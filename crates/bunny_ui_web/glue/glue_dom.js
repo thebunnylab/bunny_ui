@@ -25,7 +25,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 16;
+const EXPECTED_ABI = 17;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -87,6 +87,19 @@ function modifiers(event) {
     (event.ctrlKey ? 8 : 0)
   );
 }
+
+// The action path an element answers with, whole. A row's paths cross
+// told against the row: `~` and the rest, resolved against the nearest
+// `data-base` at or above the element — its group, which carries its
+// own path (a group's own path is told against itself). A path without
+// the `~` is whole already. Drivers and probes read paths through here.
+function actionPath(el) {
+  const path = el.getAttribute("data-path");
+  if (path === null || path.charCodeAt(0) !== 126) return path || "";
+  const home = el.closest("[data-base]");
+  return home ? home.getAttribute("data-base") + path.slice(1) : "";
+}
+window.__bunnyPath = actionPath;
 
 // A click resolved by the BROWSER: the nearest [data-path] above the
 // event target IS the pressed thing — no coordinates cross the border.
@@ -1015,12 +1028,16 @@ function applyPatches(view, length) {
     } else if (op === 17) {
       // a shape already on the page: one deep clone of the live
       // instance, numbered in pre-order from the copy's own id — the
-      // words and the action paths follow as their own ops
+      // words and the action paths that read otherwise follow as their
+      // own ops; the copy's base rides here, written on the element in
+      // hand over the template's
       const parent = u32();
       const before = u32();
       const source = lookup(u32());
+      const base = text(u16());
       if (source) {
         const el = source.cloneNode(true);
+        if (base) el.setAttribute("data-base", base);
         // a template the serializer stamped carries its number as an
         // attribute, and so does every element under it; the copy must
         // not wear them — such a copy is numbered node by node, the old
@@ -1052,7 +1069,8 @@ function applyPatches(view, length) {
         place(el, parent, before);
       }
     } else if (op === 19) {
-      // the action path alone
+      // the action path alone, as the page keeps it: `~` and the rest
+      // when it is told against its base (see actionPath)
       const el = lookup(id);
       const path = text(u16());
       if (el) {
@@ -1064,6 +1082,13 @@ function applyPatches(view, length) {
           el.removeAttribute("data-path");
         }
       }
+    } else if (op === 26) {
+      // a group's own path, the base its members' paths are told
+      // against: a created group's, or a group's inside a clone, whose
+      // copied base names the template's group
+      const el = lookup(id);
+      const base = text(u16());
+      if (el) el.setAttribute("data-base", base);
     } else if (op === 20) {
       // the words alone: the font and the ink already stand
       const el = lookup(id);
@@ -1827,10 +1852,11 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         }
       }
       const target = source ? source.closest("[data-path]") : null;
-      if (target && target.dataset.path) {
+      const path = target ? actionPath(target) : "";
+      if (path) {
         // `detail` IS the browser's click tally on a click event —
         // a double never needs a clock on this side
-        sendAction(target.dataset.path, event.detail || 1);
+        sendAction(path, event.detail || 1);
       }
     });
     window.addEventListener("resize", repositionPopovers);

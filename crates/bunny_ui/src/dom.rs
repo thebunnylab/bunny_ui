@@ -1124,12 +1124,24 @@ pub enum DomPatch {
     /// A new element cloned from a live one of the same SHAPE — the
     /// template — with its whole subtree; the ids of the copy count up
     /// in pre-order from `id`, the way a fresh mount numbers them. Only
-    /// what is the copy's own follows: its words (`SetContent`) and its
-    /// action paths (`SetPath`). Eight creates and their styles are one
-    /// word.
-    Clone { id: u32, parent: u32, before: u32, template: u32 },
+    /// what is the copy's own follows: its words (`SetContent`), the
+    /// action paths that read otherwise than the template's (`SetPath`)
+    /// and the bases of the groups inside it (`SetBase`) — the copy's
+    /// own base rides here, written on the element in hand. Eight
+    /// creates and their styles are one word.
+    Clone { id: u32, parent: u32, before: u32, template: u32, base: Option<Rc<str>> },
     /// The action path alone — what a cloned element keeps of its own.
-    SetPath { id: u32, path: Option<Rc<str>> },
+    /// `base_len` is how much of it the element's base already says:
+    /// past zero the page shows `~` and the rest, told against the
+    /// nearest `data-base` at or above the element (its group's own
+    /// path); zero shows the path whole.
+    SetPath { id: u32, path: Option<Rc<str>>, base_len: usize },
+    /// A group's own path, the base the action paths below it are told
+    /// against, written on its element as `data-base`: a created group's
+    /// after its subtree (the subtree says whether a path leaned on it),
+    /// a group's inside a clone, whose copied base names the template's
+    /// group and not its own. A clone's root takes its base on the clone.
+    SetBase { id: u32, base: Rc<str> },
     /// The words alone, for a text whose font and ink already stand.
     SetContent { id: u32, text: Arc<str> },
     /// A look the page shares: one rule in its sheet, worn by every
@@ -1311,10 +1323,26 @@ struct Templates {
     /// A root → the looks of its members, in pre-order: what a clone's
     /// members wear, without hashing them again.
     rules_of: motor::hash::FxHashMap<u32, Rc<[u64]>>,
+    /// A root → the action paths its members show, in pre-order, each
+    /// with how much of it its base says: a copy that would show the
+    /// same string took it with the element.
+    paths_of: motor::hash::FxHashMap<u32, Rc<[ShownPath]>>,
 }
 
+/// An action path as a member shows it: the path and how much of it
+/// the member's base already says (zero: shown whole). `None`: the
+/// member shows no path.
+type ShownPath = Option<(Rc<str>, usize)>;
+
 impl Templates {
-    fn register(&mut self, shape: u64, root: u32, members: Vec<u32>, rules: Vec<u64>) {
+    fn register(
+        &mut self,
+        shape: u64,
+        root: u32,
+        members: Vec<u32>,
+        rules: Vec<u64>,
+        paths: Vec<ShownPath>,
+    ) {
         if self.by_shape.contains_key(&shape) {
             return;
         }
@@ -1325,11 +1353,17 @@ impl Templates {
         }
         self.members_of.insert(root, members);
         self.rules_of.insert(root, rules.into());
+        self.paths_of.insert(root, paths.into());
     }
 
     /// The looks of a template's members, in pre-order.
     fn rules_of(&self, root: u32) -> Rc<[u64]> {
         self.rules_of.get(&root).cloned().unwrap_or_else(|| Rc::from(Vec::new()))
+    }
+
+    /// The action paths a template's members show, in pre-order.
+    fn paths_of(&self, root: u32) -> Rc<[ShownPath]> {
+        self.paths_of.get(&root).cloned().unwrap_or_else(|| Rc::from(Vec::new()))
     }
 
     fn forget_root(&mut self, root: u32) {
@@ -1343,6 +1377,7 @@ impl Templates {
             self.members.remove(&id);
         }
         self.rules_of.remove(&root);
+        self.paths_of.remove(&root);
     }
 
     /// Something other than its words reached a member: the live
@@ -1406,7 +1441,7 @@ impl DomLowering {
                 };
                 define_rule(rule, &root.node, &mut ctx, &mut patches);
                 patches.push(DomPatch::UseRule { id: 0, rule });
-                root.children = create_children(children, 0, &mut ctx, &mut patches);
+                root.children = create_children(children, 0, &mut ctx, &mut patches, None);
                 self.next_id = next_id;
                 self.root = Some(root);
             }
@@ -1725,6 +1760,31 @@ impl DomLowering {
             retained.children.iter().find_map(|child| walk(child, path))
         }
         self.root.as_ref().and_then(|root| walk(root, path))
+    }
+
+    /// Every element that answers a click or an edit, by id, with the
+    /// path the engine knows it by — a target's action path, a field's
+    /// own path, whole. What the page's resolved paths must read.
+    pub fn action_paths(&self) -> std::collections::BTreeMap<u32, String> {
+        fn walk(retained: &Retained, out: &mut std::collections::BTreeMap<u32, String>) {
+            match (&retained.node.kind, &retained.node.style.interactive) {
+                (DomKind::Field(field), _) => {
+                    out.insert(retained.id, field.path.clone());
+                }
+                (_, Some(path)) => {
+                    out.insert(retained.id, path.to_string());
+                }
+                _ => {}
+            }
+            for child in &retained.children {
+                walk(child, out);
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        if let Some(root) = &self.root {
+            walk(root, &mut out);
+        }
+        out
     }
 
     /// Every island on the page: element id, origin and size in the
@@ -2138,7 +2198,9 @@ fn create_subtree_before(
     sibling: Option<(&Retained, u32)>,
 ) -> (Retained, Option<u32>) {
     let opened = patches.len();
-    let created = create_subtree(node, parent, ctx, patches, sibling);
+    // a fresh child of a kept parent: the base above it may not be on
+    // the page, so only a group of its own tells a path against one
+    let created = create_subtree(node, parent, ctx, patches, sibling, None);
     if before != 0
         && let DomPatch::Create { before: slot, .. } | DomPatch::Clone { before: slot, .. } =
             &mut patches[opened]
@@ -2148,32 +2210,149 @@ fn create_subtree_before(
     created
 }
 
-/// The copy's own: ids in pre-order, every text's words, every action
-/// path — and the bindings filed under the new ids. The node itself
-/// moves into the retention.
-fn clone_instance(
-    mut node: DomNode,
-    id: u32,
-    rules: &[u64],
-    at: &mut usize,
+/// The group the action paths below it are told against: the nearest
+/// Group at or above an element — the element itself when it is one.
+/// A path that lies under the base ships as `~` and the rest; the base
+/// is written on the group's element only when a path leaned on it.
+struct Base {
+    path: Rc<str>,
+    leaned_on: bool,
+}
+
+impl Base {
+    /// The base a node opens, when it is a group.
+    fn of(node: &DomNode) -> Option<Base> {
+        match &node.kind {
+            DomKind::Group { path } => Some(Base { path: Rc::clone(path), leaned_on: false }),
+            _ => None,
+        }
+    }
+}
+
+/// How much of an action path its base already says: the base's own
+/// length when the path lies under it, and the base is leaned on; zero
+/// when it does not — an action armed above the group ships whole.
+fn told_against(path: &str, base: Option<&mut Base>) -> usize {
+    let Some(base) = base else {
+        return 0;
+    };
+    let len = base_len(path, Some(&base.path));
+    if len > 0 {
+        base.leaned_on = true;
+    }
+    len
+}
+
+/// The length of `base` when `path` lies under it (`base` + `/` + the
+/// rest), zero otherwise. `~` starts no identity path, so the page
+/// tells a relative path from a whole one by its first character.
+fn base_len(path: &str, base: Option<&str>) -> usize {
+    match base {
+        Some(base)
+            if !base.is_empty()
+                && path.len() > base.len() + 1
+                && path.as_bytes()[base.len()] == b'/'
+                && path.starts_with(base) =>
+        {
+            base.len()
+        }
+        _ => 0,
+    }
+}
+
+/// The string the page shows for an action path, `base_len` of it
+/// told by its base: `~` and the rest, or the path whole.
+pub(crate) fn shown_path(path: &str, base_len: usize) -> String {
+    match base_len {
+        0 => path.to_string(),
+        len => format!("~{}", &path[len..]),
+    }
+}
+
+/// Does the template's member show this path already — the same
+/// string, so the copy took it with the element?
+fn shows_already(paths: &[ShownPath], member: usize, path: &str, base_len: usize) -> bool {
+    matches!(
+        paths.get(member),
+        Some(Some((was, was_len)))
+            if (*was_len == 0) == (base_len == 0) && was[*was_len..] == path[base_len..]
+    )
+}
+
+/// What a template's members show, in pre-order: the looks they wear
+/// and the action paths on them.
+struct Shown<'a> {
+    rules: &'a [u64],
+    paths: &'a [ShownPath],
+}
+
+/// A copy of a live template: one word for the whole subtree, then the
+/// copy's own (see [`clone_instance`]). The copy's base, when a path in
+/// it leans on one, rides on that word.
+fn clone_subtree(
+    node: DomNode,
+    parent: u32,
+    template: u32,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) -> Retained {
+    let id = *ctx.next_id;
+    *ctx.next_id += 1;
+    let cloned = patches.len();
+    patches.push(DomPatch::Clone { id, parent, before: 0, template, base: None });
+    crate::stats::note_clone();
+    let rules = ctx.templates.rules_of(template);
+    let paths = ctx.templates.paths_of(template);
+    let mut at = 0;
+    let shown = Shown { rules: &rules, paths: &paths };
+    clone_instance(node, id, &shown, &mut at, ctx, patches, None, Some(cloned))
+}
+
+/// The copy's own: ids in pre-order, every text's words, every action
+/// path its template's member does not show already, the base of every
+/// group inside it a path leans on — and the bindings filed under the
+/// new ids. The node itself moves into the retention. `base` is the
+/// group the member's path is told against; `cloned` is the clone's
+/// word when the member is the copy's root, whose base rides on it.
+#[allow(clippy::too_many_arguments)]
+fn clone_instance(
+    mut node: DomNode,
+    id: u32,
+    template: &Shown,
+    at: &mut usize,
+    ctx: &mut LowerCtx,
+    patches: &mut Vec<DomPatch>,
+    base: Option<&mut Base>,
+    cloned: Option<usize>,
+) -> Retained {
+    let member = *at;
     // the look is the template's, by position; a template that lost its
     // list of looks is hashed again
-    let rule = match rules.get(*at) {
+    let rule = match template.rules.get(member) {
         Some(rule) => *rule,
         None => look_hash(&node),
     };
     *at += 1;
+    let opened = patches.len();
     if let DomKind::Text(text) = &node.kind {
         patches.push(DomPatch::SetContent { id, text: Arc::clone(&text.content) });
         if let Some(binding) = &node.binding {
             file_binding(id, binding, text, ctx);
         }
     }
+    // a group is the base of the paths below it, its own included
+    let mut own = Base::of(&node);
+    let mut base = match own.as_mut() {
+        Some(own) => Some(own),
+        None => base,
+    };
     if let Some(path) = &node.style.interactive {
-        patches.push(DomPatch::SetPath { id, path: Some(Rc::clone(path)) });
+        let base_len = told_against(path, base.as_deref_mut());
+        // the template's member shows the same string: the copy took it
+        // with the element
+        if !shows_already(template.paths, member, path, base_len) {
+            patches.push(DomPatch::SetPath { id, path: Some(Rc::clone(path)), base_len });
+        }
     }
     if let (DomKind::Group { .. }, Some(binding)) = (&node.kind, &node.binding) {
         file_class_binding(id, binding, &node.hints, ctx);
@@ -2183,9 +2362,26 @@ fn clone_instance(
         .map(|child| {
             let child_id = *ctx.next_id;
             *ctx.next_id += 1;
-            clone_instance(child, child_id, rules, at, ctx, patches)
+            clone_instance(child, child_id, template, at, ctx, patches, base.as_deref_mut(), None)
         })
         .collect();
+    // a group a path leans on carries its OWN path: the base it was
+    // copied with names the template's group. The copy's root says it
+    // on the clone's word; a group inside, ahead of its members' words.
+    // A group no path leans on may keep the template's: nothing below
+    // it reads a base
+    if let Some(own) = own
+        && own.leaned_on
+    {
+        match cloned {
+            Some(word) => {
+                if let DomPatch::Clone { base, .. } = &mut patches[word] {
+                    *base = Some(own.path);
+                }
+            }
+            None => patches.insert(opened, DomPatch::SetBase { id, base: own.path }),
+        }
+    }
     Retained { id, node, children, rule }
 }
 
@@ -2320,13 +2516,16 @@ fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
 /// sibling can be compared with it instead of hashed.
 ///
 /// `sibling` is the sibling made just before this one, with the
-/// template IT is an instance of.
+/// template IT is an instance of. `base` is the group a path here is
+/// told against, when one stands above in this subtree (a group opens
+/// its own).
 fn create_subtree(
     mut node: DomNode,
     parent: u32,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
     sibling: Option<(&Retained, u32)>,
+    base: Option<&mut Base>,
 ) -> (Retained, Option<u32>) {
     // the sibling made just before this one, when it is an instance of a
     // live template and this subtree has its shape: cloned from that
@@ -2339,13 +2538,7 @@ fn create_subtree(
         && ctx.templates.roots.contains_key(&template)
         && same_shape(&node, sibling)
     {
-        let id = *ctx.next_id;
-        *ctx.next_id += 1;
-        patches.push(DomPatch::Clone { id, parent, before: 0, template });
-        crate::stats::note_clone();
-        let rules = ctx.templates.rules_of(template);
-        let mut at = 0;
-        return (clone_instance(node, id, &rules, &mut at, ctx, patches), Some(template));
+        return (clone_subtree(node, parent, template, ctx, patches), Some(template));
     }
     // the shape is the whole subtree's: read while the children are
     // still the node's own
@@ -2358,13 +2551,7 @@ fn create_subtree(
     if let Some(shape) = shape
         && let Some(&template) = ctx.templates.by_shape.get(&shape)
     {
-        let id = *ctx.next_id;
-        *ctx.next_id += 1;
-        patches.push(DomPatch::Clone { id, parent, before: 0, template });
-        crate::stats::note_clone();
-        let rules = ctx.templates.rules_of(template);
-        let mut at = 0;
-        return (clone_instance(node, id, &rules, &mut at, ctx, patches), Some(template));
+        return (clone_subtree(node, parent, template, ctx, patches), Some(template));
     }
     let id = *ctx.next_id;
     *ctx.next_id += 1;
@@ -2400,8 +2587,15 @@ fn create_subtree(
         let (tooltip, group_owner) = marks_of(&node.style);
         patches.push(DomPatch::SetMarks { id, tooltip, group_owner });
     }
+    // a group is the base of the paths below it, its own included
+    let mut own = Base::of(&node);
+    let mut base = match own.as_mut() {
+        Some(own) => Some(own),
+        None => base,
+    };
     if let Some(path) = &node.style.interactive {
-        patches.push(DomPatch::SetPath { id, path: Some(Rc::clone(path)) });
+        let base_len = told_against(path, base.as_deref_mut());
+        patches.push(DomPatch::SetPath { id, path: Some(Rc::clone(path)), base_len });
     }
     match &node.kind {
         DomKind::Text(text) => {
@@ -2439,7 +2633,14 @@ fn create_subtree(
     }
     let children = std::mem::take(&mut node.children);
     let templates_before = ctx.templates.roots.len();
-    let children = create_children(children, id, ctx, patches);
+    let children = create_children(children, id, ctx, patches, base);
+    // a group a path leans on carries its own path, said once its
+    // subtree has: a word after it, where no patch has to move for it
+    if let Some(own) = own
+        && own.leaned_on
+    {
+        patches.push(DomPatch::SetBase { id, base: own.path });
+    }
     let retained = Retained { id, node, children, rule };
     // the first of a shape is the template the next ones clone — unless
     // a template was made inside it. A member answers to ONE template:
@@ -2454,20 +2655,36 @@ fn create_subtree(
     {
         let mut members = Vec::new();
         let mut rules = Vec::new();
-        collect_ids_and_rules(&retained, &mut members, &mut rules);
-        ctx.templates.register(shape, id, members, rules);
+        let mut paths = Vec::new();
+        collect_members(&retained, None, &mut members, &mut rules, &mut paths);
+        ctx.templates.register(shape, id, members, rules, paths);
         return (retained, Some(id));
     }
     (retained, None)
 }
 
-/// Every id and every look of a subtree, in pre-order — the order a
-/// clone is numbered in.
-fn collect_ids_and_rules(retained: &Retained, ids: &mut Vec<u32>, rules: &mut Vec<u64>) {
+/// Every id, every look and every action path of a subtree, in
+/// pre-order — the order a clone is numbered in. A path is recorded as
+/// the page shows it: told against the nearest group at or above it,
+/// the same telling the subtree was made with.
+fn collect_members(
+    retained: &Retained,
+    base: Option<&str>,
+    ids: &mut Vec<u32>,
+    rules: &mut Vec<u64>,
+    paths: &mut Vec<ShownPath>,
+) {
     ids.push(retained.id);
     rules.push(retained.rule);
+    let base = match &retained.node.kind {
+        DomKind::Group { path } => Some(&**path),
+        _ => base,
+    };
+    paths.push(
+        retained.node.style.interactive.as_ref().map(|path| (Rc::clone(path), base_len(path, base))),
+    );
     for child in &retained.children {
-        collect_ids_and_rules(child, ids, rules);
+        collect_members(child, base, ids, rules, paths);
     }
 }
 
@@ -2476,12 +2693,14 @@ fn create_children(
     parent: u32,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
+    mut base: Option<&mut Base>,
 ) -> Vec<Retained> {
     let mut out: Vec<Retained> = Vec::with_capacity(children.len());
     let mut template = None;
     for child in children {
         let sibling = out.last().zip(template);
-        let (created, made_of) = create_subtree(child, parent, ctx, patches, sibling);
+        let (created, made_of) =
+            create_subtree(child, parent, ctx, patches, sibling, base.as_deref_mut());
         template = made_of;
         out.push(created);
     }
@@ -2753,8 +2972,10 @@ fn diff_node(
         let (tooltip, group_owner) = marks_of(&new.style);
         patches.push(DomPatch::SetMarks { id, tooltip, group_owner });
     }
+    // a path that changed on a kept element ships whole: the base it
+    // could be told against may never have been written on the page
     if old.style.interactive != new.style.interactive {
-        patches.push(DomPatch::SetPath { id, path: new.style.interactive.clone() });
+        patches.push(DomPatch::SetPath { id, path: new.style.interactive.clone(), base_len: 0 });
     }
     let same_binding = same_binding(old, &new);
     if hints_changed(old, &new) {
@@ -2964,7 +3185,8 @@ fn diff_children(
             }
             None => {
                 let sibling = next.last().zip(template);
-                let (created, made_of) = create_subtree(child, retained.id, ctx, patches, sibling);
+                let (created, made_of) =
+                    create_subtree(child, retained.id, ctx, patches, sibling, None);
                 template = made_of;
                 next.push(created);
             }
@@ -3443,7 +3665,15 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// (`SetVideo`), and the canvas shell's three host verbs
 /// (`js_host_begin`, `js_host_video`, `js_host_end`) in the `./bunny.js`
 /// module.
-pub const ABI_VERSION: u32 = 16;
+///
+/// 17 (2026-10-03): action paths are told against their row. A path
+/// under the nearest group at or above its element crosses as `~` and
+/// the rest (op 19), and the group carries its own path as `data-base`:
+/// a clone's root on the clone (op 17, u16 len + utf8 after the
+/// template), any other group by op 26 (`SetBase`). A click resolves
+/// `~` against the nearest `data-base` at or above the element, and a
+/// clone whose relative paths read as its template's ships none.
+pub const ABI_VERSION: u32 = 17;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -3559,11 +3789,21 @@ pub const ABI_VERSION: u32 = 16;
 ///  16 set iframe    u8 sealed, u32 len + utf8 — the url the frame
 ///                   navigates to, or (sealed) the DOCUMENT it holds
 ///                   as `srcdoc` inside a sandbox with no powers
-///  17 set video     u32 stream (the glue's handle; 0 = none), u8
+///  17 clone         u32 parent, u32 before, u32 template, u16 len +
+///                   utf8 base — the copy's own path when a path in
+///                   it is told against it (0 = none)
+///  19 set path      u16 len + utf8 — `~` and the rest when the path
+///                   lies under its base (the nearest `data-base` at
+///                   or above the element), the path whole otherwise
+///  25 set video     u32 stream (the glue's handle; 0 = none), u8
 ///                   mirrored, u8 cover (1 = `object-fit: cover`, 0 =
 ///                   `contain`), f32 radius — the whole record; the
 ///                   glue rewires the element only when the stream
 ///                   changed, because a rewrite restarts playback
+///  26 set base      u16 len + utf8 — a group's own path, the base
+///                   the paths below it are told against: a created
+///                   group's, or a group's inside a clone (its copied
+///                   base names the template's)
 /// ```
 pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
     crate::stats::time(crate::stats::Stage::Encode, || {
@@ -3592,17 +3832,32 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 out.push(2);
                 push_u32(&mut out, *id);
             }
-            DomPatch::Clone { id, parent, before, template } => {
+            DomPatch::Clone { id, parent, before, template, base } => {
                 out.push(17);
                 push_u32(&mut out, *id);
                 push_u32(&mut out, *parent);
                 push_u32(&mut out, *before);
                 push_u32(&mut out, *template);
+                push_bytes_u16(&mut out, base.as_deref().unwrap_or("").as_bytes());
             }
-            DomPatch::SetPath { id, path } => {
+            DomPatch::SetPath { id, path, base_len } => {
                 out.push(19);
                 push_u32(&mut out, *id);
-                push_bytes_u16(&mut out, path.as_deref().unwrap_or("").as_bytes());
+                match path {
+                    // told against the base: `~` and the rest
+                    Some(path) if *base_len > 0 => {
+                        let rest = &path.as_bytes()[*base_len..];
+                        push_u16(&mut out, (rest.len() + 1) as u16);
+                        out.push(b'~');
+                        out.extend_from_slice(rest);
+                    }
+                    path => push_bytes_u16(&mut out, path.as_deref().unwrap_or("").as_bytes()),
+                }
+            }
+            DomPatch::SetBase { id, base } => {
+                out.push(26);
+                push_u32(&mut out, *id);
+                push_bytes_u16(&mut out, base.as_bytes());
             }
             DomPatch::SetContent { id, text } => {
                 out.push(20);
@@ -4173,6 +4428,7 @@ mod tests {
             | DomPatch::RemoveChildren { id, .. }
             | DomPatch::Clone { id, .. }
             | DomPatch::SetPath { id, .. }
+            | DomPatch::SetBase { id, .. }
             | DomPatch::SetContent { id, .. }
             | DomPatch::SetTransform { id, .. }
             | DomPatch::SetSize { id, .. }
@@ -5505,7 +5761,7 @@ mod tests {
                 hints: DomHints::default(),
             },
             DomPatch::SetTransform { id: 7, x: 10.0, y: 20.0 },
-            DomPatch::SetPath { id: 7, path: Some(std::rc::Rc::from("go")) },
+            DomPatch::SetPath { id: 7, path: Some(std::rc::Rc::from("go")), base_len: 0 },
             DomPatch::Remove { id: 7 },
         ];
         let bytes = encode(&patches);
@@ -7145,6 +7401,487 @@ mod tests {
         // a second frame with nothing changed is silent — the exact
         // subtree diffs like everything else
         assert!(runtime.dom_frame(&Mixed, size).is_empty());
+    }
+
+    // MARK: - Action paths told against their row
+
+    /// The page a browser holds after these frames sends, for a click
+    /// on each element, the path the engine knows the element by.
+    fn assert_clicks_resolve(replay: &crate::ssr::Replay, runtime: &Runtime) {
+        let engine = runtime.dom_action_paths();
+        assert!(!engine.is_empty(), "the page has targets");
+        assert_eq!(replay.action_paths(), engine, "{}", replay.html());
+    }
+
+    /// The path a click on the target named `name` in row `row` sends,
+    /// read off the replayed page.
+    fn target_of(replay: &crate::ssr::Replay, name: &str, row: usize) -> String {
+        replay
+            .action_paths()
+            .into_values()
+            .find(|path| path.contains(&format!("[{row}]")) && path.ends_with(&format!("[{name}]")))
+            .unwrap_or_else(|| panic!("no target `{name}` in row {row}: {}", replay.html()))
+    }
+
+    #[derive(Clone, Copy)]
+    struct Counted {
+        id: usize,
+        value: State<usize>,
+    }
+
+    fn counted(ids: std::ops::Range<usize>) -> Rc<Vec<Counted>> {
+        Rc::new(ids.map(|id| Counted { id, value: State::new(id * 10) }).collect())
+    }
+
+    /// The rows kept, and fresh ones after them.
+    fn appended<T: Copy>(rows: &[T], fresh: &[T]) -> Rc<Vec<T>> {
+        Rc::new(rows.iter().chain(fresh).copied().collect())
+    }
+
+    /// A component of its own inside each row: a group inside the clone.
+    #[derive(Clone, Copy)]
+    struct Stepper {
+        value: State<usize>,
+    }
+
+    impl Component for Stepper {
+        fn body(self, _ctx: &Context) -> impl View {
+            let value = self.value;
+            crate::hstack!(
+                text("-").on_click(move || value.set(value.get().saturating_sub(1))).id("less"),
+                text("+").on_click(move || value.set(value.get() + 1)).id("more"),
+            )
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct CounterRow {
+        row: Counted,
+    }
+
+    impl Component for CounterRow {
+        fn body(self, _ctx: &Context) -> impl View {
+            let value = self.row.value;
+            crate::hstack!(
+                text(format!("row {}", self.row.id)).on_click(move || value.set(0)).id("reset"),
+                Stepper { value },
+            )
+        }
+    }
+
+    #[derive(Clone)]
+    struct Counters {
+        rows: State<Rc<Vec<Counted>>>,
+    }
+
+    impl Component for Counters {
+        fn body(self, _ctx: &Context) -> impl View {
+            crate::vstack!(crate::views::for_each(
+                self.rows,
+                |row| row.id.to_string(),
+                |row| CounterRow { row: *row },
+            ))
+        }
+    }
+
+    /// A row's paths cross told against the row, and a copy whose paths
+    /// read as its template's ships none of them. A group inside each
+    /// copy carries its OWN path: the base it was copied with names the
+    /// template's group, and a click told against that one would reach
+    /// another row's counter.
+    #[test]
+    fn a_group_inside_a_clone_is_told_its_own_base() {
+        let size = Size { width: 400.0, height: 400.0 };
+        let page = Counters { rows: State::new(counted(1..5)) };
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&page, size);
+        let mut replay = crate::ssr::Replay::new(size);
+        replay.apply(&mount);
+        assert_clicks_resolve(&replay, &runtime);
+
+        // row 1 holds the stepper's template, so it is none itself: row
+        // 2 is built around a copy of row 1's stepper, and becomes the
+        // template rows 3 and 4 copy — a template holding a clone
+        let clones: Vec<&str> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::Clone { base, .. } => Some(base.as_deref().expect("every copy here is a base")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(clones.len(), 3, "{mount:#?}");
+        assert!(clones[0].contains("[2]") && clones[0].ends_with("/Stepper"), "{clones:?}");
+        for (row, base) in (3..).zip(&clones[1..]) {
+            assert!(base.contains(&format!("[{row}]")) && base.ends_with("/CounterRow"), "{clones:?}");
+        }
+        // the paths of the two rows built cross told against their
+        // groups; the copies ship none
+        let paths: Vec<(&str, usize)> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::SetPath { path: Some(path), base_len, .. } => Some((&**path, *base_len)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths.len(), 4, "row 1's three, row 2's own reset: {paths:?}");
+        assert!(paths.iter().all(|(_, base_len)| *base_len > 0), "{paths:?}");
+        // a group built is told its base after its subtree; the stepper
+        // inside each copied row is told its own, once
+        let bases: Vec<&str> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::SetBase { base, .. } => Some(&**base),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bases,
+            [
+                "Counters/#0/Keyed/[1]/CounterRow/#1/Stepper",
+                "Counters/#0/Keyed/[1]/CounterRow",
+                "Counters/#0/Keyed/[2]/CounterRow",
+                "Counters/#0/Keyed/[3]/CounterRow/#1/Stepper",
+                "Counters/#0/Keyed/[4]/CounterRow/#1/Stepper",
+            ]
+        );
+
+        // a click on row 3's "+" reaches row 3's counter, and no other
+        let more = target_of(&replay, "more", 3);
+        assert!(runtime.dom_action(&more, 1), "the resolved path is a live action: {more}");
+        let rows = page.rows.get();
+        let values: Vec<usize> = rows.iter().map(|row| row.value.get()).collect();
+        assert_eq!(values, [10, 20, 31, 40]);
+
+        // rows appended later copy the same template the same way
+        page.rows.set(appended(&page.rows.get(), &counted(5..7)));
+        let appended = runtime.dom_frame(&page, size);
+        replay.apply(&appended);
+        assert_clicks_resolve(&replay, &runtime);
+        assert_eq!(
+            appended.iter().filter(|patch| matches!(patch, DomPatch::SetBase { .. })).count(),
+            2,
+            "{appended:#?}"
+        );
+    }
+
+    /// Rows that hold a component of their own, cleared and run again:
+    /// the run copies only what the page still holds, tells the same
+    /// bases the mount told, and every click reaches its own row's
+    /// action — the stepper inside each row included.
+    #[test]
+    fn a_run_after_a_clear_resolves_as_the_mount_did() {
+        let size = Size { width: 400.0, height: 400.0 };
+        let page = Counters { rows: State::new(counted(1..5)) };
+        let runtime = Runtime::new();
+        let mut replay = crate::ssr::Replay::new(size);
+        let mount = runtime.dom_frame(&page, size);
+        replay.apply(&mount);
+        assert_clicks_resolve(&replay, &runtime);
+
+        page.rows.set(Rc::new(Vec::new()));
+        replay.apply(&runtime.dom_frame(&page, size));
+        assert!(runtime.dom_action_paths().is_empty(), "the clear leaves no target");
+        assert!(replay.action_paths().is_empty(), "{}", replay.html());
+
+        page.rows.set(counted(5..9));
+        let run = runtime.dom_frame(&page, size);
+        replay.apply(&run);
+        assert_clicks_resolve(&replay, &runtime);
+        // built as the mount built its rows: row 5 whole (seven
+        // elements) holding the stepper's template, row 6 around a copy
+        // of it (three), two copies of row 6 — and the mount's copies,
+        // bases and paths, told again
+        let built = |patches: &[DomPatch]| {
+            let count = |wanted: fn(&DomPatch) -> bool| patches.iter().filter(|p| wanted(p)).count();
+            [
+                count(|p| matches!(p, DomPatch::Create { .. })),
+                count(|p| matches!(p, DomPatch::Clone { .. })),
+                count(|p| matches!(p, DomPatch::SetBase { .. })),
+                count(|p| matches!(p, DomPatch::SetPath { .. })),
+            ]
+        };
+        let (run_built, mount_built) = (built(&run), built(&mount));
+        assert_eq!(run_built[0], 10, "{run:#?}");
+        assert_eq!(run_built[1..], mount_built[1..], "{run:#?}");
+
+        // a click on row 7's "+" reaches row 7's counter, and no other
+        let more = target_of(&replay, "more", 7);
+        assert!(runtime.dom_action(&more, 1), "{more}");
+        let values: Vec<usize> = page.rows.get().iter().map(|row| row.value.get()).collect();
+        assert_eq!(values, [50, 60, 71, 80]);
+    }
+
+    #[derive(Clone, Copy)]
+    struct Badge {
+        id: usize,
+    }
+
+    impl Component for Badge {
+        fn body(self, _ctx: &Context) -> impl View {
+            text(format!("badge {}", self.id)).background_color(Color::hex(0x334455))
+        }
+    }
+
+    #[derive(Clone)]
+    struct Badges {
+        rows: State<Rc<Vec<Counted>>>,
+        picked: State<usize>,
+    }
+
+    impl Component for Badges {
+        fn body(self, _ctx: &Context) -> impl View {
+            let picked = self.picked;
+            crate::vstack!(crate::views::for_each(
+                self.rows,
+                |row| row.id.to_string(),
+                move |row| {
+                    let id = row.id;
+                    // the click is armed ABOVE the row's component: its
+                    // path is the list's, never under the group's
+                    Badge { id }.on_click(move || picked.set(id))
+                },
+            ))
+        }
+    }
+
+    /// An action armed above its group does not lie under the group's
+    /// path: it ships whole, the group carries no base, and every copy
+    /// says its own path — the template's would be another row's.
+    #[test]
+    fn a_path_armed_above_its_group_ships_whole() {
+        let size = Size { width: 400.0, height: 400.0 };
+        let page = Badges { rows: State::new(counted(1..5)), picked: State::new(0) };
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&page, size);
+        let mut replay = crate::ssr::Replay::new(size);
+        replay.apply(&mount);
+        assert_clicks_resolve(&replay, &runtime);
+
+        let paths: Vec<(&str, usize)> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::SetPath { path: Some(path), base_len, .. } => Some((&**path, *base_len)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths.len(), 4, "every row says its own: {paths:?}");
+        assert!(paths.iter().all(|(path, base_len)| *base_len == 0 && !path.contains("/Badge/")), "{paths:?}");
+        assert!(mount.iter().any(|patch| matches!(patch, DomPatch::Clone { base: None, .. })), "{mount:#?}");
+        assert!(!mount.iter().any(|patch| matches!(patch, DomPatch::Clone { base: Some(_), .. })));
+        assert!(!mount.iter().any(|patch| matches!(patch, DomPatch::SetBase { .. })));
+        assert!(!replay.html().contains("data-path=\"~"), "{}", replay.html());
+
+        let third = replay
+            .action_paths()
+            .into_values()
+            .find(|path| path.contains("[3]"))
+            .expect("row 3 is a target");
+        assert!(runtime.dom_action(&third, 1));
+        assert_eq!(page.picked.get(), 3);
+    }
+
+    #[derive(Clone, Copy)]
+    struct Folding {
+        id: usize,
+        open: State<bool>,
+        hits: State<usize>,
+    }
+
+    impl Component for Folding {
+        fn body(self, _ctx: &Context) -> impl View {
+            let open = self.open;
+            let hits = self.hits;
+            let opened = open.get();
+            crate::vstack!(
+                // the name moves with the state: a kept element whose
+                // path changes on the re-run
+                text(format!("row {}", self.id))
+                    .on_click(move || open.set(!open.get()))
+                    .id(if opened { "fold" } else { "unfold" }),
+                // a target born inside a kept row
+                opened.then(|| text("details").on_click(move || hits.set(hits.get() + 1)).id("details")),
+            )
+        }
+    }
+
+    #[derive(Clone)]
+    struct Folds {
+        rows: State<Rc<Vec<Folding>>>,
+    }
+
+    impl Component for Folds {
+        fn body(self, _ctx: &Context) -> impl View {
+            crate::vstack!(crate::views::for_each(self.rows, |row| row.id.to_string(), |row| *row))
+        }
+    }
+
+    fn folds(ids: std::ops::Range<usize>) -> Rc<Vec<Folding>> {
+        Rc::new(
+            ids.map(|id| Folding { id, open: State::new(false), hits: State::new(0) }).collect(),
+        )
+    }
+
+    /// A row that re-runs and changes its structure: the target born in
+    /// it, and the target whose path moved, ship whole — the base their
+    /// row would lend them was told only to rows that leaned on it — and
+    /// every click on the page still reaches its own action, the rows
+    /// mounted after the change included.
+    #[test]
+    fn a_row_that_changes_its_structure_still_resolves() {
+        let size = Size { width: 400.0, height: 400.0 };
+        let page = Folds { rows: State::new(folds(1..5)) };
+        let runtime = Runtime::new();
+        let mut replay = crate::ssr::Replay::new(size);
+        replay.apply(&runtime.dom_frame(&page, size));
+        assert_clicks_resolve(&replay, &runtime);
+
+        // row 2 (a copy) and row 1 (the template) open
+        for row in [2, 1] {
+            let unfold = target_of(&replay, "unfold", row);
+            assert!(runtime.dom_action(&unfold, 1), "{unfold}");
+            let patches = runtime.dom_frame(&page, size);
+            let paths: Vec<usize> = patches
+                .iter()
+                .filter_map(|patch| match patch {
+                    DomPatch::SetPath { base_len, .. } => Some(*base_len),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(paths, [0, 0], "the moved path and the new one, whole: {patches:#?}");
+            replay.apply(&patches);
+            assert_clicks_resolve(&replay, &runtime);
+        }
+
+        // the new target reaches its own row
+        let details = target_of(&replay, "details", 2);
+        assert!(runtime.dom_action(&details, 1));
+        let rows = page.rows.get();
+        assert_eq!(rows.iter().map(|row| row.hits.get()).collect::<Vec<_>>(), [0, 1, 0, 0]);
+
+        // rows mounted after the change, and a row closing again
+        page.rows.set(appended(&rows, &folds(5..8)));
+        let appended = runtime.dom_frame(&page, size);
+        replay.apply(&appended);
+        assert_clicks_resolve(&replay, &runtime);
+        let fold = target_of(&replay, "fold", 2);
+        assert!(runtime.dom_action(&fold, 1));
+        replay.apply(&runtime.dom_frame(&page, size));
+        assert_clicks_resolve(&replay, &runtime);
+        let unfold = target_of(&replay, "unfold", 6);
+        assert!(runtime.dom_action(&unfold, 1));
+        replay.apply(&runtime.dom_frame(&page, size));
+        assert_clicks_resolve(&replay, &runtime);
+        assert!(page.rows.get()[5].open.get(), "row 6 opened through its resolved path");
+    }
+
+    /// A served page carries the same relative paths and bases as a
+    /// mounted one and resolves every click the same way — and a page
+    /// that hydrated takes later frames on top of the served tree.
+    #[test]
+    fn a_served_page_resolves_clicks_as_a_mounted_one() {
+        let size = Size { width: 400.0, height: 400.0 };
+        let page = Counters { rows: State::new(counted(1..4)) };
+        let served = crate::ssr::render(&page, size);
+        assert!(served.html.contains("data-base=\""), "{}", served.html);
+        assert!(served.html.contains("data-path=\"~/"), "{}", served.html);
+
+        let runtime = Runtime::new();
+        let mut replay = crate::ssr::Replay::new(size);
+        replay.apply(&runtime.dom_frame(&page, size));
+        assert_eq!(replay.html(), served.html, "the mount and the served page are one tree");
+        assert_clicks_resolve(&replay, &runtime);
+
+        // the browser adopts the served page, and the next change lands
+        // on it — the served bases still hold the paths below them
+        let hydrated = Runtime::new();
+        hydrated.dom_adopt(&page, size);
+        assert!(hydrated.dom_frame(&page, size).is_empty());
+        page.rows.set(appended(&page.rows.get(), &counted(4..6)));
+        replay.apply(&hydrated.dom_frame(&page, size));
+        assert_clicks_resolve(&replay, &hydrated);
+        let more = target_of(&replay, "more", 2);
+        assert!(hydrated.dom_action(&more, 1));
+        assert_eq!(page.rows.get()[1].value.get(), 21);
+    }
+
+    /// The new words on the wire: a clone's base, a path told against
+    /// its base, a group's base alone — and a clone with no base, a path
+    /// under none.
+    #[test]
+    fn a_relative_path_and_its_bases_cross_the_wire() {
+        let patches = vec![
+            DomPatch::Clone { id: 9, parent: 0, before: 1, template: 1, base: Some(Rc::from("A/[2]")) },
+            DomPatch::SetPath { id: 3, path: Some(Rc::from("A/[1]/#0")), base_len: 5 },
+            DomPatch::SetBase { id: 12, base: Rc::from("A/[2]/B") },
+        ];
+        let expected: Vec<u8> = [
+            &3u32.to_le_bytes()[..],
+            &[17],
+            &9u32.to_le_bytes()[..],
+            &0u32.to_le_bytes()[..],
+            &1u32.to_le_bytes()[..],
+            &1u32.to_le_bytes()[..],
+            &5u16.to_le_bytes()[..],
+            b"A/[2]",
+            &[19],
+            &3u32.to_le_bytes()[..],
+            &4u16.to_le_bytes()[..],
+            b"~/#0",
+            &[26],
+            &12u32.to_le_bytes()[..],
+            &7u16.to_le_bytes()[..],
+            b"A/[2]/B",
+        ]
+        .concat();
+        assert_eq!(encode(&patches), expected);
+        let whole = encode(&[
+            DomPatch::Clone { id: 9, parent: 0, before: 0, template: 1, base: None },
+            DomPatch::SetPath { id: 2, path: Some(Rc::from("A/#0")), base_len: 0 },
+        ]);
+        let expected: Vec<u8> = [
+            &2u32.to_le_bytes()[..],
+            &[17],
+            &9u32.to_le_bytes()[..],
+            &0u32.to_le_bytes()[..],
+            &0u32.to_le_bytes()[..],
+            &1u32.to_le_bytes()[..],
+            &0u16.to_le_bytes()[..],
+            &[19],
+            &2u32.to_le_bytes()[..],
+            &4u16.to_le_bytes()[..],
+            b"A/#0",
+        ]
+        .concat();
+        assert_eq!(whole, expected);
+    }
+
+    /// The glue's half of the contract: it reads a base on every clone
+    /// and on op 26, and it resolves `~` against the nearest
+    /// `data-base` AT OR ABOVE the element — the element itself when
+    /// it carries one, as the engine tells a group's own path against
+    /// the group.
+    #[test]
+    fn the_glue_tells_a_relative_path_against_the_nearest_base() {
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        for (line, why) in [
+            ("if (base) el.setAttribute(\"data-base\", base);", "a copy's base lands on the element in hand"),
+            ("if (path === null || path.charCodeAt(0) !== 126) return path || \"\";", "a path without `~` is whole"),
+            ("const home = el.closest(\"[data-base]\");", "the base at or above the element, itself included"),
+            ("return home ? home.getAttribute(\"data-base\") + path.slice(1) : \"\";", "the base, then the rest"),
+            ("const path = target ? actionPath(target) : \"\";", "a click sends the path resolved"),
+            ("window.__bunnyPath = actionPath;", "drivers and probes read paths whole"),
+        ] {
+            assert!(glue.contains(line), "glue_dom.js: {why}");
+        }
+        let clone = glue.find("} else if (op === 17) {").expect("the glue reads the clone op");
+        let next = glue[clone + 1..].find("} else if (op ===").map_or(glue.len(), |at| clone + 1 + at);
+        let body = &glue[clone..next];
+        let read = body.find("const base = text(u16());").expect("op 17 reads the copy's base");
+        assert!(
+            read < body.find("if (source) {").expect("the clone"),
+            "op 17 reads its base whether or not the template stands"
+        );
+        assert!(glue.contains("} else if (op === 26) {"), "glue_dom.js reads op 26");
     }
 
     // MARK: - The ABI handshake
