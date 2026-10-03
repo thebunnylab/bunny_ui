@@ -1855,7 +1855,7 @@ mod tests {
         props.foreground = Some(Color::hex(0x888888));
         props.foreground_hovered = Some(Color::hex(0xFFFFFF));
         let tree = LayoutNode::Styled {
-            props: Box::new(props),
+            props: std::rc::Rc::new(props),
             child: Box::new(text_node("flip me")),
         };
         let offsets = HashMap::default();

@@ -133,13 +133,14 @@ where
         // included — the hit-rect becomes the whole chrome, not just the label
         let theme = crate::theme::current();
         let chrome = LayoutNode::Styled {
-            props: Box::new(VisualProps {
+            props: VisualProps {
                 background: Some(theme.control),
                 background_hovered: Some(theme.control_hovered),
                 background_pressed: Some(theme.control_pressed),
                 corner_radius: Some(Corners::all(BUTTON_RADIUS)),
                 ..VisualProps::default()
-            }),
+            }
+            .shared(),
             child: Box::new(LayoutNode::Padding {
                 edges: Edges {
                     top: BUTTON_PAD_V,
