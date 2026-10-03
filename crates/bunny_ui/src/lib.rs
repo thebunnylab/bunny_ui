@@ -2005,6 +2005,18 @@ mod tests {
         );
     }
 
+    /// A look whose face is this text's, as a stream would define it.
+    fn look_with(text: crate::dom::DomText) -> crate::dom::DomPatch {
+        crate::dom::DomPatch::DefineRule {
+            rule: 0,
+            kind: crate::dom::CreateKind::Text,
+            flags: 0,
+            style: Box::default(),
+            layout: Box::default(),
+            text: Some(Box::new(text)),
+        }
+    }
+
     #[test]
     fn the_weight_scale_travels_as_a_number() {
         use crate::text_engine::Weight;
@@ -2029,10 +2041,11 @@ mod tests {
                 highlights: None,
                 truncation: None,
             };
-            let bytes = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 1, text: Box::new(text) }]);
-            // count(4), op(1), id(4), color(4), inherits(1), size(4) —
-            // then the weight
-            bytes[18]
+            let bytes = crate::dom::encode(&[look_with(text)]);
+            // count(4), op(1), rule(8), kind(1), flags(1), a bare style
+            // mask(4), a bare flow mask(2), the text flag(1) — then the
+            // face: color(4), inherits(1), size(4), and the weight
+            bytes[4 + 1 + 8 + 1 + 1 + 4 + 2 + 1 + 4 + 1 + 4]
         };
         let codes: Vec<u8> = scale.iter().map(|weight| code_of(*weight)).collect();
         assert_eq!(codes, vec![0, 1, 2, 3, 4, 5]);
@@ -4399,23 +4412,19 @@ mod tests {
                 _ => None,
             })
             .expect("the box lowers to an island");
-        // the flow lowering carries a box in the layout record: the
-        // height is PINNED to one screen, and the width belongs to the
+        // the flow lowering carries the island's own box: the height
+        // is PINNED to one screen, and the width belongs to the
         // browser — the island stretches and reports its real box back
-        let layout = patches
+        let height = patches
             .iter()
             .find_map(|patch| match patch {
-                crate::dom::DomPatch::SetLayout { id, layout } if *id == canvas => {
-                    Some(layout.clone())
+                crate::dom::DomPatch::SetBox { id, width: None, height, .. } if *id == canvas => {
+                    Some(*height)
                 }
                 _ => None,
             })
             .expect("the island is sized");
-        assert_eq!(
-            layout.height,
-            Some(200.0),
-            "the island is the window, not the content"
-        );
+        assert_eq!(height, Some(200.0), "the island is the window, not the content");
     }
 
     #[test]
@@ -5333,7 +5342,7 @@ mod tests {
         let styles: Vec<crate::dom::DomStyle> = patches
             .iter()
             .filter_map(|patch| match patch {
-                crate::dom::DomPatch::SetStyle { style, .. } => Some((**style).clone()),
+                crate::dom::DomPatch::DefineRule { style, .. } => Some((**style).clone()),
                 _ => None,
             })
             .collect();
@@ -5342,7 +5351,9 @@ mod tests {
             "the rule lets the pointer through: {styles:#?}"
         );
         assert!(
-            styles.iter().any(|style| style.interactive.is_some() && !style.pass_through),
+            patches
+                .iter()
+                .any(|patch| matches!(patch, crate::dom::DomPatch::SetPath { path: Some(_), .. })),
             "and the row keeps its own click"
         );
     }
@@ -13604,7 +13615,7 @@ mod tests {
         let runtime = Runtime::new();
         let patches = runtime.dom_frame(&Chevron, Size { width: 100.0, height: 40.0 });
         let landed = patches.iter().any(|patch| {
-            matches!(patch, crate::dom::DomPatch::SetStyle { style, .. } if style.tooltip.is_some())
+            matches!(patch, crate::dom::DomPatch::SetMarks { tooltip: Some(_), .. })
         });
         assert!(landed, "the attribute lands under paint modifiers: {patches:#?}");
     }
@@ -13629,7 +13640,7 @@ mod tests {
         let faded = patches
             .iter()
             .find_map(|patch| match patch {
-                crate::dom::DomPatch::SetStyle { style, .. } if style.opacity.is_some() => {
+                crate::dom::DomPatch::DefineRule { style, .. } if style.opacity.is_some() => {
                     Some(style.clone())
                 }
                 _ => None,
@@ -13642,8 +13653,8 @@ mod tests {
         // selector can name
         let group = faded.group.expect("the mark carries its group");
         let owner = patches.iter().any(|patch| {
-            matches!(patch, crate::dom::DomPatch::SetStyle { style, .. }
-                if style.group_owner == Some(group))
+            matches!(patch, crate::dom::DomPatch::SetMarks { group_owner: Some(owner), .. }
+                if *owner == group)
         });
         assert!(owner, "the group owns a box of its own: {patches:#?}");
 
@@ -13671,29 +13682,25 @@ mod tests {
         let runtime = Runtime::new();
         let size = Size { width: 100.0, height: 40.0 };
         let patches = runtime.dom_frame(&Labelled, size);
-        let style = patches
+        let tooltip = patches
             .iter()
             .find_map(|patch| match patch {
-                crate::dom::DomPatch::SetStyle { style, .. } if style.tooltip.is_some() => {
-                    Some(style.clone())
-                }
+                crate::dom::DomPatch::SetMarks { tooltip: Some(tooltip), .. } => Some(tooltip.clone()),
                 _ => None,
             })
             .expect("the text lands as a data attribute");
-        assert_eq!(style.tooltip.as_deref(), Some("Settings"));
-        // and the wire says so: bit 15, u16 len + utf8 at the tail
-        let bytes = crate::dom::encode(&[crate::dom::DomPatch::SetStyle {
+        assert_eq!(&*tooltip, "Settings");
+        // and the wire says so: the marks' first bit, u16 len + utf8
+        let bytes = crate::dom::encode(&[crate::dom::DomPatch::SetMarks {
             id: 3,
-            style: Box::new(crate::dom::DomStyle {
-                tooltip: Some(std::sync::Arc::from("Hi")),
-                ..crate::dom::DomStyle::default()
-            }),
+            tooltip: Some(std::sync::Arc::from("Hi")),
+            group_owner: None,
         }]);
         let expected: Vec<u8> = [
             &1u32.to_le_bytes()[..],
-            &[5],
+            &[24],
             &3u32.to_le_bytes()[..],
-            &0x8000u32.to_le_bytes()[..],
+            &[1],
             &2u16.to_le_bytes()[..],
             b"Hi",
         ]
@@ -15049,7 +15056,7 @@ mod tests {
         let accent = crate::theme::current().accent;
         let ringed = |patches: &[crate::dom::DomPatch]| {
             patches.iter().any(|patch| matches!(patch,
-                crate::dom::DomPatch::SetStyle { style, .. }
+                crate::dom::DomPatch::DefineRule { style, .. }
                     if style.border == Some((accent, 2.0))))
         };
         assert!(!ringed(&mount), "no drag, no ring");
@@ -15211,7 +15218,7 @@ mod tests {
             highlights: None,
             truncation: None,
         };
-        let with = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 4, text: Box::new(stepped) }]);
+        let with = crate::dom::encode(&[look_with(stepped)]);
         let plain = crate::dom::DomText {
             content: std::sync::Arc::from("a paragraph"),
             color: Color::hex(0x202531),
@@ -15222,7 +15229,7 @@ mod tests {
             highlights: None,
             truncation: None,
         };
-        let without = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 4, text: Box::new(plain) }]);
+        let without = crate::dom::encode(&[look_with(plain)]);
 
         // the same stream, four bytes apart — the line box is an f32
         // beside the family, and NONE travels as a plain zero
@@ -15246,7 +15253,7 @@ mod tests {
             highlights: None,
             truncation: None,
         };
-        let bytes = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 4, text: Box::new(leaning) }]);
+        let bytes = crate::dom::encode(&[look_with(leaning)]);
         let upright = crate::dom::DomText {
             content: std::sync::Arc::from("preview.rs"),
             color: Color::hex(0x202531),
@@ -15257,7 +15264,7 @@ mod tests {
             highlights: None,
             truncation: None,
         };
-        let plain = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 4, text: Box::new(upright) }]);
+        let plain = crate::dom::encode(&[look_with(upright)]);
 
         // the same stream, ONE byte apart — the slant is a flag beside
         // mono, not a payload that grows the wire

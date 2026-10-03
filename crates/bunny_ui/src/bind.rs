@@ -375,7 +375,7 @@ mod frame_tests {
         assert_eq!(frame.capture_nodes, 0, "the walk built nothing");
         assert_eq!(frame.binding_updates, 1);
         match patches.as_slice() {
-            [DomPatch::SetText { text, .. }] => assert_eq!(&*text.content, "2 rows"),
+            [DomPatch::SetContent { text, .. }] => assert_eq!(&**text, "2 rows"),
             other => panic!("one text patch, got {other:?}"),
         }
         // the print reads it live
@@ -478,7 +478,7 @@ mod frame_tests {
         assert_eq!(groups, 3, "the table, the list and the first row: {patches:?}");
         assert_eq!(clones, 4, "{patches:?}");
         assert_eq!(frame.clones, 4);
-        assert_eq!(words, ["row 2", "row 3", "row 4", "row 5"]);
+        assert_eq!(words, ["row 1", "row 2", "row 3", "row 4", "row 5"]);
 
         // the served page agrees: a clone is the template's subtree with
         // the copy's words, numbered as a fresh mount numbers them
@@ -608,7 +608,7 @@ mod frame_tests {
         let frame = stats::take();
         assert_eq!(frame.entries_indexed, 2, "the shelf and the list, no row");
         assert_eq!(frame.diff_reused, 3, "the rows were kept: {patches:?}");
-        assert!(matches!(patches.as_slice(), [DomPatch::SetText { text, .. }] if &*text.content == "2"), "{patches:?}");
+        assert!(matches!(patches.as_slice(), [DomPatch::SetContent { text, .. }] if &**text == "2"), "{patches:?}");
 
         // the shelf re-runs with another font above the rows: the rows
         // are lowered again, in their new environment — no body of
@@ -618,11 +618,11 @@ mod frame_tests {
         let frame = stats::take();
         assert_eq!(frame.entries_indexed, 2, "still no row body");
         assert_eq!(frame.diff_reused, 0, "a moved environment keeps nothing: {patches:?}");
-        let rows_moved = patches
-            .iter()
-            .filter(|patch| matches!(patch, DomPatch::SetText { text, .. } if text.content.starts_with("row ")))
-            .count();
-        assert_eq!(rows_moved, 3, "every row's text wears the new font: {patches:?}");
+        // the new face is one look, defined once; the head and every
+        // row's text wear it
+        let defined = patches.iter().filter(|patch| matches!(patch, DomPatch::DefineRule { .. })).count();
+        let worn = patches.iter().filter(|patch| matches!(patch, DomPatch::UseRule { .. })).count();
+        assert_eq!((defined, worn), (1, 4), "the head and every row's text wear the new font: {patches:?}");
     }
 }
 
