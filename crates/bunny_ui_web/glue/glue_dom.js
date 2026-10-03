@@ -1957,7 +1957,9 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     // every stroke a focused canvas island wants — a box the app
     // paints has no element to type into.
     window.addEventListener("keydown", (event) => {
-      const typing = event.target && event.target.tagName === "INPUT";
+      // the browser's own editables — a field, and a field of many lines
+      const typing =
+        event.target && (event.target.tagName === "INPUT" || event.target.tagName === "TEXTAREA");
       const mods = modifiers(event);
       if (MODIFIER_KEYS.has(event.key)) {
         if (wasm.bunny_modifiers) wasm.bunny_modifiers(mods);
@@ -1971,11 +1973,13 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         if (wasm.bunny_key(100 + Number(row[1]), mods)) event.preventDefault();
         return;
       }
+      // a key the engine does not take is the browser's: the page
+      // scrolls by the arrows, the space and the page keys, a focused
+      // link follows its Enter, Tab walks the focus
       const code = KEYS[event.key];
       if (code !== undefined) {
         if (typing && code !== 7) return;
-        if (code !== 7) event.preventDefault();
-        wasm.bunny_key(code, mods);
+        if (wasm.bunny_key(code, mods) && code !== 7) event.preventDefault();
         return;
       }
       if (event.key.length !== 1) return;
@@ -1984,6 +1988,9 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         return;
       }
       if (typing) return;
+      // typing reaches the engine only while something there takes
+      // text — a canvas island holding the keyboard
+      if (wasm.bunny_text_caret && !wasm.bunny_text_caret()) return;
       event.preventDefault();
       sendText(event.key);
     });
