@@ -4634,6 +4634,13 @@ fn cover_rect(frame: Rect, intrinsic: Option<(u32, u32)>) -> Option<Rect> {
 }
 
 impl LayoutNode {
+    /// A boundary is as flexible as its one child — and a reference to a
+    /// retained boundary answers what its tree answers, so the lowering
+    /// that keeps the answer with a group asks here too.
+    pub(crate) fn boundary_is_flexible(children: &[LayoutNode], axis: Axis, enclosing_main: Option<Axis>) -> bool {
+        children.len() == 1 && children[0].is_flexible(axis, enclosing_main)
+    }
+
     /// Flexible = wants the leftover space on the axis (the basis of
     /// stack distribution). Explicit priority, never a side effect of
     /// overflow.
@@ -4725,9 +4732,7 @@ impl LayoutNode {
             LayoutNode::Layered { children, .. } => {
                 children.iter().any(|child| child.is_flexible(axis, enclosing_main))
             }
-            LayoutNode::Boundary { children, .. } => {
-                children.len() == 1 && children[0].is_flexible(axis, enclosing_main)
-            }
+            LayoutNode::Boundary { children, .. } => Self::boundary_is_flexible(children, axis, enclosing_main),
             // a probe is not a box: it answers for its child in every
             // direction, or measuring a view would change it
             LayoutNode::Measured { child, .. } => child.is_flexible(axis, enclosing_main),

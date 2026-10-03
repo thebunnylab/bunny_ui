@@ -103,7 +103,16 @@ pub(crate) struct FlowKey {
 /// stamps the rest again when the group is reused.
 #[derive(Clone, Debug)]
 pub(crate) struct GroupRecord {
-    pub env: FlowKey,
+    /// Shared by the groups lowered one after the other in the same
+    /// environment — the rows of a list: a record is one line of the
+    /// table that holds a thousand, and the environment they all ask
+    /// about stays where the last row left it.
+    pub env: std::rc::Rc<FlowKey>,
+    /// Does the boundary's tree take its offer down the column it stands
+    /// in ([`LayoutNode::is_flexible`], vertically, no stack around) —
+    /// the fill a group's loop stamps on it, kept: a promise made from a
+    /// reference is stamped from here, and its tree is not read to ask.
+    pub fill: bool,
     /// `stretch` the group took from a hungry child of its own.
     pub own_stretch: bool,
     /// The class its body declared for it (`boundary_class`).
@@ -149,6 +158,8 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         islands_walked: Vec::new(),
         runs_below: true,
         last_face: None,
+        last_env: None,
+        promised_fill: None,
     };
     let mut children = Vec::new();
     walk.lower_into(root, &mut children);
@@ -291,6 +302,13 @@ struct Walk<'a> {
     /// declare it again — the rows of a list declare one face as many
     /// times as there are rows.
     last_face: Option<std::rc::Rc<FontSpec>>,
+    /// The environment this walk filed a group under last, shared by
+    /// the groups lowered in it again ([`GroupRecord::env`]).
+    last_env: Option<std::rc::Rc<FlowKey>>,
+    /// What the boundary reference just lowered says of its fill: the
+    /// record's, when it was promised from the reference — read by the
+    /// group loop around it, and by nothing else.
+    promised_fill: Option<bool>,
 }
 
 thread_local! {
@@ -397,6 +415,21 @@ impl Walk<'_> {
             group: self.groups.last().copied(),
             in_overlay: self.overlay_depth > 0,
             slot: self.slot,
+        }
+    }
+
+    /// The environment a group lowered here is filed under: the one the
+    /// walk filed its last group under, shared, when it is the same — a
+    /// list's rows are lowered one after the other in one environment.
+    fn filed_env(&mut self) -> std::rc::Rc<FlowKey> {
+        let key = self.flow_key();
+        match &self.last_env {
+            Some(env) if **env == key => std::rc::Rc::clone(env),
+            _ => {
+                let env = std::rc::Rc::new(key);
+                self.last_env = Some(std::rc::Rc::clone(&env));
+                env
+            }
         }
     }
 
@@ -998,37 +1031,51 @@ impl Walk<'_> {
             LayoutNode::Measured { child, .. } => self.lower_into(child, out),
 
             LayoutNode::Boundary { path, children, .. } => {
-                self.lower_boundary(path, children, false, out);
+                if self.promise(path, false, out).is_none() {
+                    self.lower_group(path, children, out);
+                }
             }
             LayoutNode::BoundaryRef { path, slot, hints } => {
                 let opened = out.len();
-                // resolves through the retention IN PLACE, the same
-                // door the placement walk uses, and lowers straight into
-                // the parent's list — a list of its own was a block of
-                // four nodes per row, filled with one and copied out. A
-                // missing entry keeps the identity anchor so the diff
-                // can match later
-                let found = slot.with_layout(|tree| match tree {
-                    // the frame's tree names only retained boundaries:
-                    // an entry that left keeps its slot filled until the
-                    // page is idle, but no tree of the frame refers to it
-                    // any more — so the boundary is not asked again
-                    Some(LayoutNode::Boundary { path, children, .. }) => {
-                        debug_assert!(
-                            crate::reconciler::is_retained(path),
-                            "the frame reached a boundary that left: {path}"
-                        );
-                        self.lower_boundary(path, children, true, out);
-                        true
+                // the frame's tree names only retained boundaries: an
+                // entry that left keeps its slot filled until the page is
+                // idle, but no tree of the frame refers to it any more —
+                // so the boundary is not asked again. A kept one is
+                // promised from the reference alone: only its entry fills
+                // the slot, with a tree rooted at a boundary of this very
+                // path, so the promise is the one that tree would make —
+                // and the tree, a thousand of them in as many places in
+                // memory for a list, is not read
+                self.promised_fill = if slot.holds() {
+                    debug_assert!(crate::reconciler::is_retained(path), "the frame reached a boundary that left: {path}");
+                    self.promise(path, true, out)
+                } else {
+                    None
+                };
+                if self.promised_fill.is_none() {
+                    // resolves through the retention IN PLACE, the same
+                    // door the placement walk uses, and lowers straight
+                    // into the parent's list — a list of its own was a
+                    // block of four nodes per row, filled with one and
+                    // copied out. A missing entry keeps the identity
+                    // anchor so the diff can match later
+                    let found = slot.with_layout(|tree| match tree {
+                        Some(LayoutNode::Boundary { path, children, .. }) => {
+                            self.lower_group(path, children, out);
+                            true
+                        }
+                        Some(tree) => {
+                            self.lower_into(tree, out);
+                            true
+                        }
+                        None => false,
+                    });
+                    if !found {
+                        out.push(node(DomKind::Group { path: std::rc::Rc::clone(path) }));
                     }
-                    Some(tree) => {
-                        self.lower_into(tree, out);
-                        true
-                    }
-                    None => false,
-                });
-                if !found {
-                    out.push(node(DomKind::Group { path: std::rc::Rc::clone(path) }));
+                    // what the walk below left here is not this
+                    // reference's: it was lowered, not promised
+                    self.promised_fill = None;
                 }
                 // the hints an `.element(…)` gave the boundary, stamped
                 // as the wrapper they replace would stamp them
@@ -1265,17 +1312,12 @@ impl Walk<'_> {
         }
     }
 
-    /// A boundary: a promise of reuse when nothing it shows can have
-    /// changed, its group lowered again otherwise. `retained` says the
-    /// walk reached it through its slot, which only a retained entry
-    /// fills — the retention is not asked again.
-    fn lower_boundary(
-        &mut self,
-        path: &std::rc::Rc<str>,
-        children: &[LayoutNode],
-        retained: bool,
-        out: &mut Vec<DomNode>,
-    ) {
+    /// A boundary's promise of reuse, pushed when nothing it shows can
+    /// have changed; the record's fill comes back with it, `None` when
+    /// the group must be lowered again. `retained` says the walk reached
+    /// it through its slot, which only a retained entry fills — the
+    /// retention is not asked again.
+    fn promise(&mut self, path: &std::rc::Rc<str>, retained: bool, out: &mut Vec<DomNode>) -> Option<bool> {
         // a CLEAN boundary is a promise, not a walk: no body at
         // or under it ran, the retained group still holds, and
         // it was lowered in the environment the walk carries
@@ -1294,15 +1336,19 @@ impl Walk<'_> {
                 !self.changed.run_above(path)
             }
         };
-        if let Some(record) = self.env.retained_groups.get(&**path)
-            && !(self.runs_below && self.changed.touches(path))
-            && holds(record)
-        {
-            self.drops_seen += record.drops;
-            out.push(promise(path, record));
-            return;
+        let record = self.env.retained_groups.get(&**path)?;
+        if (self.runs_below && self.changed.touches(path)) || !holds(record) {
+            return None;
         }
-        let key = self.flow_key();
+        self.drops_seen += record.drops;
+        out.push(promise(path, record));
+        Some(record.fill)
+    }
+
+    /// A boundary's group, lowered again: its children walked, and the
+    /// record of what it was lowered in filed for the next walk.
+    fn lower_group(&mut self, path: &std::rc::Rc<str>, children: &[LayoutNode], out: &mut Vec<DomNode>) {
+        let env = self.filed_env();
         let mut group = node(DomKind::Group { path: std::rc::Rc::clone(path) });
         group.children.reserve_exact(children.len());
         let outer_pending = self.pending_boundary_class.take();
@@ -1315,7 +1361,20 @@ impl Walk<'_> {
         for child in children {
             let opened = group.children.len();
             self.lower_into(child, &mut group.children);
-            Self::stamp_fill(child, &mut group.children[opened..]);
+            // a kept boundary promised from its reference wears the fill
+            // its record kept: its tree is not read again to ask
+            match (child, self.promised_fill.take()) {
+                (LayoutNode::BoundaryRef { .. }, Some(fill)) => {
+                    if fill {
+                        for promised in &mut group.children[opened..] {
+                            if let Some(layout) = promised.layout.as_mut() {
+                                layout.fill = true;
+                            }
+                        }
+                    }
+                }
+                _ => Self::stamp_fill(child, &mut group.children[opened..]),
+            }
         }
         self.runs_below = outer_runs;
         Self::inherit_stretch(&mut group);
@@ -1333,7 +1392,8 @@ impl Walk<'_> {
         self.groups_out.push((
             std::rc::Rc::clone(path),
             GroupRecord {
-                env: key,
+                env,
+                fill: LayoutNode::boundary_is_flexible(children, Axis::Vertical, None),
                 own_stretch,
                 own_class: group.hints.class.clone(),
                 class_binding,
@@ -1622,6 +1682,33 @@ mod tests {
         }
     }
 
+    /// Groups lowered one after the other in one environment file one
+    /// record of it, shared — the record of each row is one line of the
+    /// table — and a group lowered in another environment files its own.
+    #[test]
+    fn groups_lowered_in_one_environment_share_its_record() {
+        let offsets = HashMap::default();
+        let boundary = |name: &str| LayoutNode::Boundary {
+            path: std::rc::Rc::from(name),
+            children: vec![text_node(name)],
+            quiet: Default::default(),
+        };
+        let pressed = LayoutNode::Interactive { path: std::rc::Rc::from("press"), child: Box::new(boundary("d")) };
+        let tree = LayoutNode::Stack {
+            axis: Axis::Vertical,
+            spacing: 0.0,
+            align: CrossAlign::Start,
+            children: vec![boundary("a"), boundary("b"), boundary("c"), pressed],
+            hints: Default::default(),
+            action: None,
+        };
+        let groups = lower(&tree, &env_fixture(&offsets)).groups;
+        let env = |name: &str| &groups.iter().find(|(path, _)| &**path == name).expect("a record").1.env;
+        assert!(std::rc::Rc::ptr_eq(env("a"), env("b")) && std::rc::Rc::ptr_eq(env("b"), env("c")), "one record");
+        assert!(!std::rc::Rc::ptr_eq(env("c"), env("d")), "the pressed group's environment is its own");
+        assert_ne!(**env("c"), **env("d"));
+    }
+
     /// The inline tags are the twenty they were — and the tags of a
     /// table, a block, a list item and nothing at all are none of them.
     #[test]
@@ -1676,6 +1763,8 @@ mod tests {
             islands_walked: Vec::new(),
             runs_below: true,
             last_face: None,
+            last_env: None,
+            promised_fill: None,
         };
         assert!(walk.lowers_in(&walk.flow_key()), "a walk holds its own key");
         let moves: [(&str, fn(&mut Walk)); 11] = [
@@ -2222,6 +2311,64 @@ mod tests {
             "the row that ran shows its new words: {patches:?}"
         );
         assert_eq!(moves(&patches), 2, "{patches:?}");
+    }
+
+    /// A kept row is promised from its reference, its tree unread, and
+    /// its promise wears the fill its group's loop stamped when the row
+    /// was lowered: a row that takes its offer down the list keeps
+    /// taking it, and one that does not keeps not taking it — a swap of
+    /// two rows in either list is moves and nothing else, every row kept.
+    #[test]
+    fn a_row_promised_from_its_reference_keeps_the_fill_it_was_stamped() {
+        use crate::prelude::*;
+
+        /// Takes its offer down the column: its tree is one spacer.
+        #[derive(Clone, Copy)]
+        struct Tall;
+
+        impl Component for Tall {
+            fn body(self, _ctx: &Context) -> impl View {
+                spacer()
+            }
+        }
+
+        /// Sized by its words.
+        #[derive(Clone, Copy)]
+        struct Short(usize);
+
+        impl Component for Short {
+            fn body(self, _ctx: &Context) -> impl View {
+                text(format!("row {}", self.0))
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Column {
+            ids: State<std::rc::Rc<Vec<usize>>>,
+            tall: bool,
+        }
+
+        impl Component for Column {
+            fn body(self, _ctx: &Context) -> impl View {
+                let tall = self.tall;
+                for_each(self.ids, |id| id.to_string(), move |id| if tall { Either::First(Tall) } else { Either::Second(Short(*id)) })
+            }
+        }
+
+        let size = crate::layout::Size { width: 400.0, height: 300.0 };
+        for tall in [true, false] {
+            let column = Column { ids: State::new(std::rc::Rc::new(vec![1, 2, 3, 4, 5])), tall };
+            let runtime = crate::runtime::Runtime::new();
+            let _ = runtime.dom_frame(&column, size);
+            let _ = crate::stats::take();
+            column.ids.set(std::rc::Rc::new(vec![1, 4, 3, 2, 5]));
+            let patches = runtime.dom_frame(&column, size);
+            assert_eq!(crate::stats::take().diff_reused, 5, "every row kept (tall {tall}): {patches:?}");
+            assert!(
+                !patches.is_empty() && patches.iter().all(|p| matches!(p, crate::dom::DomPatch::Move { .. })),
+                "moves and nothing else (tall {tall}): {patches:?}"
+            );
+        }
     }
 
     /// A row's `.element("tr")` rides the reference to the row's kept
