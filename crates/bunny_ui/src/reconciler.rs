@@ -1987,14 +1987,13 @@ fn drop_entries<P: AsRef<str>>(paths: &[P]) {
                 let mut graveyard = graveyard.borrow_mut();
                 let buried = graveyard.len();
                 for path in paths {
-                    let path: &str = path.as_ref();
-                    if let Some(entry) = retained.remove(path) {
-                        live.unindex_leaving(path, &entry);
+                    if let Some((path, entry)) = retained.remove_entry(path.as_ref()) {
+                        live.unindex_leaving(&path, &entry);
                         // a view that left owes the read graph nothing
                         // more: its reads fall with it, and its bindings
                         // hear no write from here. Unpicking their reads
                         // waits for the idle, with the entry's memory
-                        motor::identity::retire_view(path);
+                        motor::identity::retire_view(&path);
                         // the entry's memory — a layout tree, a value, the
                         // bindings' objects — is freed when the page is
                         // idle, not inside the frame that let it go
