@@ -221,6 +221,52 @@ function forgetClone(root) {
   const at = cloneAt(root);
   if (at >= 0 && cloneRoots[at][0] === root) cloneRoots.splice(at, 1);
 }
+
+// A member is found by its offset only while the clone keeps its
+// template's shape. An op about to change that shape — an element
+// born, moved or removed inside the clone — registers every member
+// first, by the trail that still holds, and the clone stops being one.
+function settleClone(at) {
+  const [root, size, template] = cloneRoots[at];
+  const rootEl = elements.get(root);
+  if (rootEl) {
+    const trails = trailsOf(template, rootEl);
+    for (let k = 1; k < size; k++) {
+      let el = rootEl;
+      const trail = trails[k];
+      for (let i = 0; i < trail.length && el; i++) el = el.children[trail[i]];
+      if (!el) continue;
+      el.__n = root + k;
+      elements.set(root + k, el);
+    }
+    delete rootEl.__members;
+  }
+  cloneRoots.splice(at, 1);
+}
+
+// the clone `id` belongs to, member or root, as an index into the roots
+function cloneHolding(id) {
+  if (cloneRoots.length === 0) return -1;
+  const at = cloneAt(id);
+  if (at < 0) return -1;
+  return id - cloneRoots[at][0] < cloneRoots[at][1] ? at : -1;
+}
+
+// the children of `id` are about to change
+function settleInside(id) {
+  const known = elements.get(id);
+  if (known !== undefined && known.__members === undefined) return;
+  const at = cloneHolding(id);
+  if (at >= 0) settleClone(at);
+}
+
+// the element `id` itself is about to move or leave: only a member's
+// leaving changes a clone (a root leaves with its range)
+function settleMember(id) {
+  if (elements.get(id) !== undefined) return;
+  const at = cloneHolding(id);
+  if (at >= 0) settleClone(at);
+}
 // The looks the page wears: one rule per distinct look, inserted once
 // and never removed. An element wears a look by CLASS, so a thousand
 // rows that look alike share one rule — and the browser shares their
@@ -839,6 +885,7 @@ function applyPatches(view, length) {
   // (it may still sit in a staged fragment), or appended — staged when
   // the parent is live, so a thousand rows reach the tree once
   const place = (el, parent, before) => {
+    settleInside(parent);
     const home = lookup(parent);
     if (!home) return;
     const anchor = before ? lookup(before) : null;
@@ -917,6 +964,7 @@ function applyPatches(view, length) {
           const templateId = source.__n;
           const trails = trailsOf(templateId, source);
           el.__n = id;
+          el.__members = trails.length;
           elements.set(id, el);
           cloneRoots.push([id, trails.length, templateId]);
         }
@@ -941,6 +989,7 @@ function applyPatches(view, length) {
       const raw = bytes(u32());
       if (el) setWords(el, decoder.decode(raw));
     } else if (op === 2) {
+      settleMember(id);
       const el = lookup(id);
       if (el) {
         unregister(el);
@@ -953,6 +1002,7 @@ function applyPatches(view, length) {
       // ids that leave come as ranges — a thousand rows mounted
       // together are one — so the registry forgets them by counting,
       // never by walking the subtree
+      settleInside(id);
       const el = lookup(id);
       const ranges = u16();
       const spans = [];
@@ -1191,8 +1241,11 @@ function applyPatches(view, length) {
       }
     } else if (op === 12) {
       // one insertBefore, identity intact (0 = to the end)
+      settleMember(id);
       const el = lookup(id);
-      const parent = lookup(u32());
+      const parentId = u32();
+      settleInside(parentId);
+      const parent = lookup(parentId);
       const before = u32();
       if (el && parent) parent.insertBefore(el, before ? (lookup(before) ?? null) : null);
     } else if (op === 13) {
