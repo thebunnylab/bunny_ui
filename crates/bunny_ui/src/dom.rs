@@ -6704,6 +6704,36 @@ mod tests {
         );
     }
 
+    /// A string crosses as its count of bytes and then its UTF-8, and
+    /// the glue reads a short one of ASCII a byte at a time, each byte
+    /// being its char. That reading agrees with the decoder's only while
+    /// the count is of BYTES and the loop gives up at the first byte from
+    /// 0x80 up, leaving the whole string to the decoder; and the words
+    /// op must step over the bytes of an element it cannot find, or
+    /// every op after it reads from the middle of a string. The engine's
+    /// half is pinned on the wire, the glue's in its source.
+    #[test]
+    fn a_string_crosses_as_bytes_and_only_ascii_passes_the_decoder_by() {
+        // "é" is two bytes and one char: the count says three
+        let wire = encode(&[DomPatch::SetContent { id: 7, text: Arc::from("é1") }]);
+        assert_eq!(&wire[4..], &[20, 7, 0, 0, 0, 3, 0, 0, 0, 0xc3, 0xa9, b'1']);
+
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        for (line, why) in [
+            ("if (count === 0) return \"\";", "an empty string takes no view and no decoder"),
+            ("if (byte >= 0x80) break;", "a byte from 0x80 up hands the string to the decoder"),
+            ("return decoder.decode(bytes(count));", "the decoder reads what the loop gives up"),
+        ] {
+            assert!(glue.contains(line), "glue_dom.js: {why}");
+        }
+        let words = glue.find("} else if (op === 20) {").expect("the glue reads the words op");
+        let next = glue[words + 1..].find("} else if (op ===").map_or(glue.len(), |at| words + 1 + at);
+        assert!(
+            glue[words..next].contains("at += count;"),
+            "glue_dom.js: the words op steps over the bytes of an element it cannot find"
+        );
+    }
+
     /// The shell declares its imports in Rust (`#[link(wasm_import_module
     /// = "./bunny.js")]` and `"./bunny_gpu.js"`); every glue must answer
     /// each one, or the module fails to instantiate with a `LinkError`
