@@ -68,6 +68,11 @@ struct Registry {
     /// LENGTH of `joined`: the path of an open view is a prefix of the
     /// cursor's, so a view that opens costs a number, not a copy.
     views: Vec<usize>,
+    /// Beside each open view, the shared copy of its path, once its body
+    /// is known to run ([`begin_view_reads`]): the one copy the retention
+    /// keys the boundary by, which the bindings the body makes are filed
+    /// under instead of a copy of their own.
+    view_keys: Vec<Option<Rc<str>>>,
     /// The buffer a key derived from the cursor is spelled in before it
     /// becomes shared — one allocation per key, never one per step.
     key_scratch: String,
@@ -116,8 +121,10 @@ struct Registry {
     /// The bindings a write reached since the last frame took them.
     dirty_bindings: HashSet<Rc<str>>,
     /// view → the bindings its body made. A body that re-runs makes them
-    /// again; one that dies takes them along.
-    view_bindings: HashMap<String, Vec<Rc<str>>>,
+    /// again; one that dies takes them along. Keyed by the view's shared
+    /// path: a row that mounts files its bindings under the copy its
+    /// boundary already holds, and one that leaves frees no string.
+    view_bindings: HashMap<Rc<str>, Vec<Rc<str>>>,
 }
 
 impl Registry {
@@ -176,6 +183,7 @@ pub fn begin_pass() {
         registry.joined.clear();
         registry.joined_lens.clear();
         registry.views.clear();
+        registry.view_keys.clear();
         registry.pass_no += 1;
         registry.skipped.clear();
         registry.reran.clear();
@@ -578,6 +586,7 @@ impl Drop for Frame {
             registry.joined.truncate(depth);
             if self.pops_view {
                 registry.views.pop();
+                registry.view_keys.pop();
             }
         });
     }
@@ -613,6 +622,7 @@ fn push(spell: impl FnOnce(&mut String), is_view: bool) -> Frame {
         }
         if is_view {
             registry.views.push(registry.joined.len());
+            registry.view_keys.push(None);
         }
         Frame { pops_view: is_view, active: true }
     })
@@ -796,10 +806,17 @@ pub(crate) fn fulfill_anchor(token: AnchorToken, index: usize, generation: u32, 
 // MARK: - Read graph
 
 /// This view's body is about to (re)run: its old reads fall away — the new
-/// set is whatever the body records now.
-pub fn begin_view_reads(view: &str) {
+/// set is whatever the body records now. `view` is the innermost open
+/// view's path, shared: the bindings its body makes are filed under it.
+pub fn begin_view_reads(view: &Rc<str>) {
     REGISTRY.with(|registry| {
-        clear_view_reads(&mut registry.borrow_mut(), view);
+        let mut registry = registry.borrow_mut();
+        clear_view_reads(&mut registry, view);
+        let registry = &mut *registry;
+        if let (Some(len), Some(key)) = (registry.views.last(), registry.view_keys.last_mut()) {
+            debug_assert_eq!(&registry.joined[..*len], &**view, "the view whose body runs is the innermost one open");
+            *key = Some(Rc::clone(view));
+        }
     });
 }
 
@@ -872,7 +889,7 @@ pub fn begin_binding(key: &Rc<str>, owner: Option<&str>) -> BindingScope {
             match registry.view_bindings.get_mut(owner) {
                 Some(bindings) => bindings.push(Rc::clone(key)),
                 None => {
-                    registry.view_bindings.insert(owner.to_string(), vec![Rc::clone(key)]);
+                    registry.view_bindings.insert(Rc::from(owner), vec![Rc::clone(key)]);
                 }
             }
         }
@@ -894,7 +911,13 @@ pub fn begin_binding_under_view(key: &Rc<str>) -> BindingScope {
             match registry.view_bindings.get_mut(owner) {
                 Some(bindings) => bindings.push(Rc::clone(key)),
                 None => {
-                    registry.view_bindings.insert(owner.to_string(), vec![Rc::clone(key)]);
+                    // the body's own boundary handed its shared path over
+                    // when it began; a view with no retention spells one
+                    let owner = match registry.view_keys.last() {
+                        Some(Some(shared)) => Rc::clone(shared),
+                        _ => Rc::from(owner),
+                    };
+                    registry.view_bindings.insert(owner, vec![Rc::clone(key)]);
                 }
             }
         }
@@ -1108,6 +1131,46 @@ mod tests {
         assert_eq!(seed, ["[top]", "", "[a/b]", "[]"]);
         assert_eq!(root.as_deref(), Some("[top]"));
         assert_eq!(walk(true), walk(false), "a key in place is the bracketed string, entered");
+    }
+
+    /// A body's bindings are filed under the view that made them, and the
+    /// key is the very path its boundary shares — no copy is spelled for
+    /// it, so a row that mounts allocates none and one that leaves frees
+    /// none. A view that never handed its path over (no retention ran its
+    /// body) still files them, under a copy of its own.
+    #[test]
+    fn a_view_files_its_bindings_under_the_path_its_boundary_shares() {
+        use super::{begin_binding_under_view, begin_pass, begin_view_reads, cursor_key, end_pass, enter_view, REGISTRY};
+        use std::rc::Rc;
+
+        let filed_under = |view: &str| {
+            REGISTRY.with(|registry| {
+                registry.borrow().view_bindings.get_key_value(view).map(|(key, bindings)| (Rc::clone(key), bindings.len()))
+            })
+        };
+        begin_pass();
+        let shared: Rc<str> = Rc::from("Shared");
+        {
+            let _view = enter_view("Shared");
+            begin_view_reads(&shared);
+            let key = cursor_key("#text").expect("inside a pass");
+            drop(begin_binding_under_view(&key));
+            let again = cursor_key("#class").expect("inside a pass");
+            drop(begin_binding_under_view(&again));
+        }
+        {
+            let _view = enter_view("Spelled");
+            let key = cursor_key("#text").expect("inside a pass");
+            drop(begin_binding_under_view(&key));
+        }
+        let _ = end_pass();
+        let (key, count) = filed_under("Shared").expect("the bindings are filed");
+        assert!(Rc::ptr_eq(&key, &shared), "filed under the boundary's own path");
+        assert_eq!(count, 2);
+        let (spelled, count) = filed_under("Spelled").expect("filed without a shared path too");
+        assert_eq!(&*spelled, "Spelled");
+        assert_eq!(count, 1);
+        super::reset_world();
     }
 
     use super::named_chain;
