@@ -170,6 +170,16 @@ impl Env {
         (!raw.is_null()).then_some(Env { raw })
     }
 
+    /// The env a native method was handed — valid for that call, on that
+    /// thread.
+    ///
+    /// # Safety
+    ///
+    /// `raw` is a live `JNIEnv*` of the calling thread.
+    pub unsafe fn from_raw(raw: *mut c_void) -> Env {
+        Env { raw: raw.cast() }
+    }
+
     /// The activity instance.
     pub fn activity(&self) -> JObject {
         ACTIVITY.with(Cell::get)

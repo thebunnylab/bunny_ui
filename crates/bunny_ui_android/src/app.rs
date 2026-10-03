@@ -162,6 +162,15 @@ impl App {
         }
     }
 
+    /// Hands the system the app's commands the way Android lists them: a
+    /// phone has no menu bar, and with a hardware keyboard Meta+/ opens the
+    /// Keyboard Shortcuts Helper, which the app's activity answers from the
+    /// groups kept here ([`crate::shortcuts`], [`crate::keyboard_shortcuts!`]).
+    /// Call it again when the keys behind the items change.
+    pub fn set_menu_bar(&self, bar: &bunny_ui::menu::MenuBar) {
+        crate::shortcuts::keep(bar);
+    }
+
     /// A runtime for the window — named for its own scene.
     pub fn runtime(&self) -> Runtime {
         let seq = self.inner.scenes.get();
