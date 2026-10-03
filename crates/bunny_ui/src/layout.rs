@@ -987,7 +987,7 @@ pub enum LayoutNode {
     /// reconciler. Hover and pressed do NOT live here — placement
     /// consults the env's [`FrameStamp`] by `path` (pointer state never
     /// sticks to a tree).
-    Interactive { path: String, child: Box<LayoutNode> },
+    Interactive { path: Rc<str>, child: Box<LayoutNode> },
     /// `.hover_group()` — the subtree can paint by THIS box's pointer
     /// state instead of by its own nearest target. The group is hovered
     /// while the hovered target is the group's path or anything under
@@ -5507,7 +5507,7 @@ impl LayoutNode {
                     None => Some(frame),
                 };
                 if let Some(visible) = visible {
-                    out.hits.push((path.clone(), visible));
+                    out.hits.push((path.to_string(), visible));
                 }
                 out.fields.push(FieldPlacement {
                     path: path.clone(),
@@ -5587,7 +5587,7 @@ impl LayoutNode {
                         frame.intersection(clip)
                     });
                     visible.map(|visible| {
-                        out.hits.push((path.clone(), visible));
+                        out.hits.push((path.to_string(), visible));
                         out.customs.push(CustomPlacement {
                             path: path.clone(),
                             frame,
@@ -6669,7 +6669,7 @@ impl LayoutNode {
                     None => Some(frame),
                 };
                 let hit_index = visible.map(|visible| {
-                    out.hits.push((path.clone(), visible));
+                    out.hits.push((path.to_string(), visible));
                     out.hits.len() - 1
                 });
                 out.pointer_hit.push(hit_index);
@@ -6677,9 +6677,9 @@ impl LayoutNode {
                 // with the pointer inside the target (AppKit semantics:
                 // dragging out releases, coming back re-arms)
                 let hovered =
-                    env.stamp.interaction.hovered.as_deref() == Some(path.as_str());
+                    env.stamp.interaction.hovered.as_deref() == Some(&**path);
                 let pressed = hovered
-                    && env.stamp.interaction.pressed.as_deref() == Some(path.as_str());
+                    && env.stamp.interaction.pressed.as_deref() == Some(&**path);
                 out.pointer.push((hovered, pressed));
                 if let Some(dom) = out.dom.as_mut() {
                     // the styled below takes the path: the glue posts
@@ -9271,7 +9271,7 @@ mod tests {
     #[test]
     fn hits_outside_the_viewport_do_not_exist() {
         let interactive = |path: &str| LayoutNode::Interactive {
-            path: path.to_string(),
+            path: Rc::from(path),
             child: Box::new(text(4)),
         };
         let root = LayoutNode::Scroll {
@@ -9423,7 +9423,7 @@ mod tests {
         // different stamps must give identical frames (the LAW, now by
         // type)
         let node = LayoutNode::Interactive {
-            path: "button".to_string(),
+            path: Rc::from("button"),
             child: Box::new(styled(
                 VisualProps {
                     background: Some(Color::hex(0x111111)),
@@ -9462,7 +9462,7 @@ mod tests {
     #[test]
     fn pressed_beats_hovered() {
         let root = LayoutNode::Interactive {
-            path: "button".to_string(),
+            path: Rc::from("button"),
             child: Box::new(styled(
                 VisualProps {
                     background: Some(Color::hex(0x111111)),

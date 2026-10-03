@@ -904,7 +904,7 @@ impl Walk<'_> {
                 }
             }
             LayoutNode::Interactive { path, child } => {
-                self.pending_interactive = Some(std::rc::Rc::from(path.as_str()));
+                self.pending_interactive = Some(std::rc::Rc::clone(path));
                 self.lower_into(child, out);
                 self.pending_interactive = None;
             }

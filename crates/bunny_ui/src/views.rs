@@ -154,10 +154,10 @@ where
         // inside a pass, the button is an interaction target: the frame joins
         // the hit-test under the identity path, and the action stays registered
         // in the reconciler (retained like the effects — skipped view, live button)
-        match motor::identity::cursor_scope() {
+        match motor::identity::cursor_scope_rc() {
             Some(path) => {
                 let action = self.action.clone();
-                crate::reconciler::attribute_action(path.clone(), Rc::new(move |_| action()));
+                crate::reconciler::attribute_action(Rc::clone(&path), Rc::new(move |_| action()));
                 out.push_layout(LayoutNode::Interactive {
                     path,
                     child: Box::new(chrome),
