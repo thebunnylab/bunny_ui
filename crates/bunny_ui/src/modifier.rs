@@ -24,7 +24,7 @@ use crate::erased::CustomModifier;
 use crate::layout::{Color, CrossAlign, Edges, LayoutNode, TextHighlight, Truncation, VisualProps};
 use crate::text_engine::{FontDesign, FontPatch, FontSpec, Tracking, Weight};
 use crate::state_ext::BindingExt;
-use crate::view::{NodeList, Single, View};
+use crate::view::{NodeList, Single, View, wrap_in_place};
 use crate::views::{Alignment, wrap_layout};
 use motor::views::{ContentMode, Edge, Font, ListStyle, ProgressViewStyle, TextAlignment};
 
@@ -705,57 +705,60 @@ fn rewrite_text_node(
 /// the sum and the chain of `.padding_edge(...)` calls stops paying one
 /// box per edge.
 fn wrap_padding(out: &mut NodeList, mark: usize, edges: Edges) {
-    out.wrap_layout_from(mark, |node| match node {
-        LayoutNode::Padding { edges: inner, child } => LayoutNode::Padding {
-            edges: Edges {
-                top: inner.top + edges.top,
-                bottom: inner.bottom + edges.bottom,
-                leading: inner.leading + edges.leading,
-                trailing: inner.trailing + edges.trailing,
-            },
-            child,
-        },
-        node => LayoutNode::Padding { edges, child: Box::new(node) },
-    });
+    match out.base_from(mark) {
+        // a padding over a padding adds to it, where it stands
+        LayoutNode::Padding { edges: inner, .. } => {
+            inner.top += edges.top;
+            inner.bottom += edges.bottom;
+            inner.leading += edges.leading;
+            inner.trailing += edges.trailing;
+        }
+        node => wrap_in_place(node, |node| LayoutNode::Padding { edges, child: Box::new(node) }),
+    }
 }
 
 fn wrap_styled(out: &mut NodeList, mark: usize, delta: VisualProps) {
-    out.wrap_layout_from(mark, |node| match node {
+    match out.base_from(mark) {
         // a style that wears hints or an action stood behind their
         // wrapper, where no style reached it to merge: the new one
-        // nests, as it did
-        LayoutNode::Styled { props, child, hints, action: None } if hints.is_empty() => {
-            LayoutNode::Styled {
-                props: VisualProps::restyled(props, delta),
-                child,
-                hints,
-                action: None,
-            }
+        // nests, as it did. One that merges merges where it stands
+        LayoutNode::Styled { props, hints, action: None, .. } if hints.is_empty() => {
+            VisualProps::restyle(props, delta);
         }
-        other => LayoutNode::Styled {
+        node => wrap_in_place(node, |other| LayoutNode::Styled {
             props: delta.shared(),
             child: Box::new(other),
             hints: Default::default(),
             action: None,
-        },
-    });
+        }),
+    }
 }
 
 /// Makes what the base left the target of `path`. A stack, a text or a
-/// style with no action of its own carries it: the links of a row are
-/// armed in every body it runs, and a box around each was an allocation
-/// per action per row. Anything else — and a node that already answers
-/// another action — is wrapped in an `Interactive`, as it always was.
+/// style with no action of its own carries it, written where the node
+/// stands: the links of a row are armed in every body it runs, and a box
+/// around each was an allocation per action per row. Anything else — and
+/// a node that already answers another action — is wrapped in an
+/// `Interactive`, as it always was.
 fn arm_target(out: &mut NodeList, mark: usize, path: Rc<str>) {
-    out.wrap_layout_from(mark, |mut node| {
-        if let Some(action) = node.carried_action_mut()
-            && action.is_none()
-        {
-            *action = Some(path);
-            return node;
+    let base = out.base_from(mark);
+    if let Some(action) = base.carried_action_mut()
+        && action.is_none()
+    {
+        *action = Some(path);
+        return;
+    }
+    wrap_in_place(base, |node| LayoutNode::Interactive { path, child: Box::new(node) });
+}
+
+/// A hint's words written over the ones a node holds: the outer word
+/// wins where both speak, as it does over a hint.
+fn hint_over(words: [&mut Option<Rc<str>>; 3], outer: [&Option<Rc<str>>; 3]) {
+    for (word, outer) in words.into_iter().zip(outer) {
+        if outer.is_some() {
+            word.clone_from(outer);
         }
-        LayoutNode::Interactive { path, child: Box::new(node) }
-    });
+    }
 }
 
 /// The modified view — Swift's `ModifiedContent` with the modifier inline.
@@ -1680,46 +1683,35 @@ fn apply(
             });
         }
         Modifier::ElementHint(tag, class, dom_id) => {
-            let (tag, class, dom_id) = (tag.clone(), class.clone(), dom_id.clone());
-            out.wrap_layout_from(mark, move |mut node| {
-                // a hint over a stack, a text or a style rides the node
-                // itself: the cells, links and glyphs of a row hint in
-                // every body it runs, and a box around each was an
-                // allocation per hint per row. The outer word wins, as
-                // it does over a hint
-                if let Some(hints) = node.carried_hints_mut() {
-                    hints.tag = tag.or(hints.tag.take());
-                    hints.class = class.or(hints.class.take());
-                    hints.dom_id = dom_id.or(hints.dom_id.take());
-                    return node;
+            // every hint that folds is written where the node stands: a
+            // row hints a dozen times in every body it runs, and nothing
+            // of it moves for one
+            let outer = [tag, class, dom_id];
+            match out.base_from(mark) {
+                // a hint over a hint is one hint: the outer word wins
+                // where both speak, as the flow applies them anyway —
+                // `.element("a").css_class("x")` is one node, not two
+                LayoutNode::Hinted { tag, class, dom_id, .. } => hint_over([tag, class, dom_id], outer),
+                // a hint over a kept boundary rides the reference itself:
+                // a list that re-runs makes one per row, and a box around
+                // each was an allocation per row per run
+                LayoutNode::BoundaryRef { hints, .. } => {
+                    hint_over([&mut hints.tag, &mut hints.class, &mut hints.dom_id], outer);
                 }
-                match node {
-                    // a hint over a hint is one hint: the outer word wins
-                    // where both speak, as the flow applies them anyway —
-                    // `.element("a").css_class("x")` is one node, not two
-                    LayoutNode::Hinted { tag: inner_tag, class: inner_class, dom_id: inner_id, child } => {
-                        LayoutNode::Hinted {
-                            tag: tag.or(inner_tag),
-                            class: class.or(inner_class),
-                            dom_id: dom_id.or(inner_id),
-                            child,
-                        }
-                    }
-                    // a hint over a kept boundary rides the reference itself:
-                    // a list that re-runs makes one per row, and a box around
-                    // each was an allocation per row per run
-                    LayoutNode::BoundaryRef { path, slot, hints } => LayoutNode::BoundaryRef {
-                        path,
-                        slot,
-                        hints: crate::layout::ElementHints {
-                            tag: tag.or(hints.tag),
-                            class: class.or(hints.class),
-                            dom_id: dom_id.or(hints.dom_id),
-                        },
-                    },
-                    other => LayoutNode::Hinted { tag, class, dom_id, child: Box::new(other) },
-                }
-            });
+                node => match node.carried_hints_mut() {
+                    // a hint over a stack, a text or a style rides the node
+                    // itself: the cells, links and glyphs of a row hint in
+                    // every body it runs, and a box around each was an
+                    // allocation per hint per row
+                    Some(hints) => hint_over([&mut hints.tag, &mut hints.class, &mut hints.dom_id], outer),
+                    None => wrap_in_place(node, |other| LayoutNode::Hinted {
+                        tag: tag.clone(),
+                        class: class.clone(),
+                        dom_id: dom_id.clone(),
+                        child: Box::new(other),
+                    }),
+                },
+            }
         }
         Modifier::LayoutMode(mode) => {
             // Auto is what every target does already; only Exact asks

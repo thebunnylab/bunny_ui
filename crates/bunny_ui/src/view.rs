@@ -102,6 +102,17 @@ pub(crate) fn set_print(enabled: bool) {
     PRINT.with(|print| print.set(enabled));
 }
 
+/// Wraps a node where it stands: the node leaves its slot for `wrap`,
+/// and what `wrap` makes takes the slot. A unit node holds the place
+/// meanwhile; the list around it never shifts.
+pub(crate) fn wrap_in_place(
+    slot: &mut crate::layout::LayoutNode,
+    wrap: impl FnOnce(crate::layout::LayoutNode) -> crate::layout::LayoutNode,
+) {
+    let node = std::mem::replace(slot, crate::layout::LayoutNode::Spacer);
+    *slot = wrap(node);
+}
+
 /// A box of nothing: zero on both axes, no paint, no hit — what a
 /// modifier wraps when the view below it has no geometry at all.
 fn nothing_node() -> crate::layout::LayoutNode {
@@ -183,18 +194,29 @@ impl NodeList {
     /// box — SwiftUI's own answer, where the frame IS a view and
     /// `EmptyView` merely fills none of it. Bare `empty()` still
     /// contributes nothing to a stack: only a modifier mints the box.
+    ///
+    /// The node is wrapped where it stands ([`wrap_in_place`]), never
+    /// removed from the list and inserted again: a row's every modifier
+    /// does this.
     pub(crate) fn wrap_layout_from(
         &mut self,
         mark: usize,
         wrap: impl FnOnce(crate::layout::LayoutNode) -> crate::layout::LayoutNode,
     ) {
-        let base = if self.layout.len() > mark {
-            self.layout.remove(mark)
-        } else {
-            nothing_node()
-        };
-        self.room_for_first();
-        self.layout.insert(mark, wrap(base));
+        wrap_in_place(self.base_from(mark), wrap);
+    }
+
+    /// The node the base contributed since `mark`, where it stands — or,
+    /// when it left none, the box of nothing a modifier wraps, put in its
+    /// place ([`NodeList::wrap_layout_from`]). A modifier that folds into
+    /// the node itself — a hint or an action it carries, a padding over a
+    /// padding — writes it here, and nothing moves.
+    pub(crate) fn base_from(&mut self, mark: usize) -> &mut crate::layout::LayoutNode {
+        if self.layout.len() <= mark {
+            self.room_for_first();
+            self.layout.push(nothing_node());
+        }
+        &mut self.layout[mark]
     }
 
     /// A retained boundary: enters as a reference (the marked line in the
@@ -686,6 +708,100 @@ mod tests {
         assert_eq!(len, 5);
         assert!(capacity >= 5, "a tuple inside a tuple grows past the count it kept: {capacity}");
         assert_eq!(room(&|out| vec![text("a"), text("b"), text("c")].render_into(&ctx, out)), (3, 3));
+    }
+
+    /// A modifier that folds into the node its base left writes it where
+    /// it stands, and the tree is the one a wrap made: the outer hint wins
+    /// a word both say, over a text, a hint, a style or a box of nothing;
+    /// paddings add; a style merges into a style that wears nothing of its
+    /// own and nests around one that does; a sibling the base did not
+    /// leave is never touched.
+    #[test]
+    fn a_fold_writes_the_node_where_it_stands() {
+        use crate::ext::ViewExt as _;
+        use crate::layout::{Edges, LayoutNode};
+        let ctx = Context::default();
+        let tree = |view: &dyn Fn(&mut NodeList)| {
+            let mut out = NodeList::new();
+            view(&mut out);
+            out.take_layout()
+        };
+        let words = |hints: &crate::layout::ElementHints| {
+            [&hints.tag, &hints.class, &hints.dom_id].map(|word| word.as_deref().map(str::to_string))
+        };
+        let said = |words: [Option<&str>; 3]| words.map(|word| word.map(str::to_string));
+
+        let text_hinted = tree(&|out| {
+            text("a").element("td").css_class("x").element("th").render_into(&ctx, out)
+        });
+        let [LayoutNode::Text { hints, .. }] = text_hinted.as_slice() else {
+            panic!("one text: {text_hinted:#?}");
+        };
+        assert_eq!(words(hints), said([Some("th"), Some("x"), None]));
+
+        let nothing = tree(&|out| crate::views::empty().element("td").render_into(&ctx, out));
+        let [LayoutNode::Stack { children, hints, .. }] = nothing.as_slice() else {
+            panic!("a box of nothing: {nothing:#?}");
+        };
+        assert!(children.is_empty());
+        assert_eq!(words(hints), said([Some("td"), None, None]));
+
+        let hinted = tree(&|out| {
+            text("a").frame_width(10.0).element("td").css_class("x").element_id("i").css_class("y").render_into(&ctx, out)
+        });
+        let [LayoutNode::Hinted { tag, class, dom_id, child }] = hinted.as_slice() else {
+            panic!("one hint around the frame: {hinted:#?}");
+        };
+        assert!(matches!(**child, LayoutNode::Frame { .. }), "{hinted:#?}");
+        assert_eq!(
+            [tag, class, dom_id].map(|word| word.as_deref().map(str::to_string)),
+            said([Some("td"), Some("y"), Some("i")])
+        );
+
+        let padded = tree(&|out| {
+            text("a")
+                .padding_edge(motor::views::Edge::Top, 3.0)
+                .padding_edge(motor::views::Edge::Bottom, 5.0)
+                .padding_length(1.0)
+                .render_into(&ctx, out)
+        });
+        let [LayoutNode::Padding { edges, child }] = padded.as_slice() else {
+            panic!("one padding: {padded:#?}");
+        };
+        assert_eq!(*edges, Edges { top: 4.0, bottom: 6.0, leading: 1.0, trailing: 1.0 });
+        assert!(matches!(**child, LayoutNode::Text { .. }));
+
+        let (ink, paper) = (crate::layout::Color::hex(0x336699), crate::layout::Color::hex(0x112233));
+        let styled = tree(&|out| text("a").foreground_color(ink).background_color(paper).render_into(&ctx, out));
+        let [LayoutNode::Styled { props, child, .. }] = styled.as_slice() else {
+            panic!("one style: {styled:#?}");
+        };
+        assert_eq!((props.foreground, props.background), (Some(ink), Some(paper)));
+        assert!(matches!(**child, LayoutNode::Text { .. }));
+
+        // a style that wears a hint takes the next hint, and nests the
+        // next style around it
+        let worn = tree(&|out| {
+            text("a").background_color(paper).css_class("x").foreground_color(ink).render_into(&ctx, out)
+        });
+        let [LayoutNode::Styled { props: outer, child, hints: none, .. }] = worn.as_slice() else {
+            panic!("a style around a style: {worn:#?}");
+        };
+        let LayoutNode::Styled { props: inner, hints, .. } = &**child else {
+            panic!("a style around a style: {worn:#?}");
+        };
+        assert!(none.is_empty());
+        assert_eq!((outer.foreground, outer.background), (Some(ink), None));
+        assert_eq!((inner.foreground, inner.background), (None, Some(paper)));
+        assert_eq!(words(hints), said([None, Some("x"), None]));
+
+        let siblings = tree(&|out| (text("a"), text("b").element("td")).render_into(&ctx, out));
+        let [LayoutNode::Text { hints: first, .. }, LayoutNode::Text { hints: second, .. }] = siblings.as_slice()
+        else {
+            panic!("two texts: {siblings:#?}");
+        };
+        assert!(first.is_empty(), "the sibling before the base is not the base's");
+        assert_eq!(words(second), said([Some("td"), None, None]));
     }
 
     /// How many times a component's payload is re-materialized per
