@@ -96,6 +96,7 @@ pub(crate) struct FlowKey {
     group: Option<u64>,
     in_overlay: bool,
     slot: (Option<Px>, Option<Px>),
+    unbounded: bool,
 }
 
 /// What the lowering keeps of a group: the key it was lowered under,
@@ -140,6 +141,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         pending_tooltip: None,
         groups: Vec::new(),
         overlay_depth: 0,
+        unbounded: false,
         drops_seen: 0,
         overlays: Vec::new(),
         display: crate::layout::DisplayList::default(),
@@ -275,6 +277,12 @@ struct Walk<'a> {
     /// How deep inside an overlay LAYER the walk is: what a layer
     /// paints is decoration until something in it asks to be a target.
     overlay_depth: usize,
+    /// The walk is inside a scroller's content, down the axis it
+    /// scrolls, with no height pinned since: the column there has no
+    /// length to share. A flexible child takes what its content needs —
+    /// the pixel layout's open proposal — where a flex from a zero basis
+    /// would fold it to nothing.
+    unbounded: bool,
     /// How many drop targets the walk has met — the index into
     /// `FlowEnv::drop_rings`.
     drops_seen: usize,
@@ -430,6 +438,7 @@ impl Walk<'_> {
             group: self.groups.last().copied(),
             in_overlay: self.overlay_depth > 0,
             slot: self.slot,
+            unbounded: self.unbounded,
         }
     }
 
@@ -466,9 +475,11 @@ impl Walk<'_> {
             group,
             in_overlay,
             slot,
+            unbounded,
         } = env;
         *font == self.font
             && *slot == self.slot
+            && *unbounded == self.unbounded
             && *line_height == self.line_height
             && *text_align == self.text_align
             && *group == self.groups.last().copied()
@@ -552,12 +563,28 @@ impl Walk<'_> {
                     layout.gap = Some(*spacing as f32);
                 }
                 layout.align = Some(align_code(*align));
+                // a column with no length to share grows nobody; a row's
+                // items take the row's height, a length again
+                let open_column = *axis == Axis::Vertical && self.unbounded;
+                let outer_unbounded = self.unbounded;
+                if *axis == Axis::Horizontal {
+                    self.unbounded = false;
+                }
                 for child in children {
                     let opened = container.children.len();
                     self.lower_into(child, &mut container.children);
+                    if open_column {
+                        // a spacer or an open frame grows itself; here
+                        // it keeps its content's height instead
+                        for kept in &mut container.children[opened..] {
+                            if let Some(layout) = kept.layout.as_mut() {
+                                layout.grow = false;
+                            }
+                        }
+                    }
                     // the flexible child grows — CSS wants the flag on
                     // the ITEM, so the walk stamps it here
-                    if child.is_flexible(*axis, Some(*axis)) {
+                    else if child.is_flexible(*axis, Some(*axis)) {
                         for grown in &mut container.children[opened..] {
                             if let Some(layout) = grown.layout.as_mut() {
                                 layout.grow = true;
@@ -579,6 +606,7 @@ impl Walk<'_> {
                         }
                     }
                 }
+                self.unbounded = outer_unbounded;
                 Self::inherit_stretch(container);
                 Self::fold_table_wrapper(container);
                 Self::fold_paragraph(container);
@@ -657,6 +685,10 @@ impl Walk<'_> {
             LayoutNode::Frame { width, height, align, child } => {
                 let outer_slot = self.slot;
                 self.slot = (*width, *height);
+                let outer_unbounded = self.unbounded;
+                if height.is_some() {
+                    self.unbounded = false;
+                }
                 let container = placed(out, node(DomKind::FlexColumn));
                 {
                     let layout = container.layout.as_mut().expect("flow node");
@@ -670,6 +702,7 @@ impl Walk<'_> {
                 }
                 self.lower_into(child, &mut container.children);
                 self.slot = outer_slot;
+                self.unbounded = outer_unbounded;
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(container);
                 Self::stamp_across(child, &mut container.children);
@@ -931,7 +964,7 @@ impl Walk<'_> {
                     forced: *forced,
                 })));
             }
-            LayoutNode::Scroll { path, target, commanded, child, .. } => {
+            LayoutNode::Scroll { path, target, commanded, child, axes, fill, .. } => {
                 // a region the app holds in a binding takes the app's
                 // value: here the BROWSER is the clamp and the scroll
                 // observer writes back what it settled on, so a value
@@ -959,7 +992,12 @@ impl Walk<'_> {
                     layout.stretch = true;
                 }
                 let mut lowered = Vec::new();
+                // down the axis it scrolls the content has no length —
+                // unless the region lays it out at its own
+                let outer_unbounded = self.unbounded;
+                self.unbounded = axes.vertical() && !*fill;
                 self.lower_into(child, &mut lowered);
+                self.unbounded = outer_unbounded;
                 match lowered.as_slice() {
                     // a virtual stack IS the content already — no
                     // second skin, or the rows hide one box too deep
@@ -1875,6 +1913,7 @@ mod tests {
             pending_tooltip: None,
             groups: Vec::new(),
             overlay_depth: 0,
+            unbounded: false,
             drops_seen: 0,
             overlays: Vec::new(),
             display: crate::layout::DisplayList::default(),
@@ -2722,5 +2761,53 @@ mod tests {
         let scene = lower(&rule, &env_fixture(&offsets)).scene;
         let row = scene.children[0].children[0].layout.as_ref().expect("flow");
         assert!(row.stretch, "the row reaches the frame's edges: {row:?}");
+    }
+
+    /// Down the axis a scroller travels its content has no length to
+    /// share: a column there grows nobody — an open frame keeps its
+    /// content's height, where `flex` from a zero basis folded it to
+    /// nothing. A row inside it has a length again, and its spacer
+    /// still grows.
+    #[test]
+    fn a_column_in_a_scroller_grows_nobody() {
+        let open = LayoutNode::MaxFrame {
+            max_width: f64::INFINITY,
+            max_height: f64::INFINITY,
+            align: CrossAlign::Start,
+            child: Box::new(text_node("a section")),
+        };
+        let row = LayoutNode::Stack {
+            axis: Axis::Horizontal,
+            spacing: 0.0,
+            align: CrossAlign::Center,
+            children: vec![text_node("brand"), LayoutNode::Spacer, text_node("links")],
+            hints: Default::default(),
+            action: None,
+        };
+        let page = LayoutNode::Stack {
+            axis: Axis::Vertical,
+            spacing: 0.0,
+            align: CrossAlign::Start,
+            children: vec![open, row],
+            hints: Default::default(),
+            action: None,
+        };
+        let tree = LayoutNode::Scroll {
+            path: None,
+            target: None,
+            axes: crate::layout::ScrollAxes::Vertical,
+            commanded: None,
+            fill: false,
+            child: Box::new(page),
+        };
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let content = &scene.children[0].children[0];
+        let column = &content.children[0];
+        let section = column.children[0].layout.as_ref().expect("flow");
+        assert!(!section.grow, "no flex down an open axis: {section:?}");
+        assert!(section.stretch, "the column still takes it edge to edge: {section:?}");
+        let spacer = column.children[1].children[1].layout.as_ref().expect("flow");
+        assert!(spacer.grow, "a row has a length to share: {spacer:?}");
     }
 }
