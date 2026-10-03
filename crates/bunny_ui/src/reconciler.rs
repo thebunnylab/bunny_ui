@@ -577,15 +577,15 @@ fn cuts(path: &str) -> impl Iterator<Item = &str> {
     path.match_indices('/').map(move |(at, _)| &path[..at])
 }
 
-/// Does the path have a retained boundary, or one being built, above
-/// it? A top-level entry has neither: only the root region mounts it,
-/// so only the root region can unmount it.
-fn is_top_level(path: &str, building: &[BuildingFrame]) -> bool {
+/// Does the path have no retained boundary above it? A top-level entry
+/// has none: only the root region mounts it, so only the root region
+/// can unmount it. Asked only with no body building around the path —
+/// a body still open above it is a boundary above it, and the caller
+/// knows that without a search ([`finish_entry`]).
+fn is_top_level(path: &str) -> bool {
     RETAINED.with(|retained| {
         let retained = retained.borrow();
-        !cuts(path).any(|prefix| {
-            retained.contains_key(prefix) || building.iter().any(|frame| &*frame.path == prefix)
-        })
+        !cuts(path).any(|prefix| retained.contains_key(prefix))
     })
 }
 
@@ -843,17 +843,26 @@ pub(crate) fn begin_entry(path: &Rc<str>, list: bool) {
     });
 }
 
+/// Files a body that ran under its path, and hands back the slot its
+/// tree now fills — the one a reference to the boundary holds, so the
+/// parent's list does not search the retention for it a second time.
+///
+/// `retained` is what the decision found: a boundary the retention did
+/// not hold is a fresh mount, and there is no entry of a last run to
+/// take out first. Nothing files one at the same path while the body
+/// runs — every boundary below it has a longer path.
 pub(crate) fn finish_entry(
     path: &Rc<str>,
+    retained: bool,
     value: Erased,
     ctx: Context,
     node: RenderNode,
     layout: LayoutNode,
-) {
-    let (effects, actions, copies, editors, splits, scrolls, measures, webviews, customs, handlers, contexts) =
+) -> Rc<Slot> {
+    let (nested, (effects, actions, copies, editors, splits, scrolls, measures, webviews, customs, handlers, contexts)) =
         PASS.with(|pass| {
             let mut pass = pass.borrow_mut();
-            match pass.building.pop() {
+            let lists = match pass.building.pop() {
                 Some(frame) => {
                     debug_assert_eq!(&*frame.path, &**path, "entries close in the order they open");
                     (
@@ -883,21 +892,26 @@ pub(crate) fn finish_entry(
                     Vec::new(),
                     Vec::new(),
                 ),
-            }
+            };
+            // a body still open around this one is a boundary above it:
+            // every frame on the stack is an ancestor
+            (!pass.building.is_empty(), lists)
         });
     let parent_segments = motor::identity::parent_seed();
-    // a top-level entry is known by what stands above it — and the
-    // boundaries still building have no entry yet, so they are asked too
-    let top_level = PASS.with(|pass| is_top_level(path, &pass.borrow().building));
-    RETAINED.with(|retained| {
-        let mut retained = retained.borrow_mut();
+    // a top-level entry is known by what stands above it: a body still
+    // building around it says so at once, and only with none does the
+    // retention have to be asked at each cut
+    let top_level = !nested && is_top_level(path);
+    let filled = RETAINED.with(|retention| {
+        let mut retention = retention.borrow_mut();
         LIVE.with(|live| {
             let mut live = live.borrow_mut();
             // the slot is as old as the path: the entry of the last run
             // goes FIRST (its registrations leave the tables, its drop
             // empties the slot), then the slot is filled again, so a
             // parent that did not re-run refers to the tree of today
-            let slot = match retained.remove(path) {
+            let last = if retained { retention.remove(path) } else { None };
+            let slot = match last {
                 Some(old) => {
                     live.unindex(path, &old);
                     // the tree of the last run waits for the idle with the
@@ -935,16 +949,27 @@ pub(crate) fn finish_entry(
             if top_level {
                 live.top_level.insert(path.to_string());
             }
-            retained.insert(Rc::clone(path), Box::new(entry));
-        });
+            let filled = Rc::clone(&entry.slot);
+            if let Some(displaced) = retention.insert(Rc::clone(path), Box::new(entry)) {
+                // a fresh mount displaces nothing, by construction; were
+                // it ever to, the tables forget the keys of the entry it
+                // displaced and learn the new one's again
+                debug_assert!(false, "a boundary filed twice in one run: {path}");
+                live.unindex(path, &displaced);
+                if let Some(entry) = retention.get(&**path) {
+                    live.index(path, entry);
+                }
+            }
+            filled
+        })
     });
     // …and so is every measure kept ABOVE it. The outermost re-run of a
     // pass does this once: the boundaries between it and the ones it
     // re-ran below are new entries themselves.
-    let outermost = PASS.with(|pass| pass.borrow().building.is_empty());
-    if outermost {
+    if !nested {
         clear_measures_above(path);
     }
+    filled
 }
 
 /// An effect registered during render: goes to the entry being built,
@@ -2601,5 +2626,102 @@ mod tests {
         let printed = runtime.render(&page);
         assert!(printed.starts_with("Lines"), "the page is named: {printed}");
         assert!(printed.matches("Line\n").count() == 2, "and so is each row: {printed}");
+    }
+
+    /// Every reference to a boundary, in every retained tree, with the
+    /// slot it holds.
+    fn references() -> Vec<(Rc<str>, Rc<Slot>)> {
+        fn walk(node: &LayoutNode, out: &mut Vec<(Rc<str>, Rc<Slot>)>) {
+            match node {
+                LayoutNode::BoundaryRef { path, slot, .. } => out.push((Rc::clone(path), Rc::clone(slot))),
+                LayoutNode::Stack { children, .. } | LayoutNode::Boundary { children, .. } => {
+                    children.iter().for_each(|child| walk(child, out));
+                }
+                LayoutNode::Hinted { child, .. }
+                | LayoutNode::Interactive { child, .. }
+                | LayoutNode::Styled { child, .. } => walk(child, out),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        RETAINED.with(|retained| {
+            for entry in retained.borrow().values() {
+                entry.slot.with_layout(|tree| tree.into_iter().for_each(|tree| walk(tree, &mut out)));
+            }
+        });
+        out
+    }
+
+    /// What a closing body knows without searching must be what a
+    /// search would find. The reference a parent's list keeps holds the
+    /// very slot its boundary's entry was filed with — on a fresh mount
+    /// and on a re-run alike — and an entry stands at the top level
+    /// exactly when no retained boundary sits above it.
+    #[test]
+    fn a_closing_body_knows_its_slot_and_its_level_without_a_search() {
+        thread_local! {
+            static TOGGLE_RUNS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        #[derive(Clone, Copy)]
+        struct Toggle {
+            id: usize,
+            on: State<bool>,
+        }
+
+        impl Component for Toggle {
+            fn body(self, _ctx: &Context) -> impl View {
+                TOGGLE_RUNS.with(|runs| runs.set(runs.get() + 1));
+                if self.on.get() { Either::First(text("on")) } else { Either::Second(text("off")) }
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Toggles {
+            toggles: State<Rc<Vec<Toggle>>>,
+        }
+
+        impl Component for Toggles {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::views::for_each(self.toggles, |toggle| toggle.id.to_string(), |toggle| toggle.element("tr"))
+            }
+        }
+
+        let check = |when: &str| {
+            let refs = references();
+            assert!(!refs.is_empty(), "{when}: the list refers to its rows");
+            RETAINED.with(|retained| {
+                let retained = retained.borrow();
+                for (path, slot) in &refs {
+                    let entry = retained.get(&**path).unwrap_or_else(|| panic!("{when}: {path} is retained"));
+                    assert!(Rc::ptr_eq(&entry.slot, slot), "{when}: the reference to {path} holds its entry's slot");
+                }
+                for (path, entry) in retained.iter() {
+                    let above = cuts(path).any(|prefix| retained.contains_key(prefix));
+                    assert_eq!(entry.top_level, !above, "{when}: {path} stands at the top exactly when nothing is above it");
+                }
+            });
+        };
+
+        let on = State::new(false);
+        let toggles = State::new(Rc::new((1..=3).map(|id| Toggle { id, on }).collect::<Vec<_>>()));
+        let page = Toggles { toggles };
+        let runtime = Runtime::new();
+        let size = crate::layout::Size { width: 400.0, height: 300.0 };
+        let _ = runtime.dom_frame(&page, size);
+        assert_eq!(TOGGLE_RUNS.with(Cell::get), 3, "three rows mounted");
+        check("mounted");
+
+        // the rows re-run on their own: their entries are replaced
+        on.set(true);
+        let _ = runtime.dom_frame(&page, size);
+        assert_eq!(TOGGLE_RUNS.with(Cell::get), 6, "the three rows ran again");
+        check("re-run");
+
+        // the list re-runs: the kept rows are skipped, a new one mounts
+        toggles.set(Rc::new((1..=4).map(|id| Toggle { id, on }).collect()));
+        let _ = runtime.dom_frame(&page, size);
+        assert_eq!(TOGGLE_RUNS.with(Cell::get), 7, "the new row alone ran");
+        check("a row added");
     }
 }
