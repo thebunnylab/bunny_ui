@@ -4878,8 +4878,9 @@ impl Runtime {
         let dom = self.dom.borrow();
         let identity = motor::identity::registry_counts();
         format!(
-            "boundaries {} · bindings live {} · dom nodes {} · dom bindings {} · groups {} · template members {} · graveyard {} · identity owners {} reads {} readers {} view-bindings {} binding-reads {} dirty {} dirty-bindings {}",
+            "boundaries {} (+{} to free) · bindings live {} · dom nodes {} · dom bindings {} · groups {} · template members {} · graveyard {} · identity owners {} reads {} readers {} view-bindings {} binding-reads {} dirty {} dirty-bindings {}",
             reconciler::retained_len(),
+            reconciler::graveyard_len(),
             crate::bind::live_count(),
             dom.retained_len(),
             dom.bindings_len(),
@@ -4901,12 +4902,12 @@ impl Runtime {
     /// clear of a thousand rows pays its freeing when nobody is waiting.
     /// Returns how many subtrees were freed.
     pub fn collect_garbage(&self) -> usize {
-        self.dom.borrow_mut().collect_garbage()
+        self.dom.borrow_mut().collect_garbage() + reconciler::collect_garbage()
     }
 
-    /// Dom mode: is there anything for [`Runtime::collect_garbage`]?
+    /// Is there anything for [`Runtime::collect_garbage`]?
     pub fn garbage_pending(&self) -> bool {
-        self.dom.borrow().garbage_pending()
+        self.dom.borrow().garbage_pending() || reconciler::graveyard_len() > 0
     }
 
     pub fn dom_island_lists(&self, scale: usize) -> Vec<crate::dom::IslandList> {

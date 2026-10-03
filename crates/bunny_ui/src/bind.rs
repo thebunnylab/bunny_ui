@@ -173,6 +173,22 @@ pub(crate) fn live_count() -> usize {
     LIVE.with(|live| live.borrow().len())
 }
 
+/// The bindings of a view that left: dead to the frame now, whatever
+/// retained tree still holds their objects until an idle moment frees
+/// it. A key that a newer body made again stays — it is the newer
+/// binding's.
+pub(crate) fn forget_live(keys: &[Rc<str>]) {
+    if keys.is_empty() {
+        return;
+    }
+    LIVE.with(|live| {
+        let mut live = live.borrow_mut();
+        for key in keys {
+            live.remove(key);
+        }
+    });
+}
+
 pub(crate) fn key_at_cursor(suffix: &str) -> Option<Rc<str>> {
     motor::identity::cursor_key(suffix)
 }

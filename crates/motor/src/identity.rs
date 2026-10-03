@@ -697,16 +697,17 @@ pub fn begin_view_reads(view: &str) {
     });
 }
 
-fn clear_view_reads(registry: &mut Registry, view: &str) {
+/// Clears a view's reads and its bindings' reads; returns the keys of
+/// the bindings it had, so the caller can retire them where they live.
+fn clear_view_reads(registry: &mut Registry, view: &str) -> Vec<Rc<str>> {
     // the bindings the body made read for themselves, but they are the
     // body's: a re-run makes them again, a death takes them along
-    if let Some(bindings) = registry.view_bindings.remove(view) {
-        for binding in bindings {
-            clear_binding_reads(registry, &binding);
-        }
+    let bindings = registry.view_bindings.remove(view).unwrap_or_default();
+    for binding in &bindings {
+        clear_binding_reads(registry, binding);
     }
     let Some(keys) = registry.reads_by_view.remove(view) else {
-        return;
+        return bindings;
     };
     for key in keys {
         if let Some(readers) = registry.readers.get_mut(&key) {
@@ -716,16 +717,20 @@ fn clear_view_reads(registry: &mut Registry, view: &str) {
             }
         }
     }
+    bindings
 }
 
 /// The reads of a view that left the tree fall — the twin of the owner
 /// sweep, for a view that owns no state and so has no owner record.
-pub fn forget_view_reads(view: &str) {
+/// Returns the keys of the bindings the view had made: dead to the
+/// frame from here, whatever still holds their objects.
+pub fn forget_view_reads(view: &str) -> Vec<Rc<str>> {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
-        clear_view_reads(&mut registry, view);
+        let bindings = clear_view_reads(&mut registry, view);
         registry.dirty.remove(view);
-    });
+        bindings
+    })
 }
 
 // MARK: - Bindings
