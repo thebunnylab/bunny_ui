@@ -36,7 +36,7 @@ pub(crate) struct FlowEnv<'a> {
     /// Every body that ran this frame — a boundary with none of them
     /// under it is CLEAN, and the walk promises its reuse instead of
     /// descending.
-    pub changed: &'a [String],
+    pub changed: &'a [std::rc::Rc<str>],
     /// The Groups the retained scene actually holds, each with the
     /// environment it was lowered in — a promise the diff cannot match
     /// would mount a hole, so the walk checks first; and a boundary
@@ -201,7 +201,7 @@ struct ChangedIndex<'a> {
 }
 
 impl<'a> ChangedIndex<'a> {
-    fn new(changed: &'a [String]) -> Self {
+    fn new(changed: &'a [std::rc::Rc<str>]) -> Self {
         // a run is one entry, and mostly one boundary above it of its own
         // (a list's row under its identity): both sets sized once
         let mut exact = motor::hash::FxHashSet::default();
@@ -209,7 +209,7 @@ impl<'a> ChangedIndex<'a> {
         let mut above_a_run = motor::hash::FxHashSet::default();
         above_a_run.reserve(changed.len());
         for run in changed {
-            exact.insert(run.as_str());
+            exact.insert(&**run);
             for (at, _) in run.match_indices('/') {
                 above_a_run.insert(&run[..at]);
             }
