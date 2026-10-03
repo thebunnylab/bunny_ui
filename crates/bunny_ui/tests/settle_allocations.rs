@@ -151,9 +151,9 @@ const KEY_CHECK: u64 = if cfg!(debug_assertions) { 2 } else { 0 };
 /// its path, the retained copy of itself and its environment, the entry
 /// and the slot its tree is filed in, its parent's seed and the note
 /// that its body ran. Nothing on top of that: a body that opens mints
-/// no placeholder path.
+/// no placeholder path, and a frame names no boundary it never prints.
 #[test]
 fn a_row_that_mounts_pays_for_its_entry_and_nothing_else() {
     let cost = per_row(|_| empty());
-    assert!(cost <= 11 + KEY_CHECK, "an empty row costs the settle {cost} allocations");
+    assert!(cost <= 10 + KEY_CHECK, "an empty row costs the settle {cost} allocations");
 }

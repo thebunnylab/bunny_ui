@@ -2584,4 +2584,22 @@ mod tests {
         let gone = retained_under("Page");
         assert!(!gone.contains(inner) && gone.len() == after.len() - 2, "row a and its leaf left: {gone:?}");
     }
+
+    /// A frame's pass prints nothing, so the entries it files keep no
+    /// name — and a print that comes after still names every boundary,
+    /// because a retention built without print is built again before
+    /// anything prints it.
+    #[test]
+    fn a_frame_files_no_name_and_a_print_after_it_names_every_boundary() {
+        let page = Lines { lines: State::new(lines(1..=2)) };
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&page, crate::layout::Size { width: 400.0, height: 300.0 });
+        let named: Vec<String> = RETAINED.with(|retained| {
+            retained.borrow().iter().filter(|(_, entry)| !entry.node.line.is_empty()).map(|(path, _)| path.to_string()).collect()
+        });
+        assert!(named.is_empty(), "a frame names no boundary: {named:?}");
+        let printed = runtime.render(&page);
+        assert!(printed.starts_with("Lines"), "the page is named: {printed}");
+        assert!(printed.matches("Line\n").count() == 2, "and so is each row: {printed}");
+    }
 }
