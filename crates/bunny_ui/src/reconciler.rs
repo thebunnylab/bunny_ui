@@ -334,7 +334,14 @@ pub(crate) struct KeptMeasure {
 }
 
 /// How many questions one tree keeps the answer to.
-const KEPT_MEASURES: usize = 4;
+///
+/// A frame asks a boundary a few ways: a stack measures a flexible child
+/// twice, a stack of stacks doubles that, and each phase comes with and
+/// without a width. Trinity's agent panel is asked six ways a frame; at
+/// four kept, two answers evicted two others every frame and the panel
+/// measured afresh at rest with nothing changed (2026-10-03). Eight holds
+/// that with room; the cost is a handful of sizes per retained tree.
+const KEPT_MEASURES: usize = 8;
 
 /// The measure of a retained boundary, kept from frame to frame.
 ///
