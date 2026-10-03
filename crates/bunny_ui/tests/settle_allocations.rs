@@ -63,10 +63,13 @@ fn clock() -> f64 {
 
 const SIZE: Size = Size { width: 1200.0, height: 800.0 };
 
-/// What a row is made from: its id.
+/// What a row is made from: an id, and the two values a row of a table
+/// reads for itself — its label and whether it is selected.
 #[derive(Clone, Copy)]
 struct Item {
     id: usize,
+    label: State<Rc<str>>,
+    on: State<bool>,
 }
 
 /// A row: a boundary of its own, its body whatever the test hands it.
@@ -105,7 +108,15 @@ where
 }
 
 fn items(count: usize) -> Rc<Vec<Item>> {
-    Rc::new((1..=count).map(|id| Item { id }).collect())
+    Rc::new(
+        (1..=count)
+            .map(|id| Item {
+                id,
+                label: State::new(Rc::from(format!("row {id}").as_str())),
+                on: State::new(false),
+            })
+            .collect(),
+    )
 }
 
 /// The settle allocations of a frame that mounts `count` rows into a
@@ -156,4 +167,37 @@ const KEY_CHECK: u64 = if cfg!(debug_assertions) { 2 } else { 0 };
 fn a_row_that_mounts_pays_for_its_entry_and_nothing_else() {
     let cost = per_row(|_| empty());
     assert!(cost <= 10 + KEY_CHECK, "an empty row costs the settle {cost} allocations");
+}
+
+/// What a row costs beyond the empty row: the measure of one feature.
+fn beyond_empty<B, V>(body: B) -> u64
+where
+    B: Fn(Item) -> V + Copy + 'static,
+    V: View,
+{
+    per_row(body).saturating_sub(per_row(|_| empty()))
+}
+
+/// A label the row reads for itself pays for its key, its binding, the
+/// closure it reads through, the text it reads and the list its node
+/// is held in. The register of what it reads costs nothing more: one
+/// value read by one binding, and the bindings of one body, are held
+/// inline — four sets and a list a row, before.
+#[test]
+fn a_bound_label_files_its_reads_without_a_set() {
+    let cost = beyond_empty(|item| text!(item.label));
+    assert!(cost <= 6, "a bound label costs the settle {cost} allocations beyond the empty row");
+}
+
+/// The class a row's own element wears while it is selected is a
+/// binding too, filed the same way: no set for the flag it reads, none
+/// for the one binding reading that flag. With the label beside it the
+/// row's body made two bindings, and two are held without a list.
+#[test]
+fn a_bound_class_beside_a_bound_label_files_without_a_list() {
+    let class = beyond_empty(|item| boundary_class_when(item.on, "selected"));
+    assert!(class <= 5, "a bound class costs the settle {class} allocations beyond the empty row");
+    let label = beyond_empty(|item| text!(item.label));
+    let both = beyond_empty(|item| (boundary_class_when(item.on, "selected"), text!(item.label)));
+    assert!(both <= class + label, "the two bindings of one body cost {both}, apart {class} + {label}");
 }
