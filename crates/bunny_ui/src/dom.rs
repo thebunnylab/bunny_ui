@@ -7268,8 +7268,8 @@ mod tests {
 mod size_tests {
     /// The nodes a frame moves by the thousand: their size is a cost
     /// of every create — printed here so a diet has a number to start
-    /// from, and bounded so a field added in passing does not double
-    /// the memory a row list moves.
+    /// from, and pinned at the diet's sizes so a field added in passing
+    /// shows here before it shows in the memory a row list moves.
     #[test]
     fn the_scene_nodes_stay_small() {
         use std::mem::size_of;
@@ -7290,7 +7290,18 @@ mod size_tests {
         for (name, size) in sizes {
             eprintln!("size {name:<11} {size:>5} bytes");
         }
-        assert!(size_of::<super::DomNode>() <= 1024, "DomNode grew past a kilobyte");
+        // the bounds are the 64-bit sizes; a 32-bit target is smaller
+        // (wasm: DomNode 240, DomStyle 16, DomKind 56, Retained 264);
+        // a placed element's box stays f64, the served page prints it
+        assert!(size_of::<super::DomNode>() <= 320, "DomNode grew: box the rare record, not the node");
+        // the action path inline, the look and the marks boxed
+        assert!(size_of::<super::DomStyle>() <= 32, "DomStyle grew: a look's field belongs in DomLook");
+        // no kind wider than a text, the commonest: a wider one is boxed
+        assert!(size_of::<super::DomKind>() <= 72, "DomKind grew: box the new payload");
+        assert!(size_of::<super::DomText>() <= 72, "DomText grew");
+        // the flow record holds the wire's f32s
+        assert!(size_of::<Option<super::DomLayout>>() <= 84, "DomLayout grew: a length is an f32");
+        assert!(size_of::<super::Retained>() <= 360, "Retained grew");
         // a patch list is thousands long on a create: its slot must stay
         // small, the fat records boxed
         assert!(size_of::<super::DomPatch>() <= 96, "DomPatch grew: box the record, not the list");
