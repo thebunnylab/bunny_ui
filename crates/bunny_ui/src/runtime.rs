@@ -193,6 +193,11 @@ pub struct Runtime {
     /// Browser-reported boxes by island path — a FLEXIBLE island
     /// measures against its real box, not against a guess.
     island_boxes: RefCell<HashMap<Rc<str>, (f64, f64)>>,
+    /// Dom mode: the targets drawn inside each island, by the island's
+    /// identity — target path and frame in the island's own
+    /// coordinates, from the last walk that lowered the island. A
+    /// canvas click is routed by them.
+    island_hits: RefCell<HashMap<Rc<str>, Vec<(String, Rect)>>>,
     /// The app's boxes inside each island, frames ISLAND-LOCAL — the
     /// canvas pointer door routes the browser's coordinates by them.
     dom_customs: RefCell<Vec<(Rc<str>, crate::layout::CustomPlacement)>>,
@@ -1327,6 +1332,7 @@ impl Runtime {
             scroll_offsets: RefCell::new(HashMap::default()),
             dom_viewports: RefCell::new(HashMap::default()),
             island_boxes: RefCell::new(HashMap::default()),
+            island_hits: RefCell::new(HashMap::default()),
             dom_customs: RefCell::new(Vec::new()),
             last_scrolls: RefCell::new(Vec::new()),
             last_modal_floor: std::cell::Cell::new(None),
@@ -4678,6 +4684,7 @@ impl Runtime {
                 break;
             }
         }
+        self.note_island_hits(&output.islands_walked, output.hits);
         let mut dom = self.dom.borrow_mut();
         dom.note_groups(output.groups);
         let mut patches = dom.lower(output.scene, &output.display);
@@ -4781,6 +4788,7 @@ impl Runtime {
         drop(offsets);
         drop(carets);
         let mut dom = self.dom.borrow_mut();
+        self.note_island_hits(&output.islands_walked, output.hits);
         dom.note_groups(output.groups);
         dom.adopt(&output.scene, &output.display);
     }
@@ -4800,6 +4808,50 @@ impl Runtime {
     /// The dirty marks are CONSUMED, so a frame calls one of the two
     /// and never both.
     #[cfg(feature = "canvas")]
+    /// The hit rectangles of the last layout — path and frame, in the
+    /// window's logical px. What a probe reads to find a target on a
+    /// page that has no elements to query.
+    pub fn hits_snapshot(&self) -> Vec<(String, Rect)> {
+        self.last_hits.borrow().clone()
+    }
+
+    /// Dom mode: every island's element id, origin and size in the
+    /// layout's frame — the probe's way from a hit to a canvas point.
+    pub fn island_frames(&self) -> Vec<(u32, Px, Px, Px, Px)> {
+        self.dom.borrow().island_frames()
+    }
+
+    /// Dom mode: the targets drawn inside the islands — the island's
+    /// element id, the target's path, its frame on the island's own
+    /// canvas. What a probe clicks a row on a canvas by.
+    pub fn island_hits_snapshot(&self) -> Vec<(u32, String, Rect)> {
+        let dom = self.dom.borrow();
+        let mut out = Vec::new();
+        for (island, hits) in self.island_hits.borrow().iter() {
+            if let Some(id) = dom.island_id(island) {
+                out.extend(hits.iter().map(|(path, rect)| (id, path.clone(), *rect)));
+            }
+        }
+        out
+    }
+
+    /// The islands a walk lowered take the walk's hits; the ones a
+    /// reuse promise kept stand on their last walk's.
+    fn note_island_hits(&self, walked: &[Rc<str>], hits: Vec<(Rc<str>, String, Rect)>) {
+        if walked.is_empty() {
+            return;
+        }
+        let mut table = self.island_hits.borrow_mut();
+        for island in walked {
+            table.insert(Rc::clone(island), Vec::new());
+        }
+        for (island, path, rect) in hits {
+            if let Some(entry) = table.get_mut(&island) {
+                entry.push((path, rect));
+            }
+        }
+    }
+
     /// Dom mode: frees what the frames since the last call removed. The
     /// shell calls this off the frame — on an idle callback — so a
     /// clear of a thousand rows pays its freeing when nobody is waiting.
@@ -5311,6 +5363,42 @@ impl Runtime {
         let Some(island) = self.dom.borrow().island_path(id) else {
             return false;
         };
+        // a target drawn INSIDE the island — a row's link, a chip —
+        // hears the pointer the way the pixel road's targets do: the
+        // press arms it, a release inside fires it. The island placed
+        // its subtree at its own origin, so the canvas point IS the
+        // frame's point
+        if !self.dom_customs.borrow().iter().any(|(home, custom)| {
+            home.as_ref() == island.as_ref() && custom.frame.contains(x, y)
+        }) {
+            let under = self.island_hits.borrow().get(&island).and_then(|hits| {
+                hits.iter().rev().find_map(|(path, rect)| rect.contains(x, y).then(|| path.clone()))
+            });
+            match kind {
+                0 => {
+                    let mut interaction = self.interaction.borrow_mut();
+                    interaction.pointer = Some(Point { x, y });
+                    interaction.hovered = under.clone();
+                    interaction.pressed = under.clone();
+                    return under.is_some();
+                }
+                2 => {
+                    let pressed = self.interaction.borrow_mut().pressed.take();
+                    if let Some(path) = pressed
+                        && under.as_deref() == Some(path.as_str())
+                    {
+                        self.activate_clicks(&path, 1);
+                        return true;
+                    }
+                    return false;
+                }
+                _ => {
+                    if self.interaction.borrow().element_grab.is_none() {
+                        return false;
+                    }
+                }
+            }
+        }
         let grabbed = self.interaction.borrow().element_grab.clone();
         let placement = match (kind, grabbed) {
             // the grabbed box hears every move and the release,

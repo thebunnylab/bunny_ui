@@ -444,6 +444,9 @@ enum Event {
     Wake,
     /// The browser is idle: free what the frames removed.
     Idle,
+    /// Probe builds: the hit table of the last layout is asked for.
+    #[cfg(feature = "probe")]
+    Hits,
     /// The glue's slow clock beat once — the tooltip ages, then shows.
     TooltipTick,
     /// A right press (the browser's contextmenu, default prevented).
@@ -873,6 +876,8 @@ pub fn start_with(
                 // the page is idle: free what the frames removed
                 runtime.collect_garbage();
             }
+            #[cfg(feature = "probe")]
+            Event::Hits => probe_hits(&runtime),
             Event::Wake => {
                 // The work always lands: the tasks are polled. The FRAME is
                 // for a turn that changed something. Most wakes change
@@ -1175,6 +1180,12 @@ fn start_dom_with(
                     unsafe { js_request_frame() };
                 }
             }
+            Event::Idle => {
+                // the page is idle: free what the frames removed
+                runtime.collect_garbage();
+            }
+            #[cfg(feature = "probe")]
+            Event::Hits => probe_hits(&runtime),
             // hover, wheel and the rest belong to the browser in this
             // mode — nothing to do on our side of the border
             _ => {}
@@ -1492,6 +1503,72 @@ pub extern "C" fn bunny_wake() {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_idle() {
     dispatch(Event::Idle);
+}
+
+#[cfg(feature = "probe")]
+thread_local! {
+    /// The probe's last answer, kept until the page reads it.
+    static PROBE: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// The hit rectangles of the last layout and the islands' frames, as
+/// JSON, for a runner that has no elements to click — the probe's
+/// answer, written where [`bunny_hits_json`] reads it.
+#[cfg(feature = "probe")]
+fn probe_hits(runtime: &Runtime) {
+    let mut json = String::from("{\"hits\":[");
+    for (index, (path, rect)) in runtime.hits_snapshot().iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "{{\"path\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+            path.replace('\\', "\\\\").replace('"', "\\\""),
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height
+        ));
+    }
+    json.push_str("],\"islandHits\":[");
+    for (index, (island, path, rect)) in runtime.island_hits_snapshot().iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "{{\"island\":{island},\"path\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+            path.replace('\\', "\\\\").replace('"', "\\\""),
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height
+        ));
+    }
+    json.push_str("],\"islands\":[");
+    for (index, (id, x, y, w, h)) in runtime.island_frames().iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!("{{\"id\":{id},\"x\":{x},\"y\":{y},\"w\":{w},\"h\":{h}}}"));
+    }
+    json.push_str("]}");
+    PROBE.with(|probe| *probe.borrow_mut() = json);
+}
+
+/// Probe builds only: fills the hit table of the last layout as JSON
+/// and returns its length; [`bunny_probe_ptr`] is where it starts.
+#[cfg(feature = "probe")]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_hits_json() -> u32 {
+    dispatch(Event::Hits);
+    PROBE.with(|probe| probe.borrow().len() as u32)
+}
+
+/// Probe builds only: the bytes of the last probe answer.
+#[cfg(feature = "probe")]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_probe_ptr() -> *const u8 {
+    PROBE.with(|probe| probe.borrow().as_ptr())
 }
 
 /// Dom mode: the browser resolved a click to the nearest interactive
