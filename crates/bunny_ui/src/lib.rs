@@ -143,13 +143,16 @@ pub mod prelude {
     pub use crate::custom::{canvas, custom};
     pub use crate::erased::{CustomModifier, Erased, erased};
     pub use crate::host::{
-        ColorScheme, EditorCommand, HostSpec, NetworkPolicy, WebviewHandle, webview, webview_html,
+        ColorScheme, EditorCommand, HostSpec, MediaHandle, NetworkPolicy, VideoView, WebviewHandle,
+        video, webview, webview_html,
     };
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
     pub use crate::icon::house as symbol;
     pub use crate::icon::{ICON_GRID, Ink, Paint, Rule, Symbol, Verb};
-    pub use crate::image_engine::{ImageEngine, ImageRaster, ImageSource, RawImages, file_icon};
+    pub use crate::image_engine::{
+        FeedKey, ImageEngine, ImageFeed, ImageRaster, ImageSource, PixelFormat, RawImages, file_icon,
+    };
     // geometry is app vocabulary the moment the app paints a box of
     // its own (`custom(…)` / `canvas(…)`)
     pub use crate::layout::{
@@ -418,6 +421,145 @@ mod tests {
         assert_eq!(dirty.len(), 1, "exactly one dirty view: {dirty:?}");
         assert!(dirty[0].contains("#0"), "the tuple position identifies the sibling: {dirty:?}");
         assert!(dirty[0].ends_with("Digit"));
+    }
+
+    /// A write made during a pass reaches a view whose body already ran in
+    /// that pass (T2-BUNNY-277): the view was dirty at the pass's start, so
+    /// the pass consumed its dirt — and with it the write that came after
+    /// its body, which left it showing the old value until something else
+    /// dirtied it. The write schedules the next pass for it instead.
+    #[test]
+    fn a_write_after_a_body_ran_in_the_pass_reruns_it_next_pass() {
+        #[derive(Clone, Copy)]
+        struct Reader {
+            shown: State<i32>,
+            poke: State<u32>,
+        }
+        impl Component for Reader {
+            fn body(self, _ctx: &Context) -> impl View {
+                let _ = self.poke.get();
+                text(format!("{}", self.shown.get()))
+            }
+        }
+        // writes what the reader shows, from its own body, every run
+        #[derive(Clone, Copy)]
+        struct Writer {
+            shown: State<i32>,
+            poke: State<u32>,
+        }
+        impl Component for Writer {
+            fn body(self, _ctx: &Context) -> impl View {
+                let poked = self.poke.get();
+                self.shown.set(i32::try_from(poked).unwrap_or(i32::MAX));
+                text("writer")
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct Pair {
+            reader: Reader,
+            writer: Writer,
+        }
+        impl Component for Pair {
+            fn body(self, _ctx: &Context) -> impl View {
+                // the reader first: its body runs before the writer's
+                vstack((self.reader, self.writer))
+            }
+        }
+
+        let (shown, poke) = (State::new(0), State::new(0));
+        let pair = Pair { reader: Reader { shown, poke }, writer: Writer { shown, poke } };
+        let runtime = Runtime::new();
+        runtime.render_stable(&pair);
+
+        // both read `poke`: both are dirty when the pass starts, the reader
+        // runs first, and the writer then writes what it shows
+        poke.set(7);
+        let printed = runtime.render(&pair);
+        assert!(printed.contains("Text(\"0\")"), "this pass's reader ran before the write: {printed}");
+        let printed = runtime.render(&pair);
+        assert_eq!(runtime.body_runs(), vec!["Pair/#0/Reader".to_string()], "the write reran the reader");
+        assert!(printed.contains("Text(\"7\")"), "and it shows the write: {printed}");
+        let _ = runtime.render(&pair);
+        assert!(runtime.body_runs().is_empty(), "and the frame is still again");
+    }
+
+    /// A write made during a pass BEFORE its reader's body runs is served by
+    /// that same pass: the reader reads the new value when it runs, so no
+    /// pass follows for it.
+    #[test]
+    fn a_write_before_a_body_runs_in_the_pass_costs_no_further_pass() {
+        #[derive(Clone, Copy)]
+        struct Reader {
+            shown: State<i32>,
+            poke: State<u32>,
+        }
+        impl Component for Reader {
+            fn body(self, _ctx: &Context) -> impl View {
+                let _ = self.poke.get();
+                text(format!("{}", self.shown.get()))
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct Writer {
+            shown: State<i32>,
+            poke: State<u32>,
+        }
+        impl Component for Writer {
+            fn body(self, _ctx: &Context) -> impl View {
+                let poked = self.poke.get();
+                self.shown.set(i32::try_from(poked).unwrap_or(i32::MAX));
+                text("writer")
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct Pair {
+            writer: Writer,
+            reader: Reader,
+        }
+        impl Component for Pair {
+            fn body(self, _ctx: &Context) -> impl View {
+                // the writer first: the reader runs after the write
+                vstack((self.writer, self.reader))
+            }
+        }
+
+        let (shown, poke) = (State::new(0), State::new(0));
+        let pair = Pair { writer: Writer { shown, poke }, reader: Reader { shown, poke } };
+        let runtime = Runtime::new();
+        runtime.render_stable(&pair);
+
+        poke.set(7);
+        let printed = runtime.render(&pair);
+        assert!(printed.contains("Text(\"7\")"), "the reader ran after the write: {printed}");
+        let _ = runtime.render(&pair);
+        assert!(runtime.body_runs().is_empty(), "the pass served it; nothing runs again");
+    }
+
+    /// A body that writes what it reads, inside its own frame, is not sent
+    /// round again for it: it would write again on every pass, and a write
+    /// always notifies, so the frame would never be still.
+    #[test]
+    fn a_body_writing_what_it_reads_in_its_own_frame_is_not_rerun_for_it() {
+        #[derive(Clone, Copy)]
+        struct Clamp {
+            value: State<i32>,
+        }
+        impl Component for Clamp {
+            fn body(self, _ctx: &Context) -> impl View {
+                let value = self.value.get();
+                self.value.set(value.min(10));
+                text(format!("{}", value.min(10)))
+            }
+        }
+
+        let clamp = Clamp { value: State::new(3) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&clamp);
+        clamp.value.set(40);
+        let printed = runtime.render(&clamp);
+        assert!(printed.contains("Text(\"10\")"), "{printed}");
+        let _ = runtime.render(&clamp);
+        assert!(runtime.body_runs().is_empty(), "its own write does not send it round again");
     }
 
     #[test]
@@ -9438,7 +9580,9 @@ mod tests {
             .settled_layout(&Page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
         let hosts = runtime.hosts();
         assert_eq!(hosts.len(), 1);
-        let HostSpec::Webview { url, .. } = &hosts[0].spec;
+        let HostSpec::Webview { url, .. } = &hosts[0].spec else {
+            panic!("a webview rides in the spec: {:?}", hosts[0].spec)
+        };
         assert_eq!(&**url, "https://example.test/docs");
         // the page takes the leftover beside the rigid column
         assert_eq!(hosts[0].frame.origin.x, 100.0);
@@ -9471,6 +9615,75 @@ mod tests {
         assert_eq!(hosts[0].frame.size.height, 400.0, "the box keeps its declared height");
         assert_eq!(hosts[0].visible.size.height, 150.0, "the window is the region's worth");
         assert_eq!(hosts[0].visible.origin.y, 0.0);
+    }
+
+    /// A video host is placed by the same walk as a webview: the same
+    /// box, the same window the clip lets through, the same region and
+    /// the same mark in the display list — and no command of its own,
+    /// the browser draws there. The spec carries what the builder said.
+    #[test]
+    fn a_video_host_places_and_marks_like_a_webview() {
+        use crate::host::{HostSpec, MediaHandle, video, webview};
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Call;
+        impl Component for Call {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    text("in a call").frame(300.0, 40.0),
+                    scroll(
+                        video(MediaHandle(3))
+                            .mirrored()
+                            .aspect_ratio(motor::views::ContentMode::Fit)
+                            .corner_radius(12.0)
+                            .frame(300.0, 400.0)
+                    )
+                    .frame(300.0, 150.0)
+                )
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    text("in a call").frame(300.0, 40.0),
+                    scroll(webview("https://example.test/").frame(300.0, 400.0))
+                        .frame(300.0, 150.0)
+                )
+            }
+        }
+
+        let window = Proposal::exact(Size { width: 300.0, height: 190.0 });
+        let runtime = Runtime::new();
+        let result = runtime.settled_layout(&Call, window);
+        let hosts = runtime.hosts();
+        assert_eq!(hosts.len(), 1);
+        let feed = &hosts[0];
+        let HostSpec::Video { stream, mirrored, cover, corner_radius } = &feed.spec else {
+            panic!("a video rides in the spec: {:?}", feed.spec)
+        };
+        assert_eq!(*stream, MediaHandle(3), "the handle rides as the page minted it");
+        assert!(*mirrored, "the selfie rides");
+        assert!(!*cover, "Fit is `contain`");
+        assert_eq!(*corner_radius, 12.0);
+        assert_eq!(feed.frame.size.height, 400.0, "the box keeps its declared height");
+        assert_eq!(feed.visible.size.height, 150.0, "the window is the region's worth");
+        assert!(feed.region.is_some(), "the region it scrolls in is named");
+        assert!(feed.mark > 0, "the label painted before it stands under the mark");
+        assert!(feed.mark <= result.display.len());
+
+        // the webview twin in the same scene places identically
+        let twin = Runtime::new();
+        let _ = twin.settled_layout(&Page, window);
+        let page = &twin.hosts()[0];
+        assert_eq!(
+            (feed.frame, feed.visible, feed.region.is_some(), feed.mark),
+            (page.frame, page.visible, page.region.is_some(), page.mark),
+            "the walk places a video exactly where it places a webview"
+        );
+        assert_eq!(video(MediaHandle(1)), video(MediaHandle(1)), "the builder is a value");
     }
 
     /// A shell that owns its page pixels routes the hand itself: the
@@ -9650,7 +9863,10 @@ mod tests {
             .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
         let hosts = runtime.hosts();
         let path = hosts[0].path.clone();
-        let HostSpec::Webview { scripts, console, requests, full_motion, .. } = &hosts[0].spec;
+        let HostSpec::Webview { scripts, console, requests, full_motion, .. } = &hosts[0].spec
+        else {
+            panic!("a webview rides in the spec: {:?}", hosts[0].spec)
+        };
         assert_eq!(scripts.len(), 1, "the user script rides in the spec");
         assert!(
             *console && *requests,
@@ -9710,7 +9926,9 @@ mod tests {
             .settled_layout(&composer, Proposal::exact(Size { width: 400.0, height: 300.0 }));
         let hosts = runtime.hosts();
         let path = hosts[0].path.clone();
-        let HostSpec::Webview { url, document, .. } = &hosts[0].spec;
+        let HostSpec::Webview { url, document, .. } = &hosts[0].spec else {
+            panic!("a webview rides in the spec: {:?}", hosts[0].spec)
+        };
         assert_eq!(&**url, "about:blank", "a document never carries a url to fetch");
         let document = document.as_ref().expect("the document rides");
         assert!(document.editable && document.paste && document.focus);

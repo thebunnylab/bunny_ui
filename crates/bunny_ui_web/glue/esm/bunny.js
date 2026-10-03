@@ -30,7 +30,7 @@ import { attach as attachGpu } from "./bunny_gpu.js";
 // the key table, the modifier bits, the import/export surface. The
 // wasm exports its own number; `attach` compares the two and refuses a
 // pairing this mirror was not written for.
-export const EXPECTED_ABI = 15;
+export const EXPECTED_ABI = 16;
 
 const IN_WORKER = typeof window === "undefined";
 const WAKE_CHANNEL = "bunny-wake";
@@ -88,7 +88,10 @@ function surface(kind) {
       spent.height = 0;
       surfaces.delete(held);
     }
-    host.replaceChildren(canvas);
+    // the host overlay (below) rides ABOVE whichever surface holds the
+    // page: it is kept across the swap, after the new canvas
+    const kept = [...host.children].filter((child) => child.dataset.bunnyKeep !== undefined);
+    host.replaceChildren(canvas, ...kept);
   }
   return canvas;
 }
@@ -238,6 +241,132 @@ export function js_request_wake() {
 // module only ever drives the canvas one.
 export function js_apply_patches() {}
 export function js_island_rect() {}
+
+// MARK: - The media registry and the host overlay (`docs/video.md`)
+
+// A MediaStream never crosses into wasm. The page registers it here and
+// hands the engine the integer; the engine names it back when it places
+// a video host, and the element takes the stream by that name. Zero is
+// no stream. The page is the stream's owner throughout: releasing a
+// handle forgets the name, it stops no track.
+const streams = new Map();
+let nextStream = 1;
+
+export function registerMediaStream(stream) {
+  const handle = nextStream++;
+  streams.set(handle, stream);
+  return handle;
+}
+
+export function releaseMediaStream(handle) {
+  streams.delete(handle >>> 0);
+}
+
+// The host overlay: the page's own elements over the canvas — one
+// `<video>` per video host, placed by the engine's boxes each present.
+// A child of the host that outlives the surface (`surface()` keeps it
+// across a tier swap by its mark); pointer events pass through it to
+// the canvas. Each host gets a clip div on the window the layout
+// granted, holding the element at the whole box — the mac's container
+// and tenant, in CSS — so a feed half scrolled off is cut, never
+// rescaled. The z-order law: the element is ABOVE the canvas, and
+// whatever the scene paints after the host is under it.
+let overlay = null;
+const hosted = new Map();
+let touched = null;
+
+function hostOverlay() {
+  if (!overlay) {
+    overlay = document.createElement("div");
+    overlay.dataset.bunnyKeep = "";
+    overlay.style.cssText = "position:absolute;inset:0;overflow:hidden;pointer-events:none;";
+  }
+  if (overlay.parentNode !== host) {
+    // the host anchors its children's absolute boxes
+    if (getComputedStyle(host).position === "static") host.style.position = "relative";
+    host.appendChild(overlay);
+  }
+  return overlay;
+}
+
+// A host pass opens: nothing is placed yet.
+export function js_host_begin() {
+  if (!host) return;
+  hostOverlay();
+  touched = new Set();
+}
+
+// One video host by its path: the box (x, y, w, h) and the window the
+// clip lets through (vx, vy, vw, vh), box-local — CSS px both. The clip
+// div lands on the window and the element keeps the whole box inside
+// it; an empty window hides, never unmounts. A stamp gates the
+// attribute writes, and the stream is rewired only when the HANDLE
+// changed — writing the same one again restarts the playback.
+export function js_host_video(pointer, length, stream, x, y, w, h, vx, vy, vw, vh, flags, radius) {
+  if (!host) return;
+  const path = text(pointer, length);
+  let slot = hosted.get(path);
+  if (!slot) {
+    const clip = document.createElement("div");
+    clip.style.cssText = "position:absolute;overflow:hidden;";
+    // muted, inline and autoplaying: the audio is the app's business,
+    // on an element of its own or none
+    const video = document.createElement("video");
+    video.autoplay = true;
+    video.muted = true;
+    video.playsInline = true;
+    video.setAttribute("playsinline", "");
+    video.style.cssText = "position:absolute;display:block;pointer-events:none;";
+    clip.appendChild(video);
+    hostOverlay().appendChild(clip);
+    slot = { clip, video, stamp: "", stream: 0 };
+    hosted.set(path, slot);
+  }
+  if (touched) touched.add(path);
+  const { clip, video } = slot;
+  if (vw <= 0 || vh <= 0) {
+    clip.style.display = "none";
+  } else {
+    clip.style.display = "";
+    clip.style.left = `${x + vx}px`;
+    clip.style.top = `${y + vy}px`;
+    clip.style.width = `${vw}px`;
+    clip.style.height = `${vh}px`;
+    video.style.left = `${-vx}px`;
+    video.style.top = `${-vy}px`;
+    video.style.width = `${w}px`;
+    video.style.height = `${h}px`;
+  }
+  const handle = stream >>> 0;
+  const stamp = `${handle}|${flags >>> 0}|${radius}`;
+  if (slot.stamp === stamp) return;
+  slot.stamp = stamp;
+  video.style.objectFit = flags & 2 ? "cover" : "contain";
+  // the selfie: flipped in place, around the element's own centre
+  video.style.transform = flags & 1 ? "scaleX(-1)" : "";
+  // the corners are the BOX's, so they ride the element: a feed half
+  // scrolled off keeps its rounded corners where they are, and the
+  // clip's cut edge stays straight
+  video.style.borderRadius = radius > 0 ? `${radius}px` : "";
+  if (slot.stream !== handle) {
+    slot.stream = handle;
+    video.srcObject = handle ? (streams.get(handle) ?? null) : null;
+    video.play().catch(() => {});
+  }
+}
+
+// The pass closes: whatever it did not place left the scene, and its
+// element goes with it. The stream stays the page's to stop.
+export function js_host_end() {
+  if (!touched) return;
+  for (const [path, slot] of hosted) {
+    if (touched.has(path)) continue;
+    slot.video.srcObject = null;
+    slot.clip.remove();
+    hosted.delete(path);
+  }
+  touched = null;
+}
 
 // A panic on its way out of wasm: decode the message and log it, so an
 // abort is a sentence instead of `unreachable` and a stack of numbers.

@@ -93,6 +93,17 @@ struct Registry {
     /// inverted index: dependency → reader views.
     readers: HashMap<DepKey, HashSet<String>>,
     dirty: HashSet<String>,
+    /// From `begin_pass` to `consume_dirty`: whether a write is landing
+    /// inside a pass, where it may reach a view whose body already ran.
+    serving: bool,
+    /// The dirt this pass took to serve ([`take_dirty_under`]): a write
+    /// during the pass to a view in here that has not run yet is read
+    /// when it runs, and dirties nothing.
+    served: HashSet<String>,
+    /// Views a write reached during this pass AFTER their body ran in it
+    /// (T2-BUNNY-277). Their dirt is not the dirt the pass served, so the
+    /// pass's end leaves it for the next one.
+    missed: HashSet<String>,
     /// Effect slots by (site, scope) — the retention behind `on_change`/`on_receive`.
     effect_cells: HashMap<(Site, String), Rc<dyn std::any::Any>>,
     next_store_id: u64,
@@ -146,6 +157,8 @@ pub fn begin_pass() {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         registry.pass_active = true;
+        registry.serving = true;
+        registry.missed.clear();
         registry.pass_root = None;
         registry.path.clear();
         registry.joined.clear();
@@ -168,6 +181,9 @@ pub fn end_pass() -> Vec<String> {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         registry.pass_active = false;
+        // the pass is over: a write from here on is nobody's own
+        registry.serving = false;
+        registry.served.clear();
         // the root stays readable until the next begin_pass (the runtime
         // consults it to scope dirty state and effects)
         let Some(root) = registry.pass_root.clone() else {
@@ -307,6 +323,7 @@ pub fn take_dirty_under(root: &str) -> HashSet<String> {
                 *path == ROOT_READER || *path == root || path.starts_with(&prefix)
             });
         registry.dirty = kept;
+        registry.served = taken.clone();
         taken
     })
 }
@@ -317,7 +334,9 @@ pub fn take_dirty_under(root: &str) -> HashSet<String> {
 /// view like any dirty one; consumption stays with the pass.
 pub fn invalidate(path: &str) {
     REGISTRY.with(|registry| {
-        registry.borrow_mut().dirty.insert(path.to_string());
+        let mut registry = registry.borrow_mut();
+        note_missed(&mut registry, std::iter::once(path));
+        registry.dirty.insert(path.to_string());
     });
 }
 
@@ -338,17 +357,53 @@ pub fn has_dirty_matching(root: &str) -> bool {
 /// End of the pass: consumes from the registry the dirt this pass served —
 /// the intersection of the snapshot with the root (and the root region).
 /// What came from writes during render stays; what belongs to another root
-/// stays.
+/// stays; and a view the snapshot held that a write reached after its body
+/// ran stays too — the pass ran it, but before the write (T2-BUNNY-277).
 pub fn consume_dirty(root: &str, snapshot: &HashSet<String>) {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
+        let registry = &mut *registry;
         let prefix = format!("{root}/");
         for path in snapshot {
-            if path == ROOT_READER || path == root || path.starts_with(&prefix) {
+            if (path == ROOT_READER || path == root || path.starts_with(&prefix))
+                && !registry.missed.contains(path)
+            {
                 registry.dirty.remove(path);
             }
         }
+        registry.serving = false;
+        registry.missed.clear();
     });
+}
+
+/// Records which of `readers` a write during the pass reached too late:
+/// their body already ran in it, and their frame is closed. A reader whose
+/// frame is still OPEN is the writer itself, or an ancestor of it, mid-body —
+/// sending it round again for its own write would never let the frame rest,
+/// since a write always notifies.
+/// Is this reader's dirt served by the pass under way? The pass took
+/// its dirt, and either its frame is still open — the write is its own,
+/// and sending it round again would never let the frame rest — or the
+/// pass has not reached it yet and it reads the new value when it runs.
+/// A reader the pass did not take keeps the write for the next one.
+fn served_by_this_pass(registry: &Registry, reader: &str) -> bool {
+    if !registry.served.contains(reader) {
+        return false;
+    }
+    let open = registry.views.iter().any(|len| &registry.joined[..*len] == reader);
+    open || !registry.reran.contains(reader)
+}
+
+fn note_missed<'a>(registry: &mut Registry, readers: impl Iterator<Item = &'a str>) {
+    if !registry.serving {
+        return;
+    }
+    let open = |reader: &str| registry.views.iter().any(|len| &registry.joined[..*len] == reader);
+    let late: Vec<String> = readers
+        .filter(|reader| registry.reran.contains(*reader) && !open(reader))
+        .map(str::to_string)
+        .collect();
+    registry.missed.extend(late);
 }
 
 /// The first segment pushed in the current pass (or in the last one closed).
@@ -887,10 +942,20 @@ pub(crate) fn record_write(key: DepKey) {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         // two fields of one registry: the readers are read, the dirty set
-        // is written — no copy of the reader set in between
+        // is written — and a reader that already ran this pass is noted
         let registry = &mut *registry;
-        if let Some(readers) = registry.readers.get(&key) {
-            registry.dirty.extend(readers.iter().cloned());
+        if let Some(readers) = registry.readers.get(&key).cloned() {
+            note_missed(registry, readers.iter().map(String::as_str));
+            for reader in readers {
+                // a write DURING a pass is served by it when the pass took
+                // the reader's dirt and the reader's frame is still open
+                // (its own write) or still to come — it reads the new value
+                // then. Any other reader keeps the write for the next pass
+                if registry.serving && served_by_this_pass(registry, &reader) {
+                    continue;
+                }
+                registry.dirty.insert(reader);
+            }
         }
         if let Some(bindings) = registry.binding_readers.get(&key) {
             registry.dirty_bindings.extend(bindings.iter().cloned());

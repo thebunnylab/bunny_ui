@@ -40,6 +40,7 @@ use bunny_ui::gpu::walk::{
     RoundClip, RunAtlas, RunKind, SpriteInstance, build_frame,
 };
 use bunny_ui::image_engine::ImageEngine;
+use bunny_ui::image_engine::PixelFormat;
 use bunny_ui::image_engine::ImageSource;
 use bunny_ui::layout::{Color, DisplayList, Size};
 use bunny_ui::text_engine::TextEngine;
@@ -126,6 +127,24 @@ unsafe extern "C" {
         level: u64,
         bytes: *const c_void,
         per_row: u64,
+    );
+    // `copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:
+    // sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:`
+    // — `MTLSize` and `MTLOrigin` are 3×u64 aggregates, passed INDIRECTLY
+    // like the region above.
+    #[link_name = "objc_msgSend"]
+    fn msg_void_blit(
+        obj: Id,
+        sel: Sel,
+        buffer: Id,
+        offset: u64,
+        per_row: u64,
+        per_image: u64,
+        size: MTLSize,
+        texture: Id,
+        slice: u64,
+        level: u64,
+        origin: MTLOrigin,
     );
 }
 
@@ -429,6 +448,22 @@ fragment float4 sprite_fragment(SpriteVary in [[stage_in]],
     return float4(ink.rgb, ink.a * clip_cov(in.position.xy, round));
 }
 
+// a feed's sprite: the picture is its own size and the box is another,
+// so the sampler scales — linear — from the pixel's centre in the box
+// to its place in the picture. Pixel coordinates, no normalisation.
+constexpr sampler live_sampler(coord::pixel, filter::linear, address::clamp_to_edge);
+
+fragment float4 live_fragment(SpriteVary in [[stage_in]],
+                              device const SpriteInstance* sprites [[buffer(0)]],
+                              constant ClipRound& round [[buffer(1)]],
+                              texture2d<float> live [[texture(0)]]) {
+    SpriteInstance sprite = sprites[in.id];
+    float2 ratio = (sprite.tex.zw - sprite.tex.xy) / (sprite.dest.zw - sprite.dest.xy);
+    float2 texel = sprite.tex.xy + (in.position.xy - sprite.dest.xy) * ratio;
+    float4 ink = live.sample(live_sampler, texel);
+    return float4(ink.rgb, ink.a * clip_cov(in.position.xy, round));
+}
+
 // MARK: - Liquid glass
 //
 // The material of `glass.rs`, textually. Every constant below is that
@@ -722,6 +757,9 @@ struct Sels {
     retain: Sel,
     release: Sel,
     contents: Sel,
+    /// The blit pass a frame with feeds opens first.
+    blit_encoder: Sel,
+    copy_to_texture: Sel,
 }
 
 impl Sels {
@@ -762,6 +800,11 @@ impl Sels {
                 retain: sel("retain"),
                 release: sel("release"),
                 contents: sel("contents"),
+                blit_encoder: sel("blitCommandEncoder"),
+                copy_to_texture: sel(
+                    "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:\
+                     sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
+                ),
             }
         }
     }
@@ -776,6 +819,9 @@ struct MetalStack {
     queue: Id,
     rect_pipeline: Id,
     sprite_pipeline: Id,
+    /// The feeds' pipeline: the sprite vertex over a LINEAR sampler, so
+    /// a picture of one size lands in a box of another.
+    live_pipeline: Id,
     /// The three pipelines liquid glass adds: the pane itself, one
     /// separable blur pass, and the copy of the offscreen scene onto
     /// the target a frame with glass cannot render into directly.
@@ -789,9 +835,45 @@ struct MetalStack {
     sels: Sels,
 }
 
-unsafe fn default_device() -> Option<Id> {
+pub(crate) unsafe fn default_device() -> Option<Id> {
     let device = unsafe { MTLCreateSystemDefaultDevice() };
     (!device.is_null()).then_some(device)
+}
+
+/// A shared-storage, shader-read texture of `pixel_format` the CPU may
+/// fill with `upload_texture` — the atlas's own kind, by any format.
+pub(crate) unsafe fn shared_texture(device: Id, pixel_format: u64, width: u32, height: u32) -> Id {
+    unsafe {
+        let descriptor = msg_id_u64_u64_u64_bool(
+            class("MTLTextureDescriptor"),
+            sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
+            pixel_format,
+            width as u64,
+            height as u64,
+            0,
+        );
+        msg_void_u64(descriptor, sel("setUsage:"), TEXTURE_USAGE_SHADER_READ);
+        msg_void_u64(descriptor, sel("setStorageMode:"), STORAGE_MODE_SHARED);
+        msg_id_arg(device, sel("newTextureWithDescriptor:"), descriptor)
+    }
+}
+
+/// One tile of rows into a shared texture: `bytes` starts at the tile's
+/// first texel and the rows are `pitch_px` apart (four bytes a pixel).
+pub(crate) unsafe fn upload_texture(texture: Id, x: u32, y: u32, w: u32, h: u32, bytes: &[u8], pitch_px: u32) {
+    unsafe {
+        msg_void_region_u64_ptr_u64(
+            texture,
+            sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
+            MTLRegion {
+                origin: MTLOrigin { x: x as u64, y: y as u64, z: 0 },
+                size: MTLSize { width: w as u64, height: h as u64, depth: 1 },
+            },
+            0,
+            bytes.as_ptr() as *const c_void,
+            (pitch_px * 4) as u64,
+        );
+    }
 }
 
 impl MetalStack {
@@ -831,6 +913,8 @@ impl MetalStack {
                 build_pipeline(device, library, "rect_vertex", "rect_fragment", format, true)?;
             let sprite_pipeline =
                 build_pipeline(device, library, "sprite_vertex", "sprite_fragment", format, true)?;
+            let live_pipeline =
+                build_pipeline(device, library, "sprite_vertex", "live_fragment", format, true)?;
             // a pane blends over the scene like any other paint; the
             // blur and the blit REPLACE what they write (a pass that
             // covers its whole destination has nothing to keep)
@@ -852,6 +936,7 @@ impl MetalStack {
                 queue,
                 rect_pipeline,
                 sprite_pipeline,
+                live_pipeline,
                 glass_pipeline,
                 blur_pipeline,
                 blit_pipeline,
@@ -882,6 +967,28 @@ impl MetalStack {
     unsafe fn encode_frame(&self, frame: EncodeFrame) -> Id {
         unsafe {
             let command = msg_id(self.queue, self.sels.command_buffer);
+            // the feeds' new bytes land first, from the slot's staging
+            // buffer, on the queue — after every earlier frame that still
+            // samples the textures, before this one does
+            if !frame.live_copies.is_empty() {
+                let blit = msg_id(command, self.sels.blit_encoder);
+                for copy in frame.live_copies {
+                    msg_void_blit(
+                        blit,
+                        self.sels.copy_to_texture,
+                        frame.staging,
+                        copy.offset,
+                        copy.per_row,
+                        copy.per_row * copy.height,
+                        MTLSize { width: copy.width, height: copy.height, depth: 1 },
+                        copy.texture,
+                        0,
+                        0,
+                        MTLOrigin { x: 0, y: 0, z: 0 },
+                    );
+                }
+                msg_void(blit, self.sels.end_encoding);
+            }
             let mut cleared = false;
             let mut index = 0;
             while index < frame.runs.len() {
@@ -990,8 +1097,12 @@ impl MetalStack {
                                     0,
                                 );
                             }
-                            RunKind::Sprites | RunKind::Texture(_) => {
-                                msg_void_id(encoder, self.sels.set_pipeline, self.sprite_pipeline);
+                            RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) => {
+                                let pipeline = match run.kind {
+                                    RunKind::Live(_) => self.live_pipeline,
+                                    _ => self.sprite_pipeline,
+                                };
+                                msg_void_id(encoder, self.sels.set_pipeline, pipeline);
                                 msg_void_id_u64_u64(
                                     encoder,
                                     self.sels.set_vertex_buffer,
@@ -1007,9 +1118,11 @@ impl MetalStack {
                                     0,
                                 );
                                 // the shared atlas, or the run's own
-                                // dedicated texture — same pipeline
+                                // dedicated or live texture
                                 let texture = match run.kind {
-                                    RunKind::Texture(index) => frame.textures[index as usize],
+                                    RunKind::Texture(index) | RunKind::Live(index) => {
+                                        frame.textures[index as usize]
+                                    }
                                     _ => frame.atlas_texture,
                                 };
                                 msg_void_id_u64(
@@ -1217,6 +1330,9 @@ struct EncodeFrame<'a> {
     atlas_texture: Id,
     textures: &'a [Id],
     pyramid: Option<&'a GlassTextures>,
+    /// The slot's staging buffer, and the feeds' copies out of it.
+    staging: Id,
+    live_copies: &'a [LiveCopy],
 }
 
 /// The textures liquid glass needs: the ping and pong of the blur
@@ -1375,15 +1491,117 @@ struct MetalGround {
     device: Id,
     /// The shared atlas texture, or null until the first tile asks.
     shared: Id,
-    /// The dedicated textures by the handle the walk was given.
+    /// The dedicated AND live textures by the handle the walk was given.
     textures: HashMap<u64, Id>,
     next: u64,
     native: HashMap<u64, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// One staging buffer per ring slot: a feed's new bytes are copied
+    /// here while the walk runs, and the frame's command buffer copies
+    /// them into the texture — after every earlier frame that still
+    /// samples it, which `replaceRegion` could not promise.
+    staging: [Staging; 3],
+    /// The slot the frame in progress stages into.
+    slot: usize,
+    /// The copies the frame's blit pass makes, in order.
+    pending: Vec<LiveCopy>,
 }
+
+/// The staging buffer of one ring slot. Grows when a frame's feeds
+/// outgrow it; the buffer it grew out of waits in `retired` until the
+/// slot comes round again, because the command buffer in flight still
+/// reads it.
+struct Staging {
+    buffer: Id,
+    capacity: usize,
+    cursor: usize,
+    retired: Vec<Id>,
+}
+
+/// One feed's bytes, staged: where they lie in the slot's buffer and
+/// the texture they go to. The blit pass at the head of the frame
+/// moves them.
+#[derive(Clone, Copy)]
+struct LiveCopy {
+    texture: Id,
+    offset: u64,
+    per_row: u64,
+    width: u64,
+    height: u64,
+}
+
+/// A blit's source offset rides a 256-byte boundary — the alignment
+/// every Metal buffer copy accepts.
+const STAGING_ALIGN: usize = 256;
 
 impl MetalGround {
     fn new(device: Id) -> MetalGround {
-        MetalGround { device, shared: null_mut(), textures: HashMap::new(), next: 1, native: HashMap::new() }
+        MetalGround {
+            device,
+            shared: null_mut(),
+            textures: HashMap::new(),
+            next: 1,
+            native: HashMap::new(),
+            staging: std::array::from_fn(|_| Staging {
+                buffer: null_mut(),
+                capacity: 0,
+                cursor: 0,
+                retired: Vec::new(),
+            }),
+            slot: 0,
+            pending: Vec::new(),
+        }
+    }
+
+    /// The frame about to walk stages into ring slot `index` — whose
+    /// previous command buffer has completed, so its buffer is free and
+    /// the buffers it retired can go.
+    fn begin_slot(&mut self, index: usize) {
+        self.slot = index;
+        let staging = &mut self.staging[index];
+        staging.cursor = 0;
+        for buffer in staging.retired.drain(..) {
+            unsafe { msg_void(buffer, sel("release")) };
+        }
+        self.pending.clear();
+    }
+
+    /// Room for `bytes` in the slot's staging buffer, 256-aligned —
+    /// grown when short, the old buffer kept until the slot comes round.
+    unsafe fn stage(&mut self, bytes: &[u8]) -> u64 {
+        unsafe {
+            let staging = &mut self.staging[self.slot];
+            let offset = staging.cursor.next_multiple_of(STAGING_ALIGN);
+            let needed = offset + bytes.len();
+            if staging.buffer.is_null() || staging.capacity < needed {
+                let capacity = (needed * 2).next_multiple_of(4096);
+                crate::trace::mark("X", format_args!("what=staging-grow bytes={capacity}"));
+                let grown = msg_id_u64_u64(
+                    self.device,
+                    sel("newBufferWithLength:options:"),
+                    capacity as u64,
+                    RESOURCE_SHARED_WRITE_COMBINED,
+                );
+                if !staging.buffer.is_null() {
+                    // the copies already recorded keep their offsets: the
+                    // bytes move with them, the old buffer waits its turn
+                    let from = msg_id(staging.buffer, sel("contents")) as *const u8;
+                    let to = msg_id(grown, sel("contents")) as *mut u8;
+                    std::ptr::copy_nonoverlapping(from, to, staging.cursor);
+                    staging.retired.push(staging.buffer);
+                }
+                staging.buffer = grown;
+                staging.capacity = capacity;
+            }
+            let contents = msg_id(staging.buffer, sel("contents")) as *mut u8;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents.add(offset), bytes.len());
+            staging.cursor = needed;
+            offset as u64
+        }
+    }
+
+    /// The staging buffer the frame's copies read from.
+    fn staging_buffer(&self) -> Id {
+        self.staging[self.slot].buffer
     }
 
     /// Release this walk's native imports. In-flight slots retain their leases.
@@ -1410,55 +1628,26 @@ impl MetalGround {
     /// A shared-storage RGBA texture the CPU writes into directly (the
     /// Apple-Silicon premise of the module), read by the sprite pass.
     unsafe fn make_texture(&self, width: u32, height: u32) -> Id {
-        unsafe {
-            let descriptor = msg_id_u64_u64_u64_bool(
-                class("MTLTextureDescriptor"),
-                sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
-                PIXEL_FORMAT_RGBA8,
-                width as u64,
-                height as u64,
-                0,
-            );
-            msg_void_u64(descriptor, sel("setUsage:"), TEXTURE_USAGE_SHADER_READ);
-            msg_void_u64(descriptor, sel("setStorageMode:"), STORAGE_MODE_SHARED);
-            msg_id_arg(self.device, sel("newTextureWithDescriptor:"), descriptor)
-        }
+        unsafe { shared_texture(self.device, PIXEL_FORMAT_RGBA8, width, height) }
     }
 
     /// One tile of straight-RGBA rows into a texture: `bytes` starts at
     /// the tile's first texel and the rows are `pitch_px` apart.
     unsafe fn upload(texture: Id, x: u32, y: u32, w: u32, h: u32, bytes: &[u8], pitch_px: u32) {
-        unsafe {
-            msg_void_region_u64_ptr_u64(
-                texture,
-                sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
-                MTLRegion {
-                    origin: MTLOrigin { x: x as u64, y: y as u64, z: 0 },
-                    size: MTLSize { width: w as u64, height: h as u64, depth: 1 },
-                },
-                0,
-                bytes.as_ptr() as *const c_void,
-                (pitch_px * 4) as u64,
-            );
-        }
+        unsafe { upload_texture(texture, x, y, w, h, bytes, pitch_px) }
     }
 }
 
 impl AtlasGround for MetalGround {
     fn import_native(&mut self, source: &ImageSource) -> Option<u64> {
-        #[cfg(feature = "wgpu-surface")]
-        {
-            let ImageSource::Native { payload, .. } = source else { return None };
-            let surface = payload.downcast_ref::<crate::surface::MetalFrame>()?;
-            let texture = surface.import(self.device)?;
-            let id = self.next;
-            self.next += 1;
-            self.textures.insert(id, texture);
-            self.native.insert(id, payload.clone());
-            Some(id)
-        }
-        #[cfg(not(feature = "wgpu-surface"))]
-        { let _ = source; None }
+        let ImageSource::Native { payload, .. } = source else { return None };
+        let frame = payload.downcast_ref::<crate::surface::MetalFrame>()?;
+        let texture = frame.import(self.device)?;
+        let id = self.next;
+        self.next += 1;
+        self.textures.insert(id, texture);
+        self.native.insert(id, payload.clone());
+        Some(id)
     }
 
     fn ensure_shared(&mut self, size: u32) -> bool {
@@ -1500,6 +1689,58 @@ impl AtlasGround for MetalGround {
             unsafe { msg_void(texture, sel("release")) };
         }
     }
+
+    fn make_live(&mut self, w: u32, h: u32, format: PixelFormat) -> Option<u64> {
+        let PixelFormat::Rgba8 = format else { return None };
+        let texture = unsafe {
+            let descriptor = msg_id_u64_u64_u64_bool(
+                class("MTLTextureDescriptor"),
+                sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
+                PIXEL_FORMAT_RGBA8,
+                w as u64,
+                h as u64,
+                0,
+            );
+            msg_void_u64(descriptor, sel("setUsage:"), TEXTURE_USAGE_SHADER_READ);
+            // the GPU alone writes it, from the staging buffer, in order
+            msg_void_u64(descriptor, sel("setStorageMode:"), STORAGE_MODE_PRIVATE);
+            msg_id_arg(self.device, sel("newTextureWithDescriptor:"), descriptor)
+        };
+        if texture.is_null() {
+            return None;
+        }
+        let id = self.next;
+        self.next += 1;
+        self.textures.insert(id, texture);
+        Some(id)
+    }
+
+    fn update_live(&mut self, id: u64, w: u32, h: u32, bytes: &[u8], pitch_px: u32) -> bool {
+        let Some(&texture) = self.textures.get(&id) else { return false };
+        let per_row = pitch_px as usize * 4;
+        let needed = (h as usize - 1) * per_row + w as usize * 4;
+        if bytes.len() < needed {
+            return false;
+        }
+        let offset = unsafe { self.stage(&bytes[..needed]) };
+        // one copy per texture per frame — the newest bytes win
+        self.pending.retain(|copy| copy.texture != texture);
+        self.pending.push(LiveCopy {
+            texture,
+            offset,
+            per_row: per_row as u64,
+            width: w as u64,
+            height: h as u64,
+        });
+        true
+    }
+
+    fn drop_live(&mut self, id: u64) {
+        if let Some(texture) = self.textures.remove(&id) {
+            self.pending.retain(|copy| copy.texture != texture);
+            unsafe { msg_void(texture, sel("release")) };
+        }
+    }
 }
 
 // MARK: - Instance buffers (a fixed ring, recycled by polling)
@@ -1535,7 +1776,19 @@ impl Drop for FrameSlot {
     }
 }
 impl Drop for MetalGround {
-    fn drop(&mut self) { self.clear_native(); }
+    fn drop(&mut self) {
+        self.clear_native();
+        for staging in &mut self.staging {
+            unsafe {
+                if !staging.buffer.is_null() {
+                    msg_void(staging.buffer, sel("release"));
+                }
+                for buffer in staging.retired.drain(..) {
+                    msg_void(buffer, sel("release"));
+                }
+            }
+        }
+    }
 }
 
 /// A free slot from a ring: polled by `status`, oldest-first. When all
@@ -1830,13 +2083,16 @@ impl MetalPresenter {
                 self.physical = physical;
                 self.scale = scale;
             }
+            // the slot FIRST: the walk stages the feeds' bytes into its
+            // buffer, which is free only once its last frame completed
+            let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
+            self.ground.begin_slot(index);
             self.build_with_retries(display, scale, physical, text, images);
             // the contract of THIS frame's drawable, settled before it
             // is asked for. A window whose delegate armed the drag
             // already agrees and this changes nothing; a size the app
             // set itself has no delegate to speak for it, and lands here
             self.set_transactional(live);
-            let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
             let (sprite_offset, glass_offset) = upload_frame(
                 &mut self.slots[index],
                 self.stack.device,
@@ -1876,6 +2132,8 @@ impl MetalPresenter {
                 atlas_texture: self.ground.shared,
                 textures: &textures,
                 pyramid,
+                staging: self.ground.staging_buffer(),
+                live_copies: &self.ground.pending,
             });
             // live resize presents INSIDE the CATransaction: commit,
             // wait for the schedule, present — layer content and window
@@ -2075,6 +2333,9 @@ impl OffscreenGpu {
     ) {
         unsafe {
             let pool = objc_autoreleasePoolPush();
+            // the slot first, as the window does: the feeds stage into it
+            let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
+            self.ground.begin_slot(index);
             self.ground.clear_native();
             for attempt in 0..3 {
                 match build_frame(
@@ -2098,7 +2359,6 @@ impl OffscreenGpu {
                     }
                 }
             }
-            let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
             let (sprite_offset, glass_offset) = upload_frame(
                 &mut self.slots[index],
                 self.stack.device,
@@ -2131,6 +2391,8 @@ impl OffscreenGpu {
                 atlas_texture: self.ground.shared,
                 textures: &textures,
                 pyramid,
+                staging: self.ground.staging_buffer(),
+                live_copies: &self.ground.pending,
             });
             msg_void(command, self.stack.sels.commit);
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
@@ -2876,6 +3138,144 @@ mod tests {
         gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
         assert_eq!(gpu.atlas.images.len() + gpu.atlas.dedicated.len(), 70, "every photo is somewhere");
         assert!(!gpu.atlas.dedicated.is_empty(), "the overflow took textures of its own");
+    }
+
+    // MARK: - Feeds
+
+    /// A `w`×`h` gradient as the next frame of `feed`, `phase` in blue.
+    fn feed_frame(feed: &ImageFeed, (w, h): (u32, u32), phase: u8) {
+        let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
+        for y in 0..h {
+            for x in 0..w {
+                rgba.extend_from_slice(&[
+                    ((x * 255) / w.max(1)) as u8,
+                    ((y * 255) / h.max(1)) as u8,
+                    phase,
+                    255,
+                ]);
+            }
+        }
+        feed.push((w, h), rgba);
+    }
+
+    /// Every channel within `max_delta` — the gate for a picture the two
+    /// roads SCALE. Both filter bilinear in their own arithmetic, so
+    /// nearly every pixel may sit a step apart and `assert_close`'s one
+    /// percent rule is not the question here; byte equality at 1:1 is
+    /// asserted on its own.
+    fn assert_filtered_close(gpu: &[u8], cpu: &[u8], max_delta: u8, label: &str) {
+        assert_eq!(gpu.len(), cpu.len(), "{label}: byte lengths differ");
+        let worst = max_channel_delta(gpu, cpu);
+        assert!(worst <= max_delta, "{label}: worst channel delta {worst} (allowed {max_delta})");
+    }
+
+    #[test]
+    fn a_feed_at_one_to_one_matches_the_raster_byte_for_byte() {
+        if !device_present() {
+            return;
+        }
+        let feed = ImageFeed::new();
+        feed_frame(&feed, (64, 48), 7);
+        // 32×24 pt at scale 2 is 64×48 px: the picture's own size, and
+        // a linear sampler on a texel centre reads the texel
+        let root = image(&feed).resizable().frame(32.0, 24.0);
+        let (gpu, cpu) = scene_bytes(&root, Size { width: 40.0, height: 30.0 }, 2, Color::CANVAS);
+        assert!(
+            gpu == cpu,
+            "a 1:1 feed diverged (max channel delta {})",
+            max_channel_delta(&gpu, &cpu)
+        );
+    }
+
+    #[test]
+    fn a_feed_scaled_up_and_down_matches_within_tolerance() {
+        if !device_present() {
+            return;
+        }
+        let feed = ImageFeed::new();
+        feed_frame(&feed, (32, 24), 7);
+        // 4× up, covering a box of another shape (the cover's own clip
+        // cuts it), and ½× down beside it
+        let root = hstack((
+            image(&feed).resizable().aspect_ratio(ContentMode::Fill).frame(64.0, 30.0),
+            image(&feed).resizable().frame(8.0, 6.0),
+        ));
+        let (gpu, cpu) = scene_bytes(&root, Size { width: 100.0, height: 60.0 }, 2, Color::CANVAS);
+        assert_filtered_close(&gpu, &cpu, 3, "scaled feed");
+    }
+
+    #[test]
+    fn a_feed_keeps_one_texture_across_many_generations() {
+        if !device_present() {
+            return;
+        }
+        let feed = ImageFeed::new();
+        let engine = RawImages::default();
+        let mut gpu = OffscreenGpu::new(640, 480).expect("offscreen gpu");
+        for generation in 0..100u8 {
+            feed_frame(&feed, (64, 48), generation);
+            let runtime = Runtime::new();
+            let display = runtime.display_frame(
+                &image(&feed).resizable().frame(300.0, 200.0),
+                Size { width: 320.0, height: 240.0 },
+            );
+            gpu.present_nowait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        }
+        gpu.drain();
+        assert_eq!(gpu.atlas.live.len(), 1, "one live texture for one feed");
+        assert!(gpu.atlas.dedicated.is_empty(), "a feed never mints a dedicated texture");
+        assert_eq!(gpu.ground.textures.len(), 1, "and the ground holds exactly it");
+        assert_eq!(gpu.atlas.reset_walk, 0, "no walk ever reset the atlas");
+    }
+
+    #[test]
+    fn a_feed_beside_a_crowd_never_drains() {
+        if !device_present() {
+            return;
+        }
+        // twelve photos over the dedicated cap, warm after the first
+        // frame, and a feed changing under them: the collector is asked
+        // only when something new wants a dedicated texture — a feed is
+        // not that, however many frames it brings
+        let feed = ImageFeed::new();
+        let engine = RawImages::default();
+        let mut gpu = OffscreenGpu::new(1200, 600).expect("offscreen gpu");
+        for generation in 0..20u8 {
+            feed_frame(&feed, (64, 48), generation);
+            let runtime = Runtime::new();
+            let display = runtime.display_frame(
+                &vstack((crowd_scene(10), image(&feed).resizable().frame(200.0, 150.0))),
+                Size { width: 600.0, height: 300.0 },
+            );
+            gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        }
+        assert_eq!(gpu.atlas.dedicated.len(), 12, "the crowd keeps its textures");
+        assert_eq!(gpu.atlas.live.len(), 1);
+        assert_eq!(gpu.atlas.reset_walk, 0, "twenty frames of feed never asked the collector");
+    }
+
+    #[test]
+    fn an_idle_feed_retires() {
+        if !device_present() {
+            return;
+        }
+        let feed = ImageFeed::new();
+        feed_frame(&feed, (16, 16), 1);
+        let engine = RawImages::default();
+        let mut gpu = OffscreenGpu::new(200, 200).expect("offscreen gpu");
+        let shown = Runtime::new().display_frame(
+            &image(&feed).resizable().frame(50.0, 50.0),
+            Size { width: 100.0, height: 100.0 },
+        );
+        gpu.present_wait(&shown, 2, Color::CANVAS, &PixelFont, &engine);
+        assert_eq!(gpu.atlas.live.len(), 1);
+        let empty = Runtime::new()
+            .display_frame(&spacer().frame(100.0, 100.0), Size { width: 100.0, height: 100.0 });
+        for _ in 0..=bunny_ui::gpu::walk::LIVE_IDLE_WALKS {
+            gpu.present_wait(&empty, 2, Color::CANVAS, &PixelFont, &engine);
+        }
+        assert!(gpu.atlas.live.is_empty(), "the texture was given back");
+        assert!(gpu.ground.textures.is_empty(), "and the ground released it");
     }
 
     // MARK: - Icons

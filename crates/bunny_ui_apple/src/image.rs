@@ -276,6 +276,7 @@ impl CoreGraphicsImageEngine {
             | ImageSource::Path { .. }
             | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
+            | ImageSource::Feed { .. }
             | ImageSource::Faded { .. } => std::ptr::null_mut(),
         };
         let entry = (!image.is_null()).then(|| OwnedImage(image));
@@ -331,6 +332,7 @@ impl ImageEngine for CoreGraphicsImageEngine {
             | ImageSource::Path { .. }
             | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
+            | ImageSource::Feed { .. }
             | ImageSource::Faded { .. } => {
                 debug_assert!(false, "a house drawing never reaches an engine");
                 return None;

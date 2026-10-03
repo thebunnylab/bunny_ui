@@ -1134,7 +1134,12 @@ pub(crate) fn run_isolated(root: &str) {
             .cloned()
             .collect()
     });
-    pending.sort_by_key(|path| path.len());
+    // shallower first, so an ancestor's run covers its dirty descendants —
+    // then by path, so siblings of one depth run in ONE order. The set they
+    // come from has none of its own, and a write one makes during the pass
+    // reached the other before or after its body by the hash's whim
+    // (T2-BUNNY-277).
+    pending.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
 
     for path in pending {
         let already_ran = PASS.with(|pass| {

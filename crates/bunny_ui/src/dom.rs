@@ -92,6 +92,14 @@ pub enum DomKind {
     /// from memory under its network policy, held as `srcdoc` inside
     /// the browser's sandbox with no powers (`docs/webview.md`).
     Iframe { src: std::rc::Rc<str>, sealed: bool },
+    /// A `<video>` — the video host's web lowering: the browser's own
+    /// element playing a media stream the PAGE owns, named by the
+    /// handle the glue's registry answered (`stream`; zero names no
+    /// stream). The browser decodes and composites it; no pixel
+    /// crosses the border in either direction. The element is wired to
+    /// its stream once — a changed handle rewires it, a changed flag
+    /// alone never restarts the playback (`docs/video.md`).
+    Video { stream: u32, mirrored: bool, cover: bool, radius: f32 },
     /// A flow container: `display:flex; flex-direction:column`. Two
     /// variants instead of a payload so the keyed match's discriminant
     /// tells the axes apart — an axis change recreates the element.
@@ -866,6 +874,8 @@ pub enum CreateKind {
     Editor,
     /// An `<iframe>`: the native host's page.
     Iframe,
+    /// A `<video>`: the video host's stream, played by the browser.
+    Video,
 }
 
 /// One island's display list and the box it paints into — what a tier
@@ -965,6 +975,11 @@ pub enum DomPatch {
     /// the write is the navigation (writing the same one would
     /// reload).
     SetIframe { id: u32, src: std::rc::Rc<str>, sealed: bool },
+    /// The video's whole record — the diff ships it on ANY change, and
+    /// the glue decides what to touch: the fit, the mirror and the
+    /// radius are attribute writes, the stream is a rewire it performs
+    /// only when the handle changed (a rewrite restarts playback).
+    SetVideo { id: u32, stream: u32, mirrored: bool, cover: bool, radius: f32 },
     /// The FULL flow record — the glue resets and applies, the exact
     /// twin of `SetStyle` for the other half of an element's truth.
     /// The element moves before sibling `before` (0 = to the end)
@@ -1586,6 +1601,7 @@ fn look_hash(node: &DomNode) -> u64 {
         DomKind::Layers => 13,
         DomKind::Reuse { .. } => 14,
         DomKind::Popover { .. } => 15,
+        DomKind::Video { .. } => 16,
     };
     kind.hash(&mut hasher);
     match &node.layout {
@@ -1786,6 +1802,7 @@ fn create_kind(kind: &DomKind) -> CreateKind {
         DomKind::Image(_) => CreateKind::Image,
         DomKind::Icon(_) => CreateKind::Icon,
         DomKind::Iframe { .. } => CreateKind::Iframe,
+        DomKind::Video { .. } => CreateKind::Video,
         DomKind::FlexColumn => CreateKind::FlexColumn,
         DomKind::FlexRow => CreateKind::FlexRow,
         DomKind::Layers => CreateKind::Layers,
@@ -2185,6 +2202,15 @@ fn create_subtree(
         DomKind::Iframe { src, sealed } => {
             patches.push(DomPatch::SetIframe { id, src: std::rc::Rc::clone(src), sealed: *sealed });
         }
+        DomKind::Video { stream, mirrored, cover, radius } => {
+            patches.push(DomPatch::SetVideo {
+                id,
+                stream: *stream,
+                mirrored: *mirrored,
+                cover: *cover,
+                radius: *radius,
+            });
+        }
         _ => {}
     }
     let children = std::mem::take(&mut node.children);
@@ -2473,6 +2499,19 @@ fn diff_node(
             DomKind::Iframe { src: after, sealed: is },
         ) if before != after || was != is => {
             patches.push(DomPatch::SetIframe { id, src: std::rc::Rc::clone(after), sealed: *is });
+        }
+        // the whole record rides on any change; the glue keeps the
+        // playback where the stream is the same
+        (DomKind::Video { .. }, DomKind::Video { stream, mirrored, cover, radius })
+            if old.kind != new.kind =>
+        {
+            patches.push(DomPatch::SetVideo {
+                id,
+                stream: *stream,
+                mirrored: *mirrored,
+                cover: *cover,
+                radius: *radius,
+            });
         }
         _ => {}
     }
@@ -2828,7 +2867,7 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 ///
 /// Bump this constant when ANY of these change:
 /// - the op codes or their payloads (the table on [`encode`])
-/// - the create kinds (0 group .. 14 iframe)
+/// - the create kinds (0 group .. 15 video)
 /// - the style mask bits or their field order
 /// - the weight or truncation codes
 /// - the key table or the modifier bits (the shell's `named_key`)
@@ -2879,7 +2918,12 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 /// takes the face declared above it and its look names no font; the
 /// root's look and the look of a box whose modifiers changed the face
 /// carry that face as their text record, words aside.
-pub const ABI_VERSION: u32 = 15;
+///
+/// 16 (2026-10-03): the video host — create kind 15 and op 25
+/// (`SetVideo`), and the canvas shell's three host verbs
+/// (`js_host_begin`, `js_host_video`, `js_host_end`) in the `./bunny.js`
+/// module.
+pub const ABI_VERSION: u32 = 16;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -2893,7 +2937,8 @@ pub const ABI_VERSION: u32 = 15;
 ///                            4 scroll, 5 content, 6 canvas, 7 image,
 ///                            8 icon, 9 flex column, 10 flex row,
 ///                            11 layers, 12 popover, 13 editor — the
-///                            field of many lines, a `<textarea>`)
+///                            field of many lines, a `<textarea>`,
+///                            14 iframe, 15 video)
 ///   2 remove        —
 ///   3 set transform f32 x, f32 y
 ///   4 set size      f32 w, f32 h
@@ -2994,6 +3039,11 @@ pub const ABI_VERSION: u32 = 15;
 ///  16 set iframe    u8 sealed, u32 len + utf8 — the url the frame
 ///                   navigates to, or (sealed) the DOCUMENT it holds
 ///                   as `srcdoc` inside a sandbox with no powers
+///  17 set video     u32 stream (the glue's handle; 0 = none), u8
+///                   mirrored, u8 cover (1 = `object-fit: cover`, 0 =
+///                   `contain`), f32 radius — the whole record; the
+///                   glue rewires the element only when the stream
+///                   changed, because a rewrite restarts playback
 /// ```
 pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
     crate::stats::time(crate::stats::Stage::Encode, || {
@@ -3142,6 +3192,14 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_u32(&mut out, *id);
                 out.push(u8::from(*sealed));
                 push_bytes_u32(&mut out, src.as_bytes());
+            }
+            DomPatch::SetVideo { id, stream, mirrored, cover, radius } => {
+                out.push(25);
+                push_u32(&mut out, *id);
+                push_u32(&mut out, *stream);
+                out.push(u8::from(*mirrored));
+                out.push(u8::from(*cover));
+                push_f32(&mut out, *radius as f64);
             }
             DomPatch::DefineRule { rule, kind, flags, style, layout, text } => {
                 out.push(21);
@@ -3530,6 +3588,7 @@ fn kind_code(kind: CreateKind) -> u8 {
         CreateKind::Popover => 12,
         CreateKind::Editor => 13,
         CreateKind::Iframe => 14,
+        CreateKind::Video => 15,
     }
 }
 
@@ -3619,6 +3678,7 @@ mod tests {
             | DomPatch::SetImage { id, .. }
             | DomPatch::SetIcon { id, .. }
             | DomPatch::SetIframe { id, .. }
+            | DomPatch::SetVideo { id, .. }
             | DomPatch::SetScroll { id, .. }
             | DomPatch::Move { id, .. }
             | DomPatch::Reveal { id, .. }
@@ -5688,6 +5748,89 @@ mod tests {
             sealed: true,
         }]);
         assert_eq!(&wire[4..], &[16, 7, 0, 0, 0, 1, 3, 0, 0, 0, b'<', b'p', b'>']);
+    }
+
+    /// A video mounts ONCE and its stream rides the mount; a frame that
+    /// changes nothing ships nothing; a flipped mirror is one patch that
+    /// carries the SAME stream — the glue rewires the element only when
+    /// the handle changed, because a rewrite restarts the playback — and
+    /// a new stream is one patch too, never a re-mount. The wire's shape
+    /// and the glue's gate are pinned beside it.
+    #[test]
+    fn a_video_creates_once_and_rewires_only_on_a_changed_stream() {
+        let mut lowering = DomLowering::default();
+        let display = crate::layout::DisplayList::default();
+        let feed = |stream: u32, mirrored: bool| {
+            flow_root(vec![DomNode {
+                kind: DomKind::Video { stream, mirrored, cover: true, radius: 12.0 },
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+                style: DomStyle::default(),
+                layout: Some(DomLayout {
+                    grow: true,
+                    stretch: true,
+                    ..DomLayout::default()
+                }),
+                hints: DomHints::default(),
+                children: Vec::new(),
+                binding: None,
+                face: None,
+            }])
+        };
+
+        let mount = lowering.lower(feed(3, false), &display);
+        assert_eq!(
+            mount
+                .iter()
+                .filter(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Video, .. }))
+                .count(),
+            1,
+            "the element mounts once, as a video: {mount:#?}"
+        );
+        assert!(
+            mount.iter().any(|patch| matches!(
+                patch,
+                DomPatch::SetVideo { stream: 3, mirrored: false, cover: true, .. }
+            )),
+            "the stream rides the mount: {mount:#?}"
+        );
+
+        let steady = lowering.lower(feed(3, false), &display);
+        assert!(steady.is_empty(), "an unchanged feed ships nothing: {steady:#?}");
+
+        let flipped = lowering.lower(feed(3, true), &display);
+        assert_eq!(flipped.len(), 1, "a flip is ONE patch: {flipped:#?}");
+        assert!(
+            matches!(&flipped[0], DomPatch::SetVideo { stream: 3, mirrored: true, .. }),
+            "the flip carries the same stream, so the glue leaves the playback alone: {flipped:#?}"
+        );
+
+        let switched = lowering.lower(feed(4, true), &display);
+        assert_eq!(switched.len(), 1, "a new stream is ONE patch: {switched:#?}");
+        assert!(
+            matches!(&switched[0], DomPatch::SetVideo { stream: 4, .. }),
+            "the element survives, its stream changes: {switched:#?}"
+        );
+
+        // the wire: op, id, the stream, the two flags, then the radius
+        let wire = encode(&[DomPatch::SetVideo {
+            id: 7,
+            stream: 3,
+            mirrored: true,
+            cover: false,
+            radius: 12.0,
+        }]);
+        assert_eq!(&wire[4..], &[25, 7, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0x40, 0x41]);
+
+        // the glue's gate: the handle is compared before the element is
+        // rewired, so a flag alone never restarts the playback
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        assert!(
+            glue.contains("if (el.__stream !== stream)"),
+            "glue_dom.js must rewire a video only on a changed stream"
+        );
     }
 
     /// A mid-list insert lands `before` its real next sibling — zero
