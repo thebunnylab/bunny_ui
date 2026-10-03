@@ -671,24 +671,29 @@ pub(crate) fn decide(path: &str) -> Decision {
 /// [`decide`], with the retained boundary's own path handed back when
 /// there is one: the one copy of it the page holds, for the marks and
 /// the reference to share instead of copying the path again.
-pub(crate) fn decide_at(path: &str) -> (Decision, Option<Rc<str>>) {
+pub(crate) fn decide_at(path: &str) -> (Decision, Option<(Rc<str>, Rc<Slot>)>) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
-        let key = RETAINED
-            .with(|retained| retained.borrow().get_key_value(path).map(|(key, _)| Rc::clone(key)));
+        // one lookup: the key and the slot the reference will point at
+        let found = RETAINED.with(|retained| {
+            retained
+                .borrow()
+                .get_key_value(path)
+                .map(|(key, entry)| (Rc::clone(key), Rc::clone(&entry.slot)))
+        });
         if !pass.active {
-            return (Decision::Render, key);
+            return (Decision::Render, found);
         }
         let inside_rerun = !pass.building.is_empty();
         let under_list = pass.building.last().is_some_and(|frame| frame.list);
-        if let Some(retained) = &key
+        if let Some((retained, _)) = &found
             && (!inside_rerun || under_list)
             && !pass.dirty.contains(path)
         {
             pass.skipped.push(Rc::clone(retained));
-            (Decision::Skip, key)
+            (Decision::Skip, found)
         } else {
-            (Decision::Render, key)
+            (Decision::Render, found)
         }
     })
 }

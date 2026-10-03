@@ -164,7 +164,11 @@ impl NodeList {
     /// A retained boundary: enters as a reference (the marked line in the
     /// print, the reference node in the layout) and the final assembly
     /// expands against the reconciler.
-    pub(crate) fn push_view_ref(&mut self, path: &std::rc::Rc<str>) {
+    pub(crate) fn push_view_ref(
+        &mut self,
+        path: &std::rc::Rc<str>,
+        slot: Option<std::rc::Rc<crate::reconciler::Slot>>,
+    ) {
         // the marked line is what a PRINT expands; a frame's pass prints
         // nothing, and a line for each boundary of the page was a string
         // nobody read
@@ -175,7 +179,9 @@ impl NodeList {
         }));
         self.layout.push(crate::layout::LayoutNode::BoundaryRef {
             path: std::rc::Rc::clone(path),
-            slot: crate::reconciler::slot_of(path),
+            // the slot the decision already found, or the one a body
+            // that just ran filed its entry under
+            slot: slot.unwrap_or_else(|| crate::reconciler::slot_of(path)),
         });
     }
 
@@ -315,14 +321,14 @@ impl<T: Component> View for T {
         // thousand strings.
         enum Road {
             Loose,
-            Skip(std::rc::Rc<str>),
+            Skip(std::rc::Rc<str>, std::rc::Rc<crate::reconciler::Slot>),
             Run(std::rc::Rc<str>),
         }
         let road = motor::identity::with_current_view_path(|path| match path {
             None => Road::Loose,
             Some(path) => match crate::reconciler::decide_at(path) {
-                (crate::reconciler::Decision::Skip, Some(key)) => Road::Skip(key),
-                (_, key) => Road::Run(key.unwrap_or_else(|| std::rc::Rc::from(path))),
+                (crate::reconciler::Decision::Skip, Some((key, slot))) => Road::Skip(key, slot),
+                (_, found) => Road::Run(found.map_or_else(|| std::rc::Rc::from(path), |(key, _)| key)),
             },
         });
         let path = match road {
@@ -336,9 +342,9 @@ impl<T: Component> View for T {
             }
             // A clean, retained boundary, outside any re-running body: the
             // body does NOT run — a reference goes out and the cache answers for it.
-            Road::Skip(path) => {
+            Road::Skip(path, slot) => {
                 motor::identity::mark_skipped(&path);
-                out.push_view_ref(&path);
+                out.push_view_ref(&path, Some(slot));
                 return;
             }
             Road::Run(path) => path,
@@ -353,7 +359,7 @@ impl<T: Component> View for T {
         let mut body = NodeList::new();
         run_body(self, ctx).render_into(ctx, &mut body);
         retain_entry(self, ctx, &path, body);
-        out.push_view_ref(&path);
+        out.push_view_ref(&path, None);
     }
 }
 

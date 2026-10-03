@@ -2261,7 +2261,12 @@ fn remove_all_children(
     let mut ids: Vec<u32> = Vec::new();
     let mut leaving = leaving;
     for retained in &mut leaving {
-        forget_subtree_into(retained, ctx, &mut ids);
+        // a whole row leaves: the template question is the row's, once
+        // — a member below it cannot outlive its root
+        if !ctx.templates.members.is_empty() {
+            ctx.templates.touched(retained.id);
+        }
+        forget_subtree_into(retained, ctx, &mut ids, false);
     }
     patches.push(DomPatch::RemoveChildren { id: parent, forget: id_ranges(ids) });
     ctx.graveyard.extend(leaving);
@@ -2284,17 +2289,23 @@ fn id_ranges(mut ids: Vec<u32>) -> Vec<(u32, u32)> {
 /// groups, its bindings, its place in a template.
 fn forget_subtree(retained: &mut Retained, ctx: &mut LowerCtx) {
     let mut ids = Vec::new();
-    forget_subtree_into(retained, ctx, &mut ids);
+    forget_subtree_into(retained, ctx, &mut ids, true);
 }
 
 /// The same forgetting, in ONE walk that also lists the ids it passes
 /// — a thousand rows leaving together are nine thousand nodes, and a
 /// walk per table was five walks.
-fn forget_subtree_into(retained: &mut Retained, ctx: &mut LowerCtx, ids: &mut Vec<u32>) {
+fn forget_subtree_into(
+    retained: &mut Retained,
+    ctx: &mut LowerCtx,
+    ids: &mut Vec<u32>,
+    ask_templates: bool,
+) {
     ids.push(retained.id);
     // a template member that leaves retires the template — asked only
-    // while any template stands
-    if !ctx.templates.members.is_empty() {
+    // while any template stands, and not at all under a row that
+    // leaves whole (its root was asked)
+    if ask_templates && !ctx.templates.members.is_empty() {
         ctx.templates.touched(retained.id);
     }
     match &retained.node.kind {
@@ -2314,7 +2325,7 @@ fn forget_subtree_into(retained: &mut Retained, ctx: &mut LowerCtx, ids: &mut Ve
         ctx.bindings.remove(binding.key());
     }
     for child in &mut retained.children {
-        forget_subtree_into(child, ctx, ids);
+        forget_subtree_into(child, ctx, ids, ask_templates);
     }
 }
 
@@ -2657,49 +2668,58 @@ fn diff_children_ordered(
     }
 
     enum Plan {
-        Survivor { old_position: usize, node: Retained },
+        Survivor { old_position: usize },
         Fresh(DomNode),
     }
 
     let parent_id = retained.id;
-    let old_children = std::mem::take(&mut retained.children);
-    let mut by_path: motor::hash::FxHashMap<std::rc::Rc<str>, (usize, Retained)> =
-        motor::hash::FxHashMap::default();
-    let mut by_index: Vec<Option<Retained>> = Vec::with_capacity(old_children.len());
-    for (position, old) in old_children.into_iter().enumerate() {
-        if let DomKind::Group { path } = &old.node.kind {
-            by_path.insert(path.clone(), (position, old));
-            by_index.push(None);
-        } else {
-            by_index.push(Some(old));
-        }
-    }
+    // the old children stay where they are until they are placed: a
+    // survivor is a POSITION here, and the node moves once, at the end
+    let mut old: Vec<Option<Retained>> =
+        std::mem::take(&mut retained.children).into_iter().map(Some).collect();
+    let mut claimed: Vec<bool> = vec![false; old.len()];
+    // the paths of the old rows, indexed only when a new child does not
+    // find its row at its own position — a swap asks twice, a list that
+    // kept its order never asks, and the index holds positions, not rows
+    let mut by_path: Option<motor::hash::FxHashMap<std::rc::Rc<str>, usize>> = None;
 
     // match first — creation waits for the placement walk below
     let mut plan: Vec<Plan> = Vec::with_capacity(new_children.len());
     for (index, child) in new_children.into_iter().enumerate() {
-        let matched = match &child.kind {
-            DomKind::Group { path } | DomKind::Reuse { path } => by_path.remove(path),
-            kind => by_index.get_mut(index).and_then(|slot| match slot.take() {
-                Some(old)
-                    if std::mem::discriminant(&old.node.kind)
-                        == std::mem::discriminant(kind) =>
-                {
-                    Some((index, old))
+        let matched: Option<usize> = match &child.kind {
+            DomKind::Group { path } | DomKind::Reuse { path } => {
+                let at_place = old.get(index).and_then(|slot| slot.as_ref()).is_some_and(|was| {
+                    matches!(&was.node.kind, DomKind::Group { path: there } if there == path)
+                });
+                if at_place {
+                    Some(index)
+                } else {
+                    let index_of = by_path.get_or_insert_with(|| {
+                        let mut map = motor::hash::FxHashMap::default();
+                        for (position, slot) in old.iter().enumerate() {
+                            if let Some(was) = slot
+                                && let DomKind::Group { path } = &was.node.kind
+                            {
+                                map.insert(std::rc::Rc::clone(path), position);
+                            }
+                        }
+                        map
+                    });
+                    index_of.remove(path)
                 }
-                Some(old) => {
-                    *slot = Some(old);
-                    None
-                }
-                None => None,
+            }
+            kind => old.get(index).and_then(|slot| slot.as_ref()).and_then(|was| {
+                (std::mem::discriminant(&was.node.kind) == std::mem::discriminant(kind)).then_some(index)
             }),
         };
         match matched {
-            Some((old_position, mut old)) => {
-                diff_node(&mut old, child, ctx, patches);
-                plan.push(Plan::Survivor { old_position, node: old });
+            Some(position) if !claimed[position] => {
+                claimed[position] = true;
+                let was = old[position].as_mut().expect("an unclaimed old child is present");
+                diff_node(was, child, ctx, patches);
+                plan.push(Plan::Survivor { old_position: position });
             }
-            None => plan.push(Plan::Fresh(child)),
+            _ => plan.push(Plan::Fresh(child)),
         }
     }
 
@@ -2707,8 +2727,11 @@ fn diff_children_ordered(
     // When nothing survived, the parent is emptied in one op — a list
     // that clears or replaces its rows says one word, not one per row
     let survivors = plan.iter().filter(|entry| matches!(entry, Plan::Survivor { .. })).count();
-    let leaving: Vec<Retained> =
-        by_path.into_values().map(|(_, old)| old).chain(by_index.into_iter().flatten()).collect();
+    let leaving: Vec<Retained> = old
+        .iter_mut()
+        .zip(&claimed)
+        .filter_map(|(slot, taken)| if *taken { None } else { slot.take() })
+        .collect();
     let left = !leaving.is_empty();
     if survivors == 0 && left {
         remove_all_children(parent_id, leaving, ctx, patches);
@@ -2733,8 +2756,10 @@ fn diff_children_ordered(
             Plan::Fresh(_) => None,
         })
         .collect();
-    let stable: std::collections::HashSet<usize> =
-        longest_increasing(&survivor_positions).into_iter().collect();
+    let mut stable: Vec<bool> = vec![false; plan.len()];
+    for at in longest_increasing(&survivor_positions) {
+        stable[at] = true;
+    }
 
     // back to front: the anchor below is always already real
     let parent = retained.id;
@@ -2745,8 +2770,9 @@ fn diff_children_ordered(
         .collect();
     for at in (0..plan.len()).rev() {
         match plan.pop().expect("walking the plan") {
-            Plan::Survivor { node, .. } => {
-                if !stable.contains(&at) {
+            Plan::Survivor { old_position } => {
+                let node = old[old_position].take().expect("a survivor is placed once");
+                if !stable[at] {
                     patches.push(DomPatch::Move { id: node.id, parent, before: anchor });
                 }
                 anchor = node.id;
