@@ -78,6 +78,10 @@ impl<V: View<Arity = Single>> UnaryView for V {}
 pub struct NodeList {
     nodes: Vec<RenderNode>,
     layout: Vec<crate::layout::LayoutNode>,
+    /// How many layout nodes the list was told to expect before its
+    /// first one arrived ([`NodeList::expect_layout`]) — zero when no
+    /// one said.
+    expected: usize,
 }
 
 thread_local! {
@@ -125,6 +129,7 @@ impl NodeList {
     }
 
     pub(crate) fn push_layout(&mut self, node: crate::layout::LayoutNode) {
+        self.room_for_first();
         self.layout.push(node);
     }
 
@@ -133,6 +138,27 @@ impl NodeList {
     /// times, each growth a copy of every node before it.
     pub(crate) fn reserve_layout(&mut self, more: usize) {
         self.layout.reserve(more);
+    }
+
+    /// Says how many layout nodes are about to arrive — a tuple knows
+    /// its arity — while the list has none and no room for one. The room
+    /// is made when the first node arrives, for exactly that many: a body
+    /// of five cells grew from four to eight, two allocations where one
+    /// does, and a stack of one child held room for four. A child that
+    /// adds nothing (`empty()`) makes no room at all. A count said inside
+    /// another (a tuple first in a tuple) keeps the larger.
+    pub(crate) fn expect_layout(&mut self, count: usize) {
+        if self.layout.capacity() == 0 {
+            self.expected = self.expected.max(count);
+        }
+    }
+
+    /// The room the expected count asks for, made as the first node
+    /// arrives. With no count said, the list grows as a list grows.
+    fn room_for_first(&mut self) {
+        if self.layout.capacity() == 0 && self.expected > 0 {
+            self.layout.reserve_exact(self.expected);
+        }
     }
 
     /// Wraps the last layout node (the one from the Single view that just
@@ -165,6 +191,7 @@ impl NodeList {
         } else {
             nothing_node()
         };
+        self.room_for_first();
         self.layout.insert(mark, wrap(base));
     }
 
@@ -184,7 +211,7 @@ impl NodeList {
         } else {
             String::new()
         }));
-        self.layout.push(crate::layout::LayoutNode::BoundaryRef {
+        self.push_layout(crate::layout::LayoutNode::BoundaryRef {
             path: std::rc::Rc::clone(path),
             // the slot the decision already found, or the one a body
             // that just ran filed its entry under
@@ -457,6 +484,7 @@ impl<C: View> View for Vec<C> {
     type Arity = Many;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        out.expect_layout(self.len());
         for (position, view) in self.iter().enumerate() {
             let _frame = motor::identity::enter(position_segment(position));
             view.render_into(ctx, out);
@@ -478,6 +506,10 @@ macro_rules! tuple_view {
                 // the same type do not get confused, and an empty `Option` does
                 // not shift the indices (the structure is static, not the emitted nodes).
                 let mut position = 0usize;
+                // one node a child, as a rule: room for the arity, made
+                // when the first one arrives
+                const ARITY: usize = [$(stringify!($name)),+].len();
+                out.expect_layout(ARITY);
                 $(
                     {
                         let _frame = motor::identity::enter(position_segment(position));
@@ -626,6 +658,28 @@ mod tests {
             .expect("a thread for the probe")
             .join()
             .expect("the probe finished")
+    }
+
+    /// A tuple says its arity, and the list makes room for exactly that
+    /// many as the first node arrives: five cells take five slots, once.
+    /// A tuple of one child that adds nothing makes no room at all; a
+    /// tuple first inside a tuple keeps the larger count and grows past
+    /// it like any list; a `Vec` of views says its length the same way.
+    #[test]
+    fn a_tuple_makes_room_for_its_arity_when_its_first_node_arrives() {
+        let ctx = Context::default();
+        let room = |view: &dyn Fn(&mut NodeList)| {
+            let mut out = NodeList::new();
+            view(&mut out);
+            (out.layout.len(), out.layout.capacity())
+        };
+        assert_eq!(room(&|out| (text("a"), text("b"), text("c"), text("d"), text("e")).render_into(&ctx, out)), (5, 5));
+        assert_eq!(room(&|out| (text("a"),).render_into(&ctx, out)), (1, 1));
+        assert_eq!(room(&|out| (crate::views::empty(),).render_into(&ctx, out)), (0, 0), "nothing arrived: no room made");
+        let (len, capacity) = room(&|out| ((text("a"), text("b")), text("c"), text("d"), text("e")).render_into(&ctx, out));
+        assert_eq!(len, 5);
+        assert!(capacity >= 5, "a tuple inside a tuple grows past the count it kept: {capacity}");
+        assert_eq!(room(&|out| vec![text("a"), text("b"), text("c")].render_into(&ctx, out)), (3, 3));
     }
 
     /// How many times a component's payload is re-materialized per

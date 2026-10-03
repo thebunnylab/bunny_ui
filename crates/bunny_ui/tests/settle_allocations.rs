@@ -192,6 +192,18 @@ fn a_bound_label_files_its_reads_without_a_set() {
     assert!(cost <= 5, "a bound label costs the settle {cost} allocations beyond the empty row");
 }
 
+/// A body of five cells holds its five nodes in one list, made once for
+/// the five: it grew from four to eight before, two allocations. And a
+/// stack that holds nothing makes no room for the child that adds none
+/// — the stack's own node is all the row pays for.
+#[test]
+fn a_body_takes_the_room_its_tuple_says_and_no_more() {
+    let five = beyond_empty(|_| (text("a"), text("b"), text("c"), text("d"), text("e")));
+    assert!(five <= 6, "five fixed cells cost the settle {five} allocations beyond the empty row");
+    let hollow = beyond_empty(|_| hstack!(empty()));
+    assert!(hollow <= 1, "a stack of nothing costs the settle {hollow} allocations beyond the empty row");
+}
+
 /// The class a row's own element wears while it is selected is a
 /// binding too, filed the same way: no set for the flag it reads, none
 /// for the one binding reading that flag. With the label beside it the
