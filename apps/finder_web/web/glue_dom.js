@@ -25,7 +25,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 17;
+const EXPECTED_ABI = 18;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -1016,6 +1016,7 @@ function applyPatches(view, length) {
       const tag = text(u8());
       const cls = text(u8());
       const domId = text(u8());
+      const href = text(u16());
       const kind = u8();
       const el = createElementOf(kind, tag);
       el.__n = id;
@@ -1023,6 +1024,7 @@ function applyPatches(view, length) {
       el.__look = "";
       if (cls) el.setAttribute("class", cls);
       if (domId) el.id = domId;
+      if (href) el.setAttribute("href", href);
       if (kind === 4) {
         wireScroll(el, id);
       }
@@ -1371,9 +1373,10 @@ function applyPatches(view, length) {
       const target = lookup(u32());
       if (target) target.scrollIntoView({ block: "nearest" });
     } else if (op === 15) {
-      // live hints: class and id re-attribute in place
+      // live hints: class, id and href re-attribute in place
       const cls = text(u8());
       const domId = text(u8());
+      const href = text(u16());
       const el = lookup(id);
       if (el) {
         learn(el);
@@ -1383,6 +1386,11 @@ function applyPatches(view, length) {
           el.id = domId;
         } else {
           el.removeAttribute("id");
+        }
+        if (href) {
+          el.setAttribute("href", href);
+        } else {
+          el.removeAttribute("href");
         }
       }
     } else if (op === 16) {

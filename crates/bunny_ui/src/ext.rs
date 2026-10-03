@@ -465,7 +465,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     fn element(self, tag: impl AsRef<str>) -> Modified<Self> {
         Modified {
             base: self,
-            modifier: Modifier::ElementHint(Some(crate::modifier::hint(tag.as_ref())), None, None),
+            modifier: Modifier::ElementHint(Some(crate::modifier::hint(tag.as_ref())), None, None, None),
         }
     }
 
@@ -474,7 +474,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     fn css_class(self, class: impl AsRef<str>) -> Modified<Self> {
         Modified {
             base: self,
-            modifier: Modifier::ElementHint(None, Some(crate::modifier::hint(class.as_ref())), None),
+            modifier: Modifier::ElementHint(None, Some(crate::modifier::hint(class.as_ref())), None, None),
         }
     }
 
@@ -482,7 +482,25 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     fn element_id(self, id: impl AsRef<str>) -> Modified<Self> {
         Modified {
             base: self,
-            modifier: Modifier::ElementHint(None, None, Some(crate::modifier::hint(id.as_ref()))),
+            modifier: Modifier::ElementHint(None, None, Some(crate::modifier::hint(id.as_ref())), None),
+        }
+    }
+
+    /// A link: the Dom lowering builds an `<a href>` for this view, so
+    /// the browser owns the navigation — a press follows it, a middle
+    /// press opens a tab, a crawler reads it. `#name` reaches the
+    /// element whose [`ViewExt::element_id`] is `name`. The pixel
+    /// targets have no address bar and ignore it, as they ignore
+    /// `.element(…)`.
+    fn link(self, url: impl AsRef<str>) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::ElementHint(
+                Some(crate::modifier::hint("a")),
+                None,
+                None,
+                Some(std::rc::Rc::from(url.as_ref())),
+            ),
         }
     }
 

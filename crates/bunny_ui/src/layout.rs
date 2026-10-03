@@ -1158,6 +1158,7 @@ pub enum LayoutNode {
         tag: Option<std::rc::Rc<str>>,
         class: Option<std::rc::Rc<str>>,
         dom_id: Option<std::rc::Rc<str>>,
+        href: Option<std::rc::Rc<str>>,
         child: Box<LayoutNode>,
     },
     /// The escape hatch (`custom(…)` / `canvas(…)`): a box the APP
@@ -1188,12 +1189,45 @@ pub enum LayoutNode {
 pub struct ElementHints {
     pub(crate) tag: Option<Rc<str>>,
     pub(crate) class: Option<Rc<str>>,
-    pub(crate) dom_id: Option<Rc<str>>,
+    /// The id and the href, the rare words: one shared record, so
+    /// the many nodes that carry neither pay one word for both.
+    pub(crate) address: Option<Rc<Address>>,
 }
 
 impl ElementHints {
     pub(crate) fn is_empty(&self) -> bool {
-        self.tag.is_none() && self.class.is_none() && self.dom_id.is_none()
+        self.tag.is_none() && self.class.is_none() && self.address.is_none()
+    }
+}
+
+/// An element's address: its `id`, and where it goes when it is a link
+/// (`.link(…)`). Rare beside the tag and the class, so the hints hold
+/// it behind one shared word ([`Address::over`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Address {
+    pub dom_id: Option<Rc<str>>,
+    pub href: Option<Rc<str>>,
+}
+
+impl Address {
+    /// `base` with the words an outer hint speaks written over it —
+    /// the outer word wins where both speak, as with the tag.
+    pub fn over(
+        base: &Option<Rc<Address>>,
+        dom_id: &Option<Rc<str>>,
+        href: &Option<Rc<str>>,
+    ) -> Option<Rc<Address>> {
+        if dom_id.is_none() && href.is_none() {
+            return base.clone();
+        }
+        let mut address = base.as_deref().cloned().unwrap_or_default();
+        if dom_id.is_some() {
+            address.dom_id.clone_from(dom_id);
+        }
+        if href.is_some() {
+            address.href.clone_from(href);
+        }
+        Some(Rc::new(address))
     }
 }
 

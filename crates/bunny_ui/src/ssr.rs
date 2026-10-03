@@ -225,8 +225,11 @@ impl Tree {
         if let Some(class) = &hints.class {
             element.attrs.insert("class", class.to_string());
         }
-        if let Some(dom_id) = &hints.dom_id {
+        if let Some(dom_id) = hints.dom_id() {
             element.attrs.insert("id", dom_id.to_string());
+        }
+        if let Some(href) = hints.href() {
+            element.attrs.insert("href", href.to_string());
         }
         self.elements.insert(id, element);
     }
@@ -495,7 +498,10 @@ impl Tree {
                 element.attrs.insert("placeholder", field.placeholder.to_string());
                 element.attrs.insert("data-path", field.path.clone());
             }
-            DomPatch::SetHints { id, class, dom_id } => {
+            DomPatch::SetHints { id, class, address } => {
+                let address = address.as_deref();
+                let dom_id = address.and_then(|address| address.dom_id.as_ref());
+                let href = address.and_then(|address| address.href.as_ref());
                 if let Some(element) = self.elements.get_mut(id) {
                     match class {
                         Some(class) => element.attrs.insert("class", class.to_string()),
@@ -504,6 +510,10 @@ impl Tree {
                     match dom_id {
                         Some(dom_id) => element.attrs.insert("id", dom_id.to_string()),
                         None => element.attrs.remove("id"),
+                    };
+                    match href {
+                        Some(href) => element.attrs.insert("href", href.to_string()),
+                        None => element.attrs.remove("href"),
                     };
                 }
             }
@@ -1194,5 +1204,32 @@ mod tests {
         );
         let page = render(&Picture(source), Size { width: 200.0, height: 200.0 });
         assert!(page.html.contains("data-img=\"7:9\""), "{}", page.html);
+    }
+
+    /// A link is an `<a href>`: the browser owns the navigation, and
+    /// an id beside it rides the same record.
+    #[test]
+    fn a_link_serves_its_href() {
+        #[derive(Clone, Copy)]
+        struct Links;
+
+        impl Component for Links {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(
+                    text("source").link("https://example.com/a?b=1&c=2"),
+                    text("top").link("#top").element_id("back"),
+                )
+            }
+        }
+
+        let page = render(&Links, Size { width: 200.0, height: 200.0 });
+        assert!(
+            page.html.contains("href=\"https://example.com/a?b=1&amp;c=2\""),
+            "{}",
+            page.html
+        );
+        assert!(page.html.contains("href=\"#top\""), "{}", page.html);
+        assert!(page.html.contains("id=\"back\""), "{}", page.html);
+        assert_eq!(page.html.matches("<a ").count(), 2, "{}", page.html);
     }
 }

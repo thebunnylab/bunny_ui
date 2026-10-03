@@ -523,7 +523,11 @@ impl Walk<'_> {
         if let Some(hints) = tree.carried_hints()
             && !hints.is_empty()
         {
-            Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &hints.dom_id);
+            let (dom_id, href) = match hints.address.as_deref() {
+                Some(address) => (address.dom_id.clone(), address.href.clone()),
+                None => (None, None),
+            };
+            Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &dom_id, &href);
         }
     }
 
@@ -1085,7 +1089,11 @@ impl Walk<'_> {
                 // the hints an `.element(…)` gave the boundary, stamped
                 // as the wrapper they replace would stamp them
                 if !hints.is_empty() {
-                    Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &hints.dom_id);
+                    let (dom_id, href) = match hints.address.as_deref() {
+                Some(address) => (address.dom_id.clone(), address.href.clone()),
+                None => (None, None),
+            };
+            Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &dom_id, &href);
                 }
             }
             LayoutNode::Interactive { path, child } => {
@@ -1187,10 +1195,10 @@ impl Walk<'_> {
                 // the browser keeps its own safe area outside the tab
                 self.lower_into(child, out);
             }
-            LayoutNode::Hinted { tag, class, dom_id, child } => {
+            LayoutNode::Hinted { tag, class, dom_id, href, child } => {
                 let opened = out.len();
                 self.lower_into(child, out);
-                Self::stamp_hints(&mut out[opened..], tag, class, dom_id);
+                Self::stamp_hints(&mut out[opened..], tag, class, dom_id, href);
             }
             #[cfg(feature = "canvas")]
             LayoutNode::ExactLayout { child } => {
@@ -1285,6 +1293,7 @@ impl Walk<'_> {
         tag: &Option<std::rc::Rc<str>>,
         class: &Option<std::rc::Rc<str>>,
         dom_id: &Option<std::rc::Rc<str>>,
+        href: &Option<std::rc::Rc<str>>,
     ) {
         // a table cell that holds one plain text IS that text
         if let Some(tag) = tag
@@ -1307,9 +1316,7 @@ impl Walk<'_> {
             if class.is_some() {
                 hinted.hints.class = class.clone();
             }
-            if dom_id.is_some() {
-                hinted.hints.dom_id = dom_id.clone();
-            }
+            hinted.hints.address = crate::layout::Address::over(&hinted.hints.address, dom_id, href);
         }
     }
 
@@ -2224,7 +2231,7 @@ mod tests {
             hints: crate::layout::ElementHints {
                 tag: Some(crate::modifier::hint("td")),
                 class: Some(crate::modifier::hint("cell")),
-                dom_id: None,
+                address: None,
             },
             action: Some(std::rc::Rc::from("Row/#1")),
         };
@@ -2250,7 +2257,7 @@ mod tests {
         let hinted = |tag: &str| crate::layout::ElementHints {
             tag: Some(crate::modifier::hint(tag)),
             class: None,
-            dom_id: None,
+            address: None,
         };
         let over_hinted = LayoutNode::Styled {
             props: std::rc::Rc::new(ink),
@@ -2482,7 +2489,7 @@ mod tests {
                         LayoutNode::BoundaryRef { hints, .. }
                             if hints.tag.as_deref() == Some("tr")
                                 && hints.class.as_deref() == Some("row")
-                                && hints.dom_id.is_none()
+                                && hints.address.is_none()
                     ))
                     .count(),
                 other => panic!("the list's retained tree: {other:?}"),
