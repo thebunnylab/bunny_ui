@@ -722,7 +722,31 @@ function applyPatches(view, length) {
     at += count;
     return slice;
   };
-  const text = (count) => decoder.decode(bytes(count));
+  // the batch's bytes, read one at a time for a short string
+  const octets = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+  // a string: nothing to read when it is empty, and a short one that
+  // is all ASCII — a number in a cell, a class, a tag — built a char
+  // at a time, a byte being its char there; the decoder's door costs
+  // more than the loop. A byte from 0x80 up opens a sequence only the
+  // decoder reads, and a long string is the decoder's anyway
+  const text = (count) => {
+    if (count === 0) return "";
+    if (count <= 32) {
+      const end = at + count;
+      let words = "";
+      let i = at;
+      for (; i < end; i++) {
+        const byte = octets[i];
+        if (byte >= 0x80) break;
+        words += String.fromCharCode(byte);
+      }
+      if (i === end) {
+        at = end;
+        return words;
+      }
+    }
+    return decoder.decode(bytes(count));
+  };
 
   // the three records a look is made of, decoded with no element in
   // hand: a look is defined once (op 21), then worn by class (op 22)
@@ -1043,8 +1067,12 @@ function applyPatches(view, length) {
     } else if (op === 20) {
       // the words alone: the font and the ink already stand
       const el = lookup(id);
-      const raw = bytes(u32());
-      if (el) setWords(el, decoder.decode(raw));
+      const count = u32();
+      if (el) {
+        setWords(el, text(count));
+      } else {
+        at += count;
+      }
     } else if (op === 2) {
       settleMember(id);
       const el = lookup(id);
