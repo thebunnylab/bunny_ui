@@ -742,7 +742,15 @@ const REF_MARK: char = '\u{1}';
 pub const HOVER_KEY: &str = "#hover";
 
 pub(crate) fn begin_pass(dirty: HashSet<String>) {
-    PASS_NO.with(|count| count.set(count.get() + 1));
+    let pass_no = PASS_NO.with(|count| {
+        count.set(count.get() + 1);
+        count.get()
+    });
+    // garbage that waited out its patience is freed now: no idle came
+    let buried = BURIED_AT.with(Cell::get);
+    if buried != 0 && pass_no - buried >= GARBAGE_PATIENCE {
+        collect_garbage();
+    }
     PASS.with(|pass| {
         *pass.borrow_mut() = PassState {
             active: true,
@@ -1830,6 +1838,7 @@ fn drop_entries<P: AsRef<str>>(paths: &[P]) {
             let mut live = live.borrow_mut();
             GRAVEYARD.with(|graveyard| {
                 let mut graveyard = graveyard.borrow_mut();
+                let buried = graveyard.len();
                 for path in paths {
                     let path: &str = path.as_ref();
                     if let Some(entry) = retained.remove(path) {
@@ -1845,6 +1854,9 @@ fn drop_entries<P: AsRef<str>>(paths: &[P]) {
                         graveyard.push(entry);
                     }
                 }
+                if graveyard.len() > buried {
+                    note_buried();
+                }
             });
         });
     });
@@ -1855,12 +1867,31 @@ thread_local! {
     /// be freed: a thousand rows that leave a list are a thousand layout
     /// trees, and the frame that drops them must not pay their frees.
     static GRAVEYARD: RefCell<Vec<Box<Entry>>> = const { RefCell::new(Vec::new()) };
+    /// The pass that buried the oldest garbage still waiting; 0 when
+    /// nothing waits.
+    static BURIED_AT: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many passes garbage waits for an idle moment. A page goes idle
+/// between two clicks and frees it there; a host that never does — a
+/// shell that never asks for the collection — has it freed by the first
+/// pass after this many, so what leaves is never kept for good.
+const GARBAGE_PATIENCE: u64 = 64;
+
+/// Garbage was buried in the pass under way: the oldest starts waiting.
+fn note_buried() {
+    BURIED_AT.with(|at| {
+        if at.get() == 0 {
+            at.set(PASS_NO.with(Cell::get).max(1));
+        }
+    });
 }
 
 /// Frees the entries that left since the last call; returns how many.
 /// The read graph of their views goes first: the bindings they made are
 /// taken out of the register and out of the live table.
 pub(crate) fn collect_garbage() -> usize {
+    BURIED_AT.with(|at| at.set(0));
     collect_retired_reads();
     GRAVEYARD.with(|graveyard| {
         let mut graveyard = graveyard.borrow_mut();
@@ -1989,6 +2020,7 @@ pub(crate) fn sweep_stale(root: &str) {
             let mut live = live.borrow_mut();
             GRAVEYARD.with(|graveyard| {
                 let mut graveyard = graveyard.borrow_mut();
+                let buried = graveyard.len();
                 // the entry leaves the tables and the read graph as it
                 // leaves the retention, and waits for the idle to be freed
                 let mut fall = |path: &Rc<str>, entry: Box<Entry>| {
@@ -2004,6 +2036,9 @@ pub(crate) fn sweep_stale(root: &str) {
                     if let Some((path, entry)) = retained.remove_entry(&**top) {
                         fall(&path, entry);
                     }
+                }
+                if graveyard.len() > buried {
+                    note_buried();
                 }
             });
         });
@@ -2076,6 +2111,7 @@ pub(crate) fn clear() {
     LIVE.with(|live| *live.borrow_mut() = Live::default());
     collect_retired_reads();
     GRAVEYARD.with(|graveyard| graveyard.borrow_mut().clear());
+    BURIED_AT.with(|at| at.set(0));
     ASSEMBLED_AT.with(|at| at.set(None));
 }
 
@@ -2086,6 +2122,7 @@ pub(crate) fn reset_world() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
     collect_retired_reads();
     GRAVEYARD.with(|graveyard| graveyard.borrow_mut().clear());
+    BURIED_AT.with(|at| at.set(0));
     crate::layout::forget_pictures();
     LIVE.with(|live| *live.borrow_mut() = Live::default());
     ASSEMBLED_ROOT.with(|root| *root.borrow_mut() = None);
@@ -2337,6 +2374,56 @@ mod tests {
         assert_eq!(carried(|live| live.handler_entries.len()), 0, "the carrier left with its entry");
         assert!(carriers_match_retention(), "unmounted");
         assert_eq!(carried(|live| live.top_level.len()), 1, "the holder alone stands at the top");
+    }
+
+    /// A page frees what left when it goes idle. A host that never goes
+    /// idle — a shell that never asks for the collection — must not keep
+    /// it for good: garbage that waited out its patience is freed by the
+    /// next pass, the read graph of its bindings with it. Until then it
+    /// waits, so the frames of a page that does go idle still free
+    /// nothing.
+    #[test]
+    fn garbage_no_idle_came_for_is_freed_by_a_later_pass() {
+        #[derive(Clone, Copy)]
+        struct Line {
+            id: usize,
+            label: State<Rc<str>>,
+        }
+
+        impl Component for Line {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::text!(self.label)
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Lines {
+            lines: State<Rc<Vec<Line>>>,
+        }
+
+        impl Component for Lines {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::views::for_each(self.lines, |line| line.id.to_string(), |line| *line)
+            }
+        }
+
+        let three = (1..=3).map(|id| Line { id, label: State::new(Rc::from("line")) }).collect();
+        let lines = State::new(Rc::new(three));
+        let page = Lines { lines };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        lines.set(Rc::new(Vec::new()));
+        runtime.render(&page);
+        assert_eq!(graveyard_len(), 3, "three lines wait for the idle");
+        assert_eq!(motor::identity::retired_count(), 3, "and their bindings");
+
+        for _ in 1..GARBAGE_PATIENCE {
+            runtime.render(&page);
+        }
+        assert_eq!(graveyard_len(), 3, "within its patience the garbage waits");
+        runtime.render(&page);
+        assert_eq!(graveyard_len(), 0, "past it, the pass freed it");
+        assert_eq!(motor::identity::retired_count(), 0, "read graph and all");
     }
 
     /// The paths retained under a prefix, sorted.
