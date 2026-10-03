@@ -957,8 +957,12 @@ fn rule_text(
             }
             _ => {}
         }
+        // an inherited ink takes no color — on a text. A box's face
+        // record is the face alone: the box's own ink stays
         if text.inherits_ink {
-            base.remove("color");
+            if matches!(kind, CreateKind::Text) {
+                base.remove("color");
+            }
         } else {
             base.insert("color", color(text.color));
         }
@@ -1256,5 +1260,32 @@ mod tests {
 
         let page = render(&Eyebrow, Size { width: 200.0, height: 200.0 });
         assert!(page.css.contains("letter-spacing:2px"), "{}", page.css);
+    }
+
+    /// A box that answers the pointer with its ink and declares a face
+    /// for its subtree keeps its own ink: the face record carries the
+    /// face alone, and the text under it inherits the box's colour.
+    #[test]
+    fn a_box_that_declares_a_face_keeps_its_ink() {
+        #[derive(Clone, Copy)]
+        struct Link;
+
+        impl Component for Link {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("docs")
+                    .font_size(12.0)
+                    .foreground_color(Color::hex(0x8F86A8))
+                    .foreground_hovered(Color::hex(0xF2EEFB))
+                    .link("#docs")
+            }
+        }
+
+        let page = render(&Link, Size { width: 200.0, height: 200.0 });
+        let rule = page
+            .css
+            .lines()
+            .find(|rule| rule.contains("font:400 12px") && !rule.contains(":hover"))
+            .expect("the box that declares the face");
+        assert!(rule.contains("color:rgba(143, 134, 168"), "{}", page.css);
     }
 }
