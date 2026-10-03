@@ -672,6 +672,7 @@ impl Walk<'_> {
                 self.slot = outer_slot;
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(container);
+                Self::stamp_across(child, &mut container.children);
                 Self::fold_table_wrapper(container);
             }
             // A hug is a native flow rule on the web: a box that is not told
@@ -704,6 +705,7 @@ impl Walk<'_> {
                 self.lower_into(child, &mut container.children);
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(container);
+                Self::stamp_across(child, &mut container.children);
                 Self::fold_table_wrapper(container);
             }
             // The flex frame on the web flow: a growing box. Its FLOOR is not
@@ -720,6 +722,7 @@ impl Walk<'_> {
                 self.lower_into(child, &mut container.children);
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(container);
+                Self::stamp_across(child, &mut container.children);
                 Self::fold_table_wrapper(container);
             }
             LayoutNode::Spacer => {
@@ -1434,6 +1437,22 @@ impl Walk<'_> {
             for node in lowered {
                 if let Some(layout) = node.layout.as_mut() {
                     layout.fill = true;
+                }
+            }
+        }
+    }
+
+    /// A frame is a column that places its child by its alignment, so
+    /// the column's own stretch is off — and a child that takes the
+    /// width it is offered (a band, a row with a spacer) would hug its
+    /// content instead. Such a child stretches across the frame, as the
+    /// frame offers it. Stamped after the frame took what it inherits:
+    /// the frame's own place in ITS holder is the holder's to decide.
+    fn stamp_across(child: &LayoutNode, lowered: &mut [DomNode]) {
+        if child.is_flexible(Axis::Horizontal, Some(Axis::Vertical)) {
+            for node in lowered {
+                if let Some(layout) = node.layout.as_mut() {
+                    layout.stretch = true;
                 }
             }
         }
@@ -2678,5 +2697,30 @@ mod tests {
         let band = scene.children[0].children[0].layout.as_ref().expect("flow");
         assert!(!band.grow, "no flex on the column's axis: {band:?}");
         assert!(band.stretch, "the column takes it edge to edge: {band:?}");
+    }
+
+    /// A frame places its child by its alignment, so the column's own
+    /// stretch is off: a child that takes the width it is offered — a
+    /// row of nothing but a spacer, the hairline idiom — is stretched
+    /// across the frame instead of hugging nothing.
+    #[test]
+    fn a_frame_stretches_a_child_that_takes_the_width() {
+        let rule = LayoutNode::Frame {
+            width: None,
+            height: Some(1.0),
+            align: CrossAlign::Center,
+            child: Box::new(LayoutNode::Stack {
+                axis: Axis::Horizontal,
+                spacing: 0.0,
+                align: CrossAlign::Center,
+                children: vec![LayoutNode::Spacer],
+                hints: Default::default(),
+                action: None,
+            }),
+        };
+        let offsets = HashMap::default();
+        let scene = lower(&rule, &env_fixture(&offsets)).scene;
+        let row = scene.children[0].children[0].layout.as_ref().expect("flow");
+        assert!(row.stretch, "the row reaches the frame's edges: {row:?}");
     }
 }
