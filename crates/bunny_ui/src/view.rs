@@ -111,6 +111,7 @@ fn nothing_node() -> crate::layout::LayoutNode {
         align: crate::layout::CrossAlign::Start,
         children: Vec::new(),
         hints: Default::default(),
+        action: None,
     }
 }
 

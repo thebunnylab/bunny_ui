@@ -50,6 +50,7 @@ pub(crate) fn wrap_layout(children: Vec<LayoutNode>) -> LayoutNode {
             align: CrossAlign::Start,
             children,
             hints: Default::default(),
+            action: None,
         }
     }
 }
@@ -82,6 +83,7 @@ impl View for Text {
             highlights: None,
             truncation: None,
             hints: Default::default(),
+            action: None,
         });
     }
 }
@@ -134,11 +136,20 @@ where
         let (prints, layouts) = label.into_parts();
         out.push(RenderNode::branch("Button", prints));
 
+        // inside a pass, the button is an interaction target: the frame joins
+        // the hit-test under the identity path, and the action stays registered
+        // in the reconciler (retained like the effects — skipped view, live button)
+        let target = motor::identity::cursor_scope_rc().inspect(|path| {
+            let action = self.action.clone();
+            crate::reconciler::attribute_action(Rc::clone(path), Rc::new(move |_| action()));
+        });
+
         // the default chrome lives in the SCENE (the print stays as it was):
         // background with corners + built-in padding, hover/pressed states
-        // included — the hit-rect becomes the whole chrome, not just the label
+        // included — the hit-rect becomes the whole chrome, not just the label.
+        // The chrome is the target itself, and paints by its own hover
         let theme = crate::theme::current();
-        let chrome = LayoutNode::Styled {
+        out.push_layout(LayoutNode::Styled {
             props: VisualProps {
                 background: Some(theme.control),
                 background_hovered: Some(theme.control_hovered),
@@ -157,22 +168,8 @@ where
                 child: Box::new(wrap_layout(layouts)),
             }),
             hints: Default::default(),
-        };
-
-        // inside a pass, the button is an interaction target: the frame joins
-        // the hit-test under the identity path, and the action stays registered
-        // in the reconciler (retained like the effects — skipped view, live button)
-        match motor::identity::cursor_scope_rc() {
-            Some(path) => {
-                let action = self.action.clone();
-                crate::reconciler::attribute_action(Rc::clone(&path), Rc::new(move |_| action()));
-                out.push_layout(LayoutNode::Interactive {
-                    path,
-                    child: Box::new(chrome),
-                });
-            }
-            None => out.push_layout(chrome),
-        }
+            action: target,
+        });
     }
 }
 
@@ -457,6 +454,7 @@ impl View for TextField {
                 highlights: None,
                 truncation: None,
                 hints: Default::default(),
+                action: None,
             }),
         }
     }
@@ -650,6 +648,7 @@ where
                 align: CrossAlign::Start,
                 children: layouts,
                 hints: Default::default(),
+                action: None,
             }),
         }
     }
@@ -1506,6 +1505,7 @@ fn render_stack<C: View>(
             align,
             children: layouts,
             hints: Default::default(),
+            action: None,
         },
         // ZStack: all children in the same frame
         None => LayoutNode::Layered { align, modal: false, children: layouts },
@@ -1838,6 +1838,7 @@ where
                 align: CrossAlign::Start,
                 children: row_layouts,
                 hints: Default::default(),
+                action: None,
             }),
         });
     }
@@ -2372,6 +2373,7 @@ where
             }),
             children: layouts,
             hints: Default::default(),
+            action: None,
         });
     }
 }
@@ -2584,6 +2586,7 @@ impl<H: View, C: View> View for Section<H, C> {
             align: CrossAlign::Start,
             children: layouts,
             hints: Default::default(),
+            action: None,
         };
         // the List of sections (list_content) is a scroll region; the plain
         // Section is just the stacking

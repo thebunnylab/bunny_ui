@@ -270,8 +270,8 @@ fn a_hint_rides_the_node_it_names() {
 /// with a link to its bound label, a cell with a link around a glyph,
 /// and an empty cell — seven hints and two actions. Beyond the empty
 /// row it pays for its two bindings, its two texts, the closures of its
-/// two clicks, their paths and the targets they arm, and the lists its
-/// stacks hold; its hints cost nothing.
+/// two clicks and their paths, and the lists its stacks and its actions
+/// are held in; its hints and the targets its clicks arm cost nothing.
 #[test]
 fn a_row_of_the_benchmark_pays_for_its_bindings_and_its_clicks() {
     let cost = beyond_empty(|item| {
@@ -290,5 +290,19 @@ fn a_row_of_the_benchmark_pays_for_its_bindings_and_its_clicks() {
             hstack!(empty()).element("td").css_class("col-md-6"),
         )
     });
-    assert!(cost <= 20, "a row of the benchmark costs the settle {cost} allocations beyond the empty row");
+    assert!(cost <= 18, "a row of the benchmark costs the settle {cost} allocations beyond the empty row");
+}
+
+/// A row's links are armed in every body it runs, and the action rides
+/// the node it arms: a link that answers a click pays for the click's
+/// closure, its path and the row's list of actions, and nothing for a
+/// target around it.
+#[test]
+fn a_click_rides_the_node_it_arms() {
+    let bare = beyond_empty(|_| text("a").element("a"));
+    let armed = beyond_empty(|_| text("a").element("a").on_click(|| {}));
+    assert!(armed <= bare + 3, "a link that clicks costs {armed}, one that does not {bare}");
+    let bare = beyond_empty(|_| hstack!(hstack!(empty()).element("span")).element("a"));
+    let armed = beyond_empty(|_| hstack!(hstack!(empty()).element("span")).element("a").on_click(|| {}));
+    assert!(armed <= bare + 3, "a stack that clicks costs {armed}, one that does not {bare}");
 }

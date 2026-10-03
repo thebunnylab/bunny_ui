@@ -411,16 +411,17 @@ fn rewrite_scroll_node(
     ) -> LayoutNode,
 ) -> LayoutNode {
     match node {
-        // a node that wears hints stood behind their wrapper, which no
-        // rewrite crosses: it is left as the wrapper left it
+        // a node that wears hints or an action stood behind their
+        // wrapper, which no rewrite crosses: it is left as it was left
         marked if !marked.is_bare() => marked,
         LayoutNode::Scroll { path, axes, fill, commanded, child, .. } => {
             rewrite(path, axes, fill, commanded, child)
         }
-        LayoutNode::Styled { props, child, hints } => LayoutNode::Styled {
+        LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
             hints,
+            action,
         },
         LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
             key,
@@ -505,8 +506,8 @@ fn rewrite_field_node(
     rewrite: &impl Fn(FieldParts) -> LayoutNode,
 ) -> LayoutNode {
     match node {
-        // a node that wears hints stood behind their wrapper, which no
-        // rewrite crosses: it is left as the wrapper left it
+        // a node that wears hints or an action stood behind their
+        // wrapper, which no rewrite crosses: it is left as it was left
         marked if !marked.is_bare() => marked,
         LayoutNode::Field {
             path,
@@ -527,10 +528,11 @@ fn rewrite_field_node(
             highlights,
             secret,
         }),
-        LayoutNode::Styled { props, child, hints } => LayoutNode::Styled {
+        LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_field_node(*child, rewrite)),
             hints,
+            action,
         },
         LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
             key,
@@ -594,15 +596,16 @@ fn rewrite_pixel_node(
     icon: &impl Fn(crate::icon::Symbol, bool, bool) -> LayoutNode,
 ) -> LayoutNode {
     match node {
-        // a node that wears hints stood behind their wrapper, which no
-        // rewrite crosses: it is left as the wrapper left it
+        // a node that wears hints or an action stood behind their
+        // wrapper, which no rewrite crosses: it is left as it was left
         marked if !marked.is_bare() => marked,
         LayoutNode::Image { source, resizable, fit } => rewrite(source, resizable, fit),
         LayoutNode::Icon { symbol, resizable, forced } => icon(symbol, resizable, forced),
-        LayoutNode::Styled { props, child, hints } => LayoutNode::Styled {
+        LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
             hints,
+            action,
         },
         LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
             key,
@@ -660,16 +663,17 @@ fn rewrite_text_node(
     ) -> LayoutNode,
 ) -> LayoutNode {
     match node {
-        // a node that wears hints stood behind their wrapper, which no
-        // rewrite crosses: it is left as the wrapper left it
+        // a node that wears hints or an action stood behind their
+        // wrapper, which no rewrite crosses: it is left as it was left
         marked if !marked.is_bare() => marked,
         LayoutNode::Text { content, highlights, truncation, .. } => {
             rewrite(content, highlights, truncation)
         }
-        LayoutNode::Styled { props, child, hints } => LayoutNode::Styled {
+        LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_text_node(*child, rewrite)),
             hints,
+            action,
         },
         LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
             key,
@@ -717,16 +721,40 @@ fn wrap_padding(out: &mut NodeList, mark: usize, edges: Edges) {
 
 fn wrap_styled(out: &mut NodeList, mark: usize, delta: VisualProps) {
     out.wrap_layout_from(mark, |node| match node {
-        // a style that wears hints stood behind their wrapper, where no
-        // style reached it to merge: the new one nests, as it did
-        LayoutNode::Styled { props, child, hints } if hints.is_empty() => {
-            LayoutNode::Styled { props: VisualProps::restyled(props, delta), child, hints }
+        // a style that wears hints or an action stood behind their
+        // wrapper, where no style reached it to merge: the new one
+        // nests, as it did
+        LayoutNode::Styled { props, child, hints, action: None } if hints.is_empty() => {
+            LayoutNode::Styled {
+                props: VisualProps::restyled(props, delta),
+                child,
+                hints,
+                action: None,
+            }
         }
         other => LayoutNode::Styled {
             props: delta.shared(),
             child: Box::new(other),
             hints: Default::default(),
+            action: None,
         },
+    });
+}
+
+/// Makes what the base left the target of `path`. A stack, a text or a
+/// style with no action of its own carries it: the links of a row are
+/// armed in every body it runs, and a box around each was an allocation
+/// per action per row. Anything else — and a node that already answers
+/// another action — is wrapped in an `Interactive`, as it always was.
+fn arm_target(out: &mut NodeList, mark: usize, path: Rc<str>) {
+    out.wrap_layout_from(mark, |mut node| {
+        if let Some(action) = node.carried_action_mut()
+            && action.is_none()
+        {
+            *action = Some(path);
+            return node;
+        }
+        LayoutNode::Interactive { path, child: Box::new(node) }
     });
 }
 
@@ -1506,6 +1534,7 @@ fn apply(
                 highlights: Some(highlight.clone()),
                 truncation,
                 hints: Default::default(),
+                action: None,
             });
             rewrite_field_node(node, &|parts| {
                 FieldParts { highlights: Some(highlight.clone()), ..parts }.into_node()
@@ -1517,6 +1546,7 @@ fn apply(
                 highlights,
                 truncation: Some(*mode),
                 hints: Default::default(),
+                action: None,
             })
         }),
         Modifier::OnMeasure(report) => {
@@ -1705,10 +1735,7 @@ fn apply(
             // reconciler, frame in the hit-test under the cursor identity
             if let Some(path) = motor::identity::cursor_scope_rc() {
                 crate::reconciler::attribute_action(Rc::clone(&path), action.clone());
-                out.wrap_layout_from(mark, |node| LayoutNode::Interactive {
-                    path,
-                    child: Box::new(node),
-                });
+                arm_target(out, mark, path);
             }
         }
         Modifier::OnHover(action) => {
@@ -1722,10 +1749,7 @@ fn apply(
                     Rc::from(format!("{path}/{}", crate::reconciler::HOVER_KEY)),
                     action.clone(),
                 );
-                out.wrap_layout_from(mark, |node| LayoutNode::Interactive {
-                    path,
-                    child: Box::new(node),
-                });
+                arm_target(out, mark, path);
             }
         }
         Modifier::OnCopy(copy) => {
@@ -1735,10 +1759,7 @@ fn apply(
             // and a click returns nothing
             if let Some(path) = motor::identity::cursor_scope() {
                 crate::reconciler::attribute_copy(path.clone(), copy.clone());
-                out.wrap_layout_from(mark, |node| LayoutNode::Interactive {
-                    path: Rc::from(path),
-                    child: Box::new(node),
-                });
+                arm_target(out, mark, Rc::from(path));
             }
         }
         Modifier::OnAction(id, handler) => {
