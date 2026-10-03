@@ -182,6 +182,7 @@ impl NodeList {
             // the slot the decision already found, or the one a body
             // that just ran filed its entry under
             slot: slot.unwrap_or_else(|| crate::reconciler::slot_of(path)),
+            hints: crate::layout::ElementHints::default(),
         });
     }
 
@@ -211,7 +212,11 @@ impl NodeList {
     pub(crate) fn root_boundary(&self) -> Option<&str> {
         match self.layout.as_slice() {
             [crate::layout::LayoutNode::Boundary { path, .. }] => Some(path),
-            [crate::layout::LayoutNode::BoundaryRef { path, .. }] => Some(&**path),
+            // a hinted root is not the bare boundary a stable frame
+            // stands in for it — its hints would be lost
+            [crate::layout::LayoutNode::BoundaryRef { path, hints, .. }] if hints.is_empty() => {
+                Some(&**path)
+            }
             _ => None,
         }
     }

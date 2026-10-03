@@ -996,8 +996,11 @@ pub enum LayoutNode {
     HoverGroup { path: String, child: Box<LayoutNode> },
     /// Reference to a retained boundary (skipped by the reconciler);
     /// measure and place resolve ON-THE-FLY against the retention — the
-    /// frame's tree is never stitched into a copy.
-    BoundaryRef { path: Rc<str>, slot: Rc<crate::reconciler::Slot> },
+    /// frame's tree is never stitched into a copy. `hints` are what an
+    /// `.element(…)` over the boundary says: the reference carries them
+    /// itself, where a [`LayoutNode::Hinted`] around it was a box for
+    /// every row of a list, each time the list re-ran.
+    BoundaryRef { path: Rc<str>, slot: Rc<crate::reconciler::Slot>, hints: ElementHints },
     /// `.rendering(Gpu)`: this subtree insists on the pixel pipeline.
     /// Transparent to geometry everywhere; in Dom mode it becomes a
     /// CANVAS ISLAND — an element our layout positions, filled with the
@@ -1140,6 +1143,25 @@ pub enum LayoutNode {
     /// draw command: the scene keeps the ground, the view lands on
     /// top.
     Host { path: String, spec: crate::host::HostSpec },
+}
+
+/// The element hints a reference to a retained boundary carries itself
+/// ([`LayoutNode::BoundaryRef`]) — the words a [`LayoutNode::Hinted`]
+/// around it would hold, and as transparent: only the Dom lowering
+/// reads them.
+///
+/// Public in name only, like the slot beside it.
+#[derive(Clone, Debug, Default)]
+pub struct ElementHints {
+    pub(crate) tag: Option<Rc<str>>,
+    pub(crate) class: Option<Rc<str>>,
+    pub(crate) dom_id: Option<Rc<str>>,
+}
+
+impl ElementHints {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.tag.is_none() && self.class.is_none() && self.dom_id.is_none()
+    }
 }
 
 /// How the element lowering lays a subtree out: the browser's flow
@@ -2219,7 +2241,9 @@ impl LayoutNode {
             LayoutNode::Boundary { children, quiet, .. } => {
                 quiet.get_or_init(|| Quiet::of_all(children)).holds()
             }
-            LayoutNode::BoundaryRef { slot, .. } => slot.quiet_now(),
+            // a hinted reference answers as the wrapper it stands for
+            // did: a hint is no memory, and the placement goes ahead
+            LayoutNode::BoundaryRef { slot, hints, .. } => hints.is_empty() && slot.quiet_now(),
             _ => false,
         }
     }
@@ -5162,7 +5186,7 @@ impl LayoutNode {
             // the same question every frame. A body that re-runs makes a
             // new entry (no kept answer), and clears the answers of the
             // boundaries above it, whose size may hang on its own.
-            LayoutNode::BoundaryRef { path, slot } => {
+            LayoutNode::BoundaryRef { path, slot, .. } => {
                 let key = MeasureKey { proposal, font: env.font, line_height: env.line_height };
                 crate::reconciler::measure_retained(slot, path, key, |node| node.measure(proposal, env))
             }

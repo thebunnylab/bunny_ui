@@ -4620,7 +4620,11 @@ impl Runtime {
                 reconciler::note_stable_frame();
 {
                     let slot = reconciler::slot_of(&path);
-                    crate::layout::LayoutNode::BoundaryRef { path: Rc::from(path.as_str()), slot }
+                    crate::layout::LayoutNode::BoundaryRef {
+                        path: Rc::from(path.as_str()),
+                        slot,
+                        hints: Default::default(),
+                    }
                 }
             }
             None => {
@@ -4732,7 +4736,11 @@ impl Runtime {
                 reconciler::note_stable_frame();
 {
                     let slot = reconciler::slot_of(&path);
-                    crate::layout::LayoutNode::BoundaryRef { path: Rc::from(path.as_str()), slot }
+                    crate::layout::LayoutNode::BoundaryRef {
+                        path: Rc::from(path.as_str()),
+                        slot,
+                        hints: Default::default(),
+                    }
                 }
             }
             None => {
@@ -6317,7 +6325,11 @@ impl Runtime {
                 reconciler::note_stable_frame();
 {
                     let slot = reconciler::slot_of(&path);
-                    crate::layout::LayoutNode::BoundaryRef { path: Rc::from(path.as_str()), slot }
+                    crate::layout::LayoutNode::BoundaryRef {
+                        path: Rc::from(path.as_str()),
+                        slot,
+                        hints: Default::default(),
+                    }
                 }
             }
             None => {
