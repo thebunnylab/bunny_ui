@@ -55,10 +55,26 @@ thread_local! {
 impl<T: Clone + 'static> Bound<T> {
     /// Makes the binding at `key` and reads it once, under the view
     /// whose body is running (`owner`): the reads land on the key,
-    /// never on the body.
+    /// never on the body. A render reads first and makes the binding
+    /// after ([`Bound::from_probe`]); this eager door is the tests'.
+    #[cfg(test)]
     pub(crate) fn new(key: Rc<str>, eval: Rc<dyn Fn() -> T>) -> Rc<Self> {
         let bound = Rc::new(Bound { key, eval, cache: RefCell::new(None), stale: Cell::new(true) });
         bound.evaluate(true);
+        let weak = Rc::downgrade(&bound);
+        let weak: Weak<dyn Stale> = weak;
+        LIVE.with(|live| {
+            live.borrow_mut().insert(Rc::clone(&bound.key), weak);
+        });
+        bound
+    }
+
+    /// Makes the binding at `key` from a reading a probe already made
+    /// ([`place_lazy`]): the value is its first, and the reads the probe
+    /// filed become the key's, under the view whose body is running.
+    fn from_probe(key: Rc<str>, eval: Rc<dyn Fn() -> T>, value: T) -> Rc<Self> {
+        motor::identity::file_probe_under_view(&key);
+        let bound = Rc::new(Bound { key, eval, cache: RefCell::new(Some(value)), stale: Cell::new(false) });
         let weak = Rc::downgrade(&bound);
         let weak: Weak<dyn Stale> = weak;
         LIVE.with(|live| {
@@ -102,6 +118,7 @@ impl<T: Clone + 'static> Bound<T> {
 
     /// Did the last read depend on anything? A binding that read
     /// nothing is a constant: nothing can ever make it stale.
+    #[cfg(test)]
     pub(crate) fn reads_anything(&self) -> bool {
         motor::identity::binding_read_count(&self.key) > 0
     }
@@ -193,6 +210,31 @@ pub(crate) fn key_at_cursor(suffix: &str) -> Option<Rc<str>> {
     motor::identity::cursor_key(suffix)
 }
 
+/// A lazy source placed at render: its closure is read once, under a
+/// probe, and what the reading touched decides what the node is. A read
+/// of anything makes it a binding at the cursor's key (`suffix` says what
+/// it is), the probe's reads its own; a reading that touched nothing is
+/// its value, fixed — no key minted, no binding made, nothing filed under
+/// the body, since nothing can ever move it. Outside a pass there is no
+/// key to hang a binding on, and the value is fixed too.
+fn place_lazy<T: Clone + 'static>(eval: &Rc<dyn Fn() -> T>, suffix: &str) -> Result<Rc<Bound<T>>, T> {
+    let (value, read) = {
+        let _probe = motor::identity::begin_probe();
+        let value = eval();
+        (value, motor::identity::probe_read_anything())
+    };
+    if !read {
+        return Err(value);
+    }
+    match key_at_cursor(suffix) {
+        Some(key) => Ok(Bound::from_probe(key, Rc::clone(eval), value)),
+        None => {
+            motor::identity::forget_probe();
+            Err(value)
+        }
+    }
+}
+
 // MARK: - Text
 
 thread_local! {
@@ -272,16 +314,9 @@ impl TextSource {
     /// or a fixed string, when its one read depended on nothing.
     pub(crate) fn place(&self) -> TextSource {
         match self {
-            TextSource::Lazy(eval) => match key_at_cursor("#text") {
-                Some(key) => {
-                    let bound = Bound::new(key, Rc::clone(eval));
-                    if bound.reads_anything() {
-                        TextSource::Bound(bound)
-                    } else {
-                        TextSource::Fixed(bound.get())
-                    }
-                }
-                None => TextSource::Fixed(eval()),
+            TextSource::Lazy(eval) => match place_lazy(eval, "#text") {
+                Ok(bound) => TextSource::Bound(bound),
+                Err(fixed) => TextSource::Fixed(fixed),
             },
             other => other.clone(),
         }
@@ -355,16 +390,9 @@ impl ClassSource {
     /// or a fixed class, when its one read depended on nothing.
     pub(crate) fn place(&self) -> ClassSource {
         match self {
-            ClassSource::Lazy(eval) => match key_at_cursor("#class") {
-                Some(key) => {
-                    let bound = Bound::new(key, Rc::clone(eval));
-                    if bound.reads_anything() {
-                        ClassSource::Bound(bound)
-                    } else {
-                        ClassSource::Fixed(bound.get())
-                    }
-                }
-                None => ClassSource::Fixed(eval()),
+            ClassSource::Lazy(eval) => match place_lazy(eval, "#class") {
+                Ok(bound) => ClassSource::Bound(bound),
+                Err(fixed) => ClassSource::Fixed(fixed),
             },
             other => other.clone(),
         }
@@ -402,6 +430,41 @@ mod frame_tests {
         fn body(self, _ctx: &Context) -> impl View {
             crate::text!("{} rows", self.count)
         }
+    }
+
+    /// A `text!` that reads no state is its words, fixed: the frame mints
+    /// no key for it, makes no binding and files nothing under the body —
+    /// and the words are the ones the format writes. A class that reads
+    /// nothing is fixed the same way. Beside them, a text that reads is a
+    /// binding with its read filed under its key.
+    #[test]
+    fn a_node_that_reads_nothing_is_fixed_and_files_nothing() {
+        #[derive(Clone, Copy)]
+        struct Plain {
+            id: usize,
+        }
+
+        impl Component for Plain {
+            fn body(self, _ctx: &Context) -> impl View {
+                let id = self.id;
+                (crate::views::boundary_class_with(move || format!("row-{id}")), crate::text!("row {}", id))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&Plain { id: 7 }, SIZE);
+        assert_eq!(super::live_count(), 0, "no binding was made");
+        let [_, _, _, view_bindings, binding_reads, _, _] = motor::identity::registry_counts();
+        assert_eq!((view_bindings, binding_reads), (0, 0), "and nothing was filed");
+        let printed = runtime.render(&Plain { id: 7 });
+        assert!(printed.contains("Text(\"row 7\")") && printed.contains("BoundaryClass(\"row-7\")"), "{printed}");
+
+        let label = Label { count: State::new(3) };
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&label, SIZE);
+        assert_eq!(super::live_count(), 1, "a text that reads is a binding");
+        let [_, _, _, view_bindings, binding_reads, _, _] = motor::identity::registry_counts();
+        assert_eq!((view_bindings, binding_reads), (1, 1), "its read filed under its key, the key under its body");
     }
 
     /// A text that reads for itself wears the face above it like any

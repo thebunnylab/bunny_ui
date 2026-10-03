@@ -119,6 +119,14 @@ struct Registry {
     /// The binding being read right now: while one is open, a read
     /// belongs to it and not to the view whose body may be running.
     binding_scope: Option<Rc<str>>,
+    /// A probe is open ([`begin_probe`]): with no binding open inside
+    /// it, a read is the probe's.
+    probing: bool,
+    /// What the last probe read, kept aside until a key is minted for
+    /// it — or not, when it read nothing.
+    probe_reads: Vec<DepKey>,
+    /// A write reached something the open probe had already read.
+    probe_written: bool,
     /// binding → dependencies read in its LAST evaluation — nearly
     /// always one, held inline ([`Few`]).
     binding_reads: HashMap<Rc<str>, Few<DepKey>>,
@@ -1152,29 +1160,115 @@ pub fn begin_binding_under_view(key: &Rc<str>) -> BindingScope {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         let registry = &mut *registry;
-        clear_binding_reads(registry, key);
-        // a binding made at a key that waits retired is a body's new one
-        // there: it hears writes again, and the idle leaves it alone
-        unretire(registry, key);
-        if let Some(len) = registry.views.last() {
-            let owner = &registry.joined[..*len];
-            match registry.view_bindings.get_mut(owner) {
-                Some(bindings) => bindings.push(Rc::clone(key)),
-                None => {
-                    // the body's own boundary handed its shared path over
-                    // when it began; a view with no retention spells one
-                    let owner = match registry.view_keys.last() {
-                        Some(Some(shared)) => Rc::clone(shared),
-                        _ => Rc::from(owner),
-                    };
-                    let mut bindings = BindingKeys::default();
-                    bindings.push(Rc::clone(key));
-                    registry.view_bindings.insert(owner, bindings);
-                }
-            }
-        }
+        file_under_view(registry, key);
         BindingScope { previous: registry.binding_scope.replace(Rc::clone(key)) }
     })
+}
+
+/// A new binding at `key`, made by the body that is running: what it
+/// read before is gone, and it is filed under the view.
+fn file_under_view(registry: &mut Registry, key: &Rc<str>) {
+    clear_binding_reads(registry, key);
+    // a binding made at a key that waits retired is a body's new one
+    // there: it hears writes again, and the idle leaves it alone
+    unretire(registry, key);
+    if let Some(len) = registry.views.last() {
+        let owner = &registry.joined[..*len];
+        match registry.view_bindings.get_mut(owner) {
+            Some(bindings) => bindings.push(Rc::clone(key)),
+            None => {
+                // the body's own boundary handed its shared path over
+                // when it began; a view with no retention spells one
+                let owner = match registry.view_keys.last() {
+                    Some(Some(shared)) => Rc::clone(shared),
+                    _ => Rc::from(owner),
+                };
+                let mut bindings = BindingKeys::default();
+                bindings.push(Rc::clone(key));
+                registry.view_bindings.insert(owner, bindings);
+            }
+        }
+    }
+}
+
+/// A node's first reading, before the node is a binding: open while the
+/// scope lives ([`begin_probe`]).
+pub struct ProbeScope {
+    previous: Option<Rc<str>>,
+    was_probing: bool,
+}
+
+impl Drop for ProbeScope {
+    fn drop(&mut self) {
+        REGISTRY.with(|registry| {
+            let mut registry = registry.borrow_mut();
+            registry.binding_scope = self.previous.take();
+            registry.probing = self.was_probing;
+        });
+    }
+}
+
+/// Opens a PROBE: a node's first reading, before the node is a binding.
+///
+/// A node that reads for itself takes a key, a binding object and a
+/// place under the body that made it — and a reading that turns out to
+/// read nothing threw all three away, since nothing can ever move it.
+/// The probe reads first and decides after: every read until the scope
+/// drops is kept aside, in a list of the probe's own, and the node then
+/// either files them under the key it mints ([`file_probe_under_view`])
+/// or, having read nothing, mints nothing at all
+/// ([`probe_read_anything`]). A binding read while the probe is open
+/// reads for itself, as it would inside any binding.
+pub fn begin_probe() -> ProbeScope {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        registry.probe_reads.clear();
+        registry.probe_written = false;
+        ProbeScope {
+            previous: registry.binding_scope.take(),
+            was_probing: std::mem::replace(&mut registry.probing, true),
+        }
+    })
+}
+
+/// Did the last probe read anything?
+pub fn probe_read_anything() -> bool {
+    REGISTRY.with(|registry| !registry.borrow().probe_reads.is_empty())
+}
+
+/// Files the last probe's reads under `key`, the binding minted for
+/// them, and the binding under the view whose body is running — what
+/// [`begin_binding_under_view`] and the reads themselves file when the
+/// key is there before the reading.
+pub fn file_probe_under_view(key: &Rc<str>) {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        let registry = &mut *registry;
+        file_under_view(registry, key);
+        let reads = std::mem::take(&mut registry.probe_reads);
+        for dep in &reads {
+            file_few(&mut registry.binding_reads, Rc::clone(key), *dep);
+            file_few(&mut registry.binding_readers, *dep, Rc::clone(key));
+        }
+        // the list keeps its room for the next probe
+        registry.probe_reads = reads;
+        registry.probe_reads.clear();
+        // a write that reached what the probe had read, while it read,
+        // reaches the binding now
+        if std::mem::take(&mut registry.probe_written) {
+            registry.dirty_bindings.insert(Rc::clone(key));
+        }
+    })
+}
+
+/// Lets the last probe's reads go: the reading was not kept as a binding
+/// (no key to keep it under — a render with no pass around it).
+pub fn forget_probe() {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        registry.probe_reads.clear();
+        registry.probe_written = false;
+    });
 }
 
 /// The key is a live binding's again ([`retire_view`]).
@@ -1235,6 +1329,12 @@ pub(crate) fn record_read(key: DepKey) {
             file_few(&mut registry.binding_readers, key, binding);
             return;
         }
+        if registry.probing {
+            // a first reading with no key yet: kept aside until one is
+            // minted for it
+            registry.probe_reads.push(key);
+            return;
+        }
         if !registry.pass_active {
             return;
         }
@@ -1269,6 +1369,10 @@ pub(crate) fn record_write(key: DepKey) {
         // two fields of one registry: the readers are read, the dirty set
         // is written — and a reader that already ran this pass is noted
         let registry = &mut *registry;
+        // the open probe read it already: the binding it becomes hears it
+        if registry.probing && registry.probe_reads.contains(&key) {
+            registry.probe_written = true;
+        }
         if let Some(readers) = registry.readers.get(&key).cloned() {
             note_missed(registry, readers.iter().map(String::as_str));
             for reader in readers {
@@ -1575,6 +1679,74 @@ mod tests {
             assert_eq!(registry.binding_readers.get(&label).map(Few::len), Some(1), "the other reader stays");
             assert!(!registry.view_bindings.contains_key("Row"));
         });
+        reset_world();
+    }
+
+    /// A probe reads before the binding has a key: its reads are kept
+    /// aside, out of the tables, and filed whole under the key minted
+    /// for them — both directions — or let go when no key is minted. A
+    /// probe that read nothing says so; a binding read inside a probe
+    /// reads for itself; a write that reached what the probe had read
+    /// reaches the binding it becomes.
+    #[test]
+    fn a_probe_files_its_reads_under_the_key_minted_for_them() {
+        use super::{
+            begin_binding, begin_pass, begin_probe, begin_view_reads, end_pass, enter_view, file_probe_under_view,
+            forget_probe, probe_read_anything, record_read, record_write, registry_counts, reset_world,
+            take_dirty_bindings, DepKey, Few, REGISTRY,
+        };
+        use std::rc::Rc;
+
+        reset_world();
+        let label = DepKey::State(1);
+        let inner = DepKey::State(3);
+        let row: Rc<str> = Rc::from("Row");
+        let key: Rc<str> = Rc::from("Row/#text");
+        let nested: Rc<str> = Rc::from("Elsewhere/#text");
+        begin_pass();
+        {
+            let _view = enter_view("Row");
+            begin_view_reads(&row);
+            drop(begin_probe());
+            assert!(!probe_read_anything(), "a probe that read nothing says so");
+            let probe = begin_probe();
+            record_read(label);
+            assert_eq!(registry_counts()[4], 0, "nothing is filed while the probe reads");
+            {
+                let _binding = begin_binding(&nested, None);
+                record_read(inner);
+            }
+            drop(probe);
+            assert!(probe_read_anything());
+            file_probe_under_view(&key);
+        }
+        let _ = end_pass();
+        REGISTRY.with(|registry| {
+            let registry = registry.borrow();
+            assert!(matches!(registry.binding_reads.get(&key), Some(Few::One(dep)) if *dep == label));
+            assert!(matches!(registry.binding_readers.get(&label), Some(Few::One(reader)) if *reader == key));
+            assert!(matches!(registry.binding_readers.get(&inner), Some(Few::One(reader)) if *reader == nested), "the inner binding read for itself");
+            assert_eq!(registry.view_bindings.get("Row").map(|bindings| bindings.len()), Some(1), "filed under the row");
+        });
+        record_write(label);
+        assert_eq!(take_dirty_bindings(), vec![Rc::clone(&key)], "a write reaches the key");
+
+        // a write during the reading, to what it read, reaches the key
+        let probe = begin_probe();
+        record_read(label);
+        record_write(label);
+        drop(probe);
+        let _ = take_dirty_bindings();
+        file_probe_under_view(&key);
+        assert_eq!(take_dirty_bindings(), vec![Rc::clone(&key)], "the write during the reading");
+
+        // a probe whose reading is not kept leaves nothing behind
+        let probe = begin_probe();
+        record_read(DepKey::State(2));
+        drop(probe);
+        forget_probe();
+        assert!(!probe_read_anything());
+        assert_eq!(registry_counts()[4], 2, "only the bindings' reads stand");
         reset_world();
     }
 

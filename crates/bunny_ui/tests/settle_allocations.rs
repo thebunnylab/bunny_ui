@@ -192,6 +192,18 @@ fn a_bound_label_files_its_reads_without_a_set() {
     assert!(cost <= 5, "a bound label costs the settle {cost} allocations beyond the empty row");
 }
 
+/// A `text!` of a value that is no state reads nothing, and is no
+/// binding: it pays for its closure, its text and the list its node is
+/// held in — no key, no binding object, nothing filed under the body.
+#[test]
+fn a_text_that_reads_nothing_pays_for_its_words_alone() {
+    let cost = beyond_empty(|item| {
+        let id = item.id;
+        text!("{id}")
+    });
+    assert!(cost <= 3, "a text of no state costs the settle {cost} allocations beyond the empty row");
+}
+
 /// A body of five cells holds its five nodes in one list, made once for
 /// the five: it grew from four to eight before, two allocations. And a
 /// stack that holds nothing makes no room for the child that adds none
