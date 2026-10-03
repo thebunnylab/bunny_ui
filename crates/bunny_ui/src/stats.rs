@@ -81,6 +81,10 @@ pub struct FrameStats {
     pub binding_updates: u32,
     /// Subtrees mounted as a clone of a shape already on the page.
     pub clones: u32,
+    /// Subtrees whose whole shape was hashed to find a template — the
+    /// slow road; a row compared with the copy made just before it
+    /// does not count.
+    pub shapes_hashed: u32,
     /// Second layouts the pointer re-read asked for.
     pub hover_relayouts: u32,
     /// Calls to an app box's `paint`.
@@ -126,6 +130,7 @@ impl FrameStats {
             entries_indexed: 0,
             binding_updates: 0,
             clones: 0,
+            shapes_hashed: 0,
             hover_relayouts: 0,
             paints: 0,
             pictures_replayed: 0,
@@ -165,6 +170,7 @@ thread_local! {
     static ENTRIES_INDEXED: Cell<u32> = const { Cell::new(0) };
     static BINDING_UPDATES: Cell<u32> = const { Cell::new(0) };
     static CLONES: Cell<u32> = const { Cell::new(0) };
+    static SHAPES_HASHED: Cell<u32> = const { Cell::new(0) };
     static HOVER_RELAYOUTS: Cell<u32> = const { Cell::new(0) };
     static PAINTS: Cell<u32> = const { Cell::new(0) };
     static PICTURES_REPLAYED: Cell<u32> = const { Cell::new(0) };
@@ -211,6 +217,7 @@ pub fn take() -> FrameStats {
         entries_indexed: ENTRIES_INDEXED.with(|c| c.replace(0)),
         binding_updates: BINDING_UPDATES.with(|c| c.replace(0)),
         clones: CLONES.with(|c| c.replace(0)),
+        shapes_hashed: SHAPES_HASHED.with(|c| c.replace(0)),
         hover_relayouts: HOVER_RELAYOUTS.with(|c| c.replace(0)),
         paints: PAINTS.with(|c| c.replace(0)),
         pictures_replayed: PICTURES_REPLAYED.with(|c| c.replace(0)),
@@ -310,6 +317,11 @@ pub(crate) fn note_binding_update() {
 #[inline]
 pub(crate) fn note_clone() {
     bump(&CLONES, 1);
+}
+
+#[inline]
+pub(crate) fn note_shape_hashed() {
+    bump(&SHAPES_HASHED, 1);
 }
 
 #[inline]

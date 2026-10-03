@@ -46,6 +46,23 @@ impl Hasher for FxHasher {
         self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(SEED);
     }
 
+    // The small integers are one word each. Left to the default, a flag,
+    // a color or the terminator of every `str` went through `write` and
+    // its tail loop — a byte copy per field of every look a row hashes.
+    // The word is the one that loop made: the value's little-endian
+    // bytes, zero-filled (a `u32` IS its zero-extended `u64` there).
+    fn write_u8(&mut self, value: u8) {
+        self.write_u64(u64::from(value));
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.write_u64(u64::from(u16::from_le_bytes(value.to_ne_bytes())));
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.write_u64(u64::from(u32::from_le_bytes(value.to_ne_bytes())));
+    }
+
     fn write_usize(&mut self, value: usize) {
         self.write_u64(value as u64);
     }
@@ -66,6 +83,30 @@ mod tests {
             state = (state.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(SEED);
         }
         state
+    }
+
+    /// A flag, a short and a word hash as their bytes always did: every
+    /// key that reached a golden keeps its number.
+    #[test]
+    fn the_small_integers_answer_what_their_bytes_answered() {
+        for value in [0u32, 1, 0xff, 0x1234, 0xdead_beef, u32::MAX] {
+            let mut word = FxHasher::default();
+            word.write_u32(value);
+            assert_eq!(word.finish(), reference(&value.to_ne_bytes()), "u32 {value:#x}");
+            let short = value as u16;
+            let mut half = FxHasher::default();
+            half.write_u16(short);
+            assert_eq!(half.finish(), reference(&short.to_ne_bytes()), "u16 {short:#x}");
+            let byte = value as u8;
+            let mut one = FxHasher::default();
+            one.write_u8(byte);
+            assert_eq!(one.finish(), reference(&[byte]), "u8 {byte:#x}");
+        }
+        // and a string, whose terminator is a byte
+        let mut text = FxHasher::default();
+        std::hash::Hash::hash("App/#0/[12]", &mut text);
+        let expected = (reference(b"App/#0/[12]").rotate_left(5) ^ 0xff).wrapping_mul(SEED);
+        assert_eq!(text.finish(), expected, "a str hashes its bytes, then its 0xff");
     }
 
     #[test]
