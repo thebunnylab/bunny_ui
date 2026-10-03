@@ -33,6 +33,7 @@
 //! keep `#![forbid(unsafe_code)]`.
 
 pub mod keys;
+pub mod shortcuts;
 
 #[cfg(target_os = "android")]
 #[macro_use]
@@ -104,6 +105,49 @@ macro_rules! activity {
             unsafe { $crate::on_create(activity, saved_state_size, $main) }
         }
     };
+}
+
+/// Exports the native half of the app activity's
+/// `onProvideKeyboardShortcuts` — the bar's chords, as the system's
+/// Keyboard Shortcuts Helper (Meta+/) lists them ([`shortcuts`]).
+///
+/// The app's activity is a small Java subclass of `NativeActivity` that
+/// declares `private static native String keyboardShortcuts();` and builds
+/// its `KeyboardShortcutGroup`s from the answer's lines. `$symbol` is that
+/// method's JNI name — `Java_<package>_<Class>_keyboardShortcuts`, the
+/// package's dots as underscores — and the symbol is defined in the app's
+/// crate for [`activity!`]'s reason.
+///
+/// ```ignore
+/// bunny_ui_android::keyboard_shortcuts!(Java_com_example_app_AppActivity_keyboardShortcuts);
+/// ```
+#[macro_export]
+macro_rules! keyboard_shortcuts {
+    ($symbol:ident) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "system" fn $symbol(
+            env: *mut ::core::ffi::c_void,
+            _class: *mut ::core::ffi::c_void,
+        ) -> *mut ::core::ffi::c_void {
+            unsafe { $crate::keyboard_shortcuts_for_java(env) }
+        }
+    };
+}
+
+/// The body behind [`keyboard_shortcuts!`]: the kept groups as a Java
+/// string — a local reference the call returns — or null when the env
+/// cannot make one.
+///
+/// # Safety
+///
+/// `env` is the `JNIEnv*` the VM handed the native method, on the thread
+/// it called it on.
+#[cfg(target_os = "android")]
+#[doc(hidden)]
+pub unsafe fn keyboard_shortcuts_for_java(env: *mut ::core::ffi::c_void) -> *mut ::core::ffi::c_void {
+    unsafe { jni::Env::from_raw(env) }
+        .string(&shortcuts::kept())
+        .unwrap_or(::core::ptr::null_mut())
 }
 
 /// The entry's body, behind [`activity!`].
