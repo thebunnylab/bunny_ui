@@ -2036,4 +2036,44 @@ mod tests {
             "the page keeps its class: {counted:?}"
         );
     }
+
+    /// An island seeds its measured box on the frame that mounts it, so
+    /// the browser's first report — the mount's own echo — buys no frame,
+    /// and a box of the browser's own does. The seed reads the finished
+    /// scene, and only when the walk lowered an island: a page of
+    /// elements, a list of a thousand rows, is never walked for one.
+    #[test]
+    fn an_island_seeds_its_box_on_the_frame_that_mounts_it() {
+        use crate::prelude::*;
+
+        #[derive(Clone, Copy)]
+        struct Card;
+
+        impl Component for Card {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(
+                    text("above the island"),
+                    spacer()
+                        .frame(120.0, 40.0)
+                        .background_color(Color::hex(0x3B82F6))
+                        .rendering(Rendering::Gpu)
+                )
+            }
+        }
+
+        let runtime = crate::runtime::Runtime::new();
+        let size = crate::layout::Size { width: 600.0, height: 300.0 };
+        let mount = runtime.dom_frame(&Card, size);
+        let canvas = mount
+            .iter()
+            .find_map(|patch| match patch {
+                crate::dom::DomPatch::Create { id, kind: crate::dom::CreateKind::Canvas, .. } => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .expect("the island mounted");
+        assert!(!runtime.dom_island_box(canvas, 120.0, 40.0), "the mount's echo is not news");
+        assert!(runtime.dom_island_box(canvas, 130.0, 40.0), "a box of the browser's own is");
+    }
 }
