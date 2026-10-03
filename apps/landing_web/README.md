@@ -31,3 +31,14 @@ python3 -m http.server 8873 --directory web
 ```
 
 Then open http://localhost:8873.
+
+Deploy (Firebase Hosting, project `bunny-ui`, from this directory after
+the build above):
+
+```
+firebase deploy --only hosting
+```
+
+It serves `web/` at https://bunny-ui.web.app. Every file revalidates
+(`no-cache`): the served page, the glue and the wasm must be one build,
+or the boot adopts a page another scene drew.
