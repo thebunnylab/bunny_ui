@@ -727,7 +727,8 @@ mod tests {
             out.take_layout()
         };
         let words = |hints: &crate::layout::ElementHints| {
-            [&hints.tag, &hints.class, &hints.dom_id].map(|word| word.as_deref().map(str::to_string))
+            let dom_id = hints.address.as_ref().and_then(|address| address.dom_id.as_deref());
+            [hints.tag.as_deref(), hints.class.as_deref(), dom_id].map(|word| word.map(str::to_string))
         };
         let said = |words: [Option<&str>; 3]| words.map(|word| word.map(str::to_string));
 
@@ -749,7 +750,7 @@ mod tests {
         let hinted = tree(&|out| {
             text("a").frame_width(10.0).element("td").css_class("x").element_id("i").css_class("y").render_into(&ctx, out)
         });
-        let [LayoutNode::Hinted { tag, class, dom_id, child }] = hinted.as_slice() else {
+        let [LayoutNode::Hinted { tag, class, dom_id, child, .. }] = hinted.as_slice() else {
             panic!("one hint around the frame: {hinted:#?}");
         };
         assert!(matches!(**child, LayoutNode::Frame { .. }), "{hinted:#?}");

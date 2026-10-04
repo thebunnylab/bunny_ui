@@ -96,6 +96,7 @@ pub(crate) struct FlowKey {
     group: Option<u64>,
     in_overlay: bool,
     slot: (Option<Px>, Option<Px>),
+    unbounded: bool,
 }
 
 /// What the lowering keeps of a group: the key it was lowered under,
@@ -140,6 +141,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         pending_tooltip: None,
         groups: Vec::new(),
         overlay_depth: 0,
+        unbounded: false,
         drops_seen: 0,
         overlays: Vec::new(),
         display: crate::layout::DisplayList::default(),
@@ -275,6 +277,12 @@ struct Walk<'a> {
     /// How deep inside an overlay LAYER the walk is: what a layer
     /// paints is decoration until something in it asks to be a target.
     overlay_depth: usize,
+    /// The walk is inside a scroller's content, down the axis it
+    /// scrolls, with no height pinned since: the column there has no
+    /// length to share. A flexible child takes what its content needs —
+    /// the pixel layout's open proposal — where a flex from a zero basis
+    /// would fold it to nothing.
+    unbounded: bool,
     /// How many drop targets the walk has met — the index into
     /// `FlowEnv::drop_rings`.
     drops_seen: usize,
@@ -430,6 +438,7 @@ impl Walk<'_> {
             group: self.groups.last().copied(),
             in_overlay: self.overlay_depth > 0,
             slot: self.slot,
+            unbounded: self.unbounded,
         }
     }
 
@@ -466,9 +475,11 @@ impl Walk<'_> {
             group,
             in_overlay,
             slot,
+            unbounded,
         } = env;
         *font == self.font
             && *slot == self.slot
+            && *unbounded == self.unbounded
             && *line_height == self.line_height
             && *text_align == self.text_align
             && *group == self.groups.last().copied()
@@ -523,7 +534,11 @@ impl Walk<'_> {
         if let Some(hints) = tree.carried_hints()
             && !hints.is_empty()
         {
-            Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &hints.dom_id);
+            let (dom_id, href) = match hints.address.as_deref() {
+                Some(address) => (address.dom_id.clone(), address.href.clone()),
+                None => (None, None),
+            };
+            Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &dom_id, &href);
         }
     }
 
@@ -548,12 +563,28 @@ impl Walk<'_> {
                     layout.gap = Some(*spacing as f32);
                 }
                 layout.align = Some(align_code(*align));
+                // a column with no length to share grows nobody; a row's
+                // items take the row's height, a length again
+                let open_column = *axis == Axis::Vertical && self.unbounded;
+                let outer_unbounded = self.unbounded;
+                if *axis == Axis::Horizontal {
+                    self.unbounded = false;
+                }
                 for child in children {
                     let opened = container.children.len();
                     self.lower_into(child, &mut container.children);
+                    if open_column {
+                        // a spacer or an open frame grows itself; here
+                        // it keeps its content's height instead
+                        for kept in &mut container.children[opened..] {
+                            if let Some(layout) = kept.layout.as_mut() {
+                                layout.grow = false;
+                            }
+                        }
+                    }
                     // the flexible child grows — CSS wants the flag on
                     // the ITEM, so the walk stamps it here
-                    if child.is_flexible(*axis, Some(*axis)) {
+                    else if child.is_flexible(*axis, Some(*axis)) {
                         for grown in &mut container.children[opened..] {
                             if let Some(layout) = grown.layout.as_mut() {
                                 layout.grow = true;
@@ -575,8 +606,10 @@ impl Walk<'_> {
                         }
                     }
                 }
+                self.unbounded = outer_unbounded;
                 Self::inherit_stretch(container);
                 Self::fold_table_wrapper(container);
+                Self::fold_paragraph(container);
             }
             // a row that wraps is the browser's own: a flex row that
             // wraps its items, with the gaps in both directions — the
@@ -652,6 +685,10 @@ impl Walk<'_> {
             LayoutNode::Frame { width, height, align, child } => {
                 let outer_slot = self.slot;
                 self.slot = (*width, *height);
+                let outer_unbounded = self.unbounded;
+                if height.is_some() {
+                    self.unbounded = false;
+                }
                 let container = placed(out, node(DomKind::FlexColumn));
                 {
                     let layout = container.layout.as_mut().expect("flow node");
@@ -665,8 +702,10 @@ impl Walk<'_> {
                 }
                 self.lower_into(child, &mut container.children);
                 self.slot = outer_slot;
+                self.unbounded = outer_unbounded;
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(container);
+                Self::stamp_across(child, &mut container.children);
                 Self::fold_table_wrapper(container);
             }
             // A hug is a native flow rule on the web: a box that is not told
@@ -679,19 +718,26 @@ impl Walk<'_> {
                 let container = placed(out, node(DomKind::FlexColumn));
                 {
                     let layout = container.layout.as_mut().expect("flow node");
-                    if max_width.is_finite() {
-                        layout.max_width = Some(*max_width as f32);
-                    } else {
+                    // the wire carries f32: a ceiling past what it holds
+                    // (`f64::MAX`, "no ceiling, but not open") is none
+                    let ceiling = |length: f64| Some(length as f32).filter(|length| length.is_finite());
+                    layout.max_width = ceiling(*max_width);
+                    layout.max_height = ceiling(*max_height);
+                    // a frame open on BOTH axes fills whatever holds it.
+                    // Open on one, it is flexible on that one alone, and
+                    // `flex` is the holder's main axis, whichever that is:
+                    // a stack around it already grows or stretches it by
+                    // the axis it asks about, and a width left open in a
+                    // column would otherwise grow the HEIGHT from nothing
+                    if max_width.is_infinite() && max_height.is_infinite() {
                         layout.grow = true;
-                    }
-                    if max_height.is_finite() {
-                        layout.max_height = Some(*max_height as f32);
                     }
                     layout.align = Some(align_code(*align));
                 }
                 self.lower_into(child, &mut container.children);
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(container);
+                Self::stamp_across(child, &mut container.children);
                 Self::fold_table_wrapper(container);
             }
             // The flex frame on the web flow: a growing box. Its FLOOR is not
@@ -708,6 +754,7 @@ impl Walk<'_> {
                 self.lower_into(child, &mut container.children);
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(container);
+                Self::stamp_across(child, &mut container.children);
                 Self::fold_table_wrapper(container);
             }
             LayoutNode::Spacer => {
@@ -884,17 +931,36 @@ impl Walk<'_> {
             LayoutNode::Image { source: Some(crate::image_engine::ImageSource::Feed { .. }), .. } => {
                 out.push(node(DomKind::Box));
             }
-            LayoutNode::Image { source, fit, .. } => {
+            LayoutNode::Image { source, fit, resizable } => {
                 match source {
                     Some(source) => {
+                        // the walk never measures, so nothing else asks
+                        // the platform about these bytes: the ask hands
+                        // them over (once per identity), and the <img>
+                        // finds its URL when the patch lands
+                        if let Some(env) = &self.env.layout {
+                            let _ = crate::image_engine::intrinsic_of(env.images, source);
+                        }
                         let cover = matches!(
                             fit,
                             Some(motor::views::ContentMode::Fill)
                         );
-                        out.push(node(DomKind::Image(crate::dom::DomImage {
+                        let mut picture = node(DomKind::Image(crate::dom::DomImage {
                             key: source.key(),
                             cover,
-                        })));
+                        }));
+                        // a resizable picture takes the length it is offered
+                        // down its holder, as the pixel layout sizes it to
+                        // the proposal. Left to the browser, an <img> keeps
+                        // its natural height there with its floor at that
+                        // height — WebKit does, past a frame of 22 — where
+                        // Chrome derives it from the width by the ratio. The
+                        // width already follows by the ratio in both; a
+                        // stretch here would climb to the holders above
+                        if *resizable && let Some(layout) = picture.layout.as_mut() {
+                            layout.fill = true;
+                        }
+                        out.push(picture);
                     }
                     // no source yet: an empty box holds the room
                     None => out.push(node(DomKind::Box)),
@@ -909,7 +975,7 @@ impl Walk<'_> {
                     forced: *forced,
                 })));
             }
-            LayoutNode::Scroll { path, target, commanded, child, .. } => {
+            LayoutNode::Scroll { path, target, commanded, child, axes, fill, .. } => {
                 // a region the app holds in a binding takes the app's
                 // value: here the BROWSER is the clamp and the scroll
                 // observer writes back what it settled on, so a value
@@ -937,7 +1003,12 @@ impl Walk<'_> {
                     layout.stretch = true;
                 }
                 let mut lowered = Vec::new();
+                // down the axis it scrolls the content has no length —
+                // unless the region lays it out at its own
+                let outer_unbounded = self.unbounded;
+                self.unbounded = axes.vertical() && !*fill;
                 self.lower_into(child, &mut lowered);
+                self.unbounded = outer_unbounded;
                 match lowered.as_slice() {
                     // a virtual stack IS the content already — no
                     // second skin, or the rows hide one box too deep
@@ -1078,7 +1149,11 @@ impl Walk<'_> {
                 // the hints an `.element(…)` gave the boundary, stamped
                 // as the wrapper they replace would stamp them
                 if !hints.is_empty() {
-                    Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &hints.dom_id);
+                    let (dom_id, href) = match hints.address.as_deref() {
+                Some(address) => (address.dom_id.clone(), address.href.clone()),
+                None => (None, None),
+            };
+            Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &dom_id, &href);
                 }
             }
             LayoutNode::Interactive { path, child } => {
@@ -1180,10 +1255,10 @@ impl Walk<'_> {
                 // the browser keeps its own safe area outside the tab
                 self.lower_into(child, out);
             }
-            LayoutNode::Hinted { tag, class, dom_id, child } => {
+            LayoutNode::Hinted { tag, class, dom_id, href, child } => {
                 let opened = out.len();
                 self.lower_into(child, out);
-                Self::stamp_hints(&mut out[opened..], tag, class, dom_id);
+                Self::stamp_hints(&mut out[opened..], tag, class, dom_id, href);
             }
             #[cfg(feature = "canvas")]
             LayoutNode::ExactLayout { child } => {
@@ -1278,6 +1353,7 @@ impl Walk<'_> {
         tag: &Option<std::rc::Rc<str>>,
         class: &Option<std::rc::Rc<str>>,
         dom_id: &Option<std::rc::Rc<str>>,
+        href: &Option<std::rc::Rc<str>>,
     ) {
         // a table cell that holds one plain text IS that text
         if let Some(tag) = tag
@@ -1300,9 +1376,7 @@ impl Walk<'_> {
             if class.is_some() {
                 hinted.hints.class = class.clone();
             }
-            if dom_id.is_some() {
-                hinted.hints.dom_id = dom_id.clone();
-            }
+            hinted.hints.address = crate::layout::Address::over(&hinted.hints.address, dom_id, href);
         }
     }
 
@@ -1417,6 +1491,22 @@ impl Walk<'_> {
         }
     }
 
+    /// A frame is a column that places its child by its alignment, so
+    /// the column's own stretch is off — and a child that takes the
+    /// width it is offered (a band, a row with a spacer) would hug its
+    /// content instead. Such a child stretches across the frame, as the
+    /// frame offers it. Stamped after the frame took what it inherits:
+    /// the frame's own place in ITS holder is the holder's to decide.
+    fn stamp_across(child: &LayoutNode, lowered: &mut [DomNode]) {
+        if child.is_flexible(Axis::Horizontal, Some(Axis::Vertical)) {
+            for node in lowered {
+                if let Some(layout) = node.layout.as_mut() {
+                    layout.stretch = true;
+                }
+            }
+        }
+    }
+
     /// A stack with one child, wearing an inline tag — a link around a
     /// word, a span around an icon — needs no flex line: with one
     /// child there is nothing to distribute, and the browser's own
@@ -1437,6 +1527,29 @@ impl Walk<'_> {
             && layout.width.is_none()
             && layout.height.is_none()
             && layout.slot_y.is_none()
+        {
+            layout.plain = true;
+        }
+    }
+
+    /// A row of inline runs, side by side with no gap, is a paragraph:
+    /// `hstack!(text("Run ").element("span"), text("cargo").element("code"))`
+    /// says one sentence with a word set apart. As a flex line it would
+    /// keep each run a box of its own and break the sentence between
+    /// boxes; as a block of inline elements the browser breaks it
+    /// between WORDS, wherever the width says.
+    fn fold_paragraph(container: &mut DomNode) {
+        if !matches!(container.kind, DomKind::FlexRow) || container.children.is_empty() {
+            return;
+        }
+        let inline = container
+            .children
+            .iter()
+            .all(|run| run.hints.tag.as_deref().is_some_and(is_inline_tag));
+        if let Some(layout) = container.layout.as_mut()
+            && inline
+            && layout.gap.is_none()
+            && layout.wrap.is_none()
         {
             layout.plain = true;
         }
@@ -1811,6 +1924,7 @@ mod tests {
             pending_tooltip: None,
             groups: Vec::new(),
             overlay_depth: 0,
+            unbounded: false,
             drops_seen: 0,
             overlays: Vec::new(),
             display: crate::layout::DisplayList::default(),
@@ -2217,7 +2331,7 @@ mod tests {
             hints: crate::layout::ElementHints {
                 tag: Some(crate::modifier::hint("td")),
                 class: Some(crate::modifier::hint("cell")),
-                dom_id: None,
+                address: None,
             },
             action: Some(std::rc::Rc::from("Row/#1")),
         };
@@ -2243,7 +2357,7 @@ mod tests {
         let hinted = |tag: &str| crate::layout::ElementHints {
             tag: Some(crate::modifier::hint(tag)),
             class: None,
-            dom_id: None,
+            address: None,
         };
         let over_hinted = LayoutNode::Styled {
             props: std::rc::Rc::new(ink),
@@ -2475,7 +2589,7 @@ mod tests {
                         LayoutNode::BoundaryRef { hints, .. }
                             if hints.tag.as_deref() == Some("tr")
                                 && hints.class.as_deref() == Some("row")
-                                && hints.dom_id.is_none()
+                                && hints.address.is_none()
                     ))
                     .count(),
                 other => panic!("the list's retained tree: {other:?}"),
@@ -2577,5 +2691,178 @@ mod tests {
             .expect("the island mounted");
         assert!(!runtime.dom_island_box(canvas, 120.0, 40.0), "the mount's echo is not news");
         assert!(runtime.dom_island_box(canvas, 130.0, 40.0), "a box of the browser's own is");
+    }
+
+    /// Runs side by side with no gap read as one sentence: the row is
+    /// a block of inline elements, never a flex line of boxes.
+    #[test]
+    fn a_row_of_inline_runs_is_a_paragraph() {
+        use crate::layout::ElementHints;
+        let run = |words: &str, tag: &str| LayoutNode::Text {
+            content: crate::bind::TextSource::from(words),
+            highlights: None,
+            truncation: None,
+            hints: ElementHints { tag: Some(crate::modifier::hint(tag)), ..Default::default() },
+            action: None,
+        };
+        let row = |spacing: f64| LayoutNode::Stack {
+            axis: Axis::Horizontal,
+            spacing,
+            align: CrossAlign::Center,
+            children: vec![run("The display of ", "span"), run("count", "code"), run(" records.", "span")],
+            hints: Default::default(),
+            action: None,
+        };
+        let offsets = HashMap::default();
+        let plain = |tree: &LayoutNode| {
+            let scene = lower(tree, &env_fixture(&offsets)).scene;
+            scene.children[0].layout.as_ref().expect("flow").plain
+        };
+        assert!(plain(&row(0.0)), "a sentence flows as one block");
+        assert!(!plain(&row(8.0)), "a gap says these are items, not words");
+    }
+
+    /// A frame open across a column only, the width: the column
+    /// stretches it to its edges, and its height stays its content's —
+    /// a `flex` on it would be the column's main axis, a height grown
+    /// from a zero basis, and the page would fold to nothing.
+    #[test]
+    fn a_width_left_open_in_a_column_never_grows_the_height() {
+        let open_width = LayoutNode::MaxFrame {
+            max_width: f64::INFINITY,
+            max_height: f64::MAX,
+            align: CrossAlign::Start,
+            child: Box::new(text_node("a band")),
+        };
+        let tree = LayoutNode::Stack {
+            axis: Axis::Vertical,
+            spacing: 0.0,
+            align: CrossAlign::Start,
+            children: vec![open_width],
+            hints: Default::default(),
+            action: None,
+        };
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let band = scene.children[0].children[0].layout.as_ref().expect("flow");
+        assert!(!band.grow, "no flex on the column's axis: {band:?}");
+        assert!(band.stretch, "the column takes it edge to edge: {band:?}");
+    }
+
+    /// A frame places its child by its alignment, so the column's own
+    /// stretch is off: a child that takes the width it is offered — a
+    /// row of nothing but a spacer, the hairline idiom — is stretched
+    /// across the frame instead of hugging nothing.
+    #[test]
+    fn a_frame_stretches_a_child_that_takes_the_width() {
+        let rule = LayoutNode::Frame {
+            width: None,
+            height: Some(1.0),
+            align: CrossAlign::Center,
+            child: Box::new(LayoutNode::Stack {
+                axis: Axis::Horizontal,
+                spacing: 0.0,
+                align: CrossAlign::Center,
+                children: vec![LayoutNode::Spacer],
+                hints: Default::default(),
+                action: None,
+            }),
+        };
+        let offsets = HashMap::default();
+        let scene = lower(&rule, &env_fixture(&offsets)).scene;
+        let row = scene.children[0].children[0].layout.as_ref().expect("flow");
+        assert!(row.stretch, "the row reaches the frame's edges: {row:?}");
+    }
+
+    /// Down the axis a scroller travels its content has no length to
+    /// share: a column there grows nobody — an open frame keeps its
+    /// content's height, where `flex` from a zero basis folded it to
+    /// nothing. A row inside it has a length again, and its spacer
+    /// still grows.
+    #[test]
+    fn a_column_in_a_scroller_grows_nobody() {
+        let open = LayoutNode::MaxFrame {
+            max_width: f64::INFINITY,
+            max_height: f64::INFINITY,
+            align: CrossAlign::Start,
+            child: Box::new(text_node("a section")),
+        };
+        let row = LayoutNode::Stack {
+            axis: Axis::Horizontal,
+            spacing: 0.0,
+            align: CrossAlign::Center,
+            children: vec![text_node("brand"), LayoutNode::Spacer, text_node("links")],
+            hints: Default::default(),
+            action: None,
+        };
+        let page = LayoutNode::Stack {
+            axis: Axis::Vertical,
+            spacing: 0.0,
+            align: CrossAlign::Start,
+            children: vec![open, row],
+            hints: Default::default(),
+            action: None,
+        };
+        let tree = LayoutNode::Scroll {
+            path: None,
+            target: None,
+            axes: crate::layout::ScrollAxes::Vertical,
+            commanded: None,
+            fill: false,
+            child: Box::new(page),
+        };
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let content = &scene.children[0].children[0];
+        let column = &content.children[0];
+        let section = column.children[0].layout.as_ref().expect("flow");
+        assert!(!section.grow, "no flex down an open axis: {section:?}");
+        assert!(section.stretch, "the column still takes it edge to edge: {section:?}");
+        let spacer = column.children[1].children[1].layout.as_ref().expect("flow");
+        assert!(spacer.grow, "a row has a length to share: {spacer:?}");
+    }
+
+    /// A ceiling the wire's f32 cannot hold is no ceiling at all — it
+    /// would cross as infinity and serve `max-height:infpx`.
+    #[test]
+    fn a_ceiling_past_the_wire_is_none() {
+        let tree = LayoutNode::MaxFrame {
+            max_width: 500.0,
+            max_height: f64::MAX,
+            align: CrossAlign::Start,
+            child: Box::new(text_node("words")),
+        };
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let frame = scene.children[0].layout.as_ref().expect("flow");
+        assert_eq!(frame.max_width, Some(500.0));
+        assert_eq!(frame.max_height, None, "{frame:?}");
+    }
+
+    /// A resizable picture in a frame takes the frame's length, its
+    /// floor let go — an <img> left to itself keeps its natural height
+    /// in WebKit, past a frame of 22. It stretches nothing: the frame's
+    /// own place in its holder stays the holder's.
+    #[test]
+    fn a_resizable_picture_takes_its_frame() {
+        let picture = |resizable| LayoutNode::Frame {
+            width: Some(13.4),
+            height: Some(22.0),
+            align: CrossAlign::Center,
+            child: Box::new(LayoutNode::Image {
+                source: Some(crate::image_engine::ImageSource::bytes_keyed(1, vec![0u8; 4])),
+                resizable,
+                fit: None,
+            }),
+        };
+        let offsets = HashMap::default();
+        let lowered = |resizable| {
+            let scene = lower(&picture(resizable), &env_fixture(&offsets)).scene;
+            scene.children[0].children[0].layout.clone().expect("flow")
+        };
+        let held = lowered(true);
+        assert!(held.fill && !held.stretch, "the picture fills its frame: {held:?}");
+        let natural = lowered(false);
+        assert!(!natural.stretch && !natural.fill, "a fixed picture keeps its size: {natural:?}");
     }
 }

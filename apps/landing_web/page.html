@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>bunny_ui — one codebase, every surface</title>
+    <meta name="description" content="bunny_ui is a declarative UI framework for Rust, inspired by SwiftUI." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Instrument+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap" />
+    <style>
+      html, body { margin: 0; height: 100%; background: #0A0710; -webkit-font-smoothing: antialiased; }
+      #app { position: relative; width: 100vw; height: 100vh; height: 100dvh; overflow: hidden; }
+      ::selection { background: #5035C0; color: #F2EEFB; }
+      /* the texture bleeds past the hero and drifts — decoration the
+         page owns; the scene says where it sits */
+      .hero { position: relative; }
+      .hero-texture { position: absolute; inset: -6%; width: 112%; height: 112%; pointer-events: none;
+        animation: drift 28s ease-in-out infinite; }
+      .hero-body { position: relative; }
+      @keyframes drift {
+        0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+        50% { transform: translate3d(-2%, 1.5%, 0) scale(1.06); }
+      }
+      @media (prefers-reduced-motion: reduce) { .hero-texture { animation: none; } }
+    </style>
+    <style>
+{css}
+    </style>
+  </head>
+  <body>
+    {html}
+    <script>window.BUNNY_WASM = "landing_web.wasm";</script>
+    <script src="glue_dom.js?v={version}"></script>
+  </body>
+</html>

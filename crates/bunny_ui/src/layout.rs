@@ -1158,6 +1158,7 @@ pub enum LayoutNode {
         tag: Option<std::rc::Rc<str>>,
         class: Option<std::rc::Rc<str>>,
         dom_id: Option<std::rc::Rc<str>>,
+        href: Option<std::rc::Rc<str>>,
         child: Box<LayoutNode>,
     },
     /// The escape hatch (`custom(…)` / `canvas(…)`): a box the APP
@@ -1188,12 +1189,73 @@ pub enum LayoutNode {
 pub struct ElementHints {
     pub(crate) tag: Option<Rc<str>>,
     pub(crate) class: Option<Rc<str>>,
-    pub(crate) dom_id: Option<Rc<str>>,
+    /// The id and the href, the rare words: one shared record, so
+    /// the many nodes that carry neither pay one word for both.
+    pub(crate) address: Option<Rc<Address>>,
 }
 
 impl ElementHints {
     pub(crate) fn is_empty(&self) -> bool {
-        self.tag.is_none() && self.class.is_none() && self.dom_id.is_none()
+        self.tag.is_none() && self.class.is_none() && self.address.is_none()
+    }
+}
+
+/// An element's address: its `id`, and where it goes when it is a link
+/// (`.link(…)`). Rare beside the tag and the class, so the hints hold
+/// it behind one shared word ([`Address::over`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Address {
+    pub dom_id: Option<Rc<str>>,
+    pub href: Option<Rc<str>>,
+}
+
+thread_local! {
+    /// The addresses a page speaks, each held once — as the words in
+    /// them are. A row's `.element_id("first")` is the same address a
+    /// thousand times over; it should cost a thousand pointer bumps,
+    /// not a thousand records.
+    static ADDRESSES: std::cell::RefCell<motor::hash::FxHashSet<Rc<Address>>> =
+        std::cell::RefCell::new(motor::hash::FxHashSet::default());
+}
+
+/// The addresses a page may speak before the table stops growing: a
+/// page that mints an id per row keeps its own records past this.
+const SHARED_ADDRESSES: usize = 4096;
+
+impl Address {
+    /// `base` with the words an outer hint speaks written over it —
+    /// the outer word wins where both speak, as with the tag.
+    pub fn over(
+        base: &Option<Rc<Address>>,
+        dom_id: &Option<Rc<str>>,
+        href: &Option<Rc<str>>,
+    ) -> Option<Rc<Address>> {
+        if dom_id.is_none() && href.is_none() {
+            return base.clone();
+        }
+        let mut address = base.as_deref().cloned().unwrap_or_default();
+        if dom_id.is_some() {
+            address.dom_id.clone_from(dom_id);
+        }
+        if href.is_some() {
+            address.href.clone_from(href);
+        }
+        Some(Address::shared(address))
+    }
+
+    /// One shared copy of an address.
+    fn shared(address: Address) -> Rc<Address> {
+        ADDRESSES.with(|addresses| {
+            let mut addresses = addresses.borrow_mut();
+            if let Some(shared) = addresses.get(&address) {
+                return Rc::clone(shared);
+            }
+            let shared = Rc::new(address);
+            if addresses.len() < SHARED_ADDRESSES {
+                addresses.insert(Rc::clone(&shared));
+            }
+            shared
+        })
     }
 }
 

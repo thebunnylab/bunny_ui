@@ -33,7 +33,17 @@ pub fn render(root: &impl View, size: Size) -> SsrPage {
     for patch in &patches {
         tree.apply(patch);
     }
-    let mut css: Vec<String> = vec!["[data-path]{cursor:default}".to_string()];
+    let mut css: Vec<String> = vec![
+        "[data-path]{cursor:default}".to_string(),
+        // a link is pressable wherever it stands — the glue's twin rule
+        "a[href][href]{cursor:pointer;pointer-events:auto}".to_string(),
+        // a semantic tag never brings the browser's own look — the
+        // glue's twin rules
+        ":where(#app) :where(h1,h2,h3,h4,h5,h6,p,figure,blockquote,pre,ol,ul,li,dl,dd){margin:0;padding:0}".to_string(),
+        ":where(#app) :where(h1,h2,h3,h4,h5,h6,code,pre,kbd,samp,small,b,strong,i,em){font:inherit}".to_string(),
+        ":where(#app) :where(ol,ul){list-style:none}".to_string(),
+        ":where(#app) :where(a){color:inherit;text-decoration:none}".to_string(),
+    ];
     css.extend(tree.rules.values().cloned());
     SsrPage { html: tree.serialize_root(), css: css.join("\n") }
 }
@@ -183,10 +193,14 @@ impl Tree {
         };
         root.attrs.insert("id", "app".to_string());
         root.attrs.insert("data-hydrate", "1".to_string());
+        // the box the page was laid out in: the boot adopts the served
+        // elements at THIS size, where the scene is the one they show,
+        // and lays out at the reader's from there
+        root.attrs.insert("data-width", size.width.to_string());
+        root.attrs.insert("data-height", size.height.to_string());
         // the window is a one-slot column: its child can take the box
         root.style.insert("display", "flex".into());
         root.style.insert("flex-direction", "column".into());
-        let _ = size;
         let mut elements = BTreeMap::new();
         elements.insert(0, root);
         Tree { elements, rules: BTreeMap::new() }
@@ -225,8 +239,11 @@ impl Tree {
         if let Some(class) = &hints.class {
             element.attrs.insert("class", class.to_string());
         }
-        if let Some(dom_id) = &hints.dom_id {
+        if let Some(dom_id) = hints.dom_id() {
             element.attrs.insert("id", dom_id.to_string());
+        }
+        if let Some(href) = hints.href() {
+            element.attrs.insert("href", href.to_string());
         }
         self.elements.insert(id, element);
     }
@@ -495,7 +512,10 @@ impl Tree {
                 element.attrs.insert("placeholder", field.placeholder.to_string());
                 element.attrs.insert("data-path", field.path.clone());
             }
-            DomPatch::SetHints { id, class, dom_id } => {
+            DomPatch::SetHints { id, class, address } => {
+                let address = address.as_deref();
+                let dom_id = address.and_then(|address| address.dom_id.as_ref());
+                let href = address.and_then(|address| address.href.as_ref());
                 if let Some(element) = self.elements.get_mut(id) {
                     match class {
                         Some(class) => element.attrs.insert("class", class.to_string()),
@@ -504,6 +524,10 @@ impl Tree {
                     match dom_id {
                         Some(dom_id) => element.attrs.insert("id", dom_id.to_string()),
                         None => element.attrs.remove("id"),
+                    };
+                    match href {
+                        Some(href) => element.attrs.insert("href", href.to_string()),
+                        None => element.attrs.remove("href"),
                     };
                 }
             }
@@ -525,12 +549,25 @@ impl Tree {
                 };
                 parent.children.insert(at, *id);
             }
+            DomPatch::SetImage { id, image } => {
+                // the bytes arrive with the wasm: the element wears the
+                // identity it waits for, and the glue fills the source
+                // when the platform has the picture
+                if let Some(element) = self.elements.get_mut(id) {
+                    let key = image.key;
+                    element
+                        .attrs
+                        .insert("data-img", format!("{}:{}", key >> 32, key as u32));
+                    if image.cover {
+                        element.style.insert("object-fit", "cover".into());
+                    }
+                }
+            }
             DomPatch::SetScroll { .. }
-            | DomPatch::SetImage { .. }
             | DomPatch::SetIcon { .. }
             | DomPatch::Reveal { .. }
             | DomPatch::SetAnchor { .. } => {
-                // scroll offsets, image bytes and icon geometry arrive
+                // scroll offsets and icon geometry arrive
                 // after boot; a built page starts at rest
             }
         }
@@ -768,6 +805,13 @@ fn rule_text(
             .into(),
         );
     }
+    // layers: the same alignment across the cell, so a centred stack
+    // centres both ways
+    if matches!(kind, CreateKind::Layers) {
+        if let Some(align) = base.get("align-items").cloned() {
+            base.insert("justify-items", align);
+        }
+    }
     if let Some((top, right, bottom, left)) = layout.padding {
         base.insert("padding", format!("{} {} {} {}", px(top), px(right), px(bottom), px(left)));
     }
@@ -792,6 +836,11 @@ fn rule_text(
         base.insert("row-gap", px(line_gap));
     }
     let mut states: Vec<String> = Vec::new();
+    // layers: one grid cell, and every child IN it — auto-placement
+    // would give each layer a row of its own
+    if matches!(kind, CreateKind::Layers) {
+        states.push(format!("{selector}>*{{grid-area:1/1}}"));
+    }
     // a follower hangs its states off the GROUP's pointer: the same
     // rules, hung off the group's selector; a box without one listens
     // to its own
@@ -836,10 +885,13 @@ fn rule_text(
         shadows.push(format!("0 0 {} {}", px(radius), color(shadow)));
     }
     if let Some((response, _)) = style.transition {
-        base.insert(
-            "transition",
-            format!("background-color {response}s ease-out, transform {response}s ease-out"),
-        );
+        // every colour the engine's springs move — the fill, the ink,
+        // the border, the halo — and the transform
+        let eased: Vec<String> = ["background-color", "color", "border-color", "box-shadow", "transform"]
+            .iter()
+            .map(|property| format!("{property} {response}s ease-out"))
+            .collect();
+        base.insert("transition", eased.join(", "));
     }
     if let Some(focus) = style.focus_border {
         states.push(format!("{selector}:focus{{border-color:{c};caret-color:{c}}}", c = color(focus)));
@@ -899,6 +951,11 @@ fn rule_text(
         // a text with the face declared above it names none of its own
         if !text.inherits_face {
             base.insert("font", css_font(&text.font));
+            // the shorthand leaves the spacing alone; the face's own
+            // advance rides beside it
+            if text.font.tracking != 0.0 {
+                base.insert("letter-spacing", format!("{}px", f64::from(text.font.tracking)));
+            }
         }
         // after the font shorthand, which resets it — the served page
         // steps its lines the way the engine measured them
@@ -914,8 +971,12 @@ fn rule_text(
             }
             _ => {}
         }
+        // an inherited ink takes no color — on a text. A box's face
+        // record is the face alone: the box's own ink stays
         if text.inherits_ink {
-            base.remove("color");
+            if matches!(kind, CreateKind::Text) {
+                base.remove("color");
+            }
         } else {
             base.insert("color", color(text.color));
         }
@@ -1014,22 +1075,20 @@ fn escape_attr(value: &str) -> String {
     escape_text(value).replace('"', "&quot;")
 }
 
-/// Tag hints are a tiny closed-ish set (tr, td, table, a, span…) — a
-/// leaked str keeps the toy tree's static tags simple.
+/// The tags a served page writes as themselves — the glue builds any
+/// tag it is handed, so a tag missing here would serve a `<div>` the
+/// mounted page calls a `<section>`. A static table keeps the toy tree's
+/// tags `&'static`; an unknown word still serves as a `<div>`.
+const SERVED_TAGS: &[&str] = &[
+    "table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "a", "span", "button",
+    "h1", "h2", "h3", "h4", "h5", "h6", "p", "code", "pre", "kbd", "samp", "b", "strong", "i",
+    "em", "small", "mark", "abbr", "cite", "q", "sub", "sup", "time", "var", "u", "s", "label",
+    "nav", "header", "footer", "main", "section", "article", "aside", "figure", "figcaption",
+    "blockquote", "ol", "ul", "li", "dl", "dt", "dd", "address",
+];
+
 fn leak_tag(tag: &str) -> &'static str {
-    match tag {
-        "table" => "table",
-        "thead" => "thead",
-        "tbody" => "tbody",
-        "tr" => "tr",
-        "td" => "td",
-        "th" => "th",
-        "a" => "a",
-        "span" => "span",
-        "h1" => "h1",
-        "button" => "button",
-        _ => "div",
-    }
+    SERVED_TAGS.iter().find(|served| **served == tag).copied().unwrap_or("div")
 }
 
 #[cfg(test)]
@@ -1063,6 +1122,8 @@ mod tests {
         let second = render(&Page { on: State::new(false) }, size);
         assert_eq!(first.html, second.html, "deterministic bytes");
         assert!(first.html.contains("data-hydrate=\"1\""));
+        assert!(first.html.contains("data-width=\"300\""), "the served box");
+        assert!(first.html.contains("data-height=\"200\""), "the served box");
         assert!(first.html.contains("hello, prerender"));
         assert!(first.html.contains("display:flex"));
         assert!(!first.html.contains("position:absolute"), "a flow page ships in the flow");
@@ -1130,5 +1191,142 @@ mod tests {
         ] {
             assert!(page.html.contains(served), "{served} in {}", page.html);
         }
+    }
+
+    /// A stack of layers is ONE cell with every layer in it — grid
+    /// auto-placement alone would give each layer a row of its own.
+    #[test]
+    fn layers_share_one_cell() {
+        #[derive(Clone, Copy)]
+        struct Badge;
+
+        impl Component for Badge {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::zstack!(rectangle().frame(80.0, 20.0), text("on top"))
+            }
+        }
+
+        let page = render(&Badge, Size { width: 200.0, height: 200.0 });
+        assert!(page.css.contains(">*{grid-area:1/1}"), "{}", page.css);
+        assert!(page.css.contains("justify-items:center"), "{}", page.css);
+    }
+
+    /// A served picture has no bytes yet: it wears the identity the
+    /// glue fills the source by, once the wasm hands the bytes over.
+    #[test]
+    fn a_served_image_waits_by_its_identity() {
+        #[derive(Clone)]
+        struct Picture(crate::image_engine::ImageSource);
+
+        impl Component for Picture {
+            fn body(self, _ctx: &Context) -> impl View {
+                image(self.0.clone()).resizable().frame(20.0, 20.0)
+            }
+        }
+
+        let source = crate::image_engine::ImageSource::bytes_keyed(
+            (7u64 << 32) | 9,
+            vec![0u8; 4],
+        );
+        let page = render(&Picture(source), Size { width: 200.0, height: 200.0 });
+        assert!(page.html.contains("data-img=\"7:9\""), "{}", page.html);
+    }
+
+    /// A link is an `<a href>`: the browser owns the navigation, and
+    /// an id beside it rides the same record.
+    #[test]
+    fn a_link_serves_its_href() {
+        #[derive(Clone, Copy)]
+        struct Links;
+
+        impl Component for Links {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(
+                    text("source").link("https://example.com/a?b=1&c=2"),
+                    text("top").link("#top").element_id("back"),
+                )
+            }
+        }
+
+        let page = render(&Links, Size { width: 200.0, height: 200.0 });
+        assert!(
+            page.html.contains("href=\"https://example.com/a?b=1&amp;c=2\""),
+            "{}",
+            page.html
+        );
+        assert!(page.html.contains("href=\"#top\""), "{}", page.html);
+        assert!(page.html.contains("id=\"back\""), "{}", page.html);
+        assert_eq!(page.html.matches("<a ").count(), 2, "{}", page.html);
+    }
+
+    /// Tracking is the face's own advance: an eyebrow's wide spacing
+    /// reaches the served page as `letter-spacing`, in points.
+    #[test]
+    fn tracking_serves_as_letter_spacing() {
+        #[derive(Clone, Copy)]
+        struct Eyebrow;
+
+        impl Component for Eyebrow {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("QUICK LOOK").font_size(12.0).tracking(2.0)
+            }
+        }
+
+        let page = render(&Eyebrow, Size { width: 200.0, height: 200.0 });
+        assert!(page.css.contains("letter-spacing:2px"), "{}", page.css);
+    }
+
+    /// A box that answers the pointer with its ink and declares a face
+    /// for its subtree keeps its own ink: the face record carries the
+    /// face alone, and the text under it inherits the box's colour.
+    #[test]
+    fn a_box_that_declares_a_face_keeps_its_ink() {
+        #[derive(Clone, Copy)]
+        struct Link;
+
+        impl Component for Link {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("docs")
+                    .font_size(12.0)
+                    .foreground_color(Color::hex(0x8F86A8))
+                    .foreground_hovered(Color::hex(0xF2EEFB))
+                    .link("#docs")
+            }
+        }
+
+        let page = render(&Link, Size { width: 200.0, height: 200.0 });
+        let rule = page
+            .css
+            .lines()
+            .find(|rule| rule.contains("font:400 12px") && !rule.contains(":hover"))
+            .expect("the box that declares the face");
+        assert!(rule.contains("color:rgba(143, 134, 168"), "{}", page.css);
+    }
+
+    /// A body that bends with the width — two columns or one — adopts
+    /// the scene the build served: the adoption reads the window the
+    /// build read, and the first frame after it says nothing.
+    #[test]
+    fn a_page_that_reads_the_window_adopts_in_silence() {
+        #[derive(Clone, Copy)]
+        struct Shaped;
+
+        impl Component for Shaped {
+            fn body(self, ctx: &Context) -> impl View {
+                let wide = ctx.environment::<Viewport>().width >= 800.0;
+                if wide {
+                    Either::First(crate::hstack!(text("words"), text("code")))
+                } else {
+                    Either::Second(crate::vstack!(text("words"), text("code"), text("more")))
+                }
+            }
+        }
+
+        let size = Size { width: 1200.0, height: 800.0 };
+        let built = Runtime::new();
+        assert!(!built.dom_frame(&Shaped, size).is_empty());
+        let fresh = Runtime::new();
+        fresh.dom_adopt(&Shaped, size);
+        assert_eq!(fresh.dom_frame(&Shaped, size), Vec::new(), "the served page is already true");
     }
 }

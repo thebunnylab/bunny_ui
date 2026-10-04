@@ -607,7 +607,7 @@ fn hints_changed(old: &DomNode, new: &DomNode) -> bool {
         // the class aside, field by field: a copy of the hints with the
         // old class in it was three shared words taken and let go for
         // every kept row of a list
-        old.hints.tag != new.hints.tag || old.hints.dom_id != new.hints.dom_id
+        old.hints.tag != new.hints.tag || old.hints.address != new.hints.address
     } else {
         old.hints != new.hints
     }
@@ -1058,12 +1058,21 @@ pub struct DomLayout {
 pub struct DomHints {
     pub tag: Option<std::rc::Rc<str>>,
     pub class: Option<std::rc::Rc<str>>,
-    pub dom_id: Option<std::rc::Rc<str>>,
+    /// The id and, for a link, the href — rare, so shared behind one word.
+    pub address: Option<std::rc::Rc<crate::layout::Address>>,
 }
 
 impl DomHints {
     pub fn is_empty(&self) -> bool {
-        self.tag.is_none() && self.class.is_none() && self.dom_id.is_none()
+        self.tag.is_none() && self.class.is_none() && self.address.is_none()
+    }
+
+    pub fn dom_id(&self) -> Option<&str> {
+        self.address.as_deref().and_then(|address| address.dom_id.as_deref())
+    }
+
+    pub fn href(&self) -> Option<&str> {
+        self.address.as_deref().and_then(|address| address.href.as_deref())
     }
 }
 
@@ -1224,9 +1233,14 @@ pub enum DomPatch {
     /// element `anchor`'s real box on `side`, repositioning while
     /// either of them moves. `path` keys the dismissal doors.
     SetAnchor { id: u32, anchor: u32, side: u8, path: String },
-    /// The element's LIVE hints changed — class and id re-attribute in
-    /// place (the tag never changes without a recreation).
-    SetHints { id: u32, class: Option<std::rc::Rc<str>>, dom_id: Option<std::rc::Rc<str>> },
+    /// The element's LIVE hints changed — class, id and href
+    /// re-attribute in place (the tag never changes without a
+    /// recreation).
+    SetHints {
+        id: u32,
+        class: Option<std::rc::Rc<str>>,
+        address: Option<std::rc::Rc<crate::layout::Address>>,
+    },
 }
 
 // MARK: - Lowering (retained scene + diff)
@@ -1764,7 +1778,7 @@ impl DomLowering {
                         patches.push(DomPatch::SetHints {
                             id: bound.id,
                             class: shipped.class.clone(),
-                            dom_id: shipped.dom_id.clone(),
+                            address: shipped.address.clone(),
                         });
                         crate::stats::note_binding_update();
                         self.templates.touched(bound.id);
@@ -2492,7 +2506,7 @@ fn same_shape(node: &DomNode, old: &DomNode) -> bool {
         }
         _ => return false,
     }
-    if node.hints.dom_id.is_some() || node.style.has_marks() {
+    if node.hints.address.is_some() || node.style.has_marks() {
         return false;
     }
     let (Some(layout), Some(old_layout)) = (&node.layout, &old.layout) else {
@@ -2549,7 +2563,7 @@ fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
         return false;
     }
     // an id, a tooltip, a group of its own: the element's, never a shape's
-    if node.hints.dom_id.is_some() || node.style.has_marks() {
+    if node.hints.address.is_some() || node.style.has_marks() {
         return false;
     }
     let Some(layout) = &node.layout else {
@@ -3022,7 +3036,7 @@ fn diff_node(
             patches.push(DomPatch::SetHints {
                 id,
                 class: new.hints.class.clone(),
-                dom_id: new.hints.dom_id.clone(),
+                address: new.hints.address.clone(),
             });
             retained.hints = new.hints.clone();
             if let Some(binding) = &new.binding {
@@ -3083,7 +3097,7 @@ fn diff_node(
         patches.push(DomPatch::SetHints {
             id,
             class: new.hints.class.clone(),
-            dom_id: new.hints.dom_id.clone(),
+            address: new.hints.address.clone(),
         });
     }
     if let (DomKind::Group { .. }, Some(binding)) = (&new.kind, &new.binding)
@@ -3804,7 +3818,14 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// template), any other group by op 26 (`SetBase`). A click resolves
 /// `~` against the nearest `data-base` at or above the element, and a
 /// clone whose relative paths read as its template's ships none.
-pub const ABI_VERSION: u32 = 17;
+///
+/// 18 (2026-10-03): links. Create (op 1) and SetHints (op 15) carry a
+/// fourth hint after the id — the href, u16 len + utf8, empty for none.
+///
+/// 19 (2026-10-03): tracking. The text look's record carries the face's
+/// extra advance (f32 points, resolved) after the line height; the glue
+/// writes it as `letter-spacing`.
+pub const ABI_VERSION: u32 = 19;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -3814,6 +3835,7 @@ pub const ABI_VERSION: u32 = 17;
 /// per patch: u8 op, u32 id, payload
 ///   1 create        u32 parent, u32 before (0 = append), three hint
 ///                   strings (u8 len + utf8 each: tag, class, id),
+///                   the href (u16 len + utf8, 0 = none),
 ///                   u8 kind (0 group, 1 box, 2 text, 3 field,
 ///                            4 scroll, 5 content, 6 canvas, 7 image,
 ///                            8 icon, 9 flex column, 10 flex row,
@@ -3956,7 +3978,8 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_u32(&mut out, *before);
                 push_hint(&mut out, hints.tag.as_deref());
                 push_hint(&mut out, hints.class.as_deref());
-                push_hint(&mut out, hints.dom_id.as_deref());
+                push_hint(&mut out, hints.dom_id());
+                push_bytes_u16(&mut out, hints.href().unwrap_or("").as_bytes());
                 out.push(kind_code(*kind));
             }
             DomPatch::Remove { id } => {
@@ -4181,11 +4204,16 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 out.push(*side);
                 push_bytes_u16(&mut out, path.as_bytes());
             }
-            DomPatch::SetHints { id, class, dom_id } => {
+            DomPatch::SetHints { id, class, address } => {
+                let address = address.as_deref();
                 out.push(15);
                 push_u32(&mut out, *id);
                 push_hint(&mut out, class.as_deref());
-                push_hint(&mut out, dom_id.as_deref());
+                push_hint(&mut out, address.and_then(|address| address.dom_id.as_deref()));
+                push_bytes_u16(
+                    &mut out,
+                    address.and_then(|address| address.href.as_deref()).unwrap_or("").as_bytes(),
+                );
             }
         }
     }
@@ -4444,6 +4472,8 @@ fn encode_text_look(out: &mut Vec<u8>, text: &DomText) {
     // the line box, or 0 for "the face's own" — the browser steps its
     // lines by the same number our placement does
     push_f32(out, text.line_height.unwrap_or(0.0));
+    // the extra advance after every character, in points, resolved
+    push_f32(out, text.font.tracking);
     // 0 leading (the default), 1 centre, 2 trailing
     out.push(match text.text_align {
         None | Some(motor::views::TextAlignment::Leading) => 0,
@@ -5953,6 +5983,7 @@ mod tests {
             &0u32.to_le_bytes()[..],
             &0u32.to_le_bytes()[..],
             &[0, 0, 0],
+            &0u16.to_le_bytes()[..],
             &[1],
             &[3],
             &7u32.to_le_bytes()[..],
@@ -6777,7 +6808,14 @@ mod tests {
         let binding = NodeBinding::Class(crate::bind::Bound::new(Rc::from("row/#class"), Rc::new(String::new)));
         let hinted = |tag: &str, class: &str, id: &str, bound: bool| {
             let mut node = flow_row("row");
-            node.hints = DomHints { tag: Some(tag.into()), class: Some(class.into()), dom_id: Some(id.into()) };
+            node.hints = DomHints {
+                tag: Some(tag.into()),
+                class: Some(class.into()),
+                address: Some(Rc::new(crate::layout::Address {
+                    dom_id: Some(id.into()),
+                    href: None,
+                })),
+            };
             node.binding = bound.then(|| match &binding {
                 NodeBinding::Class(bound) => NodeBinding::Class(Rc::clone(bound)),
                 NodeBinding::Text(bound) => NodeBinding::Text(Rc::clone(bound)),
@@ -8421,6 +8459,11 @@ mod tests {
             include_str!("../../bunny_ui_web/glue/glue_dom.js"),
             include_str!("../../../apps/bench_web/web/glue_dom.js"),
             "bench_web ships a glue_dom.js that drifted from the canonical copy"
+        );
+        assert_eq!(
+            include_str!("../../bunny_ui_web/glue/glue_dom.js"),
+            include_str!("../../../apps/landing_web/web/glue_dom.js"),
+            "landing_web ships a glue_dom.js that drifted from the canonical copy"
         );
     }
 }

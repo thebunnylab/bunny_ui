@@ -144,9 +144,14 @@ pub enum Modifier {
     /// WINDOW — the scene's own title bar on a chrome-less window.
     WindowDragRegion,
     WindowControl(crate::layout::WindowControl),
-    /// Dom hints: `(tag, class, id)` — only the element lowering
+    /// Dom hints: `(tag, class, id, href)` — only the element lowering
     /// consumes them; everything else passes through.
-    ElementHint(Option<std::rc::Rc<str>>, Option<std::rc::Rc<str>>, Option<std::rc::Rc<str>>),
+    ElementHint(
+        Option<std::rc::Rc<str>>,
+        Option<std::rc::Rc<str>>,
+        Option<std::rc::Rc<str>>,
+        Option<std::rc::Rc<str>>,
+    ),
     /// `.layout(Exact)` — the element lowering keeps our numbers here.
     LayoutMode(crate::layout::LayoutMode),
 
@@ -353,8 +358,8 @@ impl Modifier {
                 }
             )
             .into(),
-            Modifier::ElementHint(tag, class, dom_id) => {
-                format!(" [.element({tag:?}, {class:?}, {dom_id:?})]")
+            Modifier::ElementHint(tag, class, dom_id, href) => {
+                format!(" [.element({tag:?}, {class:?}, {dom_id:?}, {href:?})]")
             }
             Modifier::LayoutMode(mode) => format!(" [.layout({mode:?})]"),
             Modifier::OnClick(_) => " [.onClick()]".into(),
@@ -756,12 +761,25 @@ fn arm_target(out: &mut NodeList, mark: usize, path: Rc<str>) {
 
 /// A hint's words written over the ones a node holds: the outer word
 /// wins where both speak, as it does over a hint.
-fn hint_over(words: [&mut Option<Rc<str>>; 3], outer: [&Option<Rc<str>>; 3]) {
+fn hint_over(words: [&mut Option<Rc<str>>; 4], outer: [&Option<Rc<str>>; 4]) {
     for (word, outer) in words.into_iter().zip(outer) {
         if outer.is_some() {
             word.clone_from(outer);
         }
     }
+}
+
+/// [`hint_over`] for the hints a node carries itself, the id and the
+/// href in their shared record.
+fn hints_over(hints: &mut crate::layout::ElementHints, outer: [&Option<Rc<str>>; 4]) {
+    let [tag, class, dom_id, href] = outer;
+    if tag.is_some() {
+        hints.tag.clone_from(tag);
+    }
+    if class.is_some() {
+        hints.class.clone_from(class);
+    }
+    hints.address = crate::layout::Address::over(&hints.address, dom_id, href);
 }
 
 /// The modified view — Swift's `ModifiedContent` with the modifier inline.
@@ -1685,32 +1703,33 @@ fn apply(
                 child: Box::new(node),
             });
         }
-        Modifier::ElementHint(tag, class, dom_id) => {
+        Modifier::ElementHint(tag, class, dom_id, href) => {
             // every hint that folds is written where the node stands: a
             // row hints a dozen times in every body it runs, and nothing
             // of it moves for one
-            let outer = [tag, class, dom_id];
+            let outer = [tag, class, dom_id, href];
             match out.base_from(mark) {
                 // a hint over a hint is one hint: the outer word wins
                 // where both speak, as the flow applies them anyway —
                 // `.element("a").css_class("x")` is one node, not two
-                LayoutNode::Hinted { tag, class, dom_id, .. } => hint_over([tag, class, dom_id], outer),
+                LayoutNode::Hinted { tag, class, dom_id, href, .. } => {
+                    hint_over([tag, class, dom_id, href], outer)
+                }
                 // a hint over a kept boundary rides the reference itself:
                 // a list that re-runs makes one per row, and a box around
                 // each was an allocation per row per run
-                LayoutNode::BoundaryRef { hints, .. } => {
-                    hint_over([&mut hints.tag, &mut hints.class, &mut hints.dom_id], outer);
-                }
+                LayoutNode::BoundaryRef { hints, .. } => hints_over(hints, outer),
                 node => match node.carried_hints_mut() {
                     // a hint over a stack, a text or a style rides the node
                     // itself: the cells, links and glyphs of a row hint in
                     // every body it runs, and a box around each was an
                     // allocation per hint per row
-                    Some(hints) => hint_over([&mut hints.tag, &mut hints.class, &mut hints.dom_id], outer),
+                    Some(hints) => hints_over(hints, outer),
                     None => wrap_in_place(node, |other| LayoutNode::Hinted {
                         tag: tag.clone(),
                         class: class.clone(),
                         dom_id: dom_id.clone(),
+                        href: href.clone(),
                         child: Box::new(other),
                     }),
                 },

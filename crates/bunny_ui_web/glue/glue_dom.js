@@ -14,6 +14,18 @@ document.head.appendChild(sheet);
 // where a declaration per element would copy the inline style of each
 // clone it lands on
 sheet.sheet.insertRule("[data-path]{cursor:default}", 0);
+// a link is pressable wherever it stands: a layer that asks for nothing
+// lets the click through to what it covers, and its children inherit
+// that — but not the links inside it. The doubled attribute outranks a
+// look's own cursor, the text's arrow
+sheet.sheet.insertRule("a[href][href]{cursor:pointer;pointer-events:auto}", 1);
+// a semantic tag says what an element IS, never how it looks: the
+// browser's own margins, list marks, heading faces and link ink step
+// aside, at no specificity at all, so every look still wins
+sheet.sheet.insertRule(":where(#app) :where(h1,h2,h3,h4,h5,h6,p,figure,blockquote,pre,ol,ul,li,dl,dd){margin:0;padding:0}", 2);
+sheet.sheet.insertRule(":where(#app) :where(h1,h2,h3,h4,h5,h6,code,pre,kbd,samp,small,b,strong,i,em){font:inherit}", 3);
+sheet.sheet.insertRule(":where(#app) :where(ol,ul){list-style:none}", 4);
+sheet.sheet.insertRule(":where(#app) :where(a){color:inherit;text-decoration:none}", 5);
 
 let wasm = null;
 let wakeArmed = false;
@@ -25,7 +37,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 17;
+const EXPECTED_ABI = 19;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -441,6 +453,9 @@ function lookRules(selector, kind, flags, style, layout, face) {
     decl["align-items"] =
       layout.align === 1 ? "center" : layout.align === 2 ? "flex-end" : layout.align === 3 ? "baseline" : "flex-start";
   }
+  // layers: the same alignment across the cell, so a centred stack
+  // centres both ways
+  if (kind === 11 && decl["align-items"]) decl["justify-items"] = decl["align-items"];
   if (layout.padding) decl.padding = layout.padding.map((side) => `${side}px`).join(" ");
   if (layout.grow) {
     // the flexible child — and the classic flex footgun: a zeroed
@@ -490,16 +505,23 @@ function lookRules(selector, kind, flags, style, layout, face) {
     decl["-webkit-backdrop-filter"] = style.filter;
   }
   if (face) {
-    if (!face.inheritsFace) decl.font = face.font;
+    if (!face.inheritsFace) {
+      decl.font = face.font;
+      // the shorthand leaves the spacing alone; the face's own advance
+      // rides beside it
+      if (face.tracking) decl["letter-spacing"] = `${face.tracking}px`;
+    }
     // AFTER the font shorthand, which resets line-height: 0 means the
     // face's own box
     if (face.lineHeight > 0) decl["line-height"] = `${face.lineHeight}px`;
     // 0 leading — the browser's own default for this direction
     if (face.align === 1) decl["text-align"] = "center";
     else if (face.align === 2) decl["text-align"] = "right";
-    // an inherited ink takes NO color: the box above owns both states
+    // an inherited ink takes NO color: the box above owns both states.
+    // A box's face record is the face alone — the box's own ink, the
+    // one its hover rules flip, stays
     if (face.color) decl.color = face.color;
-    else delete decl.color;
+    else if (kind === 2) delete decl.color;
     if (face.truncation !== 0) {
       decl.overflow = "hidden";
       decl["text-overflow"] = "ellipsis";
@@ -510,6 +532,9 @@ function lookRules(selector, kind, flags, style, layout, face) {
     .map(([name, value]) => `${name}:${value}`)
     .join(";");
   const rules = [`${selector}{${body}}`];
+  // layers: one grid cell, and every child IN it — auto-placement
+  // would give each layer a row of its own
+  if (kind === 11) rules.push(`${selector}>*{grid-area:1/1}`);
   // a follower hangs its states off the GROUP's pointer: the same
   // rules, hung off the group's selector, so the browser still owns
   // the hover and a group frame costs no patch; a box without one
@@ -806,7 +831,11 @@ function applyPatches(view, length) {
     if (mask & 64) {
       const response = f32();
       f32(); // damping — the CSS side keeps the duration
-      style.transition = `background-color ${response}s ease-out, transform ${response}s ease-out`;
+      // every colour the engine's springs move — the fill, the ink,
+      // the border, the halo — and the transform
+      style.transition = ["background-color", "color", "border-color", "box-shadow", "transform"]
+        .map((property) => `${property} ${response}s ease-out`)
+        .join(", ");
     }
     // the action path, the tooltip and the group owned are the
     // element's own (ops 19 and 24): a look carries none, but the
@@ -924,6 +953,7 @@ function applyPatches(view, length) {
     const italic = u8();
     const family = text(u16());
     const lineHeight = f32();
+    const tracking = f32();
     const align = u8();
     const truncation = u8();
     // 1 = the face declared above is this text's: its look names no font
@@ -932,6 +962,7 @@ function applyPatches(view, length) {
       font: cssFont(size, weight, mono, italic, family),
       inheritsFace,
       lineHeight,
+      tracking,
       align,
       color: inheritsInk ? null : color,
       truncation,
@@ -1010,6 +1041,7 @@ function applyPatches(view, length) {
       const tag = text(u8());
       const cls = text(u8());
       const domId = text(u8());
+      const href = text(u16());
       const kind = u8();
       const el = createElementOf(kind, tag);
       el.__n = id;
@@ -1017,6 +1049,7 @@ function applyPatches(view, length) {
       el.__look = "";
       if (cls) el.setAttribute("class", cls);
       if (domId) el.id = domId;
+      if (href) el.setAttribute("href", href);
       if (kind === 4) {
         wireScroll(el, id);
       }
@@ -1252,6 +1285,7 @@ function applyPatches(view, length) {
       const cover = u8();
       const el = lookup(id);
       const entry = images.get(imageKey(hi, lo));
+      if (el) el.dataset.img = imageKey(hi, lo);
       if (el && entry) {
         el.src = entry.url;
         // false: our frame IS the rect (contain and stretch resolve in
@@ -1364,9 +1398,10 @@ function applyPatches(view, length) {
       const target = lookup(u32());
       if (target) target.scrollIntoView({ block: "nearest" });
     } else if (op === 15) {
-      // live hints: class and id re-attribute in place
+      // live hints: class, id and href re-attribute in place
       const cls = text(u8());
       const domId = text(u8());
+      const href = text(u16());
       const el = lookup(id);
       if (el) {
         learn(el);
@@ -1376,6 +1411,11 @@ function applyPatches(view, length) {
           el.id = domId;
         } else {
           el.removeAttribute("id");
+        }
+        if (href) {
+          el.setAttribute("href", href);
+        } else {
+          el.removeAttribute("href");
         }
       }
     } else if (op === 16) {
@@ -1584,10 +1624,18 @@ const imports = {
     js_image_register(hi, lo, pointer, length) {
       const key = imageKey(hi, lo);
       const bytes = new Uint8Array(wasm.memory.buffer, pointer, length).slice();
-      const url = URL.createObjectURL(new Blob([bytes]));
+      // a browser sniffs the raster formats, never SVG: the markup
+      // needs its type named or the blob never decodes
+      const head = decoder.decode(bytes.subarray(0, 256)).trimStart();
+      const svg = head.startsWith("<svg") || (head.startsWith("<?xml") && head.includes("<svg"));
+      const url = URL.createObjectURL(new Blob([bytes], svg ? { type: "image/svg+xml" } : {}));
       const probe = new Image();
       const entry = { url, probe, width: 0, height: 0 };
       images.set(key, entry);
+      // a served page's <img> waits for these bytes by identity
+      for (const el of app.querySelectorAll(`img[data-img="${key}"]`)) {
+        if (!el.getAttribute("src")) el.src = url;
+      }
       probe.onload = () => {
         entry.width = probe.naturalWidth;
         entry.height = probe.naturalHeight;
@@ -1744,6 +1792,21 @@ const imports = {
   },
 };
 
+// The box the page gives its mount. The engine pins the mount at the
+// size it laid out, so the page's own answer — its stylesheet's — is
+// read with that pin let go for the one measure.
+function pageBox() {
+  const { width, height } = app.style;
+  app.style.width = "";
+  app.style.height = "";
+  const box = [app.clientWidth, app.clientHeight];
+  app.style.width = width;
+  app.style.height = height;
+  return box;
+}
+// What the engine laid the mount out at last.
+let mounted = [0, 0];
+
 const bootOpened = performance.now();
 WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
   ({ instance }) => {
@@ -1816,12 +1879,20 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     }
     window.__bunnyBoot = { instantiate: performance.now() - bootOpened };
     const startOpened = performance.now();
-    wasm[START_EXPORT](
-      app.clientWidth,
-      app.clientHeight,
-      window.devicePixelRatio || 1,
-      hydrated ? 1 : 0,
-    );
+    // a served page is adopted at the size it was laid out in — there
+    // the scene is the one its elements show — and the reader's own
+    // box follows as a resize: the difference, and nothing else
+    const reader = pageBox();
+    const served =
+      hydrated && app.dataset.width
+        ? [Number(app.dataset.width), Number(app.dataset.height)]
+        : reader;
+    mounted = served;
+    wasm[START_EXPORT](served[0], served[1], window.devicePixelRatio || 1, hydrated ? 1 : 0);
+    if (reader[0] !== served[0] || reader[1] !== served[1]) {
+      mounted = reader;
+      wasm.bunny_resize(reader[0], reader[1], window.devicePixelRatio || 1);
+    }
     window.__bunnyBoot.start = performance.now() - startOpened;
 
     // Is motion welcome? The PLATFORM answers, not this file: a reader
@@ -1860,6 +1931,20 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
       }
     });
     window.addEventListener("resize", repositionPopovers);
+    // the window's box: a page that sizes the mount to the viewport
+    // hears it move, and the bodies that read the Viewport run again —
+    // a layout that changes its columns with the width, say
+    const remount = () => {
+      if (!wasm) return;
+      const [width, height] = pageBox();
+      if (width === mounted[0] && height === mounted[1]) return;
+      mounted = [width, height];
+      wasm.bunny_resize(width, height, window.devicePixelRatio || 1);
+    };
+    // the window says it moved; the document's own box says so too
+    // when nothing dispatched the event — either is one remount
+    window.addEventListener("resize", remount);
+    new ResizeObserver(remount).observe(document.documentElement);
     // a modifier's release types nothing and makes no stroke: the
     // state it leaves is the whole event
     window.addEventListener("keyup", (event) => {
@@ -1872,7 +1957,9 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     // every stroke a focused canvas island wants — a box the app
     // paints has no element to type into.
     window.addEventListener("keydown", (event) => {
-      const typing = event.target && event.target.tagName === "INPUT";
+      // the browser's own editables — a field, and a field of many lines
+      const typing =
+        event.target && (event.target.tagName === "INPUT" || event.target.tagName === "TEXTAREA");
       const mods = modifiers(event);
       if (MODIFIER_KEYS.has(event.key)) {
         if (wasm.bunny_modifiers) wasm.bunny_modifiers(mods);
@@ -1886,11 +1973,13 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         if (wasm.bunny_key(100 + Number(row[1]), mods)) event.preventDefault();
         return;
       }
+      // a key the engine does not take is the browser's: the page
+      // scrolls by the arrows, the space and the page keys, a focused
+      // link follows its Enter, Tab walks the focus
       const code = KEYS[event.key];
       if (code !== undefined) {
         if (typing && code !== 7) return;
-        if (code !== 7) event.preventDefault();
-        wasm.bunny_key(code, mods);
+        if (wasm.bunny_key(code, mods) && code !== 7) event.preventDefault();
         return;
       }
       if (event.key.length !== 1) return;
@@ -1899,6 +1988,9 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         return;
       }
       if (typing) return;
+      // typing reaches the engine only while something there takes
+      // text — a canvas island holding the keyboard
+      if (wasm.bunny_text_caret && !wasm.bunny_text_caret()) return;
       event.preventDefault();
       sendText(event.key);
     });
