@@ -70,8 +70,21 @@ pub struct FrameStats {
     pub measure_hits: u32,
     /// Text measurements that reached the text engine.
     pub measure_misses: u32,
-    /// Times a pass rebuilt the tables the input doors read.
+    /// Times a pass rebuilt a DERIVED table the input doors read (the
+    /// handlers, the key contexts).
     pub assemblies: u32,
+    /// Retained entries whose registrations entered the live tables —
+    /// one per body that closed an entry.
+    pub entries_indexed: u32,
+    /// Elements patched by their binding's key — a text that read for
+    /// itself and moved, with no body and no walk.
+    pub binding_updates: u32,
+    /// Subtrees mounted as a clone of a shape already on the page.
+    pub clones: u32,
+    /// Subtrees whose whole shape was hashed to find a template — the
+    /// slow road; a row compared with the copy made just before it
+    /// does not count.
+    pub shapes_hashed: u32,
     /// Second layouts the pointer re-read asked for.
     pub hover_relayouts: u32,
     /// Calls to an app box's `paint`.
@@ -94,12 +107,51 @@ pub struct FrameStats {
     pub rows_summed: u32,
     /// Milliseconds per [`Stage`], all zero without a clock.
     pub stage_ms: [f64; STAGES],
+    /// Allocations made under each stage, when a bench installed a
+    /// probe ([`set_alloc_probe`]); zeros otherwise.
+    pub stage_allocs: [u64; STAGES],
 }
 
 impl FrameStats {
+    /// An empty table — `Default`, for a `const` context.
+    pub const fn new() -> Self {
+        FrameStats {
+            body_passes: 0,
+            layout_passes: 0,
+            display_commands: 0,
+            capture_nodes: 0,
+            diff_visited: 0,
+            diff_reused: 0,
+            patches: 0,
+            encode_bytes: 0,
+            measure_hits: 0,
+            measure_misses: 0,
+            assemblies: 0,
+            entries_indexed: 0,
+            binding_updates: 0,
+            clones: 0,
+            shapes_hashed: 0,
+            hover_relayouts: 0,
+            paints: 0,
+            pictures_replayed: 0,
+            commands_unseen: 0,
+            children_unplaced: 0,
+            measures_kept: 0,
+            measures_made: 0,
+            rows_summed: 0,
+            stage_ms: [0.0; STAGES],
+            stage_allocs: [0; STAGES],
+        }
+    }
+
     /// The stage's accumulated wall time in milliseconds.
     pub fn ms(&self, stage: Stage) -> f64 {
         self.stage_ms[stage as usize]
+    }
+
+    /// The allocations the stage made, when a probe counts them.
+    pub fn allocs(&self, stage: Stage) -> u64 {
+        self.stage_allocs[stage as usize]
     }
 }
 
@@ -115,6 +167,10 @@ thread_local! {
     static MEASURE_HITS: Cell<u32> = const { Cell::new(0) };
     static MEASURE_MISSES: Cell<u32> = const { Cell::new(0) };
     static ASSEMBLIES: Cell<u32> = const { Cell::new(0) };
+    static ENTRIES_INDEXED: Cell<u32> = const { Cell::new(0) };
+    static BINDING_UPDATES: Cell<u32> = const { Cell::new(0) };
+    static CLONES: Cell<u32> = const { Cell::new(0) };
+    static SHAPES_HASHED: Cell<u32> = const { Cell::new(0) };
     static HOVER_RELAYOUTS: Cell<u32> = const { Cell::new(0) };
     static PAINTS: Cell<u32> = const { Cell::new(0) };
     static PICTURES_REPLAYED: Cell<u32> = const { Cell::new(0) };
@@ -124,7 +180,9 @@ thread_local! {
     static MEASURES_MADE: Cell<u32> = const { Cell::new(0) };
     static ROWS_SUMMED: Cell<u32> = const { Cell::new(0) };
     static STAGE_MS: Cell<[f64; STAGES]> = const { Cell::new([0.0; STAGES]) };
+    static STAGE_ALLOCS: Cell<[u64; STAGES]> = const { Cell::new([0; STAGES]) };
     static CLOCK: Cell<Option<fn() -> f64>> = const { Cell::new(None) };
+    static ALLOC_PROBE: Cell<Option<fn() -> u64>> = const { Cell::new(None) };
 }
 
 /// Installs the wall clock the timers read, in milliseconds. `None`
@@ -133,6 +191,13 @@ thread_local! {
 /// on `performance.now` when the page asks for the table.
 pub fn set_clock(clock: Option<fn() -> f64>) {
     CLOCK.with(|slot| slot.set(clock));
+}
+
+/// Installs a reader of the allocation count — a bench's counting
+/// allocator — so every timed stage also learns how many allocations
+/// it made. Only a timed stage samples it.
+pub fn set_alloc_probe(probe: Option<fn() -> u64>) {
+    ALLOC_PROBE.with(|slot| slot.set(probe));
 }
 
 /// Snapshots the totals accumulated since the last call, and resets.
@@ -149,6 +214,10 @@ pub fn take() -> FrameStats {
         measure_hits: MEASURE_HITS.with(|c| c.replace(0)),
         measure_misses: MEASURE_MISSES.with(|c| c.replace(0)),
         assemblies: ASSEMBLIES.with(|c| c.replace(0)),
+        entries_indexed: ENTRIES_INDEXED.with(|c| c.replace(0)),
+        binding_updates: BINDING_UPDATES.with(|c| c.replace(0)),
+        clones: CLONES.with(|c| c.replace(0)),
+        shapes_hashed: SHAPES_HASHED.with(|c| c.replace(0)),
         hover_relayouts: HOVER_RELAYOUTS.with(|c| c.replace(0)),
         paints: PAINTS.with(|c| c.replace(0)),
         pictures_replayed: PICTURES_REPLAYED.with(|c| c.replace(0)),
@@ -158,6 +227,7 @@ pub fn take() -> FrameStats {
         measures_made: MEASURES_MADE.with(|c| c.replace(0)),
         rows_summed: ROWS_SUMMED.with(|c| c.replace(0)),
         stage_ms: STAGE_MS.with(|c| c.replace([0.0; STAGES])),
+        stage_allocs: STAGE_ALLOCS.with(|c| c.replace([0; STAGES])),
     }
 }
 
@@ -167,6 +237,8 @@ pub(crate) fn time<T>(stage: Stage, run: impl FnOnce() -> T) -> T {
     let Some(clock) = CLOCK.with(|slot| slot.get()) else {
         return run();
     };
+    let probe = ALLOC_PROBE.with(|slot| slot.get());
+    let allocs_before = probe.map(|probe| probe());
     let start = clock();
     let out = run();
     let elapsed = clock() - start;
@@ -175,6 +247,14 @@ pub(crate) fn time<T>(stage: Stage, run: impl FnOnce() -> T) -> T {
         totals[stage as usize] += elapsed;
         cell.set(totals);
     });
+    if let (Some(probe), Some(before)) = (probe, allocs_before) {
+        let made = probe().saturating_sub(before);
+        STAGE_ALLOCS.with(|cell| {
+            let mut totals = cell.get();
+            totals[stage as usize] += made;
+            cell.set(totals);
+        });
+    }
     out
 }
 
@@ -209,7 +289,6 @@ pub(crate) fn note_diff_visit() {
 }
 
 #[inline]
-#[allow(dead_code)] // the diff learns to reuse in the O(change) round
 pub(crate) fn note_diff_reuse() {
     bump(&DIFF_REUSED, 1);
 }
@@ -223,6 +302,26 @@ pub(crate) fn note_encode(patches: usize, bytes: usize) {
 #[inline]
 pub(crate) fn note_assembly() {
     bump(&ASSEMBLIES, 1);
+}
+
+#[inline]
+pub(crate) fn note_entry_indexed() {
+    bump(&ENTRIES_INDEXED, 1);
+}
+
+#[inline]
+pub(crate) fn note_binding_update() {
+    bump(&BINDING_UPDATES, 1);
+}
+
+#[inline]
+pub(crate) fn note_clone() {
+    bump(&CLONES, 1);
+}
+
+#[inline]
+pub(crate) fn note_shape_hashed() {
+    bump(&SHAPES_HASHED, 1);
 }
 
 #[inline]

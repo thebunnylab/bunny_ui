@@ -6,6 +6,15 @@ edition.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+# The pixel pipeline for the hybrid and the full-canvas keyed pages:
+# the islands and the WebGL tier, plus the probe the in-house runner
+# reads hit rectangles from. Off, the crate is the dom-only binary the
+# official page ships.
+gpu = ["bunny-ui/canvas", "bunny-ui-web/gpu", "probe"]
+probe = ["bunny-ui-web/probe"]
+
 [dependencies]
 bunny-ui.workspace = true # dom-only: no canvas feature
 bunny-ui-web = { path = "../../crates/bunny_ui_web", default-features = false }

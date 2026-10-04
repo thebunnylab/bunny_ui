@@ -16,6 +16,28 @@ const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
 #[derive(Default)]
 pub struct FxHasher(u64);
 
+/// One to seven bytes as the little-endian word they fill, zeros above.
+///
+/// Copied into a zeroed word, a tail of unknown length was a call to
+/// `memmove` for every key hashed — nearly every path has one. Two loads
+/// that overlap in the middle make the same word: a byte they both read
+/// lands at the same place from both, so the halves merge with an `or`.
+fn tail_word(tail: &[u8]) -> u64 {
+    let len = tail.len();
+    let pair = |low: u64, high: u64, width: usize| low | (high << (8 * (len - width)));
+    if len >= 4 {
+        let low = u32::from_le_bytes(tail[..4].try_into().expect("four bytes"));
+        let high = u32::from_le_bytes(tail[len - 4..].try_into().expect("four bytes"));
+        pair(u64::from(low), u64::from(high), 4)
+    } else if len >= 2 {
+        let low = u16::from_le_bytes(tail[..2].try_into().expect("two bytes"));
+        let high = u16::from_le_bytes(tail[len - 2..].try_into().expect("two bytes"));
+        pair(u64::from(low), u64::from(high), 2)
+    } else {
+        u64::from(tail[0])
+    }
+}
+
 impl Hasher for FxHasher {
     fn finish(&self) -> u64 {
         self.0
@@ -34,16 +56,29 @@ impl Hasher for FxHasher {
         // the tail, zero-filled: the same word the loop above would make
         let tail = words.remainder();
         if !tail.is_empty() {
-            let mut word = [0u8; 8];
-            for (slot, byte) in word.iter_mut().zip(tail) {
-                *slot = *byte;
-            }
-            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(SEED);
+            self.0 = (self.0.rotate_left(5) ^ tail_word(tail)).wrapping_mul(SEED);
         }
     }
 
     fn write_u64(&mut self, value: u64) {
         self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(SEED);
+    }
+
+    // The small integers are one word each. Left to the default, a flag,
+    // a color or the terminator of every `str` went through `write` and
+    // its tail loop — a byte copy per field of every look a row hashes.
+    // The word is the one that loop made: the value's little-endian
+    // bytes, zero-filled (a `u32` IS its zero-extended `u64` there).
+    fn write_u8(&mut self, value: u8) {
+        self.write_u64(u64::from(value));
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.write_u64(u64::from(u16::from_le_bytes(value.to_ne_bytes())));
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.write_u64(u64::from(u32::from_le_bytes(value.to_ne_bytes())));
     }
 
     fn write_usize(&mut self, value: usize) {
@@ -66,6 +101,30 @@ mod tests {
             state = (state.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(SEED);
         }
         state
+    }
+
+    /// A flag, a short and a word hash as their bytes always did: every
+    /// key that reached a golden keeps its number.
+    #[test]
+    fn the_small_integers_answer_what_their_bytes_answered() {
+        for value in [0u32, 1, 0xff, 0x1234, 0xdead_beef, u32::MAX] {
+            let mut word = FxHasher::default();
+            word.write_u32(value);
+            assert_eq!(word.finish(), reference(&value.to_ne_bytes()), "u32 {value:#x}");
+            let short = value as u16;
+            let mut half = FxHasher::default();
+            half.write_u16(short);
+            assert_eq!(half.finish(), reference(&short.to_ne_bytes()), "u16 {short:#x}");
+            let byte = value as u8;
+            let mut one = FxHasher::default();
+            one.write_u8(byte);
+            assert_eq!(one.finish(), reference(&[byte]), "u8 {byte:#x}");
+        }
+        // and a string, whose terminator is a byte
+        let mut text = FxHasher::default();
+        std::hash::Hash::hash("App/#0/[12]", &mut text);
+        let expected = (reference(b"App/#0/[12]").rotate_left(5) ^ 0xff).wrapping_mul(SEED);
+        assert_eq!(text.finish(), expected, "a str hashes its bytes, then its 0xff");
     }
 
     #[test]

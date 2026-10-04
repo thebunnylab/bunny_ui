@@ -24,7 +24,7 @@ use crate::erased::CustomModifier;
 use crate::layout::{Color, CrossAlign, Edges, LayoutNode, TextHighlight, Truncation, VisualProps};
 use crate::text_engine::{FontDesign, FontPatch, FontSpec, Tracking, Weight};
 use crate::state_ext::BindingExt;
-use crate::view::{NodeList, Single, View};
+use crate::view::{NodeList, Single, View, wrap_in_place};
 use crate::views::{Alignment, wrap_layout};
 use motor::views::{ContentMode, Edge, Font, ListStyle, ProgressViewStyle, TextAlignment};
 
@@ -119,8 +119,10 @@ pub enum Modifier {
     /// A soft halo behind the view: (radius, color).
     Shadow(f64, Color),
     /// The liquid-glass material behind the view. Every knob is
-    /// optional, so a chain of them MERGES into one material.
-    Glass(crate::layout::Glass),
+    /// optional, so a chain of them MERGES into one material. Boxed: the
+    /// widest record of the set and among the rarest, it sized every
+    /// modifier by itself — and a row's body holds one per modifier.
+    Glass(Box<crate::layout::Glass>),
     /// The image below negotiates size with the proposal.
     Resizable,
     /// How a resizable image maps into its box: contain or cover.
@@ -183,9 +185,10 @@ pub enum Modifier {
     /// titled, resizable, key while it is up — where the shell has
     /// one, and presents as the sheet it is everywhere else. The
     /// window's close button flips the binding; it never terminates.
+    /// The spec is boxed, for the reason the glass is.
     Dialog {
         is_presented: Binding<bool>,
-        spec: crate::layout::DialogSpec,
+        spec: Box<crate::layout::DialogSpec>,
         content: Rc<dyn Fn(&Context) -> crate::erased::Erased>,
     },
     /// `.alert(…)`: a dialog's window with an ask's manners — one size
@@ -411,12 +414,17 @@ fn rewrite_scroll_node(
     ) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        // a node that wears hints or an action stood behind their
+        // wrapper, which no rewrite crosses: it is left as it was left
+        marked if !marked.is_bare() => marked,
         LayoutNode::Scroll { path, axes, fill, commanded, child, .. } => {
             rewrite(path, axes, fill, commanded, child)
         }
-        LayoutNode::Styled { props, child } => LayoutNode::Styled {
+        LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
+            hints,
+            action,
         },
         LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
             key,
@@ -501,6 +509,9 @@ fn rewrite_field_node(
     rewrite: &impl Fn(FieldParts) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        // a node that wears hints or an action stood behind their
+        // wrapper, which no rewrite crosses: it is left as it was left
+        marked if !marked.is_bare() => marked,
         LayoutNode::Field {
             path,
             content,
@@ -520,9 +531,11 @@ fn rewrite_field_node(
             highlights,
             secret,
         }),
-        LayoutNode::Styled { props, child } => LayoutNode::Styled {
+        LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_field_node(*child, rewrite)),
+            hints,
+            action,
         },
         LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
             key,
@@ -586,11 +599,16 @@ fn rewrite_pixel_node(
     icon: &impl Fn(crate::icon::Symbol, bool, bool) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        // a node that wears hints or an action stood behind their
+        // wrapper, which no rewrite crosses: it is left as it was left
+        marked if !marked.is_bare() => marked,
         LayoutNode::Image { source, resizable, fit } => rewrite(source, resizable, fit),
         LayoutNode::Icon { symbol, resizable, forced } => icon(symbol, resizable, forced),
-        LayoutNode::Styled { props, child } => LayoutNode::Styled {
+        LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
+            hints,
+            action,
         },
         LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
             key,
@@ -642,18 +660,23 @@ fn rewrite_pixel_node(
 fn rewrite_text_node(
     node: LayoutNode,
     rewrite: &impl Fn(
-        std::sync::Arc<str>,
+        crate::bind::TextSource,
         Option<TextHighlight>,
         Option<Truncation>,
     ) -> LayoutNode,
 ) -> LayoutNode {
     match node {
-        LayoutNode::Text { content, highlights, truncation } => {
+        // a node that wears hints or an action stood behind their
+        // wrapper, which no rewrite crosses: it is left as it was left
+        marked if !marked.is_bare() => marked,
+        LayoutNode::Text { content, highlights, truncation, .. } => {
             rewrite(content, highlights, truncation)
         }
-        LayoutNode::Styled { props, child } => LayoutNode::Styled {
+        LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_text_node(*child, rewrite)),
+            hints,
+            action,
         },
         LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
             key,
@@ -685,28 +708,60 @@ fn rewrite_text_node(
 /// the sum and the chain of `.padding_edge(...)` calls stops paying one
 /// box per edge.
 fn wrap_padding(out: &mut NodeList, mark: usize, edges: Edges) {
-    out.wrap_layout_from(mark, |node| match node {
-        LayoutNode::Padding { edges: inner, child } => LayoutNode::Padding {
-            edges: Edges {
-                top: inner.top + edges.top,
-                bottom: inner.bottom + edges.bottom,
-                leading: inner.leading + edges.leading,
-                trailing: inner.trailing + edges.trailing,
-            },
-            child,
-        },
-        node => LayoutNode::Padding { edges, child: Box::new(node) },
-    });
+    match out.base_from(mark) {
+        // a padding over a padding adds to it, where it stands
+        LayoutNode::Padding { edges: inner, .. } => {
+            inner.top += edges.top;
+            inner.bottom += edges.bottom;
+            inner.leading += edges.leading;
+            inner.trailing += edges.trailing;
+        }
+        node => wrap_in_place(node, |node| LayoutNode::Padding { edges, child: Box::new(node) }),
+    }
 }
 
 fn wrap_styled(out: &mut NodeList, mark: usize, delta: VisualProps) {
-    out.wrap_layout_from(mark, |node| match node {
-        LayoutNode::Styled { mut props, child } => {
-            *props = (*props).or(delta);
-            LayoutNode::Styled { props, child }
+    match out.base_from(mark) {
+        // a style that wears hints or an action stood behind their
+        // wrapper, where no style reached it to merge: the new one
+        // nests, as it did. One that merges merges where it stands
+        LayoutNode::Styled { props, hints, action: None, .. } if hints.is_empty() => {
+            VisualProps::restyle(props, delta);
         }
-        other => LayoutNode::Styled { props: Box::new(delta), child: Box::new(other) },
-    });
+        node => wrap_in_place(node, |other| LayoutNode::Styled {
+            props: delta.shared(),
+            child: Box::new(other),
+            hints: Default::default(),
+            action: None,
+        }),
+    }
+}
+
+/// Makes what the base left the target of `path`. A stack, a text or a
+/// style with no action of its own carries it, written where the node
+/// stands: the links of a row are armed in every body it runs, and a box
+/// around each was an allocation per action per row. Anything else — and
+/// a node that already answers another action — is wrapped in an
+/// `Interactive`, as it always was.
+fn arm_target(out: &mut NodeList, mark: usize, path: Rc<str>) {
+    let base = out.base_from(mark);
+    if let Some(action) = base.carried_action_mut()
+        && action.is_none()
+    {
+        *action = Some(path);
+        return;
+    }
+    wrap_in_place(base, |node| LayoutNode::Interactive { path, child: Box::new(node) });
+}
+
+/// A hint's words written over the ones a node holds: the outer word
+/// wins where both speak, as it does over a hint.
+fn hint_over(words: [&mut Option<Rc<str>>; 3], outer: [&Option<Rc<str>>; 3]) {
+    for (word, outer) in words.into_iter().zip(outer) {
+        if outer.is_some() {
+            word.clone_from(outer);
+        }
+    }
 }
 
 /// The modified view — Swift's `ModifiedContent` with the modifier inline.
@@ -871,21 +926,30 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             return;
         }
 
-        // `.inject()` / `.modelContainer()` water the subtree.
-        let mut base_ctx = ctx.clone();
-        if let Modifier::EnvSet { set, .. } = &self.modifier {
-            set(&mut base_ctx.values);
-        }
+        // `.inject()` / `.modelContainer()` water the subtree — the one
+        // modifier that needs a context of its own. Every other borrows
+        // the one it was handed: a chain of a dozen modifiers on a row
+        // used to copy the environment a dozen times.
+        let watered;
+        let base_ctx: &Context = match &self.modifier {
+            Modifier::EnvSet { set, .. } => {
+                let mut own = ctx.clone();
+                set(Rc::make_mut(&mut own.values));
+                watered = own;
+                &watered
+            }
+            _ => ctx,
+        };
 
         // the MARK: what the base adds is ours to wrap; anything
         // already in hand belongs to a sibling and must not be touched
         let mark = out.layout_mark();
-        self.base.render_into(&base_ctx, out);
+        self.base.render_into(base_ctx, out);
 
         // …and everything the modifier does AFTER the base is
         // generic-free, so it lives in ONE function instead of
         // one copy per chain in the program
-        apply(&self.modifier, ctx, &base_ctx, out, mark);
+        apply(&self.modifier, ctx, base_ctx, out, mark);
     }
 }
 
@@ -1017,7 +1081,7 @@ fn apply(
                 // popover, and Escape stays the app's to bind.
                 let is_presented = is_presented.clone();
                 crate::reconciler::attribute_action(
-                    format!("{path}/#dismiss"),
+                    Rc::from(format!("{path}/#dismiss")),
                     Rc::new(move |_| is_presented.set(false)),
                 );
             }
@@ -1030,7 +1094,7 @@ fn apply(
                     path: path.clone(),
                     content: Rc::new(wrap_layout(dialog_layouts.clone())),
                     child: Box::new(base),
-                    surface: crate::layout::OverlaySurface::Window(spec.clone()),
+                    surface: crate::layout::OverlaySurface::Window((**spec).clone()),
                 }),
                 None => out.wrap_layout_from(mark, |base| LayoutNode::Layered {
                     align: CrossAlign::Center,
@@ -1068,7 +1132,7 @@ fn apply(
                     let is_presented = is_presented.clone();
                     Rc::new(move || is_presented.set(false))
                 };
-                crate::reconciler::attribute_action(format!("{path}/#dismiss"), {
+                crate::reconciler::attribute_action(Rc::from(format!("{path}/#dismiss")), {
                     let cancel = cancel.clone();
                     Rc::new(move |_| cancel())
                 });
@@ -1142,7 +1206,7 @@ fn apply(
                         }
                     })
                 };
-                crate::reconciler::attribute_action(format!("{path}/#dismiss"), {
+                crate::reconciler::attribute_action(Rc::from(format!("{path}/#dismiss")), {
                     // a dismiss has no count to hear: the same
                     // closure the keyboard's Escape handler holds
                     let close = close.clone();
@@ -1265,7 +1329,7 @@ fn apply(
         Modifier::Glass(glass) => wrap_styled(
             out,
             mark,
-            VisualProps { glass: Some(*glass), ..VisualProps::default() },
+            VisualProps { glass: Some(**glass), ..VisualProps::default() },
         ),
         Modifier::ForegroundColor(color) => wrap_styled(
             out,
@@ -1475,6 +1539,8 @@ fn apply(
                 content,
                 highlights: Some(highlight.clone()),
                 truncation,
+                hints: Default::default(),
+                action: None,
             });
             rewrite_field_node(node, &|parts| {
                 FieldParts { highlights: Some(highlight.clone()), ..parts }.into_node()
@@ -1485,6 +1551,8 @@ fn apply(
                 content,
                 highlights,
                 truncation: Some(*mode),
+                hints: Default::default(),
+                action: None,
             })
         }),
         Modifier::OnMeasure(report) => {
@@ -1618,13 +1686,35 @@ fn apply(
             });
         }
         Modifier::ElementHint(tag, class, dom_id) => {
-            let (tag, class, dom_id) = (tag.clone(), class.clone(), dom_id.clone());
-            out.wrap_layout_from(mark, move |node| LayoutNode::Hinted {
-                tag,
-                class,
-                dom_id,
-                child: Box::new(node),
-            });
+            // every hint that folds is written where the node stands: a
+            // row hints a dozen times in every body it runs, and nothing
+            // of it moves for one
+            let outer = [tag, class, dom_id];
+            match out.base_from(mark) {
+                // a hint over a hint is one hint: the outer word wins
+                // where both speak, as the flow applies them anyway —
+                // `.element("a").css_class("x")` is one node, not two
+                LayoutNode::Hinted { tag, class, dom_id, .. } => hint_over([tag, class, dom_id], outer),
+                // a hint over a kept boundary rides the reference itself:
+                // a list that re-runs makes one per row, and a box around
+                // each was an allocation per row per run
+                LayoutNode::BoundaryRef { hints, .. } => {
+                    hint_over([&mut hints.tag, &mut hints.class, &mut hints.dom_id], outer);
+                }
+                node => match node.carried_hints_mut() {
+                    // a hint over a stack, a text or a style rides the node
+                    // itself: the cells, links and glyphs of a row hint in
+                    // every body it runs, and a box around each was an
+                    // allocation per hint per row
+                    Some(hints) => hint_over([&mut hints.tag, &mut hints.class, &mut hints.dom_id], outer),
+                    None => wrap_in_place(node, |other| LayoutNode::Hinted {
+                        tag: tag.clone(),
+                        class: class.clone(),
+                        dom_id: dom_id.clone(),
+                        child: Box::new(other),
+                    }),
+                },
+            }
         }
         Modifier::LayoutMode(mode) => {
             // Auto is what every target does already; only Exact asks
@@ -1638,12 +1728,9 @@ fn apply(
         Modifier::OnClick(action) => {
             // the same registration as the Button: action retained in the
             // reconciler, frame in the hit-test under the cursor identity
-            if let Some(path) = motor::identity::cursor_scope() {
-                crate::reconciler::attribute_action(path.clone(), action.clone());
-                out.wrap_layout_from(mark, |node| LayoutNode::Interactive {
-                    path,
-                    child: Box::new(node),
-                });
+            if let Some(path) = motor::identity::cursor_scope_rc() {
+                crate::reconciler::attribute_action(Rc::clone(&path), action.clone());
+                arm_target(out, mark, path);
             }
         }
         Modifier::OnHover(action) => {
@@ -1652,15 +1739,12 @@ fn apply(
             // reserved key beside the click's own, which is how the
             // popover's dismiss already rides. A view with both keeps
             // one path and answers two questions.
-            if let Some(path) = motor::identity::cursor_scope() {
+            if let Some(path) = motor::identity::cursor_scope_rc() {
                 crate::reconciler::attribute_action(
-                    format!("{path}/{}", crate::reconciler::HOVER_KEY),
+                    Rc::from(format!("{path}/{}", crate::reconciler::HOVER_KEY)),
                     action.clone(),
                 );
-                out.wrap_layout_from(mark, |node| LayoutNode::Interactive {
-                    path,
-                    child: Box::new(node),
-                });
+                arm_target(out, mark, path);
             }
         }
         Modifier::OnCopy(copy) => {
@@ -1670,10 +1754,7 @@ fn apply(
             // and a click returns nothing
             if let Some(path) = motor::identity::cursor_scope() {
                 crate::reconciler::attribute_copy(path.clone(), copy.clone());
-                out.wrap_layout_from(mark, |node| LayoutNode::Interactive {
-                    path,
-                    child: Box::new(node),
-                });
+                arm_target(out, mark, Rc::from(path));
             }
         }
         Modifier::OnAction(id, handler) => {
@@ -1692,4 +1773,32 @@ fn apply(
             node.line.push_str(&modifier.suffix());
         }
     }
+}
+
+thread_local! {
+    /// The words a page hints with — tags, classes, element ids — each
+    /// held once. A row's `.element("td")` is the same word a thousand
+    /// times over; it should cost a thousand pointer bumps, not a
+    /// thousand copies.
+    static HINTS: std::cell::RefCell<motor::hash::FxHashSet<std::rc::Rc<str>>> =
+        std::cell::RefCell::new(motor::hash::FxHashSet::default());
+}
+
+/// The words a page may hint with before the table stops growing: a
+/// page that mints an id per row keeps its own copies past this.
+const HINT_WORDS: usize = 4096;
+
+/// One shared copy of a hint word.
+pub(crate) fn hint(word: &str) -> std::rc::Rc<str> {
+    HINTS.with(|hints| {
+        let mut hints = hints.borrow_mut();
+        if let Some(shared) = hints.get(word) {
+            return std::rc::Rc::clone(shared);
+        }
+        let shared: std::rc::Rc<str> = std::rc::Rc::from(word);
+        if hints.len() < HINT_WORDS {
+            hints.insert(std::rc::Rc::clone(&shared));
+        }
+        shared
+    })
 }

@@ -1208,6 +1208,8 @@ mod tests {
                 },
                 node(bar),
             ],
+            hints: Default::default(),
+            action: None,
         };
         let result = layout_root(&stack, 120.0, 100.0);
         assert_eq!(fills(&result.display)[0].origin, Point { x: 0.0, y: 30.0 });

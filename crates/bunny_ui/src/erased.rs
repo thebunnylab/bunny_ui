@@ -8,6 +8,7 @@
 //! app writes and the table stores, which is the same shape again. All
 //! the rest of the tree is typed.
 
+use std::any::Any;
 use std::rc::Rc;
 
 use motor::state::Context;
@@ -16,11 +17,16 @@ use crate::view::{NodeList, Single, View};
 
 pub(crate) trait ErasedDyn {
     fn render_into_dyn(&self, ctx: &Context, out: &mut NodeList);
+    fn as_any(&self) -> &dyn Any;
 }
 
 impl<V: View> ErasedDyn for V {
     fn render_into_dyn(&self, ctx: &Context, out: &mut NodeList) {
         self.render_into(ctx, out);
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -34,6 +40,12 @@ pub struct Erased(Rc<dyn ErasedDyn>);
 impl Erased {
     pub fn new<V: View<Arity = Single>>(view: V) -> Self {
         Erased(Rc::new(view))
+    }
+
+    /// The view behind the erasure, when it is a `V` — how a boundary
+    /// that runs again reads the value its last run was built from.
+    pub(crate) fn downcast_ref<V: View>(&self) -> Option<&V> {
+        self.0.as_any().downcast_ref()
     }
 }
 

@@ -717,9 +717,15 @@ pub enum LayoutNode {
     /// when truncation is on; highlight paints spans without touching the
     /// measure.
     Text {
-        content: Arc<str>,
+        /// The text — fixed, or read by the node itself (a binding).
+        content: crate::bind::TextSource,
         highlights: Option<TextHighlight>,
         truncation: Option<Truncation>,
+        /// What an `.element(…)` over the text says ([`ElementHints`]).
+        hints: ElementHints,
+        /// The action an `.on_click(…)` over the text arms: the text is
+        /// the target an [`LayoutNode::Interactive`] around it was.
+        action: Option<Rc<str>>,
     },
     /// Flexible on the main axis of the stack that contains it.
     Spacer,
@@ -759,7 +765,18 @@ pub enum LayoutNode {
     Measured { path: String, child: Box<LayoutNode> },
     /// Fills whatever the proposal gives (Rectangle).
     Fill,
-    Stack { axis: Axis, spacing: Px, align: CrossAlign, children: Vec<LayoutNode> },
+    /// `hints` are what an `.element(…)` over the stack says
+    /// ([`ElementHints`]), and `action` the one an `.on_click(…)` over
+    /// it arms — the stack is the target an [`LayoutNode::Interactive`]
+    /// around it was.
+    Stack {
+        axis: Axis,
+        spacing: Px,
+        align: CrossAlign,
+        children: Vec<LayoutNode>,
+        hints: ElementHints,
+        action: Option<Rc<str>>,
+    },
     /// A row that WRAPS (`hstack!(…).wrapping()`): the children go left to
     /// right at their own size, and a child that would pass the width the
     /// row was offered starts the next line. `spacing` separates the
@@ -926,7 +943,16 @@ pub enum LayoutNode {
     },
     /// Semantic visual property: background behind the child, border on
     /// top, foreground inherited. Transparent to the measure — by type.
-    Styled { props: Box<VisualProps>, child: Box<LayoutNode> },
+    /// `hints` are what an `.element(…)` over the style says
+    /// ([`ElementHints`]), and `action` the one an `.on_click(…)` over
+    /// it arms: the style is the target an [`LayoutNode::Interactive`]
+    /// around it was, and paints by that target's hover and press.
+    Styled {
+        props: Rc<VisualProps>,
+        child: Box<LayoutNode>,
+        hints: ElementHints,
+        action: Option<Rc<str>>,
+    },
     /// An animation scope: the nearest styled below interpolates its
     /// colors through this spring, keyed by the identity captured at
     /// render (`key` is `None` outside a pass — the scope is inert).
@@ -985,8 +1011,10 @@ pub enum LayoutNode {
     /// with the path that indexes the action registered in the
     /// reconciler. Hover and pressed do NOT live here — placement
     /// consults the env's [`FrameStamp`] by `path` (pointer state never
-    /// sticks to a tree).
-    Interactive { path: String, child: Box<LayoutNode> },
+    /// sticks to a tree). Only around a node that cannot carry the
+    /// action itself, or already carries one: a stack, a text and a
+    /// style hold their own.
+    Interactive { path: Rc<str>, child: Box<LayoutNode> },
     /// `.hover_group()` — the subtree can paint by THIS box's pointer
     /// state instead of by its own nearest target. The group is hovered
     /// while the hovered target is the group's path or anything under
@@ -995,8 +1023,11 @@ pub enum LayoutNode {
     HoverGroup { path: String, child: Box<LayoutNode> },
     /// Reference to a retained boundary (skipped by the reconciler);
     /// measure and place resolve ON-THE-FLY against the retention — the
-    /// frame's tree is never stitched into a copy.
-    BoundaryRef { path: String, slot: Rc<crate::reconciler::Slot> },
+    /// frame's tree is never stitched into a copy. `hints` are what an
+    /// `.element(…)` over the boundary says: the reference carries them
+    /// itself, where a [`LayoutNode::Hinted`] around it was a box for
+    /// every row of a list, each time the list re-ran.
+    BoundaryRef { path: Rc<str>, slot: Rc<crate::reconciler::Slot>, hints: ElementHints },
     /// `.rendering(Gpu)`: this subtree insists on the pixel pipeline.
     /// Transparent to geometry everywhere; in Dom mode it becomes a
     /// CANVAS ISLAND — an element our layout positions, filled with the
@@ -1116,10 +1147,13 @@ pub enum LayoutNode {
     /// inside its body — the door a row uses to flip its own `<tr>`
     /// class without its parent hearing. Invisible everywhere: zero
     /// size, no paint, no hit.
-    BoundaryHint { class: Option<String> },
+    BoundaryHint { class: Option<crate::bind::ClassSource> },
     /// Element hints for the Dom lowering — a real tag, a class, an
     /// id. Transparent everywhere else, like `.rendering()`: a pixel
     /// target never knows the child was ever going to be a `<tr>`.
+    /// Only around a node that cannot carry the hints itself: a stack,
+    /// a text, a style and a reference to a retained boundary hold
+    /// their own ([`ElementHints`]).
     Hinted {
         tag: Option<std::rc::Rc<str>>,
         class: Option<std::rc::Rc<str>>,
@@ -1139,6 +1173,83 @@ pub enum LayoutNode {
     /// draw command: the scene keeps the ground, the view lands on
     /// top.
     Host { path: String, spec: crate::host::HostSpec },
+}
+
+/// The element hints a node carries itself — a stack, a text, a style,
+/// a reference to a retained boundary: the nodes an `.element(…)` lands
+/// on most. They are the words a [`LayoutNode::Hinted`] around the node
+/// would hold, and as transparent: only the Dom lowering reads them, and
+/// a node that wears them lowers as the wrapper they replace did. A row
+/// of a list hints a cell, a link and a glyph in every body it runs, and
+/// a box around each was an allocation per hint per row.
+///
+/// Public in name only, like the slot beside it.
+#[derive(Clone, Debug, Default)]
+pub struct ElementHints {
+    pub(crate) tag: Option<Rc<str>>,
+    pub(crate) class: Option<Rc<str>>,
+    pub(crate) dom_id: Option<Rc<str>>,
+}
+
+impl ElementHints {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.tag.is_none() && self.class.is_none() && self.dom_id.is_none()
+    }
+}
+
+impl LayoutNode {
+    /// The hints a stack, a text or a style carries itself — `None` for
+    /// any other node. A reference to a retained boundary keeps its own,
+    /// read where the reference is.
+    pub(crate) fn carried_hints(&self) -> Option<&ElementHints> {
+        match self {
+            LayoutNode::Stack { hints, .. }
+            | LayoutNode::Text { hints, .. }
+            | LayoutNode::Styled { hints, .. } => Some(hints),
+            _ => None,
+        }
+    }
+
+    /// The same hints, to write — where an `.element(…)` folds its words
+    /// into the node instead of boxing it.
+    pub(crate) fn carried_hints_mut(&mut self) -> Option<&mut ElementHints> {
+        match self {
+            LayoutNode::Stack { hints, .. }
+            | LayoutNode::Text { hints, .. }
+            | LayoutNode::Styled { hints, .. } => Some(hints),
+            _ => None,
+        }
+    }
+
+    /// The action a stack, a text or a style carries itself — the path
+    /// an `.on_click(…)` over it registered.
+    pub(crate) fn carried_action(&self) -> Option<&Rc<str>> {
+        match self {
+            LayoutNode::Stack { action, .. }
+            | LayoutNode::Text { action, .. }
+            | LayoutNode::Styled { action, .. } => action.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The place for that action, to write — `None` for a node that
+    /// cannot carry one.
+    pub(crate) fn carried_action_mut(&mut self) -> Option<&mut Option<Rc<str>>> {
+        match self {
+            LayoutNode::Stack { action, .. }
+            | LayoutNode::Text { action, .. }
+            | LayoutNode::Styled { action, .. } => Some(action),
+            _ => None,
+        }
+    }
+
+    /// Does the node stand alone — no hints and no action of its own? A
+    /// node that carries either stood behind a wrapper once, and a
+    /// rewrite or a fold that looked for the bare node never reached it
+    /// there.
+    pub(crate) fn is_bare(&self) -> bool {
+        self.carried_hints().is_none_or(ElementHints::is_empty) && self.carried_action().is_none()
+    }
 }
 
 /// How the element lowering lays a subtree out: the browser's flow
@@ -2011,6 +2122,81 @@ impl VisualProps {
             from_group: self.from_group || outer.from_group,
         }
     }
+
+    /// One record of these props, shared: the one the last styled nodes
+    /// were given when the look is the same. The rows of a list wear a
+    /// few looks a thousand times over, and a thousand cells in one ink
+    /// hold one record of it.
+    pub(crate) fn shared(self) -> Rc<VisualProps> {
+        LOOKS.with(|looks| {
+            let mut looks = looks.borrow_mut();
+            if let Some(held) = looks.find(&self) {
+                return held;
+            }
+            let look = Rc::new(self);
+            looks.keep(&look);
+            look
+        })
+    }
+
+    /// The record of `outer` merged under the props a node holds ([`or`]:
+    /// what the node holds wins), shared like [`shared`], in the node's
+    /// own field. A chain of modifiers on one view makes its record ONCE:
+    /// the step a chain made a moment ago, worn by nothing else yet,
+    /// becomes the next step in place — a look nobody repeats costs what
+    /// a box cost.
+    ///
+    /// [`or`]: VisualProps::or
+    /// [`shared`]: VisualProps::shared
+    pub(crate) fn restyle(held: &mut Rc<VisualProps>, outer: VisualProps) {
+        let merged = (**held).or(outer);
+        LOOKS.with(|looks| {
+            let mut looks = looks.borrow_mut();
+            if let Some(look) = looks.find(&merged) {
+                *held = look;
+                return;
+            }
+            let newest = looks.newest;
+            if looks.held[newest].as_ref().is_some_and(|look| Rc::ptr_eq(look, held))
+                && Rc::strong_count(held) == 2
+            {
+                looks.held[newest] = None;
+                if let Some(props) = Rc::get_mut(held) {
+                    *props = merged;
+                    looks.held[newest] = Some(Rc::clone(held));
+                    return;
+                }
+            }
+            let look = Rc::new(merged);
+            looks.keep(&look);
+            *held = look;
+        })
+    }
+}
+
+/// How many looks the styled nodes share from: the few a row wears.
+const LOOKS_HELD: usize = 4;
+
+/// The looks the last styled nodes were given, newest at `newest`.
+#[derive(Default)]
+struct Looks {
+    held: [Option<Rc<VisualProps>>; LOOKS_HELD],
+    newest: usize,
+}
+
+impl Looks {
+    fn find(&self, props: &VisualProps) -> Option<Rc<VisualProps>> {
+        self.held.iter().flatten().find(|look| ***look == *props).cloned()
+    }
+
+    fn keep(&mut self, look: &Rc<VisualProps>) {
+        self.newest = (self.newest + 1) % LOOKS_HELD;
+        self.held[self.newest] = Some(Rc::clone(look));
+    }
+}
+
+thread_local! {
+    static LOOKS: std::cell::RefCell<Looks> = std::cell::RefCell::new(Looks::default());
 }
 
 /// Interaction state of a frame — resolved BEFORE layout and stamped into
@@ -2218,7 +2404,9 @@ impl LayoutNode {
             LayoutNode::Boundary { children, quiet, .. } => {
                 quiet.get_or_init(|| Quiet::of_all(children)).holds()
             }
-            LayoutNode::BoundaryRef { slot, .. } => slot.quiet_now(),
+            // a hinted reference answers as the wrapper it stands for
+            // did: a hint is no memory, and the placement goes ahead
+            LayoutNode::BoundaryRef { slot, hints, .. } => hints.is_empty() && slot.quiet_now(),
             _ => false,
         }
     }
@@ -4047,7 +4235,7 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
             Some(label) => {
                 let hovered = open.hovered == Some(index);
                 rows.push(LayoutNode::Styled {
-                    props: Box::new(VisualProps {
+                    props: VisualProps {
                         background: hovered.then_some(theme.accent),
                         background_hovered: Some(theme.accent),
                         foreground: if hovered {
@@ -4058,7 +4246,8 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
                         foreground_hovered: Some(Color::WHITE),
                         corner_radius: Some(Corners::all(4.0)),
                         ..VisualProps::default()
-                    }),
+                    }
+                    .shared(),
                     child: Box::new(LayoutNode::Frame {
                         width: None,
                         height: Some(MENU_ROW_H),
@@ -4076,15 +4265,21 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
                                         trailing: MENU_PAD_H,
                                     },
                                     child: Box::new(LayoutNode::Text {
-                                        content: label.clone(),
+                                        content: label.clone().into(),
                                         highlights: None,
                                         truncation: None,
+                                        hints: ElementHints::default(),
+                                        action: None,
                                     }),
                                 },
                                 LayoutNode::Spacer,
                             ],
+                            hints: ElementHints::default(),
+                            action: None,
                         }),
                     }),
+                    hints: ElementHints::default(),
+                    action: None,
                 });
             }
             None => {
@@ -4101,11 +4296,14 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
                             trailing: MENU_PAD_H,
                         },
                         child: Box::new(LayoutNode::Styled {
-                            props: Box::new(VisualProps {
+                            props: VisualProps {
                                 background: Some(theme.border),
                                 ..VisualProps::default()
-                            }),
+                            }
+                            .shared(),
                             child: Box::new(LayoutNode::Fill),
+                            hints: ElementHints::default(),
+                            action: None,
                         }),
                     }),
                 });
@@ -4114,7 +4312,7 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
     }
     let _ = env;
     LayoutNode::Styled {
-        props: Box::new(VisualProps {
+        props: VisualProps {
             background: Some(theme.panel),
             border: Some((theme.border, 1.0)),
             corner_radius: Some(Corners::all(7.0)),
@@ -4122,7 +4320,8 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
             clip: true,
             font: FontPatch { size: Some(13.0), ..FontPatch::default() },
             ..VisualProps::default()
-        }),
+        }
+        .shared(),
         child: Box::new(LayoutNode::Padding {
             edges: Edges {
                 top: MENU_PAD_V,
@@ -4135,8 +4334,12 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
                 spacing: 0.0,
                 align: CrossAlign::Start,
                 children: rows,
+                hints: ElementHints::default(),
+                action: None,
             }),
         }),
+        hints: ElementHints::default(),
+        action: None,
     }
 }
 
@@ -4176,22 +4379,27 @@ fn menu_frame(at: Point, size: Size, container: Rect) -> Rect {
 fn tooltip_node(text: Arc<str>) -> LayoutNode {
     let theme = crate::theme::current();
     LayoutNode::Styled {
-        props: Box::new(VisualProps {
+        props: VisualProps {
             background: Some(Color { a: 242, ..theme.fg }),
             foreground: Some(theme.canvas),
             corner_radius: Some(Corners::all(5.0)),
             shadow: Some((10.0, Color { r: 0, g: 0, b: 0, a: 90 })),
             font: FontPatch { size: Some(11.0), ..FontPatch::default() },
             ..VisualProps::default()
-        }),
+        }
+        .shared(),
         child: Box::new(LayoutNode::Padding {
             edges: Edges { top: 3.0, trailing: 7.0, bottom: 4.0, leading: 7.0 },
             child: Box::new(LayoutNode::Text {
-                content: text,
+                content: text.into(),
                 highlights: None,
                 truncation: None,
+                hints: ElementHints::default(),
+                action: None,
             }),
         }),
+        hints: ElementHints::default(),
+        action: None,
     }
 }
 
@@ -4428,6 +4636,13 @@ fn cover_rect(frame: Rect, intrinsic: Option<(u32, u32)>) -> Option<Rect> {
 }
 
 impl LayoutNode {
+    /// A boundary is as flexible as its one child — and a reference to a
+    /// retained boundary answers what its tree answers, so the lowering
+    /// that keeps the answer with a group asks here too.
+    pub(crate) fn boundary_is_flexible(children: &[LayoutNode], axis: Axis, enclosing_main: Option<Axis>) -> bool {
+        children.len() == 1 && children[0].is_flexible(axis, enclosing_main)
+    }
+
     /// Flexible = wants the leftover space on the axis (the basis of
     /// stack distribution). Explicit priority, never a side effect of
     /// overflow.
@@ -4519,9 +4734,7 @@ impl LayoutNode {
             LayoutNode::Layered { children, .. } => {
                 children.iter().any(|child| child.is_flexible(axis, enclosing_main))
             }
-            LayoutNode::Boundary { children, .. } => {
-                children.len() == 1 && children[0].is_flexible(axis, enclosing_main)
-            }
+            LayoutNode::Boundary { children, .. } => Self::boundary_is_flexible(children, axis, enclosing_main),
             // a probe is not a box: it answers for its child in every
             // direction, or measuring a view would change it
             LayoutNode::Measured { child, .. } => child.is_flexible(axis, enclosing_main),
@@ -4550,13 +4763,14 @@ impl LayoutNode {
     fn first_baseline(&self, env: &LayoutEnv<'_>) -> Option<Px> {
         match self {
             LayoutNode::Text { content, .. } => {
-                Some(env.cache.get_or_measure(content, &env.font, env.text).ascent)
+                let content = content.get();
+                Some(env.cache.get_or_measure(&content, &env.font, env.text).ascent)
             }
             LayoutNode::Field { .. } => {
                 let metrics = env.cache.get_or_measure("0", &env.font, env.text);
                 Some(FIELD_PAD_V + metrics.ascent)
             }
-            LayoutNode::Styled { props, child } => {
+            LayoutNode::Styled { props, child, .. } => {
                 let env = LayoutEnv {
                     font: props.font.apply_over(env.font),
                     line_height: props.line_height.or(env.line_height),
@@ -4608,7 +4822,8 @@ impl LayoutNode {
     pub(crate) fn measure(&self, proposal: Proposal, env: &LayoutEnv<'_>) -> (Size, Fit) {
         match self {
             LayoutNode::Text { content, truncation, .. } => {
-                let metrics = env.cache.get_or_measure(content, &env.font, env.text);
+                let content = content.get();
+                let metrics = env.cache.get_or_measure(&content, &env.font, env.text);
                 let natural = metrics.width;
                 // the line box a paragraph steps by: the face's own box,
                 // or the inherited `.line_height(…)` when one is set. With
@@ -4623,7 +4838,7 @@ impl LayoutNode {
                             Size { width, height: advance }
                         } else {
                             let lines =
-                                env.cache.get_or_break(content, &env.font, width, env.text);
+                                env.cache.get_or_break(&content, &env.font, width, env.text);
                             // A paragraph told how tall it may be answers
                             // that, not what it wishes it were. Answering
                             // the wish is what put a card's text over the
@@ -5114,7 +5329,7 @@ impl LayoutNode {
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
-            LayoutNode::Styled { props, child } => {
+            LayoutNode::Styled { props, child, .. } => {
                 // the inherited font swaps HERE, at measure time — the
                 // sanctioned VisualProps exception (font changes measure)
                 let env = LayoutEnv {
@@ -5174,7 +5389,7 @@ impl LayoutNode {
             // the same question every frame. A body that re-runs makes a
             // new entry (no kept answer), and clears the answers of the
             // boundaries above it, whose size may hang on its own.
-            LayoutNode::BoundaryRef { path, slot } => {
+            LayoutNode::BoundaryRef { path, slot, .. } => {
                 let key = MeasureKey { proposal, font: env.font, line_height: env.line_height };
                 crate::reconciler::measure_retained(slot, path, key, |node| node.measure(proposal, env))
             }
@@ -5182,9 +5397,22 @@ impl LayoutNode {
     }
 
     pub(crate) fn place(&self, frame: Rect, fit: &Fit, env: &LayoutEnv<'_>, out: &mut Placement) {
+        // a stack, a text or a style that carries its action is the
+        // target an `Interactive` around it was, at its own frame
+        match self.carried_action() {
+            Some(path) => {
+                place_target(path, frame, env, out, |out| self.place_node(frame, fit, env, out));
+            }
+            None => self.place_node(frame, fit, env, out),
+        }
+    }
+
+    /// The node itself, its own action aside.
+    fn place_node(&self, frame: Rect, fit: &Fit, env: &LayoutEnv<'_>, out: &mut Placement) {
         match (self, fit.unshared()) {
             // visual leaves: the draw list is born here
-            (LayoutNode::Text { content, highlights, truncation }, Fit::Leaf) => {
+            (LayoutNode::Text { content, highlights, truncation, .. }, Fit::Leaf) => {
+                let content = content.get();
                 let color = out.foreground.last().copied().unwrap_or_else(|| crate::theme::current().fg);
                 if let Some(dom) = out.dom.as_mut() {
                     // the WHOLE content, unwrapped: the browser re-breaks
@@ -5197,18 +5425,19 @@ impl LayoutNode {
                             // hover ink is open above this leaf
                             inherits_ink: false,
                             font: env.font,
-                            line_height: env.line_height,
+                            line_height: env.line_height.map(|height| height as f32),
                             text_align: env.text_align,
                             highlights: highlights
                                 .as_ref()
                                 .map(|h| (Rc::clone(&h.ranges), h.color)),
                             truncation: *truncation,
+                            inherits_face: false,
                         }),
                         frame,
                     );
                 }
                 place_text(
-                    content,
+                    &content,
                     highlights.as_ref(),
                     *truncation,
                     frame,
@@ -5274,7 +5503,7 @@ impl LayoutNode {
                         .unwrap_or(theme.fg);
                     if let Some(dom) = out.dom.as_mut() {
                         dom.leaf_styled(
-                            crate::dom::DomKind::Field(crate::dom::DomField {
+                            crate::dom::DomKind::Field(Box::new(crate::dom::DomField {
                                 path: path.clone(),
                                 content: content.clone(),
                                 placeholder: placeholder.clone(),
@@ -5282,19 +5511,19 @@ impl LayoutNode {
                                 color,
                                 multiline,
                                 secret,
-                            }),
+                            })),
                             frame,
                             // a bare field carries no ground, no edge
                             // and no rounding here either — the caller's
                             // own box is what shows
-                            crate::dom::DomStyle {
+                            crate::dom::DomLook {
                                 background: (!*bare).then_some(theme.field),
                                 border: (!*bare).then_some((theme.field_border, 1.0)),
                                 corner_radius: (!*bare)
                                     .then_some(Corners::all(FIELD_RADIUS)),
                                 focus_border: (!*bare).then_some(theme.focus),
                                 placeholder_color: Some(theme.placeholder),
-                                ..crate::dom::DomStyle::default()
+                                ..crate::dom::DomLook::default()
                             },
                         );
                     }
@@ -5518,7 +5747,7 @@ impl LayoutNode {
                     None => Some(frame),
                 };
                 if let Some(visible) = visible {
-                    out.hits.push((path.clone(), visible));
+                    out.hits.push((path.to_string(), visible));
                 }
                 out.fields.push(FieldPlacement {
                     path: path.clone(),
@@ -5598,7 +5827,7 @@ impl LayoutNode {
                         frame.intersection(clip)
                     });
                     visible.map(|visible| {
-                        out.hits.push((path.clone(), visible));
+                        out.hits.push((path.to_string(), visible));
                         out.customs.push(CustomPlacement {
                             path: path.clone(),
                             frame,
@@ -6006,10 +6235,10 @@ impl LayoutNode {
                             dom.leaf_styled(
                                 crate::dom::DomKind::Box,
                                 frame,
-                                crate::dom::DomStyle {
+                                crate::dom::DomLook {
                                     border: Some((accent, 2.0)),
                                     corner_radius: Some(Corners::all(6.0)),
-                                    ..crate::dom::DomStyle::default()
+                                    ..crate::dom::DomLook::default()
                                 },
                             );
                         }
@@ -6106,7 +6335,7 @@ impl LayoutNode {
                 }
             }
 
-            (LayoutNode::Stack { axis, spacing, align, children }, Fit::Children(fits)) => {
+            (LayoutNode::Stack { axis, spacing, align, children, .. }, Fit::Children(fits)) => {
                 place_stack(*axis, *spacing, *align, children, frame, fits, env, out);
             }
 
@@ -6411,7 +6640,7 @@ impl LayoutNode {
                 out.pop_clip();
             }
 
-            (LayoutNode::Styled { props, child }, Fit::Wrapped(_, fit)) => {
+            (LayoutNode::Styled { props, child, .. }, Fit::Wrapped(_, fit)) => {
                 // the nearest styled EATS the color scope: its colors
                 // move, deeper styled nodes paint plain (no shared-key
                 // thrash between siblings of one scope)
@@ -6670,39 +6899,8 @@ impl LayoutNode {
                 out.groups.pop();
             }
 
-            (LayoutNode::Interactive { path, child }, Fit::Wrapped(size, fit)) => {
-                let _ = size;
-                // outside the viewport the hit does NOT exist; a
-                // half-visible row clicks only on its visible part (the
-                // recorded rect is the intersection with the current clip)
-                let visible = match out.current_clip() {
-                    Some(clip) => frame.intersection(clip),
-                    None => Some(frame),
-                };
-                let hit_index = visible.map(|visible| {
-                    out.hits.push((path.clone(), visible));
-                    out.hits.len() - 1
-                });
-                out.pointer_hit.push(hit_index);
-                // hover/pressed from the env's STAMP; VISUAL pressed only
-                // with the pointer inside the target (AppKit semantics:
-                // dragging out releases, coming back re-arms)
-                let hovered =
-                    env.stamp.interaction.hovered.as_deref() == Some(path.as_str());
-                let pressed = hovered
-                    && env.stamp.interaction.pressed.as_deref() == Some(path.as_str());
-                out.pointer.push((hovered, pressed));
-                if let Some(dom) = out.dom.as_mut() {
-                    // the styled below takes the path: the glue posts
-                    // clicks with it and scopes `:hover` to the element
-                    dom.arm_interactive(path);
-                }
-                child.place(frame, fit, env, out);
-                if let Some(dom) = out.dom.as_mut() {
-                    dom.disarm();
-                }
-                out.pointer.pop();
-                out.pointer_hit.pop();
+            (LayoutNode::Interactive { path, child }, Fit::Wrapped(_, fit)) => {
+                place_target(path, frame, env, out, |out| child.place(frame, fit, env, out));
             }
 
             (
@@ -7736,6 +7934,48 @@ fn draw_scrollbar_h(
     }
 }
 
+/// A target's placement around what it places: its frame enters the
+/// hit-test, and what is painted inside reads its hover and press. An
+/// `Interactive` places its child inside; a stack, a text or a style
+/// that carries its action places itself.
+fn place_target(
+    path: &Rc<str>,
+    frame: Rect,
+    env: &LayoutEnv<'_>,
+    out: &mut Placement,
+    place: impl FnOnce(&mut Placement),
+) {
+    // outside the viewport the hit does NOT exist; a
+    // half-visible row clicks only on its visible part (the
+    // recorded rect is the intersection with the current clip)
+    let visible = match out.current_clip() {
+        Some(clip) => frame.intersection(clip),
+        None => Some(frame),
+    };
+    let hit_index = visible.map(|visible| {
+        out.hits.push((path.to_string(), visible));
+        out.hits.len() - 1
+    });
+    out.pointer_hit.push(hit_index);
+    // hover/pressed from the env's STAMP; VISUAL pressed only
+    // with the pointer inside the target (AppKit semantics:
+    // dragging out releases, coming back re-arms)
+    let hovered = env.stamp.interaction.hovered.as_deref() == Some(&**path);
+    let pressed = hovered && env.stamp.interaction.pressed.as_deref() == Some(&**path);
+    out.pointer.push((hovered, pressed));
+    if let Some(dom) = out.dom.as_mut() {
+        // the styled below takes the path: the glue posts
+        // clicks with it and scopes `:hover` to the element
+        dom.arm_interactive(path);
+    }
+    place(out);
+    if let Some(dom) = out.dom.as_mut() {
+        dom.disarm();
+    }
+    out.pointer.pop();
+    out.pointer_hit.pop();
+}
+
 #[allow(clippy::too_many_arguments)]
 fn place_stack(
     axis: Axis,
@@ -7811,7 +8051,7 @@ mod tests {
     use super::*;
 
     fn text(chars: usize) -> LayoutNode {
-        LayoutNode::Text { content: Arc::from("x".repeat(chars)), highlights: None, truncation: None }
+        LayoutNode::Text { content: crate::bind::TextSource::from("x".repeat(chars)), highlights: None, truncation: None, hints: ElementHints::default(), action: None }
     }
 
     fn boundary(path: &str, child: LayoutNode) -> LayoutNode {
@@ -7887,6 +8127,8 @@ mod tests {
                 boundary("gap", LayoutNode::Spacer),
                 boundary("bottom", text(5)),
             ],
+            hints: ElementHints::default(),
+            action: None,
         };
         let result = layout(&root, Proposal { width: Some(200.0), height: Some(100.0) });
 
@@ -7921,6 +8163,8 @@ mod tests {
             spacing: 0.0,
             align: CrossAlign::Center,
             children: vec![rail, boundary("body", LayoutNode::Fill)],
+            hints: ElementHints::default(),
+            action: None,
         };
         let result = layout(&row, Proposal { width: Some(1280.0), height: Some(174.0) });
 
@@ -7965,6 +8209,8 @@ mod tests {
             spacing: 0.0,
             align: CrossAlign::Center,
             children: vec![bar, body],
+            hints: ElementHints::default(),
+            action: None,
         };
         let result = layout(&column, Proposal { width: Some(500.0), height: Some(800.0) });
 
@@ -8031,6 +8277,8 @@ mod tests {
                 boundary("body", LayoutNode::Spacer),
                 capped("foot", 26.0),
             ],
+            hints: ElementHints::default(),
+            action: None,
         };
         let result = layout(&root, Proposal { width: Some(1280.0), height: Some(800.0) });
 
@@ -8071,6 +8319,8 @@ mod tests {
                 ),
                 boundary("editor", LayoutNode::Spacer),
             ],
+            hints: ElementHints::default(),
+            action: None,
         };
         let result = layout(&root, Proposal { width: Some(1200.0), height: Some(700.0) });
 
@@ -8092,6 +8342,8 @@ mod tests {
             spacing: 0.0,
             align: CrossAlign::Center,
             children,
+            hints: ElementHints::default(),
+            action: None,
         };
         let bar = row(vec![
             boundary("lead", row(vec![leaf(300.0), LayoutNode::Spacer])),
@@ -8150,6 +8402,8 @@ mod tests {
                 ),
                 boundary("rest", LayoutNode::Spacer),
             ],
+            hints: ElementHints::default(),
+            action: None,
         };
         let result = layout(&root, Proposal { width: Some(500.0), height: Some(100.0) });
         assert_eq!(result.frames.get("lane").unwrap().size.width, 300.0);
@@ -8219,6 +8473,8 @@ mod tests {
                     boundary("chips", chips(&[110.0, 130.0, 90.0])),
                     boundary("below", LayoutNode::Leaf { size: Size { width: 60.0, height: 16.0 } }),
                 ],
+                hints: ElementHints::default(),
+                action: None,
             }),
         };
         let result = layout(&rail, Proposal { width: Some(800.0), height: Some(600.0) });
@@ -8259,6 +8515,8 @@ mod tests {
                     },
                 ),
             ],
+            hints: ElementHints::default(),
+            action: None,
         };
         let width_of = |result: &LayoutResult, name: &str| result.frames.get(name).unwrap().size.width;
 
@@ -8316,6 +8574,8 @@ mod tests {
                 LayoutNode::Leaf { size: Size { width: 40.0, height: 20.0 } },
                 child,
             ],
+            hints: ElementHints::default(),
+            action: None,
         };
         let bare = row(LayoutNode::Spacer);
         assert!(bare.is_flexible(Axis::Horizontal, None), "the row spreads sideways");
@@ -8339,6 +8599,8 @@ mod tests {
             spacing: 0.0,
             align: CrossAlign::Center,
             children: vec![LayoutNode::Spacer],
+            hints: ElementHints::default(),
+            action: None,
         };
         assert!(column.is_flexible(Axis::Vertical, None));
         assert!(!column.is_flexible(Axis::Horizontal, None));
@@ -8656,6 +8918,8 @@ mod tests {
                     },
                 ),
             ],
+            hints: ElementHints::default(),
+            action: None,
         };
         let result = layout(&root, Proposal { width: Some(400.0), height: Some(300.0) });
 
@@ -8887,7 +9151,7 @@ mod tests {
 
     #[test]
     fn words_wrap_at_spaces_never_mid_word() {
-        let node = LayoutNode::Text { content: Arc::from("aa bb cc"), highlights: None, truncation: None };
+        let node = LayoutNode::Text { content: crate::bind::TextSource::from("aa bb cc"), highlights: None, truncation: None, hints: ElementHints::default(), action: None };
         let result = layout(&node, Proposal { width: Some(40.0), height: None });
 
         // "aa bb" (40px) fits; "cc" goes down whole — never an orphan "c"
@@ -8907,9 +9171,11 @@ mod tests {
     fn highlight_splits_the_line_into_colored_runs() {
         let hot = Color::hex(0xFF0000);
         let node = LayoutNode::Text {
-            content: Arc::from("abcdef"),
+            content: crate::bind::TextSource::from("abcdef"),
             highlights: Some(TextHighlight { ranges: Rc::new(vec![(2, 4)]), color: hot }),
             truncation: None,
+            hints: ElementHints::default(),
+            action: None,
         };
         let result = layout(&node, Proposal::unspecified());
 
@@ -8940,12 +9206,14 @@ mod tests {
         // "aa bb cc" at 40px breaks into "aa bb " + "cc"; the ranges
         // cover the "bb" (line 1) and the "cc" (line 2)
         let node = LayoutNode::Text {
-            content: Arc::from("aa bb cc"),
+            content: crate::bind::TextSource::from("aa bb cc"),
             highlights: Some(TextHighlight {
                 ranges: Rc::new(vec![(3, 5), (6, 8)]),
                 color: hot,
             }),
             truncation: None,
+            hints: ElementHints::default(),
+            action: None,
         };
         let result = layout(&node, Proposal::exact(Size { width: 40.0, height: 100.0 }));
 
@@ -8973,9 +9241,11 @@ mod tests {
     fn truncation_places_the_ellipsis_where_asked() {
         let truncated = |mode: Truncation| {
             let node = LayoutNode::Text {
-                content: Arc::from("abcdefgh"),
+                content: crate::bind::TextSource::from("abcdefgh"),
                 highlights: None,
                 truncation: Some(mode),
+                hints: ElementHints::default(),
+                action: None,
             };
             let result = layout(&node, Proposal { width: Some(40.0), height: None });
             assert_eq!(result.size.height, LINE_H, "truncation never wraps a line");
@@ -8996,7 +9266,7 @@ mod tests {
 
     #[test]
     fn a_word_longer_than_the_line_hard_breaks() {
-        let node = LayoutNode::Text { content: Arc::from("aaaaaaaaaa"), highlights: None, truncation: None };
+        let node = LayoutNode::Text { content: crate::bind::TextSource::from("aaaaaaaaaa"), highlights: None, truncation: None, hints: ElementHints::default(), action: None };
         let result = layout(&node, Proposal { width: Some(40.0), height: None });
 
         // 10 chars of 8px in 40px: 5 per line
@@ -9013,7 +9283,7 @@ mod tests {
     }
 
     fn styled(props: VisualProps, child: LayoutNode) -> LayoutNode {
-        LayoutNode::Styled { props: Box::new(props), child: Box::new(child) }
+        LayoutNode::Styled { props: Rc::new(props), child: Box::new(child), hints: ElementHints::default(), action: None }
     }
 
     fn rows(count: usize) -> LayoutNode {
@@ -9024,6 +9294,8 @@ mod tests {
             children: (0..count)
                 .map(|index| boundary(&format!("row{index}"), text(4)))
                 .collect(),
+            hints: ElementHints::default(),
+            action: None,
         }
     }
 
@@ -9127,6 +9399,8 @@ mod tests {
                 LayoutNode::Leaf { size: Size { width: 100.0, height: 50.0 } },
                 host("pane"),
             ],
+            hints: ElementHints::default(),
+            action: None,
         };
         let result = layout(&root, Proposal { width: Some(300.0), height: Some(200.0) });
         let placed = &result.hosts[0];
@@ -9282,7 +9556,7 @@ mod tests {
     #[test]
     fn hits_outside_the_viewport_do_not_exist() {
         let interactive = |path: &str| LayoutNode::Interactive {
-            path: path.to_string(),
+            path: Rc::from(path),
             child: Box::new(text(4)),
         };
         let root = LayoutNode::Scroll {
@@ -9300,6 +9574,8 @@ mod tests {
                     interactive("half"),    // y [16, 32) — the viewport cuts at 24
                     interactive("outside"), // y [32, 48) — invisible
                 ],
+                hints: ElementHints::default(),
+                action: None,
             }),
         };
         let result = layout(&root, Proposal::exact(Size { width: 100.0, height: 24.0 }));
@@ -9413,6 +9689,8 @@ mod tests {
                         text(3),
                     ),
                 ],
+                hints: ElementHints::default(),
+                action: None,
             },
         );
         let result = layout(&root, Proposal::unspecified());
@@ -9434,7 +9712,7 @@ mod tests {
         // different stamps must give identical frames (the LAW, now by
         // type)
         let node = LayoutNode::Interactive {
-            path: "button".to_string(),
+            path: Rc::from("button"),
             child: Box::new(styled(
                 VisualProps {
                     background: Some(Color::hex(0x111111)),
@@ -9470,10 +9748,48 @@ mod tests {
         assert_eq!(background(&hot), Color::hex(0x222222));
     }
 
+    /// A style that carries its action is the target an `Interactive`
+    /// around it was: the same hit at the same frame, and the same paint
+    /// idle, hovered and pressed.
+    #[test]
+    fn a_style_that_carries_its_action_is_the_target_around_it() {
+        let props = VisualProps {
+            background: Some(Color::hex(0x111111)),
+            background_hovered: Some(Color::hex(0x222222)),
+            background_pressed: Some(Color::hex(0x333333)),
+            ..VisualProps::default()
+        };
+        let wrapped = LayoutNode::Interactive {
+            path: Rc::from("button"),
+            child: Box::new(styled(props, text(3))),
+        };
+        let carried = LayoutNode::Styled {
+            props: Rc::new(props),
+            child: Box::new(text(3)),
+            hints: ElementHints::default(),
+            action: Some(Rc::from("button")),
+        };
+        let states = [
+            Interaction::default(),
+            Interaction { hovered: Some("button".to_string()), ..Interaction::default() },
+            Interaction {
+                hovered: Some("button".to_string()),
+                pressed: Some("button".to_string()),
+                ..Interaction::default()
+            },
+        ];
+        for state in &states {
+            let a = layout_with_pointer(&wrapped, Proposal::unspecified(), state);
+            let b = layout_with_pointer(&carried, Proposal::unspecified(), state);
+            assert_eq!(a.hits, b.hits, "the same target");
+            assert_eq!(format!("{:?}", a.display), format!("{:?}", b.display), "the same paint");
+        }
+    }
+
     #[test]
     fn pressed_beats_hovered() {
         let root = LayoutNode::Interactive {
-            path: "button".to_string(),
+            path: Rc::from("button"),
             child: Box::new(styled(
                 VisualProps {
                     background: Some(Color::hex(0x111111)),

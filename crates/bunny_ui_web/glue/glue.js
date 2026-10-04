@@ -20,11 +20,13 @@ function painter() {
 // the key table, the modifier bits, the import/export surface. The
 // wasm exports its own number; boot compares the two and refuses a
 // pairing this mirror was not written for.
-const EXPECTED_ABI = 11;
+const EXPECTED_ABI = 17;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default.
 const WASM_URL = window.BUNNY_WASM || "finder_web.wasm";
+// The entry export, the same door the element glue has.
+const START_EXPORT = window.BUNNY_START || "start";
 
 let wasm = null;
 let frameArmed = false;
@@ -201,6 +203,10 @@ const imports = {
     js_set_cursor(kind) {
       host.style.cursor = CURSORS[kind >>> 0] || "default";
     },
+    // the page's clock, for the engine's stage timers
+    js_now() {
+      return performance.now();
+    },
     js_blit(pointer, width, height) {
       const context = painter();
       if (paintCanvas.width !== width || paintCanvas.height !== height) {
@@ -232,7 +238,7 @@ const imports = {
     // dom-mode imports — the single binary carries both shells, and
     // this page only ever drives the canvas one
     js_apply_patches() {},
-    js_island() {},
+    js_island_rect() {},
     // A panic on its way out of wasm: decode the message and log it, so
     // an abort is a sentence instead of `unreachable` and a stack of
     // numbers.
@@ -507,6 +513,15 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     wasm = instance.exports;
     window.__bunny = wasm;
     if (typeof gpuAttach === "function") gpuAttach(wasm);
+    // probe builds: the hit table of the last layout, for a runner
+    // that clicks what a page without elements cannot select
+    if (wasm.bunny_hits_json && wasm.bunny_probe_ptr) {
+      window.__bunnyHits = () => {
+        const len = wasm.bunny_hits_json() >>> 0;
+        const ptr = wasm.bunny_probe_ptr() >>> 0;
+        return JSON.parse(new TextDecoder().decode(new Uint8Array(wasm.memory.buffer, ptr, len)));
+      };
+    }
     // the ABI gate: a missing export counts as version 0
     const abi = wasm.bunny_abi_version ? wasm.bunny_abi_version() >>> 0 : 0;
     if (abi !== EXPECTED_ABI) {
@@ -527,7 +542,7 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     const scale = window.devicePixelRatio || 1;
     const rect = host.getBoundingClientRect();
     let lastBox = [rect.width, rect.height, scale];
-    wasm.start(rect.width, rect.height, scale);
+    wasm[START_EXPORT](rect.width, rect.height, scale);
 
     // The box follows the page — the host's own size, and the screen's
     // ratio — so a phone that turns lays the scene out again.

@@ -81,11 +81,26 @@ unsafe extern "C" {
     /// little-endian ABI of `bunny_ui::dom::encode`) and mutates the
     /// element tree.
     fn js_apply_patches(pointer: *const u8, len: usize);
-    /// Dom mode: fresh pixels for one canvas island (physical size).
-    fn js_island(id: u32, pointer: *const u8, width: u32, height: u32);
+    /// Dom mode: the pixels of the rect that changed inside one canvas
+    /// island — the island's box (physical size, the canvas's), then
+    /// the rect's place and size inside it; `pointer` holds the rect's
+    /// pixels, straight RGBA, row by row.
+    fn js_island_rect(
+        id: u32,
+        pointer: *const u8,
+        width: u32,
+        height: u32,
+        x: u32,
+        y: u32,
+        dirty_width: u32,
+        dirty_height: u32,
+    );
     /// A panic, on its way to the console. Without it a wasm abort is one
     /// line of `unreachable` and a stack of numbers.
     fn js_panic(pointer: *const u8, len: usize);
+    /// The page's clock, in milliseconds (`performance.now`) — the stage
+    /// timers read it when a page asks for the table (`?stats`).
+    fn js_now() -> f64;
     /// The host overlay, in three verbs — the mac's `host_place` and
     /// `host_sweep` discipline with the glue holding the elements
     /// (`docs/video.md`). `begin` opens a pass; `video` places one
@@ -118,6 +133,68 @@ unsafe extern "C" {
     );
     #[cfg(feature = "canvas")]
     fn js_host_end();
+}
+
+// MARK: - The stage table, read from the page
+
+thread_local! {
+    /// The last frame table a page took — read one number at a time
+    /// through the exports below, because a struct does not cross the
+    /// border.
+    static LAST_STATS: std::cell::Cell<bunny_ui::stats::FrameStats> =
+        const { std::cell::Cell::new(bunny_ui::stats::FrameStats::new()) };
+}
+
+fn now_ms() -> f64 {
+    unsafe { js_now() }
+}
+
+/// Installs the page's clock on the stage timers. Off by default: a
+/// timer without a clock is one branch.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_stats_enable() {
+    bunny_ui::stats::set_clock(Some(now_ms));
+}
+
+/// Takes the table accumulated since the last take, for the stage and
+/// counter reads that follow.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_stats_take() {
+    LAST_STATS.with(|last| last.set(bunny_ui::stats::take()));
+}
+
+/// Milliseconds of one stage in the taken table, by the stage's index
+/// in [`bunny_ui::stats::Stage`].
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_stats_stage(stage: u32) -> f64 {
+    LAST_STATS.with(|last| last.get().stage_ms.get(stage as usize).copied().unwrap_or(0.0))
+}
+
+/// One counter of the taken table: 0 body passes, 1 layout passes, 2
+/// display commands, 3 nodes built, 4 nodes visited, 5 subtrees
+/// reused, 6 patches, 7 wire bytes, 8 measure hits, 9 measure misses,
+/// 10 assemblies, 11 entries indexed, 12 binding updates.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_stats_counter(which: u32) -> u32 {
+    LAST_STATS.with(|last| {
+        let stats = last.get();
+        match which {
+            0 => stats.body_passes,
+            1 => stats.layout_passes,
+            2 => stats.display_commands,
+            3 => stats.capture_nodes,
+            4 => stats.diff_visited,
+            5 => stats.diff_reused,
+            6 => stats.patches,
+            7 => stats.encode_bytes,
+            8 => stats.measure_hits,
+            9 => stats.measure_misses,
+            10 => stats.assemblies,
+            11 => stats.entries_indexed,
+            12 => stats.binding_updates,
+            _ => 0,
+        }
+    })
 }
 
 /// The hosts of the last layout, told to the page: one `<video>` per
@@ -446,6 +523,11 @@ enum Event {
     Repaint,
     /// A task has something to run: a fetch came back, a callback fired.
     Wake,
+    /// The browser is idle: free what the frames removed.
+    Idle,
+    /// Probe builds: the hit table of the last layout is asked for.
+    #[cfg(feature = "probe")]
+    Hits,
     /// The glue's slow clock beat once — the tooltip ages, then shows.
     TooltipTick,
     /// A right press (the browser's contextmenu, default prevented).
@@ -711,14 +793,19 @@ pub fn start_with(
                 }
                 point_cursor(&runtime);
             }
+            // a press and a release are discrete: they draw at once and
+            // close the warm period a move may have opened — no empty
+            // beats follow a click
             Event::PointerDown { x, y, clicks, modifiers } => {
                 if runtime.pointer_clicked(x, y, clicks, modifiers) {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
+                pacer.rest();
             }
             Event::PointerUp { x, y } => {
                 let _ = runtime.pointer_released(x, y);
                 present(&runtime, &full, size, scale, &mut surface);
+                pacer.rest();
             }
             // A landing that changed nothing visible may still have put the
             // finger on the clock — a hold that may become a menu, a press
@@ -869,6 +956,12 @@ pub fn start_with(
                 present(&runtime, &full, size, scale, &mut surface);
             }
             Event::Repaint => present(&runtime, &full, size, scale, &mut surface),
+            Event::Idle => {
+                // the page is idle: free what the frames removed
+                runtime.collect_garbage();
+            }
+            #[cfg(feature = "probe")]
+            Event::Hits => probe_hits(&runtime),
             Event::Wake => {
                 // The work always lands: the tasks are polled. The FRAME is
                 // for a turn that changed something. Most wakes change
@@ -1000,12 +1093,17 @@ fn start_dom_with(
         }
         #[cfg(feature = "canvas")]
         for island in runtime.dom_islands(scale) {
+            let (x, y, dirty_width, dirty_height) = island.dirty;
             unsafe {
-                js_island(
+                js_island_rect(
                     island.id,
                     island.rgba.as_ptr(),
                     island.width as u32,
                     island.height as u32,
+                    x,
+                    y,
+                    dirty_width,
+                    dirty_height,
                 );
             }
         }
@@ -1152,12 +1250,17 @@ fn start_dom_with(
                 if moved.islands {
                     #[cfg(feature = "canvas")]
                     for island in runtime.dom_islands(scale) {
+                        let (x, y, dirty_width, dirty_height) = island.dirty;
                         unsafe {
-                            js_island(
+                            js_island_rect(
                                 island.id,
                                 island.rgba.as_ptr(),
                                 island.width as u32,
                                 island.height as u32,
+                                x,
+                                y,
+                                dirty_width,
+                                dirty_height,
                             );
                         }
                     }
@@ -1171,6 +1274,12 @@ fn start_dom_with(
                     unsafe { js_request_frame() };
                 }
             }
+            Event::Idle => {
+                // the page is idle: free what the frames removed
+                runtime.collect_garbage();
+            }
+            #[cfg(feature = "probe")]
+            Event::Hits => probe_hits(&runtime),
             // hover, wheel and the rest belong to the browser in this
             // mode — nothing to do on our side of the border
             _ => {}
@@ -1479,6 +1588,81 @@ pub extern "C" fn bunny_image_ready(_key_hi: u32, _key_lo: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_wake() {
     dispatch(Event::Wake);
+}
+
+/// The page is idle: the glue calls this after a batch that removed
+/// elements, when the browser has nothing else to do, and the engine
+/// frees the subtrees it kept — off the clock between a click and its
+/// paint.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_idle() {
+    dispatch(Event::Idle);
+}
+
+#[cfg(feature = "probe")]
+thread_local! {
+    /// The probe's last answer, kept until the page reads it.
+    static PROBE: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// The hit rectangles of the last layout and the islands' frames, as
+/// JSON, for a runner that has no elements to click — the probe's
+/// answer, written where [`bunny_hits_json`] reads it.
+#[cfg(feature = "probe")]
+fn probe_hits(runtime: &Runtime) {
+    let mut json = String::from("{\"hits\":[");
+    for (index, (path, rect)) in runtime.hits_snapshot().iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "{{\"path\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+            path.replace('\\', "\\\\").replace('"', "\\\""),
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height
+        ));
+    }
+    json.push_str("],\"islandHits\":[");
+    for (index, (island, path, rect)) in runtime.island_hits_snapshot().iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "{{\"island\":{island},\"path\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+            path.replace('\\', "\\\\").replace('"', "\\\""),
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height
+        ));
+    }
+    json.push_str("],\"islands\":[");
+    for (index, (id, x, y, w, h)) in runtime.island_frames().iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!("{{\"id\":{id},\"x\":{x},\"y\":{y},\"w\":{w},\"h\":{h}}}"));
+    }
+    json.push_str("]}");
+    PROBE.with(|probe| *probe.borrow_mut() = json);
+}
+
+/// Probe builds only: fills the hit table of the last layout as JSON
+/// and returns its length; [`bunny_probe_ptr`] is where it starts.
+#[cfg(feature = "probe")]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_hits_json() -> u32 {
+    dispatch(Event::Hits);
+    PROBE.with(|probe| probe.borrow().len() as u32)
+}
+
+/// Probe builds only: the bytes of the last probe answer.
+#[cfg(feature = "probe")]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_probe_ptr() -> *const u8 {
+    PROBE.with(|probe| probe.borrow().as_ptr())
 }
 
 /// Dom mode: the browser resolved a click to the nearest interactive

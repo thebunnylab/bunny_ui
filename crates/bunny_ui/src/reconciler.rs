@@ -43,7 +43,7 @@ use crate::text_input::{CaretState, EditCommand};
 /// framework holds no clock; it carries what the shell counted.
 pub(crate) type ClickAction = Rc<dyn Fn(u8)>;
 
-pub(crate) type ActionEntry = (String, ClickAction);
+pub(crate) type ActionEntry = (Rc<str>, ClickAction);
 
 /// What a `.on_copy` answers when ⌘C reaches it: the text of what the
 /// view has selected, or `None` when nothing is. Retained like the
@@ -165,7 +165,29 @@ pub(crate) struct Entry {
     /// The body's interactive actions — retained like the effects: a
     /// skipped view's button stays clickable.
     pub actions: Vec<ActionEntry>,
-    /// The body's `.on_copy` answers — same retention.
+    /// The registrations few bodies make ([`Rare`]) — `None` for a body
+    /// that made none of them, which is nearly every row of a list.
+    pub rare: Option<Box<Rare>>,
+    /// Where the PARENT's path segments end in the entry's own path —
+    /// the cursor seed for an isolated re-run, read against the key.
+    pub parent_segments: motor::identity::PathSeed,
+    /// Did the entry close with no retained boundary above it? Then it
+    /// stands in the live tables' top level, and it is the one place the
+    /// entry's fall has to take it out of — asked here, never searched.
+    pub top_level: bool,
+}
+
+/// The registrations a body seldom makes, kept apart from its entry.
+///
+/// An entry sits in the retention's tree by value, and the tree moves
+/// its values: a row that leaves shifts the rows after it in its node,
+/// and the node that runs short borrows from or merges with the next. A
+/// row carried nine empty lists through every one of those moves; boxed
+/// apart, they are one word, and a row that makes none of them makes no
+/// box.
+#[derive(Default)]
+pub(crate) struct Rare {
+    /// The body's `.on_copy` answers — same retention as the actions.
     pub copies: Vec<CopyEntry>,
     /// The body's field editors — same retention.
     pub editors: Vec<EditorEntry>,
@@ -189,14 +211,77 @@ pub(crate) struct Entry {
     /// context is ACTIVE while a view declaring it stays mounted, or
     /// (`.key_context_focused(name)`) while the keyboard is inside it.
     pub contexts: Vec<ContextEntry>,
-    /// The PARENT's path segments, packed — the cursor seed for an isolated
-    /// re-run.
-    pub parent_segments: motor::identity::PathSeed,
 }
 
-#[derive(Default)]
+impl Rare {
+    /// The lists a body closed with, boxed — or nothing, when it made
+    /// none of them.
+    #[allow(clippy::too_many_arguments)]
+    fn boxed(
+        copies: Vec<CopyEntry>,
+        editors: Vec<EditorEntry>,
+        splits: Vec<SplitEntry>,
+        scrolls: Vec<ScrollEntry>,
+        measures: Vec<MeasureEntry>,
+        webviews: Vec<WebviewEntry>,
+        customs: Vec<(String, bool)>,
+        handlers: Vec<HandlerEntry>,
+        contexts: Vec<ContextEntry>,
+    ) -> Option<Box<Rare>> {
+        let none = copies.is_empty()
+            && editors.is_empty()
+            && splits.is_empty()
+            && scrolls.is_empty()
+            && measures.is_empty()
+            && webviews.is_empty()
+            && customs.is_empty()
+            && handlers.is_empty()
+            && contexts.is_empty();
+        (!none).then(|| {
+            Box::new(Rare { copies, editors, splits, scrolls, measures, webviews, customs, handlers, contexts })
+        })
+    }
+}
+
+impl Entry {
+    /// The body's named-action handlers.
+    fn handlers(&self) -> &[HandlerEntry] {
+        self.rare.as_ref().map_or(&[], |rare| &rare.handlers)
+    }
+
+    /// The key contexts the body declared.
+    fn contexts(&self) -> &[ContextEntry] {
+        self.rare.as_ref().map_or(&[], |rare| &rare.contexts)
+    }
+}
+
+/// How a pass met an entry, stamped on the entry's slot: its body RAN,
+/// or the walk SKIPPED it on purpose (clean and retained). A stamp from
+/// an earlier pass reads as neither.
+#[derive(Clone, Copy)]
+struct Visit {
+    ran: u64,
+    skipped: u64,
+}
+
+impl Visit {
+    /// The stamps of the pass under way. A pass is numbered from one, so
+    /// an entry that was never met (stamped zero) is met by no pass.
+    fn now() -> Visit {
+        let pass = PASS_NO.with(Cell::get);
+        Visit { ran: pass * 2, skipped: pass * 2 + 1 }
+    }
+}
+
 struct BuildingFrame {
-    path: String,
+    path: Rc<str>,
+    /// The frame of a keyed list: the rows under it are kept by key.
+    list: bool,
+    /// A keyed list's answer to "does any dirty path lie under it?",
+    /// asked by the first row it keeps. A list that ran alone has none,
+    /// and then no row it keeps can be dirty: a thousand rows ask the
+    /// dirty set nothing instead of hashing a thousand paths into it.
+    dirt_below: Cell<Option<bool>>,
     effects: Vec<EffectFn>,
     actions: Vec<ActionEntry>,
     copies: Vec<CopyEntry>,
@@ -208,6 +293,43 @@ struct BuildingFrame {
     customs: Vec<(String, bool)>,
     handlers: Vec<HandlerEntry>,
     contexts: Vec<ContextEntry>,
+}
+
+impl BuildingFrame {
+    /// The frame of a body that begins, every list empty. Spelled out
+    /// and not defaulted: a default frame is a default PATH too, and an
+    /// empty shared string is an allocation of its own — one for every
+    /// body that ran, thrown away the moment the real path took its
+    /// place.
+    fn new(path: Rc<str>, list: bool) -> BuildingFrame {
+        BuildingFrame {
+            path,
+            list,
+            effects: Vec::new(),
+            actions: Vec::new(),
+            copies: Vec::new(),
+            editors: Vec::new(),
+            splits: Vec::new(),
+            scrolls: Vec::new(),
+            measures: Vec::new(),
+            webviews: Vec::new(),
+            customs: Vec::new(),
+            handlers: Vec::new(),
+            contexts: Vec::new(),
+            dirt_below: Cell::new(None),
+        }
+    }
+
+    /// Does a path of the dirty snapshot lie strictly under this frame?
+    /// Asked once per frame: the snapshot does not move during a pass.
+    fn has_dirt_below(&self, dirty: &HashSet<String>) -> bool {
+        if let Some(known) = self.dirt_below.get() {
+            return known;
+        }
+        let below = dirty.iter().any(|path| path.len() > self.path.len() && covers(&self.path, path));
+        self.dirt_below.set(Some(below));
+        below
+    }
 }
 
 #[derive(Default)]
@@ -231,17 +353,351 @@ struct PassState {
     root_handlers: Vec<HandlerEntry>,
     root_contexts: Vec<ContextEntry>,
     /// Instrumentation: bodies that ran in this pass.
-    body_runs: Vec<String>,
-    /// Boundaries SKIPPED in this pass — a skipped one's subtree
-    /// survives the entry sweep (the walk stayed out on purpose).
-    skipped: Vec<String>,
+    body_runs: Vec<Rc<str>>,
+    /// The runs that began with no body open around them — the subtrees
+    /// the entry sweep reads. Known when they begin, never searched for.
+    outermost: Vec<Rc<str>>,
 }
 
 thread_local! {
-    static RETAINED: RefCell<BTreeMap<String, Entry>> = const { RefCell::new(BTreeMap::new()) };
+    /// Every retained boundary by path. The tree holds each entry by its
+    /// box: a node shifts, lends and merges its values at every row that
+    /// mounts or leaves, and a value a word wide moves for nothing.
+    static RETAINED: RefCell<BTreeMap<Rc<str>, Box<Entry>>> = const { RefCell::new(BTreeMap::new()) };
     static PASS: RefCell<PassState> = RefCell::new(PassState::default());
-    static LAST_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    static FRAME_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// The passes, counted: the number the entries are stamped with
+    /// ([`Visit`]). It never goes back, so no stamp is ever met twice.
+    static PASS_NO: Cell<u64> = const { Cell::new(0) };
+    static LAST_BODY_RUNS: RefCell<Vec<Rc<str>>> = const { RefCell::new(Vec::new()) };
+    /// Every body that ran since the frame last drained them — the
+    /// pass's own paths, shared: a thousand rows that mount are a
+    /// thousand counts, not a thousand copies.
+    static FRAME_BODY_RUNS: RefCell<Vec<Rc<str>>> = const { RefCell::new(Vec::new()) };
+    static LIVE: RefCell<Live> = RefCell::new(Live::default());
+}
+
+// MARK: - The live registry
+
+/// The tables the input doors read, kept TRUE at every change of the
+/// retention instead of rebuilt from it.
+///
+/// A registration enters the retention when a body closes its entry
+/// and leaves it when the entry falls — and those are the only two
+/// moments these tables move. A body that runs in a list of a thousand
+/// used to make every pass walk the thousand entries ten times over to
+/// rebuild what one entry had changed; now the entry's own keys go in
+/// and out, and a pass that ran one body pays for one body.
+///
+/// Paths are unique across every scene on the thread, so the maps hold
+/// all scenes at once. A door that LOOKS UP a path reads them directly;
+/// a door that ENUMERATES (an input by its name, the handles with
+/// commands) keeps to the scene the tables answer for.
+///
+/// Two tables are DERIVED, not kept: the named-action handlers (the
+/// deepest registration wins) and the key contexts (sorted outermost
+/// first). They rebuild only when an entry that carries one is indexed
+/// or dropped — a generation number per kind says when — and from the
+/// entries that carry one, never from the whole retention.
+///
+/// One table lags on purpose: the click keys of an entry that LEFT stay
+/// until the idle takes them out ([`collect_garbage`]), because a
+/// thousand rows that leave are two thousand keys hashed out of it in the
+/// click that let them go. Until then each one still names its owner, and
+/// a key whose owner left fires nothing ([`Live::click`]).
+#[derive(Default)]
+struct Live {
+    actions: HashMap<Rc<str>, Registered>,
+    copies: HashMap<String, CopyFn>,
+    editors: HashMap<String, EditorFn>,
+    splits: HashMap<String, SplitFn>,
+    scrolls: HashMap<String, ScrollFn>,
+    measures: HashMap<String, MeasureFn>,
+    webviews: HashMap<String, WebviewHooks>,
+    /// The app's boxes on screen — paths only.
+    customs: HashSet<String>,
+    /// The subset that answers `accepts_keys` — who may HOLD the
+    /// keyboard, as opposed to who is merely on screen.
+    keyed_customs: HashSet<String>,
+    /// How many action keys are `.on_hover` registrations — a scene with
+    /// none pays nothing for the hover road.
+    hover_keys: usize,
+    /// How many click keys of entries that left still stand in the
+    /// table, for the idle to take out — none, and the idle has nothing
+    /// to look for.
+    buried_actions: usize,
+    /// The entries that carry handlers, contexts and effects: the three
+    /// derived products rebuild from these alone.
+    handler_entries: HashSet<String>,
+    context_entries: HashSet<String>,
+    effect_entries: HashSet<String>,
+    /// Moves when an entry carrying a handler is indexed or dropped.
+    handler_gen: u64,
+    /// The same, for key contexts.
+    context_gen: u64,
+    /// The same, for effects.
+    effect_gen: u64,
+    /// The keys the ROOT REGION of the last assembly put into the maps.
+    /// Those registrations live for one pass: the next assembly takes
+    /// them out before it puts the new region's in.
+    root_keys: RootKeys,
+    /// Entries with no retained boundary above them — the ones only the
+    /// root region mounts, and so the only ones the root region can
+    /// unmount. The sweep reads this instead of searching for them.
+    top_level: HashSet<String>,
+    /// Every retained boundary's slot, by the path the retention keys it
+    /// by (the same shared copy). The retention's own tree is ordered for
+    /// the sweeps' ranges, and a point lookup in it descends a tree of
+    /// long strings that share their whole head: a thousand kept rows
+    /// were a thousand descents, each a score of string compares, and the
+    /// first cost of a list that re-ran. A decision, a reference's slot
+    /// and a "still there?" hash the path once here instead.
+    slots: HashMap<Rc<str>, Rc<Slot>>,
+}
+
+#[derive(Default)]
+struct RootKeys {
+    actions: Vec<String>,
+    copies: Vec<String>,
+    editors: Vec<String>,
+    splits: Vec<String>,
+    scrolls: Vec<String>,
+    measures: Vec<String>,
+    webviews: Vec<String>,
+    customs: Vec<String>,
+}
+
+/// A click key's registration: what it fires, and whose it is.
+struct Registered {
+    action: ClickAction,
+    /// The slot of the boundary whose body registered it — as old as the
+    /// boundary's stay in the retention: a body that re-runs keeps it and
+    /// replaces its registrations, one that leaves marks it left, and the
+    /// boundary that mounts at the same path afterwards gets a slot of its
+    /// own. `None` for the root region, whose keys leave at the next
+    /// assembly.
+    owner: Option<Rc<Slot>>,
+}
+
+impl Registered {
+    /// Does the registration still belong to a retained entry?
+    fn is_live(&self) -> bool {
+        self.owner.as_ref().is_none_or(|slot| !slot.left.get())
+    }
+}
+
+impl Live {
+    fn insert_action(&mut self, key: Rc<str>, action: ClickAction, owner: Option<Rc<Slot>>) {
+        let hover = key.ends_with(HOVER_KEY);
+        if self.actions.insert(key, Registered { action, owner }).is_none() && hover {
+            self.hover_keys += 1;
+        }
+    }
+
+    fn remove_action(&mut self, key: &str) {
+        if self.actions.remove(key).is_some() && key.ends_with(HOVER_KEY) {
+            self.hover_keys -= 1;
+        }
+    }
+
+    /// What a click at `key` fires — nothing when the key's owner left
+    /// and the idle has not taken the key out yet. A press can still
+    /// name it: the event was queued before the frame that let the row
+    /// go, and the element it hit is gone from the page but not from
+    /// the event.
+    fn click(&self, key: &str) -> Option<ClickAction> {
+        let registered = self.actions.get(key)?;
+        registered.is_live().then(|| Rc::clone(&registered.action))
+    }
+
+    /// Puts one closed entry's registrations into the tables.
+    fn index(&mut self, path: &Rc<str>, entry: &Entry) {
+        self.slots.insert(Rc::clone(path), Rc::clone(&entry.slot));
+        for (key, action) in &entry.actions {
+            self.insert_action(key.clone(), Rc::clone(action), Some(Rc::clone(&entry.slot)));
+        }
+        if let Some(rare) = &entry.rare {
+            for (key, copy) in &rare.copies {
+                self.copies.insert(key.clone(), Rc::clone(copy));
+            }
+            for (key, editor) in &rare.editors {
+                self.editors.insert(key.clone(), editor.clone());
+            }
+            for (key, split) in &rare.splits {
+                self.splits.insert(key.clone(), Rc::clone(split));
+            }
+            for (key, scroll) in &rare.scrolls {
+                self.scrolls.insert(key.clone(), Rc::clone(scroll));
+            }
+            for (key, measure) in &rare.measures {
+                self.measures.insert(key.clone(), Rc::clone(measure));
+            }
+            for (key, hooks) in &rare.webviews {
+                self.webviews.insert(key.clone(), hooks.clone());
+            }
+            for (key, accepts_keys) in &rare.customs {
+                self.customs.insert(key.clone());
+                if *accepts_keys {
+                    self.keyed_customs.insert(key.clone());
+                }
+            }
+        }
+        if !entry.handlers().is_empty() && self.handler_entries.insert(path.to_string()) {
+            self.handler_gen += 1;
+        }
+        if !entry.contexts().is_empty() && self.context_entries.insert(path.to_string()) {
+            self.context_gen += 1;
+        }
+        if !entry.effects.is_empty() && self.effect_entries.insert(path.to_string()) {
+            self.effect_gen += 1;
+        }
+    }
+
+    /// Takes one dropped entry's registrations out. A key belongs to the
+    /// one boundary that renders its position, so nothing else can hold
+    /// the same key while this entry does.
+    ///
+    /// A path stands in the carrier sets only while its entry carries
+    /// one — [`Live::index`] files it on that condition alone — so an
+    /// entry that carries nothing asks no set: a thousand rows that leave
+    /// a list hash their path for the tables they are in, and none other.
+    fn unindex(&mut self, path: &str, entry: &Entry) {
+        self.slots.remove(path);
+        for (key, _) in &entry.actions {
+            self.remove_action(key);
+        }
+        self.unindex_rest(path, entry);
+    }
+
+    /// [`Live::unindex`] for an entry that LEFT the retention: its slot
+    /// is marked left, and its click keys stay until the idle takes them
+    /// out ([`Live::take_buried`]), firing nothing meanwhile. A hover key
+    /// leaves now — the count of them says whether the hover road runs.
+    fn unindex_leaving(&mut self, path: &str, entry: &Entry) {
+        // the slot index answers for the retention: a path that left it
+        // is found by no hash, though its tree waits for the idle
+        self.slots.remove(path);
+        entry.slot.left.set(true);
+        for (key, _) in &entry.actions {
+            if key.ends_with(HOVER_KEY) {
+                self.remove_action(key);
+            } else {
+                self.buried_actions += 1;
+            }
+        }
+        self.unindex_rest(path, entry);
+    }
+
+    /// Takes out the click keys the entries that left kept in the table —
+    /// each one only while it is still the left entry's own: a boundary
+    /// that mounted at the same path since then registered its own over
+    /// it, from a slot of its own.
+    fn take_buried(&mut self, graveyard: &[Box<Entry>]) {
+        if self.buried_actions == 0 {
+            return;
+        }
+        for entry in graveyard {
+            for (key, action) in &entry.actions {
+                if let std::collections::hash_map::Entry::Occupied(found) = self.actions.entry(Rc::clone(key))
+                    && found.get().owner.as_ref().is_some_and(|owner| Rc::ptr_eq(owner, &entry.slot))
+                    && Rc::ptr_eq(&found.get().action, action)
+                {
+                    found.remove();
+                }
+            }
+        }
+        self.buried_actions = 0;
+    }
+
+    /// The registrations of [`Live::unindex`] other than the click keys.
+    fn unindex_rest(&mut self, path: &str, entry: &Entry) {
+        if let Some(rare) = &entry.rare {
+            for (key, _) in &rare.copies {
+                self.copies.remove(key);
+            }
+            for (key, _) in &rare.editors {
+                self.editors.remove(key);
+            }
+            for (key, _) in &rare.splits {
+                self.splits.remove(key);
+            }
+            for (key, _) in &rare.scrolls {
+                self.scrolls.remove(key);
+            }
+            for (key, _) in &rare.measures {
+                self.measures.remove(key);
+            }
+            for (key, _) in &rare.webviews {
+                self.webviews.remove(key);
+            }
+            for (key, _) in &rare.customs {
+                self.customs.remove(key);
+                self.keyed_customs.remove(key);
+            }
+        }
+        if !entry.handlers().is_empty() && self.handler_entries.remove(path) {
+            self.handler_gen += 1;
+        }
+        if !entry.contexts().is_empty() && self.context_entries.remove(path) {
+            self.context_gen += 1;
+        }
+        if !entry.effects.is_empty() && self.effect_entries.remove(path) {
+            self.effect_gen += 1;
+        }
+        if entry.top_level {
+            self.top_level.remove(path);
+        }
+    }
+
+    /// Takes the last root region's registrations back out.
+    fn drop_root_region(&mut self) {
+        let keys = std::mem::take(&mut self.root_keys);
+        for key in &keys.actions {
+            self.remove_action(key);
+        }
+        for key in &keys.copies {
+            self.copies.remove(key);
+        }
+        for key in &keys.editors {
+            self.editors.remove(key);
+        }
+        for key in &keys.splits {
+            self.splits.remove(key);
+        }
+        for key in &keys.scrolls {
+            self.scrolls.remove(key);
+        }
+        for key in &keys.measures {
+            self.measures.remove(key);
+        }
+        for key in &keys.webviews {
+            self.webviews.remove(key);
+        }
+        for key in &keys.customs {
+            self.customs.remove(key);
+            self.keyed_customs.remove(key);
+        }
+    }
+}
+
+/// Is a `/`-separated path's proper prefix `at` a cut between two
+/// segments? Every `/` is — a row key may hold a `/` of its own, which
+/// makes a cut that names no boundary, and a lookup that finds nothing
+/// there is harmless.
+fn cuts(path: &str) -> impl Iterator<Item = &str> {
+    path.match_indices('/').map(move |(at, _)| &path[..at])
+}
+
+/// Does the path have no retained boundary above it? A top-level entry
+/// has none: only the root region mounts it, so only the root region
+/// can unmount it. Asked only with no body building around the path —
+/// a body still open above it is a boundary above it, and the caller
+/// knows that without a search ([`finish_entry`]) — and each cut is a
+/// hash in the slot index, never a descent of the ordered retention.
+fn is_top_level(path: &str) -> bool {
+    LIVE.with(|live| {
+        let live = live.borrow();
+        !cuts(path).any(|prefix| live.slots.contains_key(prefix))
+    })
 }
 
 /// A boundary's place in the retention, as a node of the layout tree
@@ -258,6 +714,17 @@ thread_local! {
 /// public. An app has no door to one and nothing to do with one.
 pub struct Slot {
     held: RefCell<Option<Rc<Held>>>,
+    /// Did the entry it was filled for leave the retention? Set when it
+    /// leaves, while its tree still waits for the idle, and never cleared:
+    /// a boundary that mounts at the same path afterwards gets a slot of
+    /// its own. The click keys the entry left behind ask it ([`Registered`]).
+    left: Cell<bool>,
+    /// The last pass that met the boundary, and how ([`Visit`]): the
+    /// sweep reads who is alive off the entry it walks past, instead of
+    /// hashing its path into the sets of the pass. On the slot, not the
+    /// entry: the decision that stamps a skip finds the slot by the
+    /// path's hash ([`Live::slots`]) and never reaches for the entry.
+    visit: Cell<u64>,
 }
 
 /// What a slot holds while its boundary is retained.
@@ -282,7 +749,7 @@ impl std::fmt::Debug for Slot {
 
 impl Slot {
     fn empty() -> Rc<Slot> {
-        Rc::new(Slot { held: RefCell::new(None) })
+        Rc::new(Slot { held: RefCell::new(None), left: Cell::new(false), visit: Cell::new(0) })
     }
 
     fn held(&self) -> Option<Rc<Held>> {
@@ -297,6 +764,12 @@ impl Slot {
                 .get_or_init(|| crate::layout::Quiet::of_all(std::slice::from_ref(&held.layout)))
                 .holds()
         })
+    }
+
+    /// Does the slot hold its boundary's tree — asked of the slot alone,
+    /// without reaching for the tree, which lives elsewhere in memory.
+    pub(crate) fn holds(&self) -> bool {
+        self.held.borrow().is_some()
     }
 
     /// The boundary's layout tree, borrowed in place — measure and place
@@ -321,9 +794,7 @@ impl Drop for Entry {
 /// A path nothing retains answers an empty slot: the reference measures
 /// zero and places nothing, as it always did.
 pub(crate) fn slot_of(path: &str) -> Rc<Slot> {
-    RETAINED.with(|retained| {
-        retained.borrow().get(path).map_or_else(Slot::empty, |entry| Rc::clone(&entry.slot))
-    })
+    LIVE.with(|live| live.borrow().slots.get(path).map_or_else(Slot::empty, Rc::clone))
 }
 
 /// One kept answer of a retained tree's measure.
@@ -397,10 +868,10 @@ pub(crate) fn measure_retained(
 /// at a `/`. An id can hold a `/` of its own, so a prefix may name no
 /// entry — and then there is nothing to clear.
 fn clear_measures_above(path: &str) {
-    RETAINED.with(|retained| {
-        let retained = retained.borrow();
+    LIVE.with(|live| {
+        let live = live.borrow();
         for (at, _) in path.match_indices('/') {
-            if let Some(held) = retained.get(&path[..at]).and_then(|entry| entry.slot.held()) {
+            if let Some(held) = live.slots.get(&path[..at]).and_then(|slot| slot.held()) {
                 held.measures_kept.borrow_mut().clear();
             }
         }
@@ -409,7 +880,7 @@ fn clear_measures_above(path: &str) {
 
 /// Is the boundary retained? (The guard for the `Runtime` stable frame.)
 pub(crate) fn is_retained(path: &str) -> bool {
-    RETAINED.with(|retained| retained.borrow().contains_key(path))
+    LIVE.with(|live| live.borrow().slots.contains_key(path))
 }
 
 /// Records that the current frame was served WITHOUT a pass (stable
@@ -428,6 +899,16 @@ const REF_MARK: char = '\u{1}';
 pub const HOVER_KEY: &str = "#hover";
 
 pub(crate) fn begin_pass(dirty: HashSet<String>) {
+    let pass_no = PASS_NO.with(|count| {
+        count.set(count.get() + 1);
+        count.get()
+    });
+    // garbage that waited out its patience is freed now: no idle came
+    let buried = BURIED_AT.with(Cell::get);
+    let patience = if HOST_COLLECTS.with(Cell::get) { IDLE_HOST_PATIENCE } else { GARBAGE_PATIENCE };
+    if buried != 0 && pass_no - buried >= patience {
+        free_garbage();
+    }
     PASS.with(|pass| {
         *pass.borrow_mut() = PassState {
             active: true,
@@ -445,44 +926,187 @@ pub(crate) enum Decision {
 /// A boundary reached in the walk: skip if it is clean, retained, and
 /// no body above it ran in this pass (a parent that ran built new
 /// values — the config may have changed without going through `State`).
+///
+/// One parent is the exception: a KEYED LIST that re-ran. Its rows are
+/// kept by key — a row renders once per key, and what the row shows
+/// moves through the row's own reads — so under it a retained clean
+/// row is skipped like any clean boundary.
 pub(crate) fn decide(path: &str) -> Decision {
+    decide_at(path).0
+}
+
+/// [`decide`], with the retained boundary's own path handed back when
+/// there is one: the one copy of it the page holds, for the marks and
+/// the reference to share instead of copying the path again.
+pub(crate) fn decide_at(path: &str) -> (Decision, Option<(Rc<str>, Rc<Slot>)>) {
     PASS.with(|pass| {
-        let mut pass = pass.borrow_mut();
-        if !pass.active {
-            return Decision::Render;
-        }
-        let inside_rerun = !pass.building.is_empty();
-        let retained = RETAINED.with(|retained| retained.borrow().contains_key(path));
-        if !inside_rerun && retained && !pass.dirty.contains(path) {
-            pass.skipped.push(path.to_string());
-            Decision::Skip
-        } else {
-            Decision::Render
-        }
+        let pass = pass.borrow();
+        LIVE.with(|live| {
+            let live = live.borrow();
+            // one lookup, by the path's hash: the key and the slot the
+            // reference will point at, and the stamp the decision leaves
+            let found = live.slots.get_key_value(path).map(|(key, slot)| (Rc::clone(key), Rc::clone(slot)));
+            if !pass.active {
+                return (Decision::Render, found);
+            }
+            let inside_rerun = !pass.building.is_empty();
+            let list = pass.building.last().filter(|frame| frame.list);
+            // every path decided under a list lies under the list's own:
+            // with no dirt there, none of them is dirty
+            let dirty = |path: &str| {
+                list.is_none_or(|list| list.has_dirt_below(&pass.dirty)) && pass.dirty.contains(path)
+            };
+            match &found {
+                Some((_, slot)) if (!inside_rerun || list.is_some()) && !dirty(path) => {
+                    // the walk stays out on purpose, and the slot says
+                    // so to the sweep: its subtree survives it
+                    slot.visit.set(Visit::now().skipped);
+                    (Decision::Skip, found)
+                }
+                _ => (Decision::Render, found),
+            }
+        })
     })
 }
 
-pub(crate) fn begin_entry(path: &str) {
+/// What a keyed list that builds each row once per key reads of its own
+/// last run while it runs again: the value that run was built from and
+/// the tree it built — both still in the list's entry until this run
+/// closes — and, when the pass prints, the lines it printed.
+pub(crate) struct LastRun {
+    /// The list's path, the retention's own copy.
+    path: Rc<str>,
+    value: Erased,
+    held: Rc<Held>,
+    /// Empty unless the pass prints.
+    prints: Vec<RenderNode>,
+}
+
+impl LastRun {
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The list the last run was built from, when it was a `V`: the shape
+    /// that run stood its rows in is read off it.
+    pub(crate) fn value<V: crate::view::View>(&self) -> Option<&V> {
+        self.value.downcast_ref()
+    }
+
+    /// The last run's rows, in order: the list boundary's children — or,
+    /// `nested`, the children of the one stack they stood in (a list with
+    /// an axis, a spacing or an alignment of its own). `nested` is the
+    /// shape the last run was built in, which the tree alone cannot tell:
+    /// a plain column whose one row is a stack has the shape of a stack
+    /// of rows.
+    pub(crate) fn rows(&self, nested: bool) -> &[LayoutNode] {
+        let LayoutNode::Boundary { children, .. } = &self.held.layout else {
+            return &[];
+        };
+        match (nested, children.as_slice()) {
+            (false, _) => children,
+            (true, [LayoutNode::Stack { children, .. }]) => children,
+            (true, _) => &[],
+        }
+    }
+
+    /// The line the row at `at` printed, when the pass prints: the
+    /// reference to `path`, and only while the last run printed exactly
+    /// one line per node, so the line at `at` is that row's own.
+    pub(crate) fn line(&self, nested: bool, at: usize, path: &str) -> Option<&RenderNode> {
+        let lines = match (nested, self.prints.as_slice()) {
+            (false, lines) => lines,
+            (true, [branch]) => branch.children.as_slice(),
+            (true, _) => &[],
+        };
+        if lines.len() != self.rows(nested).len() {
+            return None;
+        }
+        lines.get(at).filter(|line| parse_ref(&line.line).is_some_and(|(of, _)| of == path))
+    }
+}
+
+/// The last run of the keyed list at `path`, for its rows to be kept by
+/// key — or nothing, when there is none to keep from, or when the entry
+/// it closed carries registrations of its own: a row's closure that
+/// attached one outside its row's component (a click on the row's
+/// element, an effect, a handler) filed it with the list, and a row kept
+/// without its closure would lose it. Such a list builds every row.
+pub(crate) fn last_run(path: &str) -> Option<LastRun> {
+    RETAINED.with(|retained| {
+        let retained = retained.borrow();
+        let (key, entry) = retained.get_key_value(path)?;
+        if !entry.actions.is_empty() || !entry.effects.is_empty() || entry.rare.is_some() {
+            return None;
+        }
+        let held = entry.slot.held()?;
+        let prints = if crate::view::print_enabled() { entry.node.children.clone() } else { Vec::new() };
+        Some(LastRun { path: Rc::clone(key), value: entry.value.clone(), held, prints })
+    })
+}
+
+/// Keeps a row of the keyed list being built, by its key, without
+/// entering it — the row's closure does not run. Its boundary at `path`,
+/// the one the last run referred to, is kept as a skip keeps it: stamped
+/// skipped for the sweep, the owners of the row's key scope and of its
+/// own scope touched as the steps into them would touch them, and the
+/// subtree reported skipped to the identity. Nothing is kept, and the
+/// answer is `false`, when the row is dirty itself: it runs.
+pub(crate) fn keep_row(path: &Rc<str>, slot: &Slot, key_scope: &str) -> bool {
+    let kept = PASS.with(|pass| {
+        let pass = pass.borrow();
+        let Some(list) = pass.building.last().filter(|frame| frame.list) else {
+            return false;
+        };
+        if !pass.active || (list.has_dirt_below(&pass.dirty) && pass.dirty.contains(&**path)) {
+            return false;
+        }
+        // the last run's tree names only retained rows: a row leaves
+        // when its list runs, and that run's tree no longer names it
+        debug_assert!(is_retained(path), "a kept row refers to a boundary that left: {path}");
+        slot.visit.set(Visit::now().skipped);
+        true
+    });
+    if kept {
+        motor::identity::keep_unentered(key_scope, path);
+    }
+    kept
+}
+
+pub(crate) fn begin_entry(path: &Rc<str>, list: bool) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
-        pass.body_runs.push(path.to_string());
-        pass.building.push(BuildingFrame { path: path.to_string(), ..Default::default() });
+        pass.body_runs.push(Rc::clone(path));
+        if pass.building.is_empty() {
+            // no body open around it: a subtree the sweep will read
+            pass.outermost.push(Rc::clone(path));
+        }
+        pass.building.push(BuildingFrame::new(Rc::clone(path), list));
     });
 }
 
+/// Files a body that ran under its path, and hands back the slot its
+/// tree now fills — the one a reference to the boundary holds, so the
+/// parent's list does not search the retention for it a second time.
+///
+/// `retained` is what the decision found: a boundary the retention did
+/// not hold is a fresh mount, and there is no entry of a last run to
+/// take out first. Nothing files one at the same path while the body
+/// runs — every boundary below it has a longer path.
 pub(crate) fn finish_entry(
-    path: &str,
+    path: &Rc<str>,
+    retained: bool,
     value: Erased,
     ctx: Context,
     node: RenderNode,
     layout: LayoutNode,
-) {
-    let (effects, actions, copies, editors, splits, scrolls, measures, webviews, customs, handlers, contexts) =
+) -> Rc<Slot> {
+    let (nested, (effects, actions, copies, editors, splits, scrolls, measures, webviews, customs, handlers, contexts)) =
         PASS.with(|pass| {
             let mut pass = pass.borrow_mut();
-            match pass.building.pop() {
+            let lists = match pass.building.pop() {
                 Some(frame) => {
-                    debug_assert_eq!(frame.path, path, "entries close in the order they open");
+                    debug_assert_eq!(&*frame.path, &**path, "entries close in the order they open");
                     (
                         frame.effects,
                         frame.actions,
@@ -510,55 +1134,84 @@ pub(crate) fn finish_entry(
                     Vec::new(),
                     Vec::new(),
                 ),
-            }
+            };
+            // a body still open around this one is a boundary above it:
+            // every frame on the stack is an ancestor
+            (!pass.building.is_empty(), lists)
         });
     let parent_segments = motor::identity::parent_seed();
-    RETAINED.with(|retained| {
-        let mut retained = retained.borrow_mut();
-        // the slot is as old as the path: the entry of the last run goes
-        // FIRST (its drop empties the slot), then the slot is filled again,
-        // so a parent that did not re-run refers to the tree of today
-        let slot = match retained.remove(path) {
-            Some(old) => Rc::clone(&old.slot),
-            None => Slot::empty(),
-        };
-        slot.held.replace(Some(Rc::new(Held {
-            layout,
-            measures_kept: RefCell::new(Vec::new()),
-            quiet: std::cell::OnceCell::new(),
-        })));
-        retained.insert(
-            path.to_string(),
-            Entry {
+    // a top-level entry is known by what stands above it: a body still
+    // building around it says so at once, and only with none does the
+    // retention have to be asked at each cut
+    let top_level = !nested && is_top_level(path);
+    let filled = RETAINED.with(|retention| {
+        let mut retention = retention.borrow_mut();
+        LIVE.with(|live| {
+            let mut live = live.borrow_mut();
+            // the slot is as old as the path: the entry of the last run
+            // goes FIRST (its registrations leave the tables, its drop
+            // empties the slot), then the slot is filled again, so a
+            // parent that did not re-run refers to the tree of today
+            let last = if retained { retention.remove(path) } else { None };
+            let slot = match last {
+                Some(old) => {
+                    live.unindex(path, &old);
+                    // the tree of the last run waits for the idle with the
+                    // entries that left: a list that runs again replaces a
+                    // node per row, and the frame must not pay their frees
+                    if let Some(held) = old.slot.held.take() {
+                        REPLACED.with(|replaced| replaced.borrow_mut().push(held));
+                        note_buried();
+                    }
+                    Rc::clone(&old.slot)
+                }
+                None => Slot::empty(),
+            };
+            slot.held.replace(Some(Rc::new(Held {
+                layout,
+                measures_kept: RefCell::new(Vec::new()),
+                quiet: std::cell::OnceCell::new(),
+            })));
+            let entry = Entry {
                 value,
                 ctx,
                 node,
                 slot,
                 effects,
                 actions,
-                copies,
-                editors,
-                splits,
-                scrolls,
-                measures,
-                webviews,
-                customs,
-                handlers,
-                contexts,
+                rare: Rare::boxed(copies, editors, splits, scrolls, measures, webviews, customs, handlers, contexts),
                 parent_segments,
-            },
-        );
+                top_level,
+            };
+            entry.slot.visit.set(Visit::now().ran);
+            // a body ran and its registrations are new closures: they
+            // replace the old ones in the tables the doors read, now
+            live.index(path, &entry);
+            crate::stats::note_entry_indexed();
+            if top_level {
+                live.top_level.insert(path.to_string());
+            }
+            let filled = Rc::clone(&entry.slot);
+            if let Some(displaced) = retention.insert(Rc::clone(path), Box::new(entry)) {
+                // a fresh mount displaces nothing, by construction; were
+                // it ever to, the tables forget the keys of the entry it
+                // displaced and learn the new one's again
+                debug_assert!(false, "a boundary filed twice in one run: {path}");
+                live.unindex(path, &displaced);
+                if let Some(entry) = retention.get(&**path) {
+                    live.index(path, entry);
+                }
+            }
+            filled
+        })
     });
-    // a body ran and its registrations are new closures: the tables
-    // built from the old entry are stale
-    bump_retention();
     // …and so is every measure kept ABOVE it. The outermost re-run of a
     // pass does this once: the boundaries between it and the ones it
     // re-ran below are new entries themselves.
-    let outermost = PASS.with(|pass| pass.borrow().building.is_empty());
-    if outermost {
+    if !nested {
         clear_measures_above(path);
     }
+    filled
 }
 
 /// An effect registered during render: goes to the entry being built,
@@ -575,7 +1228,7 @@ pub(crate) fn attribute_effect(effect: EffectFn) {
 }
 
 /// An interactive action registered during render — same attribution.
-pub(crate) fn attribute_action(path: String, action: ClickAction) {
+pub(crate) fn attribute_action(path: Rc<str>, action: ClickAction) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         if let Some(frame) = pass.building.last_mut() {
@@ -700,14 +1353,25 @@ thread_local! {
     static DECLARED_CONTEXTS: RefCell<Vec<ContextEntry>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Rebuilds the active contexts from the retention (the live
-/// declarations) — the twin of the handler assembly.
+/// The retained entries under `root` that carry the kind of registration
+/// `carriers` names, in path order — what a derived table rebuilds from.
+fn carriers_under(root: &str, carriers: impl FnOnce(&Live) -> Vec<String>) -> Vec<String> {
+    let mut paths = LIVE.with(|live| carriers(&live.borrow()));
+    paths.retain(|path| covers(root, path));
+    paths.sort();
+    paths
+}
+
+/// Rebuilds the active contexts from the entries that declare one —
+/// the twin of the handler assembly.
 pub(crate) fn assemble_contexts(root: &str) {
     let mut declared: Vec<ContextEntry> = Vec::new();
+    let carriers = carriers_under(root, |live| live.context_entries.iter().cloned().collect());
     RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                declared.extend(entry.contexts.iter().cloned());
+        let retained = retained.borrow();
+        for path in &carriers {
+            if let Some(entry) = retained.get(path.as_str()) {
+                declared.extend(entry.contexts().iter().cloned());
             }
         }
     });
@@ -800,11 +1464,11 @@ thread_local! {
         RefCell::new(HashMap::default());
 }
 
-/// Reassembles the handler map from the retention under the root + the
-/// root region. Precedence: the DEEPEST path wins (innermost in the
-/// tree); a depth tie → the last one mounted (deterministic from the
-/// retention order, documented as NON-contractual — the semantic
-/// tiebreak arrives with key contexts).
+/// Reassembles the handler map from the entries under the root that
+/// carry one + the root region. Precedence: the DEEPEST path wins
+/// (innermost in the tree); a depth tie → the last one mounted
+/// (deterministic from the path order, documented as NON-contractual —
+/// the semantic tiebreak arrives with key contexts).
 pub(crate) fn assemble_handlers(root: &str) {
     let mut map: HashMap<crate::action::ActionId, (usize, HandlerFn)> = HashMap::default();
     let place = |map: &mut HashMap<crate::action::ActionId, (usize, HandlerFn)>,
@@ -819,10 +1483,12 @@ pub(crate) fn assemble_handlers(root: &str) {
             }
         }
     };
+    let carriers = carriers_under(root, |live| live.handler_entries.iter().cloned().collect());
     RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (key, id, handler) in &entry.handlers {
+        let retained = retained.borrow();
+        for path in &carriers {
+            if let Some(entry) = retained.get(path.as_str()) {
+                for (key, id, handler) in entry.handlers() {
                     place(&mut map, key, *id, handler.clone());
                 }
             }
@@ -858,20 +1524,17 @@ pub(crate) fn run_handler(id: crate::action::ActionId) -> bool {
     }
 }
 
-/// Dirty views the walk did not reach (skipped parent): re-runs each
-/// one from the retained value, with the cursor seeded on the parent's
-/// path — ancestors first, because a parent's re-run covers the
-/// descendants.
+/// Dirty views the walk did not reach (a skipped parent, or a row a keyed
+/// list that ran kept): re-runs each one from the retained value, with
+/// the cursor seeded on the parent's path — ancestors first, because a
+/// parent's re-run covers the descendants.
 pub(crate) fn run_isolated(root: &str) {
     let mut pending: Vec<String> = PASS.with(|pass| {
         let pass = pass.borrow();
-        pass.dirty
-            .iter()
-            .filter(|path| {
-                covers(root, path) && !pass.body_runs.iter().any(|ran| covers(ran, path))
-            })
-            .cloned()
-            .collect()
+        LIVE.with(|live| {
+            let live = live.borrow();
+            pass.dirty.iter().filter(|path| covers(root, path) && !reached(&pass, &live, path)).cloned().collect()
+        })
     });
     // shallower first, so an ancestor's run covers its dirty descendants —
     // then by path, so siblings of one depth run in ONE order. The set they
@@ -881,20 +1544,18 @@ pub(crate) fn run_isolated(root: &str) {
     pending.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
 
     for path in pending {
-        let already_ran = PASS.with(|pass| {
-            pass.borrow().body_runs.iter().any(|ran| covers(ran, &path))
-        });
+        let already_ran = PASS.with(|pass| LIVE.with(|live| reached(&pass.borrow(), &live.borrow(), &path)));
         if already_ran {
             continue;
         }
         let Some((value, ctx, parents)) = RETAINED.with(|retained| {
-            retained.borrow().get(&path).map(|entry| {
+            retained.borrow().get(path.as_str()).map(|entry| {
                 (entry.value.clone(), entry.ctx.clone(), entry.parent_segments.clone())
             })
         }) else {
             continue; // dirty but never mounted (or already swept): nothing to re-run
         };
-        let _frames = motor::identity::seed_from(&parents);
+        let _frames = motor::identity::seed_from(&path, &parents);
         let mut scratch = crate::view::NodeList::new();
         use crate::view::View;
         // the retained value re-renders through the blanket's normal
@@ -902,6 +1563,31 @@ pub(crate) fn run_isolated(root: &str) {
         // re-retains
         value.render_into(&ctx, &mut scratch);
     }
+}
+
+/// Did the bodies that ran in this pass answer for `path`? The deepest
+/// run above it rebuilt its subtree: the path ran again with it, or left
+/// it. Unless the walk under that run stayed out of a boundary on the
+/// way down to the path — a keyed list that ran keeps its clean rows, and
+/// what is dirty inside one of them no body of the walk reached. The cut
+/// is read off the slots' stamps, one lookup per boundary between, as the
+/// sweep reads who a skip shelters.
+fn reached(pass: &PassState, live: &Live, path: &str) -> bool {
+    let Some(ran) = pass.body_runs.iter().filter(|ran| covers(ran, path)).max_by_key(|ran| ran.len()) else {
+        return false;
+    };
+    let skipped = Visit::now().skipped;
+    let mut cut = path.len();
+    while let Some(at) = path[..cut].rfind('/') {
+        if at <= ran.len() {
+            break;
+        }
+        if live.slots.get(&path[..at]).is_some_and(|slot| slot.visit.get() == skipped) {
+            return false;
+        }
+        cut = at;
+    }
+    true
 }
 
 fn covers(ancestor: &str, path: &str) -> bool {
@@ -912,14 +1598,16 @@ fn covers(ancestor: &str, path: &str) -> bool {
         && (path.len() == ancestor.len() || path.as_bytes()[ancestor.len()] == b'/')
 }
 
-/// The pass's effect queue: the root region + the whole retention under
-/// the current root (skipped or not — a retained effect is a live
-/// subscription).
+/// The pass's effect queue: the root region + every retained entry
+/// under the current root that carries one (skipped or not — a retained
+/// effect is a live subscription), in path order.
 pub(crate) fn assemble_effects(root: &str) -> Vec<EffectFn> {
     let mut queue = PASS.with(|pass| std::mem::take(&mut pass.borrow_mut().root_effects));
+    let carriers = carriers_under(root, |live| live.effect_entries.iter().cloned().collect());
     RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
+        let retained = retained.borrow();
+        for path in &carriers {
+            if let Some(entry) = retained.get(path.as_str()) {
                 queue.extend(entry.effects.iter().cloned());
             }
         }
@@ -927,54 +1615,25 @@ pub(crate) fn assemble_effects(root: &str) -> Vec<EffectFn> {
     queue
 }
 
-thread_local! {
-    /// The live click map: target path → action, which takes the
-    /// platform's click count. Reassembled on every pass, like the
-    /// effect queue.
-    static ACTIONS: RefCell<HashMap<String, ClickAction>> = RefCell::new(HashMap::default());
+/// Is the path inside the scene the tables answer for? A door that
+/// enumerates a table asks this, so a thread with two windows never
+/// answers one window's question with the other's registrations. A
+/// door that looks one path up never needs to: paths are unique.
+fn in_scene(path: &str) -> bool {
+    ASSEMBLED_ROOT.with(|root| root.borrow().as_deref().is_none_or(|root| covers(root, path)))
 }
 
-/// Reassembles the click map from the retention under the root (a
-/// skipped view's button stays clickable) + the root region.
-pub(crate) fn assemble_actions(root: &str) {
-    let mut map: HashMap<String, ClickAction> = HashMap::default();
-    RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (key, action) in &entry.actions {
-                    map.insert(key.clone(), action.clone());
-                }
-            }
-        }
-    });
-    PASS.with(|pass| {
-        for (key, action) in std::mem::take(&mut pass.borrow_mut().root_actions) {
-            map.insert(key, action);
-        }
-    });
-    // a scene with no `.on_hover` pays nothing for one: the runtime
-    // asks this before it copies a path to compare against
-    let watched = map.keys().any(|key| key.ends_with(HOVER_KEY));
-    HOVER_WATCHED.with(|flag| flag.set(watched));
-    ACTIONS.with(|actions| *actions.borrow_mut() = map);
-}
-
-thread_local! {
-    static HOVER_WATCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Does any view on screen want to hear the pointer arrive? Answered
-/// once per pass, so the hover road can cost nothing at all in a scene
-/// that never asked.
+/// Does any view on screen want to hear the pointer arrive? One read,
+/// so the hover road costs nothing at all in a scene that never asked.
 pub(crate) fn hover_watched() -> bool {
-    HOVER_WATCHED.with(|flag| flag.get())
+    LIVE.with(|live| live.borrow().hover_keys > 0)
 }
 
 /// Fires the target's action (the key comes from the hit-test).
 /// `false` = target not registered (the identity died between frame and
 /// click — harmless).
 pub(crate) fn run_action(path: &str, clicks: u8) -> bool {
-    let action = ACTIONS.with(|actions| actions.borrow().get(path).cloned());
+    let action = LIVE.with(|live| live.borrow().click(path));
     match action {
         Some(action) => {
             action(clicks);
@@ -984,40 +1643,13 @@ pub(crate) fn run_action(path: &str, clicks: u8) -> bool {
     }
 }
 
-thread_local! {
-    /// The live copy map: target path → what a ⌘C there answers.
-    /// Reassembled on every pass, like the click map.
-    static COPIES: RefCell<HashMap<String, CopyFn>> = RefCell::new(HashMap::default());
-}
-
-/// Reassembles the copy map from the retention under the root (a
-/// skipped view's table still copies) + the root region.
-pub(crate) fn assemble_copies(root: &str) {
-    let mut map: HashMap<String, CopyFn> = HashMap::default();
-    RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (key, copy) in &entry.copies {
-                    map.insert(key.clone(), copy.clone());
-                }
-            }
-        }
-    });
-    PASS.with(|pass| {
-        for (key, copy) in std::mem::take(&mut pass.borrow_mut().root_copies) {
-            map.insert(key, copy);
-        }
-    });
-    COPIES.with(|copies| *copies.borrow_mut() = map);
-}
-
 /// The view that answers a copy for a press at `path`: the path itself
 /// or its nearest ancestor that registered `.on_copy`. A click on a row
 /// hands the keyboard to the table the row belongs to.
 pub(crate) fn copy_owner(path: &str) -> Option<String> {
-    COPIES.with(|copies| {
-        copies
-            .borrow()
+    LIVE.with(|live| {
+        live.borrow()
+            .copies
             .keys()
             .filter(|owner| covers(owner, path))
             .max_by_key(|owner| owner.len())
@@ -1028,7 +1660,7 @@ pub(crate) fn copy_owner(path: &str) -> Option<String> {
 /// Does the view at `path` answer a copy? A focus that lands on one
 /// holds the keyboard with no caret.
 pub(crate) fn answers_copy(path: &str) -> bool {
-    COPIES.with(|copies| copies.borrow().contains_key(path))
+    LIVE.with(|live| live.borrow().copies.contains_key(path))
 }
 
 /// What the `.on_copy` at `path` answers now — `None` when nothing is
@@ -1036,123 +1668,8 @@ pub(crate) fn answers_copy(path: &str) -> bool {
 pub(crate) fn run_copy(path: &str) -> Option<Option<String>> {
     // outside the borrow: the answer reads the app's state, which may
     // read the runtime back
-    let copy = COPIES.with(|copies| copies.borrow().get(path).cloned())?;
+    let copy = LIVE.with(|live| live.borrow().copies.get(path).cloned())?;
     Some(copy())
-}
-
-thread_local! {
-    /// The live field-editor map — reassembled per pass, like the
-    /// actions.
-    static EDITORS: RefCell<HashMap<String, EditorFn>> = RefCell::new(HashMap::default());
-    static SPLITS: RefCell<HashMap<String, SplitFn>> = RefCell::new(HashMap::default());
-    static SCROLLS: RefCell<HashMap<String, ScrollFn>> = RefCell::new(HashMap::default());
-    static MEASURES: RefCell<HashMap<String, MeasureFn>> = RefCell::new(HashMap::default());
-    static WEBVIEWS: RefCell<HashMap<String, WebviewHooks>> = RefCell::new(HashMap::default());
-    /// The app's boxes on screen this pass — paths only.
-    static CUSTOMS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
-    /// The subset that answers `accepts_keys` — who may HOLD the
-    /// keyboard, as opposed to who is merely on screen.
-    static KEYED_CUSTOMS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
-}
-
-/// Reassembles the editor map from retention under the root + root region.
-pub(crate) fn assemble_editors(root: &str) {
-    let mut map: HashMap<String, EditorFn> = HashMap::default();
-    RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (key, editor) in &entry.editors {
-                    map.insert(key.clone(), editor.clone());
-                }
-            }
-        }
-    });
-    PASS.with(|pass| {
-        for (key, editor) in std::mem::take(&mut pass.borrow_mut().root_editors) {
-            map.insert(key, editor);
-        }
-    });
-    EDITORS.with(|editors| *editors.borrow_mut() = map);
-}
-
-/// Reassembles the split map from retention — the editors' twin.
-pub(crate) fn assemble_splits(root: &str) {
-    let mut map: HashMap<String, SplitFn> = HashMap::default();
-    RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (key, split) in &entry.splits {
-                    map.insert(key.clone(), split.clone());
-                }
-            }
-        }
-    });
-    PASS.with(|pass| {
-        for (key, split) in std::mem::take(&mut pass.borrow_mut().root_splits) {
-            map.insert(key, split);
-        }
-    });
-    SPLITS.with(|splits| *splits.borrow_mut() = map);
-}
-
-/// The scroll-offset writers, assembled the same way.
-pub(crate) fn assemble_scrolls(root: &str) {
-    let mut map: HashMap<String, ScrollFn> = HashMap::default();
-    RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (key, scroll) in &entry.scrolls {
-                    map.insert(key.clone(), scroll.clone());
-                }
-            }
-        }
-    });
-    PASS.with(|pass| {
-        for (key, scroll) in std::mem::take(&mut pass.borrow_mut().root_scrolls) {
-            map.insert(key, scroll);
-        }
-    });
-    SCROLLS.with(|scrolls| *scrolls.borrow_mut() = map);
-}
-
-/// The measurement probes, assembled the same way.
-pub(crate) fn assemble_measures(root: &str) {
-    let mut map: HashMap<String, MeasureFn> = HashMap::default();
-    RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (key, measure) in &entry.measures {
-                    map.insert(key.clone(), measure.clone());
-                }
-            }
-        }
-    });
-    PASS.with(|pass| {
-        for (key, measure) in std::mem::take(&mut pass.borrow_mut().root_measures) {
-            map.insert(key, measure);
-        }
-    });
-    MEASURES.with(|measures| *measures.borrow_mut() = map);
-}
-
-/// The webview hooks, assembled the same way.
-pub(crate) fn assemble_webviews(root: &str) {
-    let mut map: HashMap<String, WebviewHooks> = HashMap::default();
-    RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (key, hooks) in &entry.webviews {
-                    map.insert(key.clone(), hooks.clone());
-                }
-            }
-        }
-    });
-    PASS.with(|pass| {
-        for (key, hooks) in std::mem::take(&mut pass.borrow_mut().root_webviews) {
-            map.insert(key, hooks);
-        }
-    });
-    WEBVIEWS.with(|webviews| *webviews.borrow_mut() = map);
 }
 
 /// Hands one page report to its retained writer — cloned out of the
@@ -1163,8 +1680,7 @@ fn run_webview_report(
     pick: impl Fn(&WebviewHooks) -> Option<WebviewReport>,
     line: &str,
 ) -> bool {
-    let report =
-        WEBVIEWS.with(|webviews| webviews.borrow().get(path).and_then(|hooks| pick(hooks)));
+    let report = LIVE.with(|live| live.borrow().webviews.get(path).and_then(|hooks| pick(hooks)));
     match report {
         Some(report) => {
             report(line);
@@ -1186,8 +1702,8 @@ pub(crate) fn run_webview_changed(path: &str, html: &str) -> bool {
 
 /// A paste the app owns, to the document's `on_paste`.
 pub(crate) fn run_webview_pasted(path: &str, html: &str, text: &str) -> bool {
-    let report = WEBVIEWS
-        .with(|webviews| webviews.borrow().get(path).and_then(|hooks| hooks.pasted.clone()));
+    let report =
+        LIVE.with(|live| live.borrow().webviews.get(path).and_then(|hooks| hooks.pasted.clone()));
     match report {
         Some(report) => {
             report(html, text);
@@ -1205,8 +1721,8 @@ pub(crate) fn run_webview_navigated(path: &str, url: &str) -> bool {
 /// A refused load, to the page's `on_navigate_failed` — the report
 /// door with two words instead of one.
 pub(crate) fn run_webview_failed(path: &str, url: &str, why: &str) -> bool {
-    let report = WEBVIEWS
-        .with(|webviews| webviews.borrow().get(path).and_then(|hooks| hooks.failed.clone()));
+    let report =
+        LIVE.with(|live| live.borrow().webviews.get(path).and_then(|hooks| hooks.failed.clone()));
     match report {
         Some(report) => {
             report(url, why);
@@ -1231,26 +1747,31 @@ pub(crate) fn run_webview_requested(path: &str, line: &str) -> bool {
     run_webview_report(path, |hooks| hooks.requested.clone(), line)
 }
 
-/// Does any handle hold a command the shell did not spend yet? A peek:
-/// nothing is drained. A handle queues its commands with no state write,
-/// so this is how a shell learns that a frame is due for them.
+/// Does any handle in this scene hold a command the shell did not
+/// spend yet? A peek: nothing is drained. A handle queues its commands
+/// with no state write, so this is how a shell learns that a frame is
+/// due for them.
 pub(crate) fn has_webview_commands() -> bool {
-    WEBVIEWS.with(|webviews| {
-        webviews.borrow().values().any(|hooks| {
-            hooks.commands.as_ref().is_some_and(|queue| !queue.borrow().is_empty())
+    LIVE.with(|live| {
+        live.borrow().webviews.iter().any(|(path, hooks)| {
+            in_scene(path)
+                && hooks.commands.as_ref().is_some_and(|queue| !queue.borrow().is_empty())
         })
     })
 }
 
-/// Drains every handle's queued commands, paired with the path the
-/// handle is bound to — the runtime stamps eval tokens and the shell
-/// spends the rest.
+/// Drains every handle's queued commands in this scene, paired with
+/// the path the handle is bound to — the runtime stamps eval tokens
+/// and the shell spends the rest.
 pub(crate) fn drain_webview_commands() -> Vec<(String, Vec<crate::host::WebviewCommand>)> {
-    WEBVIEWS.with(|webviews| {
-        webviews
-            .borrow()
+    LIVE.with(|live| {
+        live.borrow()
+            .webviews
             .iter()
             .filter_map(|(path, hooks)| {
+                if !in_scene(path) {
+                    return None;
+                }
                 let queue = hooks.commands.as_ref()?;
                 let commands = std::mem::take(&mut *queue.borrow_mut());
                 if commands.is_empty() {
@@ -1262,45 +1783,16 @@ pub(crate) fn drain_webview_commands() -> Vec<(String, Vec<crate::host::WebviewC
     })
 }
 
-/// Reassembles the escape-hatch map from retention — the editors' twin
-/// for the boxes the app paints.
-pub(crate) fn assemble_customs(root: &str) {
-    let mut set: HashSet<String> = HashSet::default();
-    let mut keyed: HashSet<String> = HashSet::default();
-    RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (path, accepts_keys) in &entry.customs {
-                    set.insert(path.clone());
-                    if *accepts_keys {
-                        keyed.insert(path.clone());
-                    }
-                }
-            }
-        }
-    });
-    PASS.with(|pass| {
-        for (path, accepts_keys) in std::mem::take(&mut pass.borrow_mut().root_customs) {
-            if accepts_keys {
-                keyed.insert(path.clone());
-            }
-            set.insert(path);
-        }
-    });
-    CUSTOMS.with(|customs| *customs.borrow_mut() = set);
-    KEYED_CUSTOMS.with(|keyed_customs| *keyed_customs.borrow_mut() = keyed);
-}
-
 /// Is the app's box at this path still on screen? (The focus of an
 /// escape hatch lives or dies by this answer.)
 pub(crate) fn has_custom(path: &str) -> bool {
-    CUSTOMS.with(|customs| customs.borrow().contains(path))
+    LIVE.with(|live| live.borrow().customs.contains(path))
 }
 
 /// Hands a dragged divider position to the split's retained writer.
 /// `false` = no split registered at the path.
 pub(crate) fn run_split(path: &str, at: crate::layout::Px) -> bool {
-    let split = SPLITS.with(|splits| splits.borrow().get(path).cloned());
+    let split = LIVE.with(|live| live.borrow().splits.get(path).cloned());
     match split {
         Some(split) => {
             split(at);
@@ -1314,7 +1806,7 @@ pub(crate) fn run_split(path: &str, at: crate::layout::Px) -> bool {
 /// binding the app holds it in tells the truth. `false` = no writer at
 /// the path — the region was never given a binding.
 pub(crate) fn run_scroll(path: &str, offset: crate::layout::Point) -> bool {
-    let scroll = SCROLLS.with(|scrolls| scrolls.borrow().get(path).cloned());
+    let scroll = LIVE.with(|live| live.borrow().scrolls.get(path).cloned());
     match scroll {
         Some(scroll) => {
             scroll(offset);
@@ -1324,18 +1816,18 @@ pub(crate) fn run_scroll(path: &str, offset: crate::layout::Point) -> bool {
     }
 }
 
-/// Did any view in this pass ask to be measured? O(1), and it is what
-/// keeps a scene with no probe from paying for the feature: the frame
-/// record holds thousands of entries and walking it per layout to
-/// discover there is nothing to report would be a real cost.
+/// Did any view ask to be measured? O(1), and it is what keeps a scene
+/// with no probe from paying for the feature: the frame record holds
+/// thousands of entries and walking it per layout to discover there is
+/// nothing to report would be a real cost.
 pub(crate) fn has_measures() -> bool {
-    MEASURES.with(|measures| !measures.borrow().is_empty())
+    LIVE.with(|live| !live.borrow().measures.is_empty())
 }
 
 /// Hands a view's resolved size to the probe that asked for it.
 /// `false` = no probe at the path.
 pub(crate) fn run_measure(path: &str, size: crate::layout::Size) -> bool {
-    let measure = MEASURES.with(|measures| measures.borrow().get(path).cloned());
+    let measure = LIVE.with(|live| live.borrow().measures.get(path).cloned());
     match measure {
         Some(measure) => {
             measure(size);
@@ -1345,11 +1837,10 @@ pub(crate) fn run_measure(path: &str, size: crate::layout::Size) -> bool {
     }
 }
 
-/// Is the target a text field? (decides if a click FOCUSES instead of acting)
-/// The ONE live input whose named chain is `chain` — a field's editor
-/// or a box that takes the keyboard. `None` when nothing answers, and
-/// `None` when TWO do: an ambiguous name must never hand the keyboard
-/// over on a guess.
+/// The ONE live input of this scene whose named chain is `chain` — a
+/// field's editor or a box that takes the keyboard. `None` when nothing
+/// answers, and `None` when TWO do: an ambiguous name must never hand
+/// the keyboard over on a guess.
 ///
 /// `editors_only` narrows it to the fields, which is what a caret is
 /// allowed to follow — a caret belongs to an editor, and a box owns
@@ -1360,7 +1851,7 @@ pub(crate) fn input_by_chain(chain: &str, editors_only: bool) -> Option<String> 
     }
     let mut found: Option<String> = None;
     let mut walk = |path: &String| {
-        if motor::identity::named_chain(path) != chain {
+        if !in_scene(path) || motor::identity::named_chain(path) != chain {
             return false;
         }
         match &found {
@@ -1371,14 +1862,22 @@ pub(crate) fn input_by_chain(chain: &str, editors_only: bool) -> Option<String> 
         }
         false
     };
-    let ambiguous = EDITORS.with(|editors| editors.borrow().keys().any(&mut walk))
-        || (!editors_only
-            && KEYED_CUSTOMS.with(|customs| customs.borrow().iter().any(&mut walk)));
+    let ambiguous = LIVE.with(|live| {
+        let live = live.borrow();
+        live.editors.keys().any(&mut walk)
+            || (!editors_only && live.keyed_customs.iter().any(&mut walk))
+    });
     if ambiguous { None } else { found }
 }
 
 pub(crate) fn has_editor(path: &str) -> bool {
-    EDITORS.with(|editors| editors.borrow().contains_key(path))
+    LIVE.with(|live| live.borrow().editors.contains_key(path))
+}
+
+/// The field's editor at `path`, cloned out of the borrow — the record
+/// every field door reads.
+fn editor_at(path: &str) -> Option<EditorFn> {
+    LIVE.with(|live| live.borrow().editors.get(path).cloned())
 }
 
 /// Applies a command to the field — the retained closure is what
@@ -1389,95 +1888,136 @@ pub(crate) fn run_editor(
     command: EditCommand,
     state: &mut CaretState,
 ) -> Option<Option<String>> {
-    let editor = EDITORS.with(|editors| editors.borrow().get(path).cloned());
-    editor.map(|editor| (editor.command)(command, state))
+    editor_at(path).map(|editor| (editor.command)(command, state))
 }
 
 thread_local! {
-    /// Whose scene the assembled tables below currently answer for.
+    /// Whose scene the DERIVED tables (the handlers, the key contexts)
+    /// answer for.
     ///
-    /// The retention is keyed by PATH and holds every scene at once, but
-    /// the tables the input doors read (`ACTIONS`, `HANDLERS`, `EDITORS`,
-    /// …) are the flattened view of ONE root, rebuilt at the end of its
-    /// pass. On a thread with a single window that is the whole story. On
-    /// a thread with two, the window that rendered last would otherwise
-    /// answer for the window the hand is actually in — so a runtime
-    /// checks this before it reads them, and rebuilds its own if another
-    /// scene left theirs standing.
+    /// The retention is keyed by PATH and holds every scene at once; so
+    /// do the path-keyed tables, and a path is unique, so a lookup never
+    /// needs to know the scene. The two derived tables are flattened
+    /// views of ONE root — on a thread with two windows, the window that
+    /// rendered last would otherwise answer for the window the hand is
+    /// actually in — so a runtime checks this before it reads them, and
+    /// rebuilds its own if another scene left theirs standing.
     static ASSEMBLED_ROOT: RefCell<Option<String>> = const { RefCell::new(None) };
-    /// Moves each time the retention is written: an entry closed, an
-    /// entry fell. A registration enters the retention only through a
-    /// body run, which closes an entry, and leaves it only through a
-    /// sweep — so tables assembled at one generation stay true until the
-    /// number moves.
-    static RETENTION_GEN: Cell<u64> = const { Cell::new(0) };
-    /// The generation the assembled tables were built at, and whether a
-    /// root region fed them. A root region is rebuilt by every pass (its
-    /// closures are new each time), so tables that hold one never stay.
-    static ASSEMBLED_AT: Cell<Option<(u64, bool)>> = const { Cell::new(None) };
+    /// The generations the derived tables were built at — handlers,
+    /// contexts — and whether a root region fed them. A root region is
+    /// rebuilt by every pass (its closures are new each time), so tables
+    /// that hold one never stay.
+    static ASSEMBLED_AT: Cell<Option<(u64, u64, bool)>> = const { Cell::new(None) };
     /// The effect queue of the last FULL assembly, with the root and the
-    /// generation it was built for. It has its own key: the input tables
-    /// are also rebuilt outside a pass, when a scene becomes current
-    /// again, and that rebuild makes no queue.
+    /// effect generation it was built for. It has its own key: the
+    /// derived tables are also rebuilt outside a pass, when a scene
+    /// becomes current again, and that rebuild makes no queue.
     static ASSEMBLED_EFFECTS: RefCell<Option<(String, u64, Rc<[EffectFn]>)>> =
         const { RefCell::new(None) };
 }
 
-/// A number that moves when any assembled table moves: every key, and
-/// the identity of every closure behind it. It is the paranoid check's
-/// question, and nothing else asks it.
-pub(crate) fn input_fingerprint() -> u64 {
+fn fingerprint_key(key: &str) -> u64 {
     use std::hash::{Hash, Hasher};
+    let mut hasher = motor::hash::FxHasher::default();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
 
-    fn of_key(key: &str) -> u64 {
-        let mut hasher = motor::hash::FxHasher::default();
-        key.hash(&mut hasher);
-        hasher.finish()
-    }
-    fn of_ptr<T: ?Sized>(shared: &Rc<T>) -> u64 {
-        Rc::as_ptr(shared) as *const () as usize as u64
-    }
+fn fingerprint_ptr<T: ?Sized>(shared: &Rc<T>) -> u64 {
+    Rc::as_ptr(shared) as *const () as usize as u64
+}
 
+/// The fingerprint of the path-keyed tables: every key, and the identity
+/// of every closure behind it. Order never matters inside a table: a sum
+/// is the same in any order. `without_root` leaves the root region's
+/// keys out — the retention never holds those, so a fingerprint built
+/// from it must not see them either.
+fn tables_fingerprint(live: &Live, without_root: bool) -> u64 {
+    let skip = |keys: &[String], key: &str| without_root && keys.iter().any(|root| root == key);
     let mut total = 0u64;
     let mut mix = |part: u64| total = total.wrapping_mul(31).wrapping_add(part);
-    // order never matters inside a table: a sum is the same in any order
-    mix(ACTIONS.with(|map| {
-        map.borrow().iter().fold(0u64, |sum, (key, action)| sum.wrapping_add(of_key(key) ^ of_ptr(action)))
+    // a click key whose owner left waits for the idle: it is not live
+    mix(live.actions.iter().fold(0u64, |sum, (key, registered)| {
+        if skip(&live.root_keys.actions, key) || !registered.is_live() {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(&registered.action))
+        }
     }));
-    mix(COPIES.with(|map| {
-        map.borrow().iter().fold(0u64, |sum, (key, copy)| sum.wrapping_add(of_key(key) ^ of_ptr(copy)))
+    mix(live.copies.iter().fold(0u64, |sum, (key, copy)| {
+        if skip(&live.root_keys.copies, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(copy)) }
     }));
-    mix(EDITORS.with(|map| {
-        map.borrow().iter().fold(0u64, |sum, (key, editor)| sum.wrapping_add(of_key(key) ^ of_ptr(&editor.command)))
+    mix(live.editors.iter().fold(0u64, |sum, (key, editor)| {
+        if skip(&live.root_keys.editors, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(&editor.command)) }
     }));
-    mix(SPLITS.with(|map| {
-        map.borrow().iter().fold(0u64, |sum, (key, split)| sum.wrapping_add(of_key(key) ^ of_ptr(split)))
+    mix(live.splits.iter().fold(0u64, |sum, (key, split)| {
+        if skip(&live.root_keys.splits, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(split)) }
     }));
-    mix(SCROLLS.with(|map| {
-        map.borrow().iter().fold(0u64, |sum, (key, scroll)| sum.wrapping_add(of_key(key) ^ of_ptr(scroll)))
+    mix(live.scrolls.iter().fold(0u64, |sum, (key, scroll)| {
+        if skip(&live.root_keys.scrolls, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(scroll)) }
     }));
-    mix(MEASURES.with(|map| {
-        map.borrow().iter().fold(0u64, |sum, (key, measure)| sum.wrapping_add(of_key(key) ^ of_ptr(measure)))
+    mix(live.measures.iter().fold(0u64, |sum, (key, measure)| {
+        if skip(&live.root_keys.measures, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(measure)) }
     }));
+    mix(live.webviews.keys().fold(0u64, |sum, key| {
+        if skip(&live.root_keys.webviews, key) { sum } else { sum.wrapping_add(fingerprint_key(key)) }
+    }));
+    mix(live.customs.iter().fold(0u64, |sum, key| {
+        if skip(&live.root_keys.customs, key) { sum } else { sum.wrapping_add(fingerprint_key(key)) }
+    }));
+    mix(live.keyed_customs.iter().fold(0u64, |sum, key| {
+        if skip(&live.root_keys.customs, key) { sum } else { sum.wrapping_add(fingerprint_key(key)) }
+    }));
+    total
+}
+
+/// A number that moves when any table the doors read moves: every key,
+/// and the identity of every closure behind it. It is the paranoid
+/// check's question, and nothing else asks it.
+pub(crate) fn input_fingerprint() -> u64 {
+    let mut total = LIVE.with(|live| tables_fingerprint(&live.borrow(), false));
+    let mut mix = |part: u64| total = total.wrapping_mul(31).wrapping_add(part);
     mix(HANDLERS.with(|map| {
         map.borrow().values().fold(0u64, |sum, (depth, handler)| {
-            sum.wrapping_add((*depth as u64).wrapping_mul(0x9E37_79B9) ^ of_ptr(handler))
+            sum.wrapping_add((*depth as u64).wrapping_mul(0x9E37_79B9) ^ fingerprint_ptr(handler))
         })
     }));
-    mix(WEBVIEWS.with(|map| map.borrow().keys().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
-    mix(CUSTOMS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
-    mix(KEYED_CUSTOMS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
-    mix(ACTIVE_CONTEXTS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
+    mix(ACTIVE_CONTEXTS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(fingerprint_key(key)))));
     mix(DECLARED_CONTEXTS.with(|list| {
         list.borrow().iter().fold(0u64, |sum, (path, name, focused)| {
-            sum.wrapping_add(of_key(path) ^ of_key(name) ^ u64::from(*focused))
+            sum.wrapping_add(fingerprint_key(path) ^ fingerprint_key(name) ^ u64::from(*focused))
         })
     }));
     total
 }
 
-fn bump_retention() {
-    RETENTION_GEN.with(|generation| generation.set(generation.get().wrapping_add(1)));
+/// The paranoid oracle of the live tables: built again from the whole
+/// retention, do they hold the same keys over the same closures? The
+/// root region is left out of both sides.
+pub(crate) fn live_tables_match_retention() -> bool {
+    let mut scratch = Live::default();
+    RETAINED.with(|retained| {
+        for (path, entry) in retained.borrow().iter() {
+            scratch.index(path, entry);
+        }
+    });
+    LIVE.with(|live| {
+        let live = live.borrow();
+        tables_fingerprint(&live, true) == tables_fingerprint(&scratch, false) && slots_match(&live, &scratch)
+    })
+}
+
+/// Does the slot index hold the retention's slots — every retained path
+/// under the same shared copy, the same slot behind it, and nothing
+/// else? The index is kept beside the tree, never rebuilt from it, so
+/// the two drifting apart is the one way it can lie.
+fn slots_match(live: &Live, rebuilt: &Live) -> bool {
+    live.slots.len() == rebuilt.slots.len()
+        && rebuilt.slots.iter().all(|(path, slot)| {
+            live.slots
+                .get_key_value(path)
+                .is_some_and(|(key, kept)| Rc::ptr_eq(key, path) && Rc::ptr_eq(kept, slot))
+        })
 }
 
 /// Is the root region of THIS pass empty? Registrations made outside
@@ -1499,25 +2039,33 @@ fn root_region_is_empty() -> bool {
     })
 }
 
-/// Do the assembled tables still answer for `root`? They do when they
-/// were built for it, the retention did not move since, and no root
-/// region fed them then or wants to feed them now.
+fn derived_generations() -> (u64, u64) {
+    LIVE.with(|live| {
+        let live = live.borrow();
+        (live.handler_gen, live.context_gen)
+    })
+}
+
+/// Do the derived tables still answer for `root`? They do when they
+/// were built for it, no entry carrying a handler or a context moved
+/// since, and no root region fed them then or wants to feed them now.
 pub(crate) fn assembly_is_current(root: &str) -> bool {
     let same_root = ASSEMBLED_ROOT.with(|slot| slot.borrow().as_deref() == Some(root));
+    let (handlers, contexts) = derived_generations();
     same_root
-        && ASSEMBLED_AT.with(Cell::get) == Some((RETENTION_GEN.with(Cell::get), false))
+        && ASSEMBLED_AT.with(Cell::get) == Some((handlers, contexts, false))
         && root_region_is_empty()
 }
 
 /// The effect queue this root's last full assembly built — `None` when
-/// the retention moved since, when another scene assembled after it, or
-/// when a root region wants to feed the queue now. The caller then
-/// assembles a new one.
+/// an entry carrying an effect moved since, when another scene
+/// assembled after it, or when a root region wants to feed the queue
+/// now. The caller then assembles a new one.
 pub(crate) fn assembled_effects(root: &str) -> Option<Rc<[EffectFn]>> {
     if !root_region_is_empty() {
         return None;
     }
-    let generation = RETENTION_GEN.with(Cell::get);
+    let generation = LIVE.with(|live| live.borrow().effect_gen);
     ASSEMBLED_EFFECTS.with(|slot| match slot.borrow().as_ref() {
         Some((kept_root, kept_at, queue)) if kept_root == root && *kept_at == generation => {
             Some(Rc::clone(queue))
@@ -1530,9 +2078,10 @@ pub(crate) fn assembled_effects(root: &str) -> Option<Rc<[EffectFn]>> {
 /// nothing. A queue a root region fed is never kept: the region's
 /// closures are new on every pass.
 pub(crate) fn keep_assembled_effects(root: &str, queue: &Rc<[EffectFn]>, had_root_region: bool) {
+    let generation = LIVE.with(|live| live.borrow().effect_gen);
     ASSEMBLED_EFFECTS.with(|slot| {
-        *slot.borrow_mut() = (!had_root_region)
-            .then(|| (root.to_string(), RETENTION_GEN.with(Cell::get), Rc::clone(queue)));
+        *slot.borrow_mut() =
+            (!had_root_region).then(|| (root.to_string(), generation, Rc::clone(queue)));
     });
 }
 
@@ -1541,16 +2090,220 @@ pub(crate) fn pass_has_root_region() -> bool {
     !root_region_is_empty()
 }
 
-/// Whose scene the assembled tables answer for right now.
+/// Whose scene the derived tables answer for right now.
 pub(crate) fn assembled_root() -> Option<String> {
     ASSEMBLED_ROOT.with(|root| root.borrow().clone())
 }
 
-/// Records that the tables now answer for `root` — the runtime calls
-/// this as the last step of assembling them.
+/// Records that the derived tables now answer for `root` — the runtime
+/// calls this as the last step of assembling them.
 pub(crate) fn set_assembled_root(root: &str, had_root_region: bool) {
     ASSEMBLED_ROOT.with(|slot| *slot.borrow_mut() = Some(root.to_string()));
-    ASSEMBLED_AT.with(|at| at.set(Some((RETENTION_GEN.with(Cell::get), had_root_region))));
+    let (handlers, contexts) = derived_generations();
+    ASSEMBLED_AT.with(|at| at.set(Some((handlers, contexts, had_root_region))));
+}
+
+/// The root region's registrations — made outside every boundary —
+/// enter the tables for ONE pass: the last region's leave first, this
+/// pass's go in, and their keys are kept so the next assembly can take
+/// them out again.
+pub(crate) fn refresh_root_region() {
+    let (actions, copies, editors, splits, scrolls, measures, webviews, customs) =
+        PASS.with(|pass| {
+            let mut pass = pass.borrow_mut();
+            (
+                std::mem::take(&mut pass.root_actions),
+                std::mem::take(&mut pass.root_copies),
+                std::mem::take(&mut pass.root_editors),
+                std::mem::take(&mut pass.root_splits),
+                std::mem::take(&mut pass.root_scrolls),
+                std::mem::take(&mut pass.root_measures),
+                std::mem::take(&mut pass.root_webviews),
+                std::mem::take(&mut pass.root_customs),
+            )
+        });
+    LIVE.with(|live| {
+        let mut live = live.borrow_mut();
+        live.drop_root_region();
+        let mut keys = RootKeys::default();
+        for (key, action) in actions {
+            keys.actions.push(key.to_string());
+            live.insert_action(key, action, None);
+        }
+        for (key, copy) in copies {
+            keys.copies.push(key.clone());
+            live.copies.insert(key, copy);
+        }
+        for (key, editor) in editors {
+            keys.editors.push(key.clone());
+            live.editors.insert(key, editor);
+        }
+        for (key, split) in splits {
+            keys.splits.push(key.clone());
+            live.splits.insert(key, split);
+        }
+        for (key, scroll) in scrolls {
+            keys.scrolls.push(key.clone());
+            live.scrolls.insert(key, scroll);
+        }
+        for (key, measure) in measures {
+            keys.measures.push(key.clone());
+            live.measures.insert(key, measure);
+        }
+        for (key, hooks) in webviews {
+            keys.webviews.push(key.clone());
+            live.webviews.insert(key, hooks);
+        }
+        for (key, accepts_keys) in customs {
+            keys.customs.push(key.clone());
+            if accepts_keys {
+                live.keyed_customs.insert(key.clone());
+            }
+            live.customs.insert(key);
+        }
+        live.root_keys = keys;
+    });
+}
+
+/// Removes the entries at `paths` from the retention, and their
+/// registrations from the tables the doors read.
+fn drop_entries<P: AsRef<str>>(paths: &[P]) {
+    if paths.is_empty() {
+        return;
+    }
+    RETAINED.with(|retained| {
+        let mut retained = retained.borrow_mut();
+        LIVE.with(|live| {
+            let mut live = live.borrow_mut();
+            GRAVEYARD.with(|graveyard| {
+                let mut graveyard = graveyard.borrow_mut();
+                let buried = graveyard.len();
+                for path in paths {
+                    if let Some((path, entry)) = retained.remove_entry(path.as_ref()) {
+                        live.unindex_leaving(&path, &entry);
+                        // a view that left owes the read graph nothing
+                        // more: its reads fall with it, and its bindings
+                        // hear no write from here. Unpicking their reads
+                        // waits for the idle, with the entry's memory
+                        motor::identity::retire_view(&path);
+                        // the entry's memory — a layout tree, a value, the
+                        // bindings' objects — is freed when the page is
+                        // idle, not inside the frame that let it go
+                        graveyard.push(entry);
+                    }
+                }
+                if graveyard.len() > buried {
+                    note_buried();
+                }
+            });
+        });
+    });
+}
+
+thread_local! {
+    /// Entries that left the retention and wait for an idle moment to
+    /// be freed: a thousand rows that leave a list are a thousand layout
+    /// trees, and the frame that drops them must not pay their frees.
+    static GRAVEYARD: RefCell<Vec<Box<Entry>>> = const { RefCell::new(Vec::new()) };
+    /// The trees re-runs replaced, waiting for the same idle moment.
+    static REPLACED: RefCell<Vec<Rc<Held>>> = const { RefCell::new(Vec::new()) };
+    /// The pass that buried the oldest garbage still waiting; 0 when
+    /// nothing waits.
+    static BURIED_AT: Cell<u64> = const { Cell::new(0) };
+    /// Has the host asked for the collection itself — a page that goes
+    /// idle between two clicks? Then the valve waits for it as long as
+    /// [`IDLE_HOST_PATIENCE`]. A newborn runtime has not been asked yet.
+    static HOST_COLLECTS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// How many passes garbage waits for an idle moment. A page goes idle
+/// between two clicks and frees it there; a host that never does — a
+/// shell that never asks for the collection — has it freed by the first
+/// pass after this many, so what leaves is never kept for good.
+const GARBAGE_PATIENCE: u64 = 64;
+
+/// How many passes garbage waits on a host that has asked for the
+/// collection. Such a host asks again within a second of any frame (the
+/// page's idle callback has a one-second timeout), and a frame of its own
+/// must never pay for the freeing: sixty-four passes are sixty-four frames
+/// of a list that clicks fast, which may all fall inside one second. This
+/// many passes are more than a quarter minute of frames at sixty a second
+/// — no burst of clicks reaches it — and the valve stays the floor under a
+/// host that stopped asking.
+const IDLE_HOST_PATIENCE: u64 = 1024;
+
+/// Garbage was buried in the pass under way: the oldest starts waiting.
+fn note_buried() {
+    BURIED_AT.with(|at| {
+        if at.get() == 0 {
+            at.set(PASS_NO.with(Cell::get).max(1));
+        }
+    });
+}
+
+/// Frees the entries that left since the last call, and the trees the
+/// re-runs replaced; returns how many of both. The read graph of the
+/// views that left goes first: the bindings they made are taken out of
+/// the register and out of the live table. The host asks for this when
+/// it is idle — and is known from then on as a host that does.
+pub(crate) fn collect_garbage() -> usize {
+    HOST_COLLECTS.with(|asked| asked.set(true));
+    free_garbage()
+}
+
+/// [`collect_garbage`]'s work, for the host's idle and for the valve.
+fn free_garbage() -> usize {
+    BURIED_AT.with(|at| at.set(0));
+    collect_retired_reads();
+    let replaced = take_replaced();
+    let count = replaced.len();
+    drop(replaced);
+    count
+        + GRAVEYARD.with(|graveyard| {
+            let mut graveyard = graveyard.borrow_mut();
+            LIVE.with(|live| live.borrow_mut().take_buried(&graveyard));
+            let count = graveyard.len();
+            graveyard.clear();
+            count
+        })
+}
+
+/// The replaced trees, out of their list — to be dropped by the caller,
+/// with no borrow of the list held while they fall.
+fn take_replaced() -> Vec<Rc<Held>> {
+    REPLACED.with(|replaced| std::mem::take(&mut *replaced.borrow_mut()))
+}
+
+/// The bindings retired since the last collection, taken apart: their
+/// reads in the register ([`motor::identity::collect_retired`]), then
+/// their keys in the live table — a key a body made again stays the new
+/// binding's in both.
+fn collect_retired_reads() {
+    let torn = motor::identity::collect_retired();
+    crate::bind::forget_live(&torn);
+}
+
+/// Diagnostics: entries waiting to be freed.
+pub(crate) fn graveyard_len() -> usize {
+    GRAVEYARD.with(|graveyard| graveyard.borrow().len())
+}
+
+/// Diagnostics: the trees re-runs replaced, waiting to be freed.
+pub(crate) fn replaced_len() -> usize {
+    REPLACED.with(|replaced| replaced.borrow().len())
+}
+
+/// Diagnostics: the click keys entries that left still keep in the live
+/// table, for the idle to take out.
+pub(crate) fn buried_actions() -> usize {
+    LIVE.with(|live| live.borrow().buried_actions)
+}
+
+/// Is anything waiting for [`collect_garbage`] — an entry that left, a
+/// tree a re-run replaced, or the bindings of a view that left, whose
+/// reads still stand in the register?
+pub(crate) fn garbage_pending() -> bool {
+    graveyard_len() > 0 || replaced_len() > 0 || motor::identity::retirement_pending()
 }
 
 /// Drops every retained entry under `root` — the retention half of a
@@ -1558,12 +2311,15 @@ pub(crate) fn set_assembled_root(root: &str, had_root_region: bool) {
 /// other scenes on this thread keep theirs.
 pub(crate) fn forget_under(root: &str) {
     let prefix = format!("{root}/");
-    bump_retention();
-    RETAINED.with(|retained| {
+    let doomed: Vec<String> = RETAINED.with(|retained| {
         retained
-            .borrow_mut()
-            .retain(|path, _| path != root && !path.starts_with(&prefix));
+            .borrow()
+            .keys()
+            .filter(|path| &***path == root || path.starts_with(&prefix))
+            .map(|path| path.to_string())
+            .collect()
     });
+    drop_entries(&doomed);
     ASSEMBLED_ROOT.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.as_deref() == Some(root) {
@@ -1574,17 +2330,17 @@ pub(crate) fn forget_under(root: &str) {
 
 /// Identities swept by `end_pass`: their entries fall with them.
 pub(crate) fn forget(dead: &[String]) {
-    let fell = RETAINED.with(|retained| {
-        let mut retained = retained.borrow_mut();
-        let mut fell = false;
-        for path in dead {
-            fell |= retained.remove(path).is_some();
-        }
-        fell
-    });
-    if fell {
-        bump_retention();
-    }
+    drop_entries(dead);
+}
+
+/// Has the ordered walk passed the whole subtree of `shelter`, which
+/// it met before `path`? The subtree `[shelter/, shelter0)` is one run
+/// of the order, but it does not always follow its root at once: a
+/// sibling that extends the name with a byte below `/` sorts between
+/// them (`P/A` < `P/A!x` < `P/A/c`). Only a path at or past `shelter0`
+/// has left it.
+fn passed(path: &str, shelter: &str) -> bool {
+    !path.starts_with(shelter) || path.as_bytes().get(shelter.len()).is_some_and(|byte| *byte >= b'0')
 }
 
 /// The TWIN of the identity sweep, for views with NO state of their
@@ -1596,27 +2352,166 @@ pub(crate) fn forget(dead: &[String]) {
 /// walk stayed out of it on purpose). An unvisited descendant of a
 /// parent that RE-RAN is dead — the parent revisited its living
 /// children one by one.
+///
+/// Only two places can hold the dead: the subtrees of the bodies that
+/// ran, and the top level, where the root region mounts and unmounts
+/// on its own. The sweep reads those and nothing else — a pass that
+/// ran one body in a list of a thousand reads that body's subtree.
+///
+/// Who survives is read off the entries as the walk passes them: the
+/// pass stamped each one it met ([`Visit`]), so a row costs a compare,
+/// where it cost its path hashed into the sets of every run and every
+/// skip of the pass.
 pub(crate) fn sweep_stale(root: &str) {
-    let (runs, skipped) = PASS.with(|pass| {
-        let pass = pass.borrow();
-        (
-            pass.body_runs.iter().cloned().collect::<HashSet<String>>(),
-            pass.skipped.clone(),
-        )
-    });
-    let fell = RETAINED.with(|retained| {
-        let mut retained = retained.borrow_mut();
-        let before = retained.len();
-        retained.retain(|path, _| {
-            if !covers(root, path) {
-                return true; // another tree mounted on the same thread
+    let mut outermost: Vec<Rc<str>> = PASS.with(|pass| std::mem::take(&mut pass.borrow_mut().outermost));
+    // a run that began with nothing open is outermost by construction;
+    // the few are checked against each other all the same
+    outermost.sort_by_key(|run| run.len());
+    let mut runs: Vec<Rc<str>> = Vec::with_capacity(outermost.len());
+    for run in outermost {
+        if !runs.iter().any(|outer| covers(outer, &run)) {
+            runs.push(run);
+        }
+    }
+    let visit = Visit::now();
+    // a top-level entry the root region did not mount again fell, and
+    // everything under it with it — unless the walk skipped a boundary
+    // between the root and it. Asked first, while nothing has left
+    let fallen: Vec<Rc<str>> = RETAINED.with(|retained| {
+        let retained = retained.borrow();
+        let alive_at_top = |path: &str| {
+            let stamp = retained.get(path).map(|entry| entry.slot.visit.get());
+            if stamp == Some(visit.ran) || stamp == Some(visit.skipped) {
+                return true;
             }
-            runs.contains(path) || skipped.iter().any(|skip| covers(skip, path))
-        });
-        retained.len() != before
+            let mut cut = path.len();
+            while let Some(at) = path[..cut].rfind('/') {
+                if at <= root.len() {
+                    break;
+                }
+                if retained.get(&path[..at]).is_some_and(|entry| entry.slot.visit.get() == visit.skipped) {
+                    return true;
+                }
+                cut = at;
+            }
+            false
+        };
+        LIVE.with(|live| {
+            live.borrow()
+                .top_level
+                .iter()
+                .filter(|path| covers(root, path) && !alive_at_top(path))
+                .map(|path| Rc::from(path.as_str()))
+                .collect()
+        })
     });
-    if fell {
-        bump_retention();
+    RETAINED.with(|retained| {
+        let mut retained = retained.borrow_mut();
+        LIVE.with(|live| {
+            let mut live = live.borrow_mut();
+            GRAVEYARD.with(|graveyard| {
+                let mut graveyard = graveyard.borrow_mut();
+                let buried = graveyard.len();
+                // the entry leaves the tables and the read graph as it
+                // leaves the retention, and waits for the idle to be freed
+                let mut fall = |path: &Rc<str>, entry: Box<Entry>| {
+                    live.unindex_leaving(path, &entry);
+                    motor::identity::retire_view(path);
+                    graveyard.push(entry);
+                };
+                for run in &runs {
+                    sweep_under(&mut retained, run, visit, &mut fall);
+                }
+                for top in &fallen {
+                    sweep_under(&mut retained, top, visit, &mut fall);
+                    if let Some((path, entry)) = retained.remove_entry(&**top) {
+                        fall(&path, entry);
+                    }
+                }
+                if graveyard.len() > buried {
+                    note_buried();
+                }
+            });
+        });
+    });
+}
+
+/// Takes out of the retention every entry under `boundary` the pass did
+/// not meet, and hands each to `fall`.
+///
+/// Alive under a boundary that ran: it ran itself, or it stands at or
+/// under a boundary the walk skipped on purpose BELOW that run. A skipped
+/// ancestor above the run says nothing about what is under the run: the
+/// run rebuilt its subtree, and an entry it did not reach again has left
+/// (a list under a clean page clears, and the page is skipped — its rows
+/// must still go). The entries under one boundary come in one ordered
+/// range — the subtree is contiguous because `/` sorts before every byte
+/// a segment may start with after it — and a skipped entry comes before
+/// its own subtree, so the walk carries the skips it is inside. An entry
+/// that leaves is taken out where a walk stands: no search from the root
+/// of the tree for each one.
+fn sweep_under(
+    retained: &mut BTreeMap<Rc<str>, Box<Entry>>,
+    boundary: &str,
+    visit: Visit,
+    fall: &mut impl FnMut(&Rc<str>, Box<Entry>),
+) {
+    // who leaves, read off the stamps in a walk that only looks: the
+    // skips it stands inside are borrowed, and a row that stays costs
+    // nothing but its compare
+    let mut leaving: Vec<Rc<str>> = Vec::new();
+    let lo = format!("{boundary}/");
+    let hi = format!("{boundary}0");
+    let mut walked = 0;
+    {
+        let range = (std::ops::Bound::Included(lo.as_str()), std::ops::Bound::Excluded(hi.as_str()));
+        let mut shelters: Vec<&str> = Vec::new();
+        for (path, entry) in retained.range::<str, _>(range) {
+            walked += 1;
+            while shelters.last().is_some_and(|shelter| passed(path, shelter)) {
+                shelters.pop();
+            }
+            let stamp = entry.slot.visit.get();
+            if stamp == visit.skipped {
+                shelters.push(path);
+            } else if stamp != visit.ran && !shelters.iter().any(|shelter| covers(shelter, path)) {
+                leaving.push(Rc::clone(path));
+            }
+        }
+    }
+    // everything under the boundary leaves — a list that clears — and
+    // it is most of the retention: the range is cut out of the tree at
+    // its two ends, where taking the entries out one by one rebalanced
+    // the tree at each of them. The cuts touch the entries of the
+    // smaller side, and putting back what lies past the range costs no
+    // more entries than leave
+    if walked > 0 && leaving.len() == walked && walked * 2 >= retained.len() {
+        let mut under = retained.split_off(lo.as_str());
+        let mut after = under.split_off(hi.as_str());
+        if after.len() > retained.len() {
+            std::mem::swap(retained, &mut after);
+        }
+        retained.extend(after);
+        for (path, entry) in under {
+            fall(&path, entry);
+        }
+        return;
+    }
+    // …or taken out in a second walk, from the first that leaves to the
+    // last, each where the walk stands: the list is in the order of the
+    // walk, and holds the very keys it meets
+    let (Some(first), Some(last)) = (leaving.first(), leaving.last()) else {
+        return;
+    };
+    let range = (std::ops::Bound::Included(Rc::clone(first)), std::ops::Bound::Included(Rc::clone(last)));
+    let mut next = 0;
+    let taken = retained.extract_if(range, |path, _| {
+        let leaves = leaving.get(next).is_some_and(|dead| Rc::ptr_eq(dead, path));
+        next += usize::from(leaves);
+        leaves
+    });
+    for (path, entry) in taken {
+        fall(&path, entry);
     }
 }
 
@@ -1624,16 +2519,26 @@ pub(crate) fn sweep_stale(root: &str) {
 /// tests' `render_full`; the state in the identity arenas stays).
 pub(crate) fn clear() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
-    bump_retention();
+    LIVE.with(|live| *live.borrow_mut() = Live::default());
+    collect_retired_reads();
+    drop(take_replaced());
+    GRAVEYARD.with(|graveyard| graveyard.borrow_mut().clear());
+    BURIED_AT.with(|at| at.set(0));
+    ASSEMBLED_AT.with(|at| at.set(None));
 }
 
-/// The world-reset twin of [`clear`]: the retention AND every per-pass
-/// assembly falls. A newborn runtime starts from nothing — see
+/// The world-reset twin of [`clear`]: the retention AND every table
+/// falls. A newborn runtime starts from nothing — see
 /// `motor::identity::reset_world` for the other half of the contract.
 pub(crate) fn reset_world() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
+    collect_retired_reads();
+    drop(take_replaced());
+    GRAVEYARD.with(|graveyard| graveyard.borrow_mut().clear());
+    BURIED_AT.with(|at| at.set(0));
+    HOST_COLLECTS.with(|asked| asked.set(false));
     crate::layout::forget_pictures();
-    bump_retention();
+    LIVE.with(|live| *live.borrow_mut() = Live::default());
     ASSEMBLED_ROOT.with(|root| *root.borrow_mut() = None);
     ASSEMBLED_AT.with(|at| at.set(None));
     ASSEMBLED_EFFECTS.with(|slot| *slot.borrow_mut() = None);
@@ -1643,13 +2548,6 @@ pub(crate) fn reset_world() {
     ACTIVE_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
     DECLARED_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
     HANDLERS.with(|handlers| handlers.borrow_mut().clear());
-    ACTIONS.with(|actions| actions.borrow_mut().clear());
-    COPIES.with(|copies| copies.borrow_mut().clear());
-    EDITORS.with(|editors| editors.borrow_mut().clear());
-    SPLITS.with(|splits| splits.borrow_mut().clear());
-    SCROLLS.with(|scrolls| scrolls.borrow_mut().clear());
-    MEASURES.with(|measures| measures.borrow_mut().clear());
-    CUSTOMS.with(|customs| customs.borrow_mut().clear());
 }
 
 pub(crate) fn end_pass() {
@@ -1665,14 +2563,19 @@ pub(crate) fn end_pass() {
 /// Every body that ran since the last drain — a FRAME may settle over
 /// several passes, and the reuse decision needs all of them. The Dom
 /// frame drains this once per event.
-pub(crate) fn take_frame_runs() -> Vec<String> {
+/// Diagnostics: how many boundaries the reconciler retains.
+pub(crate) fn retained_len() -> usize {
+    RETAINED.with(|retained| retained.borrow().len())
+}
+
+pub(crate) fn take_frame_runs() -> Vec<Rc<str>> {
     FRAME_BODY_RUNS.with(|frame| std::mem::take(&mut *frame.borrow_mut()))
 }
 
 /// Instrumentation: the bodies that ran in the last pass (identity
 /// paths) — the proof of incrementality in the tests.
 pub(crate) fn last_body_runs() -> Vec<String> {
-    LAST_BODY_RUNS.with(|last| last.borrow().clone())
+    LAST_BODY_RUNS.with(|last| last.borrow().iter().map(|run| run.to_string()).collect())
 }
 
 // MARK: - References and expansion
@@ -1702,6 +2605,11 @@ pub(crate) fn expand(node: &RenderNode) -> RenderNode {
         };
         let mut expanded = expand(&inner);
         expanded.line.push_str(suffix);
+        if let Some(read) = expanded.live.take() {
+            // a live line keeps its suffixes: they ride the read
+            let suffix = suffix.to_string();
+            expanded.live = Some(Rc::new(move || format!("{}{suffix}", read())));
+        }
         for child in &node.children {
             expanded.children.push(expand(child));
         }
@@ -1709,6 +2617,7 @@ pub(crate) fn expand(node: &RenderNode) -> RenderNode {
     } else {
         RenderNode {
             line: node.line.clone(),
+            live: node.live.clone(),
             children: node.children.iter().map(expand).collect(),
         }
     }
@@ -1720,36 +2629,24 @@ pub(crate) fn field_key(
     stroke: &crate::action::Stroke,
     state: &mut CaretState,
 ) -> bool {
-    let editor = EDITORS.with(|editors| editors.borrow().get(path).cloned());
+    let editor = editor_at(path);
     editor.and_then(|editor| editor.key).is_some_and(|key| key(stroke, state))
 }
 
 /// The keys the field at `path` asks a software keyboard for — the
 /// letters when nothing there named any.
 pub(crate) fn field_keyboard(path: &str) -> crate::text_input::KeyboardType {
-    EDITORS.with(|editors| {
-        editors.borrow().get(path).map(|editor| editor.keyboard).unwrap_or_default()
-    })
+    editor_at(path).map(|editor| editor.keyboard).unwrap_or_default()
 }
 
 /// The field's own word for the keyboard (`TextField::on_focus`), if the
 /// app gave it one.
 pub(crate) fn field_focus_hook(path: &str) -> Option<Rc<dyn Fn(bool)>> {
-    EDITORS.with(|editors| {
-        editors
-            .borrow()
-            .get(path)
-            .and_then(|editor| editor.focus.clone())
-    })
+    editor_at(path).and_then(|editor| editor.focus.clone())
 }
 
 pub(crate) fn field_policy(path: &str) -> Option<Rc<dyn crate::text_input::EditingStrategy>> {
-    EDITORS.with(|editors| {
-        editors
-            .borrow()
-            .get(path)
-            .and_then(|editor| editor.policy.clone())
-    })
+    editor_at(path).and_then(|editor| editor.policy.clone())
 }
 
 pub(crate) fn field_caret_shape(path: &str) -> crate::text_input::CaretShape {
@@ -1759,40 +2656,876 @@ pub(crate) fn field_caret_shape(path: &str) -> crate::text_input::CaretShape {
 }
 
 pub(crate) fn field_takes_text(path: &str) -> bool {
-    let editor = EDITORS.with(|editors| editors.borrow().get(path).cloned());
+    let editor = editor_at(path);
     editor.is_some_and(|editor| editor.policy.as_ref().is_none_or(|policy| policy.takes_text()))
 }
 
 /// Whether this retained field opts into chat-style Enter submission.
 /// The door a pasted picture goes through, when the field opened one.
 pub(crate) fn field_paste_image(path: &str) -> Option<Rc<dyn Fn(crate::clipboard::ClipboardImage)>> {
-    EDITORS.with(|editors| editors.borrow().get(path).and_then(|editor| editor.paste_image.clone()))
+    editor_at(path).and_then(|editor| editor.paste_image.clone())
 }
 
 /// Does the field stand aside for the app's navigation right now? Read
 /// at the stroke, from the binding the app holds.
 pub(crate) fn field_intercepts_nav(path: &str) -> bool {
-    let intercept = EDITORS.with(|editors| {
-        editors.borrow().get(path).and_then(|editor| editor.nav_intercept.clone())
-    });
+    let intercept = editor_at(path).and_then(|editor| editor.nav_intercept.clone());
     // out of the borrow: reading a binding may reach the app's state
     intercept.is_some_and(|binding| binding.wrappedValue())
 }
 
 pub(crate) fn field_yields_on_submit(path: &str) -> bool {
-    EDITORS.with(|editors| {
-        editors
-            .borrow()
-            .get(path)
-            .is_some_and(|editor| editor.yields_on_submit)
-    })
+    editor_at(path).is_some_and(|editor| editor.yields_on_submit)
 }
 
 pub(crate) fn field_submits_on_enter(path: &str) -> bool {
-    EDITORS.with(|editors| {
-        editors
-            .borrow()
-            .get(path)
-            .is_some_and(|editor| editor.submit_on_enter)
-    })
+    editor_at(path).is_some_and(|editor| editor.submit_on_enter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::action::ActionId;
+    use crate::prelude::*;
+    use crate::runtime::Runtime;
+
+    /// The carrier sets and the top level, built again from the
+    /// retention: who carries a handler, a key context, an effect, and
+    /// who closed with nothing retained above it.
+    fn carriers_match_retention() -> bool {
+        RETAINED.with(|retained| {
+            let retained = retained.borrow();
+            let built = |carries: &dyn Fn(&Entry) -> bool| -> HashSet<String> {
+                retained.iter().filter(|(_, entry)| carries(entry)).map(|(path, _)| path.to_string()).collect()
+            };
+            let handlers = built(&|entry| !entry.handlers().is_empty());
+            let contexts = built(&|entry| !entry.contexts().is_empty());
+            let effects = built(&|entry| !entry.effects.is_empty());
+            let top_level = built(&|entry| entry.top_level);
+            LIVE.with(|live| {
+                let live = live.borrow();
+                live.handler_entries == handlers
+                    && live.context_entries == contexts
+                    && live.effect_entries == effects
+                    && live.top_level == top_level
+            })
+        })
+    }
+
+    /// An entry that falls takes its path out of the carrier sets and the
+    /// top level by what it CARRIES, never by asking each set: the guard
+    /// holds only while a path stands in a set exactly as long as its
+    /// entry carries what the set is for. A carrier that re-runs and sheds
+    /// its handler, one that takes it back, and one that unmounts — after
+    /// each, the sets are what the retention says they are.
+    #[test]
+    fn the_carrier_sets_hold_exactly_the_entries_that_carry() {
+        const POKE: ActionId = ActionId("test.carrier");
+
+        #[derive(Clone, Copy)]
+        struct Carrier {
+            armed: State<bool>,
+        }
+
+        impl Component for Carrier {
+            fn body(self, _ctx: &Context) -> impl View {
+                if self.armed.get() {
+                    Either::First(text("armed").on_action(POKE, || {}).key_context("carrier").on_appear(|| {}))
+                } else {
+                    Either::Second(text("plain"))
+                }
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Holder {
+            mounted: State<bool>,
+            armed: State<bool>,
+        }
+
+        impl Component for Holder {
+            fn body(self, _ctx: &Context) -> impl View {
+                if self.mounted.get() {
+                    Either::First(Carrier { armed: self.armed })
+                } else {
+                    Either::Second(text("closed"))
+                }
+            }
+        }
+
+        let holder = Holder { mounted: State::new(true), armed: State::new(true) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&holder);
+        let carried = |set: fn(&Live) -> usize| LIVE.with(|live| set(&live.borrow()));
+        assert_eq!(carried(|live| live.handler_entries.len()), 1, "the carrier stands in the set");
+        assert!(carriers_match_retention(), "mounted, armed");
+
+        holder.armed.set(false);
+        runtime.render_stable(&holder);
+        assert_eq!(carried(|live| live.handler_entries.len()), 0, "it shed its handler");
+        assert!(carriers_match_retention(), "re-ran and shed its handler, context and effect");
+
+        holder.armed.set(true);
+        runtime.render_stable(&holder);
+        assert!(carriers_match_retention(), "re-ran and took them back");
+
+        // the handler and the context are kept apart from the entry, boxed
+        // only while the body makes them
+        let boxed = || {
+            RETAINED.with(|retained| {
+                retained.borrow().iter().filter(|(_, entry)| entry.rare.is_some()).map(|(path, _)| path.to_string()).collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(boxed().len(), 1, "the armed carrier boxes its rare registrations: {:?}", boxed());
+        holder.armed.set(false);
+        runtime.render_stable(&holder);
+        assert!(boxed().is_empty(), "a body that makes none keeps no box: {:?}", boxed());
+        holder.armed.set(true);
+        runtime.render_stable(&holder);
+
+        holder.mounted.set(false);
+        runtime.render_stable(&holder);
+        assert_eq!(carried(|live| live.handler_entries.len()), 0, "the carrier left with its entry");
+        assert!(carriers_match_retention(), "unmounted");
+        assert_eq!(carried(|live| live.top_level.len()), 1, "the holder alone stands at the top");
+    }
+
+    /// A row of a list, its label bound.
+    #[derive(Clone, Copy)]
+    struct Line {
+        id: usize,
+        label: State<Rc<str>>,
+    }
+
+    impl Component for Line {
+        fn body(self, _ctx: &Context) -> impl View {
+            crate::text!(self.label)
+        }
+    }
+
+    /// A page that is only its list: the list runs, the page is skipped.
+    #[derive(Clone, Copy)]
+    struct Lines {
+        lines: State<Rc<Vec<Line>>>,
+    }
+
+    impl Component for Lines {
+        fn body(self, _ctx: &Context) -> impl View {
+            crate::views::for_each(self.lines, |line| line.id.to_string(), |line| *line)
+        }
+    }
+
+    fn lines(ids: std::ops::RangeInclusive<usize>) -> Rc<Vec<Line>> {
+        Rc::new(ids.map(|id| Line { id, label: State::new(Rc::from(format!("line {id}").as_str())) }).collect())
+    }
+
+    /// A body that runs again fills its slot with the tree of today at
+    /// once — the page above it did not run, and reads the list through
+    /// that slot — while the tree it replaced waits for the idle with the
+    /// entries that left, and leaves with them.
+    #[test]
+    fn a_list_that_runs_again_leaves_the_tree_it_replaced_for_the_idle() {
+        let replaced = || REPLACED.with(|replaced| replaced.borrow().len());
+        let page = Lines { lines: State::new(lines(1..=3)) };
+        let runtime = Runtime::new();
+        let printed = runtime.render(&page);
+        assert!(printed.contains("line 3"), "{printed}");
+        let _ = collect_garbage();
+
+        page.lines.set(lines(4..=5));
+        let printed = runtime.render(&page);
+        assert!(printed.contains("line 4") && printed.contains("line 5"), "the tree of today: {printed}");
+        assert!(!printed.contains("line 3"), "and nothing of the last one: {printed}");
+        assert_eq!(runtime.body_runs().len(), 3, "the list and its two new rows ran, the page did not: {:?}", runtime.body_runs());
+        assert_eq!(replaced(), 1, "the list's last tree waits for the idle");
+        assert_eq!(graveyard_len(), 3, "with the rows that left");
+
+        assert_eq!(collect_garbage(), 4, "the idle frees the tree and the rows");
+        assert_eq!(replaced(), 0);
+        let printed = runtime.render(&page);
+        assert!(printed.contains("line 4") && printed.contains("line 5"), "the slot still holds today's tree: {printed}");
+    }
+
+    /// A page frees what left when it goes idle. A host that never goes
+    /// idle — a shell that never asks for the collection — must not keep
+    /// it for good: garbage that waited out its patience is freed by the
+    /// next pass, the read graph of its bindings with it. Until then it
+    /// waits, so the frames of a page that does go idle still free
+    /// nothing. A runtime born on a thread whose last host asked for the
+    /// collection has not been asked itself.
+    #[test]
+    fn garbage_no_idle_came_for_is_freed_by_a_later_pass() {
+        let earlier = Runtime::new();
+        let _ = collect_garbage();
+        drop(earlier);
+        let three = (1..=3).map(|id| Line { id, label: State::new(Rc::from("line")) }).collect();
+        let lines = State::new(Rc::new(three));
+        let page = Lines { lines };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        lines.set(Rc::new(Vec::new()));
+        runtime.render(&page);
+        assert_eq!(graveyard_len(), 3, "three lines wait for the idle");
+        assert_eq!(motor::identity::retired_count(), 3, "and their bindings");
+
+        for _ in 1..GARBAGE_PATIENCE {
+            runtime.render(&page);
+        }
+        assert_eq!(graveyard_len(), 3, "within its patience the garbage waits");
+        runtime.render(&page);
+        assert_eq!(graveyard_len(), 0, "past it, the pass freed it");
+        assert_eq!(motor::identity::retired_count(), 0, "read graph and all");
+    }
+
+    /// A row that answers a click — or, unarmed, shows the same words
+    /// and answers nothing. The click counts into the row's own state.
+    #[derive(Clone, Copy)]
+    struct Pressable {
+        id: usize,
+        armed: bool,
+        presses: State<usize>,
+    }
+
+    impl Component for Pressable {
+        fn body(self, _ctx: &Context) -> impl View {
+            let presses = self.presses;
+            let words = format!("row {}", self.id);
+            if self.armed {
+                Either::First(text(words).on_click(move || presses.set(presses.get() + 1)))
+            } else {
+                Either::Second(text(words))
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Pressables {
+        rows: State<Rc<Vec<Pressable>>>,
+    }
+
+    impl Component for Pressables {
+        fn body(self, _ctx: &Context) -> impl View {
+            crate::views::for_each(self.rows, |row| row.id.to_string(), |row| *row)
+        }
+    }
+
+    fn pressables(ids: &[usize]) -> Vec<Pressable> {
+        ids.iter().map(|&id| Pressable { id, armed: true, presses: State::new(0) }).collect()
+    }
+
+    /// The click keys standing in the live table whose path holds `part`.
+    fn click_keys(part: &str) -> Vec<String> {
+        LIVE.with(|live| {
+            live.borrow().actions.keys().filter(|key| key.contains(part)).map(|key| key.to_string()).collect()
+        })
+    }
+
+    fn buried_actions() -> usize {
+        LIVE.with(|live| live.borrow().buried_actions)
+    }
+
+    /// A row that leaves keeps its click key in the live table until the
+    /// idle: a thousand rows hashed out of it were the larger part of the
+    /// sweep. But a key whose owner left fires nothing — a press queued
+    /// before the frame still names the element it hit, which is gone —
+    /// and the tables say what the retention says all the while. The idle
+    /// takes the key out; the rows that stayed answer throughout.
+    #[test]
+    fn a_row_that_left_fires_nothing_until_the_idle_takes_its_key_out() {
+        let all = pressables(&[1, 2, 3]);
+        let rows = State::new(Rc::new(all.clone()));
+        let page = Pressables { rows };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        let gone = click_keys("[2]");
+        let kept = click_keys("[3]");
+        assert_eq!((gone.len(), kept.len()), (1, 1), "one click per row: {gone:?} {kept:?}");
+        assert!(run_action(&gone[0], 1), "row 2 answers while it stands");
+        assert_eq!(all[1].presses.get(), 1);
+
+        rows.set(Rc::new(vec![all[0], all[2]]));
+        runtime.render(&page);
+        assert_eq!(click_keys("[2]"), gone, "the key of the row that left waits for the idle");
+        assert_eq!(buried_actions(), 1);
+        assert!(!run_action(&gone[0], 1), "and fires nothing");
+        assert_eq!(all[1].presses.get(), 1, "the row that left was not pressed");
+        assert!(live_tables_match_retention(), "a waiting key is not a live one");
+        assert!(run_action(&kept[0], 1), "a row that stayed answers");
+        assert_eq!(all[2].presses.get(), 1);
+
+        let _ = collect_garbage();
+        assert!(click_keys("[2]").is_empty(), "the idle took the key out");
+        assert_eq!(buried_actions(), 0);
+        assert!(!run_action(&gone[0], 1));
+        assert!(run_action(&kept[0], 1), "and left the rows that stayed alone");
+        assert_eq!(all[2].presses.get(), 2);
+    }
+
+    /// A row that comes back before the idle registers its click again at
+    /// the same key, over the one the row that left kept there: it answers
+    /// with the new closure, and the idle that follows leaves it standing.
+    /// One that comes back with nothing to click stands at the same path
+    /// with a slot of its own — the left key is still not its, and fires
+    /// nothing.
+    #[test]
+    fn a_row_that_comes_back_before_the_idle_answers_with_its_own_click() {
+        let all = pressables(&[1, 2, 3]);
+        let rows = State::new(Rc::new(all.clone()));
+        let page = Pressables { rows };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        let key = click_keys("[2]").pop().expect("row 2's click");
+
+        rows.set(Rc::new(vec![all[0], all[2]]));
+        runtime.render(&page);
+        rows.set(Rc::new(all.clone()));
+        runtime.render(&page);
+        assert!(run_action(&key, 1), "the row that came back answers");
+        assert_eq!(all[1].presses.get(), 1);
+        let _ = collect_garbage();
+        assert_eq!(click_keys("[2]"), [key.clone()], "the idle kept the new registration");
+        assert!(run_action(&key, 1));
+        assert_eq!(all[1].presses.get(), 2);
+
+        // it leaves again, and comes back with nothing to click
+        rows.set(Rc::new(vec![all[0], all[2]]));
+        runtime.render(&page);
+        let plain = Pressable { armed: false, ..all[1] };
+        rows.set(Rc::new(vec![all[0], plain, all[2]]));
+        runtime.render(&page);
+        let back = retained_under("Pressables");
+        assert!(back.iter().any(|path| path.contains("[2]")), "row 2 stands again: {back:?}");
+        assert!(!run_action(&key, 1), "the path stands again, but the key is not the new row's");
+        assert_eq!(all[1].presses.get(), 2);
+        assert!(live_tables_match_retention());
+        let _ = collect_garbage();
+        assert!(click_keys("[2]").is_empty(), "the idle took the left key out");
+    }
+
+    /// A host that asks for the collection when it goes idle — the page —
+    /// never has one of its frames pay for the freeing. Lists replaced,
+    /// rows swapped and lists cleared, click after click, with the idle
+    /// late by far more passes than a host that never asks is given: every
+    /// frame keeps what it let go, and what earlier frames let go, for the
+    /// idle. The idle then frees it all.
+    #[test]
+    fn a_host_that_collects_at_idle_never_frees_inside_a_frame() {
+        let rows = State::new(lines(1..=10));
+        let page = Lines { lines: rows };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        let _ = collect_garbage();
+
+        let idle_at = PASS_NO.with(Cell::get);
+        let mut next = 11;
+        let mut waiting = 0;
+        for click in 0..GARBAGE_PATIENCE * 3 {
+            match click % 3 {
+                0 => {
+                    rows.set(lines(next..=next + 9));
+                    next += 10;
+                }
+                1 => {
+                    let mut swapped = (*rows.get()).clone();
+                    swapped.swap(0, 9);
+                    rows.set(Rc::new(swapped));
+                }
+                _ => rows.set(Rc::new(Vec::new())),
+            }
+            runtime.render(&page);
+            let now = graveyard_len() + REPLACED.with(|replaced| replaced.borrow().len());
+            assert!(now > waiting, "click {click} freed what waited for the idle: {waiting} -> {now}");
+            waiting = now;
+        }
+        let late_by = PASS_NO.with(Cell::get) - idle_at;
+        assert!(late_by >= GARBAGE_PATIENCE * 3, "the idle was late by {late_by} passes");
+        assert_eq!(collect_garbage(), waiting, "the idle frees it all");
+        assert_eq!(graveyard_len(), 0);
+    }
+
+    /// A list that clears, most of the retention, leaves whole: its range
+    /// is cut out of the tree at its two ends. What sorts before the list
+    /// and what sorts after it — a header, a footer with boundaries of its
+    /// own, more of them than stand before — stays retained, every entry,
+    /// and every row leaves as a row taken out alone would: to the idle,
+    /// out of the tables, its bindings retired.
+    #[test]
+    fn a_list_that_clears_leaves_whole_and_keeps_what_sorts_around_it() {
+        #[derive(Clone, Copy)]
+        struct Note(&'static str);
+
+        impl Component for Note {
+            fn body(self, _ctx: &Context) -> impl View {
+                text(self.0)
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Footer;
+
+        impl Component for Footer {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(Note("first"), Note("second"), Note("third"), Note("fourth"))
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Framed {
+            lines: State<Rc<Vec<Line>>>,
+        }
+
+        impl Component for Framed {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(Note("head"), Lines { lines: self.lines }, Footer)
+            }
+        }
+
+        let rows = State::new(lines(1..=12));
+        let page = Framed { lines: rows };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        let all = retained_under("Framed");
+        let around: Vec<String> = all.iter().filter(|path| !path.contains("/[")).cloned().collect();
+        assert_eq!(all.len() - around.len(), 12, "a row each: {all:?}");
+        let _ = collect_garbage();
+
+        rows.set(Rc::new(Vec::new()));
+        let printed = runtime.render(&page);
+        assert_eq!(retained_under("Framed"), around, "the rows left, and everything around them stayed");
+        assert_eq!(graveyard_len(), 12, "to the idle");
+        assert_eq!(motor::identity::retired_count(), 12, "their bindings retired");
+        assert!(live_tables_match_retention() && carriers_match_retention());
+        assert!(printed.contains("head") && printed.contains("third") && !printed.contains("line"), "{printed}");
+        assert_eq!(collect_garbage(), 13, "the rows and the list's old tree");
+    }
+
+    /// The slot index, built again from the retention, against the one
+    /// kept beside it.
+    fn slot_index_matches_retention() -> bool {
+        let mut rebuilt = Live::default();
+        RETAINED.with(|retained| {
+            for (path, entry) in retained.borrow().iter() {
+                rebuilt.index(path, entry);
+            }
+        });
+        LIVE.with(|live| slots_match(&live.borrow(), &rebuilt))
+    }
+
+    /// The decisions, the references and the "still there?" questions
+    /// hash a path into the slot index instead of descending the
+    /// retention's ordered tree — so the index must say what the tree
+    /// says, at every change of it: rows that mount, a list that runs
+    /// again around rows it keeps, a row that runs alone, rows that
+    /// leave, a list that clears and the retention dropped whole.
+    #[test]
+    fn the_slot_index_follows_the_retention_through_every_change() {
+        let page = Lines { lines: State::new(lines(1..=4)) };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        let retained = || RETAINED.with(|retained| retained.borrow().len());
+        let indexed = || LIVE.with(|live| live.borrow().slots.len());
+        assert_eq!((retained(), indexed()), (6, 6), "the page, the list and four rows, each indexed");
+        assert!(slot_index_matches_retention(), "mounted");
+
+        let mut swapped = (*page.lines.get()).clone();
+        swapped.swap(0, 3);
+        page.lines.set(Rc::new(swapped));
+        runtime.render(&page);
+        assert!(slot_index_matches_retention(), "the list ran again around the rows it kept");
+
+        page.lines.get()[1].label.set(Rc::from("relabeled"));
+        runtime.render(&page);
+        assert!(slot_index_matches_retention(), "a row ran alone");
+
+        let mut fewer = (*page.lines.get()).clone();
+        fewer.remove(1);
+        page.lines.set(Rc::new(fewer));
+        runtime.render(&page);
+        assert_eq!((retained(), indexed()), (5, 5), "the row that left left the index too");
+        assert!(slot_index_matches_retention(), "a row left");
+
+        page.lines.set(Rc::new(Vec::new()));
+        runtime.render(&page);
+        assert!(slot_index_matches_retention(), "the list cleared");
+        let _ = collect_garbage();
+        assert!(slot_index_matches_retention(), "the idle freed what left, the index did not move");
+
+        clear();
+        assert_eq!(indexed(), 0, "the retention dropped whole takes the index along");
+    }
+
+    /// A kept row is skipped by its slot's stamp: the decision finds the
+    /// slot in the index, stamps it, and the sweep that walks the list's
+    /// range reads the stamp off the entry's slot — so the row stays.
+    #[test]
+    fn a_kept_row_is_stamped_on_its_slot_and_survives_the_sweep() {
+        let page = Lines { lines: State::new(lines(1..=3)) };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        let row = retained_under("Lines").into_iter().find(|path| path.ends_with("[2]/Line")).expect("row 2");
+        let slot = slot_of(&row);
+        let stamp_before = slot.visit.get();
+
+        let mut reversed = (*page.lines.get()).clone();
+        reversed.reverse();
+        page.lines.set(Rc::new(reversed));
+        runtime.render(&page);
+        assert_eq!(runtime.body_runs().len(), 1, "the list ran, its rows did not: {:?}", runtime.body_runs());
+        assert_eq!(slot.visit.get(), Visit::now().skipped, "the decision stamped the row's slot as skipped");
+        assert_ne!(slot.visit.get(), stamp_before, "a stamp of this pass, not the last one");
+        assert!(Rc::ptr_eq(&slot, &slot_of(&row)), "the row kept its slot");
+        assert!(is_retained(&row), "and the sweep kept the row");
+        assert_eq!(retained_under("Lines").len(), 5, "the page, the list and its three rows: nothing left");
+    }
+
+    /// A row of a list that reads its label in its body.
+    #[derive(Clone, Copy)]
+    struct ReadingLine {
+        id: usize,
+        label: State<Rc<str>>,
+    }
+
+    impl Component for ReadingLine {
+        fn body(self, _ctx: &Context) -> impl View {
+            text(self.label.get().to_string())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct ReadingLines {
+        lines: State<Rc<Vec<ReadingLine>>>,
+    }
+
+    impl Component for ReadingLines {
+        fn body(self, _ctx: &Context) -> impl View {
+            crate::views::for_each(self.lines, |line| line.id.to_string(), |line| *line)
+        }
+    }
+
+    /// A list that runs with no dirt under it asks the dirty set nothing
+    /// for the rows it keeps — but a row whose own read was written in
+    /// the same frame is dirt under the list, and it runs again while
+    /// the rows beside it are kept.
+    #[test]
+    fn a_kept_row_written_while_its_list_runs_still_runs() {
+        let made = (1..=4).map(|id| ReadingLine { id, label: State::new(Rc::from(format!("line {id}").as_str())) });
+        let page = ReadingLines { lines: State::new(Rc::new(made.collect())) };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+
+        // the list alone: every row kept
+        let mut reversed = (*page.lines.get()).clone();
+        reversed.reverse();
+        page.lines.set(Rc::new(reversed));
+        let printed = runtime.render(&page);
+        assert_eq!(runtime.body_runs().len(), 1, "only the list ran: {:?}", runtime.body_runs());
+        assert!(printed.find("line 4") < printed.find("line 1"), "{printed}");
+
+        // the list and one of its rows, in one frame
+        let mut swapped = (*page.lines.get()).clone();
+        swapped.swap(0, 3);
+        swapped[1].label.set(Rc::from("written"));
+        page.lines.set(Rc::new(swapped));
+        let printed = runtime.render(&page);
+        let runs = runtime.body_runs();
+        assert_eq!(runs.len(), 2, "the list and the written row ran: {runs:?}");
+        assert!(runs.iter().any(|run| run.ends_with("[3]/ReadingLine")), "the written row is row 3: {runs:?}");
+        assert!(printed.contains("written") && !printed.contains("line 3"), "and shows what was written: {printed}");
+    }
+
+    /// The counts the components inside a row made, by row and depth.
+    type Counts = Rc<RefCell<HashMap<(usize, u8), State<usize>>>>;
+
+    /// A row with a component inside it, and one inside that.
+    #[derive(Clone)]
+    struct Holder {
+        id: usize,
+        counts: Counts,
+    }
+
+    impl Component for Holder {
+        fn body(self, _ctx: &Context) -> impl View {
+            (text(format!("holder {}", self.id)), Tap { id: self.id, counts: self.counts })
+        }
+    }
+
+    /// Holds a count of its own, and a component that holds another.
+    #[derive(Clone)]
+    struct Tap {
+        id: usize,
+        counts: Counts,
+    }
+
+    impl Component for Tap {
+        fn body(self, _ctx: &Context) -> impl View {
+            let taps = State::new(0usize);
+            self.counts.borrow_mut().insert((self.id, 1), taps);
+            (text(format!("taps {} {}", self.id, taps.get())), Deep { id: self.id, counts: self.counts })
+        }
+    }
+
+    #[derive(Clone)]
+    struct Deep {
+        id: usize,
+        counts: Counts,
+    }
+
+    impl Component for Deep {
+        fn body(self, _ctx: &Context) -> impl View {
+            let deep = State::new(0usize);
+            self.counts.borrow_mut().insert((self.id, 2), deep);
+            text(format!("deep {} {}", self.id, deep.get()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct Holders {
+        ids: State<Rc<Vec<usize>>>,
+        counts: Counts,
+        once: bool,
+    }
+
+    impl Component for Holders {
+        fn body(self, _ctx: &Context) -> impl View {
+            let counts = self.counts;
+            let row = move |id: &usize| Holder { id: *id, counts: counts.clone() };
+            let list = crate::views::for_each(self.ids, |id| id.to_string(), row);
+            if self.once { list.once_per_key() } else { list }
+        }
+    }
+
+    /// A list that runs again keeps its clean rows, and the walk stays out
+    /// of them — so what is dirty inside a kept row runs after the walk,
+    /// once: a component written in the frame its list reorders, the one
+    /// inside it written too (it runs with its parent, not again), and one
+    /// written two boundaries down in a row whose middle is clean. What is
+    /// dirty inside a row that left in the frame its list ran is not run
+    /// back to life: it left with its row.
+    #[test]
+    fn what_is_dirty_inside_a_kept_row_runs_once_and_inside_a_row_that_left_not_at_all() {
+        for once in [false, true] {
+            let counts = Counts::default();
+            let page = Holders { ids: State::new(Rc::new(vec![1, 2, 3, 4])), counts: Rc::clone(&counts), once };
+            let runtime = Runtime::new();
+            runtime.render(&page);
+            let count = |id: usize, depth: u8| counts.borrow()[&(id, depth)];
+
+            page.ids.set(Rc::new(vec![1, 3, 2, 4]));
+            count(2, 1).set(5);
+            count(2, 2).set(6);
+            count(3, 2).set(7);
+            let printed = runtime.render(&page);
+            let runs = runtime.body_runs();
+            let ran = |end: &str| runs.iter().filter(|run| run.ends_with(end)).count();
+            assert_eq!(runs.len(), 4, "the list and three components (once {once}): {runs:?}");
+            let ends = ["/Keyed", "/[2]/Holder/#1/Tap", "/[2]/Holder/#1/Tap/#1/Deep", "/[3]/Holder/#1/Tap/#1/Deep"];
+            assert_eq!(ends.map(ran), [1; 4], "the list, then each dirty component once (once {once}): {runs:?}");
+            for shown in ["taps 2 5", "deep 2 6", "deep 3 7"] {
+                assert!(printed.contains(shown), "{shown:?} shows (once {once}): {printed}");
+            }
+
+            page.ids.set(Rc::new(vec![1, 3, 2]));
+            count(4, 1).set(8);
+            let printed = runtime.render(&page);
+            assert_eq!(runtime.body_runs().len(), 1, "only the list ran (once {once}): {:?}", runtime.body_runs());
+            assert!(!printed.contains("holder 4"), "row 4 left (once {once}): {printed}");
+            let held = retained_under("Holders");
+            assert!(held.iter().all(|path| !path.contains("[4]")), "and all it held with it (once {once}): {held:?}");
+        }
+    }
+
+    /// The paths retained under a prefix, sorted.
+    fn retained_under(prefix: &str) -> Vec<String> {
+        RETAINED.with(|retained| {
+            retained.borrow().keys().filter(|path| path.starts_with(prefix)).map(|path| path.to_string()).collect()
+        })
+    }
+
+    /// The sweep reads who survives off the entries in path order, and a
+    /// row the walk skipped shelters its subtree. The subtree is one run
+    /// of the order, but not always right after its row: a row whose key
+    /// extends the other's path with a byte that sorts below `/` falls in
+    /// between (`…/[a]/Row` < `…/[a]/Row!]/Row` < `…/[a]/Row/Leaf`). Both
+    /// rows are kept while the list re-runs around them, and neither one
+    /// loses the boundary inside it.
+    #[test]
+    fn a_row_that_sorts_inside_another_rows_name_leaves_its_subtree_sheltered() {
+        #[derive(Clone)]
+        struct Leaf {
+            word: Rc<str>,
+        }
+
+        impl Component for Leaf {
+            fn body(self, _ctx: &Context) -> impl View {
+                text(self.word.to_string())
+            }
+        }
+
+        #[derive(Clone)]
+        struct Row {
+            key: Rc<str>,
+        }
+
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                Leaf { word: Rc::clone(&self.key) }
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            keys: State<Rc<Vec<Rc<str>>>>,
+        }
+
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::views::for_each(self.keys, |key| key.to_string(), |key| Row { key: Rc::clone(key) })
+            }
+        }
+
+        let keys: State<Rc<Vec<Rc<str>>>> = State::new(Rc::new(vec![Rc::from("a"), Rc::from("a]/Row!")]));
+        let page = Page { keys };
+        let runtime = Runtime::new();
+        runtime.render_stable(&page);
+        let leaves = |all: &[String]| all.iter().filter(|path| path.ends_with("/Leaf")).cloned().collect::<Vec<_>>();
+        let before = retained_under("Page");
+        let sheltered = leaves(&before);
+        assert_eq!(sheltered.len(), 2, "a leaf in each row: {before:?}");
+        let inner = sheltered.iter().find(|path| path.contains("[a]/Row/")).expect("row a's leaf");
+        let between = before.iter().find(|path| path.ends_with("[a]/Row!]/Row")).expect("the other row");
+        assert!(
+            inner.as_str() > between.as_str() && between.as_str() > inner.trim_end_matches("/Leaf"),
+            "the other row sorts between row a and its leaf: {before:?}"
+        );
+
+        // the list re-runs around both rows: they are kept, and skipped
+        keys.set(Rc::new(vec![Rc::from("a"), Rc::from("a]/Row!"), Rc::from("b")]));
+        runtime.render_stable(&page);
+        let after = retained_under("Page");
+        for leaf in &sheltered {
+            assert!(after.contains(leaf), "{leaf} survived the sweep: {after:?}");
+        }
+        assert_eq!(after.len(), before.len() + 2, "row b and its leaf joined: {after:?}");
+
+        // and a row that leaves takes its leaf along
+        keys.set(Rc::new(vec![Rc::from("a]/Row!"), Rc::from("b")]));
+        runtime.render_stable(&page);
+        let gone = retained_under("Page");
+        assert!(!gone.contains(inner) && gone.len() == after.len() - 2, "row a and its leaf left: {gone:?}");
+    }
+
+    /// A frame's pass prints nothing, so the entries it files keep no
+    /// name — and a print that comes after still names every boundary,
+    /// because a retention built without print is built again before
+    /// anything prints it.
+    #[test]
+    fn a_frame_files_no_name_and_a_print_after_it_names_every_boundary() {
+        let page = Lines { lines: State::new(lines(1..=2)) };
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&page, crate::layout::Size { width: 400.0, height: 300.0 });
+        let named: Vec<String> = RETAINED.with(|retained| {
+            retained.borrow().iter().filter(|(_, entry)| !entry.node.line.is_empty()).map(|(path, _)| path.to_string()).collect()
+        });
+        assert!(named.is_empty(), "a frame names no boundary: {named:?}");
+        let printed = runtime.render(&page);
+        assert!(printed.starts_with("Lines"), "the page is named: {printed}");
+        assert!(printed.matches("Line\n").count() == 2, "and so is each row: {printed}");
+    }
+
+    /// Every reference to a boundary, in every retained tree, with the
+    /// slot it holds.
+    fn references() -> Vec<(Rc<str>, Rc<Slot>)> {
+        fn walk(node: &LayoutNode, out: &mut Vec<(Rc<str>, Rc<Slot>)>) {
+            match node {
+                LayoutNode::BoundaryRef { path, slot, .. } => out.push((Rc::clone(path), Rc::clone(slot))),
+                LayoutNode::Stack { children, .. } | LayoutNode::Boundary { children, .. } => {
+                    children.iter().for_each(|child| walk(child, out));
+                }
+                LayoutNode::Hinted { child, .. }
+                | LayoutNode::Interactive { child, .. }
+                | LayoutNode::Styled { child, .. } => walk(child, out),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        RETAINED.with(|retained| {
+            for entry in retained.borrow().values() {
+                entry.slot.with_layout(|tree| tree.into_iter().for_each(|tree| walk(tree, &mut out)));
+            }
+        });
+        out
+    }
+
+    /// What a closing body knows without searching must be what a
+    /// search would find. The reference a parent's list keeps holds the
+    /// very slot its boundary's entry was filed with — on a fresh mount
+    /// and on a re-run alike — and an entry stands at the top level
+    /// exactly when no retained boundary sits above it.
+    #[test]
+    fn a_closing_body_knows_its_slot_and_its_level_without_a_search() {
+        thread_local! {
+            static TOGGLE_RUNS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        #[derive(Clone, Copy)]
+        struct Toggle {
+            id: usize,
+            on: State<bool>,
+        }
+
+        impl Component for Toggle {
+            fn body(self, _ctx: &Context) -> impl View {
+                TOGGLE_RUNS.with(|runs| runs.set(runs.get() + 1));
+                if self.on.get() { Either::First(text("on")) } else { Either::Second(text("off")) }
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Toggles {
+            toggles: State<Rc<Vec<Toggle>>>,
+        }
+
+        impl Component for Toggles {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::views::for_each(self.toggles, |toggle| toggle.id.to_string(), |toggle| toggle.element("tr"))
+            }
+        }
+
+        let check = |when: &str| {
+            let refs = references();
+            assert!(!refs.is_empty(), "{when}: the list refers to its rows");
+            RETAINED.with(|retained| {
+                let retained = retained.borrow();
+                for (path, slot) in &refs {
+                    let entry = retained.get(&**path).unwrap_or_else(|| panic!("{when}: {path} is retained"));
+                    assert!(Rc::ptr_eq(&entry.slot, slot), "{when}: the reference to {path} holds its entry's slot");
+                }
+                for (path, entry) in retained.iter() {
+                    let above = cuts(path).any(|prefix| retained.contains_key(prefix));
+                    assert_eq!(entry.top_level, !above, "{when}: {path} stands at the top exactly when nothing is above it");
+                }
+            });
+        };
+
+        let on = State::new(false);
+        let toggles = State::new(Rc::new((1..=3).map(|id| Toggle { id, on }).collect::<Vec<_>>()));
+        let page = Toggles { toggles };
+        let runtime = Runtime::new();
+        let size = crate::layout::Size { width: 400.0, height: 300.0 };
+        let _ = runtime.dom_frame(&page, size);
+        assert_eq!(TOGGLE_RUNS.with(Cell::get), 3, "three rows mounted");
+        check("mounted");
+
+        // the rows re-run on their own: their entries are replaced
+        on.set(true);
+        let _ = runtime.dom_frame(&page, size);
+        assert_eq!(TOGGLE_RUNS.with(Cell::get), 6, "the three rows ran again");
+        check("re-run");
+
+        // the list re-runs: the kept rows are skipped, a new one mounts
+        toggles.set(Rc::new((1..=4).map(|id| Toggle { id, on }).collect()));
+        let _ = runtime.dom_frame(&page, size);
+        assert_eq!(TOGGLE_RUNS.with(Cell::get), 7, "the new row alone ran");
+        check("a row added");
+    }
 }
