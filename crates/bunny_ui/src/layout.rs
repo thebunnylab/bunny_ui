@@ -5024,6 +5024,16 @@ impl LayoutNode {
                 // what it really is — and a row above the viewport that
                 // changed owes the scroll its difference, so the rows on
                 // the glass stay where the reader is looking
+                // did this measure teach the cache a height it did not
+                // know? A list whose rows confirmed what the cache held
+                // answers the same total next frame for the same key — a
+                // function of the key and the retained tree, like any
+                // boundary's measure. One that moved a height is not: the
+                // starts under it change, and the boundaries above must
+                // ask again. (The transcript of an idle Trinity window
+                // re-measured its whole dock chain on every caret frame
+                // because every measure here poisoned, 2026-10-03.)
+                let mut cache_moved = false;
                 if let Some(cache) = cache {
                     let offset = env.scroll_offsets.get(&cache.path).map_or(0.0, |at| at.y);
                     // where each row started BEFORE this measure: a row
@@ -5032,9 +5042,9 @@ impl LayoutNode {
                     let starts = cache.offsets(*count);
                     let mut owed = 0.0;
                     for (index, size, _) in &measured {
-                        if let Some(before) = cache.record(*index, size.height)
-                            && starts.get(*index).is_some_and(|start| *start < offset - SETTLED)
-                        {
+                        let Some(before) = cache.record(*index, size.height) else { continue };
+                        cache_moved = true;
+                        if starts.get(*index).is_some_and(|start| *start < offset - SETTLED) {
                             owed += size.height - before;
                         }
                     }
@@ -5070,9 +5080,14 @@ impl LayoutNode {
                 };
                 match offsets {
                     Some(offsets) => {
-                        // the app answers each row's height, or the glass
-                        // does: not ours to keep
-                        poison_measure();
+                        // the app's closure answers each row's height by
+                        // its own rules: never ours to keep. The glass's
+                        // rows are kept while they confirm what the cache
+                        // knew; a measure that moved a height is asked
+                        // again next frame, and the one after it is kept.
+                        if cache.is_none() || cache_moved {
+                            poison_measure();
+                        }
                         let total = *offsets.last().expect("offsets carry the total");
                         (
                             Size { width, height: total },
