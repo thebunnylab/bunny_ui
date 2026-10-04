@@ -17,18 +17,23 @@ function interactive() {
   return [...document.querySelectorAll("#app [data-path]")];
 }
 
+// The action path an element answers with, whole: a row's path crosses
+// told against the row, and the glue resolves it.
+function pathOf(el) {
+  return window.__bunnyPath(el);
+}
+
 function control(name) {
-  const el = interactive().find((el) => el.dataset.path.includes(`[${name}]`));
+  const el = interactive().find((el) => pathOf(el).includes(`[${name}]`));
   if (!el) throw new Error(`no control named ${name}`);
   return el;
 }
 
 function rowEls() {
-  return interactive().filter(
-    (el) =>
-      !el.dataset.path.includes("[toggle_all]") &&
-      !el.dataset.path.includes("[filter]"),
-  );
+  return interactive().filter((el) => {
+    const path = pathOf(el);
+    return !path.includes("[toggle_all]") && !path.includes("[filter]");
+  });
 }
 
 // A real click: pointerdown + pointerup at the element's centre,

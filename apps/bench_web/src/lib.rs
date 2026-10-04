@@ -178,7 +178,9 @@ pub mod keyed {
 
     /// One row: the component wears the `<tr>` (its identity group IS
     /// the element), and its body is the cells — DIRECT children, the
-    /// exact nesting the harness pierces.
+    /// exact nesting the harness pierces. The body runs ONCE per key:
+    /// the label and the selection flag are read by their nodes, so a
+    /// write to either moves one element and runs no body at all.
     #[derive(Clone, Copy)]
     struct KeyedRow {
         seed: RowSeed,
@@ -193,15 +195,14 @@ pub mod keyed {
             let rows = self.rows;
             let selected = self.selected;
             (
-                // the row's OWN selection flag flips its own <tr>
-                boundary_class(if seed.selected.get() { "danger" } else { "" }),
+                // the row's OWN selection flag flips its own <tr>, read
+                // by the element — no body hears about it
+                boundary_class_when(seed.selected, "danger"),
                 text(id.to_string())
-                    .foreground_color(theme::fg())
                     .element("td")
                     .css_class("col-md-1"),
                 hstack!(
-                    text(seed.label.get().to_string())
-                        .foreground_color(theme::fg())
+                    text!(seed.label)
                         .element("a")
                         .on_click(move || {
                             // the two rows that change are the only
@@ -217,8 +218,10 @@ pub mod keyed {
                 .css_class("col-md-4"),
                 hstack!(
                     hstack!(
-                        text("x")
-                            .foreground_color(theme::fg_secondary())
+                        // the page's stylesheet draws the glyph through
+                        // the class, in its own icon font: an empty
+                        // element, not a text wearing a face of ours
+                        hstack!(empty())
                             .element("span")
                             .css_class("glyphicon glyphicon-remove")
                     )
@@ -231,7 +234,9 @@ pub mod keyed {
                 )
                 .element("td")
                 .css_class("col-md-1"),
-                hstack!(text(String::new())).element("td").css_class("col-md-6"),
+                // the last cell holds nothing at all: no text node to
+                // fill on every row the list mounts
+                hstack!(empty()).element("td").css_class("col-md-6"),
             )
         }
     }
@@ -263,6 +268,113 @@ pub mod keyed {
         }
     }
 
+    /// The hybrid page's root: the same controls as real elements, the
+    /// table as one canvas island our layout positions and paints.
+    #[cfg(feature = "gpu")]
+    #[derive(Clone)]
+    pub struct HybridApp(pub App);
+
+    #[cfg(feature = "gpu")]
+    pub fn hybrid_app() -> HybridApp {
+        HybridApp(app())
+    }
+
+    /// The pixel page's root: the whole page through the pixel
+    /// pipeline, the table scrolling inside the pane.
+    #[cfg(feature = "gpu")]
+    #[derive(Clone)]
+    pub struct PixelApp(pub App);
+
+    #[cfg(feature = "gpu")]
+    pub fn pixel_app() -> PixelApp {
+        PixelApp(app())
+    }
+
+    /// The selected row's wash: the theme's accent, a quarter strong.
+    #[cfg(feature = "gpu")]
+    fn selection_tint() -> Color {
+        let accent = bunny_ui::theme::current().accent;
+        Color::rgba(accent.r, accent.g, accent.b, 64)
+    }
+
+    /// One row as pixels: the same three cells a table row has, in a
+    /// row of fixed lanes — the element hints mean nothing to a canvas,
+    /// so the row says its shape itself.
+    #[cfg(feature = "gpu")]
+    #[derive(Clone, Copy)]
+    struct PixelRow {
+        seed: RowSeed,
+        rows: State<Rc<Vec<RowSeed>>>,
+        selected: State<Option<RowSeed>>,
+    }
+
+    #[cfg(feature = "gpu")]
+    impl Component for PixelRow {
+        fn body(self, _ctx: &Context) -> impl View {
+            let seed = self.seed;
+            let id = seed.id;
+            let rows = self.rows;
+            let selected = self.selected;
+            // the selection is the row's own flag: this body reads it,
+            // so a select re-runs the two rows that change and paints
+            // them — one row's worth of pixels each
+            let marked = seed.selected.get();
+            hstack!(
+                text(id.to_string()).foreground_color(theme::fg()).frame_width(72.0),
+                // the cells carry names, so a runner finds a row's
+                // label or its remove on the canvas by them
+                text!(seed.label)
+                    .foreground_color(theme::fg())
+                    .on_click(move || {
+                        if let Some(was) = selected.get() {
+                            was.selected.set(false);
+                        }
+                        seed.selected.set(true);
+                        selected.set(Some(seed));
+                    })
+                    .id("label")
+                    .frame_width_aligned(300.0, Alignment::Leading),
+                text("x")
+                    .foreground_color(theme::fg_secondary())
+                    .on_click(move || {
+                        let mut kept = (*rows.get()).clone();
+                        kept.retain(|seed| seed.id != id);
+                        rows.set(Rc::new(kept));
+                    })
+                    .id("remove")
+                    .frame_width(72.0),
+            )
+            .spacing(8.0)
+            .padding_length(8.0)
+            .frame_max(f64::INFINITY, 36.0, Alignment::Leading)
+            .background_color(if marked { selection_tint() } else { CLEAR })
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    impl App {
+        /// The table as pixels: the keyed list of pixel rows, scrolling
+        /// inside the pane.
+        fn pixel_table(self) -> impl View<Arity = bunny_ui::view::Single> {
+            let rows = self.rows;
+            let selected = self.selected;
+            scroll(
+                for_each(rows, |seed| seed.id.to_string(), move |seed| PixelRow { seed: *seed, rows, selected })
+                    .once_per_key(),
+            )
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    impl Component for PixelApp {
+        fn body(self, _ctx: &Context) -> impl View {
+            vstack!(self.0.clone().controls(), self.0.pixel_table())
+                .alignment(HorizontalAlignment::Leading)
+                .frame(900.0, 800.0)
+                .background_color(theme::panel())
+        }
+    }
+
     fn build(from: usize, count: usize) -> Vec<RowSeed> {
         (0..count)
             .map(|i| RowSeed {
@@ -273,14 +385,58 @@ pub mod keyed {
             .collect()
     }
 
+    /// The page's own typography — the face and the size its stylesheet
+    /// gives every other implementation by inheritance. A face named
+    /// matches once in the browser and is cached; the system face, a
+    /// generic the browser resolves per text run, costs the layout a
+    /// millisecond per thousand rows.
+    const PAGE_FACE: &str = "Helvetica Neue";
+    const PAGE_SIZE: f64 = 14.0;
+
     impl Component for App {
         fn body(self, _ctx: &Context) -> impl View {
+            vstack!(self.clone().controls(), self.table())
+                .alignment(HorizontalAlignment::Leading)
+                .frame(900.0, 800.0)
+                .background_color(theme::panel())
+                .font_family(PAGE_FACE)
+                .font_size(PAGE_SIZE)
+                .element_id("main")
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    impl Component for HybridApp {
+        fn body(self, _ctx: &Context) -> impl View {
+            vstack!(
+                self.0.clone().controls(),
+                // the island: the table's rows are pixels the engine
+                // paints, positioned by the page's own flow. The rows
+                // scroll inside the pane — the island is the pane's
+                // size, and the rows outside it are never rasterized
+                self.0.pixel_table().rendering(bunny_ui::layout::Rendering::Gpu),
+            )
+            .alignment(HorizontalAlignment::Leading)
+            .frame(900.0, 800.0)
+            .background_color(theme::panel())
+            .font_family(PAGE_FACE)
+            .font_size(PAGE_SIZE)
+            .element_id("main")
+        }
+    }
+
+    impl App {
+        /// The six chips, as real buttons with the ids the harness clicks.
+        fn controls(self) -> impl View<Arity = bunny_ui::view::Single> {
             let rows = self.rows;
             let selected = self.selected;
             let next_id = self.next_id;
-            let data = rows.get();
 
-            let chip = |label: &str, id: &str| {
+            // the id is the element's for the page and the identity's
+            // for the hit table: a page without elements finds the
+            // chip by the same name — so the name wraps the click,
+            // and the action's path carries it
+            let chip = |label: &str, id: &str, action: fn(State<Rc<Vec<RowSeed>>>, State<Option<RowSeed>>, State<usize>)| {
                 text(label.to_string())
                     .foreground_color(theme::fg())
                     .padding_length(8.0)
@@ -288,27 +444,29 @@ pub mod keyed {
                     .corner_radius(4.0)
                     .element("button")
                     .element_id(id)
+                    .on_click(move || action(rows, selected, next_id))
+                    .id(id)
             };
 
-            let controls = hstack!(
-                chip("Create 1,000 rows", "run").on_click(move || {
+            hstack!(
+                chip("Create 1,000 rows", "run", |rows, _, next_id| {
                     let from = next_id.get();
                     rows.set(Rc::new(build(from, 1_000)));
                     next_id.set(from + 1_000);
                 }),
-                chip("Create 10,000 rows", "runlots").on_click(move || {
+                chip("Create 10,000 rows", "runlots", |rows, _, next_id| {
                     let from = next_id.get();
                     rows.set(Rc::new(build(from, 10_000)));
                     next_id.set(from + 10_000);
                 }),
-                chip("Append 1,000 rows", "add").on_click(move || {
+                chip("Append 1,000 rows", "add", |rows, _, next_id| {
                     let from = next_id.get();
                     let mut grown = (*rows.get()).clone();
                     grown.extend(build(from, 1_000));
                     rows.set(Rc::new(grown));
                     next_id.set(from + 1_000);
                 }),
-                chip("Update every 10th row", "update").on_click(move || {
+                chip("Update every 10th row", "update", |rows, _, _| {
                     // one hundred signals flip; nine hundred rows
                     // never hear about it
                     for seed in rows.get().iter().step_by(10) {
@@ -316,11 +474,11 @@ pub mod keyed {
                         seed.label.set(Rc::from(grown.as_str()));
                     }
                 }),
-                chip("Clear", "clear").on_click(move || {
+                chip("Clear", "clear", |rows, selected, _| {
                     rows.set(Rc::new(Vec::new()));
                     selected.set(None);
                 }),
-                chip("Swap Rows", "swaprows").on_click(move || {
+                chip("Swap Rows", "swaprows", |rows, _, _| {
                     let mut swapped = (*rows.get()).clone();
                     if swapped.len() > 998 {
                         swapped.swap(1, 998);
@@ -329,24 +487,115 @@ pub mod keyed {
                 }),
             )
             .spacing(6.0)
-            .padding_length(8.0);
+            .padding_length(8.0)
+        }
 
+        /// The table: the keyed list of rows. It takes the pane's
+        /// width — a table left to its own width is measured whole
+        /// once for the width and once more to lay out.
+        fn table(self) -> impl View<Arity = bunny_ui::view::Single> {
+            let rows = self.rows;
+            let selected = self.selected;
+            // the LIST reads the rows: a change to them runs the list's
+            // key diff and nothing above it — a new key runs its row
+            // once, a key that left takes its row along, a swap moves.
+            // A row is its seed's, for as long as the seed's id stays:
+            // the closure builds it once per key
             let table = for_each(
-                (*data).clone(),
+                rows,
                 |seed| seed.id.to_string(),
                 move |seed| KeyedRow { seed: *seed, rows, selected }.element("tr"),
-            );
-
-            vstack!(
-                controls,
-                hstack!(table.element("tbody"))
-                    .element("table")
-                    .css_class("table table-hover table-striped test-data"),
             )
-            .alignment(HorizontalAlignment::Leading)
-            .frame(900.0, 800.0)
-            .background_color(theme::panel())
-            .element_id("main")
+            .once_per_key();
+            hstack!(table.element("tbody"))
+                .element("table")
+                .css_class("table table-hover table-striped test-data")
+                .frame_max(f64::INFINITY, f64::INFINITY, Alignment::Leading)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A row is the markup the harness pierces: four cells, the label
+        /// as a link in the second, the glyph's link in the third, and a
+        /// last cell with nothing in it — no element, no text node.
+        #[test]
+        fn a_row_is_the_markup_the_harness_reads() {
+            let page = app();
+            page.rows.set(Rc::new(build(1, 2)));
+            let served = bunny_ui::ssr::render(&page, bunny_ui::layout::Size { width: 1200.0, height: 800.0 });
+            let html = &served.html;
+            let rows: Vec<&str> = html.split("<tr").skip(1).collect();
+            assert_eq!(rows.len(), 2, "{html}");
+            for (id, row) in (1..).zip(rows) {
+                let row = &row[..row.find("</tr>").expect("a closed row")];
+                assert_eq!(row.matches("<td").count(), 4, "four cells: {row}");
+                let cells: Vec<&str> = row.split("<td").skip(1).collect();
+                assert!(cells[0].contains(&format!(">{id}</td>")), "the id cell: {row}");
+                assert!(cells[1].contains("<a") && cells[1].contains(&label_for(id)), "the label is a link: {row}");
+                assert!(cells[2].contains("<a") && cells[2].contains("glyphicon glyphicon-remove"), "the glyph's link: {row}");
+                let last = cells[3];
+                let body = &last[last.find('>').expect("the cell opens") + 1..];
+                assert!(body.starts_with("</td>"), "the last cell is empty: {row}");
+            }
+        }
+
+        /// One frame, replayed on the page the way the glue applies it:
+        /// every target on it must send the path the engine knows it by.
+        fn frame(page: &App, runtime: &bunny_ui::runtime::Runtime, replay: &mut bunny_ui::ssr::Replay) {
+            replay.apply(&runtime.dom_frame(page, SIZE));
+            assert_eq!(replay.action_paths(), runtime.dom_action_paths());
+        }
+
+        /// A click on the target whose whole path ends so, by the path
+        /// the page resolves for it.
+        fn click(replay: &bunny_ui::ssr::Replay, runtime: &bunny_ui::runtime::Runtime, ends_with: &str) {
+            let path = replay
+                .action_paths()
+                .into_values()
+                .find(|path| path.ends_with(ends_with))
+                .unwrap_or_else(|| panic!("no target ends with {ends_with}"));
+            assert!(runtime.dom_action(&path, 1), "a live action: {path}");
+        }
+
+        const SIZE: bunny_ui::layout::Size = bunny_ui::layout::Size { width: 1200.0, height: 800.0 };
+
+        /// The official session, clicked through the paths the page
+        /// resolves — a row's label and remove cross told against the
+        /// row, the chips against the app — and every target on the page
+        /// sends, after every operation, the path it sent when paths
+        /// crossed whole.
+        #[test]
+        fn every_click_sends_the_engines_path() {
+            let page = app();
+            let runtime = bunny_ui::runtime::Runtime::new();
+            let mut replay = bunny_ui::ssr::Replay::new(SIZE);
+            frame(&page, &runtime, &mut replay);
+
+            click(&replay, &runtime, "[run]");
+            frame(&page, &runtime, &mut replay);
+            assert_eq!(page.rows.get().len(), 1_000);
+            assert!(replay.html().contains("data-path=\"~/#2/#0\""), "a row's label is told against the row");
+
+            // select row 2 by its label, remove row 5 by its glyph
+            click(&replay, &runtime, "[2]/KeyedRow/#2/#0");
+            frame(&page, &runtime, &mut replay);
+            assert!(page.rows.get()[1].selected.get());
+            for chip in ["[update]", "[swaprows]"] {
+                click(&replay, &runtime, chip);
+                frame(&page, &runtime, &mut replay);
+            }
+            click(&replay, &runtime, "[5]/KeyedRow/#3/#0");
+            frame(&page, &runtime, &mut replay);
+            assert!(page.rows.get().iter().all(|seed| seed.id != 5));
+            assert_eq!(page.rows.get().len(), 999);
+            for chip in ["[add]", "[run]", "[clear]", "[run]"] {
+                click(&replay, &runtime, chip);
+                frame(&page, &runtime, &mut replay);
+            }
+            assert_eq!(page.rows.get().len(), 1_000);
         }
     }
 }
@@ -360,6 +609,22 @@ pub extern "C" fn start_keyed(width: f64, height: f64, scale: f64, hydrate: u32)
     } else {
         bunny_ui_web::start_dom(width, height, scale, keyed::app());
     }
+}
+
+/// The hybrid page's boot: real elements around one canvas island.
+#[cfg(all(target_arch = "wasm32", feature = "gpu"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn start_keyed_hybrid(width: f64, height: f64, scale: f64, _hydrate: u32) {
+    bunny_ui_web::start_dom(width, height, scale, keyed::hybrid_app());
+}
+
+/// The pixel page's boot: the whole keyed page through the pixel
+/// pipeline — the WebGL tier where the page has it, the CPU surface
+/// where it does not.
+#[cfg(all(target_arch = "wasm32", feature = "gpu"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn start_keyed_gpu(width: f64, height: f64, scale: f64) {
+    bunny_ui_web::start(width, height, scale, keyed::pixel_app());
 }
 
 /// The scene, shared by the wasm boot and the native page builder.

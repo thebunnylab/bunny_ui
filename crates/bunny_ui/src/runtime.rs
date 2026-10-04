@@ -193,6 +193,16 @@ pub struct Runtime {
     /// Browser-reported boxes by island path — a FLEXIBLE island
     /// measures against its real box, not against a guess.
     island_boxes: RefCell<HashMap<Rc<str>, (f64, f64)>>,
+    /// Dom mode: the targets drawn inside each island, by the island's
+    /// identity — target path and frame in the island's own
+    /// coordinates, from the last walk that lowered the island. A
+    /// canvas click is routed by them.
+    island_hits: RefCell<HashMap<Rc<str>, Vec<(String, Rect)>>>,
+    /// Dom mode: one retained paint target per island, by element id —
+    /// a frame repaints what changed inside the island and ships that
+    /// rect, where it once rasterized the whole box into a fresh bitmap.
+    #[cfg(feature = "canvas")]
+    island_surfaces: RefCell<HashMap<u32, crate::raster::Surface>>,
     /// The app's boxes inside each island, frames ISLAND-LOCAL — the
     /// canvas pointer door routes the browser's coordinates by them.
     dom_customs: RefCell<Vec<(Rc<str>, crate::layout::CustomPlacement)>>,
@@ -482,7 +492,7 @@ impl Runtime {
 
     pub fn with_environment(values: EnvironmentValues) -> Self {
         let mut ctx = Context::default();
-        ctx.values = values;
+        ctx.values = Rc::new(values);
         Self::with_parts(ctx, Rc::new(PixelFont))
     }
 
@@ -599,23 +609,21 @@ impl Runtime {
         });
     }
 
-    /// Rebuilds only the tables the input doors read.
+    /// Brings the tables the input doors read up to date. The path-keyed
+    /// ones follow the retention at every entry and need nothing here
+    /// but the root region's one-pass registrations; the two DERIVED
+    /// ones (handlers, key contexts) rebuild from the entries that carry
+    /// them.
     fn assemble_input(&self, root: &str, had_root_region: bool) {
-        reconciler::assemble_actions(root);
-        reconciler::assemble_copies(root);
-        reconciler::assemble_editors(root);
-        reconciler::assemble_splits(root);
-        reconciler::assemble_scrolls(root);
-        reconciler::assemble_measures(root);
-        reconciler::assemble_webviews(root);
-        reconciler::assemble_customs(root);
+        reconciler::refresh_root_region();
         reconciler::assemble_handlers(root);
         reconciler::assemble_contexts(root);
         reconciler::set_assembled_root(root, had_root_region);
     }
 
-    /// The paranoid cross-check of a skipped assembly: build the tables
-    /// again and see that nothing in them moved.
+    /// The paranoid cross-check of a skipped assembly: build the derived
+    /// tables again and see that nothing moved — and that the live tables
+    /// still say what the whole retention says.
     fn assemble_input_again(&self, root: &str) {
         let before = reconciler::input_fingerprint();
         self.assemble_input(root, false);
@@ -623,6 +631,10 @@ impl Runtime {
             before,
             reconciler::input_fingerprint(),
             "a skipped assembly left tables that a full one would have changed"
+        );
+        assert!(
+            reconciler::live_tables_match_retention(),
+            "the live tables drifted from the retention they follow"
         );
     }
 
@@ -735,7 +747,9 @@ impl Runtime {
     /// runtime.set_environment(|values| values.horizontalSizeClass = SizeClass::Compact);
     /// ```
     pub fn set_environment(&self, update: impl FnOnce(&mut motor::state::EnvironmentValues)) {
-        update(&mut self.ctx.borrow_mut().values);
+        // the values the retained entries share are copied once, here,
+        // and every entry keeps the ones it ran in
+        update(Rc::make_mut(&mut self.ctx.borrow_mut().values));
         self.env_moved.set(true);
     }
 
@@ -1325,6 +1339,9 @@ impl Runtime {
             scroll_offsets: RefCell::new(HashMap::default()),
             dom_viewports: RefCell::new(HashMap::default()),
             island_boxes: RefCell::new(HashMap::default()),
+            island_hits: RefCell::new(HashMap::default()),
+            #[cfg(feature = "canvas")]
+            island_surfaces: RefCell::new(HashMap::default()),
             dom_customs: RefCell::new(Vec::new()),
             last_scrolls: RefCell::new(Vec::new()),
             last_modal_floor: std::cell::Cell::new(None),
@@ -1485,15 +1502,26 @@ impl Runtime {
             reconciler::clear();
         }
         effects::reset();
-        let snapshot = motor::identity::dirty_snapshot();
-        reconciler::begin_pass(snapshot.clone());
+        // the dirt this pass serves leaves the registry now: what a body
+        // writes DURING the pass stays for the next one, and another
+        // scene's dirt stays queued for that scene. The first pass does
+        // not know its root yet — it reads everything and consumes under
+        // the root it finds
+        let (dirty, snapshot) = match self.last_root.borrow().as_deref() {
+            Some(root) => (motor::identity::take_dirty_under(root), None),
+            None => {
+                let snapshot = motor::identity::dirty_snapshot();
+                (snapshot.clone(), Some(snapshot))
+            }
+        };
+        reconciler::begin_pass(dirty);
         motor::identity::begin_pass();
 
         let mut nodes = NodeList::new();
         {
             // the scene's own segment goes down FIRST, so it is the root
             // the sweep, the dirty drain and the retention all scope by
-            let _scene = self.scene.as_ref().map(|name| motor::identity::enter(&**name));
+            let _scene = self.scene.as_ref().map(|name| motor::identity::enter(name.to_string()));
             let ctx = self.ctx.borrow().clone();
             root.render_into(&ctx, &mut nodes);
         }
@@ -1515,7 +1543,9 @@ impl Runtime {
             // with the editors of THIS pass assembled, dead fields
             // release their carets, auto-focus memory and the focus
             self.release_dead_input();
-            motor::identity::consume_dirty(pass_root, &snapshot);
+            if let Some(snapshot) = &snapshot {
+                motor::identity::consume_dirty(pass_root, snapshot);
+            }
             *self.last_root.borrow_mut() = Some(pass_root.clone());
         }
         reconciler::end_pass();
@@ -4256,6 +4286,8 @@ impl Runtime {
         // the size is known before the settle: the settle's own pass reads
         // it, and a reader runs once for a resize and never with a stale one
         self.note_viewport(crate::layout::Proposal::exact(size));
+        // a binding a write reached reads again when the layout meets it
+        crate::bind::settle_dirty();
         self.settle(root);
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
         if let Some(again) = self.reread_hover(root, size, &result) {
@@ -4426,6 +4458,7 @@ impl Runtime {
             environment: self.env_moved.get(),
             insets: self.last_insets.get() != self.frame_insets(),
             webview: reconciler::has_webview_commands(),
+            bindings: crate::bind::has_dirty(),
         }
     }
 
@@ -4524,6 +4557,8 @@ impl Runtime {
         root: &impl View,
         size: crate::layout::Size,
     ) -> crate::layout::DisplayList {
+        // a tick reads a binding a write reached, like any frame
+        crate::bind::settle_dirty();
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
         if let Some(again) = self.reread_hover(root, size, &result) {
             result = again;
@@ -4550,12 +4585,34 @@ impl Runtime {
         size: crate::layout::Size,
     ) -> Vec<crate::dom::DomPatch> {
         self.note_viewport(crate::layout::Proposal::exact(size));
+        // the bindings a write reached go stale before anything reads
+        // them: a walk that meets one reads it again, and the ones no
+        // walk meets are patched by key once the diff is done
+        let dirty_bindings = crate::bind::settle_dirty();
         self.settle(root);
         // everything that ran while settling — the reuse decision's
         // whole evidence (a theme change already cleared retention,
         // which re-runs every body and empties no promise wrongly)
-        let changed = reconciler::take_frame_runs();
-        let retained_groups = self.dom.borrow().group_paths();
+        let mut changed = reconciler::take_frame_runs();
+        // what the last frame let go leaves the group records and the
+        // bindings at the idle — now, when no idle came between: the
+        // walk reads the one table and this frame the other
+        self.dom.borrow_mut().unpick_buried();
+        // the retained groups stay where they are: the walk reads them
+        // through this borrow, which ends before the diff takes the
+        // lowering for itself
+        let dom = self.dom.borrow();
+        // a binding that reads inside an island has no element to
+        // patch: its subtree is lowered again, so the island's pixels
+        // follow the reading — the scope counts as a run under its row
+        for key in &dirty_bindings {
+            if !dom.has_binding(key)
+                && let Some((scope, _)) = key.rsplit_once('/')
+            {
+                changed.push(Rc::from(scope));
+            }
+        }
+        let retained_groups = dom.group_paths();
         // the tree, stable-root shortcut included — the flow twin of
         // the pixel path's pass assembly
         // a drag crossing targets runs no body at all, so the ring is
@@ -4569,7 +4626,11 @@ impl Runtime {
                 reconciler::note_stable_frame();
 {
                     let slot = reconciler::slot_of(&path);
-                    crate::layout::LayoutNode::BoundaryRef { path, slot }
+                    crate::layout::LayoutNode::BoundaryRef {
+                        path: Rc::from(path.as_str()),
+                        slot,
+                        hints: Default::default(),
+                    }
                 }
             }
             None => {
@@ -4583,6 +4644,8 @@ impl Runtime {
                         spacing: 0.0,
                         align: crate::layout::CrossAlign::Start,
                         children: roots,
+                        hints: Default::default(),
+                        action: None,
                     }
                 }
             }
@@ -4619,7 +4682,7 @@ impl Runtime {
             overlay_bounds: self.overlay_bounds.get(),
             dialog_frames: Some(&dialogs),
         };
-        let no_promises = std::collections::HashSet::new();
+        let no_promises = motor::hash::FxHashMap::default();
         let boxes = self.island_boxes.borrow();
         let flow = crate::dom_flow::FlowEnv {
             scroll_offsets: &*offsets,
@@ -4639,7 +4702,8 @@ impl Runtime {
             crate::dom_flow::lower(&tree, &flow)
         });
         drop(boxes);
-        self.seed_island_boxes(&output.scene);
+        drop(dom);
+        self.seed_island_boxes(&output.scene, &output.islands_walked);
         *self.dom_customs.borrow_mut() = output.customs.clone();
         drop(offsets);
         drop(carets);
@@ -4649,7 +4713,14 @@ impl Runtime {
                 break;
             }
         }
-        self.dom.borrow_mut().lower(&output.scene, &output.display)
+        self.note_island_hits(&output.islands_walked, output.hits);
+        let mut dom = self.dom.borrow_mut();
+        dom.note_groups(output.groups);
+        let mut patches = dom.lower(output.scene, &output.display);
+        if !dirty_bindings.is_empty() {
+            patches.extend(dom.refresh_bindings(&dirty_bindings));
+        }
+        patches
     }
 
     /// Hydration's engine half: run the same frame the build ran and
@@ -4660,7 +4731,9 @@ impl Runtime {
     pub fn dom_adopt(&self, root: &impl View, size: crate::layout::Size) {
         self.settle(root);
         let _ = reconciler::take_frame_runs();
-        let retained_groups = self.dom.borrow().group_paths();
+        self.dom.borrow_mut().unpick_buried();
+        let dom = self.dom.borrow();
+        let retained_groups = dom.group_paths();
         // a drag crossing targets runs no body at all, so the ring is
         // news the reuse shortcut can only hear from the interaction
         let rings = self.drop_rings();
@@ -4672,7 +4745,11 @@ impl Runtime {
                 reconciler::note_stable_frame();
 {
                     let slot = reconciler::slot_of(&path);
-                    crate::layout::LayoutNode::BoundaryRef { path, slot }
+                    crate::layout::LayoutNode::BoundaryRef {
+                        path: Rc::from(path.as_str()),
+                        slot,
+                        hints: Default::default(),
+                    }
                 }
             }
             None => {
@@ -4686,6 +4763,8 @@ impl Runtime {
                         spacing: 0.0,
                         align: crate::layout::CrossAlign::Start,
                         children: roots,
+                        hints: Default::default(),
+                        action: None,
                     }
                 }
             }
@@ -4720,8 +4799,8 @@ impl Runtime {
             overlay_bounds: self.overlay_bounds.get(),
             dialog_frames: Some(&dialogs),
         };
-        let changed: Vec<String> = Vec::new();
-        let no_promises = std::collections::HashSet::new();
+        let changed: Vec<Rc<str>> = Vec::new();
+        let no_promises = motor::hash::FxHashMap::default();
         let boxes = self.island_boxes.borrow();
         let flow = crate::dom_flow::FlowEnv {
             scroll_offsets: &*offsets,
@@ -4739,11 +4818,15 @@ impl Runtime {
         };
         let output = crate::dom_flow::lower(&tree, &flow);
         drop(boxes);
-        self.seed_island_boxes(&output.scene);
+        drop(dom);
+        self.seed_island_boxes(&output.scene, &output.islands_walked);
         *self.dom_customs.borrow_mut() = output.customs.clone();
         drop(offsets);
         drop(carets);
-        self.dom.borrow_mut().adopt(&output.scene, &output.display);
+        let mut dom = self.dom.borrow_mut();
+        self.note_island_hits(&output.islands_walked, output.hits);
+        dom.note_groups(output.groups);
+        dom.adopt(output.scene, &output.display);
     }
 
     /// A click resolved by the BROWSER: the glue walked up from the
@@ -4761,6 +4844,118 @@ impl Runtime {
     /// The dirty marks are CONSUMED, so a frame calls one of the two
     /// and never both.
     #[cfg(feature = "canvas")]
+    /// The hit rectangles of the last layout — path and frame, in the
+    /// window's logical px. What a probe reads to find a target on a
+    /// page that has no elements to query.
+    pub fn hits_snapshot(&self) -> Vec<(String, Rect)> {
+        self.last_hits.borrow().clone()
+    }
+
+    /// Dom mode: every island's element id, origin and size in the
+    /// layout's frame — the probe's way from a hit to a canvas point.
+    pub fn island_frames(&self) -> Vec<(u32, Px, Px, Px, Px)> {
+        self.dom.borrow().island_frames()
+    }
+
+    /// Dom mode: every element that answers a click or an edit, by id,
+    /// with its path whole — what a click on it must send, however the
+    /// page spells it ([`crate::ssr::Replay::action_paths`] reads the
+    /// spelling back).
+    pub fn dom_action_paths(&self) -> std::collections::BTreeMap<u32, String> {
+        self.dom.borrow().action_paths()
+    }
+
+    /// Dom mode: the targets drawn inside the islands — the island's
+    /// element id, the target's path, its frame on the island's own
+    /// canvas. What a probe clicks a row on a canvas by.
+    pub fn island_hits_snapshot(&self) -> Vec<(u32, String, Rect)> {
+        let dom = self.dom.borrow();
+        let mut out = Vec::new();
+        for (island, hits) in self.island_hits.borrow().iter() {
+            if let Some(id) = dom.island_id(island) {
+                out.extend(hits.iter().map(|(path, rect)| (id, path.clone(), *rect)));
+            }
+        }
+        out
+    }
+
+    /// The islands a walk lowered take the walk's hits; the ones a
+    /// reuse promise kept stand on their last walk's.
+    fn note_island_hits(&self, walked: &[Rc<str>], hits: Vec<(Rc<str>, String, Rect)>) {
+        if walked.is_empty() {
+            return;
+        }
+        let mut table = self.island_hits.borrow_mut();
+        for island in walked {
+            table.insert(Rc::clone(island), Vec::new());
+        }
+        for (island, path, rect) in hits {
+            if let Some(entry) = table.get_mut(&island) {
+                entry.push((path, rect));
+            }
+        }
+    }
+
+    /// Diagnostics: the sizes of what the engine retains — the
+    /// reconciler's boundaries, the live bindings, the element
+    /// lowering's retained nodes, bindings, groups and template members,
+    /// the subtrees waiting to be freed, and the identity register's
+    /// tables. One line, for a probe that watches a leak. Everything that
+    /// waits for the idle is named beside what stands: the entries and
+    /// the trees to free, the click keys and the element tables' entries
+    /// to take out, the bindings retired.
+    pub fn retained_counts(&self) -> String {
+        let dom = self.dom.borrow();
+        let identity = motor::identity::registry_counts();
+        let (bindings_waiting, groups_waiting) = dom.unpicked_len();
+        format!(
+            "boundaries {} (+{} to free, +{} trees replaced, +{} click keys) · bindings live {} ({} retired) · dom nodes {} · dom bindings {} (+{} to unpick) · groups {} (+{} to unpick) · template members {} · graveyard {} · identity owners {} reads {} readers {} view-bindings {} binding-reads {} dirty {} dirty-bindings {}",
+            reconciler::retained_len(),
+            reconciler::graveyard_len(),
+            reconciler::replaced_len(),
+            reconciler::buried_actions(),
+            crate::bind::live_count(),
+            motor::identity::retired_count(),
+            dom.retained_len(),
+            dom.bindings_len() - bindings_waiting,
+            bindings_waiting,
+            dom.groups_len() - groups_waiting,
+            groups_waiting,
+            dom.template_members_len(),
+            dom.graveyard_len(),
+            identity[0],
+            identity[1],
+            identity[2],
+            identity[3],
+            identity[4],
+            identity[5],
+            identity[6],
+        )
+    }
+
+    /// Dom mode: frees what the frames since the last call removed. The
+    /// shell calls this off the frame — on an idle callback — so a
+    /// clear of a thousand rows pays its freeing when nobody is waiting.
+    /// Returns how many subtrees were freed.
+    pub fn collect_garbage(&self) -> usize {
+        self.dom.borrow_mut().collect_garbage() + reconciler::collect_garbage()
+    }
+
+    /// The element lowering's two path-keyed tables, as they stand: the
+    /// bindings it patches by key, and the groups a walk may promise.
+    #[cfg(test)]
+    pub(crate) fn dom_tables(&self) -> (usize, usize) {
+        let dom = self.dom.borrow();
+        (dom.bindings_len(), dom.groups_len())
+    }
+
+    /// Is there anything for [`Runtime::collect_garbage`]? Every kind the
+    /// frames leave for it counts: the subtrees and the entries that left,
+    /// the trees re-runs replaced, the bindings of views that left.
+    pub fn garbage_pending(&self) -> bool {
+        self.dom.borrow().garbage_pending() || reconciler::garbage_pending()
+    }
+
     pub fn dom_island_lists(&self, scale: usize) -> Vec<crate::dom::IslandList> {
         self.dom
             .borrow_mut()
@@ -4785,30 +4980,62 @@ impl Runtime {
     /// has no islands or nothing inside one moved.
     #[cfg(feature = "canvas")]
     pub fn dom_islands(&self, scale: usize) -> Vec<crate::dom::IslandFrame> {
-        self.dom_island_lists(scale)
-            .into_iter()
-            .map(|island| {
-                let bitmap = crate::raster::rasterize_with(
-                    &island.display,
-                    island.width,
-                    island.height,
-                    scale,
-                    crate::layout::Color::rgba(0, 0, 0, 0),
-                    &*self.text,
-                    &*self.images,
+        let lists = self.dom_island_lists(scale);
+        let mut surfaces = self.island_surfaces.borrow_mut();
+        // an island that left takes its surface along
+        {
+            let dom = self.dom.borrow();
+            surfaces.retain(|id, _| dom.has_island(*id));
+        }
+        let mut frames = Vec::with_capacity(lists.len());
+        for island in lists {
+            // the retained target, born or reborn at the island's box:
+            // a new surface damages everything on its first frame
+            let stale = surfaces.get(&island.id).is_none_or(|surface| {
+                surface.bitmap().width() != island.width
+                    || surface.bitmap().height() != island.height
+            });
+            if stale {
+                surfaces.insert(
+                    island.id,
+                    crate::raster::Surface::new(
+                        island.width,
+                        island.height,
+                        scale,
+                        crate::layout::Color::rgba(0, 0, 0, 0),
+                    ),
                 );
-                crate::dom::IslandFrame {
-                    id: island.id,
-                    width: island.width,
-                    height: island.height,
-                    // the island cleared to NOTHING, so the blend left
-                    // the colour multiplied by its own coverage —
-                    // `putImageData` reads straight and would multiply
-                    // it a second time
-                    rgba: crate::raster::unpremultiplied(&bitmap.to_rgba_bytes()),
-                }
-            })
-            .collect()
+            }
+            let surface = surfaces.get_mut(&island.id).expect("the surface just placed");
+            let damage = surface.frame(island.display, &*self.text, &*self.images);
+            let Some((x0, y0, x1, y1)) = crate::raster::damage_union(&damage) else {
+                continue;
+            };
+            let x0 = x0.clamp(0, island.width as i64) as usize;
+            let x1 = x1.clamp(0, island.width as i64) as usize;
+            let y0 = y0.clamp(0, island.height as i64) as usize;
+            let y1 = y1.clamp(0, island.height as i64) as usize;
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            // the island cleared to NOTHING, so the blend left the colour
+            // multiplied by its own coverage — `putImageData` reads
+            // straight, and the mirror is kept that way
+            let mirror = surface.rgba_straight();
+            let mut rgba = Vec::with_capacity((x1 - x0) * (y1 - y0) * 4);
+            for row in y0..y1 {
+                let from = (row * island.width + x0) * 4;
+                rgba.extend_from_slice(&mirror[from..from + (x1 - x0) * 4]);
+            }
+            frames.push(crate::dom::IslandFrame {
+                id: island.id,
+                width: island.width,
+                height: island.height,
+                rgba,
+                dirty: (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32),
+            });
+        }
+        frames
     }
 
     /// Which drop targets a live drag rings, in walk order — the flow
@@ -5259,6 +5486,42 @@ impl Runtime {
         let Some(island) = self.dom.borrow().island_path(id) else {
             return false;
         };
+        // a target drawn INSIDE the island — a row's link, a chip —
+        // hears the pointer the way the pixel road's targets do: the
+        // press arms it, a release inside fires it. The island placed
+        // its subtree at its own origin, so the canvas point IS the
+        // frame's point
+        if !self.dom_customs.borrow().iter().any(|(home, custom)| {
+            home.as_ref() == island.as_ref() && custom.frame.contains(x, y)
+        }) {
+            let under = self.island_hits.borrow().get(&island).and_then(|hits| {
+                hits.iter().rev().find_map(|(path, rect)| rect.contains(x, y).then(|| path.clone()))
+            });
+            match kind {
+                0 => {
+                    let mut interaction = self.interaction.borrow_mut();
+                    interaction.pointer = Some(Point { x, y });
+                    interaction.hovered = under.clone();
+                    interaction.pressed = under.clone();
+                    return under.is_some();
+                }
+                2 => {
+                    let pressed = self.interaction.borrow_mut().pressed.take();
+                    if let Some(path) = pressed
+                        && under.as_deref() == Some(path.as_str())
+                    {
+                        self.activate_clicks(&path, 1);
+                        return true;
+                    }
+                    return false;
+                }
+                _ => {
+                    if self.interaction.borrow().element_grab.is_none() {
+                        return false;
+                    }
+                }
+            }
+        }
         let grabbed = self.interaction.borrow().element_grab.clone();
         let placement = match (kind, grabbed) {
             // the grabbed box hears every move and the release,
@@ -5346,12 +5609,30 @@ impl Runtime {
     /// Every island the scene holds seeds its measured box once — so
     /// the observer's FIRST report (which only echoes the mount) does
     /// not buy a frame. Later reports that disagree are real news.
-    fn seed_island_boxes(&self, scene: &crate::dom::DomNode) {
+    fn seed_island_boxes(&self, scene: &crate::dom::DomNode, walked: &[Rc<str>]) {
+        // only an island the walk measured has a path and a box: a page
+        // that lowered none — a page of elements, a list of a thousand
+        // rows — has nothing to seed, and its scene is not walked at
+        // all. (The walk is the scene's, not the island's own record: a
+        // split sizes the lane an island stands in after it is made.)
+        if walked.is_empty() {
+            return;
+        }
+        /// A pin is the wire's `f32`; the node's own box is the `f64`
+        /// the walk sized the pixels at. Where the pin is that box, the
+        /// seed is the box itself — the next walk measures against the
+        /// number this one did. A pin a split lane wrote over the box
+        /// is the lane's.
+        fn seed(pin: f32, own: f64) -> f64 {
+            if own as f32 == pin { own } else { pin.into() }
+        }
         fn walk(node: &crate::dom::DomNode, boxes: &mut HashMap<Rc<str>, (f64, f64)>) {
             if let crate::dom::DomKind::Canvas { path: Some(path), .. } = &node.kind {
                 if let Some(layout) = &node.layout {
                     if let (Some(w), Some(h)) = (layout.width, layout.height) {
-                        boxes.entry(Rc::clone(path)).or_insert((w, h));
+                        boxes
+                            .entry(Rc::clone(path))
+                            .or_insert((seed(w, node.width), seed(h, node.height)));
                     }
                 }
             }
@@ -5387,6 +5668,8 @@ impl Runtime {
             reconciler::clear();
             self.printless.set(false);
         }
+        // a print is a frame too: a binding a write reached reads again
+        crate::bind::settle_dirty();
         crate::view::set_print(true);
         self.render_pass(root)
             .into_nodes()
@@ -6098,7 +6381,11 @@ impl Runtime {
                 reconciler::note_stable_frame();
 {
                     let slot = reconciler::slot_of(&path);
-                    crate::layout::LayoutNode::BoundaryRef { path, slot }
+                    crate::layout::LayoutNode::BoundaryRef {
+                        path: Rc::from(path.as_str()),
+                        slot,
+                        hints: Default::default(),
+                    }
                 }
             }
             None => {
@@ -6112,6 +6399,8 @@ impl Runtime {
                         spacing: 0.0,
                         align: crate::layout::CrossAlign::Start,
                         children: roots,
+                        hints: Default::default(),
+                        action: None,
                     }
                 }
             }
@@ -6436,6 +6725,8 @@ pub struct FrameNeed {
     pub insets: bool,
     /// A webview handle holds a command the shell did not spend.
     pub webview: bool,
+    /// A write reached a node that reads for itself ([`crate::bind`]).
+    pub bindings: bool,
 }
 
 impl FrameNeed {
@@ -6447,6 +6738,7 @@ impl FrameNeed {
             || self.environment
             || self.insets
             || self.webview
+            || self.bindings
     }
 }
 

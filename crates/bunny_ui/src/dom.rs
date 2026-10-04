@@ -50,8 +50,10 @@ pub enum DomKind {
     Box,
     /// One run of text — the browser renders and selects it natively.
     Text(DomText),
-    /// A native `<input>` — the browser owns the editing.
-    Field(DomField),
+    /// A native `<input>` — the browser owns the editing. Boxed: the
+    /// widest record of the set and among the rarest, it would size
+    /// every node of the scene by itself.
+    Field(Box<DomField>),
     /// A scroll viewport; `offset` is ours, the element mirrors it.
     Scroll {
         path: Option<String>,
@@ -155,11 +157,148 @@ pub struct DomIcon {
     pub forced: bool,
 }
 
-/// The visual record of a node — everything CSS will say about it.
-/// Hover and pressed live HERE as alternatives, never resolved: the
-/// scene is pointer-invariant.
-#[derive(Clone, Debug, PartialEq, Default)]
+/// The visual record of a node — everything CSS will say about it, in
+/// the three parts a page tells apart. The action path is the
+/// element's own and rides inline: a row's every link carries one. The
+/// LOOK is what a rule shares, and the MARKS (a tooltip, the hover
+/// group a box owns) are the element's own and rare: both are boxed,
+/// and held as none when they say nothing — a flow scene's cells,
+/// links and stacks mostly wear the default look, and a default style
+/// is three words that allocate nothing.
+#[derive(Clone, Debug, Default)]
 pub struct DomStyle {
+    /// The action path of the enclosing `Interactive` — the glue posts
+    /// clicks back with it, and `:hover`/`:active` scope to it.
+    pub interactive: Option<std::rc::Rc<str>>,
+    /// `None` = the look that paints nothing ([`DomLook::NONE`]).
+    look: Option<Box<DomLook>>,
+    /// `None` = no marks.
+    marks: Option<Box<DomMarks>>,
+}
+
+/// Equal by what the parts SAY: a look boxed at its default reads the
+/// same as none.
+impl PartialEq for DomStyle {
+    fn eq(&self, other: &DomStyle) -> bool {
+        self.interactive == other.interactive
+            && same_look(self.look(), other.look())
+            && self.marks() == other.marks()
+    }
+}
+
+/// The look nobody boxed.
+static NO_LOOK: DomLook = DomLook::NONE;
+/// The marks nobody boxed.
+static NO_MARKS: DomMarks = DomMarks { tooltip: None, group_owner: None };
+
+impl DomStyle {
+    /// A style of its three parts; a default look and empty marks are
+    /// held as none.
+    pub fn new(interactive: Option<std::rc::Rc<str>>, look: DomLook, marks: DomMarks) -> DomStyle {
+        let mut style = DomStyle { interactive, look: None, marks: None };
+        style.set_look(look);
+        if marks != NO_MARKS {
+            style.marks = Some(Box::new(marks));
+        }
+        style
+    }
+
+    /// A style that is a look alone: no action path, no marks.
+    pub fn of_look(look: DomLook) -> DomStyle {
+        DomStyle::new(None, look, DomMarks::default())
+    }
+
+    /// The look — [`DomLook::NONE`] when the style paints nothing.
+    pub fn look(&self) -> &DomLook {
+        self.look.as_deref().unwrap_or(&NO_LOOK)
+    }
+
+    /// The look, to change in place: a style that painted nothing takes
+    /// a record of its own here.
+    pub fn look_mut(&mut self) -> &mut DomLook {
+        self.look.get_or_insert_with(Box::default)
+    }
+
+    /// Replaces the look; the default one is held as none.
+    pub fn set_look(&mut self, look: DomLook) {
+        self.look = (look != NO_LOOK).then(|| Box::new(look));
+    }
+
+    /// The transition of the enclosing animation scope — a look's.
+    /// Setting none on a style that paints nothing boxes nothing.
+    pub fn set_transition(&mut self, transition: Option<(f64, f64)>) {
+        if transition.is_some() || self.look.is_some() {
+            self.look_mut().transition = transition;
+        }
+    }
+
+    pub fn take_transition(&mut self) -> Option<(f64, f64)> {
+        self.look.as_mut().and_then(|look| look.transition.take())
+    }
+
+    /// The element's own marks — empty when it has none.
+    pub fn marks(&self) -> &DomMarks {
+        self.marks.as_deref().unwrap_or(&NO_MARKS)
+    }
+
+    /// Does the element carry a mark of its own?
+    pub fn has_marks(&self) -> bool {
+        *self.marks() != NO_MARKS
+    }
+
+    pub fn tooltip(&self) -> Option<&Arc<str>> {
+        self.marks().tooltip.as_ref()
+    }
+
+    pub fn group_owner(&self) -> Option<u64> {
+        self.marks().group_owner
+    }
+
+    /// Setting none on an element without marks boxes nothing.
+    pub fn set_tooltip(&mut self, tooltip: Option<Arc<str>>) {
+        if tooltip.is_some() || self.marks.is_some() {
+            self.marks.get_or_insert_with(Box::default).tooltip = tooltip;
+            self.settle_marks();
+        }
+    }
+
+    pub fn take_tooltip(&mut self) -> Option<Arc<str>> {
+        let tooltip = self.marks.as_mut().and_then(|marks| marks.tooltip.take());
+        self.settle_marks();
+        tooltip
+    }
+
+    pub fn set_group_owner(&mut self, owner: Option<u64>) {
+        if owner.is_some() || self.marks.is_some() {
+            self.marks.get_or_insert_with(Box::default).group_owner = owner;
+            self.settle_marks();
+        }
+    }
+
+    /// Marks emptied are held as none again.
+    fn settle_marks(&mut self) {
+        if self.marks.as_deref() == Some(&NO_MARKS) {
+            self.marks = None;
+        }
+    }
+
+    /// No action path, the look that paints nothing, no marks.
+    pub fn is_default(&self) -> bool {
+        self.interactive.is_none() && *self.look() == NO_LOOK && !self.has_marks()
+    }
+}
+
+/// Two looks, equal? The same record — the unboxed default on both
+/// sides, most of a scene — answers without reading a field.
+fn same_look(a: &DomLook, b: &DomLook) -> bool {
+    std::ptr::eq(a, b) || a == b
+}
+
+/// The part of a style a rule shares: everything CSS says about the
+/// element but its action path and its marks. Hover and pressed live
+/// HERE as alternatives, never resolved: the scene is pointer-invariant.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct DomLook {
     pub background: Option<Color>,
     /// A two-stop ramp over the flat background — the browser's own
     /// `radial-gradient`/`linear-gradient`. The geometry is ours (a
@@ -177,9 +316,6 @@ pub struct DomStyle {
     pub border: Option<(Color, Px)>,
     pub corner_radius: Option<Corners>,
     pub shadow: Option<(Px, Color)>,
-    /// The action path of the enclosing `Interactive` — the glue posts
-    /// clicks back with it, and `:hover`/`:active` scope to it.
-    pub interactive: Option<std::rc::Rc<str>>,
     /// `(response, damping)` of the enclosing animation scope — the
     /// glue lowers it to a CSS transition; the engine never ticks here.
     pub transition: Option<(f64, f64)>,
@@ -192,11 +328,6 @@ pub struct DomStyle {
     /// the radius already on the box: the browser cuts the subtree to
     /// the curve as a LAYER, its own native rounded clip.
     pub clip: bool,
-    /// `.tooltip(…)` — in THIS mode the browser owns the wait and the
-    /// bubble (a CSS rule on a data attribute), the way it owns the
-    /// hover and the inputs: zero patches by construction. The pixel
-    /// modes run the engine's own bubble instead.
-    pub tooltip: Option<Arc<str>>,
     /// `.opacity(…)` and its two states. In THIS mode the fade is a
     /// real LAYER — the browser composites the subtree once — which is
     /// strictly better than the per-command multiply the pixel
@@ -211,9 +342,6 @@ pub struct DomStyle {
     /// browser keeps owning the hover and a group frame still costs
     /// zero patches.
     pub group: Option<u64>,
-    /// The box a `.hover_group()` owns names itself here — the anchor
-    /// every follower's selector points at.
-    pub group_owner: Option<u64>,
     /// The liquid-glass material, as much of it as a browser owns:
     /// `backdrop-filter` gives the blur, the saturation and the
     /// brightness natively, and the rim goes on as two inset shadows
@@ -239,9 +367,34 @@ pub struct DomStyle {
     pub pass_through: bool,
 }
 
-impl DomStyle {
-    pub(crate) fn from_props(props: &VisualProps) -> DomStyle {
-        DomStyle {
+impl DomLook {
+    /// The look that paints nothing — what a style with no look of its
+    /// own wears.
+    pub const NONE: DomLook = DomLook {
+        background: None,
+        gradient: None,
+        hover_background: None,
+        pressed_background: None,
+        color: None,
+        hover_color: None,
+        pressed_color: None,
+        border: None,
+        corner_radius: None,
+        shadow: None,
+        transition: None,
+        focus_border: None,
+        placeholder_color: None,
+        clip: false,
+        opacity: None,
+        hover_opacity: None,
+        pressed_opacity: None,
+        group: None,
+        glass: None,
+        pass_through: false,
+    };
+
+    pub(crate) fn from_props(props: &VisualProps) -> DomLook {
+        DomLook {
             background: props.background,
             gradient: props.gradient,
             hover_background: props.background_hovered,
@@ -252,21 +405,59 @@ impl DomStyle {
             border: props.border,
             corner_radius: props.corner_radius,
             shadow: props.shadow,
-            interactive: None,
             transition: None,
             focus_border: None,
             placeholder_color: None,
             clip: props.clip,
-            tooltip: None,
             opacity: props.opacity,
             hover_opacity: props.opacity_hovered,
             pressed_opacity: props.opacity_pressed,
             group: None,
-            group_owner: None,
             glass: props.glass.map(GlassFilter::of),
             pass_through: false,
         }
     }
+
+    /// Do these props paint anything — would [`DomLook::from_props`]
+    /// say more than [`DomLook::NONE`]? Read prop by prop, the same
+    /// props `from_props` reads and no other, so the walk that asks it
+    /// of every styled text builds no look just to compare it.
+    pub(crate) fn paints(props: &VisualProps) -> bool {
+        let paints = props.background.is_some()
+            || props.gradient.is_some()
+            || props.background_hovered.is_some()
+            || props.background_pressed.is_some()
+            || props.foreground_hovered.is_some()
+            || props.foreground_pressed.is_some()
+            || props.border.is_some()
+            || props.corner_radius.is_some()
+            || props.shadow.is_some()
+            || props.clip
+            || props.opacity.is_some()
+            || props.opacity_hovered.is_some()
+            || props.opacity_pressed.is_some()
+            || props.glass.is_some();
+        debug_assert_eq!(
+            paints,
+            DomLook::from_props(props) != DomLook::NONE,
+            "a prop from_props reads is missing here"
+        );
+        paints
+    }
+}
+
+/// The element's own marks — never a look's: what one element says
+/// about itself, attributes on it alone.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct DomMarks {
+    /// `.tooltip(…)` — in THIS mode the browser owns the wait and the
+    /// bubble (a CSS rule on a data attribute), the way it owns the
+    /// hover and the inputs: zero patches by construction. The pixel
+    /// modes run the engine's own bubble instead.
+    pub tooltip: Option<Arc<str>>,
+    /// The box a `.hover_group()` owns names itself here — the anchor
+    /// every follower's selector points at.
+    pub group_owner: Option<u64>,
 }
 
 /// What a browser can carry of a pane of glass.
@@ -336,14 +527,18 @@ pub struct DomText {
     pub font: FontSpec,
     /// The line box, when `.line_height(…)` set one — the browser steps
     /// its own lines by it, so the element wraps at the same rhythm the
-    /// engine measured. `None` leaves the face's own box.
-    pub line_height: Option<crate::layout::Px>,
+    /// engine measured. `None` leaves the face's own box. `f32`, the
+    /// wire's precision.
+    pub line_height: Option<f32>,
     /// Where each wrapped line sits in the box — `None` is leading, the
     /// browser's own default for our writing direction.
     pub text_align: Option<motor::views::TextAlignment>,
     /// Match highlight spans (byte ranges) + their color.
     pub highlights: Option<(Rc<Vec<(usize, usize)>>, Color)>,
     pub truncation: Option<Truncation>,
+    /// The face is the one declared above: the text names no font of
+    /// its own, and the look it wears carries none.
+    pub inherits_face: bool,
 }
 
 /// One text field. Focus, caret and composition stay with the browser;
@@ -365,6 +560,59 @@ pub struct DomField {
     pub secret: bool,
 }
 
+/// What a node reads for itself ([`crate::bind`]): the lowering keeps
+/// the element id by the binding's key and patches the one element
+/// when a write reaches the binding — no walk, no diff.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NodeBinding {
+    /// The text of a text node.
+    Text(Rc<crate::bind::Bound<Arc<str>>>),
+    /// The class of a group's element (`boundary_class_with`).
+    Class(Rc<crate::bind::Bound<String>>),
+}
+
+impl NodeBinding {
+    /// The key the lowering files the element under.
+    pub fn key(&self) -> &Rc<str> {
+        match self {
+            NodeBinding::Text(bound) => bound.key(),
+            NodeBinding::Class(bound) => bound.key(),
+        }
+    }
+
+    /// The same binding OBJECT — not merely the same key: a body that
+    /// re-ran made a new one at the old key, and it may read something
+    /// else.
+    fn same_as(&self, other: &NodeBinding) -> bool {
+        match (self, other) {
+            (NodeBinding::Text(a), NodeBinding::Text(b)) => Rc::ptr_eq(a, b),
+            (NodeBinding::Class(a), NodeBinding::Class(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+/// Are two nodes driven by the same binding object?
+fn same_binding(old: &DomNode, new: &DomNode) -> bool {
+    match (&old.binding, &new.binding) {
+        (Some(was), Some(now)) => was.same_as(now),
+        _ => false,
+    }
+}
+
+/// Did the hints move, the class of a bound node aside? A class that
+/// reads for itself travels on its own road.
+fn hints_changed(old: &DomNode, new: &DomNode) -> bool {
+    if same_binding(old, new) && matches!(new.binding, Some(NodeBinding::Class(_))) {
+        // the class aside, field by field: a copy of the hints with the
+        // old class in it was three shared words taken and let go for
+        // every kept row of a list
+        old.hints.tag != new.hints.tag || old.hints.dom_id != new.hints.dom_id
+    } else {
+        old.hints != new.hints
+    }
+}
+
 /// A captured scene node: kind + parent-relative frame + style +
 /// children, exactly what one element needs to exist.
 #[derive(Clone, Debug, PartialEq)]
@@ -372,7 +620,10 @@ pub struct DomNode {
     pub kind: DomKind,
     /// Offset from the parent NODE's origin (logical px). Owned by
     /// the ABSOLUTE lowering; a flow node leaves all four at zero and
-    /// speaks through `layout`.
+    /// speaks through `layout`. `f64`, where the flow record holds
+    /// the wire's `f32`: the served page prints the engine's own
+    /// number for a placed element, and the island ledger sizes the
+    /// pixels by it.
     pub x: Px,
     pub y: Px,
     pub width: Px,
@@ -384,6 +635,25 @@ pub struct DomNode {
     /// Real-element hints (tag, class, id) — the Dom's alone.
     pub hints: DomHints,
     pub children: Vec<DomNode>,
+    /// What the node reads for itself, if anything.
+    pub binding: Option<NodeBinding>,
+    /// The face this element declares for everything under it: the
+    /// root's default, or a box whose modifiers changed the face. A
+    /// text with the declared face inherits it and declares none of
+    /// its own — a thousand cells share the one declaration above
+    /// them, as a page's own stylesheet would have it. Shared: the
+    /// boxes a walk declares one face on hold one record of it.
+    pub face: Option<Rc<FontSpec>>,
+    /// The element id the glue knows the node by, once the lowering
+    /// keeps it — zero on a scene node, and on the root, the mount
+    /// point. The retained tree is the scene's own nodes: a node the
+    /// diff creates or keeps moves into it as it is, its id and its
+    /// rule written in place and its children left in the vector they
+    /// came in.
+    pub(crate) id: u32,
+    /// The look the element wears — the rule's hash; zero on a scene
+    /// node.
+    pub(crate) rule: u64,
 }
 
 // MARK: - Capture (rides the placement walk)
@@ -435,13 +705,17 @@ impl DomCapture {
             y: 0.0,
             width: size.width,
             height: size.height,
-            style: DomStyle {
+            style: DomStyle::of_look(DomLook {
                 background: Some(crate::theme::current().canvas),
-                ..DomStyle::default()
-            },
+                ..DomLook::default()
+            }),
             layout: None,
             hints: DomHints::default(),
             children: Vec::new(),
+            binding: None,
+            face: None,
+            id: 0,
+            rule: 0,
         };
         DomCapture {
             stack: vec![(Point { x: 0.0, y: 0.0 }, root)],
@@ -480,9 +754,11 @@ impl DomCapture {
         }
         // inside a layer, a box that asks for nothing lets the pointer
         // through to what it covers
-        style.pass_through = self.overlay_depth > 0 && style.interactive.is_none();
-        style.transition = self.pending_transition.take();
-        style.tooltip = self.armed_tooltip.take();
+        if self.overlay_depth > 0 && style.interactive.is_none() {
+            style.look_mut().pass_through = true;
+        }
+        style.set_transition(self.pending_transition.take());
+        style.set_tooltip(self.armed_tooltip.take());
         let node = DomNode {
             kind,
             x: frame.origin.x - parent_origin.x,
@@ -493,6 +769,10 @@ impl DomCapture {
             layout: None,
             hints: DomHints::default(),
             children: Vec::new(),
+            binding: None,
+            face: None,
+            id: 0,
+            rule: 0,
         };
         // the node inherits the ink until a `Styled` says otherwise
         self.ink.push(self.current_ink());
@@ -520,32 +800,29 @@ impl DomCapture {
         let (_, node) = self.stack.last_mut().expect("just opened");
         // the rebuild must not drop what open() already stamped — a
         // tooltip armed by the wrapper lands on THIS box
-        let tooltip = node.style.tooltip.take();
-        node.style = DomStyle {
+        let tooltip = node.style.take_tooltip();
+        let mut look = DomLook {
             // the rebuild must not drop what the layer scope decided
             pass_through: self.overlay_depth > 0 && interactive.is_none(),
-            interactive,
             transition,
-            tooltip,
             group: props.from_group.then(|| group).flatten(),
-            ..DomStyle::from_props(props)
+            ..DomLook::from_props(props)
         };
         // the tint has no layer of its own in a browser: it folds into
         // the background, where it belongs — under whatever the box
         // paints itself and over the blurred backdrop
         if let Some(glass) = props.glass {
             let tint = glass.resolve(frame).tint;
-            node.style.background = GlassFilter::under(tint, node.style.background);
-            node.style.hover_background =
-                node.style.hover_background.and_then(|color| GlassFilter::under(tint, Some(color)));
-            node.style.pressed_background = node
-                .style
-                .pressed_background
-                .and_then(|color| GlassFilter::under(tint, Some(color)));
+            look.background = GlassFilter::under(tint, look.background);
+            look.hover_background =
+                look.hover_background.and_then(|color| GlassFilter::under(tint, Some(color)));
+            look.pressed_background =
+                look.pressed_background.and_then(|color| GlassFilter::under(tint, Some(color)));
         }
         if states || inheriting {
-            node.style.color = Some(ink);
+            look.color = Some(ink);
         }
+        node.style = DomStyle::new(interactive, look, DomMarks { tooltip, group_owner: None });
         if states {
             self.ink_scopes.push(self.stack.len());
         }
@@ -563,7 +840,7 @@ impl DomCapture {
             return;
         }
         let (_, node) = self.stack.last_mut().expect("an open node");
-        node.style.background = Some(color);
+        node.style.look_mut().background = Some(color);
     }
 
     /// Strokes the OPEN node's border (the stub leaves).
@@ -572,7 +849,7 @@ impl DomCapture {
             return;
         }
         let (_, node) = self.stack.last_mut().expect("an open node");
-        node.style.border = Some((color, width));
+        node.style.look_mut().border = Some((color, width));
     }
 
     pub(crate) fn close(&mut self) {
@@ -619,9 +896,9 @@ impl DomCapture {
         self.close();
     }
 
-    /// A childless element that carries its own style (the field's
+    /// A childless element that carries its own look (the field's
     /// theme chrome travels in the record, never hardcoded in a glue).
-    pub(crate) fn leaf_styled(&mut self, kind: DomKind, frame: Rect, style: DomStyle) {
+    pub(crate) fn leaf_styled(&mut self, kind: DomKind, frame: Rect, look: DomLook) {
         if self.island > 0 {
             return;
         }
@@ -633,9 +910,11 @@ impl DomCapture {
             field.color = self.current_ink();
         }
         self.open(kind, frame, frame.origin);
-        let pass_through = self.overlay_depth > 0 && style.interactive.is_none();
+        // the look names no action of its own: inside a layer it lets
+        // the pointer through
+        let pass_through = self.overlay_depth > 0;
         let (_, node) = self.stack.last_mut().expect("just opened");
-        node.style = DomStyle { pass_through, ..style };
+        node.style = DomStyle::of_look(DomLook { pass_through, ..look });
         self.close();
     }
 
@@ -658,7 +937,7 @@ impl DomCapture {
         }
         self.open(DomKind::Box, frame, frame.origin);
         let (_, node) = self.stack.last_mut().expect("just opened");
-        node.style.group_owner = Some(key);
+        node.style.set_group_owner(Some(key));
     }
 
     /// Opens/closes an overlay LAYER scope: what it paints inside is
@@ -735,22 +1014,26 @@ impl DomCapture {
 /// lowering owns its geometry (today's whole scene; tomorrow only a
 /// `.layout(Exact)` interior). The wire twin of [`DomStyle`]: a full
 /// replace, one write per changed node.
+///
+/// The numbers are `f32`, the precision the wire carries them at: a
+/// record half the size of one in `f64`, and nothing the browser could
+/// tell apart.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DomLayout {
     /// Gap between a flex container's children, px.
-    pub gap: Option<f64>,
+    pub gap: Option<f32>,
     /// Cross-axis alignment: 0 start, 1 center, 2 end, 3 baseline.
     pub align: Option<u8>,
     /// Padding `(top, right, bottom, left)`, px.
-    pub padding: Option<(f64, f64, f64, f64)>,
-    pub width: Option<f64>,
-    pub height: Option<f64>,
-    pub max_width: Option<f64>,
-    pub max_height: Option<f64>,
+    pub padding: Option<(f32, f32, f32, f32)>,
+    pub width: Option<f32>,
+    pub height: Option<f32>,
+    pub max_width: Option<f32>,
+    pub max_height: Option<f32>,
     /// The flexible child: `flex:1 1 0` and a zeroed min-size.
     pub grow: bool,
     /// A virtual row's absolute offset inside its content box, px.
-    pub slot_y: Option<f64>,
+    pub slot_y: Option<f32>,
     /// The child follows its container's cross size — `align-self:
     /// stretch`, and no pinned size on the stretched axis.
     pub stretch: bool,
@@ -761,7 +1044,11 @@ pub struct DomLayout {
     pub fill: bool,
     /// The row WRAPS, with this gap between its lines, px — `flex-wrap:
     /// wrap` and `row-gap`, a flow's lowering.
-    pub wrap: Option<f64>,
+    pub wrap: Option<f32>,
+    /// The element is no flex box: an inline tag around ONE child (a
+    /// link around a word) keeps the browser's own display for the
+    /// tag, where a flex line per row would be a layout per row.
+    pub plain: bool,
 }
 
 /// Element hints only the Dom consumes — a real tag, a class, an id.
@@ -822,9 +1109,15 @@ pub struct IslandList {
 /// `<canvas>`. Only islands whose commands actually changed re-raster.
 pub struct IslandFrame {
     pub id: u32,
+    /// The island's whole box, physical px — the canvas's size.
     pub width: usize,
     pub height: usize,
+    /// The pixels of `dirty` alone, straight RGBA, row by row.
     pub rgba: Vec<u8>,
+    /// What changed, physical px: `(x, y, width, height)` inside the
+    /// box. The first frame of an island, and a resized one, is the
+    /// whole box; a row that changed is a strip.
+    pub dirty: (u32, u32, u32, u32),
 }
 
 /// One mutation of the element tree. A frame's worth of patches is the
@@ -838,13 +1131,73 @@ pub enum DomPatch {
     Create { id: u32, parent: u32, before: u32, kind: CreateKind, hints: DomHints },
     /// Removes the element AND its subtree.
     Remove { id: u32 },
+    /// Empties the element: every child and its subtree leaves in one
+    /// op — a list that clears, or replaces its rows, costs one word
+    /// instead of one per row. `forget` names the ids that leave, as
+    /// ranges: elements are numbered in the order they mount, so a
+    /// thousand rows mounted together are ONE range, and the glue
+    /// forgets them by counting instead of walking the subtree.
+    RemoveChildren { id: u32, forget: Vec<(u32, u32)> },
+    /// A new element cloned from a live one of the same SHAPE — the
+    /// template — with its whole subtree; the ids of the copy count up
+    /// in pre-order from `id`, the way a fresh mount numbers them. Only
+    /// what is the copy's own follows: its words (`SetContent`), the
+    /// action paths that read otherwise than the template's (`SetPath`)
+    /// and the bases of the groups inside it (`SetBase`) — the copy's
+    /// own base rides here, written on the element in hand. Eight
+    /// creates and their styles are one word.
+    Clone { id: u32, parent: u32, before: u32, template: u32, base: Option<Rc<str>> },
+    /// The action path alone — what a cloned element keeps of its own.
+    /// `base_len` is how much of it the element's base already says:
+    /// past zero the page shows `~` and the rest, told against the
+    /// nearest `data-base` at or above the element (its group's own
+    /// path); zero shows the path whole.
+    SetPath { id: u32, path: Option<Rc<str>>, base_len: usize },
+    /// A group's own path, the base the action paths below it are told
+    /// against, written on its element as `data-base`: a created group's
+    /// after its subtree (the subtree says whether a path leaned on it),
+    /// a group's inside a clone, whose copied base names the template's
+    /// group and not its own. A clone's root takes its base on the clone.
+    SetBase { id: u32, base: Rc<str> },
+    /// The words alone, for a text whose font and ink already stand.
+    SetContent { id: u32, text: Arc<str> },
+    /// A look the page shares: one rule in its sheet, worn by every
+    /// element with that look — defined once per distinct look, by the
+    /// hash of what the rule carries (the kind, the shared part of the
+    /// flow record, the shared part of the style, a text's face and
+    /// ink). What is the element's own — its box, its marks, its
+    /// action path — travels beside it.
+    DefineRule {
+        rule: u64,
+        kind: CreateKind,
+        /// Bit 0: the element lays itself out — a table-family tag,
+        /// whose display is the browser's own and takes no flex line.
+        flags: u8,
+        style: Box<DomLook>,
+        layout: Box<DomLayout>,
+        text: Option<Box<DomText>>,
+    },
+    /// The element wears the look.
+    UseRule { id: u32, rule: u64 },
+    /// The element's own geometry — a pinned width or height, a
+    /// ceiling, a virtual row's slot — inline, the element's and not a
+    /// look's. `None` clears.
+    SetBox {
+        id: u32,
+        width: Option<f32>,
+        height: Option<f32>,
+        max_width: Option<f32>,
+        max_height: Option<f32>,
+        slot_y: Option<f32>,
+    },
+    /// The element's own marks: its tooltip and the hover group it owns.
+    SetMarks { id: u32, tooltip: Option<Arc<str>>, group_owner: Option<u64> },
     SetTransform { id: u32, x: f64, y: f64 },
     SetSize { id: u32, width: f64, height: f64 },
     /// The FULL style record — the glue resets and applies (styles are
     /// small; one write per changed node).
-    SetStyle { id: u32, style: DomStyle },
-    SetText { id: u32, text: DomText },
-    SetField { id: u32, field: DomField },
+    SetText { id: u32, text: Box<DomText> },
+    SetField { id: u32, field: Box<DomField> },
     SetScroll { id: u32, x: f64, y: f64 },
     SetImage { id: u32, image: DomImage },
     SetIcon { id: u32, icon: DomIcon },
@@ -859,7 +1212,6 @@ pub enum DomPatch {
     SetVideo { id: u32, stream: u32, mirrored: bool, cover: bool, radius: f32 },
     /// The FULL flow record — the glue resets and applies, the exact
     /// twin of `SetStyle` for the other half of an element's truth.
-    SetLayout { id: u32, layout: DomLayout },
     /// The element moves before sibling `before` (0 = to the end)
     /// under `parent` — one `insertBefore`, identity intact. Emitted
     /// for flow parents only: absolute children never need it.
@@ -879,14 +1231,6 @@ pub enum DomPatch {
 
 // MARK: - Lowering (retained scene + diff)
 
-/// A retained node: the last frame's value plus the element id the
-/// glue knows it by.
-struct Retained {
-    id: u32,
-    node: DomNode,
-    children: Vec<Retained>,
-}
-
 /// One retained island: its commands already TRANSLATED to island-
 /// local coordinates, plus the logical size. `dirty` = the pixels no
 /// longer match — the shell asks for them via `take_dirty_islands`.
@@ -904,7 +1248,13 @@ struct LowerCtx<'a> {
     next_id: &'a mut u32,
     display: &'a [DrawCommand],
     islands: &'a mut HashMap<u32, Island>,
-    group_paths: &'a mut std::collections::HashSet<std::rc::Rc<str>>,
+    bindings: &'a mut motor::hash::FxHashMap<Rc<str>, BoundElement>,
+    templates: &'a mut Templates,
+    /// Subtrees that left this frame, kept until an idle moment frees
+    /// them: a thousand rows' nodes are freed off the frame's clock.
+    graveyard: &'a mut Vec<Buried>,
+    /// The looks the page's sheet already defines, by rule hash.
+    rules: &'a mut motor::hash::FxHashSet<u64>,
 }
 
 /// The retained side of the Dom mode: last frame's scene with ids.
@@ -913,16 +1263,160 @@ struct LowerCtx<'a> {
 /// [`lower`]: DomLowering::lower
 #[derive(Default)]
 pub struct DomLowering {
-    root: Option<Retained>,
+    root: Option<DomNode>,
     next_id: u32,
     islands: HashMap<u32, Island>,
     /// Anchor relations already shipped: popover element id → anchor
     /// element id. A relation re-ships when the anchor recreates.
     anchors_sent: HashMap<u32, u32>,
-    /// Every retained Group's identity path — the walk consults this
-    /// before promising a reuse (a promise the diff cannot keep would
-    /// mount a hole).
-    group_paths: std::collections::HashSet<std::rc::Rc<str>>,
+    /// Every retained Group's identity path, with the environment the
+    /// walk lowered it in — the walk consults this before promising a
+    /// reuse (a promise the diff cannot keep would mount a hole, and a
+    /// group lowered in another environment is another scene).
+    group_paths: motor::hash::FxHashMap<std::rc::Rc<str>, crate::dom_flow::GroupRecord>,
+    /// The elements that read for themselves, by binding key: the id,
+    /// the binding, and the record last shipped for it. A write that
+    /// reaches a binding is patched from here — one element, no walk.
+    bindings: motor::hash::FxHashMap<Rc<str>, BoundElement>,
+    /// The shapes on the page a new group can be cloned from.
+    templates: Templates,
+    /// Subtrees that left and are not freed yet — see
+    /// [`DomLowering::collect_garbage`].
+    graveyard: Vec<Buried>,
+    /// How many of those had their group records and bindings taken out
+    /// of the tables. The rest still stand in them, for the idle to take
+    /// out — or the next frame, before it reads either table
+    /// ([`DomLowering::unpick_buried`]).
+    unpicked: usize,
+    /// The looks the page's sheet defines — a rule is sent once.
+    rules: motor::hash::FxHashSet<u64>,
+    /// How many of the groups the walk just noted the page has not
+    /// seen — the rows this frame mounts, which its patch list is
+    /// sized for.
+    fresh_groups: usize,
+}
+
+/// The patches a mounted row costs, about: its clone or its creates,
+/// its words, its action paths. The list is sized by it once, instead
+/// of doubling a dozen times on a thousand rows.
+const PATCHES_PER_FRESH_GROUP: usize = 8;
+
+/// What a frame let go, kept whole until an idle moment frees it: one
+/// subtree, or every child a parent had — in the one vector they left
+/// in, so a list that clears moves no row and frees no vector inside
+/// the frame.
+enum Buried {
+    One(DomNode),
+    Many(Vec<DomNode>),
+}
+
+impl Buried {
+    /// The subtrees, root by root.
+    fn roots(&self) -> &[DomNode] {
+        match self {
+            Buried::One(root) => std::slice::from_ref(root),
+            Buried::Many(roots) => roots,
+        }
+    }
+}
+
+/// One element a binding drives.
+struct BoundElement {
+    id: u32,
+    binding: NodeBinding,
+    /// What the wire last carried for it — the next patch is a copy of
+    /// it with the new reading.
+    shipped: Shipped,
+}
+
+enum Shipped {
+    Text(DomText),
+    Hints(DomHints),
+}
+
+/// The shapes the lowering can clone: for each, one live element whose
+/// subtree IS the shape. A shape is everything about a group's subtree
+/// that is not the row's own — kinds, layout, style, tags and classes,
+/// fonts and inks — and never its words or its action paths. A patch
+/// that reaches a member of the live instance (other than its words)
+/// retires the template: the next row of the shape mounts whole and
+/// becomes the template itself.
+#[derive(Default)]
+struct Templates {
+    by_shape: motor::hash::FxHashMap<u64, u32>,
+    /// A template root → its shape.
+    roots: motor::hash::FxHashMap<u32, u64>,
+    /// Every element of a template instance → its root.
+    members: motor::hash::FxHashMap<u32, u32>,
+    /// A root → its members, to forget together.
+    members_of: motor::hash::FxHashMap<u32, Vec<u32>>,
+    /// A root → the looks of its members, in pre-order: what a clone's
+    /// members wear, without hashing them again.
+    rules_of: motor::hash::FxHashMap<u32, Rc<[u64]>>,
+    /// A root → the action paths its members show, in pre-order, each
+    /// with how much of it its base says: a copy that would show the
+    /// same string took it with the element.
+    paths_of: motor::hash::FxHashMap<u32, Rc<[ShownPath]>>,
+}
+
+/// An action path as a member shows it: the path and how much of it
+/// the member's base already says (zero: shown whole). `None`: the
+/// member shows no path.
+type ShownPath = Option<(Rc<str>, usize)>;
+
+impl Templates {
+    fn register(
+        &mut self,
+        shape: u64,
+        root: u32,
+        members: Vec<u32>,
+        rules: Vec<u64>,
+        paths: Vec<ShownPath>,
+    ) {
+        if self.by_shape.contains_key(&shape) {
+            return;
+        }
+        self.by_shape.insert(shape, root);
+        self.roots.insert(root, shape);
+        for &id in &members {
+            self.members.insert(id, root);
+        }
+        self.members_of.insert(root, members);
+        self.rules_of.insert(root, rules.into());
+        self.paths_of.insert(root, paths.into());
+    }
+
+    /// The looks of a template's members, in pre-order.
+    fn rules_of(&self, root: u32) -> Rc<[u64]> {
+        self.rules_of.get(&root).cloned().unwrap_or_else(|| Rc::from(Vec::new()))
+    }
+
+    /// The action paths a template's members show, in pre-order.
+    fn paths_of(&self, root: u32) -> Rc<[ShownPath]> {
+        self.paths_of.get(&root).cloned().unwrap_or_else(|| Rc::from(Vec::new()))
+    }
+
+    fn forget_root(&mut self, root: u32) {
+        let Some(shape) = self.roots.remove(&root) else {
+            return;
+        };
+        if self.by_shape.get(&shape) == Some(&root) {
+            self.by_shape.remove(&shape);
+        }
+        for id in self.members_of.remove(&root).unwrap_or_default() {
+            self.members.remove(&id);
+        }
+        self.rules_of.remove(&root);
+        self.paths_of.remove(&root);
+    }
+
+    /// Something other than its words reached a member: the live
+    /// instance no longer IS the shape.
+    fn touched(&mut self, id: u32) {
+        if let Some(&root) = self.members.get(&id) {
+            self.forget_root(root);
+        }
+    }
 }
 
 impl DomLowering {
@@ -930,9 +1424,13 @@ impl DomLowering {
     /// list that brings the element tree up to date. The first call
     /// mounts everything. `display` is the SAME pass's draw list —
     /// canvas islands slice their command ranges out of it.
+    ///
+    /// The scene comes BY VALUE: a node the diff keeps moves into the
+    /// retained tree, so a thousand new rows are moved once, never
+    /// copied field by field and then dropped.
     pub fn lower(
         &mut self,
-        scene: &DomNode,
+        scene: DomNode,
         display: &crate::layout::DisplayList,
     ) -> Vec<DomPatch> {
         crate::stats::time(crate::stats::Stage::Diff, || self.lower_timed(scene, display))
@@ -940,36 +1438,42 @@ impl DomLowering {
 
     fn lower_timed(
         &mut self,
-        scene: &DomNode,
+        mut scene: DomNode,
         display: &crate::layout::DisplayList,
     ) -> Vec<DomPatch> {
-        let mut patches = Vec::new();
+        let mut patches =
+            Vec::with_capacity(std::mem::take(&mut self.fresh_groups) * PATCHES_PER_FRESH_GROUP);
+        // a popover is a child of the root, the portal: a scene without
+        // one cannot create one
+        let popover_in_scene =
+            scene.children.iter().any(|child| matches!(child.kind, DomKind::Popover { .. }));
         match self.root.as_mut() {
             None => {
                 self.next_id = 1;
-                let mut root = Retained {
-                    id: 0,
-                    node: shallow(scene),
-                    children: Vec::new(),
-                };
                 patches.push(DomPatch::SetSize {
                     id: 0,
                     width: scene.width,
                     height: scene.height,
                 });
-                if scene.style != DomStyle::default() {
-                    patches.push(DomPatch::SetStyle { id: 0, style: scene.style.clone() });
-                }
+                let rule = look_hash(&scene);
+                // the scene becomes the retention: the root is the mount
+                // point, id 0, and every node below is made where it stands
+                retain(&mut scene, 0, rule);
                 let mut next_id = self.next_id;
                 let mut ctx = LowerCtx {
                     next_id: &mut next_id,
                     display: display.as_slice(),
                     islands: &mut self.islands,
-                    group_paths: &mut self.group_paths,
+                    bindings: &mut self.bindings,
+                    templates: &mut self.templates,
+                    graveyard: &mut self.graveyard,
+                    rules: &mut self.rules,
                 };
-                root.children = create_children(scene, 0, &mut ctx, &mut patches);
+                define_rule(rule, &scene, &mut ctx, &mut patches);
+                patches.push(DomPatch::UseRule { id: 0, rule });
+                create_children(&mut scene.children, 0, &mut ctx, &mut patches, None);
                 self.next_id = next_id;
-                self.root = Some(root);
+                self.root = Some(scene);
             }
             Some(root) => {
                 let mut next_id = self.next_id;
@@ -977,7 +1481,10 @@ impl DomLowering {
                     next_id: &mut next_id,
                     display: display.as_slice(),
                     islands: &mut self.islands,
-                    group_paths: &mut self.group_paths,
+                    bindings: &mut self.bindings,
+                    templates: &mut self.templates,
+                    graveyard: &mut self.graveyard,
+                    rules: &mut self.rules,
                 };
                 diff_node(root, scene, &mut ctx, &mut patches);
                 self.next_id = next_id;
@@ -987,14 +1494,15 @@ impl DomLowering {
         // ship the relation when it changed — the walk only runs while
         // a popover exists (or just left)
         if !self.anchors_sent.is_empty()
-            || patches
-                .iter()
-                .any(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Popover, .. }))
+            || (popover_in_scene
+                && patches
+                    .iter()
+                    .any(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Popover, .. })))
         {
             let mut relations: Vec<(u32, u32, u8, String)> = Vec::new();
             if let Some(root) = self.root.as_ref() {
-                fn group_id(node: &Retained, path: &str) -> Option<u32> {
-                    if let DomKind::Group { path: here } = &node.node.kind
+                fn group_id(node: &DomNode, path: &str) -> Option<u32> {
+                    if let DomKind::Group { path: here } = &node.kind
                         && **here == *path
                     {
                         return Some(node.id);
@@ -1002,11 +1510,11 @@ impl DomLowering {
                     node.children.iter().find_map(|child| group_id(child, path))
                 }
                 fn collect(
-                    node: &Retained,
-                    root: &Retained,
+                    node: &DomNode,
+                    root: &DomNode,
                     out: &mut Vec<(u32, u32, u8, String)>,
                 ) {
-                    if let DomKind::Popover { path, anchor, side } = &node.node.kind
+                    if let DomKind::Popover { path, anchor, side } = &node.kind
                         && let Some(anchor_id) = group_id(root, anchor)
                     {
                         out.push((node.id, anchor_id, *side, path.clone()));
@@ -1035,9 +1543,9 @@ impl DomLowering {
     /// silent — the browser already moved, patching it back would
     /// fight the wheel.
     pub(crate) fn note_scroll(&mut self, id: u32, x: Px, y: Px) {
-        fn walk(retained: &mut Retained, id: u32, x: Px, y: Px) -> bool {
+        fn walk(retained: &mut DomNode, id: u32, x: Px, y: Px) -> bool {
             if retained.id == id {
-                if let DomKind::Scroll { offset, .. } = &mut retained.node.kind {
+                if let DomKind::Scroll { offset, .. } = &mut retained.kind {
                     *offset = (x, y);
                 }
                 return true;
@@ -1054,47 +1562,218 @@ impl DomLowering {
     /// in the exact pre-order the mount stream used, groups and
     /// islands registered, zero patches emitted. Islands stay dirty:
     /// a built page ships their boxes empty, and the first blit after
-    /// boot fills them.
-    pub(crate) fn adopt(&mut self, scene: &DomNode, display: &crate::layout::DisplayList) {
-        fn adopt_node(node: &DomNode, ctx: &mut LowerCtx) -> Retained {
+    /// boot fills them. The scene comes by value and stays as it came,
+    /// each node numbered where it stands.
+    pub(crate) fn adopt(&mut self, mut scene: DomNode, display: &crate::layout::DisplayList) {
+        fn adopt_node(node: &mut DomNode, ctx: &mut LowerCtx) {
             let id = *ctx.next_id;
             *ctx.next_id += 1;
-            if let DomKind::Group { path } = &node.kind {
-                ctx.group_paths.insert(path.clone());
+            match (&node.kind, &node.binding) {
+                (DomKind::Text(text), Some(binding)) => file_binding(id, binding, text, ctx),
+                (DomKind::Group { .. }, Some(binding)) => file_class_binding(id, binding, &node.hints, ctx),
+                _ => {}
             }
-            let mut retained = Retained {
-                id,
-                node: shallow(node),
-                children: Vec::new(),
-            };
+            let rule = look_hash(node);
+            ctx.rules.insert(rule);
+            retain(node, id, rule);
             if matches!(node.kind, DomKind::Canvas { .. }) {
                 note_island(id, node, ctx);
             }
-            retained.children =
-                node.children.iter().map(|child| adopt_node(child, ctx)).collect();
-            retained
+            for child in &mut node.children {
+                adopt_node(child, ctx);
+            }
         }
         self.next_id = 1;
         self.group_paths.clear();
+        self.bindings.clear();
+        self.templates = Templates::default();
         self.islands.clear();
         self.anchors_sent.clear();
+        self.graveyard.clear();
+        self.unpicked = 0;
+        self.rules.clear();
+        // the page holds the mount already: no patch is coming for it
+        self.fresh_groups = 0;
         let mut next_id = self.next_id;
         let mut ctx = LowerCtx {
             next_id: &mut next_id,
             display: display.as_slice(),
             islands: &mut self.islands,
-            group_paths: &mut self.group_paths,
+            bindings: &mut self.bindings,
+            templates: &mut self.templates,
+            graveyard: &mut self.graveyard,
+            rules: &mut self.rules,
         };
-        let mut root = Retained { id: 0, node: shallow(scene), children: Vec::new() };
-        root.children = scene.children.iter().map(|child| adopt_node(child, &mut ctx)).collect();
+        // the page the build painted defined the root's look too
+        let rule = look_hash(&scene);
+        ctx.rules.insert(rule);
+        retain(&mut scene, 0, rule);
+        for child in &mut scene.children {
+            adopt_node(child, &mut ctx);
+        }
         self.next_id = next_id;
-        self.root = Some(root);
+        self.root = Some(scene);
     }
 
-    /// The retained Groups' identity paths — the flow walk consults
-    /// them before promising a reuse.
-    pub(crate) fn group_paths(&self) -> std::collections::HashSet<std::rc::Rc<str>> {
-        self.group_paths.clone()
+    /// Frees the subtrees that left since the last call. A frame that
+    /// removes a thousand rows ships one word and keeps their nodes;
+    /// the shell calls this when the page is idle, so the freeing is
+    /// never on the clock between a click and its paint. Their group
+    /// records and bindings leave the tables first. Returns how many
+    /// subtrees were freed.
+    pub(crate) fn collect_garbage(&mut self) -> usize {
+        self.unpick_buried();
+        let count = self.graveyard.iter().map(|buried| buried.roots().len()).sum();
+        self.graveyard.clear();
+        self.unpicked = 0;
+        count
+    }
+
+    /// Takes the group records and the bindings of the subtrees that left
+    /// out of the tables — the half of their forgetting a frame leaves for
+    /// the idle. A thousand rows that leave are a thousand group paths and
+    /// two thousand binding keys hashed out, and nothing asks either table
+    /// before the next frame walks: the idle does it, with the freeing, or
+    /// that frame does, before it reads them, when no idle came between.
+    /// A binding the same frame patches by key is asked for in the frame
+    /// itself ([`DomLowering::refresh_bindings`]), which does it first.
+    pub(crate) fn unpick_buried(&mut self) {
+        for buried in &self.graveyard[self.unpicked..] {
+            for root in buried.roots() {
+                unpick(root, &mut self.group_paths, &mut self.bindings);
+            }
+        }
+        self.unpicked = self.graveyard.len();
+    }
+
+    /// Subtrees waiting to be freed.
+    pub(crate) fn garbage_pending(&self) -> bool {
+        !self.graveyard.is_empty()
+    }
+
+    /// Diagnostics: retained nodes, bound elements, group records,
+    /// template members, subtrees in the graveyard.
+    pub(crate) fn retained_len(&self) -> usize {
+        fn count(retained: &DomNode) -> usize {
+            1 + retained.children.iter().map(count).sum::<usize>()
+        }
+        self.root.as_ref().map_or(0, count)
+    }
+
+    pub(crate) fn bindings_len(&self) -> usize {
+        self.bindings.len()
+    }
+
+    pub(crate) fn groups_len(&self) -> usize {
+        self.group_paths.len()
+    }
+
+    /// Diagnostics: of [`DomLowering::bindings_len`] and
+    /// [`DomLowering::groups_len`], the entries that only subtrees that
+    /// left still hold, waiting for the idle to take them out.
+    pub(crate) fn unpicked_len(&self) -> (usize, usize) {
+        fn count(retained: &DomNode, lowering: &DomLowering, counts: &mut (usize, usize)) {
+            if let Some(binding) = &retained.binding
+                && lowering.bindings.get(binding.key()).is_some_and(|bound| bound.id == retained.id)
+            {
+                counts.0 += 1;
+            }
+            if let DomKind::Group { path } = &retained.kind
+                && lowering.group_paths.contains_key(path)
+            {
+                counts.1 += 1;
+            }
+            for child in &retained.children {
+                count(child, lowering, counts);
+            }
+        }
+        let mut counts = (0, 0);
+        for root in self.graveyard[self.unpicked..].iter().flat_map(Buried::roots) {
+            count(root, self, &mut counts);
+        }
+        counts
+    }
+
+    pub(crate) fn template_members_len(&self) -> usize {
+        self.templates.members.len()
+    }
+
+    pub(crate) fn graveyard_len(&self) -> usize {
+        fn count(retained: &DomNode) -> usize {
+            1 + retained.children.iter().map(count).sum::<usize>()
+        }
+        self.graveyard.iter().flat_map(Buried::roots).map(count).sum()
+    }
+
+    /// The retained Groups' records — the flow walk consults them
+    /// before promising a reuse. Borrowed, never copied: a frame asks
+    /// for a thousand rows' worth of them.
+    pub(crate) fn group_paths(&self) -> &motor::hash::FxHashMap<std::rc::Rc<str>, crate::dom_flow::GroupRecord> {
+        &self.group_paths
+    }
+
+    /// The groups a walk lowered, with what it lowered them in: filed
+    /// before the diff, so a group the diff mounts is known to the next
+    /// walk with its environment.
+    pub(crate) fn note_groups(&mut self, groups: Vec<(std::rc::Rc<str>, crate::dom_flow::GroupRecord)>) {
+        // sized once for the rows a frame mounts, not rehashed ten times
+        // on the way to a thousand
+        self.group_paths.reserve(groups.len());
+        let mut fresh = 0;
+        let mut fresh_classes = 0;
+        for (path, record) in groups {
+            let reads_its_class = record.class_binding.is_some();
+            if self.group_paths.insert(path, record).is_none() {
+                fresh += 1;
+                fresh_classes += usize::from(reads_its_class);
+            }
+        }
+        self.fresh_groups = fresh;
+        // the classes the new rows read for themselves are filed this
+        // frame, whatever else is: what the bindings take at the least
+        self.bindings.reserve(fresh_classes);
+    }
+
+    /// The bindings a write reached, patched by key: each one is read
+    /// again and the element it drives takes the new content — one
+    /// patch per changed text, no walk and no diff. A key nobody holds
+    /// is a binding whose element left; nothing to do.
+    pub(crate) fn refresh_bindings(&mut self, keys: &[Rc<str>]) -> Vec<DomPatch> {
+        // an element this frame let go must not be patched: its binding
+        // leaves the table before any key is asked
+        self.unpick_buried();
+        let mut patches = Vec::new();
+        for key in keys {
+            let Some(bound) = self.bindings.get_mut(key) else {
+                continue;
+            };
+            match (&bound.binding, &mut bound.shipped) {
+                (NodeBinding::Text(binding), Shipped::Text(shipped)) => {
+                    let content = binding.get();
+                    if content != shipped.content {
+                        shipped.content = content;
+                        patches.push(text_words_patch(bound.id, shipped));
+                        crate::stats::note_binding_update();
+                    }
+                }
+                (NodeBinding::Class(binding), Shipped::Hints(shipped)) => {
+                    let class = binding.get();
+                    let class: Option<Rc<str>> = (!class.is_empty()).then(|| Rc::from(class.as_str()));
+                    if class != shipped.class {
+                        shipped.class = class;
+                        patches.push(DomPatch::SetHints {
+                            id: bound.id,
+                            class: shipped.class.clone(),
+                            dom_id: shipped.dom_id.clone(),
+                        });
+                        crate::stats::note_binding_update();
+                        self.templates.touched(bound.id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        patches
     }
 
     /// Does the retained scene hold any canvas island? The runtime
@@ -1121,9 +1800,9 @@ impl DomLowering {
     /// resize observer reports by id, the runtime keys the box by
     /// the island's path.
     pub fn island_path(&self, id: u32) -> Option<std::rc::Rc<str>> {
-        fn walk(retained: &Retained, id: u32) -> Option<std::rc::Rc<str>> {
+        fn walk(retained: &DomNode, id: u32) -> Option<std::rc::Rc<str>> {
             if retained.id == id {
-                return match &retained.node.kind {
+                return match &retained.kind {
                     DomKind::Canvas { path, .. } => path.clone(),
                     _ => None,
                 };
@@ -1133,12 +1812,80 @@ impl DomLowering {
         self.root.as_ref().and_then(|root| walk(root, id))
     }
 
+    /// Does an island with this element id still stand?
+    pub(crate) fn has_island(&self, id: u32) -> bool {
+        self.islands.contains_key(&id)
+    }
+
+    /// Is there an element this binding key drives? A key without one
+    /// reads inside pixels — an island — where no patch can reach it.
+    pub(crate) fn has_binding(&self, key: &str) -> bool {
+        self.bindings.contains_key(key)
+    }
+
+    /// The element id of the island with this identity path.
+    pub fn island_id(&self, path: &str) -> Option<u32> {
+        fn walk(retained: &DomNode, path: &str) -> Option<u32> {
+            if let DomKind::Canvas { path: Some(own), .. } = &retained.kind
+                && &**own == path
+            {
+                return Some(retained.id);
+            }
+            retained.children.iter().find_map(|child| walk(child, path))
+        }
+        self.root.as_ref().and_then(|root| walk(root, path))
+    }
+
+    /// Every element that answers a click or an edit, by id, with the
+    /// path the engine knows it by — a target's action path, a field's
+    /// own path, whole. What the page's resolved paths must read.
+    pub fn action_paths(&self) -> std::collections::BTreeMap<u32, String> {
+        fn walk(retained: &DomNode, out: &mut std::collections::BTreeMap<u32, String>) {
+            match (&retained.kind, &retained.style.interactive) {
+                (DomKind::Field(field), _) => {
+                    out.insert(retained.id, field.path.clone());
+                }
+                (_, Some(path)) => {
+                    out.insert(retained.id, path.to_string());
+                }
+                _ => {}
+            }
+            for child in &retained.children {
+                walk(child, out);
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        if let Some(root) = &self.root {
+            walk(root, &mut out);
+        }
+        out
+    }
+
+    /// Every island on the page: element id, origin and size in the
+    /// layout's frame — what a probe needs to turn a hit inside an
+    /// island into a point on the island's own canvas.
+    pub fn island_frames(&self) -> Vec<(u32, Px, Px, Px, Px)> {
+        fn walk(retained: &DomNode, out: &mut Vec<(u32, Px, Px, Px, Px)>) {
+            if let DomKind::Canvas { origin, .. } = &retained.kind {
+                out.push((retained.id, origin.0, origin.1, retained.width, retained.height));
+            }
+            for child in &retained.children {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(root) = &self.root {
+            walk(root, &mut out);
+        }
+        out
+    }
+
     /// The scroll region path an element id belongs to — the glue's
     /// scroll observer reports by id, the runtime scrolls by path.
     pub fn scroll_path(&self, id: u32) -> Option<String> {
-        fn walk(retained: &Retained, id: u32) -> Option<String> {
+        fn walk(retained: &DomNode, id: u32) -> Option<String> {
             if retained.id == id {
-                return match &retained.node.kind {
+                return match &retained.kind {
                     DomKind::Scroll { path, .. } => path.clone(),
                     _ => None,
                 };
@@ -1149,9 +1896,237 @@ impl DomLowering {
     }
 }
 
-/// The node without its children — what the retention stores per level.
-fn shallow(node: &DomNode) -> DomNode {
-    DomNode { children: Vec::new(), ..node.clone() }
+// MARK: - The look
+
+/// The part of a flow record a rule shares: everything but the
+/// element's own geometry.
+fn look_layout(layout: &DomLayout) -> DomLayout {
+    DomLayout {
+        width: None,
+        height: None,
+        max_width: None,
+        max_height: None,
+        slot_y: None,
+        ..layout.clone()
+    }
+}
+
+/// The part of a style a rule shares: everything but the element's own
+/// action path, tooltip and the group it owns.
+fn look_style(style: &DomStyle) -> DomLook {
+    style.look().clone()
+}
+
+/// A text's face and ink, without its words.
+fn look_text(text: &DomText) -> DomText {
+    DomText { content: Arc::from(""), highlights: None, ..text.clone() }
+}
+
+fn hash_color(color: Option<Color>, hasher: &mut motor::hash::FxHasher) {
+    use std::hash::Hash;
+    color.map(|color| u32::from_be_bytes([color.r, color.g, color.b, color.a])).hash(hasher);
+}
+
+fn hash_f64(value: Option<f64>, hasher: &mut motor::hash::FxHasher) {
+    use std::hash::Hash;
+    value.map(f64::to_bits).hash(hasher);
+}
+
+/// An `f32` of the scene, hashed as the `f64` it widens to: the record
+/// held `f64` once, and a rule's hash is part of the served page's
+/// contract — the same value keeps the same hash.
+fn hash_f32(value: Option<f32>, hasher: &mut motor::hash::FxHasher) {
+    hash_f64(value.map(f64::from), hasher);
+}
+
+/// Does the element lay itself out? The table family's display is the
+/// browser's own: a `<tr>` is a row, never a flex line.
+pub(crate) fn lays_itself_out(hints: &DomHints) -> bool {
+    matches!(
+        hints.tag.as_deref(),
+        Some("table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th")
+    )
+}
+
+/// The hash of a node's look: its kind, the shared part of its flow
+/// record, the shared part of its style and, for a text, its face and
+/// ink. Two elements with one hash wear one rule.
+fn look_hash(node: &DomNode) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = motor::hash::FxHasher::default();
+    lays_itself_out(&node.hints).hash(&mut hasher);
+    let kind: u8 = match &node.kind {
+        DomKind::Root => 0,
+        DomKind::Group { .. } => 1,
+        DomKind::Box => 2,
+        DomKind::Text(_) => 3,
+        DomKind::Field(_) => 4,
+        DomKind::Scroll { .. } => 5,
+        DomKind::Content => 6,
+        DomKind::Canvas { .. } => 7,
+        DomKind::Image(_) => 8,
+        DomKind::Icon(_) => 9,
+        DomKind::Iframe { .. } => 10,
+        DomKind::FlexColumn => 11,
+        DomKind::FlexRow => 12,
+        DomKind::Layers => 13,
+        DomKind::Reuse { .. } => 14,
+        DomKind::Popover { .. } => 15,
+        DomKind::Video { .. } => 16,
+    };
+    kind.hash(&mut hasher);
+    match &node.layout {
+        Some(layout) => {
+            1u8.hash(&mut hasher);
+            hash_f32(layout.gap, &mut hasher);
+            layout.align.hash(&mut hasher);
+            layout
+                .padding
+                .map(|(top, right, bottom, left)| [top, right, bottom, left].map(|side| f64::from(side).to_bits()))
+                .hash(&mut hasher);
+            layout.grow.hash(&mut hasher);
+            layout.stretch.hash(&mut hasher);
+            layout.fill.hash(&mut hasher);
+            hash_f32(layout.wrap, &mut hasher);
+            layout.plain.hash(&mut hasher);
+        }
+        None => 0u8.hash(&mut hasher),
+    }
+    let style = node.style.look();
+    hash_color(style.background, &mut hasher);
+    hash_color(style.hover_background, &mut hasher);
+    hash_color(style.pressed_background, &mut hasher);
+    hash_color(style.color, &mut hasher);
+    hash_color(style.hover_color, &mut hasher);
+    hash_color(style.pressed_color, &mut hasher);
+    hash_color(style.focus_border, &mut hasher);
+    hash_color(style.placeholder_color, &mut hasher);
+    style.border.map(|(color, width)| (u32::from_be_bytes([color.r, color.g, color.b, color.a]), width.to_bits())).hash(&mut hasher);
+    style
+        .corner_radius
+        .map(|corners| [corners.top_left.to_bits(), corners.top_right.to_bits(), corners.bottom_right.to_bits(), corners.bottom_left.to_bits()])
+        .hash(&mut hasher);
+    style.shadow.map(|(radius, color)| (radius.to_bits(), u32::from_be_bytes([color.r, color.g, color.b, color.a]))).hash(&mut hasher);
+    style.transition.map(|(response, damping)| (response.to_bits(), damping.to_bits())).hash(&mut hasher);
+    style.clip.hash(&mut hasher);
+    hash_f64(style.opacity, &mut hasher);
+    hash_f64(style.hover_opacity, &mut hasher);
+    hash_f64(style.pressed_opacity, &mut hasher);
+    style.group.hash(&mut hasher);
+    style.pass_through.hash(&mut hasher);
+    match &style.gradient {
+        Some(crate::layout::Gradient::Radial { center, start, end, aspect, inner, outer }) => {
+            1u8.hash(&mut hasher);
+            [center.x.to_bits(), center.y.to_bits(), start.to_bits(), end.unwrap_or(-1.0).to_bits(), aspect.to_bits()].hash(&mut hasher);
+            hash_color(Some(*inner), &mut hasher);
+            hash_color(Some(*outer), &mut hasher);
+        }
+        Some(crate::layout::Gradient::Linear { start, end, from, to }) => {
+            2u8.hash(&mut hasher);
+            [start.x.to_bits(), start.y.to_bits(), end.x.to_bits(), end.y.to_bits()].hash(&mut hasher);
+            hash_color(Some(*from), &mut hasher);
+            hash_color(Some(*to), &mut hasher);
+        }
+        None => 0u8.hash(&mut hasher),
+    }
+    match &style.glass {
+        Some(glass) => {
+            1u8.hash(&mut hasher);
+            [glass.blur.to_bits(), glass.saturation.to_bits(), glass.brightness.to_bits(), glass.rim_band.to_bits()].hash(&mut hasher);
+            hash_color(Some(glass.rim), &mut hasher);
+        }
+        None => 0u8.hash(&mut hasher),
+    }
+    match &node.face {
+        Some(face) => {
+            1u8.hash(&mut hasher);
+            face.size.to_bits().hash(&mut hasher);
+            (face.weight as u8).hash(&mut hasher);
+            (face.design as u8).hash(&mut hasher);
+            (face.slant as u8).hash(&mut hasher);
+            face.family.name().as_deref().hash(&mut hasher);
+            face.tracking.to_bits().hash(&mut hasher);
+        }
+        None => 0u8.hash(&mut hasher),
+    }
+    if let DomKind::Text(text) = &node.kind {
+        text.inherits_face.hash(&mut hasher);
+        hash_color(Some(text.color), &mut hasher);
+        text.inherits_ink.hash(&mut hasher);
+        text.font.size.to_bits().hash(&mut hasher);
+        (text.font.weight as u8).hash(&mut hasher);
+        (text.font.design as u8).hash(&mut hasher);
+        (text.font.slant as u8).hash(&mut hasher);
+        text.font.family.name().as_deref().hash(&mut hasher);
+        text.font.tracking.to_bits().hash(&mut hasher);
+        hash_f32(text.line_height, &mut hasher);
+        text.text_align.map(|align| align as u8).hash(&mut hasher);
+        text.truncation.map(|mode| mode as u8).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Sends the look's rule once: the first element to wear it defines it.
+fn define_rule(rule: u64, node: &DomNode, ctx: &mut LowerCtx, patches: &mut Vec<DomPatch>) {
+    if !ctx.rules.insert(rule) {
+        return;
+    }
+    let kind = match &node.kind {
+        DomKind::Root => CreateKind::Group,
+        other => create_kind(other),
+    };
+    patches.push(DomPatch::DefineRule {
+        rule,
+        kind,
+        flags: u8::from(lays_itself_out(&node.hints)),
+        style: Box::new(look_style(&node.style)),
+        layout: Box::new(node.layout.as_ref().map(look_layout).unwrap_or_default()),
+        text: match &node.kind {
+            DomKind::Text(text) => Some(Box::new(look_text(text))),
+            _ => node.face.as_deref().map(|face| Box::new(face_only(*face))),
+        },
+    });
+}
+
+/// The look's text record for an element that declares a face for its
+/// subtree and shows no words of its own: the face, nothing else.
+fn face_only(face: FontSpec) -> DomText {
+    DomText {
+        content: Arc::from(""),
+        color: Color::BLACK,
+        inherits_ink: true,
+        font: face,
+        line_height: None,
+        text_align: None,
+        highlights: None,
+        truncation: None,
+        inherits_face: false,
+    }
+}
+
+/// The element's own geometry, as the box patch carries it.
+fn geometry_of(layout: &DomLayout) -> [Option<f32>; 5] {
+    [layout.width, layout.height, layout.max_width, layout.max_height, layout.slot_y]
+}
+
+fn box_patch(id: u32, geometry: [Option<f32>; 5]) -> DomPatch {
+    let [width, height, max_width, max_height, slot_y] = geometry;
+    DomPatch::SetBox { id, width, height, max_width, max_height, slot_y }
+}
+
+/// The element's own marks.
+fn marks_of(style: &DomStyle) -> (Option<Arc<str>>, Option<u64>) {
+    (style.tooltip().cloned(), style.group_owner())
+}
+
+/// A text's words: alone when nothing is highlighted, with the spans
+/// when something is.
+fn text_words_patch(id: u32, text: &DomText) -> DomPatch {
+    if text.highlights.is_some() {
+        DomPatch::SetText { id, text: Box::new(text.clone()) }
+    } else {
+        DomPatch::SetContent { id, text: Arc::clone(&text.content) }
+    }
 }
 
 fn create_kind(kind: &DomKind) -> CreateKind {
@@ -1263,34 +2238,384 @@ fn note_island(id: u32, node: &DomNode, ctx: &mut LowerCtx) {
     }
 }
 
-/// Emits the patches that build `node` (already positioned) under
-/// `parent` and returns its retained mirror.
 /// [`create_subtree`] with a real position: the root lands `before`
 /// its next sibling (0 = append). The interior appends in order — a
 /// fresh subtree has nothing to dodge.
 fn create_subtree_before(
-    node: &DomNode,
+    node: &mut DomNode,
     parent: u32,
     before: u32,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
-) -> Retained {
+    sibling: Option<(&DomNode, u32)>,
+) -> Option<u32> {
     let opened = patches.len();
-    let created = create_subtree(node, parent, ctx, patches);
+    // a fresh child of a kept parent: the base above it may not be on
+    // the page, so only a group of its own tells a path against one
+    let created = create_subtree(node, parent, ctx, patches, sibling, None);
     if before != 0
-        && let DomPatch::Create { before: slot, .. } = &mut patches[opened]
+        && let DomPatch::Create { before: slot, .. } | DomPatch::Clone { before: slot, .. } =
+            &mut patches[opened]
     {
         *slot = before;
     }
     created
 }
 
+/// The group the action paths below it are told against: the nearest
+/// Group at or above an element — the element itself when it is one.
+/// A path that lies under the base ships as `~` and the rest; the base
+/// is written on the group's element only when a path leaned on it.
+struct Base {
+    path: Rc<str>,
+    leaned_on: bool,
+}
+
+impl Base {
+    /// The base a node opens, when it is a group.
+    fn of(node: &DomNode) -> Option<Base> {
+        match &node.kind {
+            DomKind::Group { path } => Some(Base { path: Rc::clone(path), leaned_on: false }),
+            _ => None,
+        }
+    }
+}
+
+/// How much of an action path its base already says: the base's own
+/// length when the path lies under it, and the base is leaned on; zero
+/// when it does not — an action armed above the group ships whole.
+fn told_against(path: &str, base: Option<&mut Base>) -> usize {
+    let Some(base) = base else {
+        return 0;
+    };
+    let len = base_len(path, Some(&base.path));
+    if len > 0 {
+        base.leaned_on = true;
+    }
+    len
+}
+
+/// The length of `base` when `path` lies under it (`base` + `/` + the
+/// rest), zero otherwise. `~` starts no identity path, so the page
+/// tells a relative path from a whole one by its first character.
+fn base_len(path: &str, base: Option<&str>) -> usize {
+    match base {
+        Some(base)
+            if !base.is_empty()
+                && path.len() > base.len() + 1
+                && path.as_bytes()[base.len()] == b'/'
+                && path.starts_with(base) =>
+        {
+            base.len()
+        }
+        _ => 0,
+    }
+}
+
+/// The string the page shows for an action path, `base_len` of it
+/// told by its base: `~` and the rest, or the path whole.
+pub(crate) fn shown_path(path: &str, base_len: usize) -> String {
+    match base_len {
+        0 => path.to_string(),
+        len => format!("~{}", &path[len..]),
+    }
+}
+
+/// Does the template's member show this path already — the same
+/// string, so the copy took it with the element?
+fn shows_already(paths: &[ShownPath], member: usize, path: &str, base_len: usize) -> bool {
+    matches!(
+        paths.get(member),
+        Some(Some((was, was_len)))
+            if (*was_len == 0) == (base_len == 0) && was[*was_len..] == path[base_len..]
+    )
+}
+
+/// What a template's members show, in pre-order: the looks they wear
+/// and the action paths on them.
+struct Shown<'a> {
+    rules: &'a [u64],
+    paths: &'a [ShownPath],
+}
+
+/// A copy of a live template: one word for the whole subtree, then the
+/// copy's own (see [`clone_instance`]). The copy's base, when a path in
+/// it leans on one, rides on that word.
+fn clone_subtree(
+    node: &mut DomNode,
+    parent: u32,
+    template: u32,
+    ctx: &mut LowerCtx,
+    patches: &mut Vec<DomPatch>,
+) {
+    let id = *ctx.next_id;
+    *ctx.next_id += 1;
+    let cloned = patches.len();
+    patches.push(DomPatch::Clone { id, parent, before: 0, template, base: None });
+    crate::stats::note_clone();
+    let rules = ctx.templates.rules_of(template);
+    let paths = ctx.templates.paths_of(template);
+    let mut at = 0;
+    let shown = Shown { rules: &rules, paths: &paths };
+    clone_instance(node, id, &shown, &mut at, ctx, patches, None, Some(cloned))
+}
+
+/// The copy's own: ids in pre-order, every text's words, every action
+/// path its template's member does not show already, the base of every
+/// group inside it a path leans on — and the bindings filed under the
+/// new ids, each written on its node where it stands: the subtree
+/// moves into the retention as it came. `base` is the group the
+/// member's path is told against; `cloned` is the clone's word when the
+/// member is the copy's root, whose base rides on it.
+#[allow(clippy::too_many_arguments)]
+fn clone_instance(
+    node: &mut DomNode,
+    id: u32,
+    template: &Shown,
+    at: &mut usize,
+    ctx: &mut LowerCtx,
+    patches: &mut Vec<DomPatch>,
+    base: Option<&mut Base>,
+    cloned: Option<usize>,
+) {
+    let member = *at;
+    // the look is the template's, by position; a template that lost its
+    // list of looks is hashed again
+    let rule = match template.rules.get(member) {
+        Some(rule) => *rule,
+        None => look_hash(node),
+    };
+    *at += 1;
+    let opened = patches.len();
+    if let DomKind::Text(text) = &node.kind {
+        patches.push(DomPatch::SetContent { id, text: Arc::clone(&text.content) });
+        if let Some(binding) = &node.binding {
+            file_binding(id, binding, text, ctx);
+        }
+    }
+    // a group is the base of the paths below it, its own included
+    let mut own = Base::of(node);
+    let mut base = match own.as_mut() {
+        Some(own) => Some(own),
+        None => base,
+    };
+    if let Some(path) = &node.style.interactive {
+        let base_len = told_against(path, base.as_deref_mut());
+        // the template's member shows the same string: the copy took it
+        // with the element
+        if !shows_already(template.paths, member, path, base_len) {
+            patches.push(DomPatch::SetPath { id, path: Some(Rc::clone(path)), base_len });
+        }
+    }
+    if let (DomKind::Group { .. }, Some(binding)) = (&node.kind, &node.binding) {
+        file_class_binding(id, binding, &node.hints, ctx);
+    }
+    for child in &mut node.children {
+        let child_id = *ctx.next_id;
+        *ctx.next_id += 1;
+        clone_instance(child, child_id, template, at, ctx, patches, base.as_deref_mut(), None);
+    }
+    // a group a path leans on carries its OWN path: the base it was
+    // copied with names the template's group. The copy's root says it
+    // on the clone's word; a group inside, ahead of its members' words.
+    // A group no path leans on may keep the template's: nothing below
+    // it reads a base
+    if let Some(own) = own
+        && own.leaned_on
+    {
+        match cloned {
+            Some(word) => {
+                if let DomPatch::Clone { base, .. } = &mut patches[word] {
+                    *base = Some(own.path);
+                }
+            }
+            None => patches.insert(opened, DomPatch::SetBase { id, base: own.path }),
+        }
+    }
+    retain(node, id, rule);
+}
+
+/// A scene node becomes a retained one where it stands: its id and its
+/// look are written on it, and what its children's vector holds beyond
+/// them is given back — a capture may grow a vector as it fills it, and
+/// the retention keeps the vector the node came with.
+fn retain(node: &mut DomNode, id: u32, rule: u64) {
+    node.id = id;
+    node.rule = rule;
+    node.children.shrink_to_fit();
+}
+
+/// The shape of a subtree, hashed — `None` when the subtree holds
+/// something a clone cannot carry: a field or a scroll region (the
+/// browser's own state), an island, an image, an icon, a frame, a
+/// popover, absolute geometry, an id, a highlight, or a style that
+/// hangs a rule or an attribute off the element's own id (states,
+/// groups, glass, tooltips, gradients).
+fn shape_of(node: &DomNode) -> Option<u64> {
+    use std::hash::Hasher;
+    crate::stats::note_shape_hashed();
+    let mut hasher = motor::hash::FxHasher::default();
+    shape_into(node, &mut hasher).then(|| hasher.finish())
+}
+
+/// Does the subtree have the shape of `old`, a template instance? The
+/// twin of [`shape_into`] that compares instead of hashing: the same
+/// fields, in the same sense, and the first difference ends it.
+fn same_shape(node: &DomNode, old: &DomNode) -> bool {
+    if std::mem::discriminant(&node.kind) != std::mem::discriminant(&old.kind) {
+        return false;
+    }
+    match &node.kind {
+        DomKind::Group { .. }
+        | DomKind::Box
+        | DomKind::FlexColumn
+        | DomKind::FlexRow
+        | DomKind::Layers => {}
+        DomKind::Text(text) => {
+            if text.highlights.is_some() {
+                return false;
+            }
+            let DomKind::Text(was) = &old.kind else {
+                return false;
+            };
+            // the face and the ink, never the words
+            if text.color != was.color
+                || text.inherits_face != was.inherits_face
+                || text.inherits_ink != was.inherits_ink
+                || text.font != was.font
+                || text.line_height != was.line_height
+                || text.text_align != was.text_align
+                || text.truncation != was.truncation
+            {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+    if node.hints.dom_id.is_some() || node.style.has_marks() {
+        return false;
+    }
+    let (Some(layout), Some(old_layout)) = (&node.layout, &old.layout) else {
+        return false;
+    };
+    node.face == old.face
+        && same_look_layout(layout, old_layout)
+        && geometry_of(layout) == geometry_of(old_layout)
+        && same_look_style(&node.style, &old.style)
+        && node.hints.tag == old.hints.tag
+        && node.hints.class == old.hints.class
+        && node.style.interactive.is_some() == old.style.interactive.is_some()
+        && node.binding.is_some() == old.binding.is_some()
+        && node.children.len() == old.children.len()
+        && node.children.iter().zip(&old.children).all(|(child, was)| same_shape(child, was))
+}
+
+/// The shared part of two flow records, equal? (What [`look_hash`]
+/// reads of a layout.)
+fn same_look_layout(a: &DomLayout, b: &DomLayout) -> bool {
+    a.gap == b.gap
+        && a.align == b.align
+        && a.padding == b.padding
+        && a.grow == b.grow
+        && a.stretch == b.stretch
+        && a.fill == b.fill
+        && a.wrap == b.wrap
+        && a.plain == b.plain
+}
+
+/// The shared part of two styles, equal? (What [`look_hash`] reads of
+/// a style: its look — everything but the element's own path, tooltip
+/// and group.)
+fn same_look_style(a: &DomStyle, b: &DomStyle) -> bool {
+    same_look(a.look(), b.look())
+}
+
+fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
+    use std::hash::Hash;
+    // the kinds a clone can carry: the ones with no state of the
+    // browser's own and no identity of their own
+    match &node.kind {
+        DomKind::Group { .. }
+        | DomKind::Box
+        | DomKind::Text(_)
+        | DomKind::FlexColumn
+        | DomKind::FlexRow
+        | DomKind::Layers => {}
+        _ => return false,
+    }
+    if let DomKind::Text(text) = &node.kind
+        && text.highlights.is_some()
+    {
+        return false;
+    }
+    // an id, a tooltip, a group of its own: the element's, never a shape's
+    if node.hints.dom_id.is_some() || node.style.has_marks() {
+        return false;
+    }
+    let Some(layout) = &node.layout else {
+        return false;
+    };
+    // the look says everything a rule shares; the box and the hints
+    // say the rest the clone must carry byte for byte
+    look_hash(node).hash(hasher);
+    geometry_of(layout).map(|value| value.map(f32::to_bits)).hash(hasher);
+    node.hints.tag.as_deref().hash(hasher);
+    node.hints.class.as_deref().hash(hasher);
+    // the action path is the row's own; that there IS one is the shape
+    node.style.interactive.is_some().hash(hasher);
+    // a binding reads its own value; that there is one is the shape
+    node.binding.is_some().hash(hasher);
+    node.children.len().hash(hasher);
+    node.children.iter().all(|child| shape_into(child, hasher))
+}
+
+/// Emits the patches that build `node` under `parent` and makes the
+/// node its own retained mirror, where it stands: its id and its look
+/// are written on it and on every node below, and no node moves.
+/// Returns the template the subtree is an instance of, when it is one
+/// (a clone of it, or the template itself), so the next sibling can be
+/// compared with it instead of hashed.
+///
+/// `sibling` is the sibling made just before this one, with the
+/// template IT is an instance of. `base` is the group a path here is
+/// told against, when one stands above in this subtree (a group opens
+/// its own).
 fn create_subtree(
-    node: &DomNode,
+    node: &mut DomNode,
     parent: u32,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
-) -> Retained {
+    sibling: Option<(&DomNode, u32)>,
+    base: Option<&mut Base>,
+) -> Option<u32> {
+    // the sibling made just before this one, when it is an instance of a
+    // live template and this subtree has its shape: cloned from that
+    // template at once, by a walk that compares and stops at the first
+    // difference — never a hash over every node of every row. A list's
+    // rows mostly look alike, and this is the road they take, row after
+    // row: each new row is compared with the copy made just before it
+    if let Some((sibling, template)) = sibling
+        && matches!(node.kind, DomKind::Group { .. })
+        && ctx.templates.roots.contains_key(&template)
+        && same_shape(node, sibling)
+    {
+        clone_subtree(node, parent, template, ctx, patches);
+        return Some(template);
+    }
+    // the shape is the whole subtree's, read before anything below is
+    // made
+    let shape = match node.kind {
+        DomKind::Group { .. } => shape_of(node),
+        _ => None,
+    };
+    // a shape already on the page is cloned, never built again: one
+    // word for the subtree, then its words and its action paths
+    if let Some(shape) = shape
+        && let Some(&template) = ctx.templates.by_shape.get(&shape)
+    {
+        clone_subtree(node, parent, template, ctx, patches);
+        return Some(template);
+    }
     let id = *ctx.next_id;
     *ctx.next_id += 1;
     patches.push(DomPatch::Create {
@@ -1300,14 +2625,20 @@ fn create_subtree(
         kind: create_kind(&node.kind),
         hints: node.hints.clone(),
     });
-    if let DomKind::Group { path } = &node.kind {
-        ctx.group_paths.insert(path.clone());
+    if let (DomKind::Group { .. }, Some(binding)) = (&node.kind, &node.binding) {
+        file_class_binding(id, binding, &node.hints, ctx);
     }
+    // the look is shared; the box, the marks and the path are the
+    // element's own
+    let rule = look_hash(node);
+    define_rule(rule, node, ctx, patches);
+    patches.push(DomPatch::UseRule { id, rule });
     match &node.layout {
         // a flow node speaks semantics; its geometry fields are silent
         Some(layout) => {
-            if *layout != DomLayout::default() {
-                patches.push(DomPatch::SetLayout { id, layout: layout.clone() });
+            let geometry = geometry_of(layout);
+            if geometry.iter().any(Option::is_some) {
+                patches.push(box_patch(id, geometry));
             }
         }
         None => {
@@ -1315,12 +2646,26 @@ fn create_subtree(
             patches.push(DomPatch::SetSize { id, width: node.width, height: node.height });
         }
     }
-    if node.style != DomStyle::default() {
-        patches.push(DomPatch::SetStyle { id, style: node.style.clone() });
+    if node.style.has_marks() {
+        let (tooltip, group_owner) = marks_of(&node.style);
+        patches.push(DomPatch::SetMarks { id, tooltip, group_owner });
+    }
+    // a group is the base of the paths below it, its own included
+    let mut own = Base::of(node);
+    let mut base = match own.as_mut() {
+        Some(own) => Some(own),
+        None => base,
+    };
+    if let Some(path) = &node.style.interactive {
+        let base_len = told_against(path, base.as_deref_mut());
+        patches.push(DomPatch::SetPath { id, path: Some(Rc::clone(path)), base_len });
     }
     match &node.kind {
         DomKind::Text(text) => {
-            patches.push(DomPatch::SetText { id, text: text.clone() });
+            patches.push(text_words_patch(id, text));
+            if let Some(binding) = &node.binding {
+                file_binding(id, binding, text, ctx);
+            }
         }
         DomKind::Field(field) => {
             patches.push(DomPatch::SetField { id, field: field.clone() });
@@ -1349,76 +2694,370 @@ fn create_subtree(
         }
         _ => {}
     }
-    let children = create_children(node, id, ctx, patches);
-    Retained { id, node: shallow(node), children }
+    let templates_before = ctx.templates.roots.len();
+    create_children(&mut node.children, id, ctx, patches, base);
+    // a group a path leans on carries its own path, said once its
+    // subtree has: a word after it, where no patch has to move for it
+    if let Some(own) = own
+        && own.leaned_on
+    {
+        patches.push(DomPatch::SetBase { id, base: own.path });
+    }
+    retain(node, id, rule);
+    // the first of a shape is the template the next ones clone — unless
+    // a template was made inside it. A member answers to ONE template:
+    // a subtree holding another template's root would take that
+    // template's members as its own, and the inner one, retired by
+    // nobody when its row changed or left, would hand out copies of an
+    // element no longer on the page
+    let holds_a_template = ctx.templates.roots.len() > templates_before;
+    if let Some(shape) = shape
+        && !holds_a_template
+        && !ctx.templates.by_shape.contains_key(&shape)
+    {
+        let mut members = Vec::new();
+        let mut rules = Vec::new();
+        let mut paths = Vec::new();
+        collect_members(node, None, &mut members, &mut rules, &mut paths);
+        ctx.templates.register(shape, id, members, rules, paths);
+        return Some(id);
+    }
+    None
 }
 
+/// Every id, every look and every action path of a subtree, in
+/// pre-order — the order a clone is numbered in. A path is recorded as
+/// the page shows it: told against the nearest group at or above it,
+/// the same telling the subtree was made with.
+fn collect_members(
+    retained: &DomNode,
+    base: Option<&str>,
+    ids: &mut Vec<u32>,
+    rules: &mut Vec<u64>,
+    paths: &mut Vec<ShownPath>,
+) {
+    ids.push(retained.id);
+    rules.push(retained.rule);
+    let base = match &retained.kind {
+        DomKind::Group { path } => Some(&**path),
+        _ => base,
+    };
+    paths.push(
+        retained.style.interactive.as_ref().map(|path| (Rc::clone(path), base_len(path, base))),
+    );
+    for child in &retained.children {
+        collect_members(child, base, ids, rules, paths);
+    }
+}
+
+/// Makes every child where it stands, in order, each compared with the
+/// sibling made just before it.
 fn create_children(
-    node: &DomNode,
+    children: &mut [DomNode],
     parent: u32,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
-) -> Vec<Retained> {
-    node.children
-        .iter()
-        .map(|child| create_subtree(child, parent, ctx, patches))
-        .collect()
+    mut base: Option<&mut Base>,
+) {
+    let mut template = None;
+    for at in 0..children.len() {
+        let (made, rest) = children.split_at_mut(at);
+        let sibling = made.last().zip(template);
+        template = create_subtree(&mut rest[0], parent, ctx, patches, sibling, base.as_deref_mut());
+    }
 }
 
 /// One remove patch frees the whole subtree on the glue's side; the
 /// island registry forgets every canvas underneath.
-fn remove_subtree(retained: &Retained, ctx: &mut LowerCtx, patches: &mut Vec<DomPatch>) {
+/// Files the element a text binding drives, with the record just shipped.
+fn file_binding(id: u32, binding: &NodeBinding, shipped: &DomText, ctx: &mut LowerCtx) {
+    ctx.bindings.insert(
+        Rc::clone(binding.key()),
+        BoundElement { id, binding: binding.clone(), shipped: Shipped::Text(shipped.clone()) },
+    );
+}
+
+/// Files the element a class binding drives, with the hints just shipped.
+fn file_class_binding(id: u32, binding: &NodeBinding, shipped: &DomHints, ctx: &mut LowerCtx) {
+    ctx.bindings.insert(
+        Rc::clone(binding.key()),
+        BoundElement { id, binding: binding.clone(), shipped: Shipped::Hints(shipped.clone()) },
+    );
+}
+
+/// One subtree leaves: one remove patch frees it on the glue's side.
+/// What the diff itself may still ask about it leaves now — a template
+/// it held must not be cloned, an island it held must not be painted —
+/// and a subtree that held neither is not walked at all. Its groups and
+/// bindings wait with it ([`DomLowering::unpick_buried`]).
+fn remove_subtree(retained: DomNode, ctx: &mut LowerCtx, patches: &mut Vec<DomPatch>) {
     patches.push(DomPatch::Remove { id: retained.id });
-    fn forget_islands(retained: &Retained, islands: &mut HashMap<u32, Island>) {
-        if matches!(retained.node.kind, DomKind::Canvas { .. }) {
-            islands.remove(&retained.id);
+    if !ctx.templates.members.is_empty() || !ctx.islands.is_empty() {
+        forget_now(&retained, ctx);
+    }
+    ctx.graveyard.push(Buried::One(retained));
+}
+
+/// Every old child leaves and nothing stays: the parent is emptied in
+/// one op, which names every id that leaves, and the children go to the
+/// graveyard as the one vector they were.
+fn remove_all_children(
+    parent: u32,
+    leaving: Vec<DomNode>,
+    ctx: &mut LowerCtx,
+    patches: &mut Vec<DomPatch>,
+) {
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    let islands = !ctx.islands.is_empty();
+    for retained in &leaving {
+        // a whole row leaves: the template question is the row's, once
+        // — a member below it cannot outlive its root; a template the
+        // row holds leaves as the walk passes its root
+        if !ctx.templates.members.is_empty() {
+            ctx.templates.touched(retained.id);
         }
-        for child in &retained.children {
-            forget_islands(child, islands);
+        number_leaving(retained, &mut runs);
+        if islands {
+            forget_islands(retained, ctx);
         }
     }
-    forget_islands(retained, ctx.islands);
-    fn forget_groups(
-        retained: &Retained,
-        groups: &mut std::collections::HashSet<std::rc::Rc<str>>,
-    ) {
-        if let DomKind::Group { path } = &retained.node.kind {
-            groups.remove(path);
-        }
-        for child in &retained.children {
-            forget_groups(child, groups);
+    let forget = id_ranges(runs);
+    // a template inside a row that leaves whole, the row none itself (it
+    // holds this one): the row's question never reached it, and left
+    // standing it would hand out copies of an element no longer on the
+    // page. Its root is among the ids that leave — the few templates that
+    // stand are looked up in the runs, and no node is walked again. This
+    // cannot wait for the idle: the next frame may already ask for a copy
+    if !ctx.templates.roots.is_empty() {
+        let inside = |root: u32| {
+            let at = forget.partition_point(|&(_, end)| end <= root);
+            forget.get(at).is_some_and(|&(start, _)| start <= root)
+        };
+        let gone: Vec<u32> = ctx.templates.roots.keys().copied().filter(|&root| inside(root)).collect();
+        for root in gone {
+            ctx.templates.forget_root(root);
         }
     }
-    forget_groups(retained, ctx.group_paths);
+    patches.push(DomPatch::RemoveChildren { id: parent, forget });
+    ctx.graveyard.push(Buried::Many(leaving));
+}
+
+/// Runs of ids as sorted half-open ranges `[start, end)`, neighbours
+/// merged.
+///
+/// A subtree numbered in one piece is one run, so the walk hands over a
+/// run per row, not an id per node; and a list filled back to front
+/// numbers its last row first, so the runs come in reverse. A thousand
+/// of them are put in order where nine thousand ids were — and not at
+/// all when they already are.
+fn id_ranges(mut runs: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    if !runs.is_sorted() {
+        runs.sort_unstable();
+    }
+    let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(runs.len());
+    for (start, end) in runs {
+        match ranges.last_mut() {
+            Some((_, last)) if *last == start => *last = end,
+            _ => ranges.push((start, end)),
+        }
+    }
+    ranges
+}
+
+/// The id at the end of the runs: the run it continues grows, any other
+/// starts its own.
+fn push_run(runs: &mut Vec<(u32, u32)>, id: u32) {
+    match runs.last_mut() {
+        Some((_, end)) if *end == id => *end += 1,
+        _ => runs.push((id, id + 1)),
+    }
+}
+
+/// What the diff of this very frame may still ask about a subtree that
+/// left: a template member retires its template (asked only while any
+/// template stands), and an island leaves the registry.
+fn forget_now(retained: &DomNode, ctx: &mut LowerCtx) {
+    if !ctx.templates.members.is_empty() {
+        ctx.templates.touched(retained.id);
+    }
+    if let DomKind::Canvas { .. } = &retained.kind {
+        ctx.islands.remove(&retained.id);
+    }
+    for child in &retained.children {
+        forget_now(child, ctx);
+    }
+}
+
+/// The ids of a row that leaves whole, as runs — the patch names them.
+/// Its template question was the row's own, its islands are asked apart
+/// and only while any stands, and its groups and bindings wait for the
+/// idle: a thousand rows that leave together are nine thousand nodes, and
+/// the walk asks each one for its id and its children, and nothing else.
+fn number_leaving(retained: &DomNode, runs: &mut Vec<(u32, u32)>) {
+    push_run(runs, retained.id);
+    for child in &retained.children {
+        // most nodes of a row are leaves: they cost no call
+        if child.children.is_empty() {
+            push_run(runs, child.id);
+        } else {
+            number_leaving(child, runs);
+        }
+    }
+}
+
+/// The islands of a subtree that left, out of the registry: nothing may
+/// paint them again.
+fn forget_islands(retained: &DomNode, ctx: &mut LowerCtx) {
+    if let DomKind::Canvas { .. } = &retained.kind {
+        ctx.islands.remove(&retained.id);
+    }
+    for child in &retained.children {
+        forget_islands(child, ctx);
+    }
+}
+
+/// A subtree's group records and its bindings, out of the tables: each
+/// group by its path, and each binding only while it still drives this
+/// element — a node made at the same place since took the key over, and
+/// keeps it.
+fn unpick(
+    retained: &DomNode,
+    groups: &mut motor::hash::FxHashMap<std::rc::Rc<str>, crate::dom_flow::GroupRecord>,
+    bindings: &mut motor::hash::FxHashMap<Rc<str>, BoundElement>,
+) {
+    if let DomKind::Group { path } = &retained.kind {
+        groups.remove(path);
+    }
+    if let Some(binding) = &retained.binding
+        && let std::collections::hash_map::Entry::Occupied(bound) = bindings.entry(Rc::clone(binding.key()))
+        && bound.get().id == retained.id
+    {
+        bound.remove();
+    }
+    for child in &retained.children {
+        unpick(child, groups, bindings);
+    }
+}
+
+#[cfg(test)]
+mod forget_tests {
+    use super::{id_ranges, push_run};
+
+    /// The ranges the old way spelled: every id, sorted, neighbours merged.
+    fn by_ids(ids: &[u32]) -> Vec<(u32, u32)> {
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for id in ids {
+            match ranges.last_mut() {
+                Some((_, end)) if *end == id => *end += 1,
+                _ => ranges.push((id, id + 1)),
+            }
+        }
+        ranges
+    }
+
+    fn by_runs(ids: &[u32]) -> Vec<(u32, u32)> {
+        let mut runs = Vec::new();
+        for id in ids {
+            push_run(&mut runs, *id);
+        }
+        id_ranges(runs)
+    }
+
+    /// A clear forgets every id that leaves, as ranges the glue prunes by.
+    /// The walk now hands them over as runs — a row numbered in one piece
+    /// is one — and the ranges must be exactly those every id sorted and
+    /// merged would give: rows mounted back to front (the last row
+    /// numbered first) close into one range, a reorder's mix into the
+    /// same ranges as before, a gap stays a gap.
+    #[test]
+    fn rows_forgotten_as_runs_give_the_ranges_every_id_gave() {
+        // three rows of nine nodes, numbered last row first
+        let back_to_front: Vec<u32> = (0..3u32).rev().flat_map(|row| row * 9..row * 9 + 9).collect();
+        assert_eq!(by_runs(&back_to_front), [(0, 27)]);
+        assert_eq!(by_runs(&back_to_front), by_ids(&back_to_front));
+        // a mixed order with a hole, and a row split by a node made later
+        let mixed = [12, 13, 14, 3, 4, 5, 40, 6, 7, 8, 9, 30, 31, 0, 1, 2];
+        assert_eq!(by_runs(&mixed), by_ids(&mixed));
+        assert_eq!(by_runs(&mixed), [(0, 10), (12, 15), (30, 32), (40, 41)]);
+        assert_eq!(by_runs(&[]), []);
+    }
 }
 
 /// Diffs one matched pair: geometry, style, kind payload, children.
 fn diff_node(
-    retained: &mut Retained,
-    new: &DomNode,
+    retained: &mut DomNode,
+    mut new: DomNode,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
     // the promise, honored: the walk never descended, the diff never
-    // traverses — the retained subtree IS the frame's truth here
+    // traverses — the retained subtree IS the frame's truth here. Only
+    // the SHELL is read: the parent stamped its flags and hints on the
+    // promise again, and a parent that ran may have stamped them anew
     if let DomKind::Reuse { .. } = &new.kind {
         crate::stats::note_diff_reuse();
+        let id = retained.id;
+        let before = patches.len();
+        if let Some(layout) = &new.layout
+            && retained.layout.as_ref() != Some(layout)
+        {
+            // the stamp changed: the look may have (a flag), the box
+            // may have (a pin) — each travels its own road
+            let was = retained.layout.as_ref().map(geometry_of).unwrap_or_default();
+            retained.layout = Some(layout.clone());
+            let rule = look_hash(retained);
+            if rule != retained.rule {
+                define_rule(rule, retained, ctx, patches);
+                patches.push(DomPatch::UseRule { id, rule });
+                retained.rule = rule;
+            }
+            let now = geometry_of(layout);
+            if now != was {
+                patches.push(box_patch(id, now));
+            }
+        }
+        if hints_changed(retained, &new) {
+            patches.push(DomPatch::SetHints {
+                id,
+                class: new.hints.class.clone(),
+                dom_id: new.hints.dom_id.clone(),
+            });
+            retained.hints = new.hints.clone();
+            if let Some(binding) = &new.binding {
+                file_class_binding(id, binding, &new.hints, ctx);
+            }
+        }
+        if patches.len() > before {
+            ctx.templates.touched(id);
+        }
         return;
     }
     crate::stats::note_diff_visit();
     let id = retained.id;
-    let old = &retained.node;
+    let own_patches_from = patches.len();
+    let old = &*retained;
+    let new_children = std::mem::take(&mut new.children);
+    // the look, by its hash — a rule the page has not seen is defined
+    let rule = look_hash(&new);
+    if rule != retained.rule {
+        define_rule(rule, &new, ctx, patches);
+        patches.push(DomPatch::UseRule { id, rule });
+    }
     match &new.layout {
         // a flow node speaks semantics — its geometry fields are silent
         Some(layout) => {
-            if old.layout.as_ref() != Some(layout) {
-                patches.push(DomPatch::SetLayout { id, layout: layout.clone() });
+            let was = old.layout.as_ref().map(geometry_of);
+            let now = geometry_of(layout);
+            if was != Some(now) {
+                patches.push(box_patch(id, now));
             }
         }
         None => {
-            // an absolute node that WAS flow clears its record first
+            // an absolute node that WAS flow clears its box first
             if old.layout.is_some() {
-                patches.push(DomPatch::SetLayout { id, layout: DomLayout::default() });
+                patches.push(box_patch(id, [None; 5]));
             }
             if (old.x, old.y) != (new.x, new.y) {
                 patches.push(DomPatch::SetTransform { id, x: new.x, y: new.y });
@@ -1428,10 +3067,17 @@ fn diff_node(
             }
         }
     }
-    if old.style != new.style {
-        patches.push(DomPatch::SetStyle { id, style: new.style.clone() });
+    if old.style.marks() != new.style.marks() {
+        let (tooltip, group_owner) = marks_of(&new.style);
+        patches.push(DomPatch::SetMarks { id, tooltip, group_owner });
     }
-    if old.hints != new.hints {
+    // a path that changed on a kept element ships whole: the base it
+    // could be told against may never have been written on the page
+    if old.style.interactive != new.style.interactive {
+        patches.push(DomPatch::SetPath { id, path: new.style.interactive.clone(), base_len: 0 });
+    }
+    let same_binding = same_binding(old, &new);
+    if hints_changed(old, &new) {
         // class and id re-attribute live; a TAG change would need a
         // recreation and the walk never changes one on a kept identity
         patches.push(DomPatch::SetHints {
@@ -1440,9 +3086,29 @@ fn diff_node(
             dom_id: new.hints.dom_id.clone(),
         });
     }
+    if let (DomKind::Group { .. }, Some(binding)) = (&new.kind, &new.binding)
+        && (!same_binding || hints_changed(old, &new))
+    {
+        file_class_binding(id, binding, &new.hints, ctx);
+    }
     match (&old.kind, &new.kind) {
-        (DomKind::Text(before), DomKind::Text(after)) if before != after => {
-            patches.push(DomPatch::SetText { id, text: after.clone() });
+        (DomKind::Text(before), DomKind::Text(after)) => {
+            // the face is the look's; the words are the element's. The
+            // words of a text that reads for itself travel on their own
+            // road: the same binding object means the same reads, and
+            // the retained record may lag the patch already shipped
+            let changed = if same_binding {
+                before.highlights != after.highlights
+            } else {
+                before.content != after.content || before.highlights != after.highlights
+            };
+            if changed {
+                patches.push(text_words_patch(id, after));
+            }
+            match &new.binding {
+                Some(binding) if changed || !same_binding => file_binding(id, binding, after, ctx),
+                _ => {}
+            }
         }
         (DomKind::Field(before), DomKind::Field(after)) if before != after => {
             patches.push(DomPatch::SetField { id, field: after.clone() });
@@ -1453,7 +3119,7 @@ fn diff_node(
         ) if before != after => {
             patches.push(DomPatch::SetScroll { id, x: after.0, y: after.1 });
         }
-        (_, DomKind::Canvas { .. }) => note_island(id, new, ctx),
+        (_, DomKind::Canvas { .. }) => note_island(id, &new, ctx),
         (DomKind::Image(before), DomKind::Image(after)) if before != after => {
             patches.push(DomPatch::SetImage { id, image: *after });
         }
@@ -1481,8 +3147,12 @@ fn diff_node(
         }
         _ => {}
     }
+    // a patch other than its words reached a template's member: the
+    // live instance is no longer the shape
+    if patches.len() > own_patches_from {
+        ctx.templates.touched(id);
+    }
     let previous_target = old_kind_for_reveal(retained);
-    retained.node = shallow(new);
     let followed = match (&previous_target, &new.kind) {
         // the region follows an item: a CHANGED target reveals it —
         // virtual rows by their slot (they may not exist yet), dense
@@ -1494,16 +3164,23 @@ fn diff_node(
         (None, DomKind::Scroll { target: Some(after), .. }) => Some(after.clone()),
         _ => None,
     };
-    diff_children(retained, new, ctx, patches);
+    let flow = new.layout.is_some();
+    // the node moves into the retention under the id it had, over the
+    // children the diff reconciles next: its own were taken above
+    new.id = id;
+    new.rule = rule;
+    new.children = std::mem::take(&mut retained.children);
+    *retained = new;
+    diff_children(retained, new_children, flow, ctx, patches);
     if let Some(target) = followed {
-        reveal_target(retained, new, &target, patches);
+        reveal_target(retained, &target, patches);
     }
 }
 
-/// The retained Scroll's PREVIOUS target (before `shallow` runs, the
-/// caller captures it) — `None` when the node is not a scroll region.
-fn old_kind_for_reveal(retained: &Retained) -> Option<Option<String>> {
-    match &retained.node.kind {
+/// The retained Scroll's PREVIOUS target (the caller captures it before
+/// the new node moves in) — `None` when the node is not a scroll region.
+fn old_kind_for_reveal(retained: &DomNode) -> Option<Option<String>> {
+    match &retained.kind {
         DomKind::Scroll { target, .. } => Some(target.clone()),
         _ => None,
     }
@@ -1511,15 +3188,11 @@ fn old_kind_for_reveal(retained: &Retained) -> Option<Option<String>> {
 
 /// Emits the reveal for `target` under an already-diffed scroll node:
 /// a virtual row scrolls to its slot, a dense row asks the browser.
-fn reveal_target(
-    retained: &Retained,
-    new: &DomNode,
-    target: &str,
-    patches: &mut Vec<DomPatch>,
-) {
+/// The retention is the frame's truth by now: it holds the slots and
+/// the elements both.
+fn reveal_target(retained: &DomNode, target: &str, patches: &mut Vec<DomPatch>) {
     let suffix = format!("[{target}]");
-    // the scene knows the slot; the retention knows the element
-    let slot = new
+    let slot = retained
         .children
         .first()
         .into_iter()
@@ -1531,14 +3204,14 @@ fn reveal_target(
             _ => None,
         });
     match slot {
-        Some(y) => patches.push(DomPatch::SetScroll { id: retained.id, x: 0.0, y }),
+        Some(y) => patches.push(DomPatch::SetScroll { id: retained.id, x: 0.0, y: y.into() }),
         None => {
             let row_id = retained
                 .children
                 .first()
                 .into_iter()
                 .flat_map(|content| content.children.iter())
-                .find_map(|row| match &row.node.kind {
+                .find_map(|row| match &row.kind {
                     DomKind::Group { path } if path.ends_with(&suffix) => Some(row.id),
                     _ => None,
                 });
@@ -1553,23 +3226,25 @@ fn reveal_target(
 /// keeps its rows), everything else by position and kind. Unmatched old
 /// children leave; unmatched new ones mount.
 fn diff_children(
-    retained: &mut Retained,
-    new: &DomNode,
+    retained: &mut DomNode,
+    new_children: Vec<DomNode>,
+    flow: bool,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
     // under a FLOW parent sibling order IS the layout, so the matching
     // must also reconcile positions; under an absolute parent order
     // only decides paint stacking and the old path stays byte-for-byte
-    if new.layout.is_some() {
-        diff_children_ordered(retained, new, ctx, patches);
+    if flow {
+        diff_children_ordered(retained, new_children, ctx, patches);
         return;
     }
+    let new_len = new_children.len();
     let old_children = std::mem::take(&mut retained.children);
-    let mut by_path: HashMap<std::rc::Rc<str>, Retained> = HashMap::new();
-    let mut by_index: Vec<Option<Retained>> = Vec::with_capacity(old_children.len());
+    let mut by_path: motor::hash::FxHashMap<std::rc::Rc<str>, DomNode> = motor::hash::FxHashMap::default();
+    let mut by_index: Vec<Option<DomNode>> = Vec::with_capacity(old_children.len());
     for old in old_children {
-        if let DomKind::Group { path } = &old.node.kind {
+        if let DomKind::Group { path } = &old.kind {
             by_path.insert(path.clone(), old);
             by_index.push(None);
         } else {
@@ -1577,8 +3252,12 @@ fn diff_children(
         }
     }
 
-    let mut next: Vec<Retained> = Vec::with_capacity(new.children.len());
-    for (index, child) in new.children.iter().enumerate() {
+    let mut next: Vec<DomNode> = Vec::with_capacity(new_len);
+    let mut survivors = 0usize;
+    // the template the sibling made just before is an instance of —
+    // only a sibling made in this walk; a kept one breaks the run
+    let mut template = None;
+    for (index, child) in new_children.into_iter().enumerate() {
         let matched = match &child.kind {
             DomKind::Group { path } | DomKind::Reuse { path } => by_path.remove(path),
             // a kind change at the same index is remove+create — the
@@ -1587,7 +3266,7 @@ fn diff_children(
             // it silently and leak the element on the browser's side)
             kind => by_index.get_mut(index).and_then(|slot| match slot.take() {
                 Some(old)
-                    if std::mem::discriminant(&old.node.kind)
+                    if std::mem::discriminant(&old.kind)
                         == std::mem::discriminant(kind) =>
                 {
                     Some(old)
@@ -1603,16 +3282,31 @@ fn diff_children(
             Some(mut old) => {
                 diff_node(&mut old, child, ctx, patches);
                 next.push(old);
+                survivors += 1;
+                template = None;
             }
-            None => next.push(create_subtree(child, retained.id, ctx, patches)),
+            None => {
+                let mut child = child;
+                let sibling = next.last().zip(template);
+                template = create_subtree(&mut child, retained.id, ctx, patches, sibling, None);
+                next.push(child);
+            }
         }
     }
 
-    for (_, leftover) in by_path {
-        remove_subtree(&leftover, ctx, patches);
+    let leaving: Vec<DomNode> =
+        by_path.into_values().chain(by_index.into_iter().flatten()).collect();
+    let left = !leaving.is_empty();
+    if survivors == 0 && left {
+        // every old child left and none stayed: one op empties the parent
+        remove_all_children(retained.id, leaving, ctx, patches);
+    } else {
+        for leftover in leaving {
+            remove_subtree(leftover, ctx, patches);
+        }
     }
-    for leftover in by_index.into_iter().flatten() {
-        remove_subtree(&leftover, ctx, patches);
+    if survivors < new_len || left {
+        ctx.templates.touched(retained.id);
     }
     retained.children = next;
 }
@@ -1624,20 +3318,36 @@ fn diff_children(
 /// insert costs zero moves), while surviving children off the longest
 /// increasing subsequence of their old order move with one `Move`
 /// each — a swap of two rows is exactly two patches.
+///
+/// The ends that kept their place never enter the plan: a row appended,
+/// removed or replaced leaves the rows before it where they stood, and
+/// the rows after it too, found by path from the back. Only the middle
+/// is matched, and the old rows stay in their list while it is: a
+/// survivor is a position, diffed where it stands. A middle that only
+/// reordered is put in order in place, row by row along its cycles —
+/// a swap of two rows trades two rows, and the thousand between them
+/// never move.
 fn diff_children_ordered(
-    retained: &mut Retained,
-    new: &DomNode,
+    retained: &mut DomNode,
+    new_children: Vec<DomNode>,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
+    let old_len = retained.children.len();
+    let new_len = new_children.len();
+    let shortest = old_len.min(new_len);
+    // the head: every child that takes the old one at its own place
+    let head = (0..shortest)
+        .take_while(|&at| takes_place(&retained.children[at].kind, &new_children[at].kind))
+        .count();
     // the ALIGNED fast path: same length, every child matching its
     // old position (groups by path, the rest by kind) — the shape of
     // almost every frame. One plain loop, zero allocation; the keyed
     // machinery below only runs when something actually reordered,
     // mounted or left.
-    let aligned = retained.children.len() == new.children.len()
-        && retained.children.iter().zip(&new.children).all(|(old, child)| {
-            match (&old.node.kind, &child.kind) {
+    let aligned = old_len == new_len
+        && (head..old_len).all(|at| {
+            match (&retained.children[at].kind, &new_children[at].kind) {
                 (DomKind::Group { path: was }, DomKind::Group { path: now }) => was == now,
                 // a reuse promise aligns with the group it promised
                 (DomKind::Group { path: was }, DomKind::Reuse { path: now }) => was == now,
@@ -1647,130 +3357,375 @@ fn diff_children_ordered(
             }
         });
     if aligned {
-        for (old, child) in retained.children.iter_mut().zip(&new.children) {
+        for (old, child) in retained.children.iter_mut().zip(new_children) {
             diff_node(old, child, ctx, patches);
         }
         return;
     }
-
-    enum Plan<'a> {
-        Survivor { old_position: usize, node: Retained },
-        Fresh(&'a DomNode),
+    // the tail, from the back. Where the lengths differ, a place moved
+    // with the rows before it and only a path still names a row; where
+    // they do not, the places are the same ones and match as the head's
+    let shifted = old_len != new_len;
+    let tail = (0..shortest - head)
+        .take_while(|&back| {
+            let was = &retained.children[old_len - 1 - back].kind;
+            let now = &new_children[new_len - 1 - back].kind;
+            (!shifted || matches!(now, DomKind::Group { .. } | DomKind::Reuse { .. }))
+                && takes_place(was, now)
+        })
+        .count();
+    let (old_end, new_end) = (old_len - tail, new_len - tail);
+    let parent = retained.id;
+    // a list that was empty: every child is fresh, made where it stands,
+    // back to front — the scene's vector becomes the retention's (what
+    // it holds beyond them given back, as `retain` does), and no node
+    // moves
+    if old_len == 0 {
+        ctx.templates.touched(parent);
+        let mut children = new_children;
+        create_back_to_front(&mut children, parent, 0, ctx, patches);
+        children.shrink_to_fit();
+        retained.children = children;
+        return;
+    }
+    let mut nodes = new_children.into_iter();
+    for old in &mut retained.children[..head] {
+        diff_node(old, nodes.next().expect("the head is in the new list"), ctx, patches);
     }
 
-    let old_children = std::mem::take(&mut retained.children);
-    let mut by_path: HashMap<std::rc::Rc<str>, (usize, Retained)> = HashMap::new();
-    let mut by_index: Vec<Option<Retained>> = Vec::with_capacity(old_children.len());
-    for (position, old) in old_children.into_iter().enumerate() {
-        if let DomKind::Group { path } = &old.node.kind {
-            by_path.insert(path.clone(), (position, old));
-            by_index.push(None);
-        } else {
-            by_index.push(Some(old));
+    // INSERTED, and nothing else: the fresh rows mount before the tail
+    if head == old_end {
+        if tail == 0 {
+            // they end the list: they join it as they came and are made
+            // where they stand, back to front
+            ctx.templates.touched(parent);
+            retained.children.extend(nodes);
+            create_back_to_front(&mut retained.children[head..], parent, 0, ctx, patches);
+            return;
         }
+        let mut fresh: Vec<DomNode> = nodes.by_ref().take(new_end - head).collect();
+        for old in &mut retained.children[old_end..] {
+            diff_node(old, nodes.next().expect("the tail is in the new list"), ctx, patches);
+        }
+        ctx.templates.touched(parent);
+        let anchor = retained.children[old_end].id;
+        create_back_to_front(&mut fresh, parent, anchor, ctx, patches);
+        put_made(&mut retained.children, head, fresh);
+        return;
     }
 
-    // match first — creation waits for the placement walk below
-    let mut plan: Vec<Plan> = Vec::with_capacity(new.children.len());
-    for (index, child) in new.children.iter().enumerate() {
-        let matched = match &child.kind {
-            DomKind::Group { path } | DomKind::Reuse { path } => by_path.remove(path),
-            kind => by_index.get_mut(index).and_then(|slot| match slot.take() {
-                Some(old)
-                    if std::mem::discriminant(&old.node.kind)
-                        == std::mem::discriminant(kind) =>
-                {
-                    Some((index, old))
+    // REMOVED, and nothing else: the tail closes up behind the rows that
+    // left. When nothing at all survives, the parent is emptied in one
+    // op — a list that clears its rows says one word, not one per row
+    if head == new_end {
+        for old in &mut retained.children[old_end..] {
+            diff_node(old, nodes.next().expect("the tail is in the new list"), ctx, patches);
+        }
+        if head == 0 && tail == 0 {
+            remove_all_children(parent, std::mem::take(&mut retained.children), ctx, patches);
+        } else {
+            for leftover in retained.children.drain(head..old_end) {
+                remove_subtree(leftover, ctx, patches);
+            }
+        }
+        ctx.templates.touched(parent);
+        return;
+    }
+
+    // the middle, matched — creation waits for the placement walk
+    // below. The plan holds each new child's old POSITION, or FRESH;
+    // the fresh nodes wait in order beside it
+    let mut plan: Vec<usize> = Vec::with_capacity(new_end - head);
+    let mut fresh: Vec<DomNode> = Vec::new();
+    let mut claimed: Vec<bool> = vec![false; old_end - head];
+    // the old rows that may have moved, indexed by path only when a new
+    // child does not find its row at its own position — a list that
+    // kept its order never asks, and a swap indexes the two rows that
+    // traded places, not the rows that stayed
+    let mut moved: Option<motor::hash::FxHashMap<std::rc::Rc<str>, usize>> = None;
+    for index in head..new_end {
+        let child = nodes.next().expect("the middle is in the new list");
+        let matched: Option<usize> = match &child.kind {
+            DomKind::Group { path } | DomKind::Reuse { path } => {
+                let at_place = index < old_end
+                    && matches!(
+                        &retained.children[index].kind,
+                        DomKind::Group { path: there } if there == path
+                    );
+                if at_place {
+                    Some(index)
+                } else {
+                    moved
+                        .get_or_insert_with(|| {
+                            rows_that_may_move(
+                                &retained.children,
+                                head..old_end,
+                                index,
+                                &claimed,
+                                nodes.as_slice(),
+                                new_end,
+                            )
+                        })
+                        .remove(path)
                 }
-                Some(old) => {
-                    *slot = Some(old);
-                    None
-                }
-                None => None,
-            }),
+            }
+            kind => (index < old_end
+                && std::mem::discriminant(&retained.children[index].kind)
+                    == std::mem::discriminant(kind))
+            .then_some(index),
         };
         match matched {
-            Some((old_position, mut old)) => {
-                diff_node(&mut old, child, ctx, patches);
-                plan.push(Plan::Survivor { old_position, node: old });
+            Some(position) if !claimed[position - head] => {
+                claimed[position - head] = true;
+                diff_node(&mut retained.children[position], child, ctx, patches);
+                plan.push(position);
             }
-            None => plan.push(Plan::Fresh(child)),
+            _ => {
+                // sized once, by the first: the rest of the middle may
+                // all be fresh (a list that replaced its rows), and a
+                // node is too big to be copied on every doubling
+                if fresh.is_empty() {
+                    fresh.reserve_exact(new_end - index);
+                }
+                fresh.push(child);
+                plan.push(FRESH);
+            }
         }
     }
-
-    // removals go out before placements: an anchor is never a corpse
-    for (_, (_, leftover)) in by_path {
-        remove_subtree(&leftover, ctx, patches);
+    for old in &mut retained.children[old_end..] {
+        diff_node(old, nodes.next().expect("the tail is in the new list"), ctx, patches);
     }
-    for leftover in by_index.into_iter().flatten() {
-        remove_subtree(&leftover, ctx, patches);
+    let survivors = plan.len() - fresh.len();
+    let next_after = |children: &[DomNode], at: usize| children.get(at).map_or(0, |next| next.id);
+
+    // REORDERED, and nothing else: no row mounts, none leaves
+    if fresh.is_empty() && survivors == old_end - head {
+        let anchor = next_after(&retained.children, old_end);
+        let middle = &mut retained.children[head..old_end];
+        reorder_in_place(middle, head, plan, parent, anchor, patches);
+        return;
+    }
+
+    // removals go out before placements: an anchor is never a corpse.
+    // When nothing survived, the parent is emptied in one op — a list
+    // that replaces its rows says one word, not one per row
+    let mut kept: Vec<Option<DomNode>> = Vec::new();
+    if survivors == 0 && head == 0 && tail == 0 {
+        remove_all_children(parent, std::mem::take(&mut retained.children), ctx, patches);
+    } else if survivors == 0 {
+        for leftover in retained.children.drain(head..old_end) {
+            remove_subtree(leftover, ctx, patches);
+        }
+    } else {
+        kept = retained.children.drain(head..old_end).map(Some).collect();
+        for (slot, taken) in kept.iter_mut().zip(&claimed) {
+            if !taken && let Some(leftover) = slot.take() {
+                remove_subtree(leftover, ctx, patches);
+            }
+        }
+    }
+    // a child mounted, left or moved under a template's member: the
+    // live instance is no longer the shape
+    ctx.templates.touched(parent);
+    // Back to front: the anchor below is always already real — the
+    // tail's first row, which the drain brought to `head`
+    let mut anchor = next_after(&retained.children, head);
+
+    // nothing survived (a list that replaced its rows): the middle is
+    // the fresh nodes in their order, made where they wait and put in
+    // the list as the vector they wait in
+    if survivors == 0 {
+        create_back_to_front(&mut fresh, parent, anchor, ctx, patches);
+        put_made(&mut retained.children, head, fresh);
+        return;
     }
 
     // the stable spine: survivors whose old order already reads in
     // increasing sequence stay put; everything else moves or mounts
-    let survivor_positions: Vec<(usize, usize)> = plan
-        .iter()
-        .enumerate()
-        .filter_map(|(at, entry)| match entry {
-            Plan::Survivor { old_position, .. } => Some((at, *old_position)),
-            Plan::Fresh(_) => None,
-        })
-        .collect();
-    let stable: std::collections::HashSet<usize> =
-        longest_increasing(&survivor_positions).into_iter().collect();
-
-    // back to front: the anchor below is always already real
-    let parent = retained.id;
-    let mut anchor = 0u32;
-    let mut next: Vec<Option<Retained>> = plan
-        .iter()
-        .map(|_| None)
-        .collect();
-    for at in (0..plan.len()).rev() {
-        match plan.pop().expect("walking the plan") {
-            Plan::Survivor { node, .. } => {
-                if !stable.contains(&at) {
-                    patches.push(DomPatch::Move { id: node.id, parent, before: anchor });
-                }
-                anchor = node.id;
-                next[at] = Some(node);
+    let stable = longest_increasing(&plan);
+    let mut placed: Vec<DomNode> = Vec::with_capacity(plan.len());
+    let mut fresh = fresh.into_iter();
+    // the template the row made just before (the one BELOW, walking
+    // back to front) is an instance of: the next fresh row is compared
+    // with that row, never hashed. A survivor breaks the run
+    let mut template = None;
+    for (at, &position) in plan.iter().enumerate().rev() {
+        if position == FRESH {
+            let mut child = fresh.next_back().expect("a fresh node for every fresh entry");
+            let sibling = placed.last().zip(template);
+            template = create_subtree_before(&mut child, parent, anchor, ctx, patches, sibling);
+            anchor = child.id;
+            placed.push(child);
+        } else {
+            let node = kept[position - head].take().expect("a survivor is placed once");
+            if !stable[at] {
+                patches.push(DomPatch::Move { id: node.id, parent, before: anchor });
             }
-            Plan::Fresh(child) => {
-                let created = create_subtree_before(child, parent, anchor, ctx, patches);
-                anchor = created.id;
-                next[at] = Some(created);
-            }
+            anchor = node.id;
+            template = None;
+            placed.push(node);
         }
     }
-    retained.children = next.into_iter().map(|slot| slot.expect("planned")).collect();
+    put_placed(&mut retained.children, head, placed);
 }
 
-/// The `at` indices of the longest increasing run of `old_position`s —
-/// the survivors that need no move. O(n log n), std only.
-fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
-    let mut tails: Vec<usize> = Vec::new(); // indices into `pairs`
-    let mut parents: Vec<Option<usize>> = vec![None; pairs.len()];
-    for (index, &(_, old_position)) in pairs.iter().enumerate() {
-        let place = tails
-            .partition_point(|&tail| pairs[tail].1 < old_position);
+/// A plan entry with no old position: the child mounts.
+const FRESH: usize = usize::MAX;
+
+/// Does the new child take the old one at its own place? A group or a
+/// reuse promise by its path, anything else by its kind.
+fn takes_place(was: &DomKind, now: &DomKind) -> bool {
+    match now {
+        DomKind::Group { path } | DomKind::Reuse { path } => {
+            matches!(was, DomKind::Group { path: there } if there == path)
+        }
+        kind => std::mem::discriminant(was) == std::mem::discriminant(kind),
+    }
+}
+
+/// The old groups a new child of the middle may have come from, by
+/// path: every one whose own place no new child takes by path. A row
+/// that moved left its place to another row, so it is always here; a
+/// row still waiting for the new child at its own place is not.
+/// Asked once, by the first child (`asking`) that misses its place —
+/// `ahead` is the new list after it.
+fn rows_that_may_move(
+    old: &[DomNode],
+    middle: std::ops::Range<usize>,
+    asking: usize,
+    claimed: &[bool],
+    ahead: &[DomNode],
+    new_end: usize,
+) -> motor::hash::FxHashMap<std::rc::Rc<str>, usize> {
+    let mut rows = motor::hash::FxHashMap::default();
+    let head = middle.start;
+    for position in middle {
+        let DomKind::Group { path } = &old[position].kind else {
+            continue;
+        };
+        let waits = position > asking
+            && position < new_end
+            && takes_place(&old[position].kind, &ahead[position - asking - 1].kind);
+        if !claimed[position - head] && !waits {
+            rows.insert(std::rc::Rc::clone(path), position);
+        }
+    }
+    rows
+}
+
+/// A middle that only reordered: the survivors off the stable spine
+/// move, back to front before their next sibling, and then the rows
+/// trade places in the list where they stand — cycle by cycle, one
+/// swap per row out of place. A row the plan keeps where it was is
+/// never touched.
+fn reorder_in_place(
+    middle: &mut [DomNode],
+    head: usize,
+    mut plan: Vec<usize>,
+    parent: u32,
+    mut anchor: u32,
+    patches: &mut Vec<DomPatch>,
+) {
+    let stable = longest_increasing(&plan);
+    for (at, &position) in plan.iter().enumerate().rev() {
+        let id = middle[position - head].id;
+        if !stable[at] {
+            patches.push(DomPatch::Move { id, parent, before: anchor });
+        }
+        anchor = id;
+    }
+    // `plan[at]` names the row that belongs at `at`; a row put in its
+    // place is marked by pointing at itself
+    for position in &mut plan {
+        *position -= head;
+    }
+    for start in 0..plan.len() {
+        let mut at = start;
+        let mut from = plan[at];
+        while from != start {
+            middle.swap(at, from);
+            plan[at] = at;
+            at = from;
+            from = plan[at];
+        }
+        plan[at] = at;
+    }
+}
+
+/// Mounts the fresh children where they stand, back to front: the last
+/// before `anchor` and each one before the one made just below it, which
+/// it is compared with. No node moves — the slice is the retention.
+fn create_back_to_front(
+    fresh: &mut [DomNode],
+    parent: u32,
+    mut anchor: u32,
+    ctx: &mut LowerCtx,
+    patches: &mut Vec<DomPatch>,
+) {
+    let mut template = None;
+    for at in (0..fresh.len()).rev() {
+        let (child, below) = fresh[at..].split_first_mut().expect("a child at every place");
+        let sibling = below.first().zip(template);
+        template = create_subtree_before(child, parent, anchor, ctx, patches, sibling);
+        anchor = child.id;
+    }
+}
+
+/// Puts the children a placement walk made back to front into the
+/// list at `at`, in their order. An empty list takes them as they are.
+fn put_placed(children: &mut Vec<DomNode>, at: usize, mut placed: Vec<DomNode>) {
+    if children.is_empty() {
+        placed.reverse();
+        *children = placed;
+    } else {
+        children.splice(at..at, placed.into_iter().rev());
+    }
+}
+
+/// Puts children made in their order into the list at `at`. An empty
+/// list takes the vector they were made in as its own.
+fn put_made(children: &mut Vec<DomNode>, at: usize, made: Vec<DomNode>) {
+    if children.is_empty() {
+        *children = made;
+    } else {
+        children.splice(at..at, made);
+    }
+}
+
+/// Which entries of the plan stand on the longest increasing run of
+/// old positions — the survivors that need no move. A fresh entry is
+/// never on it. O(n log n), std only, and sized once.
+fn longest_increasing(plan: &[usize]) -> Vec<bool> {
+    const NONE: usize = usize::MAX;
+    let mut tails: Vec<usize> = Vec::with_capacity(plan.len()); // indices into `plan`
+    let mut parents: Vec<usize> = vec![NONE; plan.len()];
+    for (at, &position) in plan.iter().enumerate() {
+        if position == FRESH {
+            continue;
+        }
+        // the tails rise, so a position past the last one extends the
+        // run — the common case, a list that mostly kept its order: no
+        // search for the rows that did
+        let extends = tails.last().is_none_or(|&last| plan[last] < position);
+        let place = if extends { tails.len() } else { tails.partition_point(|&tail| plan[tail] < position) };
         if place > 0 {
-            parents[index] = Some(tails[place - 1]);
+            parents[at] = tails[place - 1];
         }
         if place == tails.len() {
-            tails.push(index);
+            tails.push(at);
         } else {
-            tails[place] = index;
+            tails[place] = at;
         }
     }
-    let mut run = Vec::with_capacity(tails.len());
-    let mut cursor = tails.last().copied();
-    while let Some(index) = cursor {
-        run.push(pairs[index].0);
-        cursor = parents[index];
+    let mut stable = vec![false; plan.len()];
+    let mut cursor = tails.last().copied().unwrap_or(NONE);
+    while cursor != NONE {
+        stable[cursor] = true;
+        cursor = parents[cursor];
     }
-    run.reverse();
-    run
+    stable
 }
+
 
 // MARK: - The wire encoding
 
@@ -1804,10 +3759,52 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 /// its line gap, after the slot), and the key table grew the function
 /// row (101 to 124, `bunny_key` now answering whether a key was taken).
 ///
-/// 11 (2026-10-02): the video host — create kind 15 and op 17 (`set
-/// video`), and the canvas shell's three host verbs (`js_host_begin`,
-/// `js_host_video`, `js_host_end`) in the `./bunny.js` module.
-pub const ABI_VERSION: u32 = 11;
+/// 11 (2026-10-02): op 18 empties an element (`RemoveChildren` — a list
+/// that clears or replaces its rows is one word, with the id ranges it
+/// forgets), a removal (op 2) unregisters its own subtree in the glue
+/// instead of a sweep over every element at the end of the batch, op
+/// 17 clones a shape already on the page (`Clone`, ids in pre-order
+/// from the copy's), op 19 sets an action path alone (`SetPath`), op
+/// 20 sets a text's words alone (`SetContent`), and the shell imports
+/// `js_now` — the page's clock, for the stage table a `?stats` page
+/// reads through `bunny_stats_*`.
+///
+/// 12 (2026-10-02): the flow record carries `plain` (bit 12, no payload):
+/// an inline tag around one child keeps the browser's own display for
+/// the tag instead of a flex line.
+///
+/// 13 (2026-10-02): an island's pixels arrive by the rect that changed
+/// (`js_island_rect`, with the box's size and the rect's place and
+/// size) instead of the whole box every time (`js_island` is gone).
+///
+/// 14 (2026-10-03): looks are shared. An element's style, flow record
+/// and text face no longer travel inline per element (ops 5 and 11 are
+/// gone, op 6 carries words and spans alone): a look is defined once
+/// by its hash (op 21, `DefineRule`: kind, style, flow record, text
+/// face) and worn by its class (op 22, `UseRule`); what is the element's
+/// own travels beside it — its box (op 23, `SetBox`: pinned sizes,
+/// ceilings, a virtual row's slot), its marks (op 24, `SetMarks`:
+/// tooltip, hover group owned), its action path (op 19).
+///
+/// 15 (2026-10-03): a face is declared once and inherited. The text
+/// look's record ends with one byte, `inherits_face`: 1 means the text
+/// takes the face declared above it and its look names no font; the
+/// root's look and the look of a box whose modifiers changed the face
+/// carry that face as their text record, words aside.
+///
+/// 16 (2026-10-03): the video host — create kind 15 and op 25
+/// (`SetVideo`), and the canvas shell's three host verbs
+/// (`js_host_begin`, `js_host_video`, `js_host_end`) in the `./bunny.js`
+/// module.
+///
+/// 17 (2026-10-03): action paths are told against their row. A path
+/// under the nearest group at or above its element crosses as `~` and
+/// the rest (op 19), and the group carries its own path as `data-base`:
+/// a clone's root on the clone (op 17, u16 len + utf8 after the
+/// template), any other group by op 26 (`SetBase`). A click resolves
+/// `~` against the nearest `data-base` at or above the element, and a
+/// clone whose relative paths read as its template's ships none.
+pub const ABI_VERSION: u32 = 17;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -1923,11 +3920,21 @@ pub const ABI_VERSION: u32 = 11;
 ///  16 set iframe    u8 sealed, u32 len + utf8 — the url the frame
 ///                   navigates to, or (sealed) the DOCUMENT it holds
 ///                   as `srcdoc` inside a sandbox with no powers
-///  17 set video     u32 stream (the glue's handle; 0 = none), u8
+///  17 clone         u32 parent, u32 before, u32 template, u16 len +
+///                   utf8 base — the copy's own path when a path in
+///                   it is told against it (0 = none)
+///  19 set path      u16 len + utf8 — `~` and the rest when the path
+///                   lies under its base (the nearest `data-base` at
+///                   or above the element), the path whole otherwise
+///  25 set video     u32 stream (the glue's handle; 0 = none), u8
 ///                   mirrored, u8 cover (1 = `object-fit: cover`, 0 =
 ///                   `contain`), f32 radius — the whole record; the
 ///                   glue rewires the element only when the stream
 ///                   changed, because a rewrite restarts playback
+///  26 set base      u16 len + utf8 — a group's own path, the base
+///                   the paths below it are told against: a created
+///                   group's, or a group's inside a clone (its copied
+///                   base names the template's)
 /// ```
 pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
     crate::stats::time(crate::stats::Stage::Encode, || {
@@ -1950,28 +3957,53 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_hint(&mut out, hints.tag.as_deref());
                 push_hint(&mut out, hints.class.as_deref());
                 push_hint(&mut out, hints.dom_id.as_deref());
-                out.push(match kind {
-                    CreateKind::Group => 0,
-                    CreateKind::Box => 1,
-                    CreateKind::Text => 2,
-                    CreateKind::Field => 3,
-                    CreateKind::Scroll => 4,
-                    CreateKind::Content => 5,
-                    CreateKind::Canvas => 6,
-                    CreateKind::Image => 7,
-                    CreateKind::Icon => 8,
-                    CreateKind::FlexColumn => 9,
-                    CreateKind::FlexRow => 10,
-                    CreateKind::Layers => 11,
-                    CreateKind::Popover => 12,
-                    CreateKind::Editor => 13,
-                    CreateKind::Iframe => 14,
-                    CreateKind::Video => 15,
-                });
+                out.push(kind_code(*kind));
             }
             DomPatch::Remove { id } => {
                 out.push(2);
                 push_u32(&mut out, *id);
+            }
+            DomPatch::Clone { id, parent, before, template, base } => {
+                out.push(17);
+                push_u32(&mut out, *id);
+                push_u32(&mut out, *parent);
+                push_u32(&mut out, *before);
+                push_u32(&mut out, *template);
+                push_bytes_u16(&mut out, base.as_deref().unwrap_or("").as_bytes());
+            }
+            DomPatch::SetPath { id, path, base_len } => {
+                out.push(19);
+                push_u32(&mut out, *id);
+                match path {
+                    // told against the base: `~` and the rest
+                    Some(path) if *base_len > 0 => {
+                        let rest = &path.as_bytes()[*base_len..];
+                        push_u16(&mut out, (rest.len() + 1) as u16);
+                        out.push(b'~');
+                        out.extend_from_slice(rest);
+                    }
+                    path => push_bytes_u16(&mut out, path.as_deref().unwrap_or("").as_bytes()),
+                }
+            }
+            DomPatch::SetBase { id, base } => {
+                out.push(26);
+                push_u32(&mut out, *id);
+                push_bytes_u16(&mut out, base.as_bytes());
+            }
+            DomPatch::SetContent { id, text } => {
+                out.push(20);
+                push_u32(&mut out, *id);
+                push_u32(&mut out, text.len() as u32);
+                out.extend_from_slice(text.as_bytes());
+            }
+            DomPatch::RemoveChildren { id, forget } => {
+                out.push(18);
+                push_u32(&mut out, *id);
+                push_u16(&mut out, forget.len().min(u16::MAX as usize) as u16);
+                for (start, end) in forget.iter().take(u16::MAX as usize) {
+                    push_u32(&mut out, *start);
+                    push_u32(&mut out, *end);
+                }
             }
             DomPatch::SetTransform { id, x, y } => {
                 out.push(3);
@@ -1985,37 +4017,10 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_f32(&mut out, *width);
                 push_f32(&mut out, *height);
             }
-            DomPatch::SetStyle { id, style } => {
-                out.push(5);
-                push_u32(&mut out, *id);
-                encode_style(&mut out, style);
-            }
             DomPatch::SetText { id, text } => {
+                // the words and the spans: the face is the look's
                 out.push(6);
                 push_u32(&mut out, *id);
-                push_u32(&mut out, pack_color(text.color));
-                // 1 = take no color of your own; the box above owns it
-                out.push(text.inherits_ink as u8);
-                push_f32(&mut out, text.font.size);
-                out.push(weight_code(text.font.weight));
-                out.push(matches!(text.font.design, FontDesign::Mono) as u8);
-                out.push(matches!(text.font.slant, crate::text_engine::Slant::Italic) as u8);
-                push_family(&mut out, &text.font);
-                // the line box, or 0 for "the face's own" — the browser
-                // steps its lines by the same number our placement does
-                push_f32(&mut out, text.line_height.unwrap_or(0.0));
-                // 0 leading (the default), 1 centre, 2 trailing
-                out.push(match text.text_align {
-                    None | Some(motor::views::TextAlignment::Leading) => 0,
-                    Some(motor::views::TextAlignment::Center) => 1,
-                    Some(motor::views::TextAlignment::Trailing) => 2,
-                });
-                out.push(match text.truncation {
-                    None => 0,
-                    Some(Truncation::Start) => 1,
-                    Some(Truncation::Middle) => 2,
-                    Some(Truncation::End) => 3,
-                });
                 push_bytes_u32(&mut out, text.content.as_bytes());
                 match &text.highlights {
                     Some((ranges, color)) => {
@@ -2095,83 +4100,67 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_bytes_u32(&mut out, src.as_bytes());
             }
             DomPatch::SetVideo { id, stream, mirrored, cover, radius } => {
-                out.push(17);
+                out.push(25);
                 push_u32(&mut out, *id);
                 push_u32(&mut out, *stream);
                 out.push(u8::from(*mirrored));
                 out.push(u8::from(*cover));
                 push_f32(&mut out, *radius as f64);
             }
-            DomPatch::SetLayout { id, layout } => {
-                out.push(11);
+            DomPatch::DefineRule { rule, kind, flags, style, layout, text } => {
+                out.push(21);
+                push_u32(&mut out, (*rule >> 32) as u32);
+                push_u32(&mut out, *rule as u32);
+                out.push(kind_code(*kind));
+                out.push(*flags);
+                encode_style(&mut out, style);
+                encode_layout(&mut out, layout);
+                match text {
+                    Some(text) => {
+                        out.push(1);
+                        encode_text_look(&mut out, text);
+                    }
+                    None => out.push(0),
+                }
+            }
+            DomPatch::UseRule { id, rule } => {
+                out.push(22);
                 push_u32(&mut out, *id);
-                let mut mask = 0u16;
-                if layout.gap.is_some() {
+                push_u32(&mut out, (*rule >> 32) as u32);
+                push_u32(&mut out, *rule as u32);
+            }
+            DomPatch::SetBox { id, width, height, max_width, max_height, slot_y } => {
+                out.push(23);
+                push_u32(&mut out, *id);
+                let fields = [width, height, max_width, max_height, slot_y];
+                let mut mask = 0u8;
+                for (bit, field) in fields.iter().enumerate() {
+                    if field.is_some() {
+                        mask |= 1 << bit;
+                    }
+                }
+                out.push(mask);
+                for field in fields.into_iter().flatten() {
+                    push_f32(&mut out, *field as f64);
+                }
+            }
+            DomPatch::SetMarks { id, tooltip, group_owner } => {
+                out.push(24);
+                push_u32(&mut out, *id);
+                let mut mask = 0u8;
+                if tooltip.is_some() {
                     mask |= 1;
                 }
-                if layout.align.is_some() {
-                    mask |= 1 << 1;
+                if group_owner.is_some() {
+                    mask |= 2;
                 }
-                if layout.padding.is_some() {
-                    mask |= 1 << 2;
+                out.push(mask);
+                if let Some(tooltip) = tooltip {
+                    push_bytes_u16(&mut out, tooltip.as_bytes());
                 }
-                if layout.width.is_some() {
-                    mask |= 1 << 3;
-                }
-                if layout.height.is_some() {
-                    mask |= 1 << 4;
-                }
-                if layout.max_width.is_some() {
-                    mask |= 1 << 5;
-                }
-                if layout.max_height.is_some() {
-                    mask |= 1 << 6;
-                }
-                if layout.grow {
-                    mask |= 1 << 7;
-                }
-                if layout.slot_y.is_some() {
-                    mask |= 1 << 8;
-                }
-                if layout.stretch {
-                    mask |= 1 << 9;
-                }
-                if layout.fill {
-                    mask |= 1 << 10;
-                }
-                if layout.wrap.is_some() {
-                    mask |= 1 << 11;
-                }
-                push_u16(&mut out, mask);
-                if let Some(gap) = layout.gap {
-                    push_f32(&mut out, gap);
-                }
-                if let Some(align) = layout.align {
-                    out.push(align);
-                }
-                if let Some((top, right, bottom, left)) = layout.padding {
-                    push_f32(&mut out, top);
-                    push_f32(&mut out, right);
-                    push_f32(&mut out, bottom);
-                    push_f32(&mut out, left);
-                }
-                if let Some(width) = layout.width {
-                    push_f32(&mut out, width);
-                }
-                if let Some(height) = layout.height {
-                    push_f32(&mut out, height);
-                }
-                if let Some(max_width) = layout.max_width {
-                    push_f32(&mut out, max_width);
-                }
-                if let Some(max_height) = layout.max_height {
-                    push_f32(&mut out, max_height);
-                }
-                if let Some(slot_y) = layout.slot_y {
-                    push_f32(&mut out, slot_y);
-                }
-                if let Some(wrap) = layout.wrap {
-                    push_f32(&mut out, wrap);
+                if let Some(owner) = group_owner {
+                    push_u32(&mut out, (*owner >> 32) as u32);
+                    push_u32(&mut out, *owner as u32);
                 }
             }
             DomPatch::Move { id, parent, before } => {
@@ -2203,7 +4192,10 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
     out
 }
 
-fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
+/// A look's style record. The format keeps a bit for the element's own
+/// action path (7), tooltip (15) and owned group (20): a look never
+/// sets them — those travel as `SetPath` and `SetMarks`.
+fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
     let mut mask: u32 = 0;
     if style.background.is_some() {
         mask |= 1;
@@ -2231,9 +4223,6 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     if style.transition.is_some() {
         mask |= 1 << 6;
     }
-    if style.interactive.is_some() {
-        mask |= 1 << 7;
-    }
     if style.focus_border.is_some() {
         mask |= 1 << 8;
     }
@@ -2256,9 +4245,6 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
         // the first payload-free bit of the format: the bit IS the value
         mask |= 1 << 14;
     }
-    if style.tooltip.is_some() {
-        mask |= 1 << 15;
-    }
     if style.opacity.is_some() {
         mask |= 1 << 16;
     }
@@ -2270,9 +4256,6 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     }
     if style.group.is_some() {
         mask |= 1 << 19;
-    }
-    if style.group_owner.is_some() {
-        mask |= 1 << 20;
     }
     if style.pass_through {
         // payload-free, like the clip bit: the bit IS the value
@@ -2305,9 +4288,6 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     if let Some((response, damping)) = style.transition {
         push_f32(out, response);
         push_f32(out, damping);
-    }
-    if let Some(path) = &style.interactive {
-        push_bytes_u16(out, path.as_bytes());
     }
     if let Some(color) = style.focus_border {
         push_u32(out, pack_color(color));
@@ -2349,9 +4329,6 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
             }
         }
     }
-    if let Some(tooltip) = &style.tooltip {
-        push_bytes_u16(out, tooltip.as_bytes());
-    }
     if let Some(opacity) = style.opacity {
         push_f32(out, opacity);
     }
@@ -2365,10 +4342,6 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
         push_u32(out, (group >> 32) as u32);
         push_u32(out, group as u32);
     }
-    if let Some(owner) = style.group_owner {
-        push_u32(out, (owner >> 32) as u32);
-        push_u32(out, owner as u32);
-    }
     if let Some(radii) = style.corner_radius.filter(|radii| radii.uniform().is_none()) {
         push_f32(out, radii.top_left);
         push_f32(out, radii.top_right);
@@ -2381,6 +4354,131 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
         push_f32(out, glass.brightness);
         push_u32(out, pack_color(glass.rim));
         push_f32(out, glass.rim_band);
+    }
+}
+
+fn encode_layout(out: &mut Vec<u8>, layout: &DomLayout) {
+                let mut mask = 0u16;
+                if layout.gap.is_some() {
+                    mask |= 1;
+                }
+                if layout.align.is_some() {
+                    mask |= 1 << 1;
+                }
+                if layout.padding.is_some() {
+                    mask |= 1 << 2;
+                }
+                if layout.width.is_some() {
+                    mask |= 1 << 3;
+                }
+                if layout.height.is_some() {
+                    mask |= 1 << 4;
+                }
+                if layout.max_width.is_some() {
+                    mask |= 1 << 5;
+                }
+                if layout.max_height.is_some() {
+                    mask |= 1 << 6;
+                }
+                if layout.grow {
+                    mask |= 1 << 7;
+                }
+                if layout.slot_y.is_some() {
+                    mask |= 1 << 8;
+                }
+                if layout.stretch {
+                    mask |= 1 << 9;
+                }
+                if layout.fill {
+                    mask |= 1 << 10;
+                }
+                if layout.wrap.is_some() {
+                    mask |= 1 << 11;
+                }
+                if layout.plain {
+                    mask |= 1 << 12;
+                }
+                push_u16(out, mask);
+                if let Some(gap) = layout.gap {
+                    push_f32(out, gap);
+                }
+                if let Some(align) = layout.align {
+                    out.push(align);
+                }
+                if let Some((top, right, bottom, left)) = layout.padding {
+                    push_f32(out, top);
+                    push_f32(out, right);
+                    push_f32(out, bottom);
+                    push_f32(out, left);
+                }
+                if let Some(width) = layout.width {
+                    push_f32(out, width);
+                }
+                if let Some(height) = layout.height {
+                    push_f32(out, height);
+                }
+                if let Some(max_width) = layout.max_width {
+                    push_f32(out, max_width);
+                }
+                if let Some(max_height) = layout.max_height {
+                    push_f32(out, max_height);
+                }
+                if let Some(slot_y) = layout.slot_y {
+                    push_f32(out, slot_y);
+                }
+                if let Some(wrap) = layout.wrap {
+                    push_f32(out, wrap);
+                }
+}
+
+/// A text's face and ink, as a look carries them.
+fn encode_text_look(out: &mut Vec<u8>, text: &DomText) {
+    push_u32(out, pack_color(text.color));
+    // 1 = take no color of your own; the box above owns it
+    out.push(text.inherits_ink as u8);
+    push_f32(out, text.font.size);
+    out.push(weight_code(text.font.weight));
+    out.push(matches!(text.font.design, FontDesign::Mono) as u8);
+    out.push(matches!(text.font.slant, crate::text_engine::Slant::Italic) as u8);
+    push_family(out, &text.font);
+    // the line box, or 0 for "the face's own" — the browser steps its
+    // lines by the same number our placement does
+    push_f32(out, text.line_height.unwrap_or(0.0));
+    // 0 leading (the default), 1 centre, 2 trailing
+    out.push(match text.text_align {
+        None | Some(motor::views::TextAlignment::Leading) => 0,
+        Some(motor::views::TextAlignment::Center) => 1,
+        Some(motor::views::TextAlignment::Trailing) => 2,
+    });
+    out.push(match text.truncation {
+        None => 0,
+        Some(Truncation::Start) => 1,
+        Some(Truncation::Middle) => 2,
+        Some(Truncation::End) => 3,
+    });
+    // 1 = the face is the one declared above: the look names no font
+    out.push(text.inherits_face as u8);
+}
+
+/// The kind's byte on the wire, shared by the create op and the rule.
+fn kind_code(kind: CreateKind) -> u8 {
+    match kind {
+        CreateKind::Group => 0,
+        CreateKind::Box => 1,
+        CreateKind::Text => 2,
+        CreateKind::Field => 3,
+        CreateKind::Scroll => 4,
+        CreateKind::Content => 5,
+        CreateKind::Canvas => 6,
+        CreateKind::Image => 7,
+        CreateKind::Icon => 8,
+        CreateKind::FlexColumn => 9,
+        CreateKind::FlexRow => 10,
+        CreateKind::Layers => 11,
+        CreateKind::Popover => 12,
+        CreateKind::Editor => 13,
+        CreateKind::Iframe => 14,
+        CreateKind::Video => 15,
     }
 }
 
@@ -2421,8 +4519,10 @@ fn push_hint(out: &mut Vec<u8>, hint: Option<&str>) {
     }
 }
 
-fn push_f32(out: &mut Vec<u8>, value: f64) {
-    out.extend_from_slice(&(value as f32).to_le_bytes());
+/// Every number crosses as `f32` — the scene's own `f32`s exactly, an
+/// `f64` rounded once.
+fn push_f32(out: &mut Vec<u8>, value: impl Into<f64>) {
+    out.extend_from_slice(&(value.into() as f32).to_le_bytes());
 }
 
 fn push_bytes_u32(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -2456,9 +4556,16 @@ mod tests {
         match patch {
             DomPatch::Create { id, .. }
             | DomPatch::Remove { id }
+            | DomPatch::RemoveChildren { id, .. }
+            | DomPatch::Clone { id, .. }
+            | DomPatch::SetPath { id, .. }
+            | DomPatch::SetBase { id, .. }
+            | DomPatch::SetContent { id, .. }
             | DomPatch::SetTransform { id, .. }
             | DomPatch::SetSize { id, .. }
-            | DomPatch::SetStyle { id, .. }
+            | DomPatch::UseRule { id, .. }
+            | DomPatch::SetBox { id, .. }
+            | DomPatch::SetMarks { id, .. }
             | DomPatch::SetText { id, .. }
             | DomPatch::SetField { id, .. }
             | DomPatch::SetImage { id, .. }
@@ -2466,13 +4573,47 @@ mod tests {
             | DomPatch::SetIframe { id, .. }
             | DomPatch::SetVideo { id, .. }
             | DomPatch::SetScroll { id, .. }
-            | DomPatch::SetLayout { id, .. }
             | DomPatch::Move { id, .. }
             | DomPatch::Reveal { id, .. }
             | DomPatch::SetAnchor { id, .. }
             | DomPatch::SetHints { id, .. } => *id,
+            DomPatch::DefineRule { .. } => 0,
         }
     }
+
+    /// The look an element wears at the end of the stream: the style
+    /// and the flow record of the rule it was last told to wear.
+    fn look_of(patches: &[DomPatch], wanted: u32) -> Option<(&DomLook, &DomLayout)> {
+        let rule = patches.iter().rev().find_map(|patch| match patch {
+            DomPatch::UseRule { id, rule } if *id == wanted => Some(*rule),
+            _ => None,
+        })?;
+        patches.iter().find_map(|patch| match patch {
+            DomPatch::DefineRule { rule: at, style, layout, .. } if *at == rule => {
+                Some((&**style, &**layout))
+            }
+            _ => None,
+        })
+    }
+
+    /// A look with this style alone, as a stream would define it.
+    fn define(style: DomLook) -> DomPatch {
+        DomPatch::DefineRule {
+            rule: 0,
+            kind: CreateKind::Box,
+            flags: 0,
+            style: Box::new(style),
+            layout: Box::new(DomLayout::default()),
+            text: None,
+        }
+    }
+
+    /// Where a look's style mask starts in its encoding: after the
+    /// count, the op, the rule's two words, the kind and the flags.
+    const MASK_AT: usize = 4 + 1 + 8 + 1 + 1;
+    /// What follows a look's style record when the flow record is bare
+    /// and no text face rides along: the flow mask and the text flag.
+    const BARE_TAIL: usize = 2 + 1;
 
     #[derive(Clone)]
     struct MiniList {
@@ -2526,9 +4667,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // one text per row plus the header
+        // one text per row plus the header — a row of a shape already
+        // on the page is a clone of it, and its text arrives as a word
         let texts = creates.iter().filter(|(_, _, kind)| *kind == CreateKind::Text).count();
-        assert_eq!(texts, 4, "header + three rows: {creates:?}");
+        let clones = patches.iter().filter(|patch| matches!(patch, DomPatch::Clone { .. })).count();
+        assert_eq!(texts + clones, 4, "header + three rows: {creates:?}");
         assert_eq!(
             creates.iter().filter(|(_, _, kind)| *kind == CreateKind::Scroll).count(),
             1
@@ -2546,7 +4689,7 @@ mod tests {
         }
         // the interactive rows carry their action paths
         let interactive = patches.iter().any(|patch| {
-            matches!(patch, DomPatch::SetStyle { style, .. } if style.interactive.is_some())
+            matches!(patch, DomPatch::SetPath { path: Some(_), .. })
         });
         assert!(interactive, "rows are clickable in the scene");
     }
@@ -2573,7 +4716,7 @@ mod tests {
     }
 
     #[test]
-    fn a_selection_change_patches_only_the_two_styles() {
+    fn a_selection_change_patches_only_the_two_looks() {
         let (runtime, view, size) = mini();
         let _ = runtime.dom_frame(&view, size);
 
@@ -2581,13 +4724,15 @@ mod tests {
         let patches = runtime.dom_frame(&view, size);
 
         assert!(!patches.is_empty());
+        // a look the page has not seen is defined once; the rows wear
         for patch in &patches {
             assert!(
-                matches!(patch, DomPatch::SetStyle { .. }),
-                "only styles move on a selection change: {patch:?}"
+                matches!(patch, DomPatch::DefineRule { .. } | DomPatch::UseRule { .. }),
+                "only looks move on a selection change: {patch:?}"
             );
         }
-        assert_eq!(patches.len(), 2, "the old row and the new one: {patches:?}");
+        let worn = patches.iter().filter(|patch| matches!(patch, DomPatch::UseRule { .. })).count();
+        assert_eq!(worn, 2, "the old row and the new one: {patches:?}");
     }
 
     #[test]
@@ -2642,17 +4787,18 @@ mod tests {
         view.gap.set(12.0);
         let patches = runtime.dom_frame(&view, size);
 
-        // under the flow the browser reflows: the padded node re-
-        // records its ONE layout, and the component beside it hears
-        // NOTHING — not even a transform
+        // under the flow the browser reflows: the padded node changes
+        // its ONE look (defined, then worn), and the component beside
+        // it hears NOTHING — not even a transform
         let on_inner: Vec<_> =
             patches.iter().filter(|patch| patch_id(patch) >= inner_group).collect();
         assert!(on_inner.is_empty(), "the sibling never hears a padding: {patches:?}");
-        assert_eq!(patches.len(), 1, "{patches:?}");
+        assert_eq!(patches.len(), 2, "{patches:?}");
         assert!(matches!(
             &patches[0],
-            DomPatch::SetLayout { layout, .. } if layout.padding == Some((12.0, 12.0, 12.0, 12.0))
+            DomPatch::DefineRule { layout, .. } if layout.padding == Some((12.0, 12.0, 12.0, 12.0))
         ));
+        assert!(matches!(&patches[1], DomPatch::UseRule { .. }), "{patches:?}");
     }
 
     /// The browser owns the wheel in this mode: a scroll it reported
@@ -2766,7 +4912,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let removes = patches.iter().filter(|p| matches!(p, DomPatch::Remove { .. })).count();
+        // a window that jumped far has no row in common with the old
+        // one: the content empties in one op, then the far band mounts
+        let removes = patches
+            .iter()
+            .filter(|p| matches!(p, DomPatch::Remove { .. } | DomPatch::RemoveChildren { .. }))
+            .count();
         assert!(!created.is_empty(), "the far band mounted");
         assert!(removes > 0, "the old window left");
         // surviving nodes sit at index × extent inside the content box —
@@ -2803,7 +4954,7 @@ mod tests {
         let size = Size { width: 200.0, height: 60.0 };
         let mount = runtime.dom_frame(&view, size);
         let chrome = mount.iter().any(|patch| {
-            matches!(patch, DomPatch::SetStyle { style, .. }
+            matches!(patch, DomPatch::DefineRule { style, .. }
                 if style.focus_border.is_some()
                     && style.background.is_some()
                     && style.placeholder_color.is_some())
@@ -2897,7 +5048,7 @@ mod tests {
         let style = patches
             .iter()
             .find_map(|patch| match patch {
-                DomPatch::SetStyle { style, .. } if style.border.is_some() => Some(style),
+                DomPatch::DefineRule { style, .. } if style.border.is_some() => Some(style),
                 _ => None,
             })
             .expect("the panel chrome reached the patches");
@@ -2924,7 +5075,7 @@ mod tests {
         let runtime = Runtime::new();
         let patches = runtime.dom_frame(&Hoverable, Size { width: 100.0, height: 50.0 });
         let hovered = patches.iter().any(|patch| {
-            matches!(patch, DomPatch::SetStyle { style, .. } if style.hover_background.is_some())
+            matches!(patch, DomPatch::DefineRule { style, .. } if style.hover_background.is_some())
         });
         assert!(hovered, "the :hover alternative reached the patches: {patches:#?}");
     }
@@ -2954,7 +5105,7 @@ mod tests {
         let ink = patches
             .iter()
             .find_map(|patch| match patch {
-                DomPatch::SetStyle { style, .. } if style.hover_color.is_some() => {
+                DomPatch::DefineRule { style, .. } if style.hover_color.is_some() => {
                     Some((style.color, style.hover_color))
                 }
                 _ => None,
@@ -2964,7 +5115,7 @@ mod tests {
         // and the text takes NO color of its own: an inline one would
         // outrank the rule that flips it
         let inherits = patches.iter().any(|patch| {
-            matches!(patch, DomPatch::SetText { text, .. } if text.inherits_ink)
+            matches!(patch, DomPatch::DefineRule { text: Some(text), .. } if text.inherits_ink)
         });
         assert!(inherits, "the glyph inherits its ink: {patches:#?}");
 
@@ -3048,11 +5199,122 @@ mod tests {
         assert_eq!(runtime.dom_islands(1).len(), 1, "fresh pixels follow the state");
     }
 
+    /// Rows that each hold an island leave — one alone, then the rest
+    /// together, a list that clears in one op for the page — and their
+    /// islands leave the registry in the frame that lets them go, while
+    /// their groups and bindings wait for the idle: no island of theirs is
+    /// painted, though none was painted yet when they left.
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn the_islands_of_rows_that_leave_are_never_painted() {
+        #[derive(Clone, Copy)]
+        struct Swatch(usize);
+
+        impl Component for Swatch {
+            fn body(self, _ctx: &Context) -> impl View {
+                spacer()
+                    .frame(10.0 + self.0 as f64, 10.0)
+                    .background_color(Color::hex(0x3B82F6))
+                    .rendering(Rendering::Gpu)
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Swatches {
+            ids: State<Rc<Vec<usize>>>,
+        }
+
+        impl Component for Swatches {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::views::for_each(self.ids, |id| id.to_string(), |id| Swatch(*id))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Swatches { ids: State::new(Rc::new(vec![1, 2, 3, 4])) };
+        let size = Size { width: 120.0, height: 80.0 };
+        let mount = runtime.dom_frame(&page, size);
+        let canvases = mount.iter().filter(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Canvas, .. })).count();
+        assert_eq!(canvases, 4, "an island a row: {mount:?}");
+
+        // one row leaves alone, then the rest together, before a single
+        // pixel was asked for
+        page.ids.set(Rc::new(vec![1, 3, 4]));
+        let patches = runtime.dom_frame(&page, size);
+        assert!(patches.iter().any(|patch| matches!(patch, DomPatch::Remove { .. })), "{patches:?}");
+        page.ids.set(Rc::new(Vec::new()));
+        let patches = runtime.dom_frame(&page, size);
+        assert!(patches.iter().any(|patch| matches!(patch, DomPatch::RemoveChildren { .. })), "{patches:?}");
+        assert!(runtime.dom_islands(1).is_empty(), "the islands that left are not painted");
+        assert!(runtime.island_frames().is_empty());
+    }
+
     /// A FLEXIBLE island guesses at mount, then the browser reports
     /// the box it really gave the element — the island re-measures
     /// against that box and the pixels agree with the element. The
     /// observer's echo of what the engine already said buys nothing.
     #[cfg(feature = "canvas")]
+    /// An island keeps a paint target of its own: a change inside it
+    /// repaints the rows it touched and ships that strip, byte for byte
+    /// what a full repaint would put there; an identical frame ships
+    /// nothing.
+    #[test]
+    fn an_island_repaints_its_damage_not_its_box() {
+        #[derive(Clone)]
+        struct Island {
+            count: State<usize>,
+        }
+
+        impl Component for Island {
+            fn body(self, _ctx: &Context) -> impl View {
+                let count = self.count;
+                crate::vstack!(
+                    text("a fixed line"),
+                    crate::text!("count {}", count.get()),
+                    text("another fixed line"),
+                )
+                .frame(200.0, 90.0)
+                .rendering(crate::layout::Rendering::Gpu)
+            }
+        }
+
+        let size = Size { width: 240.0, height: 120.0 };
+        let count = State::new(0usize);
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&Island { count }, size);
+        let first = runtime.dom_islands(1);
+        assert_eq!(first.len(), 1, "one island");
+        let (width, height) = (first[0].width, first[0].height);
+        assert_eq!(first[0].dirty, (0, 0, width as u32, height as u32), "the first frame is the whole box");
+        assert_eq!(first[0].rgba.len(), width * height * 4);
+
+        count.set(1);
+        let _ = runtime.dom_frame(&Island { count }, size);
+        let second = runtime.dom_islands(1);
+        assert_eq!(second.len(), 1, "the island changed");
+        let (x, y, dirty_width, dirty_height) = second[0].dirty;
+        assert!(
+            (dirty_height as usize) < height,
+            "one line changed: a strip, not the box ({dirty_height} of {height})"
+        );
+        assert_eq!(second[0].rgba.len(), dirty_width as usize * dirty_height as usize * 4);
+
+        // the strip is what a fresh runtime paints there
+        let fresh = Runtime::new();
+        let _ = fresh.dom_frame(&Island { count: State::new(1usize) }, size);
+        let whole = fresh.dom_islands(1).remove(0);
+        let mut expected = Vec::new();
+        for row in y..y + dirty_height {
+            let from = (row as usize * width + x as usize) * 4;
+            expected.extend_from_slice(&whole.rgba[from..from + dirty_width as usize * 4]);
+        }
+        assert_eq!(second[0].rgba, expected, "the strip matches a full repaint byte for byte");
+
+        // nothing moved: nothing ships
+        let _ = runtime.dom_frame(&Island { count }, size);
+        assert!(runtime.dom_islands(1).is_empty(), "an identical frame blits nothing");
+    }
+
     #[test]
     fn a_flexible_island_takes_the_browsers_box() {
         #[derive(Clone)]
@@ -3104,6 +5366,53 @@ mod tests {
         );
     }
 
+    /// A flexible island whose box is finer than an `f32`: the element's
+    /// pin crosses at the wire's precision, and the box the island seeds
+    /// is the one its pixels were sized at — the next walk measures
+    /// against the same number, and pixels that did not change stay put.
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn a_fine_island_box_survives_the_next_walk() {
+        #[derive(Clone)]
+        struct FineIsland {
+            count: State<usize>,
+        }
+
+        impl Component for FineIsland {
+            fn body(self, _ctx: &Context) -> impl View {
+                // a label that gives way: flexible along its row, and
+                // natural against any offer
+                let label = text("abc")
+                    .truncation_mode(crate::layout::Truncation::End)
+                    .padding_length(0.1);
+                crate::vstack!(
+                    text(format!("count {}", self.count.get())),
+                    crate::hstack!(label).rendering(crate::layout::Rendering::Gpu),
+                )
+            }
+        }
+
+        let size = Size { width: 240.0, height: 120.0 };
+        let count = State::new(0usize);
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&FineIsland { count }, size);
+        let fine = 24.0 + 2.0 * 0.1;
+        assert!(f64::from(fine as f32) != fine, "the box is finer than an f32");
+        assert!(
+            mount.iter().any(|patch| matches!(
+                patch,
+                DomPatch::SetBox { width: Some(width), .. } if *width == fine as f32
+            )),
+            "the element is pinned at the natural width: {mount:?}"
+        );
+        assert_eq!(runtime.dom_island_lists(1).len(), 1, "the island paints once");
+
+        // a walk the island takes part in, with nothing in it changed
+        count.set(1);
+        let _ = runtime.dom_frame(&FineIsland { count }, size);
+        assert!(runtime.dom_island_lists(1).is_empty(), "the same box, the same pixels");
+    }
+
     /// The Scratch pattern: a custom element whose measure EATS the
     /// width proposal. The island discovers that axis by probing two
     /// proposals, leaves it to the browser (`align-self: stretch`, no
@@ -3149,16 +5458,15 @@ mod tests {
                 _ => None,
             })
             .expect("the island mounted");
-        let stretched = mount.iter().any(|patch| {
-            matches!(
-                patch,
-                DomPatch::SetLayout { id, layout }
-                    if *id == canvas_id
-                        && layout.stretch
-                        && layout.width.is_none()
-                        && layout.height == Some(30.0)
-            )
-        });
+        // the stretch is the look's; the pinned height is the box's own
+        let stretched = look_of(&mount, canvas_id).is_some_and(|(_, layout)| layout.stretch)
+            && mount.iter().any(|patch| {
+                matches!(
+                    patch,
+                    DomPatch::SetBox { id, width: None, height: Some(height), .. }
+                        if *id == canvas_id && *height == 30.0
+                )
+            });
         assert!(stretched, "width is the browser's, height is pinned: {mount:?}");
         let _ = runtime.dom_islands(1);
 
@@ -3195,7 +5503,7 @@ mod tests {
         let wraps = mount.iter().any(|patch| {
             matches!(
                 patch,
-                DomPatch::SetLayout { layout, .. }
+                DomPatch::DefineRule { layout, .. }
                     if layout.wrap == Some(4.0) && layout.gap == Some(6.0)
             )
         });
@@ -3203,6 +5511,218 @@ mod tests {
         // and the record survives its own encoding: bit 11, its gap last
         let bytes = encode(&mount);
         assert!(!bytes.is_empty());
+    }
+
+    /// A face is declared once and inherited: the root's look carries
+    /// the default face, a text with that face names none of its own,
+    /// a text with another face declares it — and a box whose modifier
+    /// changes the face declares it for everything under it.
+    #[test]
+    fn a_face_is_declared_once_and_inherited() {
+        #[derive(Clone)]
+        struct Page;
+
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(
+                    text("plain"),
+                    text("big").font(Font::Title),
+                    crate::vstack!(text("a"), text("b")).font_family("Menlo"),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&Page, Size { width: 300.0, height: 200.0 });
+        let looks: Vec<(CreateKind, Option<&DomText>)> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::DefineRule { kind, text, .. } => Some((*kind, text.as_deref())),
+                _ => None,
+            })
+            .collect();
+        // the root declares the default face
+        let root = look_of(&mount, 0).map(|_| ()).is_some();
+        assert!(root, "{mount:?}");
+        assert!(
+            mount.iter().any(|patch| matches!(patch,
+                DomPatch::DefineRule { kind: CreateKind::Group, text: Some(text), .. }
+                    if text.font == crate::text_engine::FontSpec::DEFAULT && !text.inherits_face)),
+            "the root's look carries the default face: {looks:?}"
+        );
+        // the plain text inherits; the title declares
+        let texts: Vec<&DomText> = looks
+            .iter()
+            .filter_map(|(kind, text)| (*kind == CreateKind::Text).then_some(*text).flatten())
+            .collect();
+        assert!(
+            texts.iter().any(|text| text.inherits_face && text.font == crate::text_engine::FontSpec::DEFAULT),
+            "a text with the default face names none: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| !text.inherits_face && text.font.size > crate::text_engine::FontSpec::DEFAULT.size),
+            "a title names its face: {texts:?}"
+        );
+        // the Menlo box declares the family; its texts inherit it
+        assert!(
+            looks.iter().any(|(kind, text)| *kind != CreateKind::Text
+                && text.is_some_and(|text| text.font.family.name().as_deref() == Some("Menlo"))),
+            "the box declares the family it sets: {looks:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.inherits_face && text.font.family.name().as_deref() == Some("Menlo")),
+            "the texts under it inherit it: {texts:?}"
+        );
+    }
+
+    /// A chain of hints is one hinted node, and the words a page hints
+    /// with are held once: the same tag a thousand times is one copy.
+    #[test]
+    fn hints_fold_into_one_node_and_share_their_words() {
+        let a = crate::modifier::hint("td");
+        let b = crate::modifier::hint("td");
+        assert!(std::rc::Rc::ptr_eq(&a, &b), "one copy of the word");
+
+        #[derive(Clone)]
+        struct Cell;
+
+        impl Component for Cell {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("x").element("a").css_class("lbl")
+            }
+        }
+
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&Cell, Size { width: 100.0, height: 40.0 });
+        let hints: Vec<&DomHints> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::Create { kind: CreateKind::Text, hints, .. } => Some(hints),
+                _ => None,
+            })
+            .collect();
+        let [hints] = hints.as_slice() else {
+            panic!("one text element: {mount:?}");
+        };
+        assert_eq!(hints.tag.as_deref(), Some("a"));
+        assert_eq!(hints.class.as_deref(), Some("lbl"));
+        // and the words are the shared ones
+        assert!(hints.tag.as_ref().is_some_and(|tag| std::rc::Rc::ptr_eq(tag, &crate::modifier::hint("a"))));
+    }
+
+    /// A link around one word is no flex box: the record says `plain`,
+    /// and the browser keeps the tag's own display. The cell that
+    /// holds the link, a table cell, is not touched by the fold; the
+    /// word itself, folded into the span, is not a box at all.
+    #[test]
+    fn an_inline_tag_around_one_child_is_no_flex_box() {
+        #[derive(Clone)]
+        struct Link;
+
+        impl Component for Link {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::hstack!(
+                    crate::hstack!(crate::hstack!(empty()).element("span").css_class("glyph"))
+                        .element("a"),
+                    crate::hstack!(text("one"), text("two")).element("a").css_class("pair"),
+                )
+                .element("td")
+            }
+        }
+
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&Link, Size { width: 300.0, height: 100.0 });
+        let a_ids: Vec<u32> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::Create { id, hints, .. } if hints.tag.as_deref() == Some("a") => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(a_ids.len(), 2, "two links: {mount:?}");
+        let plain_of = |id: u32| look_of(&mount, id).is_some_and(|(_, layout)| layout.plain);
+        assert!(plain_of(a_ids[0]), "a link around one child is plain: {mount:?}");
+        assert!(!plain_of(a_ids[1]), "a link around two children keeps its flex line: {mount:?}");
+        // and the empty span inside the first link: no child, no flex
+        // line — the page's stylesheet draws the glyph in its own font
+        let span = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, hints, .. } if hints.tag.as_deref() == Some("span") => Some(*id),
+                _ => None,
+            })
+            .expect("the span mounted");
+        assert!(plain_of(span), "an empty inline tag is plain: {mount:?}");
+        assert!(
+            look_of(&mount, span).is_some_and(|(style, _)| style.color.is_none()),
+            "and wears no face of ours: {mount:?}"
+        );
+        let bytes = encode(&mount);
+        assert!(!bytes.is_empty());
+    }
+
+    /// A column around one table, on the leading edge, is a block: the
+    /// table is laid out once, not measured as a flex item and laid out
+    /// again. A centred column keeps its flex line (a block cannot
+    /// centre), and so does a column around a table that fills it.
+    #[test]
+    fn a_lone_table_on_the_leading_edge_sits_in_a_block() {
+        #[derive(Clone)]
+        struct Tables;
+
+        impl Component for Tables {
+            fn body(self, _ctx: &Context) -> impl View {
+                let table = |class: &'static str| {
+                    crate::hstack!(crate::hstack!(text("cell")).element("tbody"))
+                        .element("table")
+                        .css_class(class)
+                };
+                crate::vstack!(
+                    table("leading").frame_max(f64::INFINITY, f64::INFINITY, motor::views::Alignment::Leading),
+                    table("centred").frame_max(f64::INFINITY, f64::INFINITY, motor::views::Alignment::Center),
+                    table("filling")
+                        .frame_max(f64::INFINITY, f64::INFINITY, motor::views::Alignment::Leading)
+                        .frame_max(f64::INFINITY, f64::INFINITY, motor::views::Alignment::Leading),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&Tables, Size { width: 600.0, height: 400.0 });
+        let parent_of = |class: &str| {
+            mount
+                .iter()
+                .find_map(|patch| match patch {
+                    DomPatch::Create { parent, hints, .. }
+                        if hints.tag.as_deref() == Some("table") && hints.class.as_deref() == Some(class) =>
+                    {
+                        Some(*parent)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("the {class} table mounted: {mount:?}"))
+        };
+        let plain_of = |id: u32| look_of(&mount, id).is_some_and(|(_, layout)| layout.plain);
+        assert!(plain_of(parent_of("leading")), "the leading column is a block: {mount:?}");
+        assert!(!plain_of(parent_of("centred")), "a centred column keeps its flex line: {mount:?}");
+        // the inner frame of the doubled one is a block around the table;
+        // the outer one holds a block, not a table, and stays a column
+        let inner = parent_of("filling");
+        assert!(plain_of(inner), "the frame right around the table is a block: {mount:?}");
+        let outer = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, parent, .. } if *id == inner => Some(*parent),
+                _ => None,
+            })
+            .expect("the inner frame mounted");
+        assert!(!plain_of(outer), "a column around a block is still a column: {mount:?}");
+        // the block is still an item of the column above it, and still
+        // takes that line's offer
+        assert!(
+            look_of(&mount, inner).is_some_and(|(_, layout)| layout.grow || layout.fill),
+            "the block still takes its own line's offer: {mount:?}"
+        );
     }
 
     #[test]
@@ -3233,14 +5753,7 @@ mod tests {
                 _ => None,
             })
             .expect("the app mounted");
-        let takes = |wanted: u32| {
-            mount.iter().any(|patch| {
-                matches!(
-                    patch,
-                    DomPatch::SetLayout { id, layout } if *id == wanted && layout.fill
-                )
-            })
-        };
+        let takes = |wanted: u32| look_of(&mount, wanted).is_some_and(|(_, layout)| layout.fill);
         assert!(takes(first), "the root child takes the window: {mount:?}");
     }
 
@@ -3429,14 +5942,7 @@ mod tests {
                 hints: DomHints::default(),
             },
             DomPatch::SetTransform { id: 7, x: 10.0, y: 20.0 },
-            DomPatch::SetStyle {
-                id: 7,
-                style: DomStyle {
-                    background: Some(Color::hex(0x112233)),
-                    interactive: Some(std::rc::Rc::from("go")),
-                    ..DomStyle::default()
-                },
-            },
+            DomPatch::SetPath { id: 7, path: Some(std::rc::Rc::from("go")), base_len: 0 },
             DomPatch::Remove { id: 7 },
         ];
         let bytes = encode(&patches);
@@ -3452,10 +5958,8 @@ mod tests {
             &7u32.to_le_bytes()[..],
             &10f32.to_le_bytes()[..],
             &20f32.to_le_bytes()[..],
-            &[5],
+            &[19],
             &7u32.to_le_bytes()[..],
-            &(1u32 | 1 << 7).to_le_bytes()[..],
-            &0x112233FFu32.to_le_bytes()[..],
             &2u16.to_le_bytes()[..],
             b"go",
             &[2],
@@ -3543,7 +6047,7 @@ mod tests {
                     patch,
                     DomPatch::SetSize { .. }
                         | DomPatch::SetTransform { .. }
-                        | DomPatch::SetLayout { .. }
+                        | DomPatch::SetBox { .. }
                 ),
                 "a resize is geometry records only — the image never re-travels: {patch:?}"
             );
@@ -3583,10 +6087,13 @@ mod tests {
         view.image_on.set(false);
         let patches = runtime.dom_frame(&view, size);
         // the swapped subtree leaves whole (one remove on its root
-        // covers the image inside) and the replacement mounts fresh —
-        // nothing ever mutates the old element in place
+        // covers the image inside — or its parent empties, when it was
+        // the only child) and the replacement mounts fresh — nothing
+        // ever mutates the old element in place
         assert!(
-            patches.iter().any(|patch| matches!(patch, DomPatch::Remove { .. })),
+            patches
+                .iter()
+                .any(|patch| matches!(patch, DomPatch::Remove { .. } | DomPatch::RemoveChildren { .. })),
             "the old subtree leaves: {patches:?}"
         );
         assert!(patches
@@ -3750,7 +6257,7 @@ mod tests {
         let style = patches
             .iter()
             .find_map(|patch| match patch {
-                DomPatch::SetStyle { style, .. } if style.gradient.is_some() => Some(style),
+                DomPatch::DefineRule { style, .. } if style.gradient.is_some() => Some(style),
                 _ => None,
             })
             .expect("the ramp travels as style, not as pixels");
@@ -3765,10 +6272,10 @@ mod tests {
         // the mask bit and the payload are the wire contract
         let bytes = encode(&[patches
             .iter()
-            .find(|patch| matches!(patch, DomPatch::SetStyle { style, .. } if style.gradient.is_some()))
+            .find(|patch| matches!(patch, DomPatch::DefineRule { style, .. } if style.gradient.is_some()))
             .cloned()
-            .expect("the style patch")]);
-        let mask = u16::from_le_bytes([bytes[9], bytes[10]]);
+            .expect("the look")]);
+        let mask = u16::from_le_bytes([bytes[MASK_AT], bytes[MASK_AT + 1]]);
         assert_eq!(mask & (1 << 13), 1 << 13, "bit 13 says a ramp follows");
     }
 
@@ -3790,23 +6297,167 @@ mod tests {
         assert_eq!(bytes, expected);
     }
 
+    /// The walk asks whether a style paints without building one: the
+    /// answer must be the one the built style gives, prop by prop — a
+    /// prop it missed would fold a painted box into its text.
+    #[test]
+    fn whether_props_paint_is_asked_prop_by_prop() {
+        let ink = Color::hex(0x123456);
+        let each: [fn(&mut VisualProps); 14] = [
+            |props| props.background = Some(Color::hex(0x123456)),
+            |props| {
+                props.gradient = Some(crate::layout::Gradient::Linear {
+                    start: crate::layout::UnitPoint { x: 0.0, y: 0.0 },
+                    end: crate::layout::UnitPoint { x: 1.0, y: 1.0 },
+                    from: Color::BLACK,
+                    to: Color::WHITE,
+                })
+            },
+            |props| props.background_hovered = Some(Color::BLACK),
+            |props| props.background_pressed = Some(Color::BLACK),
+            |props| props.foreground_hovered = Some(Color::BLACK),
+            |props| props.foreground_pressed = Some(Color::BLACK),
+            |props| props.border = Some((Color::BLACK, 1.0)),
+            |props| props.corner_radius = Some(Corners::all(4.0)),
+            |props| props.shadow = Some((8.0, Color::BLACK)),
+            |props| props.clip = true,
+            |props| props.opacity = Some(0.5),
+            |props| props.opacity_hovered = Some(0.5),
+            |props| props.opacity_pressed = Some(0.5),
+            |props| props.glass = Some(crate::layout::Glass::regular()),
+        ];
+        // an ink alone paints nothing a style records: the text takes it
+        let bare = VisualProps { foreground: Some(ink), ..VisualProps::default() };
+        assert!(!DomLook::paints(&bare));
+        assert_eq!(DomLook::from_props(&bare), DomLook::NONE);
+        for (at, set) in each.iter().enumerate() {
+            let mut props = bare;
+            set(&mut props);
+            assert!(DomLook::paints(&props), "prop {at} paints");
+            assert_ne!(DomLook::from_props(&props), DomLook::NONE, "prop {at} is recorded");
+        }
+    }
+
+    /// A style that says nothing holds nothing: setting none boxes no
+    /// record, marks emptied and a look set back to the default are
+    /// held as none again, and a look boxed at its default reads as
+    /// none.
+    #[test]
+    fn a_style_that_says_nothing_boxes_nothing() {
+        let mut style = DomStyle::default();
+        style.set_transition(None);
+        style.set_tooltip(None);
+        style.set_group_owner(None);
+        assert!(style.look.is_none() && style.marks.is_none());
+        style.set_tooltip(Some(Arc::from("tip")));
+        assert!(style.has_marks());
+        assert_eq!(style.take_tooltip().as_deref(), Some("tip"));
+        assert!(style.marks.is_none(), "emptied marks are none again");
+        style.set_look(DomLook { background: Some(Color::BLACK), ..DomLook::default() });
+        assert!(style.look.is_some());
+        style.set_look(DomLook::NONE);
+        assert!(style.look.is_none());
+        let mut boxed = DomStyle::default();
+        boxed.look_mut();
+        assert_eq!(boxed, DomStyle::default());
+        assert!(boxed.is_default());
+    }
+
+    /// A look's hash names its rule, and a served page is adopted by
+    /// trusting that the rules this build hashes are the ones the page
+    /// defined: the hash is part of the contract, pinned here as
+    /// numbers — every field a look reads, and none of the element's own.
+    #[test]
+    fn a_look_hashes_to_the_rule_the_served_page_names() {
+        let mut boxed = flow_row("a");
+        boxed.kind = DomKind::Box;
+        boxed.layout = Some(DomLayout {
+            gap: Some(8.0),
+            align: Some(1),
+            padding: Some((12.5, 4.0, 0.5, 2.25)),
+            grow: true,
+            stretch: true,
+            fill: true,
+            wrap: Some(2.25),
+            plain: true,
+            width: Some(120.0),
+            ..DomLayout::default()
+        });
+        boxed.style = DomStyle::of_look(DomLook {
+            background: Some(Color::hex(0x112233)),
+            gradient: Some(crate::layout::Gradient::Linear {
+                start: crate::layout::UnitPoint { x: 0.0, y: 0.0 },
+                end: crate::layout::UnitPoint { x: 1.0, y: 0.5 },
+                from: Color::BLACK,
+                to: Color::WHITE,
+            }),
+            hover_background: Some(Color::hex(0x223344)),
+            pressed_background: Some(Color::hex(0x334455)),
+            color: Some(Color::hex(0x445566)),
+            hover_color: Some(Color::hex(0x556677)),
+            pressed_color: Some(Color::hex(0x667788)),
+            border: Some((Color::hex(0x778899), 1.5)),
+            corner_radius: Some(Corners::all(6.0)),
+            shadow: Some((4.0, Color::hex_a(0x0000_0040))),
+            transition: Some((0.4, 0.8)),
+            focus_border: Some(Color::hex(0x8899AA)),
+            placeholder_color: Some(Color::hex(0x99AABB)),
+            clip: true,
+            opacity: Some(0.5),
+            hover_opacity: Some(0.75),
+            pressed_opacity: Some(0.25),
+            group: Some(7),
+            glass: Some(GlassFilter {
+                blur: 8.0,
+                saturation: 1.5,
+                brightness: 1.0,
+                rim: Color::WHITE,
+                rim_band: 1.5,
+            }),
+            pass_through: true,
+        });
+        boxed.face = Some(Rc::new(FontSpec::DEFAULT));
+        let mut words = flow_row("b");
+        words.kind = DomKind::Text(DomText {
+            content: Arc::from("words"),
+            color: Color::hex(0x202020),
+            inherits_ink: true,
+            font: FontSpec::DEFAULT,
+            line_height: Some(18.5),
+            text_align: Some(motor::views::TextAlignment::Center),
+            highlights: None,
+            truncation: Some(Truncation::End),
+            inherits_face: false,
+        });
+        let plain = flow_row("c");
+        assert_eq!(look_hash(&boxed), 0x14d3_3cb5_f0e2_1ffa);
+        assert_eq!(look_hash(&words), 0xaeb5_8869_66cf_63d7);
+        assert_eq!(look_hash(&plain), 0x5727_5724_1e9c_57df);
+        // the element's own parts wear the same rule
+        boxed.style.interactive = Some(Rc::from("a/b"));
+        boxed.style.set_tooltip(Some(Arc::from("tip")));
+        boxed.style.set_group_owner(Some(9));
+        boxed.layout.as_mut().expect("flow").slot_y = Some(40.0);
+        assert_eq!(look_hash(&boxed), 0x14d3_3cb5_f0e2_1ffa);
+    }
+
     #[test]
     fn a_clipped_box_sets_the_overflow_bit_and_nothing_else() {
-        let bare = DomStyle {
+        let bare = DomLook {
             background: Some(Color::hex(0x123456)),
             corner_radius: Some(Corners::all(6.0)),
-            ..DomStyle::default()
+            ..DomLook::default()
         };
-        let cut = DomStyle { clip: true, ..bare.clone() };
-        let without = encode(&[DomPatch::SetStyle { id: 3, style: bare }]);
-        let with = encode(&[DomPatch::SetStyle { id: 3, style: cut }]);
+        let cut = DomLook { clip: true, ..bare.clone() };
+        let without = encode(&[define(bare)]);
+        let with = encode(&[define(cut)]);
         // the first payload-free bit: the streams differ by ONE bit in
         // the mask's high byte and nothing else
         assert_eq!(with.len(), without.len(), "the bit carries no payload");
-        let mask = u16::from_le_bytes([with[9], with[10]]);
+        let mask = u16::from_le_bytes([with[MASK_AT], with[MASK_AT + 1]]);
         assert_eq!(mask & (1 << 14), 1 << 14, "bit 14 says the overflow hides");
         let mut expected = without.clone();
-        expected[10] |= 0x40;
+        expected[MASK_AT + 1] |= 0x40;
         assert_eq!(with, expected);
     }
 
@@ -3814,30 +6465,30 @@ mod tests {
     fn four_corners_take_their_own_bit_and_leave_the_one_radius_alone() {
         // one radius keeps bit 4 and its single float — the wire a box
         // that rounds all four has always sent
-        let one = DomStyle {
+        let one = DomLook {
             corner_radius: Some(Corners::all(6.0)),
-            ..DomStyle::default()
+            ..DomLook::default()
         };
-        let bytes = encode(&[DomPatch::SetStyle { id: 3, style: one }]);
-        let mask = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
+        let bytes = encode(&[define(one)]);
+        let mask = u32::from_le_bytes(bytes[MASK_AT..MASK_AT + 4].try_into().unwrap());
         assert_eq!(mask, 1 << 4, "the one radius is bit 4, alone");
-        assert_eq!(bytes.len(), 13 + 4, "and it costs one float");
+        assert_eq!(bytes.len(), MASK_AT + 4 + 4 + BARE_TAIL, "and it costs one float");
 
         // four different ones take bit 22 INSTEAD, with the four in
         // CSS order behind it
-        let four = DomStyle {
+        let four = DomLook {
             corner_radius: Some(Corners {
                 top_left: 1.0,
                 top_right: 2.0,
                 bottom_right: 3.0,
                 bottom_left: 4.0,
             }),
-            ..DomStyle::default()
+            ..DomLook::default()
         };
-        let bytes = encode(&[DomPatch::SetStyle { id: 3, style: four }]);
-        let mask = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
+        let bytes = encode(&[define(four)]);
+        let mask = u32::from_le_bytes(bytes[MASK_AT..MASK_AT + 4].try_into().unwrap());
         assert_eq!(mask, 1 << 22, "four radii take bit 22, and bit 4 stays clear");
-        let radii: Vec<f32> = bytes[13..]
+        let radii: Vec<f32> = bytes[MASK_AT + 4..MASK_AT + 4 + 16]
             .chunks_exact(4)
             .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
             .collect();
@@ -3941,7 +6592,7 @@ mod tests {
         let ink = patches
             .iter()
             .find_map(|patch| match patch {
-                DomPatch::SetStyle { style, .. } if style.hover_color.is_some() => {
+                DomPatch::DefineRule { style, .. } if style.hover_color.is_some() => {
                     Some((style.color, style.hover_color))
                 }
                 _ => None,
@@ -4024,7 +6675,7 @@ mod tests {
         let glass = patches
             .iter()
             .find_map(|patch| match patch {
-                DomPatch::SetStyle { style, .. } => style.glass,
+                DomPatch::DefineRule { style, .. } => style.glass,
                 _ => None,
             })
             .expect("the pane carries a filter");
@@ -4038,7 +6689,7 @@ mod tests {
         let background = patches
             .iter()
             .find_map(|patch| match patch {
-                DomPatch::SetStyle { style, .. } if style.glass.is_some() => style.background,
+                DomPatch::DefineRule { style, .. } if style.glass.is_some() => style.background,
                 _ => None,
             })
             .expect("the tint became the background");
@@ -4117,6 +6768,93 @@ mod tests {
         );
     }
 
+    /// A kept row's hints move by its tag and its id. Its class moves by
+    /// them too — unless the class reads for itself through the same
+    /// binding object on both sides, and then the class travels on its
+    /// own road and says nothing here.
+    #[test]
+    fn a_kept_rows_hints_move_by_tag_and_id_and_not_by_a_class_that_reads_for_itself() {
+        let binding = NodeBinding::Class(crate::bind::Bound::new(Rc::from("row/#class"), Rc::new(String::new)));
+        let hinted = |tag: &str, class: &str, id: &str, bound: bool| {
+            let mut node = flow_row("row");
+            node.hints = DomHints { tag: Some(tag.into()), class: Some(class.into()), dom_id: Some(id.into()) };
+            node.binding = bound.then(|| match &binding {
+                NodeBinding::Class(bound) => NodeBinding::Class(Rc::clone(bound)),
+                NodeBinding::Text(bound) => NodeBinding::Text(Rc::clone(bound)),
+            });
+            node
+        };
+        let was = hinted("tr", "a", "x", true);
+        assert!(!hints_changed(&was, &hinted("tr", "a", "x", true)), "nothing moved");
+        assert!(!hints_changed(&was, &hinted("tr", "b", "x", true)), "the bound class rides its own road");
+        assert!(hints_changed(&was, &hinted("td", "a", "x", true)), "the tag moved");
+        assert!(hints_changed(&was, &hinted("tr", "a", "y", true)), "the id moved");
+        let plain = hinted("tr", "a", "x", false);
+        assert!(hints_changed(&plain, &hinted("tr", "b", "x", false)), "a class that does not read for itself moved");
+    }
+
+    /// The rows that need no move are found the same with the search and
+    /// without it: a position past the last tail extends the run, which
+    /// is where the search would have put it. Plans of every shape — a
+    /// swap, a reversal, a rotation, a few out of place, fresh entries
+    /// among them, and scrambles — stand on the same rows.
+    #[test]
+    fn the_stable_rows_are_the_ones_the_search_finds() {
+        fn searched(plan: &[usize]) -> Vec<bool> {
+            const NONE: usize = usize::MAX;
+            let mut tails: Vec<usize> = Vec::new();
+            let mut parents = vec![NONE; plan.len()];
+            for (at, &position) in plan.iter().enumerate() {
+                if position == FRESH {
+                    continue;
+                }
+                let place = tails.partition_point(|&tail| plan[tail] < position);
+                if place > 0 {
+                    parents[at] = tails[place - 1];
+                }
+                if place == tails.len() {
+                    tails.push(at);
+                } else {
+                    tails[place] = at;
+                }
+            }
+            let mut stable = vec![false; plan.len()];
+            let mut cursor = tails.last().copied().unwrap_or(NONE);
+            while cursor != NONE {
+                stable[cursor] = true;
+                cursor = parents[cursor];
+            }
+            stable
+        }
+        let mut plans: Vec<Vec<usize>> = Vec::new();
+        let mut swapped: Vec<usize> = (0..40).collect();
+        swapped.swap(1, 38);
+        plans.push(swapped);
+        plans.push((0..40).rev().collect());
+        plans.push((5..40).chain(0..5).collect());
+        let mut few: Vec<usize> = (0..40).collect();
+        few.swap(3, 9);
+        few.swap(20, 21);
+        few[30] = FRESH;
+        few.insert(12, FRESH);
+        plans.push(few);
+        let mut seed = 0x2545_f491_u64;
+        for length in [1usize, 2, 7, 64, 300] {
+            let mut scramble: Vec<usize> = (0..length).collect();
+            for at in (1..length).rev() {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                scramble.swap(at, (seed >> 33) as usize % (at + 1));
+                if seed % 11 == 0 {
+                    scramble[at] = FRESH;
+                }
+            }
+            plans.push(scramble);
+        }
+        for plan in &plans {
+            assert_eq!(longest_increasing(plan), searched(plan), "{plan:?}");
+        }
+    }
+
     // MARK: - The flow vocabulary (the wire half; the capture rides
     // in the next round)
 
@@ -4131,6 +6869,10 @@ mod tests {
             layout: Some(DomLayout::default()),
             hints: DomHints::default(),
             children: Vec::new(),
+            binding: None,
+            face: None,
+            id: 0,
+            rule: 0,
         }
     }
 
@@ -4145,6 +6887,160 @@ mod tests {
             layout: Some(DomLayout { gap: Some(8.0), ..DomLayout::default() }),
             hints: DomHints::default(),
             children,
+            binding: None,
+            face: None,
+            id: 0,
+            rule: 0,
+        }
+    }
+
+
+    /// The reorder law, in bulk: whatever a keyed list becomes — rows
+    /// swapped, moved, inserted, removed, replaced, reversed, kept by
+    /// promise or lowered again — the patches bring the page's children
+    /// to exactly the order asked for, the retained mirror agrees with
+    /// the page, and the survivors that travel are the fewest that can:
+    /// one move for each survivor off the longest run of its old order,
+    /// none for a row on it. The diff trims the ends a frame did not
+    /// touch and reorders the middle in place; this is what it may never
+    /// get wrong while doing so.
+    #[test]
+    fn every_reorder_lands_in_the_order_asked_with_the_fewest_moves() {
+        let display = crate::layout::DisplayList::default();
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut roll = move |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below.max(1) as u64) as usize
+        };
+        // a row the page already holds may come back as a promise
+        let scene = |order: &[String], promised: &dyn Fn(usize) -> bool| {
+            flow_root(
+                order
+                    .iter()
+                    .enumerate()
+                    .map(|(at, path)| {
+                        let mut row = flow_row(path);
+                        if promised(at) {
+                            row.kind = DomKind::Reuse { path: std::rc::Rc::from(path.as_str()) };
+                        }
+                        row
+                    })
+                    .collect(),
+            )
+        };
+        let mut minted = 0usize;
+        let mut mint = move || {
+            minted += 1;
+            format!("row{minted}")
+        };
+        for _ in 0..400 {
+            let mut lowering = DomLowering::default();
+            let mut page: Vec<u32> = Vec::new();
+            let mut order: Vec<String> = (0..roll(20)).map(|_| mint()).collect();
+            let mut was: Vec<String> = Vec::new();
+            for _ in 0..10 {
+                let held: std::collections::HashSet<&str> =
+                    was.iter().map(String::as_str).collect();
+                let coin: Vec<bool> = (0..order.len()).map(|_| roll(2) == 0).collect();
+                let patches = lowering.lower(
+                    scene(&order, &|at| held.contains(order[at].as_str()) && coin[at]),
+                    &display,
+                );
+                // the page, as the browser would be left by the patches
+                for patch in &patches {
+                    match patch {
+                        DomPatch::Create { id, parent: 0, before, .. }
+                        | DomPatch::Clone { id, parent: 0, before, .. } => {
+                            let at = page.iter().position(|el| el == before).unwrap_or(page.len());
+                            page.insert(at, *id);
+                        }
+                        DomPatch::Move { id, before, .. } => {
+                            page.retain(|el| el != id);
+                            let at = page.iter().position(|el| el == before).unwrap_or(page.len());
+                            page.insert(at, *id);
+                        }
+                        DomPatch::Remove { id } => page.retain(|el| el != id),
+                        DomPatch::RemoveChildren { id: 0, .. } => page.clear(),
+                        _ => {}
+                    }
+                }
+                let mirror = &lowering.root.as_ref().expect("mounted").children;
+                let paths: Vec<String> = mirror
+                    .iter()
+                    .map(|row| match &row.kind {
+                        DomKind::Group { path } => path.to_string(),
+                        other => panic!("a row is a group: {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(paths, order, "the mirror holds the order asked for");
+                assert_eq!(
+                    page,
+                    mirror.iter().map(|row| row.id).collect::<Vec<_>>(),
+                    "the page holds the mirror's elements, in its order: {patches:#?}"
+                );
+                // the fewest moves: the survivors off the longest
+                // increasing run of their old positions
+                let old_at: std::collections::HashMap<&String, usize> =
+                    was.iter().enumerate().map(|(at, path)| (path, at)).collect();
+                let survivors: Vec<usize> =
+                    order.iter().filter_map(|path| old_at.get(path).copied()).collect();
+                let mut tails: Vec<usize> = Vec::new();
+                for &position in &survivors {
+                    let place = tails.partition_point(|&tail| tail < position);
+                    if place == tails.len() {
+                        tails.push(position);
+                    } else {
+                        tails[place] = position;
+                    }
+                }
+                let moves = patches.iter().filter(|p| matches!(p, DomPatch::Move { .. })).count();
+                assert_eq!(
+                    moves,
+                    survivors.len() - tails.len(),
+                    "{was:?} -> {order:?}: {patches:#?}"
+                );
+
+                // the next frame: one of the shapes a keyed list takes
+                was = order.clone();
+                let len = order.len();
+                match roll(7) {
+                    0 if len > 1 => {
+                        let (i, j) = (roll(len), roll(len));
+                        order.swap(i, j);
+                    }
+                    1 if len > 0 => {
+                        order.remove(roll(len));
+                    }
+                    2 => {
+                        let at = roll(len + 1);
+                        order.insert(at, mint());
+                    }
+                    3 => {
+                        for _ in 0..roll(4) {
+                            if order.len() > 1 {
+                                let row = order.remove(roll(order.len()));
+                                let at = roll(order.len() + 1);
+                                order.insert(at, row);
+                            }
+                        }
+                    }
+                    4 => order = (0..roll(12)).map(|_| mint()).collect(),
+                    5 => {
+                        for _ in 0..roll(4) {
+                            let at = roll(order.len() + 1);
+                            order.insert(at, mint());
+                        }
+                        for _ in 0..roll(3) {
+                            if !order.is_empty() {
+                                order.remove(roll(order.len()));
+                            }
+                        }
+                    }
+                    _ => order.reverse(),
+                }
+            }
         }
     }
 
@@ -4157,21 +7053,29 @@ mod tests {
         let display = crate::layout::DisplayList::default();
         let rows = |order: &[&str]| flow_root(order.iter().map(|p| flow_row(p)).collect());
 
-        let mount = lowering.lower(&rows(&["a", "b", "c", "d", "e"]), &display);
+        let mount = lowering.lower(rows(&["a", "b", "c", "d", "e"]), &display);
+        // five rows of one shape: the first mounts whole, the others
+        // are clones of it
         assert_eq!(
-            mount.iter().filter(|p| matches!(p, DomPatch::Create { .. })).count(),
+            mount
+                .iter()
+                .filter(|p| matches!(p, DomPatch::Create { .. } | DomPatch::Clone { .. }))
+                .count(),
             5,
             "{mount:#?}"
         );
 
-        let swapped = lowering.lower(&rows(&["a", "d", "c", "b", "e"]), &display);
+        let swapped = lowering.lower(rows(&["a", "d", "c", "b", "e"]), &display);
         let moves: Vec<_> =
             swapped.iter().filter(|p| matches!(p, DomPatch::Move { .. })).collect();
         assert_eq!(moves.len(), 2, "a swap is two moves: {swapped:#?}");
         assert!(
             !swapped.iter().any(|p| matches!(
                 p,
-                DomPatch::Create { .. } | DomPatch::Remove { .. } | DomPatch::SetTransform { .. }
+                DomPatch::Create { .. }
+                    | DomPatch::Clone { .. }
+                    | DomPatch::Remove { .. }
+                    | DomPatch::SetTransform { .. }
             )),
             "nothing mounts, nothing leaves, nothing is positioned by hand: {swapped:#?}"
         );
@@ -4199,10 +7103,14 @@ mod tests {
                 }),
                 hints: DomHints::default(),
                 children: Vec::new(),
+                binding: None,
+                face: None,
+                id: 0,
+                rule: 0,
             }])
         };
 
-        let mount = lowering.lower(&page("https://a.test/"), &display);
+        let mount = lowering.lower(page("https://a.test/"), &display);
         assert!(
             mount.iter().any(|patch| matches!(
                 patch,
@@ -4218,10 +7126,10 @@ mod tests {
             "the src rides the mount: {mount:#?}"
         );
 
-        let steady = lowering.lower(&page("https://a.test/"), &display);
+        let steady = lowering.lower(page("https://a.test/"), &display);
         assert!(steady.is_empty(), "an unchanged page ships nothing: {steady:#?}");
 
-        let moved = lowering.lower(&page("https://b.test/"), &display);
+        let moved = lowering.lower(page("https://b.test/"), &display);
         assert_eq!(moved.len(), 1, "a navigation is ONE patch: {moved:#?}");
         assert!(matches!(
             &moved[0],
@@ -4254,10 +7162,14 @@ mod tests {
                 }),
                 hints: DomHints::default(),
                 children: Vec::new(),
+                binding: None,
+                face: None,
+                id: 0,
+                rule: 0,
             }])
         };
 
-        let mount = lowering.lower(&page("<meta><p>a letter</p>", true), &display);
+        let mount = lowering.lower(page("<meta><p>a letter</p>", true), &display);
         assert!(
             mount.iter().any(|patch| matches!(
                 patch,
@@ -4268,7 +7180,7 @@ mod tests {
 
         // the same page, unsealed: ONE patch, the seal flipped — the
         // element survives, its powers change
-        let opened = lowering.lower(&page("<meta><p>a letter</p>", false), &display);
+        let opened = lowering.lower(page("<meta><p>a letter</p>", false), &display);
         assert_eq!(opened.len(), 1, "{opened:#?}");
         assert!(matches!(&opened[0], DomPatch::SetIframe { sealed: false, .. }));
 
@@ -4306,10 +7218,14 @@ mod tests {
                 }),
                 hints: DomHints::default(),
                 children: Vec::new(),
+                binding: None,
+                face: None,
+                id: 0,
+                rule: 0,
             }])
         };
 
-        let mount = lowering.lower(&feed(3, false), &display);
+        let mount = lowering.lower(feed(3, false), &display);
         assert_eq!(
             mount
                 .iter()
@@ -4326,17 +7242,17 @@ mod tests {
             "the stream rides the mount: {mount:#?}"
         );
 
-        let steady = lowering.lower(&feed(3, false), &display);
+        let steady = lowering.lower(feed(3, false), &display);
         assert!(steady.is_empty(), "an unchanged feed ships nothing: {steady:#?}");
 
-        let flipped = lowering.lower(&feed(3, true), &display);
+        let flipped = lowering.lower(feed(3, true), &display);
         assert_eq!(flipped.len(), 1, "a flip is ONE patch: {flipped:#?}");
         assert!(
             matches!(&flipped[0], DomPatch::SetVideo { stream: 3, mirrored: true, .. }),
             "the flip carries the same stream, so the glue leaves the playback alone: {flipped:#?}"
         );
 
-        let switched = lowering.lower(&feed(4, true), &display);
+        let switched = lowering.lower(feed(4, true), &display);
         assert_eq!(switched.len(), 1, "a new stream is ONE patch: {switched:#?}");
         assert!(
             matches!(&switched[0], DomPatch::SetVideo { stream: 4, .. }),
@@ -4351,7 +7267,7 @@ mod tests {
             cover: false,
             radius: 12.0,
         }]);
-        assert_eq!(&wire[4..], &[17, 7, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0x40, 0x41]);
+        assert_eq!(&wire[4..], &[25, 7, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0x40, 0x41]);
 
         // the glue's gate: the handle is compared before the element is
         // rewired, so a flag alone never restarts the playback
@@ -4370,20 +7286,24 @@ mod tests {
         let display = crate::layout::DisplayList::default();
         let rows = |order: &[&str]| flow_root(order.iter().map(|p| flow_row(p)).collect());
 
-        let mount = lowering.lower(&rows(&["a", "b", "c"]), &display);
+        let mount = lowering.lower(rows(&["a", "b", "c"]), &display);
         let ids: Vec<u32> = mount
             .iter()
             .filter_map(|p| match p {
-                DomPatch::Create { id, .. } => Some(*id),
+                DomPatch::Create { id, .. } | DomPatch::Clone { id, .. } => Some(*id),
                 _ => None,
             })
             .collect();
 
-        let grown = lowering.lower(&rows(&["a", "new", "b", "c"]), &display);
+        let grown = lowering.lower(rows(&["a", "new", "b", "c"]), &display);
+        // the fresh row is a clone of the shape already on the page,
+        // placed where a create would be
         let creates: Vec<_> = grown
             .iter()
             .filter_map(|p| match p {
-                DomPatch::Create { id, before, .. } => Some((*id, *before)),
+                DomPatch::Create { id, before, .. } | DomPatch::Clone { id, before, .. } => {
+                    Some((*id, *before))
+                }
                 _ => None,
             })
             .collect();
@@ -4398,39 +7318,178 @@ mod tests {
         );
     }
 
+    /// The retention is the scene's own nodes, numbered where they stand
+    /// and kept in the vectors they came in — and a vector the capture
+    /// grew past its nodes gives the room back as it is kept: a slot is a
+    /// whole node's worth of memory, held for as long as its row stands.
+    /// A list that mounts, mounts again into nothing, grows at its end,
+    /// grows before its tail and is replaced whole: every row it keeps,
+    /// built or copied, holds its nodes and no room beyond them.
+    #[test]
+    fn the_retention_is_the_scene_with_no_room_beyond_its_nodes() {
+        let mut lowering = DomLowering::default();
+        let display = crate::layout::DisplayList::default();
+        // a row and a list with room for more than they hold: what a
+        // capture that grows its vectors as it fills them hands over
+        let row = |id: usize| {
+            let mut row = flow_row(&format!("L/[{id}]/Item"));
+            let mut cells = Vec::with_capacity(8);
+            cells.push(DomNode { kind: DomKind::Box, ..flow_row("") });
+            cells.push(DomNode { kind: DomKind::Box, ..flow_row("") });
+            row.children = cells;
+            row
+        };
+        let rows = |ids: &[usize]| {
+            let mut list = Vec::with_capacity(64);
+            list.extend(ids.iter().map(|&id| row(id)));
+            flow_root(list)
+        };
+        fn assert_tight(node: &DomNode, ids: &mut std::collections::HashSet<u32>) {
+            assert!(ids.insert(node.id), "id {} is kept twice", node.id);
+            assert_eq!(
+                node.children.capacity(),
+                node.children.len(),
+                "element {} holds room beyond its {} children",
+                node.id,
+                node.children.len()
+            );
+            for child in &node.children {
+                assert_tight(child, ids);
+            }
+        }
+        // the rows alone, how many
+        fn rows_tight(lowering: &DomLowering) -> usize {
+            let root = lowering.root.as_ref().expect("mounted");
+            let mut ids = std::collections::HashSet::from([0]);
+            for row in &root.children {
+                assert_tight(row, &mut ids);
+            }
+            root.children.len()
+        }
+
+        let mount = lowering.lower(rows(&[1, 2, 3, 4]), &display);
+        assert!(mount.iter().any(|p| matches!(p, DomPatch::Clone { .. })), "{mount:#?}");
+        assert_tight(lowering.root.as_ref().expect("mounted"), &mut std::collections::HashSet::new());
+        lowering.lower(rows(&[]), &display);
+        // into nothing: the scene's list is the retention's
+        lowering.lower(rows(&[1, 2, 3, 4]), &display);
+        assert_tight(lowering.root.as_ref().expect("mounted"), &mut std::collections::HashSet::new());
+        // at the end and before the tail: the list itself grows as a
+        // list grows, its rows hold no more than theirs
+        lowering.lower(rows(&[1, 2, 3, 4, 5, 6]), &display);
+        assert_eq!(rows_tight(&lowering), 6);
+        lowering.lower(rows(&[1, 2, 7, 8, 3, 4, 5, 6]), &display);
+        assert_eq!(rows_tight(&lowering), 8);
+        // replaced whole: the fresh rows and the list they wait in
+        let replaced = lowering.lower(rows(&[9, 10, 11]), &display);
+        assert!(replaced.iter().any(|p| matches!(p, DomPatch::RemoveChildren { .. })), "{replaced:#?}");
+        assert_tight(lowering.root.as_ref().expect("mounted"), &mut std::collections::HashSet::new());
+    }
+
+    /// A row that holds a template is none itself — so when the rows
+    /// leave whole, the row's question reaches no template, and the one
+    /// inside it must leave with it: a template left standing hands the
+    /// next row built around it a copy of an element no longer on the
+    /// page, and every row copied from that one inherits the hole.
+    #[test]
+    fn a_template_inside_a_row_leaves_with_the_row() {
+        let mut lowering = DomLowering::default();
+        let display = crate::layout::DisplayList::default();
+        let leaf = || DomNode { kind: DomKind::Box, ..flow_row("") };
+        // each row a component holding one of its own after a leaf
+        let rows = |ids: std::ops::Range<usize>| {
+            flow_root(
+                ids.map(|id| {
+                    let mut inner = flow_row(&format!("L/[{id}]/Item/#1/Inner"));
+                    inner.children = vec![leaf()];
+                    let mut row = flow_row(&format!("L/[{id}]/Item"));
+                    row.children = vec![leaf(), inner];
+                    row
+                })
+                .collect(),
+            )
+        };
+        // every template stands on an element of the page, and every
+        // copy the frame made is of one
+        fn assert_live(lowering: &DomLowering, patches: &[DomPatch]) {
+            fn walk(retained: &DomNode, live: &mut std::collections::HashSet<u32>) {
+                live.insert(retained.id);
+                for child in &retained.children {
+                    walk(child, live);
+                }
+            }
+            let mut live = std::collections::HashSet::new();
+            if let Some(root) = &lowering.root {
+                walk(root, &mut live);
+            }
+            for root in lowering.templates.roots.keys() {
+                assert!(live.contains(root), "template {root} stands on a removed element");
+            }
+            for patch in patches {
+                if let DomPatch::Clone { template, .. } = patch {
+                    assert!(live.contains(template), "a copy of a removed template {template}");
+                }
+            }
+        }
+        let built = |patches: &[DomPatch]| {
+            let creates = patches.iter().filter(|p| matches!(p, DomPatch::Create { .. })).count();
+            let clones = patches.iter().filter(|p| matches!(p, DomPatch::Clone { .. })).count();
+            (creates, clones)
+        };
+
+        // row 1 holds the inner template; row 2 is built around a copy
+        // of it and is the template rows 3 and 4 copy
+        let mount = lowering.lower(rows(1..5), &display);
+        assert_live(&lowering, &mount);
+        assert_eq!(built(&mount), (6, 3), "{mount:#?}");
+
+        let cleared = lowering.lower(rows(5..5), &display);
+        assert!(cleared.iter().any(|p| matches!(p, DomPatch::RemoveChildren { .. })), "{cleared:#?}");
+        assert_live(&lowering, &cleared);
+        assert!(lowering.templates.roots.is_empty(), "no row is left to be a template");
+        assert!(lowering.templates.members.is_empty());
+
+        // a run after the clear builds as the mount did
+        let again = lowering.lower(rows(5..9), &display);
+        assert_live(&lowering, &again);
+        assert_eq!(built(&again), built(&mount), "{again:#?}");
+    }
+
     /// A flow node's layout travels as ONE record — and its geometry
     /// fields never do.
     #[test]
     fn a_flow_layout_change_is_one_setlayout() {
         let mut lowering = DomLowering::default();
         let display = crate::layout::DisplayList::default();
-        let with_gap = |gap: f64| {
+        let with_gap = |gap: f32| {
             let mut root = flow_root(vec![flow_row("a")]);
             root.layout = Some(DomLayout { gap: Some(gap), ..DomLayout::default() });
             root
         };
 
-        let _ = lowering.lower(&with_gap(8.0), &display);
-        let regapped = lowering.lower(&with_gap(12.0), &display);
-        assert_eq!(regapped.len(), 1, "{regapped:#?}");
+        let _ = lowering.lower(with_gap(8.0), &display);
+        let regapped = lowering.lower(with_gap(12.0), &display);
+        // the root changes looks: the new one defined, then worn
+        assert_eq!(regapped.len(), 2, "{regapped:#?}");
         assert!(matches!(
             &regapped[0],
-            DomPatch::SetLayout { id: 0, layout } if layout.gap == Some(12.0)
+            DomPatch::DefineRule { layout, .. } if layout.gap == Some(12.0)
         ));
+        assert!(matches!(&regapped[1], DomPatch::UseRule { id: 0, .. }), "{regapped:#?}");
     }
 
-    /// The three new encodings, pinned byte for byte.
+    /// The box an element owns, a move and a reveal, pinned byte for
+    /// byte: the box is a mask of five and the floats it names, in order.
     #[test]
     fn the_flow_encoding_is_byte_stable() {
         let patches = vec![
-            DomPatch::SetLayout {
+            DomPatch::SetBox {
                 id: 5,
-                layout: DomLayout {
-                    gap: Some(8.0),
-                    grow: true,
-                    slot_y: Some(120.0),
-                    ..DomLayout::default()
-                },
+                width: None,
+                height: Some(24.0),
+                max_width: None,
+                max_height: None,
+                slot_y: Some(120.0),
             },
             DomPatch::Move { id: 5, parent: 1, before: 9 },
             DomPatch::Reveal { id: 3, target: 44 },
@@ -4438,10 +7497,10 @@ mod tests {
         let bytes = encode(&patches);
         let expected: Vec<u8> = [
             &3u32.to_le_bytes()[..],
-            &[11],
+            &[23],
             &5u32.to_le_bytes()[..],
-            &(1u16 | 1 << 7 | 1 << 8).to_le_bytes()[..],
-            &8f32.to_le_bytes()[..],
+            &[1 << 1 | 1 << 4],
+            &24f32.to_le_bytes()[..],
             &120f32.to_le_bytes()[..],
             &[12],
             &5u32.to_le_bytes()[..],
@@ -4450,6 +7509,55 @@ mod tests {
             &[13],
             &3u32.to_le_bytes()[..],
             &44u32.to_le_bytes()[..],
+        ]
+        .concat();
+        assert_eq!(bytes, expected);
+    }
+
+    /// A look on the wire, pinned byte for byte: its two words, the
+    /// kind, the flags, the style and flow records and the text flag —
+    /// then an element that wears it, and the marks of its own.
+    #[test]
+    fn the_look_encoding_is_byte_stable() {
+        let rule = 0x0000_0001_0000_0002u64;
+        let patches = vec![
+            DomPatch::DefineRule {
+                rule,
+                kind: CreateKind::FlexRow,
+                flags: 1,
+                style: Box::new(DomLook {
+                    background: Some(Color::hex(0x112233)),
+                    ..DomLook::default()
+                }),
+                layout: Box::new(DomLayout { gap: Some(8.0), grow: true, ..DomLayout::default() }),
+                text: None,
+            },
+            DomPatch::UseRule { id: 5, rule },
+            DomPatch::SetMarks { id: 5, tooltip: Some(Arc::from("Hi")), group_owner: Some(7) },
+        ];
+        let bytes = encode(&patches);
+        let expected: Vec<u8> = [
+            &3u32.to_le_bytes()[..],
+            &[21],
+            &1u32.to_le_bytes()[..],
+            &2u32.to_le_bytes()[..],
+            &[10, 1],
+            &1u32.to_le_bytes()[..],
+            &0x112233FFu32.to_le_bytes()[..],
+            &(1u16 | 1 << 7).to_le_bytes()[..],
+            &8f32.to_le_bytes()[..],
+            &[0],
+            &[22],
+            &5u32.to_le_bytes()[..],
+            &1u32.to_le_bytes()[..],
+            &2u32.to_le_bytes()[..],
+            &[24],
+            &5u32.to_le_bytes()[..],
+            &[3],
+            &2u16.to_le_bytes()[..],
+            b"Hi",
+            &0u32.to_le_bytes()[..],
+            &7u32.to_le_bytes()[..],
         ]
         .concat();
         assert_eq!(bytes, expected);
@@ -4576,7 +7684,7 @@ mod tests {
         let patches = runtime.dom_frame(&view, size);
         let stats = crate::stats::take();
 
-        assert_eq!(patches.len(), 2, "the flip is two style records: {patches:?}");
+        assert_eq!(patches.len(), 3, "the flip is a look defined, worn, and the words: {patches:?}");
         assert!(
             stats.diff_visited < 20,
             "the diff visited {} nodes for one flipped cell",
@@ -4633,12 +7741,493 @@ mod tests {
         // a layout record, not a transform)
         let flow_texts = patches
             .iter()
-            .filter(|p| matches!(p, DomPatch::SetText { .. }))
+            .filter(|p| matches!(p, DomPatch::SetContent { .. }))
             .count();
         assert_eq!(flow_texts, 4, "{patches:#?}");
         // a second frame with nothing changed is silent — the exact
         // subtree diffs like everything else
         assert!(runtime.dom_frame(&Mixed, size).is_empty());
+    }
+
+    // MARK: - Action paths told against their row
+
+    /// The page a browser holds after these frames sends, for a click
+    /// on each element, the path the engine knows the element by.
+    fn assert_clicks_resolve(replay: &crate::ssr::Replay, runtime: &Runtime) {
+        let engine = runtime.dom_action_paths();
+        assert!(!engine.is_empty(), "the page has targets");
+        assert_eq!(replay.action_paths(), engine, "{}", replay.html());
+    }
+
+    /// The path a click on the target named `name` in row `row` sends,
+    /// read off the replayed page.
+    fn target_of(replay: &crate::ssr::Replay, name: &str, row: usize) -> String {
+        replay
+            .action_paths()
+            .into_values()
+            .find(|path| path.contains(&format!("[{row}]")) && path.ends_with(&format!("[{name}]")))
+            .unwrap_or_else(|| panic!("no target `{name}` in row {row}: {}", replay.html()))
+    }
+
+    #[derive(Clone, Copy)]
+    struct Counted {
+        id: usize,
+        value: State<usize>,
+    }
+
+    fn counted(ids: std::ops::Range<usize>) -> Rc<Vec<Counted>> {
+        Rc::new(ids.map(|id| Counted { id, value: State::new(id * 10) }).collect())
+    }
+
+    /// The rows kept, and fresh ones after them.
+    fn appended<T: Copy>(rows: &[T], fresh: &[T]) -> Rc<Vec<T>> {
+        Rc::new(rows.iter().chain(fresh).copied().collect())
+    }
+
+    /// A component of its own inside each row: a group inside the clone.
+    #[derive(Clone, Copy)]
+    struct Stepper {
+        value: State<usize>,
+    }
+
+    impl Component for Stepper {
+        fn body(self, _ctx: &Context) -> impl View {
+            let value = self.value;
+            crate::hstack!(
+                text("-").on_click(move || value.set(value.get().saturating_sub(1))).id("less"),
+                text("+").on_click(move || value.set(value.get() + 1)).id("more"),
+            )
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct CounterRow {
+        row: Counted,
+    }
+
+    impl Component for CounterRow {
+        fn body(self, _ctx: &Context) -> impl View {
+            let value = self.row.value;
+            crate::hstack!(
+                text(format!("row {}", self.row.id)).on_click(move || value.set(0)).id("reset"),
+                Stepper { value },
+            )
+        }
+    }
+
+    #[derive(Clone)]
+    struct Counters {
+        rows: State<Rc<Vec<Counted>>>,
+    }
+
+    impl Component for Counters {
+        fn body(self, _ctx: &Context) -> impl View {
+            crate::vstack!(crate::views::for_each(
+                self.rows,
+                |row| row.id.to_string(),
+                |row| CounterRow { row: *row },
+            ))
+        }
+    }
+
+    /// A row's paths cross told against the row, and a copy whose paths
+    /// read as its template's ships none of them. A group inside each
+    /// copy carries its OWN path: the base it was copied with names the
+    /// template's group, and a click told against that one would reach
+    /// another row's counter.
+    #[test]
+    fn a_group_inside_a_clone_is_told_its_own_base() {
+        let size = Size { width: 400.0, height: 400.0 };
+        let page = Counters { rows: State::new(counted(1..5)) };
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&page, size);
+        let mut replay = crate::ssr::Replay::new(size);
+        replay.apply(&mount);
+        assert_clicks_resolve(&replay, &runtime);
+
+        // row 1 holds the stepper's template, so it is none itself: row
+        // 2 is built around a copy of row 1's stepper, and becomes the
+        // template rows 3 and 4 copy — a template holding a clone
+        let clones: Vec<&str> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::Clone { base, .. } => Some(base.as_deref().expect("every copy here is a base")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(clones.len(), 3, "{mount:#?}");
+        assert!(clones[0].contains("[2]") && clones[0].ends_with("/Stepper"), "{clones:?}");
+        for (row, base) in (3..).zip(&clones[1..]) {
+            assert!(base.contains(&format!("[{row}]")) && base.ends_with("/CounterRow"), "{clones:?}");
+        }
+        // the paths of the two rows built cross told against their
+        // groups; the copies ship none
+        let paths: Vec<(&str, usize)> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::SetPath { path: Some(path), base_len, .. } => Some((&**path, *base_len)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths.len(), 4, "row 1's three, row 2's own reset: {paths:?}");
+        assert!(paths.iter().all(|(_, base_len)| *base_len > 0), "{paths:?}");
+        // a group built is told its base after its subtree; the stepper
+        // inside each copied row is told its own, once
+        let bases: Vec<&str> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::SetBase { base, .. } => Some(&**base),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bases,
+            [
+                "Counters/#0/Keyed/[1]/CounterRow/#1/Stepper",
+                "Counters/#0/Keyed/[1]/CounterRow",
+                "Counters/#0/Keyed/[2]/CounterRow",
+                "Counters/#0/Keyed/[3]/CounterRow/#1/Stepper",
+                "Counters/#0/Keyed/[4]/CounterRow/#1/Stepper",
+            ]
+        );
+
+        // a click on row 3's "+" reaches row 3's counter, and no other
+        let more = target_of(&replay, "more", 3);
+        assert!(runtime.dom_action(&more, 1), "the resolved path is a live action: {more}");
+        let rows = page.rows.get();
+        let values: Vec<usize> = rows.iter().map(|row| row.value.get()).collect();
+        assert_eq!(values, [10, 20, 31, 40]);
+
+        // rows appended later copy the same template the same way
+        page.rows.set(appended(&page.rows.get(), &counted(5..7)));
+        let appended = runtime.dom_frame(&page, size);
+        replay.apply(&appended);
+        assert_clicks_resolve(&replay, &runtime);
+        assert_eq!(
+            appended.iter().filter(|patch| matches!(patch, DomPatch::SetBase { .. })).count(),
+            2,
+            "{appended:#?}"
+        );
+    }
+
+    /// Rows that hold a component of their own, cleared and run again:
+    /// the run copies only what the page still holds, tells the same
+    /// bases the mount told, and every click reaches its own row's
+    /// action — the stepper inside each row included.
+    #[test]
+    fn a_run_after_a_clear_resolves_as_the_mount_did() {
+        let size = Size { width: 400.0, height: 400.0 };
+        let page = Counters { rows: State::new(counted(1..5)) };
+        let runtime = Runtime::new();
+        let mut replay = crate::ssr::Replay::new(size);
+        let mount = runtime.dom_frame(&page, size);
+        replay.apply(&mount);
+        assert_clicks_resolve(&replay, &runtime);
+
+        page.rows.set(Rc::new(Vec::new()));
+        replay.apply(&runtime.dom_frame(&page, size));
+        assert!(runtime.dom_action_paths().is_empty(), "the clear leaves no target");
+        assert!(replay.action_paths().is_empty(), "{}", replay.html());
+
+        page.rows.set(counted(5..9));
+        let run = runtime.dom_frame(&page, size);
+        replay.apply(&run);
+        assert_clicks_resolve(&replay, &runtime);
+        // built as the mount built its rows: row 5 whole (seven
+        // elements) holding the stepper's template, row 6 around a copy
+        // of it (three), two copies of row 6 — and the mount's copies,
+        // bases and paths, told again
+        let built = |patches: &[DomPatch]| {
+            let count = |wanted: fn(&DomPatch) -> bool| patches.iter().filter(|p| wanted(p)).count();
+            [
+                count(|p| matches!(p, DomPatch::Create { .. })),
+                count(|p| matches!(p, DomPatch::Clone { .. })),
+                count(|p| matches!(p, DomPatch::SetBase { .. })),
+                count(|p| matches!(p, DomPatch::SetPath { .. })),
+            ]
+        };
+        let (run_built, mount_built) = (built(&run), built(&mount));
+        assert_eq!(run_built[0], 10, "{run:#?}");
+        assert_eq!(run_built[1..], mount_built[1..], "{run:#?}");
+
+        // a click on row 7's "+" reaches row 7's counter, and no other
+        let more = target_of(&replay, "more", 7);
+        assert!(runtime.dom_action(&more, 1), "{more}");
+        let values: Vec<usize> = page.rows.get().iter().map(|row| row.value.get()).collect();
+        assert_eq!(values, [50, 60, 71, 80]);
+    }
+
+    #[derive(Clone, Copy)]
+    struct Badge {
+        id: usize,
+    }
+
+    impl Component for Badge {
+        fn body(self, _ctx: &Context) -> impl View {
+            text(format!("badge {}", self.id)).background_color(Color::hex(0x334455))
+        }
+    }
+
+    #[derive(Clone)]
+    struct Badges {
+        rows: State<Rc<Vec<Counted>>>,
+        picked: State<usize>,
+    }
+
+    impl Component for Badges {
+        fn body(self, _ctx: &Context) -> impl View {
+            let picked = self.picked;
+            crate::vstack!(crate::views::for_each(
+                self.rows,
+                |row| row.id.to_string(),
+                move |row| {
+                    let id = row.id;
+                    // the click is armed ABOVE the row's component: its
+                    // path is the list's, never under the group's
+                    Badge { id }.on_click(move || picked.set(id))
+                },
+            ))
+        }
+    }
+
+    /// An action armed above its group does not lie under the group's
+    /// path: it ships whole, the group carries no base, and every copy
+    /// says its own path — the template's would be another row's.
+    #[test]
+    fn a_path_armed_above_its_group_ships_whole() {
+        let size = Size { width: 400.0, height: 400.0 };
+        let page = Badges { rows: State::new(counted(1..5)), picked: State::new(0) };
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&page, size);
+        let mut replay = crate::ssr::Replay::new(size);
+        replay.apply(&mount);
+        assert_clicks_resolve(&replay, &runtime);
+
+        let paths: Vec<(&str, usize)> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::SetPath { path: Some(path), base_len, .. } => Some((&**path, *base_len)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths.len(), 4, "every row says its own: {paths:?}");
+        assert!(paths.iter().all(|(path, base_len)| *base_len == 0 && !path.contains("/Badge/")), "{paths:?}");
+        assert!(mount.iter().any(|patch| matches!(patch, DomPatch::Clone { base: None, .. })), "{mount:#?}");
+        assert!(!mount.iter().any(|patch| matches!(patch, DomPatch::Clone { base: Some(_), .. })));
+        assert!(!mount.iter().any(|patch| matches!(patch, DomPatch::SetBase { .. })));
+        assert!(!replay.html().contains("data-path=\"~"), "{}", replay.html());
+
+        let third = replay
+            .action_paths()
+            .into_values()
+            .find(|path| path.contains("[3]"))
+            .expect("row 3 is a target");
+        assert!(runtime.dom_action(&third, 1));
+        assert_eq!(page.picked.get(), 3);
+    }
+
+    #[derive(Clone, Copy)]
+    struct Folding {
+        id: usize,
+        open: State<bool>,
+        hits: State<usize>,
+    }
+
+    impl Component for Folding {
+        fn body(self, _ctx: &Context) -> impl View {
+            let open = self.open;
+            let hits = self.hits;
+            let opened = open.get();
+            crate::vstack!(
+                // the name moves with the state: a kept element whose
+                // path changes on the re-run
+                text(format!("row {}", self.id))
+                    .on_click(move || open.set(!open.get()))
+                    .id(if opened { "fold" } else { "unfold" }),
+                // a target born inside a kept row
+                opened.then(|| text("details").on_click(move || hits.set(hits.get() + 1)).id("details")),
+            )
+        }
+    }
+
+    #[derive(Clone)]
+    struct Folds {
+        rows: State<Rc<Vec<Folding>>>,
+    }
+
+    impl Component for Folds {
+        fn body(self, _ctx: &Context) -> impl View {
+            crate::vstack!(crate::views::for_each(self.rows, |row| row.id.to_string(), |row| *row))
+        }
+    }
+
+    fn folds(ids: std::ops::Range<usize>) -> Rc<Vec<Folding>> {
+        Rc::new(
+            ids.map(|id| Folding { id, open: State::new(false), hits: State::new(0) }).collect(),
+        )
+    }
+
+    /// A row that re-runs and changes its structure: the target born in
+    /// it, and the target whose path moved, ship whole — the base their
+    /// row would lend them was told only to rows that leaned on it — and
+    /// every click on the page still reaches its own action, the rows
+    /// mounted after the change included.
+    #[test]
+    fn a_row_that_changes_its_structure_still_resolves() {
+        let size = Size { width: 400.0, height: 400.0 };
+        let page = Folds { rows: State::new(folds(1..5)) };
+        let runtime = Runtime::new();
+        let mut replay = crate::ssr::Replay::new(size);
+        replay.apply(&runtime.dom_frame(&page, size));
+        assert_clicks_resolve(&replay, &runtime);
+
+        // row 2 (a copy) and row 1 (the template) open
+        for row in [2, 1] {
+            let unfold = target_of(&replay, "unfold", row);
+            assert!(runtime.dom_action(&unfold, 1), "{unfold}");
+            let patches = runtime.dom_frame(&page, size);
+            let paths: Vec<usize> = patches
+                .iter()
+                .filter_map(|patch| match patch {
+                    DomPatch::SetPath { base_len, .. } => Some(*base_len),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(paths, [0, 0], "the moved path and the new one, whole: {patches:#?}");
+            replay.apply(&patches);
+            assert_clicks_resolve(&replay, &runtime);
+        }
+
+        // the new target reaches its own row
+        let details = target_of(&replay, "details", 2);
+        assert!(runtime.dom_action(&details, 1));
+        let rows = page.rows.get();
+        assert_eq!(rows.iter().map(|row| row.hits.get()).collect::<Vec<_>>(), [0, 1, 0, 0]);
+
+        // rows mounted after the change, and a row closing again
+        page.rows.set(appended(&rows, &folds(5..8)));
+        let appended = runtime.dom_frame(&page, size);
+        replay.apply(&appended);
+        assert_clicks_resolve(&replay, &runtime);
+        let fold = target_of(&replay, "fold", 2);
+        assert!(runtime.dom_action(&fold, 1));
+        replay.apply(&runtime.dom_frame(&page, size));
+        assert_clicks_resolve(&replay, &runtime);
+        let unfold = target_of(&replay, "unfold", 6);
+        assert!(runtime.dom_action(&unfold, 1));
+        replay.apply(&runtime.dom_frame(&page, size));
+        assert_clicks_resolve(&replay, &runtime);
+        assert!(page.rows.get()[5].open.get(), "row 6 opened through its resolved path");
+    }
+
+    /// A served page carries the same relative paths and bases as a
+    /// mounted one and resolves every click the same way — and a page
+    /// that hydrated takes later frames on top of the served tree.
+    #[test]
+    fn a_served_page_resolves_clicks_as_a_mounted_one() {
+        let size = Size { width: 400.0, height: 400.0 };
+        let page = Counters { rows: State::new(counted(1..4)) };
+        let served = crate::ssr::render(&page, size);
+        assert!(served.html.contains("data-base=\""), "{}", served.html);
+        assert!(served.html.contains("data-path=\"~/"), "{}", served.html);
+
+        let runtime = Runtime::new();
+        let mut replay = crate::ssr::Replay::new(size);
+        replay.apply(&runtime.dom_frame(&page, size));
+        assert_eq!(replay.html(), served.html, "the mount and the served page are one tree");
+        assert_clicks_resolve(&replay, &runtime);
+
+        // the browser adopts the served page, and the next change lands
+        // on it — the served bases still hold the paths below them
+        let hydrated = Runtime::new();
+        hydrated.dom_adopt(&page, size);
+        assert!(hydrated.dom_frame(&page, size).is_empty());
+        page.rows.set(appended(&page.rows.get(), &counted(4..6)));
+        replay.apply(&hydrated.dom_frame(&page, size));
+        assert_clicks_resolve(&replay, &hydrated);
+        let more = target_of(&replay, "more", 2);
+        assert!(hydrated.dom_action(&more, 1));
+        assert_eq!(page.rows.get()[1].value.get(), 21);
+    }
+
+    /// The new words on the wire: a clone's base, a path told against
+    /// its base, a group's base alone — and a clone with no base, a path
+    /// under none.
+    #[test]
+    fn a_relative_path_and_its_bases_cross_the_wire() {
+        let patches = vec![
+            DomPatch::Clone { id: 9, parent: 0, before: 1, template: 1, base: Some(Rc::from("A/[2]")) },
+            DomPatch::SetPath { id: 3, path: Some(Rc::from("A/[1]/#0")), base_len: 5 },
+            DomPatch::SetBase { id: 12, base: Rc::from("A/[2]/B") },
+        ];
+        let expected: Vec<u8> = [
+            &3u32.to_le_bytes()[..],
+            &[17],
+            &9u32.to_le_bytes()[..],
+            &0u32.to_le_bytes()[..],
+            &1u32.to_le_bytes()[..],
+            &1u32.to_le_bytes()[..],
+            &5u16.to_le_bytes()[..],
+            b"A/[2]",
+            &[19],
+            &3u32.to_le_bytes()[..],
+            &4u16.to_le_bytes()[..],
+            b"~/#0",
+            &[26],
+            &12u32.to_le_bytes()[..],
+            &7u16.to_le_bytes()[..],
+            b"A/[2]/B",
+        ]
+        .concat();
+        assert_eq!(encode(&patches), expected);
+        let whole = encode(&[
+            DomPatch::Clone { id: 9, parent: 0, before: 0, template: 1, base: None },
+            DomPatch::SetPath { id: 2, path: Some(Rc::from("A/#0")), base_len: 0 },
+        ]);
+        let expected: Vec<u8> = [
+            &2u32.to_le_bytes()[..],
+            &[17],
+            &9u32.to_le_bytes()[..],
+            &0u32.to_le_bytes()[..],
+            &0u32.to_le_bytes()[..],
+            &1u32.to_le_bytes()[..],
+            &0u16.to_le_bytes()[..],
+            &[19],
+            &2u32.to_le_bytes()[..],
+            &4u16.to_le_bytes()[..],
+            b"A/#0",
+        ]
+        .concat();
+        assert_eq!(whole, expected);
+    }
+
+    /// The glue's half of the contract: it reads a base on every clone
+    /// and on op 26, and it resolves `~` against the nearest
+    /// `data-base` AT OR ABOVE the element — the element itself when
+    /// it carries one, as the engine tells a group's own path against
+    /// the group.
+    #[test]
+    fn the_glue_tells_a_relative_path_against_the_nearest_base() {
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        for (line, why) in [
+            ("if (base) el.setAttribute(\"data-base\", base);", "a copy's base lands on the element in hand"),
+            ("if (path === null || path.charCodeAt(0) !== 126) return path || \"\";", "a path without `~` is whole"),
+            ("const home = el.closest(\"[data-base]\");", "the base at or above the element, itself included"),
+            ("return home ? home.getAttribute(\"data-base\") + path.slice(1) : \"\";", "the base, then the rest"),
+            ("const path = target ? actionPath(target) : \"\";", "a click sends the path resolved"),
+            ("window.__bunnyPath = actionPath;", "drivers and probes read paths whole"),
+        ] {
+            assert!(glue.contains(line), "glue_dom.js: {why}");
+        }
+        let clone = glue.find("} else if (op === 17) {").expect("the glue reads the clone op");
+        let next = glue[clone + 1..].find("} else if (op ===").map_or(glue.len(), |at| clone + 1 + at);
+        let body = &glue[clone..next];
+        let read = body.find("const base = text(u16());").expect("op 17 reads the copy's base");
+        assert!(
+            read < body.find("if (source) {").expect("the clone"),
+            "op 17 reads its base whether or not the template stands"
+        );
+        assert!(glue.contains("} else if (op === 26) {"), "glue_dom.js reads op 26");
     }
 
     // MARK: - The ABI handshake
@@ -4664,6 +8253,36 @@ mod tests {
         assert!(
             module.contains(&pin),
             "glue/esm/bunny.js expects a different ABI than the engine encodes"
+        );
+    }
+
+    /// A string crosses as its count of bytes and then its UTF-8, and
+    /// the glue reads a short one of ASCII a byte at a time, each byte
+    /// being its char. That reading agrees with the decoder's only while
+    /// the count is of BYTES and the loop gives up at the first byte from
+    /// 0x80 up, leaving the whole string to the decoder; and the words
+    /// op must step over the bytes of an element it cannot find, or
+    /// every op after it reads from the middle of a string. The engine's
+    /// half is pinned on the wire, the glue's in its source.
+    #[test]
+    fn a_string_crosses_as_bytes_and_only_ascii_passes_the_decoder_by() {
+        // "é" is two bytes and one char: the count says three
+        let wire = encode(&[DomPatch::SetContent { id: 7, text: Arc::from("é1") }]);
+        assert_eq!(&wire[4..], &[20, 7, 0, 0, 0, 3, 0, 0, 0, 0xc3, 0xa9, b'1']);
+
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        for (line, why) in [
+            ("if (count === 0) return \"\";", "an empty string takes no view and no decoder"),
+            ("if (byte >= 0x80) break;", "a byte from 0x80 up hands the string to the decoder"),
+            ("return decoder.decode(bytes(count));", "the decoder reads what the loop gives up"),
+        ] {
+            assert!(glue.contains(line), "glue_dom.js: {why}");
+        }
+        let words = glue.find("} else if (op === 20) {").expect("the glue reads the words op");
+        let next = glue[words + 1..].find("} else if (op ===").map_or(glue.len(), |at| words + 1 + at);
+        assert!(
+            glue[words..next].contains("at += count;"),
+            "glue_dom.js: the words op steps over the bytes of an element it cannot find"
         );
     }
 
@@ -4803,5 +8422,57 @@ mod tests {
             include_str!("../../../apps/bench_web/web/glue_dom.js"),
             "bench_web ships a glue_dom.js that drifted from the canonical copy"
         );
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    /// The nodes a frame moves by the thousand: their size is a cost
+    /// of every create — printed here so a diet has a number to start
+    /// from, and pinned at the diet's sizes so a field added in passing
+    /// shows here before it shows in the memory a row list moves.
+    #[test]
+    fn the_scene_nodes_stay_small() {
+        use std::mem::size_of;
+        let sizes = [
+            ("DomNode", size_of::<super::DomNode>()),
+            ("DomStyle", size_of::<super::DomStyle>()),
+            ("DomKind", size_of::<super::DomKind>()),
+            ("DomText", size_of::<super::DomText>()),
+            ("DomLayout", size_of::<Option<super::DomLayout>>()),
+            ("DomHints", size_of::<super::DomHints>()),
+            ("DomPatch", size_of::<super::DomPatch>()),
+            ("DomPatch max", 96),
+            ("LayoutNode", size_of::<crate::layout::LayoutNode>()),
+            ("RenderNode", size_of::<motor::view::RenderNode>()),
+            ("FontSpec", size_of::<crate::text_engine::FontSpec>()),
+            ("Modifier", size_of::<crate::modifier::Modifier>()),
+        ];
+        for (name, size) in sizes {
+            eprintln!("size {name:<11} {size:>5} bytes");
+        }
+        // the bounds are the 64-bit sizes; a 32-bit target is smaller
+        // (wasm: DomNode 248, DomStyle 16, DomKind 56, Modifier 56); a
+        // placed element's box stays f64, the served page prints it. The
+        // node is the retention too: its element id and its rule are the
+        // eight bytes over 320, where a wrapper around every kept node
+        // was forty and a second vector per parent
+        assert!(size_of::<super::DomNode>() <= 328, "DomNode grew: box the rare record, not the node");
+        // the action path inline, the look and the marks boxed
+        assert!(size_of::<super::DomStyle>() <= 32, "DomStyle grew: a look's field belongs in DomLook");
+        // no kind wider than a text, the commonest: a wider one is boxed
+        assert!(size_of::<super::DomKind>() <= 72, "DomKind grew: box the new payload");
+        assert!(size_of::<super::DomText>() <= 72, "DomText grew");
+        // the flow record holds the wire's f32s
+        assert!(size_of::<Option<super::DomLayout>>() <= 84, "DomLayout grew: a length is an f32");
+        // a stack, a text and a style carry their hints and their action,
+        // the text the widest: a wrapper for each was a box per row
+        assert!(size_of::<crate::layout::LayoutNode>() <= 120, "LayoutNode grew: box the rare payload");
+        // a patch list is thousands long on a create: its slot must stay
+        // small, the fat records boxed
+        assert!(size_of::<super::DomPatch>() <= 96, "DomPatch grew: box the record, not the list");
+        // a view holds one per modifier, and a row's body is built and
+        // moved whole in every run: the rare wide payload is boxed
+        assert!(size_of::<crate::modifier::Modifier>() <= 80, "Modifier grew: box the wide payload");
     }
 }

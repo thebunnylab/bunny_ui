@@ -4,7 +4,7 @@
 use crate::combine::Store;
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use crate::hash::FxHashMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
@@ -166,9 +166,16 @@ pub struct EnvironmentValues {
 }
 
 /// Render-time context: environment values + collected effects.
+///
+/// The values are shared, and copied only when written: every body that
+/// runs keeps a copy of the context it ran in, so a skipped view can
+/// answer from cache — a thousand rows kept a thousand copies of the
+/// same values (the locale's identifier allocated in each), where a
+/// share is a count. A write goes through [`Rc::make_mut`], which copies
+/// the values once when anything else still holds them.
 #[derive(Clone, Default)]
 pub struct Context {
-    pub values: EnvironmentValues,
+    pub values: Rc<EnvironmentValues>,
     pub(crate) effects: Rc<RefCell<Vec<EffectFn>>>,
 }
 
@@ -313,10 +320,13 @@ impl<T> TypedArena<T> {
 thread_local! {
     /// One arena per `TypeId` — the `dyn Any` wraps the ARENA (cold edge,
     /// one downcast per access to the typed container), never the value.
-    static ARENAS: RefCell<HashMap<TypeId, Rc<dyn Any>>> = RefCell::new(HashMap::new());
+    /// Every read and write of a state looks its arena up here, so the
+    /// key is hashed the cheap way: a `TypeId` is the compiler's, never an
+    /// outside caller's.
+    static ARENAS: RefCell<FxHashMap<TypeId, Rc<dyn Any>>> = RefCell::new(FxHashMap::default());
     /// How the sweep frees without knowing `T`: one function pointer per
     /// type, registered when the arena is born.
-    static FREERS: RefCell<HashMap<TypeId, fn(usize)>> = RefCell::new(HashMap::new());
+    static FREERS: RefCell<FxHashMap<TypeId, fn(usize)>> = RefCell::new(FxHashMap::default());
     static NEXT_DEP: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -551,5 +561,20 @@ mod tests {
         binding.set(5);
         assert!( *fired.borrow());
         assert_eq!(state.wrappedValue(), 5);
+    }
+
+    /// A copy of a context shares its values — what every retained body
+    /// keeps costs a count, not a copy of the locale — and a write copies
+    /// them once, leaving every other holder with the values it had.
+    #[test]
+    fn a_context_copy_shares_its_values_until_one_is_written() {
+        let mut ctx = Context::default();
+        ctx.values = Rc::new(EnvironmentValues { locale: Locale::new("pt-BR"), ..EnvironmentValues::default() });
+        let kept = ctx.clone();
+        assert!(Rc::ptr_eq(&kept.values, &ctx.values), "a copy shares the values");
+        Rc::make_mut(&mut ctx.values).locale = Locale::new("en");
+        assert!(!Rc::ptr_eq(&kept.values, &ctx.values), "the write copied them");
+        assert_eq!(kept.values.locale.identifier, "pt-BR", "and the copy kept what it had");
+        assert_eq!(ctx.environment::<Locale>().identifier, "en");
     }
 }

@@ -30,7 +30,7 @@ import { attach as attachGpu } from "./bunny_gpu.js";
 // the key table, the modifier bits, the import/export surface. The
 // wasm exports its own number; `attach` compares the two and refuses a
 // pairing this mirror was not written for.
-export const EXPECTED_ABI = 11;
+export const EXPECTED_ABI = 17;
 
 const IN_WORKER = typeof window === "undefined";
 const WAKE_CHANNEL = "bunny-wake";
@@ -224,6 +224,11 @@ export function js_request_frame() {
 // crosses on the channel the page listens to. (Every tab of the same
 // origin hears it too; a spare wake is one settled frame, never a
 // fault.)
+// The page's clock, for the engine's stage timers.
+export function js_now() {
+  return performance.now();
+}
+
 export function js_request_wake() {
   if (IN_WORKER) {
     wakeChannelOnce().postMessage(0);
@@ -235,7 +240,7 @@ export function js_request_wake() {
 // Dom-mode imports — the single binary carries both shells, and this
 // module only ever drives the canvas one.
 export function js_apply_patches() {}
-export function js_island() {}
+export function js_island_rect() {}
 
 // MARK: - The media registry and the host overlay (`docs/video.md`)
 

@@ -78,6 +78,10 @@ impl<V: View<Arity = Single>> UnaryView for V {}
 pub struct NodeList {
     nodes: Vec<RenderNode>,
     layout: Vec<crate::layout::LayoutNode>,
+    /// How many layout nodes the list was told to expect before its
+    /// first one arrived ([`NodeList::expect_layout`]) — zero when no
+    /// one said.
+    expected: usize,
 }
 
 thread_local! {
@@ -98,6 +102,17 @@ pub(crate) fn set_print(enabled: bool) {
     PRINT.with(|print| print.set(enabled));
 }
 
+/// Wraps a node where it stands: the node leaves its slot for `wrap`,
+/// and what `wrap` makes takes the slot. A unit node holds the place
+/// meanwhile; the list around it never shifts.
+pub(crate) fn wrap_in_place(
+    slot: &mut crate::layout::LayoutNode,
+    wrap: impl FnOnce(crate::layout::LayoutNode) -> crate::layout::LayoutNode,
+) {
+    let node = std::mem::replace(slot, crate::layout::LayoutNode::Spacer);
+    *slot = wrap(node);
+}
+
 /// A box of nothing: zero on both axes, no paint, no hit — what a
 /// modifier wraps when the view below it has no geometry at all.
 fn nothing_node() -> crate::layout::LayoutNode {
@@ -106,6 +121,8 @@ fn nothing_node() -> crate::layout::LayoutNode {
         spacing: 0.0,
         align: crate::layout::CrossAlign::Start,
         children: Vec::new(),
+        hints: Default::default(),
+        action: None,
     }
 }
 
@@ -115,11 +132,46 @@ impl NodeList {
     }
 
     pub(crate) fn push(&mut self, node: RenderNode) {
-        self.nodes.push(node);
+        // the printed tree is for people: a frame's pass prints nothing,
+        // and a line kept for every node of the page was memory nobody
+        // read — the retention built without print is rebuilt once when
+        // a print is asked for
+        if print_enabled() {
+            self.nodes.push(node);
+        }
     }
 
     pub(crate) fn push_layout(&mut self, node: crate::layout::LayoutNode) {
+        self.room_for_first();
         self.layout.push(node);
+    }
+
+    /// Room for `more` layout nodes, made once — a list knows how many
+    /// rows it is about to add, and a thousand pushes grew the list ten
+    /// times, each growth a copy of every node before it.
+    pub(crate) fn reserve_layout(&mut self, more: usize) {
+        self.layout.reserve(more);
+    }
+
+    /// Says how many layout nodes are about to arrive — a tuple knows
+    /// its arity — while the list has none and no room for one. The room
+    /// is made when the first node arrives, for exactly that many: a body
+    /// of five cells grew from four to eight, two allocations where one
+    /// does, and a stack of one child held room for four. A child that
+    /// adds nothing (`empty()`) makes no room at all. A count said inside
+    /// another (a tuple first in a tuple) keeps the larger.
+    pub(crate) fn expect_layout(&mut self, count: usize) {
+        if self.layout.capacity() == 0 {
+            self.expected = self.expected.max(count);
+        }
+    }
+
+    /// The room the expected count asks for, made as the first node
+    /// arrives. With no count said, the list grows as a list grows.
+    fn room_for_first(&mut self) {
+        if self.layout.capacity() == 0 && self.expected > 0 {
+            self.layout.reserve_exact(self.expected);
+        }
     }
 
     /// Wraps the last layout node (the one from the Single view that just
@@ -142,34 +194,53 @@ impl NodeList {
     /// box — SwiftUI's own answer, where the frame IS a view and
     /// `EmptyView` merely fills none of it. Bare `empty()` still
     /// contributes nothing to a stack: only a modifier mints the box.
+    ///
+    /// The node is wrapped where it stands ([`wrap_in_place`]), never
+    /// removed from the list and inserted again: a row's every modifier
+    /// does this.
     pub(crate) fn wrap_layout_from(
         &mut self,
         mark: usize,
         wrap: impl FnOnce(crate::layout::LayoutNode) -> crate::layout::LayoutNode,
     ) {
-        let base = if self.layout.len() > mark {
-            self.layout.remove(mark)
-        } else {
-            nothing_node()
-        };
-        self.layout.insert(mark, wrap(base));
+        wrap_in_place(self.base_from(mark), wrap);
+    }
+
+    /// The node the base contributed since `mark`, where it stands — or,
+    /// when it left none, the box of nothing a modifier wraps, put in its
+    /// place ([`NodeList::wrap_layout_from`]). A modifier that folds into
+    /// the node itself — a hint or an action it carries, a padding over a
+    /// padding — writes it here, and nothing moves.
+    pub(crate) fn base_from(&mut self, mark: usize) -> &mut crate::layout::LayoutNode {
+        if self.layout.len() <= mark {
+            self.room_for_first();
+            self.layout.push(nothing_node());
+        }
+        &mut self.layout[mark]
     }
 
     /// A retained boundary: enters as a reference (the marked line in the
     /// print, the reference node in the layout) and the final assembly
     /// expands against the reconciler.
-    pub(crate) fn push_view_ref(&mut self, path: &str) {
+    pub(crate) fn push_view_ref(
+        &mut self,
+        path: &std::rc::Rc<str>,
+        slot: Option<std::rc::Rc<crate::reconciler::Slot>>,
+    ) {
         // the marked line is what a PRINT expands; a frame's pass prints
         // nothing, and a line for each boundary of the page was a string
         // nobody read
-        self.nodes.push(RenderNode::leaf(if print_enabled() {
+        self.push(RenderNode::leaf(if print_enabled() {
             crate::reconciler::ref_line(path)
         } else {
             String::new()
         }));
-        self.layout.push(crate::layout::LayoutNode::BoundaryRef {
-            path: path.to_string(),
-            slot: crate::reconciler::slot_of(path),
+        self.push_layout(crate::layout::LayoutNode::BoundaryRef {
+            path: std::rc::Rc::clone(path),
+            // the slot the decision already found, or the one a body
+            // that just ran filed its entry under
+            slot: slot.unwrap_or_else(|| crate::reconciler::slot_of(path)),
+            hints: crate::layout::ElementHints::default(),
         });
     }
 
@@ -199,7 +270,11 @@ impl NodeList {
     pub(crate) fn root_boundary(&self) -> Option<&str> {
         match self.layout.as_slice() {
             [crate::layout::LayoutNode::Boundary { path, .. }] => Some(path),
-            [crate::layout::LayoutNode::BoundaryRef { path, .. }] => Some(path),
+            // a hinted root is not the bare boundary a stable frame
+            // stands in for it — its hints would be lost
+            [crate::layout::LayoutNode::BoundaryRef { path, hints, .. }] if hints.is_empty() => {
+                Some(&**path)
+            }
             _ => None,
         }
     }
@@ -222,6 +297,11 @@ impl NodeList {
 /// runtime clones before calling.
 pub trait Component: Clone + 'static {
     fn body(self, ctx: &Context) -> impl View;
+
+    /// The framework's own keyed list stands behind a boundary whose
+    /// rows are kept by key when it re-runs. Only that list says so.
+    #[doc(hidden)]
+    const KEYED_LIST: bool = false;
 }
 
 // MARK: - Rendering a component without stacking its payload
@@ -251,25 +331,40 @@ fn run_body<'a, T: Component>(view: &T, ctx: &'a Context) -> impl View + use<'a,
     view.clone().body(ctx)
 }
 
-/// Files the finished body under its identity.
+/// Files the finished body under its identity, and puts the reference
+/// to it in the parent's list — holding the slot the entry was just
+/// filed with, which no search has to find again.
 ///
 /// Everything here runs AFTER the descent and needs a slot for nothing
 /// during it — including the second copy of the payload, the one the
 /// retention keeps so a skipped view can answer from cache.
 #[inline(never)]
-fn retain_entry<T: Component>(view: &T, ctx: &Context, path: &str, body: NodeList) {
+fn retain_entry<T: Component>(
+    view: &T,
+    ctx: &Context,
+    path: &std::rc::Rc<str>,
+    retained: bool,
+    body: NodeList,
+    out: &mut NodeList,
+) {
     let (print_children, layout_children) = body.into_parts();
-    crate::reconciler::finish_entry(
+    // the name is the print's, and only a print reads it: a frame's pass
+    // keeps none — a retention built without print is rebuilt before
+    // anything prints it ([`crate::runtime::Runtime::render`])
+    let name = if print_enabled() { short_type_name::<T>() } else { "" };
+    let slot = crate::reconciler::finish_entry(
         path,
+        retained,
         crate::erased::erased_from(view),
         ctx.clone(),
-        RenderNode::branch(short_type_name::<T>(), print_children),
+        RenderNode::branch(name, print_children),
         crate::layout::LayoutNode::Boundary {
-            path: std::rc::Rc::from(path),
+            path: std::rc::Rc::clone(path),
             children: layout_children,
             quiet: Default::default(),
         },
     );
+    out.push_view_ref(path, Some(slot));
 }
 
 /// The same tail, for a render with no pass around it: nothing is
@@ -297,33 +392,54 @@ impl<T: Component> View for T {
         // `State::new` fired by the children's constructors anchors to this identity.
         let _frame = motor::identity::enter_view(short_type_name::<T>());
 
-        // No active pass (render outside the Runtime): direct path, no
-        // retention — the pre-reconciler behavior.
-        let Some(path) = motor::identity::current_view_path() else {
-            let mut body = NodeList::new();
-            run_body(self, ctx).render_into(ctx, &mut body);
-            close_loose::<T>(body, out);
-            return;
-        };
-
-        // A clean, retained boundary, outside any re-running body: the
-        // body does NOT run — a reference goes out and the cache answers for it.
-        if let crate::reconciler::Decision::Skip = crate::reconciler::decide(&path) {
-            motor::identity::mark_skipped(&path);
-            out.push_view_ref(&path);
-            return;
+        // The decision is made on the cursor's own path, borrowed: a
+        // boundary the page retains hands back the one copy of its path
+        // it already holds, and a boundary that is skipped costs no copy
+        // at all — a thousand kept rows are a thousand lookups, not a
+        // thousand strings.
+        enum Road {
+            Loose,
+            Skip(std::rc::Rc<str>, std::rc::Rc<crate::reconciler::Slot>),
+            /// The body runs: the path, and whether the retention held
+            /// the boundary — a fresh mount has no last entry to replace.
+            Run(std::rc::Rc<str>, bool),
         }
+        let road = motor::identity::with_current_view_path(|path| match path {
+            None => Road::Loose,
+            Some(path) => match crate::reconciler::decide_at(path) {
+                (crate::reconciler::Decision::Skip, Some((key, slot))) => Road::Skip(key, slot),
+                (_, Some((key, _))) => Road::Run(key, true),
+                (_, None) => Road::Run(std::rc::Rc::from(path), false),
+            },
+        });
+        let (path, retained) = match road {
+            // No active pass (render outside the Runtime): direct path, no
+            // retention — the pre-reconciler behavior.
+            Road::Loose => {
+                let mut body = NodeList::new();
+                run_body(self, ctx).render_into(ctx, &mut body);
+                close_loose::<T>(body, out);
+                return;
+            }
+            // A clean, retained boundary, outside any re-running body: the
+            // body does NOT run — a reference goes out and the cache answers for it.
+            Road::Skip(path, slot) => {
+                motor::identity::mark_skipped(&path);
+                out.push_view_ref(&path, Some(slot));
+                return;
+            }
+            Road::Run(path, retained) => (path, retained),
+        };
 
         // The body will run: this view's old reads drop (the new set is
         // whatever this body registers) and the effects it pushes
         // belong to the new entry.
         motor::identity::mark_reran(&path);
         motor::identity::begin_view_reads(&path);
-        crate::reconciler::begin_entry(&path);
+        crate::reconciler::begin_entry(&path, T::KEYED_LIST);
         let mut body = NodeList::new();
         run_body(self, ctx).render_into(ctx, &mut body);
-        retain_entry(self, ctx, &path, body);
-        out.push_view_ref(&path);
+        retain_entry(self, ctx, &path, retained, body, out);
     }
 }
 
@@ -392,8 +508,9 @@ impl<C: View> View for Vec<C> {
     type Arity = Many;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        out.expect_layout(self.len());
         for (position, view) in self.iter().enumerate() {
-            let _frame = motor::identity::enter(format!("#{position}"));
+            let _frame = motor::identity::enter(position_segment(position));
             view.render_into(ctx, out);
         }
     }
@@ -413,9 +530,13 @@ macro_rules! tuple_view {
                 // the same type do not get confused, and an empty `Option` does
                 // not shift the indices (the structure is static, not the emitted nodes).
                 let mut position = 0usize;
+                // one node a child, as a rule: room for the arity, made
+                // when the first one arrives
+                const ARITY: usize = [$(stringify!($name)),+].len();
+                out.expect_layout(ARITY);
                 $(
                     {
-                        let _frame = motor::identity::enter(format!("#{position}"));
+                        let _frame = motor::identity::enter(position_segment(position));
                         $name.render_into(ctx, out);
                         position += 1;
                     }
@@ -452,11 +573,29 @@ pub(crate) fn render_line(view: &impl View) -> String {
         .unwrap_or_default()
 }
 
-pub(crate) fn short_type_name<T: ?Sized>() -> String {
+pub(crate) fn short_type_name<T: ?Sized>() -> &'static str {
     let full = std::any::type_name::<T>();
     // generics: `path::DetailRow<bunny_ui::views::Text>` → `DetailRow`
     let base = full.split('<').next().unwrap_or(full);
-    base.rsplit("::").next().unwrap_or(base).to_string()
+    // the last `::` ends at the last `:` — a type's path never holds one
+    // alone — so a byte search finds it. Every boundary the walk meets
+    // names itself here, a thousand kept rows included, and the search
+    // for the two-byte pattern built a searcher each time
+    base.rfind(':').map_or(base, |at| &base[at + 1..])
+}
+
+/// The identity segment of a tuple position — a static word for the
+/// positions a body has, so a step down a tuple allocates nothing.
+pub(crate) fn position_segment(position: usize) -> std::borrow::Cow<'static, str> {
+    const POSITIONS: [&str; 32] = [
+        "#0", "#1", "#2", "#3", "#4", "#5", "#6", "#7", "#8", "#9", "#10", "#11", "#12", "#13", "#14",
+        "#15", "#16", "#17", "#18", "#19", "#20", "#21", "#22", "#23", "#24", "#25", "#26", "#27",
+        "#28", "#29", "#30", "#31",
+    ];
+    match POSITIONS.get(position) {
+        Some(word) => std::borrow::Cow::Borrowed(word),
+        None => std::borrow::Cow::Owned(format!("#{position}")),
+    }
 }
 
 #[cfg(test)]
@@ -549,6 +688,122 @@ mod tests {
             .expect("the probe finished")
     }
 
+    /// A tuple says its arity, and the list makes room for exactly that
+    /// many as the first node arrives: five cells take five slots, once.
+    /// A tuple of one child that adds nothing makes no room at all; a
+    /// tuple first inside a tuple keeps the larger count and grows past
+    /// it like any list; a `Vec` of views says its length the same way.
+    #[test]
+    fn a_tuple_makes_room_for_its_arity_when_its_first_node_arrives() {
+        let ctx = Context::default();
+        let room = |view: &dyn Fn(&mut NodeList)| {
+            let mut out = NodeList::new();
+            view(&mut out);
+            (out.layout.len(), out.layout.capacity())
+        };
+        assert_eq!(room(&|out| (text("a"), text("b"), text("c"), text("d"), text("e")).render_into(&ctx, out)), (5, 5));
+        assert_eq!(room(&|out| (text("a"),).render_into(&ctx, out)), (1, 1));
+        assert_eq!(room(&|out| (crate::views::empty(),).render_into(&ctx, out)), (0, 0), "nothing arrived: no room made");
+        let (len, capacity) = room(&|out| ((text("a"), text("b")), text("c"), text("d"), text("e")).render_into(&ctx, out));
+        assert_eq!(len, 5);
+        assert!(capacity >= 5, "a tuple inside a tuple grows past the count it kept: {capacity}");
+        assert_eq!(room(&|out| vec![text("a"), text("b"), text("c")].render_into(&ctx, out)), (3, 3));
+    }
+
+    /// A modifier that folds into the node its base left writes it where
+    /// it stands, and the tree is the one a wrap made: the outer hint wins
+    /// a word both say, over a text, a hint, a style or a box of nothing;
+    /// paddings add; a style merges into a style that wears nothing of its
+    /// own and nests around one that does; a sibling the base did not
+    /// leave is never touched.
+    #[test]
+    fn a_fold_writes_the_node_where_it_stands() {
+        use crate::ext::ViewExt as _;
+        use crate::layout::{Edges, LayoutNode};
+        let ctx = Context::default();
+        let tree = |view: &dyn Fn(&mut NodeList)| {
+            let mut out = NodeList::new();
+            view(&mut out);
+            out.take_layout()
+        };
+        let words = |hints: &crate::layout::ElementHints| {
+            [&hints.tag, &hints.class, &hints.dom_id].map(|word| word.as_deref().map(str::to_string))
+        };
+        let said = |words: [Option<&str>; 3]| words.map(|word| word.map(str::to_string));
+
+        let text_hinted = tree(&|out| {
+            text("a").element("td").css_class("x").element("th").render_into(&ctx, out)
+        });
+        let [LayoutNode::Text { hints, .. }] = text_hinted.as_slice() else {
+            panic!("one text: {text_hinted:#?}");
+        };
+        assert_eq!(words(hints), said([Some("th"), Some("x"), None]));
+
+        let nothing = tree(&|out| crate::views::empty().element("td").render_into(&ctx, out));
+        let [LayoutNode::Stack { children, hints, .. }] = nothing.as_slice() else {
+            panic!("a box of nothing: {nothing:#?}");
+        };
+        assert!(children.is_empty());
+        assert_eq!(words(hints), said([Some("td"), None, None]));
+
+        let hinted = tree(&|out| {
+            text("a").frame_width(10.0).element("td").css_class("x").element_id("i").css_class("y").render_into(&ctx, out)
+        });
+        let [LayoutNode::Hinted { tag, class, dom_id, child }] = hinted.as_slice() else {
+            panic!("one hint around the frame: {hinted:#?}");
+        };
+        assert!(matches!(**child, LayoutNode::Frame { .. }), "{hinted:#?}");
+        assert_eq!(
+            [tag, class, dom_id].map(|word| word.as_deref().map(str::to_string)),
+            said([Some("td"), Some("y"), Some("i")])
+        );
+
+        let padded = tree(&|out| {
+            text("a")
+                .padding_edge(motor::views::Edge::Top, 3.0)
+                .padding_edge(motor::views::Edge::Bottom, 5.0)
+                .padding_length(1.0)
+                .render_into(&ctx, out)
+        });
+        let [LayoutNode::Padding { edges, child }] = padded.as_slice() else {
+            panic!("one padding: {padded:#?}");
+        };
+        assert_eq!(*edges, Edges { top: 4.0, bottom: 6.0, leading: 1.0, trailing: 1.0 });
+        assert!(matches!(**child, LayoutNode::Text { .. }));
+
+        let (ink, paper) = (crate::layout::Color::hex(0x336699), crate::layout::Color::hex(0x112233));
+        let styled = tree(&|out| text("a").foreground_color(ink).background_color(paper).render_into(&ctx, out));
+        let [LayoutNode::Styled { props, child, .. }] = styled.as_slice() else {
+            panic!("one style: {styled:#?}");
+        };
+        assert_eq!((props.foreground, props.background), (Some(ink), Some(paper)));
+        assert!(matches!(**child, LayoutNode::Text { .. }));
+
+        // a style that wears a hint takes the next hint, and nests the
+        // next style around it
+        let worn = tree(&|out| {
+            text("a").background_color(paper).css_class("x").foreground_color(ink).render_into(&ctx, out)
+        });
+        let [LayoutNode::Styled { props: outer, child, hints: none, .. }] = worn.as_slice() else {
+            panic!("a style around a style: {worn:#?}");
+        };
+        let LayoutNode::Styled { props: inner, hints, .. } = &**child else {
+            panic!("a style around a style: {worn:#?}");
+        };
+        assert!(none.is_empty());
+        assert_eq!((outer.foreground, outer.background), (Some(ink), None));
+        assert_eq!((inner.foreground, inner.background), (None, Some(paper)));
+        assert_eq!(words(hints), said([None, Some("x"), None]));
+
+        let siblings = tree(&|out| (text("a"), text("b").element("td")).render_into(&ctx, out));
+        let [LayoutNode::Text { hints: first, .. }, LayoutNode::Text { hints: second, .. }] = siblings.as_slice()
+        else {
+            panic!("two texts: {siblings:#?}");
+        };
+        assert!(first.is_empty(), "the sibling before the base is not the base's");
+        assert_eq!(words(second), said([Some("td"), None, None]));
+    }
+
     /// How many times a component's payload is re-materialized per
     /// level of the render recursion.
     ///
@@ -580,5 +835,38 @@ mod tests {
              (slim {slim} B, fat {fat} B, {added} B of payload apart) — \
              a copy of `self` is being named in the recursive frame again",
         );
+    }
+
+    /// A boundary's name is its type's last path segment before the
+    /// generics — the identity segment every retained path is spelled
+    /// with, so the byte search must name each type as the reading by
+    /// `::` always did: plain, generic, nested, a closure, a tuple, a
+    /// primitive, a reference and a trait object.
+    #[test]
+    fn a_boundary_is_named_as_the_path_reading_named_it() {
+        fn by_path<T: ?Sized>() -> &'static str {
+            let full = std::any::type_name::<T>();
+            let base = full.split('<').next().unwrap_or(full);
+            base.rsplit("::").next().unwrap_or(base)
+        }
+        fn check<T: ?Sized>() {
+            assert_eq!(short_type_name::<T>(), by_path::<T>(), "{}", std::any::type_name::<T>());
+        }
+        let closure = || 1u8;
+        fn named<T>(_: &T) -> (&'static str, &'static str) {
+            (short_type_name::<T>(), by_path::<T>())
+        }
+        check::<Runtime>();
+        check::<State<Vec<Option<String>>>>();
+        check::<crate::views::ForEach<Vec<u8>, fn(&u8) -> String, fn(&u8) -> crate::views::Text>>();
+        check::<(Runtime, crate::layout::Size)>();
+        check::<u64>();
+        check::<&'static str>();
+        check::<dyn Fn(u8) -> u8>();
+        check::<[Size; 3]>();
+        let (short, path) = named(&closure);
+        assert_eq!(short, path, "a closure");
+        assert_eq!(short_type_name::<Runtime>(), "Runtime");
+        assert_eq!(short_type_name::<State<Vec<u8>>>(), "State");
     }
 }

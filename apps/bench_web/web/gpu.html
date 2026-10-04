@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>bunny_ui — finder on the web</title>
+    <title>bunny_ui — keyed benchmark, pixels</title>
     <style>
       html,
       body {
@@ -13,14 +13,19 @@
         place-items: center;
       }
       #app {
-        width: 760px;
-        height: 640px;
+        width: 900px;
+        height: 800px;
         outline: none;
       }
     </style>
   </head>
   <body>
     <div id="app" tabindex="0"></div>
+    <script>
+      // the whole page through the pixel pipeline
+      window.BUNNY_WASM = "bench_web_px.wasm";
+      window.BUNNY_START = "start_keyed_gpu";
+    </script>
     <script src="surface.js?v=14"></script>
     <script src="glue_gl.js?v=14"></script>
     <script src="glue.js?v=15"></script>
