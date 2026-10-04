@@ -1203,11 +1203,24 @@ impl ElementHints {
 /// An element's address: its `id`, and where it goes when it is a link
 /// (`.link(…)`). Rare beside the tag and the class, so the hints hold
 /// it behind one shared word ([`Address::over`]).
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Address {
     pub dom_id: Option<Rc<str>>,
     pub href: Option<Rc<str>>,
 }
+
+thread_local! {
+    /// The addresses a page speaks, each held once — as the words in
+    /// them are. A row's `.element_id("first")` is the same address a
+    /// thousand times over; it should cost a thousand pointer bumps,
+    /// not a thousand records.
+    static ADDRESSES: std::cell::RefCell<motor::hash::FxHashSet<Rc<Address>>> =
+        std::cell::RefCell::new(motor::hash::FxHashSet::default());
+}
+
+/// The addresses a page may speak before the table stops growing: a
+/// page that mints an id per row keeps its own records past this.
+const SHARED_ADDRESSES: usize = 4096;
 
 impl Address {
     /// `base` with the words an outer hint speaks written over it —
@@ -1227,7 +1240,22 @@ impl Address {
         if href.is_some() {
             address.href.clone_from(href);
         }
-        Some(Rc::new(address))
+        Some(Address::shared(address))
+    }
+
+    /// One shared copy of an address.
+    fn shared(address: Address) -> Rc<Address> {
+        ADDRESSES.with(|addresses| {
+            let mut addresses = addresses.borrow_mut();
+            if let Some(shared) = addresses.get(&address) {
+                return Rc::clone(shared);
+            }
+            let shared = Rc::new(address);
+            if addresses.len() < SHARED_ADDRESSES {
+                addresses.insert(Rc::clone(&shared));
+            }
+            shared
+        })
     }
 }
 
