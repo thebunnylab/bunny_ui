@@ -57,6 +57,8 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_void_f64(obj: Id, sel: Sel, a: f64);
     #[link_name = "objc_msgSend"]
+    fn msg_id_f64(obj: Id, sel: Sel, a: f64) -> Id;
+    #[link_name = "objc_msgSend"]
     fn msg_void_u32(obj: Id, sel: Sel, a: u32);
     #[link_name = "objc_msgSend"]
     fn msg_f64(obj: Id, sel: Sel) -> f64;
@@ -275,6 +277,10 @@ pub enum AppEvent {
     /// step. The frame the shell already knows how to draw drains the
     /// queue on its way.
     Wake,
+    /// The task clock's alarm: a sleeper's deadline came. The shell aims
+    /// one timer at the nearest deadline after every turn, so a sleeper
+    /// never asks the display link to beat for it.
+    Tasks,
     /// The reader chose a menu item this window answers — a command from
     /// the menu bar, or a standard edit sent to this window's view.
     Menu(Pick),
@@ -530,7 +536,9 @@ fn hold(queue: &mut std::collections::VecDeque<(usize, AppEvent)>, source: usize
                 *held = (*held + dt).min(1.0 / 30.0);
                 return;
             }
-            (AppEvent::Wake, AppEvent::Wake) | (AppEvent::Blink, AppEvent::Blink) => return,
+            (AppEvent::Wake, AppEvent::Wake)
+            | (AppEvent::Blink, AppEvent::Blink)
+            | (AppEvent::Tasks, AppEvent::Tasks) => return,
             _ => {}
         }
     }
@@ -1275,6 +1283,10 @@ extern "C" fn bunny_slow(_this: Id, _sel: Sel, _timer: Id) {
     dispatch_all(AppEvent::Frame { dt });
 }
 
+extern "C" fn bunny_tasks(_this: Id, _sel: Sel, _timer: Id) {
+    dispatch_all(AppEvent::Tasks);
+}
+
 extern "C" fn bunny_window_did_resize(_this: Id, _sel: Sel, note: Id) {
     window_frame_changed(note, "resize");
 }
@@ -1666,6 +1678,13 @@ thread_local! {
     static SLOW: Cell<(Id, f64)> = const { Cell::new((std::ptr::null_mut(), 0.0)) };
     /// The window delegate — the target the slow timer fires at.
     static DELEGATE: Cell<Id> = const { Cell::new(std::ptr::null_mut()) };
+    /// The task clock's alarm: one repeating timer with a far period,
+    /// re-aimed at the nearest sleeper's deadline with `setFireDate:` — a
+    /// timer made and invalidated per deadline churned the run loop.
+    static TASKS: Cell<Id> = const { Cell::new(std::ptr::null_mut()) };
+    /// Where the alarm points now, by the wall; a re-aim within half a
+    /// millisecond of it is skipped.
+    static TASKS_AIM: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
 }
 
 /// How fast the shell drives frames — the ffi twin of the runtime's
@@ -1717,6 +1736,65 @@ pub fn want_beat(window: usize, pace: DriverPace) -> bool {
     });
     set_frame_driver(effective);
     effective == DriverPace::Full
+}
+
+/// The far period of the task alarm: it fires only where it is aimed.
+const TASKS_FAR: f64 = 3600.0;
+
+/// Aims the task alarm at the nearest sleeper's deadline, `left` seconds
+/// away — or parks it (`None`) when no task sleeps. The alarm fires
+/// [`AppEvent::Tasks`]; the handler brings the task clock up to the wall,
+/// polls, and asks the engine whether anything changed. A sleeper no
+/// longer keeps the display link beating.
+pub fn aim_tasks(left: Option<f64>) {
+    let delegate = DELEGATE.with(|slot| slot.get());
+    if delegate.is_null() {
+        return;
+    }
+    let timer = TASKS.with(|slot| {
+        let timer = slot.get();
+        if !timer.is_null() {
+            return timer;
+        }
+        let fresh = unsafe {
+            msg_timer(
+                class("NSTimer"),
+                sel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+                TASKS_FAR,
+                delegate,
+                sel("bunnyTasks:"),
+                std::ptr::null_mut(),
+                1,
+            )
+        };
+        // a millisecond of tolerance lets the system fold the alarm into
+        // a wake it makes anyway
+        unsafe { msg_void_f64(fresh, sel("setTolerance:"), 0.001) };
+        slot.set(fresh);
+        fresh
+    });
+    match left {
+        None => {
+            if TASKS_AIM.with(|aim| aim.replace(None)).is_some() {
+                let far = unsafe { msg_id(class("NSDate"), sel("distantFuture")) };
+                unsafe { msg_void_id(timer, sel("setFireDate:"), far) };
+            }
+        }
+        Some(left) => {
+            let left = left.max(0.0005);
+            let target = std::time::Instant::now() + std::time::Duration::from_secs_f64(left);
+            let same = TASKS_AIM.with(|aim| aim.get()).is_some_and(|aim| {
+                let apart = if aim > target { aim - target } else { target - aim };
+                apart < std::time::Duration::from_micros(500)
+            });
+            if same {
+                return;
+            }
+            TASKS_AIM.with(|aim| aim.set(Some(target)));
+            let date = unsafe { msg_id_f64(class("NSDate"), sel("dateWithTimeIntervalSinceNow:"), left) };
+            unsafe { msg_void_id(timer, sel("setFireDate:"), date) };
+        }
+    }
 }
 
 /// Points the frame driver at the pace the moment deserves. Without a
@@ -2068,6 +2146,12 @@ unsafe fn register_classes() {
             delegate,
             sel("bunnySlow:"),
             bunny_slow as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            delegate,
+            sel("bunnyTasks:"),
+            bunny_tasks as *const c_void,
             types.as_ptr(),
         );
         class_addMethod(

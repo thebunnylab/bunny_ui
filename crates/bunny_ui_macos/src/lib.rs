@@ -50,6 +50,9 @@ fn sync_frame_driver(runtime: &Runtime, pacer: &FramePacer, window: usize) {
             bunny_ui::anim::FramePace::Idle => ffi::DriverPace::Off,
         }
     };
+    // the task alarm follows the nearest sleeper; it is no reason for
+    // the display to beat
+    ffi::aim_tasks(runtime.next_task_wake());
     // the `D` line: the driver's pace, when it changes — a tape of a
     // scene at rest must end on `off`
     if trace::active() {
@@ -703,6 +706,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // one more turn; the frame it takes drains the queue on its way
     ffi::install_wake_source();
     runtime.set_wake_hook(std::sync::Arc::new(ffi::wake_from_any_thread));
+    // the sleepers' clock is the wall, and their alarm is the shell's own
+    // timer (`ffi::aim_tasks`): a poller thirty milliseconds away no
+    // longer keeps the display link beating at full rate
+    runtime.drive_tasks_by_wall();
     // the cursor AppKit puts back between two of the shell's turns
     ffi::install_cursor_keeper();
     // two owners: the keyboard gate and the event handler
@@ -1437,6 +1444,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         let pacer = Rc::clone(&pacer);
         let resizing = Rc::clone(&resizing);
         move |runtime: &Runtime, root: &_, via: trace::Origin| {
+            // a sleeper due by now wakes before the settle polls
+            runtime.advance_tasks_to_now();
             // the handles' commands are spent BEFORE the frame
             // renders: the state an expired eval writes lands in this
             // very layout, and a navigation the app just asked for is
@@ -1905,7 +1914,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 blit(runtime, root, trace::Origin::Input);
             }
         }
-        AppEvent::Wake => {
+        AppEvent::Wake | AppEvent::Tasks => {
+            // a sleeper whose deadline passed wakes first: the alarm
+            // rang for it, or a worker's knock came by
+            runtime.advance_tasks_to_now();
             // Mid-drag there is exactly ONE presenter — the law the
             // tick path already obeys below. A worker's wake used to
             // present a whole scene between two steps of the resize:
