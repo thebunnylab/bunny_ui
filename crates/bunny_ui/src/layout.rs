@@ -2614,7 +2614,6 @@ thread_local! {
         std::cell::RefCell::new(HashMap::default());
 }
 
-/// Drops every kept picture — a newborn world starts with none.
 thread_local! {
     /// Can the shell show a box's overlay on a layer of its own? Set by
     /// the runtime before each layout from the shell's word; off, a box
@@ -2640,6 +2639,7 @@ pub(crate) fn pictures_len() -> usize {
     PICTURES.with(|pictures| pictures.borrow().len())
 }
 
+/// Drops every kept picture — a newborn world starts with none.
 pub(crate) fn forget_pictures() {
     PICTURES.with(|pictures| pictures.borrow_mut().clear());
 }
