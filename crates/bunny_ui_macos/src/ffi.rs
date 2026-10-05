@@ -281,6 +281,9 @@ pub enum AppEvent {
     /// one timer at the nearest deadline after every turn, so a sleeper
     /// never asks the display link to beat for it.
     Tasks,
+    /// The system says memory is short (a warning or worse): the caches
+    /// go — decoded images, the fallen entries waiting for the idle.
+    MemoryPressure,
     /// The reader chose a menu item this window answers — a command from
     /// the menu bar, or a standard edit sent to this window's view.
     Menu(Pick),
@@ -568,6 +571,16 @@ extern "C" fn perform_wake(_info: *mut c_void) {
 /// on the main thread, while the window is being built.
 pub fn install_wake_source() {
     bunny_ui_apple::ffi::install_wake_source(perform_wake);
+}
+
+/// The system says memory is short: every window hears it on the main
+/// thread, as an event, and lets its caches go.
+extern "C" fn perform_memory_pressure(_info: *mut c_void) {
+    dispatch_all(AppEvent::MemoryPressure);
+}
+
+pub fn install_memory_pressure() {
+    bunny_ui_apple::ffi::install_memory_pressure(perform_memory_pressure);
 }
 
 thread_local! {

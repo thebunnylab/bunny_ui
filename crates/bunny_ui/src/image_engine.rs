@@ -477,6 +477,13 @@ pub trait ImageEngine {
     /// stay `None` forever and nothing paints).
     fn intrinsic(&self, source: &ImageSource) -> Option<(u32, u32)>;
 
+    /// Lets go of every cached decode and raster: the next frame decodes
+    /// again what it still shows. The door a memory warning opens — the
+    /// caches are a convenience, and a system that asks for its memory
+    /// back gets them before it takes the app. The default keeps nothing
+    /// to let go.
+    fn drop_caches(&self) {}
+
     /// The source resampled to EXACTLY `width`×`height` physical px.
     /// `None` = nothing to paint (not decoded yet, zero size, broken).
     fn raster(

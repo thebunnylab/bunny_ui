@@ -736,6 +736,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // one more turn; the frame it takes drains the queue on its way
     ffi::install_wake_source();
     runtime.set_wake_hook(std::sync::Arc::new(ffi::wake_from_any_thread));
+    // the system's word that memory is short reaches the windows as an
+    // event, and the caches go first
+    ffi::install_memory_pressure();
     // the sleepers' clock is the wall, and their alarm is the shell's own
     // timer (`ffi::aim_tasks`): a poller thirty milliseconds away no
     // longer keeps the display link beating at full rate
@@ -2017,6 +2020,15 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     // new deadline, and the driver's pace follows it
                     sync_frame_driver(runtime, &handler_pacer, window_id);
                 }
+            }
+        }
+        AppEvent::MemoryPressure => {
+            // the caches are a convenience: the decoded images go (the
+            // next frame decodes what it still shows), and so does what
+            // fell since the last frame and waited for an idle
+            runtime.images().drop_caches();
+            if runtime.garbage_pending() {
+                runtime.collect_garbage();
             }
         }
         AppEvent::ResignKey => {
