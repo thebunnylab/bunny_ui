@@ -4307,7 +4307,11 @@ impl Runtime {
         // it, and a reader runs once for a resize and never with a stale one
         self.note_viewport(crate::layout::Proposal::exact(size));
         // a binding a write reached reads again when the layout meets it
-        crate::bind::settle_dirty();
+        // a bound text that read a new value is sized anew above it: the
+        // boundaries over it kept a measure by the old one
+        for key in crate::bind::settle_dirty() {
+            reconciler::clear_measures_above(&key);
+        }
         self.settle(root);
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
         if let Some(again) = self.reread_hover(root, size, &result) {
@@ -4629,7 +4633,11 @@ impl Runtime {
         size: crate::layout::Size,
     ) -> crate::layout::DisplayList {
         // a tick reads a binding a write reached, like any frame
-        crate::bind::settle_dirty();
+        // a bound text that read a new value is sized anew above it: the
+        // boundaries over it kept a measure by the old one
+        for key in crate::bind::settle_dirty() {
+            reconciler::clear_measures_above(&key);
+        }
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
         if let Some(again) = self.reread_hover(root, size, &result) {
             result = again;
@@ -4661,6 +4669,9 @@ impl Runtime {
         // them: a walk that meets one reads it again, and the ones no
         // walk meets are patched by key once the diff is done
         let dirty_bindings = crate::bind::settle_dirty();
+        for key in &dirty_bindings {
+            reconciler::clear_measures_above(key);
+        }
         self.settle(root);
         // everything that ran while settling — the reuse decision's
         // whole evidence (a theme change already cleared retention,
@@ -5861,7 +5872,11 @@ impl Runtime {
             self.printless.set(false);
         }
         // a print is a frame too: a binding a write reached reads again
-        crate::bind::settle_dirty();
+        // a bound text that read a new value is sized anew above it: the
+        // boundaries over it kept a measure by the old one
+        for key in crate::bind::settle_dirty() {
+            reconciler::clear_measures_above(&key);
+        }
         crate::view::set_print(true);
         self.render_pass(root)
             .into_nodes()
