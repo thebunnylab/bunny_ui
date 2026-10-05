@@ -140,6 +140,9 @@ impl<V: Clone + PartialEq + 'static> PassthroughSubject<V> {
     }
 
     pub fn send(&self, value: V) {
+        // the register never sees a subject: the send says so itself, and
+        // the settle that follows asks the effect that polls it
+        crate::identity::note_external_write();
         *self.last.borrow_mut() = Some(value);
         let watchers = self.watchers.borrow().clone();
         for watcher in watchers {

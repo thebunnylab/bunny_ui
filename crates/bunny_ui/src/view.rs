@@ -102,6 +102,18 @@ pub(crate) fn set_print(enabled: bool) {
     PRINT.with(|print| print.set(enabled));
 }
 
+/// A print node's label, for a view whose line never changes: on a
+/// frame pass it is the empty string, which a `String` holds with no
+/// allocation — a label nobody reads was a heap block per view per run.
+pub(crate) fn print_label(label: &str) -> &str {
+    if print_enabled() { label } else { "" }
+}
+
+/// A print node's line, made only when the tree is printed.
+pub(crate) fn print_line(line: impl FnOnce() -> String) -> String {
+    if print_enabled() { line() } else { String::new() }
+}
+
 /// Wraps a node where it stands: the node leaves its slot for `wrap`,
 /// and what `wrap` makes takes the slot. A unit node holds the place
 /// meanwhile; the list around it never shifts.
@@ -357,7 +369,7 @@ fn retain_entry<T: Component>(
         retained,
         crate::erased::erased_from(view),
         ctx.clone(),
-        RenderNode::branch(name, print_children),
+        RenderNode::branch(print_label(name), print_children),
         crate::layout::LayoutNode::Boundary {
             path: std::rc::Rc::clone(path),
             children: layout_children,
@@ -376,7 +388,7 @@ fn retain_entry<T: Component>(
 #[inline(never)]
 fn close_loose<T: Component>(body: NodeList, out: &mut NodeList) {
     let (print_children, layout_children) = body.into_parts();
-    out.push(RenderNode::branch(short_type_name::<T>(), print_children));
+    out.push(RenderNode::branch(print_label(short_type_name::<T>()), print_children));
     out.push_layout(crate::layout::LayoutNode::Boundary {
         path: std::rc::Rc::from(short_type_name::<T>()),
         children: layout_children,

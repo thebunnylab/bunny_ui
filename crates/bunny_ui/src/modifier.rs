@@ -1043,7 +1043,7 @@ fn apply(
             let (sheet_prints, sheet_layouts) = sheet_nodes.into_parts();
             if let Some(node) = out.last_mut() {
                 node.children
-                    .push(RenderNode::branch("Sheet", sheet_prints));
+                    .push(RenderNode::branch(crate::view::print_label("Sheet"), sheet_prints));
             }
             // The sheet centres over the base and CAPTURES: what it
             // covers is out of reach while it is up, which is what
@@ -1088,7 +1088,7 @@ fn apply(
             let (dialog_prints, dialog_layouts) = dialog_nodes.into_parts();
             if let Some(node) = out.last_mut() {
                 node.children
-                    .push(RenderNode::branch("Dialog", dialog_prints));
+                    .push(RenderNode::branch(crate::view::print_label("Dialog"), dialog_prints));
             }
             if let Some(path) = &path {
                 // the window's own close button lands here (the shell
@@ -1138,7 +1138,7 @@ fn apply(
             let (alert_prints, alert_layouts) = alert_nodes.into_parts();
             if let Some(node) = out.last_mut() {
                 node.children
-                    .push(RenderNode::branch("Alert", alert_prints));
+                    .push(RenderNode::branch(crate::view::print_label("Alert"), alert_prints));
             }
             if let Some(path) = &path {
                 // ONE cancel answer and three roads to it: the window's
@@ -1207,7 +1207,7 @@ fn apply(
             let (popover_prints, popover_layouts) = popover_nodes.into_parts();
             if let Some(node) = out.last_mut() {
                 node.children
-                    .push(RenderNode::branch("Popover", popover_prints));
+                    .push(RenderNode::branch(crate::view::print_label("Popover"), popover_prints));
             }
             if let Some(path) = &path {
                 // both dismiss triggers close through ONE machine:
