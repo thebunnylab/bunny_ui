@@ -1761,6 +1761,12 @@ unsafe fn register_classes() {
         );
         class_addMethod(
             view,
+            sel("cursorUpdate:"),
+            bunny_cursor_update as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            view,
             sel("scrollWheel:"),
             bunny_scroll_wheel as *const c_void,
             types.as_ptr(),
@@ -2551,22 +2557,6 @@ impl WindowHandle {
     pub fn raw_window(&self) -> usize {
         self.window as usize
     }
-
-    /// The pointer's outfit over the scene. Direct `set` — no cursor
-    /// rects for now (AppKit may restore it at resize edges; a cosmetic
-    /// glitch we accept).
-    pub fn set_cursor(&self, cursor: Cursor) {
-        // the shell speaks only when its answer CHANGES. Re-asserting
-        // the same cursor on every pointer event fights whatever a
-        // platform view set for its own content — a webview's hand
-        // over a link would flicker against our arrow forever.
-        if LAST_CURSOR.with(|last| last.replace(Some(cursor))) == Some(cursor) {
-            return;
-        }
-        unsafe {
-            msg_void(shape_of(cursor), sel("set"));
-        }
-    }
 }
 
 /// The `NSCursor` an outfit wears on this system. A frame's edge wears the
@@ -2720,9 +2710,10 @@ struct SegmentSlot {
 
 thread_local! {
     static SEGMENTS: RefCell<HashMap<String, SegmentSlot>> = RefCell::new(HashMap::new());
-    /// The cursor the shell last chose — the gate that keeps it from
-    /// re-asserting an unchanged answer every pointer event.
-    static LAST_CURSOR: Cell<Option<Cursor>> = const { Cell::new(None) };
+    /// The cursor the scene wants under the pointer — what `cursorUpdate:`
+    /// puts back when AppKit asks. `None` = YIELDED: over a platform view
+    /// with only the default to say, the page owns the hand.
+    static WANTED: Cell<Option<Cursor>> = const { Cell::new(Some(Cursor::Arrow)) };
 }
 
 static REGISTER_SEGMENT: Once = Once::new();
@@ -2991,11 +2982,61 @@ fn host_child_container(key: &str) -> Option<Id> {
     HOST_VIEWS.with(|hosts| hosts.borrow().get(key).map(|slot| slot.container))
 }
 
+/// The pointer's outfit over the scene.
+///
+/// An answer the POINTER asked for (a move, the hand leaving) `insist`s:
+/// AppKit is told whenever the cursor it holds is not the scene's, not only
+/// when the scene's answer changed. AppKit sets the cursor too — the arrow,
+/// whenever the hand leaves a cursor-update area that is not ours (the
+/// traffic lights, a hosted page) — and a shell that spoke only on a NEW
+/// answer believed the hand it had set once was still on screen: every
+/// button after that wore the arrow, until some box said something else.
+///
+/// A frame does not insist: it speaks when its answer changed (content
+/// slid under a still hand) and holds its peace otherwise, because a frame
+/// also lands while the cursor is not the scene's to set — mid-resize the
+/// window's edge wears its resizer, a file dragged in wears the drag's
+/// badge. Nor does an answer over a platform view: the page sets its own
+/// on every move, and insisting there would flicker against its hand over
+/// a link. And an app in the background insists on nothing.
+pub(crate) fn wear_cursor(cursor: Cursor, insist: bool) {
+    let active = unsafe {
+        msg_bool(msg_id(class("NSApplication"), sel("sharedApplication")), sel("isActive")) != 0
+    };
+    wear(cursor, insist && active);
+}
+
+fn wear(cursor: Cursor, insist: bool) {
+    let said = WANTED.with(|wanted| wanted.replace(Some(cursor)));
+    unsafe {
+        let shape = shape_of(cursor);
+        let speak = match insist {
+            true => msg_id(class("NSCursor"), sel("currentCursor")) != shape,
+            false => said != Some(cursor),
+        };
+        if speak {
+            msg_void(shape, sel("set"));
+        }
+    }
+}
+
 /// The shell steps back from the cursor: whatever owns it now (a
 /// webview's own hover, mostly) keeps it, and the NEXT thing the
 /// shell wants — even the arrow — asserts again.
 pub(crate) fn yield_cursor() {
-    LAST_CURSOR.with(|last| last.set(None));
+    WANTED.with(|wanted| wanted.set(None));
+}
+
+/// `cursorUpdate:` — AppKit putting a cursor back: the hand entered the
+/// view, left a cursor-update area inside it, or the window came to the
+/// front. Unanswered, the message walks up the responder chain to the
+/// window, whose answer is the arrow; the view answers with the scene's
+/// own, the way the Windows shell answers `WM_SETCURSOR`. Yielded, it
+/// says nothing and the page keeps its own.
+extern "C" fn bunny_cursor_update(_this: Id, _sel: Sel, _event: Id) {
+    if let Some(cursor) = WANTED.with(Cell::get) {
+        unsafe { msg_void(shape_of(cursor), sel("set")) };
+    }
 }
 
 /// One live box's sublayer and its two alternating backings — the
@@ -3169,8 +3210,10 @@ pub fn create_window(
 
         // moved/entered/exited arrive via the tracking area — no first
         // responder dance, and InVisibleRect tracks the resize by itself
-        // (the rect passed in is ignored). 0x223 = MouseEnteredAndExited |
-        // MouseMoved | ActiveInKeyWindow | InVisibleRect.
+        // (the rect passed in is ignored). CursorUpdate makes the view the
+        // one AppKit asks when it puts a cursor back (`bunny_cursor_update`)
+        // instead of the window's arrow. 0x227 = MouseEnteredAndExited |
+        // MouseMoved | CursorUpdate | ActiveInKeyWindow | InVisibleRect.
         let area = msg_id(class("NSTrackingArea"), sel("alloc"));
         let area = msg_init_tracking(
             area,
@@ -3179,7 +3222,7 @@ pub fn create_window(
                 origin: CGPoint { x: 0.0, y: 0.0 },
                 size: CGSize { width: 0.0, height: 0.0 },
             },
-            0x223,
+            0x227,
             view,
             std::ptr::null_mut(),
         );
@@ -3263,16 +3306,18 @@ pub fn create_panel(parent: &WindowHandle, width: f64, height: f64) -> WindowHan
         // hover and exit work inside the panel like anywhere else — but
         // ActiveInKeyWindow does NOT, because a popover panel never takes
         // key (that is the whole point of a panel: the window behind it
-        // keeps the keyboard). With the window's own 0x223 the tracking
+        // keeps the keyboard). With the window's own 0x227 the tracking
         // area is simply inactive and the panel receives no moves at all:
         // the rows of a menu never light, a submenu never opens, and a
         // tooltip inside a popover never appears.
         //
-        // 0x243 = MouseEnteredAndExited | MouseMoved | **ActiveInActiveApp**
-        // | InVisibleRect. ActiveInActiveApp rather than ActiveAlways: a
-        // popover belonging to an app that is not frontmost should not be
-        // tracking the pointer, and the shell already dismisses on an app
-        // switch.
+        // 0x247 = MouseEnteredAndExited | MouseMoved | CursorUpdate |
+        // **ActiveInActiveApp** | InVisibleRect. ActiveInActiveApp rather
+        // than ActiveAlways: a popover belonging to an app that is not
+        // frontmost should not be tracking the pointer, and the shell
+        // already dismisses on an app switch. CursorUpdate as in the
+        // window's: a panel that appears under the hand puts back the
+        // scene's cursor, not the arrow.
         let area = msg_id(class("NSTrackingArea"), sel("alloc"));
         let area = msg_init_tracking(
             area,
@@ -3281,7 +3326,7 @@ pub fn create_panel(parent: &WindowHandle, width: f64, height: f64) -> WindowHan
                 origin: CGPoint { x: 0.0, y: 0.0 },
                 size: CGSize { width: 0.0, height: 0.0 },
             },
-            0x243,
+            0x247,
             view,
             std::ptr::null_mut(),
         );
@@ -3430,9 +3475,9 @@ pub fn create_dialog(
         msg_void_id(window, sel("setContentView:"), view);
 
         // hover must work while EITHER of our windows is key — the
-        // panel's reasoning, spelled out above `PANEL_STYLE`. 0x243 =
-        // MouseEnteredAndExited | MouseMoved | ActiveInActiveApp |
-        // InVisibleRect.
+        // panel's reasoning, spelled out above `PANEL_STYLE`. 0x247 =
+        // MouseEnteredAndExited | MouseMoved | CursorUpdate |
+        // ActiveInActiveApp | InVisibleRect.
         let area = msg_id(class("NSTrackingArea"), sel("alloc"));
         let area = msg_init_tracking(
             area,
@@ -3441,7 +3486,7 @@ pub fn create_dialog(
                 origin: CGPoint { x: 0.0, y: 0.0 },
                 size: CGSize { width: 0.0, height: 0.0 },
             },
-            0x243,
+            0x247,
             view,
             std::ptr::null_mut(),
         );
@@ -3973,6 +4018,50 @@ mod tests {
         ] {
             assert!(!unsafe { shape_of(outfit) }.is_null(), "{outfit:?} names no cursor");
         }
+    }
+
+    /// The shell puts back a cursor AppKit replaced behind its back.
+    ///
+    /// AppKit sets the cursor too: the arrow, whenever the hand leaves a
+    /// cursor-update area that is not the scene's — the traffic lights, a
+    /// hosted page. The shell used to speak only when its ANSWER changed, so
+    /// it believed the hand it had set once was still on screen, and a button
+    /// wore the arrow until some box said something else. The pointer's next
+    /// move puts the hand back, and so does AppKit's own question.
+    #[test]
+    fn the_pointer_puts_back_a_cursor_appkit_replaced() {
+        // AppKit answers no cursor at all before the application exists
+        let current = || unsafe {
+            msg_id(class("NSApplication"), sel("sharedApplication"));
+            msg_id(class("NSCursor"), sel("currentCursor"))
+        };
+        current();
+        let (arrow, hand, beam) =
+            unsafe { (shape_of(Cursor::Arrow), shape_of(Cursor::Pointing), shape_of(Cursor::Text)) };
+        let appkit_sets = |shape: Id| unsafe { msg_void(shape, sel("set")) };
+        let update = unsafe { sel("cursorUpdate:") };
+        let appkit_asks = || bunny_cursor_update(std::ptr::null_mut(), update, std::ptr::null_mut());
+
+        wear(Cursor::Pointing, true);
+        assert_eq!(current(), hand, "the hand over a button");
+        appkit_sets(arrow);
+        wear(Cursor::Pointing, false);
+        assert_eq!(current(), arrow, "a frame speaks only for a new answer");
+        wear(Cursor::Pointing, true);
+        assert_eq!(current(), hand, "the pointer's next move puts the hand back");
+
+        appkit_sets(arrow);
+        appkit_asks();
+        assert_eq!(current(), hand, "asked, the view answers with the scene's cursor, not the arrow");
+
+        // over a page with only the default to say, the shell steps back:
+        // asked, it says nothing, and the page's own cursor stays
+        yield_cursor();
+        appkit_sets(beam);
+        appkit_asks();
+        assert_eq!(current(), beam, "the page keeps its own");
+        wear(Cursor::Arrow, true);
+        assert_eq!(current(), arrow, "and off the page the scene speaks again");
     }
 
     /// An event raised from INSIDE a handler waits its turn.

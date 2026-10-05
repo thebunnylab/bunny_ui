@@ -53,6 +53,68 @@ fn sync_frame_driver(runtime: &Runtime, pacer: &FramePacer, window: usize) {
     pacer.set_beating(ffi::want_beat(window, wanted));
 }
 
+/// Dresses the pointer for where it is now.
+///
+/// Asked after every frame and after every move of the hand — a move that
+/// changes no picture can still change the answer (one box is several
+/// surfaces: a gutter, then text), and it is the moment to put back a cursor
+/// AppKit replaced behind the shell's back. `insist` is the pointer's own ask
+/// ([`ffi::wear_cursor`]); a frame only speaks when its answer changed.
+fn point_cursor(runtime: &Runtime, insist: bool) {
+    let interaction = runtime.interaction();
+    // a live divider drag keeps the resizer even while the pointer
+    // runs ahead of the seam; hovering the grip announces it
+    let desired = match runtime.seam_axis() {
+        // lanes side by side: the seam travels left and right
+        Some(Axis::Horizontal) => ffi::Cursor::ResizeLeftRight,
+        // lanes stacked: it travels up and down
+        Some(Axis::Vertical) => ffi::Cursor::ResizeUpDown,
+        // The BOX under the pointer answers first — text wants an I-beam,
+        // and the rule below cannot know that. Only where nobody answers
+        // does the old rule stand: the hand over anything hoverable.
+        // A box's resizer is a FRAME's, which AppKit draws unlike the
+        // seam's divider.
+        None => match runtime.hovered_cursor() {
+            Some(bunny_ui::layout::Cursor::Text) => ffi::Cursor::Text,
+            Some(bunny_ui::layout::Cursor::Pointing) => ffi::Cursor::Pointing,
+            Some(bunny_ui::layout::Cursor::Cell) => ffi::Cursor::Cell,
+            Some(bunny_ui::layout::Cursor::Arrow) => ffi::Cursor::Arrow,
+            Some(bunny_ui::layout::Cursor::ResizeLeftRight) => ffi::Cursor::FrameLeftRight,
+            Some(bunny_ui::layout::Cursor::ResizeUpDown) => ffi::Cursor::FrameUpDown,
+            Some(bunny_ui::layout::Cursor::ResizeUpLeftDownRight) => {
+                ffi::Cursor::FrameUpLeftDownRight
+            }
+            Some(bunny_ui::layout::Cursor::ResizeUpRightDownLeft) => {
+                ffi::Cursor::FrameUpRightDownLeft
+            }
+            None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
+            None => ffi::Cursor::Arrow,
+        },
+    };
+    // over the island with only the DEFAULT to say, the shell
+    // YIELDS: the engine owns the cursor over its own page (the
+    // hand over a link is the webview's to give). Yielding also
+    // rearms the gate, so the first real claim off the island —
+    // or on it, a toast's hand — asserts again.
+    let over_host = interaction.pointer.is_some_and(|point| {
+        runtime.hosts().iter().any(|host| {
+            let x0 = host.frame.origin.x + host.visible.origin.x;
+            let y0 = host.frame.origin.y + host.visible.origin.y;
+            point.x >= x0
+                && point.y >= y0
+                && point.x < x0 + host.visible.size.width
+                && point.y < y0 + host.visible.size.height
+        })
+    });
+    if over_host && desired == ffi::Cursor::Arrow {
+        ffi::yield_cursor();
+    } else {
+        // the page sets its own cursor on every move: over it the
+        // shell never insists, only answers anew
+        ffi::wear_cursor(desired, insist && !over_host);
+    }
+}
+
 /// AppKit keyCode → the keymap vocabulary. Named keys come from the
 /// virtual-key table; the rest becomes `Char` through the key's OWN
 /// character — what it types with no modifier applied, read from the
@@ -1462,56 +1524,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 );
             }
             present(runtime, display, via);
-        let interaction = runtime.interaction();
-        // a live divider drag keeps the resizer even while the pointer
-        // runs ahead of the seam; hovering the grip announces it
-        let desired = match runtime.seam_axis() {
-            // lanes side by side: the seam travels left and right
-            Some(Axis::Horizontal) => ffi::Cursor::ResizeLeftRight,
-            // lanes stacked: it travels up and down
-            Some(Axis::Vertical) => ffi::Cursor::ResizeUpDown,
-            // The BOX under the pointer answers first — text wants an I-beam,
-            // and the rule below cannot know that. Only where nobody answers
-            // does the old rule stand: the hand over anything hoverable.
-            // A box's resizer is a FRAME's, which AppKit draws unlike the
-            // seam's divider.
-            None => match runtime.hovered_cursor() {
-                Some(bunny_ui::layout::Cursor::Text) => ffi::Cursor::Text,
-                Some(bunny_ui::layout::Cursor::Pointing) => ffi::Cursor::Pointing,
-                Some(bunny_ui::layout::Cursor::Cell) => ffi::Cursor::Cell,
-                Some(bunny_ui::layout::Cursor::Arrow) => ffi::Cursor::Arrow,
-                Some(bunny_ui::layout::Cursor::ResizeLeftRight) => ffi::Cursor::FrameLeftRight,
-                Some(bunny_ui::layout::Cursor::ResizeUpDown) => ffi::Cursor::FrameUpDown,
-                Some(bunny_ui::layout::Cursor::ResizeUpLeftDownRight) => {
-                    ffi::Cursor::FrameUpLeftDownRight
-                }
-                Some(bunny_ui::layout::Cursor::ResizeUpRightDownLeft) => {
-                    ffi::Cursor::FrameUpRightDownLeft
-                }
-                None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
-                None => ffi::Cursor::Arrow,
-            },
-        };
-        // over the island with only the DEFAULT to say, the shell
-        // YIELDS: the engine owns the cursor over its own page (the
-        // hand over a link is the webview's to give). Yielding also
-        // rearms the gate, so the first real claim off the island —
-        // or on it, a toast's hand — asserts again.
-        let over_host = interaction.pointer.is_some_and(|point| {
-            runtime.hosts().iter().any(|host| {
-                let x0 = host.frame.origin.x + host.visible.origin.x;
-                let y0 = host.frame.origin.y + host.visible.origin.y;
-                point.x >= x0
-                    && point.y >= y0
-                    && point.x < x0 + host.visible.size.width
-                    && point.y < y0 + host.visible.size.height
-            })
-        });
-        if over_host && desired == ffi::Cursor::Arrow {
-            ffi::yield_cursor();
-        } else {
-            window.set_cursor(desired);
-        }
+        point_cursor(runtime, false);
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
             let rect = snapshot.caret_rect;
             (
@@ -1883,6 +1896,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             if runtime.pointer_moved(x, y, modifiers) {
                 soon(runtime, root, trace::Origin::Input);
             }
+            // the cursor cannot wait for the beat, nor for a picture: the
+            // answer is the last layout's, which is what is on screen
+            point_cursor(runtime, true);
         }
         AppEvent::RightMouseDown { x, y, modifiers } => {
             // the box under the pointer hears it first; what it ignores
@@ -1911,6 +1927,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             if runtime.pointer_exited() {
                 soon(runtime, root, trace::Origin::Input);
             }
+            point_cursor(runtime, true);
         }
         AppEvent::Wheel { x, y, dx, dy, modifiers, phase } => {
             // offset is engine state: repaint without render (zero bodies).
@@ -2056,6 +2073,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 let (width, height) = window.content_size();
                 let display = runtime.animation_frame(root, Size { width, height });
                 handler_present(runtime, display, trace::Origin::Frame);
+                // a spring or a fling moved content under a still hand
+                point_cursor(runtime, false);
             } else if moved.islands {
                 // mid-resize the boxes are in the drawable, not on
                 // layers — a step repaints the scene like any other
@@ -2091,6 +2110,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     let (width, height) = window.content_size();
                     let display = runtime.animation_frame(root, Size { width, height });
                     handler_present(runtime, display, trace::Origin::Frame);
+                    point_cursor(runtime, false);
                 }
             }
             sync_frame_driver(runtime, &handler_pacer, window_id);
