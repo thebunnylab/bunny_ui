@@ -292,6 +292,10 @@ impl Default for CoreGraphicsImageEngine {
 }
 
 impl ImageEngine for CoreGraphicsImageEngine {
+    fn drop_caches(&self) {
+        CoreGraphicsImageEngine::drop_caches(self);
+    }
+
     fn intrinsic(&self, source: &ImageSource) -> Option<(u32, u32)> {
         if let ImageSource::FileIcon { .. } = source {
             // system icons are multi-representation; the fixed contract

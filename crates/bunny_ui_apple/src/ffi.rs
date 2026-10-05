@@ -318,6 +318,49 @@ pub fn install_wake_source(perform: extern "C" fn(*mut c_void)) {
     }
 }
 
+#[link(name = "System", kind = "dylib")]
+unsafe extern "C" {
+    static _dispatch_source_type_memorypressure: c_void;
+    static _dispatch_main_q: c_void;
+    fn dispatch_source_create(
+        kind: *const c_void,
+        handle: usize,
+        mask: usize,
+        queue: *const c_void,
+    ) -> *mut c_void;
+    fn dispatch_source_set_event_handler_f(source: *mut c_void, handler: extern "C" fn(*mut c_void));
+    fn dispatch_resume(object: *mut c_void);
+}
+
+/// `DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL`.
+const MEMORY_PRESSURE_MASK: usize = 0x2 | 0x4;
+
+static MEMORY_PRESSURE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Listens for the system's word that memory is short, on the main
+/// queue: `perform` runs there, on the next turn of the loop, and the
+/// shell lets its caches go. Called once, while the first window is
+/// being built.
+pub fn install_memory_pressure(perform: extern "C" fn(*mut c_void)) {
+    if !MEMORY_PRESSURE.load(Ordering::SeqCst).is_null() {
+        return;
+    }
+    unsafe {
+        let source = dispatch_source_create(
+            &raw const _dispatch_source_type_memorypressure,
+            0,
+            MEMORY_PRESSURE_MASK,
+            &raw const _dispatch_main_q,
+        );
+        if source.is_null() {
+            return;
+        }
+        dispatch_source_set_event_handler_f(source, perform);
+        dispatch_resume(source);
+        MEMORY_PRESSURE.store(source, Ordering::SeqCst);
+    }
+}
+
 /// Asks the main run loop for one more turn. Safe from any thread, and
 /// never re-entrant: a signal raised DURING a frame lands on the next
 /// turn instead of nesting inside this one.

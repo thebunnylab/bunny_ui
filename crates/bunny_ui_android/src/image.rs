@@ -172,6 +172,10 @@ impl Default for AndroidImageEngine {
 }
 
 impl ImageEngine for AndroidImageEngine {
+    fn drop_caches(&self) {
+        AndroidImageEngine::drop_caches(self);
+    }
+
     fn intrinsic(&self, source: &ImageSource) -> Option<(u32, u32)> {
         let key = source.key();
         if let Some(size) = self.sizes.borrow().get(&key) {
