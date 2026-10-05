@@ -116,12 +116,6 @@ pub struct FrameStats {
     /// was dirty, no task was ready, no frame was asked — the tree could
     /// not have changed, so no body was asked.
     pub settles_skipped: u32,
-    /// Retained boundaries whose placement was replayed from what was
-    /// kept — the draw commands, the hit regions and the tables moved
-    /// to the new origin, no walk.
-    pub placements_replayed: u32,
-    /// Retained boundaries that were placed by a walk.
-    pub placements_made: u32,
     /// Milliseconds per [`Stage`], all zero without a clock.
     pub stage_ms: [f64; STAGES],
     /// Allocations made under each stage, when a bench installed a
@@ -157,8 +151,6 @@ impl FrameStats {
             measures_made: 0,
             rows_summed: 0,
             settles_skipped: 0,
-            placements_replayed: 0,
-            placements_made: 0,
             stage_ms: [0.0; STAGES],
             stage_allocs: [0; STAGES],
         }
@@ -200,8 +192,6 @@ thread_local! {
     static MEASURES_MADE: Cell<u32> = const { Cell::new(0) };
     static ROWS_SUMMED: Cell<u32> = const { Cell::new(0) };
     static SETTLES_SKIPPED: Cell<u32> = const { Cell::new(0) };
-    static PLACEMENTS_REPLAYED: Cell<u32> = const { Cell::new(0) };
-    static PLACEMENTS_MADE: Cell<u32> = const { Cell::new(0) };
     static STAGE_MS: Cell<[f64; STAGES]> = const { Cell::new([0.0; STAGES]) };
     static STAGE_ALLOCS: Cell<[u64; STAGES]> = const { Cell::new([0; STAGES]) };
     static CLOCK: Cell<Option<fn() -> f64>> = const { Cell::new(None) };
@@ -221,6 +211,45 @@ pub fn set_clock(clock: Option<fn() -> f64>) {
 /// it made. Only a timed stage samples it.
 pub fn set_alloc_probe(probe: Option<fn() -> u64>) {
     ALLOC_PROBE.with(|slot| slot.set(probe));
+}
+
+/// The totals as they stand, left standing — what an oracle reads
+/// before it runs the slow road again, to put back after
+/// ([`restore`]): a check's counts are nobody's.
+pub(crate) fn snapshot() -> FrameStats {
+    let stats = take();
+    restore(stats);
+    stats
+}
+
+/// Puts a snapshot's totals back, over whatever accumulated since.
+pub(crate) fn restore(stats: FrameStats) {
+    BODY_PASSES.with(|c| c.set(stats.body_passes));
+    LAYOUT_PASSES.with(|c| c.set(stats.layout_passes));
+    DISPLAY_COMMANDS.with(|c| c.set(stats.display_commands));
+    CAPTURE_NODES.with(|c| c.set(stats.capture_nodes));
+    DIFF_VISITED.with(|c| c.set(stats.diff_visited));
+    DIFF_REUSED.with(|c| c.set(stats.diff_reused));
+    PATCHES.with(|c| c.set(stats.patches));
+    ENCODE_BYTES.with(|c| c.set(stats.encode_bytes));
+    MEASURE_HITS.with(|c| c.set(stats.measure_hits));
+    MEASURE_MISSES.with(|c| c.set(stats.measure_misses));
+    ASSEMBLIES.with(|c| c.set(stats.assemblies));
+    ENTRIES_INDEXED.with(|c| c.set(stats.entries_indexed));
+    BINDING_UPDATES.with(|c| c.set(stats.binding_updates));
+    CLONES.with(|c| c.set(stats.clones));
+    SHAPES_HASHED.with(|c| c.set(stats.shapes_hashed));
+    HOVER_RELAYOUTS.with(|c| c.set(stats.hover_relayouts));
+    PAINTS.with(|c| c.set(stats.paints));
+    PICTURES_REPLAYED.with(|c| c.set(stats.pictures_replayed));
+    COMMANDS_UNSEEN.with(|c| c.set(stats.commands_unseen));
+    CHILDREN_UNPLACED.with(|c| c.set(stats.children_unplaced));
+    MEASURES_KEPT.with(|c| c.set(stats.measures_kept));
+    MEASURES_MADE.with(|c| c.set(stats.measures_made));
+    ROWS_SUMMED.with(|c| c.set(stats.rows_summed));
+    SETTLES_SKIPPED.with(|c| c.set(stats.settles_skipped));
+    STAGE_MS.with(|c| c.set(stats.stage_ms));
+    STAGE_ALLOCS.with(|c| c.set(stats.stage_allocs));
 }
 
 /// Snapshots the totals accumulated since the last call, and resets.
@@ -250,8 +279,6 @@ pub fn take() -> FrameStats {
         measures_made: MEASURES_MADE.with(|c| c.replace(0)),
         rows_summed: ROWS_SUMMED.with(|c| c.replace(0)),
         settles_skipped: SETTLES_SKIPPED.with(|c| c.replace(0)),
-        placements_replayed: PLACEMENTS_REPLAYED.with(|c| c.replace(0)),
-        placements_made: PLACEMENTS_MADE.with(|c| c.replace(0)),
         stage_ms: STAGE_MS.with(|c| c.replace([0.0; STAGES])),
         stage_allocs: STAGE_ALLOCS.with(|c| c.replace([0; STAGES])),
     }
@@ -374,18 +401,6 @@ pub(crate) fn note_unseen() {
 #[allow(dead_code, reason = "the settle gate notes it when it lands")]
 pub(crate) fn note_settle_skipped() {
     bump(&SETTLES_SKIPPED, 1);
-}
-
-#[inline]
-#[allow(dead_code, reason = "the placement retention notes it when it lands")]
-pub(crate) fn note_placement_replayed() {
-    bump(&PLACEMENTS_REPLAYED, 1);
-}
-
-#[inline]
-#[allow(dead_code, reason = "the placement retention notes it when it lands")]
-pub(crate) fn note_placement_made() {
-    bump(&PLACEMENTS_MADE, 1);
 }
 
 #[inline]

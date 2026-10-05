@@ -4021,8 +4021,11 @@ pub(crate) fn layout_placing(
         // moved. The scene is placed again with the cut off, filtered by
         // the same rule as a pure function of the list, and compared.
         let mut full = Placement { keep_unseen: true, safe: out.safe, ..Placement::default() };
+        // the check places the scene again: its counts are nobody's
+        let counted = crate::stats::snapshot();
         root.place(safe, &fit, &env, &mut full);
         place_overlays(Rect { origin: safe.origin, size: insets.inset(window).size }, &env, &mut full);
+        crate::stats::restore(counted);
         let seen = full.display.seen_only();
         assert!(
             seen.as_slice() == out.display.as_slice(),

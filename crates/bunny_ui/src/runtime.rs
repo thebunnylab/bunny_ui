@@ -6933,7 +6933,10 @@ impl Runtime {
     /// change, nothing dirty, nothing fell.
     fn assert_quiet_settle(&self, root: &impl View) {
         let graveyard = reconciler::graveyard_len();
+        // the check's own pass counts for nobody
+        let counted = crate::stats::snapshot();
         self.frame_pass(root);
+        crate::stats::restore(counted);
         let ran = reconciler::last_body_runs();
         assert!(ran.is_empty(), "a quiet settle skipped a pass that ran bodies: {ran:?}");
         let observed_change = self.pump();
