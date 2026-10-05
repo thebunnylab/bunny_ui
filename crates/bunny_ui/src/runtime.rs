@@ -5880,6 +5880,11 @@ impl Runtime {
     fn apply_element_reveals(&self, result: &crate::layout::LayoutResult) -> bool {
         let mut moved = false;
         for placement in &result.customs {
+            // an overlay island shares its box's element: the box's reveal
+            // is the box's, asked once, at the box's own frame
+            if placement.overlay {
+                continue;
+            }
             let Some(path) = &placement.region else { continue };
             let Some(local) = placement.element.element().reveal() else { continue };
             // the memory is the LOCAL rect: the box's frame travels
@@ -6513,6 +6518,11 @@ impl Runtime {
         // Each (box, beat) fires once, so the user can focus away and stay
         // away until the app beats again.
         for placement in &result.customs {
+            // an overlay island shares its box's element: the keyboard goes
+            // to the box, never to the island
+            if placement.overlay {
+                continue;
+            }
             let Some(beat) = placement.element.auto_focus_beat() else {
                 continue;
             };

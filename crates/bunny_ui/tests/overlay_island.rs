@@ -121,3 +121,61 @@ fn without_layers_the_overlay_paints_inline() {
         "the box painted its caret itself"
     );
 }
+
+/// A tall document whose caret sits far down: the box asks the region to
+/// reveal it, and paints the caret as its overlay.
+struct Revealer {
+    phase: State<u32>,
+}
+
+const DEEP_CARET: Rect = Rect { origin: Point { x: 10.0, y: 1000.0 }, size: Size { width: 2.0, height: 16.0 } };
+
+impl CustomElement for Revealer {
+    fn measure(&self, proposal: Proposal, _metrics: &bunny_ui::custom::Metrics) -> Size {
+        Size { width: proposal.width.unwrap_or(0.0), height: 2000.0 }
+    }
+
+    fn paint(&self, ctx: &PaintCtx, painter: &mut Painter) {
+        painter.fill(ctx.visible, Color::WHITE);
+    }
+
+    fn paint_overlay(&self, _ctx: &PaintCtx, painter: &mut Painter) -> Option<Rect> {
+        if self.phase.get() % 2 == 0 {
+            painter.fill(DEEP_CARET, Color::BLACK);
+        }
+        Some(DEEP_CARET)
+    }
+
+    fn reveal(&self) -> Option<Rect> {
+        Some(DEEP_CARET)
+    }
+}
+
+#[test]
+fn an_overlay_in_a_scroll_region_never_moves_the_region() {
+    let phase = State::new(0u32);
+    let runtime = Runtime::new();
+    runtime.set_overlay_layers(true);
+    runtime.drop_unseen();
+    let view = scroll(custom(Revealer { phase }).id("doc")).id("region");
+    // the first frame reveals the caret: the region scrolls to show it
+    let _ = runtime.display_frame(&view, SIZE);
+    let region = runtime
+        .settled_layout(&view, Proposal::exact(SIZE))
+        .scrolls
+        .first()
+        .map(|region| region.path.clone())
+        .expect("a scroll region");
+    let revealed = runtime.scroll_offset(&region);
+    assert!(revealed.y > 0.0, "the deep caret pulled the region down: {revealed:?}");
+    let _ = bunny_ui::stats::take();
+    // the frames after it: the overlay island shares the box's element,
+    // and its reveal is the box's — asked once, at the box's frame. A
+    // second ask at the island's frame moved the region every frame.
+    for _ in 0..5 {
+        let _ = runtime.display_frame(&view, SIZE);
+        assert_eq!(runtime.scroll_offset(&region), revealed, "the region stands still");
+    }
+    let stats = bunny_ui::stats::take();
+    assert_eq!(stats.layout_passes, 5, "one layout per frame, no follow-up");
+}
