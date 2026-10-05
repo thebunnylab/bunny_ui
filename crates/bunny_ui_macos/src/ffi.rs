@@ -3449,6 +3449,8 @@ pub fn create_window(
             std::ptr::null_mut(),
         );
         msg_void_id(view, sel("addTrackingArea:"), area);
+        // the view holds the area now; the +1 of the alloc goes
+        msg_void(area, sel("release"));
 
         // delegate: resize repaints, and the last one out quits
         let delegate = msg_id(msg_id(class("BunnyDelegate"), sel("alloc")), sel("init"));
@@ -3553,6 +3555,8 @@ pub fn create_panel(parent: &WindowHandle, width: f64, height: f64) -> WindowHan
             std::ptr::null_mut(),
         );
         msg_void_id(view, sel("addTrackingArea:"), area);
+        // the view holds the area now; the +1 of the alloc goes
+        msg_void(area, sel("release"));
 
         // the child contract: the panel rides every parent move
         msg_void_id_i64(parent.window, sel("addChildWindow:ordered:"), panel, 1);
@@ -3713,6 +3717,8 @@ pub fn create_dialog(
             std::ptr::null_mut(),
         );
         msg_void_id(view, sel("addTrackingArea:"), area);
+        // the view holds the area now; the +1 of the alloc goes
+        msg_void(area, sel("release"));
 
         let delegate = msg_id(msg_id(class("BunnyDialogDelegate"), sel("alloc")), sel("init"));
         msg_void_id(window, sel("setDelegate:"), delegate);
@@ -3775,6 +3781,19 @@ impl WindowHandle {
         BACKING.with(|stores| {
             stores.borrow_mut().remove(&(self.view as usize));
         });
+    }
+
+    /// Lets a closed POPOVER panel go: the panel and its view were made
+    /// with a +1 each (`setReleasedWhenClosed:NO` keeps AppKit's hands
+    /// off), and a store that forgot the handle after `close_panel`
+    /// leaked both — a window for every tooltip ever shown. Never for a
+    /// dialog, which the shell pools and shows again.
+    pub fn release_panel(self) {
+        unsafe {
+            msg_void_id(self.window, sel("setContentView:"), std::ptr::null_mut());
+            msg_void(self.view, sel("release"));
+            msg_void(self.window, sel("release"));
+        }
     }
 
     /// The screen's visible frame in this window's LAYOUT coordinates
