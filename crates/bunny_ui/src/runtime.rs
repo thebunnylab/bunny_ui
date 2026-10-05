@@ -6662,7 +6662,7 @@ impl Runtime {
             // nodes must be observed before declaring the tree stable
             let observed_change = crate::stats::time(crate::stats::Stage::Pump, || self.pump());
             // whoever stopped being declared stops running
-            effects::sweep_tasks(&self.last_root.borrow().clone().unwrap_or_default());
+            self.sweep_tasks();
             if printed == previous
                 && !observed_change
                 && !self.has_pending_dirty()
@@ -6687,8 +6687,26 @@ impl Runtime {
             // DURING the settle — a pump that scrolls, a task that asks —
             // raises the flag again, and costs one more frame, never one
             // less.
-            self.frame_asked.set(false);
-            FRAME_REQUESTED.with(|flag| flag.set(false));
+            let asked = self.frame_asked.replace(false);
+            let asked = FRAME_REQUESTED.with(|flag| flag.replace(false)) || asked;
+            // the tasks land first, whatever follows: a wake made one
+            // ready, and what it writes is a reason below
+            self.poll_tasks();
+            if !asked && self.settle_is_quiet() {
+                // Nothing could have moved a body: no write since the last
+                // settled pass, nothing dirty, no task ready, the theme and
+                // the environment still, the insets where they were. A
+                // blink, a pointer, a wheel and a window callback land
+                // here — and a pass over a quiet tree is all-skip, zero
+                // bodies, yet it swept every owner and asked every effect.
+                // The frame still lays out: the stamp (hover, focus, caret)
+                // and the scroll offsets are the layout's, not a body's.
+                crate::stats::note_settle_skipped();
+                if crate::paranoid::on(crate::paranoid::SETTLE) {
+                    self.assert_quiet_settle(root);
+                }
+                return;
+            }
             for _ in 0..8 {
                 self.settled_epoch.set(motor::identity::write_epoch());
                 // the same order as the print path: a task that resolved
@@ -6696,12 +6714,48 @@ impl Runtime {
                 self.poll_tasks();
                 self.frame_pass(root);
                 let observed_change = crate::stats::time(crate::stats::Stage::Pump, || self.pump());
-                effects::sweep_tasks(&self.last_root.borrow().clone().unwrap_or_default());
+                self.sweep_tasks();
                 if !observed_change && !self.has_pending_dirty() && !motor::task::has_ready() {
                     return;
                 }
             }
         })
+    }
+
+    /// Could a pass change anything? False when something was written
+    /// since the last settled pass, a view is dirty, a task is ready, the
+    /// theme or the environment moved, the insets moved, or no pass ever
+    /// ran — the reasons a body re-runs for, read without a walk.
+    fn settle_is_quiet(&self) -> bool {
+        self.last_root.borrow().is_some()
+            && motor::identity::write_epoch() == self.settled_epoch.get()
+            && !motor::task::has_ready()
+            && crate::theme::version() == self.theme_version.get()
+            && !self.env_moved.get()
+            && self.last_insets.get() == self.frame_insets()
+            && !self.has_pending_dirty()
+    }
+
+    /// `BUNNY_PARANOID=settle`: the round the quiet settle skipped is run
+    /// anyway, and must come out empty — no body ran, no effect observed a
+    /// change, nothing dirty, nothing fell.
+    fn assert_quiet_settle(&self, root: &impl View) {
+        let graveyard = reconciler::graveyard_len();
+        self.frame_pass(root);
+        let ran = reconciler::last_body_runs();
+        assert!(ran.is_empty(), "a quiet settle skipped a pass that ran bodies: {ran:?}");
+        let observed_change = self.pump();
+        assert!(!observed_change, "a quiet settle skipped a pump that observed a change");
+        self.sweep_tasks();
+        assert!(!self.has_pending_dirty(), "a quiet settle left a view dirty");
+        assert_eq!(graveyard, reconciler::graveyard_len(), "a quiet settle let an entry fall");
+    }
+
+    /// Whoever stopped being declared stops running — the `.task` cells of
+    /// views that left this pass's root.
+    fn sweep_tasks(&self) {
+        let root = self.last_root.borrow();
+        effects::sweep_tasks(root.as_deref().unwrap_or(""));
     }
 
     /// The boundary a stable frame lays out with no pass: nothing is

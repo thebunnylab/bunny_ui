@@ -135,7 +135,7 @@ where
         let mut label = NodeList::new();
         self.label.render_into(ctx, &mut label);
         let (prints, layouts) = label.into_parts();
-        out.push(RenderNode::branch("Button", prints));
+        out.push(RenderNode::branch(crate::view::print_label("Button"), prints));
 
         // inside a pass, the button is an interaction target: the frame joins
         // the hit-test under the identity path, and the action stays registered
@@ -709,7 +709,7 @@ impl View for ProgressView {
     type Arity = Single;
 
     fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
-        out.push(RenderNode::leaf("ProgressView"));
+        out.push(RenderNode::leaf(crate::view::print_label("ProgressView")));
         out.push_layout(LayoutNode::Leaf {
             size: LayoutSize { width: 20.0, height: 20.0 },
         });
@@ -728,7 +728,7 @@ impl View for Spacer {
     type Arity = Single;
 
     fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
-        out.push(RenderNode::leaf("Spacer"));
+        out.push(RenderNode::leaf(crate::view::print_label("Spacer")));
         out.push_layout(LayoutNode::Spacer);
     }
 }
@@ -745,7 +745,7 @@ impl View for Rectangle {
     type Arity = Single;
 
     fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
-        out.push(RenderNode::leaf("Rectangle"));
+        out.push(RenderNode::leaf(crate::view::print_label("Rectangle")));
         out.push_layout(LayoutNode::Fill);
     }
 }
@@ -780,7 +780,7 @@ impl View for ImageUiImage {
     type Arity = Single;
 
     fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
-        out.push(RenderNode::leaf(format!("Image ({})", self.0)));
+        out.push(RenderNode::leaf(crate::view::print_line(|| format!("Image ({})", self.0))));
         out.push_layout(LayoutNode::Image { source: None, resizable: false, fit: None });
     }
 }
@@ -808,7 +808,7 @@ impl View for Image {
     type Arity = Single;
 
     fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
-        out.push(RenderNode::leaf(format!("Image ({:?})", self.0)));
+        out.push(RenderNode::leaf(crate::view::print_line(|| format!("Image ({:?})", self.0))));
         out.push_layout(LayoutNode::Image {
             source: Some(self.0.clone()),
             resizable: false,
@@ -861,7 +861,7 @@ impl View for Icon {
     type Arity = Single;
 
     fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
-        out.push(RenderNode::leaf(format!("Icon ({})", self.symbol.name)));
+        out.push(RenderNode::leaf(crate::view::print_line(|| format!("Icon ({})", self.symbol.name))));
         out.push_layout(LayoutNode::Icon {
             symbol: self.symbol,
             resizable: false,
@@ -1738,7 +1738,7 @@ impl<C: View> View for TupleView<C> {
         let mut children = NodeList::new();
         self.children.render_into(ctx, &mut children);
         let (prints, layouts) = children.into_parts();
-        out.push(RenderNode::branch("TupleView", prints));
+        out.push(RenderNode::branch(crate::view::print_label("TupleView"), prints));
         out.push_layout(wrap_layout(layouts));
     }
 }
@@ -2359,7 +2359,7 @@ where
         self.each_row(items, ctx, &mut rows, last.map(|last| (last, true)));
         let (prints, layouts) = rows.into_parts();
         out.push(RenderNode::branch(
-            for_each_line(items.len(), self.axis, self.spacing, self.align),
+            crate::view::print_line(|| for_each_line(items.len(), self.axis, self.spacing, self.align)),
             prints,
         ));
         out.push_layout(LayoutNode::Stack {
@@ -2770,12 +2770,12 @@ impl<H: View, C: View> View for Section<H, C> {
             let mut header_nodes = NodeList::new();
             header.render_into(ctx, &mut header_nodes);
             let (header_prints, header_layouts) = header_nodes.into_parts();
-            children.push(RenderNode::branch("Header", header_prints));
+            children.push(RenderNode::branch(crate::view::print_label("Header"), header_prints));
             children.push_layout(wrap_layout(header_layouts));
         }
         self.children.render_into(ctx, &mut children);
         let (prints, layouts) = children.into_parts();
-        out.push(RenderNode::branch(self.kind.to_string(), prints));
+        out.push(RenderNode::branch(crate::view::print_line(|| self.kind.to_string()), prints));
         let stacked = LayoutNode::Stack {
             axis: Axis::Vertical,
             spacing: 0.0,
@@ -2849,7 +2849,7 @@ impl<C: View> View for NavigationStack<C> {
         self.children.render_into(ctx, &mut children);
         let (prints, layouts) = children.into_parts();
         out.push(RenderNode::branch(
-            format!("NavigationStack{detail}"),
+            crate::view::print_line(|| format!("NavigationStack{detail}")),
             prints,
         ));
         out.push_layout(wrap_layout(layouts));
@@ -2887,7 +2887,7 @@ impl<L: View> View for NavigationLink<L> {
         self.label.render_into(ctx, &mut label);
         let (prints, layouts) = label.into_parts();
         out.push(RenderNode::branch(
-            format!("NavigationLink → {}", self.detail),
+            crate::view::print_line(|| format!("NavigationLink → {}", self.detail)),
             prints,
         ));
         out.push_layout(wrap_layout(layouts));
@@ -2923,7 +2923,7 @@ impl View for ToolbarItem {
     type Arity = Single;
 
     fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
-        out.push(RenderNode::leaf("ToolbarItem"));
+        out.push(RenderNode::leaf(crate::view::print_label("ToolbarItem")));
     }
 }
 
@@ -2944,7 +2944,7 @@ impl<C: View> View for WindowGroup<C> {
         let mut children = NodeList::new();
         self.children.render_into(ctx, &mut children);
         let (prints, layouts) = children.into_parts();
-        out.push(RenderNode::branch("WindowGroup", prints));
+        out.push(RenderNode::branch(crate::view::print_label("WindowGroup"), prints));
         out.push_layout(wrap_layout(layouts));
     }
 }

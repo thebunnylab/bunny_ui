@@ -378,15 +378,15 @@ pub fn end_pass() -> Vec<String> {
         let Some(root) = registry.pass_root.clone() else {
             return Vec::new();
         };
-        let prefix = format!("{root}/");
-        let under_root =
-            |owner: &str| owner == root || owner.starts_with(&prefix);
+        let below_root = |owner: &str| {
+            owner == root || owner.strip_prefix(root.as_str()).is_some_and(|rest| rest.starts_with('/'))
+        };
         let pass_no = registry.pass_no;
         let dead: Vec<String> = registry
             .owners
             .iter()
             .filter(|(owner, record)| {
-                under_root(owner)
+                below_root(owner)
                     && record.touched != pass_no
                     && !protected_by_skip(&registry, owner)
             })
@@ -564,12 +564,21 @@ pub fn invalidate(path: &str) {
 pub fn has_dirty_matching(root: &str) -> bool {
     REGISTRY.with(|registry| {
         let registry = registry.borrow();
-        let prefix = format!("{root}/");
-        registry
-            .dirty
-            .iter()
-            .any(|path| path == ROOT_READER || path == root || path.starts_with(&prefix))
+        // most frames ask with nothing dirty: no walk, no string
+        if registry.dirty.is_empty() {
+            return false;
+        }
+        registry.dirty.iter().any(|path| under_root(path, root))
     })
+}
+
+/// Is `path` the root itself, below it, or the root region — the three
+/// readers a pass over `root` serves? No string is made: the root is cut
+/// off the path and the slash checked where it stands.
+fn under_root(path: &str, root: &str) -> bool {
+    path == ROOT_READER
+        || path == root
+        || path.strip_prefix(root).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// End of the pass: consumes from the registry the dirt this pass served —
@@ -581,10 +590,8 @@ pub fn consume_dirty(root: &str, snapshot: &HashSet<String>) {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         let registry = &mut *registry;
-        let prefix = format!("{root}/");
         for path in snapshot {
-            if (path == ROOT_READER || path == root || path.starts_with(&prefix))
-                && !registry.missed.contains(path)
+            if under_root(path, root) && !registry.missed.contains(path)
             {
                 registry.dirty.remove(path);
             }
@@ -1527,6 +1534,13 @@ thread_local! {
 /// the value, and those read outside a pass.
 pub fn write_epoch() -> u64 {
     WRITE_EPOCH.with(std::cell::Cell::get)
+}
+
+/// A write the register did not see — a publisher's send, a value kept
+/// outside `State` and `Store` that an effect polls for. It moves the
+/// epoch a shell and a settle read, so the pump that would notice it runs.
+pub fn note_external_write() {
+    WRITE_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
 }
 
 pub(crate) fn record_write(key: DepKey) {

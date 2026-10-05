@@ -331,7 +331,23 @@ thread_local! {
 }
 
 fn with_arena<T: 'static, R>(f: impl FnOnce(&mut TypedArena<T>) -> R) -> R {
-    let cell = ARENAS.with(|arenas| {
+    let cell = arena_cell::<T>();
+    let result = f(&mut cell.borrow_mut());
+    result
+}
+
+/// The arena of `T`, borrowed to READ: several reads of one type may
+/// nest (a value's `Display` that reads another `State`); a write inside
+/// one fails loudly, the rule `update` already keeps.
+fn with_arena_ref<T: 'static, R>(f: impl FnOnce(&TypedArena<T>) -> R) -> R {
+    let cell = arena_cell::<T>();
+    let result = f(&cell.borrow());
+    result
+}
+
+/// The arena of `T`, made on first use.
+fn arena_cell<T: 'static>() -> Rc<RefCell<TypedArena<T>>> {
+    ARENAS.with(|arenas| {
         let mut arenas = arenas.borrow_mut();
         arenas
             .entry(TypeId::of::<T>())
@@ -344,9 +360,7 @@ fn with_arena<T: 'static, R>(f: impl FnOnce(&mut TypedArena<T>) -> R) -> R {
             .clone()
             .downcast::<RefCell<TypedArena<T>>>()
             .expect("an arena registered by TypeId is always its own type")
-    });
-    let result = f(&mut cell.borrow_mut());
-    result
+    })
 }
 
 fn free_typed<T: 'static>(index: usize) {
@@ -404,6 +418,23 @@ impl<T: Clone + 'static> State<T> {
         })
     }
 
+    /// Reads the value in place: `f` sees it borrowed, and no clone is
+    /// made — what a `text!` that only prints it needs. The read records
+    /// itself as `get()`'s does. Reads of other `State`s may nest inside
+    /// `f`; a write to a `State` of the same type inside it fails loudly,
+    /// as `update`'s rule says.
+    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        crate::identity::record_read(crate::identity::DepKey::State(self.dep));
+        with_arena_ref::<T, _>(|arena| {
+            let slot = arena
+                .slots
+                .get(self.index)
+                .filter(|slot| slot.generation == self.generation)
+                .expect(DEAD_STATE);
+            f(slot.value.as_ref().expect(DEAD_STATE))
+        })
+    }
+
     pub fn set(&self, value: T) {
         with_arena::<T, _>(|arena| {
             let slot = arena
@@ -455,7 +486,8 @@ impl<T: Clone + 'static> State<T> {
 /// at all.
 impl<T: Clone + std::fmt::Display + 'static> std::fmt::Display for State<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.wrappedValue().fmt(f)
+        // in place: a label that prints a number clones nothing
+        self.with(|value| value.fmt(f))
     }
 }
 
