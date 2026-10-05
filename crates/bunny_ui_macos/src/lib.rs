@@ -57,9 +57,13 @@ fn sync_frame_driver(runtime: &Runtime, pacer: &FramePacer, window: usize) {
 ///
 /// Asked after every frame and after every move of the hand — a move that
 /// changes no picture can still change the answer (one box is several
-/// surfaces: a gutter, then text), and it is the moment to put back a cursor
-/// AppKit replaced behind the shell's back. `insist` is the pointer's own ask
-/// ([`ffi::wear_cursor`]); a frame only speaks when its answer changed.
+/// surfaces: a gutter, then text), and both are the moment to put back a
+/// cursor AppKit replaced behind the shell's back ([`ffi::wear_cursor`]).
+/// A frame cannot leave that to the next move: a popover that comes in
+/// under a still hand is a window AppKit dresses in the arrow, inside the
+/// very frame that presents it. `insist` is false only where the cursor is
+/// not the scene's to set — mid-resize, where the window's edge wears its
+/// resizer.
 fn point_cursor(runtime: &Runtime, insist: bool) {
     let interaction = runtime.interaction();
     // a live divider drag keeps the resizer even while the pointer
@@ -110,8 +114,9 @@ fn point_cursor(runtime: &Runtime, insist: bool) {
         ffi::yield_cursor();
     } else {
         // the page sets its own cursor on every move: over it the
-        // shell never insists, only answers anew
-        ffi::wear_cursor(desired, insist && !over_host);
+        // shell never insists, only answers anew — and a hand the scene
+        // no longer holds is another window's to dress
+        ffi::wear_cursor(desired, insist && !over_host && interaction.pointer.is_some());
     }
 }
 
@@ -681,6 +686,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // one more turn; the frame it takes drains the queue on its way
     ffi::install_wake_source();
     runtime.set_wake_hook(std::sync::Arc::new(ffi::wake_from_any_thread));
+    // the cursor AppKit puts back between two of the shell's turns
+    ffi::install_cursor_keeper();
     // two owners: the keyboard gate and the event handler
     let root = Rc::new(root);
 
@@ -1080,9 +1087,22 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                                 && overlay.path.starts_with(dialog_path.as_str())
                         })
                         .map_or(window, |(_, dialog)| *dialog);
-                    let panel = store
-                        .entry(overlay.path.clone())
-                        .or_insert_with(|| ffi::create_panel(&host, w, h));
+                    let panel = store.entry(overlay.path.clone()).or_insert_with(|| {
+                        let panel = ffi::create_panel(&host, w, h);
+                        // A tooltip explains and a drag's label rides the
+                        // hand: neither takes input, and the bleed puts each
+                        // panel right over the box under the hand. Tracked,
+                        // each would take the pointer from the window beneath
+                        // it — its entry and exit read as the hand crossing
+                        // windows — and AppKit would dress it in the arrow as
+                        // it came and went.
+                        if overlay.path == bunny_ui::layout::TOOLTIP_PATH
+                            || overlay.path == bunny_ui::layout::DRAG_LABEL_PATH
+                        {
+                            panel.pass_pointer_through();
+                        }
+                        panel
+                    });
                     panel.set_frame_screen(window.layout_rect_to_screen(x, y, w, h));
                     panel.set_scene_origin(x, y);
                     let slice = full_display.translated_slice(overlay.display, -x, -y);
@@ -1392,6 +1412,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         let audit_last = Rc::clone(&audit_last);
         let audit_expects_same = Rc::clone(&audit_expects_same);
         let pacer = Rc::clone(&pacer);
+        let resizing = Rc::clone(&resizing);
         move |runtime: &Runtime, root: &_, via: trace::Origin| {
             // the handles' commands are spent BEFORE the frame
             // renders: the state an expired eval writes lands in this
@@ -1524,7 +1545,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 );
             }
             present(runtime, display, via);
-        point_cursor(runtime, false);
+        point_cursor(runtime, !resizing());
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
             let rect = snapshot.caret_rect;
             (
@@ -2074,7 +2095,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 let display = runtime.animation_frame(root, Size { width, height });
                 handler_present(runtime, display, trace::Origin::Frame);
                 // a spring or a fling moved content under a still hand
-                point_cursor(runtime, false);
+                point_cursor(runtime, !handler_resizing());
             } else if moved.islands {
                 // mid-resize the boxes are in the drawable, not on
                 // layers — a step repaints the scene like any other
@@ -2110,7 +2131,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     let (width, height) = window.content_size();
                     let display = runtime.animation_frame(root, Size { width, height });
                     handler_present(runtime, display, trace::Origin::Frame);
-                    point_cursor(runtime, false);
+                    point_cursor(runtime, !handler_resizing());
                 }
             }
             sync_frame_driver(runtime, &handler_pacer, window_id);
