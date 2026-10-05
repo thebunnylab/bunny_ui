@@ -322,7 +322,36 @@ impl ShelfPacker {
         self.shelves.clear();
         self.next_y = 0;
     }
+
+    /// The bands the shelves stand on, by their top row.
+    fn shelf_ys(&self) -> impl Iterator<Item = u32> + '_ {
+        self.shelves.iter().map(|shelf| shelf.y)
+    }
+
+    /// The shelf a tile row lies on, by its top row.
+    fn shelf_y_of(&self, tile_y: u32) -> Option<u32> {
+        self.shelves
+            .iter()
+            .find(|shelf| shelf.y <= tile_y && tile_y < shelf.y + shelf.height)
+            .map(|shelf| shelf.y)
+    }
+
+    /// Opens the named shelves for new tiles again: the row stays its
+    /// height, its cursor goes back to the left edge.
+    fn free_shelves(&mut self, freed: &[u32]) {
+        for shelf in &mut self.shelves {
+            if freed.contains(&shelf.y) {
+                shelf.cursor = 0;
+            }
+        }
+    }
 }
+
+/// How many walks a tile is kept once nobody reads it. The frames in
+/// flight read tiles a few walks old at most (three drawables, a retry
+/// or two): a shelf no walk read for this many is one no drawable still
+/// samples, so it is given back with no drain.
+pub const ATLAS_KEEP_WALKS: u64 = 8;
 
 /// The atlas is full — the caller drains the in-flight frames, resets
 /// (growing once to the cap) and walks the frame again.
@@ -341,6 +370,9 @@ pub struct RunEntry {
     pub tiles: Vec<Tile>,
     pub width: u32,
     pub height: u32,
+    /// The last walk that read it — what the collector asks before it
+    /// gives a shelf back.
+    pub walk: u64,
 }
 
 fn packed_color(color: Color) -> u32 {
@@ -350,7 +382,9 @@ fn packed_color(color: Color) -> u32 {
 /// The lookup hash — computed WITHOUT allocating (typing must never pay
 /// a String per warm frame); collisions resolve by comparing the entry.
 fn run_hash(font: FontKey, color: u32, scale: u32, content: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // every text line of every presented frame passes here: the house
+    // hash, not SipHash
+    let mut hasher = motor::hash::FxHasher::default();
     font.hash(&mut hasher);
     color.hash(&mut hasher);
     scale.hash(&mut hasher);
@@ -362,6 +396,8 @@ fn run_hash(font: FontKey, color: u32, scale: u32, content: &str) -> u64 {
 /// physical size.
 pub struct ImageEntry {
     pub tiles: Vec<Tile>,
+    /// The last walk that read it.
+    pub walk: u64,
 }
 
 /// What `resolve_image` hands the frame walk: shared tiles, or one
@@ -637,13 +673,15 @@ impl RunAtlas {
                 tiles,
                 width,
                 height,
+                walk: self.walk,
             });
         }
+        let walk = self.walk;
         let entry = self
             .entries
-            .get(&hash)
+            .get_mut(&hash)
             .and_then(|bucket| {
-                bucket.iter().find(|entry| {
+                bucket.iter_mut().find(|entry| {
                     entry.font == key
                         && entry.color == packed
                         && entry.scale == scale as u32
@@ -651,7 +689,61 @@ impl RunAtlas {
                 })
             })
             .expect("a run just resolved lives in the atlas");
-        Ok(Some(entry))
+        // read this walk: the collector keeps what a recent walk read
+        entry.walk = walk;
+        Ok(Some(&*entry))
+    }
+
+    /// The copying collector's cheaper cousin: a shelf nobody read for
+    /// `keep_walks` walks is given back — its runs and images forgotten,
+    /// its row open for new tiles — with no drain and no re-raster of
+    /// what still shows. An entry astride a freed shelf goes with it; the
+    /// tiles it left on another shelf are that shelf's to reuse when its
+    /// own turn comes. Answers how many shelves were freed; none, and the
+    /// caller takes the old road, the drain and the reset.
+    pub fn evict_stale(&mut self, keep_walks: u64) -> usize {
+        let walk = self.walk;
+        // the newest read of each shelf, by the tiles standing on it
+        let mut newest: Vec<(u32, u64)> = self.packer.shelf_ys().map(|y| (y, 0)).collect();
+        {
+            let packer = &self.packer;
+            let mut touch = |tile_y: u32, read: u64| {
+                if let Some(y) = packer.shelf_y_of(tile_y)
+                    && let Some(slot) = newest.iter_mut().find(|(top, _)| *top == y)
+                {
+                    slot.1 = slot.1.max(read);
+                }
+            };
+            for entry in self.entries.values().flatten() {
+                for tile in &entry.tiles {
+                    touch(tile.y, entry.walk);
+                }
+            }
+            for image in self.images.values() {
+                for tile in &image.tiles {
+                    touch(tile.y, image.walk);
+                }
+            }
+        }
+        let freed: Vec<u32> = newest
+            .iter()
+            .filter(|(_, read)| walk.wrapping_sub(*read) > keep_walks)
+            .map(|(y, _)| *y)
+            .collect();
+        if freed.is_empty() {
+            return 0;
+        }
+        let packer = &self.packer;
+        let on_freed = |tiles: &[Tile]| {
+            tiles.iter().any(|tile| packer.shelf_y_of(tile.y).is_some_and(|y| freed.contains(&y)))
+        };
+        self.entries.retain(|_, bucket| {
+            bucket.retain(|entry| !on_freed(&entry.tiles));
+            !bucket.is_empty()
+        });
+        self.images.retain(|_, image| !on_freed(&image.tiles));
+        self.packer.free_shelves(&freed);
+        freed.len()
     }
 
     /// The texels for one image at one physical size — warm from a map,
@@ -688,7 +780,8 @@ impl RunAtlas {
             return Ok(Some(ResolvedImage::Dedicated(entry.id, entry.width, entry.height)));
         }
         let shelf_size = height <= DEDICATED_HEIGHT && width * height <= DEDICATED_AREA;
-        if shelf_size && self.images.contains_key(&cache_key) {
+        if shelf_size && let Some(entry) = self.images.get_mut(&cache_key) {
+            entry.walk = walk;
             return Ok(self.images.get(&cache_key).map(ResolvedImage::Tiles));
         }
         let Some(raster) = raster_source(engine, source, width as usize, height as usize) else {
@@ -697,7 +790,7 @@ impl RunAtlas {
         if shelf_size {
             match self.shelve(ground, &raster, width, height) {
                 Ok(tiles) => {
-                    self.images.insert(cache_key, ImageEntry { tiles });
+                    self.images.insert(cache_key, ImageEntry { tiles, walk });
                     return Ok(self.images.get(&cache_key).map(ResolvedImage::Tiles));
                 }
                 // the shelves hold nothing but this walk's own tiles: a
@@ -1957,5 +2050,45 @@ mod tests {
         // numbers in a place a person reads
         assert_eq!(std::mem::size_of::<GlassInstance>(), 112);
         assert_eq!(std::mem::offset_of!(GlassInstance, tint), 96);
+    }
+
+    #[test]
+    fn a_shelf_nobody_read_for_a_while_is_given_back_without_a_reset() {
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let font = FontSpec::DEFAULT;
+        let engine = crate::text_engine::PixelFont;
+        // one walk fills shelves with runs nobody reads again
+        atlas.begin_walk();
+        for i in 0..100 {
+            atlas.resolve(&mut ground, &format!("an old run number {i}"), &font, Color::BLACK, 2, &engine).unwrap();
+        }
+        let shelves = atlas.packer.shelves.len();
+        assert!(shelves >= 4, "the old runs opened shelves: {shelves}");
+        let rows_used = atlas.packer.next_y;
+        // the walks after it read one run each: that run's shelf stays warm
+        for _ in 0..=ATLAS_KEEP_WALKS {
+            atlas.begin_walk();
+            atlas.resolve(&mut ground, "the run still read", &font, Color::BLACK, 2, &engine).unwrap();
+        }
+        let old_before = atlas.entries.values().flatten().filter(|entry| entry.content.starts_with("an old")).count();
+        assert_eq!(old_before, 100);
+        let freed = atlas.evict_stale(ATLAS_KEEP_WALKS);
+        assert!(freed >= 1, "shelves nobody read are given back: {freed}");
+        assert!(freed < shelves, "the shelf of the run still read stands");
+        assert_eq!(atlas.packer.next_y, rows_used, "no reset: the shelves keep their rows");
+        assert_eq!(ground.drops, 0, "no reset: the texture stands");
+        let old_after = atlas.entries.values().flatten().filter(|entry| entry.content.starts_with("an old")).count();
+        assert!(old_after < old_before, "the old runs on the freed shelves are forgotten: {old_after} of {old_before}");
+        assert!(
+            atlas.entries.values().flatten().any(|entry| entry.content == "the run still read"),
+            "the run still read stands"
+        );
+        // the freed shelves take new tiles at their left edge
+        atlas.begin_walk();
+        let uploads = ground.uploads.len();
+        atlas.resolve(&mut ground, "a fresh run", &font, Color::BLACK, 2, &engine).unwrap();
+        assert!(ground.uploads.len() > uploads, "the fresh run landed on a shelf");
+        assert_eq!(atlas.packer.next_y, rows_used, "on a freed shelf, not a new row");
     }
 }
