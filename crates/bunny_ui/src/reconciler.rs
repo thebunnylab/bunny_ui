@@ -868,11 +868,12 @@ pub(crate) fn measure_retained(
     (size, Fit::Shared(fit))
 }
 
-/// A body re-ran at `path`: the boundaries above it may size themselves
-/// by it, so what they kept is stale. Ancestors are prefixes of the path
-/// at a `/`. An id can hold a `/` of its own, so a prefix may name no
-/// entry — and then there is nothing to clear.
-fn clear_measures_above(path: &str) {
+/// Something under `path` changed size without a body of its own running
+/// — a body re-ran, or a bound text read a new value: the boundaries above
+/// it may size themselves by it, so what they kept is stale. Ancestors are
+/// prefixes of the path at a `/`. An id can hold a `/` of its own, so a
+/// prefix may name no entry — and then there is nothing to clear.
+pub(crate) fn clear_measures_above(path: &str) {
     LIVE.with(|live| {
         let live = live.borrow();
         for (at, _) in path.match_indices('/') {
