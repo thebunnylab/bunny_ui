@@ -1790,6 +1790,97 @@ mod tests {
         }
     }
 
+    /// Only the box the hand REACHES names the cursor. A frame says nothing of
+    /// what covers it — a button floating over a text box, the header a
+    /// scrolled page slides under, a menu opened over the text — and the box
+    /// under each of them answered for it: the same button wore the hand beside
+    /// the text and the I-beam on top of it.
+    #[test]
+    fn only_the_box_the_hand_reaches_names_the_cursor() {
+        /// Text wherever it is asked; a press opens a menu on it.
+        struct Prose;
+        impl CustomElement for Prose {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn name(&self) -> &str {
+                "prose"
+            }
+            fn cursor(&self, _at: Point, _visible: Rect) -> Option<crate::layout::Cursor> {
+                Some(crate::layout::Cursor::Text)
+            }
+            fn event(&self, event: &ElementEvent, ctx: &EventCtx) -> Response {
+                let ElementEvent::PointerDown { at, .. } = event else {
+                    return Response::ignored();
+                };
+                ctx.open_menu(*at, vec![crate::views::menu_item("Copy", || {})]);
+                Response::handled()
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct Screen;
+        impl Component for Screen {
+            fn body(self, _ctx: &ViewContext) -> impl View {
+                use crate::ext::ViewExt;
+                use crate::views::{button, text};
+                let button = |label: &'static str| button(text(label), || {});
+                crate::vstack!(
+                    button("Header").id("header").frame(200.0, 40.0),
+                    crate::views::scroll(custom(Prose).frame(200.0, 400.0).overlay(
+                        crate::layout::UnitPoint::TOP,
+                        button("Copy").id("copy").frame(60.0, 30.0),
+                    )),
+                )
+            }
+        }
+        use crate::layout::Cursor::Text;
+        let center = |rect: Rect| {
+            (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0)
+        };
+        let hit = |laid: &crate::layout::LayoutResult, name: &str| {
+            let found = laid.hits.iter().find(|(path, _)| path.contains(name));
+            found.map(|(_, rect)| *rect).expect(name)
+        };
+
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 200.0 };
+        let laid = runtime.layout(&Screen, Proposal::exact(size));
+        let prose = laid.customs[0].frame;
+
+        let (x, y) = center(hit(&laid, "copy"));
+        runtime.pointer_moved(x, y, false);
+        assert!(prose.contains(x, y), "the button floats over the text");
+        assert_eq!(runtime.hovered_cursor(), None, "the button's own rule, not the text's");
+        assert!(runtime.interaction().hovered.is_some(), "and that rule is the hand");
+        runtime.pointer_moved(x, y + 40.0, false);
+        assert_eq!(runtime.hovered_cursor(), Some(Text), "beside the button: the text");
+
+        // the page slides under the header, and the text's frame with it
+        let region = laid.scrolls[0].path.clone();
+        runtime.set_scroll_offset(&region, Point { x: 0.0, y: 100.0 });
+        let laid = runtime.layout(&Screen, Proposal::exact(size));
+        let (x, y) = center(hit(&laid, "header"));
+        assert!(laid.customs[0].frame.contains(x, y), "the text's frame runs under the header");
+        runtime.pointer_moved(x, y, false);
+        assert_eq!(runtime.hovered_cursor(), None, "the scroller clipped the text away from it");
+
+        // a menu opened over the text covers it
+        let (x, y) = (40.0, 150.0);
+        runtime.pointer_moved(x, y, false);
+        assert_eq!(runtime.hovered_cursor(), Some(Text));
+        runtime.pointer_clicked(x, y, 1, false);
+        runtime.pointer_released(x, y);
+        let laid = runtime.layout(&Screen, Proposal::exact(size));
+        let menu = laid
+            .overlays
+            .iter()
+            .find(|overlay| overlay.path == crate::layout::MENU_PATH)
+            .expect("the menu is open")
+            .frame;
+        let (x, y) = center(menu);
+        assert!(laid.customs[0].frame.contains(x, y), "the menu lies over the text");
+        runtime.pointer_moved(x, y, false);
+        assert_eq!(runtime.hovered_cursor(), None, "over the menu the text says nothing");
+    }
+
     /// A box that is chrome leaves the keyboard where it was: a grip is
     /// pressed, dragged and let go beside the field the reader is typing
     /// into, and the field keeps the keys — the manners the framework's own
