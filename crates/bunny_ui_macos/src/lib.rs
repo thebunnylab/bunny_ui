@@ -1580,7 +1580,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 trace::mark(
                     "F",
                     format_args!(
-                        "settle={:.2} layout={:.2} pass={:.2} asm={:.2} measure={:.2} place={:.2} hover={:.2} passes={} layouts={} asm#={} hover#={} paints={} cmds={}",
+                        "settle={:.2} layout={:.2} pass={:.2} asm={:.2} measure={:.2} place={:.2} hover={:.2} passes={} layouts={} asm#={} hover#={} paints={} cmds={} mk={} mm={}",
                         ms(Stage::Settle),
                         ms(Stage::Layout),
                         ms(Stage::Pass),
@@ -1594,6 +1594,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         stats.hover_relayouts,
                         stats.paints,
                         display.len(),
+                        stats.measures_kept,
+                        stats.measures_made,
                     ),
                 );
             }
