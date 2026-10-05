@@ -2387,10 +2387,15 @@ impl Runtime {
     /// What the pointer should look like where it is — the box under it
     /// answers, or `None` and the shell's own rule stands.
     ///
-    /// Topmost first, because the boxes are placed in paint order and the one
-    /// drawn last is the one the eye sees. The point reaches the box in ITS
-    /// coordinates, with the viewport beside it: a surface whose regions move
-    /// with the scroll (a pinned gutter) cannot answer from an x alone.
+    /// The box under the hand is the one the HIT TEST hands the pointer to at
+    /// that point, never a box whose frame merely holds it. A frame says
+    /// nothing of what covers it: a button floating over an editor, the
+    /// header a scrolled page slides under, a modal, an open menu. Asked by
+    /// frame, the box beneath answered for all of them, and one button wore
+    /// the hand beside the text and the I-beam on top of it. The point
+    /// reaches the box in ITS coordinates, with the viewport beside it: a
+    /// surface whose regions move with the scroll (a pinned gutter) cannot
+    /// answer from an x alone.
     ///
     /// A box that took the press holds the pointer until the release, and
     /// while it holds it, it answers first — wherever the hand has run. The
@@ -2398,7 +2403,7 @@ impl Runtime {
     /// layout moves it a beat later), and a resizer that became whatever lay
     /// under the hand would say the drag had let go while it had not; the
     /// seam keeps its resizer the same way ([`Self::seam_axis`]). A holding
-    /// box that says nothing at that point leaves the question to the boxes
+    /// box that says nothing at that point leaves the question to the box
     /// under the hand.
     pub fn hovered_cursor(&self) -> Option<crate::layout::Cursor> {
         let interaction = self.interaction.borrow();
@@ -2421,18 +2426,17 @@ impl Runtime {
         if over_text {
             return Some(crate::layout::Cursor::Text);
         }
-        let customs = self.last_customs.borrow();
-        customs.iter().rev().find_map(|placement| {
-            let local = crate::layout::Point {
-                x: at.x - placement.frame.origin.x,
-                y: at.y - placement.frame.origin.y,
-            };
-            let inside = local.x >= 0.0
-                && local.y >= 0.0
-                && local.x <= placement.frame.size.width
-                && local.y <= placement.frame.size.height;
-            inside.then(|| placement.element.element().cursor(local, placement.visible)).flatten()
-        })
+        // an open menu lies over every box the scene placed
+        if self.menu_row_at(at.x, at.y).is_some_and(|(_, inside)| inside) {
+            return None;
+        }
+        // the hit test asked again, not the hover read back: a press, a
+        // grab or a sweep stops the hover from following the hand, and the
+        // question is the box under the hand NOW
+        let under = self.hover_target(at.x, at.y)?;
+        let placement = self.custom_at(&under)?;
+        let local = Self::local(&placement, at.x, at.y);
+        placement.element.element().cursor(local, placement.visible)
     }
 
     /// The seam the pointer is on, by the AXIS it resizes — `None` when
