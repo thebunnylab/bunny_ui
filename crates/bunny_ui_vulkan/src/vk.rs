@@ -43,7 +43,7 @@ use bunny_ui::text_engine::TextEngine;
 
 use bunny_ui::gpu::walk::{
     build_frame, AtlasFull, AtlasGround, DrawRun, FrameBatches, GlassInstance, RectInstance,
-    RoundClip, RunAtlas, RunKind, SpriteInstance, GLASS_MAX_LEVEL,
+    RoundClip, RunAtlas, RunKind, SpriteInstance, GLASS_MAX_LEVEL, ATLAS_KEEP_WALKS,
 };
 
 // MARK: - The committed shaders (SPIR-V beside their GLSL truth)
@@ -3939,6 +3939,11 @@ impl VkPresenter {
                         eprintln!("bunny_ui vk: atlas overflow survived the resets");
                         break;
                     }
+                    // the cheap road first: shelves nobody read for a while
+                    // are given back with no drain and no re-raster
+                    if attempt == 0 && self.atlas.evict_stale(ATLAS_KEEP_WALKS) > 0 {
+                        continue;
+                    }
                     drain_all(&self.stack, &mut self.slots);
                     let mut view =
                         VkGroundView { stack: &self.stack, ground: &mut self.ground };
@@ -4503,6 +4508,11 @@ impl OffscreenVk {
                     if attempt == 3 {
                         eprintln!("bunny_ui vk: atlas overflow survived the resets");
                         break;
+                    }
+                    // the cheap road first: shelves nobody read for a while
+                    // are given back with no drain and no re-raster
+                    if attempt == 0 && self.atlas.evict_stale(ATLAS_KEEP_WALKS) > 0 {
+                        continue;
                     }
                     drain_all(&self.stack, &mut self.slots);
                     let mut view =

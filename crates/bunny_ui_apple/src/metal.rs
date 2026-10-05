@@ -37,7 +37,7 @@ use std::ptr::null_mut;
 
 use bunny_ui::gpu::walk::{
     AtlasFull, AtlasGround, DrawRun, FrameBatches, GLASS_MAX_LEVEL, GlassInstance, RectInstance,
-    RoundClip, RunAtlas, RunKind, SpriteInstance, build_frame,
+    RoundClip, RunAtlas, RunKind, SpriteInstance, build_frame, ATLAS_KEEP_WALKS,
 };
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::image_engine::PixelFormat;
@@ -2048,6 +2048,17 @@ impl MetalPresenter {
                         // rest of the text — never a crash
                         eprintln!("bunny_ui metal: atlas overflow survived two resets");
                         return;
+                    }
+                    // the cheap road first: shelves nobody read for a while
+                    // are given back with no drain and no re-raster of what
+                    // still shows — a scrolled file or a terminal's log
+                    // leave rows of text behind that only a reset took back
+                    if attempt == 0 {
+                        let freed = self.atlas.evict_stale(ATLAS_KEEP_WALKS);
+                        if freed > 0 {
+                            crate::trace::mark("X", format_args!("what=atlas-evict shelves={freed}"));
+                            continue;
+                        }
                     }
                     crate::trace::mark("X", format_args!("what=atlas-drain"));
                     self.drain_slots();
