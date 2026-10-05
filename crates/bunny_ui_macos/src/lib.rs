@@ -72,6 +72,36 @@ fn sync_frame_driver(runtime: &Runtime, pacer: &FramePacer, window: usize) {
     pacer.set_beating(ffi::want_beat(window, wanted));
 }
 
+/// Presents live blits on their layers — the islands' road, which the
+/// window behind them never takes. The flip is into the world the boxes
+/// were PLACED in: mid-resize the view is already the new size while the
+/// last layout is still the old one.
+fn present_live_blits(window: &ffi::WindowHandle, runtime: &Runtime, blits: Vec<bunny_ui::runtime::LiveBlit>) {
+    if blits.is_empty() {
+        return;
+    }
+    let scale = window.scale();
+    let (_, measured) = window.content_size();
+    let height = runtime.last_viewport().map_or(measured, |viewport| viewport.height);
+    if trace::active() {
+        trace::mark("L", format_args!("blits={}", blits.len()));
+    }
+    for blit in blits {
+        window.live_layer_blit(
+            &blit.path,
+            blit.frame.origin.x,
+            blit.frame.origin.y,
+            blit.frame.size.width,
+            blit.frame.size.height,
+            height,
+            scale,
+            blit.width,
+            blit.height,
+            &blit.rgba,
+        );
+    }
+}
+
 /// Dresses the pointer for where it is now.
 ///
 /// Asked after every frame and after every move of the hand — a move that
@@ -710,6 +740,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // timer (`ffi::aim_tasks`): a poller thirty milliseconds away no
     // longer keeps the display link beating at full rate
     runtime.drive_tasks_by_wall();
+    // a box's overlay — a caret — rides a layer of its own on the GPU
+    // road: a blink repaints the layer, and the window behind it stands
+    runtime.set_overlay_layers(metal::active());
     // the cursor AppKit puts back between two of the shell's turns
     ffi::install_cursor_keeper();
     // two owners: the keyboard gate and the event handler
@@ -1950,10 +1983,22 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         ),
                     );
                 }
-                if need.any() {
+                if need.any() && !need.only_paints() {
                     // a stream of results — an agent's tokens, a log — folds
                     // into the beat like a wheel does
                     soon(runtime, root, trace::Origin::Wake);
+                } else if need.paints {
+                    // only what some box paints was reached: an overlay
+                    // repaints on its own layer and the window behind it
+                    // never redraws; a plain box that read it takes the
+                    // frame's road
+                    let (blits, plain) = runtime.repaint_dirty_paints(window.scale());
+                    if plain || !metal::active() || window.in_live_resize() {
+                        soon(runtime, root, trace::Origin::Wake);
+                    } else {
+                        present_live_blits(&window, runtime, blits);
+                        sync_frame_driver(runtime, &handler_pacer, window_id);
+                    }
                 } else if frame_audit {
                     audit_expects_same.set(true);
                     blit(runtime, root, trace::Origin::Wake);
@@ -2131,8 +2176,20 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             //
             // The waiting door holds that law now: mid-drag it draws
             // nothing, and at rest the caret's frame is drawn at once.
-            if blinked || explained || chorded {
-                soon(runtime, root, trace::Origin::Blink);
+            // a caret on an overlay layer blinks on its layer alone
+            let layered = blinked
+                && !explained
+                && !chorded
+                && metal::active()
+                && !window.in_live_resize()
+                && !dialog_resizing();
+            let overlay = if layered { runtime.blink_overlay(window.scale()) } else { None };
+            match overlay {
+                Some(blits) => present_live_blits(&window, runtime, blits),
+                None if blinked || explained || chorded => {
+                    soon(runtime, root, trace::Origin::Blink);
+                }
+                None => {}
             }
             // The net under the beat. The display link belongs to ONE view,
             // and the system stops it while that view is hidden; asks that

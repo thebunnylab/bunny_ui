@@ -24,6 +24,7 @@
 //! I <ms> kind=<key|wheel|press|release|move|magnify>
 //! K <ms> <what the engine retains, counted> · atlas <counts> · presenters <n> · dialogs <n> · panels <n>
 //! D <ms> pace=<full|slow:<ms>|off>
+//! L <ms> blits=<n>   (live layers repainted alone: an overlay, a loop)
 //! ```
 //!
 //! `R` is a window callback (which notification asked, and at what

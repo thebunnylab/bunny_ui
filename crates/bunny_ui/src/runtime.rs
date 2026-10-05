@@ -318,6 +318,8 @@ pub struct Runtime {
     /// a sleeper's deadline is the shell's own alarm, never a reason to
     /// run the display link.
     task_driver: Cell<bool>,
+    /// Can the shell show a box's overlay on a layer of its own?
+    overlay_layers: Cell<bool>,
     /// When the task clock was last brought up to the wall.
     task_clock_last: Cell<Option<std::time::Instant>>,
     /// The size last HANDED to each measurement probe. A probe fires on
@@ -1379,6 +1381,7 @@ impl Runtime {
             key_sink: RefCell::new(None),
             touch_fresh: Cell::new(false),
             task_driver: Cell::new(false),
+            overlay_layers: Cell::new(false),
             task_clock_last: Cell::new(None),
             pending_aged: Cell::new(false),
             wheel_latch: RefCell::new(None),
@@ -5169,6 +5172,54 @@ impl Runtime {
     /// The shell calls this when a tick reports `islands` and presents
     /// each blit on the box's own surface (a layer on macOS, the
     /// island canvas on the web) — the window behind it never redraws.
+    /// The shell says whether it can show a box's overlay
+    /// ([`crate::custom::CustomElement::paint_overlay`]) on a layer of its
+    /// own. On, the layout places each overlay as an island; a write that
+    /// reaches only what the overlay read is answered by
+    /// [`Runtime::repaint_dirty_paints`] — the layer alone, no frame.
+    pub fn set_overlay_layers(&self, on: bool) {
+        self.overlay_layers.set(on);
+    }
+
+    /// The boxes a write reached since the last frame, repainted on their
+    /// own surfaces — the islands among them. The second answer says
+    /// whether a box that is NO island was reached: that one needs the
+    /// frame's road, and the shell draws a frame. The dirty paints are
+    /// taken either way: the frame repaints everything.
+    #[cfg(feature = "canvas")]
+    pub fn repaint_dirty_paints(&self, scale: usize) -> (Vec<LiveBlit>, bool) {
+        let dirty = motor::identity::take_dirty_paints();
+        if dirty.is_empty() {
+            return (Vec::new(), false);
+        }
+        let (islands, plain): (Vec<Rc<str>>, Vec<Rc<str>>) = {
+            let customs = self.last_customs.borrow();
+            dirty.into_iter().partition(|path| {
+                customs.iter().any(|placement| placement.is_island() && *placement.path == **path)
+            })
+        };
+        let blits = if islands.is_empty() { Vec::new() } else { self.live_repaint(scale, &islands) };
+        (blits, !plain.is_empty())
+    }
+
+    /// The focused box's overlay, repainted at the caret's new phase —
+    /// the blink's road when the box has an overlay island. `None` when
+    /// it has none: the shell draws a frame, as it always did.
+    #[cfg(feature = "canvas")]
+    pub fn blink_overlay(&self, scale: usize) -> Option<Vec<LiveBlit>> {
+        let island: Rc<str> = {
+            let focus = self.focus.borrow();
+            let focus = focus.as_deref()?;
+            let customs = self.last_customs.borrow();
+            let island = format!("{focus}/overlay");
+            if !customs.iter().any(|placement| placement.overlay && placement.path == island) {
+                return None;
+            }
+            Rc::from(island.as_str())
+        };
+        Some(self.live_repaint(scale, std::slice::from_ref(&island)))
+    }
+
     #[cfg(feature = "canvas")]
     pub fn live_islands(&self, scale: usize) -> Vec<LiveBlit> {
         let dirty = self.animator.borrow_mut().take_dirty_loops();
@@ -5190,7 +5241,7 @@ impl Runtime {
             .last_customs
             .borrow()
             .iter()
-            .filter(|placement| placement.live.is_some())
+            .filter(|placement| placement.is_island())
             .map(|placement| Rc::from(placement.path.as_str()))
             .collect();
         if paths.is_empty() {
@@ -5207,7 +5258,7 @@ impl Runtime {
         self.last_customs
             .borrow()
             .iter()
-            .filter(|placement| placement.live.is_some())
+            .filter(|placement| placement.is_island())
             .map(|placement| {
                 (
                     placement.path.clone(),
@@ -5231,7 +5282,7 @@ impl Runtime {
         self.last_customs
             .borrow()
             .iter()
-            .filter(|placement| placement.live.is_some())
+            .filter(|placement| placement.is_island())
             .map(|placement| placement.slice)
             .collect()
     }
@@ -5243,7 +5294,7 @@ impl Runtime {
         self.last_customs
             .borrow()
             .iter()
-            .filter(|placement| placement.live.is_some())
+            .filter(|placement| placement.is_island())
             .map(|placement| placement.path.clone())
             .collect()
     }
@@ -5419,47 +5470,85 @@ impl Runtime {
         ledger.retain(|path, _| {
             customs
                 .iter()
-                .any(|placement| placement.live.is_some() && *placement.path == **path)
+                .any(|placement| placement.is_island() && *placement.path == **path)
         });
         let focus = self.focus.borrow().clone();
         let mut blits = Vec::new();
         for path in dirty {
             let Some(placement) = customs
                 .iter()
-                .find(|placement| placement.live.is_some() && *placement.path == **path)
+                .find(|placement| placement.is_island() && *placement.path == **path)
             else {
                 continue;
             };
-            let spec = placement.live.expect("filtered on live above");
-            let phase = self.animator.borrow_mut().resolve_phase(&placement.path, spec);
-            // repaint in LOCAL coordinates: the painter's origin undoes
-            // the visible window, so the pixels cover exactly what the
-            // screen shows of the box
+            let phase = match placement.live {
+                Some(spec) => self.animator.borrow_mut().resolve_phase(&placement.path, spec),
+                None => 0.0,
+            };
             let mut display = crate::layout::DisplayList::default();
-            let focused = focus.as_deref() == Some(placement.path.as_str());
-            let ctx = crate::custom::PaintCtx {
-                frame: placement.frame,
-                visible: placement.visible,
-                metrics: crate::custom::Metrics::new(&*self.text, &self.cache, placement.font),
-                focused,
-                caret_visible: focused && self.caret_visible.get(),
-                phase,
-                scale: self.device_scale.get(),
-                touch: self.touch_modality.get(),
-            };
-            let origin = crate::layout::Point {
-                x: -placement.visible.origin.x,
-                y: -placement.visible.origin.y,
-            };
-            let mut painter = crate::custom::Painter::new(
-                &mut display,
-                origin,
-                placement.font,
-                placement.ink,
-            );
-            motor::identity::begin_paint(&placement.path);
-            placement.element.element().paint(&ctx, &mut painter);
-            motor::identity::end_paint();
+            if placement.overlay {
+                // an overlay paints in its BOX's coordinates: the painter's
+                // origin puts the box's top-left where it stands relative to
+                // the overlay's own pixels
+                let box_path = placement.path.strip_suffix("/overlay").unwrap_or(&placement.path);
+                let Some(owner) = customs.iter().find(|owner| owner.path == box_path) else {
+                    continue;
+                };
+                let focused = focus.as_deref() == Some(owner.path.as_str());
+                let ctx = crate::custom::PaintCtx {
+                    frame: owner.frame,
+                    visible: owner.visible,
+                    metrics: crate::custom::Metrics::new(&*self.text, &self.cache, placement.font),
+                    focused,
+                    caret_visible: focused && self.caret_visible.get(),
+                    phase: 0.0,
+                    scale: self.device_scale.get(),
+                    touch: self.touch_modality.get(),
+                    overlay_layered: true,
+                };
+                let origin = crate::layout::Point {
+                    x: owner.frame.origin.x - placement.frame.origin.x,
+                    y: owner.frame.origin.y - placement.frame.origin.y,
+                };
+                let mut painter = crate::custom::Painter::new(
+                    &mut display,
+                    origin,
+                    placement.font,
+                    placement.ink,
+                );
+                motor::identity::begin_paint(&placement.path);
+                let _ = owner.element.element().paint_overlay(&ctx, &mut painter);
+                motor::identity::end_paint();
+            } else {
+                // repaint in LOCAL coordinates: the painter's origin undoes
+                // the visible window, so the pixels cover exactly what the
+                // screen shows of the box
+                let focused = focus.as_deref() == Some(placement.path.as_str());
+                let ctx = crate::custom::PaintCtx {
+                    frame: placement.frame,
+                    visible: placement.visible,
+                    metrics: crate::custom::Metrics::new(&*self.text, &self.cache, placement.font),
+                    focused,
+                    caret_visible: focused && self.caret_visible.get(),
+                    phase,
+                    scale: self.device_scale.get(),
+                    touch: self.touch_modality.get(),
+                    overlay_layered: false,
+                };
+                let origin = crate::layout::Point {
+                    x: -placement.visible.origin.x,
+                    y: -placement.visible.origin.y,
+                };
+                let mut painter = crate::custom::Painter::new(
+                    &mut display,
+                    origin,
+                    placement.font,
+                    placement.ink,
+                );
+                motor::identity::begin_paint(&placement.path);
+                placement.element.element().paint(&ctx, &mut painter);
+                motor::identity::end_paint();
+            }
             let physical = (
                 ((placement.visible.size.width.round() as usize) * scale).max(1),
                 ((placement.visible.size.height.round() as usize) * scale).max(1),
@@ -6521,6 +6610,7 @@ impl Runtime {
             caret_visible: self.caret_visible.get(),
         };
         self.cache.begin_frame();
+        crate::layout::set_overlay_layers(self.overlay_layers.get());
         // the animator's sweep clock follows PLACES, not ticks — this
         // pass's touches mark who is still mounted. A pass whose
         // proposal CHANGED is a resize: geometry moved because the
@@ -7036,6 +7126,12 @@ pub struct FrameNeed {
 }
 
 impl FrameNeed {
+    /// Is a box's paint the ONLY reason? Then a shell that layers overlays
+    /// repaints them alone, and draws no frame.
+    pub fn only_paints(self) -> bool {
+        self.paints && !FrameNeed { paints: false, ..self }.any()
+    }
+
     pub fn any(self) -> bool {
         self.asked
             || self.dirty

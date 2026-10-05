@@ -61,6 +61,20 @@ pub trait CustomElement: 'static {
     /// stack lets through, so a long document paints one screen.
     fn paint(&self, ctx: &PaintCtx, painter: &mut Painter);
 
+    /// The box's OVERLAY: what it paints over its own picture and moves
+    /// on its own — a caret, a blinking mark. Painted in LOCAL
+    /// coordinates like `paint`, and answered with the rect it covers
+    /// (local too), or `None` for a box with none. A shell that can show
+    /// the overlay on a layer of its own places it as an island: its
+    /// commands are carved out of the scene and presented above it, and a
+    /// write that reaches only what the overlay read repaints the layer —
+    /// the window behind it never redraws. Then `ctx.overlay_layered` is
+    /// true in `paint`, which leaves the overlay out, since the layer
+    /// shows it. Where no layer can, the box paints as it always did.
+    fn paint_overlay(&self, _ctx: &PaintCtx, _painter: &mut Painter) -> Option<Rect> {
+        None
+    }
+
     /// The answer to the parent's proposal. The default takes what was
     /// proposed (and zero on an axis the parent left open).
     ///
@@ -381,6 +395,9 @@ pub struct PaintCtx<'a> {
     /// The blink phase the caret follows — the box paints its own
     /// caret, the runtime only says when it shows.
     pub caret_visible: bool,
+    /// Is the box's overlay ([`CustomElement::paint_overlay`]) shown on
+    /// a layer of its own? Then `paint` leaves it out.
+    pub overlay_layered: bool,
     /// Where the enclosing `.looping(...)` clock is in its cycle
     /// (0..1), snapped onto the loop's step grid. Zero outside a loop.
     /// The paint must be a pure function of it — the geometry the
