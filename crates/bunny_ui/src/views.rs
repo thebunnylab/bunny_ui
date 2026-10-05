@@ -526,6 +526,8 @@ pub struct Split<T: 'static, A, B> {
     min_a: f64,
     min_b: f64,
     trailing: bool,
+    hide_a: bool,
+    hide_b: bool,
     a: A,
     b: B,
 }
@@ -540,7 +542,7 @@ where
     A: View<Arity = Single>,
     B: View<Arity = Single>,
 {
-    Split { at, axis: Axis::Horizontal, min_a: T::FLOOR, min_b: T::FLOOR, trailing: false, a, b }
+    Split { at, axis: Axis::Horizontal, min_a: T::FLOOR, min_b: T::FLOOR, trailing: false, hide_a: false, hide_b: false, a, b }
 }
 
 /// `vsplit(at, top, bottom)` — the same seam, stacked. `at` is the TOP
@@ -551,7 +553,7 @@ where
     A: View<Arity = Single>,
     B: View<Arity = Single>,
 {
-    Split { at, axis: Axis::Vertical, min_a: T::FLOOR, min_b: T::FLOOR, trailing: false, a, b }
+    Split { at, axis: Axis::Vertical, min_a: T::FLOOR, min_b: T::FLOOR, trailing: false, hide_a: false, hide_b: false, a, b }
 }
 
 impl<T, A, B> Split<T, A, B> {
@@ -578,6 +580,28 @@ impl<T, A, B> Split<T, A, B> {
         self.trailing = true;
         self
     }
+
+    /// The leading lane is not shown: the trailing one takes the whole
+    /// extent and the seam goes with it — and BOTH lanes keep their place
+    /// in the tree. A lane that comes back is the same lane, and the one
+    /// that stayed never moved house: its state, its measures, its caret
+    /// are where they were.
+    ///
+    /// A dock that opens and closes beside an editor is this. Written as
+    /// an `if` — the split in one arm, the editor alone in the other — the
+    /// editor was a different tree in each state (an arm joins the
+    /// identity), and every toggle of the dock re-mounted it: fresh state,
+    /// every measure made again, every line shaped again.
+    pub fn hide_leading(mut self, hidden: bool) -> Self {
+        self.hide_a = hidden;
+        self
+    }
+
+    /// [`Self::hide_leading`], for the trailing lane.
+    pub fn hide_trailing(mut self, hidden: bool) -> Self {
+        self.hide_b = hidden;
+        self
+    }
 }
 
 impl<T, A, B> View for Split<T, A, B>
@@ -599,7 +623,13 @@ where
         };
         let divider =
             crate::ext::ViewExt::background_color(strut, crate::theme::divider());
-        (self.a.clone(), divider, self.b.clone()).render_into(ctx, &mut nodes);
+        // a hidden lane renders as nothing IN ITS PLACE: the tuple's
+        // positions are the identity, so the lane that shows keeps its path
+        let hidden = self.hide_a || self.hide_b;
+        let a = (!self.hide_a).then(|| self.a.clone());
+        let b = (!self.hide_b).then(|| self.b.clone());
+        let divider = (!hidden).then_some(divider);
+        (a, divider, b).render_into(ctx, &mut nodes);
         let (prints, layouts) = nodes.into_parts();
         out.push(RenderNode::branch(
             if crate::view::print_enabled() {
@@ -609,15 +639,40 @@ where
                     SeamUnit::Points => format!("at: {at}"),
                     SeamUnit::Fraction => format!("share: {at}"),
                 };
+                let lanes = match (self.hide_a, self.hide_b) {
+                    (false, false) => "",
+                    (true, false) => ", leading hidden",
+                    (false, true) => ", trailing hidden",
+                    (true, true) => ", both hidden",
+                };
                 match self.axis {
-                    Axis::Horizontal => format!("HSplitView({seam})"),
-                    Axis::Vertical => format!("VSplitView({seam})"),
+                    Axis::Horizontal => format!("HSplitView({seam}{lanes})"),
+                    Axis::Vertical => format!("VSplitView({seam}{lanes})"),
                 }
             } else {
                 String::new()
             },
             prints,
         ));
+        if hidden {
+            // the lane that shows stands where the split stood, as it is;
+            // no seam is drawn and none is dragged
+            let mut layouts = layouts.into_iter();
+            match (layouts.next(), layouts.next()) {
+                (Some(lane), None) => out.push_layout(lane),
+                // both hidden, or a lane of more than one node: a stack of
+                // whatever there is keeps the arity the parent was promised
+                (first, second) => out.push_layout(LayoutNode::Stack {
+                    axis: self.axis,
+                    spacing: 0.0,
+                    align: CrossAlign::Start,
+                    children: first.into_iter().chain(second).collect(),
+                    hints: Default::default(),
+                    action: None,
+                }),
+            }
+            return;
+        }
         match motor::identity::cursor_scope() {
             Some(path) => {
                 let binding = self.at.clone();
