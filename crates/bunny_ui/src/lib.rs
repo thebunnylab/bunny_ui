@@ -12484,6 +12484,7 @@ mod tests {
         let engine = PixelFont;
         let cache = MeasureCache::default();
         let ctx = PaintCtx {
+            overlay_layered: false,
             frame: Rect { origin: Point::ZERO, size: Size { width: 100.0, height: 100.0 } },
             visible: Rect { origin: Point::ZERO, size: Size { width: 100.0, height: 100.0 } },
             metrics: Metrics::new(&engine, &cache, FontSpec::DEFAULT),

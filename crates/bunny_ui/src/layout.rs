@@ -2615,6 +2615,26 @@ thread_local! {
 }
 
 /// Drops every kept picture — a newborn world starts with none.
+thread_local! {
+    /// Can the shell show a box's overlay on a layer of its own? Set by
+    /// the runtime before each layout from the shell's word; off, a box
+    /// paints its overlay inline and no island is placed for it.
+    static OVERLAY_LAYERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn set_overlay_layers(on: bool) {
+    OVERLAY_LAYERS.with(|flag| flag.set(on));
+}
+
+fn overlay_layers() -> bool {
+    OVERLAY_LAYERS.with(|flag| flag.get())
+}
+
+/// The island path of a box's overlay: the box's own, with a last step.
+fn overlay_path(path: &str) -> String {
+    format!("{path}/overlay")
+}
+
 /// Diagnostics: how many kept pictures stand.
 pub(crate) fn pictures_len() -> usize {
     PICTURES.with(|pictures| pictures.borrow().len())
@@ -3429,10 +3449,23 @@ pub struct CustomPlacement {
     /// The loop the box paints by, when a `.looping(...)` holds it —
     /// the runtime repaints this box alone on each step of the clock.
     pub live: Option<crate::anim::Loop>,
+    /// A box's OVERLAY, placed as an island of its own
+    /// ([`crate::custom::CustomElement::paint_overlay`]): the path is the
+    /// box's with `/overlay`, the frame is what the overlay covers, and the
+    /// runtime repaints it alone when a write reaches what it read.
+    pub overlay: bool,
     /// The box's own commands in the frame's display list
     /// (`start..end`) — what a live repaint replaces, and what the GPU
     /// presenter routes to the box's own layer.
     pub slice: (usize, usize),
+}
+
+impl CustomPlacement {
+    /// Does the box present on a surface of its own — a loop's box, or
+    /// an overlay?
+    pub fn is_island(&self) -> bool {
+        self.live.is_some() || self.overlay
+    }
 }
 
 /// A placed native host — what the shell needs to mount the platform
@@ -5904,6 +5937,7 @@ impl LayoutNode {
                             ink: out.foreground.last().copied().unwrap_or(Color::BLACK),
                             element: element.clone(),
                             live: env.live,
+                            overlay: false,
                             slice: (0, 0),
                         });
                         out.customs.len() - 1
@@ -5934,6 +5968,13 @@ impl LayoutNode {
                 // framework's, never the app's promise
                 out.push_clip(frame, 0.0);
                 let focused = env.stamp.focus == Some(path.as_str()) && !path.is_empty();
+                // the overlay's island road: open when the shell can layer
+                // it, for a box with a name, outside a loop, on the pixel
+                // world (the element world has islands of its own)
+                let layered = overlay_layers()
+                    && env.live.is_none()
+                    && placed.is_some()
+                    && out.dom.is_none();
                 let ctx = crate::custom::PaintCtx {
                     frame,
                     visible: window,
@@ -5943,6 +5984,7 @@ impl LayoutNode {
                     phase,
                     scale: env.scale,
                     touch: env.touch,
+                    overlay_layered: layered,
                 };
                 let ink = out.foreground.last().copied().unwrap_or(Color::BLACK);
                 // a box that asked to keep its picture is painted once for
@@ -5992,6 +6034,7 @@ impl LayoutNode {
                                 phase: 0.0,
                                 scale: env.scale,
                                 touch: env.touch,
+                                overlay_layered: layered,
                             };
                             let mut recorded = DisplayList::default();
                             let mut painter = crate::custom::Painter::new(
@@ -6073,6 +6116,45 @@ impl LayoutNode {
                 // the box's — a live box repaints exactly this slice
                 if let Some(index) = placed {
                     out.customs[index].slice = (start, end);
+                }
+                // The box's OVERLAY — a caret, a mark that moves on its own
+                // — is an island of its own when the shell can layer it:
+                // what it paints is carved out of the scene and presented
+                // above it, and a write that reaches only what the overlay
+                // read repaints the layer, never the window. Painted in the
+                // box's coordinates, under the box's clip, into the scene
+                // like any command; the placement remembers the slice.
+                if layered && !unseen && !out.skip_display {
+                    let overlay_from = out.display.len();
+                    out.push_clip(frame, 0.0);
+                    let mut painter =
+                        crate::custom::Painter::new(&mut out.display, frame.origin, env.font, ink);
+                    let island = overlay_path(path);
+                    motor::identity::begin_paint(&island);
+                    let covered = element.element().paint_overlay(&ctx, &mut painter);
+                    motor::identity::end_paint();
+                    out.pop_clip();
+                    let overlay_end = out.display.len();
+                    if let Some(shown) = covered.and_then(|local| local.intersection(window)) {
+                        out.customs.push(CustomPlacement {
+                            path: island,
+                            frame: Rect {
+                                origin: Point {
+                                    x: frame.origin.x + shown.origin.x,
+                                    y: frame.origin.y + shown.origin.y,
+                                },
+                                size: shown.size,
+                            },
+                            visible: Rect { origin: Point::ZERO, size: shown.size },
+                            region: out.region_stack.last().cloned(),
+                            font: env.font,
+                            ink,
+                            element: element.clone(),
+                            live: None,
+                            overlay: true,
+                            slice: (overlay_from, overlay_end),
+                        });
+                    }
                 }
             }
 
