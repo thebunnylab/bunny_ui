@@ -6133,6 +6133,12 @@ impl LayoutNode {
                     motor::identity::begin_paint(&island);
                     let covered = element.element().paint_overlay(&ctx, &mut painter);
                     motor::identity::end_paint();
+                    // a caret below the fold is painted and goes, like
+                    // every command no pixel can show
+                    if !out.keep_unseen {
+                        let clip = out.clip.last().copied();
+                        out.display.cut_unseen_from(overlay_from, clip);
+                    }
                     out.pop_clip();
                     let overlay_end = out.display.len();
                     if let Some(shown) = covered.and_then(|local| local.intersection(window)) {
