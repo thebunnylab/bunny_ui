@@ -170,6 +170,11 @@ fn watch_task(cell: &Rc<RefCell<Option<TaskSlot>>>, scope: String) {
 /// task the OTHER window owns, which the other window would then
 /// re-arm on its next frame — and a task is a thread. Two windows
 /// alternating frames turned that into thousands of threads in seconds.
+/// Diagnostics: the `.task` cells watched.
+pub(crate) fn tasks_len() -> usize {
+    TASK_CELLS.with(|cells| cells.borrow().len())
+}
+
 pub(crate) fn sweep_tasks(root: &str) {
     if !DECLARED.with(Cell::get) {
         // no queue was assembled: this pass declared nothing, and

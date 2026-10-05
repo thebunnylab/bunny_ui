@@ -42,9 +42,16 @@ pub enum Stage {
     /// The pointer re-read after a frame's layout, with the second
     /// layout when the re-read asks for one.
     Hover,
+    /// The effect pump: every registered effect asked once, per settle
+    /// round. It is INSIDE `Settle`: do not add it to `Settle`.
+    Pump,
+    /// The end of a pass: the identity register's sweep of the owners
+    /// and the reconciler's sweep of the entries that fell. It is INSIDE
+    /// `Pass`: do not add it to `Pass`.
+    Sweep,
 }
 
-const STAGES: usize = 10;
+const STAGES: usize = 12;
 
 /// One frame's worth of pipeline work, drained by [`take`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -105,6 +112,16 @@ pub struct FrameStats {
     /// time; one whose rows measure themselves only the rows under a change,
     /// and, when its head drops, moves the starts of the rows that stayed.
     pub rows_summed: u32,
+    /// Settles that ran no pass at all: nothing was written, nothing
+    /// was dirty, no task was ready, no frame was asked — the tree could
+    /// not have changed, so no body was asked.
+    pub settles_skipped: u32,
+    /// Retained boundaries whose placement was replayed from what was
+    /// kept — the draw commands, the hit regions and the tables moved
+    /// to the new origin, no walk.
+    pub placements_replayed: u32,
+    /// Retained boundaries that were placed by a walk.
+    pub placements_made: u32,
     /// Milliseconds per [`Stage`], all zero without a clock.
     pub stage_ms: [f64; STAGES],
     /// Allocations made under each stage, when a bench installed a
@@ -139,6 +156,9 @@ impl FrameStats {
             measures_kept: 0,
             measures_made: 0,
             rows_summed: 0,
+            settles_skipped: 0,
+            placements_replayed: 0,
+            placements_made: 0,
             stage_ms: [0.0; STAGES],
             stage_allocs: [0; STAGES],
         }
@@ -179,6 +199,9 @@ thread_local! {
     static MEASURES_KEPT: Cell<u32> = const { Cell::new(0) };
     static MEASURES_MADE: Cell<u32> = const { Cell::new(0) };
     static ROWS_SUMMED: Cell<u32> = const { Cell::new(0) };
+    static SETTLES_SKIPPED: Cell<u32> = const { Cell::new(0) };
+    static PLACEMENTS_REPLAYED: Cell<u32> = const { Cell::new(0) };
+    static PLACEMENTS_MADE: Cell<u32> = const { Cell::new(0) };
     static STAGE_MS: Cell<[f64; STAGES]> = const { Cell::new([0.0; STAGES]) };
     static STAGE_ALLOCS: Cell<[u64; STAGES]> = const { Cell::new([0; STAGES]) };
     static CLOCK: Cell<Option<fn() -> f64>> = const { Cell::new(None) };
@@ -226,6 +249,9 @@ pub fn take() -> FrameStats {
         measures_kept: MEASURES_KEPT.with(|c| c.replace(0)),
         measures_made: MEASURES_MADE.with(|c| c.replace(0)),
         rows_summed: ROWS_SUMMED.with(|c| c.replace(0)),
+        settles_skipped: SETTLES_SKIPPED.with(|c| c.replace(0)),
+        placements_replayed: PLACEMENTS_REPLAYED.with(|c| c.replace(0)),
+        placements_made: PLACEMENTS_MADE.with(|c| c.replace(0)),
         stage_ms: STAGE_MS.with(|c| c.replace([0.0; STAGES])),
         stage_allocs: STAGE_ALLOCS.with(|c| c.replace([0; STAGES])),
     }
@@ -342,6 +368,24 @@ pub(crate) fn note_picture_replayed() {
 #[inline]
 pub(crate) fn note_unseen() {
     bump(&COMMANDS_UNSEEN, 1);
+}
+
+#[inline]
+#[allow(dead_code, reason = "the settle gate notes it when it lands")]
+pub(crate) fn note_settle_skipped() {
+    bump(&SETTLES_SKIPPED, 1);
+}
+
+#[inline]
+#[allow(dead_code, reason = "the placement retention notes it when it lands")]
+pub(crate) fn note_placement_replayed() {
+    bump(&PLACEMENTS_REPLAYED, 1);
+}
+
+#[inline]
+#[allow(dead_code, reason = "the placement retention notes it when it lands")]
+pub(crate) fn note_placement_made() {
+    bump(&PLACEMENTS_MADE, 1);
 }
 
 #[inline]

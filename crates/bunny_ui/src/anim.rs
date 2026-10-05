@@ -318,6 +318,12 @@ fn channel(value: f64) -> u8 {
 }
 
 impl Animator {
+    /// Diagnostics: the springs, the scroll flights and the loop clocks
+    /// retained.
+    pub(crate) fn counts(&self) -> (usize, usize, usize) {
+        (self.entries.len(), self.scrolls.len(), self.loops.len())
+    }
+
     /// A layout pass is about to place — the sweep clock advances so
     /// this pass's touches are distinguishable from the last one's.
     pub(crate) fn note_place(&mut self) {

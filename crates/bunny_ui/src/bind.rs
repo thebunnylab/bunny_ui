@@ -1265,24 +1265,32 @@ mod tests {
         assert_eq!(crate::reconciler::graveyard_len(), 0, "no row left");
         assert!(runtime.garbage_pending(), "the tree the list replaced waits for the idle");
         let counts = runtime.retained_counts();
-        assert!(counts.contains("+1 trees replaced"), "{counts}");
+        assert_eq!(counts.replaced, 1, "the tree the list replaced: {counts}");
         runtime.collect_garbage();
         assert!(!runtime.garbage_pending(), "{}", runtime.retained_counts());
 
         rows.set(Rc::new(Vec::new()));
         let _ = runtime.dom_frame(&Page { rows }, size);
         let counts = runtime.retained_counts();
-        assert!(counts.contains("(+3 to free"), "the rows' entries: {counts}");
-        assert!(counts.contains("(3 retired)"), "their bindings: {counts}");
-        assert!(counts.contains("dom bindings 0 (+3 to unpick)"), "their elements' bindings: {counts}");
-        assert_eq!(counts.matches("(+3 to unpick)").count(), 2, "and their groups: {counts}");
+        assert_eq!(counts.graveyard, 3, "the rows' entries: {counts}");
+        assert_eq!(counts.bindings_retired, 3, "their bindings: {counts}");
+        assert_eq!(
+            (counts.dom_bindings, counts.dom_bindings_waiting),
+            (0, 3),
+            "their elements' bindings: {counts}"
+        );
+        assert_eq!(counts.dom_groups_waiting, 3, "and their groups: {counts}");
         assert!(runtime.garbage_pending());
 
         runtime.collect_garbage();
         assert!(!runtime.garbage_pending());
         let counts = runtime.retained_counts();
-        assert!(counts.contains("(+0 to free, +0 trees replaced, +0 click keys)") && counts.contains("(0 retired)"), "{counts}");
-        assert_eq!(counts.matches("(+0 to unpick)").count(), 2, "{counts}");
+        assert_eq!(
+            (counts.graveyard, counts.replaced, counts.buried_actions, counts.bindings_retired),
+            (0, 0, 0, 0),
+            "{counts}"
+        );
+        assert_eq!((counts.dom_bindings_waiting, counts.dom_groups_waiting), (0, 0), "{counts}");
     }
 
     /// A row written to and let go in one click is not patched: its text

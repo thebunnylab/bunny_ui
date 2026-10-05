@@ -306,6 +306,14 @@ thread_local! {
         RefCell::new((HashMap::default(), 0));
 }
 
+/// Diagnostics: the rasters and the traced paths the caches hold.
+pub(crate) fn cache_counts() -> (usize, usize) {
+    (
+        RASTERS.with(|rasters| rasters.borrow().len()),
+        TRACES.with(|traces| traces.borrow().0.len()),
+    )
+}
+
 /// The box a verb table needs, in its own coordinates — the CONTROL
 /// hull, which a curve never leaves (the Bezier property). A hull is a
 /// few transparent pixels wider than the ink on a bent curve, and it

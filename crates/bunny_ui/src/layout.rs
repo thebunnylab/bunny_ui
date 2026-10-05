@@ -2615,6 +2615,11 @@ thread_local! {
 }
 
 /// Drops every kept picture — a newborn world starts with none.
+/// Diagnostics: how many kept pictures stand.
+pub(crate) fn pictures_len() -> usize {
+    PICTURES.with(|pictures| pictures.borrow().len())
+}
+
 pub(crate) fn forget_pictures() {
     PICTURES.with(|pictures| pictures.borrow_mut().clear());
 }

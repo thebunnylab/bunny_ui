@@ -103,6 +103,14 @@ fn graft(view: Id, scale: f64, width: f64, height: f64) -> Option<MetalPresenter
     }
 }
 
+/// Diagnostics: the main window's atlas counts, and how many dialog
+/// presenters stand beside it. `None` on the CPU road.
+pub(crate) fn retained_counts() -> Option<(bunny_ui_apple::metal::AtlasCounts, usize)> {
+    PRESENTER
+        .with(|slot| slot.borrow().as_ref().map(|presenter| presenter.atlas_counts()))
+        .map(|atlas| (atlas, VIEW_PRESENTERS.with(|slot| slot.borrow().len())))
+}
+
 /// True when this window presents by GPU — the shell branches ONCE per
 /// frame on this, never mid-flight.
 pub(crate) fn active() -> bool {
