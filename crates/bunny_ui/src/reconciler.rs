@@ -373,6 +373,11 @@ thread_local! {
     /// pass's own paths, shared: a thousand rows that mount are a
     /// thousand counts, not a thousand copies.
     static FRAME_BODY_RUNS: RefCell<Vec<Rc<str>>> = const { RefCell::new(Vec::new()) };
+    /// Does anyone drain `FRAME_BODY_RUNS`? Only the Dom frame does, and it
+    /// says so by taking them once. A pixel shell never takes them — and a
+    /// list that is filled on every pass and never drained held every body
+    /// run since launch, with the path strings of the bodies that left.
+    static COLLECT_FRAME_RUNS: Cell<bool> = const { Cell::new(false) };
     static LIVE: RefCell<Live> = RefCell::new(Live::default());
 }
 
@@ -2555,7 +2560,9 @@ pub(crate) fn end_pass() {
         let mut pass = pass.borrow_mut();
         pass.active = false;
         let runs = std::mem::take(&mut pass.body_runs);
-        FRAME_BODY_RUNS.with(|frame| frame.borrow_mut().extend(runs.iter().cloned()));
+        if COLLECT_FRAME_RUNS.with(Cell::get) {
+            FRAME_BODY_RUNS.with(|frame| frame.borrow_mut().extend(runs.iter().cloned()));
+        }
         LAST_BODY_RUNS.with(|last| *last.borrow_mut() = runs);
     });
 }
@@ -2569,6 +2576,9 @@ pub(crate) fn retained_len() -> usize {
 }
 
 pub(crate) fn take_frame_runs() -> Vec<Rc<str>> {
+    // the first drain opens the collection: a frame before it had no
+    // retained element to reuse, so it missed nothing
+    COLLECT_FRAME_RUNS.with(|collect| collect.set(true));
     FRAME_BODY_RUNS.with(|frame| std::mem::take(&mut *frame.borrow_mut()))
 }
 
