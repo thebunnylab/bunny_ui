@@ -136,6 +136,8 @@ unsafe extern "C" {
     fn msg_sel(obj: Id, sel: Sel) -> Sel;
     #[link_name = "objc_msgSend"]
     fn msg_init_item(obj: Id, sel: Sel, title: Id, action: Sel, key: Id) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_i64_point_i64(obj: Id, sel: Sel, point: CGPoint, a: i64) -> i64;
 }
 
 // AppKit comes in via the ObjC runtime; the link guarantees the classes.
@@ -173,6 +175,17 @@ unsafe extern "C" {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
+    fn CFRunLoopGetMain() -> Id;
+    fn CFRunLoopObserverCreate(
+        allocator: Id,
+        activities: u64,
+        repeats: u8,
+        order: isize,
+        callout: extern "C" fn(Id, u64, *mut c_void),
+        context: *mut c_void,
+    ) -> Id;
+    fn CFRunLoopAddObserver(run_loop: Id, observer: Id, mode: Id);
+    static kCFRunLoopDefaultMode: Id;
 }
 
 // MARK: - Events
@@ -727,8 +740,65 @@ extern "C" fn bunny_mouse_moved(this: Id, _sel: Sel, event: Id) {
     dispatch(AppEvent::MouseMoved { x, y, modifiers });
 }
 
-extern "C" fn bunny_mouse_exited(_this: Id, _sel: Sel, _event: Id) {
-    dispatch(AppEvent::MouseExited);
+/// The hand left this view. A scene presents on SEVERAL windows — its own,
+/// and the popover panels and dialogs hanging from it — and leaving one of
+/// them for another is not leaving the scene: the pointer is read again
+/// where it now is. Only a hand over none of them has left.
+///
+/// The tracking areas say otherwise in two ways. A panel that comes in under
+/// a still hand (the popover a press opened) takes it from the window
+/// beneath, which hears an exit though the hand never moved; and a move
+/// across the edge between two of the scene's windows sends one window's
+/// exit and the other's entry in either order. Taken as the scene's exit,
+/// either one dropped the pointer the scene still had: the hover went dark
+/// and the cursor turned to the arrow until the hand moved again.
+extern "C" fn bunny_mouse_exited(this: Id, _sel: Sel, event: Id) {
+    match unsafe { scene_point_under_mouse(this) } {
+        Some((x, y)) => {
+            let modifiers = unsafe { modifiers_of(msg_u64(event, sel("modifierFlags"))) };
+            dispatch(AppEvent::MouseMoved { x, y, modifiers });
+        }
+        None => dispatch(AppEvent::MouseExited),
+    }
+}
+
+/// Where the hand is in SCENE coordinates while another of the scene's
+/// windows lies under it — the window a press there would reach, so a
+/// panel that lets the pointer through is never the answer. The scene is
+/// the key window's, the one every input event is dispatched to; the
+/// window `left` belongs to may already be detached from it (a panel
+/// leaves its parent before it is ordered out).
+unsafe fn scene_point_under_mouse(left: Id) -> Option<(f64, f64)> {
+    unsafe {
+        let app = msg_id(class("NSApplication"), sel("sharedApplication"));
+        let scene = owning_window(msg_id(app, sel("keyWindow")));
+        let mouse = msg_point(class("NSEvent"), sel("mouseLocation"));
+        let number = msg_i64_point_i64(
+            class("NSWindow"),
+            sel("windowNumberAtPoint:belowWindowWithWindowNumber:"),
+            mouse,
+            0,
+        );
+        let under = msg_id_u64(app, sel("windowWithWindowNumber:"), number as u64);
+        if under.is_null() || under == msg_id(left, sel("window")) || owning_window(under) != scene {
+            return None;
+        }
+        // the scene's own window sits at its origin; a panel or a dialog
+        // at the origin it was placed at, the one its events translate by
+        let view = msg_id(under, sel("contentView"));
+        let (dx, dy) = if owning_window(under) == under as usize {
+            (0.0, 0.0)
+        } else {
+            PANEL_ORIGINS.with(|origins| origins.borrow().get(&(view as usize)).copied())?
+        };
+        let point = msg_point_point(under, sel("convertPointFromScreen:"), mouse);
+        let bounds = msg_rect(view, sel("bounds"));
+        let inside = point.x >= 0.0
+            && point.y >= 0.0
+            && point.x < bounds.size.width
+            && point.y < bounds.size.height;
+        inside.then(|| (point.x + dx, bounds.size.height - point.y + dy))
+    }
 }
 
 /// BunnyView accepts first responder — without this, keyDown never arrives.
@@ -2714,6 +2784,9 @@ thread_local! {
     /// puts back when AppKit asks. `None` = YIELDED: over a platform view
     /// with only the default to say, the page owns the hand.
     static WANTED: Cell<Option<Cursor>> = const { Cell::new(Some(Cursor::Arrow)) };
+    /// The last answer insisted: the scene holds the pointer and the
+    /// cursor is its own to set — what the run loop's keeper reads.
+    static INSIST: Cell<bool> = const { Cell::new(false) };
 }
 
 static REGISTER_SEGMENT: Once = Once::new();
@@ -2984,25 +3057,27 @@ fn host_child_container(key: &str) -> Option<Id> {
 
 /// The pointer's outfit over the scene.
 ///
-/// An answer the POINTER asked for (a move, the hand leaving) `insist`s:
-/// AppKit is told whenever the cursor it holds is not the scene's, not only
-/// when the scene's answer changed. AppKit sets the cursor too — the arrow,
-/// whenever the hand leaves a cursor-update area that is not ours (the
-/// traffic lights, a hosted page) — and a shell that spoke only on a NEW
-/// answer believed the hand it had set once was still on screen: every
-/// button after that wore the arrow, until some box said something else.
+/// While the scene holds the pointer the shell `insist`s: AppKit is told
+/// whenever the cursor it holds is not the scene's, not only when the
+/// scene's answer changed. AppKit sets the cursor too — the arrow whenever
+/// the hand leaves a cursor-update area that is not ours (the traffic
+/// lights, a hosted page), and whenever one of the scene's panels comes in
+/// under a still hand — and a shell that spoke only on a NEW answer
+/// believed the hand it had set once was still on screen: a button wore the
+/// arrow until some box said something else.
 ///
-/// A frame does not insist: it speaks when its answer changed (content
-/// slid under a still hand) and holds its peace otherwise, because a frame
-/// also lands while the cursor is not the scene's to set — mid-resize the
-/// window's edge wears its resizer, a file dragged in wears the drag's
-/// badge. Nor does an answer over a platform view: the page sets its own
-/// on every move, and insisting there would flicker against its hand over
-/// a link. And an app in the background insists on nothing.
+/// Without `insist` it speaks only for a new answer: where the cursor is
+/// not the scene's to set — mid-resize the window's edge wears its resizer,
+/// and a hand the scene no longer holds is another window's — and over a
+/// platform view, whose page sets its own on every move (insisting there
+/// would flicker against its hand over a link). An app in the background
+/// insists on nothing: a file dragged in from another app wears the drag's
+/// badge.
 pub(crate) fn wear_cursor(cursor: Cursor, insist: bool) {
     let active = unsafe {
         msg_bool(msg_id(class("NSApplication"), sel("sharedApplication")), sel("isActive")) != 0
     };
+    INSIST.with(|kept| kept.set(insist));
     wear(cursor, insist && active);
 }
 
@@ -3025,6 +3100,69 @@ fn wear(cursor: Cursor, insist: bool) {
 /// shell wants — even the arrow — asserts again.
 pub(crate) fn yield_cursor() {
     WANTED.with(|wanted| wanted.set(None));
+    INSIST.with(|kept| kept.set(false));
+}
+
+/// `kCFRunLoopBeforeWaiting`: the loop ran what it had and is about to sleep.
+const BEFORE_WAITING: u64 = 1 << 5;
+
+static CURSOR_KEEPER: Once = Once::new();
+
+/// Keeps the scene's cursor between the shell's own turns.
+///
+/// AppKit dresses a window in the arrow when it comes in or goes out under a
+/// still hand — a popover the press opened, the one it closed — and it does
+/// so after the handler that ordered the window returned, without a word to
+/// the view. The next frame put the hand back, a beat later, and the arrow
+/// blinked on the button between the two. The keeper looks at the end of
+/// every turn of the main loop, before it sleeps and before the screen is
+/// composed, and puts back the scene's cursor where AppKit left another. In
+/// the default mode only: a live resize, a menu or a window drag runs a
+/// tracking loop of its own, and the cursor there is not the scene's.
+pub fn install_cursor_keeper() {
+    CURSOR_KEEPER.call_once(|| unsafe {
+        // after Core Animation's commit (2 000 000) and AppKit's own work of
+        // the turn, before the autorelease pool's pop (the largest order)
+        let observer = CFRunLoopObserverCreate(
+            std::ptr::null_mut(),
+            BEFORE_WAITING,
+            1,
+            2_147_483_000,
+            keep_cursor,
+            std::ptr::null_mut(),
+        );
+        if !observer.is_null() {
+            CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopDefaultMode);
+        }
+    });
+}
+
+extern "C" fn keep_cursor(_observer: Id, _activity: u64, _info: *mut c_void) {
+    keep(|| unsafe {
+        msg_bool(msg_id(class("NSApplication"), sel("sharedApplication")), sel("isActive")) != 0
+    });
+}
+
+/// The keeper's look: the answer the scene last insisted on, put back when
+/// the cursor AppKit holds is another — only while the app is the active
+/// one, asked last, because the loop turns far more often than the scene
+/// insists.
+fn keep(active: impl FnOnce() -> bool) {
+    if !INSIST.with(Cell::get) {
+        return;
+    }
+    let Some(cursor) = WANTED.with(Cell::get) else {
+        return;
+    };
+    if !active() {
+        return;
+    }
+    unsafe {
+        let shape = shape_of(cursor);
+        if msg_id(class("NSCursor"), sel("currentCursor")) != shape {
+            msg_void(shape, sel("set"));
+        }
+    }
 }
 
 /// `cursorUpdate:` — AppKit putting a cursor back: the hand entered the
@@ -3516,6 +3654,14 @@ impl WindowHandle {
     /// the parent's `layout_rect_to_screen` produces it.
     pub fn set_frame_screen(&self, rect: CGRect) {
         unsafe { msg_void_rect_bool(self.window, sel("setFrame:display:"), rect, 1) };
+    }
+
+    /// The panel lets the pointer through to the window under it: no
+    /// press, no move, no entry or exit and no cursor of its own. For a
+    /// surface that takes no input — and whose bleed lies over the very
+    /// box it stands beside.
+    pub fn pass_pointer_through(&self) {
+        unsafe { msg_void_bool(self.window, sel("setIgnoresMouseEvents:"), 1) };
     }
 
     /// Registers where this panel's view sits in SCENE coordinates —
@@ -4046,7 +4192,7 @@ mod tests {
         assert_eq!(current(), hand, "the hand over a button");
         appkit_sets(arrow);
         wear(Cursor::Pointing, false);
-        assert_eq!(current(), arrow, "a frame speaks only for a new answer");
+        assert_eq!(current(), arrow, "without insisting, only a new answer speaks");
         wear(Cursor::Pointing, true);
         assert_eq!(current(), hand, "the pointer's next move puts the hand back");
 
@@ -4062,6 +4208,24 @@ mod tests {
         assert_eq!(current(), beam, "the page keeps its own");
         wear(Cursor::Arrow, true);
         assert_eq!(current(), arrow, "and off the page the scene speaks again");
+
+        // between two turns of the shell — a popover ordered in under the
+        // still hand — the run loop's keeper puts the scene's cursor back
+        INSIST.with(|kept| kept.set(true));
+        wear(Cursor::Pointing, true);
+        appkit_sets(arrow);
+        keep(|| true);
+        assert_eq!(current(), hand, "the keeper puts the hand back");
+        appkit_sets(arrow);
+        keep(|| false);
+        assert_eq!(current(), arrow, "an app in the background keeps nothing");
+        INSIST.with(|kept| kept.set(false));
+        keep(|| true);
+        assert_eq!(current(), arrow, "nor does a scene that let the hand go");
+        INSIST.with(|kept| kept.set(true));
+        yield_cursor();
+        keep(|| true);
+        assert_eq!(current(), arrow, "and a yielded scene leaves the page its own");
     }
 
     /// An event raised from INSIDE a handler waits its turn.
