@@ -1945,6 +1945,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     audit_expects_same.set(true);
                     blit(runtime, root, trace::Origin::Wake);
                 } else {
+                    // a quiet turn is the idle a pixel shell has: what fell
+                    // since the last frame — entries, trees, click keys,
+                    // retired bindings — is freed now, not after sixty-four
+                    // more passes that a scene at rest never makes
+                    if runtime.garbage_pending() {
+                        runtime.collect_garbage();
+                    }
                     // no frame — but a task may have gone to sleep with a
                     // new deadline, and the driver's pace follows it
                     sync_frame_driver(runtime, &handler_pacer, window_id);
@@ -2121,6 +2128,11 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // are drawn here.
             if handler_pacer.pending().count > 0 && !handler_resizing() {
                 blit(runtime, root, trace::Origin::Blink);
+            }
+            // the slow clock is also the sweep's: a scene left alone frees
+            // what fell within half a second
+            if runtime.garbage_pending() {
+                runtime.collect_garbage();
             }
         }
         AppEvent::Frame { dt } => {
