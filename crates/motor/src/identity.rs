@@ -1671,10 +1671,12 @@ pub(crate) fn record_write(key: DepKey) {
         if registry.effect_readers.contains(&key) {
             reached = true;
         }
+        let mut reached_paint = false;
         if let Some(boxes) = registry.paint_readers.get(&key) {
             let dirty = &mut registry.dirty_paints;
             for path in boxes.iter() {
                 dirty.insert(Rc::clone(path));
+                reached_paint = true;
             }
         }
         if let Some(readers) = registry.readers.get(&key).cloned() {
@@ -1710,11 +1712,12 @@ pub(crate) fn record_write(key: DepKey) {
                     .extend(bindings.iter().filter(|binding| !retired.contains(&identity(binding))).cloned());
             }
         }
-        reached
+        (reached, reached_paint)
     });
+    let (reached, reached_paint) = reached;
     if reached {
         SCENE_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
-    } else {
+    } else if !reached_paint {
         UNREACHED_WRITES.with(|count| count.set(count.get().wrapping_add(1)));
     }
 }
