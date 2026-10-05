@@ -956,6 +956,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 for path in dead.drain(..) {
                     if let Some(panel) = store.remove(&path) {
                         panel.close_panel(&window);
+                        // forgotten by the store, it is nobody's: the
+                        // panel and its view go with it
+                        panel.release_panel();
                     }
                     beneaths.borrow_mut().remove(&path);
                 }
