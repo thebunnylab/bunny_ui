@@ -6001,7 +6001,9 @@ impl LayoutNode {
                                 ink,
                             );
                             crate::stats::note_paint();
+                            motor::identity::begin_paint(path.as_str());
                             element.element().paint(&whole, &mut painter);
+                            motor::identity::end_paint();
                             let movable =
                                 recorded.iter().all(|command| command.translated(Point::ZERO).is_some());
                             let commands: Option<Rc<[DrawCommand]>> =
@@ -6047,7 +6049,9 @@ impl LayoutNode {
                     let target = if unseen { &mut scratch } else { &mut out.display };
                     let mut painter = crate::custom::Painter::new(target, frame.origin, env.font, ink);
                     crate::stats::note_paint();
+                    motor::identity::begin_paint(path.as_str());
                     element.element().paint(&ctx, &mut painter);
+                    motor::identity::end_paint();
                     scratch.commands.clear();
                     out.unseen = scratch;
                 }

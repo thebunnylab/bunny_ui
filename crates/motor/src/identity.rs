@@ -154,6 +154,22 @@ struct Registry {
     /// nothing. A body that makes the key again spells a copy of its own,
     /// which none of them is.
     retired_bindings: HashSet<usize>,
+    /// The pump is asking the effects: a read now is an effect's.
+    effects_open: bool,
+    /// What the effects read, over the rounds of one settle — a write to
+    /// one of these is a reason to ask them again.
+    effect_readers: HashSet<DepKey>,
+    /// A box is painting: a read now is the box's, and a write to what it
+    /// read repaints the box, not the scene.
+    painting: bool,
+    /// The painting box's path, held in a warm buffer (no string per
+    /// paint) and spelled as an `Rc<str>` only when a read is filed.
+    painting_path: String,
+    painting_rc: Option<Rc<str>>,
+    /// Who paints what: the boxes that read each dependency.
+    paint_readers: HashMap<DepKey, Few<Rc<str>>>,
+    /// The boxes a write reached since the last frame took them.
+    dirty_paints: HashSet<Rc<str>>,
 }
 
 impl Registry {
@@ -759,7 +775,7 @@ pub fn registry_counts() -> [usize; 7] {
 /// Diagnostics, the tables [`registry_counts`] leaves out: the anchors,
 /// the effect cells, the views leaving, the bindings retired, the
 /// anchor sequence counters.
-pub fn registry_more_counts() -> [usize; 5] {
+pub fn registry_more_counts() -> [usize; 8] {
     REGISTRY.with(|registry| {
         let registry = registry.borrow();
         [
@@ -768,6 +784,9 @@ pub fn registry_more_counts() -> [usize; 5] {
             registry.leaving.len(),
             registry.retired.len(),
             registry.seqs.len(),
+            registry.effect_readers.len(),
+            registry.paint_readers.len(),
+            registry.dirty_paints.len(),
         ]
     })
 }
@@ -1509,6 +1528,23 @@ pub(crate) fn record_read(key: DepKey) {
             registry.probe_reads.push(key);
             return;
         }
+        if registry.painting {
+            // a box reads while it paints: a write to what it read repaints
+            // the box, not the scene
+            let registry = &mut *registry;
+            if registry.painting_rc.is_none() {
+                registry.painting_rc = Some(Rc::from(registry.painting_path.as_str()));
+            }
+            let path = registry.painting_rc.clone().expect("spelled just above");
+            file_few(&mut registry.paint_readers, key, path);
+            return;
+        }
+        if registry.effects_open {
+            // an effect reads while the pump asks it: a write to what it
+            // read is a reason to ask again
+            registry.effect_readers.insert(key);
+            return;
+        }
         if !registry.pass_active {
             return;
         }
@@ -1524,6 +1560,13 @@ pub(crate) fn record_read(key: DepKey) {
 thread_local! {
     /// Counts every write, read by a view or not.
     static WRITE_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Counts the writes that REACHED the scene: a view, a binding, an
+    /// effect, a probe read what was written — or a send came from outside
+    /// the register's sight. A write nobody read moves it not at all.
+    static SCENE_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The writes that reached nothing — a poller landing the same answer,
+    /// a value nobody shows. Diagnostics: a tape prints it.
+    static UNREACHED_WRITES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// A number that moves each time a `State` or a `Store` is written on
@@ -1536,25 +1579,106 @@ pub fn write_epoch() -> u64 {
     WRITE_EPOCH.with(std::cell::Cell::get)
 }
 
+/// A number that moves each time a write REACHES the scene: a view read
+/// what was written (it is dirty now), a binding did, an effect did on
+/// the last pump, a probe did — or a send came from outside the
+/// register's sight ([`note_external_write`]). A write nobody read does
+/// not move it: the same number after a turn of tasks means no body, no
+/// binding and no effect has anything new to say. A box's paint that read
+/// the value is told apart ([`take_dirty_paints`]).
+pub fn scene_epoch() -> u64 {
+    SCENE_EPOCH.with(std::cell::Cell::get)
+}
+
+/// Diagnostics: the writes since launch that reached nothing at all.
+pub fn unreached_writes() -> usize {
+    UNREACHED_WRITES.with(|count| count.get() as usize)
+}
+
 /// A write the register did not see — a publisher's send, a value kept
-/// outside `State` and `Store` that an effect polls for. It moves the
-/// epoch a shell and a settle read, so the pump that would notice it runs.
+/// outside `State` and `Store` that an effect polls for. It moves both
+/// epochs, so the pump that would notice it runs.
 pub fn note_external_write() {
     WRITE_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
+    SCENE_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
+}
+
+/// The pump opens the effects' reading: what they read while open is
+/// filed as theirs. `fresh` forgets the last settle's filing first — the
+/// first pump of a settle says so, and the rounds that follow add to it.
+pub fn begin_effects(fresh: bool) {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        registry.effects_open = true;
+        if fresh {
+            registry.effect_readers.clear();
+        }
+    });
+}
+
+pub fn end_effects() {
+    REGISTRY.with(|registry| registry.borrow_mut().effects_open = false);
+}
+
+/// A box begins to paint: what it reads until [`end_paint`] is the box's.
+/// The path is copied into a warm buffer — no string is made for a box
+/// that reads nothing.
+pub fn begin_paint(path: &str) {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        registry.painting = true;
+        registry.painting_path.clear();
+        registry.painting_path.push_str(path);
+        registry.painting_rc = None;
+    });
+}
+
+pub fn end_paint() {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        registry.painting = false;
+        registry.painting_rc = None;
+    });
+}
+
+/// Did a write reach a box's paint since the last frame took them?
+pub fn has_dirty_paints() -> bool {
+    REGISTRY.with(|registry| !registry.borrow().dirty_paints.is_empty())
+}
+
+/// The boxes a write reached since the last call — a frame that painted
+/// them all takes them; a shell that repaints boxes alone takes them to
+/// know which.
+pub fn take_dirty_paints() -> Vec<Rc<str>> {
+    REGISTRY.with(|registry| registry.borrow_mut().dirty_paints.drain().collect())
 }
 
 pub(crate) fn record_write(key: DepKey) {
     WRITE_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
-    REGISTRY.with(|registry| {
+    let reached = REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         // two fields of one registry: the readers are read, the dirty set
         // is written — and a reader that already ran this pass is noted
         let registry = &mut *registry;
+        // who the write REACHES: a view, a binding, an effect, a probe —
+        // the scene has something new; a box's paint alone — the box has
+        let mut reached = false;
         // the open probe read it already: the binding it becomes hears it
         if registry.probing && registry.probe_reads.contains(&key) {
             registry.probe_written = true;
+            reached = true;
+        }
+        if registry.effect_readers.contains(&key) {
+            reached = true;
+        }
+        if let Some(boxes) = registry.paint_readers.get(&key) {
+            let dirty = &mut registry.dirty_paints;
+            for path in boxes.iter() {
+                dirty.insert(Rc::clone(path));
+            }
         }
         if let Some(readers) = registry.readers.get(&key).cloned() {
+            reached = true;
             note_missed(registry, readers.iter().map(String::as_str));
             for reader in readers {
                 // a write DURING a pass is served by it when the pass took
@@ -1568,6 +1692,7 @@ pub(crate) fn record_write(key: DepKey) {
             }
         }
         if let Some(bindings) = registry.binding_readers.get(&key) {
+            reached = true;
             if registry.retired.is_empty() && registry.leaving.is_empty() {
                 registry.dirty_bindings.extend(bindings.iter().cloned());
             } else {
@@ -1585,7 +1710,13 @@ pub(crate) fn record_write(key: DepKey) {
                     .extend(bindings.iter().filter(|binding| !retired.contains(&identity(binding))).cloned());
             }
         }
+        reached
     });
+    if reached {
+        SCENE_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
+    } else {
+        UNREACHED_WRITES.with(|count| count.set(count.get().wrapping_add(1)));
+    }
 }
 
 pub(crate) fn next_store_id() -> u64 {
@@ -2148,5 +2279,98 @@ mod tests {
     fn a_path_with_no_name_projects_to_nothing() {
         assert_eq!(named_chain("Bench/@First/#0"), "");
         assert_eq!(named_chain(""), "");
+    }
+}
+
+#[cfg(test)]
+mod reach_tests {
+    use super::*;
+    use crate::state::State;
+
+    #[test]
+    fn a_write_nobody_read_moves_no_scene() {
+        let state = State::new(1u32);
+        let scene = scene_epoch();
+        let writes = write_epoch();
+        let unreached = unreached_writes();
+        state.set(2);
+        assert_eq!(scene_epoch(), scene, "nobody read it: the scene has nothing new");
+        assert_ne!(write_epoch(), writes, "but it was a write");
+        assert_eq!(unreached_writes(), unreached + 1);
+    }
+
+    #[test]
+    fn a_write_an_effect_read_is_a_scene_write() {
+        let state = State::new(1u32);
+        begin_effects(true);
+        let _ = state.wrappedValue();
+        end_effects();
+        let scene = scene_epoch();
+        state.set(2);
+        assert_ne!(scene_epoch(), scene, "the effect that read it is asked again");
+    }
+
+    #[test]
+    fn a_fresh_pump_forgets_the_last_settles_readers() {
+        let state = State::new(1u32);
+        begin_effects(true);
+        let _ = state.wrappedValue();
+        end_effects();
+        begin_effects(true);
+        end_effects();
+        let scene = scene_epoch();
+        state.set(2);
+        assert_eq!(scene_epoch(), scene, "no effect read it on the last settle");
+    }
+
+    #[test]
+    fn a_write_a_paint_read_dirties_the_box_not_the_scene() {
+        let state = State::new(1u32);
+        begin_paint("page/box");
+        let _ = state.wrappedValue();
+        end_paint();
+        let scene = scene_epoch();
+        state.set(2);
+        assert_eq!(scene_epoch(), scene, "the scene did not move");
+        assert!(has_dirty_paints());
+        let dirty = take_dirty_paints();
+        assert_eq!(dirty.iter().map(|path| &**path).collect::<Vec<_>>(), ["page/box"]);
+        assert!(!has_dirty_paints(), "taken once");
+    }
+
+    #[test]
+    fn a_subjects_send_is_a_scene_write() {
+        let scene = scene_epoch();
+        note_external_write();
+        assert_ne!(scene_epoch(), scene);
+    }
+
+    #[test]
+    fn set_if_changed_writes_only_what_moved() {
+        let state = State::new(1u32);
+        begin_effects(true);
+        let _ = state.wrappedValue();
+        end_effects();
+        let scene = scene_epoch();
+        assert!(!state.set_if_changed(1), "the same value is no write");
+        assert_eq!(scene_epoch(), scene);
+        assert!(state.set_if_changed(2));
+        assert_ne!(scene_epoch(), scene);
+        assert_eq!(state.wrappedValue(), 2);
+        let scene = scene_epoch();
+        let doubled = state.update_if(|value| {
+            if *value > 100 {
+                (false, *value)
+            } else {
+                *value *= 2;
+                (true, *value)
+            }
+        });
+        assert_eq!(doubled, 4);
+        assert_ne!(scene_epoch(), scene, "it changed, it wrote");
+        let scene = scene_epoch();
+        let kept = state.update_if(|value| (false, *value));
+        assert_eq!(kept, 4);
+        assert_eq!(scene_epoch(), scene, "it did not change, it did not write");
     }
 }
