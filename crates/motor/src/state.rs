@@ -481,6 +481,57 @@ impl<T: Clone + 'static> State<T> {
     }
 }
 
+impl<T: Clone + PartialEq + 'static> State<T> {
+    /// Writes the value only when it differs from the one held — a poller
+    /// that lands the same answer every tick wakes nobody, and a pump
+    /// that bumps a counter by zero asks no frame. `true` when it wrote.
+    /// The comparison records no read: a setter is not a reader.
+    pub fn set_if_changed(&self, value: T) -> bool {
+        let same = with_arena_ref::<T, _>(|arena| {
+            arena
+                .slots
+                .get(self.index)
+                .filter(|slot| slot.generation == self.generation)
+                .and_then(|slot| slot.value.as_ref())
+                .map(|held| *held == value)
+                .expect(DEAD_STATE)
+        });
+        if same {
+            return false;
+        }
+        self.set(value);
+        true
+    }
+
+    /// Compound mutation that says whether it changed anything: `f`
+    /// answers `(changed, result)`, and the write is recorded only when it
+    /// did — a drain that found nothing leaves the scene as it was. The
+    /// value leaves the arena while `f` runs, as in [`State::update`].
+    pub fn update_if<R>(&self, f: impl FnOnce(&mut T) -> (bool, R)) -> R {
+        let mut value = with_arena::<T, _>(|arena| {
+            arena
+                .slots
+                .get_mut(self.index)
+                .filter(|slot| slot.generation == self.generation)
+                .and_then(|slot| slot.value.take())
+                .expect(DEAD_STATE)
+        });
+        let (changed, result) = f(&mut value);
+        with_arena::<T, _>(|arena| {
+            let slot = arena
+                .slots
+                .get_mut(self.index)
+                .filter(|slot| slot.generation == self.generation)
+                .expect(DEAD_STATE);
+            slot.value = Some(value);
+        });
+        if changed {
+            crate::identity::record_write(crate::identity::DepKey::State(self.dep));
+        }
+        result
+    }
+}
+
 /// Displaying a `State` READS the value — the dependency records itself.
 /// It is what makes `text!("count: {}", self.count)` react with no `.get()`
 /// at all.

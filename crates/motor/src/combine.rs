@@ -46,6 +46,19 @@ impl<T: Clone + 'static> Store<T> {
         self.notify();
     }
 
+    /// `send`, only when the value differs from the one held — the
+    /// poller's door. `true` when it sent.
+    pub fn send_if_changed(&self, value: T) -> bool
+    where
+        T: PartialEq,
+    {
+        if *self.inner.value.borrow() == value {
+            return false;
+        }
+        self.send(value);
+        true
+    }
+
     /// `store.bulkUpdate { … }` — also the `store[\.keyPath] = value` fake.
     pub fn update(&self, f: impl FnOnce(&mut T)) {
         f(&mut self.inner.value.borrow_mut());

@@ -464,6 +464,8 @@ pub struct Runtime {
     /// The write epoch the last settle saw. A different number now means
     /// a `State` or a `Store` was written since.
     settled_epoch: Cell<u64>,
+    /// The next pump is a settle's first: the effects' filing starts afresh.
+    pump_fresh: Cell<bool>,
 }
 
 impl Default for Runtime {
@@ -790,9 +792,9 @@ impl Runtime {
             width: proposal.width.unwrap_or(0.0),
             height: proposal.height.unwrap_or(0.0),
         };
-        let quiet = motor::identity::write_epoch() == self.settled_epoch.get();
+        let quiet = motor::identity::scene_epoch() == self.settled_epoch.get();
         if self.ctx.borrow().values.window.set_viewport(viewport) && quiet {
-            self.settled_epoch.set(motor::identity::write_epoch());
+            self.settled_epoch.set(motor::identity::scene_epoch());
         }
     }
 
@@ -1410,6 +1412,7 @@ impl Runtime {
             root_boundary: RefCell::new(None),
             frame_asked: Cell::new(true),
             settled_epoch: Cell::new(u64::MAX),
+            pump_fresh: Cell::new(true),
             printless: Cell::new(false),
         };
         // Escape closes the innermost popover — pre-bound in the
@@ -4299,6 +4302,9 @@ impl Runtime {
         if let Some(again) = self.reread_hover(root, size, &result) {
             result = again;
         }
+        // every box painted with the values as they stand: what a write
+        // reached since the last frame is shown
+        let _ = motor::identity::take_dirty_paints();
         result.display
     }
 
@@ -4459,7 +4465,8 @@ impl Runtime {
         FrameNeed {
             asked: self.frame_asked.get() || FRAME_REQUESTED.with(Cell::get),
             dirty: self.has_pending_dirty(),
-            wrote: motor::identity::write_epoch() != self.settled_epoch.get(),
+            wrote: motor::identity::scene_epoch() != self.settled_epoch.get(),
+            paints: motor::identity::has_dirty_paints(),
             theme: crate::theme::version() != self.theme_version.get(),
             environment: self.env_moved.get(),
             insets: self.last_insets.get() != self.frame_insets(),
@@ -4569,6 +4576,7 @@ impl Runtime {
         if let Some(again) = self.reread_hover(root, size, &result) {
             result = again;
         }
+        let _ = motor::identity::take_dirty_paints();
         result.display
     }
 
@@ -4943,6 +4951,10 @@ impl Runtime {
             identity_leaving: more[2],
             identity_retired: more[3],
             identity_seqs: more[4],
+            identity_effect_readers: more[5],
+            identity_paint_readers: more[6],
+            identity_dirty_paints: more[7],
+            unreached_writes: motor::identity::unreached_writes(),
             frame_runs: reconciler::frame_runs_len(),
             pictures: crate::layout::pictures_len(),
             measures: self.cache.len(),
@@ -5390,7 +5402,9 @@ impl Runtime {
                 placement.font,
                 placement.ink,
             );
+            motor::identity::begin_paint(&placement.path);
             placement.element.element().paint(&ctx, &mut painter);
+            motor::identity::end_paint();
             let physical = (
                 ((placement.visible.size.width.round() as usize) * scale).max(1),
                 ((placement.visible.size.height.round() as usize) * scale).max(1),
@@ -6578,7 +6592,13 @@ impl Runtime {
     /// Returns whether any of them observed a change.
     pub fn pump(&self) -> bool {
         let ctx = self.ctx.borrow().clone();
-        effects::take().iter().any(|effect| effect(&ctx))
+        // what the effects read while asked is filed as theirs: a write
+        // to it is a reason to ask them again, and a write to anything
+        // else is not
+        motor::identity::begin_effects(self.pump_fresh.replace(false));
+        let changed = effects::take().iter().any(|effect| effect(&ctx));
+        motor::identity::end_effects();
+        changed
     }
 
     /// Puts a future on the engine's queue. It runs on the next turn —
@@ -6653,6 +6673,7 @@ impl Runtime {
     /// is input for the next pass, not for the loop.
     pub fn render_stable(&self, root: &impl View) -> String {
         let mut previous = String::new();
+        self.pump_fresh.set(true);
         for _ in 0..8 {
             // what a task resolved since the last turn is state BEFORE
             // the bodies read it
@@ -6689,6 +6710,7 @@ impl Runtime {
             // less.
             let asked = self.frame_asked.replace(false);
             let asked = FRAME_REQUESTED.with(|flag| flag.replace(false)) || asked;
+            self.pump_fresh.set(true);
             // the tasks land first, whatever follows: a wake made one
             // ready, and what it writes is a reason below
             self.poll_tasks();
@@ -6708,7 +6730,7 @@ impl Runtime {
                 return;
             }
             for _ in 0..8 {
-                self.settled_epoch.set(motor::identity::write_epoch());
+                self.settled_epoch.set(motor::identity::scene_epoch());
                 // the same order as the print path: a task that resolved
                 // writes its state, then the pass reads it
                 self.poll_tasks();
@@ -6728,7 +6750,7 @@ impl Runtime {
     /// ran — the reasons a body re-runs for, read without a walk.
     fn settle_is_quiet(&self) -> bool {
         self.last_root.borrow().is_some()
-            && motor::identity::write_epoch() == self.settled_epoch.get()
+            && motor::identity::scene_epoch() == self.settled_epoch.get()
             && !motor::task::has_ready()
             && crate::theme::version() == self.theme_version.get()
             && !self.env_moved.get()
@@ -6831,6 +6853,15 @@ pub struct RetainedCounts {
     pub identity_leaving: usize,
     pub identity_retired: usize,
     pub identity_seqs: usize,
+    /// Dependencies the effects read on the last settle.
+    pub identity_effect_readers: usize,
+    /// Dependencies some box reads when it paints.
+    pub identity_paint_readers: usize,
+    /// Boxes a write reached since the last frame.
+    pub identity_dirty_paints: usize,
+    /// Writes since launch that reached nothing — a poller landing the
+    /// same answer, a value nobody shows.
+    pub unreached_writes: usize,
     /// Body runs waiting for a drain — the Dom frame takes them; a
     /// pixel shell must drain them too, or they stand for ever.
     pub frame_runs: usize,
@@ -6866,7 +6897,7 @@ impl std::fmt::Display for RetainedCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "boundaries {} (+{} to free, +{} trees replaced, +{} click keys) · bindings live {} ({} retired) · dom nodes {} · dom bindings {} (+{} to unpick) · groups {} (+{} to unpick) · template members {} · graveyard {} · identity owners {} reads {} readers {} view-bindings {} binding-reads {} dirty {} dirty-bindings {} anchors {} effect-cells {} leaving {} retired {} seqs {} · frame runs {} · pictures {} · measures {} · live actions {} copies {} editors {} scrolls {} customs {} slots {} · tasks {} pending {} timers {} · anim {} scrolls {} loops {} · ledger {} · scroll offsets {} targets {} · carets {} · icons {} traces {}",
+            "boundaries {} (+{} to free, +{} trees replaced, +{} click keys) · bindings live {} ({} retired) · dom nodes {} · dom bindings {} (+{} to unpick) · groups {} (+{} to unpick) · template members {} · graveyard {} · identity owners {} reads {} readers {} view-bindings {} binding-reads {} dirty {} dirty-bindings {} anchors {} effect-cells {} leaving {} retired {} seqs {} effect-readers {} paint-readers {} dirty-paints {} unreached-writes {} · frame runs {} · pictures {} · measures {} · live actions {} copies {} editors {} scrolls {} customs {} slots {} · tasks {} pending {} timers {} · anim {} scrolls {} loops {} · ledger {} · scroll offsets {} targets {} · carets {} · icons {} traces {}",
             self.boundaries,
             self.graveyard,
             self.replaced,
@@ -6892,6 +6923,10 @@ impl std::fmt::Display for RetainedCounts {
             self.identity_leaving,
             self.identity_retired,
             self.identity_seqs,
+            self.identity_effect_readers,
+            self.identity_paint_readers,
+            self.identity_dirty_paints,
+            self.unreached_writes,
             self.frame_runs,
             self.pictures,
             self.measures,
@@ -6926,9 +6961,13 @@ pub struct FrameNeed {
     pub asked: bool,
     /// A view read a value that was written.
     pub dirty: bool,
-    /// A `State` or a `Store` was written, read by a view or not: an
-    /// `on_change` may watch it, and only a frame's pump finds out.
+    /// A `State` or a `Store` was written and the write REACHED the scene:
+    /// a view, a binding or an effect read it. A write nobody read is no
+    /// reason — the same value landed by a poller, a number nobody shows.
     pub wrote: bool,
+    /// A write reached a value an app box reads when it paints: the box
+    /// shows something new, the scene around it does not.
+    pub paints: bool,
     /// The theme moved.
     pub theme: bool,
     /// The environment moved.
@@ -6946,6 +6985,7 @@ impl FrameNeed {
         self.asked
             || self.dirty
             || self.wrote
+            || self.paints
             || self.theme
             || self.environment
             || self.insets

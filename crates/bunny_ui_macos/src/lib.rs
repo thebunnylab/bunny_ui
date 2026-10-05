@@ -667,6 +667,7 @@ fn why(need: bunny_ui::runtime::FrameNeed) -> String {
         (need.asked, "asked"),
         (need.dirty, "dirty"),
         (need.wrote, "wrote"),
+        (need.paints, "paints"),
         (need.theme, "theme"),
         (need.environment, "environment"),
         (need.insets, "insets"),
