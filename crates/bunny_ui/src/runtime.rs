@@ -1531,12 +1531,14 @@ impl Runtime {
             reconciler::run_isolated(pass_root);
         }
 
-        let dead = motor::identity::end_pass();
-        reconciler::forget(&dead);
-        if let Some(pass_root) = &pass_root {
-            // the twin of the sweep above, for views with no state of their own
-            reconciler::sweep_stale(pass_root);
-        }
+        crate::stats::time(crate::stats::Stage::Sweep, || {
+            let dead = motor::identity::end_pass();
+            reconciler::forget(&dead);
+            if let Some(pass_root) = &pass_root {
+                // the twin of the sweep above, for views with no state of their own
+                reconciler::sweep_stale(pass_root);
+            }
+        });
 
         if let Some(pass_root) = &pass_root {
             self.assemble_scene(pass_root);
@@ -4903,41 +4905,66 @@ impl Runtime {
         }
     }
 
-    /// Diagnostics: the sizes of what the engine retains — the
-    /// reconciler's boundaries, the live bindings, the element
-    /// lowering's retained nodes, bindings, groups and template members,
-    /// the subtrees waiting to be freed, and the identity register's
-    /// tables. One line, for a probe that watches a leak. Everything that
-    /// waits for the idle is named beside what stands: the entries and
-    /// the trees to free, the click keys and the element tables' entries
-    /// to take out, the bindings retired.
-    pub fn retained_counts(&self) -> String {
+    /// Diagnostics: the sizes of what the engine retains — every table
+    /// that outlives a frame, counted ([`RetainedCounts`]). A probe that
+    /// watches a leak reads it on a tape every few seconds: a count that
+    /// only grows names the table.
+    pub fn retained_counts(&self) -> RetainedCounts {
         let dom = self.dom.borrow();
         let identity = motor::identity::registry_counts();
+        let more = motor::identity::registry_more_counts();
         let (bindings_waiting, groups_waiting) = dom.unpicked_len();
-        format!(
-            "boundaries {} (+{} to free, +{} trees replaced, +{} click keys) · bindings live {} ({} retired) · dom nodes {} · dom bindings {} (+{} to unpick) · groups {} (+{} to unpick) · template members {} · graveyard {} · identity owners {} reads {} readers {} view-bindings {} binding-reads {} dirty {} dirty-bindings {}",
-            reconciler::retained_len(),
-            reconciler::graveyard_len(),
-            reconciler::replaced_len(),
-            reconciler::buried_actions(),
-            crate::bind::live_count(),
-            motor::identity::retired_count(),
-            dom.retained_len(),
-            dom.bindings_len() - bindings_waiting,
-            bindings_waiting,
-            dom.groups_len() - groups_waiting,
-            groups_waiting,
-            dom.template_members_len(),
-            dom.graveyard_len(),
-            identity[0],
-            identity[1],
-            identity[2],
-            identity[3],
-            identity[4],
-            identity[5],
-            identity[6],
-        )
+        let live = reconciler::live_counts();
+        let (anim_entries, anim_scrolls, anim_loops) = self.animator.borrow().counts();
+        let (icon_rasters, icon_traces) = crate::icon::cache_counts();
+        RetainedCounts {
+            boundaries: reconciler::retained_len(),
+            graveyard: reconciler::graveyard_len(),
+            replaced: reconciler::replaced_len(),
+            buried_actions: reconciler::buried_actions(),
+            bindings_live: crate::bind::live_count(),
+            bindings_retired: motor::identity::retired_count(),
+            dom_nodes: dom.retained_len(),
+            dom_bindings: dom.bindings_len() - bindings_waiting,
+            dom_bindings_waiting: bindings_waiting,
+            dom_groups: dom.groups_len() - groups_waiting,
+            dom_groups_waiting: groups_waiting,
+            dom_template_members: dom.template_members_len(),
+            dom_graveyard: dom.graveyard_len(),
+            identity_owners: identity[0],
+            identity_reads: identity[1],
+            identity_readers: identity[2],
+            identity_view_bindings: identity[3],
+            identity_binding_reads: identity[4],
+            identity_dirty: identity[5],
+            identity_dirty_bindings: identity[6],
+            identity_anchors: more[0],
+            identity_effect_cells: more[1],
+            identity_leaving: more[2],
+            identity_retired: more[3],
+            identity_seqs: more[4],
+            frame_runs: reconciler::frame_runs_len(),
+            pictures: crate::layout::pictures_len(),
+            measures: self.cache.len(),
+            live_actions: live.actions,
+            live_copies: live.copies,
+            live_editors: live.editors,
+            live_scrolls: live.scrolls,
+            live_customs: live.customs,
+            live_slots: live.slots,
+            tasks: crate::effects::tasks_len(),
+            tasks_pending: motor::task::pending(),
+            timers: motor::task::timers_len(),
+            anim_entries,
+            anim_scrolls,
+            anim_loops,
+            live_ledger: self.live_ledger.borrow().len(),
+            scroll_offsets: self.scroll_offsets.borrow().len(),
+            scroll_targets: self.scroll_targets.borrow().len(),
+            carets: self.carets.borrow().len(),
+            icon_rasters,
+            icon_traces,
+        }
     }
 
     /// Dom mode: frees what the frames since the last call removed. The
@@ -6633,7 +6660,7 @@ impl Runtime {
             let printed = self.render(root);
             // pump first: side effects fired by THIS render's onAppear
             // nodes must be observed before declaring the tree stable
-            let observed_change = self.pump();
+            let observed_change = crate::stats::time(crate::stats::Stage::Pump, || self.pump());
             // whoever stopped being declared stops running
             effects::sweep_tasks(&self.last_root.borrow().clone().unwrap_or_default());
             if printed == previous
@@ -6668,7 +6695,7 @@ impl Runtime {
                 // writes its state, then the pass reads it
                 self.poll_tasks();
                 self.frame_pass(root);
-                let observed_change = self.pump();
+                let observed_change = crate::stats::time(crate::stats::Stage::Pump, || self.pump());
                 effects::sweep_tasks(&self.last_root.borrow().clone().unwrap_or_default());
                 if !observed_change && !self.has_pending_dirty() && !motor::task::has_ready() {
                     return;
@@ -6710,6 +6737,130 @@ thread_local! {
 /// it.
 pub fn request_frame() {
     FRAME_REQUESTED.with(|flag| flag.set(true));
+}
+
+/// What the engine retains, counted — the sizes of every table that
+/// outlives a frame. [`Runtime::retained_counts`] fills it; a shell
+/// prints it on its tape every few seconds (`K` lines), and a soak test
+/// asserts that nothing in it grows while the scene stands still.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetainedCounts {
+    /// Boundaries the reconciler retains.
+    pub boundaries: usize,
+    /// Trees waiting for the idle to be freed.
+    pub graveyard: usize,
+    /// Trees a re-run replaced, waiting with them.
+    pub replaced: usize,
+    /// Click keys of entries that left, waiting to be taken out.
+    pub buried_actions: usize,
+    /// Bindings that read for themselves, alive.
+    pub bindings_live: usize,
+    /// Bindings retired, waiting to be taken out.
+    pub bindings_retired: usize,
+    pub dom_nodes: usize,
+    pub dom_bindings: usize,
+    pub dom_bindings_waiting: usize,
+    pub dom_groups: usize,
+    pub dom_groups_waiting: usize,
+    pub dom_template_members: usize,
+    pub dom_graveyard: usize,
+    /// The identity register's tables.
+    pub identity_owners: usize,
+    pub identity_reads: usize,
+    pub identity_readers: usize,
+    pub identity_view_bindings: usize,
+    pub identity_binding_reads: usize,
+    pub identity_dirty: usize,
+    pub identity_dirty_bindings: usize,
+    pub identity_anchors: usize,
+    pub identity_effect_cells: usize,
+    pub identity_leaving: usize,
+    pub identity_retired: usize,
+    pub identity_seqs: usize,
+    /// Body runs waiting for a drain — the Dom frame takes them; a
+    /// pixel shell must drain them too, or they stand for ever.
+    pub frame_runs: usize,
+    /// Kept pictures of `.cached` boxes.
+    pub pictures: usize,
+    /// Text measurements the cache holds.
+    pub measures: usize,
+    /// The live tables: the doors the last placements registered.
+    pub live_actions: usize,
+    pub live_copies: usize,
+    pub live_editors: usize,
+    pub live_scrolls: usize,
+    pub live_customs: usize,
+    pub live_slots: usize,
+    /// `.task` cells the effects watch.
+    pub tasks: usize,
+    /// Futures on the engine's queue.
+    pub tasks_pending: usize,
+    /// Sleepers with a deadline.
+    pub timers: usize,
+    pub anim_entries: usize,
+    pub anim_scrolls: usize,
+    pub anim_loops: usize,
+    pub live_ledger: usize,
+    pub scroll_offsets: usize,
+    pub scroll_targets: usize,
+    pub carets: usize,
+    pub icon_rasters: usize,
+    pub icon_traces: usize,
+}
+
+impl std::fmt::Display for RetainedCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "boundaries {} (+{} to free, +{} trees replaced, +{} click keys) · bindings live {} ({} retired) · dom nodes {} · dom bindings {} (+{} to unpick) · groups {} (+{} to unpick) · template members {} · graveyard {} · identity owners {} reads {} readers {} view-bindings {} binding-reads {} dirty {} dirty-bindings {} anchors {} effect-cells {} leaving {} retired {} seqs {} · frame runs {} · pictures {} · measures {} · live actions {} copies {} editors {} scrolls {} customs {} slots {} · tasks {} pending {} timers {} · anim {} scrolls {} loops {} · ledger {} · scroll offsets {} targets {} · carets {} · icons {} traces {}",
+            self.boundaries,
+            self.graveyard,
+            self.replaced,
+            self.buried_actions,
+            self.bindings_live,
+            self.bindings_retired,
+            self.dom_nodes,
+            self.dom_bindings,
+            self.dom_bindings_waiting,
+            self.dom_groups,
+            self.dom_groups_waiting,
+            self.dom_template_members,
+            self.dom_graveyard,
+            self.identity_owners,
+            self.identity_reads,
+            self.identity_readers,
+            self.identity_view_bindings,
+            self.identity_binding_reads,
+            self.identity_dirty,
+            self.identity_dirty_bindings,
+            self.identity_anchors,
+            self.identity_effect_cells,
+            self.identity_leaving,
+            self.identity_retired,
+            self.identity_seqs,
+            self.frame_runs,
+            self.pictures,
+            self.measures,
+            self.live_actions,
+            self.live_copies,
+            self.live_editors,
+            self.live_scrolls,
+            self.live_customs,
+            self.live_slots,
+            self.tasks,
+            self.tasks_pending,
+            self.timers,
+            self.anim_entries,
+            self.anim_scrolls,
+            self.anim_loops,
+            self.live_ledger,
+            self.scroll_offsets,
+            self.scroll_targets,
+            self.carets,
+            self.icon_rasters,
+            self.icon_traces,
+        )
+    }
 }
 
 /// Why a scene needs a frame. See [`Runtime::frame_need`].

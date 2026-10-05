@@ -18,6 +18,12 @@
 //! S <ms> dur=<ms> n=<alive> raster=<n> px=<n>
 //! E <ms> dur=<ms>
 //! X <ms> what=<name>
+//! F <ms> settle=<ms> layout=<ms> pass=<ms> asm=<ms> measure=<ms> place=<ms> hover=<ms> passes=<n> layouts=<n> asm#=<n> hover#=<n> paints=<n> cmds=<n>
+//! W <ms> ran=<0|1> need=<0|1> why=<reasons>
+//! A <ms> asks=<n> also=<origins>
+//! I <ms> kind=<key|wheel|press|release|move|magnify>
+//! K <ms> <what the engine retains, counted> · atlas <counts> · presenters <n> · dialogs <n> · panels <n>
+//! D <ms> pace=<full|slow:<ms>|off>
 //! ```
 //!
 //! `R` is a window callback (which notification asked, and at what

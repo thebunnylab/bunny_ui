@@ -327,6 +327,11 @@ pub fn next_timer_in() -> Option<f64> {
     })
 }
 
+/// Diagnostics: how many sleepers hold a deadline.
+pub fn timers_len() -> usize {
+    EXECUTOR.with(|executor| executor.borrow().timers.len())
+}
+
 // MARK: - The channel: one value or a whole stream
 
 struct Chan<T> {

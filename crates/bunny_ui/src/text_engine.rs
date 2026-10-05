@@ -635,6 +635,16 @@ impl MeasureCache {
         self.floor.unwrap_or(CACHE_FLOOR)
     }
 
+    /// Diagnostics: the entries in both maps.
+    pub fn len(&self) -> usize {
+        self.entries.get()
+    }
+
+    /// Diagnostics: no entry at all.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// The start of a layout pass: the clock ticks. A cache over its floor
     /// is swept — what went [`CACHE_KEEP_FRAMES`] without use is dropped —
     /// on one pass in [`SWEEP_EVERY`]; with a floor of zero, on every pass.

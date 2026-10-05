@@ -2572,6 +2572,37 @@ pub(crate) fn take_frame_runs() -> Vec<Rc<str>> {
     FRAME_BODY_RUNS.with(|frame| std::mem::take(&mut *frame.borrow_mut()))
 }
 
+/// Diagnostics: the body runs waiting for a drain.
+pub(crate) fn frame_runs_len() -> usize {
+    FRAME_BODY_RUNS.with(|frame| frame.borrow().len())
+}
+
+/// The sizes of the live tables, for [`crate::runtime::RetainedCounts`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LiveCounts {
+    pub actions: usize,
+    pub copies: usize,
+    pub editors: usize,
+    pub scrolls: usize,
+    pub customs: usize,
+    pub slots: usize,
+}
+
+/// Diagnostics: how many doors the live tables hold, by kind.
+pub(crate) fn live_counts() -> LiveCounts {
+    LIVE.with(|live| {
+        let live = live.borrow();
+        LiveCounts {
+            actions: live.actions.len(),
+            copies: live.copies.len(),
+            editors: live.editors.len(),
+            scrolls: live.scrolls.len(),
+            customs: live.customs.len(),
+            slots: live.slots.len(),
+        }
+    })
+}
+
 /// Instrumentation: the bodies that ran in the last pass (identity
 /// paths) — the proof of incrementality in the tests.
 pub(crate) fn last_body_runs() -> Vec<String> {

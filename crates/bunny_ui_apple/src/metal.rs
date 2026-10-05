@@ -1889,6 +1889,31 @@ unsafe fn upload_frame(
 /// The per-layer GPU state. The shell owns it: a view has no ivars, so
 /// the presenter lives in a thread-local of the shell, next to the run
 /// loop, keyed however that platform names its surfaces.
+/// What a presenter's atlas holds, counted ([`MetalPresenter::atlas_counts`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AtlasCounts {
+    /// Text run tiles, over every font and colour.
+    pub runs: usize,
+    /// Image tiles on the shelves.
+    pub images: usize,
+    /// Images too big for a shelf, each a texture of its own.
+    pub dedicated: usize,
+    /// Live feeds, one texture each.
+    pub live: usize,
+    /// The atlas texture's side, in texels.
+    pub size: u32,
+}
+
+impl std::fmt::Display for AtlasCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "runs {} images {} dedicated {} live {} size {}",
+            self.runs, self.images, self.dedicated, self.live, self.size
+        )
+    }
+}
+
 pub struct MetalPresenter {
     stack: MetalStack,
     layer: Id,
@@ -2223,6 +2248,20 @@ impl MetalPresenter {
     /// had to be. One frame a beat never drains that line. A shell reads
     /// this after a present and holds ONE beat when the wait says the line
     /// is full (`FramePacer::congested`): the line drains and stays short.
+    /// Diagnostics: what the text atlas holds — the run tiles, the
+    /// image tiles, the dedicated textures, the live feeds, and the
+    /// atlas's side in texels. A tape prints it beside the engine's own
+    /// counts, so a tile population that only grows is named.
+    pub fn atlas_counts(&self) -> AtlasCounts {
+        AtlasCounts {
+            runs: self.atlas.entries.values().map(Vec::len).sum(),
+            images: self.atlas.images.len(),
+            dedicated: self.atlas.dedicated.len(),
+            live: self.atlas.live.len(),
+            size: self.atlas.size,
+        }
+    }
+
     pub fn drawable_wait_ms(&self) -> f64 {
         self.drawable_wait_ms
     }

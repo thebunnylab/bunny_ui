@@ -50,6 +50,22 @@ fn sync_frame_driver(runtime: &Runtime, pacer: &FramePacer, window: usize) {
             bunny_ui::anim::FramePace::Idle => ffi::DriverPace::Off,
         }
     };
+    // the `D` line: the driver's pace, when it changes — a tape of a
+    // scene at rest must end on `off`
+    if trace::active() {
+        thread_local! {
+            static LAST_PACE: Cell<Option<ffi::DriverPace>> = const { Cell::new(None) };
+        }
+        if LAST_PACE.with(|last| last.replace(Some(wanted))) != Some(wanted) {
+            match wanted {
+                ffi::DriverPace::Full => trace::mark("D", format_args!("pace=full")),
+                ffi::DriverPace::Slow(step) => {
+                    trace::mark("D", format_args!("pace=slow:{:.0}ms", step * 1000.0));
+                }
+                ffi::DriverPace::Off => trace::mark("D", format_args!("pace=off")),
+            }
+        }
+    }
     pacer.set_beating(ffi::want_beat(window, wanted));
 }
 
@@ -1406,9 +1422,15 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 || dialogs.borrow().values().any(|dialog| dialog.is_visible() && dialog.in_live_resize())
         })
     };
+    // the `K` line: what the engine retains, every 256 frames or ten
+    // seconds, whichever comes first — a count that only grows across an
+    // idle hour names a leak. (frames drawn, the clock of the last line)
+    let kept_line: Rc<Cell<(u32, f64)>> = Rc::new(Cell::new((0, f64::NEG_INFINITY)));
     let blit = {
         let present = Rc::clone(&present);
         let dialogs = Rc::clone(&dialogs);
+        let panels = Rc::clone(&panels);
+        let kept_line = Rc::clone(&kept_line);
         let audit_last = Rc::clone(&audit_last);
         let audit_expects_same = Rc::clone(&audit_expects_same);
         let pacer = Rc::clone(&pacer);
@@ -1525,6 +1547,27 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         display.len(),
                     ),
                 );
+            }
+            if frame_stats {
+                let (frames, last_ms) = kept_line.get();
+                let now = trace::clock_ms();
+                if frames % 256 == 0 || now - last_ms >= 10_000.0 {
+                    let atlas = metal::retained_counts()
+                        .map(|(atlas, presenters)| format!(" · atlas {atlas} · presenters {presenters}"))
+                        .unwrap_or_default();
+                    trace::mark(
+                        "K",
+                        format_args!(
+                            "{}{atlas} · dialogs {} · panels {}",
+                            runtime.retained_counts(),
+                            dialogs.borrow().len(),
+                            panels.borrow().len()
+                        ),
+                    );
+                    kept_line.set((frames.wrapping_add(1), now));
+                } else {
+                    kept_line.set((frames.wrapping_add(1), last_ms));
+                }
             }
             if frame_audit {
                 let mut last = audit_last.borrow_mut();
@@ -1806,6 +1849,27 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 .values()
                 .any(|dialog| dialog.is_visible() && dialog.in_live_resize())
         };
+        // the `I` line: an input's arrival, for a tape that measures the
+        // road from the hand to the glass (the `E` that follows closes it)
+        if trace::active() {
+            let kind = match &event {
+                AppEvent::Key { .. }
+                | AppEvent::ImeInsert { .. }
+                | AppEvent::ImeMark { .. }
+                | AppEvent::ImeUnmark => Some("key"),
+                AppEvent::Wheel { .. } => Some("wheel"),
+                AppEvent::MouseDown { .. }
+                | AppEvent::RightMouseDown { .. }
+                | AppEvent::MiddleMouseDown { .. } => Some("press"),
+                AppEvent::MouseUp { .. } => Some("release"),
+                AppEvent::MouseMoved { .. } => Some("move"),
+                AppEvent::Magnify { .. } => Some("magnify"),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                trace::mark("I", format_args!("kind={kind}"));
+            }
+        }
         match event {
         AppEvent::Redraw => blit(runtime, root, trace::Origin::Redraw),
         // the Redraw that follows presents it

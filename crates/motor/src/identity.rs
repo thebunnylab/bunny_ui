@@ -749,6 +749,22 @@ pub fn registry_counts() -> [usize; 7] {
     })
 }
 
+/// Diagnostics, the tables [`registry_counts`] leaves out: the anchors,
+/// the effect cells, the views leaving, the bindings retired, the
+/// anchor sequence counters.
+pub fn registry_more_counts() -> [usize; 5] {
+    REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        [
+            registry.anchors.len(),
+            registry.effect_cells.len(),
+            registry.leaving.len(),
+            registry.retired.len(),
+            registry.seqs.len(),
+        ]
+    })
+}
+
 pub fn cursor_scope() -> Option<String> {
     REGISTRY.with(|registry| {
         let registry = registry.borrow();
