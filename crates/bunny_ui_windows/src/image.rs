@@ -447,7 +447,8 @@ impl WicImageEngine {
             | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
             | ImageSource::Feed { .. }
-            | ImageSource::Faded { .. } => None,
+            | ImageSource::Faded { .. }
+            | ImageSource::Mirrored { .. } => None,
         };
         let answer = decoded.as_ref().map(read);
         self.decoded.borrow_mut().insert(key, decoded);
@@ -614,7 +615,8 @@ impl ImageEngine for WicImageEngine {
             | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
             | ImageSource::Feed { .. }
-            | ImageSource::Faded { .. } => {
+            | ImageSource::Faded { .. }
+            | ImageSource::Mirrored { .. } => {
                 debug_assert!(false, "a house drawing never reaches an engine");
                 return None;
             }

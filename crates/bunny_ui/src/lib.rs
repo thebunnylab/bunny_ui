@@ -17358,6 +17358,70 @@ mod tests {
         }
     }
 
+    /// The picture sources a scene draws, in order.
+    fn image_sources(display: &crate::layout::DisplayList) -> Vec<ImageSource> {
+        display
+            .iter()
+            .filter_map(|command| match command {
+                crate::layout::DrawCommand::Image { source, .. } => Some(source.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A chevron that said it flips points the other way in a
+    /// right-to-left scene — its source is the same glyph in a mirror —
+    /// and stays as drawn left to right.
+    #[test]
+    fn a_flipped_chevron_points_the_other_way_only_in_rtl() {
+        #[derive(Clone, Copy)]
+        struct Disclosure;
+        impl Component for Disclosure {
+            fn body(self, _ctx: &Context) -> impl View {
+                icon(symbol::CHEVRON_RIGHT).flips_for_right_to_left_layout_direction(true)
+            }
+        }
+        let size = Size { width: 40.0, height: 40.0 };
+        let plain = Runtime::new();
+        let drawn = image_sources(&plain.display_frame(&Disclosure, size));
+        assert_eq!(drawn.len(), 1, "one glyph");
+        assert!(matches!(drawn[0], ImageSource::Symbol { .. }), "left to right, the glyph itself");
+
+        let mirrored = Runtime::new();
+        mirrored.set_layout_direction(Some(LayoutDirection::RightToLeft));
+        let flipped = image_sources(&mirrored.display_frame(&Disclosure, size));
+        assert_eq!(flipped.len(), 1, "one glyph");
+        assert!(matches!(flipped[0], ImageSource::Mirrored { .. }), "right to left, in a mirror");
+        assert_eq!(flipped[0].mirrored(), drawn[0], "of the same glyph");
+    }
+
+    /// A picture keeps its face unless its view asked to flip, and a view
+    /// below can turn an ancestor's flip off again.
+    #[test]
+    fn a_picture_keeps_its_face_in_rtl() {
+        #[derive(Clone, Copy)]
+        struct Rail;
+        impl Component for Rail {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    icon(symbol::CHEVRON_RIGHT),
+                    vstack!(
+                        icon(symbol::CHEVRON_RIGHT),
+                        icon(symbol::CHEVRON_RIGHT).flips_for_right_to_left_layout_direction(false),
+                    )
+                    .flips_for_right_to_left_layout_direction(true),
+                )
+            }
+        }
+        let runtime = Runtime::new();
+        runtime.set_layout_direction(Some(LayoutDirection::RightToLeft));
+        let sources = image_sources(&runtime.display_frame(&Rail, Size { width: 40.0, height: 120.0 }));
+        assert_eq!(sources.len(), 3);
+        assert!(matches!(sources[0], ImageSource::Symbol { .. }), "nobody asked: the face stays");
+        assert!(matches!(sources[1], ImageSource::Mirrored { .. }), "the parent asked");
+        assert!(matches!(sources[2], ImageSource::Symbol { .. }), "and the child said no");
+    }
+
     /// The shell's insets reach a BODY, and the keyboard's band stays its
     /// own number.
     ///
