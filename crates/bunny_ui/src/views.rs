@@ -369,7 +369,8 @@ impl View for TextField {
         // compared, and copied only when it changed — once, for the
         // layout, the reads and the input method alike
         let lent = scope.as_deref().and_then(crate::reconciler::editor_text).unwrap_or_default();
-        let value = self.text.with(|value| crate::text_input::lend_text(&lent, value));
+        let version = self.text.version();
+        let value = self.text.with(|value| crate::text_input::lend_text(&lent, value, version));
         out.push(RenderNode::leaf(if crate::view::print_enabled() {
             format!("TextField({:?}, text: {:?})", self.placeholder, value)
         } else {
@@ -401,9 +402,10 @@ impl View for TextField {
                         Rc::new(move |state: &mut crate::text_input::CaretState| {
                             // an app's strategy answers its own reads
                             lends.then(|| {
+                                let version = binding.version();
                                 binding.with(|value| {
                                     crate::text_input::clamp_state(value, state);
-                                    crate::text_input::lend_text(&lent, value)
+                                    crate::text_input::lend_text(&lent, value, version)
                                 })
                             })
                         })

@@ -432,20 +432,35 @@ pub fn byte_to_utf16(text: &str, byte: usize) -> usize {
     utf16_len(&text.as_bytes()[..clamp_to_boundary(text, byte)])
 }
 
-/// A field's text as one shared allocation: the one lent last while the
-/// value still holds the same text — compared, which costs nothing when
-/// the length moved and a fast byte compare when it did not — else a
-/// fresh one, kept for the next read.
-pub(crate) fn lend_text(lent: &std::cell::RefCell<Option<std::sync::Arc<str>>>, value: &str) -> std::sync::Arc<str> {
+/// A field's text as lent: the shared allocation, and the version of the
+/// binding's value it was made from, when the binding names one.
+pub(crate) struct Lent {
+    pub text: std::sync::Arc<str>,
+    pub version: Option<(u64, u64)>,
+}
+
+/// A field's text as one shared allocation: the one lent last, while the
+/// binding's version stands (no compare at all) or while the value still
+/// holds the same text (compared — nothing to pay when the length moved, a
+/// fast byte compare when it did not); else a fresh one, kept for the next.
+pub(crate) fn lend_text(
+    lent: &std::cell::RefCell<Option<Lent>>,
+    value: &str,
+    version: Option<(u64, u64)>,
+) -> std::sync::Arc<str> {
     let mut lent = lent.borrow_mut();
-    match lent.as_ref() {
-        Some(kept) if **kept == *value => kept.clone(),
-        _ => {
-            let fresh: std::sync::Arc<str> = std::sync::Arc::from(value);
-            *lent = Some(fresh.clone());
-            fresh
+    if let Some(kept) = lent.as_mut() {
+        if version.is_some() && kept.version == version {
+            return kept.text.clone();
+        }
+        if *kept.text == *value {
+            kept.version = version;
+            return kept.text.clone();
         }
     }
+    let fresh: std::sync::Arc<str> = std::sync::Arc::from(value);
+    *lent = Some(Lent { text: fresh.clone(), version });
+    fresh
 }
 
 /// UTF-16 units in whole UTF-8 bytes, in one pass: a lead or ASCII byte
