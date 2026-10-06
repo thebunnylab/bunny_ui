@@ -17422,6 +17422,103 @@ mod tests {
         assert!(matches!(sources[2], ImageSource::Symbol { .. }), "and the child said no");
     }
 
+    #[derive(Clone, Copy)]
+    struct Form {
+        name: State<String>,
+    }
+    impl Component for Form {
+        fn body(self, _ctx: &Context) -> impl View {
+            text_field("name", self.name.binding()).frame_width(120.0)
+        }
+    }
+
+    /// The field's run — where its text line starts — and its placement.
+    fn field_run(runtime: &Runtime, form: &Form) -> (f64, crate::layout::FieldPlacement) {
+        use crate::layout::{DrawCommand, Proposal, Size};
+        let result = runtime.layout(form, Proposal::exact(Size { width: 240.0, height: 60.0 }));
+        let field = result.fields.first().expect("the field is placed").clone();
+        let x = result
+            .display
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::TextLine { origin, .. } => Some(origin.x),
+                _ => None,
+            })
+            .expect("the field paints its run");
+        (x, field)
+    }
+
+    /// A field anchors a line that fits at the scene's leading edge: the
+    /// right one in a right-to-left scene.
+    #[test]
+    fn a_field_reads_from_the_right_in_rtl() {
+        let form = Form { name: State::new("abc".to_string()) };
+        let ltr = Runtime::new();
+        ltr.render_stable(&form);
+        let (x, field) = field_run(&ltr, &form);
+        assert_eq!(x, field.run.origin.x, "left to right, at the run's left edge");
+
+        let rtl = Runtime::new();
+        rtl.set_layout_direction(Some(LayoutDirection::RightToLeft));
+        rtl.render_stable(&form);
+        let (x, field) = field_run(&rtl, &form);
+        assert_eq!(field.direction, LayoutDirection::RightToLeft);
+        assert_eq!(x + 24.0, field.run.origin.x + field.run.size.width, "right to left, ending at its right edge");
+    }
+
+    /// A Hebrew line reads right to left whatever the scene does: its
+    /// logical start is its right end, the caret after the last letter
+    /// stands at the LEFT, and a step back walks right.
+    #[test]
+    fn a_hebrew_line_puts_the_caret_at_its_logical_place() {
+        use crate::text_input::EditCommand;
+        // four letters, 8 px each in the house font: a run of 32
+        let form = Form { name: State::new("שלום".to_string()) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&form);
+        let (x, field) = field_run(&runtime, &form);
+        assert_eq!(x, field.run.origin.x, "anchored at the scene's left edge");
+        let y = field.frame.origin.y + field.frame.size.height / 2.0;
+        // a click at the LEFT end of the line is a click at its end
+        runtime.pointer_pressed(field.run.origin.x + 1.0, y);
+        runtime.pointer_released(field.run.origin.x + 1.0, y);
+        let caret = runtime.ime_snapshot().expect("focused").caret_rect.origin.x;
+        assert_eq!(caret, field.run.origin.x, "after the last letter: the left end");
+        // one step back toward the start walks RIGHT, one letter
+        runtime.key(EditCommand::Left(false));
+        let caret = runtime.ime_snapshot().expect("focused").caret_rect.origin.x;
+        assert_eq!(caret, field.run.origin.x + 8.0);
+        assert_eq!(runtime.ime_rect_for(3).expect("a rect").origin.x, field.run.origin.x + 8.0);
+    }
+
+    /// A click in a right-to-left line lands on the byte under the hand:
+    /// near the right end it is the start, and what is typed goes there.
+    #[test]
+    fn a_click_in_an_rtl_field_lands_on_the_byte_under_the_hand() {
+        use crate::text_input::EditCommand;
+        let form = Form { name: State::new("שלום".to_string()) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&form);
+        let (_, field) = field_run(&runtime, &form);
+        let y = field.frame.origin.y + field.frame.size.height / 2.0;
+        // a point just inside the right end: before the first letter
+        let start = field.run.origin.x + 31.0;
+        runtime.pointer_pressed(start, y);
+        runtime.pointer_released(start, y);
+        runtime.key(EditCommand::Insert("א".into()));
+        assert_eq!(form.name.get(), "אשלום");
+        // five letters now, a run of 40: a point between the second and
+        // the third letter from the right
+        let (_, field) = field_run(&runtime, &form);
+        let between = field.run.origin.x + 40.0 - 17.0;
+        runtime.pointer_pressed(between, y);
+        runtime.pointer_released(between, y);
+        runtime.key(EditCommand::Insert("ב".into()));
+        assert_eq!(form.name.get(), "אשבלום");
+        // six letters now: three stand to the right of the same point
+        assert_eq!(runtime.ime_index_at(between, y), Some(3), "the index under the hand, in UTF-16");
+    }
+
     /// The shell's insets reach a BODY, and the keyboard's band stays its
     /// own number.
     ///

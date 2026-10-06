@@ -3542,6 +3542,45 @@ pub struct FieldPlacement {
     /// measures the MASK when it turns a click into a caret, and
     /// refuses the platform a copy.
     pub secret: bool,
+    /// Which way the scene around the field reads: where a line that
+    /// fits is anchored ([`field_run_x`]). A line's OWN direction is its
+    /// first letter's, decided by whoever reads it.
+    pub direction: LayoutDirection,
+}
+
+/// Where a field's run of `text_width` starts inside `run` — the frame
+/// minus the field's padding — scrolled by `offset_x`. A line that fits
+/// is anchored at the SCENE's leading edge, the right one when the
+/// scene reads right to left; a line that overflows scrolls by its OWN
+/// reading direction, so offset zero always shows the text's start and
+/// the caret's reveal counts in logical units either way. The answer is
+/// the run's LEFT edge, which is what a `TextLine` and every reader of
+/// one count from. Written once, read by the placement and by the
+/// runtime that turns a click back into a byte.
+pub(crate) fn field_run_x(
+    run: Rect,
+    offset_x: Px,
+    text_width: Px,
+    anchor_rtl: bool,
+    line_rtl: bool,
+) -> Px {
+    if text_width <= run.size.width {
+        if anchor_rtl { run.origin.x + run.size.width - text_width } else { run.origin.x }
+    } else if line_rtl {
+        run.origin.x + run.size.width - text_width + offset_x
+    } else {
+        run.origin.x - offset_x
+    }
+}
+
+/// Where the glyph boundary after a logical prefix of `prefix_width`
+/// stands on a line that starts at `line_x` and is `line_width` wide:
+/// so far from the left on a left-to-right line, so far from the right
+/// on a right-to-left one — the engines draw a right-to-left run in
+/// visual order, so its logical start is its right end. Exact for a
+/// line of one direction; a mixed line is placed by its first word.
+pub(crate) fn field_glyph_x(line_x: Px, line_width: Px, line_rtl: bool, prefix_width: Px) -> Px {
+    if line_rtl { line_x + line_width - prefix_width } else { line_x + prefix_width }
 }
 
 /// Which visual line owns a byte: the FIRST whose end reaches it, so a
@@ -5927,12 +5966,29 @@ impl LayoutNode {
                     x: frame.origin.x + FIELD_PAD_H - offset.x,
                     y: frame.origin.y + FIELD_PAD_V - offset.y,
                 };
+                let run = Rect {
+                    origin: Point { x: frame.origin.x + FIELD_PAD_H, y: frame.origin.y + FIELD_PAD_V },
+                    size: Size { width: inner, height: inner_h },
+                };
                 // everything the field writes is cut by its own box:
                 // a string longer than the field stops at the border
                 // instead of painting over the neighbour
                 out.push_clip(frame, if *bare { 0.0 } else { FIELD_RADIUS });
                 let width_of = |from: usize, to: usize| {
                     env.cache.get_or_measure(&sample[from..to], &env.font, env.text).width
+                };
+                // where a line starts and which way it reads: anchored by
+                // the SCENE, read by its first letter. A left-to-right line
+                // in a left-to-right scene is where it always was and
+                // measures nothing new; every other line knows its width
+                let anchor_rtl = env.rtl();
+                let line_geometry = |start: usize, end: usize| -> (Px, Px, bool) {
+                    let line_rtl = crate::text_input::reads_right_to_left(&sample[start..end]);
+                    if !anchor_rtl && !line_rtl {
+                        return (text_origin.x, 0.0, false);
+                    }
+                    let line_w = width_of(start, end);
+                    (field_run_x(run, offset.x, line_w, anchor_rtl, line_rtl), line_w, line_rtl)
                 };
                 let color = if content.is_empty() {
                     theme.placeholder
@@ -5948,6 +6004,11 @@ impl LayoutNode {
                     {
                         continue;
                     }
+                    let (line_x, line_w, line_rtl) = line_geometry(start, end);
+                    let glyph = |prefix: Px| field_glyph_x(line_x, line_w, line_rtl, prefix);
+                    // a band between two glyph boundaries, whichever way
+                    // the line puts them
+                    let band = |a: Px, b: Px| if a <= b { (a, b) } else { (b, a) };
                     // selection behind the text
                     if let Some((from, to)) = selection {
                         let head = from.clamp(start, end);
@@ -5957,10 +6018,12 @@ impl LayoutNode {
                         // empty line would show nothing at all
                         let over = to > end && from <= end;
                         if head < tail || over {
-                            let x0 = text_origin.x + width_of(start, head);
-                            let x1 = text_origin.x
-                                + width_of(start, tail)
-                                + if over { line_h / 2.0 } else { 0.0 };
+                            let (mut x0, mut x1) =
+                                band(glyph(width_of(start, head)), glyph(width_of(start, tail)));
+                            if over {
+                                // the line's end: its left on a right-to-left line
+                                if line_rtl { x0 -= line_h / 2.0 } else { x1 += line_h / 2.0 }
+                            }
                             out.draw(DrawCommand::FillRect {
                                 rect: Rect {
                                     origin: Point { x: x0, y },
@@ -5979,7 +6042,7 @@ impl LayoutNode {
                             sample,
                             (start, end),
                             highlights.as_ref().filter(|_| !content.is_empty()),
-                            Point { x: text_origin.x, y },
+                            Point { x: line_x, y },
                             color,
                             env,
                             out,
@@ -5991,8 +6054,8 @@ impl LayoutNode {
                         let head = from.clamp(start, end);
                         let tail = to.clamp(start, end);
                         if head < tail {
-                            let x0 = text_origin.x + width_of(start, head);
-                            let x1 = text_origin.x + width_of(start, tail);
+                            let (x0, x1) =
+                                band(glyph(width_of(start, head)), glyph(width_of(start, tail)));
                             out.draw(DrawCommand::FillRect {
                                 rect: Rect {
                                     origin: Point { x: x0, y: y + line_h - 1.0 },
@@ -6025,8 +6088,14 @@ impl LayoutNode {
                         ).max(FIELD_CARET_W)
                     };
                     let height = if shape == CaretShape::Underline { FIELD_CARET_W } else { line_h };
+                    // the boundary the caret stands at — and a caret that
+                    // covers the NEXT character covers it on the side the
+                    // line continues to, the left on a right-to-left line
+                    let (line_x, line_w, line_rtl) = line_geometry(start, end);
+                    let boundary =
+                        field_glyph_x(line_x, line_w, line_rtl, width_of(start, caret.max(start)));
                     let origin = Point {
-                        x: text_origin.x + width_of(start, caret.max(start)),
+                        x: if line_rtl && shape != CaretShape::Bar { boundary - width } else { boundary },
                         y: text_origin.y + index as Px * line_h,
                     };
                     out.draw(DrawCommand::FillRect {
@@ -6066,19 +6135,14 @@ impl LayoutNode {
                 out.fields.push(FieldPlacement {
                     path: path.clone(),
                     frame,
-                    run: Rect {
-                        origin: Point {
-                            x: frame.origin.x + FIELD_PAD_H,
-                            y: frame.origin.y + FIELD_PAD_V,
-                        },
-                        size: Size { width: inner, height: inner_h },
-                    },
+                    run,
                     text_origin,
                     font: env.font,
                     line_height: line_h,
                     multiline,
                     auto_focus: *auto_focus,
                     secret,
+                    direction: env.direction,
                 });
             }
 
@@ -8136,14 +8200,27 @@ fn emit_text_runs(
         return;
     }
 
+    // a right-to-left line is drawn in visual order: its logical start
+    // is its right end, so a segment sits as far from the right as the
+    // text through its END measures. Pure runs exact; a mixed line
+    // follows its first word, like every reader of it here
+    let rtl = crate::text_input::reads_right_to_left(&content[line_start..line_end]);
+    let line_width = if rtl {
+        env.cache.get_or_measure(&content[line_start..line_end], &env.font, env.text).width
+    } else {
+        0.0
+    };
     for (start, end, hot) in segments {
-        let offset = if start == line_start {
-            0.0
+        let x = if rtl {
+            let through = env.cache.get_or_measure(&content[line_start..end], &env.font, env.text).width;
+            origin.x + line_width - through
+        } else if start == line_start {
+            origin.x
         } else {
-            env.cache.get_or_measure(&content[line_start..start], &env.font, env.text).width
+            origin.x + env.cache.get_or_measure(&content[line_start..start], &env.font, env.text).width
         };
         out.draw(DrawCommand::TextLine {
-            origin: Point { x: origin.x + offset, y: origin.y },
+            origin: Point { x, y: origin.y },
             content: content.clone(),
             range: (start, end),
             color: if hot { highlight.color } else { base_color },
@@ -9075,6 +9152,35 @@ mod tests {
         assert_eq!(point(LayoutDirection::LeftToRight).leading_fraction(), (0.2, 0.5));
         assert_eq!(point(LayoutDirection::RightToLeft).fraction(), (0.2, 0.5), "the hand is where it is");
         assert_eq!(point(LayoutDirection::RightToLeft).leading_fraction(), (0.8, 0.5), "and far from the start");
+    }
+
+    /// A highlighted segment of a right-to-left line sits where its
+    /// glyphs are drawn: as far from the right as the text through its
+    /// end measures.
+    #[test]
+    fn a_highlight_segment_sits_where_its_glyphs_are_in_a_right_to_left_line() {
+        // four Hebrew letters, two bytes each, 8 px each: a run of 32,
+        // the second letter lit
+        let node = LayoutNode::Text {
+            content: crate::bind::TextSource::from("שלום"),
+            highlights: Some(TextHighlight { ranges: Rc::new(vec![(2, 4)]), color: Color::WHITE }),
+            truncation: None,
+            hints: ElementHints::default(),
+            action: None,
+        };
+        let segments: Vec<((usize, usize), Px)> = layout(&node, Proposal::unspecified())
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::TextLine { origin, range, .. } => Some((*range, origin.x)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            segments,
+            [((0, 2), 24.0), ((2, 4), 16.0), ((4, 8), 0.0)],
+            "the first letter at the right, the last at the left"
+        );
     }
 
     /// The contract on the other side: left to right is what it always

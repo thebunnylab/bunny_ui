@@ -3850,31 +3850,57 @@ impl Runtime {
                 let row = ((y - field.text_origin.y) / field.line_height).floor();
                 let row = (row.max(0.0) as usize).min(lines.len().saturating_sub(1));
                 let (start, end) = lines[row];
+                let along = self.field_line_x(&field, path, &seen[start..end], x);
                 let caret = start
-                    + caret_from_x(
-                        &seen[start..end],
-                        x - field.text_origin.x,
-                        &field.font,
-                        &*self.text,
-                        &self.cache,
-                    );
+                    + caret_from_x(&seen[start..end], along, &field.font, &*self.text, &self.cache);
                 (home(caret), (home(start), home(end)))
             }
-            Some(field) => (
-                home(caret_from_x(
-                    seen,
-                    x - field.text_origin.x,
-                    &field.font,
-                    &*self.text,
-                    &self.cache,
-                )),
-                whole,
-            ),
+            Some(field) => {
+                let along = self.field_line_x(&field, path, seen, x);
+                (home(caret_from_x(seen, along, &field.font, &*self.text, &self.cache)), whole)
+            }
             // before the first layout there is no run to measure
             // against: the caret goes to the end, as it always did
             None => (text.len(), whole),
         };
         Some((text, caret, line))
+    }
+
+    /// Where one visual line of a field starts, how wide it is and which
+    /// way it reads — the placement's own formulas, read back.
+    fn field_line(
+        &self,
+        field: &crate::layout::FieldPlacement,
+        path: &str,
+        line: &str,
+    ) -> (Px, Px, bool) {
+        let anchor_rtl = field.direction.is_rtl();
+        let line_rtl = crate::text_input::reads_right_to_left(line);
+        if !anchor_rtl && !line_rtl {
+            return (field.text_origin.x, 0.0, false);
+        }
+        let width = self.cache.get_or_measure(line, &field.font, &*self.text).width;
+        // a wrapped field never rolls sideways; a one-line one does
+        let offset_x = if field.multiline {
+            0.0
+        } else {
+            self.scroll_offsets.borrow().get(path).map_or(0.0, |offset| offset.x)
+        };
+        (crate::layout::field_run_x(field.run, offset_x, width, anchor_rtl, line_rtl), width, line_rtl)
+    }
+
+    /// The pointer's distance along one visual line of a field, from the
+    /// line's logical START — from its right end on a right-to-left
+    /// line — which is what `caret_from_x` measures prefixes against.
+    fn field_line_x(
+        &self,
+        field: &crate::layout::FieldPlacement,
+        path: &str,
+        line: &str,
+        x: Px,
+    ) -> Px {
+        let (line_x, width, line_rtl) = self.field_line(field, path, line);
+        if line_rtl { line_x + width - x } else { x - line_x }
     }
 
     /// The geometry the last layout recorded for a field.
@@ -4186,8 +4212,12 @@ impl Runtime {
             .cloned()?;
         let metrics = self.cache.get_or_measure(&text, &field.font, &*self.text);
         let prefix = self.cache.get_or_measure(&text[..caret], &field.font, &*self.text).width;
+        let (line_x, width, line_rtl) = self.field_line(&field, &path, &text);
         let caret_rect = Rect {
-            origin: Point { x: field.text_origin.x + prefix, y: field.text_origin.y },
+            origin: Point {
+                x: crate::layout::field_glyph_x(line_x, width, line_rtl, prefix),
+                y: field.text_origin.y,
+            },
             size: crate::layout::Size { width: 1.5, height: metrics.height() },
         };
 
@@ -4220,8 +4250,8 @@ impl Runtime {
         }
         let mut probe = CaretState::default();
         let text = reconciler::run_editor(&path, EditCommand::Read, &mut probe)??;
-        let byte =
-            caret_from_x(&text, x - field.text_origin.x, &field.font, &*self.text, &self.cache);
+        let along = self.field_line_x(&field, &path, &text, x);
+        let byte = caret_from_x(&text, along, &field.font, &*self.text, &self.cache);
         Some(crate::text_input::byte_to_utf16(&text, byte))
     }
 
@@ -4248,8 +4278,12 @@ impl Runtime {
         let byte = crate::text_input::utf16_to_byte(&text, utf16);
         let metrics = self.cache.get_or_measure(&text, &field.font, &*self.text);
         let prefix = self.cache.get_or_measure(&text[..byte], &field.font, &*self.text).width;
+        let (line_x, width, line_rtl) = self.field_line(&field, &path, &text);
         Some(Rect {
-            origin: Point { x: field.text_origin.x + prefix, y: field.text_origin.y },
+            origin: Point {
+                x: crate::layout::field_glyph_x(line_x, width, line_rtl, prefix),
+                y: field.text_origin.y,
+            },
             size: crate::layout::Size { width: 1.5, height: metrics.height() },
         })
     }
