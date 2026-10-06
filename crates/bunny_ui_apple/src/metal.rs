@@ -2200,6 +2200,10 @@ struct Patch {
     /// The box it covers on screen (physical, top-left), or `None`
     /// while it hides.
     shown: Option<DamageRect>,
+    /// The frame whose box the layer holds, and the box — shown again as
+    /// it is when that frame comes back over the same base. Forgotten
+    /// when the base changes under it.
+    held: Option<(Rc<DisplayList>, DamageRect)>,
     /// Its drawables, offered back while the window rests.
     drawables: Drawables,
 }
@@ -2233,7 +2237,7 @@ impl Patch {
             // first among the sublayers: over the drawable, under the
             // live layers the shell hangs after it
             msg_void_id_u64(root, sel("insertSublayer:atIndex:"), layer, 0);
-            Some(Patch { layer, size: (0, 0), scale, shown: None, drawables: Drawables::default() })
+            Some(Patch { layer, size: (0, 0), scale, shown: None, held: None, drawables: Drawables::default() })
         }
     }
 
@@ -2287,9 +2291,15 @@ pub struct MetalPresenter {
     /// is measured against it, never against the patch before it — so a
     /// patch always covers every pixel the layer under it has wrong.
     base: Option<KeptFrame>,
-    /// The layer that carries a change too small to repaint the window
-    /// for, made on the first such change.
-    patch: Option<Patch>,
+    /// The layers that carry a change too small to repaint the window
+    /// for — two at most, so a change that comes back (the caret's blink,
+    /// a hover that leaves and returns) shows the box already painted
+    /// instead of painting it again. Made on the first such changes.
+    patches: Vec<Patch>,
+    /// The frame the patches showed before the one on screen: a new
+    /// frame equal to it is a change coming back, and is painted beside
+    /// the one on screen instead of over it.
+    previous: Option<Rc<DisplayList>>,
     /// Text boxes for the diff against the base, warm across strokes.
     boxes: MeasureCache,
     /// The window's own drawables, offered back while it rests.
@@ -2390,15 +2400,15 @@ impl MetalPresenter {
         }
         unsafe {
             let window = self.drawables.offer(false);
-            let patch = match self.patch.as_mut() {
-                Some(patch) => {
-                    let hidden = patch.shown.is_none();
-                    patch.drawables.offer(hidden)
-                }
-                None => true,
-            };
+            let mut patch = true;
+            for each in &mut self.patches {
+                // a patch that holds a frame to show again keeps its
+                // pixels, hidden or not
+                let unused = each.shown.is_none() && each.held.is_none();
+                patch &= each.drawables.offer(unused);
+            }
             let offered = self.drawables.offered()
-                + self.patch.as_ref().map_or(0, |patch| patch.drawables.offered());
+                + self.patches.iter().map(|patch| patch.drawables.offered()).sum::<usize>();
             if window && patch && offered > 0 {
                 crate::trace::mark("X", format_args!("what=drawables-offered n={offered}"));
             }
@@ -2536,13 +2546,45 @@ impl MetalPresenter {
                 // the window's layer already shows this frame (a stroke
                 // undone, a hover gone): the patch over it steps aside
                 // and nothing encodes
-                if let Some(patch) = self.patch.as_mut() {
+                if self.patches.iter().any(|patch| patch.shown.is_some()) {
+                    self.previous = self.patch_on_screen();
                     let transaction = class("CATransaction");
                     msg_void(transaction, sel("begin"));
-                    patch.hide();
+                    for patch in &mut self.patches {
+                        patch.hide();
+                    }
                     msg_void(transaction, sel("commit"));
                 }
                 self.retained = self.base.clone();
+                objc_autoreleasePoolPop(pool);
+                return;
+            }
+            // a frame that comes back over the same base: the patch that
+            // holds its box shows again, the other steps aside — one
+            // transaction, nothing walked, nothing encoded
+            if let Plan::Patch(rect) = plan
+                && let Some(again) = self.patches.iter().position(|patch| {
+                    patch.held.as_ref().is_some_and(|(held, box_)| *box_ == rect && held.as_slice() == display.as_slice())
+                })
+            {
+                self.previous = self.patch_on_screen();
+                let transaction = class("CATransaction");
+                msg_void(transaction, sel("begin"));
+                for (at, patch) in self.patches.iter_mut().enumerate() {
+                    if at == again {
+                        if patch.shown != Some(rect) {
+                            msg_void_rect(patch.layer, sel("setFrame:"), Patch::frame(rect, physical, scale));
+                            msg_void_bool(patch.layer, sel("setHidden:"), 0);
+                            patch.shown = Some(rect);
+                        }
+                    } else {
+                        patch.hide();
+                    }
+                }
+                msg_void(transaction, sel("commit"));
+                let held = self.patches[again].held.as_ref().map(|(held, _)| held.clone());
+                self.retained = held.map(|held| (held, physical, scale, canvas));
+                crate::trace::mark("Q", format_args!("box={},{},{},{} again", rect.0, rect.1, rect.2, rect.3));
                 objc_autoreleasePoolPop(pool);
                 return;
             }
@@ -2578,16 +2620,19 @@ impl MetalPresenter {
             if let Plan::Patch(rect) = plan {
                 // glass reads the whole scene, so a frame that carries a
                 // pane repaints whole (the diff refuses one already)
-                if self.batches.glass.is_empty() && self.present_patch(index, rect, canvas, physical, scale) {
-                    self.retained = Some((Rc::new(display.clone()), physical, scale, canvas));
-                    objc_autoreleasePoolPop(pool);
-                    return;
+                if self.batches.glass.is_empty() {
+                    let held = Rc::new(display.clone());
+                    if self.present_patch(index, rect, canvas, physical, scale, &held) {
+                        self.retained = Some((held, physical, scale, canvas));
+                        objc_autoreleasePoolPop(pool);
+                        return;
+                    }
                 }
             }
             // a whole frame over a patch takes the patch down in the same
             // transaction — apart, the box would show the old frame for
             // one refresh
-            let hiding = self.patch.as_ref().is_some_and(|patch| patch.shown.is_some());
+            let hiding = self.patches.iter().any(|patch| patch.shown.is_some());
             // the contract of THIS frame's drawable, settled before it
             // is asked for. A window whose delegate armed the drag
             // already agrees and this changes nothing; a size the app
@@ -2649,7 +2694,7 @@ impl MetalPresenter {
                 let transaction = class("CATransaction");
                 msg_void(transaction, sel("begin"));
                 msg_void(drawable, self.stack.sels.present);
-                if let Some(patch) = self.patch.as_mut() {
+                for patch in &mut self.patches {
                     patch.hide();
                 }
                 msg_void(transaction, sel("commit"));
@@ -2659,11 +2704,25 @@ impl MetalPresenter {
             }
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
             self.drawables.presented(drawable);
+            // a new base: what the patches hold was measured against the
+            // old one
+            for patch in &mut self.patches {
+                patch.held = None;
+            }
+            self.previous = None;
             let kept = (Rc::new(display.clone()), physical, scale, canvas);
             self.base = Some(kept.clone());
             self.retained = Some(kept);
             objc_autoreleasePoolPop(pool);
         }
+    }
+
+    /// The frame a shown patch holds — what the screen shows over the base.
+    fn patch_on_screen(&self) -> Option<Rc<DisplayList>> {
+        self.patches
+            .iter()
+            .find(|patch| patch.shown.is_some())
+            .and_then(|patch| patch.held.as_ref().map(|(held, _)| held.clone()))
     }
 
     /// The plan for `display` against the frame the window's layer
@@ -2713,14 +2772,32 @@ impl MetalPresenter {
         canvas: Color,
         physical: (usize, usize),
         scale: usize,
+        held: &Rc<DisplayList>,
     ) -> bool {
         unsafe {
-            if self.patch.is_none() {
-                self.patch = Patch::new(&self.stack, self.layer, scale);
-            }
-            let Some(patch) = self.patch.as_mut() else {
-                return false;
+            // a new frame paints over the patch on screen, in place, as one
+            // patch always did. A frame that came back — equal to the one
+            // shown before — paints beside it instead, so both are kept
+            // and the next turn of the toggle shows one without painting;
+            // the second patch is made the first time that happens
+            let on_screen = self.patches.iter().position(|patch| patch.shown.is_some());
+            let came_back = self.previous.as_ref().is_some_and(|previous| previous.as_slice() == held.as_slice());
+            let beside = self.patches.iter().position(|patch| patch.shown.is_none());
+            let target = match (on_screen, came_back, beside) {
+                (Some(shown), false, _) => shown,
+                (Some(_), true, Some(free)) | (None, _, Some(free)) => free,
+                (Some(shown), true, None) if self.patches.len() >= 2 => shown,
+                _ => {
+                    let Some(fresh) = Patch::new(&self.stack, self.layer, scale) else {
+                        return false;
+                    };
+                    self.patches.push(fresh);
+                    self.patches.len() - 1
+                }
             };
+            self.previous = self.patch_on_screen();
+            let (before, rest) = self.patches.split_at_mut(target);
+            let (patch, after) = rest.split_first_mut().expect("the target patch");
             let size = ((rect.2 - rect.0) as usize, (rect.3 - rect.1) as usize);
             let moves = patch.shown != Some(rect);
             if patch.scale != scale {
@@ -2778,7 +2855,13 @@ impl MetalPresenter {
                 patch.shown = Some(rect);
             }
             msg_void(drawable, self.stack.sels.present);
+            // the other patch steps aside in the same transaction, and
+            // keeps what it holds
+            for other in before.iter_mut().chain(after.iter_mut()) {
+                other.hide();
+            }
             msg_void(transaction, sel("commit"));
+            patch.held = Some((held.clone(), rect));
             patch.drawables.presented(drawable);
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
             crate::trace::mark(
@@ -2850,7 +2933,8 @@ impl MetalPresenter {
             batches: FrameBatches::default(),
             retained: None,
             base: None,
-            patch: None,
+            patches: Vec::new(),
+            previous: None,
             boxes: MeasureCache::default(),
             drawables: Drawables::default(),
             resting: false,
