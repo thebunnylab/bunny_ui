@@ -418,7 +418,15 @@ pub fn utf16_to_byte(text: &str, utf16: usize) -> usize {
 }
 
 pub fn byte_to_utf16(text: &str, byte: usize) -> usize {
-    text[..clamp_to_boundary(text, byte)].chars().map(char::len_utf16).sum()
+    // Counted, not decoded: a UTF-8 prefix has as many chars as bytes
+    // minus continuation bytes, and a char takes two UTF-16 units exactly
+    // when its encoding takes four bytes (a lead byte 0xF0..=0xF7). Two
+    // byte scans the compiler vectorizes, where decoding every char
+    // walked a 30 000-line document twice per keystroke for the IME.
+    let prefix = text[..clamp_to_boundary(text, byte)].as_bytes();
+    let continuations = prefix.iter().filter(|&&b| b & 0xC0 == 0x80).count();
+    let four_byte_leads = prefix.iter().filter(|&&b| b & 0xF8 == 0xF0).count();
+    prefix.len() - continuations + four_byte_leads
 }
 
 /// Appearance of the native caret, supplied by the retained editing policy.
@@ -497,6 +505,16 @@ pub trait EditingStrategy {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn utf16_offsets_are_counted_as_the_decoder_would_count_them() {
+        let text = "ascii, then café, then 日本語, then 🦀🐇, then more";
+        for byte in 0..=text.len() {
+            let byte = super::clamp_to_boundary(text, byte);
+            let decoded: usize = text[..byte].chars().map(char::len_utf16).sum();
+            assert_eq!(super::byte_to_utf16(text, byte), decoded, "at byte {byte}");
+        }
+    }
+
     use super::*;
 
     fn state(caret: usize) -> CaretState {
