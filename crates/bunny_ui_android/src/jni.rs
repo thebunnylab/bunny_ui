@@ -661,13 +661,11 @@ pub fn keyboard(show: bool) -> bool {
     ask().unwrap_or(false)
 }
 
-/// The configuration the activity's resources hold right now: the
-/// `uiMode` bits, the width in dp and the density in dpi. The native
-/// `AConfiguration` road answers a rotation or a night switch late —
-/// the resources are what the framework updated before it called.
-pub fn configuration() -> Option<(i32, i32, i32)> {
-    let env = Env::current()?;
-    let _frame = Frame::new(env, 8)?;
+/// The `Configuration` the activity's resources hold right now — what
+/// the framework updated before it called; the native `AConfiguration`
+/// road answers a rotation or a night switch late. A local reference,
+/// in the caller's frame.
+fn current_configuration(env: Env) -> Option<JObject> {
     let activity = env.activity();
     let context_class = env.class(c"android/content/Context")?;
     let get_resources =
@@ -679,8 +677,32 @@ pub fn configuration() -> Option<(i32, i32, i32)> {
         c"getConfiguration",
         c"()Landroid/content/res/Configuration;",
     )?;
-    let configuration = env.call_object(resources, get_configuration, &[])?;
+    env.call_object(resources, get_configuration, &[])
+}
+
+/// The configuration the activity's resources hold right now: the
+/// `uiMode` bits, the width in dp and the density in dpi.
+pub fn configuration() -> Option<(i32, i32, i32)> {
+    let env = Env::current()?;
+    let _frame = Frame::new(env, 8)?;
+    let configuration = current_configuration(env)?;
     let configuration_class = env.class(c"android/content/res/Configuration")?;
     let read = |name: &CStr| env.int_field(configuration, env.field(configuration_class, name, c"I")?);
     Some((read(c"uiMode")?, read(c"screenWidthDp")?, read(c"densityDpi")?))
+}
+
+/// The languages the configuration holds, best first, as one
+/// comma-separated list of BCP-47 tags (`LocaleList.toLanguageTags`).
+pub fn language_tags() -> Option<String> {
+    let env = Env::current()?;
+    let _frame = Frame::new(env, 8)?;
+    let configuration = current_configuration(env)?;
+    let configuration_class = env.class(c"android/content/res/Configuration")?;
+    let get_locales =
+        env.method(configuration_class, c"getLocales", c"()Landroid/os/LocaleList;")?;
+    let locales = env.call_object(configuration, get_locales, &[])?;
+    let list_class = env.class(c"android/os/LocaleList")?;
+    let to_tags = env.method(list_class, c"toLanguageTags", c"()Ljava/lang/String;")?;
+    let tags = env.call_object(locales, to_tags, &[])?;
+    env.to_string(tags)
 }
