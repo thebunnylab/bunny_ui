@@ -108,9 +108,14 @@ pub enum Step {
 /// with a loop on screen; `soak` is `rest` for a long while.
 pub fn play(args: &Args, over: (f64, f64), send: impl Fn(Step) -> bool) {
     let secs = args.secs.max(0.1);
+    // the moment the steps begin, on the shared clock: a measuring run
+    // anchors its window here rather than on the first frame, which a
+    // framework may report late
+    let started = || println!("SCRIPT_START {}", unix_ms());
     match args.script.as_str() {
         "wheel" => {
             std::thread::sleep(Duration::from_secs(1));
+            started();
             let steps = (secs * STEPS_PER_SECOND as f64) as u64;
             let pause = Duration::from_micros(1_000_000 / STEPS_PER_SECOND);
             for step in 0..steps {
@@ -124,6 +129,7 @@ pub fn play(args: &Args, over: (f64, f64), send: impl Fn(Step) -> bool) {
         }
         "type" | "append" => {
             std::thread::sleep(Duration::from_secs(1));
+            started();
             let strokes = (secs * 10.0) as u64;
             let append = args.script == "append";
             for stroke in 0..strokes {
@@ -137,6 +143,7 @@ pub fn play(args: &Args, over: (f64, f64), send: impl Fn(Step) -> bool) {
         }
         "stream" => {
             std::thread::sleep(Duration::from_secs(1));
+            started();
             let appends = (secs * 1000.0 / 33.0) as u64;
             for _ in 0..appends {
                 if !send(Step::Append) {
