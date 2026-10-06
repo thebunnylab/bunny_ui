@@ -211,10 +211,9 @@ pub(crate) fn boundary_before(text: &str, index: usize) -> usize {
     previous_boundary(text, index)
 }
 
-/// Applies a command to the (text, caret) pair — the ONLY mutation door.
-/// State outside the text (the app swapped the string from outside)
-/// clamps here. The output is the text `Read`/`Copy`/`Cut` extract.
-pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) -> Option<String> {
+/// The caret, the anchor and a live composition, held inside `text`: the
+/// app may have swapped the string from outside since they were set.
+pub(crate) fn clamp_state(text: &str, state: &mut CaretState) {
     state.caret = clamp_to_boundary(text, state.caret);
     if let Some(anchor) = state.anchor {
         state.anchor = Some(clamp_to_boundary(text, anchor));
@@ -224,6 +223,13 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
         let end = clamp_to_boundary(text, end);
         state.marked = (start < end).then_some((start, end));
     }
+}
+
+/// Applies a command to the (text, caret) pair — the ONLY mutation door.
+/// State outside the text (the app swapped the string from outside)
+/// clamps here. The output is the text `Read`/`Copy`/`Cut` extract.
+pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) -> Option<String> {
+    clamp_state(text, state);
 
     // any command that is not composition or reading ends the live
     // composition (commits it as it stands) before acting — except
