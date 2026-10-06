@@ -311,12 +311,12 @@ impl Bitmap {
     /// `R,G,B,A` bytes per pixel, row by row — the format platform blits
     /// expect with no endianness argument.
     pub fn to_rgba_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.pixels.len() * 4);
-        for pixel in &self.pixels {
-            bytes.push((pixel >> 24) as u8);
-            bytes.push((pixel >> 16) as u8);
-            bytes.push((pixel >> 8) as u8);
-            bytes.push(*pixel as u8);
+        // one sized allocation and a straight copy per pixel — a push per
+        // byte checked its capacity four times a pixel, and a looping
+        // canvas pays this on every tick
+        let mut bytes = vec![0u8; self.pixels.len() * 4];
+        for (dst, pixel) in bytes.chunks_exact_mut(4).zip(&self.pixels) {
+            dst.copy_from_slice(&pixel.to_be_bytes());
         }
         bytes
     }
