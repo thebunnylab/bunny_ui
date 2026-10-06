@@ -513,6 +513,9 @@ enum Event {
     Frame { dt: f64, elapsed: f64 },
     /// The platform's motion preference, at boot and on every change.
     Motion { allowed: bool },
+    /// The languages the reader prefers, as the browser lists them —
+    /// one comma-joined BCP-47 list, the shell's report to the runtime.
+    Languages(String),
     Resize { width: f64, height: f64, scale: f64 },
     /// The browser finished decoding a registered image — measure and
     /// paint can answer for real now.
@@ -689,6 +692,11 @@ pub fn start_with(
     // a task that woke asks the page for one turn — the browser's
     // answer to the desktop's run loop source
     runtime.set_wake_hook(std::sync::Arc::new(|| unsafe { js_request_wake() }));
+    // the reader's languages, when the glue sent them first: the first
+    // frame is already theirs, and no frame is rebuilt for a report
+    if let Some(list) = reported_languages() {
+        runtime.set_system_locale(Locale::parse(&list));
+    }
     let mut size = Size { width, height };
     // the surface wants an INTEGER scale (the snapping contract);
     // fractional device ratios round to the nearest whole step
@@ -949,6 +957,13 @@ pub fn start_with(
                     unsafe { js_request_frame() };
                 }
             }
+            // the reader's languages moved: the environment follows, and
+            // the frame that follows rebuilds the retention once
+            Event::Languages(list) => {
+                if runtime.set_system_locale(Locale::parse(&list)) && runtime.wants_frame() {
+                    unsafe { js_request_frame() };
+                }
+            }
             Event::ImageReady => {
                 // the layout reflows around the fresh intrinsic size and
                 // the paint asks the engine again — one full frame, settle
@@ -1044,6 +1059,12 @@ fn start_dom_with(
     // `bunny_set_motion` once it has asked the platform whether motion is
     // welcome here.
     runtime.set_motion(true, true);
+    // the languages the glue sent before the start — the served page's
+    // own when it hydrates, so the adopt runs in the language the page
+    // was built in; the reader's otherwise
+    if let Some(list) = reported_languages() {
+        runtime.set_system_locale(Locale::parse(&list));
+    }
     // one context for every island on the page. A canvas per island
     // would hit the browser's context ceiling, and an island that
     // claimed webgl2 could never take putImageData back when the
@@ -1237,6 +1258,13 @@ fn start_dom_with(
             Event::Motion { allowed } => {
                 runtime.set_motion(true, !allowed);
                 if runtime.wants_frame() {
+                    unsafe { js_request_frame() };
+                }
+            }
+            // the reader's languages moved: the environment follows, the
+            // bodies that read it run again, and the diff patches the words
+            Event::Languages(list) => {
+                if runtime.set_system_locale(Locale::parse(&list)) && runtime.wants_frame() {
                     unsafe { js_request_frame() };
                 }
             }
@@ -1716,6 +1744,31 @@ pub extern "C" fn bunny_abi_version() -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_set_motion(allowed: u32) {
     dispatch(Event::Motion { allowed: allowed != 0 });
+}
+
+thread_local! {
+    /// The languages the glue reported last — kept so a report that
+    /// arrives BEFORE the shell starts (the glue sends it first, so the
+    /// first frame is already in the reader's language) seeds the
+    /// runtime when it does.
+    static SYSTEM_LANGUAGES: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// The languages the reader prefers, as the glue reads them
+/// (`navigator.languages`, joined by commas), through the same allocator
+/// road as `bunny_text`. The glue sends them before the page starts and
+/// again whenever the browser says they changed; the runtime's
+/// environment follows, and a change re-runs the bodies that read it.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_set_languages(pointer: *mut u8, len: usize) {
+    let list = unsafe { String::from_raw_parts(pointer, len, len.max(1)) };
+    SYSTEM_LANGUAGES.with(|slot| *slot.borrow_mut() = Some(list.clone()));
+    dispatch(Event::Languages(list));
+}
+
+/// The languages the glue reported before the shell started, if any.
+fn reported_languages() -> Option<String> {
+    SYSTEM_LANGUAGES.with(|slot| slot.borrow().clone())
 }
 
 /// Dom mode: the input edited. Both strings arrive through

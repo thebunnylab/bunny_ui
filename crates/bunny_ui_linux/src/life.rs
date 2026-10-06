@@ -11,6 +11,7 @@
 //! answer every later ask gets, by name. A second launch reaches the
 //! running one through the spool, like everywhere.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -18,6 +19,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use bunny_ui::app::{AppEvent, Notification, emit};
+use bunny_ui::prelude::Locale;
+use bunny_ui::words::{Word, Words};
 
 // The notification's own half of libdbus — the same functions the
 // portal speaks, declared here for this module's use.
@@ -130,15 +133,54 @@ const REPLY_TIMEOUT_MS: c_int = 2_000;
 /// One turn of the pump on each bus.
 const PUMP_SLICE_MS: c_int = 50;
 
+/// A notification on its way to the thread, with the desktop's word
+/// for its default action already resolved — on the thread that asked,
+/// where the locale lives.
+struct Letter {
+    notification: Notification,
+    open: CString,
+}
+
 /// The letters on their way to the thread.
-static LETTERS: OnceLock<Mutex<Sender<Notification>>> = OnceLock::new();
+static LETTERS: OnceLock<Mutex<Sender<Letter>>> = OnceLock::new();
+
+thread_local! {
+    /// The locale the shell knows — what the framework's own words are
+    /// resolved in here, where no window is at hand.
+    static LOCALE: RefCell<Locale> = RefCell::new(Locale::default());
+}
+
+/// The locale the shell knows (see [`LOCALE`]).
+pub(crate) fn locale() -> Locale {
+    LOCALE.with(|slot| slot.borrow().clone())
+}
+
+/// Records the locale the shell knows — the one the windows read.
+pub(crate) fn set_locale(locale: Locale) {
+    LOCALE.with(|slot| *slot.borrow_mut() = locale);
+}
+
+/// The languages the environment asks for, best first: `LANGUAGE`'s
+/// colon-separated list, else the first of `LC_ALL`, `LC_MESSAGES` and
+/// `LANG` that is set — glibc's own order for the messages' language.
+/// `C` and `POSIX` are English, and so is an environment that says
+/// nothing.
+pub(crate) fn preferred_locale() -> Locale {
+    let read = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let list = read("LANGUAGE")
+        .or_else(|| read("LC_ALL"))
+        .or_else(|| read("LC_MESSAGES"))
+        .or_else(|| read("LANG"))
+        .unwrap_or_default();
+    Locale::parse(&list)
+}
 /// Why the thread cannot show any — set once at boot, if the session
 /// bus is not there.
 static REFUSAL: Mutex<Option<String>> = Mutex::new(None);
 
 /// Starts the thread and installs the notifier — at boot.
 pub(crate) fn install() {
-    let (sender, receiver) = mpsc::channel::<Notification>();
+    let (sender, receiver) = mpsc::channel::<Letter>();
     if LETTERS.set(Mutex::new(sender)).is_err() {
         return;
     }
@@ -155,10 +197,15 @@ fn notify(notification: &Notification) -> Result<(), String> {
     let Some(letters) = LETTERS.get() else {
         return Err(String::from("no shell is running to show a notification"));
     };
+    let open = Words::for_locale(&locale()).get(Word::Open);
+    let letter = Letter {
+        notification: notification.clone(),
+        open: CString::new(open.as_ref()).unwrap_or_default(),
+    };
     letters
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .send(notification.clone())
+        .send(letter)
         .map_err(|_| String::from("the notification thread is gone"))
 }
 
@@ -172,7 +219,7 @@ fn app_name() -> CString {
 }
 
 /// The thread: both buses, pumped in turn, for the life of the process.
-fn pump(letters: Receiver<Notification>) {
+fn pump(letters: Receiver<Letter>) {
     let mut error = DbusError::new();
     let session = unsafe { dbus_bus_get_private(DBUS_BUS_SESSION, &mut error) };
     if session.is_null() {
@@ -213,10 +260,11 @@ fn pump(letters: Receiver<Notification>) {
             if session.is_null() {
                 continue;
             }
-            let replaces = numbers.get(&letter.id).copied().unwrap_or(0);
-            if let Some(number) = unsafe { send_notify(session, &name, &letter, replaces) } {
-                numbers.insert(letter.id.clone(), number);
-                ids.insert(number, letter.id);
+            let Letter { notification, open } = letter;
+            let replaces = numbers.get(&notification.id).copied().unwrap_or(0);
+            if let Some(number) = unsafe { send_notify(session, &name, &notification, &open, replaces) } {
+                numbers.insert(notification.id.clone(), number);
+                ids.insert(number, notification.id);
             }
         }
         let mut heard = false;
@@ -260,11 +308,13 @@ fn pump(letters: Receiver<Notification>) {
 /// `Notify(app_name, replaces_id, app_icon, summary, body, actions,
 /// hints, expire_timeout)` → the desktop's number for it. The first
 /// action is the desktop's own "default" — the notification itself,
-/// clicked — then the app's buttons, key and label in turn.
+/// clicked — labelled `open` in the person's language, then the app's
+/// buttons, key and label in turn.
 unsafe fn send_notify(
     session: *mut c_void,
     name: &CStr,
     letter: &Notification,
+    open: &CStr,
     replaces: u32,
 ) -> Option<u32> {
     unsafe {
@@ -289,7 +339,7 @@ unsafe fn send_notify(
         let mut actions = DbusIter::new();
         dbus_message_iter_open_container(&mut iter, DBUS_TYPE_ARRAY, c"s".as_ptr(), &mut actions);
         append_string(&mut actions, c"default");
-        append_string(&mut actions, c"Open");
+        append_string(&mut actions, open);
         for action in &letter.actions {
             let key = CString::new(action.key.as_str()).unwrap_or_default();
             let label = CString::new(action.label.as_str()).unwrap_or_default();

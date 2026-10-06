@@ -23,7 +23,7 @@ use std::rc::Rc;
 
 use bunny_ui::action::{Key, KeyMatch, KeyPattern, Stroke};
 use bunny_ui::layout::{Axis, Size};
-use bunny_ui::prelude::{EditCommand, Runtime};
+use bunny_ui::prelude::{EditCommand, Locale, Runtime};
 use bunny_ui::view::View;
 
 use ffi::AppEvent;
@@ -206,6 +206,8 @@ struct Slot {
     /// against.
     window: usize,
     handle: ffi::WindowHandle,
+    /// The window's own scene — what a locale the app pins reaches.
+    runtime: Rc<Runtime>,
     handler: RefCell<Box<dyn FnMut(AppEvent)>>,
     key_gate: RefCell<Box<dyn FnMut(&ffi::KeyStroke) -> bool>>,
     /// The bar's answer to a menu key — Alt alone, F10, an Alt chord.
@@ -253,6 +255,8 @@ struct AppInner {
     slots: RefCell<Vec<Rc<Slot>>>,
     routed: std::cell::Cell<bool>,
     scenes: std::cell::Cell<usize>,
+    /// The locale the app pinned over the system's, for every window.
+    pinned_locale: RefCell<Option<Locale>>,
 }
 
 impl Default for App {
@@ -276,6 +280,7 @@ impl App {
                 slots: RefCell::new(Vec::new()),
                 routed: std::cell::Cell::new(false),
                 scenes: std::cell::Cell::new(0),
+                pinned_locale: RefCell::new(None),
             }),
         }
     }
@@ -285,11 +290,16 @@ impl App {
     ///
     /// Dress it before handing it back ([`Runtime::text_engine`], the
     /// keymap, the host's action handlers): the app never touches it
-    /// again.
+    /// again — except for the locale it pinned ([`App::set_locale`]),
+    /// which every window is born reading.
     pub fn runtime(&self) -> Runtime {
         let seq = self.inner.scenes.get();
         self.inner.scenes.set(seq + 1);
-        Runtime::scene(format!("w{seq}"))
+        let runtime = Runtime::scene(format!("w{seq}"));
+        if let Some(locale) = self.inner.pinned_locale.borrow().as_ref() {
+            runtime.set_locale(Some(locale.clone()));
+        }
+        runtime
     }
 
     /// Raises a window on `runtime`, showing `root`.
@@ -315,6 +325,33 @@ impl App {
     /// The windows the app has open, oldest first.
     pub fn windows(&self) -> Vec<WindowId> {
         self.inner.slots.borrow().iter().map(|slot| WindowId(slot.window)).collect()
+    }
+
+    /// Pins the language every window reads — over the system's display
+    /// languages, which the windows follow otherwise — or, with `None`,
+    /// lets them follow those again. A window whose locale moved draws
+    /// its next frame in it, and a window still to open is born in it.
+    /// A pin that changes nothing costs nothing.
+    ///
+    /// The preference itself is the app's: a settings page that offers
+    /// a language writes it here, and keeps it where it keeps the rest.
+    pub fn set_locale(&self, locale: Option<Locale>) {
+        *self.inner.pinned_locale.borrow_mut() = locale.clone();
+        let mut moved = false;
+        for slot in self.inner.live() {
+            moved |= slot.runtime.set_locale(locale.clone());
+        }
+        if moved {
+            // the frame follows on the wake road: a posted message, so it
+            // never re-enters the handler this may have been called from
+            ffi::wake_from_any_thread();
+        }
+    }
+
+    /// The locale the windows read: the app's pin, else the system's
+    /// display languages as they stand now.
+    pub fn locale(&self) -> Locale {
+        self.inner.pinned_locale.borrow().clone().unwrap_or_else(ffi::preferred_locale)
     }
 
     /// Enters the message pump. Returns when the last window closes.
@@ -451,6 +488,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         bunny_ui::theme::install(bunny_ui::theme::Theme::dark());
     }
     runtime.set_reduce_motion(!ffi::animations_enabled());
+    // the system's display languages reach the scene before its first
+    // frame; a locale the app pinned (`App::set_locale`) stands over them
+    runtime.set_system_locale(ffi::preferred_locale());
     // a task that lands on a worker thread asks the pump for one more
     // turn; the frame it takes drains the queue on its way
     runtime.set_wake_hook(std::sync::Arc::new(ffi::wake_from_any_thread));
@@ -1288,6 +1328,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
             AppEvent::SettingsChanged => {
                 runtime.set_reduce_motion(!ffi::animations_enabled());
+                // the display languages are a setting like the rest: read
+                // again, and a list that did not move rebuilds nothing
+                runtime.set_system_locale(ffi::preferred_locale());
                 if mirror_theme {
                     let wants_dark = ffi::os_uses_light_theme() == Some(false);
                     let is_dark =
@@ -1474,6 +1517,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     Rc::new(Slot {
         window: window.raw_window(),
         handle: window,
+        runtime,
         handler: RefCell::new(handler),
         key_gate: RefCell::new(key_gate),
         menu_gate: RefCell::new(menu_gate),

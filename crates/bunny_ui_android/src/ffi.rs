@@ -1120,6 +1120,14 @@ pub fn view_scale() -> usize {
     SCALE.with(Cell::get).max(1)
 }
 
+/// The languages the person set, best first — the configuration's
+/// locale list, as BCP-47 tags; English when the activity holds none.
+pub fn preferred_locale() -> bunny_ui::prelude::Locale {
+    crate::jni::language_tags()
+        .map(|tags| bunny_ui::prelude::Locale::parse(&tags))
+        .unwrap_or_default()
+}
+
 /// The configuration: dark or light (`None` when the system says
 /// neither), whether the width is compact, and the scale.
 pub fn config() -> (Option<bool>, bool, usize) {

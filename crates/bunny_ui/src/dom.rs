@@ -1024,7 +1024,9 @@ pub struct DomLayout {
     pub gap: Option<f32>,
     /// Cross-axis alignment: 0 start, 1 center, 2 end, 3 baseline.
     pub align: Option<u8>,
-    /// Padding `(top, right, bottom, left)`, px.
+    /// Padding `(top, trailing, bottom, leading)`, px — logical sides, so
+    /// the page writes them as `padding-block` and `padding-inline` and
+    /// a right-to-left mount puts the leading inset on the right.
     pub padding: Option<(f32, f32, f32, f32)>,
     pub width: Option<f32>,
     pub height: Option<f32>,
@@ -1049,6 +1051,11 @@ pub struct DomLayout {
     /// link around a word) keeps the browser's own display for the
     /// tag, where a flex line per row would be a layout per row.
     pub plain: bool,
+    /// The subtree reads the OTHER way from what surrounds it — an
+    /// island an `.environment(…)` turned: `direction` and an isolated
+    /// `unicode-bidi`, so the browser orders its rows, aligns its
+    /// `start` and shapes its words the island's way. `None` inherits.
+    pub direction: Option<motor::state::LayoutDirection>,
 }
 
 /// Element hints only the Dom consumes — a real tag, a class, an id.
@@ -1241,6 +1248,14 @@ pub enum DomPatch {
         class: Option<std::rc::Rc<str>>,
         address: Option<std::rc::Rc<crate::layout::Address>>,
     },
+    /// The element's language and the way it reads — `lang` and `dir`,
+    /// the attributes the browser orders, aligns and shapes by, and a
+    /// screen reader speaks in. The MOUNT wears them (id 0), written on
+    /// the first frame and again when the locale in effect moves; an
+    /// island that reads the other way rides its look instead
+    /// (`DomLayout::direction`), because a language has no CSS form and
+    /// a direction has.
+    SetLanguage { id: u32, lang: std::rc::Rc<str>, dir: motor::state::LayoutDirection },
 }
 
 // MARK: - Lowering (retained scene + diff)
@@ -1280,9 +1295,13 @@ pub struct DomLowering {
     root: Option<DomNode>,
     next_id: u32,
     islands: HashMap<u32, Island>,
-    /// Anchor relations already shipped: popover element id → anchor
-    /// element id. A relation re-ships when the anchor recreates.
-    anchors_sent: HashMap<u32, u32>,
+    /// Anchor relations already shipped: popover element id → (anchor
+    /// element id, side). A relation re-ships when the anchor recreates
+    /// or the side turns with the direction.
+    anchors_sent: HashMap<u32, (u32, u8)>,
+    /// The language the mount wears and the way it reads, as last
+    /// shipped — compared each frame, written when either moved.
+    language: Option<(Rc<str>, motor::state::LayoutDirection)>,
     /// Every retained Group's identity path, with the environment the
     /// walk lowered it in — the walk consults this before promising a
     /// reuse (a promise the diff cannot keep would mount a hole, and a
@@ -1434,6 +1453,26 @@ impl Templates {
 }
 
 impl DomLowering {
+    /// The language the mount wears and the way it reads, noted for the
+    /// diff: `Some` is the patch that writes them, when either moved —
+    /// the first frame always, a frame that changed nothing never. One
+    /// short string compared per frame, and no allocation until a move.
+    pub(crate) fn note_language(
+        &mut self,
+        lang: &str,
+        dir: motor::state::LayoutDirection,
+    ) -> Option<DomPatch> {
+        if let Some((held, held_dir)) = &self.language
+            && **held == *lang
+            && *held_dir == dir
+        {
+            return None;
+        }
+        let lang: Rc<str> = Rc::from(lang);
+        self.language = Some((Rc::clone(&lang), dir));
+        Some(DomPatch::SetLanguage { id: 0, lang, dir })
+    }
+
     /// Diffs `scene` against the retained one and returns the patch
     /// list that brings the element tree up to date. The first call
     /// mounts everything. `display` is the SAME pass's draw list —
@@ -1543,8 +1582,8 @@ impl DomLowering {
                 relations.iter().map(|(id, ..)| *id).collect();
             self.anchors_sent.retain(|id, _| live.contains(id));
             for (id, anchor, side, path) in relations {
-                if self.anchors_sent.get(&id) != Some(&anchor) {
-                    self.anchors_sent.insert(id, anchor);
+                if self.anchors_sent.get(&id) != Some(&(anchor, side)) {
+                    self.anchors_sent.insert(id, (anchor, side));
                     patches.push(DomPatch::SetAnchor { id, anchor, side, path });
                 }
             }
@@ -1996,13 +2035,20 @@ fn look_hash(node: &DomNode) -> u64 {
             layout.align.hash(&mut hasher);
             layout
                 .padding
-                .map(|(top, right, bottom, left)| [top, right, bottom, left].map(|side| f64::from(side).to_bits()))
+                .map(|(top, trailing, bottom, leading)| {
+                    [top, trailing, bottom, leading].map(|side| f64::from(side).to_bits())
+                })
                 .hash(&mut hasher);
             layout.grow.hash(&mut hasher);
             layout.stretch.hash(&mut hasher);
             layout.fill.hash(&mut hasher);
             hash_f32(layout.wrap, &mut hasher);
             layout.plain.hash(&mut hasher);
+            // only an island adds to the hash: every look without a direction
+            // of its own hashes as it always did
+            if let Some(direction) = layout.direction {
+                direction.is_rtl().hash(&mut hasher);
+            }
         }
         None => 0u8.hash(&mut hasher),
     }
@@ -3761,6 +3807,8 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// - the field padding the glue mirrors (`FIELD_PAD_V`/`FIELD_PAD_H`)
 /// - the import surface: the modules' names or the verbs in them (the
 ///   glue's import object is keyed by those names)
+/// - what the glue WRITES for a field of the records — a physical side
+///   that becomes a logical one paints another page from the same bytes
 ///
 /// A test pins the glue to this number: bump one side alone and the
 /// suite goes red before the browser ever gets the chance to.
@@ -3825,7 +3873,20 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// 19 (2026-10-03): tracking. The text look's record carries the face's
 /// extra advance (f32 points, resolved) after the line height; the glue
 /// writes it as `letter-spacing`.
-pub const ABI_VERSION: u32 = 19;
+///
+/// 20 (2026-10-06): the page's writing. Op 27 (`SetLanguage`) puts `lang`
+/// and `dir` on the mount — the first frame, and again when the locale
+/// in effect moves; the flow record carries a direction of its own (bit
+/// 13, u8: 0 ltr, 1 rtl) for an island that reads the other way, which
+/// the glue writes as `direction` and an isolated `unicode-bidi`; the
+/// record's four paddings read (top, trailing, bottom, leading) and are
+/// written as `padding-block` and `padding-inline`; a trailing text
+/// aligns to `end`; a popover's side crosses PHYSICAL, turned by the
+/// walk where the anchor's direction is known; and a horizontal scroll
+/// offset is logical on both sides of the wire — the glue negates
+/// `scrollLeft` under a right-to-left mount, which reports it at or
+/// below zero.
+pub const ABI_VERSION: u32 = 20;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -3922,20 +3983,30 @@ pub const ABI_VERSION: u32 = 19;
 ///                   rides the geometry: the `<svg>` draws with
 ///                   `currentColor`, so hover and press flip through
 ///                   the box above with no patch of their own
-///  11 set layout    u16 mask, fields in bit order:
+///  11 set layout    (retired in 14: the record rides op 21) u16 mask,
+///                   fields in bit order:
 ///                   0 gap f32,  1 align u8 (0 start, 1 center,
-///                   2 end, 3 baseline),  2 padding f32 x4 (t r b l),
+///                   2 end, 3 baseline),  2 padding f32 x4 (top,
+///                   trailing, bottom, leading — logical sides, written
+///                   as padding-block and padding-inline),
 ///                   3 width f32,  4 height f32,  5 max width f32,
 ///                   6 max height f32,  7 grow (flag, no payload),
 ///                   8 slot y f32 (a virtual row's offset),
 ///                   9 stretch (flag, no payload),
-///                   10 fill (flag, no payload)
+///                   10 fill (flag, no payload),
+///                   11 wrap f32 (the line gap of a wrapping row),
+///                   12 plain (flag, no payload),
+///                   13 direction u8 (0 ltr, 1 rtl) — an island that
+///                   reads the other way: `direction` and an isolated
+///                   `unicode-bidi` on its box
 ///  12 move          u32 parent, u32 before (0 = to the end)
 ///  13 reveal        u32 target — the container scrolls it into view
 ///  14 set anchor    u32 anchor element, u8 side (0 top, 1 bottom,
-///                   2 leading, 3 trailing), u16 len + utf8 path —
-///                   the browser positions the card from the anchor's
-///                   real box, and the path keys the dismissal doors
+///                   2 left, 3 right — PHYSICAL: the walk turns a
+///                   leading side where the anchor's direction is
+///                   known), u16 len + utf8 path — the browser
+///                   positions the card from the anchor's real box,
+///                   and the path keys the dismissal doors
 ///  15 set hints     two hint strings (u8 len + utf8 each: class, id)
 ///                   — the LIVE half of the hints, re-attributed in
 ///                   place. The tag never changes without a recreation
@@ -3957,6 +4028,9 @@ pub const ABI_VERSION: u32 = 19;
 ///                   the paths below it are told against: a created
 ///                   group's, or a group's inside a clone (its copied
 ///                   base names the template's)
+///  27 set language  u8 dir (0 ltr, 1 rtl), u8 len + utf8 tag — the
+///                   element's `lang` and `dir`: the mount's, on the
+///                   first frame and when the locale in effect moves
 /// ```
 pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
     crate::stats::time(crate::stats::Stage::Encode, || {
@@ -4215,6 +4289,12 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                     address.and_then(|address| address.href.as_deref()).unwrap_or("").as_bytes(),
                 );
             }
+            DomPatch::SetLanguage { id, lang, dir } => {
+                out.push(27);
+                push_u32(&mut out, *id);
+                out.push(dir.is_rtl() as u8);
+                push_hint(&mut out, Some(lang));
+            }
         }
     }
     out
@@ -4426,6 +4506,9 @@ fn encode_layout(out: &mut Vec<u8>, layout: &DomLayout) {
                 if layout.plain {
                     mask |= 1 << 12;
                 }
+                if layout.direction.is_some() {
+                    mask |= 1 << 13;
+                }
                 push_u16(out, mask);
                 if let Some(gap) = layout.gap {
                     push_f32(out, gap);
@@ -4433,11 +4516,11 @@ fn encode_layout(out: &mut Vec<u8>, layout: &DomLayout) {
                 if let Some(align) = layout.align {
                     out.push(align);
                 }
-                if let Some((top, right, bottom, left)) = layout.padding {
+                if let Some((top, trailing, bottom, leading)) = layout.padding {
                     push_f32(out, top);
-                    push_f32(out, right);
+                    push_f32(out, trailing);
                     push_f32(out, bottom);
-                    push_f32(out, left);
+                    push_f32(out, leading);
                 }
                 if let Some(width) = layout.width {
                     push_f32(out, width);
@@ -4456,6 +4539,9 @@ fn encode_layout(out: &mut Vec<u8>, layout: &DomLayout) {
                 }
                 if let Some(wrap) = layout.wrap {
                     push_f32(out, wrap);
+                }
+                if let Some(direction) = layout.direction {
+                    out.push(direction.is_rtl() as u8);
                 }
 }
 
@@ -4606,7 +4692,8 @@ mod tests {
             | DomPatch::Move { id, .. }
             | DomPatch::Reveal { id, .. }
             | DomPatch::SetAnchor { id, .. }
-            | DomPatch::SetHints { id, .. } => *id,
+            | DomPatch::SetHints { id, .. }
+            | DomPatch::SetLanguage { id, .. } => *id,
             DomPatch::DefineRule { .. } => 0,
         }
     }
@@ -4722,6 +4809,65 @@ mod tests {
             matches!(patch, DomPatch::SetPath { path: Some(_), .. })
         });
         assert!(interactive, "rows are clickable in the scene");
+    }
+
+    /// The mount wears the page's language and the way it reads: op 27
+    /// on the first frame, nothing on a still one, and one patch when
+    /// the locale in effect moves.
+    #[test]
+    fn the_mount_carries_the_language_and_the_direction() {
+        use motor::state::{LayoutDirection, Locale};
+        let bytes = encode(&[DomPatch::SetLanguage {
+            id: 0,
+            lang: std::rc::Rc::from("ar"),
+            dir: LayoutDirection::RightToLeft,
+        }]);
+        assert_eq!(bytes, [1, 0, 0, 0, 27, 0, 0, 0, 0, 1, 2, b'a', b'r']);
+
+        let languages = |patches: &[DomPatch]| -> Vec<(u32, String, LayoutDirection)> {
+            patches
+                .iter()
+                .filter_map(|patch| match patch {
+                    DomPatch::SetLanguage { id, lang, dir } => Some((*id, lang.to_string(), *dir)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (runtime, view, size) = mini();
+        let first = runtime.dom_frame(&view, size);
+        assert!(matches!(first[0], DomPatch::SetSize { id: 0, .. }), "the mount's size still leads");
+        assert_eq!(languages(&first), [(0, "en".to_string(), LayoutDirection::LeftToRight)]);
+        let still = runtime.dom_frame(&view, size);
+        assert!(languages(&still).is_empty(), "a still frame says nothing: {still:?}");
+        runtime.set_system_locale(Locale::new("ar"));
+        let moved = runtime.dom_frame(&view, size);
+        assert_eq!(languages(&moved), [(0, "ar".to_string(), LayoutDirection::RightToLeft)]);
+    }
+
+    /// A direction of an island's own is one byte more on the wire and
+    /// another look to the sheet.
+    #[test]
+    fn a_direction_is_a_look_of_its_own() {
+        use motor::state::LayoutDirection;
+        let look = |direction| DomPatch::DefineRule {
+            rule: 1,
+            kind: CreateKind::Box,
+            flags: 0,
+            style: Box::default(),
+            layout: Box::new(DomLayout { direction, ..DomLayout::default() }),
+            text: None,
+        };
+        let plain = encode(&[look(None)]);
+        let turned = encode(&[look(Some(LayoutDirection::RightToLeft))]);
+        assert_eq!(turned.len(), plain.len() + 1, "one byte: the direction");
+        // the record ends with the face byte (none here): the direction sits before it
+        assert_eq!(turned[turned.len() - 2], 1, "right to left is 1");
+        let mut inherits = flow_row("a");
+        inherits.kind = DomKind::Box;
+        let mut turned_node = flow_row("a");
+        turned_node.kind = DomKind::Box;
+        turned_node.layout = Some(DomLayout { direction: Some(LayoutDirection::LeftToRight), ..DomLayout::default() });
+        assert_ne!(look_hash(&inherits), look_hash(&turned_node), "another rule");
     }
 
     #[test]
@@ -6392,6 +6538,31 @@ mod tests {
         boxed.look_mut();
         assert_eq!(boxed, DomStyle::default());
         assert!(boxed.is_default());
+    }
+
+    /// The padding record reads (top, trailing, bottom, leading) and
+    /// crosses the wire in that order — the same four floats it always
+    /// did, so a page built before the sides were named logical reads
+    /// the same bytes.
+    #[test]
+    fn the_padding_record_reads_top_trailing_bottom_leading() {
+        let rule = DomPatch::DefineRule {
+            rule: 1,
+            kind: CreateKind::FlexColumn,
+            flags: 0,
+            style: Box::default(),
+            layout: Box::new(DomLayout { padding: Some((1.0, 2.0, 3.0, 4.0)), ..DomLayout::default() }),
+            text: None,
+        };
+        let bytes = encode(&[rule]);
+        let mut expected = Vec::new();
+        for side in [1.0f32, 2.0, 3.0, 4.0] {
+            expected.extend_from_slice(&side.to_le_bytes());
+        }
+        assert!(
+            bytes.windows(expected.len()).any(|window| window == expected),
+            "the four sides cross in record order: {bytes:?}"
+        );
     }
 
     /// A look's hash names its rule, and a served page is adopted by
@@ -8292,6 +8463,24 @@ mod tests {
             module.contains(&pin),
             "glue/esm/bunny.js expects a different ABI than the engine encodes"
         );
+    }
+
+    /// Every glue reports the reader's languages — before the start, so
+    /// the first frame is theirs, and again when the browser says they
+    /// changed — through the one export, feature-detected like motion.
+    #[test]
+    fn the_glues_report_the_languages() {
+        for (name, glue) in [
+            ("glue_dom.js", include_str!("../../bunny_ui_web/glue/glue_dom.js")),
+            ("glue.js", include_str!("../../bunny_ui_web/glue/glue.js")),
+            ("esm/bunny.js", include_str!("../../bunny_ui_web/glue/esm/bunny.js")),
+        ] {
+            assert!(glue.contains("if (wasm.bunny_set_languages)"), "{name} reports the languages");
+            assert!(glue.contains("\"languagechange\""), "{name} hears them change");
+            let send = glue.find("sendLanguages(").expect(name);
+            let start = glue.find("START_EXPORT](").or_else(|| glue.find("start(rect.width")).expect(name);
+            assert!(send < start, "{name} sends the languages before the start");
+        }
     }
 
     /// A string crosses as its count of bytes and then its UTF-8, and

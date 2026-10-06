@@ -69,6 +69,7 @@ through the keyboard's road.
 | present | Metal, on the view's own `CAMetalLayer`; no CPU road |
 | frames | `CADisplayLink`, born paused, running only while something moves — never in the background |
 | dark, size class | the traits, mirrored into the theme (while the app has not chosen one) and `SizeClass` |
+| languages | `NSLocale.preferredLanguages` at mount — a change of language relaunches the app; the app may pin one with `App::set_locale` (`docs/i18n.md`) |
 | hosts | a webview rides the shared tenant, under the same sandwich the desktops keep |
 | synthetic input into a page | not claimed — the phone has no event constructor a page trusts |
 | a chrome, a cursor, a live resize | none: the phone has no window frame and no pointer |

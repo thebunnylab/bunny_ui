@@ -47,7 +47,7 @@ use std::rc::Rc;
 
 use bunny_ui::action::{Key, KeyMatch, KeyPattern, Stroke};
 use bunny_ui::layout::{Edges, Size};
-use bunny_ui::prelude::{EditCommand, Runtime, SizeClass};
+use bunny_ui::prelude::{EditCommand, Locale, Runtime, SizeClass};
 use bunny_ui::view::View;
 
 pub use bunny_ui_apple::credentials;
@@ -211,8 +211,18 @@ struct AppInner {
     pending: RefCell<Option<Box<dyn FnOnce()>>>,
     opened: Cell<bool>,
     scenes: Cell<usize>,
+    /// The window's scene, once `open` named it — what a locale the app
+    /// pins reaches.
+    runtime: RefCell<Option<Rc<Runtime>>>,
     /// What runs when the system asks for memory back.
     memory: RefCell<Option<Rc<dyn Fn()>>>,
+    /// The bar the app filed, kept to be worded again when the language
+    /// the window reads moves.
+    menu_bar: RefCell<Option<bunny_ui::menu::MenuBar>>,
+    /// The locale the filed menus were last worded in.
+    menu_locale: RefCell<Option<Locale>>,
+    /// The locale the app pinned over the system's.
+    pinned_locale: RefCell<Option<Locale>>,
 }
 
 impl Default for App {
@@ -234,16 +244,55 @@ impl App {
                 pending: RefCell::new(None),
                 opened: Cell::new(false),
                 scenes: Cell::new(0),
+                runtime: RefCell::new(None),
                 memory: RefCell::new(None),
+                menu_bar: RefCell::new(None),
+                menu_locale: RefCell::new(None),
+                pinned_locale: RefCell::new(None),
             }),
         }
     }
 
-    /// A runtime for the window — named for its own scene.
+    /// A runtime for the window — named for its own scene, and born
+    /// reading the locale the app pinned ([`App::set_locale`]), if any.
     pub fn runtime(&self) -> Runtime {
         let seq = self.inner.scenes.get();
         self.inner.scenes.set(seq + 1);
-        Runtime::scene(format!("w{seq}"))
+        let runtime = Runtime::scene(format!("w{seq}"));
+        if let Some(locale) = self.inner.pinned_locale.borrow().as_ref() {
+            runtime.set_locale(Some(locale.clone()));
+        }
+        runtime
+    }
+
+    /// Pins the language the window reads — over the system's, which it
+    /// follows otherwise — or, with `None`, lets it follow the system
+    /// again. The scene draws its next frame in it, and the menus filed
+    /// with UIKit are worded again when their language moved. A pin that
+    /// changes nothing costs nothing.
+    ///
+    /// The preference itself is the app's: a settings page that offers
+    /// a language writes it here, and keeps it where it keeps the rest.
+    pub fn set_locale(&self, locale: Option<Locale>) {
+        *self.inner.pinned_locale.borrow_mut() = locale.clone();
+        let moved = self
+            .inner
+            .runtime
+            .borrow()
+            .as_ref()
+            .is_some_and(|runtime| runtime.set_locale(locale));
+        if moved {
+            // the frame follows on the wake road, which never re-enters
+            // the handler this may have been called from
+            bunny_ui_apple::ffi::wake_from_any_thread();
+        }
+        self.inner.refresh_menu_bar();
+    }
+
+    /// The locale the window reads: the app's pin, else the system's
+    /// preferred languages as they stand now.
+    pub fn locale(&self) -> Locale {
+        self.inner.locale()
     }
 
     /// Records the window `run` raises on `runtime`, showing `root`.
@@ -260,6 +309,7 @@ impl App {
         );
         let memory = Rc::clone(&self.inner);
         let _ = spec;
+        *self.inner.runtime.borrow_mut() = Some(Rc::clone(&runtime));
         *self.inner.pending.borrow_mut() =
             Some(Box::new(move || mount(runtime, root, memory.memory.borrow().clone())));
         WindowId(1)
@@ -284,9 +334,15 @@ impl App {
     /// UIKit keeps it, Quit is the system's (`bunny_ui_apple::uikit_menu`
     /// says why, rule by rule). A row runs through the keymap first — UIKit
     /// matches a key command before the view hears the key — and a row the
-    /// window does not answer is dark.
+    /// window does not answer is dark. UIKit's own rows are worded in the
+    /// language the window reads ([`App::locale`], [`bunny_ui::words`]),
+    /// and worded again by the app when that language moves.
     pub fn set_menu_bar(&self, bar: &bunny_ui::menu::MenuBar) {
-        ffi::install_menu_bar(bunny_ui_apple::uikit_menu::arrange(bar));
+        let locale = self.inner.locale();
+        let words = bunny_ui::words::Words::for_locale(&locale);
+        ffi::install_menu_bar(bunny_ui_apple::uikit_menu::arrange(bar, &words));
+        *self.inner.menu_bar.borrow_mut() = Some(bar.clone());
+        *self.inner.menu_locale.borrow_mut() = Some(locale);
     }
 
     /// What to let go of when the system asks for memory back — the
@@ -311,6 +367,29 @@ impl App {
     }
 }
 
+impl AppInner {
+    /// The locale the window reads: the app's pin, else the system's
+    /// preferred languages, read now.
+    fn locale(&self) -> Locale {
+        self.pinned_locale.borrow().clone().unwrap_or_else(bunny_ui_apple::ffi::preferred_locale)
+    }
+
+    /// Words the filed menus in the locale the window reads — when that
+    /// moved since they were last filed. A pin that changes nothing
+    /// leaves them standing.
+    fn refresh_menu_bar(&self) {
+        let bar = self.menu_bar.borrow();
+        let Some(bar) = bar.as_ref() else { return };
+        let locale = self.locale();
+        if self.menu_locale.borrow().as_ref() == Some(&locale) {
+            return;
+        }
+        let words = bunny_ui::words::Words::for_locale(&locale);
+        ffi::install_menu_bar(bunny_ui_apple::uikit_menu::arrange(bar, &words));
+        *self.menu_locale.borrow_mut() = Some(locale);
+    }
+}
+
 /// Wires everything that lives as long as the app does — the GPU road,
 /// the mirrors, the gates and the event handler — once UIKit has built
 /// the window.
@@ -330,7 +409,11 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
         bunny_ui::theme::install(bunny_ui::theme::Theme::dark());
     }
     runtime.set_reduce_motion(ffi::reduce_motion());
-    runtime.set_environment(|values| values.horizontalSizeClass = size_class(compact));
+    // the system's languages reach the scene before its first frame; a
+    // locale the app pinned (`App::set_locale`) stands over them. There
+    // is no live report to hear: a change of language relaunches the app
+    runtime.set_system_locale(bunny_ui_apple::ffi::preferred_locale());
+    runtime.set_size_class(size_class(compact));
     let insets = ffi::safe_area();
     runtime.set_safe_area(edges(insets.top, insets.left, insets.bottom, insets.right));
     // a task that lands on a worker thread asks the loop for one more
@@ -781,7 +864,7 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                         });
                     }
                 }
-                runtime.set_environment(|values| values.horizontalSizeClass = size_class(compact));
+                runtime.set_size_class(size_class(compact));
                 blit(runtime, root);
             }
             AppEvent::SafeArea { top, left, bottom, right } => {

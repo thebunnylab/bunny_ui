@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 
 use crate::dom::{CreateKind, DomPatch};
 use crate::layout::{Color, Size};
+use motor::state::Locale;
 use crate::runtime::Runtime;
 use crate::view::View;
 
@@ -22,12 +23,31 @@ pub struct SsrPage {
     pub html: String,
     /// The looks the page wears, one rule each — and the targets' cursor.
     pub css: String,
+    /// The language the page was rendered in — the first tag of the
+    /// locale, what `<html lang>` wants; the mount wears it already.
+    pub lang: String,
+    /// Which way the page reads, as `<html dir>` spells it: `"ltr"` or
+    /// `"rtl"`; the mount wears it already.
+    pub dir: &'static str,
 }
 
-/// Renders `root` at `size` and serializes the mount — the same
-/// patches a browser would receive, applied to a toy tree here.
+/// Renders `root` at `size` in the default locale and serializes the
+/// mount — the same patches a browser would receive, applied to a toy
+/// tree here. [`render_in`] renders in a locale of the server's
+/// choosing.
 pub fn render(root: &impl View, size: Size) -> SsrPage {
+    render_in(root, size, &Locale::default())
+}
+
+/// [`render`] in `locale` — a server that read the request's
+/// `Accept-Language` passes `Locale::parse(header)`; the page is laid
+/// out in that locale's direction, its words resolve against it, and
+/// the mount wears its `lang` and `dir`. The glue sends the mount's own
+/// language before the start, so the adopt runs in the language the
+/// page was built in and only the reader's own report moves it.
+pub fn render_in(root: &impl View, size: Size, locale: &Locale) -> SsrPage {
     let runtime = Runtime::new();
+    runtime.set_locale(Some(locale.clone()));
     let patches = runtime.dom_frame(root, size);
     let mut tree = Tree::new(size);
     for patch in &patches {
@@ -45,20 +65,39 @@ pub fn render(root: &impl View, size: Size) -> SsrPage {
         ":where(#app) :where(a){color:inherit;text-decoration:none}".to_string(),
     ];
     css.extend(tree.rules.values().cloned());
-    SsrPage { html: tree.serialize_root(), css: css.join("\n") }
+    SsrPage {
+        html: tree.serialize_root(),
+        css: css.join("\n"),
+        lang: runtime.locale().identifier().to_string(),
+        dir: if runtime.layout_direction().is_rtl() { "rtl" } else { "ltr" },
+    }
 }
 
 /// A whole document: the page, its stylesheet, and the boot scripts.
 /// `wasm` names the binary the glue will fetch; the mount carries
 /// `data-hydrate` so the glue adopts instead of rebuilding.
 pub fn render_document(root: &impl View, size: Size, wasm: &str, glue: &str) -> String {
-    let page = render(root, size);
+    render_document_in(root, size, wasm, glue, &Locale::default())
+}
+
+/// [`render_document`] in `locale`: the document's root says the
+/// language and the direction too.
+pub fn render_document_in(
+    root: &impl View,
+    size: Size,
+    wasm: &str,
+    glue: &str,
+    locale: &Locale,
+) -> String {
+    let page = render_in(root, size, locale);
     format!(
-        "<!doctype html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"utf-8\" />\n    \
+        "<!doctype html>\n<html lang=\"{lang}\" dir=\"{dir}\">\n  <head>\n    <meta charset=\"utf-8\" />\n    \
          <style>\nhtml,body{{margin:0;height:100%;background:#101216;display:grid;place-items:center}}\n\
          #app{{position:relative;width:{width}px;height:{height}px;overflow:hidden}}\n{css}\n</style>\n  </head>\n  <body>\n    \
          {html}\n    <script>\n      window.BUNNY_WASM = \"{wasm}\";\n    </script>\n    \
          <script src=\"{glue}\"></script>\n  </body>\n</html>\n",
+        lang = page.lang,
+        dir = page.dir,
         width = size.width,
         height = size.height,
         css = page.css,
@@ -563,6 +602,12 @@ impl Tree {
                     }
                 }
             }
+            DomPatch::SetLanguage { id, lang, dir } => {
+                if let Some(element) = self.elements.get_mut(id) {
+                    element.attrs.insert("lang", lang.to_string());
+                    element.attrs.insert("dir", if dir.is_rtl() { "rtl" } else { "ltr" }.to_string());
+                }
+            }
             DomPatch::SetScroll { .. }
             | DomPatch::SetIcon { .. }
             | DomPatch::Reveal { .. }
@@ -812,8 +857,18 @@ fn rule_text(
             base.insert("justify-items", align);
         }
     }
-    if let Some((top, right, bottom, left)) = layout.padding {
-        base.insert("padding", format!("{} {} {} {}", px(top), px(right), px(bottom), px(left)));
+    // the record's sides are logical, and so are the properties: a
+    // right-to-left mount puts the leading inset on the right by itself
+    if let Some((top, trailing, bottom, leading)) = layout.padding {
+        base.insert("padding-block", format!("{} {}", px(top), px(bottom)));
+        base.insert("padding-inline", format!("{} {}", px(leading), px(trailing)));
+    }
+    // an island that reads the other way: the browser orders its rows,
+    // aligns its `start` and shapes its words that way, isolated from
+    // the text around it
+    if let Some(direction) = layout.direction {
+        base.insert("direction", if direction.is_rtl() { "rtl" } else { "ltr" }.into());
+        base.insert("unicode-bidi", "isolate".into());
     }
     if layout.grow {
         // the flexible child — and the classic flex footgun: a zeroed
@@ -966,8 +1021,11 @@ fn rule_text(
             Some(motor::views::TextAlignment::Center) => {
                 base.insert("text-align", "center".into());
             }
+            // `end`, not `right`: the trailing edge is the left one in a
+            // right-to-left mount, and leading is the browser's own
+            // `start`, which is why it is never written
             Some(motor::views::TextAlignment::Trailing) => {
-                base.insert("text-align", "right".into());
+                base.insert("text-align", "end".into());
             }
             _ => {}
         }
@@ -1096,6 +1154,119 @@ mod tests {
     use super::*;
     use crate::prelude::*;
 
+    /// The padding record is logical and so are the properties the page
+    /// writes: `padding-block` and `padding-inline`, never a physical
+    /// `padding`, so a right-to-left mount puts the leading inset on
+    /// the right without a word from the engine.
+    #[test]
+    fn leading_padding_is_inline_start_on_the_page() {
+        let layout = crate::dom::DomLayout {
+            padding: Some((1.0, 2.0, 3.0, 4.0)),
+            ..crate::dom::DomLayout::default()
+        };
+        let rule = rule_text(
+            "k",
+            crate::dom::CreateKind::FlexColumn,
+            false,
+            &crate::dom::DomLook::default(),
+            &layout,
+            None,
+        );
+        assert!(rule.contains("padding-block:1px 3px"), "{rule}");
+        assert!(rule.contains("padding-inline:4px 2px"), "leading first: {rule}");
+        assert!(!rule.contains("padding:"), "no physical padding: {rule}");
+    }
+
+    /// A trailing text aligns to `end`, never `right`; a leading one
+    /// writes nothing and takes the browser's own `start`.
+    #[test]
+    fn a_trailing_text_aligns_to_the_end_not_the_right() {
+        let face = |align| crate::dom::DomText {
+            content: std::sync::Arc::from("words"),
+            color: Color::BLACK,
+            inherits_ink: false,
+            font: crate::text_engine::FontSpec::DEFAULT,
+            line_height: None,
+            text_align: align,
+            highlights: None,
+            truncation: None,
+            inherits_face: false,
+        };
+        let rule = |align| {
+            rule_text(
+                "k",
+                crate::dom::CreateKind::Text,
+                false,
+                &crate::dom::DomLook::default(),
+                &crate::dom::DomLayout::default(),
+                Some(&face(align)),
+            )
+        };
+        let trailing = rule(Some(TextAlignment::Trailing));
+        assert!(trailing.contains("text-align:end"), "{trailing}");
+        assert!(!trailing.contains("right"), "{trailing}");
+        assert!(!rule(None).contains("text-align"), "leading is the browser's own start");
+        assert!(rule(Some(TextAlignment::Center)).contains("text-align:center"));
+    }
+
+    /// A served page's mount wears its language and the way it reads:
+    /// English and left to right by default, Arabic and right to left
+    /// when the runtime says so.
+    #[test]
+    fn the_mount_wears_the_language_and_the_direction() {
+        let size = Size { width: 300.0, height: 200.0 };
+        let page = render(&Page { on: State::new(false) }, size);
+        assert!(page.html.contains("lang=\"en\""), "{}", page.html);
+        assert!(page.html.contains("dir=\"ltr\""), "{}", page.html);
+    }
+
+    /// An island that reads the other way carries its own `direction`
+    /// in its rule, isolated.
+    #[test]
+    fn an_rtl_island_sets_its_own_dir() {
+        let layout = crate::dom::DomLayout {
+            direction: Some(LayoutDirection::RightToLeft),
+            ..crate::dom::DomLayout::default()
+        };
+        let rule = rule_text(
+            "k",
+            crate::dom::CreateKind::Box,
+            false,
+            &crate::dom::DomLook::default(),
+            &layout,
+            None,
+        );
+        assert!(rule.contains("direction:rtl"), "{rule}");
+        assert!(rule.contains("unicode-bidi:isolate"), "{rule}");
+        let plain = rule_text(
+            "k",
+            crate::dom::CreateKind::Box,
+            false,
+            &crate::dom::DomLook::default(),
+            &crate::dom::DomLayout::default(),
+            None,
+        );
+        assert!(
+            !plain.contains("direction:ltr") && !plain.contains("unicode-bidi"),
+            "a box that inherits says nothing: {plain}"
+        );
+    }
+
+    /// The page and the glue write one CSS: the logical names the page
+    /// uses are the ones the glue spells, and neither says a side.
+    #[test]
+    fn the_page_and_the_glue_write_the_same_logical_properties() {
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        for name in ["padding-block", "padding-inline"] {
+            assert!(glue.contains(&format!("decl[\"{name}\"]")), "the glue writes {name}");
+        }
+        assert!(glue.contains("decl[\"text-align\"] = \"end\""), "the glue aligns to end");
+        assert!(!glue.contains("decl[\"text-align\"] = \"right\""), "and never to right");
+        assert!(!glue.contains("decl.padding ="), "and writes no physical padding");
+        assert!(glue.contains("decl.direction ="), "the glue writes an island's direction");
+        assert!(glue.contains("decl[\"unicode-bidi\"] = \"isolate\""), "isolated");
+    }
+
     #[derive(Clone)]
     struct Page {
         on: State<bool>,
@@ -1127,6 +1298,65 @@ mod tests {
         assert!(first.html.contains("hello, prerender"));
         assert!(first.html.contains("display:flex"));
         assert!(!first.html.contains("position:absolute"), "a flow page ships in the flow");
+    }
+
+    /// A page rendered in a locale is laid out and worded in it, and says
+    /// so on its mount and its document root — Arabic reads right to left.
+    #[test]
+    fn a_served_page_in_arabic_is_already_rtl() {
+        let size = Size { width: 300.0, height: 200.0 };
+        let page = render_in(&Page { on: State::new(false) }, size, &Locale::new("ar"));
+        assert_eq!((page.lang.as_str(), page.dir), ("ar", "rtl"));
+        assert!(page.html.contains("lang=\"ar\""), "{}", page.html);
+        assert!(page.html.contains("dir=\"rtl\""), "{}", page.html);
+        let document = render_document_in(
+            &Page { on: State::new(false) },
+            size,
+            "page.wasm",
+            "glue_dom.js",
+            &Locale::parse("ar,en"),
+        );
+        assert!(document.contains("<html lang=\"ar\" dir=\"rtl\">"), "{document}");
+        let english = render(&Page { on: State::new(false) }, size);
+        assert_eq!((english.lang.as_str(), english.dir), ("en", "ltr"));
+        assert!(render_document(&Page { on: State::new(false) }, size, "w", "g").contains("<html lang=\"en\" dir=\"ltr\">"));
+    }
+
+    /// The locale a page is sealed in is the whole list's first tag.
+    #[test]
+    fn a_page_is_sealed_in_its_language() {
+        let size = Size { width: 300.0, height: 200.0 };
+        let page = render_in(&Page { on: State::new(false) }, size, &Locale::parse("pt-BR,en"));
+        assert_eq!((page.lang.as_str(), page.dir), ("pt-BR", "ltr"));
+        assert!(page.html.contains("lang=\"pt-BR\""));
+    }
+
+    /// A page served in Arabic is adopted in silence by a runtime that
+    /// speaks Arabic: the mount's language and direction are noted, not
+    /// sent again.
+    #[test]
+    fn an_adopted_page_keeps_its_language_in_silence() {
+        let size = Size { width: 300.0, height: 200.0 };
+        let built = Page { on: State::new(false) };
+        let runtime = Runtime::new();
+        runtime.set_locale(Some(Locale::new("ar")));
+        let mount = runtime.dom_frame(&built, size);
+        assert!(mount.iter().any(|patch| matches!(patch, DomPatch::SetLanguage { .. })));
+
+        let served = Page { on: State::new(false) };
+        let fresh = Runtime::new();
+        fresh.set_locale(Some(Locale::new("ar")));
+        fresh.dom_adopt(&served, size);
+        let first = fresh.dom_frame(&served, size);
+        assert!(first.is_empty(), "the adopted page is already true, language included: {first:?}");
+        // the reader's own report moves it: one patch on the mount
+        fresh.set_locale(None);
+        assert!(fresh.set_system_locale(Locale::new("en")));
+        let moved = fresh.dom_frame(&served, size);
+        assert!(
+            moved.iter().any(|patch| matches!(patch, DomPatch::SetLanguage { dir, .. } if !dir.is_rtl())),
+            "{moved:?}"
+        );
     }
 
     /// Hydration's other half: a fresh runtime adopts the same scene

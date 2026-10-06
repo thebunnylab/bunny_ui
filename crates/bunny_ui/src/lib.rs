@@ -40,6 +40,7 @@
 pub mod action;
 pub mod anim;
 pub mod bind;
+pub mod catalog;
 pub mod clipboard;
 pub mod custom;
 pub mod dom;
@@ -78,6 +79,7 @@ pub mod touch;
 pub mod view;
 pub(crate) mod viewport;
 pub mod views;
+pub mod words;
 
 pub use runtime::request_frame;
 
@@ -138,6 +140,9 @@ pub mod task {
 pub mod prelude {
     pub use crate::action::{ActionId, Key, KeyPattern};
     pub use crate::anim::{FramePace, Loop, Spring, Ticked};
+    // the app's strings: `catalog::Table` and `catalog::Key` stay
+    // qualified, as the views have a `Table` and the actions a `Key`
+    pub use crate::catalog::{self, Catalog, Strings};
     pub use crate::touch::{Gesture, TouchScene};
     pub use crate::custom::{
         Custom, CustomElement, ElementEvent, EventCtx, ImeContext, Metrics, PaintCtx, Painter,
@@ -165,6 +170,7 @@ pub mod prelude {
         VisualProps,
     };
     pub use crate::theme::{self, Theme};
+    pub use crate::words::{self, Word, Words};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Tracking, Weight};
     pub use crate::text_input::{CaretState, EditCommand, KeyboardType};
     pub use crate::one_of::{OneOf3, OneOf4, OneOf5, OneOf6, OneOf7, OneOf8};
@@ -181,8 +187,9 @@ pub mod prelude {
     pub use motor::loadable::{Loadable, LoadableSubject, LoadError};
     pub use motor::runtime::Site;
     pub use motor::state::{
-        Binding, Context, Environment, EnvironmentValues, FromEnvironment, KeyboardInset, Locale,
-        ProvidesQueries, SafeAreaInsets, SizeClass, State, Viewport, WindowState,
+        Binding, Context, Environment, EnvironmentValues, FromEnvironment, KeyboardInset,
+        LayoutDirection, Locale, ProvidesQueries, SafeAreaInsets, SizeClass, State, Viewport,
+        WindowState,
     };
     pub use motor::views::{
         ContentMode, Edge, Font, ListStyle, NavigationPath, ProgressViewStyle, Query,
@@ -12545,6 +12552,7 @@ mod tests {
             phase: 0.0,
             scale: 2.0,
             touch: false,
+            direction: LayoutDirection::LeftToRight,
         };
 
         // the product's own line, `(v * scale).round() / scale`
@@ -16859,6 +16867,708 @@ mod tests {
             }
         }
         assert_eq!(first_line(&Runtime::new().display_frame(&Preview, size)), "narrow");
+    }
+
+    // MARK: - The locale reaches the body
+
+    /// The shell's report moves the environment once: the first report
+    /// is news, the same report again is not, and only news asks for a
+    /// frame.
+    #[test]
+    fn a_system_locale_moves_the_environment_once() {
+        let runtime = Runtime::new();
+        let size = Size { width: 300.0, height: 200.0 };
+        let _ = runtime.display_frame(&text("hi"), size);
+        assert!(!runtime.frame_need().environment);
+        assert!(runtime.set_system_locale(Locale::parse("pt-BR,en")), "the first report is news");
+        assert!(runtime.frame_need().environment);
+        assert_eq!(runtime.locale().as_str(), "pt-BR,en");
+        let _ = runtime.display_frame(&text("hi"), size);
+        assert!(!runtime.set_system_locale(Locale::parse("pt-BR,en")), "the same report is not");
+        assert!(!runtime.frame_need().environment, "and costs no frame");
+    }
+
+    /// The app's pin outranks the system's report: while pinned, a
+    /// system that moves changes nothing a body sees; unpinned, the
+    /// environment follows the system again.
+    #[test]
+    fn a_pinned_locale_outranks_the_systems() {
+        let runtime = Runtime::new();
+        runtime.set_system_locale(Locale::new("en-US"));
+        assert!(runtime.set_locale(Some(Locale::new("pt-BR"))));
+        assert_eq!(runtime.locale().identifier(), "pt-BR");
+        assert!(!runtime.set_system_locale(Locale::new("fr")), "a system move under a pin is no news");
+        assert_eq!(runtime.locale().identifier(), "pt-BR");
+        assert!(!runtime.set_locale(Some(Locale::new("pt-BR"))), "the same pin again is no news");
+        assert!(runtime.set_locale(None), "unpinned, the system's word stands");
+        assert_eq!(runtime.locale().identifier(), "fr");
+    }
+
+    /// A locale brings its direction, and a pinned direction overrides
+    /// it without touching the language.
+    #[test]
+    fn a_locale_brings_its_direction_and_a_pin_overrides_it() {
+        let runtime = Runtime::new();
+        assert_eq!(runtime.layout_direction(), LayoutDirection::LeftToRight);
+        runtime.set_system_locale(Locale::new("ar"));
+        assert_eq!(runtime.layout_direction(), LayoutDirection::RightToLeft);
+        assert_eq!(
+            runtime.context().environment::<LayoutDirection>(),
+            LayoutDirection::RightToLeft,
+            "a body reads the same"
+        );
+        assert!(runtime.set_layout_direction(Some(LayoutDirection::LeftToRight)));
+        assert_eq!(runtime.layout_direction(), LayoutDirection::LeftToRight);
+        assert_eq!(runtime.locale().identifier(), "ar", "the language stayed");
+        assert!(!runtime.set_layout_direction(Some(LayoutDirection::LeftToRight)));
+        assert!(runtime.set_layout_direction(None), "the locale decides again");
+        assert_eq!(runtime.layout_direction(), LayoutDirection::RightToLeft);
+    }
+
+    /// A body that reads the locale runs again when it moves — inside
+    /// the settle, once — and a still frame runs no body.
+    #[test]
+    fn a_body_that_reads_the_locale_runs_again_when_it_moves() {
+        #[derive(Clone, Copy)]
+        struct Greeting;
+        impl Component for Greeting {
+            fn body(self, ctx: &Context) -> impl View {
+                let word = match ctx.environment::<Locale>().language() {
+                    "pt" => "oi",
+                    _ => "hello",
+                };
+                vstack!(text(word), spacer())
+            }
+        }
+        fn first_line(display: &crate::layout::DisplayList) -> String {
+            display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { content, .. } => {
+                        Some(content.to_string())
+                    }
+                    _ => None,
+                })
+                .expect("a line paints")
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 300.0, height: 200.0 };
+        assert_eq!(first_line(&runtime.display_frame(&Greeting, size)), "hello");
+        let _ = runtime.display_frame(&Greeting, size);
+        assert!(runtime.body_runs().is_empty(), "nothing moved, nothing ran");
+        runtime.set_system_locale(Locale::parse("pt-BR,en"));
+        assert_eq!(first_line(&runtime.display_frame(&Greeting, size)), "oi");
+        let _ = runtime.display_frame(&Greeting, size);
+        assert!(runtime.body_runs().is_empty(), "and settled");
+    }
+
+    /// A seed is the locale until a shell speaks: headless and in a
+    /// preview the app's `with_environment` stands, and a direction the
+    /// seed did not name is the seed's own.
+    #[test]
+    fn a_headless_seed_is_the_locale_until_a_shell_speaks() {
+        let mut values = EnvironmentValues::default();
+        values.locale = Locale::new("he");
+        let runtime = Runtime::with_environment(values);
+        assert_eq!(runtime.locale().identifier(), "he");
+        assert_eq!(runtime.layout_direction(), LayoutDirection::RightToLeft, "derived from the seed");
+        assert!(!runtime.frame_need().environment, "a derivation at birth moves nothing");
+        assert!(runtime.set_system_locale(Locale::new("en")));
+        assert_eq!(runtime.locale().identifier(), "en");
+        assert_eq!(runtime.layout_direction(), LayoutDirection::LeftToRight);
+
+        // a seed that names a direction keeps it
+        let mut values = EnvironmentValues::default();
+        values.layoutDirection = LayoutDirection::RightToLeft;
+        let runtime = Runtime::with_environment(values);
+        assert_eq!(runtime.layout_direction(), LayoutDirection::RightToLeft);
+        assert_eq!(runtime.locale().identifier(), "en");
+    }
+
+    /// The typed doors compare first: a size class that stands is not
+    /// written, and the retention is not rebuilt for it.
+    #[test]
+    fn a_size_class_that_did_not_move_costs_nothing() {
+        let runtime = Runtime::new();
+        let size = Size { width: 390.0, height: 844.0 };
+        let _ = runtime.display_frame(&text("hi"), size);
+        assert!(!runtime.set_size_class(SizeClass::Regular), "regular already");
+        assert!(!runtime.frame_need().environment);
+        assert!(runtime.set_size_class(SizeClass::Compact));
+        assert!(runtime.frame_need().environment);
+        assert_eq!(runtime.context().environment::<SizeClass>(), SizeClass::Compact);
+    }
+
+    // MARK: - The direction reaches the layout
+
+    /// Where each text line starts, by its words — the probe the
+    /// direction tests read the scene through.
+    fn text_lefts(display: &crate::layout::DisplayList) -> Vec<(String, f64)> {
+        display
+            .iter()
+            .filter_map(|command| match command {
+                crate::layout::DrawCommand::TextLine { content, origin, .. } => {
+                    Some((content.to_string(), origin.x))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[derive(Clone, Copy)]
+    struct Pair;
+    impl Component for Pair {
+        fn body(self, _ctx: &Context) -> impl View {
+            hstack!(text("a"), text("bb"))
+        }
+    }
+
+    /// An `.environment` that turns the direction turns it for its
+    /// subtree alone: the island reads from the right inside a scene
+    /// that reads from the left.
+    #[test]
+    fn an_rtl_island_inside_an_ltr_tree_mirrors_only_itself() {
+        #[derive(Clone, Copy)]
+        struct Scene;
+        impl Component for Scene {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    Pair,
+                    Pair.environment(|values| values.layoutDirection = LayoutDirection::RightToLeft),
+                )
+            }
+        }
+        let runtime = Runtime::new();
+        let lefts = text_lefts(&runtime.display_frame(&Scene, Size { width: 100.0, height: 100.0 }));
+        assert_eq!(
+            lefts,
+            [("a".into(), 0.0), ("bb".into(), 8.0), ("a".into(), 16.0), ("bb".into(), 0.0)],
+            "the plain row reads left to right, the island right to left"
+        );
+    }
+
+    /// The other way round: a scene pinned right to left stands at the
+    /// window's right edge and reads from it, and an island turned back
+    /// reads from its own left.
+    #[test]
+    fn an_ltr_island_inside_an_rtl_app_reads_from_the_left() {
+        #[derive(Clone, Copy)]
+        struct Scene;
+        impl Component for Scene {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    Pair,
+                    Pair.environment(|values| values.layoutDirection = LayoutDirection::LeftToRight),
+                )
+            }
+        }
+        let runtime = Runtime::new();
+        assert!(runtime.set_layout_direction(Some(LayoutDirection::RightToLeft)));
+        let lefts = text_lefts(&runtime.display_frame(&Scene, Size { width: 100.0, height: 100.0 }));
+        assert_eq!(
+            lefts,
+            [("a".into(), 92.0), ("bb".into(), 76.0), ("a".into(), 76.0), ("bb".into(), 84.0)],
+            "the scene hugs the right edge; the plain row reads right to left, the island left to right"
+        );
+    }
+
+    /// Three words in a horizontal strip, 240 wide, in a window of 100.
+    #[derive(Clone, Copy)]
+    struct Strip;
+    impl Component for Strip {
+        fn body(self, _ctx: &Context) -> impl View {
+            scroll(hstack!(text("aaaaaaaaaa"), text("bbbbbbbbbb"), text("cccccccccc")))
+                .horizontal()
+                .id("strip")
+        }
+    }
+
+    /// The wheel reveals the TRAILING content of a right-to-left strip:
+    /// the strip starts at the right, a turn toward the right has nothing
+    /// earlier to show, a turn toward the left shows the rest — and the
+    /// offset still counts from the leading edge.
+    #[test]
+    fn the_wheel_reveals_the_trailing_content_in_rtl() {
+        use crate::layout::{Proposal, Size};
+        let size = Size { width: 100.0, height: 50.0 };
+        let left_of = |runtime: &Runtime, word: &str| {
+            text_lefts(&runtime.display_frame(&Strip, size))
+                .into_iter()
+                .find(|(content, _)| content == word)
+                .map(|(_, x)| x)
+                .unwrap_or_else(|| panic!("{word} paints"))
+        };
+        let ltr = Runtime::new();
+        ltr.render_stable(&Strip);
+        let path = ltr.layout(&Strip, Proposal::exact(size)).scrolls[0].path.clone();
+        assert_eq!(left_of(&ltr, "aaaaaaaaaa"), 0.0, "left to right, the strip starts at the left");
+        assert!(ltr.wheel(50.0, 8.0, -40.0, 0.0), "a turn toward the right shows the rest");
+        assert_eq!(ltr.scroll_offset(&path).x, 40.0);
+        assert_eq!(left_of(&ltr, "aaaaaaaaaa"), -40.0);
+
+        let rtl = Runtime::new();
+        rtl.set_layout_direction(Some(LayoutDirection::RightToLeft));
+        rtl.render_stable(&Strip);
+        let _ = rtl.layout(&Strip, Proposal::exact(size));
+        assert_eq!(left_of(&rtl, "aaaaaaaaaa"), 20.0, "the first word ends at the right edge");
+        assert_eq!(left_of(&rtl, "cccccccccc"), -140.0, "the last hangs out past the left");
+        assert!(!rtl.wheel(50.0, 8.0, -40.0, 0.0), "a turn toward the right has nothing earlier to show");
+        assert_eq!(rtl.scroll_offset(&path).x, 0.0);
+        assert!(rtl.wheel(50.0, 8.0, 40.0, 0.0), "a turn toward the left shows the rest");
+        assert_eq!(rtl.scroll_offset(&path).x, 40.0, "and the offset counts from the leading edge");
+        assert_eq!(left_of(&rtl, "aaaaaaaaaa"), 60.0, "the strip moved right by it");
+    }
+
+    /// Dragging the horizontal thumb in a right-to-left strip moves the
+    /// content with the hand: the thumb starts at the right end, and a
+    /// pointer going left scrolls toward the trailing content.
+    #[test]
+    fn dragging_the_horizontal_thumb_in_rtl_moves_the_content_with_the_hand() {
+        use crate::layout::{Proposal, Size};
+        let runtime = Runtime::new();
+        runtime.set_layout_direction(Some(LayoutDirection::RightToLeft));
+        runtime.render_stable(&Strip);
+        let viewport = Proposal::exact(Size { width: 100.0, height: 50.0 });
+        let result = runtime.layout(&Strip, viewport);
+        let path = result.scrolls[0].path.clone();
+        let thumb = result
+            .hits
+            .iter()
+            .find(|(path, _)| path.ends_with("/#thumb-h"))
+            .expect("the thumb is a target")
+            .1;
+        assert_eq!(
+            thumb.origin.x + thumb.size.width,
+            100.0 - crate::layout::SCROLLBAR_INSET,
+            "the thumb starts at the right end of its track"
+        );
+        let (grab_x, y) = (thumb.origin.x + 4.0, thumb.origin.y + 2.0);
+        assert!(runtime.pointer_pressed(grab_x, y));
+        assert!(runtime.pointer_moved(grab_x - 1.0, y, false), "a point to the left is a step");
+        let after_one = runtime.scroll_offset(&path).x;
+        assert!(after_one > 0.0 && after_one < 50.0, "one point of thumb is a small step: {after_one}");
+        assert!(runtime.pointer_moved(-10_000.0, y, false));
+        assert_eq!(runtime.scroll_offset(&path).x, 140.0, "the far end is the far end");
+        assert_eq!(runtime.pointer_released(-10_000.0, y), None);
+    }
+
+    /// Dragging a split in a right-to-left scene writes the lane on the
+    /// right — the first one — as the pointer's distance from the
+    /// frame's right edge.
+    #[test]
+    fn dragging_a_split_in_rtl_writes_the_lane_on_the_right() {
+        use crate::layout::{Proposal, Size};
+        #[derive(Clone, Copy)]
+        struct Bench {
+            seam: State<f64>,
+        }
+        impl Component for Bench {
+            fn body(self, _ctx: &Context) -> impl View {
+                hsplit(self.seam.binding(), text("panel"), text("editor")).min_sizes(120.0, 200.0)
+            }
+        }
+        let bench = Bench { seam: State::new(260.0) };
+        let runtime = Runtime::new();
+        runtime.set_layout_direction(Some(LayoutDirection::RightToLeft));
+        runtime.render_stable(&bench);
+        let viewport = Proposal::exact(Size { width: 1200.0, height: 700.0 });
+        let grip_center = |result: &crate::layout::LayoutResult| {
+            let (_, grip) = result
+                .hits
+                .iter()
+                .find(|(path, _)| path.ends_with("/#split"))
+                .expect("the seam registers a grip");
+            grip.origin.x + grip.size.width / 2.0
+        };
+        let center = grip_center(&runtime.layout(&bench, viewport));
+        assert!((center - 939.5).abs() < 1.0, "the seam stands 260 from the RIGHT edge: {center}");
+        assert!(runtime.pointer_pressed(center, 300.0));
+        assert!(runtime.pointer_moved(800.0, 300.0, false));
+        assert_eq!(bench.seam.get(), 400.0, "the lane on the right is as wide as the pointer's reach from the right");
+        let moved = grip_center(&runtime.layout(&bench, viewport));
+        assert!((moved - 799.5).abs() < 1.0, "and the seam followed: {moved}");
+    }
+
+    /// A popover's side is named from the leading edge: right to left,
+    /// a leading popover opens to the RIGHT of its anchor and a trailing
+    /// one to the left; above and below stay centred. The mirror of
+    /// `a_popover_hangs_off_every_side_with_the_gap`.
+    #[test]
+    fn a_popover_on_the_leading_side_opens_to_the_right_in_rtl() {
+        #[derive(Clone)]
+        struct Turning {
+            side: State<usize>,
+        }
+        impl Component for Turning {
+            fn body(self, _ctx: &Context) -> impl View {
+                let side =
+                    [Side::Bottom, Side::Top, Side::Trailing, Side::Leading][self.side.get()];
+                vstack!(
+                    spacer().frame(180.0, 80.0),
+                    spacer().frame(20.0, 20.0).popover(
+                        State::new(true).binding(),
+                        side,
+                        |_| erased(spacer().frame(40.0, 30.0)),
+                    ),
+                )
+            }
+        }
+        let runtime = Runtime::new();
+        runtime.set_layout_direction(Some(LayoutDirection::RightToLeft));
+        let view = Turning { side: State::new(0) };
+        let window = crate::layout::Proposal::exact(Size { width: 200.0, height: 200.0 });
+        // the column hugs the right edge, so the anchor sits at (100, 80)–(120, 100)
+        let frame = |index: usize| {
+            view.side.set(index);
+            let result = runtime.layout(&view, window);
+            assert_eq!(result.overlays.len(), 1, "one open popover");
+            result.overlays[0].frame
+        };
+        let bottom = frame(0);
+        assert_eq!((bottom.origin.x, bottom.origin.y), (90.0, 106.0), "below, centred");
+        let top = frame(1);
+        assert_eq!((top.origin.x, top.origin.y), (90.0, 44.0), "above, centred");
+        let trailing = frame(2);
+        assert_eq!((trailing.origin.x, trailing.origin.y), (54.0, 75.0), "trailing is the left");
+        let leading = frame(3);
+        assert_eq!((leading.origin.x, leading.origin.y), (126.0, 75.0), "leading is the right");
+    }
+
+    /// A tooltip asked for on the leading side shows on the right of
+    /// its anchor in a right-to-left scene.
+    #[test]
+    fn a_tooltip_on_the_leading_side_opens_to_the_right_in_rtl() {
+        use crate::layout::TOOLTIP_PATH;
+        #[derive(Clone, Copy)]
+        struct Rail;
+        impl Component for Rail {
+            fn body(self, _ctx: &Context) -> impl View {
+                // centred in a wide window, so either side has room
+                vstack!(
+                    text("gear").tooltip_side("Settings", Side::Leading).frame(40.0, 20.0),
+                    spacer().frame(40.0, 60.0),
+                )
+                .frame(400.0, 120.0)
+            }
+        }
+        let bubble = |direction: LayoutDirection| {
+            let runtime = Runtime::new();
+            runtime.set_layout_direction(Some(direction));
+            let size = Size { width: 400.0, height: 120.0 };
+            let result = runtime.layout(&Rail, crate::layout::Proposal::exact(size));
+            let anchor = result
+                .tooltips
+                .first()
+                .expect("the gear explains itself")
+                .rect;
+            runtime.pointer_moved(anchor.origin.x + 5.0, anchor.origin.y + 5.0, false);
+            runtime.tooltip_tick();
+            assert!(runtime.tooltip_tick(), "the second beat shows the bubble");
+            let result = runtime.layout(&Rail, crate::layout::Proposal::exact(size));
+            let bubble = result
+                .overlays
+                .iter()
+                .find(|overlay| overlay.path == TOOLTIP_PATH)
+                .expect("the bubble is an overlay")
+                .frame;
+            (anchor, bubble)
+        };
+        let (anchor, left_of) = bubble(LayoutDirection::LeftToRight);
+        assert!(left_of.origin.x + left_of.size.width <= anchor.origin.x, "left to right, before the anchor");
+        let (anchor, right_of) = bubble(LayoutDirection::RightToLeft);
+        assert!(right_of.origin.x >= anchor.origin.x + anchor.size.width, "right to left, after it");
+    }
+
+    /// A context menu hangs down-LEFT of the press in a right-to-left
+    /// scene, and lays its rows out from the right.
+    #[test]
+    fn a_context_menu_hangs_down_left_in_rtl() {
+        use crate::action::Modifiers;
+        use crate::custom::PointerButton;
+        use crate::layout::MENU_PATH;
+        #[derive(Clone, Copy)]
+        struct Pane;
+        impl Component for Pane {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("file").frame(400.0, 100.0).context_menu(vec![menu_item("Open", || {})])
+            }
+        }
+        let size = Size { width: 500.0, height: 200.0 };
+        let menu = |direction: LayoutDirection| {
+            let runtime = Runtime::new();
+            runtime.set_layout_direction(Some(direction));
+            runtime.render_stable(&Pane);
+            let _ = runtime.layout(&Pane, crate::layout::Proposal::exact(size));
+            assert!(runtime.button_pressed(250.0, 50.0, PointerButton::Secondary, Modifiers::NONE));
+            let result = runtime.layout(&Pane, crate::layout::Proposal::exact(size));
+            let panel = result
+                .overlays
+                .iter()
+                .find(|overlay| overlay.path == MENU_PATH)
+                .expect("the menu is an overlay");
+            let label = result
+                .display
+                .iter()
+                .skip(panel.display.0)
+                .take(panel.display.1 - panel.display.0)
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { origin, .. } => Some(origin.x),
+                    _ => None,
+                })
+                .expect("the row paints its label");
+            (panel.frame, label)
+        };
+        let (frame, label) = menu(LayoutDirection::LeftToRight);
+        assert_eq!(frame.origin.x, 250.0, "left to right, the panel hangs right of the press");
+        assert!(label < frame.origin.x + frame.size.width / 2.0, "and its label reads from the left");
+        let (frame, label) = menu(LayoutDirection::RightToLeft);
+        assert_eq!(frame.origin.x + frame.size.width, 250.0, "right to left, it hangs left of the press");
+        assert!(label > frame.origin.x + frame.size.width / 2.0, "and its label reads from the right");
+    }
+
+    /// The window's bands are physical and a body's are its own: right to
+    /// left, the environment's `leading` inset is the right band, while
+    /// the root still stands inside the window's left one.
+    #[test]
+    fn the_environments_safe_area_swaps_leading_and_trailing_in_rtl() {
+        #[derive(Clone, Copy)]
+        struct Reader;
+        impl Component for Reader {
+            fn body(self, ctx: &Context) -> impl View {
+                let insets = ctx.environment::<SafeAreaInsets>();
+                hstack!(text!("{}:{}", insets.leading, insets.trailing), spacer())
+            }
+        }
+        let size = Size { width: 100.0, height: 50.0 };
+        let bands = crate::layout::Edges { top: 0.0, trailing: 30.0, bottom: 0.0, leading: 10.0 };
+        let ltr = Runtime::new();
+        ltr.set_safe_area(bands);
+        assert_eq!(text_lefts(&ltr.display_frame(&Reader, size)), [("10:30".into(), 10.0)]);
+
+        let rtl = Runtime::new();
+        rtl.set_layout_direction(Some(LayoutDirection::RightToLeft));
+        rtl.set_safe_area(bands);
+        // the body reads the right band as leading; the row still fills the
+        // window's inner width, 10 from the left and 30 from the right, and
+        // its first word ends on the right band
+        assert_eq!(text_lefts(&rtl.display_frame(&Reader, size)), [("30:10".into(), 70.0 - 40.0)]);
+    }
+
+    /// A box hears which way the scene around it reads — in its paint and
+    /// in its events — and the leading-edge formula is offered to it, in
+    /// its own left-origin coordinates.
+    #[test]
+    fn a_box_hears_the_direction_it_paints_in() {
+        use std::cell::RefCell;
+        #[derive(Default)]
+        struct Heard {
+            painted_rtl: Option<bool>,
+            gutter_x: Option<f64>,
+            event_rtl: Option<bool>,
+        }
+        struct Gutter {
+            heard: Rc<RefCell<Heard>>,
+        }
+        impl CustomElement for Gutter {
+            fn paint(&self, ctx: &PaintCtx, _painter: &mut Painter) {
+                let mut heard = self.heard.borrow_mut();
+                heard.painted_rtl = Some(ctx.rtl());
+                // a gutter of 10 on the leading edge
+                heard.gutter_x = Some(ctx.leading_x(0.0, 10.0));
+            }
+            fn event(&self, _event: &ElementEvent, ctx: &EventCtx) -> crate::custom::Response {
+                self.heard.borrow_mut().event_rtl = Some(ctx.direction.is_rtl());
+                crate::custom::Response::ignored()
+            }
+        }
+        #[derive(Clone)]
+        struct Pane {
+            heard: Rc<RefCell<Heard>>,
+        }
+        impl Component for Pane {
+            fn body(self, _ctx: &Context) -> impl View {
+                custom(Gutter { heard: Rc::clone(&self.heard) }).frame(200.0, 100.0)
+            }
+        }
+        let size = Size { width: 300.0, height: 200.0 };
+        for direction in [LayoutDirection::LeftToRight, LayoutDirection::RightToLeft] {
+            let heard = Rc::new(RefCell::new(Heard::default()));
+            let pane = Pane { heard: Rc::clone(&heard) };
+            let runtime = Runtime::new();
+            runtime.set_layout_direction(Some(direction));
+            runtime.render_stable(&pane);
+            let _ = runtime.display_frame(&pane, size);
+            let result = runtime.layout(&pane, crate::layout::Proposal::exact(size));
+            let frame = result.customs.first().expect("the box is placed").frame;
+            runtime.pointer_moved(frame.origin.x + 20.0, frame.origin.y + 20.0, false);
+            let heard = heard.borrow();
+            let rtl = direction.is_rtl();
+            assert_eq!(heard.painted_rtl, Some(rtl), "the paint knows");
+            assert_eq!(heard.gutter_x, Some(if rtl { 190.0 } else { 0.0 }), "the gutter sits on the leading edge");
+            assert_eq!(heard.event_rtl, Some(rtl), "and so does the event");
+        }
+    }
+
+    /// The picture sources a scene draws, in order.
+    fn image_sources(display: &crate::layout::DisplayList) -> Vec<ImageSource> {
+        display
+            .iter()
+            .filter_map(|command| match command {
+                crate::layout::DrawCommand::Image { source, .. } => Some(source.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A chevron that said it flips points the other way in a
+    /// right-to-left scene — its source is the same glyph in a mirror —
+    /// and stays as drawn left to right.
+    #[test]
+    fn a_flipped_chevron_points_the_other_way_only_in_rtl() {
+        #[derive(Clone, Copy)]
+        struct Disclosure;
+        impl Component for Disclosure {
+            fn body(self, _ctx: &Context) -> impl View {
+                icon(symbol::CHEVRON_RIGHT).flips_for_right_to_left_layout_direction(true)
+            }
+        }
+        let size = Size { width: 40.0, height: 40.0 };
+        let plain = Runtime::new();
+        let drawn = image_sources(&plain.display_frame(&Disclosure, size));
+        assert_eq!(drawn.len(), 1, "one glyph");
+        assert!(matches!(drawn[0], ImageSource::Symbol { .. }), "left to right, the glyph itself");
+
+        let mirrored = Runtime::new();
+        mirrored.set_layout_direction(Some(LayoutDirection::RightToLeft));
+        let flipped = image_sources(&mirrored.display_frame(&Disclosure, size));
+        assert_eq!(flipped.len(), 1, "one glyph");
+        assert!(matches!(flipped[0], ImageSource::Mirrored { .. }), "right to left, in a mirror");
+        assert_eq!(flipped[0].mirrored(), drawn[0], "of the same glyph");
+    }
+
+    /// A picture keeps its face unless its view asked to flip, and a view
+    /// below can turn an ancestor's flip off again.
+    #[test]
+    fn a_picture_keeps_its_face_in_rtl() {
+        #[derive(Clone, Copy)]
+        struct Rail;
+        impl Component for Rail {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    icon(symbol::CHEVRON_RIGHT),
+                    vstack!(
+                        icon(symbol::CHEVRON_RIGHT),
+                        icon(symbol::CHEVRON_RIGHT).flips_for_right_to_left_layout_direction(false),
+                    )
+                    .flips_for_right_to_left_layout_direction(true),
+                )
+            }
+        }
+        let runtime = Runtime::new();
+        runtime.set_layout_direction(Some(LayoutDirection::RightToLeft));
+        let sources = image_sources(&runtime.display_frame(&Rail, Size { width: 40.0, height: 120.0 }));
+        assert_eq!(sources.len(), 3);
+        assert!(matches!(sources[0], ImageSource::Symbol { .. }), "nobody asked: the face stays");
+        assert!(matches!(sources[1], ImageSource::Mirrored { .. }), "the parent asked");
+        assert!(matches!(sources[2], ImageSource::Symbol { .. }), "and the child said no");
+    }
+
+    #[derive(Clone, Copy)]
+    struct Form {
+        name: State<String>,
+    }
+    impl Component for Form {
+        fn body(self, _ctx: &Context) -> impl View {
+            text_field("name", self.name.binding()).frame_width(120.0)
+        }
+    }
+
+    /// The field's run — where its text line starts — and its placement.
+    fn field_run(runtime: &Runtime, form: &Form) -> (f64, crate::layout::FieldPlacement) {
+        use crate::layout::{DrawCommand, Proposal, Size};
+        let result = runtime.layout(form, Proposal::exact(Size { width: 240.0, height: 60.0 }));
+        let field = result.fields.first().expect("the field is placed").clone();
+        let x = result
+            .display
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::TextLine { origin, .. } => Some(origin.x),
+                _ => None,
+            })
+            .expect("the field paints its run");
+        (x, field)
+    }
+
+    /// A field anchors a line that fits at the scene's leading edge: the
+    /// right one in a right-to-left scene.
+    #[test]
+    fn a_field_reads_from_the_right_in_rtl() {
+        let form = Form { name: State::new("abc".to_string()) };
+        let ltr = Runtime::new();
+        ltr.render_stable(&form);
+        let (x, field) = field_run(&ltr, &form);
+        assert_eq!(x, field.run.origin.x, "left to right, at the run's left edge");
+
+        let rtl = Runtime::new();
+        rtl.set_layout_direction(Some(LayoutDirection::RightToLeft));
+        rtl.render_stable(&form);
+        let (x, field) = field_run(&rtl, &form);
+        assert_eq!(field.direction, LayoutDirection::RightToLeft);
+        assert_eq!(x + 24.0, field.run.origin.x + field.run.size.width, "right to left, ending at its right edge");
+    }
+
+    /// A Hebrew line reads right to left whatever the scene does: its
+    /// logical start is its right end, the caret after the last letter
+    /// stands at the LEFT, and a step back walks right.
+    #[test]
+    fn a_hebrew_line_puts_the_caret_at_its_logical_place() {
+        use crate::text_input::EditCommand;
+        // four letters, 8 px each in the house font: a run of 32
+        let form = Form { name: State::new("שלום".to_string()) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&form);
+        let (x, field) = field_run(&runtime, &form);
+        assert_eq!(x, field.run.origin.x, "anchored at the scene's left edge");
+        let y = field.frame.origin.y + field.frame.size.height / 2.0;
+        // a click at the LEFT end of the line is a click at its end
+        runtime.pointer_pressed(field.run.origin.x + 1.0, y);
+        runtime.pointer_released(field.run.origin.x + 1.0, y);
+        let caret = runtime.ime_snapshot().expect("focused").caret_rect.origin.x;
+        assert_eq!(caret, field.run.origin.x, "after the last letter: the left end");
+        // one step back toward the start walks RIGHT, one letter
+        runtime.key(EditCommand::Left(false));
+        let caret = runtime.ime_snapshot().expect("focused").caret_rect.origin.x;
+        assert_eq!(caret, field.run.origin.x + 8.0);
+        assert_eq!(runtime.ime_rect_for(3).expect("a rect").origin.x, field.run.origin.x + 8.0);
+    }
+
+    /// A click in a right-to-left line lands on the byte under the hand:
+    /// near the right end it is the start, and what is typed goes there.
+    #[test]
+    fn a_click_in_an_rtl_field_lands_on_the_byte_under_the_hand() {
+        use crate::text_input::EditCommand;
+        let form = Form { name: State::new("שלום".to_string()) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&form);
+        let (_, field) = field_run(&runtime, &form);
+        let y = field.frame.origin.y + field.frame.size.height / 2.0;
+        // a point just inside the right end: before the first letter
+        let start = field.run.origin.x + 31.0;
+        runtime.pointer_pressed(start, y);
+        runtime.pointer_released(start, y);
+        runtime.key(EditCommand::Insert("א".into()));
+        assert_eq!(form.name.get(), "אשלום");
+        // five letters now, a run of 40: a point between the second and
+        // the third letter from the right
+        let (_, field) = field_run(&runtime, &form);
+        let between = field.run.origin.x + 40.0 - 17.0;
+        runtime.pointer_pressed(between, y);
+        runtime.pointer_released(between, y);
+        runtime.key(EditCommand::Insert("ב".into()));
+        assert_eq!(form.name.get(), "אשבלום");
+        // six letters now: three stand to the right of the same point
+        assert_eq!(runtime.ime_index_at(between, y), Some(3), "the index under the hand, in UTF-16");
     }
 
     /// The shell's insets reach a BODY, and the keyboard's band stays its

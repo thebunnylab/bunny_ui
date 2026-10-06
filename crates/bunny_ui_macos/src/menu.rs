@@ -11,8 +11,10 @@
 //!   app's Settings, Services, Hide, Hide Others, Show All and Quit, in that
 //!   order. The app's [`Item::About`] and its [`Role::Settings`] and
 //!   [`Role::Quit`] commands are lifted out of wherever the app declared
-//!   them, titled in the mac's words, and filed here; the rest of the app
-//!   menu is the platform's and the app never declares it.
+//!   them, titled in the mac's words — in the person's language, through
+//!   [`bunny_ui::words`], the app's name where the language puts it — and
+//!   filed here; the rest of the app menu is the platform's and the app
+//!   never declares it.
 //! - **Quit never goes dark.** With no quit command declared, the item is
 //!   the system's `terminate:`; with one, the command runs while the window
 //!   answers it and `terminate:` runs when it does not.
@@ -51,6 +53,7 @@ use std::rc::Rc;
 
 use bunny_ui::action::{ActionId, Key, KeyPattern};
 use bunny_ui::menu::{Command, Edit, Item, Menu, MenuBar, MenuRole, Role, Shortcut};
+use bunny_ui::words::{Word, Words};
 
 // =============================================================================
 // What the mac will build
@@ -94,9 +97,11 @@ pub(crate) enum Line {
         key: Option<KeyEquivalent>,
     },
     /// A standard edit, sent by its selector to whoever is first responder —
-    /// the framework's view, or a hosted page that answers for itself.
+    /// the framework's view, or a hosted page that answers for itself. The
+    /// title is the framework's word for it, in the person's language.
     Edit {
         edit: Edit,
+        title: Rc<str>,
         key: Option<KeyEquivalent>,
     },
     /// An item AppKit answers itself, by selector, up the responder chain.
@@ -105,8 +110,10 @@ pub(crate) enum Line {
         selector: &'static str,
         key: Option<KeyEquivalent>,
     },
-    /// The Services submenu, which AppKit fills.
-    Services,
+    /// The Services submenu, which AppKit fills, under its title.
+    Services {
+        title: Rc<str>,
+    },
     /// A menu opening from this line.
     Submenu(NativeMenu),
     Separator,
@@ -192,7 +199,7 @@ struct Filed<'bar> {
 
 /// The app's bar, arranged as the mac draws it. `app` is the name the menu
 /// bar shows in bold (the bundle's), which the app menu's items repeat.
-pub(crate) fn arrange(bar: &MenuBar, app: &str) -> Vec<NativeMenu> {
+pub(crate) fn arrange(bar: &MenuBar, app: &str, words: &Words) -> Vec<NativeMenu> {
     let mut filed = Filed::default();
     let mut menus: Vec<NativeMenu> = bar
         .menus()
@@ -203,18 +210,18 @@ pub(crate) fn arrange(bar: &MenuBar, app: &str) -> Vec<NativeMenu> {
                 Some(MenuRole::Help) => MenuKind::Help,
                 None => MenuKind::Plain,
             },
-            lines: lower(menu, &mut filed),
+            lines: lower(menu, &mut filed, words),
         })
         .filter(|menu| !menu.lines.is_empty())
         .collect();
     let help = menus.iter().position(|menu| menu.kind == MenuKind::Help).unwrap_or(menus.len());
-    menus.insert(help, window_menu());
-    menus.insert(0, app_menu(app, &filed));
+    menus.insert(help, window_menu(words));
+    menus.insert(0, app_menu(app, &filed, words));
     menus
 }
 
 /// A menu's lines with the filed items lifted out and the rules tidied.
-fn lower<'bar>(menu: &'bar Menu, filed: &mut Filed<'bar>) -> Vec<Line> {
+fn lower<'bar>(menu: &'bar Menu, filed: &mut Filed<'bar>, words: &Words) -> Vec<Line> {
     let lines = menu.entries().iter().filter_map(|item| match item {
         Item::About if !filed.about => {
             filed.about = true;
@@ -239,10 +246,11 @@ fn lower<'bar>(menu: &'bar Menu, filed: &mut Filed<'bar>) -> Vec<Line> {
         Item::About => None,
         Item::Edit(edit) => Some(Line::Edit {
             edit: *edit,
+            title: Rc::from(&*words.get(edit.word())),
             key: KeyEquivalent::of(Some(&Shortcut::from(edit.stroke()))),
         }),
         Item::Submenu(menu) => {
-            let lines = lower(menu, filed);
+            let lines = lower(menu, filed, words);
             (!lines.is_empty()).then(|| {
                 Line::Submenu(NativeMenu {
                     title: menu.title().into(),
@@ -279,19 +287,23 @@ fn command_key(key: char, extra: u64) -> Option<KeyEquivalent> {
 }
 
 /// The app menu: what the app filed here, and the platform's own.
-fn app_menu(app: &str, filed: &Filed<'_>) -> NativeMenu {
+fn app_menu(app: &str, filed: &Filed<'_>, words: &Words) -> NativeMenu {
+    // the mac's words, in the person's language; the ones that name the
+    // app take the name where the language puts it
+    let word = |word: Word| -> Rc<str> { Rc::from(&*words.get(word)) };
+    let titled = |word: Word| -> Rc<str> { Rc::from(words.titled(word, app)) };
     let about = filed.about.then(|| Line::System {
-        title: format!("About {app}").into(),
+        title: titled(Word::About),
         selector: "orderFrontStandardAboutPanel:",
         key: None,
     });
     let settings = filed.settings.map(|command| Line::Command {
-        title: "Settings…".into(),
+        title: word(Word::Settings),
         action: command.action(),
         key: KeyEquivalent::of(command.keys()),
     });
     let quit = Line::Quit {
-        title: format!("Quit {app}").into(),
+        title: titled(Word::Quit),
         action: filed.quit.map(Command::action),
         key: match filed.quit {
             Some(command) => KeyEquivalent::of(command.keys()),
@@ -300,19 +312,15 @@ fn app_menu(app: &str, filed: &Filed<'_>) -> NativeMenu {
     };
     let lines = about.into_iter().chain([Line::Separator]).chain(settings).chain([
         Line::Separator,
-        Line::Services,
+        Line::Services { title: word(Word::Services) },
         Line::Separator,
+        Line::System { title: titled(Word::Hide), selector: "hide:", key: command_key('h', 0) },
         Line::System {
-            title: format!("Hide {app}").into(),
-            selector: "hide:",
-            key: command_key('h', 0),
-        },
-        Line::System {
-            title: "Hide Others".into(),
+            title: word(Word::HideOthers),
             selector: "hideOtherApplications:",
             key: command_key('h', OPTION),
         },
-        Line::System { title: "Show All".into(), selector: "unhideAllApplications:", key: None },
+        Line::System { title: word(Word::ShowAll), selector: "unhideAllApplications:", key: None },
         Line::Separator,
         quit,
     ]);
@@ -320,20 +328,21 @@ fn app_menu(app: &str, filed: &Filed<'_>) -> NativeMenu {
 }
 
 /// The Window menu: the platform's items; AppKit adds the window list.
-fn window_menu() -> NativeMenu {
+fn window_menu(words: &Words) -> NativeMenu {
+    let word = |word: Word| -> Rc<str> { Rc::from(&*words.get(word)) };
     NativeMenu {
-        title: "Window".into(),
+        title: word(Word::Window),
         kind: MenuKind::Window,
         lines: vec![
             Line::System {
-                title: "Minimize".into(),
+                title: word(Word::Minimize),
                 selector: "performMiniaturize:",
                 key: command_key('m', 0),
             },
-            Line::System { title: "Zoom".into(), selector: "performZoom:", key: None },
+            Line::System { title: word(Word::Zoom), selector: "performZoom:", key: None },
             Line::Separator,
             Line::System {
-                title: "Bring All to Front".into(),
+                title: word(Word::BringAllToFront),
                 selector: "arrangeInFront:",
                 key: None,
             },
@@ -419,9 +428,9 @@ mod tests {
             .map(|line| match line {
                 Line::Command { title, .. }
                 | Line::Quit { title, .. }
-                | Line::System { title, .. } => title.to_string(),
-                Line::Edit { edit, .. } => edit.title().to_owned(),
-                Line::Services => "Services".to_owned(),
+                | Line::System { title, .. }
+                | Line::Edit { title, .. }
+                | Line::Services { title } => title.to_string(),
                 Line::Submenu(menu) => format!("{} ▸", menu.title),
                 Line::Separator => "─".to_owned(),
             })
@@ -430,7 +439,7 @@ mod tests {
 
     #[test]
     fn the_app_menu_leads_and_holds_what_the_mac_files_there() {
-        let menus = arrange(&bar(), "Trinity");
+        let menus = arrange(&bar(), "Trinity", &Words::english());
         assert_eq!(titles(&menus), ["Trinity", "File", "Edit", "View", "Window", "Help"]);
         assert_eq!(menus[0].kind, MenuKind::App);
         assert_eq!(
@@ -463,7 +472,7 @@ mod tests {
 
     #[test]
     fn a_filed_item_leaves_no_gap_where_it_stood() {
-        let menus = arrange(&bar(), "Trinity");
+        let menus = arrange(&bar(), "Trinity", &Words::english());
         assert_eq!(line_titles(&menus[1]), ["Open…", "Save"], "no rule is left dangling in File");
         assert_eq!(
             line_titles(&menus[5]),
@@ -477,7 +486,7 @@ mod tests {
                 .item(Command::new("Exit", QUIT).role(Role::Quit)),
         );
         assert_eq!(
-            titles(&arrange(&only_filed, "Trinity")),
+            titles(&arrange(&only_filed, "Trinity", &Words::english())),
             ["Trinity", "Window"],
             "a menu left with nothing is not drawn",
         );
@@ -485,18 +494,18 @@ mod tests {
 
     #[test]
     fn the_window_menu_stands_before_help_or_last() {
-        let menus = arrange(&bar(), "Trinity");
+        let menus = arrange(&bar(), "Trinity", &Words::english());
         assert_eq!(menus[4].kind, MenuKind::Window);
         assert_eq!(menus[5].kind, MenuKind::Help);
         assert_eq!(line_titles(&menus[4]), ["Minimize", "Zoom", "─", "Bring All to Front"]);
         let helpless = MenuBar::new().menu(Menu::new("File").item(Command::new("Open…", OPEN)));
-        let menus = arrange(&helpless, "Trinity");
+        let menus = arrange(&helpless, "Trinity", &Words::english());
         assert_eq!(titles(&menus), ["Trinity", "File", "Window"]);
     }
 
     #[test]
     fn with_no_quit_declared_the_system_quits() {
-        let menus = arrange(&MenuBar::new(), "Trinity");
+        let menus = arrange(&MenuBar::new(), "Trinity", &Words::english());
         assert_eq!(
             line_titles(&menus[0]),
             ["Services", "─", "Hide Trinity", "Hide Others", "Show All", "─", "Quit Trinity"]
@@ -509,6 +518,54 @@ mod tests {
                 key: Some(KeyEquivalent { key: 'q', mask: COMMAND }),
             }),
         );
+    }
+
+    /// The bar speaks the words it is given: a Brazilian machine reads the
+    /// app menu, the edits and the Window menu in Portuguese, and the
+    /// app's own titles stay the app's.
+    #[test]
+    fn the_app_menu_speaks_the_words_it_is_given() {
+        let words = Words::for_locale(&bunny_ui::prelude::Locale::new("pt-BR"));
+        let menus = arrange(&bar(), "Bunny", &words);
+        assert_eq!(titles(&menus), ["Bunny", "File", "Edit", "View", "Janela", "Help"]);
+        assert_eq!(
+            line_titles(&menus[0]),
+            [
+                "Sobre o Bunny",
+                "─",
+                "Ajustes…",
+                "─",
+                "Serviços",
+                "─",
+                "Ocultar Bunny",
+                "Ocultar Outros",
+                "Mostrar Tudo",
+                "─",
+                "Encerrar Bunny",
+            ],
+        );
+        assert_eq!(
+            line_titles(&menus[2]),
+            ["Desfazer", "Refazer", "Recortar", "Copiar", "Colar", "Selecionar Tudo"]
+        );
+        assert_eq!(line_titles(&menus[4]), ["Minimizar", "Zoom", "─", "Trazer Tudo para a Frente"]);
+    }
+
+    /// A language that puts the app's name last keeps its order: the
+    /// template decides where the name goes, not a prefix.
+    #[test]
+    fn a_word_order_that_puts_the_app_last_is_kept() {
+        let german = Words::for_locale(&bunny_ui::prelude::Locale::new("de"));
+        let menus = arrange(&MenuBar::new(), "Bunny", &german);
+        assert_eq!(
+            line_titles(&menus[0]),
+            ["Dienste", "─", "Bunny ausblenden", "Andere ausblenden", "Alle einblenden", "─", "Bunny beenden"]
+        );
+        let japanese = Words::for_locale(&bunny_ui::prelude::Locale::new("ja"));
+        let menus = arrange(&MenuBar::new(), "Bunny", &japanese);
+        let lines = line_titles(&menus[0]);
+        assert_eq!(lines[2], "Bunnyを非表示");
+        assert_eq!(lines[6], "Bunnyを終了");
     }
 
     #[test]
@@ -534,7 +591,7 @@ mod tests {
             of(KeyPattern::command(Key::Up)),
             Some(KeyEquivalent { key: '\u{f700}', mask: COMMAND }),
         );
-        let menus = arrange(&bar(), "Trinity");
+        let menus = arrange(&bar(), "Trinity", &Words::english());
         let Line::Command { key, .. } = &menus[5].lines[0] else {
             panic!("the shortcuts item");
         };
@@ -543,12 +600,12 @@ mod tests {
 
     #[test]
     fn the_edit_items_carry_their_accelerators_and_selectors() {
-        let menus = arrange(&bar(), "Trinity");
+        let menus = arrange(&bar(), "Trinity", &Words::english());
         let keys: Vec<_> = menus[2]
             .lines
             .iter()
             .map(|line| match line {
-                Line::Edit { edit, key } => (edit_selector(*edit), key.clone()),
+                Line::Edit { edit, key, .. } => (edit_selector(*edit), key.clone()),
                 other => panic!("the Edit menu holds edits only, not {other:?}"),
             })
             .collect();
@@ -580,7 +637,7 @@ mod tests {
                     .separator(),
             ),
         );
-        let menus = arrange(&bar, "Trinity");
+        let menus = arrange(&bar, "Trinity", &Words::english());
         let Line::Submenu(recent) = &menus[1].lines[0] else {
             panic!("the submenu stands");
         };
@@ -588,7 +645,7 @@ mod tests {
         let empty = MenuBar::new()
             .menu(Menu::new("File").item(Menu::new("Recent")).item(Command::new("Open…", OPEN)));
         assert_eq!(
-            line_titles(&arrange(&empty, "Trinity")[1]),
+            line_titles(&arrange(&empty, "Trinity", &Words::english())[1]),
             ["Open…"],
             "an empty submenu is not drawn"
         );

@@ -148,6 +148,7 @@ the activity, which was running already, and returns.
 | activation | the center's delegate, while running or launched by the click | the toast's `Activated` event, while running | `ActionInvoked` on the session bus | the center's delegate, while running or launched by the tap | the activity RE-CREATED with the tap's intent, read at create — while running or as the launch |
 | second launch | the spool; a BUNDLED app reopens through the delegate instead | the spool | the spool | the system's own: one process by construction | the system's own: one activity by construction |
 | a url handed over | `application:openURLs:` → `Reopened` | an argument → the spool | an argument → the spool | the scene's `scene:openURLContexts:`, or the launch's `URLContexts` → `Reopened` | not yet — a `NativeActivity` hears no new intent |
+| languages | `NSLocale.preferredLanguages`, and `NSCurrentLocaleDidChangeNotification` while running | `GetUserPreferredUILanguages`, read again on `WM_SETTINGCHANGE` | `LANGUAGE`, else `LC_ALL`, `LC_MESSAGES`, `LANG` — once; the environment does not move | `NSLocale.preferredLanguages`; a change relaunches the app | the configuration's `LocaleList`, read again on every configuration change |
 
 Five honest edges. macOS shows notifications for a BUNDLE, never a
 bare binary — the system's own center raises for a process with no

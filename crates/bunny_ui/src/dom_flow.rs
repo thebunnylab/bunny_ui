@@ -27,6 +27,9 @@ use crate::text_engine::FontSpec;
 pub(crate) struct FlowEnv<'a> {
     /// Scroll offsets by region path (the browser reported them).
     pub scroll_offsets: &'a HashMap<String, Point>,
+    /// Which way the scene reads — the root's; a `Styled` that turns it
+    /// opens an island, and the walk carries the island's own.
+    pub direction: motor::state::LayoutDirection,
     /// The window box: the root's width and height.
     pub size: (Px, Px),
     /// The island door: a canvas island still measures and paints
@@ -90,6 +93,7 @@ pub(crate) struct FlowKey {
     font: FontSpec,
     line_height: Option<Px>,
     text_align: Option<motor::views::TextAlignment>,
+    direction: motor::state::LayoutDirection,
     interactive: Option<std::rc::Rc<str>>,
     transition: Option<(f64, f64)>,
     tooltip: Option<std::sync::Arc<str>>,
@@ -136,6 +140,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         declared: FontSpec::DEFAULT,
         line_height: None,
         text_align: None,
+        direction: env.direction,
         pending_interactive: None,
         pending_transition: None,
         pending_tooltip: None,
@@ -266,6 +271,8 @@ struct Walk<'a> {
     line_height: Option<crate::layout::Px>,
     /// The inherited line alignment, mirroring `line_height`.
     text_align: Option<motor::views::TextAlignment>,
+    /// Which way the walk reads here — the root's, or an island's.
+    direction: motor::state::LayoutDirection,
     pending_interactive: Option<std::rc::Rc<str>>,
     pending_transition: Option<(f64, f64)>,
     /// A tooltip armed by a wrapper, landing on the next box that
@@ -432,6 +439,7 @@ impl Walk<'_> {
             font: self.font,
             line_height: self.line_height,
             text_align: self.text_align,
+            direction: self.direction,
             interactive: self.pending_interactive.clone(),
             transition: self.pending_transition,
             tooltip: self.pending_tooltip.clone(),
@@ -469,6 +477,7 @@ impl Walk<'_> {
             font,
             line_height,
             text_align,
+            direction,
             interactive,
             transition,
             tooltip,
@@ -480,6 +489,7 @@ impl Walk<'_> {
         *font == self.font
             && *slot == self.slot
             && *unbounded == self.unbounded
+            && *direction == self.direction
             && *line_height == self.line_height
             && *text_align == self.text_align
             && *group == self.groups.last().copied()
@@ -663,14 +673,14 @@ impl Walk<'_> {
                     )
                     && let Some(layout) = only.layout.as_mut()
                 {
-                    let (was_top, was_right, was_bottom, was_left) =
+                    let (was_top, was_trailing, was_bottom, was_leading) =
                         layout.padding.unwrap_or((0.0, 0.0, 0.0, 0.0));
                     let sum = |was: f32, more: Px| (f64::from(was) + more) as f32;
                     layout.padding = Some((
                         sum(was_top, top),
-                        sum(was_right, trailing),
+                        sum(was_trailing, trailing),
                         sum(was_bottom, bottom),
-                        sum(was_left, leading),
+                        sum(was_leading, leading),
                     ));
                     out.append(&mut lowered);
                     return;
@@ -776,9 +786,15 @@ impl Walk<'_> {
                 let outer_font = self.font;
                 let outer_line_height = self.line_height;
                 let outer_text_align = self.text_align;
+                let outer_direction = self.direction;
                 self.font = props.font.apply_over(self.font);
                 self.line_height = props.line_height.or(self.line_height);
                 self.text_align = props.text_align.or(self.text_align);
+                self.direction = props.direction.unwrap_or(self.direction);
+                // a style that turns the direction opens an ISLAND: its box
+                // says so, and the browser reads everything under it the
+                // island's way
+                let turned = props.direction.filter(|direction| *direction != outer_direction);
 
                 let states = props.foreground_hovered.is_some()
                     || props.foreground_pressed.is_some();
@@ -795,6 +811,7 @@ impl Walk<'_> {
                     && child.is_bare()
                     && !states
                     && !inheriting
+                    && turned.is_none()
                     && self.overlay_depth == 0
                     && self.pending_transition.is_none()
                     && !DomLook::paints(props)
@@ -805,9 +822,13 @@ impl Walk<'_> {
                     self.font = outer_font;
                     self.line_height = outer_line_height;
                     self.text_align = outer_text_align;
+                    self.direction = outer_direction;
                     return;
                 }
                 let boxed = placed(out, node(DomKind::Box));
+                if let (Some(direction), Some(layout)) = (turned, boxed.layout.as_mut()) {
+                    layout.direction = Some(direction);
+                }
                 let interactive = self.pending_interactive.take();
                 let mut look = DomLook {
                     // a layer that asks for nothing lets the click
@@ -817,6 +838,11 @@ impl Walk<'_> {
                     transition: self.pending_transition.take(),
                     ..DomLook::from_props(props)
                 };
+                // a wash is anchored from the leading side: it flips with
+                // the scene, as the engine's does
+                if self.direction.is_rtl() {
+                    look.gradient = look.gradient.map(crate::layout::Gradient::flipped);
+                }
                 let marks = DomMarks { tooltip: self.pending_tooltip.take(), group_owner: None };
                 // the tint is the half of the material an ELEMENT owns:
                 // it sits under whatever the box paints itself, because
@@ -861,6 +887,7 @@ impl Walk<'_> {
                 self.font = outer_font;
                 self.line_height = outer_line_height;
                 self.text_align = outer_text_align;
+                self.direction = outer_direction;
                 Self::stamp_fill(child, &mut boxed.children);
                 Self::inherit_stretch(boxed);
             }
@@ -1328,7 +1355,10 @@ impl Walk<'_> {
                 let anchor = placed(out, node(DomKind::Group { path: std::rc::Rc::from(anchor_path.as_str()) }));
                 self.lower_into(child, &mut anchor.children);
 
-                let side = match side {
+                // the side as the window sees it — the glue positions
+                // physically and knows nothing of the direction; here the
+                // anchor's is known
+                let side = match side.physical(self.direction.is_rtl()) {
                     crate::layout::Side::Top => 0u8,
                     crate::layout::Side::Bottom => 1,
                     crate::layout::Side::Leading => 2,
@@ -1773,8 +1803,16 @@ mod tests {
     use std::sync::Arc;
 
     fn env_fixture(offsets: &HashMap<String, Point>) -> FlowEnv<'_> {
+        env_fixture_in(offsets, motor::state::LayoutDirection::LeftToRight)
+    }
+
+    fn env_fixture_in(
+        offsets: &HashMap<String, Point>,
+        direction: motor::state::LayoutDirection,
+    ) -> FlowEnv<'_> {
         FlowEnv {
             scroll_offsets: offsets,
+            direction,
             size: (400.0, 300.0),
             layout: None,
             changed: &[],
@@ -1920,6 +1958,7 @@ mod tests {
             declared: FontSpec::DEFAULT,
             line_height: None,
             text_align: None,
+            direction: env.direction,
             pending_interactive: None,
             pending_transition: None,
             pending_tooltip: None,
@@ -1942,7 +1981,8 @@ mod tests {
             promised_fill: None,
         };
         assert!(walk.lowers_in(&walk.flow_key()), "a walk holds its own key");
-        let moves: [(&str, fn(&mut Walk)); 11] = [
+        let moves: [(&str, fn(&mut Walk)); 12] = [
+            ("the direction", |walk| walk.direction = motor::state::LayoutDirection::RightToLeft),
             ("the ink", |walk| walk.ink.push(Color { r: 1, g: 2, b: 3, a: 255 })),
             ("an ink scope", |walk| walk.ink_scopes.push(0)),
             ("the face", |walk| walk.font.size += 3.0),
@@ -1963,6 +2003,95 @@ mod tests {
             assert!(!walk.lowers_in(&before), "{what} moved, and the old key no longer holds");
             assert!(walk.lowers_in(&after), "the walk holds its key after {what}");
         }
+    }
+
+    fn boxes_with_direction(node: &crate::dom::DomNode, out: &mut Vec<Option<motor::state::LayoutDirection>>) {
+        if matches!(node.kind, DomKind::Box) {
+            out.push(node.layout.as_ref().and_then(|layout| layout.direction));
+        }
+        for child in &node.children {
+            boxes_with_direction(child, out);
+        }
+    }
+
+    /// A style that turns the direction opens an island: its box says
+    /// so, even over a bare text that would otherwise take no box, and a
+    /// style that only repeats the direction around it says nothing.
+    #[test]
+    fn an_ltr_island_in_an_rtl_walk_carries_its_direction() {
+        use motor::state::LayoutDirection;
+        let island = |direction| LayoutNode::Styled {
+            props: crate::layout::VisualProps { direction: Some(direction), ..Default::default() }.shared(),
+            child: Box::new(text_node("code")),
+            hints: Default::default(),
+            action: None,
+        };
+        let offsets = HashMap::default();
+        let env = env_fixture_in(&offsets, LayoutDirection::RightToLeft);
+        let output = lower(&island(LayoutDirection::LeftToRight), &env);
+        let mut boxes = Vec::new();
+        boxes_with_direction(&output.scene, &mut boxes);
+        assert_eq!(boxes, [Some(LayoutDirection::LeftToRight)], "the island's box names its direction");
+        let output = lower(&island(LayoutDirection::RightToLeft), &env);
+        let mut boxes = Vec::new();
+        boxes_with_direction(&output.scene, &mut boxes);
+        assert!(boxes.is_empty(), "the same direction opens no island: {boxes:?}");
+    }
+
+    /// A popover's side crosses the wire as the window sees it: a
+    /// leading side is the right one under a right-to-left walk.
+    #[test]
+    fn a_leading_popover_opens_on_the_right_under_rtl() {
+        use motor::state::LayoutDirection;
+        fn popover_side(node: &crate::dom::DomNode) -> Option<u8> {
+            if let DomKind::Popover { side, .. } = &node.kind {
+                return Some(*side);
+            }
+            node.children.iter().find_map(popover_side)
+        }
+        let anchored = LayoutNode::Anchored {
+            path: "App/#0/popover".into(),
+            side: crate::layout::Side::Leading,
+            overlay: std::rc::Rc::new(text_node("card")),
+            child: Box::new(text_node("anchor")),
+        };
+        let offsets = HashMap::default();
+        let ltr = lower(&anchored, &env_fixture(&offsets));
+        assert_eq!(popover_side(&ltr.scene), Some(2), "left of the anchor");
+        let rtl = lower(&anchored, &env_fixture_in(&offsets, LayoutDirection::RightToLeft));
+        assert_eq!(popover_side(&rtl.scene), Some(3), "right of the anchor");
+    }
+
+    /// A wash named from the leading corner flips with the walk.
+    #[test]
+    fn a_gradient_mirrors_under_rtl() {
+        use motor::state::LayoutDirection;
+        let washed = LayoutNode::Styled {
+            props: crate::layout::VisualProps {
+                gradient: Some(crate::layout::Gradient::Linear {
+                    start: crate::layout::UnitPoint::LEADING,
+                    end: crate::layout::UnitPoint::TRAILING,
+                    from: Color::BLACK,
+                    to: Color::WHITE,
+                }),
+                ..Default::default()
+            }
+            .shared(),
+            child: Box::new(text_node("hero")),
+            hints: Default::default(),
+            action: None,
+        };
+        let offsets = HashMap::default();
+        let start_x = |env: &FlowEnv| {
+            let output = lower(&washed, env);
+            let boxed = &output.scene.children[0];
+            match boxed.style.look().gradient {
+                Some(crate::layout::Gradient::Linear { start, .. }) => start.x,
+                other => panic!("a ramp stays a ramp: {other:?}"),
+            }
+        };
+        assert_eq!(start_x(&env_fixture(&offsets)), 0.0);
+        assert_eq!(start_x(&env_fixture_in(&offsets, LayoutDirection::RightToLeft)), 1.0);
     }
 
     /// A table the column must feed — one that stretches across it —

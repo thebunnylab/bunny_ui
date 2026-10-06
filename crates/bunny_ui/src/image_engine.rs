@@ -84,6 +84,13 @@ pub enum ImageSource {
     /// and the damage diff need to learn nothing: a faded image is
     /// simply another image.
     Faded { key: u64, inner: Rc<ImageSource>, alpha: u8 },
+    /// Any source, seen in a MIRROR — what a view that
+    /// `.flips_for_right_to_left_layout_direction(true)` leaves for the
+    /// pixel pipelines in a right-to-left scene: a chevron that points
+    /// the way, never a photograph. The flip rides the identity like a
+    /// veil does, so a mirrored image is simply another image to every
+    /// pipeline; the raster is the inner's with each row read backwards.
+    Mirrored { key: u64, inner: Rc<ImageSource> },
 }
 
 /// Domain tags folded into the key so the two variants never share an
@@ -92,6 +99,7 @@ const BYTES_TAG: u64 = 0x62_6e_79_5f_62_79_74_65; // "bny_byte"
 const ICON_TAG: u64 = 0x62_6e_79_5f_69_63_6f_6e; // "bny_icon"
 const PATH_TAG: u64 = 0x62_6e_79_5f_70_61_74_68; // "bny_path"
 const FADE_TAG: u64 = 0x62_6e_79_5f_66_61_64_65; // "bny_fade"
+const MIRROR_TAG: u64 = 0x62_6e_79_5f_6d_69_72_72; // "bny_mirr"
 const RGBA_TAG: u64 = 0x62_6e_79_5f_72_67_62_61; // "bny_rgba"
 const FEED_TAG: u64 = 0x626e_795f_6665_6564; // "bny_feed"
 
@@ -341,6 +349,28 @@ impl ImageSource {
         ImageSource::Faded { key: hasher.finish(), inner, alpha }
     }
 
+    /// The source seen in a mirror — what a right-to-left scene does to
+    /// a picture that asked to flip. An involution: the mirror of a
+    /// mirror is the picture again, so a stack of flips is never more
+    /// than one. A native frame lives in the presenter's own ring and
+    /// cannot be turned on the CPU: it stays as it is.
+    pub fn mirrored(&self) -> ImageSource {
+        let inner = match self {
+            ImageSource::Mirrored { inner, .. } => return (**inner).clone(),
+            ImageSource::Native { .. } => return self.clone(),
+            other => Rc::new(other.clone()),
+        };
+        let mut hasher = motor::hash::FxHasher::default();
+        hasher.write_u64(MIRROR_TAG);
+        hasher.write_u64(inner.key());
+        // a feed's key is its SLOT: frame 40 in the mirror must not be
+        // frame 41, or the cache would show a stale picture
+        if let ImageSource::Feed { generation, .. } = &*inner {
+            hasher.write_u64(*generation);
+        }
+        ImageSource::Mirrored { key: hasher.finish(), inner }
+    }
+
     /// The cheap identity — what diffs, caches and the wire carry.
     pub fn key(&self) -> u64 {
         match self {
@@ -351,7 +381,8 @@ impl ImageSource {
             | ImageSource::Native { key, .. }
             | ImageSource::Rgba { key, .. }
             | ImageSource::Feed { key, .. }
-            | ImageSource::Faded { key, .. } => *key,
+            | ImageSource::Faded { key, .. }
+            | ImageSource::Mirrored { key, .. } => *key,
         }
     }
 }
@@ -408,6 +439,10 @@ impl PartialEq for ImageSource {
             | (
                 ImageSource::Faded { key, .. },
                 ImageSource::Faded { key: other_key, .. },
+            )
+            | (
+                ImageSource::Mirrored { key, .. },
+                ImageSource::Mirrored { key: other_key, .. },
             ) => key == other_key,
             _ => false,
         }
@@ -448,6 +483,7 @@ impl fmt::Debug for ImageSource {
             ImageSource::Faded { inner, alpha, .. } => {
                 write!(f, "faded({inner:?}, {alpha})")
             }
+            ImageSource::Mirrored { inner, .. } => write!(f, "mirrored({inner:?})"),
         }
     }
 }
@@ -558,6 +594,7 @@ pub fn raster_source(
         ImageSource::Faded { key, inner, alpha } => {
             fade_raster(*key, engine, inner, *alpha, width, height)
         }
+        ImageSource::Mirrored { key, inner } => mirror_raster(*key, engine, inner, width, height),
         _ => engine.raster(source, width, height),
     }
 }
@@ -581,8 +618,10 @@ pub fn intrinsic_of(engine: &dyn ImageEngine, source: &ImageSource) -> Option<(u
         ImageSource::Rgba { size, .. }
         | ImageSource::Native { size, .. }
         | ImageSource::Feed { size, .. } => Some(*size),
-        // a veil never changes a size
-        ImageSource::Faded { inner, .. } => intrinsic_of(engine, inner),
+        // a veil never changes a size, and neither does a mirror
+        ImageSource::Faded { inner, .. } | ImageSource::Mirrored { inner, .. } => {
+            intrinsic_of(engine, inner)
+        }
         _ => engine.intrinsic(source),
     }
 }
@@ -625,6 +664,50 @@ fn fade_raster(
         cache.insert((key, width, height), Rc::clone(&faded));
     });
     Some(faded)
+}
+
+thread_local! {
+    static MIRRORED: RefCell<HashMap<(u64, usize, usize), Rc<ImageRaster>>> =
+        RefCell::new(HashMap::default());
+}
+
+/// The source's own pixels with every row read backwards — the flip a
+/// right-to-left scene gives a picture that asked for it. Kept like the
+/// faded copies: the pictures that flip are glyphs, and few.
+fn mirror_raster(
+    key: u64,
+    engine: &dyn ImageEngine,
+    inner: &ImageSource,
+    width: usize,
+    height: usize,
+) -> Option<Rc<ImageRaster>> {
+    if let Some(hit) = MIRRORED.with(|cache| cache.borrow().get(&(key, width, height)).cloned()) {
+        return Some(hit);
+    }
+    let source = raster_source(engine, inner, width, height)?;
+    let mut rgba = source.rgba.clone();
+    let row = source.width * 4;
+    if row > 0 {
+        for line in rgba.chunks_exact_mut(row) {
+            // reverse the pixels of the row, each four bytes whole
+            let pixels = source.width;
+            for x in 0..pixels / 2 {
+                let (a, b) = (x * 4, (pixels - 1 - x) * 4);
+                for channel in 0..4 {
+                    line.swap(a + channel, b + channel);
+                }
+            }
+        }
+    }
+    let mirrored = Rc::new(ImageRaster { width: source.width, height: source.height, rgba });
+    MIRRORED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= FADE_KEEP {
+            cache.clear();
+        }
+        cache.insert((key, width, height), Rc::clone(&mirrored));
+    });
+    Some(mirrored)
 }
 
 // MARK: - Feeds: a picture whose bytes change and whose identity stays
@@ -981,7 +1064,8 @@ impl ImageEngine for RawImages {
             | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
             | ImageSource::Feed { .. }
-            | ImageSource::Faded { .. } => {
+            | ImageSource::Faded { .. }
+            | ImageSource::Mirrored { .. } => {
                 // the door intercepts what the house draws before any
                 // engine — a regression at a call site should be LOUD
                 debug_assert!(false, "a house drawing never reaches an engine");
@@ -1014,7 +1098,8 @@ impl ImageEngine for RawImages {
             | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
             | ImageSource::Feed { .. }
-            | ImageSource::Faded { .. } => {
+            | ImageSource::Faded { .. }
+            | ImageSource::Mirrored { .. } => {
                 debug_assert!(false, "a house drawing never reaches an engine");
                 return None;
             }
@@ -1225,6 +1310,31 @@ mod tests {
         assert_ne!(first.key(), second.key(), "the veil's identity moves with the frame");
         let shown = raster_source(&engine, &second, 1, 1).expect("pixels");
         assert_eq!(&shown.rgba[..], &[0, 0, 0, 128], "the veil shows the NEW frame");
+    }
+
+    /// A mirror is an identity of its own, a mirror of a mirror is the
+    /// picture again, and the mirrored raster reads each row backwards.
+    #[test]
+    fn a_mirror_of_a_mirror_is_the_picture_and_its_raster_reads_backwards() {
+        let red = [255u8, 0, 0, 255];
+        let blue = [0u8, 0, 255, 255];
+        let mut pixels = Vec::new();
+        pixels.extend_from_slice(&red);
+        pixels.extend_from_slice(&blue);
+        let source = ImageSource::rgba(7, (2, 1), pixels);
+        let mirrored = source.mirrored();
+        assert!(matches!(mirrored, ImageSource::Mirrored { .. }));
+        assert_ne!(mirrored.key(), source.key(), "another image to every cache");
+        assert_eq!(mirrored.mirrored(), source, "the mirror of a mirror is the picture");
+        assert_eq!(source.mirrored(), mirrored, "and the same picture mirrors to the same key");
+        let engine = RawImages::default();
+        assert_eq!(intrinsic_of(&engine, &mirrored), Some((2, 1)), "a mirror changes no size");
+        let raster = raster_source(&engine, &mirrored, 2, 1).expect("pixels");
+        assert_eq!(&raster.rgba[..4], &blue, "the row reads backwards");
+        assert_eq!(&raster.rgba[4..], &red);
+        let faded = source.faded(0.5).mirrored();
+        assert!(matches!(faded, ImageSource::Mirrored { .. }), "a veil can be mirrored");
+        assert_eq!(format!("{faded:?}"), format!("mirrored({:?})", source.faded(0.5)));
     }
 
     #[test]

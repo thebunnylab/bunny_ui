@@ -92,6 +92,10 @@ unsafe extern "C" {
     fn msg_void_id_id(obj: Id, sel: Sel, a: Id, b: Id);
     #[link_name = "objc_msgSend"]
     fn msg_bool_sel(obj: Id, sel: Sel, a: Sel) -> i8;
+    #[link_name = "objc_msgSend"]
+    fn msg_u64(obj: Id, sel: Sel) -> u64;
+    #[link_name = "objc_msgSend"]
+    fn msg_id_u64(obj: Id, sel: Sel, a: u64) -> Id;
 }
 
 #[link(name = "Foundation", kind = "framework")]
@@ -199,6 +203,35 @@ pub unsafe fn error_message(error: Id) -> String {
             return "unknown error".to_string();
         }
         std::ffi::CStr::from_ptr(chars).to_string_lossy().into_owned()
+    }
+}
+
+/// The languages the person prefers, best first, as the system keeps
+/// them: `+[NSLocale preferredLanguages]`, BCP-47 tags with the region
+/// the person chose for each language already in them. A language the
+/// person picked for THIS app in the system's settings leads the list
+/// when the bundle declares what it speaks; a bare binary reads the
+/// system's own. Both shells report it at mount; the mac again when the
+/// system says it moved.
+pub fn preferred_locale() -> bunny_ui::prelude::Locale {
+    use bunny_ui::prelude::Locale;
+    unsafe {
+        let pool = objc_autoreleasePoolPush();
+        let languages = msg_id(class("NSLocale"), sel("preferredLanguages"));
+        let mut list = String::new();
+        if !languages.is_null() {
+            for index in 0..msg_u64(languages, sel("count")) {
+                let tag = text_argument_to_string(msg_id_u64(languages, sel("objectAtIndex:"), index));
+                if !tag.is_empty() {
+                    if !list.is_empty() {
+                        list.push(',');
+                    }
+                    list.push_str(&tag);
+                }
+            }
+        }
+        objc_autoreleasePoolPop(pool);
+        Locale::parse(&list)
     }
 }
 

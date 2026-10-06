@@ -1,8 +1,10 @@
 //! The app's life outside its window, on this platform: the application
-//! delegate (a reopen, a url handed over) and the workspace's sleep and
-//! wake — each one answering a door of `bunny_ui::app`. The desktop's
-//! notifications are the shared half's, `bunny_ui_apple::notifications`,
-//! and the same delegate object answers their center.
+//! delegate (a reopen, a url handed over), the workspace's sleep and
+//! wake — each one answering a door of `bunny_ui::app` — and the
+//! system's word that its languages moved, which is the shell's own
+//! event. The desktop's notifications are the shared half's,
+//! `bunny_ui_apple::notifications`, and the same delegate object
+//! answers their center.
 //!
 //! A bundled app is ONE process by the system's own rule — a second
 //! launch and a url both reach the running one through the delegate,
@@ -66,6 +68,19 @@ pub(crate) fn install() {
                 null_mut(),
             );
         }
+        // the system's languages: the DEFAULT center posts the change
+        // (the workspace's does not), and the windows hear it as an
+        // event of the shell's own, not one of `bunny_ui::app`'s — no
+        // app has a say in it, every window re-reads the list
+        let defaults = msg_id(class("NSNotificationCenter"), sel("defaultCenter"));
+        msg_void_id_sel_id_id(
+            defaults,
+            sel("addObserver:selector:name:object:"),
+            delegate,
+            sel("bunnyLocaleChanged:"),
+            ns("NSCurrentLocaleDidChangeNotification"),
+            null_mut(),
+        );
         // a bundled app's notification center learns its delegate
         // now: a click on a notification can be the very thing that
         // launched the process, and the response arrives early
@@ -109,6 +124,13 @@ extern "C" fn bridge_did_wake(_this: Id, _sel: Sel, _notification: Id) {
     emit(AppEvent::DidWake);
 }
 
+/// `NSCurrentLocaleDidChangeNotification` — the person changed the
+/// system's languages or region: a beat every window shares, and the
+/// app's menu bar is worded again after them.
+extern "C" fn bridge_locale_changed(_this: Id, _sel: Sel, _notification: Id) {
+    crate::ffi::dispatch_all(crate::ffi::AppEvent::Locale);
+}
+
 /// The one delegate instance, built on first use.
 fn delegate() -> Id {
     DELEGATE.with(|slot| {
@@ -119,7 +141,7 @@ fn delegate() -> Id {
         let instance = unsafe {
             let name = CString::new("BunnyAppDelegate").expect("class name");
             let bridge = objc_allocateClassPair(class("NSObject"), name.as_ptr(), 0);
-            let methods: [(&str, *const c_void, &str); 4] = [
+            let methods: [(&str, *const c_void, &str); 5] = [
                 (
                     "applicationShouldHandleReopen:hasVisibleWindows:",
                     bridge_reopen as *const c_void,
@@ -128,6 +150,7 @@ fn delegate() -> Id {
                 ("application:openURLs:", bridge_open_urls as *const c_void, "v@:@@"),
                 ("bunnyWillSleep:", bridge_will_sleep as *const c_void, "v@:@"),
                 ("bunnyDidWake:", bridge_did_wake as *const c_void, "v@:@"),
+                ("bunnyLocaleChanged:", bridge_locale_changed as *const c_void, "v@:@"),
             ];
             for (selector, imp, types) in methods {
                 let types = CString::new(types).expect("type encoding");

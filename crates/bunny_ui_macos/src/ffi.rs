@@ -288,6 +288,10 @@ pub enum AppEvent {
     /// The system says memory is short (a warning or worse): the caches
     /// go — decoded images, the fallen entries waiting for the idle.
     MemoryPressure,
+    /// The system's languages or region moved
+    /// (`NSCurrentLocaleDidChangeNotification`): every window reads the
+    /// preferred list again, and one whose locale moved draws a frame.
+    Locale,
     /// The reader chose a menu item this window answers — a command from
     /// the menu bar, or a standard edit sent to this window's view.
     Menu(Pick),
@@ -4152,13 +4156,13 @@ unsafe fn build_menu(menu: &crate::menu::NativeMenu) -> Id {
                 Line::Quit { title, action, key } => {
                     targeted(new_item(title, Some("bunnyMenuPick:"), key.as_ref()), MenuEntry::Quit(*action))
                 }
-                Line::Edit { edit, key } => {
-                    new_item(edit.title(), Some(crate::menu::edit_selector(*edit)), key.as_ref())
+                Line::Edit { edit, title, key } => {
+                    new_item(title, Some(crate::menu::edit_selector(*edit)), key.as_ref())
                 }
                 Line::System { title, selector, key } => new_item(title, Some(selector), key.as_ref()),
-                Line::Services => {
-                    let item = new_item("Services", None, None);
-                    let services = new_menu("Services");
+                Line::Services { title } => {
+                    let item = new_item(title, None, None);
+                    let services = new_menu(title);
                     msg_void_id(item, sel("setSubmenu:"), services);
                     let app = msg_id(class("NSApplication"), sel("sharedApplication"));
                     msg_void_id(app, sel("setServicesMenu:"), services);

@@ -144,6 +144,7 @@ answers nothing, and the app asks again.
 | the window | comes and goes with the background and a rotation; the surface renews on the same device, the atlas stays |
 | scale | the density over 160, rounded to a whole number: a 420 dpi phone is 3×, 360 points wide |
 | dark, size class | the configuration (`uiMode`, the width in dp), mirrored into the theme (while the app has not chosen one) and `SizeClass`; a change is an event, not a new activity |
+| languages | the configuration's `LocaleList`, at mount and on every configuration change — the sample manifest keeps the activity through `locale` and `layoutDirection`; the app may pin one with `App::set_locale` (`docs/i18n.md`) |
 | text, images | `android.graphics` and `AImageDecoder`; a face the app ships goes through `register_font`, which reads the family out of the file |
 | the clipboard, reduce motion | the system's, through JNI |
 | the modality | every gesture sets it: `Runtime::last_input_was_touch`, and `touch` on a custom box's event and paint |
