@@ -25,6 +25,12 @@ character ten times a second and nothing else, so every stroke is a text the eng
 seen; `stream` appends every 33 ms. Steps are raised through the shell's own door (`bunny_ui_macos::drive`), the same one the
 window system's callbacks use — no synthesized system events, no accessibility permission.
 
+The table, editor and chat name **Menlo** explicitly (12 pt in the table's cells, 13 pt in the
+editor and chat). The font is part of the macOS fixture and must be installed; a platform's
+default face changes glyph widths, wrapping and raster work. Record the installed font's digest
+alongside the executable's digest. The historical tables below predate this fixed-face fixture
+and must not be mixed with its measurements.
+
 Every app prints `FIRST_FRAME <unix ms>` once, when its root has run its first pass; the launch
 cost is that line against the spawn time. A scripted run also prints `SCRIPT_START <unix ms>` when
 its first step is about to be sent, and the stretch a scene is measured over is anchored there —
@@ -104,4 +110,3 @@ compositing it, in milliseconds per second.
 
 Absolute CPU percentages move between sessions on this machine (a busy machine schedules the same
 work differently), which is why only the interleaved pairs above are compared.
-
