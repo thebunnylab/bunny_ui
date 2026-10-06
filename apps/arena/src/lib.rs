@@ -103,8 +103,9 @@ pub enum Step {
 /// The scripts, as the worker plays them. `rest` is `secs` of nothing;
 /// `wheel` is 240 steps a second over `(x, y)`, down for half of `secs`
 /// and back up; `type` alternates a character and a backspace ten times a
-/// second; `stream` appends every 33 ms; `loop` is `rest` with a loop on
-/// screen; `soak` is `rest` for a long while.
+/// second; `append` types a character ten times a second, so the text is
+/// new on every stroke; `stream` appends every 33 ms; `loop` is `rest`
+/// with a loop on screen; `soak` is `rest` for a long while.
 pub fn play(args: &Args, over: (f64, f64), send: impl Fn(Step) -> bool) {
     let secs = args.secs.max(0.1);
     match args.script.as_str() {
@@ -121,11 +122,12 @@ pub fn play(args: &Args, over: (f64, f64), send: impl Fn(Step) -> bool) {
             }
             std::thread::sleep(Duration::from_secs(1));
         }
-        "type" => {
+        "type" | "append" => {
             std::thread::sleep(Duration::from_secs(1));
             let strokes = (secs * 10.0) as u64;
+            let append = args.script == "append";
             for stroke in 0..strokes {
-                let step = if stroke % 2 == 0 { Step::Type('x') } else { Step::Backspace };
+                let step = if append || stroke % 2 == 0 { Step::Type('x') } else { Step::Backspace };
                 if !send(step) {
                     return;
                 }
