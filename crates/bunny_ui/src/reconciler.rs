@@ -59,8 +59,8 @@ type EditFn = Rc<dyn Fn(EditCommand, &mut CaretState) -> Option<String>>;
 pub(crate) type FieldKeyFn = Rc<dyn Fn(&crate::action::Stroke, &mut CaretState) -> bool>;
 /// A field's text as one shared allocation: what its last render or read
 /// lent, carried from render to render so a text that did not change is
-/// compared, never copied.
-pub(crate) type LentText = Rc<RefCell<Option<std::sync::Arc<str>>>>;
+/// never copied — nor even compared, while its version stands.
+pub(crate) type LentText = Rc<RefCell<Option<crate::text_input::Lent>>>;
 /// Reads a field's text without copying it — `None` when the field
 /// cannot lend (an app's editing strategy answers the read itself).
 pub(crate) type ReadFn = Rc<dyn Fn(&mut CaretState) -> Option<std::sync::Arc<str>>>;
