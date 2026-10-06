@@ -8465,6 +8465,24 @@ mod tests {
         );
     }
 
+    /// Every glue reports the reader's languages — before the start, so
+    /// the first frame is theirs, and again when the browser says they
+    /// changed — through the one export, feature-detected like motion.
+    #[test]
+    fn the_glues_report_the_languages() {
+        for (name, glue) in [
+            ("glue_dom.js", include_str!("../../bunny_ui_web/glue/glue_dom.js")),
+            ("glue.js", include_str!("../../bunny_ui_web/glue/glue.js")),
+            ("esm/bunny.js", include_str!("../../bunny_ui_web/glue/esm/bunny.js")),
+        ] {
+            assert!(glue.contains("if (wasm.bunny_set_languages)"), "{name} reports the languages");
+            assert!(glue.contains("\"languagechange\""), "{name} hears them change");
+            let send = glue.find("sendLanguages(").expect(name);
+            let start = glue.find("START_EXPORT](").or_else(|| glue.find("start(rect.width")).expect(name);
+            assert!(send < start, "{name} sends the languages before the start");
+        }
+    }
+
     /// A string crosses as its count of bytes and then its UTF-8, and
     /// the glue reads a short one of ASCII a byte at a time, each byte
     /// being its char. That reading agrees with the decoder's only while
