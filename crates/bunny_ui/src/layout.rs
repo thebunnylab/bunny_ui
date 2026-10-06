@@ -6668,14 +6668,16 @@ impl LayoutNode {
                             out.push_clip(frame, 0.0);
                             out.draw(DrawCommand::Image {
                                 rect,
-                                source: source.clone(),
+                                source: if env.mirrors() { source.mirrored() } else { source.clone() },
                             });
                             out.pop_clip();
                         }
                     } else if frame.size.width > 0.0 && frame.size.height > 0.0 {
+                        // a picture keeps its face unless its view asked
+                        // to flip with the scene
                         out.draw(DrawCommand::Image {
                             rect: frame,
-                            source: source.clone(),
+                            source: if env.mirrors() { source.mirrored() } else { source.clone() },
                         });
                     }
                 }
@@ -6712,13 +6714,16 @@ impl LayoutNode {
                         },
                         size: Size { width: side, height: side },
                     };
+                    let glyph = if *forced {
+                        ImageSource::symbol_forced(*symbol, color)
+                    } else {
+                        ImageSource::symbol(*symbol, color)
+                    };
+                    // a glyph that points the way flips with the scene
+                    // when its view said so; its identity carries the flip
                     out.draw(DrawCommand::Image {
                         rect,
-                        source: if *forced {
-                            ImageSource::symbol_forced(*symbol, color)
-                        } else {
-                            ImageSource::symbol(*symbol, color)
-                        },
+                        source: if env.mirrors() { glyph.mirrored() } else { glyph },
                     });
                 }
             }
