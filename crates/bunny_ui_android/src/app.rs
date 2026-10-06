@@ -7,11 +7,23 @@ use std::rc::Rc;
 
 use bunny_ui::action::{Key, KeyMatch, Stroke};
 use bunny_ui::layout::{Edges, Size};
-use bunny_ui::prelude::{EditCommand, Runtime, SizeClass};
+use bunny_ui::prelude::{EditCommand, Locale, Runtime, SizeClass};
 use bunny_ui::view::View;
 
 use crate::ffi::{self, AppEvent};
 use crate::keys::{self, key_pattern};
+
+thread_local! {
+    /// The locale the shell knows — what the framework's own words are
+    /// resolved in where no window is at hand: the shortcuts helper's
+    /// rows, the notification channel's name.
+    static LOCALE: RefCell<Locale> = RefCell::new(Locale::default());
+}
+
+/// The locale the shell knows (see [`LOCALE`]).
+pub(crate) fn locale() -> Locale {
+    LOCALE.with(|slot| slot.borrow().clone())
+}
 
 /// Points the shell's frame driver at the pace the runtime asks for:
 /// the choreographer for springs, flings and a finger on the clock, one
@@ -168,7 +180,7 @@ impl App {
     /// groups kept here ([`crate::shortcuts`], [`crate::keyboard_shortcuts!`]).
     /// Call it again when the keys behind the items change.
     pub fn set_menu_bar(&self, bar: &bunny_ui::menu::MenuBar) {
-        crate::shortcuts::keep(bar);
+        crate::shortcuts::keep(bar, &bunny_ui::words::Words::for_locale(&locale()));
     }
 
     /// A runtime for the window — named for its own scene.

@@ -31,6 +31,7 @@
 
 use bunny_ui::action::{Key, KeyPattern};
 use bunny_ui::menu::{Item, MenuBar, Role};
+use bunny_ui::words::Words;
 
 use crate::keys;
 
@@ -55,22 +56,23 @@ const META_SHIFT_ON: i32 = 0x01;
 const META_ALT_ON: i32 = 0x02;
 const META_CTRL_ON: i32 = 0x1000;
 
-/// The helper's groups for `bar`, in the bar's order. A menu with no chord
-/// the keyboard can type is left out — the helper draws no empty sheets.
+/// The helper's groups for `bar`, in the bar's order, the standard edits
+/// labelled in `words`. A menu with no chord the keyboard can type is
+/// left out — the helper draws no empty sheets.
 #[must_use]
-pub fn groups(bar: &MenuBar) -> Vec<Group> {
+pub fn groups(bar: &MenuBar, words: &Words) -> Vec<Group> {
     bar.menus()
         .iter()
         .filter_map(|menu| {
             let mut chords = Vec::new();
-            collect(menu.entries(), &mut chords);
+            collect(menu.entries(), words, &mut chords);
             (!chords.is_empty()).then(|| Group { title: menu.title().to_owned(), chords })
         })
         .collect()
 }
 
 /// The rows `items` give, a submenu's folded into its menu's.
-fn collect(items: &[Item], chords: &mut Vec<Chord>) {
+fn collect(items: &[Item], words: &Words, chords: &mut Vec<Chord>) {
     for item in items {
         match item {
             Item::Command(command) if command.filed_as() == Some(Role::Quit) => {}
@@ -79,8 +81,8 @@ fn collect(items: &[Item], chords: &mut Vec<Chord>) {
                     chords.push(chord);
                 }
             }
-            Item::Edit(edit) => chords.extend(chord(edit.title(), edit.stroke())),
-            Item::Submenu(menu) => collect(menu.entries(), chords),
+            Item::Edit(edit) => chords.extend(chord(&words.get(edit.word()), edit.stroke())),
+            Item::Submenu(menu) => collect(menu.entries(), words, chords),
             Item::About | Item::Separator => {}
         }
     }
@@ -159,8 +161,8 @@ static KEPT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 /// Keeps `bar`'s groups for the helper's next question.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-pub(crate) fn keep(bar: &MenuBar) {
-    let wire = encode(&groups(bar));
+pub(crate) fn keep(bar: &MenuBar, words: &Words) {
+    let wire = encode(&groups(bar, words));
     if let Ok(mut kept) = KEPT.lock() {
         *kept = wire;
     }
@@ -248,7 +250,7 @@ mod tests {
     /// a `control` stroke and a menu with nothing to type are left out.
     #[test]
     fn the_helper_lists_each_menus_typeable_chords_under_its_title() {
-        let groups = groups(&bar());
+        let groups = groups(&bar(), &Words::english());
         let titles: Vec<&str> = groups.iter().map(|group| group.title.as_str()).collect();
         assert_eq!(titles, ["File", "Edit", "View", "Go"], "Help holds nothing to type");
 
