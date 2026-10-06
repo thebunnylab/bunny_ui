@@ -3480,6 +3480,13 @@ pub fn create_window(
             start_beat(window, view, delegate);
         }
 
+        // `BUNNY_WINDOW_FLOATING`: the window rides above every normal
+        // window. A measuring run asks for it, so the window it times is
+        // seen and not covered — a covered window is a different workload.
+        if std::env::var_os("BUNNY_WINDOW_FLOATING").is_some() {
+            const NS_FLOATING_WINDOW_LEVEL: i64 = 3;
+            msg_void_i64(window, sel("setLevel:"), NS_FLOATING_WINDOW_LEVEL);
+        }
         msg_void_id(window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
         // the keyboard is born pointing at the event view
         msg_void_id(window, sel("makeFirstResponder:"), view);
