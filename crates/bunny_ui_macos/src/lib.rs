@@ -1736,7 +1736,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
             let rect = snapshot.caret_rect;
             (
-                std::rc::Rc::from(snapshot.text),
+                snapshot.text,
                 ffi::NSRange {
                     location: snapshot.selected.0 as u64,
                     length: snapshot.selected.1 as u64,

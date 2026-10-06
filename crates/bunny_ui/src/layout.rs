@@ -5286,15 +5286,22 @@ impl LayoutNode {
                 (size, Fit::Leaf)
             }
 
-            LayoutNode::Field { path, content, placeholder, multiline, secret, .. } => {
+            LayoutNode::Field { path, content: held, placeholder, multiline, secret, .. } => {
                 let shown;
                 let content: &str = if *secret {
-                    shown = crate::text_input::masked(content);
+                    shown = crate::text_input::masked(held);
                     &shown
                 } else {
-                    content
+                    held
                 };
                 let sample: &str = if content.is_empty() { placeholder } else { content };
+                // the allocation the sample lives in, when it is one: the
+                // field's kept lines are then found by pointer
+                let shared = if content.is_empty() {
+                    Some(placeholder)
+                } else {
+                    (!*secret).then_some(held)
+                };
                 if *multiline {
                     // the box the parent gives, and the text wraps INSIDE
                     // it: a long line never widens the column, and a tall
@@ -5308,7 +5315,7 @@ impl LayoutNode {
                     let height = proposal.height.unwrap_or_else(|| {
                         let inner = (width - 2.0 * FIELD_PAD_H).max(1.0);
                         let lines =
-                            env.cache.field_lines(path, sample, None, &env.font, inner, env.text);
+                            env.cache.field_lines(path, sample, shared, &env.font, inner, env.text);
                         lines.len() as Px * line_h + 2.0 * FIELD_PAD_V
                     });
                     (Size { width, height }, Fit::Leaf)

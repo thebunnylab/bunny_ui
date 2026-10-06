@@ -432,6 +432,22 @@ pub fn byte_to_utf16(text: &str, byte: usize) -> usize {
     utf16_len(&text.as_bytes()[..clamp_to_boundary(text, byte)])
 }
 
+/// A field's text as one shared allocation: the one lent last while the
+/// value still holds the same text — compared, which costs nothing when
+/// the length moved and a fast byte compare when it did not — else a
+/// fresh one, kept for the next read.
+pub(crate) fn lend_text(lent: &std::cell::RefCell<Option<std::sync::Arc<str>>>, value: &str) -> std::sync::Arc<str> {
+    let mut lent = lent.borrow_mut();
+    match lent.as_ref() {
+        Some(kept) if **kept == *value => kept.clone(),
+        _ => {
+            let fresh: std::sync::Arc<str> = std::sync::Arc::from(value);
+            *lent = Some(fresh.clone());
+            fresh
+        }
+    }
+}
+
 /// UTF-16 units in whole UTF-8 bytes, in one pass: a lead or ASCII byte
 /// is one unit, a four-byte lead one more, a continuation none. Counted in
 /// blocks whose total fits a byte — UTF-8 never holds more units than
