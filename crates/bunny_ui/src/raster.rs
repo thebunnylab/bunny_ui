@@ -1248,6 +1248,157 @@ fn touches(a: DamageRect, b: DamageRect) -> bool {
     a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
 }
 
+/// The superset bounds of one command under `clip` (physical, `factor`
+/// pixels a point), or `None` when it paints nothing or lands outside
+/// the clip and the surface (`whole`).
+fn command_box(
+    command: &DrawCommand,
+    clip: Option<DamageRect>,
+    factor: f64,
+    whole: DamageRect,
+    cache: &crate::text_engine::MeasureCache,
+    text: &dyn TextEngine,
+) -> Option<DamageRect> {
+    let raw = match command {
+        DrawCommand::FillRect { rect, .. }
+        | DrawCommand::StrokeRect { rect, .. }
+        | DrawCommand::Backdrop { rect, .. }
+        | DrawCommand::Gradient { rect, .. } => Bitmap::snap(scale_rect(*rect, factor)),
+        DrawCommand::Shadow { rect, radius, .. } => {
+            let (x0, y0, x1, y1) = Bitmap::snap(scale_rect(*rect, factor));
+            let reach = (radius * factor).max(1.0).round() as i64;
+            (x0 - reach, y0 - reach, x1 + reach, y1 + reach)
+        }
+        DrawCommand::TextLine { origin, content, range, font, .. } => {
+            let metrics = cache.get_or_measure(&content[range.0..range.1], font, text);
+            let x = (origin.x * factor).round() as i64;
+            let y = (origin.y * factor).round() as i64;
+            // +2px of slack per edge: measure vs raster rounding
+            // never crosses it, and a superset is always safe
+            (
+                x - 2,
+                y - 2,
+                x + (metrics.width * factor).ceil() as i64 + 2,
+                y + (metrics.height() * factor).ceil() as i64 + 2,
+            )
+        }
+        // the destination rect is the whole truth — no slack needed
+        DrawCommand::Image { rect, .. } => Bitmap::snap(scale_rect(*rect, factor)),
+        // a clip that CHANGES must damage everything it governs —
+        // its own box is the safe superset (the curve and the
+        // nested cuts only ever REMOVE coverage). Identical clips
+        // in the prefix and suffix contribute nothing, as ever.
+        DrawCommand::PushClip { rect, .. } => Bitmap::snap(scale_rect(*rect, factor)),
+        DrawCommand::PopClip => return None,
+    };
+    let clipped = match clip {
+        Some(clip) => intersect(raw, clip)?,
+        None => raw,
+    };
+    intersect(clipped, whole)
+}
+
+/// Walks `commands[..upto]` keeping the physical clip stack; calls
+/// `visit(index, clip_at_index)` for every command it passes.
+fn walk_clips(
+    commands: &[DrawCommand],
+    upto: usize,
+    factor: f64,
+    mut visit: impl FnMut(usize, Option<DamageRect>),
+) {
+    let mut stack: Vec<DamageRect> = Vec::new();
+    for (index, command) in commands[..upto].iter().enumerate() {
+        visit(index, stack.last().copied());
+        match command {
+            DrawCommand::PushClip { rect, .. } => {
+                let snapped = Bitmap::snap(scale_rect(*rect, factor));
+                let top = match stack.last().copied() {
+                    Some(top) => {
+                        intersect(snapped, top).unwrap_or((snapped.0, snapped.1, snapped.0, snapped.1))
+                    }
+                    None => snapped,
+                };
+                stack.push(top);
+            }
+            DrawCommand::PopClip => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// What a list paints differently from the one already on screen — the
+/// question a backend that keeps its last frame asks before it paints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListDamage {
+    /// The two lists paint alike: nothing to do.
+    Same,
+    /// The one box (physical, clamped to the surface) that covers every
+    /// pixel the new list paints differently — a superset, as the
+    /// surface's own boxes are.
+    Rect(DamageRect),
+    /// More than the limit changed, or the new list carries glass (a
+    /// pane reads what lies under it, near or far): paint the whole.
+    Whole,
+}
+
+/// The change from `old` to `new` on a surface of `size` physical pixels
+/// at `scale`. The common prefix and suffix paint the same pixels; the
+/// middles of both lists, boxed under their own clips, are the change —
+/// [`Surface::frame`]'s diff, without a retained bitmap. `limit` caps
+/// the middle commands worth boxing: a scroll moves them all and is
+/// answered `Whole` before one box is measured. Changes that land
+/// outside every clip (a row appended below the fold) box to nothing,
+/// and the answer is `Same`.
+pub fn list_damage(
+    old: &[DrawCommand],
+    new: &[DrawCommand],
+    scale: usize,
+    size: (usize, usize),
+    limit: usize,
+    cache: &crate::text_engine::MeasureCache,
+    text: &dyn TextEngine,
+) -> ListDamage {
+    let mut prefix = 0;
+    while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
+        prefix += 1;
+    }
+    if prefix == old.len() && prefix == new.len() {
+        return ListDamage::Same;
+    }
+    let mut suffix = 0;
+    while suffix < old.len() - prefix
+        && suffix < new.len() - prefix
+        && old[old.len() - 1 - suffix] == new[new.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    if (old.len() - prefix - suffix) + (new.len() - prefix - suffix) > limit {
+        return ListDamage::Whole;
+    }
+    if new.iter().any(|command| matches!(command, DrawCommand::Backdrop { .. })) {
+        return ListDamage::Whole;
+    }
+    let factor = scale as f64;
+    let whole = (0, 0, size.0 as i64, size.1 as i64);
+    let mut damage: Option<DamageRect> = None;
+    for (list, end) in [(old, old.len() - suffix), (new, new.len() - suffix)] {
+        walk_clips(list, end, factor, |index, clip| {
+            if index < prefix {
+                return;
+            }
+            if let Some(found) = command_box(&list[index], clip, factor, whole, cache, text) {
+                damage = Some(damage.map_or(found, |seen| union(seen, found)));
+            }
+        });
+    }
+    match damage {
+        Some(rect) => ListDamage::Rect(rect),
+        None => ListDamage::Same,
+    }
+}
+
 /// A retained paint target: the previous frame's bitmap, its display
 /// list, and the physical bounds of every command. A new frame DIFFS
 /// against the retained list (common prefix + common suffix — a hover
@@ -1317,44 +1468,7 @@ impl Surface {
         clip: Option<DamageRect>,
         text: &dyn TextEngine,
     ) -> Option<DamageRect> {
-        let factor = self.scale as f64;
-        let raw = match command {
-            DrawCommand::FillRect { rect, .. }
-            | DrawCommand::StrokeRect { rect, .. }
-            | DrawCommand::Backdrop { rect, .. }
-            | DrawCommand::Gradient { rect, .. } => Bitmap::snap(scale_rect(*rect, factor)),
-            DrawCommand::Shadow { rect, radius, .. } => {
-                let (x0, y0, x1, y1) = Bitmap::snap(scale_rect(*rect, factor));
-                let reach = (radius * factor).max(1.0).round() as i64;
-                (x0 - reach, y0 - reach, x1 + reach, y1 + reach)
-            }
-            DrawCommand::TextLine { origin, content, range, font, .. } => {
-                let metrics = self.cache.get_or_measure(&content[range.0..range.1], font, text);
-                let x = (origin.x * factor).round() as i64;
-                let y = (origin.y * factor).round() as i64;
-                // +2px of slack per edge: measure vs raster rounding
-                // never crosses it, and a superset is always safe
-                (
-                    x - 2,
-                    y - 2,
-                    x + (metrics.width * factor).ceil() as i64 + 2,
-                    y + (metrics.height() * factor).ceil() as i64 + 2,
-                )
-            }
-            // the destination rect is the whole truth — no slack needed
-            DrawCommand::Image { rect, .. } => Bitmap::snap(scale_rect(*rect, factor)),
-            // a clip that CHANGES must damage everything it governs —
-            // its own box is the safe superset (the curve and the
-            // nested cuts only ever REMOVE coverage). Identical clips
-            // in the prefix and suffix contribute nothing, as ever.
-            DrawCommand::PushClip { rect, .. } => Bitmap::snap(scale_rect(*rect, factor)),
-            DrawCommand::PopClip => return None,
-        };
-        let clipped = match clip {
-            Some(clip) => intersect(raw, clip)?,
-            None => raw,
-        };
-        intersect(clipped, self.whole())
+        command_box(command, clip, self.scale as f64, self.whole(), &self.cache, text)
     }
 
     /// Walks `commands[..upto]` keeping the physical clip stack; calls
@@ -1363,29 +1477,9 @@ impl Surface {
         &self,
         commands: &[DrawCommand],
         upto: usize,
-        mut visit: impl FnMut(usize, Option<DamageRect>),
+        visit: impl FnMut(usize, Option<DamageRect>),
     ) {
-        let factor = self.scale as f64;
-        let mut stack: Vec<DamageRect> = Vec::new();
-        for (index, command) in commands[..upto].iter().enumerate() {
-            visit(index, stack.last().copied());
-            match command {
-                DrawCommand::PushClip { rect, .. } => {
-                    let snapped = Bitmap::snap(scale_rect(*rect, factor));
-                    let top = match stack.last().copied() {
-                        Some(top) => {
-                            intersect(snapped, top).unwrap_or((snapped.0, snapped.1, snapped.0, snapped.1))
-                        }
-                        None => snapped,
-                    };
-                    stack.push(top);
-                }
-                DrawCommand::PopClip => {
-                    stack.pop();
-                }
-                _ => {}
-            }
-        }
+        walk_clips(commands, upto, self.scale as f64, visit)
     }
 
     /// Paints the new frame incrementally and returns the damaged rects
@@ -2191,6 +2285,168 @@ mod tests {
         surface.frame(frames[0].clone(), &PixelFont, &RawImages::default());
         let damage = surface.frame(frames[0].clone(), &PixelFont, &RawImages::default());
         assert!(damage.is_empty(), "same list, no damage: {damage:?}");
+    }
+
+    /// A clipped scene for the diff: a panel, a clipped region with rows
+    /// and lines, and a footer under the clip.
+    fn damage_scene() -> Vec<DrawCommand> {
+        vec![
+            fill(0.0, 0.0, 120.0, 80.0, Color::WHITE),
+            DrawCommand::PushClip {
+                rect: Rect {
+                    origin: Point { x: 4.0, y: 8.0 },
+                    size: Size { width: 112.0, height: 52.0 },
+                },
+                corner_radius: Corners::ZERO,
+            },
+            fill(8.0, 10.0, 100.0, 18.0, Color::hex(0xEEEEF2)),
+            line(10.0, 12.0, "alpha", Color::BLACK),
+            fill(8.0, 32.0, 100.0, 18.0, Color::hex(0xEEEEF2)),
+            line(10.0, 34.0, "beta", Color::BLACK),
+            DrawCommand::PopClip,
+            fill(0.0, 66.0, 120.0, 14.0, Color::hex(0xD8DCE6)),
+        ]
+    }
+
+    #[test]
+    fn a_list_damage_box_holds_every_pixel_the_new_list_changes() {
+        // the oracle: outside the box the old and the new list paint the
+        // same bytes, so a backend may keep those pixels and repaint the
+        // box alone. Random edits over a clipped scene, at two scales
+        let words = ["alpha", "beta", "gamma", "x", "a longer line of words", ""];
+        let colors = [Color::BLACK, Color::WHITE, Color::hex(0xD8DCE6), Color::hex(0x3366CC)];
+        let mut seed: u64 = 0x5eed_da4a;
+        let mut roll = move |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) % n as u64) as usize
+        };
+        for scale in [1usize, 2] {
+            let cache = crate::text_engine::MeasureCache::default();
+            let (width, height) = (120 * scale, 80 * scale);
+            let mut current = damage_scene();
+            let mut boxed = 0;
+            for _ in 0..400 {
+                let mut next = current.clone();
+                // the clip's insides: between the push and the pop
+                let push = next.iter().position(|c| matches!(c, DrawCommand::PushClip { .. })).unwrap();
+                let pop = next.iter().position(|c| matches!(c, DrawCommand::PopClip)).unwrap();
+                let at = |roll: &mut dyn FnMut(usize) -> usize, lo: usize, hi: usize| lo + roll(hi - lo);
+                match roll(7) {
+                    0 if pop > push + 1 => {
+                        let index = at(&mut roll, push + 1, pop);
+                        if let DrawCommand::FillRect { color, .. } = &mut next[index] {
+                            *color = colors[roll(colors.len())];
+                        }
+                    }
+                    1 if pop > push + 1 => {
+                        let index = at(&mut roll, push + 1, pop);
+                        match &mut next[index] {
+                            DrawCommand::FillRect { rect, .. } => {
+                                rect.origin.x = roll(60) as f64 - 10.0;
+                                rect.origin.y = roll(90) as f64 - 10.0;
+                            }
+                            DrawCommand::TextLine { origin, .. } => {
+                                origin.x = roll(80) as f64;
+                                origin.y = roll(90) as f64 - 10.0;
+                            }
+                            _ => {}
+                        }
+                    }
+                    2 if pop > push + 1 => {
+                        let index = at(&mut roll, push + 1, pop);
+                        if let DrawCommand::TextLine { content, range, .. } = &mut next[index] {
+                            let word = words[roll(words.len())];
+                            *content = std::sync::Arc::from(word);
+                            *range = (0, word.len());
+                        }
+                    }
+                    3 => {
+                        let y = roll(100) as f64 - 10.0;
+                        next.insert(at(&mut roll, push + 1, pop + 1), line(roll(60) as f64, y, words[roll(words.len())], Color::BLACK));
+                    }
+                    4 if pop > push + 1 => {
+                        next.remove(at(&mut roll, push + 1, pop));
+                    }
+                    5 => {
+                        if let DrawCommand::PushClip { rect, .. } = &mut next[push] {
+                            rect.origin.y = 2.0 + roll(12) as f64;
+                            rect.size.height = 30.0 + roll(30) as f64;
+                        }
+                    }
+                    _ => {
+                        let last = next.len() - 1;
+                        if let DrawCommand::FillRect { color, .. } = &mut next[last] {
+                            *color = colors[roll(colors.len())];
+                        }
+                    }
+                }
+                let old = list(current.clone());
+                let new = list(next.clone());
+                let before = rasterize_scaled(&old, width, height, scale, Color::CANVAS);
+                let after = rasterize_scaled(&new, width, height, scale, Color::CANVAS);
+                let answer =
+                    list_damage(old.as_slice(), new.as_slice(), scale, (width, height), 64, &cache, &PixelFont);
+                let inside = |x: usize, y: usize| match answer {
+                    ListDamage::Rect((x0, y0, x1, y1)) => {
+                        (x as i64) >= x0 && (x as i64) < x1 && (y as i64) >= y0 && (y as i64) < y1
+                    }
+                    ListDamage::Same => false,
+                    ListDamage::Whole => true,
+                };
+                if let ListDamage::Rect(rect) = answer {
+                    boxed += 1;
+                    assert!(rect.0 >= 0 && rect.1 >= 0 && rect.2 <= width as i64 && rect.3 <= height as i64);
+                }
+                for y in 0..height {
+                    for x in 0..width {
+                        if !inside(x, y) {
+                            assert_eq!(
+                                before.pixels()[y * width + x],
+                                after.pixels()[y * width + x],
+                                "pixel ({x}, {y}) changed outside {answer:?} at scale {scale}"
+                            );
+                        }
+                    }
+                }
+                current = next;
+            }
+            assert!(boxed > 150, "the edits mostly box: {boxed} of 400 at scale {scale}");
+        }
+    }
+
+    #[test]
+    fn a_row_appended_below_the_fold_damages_nothing() {
+        // the stream's case: a line lands under the clip's bottom edge —
+        // nothing on screen moves
+        let cache = crate::text_engine::MeasureCache::default();
+        let old = damage_scene();
+        let mut new = old.clone();
+        let pop = new.iter().position(|c| matches!(c, DrawCommand::PopClip)).unwrap();
+        new.insert(pop, line(10.0, 64.0, "below the fold", Color::BLACK));
+        let answer = list_damage(&old, &new, 2, (240, 160), 64, &cache, &PixelFont);
+        assert_eq!(answer, ListDamage::Same);
+    }
+
+    #[test]
+    fn a_scroll_is_whole_before_a_box_is_measured_and_glass_is_always_whole() {
+        let cache = crate::text_engine::MeasureCache::default();
+        let rows = |shift: f64| -> Vec<DrawCommand> {
+            (0..40).map(|i| fill(0.0, i as f64 * 4.0 + shift, 120.0, 3.0, Color::BLACK)).collect()
+        };
+        assert_eq!(list_damage(&rows(0.0), &rows(1.0), 1, (120, 80), 64, &cache, &PixelFont), ListDamage::Whole);
+        assert_eq!(cache.len(), 0, "nothing was measured");
+        let mut glass = damage_scene();
+        let pane = Rect { origin: Point { x: 0.0, y: 0.0 }, size: Size { width: 40.0, height: 40.0 } };
+        glass.push(DrawCommand::Backdrop {
+            rect: pane,
+            glass: Glass::frosted().resolve(pane),
+            corner_radius: Corners::ZERO,
+        });
+        let mut moved = glass.clone();
+        if let DrawCommand::FillRect { color, .. } = &mut moved[7] {
+            *color = Color::BLACK;
+        }
+        assert_eq!(list_damage(&glass, &moved, 1, (120, 80), 64, &cache, &PixelFont), ListDamage::Whole);
     }
 
     #[test]
