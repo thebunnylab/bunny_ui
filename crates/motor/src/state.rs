@@ -606,6 +606,10 @@ pub struct State<T> {
 struct TypedSlot<T> {
     generation: u32,
     value: Option<T>,
+    /// Writes the slot has taken, its birth included: with the state's
+    /// identity it names the value's content — a reader that kept what it
+    /// saw at a count knows nothing changed while the count stands.
+    writes: u64,
 }
 
 struct TypedArena<T> {
@@ -622,9 +626,10 @@ impl<T> TypedArena<T> {
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index];
             slot.value = Some(value);
+            slot.writes += 1;
             (index, slot.generation)
         } else {
-            self.slots.push(TypedSlot { generation: 0, value: Some(value) });
+            self.slots.push(TypedSlot { generation: 0, value: Some(value), writes: 0 });
             (self.slots.len() - 1, 0)
         }
     }
@@ -779,11 +784,28 @@ impl<T: Clone + 'static> State<T> {
                 .filter(|slot| slot.generation == self.generation)
                 .expect(DEAD_STATE);
             slot.value = Some(value);
+            slot.writes += u64::from(changed);
         });
         if changed {
             crate::identity::record_write(crate::identity::DepKey::State(self.dep));
         }
         result
+    }
+
+    /// The value's version: the state's identity and the writes its slot
+    /// has taken. Two equal versions are the same content; a reader that
+    /// kept a copy of what it saw at a version may keep it while the
+    /// version stands. Records no read.
+    pub fn version(&self) -> (u64, u64) {
+        let writes = with_arena_ref::<T, _>(|arena| {
+            arena
+                .slots
+                .get(self.index)
+                .filter(|slot| slot.generation == self.generation)
+                .map(|slot| slot.writes)
+                .expect(DEAD_STATE)
+        });
+        (self.dep, writes)
     }
 
     pub fn set(&self, value: T) {
@@ -794,6 +816,7 @@ impl<T: Clone + 'static> State<T> {
                 .filter(|slot| slot.generation == self.generation)
                 .expect(DEAD_STATE);
             slot.value = Some(value);
+            slot.writes += 1;
         });
         crate::identity::record_write(crate::identity::DepKey::State(self.dep));
     }
@@ -819,6 +842,7 @@ impl<T: Clone + 'static> State<T> {
                 .filter(|slot| slot.generation == self.generation)
                 .expect(DEAD_STATE);
             slot.value = Some(value);
+            slot.writes += 1;
         });
         crate::identity::record_write(crate::identity::DepKey::State(self.dep));
         result
@@ -886,6 +910,10 @@ trait Source<T> {
     fn modify(&self, _edit: &mut dyn FnMut(&mut T) -> bool) -> Option<bool> {
         None
     }
+    /// The value's version, where the source can name one.
+    fn version(&self) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 /// A getter closure: it has nothing to lend, and lends the copy it makes.
@@ -919,6 +947,10 @@ impl<T: Clone + 'static> Source<T> for StateSource<T> {
             (changed, changed)
         }))
     }
+
+    fn version(&self) -> Option<(u64, u64)> {
+        Some(self.0.version())
+    }
 }
 
 /// A source whose writes must reach a setter of their own (`onSet`): it
@@ -932,6 +964,10 @@ impl<T> Source<T> for Through<T> {
 
     fn lend(&self, visit: &mut dyn FnMut(&T)) {
         self.0.lend(visit)
+    }
+
+    fn version(&self) -> Option<(u64, u64)> {
+        self.0.version()
     }
 }
 
@@ -953,6 +989,14 @@ impl<T: Clone + 'static> Binding<T> {
         let mut answer = None;
         self.get.lend(&mut |value: &T| answer = f.take().map(|f| f(value)));
         answer.expect("a binding lends its value exactly once")
+    }
+
+    /// The value's version — the state's identity and its writes — for a
+    /// state's own binding: two equal versions are the same content, so a
+    /// copy kept at a version needs no compare while it stands. `None` for
+    /// a binding made of closures, whose content only a compare can tell.
+    pub fn version(&self) -> Option<(u64, u64)> {
+        self.get.version()
     }
 
     /// Edits the value and writes it back when `edit` says it changed. A
@@ -1095,6 +1139,30 @@ mod tests {
             true
         }));
         assert_eq!(state.wrappedValue(), "");
+    }
+
+    #[test]
+    fn a_version_moves_with_every_write_and_names_its_state() {
+        let note = State::new(String::from("a"));
+        let other = State::new(String::from("a"));
+        let binding = note.binding();
+        let first = binding.version().expect("a state's binding has a version");
+        assert_eq!(binding.version(), Some(first), "reading moves nothing");
+        note.set(String::from("b"));
+        let second = binding.version().unwrap();
+        assert_ne!(first, second, "a write moves it");
+        assert!(!binding.modify(|_| false));
+        assert_eq!(binding.version(), Some(second), "an edit that changed nothing does not");
+        assert!(binding.modify(|text| {
+            text.push('c');
+            true
+        }));
+        assert_ne!(binding.version(), Some(second), "an edit that changed does");
+        assert_ne!(other.binding().version(), binding.version(), "another state never shares one");
+        let observed = note.binding().onSet(|_| {});
+        assert_eq!(observed.version(), binding.version(), "an observed binding reads the same version");
+        let made = Binding::new(move || note.wrappedValue(), move |value| note.set(value));
+        assert_eq!(made.version(), None, "a binding made of closures cannot name one");
     }
 
     #[test]
