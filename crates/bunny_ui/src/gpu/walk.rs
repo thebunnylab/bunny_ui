@@ -25,7 +25,7 @@ use crate::text_engine::{FontKey, FontSpec, TextEngine};
 /// atlas and re-inserts the current frame — a copying collector, not a
 /// per-tile free list.
 pub const ATLAS_CHUNK_WIDTH: u32 = 1024;
-pub const ATLAS_INITIAL_SIZE: u32 = 2048;
+pub const ATLAS_INITIAL_SIZE: u32 = 1024;
 pub const ATLAS_MAX_SIZE: u32 = 4096;
 
 // MARK: - The wire format shared with both tiers' shaders
@@ -511,12 +511,14 @@ impl RunAtlas {
     }
 
     /// Drops every entry and every shelf. `grow` doubles the texture
-    /// once (2048 → 4096); the ground re-makes it lazily. The caller
+    /// (1024 → 2048 → 4096); the ground re-makes it lazily. The caller
     /// MUST have drained in-flight frames — this is the one moment
-    /// texel space is reused.
+    /// texel space is reused. The atlas is born small: a window of text
+    /// fits in a megapixel, and a texture four times a window's need is
+    /// memory the process holds for nothing — the arena counted it.
     pub fn reset(&mut self, ground: &mut dyn AtlasGround, grow: bool) {
         if grow && self.size < ATLAS_MAX_SIZE {
-            self.size = ATLAS_MAX_SIZE;
+            self.size = (self.size * 2).min(ATLAS_MAX_SIZE);
             ground.drop_shared();
             self.packer = ShelfPacker::new(self.size, self.size);
         } else {
@@ -1823,7 +1825,7 @@ mod tests {
     /// walk again, twice. `false` = the frame never walked whole.
     fn present(ground: &mut RecordingGround, atlas: &mut RunAtlas, display: &DisplayList) -> bool {
         let mut batches = FrameBatches::default();
-        for attempt in 0..3 {
+        for attempt in 0..4 {
             let walked = build_frame(
                 ground,
                 display,
@@ -1836,7 +1838,7 @@ mod tests {
             );
             match walked {
                 Ok(()) => return true,
-                Err(AtlasFull) if attempt < 2 => atlas.reset(ground, true),
+                Err(AtlasFull) if attempt < 3 => atlas.reset(ground, true),
                 Err(AtlasFull) => return false,
             }
         }
@@ -2016,7 +2018,7 @@ mod tests {
             present(&mut ground, &mut atlas, &photos(70, 100, (500.0, 125.0))),
             "the frame walked whole"
         );
-        assert_eq!(atlas.size, ATLAS_MAX_SIZE, "the atlas grew once");
+        assert_eq!(atlas.size, ATLAS_MAX_SIZE, "the atlas grew to its largest");
         assert_eq!(atlas.images.len() + atlas.dedicated.len(), 70, "every photo is somewhere");
         assert!(!atlas.dedicated.is_empty(), "the overflow took textures of its own");
         assert!(atlas.images.len() >= 40, "the shelves took their share: {}", atlas.images.len());
@@ -2058,9 +2060,10 @@ mod tests {
         let mut atlas = RunAtlas::new();
         let font = FontSpec::DEFAULT;
         let engine = crate::text_engine::PixelFont;
-        // one walk fills shelves with runs nobody reads again
+        // one walk fills shelves with runs nobody reads again — half the
+        // first atlas, which is a megapixel now
         atlas.begin_walk();
-        for i in 0..100 {
+        for i in 0..50 {
             atlas.resolve(&mut ground, &format!("an old run number {i}"), &font, Color::BLACK, 2, &engine).unwrap();
         }
         let shelves = atlas.packer.shelves.len();
@@ -2072,7 +2075,7 @@ mod tests {
             atlas.resolve(&mut ground, "the run still read", &font, Color::BLACK, 2, &engine).unwrap();
         }
         let old_before = atlas.entries.values().flatten().filter(|entry| entry.content.starts_with("an old")).count();
-        assert_eq!(old_before, 100);
+        assert_eq!(old_before, 50);
         let freed = atlas.evict_stale(ATLAS_KEEP_WALKS);
         assert!(freed >= 1, "shelves nobody read are given back: {freed}");
         assert!(freed < shelves, "the shelf of the run still read stands");
