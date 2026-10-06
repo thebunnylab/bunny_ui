@@ -708,6 +708,43 @@ pub enum Truncation {
     End,
 }
 
+/// Where a split's seam stands: a number fixed at render, or a binding the
+/// layout reads for itself on every frame. The seam is app state a drag
+/// writes on every pointer move; read in the body, each write re-ran the
+/// body that holds the split — the whole window's, for a dock — and every
+/// body under it, before a frame could lay out. Read by the layout, a
+/// write is a frame and nothing else.
+#[derive(Clone)]
+pub enum SeamAt {
+    Fixed(Px),
+    Bound(Rc<crate::bind::Bound<f64>>),
+}
+
+impl SeamAt {
+    /// The seam now.
+    pub fn value(&self) -> Px {
+        match self {
+            SeamAt::Fixed(at) => *at,
+            SeamAt::Bound(bound) => bound.get(),
+        }
+    }
+}
+
+impl From<Px> for SeamAt {
+    fn from(at: Px) -> Self {
+        SeamAt::Fixed(at)
+    }
+}
+
+impl std::fmt::Debug for SeamAt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SeamAt::Fixed(at) => write!(f, "{at}"),
+            SeamAt::Bound(bound) => write!(f, "{} (bound)", bound.get()),
+        }
+    }
+}
+
 /// The layout tree that a render pass emits. A closed set (everything
 /// reduces to the built-ins after the bodies), children in a `Vec` — the
 /// static dispatch lives in the VIEW tree; this is the runtime structure.
@@ -911,7 +948,10 @@ pub enum LayoutNode {
         path: String,
         axis: Axis,
         unit: SeamUnit,
-        at: Px,
+        /// Where the seam stands — read by the LAYOUT when it is a
+        /// binding, so a drag moves it with no body between the hand and
+        /// the frame.
+        at: SeamAt,
         min_a: Px,
         min_b: Px,
         /// Which lane the seam names. `false` — the default — is lane A:
@@ -5422,7 +5462,7 @@ impl LayoutNode {
 
             LayoutNode::Split { axis, unit, at, min_a, min_b, trailing, children, .. } => {
                 measure_split(
-                    *axis, *unit, *at, *min_a, *min_b, *trailing, children, proposal, env,
+                    *axis, *unit, at.value(), *min_a, *min_b, *trailing, children, proposal, env,
                 )
             }
 
@@ -8778,7 +8818,7 @@ mod tests {
             path: "seam".into(),
             axis: Axis::Horizontal,
             unit: SeamUnit::Points,
-            at,
+            at: at.into(),
             min_a: 100.0,
             min_b: 100.0,
             trailing: false,
@@ -8831,7 +8871,7 @@ mod tests {
                     path: "seam".into(),
                     axis: Axis::Horizontal,
                     unit: SeamUnit::Points,
-                    at,
+                    at: at.into(),
                     min_a: 320.0,
                     min_b: 180.0,
                     trailing: true,
@@ -8889,7 +8929,7 @@ mod tests {
                     path: "seam".into(),
                     axis: Axis::Horizontal,
                     unit: SeamUnit::Points,
-                    at: 248.0,
+                    at: 248.0.into(),
                     min_a: 320.0,
                     min_b: 180.0,
                     trailing,
@@ -8939,7 +8979,7 @@ mod tests {
             path: "seam".into(),
             axis: Axis::Vertical,
             unit: SeamUnit::Points,
-            at: 300.0,
+            at: 300.0.into(),
             min_a: 80.0,
             min_b: 80.0,
             trailing: false,

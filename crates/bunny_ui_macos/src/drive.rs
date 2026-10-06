@@ -29,6 +29,17 @@ pub fn wheel(x: f64, y: f64, dx: f64, dy: f64) {
     });
 }
 
+/// The primary button pressed at a point of the key window, with nothing
+/// held — a click's first half, a drag's start.
+pub fn press(x: f64, y: f64) {
+    ffi::dispatch(AppEvent::MouseDown { x, y, clicks: 1, modifiers: bunny_ui::action::Modifiers::NONE });
+}
+
+/// The primary button released at a point of the key window.
+pub fn release(x: f64, y: f64) {
+    ffi::dispatch(AppEvent::MouseUp { x, y });
+}
+
 /// The pointer at a point of the key window, with nothing held.
 pub fn pointer(x: f64, y: f64) {
     ffi::dispatch(AppEvent::MouseMoved {
