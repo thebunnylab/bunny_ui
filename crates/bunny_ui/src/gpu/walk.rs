@@ -951,13 +951,84 @@ pub struct DrawRun {
     /// Glass only: how deep the blur pyramid must go for this batch —
     /// the deepest blur any pane in it asked for.
     pub levels: u32,
+    /// The pixels the run's instances may touch, clipped: what decides
+    /// whether a later instance may join it past runs painted after it.
+    pub bounds: Box4,
 }
 
-fn note_run(runs: &mut Vec<DrawRun>, kind: RunKind, round: u32, index: usize) {
-    match runs.last_mut() {
-        Some(run) if run.kind == kind && run.round == round => run.count += 1,
-        _ => runs.push(DrawRun { kind, base: index as u32, count: 1, round, levels: 0 }),
+/// Which instance list a run reads: rects (and shadows and ramps), the
+/// sprites (atlas, dedicated and live textures alike), or glass. A run
+/// grows only at the end of its own list, so a run of another kind on the
+/// same list stands between.
+fn list_of(kind: RunKind) -> u8 {
+    match kind {
+        RunKind::Rects => 0,
+        RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) => 1,
+        RunKind::Glass => 2,
     }
+}
+
+/// How many runs back an instance looks for a run to join.
+const JOIN_LOOKBACK: usize = 4;
+
+/// An instance, into the run in front of it — or, when that run is of
+/// another kind, into the last run of its own kind, provided nothing
+/// painted after that run touches the instance's pixels: drawn earlier,
+/// it lands under nothing it should have covered and covers nothing it
+/// should have lain under, so the frame is the same and its draws fewer.
+/// Rows of a list alternate a background and its text; this folds them
+/// into one run of each. Glass reads what lies under it, and nothing
+/// joins past a pane.
+fn note_run(runs: &mut Vec<DrawRun>, kind: RunKind, round: u32, index: usize, bounds: Box4) {
+    if let Some(run) = runs.last_mut()
+        && run.kind == kind
+        && run.round == round
+    {
+        run.count += 1;
+        run.bounds = box_union(run.bounds, bounds);
+        return;
+    }
+    let list = list_of(kind);
+    for at in (runs.len().saturating_sub(JOIN_LOOKBACK)..runs.len()).rev() {
+        let run = runs[at];
+        if run.kind == RunKind::Glass {
+            break;
+        }
+        if list_of(run.kind) == list {
+            // the last run on this instance's own list: it is the one an
+            // instance can follow, and only when it is of the same kind
+            // under the same curve
+            if run.kind == kind && run.round == round && run.base + run.count == index as u32 {
+                let run = &mut runs[at];
+                run.count += 1;
+                run.bounds = box_union(run.bounds, bounds);
+                return;
+            }
+            break;
+        }
+        if box_intersect(run.bounds, bounds).is_some() {
+            break;
+        }
+    }
+    runs.push(DrawRun { kind, base: index as u32, count: 1, round, levels: 0, bounds });
+}
+
+/// The pixels a rect instance may touch: its quad cut by its clip.
+fn rect_box(instance: &RectInstance) -> Box4 {
+    let low_x = instance.rect[0].max(instance.clip[0]);
+    let low_y = instance.rect[1].max(instance.clip[1]);
+    let high_x = instance.rect[2].min(instance.clip[2]);
+    let high_y = instance.rect[3].min(instance.clip[3]);
+    (low_x.floor() as i64, low_y.floor() as i64, high_x.ceil() as i64, high_y.ceil() as i64)
+}
+
+/// The pixels a sprite may touch: its destination cut by its clip.
+fn sprite_box(instance: &SpriteInstance) -> Box4 {
+    let low_x = instance.dest[0].max(instance.clip[0]);
+    let low_y = instance.dest[1].max(instance.clip[1]);
+    let high_x = instance.dest[2].min(instance.clip[2]);
+    let high_y = instance.dest[3].min(instance.clip[3]);
+    (low_x.floor() as i64, low_y.floor() as i64, high_x.ceil() as i64, high_y.ceil() as i64)
 }
 
 fn box_union(a: Box4, b: Box4) -> Box4 {
@@ -985,7 +1056,7 @@ fn note_glass(
         run.levels = run.levels.max(levels);
         *batch = batch.map(|acc| box_union(acc, bounds));
     } else {
-        runs.push(DrawRun { kind: RunKind::Glass, base: index as u32, count: 1, round, levels });
+        runs.push(DrawRun { kind: RunKind::Glass, base: index as u32, count: 1, round, levels, bounds });
         *batch = Some(bounds);
     }
 }
@@ -1051,7 +1122,7 @@ pub fn build_frame(
                 }
                 let radii = corner_clamp(corner_radius * factor, snapped);
                 push_rect(out, snapped, clip, *color, radii, 0.0, KIND_FILL, 0.0);
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
+                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1, rect_box(&out[out.len() - 1]));
             }
             DrawCommand::Backdrop { rect, glass, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
@@ -1165,7 +1236,7 @@ pub fn build_frame(
                         )
                     }
                 }
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
+                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1, rect_box(&out[out.len() - 1]));
             }
             DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
@@ -1181,7 +1252,7 @@ pub fn build_frame(
                 let thickness = (width * factor).max(1.0).round();
                 let radii = corner_clamp(corner_radius * factor, snapped);
                 push_rect(out, snapped, clip, *color, radii, thickness, KIND_STROKE, 0.0);
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
+                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1, rect_box(&out[out.len() - 1]));
             }
             DrawCommand::Shadow { rect, radius, color, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
@@ -1202,7 +1273,7 @@ pub fn build_frame(
                     continue;
                 }
                 push_rect(out, expanded, clip, *color, corner, reach, KIND_SHADOW, reach_px as f64);
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
+                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1, rect_box(&out[out.len() - 1]));
             }
             DrawCommand::TextLine { origin, content, range, color, font } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
@@ -1262,6 +1333,7 @@ pub fn build_frame(
                         RunKind::Sprites,
                         round_of(&clips),
                         batches.sprites.len() - 1,
+                        sprite_box(&batches.sprites[batches.sprites.len() - 1]),
                     );
                 }
             }
@@ -1320,6 +1392,7 @@ pub fn build_frame(
                                 RunKind::Sprites,
                                 round_of(&clips),
                                 batches.sprites.len() - 1,
+                                sprite_box(&batches.sprites[batches.sprites.len() - 1]),
                             );
                         }
                     }
@@ -1341,6 +1414,7 @@ pub fn build_frame(
                             RunKind::Texture(index as u16),
                             round_of(&clips),
                             batches.sprites.len() - 1,
+                            sprite_box(&batches.sprites[batches.sprites.len() - 1]),
                         );
                     }
                     // the picture's own texels under the destination's
@@ -1363,6 +1437,7 @@ pub fn build_frame(
                             RunKind::Live(index as u16),
                             round_of(&clips),
                             batches.sprites.len() - 1,
+                            sprite_box(&batches.sprites[batches.sprites.len() - 1]),
                         );
                     }
                 }
@@ -1590,6 +1665,74 @@ mod tests {
         });
         display.push(DrawCommand::PopClip);
         display
+    }
+
+    fn walk_runs(display: &DisplayList) -> Vec<(RunKind, u32, u32)> {
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let mut batches = FrameBatches::default();
+        build_frame(
+            &mut ground,
+            display,
+            1,
+            (400, 400),
+            &crate::text_engine::PixelFont,
+            &crate::image_engine::RawImages::default(),
+            &mut atlas,
+            &mut batches,
+        )
+        .expect("the scene fits the atlas");
+        batches.runs.iter().map(|run| (run.kind, run.base, run.count)).collect()
+    }
+
+    fn row(display: &mut DisplayList, y: f64, word: &str) {
+        display.push(DrawCommand::FillRect {
+            rect: Rect {
+                origin: crate::layout::Point { x: 0.0, y },
+                size: crate::layout::Size { width: 300.0, height: 20.0 },
+            },
+            color: Color::rgba(30, 30, 40, 255),
+            corner_radius: Corners::ZERO,
+        });
+        display.push(DrawCommand::TextLine {
+            origin: crate::layout::Point { x: 4.0, y: y + 2.0 },
+            content: std::sync::Arc::from(word),
+            range: (0, word.len()),
+            color: Color::rgba(240, 240, 240, 255),
+            font: FontSpec::DEFAULT,
+        });
+    }
+
+    #[test]
+    fn rows_that_do_not_touch_fold_into_one_run_of_each_kind() {
+        let mut display = DisplayList::default();
+        for at in 0..10 {
+            row(&mut display, at as f64 * 24.0, "row");
+        }
+        let runs = walk_runs(&display);
+        assert_eq!(runs.len(), 2, "every background in one run, every label in another: {runs:?}");
+        assert_eq!(runs[0], (RunKind::Rects, 0, 10));
+        assert_eq!(runs[1].0, RunKind::Sprites);
+    }
+
+    #[test]
+    fn a_rect_over_earlier_text_keeps_its_place_in_paint_order() {
+        let mut display = DisplayList::default();
+        row(&mut display, 0.0, "under");
+        // a veil over the label: it must be drawn after it
+        display.push(DrawCommand::FillRect {
+            rect: Rect {
+                origin: crate::layout::Point { x: 0.0, y: 0.0 },
+                size: crate::layout::Size { width: 300.0, height: 20.0 },
+            },
+            color: Color::rgba(0, 0, 0, 128),
+            corner_radius: Corners::ZERO,
+        });
+        let runs = walk_runs(&display);
+        assert_eq!(runs.len(), 3, "rect, label, then the veil: {runs:?}");
+        assert_eq!(runs[0], (RunKind::Rects, 0, 1));
+        assert_eq!(runs[1].0, RunKind::Sprites);
+        assert_eq!(runs[2], (RunKind::Rects, 1, 1));
     }
 
     #[test]
