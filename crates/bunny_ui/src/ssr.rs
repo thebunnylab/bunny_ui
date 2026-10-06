@@ -563,6 +563,12 @@ impl Tree {
                     }
                 }
             }
+            DomPatch::SetLanguage { id, lang, dir } => {
+                if let Some(element) = self.elements.get_mut(id) {
+                    element.attrs.insert("lang", lang.to_string());
+                    element.attrs.insert("dir", if dir.is_rtl() { "rtl" } else { "ltr" }.to_string());
+                }
+            }
             DomPatch::SetScroll { .. }
             | DomPatch::SetIcon { .. }
             | DomPatch::Reveal { .. }
@@ -817,6 +823,13 @@ fn rule_text(
     if let Some((top, trailing, bottom, leading)) = layout.padding {
         base.insert("padding-block", format!("{} {}", px(top), px(bottom)));
         base.insert("padding-inline", format!("{} {}", px(leading), px(trailing)));
+    }
+    // an island that reads the other way: the browser orders its rows,
+    // aligns its `start` and shapes its words that way, isolated from
+    // the text around it
+    if let Some(direction) = layout.direction {
+        base.insert("direction", if direction.is_rtl() { "rtl" } else { "ltr" }.into());
+        base.insert("unicode-bidi", "isolate".into());
     }
     if layout.grow {
         // the flexible child — and the classic flex footgun: a zeroed
@@ -1157,6 +1170,49 @@ mod tests {
         assert!(rule(Some(TextAlignment::Center)).contains("text-align:center"));
     }
 
+    /// A served page's mount wears its language and the way it reads:
+    /// English and left to right by default, Arabic and right to left
+    /// when the runtime says so.
+    #[test]
+    fn the_mount_wears_the_language_and_the_direction() {
+        let size = Size { width: 300.0, height: 200.0 };
+        let page = render(&Page { on: State::new(false) }, size);
+        assert!(page.html.contains("lang=\"en\""), "{}", page.html);
+        assert!(page.html.contains("dir=\"ltr\""), "{}", page.html);
+    }
+
+    /// An island that reads the other way carries its own `direction`
+    /// in its rule, isolated.
+    #[test]
+    fn an_rtl_island_sets_its_own_dir() {
+        let layout = crate::dom::DomLayout {
+            direction: Some(LayoutDirection::RightToLeft),
+            ..crate::dom::DomLayout::default()
+        };
+        let rule = rule_text(
+            "k",
+            crate::dom::CreateKind::Box,
+            false,
+            &crate::dom::DomLook::default(),
+            &layout,
+            None,
+        );
+        assert!(rule.contains("direction:rtl"), "{rule}");
+        assert!(rule.contains("unicode-bidi:isolate"), "{rule}");
+        let plain = rule_text(
+            "k",
+            crate::dom::CreateKind::Box,
+            false,
+            &crate::dom::DomLook::default(),
+            &crate::dom::DomLayout::default(),
+            None,
+        );
+        assert!(
+            !plain.contains("direction:ltr") && !plain.contains("unicode-bidi"),
+            "a box that inherits says nothing: {plain}"
+        );
+    }
+
     /// The page and the glue write one CSS: the logical names the page
     /// uses are the ones the glue spells, and neither says a side.
     #[test]
@@ -1168,6 +1224,8 @@ mod tests {
         assert!(glue.contains("decl[\"text-align\"] = \"end\""), "the glue aligns to end");
         assert!(!glue.contains("decl[\"text-align\"] = \"right\""), "and never to right");
         assert!(!glue.contains("decl.padding ="), "and writes no physical padding");
+        assert!(glue.contains("decl.direction ="), "the glue writes an island's direction");
+        assert!(glue.contains("decl[\"unicode-bidi\"] = \"isolate\""), "isolated");
     }
 
     #[derive(Clone)]
