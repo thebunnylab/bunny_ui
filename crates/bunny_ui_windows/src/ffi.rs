@@ -346,6 +346,12 @@ unsafe extern "system" {
     fn GlobalFree(handle: Handle) -> Handle;
     fn GlobalSize(handle: Handle) -> usize;
     fn Sleep(milliseconds: u32);
+    fn GetUserPreferredUILanguages(
+        flags: u32,
+        count: *mut u32,
+        buffer: *mut u16,
+        size: *mut u32,
+    ) -> i32;
 }
 
 #[link(name = "dwmapi", kind = "raw-dylib")]
@@ -1050,6 +1056,38 @@ pub fn animations_enabled() -> bool {
         );
     }
     enabled != 0
+}
+
+/// The display languages the person set, best first — the system's own
+/// list (`GetUserPreferredUILanguages`), read as BCP-47 names; English
+/// when the call refuses.
+pub fn preferred_locale() -> bunny_ui::prelude::Locale {
+    use bunny_ui::prelude::Locale;
+    /// `MUI_LANGUAGE_NAME`: the names ("pt-BR"), not the identifiers.
+    const MUI_LANGUAGE_NAME: u32 = 0x8;
+    let mut count = 0u32;
+    let mut size = 0u32;
+    // the length first, then the list: one buffer of NUL-separated
+    // names, closed by a second NUL
+    let asked = unsafe {
+        GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &mut count, std::ptr::null_mut(), &mut size)
+    };
+    if asked == 0 || size == 0 {
+        return Locale::default();
+    }
+    let mut buffer = vec![0u16; size as usize];
+    let filled = unsafe {
+        GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &mut count, buffer.as_mut_ptr(), &mut size)
+    };
+    if filled == 0 {
+        return Locale::default();
+    }
+    let names: Vec<String> = buffer[..(size as usize).min(buffer.len())]
+        .split(|&unit| unit == 0)
+        .filter(|name| !name.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect();
+    Locale::parse(&names.join(","))
 }
 
 // MARK: - Scene chrome (the window draws its own crown)
