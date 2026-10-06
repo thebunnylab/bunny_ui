@@ -1904,11 +1904,9 @@ impl Runtime {
         let Some(split) = placement else {
             return false;
         };
-        let (pointer_main, origin_main) = match split.axis {
-            crate::layout::Axis::Horizontal => (x, split.frame.origin.x),
-            crate::layout::Axis::Vertical => (y, split.frame.origin.y),
-        };
-        // the pointer names lane A's extent in POINTS; what the binding
+        // the pointer names lane A's extent in POINTS — counted from the
+        // frame's leading edge, which is its right one in a right-to-left
+        // scene, where lane A stands at the right; what the binding
         // holds is whatever unit the seam speaks, so the clamp runs in
         // that unit and the write-back is already in it
         //
@@ -1916,7 +1914,13 @@ impl Runtime {
         // pointer still lands where it lands and the app is holding the
         // OTHER side of it: the reach is mirrored across the room, and
         // the floors swap with it.
-        let reached = pointer_main - origin_main;
+        let reached = match split.axis {
+            crate::layout::Axis::Horizontal if split.direction.is_rtl() => {
+                split.frame.origin.x + split.frame.size.width - x
+            }
+            crate::layout::Axis::Horizontal => x - split.frame.origin.x,
+            crate::layout::Axis::Vertical => y - split.frame.origin.y,
+        };
         let (reached, near, far) = if split.trailing {
             ((split.room - reached).max(0.0), split.min_b, split.min_a)
         } else {
@@ -1936,14 +1940,17 @@ impl Runtime {
         reconciler::run_split(path, at)
     }
 
-    /// The thumb's geometry, in the axis it travels: `(track start,
-    /// track length, thumb length, travel, max offset)`. The mirror of
+    /// The thumb's geometry, in the axis it travels: `(the thumb's head
+    /// at offset zero, thumb length, travel, max offset, sign)` — the
+    /// head is `start + sign × travel × offset / max`. The sign is `-1`
+    /// for a horizontal thumb in a right-to-left region, where the thumb
+    /// starts at the right end and travels left. The mirror of
     /// `draw_scrollbar` — one formula, written twice on purpose would
     /// be a bug waiting, so this reads the SAME constants.
     fn thumb_geometry(
         region: &crate::layout::ScrollRegion,
         horizontal: bool,
-    ) -> Option<(Px, Px, Px, Px)> {
+    ) -> Option<(Px, Px, Px, Px, Px)> {
         let (extent, content) = match horizontal {
             true => (region.frame.size.width, region.content.width),
             false => (region.frame.size.height, region.content.height),
@@ -1959,11 +1966,18 @@ impl Runtime {
         let thumb = ((extent / content) * track)
             .max(crate::layout::SCROLLBAR_MIN)
             .min(track);
-        let start = match horizontal {
-            true => region.frame.origin.x,
-            false => region.frame.origin.y,
-        } + crate::layout::SCROLLBAR_INSET;
-        Some((start, thumb, (track - thumb).max(0.0), max))
+        let mirrored = horizontal && region.direction.is_rtl();
+        let start = match (horizontal, mirrored) {
+            (true, true) => {
+                region.frame.origin.x + region.frame.size.width
+                    - crate::layout::SCROLLBAR_INSET
+                    - thumb
+            }
+            (true, false) => region.frame.origin.x + crate::layout::SCROLLBAR_INSET,
+            (false, _) => region.frame.origin.y + crate::layout::SCROLLBAR_INSET,
+        };
+        let sign = if mirrored { -1.0 } else { 1.0 };
+        Some((start, thumb, (track - thumb).max(0.0), max, sign))
     }
 
     fn region_at(&self, path: &str) -> Option<crate::layout::ScrollRegion> {
@@ -1978,13 +1992,13 @@ impl Runtime {
             None => (target.strip_suffix("/#thumb-h")?, true),
         };
         let region = self.region_at(path)?;
-        let (start, thumb, travel, max) = Self::thumb_geometry(&region, horizontal)?;
+        let (start, thumb, travel, max, sign) = Self::thumb_geometry(&region, horizontal)?;
         let offset = self.scroll_offset(path);
         let along = match horizontal {
             true => offset.x,
             false => offset.y,
         };
-        let head = start + travel * (along / max);
+        let head = start + sign * travel * (along / max);
         let pointer = if horizontal { x } else { y };
         Some(crate::layout::ThumbDrag {
             path: path.to_string(),
@@ -2000,7 +2014,7 @@ impl Runtime {
         let Some(region) = self.region_at(&drag.path) else {
             return false;
         };
-        let Some((start, _, travel, max)) = Self::thumb_geometry(&region, drag.horizontal)
+        let Some((start, _, travel, max, sign)) = Self::thumb_geometry(&region, drag.horizontal)
         else {
             return false;
         };
@@ -2008,7 +2022,7 @@ impl Runtime {
             return false;
         }
         let pointer = if drag.horizontal { x } else { y };
-        let along = (((pointer - drag.grab) - start) / travel * max).clamp(0.0, max);
+        let along = (sign * ((pointer - drag.grab) - start) / travel * max).clamp(0.0, max);
         let current = self.scroll_offset(&drag.path);
         let next = match drag.horizontal {
             true => Point { x: along, y: current.y },
@@ -2976,6 +2990,10 @@ impl Runtime {
             // the wheel is sovereign: a reveal in flight dies here
             self.animator.borrow_mut().cancel_scroll(&region.path);
             let current = offsets.get(&region.path).copied().unwrap_or_default();
+            // the hand's turn is physical and the offset is logical: a
+            // turn that reveals what lies to the right reveals EARLIER
+            // content in a right-to-left region, so the offset shrinks
+            let dx = if region.direction.is_rtl() { -dx } else { dx };
             let next = Point {
                 x: (current.x - dx).clamp(0.0, max_x),
                 y: (current.y - dy).clamp(0.0, max_y),
@@ -6084,6 +6102,10 @@ impl Runtime {
             (region.content.width.round() - region.frame.size.width.round()).max(0.0);
         let travel_y =
             (region.content.height.round() - region.frame.size.height.round()).max(0.0);
+        // the shift is physical (the content moves left by `dx`) and the
+        // offset is logical: right to left, the content moves left as
+        // the offset SHRINKS
+        let dx = if region.direction.is_rtl() { -dx } else { dx };
         let next = Point {
             x: (current.x + dx).clamp(0.0, travel_x),
             y: (current.y + dy).clamp(0.0, travel_y),
