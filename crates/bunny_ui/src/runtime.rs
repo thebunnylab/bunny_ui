@@ -4948,6 +4948,7 @@ impl Runtime {
         let boxes = self.island_boxes.borrow();
         let flow = crate::dom_flow::FlowEnv {
             scroll_offsets: &*offsets,
+            direction: self.layout_direction(),
             size: (size.width, size.height),
             layout: Some(env),
             changed: &changed,
@@ -4981,6 +4982,12 @@ impl Runtime {
         let mut patches = dom.lower(output.scene, &output.display);
         if !dirty_bindings.is_empty() {
             patches.extend(dom.refresh_bindings(&dirty_bindings));
+        }
+        // the mount's language and direction, after everything else: the
+        // first frame always says them, a still frame never
+        let locale = self.locale();
+        if let Some(patch) = dom.note_language(locale.identifier(), self.layout_direction()) {
+            patches.push(patch);
         }
         patches
     }
@@ -5071,6 +5078,7 @@ impl Runtime {
         let boxes = self.island_boxes.borrow();
         let flow = crate::dom_flow::FlowEnv {
             scroll_offsets: &*offsets,
+            direction: self.layout_direction(),
             size: (size.width, size.height),
             layout: Some(env),
             changed: &changed,
@@ -5094,6 +5102,10 @@ impl Runtime {
         self.note_island_hits(&output.islands_walked, output.hits);
         dom.note_groups(output.groups);
         dom.adopt(output.scene, &output.display);
+        // the served mount already wears its language: noted, not sent,
+        // so the first frame says nothing about it either
+        let locale = self.locale();
+        let _ = dom.note_language(locale.identifier(), self.layout_direction());
     }
 
     /// A click resolved by the BROWSER: the glue walked up from the

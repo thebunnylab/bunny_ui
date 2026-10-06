@@ -28,6 +28,16 @@ sheet.sheet.insertRule(":where(#app) :where(ol,ul){list-style:none}", 4);
 sheet.sheet.insertRule(":where(#app) :where(a){color:inherit;text-decoration:none}", 5);
 
 let wasm = null;
+// Does the mount read right to left? Op 27 says, and a horizontal
+// scroll offset is logical on the wire: the browser reports scrollLeft
+// at or below zero under a right-to-left box, and the engine counts
+// from the content's leading edge either way
+let rtl = false;
+// Has any look carried a direction of its own? Then an island may read
+// the other way from the mount, and a scroller asks its own computed
+// style instead of the mount's flag
+let dirRules = false;
+const isRtl = (el) => (dirRules ? getComputedStyle(el).direction === "rtl" : rtl);
 let wakeArmed = false;
 let frameArmed = false;
 let lastFrame = 0;
@@ -37,7 +47,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 19;
+const EXPECTED_ABI = 20;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -464,6 +474,12 @@ function lookRules(selector, kind, flags, style, layout, face) {
     decl["padding-block"] = `${top}px ${bottom}px`;
     decl["padding-inline"] = `${leading}px ${trailing}px`;
   }
+  if (layout.direction !== null) {
+    // an island that reads the other way: the browser orders its rows,
+    // aligns its start and shapes its words that way, isolated
+    decl.direction = layout.direction === 1 ? "rtl" : "ltr";
+    decl["unicode-bidi"] = "isolate";
+  }
   if (layout.grow) {
     // the flexible child — and the classic flex footgun: a zeroed
     // min-size, or content refuses to shrink
@@ -690,7 +706,10 @@ function wireInput(input) {
 // A scroll box's reporting — shared by creation and hydration.
 function wireScroll(el, id) {
   el.addEventListener("scroll", () => {
-    wasm.bunny_dom_scroll(id, el.scrollLeft, el.scrollTop);
+    // the offset crosses logical: distance from the content's leading
+    // edge, which a right-to-left box reports as scrollLeft at or below zero
+    const left = isRtl(el) ? -el.scrollLeft : el.scrollLeft;
+    wasm.bunny_dom_scroll(id, left, el.scrollTop);
     repositionPopovers();
   });
   viewportObserver.observe(el);
@@ -938,6 +957,7 @@ function applyPatches(view, length) {
       fill: (mask & 1024) !== 0,
       wrap: null,
       plain: (mask & 4096) !== 0,
+      direction: null,
     };
     if (mask & 1) layout.gap = f32();
     if (mask & 2) layout.align = u8();
@@ -950,6 +970,11 @@ function applyPatches(view, length) {
     if (mask & 64) f32();
     if (mask & 256) f32();
     if (mask & 2048) layout.wrap = f32();
+    if (mask & 8192) {
+      // an island that reads the other way
+      layout.direction = u8();
+      dirRules = true;
+    }
     return layout;
   };
   const readFace = () => {
@@ -1284,7 +1309,10 @@ function applyPatches(view, length) {
       const x = f32();
       const y = f32();
       if (el) {
-        if (Math.abs(el.scrollLeft - x) >= 1) el.scrollLeft = x;
+        // the engine's offset is logical: the browser's left is its mirror
+        // under a right-to-left box
+        const left = isRtl(el) ? -x : x;
+        if (Math.abs(el.scrollLeft - left) >= 1) el.scrollLeft = left;
         if (Math.abs(el.scrollTop - y) >= 1) el.scrollTop = y;
       }
     } else if (op === 9) {
@@ -1480,6 +1508,17 @@ function applyPatches(view, length) {
         el.dataset.anchor = anchor;
         el.dataset.side = side;
         placePopover(el);
+      }
+    } else if (op === 27) {
+      // the element's language and the way it reads — the mount's: what
+      // the browser orders, aligns and shapes by, and a reader hears
+      const dir = u8();
+      const lang = text(u8());
+      const el = lookup(id);
+      if (el) {
+        el.setAttribute("lang", lang);
+        el.setAttribute("dir", dir === 1 ? "rtl" : "ltr");
+        if (el === app) rtl = dir === 1;
       }
     }
   }
