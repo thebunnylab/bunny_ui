@@ -331,6 +331,8 @@ pub struct Runtime {
     task_driver: Cell<bool>,
     /// Can the shell show a box's overlay on a layer of its own?
     overlay_layers: Cell<bool>,
+    /// Can the shell show a scrollbar's thumb on a layer of its own?
+    thumb_layers: Cell<bool>,
     /// When the task clock was last brought up to the wall.
     task_clock_last: Cell<Option<std::time::Instant>>,
     /// The size last HANDED to each measurement probe. A probe fires on
@@ -430,6 +432,9 @@ pub struct Runtime {
     /// press gate consults them.
     last_drag_regions: RefCell<Vec<Rect>>,
     last_control_regions: RefCell<Vec<(crate::layout::WindowControl, Rect)>>,
+    /// The thumbs the last layout took out of the scene for the shell's
+    /// layers.
+    last_thumbs: RefCell<Vec<crate::layout::Thumb>>,
     /// Where popovers may live, in layout coordinates. `None` = the
     /// viewport; the desktop shell sets the SCREEN — overflow becomes
     /// plain geometry.
@@ -1509,6 +1514,7 @@ impl Runtime {
             touch_fresh: Cell::new(false),
             task_driver: Cell::new(false),
             overlay_layers: Cell::new(false),
+            thumb_layers: Cell::new(false),
             task_clock_last: Cell::new(None),
             pending_aged: Cell::new(false),
             wheel_latch: RefCell::new(None),
@@ -1539,6 +1545,7 @@ impl Runtime {
             tooltip: RefCell::new(TooltipLife::default()),
             last_drag_regions: RefCell::new(Vec::new()),
             last_control_regions: RefCell::new(Vec::new()),
+            last_thumbs: RefCell::new(Vec::new()),
             overlay_bounds: Cell::new(None),
             dialog_frames: RefCell::new(HashMap::default()),
             open_alerts: RefCell::new(Vec::new()),
@@ -5448,6 +5455,21 @@ impl Runtime {
         self.overlay_layers.set(on);
     }
 
+    /// The shell says whether it can show a scrollbar's thumb on a layer
+    /// of its own, above the whole scene. On, a thumb that nothing covers
+    /// leaves the display list and [`Runtime::thumbs`] carries it instead:
+    /// a list that grew below the fold is then the same list, and the
+    /// frame is the layer moving. Read at the next layout.
+    pub fn set_thumb_layers(&self, on: bool) {
+        self.thumb_layers.set(on);
+    }
+
+    /// The thumbs the last layout left to the shell's layers, in paint
+    /// order — empty unless [`Runtime::set_thumb_layers`] is on.
+    pub fn thumbs(&self) -> Vec<crate::layout::Thumb> {
+        self.last_thumbs.borrow().clone()
+    }
+
     /// The boxes a write reached since the last frame, repainted on their
     /// own surfaces — the islands among them. The second answer says
     /// whether a box that is NO island was reached: that one needs the
@@ -6906,6 +6928,7 @@ impl Runtime {
         };
         self.cache.begin_frame();
         crate::layout::set_overlay_layers(self.overlay_layers.get());
+        crate::layout::set_thumb_layers(self.thumb_layers.get());
         // the animator's sweep clock follows PLACES, not ticks — this
         // pass's touches mark who is still mounted. A pass whose
         // proposal CHANGED is a resize: geometry moved because the
@@ -6982,6 +7005,7 @@ impl Runtime {
         self.last_drops.borrow_mut().clone_from(&result.drops);
         self.last_drag_regions.borrow_mut().clone_from(&result.drag_regions);
         self.last_control_regions.borrow_mut().clone_from(&result.control_regions);
+        self.last_thumbs.borrow_mut().clone_from(&result.thumbs);
         // an applied-target memory whose region left the scene goes
         // with it — live regions keep theirs (the wheel stays sovereign)
         self.scroll_targets

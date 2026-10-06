@@ -2799,6 +2799,21 @@ fn overlay_layers() -> bool {
     OVERLAY_LAYERS.with(|flag| flag.get())
 }
 
+thread_local! {
+    /// Can the shell show a scrollbar's thumb on a layer of its own? Set by
+    /// the runtime before each layout from the shell's word; off, every
+    /// thumb paints in the scene.
+    static THUMB_LAYERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn set_thumb_layers(on: bool) {
+    THUMB_LAYERS.with(|flag| flag.set(on));
+}
+
+fn thumb_layers() -> bool {
+    THUMB_LAYERS.with(|flag| flag.get())
+}
+
 /// The island path of a box's overlay: the box's own, with a last step.
 fn overlay_path(path: &str) -> String {
     format!("{path}/overlay")
@@ -2907,6 +2922,20 @@ impl DisplayList {
 
     pub(crate) fn push(&mut self, command: DrawCommand) {
         self.commands.push(command);
+    }
+
+    /// Takes out the commands at these indices, given in increasing order.
+    fn remove_sorted(&mut self, indices: &[usize]) {
+        let mut index = 0;
+        let mut gone = indices.iter().peekable();
+        self.commands.retain(|_| {
+            let keep = gone.peek() != Some(&&index);
+            if !keep {
+                gone.next();
+            }
+            index += 1;
+            keep
+        });
     }
 
     pub(crate) fn extend(&mut self, other: DisplayList) {
@@ -3878,6 +3907,11 @@ pub struct Placement {
     /// `paint` as "this frame happened", so the call is made and the
     /// commands go nowhere.
     unseen: DisplayList,
+    /// The thumbs may leave the scene for layers of their own — the
+    /// shell's word, on its own frames. The placement remembers where each
+    /// thumb it drew stands, and [`lift_thumbs`] decides after the walk.
+    thumb_layers: bool,
+    thumb_marks: Vec<usize>,
 }
 
 impl Placement {
@@ -4016,6 +4050,20 @@ impl Placement {
     fn current_clip(&self) -> Option<Rect> {
         self.clip.last().copied()
     }
+
+    /// A scrollbar's thumb joins the list like any fill; when the shell
+    /// layers thumbs, the placement remembers where it stands.
+    fn draw_thumb(&mut self, rect: Rect) {
+        let at = self.display.len();
+        self.draw(DrawCommand::FillRect {
+            rect,
+            color: crate::theme::current().scrollbar,
+            corner_radius: Corners::all(SCROLLBAR_W / 2.0),
+        });
+        if self.thumb_layers && self.display.len() > at {
+            self.thumb_marks.push(at);
+        }
+    }
 }
 
 impl Rect {
@@ -4108,6 +4156,23 @@ impl Frames {
     }
 }
 
+/// A scrollbar's thumb taken out of the scene for the shell to show on a
+/// layer of its own (`Runtime::set_thumb_layers`). A list that grows below
+/// the fold changes nothing on screen but its thumb; with the thumb on a
+/// layer the scene's list stays what it was, the presenter has no frame to
+/// paint, and moving the layer is the whole of the change — the way the
+/// platform's own scrollers move.
+///
+/// The rect the scene would have filled — window coordinates, top-left, in
+/// points — and the colour its pixels would have had there: the thumb over
+/// what it stands on, opaque.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Thumb {
+    pub rect: Rect,
+    pub color: Color,
+    pub radius: Px,
+}
+
 /// The result of the full pass: the size the root answered, the frames,
 /// the draw list and the interaction targets.
 #[derive(Debug)]
@@ -4166,6 +4231,9 @@ pub struct LayoutResult {
     /// the innermost target; siblings keep paint order, so the one
     /// drawn later still wins where they overlap.
     pub drops: Vec<DropRegion>,
+    /// The thumbs the shell shows on layers of its own, in paint order —
+    /// empty unless it asked for them.
+    pub thumbs: Vec<Thumb>,
 }
 
 /// Runs both phases from the root with the default environment — the
@@ -4306,7 +4374,11 @@ pub(crate) fn layout_placing(
     // must not shrink the room a popover positions in.
     let container =
         Rect { origin: Point { x: insets.leading, y: insets.top }, size: insets.inset(window).size };
-    let mut out = Placement { keep_unseen, ..Placement::default() };
+    let mut out = Placement {
+        keep_unseen,
+        thumb_layers: !keep_unseen && thumb_layers(),
+        ..Placement::default()
+    };
     out.safe = (insets != Edges::ZERO).then_some(SafeFrame { window, safe });
     crate::stats::time(crate::stats::Stage::Place, || root.place(safe, &fit, &env, &mut out));
     place_overlays(container, &env, &mut out);
@@ -4356,6 +4428,7 @@ pub(crate) fn layout_placing(
             "paranoid(seen): the cut moved something other than the draw list",
         );
     }
+    let thumbs = lift_thumbs(&mut out, &env);
     LayoutResult {
         size,
         frames: out.frames,
@@ -4378,7 +4451,309 @@ pub(crate) fn layout_placing(
         menus: out.menus,
         drag_sources: out.drag_sources,
         drops: out.drops,
+        thumbs,
     }
+}
+
+/// The thumbs a layer of their own shows exactly as the scene would, taken
+/// out of the list. A thumb qualifies when the window itself presents it
+/// (before the first popover, which presents on a surface of its own), when
+/// it stands whole inside the clip it was drawn under and clear of that
+/// clip's rounded corners, when nothing painted after it reaches its pixels
+/// — a layer sits above the whole scene, so whatever covered the thumb would
+/// end up under it — and when what it stands on is ONE colour: the window's
+/// floor, or fills that cover it whole. Its layer is then that colour with
+/// the thumb blended over it, opaque, byte for byte the pixel the scene
+/// would have painted; a translucent layer would be blended by the
+/// compositor in a space of its own, a shade off the scene's. Glass painted
+/// after a thumb disqualifies it (a pane samples the pixels around itself),
+/// and so does any native host in the frame (its view stacks with the layers
+/// by rules of its own). A thumb that does not qualify stays where it was
+/// drawn.
+///
+/// The lifted commands leave the list, and every range kept into it — the
+/// live boxes' slices, the popovers' — moves with them.
+fn lift_thumbs(out: &mut Placement, env: &LayoutEnv<'_>) -> Vec<Thumb> {
+    let marks = std::mem::take(&mut out.thumb_marks);
+    if marks.is_empty() || !out.hosts.is_empty() {
+        return Vec::new();
+    }
+    struct Candidate {
+        at: usize,
+        rect: Rect,
+        color: Color,
+        radius: Px,
+        /// The thumb's pixels — along its length, and across it.
+        along: (i64, i64),
+        across: (i64, i64),
+        vertical: bool,
+        /// What it stands on, along its length: runs of one colour each.
+        /// `None` once anything but fills across its whole width lands
+        /// under it.
+        ground: Option<Vec<(i64, i64, Color)>>,
+        clear: bool,
+    }
+    // the GPU's own snap: each edge of the scaled rect rounded on its own
+    let scale = env.scale.max(1.0);
+    let snap = |rect: Rect| {
+        (
+            (rect.origin.x * scale).round() as i64,
+            (rect.origin.y * scale).round() as i64,
+            ((rect.origin.x + rect.size.width) * scale).round() as i64,
+            ((rect.origin.y + rect.size.height) * scale).round() as i64,
+        )
+    };
+    let end = out
+        .overlays
+        .first()
+        .map_or(out.display.len(), |overlay| overlay.display.0)
+        .min(out.display.len());
+    let commands = &out.display.as_slice()[..end];
+    let floor = crate::theme::canvas();
+    let mut candidates: Vec<Candidate> = marks
+        .iter()
+        .filter(|&&at| at < end)
+        .filter_map(|&at| match &commands[at] {
+            DrawCommand::FillRect { rect, color, corner_radius } => {
+                let pixels = snap(*rect);
+                let vertical = rect.size.height >= rect.size.width;
+                let (along, across) = if vertical {
+                    ((pixels.1, pixels.3), (pixels.0, pixels.2))
+                } else {
+                    ((pixels.0, pixels.2), (pixels.1, pixels.3))
+                };
+                Some(Candidate {
+                    at,
+                    rect: *rect,
+                    color: *color,
+                    radius: corner_radius.max(),
+                    along,
+                    across,
+                    vertical,
+                    ground: Some(vec![(along.0, along.1, floor)]),
+                    clear: true,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    let customs = &out.customs;
+    let carved =
+        |index: usize| customs.iter().any(|custom| index >= custom.slice.0 && index < custom.slice.1);
+    let mut clips: Vec<(Rect, Corners)> = Vec::new();
+    for (index, command) in commands.iter().enumerate() {
+        match command {
+            DrawCommand::PushClip { rect, corner_radius } => {
+                clips.push((*rect, *corner_radius));
+                continue;
+            }
+            DrawCommand::PopClip => {
+                clips.pop();
+                continue;
+            }
+            _ => {}
+        }
+        let clip = clips.last().map(|(rect, _)| *rect);
+        for candidate in candidates.iter_mut().filter(|candidate| candidate.clear) {
+            let thumb = candidate.rect;
+            // whole inside the clip and clear of every curve over it
+            let open = || {
+                clip.is_none_or(|clip| rect_within(thumb, clip))
+                    && clips.iter().all(|(rect, corners)| clear_of_corners(thumb, *rect, *corners))
+            };
+            if index == candidate.at {
+                let one = candidate.ground.as_ref().is_some_and(|runs| runs.len() == 1);
+                candidate.clear = one && open() && !carved(index);
+                continue;
+            }
+            // a pane after the thumb samples around itself
+            if index > candidate.at && matches!(command, DrawCommand::Backdrop { .. }) {
+                candidate.clear = false;
+                continue;
+            }
+            let target = match clip {
+                Some(clip) => match thumb.intersection(clip) {
+                    Some(target) => target,
+                    None => continue,
+                },
+                None => thumb,
+            };
+            if !reaches(command, target, env) {
+                continue;
+            }
+            if index > candidate.at {
+                // painted over it
+                candidate.clear = false;
+                continue;
+            }
+            // under it: a fill across its whole width paints a stretch of
+            // its length; anything else mixes what it stands on
+            let crossed = match command {
+                DrawCommand::FillRect { rect, color, corner_radius }
+                    if clips.iter().all(|(rect, corners)| clear_of_corners(thumb, *rect, *corners))
+                        && clear_of_corners(thumb, *rect, *corner_radius) =>
+                {
+                    let fill = snap(*rect);
+                    let fill = match clip.map(snap) {
+                        Some(cut) => (fill.0.max(cut.0), fill.1.max(cut.1), fill.2.min(cut.2), fill.3.min(cut.3)),
+                        None => fill,
+                    };
+                    let (along, across) = if candidate.vertical {
+                        ((fill.1, fill.3), (fill.0, fill.2))
+                    } else {
+                        ((fill.0, fill.2), (fill.1, fill.3))
+                    };
+                    let touches = along.0 < candidate.along.1
+                        && along.1 > candidate.along.0
+                        && across.0 < candidate.across.1
+                        && across.1 > candidate.across.0;
+                    if !touches {
+                        continue;
+                    }
+                    (across.0 <= candidate.across.0 && across.1 >= candidate.across.1)
+                        .then_some((along, *color))
+                }
+                _ => None,
+            };
+            match (crossed, candidate.ground.as_mut()) {
+                (Some(((from, to), color)), Some(runs)) => paint_runs(runs, from, to, color),
+                _ => {
+                    candidate.ground = None;
+                    candidate.clear = false;
+                }
+            }
+        }
+    }
+    candidates.retain(|candidate| candidate.clear);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let lifted: Vec<usize> = candidates.iter().map(|candidate| candidate.at).collect();
+    out.display.remove_sorted(&lifted);
+    let moved = |index: usize| index - lifted.partition_point(|&at| at < index);
+    for custom in &mut out.customs {
+        custom.slice = (moved(custom.slice.0), moved(custom.slice.1));
+    }
+    for overlay in &mut out.overlays {
+        overlay.display = (moved(overlay.display.0), moved(overlay.display.1));
+    }
+    candidates
+        .into_iter()
+        .map(|candidate| Thumb {
+            rect: candidate.rect,
+            color: blend(
+                candidate.ground.and_then(|runs| runs.first().map(|run| run.2)).unwrap_or(floor),
+                candidate.color,
+            ),
+            radius: candidate.radius,
+        })
+        .collect()
+}
+
+/// A fill over the stretch `from..to` of a thumb's length: the runs under
+/// it take its colour (blended, when it is translucent), and neighbours of
+/// one colour merge — one run left is one ground.
+fn paint_runs(runs: &mut Vec<(i64, i64, Color)>, from: i64, to: i64, ink: Color) {
+    let mut painted = Vec::with_capacity(runs.len() + 2);
+    for &(start, end, under) in runs.iter() {
+        let (low, high) = (start.max(from), end.min(to));
+        if low >= high {
+            painted.push((start, end, under));
+            continue;
+        }
+        if start < low {
+            painted.push((start, low, under));
+        }
+        painted.push((low, high, if ink.a == 255 { ink } else { blend(under, ink) }));
+        if high < end {
+            painted.push((high, end, under));
+        }
+    }
+    painted.dedup_by(|later, earlier| {
+        let joins = earlier.2 == later.2 && earlier.1 == later.0;
+        if joins {
+            earlier.1 = later.1;
+        }
+        joins
+    });
+    *runs = painted;
+}
+
+/// Can `command` put ink inside `target`? [`DrawCommand::may_reach`], with
+/// two answers made exact: a line of text reaches as far as it measures, not
+/// to the window's edge, and a stroke paints its band, not the box inside it.
+fn reaches(command: &DrawCommand, target: Rect, env: &LayoutEnv<'_>) -> bool {
+    if !command.may_reach(target) {
+        return false;
+    }
+    match command {
+        DrawCommand::TextLine { origin, content, range, font, .. } => {
+            let metrics = env.cache.get_or_measure(&content[range.0..range.1], font, env.text);
+            // two points of slack each way: measure and raster round apart
+            let ink = Rect {
+                origin: Point { x: origin.x - 2.0, y: origin.y - 2.0 },
+                size: Size { width: metrics.width + 4.0, height: metrics.height() + 4.0 },
+            };
+            ink.intersection(target).is_some()
+        }
+        DrawCommand::StrokeRect { rect, width, corner_radius, .. } => {
+            let inset = width / 2.0 + 1.0;
+            let inner = Rect {
+                origin: Point { x: rect.origin.x + inset, y: rect.origin.y + inset },
+                size: Size {
+                    width: rect.size.width - 2.0 * inset,
+                    height: rect.size.height - 2.0 * inset,
+                },
+            };
+            inner.is_empty()
+                || !rect_within(target, inner)
+                || !clear_of_corners(target, *rect, *corner_radius)
+        }
+        _ => true,
+    }
+}
+
+/// `over` painted on `ground` the way the GPU blends a fill: straight
+/// alpha, rounded to the byte — the scene's own pixel.
+fn blend(ground: Color, over: Color) -> Color {
+    let alpha = over.a as u32;
+    let mix = |under: u8, ink: u8| ((ink as u32 * alpha + under as u32 * (255 - alpha) + 127) / 255) as u8;
+    Color { r: mix(ground.r, over.r), g: mix(ground.g, over.g), b: mix(ground.b, over.b), a: 255 }
+}
+
+/// Is `inner` whole inside `outer`?
+fn rect_within(inner: Rect, outer: Rect) -> bool {
+    inner.origin.x >= outer.origin.x
+        && inner.origin.y >= outer.origin.y
+        && inner.origin.x + inner.size.width <= outer.origin.x + outer.size.width
+        && inner.origin.y + inner.size.height <= outer.origin.y + outer.size.height
+}
+
+/// Does `rect` stay out of the squares a rounded clip cuts its corners
+/// from? Inside them the curve may take pixels the rect would paint.
+fn clear_of_corners(rect: Rect, clip: Rect, corners: Corners) -> bool {
+    if corners.is_zero() {
+        return true;
+    }
+    let (left, top) = (clip.origin.x, clip.origin.y);
+    let (right, bottom) = (left + clip.size.width, top + clip.size.height);
+    let squares = [
+        (corners.top_left, left, top, left + corners.top_left, top + corners.top_left),
+        (corners.top_right, right - corners.top_right, top, right, top + corners.top_right),
+        (
+            corners.bottom_right,
+            right - corners.bottom_right,
+            bottom - corners.bottom_right,
+            right,
+            bottom,
+        ),
+        (corners.bottom_left, left, bottom - corners.bottom_left, left + corners.bottom_left, bottom),
+    ];
+    let (x0, y0) = (rect.origin.x, rect.origin.y);
+    let (x1, y1) = (x0 + rect.size.width, y0 + rect.size.height);
+    squares.iter().all(|&(radius, sx0, sy0, sx1, sy1)| {
+        radius <= 0.0 || x1 <= sx0 || x0 >= sx1 || y1 <= sy0 || y0 >= sy1
+    })
 }
 
 /// Runs both phases WITH the Dom capture on: the same walk, plus the
@@ -4426,6 +4801,7 @@ pub fn layout_dom(
             menus: out.menus,
             drag_sources: out.drag_sources,
             drops: out.drops,
+            thumbs: Vec::new(),
         },
         scene,
     )
@@ -8488,13 +8864,9 @@ fn draw_scrollbar(
     } else {
         frame.origin.x + frame.size.width - SCROLLBAR_INSET - SCROLLBAR_W
     };
-    out.draw(DrawCommand::FillRect {
-        rect: Rect {
-            origin: Point { x: thumb_x, y: thumb_y },
-            size: Size { width: SCROLLBAR_W, height: thumb_h },
-        },
-        color: crate::theme::current().scrollbar,
-        corner_radius: Corners::all(SCROLLBAR_W / 2.0),
+    out.draw_thumb(Rect {
+        origin: Point { x: thumb_x, y: thumb_y },
+        size: Size { width: SCROLLBAR_W, height: thumb_h },
     });
     // the grab band, over the paint and pushed AFTER the content: the
     // reverse hit walk finds it first, and the thumb is draggable
@@ -8549,13 +8921,9 @@ fn draw_scrollbar_h(
         frame.origin.x + SCROLLBAR_INSET + along
     };
     let thumb_y = frame.origin.y + frame.size.height - SCROLLBAR_INSET - SCROLLBAR_W;
-    out.draw(DrawCommand::FillRect {
-        rect: Rect {
-            origin: Point { x: thumb_x, y: thumb_y },
-            size: Size { width: thumb_w, height: SCROLLBAR_W },
-        },
-        color: crate::theme::current().scrollbar,
-        corner_radius: Corners::all(SCROLLBAR_W / 2.0),
+    out.draw_thumb(Rect {
+        origin: Point { x: thumb_x, y: thumb_y },
+        size: Size { width: thumb_w, height: SCROLLBAR_W },
     });
     if let Some(path) = path {
         let band = Rect {
