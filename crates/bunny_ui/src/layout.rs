@@ -931,7 +931,10 @@ pub enum LayoutNode {
         /// The offset the APP is holding, read at render — `Some` only
         /// when the region was given a binding. It is the value, the
         /// way a split carries `at`; the writer that sends a move back
-        /// is retained beside it.
+        /// is retained beside it. An offset counts from the content's
+        /// LEADING edge: `x` zero shows the start of a strip whichever
+        /// way it reads, so an app's number means the same in a
+        /// right-to-left scene.
         commanded: Option<Point>,
         /// The child is at least as big as the VIEWPORT on the scrolling
         /// axes, however little content it holds.
@@ -2388,7 +2391,8 @@ pub struct Interaction {
 pub struct ThumbDrag {
     pub path: String,
     pub horizontal: bool,
-    /// Distance from the thumb's leading edge to the press.
+    /// Distance from the thumb's left (or top) edge to the press — a
+    /// physical measure, whichever way the region reads.
     pub grab: Px,
 }
 
@@ -3087,6 +3091,11 @@ pub struct ScrollRegion {
     /// A variable-height region's prefix-sum offsets (`offsets[i]` =
     /// row `i`'s start; last entry = total) — snapshot material too.
     pub row_offsets: Option<Rc<Vec<Px>>>,
+    /// Which way the region reads. The horizontal offset counts from
+    /// the content's leading edge either way; right to left that edge
+    /// is the right one, so the wheel's and the thumb's physical moves
+    /// change the offset the other way round.
+    pub direction: LayoutDirection,
 }
 
 /// What SURFACE a modal layer asks the shell for.
@@ -3510,6 +3519,10 @@ pub struct SplitPlacement {
     /// Which lane the seam names — see [`LayoutNode::Split`]. The drag
     /// reads it so the pointer writes back the lane the app is holding.
     pub trailing: bool,
+    /// Which way the lanes read: right to left, lane A stands at the
+    /// right and the pointer's reach is counted from the frame's right
+    /// edge.
+    pub direction: LayoutDirection,
 }
 
 /// A placed escape hatch — what the runtime needs to route an event
@@ -6637,12 +6650,14 @@ impl LayoutNode {
                 // THIS, never by the frame (the divider is not room)
                 let room = (lane_main(0) + lane_main(2)).max(0.0);
                 // lanes in measure order: A, divider, B — each filling
-                // the frame's cross extent
+                // the frame's cross extent, from the leading edge (the
+                // right one in a right-to-left scene: lane A stands there)
+                let rtl = *axis == Axis::Horizontal && env.rtl();
                 let mut cursor = 0.0;
                 for (child, (size, fit)) in children.iter().zip(fits) {
                     let (origin, lane) = match axis {
                         Axis::Horizontal => (
-                            Point { x: frame.origin.x + cursor, y: frame.origin.y },
+                            Point { x: leading_x(frame, cursor, size.width, rtl), y: frame.origin.y },
                             Size { width: size.width, height: frame.size.height },
                         ),
                         Axis::Vertical => (
@@ -6664,7 +6679,11 @@ impl LayoutNode {
                     match axis {
                         Axis::Horizontal => Rect {
                             origin: Point {
-                                x: frame.origin.x + center - SPLIT_GRIP / 2.0,
+                                x: if rtl {
+                                    frame.origin.x + frame.size.width - center - SPLIT_GRIP / 2.0
+                                } else {
+                                    frame.origin.x + center - SPLIT_GRIP / 2.0
+                                },
                                 y: frame.origin.y,
                             },
                             size: Size { width: SPLIT_GRIP, height: frame.size.height },
@@ -6694,6 +6713,7 @@ impl LayoutNode {
                     min_a: *min_a,
                     min_b: *min_b,
                     trailing: *trailing,
+                    direction: env.direction,
                 });
             }
 
@@ -6820,8 +6840,16 @@ impl LayoutNode {
                 let offset =
                     Point { x: raw.x.clamp(0.0, max_x), y: raw.y.clamp(0.0, max_y) };
                 out.push_clip(frame, 0.0);
+                // the offset counts from the content's LEADING edge: zero
+                // shows its start, which right to left is its right end
+                // — the content hangs out past the frame's left edge and
+                // travels right as the offset grows
                 let content_origin = Point {
-                    x: frame.origin.x - offset.x,
+                    x: if env.rtl() {
+                        frame.origin.x + frame.size.width - content.width + offset.x
+                    } else {
+                        frame.origin.x - offset.x
+                    },
                     y: frame.origin.y - offset.y,
                 };
                 // animated origins below anchor to the content box —
@@ -6853,6 +6881,7 @@ impl LayoutNode {
                         anim: env.anim.map(|scope| scope.spec),
                         row_extent,
                         row_offsets,
+                        direction: env.direction,
                     });
                 }
                 if let Some(dom) = out.dom.as_mut() {
@@ -6900,6 +6929,7 @@ impl LayoutNode {
                         content.height,
                         offset.y,
                         max_y,
+                        env.rtl(),
                         out,
                     );
                 }
@@ -6910,6 +6940,7 @@ impl LayoutNode {
                         content.width,
                         offset.x,
                         max_x,
+                        env.rtl(),
                         out,
                     );
                 }
@@ -8143,15 +8174,17 @@ pub(crate) const FIELD_RADIUS: Px = 5.0;
 const FIELD_CARET_W: Px = 1.5;
 
 /// The region's thumb — draw-only at this stage (drag arrives with
-/// pointer capture): 4px wide at 6px from the right edge, track with
-/// inset 6, floor of 24, proportional to the viewport — and it only
-/// exists when there is overflow (short content never gets a bar).
+/// pointer capture): 4px wide at 6px from the trailing edge (the right
+/// one, or the left one in a right-to-left scene), track with inset 6,
+/// floor of 24, proportional to the viewport — and it only exists when
+/// there is overflow (short content never gets a bar).
 fn draw_scrollbar(
     path: Option<&str>,
     frame: Rect,
     content_h: Px,
     offset_y: Px,
     max_y: Px,
+    rtl: bool,
     out: &mut Placement,
 ) {
     let track = frame.size.height - 2.0 * SCROLLBAR_INSET;
@@ -8161,7 +8194,11 @@ fn draw_scrollbar(
     let thumb_h = ((frame.size.height / content_h) * track).max(SCROLLBAR_MIN).min(track);
     let travel = track - thumb_h;
     let thumb_y = frame.origin.y + SCROLLBAR_INSET + travel * (offset_y / max_y);
-    let thumb_x = frame.origin.x + frame.size.width - SCROLLBAR_INSET - SCROLLBAR_W;
+    let thumb_x = if rtl {
+        frame.origin.x + SCROLLBAR_INSET
+    } else {
+        frame.origin.x + frame.size.width - SCROLLBAR_INSET - SCROLLBAR_W
+    };
     out.draw(DrawCommand::FillRect {
         rect: Rect {
             origin: Point { x: thumb_x, y: thumb_y },
@@ -8197,13 +8234,17 @@ fn clip_of(out: &Placement, rect: Rect) -> Option<Rect> {
     }
 }
 
-/// The vertical thumb, turned on its side.
+/// The vertical thumb, turned on its side. It travels from the leading
+/// end: right to left it starts at the right and moves left as the
+/// offset grows — the runtime's `thumb_geometry` is the same formula
+/// read back, so the two must move together.
 fn draw_scrollbar_h(
     path: Option<&str>,
     frame: Rect,
     content_w: Px,
     offset_x: Px,
     max_x: Px,
+    rtl: bool,
     out: &mut Placement,
 ) {
     let track = frame.size.width - 2.0 * SCROLLBAR_INSET;
@@ -8212,7 +8253,12 @@ fn draw_scrollbar_h(
     }
     let thumb_w = ((frame.size.width / content_w) * track).max(SCROLLBAR_MIN).min(track);
     let travel = track - thumb_w;
-    let thumb_x = frame.origin.x + SCROLLBAR_INSET + travel * (offset_x / max_x);
+    let along = travel * (offset_x / max_x);
+    let thumb_x = if rtl {
+        frame.origin.x + frame.size.width - SCROLLBAR_INSET - thumb_w - along
+    } else {
+        frame.origin.x + SCROLLBAR_INSET + along
+    };
     let thumb_y = frame.origin.y + frame.size.height - SCROLLBAR_INSET - SCROLLBAR_W;
     out.draw(DrawCommand::FillRect {
         rect: Rect {
@@ -8614,6 +8660,43 @@ mod tests {
                     layer: Box::new(fixed("badge", 8.0, 8.0)),
                     child: Box::new(fixed("host", 80.0, 40.0)),
                 },
+                LayoutNode::Frame {
+                    width: Some(240.0),
+                    height: Some(30.0),
+                    align: CrossAlign::Center,
+                    child: Box::new(LayoutNode::Scroll {
+                        commanded: None,
+                        axes: ScrollAxes::Horizontal,
+                        fill: false,
+                        path: Some("strip".into()),
+                        target: None,
+                        child: Box::new(boundary("strip_content", text(60))),
+                    }),
+                },
+                LayoutNode::Frame {
+                    width: Some(260.0),
+                    height: Some(40.0),
+                    align: CrossAlign::Center,
+                    child: Box::new(LayoutNode::Split {
+                        path: "seam".into(),
+                        axis: Axis::Horizontal,
+                        unit: SeamUnit::Points,
+                        at: SeamAt::Fixed(100.0),
+                        min_a: 50.0,
+                        min_b: 50.0,
+                        trailing: false,
+                        children: vec![
+                            boundary("lane_a", LayoutNode::Spacer),
+                            LayoutNode::Frame {
+                                width: Some(1.0),
+                                height: None,
+                                align: CrossAlign::Center,
+                                child: Box::new(LayoutNode::Spacer),
+                            },
+                            boundary("lane_b", LayoutNode::Spacer),
+                        ],
+                    }),
+                },
             ],
         );
         let width = 300.0;
@@ -8623,7 +8706,7 @@ mod tests {
         assert_eq!(ltr.size, rtl.size, "a direction changes no measure");
         let paths = [
             "r1", "r2", "r3", "pad", "padded", "framed", "f1", "f2", "f3", "f4", "under", "over",
-            "badge", "host",
+            "badge", "host", "strip_content", "lane_a", "lane_b",
         ];
         for path in paths {
             let (left, right) = (frame_of(&ltr, path), frame_of(&rtl, path));
@@ -8641,6 +8724,113 @@ mod tests {
             assert_eq!(path, twin);
             assert!((right.origin.x - (width - left.origin.x - left.size.width)).abs() < 1e-9, "{path}");
         }
+    }
+
+    /// A split's first lane is its leading one — at the right in a
+    /// right-to-left scene — and the grip rides the seam between them.
+    #[test]
+    fn a_split_puts_its_first_lane_on_the_right_and_the_grip_follows() {
+        let split = LayoutNode::Split {
+            path: "seam".into(),
+            axis: Axis::Horizontal,
+            unit: SeamUnit::Points,
+            at: SeamAt::Fixed(260.0),
+            min_a: 100.0,
+            min_b: 100.0,
+            trailing: false,
+            children: vec![
+                boundary("a", LayoutNode::Spacer),
+                LayoutNode::Frame {
+                    width: Some(1.0),
+                    height: None,
+                    align: CrossAlign::Center,
+                    child: Box::new(LayoutNode::Spacer),
+                },
+                boundary("b", LayoutNode::Spacer),
+            ],
+        };
+        let proposal = Proposal { width: Some(1200.0), height: Some(700.0) };
+        let result = layout_in(&split, proposal, LayoutDirection::RightToLeft);
+        let a = frame_of(&result, "a");
+        assert_eq!((a.origin.x, a.size.width), (940.0, 260.0), "lane A stands at the right");
+        let b = frame_of(&result, "b");
+        assert_eq!((b.origin.x, b.size.width), (0.0, 939.0), "lane B takes the rest, from the left");
+        let (path, grip) = result.hits.last().expect("the seam registers a grip").clone();
+        assert_eq!(path, "seam/#split");
+        assert!(grip.origin.x < 939.5 && 939.5 < grip.origin.x + grip.size.width, "the grip rides the seam");
+        assert_eq!(result.splits[0].direction, LayoutDirection::RightToLeft);
+    }
+
+    /// A horizontal region starts at its trailing edge in a right-to-left
+    /// scene: offset zero shows the content's leading end, its right one,
+    /// and the thumb stands at the right end of its track.
+    #[test]
+    fn horizontal_scroll_starts_at_the_trailing_edge_in_rtl() {
+        let region = LayoutNode::Frame {
+            width: Some(100.0),
+            height: Some(50.0),
+            align: CrossAlign::Center,
+            child: Box::new(LayoutNode::Scroll {
+                commanded: None,
+                axes: ScrollAxes::Horizontal,
+                fill: false,
+                path: Some("strip".into()),
+                target: None,
+                child: Box::new(boundary("content", text(40))),
+            }),
+        };
+        let proposal = Proposal { width: Some(100.0), height: Some(50.0) };
+        let ltr = layout(&region, proposal);
+        assert_eq!(frame_of(&ltr, "content").origin.x, 0.0);
+        let rtl = layout_in(&region, proposal, LayoutDirection::RightToLeft);
+        let content = frame_of(&rtl, "content");
+        assert_eq!(content.size.width, 320.0);
+        assert_eq!(content.origin.x, -220.0, "the content hangs out past the left edge, its start at the right");
+        let thumb = |result: &LayoutResult| {
+            result.hits.iter().find(|(path, _)| path == "strip/#thumb-h").expect("the thumb is a target").1
+        };
+        assert_eq!(thumb(&ltr).origin.x, SCROLLBAR_INSET, "left to right, the thumb starts at the left");
+        let mirrored = thumb(&rtl);
+        assert_eq!(mirrored.origin.x + mirrored.size.width, 100.0 - SCROLLBAR_INSET, "right to left, at the right");
+        assert_eq!(mirrored.size, thumb(&ltr).size);
+        assert_eq!(rtl.scrolls[0].direction, LayoutDirection::RightToLeft);
+    }
+
+    /// The vertical bar sits on the trailing edge: the left one in a
+    /// right-to-left scene.
+    #[test]
+    fn the_vertical_scrollbar_sits_on_the_left_in_rtl() {
+        let rows = (0..50).map(|_| text(1)).collect();
+        let region = LayoutNode::Frame {
+            width: Some(100.0),
+            height: Some(100.0),
+            align: CrossAlign::Center,
+            child: Box::new(LayoutNode::Scroll {
+                commanded: None,
+                axes: ScrollAxes::Vertical,
+                fill: false,
+                path: Some("list".into()),
+                target: None,
+                child: Box::new(stack(Axis::Vertical, CrossAlign::Start, rows)),
+            }),
+        };
+        let proposal = Proposal { width: Some(100.0), height: Some(100.0) };
+        let bar_x = |result: &LayoutResult| {
+            result
+                .display
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::FillRect { rect, .. }
+                        if rect.size.width == SCROLLBAR_W && rect.size.height > rect.size.width =>
+                    {
+                        Some(rect.origin.x)
+                    }
+                    _ => None,
+                })
+                .expect("the bar paints")
+        };
+        assert_eq!(bar_x(&layout(&region, proposal)), 100.0 - SCROLLBAR_INSET - SCROLLBAR_W);
+        assert_eq!(bar_x(&layout_in(&region, proposal, LayoutDirection::RightToLeft)), SCROLLBAR_INSET);
     }
 
     /// The contract on the other side: left to right is what it always

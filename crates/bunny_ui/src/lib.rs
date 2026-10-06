@@ -17020,6 +17020,123 @@ mod tests {
         );
     }
 
+    /// Three words in a horizontal strip, 240 wide, in a window of 100.
+    #[derive(Clone, Copy)]
+    struct Strip;
+    impl Component for Strip {
+        fn body(self, _ctx: &Context) -> impl View {
+            scroll(hstack!(text("aaaaaaaaaa"), text("bbbbbbbbbb"), text("cccccccccc")))
+                .horizontal()
+                .id("strip")
+        }
+    }
+
+    /// The wheel reveals the TRAILING content of a right-to-left strip:
+    /// the strip starts at the right, a turn toward the right has nothing
+    /// earlier to show, a turn toward the left shows the rest — and the
+    /// offset still counts from the leading edge.
+    #[test]
+    fn the_wheel_reveals_the_trailing_content_in_rtl() {
+        use crate::layout::{Proposal, Size};
+        let size = Size { width: 100.0, height: 50.0 };
+        let left_of = |runtime: &Runtime, word: &str| {
+            text_lefts(&runtime.display_frame(&Strip, size))
+                .into_iter()
+                .find(|(content, _)| content == word)
+                .map(|(_, x)| x)
+                .unwrap_or_else(|| panic!("{word} paints"))
+        };
+        let ltr = Runtime::new();
+        ltr.render_stable(&Strip);
+        let path = ltr.layout(&Strip, Proposal::exact(size)).scrolls[0].path.clone();
+        assert_eq!(left_of(&ltr, "aaaaaaaaaa"), 0.0, "left to right, the strip starts at the left");
+        assert!(ltr.wheel(50.0, 8.0, -40.0, 0.0), "a turn toward the right shows the rest");
+        assert_eq!(ltr.scroll_offset(&path).x, 40.0);
+        assert_eq!(left_of(&ltr, "aaaaaaaaaa"), -40.0);
+
+        let rtl = Runtime::new();
+        rtl.set_layout_direction(Some(LayoutDirection::RightToLeft));
+        rtl.render_stable(&Strip);
+        let _ = rtl.layout(&Strip, Proposal::exact(size));
+        assert_eq!(left_of(&rtl, "aaaaaaaaaa"), 20.0, "the first word ends at the right edge");
+        assert_eq!(left_of(&rtl, "cccccccccc"), -140.0, "the last hangs out past the left");
+        assert!(!rtl.wheel(50.0, 8.0, -40.0, 0.0), "a turn toward the right has nothing earlier to show");
+        assert_eq!(rtl.scroll_offset(&path).x, 0.0);
+        assert!(rtl.wheel(50.0, 8.0, 40.0, 0.0), "a turn toward the left shows the rest");
+        assert_eq!(rtl.scroll_offset(&path).x, 40.0, "and the offset counts from the leading edge");
+        assert_eq!(left_of(&rtl, "aaaaaaaaaa"), 60.0, "the strip moved right by it");
+    }
+
+    /// Dragging the horizontal thumb in a right-to-left strip moves the
+    /// content with the hand: the thumb starts at the right end, and a
+    /// pointer going left scrolls toward the trailing content.
+    #[test]
+    fn dragging_the_horizontal_thumb_in_rtl_moves_the_content_with_the_hand() {
+        use crate::layout::{Proposal, Size};
+        let runtime = Runtime::new();
+        runtime.set_layout_direction(Some(LayoutDirection::RightToLeft));
+        runtime.render_stable(&Strip);
+        let viewport = Proposal::exact(Size { width: 100.0, height: 50.0 });
+        let result = runtime.layout(&Strip, viewport);
+        let path = result.scrolls[0].path.clone();
+        let thumb = result
+            .hits
+            .iter()
+            .find(|(path, _)| path.ends_with("/#thumb-h"))
+            .expect("the thumb is a target")
+            .1;
+        assert_eq!(
+            thumb.origin.x + thumb.size.width,
+            100.0 - crate::layout::SCROLLBAR_INSET,
+            "the thumb starts at the right end of its track"
+        );
+        let (grab_x, y) = (thumb.origin.x + 4.0, thumb.origin.y + 2.0);
+        assert!(runtime.pointer_pressed(grab_x, y));
+        assert!(runtime.pointer_moved(grab_x - 1.0, y, false), "a point to the left is a step");
+        let after_one = runtime.scroll_offset(&path).x;
+        assert!(after_one > 0.0 && after_one < 50.0, "one point of thumb is a small step: {after_one}");
+        assert!(runtime.pointer_moved(-10_000.0, y, false));
+        assert_eq!(runtime.scroll_offset(&path).x, 140.0, "the far end is the far end");
+        assert_eq!(runtime.pointer_released(-10_000.0, y), None);
+    }
+
+    /// Dragging a split in a right-to-left scene writes the lane on the
+    /// right — the first one — as the pointer's distance from the
+    /// frame's right edge.
+    #[test]
+    fn dragging_a_split_in_rtl_writes_the_lane_on_the_right() {
+        use crate::layout::{Proposal, Size};
+        #[derive(Clone, Copy)]
+        struct Bench {
+            seam: State<f64>,
+        }
+        impl Component for Bench {
+            fn body(self, _ctx: &Context) -> impl View {
+                hsplit(self.seam.binding(), text("panel"), text("editor")).min_sizes(120.0, 200.0)
+            }
+        }
+        let bench = Bench { seam: State::new(260.0) };
+        let runtime = Runtime::new();
+        runtime.set_layout_direction(Some(LayoutDirection::RightToLeft));
+        runtime.render_stable(&bench);
+        let viewport = Proposal::exact(Size { width: 1200.0, height: 700.0 });
+        let grip_center = |result: &crate::layout::LayoutResult| {
+            let (_, grip) = result
+                .hits
+                .iter()
+                .find(|(path, _)| path.ends_with("/#split"))
+                .expect("the seam registers a grip");
+            grip.origin.x + grip.size.width / 2.0
+        };
+        let center = grip_center(&runtime.layout(&bench, viewport));
+        assert!((center - 939.5).abs() < 1.0, "the seam stands 260 from the RIGHT edge: {center}");
+        assert!(runtime.pointer_pressed(center, 300.0));
+        assert!(runtime.pointer_moved(800.0, 300.0, false));
+        assert_eq!(bench.seam.get(), 400.0, "the lane on the right is as wide as the pointer's reach from the right");
+        let moved = grip_center(&runtime.layout(&bench, viewport));
+        assert!((moved - 799.5).abs() < 1.0, "and the seam followed: {moved}");
+    }
+
     /// The shell's insets reach a BODY, and the keyboard's band stays its
     /// own number.
     ///
