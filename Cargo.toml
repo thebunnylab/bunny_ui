@@ -13,6 +13,7 @@ members = [
     "crates/bunny_ui_web",
     "crates/countries_core",
     "apps/countries_pure",
+    "apps/arena",
     "apps/finder_web",
     "apps/bench_web",
     "apps/landing_web",
