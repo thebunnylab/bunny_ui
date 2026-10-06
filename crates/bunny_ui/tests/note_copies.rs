@@ -2,9 +2,9 @@
 //!
 //! A note of a megabyte lives in the app's state. A field shows it,
 //! the caret follows it and the input method reads it after every frame;
-//! each of them used to take a copy of its own, six a stroke with the
-//! edit's. A stroke now copies the note twice: the edit changes a copy of
-//! the text it is handed, and the field turns the new text into the one
+//! each of them used to take a copy of its own, eight a stroke with the
+//! edit's. A stroke now copies the note once: the edit changes the text
+//! where the state keeps it, and the field turns the new text into the one
 //! shared allocation that the layout, the reads and the input method
 //! borrow alike. The count is of allocations at least the note's size:
 //! a copy of it, or a copy grown into a larger one — never the frame's
@@ -58,7 +58,7 @@ impl Component for Panel {
 }
 
 #[test]
-fn a_keystroke_in_a_long_note_copies_it_twice() {
+fn a_keystroke_in_a_long_note_copies_it_once() {
     let note: String = (0..40_000).map(|line| format!("line {line} of a long note\n")).collect();
     let size = note.len() as u64;
     NOTE.with(|note| note.set(size as usize));
@@ -79,11 +79,13 @@ fn a_keystroke_in_a_long_note_copies_it_twice() {
         assert_eq!(snapshot.text.len(), panel.note.with(String::len), "the snapshot is the note");
         copied() - before
     };
+    // the first stroke grows the state's string past its exact size; the
+    // strokes after it append within that room
     stroke("x");
     for at in 0..10 {
         let copied = stroke(if at % 2 == 0 { "y" } else { "z" });
         assert!(
-            copied <= 2 * (size + 64),
+            copied <= size + 64,
             "stroke {at} copied the note {:.1} times",
             copied as f64 / size as f64
         );
