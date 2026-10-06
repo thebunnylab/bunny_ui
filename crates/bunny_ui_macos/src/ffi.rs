@@ -2488,6 +2488,111 @@ impl WindowHandle {
         unsafe { msg_bool(self.view, sel("inLiveResize")) != 0 }
     }
 
+    /// Shows the thumbs the scene left to layers of their own
+    /// (`Runtime::set_thumb_layers`): one plain layer each, above
+    /// everything the window presents, painting nothing but its own
+    /// background. A thumb that did not move costs a comparison, one that
+    /// moved a frame set, and a layer with no thumb left hides. Each edge
+    /// lands on the device pixel the GPU rounds the scene's rect to;
+    /// `view_height` is the placing layout's height, as the live layers
+    /// take it.
+    pub fn thumb_layers(&self, thumbs: &[bunny_ui::layout::Thumb], view_height: f64, scale: usize) {
+        unsafe {
+            let root = msg_id(self.view, sel("layer"));
+            if root.is_null() {
+                return;
+            }
+            THUMB_LAYERS.with(|store| {
+                let mut store = store.borrow_mut();
+                let layers = store.entry(self.view as usize).or_default();
+                if thumbs.is_empty() && layers.iter().all(|layer| layer.shown.is_none()) {
+                    return;
+                }
+                without_actions(|| {
+                    // a view that changed its layer took the old one's
+                    // sublayers with it: these hang from the new one
+                    if let Some(first) = layers.first()
+                        && msg_id(first.layer, sel("superlayer")) != root
+                    {
+                        for entry in layers.iter() {
+                            msg_void_id(root, sel("addSublayer:"), entry.layer);
+                        }
+                    }
+                    let scale = scale.max(1) as f64;
+                    for (index, thumb) in thumbs.iter().enumerate() {
+                        if index == layers.len() {
+                            let layer = msg_id(class("CALayer"), sel("layer"));
+                            // ours until the process ends: a view that
+                            // goes leaves an orphan, never a dangling id
+                            msg_void(layer, sel("retain"));
+                            kill_layer_actions(layer);
+                            msg_void_u32(
+                                layer,
+                                sel("setAutoresizingMask:"),
+                                Self::LAYER_MIN_Y_MARGIN | Self::LAYER_MAX_X_MARGIN,
+                            );
+                            // above the patches and the live boxes: the
+                            // scene lifted the thumb only where nothing
+                            // after it paints over its pixels
+                            msg_void_f64(layer, sel("setZPosition:"), 1.0);
+                            msg_void_bool(layer, sel("setHidden:"), 1);
+                            msg_void_id(root, sel("addSublayer:"), layer);
+                            layers.push(ThumbLayer { layer, shown: None, color: None, radius: -1.0 });
+                        }
+                        let entry = &mut layers[index];
+                        let rect = thumb.rect;
+                        let x0 = (rect.origin.x * scale).round();
+                        let y0 = (rect.origin.y * scale).round();
+                        let x1 = ((rect.origin.x + rect.size.width) * scale).round();
+                        let y1 = ((rect.origin.y + rect.size.height) * scale).round();
+                        let (width, height) = ((x1 - x0) / scale, (y1 - y0) / scale);
+                        let frame = CGRect {
+                            origin: CGPoint { x: x0 / scale, y: view_height - y0 / scale - height },
+                            size: CGSize { width, height },
+                        };
+                        let was = entry.shown.replace(frame);
+                        if was.is_none_or(|was| {
+                            was.origin.x != frame.origin.x
+                                || was.origin.y != frame.origin.y
+                                || was.size.width != frame.size.width
+                                || was.size.height != frame.size.height
+                        }) {
+                            msg_void_rect(entry.layer, sel("setFrame:"), frame);
+                        }
+                        let radius = thumb.radius.min(width / 2.0).min(height / 2.0).max(0.0);
+                        if entry.radius != radius {
+                            entry.radius = radius;
+                            msg_void_f64(entry.layer, sel("setCornerRadius:"), radius);
+                        }
+                        if entry.color != Some(thumb.color) {
+                            entry.color = Some(thumb.color);
+                            let color = thumb.color;
+                            let space = CGColorSpaceCreateDeviceRGB();
+                            let components = [
+                                color.r as f64 / 255.0,
+                                color.g as f64 / 255.0,
+                                color.b as f64 / 255.0,
+                                color.a as f64 / 255.0,
+                            ];
+                            let cg = CGColorCreate(space, components.as_ptr());
+                            msg_void_id(entry.layer, sel("setBackgroundColor:"), cg);
+                            CGColorRelease(cg);
+                            CGColorSpaceRelease(space);
+                        }
+                        if was.is_none() {
+                            msg_void_bool(entry.layer, sel("setHidden:"), 0);
+                        }
+                    }
+                    for entry in layers.iter_mut().skip(thumbs.len()) {
+                        if entry.shown.take().is_some() {
+                            msg_void_bool(entry.layer, sel("setHidden:"), 1);
+                        }
+                    }
+                });
+            });
+        }
+    }
+
     /// Removes the layers of live boxes that left the scene.
     pub fn live_layer_sweep(&self, alive: &[String]) {
         LIVE_LAYERS.with(|layers| {
@@ -2889,6 +2994,9 @@ thread_local! {
     /// One sublayer per LIVE box, keyed by identity — the box's own
     /// presentation surface while its loop runs.
     static LIVE_LAYERS: RefCell<HashMap<String, LiveLayer>> = RefCell::new(HashMap::new());
+    /// The thumb layers of each view, by the view's address — reused in
+    /// paint order, hidden when the scene lifts fewer.
+    static THUMB_LAYERS: RefCell<HashMap<usize, Vec<ThumbLayer>>> = RefCell::new(HashMap::new());
     /// One platform view per HOST box, keyed by identity — the native
     /// content that composites above the scene.
     static HOST_VIEWS: RefCell<HashMap<String, HostSlot>> = RefCell::new(HashMap::new());
@@ -3324,6 +3432,21 @@ extern "C" fn bunny_cursor_update(_this: Id, _sel: Sel, _event: Id) {
     if let Some(cursor) = WANTED.with(Cell::get) {
         unsafe { msg_void(shape_of(cursor), sel("set")) };
     }
+}
+
+/// One thumb's layer and what it holds now — the frame (`None` while
+/// hidden), the colour and the radius it was last given.
+struct ThumbLayer {
+    layer: Id,
+    shown: Option<CGRect>,
+    color: Option<bunny_ui::layout::Color>,
+    radius: f64,
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGColorCreate(space: *mut c_void, components: *const f64) -> Id;
+    fn CGColorRelease(color: Id);
 }
 
 /// One live box's sublayer and its two alternating backings — the

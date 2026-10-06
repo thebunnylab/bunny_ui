@@ -1419,6 +1419,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 if !resizing {
                     window.live_layer_sweep(&runtime.live_paths());
                 }
+                // the thumbs the scene left to layers, on every frame —
+                // the one the presenter skipped included: a thumb that
+                // moved is all such a frame is
+                window.thumb_layers(&runtime.thumbs(), placed, scale);
             } else {
                 let mut slot = surface.borrow_mut();
                 let stale = match &*slot {
@@ -1539,7 +1543,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // frame the gate would have lost — `X what=missed-frame` on the tape
     // and a line on stderr. It is how the gate is proven on a real app.
     let frame_audit = std::env::var_os("BUNNY_FRAME_AUDIT").is_some();
-    let audit_last: Rc<RefCell<Option<bunny_ui::layout::DisplayList>>> = Rc::new(RefCell::new(None));
+    // the picture is the list AND the thumbs the scene left to layers
+    type Picture = (bunny_ui::layout::DisplayList, Vec<bunny_ui::layout::Thumb>);
+    let audit_last: Rc<RefCell<Option<Picture>>> = Rc::new(RefCell::new(None));
     let audit_expects_same = Rc::new(Cell::new(false));
     // the engine's stage timers ride the tape's clock: an `F` line for
     // each frame says where the time went BEFORE the present opened
@@ -1665,6 +1671,12 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     );
                 }
             }
+            // a scrollbar's thumb rides a layer of its own on the GPU road:
+            // a list that grew below the fold is then no frame to paint.
+            // While the window changes size the thumbs come home, as the
+            // live boxes do — a layer and the window frame land in
+            // different beats, and a drag shows the difference
+            runtime.set_thumb_layers(metal::active() && !window.in_live_resize());
             let display = runtime.display_frame(root, Size { width, height });
             if frame_stats {
                 let stats = bunny_ui::stats::take();
@@ -1715,13 +1727,16 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
             if frame_audit {
                 let mut last = audit_last.borrow_mut();
+                let thumbs = runtime.thumbs();
                 if audit_expects_same.replace(false)
-                    && last.as_ref().is_some_and(|last| last.as_slice() != display.as_slice())
+                    && last.as_ref().is_some_and(|(list, kept)| {
+                        list.as_slice() != display.as_slice() || *kept != thumbs
+                    })
                 {
                     trace::mark("X", format_args!("what=missed-frame"));
                     eprintln!("bunny_ui: FRAME AUDIT — a wake that asked for no frame changed the picture");
                 }
-                *last = Some(display.clone());
+                *last = Some((display.clone(), thumbs));
             }
             // this frame carries every ask that waited for it
             let asked = pacer.drew();
@@ -2356,6 +2371,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 blit(runtime, root, trace::Origin::Frame);
             } else if moved.scene {
                 let (width, height) = window.content_size();
+                runtime.set_thumb_layers(metal::active() && !window.in_live_resize());
                 let display = runtime.animation_frame(root, Size { width, height });
                 handler_present(runtime, display, trace::Origin::Frame);
                 // a spring or a fling moved content under a still hand
