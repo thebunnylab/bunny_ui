@@ -15,7 +15,7 @@ use std::cell::{Cell, RefCell};
 use motor::hash::FxHashMap as HashMap;
 use std::rc::Rc;
 
-use motor::state::{Context, EnvironmentValues};
+use motor::state::{Context, EnvironmentValues, LayoutDirection, Locale, SizeClass};
 
 use crate::action::{
     ALERT_CANCEL, ALERT_CONTEXT, ALERT_DEFAULT, ActionId, KeyPattern, OVERLAY_CONTEXT,
@@ -449,6 +449,15 @@ pub struct Runtime {
     /// The software keyboard's height over the window, 0 when hidden.
     /// It joins the bottom inset: content shrinks above the keys.
     keyboard_inset: Cell<Px>,
+    /// The languages the SHELL reports — the system's list. `None`
+    /// headless, or before the shell spoke.
+    system_locale: RefCell<Option<Locale>>,
+    /// The locale the APP pinned ([`Runtime::set_locale`]), over the
+    /// system's.
+    pinned_locale: RefCell<Option<Locale>>,
+    /// The direction the app pinned; `None` derives it from the locale
+    /// in effect.
+    pinned_direction: Cell<Option<LayoutDirection>>,
     /// The insets of the last layout — an inset change is a resize.
     last_insets: Cell<crate::layout::Edges>,
     /// The Dom mode's retained scene — [`Runtime::dom_frame`] diffs
@@ -746,16 +755,14 @@ impl Runtime {
         }
     }
 
-    /// How many PHYSICAL pixels one layout point covers — what the
-    /// shell reads from the screen (`2.0` on a retina display). It
-    /// reaches the app through [`crate::custom::PaintCtx::scale`], so
-    /// a box that draws parts which TOUCH can put the shared edge on
-    /// a whole pixel. The default is `1.0`.
-    /// Moves the environment every body reads — the shell's door for
-    /// what the platform decides at runtime: the size class on a
-    /// rotation, a locale change. The next pass rebuilds the retention
-    /// once (bodies baked the old values into the scene) and runs
-    /// incremental again; an update that changes nothing costs nothing.
+    /// Moves the environment every body reads — the general door for
+    /// what the platform decides at runtime. The next pass rebuilds the
+    /// retention once (bodies baked the old values into the scene) and
+    /// runs incremental again — whether or not the closure changed
+    /// anything, because the door cannot see inside it. The typed doors
+    /// ([`Runtime::set_size_class`], [`Runtime::set_system_locale`],
+    /// [`Runtime::set_safe_area`], …) compare first, so a report that
+    /// changes nothing costs nothing: prefer them.
     ///
     /// ```ignore
     /// runtime.set_environment(|values| values.horizontalSizeClass = SizeClass::Compact);
@@ -765,6 +772,91 @@ impl Runtime {
         // and every entry keeps the ones it ran in
         update(Rc::make_mut(&mut self.ctx.borrow_mut().values));
         self.env_moved.set(true);
+    }
+
+    /// The window's horizontal size class, as the shell reads it from
+    /// the platform's traits. Compared first: a rotation that keeps the
+    /// class rebuilds nothing. The answer says whether it moved.
+    pub fn set_size_class(&self, class: SizeClass) -> bool {
+        if self.ctx.borrow().values.horizontalSizeClass == class {
+            return false;
+        }
+        self.set_environment(|values| values.horizontalSizeClass = class);
+        true
+    }
+
+    /// The languages the system prefers, as the SHELL reports them —
+    /// the door every shell opens at mount, and again when the system's
+    /// list moves. The environment follows unless the app pinned a
+    /// locale ([`Runtime::set_locale`]); the direction follows the
+    /// locale unless pinned ([`Runtime::set_layout_direction`]). A
+    /// report that changes nothing costs nothing, and the answer says
+    /// whether anything moved — the shell's cue to present a frame.
+    pub fn set_system_locale(&self, locale: Locale) -> bool {
+        if self.system_locale.borrow().as_ref() == Some(&locale) {
+            return false;
+        }
+        *self.system_locale.borrow_mut() = Some(locale);
+        self.settle_locale()
+    }
+
+    /// The APP's choice: `Some` pins a locale over whatever the shell
+    /// reports — the language a person chose inside the app, or a seed
+    /// an example wants kept once a shell speaks — and `None` follows
+    /// the system again. The answer says whether the environment moved.
+    pub fn set_locale(&self, locale: Option<Locale>) -> bool {
+        if *self.pinned_locale.borrow() == locale {
+            return false;
+        }
+        *self.pinned_locale.borrow_mut() = locale;
+        self.settle_locale()
+    }
+
+    /// The locale in effect — the app's pin, else the system's report,
+    /// else what the environment was seeded with. A count, not a copy.
+    pub fn locale(&self) -> Locale {
+        self.ctx.borrow().values.locale.clone()
+    }
+
+    /// Pins the layout direction (`Some`), or lets the locale decide
+    /// again (`None`) — the knob a developer turns to see a scene
+    /// mirrored without changing its language. The answer says whether
+    /// the environment moved.
+    pub fn set_layout_direction(&self, direction: Option<LayoutDirection>) -> bool {
+        if self.pinned_direction.get() == direction {
+            return false;
+        }
+        self.pinned_direction.set(direction);
+        self.settle_locale()
+    }
+
+    /// The direction in effect — the pin, else the locale's own. What
+    /// every layout pass reads.
+    pub fn layout_direction(&self) -> LayoutDirection {
+        self.ctx.borrow().values.layoutDirection
+    }
+
+    /// Writes the locale and the direction in effect into the
+    /// environment — ONCE, together, and only when one of them moved.
+    fn settle_locale(&self) -> bool {
+        let wanted = {
+            let pinned = self.pinned_locale.borrow();
+            let system = self.system_locale.borrow();
+            pinned.clone().or_else(|| system.clone())
+        };
+        let mut ctx = self.ctx.borrow_mut();
+        // no pin and no report: the seed stands
+        let locale = wanted.unwrap_or_else(|| ctx.values.locale.clone());
+        let direction = self.pinned_direction.get().unwrap_or_else(|| locale.direction());
+        if ctx.values.locale == locale && ctx.values.layoutDirection == direction {
+            return false;
+        }
+        let values = Rc::make_mut(&mut ctx.values);
+        values.locale = locale;
+        values.layoutDirection = direction;
+        drop(ctx);
+        self.env_moved.set(true);
+        true
     }
 
     /// The window's safe area, in layout points: the shell mirrors the
@@ -844,6 +936,11 @@ impl Runtime {
         insets
     }
 
+    /// How many PHYSICAL pixels one layout point covers — what the
+    /// shell reads from the screen (`2.0` on a retina display). It
+    /// reaches the app through [`crate::custom::PaintCtx::scale`], so
+    /// a box that draws parts which TOUCH can put the shared edge on
+    /// a whole pixel. The default is `1.0`.
     pub fn set_device_scale(&self, scale: Px) {
         let scale = scale.max(1.0);
         if self.device_scale.get() != scale {
@@ -1332,7 +1429,16 @@ impl Runtime {
         Self::assembled(Some(name), ctx, text)
     }
 
-    fn assembled(scene: Option<Rc<str>>, ctx: Context, text: Rc<dyn TextEngine>) -> Self {
+    fn assembled(scene: Option<Rc<str>>, mut ctx: Context, text: Rc<dyn TextEngine>) -> Self {
+        // a seed that names only a locale takes the locale's direction;
+        // one that names a direction keeps it (nothing is shared yet, so
+        // the write copies nothing and moves no environment)
+        if ctx.values.layoutDirection == LayoutDirection::LeftToRight {
+            let direction = ctx.values.locale.direction();
+            if direction != ctx.values.layoutDirection {
+                Rc::make_mut(&mut ctx.values).layoutDirection = direction;
+            }
+        }
         let runtime = Runtime {
             ctx: RefCell::new(ctx),
             env_moved: Cell::new(false),
@@ -1423,6 +1529,9 @@ impl Runtime {
             device_scale: Cell::new(1.0),
             safe_area: Cell::new(crate::layout::Edges::ZERO),
             keyboard_inset: Cell::new(0.0),
+            system_locale: RefCell::new(None),
+            pinned_locale: RefCell::new(None),
+            pinned_direction: Cell::new(None),
             last_insets: Cell::new(crate::layout::Edges::ZERO),
             dom: RefCell::new(crate::dom::DomLowering::default()),
             root_boundary: RefCell::new(None),
