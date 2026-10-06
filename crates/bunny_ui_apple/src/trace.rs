@@ -12,6 +12,7 @@
 //! # bunny-trace v2 pid=<pid> t0=<unix_ms> tag=<tag>
 //! R <ms> <w>x<h> kind=<resize|move|backing> live=<0|1>
 //! P <ms> <w>x<h> live=<0|1> cmds=<n> via=<origin>
+//! G <ms> gpu=<ms>                   a completed frame's time on the GPU, read when its slot is taken again
 //! H <ms> dur=<ms> hosts=<n>
 //! O <ms> dur=<ms> panels=<n>
 //! M <ms> dur=<ms> sync=<0|1>
@@ -134,6 +135,12 @@ fn line(args: std::fmt::Arguments<'_>) {
 
 /// One line outside a present — the window callbacks (`R`) and the
 /// one-time costs (`X`).
+/// Is a tape being written? A caller with a cost to measure before it
+/// marks asks first.
+pub fn enabled() -> bool {
+    out().is_some()
+}
+
 pub fn mark(kind: &str, args: std::fmt::Arguments<'_>) {
     if !active() {
         return;
