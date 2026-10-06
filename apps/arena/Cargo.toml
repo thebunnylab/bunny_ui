@@ -1,0 +1,26 @@
+[package]
+name = "arena"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The arena's own apps: the scenes every framework is measured on, scripted, in a real window"
+
+[dependencies]
+bunny-ui = { path = "../../crates/bunny_ui", features = ["gpu"] }
+bunny-ui-macos = { path = "../../crates/bunny_ui_macos" }
+
+[[bin]]
+name = "arena_table"
+path = "src/bin/arena_table.rs"
+
+[[bin]]
+name = "arena_editor"
+path = "src/bin/arena_editor.rs"
+
+[[bin]]
+name = "arena_stream"
+path = "src/bin/arena_stream.rs"
+
+[[bin]]
+name = "arena_canvas"
+path = "src/bin/arena_canvas.rs"
