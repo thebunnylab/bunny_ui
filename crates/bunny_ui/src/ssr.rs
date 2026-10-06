@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 
 use crate::dom::{CreateKind, DomPatch};
 use crate::layout::{Color, Size};
+use motor::state::Locale;
 use crate::runtime::Runtime;
 use crate::view::View;
 
@@ -22,12 +23,31 @@ pub struct SsrPage {
     pub html: String,
     /// The looks the page wears, one rule each — and the targets' cursor.
     pub css: String,
+    /// The language the page was rendered in — the first tag of the
+    /// locale, what `<html lang>` wants; the mount wears it already.
+    pub lang: String,
+    /// Which way the page reads, as `<html dir>` spells it: `"ltr"` or
+    /// `"rtl"`; the mount wears it already.
+    pub dir: &'static str,
 }
 
-/// Renders `root` at `size` and serializes the mount — the same
-/// patches a browser would receive, applied to a toy tree here.
+/// Renders `root` at `size` in the default locale and serializes the
+/// mount — the same patches a browser would receive, applied to a toy
+/// tree here. [`render_in`] renders in a locale of the server's
+/// choosing.
 pub fn render(root: &impl View, size: Size) -> SsrPage {
+    render_in(root, size, &Locale::default())
+}
+
+/// [`render`] in `locale` — a server that read the request's
+/// `Accept-Language` passes `Locale::parse(header)`; the page is laid
+/// out in that locale's direction, its words resolve against it, and
+/// the mount wears its `lang` and `dir`. The glue sends the mount's own
+/// language before the start, so the adopt runs in the language the
+/// page was built in and only the reader's own report moves it.
+pub fn render_in(root: &impl View, size: Size, locale: &Locale) -> SsrPage {
     let runtime = Runtime::new();
+    runtime.set_locale(Some(locale.clone()));
     let patches = runtime.dom_frame(root, size);
     let mut tree = Tree::new(size);
     for patch in &patches {
@@ -45,20 +65,39 @@ pub fn render(root: &impl View, size: Size) -> SsrPage {
         ":where(#app) :where(a){color:inherit;text-decoration:none}".to_string(),
     ];
     css.extend(tree.rules.values().cloned());
-    SsrPage { html: tree.serialize_root(), css: css.join("\n") }
+    SsrPage {
+        html: tree.serialize_root(),
+        css: css.join("\n"),
+        lang: runtime.locale().identifier().to_string(),
+        dir: if runtime.layout_direction().is_rtl() { "rtl" } else { "ltr" },
+    }
 }
 
 /// A whole document: the page, its stylesheet, and the boot scripts.
 /// `wasm` names the binary the glue will fetch; the mount carries
 /// `data-hydrate` so the glue adopts instead of rebuilding.
 pub fn render_document(root: &impl View, size: Size, wasm: &str, glue: &str) -> String {
-    let page = render(root, size);
+    render_document_in(root, size, wasm, glue, &Locale::default())
+}
+
+/// [`render_document`] in `locale`: the document's root says the
+/// language and the direction too.
+pub fn render_document_in(
+    root: &impl View,
+    size: Size,
+    wasm: &str,
+    glue: &str,
+    locale: &Locale,
+) -> String {
+    let page = render_in(root, size, locale);
     format!(
-        "<!doctype html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"utf-8\" />\n    \
+        "<!doctype html>\n<html lang=\"{lang}\" dir=\"{dir}\">\n  <head>\n    <meta charset=\"utf-8\" />\n    \
          <style>\nhtml,body{{margin:0;height:100%;background:#101216;display:grid;place-items:center}}\n\
          #app{{position:relative;width:{width}px;height:{height}px;overflow:hidden}}\n{css}\n</style>\n  </head>\n  <body>\n    \
          {html}\n    <script>\n      window.BUNNY_WASM = \"{wasm}\";\n    </script>\n    \
          <script src=\"{glue}\"></script>\n  </body>\n</html>\n",
+        lang = page.lang,
+        dir = page.dir,
         width = size.width,
         height = size.height,
         css = page.css,
@@ -1259,6 +1298,65 @@ mod tests {
         assert!(first.html.contains("hello, prerender"));
         assert!(first.html.contains("display:flex"));
         assert!(!first.html.contains("position:absolute"), "a flow page ships in the flow");
+    }
+
+    /// A page rendered in a locale is laid out and worded in it, and says
+    /// so on its mount and its document root — Arabic reads right to left.
+    #[test]
+    fn a_served_page_in_arabic_is_already_rtl() {
+        let size = Size { width: 300.0, height: 200.0 };
+        let page = render_in(&Page { on: State::new(false) }, size, &Locale::new("ar"));
+        assert_eq!((page.lang.as_str(), page.dir), ("ar", "rtl"));
+        assert!(page.html.contains("lang=\"ar\""), "{}", page.html);
+        assert!(page.html.contains("dir=\"rtl\""), "{}", page.html);
+        let document = render_document_in(
+            &Page { on: State::new(false) },
+            size,
+            "page.wasm",
+            "glue_dom.js",
+            &Locale::parse("ar,en"),
+        );
+        assert!(document.contains("<html lang=\"ar\" dir=\"rtl\">"), "{document}");
+        let english = render(&Page { on: State::new(false) }, size);
+        assert_eq!((english.lang.as_str(), english.dir), ("en", "ltr"));
+        assert!(render_document(&Page { on: State::new(false) }, size, "w", "g").contains("<html lang=\"en\" dir=\"ltr\">"));
+    }
+
+    /// The locale a page is sealed in is the whole list's first tag.
+    #[test]
+    fn a_page_is_sealed_in_its_language() {
+        let size = Size { width: 300.0, height: 200.0 };
+        let page = render_in(&Page { on: State::new(false) }, size, &Locale::parse("pt-BR,en"));
+        assert_eq!((page.lang.as_str(), page.dir), ("pt-BR", "ltr"));
+        assert!(page.html.contains("lang=\"pt-BR\""));
+    }
+
+    /// A page served in Arabic is adopted in silence by a runtime that
+    /// speaks Arabic: the mount's language and direction are noted, not
+    /// sent again.
+    #[test]
+    fn an_adopted_page_keeps_its_language_in_silence() {
+        let size = Size { width: 300.0, height: 200.0 };
+        let built = Page { on: State::new(false) };
+        let runtime = Runtime::new();
+        runtime.set_locale(Some(Locale::new("ar")));
+        let mount = runtime.dom_frame(&built, size);
+        assert!(mount.iter().any(|patch| matches!(patch, DomPatch::SetLanguage { .. })));
+
+        let served = Page { on: State::new(false) };
+        let fresh = Runtime::new();
+        fresh.set_locale(Some(Locale::new("ar")));
+        fresh.dom_adopt(&served, size);
+        let first = fresh.dom_frame(&served, size);
+        assert!(first.is_empty(), "the adopted page is already true, language included: {first:?}");
+        // the reader's own report moves it: one patch on the mount
+        fresh.set_locale(None);
+        assert!(fresh.set_system_locale(Locale::new("en")));
+        let moved = fresh.dom_frame(&served, size);
+        assert!(
+            moved.iter().any(|patch| matches!(patch, DomPatch::SetLanguage { dir, .. } if !dir.is_rtl())),
+            "{moved:?}"
+        );
     }
 
     /// Hydration's other half: a fresh runtime adopts the same scene
