@@ -6592,6 +6592,14 @@ impl Runtime {
         // in this very frame, not in the one after — no body lays out a
         // window it has never seen
         self.note_viewport(proposal);
+        // a binding a write reached — a bound text, a split's seam — is
+        // read again where the layout meets it, and the measures kept
+        // above it were by the old value: every layout clears them, not
+        // only a frame's, so a probe's bare `layout` after a drag sees
+        // the seam where the hand left it
+        for key in crate::bind::settle_dirty() {
+            reconciler::clear_measures_above(&key);
+        }
         // STABLE boundary-root frame (hover, wheel, blink, the
         // post-settle layout): nothing dirty, same theme, retained
         // root — the walk would be all-skip and emit exactly ONE

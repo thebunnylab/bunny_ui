@@ -235,6 +235,20 @@ fn place_lazy<T: Clone + 'static>(eval: &Rc<dyn Fn() -> T>, suffix: &str) -> Res
     }
 }
 
+// MARK: - Seams
+
+/// A split's seam for its layout node: the binding is read once at
+/// render, under a probe. A reading that touched state becomes a binding
+/// the layout reads for itself on every frame — a drag writes the seam and
+/// the next frame lays out with it, no body between — and a reading that
+/// touched nothing is the number, fixed.
+pub(crate) fn seam_at(eval: Rc<dyn Fn() -> f64>) -> crate::layout::SeamAt {
+    match place_lazy(&eval, "#seam") {
+        Ok(bound) => crate::layout::SeamAt::Bound(bound),
+        Err(value) => crate::layout::SeamAt::Fixed(value),
+    }
+}
+
 // MARK: - Text
 
 thread_local! {

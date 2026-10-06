@@ -613,7 +613,13 @@ where
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
-        let at = self.at.wrappedValue().amount();
+        // the seam is read for the LAYOUT, not for this body: a drag
+        // writes it on every pointer move, and a body that read it here
+        // re-ran — with every body under it — before each frame
+        let binding = self.at.clone();
+        let eval: Rc<dyn Fn() -> f64> = Rc::new(move || binding.wrappedValue().amount());
+        let seam = crate::bind::seam_at(eval);
+        let at = seam.value();
         let mut nodes = NodeList::new();
         // the divider is an ORDINARY child (a themed 1pt strut): it
         // measures, paints and lowers like anything else on every target
@@ -690,7 +696,7 @@ where
                     path,
                     axis: self.axis,
                     unit: T::UNIT,
-                    at,
+                    at: seam,
                     min_a: self.min_a,
                     min_b: self.min_b,
                     trailing: self.trailing,

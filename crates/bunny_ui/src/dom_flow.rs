@@ -1065,7 +1065,8 @@ impl Walk<'_> {
                     }
                 }
             }
-            LayoutNode::Split { axis, at, children, .. } => {
+            LayoutNode::Split { axis, at: seam, children, .. } => {
+                let at = &seam.value();
                 let kind = match axis {
                     Axis::Horizontal => DomKind::FlexRow,
                     Axis::Vertical => DomKind::FlexColumn,
