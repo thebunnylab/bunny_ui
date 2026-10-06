@@ -358,7 +358,10 @@ pub enum SizeClass {
 /// exactly what it is, and a bottom sheet that stops above the home
 /// indicator is a sheet with a gap under it.
 ///
-/// Leading is the left edge.
+/// Stored as the window sees them: `leading` is the LEFT band. Read
+/// through the environment, leading follows the direction — a body in
+/// a right-to-left scene gets the right band as its `leading`, which is
+/// the side its content starts from.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct SafeAreaInsets {
     pub top: f64,
@@ -515,8 +518,16 @@ impl FromEnvironment for SizeClass {
 }
 
 impl FromEnvironment for SafeAreaInsets {
+    /// The window's bands in the BODY's direction: right to left, the
+    /// right band is the leading one. The stored value stays the
+    /// window's, so the shell writes it once however the scene reads.
     fn from_environment(values: &EnvironmentValues) -> Self {
-        values.safeAreaInsets
+        let insets = values.safeAreaInsets;
+        if values.layoutDirection.is_rtl() {
+            SafeAreaInsets { leading: insets.trailing, trailing: insets.leading, ..insets }
+        } else {
+            insets
+        }
     }
 }
 

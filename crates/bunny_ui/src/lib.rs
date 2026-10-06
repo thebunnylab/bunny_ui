@@ -17274,6 +17274,34 @@ mod tests {
         assert!(label > frame.origin.x + frame.size.width / 2.0, "and its label reads from the right");
     }
 
+    /// The window's bands are physical and a body's are its own: right to
+    /// left, the environment's `leading` inset is the right band, while
+    /// the root still stands inside the window's left one.
+    #[test]
+    fn the_environments_safe_area_swaps_leading_and_trailing_in_rtl() {
+        #[derive(Clone, Copy)]
+        struct Reader;
+        impl Component for Reader {
+            fn body(self, ctx: &Context) -> impl View {
+                let insets = ctx.environment::<SafeAreaInsets>();
+                hstack!(text!("{}:{}", insets.leading, insets.trailing), spacer())
+            }
+        }
+        let size = Size { width: 100.0, height: 50.0 };
+        let bands = crate::layout::Edges { top: 0.0, trailing: 30.0, bottom: 0.0, leading: 10.0 };
+        let ltr = Runtime::new();
+        ltr.set_safe_area(bands);
+        assert_eq!(text_lefts(&ltr.display_frame(&Reader, size)), [("10:30".into(), 10.0)]);
+
+        let rtl = Runtime::new();
+        rtl.set_layout_direction(Some(LayoutDirection::RightToLeft));
+        rtl.set_safe_area(bands);
+        // the body reads the right band as leading; the row still fills the
+        // window's inner width, 10 from the left and 30 from the right, and
+        // its first word ends on the right band
+        assert_eq!(text_lefts(&rtl.display_frame(&Reader, size)), [("30:10".into(), 70.0 - 40.0)]);
+    }
+
     /// The shell's insets reach a BODY, and the keyboard's band stays its
     /// own number.
     ///
