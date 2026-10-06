@@ -758,6 +758,34 @@ impl<T: Clone + 'static> State<T> {
         })
     }
 
+    /// Compound mutation that says whether it changed anything: `f`
+    /// answers `(changed, result)`, and the write is recorded only when it
+    /// did — a drain that found nothing leaves the scene as it was. The
+    /// value leaves the arena while `f` runs, as in [`State::update`].
+    pub fn update_if<R>(&self, f: impl FnOnce(&mut T) -> (bool, R)) -> R {
+        let mut value = with_arena::<T, _>(|arena| {
+            arena
+                .slots
+                .get_mut(self.index)
+                .filter(|slot| slot.generation == self.generation)
+                .and_then(|slot| slot.value.take())
+                .expect(DEAD_STATE)
+        });
+        let (changed, result) = f(&mut value);
+        with_arena::<T, _>(|arena| {
+            let slot = arena
+                .slots
+                .get_mut(self.index)
+                .filter(|slot| slot.generation == self.generation)
+                .expect(DEAD_STATE);
+            slot.value = Some(value);
+        });
+        if changed {
+            crate::identity::record_write(crate::identity::DepKey::State(self.dep));
+        }
+        result
+    }
+
     pub fn set(&self, value: T) {
         with_arena::<T, _>(|arena| {
             let slot = arena
@@ -830,33 +858,6 @@ impl<T: Clone + PartialEq + 'static> State<T> {
         true
     }
 
-    /// Compound mutation that says whether it changed anything: `f`
-    /// answers `(changed, result)`, and the write is recorded only when it
-    /// did — a drain that found nothing leaves the scene as it was. The
-    /// value leaves the arena while `f` runs, as in [`State::update`].
-    pub fn update_if<R>(&self, f: impl FnOnce(&mut T) -> (bool, R)) -> R {
-        let mut value = with_arena::<T, _>(|arena| {
-            arena
-                .slots
-                .get_mut(self.index)
-                .filter(|slot| slot.generation == self.generation)
-                .and_then(|slot| slot.value.take())
-                .expect(DEAD_STATE)
-        });
-        let (changed, result) = f(&mut value);
-        with_arena::<T, _>(|arena| {
-            let slot = arena
-                .slots
-                .get_mut(self.index)
-                .filter(|slot| slot.generation == self.generation)
-                .expect(DEAD_STATE);
-            slot.value = Some(value);
-        });
-        if changed {
-            crate::identity::record_write(crate::identity::DepKey::State(self.dep));
-        }
-        result
-    }
 }
 
 /// Displaying a `State` READS the value — the dependency records itself.
@@ -880,6 +881,11 @@ pub struct Binding<T> {
 trait Source<T> {
     fn get(&self) -> T;
     fn lend(&self, visit: &mut dyn FnMut(&T));
+    /// Edits the value where it lives and says whether it changed — `None`
+    /// when the source cannot (its writes go through a setter).
+    fn modify(&self, _edit: &mut dyn FnMut(&mut T) -> bool) -> Option<bool> {
+        None
+    }
 }
 
 /// A getter closure: it has nothing to lend, and lends the copy it makes.
@@ -906,6 +912,27 @@ impl<T: Clone + 'static> Source<T> for StateSource<T> {
     fn lend(&self, visit: &mut dyn FnMut(&T)) {
         self.0.with(|value| visit(value))
     }
+
+    fn modify(&self, edit: &mut dyn FnMut(&mut T) -> bool) -> Option<bool> {
+        Some(self.0.update_if(|value| {
+            let changed = edit(value);
+            (changed, changed)
+        }))
+    }
+}
+
+/// A source whose writes must reach a setter of their own (`onSet`): it
+/// reads and lends as the source under it, and never edits in place.
+struct Through<T>(Rc<dyn Source<T>>);
+
+impl<T> Source<T> for Through<T> {
+    fn get(&self) -> T {
+        self.0.get()
+    }
+
+    fn lend(&self, visit: &mut dyn FnMut(&T)) {
+        self.0.lend(visit)
+    }
 }
 
 impl<T: Clone + 'static> Binding<T> {
@@ -928,6 +955,23 @@ impl<T: Clone + 'static> Binding<T> {
         answer.expect("a binding lends its value exactly once")
     }
 
+    /// Edits the value and writes it back when `edit` says it changed. A
+    /// state's own binding edits in place — no copy of the value, and no
+    /// write at all when nothing changed; any other binding reads a copy,
+    /// edits it, and hands it to its setter when it changed. True when it
+    /// changed.
+    pub fn modify(&self, mut edit: impl FnMut(&mut T) -> bool) -> bool {
+        if let Some(changed) = self.get.modify(&mut edit) {
+            return changed;
+        }
+        let mut value = self.get.get();
+        let changed = edit(&mut value);
+        if changed {
+            (self.set)(value);
+        }
+        changed
+    }
+
     pub fn set(&self, value: T) {
         (self.set)(value)
     }
@@ -944,6 +988,8 @@ impl<T: Clone + 'static> Binding<T> {
     pub fn onSet(self, perform: impl Fn(&T) + 'static) -> Self {
         let Binding { get, set } = self;
         let old_set = set;
+        // the observer hears every write, so none may bypass the setter
+        let get: Rc<dyn Source<T>> = Rc::new(Through(get));
         Binding { get, set: Rc::new(move |value| { old_set(value.clone()); perform(&value) }) }
     }
 
@@ -1020,6 +1066,35 @@ mod tests {
         let made = Binding::new(move || state.wrappedValue(), move |value| state.set(value));
         assert_eq!(made.with(|value| value.0), 7);
         assert_eq!(CLONES.with(Cell::get), 1, "a made binding reads through its getter");
+    }
+
+    #[test]
+    fn a_state_binding_edits_in_place_and_an_observed_one_writes_through() {
+        let state = State::new(String::from("note"));
+        let binding = state.binding();
+        assert!(binding.modify(|text| {
+            text.push('!');
+            true
+        }));
+        assert_eq!(state.wrappedValue(), "note!");
+        assert!(!binding.modify(|_| false), "an edit that changed nothing writes nothing");
+        let heard = Rc::new(std::cell::Cell::new(0));
+        let observed = {
+            let heard = heard.clone();
+            state.binding().onSet(move |_| heard.set(heard.get() + 1))
+        };
+        assert!(observed.modify(|text| {
+            text.push('?');
+            true
+        }));
+        assert_eq!(state.wrappedValue(), "note!?");
+        assert_eq!(heard.get(), 1, "the observer hears an edit made through its binding");
+        let made = Binding::new(move || state.wrappedValue(), move |value| state.set(value));
+        assert!(made.modify(|text| {
+            text.clear();
+            true
+        }));
+        assert_eq!(state.wrappedValue(), "");
     }
 
     #[test]
