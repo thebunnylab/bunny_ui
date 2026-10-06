@@ -456,7 +456,14 @@ function lookRules(selector, kind, flags, style, layout, face) {
   // layers: the same alignment across the cell, so a centred stack
   // centres both ways
   if (kind === 11 && decl["align-items"]) decl["justify-items"] = decl["align-items"];
-  if (layout.padding) decl.padding = layout.padding.map((side) => `${side}px`).join(" ");
+  if (layout.padding) {
+    // the record's sides are logical (top, trailing, bottom, leading), and
+    // so are the properties: a right-to-left mount puts the leading inset
+    // on the right by itself
+    const [top, trailing, bottom, leading] = layout.padding;
+    decl["padding-block"] = `${top}px ${bottom}px`;
+    decl["padding-inline"] = `${leading}px ${trailing}px`;
+  }
   if (layout.grow) {
     // the flexible child — and the classic flex footgun: a zeroed
     // min-size, or content refuses to shrink
@@ -514,9 +521,10 @@ function lookRules(selector, kind, flags, style, layout, face) {
     // AFTER the font shorthand, which resets line-height: 0 means the
     // face's own box
     if (face.lineHeight > 0) decl["line-height"] = `${face.lineHeight}px`;
-    // 0 leading — the browser's own default for this direction
+    // 0 leading — the browser's own `start`, which follows the direction;
+    // trailing is `end` for the same reason, never `right`
     if (face.align === 1) decl["text-align"] = "center";
-    else if (face.align === 2) decl["text-align"] = "right";
+    else if (face.align === 2) decl["text-align"] = "end";
     // an inherited ink takes NO color: the box above owns both states.
     // A box's face record is the face alone — the box's own ink, the
     // one its hover rules flip, stays
