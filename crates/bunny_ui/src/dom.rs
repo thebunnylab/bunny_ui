@@ -1024,7 +1024,9 @@ pub struct DomLayout {
     pub gap: Option<f32>,
     /// Cross-axis alignment: 0 start, 1 center, 2 end, 3 baseline.
     pub align: Option<u8>,
-    /// Padding `(top, right, bottom, left)`, px.
+    /// Padding `(top, trailing, bottom, leading)`, px — logical sides, so
+    /// the page writes them as `padding-block` and `padding-inline` and
+    /// a right-to-left mount puts the leading inset on the right.
     pub padding: Option<(f32, f32, f32, f32)>,
     pub width: Option<f32>,
     pub height: Option<f32>,
@@ -1996,7 +1998,9 @@ fn look_hash(node: &DomNode) -> u64 {
             layout.align.hash(&mut hasher);
             layout
                 .padding
-                .map(|(top, right, bottom, left)| [top, right, bottom, left].map(|side| f64::from(side).to_bits()))
+                .map(|(top, trailing, bottom, leading)| {
+                    [top, trailing, bottom, leading].map(|side| f64::from(side).to_bits())
+                })
                 .hash(&mut hasher);
             layout.grow.hash(&mut hasher);
             layout.stretch.hash(&mut hasher);
@@ -4433,11 +4437,11 @@ fn encode_layout(out: &mut Vec<u8>, layout: &DomLayout) {
                 if let Some(align) = layout.align {
                     out.push(align);
                 }
-                if let Some((top, right, bottom, left)) = layout.padding {
+                if let Some((top, trailing, bottom, leading)) = layout.padding {
                     push_f32(out, top);
-                    push_f32(out, right);
+                    push_f32(out, trailing);
                     push_f32(out, bottom);
-                    push_f32(out, left);
+                    push_f32(out, leading);
                 }
                 if let Some(width) = layout.width {
                     push_f32(out, width);
@@ -6392,6 +6396,31 @@ mod tests {
         boxed.look_mut();
         assert_eq!(boxed, DomStyle::default());
         assert!(boxed.is_default());
+    }
+
+    /// The padding record reads (top, trailing, bottom, leading) and
+    /// crosses the wire in that order — the same four floats it always
+    /// did, so a page built before the sides were named logical reads
+    /// the same bytes.
+    #[test]
+    fn the_padding_record_reads_top_trailing_bottom_leading() {
+        let rule = DomPatch::DefineRule {
+            rule: 1,
+            kind: CreateKind::FlexColumn,
+            flags: 0,
+            style: Box::default(),
+            layout: Box::new(DomLayout { padding: Some((1.0, 2.0, 3.0, 4.0)), ..DomLayout::default() }),
+            text: None,
+        };
+        let bytes = encode(&[rule]);
+        let mut expected = Vec::new();
+        for side in [1.0f32, 2.0, 3.0, 4.0] {
+            expected.extend_from_slice(&side.to_le_bytes());
+        }
+        assert!(
+            bytes.windows(expected.len()).any(|window| window == expected),
+            "the four sides cross in record order: {bytes:?}"
+        );
     }
 
     /// A look's hash names its rule, and a served page is adopted by

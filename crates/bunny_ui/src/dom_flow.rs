@@ -663,14 +663,14 @@ impl Walk<'_> {
                     )
                     && let Some(layout) = only.layout.as_mut()
                 {
-                    let (was_top, was_right, was_bottom, was_left) =
+                    let (was_top, was_trailing, was_bottom, was_leading) =
                         layout.padding.unwrap_or((0.0, 0.0, 0.0, 0.0));
                     let sum = |was: f32, more: Px| (f64::from(was) + more) as f32;
                     layout.padding = Some((
                         sum(was_top, top),
-                        sum(was_right, trailing),
+                        sum(was_trailing, trailing),
                         sum(was_bottom, bottom),
-                        sum(was_left, leading),
+                        sum(was_leading, leading),
                     ));
                     out.append(&mut lowered);
                     return;

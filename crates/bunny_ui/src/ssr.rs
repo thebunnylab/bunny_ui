@@ -812,8 +812,11 @@ fn rule_text(
             base.insert("justify-items", align);
         }
     }
-    if let Some((top, right, bottom, left)) = layout.padding {
-        base.insert("padding", format!("{} {} {} {}", px(top), px(right), px(bottom), px(left)));
+    // the record's sides are logical, and so are the properties: a
+    // right-to-left mount puts the leading inset on the right by itself
+    if let Some((top, trailing, bottom, leading)) = layout.padding {
+        base.insert("padding-block", format!("{} {}", px(top), px(bottom)));
+        base.insert("padding-inline", format!("{} {}", px(leading), px(trailing)));
     }
     if layout.grow {
         // the flexible child — and the classic flex footgun: a zeroed
@@ -966,8 +969,11 @@ fn rule_text(
             Some(motor::views::TextAlignment::Center) => {
                 base.insert("text-align", "center".into());
             }
+            // `end`, not `right`: the trailing edge is the left one in a
+            // right-to-left mount, and leading is the browser's own
+            // `start`, which is why it is never written
             Some(motor::views::TextAlignment::Trailing) => {
-                base.insert("text-align", "right".into());
+                base.insert("text-align", "end".into());
             }
             _ => {}
         }
@@ -1095,6 +1101,74 @@ fn leak_tag(tag: &str) -> &'static str {
 mod tests {
     use super::*;
     use crate::prelude::*;
+
+    /// The padding record is logical and so are the properties the page
+    /// writes: `padding-block` and `padding-inline`, never a physical
+    /// `padding`, so a right-to-left mount puts the leading inset on
+    /// the right without a word from the engine.
+    #[test]
+    fn leading_padding_is_inline_start_on_the_page() {
+        let layout = crate::dom::DomLayout {
+            padding: Some((1.0, 2.0, 3.0, 4.0)),
+            ..crate::dom::DomLayout::default()
+        };
+        let rule = rule_text(
+            "k",
+            crate::dom::CreateKind::FlexColumn,
+            false,
+            &crate::dom::DomLook::default(),
+            &layout,
+            None,
+        );
+        assert!(rule.contains("padding-block:1px 3px"), "{rule}");
+        assert!(rule.contains("padding-inline:4px 2px"), "leading first: {rule}");
+        assert!(!rule.contains("padding:"), "no physical padding: {rule}");
+    }
+
+    /// A trailing text aligns to `end`, never `right`; a leading one
+    /// writes nothing and takes the browser's own `start`.
+    #[test]
+    fn a_trailing_text_aligns_to_the_end_not_the_right() {
+        let face = |align| crate::dom::DomText {
+            content: std::sync::Arc::from("words"),
+            color: Color::BLACK,
+            inherits_ink: false,
+            font: crate::text_engine::FontSpec::DEFAULT,
+            line_height: None,
+            text_align: align,
+            highlights: None,
+            truncation: None,
+            inherits_face: false,
+        };
+        let rule = |align| {
+            rule_text(
+                "k",
+                crate::dom::CreateKind::Text,
+                false,
+                &crate::dom::DomLook::default(),
+                &crate::dom::DomLayout::default(),
+                Some(&face(align)),
+            )
+        };
+        let trailing = rule(Some(TextAlignment::Trailing));
+        assert!(trailing.contains("text-align:end"), "{trailing}");
+        assert!(!trailing.contains("right"), "{trailing}");
+        assert!(!rule(None).contains("text-align"), "leading is the browser's own start");
+        assert!(rule(Some(TextAlignment::Center)).contains("text-align:center"));
+    }
+
+    /// The page and the glue write one CSS: the logical names the page
+    /// uses are the ones the glue spells, and neither says a side.
+    #[test]
+    fn the_page_and_the_glue_write_the_same_logical_properties() {
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        for name in ["padding-block", "padding-inline"] {
+            assert!(glue.contains(&format!("decl[\"{name}\"]")), "the glue writes {name}");
+        }
+        assert!(glue.contains("decl[\"text-align\"] = \"end\""), "the glue aligns to end");
+        assert!(!glue.contains("decl[\"text-align\"] = \"right\""), "and never to right");
+        assert!(!glue.contains("decl.padding ="), "and writes no physical padding");
+    }
 
     #[derive(Clone)]
     struct Page {
