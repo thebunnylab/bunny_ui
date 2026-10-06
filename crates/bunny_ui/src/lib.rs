@@ -16810,6 +16810,137 @@ mod tests {
         assert_eq!(first_line(&Runtime::new().display_frame(&Preview, size)), "narrow");
     }
 
+    // MARK: - The locale reaches the body
+
+    /// The shell's report moves the environment once: the first report
+    /// is news, the same report again is not, and only news asks for a
+    /// frame.
+    #[test]
+    fn a_system_locale_moves_the_environment_once() {
+        let runtime = Runtime::new();
+        let size = Size { width: 300.0, height: 200.0 };
+        let _ = runtime.display_frame(&text("hi"), size);
+        assert!(!runtime.frame_need().environment);
+        assert!(runtime.set_system_locale(Locale::parse("pt-BR,en")), "the first report is news");
+        assert!(runtime.frame_need().environment);
+        assert_eq!(runtime.locale().as_str(), "pt-BR,en");
+        let _ = runtime.display_frame(&text("hi"), size);
+        assert!(!runtime.set_system_locale(Locale::parse("pt-BR,en")), "the same report is not");
+        assert!(!runtime.frame_need().environment, "and costs no frame");
+    }
+
+    /// The app's pin outranks the system's report: while pinned, a
+    /// system that moves changes nothing a body sees; unpinned, the
+    /// environment follows the system again.
+    #[test]
+    fn a_pinned_locale_outranks_the_systems() {
+        let runtime = Runtime::new();
+        runtime.set_system_locale(Locale::new("en-US"));
+        assert!(runtime.set_locale(Some(Locale::new("pt-BR"))));
+        assert_eq!(runtime.locale().identifier(), "pt-BR");
+        assert!(!runtime.set_system_locale(Locale::new("fr")), "a system move under a pin is no news");
+        assert_eq!(runtime.locale().identifier(), "pt-BR");
+        assert!(!runtime.set_locale(Some(Locale::new("pt-BR"))), "the same pin again is no news");
+        assert!(runtime.set_locale(None), "unpinned, the system's word stands");
+        assert_eq!(runtime.locale().identifier(), "fr");
+    }
+
+    /// A locale brings its direction, and a pinned direction overrides
+    /// it without touching the language.
+    #[test]
+    fn a_locale_brings_its_direction_and_a_pin_overrides_it() {
+        let runtime = Runtime::new();
+        assert_eq!(runtime.layout_direction(), LayoutDirection::LeftToRight);
+        runtime.set_system_locale(Locale::new("ar"));
+        assert_eq!(runtime.layout_direction(), LayoutDirection::RightToLeft);
+        assert_eq!(
+            runtime.context().environment::<LayoutDirection>(),
+            LayoutDirection::RightToLeft,
+            "a body reads the same"
+        );
+        assert!(runtime.set_layout_direction(Some(LayoutDirection::LeftToRight)));
+        assert_eq!(runtime.layout_direction(), LayoutDirection::LeftToRight);
+        assert_eq!(runtime.locale().identifier(), "ar", "the language stayed");
+        assert!(!runtime.set_layout_direction(Some(LayoutDirection::LeftToRight)));
+        assert!(runtime.set_layout_direction(None), "the locale decides again");
+        assert_eq!(runtime.layout_direction(), LayoutDirection::RightToLeft);
+    }
+
+    /// A body that reads the locale runs again when it moves — inside
+    /// the settle, once — and a still frame runs no body.
+    #[test]
+    fn a_body_that_reads_the_locale_runs_again_when_it_moves() {
+        #[derive(Clone, Copy)]
+        struct Greeting;
+        impl Component for Greeting {
+            fn body(self, ctx: &Context) -> impl View {
+                let word = match ctx.environment::<Locale>().language() {
+                    "pt" => "oi",
+                    _ => "hello",
+                };
+                vstack!(text(word), spacer())
+            }
+        }
+        fn first_line(display: &crate::layout::DisplayList) -> String {
+            display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { content, .. } => {
+                        Some(content.to_string())
+                    }
+                    _ => None,
+                })
+                .expect("a line paints")
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 300.0, height: 200.0 };
+        assert_eq!(first_line(&runtime.display_frame(&Greeting, size)), "hello");
+        let _ = runtime.display_frame(&Greeting, size);
+        assert!(runtime.body_runs().is_empty(), "nothing moved, nothing ran");
+        runtime.set_system_locale(Locale::parse("pt-BR,en"));
+        assert_eq!(first_line(&runtime.display_frame(&Greeting, size)), "oi");
+        let _ = runtime.display_frame(&Greeting, size);
+        assert!(runtime.body_runs().is_empty(), "and settled");
+    }
+
+    /// A seed is the locale until a shell speaks: headless and in a
+    /// preview the app's `with_environment` stands, and a direction the
+    /// seed did not name is the seed's own.
+    #[test]
+    fn a_headless_seed_is_the_locale_until_a_shell_speaks() {
+        let mut values = EnvironmentValues::default();
+        values.locale = Locale::new("he");
+        let runtime = Runtime::with_environment(values);
+        assert_eq!(runtime.locale().identifier(), "he");
+        assert_eq!(runtime.layout_direction(), LayoutDirection::RightToLeft, "derived from the seed");
+        assert!(!runtime.frame_need().environment, "a derivation at birth moves nothing");
+        assert!(runtime.set_system_locale(Locale::new("en")));
+        assert_eq!(runtime.locale().identifier(), "en");
+        assert_eq!(runtime.layout_direction(), LayoutDirection::LeftToRight);
+
+        // a seed that names a direction keeps it
+        let mut values = EnvironmentValues::default();
+        values.layoutDirection = LayoutDirection::RightToLeft;
+        let runtime = Runtime::with_environment(values);
+        assert_eq!(runtime.layout_direction(), LayoutDirection::RightToLeft);
+        assert_eq!(runtime.locale().identifier(), "en");
+    }
+
+    /// The typed doors compare first: a size class that stands is not
+    /// written, and the retention is not rebuilt for it.
+    #[test]
+    fn a_size_class_that_did_not_move_costs_nothing() {
+        let runtime = Runtime::new();
+        let size = Size { width: 390.0, height: 844.0 };
+        let _ = runtime.display_frame(&text("hi"), size);
+        assert!(!runtime.set_size_class(SizeClass::Regular), "regular already");
+        assert!(!runtime.frame_need().environment);
+        assert!(runtime.set_size_class(SizeClass::Compact));
+        assert!(runtime.frame_need().environment);
+        assert_eq!(runtime.context().environment::<SizeClass>(), SizeClass::Compact);
+    }
+
     /// The shell's insets reach a BODY, and the keyboard's band stays its
     /// own number.
     ///
