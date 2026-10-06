@@ -472,6 +472,9 @@ mod probe {
 
     pub(crate) fn run() {
         let app = App::new();
+        // the checks read the mac's own words back in English, whatever
+        // language the system speaks
+        app.set_locale(Some(Locale::new("en")));
         let runtime = app.runtime().text_engine(Rc::new(CoreTextEngine::new()));
         let probe = Rc::new(Probe {
             saved: Rc::new(Cell::new(0)),

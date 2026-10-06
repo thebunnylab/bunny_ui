@@ -284,6 +284,10 @@ pub enum AppEvent {
     /// The system says memory is short (a warning or worse): the caches
     /// go — decoded images, the fallen entries waiting for the idle.
     MemoryPressure,
+    /// The system's languages or region moved
+    /// (`NSCurrentLocaleDidChangeNotification`): every window reads the
+    /// preferred list again, and one whose locale moved draws a frame.
+    Locale,
     /// The reader chose a menu item this window answers — a command from
     /// the menu bar, or a standard edit sent to this window's view.
     Menu(Pick),
