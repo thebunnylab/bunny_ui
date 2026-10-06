@@ -300,7 +300,9 @@ impl Edit {
     pub const ALL: [Edit; 6] =
         [Edit::Undo, Edit::Redo, Edit::Cut, Edit::Copy, Edit::Paste, Edit::SelectAll];
 
-    /// The item's title, as the platforms all write it.
+    /// The item's title in the source language. A shell that draws the
+    /// item resolves it in the person's through [`crate::words::Words`],
+    /// by [`Edit::word`].
     pub const fn title(self) -> &'static str {
         match self {
             Edit::Undo => "Undo",
@@ -309,6 +311,20 @@ impl Edit {
             Edit::Copy => "Copy",
             Edit::Paste => "Paste",
             Edit::SelectAll => "Select All",
+        }
+    }
+
+    /// The framework's word for the item — what a shell asks
+    /// [`crate::words::Words`] for.
+    pub const fn word(self) -> crate::words::Word {
+        use crate::words::Word;
+        match self {
+            Edit::Undo => Word::Undo,
+            Edit::Redo => Word::Redo,
+            Edit::Cut => Word::Cut,
+            Edit::Copy => Word::Copy,
+            Edit::Paste => Word::Paste,
+            Edit::SelectAll => Word::SelectAll,
         }
     }
 
@@ -564,6 +580,20 @@ mod tests {
         }
         assert!(Edit::Redo.stroke().shift, "redo is undo with shift");
         assert_eq!(Edit::SelectAll.title(), "Select All");
+    }
+
+    /// The source title of every edit is the framework's English word
+    /// for it — one table, read two ways.
+    #[test]
+    fn an_edits_title_is_its_english_word() {
+        let words = crate::words::Words::english();
+        for edit in Edit::ALL {
+            assert_eq!(words.get(edit.word()), edit.title(), "{edit:?}");
+        }
+        assert_eq!(
+            crate::words::Words::for_locale(&motor::state::Locale::new("pt-BR")).get(Edit::Cut.word()),
+            "Recortar"
+        );
     }
 
     #[test]
