@@ -154,6 +154,26 @@ thread_local! {
 pub(crate) fn locale() -> Locale {
     LOCALE.with(|slot| slot.borrow().clone())
 }
+
+/// Records the locale the shell knows — the one the windows read.
+pub(crate) fn set_locale(locale: Locale) {
+    LOCALE.with(|slot| *slot.borrow_mut() = locale);
+}
+
+/// The languages the environment asks for, best first: `LANGUAGE`'s
+/// colon-separated list, else the first of `LC_ALL`, `LC_MESSAGES` and
+/// `LANG` that is set — glibc's own order for the messages' language.
+/// `C` and `POSIX` are English, and so is an environment that says
+/// nothing.
+pub(crate) fn preferred_locale() -> Locale {
+    let read = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let list = read("LANGUAGE")
+        .or_else(|| read("LC_ALL"))
+        .or_else(|| read("LC_MESSAGES"))
+        .or_else(|| read("LANG"))
+        .unwrap_or_default();
+    Locale::parse(&list)
+}
 /// Why the thread cannot show any — set once at boot, if the session
 /// bus is not there.
 static REFUSAL: Mutex<Option<String>> = Mutex::new(None);
