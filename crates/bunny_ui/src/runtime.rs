@@ -4045,8 +4045,6 @@ impl Runtime {
     /// Indices already in UTF-16 at the framework edge; the caret rect
     /// comes from the geometry retained from the last layout.
     pub fn ime_snapshot(&self) -> Option<ImeSnapshot> {
-        use crate::text_input::byte_to_utf16;
-
         let path = self.focus.borrow().clone()?;
         // the app's box answers for itself; only the caret rect
         // changes hands, from the box's coordinates into the scene's
@@ -4067,12 +4065,10 @@ impl Runtime {
 
         let caret = crate::text_input::clamp_index(&text, state.caret);
         let (start, end) = state.selection().unwrap_or((caret, caret));
-        let start_utf16 = byte_to_utf16(&text, start);
-        let selected = (start_utf16, byte_to_utf16(&text, end) - start_utf16);
-        let marked = state.marked.map(|(start, end)| {
-            let start_utf16 = byte_to_utf16(&text, start);
-            (start_utf16, byte_to_utf16(&text, end) - start_utf16)
-        });
+        // each span counted from where it starts: one walk to the start,
+        // then only the span — never the text twice
+        let selected = crate::text_input::utf16_span(&text, start, end);
+        let marked = state.marked.map(|(start, end)| crate::text_input::utf16_span(&text, start, end));
 
         let field = self
             .last_fields
