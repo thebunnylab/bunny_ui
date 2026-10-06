@@ -157,6 +157,16 @@ The tool prints Rust const data to paste into the app — the default
 build carries no parser. The same parser opens at runtime behind the
 `svg` feature (`Symbol::from_svg`) for the app that accepts the cost.
 
+## Languages and direction
+
+The shell reports the languages the system prefers, as a list, before
+the first frame. A view reads `Locale` from its environment and picks
+the table that serves it best; the framework's own words — the mac's
+app menu, the Edit items, a notification's button — speak sixteen
+languages on their own. A right-to-left locale mirrors the scene:
+stacks, padding, splits, scroll bars, popovers and the caret read from
+the right, and a subtree may read the other way (`docs/i18n.md`).
+
 ## Status
 
 Early development. The API is not stable.
