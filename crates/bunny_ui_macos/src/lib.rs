@@ -53,6 +53,15 @@ fn sync_frame_driver(runtime: &Runtime, pacer: &FramePacer, window: usize) {
     // the task alarm follows the nearest sleeper; it is no reason for
     // the display to beat
     ffi::aim_tasks(runtime.next_task_wake());
+    // parking: the presenter lets its frames go and offers its atlas back
+    // to the system while the window rests
+    thread_local! {
+        static PARKED: Cell<bool> = const { Cell::new(false) };
+    }
+    let parked = wanted == ffi::DriverPace::Off;
+    if PARKED.with(|last| last.replace(parked)) != parked && parked && metal::active() {
+        metal::rest();
+    }
     // the `D` line: the driver's pace, when it changes — a tape of a
     // scene at rest must end on `off`
     if trace::active() {

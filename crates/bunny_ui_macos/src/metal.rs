@@ -111,6 +111,22 @@ pub(crate) fn retained_counts() -> Option<(bunny_ui_apple::metal::AtlasCounts, u
         .map(|atlas| (atlas, VIEW_PRESENTERS.with(|slot| slot.borrow().len())))
 }
 
+/// Every window's presenter rests — its frames in flight let go, its atlas
+/// offered back to the system — when the shell's frame driver parks (see
+/// [`MetalPresenter::rest`]).
+pub(crate) fn rest() {
+    PRESENTER.with(|slot| {
+        if let Some(presenter) = slot.borrow_mut().as_mut() {
+            presenter.rest();
+        }
+    });
+    VIEW_PRESENTERS.with(|slot| {
+        for presenter in slot.borrow_mut().values_mut() {
+            presenter.rest();
+        }
+    });
+}
+
 /// True when this window presents by GPU — the shell branches ONCE per
 /// frame on this, never mid-flight.
 pub(crate) fn active() -> bool {

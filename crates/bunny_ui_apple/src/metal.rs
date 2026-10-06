@@ -80,6 +80,8 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_f64(obj: Id, sel: Sel) -> f64;
     #[link_name = "objc_msgSend"]
+    fn msg_u64_u64(obj: Id, sel: Sel, a: u64) -> u64;
+    #[link_name = "objc_msgSend"]
     fn msg_id_arg(obj: Id, sel: Sel, a: Id) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_id_u64(obj: Id, sel: Sel, a: u64) -> Id;
@@ -175,6 +177,10 @@ const TEXTURE_USAGE_RENDER_TARGET: u64 = 4;
 const RESOURCE_SHARED_WRITE_COMBINED: u64 = 1;
 const PRIMITIVE_TRIANGLE: u64 = 3;
 const STATUS_COMPLETED: u64 = 4; // MTLCommandBufferStatus: Completed=4, Error=5
+// MTLPurgeableState: what a resource may lose while nobody draws with it
+const PURGEABLE_NON_VOLATILE: u64 = 2;
+const PURGEABLE_VOLATILE: u64 = 3;
+const PURGEABLE_EMPTY: u64 = 4;
 
 // The run atlas: text tiles append into one shared texture. Runs wider
 // than a chunk split into seamless chunks (texel reads are 1:1, a seam
@@ -1510,6 +1516,8 @@ struct MetalGround {
     slot: usize,
     /// The copies the frame's blit pass makes, in order.
     pending: Vec<LiveCopy>,
+    /// The atlas was offered back to the system while the window rested.
+    volatile: bool,
 }
 
 /// The staging buffer of one ring slot. Grows when a frame's feeds
@@ -1540,10 +1548,34 @@ struct LiveCopy {
 const STAGING_ALIGN: usize = 256;
 
 impl MetalGround {
+    /// The window rests: the atlas is a cache, and the system may take
+    /// it back under pressure while nobody draws with it.
+    unsafe fn rest(&mut self) {
+        if !self.shared.is_null() && !self.volatile {
+            unsafe { msg_u64_u64(self.shared, sel("setPurgeableState:"), PURGEABLE_VOLATILE) };
+            self.volatile = true;
+        }
+    }
+
+    /// A frame is about to draw: the atlas is asked back. False when the
+    /// system took it — every tile it held is gone.
+    unsafe fn wake(&mut self) -> bool {
+        if !self.volatile {
+            return true;
+        }
+        self.volatile = false;
+        if self.shared.is_null() {
+            return true;
+        }
+        let before = unsafe { msg_u64_u64(self.shared, sel("setPurgeableState:"), PURGEABLE_NON_VOLATILE) };
+        before != PURGEABLE_EMPTY
+    }
+
     fn new(device: Id) -> MetalGround {
         MetalGround {
             device,
             shared: null_mut(),
+            volatile: false,
             textures: HashMap::new(),
             next: 1,
             native: HashMap::new(),
@@ -1671,6 +1703,7 @@ impl AtlasGround for MetalGround {
     }
 
     fn drop_shared(&mut self) {
+        self.volatile = false;
         if !self.shared.is_null() {
             unsafe { msg_void(self.shared, sel("release")) };
             self.shared = null_mut();
@@ -2007,6 +2040,30 @@ impl MetalPresenter {
     /// drawable taken under the asynchronous contract and then
     /// presented inside the transaction is the one frame the layer
     /// stretches from the size it used to have.
+    /// The window went to rest. The frames in flight are waited out (the
+    /// last one was committed moments ago) and let go, and the atlas — a
+    /// cache, rebuilt from the scene whenever it is lost — is offered
+    /// back to the system: a resting window keeps its pixels on screen
+    /// and needs none of its tiles until the next frame, which asks for
+    /// the atlas again and re-rasterizes only if the system took it.
+    pub fn rest(&mut self) {
+        unsafe {
+            for slot in &mut self.slots {
+                if slot.command.is_null() {
+                    continue;
+                }
+                if msg_u64(slot.command, self.stack.sels.status) < STATUS_COMPLETED {
+                    msg_void(slot.command, self.stack.sels.wait_completed);
+                }
+                mark_gpu_time(slot.command, &self.stack.sels);
+                msg_void(slot.command, self.stack.sels.release);
+                slot.command = null_mut();
+                slot.native.clear();
+            }
+            self.ground.rest();
+        }
+    }
+
     pub fn set_transactional(&mut self, live: bool) {
         if live == self.transactional {
             return;
@@ -2124,6 +2181,12 @@ impl MetalPresenter {
                 // second — nothing changed, nothing encodes
                 objc_autoreleasePoolPop(pool);
                 return;
+            }
+            if !self.ground.wake() {
+                // the system took the atlas while the window rested: its
+                // tiles are gone, and the walk below rasterizes anew
+                crate::trace::mark("X", format_args!("what=atlas-purged"));
+                self.atlas.reset(&mut self.ground, false);
             }
             if physical != self.physical || scale != self.scale {
                 // the drawable must resize BEFORE nextDrawable, or the
@@ -3622,5 +3685,36 @@ mod tests {
         // a pane over a pane compounds: the upper one samples a scene
         // that already carries the lower one's own difference
         assert_glass_close(&gpu, &cpu, 6, 0.015, "stacked panes");
+    }
+
+    #[test]
+    fn a_resting_atlas_is_offered_back_and_a_purged_one_says_so() {
+        if !device_present() {
+            return;
+        }
+        unsafe {
+            let device = MTLCreateSystemDefaultDevice();
+            let mut ground = MetalGround::new(device);
+            // no atlas yet: resting offers nothing, waking finds nothing lost
+            ground.rest();
+            assert!(!ground.volatile, "no texture, nothing to offer");
+            assert!(ground.wake());
+            assert!(ground.ensure_shared(256));
+            // at rest the texture is volatile; asked back untouched, it kept its tiles
+            ground.rest();
+            assert!(ground.volatile);
+            assert!(ground.wake(), "nothing took the atlas: its tiles stand");
+            assert!(!ground.volatile);
+            // the system takes it (Empty is what a purge leaves): the wake says so
+            ground.rest();
+            msg_u64_u64(ground.shared, sel("setPurgeableState:"), PURGEABLE_EMPTY);
+            assert!(!ground.wake(), "a purged atlas is reported lost");
+            // a dropped texture leaves no flag behind
+            ground.rest();
+            ground.drop_shared();
+            assert!(!ground.volatile);
+            drop(ground);
+            msg_void(device, sel("release"));
+        }
     }
 }
