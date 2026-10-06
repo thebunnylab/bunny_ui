@@ -28,6 +28,7 @@
 //! [`PixelFont`]: crate::text_engine::PixelFont
 
 use motor::hash::FxHashMap as HashMap;
+use motor::state::LayoutDirection;
 use motor::views::ContentMode;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -612,6 +613,20 @@ pub struct LayoutEnv<'a> {
     pub line_height: Option<Px>,
     /// Where a wrapped line sits inside its box. `None` = leading.
     pub text_align: Option<motor::views::TextAlignment>,
+    /// Which way the leading edge faces. PLACEMENT reads it — a row lays
+    /// out from the right, a padding's leading edge is the right one,
+    /// `Start` hugs the right — and measure never does: a sum of widths,
+    /// a padding's total and a split's division have no side. Left out
+    /// of [`MeasureKey`] for that reason, like `text_align`. The runtime
+    /// seeds it from the locale in effect; a `Styled` turns it for an
+    /// island that reads the other way.
+    pub direction: LayoutDirection,
+    /// Does the subtree flip its pictures when the direction is right
+    /// to left (`.flips_for_right_to_left_layout_direction(true)`)?
+    /// Inherited like the font and decided per picture by
+    /// [`LayoutEnv::mirrors`], so an island that reads the other way
+    /// stops — or starts — flipping on its own.
+    pub flips: bool,
     /// The pass's frame state — consulted BY PATH during placement.
     pub stamp: FrameStamp<'a>,
     /// The frame's animator — `None` in bare layouts (tests, direct
@@ -642,6 +657,19 @@ pub struct LayoutEnv<'a> {
     /// PAINT and nothing else, because a modality decides chrome and
     /// never geometry.
     pub touch: bool,
+}
+
+impl LayoutEnv<'_> {
+    /// Does the leading edge face right?
+    pub fn rtl(&self) -> bool {
+        self.direction.is_rtl()
+    }
+
+    /// Is a picture placed here drawn mirrored — the subtree asked to
+    /// flip, and the scene reads right to left?
+    pub fn mirrors(&self) -> bool {
+        self.flips && self.rtl()
+    }
 }
 
 /// An open animation scope, walking down with the placement. The
@@ -1567,6 +1595,14 @@ impl UnitPoint {
         UnitPoint { x, y }
     }
 
+    /// The same point seen from the other side: leading becomes
+    /// trailing, the middle stays. What a right-to-left scene does to
+    /// every anchor, so `TOP_LEADING` parks a badge in the top RIGHT
+    /// corner there.
+    pub const fn flipped(self) -> UnitPoint {
+        UnitPoint { x: 1.0 - self.x, y: self.y }
+    }
+
     /// The point in the scene's coordinates.
     fn resolve(self, rect: Rect) -> Point {
         Point {
@@ -2153,6 +2189,15 @@ pub struct VisualProps {
     /// Inherited beside the font; `None` is leading, which is where every
     /// line has always been placed.
     pub text_align: Option<motor::views::TextAlignment>,
+    /// Which way the subtree reads — what an `.environment(…)` that
+    /// turned the direction becomes, so the layout, which never sees
+    /// the environment, reads the island from its own side. Placement
+    /// only, like `text_align`: a direction changes no measure.
+    pub direction: Option<LayoutDirection>,
+    /// `.flips_for_right_to_left_layout_direction(…)` — do the pictures
+    /// below mirror in a right-to-left scene? `Some(false)` turns an
+    /// ancestor's flip off again; `None` inherits.
+    pub flips: Option<bool>,
     /// A soft halo behind the view: `(radius, color)`. The falloff is
     /// quadratic; the halo paints OUTSIDE the shape and follows the
     /// corner radius — including the notch behind a rounded corner,
@@ -2217,6 +2262,8 @@ impl VisualProps {
             font: self.font.or(outer.font),
             line_height: self.line_height.or(outer.line_height),
             text_align: self.text_align.or(outer.text_align),
+            direction: self.direction.or(outer.direction),
+            flips: self.flips.or(outer.flips),
             shadow: self.shadow.or(outer.shadow),
             opacity: self.opacity.or(outer.opacity),
             opacity_hovered: self.opacity_hovered.or(outer.opacity_hovered),
@@ -3941,6 +3988,16 @@ pub struct LayoutResult {
 ///
 /// [`PixelFont`]: crate::text_engine::PixelFont
 pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
+    layout_in(root, proposal, LayoutDirection::LeftToRight)
+}
+
+/// [`layout`], reading from the side `direction` says — the headless
+/// door a right-to-left scene is proved through.
+pub(crate) fn layout_in(
+    root: &LayoutNode,
+    proposal: Proposal,
+    direction: LayoutDirection,
+) -> LayoutResult {
     let engine = PixelFont;
     let images = RawImages::default();
     let cache = MeasureCache::default();
@@ -3958,6 +4015,8 @@ pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
             font: FontSpec::DEFAULT,
             line_height: None,
             text_align: None,
+            direction,
+            flips: false,
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,
@@ -4037,7 +4096,14 @@ pub(crate) fn layout_placing(
         height: proposal.height.map(|height| (height - insets.vertical()).max(0.0)),
     };
     let (size, fit) = crate::stats::time(crate::stats::Stage::Measure, || root.measure(inner, &env));
-    let safe = Rect { origin: Point { x: insets.leading, y: insets.top }, size };
+    // the root stands at the leading inset — the right one in a scene
+    // that reads right to left, where a root wider than the window
+    // spills LEFT, as a left-to-right one spills right
+    let root_x = match inner.width {
+        Some(width) if env.rtl() => insets.leading + (width - size.width),
+        _ => insets.leading,
+    };
+    let safe = Rect { origin: Point { x: root_x, y: insets.top }, size };
     // the window: the proposal where it was proposed, the root's answer
     // plus the insets where it was open
     let window = Rect {
@@ -4047,14 +4113,16 @@ pub(crate) fn layout_placing(
             height: proposal.height.unwrap_or(size.height + insets.vertical()),
         },
     };
-    let mut out = Placement { keep_unseen, ..Placement::default() };
-    out.safe = (insets != Edges::ZERO).then_some(SafeFrame { window, safe });
-    crate::stats::time(crate::stats::Stage::Place, || root.place(safe, &fit, &env, &mut out));
     // popovers place AFTER the root: painted on top, hit first, free
     // of every scroll clip. Their default container is the WINDOW's
     // safe rect (the proposal), never the root's answer — a small scene
     // must not shrink the room a popover positions in.
-    place_overlays(Rect { origin: safe.origin, size: insets.inset(window).size }, &env, &mut out);
+    let container =
+        Rect { origin: Point { x: insets.leading, y: insets.top }, size: insets.inset(window).size };
+    let mut out = Placement { keep_unseen, ..Placement::default() };
+    out.safe = (insets != Edges::ZERO).then_some(SafeFrame { window, safe });
+    crate::stats::time(crate::stats::Stage::Place, || root.place(safe, &fit, &env, &mut out));
+    place_overlays(container, &env, &mut out);
     if !keep_unseen && crate::paranoid::on(crate::paranoid::SEEN) {
         // the claim of the cut: the list is the FULL list with what no
         // pixel can show taken out, and nothing else in the placement
@@ -4064,7 +4132,7 @@ pub(crate) fn layout_placing(
         // the check places the scene again: its counts are nobody's
         let counted = crate::stats::snapshot();
         root.place(safe, &fit, &env, &mut full);
-        place_overlays(Rect { origin: safe.origin, size: insets.inset(window).size }, &env, &mut full);
+        place_overlays(container, &env, &mut full);
         crate::stats::restore(counted);
         let seen = full.display.seen_only();
         assert!(
@@ -4918,6 +4986,8 @@ impl LayoutNode {
                     font: props.font.apply_over(env.font),
                     line_height: props.line_height.or(env.line_height),
                     text_align: props.text_align.or(env.text_align),
+                    direction: props.direction.unwrap_or(env.direction),
+                    flips: props.flips.unwrap_or(env.flips),
                     ..*env
                 };
                 child.first_baseline(&env)
@@ -5479,6 +5549,8 @@ impl LayoutNode {
                     font: props.font.apply_over(env.font),
                     line_height: props.line_height.or(env.line_height),
                     text_align: props.text_align.or(env.text_align),
+                    direction: props.direction.unwrap_or(env.direction),
+                    flips: props.flips.unwrap_or(env.flips),
                     ..*env
                 };
                 let (size, fit) = child.measure(proposal, &env);
@@ -6639,6 +6711,10 @@ impl LayoutNode {
                     width: stretch(layer_size.width, base_size.width, frame.size.width),
                     height: stretch(layer_size.height, base_size.height, frame.size.height),
                 };
+                // an anchor is named from the leading side: a badge at
+                // TOP_LEADING parks in the top right of a scene that
+                // reads right to left
+                let at = if env.rtl() { at.flipped() } else { *at };
                 let origin = Point {
                     x: frame.origin.x + (frame.size.width - size.width) * at.x,
                     y: frame.origin.y + (frame.size.height - size.height) * at.y,
@@ -6686,8 +6762,7 @@ impl LayoutNode {
                     // the alignment edge is horizontal — a 2pt accent bar
                     // hugs the leading side and still centers vertically
                     let origin = Point {
-                        x: frame.origin.x
-                            + align_offset(frame.size.width, size.width, *align),
+                        x: align_x(frame, size.width, *align, env.rtl()),
                         y: frame.origin.y
                             + align_offset(frame.size.height, size.height, CrossAlign::Center),
                     };
@@ -6696,8 +6771,9 @@ impl LayoutNode {
             }
 
             (LayoutNode::Padding { edges, child }, Fit::Wrapped(child_size, fit)) => {
+                // the leading inset is on the side the scene reads from
                 let origin = Point {
-                    x: frame.origin.x + edges.leading,
+                    x: leading_x(frame, edges.leading, child_size.width, env.rtl()),
                     y: frame.origin.y + edges.top,
                 };
                 child.place(Rect { origin, size: *child_size }, fit, env, out);
@@ -6705,8 +6781,7 @@ impl LayoutNode {
 
             (LayoutNode::Frame { align, child, .. }, Fit::Wrapped(child_size, fit)) => {
                 let origin = Point {
-                    x: frame.origin.x
-                        + align_offset(frame.size.width, child_size.width, *align),
+                    x: align_x(frame, child_size.width, *align, env.rtl()),
                     y: frame.origin.y
                         + align_offset(frame.size.height, child_size.height, CrossAlign::Center),
                 };
@@ -6721,8 +6796,7 @@ impl LayoutNode {
 
             (LayoutNode::MaxFrame { align, child, .. }, Fit::Wrapped(child_size, fit))
             | (LayoutNode::FlexFrame { align, child, .. }, Fit::Wrapped(child_size, fit)) => {
-                let x = frame.origin.x
-                    + align_offset(frame.size.width, child_size.width, *align);
+                let x = align_x(frame, child_size.width, *align, env.rtl());
                 let y = frame.origin.y
                     + align_offset(frame.size.height, child_size.height, CrossAlign::Center);
                 child.place(Rect { origin: Point { x, y }, size: *child_size }, fit, env, out);
@@ -6851,6 +6925,8 @@ impl LayoutNode {
                     font: props.font.apply_over(env.font),
                     line_height: props.line_height.or(env.line_height),
                     text_align: props.text_align.or(env.text_align),
+                    direction: props.direction.unwrap_or(env.direction),
+                    flips: props.flips.unwrap_or(env.flips),
                     anim: env.anim.map(|scope| AnimScope { colors: false, ..scope }),
                     ..*env
                 };
@@ -7119,8 +7195,10 @@ impl LayoutNode {
                 for ((index, child), (fit_index, size, fit)) in children.iter().zip(fits) {
                     debug_assert_eq!(*index, *fit_index, "window and fit walk in step");
                     materialized.push(*index);
+                    // a row that measured narrower than its band hugs
+                    // the leading edge, like a column's child would
                     let origin = Point {
-                        x: frame.origin.x,
+                        x: leading_x(frame, 0.0, size.width, env.rtl()),
                         y: frame.origin.y + start_of(*index),
                     };
                     child.place(Rect { origin, size: *size }, fit, env, out);
@@ -7712,7 +7790,8 @@ fn place_flow(
     for (line, &start) in lines.iter().enumerate() {
         let end = lines.get(line + 1).copied().unwrap_or(fits.len());
         let height = fits[start..end].iter().fold(0.0, |tallest: Px, (size, _)| tallest.max(size.height));
-        let mut left = frame.origin.x;
+        // each line reads from the leading edge, like a row
+        let mut along = 0.0;
         for index in start..end {
             let (size, fit) = &fits[index];
             // a baseline is a line's own: its children share it the way
@@ -7721,7 +7800,8 @@ fn place_flow(
                 CrossAlign::Baseline => height - size.height,
                 align => align_offset(height, size.height, align),
             };
-            let at = Rect { origin: Point { x: left, y: top + offset }, size: *size };
+            let x = leading_x(frame, along, size.width, env.rtl());
+            let at = Rect { origin: Point { x, y: top + offset }, size: *size };
             let child = &children[index];
             if out.leaves_unplaced(at) && child.quiet_now() {
                 child.record_unplaced(at, env, out);
@@ -7729,7 +7809,7 @@ fn place_flow(
             } else {
                 child.place(at, fit, env, out);
             }
-            left += size.width + spacing;
+            along += size.width + spacing;
         }
         top += height + line_spacing;
     }
@@ -7939,6 +8019,26 @@ fn align_offset(room: Px, child: Px, align: CrossAlign) -> Px {
         CrossAlign::Center => (leftover / 2.0).max(0.0),
         CrossAlign::End => leftover.max(0.0),
     }
+}
+
+/// Where a child of `width` that starts `along` from the frame's LEADING
+/// edge stands: left to right at `frame.x + along`; right to left the
+/// leading edge is the right one, and the child ends `along` before it.
+/// The one formula behind a row's cursor, a padding's inset, a flow's
+/// line, a split's lanes and a virtual row — a direction is a branch
+/// here, never a pass over what was placed.
+fn leading_x(frame: Rect, along: Px, width: Px, rtl: bool) -> Px {
+    if rtl { frame.origin.x + frame.size.width - along - width } else { frame.origin.x + along }
+}
+
+/// [`align_offset`] on the one axis where leading has a side. The RECT
+/// is mirrored, not the alignment: right to left, `Start` hugs the right
+/// and a child too wide spills LEFT — out past the far side of its
+/// leading edge, exactly where a left-to-right one spills right; `End`
+/// hugs the left; `Center` stays put while it fits.
+fn align_x(frame: Rect, width: Px, align: CrossAlign, rtl: bool) -> Px {
+    let offset = align_offset(frame.size.width, width, align);
+    if rtl { frame.origin.x + frame.size.width - width - offset } else { frame.origin.x + offset }
 }
 
 /// How many whole lines fit in the room, of the `lines` there are.
@@ -8189,8 +8289,12 @@ fn place_stack(
     env: &LayoutEnv<'_>,
     out: &mut Placement,
 ) {
+    // a row reads from its leading edge: the left one, or the right one
+    // in a right-to-left scene, where the cursor walks back
+    let rtl = axis == Axis::Horizontal && env.rtl();
     let mut cursor = match axis {
         Axis::Vertical => frame.origin.y,
+        Axis::Horizontal if rtl => frame.origin.x + frame.size.width,
         Axis::Horizontal => frame.origin.x,
     };
     // baseline alignment: every child sits on the SHARED first
@@ -8225,12 +8329,21 @@ fn place_stack(
             align => align_offset(extent, len, align),
         };
         let origin = match axis {
-            Axis::Vertical => Point {
-                x: frame.origin.x + cross_offset(frame.size.width, size.width),
-                y: cursor,
-            },
+            // the column's cross axis is the one with a side: the
+            // offset is mirrored inside the frame, so `Start` hugs the
+            // right and a too-wide child spills left in a right-to-left
+            // scene (a vertical stack has no shared baseline: start)
+            Axis::Vertical => {
+                let offset = cross_offset(frame.size.width, size.width);
+                let x = if env.rtl() {
+                    frame.origin.x + frame.size.width - size.width - offset
+                } else {
+                    frame.origin.x + offset
+                };
+                Point { x, y: cursor }
+            }
             Axis::Horizontal => Point {
-                x: cursor,
+                x: if rtl { cursor - size.width } else { cursor },
                 y: frame.origin.y + cross_offset(frame.size.height, size.height),
             },
         };
@@ -8241,10 +8354,11 @@ fn place_stack(
         } else {
             child.place(at, fit, env, out);
         }
-        cursor += match axis {
+        let step = match axis {
             Axis::Vertical => size.height,
             Axis::Horizontal => size.width,
         } + spacing;
+        if rtl { cursor -= step } else { cursor += step }
     }
 }
 
@@ -8258,6 +8372,300 @@ mod tests {
 
     fn boundary(path: &str, child: LayoutNode) -> LayoutNode {
         LayoutNode::Boundary { path: Rc::from(path), children: vec![child], quiet: Default::default() }
+    }
+
+    // MARK: - Right to left
+
+    fn stack(axis: Axis, align: CrossAlign, children: Vec<LayoutNode>) -> LayoutNode {
+        LayoutNode::Stack {
+            axis,
+            spacing: 0.0,
+            align,
+            children,
+            hints: ElementHints::default(),
+            action: None,
+        }
+    }
+
+    fn fixed(path: &str, width: Px, height: Px) -> LayoutNode {
+        boundary(
+            path,
+            LayoutNode::Frame {
+                width: Some(width),
+                height: Some(height),
+                align: CrossAlign::Center,
+                child: Box::new(LayoutNode::Spacer),
+            },
+        )
+    }
+
+    fn frame_of(result: &LayoutResult, path: &str) -> Rect {
+        result.frames.get(path).unwrap_or_else(|| panic!("{path} is placed"))
+    }
+
+    /// A row reads from its leading edge: the right one in a right-to-left
+    /// scene, so the first child stands at the right and the row walks
+    /// left — and the root stands at the window's right edge too.
+    #[test]
+    fn an_hstack_lays_out_from_the_right_when_the_direction_is() {
+        let row = stack(
+            Axis::Horizontal,
+            CrossAlign::Center,
+            vec![boundary("a", text(2)), boundary("b", text(3))],
+        );
+        let proposal = Proposal { width: Some(100.0), height: Some(20.0) };
+        let ltr = layout(&row, proposal);
+        assert_eq!(frame_of(&ltr, "a").origin.x, 0.0);
+        assert_eq!(frame_of(&ltr, "b").origin.x, 16.0);
+        let rtl = layout_in(&row, proposal, LayoutDirection::RightToLeft);
+        assert_eq!(frame_of(&rtl, "a").origin.x, 84.0, "the first child ends at the right edge");
+        assert_eq!(frame_of(&rtl, "b").origin.x, 60.0, "and the row walks left");
+        assert_eq!(frame_of(&rtl, "a").origin.y, frame_of(&ltr, "a").origin.y, "nothing moves vertically");
+    }
+
+    /// A column's leading edge is its right one in a right-to-left scene:
+    /// `Start` hugs the right, and a child too wide for the window spills
+    /// LEFT — the mirror of the rule that spills right.
+    #[test]
+    fn a_leading_column_hugs_the_right_in_rtl_and_a_wide_child_spills_left() {
+        let column = stack(
+            Axis::Vertical,
+            CrossAlign::Start,
+            vec![fixed("fits", 40.0, 10.0), fixed("wide", 140.0, 10.0)],
+        );
+        let proposal = Proposal { width: Some(100.0), height: Some(100.0) };
+        let ltr = layout(&column, proposal);
+        assert_eq!(frame_of(&ltr, "fits").origin.x, 0.0);
+        assert_eq!(frame_of(&ltr, "wide").origin.x, 0.0, "a left-to-right column spills right");
+        let rtl = layout_in(&column, proposal, LayoutDirection::RightToLeft);
+        assert_eq!(frame_of(&rtl, "fits").origin.x, 60.0, "start hugs the right");
+        assert_eq!(frame_of(&rtl, "wide").origin.x, -40.0, "and what does not fit spills left");
+        let end = stack(Axis::Vertical, CrossAlign::End, vec![fixed("fits", 40.0, 10.0)]);
+        assert_eq!(
+            frame_of(&layout_in(&end, proposal, LayoutDirection::RightToLeft), "fits").origin.x,
+            60.0,
+            "a column as wide as its child has one place for it",
+        );
+    }
+
+    /// The leading inset is on the side the scene reads from.
+    #[test]
+    fn leading_padding_sits_on_the_right_in_rtl() {
+        let padded = LayoutNode::Padding {
+            edges: Edges { top: 0.0, trailing: 2.0, bottom: 0.0, leading: 10.0 },
+            child: Box::new(boundary("inner", text(5))),
+        };
+        let ltr = layout(&padded, Proposal::unspecified());
+        assert_eq!(ltr.size.width, 52.0);
+        assert_eq!(frame_of(&ltr, "inner").origin.x, 10.0);
+        let rtl = layout_in(&padded, Proposal::unspecified(), LayoutDirection::RightToLeft);
+        assert_eq!(rtl.size, ltr.size, "a direction changes no measure");
+        assert_eq!(frame_of(&rtl, "inner").origin.x, 2.0, "the trailing inset is the left one");
+    }
+
+    /// A frame's horizontal alignment names a side, and the side follows
+    /// the direction; the centre stays where it was.
+    #[test]
+    fn a_frame_puts_its_leading_edge_on_the_right_in_rtl() {
+        let lane = |align: CrossAlign| LayoutNode::Frame {
+            width: Some(132.0),
+            height: Some(30.0),
+            align,
+            child: Box::new(boundary("n", text(4))),
+        };
+        let read = |align: CrossAlign, direction: LayoutDirection| {
+            frame_of(&layout_in(&lane(align), Proposal::unspecified(), direction), "n").origin.x
+        };
+        use LayoutDirection::{LeftToRight, RightToLeft};
+        assert_eq!(read(CrossAlign::Start, LeftToRight), 0.0);
+        assert_eq!(read(CrossAlign::Start, RightToLeft), 100.0);
+        assert_eq!(read(CrossAlign::End, LeftToRight), 100.0);
+        assert_eq!(read(CrossAlign::End, RightToLeft), 0.0);
+        assert_eq!(read(CrossAlign::Center, LeftToRight), 50.0);
+        assert_eq!(read(CrossAlign::Center, RightToLeft), 50.0);
+    }
+
+    /// A pile's alignment edge is horizontal, and it follows the
+    /// direction like a frame's.
+    #[test]
+    fn a_layered_stack_hugs_the_right_for_leading_in_rtl() {
+        let pile = LayoutNode::Layered {
+            align: CrossAlign::Start,
+            modal: false,
+            children: vec![fixed("wide", 118.0, 10.0), fixed("bar", 2.0, 10.0)],
+        };
+        assert_eq!(frame_of(&layout(&pile, Proposal::unspecified()), "bar").origin.x, 0.0);
+        let rtl = layout_in(&pile, Proposal::unspecified(), LayoutDirection::RightToLeft);
+        assert_eq!(frame_of(&rtl, "bar").origin.x, 116.0);
+        assert_eq!(frame_of(&rtl, "wide").origin.x, 0.0);
+    }
+
+    /// An anchor is named from the leading side: a badge at the top
+    /// leading corner parks at the top RIGHT of a right-to-left scene.
+    #[test]
+    fn an_overlay_at_top_leading_sits_top_right_in_rtl() {
+        let badge = |at: UnitPoint| LayoutNode::Overlay {
+            at,
+            behind: false,
+            layer: Box::new(fixed("badge", 10.0, 10.0)),
+            child: Box::new(fixed("box", 100.0, 50.0)),
+        };
+        let read = |at: UnitPoint, direction: LayoutDirection| {
+            frame_of(&layout_in(&badge(at), Proposal::unspecified(), direction), "badge").origin
+        };
+        use LayoutDirection::{LeftToRight, RightToLeft};
+        assert_eq!(read(UnitPoint::TOP_LEADING, LeftToRight), Point { x: 0.0, y: 0.0 });
+        assert_eq!(read(UnitPoint::TOP_LEADING, RightToLeft), Point { x: 90.0, y: 0.0 });
+        assert_eq!(read(UnitPoint::TOP_TRAILING, RightToLeft), Point { x: 0.0, y: 0.0 });
+        assert_eq!(read(UnitPoint::BOTTOM, RightToLeft), Point { x: 45.0, y: 40.0 }, "the middle stays");
+    }
+
+    /// A wrapping row starts every line at the leading edge.
+    #[test]
+    fn a_flow_wraps_from_the_right_in_rtl() {
+        let flow = LayoutNode::Flow {
+            spacing: 0.0,
+            line_spacing: 0.0,
+            align: CrossAlign::Start,
+            children: vec![boundary("a", text(5)), boundary("b", text(5)), boundary("c", text(5))],
+        };
+        let proposal = Proposal { width: Some(100.0), height: Some(100.0) };
+        let ltr = layout(&flow, proposal);
+        assert_eq!(frame_of(&ltr, "a").origin, Point { x: 0.0, y: 0.0 });
+        assert_eq!(frame_of(&ltr, "b").origin, Point { x: 40.0, y: 0.0 });
+        assert_eq!(frame_of(&ltr, "c").origin, Point { x: 0.0, y: 16.0 }, "the third wraps");
+        let rtl = layout_in(&flow, proposal, LayoutDirection::RightToLeft);
+        assert_eq!(frame_of(&rtl, "a").origin, Point { x: 60.0, y: 0.0 }, "the first ends at the right edge");
+        assert_eq!(frame_of(&rtl, "b").origin, Point { x: 20.0, y: 0.0 });
+        assert_eq!(frame_of(&rtl, "c").origin, Point { x: 60.0, y: 16.0 }, "and so does the next line");
+    }
+
+    /// The mirror of `a_squashed_column_keeps_its_bar_on_the_edge_the_window_counts_from`:
+    /// a right-to-left window counts from its right edge, so a root too
+    /// wide to shrink loses its LEFT end, and the bar keeps its right end
+    /// on the window's.
+    #[test]
+    fn a_root_wider_than_the_window_spills_left_in_rtl() {
+        let bar = boundary(
+            "bar",
+            LayoutNode::Frame {
+                width: None,
+                height: Some(40.0),
+                align: CrossAlign::Center,
+                child: Box::new(LayoutNode::Fill),
+            },
+        );
+        let column = stack(Axis::Vertical, CrossAlign::Center, vec![bar, fixed("body", 948.0, 10.0)]);
+        let proposal = Proposal { width: Some(500.0), height: Some(800.0) };
+        let result = layout_in(&column, proposal, LayoutDirection::RightToLeft);
+        assert_eq!(result.size.width, 948.0, "the frame is as wide as the body it cannot shrink");
+        let bar = frame_of(&result, "bar");
+        assert_eq!(bar.origin.x + bar.size.width, 500.0, "the bar keeps its right end on the window's");
+        assert_eq!(bar.origin.x, -448.0, "and loses its left end past the window");
+    }
+
+    /// The structural guard: a scene of rows, columns, paddings, frames,
+    /// a wrapping row and a pile, laid out both ways, is its own mirror —
+    /// every frame and every hit satisfies `x' = W − x − w` and keeps its
+    /// y. What this proves is that no placement site was missed.
+    #[test]
+    fn a_right_to_left_scene_is_the_mirror_of_its_left_to_right_twin() {
+        let scene = stack(
+            Axis::Vertical,
+            CrossAlign::Start,
+            vec![
+                stack(
+                    Axis::Horizontal,
+                    CrossAlign::Center,
+                    vec![fixed("r1", 30.0, 10.0), boundary("r2", text(3)), fixed("r3", 50.0, 20.0)],
+                ),
+                boundary(
+                    "pad",
+                    LayoutNode::Padding {
+                        edges: Edges { top: 1.0, trailing: 3.0, bottom: 1.0, leading: 7.0 },
+                        child: Box::new(fixed("padded", 20.0, 10.0)),
+                    },
+                ),
+                LayoutNode::Frame {
+                    width: Some(200.0),
+                    height: Some(30.0),
+                    align: CrossAlign::End,
+                    child: Box::new(fixed("framed", 60.0, 10.0)),
+                },
+                LayoutNode::Flow {
+                    spacing: 4.0,
+                    line_spacing: 2.0,
+                    align: CrossAlign::Start,
+                    children: vec![
+                        boundary("f1", text(6)),
+                        boundary("f2", text(6)),
+                        boundary("f3", text(6)),
+                        boundary("f4", text(6)),
+                    ],
+                },
+                LayoutNode::Layered {
+                    align: CrossAlign::Start,
+                    modal: false,
+                    children: vec![fixed("under", 120.0, 20.0), fixed("over", 15.0, 20.0)],
+                },
+                LayoutNode::Overlay {
+                    at: UnitPoint::TOP_LEADING,
+                    behind: false,
+                    layer: Box::new(fixed("badge", 8.0, 8.0)),
+                    child: Box::new(fixed("host", 80.0, 40.0)),
+                },
+            ],
+        );
+        let width = 300.0;
+        let proposal = Proposal { width: Some(width), height: Some(400.0) };
+        let ltr = layout(&scene, proposal);
+        let rtl = layout_in(&scene, proposal, LayoutDirection::RightToLeft);
+        assert_eq!(ltr.size, rtl.size, "a direction changes no measure");
+        let paths = [
+            "r1", "r2", "r3", "pad", "padded", "framed", "f1", "f2", "f3", "f4", "under", "over",
+            "badge", "host",
+        ];
+        for path in paths {
+            let (left, right) = (frame_of(&ltr, path), frame_of(&rtl, path));
+            assert_eq!(left.size, right.size, "{path} keeps its size");
+            assert_eq!(left.origin.y, right.origin.y, "{path} keeps its y");
+            assert!(
+                (right.origin.x - (width - left.origin.x - left.size.width)).abs() < 1e-9,
+                "{path}: {} is not the mirror of {}",
+                right.origin.x,
+                left.origin.x
+            );
+        }
+        assert_eq!(ltr.hits.len(), rtl.hits.len());
+        for ((path, left), (twin, right)) in ltr.hits.iter().zip(&rtl.hits) {
+            assert_eq!(path, twin);
+            assert!((right.origin.x - (width - left.origin.x - left.size.width)).abs() < 1e-9, "{path}");
+        }
+    }
+
+    /// The contract on the other side: left to right is what it always
+    /// was, down to the last command.
+    #[test]
+    fn a_left_to_right_scene_is_the_one_it_always_was() {
+        let scene = stack(
+            Axis::Vertical,
+            CrossAlign::Start,
+            vec![
+                stack(Axis::Horizontal, CrossAlign::Center, vec![boundary("a", text(2)), boundary("b", text(3))]),
+                LayoutNode::Padding {
+                    edges: Edges { top: 1.0, trailing: 3.0, bottom: 1.0, leading: 7.0 },
+                    child: Box::new(boundary("c", text(4))),
+                },
+            ],
+        );
+        let proposal = Proposal { width: Some(100.0), height: Some(100.0) };
+        let plain = layout(&scene, proposal);
+        let spelled = layout_in(&scene, proposal, LayoutDirection::LeftToRight);
+        assert_eq!(plain.display.as_slice(), spelled.display.as_slice());
+        assert_eq!(plain.hits, spelled.hits);
+        for path in ["a", "b", "c"] {
+            assert_eq!(frame_of(&plain, path), frame_of(&spelled, path));
+        }
     }
 
     /// The starts a list whose rows measure themselves keeps are the ones
@@ -9217,6 +9625,8 @@ mod tests {
             font: FontSpec::DEFAULT,
             line_height: None,
             text_align: None,
+            direction: LayoutDirection::LeftToRight,
+            flips: false,
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,
@@ -9252,6 +9662,8 @@ mod tests {
                 font: FontSpec::DEFAULT,
                 line_height: None,
                 text_align: None,
+                direction: LayoutDirection::LeftToRight,
+                flips: false,
                 stamp: FrameStamp::idle(interaction, &carets),
                 animator: None,
                 anim: None,
@@ -9310,6 +9722,8 @@ mod tests {
             font: FontSpec::DEFAULT,
             line_height: None,
             text_align: None,
+            direction: LayoutDirection::LeftToRight,
+            flips: false,
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,
@@ -9642,6 +10056,8 @@ mod tests {
             font: FontSpec::DEFAULT,
             line_height: None,
             text_align: None,
+            direction: LayoutDirection::LeftToRight,
+            flips: false,
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,
@@ -9715,6 +10131,8 @@ mod tests {
             font: FontSpec::DEFAULT,
             line_height: None,
             text_align: None,
+            direction: LayoutDirection::LeftToRight,
+            flips: false,
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,

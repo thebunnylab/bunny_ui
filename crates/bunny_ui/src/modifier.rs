@@ -228,8 +228,12 @@ pub enum Modifier {
     Toolbar,
     AttachEnvironmentOverrides,
     AttachEnvironmentOverridesOnChange,
-    FlipsForRightToLeftLayoutDirection(bool),
     NavigationDestination,
+
+    /// `.flipsForRightToLeftLayoutDirection(…)` — the pictures below
+    /// mirror in a right-to-left scene (a chevron that points the way,
+    /// never a photograph). A style to the layout, like a font.
+    FlipsForRightToLeftLayoutDirection(bool),
 }
 
 impl Modifier {
@@ -1782,6 +1786,23 @@ fn apply(
             if let Some(path) = motor::identity::cursor_scope() {
                 crate::reconciler::attribute_handler(path, *id, handler.clone());
             }
+        }
+        _ => {}
+    }
+
+    // the environment's direction and the flip are STYLES to the layout,
+    // which never sees the environment: an `.environment(…)` that turned
+    // the direction wraps its subtree in a styled node, so the island
+    // below reads from its own side; a flip rides the same node
+    match modifier {
+        Modifier::EnvSet { .. } => {
+            let (outer, inner) = (ctx.values.layoutDirection, base_ctx.values.layoutDirection);
+            if outer != inner {
+                wrap_styled(out, mark, VisualProps { direction: Some(inner), ..Default::default() });
+            }
+        }
+        Modifier::FlipsForRightToLeftLayoutDirection(flips) => {
+            wrap_styled(out, mark, VisualProps { flips: Some(*flips), ..Default::default() });
         }
         _ => {}
     }

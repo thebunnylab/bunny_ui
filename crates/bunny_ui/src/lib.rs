@@ -16947,6 +16947,79 @@ mod tests {
         assert_eq!(runtime.context().environment::<SizeClass>(), SizeClass::Compact);
     }
 
+    // MARK: - The direction reaches the layout
+
+    /// Where each text line starts, by its words — the probe the
+    /// direction tests read the scene through.
+    fn text_lefts(display: &crate::layout::DisplayList) -> Vec<(String, f64)> {
+        display
+            .iter()
+            .filter_map(|command| match command {
+                crate::layout::DrawCommand::TextLine { content, origin, .. } => {
+                    Some((content.to_string(), origin.x))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[derive(Clone, Copy)]
+    struct Pair;
+    impl Component for Pair {
+        fn body(self, _ctx: &Context) -> impl View {
+            hstack!(text("a"), text("bb"))
+        }
+    }
+
+    /// An `.environment` that turns the direction turns it for its
+    /// subtree alone: the island reads from the right inside a scene
+    /// that reads from the left.
+    #[test]
+    fn an_rtl_island_inside_an_ltr_tree_mirrors_only_itself() {
+        #[derive(Clone, Copy)]
+        struct Scene;
+        impl Component for Scene {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    Pair,
+                    Pair.environment(|values| values.layoutDirection = LayoutDirection::RightToLeft),
+                )
+            }
+        }
+        let runtime = Runtime::new();
+        let lefts = text_lefts(&runtime.display_frame(&Scene, Size { width: 100.0, height: 100.0 }));
+        assert_eq!(
+            lefts,
+            [("a".into(), 0.0), ("bb".into(), 8.0), ("a".into(), 16.0), ("bb".into(), 0.0)],
+            "the plain row reads left to right, the island right to left"
+        );
+    }
+
+    /// The other way round: a scene pinned right to left stands at the
+    /// window's right edge and reads from it, and an island turned back
+    /// reads from its own left.
+    #[test]
+    fn an_ltr_island_inside_an_rtl_app_reads_from_the_left() {
+        #[derive(Clone, Copy)]
+        struct Scene;
+        impl Component for Scene {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    Pair,
+                    Pair.environment(|values| values.layoutDirection = LayoutDirection::LeftToRight),
+                )
+            }
+        }
+        let runtime = Runtime::new();
+        assert!(runtime.set_layout_direction(Some(LayoutDirection::RightToLeft)));
+        let lefts = text_lefts(&runtime.display_frame(&Scene, Size { width: 100.0, height: 100.0 }));
+        assert_eq!(
+            lefts,
+            [("a".into(), 92.0), ("bb".into(), 76.0), ("a".into(), 76.0), ("bb".into(), 84.0)],
+            "the scene hugs the right edge; the plain row reads right to left, the island left to right"
+        );
+    }
+
     /// The shell's insets reach a BODY, and the keyboard's band stays its
     /// own number.
     ///
