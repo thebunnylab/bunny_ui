@@ -81,7 +81,7 @@ pub enum EditCommand {
 }
 
 /// The previous char boundary (or 0).
-fn previous_boundary(text: &str, index: usize) -> usize {
+pub(crate) fn previous_boundary(text: &str, index: usize) -> usize {
     let mut index = index.min(text.len());
     loop {
         if index == 0 {
@@ -108,7 +108,7 @@ fn next_boundary(text: &str, index: usize) -> usize {
     }
 }
 
-fn clamp_to_boundary(text: &str, index: usize) -> usize {
+pub(crate) fn clamp_to_boundary(text: &str, index: usize) -> usize {
     let index = index.min(text.len());
     if text.is_char_boundary(index) {
         index
@@ -437,6 +437,12 @@ pub fn byte_to_utf16(text: &str, byte: usize) -> usize {
 pub(crate) struct Lent {
     pub text: std::sync::Arc<str>,
     pub version: Option<(u64, u64)>,
+    /// The field's own edits since this text was lent: every byte before
+    /// this one is as the text has it — set only while that holds.
+    pub kept_before: Option<usize>,
+    /// The text this one was edited from, and the bytes they share: a
+    /// count made over the old one carries over up to there.
+    pub from: Option<(std::sync::Arc<str>, usize)>,
 }
 
 /// A field's text as one shared allocation: the one lent last, while the
@@ -455,11 +461,14 @@ pub(crate) fn lend_text(
         }
         if *kept.text == *value {
             kept.version = version;
+            kept.kept_before = None;
             return kept.text.clone();
         }
     }
     let fresh: std::sync::Arc<str> = std::sync::Arc::from(value);
-    *lent = Some(Lent { text: fresh.clone(), version });
+    // what the field's own edits left of the old text travels with the new
+    let from = lent.take().and_then(|old| old.kept_before.map(|before| (old.text, before)));
+    *lent = Some(Lent { text: fresh.clone(), version, kept_before: None, from });
     fresh
 }
 
@@ -469,7 +478,7 @@ pub(crate) fn lend_text(
 /// bytes, and a block cut through a character gains at most one — so the
 /// compiler adds sixteen bytes at a time instead of widening each one to
 /// a word.
-fn utf16_len(bytes: &[u8]) -> usize {
+pub(crate) fn utf16_len(bytes: &[u8]) -> usize {
     bytes
         .chunks(UTF16_BLOCK)
         .map(|block| {

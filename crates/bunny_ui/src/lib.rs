@@ -7534,6 +7534,69 @@ mod tests {
     }
 
     #[test]
+    fn the_input_method_counts_stay_true_through_edits_moves_and_outside_writes() {
+        use crate::layout::{Proposal, Size};
+        #[derive(Clone)]
+        struct Panel {
+            note: State<String>,
+        }
+        impl Component for Panel {
+            fn body(self, _: &Context) -> impl View {
+                text_editor("note", self.note.binding()).frame(400.0, 300.0)
+            }
+        }
+        let note: String = (0..300).map(|line| format!("line {line} — é 日本 🦀\n")).collect();
+        let panel = Panel { note: State::new(note) };
+        let runtime = Runtime::new();
+        let proposal = Proposal::exact(Size { width: 400.0, height: 300.0 });
+        runtime.render_stable(&panel);
+        let layout = runtime.layout(&panel, proposal);
+        let path = layout.hits.first().expect("field target").0.clone();
+        runtime.focus(&path);
+        let mut seed: u64 = 0x0071_6f75_6e74;
+        let mut roll = move |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let words = ["x", "é", "日", "🦀", "\n", "ab"];
+        for step in 0..400 {
+            match roll(9) {
+                0..=2 => {
+                    let word = words[roll(words.len() as u64) as usize];
+                    runtime.key(EditCommand::Insert(word.into()));
+                }
+                3 | 4 => {
+                    runtime.key(EditCommand::Backspace);
+                }
+                5 => {
+                    runtime.key(EditCommand::Left(false));
+                }
+                6 => {
+                    runtime.key(EditCommand::Right(false));
+                }
+                7 => {
+                    for _ in 0..roll(40) {
+                        runtime.key(EditCommand::Left(false));
+                    }
+                }
+                _ => {
+                    // the app writes the note itself: no edit of the field's
+                    // may carry a count over it
+                    panel.note.update(|text| text.insert_str(0, "outside "));
+                }
+            }
+            runtime.render_stable(&panel);
+            let _ = runtime.layout(&panel, proposal);
+            let snapshot = runtime.ime_snapshot().expect("the focused note answers the input method");
+            let text = panel.note.get();
+            let caret = crate::text_input::clamp_index(&text, runtime.caret_for(&path).caret);
+            let units: usize = text[..caret].chars().map(char::len_utf16).sum();
+            assert_eq!(snapshot.selected.0, units, "step {step}: the caret's UTF-16 offset");
+            assert_eq!(&*snapshot.text, text.as_str(), "step {step}: the snapshot is the note");
+        }
+    }
+
+    #[test]
     fn a_note_is_never_shaped_whole_while_it_is_typed_into() {
         use crate::layout::{Proposal, Size};
         use crate::text_engine::{FontSpec, LineMetrics, PixelFont, TextEngine, TextRaster};

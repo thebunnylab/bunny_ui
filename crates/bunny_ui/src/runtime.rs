@@ -232,6 +232,11 @@ pub struct Runtime {
     /// typing or focusing returns it to solid (an idle caret blinks,
     /// an active one does not).
     caret_visible: Cell<bool>,
+    /// The last UTF-16 count the input method was given: the text, a byte
+    /// and the units before it. The next count starts there, and it
+    /// carries over the field's own edits up to the first byte they
+    /// touched — a caret at the end of a megabyte is not walked to again.
+    utf16_memo: RefCell<Option<(std::sync::Arc<str>, usize, usize)>>,
     /// The column a vertical walk keeps while it crosses short lines.
     /// Any other caret move clears it — the walk starts fresh from
     /// wherever the caret now stands.
@@ -1481,6 +1486,7 @@ impl Runtime {
             focus_heard: RefCell::new((None, None)),
             carets: RefCell::new(HashMap::default()),
             caret_visible: Cell::new(true),
+            utf16_memo: RefCell::new(None),
             goal_column: Cell::new(None),
             last_fields: RefCell::new(Vec::new()),
             last_splits: RefCell::new(Vec::new()),
@@ -4236,10 +4242,16 @@ impl Runtime {
 
         let caret = crate::text_input::clamp_index(&text, state.caret);
         let (start, end) = state.selection().unwrap_or((caret, caret));
-        // each span counted from where it starts: one walk to the start,
-        // then only the span — never the text twice
-        let selected = crate::text_input::utf16_span(&text, start, end);
-        let marked = state.marked.map(|(start, end)| crate::text_input::utf16_span(&text, start, end));
+        // each span counted from where the last count stood: nothing but
+        // the distance walked, never the text from its start
+        let span = |start: usize, end: usize| {
+            let head = self.utf16_before(&path, &text, start);
+            let start = crate::text_input::clamp_to_boundary(&text, start);
+            let end = crate::text_input::clamp_to_boundary(&text, end.max(start));
+            (head, crate::text_input::utf16_len(&text.as_bytes()[start..end]))
+        };
+        let selected = span(start, end);
+        let marked = state.marked.map(|(start, end)| span(start, end));
 
         let field = self
             .last_fields
@@ -4250,6 +4262,40 @@ impl Runtime {
         let caret_rect = self.field_byte_rect(&field, &text, caret);
 
         Some(ImeSnapshot { text, selected, marked, caret_rect })
+    }
+
+    /// A field's caret, for tests that check what the input method is told.
+    #[cfg(test)]
+    pub(crate) fn caret_for(&self, path: &str) -> CaretState {
+        self.carets.borrow().get(path).copied().unwrap_or_default()
+    }
+
+    /// UTF-16 units before `byte` of a field's text, counted from the last
+    /// count: over the same text only the distance between the two bytes,
+    /// and over a text the field's own edits made from it, the same — up to
+    /// the first byte those edits touched, which both texts share.
+    fn utf16_before(&self, path: &str, text: &std::sync::Arc<str>, byte: usize) -> usize {
+        let byte = crate::text_input::clamp_to_boundary(text, byte);
+        let mut memo = self.utf16_memo.borrow_mut();
+        let from = memo.as_ref().and_then(|(kept, at, units)| {
+            if std::sync::Arc::ptr_eq(kept, text) {
+                return Some((*at, *units));
+            }
+            let cell = reconciler::editor_text(path)?;
+            let cell = cell.borrow();
+            let lent = cell.as_ref()?;
+            let (old, shared) = lent.from.as_ref()?;
+            (std::sync::Arc::ptr_eq(&lent.text, text) && std::sync::Arc::ptr_eq(old, kept) && *at <= *shared)
+                .then_some((*at, *units))
+        });
+        let bytes = text.as_bytes();
+        let units = match from {
+            Some((at, units)) if at <= byte => units + crate::text_input::utf16_len(&bytes[at..byte]),
+            Some((at, units)) => units - crate::text_input::utf16_len(&bytes[byte..at]),
+            None => crate::text_input::utf16_len(&bytes[..byte]),
+        };
+        *memo = Some((text.clone(), byte, units));
+        units
     }
 
     /// The UTF-16 index in the FOCUSED field at a layout point — `None`
