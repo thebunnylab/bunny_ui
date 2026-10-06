@@ -186,6 +186,16 @@ function sendText(text) {
   new Uint8Array(wasm.memory.buffer, pointer, bytes.length).set(bytes);
   wasm.bunny_text(pointer, bytes.length);
 }
+// The languages the reader prefers, best first, as the browser lists
+// them — one comma-joined list, the shell's report to the runtime
+const readerLanguages = () =>
+  (navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language || "en"]).join(",");
+function sendLanguages(list) {
+  const bytes = new TextEncoder().encode(list);
+  const pointer = wasm.bunny_alloc(bytes.length);
+  new Uint8Array(wasm.memory.buffer, pointer, bytes.length).set(bytes);
+  wasm.bunny_set_languages(pointer, bytes.length);
+}
 // The element registry: what the engine created, by id — and the
 // roots of the clones. A clone's members are not registered at all:
 // their ids follow the root's in pre-order, so a member is found by its
@@ -1935,6 +1945,12 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         ? [Number(app.dataset.width), Number(app.dataset.height)]
         : reader;
     mounted = served;
+    // the languages go in BEFORE the start, so the first frame is already
+    // in them: a served page adopts in the language it was built in — the
+    // mount's own — and a fresh page starts in the reader's
+    if (wasm.bunny_set_languages) {
+      sendLanguages(hydrated && app.lang ? app.lang : readerLanguages());
+    }
     wasm[START_EXPORT](served[0], served[1], window.devicePixelRatio || 1, hydrated ? 1 : 0);
     if (reader[0] !== served[0] || reader[1] !== served[1]) {
       mounted = reader;
@@ -1951,6 +1967,16 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
       wasm.bunny_set_motion(query.matches ? 0 : 1);
       query.addEventListener("change", (event) => {
         if (wasm) wasm.bunny_set_motion(event.matches ? 0 : 1);
+      });
+    }
+
+    // The reader's languages: a served page adopted in its own language
+    // now hears the reader's — one diff, if they differ — and a reader who
+    // changes them is heard at once
+    if (wasm.bunny_set_languages) {
+      if (hydrated) sendLanguages(readerLanguages());
+      addEventListener("languagechange", () => {
+        if (wasm) sendLanguages(readerLanguages());
       });
     }
 
