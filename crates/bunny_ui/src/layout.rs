@@ -2438,7 +2438,8 @@ pub struct ThumbDrag {
 /// A draw command — the output of the placement pass, in paint order
 /// (whoever comes later paints on top; `Layered` counts on that).
 /// It is the rasterizer's interface and, later on, any backend's.
-#[derive(Clone, PartialEq, Debug)]
+/// Equality is "paints alike" — see the `PartialEq` impl.
+#[derive(Clone, Debug)]
 pub enum DrawCommand {
     /// `corner_radius: Corners::ZERO` = plain rectangle (the usual
     /// straight path). Four numbers, so a band of a bigger figure can
@@ -2492,6 +2493,45 @@ pub enum DrawCommand {
     /// intersection, so the composition lives where the stacks live.
     PushClip { rect: Rect, corner_radius: Corners },
     PopClip,
+}
+
+/// Two commands are equal when they paint alike. Every kind compares
+/// field by field, except a line of text: it compares the span it paints,
+/// not the content it slices that span from. A keystroke gives the whole
+/// note a new string, and the lines it did not touch still paint the same
+/// pixels — so the diffs that keep a frame (the presenters' skip, the
+/// retained surface, a patch) see one changed line, not the screen. It is
+/// cheaper too: a line compares its own bytes, never the note's.
+impl PartialEq for DrawCommand {
+    fn eq(&self, other: &DrawCommand) -> bool {
+        use DrawCommand::*;
+        // exhaustive over `self`: a new kind of command must say what its
+        // equality is
+        match self {
+            FillRect { rect, color, corner_radius } => matches!(other,
+                FillRect { rect: r, color: c, corner_radius: k } if rect == r && color == c && corner_radius == k),
+            Gradient { rect, paint, corner_radius } => matches!(other,
+                Gradient { rect: r, paint: p, corner_radius: k } if rect == r && paint == p && corner_radius == k),
+            Backdrop { rect, glass, corner_radius } => matches!(other,
+                Backdrop { rect: r, glass: g, corner_radius: k } if rect == r && glass == g && corner_radius == k),
+            Shadow { rect, radius, color, corner_radius } => matches!(other,
+                Shadow { rect: r, radius: d, color: c, corner_radius: k }
+                    if rect == r && radius == d && color == c && corner_radius == k),
+            StrokeRect { rect, color, width, corner_radius } => matches!(other,
+                StrokeRect { rect: r, color: c, width: w, corner_radius: k }
+                    if rect == r && color == c && width == w && corner_radius == k),
+            TextLine { origin, content, range, color, font } => matches!(other,
+                TextLine { origin: o, content: t, range: g, color: c, font: f }
+                    if origin == o && color == c && font == f
+                        && ((Arc::ptr_eq(content, t) && range == g)
+                            || content[range.0..range.1] == t[g.0..g.1])),
+            Image { rect, source } => matches!(other,
+                Image { rect: r, source: s } if rect == r && source == s),
+            PushClip { rect, corner_radius } => matches!(other,
+                PushClip { rect: r, corner_radius: k } if rect == r && corner_radius == k),
+            PopClip => matches!(other, PopClip),
+        }
+    }
 }
 
 /// Can a subtree be LEFT UNPLACED while it sits far off the glass?
@@ -8645,6 +8685,27 @@ fn place_stack(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_of_text_equals_another_that_paints_the_same_span() {
+        // a keystroke elsewhere in the note gives every line a new string
+        // to slice; the lines it did not touch still paint alike
+        let line = |content: &Arc<str>, range: (usize, usize), y: f64| DrawCommand::TextLine {
+            origin: Point { x: 8.0, y },
+            content: content.clone(),
+            range,
+            color: Color::BLACK,
+            font: FontSpec::DEFAULT,
+        };
+        let before: Arc<str> = Arc::from("first line\nsecond line");
+        let after: Arc<str> = Arc::from("first line\nsecond linex");
+        assert_eq!(line(&before, (0, 10), 0.0), line(&after, (0, 10), 0.0));
+        assert_ne!(line(&before, (11, 22), 16.0), line(&after, (11, 23), 16.0));
+        assert_ne!(line(&before, (0, 10), 0.0), line(&after, (0, 10), 1.0));
+        // the same span found at another place in another string
+        let moved: Arc<str> = Arc::from("x\nfirst line");
+        assert_eq!(line(&before, (0, 10), 0.0), line(&moved, (2, 12), 0.0));
+    }
 
     fn text(chars: usize) -> LayoutNode {
         LayoutNode::Text { content: crate::bind::TextSource::from("x".repeat(chars)), highlights: None, truncation: None, hints: ElementHints::default(), action: None }
