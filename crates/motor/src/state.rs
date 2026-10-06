@@ -798,9 +798,13 @@ impl<T: Clone + 'static> State<T> {
 
     /// `$x` — the binding projection.
     pub fn binding(&self) -> Binding<T> {
-        let for_get = *self;
         let for_set = *self;
-        Binding::new(move || for_get.wrappedValue(), move |value| for_set.set(value))
+        Binding {
+            // a state's own binding lends its value in place: a field of
+            // a megabyte reads it without a copy
+            get: Rc::new(StateSource(*self)),
+            set: Rc::new(move |value| for_set.set(value)),
+        }
     }
 }
 
@@ -867,17 +871,61 @@ impl<T: Clone + std::fmt::Display + 'static> std::fmt::Display for State<T> {
 
 /// `Binding<T>` — a get/set pair (`$x`, `@Binding`, `Binding.dispatched`).
 pub struct Binding<T> {
-    get: Rc<dyn Fn() -> T>,
+    get: Rc<dyn Source<T>>,
     set: Rc<dyn Fn(T)>,
+}
+
+/// Where a binding's value comes from: a getter, which answers with a
+/// copy, and a lend, which shows the value in place where the source can.
+trait Source<T> {
+    fn get(&self) -> T;
+    fn lend(&self, visit: &mut dyn FnMut(&T));
+}
+
+/// A getter closure: it has nothing to lend, and lends the copy it makes.
+struct Getter<F>(F);
+
+impl<T, F: Fn() -> T> Source<T> for Getter<F> {
+    fn get(&self) -> T {
+        (self.0)()
+    }
+
+    fn lend(&self, visit: &mut dyn FnMut(&T)) {
+        visit(&(self.0)())
+    }
+}
+
+/// A state's own binding: it lends the value where it lives.
+struct StateSource<T>(State<T>);
+
+impl<T: Clone + 'static> Source<T> for StateSource<T> {
+    fn get(&self) -> T {
+        self.0.wrappedValue()
+    }
+
+    fn lend(&self, visit: &mut dyn FnMut(&T)) {
+        self.0.with(|value| visit(value))
+    }
 }
 
 impl<T: Clone + 'static> Binding<T> {
     pub fn new(get: impl Fn() -> T + 'static, set: impl Fn(T) + 'static) -> Self {
-        Binding { get: Rc::new(get), set: Rc::new(set) }
+        Binding { get: Rc::new(Getter(get)), set: Rc::new(set) }
     }
 
     pub fn wrappedValue(&self) -> T {
-        (self.get)()
+        self.get.get()
+    }
+
+    /// Reads the value in place: a state's own binding lends it without
+    /// a clone, and records the read as `wrappedValue` does; a binding
+    /// made of closures has nothing to lend, and `f` sees the value its
+    /// getter returns.
+    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        let mut f = Some(f);
+        let mut answer = None;
+        self.get.lend(&mut |value: &T| answer = f.take().map(|f| f(value)));
+        answer.expect("a binding lends its value exactly once")
     }
 
     pub fn set(&self, value: T) {
@@ -911,9 +959,9 @@ impl<T: Clone + 'static> Binding<T> {
         let old_get2 = self.get.clone();
         let old_set = self.set.clone();
         Binding::new(
-            move || get(&(old_get)()),
+            move || get(&old_get.get()),
             move |value| {
-                let mut whole = (old_get2)();
+                let mut whole = old_get2.get();
                 set(&mut whole, value);
                 (old_set)(whole);
             },
@@ -949,6 +997,30 @@ pub trait ProvidesQueries {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_state_binding_lends_its_value_and_a_made_one_reads_it() {
+        use std::cell::Cell;
+        thread_local! { static CLONES: Cell<usize> = const { Cell::new(0) }; }
+        #[derive(PartialEq, Debug)]
+        struct Counted(usize);
+        impl Clone for Counted {
+            fn clone(&self) -> Self {
+                CLONES.with(|n| n.set(n.get() + 1));
+                Counted(self.0)
+            }
+        }
+        let state = State::new(Counted(7));
+        let binding = state.binding();
+        CLONES.with(|n| n.set(0));
+        assert_eq!(binding.with(|value| value.0), 7);
+        assert_eq!(CLONES.with(Cell::get), 0, "a state's binding lends without a clone");
+        binding.clone().onSet(|_| {}).with(|value| assert_eq!(value.0, 7));
+        assert_eq!(CLONES.with(Cell::get), 0, "and keeps lending through onSet and clone");
+        let made = Binding::new(move || state.wrappedValue(), move |value| state.set(value));
+        assert_eq!(made.with(|value| value.0), 7);
+        assert_eq!(CLONES.with(Cell::get), 1, "a made binding reads through its getter");
+    }
 
     #[test]
     fn state_clones_share_storage() {
