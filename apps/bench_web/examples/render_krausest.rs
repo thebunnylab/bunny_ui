@@ -15,12 +15,14 @@ fn main() {
         Size { width: 1200.0, height: 800.0 },
     );
     println!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"utf-8\"/>\n    \
+        "<!DOCTYPE html>\n<html lang=\"{lang}\" dir=\"{dir}\">\n<head>\n    <meta charset=\"utf-8\"/>\n    \
          <title>bunny_ui-\"keyed\"</title>\n    \
          <link href=\"/css/currentStyle.css\" rel=\"stylesheet\"/>\n    \
          <style>\n#app{{position:relative;width:1200px;min-height:800px;overflow:visible}}\n{css}\n</style>\n</head>\n<body>\n\
          {html}\n<script>\n  window.BUNNY_WASM = \"bench_web.wasm\";\n  window.BUNNY_START = \"start_keyed\";\n</script>\n\
          <script src=\"glue_dom.js\"></script>\n</body>\n</html>",
+        lang = page.lang,
+        dir = page.dir,
         css = page.css,
         html = page.html,
     );
