@@ -174,13 +174,69 @@ struct CFRunLoopSourceContext {
 }
 
 pub unsafe fn class(name: &str) -> Id {
-    let name = CString::new(name).expect("class name without NUL");
-    unsafe { objc_getClass(name.as_ptr()) }
+    if let Some(found) = NAMES.with(|names| names.borrow().classes.get(name).copied()) {
+        return found;
+    }
+    let found = {
+        let c_name = CString::new(name).expect("class name without NUL");
+        unsafe { objc_getClass(c_name.as_ptr()) }
+    };
+    // a class registered at run time is nil until it is: nil is not kept
+    if !found.is_null() {
+        NAMES.with(|names| names.borrow_mut().classes.insert(name.into(), found));
+    }
+    found
 }
 
 pub unsafe fn sel(name: &str) -> Sel {
-    let name = CString::new(name).expect("selector without NUL");
-    unsafe { sel_registerName(name.as_ptr()) }
+    if let Some(found) = NAMES.with(|names| names.borrow().selectors.get(name).copied()) {
+        return found;
+    }
+    let found = {
+        let c_name = CString::new(name).expect("selector without NUL");
+        unsafe { sel_registerName(c_name.as_ptr()) }
+    };
+    NAMES.with(|names| names.borrow_mut().selectors.insert(name.into(), found));
+    found
+}
+
+/// Selectors and classes by name, looked up once per thread: a frame
+/// names dozens of them, and every name used to cost a C string and the
+/// runtime's own lookup.
+#[derive(Default)]
+struct Names {
+    selectors: std::collections::HashMap<Box<str>, Sel, NameHash>,
+    classes: std::collections::HashMap<Box<str>, Id, NameHash>,
+}
+
+thread_local! {
+    static NAMES: std::cell::RefCell<Names> = std::cell::RefCell::new(Names::default());
+}
+
+/// FNV-1a over a name's bytes — a selector is a few dozen bytes, and the
+/// default hasher's keyed rounds cost more than the lookup they guard.
+#[derive(Default, Clone, Copy)]
+struct NameHash;
+
+impl std::hash::BuildHasher for NameHash {
+    type Hasher = Fnv;
+    fn build_hasher(&self) -> Fnv {
+        Fnv(0xcbf29ce484222325)
+    }
+}
+
+struct Fnv(u64);
+
+impl std::hash::Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 ^ byte as u64).wrapping_mul(0x100000001b3);
+        }
+    }
 }
 
 /// A fresh autoreleased `NSString` with this text.
