@@ -330,7 +330,7 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
         bunny_ui::theme::install(bunny_ui::theme::Theme::dark());
     }
     runtime.set_reduce_motion(ffi::reduce_motion());
-    runtime.set_environment(|values| values.horizontalSizeClass = size_class(compact));
+    runtime.set_size_class(size_class(compact));
     let insets = ffi::safe_area();
     runtime.set_safe_area(edges(insets.top, insets.left, insets.bottom, insets.right));
     // a task that lands on a worker thread asks the loop for one more
@@ -781,7 +781,7 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                         });
                     }
                 }
-                runtime.set_environment(|values| values.horizontalSizeClass = size_class(compact));
+                runtime.set_size_class(size_class(compact));
                 blit(runtime, root);
             }
             AppEvent::SafeArea { top, left, bottom, right } => {
