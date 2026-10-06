@@ -17137,6 +17137,143 @@ mod tests {
         assert!((moved - 799.5).abs() < 1.0, "and the seam followed: {moved}");
     }
 
+    /// A popover's side is named from the leading edge: right to left,
+    /// a leading popover opens to the RIGHT of its anchor and a trailing
+    /// one to the left; above and below stay centred. The mirror of
+    /// `a_popover_hangs_off_every_side_with_the_gap`.
+    #[test]
+    fn a_popover_on_the_leading_side_opens_to_the_right_in_rtl() {
+        #[derive(Clone)]
+        struct Turning {
+            side: State<usize>,
+        }
+        impl Component for Turning {
+            fn body(self, _ctx: &Context) -> impl View {
+                let side =
+                    [Side::Bottom, Side::Top, Side::Trailing, Side::Leading][self.side.get()];
+                vstack!(
+                    spacer().frame(180.0, 80.0),
+                    spacer().frame(20.0, 20.0).popover(
+                        State::new(true).binding(),
+                        side,
+                        |_| erased(spacer().frame(40.0, 30.0)),
+                    ),
+                )
+            }
+        }
+        let runtime = Runtime::new();
+        runtime.set_layout_direction(Some(LayoutDirection::RightToLeft));
+        let view = Turning { side: State::new(0) };
+        let window = crate::layout::Proposal::exact(Size { width: 200.0, height: 200.0 });
+        // the column hugs the right edge, so the anchor sits at (100, 80)–(120, 100)
+        let frame = |index: usize| {
+            view.side.set(index);
+            let result = runtime.layout(&view, window);
+            assert_eq!(result.overlays.len(), 1, "one open popover");
+            result.overlays[0].frame
+        };
+        let bottom = frame(0);
+        assert_eq!((bottom.origin.x, bottom.origin.y), (90.0, 106.0), "below, centred");
+        let top = frame(1);
+        assert_eq!((top.origin.x, top.origin.y), (90.0, 44.0), "above, centred");
+        let trailing = frame(2);
+        assert_eq!((trailing.origin.x, trailing.origin.y), (54.0, 75.0), "trailing is the left");
+        let leading = frame(3);
+        assert_eq!((leading.origin.x, leading.origin.y), (126.0, 75.0), "leading is the right");
+    }
+
+    /// A tooltip asked for on the leading side shows on the right of
+    /// its anchor in a right-to-left scene.
+    #[test]
+    fn a_tooltip_on_the_leading_side_opens_to_the_right_in_rtl() {
+        use crate::layout::TOOLTIP_PATH;
+        #[derive(Clone, Copy)]
+        struct Rail;
+        impl Component for Rail {
+            fn body(self, _ctx: &Context) -> impl View {
+                // centred in a wide window, so either side has room
+                vstack!(
+                    text("gear").tooltip_side("Settings", Side::Leading).frame(40.0, 20.0),
+                    spacer().frame(40.0, 60.0),
+                )
+                .frame(400.0, 120.0)
+            }
+        }
+        let bubble = |direction: LayoutDirection| {
+            let runtime = Runtime::new();
+            runtime.set_layout_direction(Some(direction));
+            let size = Size { width: 400.0, height: 120.0 };
+            let result = runtime.layout(&Rail, crate::layout::Proposal::exact(size));
+            let anchor = result
+                .tooltips
+                .first()
+                .expect("the gear explains itself")
+                .rect;
+            runtime.pointer_moved(anchor.origin.x + 5.0, anchor.origin.y + 5.0, false);
+            runtime.tooltip_tick();
+            assert!(runtime.tooltip_tick(), "the second beat shows the bubble");
+            let result = runtime.layout(&Rail, crate::layout::Proposal::exact(size));
+            let bubble = result
+                .overlays
+                .iter()
+                .find(|overlay| overlay.path == TOOLTIP_PATH)
+                .expect("the bubble is an overlay")
+                .frame;
+            (anchor, bubble)
+        };
+        let (anchor, left_of) = bubble(LayoutDirection::LeftToRight);
+        assert!(left_of.origin.x + left_of.size.width <= anchor.origin.x, "left to right, before the anchor");
+        let (anchor, right_of) = bubble(LayoutDirection::RightToLeft);
+        assert!(right_of.origin.x >= anchor.origin.x + anchor.size.width, "right to left, after it");
+    }
+
+    /// A context menu hangs down-LEFT of the press in a right-to-left
+    /// scene, and lays its rows out from the right.
+    #[test]
+    fn a_context_menu_hangs_down_left_in_rtl() {
+        use crate::action::Modifiers;
+        use crate::custom::PointerButton;
+        use crate::layout::MENU_PATH;
+        #[derive(Clone, Copy)]
+        struct Pane;
+        impl Component for Pane {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("file").frame(400.0, 100.0).context_menu(vec![menu_item("Open", || {})])
+            }
+        }
+        let size = Size { width: 500.0, height: 200.0 };
+        let menu = |direction: LayoutDirection| {
+            let runtime = Runtime::new();
+            runtime.set_layout_direction(Some(direction));
+            runtime.render_stable(&Pane);
+            let _ = runtime.layout(&Pane, crate::layout::Proposal::exact(size));
+            assert!(runtime.button_pressed(250.0, 50.0, PointerButton::Secondary, Modifiers::NONE));
+            let result = runtime.layout(&Pane, crate::layout::Proposal::exact(size));
+            let panel = result
+                .overlays
+                .iter()
+                .find(|overlay| overlay.path == MENU_PATH)
+                .expect("the menu is an overlay");
+            let label = result
+                .display
+                .iter()
+                .skip(panel.display.0)
+                .take(panel.display.1 - panel.display.0)
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { origin, .. } => Some(origin.x),
+                    _ => None,
+                })
+                .expect("the row paints its label");
+            (panel.frame, label)
+        };
+        let (frame, label) = menu(LayoutDirection::LeftToRight);
+        assert_eq!(frame.origin.x, 250.0, "left to right, the panel hangs right of the press");
+        assert!(label < frame.origin.x + frame.size.width / 2.0, "and its label reads from the left");
+        let (frame, label) = menu(LayoutDirection::RightToLeft);
+        assert_eq!(frame.origin.x + frame.size.width, 250.0, "right to left, it hangs left of the press");
+        assert!(label > frame.origin.x + frame.size.width / 2.0, "and its label reads from the right");
+    }
+
     /// The shell's insets reach a BODY, and the keyboard's band stays its
     /// own number.
     ///
