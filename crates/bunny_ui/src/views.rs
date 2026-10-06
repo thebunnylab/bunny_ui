@@ -385,6 +385,7 @@ impl View for TextField {
                 let key_strategy = self.editing.clone();
                 let typing_strategy = self.editing.clone();
                 let key_binding = self.text.clone();
+                let lent_for_edit = lent.clone();
                 crate::reconciler::attribute_editor(
                     path.clone(),
                     crate::reconciler::EditorFn {
@@ -475,7 +476,9 @@ impl View for TextField {
                             None => {
                                 let mut command = Some(command);
                                 let mut output = None;
-                                binding.modify(|value| {
+                                let before = binding.version();
+                                let mut touched = usize::MAX;
+                                let changed = binding.modify(|value| {
                                     let Some(command) = command.take() else {
                                         return false;
                                     };
@@ -486,12 +489,30 @@ impl View for TextField {
                                         .flatten()
                                         .reduce(|(a, b), (s, e)| (a.min(s), b.max(e)));
                                     let kept = span.map(|(start, end)| value[start..end].to_owned());
+                                    // the first byte this edit can touch: the span it
+                                    // replaces, or the caret — one character before it
+                                    // for a backspace
+                                    touched = match (span, &command) {
+                                        (Some((start, _)), _) => start,
+                                        (None, crate::text_input::EditCommand::Backspace) => {
+                                            crate::text_input::previous_boundary(value, state.caret)
+                                        }
+                                        (None, _) => state.caret.min(value.len()),
+                                    };
                                     output = crate::text_input::apply(value, state, command);
                                     value.len() != before
                                         || span.zip(kept).is_some_and(|((start, end), kept)| {
                                             value.get(start..end) != Some(kept.as_str())
                                         })
                                 });
+                                // the bytes before the first one touched are as the
+                                // lent text has them — told only while the lent text
+                                // is the one these edits started from
+                                if changed && let Some(lent) = lent_for_edit.borrow_mut().as_mut() {
+                                    if lent.kept_before.is_some() || (before.is_some() && lent.version == before) {
+                                        lent.kept_before = Some(lent.kept_before.map_or(touched, |kept| kept.min(touched)));
+                                    }
+                                }
                                 output
                             }
                         }
