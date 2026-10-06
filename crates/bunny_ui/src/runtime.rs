@@ -1087,7 +1087,7 @@ impl Runtime {
             handler.0(Point { x, y });
             return true;
         }
-        self.open_menu(Point { x, y }, region.items);
+        self.open_menu(Point { x, y }, region.items, region.direction);
         true
     }
 
@@ -1096,7 +1096,12 @@ impl Runtime {
     /// box asked from inside an event ([`crate::custom::EventCtx::open_menu`]).
     /// One road, so the dismiss, the outside press and the row that
     /// fires on the down are the same for both.
-    fn open_menu(&self, at: Point, items: std::rc::Rc<[crate::views::MenuItem]>) {
+    fn open_menu(
+        &self,
+        at: Point,
+        items: std::rc::Rc<[crate::views::MenuItem]>,
+        direction: LayoutDirection,
+    ) {
         let entries: Vec<Option<std::sync::Arc<str>>> = items
             .iter()
             .map(|item| match item {
@@ -1106,7 +1111,7 @@ impl Runtime {
             .collect();
         *self.menu_items.borrow_mut() = Some(items);
         self.interaction.borrow_mut().menu =
-            Some(crate::layout::MenuOpen { at, entries, hovered: None });
+            Some(crate::layout::MenuOpen { at, entries, hovered: None, direction });
     }
 
     /// Closes the open menu without firing anything. `true` = one was
@@ -2086,7 +2091,7 @@ impl Runtime {
                 x: at.x + placement.frame.origin.x,
                 y: at.y + placement.frame.origin.y,
             };
-            self.open_menu(at, items);
+            self.open_menu(at, items, self.layout_direction());
         }
         answer
     }
