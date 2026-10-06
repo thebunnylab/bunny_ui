@@ -573,8 +573,11 @@ impl App {
     ///
     /// One bar for the app, as the mac has one menu bar: every window's
     /// commands run in the window that is frontmost when they are chosen.
+    /// The mac's own items are worded in the language the system
+    /// prefers ([`bunny_ui::words`]).
     pub fn set_menu_bar(&self, bar: &bunny_ui::menu::MenuBar) {
-        ffi::install_menu_bar(&menu::arrange(bar, &ffi::app_name()));
+        let words = bunny_ui::words::Words::for_locale(&bunny_ui_apple::ffi::preferred_locale());
+        ffi::install_menu_bar(&menu::arrange(bar, &ffi::app_name(), &words));
     }
 
     /// Enters the AppKit run loop. Returns when the app terminates.

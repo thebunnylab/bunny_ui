@@ -4020,13 +4020,13 @@ unsafe fn build_menu(menu: &crate::menu::NativeMenu) -> Id {
                 Line::Quit { title, action, key } => {
                     targeted(new_item(title, Some("bunnyMenuPick:"), key.as_ref()), MenuEntry::Quit(*action))
                 }
-                Line::Edit { edit, key } => {
-                    new_item(edit.title(), Some(crate::menu::edit_selector(*edit)), key.as_ref())
+                Line::Edit { edit, title, key } => {
+                    new_item(title, Some(crate::menu::edit_selector(*edit)), key.as_ref())
                 }
                 Line::System { title, selector, key } => new_item(title, Some(selector), key.as_ref()),
-                Line::Services => {
-                    let item = new_item("Services", None, None);
-                    let services = new_menu("Services");
+                Line::Services { title } => {
+                    let item = new_item(title, None, None);
+                    let services = new_menu(title);
                     msg_void_id(item, sel("setSubmenu:"), services);
                     let app = msg_id(class("NSApplication"), sel("sharedApplication"));
                     msg_void_id(app, sel("setServicesMenu:"), services);

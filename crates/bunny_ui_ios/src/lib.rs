@@ -286,7 +286,8 @@ impl App {
     /// matches a key command before the view hears the key — and a row the
     /// window does not answer is dark.
     pub fn set_menu_bar(&self, bar: &bunny_ui::menu::MenuBar) {
-        ffi::install_menu_bar(bunny_ui_apple::uikit_menu::arrange(bar));
+        let words = bunny_ui::words::Words::for_locale(&bunny_ui_apple::ffi::preferred_locale());
+        ffi::install_menu_bar(bunny_ui_apple::uikit_menu::arrange(bar, &words));
     }
 
     /// What to let go of when the system asks for memory back — the
