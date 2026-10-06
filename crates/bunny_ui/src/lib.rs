@@ -12500,6 +12500,7 @@ mod tests {
             phase: 0.0,
             scale: 2.0,
             touch: false,
+            direction: LayoutDirection::LeftToRight,
         };
 
         // the product's own line, `(v * scale).round() / scale`
@@ -17300,6 +17301,61 @@ mod tests {
         // window's inner width, 10 from the left and 30 from the right, and
         // its first word ends on the right band
         assert_eq!(text_lefts(&rtl.display_frame(&Reader, size)), [("30:10".into(), 70.0 - 40.0)]);
+    }
+
+    /// A box hears which way the scene around it reads — in its paint and
+    /// in its events — and the leading-edge formula is offered to it, in
+    /// its own left-origin coordinates.
+    #[test]
+    fn a_box_hears_the_direction_it_paints_in() {
+        use std::cell::RefCell;
+        #[derive(Default)]
+        struct Heard {
+            painted_rtl: Option<bool>,
+            gutter_x: Option<f64>,
+            event_rtl: Option<bool>,
+        }
+        struct Gutter {
+            heard: Rc<RefCell<Heard>>,
+        }
+        impl CustomElement for Gutter {
+            fn paint(&self, ctx: &PaintCtx, _painter: &mut Painter) {
+                let mut heard = self.heard.borrow_mut();
+                heard.painted_rtl = Some(ctx.rtl());
+                // a gutter of 10 on the leading edge
+                heard.gutter_x = Some(ctx.leading_x(0.0, 10.0));
+            }
+            fn event(&self, _event: &ElementEvent, ctx: &EventCtx) -> crate::custom::Response {
+                self.heard.borrow_mut().event_rtl = Some(ctx.direction.is_rtl());
+                crate::custom::Response::ignored()
+            }
+        }
+        #[derive(Clone)]
+        struct Pane {
+            heard: Rc<RefCell<Heard>>,
+        }
+        impl Component for Pane {
+            fn body(self, _ctx: &Context) -> impl View {
+                custom(Gutter { heard: Rc::clone(&self.heard) }).frame(200.0, 100.0)
+            }
+        }
+        let size = Size { width: 300.0, height: 200.0 };
+        for direction in [LayoutDirection::LeftToRight, LayoutDirection::RightToLeft] {
+            let heard = Rc::new(RefCell::new(Heard::default()));
+            let pane = Pane { heard: Rc::clone(&heard) };
+            let runtime = Runtime::new();
+            runtime.set_layout_direction(Some(direction));
+            runtime.render_stable(&pane);
+            let _ = runtime.display_frame(&pane, size);
+            let result = runtime.layout(&pane, crate::layout::Proposal::exact(size));
+            let frame = result.customs.first().expect("the box is placed").frame;
+            runtime.pointer_moved(frame.origin.x + 20.0, frame.origin.y + 20.0, false);
+            let heard = heard.borrow();
+            let rtl = direction.is_rtl();
+            assert_eq!(heard.painted_rtl, Some(rtl), "the paint knows");
+            assert_eq!(heard.gutter_x, Some(if rtl { 190.0 } else { 0.0 }), "the gutter sits on the leading edge");
+            assert_eq!(heard.event_rtl, Some(rtl), "and so does the event");
+        }
     }
 
     /// The shell's insets reach a BODY, and the keyboard's band stays its

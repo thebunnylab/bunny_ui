@@ -32,7 +32,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use motor::state::Context;
+use motor::state::{Context, LayoutDirection};
 use motor::view::RenderNode;
 
 use crate::image_engine::ImageSource;
@@ -412,12 +412,32 @@ pub struct PaintCtx<'a> {
     /// twice — a darker thread down the seam. [`Self::snap`] puts the
     /// edge on a whole pixel and the thread goes away.
     pub scale: Px,
+    /// Which way the scene around the box reads. The box's own
+    /// coordinates stay left-origin either way — a document's columns
+    /// are the document's — but a box that draws chrome with a side (a
+    /// gutter, a disclosure, a scrollbar of its own) puts it on the
+    /// leading edge with [`Self::leading_x`].
+    pub direction: LayoutDirection,
 }
 
 impl PaintCtx<'_> {
     /// The box's size — the usual start of a paint.
     pub fn size(&self) -> Size {
         self.frame.size
+    }
+
+    /// Does the scene around the box read right to left?
+    pub fn rtl(&self) -> bool {
+        self.direction.is_rtl()
+    }
+
+    /// Where a part of `width` that starts `along` from the box's
+    /// LEADING edge stands, in the box's own coordinates: `along` from
+    /// the left, or ending `along` before the right edge in a
+    /// right-to-left scene — the layout's own rule, offered to a box
+    /// that mirrors its chrome by hand.
+    pub fn leading_x(&self, along: Px, width: Px) -> Px {
+        if self.rtl() { self.frame.size.width - along - width } else { along }
     }
 
     /// The whole box in LOCAL coordinates — what a background fills.
@@ -953,6 +973,10 @@ pub struct EventCtx<'a> {
     /// while the app is talking, which is the rule every door into a
     /// box already lives by.
     pub(crate) menu: &'a RefCell<Option<(Point, Rc<[crate::views::MenuItem]>)>>,
+    /// Which way the scene around the box reads — the same answer its
+    /// paint was given ([`PaintCtx::direction`]), so a box that put a
+    /// gutter on the leading edge hit-tests it on the same side.
+    pub direction: LayoutDirection,
 }
 
 impl EventCtx<'_> {

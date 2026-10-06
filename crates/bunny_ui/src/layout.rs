@@ -3401,15 +3401,28 @@ pub struct DropPoint {
     pub local: Point,
     /// The target's own box size — what the fraction divides by.
     pub size: Size,
+    /// Which way the target reads — what [`DropPoint::leading_fraction`]
+    /// counts from.
+    pub direction: LayoutDirection,
 }
 
 impl DropPoint {
     /// The pointer as a FRACTION of the box: `0.0` at the origin edge,
     /// `1.0` at the far edge, each axis on its own. A quadrant, a half
     /// or an insertion index is decided from this and nothing else.
+    /// Physical: the left edge is zero whichever way the target reads.
     pub fn fraction(&self) -> (Px, Px) {
         let axis = |value: Px, extent: Px| if extent > 0.0 { value / extent } else { 0.0 };
         (axis(self.local.x, self.size.width), axis(self.local.y, self.size.height))
+    }
+
+    /// [`DropPoint::fraction`] counted from the LEADING edge: `0.0` where
+    /// the target's content starts, which is its right edge in a
+    /// right-to-left scene. An insertion index into a row of chips reads
+    /// this, so dropping before the first chip means the same both ways.
+    pub fn leading_fraction(&self) -> (Px, Px) {
+        let (x, y) = self.fraction();
+        if self.direction.is_rtl() { (1.0 - x, y) } else { (x, y) }
     }
 }
 
@@ -3426,6 +3439,8 @@ pub struct DropRegion {
     /// The target's OWN box, whole. The fraction divides by this, so a
     /// clipped target never lies about where the hand is.
     pub frame: Rect,
+    /// Which way the target reads — carried into the [`DropPoint`].
+    pub direction: LayoutDirection,
 }
 
 impl std::fmt::Debug for DropRegion {
@@ -3611,6 +3626,9 @@ pub struct CustomPlacement {
     /// (`start..end`) — what a live repaint replaces, and what the GPU
     /// presenter routes to the box's own layer.
     pub slice: (usize, usize),
+    /// Which way the box's scene reads — what its paint and its events
+    /// are told, and the direction a menu it opens hangs in.
+    pub direction: LayoutDirection,
 }
 
 impl CustomPlacement {
@@ -6135,6 +6153,7 @@ impl LayoutNode {
                             live: env.live,
                             overlay: false,
                             slice: (0, 0),
+                            direction: env.direction,
                         });
                         out.customs.len() - 1
                     })
@@ -6181,6 +6200,7 @@ impl LayoutNode {
                     scale: env.scale,
                     touch: env.touch,
                     overlay_layered: layered,
+                    direction: env.direction,
                 };
                 let ink = out.foreground.last().copied().unwrap_or(Color::BLACK);
                 // a box that asked to keep its picture is painted once for
@@ -6231,6 +6251,7 @@ impl LayoutNode {
                                 scale: env.scale,
                                 touch: env.touch,
                                 overlay_layered: layered,
+                                direction: env.direction,
                             };
                             let mut recorded = DisplayList::default();
                             let mut painter = crate::custom::Painter::new(
@@ -6355,6 +6376,7 @@ impl LayoutNode {
                             live: None,
                             overlay: true,
                             slice: (overlay_from, overlay_end),
+                            direction: env.direction,
                         });
                     }
                 }
@@ -6566,6 +6588,7 @@ impl LayoutNode {
                         over: over.clone(),
                         rect,
                         frame,
+                        direction: env.direction,
                     });
                 }
                 child.place(frame, fit, env, out);
@@ -9032,6 +9055,21 @@ mod tests {
         assert_eq!(center, UnitPoint::CENTER, "the centre is its own mirror");
         let glass = Glass::regular().spot(UnitPoint::TOP_LEADING, 0.5, 0.3).flipped();
         assert_eq!(glass.spot.map(|(center, ..)| center), Some(UnitPoint::TOP_TRAILING));
+    }
+
+    /// A drop's fraction is physical, and its leading fraction counts from
+    /// the edge the target's content starts at.
+    #[test]
+    fn a_drop_names_its_leading_fraction() {
+        let point = |direction: LayoutDirection| DropPoint {
+            local: Point { x: 20.0, y: 5.0 },
+            size: Size { width: 100.0, height: 10.0 },
+            direction,
+        };
+        assert_eq!(point(LayoutDirection::LeftToRight).fraction(), (0.2, 0.5));
+        assert_eq!(point(LayoutDirection::LeftToRight).leading_fraction(), (0.2, 0.5));
+        assert_eq!(point(LayoutDirection::RightToLeft).fraction(), (0.2, 0.5), "the hand is where it is");
+        assert_eq!(point(LayoutDirection::RightToLeft).leading_fraction(), (0.8, 0.5), "and far from the start");
     }
 
     /// The contract on the other side: left to right is what it always
