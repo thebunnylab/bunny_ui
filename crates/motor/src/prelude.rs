@@ -7,7 +7,8 @@ pub use crate::loadable::{Loadable, LoadableSubject, LoadError};
 pub use crate::modifiers::{CustomModifier, ModifierBehavior, ModifiedView, Modifier, ViewExt};
 pub use crate::runtime::Runtime;
 pub use crate::state::{
-    Binding, Context, Environment, EnvironmentValues, FromEnvironment, Locale, ProvidesQueries, State,
+    Binding, Context, Environment, EnvironmentValues, FromEnvironment, LayoutDirection, Locale,
+    ProvidesQueries, State,
 };
 pub use std::rc::Rc;
 pub use crate::view::{AnyView, RenderNode, Component, View};
