@@ -2819,6 +2819,14 @@ pub struct DisplayList {
     commands: Vec<DrawCommand>,
 }
 
+/// A list from its commands, as they will paint — what a backend's
+/// tests and tools build by hand.
+impl From<Vec<DrawCommand>> for DisplayList {
+    fn from(commands: Vec<DrawCommand>) -> DisplayList {
+        DisplayList { commands }
+    }
+}
+
 impl DisplayList {
     /// This list with what no pixel can show taken out — the rule the
     /// placement applies while it walks ([`Placement::draw`]), as a pure

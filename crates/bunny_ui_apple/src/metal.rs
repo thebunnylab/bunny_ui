@@ -34,6 +34,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::null_mut;
+use std::rc::Rc;
 
 use bunny_ui::gpu::walk::{
     AtlasFull, AtlasGround, DrawRun, FrameBatches, GLASS_MAX_LEVEL, GlassInstance, RectInstance,
@@ -43,9 +44,10 @@ use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::image_engine::PixelFormat;
 use bunny_ui::image_engine::ImageSource;
 use bunny_ui::layout::{Color, DisplayList, Size};
-use bunny_ui::text_engine::TextEngine;
+use bunny_ui::raster::{DamageRect, ListDamage, list_damage};
+use bunny_ui::text_engine::{MeasureCache, TextEngine};
 
-use crate::ffi::{CGSize, Id, Sel, class, error_message, kill_layer_actions, ns_string, sel};
+use crate::ffi::{CGPoint, CGRect, CGSize, Id, Sel, class, error_message, kill_layer_actions, ns_string, sel};
 
 // MARK: - FFI border
 
@@ -100,6 +102,9 @@ unsafe extern "C" {
     // `CGSize` is a 2-double HFA — it travels in registers.
     #[link_name = "objc_msgSend"]
     fn msg_void_size(obj: Id, sel: Sel, a: CGSize);
+    // `CGRect` is a 4-double HFA — registers too.
+    #[link_name = "objc_msgSend"]
+    fn msg_void_rect(obj: Id, sel: Sel, a: CGRect);
     // `MTLClearColor` is a 4-double HFA — registers as well.
     #[link_name = "objc_msgSend"]
     fn msg_void_clear_color(obj: Id, sel: Sel, a: MTLClearColor);
@@ -274,6 +279,9 @@ using namespace metal;
 
 struct Uniforms {
     float2 viewport;
+    // where the target's first pixel sits in the frame: zero for a
+    // whole frame, the patch's corner for a patch
+    float2 origin;
 };
 
 struct RectInstance {
@@ -341,7 +349,7 @@ vertex RectVary rect_vertex(uint vid [[vertex_id]],
     float2 high = max(min(rect.rect.zw, rect.clip.zw), low);
     float2 corner = unit_corners[vid];
     RectVary out;
-    out.position = to_ndc(mix(low, high, corner), uniforms.viewport);
+    out.position = to_ndc(mix(low, high, corner) - uniforms.origin, uniforms.viewport);
     out.id = iid;
     return out;
 }
@@ -361,9 +369,11 @@ static float clip_cov(float2 p, constant ClipRound& round) {
 
 fragment float4 rect_fragment(RectVary in [[stage_in]],
                               device const RectInstance* rects [[buffer(0)]],
-                              constant ClipRound& round [[buffer(1)]]) {
+                              constant ClipRound& round [[buffer(1)]],
+                              constant Uniforms& uniforms [[buffer(2)]]) {
     RectInstance rect = rects[in.id];
-    float2 p = in.position.xy;
+    // the frame's pixel, wherever the target sits in it
+    float2 p = in.position.xy + uniforms.origin;
     float kind = rect.params.z;
     float coverage;
     if (kind == 0.0) {
@@ -438,7 +448,7 @@ vertex SpriteVary sprite_vertex(uint vid [[vertex_id]],
     float2 high = max(min(sprite.dest.zw, sprite.clip.zw), low);
     float2 corner = unit_corners[vid];
     SpriteVary out;
-    out.position = to_ndc(mix(low, high, corner), uniforms.viewport);
+    out.position = to_ndc(mix(low, high, corner) - uniforms.origin, uniforms.viewport);
     out.id = iid;
     return out;
 }
@@ -446,14 +456,16 @@ vertex SpriteVary sprite_vertex(uint vid [[vertex_id]],
 fragment float4 sprite_fragment(SpriteVary in [[stage_in]],
                                 device const SpriteInstance* sprites [[buffer(0)]],
                                 constant ClipRound& round [[buffer(1)]],
+                                constant Uniforms& uniforms [[buffer(2)]],
                                 texture2d<float, access::read> atlas [[texture(0)]]) {
     SpriteInstance sprite = sprites[in.id];
+    float2 p = in.position.xy + uniforms.origin;
     float2 ratio = (sprite.tex.zw - sprite.tex.xy) / (sprite.dest.zw - sprite.dest.xy);
-    float2 texel = sprite.tex.xy + (floor(in.position.xy) - floor(sprite.dest.xy)) * ratio;
+    float2 texel = sprite.tex.xy + (floor(p) - floor(sprite.dest.xy)) * ratio;
     // straight alpha in, straight alpha out — only the coverage moves,
     // and text under a rounded corner loses its square edge at last
     float4 ink = atlas.read(uint2(texel));
-    return float4(ink.rgb, ink.a * clip_cov(in.position.xy, round));
+    return float4(ink.rgb, ink.a * clip_cov(p, round));
 }
 
 // a feed's sprite: the picture is its own size and the box is another,
@@ -464,12 +476,14 @@ constexpr sampler live_sampler(coord::pixel, filter::linear, address::clamp_to_e
 fragment float4 live_fragment(SpriteVary in [[stage_in]],
                               device const SpriteInstance* sprites [[buffer(0)]],
                               constant ClipRound& round [[buffer(1)]],
+                              constant Uniforms& uniforms [[buffer(2)]],
                               texture2d<float> live [[texture(0)]]) {
     SpriteInstance sprite = sprites[in.id];
+    float2 p = in.position.xy + uniforms.origin;
     float2 ratio = (sprite.tex.zw - sprite.tex.xy) / (sprite.dest.zw - sprite.dest.xy);
-    float2 texel = sprite.tex.xy + (in.position.xy - sprite.dest.xy) * ratio;
+    float2 texel = sprite.tex.xy + (p - sprite.dest.xy) * ratio;
     float4 ink = live.sample(live_sampler, texel);
-    return float4(ink.rgb, ink.a * clip_cov(in.position.xy, round));
+    return float4(ink.rgb, ink.a * clip_cov(p, round));
 }
 
 // MARK: - Liquid glass
@@ -618,7 +632,7 @@ vertex GlassVary glass_vertex(uint vid [[vertex_id]],
     float2 high = max(min(pane.rect.zw, pane.clip.zw), low);
     float2 corner = unit_corners[vid];
     GlassVary out;
-    out.position = to_ndc(mix(low, high, corner), uniforms.viewport);
+    out.position = to_ndc(mix(low, high, corner) - uniforms.origin, uniforms.viewport);
     out.id = iid;
     return out;
 }
@@ -633,7 +647,7 @@ fragment float4 glass_fragment(GlassVary in [[stage_in]],
     constexpr sampler s(mag_filter::linear, min_filter::linear,
                         mip_filter::linear, address::clamp_to_edge);
     GlassInstance pane = panes[in.id];
-    float2 point = in.position.xy;
+    float2 point = in.position.xy + uniforms.origin;
 
     float2 half_size = (pane.rect.zw - pane.rect.xy) * 0.5;
     float2 center_to_point = point - pane.rect.xy - half_size;
@@ -1064,15 +1078,22 @@ impl MetalStack {
             let load = if clear { LOAD_ACTION_CLEAR } else { LOAD_ACTION_LOAD };
             let encoder = self.begin_pass(command, frame.target, 0, load, frame.canvas);
             if !runs.is_empty() {
-                let size = [frame.viewport.0, frame.viewport.1];
+                let uniforms = [frame.viewport.0, frame.viewport.1, frame.origin.0, frame.origin.1];
                 // argument bindings persist across pipeline swaps — the
-                // uniforms bind once
+                // uniforms bind once, to both stages
                 msg_void_ptr_u64_u64(
                     encoder,
                     self.sels.set_vertex_bytes,
-                    size.as_ptr() as *const c_void,
-                    8,
+                    uniforms.as_ptr() as *const c_void,
+                    16,
                     1,
+                );
+                msg_void_ptr_u64_u64(
+                    encoder,
+                    self.sels.set_fragment_bytes,
+                    uniforms.as_ptr() as *const c_void,
+                    16,
+                    2,
                 );
                 let mut bound: Option<RunKind> = None;
                 let mut bound_round: Option<u32> = None;
@@ -1175,12 +1196,12 @@ impl MetalStack {
         unsafe {
             let encoder =
                 self.begin_pass(command, frame.target, 0, LOAD_ACTION_LOAD, frame.canvas);
-            let size = [frame.viewport.0, frame.viewport.1];
+            let size = [frame.viewport.0, frame.viewport.1, frame.origin.0, frame.origin.1];
             msg_void_ptr_u64_u64(
                 encoder,
                 self.sels.set_vertex_bytes,
                 size.as_ptr() as *const c_void,
-                8,
+                16,
                 1,
             );
             msg_void_id(encoder, self.sels.set_pipeline, self.glass_pipeline);
@@ -1209,7 +1230,7 @@ impl MetalStack {
                 encoder,
                 self.sels.set_fragment_bytes,
                 size.as_ptr() as *const c_void,
-                8,
+                16,
                 2,
             );
             msg_void_id_u64(encoder, self.sels.set_fragment_texture, pyramid.ping, 0);
@@ -1333,7 +1354,11 @@ struct EncodeFrame<'a> {
     /// The drawable to copy onto at the end, or null.
     present_to: Id,
     canvas: Color,
+    /// The target's size in pixels.
     viewport: (f32, f32),
+    /// Where the target's first pixel sits in the frame: zero for a
+    /// whole frame, a patch's corner for a patch.
+    origin: (f32, f32),
     instances: Id,
     sprite_offset: usize,
     glass_offset: usize,
@@ -1830,9 +1855,6 @@ impl Drop for MetalGround {
     }
 }
 
-/// A free slot from a ring: polled by `status`, oldest-first. When all
-/// ride the GPU (a burst above the refresh rate), waits for the oldest
-/// — bounded by one sub-millisecond frame.
 /// A completed frame's time on the GPU, on the tape: `G gpu=<ms>`. Read
 /// when its slot is taken for a later frame — the command buffer is done
 /// by then, and the two timestamps are the GPU's own clock.
@@ -1846,6 +1868,9 @@ unsafe fn mark_gpu_time(command: Id, sels: &Sels) {
     }
 }
 
+/// A free slot from a ring: polled by `status`, oldest-first. When all
+/// ride the GPU (a burst above the refresh rate), waits for the oldest
+/// — bounded by one sub-millisecond frame.
 fn acquire_slot(slots: &mut [FrameSlot; 3], cursor: &mut usize, sels: &Sels) -> usize {
     unsafe {
         for offset in 0..slots.len() {
@@ -1968,6 +1993,136 @@ impl std::fmt::Display for AtlasCounts {
     }
 }
 
+/// A frame a layer shows: the list, its physical size, its scale and its
+/// clear colour — the staleness quadruple, the list shared.
+type KeptFrame = (Rc<DisplayList>, (usize, usize), usize, Color);
+
+/// What a frame needs from the window, measured against the frame the
+/// window's own layer shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Plan {
+    /// The layer already shows this frame: a patch over it steps aside.
+    Same,
+    /// The change fits a patch: this box (physical, top-left) repaints.
+    Patch(DamageRect),
+    /// Repaint the window.
+    Whole,
+}
+
+/// A patch box snaps outward to this grid of pixels, so the strokes of
+/// one word keep one drawable size instead of asking for a new one per
+/// glyph.
+const PATCH_GRID: i64 = 64;
+
+/// How many changed commands the diff boxes before it calls the frame
+/// whole — a scroll moves them all and never pays a measure.
+const PATCH_COMMANDS: usize = 64;
+
+/// The share of the window a patch may cover, as a fraction. Past it the
+/// window repaints whole: a patch pays a pass and a composite of its own,
+/// and a big one buys little.
+const PATCH_SHARE: (i64, i64) = (1, 4);
+
+/// The damage snapped outward to the patch grid and clamped to the
+/// window — `None` when nothing of it lands on the window.
+fn snap_patch(damage: DamageRect, physical: (usize, usize)) -> Option<DamageRect> {
+    let (width, height) = (physical.0 as i64, physical.1 as i64);
+    let down = |v: i64| v.div_euclid(PATCH_GRID) * PATCH_GRID;
+    let up = |v: i64| (v + PATCH_GRID - 1).div_euclid(PATCH_GRID) * PATCH_GRID;
+    let rect = (down(damage.0).max(0), down(damage.1).max(0), up(damage.2).min(width), up(damage.3).min(height));
+    (rect.0 < rect.2 && rect.1 < rect.3).then_some(rect)
+}
+
+/// The patch for a damage box, or `None` when it would cover more of the
+/// window than [`PATCH_SHARE`].
+fn patch_box(damage: DamageRect, physical: (usize, usize)) -> Option<DamageRect> {
+    let rect = snap_patch(damage, physical)?;
+    let area = (rect.2 - rect.0) * (rect.3 - rect.1);
+    let window = physical.0 as i64 * physical.1 as i64;
+    (area * PATCH_SHARE.1 <= window * PATCH_SHARE.0).then_some(rect)
+}
+
+/// The small layer over the window's own: a `CAMetalLayer` hung above
+/// the drawable and under every live layer, showing the new frame's
+/// pixels inside its box while the window's layer keeps the last whole
+/// frame. A keystroke or a scrollbar that moves then costs the GPU, and
+/// the window server compositing it, the box — not the window.
+struct Patch {
+    layer: Id,
+    /// The drawable size the layer was last given, in pixels.
+    size: (usize, usize),
+    /// The scale the layer was last given.
+    scale: usize,
+    /// The box it covers on screen (physical, top-left), or `None`
+    /// while it hides.
+    shown: Option<DamageRect>,
+}
+
+impl Patch {
+    /// A hidden patch layer over `root`'s drawable, configured as the
+    /// window's own layer is (opaque: the box is painted whole).
+    unsafe fn new(stack: &MetalStack, root: Id, scale: usize) -> Option<Patch> {
+        unsafe {
+            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            if layer.is_null() {
+                return None;
+            }
+            msg_void_id(layer, sel("setDevice:"), stack.device);
+            msg_void_u64(layer, sel("setPixelFormat:"), stack.format);
+            msg_void_bool(layer, sel("setOpaque:"), 1);
+            msg_void_bool(layer, sel("setFramebufferOnly:"), 1);
+            // a patch presents a stroke at a time: two drawables keep one
+            // on screen and one to paint
+            msg_void_u64(layer, sel("setMaximumDrawableCount:"), 2);
+            msg_void_bool(layer, sel("setAllowsNextDrawableTimeout:"), 0);
+            // every patch presents inside the transaction, its box and
+            // its pixels together. A layer that flips between that and
+            // the asynchronous present loses frames: a drawable once
+            // presented inside a transaction and later presented on its
+            // own is not shown (seen on screen, a stroke behind)
+            msg_void_bool(layer, sel("setPresentsWithTransaction:"), 1);
+            msg_void_f64(layer, sel("setContentsScale:"), scale as f64);
+            msg_void_bool(layer, sel("setHidden:"), 1);
+            kill_layer_actions(layer);
+            // first among the sublayers: over the drawable, under the
+            // live layers the shell hangs after it
+            msg_void_id_u64(root, sel("insertSublayer:atIndex:"), layer, 0);
+            Some(Patch { layer, size: (0, 0), scale, shown: None })
+        }
+    }
+
+    /// The box in the root layer's points: the Mac counts from the
+    /// bottom-left, UIKit from the top-left.
+    fn frame(rect: DamageRect, physical: (usize, usize), scale: usize) -> CGRect {
+        let scale = scale as f64;
+        let y = if cfg!(target_os = "macos") { physical.1 as i64 - rect.3 } else { rect.1 };
+        CGRect {
+            origin: CGPoint { x: rect.0 as f64 / scale, y: y as f64 / scale },
+            size: CGSize {
+                width: (rect.2 - rect.0) as f64 / scale,
+                height: (rect.3 - rect.1) as f64 / scale,
+            },
+        }
+    }
+
+    /// Hides the layer — inside whatever transaction is open.
+    unsafe fn hide(&mut self) {
+        if self.shown.take().is_some() {
+            unsafe { msg_void_bool(self.layer, sel("setHidden:"), 1) };
+            crate::trace::mark("Q", format_args!("hide"));
+        }
+    }
+}
+
+impl Drop for Patch {
+    fn drop(&mut self) {
+        unsafe {
+            msg_void(self.layer, sel("removeFromSuperlayer"));
+            msg_void(self.layer, sel("release"));
+        }
+    }
+}
+
 pub struct MetalPresenter {
     stack: MetalStack,
     layer: Id,
@@ -1980,7 +2135,16 @@ pub struct MetalPresenter {
     batches: FrameBatches,
     /// The last presented frame's key — an identical frame skips the
     /// encode entirely.
-    retained: Option<(DisplayList, (usize, usize), usize, Color)>,
+    retained: Option<KeptFrame>,
+    /// The last WHOLE frame: what the window's own layer shows. A patch
+    /// is measured against it, never against the patch before it — so a
+    /// patch always covers every pixel the layer under it has wrong.
+    base: Option<KeptFrame>,
+    /// The layer that carries a change too small to repaint the window
+    /// for, made on the first such change.
+    patch: Option<Patch>,
+    /// Text boxes for the diff against the base, warm across strokes.
+    boxes: MeasureCache,
     /// Whether the layer currently presents inside the CATransaction —
     /// toggled ON only during live resize.
     transactional: bool,
@@ -2021,7 +2185,7 @@ impl MetalPresenter {
 /// scale and the clear color all sit in the key (the CPU staleness
 /// quadruple, verbatim).
 fn frame_repeats(
-    retained: &Option<(DisplayList, (usize, usize), usize, Color)>,
+    retained: &Option<KeptFrame>,
     display: &DisplayList,
     physical: (usize, usize),
     scale: usize,
@@ -2035,11 +2199,6 @@ fn frame_repeats(
 }
 
 impl MetalPresenter {
-    /// Flips the layer's present contract and remembers it. The flag
-    /// has to be set BEFORE the drawable it governs is asked for: a
-    /// drawable taken under the asynchronous contract and then
-    /// presented inside the transaction is the one frame the layer
-    /// stretches from the size it used to have.
     /// The window went to rest. The frames in flight are waited out (the
     /// last one was committed moments ago) and let go, and the atlas — a
     /// cache, rebuilt from the scene whenever it is lost — is offered
@@ -2064,6 +2223,11 @@ impl MetalPresenter {
         }
     }
 
+    /// Flips the layer's present contract and remembers it. The flag
+    /// has to be set BEFORE the drawable it governs is asked for: a
+    /// drawable taken under the asynchronous contract and then
+    /// presented inside the transaction is the one frame the layer
+    /// stretches from the size it used to have.
     pub fn set_transactional(&mut self, live: bool) {
         if live == self.transactional {
             return;
@@ -2182,6 +2346,23 @@ impl MetalPresenter {
                 objc_autoreleasePoolPop(pool);
                 return;
             }
+            // what the frame changes against the window's own layer — a
+            // live resize is always whole
+            let plan = if live { Plan::Whole } else { self.plan(display, physical, scale, canvas, text) };
+            if plan == Plan::Same {
+                // the window's layer already shows this frame (a stroke
+                // undone, a hover gone): the patch over it steps aside
+                // and nothing encodes
+                if let Some(patch) = self.patch.as_mut() {
+                    let transaction = class("CATransaction");
+                    msg_void(transaction, sel("begin"));
+                    patch.hide();
+                    msg_void(transaction, sel("commit"));
+                }
+                self.retained = self.base.clone();
+                objc_autoreleasePoolPop(pool);
+                return;
+            }
             if !self.ground.wake() {
                 // the system took the atlas while the window rested: its
                 // tiles are gone, and the walk below rasterizes anew
@@ -2208,11 +2389,24 @@ impl MetalPresenter {
             let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
             self.ground.begin_slot(index);
             self.build_with_retries(display, scale, physical, text, images);
+            if let Plan::Patch(rect) = plan {
+                // glass reads the whole scene, so a frame that carries a
+                // pane repaints whole (the diff refuses one already)
+                if self.batches.glass.is_empty() && self.present_patch(index, rect, canvas, physical, scale) {
+                    self.retained = Some((Rc::new(display.clone()), physical, scale, canvas));
+                    objc_autoreleasePoolPop(pool);
+                    return;
+                }
+            }
+            // a whole frame over a patch takes the patch down in the same
+            // transaction — apart, the box would show the old frame for
+            // one refresh
+            let hiding = self.patch.as_ref().is_some_and(|patch| patch.shown.is_some());
             // the contract of THIS frame's drawable, settled before it
             // is asked for. A window whose delegate armed the drag
             // already agrees and this changes nothing; a size the app
             // set itself has no delegate to speak for it, and lands here
-            self.set_transactional(live);
+            self.set_transactional(live || hiding);
             let (sprite_offset, glass_offset) = upload_frame(
                 &mut self.slots[index],
                 self.stack.device,
@@ -2244,6 +2438,7 @@ impl MetalPresenter {
                 present_to,
                 canvas,
                 viewport: (physical.0 as f32, physical.1 as f32),
+                origin: (0.0, 0.0),
                 instances: self.slots[index].buffer,
                 sprite_offset,
                 glass_offset,
@@ -2257,19 +2452,154 @@ impl MetalPresenter {
             });
             // live resize presents INSIDE the CATransaction: commit,
             // wait for the schedule, present — layer content and window
-            // frame land together (the anti-tear toggle). every other
-            // frame presents async, no stall.
-            if live {
+            // frame land together (the anti-tear toggle). A frame that
+            // takes a patch down does the same with the patch. Every
+            // other frame presents async, no stall.
+            if live || hiding {
                 msg_void(command, self.stack.sels.commit);
                 msg_void(command, self.stack.sels.wait_scheduled);
+                let transaction = class("CATransaction");
+                msg_void(transaction, sel("begin"));
                 msg_void(drawable, self.stack.sels.present);
+                if let Some(patch) = self.patch.as_mut() {
+                    patch.hide();
+                }
+                msg_void(transaction, sel("commit"));
             } else {
                 msg_void_id(command, self.stack.sels.present_drawable, drawable);
                 msg_void(command, self.stack.sels.commit);
             }
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
-            self.retained = Some((display.clone(), physical, scale, canvas));
+            let kept = (Rc::new(display.clone()), physical, scale, canvas);
+            self.base = Some(kept.clone());
+            self.retained = Some(kept);
             objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    /// The plan for `display` against the frame the window's layer
+    /// shows: the same frame, a box small enough for a patch, or the
+    /// whole window. No base yet, or a base of another size, scale or
+    /// colour, is the whole window.
+    fn plan(
+        &mut self,
+        display: &DisplayList,
+        physical: (usize, usize),
+        scale: usize,
+        canvas: Color,
+        text: &dyn TextEngine,
+    ) -> Plan {
+        let Some((base, base_physical, base_scale, base_canvas)) = &self.base else {
+            return Plan::Whole;
+        };
+        if *base_physical != physical || *base_scale != scale || *base_canvas != canvas {
+            return Plan::Whole;
+        }
+        self.boxes.begin_frame();
+        match list_damage(
+            base.as_slice(),
+            display.as_slice(),
+            scale,
+            physical,
+            PATCH_COMMANDS,
+            &self.boxes,
+            text,
+        ) {
+            ListDamage::Same => Plan::Same,
+            ListDamage::Whole => Plan::Whole,
+            ListDamage::Rect(damage) => patch_box(damage, physical).map_or(Plan::Whole, Plan::Patch),
+        }
+    }
+
+    /// Presents `rect` of the frame just walked into slot `index`
+    /// through the patch layer, which the window's own layer keeps
+    /// showing the base under. The patch presents inside the
+    /// transaction, with its new geometry when the box moved, resized or
+    /// shows from hiding. False when no patch layer can be had — the
+    /// caller paints whole.
+    unsafe fn present_patch(
+        &mut self,
+        index: usize,
+        rect: DamageRect,
+        canvas: Color,
+        physical: (usize, usize),
+        scale: usize,
+    ) -> bool {
+        unsafe {
+            if self.patch.is_none() {
+                self.patch = Patch::new(&self.stack, self.layer, scale);
+            }
+            let Some(patch) = self.patch.as_mut() else {
+                return false;
+            };
+            let size = ((rect.2 - rect.0) as usize, (rect.3 - rect.1) as usize);
+            let moves = patch.shown != Some(rect);
+            if patch.scale != scale {
+                msg_void_f64(patch.layer, self.stack.sels.set_contents_scale, scale as f64);
+                patch.scale = scale;
+            }
+            if patch.size != size {
+                msg_void_size(
+                    patch.layer,
+                    self.stack.sels.set_drawable_size,
+                    CGSize { width: size.0 as f64, height: size.1 as f64 },
+                );
+                patch.size = size;
+            }
+            let (sprite_offset, glass_offset) = upload_frame(
+                &mut self.slots[index],
+                self.stack.device,
+                &self.stack.sels,
+                &self.batches,
+            );
+            let drawable = msg_id(patch.layer, self.stack.sels.next_drawable);
+            if drawable.is_null() {
+                return false;
+            }
+            let texture = msg_id(drawable, self.stack.sels.texture);
+            self.slots[index].native = self.ground.native.values().cloned().collect();
+            let textures = self.ground.bound(&self.batches.textures);
+            let command = self.stack.encode_frame(EncodeFrame {
+                target: texture,
+                present_to: null_mut(),
+                canvas,
+                viewport: (size.0 as f32, size.1 as f32),
+                origin: (rect.0 as f32, rect.1 as f32),
+                instances: self.slots[index].buffer,
+                sprite_offset,
+                glass_offset,
+                runs: &self.batches.runs,
+                rounds: &self.batches.rounds,
+                atlas_texture: self.ground.shared,
+                textures: &textures,
+                pyramid: None,
+                staging: self.ground.staging_buffer(),
+                live_copies: &self.ground.pending,
+            });
+            msg_void(command, self.stack.sels.commit);
+            msg_void(command, self.stack.sels.wait_scheduled);
+            let transaction = class("CATransaction");
+            msg_void(transaction, sel("begin"));
+            if moves {
+                msg_void_rect(patch.layer, sel("setFrame:"), Patch::frame(rect, physical, scale));
+                msg_void_bool(patch.layer, sel("setHidden:"), 0);
+                patch.shown = Some(rect);
+            }
+            msg_void(drawable, self.stack.sels.present);
+            msg_void(transaction, sel("commit"));
+            self.slots[index].command = msg_id(command, self.stack.sels.retain);
+            crate::trace::mark(
+                "Q",
+                format_args!(
+                    "box={},{},{},{}{}",
+                    rect.0,
+                    rect.1,
+                    rect.2,
+                    rect.3,
+                    if moves { " moved" } else { "" }
+                ),
+            );
+            true
         }
     }
 }
@@ -2326,6 +2656,9 @@ impl MetalPresenter {
             atlas: RunAtlas::new(),
             batches: FrameBatches::default(),
             retained: None,
+            base: None,
+            patch: None,
+            boxes: MeasureCache::default(),
             transactional: false,
             glass: None,
             drawable_wait_ms: 0.0,
@@ -2405,28 +2738,7 @@ impl OffscreenGpu {
         }
         let stack = MetalStack::create(PIXEL_FORMAT_RGBA8)?;
         unsafe {
-            let pool = objc_autoreleasePoolPush();
-            let descriptor = msg_id_u64_u64_u64_bool(
-                class("MTLTextureDescriptor"),
-                sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
-                PIXEL_FORMAT_RGBA8,
-                width as u64,
-                height as u64,
-                0,
-            );
-            msg_void_u64(
-                descriptor,
-                sel("setUsage:"),
-                TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ,
-            );
-            // Shared: the CPU reads the render target directly (the
-            // Apple-Silicon premise of the module)
-            msg_void_u64(descriptor, sel("setStorageMode:"), STORAGE_MODE_SHARED);
-            let target = msg_id_arg(stack.device, sel("newTextureWithDescriptor:"), descriptor);
-            objc_autoreleasePoolPop(pool);
-            if target.is_null() {
-                return None;
-            }
+            let target = readable_target(stack.device, width, height)?;
             let device = stack.device;
             Some(OffscreenGpu {
                 stack,
@@ -2440,6 +2752,34 @@ impl OffscreenGpu {
                 atlas: RunAtlas::new(),
                 batches: FrameBatches::default(),
             })
+        }
+    }
+
+    /// Walks the frame into the batches, resetting the atlas on overflow
+    /// as the window does.
+    fn walk(&mut self, display: &DisplayList, scale: usize, text: &dyn TextEngine, images: &dyn ImageEngine) {
+        self.ground.clear_native();
+        for attempt in 0..4 {
+            match build_frame(
+                &mut self.ground,
+                display,
+                scale,
+                (self.width, self.height),
+                text,
+                images,
+                &mut self.atlas,
+                &mut self.batches,
+            ) {
+                Ok(()) => break,
+                Err(AtlasFull) => {
+                    if attempt == 3 {
+                        eprintln!("bunny_ui metal: atlas overflow survived three resets");
+                        break;
+                    }
+                    self.drain();
+                    self.atlas.reset(&mut self.ground, true);
+                }
+            }
         }
     }
 
@@ -2470,29 +2810,7 @@ impl OffscreenGpu {
             // the slot first, as the window does: the feeds stage into it
             let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
             self.ground.begin_slot(index);
-            self.ground.clear_native();
-            for attempt in 0..4 {
-                match build_frame(
-                    &mut self.ground,
-                    display,
-                    scale,
-                    (self.width, self.height),
-                    text,
-                    images,
-                    &mut self.atlas,
-                    &mut self.batches,
-                ) {
-                    Ok(()) => break,
-                    Err(AtlasFull) => {
-                        if attempt == 3 {
-                            eprintln!("bunny_ui metal: atlas overflow survived three resets");
-                            break;
-                        }
-                        self.drain();
-                        self.atlas.reset(&mut self.ground, true);
-                    }
-                }
-            }
+            self.walk(display, scale, text, images);
             let (sprite_offset, glass_offset) = upload_frame(
                 &mut self.slots[index],
                 self.stack.device,
@@ -2517,6 +2835,7 @@ impl OffscreenGpu {
                 present_to: null_mut(),
                 canvas,
                 viewport: (self.width as f32, self.height as f32),
+                origin: (0.0, 0.0),
                 instances: self.slots[index].buffer,
                 sprite_offset,
                 glass_offset,
@@ -2576,26 +2895,107 @@ impl OffscreenGpu {
     /// The rendered bytes, R,G,B,A per pixel — the same order as the
     /// Surface mirror, so parity compares are `==` over slices.
     pub fn read_rgba(&self) -> Vec<u8> {
-        let mut bytes = vec![0u8; self.width * self.height * 4];
-        unsafe {
-            msg_void_ptr_u64_region_u64(
-                self.target,
-                self.stack.sels.get_bytes,
-                bytes.as_mut_ptr() as *mut c_void,
-                (self.width * 4) as u64,
-                MTLRegion {
-                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
-                    size: MTLSize {
-                        width: self.width as u64,
-                        height: self.height as u64,
-                        depth: 1,
-                    },
-                },
-                0,
-            );
-        }
-        bytes
+        unsafe { read_target(self.target, self.width, self.height, &self.stack.sels) }
     }
+
+    /// Renders the box `rect` (physical, top-left: x0, y0, x1, y1) of
+    /// `display` into a target of the box's own size — the patch a
+    /// window presents over its last whole frame — and returns its RGBA
+    /// bytes, row by row.
+    pub fn patch_rgba(
+        &mut self,
+        display: &DisplayList,
+        scale: usize,
+        canvas: Color,
+        text: &dyn TextEngine,
+        images: &dyn ImageEngine,
+        rect: (usize, usize, usize, usize),
+    ) -> Vec<u8> {
+        let (width, height) = (rect.2 - rect.0, rect.3 - rect.1);
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
+            self.ground.begin_slot(index);
+            self.walk(display, scale, text, images);
+            let (sprite_offset, glass_offset) = upload_frame(
+                &mut self.slots[index],
+                self.stack.device,
+                &self.stack.sels,
+                &self.batches,
+            );
+            let target = readable_target(self.stack.device, width, height).expect("a patch target");
+            self.slots[index].native = self.ground.native.values().cloned().collect();
+            let textures = self.ground.bound(&self.batches.textures);
+            let command = self.stack.encode_frame(EncodeFrame {
+                target,
+                present_to: null_mut(),
+                canvas,
+                viewport: (width as f32, height as f32),
+                origin: (rect.0 as f32, rect.1 as f32),
+                instances: self.slots[index].buffer,
+                sprite_offset,
+                glass_offset,
+                runs: &self.batches.runs,
+                rounds: &self.batches.rounds,
+                atlas_texture: self.ground.shared,
+                textures: &textures,
+                pyramid: None,
+                staging: self.ground.staging_buffer(),
+                live_copies: &self.ground.pending,
+            });
+            msg_void(command, self.stack.sels.commit);
+            msg_void(command, self.stack.sels.wait_completed);
+            self.slots[index].command = msg_id(command, self.stack.sels.retain);
+            let bytes = read_target(target, width, height, &self.stack.sels);
+            msg_void(target, self.stack.sels.release);
+            objc_autoreleasePoolPop(pool);
+            bytes
+        }
+    }
+}
+
+/// A render target the CPU can read: RGBA8, shared storage (the
+/// Apple-Silicon premise of the module).
+unsafe fn readable_target(device: Id, width: usize, height: usize) -> Option<Id> {
+    unsafe {
+        let pool = objc_autoreleasePoolPush();
+        let descriptor = msg_id_u64_u64_u64_bool(
+            class("MTLTextureDescriptor"),
+            sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
+            PIXEL_FORMAT_RGBA8,
+            width as u64,
+            height as u64,
+            0,
+        );
+        msg_void_u64(
+            descriptor,
+            sel("setUsage:"),
+            TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ,
+        );
+        msg_void_u64(descriptor, sel("setStorageMode:"), STORAGE_MODE_SHARED);
+        let target = msg_id_arg(device, sel("newTextureWithDescriptor:"), descriptor);
+        objc_autoreleasePoolPop(pool);
+        (!target.is_null()).then_some(target)
+    }
+}
+
+/// A readable target's bytes, R,G,B,A per pixel, row by row.
+unsafe fn read_target(target: Id, width: usize, height: usize, sels: &Sels) -> Vec<u8> {
+    let mut bytes = vec![0u8; width * height * 4];
+    unsafe {
+        msg_void_ptr_u64_region_u64(
+            target,
+            sels.get_bytes,
+            bytes.as_mut_ptr() as *mut c_void,
+            (width * 4) as u64,
+            MTLRegion {
+                origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                size: MTLSize { width: width as u64, height: height as u64, depth: 1 },
+            },
+            0,
+        );
+    }
+    bytes
 }
 
 // MARK: - Tests
@@ -2664,6 +3064,103 @@ mod tests {
             "{label}: {beyond_one} channels beyond one step ({:.3}% > 1%)",
             share * 100.0
         );
+    }
+
+    /// A scene for the patch tests: a panel, a rounded clip over rows
+    /// and text, a pill that moves by fractions of a point, a stroke and
+    /// a shadow — every pipeline that reads its pixel's position.
+    fn patch_scene(word: &str, hot: bool, shift: f64) -> DisplayList {
+        use bunny_ui::layout::{Corners, DrawCommand, Point, Rect};
+        let rect = |x: f64, y: f64, w: f64, h: f64| Rect {
+            origin: Point { x, y },
+            size: Size { width: w, height: h },
+        };
+        let line = |x: f64, y: f64, text: &str| DrawCommand::TextLine {
+            origin: Point { x, y },
+            content: std::sync::Arc::from(text),
+            range: (0, text.len()),
+            color: Color::BLACK,
+            font: bunny_ui::text_engine::FontSpec::DEFAULT,
+        };
+        DisplayList::from(vec![
+            DrawCommand::FillRect { rect: rect(0.0, 0.0, 160.0, 100.0), color: Color::WHITE, corner_radius: Corners::ZERO },
+            DrawCommand::PushClip { rect: rect(6.0, 6.0, 148.0, 80.0), corner_radius: Corners::all(10.0) },
+            DrawCommand::FillRect {
+                rect: rect(8.0, 10.0, 140.0, 18.0),
+                color: if hot { Color::hex(0xD8DCE6) } else { Color::hex(0xEEEEF2) },
+                corner_radius: Corners::all(4.0),
+            },
+            line(12.0, 12.0, word),
+            DrawCommand::FillRect { rect: rect(8.0, 32.0, 140.0, 18.0), color: Color::hex(0xEEEEF2), corner_radius: Corners::ZERO },
+            line(12.0, 34.0, "beta"),
+            DrawCommand::Shadow { rect: rect(20.0, 56.0 + shift, 40.0, 12.0), radius: 4.0, color: Color::BLACK, corner_radius: Corners::all(6.0) },
+            DrawCommand::FillRect { rect: rect(20.0, 56.0 + shift, 40.0, 12.0), color: Color::hex(0x3366CC), corner_radius: Corners::all(6.0) },
+            DrawCommand::StrokeRect { rect: rect(70.0 + shift, 56.0, 40.0, 12.0), color: Color::BLACK, width: 1.5, corner_radius: Corners::all(3.0) },
+            DrawCommand::PopClip,
+            line(10.0, 88.0, "footer"),
+        ])
+    }
+
+    #[test]
+    fn a_patch_over_the_last_whole_frame_is_the_new_frame_byte_for_byte() {
+        // the window keeps its last whole frame and lays the patch over
+        // it: the two together must be the new frame, pixel for pixel —
+        // for the exact damage box and for the box snapped to the grid
+        if !device_present() {
+            return;
+        }
+        let scale = 2;
+        let physical = (320usize, 200usize);
+        let cache = MeasureCache::default();
+        let mut gpu = OffscreenGpu::new(physical.0, physical.1).expect("offscreen gpu");
+        let pairs = [
+            (("alpha", false, 0.0), ("alphax", false, 0.0)),
+            (("alpha", false, 0.0), ("alpha", true, 0.0)),
+            (("alpha", false, 0.0), ("alpha", false, 1.25)),
+            (("beta", true, 0.75), ("b", false, 0.0)),
+        ];
+        for (from, to) in pairs {
+            let old = patch_scene(from.0, from.1, from.2);
+            let new = patch_scene(to.0, to.1, to.2);
+            gpu.present_wait(&new, scale, Color::CANVAS, &PixelFont, &RawImages::default());
+            let whole = gpu.read_rgba();
+            gpu.present_wait(&old, scale, Color::CANVAS, &PixelFont, &RawImages::default());
+            let base = gpu.read_rgba();
+            let ListDamage::Rect(damage) =
+                list_damage(old.as_slice(), new.as_slice(), scale, physical, 64, &cache, &PixelFont)
+            else {
+                panic!("{from:?} -> {to:?} boxes");
+            };
+            for rect in [damage, snap_patch(damage, physical).expect("on the window")] {
+                let rect = (rect.0 as usize, rect.1 as usize, rect.2 as usize, rect.3 as usize);
+                let patch = gpu.patch_rgba(&new, scale, Color::CANVAS, &PixelFont, &RawImages::default(), rect);
+                let row = (rect.2 - rect.0) * 4;
+                let mut composed = base.clone();
+                for y in rect.1..rect.3 {
+                    let at = (y * physical.0 + rect.0) * 4;
+                    composed[at..at + row].copy_from_slice(&patch[(y - rect.1) * row..(y - rect.1 + 1) * row]);
+                }
+                if let Some(first) = composed.iter().zip(&whole).position(|(a, b)| a != b) {
+                    let pixel = first / 4;
+                    panic!(
+                        "{from:?} -> {to:?} under {rect:?}: pixel ({}, {}) differs",
+                        pixel % physical.0,
+                        pixel / physical.0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_patch_box_snaps_to_the_grid_and_a_big_change_is_whole() {
+        let window = (2560, 1600);
+        assert_eq!(snap_patch((70, 10, 130, 20), window), Some((64, 0, 192, 64)));
+        assert_eq!(snap_patch((2500, 1590, 2600, 1700), window), Some((2496, 1536, 2560, 1600)));
+        assert_eq!(snap_patch((-40, -40, -1, -1), window), None);
+        // a quarter of the window is the most a patch covers
+        assert_eq!(patch_box((0, 0, 2560, 380), window), Some((0, 0, 2560, 384)));
+        assert_eq!(patch_box((0, 0, 2560, 400), window), None);
     }
 
     #[test]
@@ -3000,7 +3497,7 @@ mod tests {
         let logical = Size { width: 100.0, height: 60.0 };
         let quiet = runtime.display_frame(&text("still"), logical);
         let changed = runtime.display_frame(&text("moved"), logical);
-        let retained = Some((quiet.clone(), (200usize, 120usize), 2usize, Color::CANVAS));
+        let retained = Some((Rc::new(quiet.clone()), (200usize, 120usize), 2usize, Color::CANVAS));
         assert!(frame_repeats(&retained, &quiet, (200, 120), 2, Color::CANVAS));
         assert!(!frame_repeats(&retained, &changed, (200, 120), 2, Color::CANVAS));
         assert!(!frame_repeats(&retained, &quiet, (210, 120), 2, Color::CANVAS));
