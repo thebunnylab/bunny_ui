@@ -553,6 +553,19 @@ function sendText(value) {
   new Uint8Array(memory.buffer, pointer >>> 0, encoded.length).set(encoded);
   wasm.bunny_text(pointer, encoded.length);
 }
+// The languages the reader prefers, best first, as the browser lists
+// them — one comma-joined list, the shell's report to the runtime
+const readerLanguages = () => {
+  const nav = globalThis.navigator;
+  const list = nav && nav.languages && nav.languages.length ? nav.languages : [(nav && nav.language) || "en"];
+  return list.join(",");
+};
+function sendLanguages(list) {
+  const encoded = new TextEncoder().encode(list);
+  const pointer = wasm.bunny_alloc(encoded.length);
+  new Uint8Array(memory.buffer, pointer >>> 0, encoded.length).set(encoded);
+  wasm.bunny_set_languages(pointer, encoded.length);
+}
 
 // The host's box in CSS px and the device ratio — what `bunny_resize`
 // takes; the shell multiplies the two itself.
@@ -631,6 +644,9 @@ export async function attach(memoryHandle, exports, hostElement, start) {
   const scale = window.devicePixelRatio || 1;
   const rect = host.getBoundingClientRect();
   lastBox = [rect.width, rect.height, scale];
+  // the languages go in BEFORE the start: the first frame is already
+  // the reader's, and no frame is rebuilt for the report
+  if (wasm.bunny_set_languages) sendLanguages(readerLanguages());
   start(rect.width, rect.height, scale);
   // whatever the engine asked for while the page was still attaching
   if (pendingWake) {
@@ -650,6 +666,12 @@ export async function attach(memoryHandle, exports, hostElement, start) {
     wasm.bunny_set_motion(query.matches ? 0 : 1);
     query.addEventListener("change", (event) => {
       if (wasm) wasm.bunny_set_motion(event.matches ? 0 : 1);
+    });
+  }
+  // a reader who changes their languages is heard at once
+  if (wasm.bunny_set_languages) {
+    globalThis.addEventListener("languagechange", () => {
+      if (wasm) sendLanguages(readerLanguages());
     });
   }
 
