@@ -57,6 +57,13 @@ pub(crate) type CopyEntry = (String, CopyFn);
 /// the actions — a skipped view's field still edits.
 type EditFn = Rc<dyn Fn(EditCommand, &mut CaretState) -> Option<String>>;
 pub(crate) type FieldKeyFn = Rc<dyn Fn(&crate::action::Stroke, &mut CaretState) -> bool>;
+/// A field's text as one shared allocation: what its last render or read
+/// lent, carried from render to render so a text that did not change is
+/// compared, never copied.
+pub(crate) type LentText = Rc<RefCell<Option<std::sync::Arc<str>>>>;
+/// Reads a field's text without copying it — `None` when the field
+/// cannot lend (an app's editing strategy answers the read itself).
+pub(crate) type ReadFn = Rc<dyn Fn(&mut CaretState) -> Option<std::sync::Arc<str>>>;
 #[derive(Clone)]
 pub(crate) struct EditorFn {
     pub submit_on_enter: bool,
@@ -77,6 +84,10 @@ pub(crate) struct EditorFn {
     /// The keys a software keyboard lays out for the field
     /// (`TextField::keyboard_type`).
     pub keyboard: crate::text_input::KeyboardType,
+    /// The field's text as it was last lent.
+    pub text: LentText,
+    /// The read that lends it.
+    pub read: ReadFn,
 }
 pub(crate) type EditorEntry = (String, EditorFn);
 
@@ -1884,6 +1895,23 @@ pub(crate) fn has_editor(path: &str) -> bool {
 /// every field door reads.
 fn editor_at(path: &str) -> Option<EditorFn> {
     LIVE.with(|live| live.borrow().editors.get(path).cloned())
+}
+
+/// The text a field's editor last lent: the cell a new render of the same
+/// field carries on, so its unchanged text is not copied again.
+pub(crate) fn editor_text(path: &str) -> Option<LentText> {
+    LIVE.with(|live| live.borrow().editors.get(path).map(|editor| editor.text.clone()))
+}
+
+/// The field's text, shared: lent by its editor where it can, read
+/// through its command where an app's strategy answers. `None` for a path
+/// that holds no field. The caret state is clamped to the text either way.
+pub(crate) fn read_editor(path: &str, state: &mut CaretState) -> Option<std::sync::Arc<str>> {
+    let editor = editor_at(path)?;
+    if let Some(text) = (editor.read)(state) {
+        return Some(text);
+    }
+    (editor.command)(EditCommand::Read, state).map(std::sync::Arc::from)
 }
 
 /// Applies a command to the field — the retained closure is what

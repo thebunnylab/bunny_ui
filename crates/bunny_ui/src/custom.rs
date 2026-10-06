@@ -2324,7 +2324,7 @@ mod tests {
                 .applied
         );
         let snapshot = runtime.ime_snapshot().expect("the box answers");
-        assert_eq!(snapshot.text, "abに");
+        assert_eq!(&*snapshot.text, "abに");
         assert!(snapshot.marked.is_some(), "the composition is live");
         // the caret rect crossed from the box's coordinates into the
         // scene's: the box sits under one line of text

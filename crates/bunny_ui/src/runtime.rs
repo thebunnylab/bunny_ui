@@ -45,7 +45,9 @@ pub struct Edited {
 /// vocabulary — and the caret rect in LAYOUT coordinates (the shell
 /// converts to screen; it is where the IME candidate window lands).
 pub struct ImeSnapshot {
-    pub text: String,
+    /// The field's text, shared with the field: a note of a megabyte
+    /// reaches the platform's input method without a copy.
+    pub text: std::sync::Arc<str>,
     /// (location, length) in UTF-16.
     pub selected: (usize, usize),
     /// Marked range in UTF-16, if a composition is live.
@@ -3828,9 +3830,9 @@ impl Runtime {
     /// The line comes from the pointer, never from the byte: a caret
     /// sitting exactly on a break belongs to the line it was typed on,
     /// and a third click there must still take the line under the hand.
-    fn caret_under(&self, path: &str, x: Px, y: Px) -> Option<(String, usize, (usize, usize))> {
+    fn caret_under(&self, path: &str, x: Px, y: Px) -> Option<(std::sync::Arc<str>, usize, (usize, usize))> {
         let mut probe = CaretState::default();
-        let text = reconciler::run_editor(path, EditCommand::Read, &mut probe)??;
+        let text = reconciler::read_editor(path, &mut probe)?;
         let placement = self.field_at(path);
         // a secret field draws bullets, and a bullet is not as wide as
         // the character it stands for: the pointer has to be resolved
@@ -3846,7 +3848,7 @@ impl Runtime {
         let whole = (0, text.len());
         let (caret, line) = match placement {
             Some(field) if field.multiline => {
-                let lines = self.wrap(seen, &field);
+                let lines = self.wrap(seen, (!secret).then_some(&text), &field);
                 let row = ((y - field.text_origin.y) / field.line_height).floor();
                 let row = (row.max(0.0) as usize).min(lines.len().saturating_sub(1));
                 let (start, end) = lines[row];
@@ -3913,12 +3915,14 @@ impl Runtime {
     fn wrap(
         &self,
         text: &str,
+        shared: Option<&std::sync::Arc<str>>,
         field: &crate::layout::FieldPlacement,
     ) -> std::rc::Rc<Vec<(usize, usize)>> {
         if field.multiline {
             // the field's own lines, kept between its edits — the same
-            // state the placement reads and writes
-            self.cache.field_lines(&field.path, text, None, &field.font, field.run.size.width, &*self.text)
+            // state the placement reads and writes; the shared text finds
+            // them by pointer, never by comparing the note
+            self.cache.field_lines(&field.path, text, shared, &field.font, field.run.size.width, &*self.text)
         } else {
             self.cache.get_or_break(text, &field.font, field.run.size.width, &*self.text)
         }
@@ -3932,12 +3936,12 @@ impl Runtime {
     fn field_byte_rect(
         &self,
         field: &crate::layout::FieldPlacement,
-        text: &str,
+        text: &std::sync::Arc<str>,
         byte: usize,
     ) -> Rect {
         let byte = crate::text_input::clamp_index(text, byte);
         let (start, end, row) = if field.multiline {
-            let lines = self.wrap(text, field);
+            let lines = self.wrap(text, Some(text), field);
             let row = crate::layout::line_of(&lines, byte);
             let (start, end) = lines.get(row).copied().unwrap_or((0, text.len()));
             (start.min(byte), end.max(byte), row)
@@ -3969,23 +3973,22 @@ impl Runtime {
         // before the first layout there is no box to scroll inside
         let Some(field) = self.field_at(path) else { return };
         let mut probe = CaretState::default();
-        let Some(Some(text)) = reconciler::run_editor(path, EditCommand::Read, &mut probe)
-        else {
+        let Some(lent) = reconciler::read_editor(path, &mut probe) else {
             return;
         };
         let caret = self.carets.borrow().get(path).map(|state| state.caret).unwrap_or(0);
-        let caret = crate::text_input::clamp_index(&text, caret);
+        let caret = crate::text_input::clamp_index(&lent, caret);
         // what scrolls is what is drawn: bullets for a secret field
         let shown = if field.secret {
-            crate::text_input::masked(&text)
+            crate::text_input::masked(&lent)
         } else {
             String::new()
         };
         let (text, caret) = if field.secret {
-            let caret = crate::text_input::masked_index(&text, caret);
+            let caret = crate::text_input::masked_index(&lent, caret);
             (shown.as_str(), caret)
         } else {
-            (text.as_str(), caret)
+            (&*lent, caret)
         };
         let mut offset =
             self.scroll_offsets.borrow().get(path).copied().unwrap_or_default();
@@ -4004,7 +4007,7 @@ impl Runtime {
             at_offset.clamp(0.0, (full - box_extent).max(0.0))
         };
         if field.multiline {
-            let lines = self.wrap(text, &field);
+            let lines = self.wrap(text, (!field.secret).then_some(&lent), &field);
             let row = crate::layout::caret_line(&lines, caret, reconciler::field_caret_shape(path));
             offset.x = 0.0;
             offset.y = follow(
@@ -4074,11 +4077,10 @@ impl Runtime {
             return declined;
         };
         let mut probe = CaretState::default();
-        let Some(Some(text)) = reconciler::run_editor(path, EditCommand::Read, &mut probe)
-        else {
+        let Some(text) = reconciler::read_editor(path, &mut probe) else {
             return declined;
         };
-        let lines = self.wrap(&text, &field);
+        let lines = self.wrap(&text, Some(&text), &field);
         let mut state = self.carets.borrow().get(path).copied().unwrap_or_default();
         let caret = crate::text_input::clamp_index(&text, state.caret);
         let row = crate::layout::line_of(&lines, caret);
@@ -4222,14 +4224,14 @@ impl Runtime {
                 crate::custom::Metrics::new(&*self.text, &self.cache, placement.font);
             let context = placement.element.element().ime(&metrics)?;
             return Some(ImeSnapshot {
-                text: context.text,
+                text: context.text.into(),
                 selected: context.selected,
                 marked: context.marked,
                 caret_rect: Self::to_layout(&placement, context.caret_rect),
             });
         }
         let mut probe = CaretState::default();
-        let text = reconciler::run_editor(&path, EditCommand::Read, &mut probe)??;
+        let text = reconciler::read_editor(&path, &mut probe)?;
         let state = self.carets.borrow().get(&path).copied().unwrap_or_default();
 
         let caret = crate::text_input::clamp_index(&text, state.caret);
@@ -4275,7 +4277,7 @@ impl Runtime {
             return None;
         }
         let mut probe = CaretState::default();
-        let text = reconciler::run_editor(&path, EditCommand::Read, &mut probe)??;
+        let text = reconciler::read_editor(&path, &mut probe)?;
         let along = self.field_line_x(&field, &path, &text, x);
         let byte = caret_from_x(&text, along, &field.font, &*self.text, &self.cache);
         Some(crate::text_input::byte_to_utf16(&text, byte))
@@ -4300,7 +4302,7 @@ impl Runtime {
             .find(|field| field.path == path)
             .cloned()?;
         let mut probe = CaretState::default();
-        let text = reconciler::run_editor(&path, EditCommand::Read, &mut probe)??;
+        let text = reconciler::read_editor(&path, &mut probe)?;
         let byte = crate::text_input::utf16_to_byte(&text, utf16);
         Some(self.field_byte_rect(&field, &text, byte))
     }
@@ -4319,10 +4321,8 @@ impl Runtime {
             self.focus(path);
         }
         let mut state = self.carets.borrow().get(path).copied().unwrap_or_default();
-        let current = reconciler::run_editor(path, EditCommand::Read, &mut state)
-            .flatten()
-            .unwrap_or_default();
-        if current != content {
+        let current = reconciler::read_editor(path, &mut state).unwrap_or_default();
+        if &*current != content {
             let _ = reconciler::run_editor(path, EditCommand::SelectAll, &mut state);
             let _ = reconciler::run_editor(
                 path,

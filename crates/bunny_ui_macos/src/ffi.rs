@@ -886,7 +886,8 @@ fn gate_consumed(stroke: &KeyStroke) -> bool {
 /// reconversion asks for arbitrary substrings.
 #[derive(Clone)]
 struct ImeMirror {
-    text: std::rc::Rc<str>,
+    /// The field's own text, shared — never copied for the mirror.
+    text: std::sync::Arc<str>,
     selected: NSRange,
     marked: NSRange,
     caret_screen: CGRect,
@@ -919,7 +920,7 @@ pub fn set_ime_resolvers(
 }
 
 /// The shell syncs the focused-field mirror (`None` = no focus).
-pub fn sync_ime(state: Option<(std::rc::Rc<str>, NSRange, Option<NSRange>, CGRect)>) {
+pub fn sync_ime(state: Option<(std::sync::Arc<str>, NSRange, Option<NSRange>, CGRect)>) {
     INTERPRET.with(|flag| flag.set(state.is_some()));
     IME.with(|ime| {
         *ime.borrow_mut() = state.map(|(text, selected, marked, caret_screen)| ImeMirror {

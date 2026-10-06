@@ -363,13 +363,19 @@ impl View for TextField {
     type Arity = Single;
 
     fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
-        let value = self.text.wrappedValue();
+        let scope = motor::identity::cursor_scope();
+        // the text as one shared allocation, carried from the field's last
+        // render: a note of a megabyte is borrowed from the binding and
+        // compared, and copied only when it changed — once, for the
+        // layout, the reads and the input method alike
+        let lent = scope.as_deref().and_then(crate::reconciler::editor_text).unwrap_or_default();
+        let value = self.text.with(|value| crate::text_input::lend_text(&lent, value));
         out.push(RenderNode::leaf(if crate::view::print_enabled() {
             format!("TextField({:?}, text: {:?})", self.placeholder, value)
         } else {
             String::new()
         }));
-        match motor::identity::cursor_scope() {
+        match scope {
             Some(path) => {
                 let binding = self.text.clone();
                 let multiline = self.multiline;
@@ -387,6 +393,21 @@ impl View for TextField {
                     paste_image: self.paste_image.clone(),
                     focus: self.focus.clone(),
                     keyboard: self.keyboard,
+                    text: lent.clone(),
+                    read: {
+                        let binding = self.text.clone();
+                        let lent = lent.clone();
+                        let lends = self.editing.is_none();
+                        Rc::new(move |state: &mut crate::text_input::CaretState| {
+                            // an app's strategy answers its own reads
+                            lends.then(|| {
+                                binding.with(|value| {
+                                    crate::text_input::clamp_state(value, state);
+                                    crate::text_input::lend_text(&lent, value)
+                                })
+                            })
+                        })
+                    },
                     key: self.editing.as_ref().map(|_| Rc::new(move |stroke: &crate::action::Stroke, state: &mut crate::text_input::CaretState| {
                         let Some(strategy) = &key_strategy else { return false };
                         let mut value = key_binding.wrappedValue();
@@ -427,7 +448,19 @@ impl View for TextField {
                             crate::text_input::clamp_state(&value, state);
                             return Some(value);
                         }
-                        let mut value = binding.wrappedValue();
+                        // the copy the edit works on, with room for what it
+                        // inserts: a note of a megabyte grown by one letter
+                        // must not be reallocated at twice its size
+                        let room = match &command {
+                            crate::text_input::EditCommand::Insert(text) => text.len(),
+                            crate::text_input::EditCommand::SetMarked { text, .. } => text.len(),
+                            _ => 0,
+                        };
+                        let mut value = binding.with(|text| {
+                            let mut value = String::with_capacity(text.len() + room);
+                            value.push_str(text);
+                            value
+                        });
                         let (output, changed) = match &strategy {
                             // an app's strategy may rewrite anything: its
                             // edit is compared whole
@@ -472,7 +505,7 @@ impl View for TextField {
                     // a chain writes this, never the constructor
                     highlights: None,
                     path,
-                    content: Arc::from(value),
+                    content: value,
                     placeholder: self.placeholder.clone(),
                     multiline: self.multiline,
                     auto_focus: crate::layout::AutoFocus::Off,
@@ -484,7 +517,7 @@ impl View for TextField {
                 content: if value.is_empty() {
                     self.placeholder.clone().into()
                 } else {
-                    Arc::<str>::from(value).into()
+                    value.into()
                 },
                 highlights: None,
                 truncation: None,
