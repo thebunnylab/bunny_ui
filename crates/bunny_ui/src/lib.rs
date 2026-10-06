@@ -181,8 +181,9 @@ pub mod prelude {
     pub use motor::loadable::{Loadable, LoadableSubject, LoadError};
     pub use motor::runtime::Site;
     pub use motor::state::{
-        Binding, Context, Environment, EnvironmentValues, FromEnvironment, KeyboardInset, Locale,
-        ProvidesQueries, SafeAreaInsets, SizeClass, State, Viewport, WindowState,
+        Binding, Context, Environment, EnvironmentValues, FromEnvironment, KeyboardInset,
+        LayoutDirection, Locale, ProvidesQueries, SafeAreaInsets, SizeClass, State, Viewport,
+        WindowState,
     };
     pub use motor::views::{
         ContentMode, Edge, Font, ListStyle, NavigationPath, ProgressViewStyle, Query,

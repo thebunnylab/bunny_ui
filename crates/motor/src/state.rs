@@ -12,26 +12,328 @@ use std::rc::Rc;
 /// Returns whether it observed a state change (i.e. a re-render is due).
 pub type EffectFn = Rc<dyn Fn(&Context) -> bool>;
 
-/// Fake `Locale` (`import Foundation`).
-#[derive(Clone, Debug, PartialEq)]
+/// `\.locale` — the languages the reader asked for, best first, as one
+/// normalized BCP-47 list: `"pt-BR,en-US,en"`.
+///
+/// A list, not a word. A person who reads Portuguese and English is
+/// served Portuguese where there is some and English where there is
+/// not, and an app that speaks neither falls to its own source
+/// language — [`Locale::pick`] is that decision, made once per table.
+/// The shell reports the system's list, the app may pin its own, and a
+/// body reads whichever stands with `ctx.environment::<Locale>()`.
+///
+/// Shared, not copied: the tags sit behind an `Rc`, so the clone every
+/// read hands out is a count. A thousand rows asking cost a thousand
+/// increments and no bytes, and every accessor is a slice of the one
+/// string.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Locale {
-    pub identifier: String,
+    tags: Rc<str>,
 }
 
 impl Locale {
-    pub fn new(identifier: impl Into<String>) -> Self {
-        Locale { identifier: identifier.into() }
+    /// One tag — `Locale::new("pt-BR")`. Spelled however the platform
+    /// spells it: `pt_BR.UTF-8` and `PT-br` both land on `pt-BR`. An
+    /// empty tag is the default.
+    pub fn new(tag: impl AsRef<str>) -> Self {
+        Self::parse(tag.as_ref())
     }
 
-    /// `Locale.shortIdentifier` — first two components.
-    pub fn shortIdentifier(&self) -> String {
-        self.identifier.chars().take(2).collect()
+    /// Several tags, best first, each normalized and kept once.
+    pub fn preferred<I, S>(tags: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut list = String::new();
+        for tag in tags {
+            push_tags(&mut list, tag.as_ref());
+        }
+        Self::finish(list)
+    }
+
+    /// The ONE normalizer, which every shell's report goes through, so
+    /// a spelling has one home: tags separated by commas, semicolons,
+    /// colons or spaces (a browser's `navigator.languages` joined, a
+    /// POSIX `LANGUAGE`, an `Accept-Language` header with its `q=`
+    /// weights, which are dropped); `_` for `-`; a POSIX encoding and
+    /// modifier (`.UTF-8@latin`) cut away; `C` and `POSIX` ignored;
+    /// the language lowercased with its legacy codes brought forward
+    /// (`iw` → `he`, `ji` → `yi`, `in` → `id`), a script in Title case,
+    /// a region in upper; a tag repeated kept once. Nothing left is the
+    /// default.
+    pub fn parse(list: &str) -> Self {
+        let mut out = String::with_capacity(list.len());
+        push_tags(&mut out, list);
+        Self::finish(out)
+    }
+
+    fn finish(list: String) -> Self {
+        if list.is_empty() { Self::default() } else { Locale { tags: Rc::from(list) } }
+    }
+
+    /// The first tag — the locale the reader prefers above all others.
+    pub fn identifier(&self) -> &str {
+        self.tags().next().unwrap_or("en")
+    }
+
+    /// The first tag's language: `"pt"` of `pt-BR`.
+    pub fn language(&self) -> &str {
+        Tag::of(self.identifier()).language
+    }
+
+    /// The first tag's script, when it names one: `"Hant"` of `zh-Hant-TW`.
+    pub fn script(&self) -> Option<&str> {
+        Tag::of(self.identifier()).script
+    }
+
+    /// The first tag's region, when it names one: `"BR"` of `pt-BR`,
+    /// `"419"` of `es-419`.
+    pub fn region(&self) -> Option<&str> {
+        Tag::of(self.identifier()).region
+    }
+
+    /// Every tag, best first.
+    pub fn tags(&self) -> impl Iterator<Item = &str> + '_ {
+        self.tags.split(',')
+    }
+
+    /// The whole list as it is kept — what a wire or a log wants.
+    pub fn as_str(&self) -> &str {
+        &self.tags
+    }
+
+    /// Which of `supported` serves this reader best: the index of the
+    /// tag chosen, or `None` when none speaks any of the languages
+    /// asked for. See [`Locale::pick_in`].
+    pub fn pick(&self, supported: &[&str]) -> Option<usize> {
+        self.pick_in(supported.iter().copied())
+    }
+
+    /// [`Locale::pick`] over any list of tags, without building a slice.
+    ///
+    /// For each preferred tag, best first: the exact tag; then the tag
+    /// cut from the right (`pt-Latn-BR`, `pt-Latn`, `pt`); then any tag
+    /// of the same language whose script agrees — a region implies its
+    /// script where that matters (`zh-TW` is `Hant`, `zh` and `zh-CN`
+    /// are `Hans`). Only then the next preference: a reader of `pt-BR`
+    /// is better served by `pt-PT` than by the English they listed
+    /// second. Case never matters, legacy codes meet their modern
+    /// names, and nothing allocates.
+    pub fn pick_in<'s, I>(&self, supported: I) -> Option<usize>
+    where
+        I: Iterator<Item = &'s str> + Clone,
+    {
+        for preferred in self.tags() {
+            let mut range = preferred;
+            loop {
+                if let Some(index) =
+                    supported.clone().position(|tag| tag.eq_ignore_ascii_case(range))
+                {
+                    return Some(index);
+                }
+                match range.rfind('-') {
+                    Some(cut) => range = &range[..cut],
+                    None => break,
+                }
+            }
+            let want = Tag::of(preferred);
+            let want_script = want.script_or_implied();
+            if let Some(index) = supported.clone().position(|tag| {
+                let have = Tag::of(tag);
+                same_language(have.language, want.language)
+                    && match (want_script, have.script_or_implied()) {
+                        (Some(wanted), Some(had)) => wanted.eq_ignore_ascii_case(had),
+                        _ => true,
+                    }
+            }) {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    /// Which way the first tag reads. A script decides when the tag
+    /// names one (`az-Arab` reads right to left, `ar-Latn` does not);
+    /// the language decides otherwise.
+    pub fn direction(&self) -> LayoutDirection {
+        let tag = Tag::of(self.identifier());
+        let rtl = match tag.script {
+            Some(script) => RTL_SCRIPTS.iter().any(|known| known.eq_ignore_ascii_case(script)),
+            None => RTL_LANGUAGES.iter().any(|known| known.eq_ignore_ascii_case(tag.language)),
+        };
+        if rtl { LayoutDirection::RightToLeft } else { LayoutDirection::LeftToRight }
     }
 }
 
 impl Default for Locale {
+    /// English — the language the framework's own words are written in.
     fn default() -> Self {
-        Locale { identifier: "en".into() } // Locale.backendDefault
+        Locale { tags: Rc::from("en") }
+    }
+}
+
+impl std::fmt::Display for Locale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.tags)
+    }
+}
+
+/// The scripts written right to left.
+const RTL_SCRIPTS: [&str; 9] =
+    ["Arab", "Hebr", "Thaa", "Syrc", "Nkoo", "Adlm", "Rohg", "Mand", "Samr"];
+
+/// The languages written right to left when their tag names no script.
+const RTL_LANGUAGES: [&str; 17] = [
+    "ar", "he", "fa", "ur", "ps", "sd", "ug", "yi", "dv", "ckb", "ks", "syr", "nqo", "arc", "prs",
+    "iw", "ji",
+];
+
+/// Writes every tag of `list` that names a language into `out`,
+/// normalized and separated by commas, skipping one already there.
+fn push_tags(out: &mut String, list: &str) {
+    let separators = |c: char| c == ',' || c == ';' || c == ':' || c.is_ascii_whitespace();
+    for token in list.split(separators) {
+        // a POSIX locale carries its encoding and modifier behind the tag
+        let token = token.split(['.', '@']).next().unwrap_or("");
+        let language = token.split(['-', '_']).next().unwrap_or("");
+        let names_a_language = (2..=8).contains(&language.len())
+            && language.bytes().all(|b| b.is_ascii_alphabetic())
+            && !language.eq_ignore_ascii_case("POSIX");
+        if !names_a_language || token.contains('=') {
+            continue;
+        }
+        let start = out.len();
+        if start > 0 {
+            out.push(',');
+        }
+        let tag_start = out.len();
+        push_canonical(out, token);
+        let repeated = {
+            let written = &out[tag_start..];
+            out[..start].split(',').any(|earlier| earlier == written)
+        };
+        if repeated {
+            out.truncate(start);
+        }
+    }
+}
+
+/// One tag in canonical spelling: subtags by their shape, not their
+/// position — the language lowercased, a four-letter script in Title
+/// case, a two-letter or three-digit region in upper, the rest lower.
+fn push_canonical(out: &mut String, tag: &str) {
+    for (index, sub) in tag.split(['-', '_']).filter(|sub| !sub.is_empty()).enumerate() {
+        if index > 0 {
+            out.push('-');
+        }
+        let is_alpha = sub.bytes().all(|b| b.is_ascii_alphabetic());
+        if index == 0 {
+            let at = out.len();
+            out.extend(sub.chars().map(|c| c.to_ascii_lowercase()));
+            if let Some(modern) = modern_name(&out[at..]) {
+                out.truncate(at);
+                out.push_str(modern);
+            }
+        } else if sub.len() == 4 && is_alpha {
+            let mut chars = sub.chars();
+            out.extend(chars.next().map(|c| c.to_ascii_uppercase()));
+            out.extend(chars.map(|c| c.to_ascii_lowercase()));
+        } else if (sub.len() == 2 && is_alpha)
+            || (sub.len() == 3 && sub.bytes().all(|b| b.is_ascii_digit()))
+        {
+            out.extend(sub.chars().map(|c| c.to_ascii_uppercase()));
+        } else {
+            out.extend(sub.chars().map(|c| c.to_ascii_lowercase()));
+        }
+    }
+}
+
+/// The modern name of one of the three legacy codes the platforms still
+/// hand out; `None` for every language already called by its name.
+fn modern_name(language: &str) -> Option<&'static str> {
+    if language.eq_ignore_ascii_case("iw") {
+        Some("he")
+    } else if language.eq_ignore_ascii_case("ji") {
+        Some("yi")
+    } else if language.eq_ignore_ascii_case("in") {
+        Some("id")
+    } else {
+        None
+    }
+}
+
+fn same_language(a: &str, b: &str) -> bool {
+    modern_name(a).unwrap_or(a).eq_ignore_ascii_case(modern_name(b).unwrap_or(b))
+}
+
+/// One tag's subtags, read in place — the reading twin of
+/// [`push_canonical`], which works on tags an app wrote by hand too.
+#[derive(Clone, Copy)]
+struct Tag<'a> {
+    language: &'a str,
+    script: Option<&'a str>,
+    region: Option<&'a str>,
+}
+
+impl<'a> Tag<'a> {
+    fn of(tag: &'a str) -> Self {
+        let mut parts = tag.split(['-', '_']);
+        let language = parts.next().unwrap_or("");
+        let mut script = None;
+        let mut region = None;
+        for part in parts {
+            let is_alpha = part.bytes().all(|b| b.is_ascii_alphabetic());
+            if script.is_none() && region.is_none() && part.len() == 4 && is_alpha {
+                script = Some(part);
+            } else if region.is_none()
+                && ((part.len() == 2 && is_alpha)
+                    || (part.len() == 3 && part.bytes().all(|b| b.is_ascii_digit())))
+            {
+                region = Some(part);
+            } else {
+                // variants and extensions: nothing a match reads
+                break;
+            }
+        }
+        Tag { language, script, region }
+    }
+
+    /// The script named, or the one the region implies where a language
+    /// is written two ways: Chinese is traditional in Taiwan, Hong Kong
+    /// and Macau and simplified everywhere else, bare `zh` included.
+    fn script_or_implied(&self) -> Option<&'a str> {
+        if self.script.is_some() {
+            return self.script;
+        }
+        if self.language.eq_ignore_ascii_case("zh") {
+            let traditional = self.region.is_some_and(|region| {
+                ["TW", "HK", "MO"].iter().any(|known| known.eq_ignore_ascii_case(region))
+            });
+            return Some(if traditional { "Hant" } else { "Hans" });
+        }
+        None
+    }
+}
+
+/// `\.layoutDirection` — which way a row reads, and where leading is.
+///
+/// The runtime derives it from the locale in effect and an app may pin
+/// it (`Runtime::set_layout_direction`); an island that reads the other
+/// way turns it for its own subtree with
+/// `.environment(|values| values.layoutDirection = …)`. The layout
+/// engine mirrors every leading edge by it; pictures keep their face
+/// unless a view says `flips_for_right_to_left_layout_direction(true)`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum LayoutDirection {
+    #[default]
+    LeftToRight,
+    RightToLeft,
+}
+
+impl LayoutDirection {
+    pub const fn is_rtl(self) -> bool {
+        matches!(self, LayoutDirection::RightToLeft)
     }
 }
 
@@ -150,7 +452,11 @@ impl WindowValues {
 /// like `@Entry` extensions do in real SwiftUI.
 #[derive(Clone, Default)]
 pub struct EnvironmentValues {
+    /// `\.locale` — the shell's report or the app's pin, see [`Locale`].
     pub locale: Locale,
+    /// `\.layoutDirection` — derived from the locale by the runtime
+    /// unless pinned, see [`LayoutDirection`].
+    pub layoutDirection: LayoutDirection,
     /// `\.horizontalSizeClass`.
     pub horizontalSizeClass: SizeClass,
     /// `\.safeAreaInsets` — the shell's, mirrored per layout.
@@ -170,8 +476,7 @@ pub struct EnvironmentValues {
 /// The values are shared, and copied only when written: every body that
 /// runs keeps a copy of the context it ran in, so a skipped view can
 /// answer from cache — a thousand rows kept a thousand copies of the
-/// same values (the locale's identifier allocated in each), where a
-/// share is a count. A write goes through [`Rc::make_mut`], which copies
+/// same values, where a share is a count. A write goes through [`Rc::make_mut`], which copies
 /// the values once when anything else still holds them.
 #[derive(Clone, Default)]
 pub struct Context {
@@ -192,7 +497,14 @@ pub trait FromEnvironment: Clone + 'static {
 
 impl FromEnvironment for Locale {
     fn from_environment(values: &EnvironmentValues) -> Self {
+        // a count, not a copy: the tags are shared
         values.locale.clone()
+    }
+}
+
+impl FromEnvironment for LayoutDirection {
+    fn from_environment(values: &EnvironmentValues) -> Self {
+        values.layoutDirection
     }
 }
 
@@ -657,7 +969,144 @@ mod tests {
         assert!(Rc::ptr_eq(&kept.values, &ctx.values), "a copy shares the values");
         Rc::make_mut(&mut ctx.values).locale = Locale::new("en");
         assert!(!Rc::ptr_eq(&kept.values, &ctx.values), "the write copied them");
-        assert_eq!(kept.values.locale.identifier, "pt-BR", "and the copy kept what it had");
-        assert_eq!(ctx.environment::<Locale>().identifier, "en");
+        assert_eq!(kept.values.locale.identifier(), "pt-BR", "and the copy kept what it had");
+        assert_eq!(ctx.environment::<Locale>().identifier(), "en");
+    }
+
+    // MARK: - The locale is a list
+
+    /// However a platform spells a tag, the list keeps one spelling:
+    /// the language lower, a script in Title case, a region upper, the
+    /// POSIX encoding and modifier cut away.
+    #[test]
+    fn a_locale_is_canonical_however_it_was_spelled() {
+        assert_eq!(Locale::new("PT_br.UTF-8@latin").as_str(), "pt-BR");
+        assert_eq!(Locale::new("ZH-hant-tw").as_str(), "zh-Hant-TW");
+        assert_eq!(Locale::new("sr-latn-rs").as_str(), "sr-Latn-RS");
+        let latin_america = Locale::new("es-419");
+        assert_eq!(latin_america.region(), Some("419"));
+        assert_eq!(latin_america.script(), None);
+        assert_eq!(latin_america.language(), "es");
+        assert_eq!(Locale::new("en").to_string(), "en");
+    }
+
+    /// A `LANGUAGE` variable, an `Accept-Language` header and a joined
+    /// `navigator.languages` all become one list, best first; `C`,
+    /// `POSIX`, a wildcard and a weight are not languages.
+    #[test]
+    fn a_posix_list_becomes_a_preference_list() {
+        assert_eq!(Locale::parse("pt_BR:en_US:C").as_str(), "pt-BR,en-US");
+        assert_eq!(Locale::parse("pt-BR,pt;q=0.9,en;q=0.8,*").as_str(), "pt-BR,pt,en");
+        assert_eq!(Locale::parse("C"), Locale::default());
+        assert_eq!(Locale::parse("POSIX").as_str(), "en");
+        assert_eq!(Locale::parse(""), Locale::default());
+        assert_eq!(Locale::preferred(["fr-CH", "de_CH.UTF-8"]).as_str(), "fr-CH,de-CH");
+        assert_eq!(Locale::new("").as_str(), "en");
+    }
+
+    #[test]
+    fn a_repeated_tag_is_kept_once() {
+        assert_eq!(Locale::parse("en-US,en-us,EN_us,en").as_str(), "en-US,en");
+        assert_eq!(Locale::preferred(["pt", "pt"]).tags().count(), 1);
+    }
+
+    /// Every read of the environment clones the locale: the clone has to
+    /// be a count, or a thousand rows would allocate a thousand strings.
+    #[test]
+    fn a_locale_copy_is_a_count_not_a_string() {
+        let locale = Locale::parse("pt-BR,en");
+        let copy = locale.clone();
+        assert_eq!(locale.as_str().as_ptr(), copy.as_str().as_ptr(), "one string, two holders");
+        assert_eq!(std::mem::size_of::<Locale>(), std::mem::size_of::<Rc<str>>());
+        assert_eq!(locale, copy);
+    }
+
+    #[test]
+    fn a_locale_falls_from_its_region_to_its_language() {
+        assert_eq!(Locale::new("pt-BR").pick(&["en", "pt"]), Some(1));
+        assert_eq!(Locale::new("pt-Latn-BR").pick(&["en", "pt-Latn"]), Some(1));
+        // the same language in another region beats the next preference
+        assert_eq!(Locale::parse("pt-BR,en").pick(&["en", "pt-PT"]), Some(1));
+    }
+
+    #[test]
+    fn a_locale_prefers_an_exact_tag_over_its_language() {
+        assert_eq!(Locale::new("pt-BR").pick(&["pt", "pt-BR"]), Some(1));
+        assert_eq!(Locale::new("pt").pick(&["pt-BR", "pt"]), Some(1));
+        // a bare language with no exact table takes the region's
+        assert_eq!(Locale::new("pt").pick(&["en", "pt-BR"]), Some(1));
+    }
+
+    #[test]
+    fn a_second_preference_speaks_when_the_first_is_unknown() {
+        assert_eq!(Locale::parse("gsw,fr-CH").pick(&["en", "fr"]), Some(1));
+        assert_eq!(Locale::parse("ja,pt-BR,en").pick(&["en", "pt"]), Some(1));
+    }
+
+    #[test]
+    fn a_tag_matches_regardless_of_case() {
+        assert_eq!(Locale::new("pt-br").pick(&["PT-BR"]), Some(0));
+        assert_eq!(Locale::new("ZH-TW").pick(&["zh-hant"]), Some(0));
+    }
+
+    /// Chinese is written two ways, and a region says which: a reader
+    /// in Taiwan is served the traditional table, one in Singapore the
+    /// simplified, and bare `zh` is simplified.
+    #[test]
+    fn a_chinese_region_implies_its_script() {
+        assert_eq!(Locale::new("zh-TW").pick(&["zh-Hans", "zh-Hant"]), Some(1));
+        assert_eq!(Locale::new("zh-HK").pick(&["zh-Hans", "zh-Hant"]), Some(1));
+        assert_eq!(Locale::new("zh-SG").pick(&["zh-Hant", "zh-Hans"]), Some(1));
+        assert_eq!(Locale::new("zh").pick(&["zh-TW", "zh-CN"]), Some(1));
+        assert_eq!(Locale::new("zh-Hant").pick(&["zh-CN", "zh-TW"]), Some(1));
+        // no table of the right script: the language alone does not serve
+        assert_eq!(Locale::new("zh-TW").pick(&["zh-Hans"]), None);
+    }
+
+    #[test]
+    fn a_legacy_language_code_meets_its_modern_name() {
+        assert_eq!(Locale::new("iw").as_str(), "he");
+        assert_eq!(Locale::new("iw-IL").pick(&["en", "he"]), Some(1));
+        assert_eq!(Locale::new("he").pick(&["en", "iw"]), Some(1));
+        assert_eq!(Locale::new("in").language(), "id");
+        assert_eq!(Locale::new("ji").language(), "yi");
+    }
+
+    #[test]
+    fn a_locale_nobody_speaks_picks_nothing() {
+        assert_eq!(Locale::new("ja").pick(&["en", "pt"]), None);
+        assert_eq!(Locale::new("ja").pick(&[]), None);
+        assert_eq!(Locale::new("ja").pick_in(["en", "pt"].into_iter()), None);
+    }
+
+    #[test]
+    fn a_script_decides_the_direction_before_the_language() {
+        use LayoutDirection::{LeftToRight, RightToLeft};
+        assert_eq!(Locale::new("ar").direction(), RightToLeft);
+        assert_eq!(Locale::new("he-IL").direction(), RightToLeft);
+        assert_eq!(Locale::new("fa").direction(), RightToLeft);
+        assert_eq!(Locale::new("ur-PK").direction(), RightToLeft);
+        assert_eq!(Locale::new("ckb").direction(), RightToLeft);
+        assert_eq!(Locale::new("iw").direction(), RightToLeft, "the legacy code reads the same");
+        assert_eq!(Locale::new("ar-Latn").direction(), LeftToRight, "romanized Arabic reads left to right");
+        assert_eq!(Locale::new("az-Arab").direction(), RightToLeft, "Azerbaijani in Arabic script does not");
+        assert_eq!(Locale::new("pa-Arab-PK").direction(), RightToLeft);
+        assert_eq!(Locale::new("pa").direction(), LeftToRight);
+        assert_eq!(Locale::parse("ar,en").direction(), RightToLeft, "the first tag decides");
+        assert_eq!(Locale::parse("en,ar").direction(), LeftToRight);
+    }
+
+    #[test]
+    fn the_default_locale_is_english_and_reads_left_to_right() {
+        let locale = Locale::default();
+        assert_eq!(locale.identifier(), "en");
+        assert_eq!(locale.language(), "en");
+        assert_eq!(locale.region(), None);
+        assert_eq!(locale.direction(), LayoutDirection::LeftToRight);
+        assert_eq!(LayoutDirection::default(), LayoutDirection::LeftToRight);
+        assert!(!LayoutDirection::LeftToRight.is_rtl() && LayoutDirection::RightToLeft.is_rtl());
+        let values = EnvironmentValues::default();
+        assert_eq!(values.layoutDirection, LayoutDirection::LeftToRight);
+        assert_eq!(Context::default().environment::<LayoutDirection>(), LayoutDirection::LeftToRight);
     }
 }

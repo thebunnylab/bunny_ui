@@ -30,13 +30,11 @@ impl Country {
         Country { name, translations, population, flag, alpha3Code }
     }
 
-    /// `func name(locale: Locale) -> String`
+    /// `func name(locale: Locale) -> String` — the translations are keyed
+    /// by language (`"pt"`), which the locale answers as a slice.
     pub fn name_locale(&self, locale: Locale) -> String {
-        let localeId = locale.shortIdentifier();
-        if let Some(value) = self.translations.get(&localeId) {
-            if let Some(localizedName) = value {
-                return localizedName.clone();
-            }
+        if let Some(Some(localizedName)) = self.translations.get(locale.language()) {
+            return localizedName.clone();
         }
         self.name.clone()
     }
