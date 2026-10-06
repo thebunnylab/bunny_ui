@@ -23,13 +23,13 @@ use countries_pure::root_view;
 fn main() {
     // same assembly order as the headless demo
     let app = AppEnvironment::bootstrap();
-    let mut environment = EnvironmentValues::default();
-    environment.locale = Locale::new("en");
+    // the shell reports the system's languages into the environment;
+    // the demo's translations are keyed by language, so the list is
+    // served in the reader's own
     #[cfg(target_os = "android")]
-    let runtime =
-        Runtime::with_environment(environment).text_engine(Rc::new(AndroidTextEngine::new()));
+    let runtime = Runtime::new().text_engine(Rc::new(AndroidTextEngine::new()));
     #[cfg(not(target_os = "android"))]
-    let runtime = Runtime::with_environment(environment);
+    let runtime = Runtime::new();
     let ctx = runtime.context();
     let root = root_view(&app, &ctx);
 

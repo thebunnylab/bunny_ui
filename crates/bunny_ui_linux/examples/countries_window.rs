@@ -24,10 +24,10 @@ use countries_pure::root_view;
 fn main() {
     // same assembly order as the headless demo
     let app = AppEnvironment::bootstrap();
-    let mut environment = EnvironmentValues::default();
-    environment.locale = Locale::new("en");
-    let runtime =
-        Runtime::with_environment(environment).text_engine(Rc::new(FreeTypeEngine::new()));
+    // the shell reports the system's languages into the environment;
+    // the demo's translations are keyed by language, so the list is
+    // served in the reader's own
+    let runtime = Runtime::new().text_engine(Rc::new(FreeTypeEngine::new()));
     let ctx = runtime.context();
     let root = root_view(&app, &ctx);
 
