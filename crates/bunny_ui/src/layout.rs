@@ -500,6 +500,17 @@ impl Side {
             Side::Trailing => Side::Leading,
         }
     }
+
+    /// The side as the window sees it: leading is the right one in a
+    /// right-to-left scene. Decided where the anchor is placed, so the
+    /// frame math that follows stays physical and knows nothing.
+    pub fn physical(self, rtl: bool) -> Side {
+        match self {
+            Side::Leading if rtl => Side::Trailing,
+            Side::Trailing if rtl => Side::Leading,
+            side => side,
+        }
+    }
 }
 
 /// What the pointer should LOOK like over a box.
@@ -1647,6 +1658,25 @@ pub enum Gradient {
 }
 
 impl Gradient {
+    /// The same ramp seen from the other side: every anchor flipped
+    /// across the box, which is what a right-to-left scene does to a
+    /// wash named from its leading corner. The colours stay.
+    pub fn flipped(self) -> Gradient {
+        match self {
+            Gradient::Radial { center, start, end, aspect, inner, outer } => Gradient::Radial {
+                center: center.flipped(),
+                start,
+                end,
+                aspect,
+                inner,
+                outer,
+            },
+            Gradient::Linear { start, end, from, to } => {
+                Gradient::Linear { start: start.flipped(), end: end.flipped(), from, to }
+            }
+        }
+    }
+
     /// Rings from the centre, reaching the box's farthest corner.
     pub fn radial(inner: Color, outer: Color) -> Gradient {
         Gradient::Radial {
@@ -1974,6 +2004,15 @@ impl Glass {
 
     /// A pool of light in the pane: where, how wide as a fraction of
     /// the pane's smaller side, and how bright.
+    /// The material seen from the other side: its spot, the one knob
+    /// with a place in the pane, flipped across it.
+    pub fn flipped(self) -> Glass {
+        Glass {
+            spot: self.spot.map(|(center, radius, alpha)| (center.flipped(), radius, alpha)),
+            ..self
+        }
+    }
+
     pub const fn spot(mut self, center: UnitPoint, radius: f64, alpha: f64) -> Glass {
         self.spot = Some((center, radius, alpha));
         self
@@ -3262,6 +3301,8 @@ pub struct OverlayPlacement {
 #[derive(Clone, Debug)]
 pub struct TooltipRegion {
     pub text: Arc<str>,
+    /// The side as the window sees it — a leading side of a
+    /// right-to-left scene is recorded as the right one.
     pub side: Side,
     pub rect: Rect,
 }
@@ -3277,6 +3318,10 @@ pub struct MenuRegion {
     /// framework's panel and an app-drawn one are two answers to the same
     /// gesture, and a region that gave both would open two menus.
     pub on_click: Option<ContextClick>,
+    /// Which way the region reads: the panel it opens hangs down-left
+    /// of the press and lays its rows out from the right in a
+    /// right-to-left scene.
+    pub direction: LayoutDirection,
 }
 
 /// What an app does with a right press it asked to hear — the point, in
@@ -3412,6 +3457,9 @@ pub struct MenuOpen {
     pub entries: Vec<Option<Arc<str>>>,
     /// The row under the pointer — the runtime's, never CSS.
     pub hovered: Option<usize>,
+    /// Which way the panel reads — the region's, or the scene's for a
+    /// box that asked.
+    pub direction: LayoutDirection,
 }
 
 /// An overlay waiting for the deferred pass (the anchor placed, the
@@ -3419,16 +3467,21 @@ pub struct MenuOpen {
 #[derive(Debug)]
 struct QueuedOverlay {
     path: String,
-    /// Where it hangs from. `None` is a SHEET: it hangs from nothing
-    /// and centres in the window — never in the overlay container,
-    /// which on a desktop is the whole screen. A sheet is modal to the
-    /// window it belongs to and has no business outside it.
+    /// Where it hangs from — PHYSICAL, decided where the anchor was
+    /// placed (a leading popover of a right-to-left island hangs at its
+    /// right). `None` is a SHEET: it hangs from nothing and centres in
+    /// the window — never in the overlay container, which on a desktop
+    /// is the whole screen. A sheet is modal to the window it belongs
+    /// to and has no business outside it.
     side: Option<Side>,
     /// The surface the layer asked for — carried into the placement.
     surface: OverlaySurface,
     node: Rc<LayoutNode>,
     anchor: Rect,
     anchor_visible: bool,
+    /// The direction the anchor was placed in: the overlay's content is
+    /// laid out in it, not in the root's.
+    direction: LayoutDirection,
 }
 
 /// When a field asks for the keyboard by itself.
@@ -4570,13 +4623,19 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
 /// The menu frame: the panel hangs down-right of the press, flips up
 /// or left when the container has no room, and clamps like everything
 /// anchored.
-fn menu_frame(at: Point, size: Size, container: Rect) -> Rect {
-    let mut x = at.x;
+fn menu_frame(at: Point, size: Size, container: Rect, rtl: bool) -> Rect {
+    // down-right of the press, or down-LEFT in a right-to-left scene;
+    // either flips to the other side when its own has no room
+    let mut x = if rtl { at.x - size.width } else { at.x };
     let mut y = at.y;
     if y + size.height > container.origin.y + container.size.height {
         y = at.y - size.height;
     }
-    if x + size.width > container.origin.x + container.size.width {
+    if rtl {
+        if x < container.origin.x {
+            x = at.x;
+        }
+    } else if x + size.width > container.origin.x + container.size.width {
         x = at.x - size.width;
     }
     let clamp = |value: Px, low: Px, high: Px| value.min(high).max(low);
@@ -4633,6 +4692,10 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
     while !out.overlay_queue.is_empty() && placed < OVERLAY_CAP {
         placed += 1;
         let queued = out.overlay_queue.remove(0);
+        // the overlay reads the way its anchor did, not the way the root
+        // does: a popover of a right-to-left island lays out from the
+        // right inside a scene that reads from the left
+        let env = &LayoutEnv { direction: queued.direction, ..*env };
         let proposal = Proposal {
             width: Some(container.size.width),
             height: Some(container.size.height),
@@ -4748,6 +4811,8 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
     // the menu lands above every popover — the runtime opened it, the
     // runtime will close it, and its rows highlight from the stamp
     if let Some(open) = env.stamp.interaction.menu.clone() {
+        // the panel reads the way the region it opened from does
+        let env = &LayoutEnv { direction: open.direction, ..*env };
         let node = menu_node(&open, env);
         // natural width, floored at the house minimum; the height is
         // the rows' own
@@ -4763,7 +4828,7 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
             Proposal { width: Some(size.width), height: Some(size.height) },
             env,
         );
-        let frame = menu_frame(open.at, size, container);
+        let frame = menu_frame(open.at, size, container, env.rtl());
         let start = out.display.len();
         node.place(frame, &fit, env, out);
         let end = out.display.len();
@@ -4786,7 +4851,10 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
             height: Some(container.size.height),
         };
         let (size, fit) = node.measure(proposal, env);
-        let at = Point { x: live.at.x + 14.0, y: live.at.y + 16.0 };
+        // off the pointer's trailing side: the right, or the left in a
+        // right-to-left scene, so the hand never covers the label
+        let x = if env.rtl() { live.at.x - 14.0 - size.width } else { live.at.x + 14.0 };
+        let at = Point { x, y: live.at.y + 16.0 };
         let clamp = |value: Px, low: Px, high: Px| value.min(high).max(low);
         let frame = Rect {
             origin: Point {
@@ -6353,6 +6421,7 @@ impl LayoutNode {
                     node: Rc::clone(content),
                     anchor: frame,
                     anchor_visible: true,
+                    direction: env.direction,
                 });
             }
 
@@ -6374,11 +6443,12 @@ impl LayoutNode {
                     .is_none_or(|clip| anchor.intersection(clip).is_some());
                 out.overlay_queue.push(QueuedOverlay {
                     path: path.clone(),
-                    side: Some(*side),
+                    side: Some(side.physical(env.rtl())),
                     surface: OverlaySurface::Layer,
                     node: Rc::clone(overlay),
                     anchor,
                     anchor_visible,
+                    direction: env.direction,
                 });
             }
 
@@ -6448,7 +6518,14 @@ impl LayoutNode {
                 // is the chip's. Clipped like a hit: what is not visible
                 // explains nothing.
                 if let Some(rect) = clip_of(out, frame) {
-                    out.tooltips.push(TooltipRegion { text: text.clone(), side: *side, rect });
+                    // the side as the window sees it, decided here where
+                    // the direction is known; the bubble's own math is
+                    // physical
+                    out.tooltips.push(TooltipRegion {
+                        text: text.clone(),
+                        side: side.physical(env.rtl()),
+                        rect,
+                    });
                 }
                 child.place(frame, fit, env, out);
             }
@@ -6460,6 +6537,7 @@ impl LayoutNode {
                         items: items.clone(),
                         rect,
                         on_click: on_click.clone(),
+                        direction: env.direction,
                     });
                 }
                 child.place(frame, fit, env, out);
@@ -6995,6 +7073,9 @@ impl LayoutNode {
                 // halo is under it and therefore inside it — hang the
                 // halo on a wrapper to keep it out
                 if let Some(glass) = props.glass {
+                    // a spot anchored to a leading corner sits at the
+                    // right one in a right-to-left scene, like a gradient
+                    let glass = if env.rtl() { glass.flipped() } else { glass };
                     out.draw(DrawCommand::Backdrop {
                         rect: frame,
                         glass: glass.resolve(frame),
@@ -7039,6 +7120,8 @@ impl LayoutNode {
                 // child: the two compose, and the geometry resolves to
                 // px here — the shaders only evaluate
                 if let Some(gradient) = props.gradient {
+                    // its anchors are named from the leading side
+                    let gradient = if env.rtl() { gradient.flipped() } else { gradient };
                     out.draw(DrawCommand::Gradient {
                         rect: frame,
                         paint: gradient.resolve(frame),
@@ -7880,13 +7963,21 @@ fn place_text(
     let leading = (advance - line_h) / 2.0;
     let top = frame.origin.y + leading;
     // where a line sits in the room the box gives it: leading is offset
-    // zero, which is where every line has always been placed
+    // zero, which is where every line has always been placed — and the
+    // whole room in a right-to-left scene, where the leading edge is the
+    // right one (a line wider than its box keeps its END on that edge
+    // and its start spills left, trailing). The origin stays the drawn
+    // run's LEFT edge either way: that is what every reader of a
+    // `TextLine` counts from.
+    let rtl = env.rtl();
     let slide = |width: Px| -> Px {
         let room = frame.size.width - width;
-        match env.text_align {
-            None | Some(motor::views::TextAlignment::Leading) => 0.0,
-            Some(motor::views::TextAlignment::Center) => room / 2.0,
-            Some(motor::views::TextAlignment::Trailing) => room,
+        match (env.text_align, rtl) {
+            (None | Some(motor::views::TextAlignment::Leading), false) => 0.0,
+            (None | Some(motor::views::TextAlignment::Leading), true) => room,
+            (Some(motor::views::TextAlignment::Center), _) => room / 2.0,
+            (Some(motor::views::TextAlignment::Trailing), false) => room,
+            (Some(motor::views::TextAlignment::Trailing), true) => 0.0,
         }
     };
 
@@ -7935,11 +8026,18 @@ fn place_text(
             });
             break;
         }
-        // a centred or trailing line has to know its OWN width; a leading
-        // one never asks, so the common case measures nothing extra
-        let x = match env.text_align {
-            None | Some(motor::views::TextAlignment::Leading) => frame.origin.x,
-            _ => {
+        // a line that does not start at the frame's left edge has to know
+        // its OWN width; one that does never asks, so the common case
+        // measures nothing extra — leading left to right, trailing right
+        // to left
+        let starts_at_left = matches!(
+            (env.text_align, rtl),
+            (None | Some(motor::views::TextAlignment::Leading), false)
+                | (Some(motor::views::TextAlignment::Trailing), true)
+        );
+        let x = match starts_at_left {
+            true => frame.origin.x,
+            false => {
                 // the space a break swallowed is INVISIBLE, and counting
                 // it would slide the line half a space off centre — the
                 // browser trims it too, so the two lowerings agree
@@ -8831,6 +8929,109 @@ mod tests {
         };
         assert_eq!(bar_x(&layout(&region, proposal)), 100.0 - SCROLLBAR_INSET - SCROLLBAR_W);
         assert_eq!(bar_x(&layout_in(&region, proposal, LayoutDirection::RightToLeft)), SCROLLBAR_INSET);
+    }
+
+    /// A line aligned leading hugs the right in a right-to-left scene,
+    /// a trailing one the left, and each wrapped line sits on its own
+    /// width — the mirror of the alignment test the runtime suite keeps.
+    #[test]
+    fn text_aligned_leading_hugs_the_right_in_rtl() {
+        use motor::views::TextAlignment;
+        let words = |content: &str, align: Option<TextAlignment>| LayoutNode::Frame {
+            width: Some(40.0),
+            height: None,
+            align: CrossAlign::Start,
+            child: Box::new(LayoutNode::Styled {
+                props: VisualProps { text_align: align, ..VisualProps::default() }.shared(),
+                child: Box::new(LayoutNode::Text {
+                    content: crate::bind::TextSource::from(content.to_string()),
+                    highlights: None,
+                    truncation: None,
+                    hints: ElementHints::default(),
+                    action: None,
+                }),
+                hints: ElementHints::default(),
+                action: None,
+            }),
+        };
+        let lefts = |node: &LayoutNode, direction: LayoutDirection| -> Vec<Px> {
+            layout_in(node, Proposal::unspecified(), direction)
+                .display
+                .iter()
+                .filter_map(|command| match command {
+                    DrawCommand::TextLine { origin, .. } => Some(origin.x),
+                    _ => None,
+                })
+                .collect()
+        };
+        use LayoutDirection::{LeftToRight, RightToLeft};
+        // one line of five glyphs fills its box of forty: one place
+        assert_eq!(lefts(&words("xxxxx", None), LeftToRight), [0.0]);
+        assert_eq!(lefts(&words("xxxxx", None), RightToLeft), [0.0]);
+        // "aa bbbb" wraps into "aa" (16) and "bbbb" (32) in a box the
+        // paragraph fills: each line sits on its own width
+        assert_eq!(lefts(&words("aa bbbb", None), LeftToRight), [0.0, 0.0]);
+        assert_eq!(lefts(&words("aa bbbb", None), RightToLeft), [24.0, 8.0], "leading hugs the right");
+        assert_eq!(lefts(&words("aa bbbb", Some(TextAlignment::Trailing)), LeftToRight), [24.0, 8.0]);
+        assert_eq!(lefts(&words("aa bbbb", Some(TextAlignment::Trailing)), RightToLeft), [0.0, 0.0], "trailing hugs the left");
+        assert_eq!(lefts(&words("aa bbbb", Some(TextAlignment::Center)), LeftToRight), [12.0, 4.0]);
+        assert_eq!(lefts(&words("aa bbbb", Some(TextAlignment::Center)), RightToLeft), [12.0, 4.0], "the centre stays");
+    }
+
+    /// A truncated line keeps its end — the ellipsis — on the leading
+    /// edge, the right one in a right-to-left scene.
+    #[test]
+    fn a_truncated_line_hugs_the_right_in_rtl() {
+        let node = LayoutNode::Frame {
+            width: Some(100.0),
+            height: None,
+            align: CrossAlign::Start,
+            child: Box::new(LayoutNode::Text {
+                content: crate::bind::TextSource::from("x".repeat(20)),
+                highlights: None,
+                truncation: Some(Truncation::End),
+                hints: ElementHints::default(),
+                action: None,
+            }),
+        };
+        let line = |direction: LayoutDirection| {
+            layout_in(&node, Proposal::unspecified(), direction)
+                .display
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::TextLine { origin, content, .. } => {
+                        Some((origin.x, content.chars().count() as Px * 8.0))
+                    }
+                    _ => None,
+                })
+                .expect("the line paints")
+        };
+        let (x, width) = line(LayoutDirection::LeftToRight);
+        assert_eq!(x, 0.0);
+        assert!(width <= 100.0 && width > 80.0, "cut to the box: {width}");
+        let (x, mirrored) = line(LayoutDirection::RightToLeft);
+        assert_eq!(mirrored, width, "the same cut");
+        assert_eq!(x + width, 100.0, "its end on the right edge");
+    }
+
+    /// A gradient's anchors are named from the leading side: flipped,
+    /// a leading-to-trailing ramp runs the other way, and a spot in a
+    /// pane's leading corner moves to the right one.
+    #[test]
+    fn a_gradient_anchored_leading_flips_with_the_scene() {
+        let ramp = Gradient::Linear {
+            start: UnitPoint::LEADING,
+            end: UnitPoint::TRAILING,
+            from: Color::WHITE,
+            to: Color::BLACK,
+        };
+        let Gradient::Linear { start, end, .. } = ramp.flipped() else { panic!("a ramp stays a ramp") };
+        assert_eq!((start, end), (UnitPoint::TRAILING, UnitPoint::LEADING));
+        let wash = Gradient::radial(Color::WHITE, Color::BLACK);
+        let Gradient::Radial { center, .. } = wash.flipped() else { panic!("a wash stays a wash") };
+        assert_eq!(center, UnitPoint::CENTER, "the centre is its own mirror");
+        let glass = Glass::regular().spot(UnitPoint::TOP_LEADING, 0.5, 0.3).flipped();
+        assert_eq!(glass.spot.map(|(center, ..)| center), Some(UnitPoint::TOP_TRAILING));
     }
 
     /// The contract on the other side: left to right is what it always
