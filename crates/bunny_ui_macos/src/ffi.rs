@@ -119,6 +119,10 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_void_id_id(obj: Id, sel: Sel, a: Id, b: Id);
     #[link_name = "objc_msgSend"]
+    fn msg_ptr(obj: Id, sel: Sel) -> *mut u8;
+    #[link_name = "objc_msgSend"]
+    fn msg_i32_u32_ptr(obj: Id, sel: Sel, a: u32, b: *mut u32) -> i32;
+    #[link_name = "objc_msgSend"]
     fn msg_point_point(obj: Id, sel: Sel, point: CGPoint) -> CGPoint;
     #[link_name = "objc_msgSend"]
     fn msg_void_id_i64(obj: Id, sel: Sel, a: Id, b: i64);
@@ -2355,10 +2359,47 @@ impl WindowHandle {
                         sel("setAutoresizingMask:"),
                         Self::LAYER_MIN_Y_MARGIN | Self::LAYER_MAX_X_MARGIN,
                     );
-                    LiveLayer { layer, buffers: [Vec::new(), Vec::new()], flip: false }
+                    LiveLayer {
+                        layer,
+                        buffers: [Vec::new(), Vec::new()],
+                        surfaces: [std::ptr::null_mut(); 2],
+                        surface_size: (0, 0),
+                        flip: false,
+                    }
                 });
-                // premultiply into the spare backing
                 entry.flip = !entry.flip;
+                // the surfaces are the picture's size; a box that grew gets new ones
+                if entry.surface_size != (px_width, px_height) {
+                    entry.drop_surfaces();
+                    let pair = [make_surface(px_width, px_height), make_surface(px_width, px_height)];
+                    if pair.iter().all(|surface| !surface.is_null()) {
+                        entry.surfaces = pair;
+                        entry.surface_size = (px_width, px_height);
+                    } else {
+                        for surface in pair {
+                            if !surface.is_null() {
+                                msg_void(surface, sel("release"));
+                            }
+                        }
+                    }
+                }
+                let surface = entry.surfaces[entry.flip as usize];
+                if !surface.is_null() && fill_surface(surface, px_width, px_height, rgba) {
+                    without_actions(|| {
+                        msg_void_rect(
+                            entry.layer,
+                            sel("setFrame:"),
+                            CGRect {
+                                origin: CGPoint { x, y: view_height - y - h },
+                                size: CGSize { width: w, height: h },
+                            },
+                        );
+                        msg_void_f64(entry.layer, sel("setContentsScale:"), scale as f64);
+                        msg_void_id(entry.layer, sel("setContents:"), surface);
+                    });
+                    return;
+                }
+                // premultiply into the spare backing
                 let backing = &mut entry.buffers[entry.flip as usize];
                 backing.clear();
                 backing.extend_from_slice(rgba);
@@ -2447,7 +2488,10 @@ impl WindowHandle {
                 if alive.iter().any(|path| path == key) {
                     return true;
                 }
-                unsafe { msg_void(entry.layer, sel("removeFromSuperlayer")) };
+                unsafe {
+                    msg_void(entry.layer, sel("removeFromSuperlayer"));
+                    entry.drop_surfaces();
+                }
                 false
             });
         });
@@ -3275,11 +3319,92 @@ extern "C" fn bunny_cursor_update(_this: Id, _sel: Sel, _event: Id) {
 }
 
 /// One live box's sublayer and its two alternating backings — the
-/// picture on screen is never the buffer being written.
+/// picture on screen is never the buffer being written. The backings
+/// are IOSurfaces: Core Animation composites one directly, where a
+/// CGImage made it copy and colour-convert every picture on commit (the
+/// arena's looping canvas spent two thirds of its tick there). The byte
+/// buffers stay for the road without surfaces.
 struct LiveLayer {
     layer: Id,
     buffers: [Vec<u8>; 2],
+    surfaces: [Id; 2],
+    surface_size: (usize, usize),
     flip: bool,
+}
+
+impl LiveLayer {
+    /// Lets the surfaces go; the layer is the caller's.
+    unsafe fn drop_surfaces(&mut self) {
+        for surface in &mut self.surfaces {
+            if !surface.is_null() {
+                unsafe { msg_void(*surface, sel("release")) };
+                *surface = std::ptr::null_mut();
+            }
+        }
+        self.surface_size = (0, 0);
+    }
+}
+
+/// A BGRA IOSurface of `width` × `height` pixels, retained; null when the
+/// system refuses one (the caller falls back to a CGImage).
+unsafe fn make_surface(width: usize, height: usize) -> Id {
+    unsafe {
+        let dict = msg_id(class("NSMutableDictionary"), sel("dictionary"));
+        if dict.is_null() {
+            return std::ptr::null_mut();
+        }
+        let number = |value: u64| msg_id_u64(class("NSNumber"), sel("numberWithUnsignedLongLong:"), value);
+        let key = |name: &str| {
+            let name = std::ffi::CString::new(name).expect("key");
+            msg_id_arg(class("NSString"), sel("stringWithUTF8String:"), name.as_ptr() as Id)
+        };
+        // 'BGRA': the order Core Animation composites without conversion
+        const BGRA: u64 = 0x4247_5241;
+        msg_void_id_id(dict, sel("setObject:forKey:"), number(width as u64), key("IOSurfaceWidth"));
+        msg_void_id_id(dict, sel("setObject:forKey:"), number(height as u64), key("IOSurfaceHeight"));
+        msg_void_id_id(dict, sel("setObject:forKey:"), number(4), key("IOSurfaceBytesPerElement"));
+        msg_void_id_id(dict, sel("setObject:forKey:"), number(BGRA), key("IOSurfacePixelFormat"));
+        let class = class("IOSurface");
+        if class.is_null() {
+            return std::ptr::null_mut();
+        }
+        msg_id_arg(msg_id(class, sel("alloc")), sel("initWithProperties:"), dict)
+    }
+}
+
+/// Writes straight RGBA rows into a locked surface as premultiplied BGRA,
+/// honouring the surface's own row stride.
+unsafe fn fill_surface(surface: Id, px_width: usize, px_height: usize, rgba: &[u8]) -> bool {
+    unsafe {
+        let mut seed = 0u32;
+        if msg_i32_u32_ptr(surface, sel("lockWithOptions:seed:"), 0, &mut seed) != 0 {
+            return false;
+        }
+        let base = msg_ptr(surface, sel("baseAddress"));
+        let stride = msg_u64(surface, sel("bytesPerRow")) as usize;
+        if base.is_null() || stride < px_width * 4 {
+            let _ = msg_i32_u32_ptr(surface, sel("unlockWithOptions:seed:"), 0, &mut seed);
+            return false;
+        }
+        for row in 0..px_height {
+            let src = &rgba[row * px_width * 4..(row + 1) * px_width * 4];
+            let dst = std::slice::from_raw_parts_mut(base.add(row * stride), px_width * 4);
+            for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                let alpha = s[3] as u32;
+                let (r, g, b) = if alpha == 255 {
+                    (s[0], s[1], s[2])
+                } else {
+                    ((s[0] as u32 * alpha / 255) as u8, (s[1] as u32 * alpha / 255) as u8, (s[2] as u32 * alpha / 255) as u8)
+                };
+                d[0] = b;
+                d[1] = g;
+                d[2] = r;
+                d[3] = s[3];
+            }
+        }
+        let _ = msg_i32_u32_ptr(surface, sel("unlockWithOptions:seed:"), 0, &mut seed);
+        true
+    }
 }
 
 /// Mutates layers with the implicit animations OFF. Core Animation
