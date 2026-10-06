@@ -433,10 +433,24 @@ pub fn byte_to_utf16(text: &str, byte: usize) -> usize {
 }
 
 /// UTF-16 units in whole UTF-8 bytes, in one pass: a lead or ASCII byte
-/// is one unit, a four-byte lead one more, a continuation none.
+/// is one unit, a four-byte lead one more, a continuation none. Counted in
+/// blocks whose total fits a byte — UTF-8 never holds more units than
+/// bytes, and a block cut through a character gains at most one — so the
+/// compiler adds sixteen bytes at a time instead of widening each one to
+/// a word.
 fn utf16_len(bytes: &[u8]) -> usize {
-    bytes.iter().map(|&b| usize::from(b & 0xC0 != 0x80) + usize::from(b >= 0xF0)).sum()
+    bytes
+        .chunks(UTF16_BLOCK)
+        .map(|block| {
+            block.iter().fold(0u8, |sum, &b| {
+                sum.wrapping_add(u8::from(b & 0xC0 != 0x80) + u8::from(b >= 0xF0))
+            }) as usize
+        })
+        .sum()
 }
+
+/// A block of [`utf16_len`]: its count is at most its length plus one.
+const UTF16_BLOCK: usize = 240;
 
 /// The UTF-16 span of `start..end` after the offset of `start` — a
 /// selection measured from where it begins, not from the text's start.
@@ -560,6 +574,22 @@ mod tests {
                 let end = super::clamp_to_boundary(text, end);
                 assert_eq!(super::utf16_span(text, byte, end), (units(0, byte), units(byte, end)), "span {byte}..{end}");
             }
+        }
+    }
+
+    #[test]
+    fn a_long_text_counts_across_its_blocks() {
+        // characters of every width cut by every block boundary, and runs
+        // of four-byte characters as dense as UTF-8 allows
+        let mut text = String::new();
+        for i in 0..400 {
+            text.push_str(["a", "é", "語", "🦀", "🐇🦀", "ascii run "][i % 6]);
+        }
+        text.push_str(&"🦀".repeat(300));
+        for byte in (0..=text.len()).step_by(7) {
+            let byte = super::clamp_to_boundary(&text, byte);
+            let units: usize = text[..byte].chars().map(char::len_utf16).sum();
+            assert_eq!(super::byte_to_utf16(&text, byte), units, "at byte {byte}");
         }
     }
 
