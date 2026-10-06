@@ -2051,7 +2051,7 @@ impl MetalPresenter {
         images: &dyn ImageEngine,
     ) {
         self.ground.clear_native();
-        for attempt in 0..3 {
+        for attempt in 0..4 {
             match build_frame(
                 &mut self.ground,
                 display,
@@ -2064,10 +2064,10 @@ impl MetalPresenter {
             ) {
                 Ok(()) => return,
                 Err(AtlasFull) => {
-                    if attempt == 2 {
+                    if attempt == 3 {
                         // pathological frame: keep the rects, drop the
                         // rest of the text — never a crash
-                        eprintln!("bunny_ui metal: atlas overflow survived two resets");
+                        eprintln!("bunny_ui metal: atlas overflow survived three resets");
                         return;
                     }
                     // the cheap road first: shelves nobody read for a while
@@ -2408,7 +2408,7 @@ impl OffscreenGpu {
             let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
             self.ground.begin_slot(index);
             self.ground.clear_native();
-            for attempt in 0..3 {
+            for attempt in 0..4 {
                 match build_frame(
                     &mut self.ground,
                     display,
@@ -2421,8 +2421,8 @@ impl OffscreenGpu {
                 ) {
                     Ok(()) => break,
                     Err(AtlasFull) => {
-                        if attempt == 2 {
-                            eprintln!("bunny_ui metal: atlas overflow survived two resets");
+                        if attempt == 3 {
+                            eprintln!("bunny_ui metal: atlas overflow survived three resets");
                             break;
                         }
                         self.drain();
