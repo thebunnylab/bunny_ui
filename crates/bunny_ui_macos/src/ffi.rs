@@ -445,7 +445,6 @@ unsafe fn start_beat(window: Id, view: Id, delegate: Id) {
                     NSRunLoopCommonModes,
                 );
                 LINK.with(|slot| slot.set(link));
-                LINK_PAUSED.with(|state| state.set((link, true)));
             }
         } else {
             eprintln!("bunny_ui: this macOS has no view display link; animations snap");
@@ -1695,9 +1694,6 @@ thread_local! {
     /// only while animations run. Zero-ivar classes: per-window state
     /// lives beside the run loop (the backing-store pattern).
     static LINK: Cell<Id> = const { Cell::new(std::ptr::null_mut()) };
-    /// The link the pause was last set on, and the pause: the driver is
-    /// re-aimed after every event, and an unchanged pace sends nothing.
-    static LINK_PAUSED: Cell<(Id, bool)> = const { Cell::new((std::ptr::null_mut(), true)) };
     /// The slow beat: `(timer, interval)`. Alive only while loop clocks
     /// are the sole animation — one wake per step instead of a display
     /// rate of empty ticks.
@@ -1831,7 +1827,10 @@ pub fn set_frame_driver(pace: DriverPace) {
     let full = pace == DriverPace::Full;
     LINK.with(|slot| {
         let link = slot.get();
-        if !link.is_null() && LINK_PAUSED.with(|state| state.replace((link, !full))) != (link, !full) {
+        // sent every time, unchanged or not: AppKit pauses a view's link
+        // on its own when it judges the window covered (some displays never
+        // report it visible), and only this keeps the beat coming
+        if !link.is_null() {
             unsafe { msg_void_bool(link, sel("setPaused:"), (!full) as i8) };
         }
     });
