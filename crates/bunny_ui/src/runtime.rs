@@ -1155,6 +1155,7 @@ impl Runtime {
         crate::layout::DropPoint {
             local: Point { x: x - region.frame.origin.x, y: y - region.frame.origin.y },
             size: region.frame.size,
+            direction: region.direction,
         }
     }
 
@@ -2085,15 +2086,17 @@ impl Runtime {
             menu: &asked,
             touch: self.touch_modality.get(),
             held_ms: self.press_held_ms(),
+            direction: placement.direction,
         };
         let answer = placement.element.element().event(&event, &ctx);
         if let Some((at, items)) = asked.into_inner() {
-            // the point is the box's own, and a menu lives in the scene
+            // the point is the box's own, and a menu lives in the scene —
+            // and hangs the way the box's scene reads
             let at = Point {
                 x: at.x + placement.frame.origin.x,
                 y: at.y + placement.frame.origin.y,
             };
-            self.open_menu(at, items, self.layout_direction());
+            self.open_menu(at, items, placement.direction);
         }
         answer
     }
@@ -5660,6 +5663,7 @@ impl Runtime {
                     scale: self.device_scale.get(),
                     touch: self.touch_modality.get(),
                     overlay_layered: true,
+                    direction: placement.direction,
                 };
                 let origin = crate::layout::Point {
                     x: owner.frame.origin.x - placement.frame.origin.x,
@@ -5689,6 +5693,7 @@ impl Runtime {
                     scale: self.device_scale.get(),
                     touch: self.touch_modality.get(),
                     overlay_layered: false,
+                    direction: placement.direction,
                 };
                 let origin = crate::layout::Point {
                     x: -placement.visible.origin.x,
