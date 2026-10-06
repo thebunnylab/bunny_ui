@@ -7489,6 +7489,58 @@ mod tests {
     }
 
     #[test]
+    fn a_note_is_never_shaped_whole_while_it_is_typed_into() {
+        use crate::layout::{Proposal, Size};
+        use crate::text_engine::{FontSpec, LineMetrics, PixelFont, TextEngine, TextRaster};
+        use std::cell::Cell;
+        // a text engine that remembers the longest string it was asked to shape
+        struct Longest(Cell<usize>);
+        impl TextEngine for Longest {
+            fn measure_line(&self, text: &str, font: &FontSpec) -> LineMetrics {
+                self.0.set(self.0.get().max(text.len()));
+                PixelFont.measure_line(text, font)
+            }
+            fn raster_line(&self, text: &str, font: &FontSpec, color: crate::layout::Color, scale: usize) -> Option<TextRaster> {
+                PixelFont.raster_line(text, font, color, scale)
+            }
+        }
+        #[derive(Clone)]
+        struct Panel {
+            note: State<String>,
+        }
+        impl Component for Panel {
+            fn body(self, _: &Context) -> impl View {
+                text_editor("note", self.note.binding()).frame(400.0, 300.0)
+            }
+        }
+        // two thousand lines, some of them long enough to wrap
+        let note: String = (0..2000)
+            .map(|line| if line % 9 == 0 { format!("{} {line}\n", "a long line that wraps".repeat(4)) } else { format!("line {line}\n") })
+            .collect();
+        let engine = Rc::new(Longest(Cell::new(0)));
+        let panel = Panel { note: State::new(note.clone()) };
+        let runtime = Runtime::new().text_engine(engine.clone());
+        let proposal = Proposal::exact(Size { width: 400.0, height: 300.0 });
+        runtime.render_stable(&panel);
+        let layout = runtime.layout(&panel, proposal);
+        let path = layout.hits.first().expect("field target").0.clone();
+        runtime.focus(&path);
+        for stroke in 0..20 {
+            runtime.key(EditCommand::Insert(if stroke % 5 == 4 { "\n".into() } else { "x".into() }));
+            runtime.render_stable(&panel);
+            let _ = runtime.layout(&panel, proposal);
+            let snapshot = runtime.ime_snapshot().expect("the focused note answers the input method");
+            assert!(snapshot.caret_rect.size.height > 0.0);
+        }
+        assert_eq!(panel.note.get().len(), note.len() + 20, "every stroke landed");
+        assert!(
+            engine.0.get() < 200,
+            "the longest string shaped was {} bytes: a line, never the note",
+            engine.0.get()
+        );
+    }
+
+    #[test]
     fn native_inputs_request_a_text_pointer_inside_clickable_chrome() {
         use crate::layout::{Cursor, Proposal, Size};
         #[derive(Clone, Copy)]

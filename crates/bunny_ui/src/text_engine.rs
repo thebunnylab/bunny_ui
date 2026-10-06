@@ -528,6 +528,14 @@ fn wrap_paragraph(
     cache: &MeasureCache,
     lines: &mut Vec<(usize, usize)>,
 ) {
+    // a paragraph that fits is one line, whatever its words: a short
+    // printable-ASCII one is decided by a bound (no shaping at all), any
+    // other by ONE measure of the whole — the word walk below measures a
+    // growing prefix per word, which a page of short lines never needs
+    if paragraph_fits(&text[start..stop], font, max_width, engine, cache) {
+        lines.push((start, stop));
+        return;
+    }
     let mut line_start = start;
     let mut cursor = start;
 
@@ -575,6 +583,108 @@ fn wrap_paragraph(
     lines.push((line_start, stop));
 }
 
+/// True when the paragraph is one line at `max_width`. Printable ASCII
+/// is bounded by its widest glyph times its length (kerning and tracking
+/// only nudge a run of these; the bound carries the margin); anything
+/// else, or a long ASCII paragraph, is measured once, whole.
+fn paragraph_fits(
+    paragraph: &str,
+    font: &FontSpec,
+    max_width: Px,
+    engine: &dyn TextEngine,
+    cache: &MeasureCache,
+) -> bool {
+    if paragraph.is_empty() {
+        return true;
+    }
+    let bytes = paragraph.as_bytes();
+    if bytes.iter().all(|byte| (0x20..0x7f).contains(byte))
+        && cache.ascii_advance(font, engine) * bytes.len() as Px <= max_width
+    {
+        return true;
+    }
+    cache.get_or_measure(paragraph, font, engine).width <= max_width
+}
+
+/// How many leading bytes two strings share — compared in blocks, which
+/// the platform's memcmp runs at memory speed.
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    const BLOCK: usize = 256;
+    let n = a.len().min(b.len());
+    let mut at = 0;
+    while at + BLOCK <= n && a[at..at + BLOCK] == b[at..at + BLOCK] {
+        at += BLOCK;
+    }
+    while at < n && a[at] == b[at] {
+        at += 1;
+    }
+    at
+}
+
+/// How many trailing bytes two strings share, at most `limit`.
+fn common_suffix(a: &[u8], b: &[u8], limit: usize) -> usize {
+    const BLOCK: usize = 256;
+    let (la, lb) = (a.len(), b.len());
+    let mut at = 0;
+    while at + BLOCK <= limit && a[la - at - BLOCK..la - at] == b[lb - at - BLOCK..lb - at] {
+        at += BLOCK;
+    }
+    while at < limit && a[la - 1 - at] == b[lb - 1 - at] {
+        at += 1;
+    }
+    at
+}
+
+/// The lines of `new`, from the lines `old` was broken into: the
+/// paragraphs an edit touched are wrapped again, the ones before it
+/// stand, and the ones after it shift by the edit's length. The answer is
+/// the one [`break_lines`] gives `new` from scratch — the test holds the
+/// two to it over random edits.
+#[allow(clippy::too_many_arguments)]
+fn rewrap(
+    old: &str,
+    old_lines: &[(usize, usize)],
+    new: &str,
+    font: &FontSpec,
+    max_width: Px,
+    engine: &dyn TextEngine,
+    cache: &MeasureCache,
+) -> Vec<(usize, usize)> {
+    let (a, b) = (old.as_bytes(), new.as_bytes());
+    let prefix = common_prefix(a, b);
+    let suffix = common_suffix(a, b, a.len().min(b.len()) - prefix);
+    // the touched paragraphs, in NEW coordinates: from the start of the
+    // one the edit begins in to the end of the one it ends in (a break
+    // typed at the end of a line takes the next paragraph along, which
+    // costs one more wrap and keeps the rule simple)
+    let start = b[..prefix].iter().rposition(|&byte| byte == b'\n').map_or(0, |at| at + 1);
+    let changed_end = b.len() - suffix;
+    let end_new = b[changed_end..]
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map_or(b.len(), |at| changed_end + at);
+    // the same end in OLD coordinates: what follows it is the shared tail
+    let end_old = a.len() - (b.len() - end_new);
+    let head = old_lines.partition_point(|&(line_start, _)| line_start < start);
+    let tail = old_lines.partition_point(|&(line_start, _)| line_start <= end_old);
+    let mut lines = Vec::with_capacity(old_lines.len() + 4);
+    lines.extend_from_slice(&old_lines[..head]);
+    let mut paragraph = start;
+    loop {
+        let stop = new[paragraph..end_new].find('\n').map_or(end_new, |at| paragraph + at);
+        wrap_paragraph(new, paragraph, stop, font, max_width, engine, cache, &mut lines);
+        if stop == end_new {
+            break;
+        }
+        paragraph = stop + 1;
+    }
+    let grown = b.len() as isize - a.len() as isize;
+    lines.extend(old_lines[tail..].iter().map(|&(line_start, line_end)| {
+        ((line_start as isize + grown) as usize, (line_end as isize + grown) as usize)
+    }));
+    lines
+}
+
 // MARK: - Measurement cache
 
 type BreakLines = std::rc::Rc<Vec<(usize, usize)>>;
@@ -608,7 +718,29 @@ pub struct MeasureCache {
     lines: RefCell<HashMap<FontKey, HashMap<String, (LineMetrics, std::cell::Cell<u32>)>>>,
     breaks:
         RefCell<HashMap<(FontKey, u32), HashMap<String, (BreakLines, std::cell::Cell<u32>)>>>,
+    /// Multi-line fields, by path: their lines at the widths they were
+    /// laid out at ([`MeasureCache::field_lines`]).
+    fields: RefCell<HashMap<String, Vec<FieldLines>>>,
+    /// The widest printable ASCII glyph of each font, with a margin — the
+    /// bound that lets a short ASCII paragraph skip shaping.
+    ascii_advance: RefCell<HashMap<FontKey, Px>>,
 }
+
+/// One multi-line field's visual lines at one width, kept from frame to
+/// frame with the text they break.
+struct FieldLines {
+    mode: (FontKey, u32),
+    text: Arc<str>,
+    lines: BreakLines,
+    used: std::cell::Cell<u32>,
+}
+
+/// The widths one field keeps lines for at once — a field measured at a
+/// probe width and placed at its own needs two.
+const FIELD_WIDTHS_KEPT: usize = 3;
+
+/// How many passes a field's lines outlive its last layout.
+const FIELD_KEEP_FRAMES: u32 = 64;
 
 /// How many frames an entry survives without use. Typing ALTERNATES
 /// content (backspace restores the string from two frames ago; a filter
@@ -651,6 +783,13 @@ impl MeasureCache {
     pub fn begin_frame(&self) {
         let frame = self.frame.get().wrapping_add(1);
         self.frame.set(frame);
+        if frame % SWEEP_EVERY == 0 {
+            let mut fields = self.fields.borrow_mut();
+            for kept in fields.values_mut() {
+                kept.retain(|lines| frame.wrapping_sub(lines.used.get()) <= FIELD_KEEP_FRAMES);
+            }
+            fields.retain(|_, kept| !kept.is_empty());
+        }
         let floor = self.floor();
         if self.entries.get() <= floor || (floor > 0 && frame % SWEEP_EVERY != 0) {
             return;
@@ -726,6 +865,77 @@ impl MeasureCache {
         self.entries.set(self.entries.get() + 1);
         broken
     }
+
+    /// A multi-line field's visual lines — what [`MeasureCache::get_or_break`]
+    /// answers, kept per field (its `path`) and per width instead of per
+    /// text. A string that differs from the kept one is compared with it
+    /// (shared head, shared tail) and only the paragraphs between are
+    /// wrapped again: a note of thirty thousand lines re-wraps the line
+    /// being typed, and the cache holds one copy of the text per field,
+    /// not one per keystroke. `shared` is the caller's own handle on the
+    /// text, adopted so the next frame's question is a pointer compare.
+    pub fn field_lines(
+        &self,
+        path: &str,
+        text: &str,
+        shared: Option<&Arc<str>>,
+        font: &FontSpec,
+        max_width: Px,
+        engine: &dyn TextEngine,
+    ) -> BreakLines {
+        let mode = (font.key(), (max_width * 1000.0).round() as u32);
+        let now = self.frame.get();
+        let owned = || shared.cloned().unwrap_or_else(|| Arc::from(text));
+        let mut fields = self.fields.borrow_mut();
+        if let Some(kept) = fields.get_mut(path).and_then(|all| all.iter_mut().find(|kept| kept.mode == mode)) {
+            kept.used.set(now);
+            let same = shared.is_some_and(|handle| Arc::ptr_eq(handle, &kept.text)) || *kept.text == *text;
+            if !same {
+                let lines = rewrap(&kept.text, &kept.lines, text, font, max_width, engine, self);
+                kept.lines = std::rc::Rc::new(lines);
+            }
+            if !same || shared.is_some() {
+                kept.text = owned();
+            }
+            return kept.lines.clone();
+        }
+        let lines = std::rc::Rc::new(break_lines(text, font, max_width, engine, self));
+        let fresh = FieldLines { mode, text: owned(), lines: lines.clone(), used: std::cell::Cell::new(now) };
+        match fields.get_mut(path) {
+            Some(all) => {
+                // a field seen at more widths than it keeps forgets the
+                // one it used longest ago
+                if all.len() >= FIELD_WIDTHS_KEPT
+                    && let Some(oldest) = (0..all.len()).max_by_key(|&at| now.wrapping_sub(all[at].used.get()))
+                {
+                    all.swap_remove(oldest);
+                }
+                all.push(fresh);
+            }
+            None => {
+                fields.insert(path.to_string(), vec![fresh]);
+            }
+        }
+        lines
+    }
+
+    /// The widest printable ASCII glyph of `font`, with a margin for the
+    /// nudges of kerning and tracking — measured once per font.
+    fn ascii_advance(&self, font: &FontSpec, engine: &dyn TextEngine) -> Px {
+        let key = font.key();
+        if let Some(&advance) = self.ascii_advance.borrow().get(&key) {
+            return advance;
+        }
+        let mut widest: Px = 0.0;
+        for byte in 0x20u8..0x7f {
+            let glyph = [byte];
+            let glyph = std::str::from_utf8(&glyph).unwrap_or(" ");
+            widest = widest.max(engine.measure_line(glyph, font).width);
+        }
+        let advance = widest * 1.05;
+        self.ascii_advance.borrow_mut().insert(key, advance);
+        advance
+    }
 }
 
 #[cfg(test)]
@@ -744,6 +954,86 @@ mod tests {
     #[test]
     fn empty_text_rasters_to_nothing() {
         assert!(PixelFont.raster_line("", &FontSpec::DEFAULT, Color::BLACK, 1).is_none());
+    }
+
+    /// A small deterministic generator — the house keeps no dependency
+    /// for a test's dice.
+    struct Dice(u64);
+    impl Dice {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+    }
+
+    fn words(dice: &mut Dice, len: usize) -> String {
+        const ALPHABET: [&str; 7] = ["a", "bb", " ", " ", "\n", "é", "ccccccc"];
+        (0..len).map(|_| ALPHABET[dice.below(ALPHABET.len())]).collect()
+    }
+
+    #[test]
+    fn a_rewrap_after_an_edit_is_the_break_from_scratch() {
+        let mut dice = Dice(0x5eed_cafe);
+        let font = FontSpec::DEFAULT;
+        for round in 0..400 {
+            let cache = MeasureCache::default();
+            let width = [24.0, 40.0, 64.0, 100.0, 1000.0][dice.below(5)];
+            let old_len = dice.below(40);
+            let old = words(&mut dice, old_len);
+            let old_lines = break_lines(&old, &font, width, &PixelFont, &cache);
+            // an edit: a run replaced by another, anywhere (char boundaries)
+            let bounds: Vec<usize> = old.char_indices().map(|(at, _)| at).chain([old.len()]).collect();
+            let first = dice.below(bounds.len());
+            let last = first + dice.below(bounds.len() - first);
+            let (from, to) = (bounds[first], bounds[last]);
+            let inserted_len = dice.below(6);
+            let inserted = words(&mut dice, inserted_len);
+            let new = format!("{}{}{}", &old[..from], inserted, &old[to..]);
+            let rewrapped = rewrap(&old, &old_lines, &new, &font, width, &PixelFont, &cache);
+            let fresh = break_lines(&new, &font, width, &PixelFont, &cache);
+            assert_eq!(rewrapped, fresh, "round {round}: {old:?} → {new:?} at width {width}");
+        }
+    }
+
+    #[test]
+    fn a_field_keeps_one_text_and_its_lines_follow_each_keystroke() {
+        let cache = MeasureCache::default();
+        let font = FontSpec::DEFAULT;
+        let mut note: String = (0..300).map(|line| format!("line {line} of the note\n")).collect();
+        for stroke in 0..50 {
+            cache.begin_frame();
+            note.insert(note.len() / 2, if stroke % 7 == 6 { '\n' } else { 'x' });
+            let text: Arc<str> = Arc::from(note.as_str());
+            let kept = cache.field_lines("note", &text, Some(&text), &font, 200.0, &PixelFont);
+            assert_eq!(*kept, break_lines(&note, &font, 200.0, &PixelFont, &cache), "stroke {stroke}");
+        }
+        assert_eq!(cache.fields.borrow().len(), 1, "one field");
+        assert_eq!(cache.fields.borrow()["note"].len(), 1, "one width, one text");
+        assert_eq!(
+            cache.breaks.borrow().values().map(HashMap::len).sum::<usize>(),
+            0,
+            "no note was kept whole as a break key"
+        );
+    }
+
+    #[test]
+    fn a_short_ascii_paragraph_is_one_line_without_shaping() {
+        let cache = MeasureCache::default();
+        let font = FontSpec::DEFAULT;
+        let lines = break_lines("short\nlines\nhere", &font, 1000.0, &PixelFont, &cache);
+        assert_eq!(lines, vec![(0, 5), (6, 11), (12, 16)]);
+        assert_eq!(cache.len(), 0, "the bound decided: no string was measured");
+        // a paragraph past the bound (30 × 5 cells × 8 px × 1.05) that
+        // still fits is measured once, whole
+        let long = "word ".repeat(30);
+        let lines = break_lines(&long, &font, 1230.0, &PixelFont, &cache);
+        assert_eq!(lines, vec![(0, long.len())]);
+        assert_eq!(cache.len(), 1, "one measure of the whole paragraph");
     }
 
     #[test]
