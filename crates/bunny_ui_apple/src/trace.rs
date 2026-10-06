@@ -26,6 +26,7 @@
 //! K <ms> <what the engine retains, counted> · atlas <counts> · presenters <n> · dialogs <n> · panels <n>
 //! D <ms> pace=<full|slow:<ms>|off>
 //! L <ms> blits=<n>   (live layers repainted alone: an overlay, a loop)
+//! Q <ms> box=<x0>,<y0>,<x1>,<y1>[ moved] | hide   (a change presented through the patch layer, or the patch stepping aside)
 //! ```
 //!
 //! `R` is a window callback (which notification asked, and at what
