@@ -78,6 +78,8 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_u64(obj: Id, sel: Sel) -> u64;
     #[link_name = "objc_msgSend"]
+    fn msg_f64(obj: Id, sel: Sel) -> f64;
+    #[link_name = "objc_msgSend"]
     fn msg_id_arg(obj: Id, sel: Sel, a: Id) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_id_u64(obj: Id, sel: Sel, a: u64) -> Id;
@@ -754,6 +756,8 @@ struct Sels {
     wait_scheduled: Sel,
     present: Sel,
     status: Sel,
+    gpu_start: Sel,
+    gpu_end: Sel,
     retain: Sel,
     release: Sel,
     contents: Sel,
@@ -797,6 +801,8 @@ impl Sels {
                 wait_scheduled: sel("waitUntilScheduled"),
                 present: sel("present"),
                 status: sel("status"),
+                gpu_start: sel("GPUStartTime"),
+                gpu_end: sel("GPUEndTime"),
                 retain: sel("retain"),
                 release: sel("release"),
                 contents: sel("contents"),
@@ -1794,6 +1800,19 @@ impl Drop for MetalGround {
 /// A free slot from a ring: polled by `status`, oldest-first. When all
 /// ride the GPU (a burst above the refresh rate), waits for the oldest
 /// — bounded by one sub-millisecond frame.
+/// A completed frame's time on the GPU, on the tape: `G gpu=<ms>`. Read
+/// when its slot is taken for a later frame — the command buffer is done
+/// by then, and the two timestamps are the GPU's own clock.
+unsafe fn mark_gpu_time(command: Id, sels: &Sels) {
+    if !crate::trace::enabled() {
+        return;
+    }
+    let (start, end) = unsafe { (msg_f64(command, sels.gpu_start), msg_f64(command, sels.gpu_end)) };
+    if end > start {
+        crate::trace::mark("G", format_args!("gpu={:.2}", (end - start) * 1000.0));
+    }
+}
+
 fn acquire_slot(slots: &mut [FrameSlot; 3], cursor: &mut usize, sels: &Sels) -> usize {
     unsafe {
         for offset in 0..slots.len() {
@@ -1802,6 +1821,7 @@ fn acquire_slot(slots: &mut [FrameSlot; 3], cursor: &mut usize, sels: &Sels) -> 
                 || msg_u64(slots[index].command, sels.status) >= STATUS_COMPLETED;
             if free {
                 if !slots[index].command.is_null() {
+                    mark_gpu_time(slots[index].command, sels);
                     msg_void(slots[index].command, sels.release);
                     slots[index].command = null_mut();
                     slots[index].native.clear();
@@ -1812,6 +1832,7 @@ fn acquire_slot(slots: &mut [FrameSlot; 3], cursor: &mut usize, sels: &Sels) -> 
         }
         let index = *cursor;
         msg_void(slots[index].command, sels.wait_completed);
+        mark_gpu_time(slots[index].command, sels);
         msg_void(slots[index].command, sels.release);
         slots[index].command = null_mut();
         slots[index].native.clear();
