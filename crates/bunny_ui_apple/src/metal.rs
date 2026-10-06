@@ -47,7 +47,7 @@ use bunny_ui::layout::{Color, DisplayList, Size};
 use bunny_ui::raster::{DamageRect, ListDamage, list_damage};
 use bunny_ui::text_engine::{MeasureCache, TextEngine};
 
-use crate::ffi::{CGPoint, CGRect, CGSize, Id, Sel, class, error_message, kill_layer_actions, ns_string, sel};
+use crate::ffi::{CFRelease, CFRetain, CGPoint, CGRect, CGSize, Id, Sel, class, error_message, kill_layer_actions, ns_string, sel};
 
 // MARK: - FFI border
 
@@ -1993,6 +1993,150 @@ impl std::fmt::Display for AtlasCounts {
     }
 }
 
+#[link(name = "IOSurface", kind = "framework")]
+unsafe extern "C" {
+    fn IOSurfaceSetPurgeable(buffer: Id, new_state: u32, old_state: *mut u32) -> i32;
+}
+
+/// `kIOSurfacePurgeableNonVolatile`, `kIOSurfacePurgeableVolatile`.
+const SURFACE_NON_VOLATILE: u32 = 0;
+const SURFACE_VOLATILE: u32 = 1;
+
+/// A layer's drawables as the presenter met them. A resting window shows
+/// one drawable and needs none of the others until its next frame — at a
+/// window's size each is several megabytes — so the ones off screen are
+/// offered back to the system while it rests, as the atlas is, and a
+/// frame takes its drawable back whole before it paints it.
+#[derive(Default)]
+struct Drawables {
+    /// Their surfaces, retained, and whether each is offered back.
+    surfaces: Vec<(Id, bool)>,
+    /// The drawable presented last, retained, and when: the one on screen
+    /// once its present has landed.
+    shown: Option<(Id, std::time::Instant)>,
+    /// The system declined an offer once: no more asks.
+    declined: bool,
+}
+
+/// How many surfaces a layer keeps at most — three drawables, and a
+/// spare for the one a resize leaves behind.
+const DRAWABLES_KEPT: usize = 4;
+
+/// A present is on screen within a refresh or two: past this it has
+/// landed, whether or not the layer said so. A window's first frame is
+/// never reported presented at all.
+const PRESENT_LANDS_IN: std::time::Duration = std::time::Duration::from_millis(100);
+
+impl Drawables {
+    /// A drawable taken for a frame: its surface is remembered, and taken
+    /// back from the system when it was offered while the window rested.
+    unsafe fn take(&mut self, texture: Id) {
+        unsafe {
+            let surface = msg_id(texture, sel("iosurface"));
+            if surface.is_null() {
+                return;
+            }
+            match self.surfaces.iter_mut().find(|(kept, _)| *kept == surface) {
+                Some((kept, offered)) => {
+                    if *offered {
+                        // the frame paints it whole: what the system took
+                        // of it, if anything, is not missed
+                        let mut was = 0;
+                        IOSurfaceSetPurgeable(*kept, SURFACE_NON_VOLATILE, &mut was);
+                        *offered = false;
+                    }
+                }
+                None => {
+                    CFRetain(surface as *const c_void);
+                    self.surfaces.push((surface, false));
+                    if self.surfaces.len() > DRAWABLES_KEPT {
+                        let (old, offered) = self.surfaces.remove(0);
+                        if offered {
+                            let mut was = 0;
+                            IOSurfaceSetPurgeable(old, SURFACE_NON_VOLATILE, &mut was);
+                        }
+                        CFRelease(old as *const c_void);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The drawable just presented.
+    unsafe fn presented(&mut self, drawable: Id) {
+        unsafe {
+            let now = std::time::Instant::now();
+            if let Some((old, _)) = self.shown.replace((msg_id(drawable, sel("retain")), now)) {
+                msg_void(old, sel("release"));
+            }
+        }
+    }
+
+    /// Offers every surface but the one on screen back to the system —
+    /// all of them when `hidden` (nothing of the layer shows). False when
+    /// the last present has not landed yet: the drawable before it may
+    /// still be the one on screen, and the offer waits.
+    unsafe fn offer(&mut self, hidden: bool) -> bool {
+        unsafe {
+            if self.declined {
+                return true;
+            }
+            let on_screen = match (hidden, self.shown) {
+                (true, _) => null_mut(),
+                (false, None) => return true,
+                (false, Some((shown, at))) => {
+                    let landed = at.elapsed() >= PRESENT_LANDS_IN
+                        || msg_f64(shown, sel("presentedTime")) > 0.0;
+                    if !landed {
+                        return false;
+                    }
+                    msg_id(msg_id(shown, sel("texture")), sel("iosurface"))
+                }
+            };
+            for (surface, offered) in &mut self.surfaces {
+                if *surface == on_screen || *offered {
+                    continue;
+                }
+                let mut was = 0;
+                if IOSurfaceSetPurgeable(*surface, SURFACE_VOLATILE, &mut was) != 0 {
+                    self.declined = true;
+                    return true;
+                }
+                *offered = true;
+            }
+            true
+        }
+    }
+
+    /// The layer remade its drawables (a new size): the surfaces held are
+    /// let go, whole.
+    unsafe fn forget(&mut self) {
+        unsafe {
+            for (surface, offered) in self.surfaces.drain(..) {
+                if offered {
+                    let mut was = 0;
+                    IOSurfaceSetPurgeable(surface, SURFACE_NON_VOLATILE, &mut was);
+                }
+                CFRelease(surface as *const c_void);
+            }
+            if let Some((shown, _)) = self.shown.take() {
+                msg_void(shown, sel("release"));
+            }
+        }
+    }
+
+    /// How many surfaces are offered back right now.
+    fn offered(&self) -> usize {
+        self.surfaces.iter().filter(|(_, offered)| *offered).count()
+    }
+}
+
+impl Drop for Drawables {
+    fn drop(&mut self) {
+        unsafe { self.forget() }
+    }
+}
+
 /// A frame a layer shows: the list, its physical size, its scale and its
 /// clear colour — the staleness quadruple, the list shared.
 type KeptFrame = (Rc<DisplayList>, (usize, usize), usize, Color);
@@ -2056,6 +2200,8 @@ struct Patch {
     /// The box it covers on screen (physical, top-left), or `None`
     /// while it hides.
     shown: Option<DamageRect>,
+    /// Its drawables, offered back while the window rests.
+    drawables: Drawables,
 }
 
 impl Patch {
@@ -2087,7 +2233,7 @@ impl Patch {
             // first among the sublayers: over the drawable, under the
             // live layers the shell hangs after it
             msg_void_id_u64(root, sel("insertSublayer:atIndex:"), layer, 0);
-            Some(Patch { layer, size: (0, 0), scale, shown: None })
+            Some(Patch { layer, size: (0, 0), scale, shown: None, drawables: Drawables::default() })
         }
     }
 
@@ -2117,6 +2263,7 @@ impl Patch {
 impl Drop for Patch {
     fn drop(&mut self) {
         unsafe {
+            self.drawables.forget();
             msg_void(self.layer, sel("removeFromSuperlayer"));
             msg_void(self.layer, sel("release"));
         }
@@ -2145,6 +2292,11 @@ pub struct MetalPresenter {
     patch: Option<Patch>,
     /// Text boxes for the diff against the base, warm across strokes.
     boxes: MeasureCache,
+    /// The window's own drawables, offered back while it rests.
+    drawables: Drawables,
+    /// The window rests: set by [`MetalPresenter::rest`], cleared by the
+    /// next frame that paints.
+    resting: bool,
     /// Whether the layer currently presents inside the CATransaction —
     /// toggled ON only during live resize.
     transactional: bool,
@@ -2204,8 +2356,10 @@ impl MetalPresenter {
     /// cache, rebuilt from the scene whenever it is lost — is offered
     /// back to the system: a resting window keeps its pixels on screen
     /// and needs none of its tiles until the next frame, which asks for
-    /// the atlas again and re-rasterizes only if the system took it.
-    pub fn rest(&mut self) {
+    /// the atlas again and re-rasterizes only if the system took it. So
+    /// are the drawables off screen ([`MetalPresenter::offer_drawables`]);
+    /// false when that has to wait for the last present to land.
+    pub fn rest(&mut self) -> bool {
         unsafe {
             for slot in &mut self.slots {
                 if slot.command.is_null() {
@@ -2220,6 +2374,35 @@ impl MetalPresenter {
                 slot.native.clear();
             }
             self.ground.rest();
+        }
+        self.resting = true;
+        self.offer_drawables()
+    }
+
+    /// Offers the drawables off screen — the window's and the patch's —
+    /// back to the system while the window rests. False when the last
+    /// present has not landed: the drawable before it may still be the
+    /// one on screen, and the shell asks again a moment later. A window
+    /// that painted since it rested answers true and offers nothing.
+    pub fn offer_drawables(&mut self) -> bool {
+        if !self.resting {
+            return true;
+        }
+        unsafe {
+            let window = self.drawables.offer(false);
+            let patch = match self.patch.as_mut() {
+                Some(patch) => {
+                    let hidden = patch.shown.is_none();
+                    patch.drawables.offer(hidden)
+                }
+                None => true,
+            };
+            let offered = self.drawables.offered()
+                + self.patch.as_ref().map_or(0, |patch| patch.drawables.offered());
+            if window && patch && offered > 0 {
+                crate::trace::mark("X", format_args!("what=drawables-offered n={offered}"));
+            }
+            window && patch
         }
     }
 
@@ -2370,6 +2553,9 @@ impl MetalPresenter {
                 self.atlas.reset(&mut self.ground, false);
             }
             if physical != self.physical || scale != self.scale {
+                // the layer makes new drawables at the new size: the old
+                // ones are let go
+                self.drawables.forget();
                 // the drawable must resize BEFORE nextDrawable, or the
                 // frame comes back at the old size
                 msg_void_f64(self.layer, self.stack.sels.set_contents_scale, scale as f64);
@@ -2421,6 +2607,8 @@ impl MetalPresenter {
                 return;
             }
             let drawable_texture = msg_id(drawable, self.stack.sels.texture);
+            self.resting = false;
+            self.drawables.take(drawable_texture);
             // a drawable cannot be READ, so a frame that carries glass
             // renders into a scene texture of its own and is copied
             // over at the end. A frame without glass never asks for
@@ -2470,6 +2658,7 @@ impl MetalPresenter {
                 msg_void(command, self.stack.sels.commit);
             }
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
+            self.drawables.presented(drawable);
             let kept = (Rc::new(display.clone()), physical, scale, canvas);
             self.base = Some(kept.clone());
             self.retained = Some(kept);
@@ -2539,6 +2728,7 @@ impl MetalPresenter {
                 patch.scale = scale;
             }
             if patch.size != size {
+                patch.drawables.forget();
                 msg_void_size(
                     patch.layer,
                     self.stack.sels.set_drawable_size,
@@ -2557,6 +2747,8 @@ impl MetalPresenter {
                 return false;
             }
             let texture = msg_id(drawable, self.stack.sels.texture);
+            self.resting = false;
+            patch.drawables.take(texture);
             self.slots[index].native = self.ground.native.values().cloned().collect();
             let textures = self.ground.bound(&self.batches.textures);
             let command = self.stack.encode_frame(EncodeFrame {
@@ -2587,6 +2779,7 @@ impl MetalPresenter {
             }
             msg_void(drawable, self.stack.sels.present);
             msg_void(transaction, sel("commit"));
+            patch.drawables.presented(drawable);
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
             crate::trace::mark(
                 "Q",
@@ -2659,6 +2852,8 @@ impl MetalPresenter {
             base: None,
             patch: None,
             boxes: MeasureCache::default(),
+            drawables: Drawables::default(),
+            resting: false,
             transactional: false,
             glass: None,
             drawable_wait_ms: 0.0,

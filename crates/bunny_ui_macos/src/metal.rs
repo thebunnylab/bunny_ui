@@ -112,19 +112,69 @@ pub(crate) fn retained_counts() -> Option<(bunny_ui_apple::metal::AtlasCounts, u
 }
 
 /// Every window's presenter rests — its frames in flight let go, its atlas
-/// offered back to the system — when the shell's frame driver parks (see
-/// [`MetalPresenter::rest`]).
+/// and its drawables off screen offered back to the system — when the
+/// shell's frame driver parks (see [`MetalPresenter::rest`]).
 pub(crate) fn rest() {
+    if !each_presenter(MetalPresenter::rest) {
+        offer_later(0);
+    }
+}
+
+/// Runs `f` on every window's presenter; true when every one answered true.
+fn each_presenter(f: impl Fn(&mut MetalPresenter) -> bool) -> bool {
+    let mut all = true;
     PRESENTER.with(|slot| {
-        if let Some(presenter) = slot.borrow_mut().as_mut() {
-            presenter.rest();
+        if let Ok(mut slot) = slot.try_borrow_mut()
+            && let Some(presenter) = slot.as_mut()
+        {
+            all &= f(presenter);
         }
     });
     VIEW_PRESENTERS.with(|slot| {
-        for presenter in slot.borrow_mut().values_mut() {
-            presenter.rest();
+        if let Ok(mut presenters) = slot.try_borrow_mut() {
+            for presenter in presenters.values_mut() {
+                all &= f(presenter);
+            }
         }
     });
+    all
+}
+
+#[allow(non_upper_case_globals)]
+unsafe extern "C" {
+    static _dispatch_main_q: std::ffi::c_void;
+    fn dispatch_time(when: u64, delta: i64) -> u64;
+    fn dispatch_after_f(
+        when: u64,
+        queue: *const std::ffi::c_void,
+        context: *mut std::ffi::c_void,
+        work: extern "C" fn(*mut std::ffi::c_void),
+    );
+}
+
+/// How long after a park the drawables are offered again when the last
+/// present had not landed: past the time a present takes to land.
+const OFFER_AGAIN_NS: i64 = 120_000_000;
+
+/// Asks the presenters to offer their drawables a moment from now, on the
+/// main queue — the window never waits for its last present to land.
+fn offer_later(attempt: usize) {
+    unsafe {
+        dispatch_after_f(
+            dispatch_time(0, OFFER_AGAIN_NS),
+            &raw const _dispatch_main_q,
+            attempt as *mut std::ffi::c_void,
+            offer_again,
+        );
+    }
+}
+
+extern "C" fn offer_again(context: *mut std::ffi::c_void) {
+    let attempt = context as usize;
+    // a presenter that painted since it rested has nothing to offer
+    if !each_presenter(MetalPresenter::offer_drawables) && attempt < 4 {
+        offer_later(attempt + 1);
+    }
 }
 
 /// True when this window presents by GPU — the shell branches ONCE per
