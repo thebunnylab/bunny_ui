@@ -66,7 +66,9 @@ pub fn notify(notification: &Notification) -> Result<(), String> {
         return Err(String::from("the person did not allow notifications for this app"));
     }
     if !CHANNEL_MADE.with(Cell::get) {
-        make_channel(env, manager).ok_or("the notification channel could not be made")?;
+        let words = bunny_ui::words::Words::for_locale(&crate::app::locale());
+        make_channel(env, manager, &words.get(bunny_ui::words::Word::Notifications))
+            .ok_or("the notification channel could not be made")?;
         CHANNEL_MADE.with(|slot| slot.set(true));
     }
     let built = build(env, notification)?;
@@ -135,9 +137,10 @@ fn ask_permission(env: Env) -> Option<()> {
     env.call_void(env.activity(), request, &[object(wanted), int(1)]).then_some(())
 }
 
-/// The channel, made once: the platform keeps it, and a second
-/// creation is a no-op there too.
-fn make_channel(env: Env, manager: JObject) -> Option<()> {
+/// The channel, made once, under `name` in the person's language: the
+/// platform keeps it, and a second creation with the same id only
+/// renames it.
+fn make_channel(env: Env, manager: JObject, name: &str) -> Option<()> {
     let channel_class = env.class(c"android/app/NotificationChannel")?;
     let new_channel = env.method(
         channel_class,
@@ -147,7 +150,7 @@ fn make_channel(env: Env, manager: JObject) -> Option<()> {
     let channel = env.new_object(
         channel_class,
         new_channel,
-        &[object(env.string(CHANNEL)?), object(env.string("Notifications")?), int(IMPORTANCE_HIGH)],
+        &[object(env.string(CHANNEL)?), object(env.string(name)?), int(IMPORTANCE_HIGH)],
     )?;
     let manager_class = env.class(c"android/app/NotificationManager")?;
     let create = env.method(

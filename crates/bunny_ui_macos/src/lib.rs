@@ -24,7 +24,7 @@ use std::rc::Rc;
 
 use bunny_ui::action::{Key, KeyMatch, KeyPattern, Stroke};
 use bunny_ui::layout::{Axis, Size};
-use bunny_ui::prelude::{EditCommand, Runtime};
+use bunny_ui::prelude::{EditCommand, Locale, Runtime};
 use bunny_ui::view::View;
 
 use ffi::AppEvent;
@@ -448,6 +448,8 @@ struct Slot {
     /// The `NSWindow` as an address — what an event's source is
     /// compared against.
     window: usize,
+    /// The window's own scene — what a locale the app pins reaches.
+    runtime: Rc<Runtime>,
     handler: RefCell<Box<dyn FnMut(AppEvent)>>,
     key_gate: RefCell<Box<dyn FnMut(&ffi::KeyStroke) -> bool>>,
     drag_gate: Box<dyn Fn(f64, f64) -> bool>,
@@ -500,6 +502,13 @@ struct AppInner {
     slots: RefCell<Vec<Rc<Slot>>>,
     routed: std::cell::Cell<bool>,
     scenes: std::cell::Cell<usize>,
+    /// The bar the app set, kept to be worded again when the language
+    /// the windows read moves.
+    menu_bar: RefCell<Option<bunny_ui::menu::MenuBar>>,
+    /// The locale the bar on the menu bar was last worded in.
+    menu_locale: RefCell<Option<Locale>>,
+    /// The locale the app pinned over the system's, for every window.
+    pinned_locale: RefCell<Option<Locale>>,
 }
 
 impl Default for App {
@@ -523,6 +532,9 @@ impl App {
                 slots: RefCell::new(Vec::new()),
                 routed: std::cell::Cell::new(false),
                 scenes: std::cell::Cell::new(0),
+                menu_bar: RefCell::new(None),
+                menu_locale: RefCell::new(None),
+                pinned_locale: RefCell::new(None),
             }),
         }
     }
@@ -532,11 +544,46 @@ impl App {
     ///
     /// Dress it before handing it back ([`Runtime::text_engine`], the
     /// keymap, the host's action handlers): the app never touches it
-    /// again.
+    /// again — except for the locale it pinned ([`App::set_locale`]),
+    /// which every window is born reading.
     pub fn runtime(&self) -> Runtime {
         let seq = self.inner.scenes.get();
         self.inner.scenes.set(seq + 1);
-        Runtime::scene(format!("w{seq}"))
+        let runtime = Runtime::scene(format!("w{seq}"));
+        if let Some(locale) = self.inner.pinned_locale.borrow().as_ref() {
+            runtime.set_locale(Some(locale.clone()));
+        }
+        runtime
+    }
+
+    /// Pins the language every window reads — over the system's, which
+    /// the windows follow otherwise — or, with `None`, lets them follow
+    /// it again. A window whose locale moved draws its next frame in it,
+    /// a window still to open is born in it, and the menu bar is worded
+    /// again when its language moved. A pin that changes nothing costs
+    /// nothing.
+    ///
+    /// The preference itself is the app's: a settings page that offers
+    /// a language writes it here, and keeps it where it keeps the rest.
+    pub fn set_locale(&self, locale: Option<Locale>) {
+        *self.inner.pinned_locale.borrow_mut() = locale.clone();
+        let mut moved = false;
+        for slot in self.inner.live() {
+            moved |= slot.runtime.set_locale(locale.clone());
+        }
+        if moved {
+            // the frame follows on the shared road: a wake draws every
+            // window whose environment moved, and never re-enters the
+            // handler this may have been called from
+            ffi::wake_from_any_thread();
+        }
+        self.inner.refresh_menu_bar();
+    }
+
+    /// The locale the windows read: the app's pin, else the system's
+    /// preferred languages as they stand now.
+    pub fn locale(&self) -> Locale {
+        self.inner.locale()
     }
 
     /// Raises a window on `runtime`, showing `root`.
@@ -582,8 +629,15 @@ impl App {
     ///
     /// One bar for the app, as the mac has one menu bar: every window's
     /// commands run in the window that is frontmost when they are chosen.
+    /// The mac's own items are worded in the language the windows read
+    /// ([`App::locale`], [`bunny_ui::words`]), and worded again by the
+    /// app when that language moves.
     pub fn set_menu_bar(&self, bar: &bunny_ui::menu::MenuBar) {
-        ffi::install_menu_bar(&menu::arrange(bar, &ffi::app_name()));
+        let locale = self.inner.locale();
+        let words = bunny_ui::words::Words::for_locale(&locale);
+        ffi::install_menu_bar(&menu::arrange(bar, &ffi::app_name(), &words));
+        *self.inner.menu_bar.borrow_mut() = Some(bar.clone());
+        *self.inner.menu_locale.borrow_mut() = Some(locale);
     }
 
     /// Enters the AppKit run loop. Returns when the app terminates.
@@ -604,6 +658,7 @@ impl AppInner {
         ffi::set_handler(Box::new(move |event| {
             let source = ffi::event_source();
             let gone = matches!(event, AppEvent::WindowClosed);
+            let spoke = matches!(event, AppEvent::Locale);
             for slot in app.live() {
                 // source 0 is a beat every window shares
                 if source == 0 || slot.window == source {
@@ -613,6 +668,11 @@ impl AppInner {
             }
             if gone {
                 app.buried(source);
+            }
+            if spoke {
+                // the bar is one for the app: worded again, once, after
+                // every window has heard the system's new languages
+                app.refresh_menu_bar();
             }
         }));
         let app = Rc::clone(&self);
@@ -673,6 +733,27 @@ impl AppInner {
     /// Drops the slot of a window that has gone.
     fn buried(&self, window: usize) {
         self.slots.borrow_mut().retain(|slot| slot.window != window);
+    }
+
+    /// The locale the windows read: the app's pin, else the system's
+    /// preferred languages, read now.
+    fn locale(&self) -> Locale {
+        self.pinned_locale.borrow().clone().unwrap_or_else(bunny_ui_apple::ffi::preferred_locale)
+    }
+
+    /// Words the bar on the menu bar in the locale the windows read —
+    /// when that moved since the bar was last arranged. A report that
+    /// changes nothing leaves the bar standing.
+    fn refresh_menu_bar(&self) {
+        let bar = self.menu_bar.borrow();
+        let Some(bar) = bar.as_ref() else { return };
+        let locale = self.locale();
+        if self.menu_locale.borrow().as_ref() == Some(&locale) {
+            return;
+        }
+        let words = bunny_ui::words::Words::for_locale(&locale);
+        ffi::install_menu_bar(&menu::arrange(bar, &ffi::app_name(), &words));
+        *self.menu_locale.borrow_mut() = Some(locale);
     }
 }
 
@@ -748,6 +829,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // the system's word that memory is short reaches the windows as an
     // event, and the caches go first
     ffi::install_memory_pressure();
+    // the system's languages reach the scene before its first frame; a
+    // locale the app pinned (`App::set_locale`) stands over them
+    runtime.set_system_locale(bunny_ui_apple::ffi::preferred_locale());
     // the sleepers' clock is the wall, and their alarm is the shell's own
     // timer (`ffi::aim_tasks`): a poller thirty milliseconds away no
     // longer keeps the display link beating at full rate
@@ -2033,6 +2117,14 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 }
             }
         }
+        AppEvent::Locale => {
+            // the system's languages moved: the scene reads them again —
+            // unless the app pinned its own, or the list came back the
+            // same, and then nothing is rebuilt and nothing is drawn
+            if runtime.set_system_locale(bunny_ui_apple::ffi::preferred_locale()) {
+                blit(runtime, root, trace::Origin::Redraw);
+            }
+        }
         AppEvent::MemoryPressure => {
             // the caches are a convenience: the decoded images go (the
             // next frame decodes what it still shows), and so does what
@@ -2385,6 +2477,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
 
     Rc::new(Slot {
         window: window.raw_window(),
+        runtime,
         handler: RefCell::new(handler),
         key_gate: RefCell::new(key_gate),
         drag_gate,

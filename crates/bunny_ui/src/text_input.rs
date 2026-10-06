@@ -515,6 +515,32 @@ pub trait EditingStrategy {
     }
 }
 
+/// Does `text` read right to left? Decided by its first LETTER — the
+/// first character with a direction of its own — in a script written
+/// right to left: Hebrew, Arabic and its extensions, Syriac, Thaana,
+/// NKo. Digits and punctuation have no say. A pure run is exact; a
+/// mixed line follows its first word, which is the paragraph direction
+/// every text system agrees on when nothing else is said.
+pub fn reads_right_to_left(text: &str) -> bool {
+    text.chars().find(|c| c.is_alphabetic()).is_some_and(is_rtl_char)
+}
+
+/// Is `c` a letter of a script written right to left?
+pub fn is_rtl_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x0590..=0x05FF   // Hebrew
+            | 0x0600..=0x06FF // Arabic
+            | 0x0700..=0x074F // Syriac
+            | 0x0750..=0x077F // Arabic Supplement
+            | 0x0780..=0x07BF // Thaana
+            | 0x07C0..=0x07FF // NKo
+            | 0x08A0..=0x08FF // Arabic Extended-A
+            | 0xFB1D..=0xFDFF // Hebrew and Arabic presentation forms
+            | 0xFE70..=0xFEFF // Arabic presentation forms B
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -535,6 +561,18 @@ mod tests {
 
     fn state(caret: usize) -> CaretState {
         CaretState { caret, anchor: None, marked: None }
+    }
+
+    #[test]
+    fn a_line_reads_the_way_its_first_letter_does() {
+        assert!(reads_right_to_left("שלום"));
+        assert!(reads_right_to_left("مرحبا world"), "the first word decides");
+        assert!(reads_right_to_left("123 שלום"), "digits have no say");
+        assert!(reads_right_to_left("(أ)"), "nor does punctuation");
+        assert!(!reads_right_to_left("hello مرحبا"));
+        assert!(!reads_right_to_left("abc"));
+        assert!(!reads_right_to_left(""));
+        assert!(!reads_right_to_left("123"));
     }
 
     #[test]

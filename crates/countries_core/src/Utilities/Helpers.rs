@@ -76,7 +76,7 @@ mod tests {
 
     #[test]
     fn backendDefaultIsEn() {
-        assert_eq!(Locale::backendDefault().identifier, "en");
+        assert_eq!(Locale::backendDefault().identifier(), "en");
     }
 
     #[test]

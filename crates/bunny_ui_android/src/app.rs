@@ -7,11 +7,28 @@ use std::rc::Rc;
 
 use bunny_ui::action::{Key, KeyMatch, Stroke};
 use bunny_ui::layout::{Edges, Size};
-use bunny_ui::prelude::{EditCommand, Runtime, SizeClass};
+use bunny_ui::prelude::{EditCommand, Locale, Runtime, SizeClass};
 use bunny_ui::view::View;
 
 use crate::ffi::{self, AppEvent};
 use crate::keys::{self, key_pattern};
+
+thread_local! {
+    /// The locale the shell knows — what the framework's own words are
+    /// resolved in where no window is at hand: the shortcuts helper's
+    /// rows, the notification channel's name.
+    static LOCALE: RefCell<Locale> = RefCell::new(Locale::default());
+}
+
+/// The locale the shell knows (see [`LOCALE`]).
+pub(crate) fn locale() -> Locale {
+    LOCALE.with(|slot| slot.borrow().clone())
+}
+
+/// Records the locale the shell knows — the one the window reads.
+pub(crate) fn set_locale(locale: Locale) {
+    LOCALE.with(|slot| *slot.borrow_mut() = locale);
+}
 
 /// Points the shell's frame driver at the pace the runtime asks for:
 /// the choreographer for springs, flings and a finger on the clock, one
@@ -134,8 +151,18 @@ struct AppInner {
     pending: RefCell<Option<Box<dyn FnOnce()>>>,
     opened: Cell<bool>,
     scenes: Cell<usize>,
+    /// The window's scene, once `open` named it — what a locale the app
+    /// pins reaches.
+    runtime: RefCell<Option<Rc<Runtime>>>,
     /// What runs when the system asks for memory back.
     memory: RefCell<Option<Rc<dyn Fn()>>>,
+    /// The bar the app handed the system, kept to be worded again when
+    /// the language the window reads moves.
+    menu_bar: RefCell<Option<bunny_ui::menu::MenuBar>>,
+    /// The locale the shortcut groups were last kept in.
+    menu_locale: RefCell<Option<Locale>>,
+    /// The locale the app pinned over the configuration's.
+    pinned_locale: RefCell<Option<Locale>>,
 }
 
 impl Default for App {
@@ -157,7 +184,11 @@ impl App {
                 pending: RefCell::new(None),
                 opened: Cell::new(false),
                 scenes: Cell::new(0),
+                runtime: RefCell::new(None),
                 memory: RefCell::new(None),
+                menu_bar: RefCell::new(None),
+                menu_locale: RefCell::new(None),
+                pinned_locale: RefCell::new(None),
             }),
         }
     }
@@ -166,16 +197,58 @@ impl App {
     /// phone has no menu bar, and with a hardware keyboard Meta+/ opens the
     /// Keyboard Shortcuts Helper, which the app's activity answers from the
     /// groups kept here ([`crate::shortcuts`], [`crate::keyboard_shortcuts!`]).
-    /// Call it again when the keys behind the items change.
+    /// Call it again when the keys behind the items change. The standard
+    /// rows are worded in the language the window reads ([`App::locale`],
+    /// [`bunny_ui::words`]), and worded again when that language moves.
     pub fn set_menu_bar(&self, bar: &bunny_ui::menu::MenuBar) {
-        crate::shortcuts::keep(bar);
+        let locale = self.inner.locale();
+        crate::shortcuts::keep(bar, &bunny_ui::words::Words::for_locale(&locale));
+        *self.inner.menu_bar.borrow_mut() = Some(bar.clone());
+        *self.inner.menu_locale.borrow_mut() = Some(locale);
     }
 
-    /// A runtime for the window — named for its own scene.
+    /// A runtime for the window — named for its own scene, and born
+    /// reading the locale the app pinned ([`App::set_locale`]), if any.
     pub fn runtime(&self) -> Runtime {
         let seq = self.inner.scenes.get();
         self.inner.scenes.set(seq + 1);
-        Runtime::scene(format!("w{seq}"))
+        let runtime = Runtime::scene(format!("w{seq}"));
+        if let Some(locale) = self.inner.pinned_locale.borrow().as_ref() {
+            runtime.set_locale(Some(locale.clone()));
+        }
+        runtime
+    }
+
+    /// Pins the language the window reads — over the configuration's,
+    /// which it follows otherwise — or, with `None`, lets it follow the
+    /// configuration again. The scene draws its next frame in it, and
+    /// the shell's own words follow: the shortcut groups are kept again
+    /// when their language moved, the notification channel is named in
+    /// it at the next post. A pin that changes nothing costs nothing.
+    ///
+    /// The preference itself is the app's: a settings page that offers
+    /// a language writes it here, and keeps it where it keeps the rest.
+    pub fn set_locale(&self, locale: Option<Locale>) {
+        *self.inner.pinned_locale.borrow_mut() = locale.clone();
+        let moved = self
+            .inner
+            .runtime
+            .borrow()
+            .as_ref()
+            .is_some_and(|runtime| runtime.set_locale(locale));
+        set_locale(self.inner.locale());
+        if moved {
+            // the frame follows on the wake road, which never re-enters
+            // the handler this may have been called from
+            ffi::wake_from_any_thread();
+        }
+        self.inner.refresh_shortcuts();
+    }
+
+    /// The locale the window reads: the app's pin, else the
+    /// configuration's languages as they stand now.
+    pub fn locale(&self) -> Locale {
+        self.inner.locale()
     }
 
     /// Records the window `run` raises on `runtime`, showing `root`.
@@ -192,6 +265,7 @@ impl App {
         );
         let inner = Rc::clone(&self.inner);
         let _ = spec;
+        *self.inner.runtime.borrow_mut() = Some(Rc::clone(&runtime));
         *self.inner.pending.borrow_mut() = Some(Box::new(move || mount(runtime, root, inner)));
         WindowId(1)
     }
@@ -229,6 +303,28 @@ impl App {
     }
 }
 
+impl AppInner {
+    /// The locale the window reads: the app's pin, else the
+    /// configuration's languages, read now.
+    fn locale(&self) -> Locale {
+        self.pinned_locale.borrow().clone().unwrap_or_else(ffi::preferred_locale)
+    }
+
+    /// Keeps the shortcut groups again in the locale the window reads —
+    /// when that moved since they were last kept. A report that changes
+    /// nothing leaves them standing.
+    fn refresh_shortcuts(&self) {
+        let bar = self.menu_bar.borrow();
+        let Some(bar) = bar.as_ref() else { return };
+        let locale = self.locale();
+        if self.menu_locale.borrow().as_ref() == Some(&locale) {
+            return;
+        }
+        crate::shortcuts::keep(bar, &bunny_ui::words::Words::for_locale(&locale));
+        *self.menu_locale.borrow_mut() = Some(locale);
+    }
+}
+
 /// Wires everything that lives as long as the app does — the road to
 /// the window, the mirrors, the gates and the event handler — once the
 /// system has handed the activity its first window.
@@ -248,7 +344,13 @@ fn mount(runtime: Rc<Runtime>, root: impl View, app: Rc<AppInner>) {
         bunny_ui::theme::install(bunny_ui::theme::Theme::dark());
     }
     runtime.set_reduce_motion(ffi::reduce_motion());
-    runtime.set_environment(|values| values.horizontalSizeClass = size_class(compact));
+    // the configuration's languages reach the scene before its first
+    // frame; a locale the app pinned (`App::set_locale`) stands over
+    // them, and the shell's own words (the shortcuts helper's rows, the
+    // notification channel's name) are resolved in whichever it reads
+    runtime.set_system_locale(ffi::preferred_locale());
+    set_locale(runtime.locale());
+    runtime.set_size_class(size_class(compact));
     let (top, left, bottom, right) = ffi::safe_area();
     runtime.set_safe_area(edges(top, left, bottom, right));
     // a task that lands on a worker thread asks the loop for one more
@@ -419,8 +521,15 @@ fn mount(runtime: Rc<Runtime>, root: impl View, app: Rc<AppInner>) {
                         });
                     }
                 }
-                runtime.set_environment(|values| values.horizontalSizeClass = size_class(compact));
+                runtime.set_size_class(size_class(compact));
                 runtime.set_device_scale(scale as f64);
+                // a change of language is a configuration change too (the
+                // manifest keeps the activity through it): the list is
+                // read again, and the shell's own words follow when it moved
+                if runtime.set_system_locale(ffi::preferred_locale()) {
+                    set_locale(runtime.locale());
+                    app.refresh_shortcuts();
+                }
                 blit(runtime, root);
             }
             AppEvent::SafeArea { top, left, bottom, right } => {

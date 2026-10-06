@@ -31,7 +31,7 @@ use bunny_ui::host::MouseButton;
 use bunny_ui::layout::{Axis, Size};
 use bunny_ui::menu::{AltTap, MenuKey};
 use bunny_ui::pacing::{Beat, FramePacer, Urgency, Verdict};
-use bunny_ui::prelude::{EditCommand, Runtime};
+use bunny_ui::prelude::{EditCommand, Locale, Runtime};
 use bunny_ui::view::{Either, Single, View};
 
 use ffi::AppEvent;
@@ -255,6 +255,8 @@ pub struct App {
 struct Slot {
     window: usize,
     handle: ffi::WindowHandle,
+    /// The window's own scene — what a locale the app pins reaches.
+    runtime: Rc<Runtime>,
     handler: RefCell<Box<dyn FnMut(AppEvent)>>,
     key_gate: RefCell<Box<dyn FnMut(&ffi::KeyStroke) -> bool>>,
     drag_gate: Box<dyn Fn(f64, f64) -> bool>,
@@ -265,6 +267,8 @@ struct AppInner {
     slots: RefCell<Vec<Rc<Slot>>>,
     routed: std::cell::Cell<bool>,
     scenes: std::cell::Cell<usize>,
+    /// The locale the app pinned over the environment's, for every window.
+    pinned_locale: RefCell<Option<Locale>>,
 }
 
 impl AppInner {
@@ -339,15 +343,21 @@ impl App {
                 slots: RefCell::new(Vec::new()),
                 routed: std::cell::Cell::new(false),
                 scenes: std::cell::Cell::new(0),
+                pinned_locale: RefCell::new(None),
             }),
         }
     }
 
-    /// A runtime for the window — named for its own scene.
+    /// A runtime for the window — named for its own scene, and born
+    /// reading the locale the app pinned ([`App::set_locale`]), if any.
     pub fn runtime(&self) -> Runtime {
         let seq = self.inner.scenes.get();
         self.inner.scenes.set(seq + 1);
-        Runtime::scene(format!("w{seq}"))
+        let runtime = Runtime::scene(format!("w{seq}"));
+        if let Some(locale) = self.inner.pinned_locale.borrow().as_ref() {
+            runtime.set_locale(Some(locale.clone()));
+        }
+        runtime
     }
 
     /// Raises a window on `runtime`, showing `root` — painted first,
@@ -372,6 +382,35 @@ impl App {
     /// The windows the app has open, oldest first.
     pub fn windows(&self) -> Vec<WindowId> {
         self.inner.slots.borrow().iter().map(|slot| WindowId(slot.window)).collect()
+    }
+
+    /// Pins the language every window reads — over the environment's,
+    /// which the windows follow otherwise — or, with `None`, lets them
+    /// follow it again. A window whose locale moved draws its next frame
+    /// in it, a window still to open is born in it, and the shell's own
+    /// words (a notification's button) follow. A pin that changes
+    /// nothing costs nothing.
+    ///
+    /// The preference itself is the app's: a settings page that offers
+    /// a language writes it here, and keeps it where it keeps the rest.
+    pub fn set_locale(&self, locale: Option<Locale>) {
+        *self.inner.pinned_locale.borrow_mut() = locale.clone();
+        let mut moved = false;
+        for slot in self.inner.live() {
+            moved |= slot.runtime.set_locale(locale.clone());
+        }
+        life::set_locale(self.locale());
+        if moved {
+            // the frame follows on the wake road, which never re-enters
+            // the handler this may have been called from
+            ffi::wake_from_any_thread();
+        }
+    }
+
+    /// The locale the windows read: the app's pin, else the environment's
+    /// languages as they stand now.
+    pub fn locale(&self) -> Locale {
+        self.inner.pinned_locale.borrow().clone().unwrap_or_else(life::preferred_locale)
     }
 
     /// Enters the event road. Returns when the window closes.
@@ -565,6 +604,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         bunny_ui::theme::install(bunny_ui::theme::Theme::dark());
     }
     runtime.set_reduce_motion(!ffi::animations_enabled());
+    // the environment's languages reach the scene before its first
+    // frame; a locale the app pinned (`App::set_locale`) stands over
+    // them, and the shell's own words are resolved in whichever the
+    // scene reads. The environment does not move while the process
+    // runs: there is no live report to hear
+    runtime.set_system_locale(life::preferred_locale());
+    life::set_locale(runtime.locale());
     // a task that lands on a worker thread asks the pump for one more
     // turn; the frame it takes drains the queue on its way
     runtime.set_wake_hook(std::sync::Arc::new(ffi::wake_from_any_thread));
@@ -1453,6 +1499,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     Rc::new(Slot {
         window: window.raw_window(),
         handle: window,
+        runtime,
         handler: RefCell::new(handler),
         key_gate: RefCell::new(key_gate),
         drag_gate,

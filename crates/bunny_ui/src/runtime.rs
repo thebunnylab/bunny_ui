@@ -15,7 +15,7 @@ use std::cell::{Cell, RefCell};
 use motor::hash::FxHashMap as HashMap;
 use std::rc::Rc;
 
-use motor::state::{Context, EnvironmentValues};
+use motor::state::{Context, EnvironmentValues, LayoutDirection, Locale, SizeClass};
 
 use crate::action::{
     ALERT_CANCEL, ALERT_CONTEXT, ALERT_DEFAULT, ActionId, KeyPattern, OVERLAY_CONTEXT,
@@ -449,6 +449,15 @@ pub struct Runtime {
     /// The software keyboard's height over the window, 0 when hidden.
     /// It joins the bottom inset: content shrinks above the keys.
     keyboard_inset: Cell<Px>,
+    /// The languages the SHELL reports — the system's list. `None`
+    /// headless, or before the shell spoke.
+    system_locale: RefCell<Option<Locale>>,
+    /// The locale the APP pinned ([`Runtime::set_locale`]), over the
+    /// system's.
+    pinned_locale: RefCell<Option<Locale>>,
+    /// The direction the app pinned; `None` derives it from the locale
+    /// in effect.
+    pinned_direction: Cell<Option<LayoutDirection>>,
     /// The insets of the last layout — an inset change is a resize.
     last_insets: Cell<crate::layout::Edges>,
     /// The Dom mode's retained scene — [`Runtime::dom_frame`] diffs
@@ -746,16 +755,14 @@ impl Runtime {
         }
     }
 
-    /// How many PHYSICAL pixels one layout point covers — what the
-    /// shell reads from the screen (`2.0` on a retina display). It
-    /// reaches the app through [`crate::custom::PaintCtx::scale`], so
-    /// a box that draws parts which TOUCH can put the shared edge on
-    /// a whole pixel. The default is `1.0`.
-    /// Moves the environment every body reads — the shell's door for
-    /// what the platform decides at runtime: the size class on a
-    /// rotation, a locale change. The next pass rebuilds the retention
-    /// once (bodies baked the old values into the scene) and runs
-    /// incremental again; an update that changes nothing costs nothing.
+    /// Moves the environment every body reads — the general door for
+    /// what the platform decides at runtime. The next pass rebuilds the
+    /// retention once (bodies baked the old values into the scene) and
+    /// runs incremental again — whether or not the closure changed
+    /// anything, because the door cannot see inside it. The typed doors
+    /// ([`Runtime::set_size_class`], [`Runtime::set_system_locale`],
+    /// [`Runtime::set_safe_area`], …) compare first, so a report that
+    /// changes nothing costs nothing: prefer them.
     ///
     /// ```ignore
     /// runtime.set_environment(|values| values.horizontalSizeClass = SizeClass::Compact);
@@ -767,9 +774,96 @@ impl Runtime {
         self.env_moved.set(true);
     }
 
+    /// The window's horizontal size class, as the shell reads it from
+    /// the platform's traits. Compared first: a rotation that keeps the
+    /// class rebuilds nothing. The answer says whether it moved.
+    pub fn set_size_class(&self, class: SizeClass) -> bool {
+        if self.ctx.borrow().values.horizontalSizeClass == class {
+            return false;
+        }
+        self.set_environment(|values| values.horizontalSizeClass = class);
+        true
+    }
+
+    /// The languages the system prefers, as the SHELL reports them —
+    /// the door every shell opens at mount, and again when the system's
+    /// list moves. The environment follows unless the app pinned a
+    /// locale ([`Runtime::set_locale`]); the direction follows the
+    /// locale unless pinned ([`Runtime::set_layout_direction`]). A
+    /// report that changes nothing costs nothing, and the answer says
+    /// whether anything moved — the shell's cue to present a frame.
+    pub fn set_system_locale(&self, locale: Locale) -> bool {
+        if self.system_locale.borrow().as_ref() == Some(&locale) {
+            return false;
+        }
+        *self.system_locale.borrow_mut() = Some(locale);
+        self.settle_locale()
+    }
+
+    /// The APP's choice: `Some` pins a locale over whatever the shell
+    /// reports — the language a person chose inside the app, or a seed
+    /// an example wants kept once a shell speaks — and `None` follows
+    /// the system again. The answer says whether the environment moved.
+    pub fn set_locale(&self, locale: Option<Locale>) -> bool {
+        if *self.pinned_locale.borrow() == locale {
+            return false;
+        }
+        *self.pinned_locale.borrow_mut() = locale;
+        self.settle_locale()
+    }
+
+    /// The locale in effect — the app's pin, else the system's report,
+    /// else what the environment was seeded with. A count, not a copy.
+    pub fn locale(&self) -> Locale {
+        self.ctx.borrow().values.locale.clone()
+    }
+
+    /// Pins the layout direction (`Some`), or lets the locale decide
+    /// again (`None`) — the knob a developer turns to see a scene
+    /// mirrored without changing its language. The answer says whether
+    /// the environment moved.
+    pub fn set_layout_direction(&self, direction: Option<LayoutDirection>) -> bool {
+        if self.pinned_direction.get() == direction {
+            return false;
+        }
+        self.pinned_direction.set(direction);
+        self.settle_locale()
+    }
+
+    /// The direction in effect — the pin, else the locale's own. What
+    /// every layout pass reads.
+    pub fn layout_direction(&self) -> LayoutDirection {
+        self.ctx.borrow().values.layoutDirection
+    }
+
+    /// Writes the locale and the direction in effect into the
+    /// environment — ONCE, together, and only when one of them moved.
+    fn settle_locale(&self) -> bool {
+        let wanted = {
+            let pinned = self.pinned_locale.borrow();
+            let system = self.system_locale.borrow();
+            pinned.clone().or_else(|| system.clone())
+        };
+        let mut ctx = self.ctx.borrow_mut();
+        // no pin and no report: the seed stands
+        let locale = wanted.unwrap_or_else(|| ctx.values.locale.clone());
+        let direction = self.pinned_direction.get().unwrap_or_else(|| locale.direction());
+        if ctx.values.locale == locale && ctx.values.layoutDirection == direction {
+            return false;
+        }
+        let values = Rc::make_mut(&mut ctx.values);
+        values.locale = locale;
+        values.layoutDirection = direction;
+        drop(ctx);
+        self.env_moved.set(true);
+        true
+    }
+
     /// The window's safe area, in layout points: the shell mirrors the
     /// platform's insets (`safeAreaInsets` on a phone) and the next
-    /// layout lays the root out inside them. Leading is the left edge.
+    /// layout lays the root out inside them. The insets are the window's
+    /// as it sees them — `leading` is the LEFT band; a body reading them
+    /// through the environment gets them in its own direction.
     pub fn set_safe_area(&self, insets: crate::layout::Edges) {
         if self.safe_area.get() == insets {
             return;
@@ -844,6 +938,11 @@ impl Runtime {
         insets
     }
 
+    /// How many PHYSICAL pixels one layout point covers — what the
+    /// shell reads from the screen (`2.0` on a retina display). It
+    /// reaches the app through [`crate::custom::PaintCtx::scale`], so
+    /// a box that draws parts which TOUCH can put the shared edge on
+    /// a whole pixel. The default is `1.0`.
     pub fn set_device_scale(&self, scale: Px) {
         let scale = scale.max(1.0);
         if self.device_scale.get() != scale {
@@ -990,7 +1089,7 @@ impl Runtime {
             handler.0(Point { x, y });
             return true;
         }
-        self.open_menu(Point { x, y }, region.items);
+        self.open_menu(Point { x, y }, region.items, region.direction);
         true
     }
 
@@ -999,7 +1098,12 @@ impl Runtime {
     /// box asked from inside an event ([`crate::custom::EventCtx::open_menu`]).
     /// One road, so the dismiss, the outside press and the row that
     /// fires on the down are the same for both.
-    fn open_menu(&self, at: Point, items: std::rc::Rc<[crate::views::MenuItem]>) {
+    fn open_menu(
+        &self,
+        at: Point,
+        items: std::rc::Rc<[crate::views::MenuItem]>,
+        direction: LayoutDirection,
+    ) {
         let entries: Vec<Option<std::sync::Arc<str>>> = items
             .iter()
             .map(|item| match item {
@@ -1009,7 +1113,7 @@ impl Runtime {
             .collect();
         *self.menu_items.borrow_mut() = Some(items);
         self.interaction.borrow_mut().menu =
-            Some(crate::layout::MenuOpen { at, entries, hovered: None });
+            Some(crate::layout::MenuOpen { at, entries, hovered: None, direction });
     }
 
     /// Closes the open menu without firing anything. `true` = one was
@@ -1051,6 +1155,7 @@ impl Runtime {
         crate::layout::DropPoint {
             local: Point { x: x - region.frame.origin.x, y: y - region.frame.origin.y },
             size: region.frame.size,
+            direction: region.direction,
         }
     }
 
@@ -1332,7 +1437,16 @@ impl Runtime {
         Self::assembled(Some(name), ctx, text)
     }
 
-    fn assembled(scene: Option<Rc<str>>, ctx: Context, text: Rc<dyn TextEngine>) -> Self {
+    fn assembled(scene: Option<Rc<str>>, mut ctx: Context, text: Rc<dyn TextEngine>) -> Self {
+        // a seed that names only a locale takes the locale's direction;
+        // one that names a direction keeps it (nothing is shared yet, so
+        // the write copies nothing and moves no environment)
+        if ctx.values.layoutDirection == LayoutDirection::LeftToRight {
+            let direction = ctx.values.locale.direction();
+            if direction != ctx.values.layoutDirection {
+                Rc::make_mut(&mut ctx.values).layoutDirection = direction;
+            }
+        }
         let runtime = Runtime {
             ctx: RefCell::new(ctx),
             env_moved: Cell::new(false),
@@ -1423,6 +1537,9 @@ impl Runtime {
             device_scale: Cell::new(1.0),
             safe_area: Cell::new(crate::layout::Edges::ZERO),
             keyboard_inset: Cell::new(0.0),
+            system_locale: RefCell::new(None),
+            pinned_locale: RefCell::new(None),
+            pinned_direction: Cell::new(None),
             last_insets: Cell::new(crate::layout::Edges::ZERO),
             dom: RefCell::new(crate::dom::DomLowering::default()),
             root_boundary: RefCell::new(None),
@@ -1795,11 +1912,9 @@ impl Runtime {
         let Some(split) = placement else {
             return false;
         };
-        let (pointer_main, origin_main) = match split.axis {
-            crate::layout::Axis::Horizontal => (x, split.frame.origin.x),
-            crate::layout::Axis::Vertical => (y, split.frame.origin.y),
-        };
-        // the pointer names lane A's extent in POINTS; what the binding
+        // the pointer names lane A's extent in POINTS — counted from the
+        // frame's leading edge, which is its right one in a right-to-left
+        // scene, where lane A stands at the right; what the binding
         // holds is whatever unit the seam speaks, so the clamp runs in
         // that unit and the write-back is already in it
         //
@@ -1807,7 +1922,13 @@ impl Runtime {
         // pointer still lands where it lands and the app is holding the
         // OTHER side of it: the reach is mirrored across the room, and
         // the floors swap with it.
-        let reached = pointer_main - origin_main;
+        let reached = match split.axis {
+            crate::layout::Axis::Horizontal if split.direction.is_rtl() => {
+                split.frame.origin.x + split.frame.size.width - x
+            }
+            crate::layout::Axis::Horizontal => x - split.frame.origin.x,
+            crate::layout::Axis::Vertical => y - split.frame.origin.y,
+        };
         let (reached, near, far) = if split.trailing {
             ((split.room - reached).max(0.0), split.min_b, split.min_a)
         } else {
@@ -1827,14 +1948,17 @@ impl Runtime {
         reconciler::run_split(path, at)
     }
 
-    /// The thumb's geometry, in the axis it travels: `(track start,
-    /// track length, thumb length, travel, max offset)`. The mirror of
+    /// The thumb's geometry, in the axis it travels: `(the thumb's head
+    /// at offset zero, thumb length, travel, max offset, sign)` — the
+    /// head is `start + sign × travel × offset / max`. The sign is `-1`
+    /// for a horizontal thumb in a right-to-left region, where the thumb
+    /// starts at the right end and travels left. The mirror of
     /// `draw_scrollbar` — one formula, written twice on purpose would
     /// be a bug waiting, so this reads the SAME constants.
     fn thumb_geometry(
         region: &crate::layout::ScrollRegion,
         horizontal: bool,
-    ) -> Option<(Px, Px, Px, Px)> {
+    ) -> Option<(Px, Px, Px, Px, Px)> {
         let (extent, content) = match horizontal {
             true => (region.frame.size.width, region.content.width),
             false => (region.frame.size.height, region.content.height),
@@ -1850,11 +1974,18 @@ impl Runtime {
         let thumb = ((extent / content) * track)
             .max(crate::layout::SCROLLBAR_MIN)
             .min(track);
-        let start = match horizontal {
-            true => region.frame.origin.x,
-            false => region.frame.origin.y,
-        } + crate::layout::SCROLLBAR_INSET;
-        Some((start, thumb, (track - thumb).max(0.0), max))
+        let mirrored = horizontal && region.direction.is_rtl();
+        let start = match (horizontal, mirrored) {
+            (true, true) => {
+                region.frame.origin.x + region.frame.size.width
+                    - crate::layout::SCROLLBAR_INSET
+                    - thumb
+            }
+            (true, false) => region.frame.origin.x + crate::layout::SCROLLBAR_INSET,
+            (false, _) => region.frame.origin.y + crate::layout::SCROLLBAR_INSET,
+        };
+        let sign = if mirrored { -1.0 } else { 1.0 };
+        Some((start, thumb, (track - thumb).max(0.0), max, sign))
     }
 
     fn region_at(&self, path: &str) -> Option<crate::layout::ScrollRegion> {
@@ -1869,13 +2000,13 @@ impl Runtime {
             None => (target.strip_suffix("/#thumb-h")?, true),
         };
         let region = self.region_at(path)?;
-        let (start, thumb, travel, max) = Self::thumb_geometry(&region, horizontal)?;
+        let (start, thumb, travel, max, sign) = Self::thumb_geometry(&region, horizontal)?;
         let offset = self.scroll_offset(path);
         let along = match horizontal {
             true => offset.x,
             false => offset.y,
         };
-        let head = start + travel * (along / max);
+        let head = start + sign * travel * (along / max);
         let pointer = if horizontal { x } else { y };
         Some(crate::layout::ThumbDrag {
             path: path.to_string(),
@@ -1891,7 +2022,7 @@ impl Runtime {
         let Some(region) = self.region_at(&drag.path) else {
             return false;
         };
-        let Some((start, _, travel, max)) = Self::thumb_geometry(&region, drag.horizontal)
+        let Some((start, _, travel, max, sign)) = Self::thumb_geometry(&region, drag.horizontal)
         else {
             return false;
         };
@@ -1899,7 +2030,7 @@ impl Runtime {
             return false;
         }
         let pointer = if drag.horizontal { x } else { y };
-        let along = (((pointer - drag.grab) - start) / travel * max).clamp(0.0, max);
+        let along = (sign * ((pointer - drag.grab) - start) / travel * max).clamp(0.0, max);
         let current = self.scroll_offset(&drag.path);
         let next = match drag.horizontal {
             true => Point { x: along, y: current.y },
@@ -1955,15 +2086,17 @@ impl Runtime {
             menu: &asked,
             touch: self.touch_modality.get(),
             held_ms: self.press_held_ms(),
+            direction: placement.direction,
         };
         let answer = placement.element.element().event(&event, &ctx);
         if let Some((at, items)) = asked.into_inner() {
-            // the point is the box's own, and a menu lives in the scene
+            // the point is the box's own, and a menu lives in the scene —
+            // and hangs the way the box's scene reads
             let at = Point {
                 x: at.x + placement.frame.origin.x,
                 y: at.y + placement.frame.origin.y,
             };
-            self.open_menu(at, items);
+            self.open_menu(at, items, placement.direction);
         }
         answer
     }
@@ -2867,6 +3000,10 @@ impl Runtime {
             // the wheel is sovereign: a reveal in flight dies here
             self.animator.borrow_mut().cancel_scroll(&region.path);
             let current = offsets.get(&region.path).copied().unwrap_or_default();
+            // the hand's turn is physical and the offset is logical: a
+            // turn that reveals what lies to the right reveals EARLIER
+            // content in a right-to-left region, so the offset shrinks
+            let dx = if region.direction.is_rtl() { -dx } else { dx };
             let next = Point {
                 x: (current.x - dx).clamp(0.0, max_x),
                 y: (current.y - dy).clamp(0.0, max_y),
@@ -3713,31 +3850,57 @@ impl Runtime {
                 let row = ((y - field.text_origin.y) / field.line_height).floor();
                 let row = (row.max(0.0) as usize).min(lines.len().saturating_sub(1));
                 let (start, end) = lines[row];
+                let along = self.field_line_x(&field, path, &seen[start..end], x);
                 let caret = start
-                    + caret_from_x(
-                        &seen[start..end],
-                        x - field.text_origin.x,
-                        &field.font,
-                        &*self.text,
-                        &self.cache,
-                    );
+                    + caret_from_x(&seen[start..end], along, &field.font, &*self.text, &self.cache);
                 (home(caret), (home(start), home(end)))
             }
-            Some(field) => (
-                home(caret_from_x(
-                    seen,
-                    x - field.text_origin.x,
-                    &field.font,
-                    &*self.text,
-                    &self.cache,
-                )),
-                whole,
-            ),
+            Some(field) => {
+                let along = self.field_line_x(&field, path, seen, x);
+                (home(caret_from_x(seen, along, &field.font, &*self.text, &self.cache)), whole)
+            }
             // before the first layout there is no run to measure
             // against: the caret goes to the end, as it always did
             None => (text.len(), whole),
         };
         Some((text, caret, line))
+    }
+
+    /// Where one visual line of a field starts, how wide it is and which
+    /// way it reads — the placement's own formulas, read back.
+    fn field_line(
+        &self,
+        field: &crate::layout::FieldPlacement,
+        path: &str,
+        line: &str,
+    ) -> (Px, Px, bool) {
+        let anchor_rtl = field.direction.is_rtl();
+        let line_rtl = crate::text_input::reads_right_to_left(line);
+        if !anchor_rtl && !line_rtl {
+            return (field.text_origin.x, 0.0, false);
+        }
+        let width = self.cache.get_or_measure(line, &field.font, &*self.text).width;
+        // a wrapped field never rolls sideways; a one-line one does
+        let offset_x = if field.multiline {
+            0.0
+        } else {
+            self.scroll_offsets.borrow().get(path).map_or(0.0, |offset| offset.x)
+        };
+        (crate::layout::field_run_x(field.run, offset_x, width, anchor_rtl, line_rtl), width, line_rtl)
+    }
+
+    /// The pointer's distance along one visual line of a field, from the
+    /// line's logical START — from its right end on a right-to-left
+    /// line — which is what `caret_from_x` measures prefixes against.
+    fn field_line_x(
+        &self,
+        field: &crate::layout::FieldPlacement,
+        path: &str,
+        line: &str,
+        x: Px,
+    ) -> Px {
+        let (line_x, width, line_rtl) = self.field_line(field, path, line);
+        if line_rtl { line_x + width - x } else { x - line_x }
     }
 
     /// The geometry the last layout recorded for a field.
@@ -3773,17 +3936,23 @@ impl Runtime {
         byte: usize,
     ) -> Rect {
         let byte = crate::text_input::clamp_index(text, byte);
-        let (x, y) = if field.multiline {
+        let (start, end, row) = if field.multiline {
             let lines = self.wrap(text, field);
             let row = crate::layout::line_of(&lines, byte);
-            let start = lines.get(row).map_or(0, |line| line.0).min(byte);
-            let head = self.cache.get_or_measure(&text[start..byte], &field.font, &*self.text).width;
-            (head, row as Px * field.line_height)
+            let (start, end) = lines.get(row).copied().unwrap_or((0, text.len()));
+            (start.min(byte), end.max(byte), row)
         } else {
-            (self.cache.get_or_measure(&text[..byte], &field.font, &*self.text).width, 0.0)
+            (0, text.len(), 0)
         };
+        let head = self.cache.get_or_measure(&text[start..byte], &field.font, &*self.text).width;
+        // the line's own start, width and direction — the placement's
+        // formulas, read back for the line the byte is on
+        let (line_x, width, line_rtl) = self.field_line(field, &field.path, &text[start..end]);
         Rect {
-            origin: Point { x: field.text_origin.x + x, y: field.text_origin.y + y },
+            origin: Point {
+                x: crate::layout::field_glyph_x(line_x, width, line_rtl, head),
+                y: field.text_origin.y + row as Px * field.line_height,
+            },
             size: crate::layout::Size { width: 1.5, height: field.line_height },
         }
     }
@@ -4107,8 +4276,8 @@ impl Runtime {
         }
         let mut probe = CaretState::default();
         let text = reconciler::run_editor(&path, EditCommand::Read, &mut probe)??;
-        let byte =
-            caret_from_x(&text, x - field.text_origin.x, &field.font, &*self.text, &self.cache);
+        let along = self.field_line_x(&field, &path, &text, x);
+        let byte = caret_from_x(&text, along, &field.font, &*self.text, &self.cache);
         Some(crate::text_input::byte_to_utf16(&text, byte))
     }
 
@@ -4781,6 +4950,8 @@ impl Runtime {
             font: FontSpec::DEFAULT,
             line_height: None,
             text_align: None,
+            direction: self.layout_direction(),
+            flips: false,
             stamp,
             animator: Some(&self.animator),
             live: None,
@@ -4794,6 +4965,7 @@ impl Runtime {
         let boxes = self.island_boxes.borrow();
         let flow = crate::dom_flow::FlowEnv {
             scroll_offsets: &*offsets,
+            direction: self.layout_direction(),
             size: (size.width, size.height),
             layout: Some(env),
             changed: &changed,
@@ -4827,6 +4999,12 @@ impl Runtime {
         let mut patches = dom.lower(output.scene, &output.display);
         if !dirty_bindings.is_empty() {
             patches.extend(dom.refresh_bindings(&dirty_bindings));
+        }
+        // the mount's language and direction, after everything else: the
+        // first frame always says them, a still frame never
+        let locale = self.locale();
+        if let Some(patch) = dom.note_language(locale.identifier(), self.layout_direction()) {
+            patches.push(patch);
         }
         patches
     }
@@ -4901,6 +5079,8 @@ impl Runtime {
             font: FontSpec::DEFAULT,
             line_height: None,
             text_align: None,
+            direction: self.layout_direction(),
+            flips: false,
             stamp,
             animator: Some(&self.animator),
             live: None,
@@ -4915,6 +5095,7 @@ impl Runtime {
         let boxes = self.island_boxes.borrow();
         let flow = crate::dom_flow::FlowEnv {
             scroll_offsets: &*offsets,
+            direction: self.layout_direction(),
             size: (size.width, size.height),
             layout: Some(env),
             changed: &changed,
@@ -4938,6 +5119,10 @@ impl Runtime {
         self.note_island_hits(&output.islands_walked, output.hits);
         dom.note_groups(output.groups);
         dom.adopt(output.scene, &output.display);
+        // the served mount already wears its language: noted, not sent,
+        // so the first frame says nothing about it either
+        let locale = self.locale();
+        let _ = dom.note_language(locale.identifier(), self.layout_direction());
     }
 
     /// A click resolved by the BROWSER: the glue walked up from the
@@ -5541,6 +5726,7 @@ impl Runtime {
                     scale: self.device_scale.get(),
                     touch: self.touch_modality.get(),
                     overlay_layered: true,
+                    direction: placement.direction,
                 };
                 let origin = crate::layout::Point {
                     x: owner.frame.origin.x - placement.frame.origin.x,
@@ -5570,6 +5756,7 @@ impl Runtime {
                     scale: self.device_scale.get(),
                     touch: self.touch_modality.get(),
                     overlay_layered: false,
+                    direction: placement.direction,
                 };
                 let origin = crate::layout::Point {
                     x: -placement.visible.origin.x,
@@ -5990,6 +6177,10 @@ impl Runtime {
             (region.content.width.round() - region.frame.size.width.round()).max(0.0);
         let travel_y =
             (region.content.height.round() - region.frame.size.height.round()).max(0.0);
+        // the shift is physical (the content moves left by `dx`) and the
+        // offset is logical: right to left, the content moves left as
+        // the offset SHRINKS
+        let dx = if region.direction.is_rtl() { -dx } else { dx };
         let next = Point {
             x: (current.x + dx).clamp(0.0, travel_x),
             y: (current.y + dy).clamp(0.0, travel_y),
@@ -6695,6 +6886,8 @@ impl Runtime {
             font: FontSpec::DEFAULT,
             line_height: None,
             text_align: None,
+            direction: self.layout_direction(),
+            flips: false,
             stamp,
             animator: Some(&self.animator),
             anim: None,

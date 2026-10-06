@@ -19,7 +19,8 @@
 //! - **A menu UIKit does not have stands after the one before it** — Go
 //!   after View, Run after Go — in the bar's own order.
 //! - **The roles go where UIKit keeps them.** The Settings command replaces
-//!   the application menu's Preferences group. About is the system's own row,
+//!   the application menu's Preferences group, worded in the person's
+//!   language ([`bunny_ui::words`]). About is the system's own row,
 //!   kept when the app declares [`Item::About`] and removed when it does not.
 //!   Quit is the SYSTEM's on this platform — an app does not end itself — so
 //!   a [`Role::Quit`] command has no row here.
@@ -48,6 +49,7 @@
 
 use bunny_ui::action::{ActionId, Key, KeyPattern};
 use bunny_ui::menu::{Item, Menu, MenuBar, MenuRole, Pick, Role, Shortcut};
+use bunny_ui::words::{Word, Words};
 
 // =============================================================================
 // What UIKit will build
@@ -231,11 +233,11 @@ pub struct UiArrangement {
 // =============================================================================
 
 /// The app's bar, arranged as UIKit files a main menu — the module's rules.
-pub fn arrange(bar: &MenuBar) -> UiArrangement {
+pub fn arrange(bar: &MenuBar, words: &Words) -> UiArrangement {
     let mut arranged = UiArrangement::default();
     let mut previous = Anchor::Standard(Standard::View);
     for (index, menu) in bar.menus().iter().enumerate() {
-        let groups = groups(menu, &mut arranged);
+        let groups = groups(menu, &mut arranged, words);
         let standard = Standard::named(menu);
         let identifier = match standard {
             Some(_) => String::new(),
@@ -262,7 +264,7 @@ pub fn arrange(bar: &MenuBar) -> UiArrangement {
 }
 
 /// A menu's items cut into groups at its rules, with the roles lifted out.
-fn groups(menu: &Menu, arranged: &mut UiArrangement) -> Vec<Vec<UiItem>> {
+fn groups(menu: &Menu, arranged: &mut UiArrangement, words: &Words) -> Vec<Vec<UiItem>> {
     let mut groups: Vec<Vec<UiItem>> = vec![Vec::new()];
     for item in menu.entries() {
         match item {
@@ -273,7 +275,7 @@ fn groups(menu: &Menu, arranged: &mut UiArrangement) -> Vec<Vec<UiItem>> {
             Item::Command(command) => match command.filed_as() {
                 Some(Role::Settings) if arranged.settings.is_none() => {
                     arranged.settings = Some(UiCommand {
-                        title: "Settings…".to_owned(),
+                        title: words.get(Word::Settings).into_owned(),
                         action: command.action(),
                         key: UiKey::of(command.keys()),
                         stroke: command.keys().and_then(Shortcut::single),
@@ -293,7 +295,7 @@ fn groups(menu: &Menu, arranged: &mut UiArrangement) -> Vec<Vec<UiItem>> {
                 }
             },
             Item::Submenu(submenu) => {
-                let inner = self::groups(submenu, arranged);
+                let inner = self::groups(submenu, arranged, words);
                 if !inner.is_empty()
                     && let Some(group) = groups.last_mut()
                 {
@@ -367,7 +369,7 @@ mod tests {
 
     #[test]
     fn a_menu_uikit_has_takes_the_apps_groups_and_keeps_its_own_rows() {
-        let arranged = arrange(&bar());
+        let arranged = arrange(&bar(), &Words::english());
         let file = &arranged.menus[0];
         assert_eq!(file.place, Place::Into(Standard::File));
         assert_eq!(file.groups.len(), 1, "Settings and Quit left File; its rule went with them");
@@ -380,7 +382,7 @@ mod tests {
 
     #[test]
     fn a_menu_uikit_has_not_stands_after_the_one_before_it() {
-        let arranged = arrange(&bar());
+        let arranged = arrange(&bar(), &Words::english());
         let go = &arranged.menus[2];
         assert_eq!(go.place, Place::After(Anchor::Standard(Standard::Edit)));
         let run = &arranged.menus[3];
@@ -391,7 +393,7 @@ mod tests {
 
     #[test]
     fn the_roles_go_where_uikit_keeps_them() {
-        let arranged = arrange(&bar());
+        let arranged = arrange(&bar(), &Words::english());
         let settings = arranged.settings.as_ref().expect("Settings is the app's");
         assert_eq!(settings.title, "Settings…");
         assert_eq!(settings.action, SETTINGS);
@@ -403,12 +405,12 @@ mod tests {
             .flat_map(|menu| menu.groups.iter().flatten())
             .any(|item| matches!(item, UiItem::Command(command) if command.action == QUIT));
         assert!(!quits, "the system ends an app here; Quit has no row");
-        assert!(!arrange(&MenuBar::new()).about, "no About declared, none kept");
+        assert!(!arrange(&MenuBar::new(), &Words::english()).about, "no About declared, none kept");
     }
 
     #[test]
     fn a_key_command_is_given_only_where_uikit_can_name_the_stroke() {
-        let arranged = arrange(&bar());
+        let arranged = arrange(&bar(), &Words::english());
         let UiItem::Command(save) = &arranged.menus[0].groups[0][1] else { panic!("Save") };
         assert_eq!(save.key, Some(UiKey { input: UiInput::Text('s'), modifiers: COMMAND }));
         assert_eq!(save.stroke(), Some(KeyPattern::command(Key::Char('s'))), "the stroke the keymap is offered");
@@ -436,7 +438,7 @@ mod tests {
                     Menu::new("Recent").item(Command::new("Back", BACK)).separator().item(Command::new("Run", RUN)),
                 ),
             );
-        let arranged = arrange(&bar);
+        let arranged = arrange(&bar, &Words::english());
         assert_eq!(arranged.menus.len(), 1, "Tools held nothing");
         let UiItem::Submenu { title, groups } = &arranged.menus[0].groups[0][0] else { panic!("a submenu") };
         assert_eq!(title, "Recent");
