@@ -445,6 +445,7 @@ unsafe fn start_beat(window: Id, view: Id, delegate: Id) {
                     NSRunLoopCommonModes,
                 );
                 LINK.with(|slot| slot.set(link));
+                LINK_PAUSED.with(|state| state.set((link, true)));
             }
         } else {
             eprintln!("bunny_ui: this macOS has no view display link; animations snap");
@@ -1694,6 +1695,9 @@ thread_local! {
     /// only while animations run. Zero-ivar classes: per-window state
     /// lives beside the run loop (the backing-store pattern).
     static LINK: Cell<Id> = const { Cell::new(std::ptr::null_mut()) };
+    /// The link the pause was last set on, and the pause: the driver is
+    /// re-aimed after every event, and an unchanged pace sends nothing.
+    static LINK_PAUSED: Cell<(Id, bool)> = const { Cell::new((std::ptr::null_mut(), true)) };
     /// The slow beat: `(timer, interval)`. Alive only while loop clocks
     /// are the sole animation — one wake per step instead of a display
     /// rate of empty ticks.
@@ -1827,7 +1831,7 @@ pub fn set_frame_driver(pace: DriverPace) {
     let full = pace == DriverPace::Full;
     LINK.with(|slot| {
         let link = slot.get();
-        if !link.is_null() {
+        if !link.is_null() && LINK_PAUSED.with(|state| state.replace((link, !full))) != (link, !full) {
             unsafe { msg_void_bool(link, sel("setPaused:"), (!full) as i8) };
         }
     });
@@ -3955,14 +3959,46 @@ impl WindowHandle {
             if screen.is_null() {
                 return None;
             }
+            // asked every frame, and it moves only with the window, its
+            // screen or the screen's own furniture (the Dock, the menu
+            // bar): the answer is kept for the window's frame and its
+            // screen, and asked again at least once a second
+            let frame = msg_rect(self.window, sel("frame"));
+            let bounds = msg_rect(self.view, sel("bounds"));
+            let key = (screen as usize, rect_bits(frame), rect_bits(bounds));
+            let now = std::time::Instant::now();
+            if let Some(kept) = SCREEN_BOUNDS.with(|slot| {
+                slot.get().filter(|(at, kept_key, _)| {
+                    *kept_key == key && now.duration_since(*at) < SCREEN_BOUNDS_KEPT
+                })
+            }) {
+                return Some(kept.2);
+            }
             let visible = msg_rect(screen, sel("visibleFrame"));
             let in_window = msg_rect_rect(self.window, sel("convertRectFromScreen:"), visible);
-            let bounds = msg_rect(self.view, sel("bounds"));
             // AppKit flip: y-up window coords → top-left layout coords
             let top = bounds.size.height - in_window.origin.y - in_window.size.height;
-            Some((in_window.origin.x, top, in_window.size.width, in_window.size.height))
+            let answer = (in_window.origin.x, top, in_window.size.width, in_window.size.height);
+            SCREEN_BOUNDS.with(|slot| slot.set(Some((now, key, answer))));
+            Some(answer)
         }
     }
+}
+
+/// The screen's usable bounds as the main window last read them, keyed by
+/// its screen, its frame and its view's bounds.
+type ScreenBoundsKey = (usize, [u64; 4], [u64; 4]);
+
+thread_local! {
+    static SCREEN_BOUNDS: Cell<Option<(std::time::Instant, ScreenBoundsKey, (f64, f64, f64, f64))>> =
+        const { Cell::new(None) };
+}
+
+/// How long the screen's bounds are trusted for the same window frame.
+const SCREEN_BOUNDS_KEPT: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn rect_bits(rect: CGRect) -> [u64; 4] {
+    [rect.origin.x.to_bits(), rect.origin.y.to_bits(), rect.size.width.to_bits(), rect.size.height.to_bits()]
 }
 
 // MARK: - The menu bar
