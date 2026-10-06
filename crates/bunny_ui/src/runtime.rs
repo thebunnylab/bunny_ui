@@ -861,7 +861,9 @@ impl Runtime {
 
     /// The window's safe area, in layout points: the shell mirrors the
     /// platform's insets (`safeAreaInsets` on a phone) and the next
-    /// layout lays the root out inside them. Leading is the left edge.
+    /// layout lays the root out inside them. The insets are the window's
+    /// as it sees them — `leading` is the LEFT band; a body reading them
+    /// through the environment gets them in its own direction.
     pub fn set_safe_area(&self, insets: crate::layout::Edges) {
         if self.safe_area.get() == insets {
             return;
