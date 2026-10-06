@@ -7496,6 +7496,44 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_that_keeps_the_length_still_writes_and_a_move_never_does() {
+        use crate::layout::{Proposal, Size};
+        #[derive(Clone)]
+        struct Panel {
+            note: State<String>,
+            writes: State<i32>,
+        }
+        impl Component for Panel {
+            fn body(self, _: &Context) -> impl View {
+                let writes = self.writes;
+                text_editor("note", self.note.binding().onSet(move |_| writes.add(1))).frame(200.0, 80.0)
+            }
+        }
+        let panel = Panel { note: State::new("abc".to_string()), writes: State::new(0) };
+        let runtime = Runtime::new();
+        let proposal = Proposal::exact(Size { width: 200.0, height: 80.0 });
+        runtime.render_stable(&panel);
+        let layout = runtime.layout(&panel, proposal);
+        let path = layout.hits.first().expect("field target").0.clone();
+        runtime.focus(&path);
+        // the caret goes home, then a shift-move selects the "a"
+        runtime.key(EditCommand::Home(false));
+        runtime.key(EditCommand::Right(true));
+        assert_eq!(panel.writes.get(), 0, "moves and selections write nothing");
+        let _ = runtime.ime_snapshot();
+        assert_eq!(panel.writes.get(), 0, "a read writes nothing");
+        // one byte over one byte: the length stands, the text does not
+        assert!(runtime.key(EditCommand::Insert("x".into())).applied);
+        assert_eq!(panel.note.get(), "xbc");
+        assert_eq!(panel.writes.get(), 1, "the equal-length edit was written");
+        // a backspace at the start changes nothing and writes nothing
+        runtime.key(EditCommand::Home(false));
+        runtime.key(EditCommand::Backspace);
+        assert_eq!(panel.note.get(), "xbc");
+        assert_eq!(panel.writes.get(), 1, "an edit that changed nothing wrote nothing");
+    }
+
+    #[test]
     fn a_note_is_never_shaped_whole_while_it_is_typed_into() {
         use crate::layout::{Proposal, Size};
         use crate::text_engine::{FontSpec, LineMetrics, PixelFont, TextEngine, TextRaster};

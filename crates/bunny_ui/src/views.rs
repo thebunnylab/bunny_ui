@@ -418,15 +418,49 @@ impl View for TextField {
                             }
                             command => command,
                         };
+                        // a read lends the text once: no copy to compare
+                        // against and no write — the runtime reads the
+                        // focused field after every frame, and a note of a
+                        // megabyte made each read three copies of it
+                        if strategy.is_none() && matches!(command, crate::text_input::EditCommand::Read) {
+                            let value = binding.wrappedValue();
+                            crate::text_input::clamp_state(&value, state);
+                            return Some(value);
+                        }
                         let mut value = binding.wrappedValue();
-                        let original = value.clone();
-                        let output = match &strategy {
-                            Some(strategy) => strategy.edit(&mut value, state, command),
-                            None => crate::text_input::apply(&mut value, state, command),
+                        let (output, changed) = match &strategy {
+                            // an app's strategy may rewrite anything: its
+                            // edit is compared whole
+                            Some(strategy) => {
+                                let original = value.clone();
+                                let output = strategy.edit(&mut value, state, command);
+                                let changed = value != original;
+                                (output, changed)
+                            }
+                            // the field's own edit touches the text only at
+                            // the caret, the selection or the composition:
+                            // a change that keeps the length can only have
+                            // rewritten those bytes, so they are all that is
+                            // kept to compare — never a copy of the note
+                            None => {
+                                crate::text_input::clamp_state(&value, state);
+                                let before = value.len();
+                                let span = [state.selection(), state.marked]
+                                    .into_iter()
+                                    .flatten()
+                                    .reduce(|(a, b), (s, e)| (a.min(s), b.max(e)));
+                                let kept = span.map(|(start, end)| value[start..end].to_owned());
+                                let output = crate::text_input::apply(&mut value, state, command);
+                                let changed = value.len() != before
+                                    || span.zip(kept).is_some_and(|((start, end), kept)| {
+                                        value.get(start..end) != Some(kept.as_str())
+                                    });
+                                (output, changed)
+                            }
                         };
                         // the set dirties whoever READS — only when the text
                         // actually changed (Read/Copy must not invalidate the world)
-                        if value != original {
+                        if changed {
                             binding.set(value);
                         }
                         output
