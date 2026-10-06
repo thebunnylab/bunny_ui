@@ -40,6 +40,7 @@
 pub mod action;
 pub mod anim;
 pub mod bind;
+pub mod catalog;
 pub mod clipboard;
 pub mod custom;
 pub mod dom;
@@ -138,6 +139,9 @@ pub mod task {
 pub mod prelude {
     pub use crate::action::{ActionId, Key, KeyPattern};
     pub use crate::anim::{FramePace, Loop, Spring, Ticked};
+    // the app's strings: `catalog::Table` and `catalog::Key` stay
+    // qualified, as the views have a `Table` and the actions a `Key`
+    pub use crate::catalog::{self, Catalog, Strings};
     pub use crate::touch::{Gesture, TouchScene};
     pub use crate::custom::{
         Custom, CustomElement, ElementEvent, EventCtx, ImeContext, Metrics, PaintCtx, Painter,
