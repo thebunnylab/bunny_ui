@@ -142,6 +142,7 @@ pub const ALPHA_PREMULTIPLIED_LAST: u32 = 1;
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
+    pub fn CFRetain(cf: *const c_void) -> *const c_void;
     pub fn CFRelease(cf: *const c_void);
     pub fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
     fn CFRunLoopGetMain() -> Id;
