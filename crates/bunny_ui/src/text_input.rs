@@ -423,10 +423,22 @@ pub fn byte_to_utf16(text: &str, byte: usize) -> usize {
     // when its encoding takes four bytes (a lead byte 0xF0..=0xF7). Two
     // byte scans the compiler vectorizes, where decoding every char
     // walked a 30 000-line document twice per keystroke for the IME.
-    let prefix = text[..clamp_to_boundary(text, byte)].as_bytes();
-    let continuations = prefix.iter().filter(|&&b| b & 0xC0 == 0x80).count();
-    let four_byte_leads = prefix.iter().filter(|&&b| b & 0xF8 == 0xF0).count();
-    prefix.len() - continuations + four_byte_leads
+    utf16_len(&text.as_bytes()[..clamp_to_boundary(text, byte)])
+}
+
+/// UTF-16 units in whole UTF-8 bytes, in one pass: a lead or ASCII byte
+/// is one unit, a four-byte lead one more, a continuation none.
+fn utf16_len(bytes: &[u8]) -> usize {
+    bytes.iter().map(|&b| usize::from(b & 0xC0 != 0x80) + usize::from(b >= 0xF0)).sum()
+}
+
+/// The UTF-16 span of `start..end` after the offset of `start` — a
+/// selection measured from where it begins, not from the text's start.
+pub fn utf16_span(text: &str, start: usize, end: usize) -> (usize, usize) {
+    let start = clamp_to_boundary(text, start);
+    let end = clamp_to_boundary(text, end.max(start));
+    let head = utf16_len(&text.as_bytes()[..start]);
+    (head, utf16_len(&text.as_bytes()[start..end]))
 }
 
 /// Appearance of the native caret, supplied by the retained editing policy.
@@ -508,10 +520,14 @@ mod tests {
     #[test]
     fn utf16_offsets_are_counted_as_the_decoder_would_count_them() {
         let text = "ascii, then café, then 日本語, then 🦀🐇, then more";
+        let units = |from: usize, to: usize| -> usize { text[from..to].chars().map(char::len_utf16).sum() };
         for byte in 0..=text.len() {
             let byte = super::clamp_to_boundary(text, byte);
-            let decoded: usize = text[..byte].chars().map(char::len_utf16).sum();
-            assert_eq!(super::byte_to_utf16(text, byte), decoded, "at byte {byte}");
+            assert_eq!(super::byte_to_utf16(text, byte), units(0, byte), "at byte {byte}");
+            for end in byte..=text.len() {
+                let end = super::clamp_to_boundary(text, end);
+                assert_eq!(super::utf16_span(text, byte, end), (units(0, byte), units(byte, end)), "span {byte}..{end}");
+            }
         }
     }
 
