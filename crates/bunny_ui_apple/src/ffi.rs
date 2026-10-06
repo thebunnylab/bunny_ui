@@ -174,7 +174,7 @@ struct CFRunLoopSourceContext {
 }
 
 pub unsafe fn class(name: &str) -> Id {
-    if let Some(found) = NAMES.with(|names| names.borrow().classes.get(name).copied()) {
+    if let Some(found) = kept(|names| names.classes.get(name).copied()) {
         return found;
     }
     let found = {
@@ -183,21 +183,35 @@ pub unsafe fn class(name: &str) -> Id {
     };
     // a class registered at run time is nil until it is: nil is not kept
     if !found.is_null() {
-        NAMES.with(|names| names.borrow_mut().classes.insert(name.into(), found));
+        keep(|names| names.classes.insert(name.into(), found));
     }
     found
 }
 
 pub unsafe fn sel(name: &str) -> Sel {
-    if let Some(found) = NAMES.with(|names| names.borrow().selectors.get(name).copied()) {
+    if let Some(found) = kept(|names| names.selectors.get(name).copied()) {
         return found;
     }
     let found = {
         let c_name = CString::new(name).expect("selector without NUL");
         unsafe { sel_registerName(c_name.as_ptr()) }
     };
-    NAMES.with(|names| names.borrow_mut().selectors.insert(name.into(), found));
+    keep(|names| names.selectors.insert(name.into(), found));
     found
+}
+
+/// A name found in this thread's table — `None` when it is not there, and
+/// also when the table is gone: a thread that is ending drops its locals
+/// one by one, and an object dropped after the table still sends messages
+/// (a frame waited out, a layer released). Those take the runtime's own
+/// lookup instead of panicking inside a destructor.
+fn kept<R>(find: impl FnOnce(&Names) -> Option<R>) -> Option<R> {
+    NAMES.try_with(|names| names.try_borrow().ok().and_then(|names| find(&names))).ok().flatten()
+}
+
+/// Keeps a name in this thread's table, while the table stands.
+fn keep<R>(insert: impl FnOnce(&mut Names) -> R) {
+    let _ = NAMES.try_with(|names| names.try_borrow_mut().map(|mut names| insert(&mut names)));
 }
 
 /// Selectors and classes by name, looked up once per thread: a frame
@@ -462,5 +476,34 @@ pub fn wake_from_any_thread() {
     unsafe {
         CFRunLoopSourceSignal(source);
         CFRunLoopWakeUp(CFRunLoopGetMain());
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    #[test]
+    fn a_name_asked_while_a_thread_ends_is_still_answered() {
+        // a local registered BEFORE the names' table is dropped after it
+        // (in reverse order of registration), and its drop still sends a
+        // message: the lookup must answer, not panic inside a destructor
+        struct Late;
+        impl Drop for Late {
+            fn drop(&mut self) {
+                let found = unsafe { sel("release") };
+                assert!(!found.is_null());
+            }
+        }
+        thread_local! {
+            static LATE: Late = const { Late };
+        }
+        std::thread::spawn(|| {
+            LATE.with(|_| {});
+            let first = unsafe { sel("retain") };
+            assert_eq!(first, unsafe { sel("retain") }, "a name is kept once found");
+        })
+        .join()
+        .expect("the thread ends without aborting");
     }
 }
