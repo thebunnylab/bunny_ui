@@ -141,6 +141,10 @@ pub struct Runtime {
     /// The root of the last pass — scopes `take_dirty` so it does not
     /// drain dirt from another tree mounted on the same thread.
     last_root: RefCell<Option<String>>,
+    /// The TYPE of the root view the last pass rendered: a runtime handed
+    /// another root — a probe laying out one surface, then another — is
+    /// quiet for neither, and the stable frame is only the same root's.
+    last_root_type: Cell<Option<std::any::TypeId>>,
     /// The targets of the last layout, OUTER before INNER with siblings
     /// in paint order — the hit-test
     /// map for pointer events.
@@ -1334,6 +1338,7 @@ impl Runtime {
             env_moved: Cell::new(false),
             scene,
             last_root: RefCell::new(None),
+            last_root_type: Cell::new(None),
             last_hits: RefCell::new(Vec::new()),
             last_hover_sensitive: RefCell::new(Vec::new()),
             last_sensitive_groups: RefCell::new(Vec::new()),
@@ -1454,7 +1459,7 @@ impl Runtime {
     /// One incremental pass: walk with skips, isolated re-runs of dirty
     /// views the walk missed, effect-queue reassembly, and the sweep.
     /// Returns both outputs (print and layout) still holding references.
-    fn render_pass(&self, root: &impl View) -> NodeList {
+    fn render_pass<R: View>(&self, root: &R) -> NodeList {
         // virtualized bodies read LAST frame's region geometry (offset
         // taken NOW — a wheel that just moved it must reach the window
         // math) — published fresh before every pass
@@ -1564,6 +1569,7 @@ impl Runtime {
             }
             *self.last_root.borrow_mut() = Some(pass_root.clone());
         }
+        self.last_root_type.set(Some(std::any::TypeId::of::<R>()));
         reconciler::end_pass();
         // every pass teaches the stable frame its boundary — a print, a
         // settle and a frame pass alike, and a runtime handed another
@@ -4298,9 +4304,9 @@ impl Runtime {
     /// its retained [`Surface`] and blits only the damage.
     ///
     /// [`Surface`]: crate::raster::Surface
-    pub fn display_frame(
+    pub fn display_frame<R: View>(
         &self,
-        root: &impl View,
+        root: &R,
         size: crate::layout::Size,
     ) -> crate::layout::DisplayList {
         // the size is known before the settle: the settle's own pass reads
@@ -4627,9 +4633,9 @@ impl Runtime {
     /// the real-event path (the documented contract). Hover still
     /// re-resolves: content slides under a still pointer while
     /// something animates.
-    pub fn animation_frame(
+    pub fn animation_frame<R: View>(
         &self,
-        root: &impl View,
+        root: &R,
         size: crate::layout::Size,
     ) -> crate::layout::DisplayList {
         // a tick reads a binding a write reached, like any frame
@@ -4659,9 +4665,9 @@ impl Runtime {
     /// hover never re-resolves (the glue sends no pointer moves —
     /// `:hover` belongs to the browser, and the scene is pointer-
     /// invariant by construction).
-    pub fn dom_frame(
+    pub fn dom_frame<R: View>(
         &self,
-        root: &impl View,
+        root: &R,
         size: crate::layout::Size,
     ) -> Vec<crate::dom::DomPatch> {
         self.note_viewport(crate::layout::Proposal::exact(size));
@@ -4703,7 +4709,7 @@ impl Runtime {
         let rings = self.drop_rings();
         let rings_held = *self.last_drop_rings.borrow() == rings;
         *self.last_drop_rings.borrow_mut() = rings.clone();
-        let stable_root = rings_held.then(|| self.stable_boundary()).flatten();
+        let stable_root = rings_held.then(|| self.stable_boundary(std::any::TypeId::of::<R>())).flatten();
         let tree = match stable_root {
             Some(path) => {
                 reconciler::note_stable_frame();
@@ -4811,7 +4817,7 @@ impl Runtime {
     /// holds these elements, ids assigned by the same pre-order. The
     /// next [`Runtime::dom_frame`] diffs against a page that is
     /// already true and says nothing.
-    pub fn dom_adopt(&self, root: &impl View, size: crate::layout::Size) {
+    pub fn dom_adopt<R: View>(&self, root: &R, size: crate::layout::Size) {
         // the build's frame knew its window: a body that bends with the
         // width must see the same one here, or it adopts another scene
         self.note_viewport(crate::layout::Proposal::exact(size));
@@ -4825,7 +4831,7 @@ impl Runtime {
         let rings = self.drop_rings();
         let rings_held = *self.last_drop_rings.borrow() == rings;
         *self.last_drop_rings.borrow_mut() = rings.clone();
-        let stable_root = rings_held.then(|| self.stable_boundary()).flatten();
+        let stable_root = rings_held.then(|| self.stable_boundary(std::any::TypeId::of::<R>())).flatten();
         let tree = match stable_root {
             Some(path) => {
                 reconciler::note_stable_frame();
@@ -6572,9 +6578,9 @@ impl Runtime {
     }
 
     /// One layout pass, optionally with the Dom capture riding it.
-    fn layout_once_with(
+    fn layout_once_with<R: View>(
         &self,
-        root: &impl View,
+        root: &R,
         proposal: crate::layout::Proposal,
         dom: bool,
         collect_display: bool,
@@ -6591,7 +6597,7 @@ impl Runtime {
         // root — the walk would be all-skip and emit exactly ONE
         // reference; synthesize the reference and skip the whole pass.
         // Any other situation walks the real pass.
-        let stable_root = self.stable_boundary();
+        let stable_root = self.stable_boundary(std::any::TypeId::of::<R>());
         let tree = match stable_root {
             Some(path) => {
                 // the observable contract holds: THIS frame ran zero bodies
@@ -6872,7 +6878,7 @@ impl Runtime {
     /// observed a change and no view is dirty — bodies having run asks
     /// for no confirmation (a pass with no new dirt produced a
     /// consistent tree by definition; the next pass would be all-skip).
-    pub fn settle(&self, root: &impl View) {
+    pub fn settle<R: View>(&self, root: &R) {
         crate::stats::time(crate::stats::Stage::Settle, || {
             // the frame that was asked for is this one. A request made
             // DURING the settle — a pump that scrolls, a task that asks —
@@ -6884,7 +6890,7 @@ impl Runtime {
             // the tasks land first, whatever follows: a wake made one
             // ready, and what it writes is a reason below
             self.poll_tasks();
-            if !asked && self.settle_is_quiet() {
+            if !asked && self.settle_is_quiet(std::any::TypeId::of::<R>()) {
                 // Nothing could have moved a body: no write since the last
                 // settled pass, nothing dirty, no task ready, the theme and
                 // the environment still, the insets where they were. A
@@ -6916,10 +6922,17 @@ impl Runtime {
 
     /// Could a pass change anything? False when something was written
     /// since the last settled pass, a view is dirty, a task is ready, the
-    /// theme or the environment moved, the insets moved, or no pass ever
-    /// ran — the reasons a body re-runs for, read without a walk.
-    fn settle_is_quiet(&self) -> bool {
+    /// theme or the environment moved, the insets moved, no pass ever ran,
+    /// the last pass rendered ANOTHER root view (a probe's second surface
+    /// has bodies of its own to run), or the root is no retained boundary
+    /// at all — a root of plain views is rebuilt by every pass, its tasks
+    /// and effects declared anew each time, and only a pass can see what
+    /// the new value declares — the reasons a body re-runs for, read
+    /// without a walk.
+    fn settle_is_quiet(&self, root: std::any::TypeId) -> bool {
         self.last_root.borrow().is_some()
+            && self.last_root_type.get() == Some(root)
+            && self.root_boundary.borrow().is_some()
             && motor::identity::scene_epoch() == self.settled_epoch.get()
             && !motor::task::has_ready()
             && crate::theme::version() == self.theme_version.get()
@@ -6957,8 +6970,9 @@ impl Runtime {
     /// dirty, the theme and the environment did not move, and the root
     /// boundary of the last pass is still retained. Such a pass would
     /// skip the root, run no body and produce exactly this reference.
-    fn stable_boundary(&self) -> Option<String> {
-        (crate::theme::version() == self.theme_version.get()
+    fn stable_boundary(&self, root: std::any::TypeId) -> Option<String> {
+        (self.last_root_type.get() == Some(root)
+            && crate::theme::version() == self.theme_version.get()
             && !self.env_moved.get()
             && !self.has_pending_dirty())
         .then(|| self.root_boundary.borrow().clone())
