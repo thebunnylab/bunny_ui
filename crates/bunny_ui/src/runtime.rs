@@ -3752,7 +3752,40 @@ impl Runtime {
         text: &str,
         field: &crate::layout::FieldPlacement,
     ) -> std::rc::Rc<Vec<(usize, usize)>> {
-        self.cache.get_or_break(text, &field.font, field.run.size.width, &*self.text)
+        if field.multiline {
+            // the field's own lines, kept between its edits — the same
+            // state the placement reads and writes
+            self.cache.field_lines(&field.path, text, None, &field.font, field.run.size.width, &*self.text)
+        } else {
+            self.cache.get_or_break(text, &field.font, field.run.size.width, &*self.text)
+        }
+    }
+
+    /// Where a byte of a field's text stands, as a caret-wide rect in the
+    /// scene: the input method places its window by it. A note answers
+    /// from its own lines — the byte's line, and the stretch of that line
+    /// before it — so nothing is shaped but one line's head; a one-line
+    /// field measures its head as it always did. The height is the line's.
+    fn field_byte_rect(
+        &self,
+        field: &crate::layout::FieldPlacement,
+        text: &str,
+        byte: usize,
+    ) -> Rect {
+        let byte = crate::text_input::clamp_index(text, byte);
+        let (x, y) = if field.multiline {
+            let lines = self.wrap(text, field);
+            let row = crate::layout::line_of(&lines, byte);
+            let start = lines.get(row).map_or(0, |line| line.0).min(byte);
+            let head = self.cache.get_or_measure(&text[start..byte], &field.font, &*self.text).width;
+            (head, row as Px * field.line_height)
+        } else {
+            (self.cache.get_or_measure(&text[..byte], &field.font, &*self.text).width, 0.0)
+        };
+        Rect {
+            origin: Point { x: field.text_origin.x + x, y: field.text_origin.y + y },
+            size: crate::layout::Size { width: 1.5, height: field.line_height },
+        }
     }
 
     /// The run follows the caret: the field scrolls its own text so the
@@ -4047,12 +4080,7 @@ impl Runtime {
             .iter()
             .find(|field| field.path == path)
             .cloned()?;
-        let metrics = self.cache.get_or_measure(&text, &field.font, &*self.text);
-        let prefix = self.cache.get_or_measure(&text[..caret], &field.font, &*self.text).width;
-        let caret_rect = Rect {
-            origin: Point { x: field.text_origin.x + prefix, y: field.text_origin.y },
-            size: crate::layout::Size { width: 1.5, height: metrics.height() },
-        };
+        let caret_rect = self.field_byte_rect(&field, &text, caret);
 
         Some(ImeSnapshot { text, selected, marked, caret_rect })
     }
@@ -4109,12 +4137,7 @@ impl Runtime {
         let mut probe = CaretState::default();
         let text = reconciler::run_editor(&path, EditCommand::Read, &mut probe)??;
         let byte = crate::text_input::utf16_to_byte(&text, utf16);
-        let metrics = self.cache.get_or_measure(&text, &field.font, &*self.text);
-        let prefix = self.cache.get_or_measure(&text[..byte], &field.font, &*self.text).width;
-        Some(Rect {
-            origin: Point { x: field.text_origin.x + prefix, y: field.text_origin.y },
-            size: crate::layout::Size { width: 1.5, height: metrics.height() },
-        })
+        Some(self.field_byte_rect(&field, &text, byte))
     }
 
     /// Dom mode's sync door: the BROWSER's input owns the editing there,

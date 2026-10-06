@@ -3424,10 +3424,26 @@ pub struct FieldPlacement {
 /// caret at a break belongs to the line it was typed on and not to the
 /// one after. Never empty — a field always has at least one line.
 pub fn line_of(lines: &[(usize, usize)], byte: usize) -> usize {
-    lines
-        .iter()
-        .position(|&(_, end)| byte <= end)
-        .unwrap_or(lines.len().saturating_sub(1))
+    // the lines run in order, so their ends do: the first end that
+    // reaches the byte is found by halving, not by walking a note
+    let row = lines.partition_point(|&(_, end)| end < byte);
+    if row < lines.len() { row } else { lines.len().saturating_sub(1) }
+}
+
+/// The widths a note asks for when its parent proposes none. A short
+/// note keeps the answer it always had (the whole string, measured); a
+/// long one is as wide as its widest paragraph, each measured on its own
+/// and kept — shaping a document as one line would be the cost of the
+/// document, and the widest paragraph is the honest width anyway.
+fn note_natural_width(sample: &str, env: &LayoutEnv<'_>) -> Px {
+    const MEASURED_WHOLE: usize = 4096;
+    if sample.len() <= MEASURED_WHOLE {
+        return env.cache.get_or_measure(sample, &env.font, env.text).width;
+    }
+    sample
+        .split('\n')
+        .map(|paragraph| env.cache.get_or_measure(paragraph, &env.font, env.text).width)
+        .fold(0.0, Px::max)
 }
 
 /// Block/underline carets cover the next glyph at a soft wrap. Keep this
@@ -5014,7 +5030,7 @@ impl LayoutNode {
                 (size, Fit::Leaf)
             }
 
-            LayoutNode::Field { content, placeholder, multiline, secret, .. } => {
+            LayoutNode::Field { path, content, placeholder, multiline, secret, .. } => {
                 let shown;
                 let content: &str = if *secret {
                     shown = crate::text_input::masked(content);
@@ -5023,21 +5039,28 @@ impl LayoutNode {
                     content
                 };
                 let sample: &str = if content.is_empty() { placeholder } else { content };
-                let metrics = env.cache.get_or_measure(sample, &env.font, env.text);
-                let natural = metrics.width + 2.0 * FIELD_PAD_H;
-                let width = proposal.width.unwrap_or(natural);
-                let height = match multiline {
-                    // the box the parent gives, and the text wraps
-                    // INSIDE it: a long line never widens the column,
-                    // and a tall text never grows the box — it scrolls
-                    true => proposal.height.unwrap_or_else(|| {
+                if *multiline {
+                    // the box the parent gives, and the text wraps INSIDE
+                    // it: a long line never widens the column, and a tall
+                    // text never grows the box — it scrolls. The line
+                    // height is a probe's, as the placement's is: a note
+                    // is never shaped whole as one line to learn it
+                    let line_h = env.cache.get_or_measure("0", &env.font, env.text).height();
+                    let width = proposal
+                        .width
+                        .unwrap_or_else(|| note_natural_width(sample, env) + 2.0 * FIELD_PAD_H);
+                    let height = proposal.height.unwrap_or_else(|| {
                         let inner = (width - 2.0 * FIELD_PAD_H).max(1.0);
-                        let lines = env.cache.get_or_break(sample, &env.font, inner, env.text);
-                        lines.len() as Px * metrics.height() + 2.0 * FIELD_PAD_V
-                    }),
-                    false => metrics.height() + 2.0 * FIELD_PAD_V,
-                };
-                (Size { width, height }, Fit::Leaf)
+                        let lines =
+                            env.cache.field_lines(path, sample, None, &env.font, inner, env.text);
+                        lines.len() as Px * line_h + 2.0 * FIELD_PAD_V
+                    });
+                    (Size { width, height }, Fit::Leaf)
+                } else {
+                    let metrics = env.cache.get_or_measure(sample, &env.font, env.text);
+                    let width = proposal.width.unwrap_or(metrics.width + 2.0 * FIELD_PAD_H);
+                    (Size { width, height: metrics.height() + 2.0 * FIELD_PAD_V }, Fit::Leaf)
+                }
             }
 
             LayoutNode::Leaf { size } => (*size, Fit::Leaf),
@@ -5732,7 +5755,7 @@ impl LayoutNode {
                 let single = [(0usize, sample.len())];
                 let broken;
                 let lines: &[(usize, usize)] = if multiline {
-                    broken = env.cache.get_or_break(sample, &env.font, inner, env.text);
+                    broken = env.cache.field_lines(path, sample, Some(sample), &env.font, inner, env.text);
                     &broken
                 } else {
                     &single
@@ -5768,13 +5791,21 @@ impl LayoutNode {
                 } else {
                     out.foreground.last().copied().unwrap_or(theme.fg)
                 };
-                for (index, &(start, end)) in lines.iter().enumerate() {
+                // a note of a thousand lines pays for the ones that show —
+                // the same discipline the row window keeps, and the walk
+                // starts at the first of them (a line before it is checked
+                // anyway, for the rounding)
+                let first = if line_h > 0.0 {
+                    (((frame.origin.y - text_origin.y) / line_h).floor().max(0.0) as usize).saturating_sub(1)
+                } else {
+                    0
+                };
+                for (index, &(start, end)) in lines.iter().enumerate().skip(first) {
                     let y = text_origin.y + index as Px * line_h;
-                    // a note of a thousand lines pays for the ones that
-                    // show — the same discipline the row window keeps
-                    if y + line_h <= frame.origin.y
-                        || y >= frame.origin.y + frame.size.height
-                    {
+                    if y >= frame.origin.y + frame.size.height {
+                        break;
+                    }
+                    if y + line_h <= frame.origin.y {
                         continue;
                     }
                     // selection behind the text
