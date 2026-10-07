@@ -53,6 +53,20 @@ by the requested duration plus two seconds, including the one-second grace. Miss
 completion is a failed workload and its observed CPU, memory and GPU values are excluded from
 rankings. These markers are outside the steady CPU counter window.
 
+Typing and append also require the `editor-tail-v1` state contract. The editor starts focused,
+with a collapsed selection at the document's end and that caret in view. Before the first
+mutation, `EDITOR_READY` reports its Unix timestamp, `length_utf16`, `caret_utf16` and
+`selection_utf16` from the live editor. `EDITOR_DONE` reports the same fields plus `text_ok`
+after comparing the entire final document with the requested sequence: append adds exactly
+the requested number of `x` characters; alternating typing restores the original for an even
+count and leaves one trailing `x` for an odd count. Both observations use UTF-16 units.
+
+The final observation happens before `SCRIPT_DONE`, after the measured window. The original
+fixture is reloaded there, so an extra full document is not held throughout measurement.
+Missing state, an incorrect caret/selection or `text_ok=0` rejects the editor row even when
+event counts match. Earlier editor measurements below predate these state witnesses; they
+describe their recorded Bunny fixture, not a comparison with a verified common starting state.
+
 The historical before/after tables below use the preserved script implementation from their
 source revisions. Binaries with the absolute-deadline protocol need a fresh comparison session.
 
@@ -203,3 +217,67 @@ scratch consumer suite passes 2,889 tests with 44 ignored. Actual-window capture
 typing pixels exactly at both document sizes; append differs by at most two channel levels
 from corrected Metal. Crop-versus-whole raster and Metal parity are checked at scales 1 and 2.
 Apple strict clippy has the same 43 existing diagnostics as the baseline, with none introduced.
+
+## The absolute-deadline round (2026-10-07)
+
+Three interleaved release rounds on the same M5 Max, macOS 27.0 and 1680×1050 display at
+60 Hz use renderer `18eca8e` and arena `9ebf5bb`. The table, editor and chat use the fixed
+Menlo fixture. All Bunny workloads completed within the protocol limits above. The first
+CPU canary was 54.014 ms; the 70.2182 ms admission limit stayed fixed, and refused starts
+waited for a quiet window.
+
+CPU is percent of one core from two kernel-counter reads, with frame and GPU tracing off.
+Active scripts last ten seconds; their CPU window is seconds 1–9 after `SCRIPT_START`.
+The looping canvas uses seconds 2–8 after its first frame. Rest lasts twenty seconds and
+uses seconds 10–18. Physical footprint is read after each CPU window and includes the
+process's graphics allocations; it is neither allocation count nor total desktop memory.
+
+| scene | median CPU | median physical footprint |
+|---|---:|---:|
+| table at rest | 0.0121% | 33 MB |
+| table under the wheel | 7.1518% | 196 MB |
+| type, 400 lines | 0.6018% | 32 MB |
+| type, 30,000 lines | 0.8840% | 49 MB |
+| append, 30,000 lines | 1.4055% | 46 MB |
+| chat streaming | 1.5477% | 35 MB |
+| looping canvas | 2.0015% | 32 MB |
+
+The median spawn-to-first-frame announcement is 78.61 ms over fifteen separate launches.
+This is the fixture's first root pass, not a measured first pixel on the display. These
+absolute values belong to this session; changes from historical tables are not an A/B
+engine speedup, since the input protocol and collection method also changed.
+
+
+## Editors with state witnesses (2026-10-07)
+
+The `editor-tail-v1` fixture at `e3274a6` keeps renderer `18eca8e` and the same machine,
+font and CPU collection windows. Three interleaved release rounds validate the actual
+initial and final UTF-16 selection and complete text, alongside the existing input deadlines.
+All nine Bunny samples pass both protocols. The first CPU canary was 53.496708 ms; its
+69.5457204 ms admission limit stayed fixed.
+
+| scene | median CPU | median physical footprint | valid rounds |
+|---|---:|---:|---:|
+| type, 400 lines | 0.6060% | 32 MB | 3 |
+| type, 30,000 lines | 0.8983% | 49 MB | 3 |
+| append, 30,000 lines | 1.3553% | 47 MB | 3 |
+
+These are freshly calibrated absolute observations, not a renderer speedup over the preceding
+round. Physical footprint remains distinct from allocated bytes or allocation counts.
+
+
+A separate GPU pass ran each editor script for thirty seconds and recorded seven seconds
+starting three seconds after `SCRIPT_START`. All nine Bunny samples passed actual-state and
+input-deadline validation. No CPU ranking was collected during GPU tracing.
+
+| scene | median app GPU | median app + WindowServer | observed total range |
+|---|---:|---:|---:|
+| type, 400 lines | 0 ms/s | 1.3070 ms/s | 0.7149–1.4563 ms/s |
+| type, 30,000 lines | 0 ms/s | 0.7165 ms/s | 0.6971–1.0908 ms/s |
+| append, 30,000 lines | 0 ms/s | 1.4104 ms/s | 0.8084–1.5297 ms/s |
+
+The WindowServer column observes the system compositor globally; it is not an exclusive
+attribution to this window. A zero app-GPU value does not mean that presenting the window
+costs no GPU work. The ranges retain the compositor variation instead of hiding it behind
+the median. Frozen executable/resource hashes and collector sources still match after all
+three phases.
