@@ -6,8 +6,8 @@ that a worker thread paces with a real clock, and exits on its own.
 
 ```bash
 cargo build --release -p arena
-BUNNY_PRESENT_TRACE=/tmp/table-{pid}.trace BUNNY_FRAME_STATS=1 \
-  target/release/arena_table --script wheel --secs 3 --rows 10000
+BUNNY_WINDOW_FLOATING=1 \
+  target/release/arena_table --script wheel --secs 10 --rows 10000
 ```
 
 ## Scenes
@@ -25,6 +25,12 @@ character ten times a second and nothing else, so every stroke is a text the eng
 seen; `stream` appends every 33 ms. Steps are raised through the shell's own door (`bunny_ui_macos::drive`), the same one the
 window system's callbacks use — no synthesized system events, no accessibility permission.
 
+The table, editor and chat name **Menlo** explicitly (12 pt in the table's cells, 13 pt in the
+editor and chat). The font is part of the macOS fixture and must be installed; a platform's
+default face changes glyph widths, wrapping and raster work. Record the installed font's digest
+alongside the executable's digest. The historical tables below predate this fixed-face fixture
+and must not be mixed with its measurements.
+
 Every app prints `FIRST_FRAME <unix ms>` once, when its root has run its first pass; the launch
 cost is that line against the spawn time. A scripted run also prints `SCRIPT_START <unix ms>` when
 its first step is about to be sent, and the stretch a scene is measured over is anchored there —
@@ -34,7 +40,18 @@ time or into the launch. The fixtures (`rows-10k.tsv`, `lines-400.txt`,
 
 ## What is read
 
-The present tape (`BUNNY_PRESENT_TRACE`, with `BUNNY_FRAME_STATS=1`):
+CPU and footprint runs leave `BUNNY_PRESENT_TRACE` and `BUNNY_FRAME_STATS` unset. Detailed
+tracing changes the work being measured: four interleaved runs of the same fixed-face binary
+measured a wheel median of 14.968% CPU with both enabled and 7.203% with both disabled. That
+difference is diagnostic overhead, not an engine improvement. Collect the present tape and
+frame histograms in a separate pass:
+
+```bash
+BUNNY_WINDOW_FLOATING=1 BUNNY_PRESENT_TRACE=/tmp/table-{pid}.trace BUNNY_FRAME_STATS=1 \
+  target/release/arena_table --script wheel --secs 10 --rows 10000
+```
+
+The present tape contains:
 
 - `F` — a frame's CPU half: `settle=` (bodies and effects), `layout=` (measure and place), `place=`.
 - `P` — a present, with the drawable's size and the command count; `P` lines per second at rest
@@ -46,14 +63,17 @@ The present tape (`BUNNY_PRESENT_TRACE`, with `BUNNY_FRAME_STATS=1`):
 - `Q` — a change presented through the patch layer (its box, and `moved` when the box changed),
   or the patch stepping aside.
 
-Around the process: its CPU time (`ps`) at the start and the end of the script's active stretch —
+Around the process: its CPU time from the kernel at the start and the end of the script's active stretch —
 the CPU column is that difference over the wall time between them (`top`'s once-a-second samples
 miss short bursts and are kept only as a second view); `footprint` for the physical footprint and
 the graphics memory it holds (IOAccelerator, IOSurface), read when the window has rested long
 enough for the Metal driver's launch-time allocations to drain (seconds after a launch every Metal
 app holds 100–300 MB that are gone ten seconds later); `ioreg`'s accelerator statistics for the
 device's utilization against an idle baseline; and, in a separate pass, Instruments' Metal
-Application recording for the GPU time of every command buffer.
+Application recording for the GPU's execution intervals, keeping the app, global WindowServer
+and other processes separate. WindowServer activity is an observation of the whole desktop;
+it cannot all be attributed exclusively to the measured app. Read footprint after the CPU
+counter window closes, and retain the raw counter values and actual sample times.
 
 ## Rules
 
@@ -104,4 +124,3 @@ compositing it, in milliseconds per second.
 
 Absolute CPU percentages move between sessions on this machine (a busy machine schedules the same
 work differently), which is why only the interleaved pairs above are compared.
-

@@ -17,6 +17,11 @@ pub const STEPS_PER_SECOND: u64 = 240;
 /// The window every arena app opens: the workbench's own size.
 pub const WINDOW: (f64, f64) = (1280.0, 800.0);
 
+/// The face shared by the text-bearing macOS scenes. Naming the face is
+/// part of the fixture: a platform's default would change glyph widths,
+/// wrapping and raster work between measurements. It must be installed.
+pub const FONT_FAMILY: &str = "Menlo";
+
 /// What the script asked for, from the command line.
 #[derive(Clone, Debug)]
 pub struct Args {
@@ -30,7 +35,12 @@ impl Args {
     /// `--script S --secs N --rows N --lines N`, with the arena's defaults.
     #[must_use]
     pub fn parse() -> Args {
-        let mut args = Args { script: "rest".to_owned(), secs: 30.0, rows: 10_000, lines: 400 };
+        let mut args = Args {
+            script: "rest".to_owned(),
+            secs: 30.0,
+            rows: 10_000,
+            lines: 400,
+        };
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             let value = it.next();
@@ -72,7 +82,11 @@ pub fn rows(count: usize) -> Vec<[String; 6]> {
 /// The editor's text: `lines-400.txt` or `lines-30k.txt`.
 #[must_use]
 pub fn lines(count: usize) -> String {
-    let file = if count > 400 { "lines-30k.txt" } else { "lines-400.txt" };
+    let file = if count > 400 {
+        "lines-30k.txt"
+    } else {
+        "lines-400.txt"
+    };
     std::fs::read_to_string(fixtures().join(file)).unwrap_or_default()
 }
 
@@ -80,7 +94,9 @@ pub fn lines(count: usize) -> String {
 /// orchestrator and every app share.
 #[must_use]
 pub fn unix_ms() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis())
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
 }
 
 /// Says the first frame happened, once. Called from a `.task` on the root,
@@ -120,7 +136,11 @@ pub fn play(args: &Args, over: (f64, f64), send: impl Fn(Step) -> bool) {
             let pause = Duration::from_micros(1_000_000 / STEPS_PER_SECOND);
             for step in 0..steps {
                 let dy = if step < steps / 2 { -6.0 } else { 6.0 };
-                if !send(Step::Wheel { x: over.0, y: over.1, dy }) {
+                if !send(Step::Wheel {
+                    x: over.0,
+                    y: over.1,
+                    dy,
+                }) {
                     return;
                 }
                 std::thread::sleep(pause);
@@ -133,7 +153,11 @@ pub fn play(args: &Args, over: (f64, f64), send: impl Fn(Step) -> bool) {
             let strokes = (secs * 10.0) as u64;
             let append = args.script == "append";
             for stroke in 0..strokes {
-                let step = if append || stroke % 2 == 0 { Step::Type('x') } else { Step::Backspace };
+                let step = if append || stroke % 2 == 0 {
+                    Step::Type('x')
+                } else {
+                    Step::Backspace
+                };
                 if !send(step) {
                     return;
                 }
@@ -171,7 +195,12 @@ pub fn raise(step: Step) {
 /// The script, mounted on a view: the worker starts when the view first
 /// appears, the first frame is announced, and `Done` ends the process.
 /// `on_step` sees every step before it is raised — a stream appends there.
-pub fn scripted<V: View<Arity = Single>>(view: V, args: Args, over: (f64, f64), on_step: impl Fn(Step) + 'static) -> impl View {
+pub fn scripted<V: View<Arity = Single>>(
+    view: V,
+    args: Args,
+    over: (f64, f64),
+    on_step: impl Fn(Step) + 'static,
+) -> impl View {
     let on_step = std::rc::Rc::new(on_step);
     view.task(move || {
         let args = args.clone();
