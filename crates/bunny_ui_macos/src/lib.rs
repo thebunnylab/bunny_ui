@@ -53,6 +53,13 @@ fn sync_frame_driver(runtime: &Runtime, pacer: &FramePacer, window: usize) {
     // the task alarm follows the nearest sleeper; it is no reason for
     // the display to beat
     ffi::aim_tasks(runtime.next_task_wake());
+    // A covered view can lose its display link without consuming the
+    // pending frame. Keep the recovery clock while the link is wanted,
+    // including a spring that has no pending input frame yet.
+    ffi::want_blink(
+        window,
+        runtime.slow_tick_needed() || pacer.pending().count > 0 || wanted == ffi::DriverPace::Full,
+    );
     // parking: the presenter lets its frames go and offers its atlas back
     // to the system while the window rests
     thread_local! {
@@ -2048,6 +2055,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // them with it, and the slot the app drops right after this
             // carries the runtime — and with it the retained tree, the
             // scene's world and every task hanging off it.
+            // The platform already forgot this window's clock requests.
+            // Do not put them back through the ordinary event tail.
+            return;
         }
         AppEvent::DialogClose { window: which } => {
             // the red button: the window did NOT close (the delegate
@@ -2327,8 +2337,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // The net under the beat. The display link belongs to ONE view,
             // and the system stops it while that view is hidden; asks that
             // wait for a beat that does not come would wait for ever. This
-            // timer always runs: half a second later, at the worst, they
-            // are drawn here.
+            // timer stays armed while a frame waits: half a second later,
+            // at the worst, it is drawn here.
             if handler_pacer.pending().count > 0 && !handler_resizing() {
                 blit(runtime, root, trace::Origin::Blink);
             }
