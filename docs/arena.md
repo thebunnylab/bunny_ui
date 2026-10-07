@@ -146,3 +146,42 @@ Rest CPU fell by 57.2%, with a lower value in every pair; the absolute saving is
 Wheel remained within run-to-run variation. Normal and paranoid runs each passed 896 engine
 tests and 27 native-shell tests; the full scratch consumer suite passed 2,889 tests with
 44 ignored. These measurements make no allocation or GPU claim.
+
+## Small opaque patches (fixed-face fixture)
+
+On macOS, a small opaque patch can use the software raster and a `CALayer` backed by an
+IOSurface. The strategy accepts at most 128 Ki physical pixels, 64 commands, 4 KiB of text
+and 128 Ki pixels of text raster work. Unsupported paint or a busy surface pool takes the
+existing Metal path. Each patch keeps at most three surfaces; the current surface and any
+surface the compositor still uses are protected. A DeviceRGB tag preserves the Metal layer's
+colour appearance.
+
+Interleaved release pairs on the same M5 Max and display compare this strategy with the
+preceding Metal-only build, including the texel-centre correctness fix (`83dcb3f`). CPU uses
+kernel counters from seconds 1–9 after the script starts, with tracing off. Footprint is read
+after that counter window, during the active scene; it is physical memory, not allocation count.
+
+| scene | pairs | CPU before | CPU after | footprint before / after |
+|---|---|---|---|---|
+| append, 30,000 lines | 6 | 1.850% | 1.569% | 195.5 / 45.5 MB (two separate pairs) |
+| type, 400 lines | 4 | 0.790% | 0.590% | 182 / 32 MB |
+| table under the wheel | 4 | 6.920% | 7.091% | 195 / 195 MB |
+| chat streaming | 4 | 1.495% | 1.533% | 33.5 / 35 MB |
+
+Append CPU fell by 15.2%, lower in all six pairs; typing fell by 25.4%, lower in all four.
+Wheel and streaming each increased by 2.5%, below the 5% regression guard, with variation across pairs.
+Typing's footprint reduction is mostly driver-owned graphics memory: the unmapped graphics
+category was 145 MB before and about 1.2 MB after in the first pair. These small edits no
+longer keep submitting Metal work while the initial frame's driver allocations can drain.
+
+Three separate interleaved GPU pairs of append at 30,000 lines measure a median observed app
+plus global WindowServer cost of 1.809 → 1.234 ms/s, 31.8% lower and lower in every pair.
+The app's median is 0.602 → 0.000 ms/s; WindowServer's is 1.207 → 1.234 ms/s. The software
+path still needs composition, and the global WindowServer figure is not exclusive attribution
+to this window. These GPU traces are separate from every CPU measurement above.
+
+Normal and paranoid runs each pass 896 engine, 66 Apple and 27 native-shell tests; the complete
+scratch consumer suite passes 2,889 tests with 44 ignored. Actual-window captures preserve
+typing pixels exactly at both document sizes; append differs by at most two channel levels
+from corrected Metal. Crop-versus-whole raster and Metal parity are checked at scales 1 and 2.
+Apple strict clippy has the same 43 existing diagnostics as the baseline, with none introduced.
