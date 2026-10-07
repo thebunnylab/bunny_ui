@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "bunny-ui",
  "bunny-ui-macos",
+ "serde_json",
 ]
 
 [[package]]

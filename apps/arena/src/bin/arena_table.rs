@@ -1,12 +1,10 @@
 //! Ten thousand rows of six columns in a virtual list: at rest, under the
 //! wheel, or soaking.
-use arena::{Args, FONT_FAMILY, Step, WINDOW, rows, scripted};
-use bunny_ui::layout::{Color, Size};
+use arena::{Args, FONT_FAMILY, WINDOW, rows};
+use bunny_ui::layout::Color;
 use bunny_ui::prelude::*;
 
 const ROW_H: f64 = 24.0;
-/// A point over the rows, in layout points.
-const OVER: (f64, f64) = (WINDOW.0 * 0.5, WINDOW.1 * 0.5);
 const WIDTHS: [f64; 6] = [70.0, 300.0, 90.0, 140.0, 90.0, 110.0];
 
 #[derive(Clone)]
@@ -19,15 +17,9 @@ impl Component for Table {
         let rows = self.rows.clone();
         let count = rows.len();
         vstack!(
-            hstack!(
-                text!("{count} rows").font_size(13.0).bold(),
-                spacer(),
-                text!("the arena · table")
-                    .font_size(12.0)
-                    .foreground_color(Color::OUTLINE),
-            )
-            .padding_length(10.0)
-            .frame_height(40.0),
+            hstack!(text!("{count} rows").font_size(13.0), spacer(),)
+                .padding_edge(Edge::Leading, 12.0)
+                .frame_height(40.0),
             virtual_list(
                 count,
                 |i| format!("row-{i}"),
@@ -39,16 +31,28 @@ impl Component for Table {
                         Color::hex(0x17171C)
                     };
                     hstack!(
-                        text!(c0).font_size(12.0).frame_width(WIDTHS[0]),
-                        text!(c1).font_size(12.0).frame_width(WIDTHS[1]),
-                        text!(c2).font_size(12.0).frame_width(WIDTHS[2]),
-                        text!(c3).font_size(12.0).frame_width(WIDTHS[3]),
-                        text!(c4).font_size(12.0).frame_width(WIDTHS[4]),
-                        text!(c5).font_size(12.0).frame_width(WIDTHS[5]),
+                        text!(c0)
+                            .font_size(12.0)
+                            .frame_width_aligned(WIDTHS[0], Alignment::Leading),
+                        text!(c1)
+                            .font_size(12.0)
+                            .frame_width_aligned(WIDTHS[1], Alignment::Leading),
+                        text!(c2)
+                            .font_size(12.0)
+                            .frame_width_aligned(WIDTHS[2], Alignment::Leading),
+                        text!(c3)
+                            .font_size(12.0)
+                            .frame_width_aligned(WIDTHS[3], Alignment::Leading),
+                        text!(c4)
+                            .font_size(12.0)
+                            .frame_width_aligned(WIDTHS[4], Alignment::Leading),
+                        text!(c5)
+                            .font_size(12.0)
+                            .frame_width_aligned(WIDTHS[5], Alignment::Leading),
                     )
                     .spacing(8.0)
                     .padding_edge(Edge::Leading, 12.0)
-                    .frame_height(ROW_H)
+                    .frame_aligned(WINDOW.0, ROW_H, Alignment::Leading)
                     .background_color(shade)
                 }
             )
@@ -56,6 +60,8 @@ impl Component for Table {
         )
         .spacing(0.0)
         .font_family(FONT_FAMILY)
+        .foreground_color(Color::hex(0xE6E6EA))
+        .background_color(Color::hex(0x17171C))
     }
 }
 
@@ -64,12 +70,13 @@ fn main() {
     let table = Table {
         rows: std::rc::Rc::new(rows(args.rows)),
     };
-    bunny_ui_macos::run_window(
+    let count = table.rows.len();
+    arena::scene::run(
         "arena — table",
-        Size {
-            width: WINDOW.0,
-            height: WINDOW.1,
-        },
-        scripted(table, args, OVER, |_: Step| {}),
+        "table",
+        table,
+        args,
+        |_| {},
+        move || serde_json::json!({"item_count": count}),
     );
 }

@@ -70,6 +70,38 @@ describe their recorded Bunny fixture, not a comparison with a verified common s
 The historical before/after tables below use the preserved script implementation from their
 source revisions. Binaries with the absolute-deadline protocol need a fresh comparison session.
 
+## Non-editor geometry and work
+
+The non-editor fixtures use `scene-geometry-v1`. The table has a 40 pt header above a
+1280×760 viewport, 24 pt rows with no gaps, and six left-aligned columns of 70/300/90/140/90/110 pt.
+Column gaps are 8 pt and the leading inset is 12 pt. Streaming starts empty at the top of a
+1280×800 viewport, with 28 pt rows, an 8 pt leading inset and one exact message per append.
+Both lists paint alternating row backgrounds across the viewport width. Their floor colour
+is `17171c`, the other stripe is `1c1c21`, and text is regular Menlo in `e6e6ea`.
+
+The canvas has the same 40 pt header, with a 240×240 drawing box at `(0,40)`. A 12 pt square
+in `e69933` follows a 72 pt radius orbit over two seconds. Headers use 13 pt regular Menlo
+with a 12 pt leading inset. Text stays vertically centred; native font rasterization remains
+part of the implementation being measured.
+
+`SCENE_READY` and `SCENE_DONE` report the actual layout, held scroll offset and content state
+at input boundaries. The observer uses the window's root and runtime, with an extra layout
+before the first input or after completion, outside the CPU counter window. Rest has no input
+and reports only completion. Streaming completion verifies every stored message and its count;
+an unchanged offset at the top is part of the scene, even after content exceeds the viewport.
+
+A separate `ARENA_SCENE_DIAGNOSTIC=1` run establishes actual motion. For `wheel`, it sends
+120 downward events at 240 Hz, allows one second to settle, records `SCENE_DOWN`, then repeats
+upward and records `SCENE_UP`. The expected settled offsets are 0 → 720 → 0 pt. For the canvas,
+`CANVAS_FRAME` samples the actual paint rectangle, marker and phase across wall time. These
+are paint observations, not presentation counts or input-to-photon measurements. The diagnostic
+changes the workload and must be unset for CPU, footprint and GPU runs.
+
+Admission combines observed geometry and content, own-window visual inspection, and separate
+motion diagnostics. Preserve their source and executable hashes with the frozen measurement
+session; completion counters alone cannot prove that content was drawn. Earlier non-editor
+tables below describe their recorded fixtures and predate this geometry contract.
+
 ## What is read
 
 CPU and footprint runs leave `BUNNY_PRESENT_TRACE` and `BUNNY_FRAME_STATS` unset. Detailed
@@ -115,6 +147,11 @@ the session; the display awake (a sleeping display stops every display link, and
 app never reports a frame); every window floated above the others (`BUNNY_WINDOW_FLOATING`), since
 a window opened from a background process lands behind the front one, and a covered window is a
 different workload; medians over runs; absolutes compared only inside one session's table.
+The graphical session must also remain unlocked: an awake display alone is insufficient.
+Read console/login/lock/display state before and after every sample, and sample it every
+500 ms in the parent collector. Preserve those observations and reject an observed lock or
+a sampling gap longer than 1.5 seconds; transitions between polls are not claimed observable. A window can still report layout and yield an own-window image
+while its native surface is occluded; neither observation alone admits a performance run.
 
 ## bunny_ui's own numbers
 
@@ -281,3 +318,50 @@ attribution to this window. A zero app-GPU value does not mean that presenting t
 costs no GPU work. The ranges retain the compositor variation instead of hiding it behind
 the median. Frozen executable/resource hashes and collector sources still match after all
 three phases.
+
+## The explicit-geometry round (2026-10-07)
+
+Fixture `ad47db9` implements `scene-geometry-v1` with renderer `18eca8e` unchanged.
+The same M5 Max, macOS 27.0 and 1680×1050 display at 1×/60 Hz run three interleaved
+release rounds. Separate unlocked-window diagnostics establish actual list geometry,
+settled wheel travel, exact streaming content and sampled visible canvas motion before
+the executables are frozen. They do not establish presentation counts.
+
+All twelve Bunny steady-state samples pass workload, geometry and host admission. CPU
+uses two kernel-counter reads; physical footprint is read after that window. Active input
+uses seconds 1–9 after script start, rest uses seconds 10–18 after first frame, and the
+canvas uses seconds 2–8. Tracing and diagnostic capture are disabled.
+
+| scene | CPU median | physical footprint median | valid samples |
+|---|---|---|---|
+| table at rest | 0.012239% | 33 MB | 3/3 |
+| table under the wheel | 6.993010% | 195 MB | 3/3 |
+| chat streaming | 4.141815% | 185 MB | 3/3 |
+| looping canvas | 2.070548% | 41 MB | 3/3 |
+
+These are the explicit geometry fixtures, including full-width alternating row backgrounds.
+Older non-editor figures above retain their different scene definitions; comparing them
+with this table is not a renderer before/after experiment. Footprint is not allocation count.
+
+Fifteen table launches have a median first-frame marker latency of **78.617 ms**
+(range **73.338–82.799 ms**). This is an application startup marker, not input-to-photon
+or confirmed first-pixel latency. All fifteen launches pass admission.
+
+
+A separate GPU pass runs thirty-second scripts and records seven seconds beginning
+three seconds after script start, or after the first frame for rest and canvas.
+All twelve Bunny GPU samples pass workload, geometry and host admission. CPU is not
+ranked during this tracing pass. Values below are GPU milliseconds per wall second.
+
+| scene | app median | WindowServer median | app + WindowServer median | observed total range |
+|---|---:|---:|---:|---:|
+| table at rest | 0.0000 | 0.1025 | 0.1025 | 0.0671–0.9623 |
+| table under the wheel | 9.8921 | 20.4738 | 30.3572 | 30.2074–30.3659 |
+| chat streaming | 1.6771 | 9.6015 | 11.2786 | 11.2540–11.5524 |
+| looping canvas | 0.0000 | 3.1895 | 3.1895 | 2.1253–6.0642 |
+
+WindowServer is the global compositor, not an exclusive charge to this window. Its
+variation remains visible in the ranges; the idle totals do not establish a GPU ranking.
+The zero app-GPU value for the software canvas does not imply zero presentation cost.
+Executable, resource, calibration-evidence and collector hashes match after the complete
+CPU and GPU passes. This round calibrates fixtures; it changes no renderer strategy.
