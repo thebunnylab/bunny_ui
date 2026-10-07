@@ -246,3 +246,21 @@ The median spawn-to-first-frame announcement is 78.61 ms over fifteen separate l
 This is the fixture's first root pass, not a measured first pixel on the display. These
 absolute values belong to this session; changes from historical tables are not an A/B
 engine speedup, since the input protocol and collection method also changed.
+
+
+## Editors with state witnesses (2026-10-07)
+
+The `editor-tail-v1` fixture at `e3274a6` keeps renderer `18eca8e` and the same machine,
+font and CPU collection windows. Three interleaved release rounds validate the actual
+initial and final UTF-16 selection and complete text, alongside the existing input deadlines.
+All nine Bunny samples pass both protocols. The first CPU canary was 53.496708 ms; its
+69.5457204 ms admission limit stayed fixed.
+
+| scene | median CPU | median physical footprint | valid rounds |
+|---|---:|---:|---:|
+| type, 400 lines | 0.6060% | 32 MB | 3 |
+| type, 30,000 lines | 0.8983% | 49 MB | 3 |
+| append, 30,000 lines | 1.3553% | 47 MB | 3 |
+
+These are freshly calibrated absolute observations, not a renderer speedup over the preceding
+round. Physical footprint remains distinct from allocated bytes or allocation counts.
