@@ -318,3 +318,31 @@ attribution to this window. A zero app-GPU value does not mean that presenting t
 costs no GPU work. The ranges retain the compositor variation instead of hiding it behind
 the median. Frozen executable/resource hashes and collector sources still match after all
 three phases.
+
+## The explicit-geometry round (2026-10-07)
+
+Fixture `ad47db9` implements `scene-geometry-v1` with renderer `18eca8e` unchanged.
+The same M5 Max, macOS 27.0 and 1680×1050 display at 1×/60 Hz run three interleaved
+release rounds. Separate unlocked-window diagnostics establish actual list geometry,
+settled wheel travel, exact streaming content and sampled visible canvas motion before
+the executables are frozen. They do not establish presentation counts.
+
+All twelve Bunny steady-state samples pass workload, geometry and host admission. CPU
+uses two kernel-counter reads; physical footprint is read after that window. Active input
+uses seconds 1–9 after script start, rest uses seconds 10–18 after first frame, and the
+canvas uses seconds 2–8. Tracing and diagnostic capture are disabled.
+
+| scene | CPU median | physical footprint median | valid samples |
+|---|---|---|---|
+| table at rest | 0.012239% | 33 MB | 3/3 |
+| table under the wheel | 6.993010% | 195 MB | 3/3 |
+| chat streaming | 4.141815% | 185 MB | 3/3 |
+| looping canvas | 2.070548% | 41 MB | 3/3 |
+
+These are the explicit geometry fixtures, including full-width alternating row backgrounds.
+Older non-editor figures above retain their different scene definitions; comparing them
+with this table is not a renderer before/after experiment. Footprint is not allocation count.
+
+Fifteen table launches have a median first-frame marker latency of **78.617 ms**
+(range **73.338–82.799 ms**). This is an application startup marker, not input-to-photon
+or confirmed first-pixel latency. All fifteen launches pass admission.
