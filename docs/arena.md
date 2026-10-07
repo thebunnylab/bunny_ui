@@ -379,3 +379,67 @@ The patch uses the same endpoint addition order as the full raster, with unchang
 radii, stroke widths, admission limits and surface ownership. Exact crop tests cover
 fractional text, fills, strokes and nested clips at scales one and two. This is a rendering
 correction and makes no performance claim.
+
+
+## Measured text coverage for small patches (2026-10-07)
+
+A narrow opaque patch uses cached physical text bounds to exclude lines whose
+raster cannot reach it. The bound follows the full raster's origin rounding,
+measured extent and two-pixel safety margin; clips and other commands remain
+intact. The presenter's aged measurement cache serves both coverage and the
+admitted text-work budget. Unknown metrics and unsupported work keep the Metal
+fallback. The pixel, command, text and surface-ownership limits are unchanged.
+
+Four interleaved release pairs per scene compare renderer `9fc3081` with this
+change on the same M5 Max and 1×/60 Hz display. All forty samples pass actual
+scene/editor state, input deadlines and unlocked-host admission. CPU uses two
+kernel-counter reads over seconds 1–9 of the ten-second script, with tracing
+disabled. The initial CPU canary is 61.247917 ms; its 79.622292 ms limit stays fixed.
+
+| scene | CPU before | CPU after | change | footprint before / after |
+|---|---:|---:|---:|---:|
+| chat streaming | 4.126175% | 2.114334% | −48.76% | 185 / 34 MB |
+| table under the wheel | 6.840690% | 6.997929% | +2.30% | 196 / 195 MB |
+| type, 400 lines | 0.645999% | 0.570365% | −11.71% | 32 / 32 MB |
+| type, 30,000 lines | 0.951948% | 0.922987% | −3.04% | 48.5 / 49 MB |
+| append, 30,000 lines | 1.510410% | 1.376236% | −8.88% | 46.5 / 46 MB |
+
+Streaming improves in every pair and passes the predeclared 5% time-reduction
+threshold. Every guard stays within the 5% median-regression limit. Physical
+footprint is read after the CPU window; it is not allocation count.
+
+Actual-window checks cover seven moving/retained thumb states, native wheel
+travel, canvas motion, scene pixels and focused edits. The candidate exercises
+both software and retained patches; the three editor final client images are
+exactly equal to the baseline. Unit crop tests cover scales one and two,
+fractional origins, clips and font variations. Normal and paranoid suites each
+pass 896 core, 74 Apple and 27 shell tests; the complete scratch consumer suite
+passes 2,889 tests with 44 ignored. iOS compilation passes. Strict Apple clippy
+reports the same 77 baseline diagnostics, with none added; it is not a clean
+strict-clippy pass.
+
+Three separate interleaved GPU pairs for streaming are all valid and all lower
+with the candidate. They run thirty-second scripts and record seven seconds
+starting three seconds after script start. Median app GPU is 1.691 → 0 ms/s;
+the observed app plus global WindowServer median is 6.036 → 4.568 ms/s
+(24.3% lower). Total ranges are 6.011–6.090 before and 4.093–5.091 after.
+The compositor is global, so these totals are not exclusive window attribution;
+zero recorded app GPU does not mean zero presentation cost.
+
+The separate GPU guard matrix admits all thirty samples across the five scenes.
+All observed guard medians stay within 5% of the preceding renderer. The table
+reports app plus **global** WindowServer time, in ms/s, with the full observed
+ranges; individual compositor peaks remain in the evidence.
+
+| scene | before median (range) | after median (range) |
+|---|---:|---:|
+| chat streaming | 6.036 (6.011–6.090) | 4.568 (4.093–5.091) |
+| table under the wheel | 16.221 (16.144–17.831) | 16.182 (16.015–16.263) |
+| type, 400 lines | 2.635 (2.631–2.733) | 2.655 (2.586–3.404) |
+| type, 30,000 lines | 4.174 (2.615–4.754) | 2.693 (2.322–3.334) |
+| append, 30,000 lines | 2.631 (2.587–2.742) | 2.648 (2.636–3.820) |
+
+Recorded app GPU remains zero in both editor versions. Wheel app medians are
+9.864 → 9.888 ms/s. The global compositor ranges do not establish identical cost,
+a tail-latency guarantee or a causal editor-GPU speedup. CPU, native pixel and
+workload evidence are separate from these GPU recordings.

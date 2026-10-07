@@ -2615,7 +2615,7 @@ impl MetalPresenter {
             }
             #[cfg(target_os = "macos")]
             if let Plan::Patch(rect) = plan
-                && let Some(scene) = software_patch::Scene::new(display, rect, scale, canvas, text)
+                && let Some(scene) = software_patch::Scene::new(display, rect, scale, canvas, text, &self.boxes)
                 && self.present_software_patch(&scene.raster(scale, canvas, text, images), display, rect, physical, scale, canvas)
             {
                 objc_autoreleasePoolPop(pool);
@@ -3524,7 +3524,7 @@ mod tests {
             for logical in [(0, 0, 64, 64), (64, 0, 128, 64), (0, 64, 160, 100)] {
                 let s = scale as i64;
                 let rect = (logical.0*s, logical.1*s, logical.2*s, logical.3*s);
-                let scene = software_patch::Scene::new(&display, rect, scale, Color::CANVAS, &text).expect("bounded simple scene");
+                let scene = software_patch::Scene::new(&display, rect, scale, Color::CANVAS, &text, &MeasureCache::default()).expect("bounded simple scene");
                 let patch = scene.raster(scale, Color::CANVAS, &text, &RawImages::default());
                 let mut gpu_crop = Vec::new();
                 for y in rect.1..rect.3 {
