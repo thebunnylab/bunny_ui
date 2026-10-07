@@ -1015,9 +1015,8 @@ impl Runtime {
         true
     }
 
-    /// Is a tooltip waiting on the clock? The web glue asks after a
-    /// pointer event to arm its timeout chain; the mac shell rides the
-    /// blink timer and never asks.
+    /// Is a tooltip waiting on the clock? The shell uses the answer to
+    /// keep its slow clock alive until the bubble has appeared.
     pub fn tooltip_waiting(&self) -> bool {
         self.tooltip.borrow().pending.is_some()
     }
@@ -4207,17 +4206,31 @@ impl Runtime {
         dropped.is_some()
     }
 
+    /// Whether the shell's slow clock still has work: a caret, a delayed
+    /// tooltip, a pending key sequence, a wheel gesture or deferred garbage.
+    /// The shell also keeps that clock alive while it needs the display
+    /// link or a frame awaits a beat, preserving covered-window recovery.
+    pub fn slow_tick_needed(&self) -> bool {
+        self.caret_blinks()
+            || self.tooltip_waiting()
+            || !self.pending.borrow().is_empty()
+            || self.wheel_latch.borrow().is_some()
+            || self.garbage_pending()
+    }
+
+    fn caret_blinks(&self) -> bool {
+        self.focus.borrow().as_deref().is_some_and(|path| {
+            !reconciler::answers_copy(path) || self.custom_at(path).is_some()
+        })
+    }
+
     /// Half-period of the blink (the shell calls it on a timer):
     /// toggles caret visibility. `true` = a field is focused — repaint.
     /// A view that holds the keyboard only to answer a copy has no caret,
     /// so it asks for no repaint: a focused table is not redrawn twice a
     /// second for nothing.
     pub fn blink(&self) -> bool {
-        let focus = self.focus.borrow().clone();
-        let caretless = focus
-            .as_deref()
-            .is_none_or(|path| reconciler::answers_copy(path) && self.custom_at(path).is_none());
-        if caretless {
+        if !self.caret_blinks() {
             self.caret_visible.set(true);
             return false;
         }
