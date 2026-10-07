@@ -8,7 +8,9 @@
 //! shell's own door (`bunny_ui_macos::drive`) — no CGEvent, no Accessibility.
 
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod schedule;
 
 use bunny_ui::prelude::*;
 
@@ -123,61 +125,51 @@ pub enum Step {
 /// new on every stroke; `stream` appends every 33 ms; `loop` is `rest`
 /// with a loop on screen; `soak` is `rest` for a long while.
 pub fn play(args: &Args, over: (f64, f64), send: impl Fn(Step) -> bool) {
-    let secs = args.secs.max(0.1);
-    // the moment the steps begin, on the shared clock: a measuring run
-    // anchors its window here rather than on the first frame, which a
-    // framework may report late
-    let started = || println!("SCRIPT_START {}", unix_ms());
-    match args.script.as_str() {
-        "wheel" => {
-            std::thread::sleep(Duration::from_secs(1));
-            started();
-            let steps = (secs * STEPS_PER_SECOND as f64) as u64;
-            let pause = Duration::from_micros(1_000_000 / STEPS_PER_SECOND);
-            for step in 0..steps {
-                let dy = if step < steps / 2 { -6.0 } else { 6.0 };
-                if !send(Step::Wheel {
+    use schedule::{Cadence, wait_until};
+    let seconds = args.secs.max(0.1);
+    let duration = Duration::from_secs_f64(seconds);
+    let cadence = Cadence::for_script(&args.script);
+    if cadence.is_some() {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let start = Instant::now();
+    let count = cadence.map_or(0, |cadence| cadence.count(seconds));
+    let mut max_late = Duration::ZERO;
+    if let Some(cadence) = cadence {
+        println!("SCRIPT_START {}", unix_ms());
+        for index in 0..count {
+            let deadline = cadence.deadline(index);
+            wait_until(start, deadline);
+            max_late = max_late.max(start.elapsed().saturating_sub(deadline));
+            let step = match cadence {
+                Cadence::Wheel => Step::Wheel {
                     x: over.0,
                     y: over.1,
-                    dy,
-                }) {
-                    return;
+                    dy: if index < count / 2 { -6.0 } else { 6.0 },
+                },
+                Cadence::Keystroke => {
+                    if args.script == "append" || index.is_multiple_of(2) {
+                        Step::Type('x')
+                    } else {
+                        Step::Backspace
+                    }
                 }
-                std::thread::sleep(pause);
+                Cadence::Stream => Step::Append,
+            };
+            if !send(step) {
+                return;
             }
-            std::thread::sleep(Duration::from_secs(1));
         }
-        "type" | "append" => {
-            std::thread::sleep(Duration::from_secs(1));
-            started();
-            let strokes = (secs * 10.0) as u64;
-            let append = args.script == "append";
-            for stroke in 0..strokes {
-                let step = if append || stroke % 2 == 0 {
-                    Step::Type('x')
-                } else {
-                    Step::Backspace
-                };
-                if !send(step) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        "stream" => {
-            std::thread::sleep(Duration::from_secs(1));
-            started();
-            let appends = (secs * 1000.0 / 33.0) as u64;
-            for _ in 0..appends {
-                if !send(Step::Append) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(33));
-            }
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        _ => std::thread::sleep(Duration::from_secs_f64(secs)),
+    }
+    wait_until(start, duration);
+    println!(
+        "SCRIPT_QUEUED {} count={count} elapsed_ns={} max_late_ns={}",
+        unix_ms(),
+        start.elapsed().as_nanos(),
+        max_late.as_nanos()
+    );
+    if cadence.is_some() {
+        wait_until(start, duration + Duration::from_secs(1));
     }
     let _ = send(Step::Done);
 }
@@ -209,12 +201,15 @@ pub fn scripted<V: View<Arity = Single>>(
             first_frame();
             let (sender, receiver) = task::channel::<Step>();
             std::thread::spawn(move || play(&args, over, |step| sender.send(step).is_ok()));
+            let mut handled = 0u64;
             while let Some(step) = receiver.recv().await {
                 on_step(step);
                 if matches!(step, Step::Done) {
+                    println!("SCRIPT_DONE {} count={handled}", unix_ms());
                     std::process::exit(0);
                 }
                 raise(step);
+                handled += 1;
             }
         }
     })
