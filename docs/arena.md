@@ -346,3 +346,22 @@ with this table is not a renderer before/after experiment. Footprint is not allo
 Fifteen table launches have a median first-frame marker latency of **78.617 ms**
 (range **73.338–82.799 ms**). This is an application startup marker, not input-to-photon
 or confirmed first-pixel latency. All fifteen launches pass admission.
+
+
+A separate GPU pass runs thirty-second scripts and records seven seconds beginning
+three seconds after script start, or after the first frame for rest and canvas.
+All twelve Bunny GPU samples pass workload, geometry and host admission. CPU is not
+ranked during this tracing pass. Values below are GPU milliseconds per wall second.
+
+| scene | app median | WindowServer median | app + WindowServer median | observed total range |
+|---|---:|---:|---:|---:|
+| table at rest | 0.0000 | 0.1025 | 0.1025 | 0.0671–0.9623 |
+| table under the wheel | 9.8921 | 20.4738 | 30.3572 | 30.2074–30.3659 |
+| chat streaming | 1.6771 | 9.6015 | 11.2786 | 11.2540–11.5524 |
+| looping canvas | 0.0000 | 3.1895 | 3.1895 | 2.1253–6.0642 |
+
+WindowServer is the global compositor, not an exclusive charge to this window. Its
+variation remains visible in the ranges; the idle totals do not establish a GPU ranking.
+The zero app-GPU value for the software canvas does not imply zero presentation cost.
+Executable, resource, calibration-evidence and collector hashes match after the complete
+CPU and GPU passes. This round calibrates fixtures; it changes no renderer strategy.
