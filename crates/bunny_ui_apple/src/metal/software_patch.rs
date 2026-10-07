@@ -85,8 +85,7 @@ impl Scene {
                 | DrawCommand::Image { .. } => return None,
             }
         }
-        let display =
-            lifted.translated_slice((0, lifted.len()), -logical.origin.x, -logical.origin.y);
+        let display = patch_coordinates(&lifted, rect, factor)?;
         Some(Self {
             display,
             size: (width, height),
@@ -110,6 +109,48 @@ impl Scene {
             images,
         )
     }
+}
+
+// The whole raster snaps in window coordinates. Rounding a translated
+// half-pixel instead can cross zero and move the result one pixel: round
+// ties away from zero do not commute with an integer translation.
+fn patch_coordinates(display: &DisplayList, patch: DamageRect, factor: f64) -> Option<DisplayList> {
+    let point = |origin: Point| Point {
+        x: ((origin.x * factor).round() - patch.0 as f64) / factor,
+        y: ((origin.y * factor).round() - patch.1 as f64) / factor,
+    };
+    let rect = |rect: Rect| {
+        let x = rect.origin.x * factor;
+        let y = rect.origin.y * factor;
+        Rect {
+            origin: point(rect.origin),
+            // Match scale_rect followed by Bitmap::snap, including its
+            // endpoint addition order. Radii and stroke widths stay logical.
+            size: Size {
+                width: ((x + rect.size.width * factor).round() - x.round()) / factor,
+                height: ((y + rect.size.height * factor).round() - y.round()) / factor,
+            },
+        }
+    };
+    display
+        .iter()
+        .cloned()
+        .map(|mut command| {
+            match &mut command {
+                DrawCommand::FillRect { rect: bounds, .. }
+                | DrawCommand::StrokeRect { rect: bounds, .. }
+                | DrawCommand::PushClip { rect: bounds, .. } => *bounds = rect(*bounds),
+                DrawCommand::TextLine { origin, .. } => *origin = point(*origin),
+                DrawCommand::PopClip => {}
+                DrawCommand::Gradient { .. }
+                | DrawCommand::Backdrop { .. }
+                | DrawCommand::Shadow { .. }
+                | DrawCommand::Image { .. } => return None,
+            }
+            Some(command)
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(DisplayList::from)
 }
 
 #[link(name = "IOSurface", kind = "framework")]
@@ -320,7 +361,16 @@ mod tests {
                 ..FontSpec::DEFAULT
             },
         }]);
-        assert!(Scene::new(&huge_glyph, (0, 0, 128, 128), 1, Color::CANVAS, &crate::CoreTextEngine::new()).is_none());
+        assert!(
+            Scene::new(
+                &huge_glyph,
+                (0, 0, 128, 128),
+                1,
+                Color::CANVAS,
+                &crate::CoreTextEngine::new()
+            )
+            .is_none()
+        );
         let unsupported = DrawCommand::Shadow {
             rect: Rect {
                 origin: Point { x: 0.0, y: 0.0 },
@@ -335,6 +385,131 @@ mod tests {
         };
         let shadow = DisplayList::from(vec![fill(), unsupported]);
         assert!(Scene::new(&shadow, (0, 0, 128, 128), 1, Color::CANVAS, &PixelFont).is_none());
+    }
+
+    fn assert_crop(display: &DisplayList, rect: DamageRect, scale: usize, text: &dyn TextEngine) {
+        let full = rasterize_with(
+            display,
+            1280 * scale,
+            800 * scale,
+            scale,
+            Color::WHITE,
+            text,
+            &RawImages::default(),
+        );
+        let scene = Scene::new(display, rect, scale, Color::WHITE, text)
+            .expect("a bounded supported scene admits a software patch");
+        let patch = scene.raster(scale, Color::WHITE, text, &RawImages::default());
+        for y in rect.1..rect.3 {
+            for x in rect.0..rect.2 {
+                assert_eq!(
+                    patch.pixel((x - rect.0) as usize, (y - rect.1) as usize),
+                    full.pixel(x as usize, y as usize),
+                    "scale {scale}, pixel {x},{y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn software_patch_keeps_fractional_ink_and_nested_clips() {
+        use bunny_ui::text_engine::Slant;
+        let text = crate::CoreTextEngine::new();
+        let rect = |x, y, width, height| Rect {
+            origin: Point { x, y },
+            size: Size { width, height },
+        };
+        for slant in [Slant::Upright, Slant::Italic] {
+            for tracking in [-0.75, 0.0, 1.25] {
+                let content = "ffi jA é العربية";
+                let display = DisplayList::from(vec![
+                    fill(),
+                    DrawCommand::PushClip {
+                        rect: rect(5.25, 3.75, 210.5, 50.5),
+                        corner_radius: Corners::all(7.0),
+                    },
+                    DrawCommand::TextLine {
+                        origin: Point { x: 12.25, y: 8.75 },
+                        content: content.into(),
+                        range: (0, content.len()),
+                        color: Color::BLACK,
+                        font: FontSpec {
+                            slant,
+                            tracking,
+                            size: 13.0,
+                            ..FontSpec::DEFAULT.family("Menlo")
+                        },
+                    },
+                    DrawCommand::PushClip {
+                        rect: rect(24.5, 10.25, 140.25, 25.5),
+                        corner_radius: Corners::all(3.0),
+                    },
+                    DrawCommand::TextLine {
+                        origin: Point {
+                            x: 143.75,
+                            y: 21.25,
+                        },
+                        content: "edge".into(),
+                        range: (0, 4),
+                        color: Color::hex(0xDE7932),
+                        font: FontSpec::DEFAULT.family("Menlo"),
+                    },
+                    DrawCommand::PopClip,
+                    DrawCommand::PopClip,
+                ]);
+                for scale in [1, 2] {
+                    let s = scale as i64;
+                    for (left, right) in [(10, 18), (60, 72), (142, 150), (160, 168), (214, 220)] {
+                        assert_crop(&display, (left * s, 0, right * s, 56 * s), scale, &text);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn software_patch_keeps_fractional_fills_strokes_and_clip_edges() {
+        let rect = |x, y, width, height| Rect {
+            origin: Point { x, y },
+            size: Size { width, height },
+        };
+        let display = DisplayList::from(vec![
+            fill(),
+            DrawCommand::PushClip {
+                rect: rect(5.25, 3.75, 210.5, 50.5),
+                corner_radius: Corners::all(12.5),
+            },
+            DrawCommand::FillRect {
+                rect: rect(-0.25, -0.75, 39.5, 33.5),
+                color: Color::hex(0x619732),
+                corner_radius: Corners::all(8.0),
+            },
+            DrawCommand::FillRect {
+                rect: rect(12.25, 8.75, 172.5, 27.5),
+                color: Color::hex(0x325397),
+                corner_radius: Corners::all(6.5),
+            },
+            DrawCommand::StrokeRect {
+                rect: rect(24.5, 10.25, 140.25, 25.5),
+                color: Color::hex(0xDE7932),
+                width: 1.75,
+                corner_radius: Corners::all(3.5),
+            },
+            DrawCommand::PopClip,
+        ]);
+        for scale in [1, 2] {
+            let s = scale as i64;
+            for left in [0, 5, 12, 24, 60, 144, 160, 180, 210] {
+                for top in [0, 4, 8, 12, 20, 32, 44] {
+                    assert_crop(
+                        &display,
+                        (left * s, top * s, (left + 8) * s, (top + 8) * s),
+                        scale,
+                        &PixelFont,
+                    );
+                }
+            }
+        }
     }
 
     #[link(name = "IOSurface", kind = "framework")]
