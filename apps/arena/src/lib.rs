@@ -10,7 +10,10 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod diagnostic;
 mod schedule;
+pub use diagnostic::Checkpoint;
+pub mod scene;
 
 use bunny_ui::prelude::*;
 
@@ -111,10 +114,16 @@ pub fn first_frame() {
 /// One step of a script, from the worker's clock to the main thread.
 #[derive(Clone, Copy, Debug)]
 pub enum Step {
-    Wheel { x: f64, y: f64, dy: f64 },
+    Wheel {
+        x: f64,
+        y: f64,
+        dy: f64,
+    },
     Type(char),
     Backspace,
     Append,
+    /// An untimed observation requested after native scrolling settles.
+    Checkpoint(Checkpoint),
     Done,
 }
 
@@ -125,6 +134,10 @@ pub enum Step {
 /// new on every stroke; `stream` appends every 33 ms; `loop` is `rest`
 /// with a loop on screen; `soak` is `rest` for a long while.
 pub fn play(args: &Args, over: (f64, f64), send: impl Fn(Step) -> bool) {
+    if args.script == "wheel" && std::env::var_os("ARENA_SCENE_DIAGNOSTIC").is_some() {
+        diagnostic::wheel(over, send);
+        return;
+    }
     use schedule::{Cadence, wait_until};
     let seconds = args.secs.max(0.1);
     let duration = Duration::from_secs_f64(seconds);
@@ -180,7 +193,7 @@ pub fn raise(step: Step) {
         Step::Wheel { x, y, dy } => bunny_ui_macos::drive::wheel(x, y, 0.0, dy),
         Step::Type(c) => bunny_ui_macos::drive::text(&c.to_string()),
         Step::Backspace => bunny_ui_macos::drive::backspace(),
-        Step::Append | Step::Done => {}
+        Step::Append | Step::Checkpoint(_) | Step::Done => {}
     }
 }
 
@@ -209,7 +222,9 @@ pub fn scripted<V: View<Arity = Single>>(
                     std::process::exit(0);
                 }
                 raise(step);
-                handled += 1;
+                if !matches!(step, Step::Checkpoint(_)) {
+                    handled += 1;
+                }
             }
         }
     })

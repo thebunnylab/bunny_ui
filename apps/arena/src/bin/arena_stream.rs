@@ -1,10 +1,8 @@
 //! A chat that grows by one message every 33 ms: what a streaming answer
 //! costs the window per append.
-use arena::{Args, FONT_FAMILY, Step, WINDOW, scripted};
-use bunny_ui::layout::{Color, Size};
+use arena::{Args, FONT_FAMILY, Step, WINDOW};
+use bunny_ui::layout::Color;
 use bunny_ui::prelude::*;
-
-const OVER: (f64, f64) = (WINDOW.0 * 0.5, WINDOW.1 * 0.5);
 
 #[derive(Clone)]
 struct Chat {
@@ -22,8 +20,8 @@ impl Component for Chat {
                 let line = messages[i].clone();
                 text!(line)
                     .font_size(13.0)
-                    .padding_length(8.0)
-                    .frame_height(28.0)
+                    .padding_edge(Edge::Leading, 8.0)
+                    .frame_aligned(WINDOW.0, 28.0, Alignment::Leading)
                     .background_color(if i % 2 == 0 {
                         Color::hex(0x1C1C21)
                     } else {
@@ -33,6 +31,8 @@ impl Component for Chat {
         )
         .row_height(28.0)
         .font_family(FONT_FAMILY)
+        .foreground_color(Color::hex(0xE6E6EA))
+        .background_color(Color::hex(0x17171C))
     }
 }
 
@@ -50,12 +50,18 @@ fn main() {
             });
         }
     };
-    bunny_ui_macos::run_window(
+    arena::scene::run(
         "arena — stream",
-        Size {
-            width: WINDOW.0,
-            height: WINDOW.1,
+        "stream",
+        chat,
+        args,
+        append,
+        move || {
+            let all = messages.get();
+            let content_ok = all.iter().enumerate().all(|(n, actual)| {
+                actual == &format!("message {n}: a token lands, and the list grows by one line")
+            });
+            serde_json::json!({"item_count": all.len(), "content_ok": content_ok})
         },
-        scripted(chat, args, OVER, append),
     );
 }

@@ -6,6 +6,7 @@ publish = false
 description = "The arena's own apps: the scenes every framework is measured on, scripted, in a real window"
 
 [dependencies]
+serde_json.workspace = true
 bunny-ui = { path = "../../crates/bunny_ui", features = ["gpu"] }
 bunny-ui-macos = { path = "../../crates/bunny_ui_macos" }
 
