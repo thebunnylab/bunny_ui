@@ -49,6 +49,9 @@ use bunny_ui::text_engine::{MeasureCache, TextEngine};
 
 use crate::ffi::{CFRelease, CFRetain, CGPoint, CGRect, CGSize, Id, Sel, class, error_message, kill_layer_actions, ns_string, sel};
 
+#[cfg(target_os = "macos")]
+mod software_patch;
+
 // MARK: - FFI border
 
 #[link(name = "Metal", kind = "framework")]
@@ -2188,13 +2191,23 @@ fn patch_box(damage: DamageRect, physical: (usize, usize)) -> Option<DamageRect>
     (area * PATCH_SHARE.1 <= window * PATCH_SHARE.0).then_some(rect)
 }
 
-/// The small layer over the window's own: a `CAMetalLayer` hung above
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatchKind {
+    Metal,
+    #[cfg(target_os = "macos")]
+    Software,
+}
+
+/// The small layer over the window's own: a patch hung above
 /// the drawable and under every live layer, showing the new frame's
 /// pixels inside its box while the window's layer keeps the last whole
 /// frame. A keystroke or a scrollbar that moves then costs the GPU, and
 /// the window server compositing it, the box — not the window.
 struct Patch {
     layer: Id,
+    kind: PatchKind,
+    #[cfg(target_os = "macos")]
+    software: software_patch::Backing,
     /// The drawable size the layer was last given, in pixels.
     size: (usize, usize),
     /// The scale the layer was last given.
@@ -2213,33 +2226,43 @@ struct Patch {
 impl Patch {
     /// A hidden patch layer over `root`'s drawable, configured as the
     /// window's own layer is (opaque: the box is painted whole).
-    unsafe fn new(stack: &MetalStack, root: Id, scale: usize) -> Option<Patch> {
+    unsafe fn new(stack: &MetalStack, root: Id, scale: usize, kind: PatchKind) -> Option<Patch> {
         unsafe {
-            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let layer_class = match kind {
+                PatchKind::Metal => "CAMetalLayer",
+                #[cfg(target_os = "macos")]
+                PatchKind::Software => "CALayer",
+            };
+            let layer = msg_id(msg_id(class(layer_class), sel("alloc")), sel("init"));
             if layer.is_null() {
                 return None;
             }
-            msg_void_id(layer, sel("setDevice:"), stack.device);
-            msg_void_u64(layer, sel("setPixelFormat:"), stack.format);
+            if kind == PatchKind::Metal {
+                msg_void_id(layer, sel("setDevice:"), stack.device);
+                msg_void_u64(layer, sel("setPixelFormat:"), stack.format);
+                msg_void_bool(layer, sel("setFramebufferOnly:"), 1);
+                // a patch presents a stroke at a time: two drawables keep one
+                // on screen and one to paint
+                msg_void_u64(layer, sel("setMaximumDrawableCount:"), 2);
+                msg_void_bool(layer, sel("setAllowsNextDrawableTimeout:"), 0);
+                // every patch presents inside the transaction, its box and
+                // its pixels together. A layer that flips between that and
+                // the asynchronous present loses frames: a drawable once
+                // presented inside a transaction and later presented on its
+                // own is not shown (seen on screen, a stroke behind)
+                msg_void_bool(layer, sel("setPresentsWithTransaction:"), 1);
+            }
             msg_void_bool(layer, sel("setOpaque:"), 1);
-            msg_void_bool(layer, sel("setFramebufferOnly:"), 1);
-            // a patch presents a stroke at a time: two drawables keep one
-            // on screen and one to paint
-            msg_void_u64(layer, sel("setMaximumDrawableCount:"), 2);
-            msg_void_bool(layer, sel("setAllowsNextDrawableTimeout:"), 0);
-            // every patch presents inside the transaction, its box and
-            // its pixels together. A layer that flips between that and
-            // the asynchronous present loses frames: a drawable once
-            // presented inside a transaction and later presented on its
-            // own is not shown (seen on screen, a stroke behind)
-            msg_void_bool(layer, sel("setPresentsWithTransaction:"), 1);
             msg_void_f64(layer, sel("setContentsScale:"), scale as f64);
             msg_void_bool(layer, sel("setHidden:"), 1);
             kill_layer_actions(layer);
             // first among the sublayers: over the drawable, under the
             // live layers the shell hangs after it
             msg_void_id_u64(root, sel("insertSublayer:atIndex:"), layer, 0);
-            Some(Patch { layer, size: (0, 0), scale, shown: None, held: None, drawables: Drawables::default() })
+            Some(Patch { layer, kind,
+                #[cfg(target_os = "macos")]
+                software: software_patch::Backing::default(),
+                size: (0, 0), scale, shown: None, held: None, drawables: Drawables::default() })
         }
     }
 
@@ -2294,7 +2317,7 @@ pub struct MetalPresenter {
     /// patch always covers every pixel the layer under it has wrong.
     base: Option<KeptFrame>,
     /// The layers that carry a change too small to repaint the window
-    /// for — two at most, so a change that comes back (the caret's blink,
+    /// for — two per strategy at most, so a change that comes back (the caret's blink,
     /// a hover that leaves and returns) shows the box already painted
     /// instead of painting it again. Made on the first such changes.
     patches: Vec<Patch>,
@@ -2590,6 +2613,14 @@ impl MetalPresenter {
                 objc_autoreleasePoolPop(pool);
                 return;
             }
+            #[cfg(target_os = "macos")]
+            if let Plan::Patch(rect) = plan
+                && let Some(scene) = software_patch::Scene::new(display, rect, scale, canvas, text)
+                && self.present_software_patch(&scene.raster(scale, canvas, text, images), display, rect, physical, scale, canvas)
+            {
+                objc_autoreleasePoolPop(pool);
+                return;
+            }
             if !self.ground.wake() {
                 // the system took the atlas while the window rested: its
                 // tiles are gone, and the walk below rasterizes anew
@@ -2761,6 +2792,62 @@ impl MetalPresenter {
         }
     }
 
+    /// Keep at most two patches per strategy: one on screen and one
+    /// retained for a returning frame. Both strategies share the same
+    /// base and visibility rules; a whole frame invalidates every patch.
+    unsafe fn patch_target(&mut self, held: &DisplayList, scale: usize, kind: PatchKind) -> Option<usize> {
+        let on_screen = self.patches.iter().position(|patch| patch.kind == kind && patch.shown.is_some());
+        let came_back = self.previous.as_ref().is_some_and(|previous| previous.as_slice() == held.as_slice());
+        let beside = self.patches.iter().position(|patch| patch.kind == kind && patch.shown.is_none());
+        match (on_screen, came_back, beside) {
+            (Some(shown), false, _) => Some(shown),
+            (Some(_), true, Some(free)) | (None, _, Some(free)) => Some(free),
+            _ => {
+                let fresh = unsafe { Patch::new(&self.stack, self.layer, scale, kind) }?;
+                self.patches.push(fresh);
+                Some(self.patches.len() - 1)
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe fn present_software_patch(
+        &mut self,
+        bitmap: &bunny_ui::raster::Bitmap,
+        display: &DisplayList,
+        rect: DamageRect,
+        physical: (usize, usize),
+        scale: usize,
+        canvas: Color,
+    ) -> bool {
+        unsafe {
+            let Some(target) = self.patch_target(display, scale, PatchKind::Software) else { return false; };
+            let Some(surface) = self.patches[target].software.prepare(bitmap) else { return false; };
+            self.previous = self.patch_on_screen();
+            let held = Rc::new(display.clone());
+            let transaction = class("CATransaction");
+            msg_void(transaction, sel("begin"));
+            for (index, patch) in self.patches.iter_mut().enumerate() {
+                if index == target {
+                    msg_void_f64(patch.layer, sel("setContentsScale:"), scale as f64);
+                    msg_void_rect(patch.layer, sel("setFrame:"), Patch::frame(rect, physical, scale));
+                    msg_void_id(patch.layer, sel("setContents:"), surface);
+                    msg_void_bool(patch.layer, sel("setHidden:"), 0);
+                    patch.scale = scale;
+                    patch.size = (bitmap.width(), bitmap.height());
+                    patch.shown = Some(rect);
+                    patch.held = Some((held.clone(), rect));
+                } else {
+                    patch.hide();
+                }
+            }
+            msg_void(transaction, sel("commit"));
+            self.retained = Some((held, physical, scale, canvas));
+            crate::trace::mark("Q", format_args!("box={},{},{},{} software", rect.0, rect.1, rect.2, rect.3));
+            true
+        }
+    }
+
     /// Presents `rect` of the frame just walked into slot `index`
     /// through the patch layer, which the window's own layer keeps
     /// showing the base under. The patch presents inside the
@@ -2777,25 +2864,8 @@ impl MetalPresenter {
         held: &Rc<DisplayList>,
     ) -> bool {
         unsafe {
-            // a new frame paints over the patch on screen, in place, as one
-            // patch always did. A frame that came back — equal to the one
-            // shown before — paints beside it instead, so both are kept
-            // and the next turn of the toggle shows one without painting;
-            // the second patch is made the first time that happens
-            let on_screen = self.patches.iter().position(|patch| patch.shown.is_some());
-            let came_back = self.previous.as_ref().is_some_and(|previous| previous.as_slice() == held.as_slice());
-            let beside = self.patches.iter().position(|patch| patch.shown.is_none());
-            let target = match (on_screen, came_back, beside) {
-                (Some(shown), false, _) => shown,
-                (Some(_), true, Some(free)) | (None, _, Some(free)) => free,
-                (Some(shown), true, None) if self.patches.len() >= 2 => shown,
-                _ => {
-                    let Some(fresh) = Patch::new(&self.stack, self.layer, scale) else {
-                        return false;
-                    };
-                    self.patches.push(fresh);
-                    self.patches.len() - 1
-                }
+            let Some(target) = self.patch_target(held, scale, PatchKind::Metal) else {
+                return false;
             };
             self.previous = self.patch_on_screen();
             let (before, rest) = self.patches.split_at_mut(target);
@@ -3429,6 +3499,42 @@ mod tests {
                         pixel / physical.0
                     );
                 }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_software_patch_matches_the_whole_oracle_and_metal() {
+        use bunny_ui::layout::DrawCommand;
+        let text = crate::CoreTextEngine::new();
+        for scale in [1, 2] {
+            let display = DisplayList::from(patch_scene("alphax", true, 0.75).iter()
+                .filter(|command| !matches!(command, DrawCommand::Shadow { .. }))
+                .cloned().map(|command| match command {
+                    DrawCommand::TextLine { origin, content, range, color, font } =>
+                        DrawCommand::TextLine { origin, content, range, color, font: font.family("Menlo") },
+                    other => other,
+                }).collect::<Vec<_>>());
+            let physical = (160 * scale, 100 * scale);
+            let mut gpu = OffscreenGpu::new(physical.0, physical.1).expect("offscreen GPU");
+            gpu.present_wait(&display, scale, Color::CANVAS, &text, &RawImages::default());
+            let gpu = gpu.read_rgba();
+            let full = rasterize_with(&display, physical.0, physical.1, scale, Color::CANVAS, &text, &RawImages::default());
+            for logical in [(0, 0, 64, 64), (64, 0, 128, 64), (0, 64, 160, 100)] {
+                let s = scale as i64;
+                let rect = (logical.0*s, logical.1*s, logical.2*s, logical.3*s);
+                let scene = software_patch::Scene::new(&display, rect, scale, Color::CANVAS, &text).expect("bounded simple scene");
+                let patch = scene.raster(scale, Color::CANVAS, &text, &RawImages::default());
+                let mut gpu_crop = Vec::new();
+                for y in rect.1..rect.3 {
+                    for x in rect.0..rect.2 {
+                        assert_eq!(patch.pixel((x-rect.0) as usize, (y-rect.1) as usize), full.pixel(x as usize, y as usize), "scale {scale}, pixel {x},{y}");
+                        let offset = (y as usize * physical.0 + x as usize) * 4;
+                        gpu_crop.extend_from_slice(&gpu[offset..offset+4]);
+                    }
+                }
+                assert_close(&gpu_crop, &patch.to_rgba_bytes(), 2, "software patch against Metal");
             }
         }
     }
