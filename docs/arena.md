@@ -25,6 +25,12 @@ character ten times a second and nothing else, so every stroke is a text the eng
 seen; `stream` appends every 33 ms. Steps are raised through the shell's own door (`bunny_ui_macos::drive`), the same one the
 window system's callbacks use — no synthesized system events, no accessibility permission.
 
+The producer uses absolute monotonic deadlines: event `i` is due at `i / 240` seconds for
+wheel, `i / 10` for typing, or `i × 33 ms` for streaming. A late producer catches up without
+discarding events; handling time is never added to the next deadline. Event counts round down.
+The active script starts one second after the first-frame announcement and keeps a one-second
+grace after its requested duration. Rest has no input steps or extra grace.
+
 The table, editor and chat name **Menlo** explicitly (12 pt in the table's cells, 13 pt in the
 editor and chat). The font is part of the macOS fixture and must be installed; a platform's
 default face changes glyph widths, wrapping and raster work. Record the installed font's digest
@@ -37,6 +43,18 @@ its first step is about to be sent, and the stretch a scene is measured over is 
 a window that reports its first frame late, or early, would otherwise slide the stretch into idle
 time or into the launch. The fixtures (`rows-10k.tsv`, `lines-400.txt`,
 `lines-30k.txt`) are read from `ARENA_FIXTURES`.
+
+At the end of the producer's duration, `SCRIPT_QUEUED` prints its Unix timestamp, `count`,
+`elapsed_ns` and `max_late_ns`. After the main thread has handled every queued step in order,
+`SCRIPT_DONE` prints its timestamp and handled `count`. Handler completion does not measure
+input-to-photon latency. Comparisons require matching requested, queued and handled counts;
+the current admission limits are 20 ms for producer lateness/duration overrun and completion
+by the requested duration plus two seconds, including the one-second grace. Missing or late
+completion is a failed workload and its observed CPU, memory and GPU values are excluded from
+rankings. These markers are outside the steady CPU counter window.
+
+The historical before/after tables below use the preserved script implementation from their
+source revisions. Binaries with the absolute-deadline protocol need a fresh comparison session.
 
 ## What is read
 
