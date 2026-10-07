@@ -24,6 +24,7 @@ impl Scene {
         scale: usize,
         canvas: Color,
         text: &dyn TextEngine,
+        cache: &MeasureCache,
     ) -> Option<Self> {
         let width = usize::try_from(rect.2.checked_sub(rect.0)?).ok()?;
         let height = usize::try_from(rect.3.checked_sub(rect.1)?).ok()?;
@@ -46,7 +47,8 @@ impl Scene {
                 height: height as f64 / factor,
             },
         };
-        let (_, lifted) = carve_covering(display, (0, display.len()), logical)?;
+        let candidates = measured_candidates(display, rect, factor, text, cache)?;
+        let (_, lifted) = carve_covering(&candidates, (0, candidates.len()), logical)?;
         if lifted.len() > MAX_COMMANDS {
             return None;
         }
@@ -68,7 +70,7 @@ impl Scene {
                     if bytes > MAX_TEXT_BYTES {
                         return None;
                     }
-                    let metrics = text.measure_line(&content[range.0..range.1], font);
+                    let metrics = cache.get_or_measure(&content[range.0..range.1], font, text);
                     if !metrics.width.is_finite() || !metrics.height().is_finite() {
                         return None;
                     }
@@ -109,6 +111,59 @@ impl Scene {
             images,
         )
     }
+}
+
+// Text coverage in carve_covering deliberately has no right edge. A
+// narrow patch must not spend its raster budget on lines that stop before
+// it. Filter before the carve so irrelevant text cannot multiply clip
+// wrappers or consume its command budget. The presenter's aged metrics
+// serve both this bound and the admitted raster-work estimate.
+fn measured_candidates(
+    display: &DisplayList,
+    patch: DamageRect,
+    factor: f64,
+    text: &dyn TextEngine,
+    cache: &MeasureCache,
+) -> Option<DisplayList> {
+    let mut commands = Vec::with_capacity(display.len());
+    for command in display.iter() {
+        if let DrawCommand::TextLine {
+            origin,
+            content,
+            range,
+            font,
+            ..
+        } = command
+        {
+            let line = content.get(range.0..range.1)?;
+            // Do not shape an unbounded line just to decide to reject it.
+            if line.len() > MAX_TEXT_BYTES {
+                return None;
+            }
+            let metrics = cache.get_or_measure(line, font, text);
+            let x = (origin.x * factor).round();
+            let y = (origin.y * factor).round();
+            let width = (metrics.width * factor).ceil();
+            let height = (metrics.height() * factor).ceil();
+            if [x, y, width, height].iter().any(|value| !value.is_finite())
+                || metrics.width < 0.0
+                || metrics.height() < 0.0
+            {
+                return None;
+            }
+            // The same two physical pixels of rounding slack as the
+            // damage oracle. Clips can only remove ink from this bound.
+            if x - 2.0 >= patch.2 as f64
+                || x + width + 2.0 <= patch.0 as f64
+                || y - 2.0 >= patch.3 as f64
+                || y + height + 2.0 <= patch.1 as f64
+            {
+                continue;
+            }
+        }
+        commands.push(command.clone());
+    }
+    Some(DisplayList::from(commands))
 }
 
 // The whole raster snaps in window coordinates. Rounding a translated
@@ -328,21 +383,62 @@ mod tests {
     #[test]
     fn software_work_is_bounded_and_unsupported_ink_stays_on_metal() {
         let display = DisplayList::from(vec![fill()]);
-        assert!(Scene::new(&display, (0, 0, 128, 128), 1, Color::CANVAS, &PixelFont).is_some());
-        assert!(Scene::new(&display, (0, 0, 640, 640), 1, Color::CANVAS, &PixelFont).is_none());
-        assert!(Scene::new(&display, (0, 0, 128, 128), 0, Color::CANVAS, &PixelFont).is_none());
+        assert!(
+            Scene::new(
+                &display,
+                (0, 0, 128, 128),
+                1,
+                Color::CANVAS,
+                &PixelFont,
+                &MeasureCache::default()
+            )
+            .is_some()
+        );
+        assert!(
+            Scene::new(
+                &display,
+                (0, 0, 640, 640),
+                1,
+                Color::CANVAS,
+                &PixelFont,
+                &MeasureCache::default()
+            )
+            .is_none()
+        );
+        assert!(
+            Scene::new(
+                &display,
+                (0, 0, 128, 128),
+                0,
+                Color::CANVAS,
+                &PixelFont,
+                &MeasureCache::default()
+            )
+            .is_none()
+        );
         assert!(
             Scene::new(
                 &display,
                 (0, 0, 128, 128),
                 1,
                 Color::CANVAS.fade(),
-                &PixelFont
+                &PixelFont,
+                &MeasureCache::default()
             )
             .is_none()
         );
         let commands = DisplayList::from(vec![fill(); MAX_COMMANDS + 1]);
-        assert!(Scene::new(&commands, (0, 0, 128, 128), 1, Color::CANVAS, &PixelFont).is_none());
+        assert!(
+            Scene::new(
+                &commands,
+                (0, 0, 128, 128),
+                1,
+                Color::CANVAS,
+                &PixelFont,
+                &MeasureCache::default()
+            )
+            .is_none()
+        );
         let long = DisplayList::from(vec![DrawCommand::TextLine {
             origin: Point { x: 0.0, y: 0.0 },
             content: "x".repeat(MAX_TEXT_BYTES + 1).into(),
@@ -350,7 +446,17 @@ mod tests {
             color: Color::BLACK,
             font: FontSpec::DEFAULT,
         }]);
-        assert!(Scene::new(&long, (0, 0, 128, 128), 1, Color::CANVAS, &PixelFont).is_none());
+        assert!(
+            Scene::new(
+                &long,
+                (0, 0, 128, 128),
+                1,
+                Color::CANVAS,
+                &PixelFont,
+                &MeasureCache::default()
+            )
+            .is_none()
+        );
         let huge_glyph = DisplayList::from(vec![DrawCommand::TextLine {
             origin: Point { x: 0.0, y: 0.0 },
             content: "x".into(),
@@ -367,7 +473,8 @@ mod tests {
                 (0, 0, 128, 128),
                 1,
                 Color::CANVAS,
-                &crate::CoreTextEngine::new()
+                &crate::CoreTextEngine::new(),
+                &MeasureCache::default()
             )
             .is_none()
         );
@@ -384,7 +491,17 @@ mod tests {
             corner_radius: Corners::ZERO,
         };
         let shadow = DisplayList::from(vec![fill(), unsupported]);
-        assert!(Scene::new(&shadow, (0, 0, 128, 128), 1, Color::CANVAS, &PixelFont).is_none());
+        assert!(
+            Scene::new(
+                &shadow,
+                (0, 0, 128, 128),
+                1,
+                Color::CANVAS,
+                &PixelFont,
+                &MeasureCache::default()
+            )
+            .is_none()
+        );
     }
 
     fn assert_crop(display: &DisplayList, rect: DamageRect, scale: usize, text: &dyn TextEngine) {
@@ -397,8 +514,15 @@ mod tests {
             text,
             &RawImages::default(),
         );
-        let scene = Scene::new(display, rect, scale, Color::WHITE, text)
-            .expect("a bounded supported scene admits a software patch");
+        let scene = Scene::new(
+            display,
+            rect,
+            scale,
+            Color::WHITE,
+            text,
+            &MeasureCache::default(),
+        )
+        .expect("a bounded supported scene admits a software patch");
         let patch = scene.raster(scale, Color::WHITE, text, &RawImages::default());
         for y in rect.1..rect.3 {
             for x in rect.0..rect.2 {
@@ -510,6 +634,142 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn text_left_of_a_striped_thumb_does_not_spend_the_patch_budget() {
+        let mut commands = Vec::new();
+        for row in 0..28 {
+            commands.push(DrawCommand::FillRect {
+                rect: Rect {
+                    origin: Point {
+                        x: 0.0,
+                        y: row as f64 * 28.0,
+                    },
+                    size: Size {
+                        width: 1280.0,
+                        height: 28.0,
+                    },
+                },
+                color: if row % 2 == 0 {
+                    Color::hex(0x17171C)
+                } else {
+                    Color::hex(0x1C1C21)
+                },
+                corner_radius: Corners::ZERO,
+            });
+            let content = format!("message {row}: a token lands, and the list grows by one line");
+            commands.push(DrawCommand::TextLine {
+                origin: Point {
+                    x: 8.0,
+                    y: row as f64 * 28.0 + 6.0,
+                },
+                range: (0, content.len()),
+                content: content.into(),
+                color: Color::WHITE,
+                font: FontSpec::DEFAULT,
+            });
+        }
+        commands.push(DrawCommand::FillRect {
+            rect: Rect {
+                origin: Point { x: 1274.0, y: 2.0 },
+                size: Size {
+                    width: 4.0,
+                    height: 730.0,
+                },
+            },
+            color: Color::WHITE.fade(),
+            corner_radius: Corners::all(2.0),
+        });
+        let display = DisplayList::from(commands);
+        for scale in [1, 2] {
+            let s = scale as i64;
+            assert_crop(
+                &display,
+                (1272 * s, 0, 1280 * s, 736 * s),
+                scale,
+                &PixelFont,
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_text_extent_cannot_be_culled_to_admit_a_patch() {
+        use bunny_ui::text_engine::{LineMetrics, TextRaster};
+        struct UnknownExtent;
+        impl TextEngine for UnknownExtent {
+            fn measure_line(&self, _: &str, _: &FontSpec) -> LineMetrics {
+                LineMetrics {
+                    width: f64::NAN,
+                    ascent: 12.0,
+                    descent: 4.0,
+                }
+            }
+            fn raster_line(&self, _: &str, _: &FontSpec, _: Color, _: usize) -> Option<TextRaster> {
+                panic!("unbounded work never reaches the rasterizer")
+            }
+        }
+        let display = DisplayList::from(vec![
+            fill(),
+            DrawCommand::TextLine {
+                origin: Point { x: 8.0, y: 8.0 },
+                content: "unknown".into(),
+                range: (0, 7),
+                color: Color::BLACK,
+                font: FontSpec::DEFAULT,
+            },
+        ]);
+        assert!(
+            Scene::new(
+                &display,
+                (600, 0, 608, 32),
+                1,
+                Color::WHITE,
+                &UnknownExtent,
+                &MeasureCache::default()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn patch_admission_reuses_the_presenters_text_measurements() {
+        use bunny_ui::text_engine::{LineMetrics, TextRaster};
+        struct Counting(std::cell::Cell<usize>);
+        impl TextEngine for Counting {
+            fn measure_line(&self, line: &str, font: &FontSpec) -> LineMetrics {
+                self.0.set(self.0.get() + 1);
+                PixelFont.measure_line(line, font)
+            }
+            fn raster_line(&self, _: &str, _: &FontSpec, _: Color, _: usize) -> Option<TextRaster> {
+                panic!("admission does not rasterize text")
+            }
+        }
+        let text = Counting(std::cell::Cell::new(0));
+        let cache = MeasureCache::default();
+        cache.get_or_measure("cached", &FontSpec::DEFAULT, &text);
+        let mut commands = vec![fill()];
+        for x in [8.0, 600.0] {
+            commands.push(DrawCommand::TextLine {
+                origin: Point { x, y: 8.0 },
+                content: "cached".into(),
+                range: (0, 6),
+                color: Color::BLACK,
+                font: FontSpec::DEFAULT,
+            });
+        }
+        let display = DisplayList::from(commands);
+        for _ in 0..3 {
+            cache.begin_frame();
+            assert!(
+                Scene::new(&display, (600, 0, 640, 32), 1, Color::WHITE, &text, &cache).is_some()
+            );
+        }
+        assert_eq!(
+            text.0.get(),
+            1,
+            "patch admission reshaped an already measured line"
+        );
     }
 
     #[link(name = "IOSurface", kind = "framework")]
