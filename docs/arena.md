@@ -365,3 +365,17 @@ variation remains visible in the ranges; the idle totals do not establish a GPU 
 The zero app-GPU value for the software canvas does not imply zero presentation cost.
 Executable, resource, calibration-evidence and collector hashes match after the complete
 CPU and GPU passes. This round calibrates fixtures; it changes no renderer strategy.
+
+
+## A patch keeps the window's pixel origin
+
+Software patches snap text origins and primitive/clip endpoints in the original window
+coordinates before moving them into their small backing. Rounding after translation can
+move a half-pixel by one pixel when the local coordinate crosses zero: at scale two,
+12.25 points rounds to physical pixel 25; subtracting a 120-pixel patch origin must keep
+pixel -95, while rounding the translated -95.5 would produce -96.
+
+The patch uses the same endpoint addition order as the full raster, with unchanged fonts,
+radii, stroke widths, admission limits and surface ownership. Exact crop tests cover
+fractional text, fills, strokes and nested clips at scales one and two. This is a rendering
+correction and makes no performance claim.
