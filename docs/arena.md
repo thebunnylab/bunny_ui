@@ -264,3 +264,20 @@ All nine Bunny samples pass both protocols. The first CPU canary was 53.496708 m
 
 These are freshly calibrated absolute observations, not a renderer speedup over the preceding
 round. Physical footprint remains distinct from allocated bytes or allocation counts.
+
+
+A separate GPU pass ran each editor script for thirty seconds and recorded seven seconds
+starting three seconds after `SCRIPT_START`. All nine Bunny samples passed actual-state and
+input-deadline validation. No CPU ranking was collected during GPU tracing.
+
+| scene | median app GPU | median app + WindowServer | observed total range |
+|---|---:|---:|---:|
+| type, 400 lines | 0 ms/s | 1.3070 ms/s | 0.7149–1.4563 ms/s |
+| type, 30,000 lines | 0 ms/s | 0.7165 ms/s | 0.6971–1.0908 ms/s |
+| append, 30,000 lines | 0 ms/s | 1.4104 ms/s | 0.8084–1.5297 ms/s |
+
+The WindowServer column observes the system compositor globally; it is not an exclusive
+attribution to this window. A zero app-GPU value does not mean that presenting the window
+costs no GPU work. The ranges retain the compositor variation instead of hiding it behind
+the median. Frozen executable/resource hashes and collector sources still match after all
+three phases.
