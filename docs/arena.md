@@ -124,3 +124,25 @@ compositing it, in milliseconds per second.
 
 Absolute CPU percentages move between sessions on this machine (a busy machine schedules the same
 work differently), which is why only the interleaved pairs above are compared.
+
+## The slow clock at rest (fixed-face fixture)
+
+The macOS shell parks its half-second housekeeping timer when no window needs it. A caret,
+tooltip delay, key sequence, wheel gesture, deferred garbage or display-frame recovery keeps
+the clock armed. Requests from all open windows are combined; replacing the timer's window
+invalidates the former timer, and events preserve an already armed timer's cadence.
+
+Four interleaved release pairs on the same M5 Max and display, with tracing disabled, compare
+the preceding binary with this change. Rest uses seconds 10–18 after the first frame; wheel
+uses seconds 1–9 after the script starts. Values are median process CPU, as percent of one core,
+from two kernel-counter reads per run.
+
+| scene | before | after |
+|---|---|---|
+| table at rest | 0.02364% | 0.01011% |
+| table under the wheel | 7.234% | 7.188% |
+
+Rest CPU fell by 57.2%, with a lower value in every pair; the absolute saving is small.
+Wheel remained within run-to-run variation. Normal and paranoid runs each passed 896 engine
+tests and 27 native-shell tests; the full scratch consumer suite passed 2,889 tests with
+44 ignored. These measurements make no allocation or GPU claim.

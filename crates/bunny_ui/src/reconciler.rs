@@ -2901,6 +2901,7 @@ mod tests {
         let printed = runtime.render(&page);
         assert!(printed.contains("line 3"), "{printed}");
         let _ = collect_garbage();
+        assert!(!runtime.slow_tick_needed(), "the settled scene has no clock work");
 
         page.lines.set(lines(4..=5));
         let printed = runtime.render(&page);
@@ -2909,8 +2910,10 @@ mod tests {
         assert_eq!(runtime.body_runs().len(), 3, "the list and its two new rows ran, the page did not: {:?}", runtime.body_runs());
         assert_eq!(replaced(), 1, "the list's last tree waits for the idle");
         assert_eq!(graveyard_len(), 3, "with the rows that left");
+        assert!(runtime.slow_tick_needed(), "the idle sweep keeps the slow clock armed");
 
         assert_eq!(collect_garbage(), 4, "the idle frees the tree and the rows");
+        assert!(!runtime.slow_tick_needed(), "the sweep lets the clock park");
         assert_eq!(replaced(), 0);
         let printed = runtime.render(&page);
         assert!(printed.contains("line 4") && printed.contains("line 5"), "the slot still holds today's tree: {printed}");
