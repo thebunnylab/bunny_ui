@@ -461,7 +461,9 @@ fragment float4 sprite_fragment(SpriteVary in [[stage_in]],
     SpriteInstance sprite = sprites[in.id];
     float2 p = in.position.xy + uniforms.origin;
     float2 ratio = (sprite.tex.zw - sprite.tex.xy) / (sprite.dest.zw - sprite.dest.xy);
-    float2 texel = sprite.tex.xy + (floor(p) - floor(sprite.dest.xy)) * ratio;
+    // Sample the pixel centre: a fast-math reciprocal just below one
+    // must not round an integer texel boundary into its left neighbour.
+    float2 texel = sprite.tex.xy + (p - sprite.dest.xy) * ratio;
     // straight alpha in, straight alpha out — only the coverage moves,
     // and text under a rounded corner loses its square edge at last
     float4 ink = atlas.read(uint2(texel));
@@ -3428,6 +3430,29 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn atlas_texel_centres_preserve_thin_columns_at_both_scales() {
+        use bunny_ui::layout::DrawCommand;
+        let text = crate::CoreTextEngine::new();
+        let display = DisplayList::from(patch_scene("alphax", true, 0.75).iter()
+            .filter(|command| !matches!(command, DrawCommand::Shadow { .. }))
+            .cloned().map(|command| match command {
+                DrawCommand::TextLine { origin, content, range, color, font } =>
+                    DrawCommand::TextLine { origin, content, range, color, font: font.family("Menlo") },
+                other => other,
+            }).collect::<Vec<_>>());
+        for scale in [1, 2] {
+            let physical = (160 * scale, 100 * scale);
+            let mut gpu = OffscreenGpu::new(physical.0, physical.1).expect("offscreen GPU");
+            gpu.present_wait(&display, scale, Color::CANVAS, &text, &RawImages::default());
+            let cpu = rasterize_with(&display, physical.0, physical.1, scale, Color::CANVAS, &text, &RawImages::default());
+            // An integer texel edge times a reciprocal just below one
+            // selected the previous column. Menlo at scale 1 exposed a
+            // 184-level error, while the older scale-2 scene passed.
+            assert_close(&gpu.read_rgba(), &cpu.to_rgba_bytes(), 2, "atlas texel centres");
         }
     }
 
