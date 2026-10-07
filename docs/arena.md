@@ -70,6 +70,38 @@ describe their recorded Bunny fixture, not a comparison with a verified common s
 The historical before/after tables below use the preserved script implementation from their
 source revisions. Binaries with the absolute-deadline protocol need a fresh comparison session.
 
+## Non-editor geometry and work
+
+The non-editor fixtures use `scene-geometry-v1`. The table has a 40 pt header above a
+1280×760 viewport, 24 pt rows with no gaps, and six left-aligned columns of 70/300/90/140/90/110 pt.
+Column gaps are 8 pt and the leading inset is 12 pt. Streaming starts empty at the top of a
+1280×800 viewport, with 28 pt rows, an 8 pt leading inset and one exact message per append.
+Both lists paint alternating row backgrounds across the viewport width. Their floor colour
+is `17171c`, the other stripe is `1c1c21`, and text is regular Menlo in `e6e6ea`.
+
+The canvas has the same 40 pt header, with a 240×240 drawing box at `(0,40)`. A 12 pt square
+in `e69933` follows a 72 pt radius orbit over two seconds. Headers use 13 pt regular Menlo
+with a 12 pt leading inset. Text stays vertically centred; native font rasterization remains
+part of the implementation being measured.
+
+`SCENE_READY` and `SCENE_DONE` report the actual layout, held scroll offset and content state
+at input boundaries. The observer uses the window's root and runtime, with an extra layout
+before the first input or after completion, outside the CPU counter window. Rest has no input
+and reports only completion. Streaming completion verifies every stored message and its count;
+an unchanged offset at the top is part of the scene, even after content exceeds the viewport.
+
+A separate `ARENA_SCENE_DIAGNOSTIC=1` run establishes actual motion. For `wheel`, it sends
+120 downward events at 240 Hz, allows one second to settle, records `SCENE_DOWN`, then repeats
+upward and records `SCENE_UP`. The expected settled offsets are 0 → 720 → 0 pt. For the canvas,
+`CANVAS_FRAME` samples the actual paint rectangle, marker and phase across wall time. These
+are paint observations, not presentation counts or input-to-photon measurements. The diagnostic
+changes the workload and must be unset for CPU, footprint and GPU runs.
+
+Admission combines observed geometry and content, own-window visual inspection, and separate
+motion diagnostics. Preserve their source and executable hashes with the frozen measurement
+session; completion counters alone cannot prove that content was drawn. Earlier non-editor
+tables below describe their recorded fixtures and predate this geometry contract.
+
 ## What is read
 
 CPU and footprint runs leave `BUNNY_PRESENT_TRACE` and `BUNNY_FRAME_STATS` unset. Detailed
@@ -115,6 +147,11 @@ the session; the display awake (a sleeping display stops every display link, and
 app never reports a frame); every window floated above the others (`BUNNY_WINDOW_FLOATING`), since
 a window opened from a background process lands behind the front one, and a covered window is a
 different workload; medians over runs; absolutes compared only inside one session's table.
+The graphical session must also remain unlocked: an awake display alone is insufficient.
+Read console/login/lock/display state before and after every sample, and sample it every
+500 ms in the parent collector. Preserve those observations and reject an observed lock or
+a sampling gap longer than 1.5 seconds; transitions between polls are not claimed observable. A window can still report layout and yield an own-window image
+while its native surface is occluded; neither observation alone admits a performance run.
 
 ## bunny_ui's own numbers
 
