@@ -8281,6 +8281,8 @@ mod tests {
         assert!(!cut.applied);
         assert_eq!(cut.output, None);
         assert!(!runtime.blink(), "a copy target asks for no caret repaint");
+        runtime.collect_garbage();
+        assert!(!runtime.slow_tick_needed(), "a copy target does not keep the clock awake");
 
         // another row, another answer
         runtime.layout(&table, viewport);
@@ -10895,11 +10897,14 @@ mod tests {
         let field = result.fields.first().expect("field placed").clone();
 
         // click in the middle of "abcdef" (PixelFont: 8px/char): between c and d
+        runtime.collect_garbage();
+        assert!(!runtime.slow_tick_needed(), "an unfocused field has no clock work");
         let x = field.text_origin.x + 3.0 * 8.0 + 2.0;
         let y = field.frame.origin.y + field.frame.size.height / 2.0;
         runtime.pointer_pressed(x, y);
         runtime.pointer_released(x, y);
         assert_eq!(runtime.focused(), Some(field.path.clone()));
+        assert!(runtime.slow_tick_needed(), "the focused caret arms the clock");
         // typing at the clicked point proves the position without exposing the index
         runtime.key(EditCommand::Insert("X".into()));
         assert!(runtime.render_stable(&form).contains("abcXdef"));
@@ -10932,6 +10937,8 @@ mod tests {
         // without focus, the tick requests no repaint
         runtime.blur();
         assert!(!runtime.blink());
+        runtime.collect_garbage();
+        assert!(!runtime.slow_tick_needed(), "blur parks the clock after its garbage is freed");
     }
 
     #[test]
@@ -11087,6 +11094,7 @@ mod tests {
         let (x, y) = (200.0, 50.0);
         assert!(!legend_frame().contains(x, y));
         assert!(runtime.wheel(x, y, 0.0, -200.0));
+        assert!(runtime.slow_tick_needed(), "the wheel latch needs its expiry ticks");
         assert!(legend_frame().contains(x, y), "the legend slid under the pointer");
 
         // the same gesture goes on: the page has it, the legend is quiet
@@ -11104,7 +11112,10 @@ mod tests {
         // two slow ticks with no wheel: the gesture is over, and the
         // next wheel is for what is under the pointer NOW
         runtime.wheel_tick();
+        assert!(runtime.slow_tick_needed(), "one tick cannot park a live gesture");
         runtime.wheel_tick();
+        runtime.collect_garbage();
+        assert!(!runtime.slow_tick_needed(), "the expired wheel latch lets the clock park");
         layout();
         assert!(legend_frame().contains(x, y));
         assert!(runtime.wheel(x, y, 0.0, -40.0));
@@ -13070,10 +13081,13 @@ mod tests {
         // tooltip's own idiom
         assert_eq!(runtime.chord(&k), KeyMatch::Pending);
         assert!(!runtime.chord_tick(), "one tick only ages it");
+        assert!(runtime.slow_tick_needed(), "a pending chord needs its second tick");
         assert_eq!(runtime.pending_chord(), vec![k]);
         assert!(runtime.chord_tick(), "the second lets the keyboard go");
         assert!(runtime.pending_chord().is_empty());
         assert!(!runtime.chord_tick(), "and an empty hand ticks for free");
+        runtime.collect_garbage();
+        assert!(!runtime.slow_tick_needed(), "an expired chord has no clock work");
 
         // a scoped sequence answers only while its context is mounted
         assert_eq!(runtime.chord(&k), KeyMatch::Pending);
@@ -14003,12 +14017,16 @@ mod tests {
         // prime the retained geometry, then hover the labelled view
         let _ = runtime.layout(&Rail, crate::layout::Proposal::exact(size));
         runtime.pointer_moved(10.0, 8.0, false);
+        assert!(runtime.slow_tick_needed(), "the tooltip wait arms the clock");
         assert_eq!(overlay_count(&runtime), 0, "no bubble before the wait");
         // the first beat only ages the wait
         assert!(!runtime.tooltip_tick(), "one beat is not the delay");
+        assert!(runtime.slow_tick_needed(), "the tooltip still needs its second tick");
         assert_eq!(overlay_count(&runtime), 0);
         // the second beat shows — and asks for a repaint
         assert!(runtime.tooltip_tick(), "the second beat shows the bubble");
+        runtime.collect_garbage();
+        assert!(!runtime.slow_tick_needed(), "a shown tooltip no longer waits on the clock");
         let result = runtime.layout(&Rail, crate::layout::Proposal::exact(size));
         let bubble = result
             .overlays

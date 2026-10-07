@@ -375,6 +375,8 @@ impl Default for Manners {
 fn forget_window(window: usize) {
     // a window that closed wants no beat
     BEAT_WANTS.with(|wants| wants.borrow_mut().retain(|(open, _)| *open != window));
+    let blinking = BLINK_WANTS.with(|wants| wants.borrow_mut().remove(window));
+    set_blinking(blinking);
     let view = WINDOWS.with(|windows| {
         windows
             .borrow()
@@ -409,16 +411,7 @@ pub fn close_top_level(window: usize) {
 unsafe fn start_beat(window: Id, view: Id, delegate: Id) {
     unsafe {
         BEAT_OWNER.with(|owner| owner.set(window as usize));
-        // the caret blink half-period — the run loop retains the timer
-        let _ = msg_timer(
-            class("NSTimer"),
-            sel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
-            0.5,
-            delegate,
-            sel("bunnyBlink:"),
-            std::ptr::null_mut(),
-            1,
-        );
+        install_blink(delegate);
 
         // the frame driver: a display link owned by the view, delivered
         // by SELECTOR on the main run loop (macOS 14+) — no blocks, no
@@ -1690,6 +1683,11 @@ extern "C" fn bunny_window_will_close(_this: Id, _sel: Sel, note: Id) {
 }
 
 thread_local! {
+    /// One slow housekeeping timer, retained by its run loop even while
+    /// parked. Replacing the beat owner invalidates the old timer first.
+    static BLINK: Cell<Id> = const { Cell::new(std::ptr::null_mut()) };
+    static BLINKING: Cell<bool> = const { Cell::new(false) };
+    static BLINK_WANTS: RefCell<SlowTicks> = const { RefCell::new(SlowTicks(Vec::new())) };
     /// The window's display link — born paused; the shell resumes it
     /// only while animations run. Zero-ivar classes: per-window state
     /// lives beside the run loop (the backing-store pattern).
@@ -1707,6 +1705,73 @@ thread_local! {
     /// Where the alarm points now, by the wall; a re-aim within half a
     /// millisecond of it is skipped.
     static TASKS_AIM: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+/// The slow clock serves every window that still has work for it.
+#[derive(Default)]
+struct SlowTicks(Vec<(usize, bool)>);
+
+impl SlowTicks {
+    fn set(&mut self, window: usize, needed: bool) -> bool {
+        match self.0.iter_mut().find(|(open, _)| *open == window) {
+            Some(entry) => entry.1 = needed,
+            None => self.0.push((window, needed)),
+        }
+        self.any()
+    }
+
+    fn remove(&mut self, window: usize) -> bool {
+        self.0.retain(|(open, _)| *open != window);
+        self.any()
+    }
+
+    fn any(&self) -> bool {
+        self.0.iter().any(|(_, needed)| *needed)
+    }
+}
+
+/// One window asks for the slow clock; an idle window cannot park it
+/// under another window's caret, deadline or pending frame.
+pub(crate) fn want_blink(window: usize, needed: bool) {
+    let needed = BLINK_WANTS.with(|wants| wants.borrow_mut().set(window, needed));
+    set_blinking(needed);
+}
+
+fn set_blinking(needed: bool) {
+    let timer = BLINK.with(Cell::get);
+    if timer.is_null() || BLINKING.with(|running| running.replace(needed)) == needed {
+        return;
+    }
+    unsafe {
+        let date = if needed {
+            msg_id_f64(class("NSDate"), sel("dateWithTimeIntervalSinceNow:"), 0.5)
+        } else {
+            msg_id(class("NSDate"), sel("distantFuture"))
+        };
+        msg_void_id(timer, sel("setFireDate:"), date);
+    }
+}
+
+unsafe fn install_blink(delegate: Id) {
+    unsafe {
+        let old = BLINK.with(|slot| slot.replace(std::ptr::null_mut()));
+        if !old.is_null() {
+            msg_void(old, sel("invalidate"));
+        }
+        let timer = msg_timer(
+            class("NSTimer"),
+            sel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+            0.5,
+            delegate,
+            sel("bunnyBlink:"),
+            std::ptr::null_mut(),
+            1,
+        );
+        msg_void_id(timer, sel("setFireDate:"), msg_id(class("NSDate"), sel("distantFuture")));
+        BLINK.with(|slot| slot.set(timer));
+        BLINKING.with(|running| running.set(false));
+        set_blinking(BLINK_WANTS.with(|wants| wants.borrow().any()));
+    }
 }
 
 /// How fast the shell drives frames — the ffi twin of the runtime's
@@ -4528,6 +4593,51 @@ unsafe fn tiff_to_png(tiff: Id) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_still_window_cannot_park_another_windows_slow_clock() {
+        let mut ticks = SlowTicks::default();
+        assert!(!ticks.set(1, false));
+        assert!(ticks.set(2, true));
+        assert!(ticks.set(1, false));
+        assert!(ticks.remove(1));
+        assert!(!ticks.remove(2));
+        assert!(!ticks.set(2, false), "a reused window identity has no old request");
+    }
+
+    #[test]
+    fn the_blink_timer_parks_and_leaves_with_its_owner() {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let delegate = msg_id(msg_id(class("NSObject"), sel("alloc")), sel("init"));
+            BLINK_WANTS.with(|wants| wants.borrow_mut().0.clear());
+            install_blink(delegate);
+            let first = BLINK.with(Cell::get);
+            msg_id(first, sel("retain"));
+            let fire_at = |timer| msg_f64(msg_id(timer, sel("fireDate")), sel("timeIntervalSinceReferenceDate"));
+            let parked = fire_at(first);
+            want_blink(1, true);
+            let armed = fire_at(first);
+            assert!(armed < parked, "work brings the parked clock back");
+            want_blink(2, false);
+            assert_eq!(fire_at(first).to_bits(), armed.to_bits(), "another event preserves the armed cadence");
+            install_blink(delegate);
+            let second = BLINK.with(Cell::get);
+            assert_ne!(first, second);
+            assert_eq!(msg_bool(first, sel("isValid")), 0, "the former owner leaves no timer behind");
+            assert_ne!(msg_bool(second, sel("isValid")), 0);
+            assert!(fire_at(second) < parked, "the surviving window's request follows the owner");
+            want_blink(1, false);
+            assert_eq!(fire_at(second).to_bits(), parked.to_bits(), "the last request parks the timer");
+            BLINK.with(|slot| slot.set(std::ptr::null_mut()));
+            msg_void(second, sel("invalidate"));
+            BLINK_WANTS.with(|wants| wants.borrow_mut().0.clear());
+            BLINKING.with(|running| running.set(false));
+            msg_void(first, sel("release"));
+            msg_void(delegate, sel("release"));
+            objc_autoreleasePoolPop(pool);
+        }
+    }
 
     /// A frame's four outfits reach macOS 15's frame cursor at a position on
     /// their own axis, in the SDK's bits (`NSCursor.h`: top 1, left 2,
