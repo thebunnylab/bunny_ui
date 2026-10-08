@@ -103,6 +103,19 @@ type D3dCompileFn = unsafe extern "system" fn(
 
 const DRIVER_TYPE_HARDWARE: u32 = 1;
 const DRIVER_TYPE_WARP: u32 = 5;
+
+#[derive(Clone, Copy)]
+enum Driver {
+    Hardware,
+    Warp,
+}
+
+/// `D3D_SHADER_MACRO`: two `LPCSTR`s, followed by a null sentinel.
+#[repr(C)]
+struct ShaderDefine {
+    name: *const i8,
+    definition: *const i8,
+}
 const CREATE_DEVICE_BGRA_SUPPORT: u32 = 0x20;
 const SDK_VERSION: u32 = 7;
 const FEATURE_LEVEL_11_0: u32 = 0xb000;
@@ -1009,7 +1022,15 @@ float4 blur_fragment(BlitVary vary) : SV_Target {
         float2 away = away_step * BLUR_O[i];
         acc += (blur_tap(uv + away) + blur_tap(uv - away)) * BLUR_W[i];
     }
+#ifdef BUNNY_GLASS_BYTE_PRECISION
+    // The CPU pyramid stores ideal, rounded sRGB bytes. WARP's
+    // permitted transfer-function precision compounds across passes;
+    // center the value on that byte grid before its sRGB RTV encodes it.
+    float3 encoded = floor(saturate(linear_to_srgb3(acc.rgb)) * 255.0 + 0.5) / 255.0;
+    return float4(srgb_to_linear3(encoded), floor(saturate(acc.a) * 255.0 + 0.5) / 255.0);
+#else
     return acc;
+#endif
 }
 
 struct GlassVary {
@@ -1194,17 +1215,30 @@ fn compiler() -> Option<D3dCompileFn> {
     address.map(|address| unsafe { std::mem::transmute::<usize, D3dCompileFn>(address) })
 }
 
-unsafe fn compile_shader(compile: D3dCompileFn, entry: &str, target: &str) -> Option<Com<Blob>> {
+unsafe fn compile_shader(
+    compile: D3dCompileFn,
+    entry: &str,
+    target: &str,
+    driver: Driver,
+) -> Option<Com<Blob>> {
     let entry = CString::new(entry).expect("entry without NUL");
     let target = CString::new(target).expect("target without NUL");
     let mut code: *mut Blob = null_mut();
     let mut errors: *mut Blob = null_mut();
+    let defines = [
+        ShaderDefine { name: c"BUNNY_GLASS_BYTE_PRECISION".as_ptr(), definition: c"1".as_ptr() },
+        ShaderDefine { name: null(), definition: null() },
+    ];
+    let defines = match driver {
+        Driver::Hardware => null(),
+        Driver::Warp => defines.as_ptr().cast(),
+    };
     let hr = unsafe {
         compile(
             SHADER_SOURCE.as_ptr() as *const c_void,
             SHADER_SOURCE.len(),
             null(),
-            null(),
+            defines,
             null(),
             entry.as_ptr(),
             target.as_ptr(),
@@ -1275,6 +1309,10 @@ impl D3dStack {
     }
 
     fn build(warp_fallback: bool) -> Result<D3dStack, String> {
+        Self::build_on(Driver::Hardware, warp_fallback)
+    }
+
+    fn build_on(mut driver: Driver, warp_fallback: bool) -> Result<D3dStack, String> {
         let compile = compiler().ok_or("no d3dcompiler_47.dll on this system")?;
         let levels = [FEATURE_LEVEL_11_0];
         let mut device: *mut Device = null_mut();
@@ -1282,7 +1320,10 @@ impl D3dStack {
         let mut hr = unsafe {
             D3D11CreateDevice(
                 null_mut(),
-                DRIVER_TYPE_HARDWARE,
+                match driver {
+                    Driver::Hardware => DRIVER_TYPE_HARDWARE,
+                    Driver::Warp => DRIVER_TYPE_WARP,
+                },
                 0,
                 CREATE_DEVICE_BGRA_SUPPORT,
                 levels.as_ptr(),
@@ -1294,6 +1335,7 @@ impl D3dStack {
             )
         };
         if !com_ok(hr) && warp_fallback {
+            driver = Driver::Warp;
             hr = unsafe {
                 D3D11CreateDevice(
                     null_mut(),
@@ -1317,7 +1359,7 @@ impl D3dStack {
         let d = device.as_ptr();
         unsafe {
             let shader = |entry: &str, target: &str| -> Result<Com<Blob>, String> {
-                compile_shader(compile, entry, target)
+                compile_shader(compile, entry, target, driver)
                     .ok_or_else(|| format!("shader {entry} did not compile"))
             };
             let make_vs = |blob: &Com<Blob>, name: &str| -> Result<Com<VertexShader>, String> {
@@ -3809,6 +3851,10 @@ impl OffscreenD3d {
             return None;
         }
         let stack = D3dStack::create(true)?;
+        Self::with_stack(width, height, stack)
+    }
+
+    fn with_stack(width: usize, height: usize, stack: D3dStack) -> Option<OffscreenD3d> {
         let device = stack.device.as_ptr();
         let context = stack.context.as_ptr();
         let desc = Texture2dDesc {
@@ -4048,23 +4094,31 @@ mod tests {
         scale: usize,
         canvas: Color,
     ) -> (Vec<u8>, Vec<u8>) {
-        let physical = (
-            (logical.width.round() as usize) * scale,
-            (logical.height.round() as usize) * scale,
-        );
+        let physical =
+            ((logical.width.round() as usize) * scale, (logical.height.round() as usize) * scale);
+        let gpu = OffscreenD3d::new(physical.0, physical.1).expect("offscreen gpu");
+        scene_bytes_on(root, logical, scale, canvas, gpu)
+    }
+
+    fn scene_bytes_on(
+        root: &impl View,
+        logical: Size,
+        scale: usize,
+        canvas: Color,
+        mut gpu: OffscreenD3d,
+    ) -> (Vec<u8>, Vec<u8>) {
         let runtime = Runtime::new();
         let display = runtime.display_frame(root, logical);
         let cpu = rasterize_with(
             &display,
-            physical.0,
-            physical.1,
+            gpu.width,
+            gpu.height,
             scale,
             canvas,
             &PixelFont,
             &RawImages::default(),
         )
         .to_rgba_bytes();
-        let mut gpu = OffscreenD3d::new(physical.0, physical.1).expect("offscreen gpu");
         gpu.present_wait(&display, scale, canvas, &PixelFont, &RawImages::default());
         (gpu.read_rgba(), cpu)
     }
@@ -4876,22 +4930,44 @@ mod tests {
         // two panes that OVERLAP must not share one capture of the
         // scene: the upper one would sample a blur taken before the
         // lower one existed, and the glass under it would vanish
-        use bunny_ui::layout::Glass;
-        let root = zstack!((
-            empty()
-                .frame_width(240.0)
-                .frame_height(160.0)
-                .background_gradient(bunny_ui::layout::Gradient::linear(
-                    Color::hex(0x102A64),
-                    Color::hex(0xE8D14A),
-                )),
-            empty().frame(180.0, 110.0).corner_radius(28.0).glass(Glass::regular()),
-            empty().frame(90.0, 60.0).corner_radius(18.0).glass(Glass::clear()),
-        ));
-        let (gpu, cpu) =
-            scene_bytes(&root, Size { width: 240.0, height: 160.0 }, 2, Color::CANVAS);
+        let (gpu, cpu) = scene_bytes(
+            &stacked_pane_scene(),
+            Size { width: 240.0, height: 160.0 },
+            2,
+            Color::CANVAS,
+        );
         // a pane over a pane compounds: the upper one samples a scene
         // that already carries the lower one's own difference
         assert_glass_close(&gpu, &cpu, 6, 0.015, "stacked panes");
+    }
+
+    #[test]
+    fn stacked_panes_on_warp_keep_the_same_material_precision() {
+        if !device_present() {
+            return;
+        }
+        // Exercise software even on a host with a hardware adapter, so
+        // its repeated sRGB conversions cannot hide behind the GPU path.
+        let stack = D3dStack::build_on(Driver::Warp, false).expect("WARP stack");
+        let gpu = OffscreenD3d::with_stack(480, 320, stack).expect("WARP target");
+        let (gpu, cpu) = scene_bytes_on(
+            &stacked_pane_scene(),
+            Size { width: 240.0, height: 160.0 },
+            2,
+            Color::CANVAS,
+            gpu,
+        );
+        assert_glass_close(&gpu, &cpu, 6, 0.015, "stacked panes on WARP");
+    }
+
+    fn stacked_pane_scene() -> impl View {
+        use bunny_ui::layout::Glass;
+        zstack!((
+            empty().frame_width(240.0).frame_height(160.0).background_gradient(
+                bunny_ui::layout::Gradient::linear(Color::hex(0x102A64), Color::hex(0xE8D14A),)
+            ),
+            empty().frame(180.0, 110.0).corner_radius(28.0).glass(Glass::regular()),
+            empty().frame(90.0, 60.0).corner_radius(18.0).glass(Glass::clear()),
+        ))
     }
 }
