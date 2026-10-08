@@ -63,7 +63,10 @@ def main():
         # A failing core invocation can stop Cargo before it reaches a native
         # dependent. Each touched package must therefore run independently.
         for package in arguments.package:
-            command = ["cargo", "clippy", "--locked", "--all-targets", "--all-features",
+            # Retain independently compilable targets after one fails. Without
+            # this, a library error can cancel its test target and make inherited
+            # test-only warnings appear new on whichever revision ran farther.
+            command = ["cargo", "clippy", "--locked", "--all-targets", "--all-features", "--keep-going",
                        "--no-deps", "--message-format=json", "--target-dir", str(output / (name + "-target")),
                        "-p", package, "--", "-D", "warnings"]
             log = output / (name + "-" + package + ".jsonl")
