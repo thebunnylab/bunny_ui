@@ -6,27 +6,97 @@ use bunny_ui::raster::{Bitmap, rasterize_with};
 
 const MAX_BASE_PIXELS: usize = 8 * 1024 * 1024;
 
+/// The window base is prepared once. An eight-bit image can declare its
+/// opaque pixels without imposing image preparation on entering scroll rows.
+struct OpaqueBase(Id);
+
+impl OpaqueBase {
+    fn new(bitmap: &Bitmap) -> Option<Self> {
+        if bitmap.width() == 0
+            || bitmap.height() == 0
+            || bitmap.pixels().iter().any(|pixel| pixel & 255 != 255)
+        {
+            return None;
+        }
+        let stride = bitmap.width().checked_mul(4)?;
+        let pixels = bitmap.to_rgba_bytes();
+        unsafe {
+            let provider = crate::ffi::owned_provider(pixels.as_ptr(), pixels.len());
+            if provider.is_null() {
+                return None;
+            }
+            let space = crate::ffi::CGColorSpaceCreateDeviceRGB();
+            if space.is_null() {
+                crate::ffi::CGDataProviderRelease(provider);
+                return None;
+            }
+            // kCGImageAlphaNoneSkipLast: RGBX bytes, no transparency.
+            let image = crate::ffi::CGImageCreate(
+                bitmap.width(),
+                bitmap.height(),
+                8,
+                32,
+                stride,
+                space,
+                5,
+                provider,
+                std::ptr::null(),
+                false,
+                0,
+            );
+            crate::ffi::CGColorSpaceRelease(space);
+            crate::ffi::CGDataProviderRelease(provider);
+            (!image.is_null()).then(|| Self(image))
+        }
+    }
+}
+
+impl Drop for OpaqueBase {
+    fn drop(&mut self) {
+        unsafe { crate::ffi::CGImageRelease(self.0) };
+    }
+}
+
+enum BaseBacking {
+    Image(OpaqueBase),
+    Surface(software_patch::Surface),
+}
+
+impl BaseBacking {
+    fn new(bitmap: &Bitmap) -> Option<Self> {
+        if let Some(image) = OpaqueBase::new(bitmap) {
+            return Some(Self::Image(image));
+        }
+        let surface = software_patch::Surface::new((bitmap.width(), bitmap.height()))?;
+        surface.write(bitmap).then_some(Self::Surface(surface))
+    }
+
+    fn raw(&self) -> Id {
+        match self {
+            Self::Image(image) => image.0,
+            Self::Surface(surface) => surface.raw,
+        }
+    }
+}
+
 struct BaseLayer {
     raw: Id,
-    surface: software_patch::Surface,
+    backing: BaseBacking,
 }
 
 impl BaseLayer {
     unsafe fn new(root: Id) -> Option<Self> {
         unsafe {
-            let surface = software_patch::Surface::new((1, 1))?;
-            if !surface.write(&Bitmap::new(1, 1, bunny_ui::theme::canvas())) {
-                return None;
-            }
+            let backing = BaseBacking::new(&Bitmap::new(1, 1, bunny_ui::theme::canvas()))?;
             let raw = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
             if raw.is_null() {
                 return None;
             }
             kill_layer_actions(raw);
             msg_void_bool(raw, sel("setOpaque:"), 1);
-            msg_void_id(raw, sel("setContents:"), surface.raw);
+            msg_void_id(raw, sel("setContents:"), backing.raw());
             msg_void_id_u64(root, sel("insertSublayer:atIndex:"), raw, 0);
-            Some(Self { raw, surface })
+            Some(Self { raw, backing })
         }
     }
 
@@ -48,17 +118,14 @@ impl BaseLayer {
     }
 
     unsafe fn paint(&mut self, bitmap: &Bitmap, size: Size, scale: usize) -> bool {
-        let Some(surface) = software_patch::Surface::new((bitmap.width(), bitmap.height())) else {
+        let Some(backing) = BaseBacking::new(bitmap) else {
             return false;
         };
-        if !surface.write(bitmap) {
-            return false;
-        }
         unsafe {
             self.size(size, scale);
-            msg_void_id(self.raw, sel("setContents:"), surface.raw);
+            msg_void_id(self.raw, sel("setContents:"), backing.raw());
         }
-        self.surface = surface;
+        self.backing = backing;
         true
     }
 }
@@ -413,6 +480,47 @@ mod tests {
             corner_radius: Corners::ZERO,
         });
         DisplayList::from(commands)
+    }
+
+    #[test]
+    fn the_static_image_owns_its_bytes_and_refuses_transparency() {
+        unsafe extern "C" {
+            fn CGImageGetAlphaInfo(image: Id) -> u32;
+            fn CGImageGetDataProvider(image: Id) -> Id;
+            fn CGDataProviderCopyData(provider: Id) -> Id;
+            fn CFDataGetLength(data: Id) -> isize;
+            fn CFDataGetBytePtr(data: Id) -> *const u8;
+        }
+        let image = {
+            let bitmap = Bitmap::new(2, 2, Color::hex(0x123456));
+            OpaqueBase::new(&bitmap).unwrap()
+        };
+        unsafe {
+            assert_eq!(CGImageGetAlphaInfo(image.0), 5);
+            let data = CGDataProviderCopyData(CGImageGetDataProvider(image.0));
+            assert!(!data.is_null());
+            assert_eq!(CFDataGetLength(data), 16);
+            assert_eq!(
+                std::slice::from_raw_parts(CFDataGetBytePtr(data), 16),
+                &[0x12, 0x34, 0x56, 0xff].repeat(4)
+            );
+            CFRelease(data);
+        }
+        let transparent = Bitmap::new(
+            2,
+            2,
+            Color {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 128,
+            },
+        );
+        assert!(OpaqueBase::new(&transparent).is_none());
+        assert!(matches!(
+            BaseBacking::new(&transparent),
+            Some(BaseBacking::Surface(_))
+        ));
     }
 
     #[test]

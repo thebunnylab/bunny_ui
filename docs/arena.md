@@ -645,3 +645,72 @@ presentation timestamps or a guarantee that every possible source of jitter
 is gone. Deterministic clock tests cover all sampled timer phases at 30, 60
 and 120 Hz, a stalled link and its resumption. The macOS normal and paranoid
 suites each pass 30 tests.
+
+
+## Opaque native composition (2026-10-08)
+
+A layer's opaque flag alone does not remove the alpha channel from its image.
+On Apple Silicon, admitted opaque scroll bands now use the public `w30r`
+IOSurface format (30RGBLEPackedWideGamut). Its three channels occupy the same
+four bytes per pixel; each SDR byte has the exact extended-range code
+`384 + 2 * byte`. A write containing transparency is refused before any shared
+pixel changes. Other architectures or refused allocations retain BGRA.
+Existing band admission, exact matching, conservative retirement and fallback
+are unchanged; no new cache or periodic work is introduced.
+
+The native window's static opaque base uses an immutable eight-bit RGBX image.
+Its data provider owns the bytes after the source bitmap is dropped. This image
+is prepared for the base, not for every entering row. A translucent bitmap or
+refused image allocation retains the ordinary BGRA surface. The combination
+keeps the moving-row path free of per-row image preparation while declaring
+opacity for both the base and its moving children.
+
+Three interleaved release pairs compare `180a375` with this change on the same
+M5 Max and 1x/60 Hz display. CPU uses two kernel-counter reads over seconds 1–9
+of the ten-second wheel script, with diagnostics disabled. Separate GPU runs
+record seven seconds starting three seconds into a thirty-second script. All
+six CPU and six GPU samples pass host, workload and native-state admission;
+there are no concurrent measurements or builds within sixty seconds of timing.
+
+| wheel metric | before | after |
+|---|---:|---:|
+| median CPU, one core | 7.284095% | 7.277229% |
+| observed app + global compositor GPU | 11.789803 ms/s | 6.233249 ms/s |
+| physical footprint | 42–43 MB | 54 MB |
+
+GPU decreases by 47.13%, lower in every pair. Ranges are 11.737083–11.799157
+before and 6.136265–6.261507 after. Recorded app GPU is zero throughout; the
+remaining observation is the global WindowServer, not exclusive attribution
+to this window. The CPU difference is small variation, not a CPU speedup.
+The static image adds resident memory: this is a GPU improvement with a memory
+tradeoff, not an allocation reduction.
+
+All 24 separate guard samples pass. Every active median stays within the
+predeclared 5% CPU regression limit. Footprint is observed after the CPU window.
+
+| guard | CPU before | CPU after | footprint before / after |
+|---|---:|---:|---:|
+| type, 400 lines | 0.585348% | 0.574532% | 32 / 32 MB |
+| chat streaming | 1.979532% | 1.952747% | 34–35 / 44–45 MB |
+| animated canvas | 2.016748% | 2.039585% | 36 / 36 MB |
+| table at rest | 0.003300% | 0.004366% | 34 / 45–46 MB |
+
+Rest uses seconds 10–18 after the first frame. Each version has one exactly
+unchanged counter interval. Ranges are 0–0.023369% before and 0–0.004469% after;
+the median difference is +0.001066 percentage points. This session does not
+establish a zero median, identical idle cost or a universal zero-CPU guarantee.
+
+Exact-position production pixels at frames 1, 10, 11, 30, 99, 100 and 101 pass
+the unchanged tolerance of two channel levels. Thirty-two native-base/Metal
+comparisons cover repeat, forward/reverse motion, unsupported paint, resize,
+forced 2x raster scale and theme changes, including one-way promotion. Native
+arena pixels, scroll travel, streaming state and canvas motion also pass.
+The monitor is physically 1x; forced-scale and unit coverage do not constitute
+a measurement on a physical 2x monitor.
+
+Normal and paranoid Apple suites each pass 85 tests; the unchanged recovery
+correction passes 30 macOS tests in each mode. iOS compiles and the complete
+scratch consumer suite passes 2,889 tests with 44 ignored. Strict Apple lint
+retains the same 34 baseline diagnostics, with no new signatures; this is not
+a green strict-clippy gate. Frozen sources, executables, collectors, all raw
+samples and rejected candidates are preserved separately from these docs.
