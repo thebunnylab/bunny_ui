@@ -625,3 +625,23 @@ CPU medians are 7.27665% before and 7.45021% after (+2.39%, inside the 5% active
 regression guard); footprints are 44 MB before and 41–42 MB after. The earlier
 prototype's +1.39% result is retained separately. Idle and active footprints
 have different lifetimes and are not interchangeable.
+
+
+## Recovery yields to healthy display beats (2026-10-08)
+
+The macOS shell's half-second recovery callback used to drain pending input
+even while the display link was advancing normally. During continuous wheel
+input this could split one display interval into two shorter scroll advances.
+Recovery now requires at least 100 ms without a display beat. It still rescues
+a missing link, yields when the link resumes, and keeps the existing timer's
+parking and cadence. Input deadlines, counts and total travel are unchanged.
+
+Two separate twelve-second diagnostic runs compare the preceding renderer
+with the correction. Blink-origin scroll publications fall from 22 to zero;
+the candidate records 718 display-beat publications and one initial input
+publication. Exact-position pixels around the hundredth row and native
+0 → 720 → 0 pt travel pass. These are publication traces, not physical
+presentation timestamps or a guarantee that every possible source of jitter
+is gone. Deterministic clock tests cover all sampled timer phases at 30, 60
+and 120 Hz, a stalled link and its resumption. The macOS normal and paranoid
+suites each pass 30 tests.
