@@ -14,10 +14,11 @@
 //! polls `status`, because the whole shell is one thread and a completion
 //! handler would be the only concurrent code in the codebase.
 //!
-//! The GPU is the DEFAULT presentation of a window; `BUNNY_PRESENT=cpu`
-//! forces the CPU raster, and any Metal failure falls back to it with
-//! one line on stderr. The choice happens ONCE, at window creation —
-//! a window never switches backends mid-flight.
+//! On macOS, [`WindowPresenter`] starts bounded opaque scroll scenes on
+//! native layers and creates this GPU backend only when their paint needs
+//! it. Promotion is one-way and transactional. iOS uses Metal immediately.
+//! `BUNNY_PRESENT=cpu` keeps the explicit CPU backend; failure to initialize
+//! Metal reports the cause and retains the software fallback.
 //!
 //! The LAW of the port: every policy decision — snapping, radius clamps,
 //! stroke thickness, shadow reach, the clip stack — is resolved on the
@@ -53,6 +54,10 @@ use crate::ffi::{CFRelease, CFRetain, CGPoint, CGRect, CGSize, Id, Sel, class, e
 mod software_patch;
 #[cfg(target_os = "macos")]
 mod scroll_bands;
+#[cfg(target_os = "macos")]
+mod window;
+#[cfg(target_os = "macos")]
+pub use window::WindowPresenter;
 
 // MARK: - FFI border
 
