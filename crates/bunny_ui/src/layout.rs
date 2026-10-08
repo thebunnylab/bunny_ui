@@ -4382,22 +4382,28 @@ pub(crate) fn layout_placing(
     out.safe = (insets != Edges::ZERO).then_some(SafeFrame { window, safe });
     crate::stats::time(crate::stats::Stage::Place, || root.place(safe, &fit, &env, &mut out));
     place_overlays(container, &env, &mut out);
-    if !keep_unseen && crate::paranoid::on(crate::paranoid::SEEN) {
+    if crate::paranoid::on(crate::paranoid::SEEN) {
         // the claim of the cut: the list is the FULL list with what no
         // pixel can show taken out, and nothing else in the placement
-        // moved. The scene is placed again with the cut off, filtered by
-        // the same rule as a pure function of the list, and compared.
-        let mut full = Placement { keep_unseen: true, safe: out.safe, ..Placement::default() };
+        // moved. Place the opposite path too, compare the cut against the
+        // full list's pure filter, and return the caller's original choice.
+        let mut other = Placement {
+            keep_unseen: !keep_unseen,
+            thumb_layers: keep_unseen && thumb_layers(),
+            safe: out.safe,
+            ..Placement::default()
+        };
         // the check places the scene again: its counts are nobody's
         let counted = crate::stats::snapshot();
-        root.place(safe, &fit, &env, &mut full);
-        place_overlays(container, &env, &mut full);
+        root.place(safe, &fit, &env, &mut other);
+        place_overlays(container, &env, &mut other);
         crate::stats::restore(counted);
+        let (full, cut) = if keep_unseen { (&out, &other) } else { (&other, &out) };
         let seen = full.display.seen_only();
         assert!(
-            seen.as_slice() == out.display.as_slice(),
+            seen.as_slice() == cut.display.as_slice(),
             "paranoid(seen): the placement's cut and the filter of the full list differ — {} commands against {} (the full list holds {})",
-            out.display.len(),
+            cut.display.len(),
             seen.len(),
             full.display.len(),
         );
@@ -4405,26 +4411,26 @@ pub(crate) fn layout_placing(
         // ones nested in it: the cut's frames are the full placement's, in
         // order, with some left out — never one moved, never one invented
         let mut all = full.frames.entries.iter();
-        let frames_agree = out.frames.entries.iter().all(|kept| all.any(|entry| entry == kept));
+        let frames_agree = cut.frames.entries.iter().all(|kept| all.any(|entry| entry == kept));
         // …and a hover group off the glass is not asked whether it paints a
         // hover nobody can give it
-        let groups_agree = out.sensitive_groups.iter().all(|group| full.sensitive_groups.contains(group));
+        let groups_agree = cut.sensitive_groups.iter().all(|group| full.sensitive_groups.contains(group));
         assert!(
-            full.hits == out.hits
+            full.hits == cut.hits
                 && frames_agree
                 && groups_agree
-                && full.scrolls.len() == out.scrolls.len()
-                && full.fields.len() == out.fields.len()
-                && full.customs.len() == out.customs.len()
-                && full.hosts.len() == out.hosts.len()
-                && full.tooltips.len() == out.tooltips.len()
-                && full.menus.len() == out.menus.len()
-                && full.drag_sources.len() == out.drag_sources.len()
-                && full.drops.len() == out.drops.len()
-                && full.overlays.len() == out.overlays.len()
-                && full.misses == out.misses
-                && full.drag_regions == out.drag_regions
-                && full.hover_sensitive == out.hover_sensitive,
+                && full.scrolls.len() == cut.scrolls.len()
+                && full.fields.len() == cut.fields.len()
+                && full.customs.len() == cut.customs.len()
+                && full.hosts.len() == cut.hosts.len()
+                && full.tooltips.len() == cut.tooltips.len()
+                && full.menus.len() == cut.menus.len()
+                && full.drag_sources.len() == cut.drag_sources.len()
+                && full.drops.len() == cut.drops.len()
+                && full.overlays.len() == cut.overlays.len()
+                && full.misses == cut.misses
+                && full.drag_regions == cut.drag_regions
+                && full.hover_sensitive == cut.hover_sensitive,
             "paranoid(seen): the cut moved something other than the draw list",
         );
     }
@@ -5684,7 +5690,9 @@ impl LayoutNode {
                     // text never grows the box — it scrolls. The line
                     // height is a probe's, as the placement's is: a note
                     // is never shaped whole as one line to learn it
-                    let line_h = env.cache.get_or_measure("0", &env.font, env.text).height();
+                    let line_h = env.line_height.unwrap_or_else(|| {
+                        env.cache.get_or_measure("0", &env.font, env.text).height()
+                    });
                     let width = proposal
                         .width
                         .unwrap_or_else(|| note_natural_width(sample, env) + 2.0 * FIELD_PAD_H);
@@ -5698,7 +5706,8 @@ impl LayoutNode {
                 } else {
                     let metrics = env.cache.get_or_measure(sample, &env.font, env.text);
                     let width = proposal.width.unwrap_or(metrics.width + 2.0 * FIELD_PAD_H);
-                    (Size { width, height: metrics.height() + 2.0 * FIELD_PAD_V }, Fit::Leaf)
+                    let line_h = env.line_height.unwrap_or(metrics.height());
+                    (Size { width, height: line_h + 2.0 * FIELD_PAD_V }, Fit::Leaf)
                 }
             }
 
@@ -6388,7 +6397,10 @@ impl LayoutNode {
                     &env.font,
                     env.text,
                 );
-                let line_h = metrics.height();
+                // The line box owns caret, selection and scroll geometry;
+                // the font keeps its own raster, centred by half-leading.
+                let line_h = env.line_height.unwrap_or(metrics.height());
+                let leading = (line_h - metrics.height()) / 2.0;
                 let inner = (frame.size.width - 2.0 * FIELD_PAD_H).max(0.0);
                 let inner_h = (frame.size.height - 2.0 * FIELD_PAD_V).max(0.0);
                 // one shape, one loop: the one-line field is the field
@@ -6453,17 +6465,21 @@ impl LayoutNode {
                 // the same discipline the row window keeps, and the walk
                 // starts at the first of them (a line before it is checked
                 // anyway, for the rounding)
+                let paint_top = leading.min(0.0);
+                let paint_bottom = line_h.max(leading + metrics.height());
                 let first = if line_h > 0.0 {
-                    (((frame.origin.y - text_origin.y) / line_h).floor().max(0.0) as usize).saturating_sub(1)
+                    let before = ((paint_bottom - line_h) / line_h).ceil().max(0.0) as usize;
+                    (((frame.origin.y - text_origin.y) / line_h).floor().max(0.0) as usize)
+                        .saturating_sub(1).saturating_sub(before)
                 } else {
                     0
                 };
                 for (index, &(start, end)) in lines.iter().enumerate().skip(first) {
                     let y = text_origin.y + index as Px * line_h;
-                    if y >= frame.origin.y + frame.size.height {
+                    if y + paint_top >= frame.origin.y + frame.size.height {
                         break;
                     }
-                    if y + line_h <= frame.origin.y {
+                    if y + paint_bottom <= frame.origin.y {
                         continue;
                     }
                     let (line_x, line_w, line_rtl) = line_geometry(start, end);
@@ -6504,7 +6520,7 @@ impl LayoutNode {
                             sample,
                             (start, end),
                             highlights.as_ref().filter(|_| !content.is_empty()),
-                            Point { x: line_x, y },
+                            Point { x: line_x, y: y + leading },
                             color,
                             env,
                             out,
@@ -6573,7 +6589,11 @@ impl LayoutNode {
                     // Keep the covered character readable on a solid block.
                     // Empty content must not borrow a glyph from the placeholder.
                     if shape == CaretShape::Block && let Some(next) = next {
-                        emit_text_runs(content, (caret, next), None, origin, theme.field, env, out);
+                        emit_text_runs(
+                            content, (caret, next), None,
+                            Point { x: origin.x, y: origin.y + leading },
+                            theme.field, env, out,
+                        );
                     }
                 }
                 out.pop_clip();
