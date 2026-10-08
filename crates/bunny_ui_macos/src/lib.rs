@@ -21,6 +21,7 @@ use std::cell::{Cell, RefCell};
 
 use bunny_ui::pacing::{Beat, FramePacer, Urgency, Verdict};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use bunny_ui::action::{Key, KeyMatch, KeyPattern, Stroke};
 use bunny_ui::layout::{Axis, Size};
@@ -86,6 +87,13 @@ fn sync_frame_driver(runtime: &Runtime, pacer: &FramePacer, window: usize) {
         }
     }
     pacer.set_beating(ffi::want_beat(window, wanted));
+}
+
+/// The half-second recovery clock may rescue a stopped display link, but
+/// must not split a healthy beat into two presents. The clock is supplied
+/// by the window so the recovery boundary can be exercised without sleeping.
+fn frame_recovery_due(last_beat: Option<Duration>, now: Duration) -> bool {
+    last_beat.is_none_or(|last| now.saturating_sub(last) >= Duration::from_millis(100))
 }
 
 /// Presents live blits on their layers — the islands' road, which the
@@ -2004,6 +2012,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             accepted
         }
     });
+    let frame_clock = Instant::now();
+    let mut last_display_beat = None;
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
@@ -2337,9 +2347,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // The net under the beat. The display link belongs to ONE view,
             // and the system stops it while that view is hidden; asks that
             // wait for a beat that does not come would wait for ever. This
-            // timer stays armed while a frame waits: half a second later,
-            // at the worst, it is drawn here.
-            if handler_pacer.pending().count > 0 && !handler_resizing() {
+            // timer stays armed while a frame waits. A recent display beat
+            // owns the pending input; only a link silent for 100 ms needs
+            // rescuing. The next half-second tick then draws the frame.
+            if handler_pacer.pending().count > 0
+                && !handler_resizing()
+                && frame_recovery_due(last_display_beat, frame_clock.elapsed())
+            {
                 blit(runtime, root, trace::Origin::Blink);
             }
             // the slow clock is also the sweep's: a scene left alone frees
@@ -2349,6 +2363,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
         }
         AppEvent::Frame { dt } => {
+            last_display_beat = Some(frame_clock.elapsed());
             // the tick path: springs advance, then layout only — zero
             // bodies on a stable tree; settle and effects belong to the
             // real-event path. A tick that moved ONLY loop clocks does
@@ -2522,6 +2537,38 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_does_not_split_regular_display_beats() {
+        // Pending wheel input is normal between beats. Sweep every phase
+        // of the recovery timer at 30, 60 and 120 Hz over twelve seconds.
+        for hz in [30, 60, 120] {
+            let interval = 1_000_000 / hz;
+            for phase in (0..interval).step_by(1_000) {
+                for tick in 1..=24 {
+                    let now = tick * 500_000 + phase;
+                    let last = now / interval * interval;
+                    assert!(!frame_recovery_due(
+                        Some(Duration::from_micros(last)),
+                        Duration::from_micros(now),
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_rescues_a_missing_link_and_yields_when_it_resumes() {
+        assert!(frame_recovery_due(None, Duration::from_millis(500)));
+        let last = Some(Duration::from_millis(500));
+        assert!(!frame_recovery_due(last, Duration::from_millis(599)));
+        assert!(frame_recovery_due(last, Duration::from_millis(600)));
+        assert!(frame_recovery_due(last, Duration::from_millis(1_000)));
+        assert!(!frame_recovery_due(
+            Some(Duration::from_millis(1_010)),
+            Duration::from_millis(1_015),
+        ));
+    }
 
     fn stroke(code: u16, bare: &str, shift: bool) -> ffi::KeyStroke {
         ffi::KeyStroke {
