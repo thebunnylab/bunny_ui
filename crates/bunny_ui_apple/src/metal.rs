@@ -2018,9 +2018,10 @@ const SURFACE_VOLATILE: u32 = 1;
 struct Drawables {
     /// Their surfaces, retained, and whether each is offered back.
     surfaces: Vec<(Id, bool)>,
-    /// The drawable presented last, retained, and when: the one on screen
-    /// once its present has landed.
-    shown: Option<(Id, std::time::Instant)>,
+    /// The last presentation keeps its drawable only until it lands. The
+    /// visible IOSurface then owns pixel lifetime without keeping Metal's
+    /// drawable-lifetime tracking awake throughout an otherwise idle window.
+    shown: Option<ShownSurface>,
     /// The system declined an offer once: no more asks.
     declined: bool,
 }
@@ -2033,6 +2034,51 @@ const DRAWABLES_KEPT: usize = 4;
 /// landed, whether or not the layer said so. A window's first frame is
 /// never reported presented at all.
 const PRESENT_LANDS_IN: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Ownership changes when a presentation lands: the drawable is needed to
+/// observe completion, then only its surface is needed to protect pixels.
+enum ShownSurface {
+    Presenting { drawable: Id, at: std::time::Instant },
+    Displayed(Id),
+}
+
+impl ShownSurface {
+    /// The displayed surface, once the last presentation has landed. A
+    /// retained drawable keeps the system's frame accounting active even
+    /// when no application frame is scheduled, so release it at this point.
+    unsafe fn settled(&mut self) -> Option<Id> {
+        unsafe {
+            let (drawable, at) = match self {
+                Self::Displayed(surface) => return Some(*surface),
+                Self::Presenting { drawable, at } => (*drawable, *at),
+            };
+            if at.elapsed() < PRESENT_LANDS_IN
+                && msg_f64(drawable, sel("presentedTime")) <= 0.0
+            {
+                return None;
+            }
+            let surface = msg_id(msg_id(drawable, sel("texture")), sel("iosurface"));
+            if !surface.is_null() {
+                CFRetain(surface as *const c_void);
+            }
+            // Retain the surface BEFORE dropping the drawable that owns it.
+            *self = Self::Displayed(surface);
+            Some(surface)
+        }
+    }
+}
+
+impl Drop for ShownSurface {
+    fn drop(&mut self) {
+        unsafe {
+            match self {
+                Self::Presenting { drawable, .. } => msg_void(*drawable, sel("release")),
+                Self::Displayed(surface) if !surface.is_null() => CFRelease(*surface as *const c_void),
+                Self::Displayed(_) => {}
+            }
+        }
+    }
+}
 
 impl Drawables {
     /// A drawable taken for a frame: its surface is remembered, and taken
@@ -2072,10 +2118,10 @@ impl Drawables {
     /// The drawable just presented.
     unsafe fn presented(&mut self, drawable: Id) {
         unsafe {
-            let now = std::time::Instant::now();
-            if let Some((old, _)) = self.shown.replace((msg_id(drawable, sel("retain")), now)) {
-                msg_void(old, sel("release"));
-            }
+            self.shown = Some(ShownSurface::Presenting {
+                drawable: msg_id(drawable, sel("retain")),
+                at: std::time::Instant::now(),
+            });
         }
     }
 
@@ -2085,21 +2131,18 @@ impl Drawables {
     /// still be the one on screen, and the offer waits.
     unsafe fn offer(&mut self, hidden: bool) -> bool {
         unsafe {
+            let on_screen = match self.shown.as_mut() {
+                Some(shown) => match shown.settled() {
+                    Some(surface) => if hidden { null_mut() } else { surface },
+                    None => return false,
+                },
+                None if hidden => null_mut(),
+                None => return true,
+            };
+            // A refused purge still releases a completed drawable's wrapper.
             if self.declined {
                 return true;
             }
-            let on_screen = match (hidden, self.shown) {
-                (true, _) => null_mut(),
-                (false, None) => return true,
-                (false, Some((shown, at))) => {
-                    let landed = at.elapsed() >= PRESENT_LANDS_IN
-                        || msg_f64(shown, sel("presentedTime")) > 0.0;
-                    if !landed {
-                        return false;
-                    }
-                    msg_id(msg_id(shown, sel("texture")), sel("iosurface"))
-                }
-            };
             for (surface, offered) in &mut self.surfaces {
                 if *surface == on_screen || *offered {
                     continue;
@@ -2126,9 +2169,7 @@ impl Drawables {
                 }
                 CFRelease(surface as *const c_void);
             }
-            if let Some((shown, _)) = self.shown.take() {
-                msg_void(shown, sel("release"));
-            }
+            self.shown = None;
         }
     }
 
@@ -4643,6 +4684,57 @@ mod tests {
         // a pane over a pane compounds: the upper one samples a scene
         // that already carries the lower one's own difference
         assert_glass_close(&gpu, &cpu, 6, 0.015, "stacked panes");
+    }
+
+    /// The wrapper's lifetime is observable independently of the pixels:
+    /// a weak Objective-C reference must clear while the visible IOSurface
+    /// remains usable. No window, sleeps or private Metal selectors needed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_landed_frame_keeps_pixels_without_retaining_its_drawable() {
+        if !device_present() {
+            return;
+        }
+        unsafe extern "C" {
+            fn objc_initWeak(location: *mut Id, object: Id) -> Id;
+            fn objc_destroyWeak(location: *mut Id);
+            fn IOSurfaceGetWidth(surface: Id) -> usize;
+        }
+        unsafe {
+            let outer = objc_autoreleasePoolPush();
+            let device = MTLCreateSystemDefaultDevice();
+            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            msg_void_id(layer, sel("setDevice:"), device);
+            msg_void_u64(layer, sel("setPixelFormat:"), PIXEL_FORMAT_BGRA8);
+            msg_void_size(layer, sel("setDrawableSize:"), CGSize { width: 8.0, height: 8.0 });
+            let mut frames = Drawables::default();
+            let pool = objc_autoreleasePoolPush();
+            let drawable = msg_id(layer, sel("nextDrawable"));
+            assert!(!drawable.is_null());
+            let mut weak = null_mut();
+            objc_initWeak(&mut weak, drawable);
+            frames.take(msg_id(drawable, sel("texture")));
+            frames.presented(drawable);
+            objc_autoreleasePoolPop(pool);
+            assert!(!weak.is_null(), "the pending presentation owns its wrapper");
+            if let Some(ShownSurface::Presenting { at, .. }) = &mut frames.shown {
+                *at -= PRESENT_LANDS_IN;
+            }
+            // A prior refused purge must not keep this wrapper alive.
+            frames.declined = true;
+            assert!(frames.offer(false));
+            assert!(weak.is_null(), "a landed frame releases its drawable wrapper");
+            let surface = frames.shown.as_mut().and_then(|shown| shown.settled()).unwrap();
+            assert!(!surface.is_null());
+            assert_eq!(IOSurfaceGetWidth(surface), 8, "the visible pixels remain owned");
+            assert!(frames.offer(false), "repeated rest is already settled");
+            frames.forget();
+            assert!(frames.shown.is_none());
+            objc_destroyWeak(&mut weak);
+            msg_void(layer, sel("release"));
+            msg_void(device, sel("release"));
+            objc_autoreleasePoolPop(outer);
+        }
     }
 
     #[test]

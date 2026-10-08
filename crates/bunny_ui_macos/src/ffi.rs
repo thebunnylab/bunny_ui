@@ -1838,6 +1838,12 @@ pub fn aim_tasks(left: Option<f64>) {
     if delegate.is_null() {
         return;
     }
+    // With no sleeper there is no alarm to create. A freshly scheduled
+    // repeating timer would otherwise keep its first hourly fire date:
+    // TASKS_AIM starts empty, so the parking branch below cannot move it.
+    if left.is_none() && TASKS.with(Cell::get).is_null() {
+        return;
+    }
     let timer = TASKS.with(|slot| {
         let timer = slot.get();
         if !timer.is_null() {
@@ -4634,6 +4640,40 @@ mod tests {
             BLINK_WANTS.with(|wants| wants.borrow_mut().0.clear());
             BLINKING.with(|running| running.set(false));
             msg_void(first, sel("release"));
+            msg_void(delegate, sel("release"));
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    #[test]
+    fn an_empty_task_queue_never_arms_an_unused_alarm() {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let delegate = msg_id(msg_id(class("NSObject"), sel("alloc")), sel("init"));
+            let old_delegate = DELEGATE.with(|slot| slot.replace(delegate));
+            assert!(TASKS.with(Cell::get).is_null());
+            assert!(TASKS_AIM.with(Cell::get).is_none());
+            aim_tasks(None);
+            assert!(TASKS.with(Cell::get).is_null(), "no deadline must create no hourly wake");
+
+            aim_tasks(Some(60.0));
+            let timer = TASKS.with(Cell::get);
+            assert!(!timer.is_null(), "a sleeping task still gets an alarm");
+            let fire_at = |timer| msg_f64(msg_id(timer, sel("fireDate")), sel("timeIntervalSinceReferenceDate"));
+            let armed = fire_at(timer);
+            aim_tasks(None);
+            let parked = fire_at(timer);
+            assert!(parked > armed + TASKS_FAR, "an emptied queue parks its existing alarm");
+            aim_tasks(None);
+            assert_eq!(fire_at(timer).to_bits(), parked.to_bits());
+            aim_tasks(Some(120.0));
+            assert_eq!(TASKS.with(Cell::get), timer, "a later task reuses the alarm");
+            assert!(fire_at(timer) < parked);
+
+            TASKS.with(|slot| slot.set(std::ptr::null_mut()));
+            TASKS_AIM.with(|aim| aim.set(None));
+            msg_void(timer, sel("invalidate"));
+            DELEGATE.with(|slot| slot.set(old_delegate));
             msg_void(delegate, sel("release"));
             objc_autoreleasePoolPop(pool);
         }
