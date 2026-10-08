@@ -110,10 +110,11 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     }
 
     /// `.line_height(24.0)` — the box each line steps by, in points, the
-    /// CSS `line-height`. A `text(…)` measures with the FONT's own box
+    /// CSS `line-height`. Text and fields measure with the FONT's own box
     /// (`ascent + descent`); this overrides it, stepping the lines by the
     /// value and centring the glyphs in the taller box (the CSS
-    /// half-leading). Inherited, so a column sets the rhythm once.
+    /// half-leading). Inherited, so a column sets the rhythm once. A
+    /// field's caret, selection and scroll step use the same line box.
     fn line_height(self, height: f64) -> Modified<Self> {
         Modified {
             base: self,

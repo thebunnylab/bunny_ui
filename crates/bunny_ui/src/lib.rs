@@ -2323,6 +2323,103 @@ mod tests {
     }
 
     #[test]
+    fn field_line_height_steps_and_centres_the_inherited_editor_lines() {
+        use crate::layout::{DrawCommand, Proposal};
+        let runtime = Runtime::new();
+        let note = State::new("alpha\nbeta\ngamma".to_string());
+        let runs = |result: &crate::layout::LayoutResult| {
+            result.display.iter().filter_map(|command| match command {
+                DrawCommand::TextLine { origin, .. } => Some(origin.y),
+                _ => None,
+            }).collect::<Vec<_>>()
+        };
+        for (pitch, tops) in [(24.0, vec![9.0, 33.0, 57.0]), (12.0, vec![3.0, 15.0, 27.0])] {
+            let view = vstack((text_editor("", note.binding()),)).line_height(pitch);
+            let result = runtime.layout(&view, Proposal::unspecified());
+            let field = result.fields.first().expect("the editor is placed");
+            assert_eq!(field.line_height, pitch, "the editor inherits its column's line box");
+            assert_eq!(field.frame.size.height, 3.0 * pitch + 10.0, "natural size uses the same pitch");
+            assert_eq!(runs(&result), tops, "each glyph splits the positive or negative half-leading");
+        }
+        let plain = runtime.layout(&vstack((text_editor("", note.binding()),)), Proposal::unspecified());
+        assert_eq!(plain.fields[0].line_height, 16.0);
+        assert_eq!(plain.fields[0].frame.size.height, 58.0);
+        assert_eq!(runs(&plain), vec![5.0, 21.0, 37.0]);
+        let one = runtime.layout(&vstack((text_field("", note.binding()),)).line_height(24.0), Proposal::unspecified());
+        assert_eq!(one.fields[0].line_height, 24.0);
+        assert_eq!(one.fields[0].frame.size.height, 34.0);
+        assert_eq!(runs(&one), vec![9.0]);
+    }
+
+    #[test]
+    fn field_line_height_keeps_pointer_caret_and_reveal_on_the_line_box() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+        use crate::text_input::EditCommand;
+        #[derive(Clone, Copy)]
+        struct Panel { note: State<String> }
+        impl Component for Panel {
+            fn body(self, _ctx: &Context) -> impl View {
+                text_editor("", self.note.binding()).line_height(24.0).frame(120.0, 56.0)
+            }
+        }
+        let runtime = Runtime::new();
+        let view = Panel { note: State::new("alpha\nbeta\ngamma".to_string()) };
+        runtime.render_stable(&view);
+        let viewport = Proposal::exact(Size { width: 120.0, height: 56.0 });
+        let result = runtime.layout(&view, viewport);
+        let field = result.fields.first().expect("the editor is placed").clone();
+        assert!(runtime.pointer_clicked(field.run.origin.x, field.run.origin.y + 26.0, 1, false));
+        assert_eq!(runtime.ime_snapshot().expect("focused editor").selected, (6, 0));
+        assert!(runtime.key(EditCommand::End(false)).applied);
+        let tail = runtime.layout(&view, viewport);
+        assert_eq!(runtime.ime_snapshot().expect("focused editor").selected, (16, 0));
+        assert_eq!(runtime.scroll_offset(&field.path).y, 26.0, "the last line fits the padded viewport");
+        let caret = tail.display.iter().find_map(|command| match command {
+            DrawCommand::FillRect { rect, color, .. } if *color == crate::theme::current().caret => Some(*rect),
+            _ => None,
+        }).expect("the focused editor paints a caret");
+        assert_eq!(caret.origin.y, 27.0);
+        assert_eq!(caret.size.height, 24.0, "caret covers the declared line box");
+        assert_eq!(runtime.ime_snapshot().expect("focused editor").caret_rect, caret);
+        assert!(runtime.key(EditCommand::SelectAll).applied);
+        let selected = runtime.layout(&view, viewport);
+        let bands = selected.display.iter().filter_map(|command| match command {
+            DrawCommand::FillRect { rect, color, .. } if *color == crate::theme::current().selection => Some(rect.size.height),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert!(!bands.is_empty());
+        assert!(bands.iter().all(|height| *height == 24.0), "selection uses the same line box");
+    }
+
+    #[test]
+    fn field_line_height_keeps_overlapping_glyphs_at_the_clip() {
+        use crate::layout::{DrawCommand, Point, Proposal, Size};
+        #[derive(Clone, Copy)]
+        struct Panel { note: State<String> }
+        impl Component for Panel {
+            fn body(self, _ctx: &Context) -> impl View {
+                text_editor("", self.note.binding()).line_height(1.0).frame(120.0, 20.0)
+            }
+        }
+        let runtime = Runtime::new();
+        let panel = Panel { note: State::new("a\n".repeat(20)) };
+        runtime.render_stable(&panel);
+        let viewport = Proposal::exact(Size { width: 120.0, height: 20.0 });
+        let first = runtime.layout(&panel, viewport);
+        let path = first.fields.first().expect("the editor is placed").path.clone();
+        runtime.set_scroll_offset(&path, Point { x: 0.0, y: 10.0 });
+        let scrolled = runtime.layout(&panel, viewport);
+        let tops = scrolled.display.iter().filter_map(|command| match command {
+            DrawCommand::TextLine { origin, .. } => Some(origin.y),
+            _ => None,
+        }).collect::<Vec<_>>();
+        // Sixteen-point glyphs overlap their one-point line boxes. A glyph
+        // whose box is above the viewport still paints into it; row culling
+        // must include that ink, including more than one preceding row.
+        assert_eq!(tops, (0..20).map(|row| f64::from(row) - 12.5).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn what_a_task_lands_reaches_the_next_frame() {
         #[derive(Clone, Copy)]
         struct Panel {
@@ -9363,6 +9460,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_quiet_settle_rebuilds_after_the_thread_world_is_reset() {
+        use std::cell::Cell;
+
+        #[derive(Clone)]
+        struct Page {
+            runs: Rc<Cell<usize>>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                self.runs.set(self.runs.get() + 1);
+                text("a retained page")
+            }
+        }
+
+        crate::paranoid::force(crate::paranoid::SETTLE);
+        let page = Page { runs: Rc::new(Cell::new(0)) };
+        let runtime = Runtime::new();
+        runtime.settle(&page);
+        let ran = page.runs.get();
+        assert!(ran > 0);
+        let observer = Runtime::new();
+        observer.poll_tasks();
+        runtime.settle(&page);
+        assert_eq!(page.runs.get(), ran + 1, "a reset world must rebuild the old runtime's root");
+        crate::paranoid::release();
+    }
+
+    #[test]
+    fn paranoid_seen_preserves_the_probes_complete_draw_list() {
+        use crate::layout::{Color, Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let rows: Vec<_> = (0..20)
+                    .map(|row| text(format!("probe row {row}")).frame_height(24.0))
+                    .collect();
+                scroll(vstack!(rows)).frame(240.0, 60.0)
+            }
+        }
+
+        crate::paranoid::force(crate::paranoid::SEEN);
+        let size = Size { width: 240.0, height: 60.0 };
+        let whole = Runtime::new();
+        let shell = Runtime::new();
+        shell.drop_unseen();
+        let whole = whole.settled_layout(&Page, Proposal::exact(size));
+        let shell = shell.settled_layout(&Page, Proposal::exact(size));
+        let has_last_row = |list: &crate::layout::DisplayList| {
+            list.iter().any(|command| matches!(command,
+                crate::layout::DrawCommand::TextLine { content, range, .. }
+                    if &content[range.0..range.1] == "probe row 19"))
+        };
+        assert!(has_last_row(&whole.display), "paranoid checks must retain the probe's offscreen words");
+        assert!(!has_last_row(&shell.display), "the shell still drops unseen draw commands");
+        assert!(whole.display.len() > shell.display.len());
+        let paint = |list: &crate::layout::DisplayList| {
+            crate::raster::rasterize_scaled(list, 240, 60, 1, Color::WHITE)
+        };
+        assert_eq!(paint(&whole.display).pixels(), paint(&shell.display).pixels());
+        crate::paranoid::release();
+    }
+
     /// What the placement drops is what the clip would have erased: the
     /// SAME pixels, byte for byte.
     ///
@@ -9420,12 +9582,6 @@ mod tests {
             }
         }
 
-        // the paranoid check turns the cut on for EVERY runtime, so there is
-        // no control to raster against — and it compares the two lists of
-        // every layout of the suite on its own
-        if crate::paranoid::on(crate::paranoid::SEEN) {
-            return;
-        }
         let size = Size { width: 300.0, height: 220.0 };
         let (cut, whole) = (Runtime::new(), Runtime::new());
         cut.drop_unseen();
