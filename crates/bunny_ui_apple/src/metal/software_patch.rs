@@ -15,6 +15,9 @@ const MAX_SURFACES: usize = 3;
 pub(super) struct Scene {
     display: DisplayList,
     size: (usize, usize),
+    rect: DamageRect,
+    scale: usize,
+    canvas: Color,
 }
 
 impl Scene {
@@ -91,22 +94,40 @@ impl Scene {
         Some(Self {
             display,
             size: (width, height),
+            rect,
+            scale,
+            canvas,
         })
     }
 
-    pub(super) fn raster(
-        &self,
-        scale: usize,
-        canvas: Color,
-        text: &dyn TextEngine,
-        images: &dyn ImageEngine,
-    ) -> Bitmap {
+    /// Equal normalized commands prove equal pixels at the same destination.
+    /// The presenter also requires the patch to remain visible over its base.
+    pub(super) fn matches(&self, other: &Self) -> bool {
+        self.rect == other.rect
+            && self.scale == other.scale
+            && self.canvas == other.canvas
+            && self.display.as_slice() == other.display.as_slice()
+    }
+
+    pub(super) const fn bounds(&self) -> DamageRect {
+        self.rect
+    }
+
+    pub(super) const fn scale(&self) -> usize {
+        self.scale
+    }
+
+    pub(super) const fn canvas(&self) -> Color {
+        self.canvas
+    }
+
+    pub(super) fn raster(&self, text: &dyn TextEngine, images: &dyn ImageEngine) -> Bitmap {
         rasterize_with(
             &self.display,
             self.size.0,
             self.size.1,
-            scale,
-            canvas,
+            self.scale,
+            self.canvas,
             text,
             images,
         )
@@ -523,7 +544,7 @@ mod tests {
             &MeasureCache::default(),
         )
         .expect("a bounded supported scene admits a software patch");
-        let patch = scene.raster(scale, Color::WHITE, text, &RawImages::default());
+        let patch = scene.raster(text, &RawImages::default());
         for y in rect.1..rect.3 {
             for x in rect.0..rect.2 {
                 assert_eq!(
@@ -769,6 +790,129 @@ mod tests {
             text.0.get(),
             1,
             "patch admission reshaped an already measured line"
+        );
+    }
+
+    #[test]
+    fn physical_scene_reuses_fractional_changes_but_keeps_visible_ink() {
+        let commands = |height, clip_height, color| {
+            DisplayList::from(vec![
+                DrawCommand::PushClip {
+                    rect: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 24.0,
+                            height: clip_height,
+                        },
+                    },
+                    corner_radius: Corners::ZERO,
+                },
+                DrawCommand::FillRect {
+                    rect: Rect {
+                        origin: Point { x: 2.25, y: 2.25 },
+                        size: Size { width: 4.0, height },
+                    },
+                    color,
+                    corner_radius: Corners::ZERO,
+                },
+                DrawCommand::PopClip,
+            ])
+        };
+        let first = commands(10.1, 20.0, Color::BLACK);
+        let same = commands(10.2, 20.0, Color::BLACK);
+        assert_ne!(first.as_slice(), same.as_slice());
+        for scale in [1, 2] {
+            let s = scale as i64;
+            let scene = |display: &DisplayList| {
+                Scene::new(
+                    display,
+                    (0, 0, 24 * s, 24 * s),
+                    scale,
+                    Color::WHITE,
+                    &PixelFont,
+                    &MeasureCache::default(),
+                )
+                .expect("bounded fractional scene")
+            };
+            let first = scene(&first);
+            let pixels = first
+                .raster(&PixelFont, &RawImages::default())
+                .to_rgba_bytes();
+            let same = scene(&same);
+            assert!(first.matches(&same), "scale {scale}");
+            assert_eq!(
+                pixels,
+                same.raster(&PixelFont, &RawImages::default())
+                    .to_rgba_bytes()
+            );
+            for changed in [
+                commands(10.75, 20.0, Color::BLACK),
+                commands(10.1, 8.0, Color::BLACK),
+                commands(10.1, 20.0, Color::hex(0x123456)),
+            ] {
+                let changed = scene(&changed);
+                assert!(!first.matches(&changed), "scale {scale}");
+                assert_ne!(
+                    pixels,
+                    changed
+                        .raster(&PixelFont, &RawImages::default())
+                        .to_rgba_bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn equal_local_pixels_do_not_reuse_a_different_destination_or_scale() {
+        let scene = |rect: DamageRect, scale: usize, canvas| {
+            let factor = scale as f64;
+            let display = DisplayList::from(vec![DrawCommand::FillRect {
+                rect: Rect {
+                    origin: Point {
+                        x: rect.0 as f64 / factor,
+                        y: rect.1 as f64 / factor,
+                    },
+                    size: Size {
+                        width: (rect.2 - rect.0) as f64 / factor,
+                        height: (rect.3 - rect.1) as f64 / factor,
+                    },
+                },
+                color: Color::WHITE.fade(),
+                corner_radius: Corners::ZERO,
+            }]);
+            Scene::new(
+                &display,
+                rect,
+                scale,
+                canvas,
+                &PixelFont,
+                &MeasureCache::default(),
+            )
+            .expect("bounded translucent ink on an opaque canvas")
+        };
+        let first = scene((0, 0, 8, 8), 1, Color::WHITE);
+        let pixels = first
+            .raster(&PixelFont, &RawImages::default())
+            .to_rgba_bytes();
+        for changed in [
+            scene((8, 0, 16, 8), 1, Color::WHITE),
+            scene((0, 0, 8, 8), 2, Color::WHITE),
+        ] {
+            assert_eq!(
+                pixels,
+                changed
+                    .raster(&PixelFont, &RawImages::default())
+                    .to_rgba_bytes()
+            );
+            assert!(!first.matches(&changed));
+        }
+        let changed = scene((0, 0, 8, 8), 1, Color::BLACK);
+        assert!(!first.matches(&changed));
+        assert_ne!(
+            pixels,
+            changed
+                .raster(&PixelFont, &RawImages::default())
+                .to_rgba_bytes()
         );
     }
 
