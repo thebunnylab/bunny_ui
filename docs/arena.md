@@ -443,3 +443,76 @@ Recorded app GPU remains zero in both editor versions. Wheel app medians are
 9.864 → 9.888 ms/s. The global compositor ranges do not establish identical cost,
 a tail-latency guarantee or a causal editor-GPU speedup. CPU, native pixel and
 workload evidence are separate from these GPU recordings.
+
+
+## Retained opaque scroll bands (2026-10-07)
+
+The macOS presenter can move already-rendered opaque bands instead of drawing
+the entire scrolling viewport again. Admission proves a complete, disjoint
+partition of one rectangular viewport, bounded local paint and unchanged
+exterior paint. Exact normalized commands identify reusable pixels; coherent
+translation across at least half the bands activates the strategy. It consumes
+ordinary display commands and does not depend on application or fixture IDs.
+Unsupported effects, images, geometry, resize or canvas changes return to a
+whole Metal frame. Small trailing decorations retain their existing software
+patch admission and physical-coordinate rules.
+
+Entering bands share a bounded text-raster cache. Visible surfaces stay
+immutable; detached surfaces require an observed compositor use, three elapsed
+frames, at least 100 ms since retirement and no current use before recycling.
+The layer count, cache bytes, band pixels and retired surfaces are bounded.
+CoreText also measures and draws the same shaped line instead of shaping it
+twice during rasterization. Repeated frames still return before this strategy.
+
+Owned-window comparisons at fixed frames 1, 30 and 90 preserve all channels
+within the existing tolerance of two, with explicit nontransparent captures.
+Native events prove scroll travel and activation in the real virtual list.
+Composition tests cover scales one and two, fractional origins, reverse travel,
+duplicate rows, changed content and refused geometry. The attached display is
+1×; this round does not claim actual-window coverage on a 2× monitor.
+
+Three interleaved release pairs compare renderer `6b03bac` with the final
+revision on the same M5 Max and 1×/60 Hz display. All six wheel CPU samples
+pass workload, input and unlocked-host checks. CPU uses two kernel-counter
+reads over seconds 1–9; binaries, fixtures and sources are frozen. Builds
+precede admission by at least 60 seconds. The session's initial canary limit
+remains fixed; rejected prelaunch canaries are preserved rather than timed.
+
+| wheel metric | before | after | change |
+|---|---:|---:|---:|
+| median CPU, one core | 6.970005% | 7.102498% | +1.90% |
+| physical footprint | 195 MB | 44 MB | −77.44% |
+| observed app + global compositor GPU | 16.790590 ms/s | 8.718706 ms/s | −48.07% |
+
+The CPU result is within the predeclared 5% regression guard; it is not a CPU
+speedup. Physical footprint is not an allocation count. The GPU result uses
+six separate valid native-input samples, with every paired total lower.
+Recorded app GPU medians are 9.915 → 0 ms/s, while global WindowServer
+medians rise from 6.875 to 8.719 ms/s. Combined ranges are 16.757–17.278 before
+and 8.612–8.807 after. The compositor is global, so the combined observation
+is not exclusive window attribution; zero recorded app GPU does not mean
+zero presentation cost.
+
+All 24 separate CPU guard samples pass native state, deadlines and host
+admission. Active guard medians remain within the predeclared 5% limit:
+
+| guard | CPU before | CPU after | change |
+|---|---:|---:|---:|
+| type, 400 lines | 0.565817% | 0.563705% | −0.37% |
+| chat streaming | 2.132276% | 2.208449% | +3.57% |
+| animated canvas | 2.087509% | 2.105154% | +0.85% |
+
+Idle uses three separate 20-second pairs. Median CPU is 0.009945% before and
+0.011031% after, a +0.001086 percentage-point difference (+10.92% relative).
+Ranges overlap: 0.009557–0.012082% before, 0.010890–0.012296% after. Both
+footprints are 33 MB. This is a small absolute residual, not a zero-CPU or
+identical-cost claim; the active relative guard is not an idle noise model.
+The memory footprints of typing, streaming and animation are unchanged at
+32, 34 and 41 MB respectively (medians).
+
+The final text change passes 75 Apple library tests and iOS compilation;
+unchanged core and shell tests pass 883 and 27. The complete scratch consumer
+suite passes 2,889 tests with 44 ignored. Strict Apple library clippy still
+reports 34 existing diagnostics outside the new strategy, with none added;
+this is not a green strict-clippy gate. The measured engine sources and
+binaries are frozen separately from documentation.

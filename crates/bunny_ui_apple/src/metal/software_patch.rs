@@ -169,7 +169,7 @@ fn measured_candidates(
 // The whole raster snaps in window coordinates. Rounding a translated
 // half-pixel instead can cross zero and move the result one pixel: round
 // ties away from zero do not commute with an integer translation.
-fn patch_coordinates(display: &DisplayList, patch: DamageRect, factor: f64) -> Option<DisplayList> {
+pub(super) fn patch_coordinates(display: &DisplayList, patch: DamageRect, factor: f64) -> Option<DisplayList> {
     let point = |origin: Point| Point {
         x: ((origin.x * factor).round() - patch.0 as f64) / factor,
         y: ((origin.y * factor).round() - patch.1 as f64) / factor,
@@ -233,13 +233,13 @@ unsafe extern "C" {
     fn msg_void_id_id(obj: Id, sel: Sel, value: Id, key: Id);
 }
 
-struct Surface {
-    raw: Id,
-    size: (usize, usize),
+pub(super) struct Surface {
+    pub(super) raw: Id,
+    pub(super) size: (usize, usize),
 }
 
 impl Surface {
-    fn new(size: (usize, usize)) -> Option<Self> {
+    pub(super) fn new(size: (usize, usize)) -> Option<Self> {
         unsafe {
             let properties = msg_id(class("NSMutableDictionary"), sel("dictionary"));
             if properties.is_null() {
@@ -278,11 +278,11 @@ impl Surface {
         }
     }
 
-    fn busy(&self) -> bool {
+    pub(super) fn busy(&self) -> bool {
         unsafe { IOSurfaceIsInUse(self.raw) != 0 }
     }
 
-    fn write(&self, bitmap: &Bitmap) -> bool {
+    pub(super) fn write(&self, bitmap: &Bitmap) -> bool {
         if self.size != (bitmap.width(), bitmap.height()) {
             return false;
         }
