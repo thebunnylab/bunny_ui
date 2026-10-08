@@ -4075,6 +4075,96 @@ mod tests {
     use bunny_ui::prelude::*;
     use bunny_ui::raster::rasterize_with;
 
+    /// DXGI 1.1's descriptor identifies software independently of the
+    /// driver type requested from D3D11CreateDevice.
+    #[repr(C)]
+    struct AdapterDesc1 {
+        description: [u16; 128],
+        vendor: u32,
+        device: u32,
+        subsystem: u32,
+        revision: u32,
+        video: usize,
+        system: usize,
+        shared: usize,
+        luid_low: u32,
+        luid_high: i32,
+        flags: u32,
+    }
+
+    #[repr(C)]
+    struct Adapter1 {
+        vtbl: *const Adapter1Vtbl,
+    }
+
+    #[repr(C)]
+    struct Adapter1Vtbl {
+        unknown: UnknownVtbl,
+        _pad_3_9: [usize; 7],
+        get_desc1: unsafe extern "system" fn(*mut Adapter1, *mut AdapterDesc1) -> Hresult,
+    }
+
+    const _: () = assert!(
+        std::mem::offset_of!(AdapterDesc1, flags) == 280 + 3 * std::mem::size_of::<usize>()
+    );
+    const _: () =
+        assert!(std::mem::offset_of!(Adapter1Vtbl, get_desc1) == 10 * std::mem::size_of::<usize>());
+
+    fn report_adapter(device: *mut Device) {
+        const IID_ADAPTER1: Guid = Guid {
+            d1: 0x29038f61,
+            d2: 0x3839,
+            d3: 0x4626,
+            d4: [0x91, 0xfd, 0x08, 0x68, 0x79, 0x01, 0x1a, 0x05],
+        };
+        // The descriptor and vtable follow the installed dxgi.h; every
+        // interface is retained until the descriptor has been read.
+        let desc = unsafe {
+            let mut dxgi = null_mut();
+            assert!(com_ok(((*(*device).vtbl).unknown.query_interface)(
+                device.cast(),
+                &IID_DXGI_DEVICE,
+                &mut dxgi,
+            )));
+            let dxgi = Com::<DxgiDevice>::from_raw(dxgi.cast()).expect("DXGI device");
+            let mut adapter = null_mut();
+            assert!(com_ok(((*(*dxgi.as_ptr()).vtbl).get_adapter)(
+                dxgi.as_ptr(),
+                &mut adapter
+            )));
+            let adapter = Com::from_raw(adapter).expect("DXGI adapter");
+            let mut adapter1 = null_mut();
+            assert!(com_ok(((*(*adapter.as_ptr()).vtbl)
+                .unknown
+                .query_interface)(
+                adapter.as_ptr().cast(),
+                &IID_ADAPTER1,
+                &mut adapter1,
+            )));
+            let adapter1 = Com::<Adapter1>::from_raw(adapter1.cast()).expect("DXGI 1.1 adapter");
+            let mut desc: AdapterDesc1 = std::mem::zeroed();
+            assert!(com_ok(((*(*adapter1.as_ptr()).vtbl).get_desc1)(
+                adapter1.as_ptr(),
+                &mut desc
+            )));
+            desc
+        };
+        let end = desc
+            .description
+            .iter()
+            .position(|ch| *ch == 0)
+            .unwrap_or(128);
+        eprintln!(
+            "D3D parity adapter: {} vendor={:#x} device={:#x} flags={:#x} luid={:08x}:{:08x}",
+            String::from_utf16_lossy(&desc.description[..end]),
+            desc.vendor,
+            desc.device,
+            desc.flags,
+            u32::from_ne_bytes(desc.luid_high.to_ne_bytes()),
+            desc.luid_low,
+        );
+    }
+
     /// One probe, cached: WARP makes a device near-universal, but a
     /// machine without the compiler DLL skips honestly.
     fn device_present() -> bool {
@@ -4107,6 +4197,7 @@ mod tests {
         canvas: Color,
         mut gpu: OffscreenD3d,
     ) -> (Vec<u8>, Vec<u8>) {
+        report_adapter(gpu.stack.device.as_ptr());
         let runtime = Runtime::new();
         let display = runtime.display_frame(root, logical);
         let cpu = rasterize_with(
