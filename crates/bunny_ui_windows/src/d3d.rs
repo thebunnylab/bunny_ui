@@ -104,10 +104,23 @@ type D3dCompileFn = unsafe extern "system" fn(
 const DRIVER_TYPE_HARDWARE: u32 = 1;
 const DRIVER_TYPE_WARP: u32 = 5;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Driver {
     Hardware,
     Warp,
+}
+
+impl Driver {
+    fn precision(self, vendor: u32, device: u32) -> Self {
+        // DXGI documents a primary Basic Render Driver with no SOFTWARE
+        // flag: a successful HARDWARE request can still return WARP.
+        // Its documented vendor/device pair identifies both Basic paths.
+        // https://learn.microsoft.com/windows/win32/direct3ddxgi/d3d10-graphics-programming-guide-dxgi
+        match (self, vendor, device) {
+            (Self::Hardware, 0x1414, 0x8c) => Self::Warp,
+            _ => self,
+        }
+    }
 }
 
 /// `D3D_SHADER_MACRO`: two `LPCSTR`s, followed by a null sentinel.
@@ -503,6 +516,88 @@ struct DxgiAdapterVtbl {
     // 6 GetParent
     get_parent:
         unsafe extern "system" fn(*mut DxgiAdapter, *const Guid, *mut *mut c_void) -> Hresult,
+}
+
+/// DXGI 1.1's descriptor identifies software independently of the
+/// driver type requested from D3D11CreateDevice.
+#[repr(C)]
+struct AdapterDesc1 {
+    description: [u16; 128],
+    vendor: u32,
+    device: u32,
+    subsystem: u32,
+    revision: u32,
+    video: usize,
+    system: usize,
+    shared: usize,
+    luid_low: u32,
+    luid_high: i32,
+    flags: u32,
+}
+
+#[repr(C)]
+struct Adapter1 {
+    vtbl: *const Adapter1Vtbl,
+}
+
+#[repr(C)]
+struct Adapter1Vtbl {
+    unknown: UnknownVtbl,
+    _pad_3_9: [usize; 7],
+    get_desc1: unsafe extern "system" fn(*mut Adapter1, *mut AdapterDesc1) -> Hresult,
+}
+
+const _: () =
+    assert!(std::mem::offset_of!(AdapterDesc1, flags) == 280 + 3 * std::mem::size_of::<usize>());
+const _: () =
+    assert!(std::mem::offset_of!(Adapter1Vtbl, get_desc1) == 10 * std::mem::size_of::<usize>());
+
+fn adapter_description(device: &Com<Device>) -> Result<AdapterDesc1, String> {
+    const IID_ADAPTER1: Guid = Guid {
+        d1: 0x29038f61,
+        d2: 0x3839,
+        d3: 0x4626,
+        d4: [0x91, 0xfd, 0x08, 0x68, 0x79, 0x01, 0x1a, 0x05],
+    };
+    // Windows' DXGI 1.1 descriptor and vtable, checked against dxgi.h.
+    // Retain each interface until its successor and descriptor are read.
+    let device = device.as_ptr();
+    unsafe {
+        let mut dxgi = null_mut();
+        if !com_ok(((*(*device).vtbl).unknown.query_interface)(
+            device.cast(),
+            &IID_DXGI_DEVICE,
+            &mut dxgi,
+        )) {
+            return Err("DXGI device unavailable".to_owned());
+        }
+        let dxgi = Com::<DxgiDevice>::from_raw(dxgi.cast()).ok_or("null DXGI device")?;
+        let mut adapter = null_mut();
+        if !com_ok(((*(*dxgi.as_ptr()).vtbl).get_adapter)(
+            dxgi.as_ptr(),
+            &mut adapter,
+        )) {
+            return Err("DXGI adapter unavailable".to_owned());
+        }
+        let adapter = Com::from_raw(adapter).ok_or("null DXGI adapter")?;
+        let mut adapter1 = null_mut();
+        if !com_ok(((*(*adapter.as_ptr()).vtbl).unknown.query_interface)(
+            adapter.as_ptr().cast(),
+            &IID_ADAPTER1,
+            &mut adapter1,
+        )) {
+            return Err("DXGI 1.1 adapter unavailable".to_owned());
+        }
+        let adapter1 = Com::<Adapter1>::from_raw(adapter1.cast()).ok_or("null DXGI 1.1 adapter")?;
+        let mut desc: AdapterDesc1 = std::mem::zeroed();
+        if !com_ok(((*(*adapter1.as_ptr()).vtbl).get_desc1)(
+            adapter1.as_ptr(),
+            &mut desc,
+        )) {
+            return Err("DXGI adapter description unavailable".to_owned());
+        }
+        Ok(desc)
+    }
 }
 
 /// `IDXGIFactory2` — the swapchain maker.
@@ -1356,6 +1451,8 @@ impl D3dStack {
         }
         let device = Com::from_raw(device).ok_or("null device")?;
         let context = Com::from_raw(context).ok_or("null context")?;
+        let adapter = adapter_description(&device)?;
+        driver = driver.precision(adapter.vendor, adapter.device);
         let d = device.as_ptr();
         unsafe {
             let shader = |entry: &str, target: &str| -> Result<Com<Blob>, String> {
@@ -4075,80 +4172,8 @@ mod tests {
     use bunny_ui::prelude::*;
     use bunny_ui::raster::rasterize_with;
 
-    /// DXGI 1.1's descriptor identifies software independently of the
-    /// driver type requested from D3D11CreateDevice.
-    #[repr(C)]
-    struct AdapterDesc1 {
-        description: [u16; 128],
-        vendor: u32,
-        device: u32,
-        subsystem: u32,
-        revision: u32,
-        video: usize,
-        system: usize,
-        shared: usize,
-        luid_low: u32,
-        luid_high: i32,
-        flags: u32,
-    }
-
-    #[repr(C)]
-    struct Adapter1 {
-        vtbl: *const Adapter1Vtbl,
-    }
-
-    #[repr(C)]
-    struct Adapter1Vtbl {
-        unknown: UnknownVtbl,
-        _pad_3_9: [usize; 7],
-        get_desc1: unsafe extern "system" fn(*mut Adapter1, *mut AdapterDesc1) -> Hresult,
-    }
-
-    const _: () = assert!(
-        std::mem::offset_of!(AdapterDesc1, flags) == 280 + 3 * std::mem::size_of::<usize>()
-    );
-    const _: () =
-        assert!(std::mem::offset_of!(Adapter1Vtbl, get_desc1) == 10 * std::mem::size_of::<usize>());
-
-    fn report_adapter(device: *mut Device) {
-        const IID_ADAPTER1: Guid = Guid {
-            d1: 0x29038f61,
-            d2: 0x3839,
-            d3: 0x4626,
-            d4: [0x91, 0xfd, 0x08, 0x68, 0x79, 0x01, 0x1a, 0x05],
-        };
-        // The descriptor and vtable follow the installed dxgi.h; every
-        // interface is retained until the descriptor has been read.
-        let desc = unsafe {
-            let mut dxgi = null_mut();
-            assert!(com_ok(((*(*device).vtbl).unknown.query_interface)(
-                device.cast(),
-                &IID_DXGI_DEVICE,
-                &mut dxgi,
-            )));
-            let dxgi = Com::<DxgiDevice>::from_raw(dxgi.cast()).expect("DXGI device");
-            let mut adapter = null_mut();
-            assert!(com_ok(((*(*dxgi.as_ptr()).vtbl).get_adapter)(
-                dxgi.as_ptr(),
-                &mut adapter
-            )));
-            let adapter = Com::from_raw(adapter).expect("DXGI adapter");
-            let mut adapter1 = null_mut();
-            assert!(com_ok(((*(*adapter.as_ptr()).vtbl)
-                .unknown
-                .query_interface)(
-                adapter.as_ptr().cast(),
-                &IID_ADAPTER1,
-                &mut adapter1,
-            )));
-            let adapter1 = Com::<Adapter1>::from_raw(adapter1.cast()).expect("DXGI 1.1 adapter");
-            let mut desc: AdapterDesc1 = std::mem::zeroed();
-            assert!(com_ok(((*(*adapter1.as_ptr()).vtbl).get_desc1)(
-                adapter1.as_ptr(),
-                &mut desc
-            )));
-            desc
-        };
+    fn report_adapter(device: &Com<Device>) {
+        let desc = adapter_description(device).expect("parity adapter description");
         let end = desc
             .description
             .iter()
@@ -4197,7 +4222,7 @@ mod tests {
         canvas: Color,
         mut gpu: OffscreenD3d,
     ) -> (Vec<u8>, Vec<u8>) {
-        report_adapter(gpu.stack.device.as_ptr());
+        report_adapter(&gpu.stack.device);
         let runtime = Runtime::new();
         let display = runtime.display_frame(root, logical);
         let cpu = rasterize_with(
@@ -4239,6 +4264,17 @@ mod tests {
             "{label}: {beyond_one} channels beyond one step ({:.3}% > 1%)",
             share * 100.0
         );
+    }
+
+    #[test]
+    fn the_basic_default_adapter_keeps_software_precision() {
+        // The primary Basic adapter has no SOFTWARE flag and was returned
+        // by a successful hardware request in the failing parity gate.
+        assert_eq!(Driver::Hardware.precision(0x1414, 0x8c), Driver::Warp);
+        assert_eq!(Driver::Warp.precision(0x1414, 0x8c), Driver::Warp);
+        assert_eq!(Driver::Hardware.precision(0x1002, 0x1586), Driver::Hardware);
+        assert_eq!(Driver::Hardware.precision(0x1414, 0x8d), Driver::Hardware);
+        assert_eq!(Driver::Hardware.precision(0x1002, 0x8c), Driver::Hardware);
     }
 
     #[test]
