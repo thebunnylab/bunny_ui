@@ -567,6 +567,14 @@ pub(super) struct Presenter {
 }
 
 impl Presenter {
+    /// Seeds the same generic admission from an already rasterized native base.
+    pub(super) fn seed(&mut self, display: &DisplayList, physical: (usize, usize),
+                      scale: usize, canvas: Color, text: &dyn TextEngine,
+                      boxes: &MeasureCache) -> bool {
+        self.prior = Scene::new(display, physical, scale, canvas, text, boxes);
+        self.prior.is_some()
+    }
+
     pub(super) fn active(&self) -> bool {
         self.active
     }
