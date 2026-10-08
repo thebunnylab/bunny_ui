@@ -190,7 +190,11 @@ fn measured_candidates(
 // The whole raster snaps in window coordinates. Rounding a translated
 // half-pixel instead can cross zero and move the result one pixel: round
 // ties away from zero do not commute with an integer translation.
-pub(super) fn patch_coordinates(display: &DisplayList, patch: DamageRect, factor: f64) -> Option<DisplayList> {
+pub(super) fn patch_coordinates(
+    display: &DisplayList,
+    patch: DamageRect,
+    factor: f64,
+) -> Option<DisplayList> {
     let point = |origin: Point| Point {
         x: ((origin.x * factor).round() - patch.0 as f64) / factor,
         y: ((origin.y * factor).round() - patch.1 as f64) / factor,
@@ -254,13 +258,54 @@ unsafe extern "C" {
     fn msg_void_id_id(obj: Id, sel: Sel, value: Id, key: Id);
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SurfaceFormat {
+    Bgra8,
+    #[cfg(target_arch = "aarch64")]
+    OpaqueRgb10,
+}
+
+impl SurfaceFormat {
+    fn code(self) -> u32 {
+        match self {
+            Self::Bgra8 => u32::from_be_bytes(*b"BGRA"),
+            #[cfg(target_arch = "aarch64")]
+            Self::OpaqueRgb10 => u32::from_be_bytes(*b"w30r"),
+        }
+    }
+}
+
+// BGR10_XR decodes each channel as (code - 384) / 510. Every SDR byte
+// therefore has an exact code, 384 + 2 * byte. The upper two bits are
+// padding, not alpha: the compositor sees an intrinsically opaque image.
+#[cfg(any(target_arch = "aarch64", test))]
+fn opaque_rgb10(rgba: u32) -> [u8; 4] {
+    let channel = |shift: u32| ((rgba >> shift) & 255) * 2 + 384;
+    ((channel(24) << 20) | (channel(16) << 10) | channel(8)).to_le_bytes()
+}
+
 pub(super) struct Surface {
     pub(super) raw: Id,
     pub(super) size: (usize, usize),
+    format: SurfaceFormat,
 }
 
 impl Surface {
     pub(super) fn new(size: (usize, usize)) -> Option<Self> {
+        Self::with_format(size, SurfaceFormat::Bgra8)
+    }
+
+    /// Apple Silicon can share opaque RGB10 pixels directly with CA. Other
+    /// Macs and refused allocations retain the existing BGRA backing.
+    pub(super) fn new_opaque(size: (usize, usize)) -> Option<Self> {
+        #[cfg(target_arch = "aarch64")]
+        if let Some(surface) = Self::with_format(size, SurfaceFormat::OpaqueRgb10) {
+            return Some(surface);
+        }
+        Self::new(size)
+    }
+
+    fn with_format(size: (usize, usize), format: SurfaceFormat) -> Option<Self> {
         unsafe {
             let properties = msg_id(class("NSMutableDictionary"), sel("dictionary"));
             if properties.is_null() {
@@ -270,7 +315,7 @@ impl Surface {
                 ("IOSurfaceWidth", size.0 as u64),
                 ("IOSurfaceHeight", size.1 as u64),
                 ("IOSurfaceBytesPerElement", 4),
-                ("IOSurfacePixelFormat", 0x4247_5241), // BGRA
+                ("IOSurfacePixelFormat", u64::from(format.code())),
             ] {
                 let number =
                     msg_id_u64(class("NSNumber"), sel("numberWithUnsignedLongLong:"), value);
@@ -295,7 +340,7 @@ impl Surface {
             }
             IOSurfaceSetValue(raw, kIOSurfaceColorSpace, description);
             CFRelease(description);
-            Some(Self { raw, size })
+            Some(Self { raw, size, format })
         }
     }
 
@@ -305,6 +350,12 @@ impl Surface {
 
     pub(super) fn write(&self, bitmap: &Bitmap) -> bool {
         if self.size != (bitmap.width(), bitmap.height()) {
+            return false;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.format == SurfaceFormat::OpaqueRgb10
+            && bitmap.pixels().iter().any(|pixel| pixel & 0xff != 0xff)
+        {
             return false;
         }
         unsafe {
@@ -318,10 +369,18 @@ impl Surface {
                 for (row, pixels) in bitmap.pixels().chunks_exact(self.size.0).enumerate() {
                     let output =
                         std::slice::from_raw_parts_mut(base.add(row * stride), self.size.0 * 4);
-                    for (rgba, bgra) in pixels.iter().zip(output.as_chunks_mut::<4>().0) {
-                        // An opaque canvas keeps every result opaque: the CPU
-                        // packed RGBA becomes little-endian BGRA without alpha conversion.
-                        bgra.copy_from_slice(&rgba.rotate_right(8).to_le_bytes());
+                    match self.format {
+                        SurfaceFormat::Bgra8 => {
+                            for (rgba, bgra) in pixels.iter().zip(output.as_chunks_mut::<4>().0) {
+                                bgra.copy_from_slice(&rgba.rotate_right(8).to_le_bytes());
+                            }
+                        }
+                        #[cfg(target_arch = "aarch64")]
+                        SurfaceFormat::OpaqueRgb10 => {
+                            for (rgba, rgb10) in pixels.iter().zip(output.as_chunks_mut::<4>().0) {
+                                rgb10.copy_from_slice(&opaque_rgb10(*rgba));
+                            }
+                        }
                     }
                 }
             }
@@ -386,6 +445,61 @@ mod tests {
         layout::Corners,
         text_engine::{FontSpec, PixelFont},
     };
+
+    #[test]
+    fn every_sdr_byte_has_an_exact_opaque_rgb10_code() {
+        for value in 0u32..=255 {
+            let rgba = (value << 24) | ((255 - value) << 16) | ((value ^ 0xa5) << 8) | 255;
+            let packed = u32::from_le_bytes(opaque_rgb10(rgba));
+            assert_eq!(packed >> 30, 0, "padding does not encode alpha");
+            for (source, destination) in [(24, 20), (16, 10), (8, 0)] {
+                let encoded = (packed >> destination) & 1023;
+                assert!((384..=894).contains(&encoded));
+                assert_eq!((encoded - 384) / 2, (rgba >> source) & 255);
+                assert_eq!((encoded - 384) % 2, 0);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn opaque_surfaces_refuse_alpha_before_touching_shared_pixels() {
+        unsafe extern "C" {
+            fn IOSurfaceGetPixelFormat(surface: Id) -> u32;
+        }
+        let surface = Surface::new_opaque((2, 2)).expect("opaque backing");
+        assert_eq!(
+            unsafe { IOSurfaceGetPixelFormat(surface.raw) },
+            u32::from_be_bytes(*b"w30r")
+        );
+        assert!(surface.write(&Bitmap::new(2, 2, Color::hex(0x123456))));
+        let snapshot = || unsafe {
+            assert_eq!(IOSurfaceLock(surface.raw, 0, null_mut()), 0);
+            let base = IOSurfaceGetBaseAddress(surface.raw).cast::<u8>();
+            let stride = IOSurfaceGetBytesPerRow(surface.raw);
+            let pixels = (0..2)
+                .flat_map(|row| std::slice::from_raw_parts(base.add(row * stride), 8).to_vec())
+                .collect::<Vec<_>>();
+            assert_eq!(IOSurfaceUnlock(surface.raw, 0, null_mut()), 0);
+            pixels
+        };
+        let expected = opaque_rgb10(0x123456ff).repeat(4);
+        assert_eq!(snapshot(), expected);
+        let translucent = Color {
+            r: 20,
+            g: 40,
+            b: 60,
+            a: 128,
+        };
+        assert!(!surface.write(&Bitmap::new(2, 2, translucent)));
+        assert!(!surface.write(&Bitmap::new(1, 2, Color::WHITE)));
+        assert_eq!(snapshot(), expected);
+        let ordinary = Surface::new((2, 2)).unwrap();
+        assert_eq!(
+            unsafe { IOSurfaceGetPixelFormat(ordinary.raw) },
+            u32::from_be_bytes(*b"BGRA")
+        );
+    }
 
     fn fill() -> DrawCommand {
         DrawCommand::FillRect {
