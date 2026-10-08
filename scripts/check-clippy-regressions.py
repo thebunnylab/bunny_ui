@@ -58,25 +58,33 @@ def main():
     keys = {}
     for name, source in (("baseline", arguments.baseline), ("candidate", arguments.candidate)):
         source = source.resolve()
-        command = ["cargo", "clippy", "--locked", "--all-targets", "--all-features",
-                   "--no-deps", "--message-format=json", "--target-dir", str(output / (name + "-target"))]
+        record["strict_runs"][name] = {}
+        keys[name] = set()
+        # A failing core invocation can stop Cargo before it reaches a native
+        # dependent. Each touched package must therefore run independently.
         for package in arguments.package:
-            command.extend(["-p", package])
-        command.extend(["--", "-D", "warnings"])
-        log = output / (name + ".jsonl")
-        with log.open("w", encoding="utf-8") as stream:
-            result = subprocess.run(command, cwd=source, stdout=stream, stderr=subprocess.STDOUT)
-        keys[name] = diagnostic_keys(log, source)
-        record["strict_runs"][name] = {"exit_code": result.returncode,
-                                       "diagnostics": [json.loads(key) for key in sorted(keys[name])]}
-        if result.returncode not in (0, 101) or (result.returncode and not keys[name]):
-            raise RuntimeError(f"{name} strict invocation failed without diagnostic coverage; see {log}")
+            command = ["cargo", "clippy", "--locked", "--all-targets", "--all-features",
+                       "--no-deps", "--message-format=json", "--target-dir", str(output / (name + "-target")),
+                       "-p", package, "--", "-D", "warnings"]
+            log = output / (name + "-" + package + ".jsonl")
+            with log.open("w", encoding="utf-8") as stream:
+                result = subprocess.run(command, cwd=source, stdout=stream, stderr=subprocess.STDOUT)
+            package_keys = diagnostic_keys(log, source)
+            record["strict_runs"][name][package] = {
+                "exit_code": result.returncode,
+                "diagnostics": [json.loads(key) for key in sorted(package_keys)],
+            }
+            if result.returncode not in (0, 101) or (result.returncode and not package_keys):
+                raise RuntimeError(f"{name}/{package} strict invocation failed without diagnostic coverage; see {log}")
+            keys[name].update(json.dumps({"package": package, **json.loads(key)}, sort_keys=True)
+                              for key in package_keys)
     record["shared"] = len(keys["baseline"] & keys["candidate"])
     record["new"] = [json.loads(key) for key in sorted(keys["candidate"] - keys["baseline"])]
     record["removed"] = [json.loads(key) for key in sorted(keys["baseline"] - keys["candidate"])]
     (output / "comparison.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({"strict_exit_codes": {name: run["exit_code"]
-                                          for name, run in record["strict_runs"].items()},
+    print(json.dumps({"strict_exit_codes": {name: {package: run["exit_code"]
+                                                   for package, run in runs.items()}
+                                          for name, runs in record["strict_runs"].items()},
                       "shared": record["shared"], "new": len(record["new"]),
                       "removed": len(record["removed"])}, indent=2))
     for diagnostic in record["new"]:
