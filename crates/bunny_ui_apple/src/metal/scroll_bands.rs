@@ -489,7 +489,7 @@ impl Surfaces {
         });
         let surface = match free {
             Some(at) => self.retired.swap_remove(at).surface,
-            None => software_patch::Surface::new(size)?,
+            None => software_patch::Surface::new_opaque(size)?,
         };
         surface.write(bitmap).then_some(surface)
     }
