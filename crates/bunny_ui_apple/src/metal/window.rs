@@ -488,8 +488,8 @@ mod tests {
             fn CGImageGetAlphaInfo(image: Id) -> u32;
             fn CGImageGetDataProvider(image: Id) -> Id;
             fn CGDataProviderCopyData(provider: Id) -> Id;
-            fn CFDataGetLength(data: Id) -> isize;
-            fn CFDataGetBytePtr(data: Id) -> *const u8;
+            fn CFDataGetLength(data: *const std::ffi::c_void) -> isize;
+            fn CFDataGetBytePtr(data: *const std::ffi::c_void) -> *const u8;
         }
         let image = {
             let bitmap = Bitmap::new(2, 2, Color::hex(0x123456));
