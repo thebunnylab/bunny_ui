@@ -51,6 +51,8 @@ use crate::ffi::{CFRelease, CFRetain, CGPoint, CGRect, CGSize, Id, Sel, class, e
 
 #[cfg(target_os = "macos")]
 mod software_patch;
+#[cfg(target_os = "macos")]
+mod scroll_bands;
 
 // MARK: - FFI border
 
@@ -2321,6 +2323,8 @@ pub struct MetalPresenter {
     /// a hover that leaves and returns) shows the box already painted
     /// instead of painting it again. Made on the first such changes.
     patches: Vec<Patch>,
+    #[cfg(target_os = "macos")]
+    scroll_bands: scroll_bands::Presenter,
     /// The frame the patches showed before the one on screen: a new
     /// frame equal to it is a change coming back, and is painted beside
     /// the one on screen instead of over it.
@@ -2564,9 +2568,27 @@ impl MetalPresenter {
                 objc_autoreleasePoolPop(pool);
                 return;
             }
+            self.boxes.begin_frame();
+            #[cfg(target_os = "macos")]
+            let rows_active = self.scroll_bands.active();
+            #[cfg(not(target_os = "macos"))]
+            let rows_active = false;
+            #[cfg(target_os = "macos")]
+            if !live && physical == self.physical && scale == self.scale
+                && self.base.as_ref().is_some_and(|(_, _, _, c)| *c == canvas)
+                && !self.patches.iter().any(|p| p.shown.is_some())
+                && self.scroll_bands.present(scroll_bands::Frame { root: self.layer, display, physical, scale, canvas, text, images, boxes: &self.boxes })
+            {
+                self.retained = Some((Rc::new(display.clone()), physical, scale, canvas));
+                if !self.resting { self.rest(); } else { self.offer_drawables(); }
+                objc_autoreleasePoolPop(pool);
+                return;
+            }
             // what the frame changes against the window's own layer — a
             // live resize is always whole
-            let plan = if live { Plan::Whole } else { self.plan(display, physical, scale, canvas, text) };
+            let plan = if live || rows_active { Plan::Whole } else { self.plan(display, physical, scale, canvas, text) };
+            #[cfg(target_os = "macos")]
+            if plan != Plan::Whole { self.scroll_bands.discard_trial(); }
             if plan == Plan::Same {
                 // the window's layer already shows this frame (a stroke
                 // undone, a hover gone): the patch over it steps aside
@@ -2665,7 +2687,7 @@ impl MetalPresenter {
             // a whole frame over a patch takes the patch down in the same
             // transaction — apart, the box would show the old frame for
             // one refresh
-            let hiding = self.patches.iter().any(|patch| patch.shown.is_some());
+            let hiding = rows_active || self.patches.iter().any(|patch| patch.shown.is_some());
             // the contract of THIS frame's drawable, settled before it
             // is asked for. A window whose delegate armed the drag
             // already agrees and this changes nothing; a size the app
@@ -2727,6 +2749,8 @@ impl MetalPresenter {
                 let transaction = class("CATransaction");
                 msg_void(transaction, sel("begin"));
                 msg_void(drawable, self.stack.sels.present);
+                #[cfg(target_os = "macos")]
+                if rows_active { self.scroll_bands.hide(); }
                 for patch in &mut self.patches {
                     patch.hide();
                 }
@@ -2776,7 +2800,6 @@ impl MetalPresenter {
         if *base_physical != physical || *base_scale != scale || *base_canvas != canvas {
             return Plan::Whole;
         }
-        self.boxes.begin_frame();
         match list_damage(
             base.as_slice(),
             display.as_slice(),
@@ -3006,6 +3029,8 @@ impl MetalPresenter {
             retained: None,
             base: None,
             patches: Vec::new(),
+            #[cfg(target_os = "macos")]
+            scroll_bands: scroll_bands::Presenter::default(),
             previous: None,
             boxes: MeasureCache::default(),
             drawables: Drawables::default(),

@@ -526,19 +526,36 @@ impl TextEngine for CoreTextEngine {
         if text.is_empty() {
             return None;
         }
-        let metrics = self.measure_line(text, font);
+        let ct_font = self.font(font);
+        let (line, metrics) = unsafe {
+            // Shape once, then measure and draw the same tracked line.
+            let line = make_line(text, ct_font, font);
+            let width = CTLineGetTypographicBounds(
+                line,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let ascent = CTFontGetAscent(ct_font);
+            let descent = CTFontGetDescent(ct_font) + CTFontGetLeading(ct_font);
+            (
+                line,
+                LineMetrics {
+                    width,
+                    ascent,
+                    descent,
+                },
+            )
+        };
         let width = (metrics.width * scale as f64).ceil() as usize;
         let height = (metrics.height() * scale as f64).ceil() as usize;
         if width == 0 || height == 0 {
+            unsafe { CFRelease(line) };
             return None;
         }
 
-        let ct_font = self.font(font);
         let mut rgba = vec![0u8; width * height * 4];
         unsafe {
-            // the SAME line the measurement built: what is drawn is what
-            // was measured, tracking included
-            let line = make_line(text, ct_font, font);
             let space = CGColorSpaceCreateDeviceRGB();
             let context = CGBitmapContextCreate(
                 rgba.as_mut_ptr() as *mut c_void,
