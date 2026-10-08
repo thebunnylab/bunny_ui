@@ -2322,6 +2322,30 @@ pub(crate) fn graveyard_len() -> usize {
     GRAVEYARD.with(|graveyard| graveyard.borrow().len())
 }
 
+/// The live entry identities before a paranoid pass. Retired entries are
+/// absent: collecting their memory must not look like a new retirement.
+pub(crate) struct RetainedSnapshot(Vec<(Rc<str>, Rc<Slot>)>);
+
+impl RetainedSnapshot {
+    /// Every path still names the same live entry, with none added or lost.
+    pub(crate) fn is_current(&self) -> bool {
+        RETAINED.with(|retained| {
+            let retained = retained.borrow();
+            retained.len() == self.0.len()
+                && self.0.iter().all(|(path, slot)| {
+                    retained.get(path).is_some_and(|entry| Rc::ptr_eq(&entry.slot, slot))
+                })
+        })
+    }
+}
+
+/// Captures live retention only when the caller runs a diagnostic check.
+pub(crate) fn retained_snapshot() -> RetainedSnapshot {
+    RETAINED.with(|retained| {
+        RetainedSnapshot(retained.borrow().iter().map(|(path, entry)| (path.clone(), entry.slot.clone())).collect())
+    })
+}
+
 /// Diagnostics: the trees re-runs replaced, waiting to be freed.
 pub(crate) fn replaced_len() -> usize {
     REPLACED.with(|replaced| replaced.borrow().len())
@@ -2948,6 +2972,44 @@ mod tests {
         runtime.render(&page);
         assert_eq!(graveyard_len(), 0, "past it, the pass freed it");
         assert_eq!(motor::identity::retired_count(), 0, "read graph and all");
+    }
+
+    /// A skipped settle must keep every live entry, even when the check's
+    /// pass reaches the collection valve and frees entries retired earlier.
+    #[test]
+    fn a_quiet_settle_can_collect_previously_retired_entries() {
+        crate::paranoid::force(crate::paranoid::SETTLE);
+        let page = Lines { lines: State::new(lines(1..=3)) };
+        let runtime = Runtime::new();
+        runtime.settle(&page);
+        page.lines.set(Rc::new(Vec::new()));
+        runtime.settle(&page);
+        assert_eq!(graveyard_len(), 3, "the old rows wait for collection");
+
+        for _ in 0..GARBAGE_PATIENCE {
+            runtime.settle(&page);
+        }
+        assert_eq!(graveyard_len(), 0, "the quiet check reached the collection valve");
+        assert!(last_body_runs().is_empty(), "collection rebuilt no live body");
+        crate::paranoid::release();
+    }
+
+    /// Equal table sizes cannot hide a removed entry or a new slot at the
+    /// same path. A live snapshot compares the retained identities.
+    #[test]
+    fn a_retained_snapshot_detects_replacement_at_the_same_path() {
+        let page = Lines { lines: State::new(lines(1..=3)) };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        let before = retained_snapshot();
+        assert!(before.is_current());
+        let count = retained_len();
+        let root = before.0.first().expect("the page retains its root").0.clone();
+        forget_under(&root);
+        runtime.render(&page);
+        assert_eq!(retained_len(), count, "the same paths are rebuilt");
+        assert!(!before.is_current(), "new slots at the same paths are different entries");
+        assert!(retained_snapshot().is_current());
     }
 
     /// A row that answers a click — or, unarmed, shows the same words

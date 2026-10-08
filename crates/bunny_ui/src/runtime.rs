@@ -6990,8 +6990,9 @@ impl Runtime {
                     crate::layout::layout_dom(&tree, proposal, env, collect_display);
                 (result, Some(scene))
             } else {
-                // the paranoid check needs the cut on to have a claim to check
-                let drop = self.drops_unseen.get() || crate::paranoid::on(crate::paranoid::SEEN);
+                // Paranoid cross-checks preserve the runtime's public choice:
+                // probes keep offscreen words; shells request the cut.
+                let drop = self.drops_unseen.get();
                 (crate::layout::layout_placing(&tree, proposal, env, insets, !drop), None)
             }
         });
@@ -7235,7 +7236,7 @@ impl Runtime {
     fn settle_is_quiet(&self, root: std::any::TypeId) -> bool {
         self.last_root.borrow().is_some()
             && self.last_root_type.get() == Some(root)
-            && self.root_boundary.borrow().is_some()
+            && self.root_boundary.borrow().as_deref().is_some_and(reconciler::is_retained)
             && motor::identity::scene_epoch() == self.settled_epoch.get()
             && !motor::task::has_ready()
             && crate::theme::version() == self.theme_version.get()
@@ -7248,7 +7249,7 @@ impl Runtime {
     /// anyway, and must come out empty — no body ran, no effect observed a
     /// change, nothing dirty, nothing fell.
     fn assert_quiet_settle(&self, root: &impl View) {
-        let graveyard = reconciler::graveyard_len();
+        let retained = reconciler::retained_snapshot();
         // the check's own pass counts for nobody
         let counted = crate::stats::snapshot();
         self.frame_pass(root);
@@ -7259,7 +7260,7 @@ impl Runtime {
         assert!(!observed_change, "a quiet settle skipped a pump that observed a change");
         self.sweep_tasks();
         assert!(!self.has_pending_dirty(), "a quiet settle left a view dirty");
-        assert_eq!(graveyard, reconciler::graveyard_len(), "a quiet settle let an entry fall");
+        assert!(retained.is_current(), "a quiet settle changed the live entries");
     }
 
     /// Whoever stopped being declared stops running — the `.task` cells of

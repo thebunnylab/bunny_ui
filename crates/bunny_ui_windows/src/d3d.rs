@@ -103,6 +103,32 @@ type D3dCompileFn = unsafe extern "system" fn(
 
 const DRIVER_TYPE_HARDWARE: u32 = 1;
 const DRIVER_TYPE_WARP: u32 = 5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Driver {
+    Hardware,
+    Warp,
+}
+
+impl Driver {
+    fn precision(self, vendor: u32, device: u32) -> Self {
+        // DXGI documents a primary Basic Render Driver with no SOFTWARE
+        // flag: a successful HARDWARE request can still return WARP.
+        // Its documented vendor/device pair identifies both Basic paths.
+        // https://learn.microsoft.com/windows/win32/direct3ddxgi/d3d10-graphics-programming-guide-dxgi
+        match (self, vendor, device) {
+            (Self::Hardware, 0x1414, 0x8c) => Self::Warp,
+            _ => self,
+        }
+    }
+}
+
+/// `D3D_SHADER_MACRO`: two `LPCSTR`s, followed by a null sentinel.
+#[repr(C)]
+struct ShaderDefine {
+    name: *const i8,
+    definition: *const i8,
+}
 const CREATE_DEVICE_BGRA_SUPPORT: u32 = 0x20;
 const SDK_VERSION: u32 = 7;
 const FEATURE_LEVEL_11_0: u32 = 0xb000;
@@ -490,6 +516,88 @@ struct DxgiAdapterVtbl {
     // 6 GetParent
     get_parent:
         unsafe extern "system" fn(*mut DxgiAdapter, *const Guid, *mut *mut c_void) -> Hresult,
+}
+
+/// DXGI 1.1's descriptor identifies software independently of the
+/// driver type requested from D3D11CreateDevice.
+#[repr(C)]
+struct AdapterDesc1 {
+    description: [u16; 128],
+    vendor: u32,
+    device: u32,
+    subsystem: u32,
+    revision: u32,
+    video: usize,
+    system: usize,
+    shared: usize,
+    luid_low: u32,
+    luid_high: i32,
+    flags: u32,
+}
+
+#[repr(C)]
+struct Adapter1 {
+    vtbl: *const Adapter1Vtbl,
+}
+
+#[repr(C)]
+struct Adapter1Vtbl {
+    unknown: UnknownVtbl,
+    _pad_3_9: [usize; 7],
+    get_desc1: unsafe extern "system" fn(*mut Adapter1, *mut AdapterDesc1) -> Hresult,
+}
+
+const _: () =
+    assert!(std::mem::offset_of!(AdapterDesc1, flags) == 280 + 3 * std::mem::size_of::<usize>());
+const _: () =
+    assert!(std::mem::offset_of!(Adapter1Vtbl, get_desc1) == 10 * std::mem::size_of::<usize>());
+
+fn adapter_description(device: &Com<Device>) -> Result<AdapterDesc1, String> {
+    const IID_ADAPTER1: Guid = Guid {
+        d1: 0x29038f61,
+        d2: 0x3839,
+        d3: 0x4626,
+        d4: [0x91, 0xfd, 0x08, 0x68, 0x79, 0x01, 0x1a, 0x05],
+    };
+    // Windows' DXGI 1.1 descriptor and vtable, checked against dxgi.h.
+    // Retain each interface until its successor and descriptor are read.
+    let device = device.as_ptr();
+    unsafe {
+        let mut dxgi = null_mut();
+        if !com_ok(((*(*device).vtbl).unknown.query_interface)(
+            device.cast(),
+            &IID_DXGI_DEVICE,
+            &mut dxgi,
+        )) {
+            return Err("DXGI device unavailable".to_owned());
+        }
+        let dxgi = Com::<DxgiDevice>::from_raw(dxgi.cast()).ok_or("null DXGI device")?;
+        let mut adapter = null_mut();
+        if !com_ok(((*(*dxgi.as_ptr()).vtbl).get_adapter)(
+            dxgi.as_ptr(),
+            &mut adapter,
+        )) {
+            return Err("DXGI adapter unavailable".to_owned());
+        }
+        let adapter = Com::from_raw(adapter).ok_or("null DXGI adapter")?;
+        let mut adapter1 = null_mut();
+        if !com_ok(((*(*adapter.as_ptr()).vtbl).unknown.query_interface)(
+            adapter.as_ptr().cast(),
+            &IID_ADAPTER1,
+            &mut adapter1,
+        )) {
+            return Err("DXGI 1.1 adapter unavailable".to_owned());
+        }
+        let adapter1 = Com::<Adapter1>::from_raw(adapter1.cast()).ok_or("null DXGI 1.1 adapter")?;
+        let mut desc: AdapterDesc1 = std::mem::zeroed();
+        if !com_ok(((*(*adapter1.as_ptr()).vtbl).get_desc1)(
+            adapter1.as_ptr(),
+            &mut desc,
+        )) {
+            return Err("DXGI adapter description unavailable".to_owned());
+        }
+        Ok(desc)
+    }
 }
 
 /// `IDXGIFactory2` — the swapchain maker.
@@ -1009,7 +1117,15 @@ float4 blur_fragment(BlitVary vary) : SV_Target {
         float2 away = away_step * BLUR_O[i];
         acc += (blur_tap(uv + away) + blur_tap(uv - away)) * BLUR_W[i];
     }
+#ifdef BUNNY_GLASS_BYTE_PRECISION
+    // The CPU pyramid stores ideal, rounded sRGB bytes. WARP's
+    // permitted transfer-function precision compounds across passes;
+    // center the value on that byte grid before its sRGB RTV encodes it.
+    float3 encoded = floor(saturate(linear_to_srgb3(acc.rgb)) * 255.0 + 0.5) / 255.0;
+    return float4(srgb_to_linear3(encoded), floor(saturate(acc.a) * 255.0 + 0.5) / 255.0);
+#else
     return acc;
+#endif
 }
 
 struct GlassVary {
@@ -1194,17 +1310,30 @@ fn compiler() -> Option<D3dCompileFn> {
     address.map(|address| unsafe { std::mem::transmute::<usize, D3dCompileFn>(address) })
 }
 
-unsafe fn compile_shader(compile: D3dCompileFn, entry: &str, target: &str) -> Option<Com<Blob>> {
+unsafe fn compile_shader(
+    compile: D3dCompileFn,
+    entry: &str,
+    target: &str,
+    driver: Driver,
+) -> Option<Com<Blob>> {
     let entry = CString::new(entry).expect("entry without NUL");
     let target = CString::new(target).expect("target without NUL");
     let mut code: *mut Blob = null_mut();
     let mut errors: *mut Blob = null_mut();
+    let defines = [
+        ShaderDefine { name: c"BUNNY_GLASS_BYTE_PRECISION".as_ptr(), definition: c"1".as_ptr() },
+        ShaderDefine { name: null(), definition: null() },
+    ];
+    let defines = match driver {
+        Driver::Hardware => null(),
+        Driver::Warp => defines.as_ptr().cast(),
+    };
     let hr = unsafe {
         compile(
             SHADER_SOURCE.as_ptr() as *const c_void,
             SHADER_SOURCE.len(),
             null(),
-            null(),
+            defines,
             null(),
             entry.as_ptr(),
             target.as_ptr(),
@@ -1275,6 +1404,10 @@ impl D3dStack {
     }
 
     fn build(warp_fallback: bool) -> Result<D3dStack, String> {
+        Self::build_on(Driver::Hardware, warp_fallback)
+    }
+
+    fn build_on(mut driver: Driver, warp_fallback: bool) -> Result<D3dStack, String> {
         let compile = compiler().ok_or("no d3dcompiler_47.dll on this system")?;
         let levels = [FEATURE_LEVEL_11_0];
         let mut device: *mut Device = null_mut();
@@ -1282,7 +1415,10 @@ impl D3dStack {
         let mut hr = unsafe {
             D3D11CreateDevice(
                 null_mut(),
-                DRIVER_TYPE_HARDWARE,
+                match driver {
+                    Driver::Hardware => DRIVER_TYPE_HARDWARE,
+                    Driver::Warp => DRIVER_TYPE_WARP,
+                },
                 0,
                 CREATE_DEVICE_BGRA_SUPPORT,
                 levels.as_ptr(),
@@ -1294,6 +1430,7 @@ impl D3dStack {
             )
         };
         if !com_ok(hr) && warp_fallback {
+            driver = Driver::Warp;
             hr = unsafe {
                 D3D11CreateDevice(
                     null_mut(),
@@ -1314,10 +1451,12 @@ impl D3dStack {
         }
         let device = Com::from_raw(device).ok_or("null device")?;
         let context = Com::from_raw(context).ok_or("null context")?;
+        let adapter = adapter_description(&device)?;
+        driver = driver.precision(adapter.vendor, adapter.device);
         let d = device.as_ptr();
         unsafe {
             let shader = |entry: &str, target: &str| -> Result<Com<Blob>, String> {
-                compile_shader(compile, entry, target)
+                compile_shader(compile, entry, target, driver)
                     .ok_or_else(|| format!("shader {entry} did not compile"))
             };
             let make_vs = |blob: &Com<Blob>, name: &str| -> Result<Com<VertexShader>, String> {
@@ -3809,6 +3948,10 @@ impl OffscreenD3d {
             return None;
         }
         let stack = D3dStack::create(true)?;
+        Self::with_stack(width, height, stack)
+    }
+
+    fn with_stack(width: usize, height: usize, stack: D3dStack) -> Option<OffscreenD3d> {
         let device = stack.device.as_ptr();
         let context = stack.context.as_ptr();
         let desc = Texture2dDesc {
@@ -4029,6 +4172,24 @@ mod tests {
     use bunny_ui::prelude::*;
     use bunny_ui::raster::rasterize_with;
 
+    fn report_adapter(device: &Com<Device>) {
+        let desc = adapter_description(device).expect("parity adapter description");
+        let end = desc
+            .description
+            .iter()
+            .position(|ch| *ch == 0)
+            .unwrap_or(128);
+        eprintln!(
+            "D3D parity adapter: {} vendor={:#x} device={:#x} flags={:#x} luid={:08x}:{:08x}",
+            String::from_utf16_lossy(&desc.description[..end]),
+            desc.vendor,
+            desc.device,
+            desc.flags,
+            u32::from_ne_bytes(desc.luid_high.to_ne_bytes()),
+            desc.luid_low,
+        );
+    }
+
     /// One probe, cached: WARP makes a device near-universal, but a
     /// machine without the compiler DLL skips honestly.
     fn device_present() -> bool {
@@ -4048,23 +4209,32 @@ mod tests {
         scale: usize,
         canvas: Color,
     ) -> (Vec<u8>, Vec<u8>) {
-        let physical = (
-            (logical.width.round() as usize) * scale,
-            (logical.height.round() as usize) * scale,
-        );
+        let physical =
+            ((logical.width.round() as usize) * scale, (logical.height.round() as usize) * scale);
+        let gpu = OffscreenD3d::new(physical.0, physical.1).expect("offscreen gpu");
+        scene_bytes_on(root, logical, scale, canvas, gpu)
+    }
+
+    fn scene_bytes_on(
+        root: &impl View,
+        logical: Size,
+        scale: usize,
+        canvas: Color,
+        mut gpu: OffscreenD3d,
+    ) -> (Vec<u8>, Vec<u8>) {
+        report_adapter(&gpu.stack.device);
         let runtime = Runtime::new();
         let display = runtime.display_frame(root, logical);
         let cpu = rasterize_with(
             &display,
-            physical.0,
-            physical.1,
+            gpu.width,
+            gpu.height,
             scale,
             canvas,
             &PixelFont,
             &RawImages::default(),
         )
         .to_rgba_bytes();
-        let mut gpu = OffscreenD3d::new(physical.0, physical.1).expect("offscreen gpu");
         gpu.present_wait(&display, scale, canvas, &PixelFont, &RawImages::default());
         (gpu.read_rgba(), cpu)
     }
@@ -4094,6 +4264,17 @@ mod tests {
             "{label}: {beyond_one} channels beyond one step ({:.3}% > 1%)",
             share * 100.0
         );
+    }
+
+    #[test]
+    fn the_basic_default_adapter_keeps_software_precision() {
+        // The primary Basic adapter has no SOFTWARE flag and was returned
+        // by a successful hardware request in the failing parity gate.
+        assert_eq!(Driver::Hardware.precision(0x1414, 0x8c), Driver::Warp);
+        assert_eq!(Driver::Warp.precision(0x1414, 0x8c), Driver::Warp);
+        assert_eq!(Driver::Hardware.precision(0x1002, 0x1586), Driver::Hardware);
+        assert_eq!(Driver::Hardware.precision(0x1414, 0x8d), Driver::Hardware);
+        assert_eq!(Driver::Hardware.precision(0x1002, 0x8c), Driver::Hardware);
     }
 
     #[test]
@@ -4876,22 +5057,44 @@ mod tests {
         // two panes that OVERLAP must not share one capture of the
         // scene: the upper one would sample a blur taken before the
         // lower one existed, and the glass under it would vanish
-        use bunny_ui::layout::Glass;
-        let root = zstack!((
-            empty()
-                .frame_width(240.0)
-                .frame_height(160.0)
-                .background_gradient(bunny_ui::layout::Gradient::linear(
-                    Color::hex(0x102A64),
-                    Color::hex(0xE8D14A),
-                )),
-            empty().frame(180.0, 110.0).corner_radius(28.0).glass(Glass::regular()),
-            empty().frame(90.0, 60.0).corner_radius(18.0).glass(Glass::clear()),
-        ));
-        let (gpu, cpu) =
-            scene_bytes(&root, Size { width: 240.0, height: 160.0 }, 2, Color::CANVAS);
+        let (gpu, cpu) = scene_bytes(
+            &stacked_pane_scene(),
+            Size { width: 240.0, height: 160.0 },
+            2,
+            Color::CANVAS,
+        );
         // a pane over a pane compounds: the upper one samples a scene
         // that already carries the lower one's own difference
         assert_glass_close(&gpu, &cpu, 6, 0.015, "stacked panes");
+    }
+
+    #[test]
+    fn stacked_panes_on_warp_keep_the_same_material_precision() {
+        if !device_present() {
+            return;
+        }
+        // Exercise software even on a host with a hardware adapter, so
+        // its repeated sRGB conversions cannot hide behind the GPU path.
+        let stack = D3dStack::build_on(Driver::Warp, false).expect("WARP stack");
+        let gpu = OffscreenD3d::with_stack(480, 320, stack).expect("WARP target");
+        let (gpu, cpu) = scene_bytes_on(
+            &stacked_pane_scene(),
+            Size { width: 240.0, height: 160.0 },
+            2,
+            Color::CANVAS,
+            gpu,
+        );
+        assert_glass_close(&gpu, &cpu, 6, 0.015, "stacked panes on WARP");
+    }
+
+    fn stacked_pane_scene() -> impl View {
+        use bunny_ui::layout::Glass;
+        zstack!((
+            empty().frame_width(240.0).frame_height(160.0).background_gradient(
+                bunny_ui::layout::Gradient::linear(Color::hex(0x102A64), Color::hex(0xE8D14A),)
+            ),
+            empty().frame(180.0, 110.0).corner_radius(28.0).glass(Glass::regular()),
+            empty().frame(90.0, 60.0).corner_radius(18.0).glass(Glass::clear()),
+        ))
     }
 }
