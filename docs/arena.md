@@ -471,8 +471,8 @@ Composition tests cover scales one and two, fractional origins, reverse travel,
 duplicate rows, changed content and refused geometry. The attached display is
 1×; this round does not claim actual-window coverage on a 2× monitor.
 
-Three interleaved release pairs compare renderer `6b03bac` with the final
-revision on the same M5 Max and 1×/60 Hz display. All six wheel CPU samples
+Three interleaved release pairs compare renderer `6b03bac` with
+`28898ea` on the same M5 Max and 1×/60 Hz display. All six wheel CPU samples
 pass workload, input and unlocked-host checks. CPU uses two kernel-counter
 reads over seconds 1–9; binaries, fixtures and sources are frozen. Builds
 precede admission by at least 60 seconds. The session's initial canary limit
@@ -516,3 +516,66 @@ suite passes 2,889 tests with 44 ignored. Strict Apple library clippy still
 reports 34 existing diagnostics outside the new strategy, with none added;
 this is not a green strict-clippy gate. The measured engine sources and
 binaries are frozen separately from documentation.
+
+### A software patch keeps identical physical pixels (2026-10-08)
+
+Two logically different scenes can rasterize to the same physical pixels: a
+small fractional geometry change may not cross a pixel boundary. A currently
+visible software patch now retains its backing when its exact normalized
+commands, physical bounds, scale and canvas are equal. The logical frame
+witness still advances. Hiding the patch or replacing its underlying whole
+frame clears the witness; changed pixels continue through the existing guarded
+surface pool. No hash stands in for equality and no visible surface is written.
+
+The same native nine-state probe, built against `28898ea` and this revision,
+shows four redundant publications before and zero after. All client pixels
+match the whole-Metal oracle exactly, including changed-pixel, hide/return and
+new-base controls. Unit tests cover fractional changes, clips, destinations,
+scale and canvas at 1× and 2×. Native observations use the attached 1× display.
+
+Four interleaved streaming CPU pairs measure medians 2.008027% → 1.976027%
+(−1.59%). This does not meet the time-retention threshold on its own. Streaming
+footprint medians are 35 → 34.5 MB; these are not allocation counts.
+
+A separate three-pair GPU block showed an unusually high candidate sample, so
+one fixed three-pair replication ran on the unchanged frozen binaries. Every
+replication pair improved. Across both blocks, all 12 samples are valid and
+five of six paired totals are lower. Median observed app plus global compositor
+time is 2.075152 → 1.206443 ms/s (−41.86%). Recorded app GPU is zero throughout;
+the combined values are global WindowServer observations, not exclusive window
+attribution or a guarantee of zero presentation cost.
+
+The original outlier remains included: ranges are 1.822026–2.745472 ms/s before
+and 0.875837–4.634257 after. Replication medians are 2.190260 → 1.099478 ms/s.
+This establishes a lower median with observed variability, not a tail guarantee.
+No scene, tolerance or sample was removed to obtain the result.
+
+Native table/canvas motion, input and scene checks pass. Editor comparisons
+preserve the complete client image, including alpha: both captured post-input
+caret phases match byte for byte in the 400-line, 30,000-line and append scenes.
+Comparing only the last capture had incorrectly compared opposite blink phases;
+the initial failed comparison and every image are retained.
+
+Four interleaved pairs per guard keep every active median within the fixed 5%
+CPU regression limit. These are small increases, not CPU improvements:
+
+| active guard | CPU before | CPU after | change |
+|---|---:|---:|---:|
+| wheel | 7.066459% | 7.326718% | +3.68% |
+| type, 400 lines | 0.549778% | 0.565123% | +2.79% |
+| type, 30,000 lines | 0.880077% | 0.894074% | +1.59% |
+| append, 30,000 lines | 1.337766% | 1.354329% | +1.24% |
+
+Four separate 20-second idle pairs measure 0.010258594% → 0.010265591% CPU,
+an absolute change of +0.000006997 percentage points. Ranges overlap:
+0.009415833–0.012787394% before and
+0.009958221–0.011981864% after. This is an observed
+residual, not literal zero or proof of identical cost.
+
+All 48 CPU samples and 12 GPU samples pass workload and unlocked-host admission.
+Normal and paranoid tests pass 77 Apple and 27 macOS tests each; iOS compiles,
+and the complete scratch consumer suite passes 2,889 tests with 44 ignored.
+Strict Apple library clippy retains the same 34 baseline errors plus three
+dependency warnings, with no additions; it is not a green strict-clippy gate.
+The engine sources, executables, fixtures, raw comparisons and rejected
+attempts are frozen separately from this documentation.

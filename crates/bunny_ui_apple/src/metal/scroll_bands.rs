@@ -689,7 +689,7 @@ impl Presenter {
         }
         let mut fresh_overlay = None;
         let overlay = if let Some((_, paint)) = &scene.overlay {
-            let bitmap = paint.raster(scale, canvas, &cached, images);
+            let bitmap = paint.raster(&cached, images);
             match self.overlays.iter().position(|o| {
                 o.bitmap.width() == bitmap.width()
                     && o.bitmap.height() == bitmap.height()
@@ -948,7 +948,7 @@ mod tests {
                 }
                 if let Some((rect, overlay)) = &admitted.overlay {
                     let tile =
-                        overlay.raster(scale, Color::WHITE, &PixelFont, &RawImages::default());
+                        overlay.raster(&PixelFont, &RawImages::default());
                     for y in rect.1..rect.3 {
                         for x in rect.0..rect.2 {
                             composed[y as usize * size.0 + x as usize] = tile.pixels()
