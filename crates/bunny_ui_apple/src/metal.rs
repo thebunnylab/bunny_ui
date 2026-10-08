@@ -2210,6 +2210,9 @@ struct Patch {
     kind: PatchKind,
     #[cfg(target_os = "macos")]
     software: software_patch::Backing,
+    /// The normalized scene of a still-visible software patch.
+    #[cfg(target_os = "macos")]
+    software_scene: Option<software_patch::Scene>,
     /// The drawable size the layer was last given, in pixels.
     size: (usize, usize),
     /// The scale the layer was last given.
@@ -2264,6 +2267,8 @@ impl Patch {
             Some(Patch { layer, kind,
                 #[cfg(target_os = "macos")]
                 software: software_patch::Backing::default(),
+                #[cfg(target_os = "macos")]
+                software_scene: None,
                 size: (0, 0), scale, shown: None, held: None, drawables: Drawables::default() })
         }
     }
@@ -2284,6 +2289,8 @@ impl Patch {
 
     /// Hides the layer — inside whatever transaction is open.
     unsafe fn hide(&mut self) {
+        #[cfg(target_os = "macos")]
+        { self.software_scene = None; }
         if self.shown.take().is_some() {
             unsafe { msg_void_bool(self.layer, sel("setHidden:"), 1) };
             crate::trace::mark("Q", format_args!("hide"));
@@ -2638,7 +2645,7 @@ impl MetalPresenter {
             #[cfg(target_os = "macos")]
             if let Plan::Patch(rect) = plan
                 && let Some(scene) = software_patch::Scene::new(display, rect, scale, canvas, text, &self.boxes)
-                && self.present_software_patch(&scene.raster(scale, canvas, text, images), display, rect, physical, scale, canvas)
+                && self.present_software_patch(scene, display, physical, text, images)
             {
                 objc_autoreleasePoolPop(pool);
                 return;
@@ -2765,6 +2772,8 @@ impl MetalPresenter {
             // old one
             for patch in &mut self.patches {
                 patch.held = None;
+                #[cfg(target_os = "macos")]
+                { patch.software_scene = None; }
             }
             self.previous = None;
             let kept = (Rc::new(display.clone()), physical, scale, canvas);
@@ -2836,16 +2845,32 @@ impl MetalPresenter {
     #[cfg(target_os = "macos")]
     unsafe fn present_software_patch(
         &mut self,
-        bitmap: &bunny_ui::raster::Bitmap,
+        scene: software_patch::Scene,
         display: &DisplayList,
-        rect: DamageRect,
         physical: (usize, usize),
-        scale: usize,
-        canvas: Color,
+        text: &dyn TextEngine,
+        images: &dyn ImageEngine,
     ) -> bool {
         unsafe {
+            let rect = scene.bounds();
+            let scale = scene.scale();
+            let canvas = scene.canvas();
+            if let Some(same) = self.patches.iter().position(|patch| {
+                patch.shown == Some(rect) && patch.held.is_some()
+                    && patch.software_scene.as_ref().is_some_and(|held| held.matches(&scene))
+            }) {
+                // Logical geometry changed, but no physical pixel did. Keep
+                // the visible surface untouched and advance the frame witness.
+                self.previous = self.patch_on_screen();
+                let held = Rc::new(display.clone());
+                self.patches[same].held = Some((held.clone(), rect));
+                self.retained = Some((held, physical, scale, canvas));
+                crate::trace::mark("Q", format_args!("box={},{},{},{} unchanged", rect.0, rect.1, rect.2, rect.3));
+                return true;
+            }
+            let bitmap = scene.raster(text, images);
             let Some(target) = self.patch_target(display, scale, PatchKind::Software) else { return false; };
-            let Some(surface) = self.patches[target].software.prepare(bitmap) else { return false; };
+            let Some(surface) = self.patches[target].software.prepare(&bitmap) else { return false; };
             self.previous = self.patch_on_screen();
             let held = Rc::new(display.clone());
             let transaction = class("CATransaction");
@@ -2865,6 +2890,7 @@ impl MetalPresenter {
                 }
             }
             msg_void(transaction, sel("commit"));
+            self.patches[target].software_scene = Some(scene);
             self.retained = Some((held, physical, scale, canvas));
             crate::trace::mark("Q", format_args!("box={},{},{},{} software", rect.0, rect.1, rect.2, rect.3));
             true
@@ -3550,7 +3576,7 @@ mod tests {
                 let s = scale as i64;
                 let rect = (logical.0*s, logical.1*s, logical.2*s, logical.3*s);
                 let scene = software_patch::Scene::new(&display, rect, scale, Color::CANVAS, &text, &MeasureCache::default()).expect("bounded simple scene");
-                let patch = scene.raster(scale, Color::CANVAS, &text, &RawImages::default());
+                let patch = scene.raster(&text, &RawImages::default());
                 let mut gpu_crop = Vec::new();
                 for y in rect.1..rect.3 {
                     for x in rect.0..rect.2 {
