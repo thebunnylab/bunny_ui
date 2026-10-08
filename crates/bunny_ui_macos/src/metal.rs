@@ -1,5 +1,7 @@
-//! The Mac's side of the Metal road: where each window's presenter
-//! lives, and how a `CAMetalLayer` reaches an `NSView`.
+//! The Mac's layer presenter: native opaque bands until a scene needs
+//! Metal, and the existing GPU backend after that one-way promotion.
+//! This module owns where each window's presenter lives and how its
+//! `CAMetalLayer` reaches an `NSView`.
 //!
 //! The presenter itself — the stack, the shaders, the atlas, the frame
 //! — is the shared Apple half ([`bunny_ui_apple::metal`]). This module
@@ -15,7 +17,7 @@ use std::collections::HashMap;
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::layout::{Color, DisplayList, Size};
 use bunny_ui::text_engine::TextEngine;
-use bunny_ui_apple::metal::MetalPresenter;
+use bunny_ui_apple::metal::WindowPresenter as MetalPresenter;
 pub use bunny_ui_apple::metal::OffscreenGpu;
 
 use crate::ffi::{Id, Sel, class, sel};
@@ -55,8 +57,8 @@ const CONGESTED_MS: f64 = 1.5;
 /// Grafts the CAMetalLayer onto the view — called by `create_window`
 /// BEFORE `setWantsLayer:`, so the view becomes layer-HOSTING and
 /// `drawRect:` never runs. Returns false (and touches nothing) when the
-/// GPU path is refused or cannot come up; the caller proceeds with the
-/// CPU path.
+/// layer path is explicitly refused or cannot come up; the caller
+/// proceeds with the CPU path. Metal itself initializes on demand.
 pub(crate) fn try_install(view: Id, scale: f64, width: f64, height: f64) -> bool {
     match graft(view, scale, width, height) {
         Some(presenter) => {

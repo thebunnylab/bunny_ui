@@ -579,3 +579,49 @@ Strict Apple library clippy retains the same 34 baseline errors plus three
 dependency warnings, with no additions; it is not a green strict-clippy gate.
 The engine sources, executables, fixtures, raw comparisons and rejected
 attempts are frozen separately from this documentation.
+
+
+## Native base before the GPU (2026-10-08)
+
+A macOS window can now start an admitted opaque scroll scene on native
+IOSurface-backed layers, including its first canvas. It reuses the existing
+bounded band compositor without creating a Metal device or command queue.
+Unsupported paint, changed geometry/scale/canvas or live resize promotes the
+window to Metal once. The old native cover remains until the first successful
+GPU frame and leaves in the same transaction. A window that has required Metal
+keeps it; this is not a promise of zero CPU for every scene or after promotion.
+The explicit CPU override, iOS renderer and offscreen GPU are unchanged.
+
+The fixed six-pair table-rest observation compares the retained prior build
+with the native-base candidate on the same machine and 10,000-row fixture.
+Each process runs for 20 seconds; two kernel-counter reads cover 10–18 seconds
+after FIRST_FRAME. No tracing, concurrent build or competitor executable runs.
+All 12 observations pass host, completion and scene admission.
+
+| Bunny version | idle CPU median | observed range | idle footprint |
+|---|---:|---:|---:|
+| retained prior | 0.00201461% | 0.00194131–0.00227944% | 33 MB |
+| native base | 0% | 0–0.00401877% | 34 MB |
+
+Four of six candidate intervals have exactly unchanged counters; two contain
+residual process work. The zero is the observed median, not an absolute physical
+zero guarantee. An earlier four-pair prototype screen measured 0.00195033%,
+including two zero intervals, and is retained with the final evidence.
+Separate callback tracing observes no periodic 1–5 second dispatch sources in
+the candidate and no framework frame work after settling; remaining callbacks
+pass through AppKit/Core Animation. No operating-system timer is cancelled.
+
+Actual own-window comparisons cover 32 frames across native rest, repeated and
+bidirectional scrolling, unsupported paint, resize, canvas change and a forced
+2x raster scale. Every channel differs by at most 2; this uses the actual 1x
+monitor and does not establish a physical 2x-monitor result. Regression coverage
+also checks promotion on live resize, no GPU device before admission fails,
+an aborted first GPU frame retaining its cover, and task delivery across
+multiple windows.
+
+The final three-pair wheel guard uses the same counter collector and absolute
+240-event/s script. All six runs complete and preserve their final scene.
+CPU medians are 7.27665% before and 7.45021% after (+2.39%, inside the 5% active
+regression guard); footprints are 44 MB before and 41–42 MB after. The earlier
+prototype's +1.39% result is retained separately. Idle and active footprints
+have different lifetimes and are not interchangeable.
