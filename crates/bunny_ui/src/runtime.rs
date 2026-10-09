@@ -6820,6 +6820,9 @@ impl Runtime {
         }
         for field in &result.fields {
             if self.claim_auto_focus(&field.path, field.auto_focus) {
+                // This layout has retained the field's geometry. Reveal the
+                // focused caret now, before the first frame or keystroke.
+                self.reveal_caret(&field.path);
                 return true;
             }
         }
