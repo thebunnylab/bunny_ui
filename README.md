@@ -13,7 +13,7 @@ struct Counter {
 }
 
 impl Component for Counter {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         vstack!(
             text!("Count: {}", self.count),
             button(text("Tap"), move || self.count.add(1)),
@@ -22,7 +22,16 @@ impl Component for Counter {
 }
 ```
 
-The display of `count` records a read. A tap changes the state, and the framework runs only this view again.
+The text node records the read. A tap changes the state and updates that node
+without running the component body again. `text(self.count)` also binds directly;
+`text!("Count: {}", self.count)` adds formatting.
+
+For MVVM, keep presentation properties and commands on an ordinary Rust struct
+and supply it through a `vm` field on the view. The body composes the interface
+from that model. `view_model(Model::new)` inside a body is also supported when
+that component should own the model's lifetime. See
+[the MVVM guide](docs/mvvm.md), `counter_mvvm`, and the editable
+`profile_mvvm` example.
 
 ## Work that waits
 

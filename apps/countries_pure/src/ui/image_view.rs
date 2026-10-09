@@ -33,9 +33,9 @@ impl ImageView {
 }
 
 impl Component for ImageView {
-    fn body(self, ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         match self.image.get() {
-            Loadable::NotRequested => OneOf4::A(self.default_view(ctx)),
+            Loadable::NotRequested => OneOf4::A(self.default_view()),
             Loadable::IsLoading(..) => OneOf4::B(Self::loading_view()),
             Loadable::Loaded(image) => OneOf4::C(Self::loaded_view(image)),
             Loadable::Failed(error) => OneOf4::D(Self::failed_view(error)),
@@ -58,8 +58,8 @@ impl ImageView {
 // MARK: - Content
 
 impl ImageView {
-    fn default_view(self, ctx: &Context) -> impl UnaryView {
-        let injected = ctx.environment::<DIContainer>();
+    fn default_view(self) -> impl UnaryView {
+        let injected = environment::<DIContainer>();
         text("").on_appear(move || self.load_image(&injected))
     }
 

@@ -908,7 +908,7 @@ impl Runtime {
         // that paints THROUGH the band and holds its own content clear — an
         // ambient wash under the status bar, a sheet whose foot lands on the
         // display's own edge. Mirrored rather than exposed only on the
-        // runtime because a body has a `Context` and no runtime.
+        // runtime because a body reads its environment without a runtime handle.
         self.set_environment(|values| {
             values.safeAreaInsets = motor::state::SafeAreaInsets {
                 top: insets.top,
@@ -924,7 +924,7 @@ impl Runtime {
     }
 
     /// The size the window lays its root out at, written where a body
-    /// reads it (`ctx.environment::<Viewport>()`). A move dirties exactly
+    /// reads it (`environment::<Viewport>()`). A move dirties exactly
     /// the bodies that read it; the frame writing it is the frame that
     /// serves them, so a quiet scene stays quiet to a shell that asks.
     fn note_viewport(&self, proposal: crate::layout::Proposal) {
@@ -940,7 +940,7 @@ impl Runtime {
 
     /// The shell's door for what the platform says about the window —
     /// maximized or not. A body reads it as
-    /// `ctx.environment::<WindowState>()`, and only the bodies that read
+    /// `environment::<WindowState>()`, and only the bodies that read
     /// it re-run when it moves. `true` when it moved: the shell presents.
     pub fn set_window_state(&self, state: motor::state::WindowState) -> bool {
         let moved = self.ctx.borrow().values.window.set_state(state);

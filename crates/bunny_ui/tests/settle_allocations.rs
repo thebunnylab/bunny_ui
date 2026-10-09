@@ -84,7 +84,7 @@ where
     B: Fn(Item) -> V + Copy + 'static,
     V: View,
 {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         (self.body)(self.item)
     }
 }
@@ -101,7 +101,7 @@ where
     B: Fn(Item) -> V + Copy + 'static,
     V: View,
 {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let body = self.body;
         for_each(self.items, |item| item.id.to_string(), move |item| Row { item: *item, body })
     }

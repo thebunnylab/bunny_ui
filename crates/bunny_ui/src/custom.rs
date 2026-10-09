@@ -1160,7 +1160,6 @@ mod tests {
     use crate::state_ext::StateExt;
     use crate::view::{Component, Either};
     use motor::state::State;
-    use motor::state::Context as ViewContext;
 
     /// A surface that fills itself and remembers what it was told.
     struct Bar {
@@ -1324,7 +1323,7 @@ mod tests {
             color: Color,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 custom(Bar { color: Color::FILL, seen: self.seen })
                     .foreground_color(self.color)
@@ -1346,7 +1345,7 @@ mod tests {
         #[derive(Clone)]
         struct Screen;
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 canvas(|ctx, painter| painter.fill(ctx.bounds(), Color::FILL))
             }
         }
@@ -1365,7 +1364,7 @@ mod tests {
         #[derive(Clone)]
         struct Screen;
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 canvas(|ctx, painter| painter.fill(ctx.bounds(), Color::hex(0x3B82F6)))
                     .frame(40.0, 20.0)
@@ -1428,7 +1427,7 @@ mod tests {
             log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 custom(Recorder::new(&self.log))
                     .frame(80.0, 40.0)
@@ -1470,7 +1469,7 @@ mod tests {
             fired: Rc<Cell<bool>>,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 let fired = Rc::clone(&self.fired);
                 crate::zstack!(
                     crate::views::button(crate::views::text("under"), move || fired.set(true)),
@@ -1495,7 +1494,7 @@ mod tests {
             takes_wheel: Rc<Cell<bool>>,
         }
         impl Component for Scrolled {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 let (log, takes_wheel) = (self.log, self.takes_wheel);
                 crate::views::list(
@@ -1539,7 +1538,7 @@ mod tests {
             log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 let log = self.log;
                 crate::views::scroll(crate::vstack!(
@@ -1581,7 +1580,7 @@ mod tests {
             log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 custom(Recorder::new(&self.log))
             }
         }
@@ -1648,7 +1647,7 @@ mod tests {
         }
 
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 // inset, so the box's own point is NOT the scene's
                 use crate::ext::ViewExt as _;
                 custom(Canvas { minted: Rc::clone(&self.minted) }).padding_length(20.0)
@@ -1741,7 +1740,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Screen;
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 custom(Sheet)
             }
         }
@@ -1802,7 +1801,7 @@ mod tests {
             reach: bool,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 // the grip over the middle of the cells: (94, 44) to (106, 56)
                 crate::zstack!(custom(Cells), custom(Grip { reach: self.reach }).frame(12.0, 12.0))
@@ -1859,7 +1858,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Screen;
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 use crate::views::{button, text};
                 let button = |label: &'static str| button(text(label), || {});
@@ -1949,7 +1948,7 @@ mod tests {
             editor: MiniEditor,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 // the editor on 0..40, the chrome on 40..46, a plain box on 46..52
                 crate::vstack!(
@@ -1992,7 +1991,7 @@ mod tests {
             log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 custom(Recorder::new(&self.log))
             }
         }
@@ -2081,7 +2080,7 @@ mod tests {
     }
 
     impl Component for Commanding {
-        fn body(self, _ctx: &ViewContext) -> impl View {
+        fn body(self) -> impl View {
             use crate::ext::ViewExt;
             custom(self.box_).frame(200.0, 40.0)
         }
@@ -2253,7 +2252,7 @@ mod tests {
     }
 
     impl Component for Editing {
-        fn body(self, _ctx: &ViewContext) -> impl View {
+        fn body(self) -> impl View {
             use crate::ext::ViewExt;
             crate::vstack!(
                 crate::views::text("above"),
@@ -2388,7 +2387,7 @@ mod tests {
             editor: MiniEditor,
         }
         impl Component for Beating {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 crate::vstack!(
                     crate::views::text("above"),
@@ -2421,7 +2420,7 @@ mod tests {
             log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 custom(Recorder::new(&self.log))
             }
         }
@@ -2463,7 +2462,7 @@ mod tests {
             gone: State<bool>,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 if self.gone.get() {
                     Either::Second(crate::views::text("the box left"))

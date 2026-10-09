@@ -13,7 +13,7 @@
 //! }
 //!
 //! impl Component for Counter {
-//!     fn body(self, _ctx: &Context) -> impl View {
+//!     fn body(self) -> impl View {
 //!         vstack!(
 //!             text!("count: {}", self.count),
 //!             button(text("increment"), move || self.count.add(1)),
@@ -44,6 +44,7 @@ pub mod catalog;
 pub mod clipboard;
 pub mod custom;
 pub mod dom;
+pub mod diagnostics;
 mod dom_flow;
 pub mod effects;
 pub mod erased;
@@ -58,6 +59,7 @@ pub mod layout;
 pub mod menu;
 mod loans;
 pub mod modifier;
+pub mod model;
 pub mod one_of;
 #[cfg(feature = "gpu")]
 pub mod gpu;
@@ -73,6 +75,7 @@ pub mod ssr;
 pub mod state_ext;
 pub mod stats;
 pub mod text_engine;
+pub mod text_value;
 pub mod text_input;
 pub mod theme;
 pub mod touch;
@@ -176,6 +179,8 @@ pub mod prelude {
     pub use crate::one_of::{OneOf3, OneOf4, OneOf5, OneOf6, OneOf7, OneOf8};
     pub use crate::runtime::{Edited, FrameNeed, ImeSnapshot, LiveBlit, Runtime};
     pub use crate::state_ext::{BindingExt, StateExt};
+    pub use crate::text_value::IntoText;
+    pub use crate::model::{Derived, derived, view_model};
     pub use crate::task;
     pub use crate::view::{Component, Either, Many, Single, UnaryView, View};
     pub use crate::views::*;
@@ -187,7 +192,7 @@ pub mod prelude {
     pub use motor::loadable::{Loadable, LoadableSubject, LoadError};
     pub use motor::runtime::Site;
     pub use motor::state::{
-        Binding, Context, Environment, EnvironmentValues, FromEnvironment, KeyboardInset,
+        environment, Binding, Context, Environment, EnvironmentValues, FromEnvironment, KeyboardInset,
         LayoutDirection, Locale, ProvidesQueries, SafeAreaInsets, SizeClass, State, Viewport,
         WindowState,
     };
@@ -207,7 +212,7 @@ mod tests {
         struct Cell;
 
         impl Component for Cell {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack((
                     text("United States").font(Font::Title),
                     text("Population 125000000").font(Font::Caption),
@@ -250,7 +255,7 @@ mod tests {
         }
 
         impl Component for Probe {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("probe").on_change(
                     move || self.flag.get(),
                     false,
@@ -287,7 +292,7 @@ mod tests {
         }
 
         impl Component for Pair {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 (
                     text("a").on_change(
                         move || self.value.get(),
@@ -330,7 +335,7 @@ mod tests {
         }
 
         impl Component for LoadRow {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 if self.loaded.get() {
                     Either::First(text(format!("{} ready", self.name)))
                 } else {
@@ -352,7 +357,7 @@ mod tests {
         }
 
         impl Component for Board {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let appeared = self.appeared.clone();
                 list(
                     self.items.get(),
@@ -400,7 +405,7 @@ mod tests {
         }
 
         impl Component for Digit {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text(format!("{}", self.n.get()))
             }
         }
@@ -412,7 +417,7 @@ mod tests {
         }
 
         impl Component for Duo {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack((self.a, self.b))
             }
         }
@@ -447,7 +452,7 @@ mod tests {
             poke: State<u32>,
         }
         impl Component for Reader {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let _ = self.poke.get();
                 text(format!("{}", self.shown.get()))
             }
@@ -459,7 +464,7 @@ mod tests {
             poke: State<u32>,
         }
         impl Component for Writer {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let poked = self.poke.get();
                 self.shown.set(i32::try_from(poked).unwrap_or(i32::MAX));
                 text("writer")
@@ -471,7 +476,7 @@ mod tests {
             writer: Writer,
         }
         impl Component for Pair {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 // the reader first: its body runs before the writer's
                 vstack((self.reader, self.writer))
             }
@@ -505,7 +510,7 @@ mod tests {
             poke: State<u32>,
         }
         impl Component for Reader {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let _ = self.poke.get();
                 text(format!("{}", self.shown.get()))
             }
@@ -516,7 +521,7 @@ mod tests {
             poke: State<u32>,
         }
         impl Component for Writer {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let poked = self.poke.get();
                 self.shown.set(i32::try_from(poked).unwrap_or(i32::MAX));
                 text("writer")
@@ -528,7 +533,7 @@ mod tests {
             reader: Reader,
         }
         impl Component for Pair {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 // the writer first: the reader runs after the write
                 vstack((self.writer, self.reader))
             }
@@ -556,7 +561,7 @@ mod tests {
             value: State<i32>,
         }
         impl Component for Clamp {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let value = self.value.get();
                 self.value.set(value.min(10));
                 text(format!("{}", value.min(10)))
@@ -581,7 +586,7 @@ mod tests {
         }
 
         impl Component for Digit {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text(format!("{}", self.n.get()))
             }
         }
@@ -593,7 +598,7 @@ mod tests {
         }
 
         impl Component for Duo {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack((self.a, self.b))
             }
         }
@@ -638,7 +643,7 @@ mod tests {
         }
 
         impl Component for Chip {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let color = if self.on.get() { ON } else { OFF };
                 text("chip").background_color(color).animated(Spring::smooth())
             }
@@ -652,7 +657,7 @@ mod tests {
         }
 
         impl Component for Plain {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let color = if self.on.get() { ON } else { OFF };
                 text("chip").background_color(color)
             }
@@ -718,7 +723,7 @@ mod tests {
         }
 
         impl Component for Swap {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 if self.editing.get() {
                     Either::First(
                         list(
@@ -767,7 +772,7 @@ mod tests {
         }
 
         impl Component for Form {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_field("type…", self.value.binding())
             }
         }
@@ -811,7 +816,7 @@ mod tests {
         struct Sheet;
 
         impl Component for Sheet {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 table(
                     vec![column("Name", 100.0), column("Size", 60.0)],
                     3,
@@ -860,7 +865,7 @@ mod tests {
         struct Sheet;
 
         impl Component for Sheet {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 table(
                     vec![column("Name", 100.0)],
                     2,
@@ -908,7 +913,7 @@ mod tests {
         struct Sheet(bool);
 
         impl Component for Sheet {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let columns = if self.0 {
                     vec![column("Name", 100.0), column_flex("Notes")]
                 } else {
@@ -962,7 +967,7 @@ mod tests {
         }
 
         impl Component for Sheet {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let opened = Rc::clone(&self.opened);
                 table(
                     vec![
@@ -1021,7 +1026,7 @@ mod tests {
         struct Headline(bool);
 
         impl Component for Headline {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let run = text("No server in between.");
                 if self.0 {
                     Either::First(run.tracking(-0.5))
@@ -1086,7 +1091,7 @@ mod tests {
         struct Lane(Alignment);
 
         impl Component for Lane {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let cell = move |value: &'static str| {
                     text(value).frame_width_aligned(132.0, self.0)
                 };
@@ -1101,7 +1106,7 @@ mod tests {
         struct Multiline;
 
         impl Component for Multiline {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let cell = |value: &'static str| {
                     text(value)
                         .frame_width(132.0)
@@ -1155,7 +1160,7 @@ mod tests {
         struct Rowline;
 
         impl Component for Rowline {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 hstack!(
                     // a baselineless 20px box: its baseline IS its bottom
                     spacer().frame(10.0, 20.0),
@@ -1195,7 +1200,7 @@ mod tests {
         struct Big;
 
         impl Component for Big {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 virtual_list(10_000, |row| format!("row{row}"), |row| {
                     text(format!("item {row}"))
                 })
@@ -1243,7 +1248,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Deep;
         impl Component for Deep {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 virtual_list(10_000, |row| format!("row{row}"), |row| {
                     text(format!("file_{row:04}.rs")).frame_height(28.0)
                 })
@@ -1284,7 +1289,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Varied;
         impl Component for Varied {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 virtual_list(300, |row| format!("row{row}"), |row| {
                     text(format!("item {row}"))
                 })
@@ -1337,7 +1342,7 @@ mod tests {
             reply: State<f64>,
         }
         impl Component for Transcript {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let reply = self.reply.get();
                 virtual_list(2000, |row| format!("entry{row}"), move |row| {
                     let height = match row {
@@ -1387,7 +1392,7 @@ mod tests {
             grown: State<bool>,
         }
         impl Component for Transcript {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let grown = self.grown.get();
                 virtual_list(100, |row| format!("entry{row}"), move |row| {
                     spacer().frame_height(if row == 9 && grown { 90.0 } else { 30.0 })
@@ -1429,7 +1434,7 @@ mod tests {
             following: State<bool>,
         }
         impl Component for Transcript {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 virtual_list(self.entries.get(), |row| format!("entry{row}"), |_| {
                     spacer().frame_height(40.0)
                 })
@@ -1484,7 +1489,7 @@ mod tests {
             following: State<bool>,
         }
         impl Component for Transcript {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let built = std::rc::Rc::clone(&self.built);
                 virtual_list(2000, |row| format!("entry{row}"), move |row| {
                     built.borrow_mut().push(row);
@@ -1522,7 +1527,7 @@ mod tests {
             first: State<usize>,
         }
         impl Component for Transcript {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let first = self.first.get();
                 // a row is as tall as what it holds, wherever the window puts it
                 virtual_list(100, move |row| format!("entry{}", first + row), move |row| {
@@ -1569,7 +1574,7 @@ mod tests {
             following: State<bool>,
         }
         impl Component for Transcript {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let first = self.first.get();
                 virtual_list(50, move |row| format!("entry{}", first + row), move |row| {
                     spacer().frame_height(20.0 * (1 + (first + row) % 3) as f64)
@@ -1619,7 +1624,7 @@ mod tests {
             following: State<bool>,
         }
         impl Component for Transcript {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let reply = self.reply.get();
                 virtual_list(10_000, |row| format!("entry{row}"), move |row| {
                     let height = match row {
@@ -1682,7 +1687,7 @@ mod tests {
             reply: State<f64>,
         }
         impl Component for Transcript {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let reply = self.reply.get();
                 virtual_list(200, |row| format!("entry{row}"), move |row| {
                     let height = match row {
@@ -1699,7 +1704,7 @@ mod tests {
             reply: State<f64>,
         }
         impl Component for Panel {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(text("Agents"), Transcript { reply: self.reply })
             }
         }
@@ -1740,7 +1745,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Pinned;
         impl Component for Pinned {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 virtual_list(300, |row| format!("row{row}"), |row| {
                     text(format!("item {row}"))
                 })
@@ -1766,7 +1771,7 @@ mod tests {
             count: State<usize>,
         }
         impl Component for Shrinking {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 virtual_list(self.count.get(), |row| format!("row{row}"), |row| {
                     text(format!("item {row}"))
                 })
@@ -1793,7 +1798,7 @@ mod tests {
         struct VirtualTen;
 
         impl Component for VirtualTen {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 virtual_list(10, |row| format!("row{row}"), |row| {
                     text(format!("item {row}"))
                 })
@@ -1804,7 +1809,7 @@ mod tests {
         struct DenseTen;
 
         impl Component for DenseTen {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 list(
                     (0..10).collect::<Vec<_>>(),
                     |row| format!("row{row}"),
@@ -1831,7 +1836,7 @@ mod tests {
         struct Empty;
 
         impl Component for Empty {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 virtual_list(0, |row| format!("row{row}"), |row| {
                     text(format!("item {row}"))
                 })
@@ -1842,7 +1847,7 @@ mod tests {
         struct One;
 
         impl Component for One {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 virtual_list(1, |row| format!("row{row}"), |row| {
                     text(format!("item {row}"))
                 })
@@ -1878,7 +1883,7 @@ mod tests {
         struct Launcher;
 
         impl Component for Launcher {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 // the launcher shape: a padded, styled panel WRAPPING a
                 // scroll — the stack must stay flexible through the
                 // nesting, never freeze at the content's full extent
@@ -1920,7 +1925,7 @@ mod tests {
         struct Trailing;
 
         impl Component for Trailing {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::hstack!(
                     spacer(),
                     text("steady")
@@ -1961,7 +1966,7 @@ mod tests {
         }
 
         impl Component for WebFinder {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let visible = self.visible.get();
                 let count = visible.len();
                 let selected = self.selected;
@@ -2014,7 +2019,7 @@ mod tests {
         struct Big;
 
         impl Component for Big {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 virtual_list(10_000, |row| format!("row{row}"), |row| {
                     text(format!("item {row}"))
                 })
@@ -2057,7 +2062,7 @@ mod tests {
         }
 
         impl Component for Picker {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 virtual_list(10_000, |row| format!("row{row}"), |row| {
                     text(format!("item {row}"))
                 })
@@ -2105,7 +2110,7 @@ mod tests {
         struct Lazy;
 
         impl Component for Lazy {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 virtual_list(10_000, |row| format!("row{row}"), |row| {
                     text(format!("item {row}"))
                         .on_appear(move || APPEARED.with(|log| log.borrow_mut().push(row)))
@@ -2146,7 +2151,7 @@ mod tests {
         }
 
         impl Component for Shrinker {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let count = self.count.get();
                 virtual_list(count, |row| format!("row{row}"), |row| {
                     text(format!("item {row}"))
@@ -2358,7 +2363,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Panel { note: State<String> }
         impl Component for Panel {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_editor("", self.note.binding()).line_height(24.0).frame(120.0, 56.0)
             }
         }
@@ -2397,7 +2402,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Panel { note: State<String> }
         impl Component for Panel {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_editor("", self.note.binding()).line_height(1.0).frame(120.0, 20.0)
             }
         }
@@ -2427,7 +2432,7 @@ mod tests {
         }
 
         impl Component for Panel {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text(format!("{} lines", self.lines.get()))
             }
         }
@@ -2472,7 +2477,7 @@ mod tests {
         }
 
         impl Component for Screen {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let starts = Rc::clone(&self.starts);
                 if self.open.get() {
                     Either::First(
@@ -2524,7 +2529,7 @@ mod tests {
         }
 
         impl Component for Stripe {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 // a slot arrives above the named one; without the name
                 // the hit path of the git slot would shift with it
                 let head = if self.extra.get() {
@@ -2574,7 +2579,7 @@ mod tests {
         }
 
         impl Component for Debounced {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let searched = self.searched;
                 let typed = self.typed;
                 // the search field's recipe: every keystroke restarts
@@ -2625,7 +2630,7 @@ mod tests {
         }
 
         impl Component for Polling {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let millis = self.millis;
                 // the shape every poll loop has: wake, look, wait again
                 text("polling").task_id(millis.get(), move || async move {
@@ -2693,7 +2698,7 @@ mod tests {
         }
 
         impl Component for Watcher {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let starts = Rc::clone(&self.starts);
                 text("watching").task(move || {
                     starts.set(starts.get() + 1);
@@ -2709,7 +2714,7 @@ mod tests {
         }
 
         impl Component for Screen {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack((
                     text(format!("tick {}", self.ticks.get())),
                     Watcher { starts: Rc::clone(&self.starts) },
@@ -2746,7 +2751,7 @@ mod tests {
         }
 
         impl Component for Detail {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let starts = Rc::clone(&self.starts);
                 // the id is the file being read: another file, another
                 // read, and the one in flight is cancelled
@@ -2814,7 +2819,7 @@ mod tests {
         }
 
         impl Component for Board {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let items =
                     if self.flipped.get() { vec!["b", "a"] } else { vec!["a", "b"] };
                 for_each(items, |id| id.to_string(), |id| {
@@ -2884,7 +2889,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Mark;
         impl Component for Mark {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 canvas(|ctx, p| {
                     let red = (ctx.phase * 255.0).round() as u8;
                     p.fill(ctx.bounds(), crate::layout::Color::rgba(red, 0, 0, 255));
@@ -2950,7 +2955,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Bar;
         impl Component for Bar {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 hstack!(
                     canvas(|ctx, p| {
                         p.fill(ctx.bounds(), crate::layout::Color::rgba(1, 2, 3, 255));
@@ -3001,7 +3006,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Steady;
         impl Component for Steady {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 canvas(|ctx, p| {
                     p.fill(ctx.bounds(), crate::layout::Color::rgba(9, 9, 9, 255));
                 })
@@ -3030,7 +3035,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Mark;
         impl Component for Mark {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 canvas(|ctx, p| {
                     let red = (ctx.phase * 255.0).round() as u8;
                     p.fill(ctx.bounds(), crate::layout::Color::rgba(red, 0, 0, 255));
@@ -3070,7 +3075,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Caret;
         impl Component for Caret {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 canvas(|ctx, p| {
                     let on = ctx.phase < 0.5;
                     p.fill(
@@ -3129,7 +3134,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Bar;
         impl Component for Bar {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     canvas(|ctx, p| {
                         p.fill(ctx.bounds(), crate::layout::Color::BLACK);
@@ -3168,7 +3173,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Mark;
         impl Component for Mark {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 canvas(|ctx, p| {
                     p.fill(ctx.bounds(), crate::layout::Color::BLACK);
                 })
@@ -3202,7 +3207,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Mark;
         impl Component for Mark {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 canvas(|ctx, p| {
                     p.fill(ctx.bounds(), crate::layout::Color::BLACK);
                 })
@@ -3230,7 +3235,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Mark;
         impl Component for Mark {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 canvas(|ctx, p| {
                     let red = (ctx.phase * 255.0).round() as u8;
                     p.fill(ctx.bounds(), crate::layout::Color::rgba(red, 0, 0, 255));
@@ -3265,7 +3270,7 @@ mod tests {
         struct Rows;
 
         impl Component for Rows {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 list(
                     (0..10).collect::<Vec<_>>(),
                     |row| format!("row{row}"),
@@ -3278,7 +3283,7 @@ mod tests {
         struct Plain;
 
         impl Component for Plain {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 list(
                     (0..10).collect::<Vec<_>>(),
                     |row| format!("row{row}"),
@@ -3317,7 +3322,7 @@ mod tests {
         }
 
         impl Component for Revealer {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 list(
                     (0..10).collect::<Vec<_>>(),
                     |row| format!("row{row}"),
@@ -3382,7 +3387,7 @@ mod tests {
         }
 
         impl Component for Framed {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let color = if self.on.get() { ON } else { OFF };
                 text("x").border(color, 1.0).animated(Spring::smooth())
             }
@@ -3404,7 +3409,7 @@ mod tests {
         }
 
         impl Component for Inner {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let color = if self.on.get() { ON } else { OFF };
                 text("i").background_color(color)
             }
@@ -3416,7 +3421,7 @@ mod tests {
         }
 
         impl Component for Outer {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 self.inner.animated(Spring::smooth())
             }
         }
@@ -3451,7 +3456,7 @@ mod tests {
         }
 
         impl Component for Chip {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let color = if self.on.get() { ON } else { OFF };
                 text("chip").background_color(color).animated(Spring::smooth())
             }
@@ -3492,7 +3497,7 @@ mod tests {
         struct Label;
 
         impl Component for Label {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("steady")
             }
         }
@@ -3519,7 +3524,7 @@ mod tests {
         }
 
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text(format!("count {}", self.count.get()))
             }
         }
@@ -3557,7 +3562,7 @@ mod tests {
         }
 
         impl Component for Counter {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let label = self.label.get();
                 let pressed = Rc::clone(&self.pressed);
                 // the closure captures what THIS body read: an old table
@@ -3607,7 +3612,7 @@ mod tests {
         }
 
         impl Component for Feed {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let quiet = self.quiet;
                 let heard = Rc::clone(&self.heard);
                 // `quiet` has NO reader in any view: only this watcher
@@ -3684,7 +3689,7 @@ mod tests {
         }
 
         impl Component for Rows {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let lit = self.lit;
                 let rows: Vec<_> = (0..40)
                     .map(|row| {
@@ -3757,7 +3762,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Page;
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("page")
             }
         }
@@ -3805,7 +3810,7 @@ mod tests {
             wide: State<bool>,
         }
         impl Component for Leaf {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text(if self.wide.get() { "a much, much wider label" } else { "narrow" })
             }
         }
@@ -3815,7 +3820,7 @@ mod tests {
             wide: State<bool>,
         }
         impl Component for Middle {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 // hugs its child: its own size IS the leaf's
                 hstack!(Leaf { wide: self.wide }, text("|"))
             }
@@ -3826,7 +3831,7 @@ mod tests {
             wide: State<bool>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(text("title"), Middle { wide: self.wide })
             }
         }
@@ -3905,7 +3910,7 @@ mod tests {
             stable: bool,
         }
         impl Component for Holder {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     custom(Growing {
                         height: Rc::clone(&self.height),
@@ -3963,7 +3968,7 @@ mod tests {
         }
 
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let painted = Rc::clone(&self.painted);
                 let chart = canvas(move |ctx, painter| {
                     painted.set(painted.get() + 1);
@@ -4031,12 +4036,12 @@ mod tests {
         struct Second;
 
         impl Component for First {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("first")
             }
         }
         impl Component for Second {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("second, and wider")
             }
         }
@@ -4062,7 +4067,7 @@ mod tests {
         }
 
         impl Component for Badge {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text(format!("badge {}", self.store.value()))
             }
         }
@@ -4088,7 +4093,7 @@ mod tests {
         }
 
         impl Component for Watcher {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 // the publisher is recomputed on every body — as in the real app
                 text("w").on_receive(self.store.updates(|value| *value), move |value| {
                     self.seen.borrow_mut().push(value)
@@ -4127,7 +4132,7 @@ mod tests {
         }
 
         impl Component for Title {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text(format!("count: {}", self.count.get()))
             }
         }
@@ -4138,7 +4143,7 @@ mod tests {
         }
 
         impl Component for Screen {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let count = self.title.count;
                 vstack((
                     self.title,
@@ -4182,7 +4187,7 @@ mod tests {
         }
 
         impl Component for Bench {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 hsplit(
                     self.seam.binding(),
                     text("panel"),
@@ -4244,7 +4249,7 @@ mod tests {
             seam: State<f64>,
         }
         impl Component for Bench {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 hsplit(self.seam.binding(), text("editor"), text("dock"))
                     .min_sizes(320.0, 180.0)
                     .seam_on_trailing()
@@ -4298,7 +4303,7 @@ mod tests {
         }
 
         impl Component for Panes {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 hsplit(self.share.binding(), text("left"), text("right"))
             }
         }
@@ -4330,7 +4335,7 @@ mod tests {
         }
 
         impl Component for Pinned {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 hsplit(self.seam.binding(), text("left"), text("right"))
                     .min_sizes(50.0, 50.0)
             }
@@ -4367,7 +4372,7 @@ mod tests {
         }
 
         impl Component for Bench {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 hsplit(
                     self.dock.binding(),
                     text("dock"),
@@ -4444,7 +4449,7 @@ mod tests {
         }
 
         impl Component for Panes {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 hsplit(self.share.binding(), text("left"), text("right"))
             }
         }
@@ -4486,7 +4491,7 @@ mod tests {
         }
 
         impl Component for Card {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("half")
                     .foreground_color(Color { r: 10, g: 20, b: 30, a: 200 })
                     .background_color(Color { r: 0, g: 0, b: 0, a: 100 })
@@ -4535,7 +4540,7 @@ mod tests {
         }
 
         impl Component for Chip {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let mark = text("x")
                     .foreground_color(Color { r: 200, g: 200, b: 200, a: 255 })
                     .opacity(0.0)
@@ -4638,7 +4643,7 @@ mod tests {
         }
 
         impl Component for Ledger {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 scroll(custom(Surface { caret: self.caret.get() })).id("region")
             }
         }
@@ -4711,7 +4716,7 @@ mod tests {
         }
 
         impl Component for Ledger {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 scroll(custom(Surface { caret: self.caret.get() })).id("region")
             }
         }
@@ -4761,7 +4766,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Ledger;
         impl Component for Ledger {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 scroll(custom(Surface))
             }
         }
@@ -4805,7 +4810,7 @@ mod tests {
         }
 
         impl Component for Row {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let seen = Rc::clone(&self.seen);
                 text("file.rs").on_click_count(move |clicks| seen.borrow_mut().push(clicks))
             }
@@ -4841,7 +4846,7 @@ mod tests {
         }
 
         impl Component for Row {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let plain = Rc::clone(&self.plain);
                 let doubled = Rc::clone(&self.doubled);
                 hstack((
@@ -4892,7 +4897,7 @@ mod tests {
         }
 
         impl Component for Board {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let left = Rc::clone(&self.seen);
                 let right = Rc::clone(&self.seen);
                 hstack((
@@ -4929,14 +4934,14 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Plain;
         impl Component for Plain {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("a").on_click(|| {})
             }
         }
         #[derive(Clone, Copy)]
         struct Counted;
         impl Component for Counted {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("a").on_click_count(|_| {})
             }
         }
@@ -4983,7 +4988,7 @@ mod tests {
         }
 
         impl Component for Bench {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let one = custom(Pane { typed: Rc::clone(&self.typed) }).id("code");
                 if self.split.get() {
                     // the split duplicates the pane — and its name with
@@ -5084,7 +5089,7 @@ mod tests {
         }
 
         impl Component for Bench {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let deleted = Rc::clone(&self.deleted);
                 custom(Modal { mode: Rc::clone(&self.mode), typed: Rc::clone(&self.typed) })
                     .id("editor")
@@ -5173,7 +5178,7 @@ mod tests {
         }
 
         impl Component for Bench {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let typed = Rc::clone(&self.typed);
                 let pane = custom(Editor { typed }).id("code");
                 if self.split.get() {
@@ -5225,7 +5230,7 @@ mod tests {
         }
 
         impl Component for Bench {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let field = text_field("name", self.name.binding()).id("subject");
                 if self.split.get() {
                     Either::First(hsplit(self.seam.binding(), field, text("other")))
@@ -5276,7 +5281,7 @@ mod tests {
         }
 
         impl Component for Gone {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 self.here.get().then(|| text_field("name", self.name.binding()).id("only"))
             }
         }
@@ -5326,7 +5331,7 @@ mod tests {
         }
 
         impl Component for Bench {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let log = Rc::clone(&self.log);
                 let pane = custom(Editor { log }).id("code");
                 if self.split.get() {
@@ -5378,7 +5383,7 @@ mod tests {
         }
 
         impl Component for Bench {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let one = custom(Editor).id("code");
                 if self.twin.get() {
                     // the edit above AND a second box wearing the name
@@ -5424,7 +5429,7 @@ mod tests {
         }
 
         impl Component for Bench {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 if self.split.get() {
                     Either::First(hsplit(self.seam.binding(), custom(Editor), text("other")))
                 } else {
@@ -5464,7 +5469,7 @@ mod tests {
         }
 
         impl Component for Bench {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let field = text_field("search", self.query.binding()).id("query");
                 if self.split.get() {
                     Either::First(hsplit(self.seam.binding(), field, text("other")))
@@ -5511,7 +5516,7 @@ mod tests {
         }
 
         impl Component for Strip {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let chip = text("file.rs").padding_length(8.0);
                 let one = if self.ruled.get() {
                     Either::First(chip.overlay(
@@ -5563,7 +5568,7 @@ mod tests {
         }
 
         impl Component for Card {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 rectangle()
                     .frame(200.0, 100.0)
                     .background_color(Color::hex(0x111111))
@@ -5614,7 +5619,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Bar;
         impl Component for Bar {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("tab")
                     .frame(300.0, 40.0)
                     .overlay(
@@ -5646,7 +5651,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Both;
         impl Component for Both {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("middle")
                     .background(
                         UnitPoint::CENTER,
@@ -5693,7 +5698,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Row;
         impl Component for Row {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("row")
                     .background_color(Color::hex(0x202020))
                     .on_click(|| {})
@@ -5734,7 +5739,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Panel;
         impl Component for Panel {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let rows: Vec<usize> = (0..30).collect();
                 scroll(for_each(
                     rows,
@@ -5774,7 +5779,7 @@ mod tests {
         }
 
         impl Component for Tapper {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack((
                     text(format!("count: {}", self.count.get())),
                     button(text("tap!"), move || self.count.update(|n| *n += 1)),
@@ -5846,7 +5851,7 @@ mod tests {
     }
 
     impl Component for TapperFixture {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             vstack((
                 text(format!("count: {}", self.count.get())),
                 button(text("tap!"), move || self.count.update(|n| *n += 1)),
@@ -5898,7 +5903,7 @@ mod tests {
         struct CloseGlyph;
 
         impl Component for CloseGlyph {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 // the tab's ✕: faint until the pointer arrives
                 text("x")
                     .foreground_color(FAINT)
@@ -6101,7 +6106,7 @@ mod tests {
         struct One;
 
         impl Component for One {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 button(text("go"), || {})
             }
         }
@@ -6141,7 +6146,7 @@ mod tests {
         }
 
         impl Component for Rows {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let _ = self.flip.get(); // read: set() invalidates this body
                 list(
                     (0..10).map(|index| index.to_string()).collect(),
@@ -6221,7 +6226,7 @@ mod tests {
         }
 
         impl Component for Form {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack((
                     text(format!("hello {}", self.name.get())),
                     text_field("Your name", self.name.binding()),
@@ -6300,7 +6305,7 @@ mod tests {
         }
 
         impl Component for Form {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_field("name", self.name.binding()).frame_width(120.0)
             }
         }
@@ -6411,7 +6416,7 @@ mod tests {
         }
 
         impl Component for Form {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_field("note", self.note.binding()).frame_width(200.0)
             }
         }
@@ -6540,7 +6545,7 @@ mod tests {
         }
 
         impl Component for Panel {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack((
                     text_editor("write a note", self.note.binding()).frame(120.0, 72.0),
                     text_field("name", self.name.binding()).frame_width(120.0),
@@ -6651,12 +6656,12 @@ mod tests {
         }
 
         impl Component for Note {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack((text("head"), text_editor("note", self.text.binding())))
             }
         }
         impl Component for Name {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack((text("head"), text_field("note", self.text.binding())))
             }
         }
@@ -6728,7 +6733,7 @@ mod tests {
             box_takes: bool,
         }
         impl Component for Panel {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let attached = Rc::clone(&self.attached);
                 vstack!(
                     text_editor("ask", self.prompt.binding())
@@ -6788,7 +6793,7 @@ mod tests {
         }
 
         impl Component for Composer {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_editor("ask", self.prompt.binding())
                     .nav_intercept(self.completing.binding())
                     .id("composer")
@@ -6840,7 +6845,7 @@ mod tests {
         }
 
         impl Component for Tab {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let field = text_field("filter", self.filter.binding()).id("filter");
                 let field = if self.first_only.get() {
                     Either::First(field.auto_focus())
@@ -6916,7 +6921,7 @@ mod tests {
         }
 
         impl Component for Desk {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let picker = self.open.get().then(|| {
                     text_field("query", self.query.binding()).id("query").auto_focus_beat(1)
                 });
@@ -7011,7 +7016,7 @@ mod tests {
         }
 
         impl Component for Bar {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let field = text_field("find", self.query.binding()).id("query");
                 let field = if self.selecting.get() {
                     erased(field.select_on_beat(self.beat.get()))
@@ -7086,7 +7091,7 @@ mod tests {
         }
 
         impl Component for Bar {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let field = text_field("find", self.query.binding()).on_submit(move || self.committed.add(1));
                 let field = if self.yields.get() { field.yield_on_submit() } else { field };
                 vstack!(
@@ -7156,7 +7161,7 @@ mod tests {
         }
 
         impl Component for Desk {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let outer = self.outer.get().then(|| {
                     text_field("outer", self.query.binding()).id("outer").auto_focus_beat(1)
                 });
@@ -7234,7 +7239,7 @@ mod tests {
         }
 
         impl Component for Panel {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack((
                     text_editor("write a note", self.note.binding()).frame(120.0, 72.0),
                     text_field("name", self.name.binding()).frame_width(120.0),
@@ -7330,7 +7335,7 @@ mod tests {
         }
 
         impl Component for Menu {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let first = Rc::clone(&self.log);
                 let second = Rc::clone(&self.log);
                 vstack((
@@ -7394,7 +7399,7 @@ mod tests {
         }
 
         impl Component for Rows {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let log = Rc::clone(&self.log);
                 scroll(for_each(
                     (0..20).collect::<Vec<usize>>(),
@@ -7553,7 +7558,7 @@ mod tests {
             sent: State<i32>,
         }
         impl Component for Panel {
-            fn body(self, _: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_editor("note", self.note.binding())
                     .editing_strategy(Some(self.policy.clone()))
                     .on_submit(move || self.sent.add(1))
@@ -7601,7 +7606,7 @@ mod tests {
             writes: State<i32>,
         }
         impl Component for Panel {
-            fn body(self, _: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let writes = self.writes;
                 text_editor("note", self.note.binding().onSet(move |_| writes.add(1))).frame(200.0, 80.0)
             }
@@ -7638,7 +7643,7 @@ mod tests {
             note: State<String>,
         }
         impl Component for Panel {
-            fn body(self, _: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_editor("note", self.note.binding()).frame(400.0, 300.0)
             }
         }
@@ -7714,7 +7719,7 @@ mod tests {
             note: State<String>,
         }
         impl Component for Panel {
-            fn body(self, _: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_editor("note", self.note.binding()).frame(400.0, 300.0)
             }
         }
@@ -7753,7 +7758,7 @@ mod tests {
             note: State<String>,
         }
         impl Component for Panel {
-            fn body(self, _: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     text_field("name", self.note.binding()).frame(200.0, 30.0),
                     text_editor("message", self.note.binding()).frame(200.0, 60.0),
@@ -7836,7 +7841,7 @@ mod tests {
             policy: Rc<Modal>,
         }
         impl Component for Field {
-            fn body(self, _: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_editor("placeholder", self.note.binding())
                     .editing_strategy(Some(self.policy))
                     .frame(40.0, 26.0)
@@ -7913,7 +7918,7 @@ mod tests {
             count: State<usize>,
         }
         impl Component for Panel {
-            fn body(self, _: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("drop here")
                     .frame(100.0, 40.0)
                     .on_drop::<ExternalPaths>(move |files| self.count.set(files.0.len()))
@@ -7946,7 +7951,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Note(State<String>);
         impl Component for Note {
-            fn body(self, _: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_editor("note", self.0.binding()).frame(400.0, 100.0)
             }
         }
@@ -8007,7 +8012,7 @@ mod tests {
             sends: State<i32>,
         }
         impl Component for Chat {
-            fn body(self, _: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_editor("message", self.value.binding())
                     .submit_on_enter()
                     .on_submit(move || self.sends.add(1))
@@ -8077,7 +8082,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Note(State<String>);
         impl Component for Note {
-            fn body(self, _: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_editor("", self.0.binding())
                     .auto_focus()
                     .frame(80.0, 200.0)
@@ -8133,7 +8138,7 @@ mod tests {
         }
 
         impl Component for Panel {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack((
                     text_editor("write a note", self.note.binding())
                         .on_submit(move || self.committed.add(1))
@@ -8215,7 +8220,7 @@ mod tests {
         }
 
         impl Component for Inner {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("inner").on_action(PING, move || self.hits.add(10))
             }
         }
@@ -8226,7 +8231,7 @@ mod tests {
         }
 
         impl Component for Outer {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(Inner { hits: self.hits })
                     .on_action(PING, move || self.hits.add(1))
             }
@@ -8268,13 +8273,13 @@ mod tests {
         }
 
         impl Component for Palette {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("palette").on_action(POKE, move || self.hits.add(1))
             }
         }
 
         impl Component for Holder {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let _ = self.other.get();
                 if self.mounted.get() {
                     Either::First(Palette { hits: self.hits })
@@ -8314,7 +8319,7 @@ mod tests {
     const COPY_ROWS: [&str; 2] = ["alpha\t1", "beta\t2"];
 
     impl Component for CopyTable {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let picked = self.picked;
             vstack((
                 text(COPY_ROWS[0]).on_click(move || picked.set(Some(0))),
@@ -8409,7 +8414,7 @@ mod tests {
         struct Empty;
 
         impl Component for Empty {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("no rows").on_copy(|| None)
             }
         }
@@ -8449,7 +8454,7 @@ mod tests {
             saved: State<i32>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let saved = self.saved;
                 if self.mounted.get() {
                     Either::First(text("page").on_action(SAVE, move || saved.add(1)))
@@ -8503,7 +8508,7 @@ mod tests {
             saved: State<i32>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let (open, saved) = (self.open, self.saved);
                 text("the page")
                     .frame(WINDOW.width, WINDOW.height)
@@ -8550,7 +8555,7 @@ mod tests {
             name: State<String>,
         }
         impl Component for Form {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_field("Your name", self.name.binding()).frame_width(200.0)
             }
         }
@@ -8621,7 +8626,7 @@ mod tests {
             key: State<String>,
         }
         impl Component for Form {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_field("API key", self.key.binding()).secret(true).frame_width(200.0)
             }
         }
@@ -8679,7 +8684,7 @@ mod tests {
             heard: Rc<RefCell<Vec<KeyPattern>>>,
         }
         impl Component for Bench {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 custom(Editor { heard: self.heard }).id("code")
             }
         }
@@ -8752,7 +8757,7 @@ mod tests {
             borrows: Rc<Cell<bool>>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let keys = self.open.get().then(|| {
                     let keys = custom(Keys);
                     let keys = if self.borrows.get() { keys.borrow_focus(1) } else { keys.auto_focus(1) };
@@ -8810,7 +8815,7 @@ mod tests {
             plain: State<i32>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let (chrome, plain) = (self.chrome, self.plain);
                 vstack((
                     text_field("name", self.name.binding()).id("name").frame_width(200.0),
@@ -8866,7 +8871,7 @@ mod tests {
             open: State<bool>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let keys = self.open.get().then(|| custom(Keys).borrow_focus(1).id("menu-keys"));
                 vstack((text_field("name", self.name.binding()).id("name").frame_width(200.0), keys))
             }
@@ -8903,7 +8908,7 @@ mod tests {
         }
 
         impl Component for Holder {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let _ = self.other.get();
                 if self.mounted.get() {
                     Either::First(self.table)
@@ -8951,7 +8956,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Page;
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("a page that claims nothing")
             }
         }
@@ -8994,7 +8999,7 @@ mod tests {
             local: State<i32>,
         }
         impl Component for Pane {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let local = self.local;
                 if self.focused.get() {
                     Either::First(text("pane").on_action(JUMP, move || local.add(1)))
@@ -9036,7 +9041,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Blank;
         impl Component for Blank {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("blank")
             }
         }
@@ -9065,7 +9070,7 @@ mod tests {
             url: State<String>,
         }
         impl Component for Bar {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 // "https://{{host}}/v1" — the braces are the run
                 let text = self.url.get();
                 let start = text.find("{{").unwrap_or(0);
@@ -9108,7 +9113,7 @@ mod tests {
             url: State<String>,
         }
         impl Component for Bar {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_field("type a url here", self.url.binding())
                     .highlight(vec![(0, 4)], Color::hex(0xE5C07B))
             }
@@ -9139,7 +9144,7 @@ mod tests {
             bare: bool,
         }
         impl Component for Cell {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let field = text_field("", self.value.binding());
                 if self.bare {
                     Either::First(field.bare())
@@ -9208,7 +9213,7 @@ mod tests {
             lane: State<f64>,
         }
         impl Component for Strip {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let lane = self.lane;
                 hstack((
                     scroll(empty().frame(CONTENT, 24.0))
@@ -9254,7 +9259,7 @@ mod tests {
             open: State<bool>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("the page under it").frame(WINDOW.width, WINDOW.height).sheet(
                     self.open.binding(),
                     |_| crate::erased::erased(text("the palette").frame(300.0, 200.0)),
@@ -9307,7 +9312,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Dock;
         impl Component for Dock {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 // a header row that needs more than the lane has
                 vstack(
                     hstack((
@@ -9359,7 +9364,7 @@ mod tests {
             send: State<f64>,
         }
         impl Component for Composer {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let (label, send) = (self.label, self.send);
                 hstack((
                     text(LABEL)
@@ -9421,7 +9426,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Card;
         impl Component for Card {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack(
                     text(
                         "um dek bastante longo que quebra em varias linhas quando a coluna \
@@ -9469,7 +9474,7 @@ mod tests {
             runs: Rc<Cell<usize>>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 self.runs.set(self.runs.get() + 1);
                 text("a retained page")
             }
@@ -9495,7 +9500,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Page;
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let rows: Vec<_> = (0..20)
                     .map(|row| text(format!("probe row {row}")).frame_height(24.0))
                     .collect();
@@ -9542,7 +9547,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Page;
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let rows: Vec<_> = (0..40)
                     .map(|row| {
                         let chips: Vec<_> = (0..12)
@@ -9636,7 +9641,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Row(usize);
         impl Component for Row {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 hstack!(rectangle().frame(8.0, 8.0), text(format!("row {}", self.0)), spacer())
                     .on_click(|| {})
                     .tooltip(format!("row {}", self.0))
@@ -9649,7 +9654,7 @@ mod tests {
             painted: Rc<Cell<usize>>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let painted = Rc::clone(&self.painted);
                 list(
                     (0..300usize).collect(),
@@ -9719,7 +9724,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Page;
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 scroll(text(BODY).frame_max(f64::INFINITY, f64::INFINITY, Alignment::Leading))
             }
         }
@@ -9776,7 +9781,7 @@ mod tests {
             lane: State<f64>,
         }
         impl Component for Strip {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let lane = self.lane;
                 hstack((
                     scroll(empty().frame(720.0, 24.0))
@@ -9816,7 +9821,7 @@ mod tests {
             lane: State<f64>,
         }
         impl Component for Strip {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let lane = self.lane;
                 hstack((
                     empty()
@@ -9854,7 +9859,7 @@ mod tests {
             right: State<f64>,
         }
         impl Component for Strip {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let (left, right) = (self.left, self.right);
                 let lane = |width: f64| scroll(empty().frame(width, 24.0)).horizontal().hugging();
                 hstack((
@@ -9889,7 +9894,7 @@ mod tests {
             reports: State<usize>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let measured = self.measured;
                 let reports = self.reports;
                 vstack(for_each(
@@ -9940,7 +9945,7 @@ mod tests {
             natural: State<f64>,
         }
         impl Component for Card {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let natural = self.natural;
                 // the document measures freely; the card caps it
                 let document = vstack(for_each(
@@ -9978,7 +9983,7 @@ mod tests {
             bottom: State<f64>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let (top, bottom) = (self.top, self.bottom);
                 vstack((
                     text("a").frame(100.0, 30.0).on_measure(move |s| top.set(s.height)),
@@ -10005,7 +10010,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Page;
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 hstack((
                     text("side").frame(100.0, 300.0),
                     webview("https://example.test/docs"),
@@ -10039,7 +10044,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Page;
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 scroll(webview("https://example.test/").frame(200.0, 400.0))
                     .frame(200.0, 150.0)
             }
@@ -10067,7 +10072,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Call;
         impl Component for Call {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     text("in a call").frame(300.0, 40.0),
                     scroll(
@@ -10084,7 +10089,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Page;
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     text("in a call").frame(300.0, 40.0),
                     scroll(webview("https://example.test/").frame(300.0, 400.0))
@@ -10140,7 +10145,7 @@ mod tests {
             open: State<bool>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 hstack((
                     button(text("act"), || {}).frame(100.0, 300.0),
                     scroll(webview("https://example.test/").frame(300.0, 600.0))
@@ -10179,7 +10184,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Layered;
         impl Component for Layered {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 zstack!(
                     webview("https://example.test/"),
                     text("saving…")
@@ -10202,7 +10207,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Plain;
         impl Component for Plain {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 hstack!(text("side"), webview("https://example.test/"))
             }
         }
@@ -10226,7 +10231,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Pane;
         impl Component for Pane {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 webview("https://example.test/")
             }
         }
@@ -10236,7 +10241,7 @@ mod tests {
             room: State<f64>,
         }
         impl Component for Outer {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack(Pane).frame(self.room.get(), 300.0)
             }
         }
@@ -10277,7 +10282,7 @@ mod tests {
             fetched: State<String>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let (landed, heard) = (self.landed, self.heard);
                 let (spoke, fetched) = (self.spoke, self.fetched);
                 webview("https://example.test/")
@@ -10342,7 +10347,7 @@ mod tests {
             pasted: State<String>,
         }
         impl Component for Composer {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let (body, pasted) = (self.body, self.pasted);
                 webview_html("<p>dear</p>", "", NetworkPolicy::Deny)
                     .editable()
@@ -10414,7 +10419,7 @@ mod tests {
             url: State<String>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 hstack!(text_field("where to", self.url.binding()).hug_height())
                     .alignment(VerticalAlignment::Center)
                     .frame_height(30.0)
@@ -10448,7 +10453,7 @@ mod tests {
             title: State<String>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 webview("https://example.test/").handle(&self.handle)
             }
         }
@@ -10517,7 +10522,7 @@ mod tests {
             refused: State<String>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let (landed, refused) = (self.landed, self.refused);
                 webview("https://example.test/")
                     .on_navigate(move |url| landed.set(url.to_string()))
@@ -10548,7 +10553,7 @@ mod tests {
             refused: State<String>,
         }
         impl Component for Watcher {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let refused = self.refused;
                 webview("https://example.test/")
                     .on_navigate_failed(move |_, why| refused.set(why.to_string()))
@@ -10578,7 +10583,7 @@ mod tests {
             handle: WebviewHandle,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 webview("https://example.test/").handle(&self.handle)
             }
         }
@@ -10651,7 +10656,7 @@ mod tests {
             seen: State<f64>,
         }
         impl Component for Inner {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let seen = self.seen;
                 // the WIDTH follows the room the outer hands down, so
                 // the measured size can move while this body does not
@@ -10667,7 +10672,7 @@ mod tests {
             seen: State<f64>,
         }
         impl Component for Outer {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 // the outer re-runs on `room`; the inner's payload never
                 // changes, so its body is skipped
                 vstack(Inner { seen: self.seen }).frame(self.room.get(), 400.0)
@@ -10705,7 +10710,7 @@ mod tests {
             at: State<Point>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 scroll(for_each(
                     (0..40).collect::<Vec<i32>>(),
                     |line| line.to_string(),
@@ -10757,7 +10762,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Page;
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 scroll(for_each(
                     (0..40).collect::<Vec<i32>>(),
                     |line| line.to_string(),
@@ -10784,7 +10789,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Page;
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("no view claims a thing")
             }
         }
@@ -10831,7 +10836,7 @@ mod tests {
         }
 
         impl Component for MiniPalette {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let query = self.query.get();
                 let all = ["alpha", "beta", "gamma"];
                 let count = all.iter().filter(|name| name.contains(&query)).count();
@@ -10885,7 +10890,7 @@ mod tests {
         struct Chip;
 
         impl Component for Chip {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 // a token read in the BODY gets baked into the retained scene —
                 // install has to rebuild with no dirty state at all
                 button(text("go").foreground_color(theme::accent()), || {})
@@ -10942,7 +10947,7 @@ mod tests {
         }
 
         impl Component for Counter {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     text!("Count: {}", self.count),
                     button(text("Tap"), move || self.count.add(1)),
@@ -10981,7 +10986,7 @@ mod tests {
         }
 
         impl Component for Form {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_field("name", self.name.binding())
             }
         }
@@ -11040,7 +11045,7 @@ mod tests {
         }
 
         impl Component for Form {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_field("name", self.name.binding())
             }
         }
@@ -11140,7 +11145,7 @@ mod tests {
         struct Stacked;
 
         impl Component for Stacked {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 zstack!(
                     scroll(text("page").frame(400.0, 4000.0)).id("page"),
                     scroll(text("panel").frame(180.0, 900.0)).id("panel").frame(200.0, 100.0),
@@ -11182,7 +11187,7 @@ mod tests {
         }
 
         impl Component for Anchored {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 scroll(text("page").frame(400.0, 4000.0)).id("page").popover(
                     self.open.binding(),
                     Side::Trailing,
@@ -11221,7 +11226,7 @@ mod tests {
         struct Dashboard;
 
         impl Component for Dashboard {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 scroll(vstack!(
                     text("charts").frame(400.0, 200.0),
                     scroll(text("legend").frame(400.0, 900.0)).id("legend").frame(400.0, 100.0),
@@ -11308,7 +11313,7 @@ mod tests {
         }
 
         impl Component for Stage {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let behind = self.behind;
                 scroll(text("the page behind").frame(400.0, 4000.0))
                     .id("page")
@@ -11386,7 +11391,7 @@ mod tests {
         }
 
         impl Component for Stage {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let (behind, confirmed) = (self.behind, self.confirmed);
                 text("the page behind")
                     .frame(400.0, 300.0)
@@ -11430,7 +11435,7 @@ mod tests {
             behind: State<i32>,
         }
         impl Component for Stage {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let behind = self.behind;
                 text("the page behind")
                     .frame(400.0, 300.0)
@@ -11472,7 +11477,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Pane;
         impl Component for Pane {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 // anchored INSIDE the body: this is the state a sweep
                 // from the wrong root would free
                 let count = State::new(0u32);
@@ -11545,7 +11550,7 @@ mod tests {
             arms: Rc<Cell<u32>>,
         }
         impl Component for Pane {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let arms = Rc::clone(&self.arms);
                 button(text("press"), || {}).frame(VIEWPORT.width, VIEWPORT.height).task_id(
                     "work",
@@ -11624,7 +11629,7 @@ mod tests {
         }
 
         impl Component for Form {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_field("password", self.password.binding())
                     .secret(!self.revealed.get())
                     .frame_width(200.0)
@@ -11709,7 +11714,7 @@ mod tests {
             second: State<String>,
         }
         impl Component for Form {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     text_field("one", self.first.binding()).id("one"),
                     text_field("two", self.second.binding()).id("two"),
@@ -11746,7 +11751,7 @@ mod tests {
             note: State<String>,
         }
         impl Component for Form {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     text_field("email", self.email.binding())
                         .keyboard_type(KeyboardType::Email)
@@ -11786,7 +11791,7 @@ mod tests {
             heard: Heard,
         }
         impl Component for Form {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let (one, two) = (self.heard.clone(), self.heard.clone());
                 vstack!(
                     text_field("one", self.first.binding())
@@ -11865,7 +11870,7 @@ mod tests {
             open: State<bool>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("the page under it").frame(WINDOW.width, WINDOW.height).dialog(
                     self.open.binding(),
                     DialogSpec::titled("Settings").min_size(300.0, 200.0),
@@ -11914,7 +11919,7 @@ mod tests {
             open: State<bool>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("the page").frame(WINDOW.width, WINDOW.height).dialog(
                     self.open.binding(),
                     DialogSpec::titled("Settings").min_size(300.0, 200.0).opens_at(900.0, 600.0),
@@ -11972,7 +11977,7 @@ mod tests {
             open: State<bool>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("the page").frame(WINDOW.width, WINDOW.height).dialog(
                     self.open.binding(),
                     DialogSpec::titled("Settings").min_size(300.0, 200.0),
@@ -12027,7 +12032,7 @@ mod tests {
             open: State<bool>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("the page").frame(WINDOW.width, WINDOW.height).dialog(
                     self.open.binding(),
                     DialogSpec::titled("Settings").min_size(300.0, 200.0),
@@ -12072,7 +12077,7 @@ mod tests {
             menu: State<bool>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let menu = self.menu;
                 text("the page").frame(WINDOW.width, WINDOW.height).dialog(
                     self.open.binding(),
@@ -12113,7 +12118,7 @@ mod tests {
             open: State<bool>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("the page").frame(WINDOW.width, WINDOW.height).dialog(
                     self.open.binding(),
                     DialogSpec::titled("Settings").min_size(300.0, 200.0),
@@ -12148,7 +12153,7 @@ mod tests {
             behind: State<i32>,
         }
         impl Component for Stage {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let behind = self.behind;
                 text("the page behind")
                     .frame(400.0, 300.0)
@@ -12193,7 +12198,7 @@ mod tests {
             tall: State<bool>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let tall = self.tall;
                 text("the page").frame(WINDOW.width, WINDOW.height).alert(
                     self.open.binding(),
@@ -12276,7 +12281,7 @@ mod tests {
             heard: State<i32>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let (open, answer, heard) = (self.open, self.answer, self.heard);
                 text("the page")
                     .frame(WINDOW.width, WINDOW.height)
@@ -12387,7 +12392,7 @@ mod tests {
         }
 
         impl Component for Desk {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 custom(Pane).id("editor").frame(300.0, 200.0).alert(
                     self.open.binding(),
                     AlertSpec::new("Unsaved Changes", 260.0),
@@ -12454,7 +12459,7 @@ mod tests {
             dismissed: State<i32>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let dismissed = self.dismissed;
                 text("Theme")
                     .frame(80.0, 24.0)
@@ -12498,7 +12503,7 @@ mod tests {
         }
 
         impl Component for Misplaced {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack((
                     text("header").frame(400.0, 40.0).sheet(self.open.binding(), move |_| {
                         erased(text("panel").frame(120.0, 80.0))
@@ -12538,7 +12543,7 @@ mod tests {
         struct Nest;
 
         impl Component for Nest {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 scroll(vstack((
                     text("head").frame(300.0, 50.0),
                     scroll(text("inner").frame(280.0, 900.0)).id("inner").frame(300.0, 100.0),
@@ -12773,7 +12778,7 @@ mod tests {
         }
 
         impl Component for Sheet {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 custom(Bands { seen: self.seen.with(Rc::clone) })
             }
         }
@@ -12859,7 +12864,7 @@ mod tests {
         }
 
         impl Component for Badge {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text(format!("n: {}", self.n.get()))
             }
         }
@@ -12904,7 +12909,7 @@ mod tests {
         struct Row;
 
         impl Component for Row {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 // Option None does not print; Either/OneOf pick the arm at
                 // compile time — the type is the sum, the discriminant is runtime
                 vstack((
@@ -12934,7 +12939,7 @@ mod tests {
         }
 
         impl Component for Rows {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let items: Vec<usize> = (0..10).collect();
                 let selected = self.selected.get();
                 list(items, |index| format!("row{index}"), |index| text(format!("r{index}")))
@@ -12986,7 +12991,7 @@ mod tests {
         }
 
         impl Component for Form {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_field("Your name", self.name.binding()).monospaced().auto_focus()
             }
         }
@@ -13023,7 +13028,7 @@ mod tests {
         }
 
         impl Component for App {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let palette = self
                     .palette_open
                     .get()
@@ -13075,7 +13080,7 @@ mod tests {
         }
 
         impl Component for Bench {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     text_field("code", self.code.binding()).id("editor"),
                     vstack!(text("Agent"), text_field("ask", self.prompt.binding()).id("composer"))
@@ -13126,7 +13131,7 @@ mod tests {
         struct App;
 
         impl Component for App {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(text("bench"), text("palette").key_context("palette")).key_context("workbench")
             }
         }
@@ -13177,7 +13182,7 @@ mod tests {
         }
 
         impl Component for App {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let editor = self.editing.get().then(|| text("code").key_context("editor"));
                 vstack!(text("bench"), editor)
             }
@@ -13378,7 +13383,7 @@ mod tests {
             card: State<bool>,
         }
         impl Component for App {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("editor").key_context("editor").popover(
                     self.card.binding(),
                     crate::layout::Side::Trailing,
@@ -13436,7 +13441,7 @@ mod tests {
         }
 
         impl Component for App {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let dark_on = self.dark.get();
                 vstack!(
                     text("hello").foreground_color(theme::fg()),
@@ -13492,7 +13497,7 @@ mod tests {
         struct Rows;
 
         impl Component for Rows {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     text("alpha")
                         .padding_length(6.0)
@@ -13548,7 +13553,7 @@ mod tests {
         #[derive(Clone)]
         struct Crowned;
         impl Component for Crowned {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     hstack!(
                         text("title"),
@@ -13593,7 +13598,7 @@ mod tests {
         #[derive(Clone)]
         struct Barred;
         impl Component for Barred {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     hstack!(text("title"), spacer(), button(text("act"), || {}))
                         .frame(200.0, 40.0)
@@ -13642,7 +13647,7 @@ mod tests {
     }
 
     impl Component for Anchored {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             vstack!(
                 spacer().frame(180.0, self.above),
                 spacer().frame(20.0, 20.0).popover(self.open.binding(), self.side, |_| {
@@ -13673,7 +13678,7 @@ mod tests {
             side: State<usize>,
         }
         impl Component for Turning {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let side =
                     [Side::Bottom, Side::Top, Side::Trailing, Side::Leading][self.side.get()];
                 vstack!(
@@ -13723,7 +13728,7 @@ mod tests {
                 open: State<bool>,
             }
             impl Component for Wide {
-                fn body(self, _ctx: &Context) -> impl View {
+                fn body(self) -> impl View {
                     vstack!(
                         spacer().frame(180.0, 80.0),
                         spacer().frame(20.0, 20.0).popover(
@@ -13766,7 +13771,7 @@ mod tests {
             open: State<bool>,
         }
         impl Component for Covered {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 zstack!(
                     button(text("under"), || {}).frame(120.0, 120.0),
                     spacer().frame(20.0, 20.0).popover(self.open.binding(), Side::Bottom, |_| {
@@ -13801,7 +13806,7 @@ mod tests {
     }
 
     impl Component for RowAnchored {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let open = self.open;
             vstack!(
                 list(
@@ -13880,7 +13885,7 @@ mod tests {
             inner: State<bool>,
         }
         impl Component for Nested {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let inner = self.inner;
                 vstack!(
                     spacer().frame(180.0, 80.0),
@@ -13945,7 +13950,7 @@ mod tests {
             told: State<usize>,
         }
         impl Component for Told {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let told = self.told;
                 vstack!(
                     spacer().frame(180.0, 80.0),
@@ -14001,7 +14006,7 @@ mod tests {
             #[derive(Clone)]
             struct Bare;
             impl Component for Bare {
-                fn body(self, _ctx: &Context) -> impl View {
+                fn body(self) -> impl View {
                     vstack!(spacer().frame(180.0, 80.0), spacer().frame(20.0, 20.0))
                 }
             }
@@ -14152,7 +14157,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Rail;
         impl Component for Rail {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     text("gear").tooltip("Settings"),
                     text("below"),
@@ -14219,7 +14224,7 @@ mod tests {
             count: State<usize>,
         }
         impl Component for Two {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let count = self.count;
                 vstack!(
                     text("hover me").tooltip("An explanation"),
@@ -14257,7 +14262,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct One;
         impl Component for One {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("label").tooltip("Explains")
             }
         }
@@ -14282,7 +14287,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Chevron;
         impl Component for Chevron {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 icon(symbol::CHEVRON_RIGHT)
                     .foreground_color(Color::hex(0x3B82F6))
                     .tooltip("The selected file opens here")
@@ -14301,7 +14306,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Chip;
         impl Component for Chip {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 hstack((
                     text("file.rs"),
                     text("x").opacity(0.0).opacity_hovered(1.0).group_hovered().on_click(|| {}),
@@ -14351,7 +14356,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Labelled;
         impl Component for Labelled {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("gear").tooltip("Settings")
             }
         }
@@ -14429,7 +14434,7 @@ mod tests {
         }
 
         impl Component for Pane {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 custom(Terminal { heard: Rc::clone(&self.heard), answers: self.answers })
                     .frame(200.0, 100.0)
                     .context_menu(vec![menu_item("Inspect", || {})])
@@ -14494,7 +14499,7 @@ mod tests {
         }
 
         impl Component for Root {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 custom(Surface { heard: Rc::clone(&self.heard) }).frame(200.0, 100.0)
             }
         }
@@ -14529,7 +14534,7 @@ mod tests {
             opened: State<usize>,
         }
         impl Component for Row {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let opened = self.opened;
                 vstack!(
                     text("file_0001.rs").context_menu(vec![
@@ -14623,7 +14628,7 @@ mod tests {
             at: State<Option<(f64, f64)>>,
         }
         impl Component for Row {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let at = self.at;
                 vstack!(
                     text("file_0001.rs")
@@ -14669,7 +14674,7 @@ mod tests {
             picked: State<usize>,
         }
         impl Component for Nest {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let (heard, picked) = (self.heard, self.picked);
                 vstack!(
                     text("inner").on_context_click(move |_| heard.set(heard.get() + 1)),
@@ -14707,7 +14712,7 @@ mod tests {
             fired: State<usize>,
         }
         impl Component for One {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let fired = self.fired;
                 text("target").context_menu(vec![
                     menu_item("First", move || fired.set(fired.get() + 1)),
@@ -14747,7 +14752,7 @@ mod tests {
     }
 
     impl Component for DragBoard {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let clicked = self.clicked;
             let landed = self.landed;
             let wrong = self.wrong;
@@ -14769,7 +14774,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Card;
         impl Component for Card {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(text("chip").frame(60.0, 20.0).tooltip("the chip"), spacer())
                     .frame(200.0, 80.0)
                     .tooltip("the card")
@@ -14800,7 +14805,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Card;
         impl Component for Card {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     text("chip")
                         .frame(60.0, 20.0)
@@ -14836,7 +14841,7 @@ mod tests {
     }
 
     impl Component for NestedBoard {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let on_chip = self.on_chip;
             let on_pane = self.on_pane;
             vstack!(
@@ -14865,7 +14870,7 @@ mod tests {
     }
 
     impl Component for CaughtBoard {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let on_catcher = self.on_catcher;
             let on_pane = self.on_pane;
             vstack!(
@@ -15002,7 +15007,7 @@ mod tests {
         }
 
         impl Component for Mixed {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let landed = self.landed;
                 vstack!(
                     text("tab 3").on_drag(|| drag(TabDrag { index: 3 }, "tab 3")),
@@ -15230,7 +15235,7 @@ mod tests {
             downs: Rc<Cell<usize>>,
         }
         impl Component for Pane {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let focused = self.focused;
                 custom(Surface { rises: self.rises.get(), downs: Rc::clone(&self.downs) })
                     .frame(120.0, 80.0)
@@ -15272,7 +15277,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Sheet;
         impl Component for Sheet {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 scroll(
                     vstack!(
                         text("a wide row that runs far past the viewport edge"),
@@ -15332,7 +15337,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Line;
         impl Component for Line {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 scroll(text("one very long unwrapped line of code that overflows"))
                     .horizontal()
                     .frame(100.0, 24.0)
@@ -15351,7 +15356,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Sheet;
         impl Component for Sheet {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 table(
                     vec![
                         column("Name", 200.0),
@@ -15500,7 +15505,7 @@ mod tests {
             zone: State<Option<(usize, usize)>>,
         }
         impl Component for Board {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let landed = self.landed;
                 let zone = self.zone;
                 // a pane body: 200x100, dropped on by quadrant
@@ -15570,7 +15575,7 @@ mod tests {
             seen: State<Vec<String>>,
         }
         impl Component for Board {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let seen = self.seen;
                 vstack!(
                     text("tab").on_drag(|| drag(Tab { index: 1 }, "tab")),
@@ -15646,7 +15651,7 @@ mod tests {
             at: State<Option<(i64, i64)>>,
         }
         impl Component for Board {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let at = self.at;
                 vstack!(
                     text("tab").on_drag(|| drag(Tab { index: 0 }, "t")),
@@ -15715,7 +15720,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Board;
         impl Component for Board {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     text("tab").on_drag(|| drag(Tab { index: 3 }, "tab 3")),
                     // NO preview declared: this one wears the
@@ -15777,7 +15782,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Tabs;
         impl Component for Tabs {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     // the preview tab of an editor: leaning says "you
                     // are only looking"
@@ -16065,7 +16070,7 @@ mod tests {
         }
 
         impl Component for Board {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 custom(Asking { saw: self.saw })
             }
         }
@@ -16164,7 +16169,7 @@ mod tests {
         }
 
         impl Component for Board {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 custom(Held { moves: self.moves })
             }
         }
@@ -16201,7 +16206,7 @@ mod tests {
             count: State<usize>,
         }
         impl Component for Tapper {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let count = self.count;
                 vstack!(button(text("tap"), move || count.add(1)), spacer())
             }
@@ -16243,7 +16248,7 @@ mod tests {
             fired: State<usize>,
         }
         impl Component for Rows {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let fired = self.fired;
                 list((0..100).collect::<Vec<usize>>(), |row| format!("row{row}"), move |row| {
                     button(text(format!("item {row}")), move || fired.add(1))
@@ -16292,7 +16297,7 @@ mod tests {
             fired: State<usize>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let fired = self.fired;
                 vstack!(
                     button(text("go"), move || fired.add(1)).frame(200.0, 30.0),
@@ -16336,7 +16341,7 @@ mod tests {
         #[derive(Clone)]
         struct Row;
         impl Component for Row {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 scroll(vstack!(
                     text("file_0001.rs").context_menu(vec![menu_item("Open", || {})]),
                     text("tall").frame_height(1000.0),
@@ -16370,7 +16375,7 @@ mod tests {
             opened: State<usize>,
         }
         impl Component for Row {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let opened = self.opened;
                 scroll(vstack!(
                     text("file_0001.rs").context_menu(vec![
@@ -16424,7 +16429,7 @@ mod tests {
             value: State<String>,
         }
         impl Component for Form {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 scroll(vstack!(
                     text_field("type…", self.value.binding()),
                     text("tall").frame_height(1000.0),
@@ -16466,7 +16471,7 @@ mod tests {
             rows: usize,
         }
         impl Component for Rows {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 list((0..self.rows).collect::<Vec<usize>>(), |row| format!("row{row}"), |row| {
                     text(format!("item {row}"))
                 })
@@ -16538,7 +16543,7 @@ mod tests {
             count: State<usize>,
         }
         impl Component for Form {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let count = self.count;
                 vstack!(
                     text_field("type…", self.value.binding()),
@@ -16603,7 +16608,7 @@ mod tests {
             at: Rc<Cell<Point>>,
         }
         impl Component for Map {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 custom(Zoomable { scale: self.scale.clone(), at: self.at.clone() })
             }
         }
@@ -16675,7 +16680,7 @@ mod tests {
             grabs: bool,
         }
         impl Component for Office {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 custom(Map {
                     heard: self.heard.clone(),
                     knows_cancel: self.knows_cancel,
@@ -16740,7 +16745,7 @@ mod tests {
             drags: Rc<Cell<usize>>,
         }
         impl Component for Sketch {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 scroll(vstack!(
                     custom(Canvas { downs: self.downs.clone(), drags: self.drags.clone() })
                         .frame(200.0, 150.0),
@@ -16783,7 +16788,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Page;
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(text("hello"), spacer()).background_color(Color::hex(0xFF0000))
             }
         }
@@ -16820,7 +16825,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Page;
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(text("hello"), spacer())
                     .background_color(Color::hex(0xFF0000))
                     .ignores_safe_area()
@@ -16860,7 +16865,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Page;
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(text("hello"), text("world"), spacer())
                     .background_color(Color::hex(0x336699))
             }
@@ -16868,7 +16873,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Reclaiming;
         impl Component for Reclaiming {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(text("hello"), text("world"), spacer())
                     .background_color(Color::hex(0x336699))
                     .ignores_safe_area()
@@ -16892,7 +16897,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Page;
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(text("hello"), spacer()).background_color(Color::hex(0xFF0000))
             }
         }
@@ -16932,7 +16937,7 @@ mod tests {
             count: State<usize>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let count = self.count;
                 vstack!(button(text("tap"), move || count.add(1)), spacer())
             }
@@ -16967,7 +16972,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Page;
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     text("header")
                         .frame(390.0, 40.0)
@@ -17010,15 +17015,15 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Workbench;
         impl Component for Workbench {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(Chassis, Still)
             }
         }
         #[derive(Clone, Copy)]
         struct Chassis;
         impl Component for Chassis {
-            fn body(self, ctx: &Context) -> impl View {
-                let window = ctx.environment::<Viewport>();
+            fn body(self) -> impl View {
+                let window = environment::<Viewport>();
                 let portrait = window.width < 600.0 && window.width < window.height;
                 text(if portrait { "portrait" } else { "desktop" })
             }
@@ -17026,7 +17031,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Still;
         impl Component for Still {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("the rest of the tree")
             }
         }
@@ -17068,8 +17073,8 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Caption;
         impl Component for Caption {
-            fn body(self, ctx: &Context) -> impl View {
-                text(if ctx.environment::<WindowState>().maximized { "restore" } else { "maximize" })
+            fn body(self) -> impl View {
+                text(if environment::<WindowState>().maximized { "restore" } else { "maximize" })
             }
         }
         let runtime = Runtime::new();
@@ -17100,8 +17105,8 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Adaptive;
         impl Component for Adaptive {
-            fn body(self, ctx: &Context) -> impl View {
-                let label = match ctx.environment::<SizeClass>() {
+            fn body(self) -> impl View {
+                let label = match environment::<SizeClass>() {
                     SizeClass::Compact => "narrow",
                     SizeClass::Regular => "wide",
                 };
@@ -17138,7 +17143,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Preview;
         impl Component for Preview {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 Adaptive.environment(|values| values.horizontalSizeClass = SizeClass::Compact)
             }
         }
@@ -17208,8 +17213,8 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Greeting;
         impl Component for Greeting {
-            fn body(self, ctx: &Context) -> impl View {
-                let word = match ctx.environment::<Locale>().language() {
+            fn body(self) -> impl View {
+                let word = match environment::<Locale>().language() {
                     "pt" => "oi",
                     _ => "hello",
                 };
@@ -17295,7 +17300,7 @@ mod tests {
     #[derive(Clone, Copy)]
     struct Pair;
     impl Component for Pair {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             hstack!(text("a"), text("bb"))
         }
     }
@@ -17308,7 +17313,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Scene;
         impl Component for Scene {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     Pair,
                     Pair.environment(|values| values.layoutDirection = LayoutDirection::RightToLeft),
@@ -17332,7 +17337,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Scene;
         impl Component for Scene {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     Pair,
                     Pair.environment(|values| values.layoutDirection = LayoutDirection::LeftToRight),
@@ -17353,7 +17358,7 @@ mod tests {
     #[derive(Clone, Copy)]
     struct Strip;
     impl Component for Strip {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             scroll(hstack!(text("aaaaaaaaaa"), text("bbbbbbbbbb"), text("cccccccccc")))
                 .horizontal()
                 .id("strip")
@@ -17440,7 +17445,7 @@ mod tests {
             seam: State<f64>,
         }
         impl Component for Bench {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 hsplit(self.seam.binding(), text("panel"), text("editor")).min_sizes(120.0, 200.0)
             }
         }
@@ -17477,7 +17482,7 @@ mod tests {
             side: State<usize>,
         }
         impl Component for Turning {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let side =
                     [Side::Bottom, Side::Top, Side::Trailing, Side::Leading][self.side.get()];
                 vstack!(
@@ -17519,7 +17524,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Rail;
         impl Component for Rail {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 // centred in a wide window, so either side has room
                 vstack!(
                     text("gear").tooltip_side("Settings", Side::Leading).frame(40.0, 20.0),
@@ -17566,7 +17571,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Pane;
         impl Component for Pane {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("file").frame(400.0, 100.0).context_menu(vec![menu_item("Open", || {})])
             }
         }
@@ -17611,8 +17616,8 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Reader;
         impl Component for Reader {
-            fn body(self, ctx: &Context) -> impl View {
-                let insets = ctx.environment::<SafeAreaInsets>();
+            fn body(self) -> impl View {
+                let insets = environment::<SafeAreaInsets>();
                 hstack!(text!("{}:{}", insets.leading, insets.trailing), spacer())
             }
         }
@@ -17663,7 +17668,7 @@ mod tests {
             heard: Rc<RefCell<Heard>>,
         }
         impl Component for Pane {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 custom(Gutter { heard: Rc::clone(&self.heard) }).frame(200.0, 100.0)
             }
         }
@@ -17705,7 +17710,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Disclosure;
         impl Component for Disclosure {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 icon(symbol::CHEVRON_RIGHT).flips_for_right_to_left_layout_direction(true)
             }
         }
@@ -17730,7 +17735,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Rail;
         impl Component for Rail {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     icon(symbol::CHEVRON_RIGHT),
                     vstack!(
@@ -17755,7 +17760,7 @@ mod tests {
         name: State<String>,
     }
     impl Component for Form {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             text_field("name", self.name.binding()).frame_width(120.0)
         }
     }
@@ -17863,9 +17868,9 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Reader;
         impl Component for Reader {
-            fn body(self, ctx: &Context) -> impl View {
-                let safe = ctx.environment::<SafeAreaInsets>();
-                let keys = ctx.environment::<KeyboardInset>();
+            fn body(self) -> impl View {
+                let safe = environment::<SafeAreaInsets>();
+                let keys = environment::<KeyboardInset>();
                 vstack!(text(format!("{} {} {}", safe.top, safe.bottom, keys.0)), spacer())
             }
         }
@@ -17922,7 +17927,7 @@ mod tests {
             opened: State<usize>,
         }
         impl Component for Row {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let opened = self.opened;
                 vstack!(
                     text("file_0001.rs").context_menu(vec![
@@ -17961,7 +17966,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Page;
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let band = |color: u32, height: f64| {
                     // a height of its own, then the whole width: `frame_max` caps
                     // and grows only toward an infinite edge
@@ -18029,7 +18034,7 @@ mod input_focus_policy_tests {
         wrapped: State<bool>,
     }
     impl Component for Fields {
-        fn body(self, _: &Context) -> impl View {
+        fn body(self) -> impl View {
             let first = text_editor("one", State::new(String::new()).binding())
                 .editing_strategy(
                     self.enabled

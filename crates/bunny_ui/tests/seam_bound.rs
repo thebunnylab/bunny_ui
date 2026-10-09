@@ -16,7 +16,7 @@ struct Room {
 }
 
 impl Component for Room {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         hsplit(self.seam.binding(), text!("a").on_click(|| {}).id("a"), text!("b").on_click(|| {}).id("b"))
             .min_sizes(50.0, 50.0)
     }

@@ -17,7 +17,7 @@ struct PaintProbe {
 }
 
 impl Component for Dial {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let probe = self.probe.clone();
         vstack!(
             hstack!(

@@ -441,7 +441,7 @@ mod frame_tests {
     }
 
     impl Component for Label {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             crate::text!("{} rows", self.count)
         }
     }
@@ -459,7 +459,7 @@ mod frame_tests {
         }
 
         impl Component for Plain {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let id = self.id;
                 (crate::views::boundary_class_with(move || format!("row-{id}")), crate::text!("row {}", id))
             }
@@ -491,7 +491,7 @@ mod frame_tests {
         }
 
         impl Component for Pair {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(text("fixed"), crate::text!("{} rows", self.count)).font_family("Menlo")
             }
         }
@@ -526,7 +526,7 @@ mod frame_tests {
         }
 
         impl Component for Row {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let id = self.item.id;
                 (
                     boundary_class_when(self.on, "danger"),
@@ -549,7 +549,7 @@ mod frame_tests {
         }
 
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(for_each(self.rows, |item| item.id.to_string(), |item| {
                     Row { item: *item, on: State::new(false) }.element("tr")
                 }))
@@ -621,7 +621,7 @@ mod frame_tests {
         }
 
         impl Component for Row {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let id = self.item.id;
                 // every third row carries a second cell
                 crate::hstack!(text(id.to_string()), (id % 3 == 0).then(|| text("marked"))).element("tr")
@@ -634,7 +634,7 @@ mod frame_tests {
         }
 
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(for_each(self.rows, |item| item.id.to_string(), |item| Row { item: *item }))
             }
         }
@@ -703,7 +703,7 @@ mod frame_tests {
     }
 
     impl Component for Flag {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             (boundary_class_when(self.on, "danger"), text("flag"))
         }
     }
@@ -739,7 +739,7 @@ mod frame_tests {
         }
 
         impl Component for Tagged {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 (boundary_class_when(self.on, format!("tag-{}", self.id)), text("tagged"))
             }
         }
@@ -766,7 +766,7 @@ mod frame_tests {
     }
 
     impl Component for Row {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             text(format!("row {}", self.id))
         }
     }
@@ -777,7 +777,7 @@ mod frame_tests {
     }
 
     impl Component for Table {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             for_each(self.rows, |item| item.id.to_string(), |item| Row { id: item.id })
         }
     }
@@ -980,7 +980,7 @@ mod frame_tests {
     }
 
     impl Component for Shelf {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             // the head and the font are read by the body on purpose: a
             // change to either re-runs the shelf, and the list under it
             let font = if self.big.get() { Font::Title } else { Font::Body };
@@ -1042,7 +1042,7 @@ mod tests {
     struct RowView(Row);
 
     impl Component for RowView {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let row = self.0;
             crate::hstack!(text(row.id.to_string()), crate::text!(row.label))
         }
@@ -1054,7 +1054,7 @@ mod tests {
     }
 
     impl Component for Page {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             crate::vstack!(
                 text("a page that never runs again"),
                 for_each(self.rows, |row| row.id.to_string(), |row| RowView(*row)),
@@ -1152,7 +1152,7 @@ mod tests {
         }
 
         impl Component for Restoring {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let rows = self.rows;
                 let all = Rc::clone(&self.all);
                 let short = rows.get().len() < all.len();
@@ -1339,7 +1339,7 @@ mod tests {
         struct Badge;
 
         impl Component for Badge {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("new")
             }
         }
@@ -1351,7 +1351,7 @@ mod tests {
         }
 
         impl Component for Flagged {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(self.flag.get().then_some(Badge), crate::text!(self.label))
             }
         }
