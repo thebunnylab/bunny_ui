@@ -78,7 +78,7 @@ impl Workbench {
 }
 
 impl Component for Workbench {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let page = match self.mode.get() {
             Mode::Board => erased(board(self.legend_rows, &self.flags, self.kept_pictures)),
             Mode::Table => erased(table()),
@@ -155,7 +155,7 @@ struct StatusBar {
 }
 
 impl Component for StatusBar {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let dot = SERIES[self.pulse.get() % SERIES.len()];
         hstack!(
             text("main · 8 charts · ready").foreground_color(theme::fg_secondary()),
@@ -202,7 +202,7 @@ struct Panel {
 }
 
 impl Component for Panel {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         // the plot and its legend share the room the panel is given: the
         // size comes back through a probe, and the second pass places the
         // legend with it — a product's mount is two passes for this reason
@@ -280,7 +280,7 @@ struct LegendRow {
 }
 
 impl Component for LegendRow {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let (panel, row) = (self.panel, self.row);
         let label = format!("Region {panel} · Series {row:03} · a long label that does not fit");
         let value = format!("{:.0}", sample(panel, row) * 250_000.0);
@@ -312,7 +312,7 @@ struct LegendFlag {
 }
 
 impl Component for LegendFlag {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let on = self.flag.get();
         text(if on { "Totals shown" } else { "Totals hidden" })
             .font(Font::Subheadline)

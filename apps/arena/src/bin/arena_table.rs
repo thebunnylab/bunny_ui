@@ -13,7 +13,7 @@ struct Table {
 }
 
 impl Component for Table {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let rows = self.rows.clone();
         let count = rows.len();
         vstack!(

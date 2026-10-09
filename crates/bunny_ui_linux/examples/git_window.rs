@@ -43,7 +43,7 @@ struct App {
 }
 
 impl Component for App {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let commits = self.commits;
         let reloads = self.reloads;
         let reading = self.reading;

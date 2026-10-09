@@ -1,19 +1,33 @@
 # bunny_ui
 
-A declarative UI framework for Rust, inspired by SwiftUI.
+A declarative UI framework for Rust with fine-grained reactivity, inspired by SwiftUI.
 
-Write views as value types. The framework finds the views that read changed state and runs only those.
+Write views as value types and let reads establish their reactive dependencies.
+`State<T>` is Bunny UI's signal primitive: changing a value invalidates its
+subscribers. A text node can subscribe directly, so a counter update can change
+its label without rerunning the component body.
+
+- **Fine-grained signals:** `State`, two-way `Binding` projections and read-only
+  `Derived` values share one dependency system.
+- **Plain Rust MVVM:** presentation structs hold independent reactive properties
+  and command methods; views receive them through ordinary fields.
+- **Explicit composition:** typed components declare `body(self)` and request
+  ambient values only when needed with `environment::<T>()`.
+- **Scoped work:** views can own state and asynchronous tasks, with cleanup when
+  their mounted identity leaves the tree.
 
 ## Quick look
 
 ```rust
+use bunny_ui::prelude::*;
+
 #[derive(Clone, Copy)]
 struct Counter {
     count: State<i32>,
 }
 
 impl Component for Counter {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         vstack!(
             text!("Count: {}", self.count),
             button(text("Tap"), move || self.count.add(1)),
@@ -22,7 +36,86 @@ impl Component for Counter {
 }
 ```
 
-The display of `count` records a read. A tap changes the state, and the framework runs only this view again.
+The text node records the read. A tap changes the state and updates that node
+without running the component body again. `text(self.count)` also binds directly;
+`text!("Count: {}", self.count)` adds formatting.
+
+## Signals and subscriptions
+
+The API calls its signal `State<T>`. The subscription belongs to the place that
+reads it, which is what determines the scope of an update.
+
+| API | Role | Typical use |
+| --- | --- | --- |
+| `State<T>` | A reactive value behind a small typed handle | Independent presentation properties |
+| `Binding<T>` | A read/write projection, including application getters and setters | Two-way fields and child controls |
+| `Derived<T>` | A lazy, read-only computation | Computed presentation values |
+| `text(state)` / `text(binding)` / `text(derived)` | A read deferred to the text node | Update a label without rerunning its component body |
+| `text!("Count: {}", state)` | Formatting with reads at the text node | Reactive formatted labels |
+
+Reading `state.get()` in `body` subscribes that component to the value. That is
+useful when state controls structure, such as whether a panel exists. For a
+label, passing the reactive value directly to `text` keeps the subscription on
+the label. `text(name.get())` instead takes a string snapshot while the body is
+running. A state change does not automatically rebuild the whole application.
+
+Bindings preserve the dependencies of their getter; a binding around ordinary
+nonreactive data does not create change notifications by itself. Derived values
+compute when read, and subscribe to the state read by that computation. They are
+not global memos; text nodes retain their normal caching. See the
+[public authoring tests](crates/bunny_ui/tests/authoring.rs) for body and node
+execution counters that verify update granularity.
+
+## MVVM with ordinary Rust structs
+
+Keep presentation properties and commands on a model and supply it through a
+`vm` field. Each property remains independently reactive.
+
+```rust
+use bunny_ui::prelude::*;
+
+#[derive(Clone, Copy)]
+struct CounterModel {
+    count: State<i32>,
+}
+
+impl CounterModel {
+    fn increment(self) {
+        self.count.add(1);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Counter {
+    vm: CounterModel,
+}
+
+impl Component for Counter {
+    fn body(self) -> impl View {
+        vstack!(
+            text(self.vm.count),
+            button(text("Increment"), move || self.vm.increment()),
+        )
+    }
+}
+```
+
+The model's commands can be tested without a window. Domain models and services
+remain independent of Bunny UI. Prefer separate `State` properties when fields
+should update independently; wrapping a whole model in one `State` gives its
+readers a shared dependency.
+
+Both a model supplied through a field and a body-local `view_model(Model::new)`
+are supported. Initialization determines ownership: an app can create a model
+outside rendering, or `view_model` can retain it once per mounted identity and
+release its state on unmount. A field stores the supplied model; it does not
+change its lifetime. The [MVVM guide](docs/mvvm.md) explains both forms, derived
+properties and two-way editing. Run the complete examples without a window:
+
+```bash
+cargo run -p bunny-ui --example counter_mvvm
+cargo run -p bunny-ui --example profile_mvvm
+```
 
 ## Work that waits
 
@@ -30,7 +123,7 @@ A view can own asynchronous work. `.task` starts it on the view's first
 appearance and ends it when the view leaves the tree.
 
 ```rust
-row.task(move || async move {
+row.task(async move || {
     let (lines, reader) = task::channel();
     std::thread::spawn(move || read_the_log(lines));
     while let Some(line) = reader.recv().await {
@@ -38,6 +131,10 @@ row.task(move || async move {
     }
 })
 ```
+
+Tasks accept async closures that borrow their owned captures across `.await`.
+The running task keeps those captures alive. Ordinary `move || async move { … }`
+factories remain supported, with the same identity and cancellation behavior.
 
 The framework reads no file and opens no socket. The application does
 that on its own thread — or through its own browser callback — and

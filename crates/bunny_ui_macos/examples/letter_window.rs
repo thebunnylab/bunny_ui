@@ -123,7 +123,7 @@ struct Reader {
 }
 
 impl Component for Reader {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let (policy, fetched, linked) = (self.policy, self.fetched, self.linked);
         let (committed, commits) = (self.committed, self.commits);
         let (port, hits, handle) = (self.port, self.hits, self.handle);

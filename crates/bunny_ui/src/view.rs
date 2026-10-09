@@ -298,7 +298,7 @@ impl NodeList {
 
 /// The conformance every `struct X: View` writes by hand.
 ///
-/// (`var body: some View` → `fn body(self, ctx: &Context) -> impl View` —
+/// (`var body: some View` → `fn body(self) -> impl View` —
 /// return-position `impl Trait` in trait, stable since Rust 1.75. The
 /// concrete type of the whole tree is known at compile time.)
 ///
@@ -308,7 +308,7 @@ impl NodeList {
 /// `&self` form demanded. Views are cheap values (`State` is Copy); the
 /// runtime clones before calling.
 pub trait Component: Clone + 'static {
-    fn body(self, ctx: &Context) -> impl View;
+    fn body(self) -> impl View;
 
     /// The framework's own keyed list stands behind a boundary whose
     /// rows are kept by key when it re-runs. Only that list says so.
@@ -339,8 +339,10 @@ pub trait Component: Clone + 'static {
 /// renders. Written at the call site instead, the same copy would
 /// reserve its slot in the caller's frame for the whole subtree.
 #[inline(never)]
-fn run_body<'a, T: Component>(view: &T, ctx: &'a Context) -> impl View + use<'a, T> {
-    view.clone().body(ctx)
+fn run_body<T: Component>(view: &T, ctx: &Context) -> impl View {
+    motor::state::with_environment(ctx, || {
+        crate::diagnostics::body(std::any::type_name::<T>(), || view.clone().body())
+    })
 }
 
 /// Files the finished body under its identity, and puts the reference
@@ -668,7 +670,7 @@ mod tests {
     }
 
     impl<const N: usize> Component for Level<N> {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             mark();
             let deeper =
                 (self.left > 0).then(|| Level { payload: self.payload, left: self.left - 1 });

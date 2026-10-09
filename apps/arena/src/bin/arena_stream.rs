@@ -10,7 +10,7 @@ struct Chat {
 }
 
 impl Component for Chat {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let messages = self.messages.get();
         let count = messages.len();
         virtual_list(

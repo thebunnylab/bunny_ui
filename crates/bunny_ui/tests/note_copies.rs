@@ -52,7 +52,7 @@ struct Panel {
 }
 
 impl Component for Panel {
-    fn body(self, _: &Context) -> impl View {
+    fn body(self) -> impl View {
         text_editor("note", self.note.binding()).frame(400.0, 300.0)
     }
 }

@@ -1273,7 +1273,7 @@ mod tests {
     }
 
     impl Component for Page {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let on = self.on.get();
             crate::vstack!(
                 text("hello, prerender").foreground_color(Color::hex(0xF5F5F5)),
@@ -1393,7 +1393,7 @@ mod tests {
         struct Placed;
 
         impl Component for Placed {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(
                     text("flow above"),
                     crate::vstack!(
@@ -1431,7 +1431,7 @@ mod tests {
         struct Badge;
 
         impl Component for Badge {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::zstack!(rectangle().frame(80.0, 20.0), text("on top"))
             }
         }
@@ -1449,7 +1449,7 @@ mod tests {
         struct Picture(crate::image_engine::ImageSource);
 
         impl Component for Picture {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 image(self.0.clone()).resizable().frame(20.0, 20.0)
             }
         }
@@ -1470,7 +1470,7 @@ mod tests {
         struct Links;
 
         impl Component for Links {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(
                     text("source").link("https://example.com/a?b=1&c=2"),
                     text("top").link("#top").element_id("back"),
@@ -1497,7 +1497,7 @@ mod tests {
         struct Eyebrow;
 
         impl Component for Eyebrow {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("QUICK LOOK").font_size(12.0).tracking(2.0)
             }
         }
@@ -1515,7 +1515,7 @@ mod tests {
         struct Link;
 
         impl Component for Link {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("docs")
                     .font_size(12.0)
                     .foreground_color(Color::hex(0x8F86A8))
@@ -1542,8 +1542,8 @@ mod tests {
         struct Shaped;
 
         impl Component for Shaped {
-            fn body(self, ctx: &Context) -> impl View {
-                let wide = ctx.environment::<Viewport>().width >= 800.0;
+            fn body(self) -> impl View {
+                let wide = environment::<Viewport>().width >= 800.0;
                 if wide {
                     Either::First(crate::hstack!(text("words"), text("code")))
                 } else {

@@ -16,7 +16,7 @@ struct Counter {
 }
 
 impl Component for Counter {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         vstack!(
             text!("count: {}", self.count),
             spacer(),

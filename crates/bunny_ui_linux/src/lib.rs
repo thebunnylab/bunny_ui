@@ -476,7 +476,7 @@ struct WindowRoot<V: View> {
 }
 
 impl<V: View> bunny_ui::view::Component for WindowRoot<V> {
-    fn body(self, _ctx: &bunny_ui::prelude::Context) -> impl View {
+    fn body(self) -> impl View {
         self.root
     }
 }

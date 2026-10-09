@@ -16,7 +16,7 @@ struct Row {
 }
 
 impl Component for Row {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         // the word is handed to the text, never read here: a write moves
         // the text through its binding and runs no body
         let word = self.word;

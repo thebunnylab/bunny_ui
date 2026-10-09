@@ -22,7 +22,7 @@ struct Chat {
 }
 
 impl Component for Chat {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let lines: Vec<usize> = (0..self.lines.get()).collect();
         scroll(for_each(lines, |line| line.to_string(), |line| {
             text(format!("line {line}")).frame_height(20.0)
@@ -106,7 +106,7 @@ fn a_thumb_under_later_paint_stays_in_the_scene() {
     }
 
     impl Component for Veiled {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             zstack!(
                 Chat { lines: self.lines },
                 rectangle().foreground_color(Color::rgba(255, 0, 0, 40)).frame(WINDOW.width, WINDOW.height),
@@ -132,7 +132,7 @@ fn a_thumb_in_a_rounded_corner_stays_in_the_scene() {
     }
 
     impl Component for Card {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             Chat { lines: self.lines }.corner_radius(self.radius).clipped()
         }
     }
@@ -159,7 +159,7 @@ fn a_popover_keeps_its_thumb_and_its_slice() {
     }
 
     impl Component for Anchored {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             scroll(text("page").frame(400.0, 4000.0)).id("page").popover(
                 self.open.binding(),
                 Side::Trailing,
@@ -203,7 +203,7 @@ fn a_live_box_after_a_lifted_thumb_keeps_its_slice() {
     }
 
     impl Component for Beside {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             hstack!(Chat { lines: self.lines }.frame(200.0, 200.0), custom(Swatch).frame(100.0, 200.0).id("swatch"))
         }
     }
@@ -233,7 +233,7 @@ fn a_thumb_on_one_fill_takes_its_colour_and_on_many_stays() {
     }
 
     impl Component for Rows {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let lines: Vec<usize> = (0..self.lines.get()).collect();
             let striped = self.striped;
             scroll(for_each(lines, |line| line.to_string(), move |line| {
@@ -271,7 +271,7 @@ fn a_line_that_runs_under_the_thumb_keeps_it_in_the_scene() {
     }
 
     impl Component for Long {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let lines: Vec<usize> = (0..self.lines.get()).collect();
             let word = "w".repeat(self.width);
             scroll(for_each(lines, |line| line.to_string(), move |_| text(word.clone()).frame_height(20.0)))
