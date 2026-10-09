@@ -126,6 +126,28 @@ type KeySink = Rc<dyn Fn(&crate::action::KeyReport)>;
 /// it gave for that (`TextField::on_focus`).
 type FocusHeard = (Option<String>, Option<Rc<dyn Fn(bool)>>);
 
+// A field that heard input stays solid through the next slow beat. Once
+// that beat observes quiet, the existing half-period alternation resumes.
+#[derive(Clone, Copy)]
+enum CaretPhase {
+    Held,
+    Visible,
+    Hidden,
+}
+
+impl CaretPhase {
+    fn visible(self) -> bool {
+        !matches!(self, Self::Hidden)
+    }
+
+    fn beat(self) -> Self {
+        match self {
+            Self::Held | Self::Hidden => Self::Visible,
+            Self::Visible => Self::Hidden,
+        }
+    }
+}
+
 pub struct Runtime {
     /// The environment every body reads. Behind a cell because the
     /// shell moves it at runtime — a rotation flips the size class —
@@ -231,7 +253,7 @@ pub struct Runtime {
     /// Blink phase: the caret goes and comes back on the shell tick;
     /// typing or focusing returns it to solid (an idle caret blinks,
     /// an active one does not).
-    caret_visible: Cell<bool>,
+    caret_phase: Cell<CaretPhase>,
     /// The last UTF-16 count the input method was given: the text, a byte
     /// and the units before it. The next count starts there, and it
     /// carries over the field's own edits up to the first byte they
@@ -1489,7 +1511,7 @@ impl Runtime {
             focused_policy: RefCell::new(None),
             focus_heard: RefCell::new((None, None)),
             carets: RefCell::new(HashMap::default()),
-            caret_visible: Cell::new(true),
+            caret_phase: Cell::new(CaretPhase::Visible),
             utf16_memo: RefCell::new(None),
             goal_column: Cell::new(None),
             last_fields: RefCell::new(Vec::new()),
@@ -2144,7 +2166,7 @@ impl Runtime {
             return;
         }
         self.blur();
-        self.caret_visible.set(true);
+        self.caret_phase.set(CaretPhase::Visible);
         *self.focus.borrow_mut() = Some(path.to_string());
         if let Some(placement) = self.custom_at(path) {
             self.deliver(&placement, crate::custom::ElementEvent::Focused(true));
@@ -2185,7 +2207,7 @@ impl Runtime {
             let mut state = self.carets.borrow().get(&path).copied().unwrap_or_default();
             if reconciler::field_key(&path, &stroke, &mut state) {
                 self.carets.borrow_mut().insert(path.clone(), state);
-                self.caret_visible.set(true);
+                self.caret_phase.set(CaretPhase::Held);
                 self.frame_asked.set(true);
                 self.goal_column.set(None);
                 self.reveal_caret(&path);
@@ -2237,7 +2259,7 @@ impl Runtime {
         };
         let response = self.deliver(&placement, crate::custom::ElementEvent::Key(stroke));
         if response.handled {
-            self.caret_visible.set(true);
+            self.caret_phase.set(CaretPhase::Visible);
             self.dirty_island_of(&placement.path);
         }
         response
@@ -3735,7 +3757,11 @@ impl Runtime {
         if moved {
             self.blur();
         }
-        self.caret_visible.set(true);
+        self.caret_phase.set(if placement.is_some() || self.custom_at(path).is_some() {
+            CaretPhase::Visible
+        } else {
+            CaretPhase::Held
+        });
         *self.focus.borrow_mut() = Some(path.to_string());
         self.sync_field_focus();
         self.carets
@@ -3761,7 +3787,7 @@ impl Runtime {
     /// `shift` keeps the anchor where it already was, which is the
     /// keyboard's own extend done with the mouse.
     fn select_at(&self, path: &str, x: Px, y: Px, clicks: u8, shift: bool) {
-        self.caret_visible.set(true);
+        self.caret_phase.set(CaretPhase::Held);
         self.goal_column.set(None);
         let held = self.focus.borrow().as_deref() == Some(path);
         *self.focus.borrow_mut() = Some(path.to_string());
@@ -3828,7 +3854,7 @@ impl Runtime {
         state.anchor = Some(anchor);
         state.caret = caret;
         self.carets.borrow_mut().insert(path.to_string(), state);
-        self.caret_visible.set(true);
+        self.caret_phase.set(CaretPhase::Held);
         self.reveal_caret(path);
         true
     }
@@ -4133,7 +4159,7 @@ impl Runtime {
         state.caret = landed;
         state.marked = None;
         self.carets.borrow_mut().insert(path.to_string(), state);
-        self.caret_visible.set(true);
+        self.caret_phase.set(CaretPhase::Held);
         self.reveal_caret(path);
         self.goal_column.set(Some(column));
         Edited { applied: true, output: None }
@@ -4224,18 +4250,22 @@ impl Runtime {
         })
     }
 
-    /// Half-period of the blink (the shell calls it on a timer):
-    /// toggles caret visibility. `true` = a field is focused — repaint.
+    /// One slow-clock half-period. A built-in field stays solid through
+    /// the first beat after input; subsequent quiet beats alternate its
+    /// visibility. Custom elements retain their own blink behavior.
+    /// `true` means the visible phase changed and needs a repaint.
     /// A view that holds the keyboard only to answer a copy has no caret,
     /// so it asks for no repaint: a focused table is not redrawn twice a
     /// second for nothing.
     pub fn blink(&self) -> bool {
         if !self.caret_blinks() {
-            self.caret_visible.set(true);
+            self.caret_phase.set(CaretPhase::Visible);
             return false;
         }
-        self.caret_visible.set(!self.caret_visible.get());
-        true
+        let previous = self.caret_phase.get();
+        let next = previous.beat();
+        self.caret_phase.set(next);
+        previous.visible() != next.visible()
     }
 
     /// The IME snapshot of the focused field — `None` without focus.
@@ -4471,7 +4501,7 @@ impl Runtime {
             };
             let response = self.deliver(&placement, event);
             if response.handled {
-                self.caret_visible.set(true);
+                self.caret_phase.set(CaretPhase::Visible);
                 self.dirty_island_of(&placement.path);
             }
             return Edited { applied: response.handled, output: response.text };
@@ -4479,10 +4509,13 @@ impl Runtime {
         let mut state = self.carets.borrow().get(&path).copied().unwrap_or_default();
         // outside the map borrow: the editor writes to the binding and
         // can re-enter the runtime
+        let observational = matches!(command, EditCommand::Read | EditCommand::Copy);
         match reconciler::run_editor(&path, command, &mut state) {
             Some(output) => {
                 self.carets.borrow_mut().insert(path.clone(), state);
-                self.caret_visible.set(true);
+                if !observational {
+                    self.caret_phase.set(CaretPhase::Held);
+                }
                 self.reveal_caret(&path);
                 Edited { applied: true, output }
             }
@@ -4509,7 +4542,7 @@ impl Runtime {
             if let Some(image) = crate::clipboard::read_image() {
                 let response = self.deliver(&placement, crate::custom::ElementEvent::PasteImage(image));
                 if response.handled {
-                    self.caret_visible.set(true);
+                    self.caret_phase.set(CaretPhase::Visible);
                     self.dirty_island_of(&placement.path);
                     return true;
                 }
@@ -5002,7 +5035,7 @@ impl Runtime {
             interaction: &interaction,
             focus: focus.as_deref(),
             carets: &carets,
-            caret_visible: self.caret_visible.get(),
+            caret_visible: self.caret_phase.get().visible(),
         };
         self.cache.begin_frame();
         self.last_proposal.set(Some(crate::layout::Proposal::exact(size)));
@@ -5131,7 +5164,7 @@ impl Runtime {
             interaction: &interaction,
             focus: focus.as_deref(),
             carets: &carets,
-            caret_visible: self.caret_visible.get(),
+            caret_visible: self.caret_phase.get().visible(),
         };
         self.cache.begin_frame();
         self.last_proposal.set(Some(crate::layout::Proposal::exact(size)));
@@ -5802,7 +5835,7 @@ impl Runtime {
                     visible: owner.visible,
                     metrics: crate::custom::Metrics::new(&*self.text, &self.cache, placement.font),
                     focused,
-                    caret_visible: focused && self.caret_visible.get(),
+                    caret_visible: focused && self.caret_phase.get().visible(),
                     phase: 0.0,
                     scale: self.device_scale.get(),
                     touch: self.touch_modality.get(),
@@ -5832,7 +5865,7 @@ impl Runtime {
                     visible: placement.visible,
                     metrics: crate::custom::Metrics::new(&*self.text, &self.cache, placement.font),
                     focused,
-                    caret_visible: focused && self.caret_visible.get(),
+                    caret_visible: focused && self.caret_phase.get().visible(),
                     phase,
                     scale: self.device_scale.get(),
                     touch: self.touch_modality.get(),
@@ -6820,6 +6853,9 @@ impl Runtime {
         }
         for field in &result.fields {
             if self.claim_auto_focus(&field.path, field.auto_focus) {
+                // This layout has retained the field's geometry. Reveal the
+                // focused caret now, before the first frame or keystroke.
+                self.reveal_caret(&field.path);
                 return true;
             }
         }
@@ -6937,7 +6973,7 @@ impl Runtime {
             interaction: &interaction,
             focus: focus.as_deref(),
             carets: &carets,
-            caret_visible: self.caret_visible.get(),
+            caret_visible: self.caret_phase.get().visible(),
         };
         self.cache.begin_frame();
         crate::layout::set_overlay_layers(self.overlay_layers.get());

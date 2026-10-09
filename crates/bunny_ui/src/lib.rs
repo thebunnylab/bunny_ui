@@ -11079,7 +11079,8 @@ mod tests {
         };
         let visible = runtime.layout(&form, viewport);
         assert_eq!(caret_count(&visible), 1);
-        assert!(runtime.blink(), "focused: the tick requests a repaint");
+        assert!(!runtime.blink(), "the first beat after typing keeps the caret solid");
+        assert!(runtime.blink(), "a quiet field starts its idle blink");
         let hidden = runtime.layout(&form, viewport);
         assert_eq!(caret_count(&hidden), 0, "off half-period");
         assert!(runtime.blink());

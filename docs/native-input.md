@@ -35,3 +35,11 @@ and Cmd+Up/Down by document; Shift extends the selection for each motion. Word
 movement uses the same Unicode character classes as double-click selection.
 Logical line edges remain stable under soft wrapping and stop before newlines.
 AppKit's corresponding text command selectors use the same edit commands.
+
+Built-in field carets stay solid during accepted text, IME, navigation and
+selection input. The first slow-clock beat after activity keeps them visible;
+following quiet beats toggle at the existing half-period. This gives the caret
+one complete quiet interval before it disappears, using the shell's existing
+clock. Read/Copy queries preserve the phase. Custom elements keep ownership of
+their blink behavior, and a window without caret or other pending work still
+parks its clock.
