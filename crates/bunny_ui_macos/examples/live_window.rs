@@ -30,7 +30,7 @@ const BAR_H: f64 = 44.0;
 struct LiveDemo;
 
 impl Component for LiveDemo {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let ring = canvas(|ctx, painter| {
             // one slow breath per loop: the phase turns into a radius
             let size = ctx.size();

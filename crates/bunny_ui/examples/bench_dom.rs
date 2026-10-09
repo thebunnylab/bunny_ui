@@ -82,7 +82,7 @@ struct Row {
 }
 
 impl Component for Row {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let on = self.on.get();
         let toggle = self.on;
         hstack!(
@@ -119,7 +119,7 @@ struct Table {
 }
 
 impl Component for Table {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let count = if self.filtered.get() { FILTERED } else { ROWS };
         let toggles = self.toggles.clone();
         let items: Vec<usize> = (0..count).collect();

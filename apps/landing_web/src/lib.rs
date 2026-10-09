@@ -290,8 +290,8 @@ struct Landing {
 }
 
 impl Component for Landing {
-    fn body(self, ctx: &Context) -> impl View {
-        let shape = Shape::of(ctx.environment::<Viewport>().width.max(320.0));
+    fn body(self) -> impl View {
+        let shape = Shape::of(environment::<Viewport>().width.max(320.0));
         scroll(
             vstack!(
                 hero(shape, self.texture.clone()),

@@ -36,7 +36,7 @@ struct Store {
 }
 
 impl Component for Store {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let clear = self.clone();
         let again = self.clone();
         vstack!(

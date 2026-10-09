@@ -15,7 +15,7 @@ struct Editor {
 }
 
 impl Component for Editor {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         text_editor("", self.text.binding())
             .font_family(FONT_FAMILY)
             .font_size(13.0)

@@ -2567,7 +2567,7 @@ mod tests {
         struct Row(Item);
 
         impl Component for Row {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text(format!("row {} seen {}", self.0.id, self.0.seen.get()))
             }
         }
@@ -2578,7 +2578,7 @@ mod tests {
         }
 
         impl Component for Table {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 for_each(self.rows, |item| item.id.to_string(), |item| Row(*item))
             }
         }
@@ -2631,7 +2631,7 @@ mod tests {
         struct Tall;
 
         impl Component for Tall {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 spacer()
             }
         }
@@ -2641,7 +2641,7 @@ mod tests {
         struct Short(usize);
 
         impl Component for Short {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text(format!("row {}", self.0))
             }
         }
@@ -2653,7 +2653,7 @@ mod tests {
         }
 
         impl Component for Column {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let tall = self.tall;
                 for_each(self.ids, |id| id.to_string(), move |id| if tall { Either::First(Tall) } else { Either::Second(Short(*id)) })
             }
@@ -2688,7 +2688,7 @@ mod tests {
         struct Row(usize);
 
         impl Component for Row {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text(format!("row {}", self.0))
             }
         }
@@ -2699,7 +2699,7 @@ mod tests {
         }
 
         impl Component for Table {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 for_each(self.rows, |id| id.to_string(), |id| {
                     Row(*id).element("tr").css_class("row")
                 })
@@ -2754,7 +2754,7 @@ mod tests {
         }
 
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text(format!("count {}", self.count.get()))
             }
         }
@@ -2796,7 +2796,7 @@ mod tests {
         struct Card;
 
         impl Component for Card {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(
                     text("above the island"),
                     spacer()
