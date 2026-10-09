@@ -86,7 +86,14 @@ Initializer arguments seed the first mount. Use a new view identity to recreate
 a model for a different document or account within the same root or window
 scene (`Runtime::scene`). Work attached with `.task` still
 belongs to the view and is cancelled by unmounting; the ViewModel introduces no
-executor. A model created explicitly outside rendering follows `State`'s
+executor. `.task(async move || { ... })` can borrow its owned captures across
+await. The running task keeps its factory alive until completion or cancellation;
+no `Clone` or `Send` bound is required. `.task_id` restarts only when its id changes.
+The earlier `move || async move { ... }` syntax remains valid. Generic helpers
+forwarding a task factory now declare `F: AsyncFn() + 'static` rather than
+separate `Fn() -> Fut` and `Future` bounds.
+
+A model created explicitly outside rendering follows `State`'s
 application lifetime, so that construction is for app-owned state, not rows.
 
 `derived` declares a read-only computation. Reads subscribe wherever the derived
