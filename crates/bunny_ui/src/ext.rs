@@ -1309,12 +1309,12 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// and is CANCELLED when the view leaves the tree.
     ///
     /// The framework opens no file and no socket: the task is where the
-    /// app does that. What the future needs to own it creates inside
-    /// itself, which is what lets the closure stay `Fn` (and a
-    /// [`ViewExt::task_id`] restart possible):
+    /// app does that. Async closures may borrow their owned captures
+    /// across an await; the running task keeps the factory alive.
+    /// Ordinary closures returning futures remain supported too:
     ///
     /// ```ignore
-    /// row.task(move || async move {
+    /// row.task(async move || {
     ///     let (lines, reader) = task::channel();
     ///     std::thread::spawn(move || read_the_log(lines));
     ///     while let Some(line) = reader.recv().await {
@@ -1326,11 +1326,14 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// Cancelling drops the future where it stands: the reader dies,
     /// the worker's next `send` answers `Err`, and that is the signal
     /// to stop working.
+    ///
+    /// Generic forwarding helpers use `F: AsyncFn() + 'static`. A bound
+    /// written only as `F: Fn() -> Fut` does not imply `AsyncFn` for an
+    /// arbitrary type; concrete closures returning futures support both.
     #[track_caller]
-    fn task<F, Fut>(self, start: F) -> Modified<Self>
+    fn task<F>(self, start: F) -> Modified<Self>
     where
-        F: Fn() -> Fut + 'static,
-        Fut: std::future::Future<Output = ()> + 'static,
+        F: AsyncFn() + 'static,
     {
         self.task_keyed(Location::caller(), None, start)
     }
@@ -1338,26 +1341,24 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// `.task(id:) { await … }` — the same, plus a restart: an `id`
     /// that moves cancels what runs and starts the work again.
     #[track_caller]
-    fn task_id<I, F, Fut>(self, id: I, start: F) -> Modified<Self>
+    fn task_id<I, F>(self, id: I, start: F) -> Modified<Self>
     where
         I: std::fmt::Display,
-        F: Fn() -> Fut + 'static,
-        Fut: std::future::Future<Output = ()> + 'static,
+        F: AsyncFn() + 'static,
     {
         self.task_keyed(Location::caller(), Some(id.to_string()), start)
     }
 
     /// `.task` with an explicit site — same case as
     /// [`ViewExt::on_change_keyed`].
-    fn task_keyed<F, Fut>(
+    fn task_keyed<F>(
         self,
         site: impl Into<Site>,
         id: Option<String>,
         start: F,
     ) -> Modified<Self>
     where
-        F: Fn() -> Fut + 'static,
-        Fut: std::future::Future<Output = ()> + 'static,
+        F: AsyncFn() + 'static,
     {
         Modified {
             base: self,

@@ -123,7 +123,7 @@ A view can own asynchronous work. `.task` starts it on the view's first
 appearance and ends it when the view leaves the tree.
 
 ```rust
-row.task(move || async move {
+row.task(async move || {
     let (lines, reader) = task::channel();
     std::thread::spawn(move || read_the_log(lines));
     while let Some(line) = reader.recv().await {
@@ -131,6 +131,10 @@ row.task(move || async move {
     }
 })
 ```
+
+Tasks accept async closures that borrow their owned captures across `.await`.
+The running task keeps those captures alive. Ordinary `move || async move { … }`
+factories remain supported, with the same identity and cancellation behavior.
 
 The framework reads no file and opens no socket. The application does
 that on its own thread — or through its own browser callback — and
