@@ -89,12 +89,14 @@ impl View for Text {
     }
 }
 
-/// `Text` takes anything that becomes an `Arc<str>`: a literal or a
-/// `String` pay ONE allocation here, and an `Arc<str>` handed in (a row
-/// model that shares its strings) pays NOTHING — the body of a list
-/// clones pointers, not bytes.
-pub fn text(string: impl Into<Arc<str>>) -> Text {
-    Text(crate::bind::TextSource::Fixed(string.into()))
+/// Displays fixed text or a reactive state/binding. Reactive inputs read at
+/// the text node, so changing them does not rerun the component body.
+/// An eager `text(state.get())` instead reads the snapshot in the body.
+#[track_caller]
+pub fn text(value: impl crate::text_value::IntoText) -> Text {
+    let text = value.into_text();
+    crate::diagnostics::text(&text.0);
+    text
 }
 
 /// A text that reads for itself. The closure is the NODE's: it runs
@@ -2700,7 +2702,7 @@ where
 {
     const KEYED_LIST: bool = true;
 
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         KeyedRows(self.0)
     }
 }
@@ -3141,7 +3143,7 @@ mod once_per_key_tests {
     struct Inner;
 
     impl Component for Inner {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let taps = State::new(0usize);
             INNER.with(|inner| inner.borrow_mut().push(taps));
             text(format!("taps {}", taps.get()))
@@ -3156,7 +3158,7 @@ mod once_per_key_tests {
     }
 
     impl Component for Line {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             // state of the row's own, born in its body: it anchors at the
             // row's own scope
             let own = State::new(0usize);
@@ -3189,7 +3191,7 @@ mod once_per_key_tests {
     }
 
     impl Component for Page {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let (built, marks) = (self.built.clone(), self.marks.clone());
             let line = move |item: &Item| {
                 built.set(built.get() + 1);
@@ -3430,7 +3432,7 @@ mod once_per_key_tests {
     }
 
     impl Component for Reshaped {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let row = |item: &Item| vstack(Line { item: *item, mark: State::new(item.id * 10) });
             let stand = self.stand.get();
             let list = for_each(self.items, |item| item.id.to_string(), row);

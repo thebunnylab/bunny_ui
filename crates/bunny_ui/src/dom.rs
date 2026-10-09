@@ -4739,7 +4739,7 @@ mod tests {
     }
 
     impl Component for MiniList {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let count = self.count.get();
             let selected = self.selected;
             let selected_index = selected.get();
@@ -4931,7 +4931,7 @@ mod tests {
         struct Inner;
 
         impl Component for Inner {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("steady").background_color(Color::hex(0x223344))
             }
         }
@@ -4942,7 +4942,7 @@ mod tests {
         }
 
         impl Component for Outer {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(text("mover").padding_length(self.gap.get()), Inner)
             }
         }
@@ -5010,7 +5010,7 @@ mod tests {
             at: State<Point>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 scroll(crate::views::for_each(
                     (0..30).collect::<Vec<i32>>(),
                     |line| line.to_string(),
@@ -5057,7 +5057,7 @@ mod tests {
         struct Big;
 
         impl Component for Big {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 // the flow's one requirement: the app DECLARES the row
                 // extent (the browser owns layout; nothing measures)
                 virtual_list(10_000, |row| format!("row{row}"), |row| {
@@ -5120,7 +5120,7 @@ mod tests {
         }
 
         impl Component for WithField {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_field("type here", self.query.binding()).auto_focus()
             }
         }
@@ -5160,12 +5160,12 @@ mod tests {
         }
 
         impl Component for Note {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_editor("note", self.text.binding())
             }
         }
         impl Component for Name {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text_field("note", self.text.binding())
             }
         }
@@ -5210,7 +5210,7 @@ mod tests {
         struct Panel;
 
         impl Component for Panel {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("chrome")
                     .background_color(Color::hex(0xFFFFFF))
                     .corner_radius(12.0)
@@ -5239,7 +5239,7 @@ mod tests {
         struct Hoverable;
 
         impl Component for Hoverable {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("hi")
                     .background_color(Color::hex(0x111111))
                     .background_hovered(Color::hex(0x222222))
@@ -5265,7 +5265,7 @@ mod tests {
         struct CloseGlyph;
 
         impl Component for CloseGlyph {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("x")
                     .foreground_color(FAINT)
                     .foreground_hovered(BRIGHT)
@@ -5317,7 +5317,7 @@ mod tests {
         }
 
         impl Component for WithIsland {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(
                     text("above the island"),
                     spacer()
@@ -5387,7 +5387,7 @@ mod tests {
         struct Swatch(usize);
 
         impl Component for Swatch {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 spacer()
                     .frame(10.0 + self.0 as f64, 10.0)
                     .background_color(Color::hex(0x3B82F6))
@@ -5401,7 +5401,7 @@ mod tests {
         }
 
         impl Component for Swatches {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::views::for_each(self.ids, |id| id.to_string(), |id| Swatch(*id))
             }
         }
@@ -5442,7 +5442,7 @@ mod tests {
         }
 
         impl Component for Island {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let count = self.count;
                 crate::vstack!(
                     text("a fixed line"),
@@ -5497,7 +5497,7 @@ mod tests {
         struct WithFlexIsland;
 
         impl Component for WithFlexIsland {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(
                     text("above the island"),
                     spacer()
@@ -5555,7 +5555,7 @@ mod tests {
         }
 
         impl Component for FineIsland {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 // a label that gives way: flexible along its row, and
                 // natural against any offer
                 let label = text("abc")
@@ -5619,7 +5619,7 @@ mod tests {
         struct WithHungryIsland;
 
         impl Component for WithHungryIsland {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(text("above"), crate::custom::custom(EatsWidth))
             }
         }
@@ -5667,7 +5667,7 @@ mod tests {
         struct Chips;
 
         impl Component for Chips {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::hstack!(text("Objective D8"), text("Variables D2:D6"), text("Constraints 2"))
                     .spacing(6.0)
                     .line_spacing(4.0)
@@ -5699,7 +5699,7 @@ mod tests {
         struct Page;
 
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(
                     text("plain"),
                     text("big").font(Font::Title),
@@ -5763,7 +5763,7 @@ mod tests {
         struct Cell;
 
         impl Component for Cell {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("x").element("a").css_class("lbl")
             }
         }
@@ -5796,7 +5796,7 @@ mod tests {
         struct Link;
 
         impl Component for Link {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::hstack!(
                     crate::hstack!(crate::hstack!(empty()).element("span").css_class("glyph"))
                         .element("a"),
@@ -5847,7 +5847,7 @@ mod tests {
         struct Tables;
 
         impl Component for Tables {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let table = |class: &'static str| {
                     crate::hstack!(crate::hstack!(text("cell")).element("tbody"))
                         .element("table")
@@ -5907,7 +5907,7 @@ mod tests {
         struct Paned;
 
         impl Component for Paned {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(
                     text("toolbar"),
                     virtual_list(100, |row| format!("r{row}"), |row| {
@@ -5964,7 +5964,7 @@ mod tests {
         struct Pane;
 
         impl Component for Pane {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 use motor::views::Edge;
                 crate::vstack!(crate::vstack!(
                     crate::hstack!(text("toolbar")),
@@ -6068,7 +6068,7 @@ mod tests {
         }
 
         impl Component for WithPad {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(
                     text("above"),
                     crate::custom::custom(Pad { mark: self.mark, note: self.note })
@@ -6158,7 +6158,7 @@ mod tests {
     }
 
     impl Component for Gallery {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             image(self.source.get()).resizable().frame(24.0, 24.0)
         }
     }
@@ -6203,7 +6203,7 @@ mod tests {
     }
 
     impl Component for Sized {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             image(tiny_image(10)).resizable().frame(self.width.get(), 24.0)
         }
     }
@@ -6237,7 +6237,7 @@ mod tests {
     }
 
     impl Component for Swaps {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             if self.image_on.get() {
                 erased(image(tiny_image(10)).resizable().frame(24.0, 24.0))
             } else {
@@ -6291,7 +6291,7 @@ mod tests {
 
     #[cfg(feature = "canvas")]
     impl Component for Isle {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             image(tiny_image(200))
                 .resizable()
                 .frame(8.0, 8.0)
@@ -6335,7 +6335,7 @@ mod tests {
     }
 
     impl Component for Popped {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             crate::vstack!(
                 text("base"),
                 text("anchor").popover(self.open.binding(), crate::layout::Side::Bottom, |_| {
@@ -6419,7 +6419,7 @@ mod tests {
         #[derive(Clone)]
         struct Glow;
         impl Component for Glow {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 use crate::layout::{Gradient, UnitPoint};
                 let violet = Color::hex(0x8B5CF6);
                 spacer().frame(80.0, 40.0).background_color(Color::hex(0x101014)).background_gradient(
@@ -6778,7 +6778,7 @@ mod tests {
         struct CloseButton;
 
         impl Component for CloseButton {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 icon(MARK)
                     .foreground_color(FAINT)
                     .foreground_hovered(BRIGHT)
@@ -6829,7 +6829,7 @@ mod tests {
         }
 
         impl Component for Tinted {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 icon(MARK).foreground_color(self.ink.get())
             }
         }
@@ -6864,7 +6864,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Panel;
         impl Component for Panel {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text("hello")
                     .padding_length(10.0)
                     .corner_radius(16.0)
@@ -6934,7 +6934,7 @@ mod tests {
         }
 
         impl Component for Lamp {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let lit = self.on.get();
                 text("lamp")
                     .background_color(if lit {
@@ -7783,7 +7783,7 @@ mod tests {
         }
 
         impl Component for Follows {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let selected = self.selected.get();
                 virtual_list(1_000, |row| format!("r{row}"), |row| {
                     text(format!("item {row}"))
@@ -7818,7 +7818,7 @@ mod tests {
         }
 
         impl Component for Wordy {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let on = self.flip.get();
                 crate::vstack!(
                     text("a long paragraph that would have wrapped through the cache"),
@@ -7854,7 +7854,7 @@ mod tests {
         }
 
         impl Component for Cell {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let on = self.on.get();
                 let toggle = self.on;
                 text(if on { "on" } else { "off" })
@@ -7873,7 +7873,7 @@ mod tests {
         }
 
         impl Component for Grid {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 let cells = self.cells.clone();
                 crate::vstack!(list(
                     (0..50).collect::<Vec<_>>(),
@@ -7924,7 +7924,7 @@ mod tests {
         struct Mixed;
 
         impl Component for Mixed {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(
                     text("flow above"),
                     crate::vstack!(text("pinned"), text("exact"))
@@ -8000,7 +8000,7 @@ mod tests {
     }
 
     impl Component for Stepper {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let value = self.value;
             crate::hstack!(
                 text("-").on_click(move || value.set(value.get().saturating_sub(1))).id("less"),
@@ -8015,7 +8015,7 @@ mod tests {
     }
 
     impl Component for CounterRow {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let value = self.row.value;
             crate::hstack!(
                 text(format!("row {}", self.row.id)).on_click(move || value.set(0)).id("reset"),
@@ -8030,7 +8030,7 @@ mod tests {
     }
 
     impl Component for Counters {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             crate::vstack!(crate::views::for_each(
                 self.rows,
                 |row| row.id.to_string(),
@@ -8172,7 +8172,7 @@ mod tests {
     }
 
     impl Component for Badge {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             text(format!("badge {}", self.id)).background_color(Color::hex(0x334455))
         }
     }
@@ -8184,7 +8184,7 @@ mod tests {
     }
 
     impl Component for Badges {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let picked = self.picked;
             crate::vstack!(crate::views::for_each(
                 self.rows,
@@ -8243,7 +8243,7 @@ mod tests {
     }
 
     impl Component for Folding {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let open = self.open;
             let hits = self.hits;
             let opened = open.get();
@@ -8265,7 +8265,7 @@ mod tests {
     }
 
     impl Component for Folds {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             crate::vstack!(crate::views::for_each(self.rows, |row| row.id.to_string(), |row| *row))
         }
     }

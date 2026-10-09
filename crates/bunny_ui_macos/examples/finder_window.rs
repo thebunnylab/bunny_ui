@@ -150,7 +150,7 @@ struct Finder {
 }
 
 impl Component for Finder {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let query = self.query.get();
         let items: Vec<Row> = FILES
             .iter()

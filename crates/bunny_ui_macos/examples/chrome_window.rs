@@ -29,7 +29,7 @@ struct App {
 }
 
 impl Component for App {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let tab = self.tab;
         let active = tab.get();
         let titles = ["Code", "Pareto", "Infra", "Atrium"];

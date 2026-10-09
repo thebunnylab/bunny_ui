@@ -1052,7 +1052,7 @@ mod tests {
         #[derive(Clone)]
         struct List;
         impl Component for List {
-            fn body(self, _: &Context) -> impl View {
+            fn body(self) -> impl View {
                 vstack!(
                     text!("Records").frame_height(40.0),
                     virtual_list(

@@ -257,7 +257,7 @@ struct App {
 }
 
 impl Component for App {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let bar = hstack!(
             spacer().frame(LIGHTS_W, 1.0),
             text("sketch").bold(),

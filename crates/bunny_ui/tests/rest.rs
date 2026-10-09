@@ -77,7 +77,7 @@ struct Page {
 }
 
 impl Component for Page {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let status = self.status;
         let count = self.count;
         vstack!(

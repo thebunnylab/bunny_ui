@@ -2822,7 +2822,7 @@ mod tests {
         }
 
         impl Component for Carrier {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 if self.armed.get() {
                     Either::First(text("armed").on_action(POKE, || {}).key_context("carrier").on_appear(|| {}))
                 } else {
@@ -2838,7 +2838,7 @@ mod tests {
         }
 
         impl Component for Holder {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 if self.mounted.get() {
                     Either::First(Carrier { armed: self.armed })
                 } else {
@@ -2892,7 +2892,7 @@ mod tests {
     }
 
     impl Component for Line {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             crate::text!(self.label)
         }
     }
@@ -2904,7 +2904,7 @@ mod tests {
     }
 
     impl Component for Lines {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             crate::views::for_each(self.lines, |line| line.id.to_string(), |line| *line)
         }
     }
@@ -3022,7 +3022,7 @@ mod tests {
     }
 
     impl Component for Pressable {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let presses = self.presses;
             let words = format!("row {}", self.id);
             if self.armed {
@@ -3039,7 +3039,7 @@ mod tests {
     }
 
     impl Component for Pressables {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             crate::views::for_each(self.rows, |row| row.id.to_string(), |row| *row)
         }
     }
@@ -3190,7 +3190,7 @@ mod tests {
         struct Note(&'static str);
 
         impl Component for Note {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text(self.0)
             }
         }
@@ -3199,7 +3199,7 @@ mod tests {
         struct Footer;
 
         impl Component for Footer {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(Note("first"), Note("second"), Note("third"), Note("fourth"))
             }
         }
@@ -3210,7 +3210,7 @@ mod tests {
         }
 
         impl Component for Framed {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::vstack!(Note("head"), Lines { lines: self.lines }, Footer)
             }
         }
@@ -3321,7 +3321,7 @@ mod tests {
     }
 
     impl Component for ReadingLine {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             text(self.label.get().to_string())
         }
     }
@@ -3332,7 +3332,7 @@ mod tests {
     }
 
     impl Component for ReadingLines {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             crate::views::for_each(self.lines, |line| line.id.to_string(), |line| *line)
         }
     }
@@ -3379,7 +3379,7 @@ mod tests {
     }
 
     impl Component for Holder {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             (text(format!("holder {}", self.id)), Tap { id: self.id, counts: self.counts })
         }
     }
@@ -3392,7 +3392,7 @@ mod tests {
     }
 
     impl Component for Tap {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let taps = State::new(0usize);
             self.counts.borrow_mut().insert((self.id, 1), taps);
             (text(format!("taps {} {}", self.id, taps.get())), Deep { id: self.id, counts: self.counts })
@@ -3406,7 +3406,7 @@ mod tests {
     }
 
     impl Component for Deep {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let deep = State::new(0usize);
             self.counts.borrow_mut().insert((self.id, 2), deep);
             text(format!("deep {} {}", self.id, deep.get()))
@@ -3421,7 +3421,7 @@ mod tests {
     }
 
     impl Component for Holders {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let counts = self.counts;
             let row = move |id: &usize| Holder { id: *id, counts: counts.clone() };
             let list = crate::views::for_each(self.ids, |id| id.to_string(), row);
@@ -3491,7 +3491,7 @@ mod tests {
         }
 
         impl Component for Leaf {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 text(self.word.to_string())
             }
         }
@@ -3502,7 +3502,7 @@ mod tests {
         }
 
         impl Component for Row {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 Leaf { word: Rc::clone(&self.key) }
             }
         }
@@ -3513,7 +3513,7 @@ mod tests {
         }
 
         impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::views::for_each(self.keys, |key| key.to_string(), |key| Row { key: Rc::clone(key) })
             }
         }
@@ -3609,7 +3609,7 @@ mod tests {
         }
 
         impl Component for Toggle {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 TOGGLE_RUNS.with(|runs| runs.set(runs.get() + 1));
                 if self.on.get() { Either::First(text("on")) } else { Either::Second(text("off")) }
             }
@@ -3621,7 +3621,7 @@ mod tests {
         }
 
         impl Component for Toggles {
-            fn body(self, _ctx: &Context) -> impl View {
+            fn body(self) -> impl View {
                 crate::views::for_each(self.toggles, |toggle| toggle.id.to_string(), |toggle| toggle.element("tr"))
             }
         }

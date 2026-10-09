@@ -493,6 +493,41 @@ impl Context {
     }
 }
 
+thread_local! {
+    static BODY_ENVIRONMENT: RefCell<Option<Rc<EnvironmentValues>>> = const { RefCell::new(None) };
+}
+
+/// Reads the environment of the component whose body is running.
+///
+/// Call this in a component body or a helper called by that body. Capture
+/// the returned value when an event or asynchronous task needs it later.
+///
+/// # Panics
+/// Panics outside a component body; no implicit default environment exists.
+pub fn environment<T: FromEnvironment>() -> T {
+    let values = BODY_ENVIRONMENT.with(|current| current.borrow().clone())
+        .expect("environment() must be called inside a component body; capture the value for callbacks");
+    T::from_environment(&values)
+}
+
+/// Runs a component body in its inherited environment and restores the
+/// enclosing scope, including when the body unwinds.
+#[doc(hidden)]
+pub fn with_environment<R>(ctx: &Context, body: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Rc<EnvironmentValues>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BODY_ENVIRONMENT.with(|current| {
+                current.replace(self.0.take());
+            });
+        }
+    }
+    let _restore = Restore(
+        BODY_ENVIRONMENT.with(|current| current.replace(Some(Rc::clone(&ctx.values)))),
+    );
+    body()
+}
+
 /// `@Environment(\.key) var x: T` — resolvable from `EnvironmentValues`.
 pub trait FromEnvironment: Clone + 'static {
     fn from_environment(values: &EnvironmentValues) -> Self;
@@ -1087,6 +1122,36 @@ pub trait ProvidesQueries {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_environment_restores_nested_scopes_even_after_unwind() {
+        let outer = Context {
+            values: Rc::new(EnvironmentValues {
+                locale: Locale::new("pt-BR"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let inner = Context {
+            values: Rc::new(EnvironmentValues {
+                locale: Locale::new("ja"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        with_environment(&outer, || {
+            assert_eq!(environment::<Locale>().identifier(), "pt-BR");
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_environment(&inner, || {
+                    assert_eq!(environment::<Locale>().identifier(), "ja");
+                    panic!("a component failed");
+                });
+            }));
+            assert!(panic.is_err());
+            assert_eq!(environment::<Locale>().identifier(), "pt-BR");
+        });
+        assert!(std::panic::catch_unwind(environment::<Locale>).is_err());
+    }
 
     #[test]
     fn a_state_binding_lends_its_value_and_a_made_one_reads_it() {
