@@ -1,0 +1,33 @@
+{
+  "unicode": "17.0.0",
+  "uax29_revision": 47,
+  "inputs": [
+    {
+      "file": "GraphemeBreakProperty.txt",
+      "url": "https://www.unicode.org/Public/17.0.0/ucd/auxiliary/GraphemeBreakProperty.txt",
+      "blake3": "b0026f943842859a79f3192c4b03c73a92a061f5c7031947ee4dda17273cf113"
+    },
+    {
+      "file": "emoji-data.txt",
+      "url": "https://www.unicode.org/Public/17.0.0/ucd/emoji/emoji-data.txt",
+      "blake3": "fe16b280dcc1ad46f115b908be5ac10db66fa6e5bbf837d959ad96913a3072ee"
+    },
+    {
+      "file": "DerivedCoreProperties.txt",
+      "url": "https://www.unicode.org/Public/17.0.0/ucd/DerivedCoreProperties.txt",
+      "blake3": "3ea24708eced3bc41de5487afa98a45160dcebafb5ca315469ec8502efd2ffbe"
+    }
+  ],
+  "fixtures": [
+    {
+      "file": "crates/bunny_ui/tests/data/unicode-17.0.0/GraphemeBreakTest.txt",
+      "url": "https://www.unicode.org/Public/17.0.0/ucd/auxiliary/GraphemeBreakTest.txt",
+      "blake3": "93998269cbf8cc29067b885d1b64fdbaeb5df43dd188f8cec849dfb723c80dad"
+    },
+    {
+      "file": "crates/bunny_ui/tests/data/unicode-17.0.0/LICENSE.txt",
+      "url": "https://www.unicode.org/license.txt",
+      "blake3": "0ff003f636c91e2d6a41461efa6c561db32aa656b971a4bb417a34af910e2bb7"
+    }
+  ]
+}
