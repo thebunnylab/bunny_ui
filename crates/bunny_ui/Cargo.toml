@@ -1,13 +1,11 @@
 [package]
-name = "bunny-ui"
-version = "0.1.0"
+name = "bunny-ui-core"
+version.workspace = true
 edition.workspace = true
-description = "Declarative UI in Rust with a SwiftUI spirit — monomorphic typed tree, state with structural identity, incremental reconciliation"
+description = "The core of bunny-ui — monomorphic typed tree, state with structural identity, incremental reconciliation. Applications add `bunny-ui`, which re-exports it with the platform shell"
 license-file.workspace = true
 repository.workspace = true
 readme = "../../README.md"
-keywords = ["ui", "gui", "declarative", "reactive", "swiftui"]
-categories = ["gui"]
 
 [features]
 default = ["canvas"]

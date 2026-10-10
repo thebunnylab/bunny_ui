@@ -1,0 +1,67 @@
+[package]
+name = "bunny-ui"
+version.workspace = true
+edition.workspace = true
+description = "Declarative UI in Rust with fine-grained reactivity, inspired by SwiftUI — one crate, with the native shell of the target it compiles for"
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["ui", "gui", "declarative", "reactive", "swiftui"]
+categories = ["gui"]
+
+[features]
+default = ["shell", "canvas"]
+# The shell of the target: macOS, iOS, Windows, Linux, Android or the
+# web, behind `run_window` and `platform`. Off for a crate that only
+# builds views — a component library, a theme — and leaves the window
+# to the application.
+shell = [
+    "dep:bunny-ui-macos",
+    "dep:bunny-ui-ios",
+    "dep:bunny-ui-windows",
+    "dep:bunny-ui-linux",
+    "dep:bunny-ui-android",
+    "dep:bunny-ui-web",
+]
+# The core's own features, passed through (see bunny-ui-core).
+canvas = ["bunny-ui-core/canvas"]
+svg = ["bunny-ui-core/svg"]
+gpu = ["bunny-ui-core/gpu"]
+codec = ["bunny-ui-core/codec"]
+
+[dependencies]
+bunny-ui-core.workspace = true
+
+# The target picks the shell; the application never names one.
+[target.'cfg(target_os = "macos")'.dependencies]
+bunny-ui-macos = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+bunny-ui-ios = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+bunny-ui-windows = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bunny-ui-linux = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+bunny-ui-android = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bunny-ui-web = { workspace = true, optional = true }
+
+[[example]]
+name = "counter"
+required-features = ["shell"]
+
+# One page per platform, each with the shell that target compiles.
+[package.metadata.docs.rs]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-ios",
+    "aarch64-linux-android",
+    "wasm32-unknown-unknown",
+]

@@ -2,6 +2,8 @@
 //! with it, and both lanes keep their place in the tree — the lane that
 //! stays is the same lane before, during and after, and the one that
 //! returns comes back to its own path.
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use bunny_ui::layout::{Proposal, Size};
 use bunny_ui::prelude::*;
 use bunny_ui::runtime::Runtime;

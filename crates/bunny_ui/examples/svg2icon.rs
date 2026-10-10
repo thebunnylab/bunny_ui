@@ -2,13 +2,15 @@
 //! const source to paste into your app.
 //!
 //! ```sh
-//! cargo run -p bunny-ui --features svg --example svg2icon -- icons/*.svg
+//! cargo run -p bunny-ui-core --features svg --example svg2icon -- icons/*.svg
 //! ```
 //!
 //! Each file becomes one `Symbol` const named after the file stem
 //! (`chevron-down.svg` → `CHEVRON_DOWN`, name `"chevron.down"`),
 //! normalized onto the house 24 grid. Notes about collapsed colors
 //! print as comments — a clean file converts silently.
+
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
 
 #[cfg(feature = "svg")]
 fn main() {

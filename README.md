@@ -16,9 +16,25 @@ its label without rerunning the component body.
 - **Scoped work:** views can own state and asynchronous tasks, with cleanup when
   their mounted identity leaves the tree.
 
+## Install
+
+```bash
+cargo add bunny-ui
+```
+
+`bunny-ui` is the one crate an application adds: the core and the shell of the
+target it compiles for — macOS, iOS, Windows, Linux, Android or the web — with
+nothing to pick by hand. A crate that only builds views, such as a component
+library or a theme, leaves the shell to the application:
+
+```toml
+bunny-ui = { version = "0.2", default-features = false }
+```
+
 ## Quick look
 
 ```rust
+use bunny_ui::layout::Size;
 use bunny_ui::prelude::*;
 
 #[derive(Clone, Copy)]
@@ -34,11 +50,18 @@ impl Component for Counter {
         )
     }
 }
+
+fn main() {
+    let counter = Counter { count: State::new(0) };
+    bunny_ui::run_window("Counter", Size { width: 280.0, height: 180.0 }, counter);
+}
 ```
 
 The text node records the read. A tap changes the state and updates that node
 without running the component body again. `text(self.count)` also binds directly;
-`text!("Count: {}", self.count)` adds formatting.
+`text!("Count: {}", self.count)` adds formatting. The same `main` opens a native
+window on macOS, iOS, Windows, Linux and Android; the web starts from the page
+(`bunny_ui::platform::start`).
 
 ## Signals and subscriptions
 
@@ -113,8 +136,8 @@ change its lifetime. The [MVVM guide](docs/mvvm.md) explains both forms, derived
 properties and two-way editing. Run the complete examples without a window:
 
 ```bash
-cargo run -p bunny-ui --example counter_mvvm
-cargo run -p bunny-ui --example profile_mvvm
+cargo run -p bunny-ui-core --example counter_mvvm
+cargo run -p bunny-ui-core --example profile_mvvm
 ```
 
 ## Work that waits
@@ -247,7 +270,7 @@ Sixteen symbols ship with the framework (`bunny_ui::symbol`). An app
 converts its own icon files offline:
 
 ```bash
-cargo run -p bunny-ui --features svg --example svg2icon -- icons/*.svg
+cargo run -p bunny-ui-core --features svg --example svg2icon -- icons/*.svg
 ```
 
 The tool prints Rust const data to paste into the app — the default
@@ -276,11 +299,15 @@ cargo test
 cargo test --features svg   # the icon converter's parser rides the flag
 ```
 
+The core lives in `crates/bunny_ui` and publishes as `bunny-ui-core`;
+`crates/bunny_ui_facade` publishes as `bunny-ui`, the crate an application
+adds. Each platform shell is its own crate, and the facade picks it by target.
+
 ## Demos
 
 ```bash
-cargo run -p bunny-ui --example counter_headless
-cargo run -p bunny-ui-macos --example counter_window
+cargo run -p bunny-ui-core --example counter_headless
+cargo run -p bunny-ui --example counter
 cargo run -p bunny-ui-macos --example git_window
 cargo run -p bunny-ui-macos --example sketch_window
 cargo run -p bunny-ui-macos --example icon_window
@@ -290,7 +317,7 @@ crates/bunny_ui_android/android/run-emu.sh touch_window_android
 cargo run -p bunny-ui-linux --example browser_window_linux
 ```
 
-The first demo prints a small interface to the terminal. The second opens a native macOS window. The third reads this repository's own `git log` from a worker thread and fills the window while it scrolls. The fourth is one box the application owns: it draws its own ink with the pointer, sizes its brush with the wheel, and types into a caption of its own — composition included. The fifth shows the sixteen house glyphs across fonts and inks. The sixth prints a full sample application. The seventh runs on the iOS Simulator: a list that pans and flings, a field that raises the keyboard, a canvas that draws under one finger and zooms under two (`docs/ios.md`). The eighth is the same screen on the Android emulator, presented by Vulkan (`docs/android.md`). The last one opens a web page on Linux — WPE WebKit held as one box of the scene, its pixels painted by the shell itself (`docs/linux.md`, `docs/webview.md`).
+The first demo prints a small interface to the terminal. The second opens the same counter in a native window, on whichever desktop runs it. The third reads this repository's own `git log` from a worker thread and fills the window while it scrolls. The fourth is one box the application owns: it draws its own ink with the pointer, sizes its brush with the wheel, and types into a caption of its own — composition included. The fifth shows the sixteen house glyphs across fonts and inks. The sixth prints a full sample application. The seventh runs on the iOS Simulator: a list that pans and flings, a field that raises the keyboard, a canvas that draws under one finger and zooms under two (`docs/ios.md`). The eighth is the same screen on the Android emulator, presented by Vulkan (`docs/android.md`). The last one opens a web page on Linux — WPE WebKit held as one box of the scene, its pixels painted by the shell itself (`docs/linux.md`, `docs/webview.md`).
 
 ## Design rules
 

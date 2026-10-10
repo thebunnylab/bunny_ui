@@ -15,6 +15,8 @@
 //! at what the path costs today: going under it is progress, going over
 //! it is the regression these tests are for.
 
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::rc::Rc;
