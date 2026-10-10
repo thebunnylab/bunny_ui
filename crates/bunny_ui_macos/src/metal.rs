@@ -219,12 +219,13 @@ pub(crate) fn arm_transaction_view(view: Id, live: bool) {
     });
 }
 
-/// Arms (or disarms) the layer's transactional present, from AppKit's
+/// Requires the layer's transactional present, from AppKit's
 /// own word that a drag is starting. It arrives BEFORE the first
 /// resized frame, which is the only moment early enough: by the time a
 /// frame observes `inLiveResize` the window has already grown, and a
 /// drawable of the old size stretched to the new bounds is what the
-/// eye reads as the whole UI drawn twice.
+/// eye reads as the whole UI drawn twice. After the drag, the layer retains
+/// its contract so a pending transaction cannot lose its drawable.
 pub(crate) fn arm_transaction(live: bool) {
     PRESENTER.with(|slot| {
         if let Some(presenter) = slot.borrow_mut().as_mut() {
