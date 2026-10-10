@@ -14,6 +14,10 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
+#[path = "accessibility.rs"]
+mod accessibility;
+pub(crate) use accessibility::{Accessibility, Request as AccessibilityRequest};
+
 // MARK: - Win32 ABI surface (the platform headers, transcribed)
 
 pub type Hwnd = isize;
@@ -644,6 +648,10 @@ pub(crate) fn com_init() {
 /// beats to each of them.
 #[derive(Clone)]
 pub enum AppEvent {
+    /// First UIA query enables semantic collection.
+    AccessibilityEnable,
+    /// A validated COM request returns to the scene thread.
+    AccessibilityRequest(AccessibilityRequest),
     MouseDown { x: f64, y: f64, clicks: u8, modifiers: bunny_ui::action::Modifiers },
     /// The right button: the context-menu press.
     RightMouseDown { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
@@ -2127,6 +2135,9 @@ fn wheel_lines() -> f64 {
 
 unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize {
     match msg {
+        0x003D => accessibility::get_object(hwnd, wparam, lparam)
+            .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }),
+        accessibility::MESSAGE => { accessibility::drain(hwnd); 0 }
         WM_CREATE => 0,
         WM_SIZE => {
             // ONLY a top-level window has a size of its own: a panel is
@@ -2772,6 +2783,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_DESTROY => {
+            accessibility::destroy(hwnd);
             BACKING.with(|stores| {
                 if let Some(mut backing) = stores.borrow_mut().remove(&hwnd) {
                     backing.release();

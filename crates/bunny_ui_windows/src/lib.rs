@@ -505,6 +505,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let surface: Rc<RefCell<Option<(bunny_ui::raster::Surface, usize, bunny_ui::layout::Color)>>> =
         Rc::new(RefCell::new(None));
     // the open popovers' panels, pooled by identity path
+    let accessibility = Rc::new(ffi::Accessibility::new(window));
     let panels: Rc<RefCell<std::collections::HashMap<String, ffi::WindowHandle>>> =
         Rc::new(RefCell::new(std::collections::HashMap::new()));
     // The scene a popover's MATERIAL samples, kept per panel beside the base
@@ -1010,7 +1011,27 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
         }
     });
+    // Semantics follow every pixel path, including retained GPU early returns.
+    let present = Rc::new({
+        let paint = present;
+        let accessibility = Rc::clone(&accessibility);
+        let panels = Rc::clone(&panels);
+        let dialogs = Rc::clone(&dialogs);
+        move |runtime: &Runtime, display| {
+            paint(runtime, display);
+            let surfaces: Vec<_> = {
+                let panels = panels.borrow();
+                let dialogs = dialogs.borrow();
+                runtime.overlays().iter().filter_map(|overlay| {
+                    panels.get(&overlay.path).or_else(|| dialogs.get(&overlay.path))
+                        .map(|handle| (overlay.path.clone(), *handle))
+                }).collect()
+            };
+            accessibility.update(runtime, window, &surfaces);
+        }
+    });
     let blit = {
+        let accessibility = Rc::clone(&accessibility);
         let present = Rc::clone(&present);
         move |runtime: &Runtime, root: &_| {
             // A dialog's close button is the reader asking the SCENE to close,
@@ -1055,6 +1076,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     size: Size { width: w, height: h },
                 },
             ));
+            if accessibility.requested() { runtime.set_accessibility_enabled(true); }
             let display = runtime.display_frame(root, Size { width, height });
             present(runtime, display);
             let interaction = runtime.interaction();
@@ -1298,6 +1320,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         let runtime = &handler_runtime;
         let root = &*handler_root;
         match event {
+            AppEvent::AccessibilityEnable => {
+                runtime.set_accessibility_enabled(true);
+                blit(runtime, root);
+            }
+            AppEvent::AccessibilityRequest(request) => {
+                if request.apply(runtime) { blit(runtime, root); }
+            }
             // Redraw is NEVER gated — it IS the resize presenter, and
             // holding it back leaves the compositor stretching a stale
             // frame. A worker's wake mid-drag polls on the next turn
