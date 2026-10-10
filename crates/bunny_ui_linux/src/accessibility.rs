@@ -276,6 +276,10 @@ impl Accessibility {
         let old = self.entries.take();
         if let Some(service) = &self.service {
             service.changed(&old, &[]);
+            service
+                .windows
+                .borrow_mut()
+                .retain(|owner| !std::ptr::eq(owner.as_ptr(), self));
         }
     }
 }
@@ -293,6 +297,7 @@ struct Service {
     parent: RefCell<Value>,
     id: Cell<i32>,
     connected: Cell<bool>,
+    root_children: RefCell<Vec<String>>,
 }
 impl Service {
     fn new() -> Result<Rc<Self>, String> {
@@ -316,6 +321,7 @@ impl Service {
             parent: RefCell::new(Value::reference("org.a11y.atspi.Registry", ROOT)),
             id: Cell::new(0),
             connected: Cell::new(true),
+            root_children: RefCell::new(Vec::new()),
         }))
     }
     fn live(&self) -> Vec<Rc<Accessibility>> {
@@ -371,14 +377,6 @@ impl Service {
                         1,
                         0,
                         Value::I32(0),
-                    );
-                    self.event(
-                        &previous.parent,
-                        c"ChildrenChanged",
-                        "remove",
-                        child_index(old, previous),
-                        0,
-                        self.reference(&previous.path),
                     );
                 }
                 Some(current) => {
@@ -437,17 +435,38 @@ impl Service {
                 }
             }
         }
-        for current in new
+        let roots = self.children(None);
+        let prior_roots = self.root_children.replace(roots.clone());
+        self.children_changed(ROOT, &prior_roots, &roots);
+        for parent in old
             .iter()
-            .filter(|entry| !old.iter().any(|previous| previous.path == entry.path))
+            .chain(new)
+            .filter(|entry| !matches!(entry.kind, Kind::Control(_)))
         {
+            if old.iter().any(|entry| std::ptr::eq(entry, parent))
+                || !old.iter().any(|entry| entry.path == parent.path)
+            {
+                let previous = old
+                    .iter()
+                    .find(|entry| entry.path == parent.path)
+                    .map_or(&[][..], |entry| entry.children.as_slice());
+                let current = new
+                    .iter()
+                    .find(|entry| entry.path == parent.path)
+                    .map_or(&[][..], |entry| entry.children.as_slice());
+                self.children_changed(&parent.path, previous, current);
+            }
+        }
+    }
+    fn children_changed(&self, parent: &str, old: &[String], new: &[String]) {
+        for edit in child_edits(old, new) {
             self.event(
-                &current.parent,
+                parent,
                 c"ChildrenChanged",
-                "add",
-                child_index(new, current),
+                if edit.add { "add" } else { "remove" },
+                edit.index as i32,
                 0,
-                self.reference(&current.path),
+                self.reference(&edit.path),
             );
         }
     }
@@ -486,6 +505,14 @@ impl Service {
                     Ok(reply)
                 }),
                 Err(failure) => {
+                    if std::env::var_os("BUNNY_ATSPI_TRACE").is_some() {
+                        eprintln!(
+                            "AT-SPI rejected {} {}.{}: {failure:?}",
+                            message.path(),
+                            message.interface(),
+                            message.member()
+                        );
+                    }
                     let (name, text) = failure.details();
                     message.error(name, text)
                 }
@@ -578,9 +605,14 @@ impl Service {
             owner
                 .runtime
                 .accessibility_action(node.id, action)
-                .map_err(|error| match error {
-                    bunny_ui::accessibility::ActionError::Unavailable => Failure::Unavailable,
-                    bunny_ui::accessibility::ActionError::Unsupported => Failure::Unsupported,
+                .map_err(|error| {
+                    if std::env::var_os("BUNNY_ATSPI_TRACE").is_some() {
+                        eprintln!("AT-SPI runtime refused {}: {error}", node.id.get());
+                    }
+                    match error {
+                        bunny_ui::accessibility::ActionError::Unavailable => Failure::Unavailable,
+                        bunny_ui::accessibility::ActionError::Unsupported => Failure::Unsupported,
+                    }
                 })?;
             owner.redraw();
             Ok(vec![Value::Bool(true)])
@@ -785,6 +817,51 @@ impl Service {
     }
 }
 
+struct ChildEdit {
+    add: bool,
+    index: usize,
+    path: String,
+}
+
+/// Apply removals and moves to the client's prior child order. A move never
+/// retires the object: only its position changes, preserving native identity.
+fn child_edits(old: &[String], new: &[String]) -> Vec<ChildEdit> {
+    if old == new {
+        return Vec::new();
+    }
+    let wanted: std::collections::HashSet<&str> = new.iter().map(String::as_str).collect();
+    let mut current = old.to_vec();
+    let mut edits = Vec::new();
+    for index in (0..current.len()).rev() {
+        if !wanted.contains(current[index].as_str()) {
+            edits.push(ChildEdit {
+                add: false,
+                index,
+                path: current.remove(index),
+            });
+        }
+    }
+    for (index, path) in new.iter().enumerate() {
+        if current.get(index) == Some(path) {
+            continue;
+        }
+        if let Some(previous) = current.iter().position(|candidate| candidate == path) {
+            edits.push(ChildEdit {
+                add: false,
+                index: previous,
+                path: current.remove(previous),
+            });
+        }
+        current.insert(index, path.clone());
+        edits.push(ChildEdit {
+            add: true,
+            index,
+            path: path.clone(),
+        });
+    }
+    edits
+}
+
 fn child_index(entries: &[Entry], entry: &Entry) -> i32 {
     entries
         .iter()
@@ -904,6 +981,21 @@ mod tests {
         for (start, end) in [(-1, 0), (3, 2), (0, 6)] {
             assert_eq!(text_range("a👩‍🚀z", start, end), Err(Failure::Arguments));
         }
+    }
+    #[test]
+    fn child_events_preserve_order_through_moves_removals_and_insertions() {
+        let old = ["main", "one", "two", "keeper"].map(str::to_owned).to_vec();
+        let new = ["keeper", "main", "new", "two"].map(str::to_owned).to_vec();
+        let mut replay = old.clone();
+        for edit in child_edits(&old, &new) {
+            if edit.add {
+                replay.insert(edit.index, edit.path);
+            } else {
+                assert_eq!(replay.remove(edit.index), edit.path);
+            }
+        }
+        assert_eq!(replay, new);
+        assert!(child_edits(&new, &new).is_empty());
     }
     #[test]
     fn hit_testing_is_half_open_and_does_not_overflow() {

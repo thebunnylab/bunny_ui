@@ -35,6 +35,7 @@ fn main() {
                 }),
                 button(text("Open modal"), move || self.modal.set(true)),
                 button(text("Remove row"), move || self.rows.set(vec![1])),
+                button(text("Reverse rows"), move || self.rows.set(vec![2, 1])),
                 button(text("Close form"), move || (self.close)()),
                 for_each(
                     self.rows,

@@ -60,6 +60,12 @@ try:
     assert Atspi.Text.get_text(field, 0, -1) == "Lunch"
     print("AT-SPI discovery: Description, ENTRY, Lunch", flush=True)
     identity = field.get_accessible_id()
+    form_root = field.get_parent()
+    app_root = field.get_application()
+    assert app_root.get_child_at_index(0).get_name() == "Bunny AT-SPI witness"
+    assert app_root.get_child_at_index(1).get_name() == "AT-SPI keeper"
+    assert form_root.get_index_in_parent() == 0
+    assert app_root.get_child_at_index(1).get_index_in_parent() == 1
     session = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     address = session.call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress",
                                 None, None, Gio.DBusCallFlags.NONE, 3000, None).unpack()[0]
@@ -122,6 +128,10 @@ try:
 
     stale = named("Row 2")
     stale_path = stale.get_accessible_id()
+    assert named("Reverse rows").get_action_iface().do_action(0)
+    order = [node.get_name() for node in descendants(form_root)]
+    assert order.index("Row 2") < order.index("Row 1")
+    assert named("Row 2").get_accessible_id() == stale_path
     assert named("Remove row").get_action_iface().do_action(0)
     unavailable(lambda: Atspi.Action.do_action(stale, 0))
     wire_unavailable(stale_path, "org.a11y.atspi.Action", "DoAction", GLib.Variant("(i)", (0,)))
@@ -134,6 +144,8 @@ try:
     restored = wait_for(lambda: named("Updated name"), "form not restored")
     assert Atspi.Text.get_text(restored, 0, -1) == "Dinner 👩‍🚀"
     restored_path = restored.get_accessible_id()
+    assert restored_path != identity, "a modal-retired handle was revived"
+    wire_unavailable(identity, "org.a11y.atspi.EditableText", "SetTextContents", GLib.Variant("(s)", ("revived",)))
     assert named("Close form").get_action_iface().do_action(0)
     unavailable(lambda: Atspi.EditableText.set_text_contents(restored, "closed"))
     restored.clear_cache()

@@ -7,7 +7,7 @@ fi
 export XDG_RUNTIME_DIR
 XDG_RUNTIME_DIR=$(mktemp -d)
 chmod 700 "$XDG_RUNTIME_DIR"
-export WAYLAND_DISPLAY=bunny-accessibility DISPLAY=:98 BUNNY_PRESENT=cpu
+export WAYLAND_DISPLAY=bunny-accessibility DISPLAY=:98 BUNNY_PRESENT=cpu BUNNY_ATSPI_TRACE=1
 weston --backend=headless-backend.so --socket="$WAYLAND_DISPLAY" --width=1280 --height=800 \
   --use-pixman --idle-time=0 --log="$XDG_RUNTIME_DIR/weston.log" &
 weston_pid=$!
