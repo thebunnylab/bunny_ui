@@ -214,3 +214,40 @@ unsafe extern "system" {
     ) -> Hresult;
     pub(super) fn SafeArrayDestroy(array: *mut SafeArray) -> Hresult;
 }
+
+#[repr(C)]
+struct GuiThreadInfo {
+    size: u32,
+    flags: u32,
+    active: Hwnd,
+    focus: Hwnd,
+    capture: Hwnd,
+    menu_owner: Hwnd,
+    move_size: Hwnd,
+    caret: Hwnd,
+    caret_rect: super::super::Rect,
+}
+#[link(name = "user32", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn GetWindowThreadProcessId(window: Hwnd, process: *mut u32) -> u32;
+    fn GetGUIThreadInfo(thread: u32, info: *mut GuiThreadInfo) -> i32;
+}
+/// GetFocus alone reads the CALLER's thread; a COM callback may be on an MTA.
+pub(super) fn window_has_focus(window: Hwnd) -> bool {
+    let thread = unsafe { GetWindowThreadProcessId(window, std::ptr::null_mut()) };
+    if thread == 0 {
+        return false;
+    }
+    let mut info = GuiThreadInfo {
+        size: std::mem::size_of::<GuiThreadInfo>() as u32,
+        flags: 0,
+        active: 0,
+        focus: 0,
+        capture: 0,
+        menu_owner: 0,
+        move_size: 0,
+        caret: 0,
+        caret_rect: super::super::Rect::default(),
+    };
+    unsafe { GetGUIThreadInfo(thread, &mut info) != 0 && info.focus == window }
+}

@@ -47,7 +47,7 @@ struct Surface {
     window: Hwnd,
     queue: Arc<Queue>,
     alive: AtomicBool,
-    snapshot: Mutex<Snapshot>,
+    snapshot: Mutex<Arc<Snapshot>>,
     providers: Mutex<HashMap<Key, Owned>>,
 }
 thread_local! {
@@ -85,7 +85,7 @@ impl Accessibility {
                 window,
                 queue: Arc::clone(&self.queue),
                 alive: AtomicBool::new(true),
-                snapshot: Mutex::new(Snapshot::default()),
+                snapshot: Mutex::new(Arc::new(Snapshot::default())),
                 providers: Mutex::new(HashMap::new()),
             });
             SURFACES.with(|all| all.borrow_mut().insert(window, Arc::downgrade(&surface)));
@@ -180,13 +180,12 @@ impl Request {
         if surface.read(self.key).is_err() {
             return false;
         }
-        if let Key::Node(id) = self.key {
-            if runtime
+        if let Key::Node(id) = self.key
+            && runtime
                 .accessibility_action(id, self.action.clone())
                 .is_err()
-            {
-                return false;
-            }
+        {
+            return false;
         }
         if matches!(self.action, Action::Focus | Action::SetText(_)) {
             // UI thread only. SetFocus gives the real window keyboard input;
@@ -231,7 +230,7 @@ pub(super) fn get_object(window: Hwnd, wparam: usize, lparam: isize) -> Option<i
     Some(unsafe { UiaReturnRawElementProvider(window, wparam, lparam, provider.simple()) })
 }
 impl Surface {
-    fn read(&self, key: Key) -> Result<(Snapshot, Option<Node>), Hresult> {
+    fn read(&self, key: Key) -> Result<(Arc<Snapshot>, Option<Node>), Hresult> {
         let snapshot = self.snapshot.lock().map_err(|_| FAILED)?;
         if !self.alive.load(Ordering::Acquire) {
             return Err(UNAVAILABLE);
@@ -260,10 +259,10 @@ impl Surface {
             .or_insert_with(|| Owned::new(self, key, node.map(|node| node.role)))
             .clone())
     }
-    fn replace(&self, snapshot: Snapshot) -> Result<Snapshot, Hresult> {
+    fn replace(&self, snapshot: Snapshot) -> Result<Arc<Snapshot>, Hresult> {
         let previous = {
             let mut current = self.snapshot.lock().map_err(|_| FAILED)?;
-            std::mem::replace(&mut *current, snapshot)
+            std::mem::replace(&mut *current, Arc::new(snapshot))
         };
         let retired = {
             let snapshot = self.snapshot.lock().map_err(|_| FAILED)?;
@@ -305,7 +304,7 @@ impl Surface {
             }
         }
     }
-    fn notify(self: &Arc<Self>, previous: Snapshot) {
+    fn notify(self: &Arc<Self>, previous: Arc<Snapshot>) {
         if unsafe { UiaClientsAreListening() } == 0 {
             return;
         }
@@ -317,11 +316,9 @@ impl Surface {
             .iter()
             .map(|n| n.id)
             .ne(current.nodes.iter().map(|n| n.id));
-        if changed {
-            if let Ok(root) = self.provider(Key::Root) {
-                unsafe {
-                    UiaRaiseStructureChangedEvent(root.simple(), 2, ptr::null(), 0);
-                }
+        if changed && let Ok(root) = self.provider(Key::Root) {
+            unsafe {
+                UiaRaiseStructureChangedEvent(root.simple(), 2, ptr::null(), 0);
             }
         }
         for node in &current.nodes {
@@ -349,6 +346,17 @@ impl Surface {
                         VALUE_VALUE,
                         Variant::string(old.value.as_deref().unwrap_or("")),
                         Variant::string(node.value.as_deref().unwrap_or("")),
+                    );
+                }
+                if old.bounds != node.bounds
+                    || previous.origin != current.origin
+                    || previous.factor != current.factor
+                {
+                    notify_property(
+                        &provider,
+                        BOUNDS,
+                        self.bounds(&previous, Some(old)).and_then(Variant::bounds),
+                        self.bounds(&current, Some(node)).and_then(Variant::bounds),
                     );
                 }
                 if old.focused != node.focused {
@@ -566,7 +574,8 @@ fn output<T>(out: *mut T, empty: T, action: impl FnOnce() -> Result<T, Hresult>)
         Err(error) => error,
     }
 }
-fn state(value: &Provider) -> Result<(Arc<Surface>, Snapshot, Option<Node>), Hresult> {
+type Available = (Arc<Surface>, Arc<Snapshot>, Option<Node>);
+fn state(value: &Provider) -> Result<Available, Hresult> {
     let surface = value.surface.upgrade().ok_or(UNAVAILABLE)?;
     let (snapshot, node) = surface.read(value.key)?;
     Ok((surface, snapshot, node))
@@ -613,7 +622,9 @@ unsafe extern "system" fn property(this: Object, property: i32, out: *mut Varian
                         Role::TextField | Role::PasswordField => 50004,
                     })),
                     AUTOMATION_ID => Variant::string(&format!("bunny:{}", node.id.get())),
-                    FOCUSED => Ok(Variant::boolean(node.focused)),
+                    FOCUSED => Ok(Variant::boolean(
+                        node.focused && window_has_focus(surface.window),
+                    )),
                     FOCUSABLE => Ok(Variant::boolean(matches!(
                         node.role,
                         Role::TextField | Role::PasswordField
@@ -723,12 +734,15 @@ fn enqueue(value: &Provider, action: Action) -> Hresult {
     let Ok((surface, _, _)) = state(value) else {
         return UNAVAILABLE;
     };
-    let supported = match (value.role, &action) {
+    let supported = matches!(
+        (value.role, &action),
         (Some(Role::Button), Action::Activate)
-        | (Some(Role::TextField | Role::PasswordField), Action::Focus | Action::SetText(_))
-        | (None, Action::Focus) => true,
-        _ => false,
-    };
+            | (
+                Some(Role::TextField | Role::PasswordField),
+                Action::Focus | Action::SetText(_)
+            )
+            | (None, Action::Focus)
+    );
     if !supported {
         return UNSUPPORTED;
     }
@@ -785,6 +799,9 @@ unsafe extern "system" fn at_point(this: Object, x: f64, y: f64, out: *mut Objec
 unsafe extern "system" fn focused(this: Object, out: *mut Object) -> Hresult {
     output(out, ptr::null_mut(), || {
         let (surface, snapshot, _) = state(unsafe { provider(this) })?;
+        if !window_has_focus(surface.window) {
+            return Ok(ptr::null_mut());
+        }
         match snapshot.nodes.iter().find(|node| node.focused) {
             Some(node) => surface.provider(Key::Node(node.id))?.interface(&FRAGMENT),
             None => Ok(ptr::null_mut()),
@@ -863,3 +880,157 @@ static VALUE_VTABLE: ValueVtbl = ValueVtbl {
     get: get_value,
     read_only,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bunny_ui::prelude::{State, button, text, text_field, vstack};
+
+    fn fixture() -> (Arc<Surface>, Owned, Owned, Owned) {
+        let runtime = Runtime::new();
+        runtime.set_accessibility_enabled(true);
+        let value = State::new("Lunch".to_string());
+        let root = vstack!(
+            button(text("Save"), || {}),
+            text_field("Description", value.binding()),
+            text("Read only")
+        );
+        let _ = runtime.display_frame(
+            &root,
+            bunny_ui::layout::Size {
+                width: 480.0,
+                height: 480.0,
+            },
+        );
+        let tree = runtime.accessibility_tree();
+        let nodes: Vec<_> = tree
+            .nodes()
+            .iter()
+            .map(|node| Node {
+                id: node.id,
+                role: node.role,
+                label: Arc::clone(&node.label),
+                value: node.value.clone(),
+                bounds: node.bounds,
+                focused: node.focused,
+            })
+            .collect();
+        let surface = Arc::new(Surface {
+            window: 0,
+            queue: Arc::new(Queue {
+                owner: 0,
+                requested: AtomicBool::new(true),
+                alive: AtomicBool::new(true),
+                requests: Mutex::new(Vec::new()),
+            }),
+            alive: AtomicBool::new(true),
+            snapshot: Mutex::new(Arc::new(Snapshot {
+                nodes,
+                origin: (0.0, 0.0),
+                factor: 1.0,
+            })),
+            providers: Mutex::new(HashMap::new()),
+        });
+        let button = surface.provider(Key::Node(tree.nodes()[0].id)).unwrap();
+        let field = surface.provider(Key::Node(tree.nodes()[1].id)).unwrap();
+        let text = surface.provider(Key::Node(tree.nodes()[2].id)).unwrap();
+        (surface, button, field, text)
+    }
+
+    #[test]
+    fn com_identity_and_refcounts_survive_concurrent_queries_and_retirement() {
+        let (surface, button, field, _) = fixture();
+        let canonical = field.simple() as usize;
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let field = field.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        let port = field.interface(&VALUE).unwrap();
+                        let mut identity = ptr::null_mut();
+                        unsafe {
+                            assert_eq!(query(port, &UNKNOWN, &mut identity), OK);
+                            assert_eq!(identity as usize, canonical);
+                            release(identity);
+                            release(port);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            unsafe { provider(field.simple()) }
+                .refs
+                .load(Ordering::Acquire),
+            2
+        ); // cache + caller
+        surface.alive.store(false, Ordering::Release);
+        surface.providers.lock().unwrap().clear();
+        drop(surface);
+        let still_queryable = field.interface(&VALUE).unwrap();
+        unsafe {
+            let mut result = ptr::dangling_mut::<u16>();
+            assert_eq!(get_value(still_queryable, &mut result), UNAVAILABLE);
+            assert!(result.is_null());
+            release(still_queryable);
+            assert_eq!(invoke(button.simple()), UNAVAILABLE);
+        }
+        assert_eq!(
+            unsafe { provider(field.simple()) }
+                .refs
+                .load(Ordering::Acquire),
+            1
+        );
+    }
+
+    #[test]
+    fn native_outputs_and_capabilities_follow_com_contract() {
+        let (_surface, button, field, text) = fixture();
+        unsafe {
+            assert_eq!(query(field.simple(), &VALUE, ptr::null_mut()), POINTER);
+            let mut result = ptr::dangling_mut::<std::ffi::c_void>();
+            assert_eq!(query(field.simple(), &INVOKE, &mut result), NO_INTERFACE);
+            assert!(result.is_null());
+            assert_eq!(query(field.simple(), ptr::null(), &mut result), POINTER);
+            assert_eq!(pattern(text.simple(), VALUE_PATTERN, &mut result), OK);
+            assert!(result.is_null());
+            assert_eq!(pattern(button.simple(), VALUE_PATTERN, &mut result), OK);
+            assert!(result.is_null());
+            assert_eq!(navigate(field.simple(), 99, &mut result), INVALID);
+            assert!(result.is_null());
+            assert_eq!(invoke(text.simple()), UNSUPPORTED);
+            assert_eq!(set_value(field.simple(), ptr::null()), INVALID);
+            let invalid_utf16 = [0xd800, 0];
+            assert_eq!(set_value(field.simple(), invalid_utf16.as_ptr()), INVALID);
+            let mut array = ptr::null_mut();
+            assert_eq!(runtime_id(field.simple(), &mut array), OK);
+            assert!(!array.is_null());
+            assert_eq!(SafeArrayDestroy(array), OK);
+            let mut value = Variant::empty();
+            assert_eq!(property(field.simple(), VALUE_VALUE, &mut value), OK);
+            assert_eq!(value.kind, 8);
+            assert_eq!(VariantClear(&mut value), OK);
+        }
+    }
+
+    #[test]
+    fn retirement_is_checked_again_before_an_accepted_action_reaches_runtime() {
+        let (surface, button, _, _) = fixture();
+        let request = Request {
+            surface: Arc::downgrade(&surface),
+            key: unsafe { provider(button.simple()) }.key,
+            action: Action::Activate,
+        };
+        surface.alive.store(false, Ordering::Release);
+        assert!(!request.apply(&Runtime::new()));
+        let mut out = Variant::empty();
+        assert_eq!(
+            unsafe { property(button.simple(), NAME, &mut out) },
+            UNAVAILABLE
+        );
+        assert_eq!(out.kind, 0);
+    }
+}
