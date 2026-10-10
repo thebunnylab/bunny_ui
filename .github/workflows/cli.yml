@@ -47,10 +47,11 @@ jobs:
         run: |
           # `cargo install` builds from the package: a template left out
           # of it is a `bunny new` with nothing to write
-          cargo package -p bunny-cli --locked --list --allow-dirty > package.txt
-          grep -qx 'templates/android/gradlew' package.txt
-          grep -qx 'templates/app/Cargo.toml.tmpl' package.txt
-          grep -qx 'templates/LICENSE' package.txt
+          # (compared with `/` and without `\r`, however the host prints paths)
+          cargo package -p bunny-cli --locked --list --allow-dirty | tr -d '\r' | tr '\\' '/' > package.txt
+          for file in templates/android/gradlew templates/app/Cargo.toml.tmpl templates/LICENSE; do
+            grep -qx "$file" package.txt || { echo "missing from the package: $file"; cat package.txt; exit 1; }
+          done
 
   new-project:
     name: a new project builds everywhere
