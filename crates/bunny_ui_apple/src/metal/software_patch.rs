@@ -26,6 +26,16 @@ pub(super) struct Scene {
     canvas: Color,
 }
 
+pub(super) struct BasePiece {
+    pub(super) surface: Surface,
+    pub(super) bounds: DamageRect,
+}
+
+pub(super) struct Mosaic {
+    pub(super) background: Surface,
+    pub(super) pieces: Vec<BasePiece>,
+}
+
 impl Scene {
     pub(super) fn new(
         display: &DisplayList,
@@ -200,6 +210,75 @@ impl Scene {
 
     pub(super) const fn canvas(&self) -> Color {
         self.canvas
+    }
+
+    /// A static opaque picture can share one background pixel and retain
+    /// only the exact non-background ink. Raster bytes, not command bounds,
+    /// decide what can be omitted; antialiasing and borders stay intact.
+    pub(super) fn mosaic(
+        &self,
+        text: &dyn TextEngine,
+        images: &dyn ImageEngine,
+        cache: &MeasureCache,
+    ) -> Option<Mosaic> {
+        let color = self
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::FillRect { rect, color, .. } if color.a == 255 => {
+                    Some((rect.size.width * rect.size.height, *color))
+                }
+                _ => None,
+            })
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .map_or(self.canvas, |(_, color)| color);
+        let background = Surface::new_opaque((1, 1))?;
+        if !background.write(&Bitmap::new(1, 1, color)) {
+            return None;
+        }
+        let mut bytes = background.allocated_bytes();
+        // Native layers have a cost too: retain pieces only when their
+        // real surface allocations save at least one quarter of the picture.
+        let limit = self.size.0.checked_mul(self.size.1)?.checked_mul(3)?;
+        let column = 256usize.checked_mul(self.scale)?;
+        let mut pieces = Vec::new();
+        let complete = self.raster_bands(text, images, cache, |y, bitmap| {
+            for x in (0..bitmap.width()).step_by(column) {
+                let Some(region) = PixelRegion::new(
+                    bitmap,
+                    (x, 0, (x + column).min(bitmap.width()), bitmap.height()),
+                ) else {
+                    return false;
+                };
+                let Some(ink) = region.foreground(color) else {
+                    continue;
+                };
+                if pieces.len() >= 128 {
+                    return false;
+                }
+                let Some(surface) = Surface::new_opaque(ink.size()) else {
+                    return false;
+                };
+                let Some(total) = bytes.checked_add(surface.allocated_bytes()) else {
+                    return false;
+                };
+                if total > limit || !surface.write_pixels(ink) {
+                    return false;
+                }
+                bytes = total;
+                pieces.push(BasePiece {
+                    surface,
+                    bounds: (
+                        ink.rect.0 as i64,
+                        (y + ink.rect.1) as i64,
+                        ink.rect.2 as i64,
+                        (y + ink.rect.3) as i64,
+                    ),
+                });
+            }
+            true
+        });
+        complete.then_some(Mosaic { background, pieces })
     }
 
     /// Emits opaque bands without allocating a full-window scratch bitmap.
@@ -378,6 +457,7 @@ unsafe extern "C" {
     fn IOSurfaceUnlock(surface: Id, options: u32, seed: *mut u32) -> i32;
     fn IOSurfaceGetBaseAddress(surface: Id) -> *mut c_void;
     fn IOSurfaceGetBytesPerRow(surface: Id) -> usize;
+    fn IOSurfaceGetAllocSize(surface: Id) -> usize;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -434,6 +514,31 @@ impl<'a> PixelRegion<'a> {
             && rect.2 <= bitmap.width()
             && rect.3 <= bitmap.height())
         .then_some(Self { bitmap, rect })
+    }
+
+    fn foreground(self, background: Color) -> Option<Self> {
+        let background =
+            u32::from_be_bytes([background.r, background.g, background.b, background.a]);
+        let (mut left, mut top, mut right, mut bottom) = (usize::MAX, usize::MAX, 0, 0);
+        for (y, row) in self.rows().enumerate() {
+            for (x, pixel) in row.iter().enumerate() {
+                if *pixel != background {
+                    left = left.min(x);
+                    top = top.min(y);
+                    right = right.max(x + 1);
+                    bottom = bottom.max(y + 1);
+                }
+            }
+        }
+        (left < right).then(|| Self {
+            bitmap: self.bitmap,
+            rect: (
+                self.rect.0 + left,
+                self.rect.1 + top,
+                self.rect.0 + right,
+                self.rect.1 + bottom,
+            ),
+        })
     }
 
     pub(super) fn whole(bitmap: &'a Bitmap) -> Option<Self> {
@@ -527,6 +632,10 @@ impl Surface {
                 PixelRegion::whole(bitmap).is_some_and(|pixels| surface.write_rows(y, pixels))
             })
             .then_some(surface)
+    }
+
+    pub(super) fn allocated_bytes(&self) -> usize {
+        unsafe { IOSurfaceGetAllocSize(self.raw) }
     }
 
     pub(super) fn busy(&self) -> bool {
@@ -643,6 +752,178 @@ mod tests {
         layout::Corners,
         text_engine::{FontSpec, PixelFont},
     };
+
+    #[test]
+    fn a_moderately_dense_base_still_saves_a_quarter_of_surface_storage() {
+        let display = DisplayList::from(vec![
+            DrawCommand::FillRect {
+                rect: Rect {
+                    origin: Point::ZERO,
+                    size: Size {
+                        width: 800.0,
+                        height: 600.0,
+                    },
+                },
+                color: Color::WHITE,
+                corner_radius: Corners::ZERO,
+            },
+            DrawCommand::FillRect {
+                rect: Rect {
+                    origin: Point::ZERO,
+                    size: Size {
+                        width: 500.0,
+                        height: 600.0,
+                    },
+                },
+                color: Color::BLACK,
+                corner_radius: Corners::ZERO,
+            },
+        ]);
+        let cache = MeasureCache::default();
+        let scene = Scene::base(&display, (800, 600), 1, Color::WHITE, &PixelFont, &cache).unwrap();
+        let mosaic = scene
+            .mosaic(&PixelFont, &RawImages::default(), &cache)
+            .expect("a moderate scene can save surface storage");
+        let bytes = mosaic.background.allocated_bytes()
+            + mosaic
+                .pieces
+                .iter()
+                .map(|p| p.surface.allocated_bytes())
+                .sum::<usize>();
+        assert!(bytes > 800 * 600 * 2);
+        assert!(bytes <= 800 * 600 * 3);
+    }
+
+    #[test]
+    fn a_static_mosaic_reconstructs_every_pixel_and_refuses_dense_storage() {
+        fn pixels(surface: &Surface) -> Vec<u32> {
+            unsafe {
+                assert_eq!(IOSurfaceLock(surface.raw, 0, null_mut()), 0);
+                let base = IOSurfaceGetBaseAddress(surface.raw).cast::<u8>();
+                let stride = IOSurfaceGetBytesPerRow(surface.raw);
+                let result = (0..surface.size.1)
+                    .flat_map(|y| {
+                        std::slice::from_raw_parts(base.add(y * stride), surface.size.0 * 4)
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|bytes| {
+                                let word = u32::from_le_bytes(*bytes);
+                                match surface.format {
+                                    SurfaceFormat::Bgra8 => word.rotate_left(8),
+                                    #[cfg(target_arch = "aarch64")]
+                                    SurfaceFormat::OpaqueRgb10 => {
+                                        let byte =
+                                            |shift: u32| (((word >> shift) & 1023u32) - 384) / 2;
+                                        (byte(20) << 24) | (byte(10) << 16) | (byte(0) << 8) | 255
+                                    }
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                assert_eq!(IOSurfaceUnlock(surface.raw, 0, null_mut()), 0);
+                result
+            }
+        }
+        let rect = |x, y, width, height| Rect {
+            origin: Point { x, y },
+            size: Size { width, height },
+        };
+        let mut commands = vec![
+            DrawCommand::FillRect {
+                rect: rect(-0.5, -0.5, 800.0, 600.0),
+                color: Color::WHITE,
+                corner_radius: Corners::all(10.5),
+            },
+            DrawCommand::StrokeRect {
+                rect: rect(0.5, 0.5, 799.0, 599.0),
+                color: Color::hex(0x237bd9),
+                corner_radius: Corners::all(8.5),
+                width: 1.5,
+            },
+            DrawCommand::PushClip {
+                rect: rect(12.5, 20.5, 350.0, 550.0),
+                corner_radius: Corners::all(12.5),
+            },
+        ];
+        for row in 0..20 {
+            commands.push(DrawCommand::TextLine {
+                origin: Point {
+                    x: 8.5,
+                    y: 12.5 + row as f64 * 25.0,
+                },
+                content: "every antialiased pixel stays".into(),
+                range: (0, 28),
+                color: Color::rgba(50, 20, 150, 170),
+                font: FontSpec::DEFAULT,
+            });
+        }
+        commands.push(DrawCommand::PopClip);
+        let display = DisplayList::from(commands);
+        let cache = MeasureCache::default();
+        for scale in [1, 2] {
+            let scene = Scene::base(
+                &display,
+                (800 * scale, 600 * scale),
+                scale,
+                Color::BLACK,
+                &PixelFont,
+                &cache,
+            )
+            .unwrap();
+            let mosaic = scene
+                .mosaic(&PixelFont, &RawImages::default(), &cache)
+                .unwrap();
+            let mut actual = vec![pixels(&mosaic.background)[0]; scene.size.0 * scene.size.1];
+            let mut touched = vec![false; actual.len()];
+            let bytes = mosaic.background.allocated_bytes()
+                + mosaic
+                    .pieces
+                    .iter()
+                    .map(|p| p.surface.allocated_bytes())
+                    .sum::<usize>();
+            assert!(bytes <= actual.len() * 2);
+            for piece in &mosaic.pieces {
+                let values = pixels(&piece.surface);
+                for y in 0..piece.surface.size.1 {
+                    for x in 0..piece.surface.size.0 {
+                        let at = (piece.bounds.1 as usize + y) * scene.size.0
+                            + piece.bounds.0 as usize
+                            + x;
+                        assert!(!touched[at], "pieces do not overlap");
+                        touched[at] = true;
+                        actual[at] = values[y * piece.surface.size.0 + x];
+                    }
+                }
+            }
+            assert_eq!(
+                actual,
+                scene.raster(&PixelFont, &RawImages::default()).pixels(),
+                "scale {scale}"
+            );
+        }
+        let mut dense = vec![DrawCommand::FillRect {
+            rect: rect(0.0, 0.0, 800.0, 600.0),
+            color: Color::WHITE,
+            corner_radius: Corners::ZERO,
+        }];
+        for column in 0..16 {
+            dense.push(DrawCommand::FillRect {
+                rect: rect(column as f64 * 50.0, 0.0, 25.0, 600.0),
+                color: Color::BLACK,
+                corner_radius: Corners::ZERO,
+            });
+        }
+        let dense = DisplayList::from(dense);
+        let scene = Scene::base(&dense, (800, 600), 1, Color::WHITE, &PixelFont, &cache).unwrap();
+        assert!(
+            scene
+                .mosaic(&PixelFont, &RawImages::default(), &cache)
+                .is_none(),
+            "dense paint keeps the full native surface"
+        );
+    }
 
     #[test]
     fn native_base_raster_bands_are_bounded_and_match_the_whole_scene() {

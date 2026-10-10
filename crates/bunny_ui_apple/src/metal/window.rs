@@ -118,9 +118,54 @@ impl BaseBacking {
     }
 }
 
+struct BasePiece {
+    raw: Id,
+    // Keep the allocation alive until the layer releases its contents.
+    _surface: software_patch::Surface,
+}
+
+impl BasePiece {
+    unsafe fn new(
+        piece: software_patch::BasePiece,
+        physical: (usize, usize),
+        scale: usize,
+    ) -> Option<Self> {
+        unsafe {
+            let raw = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
+            if raw.is_null() {
+                return None;
+            }
+            kill_layer_actions(raw);
+            msg_void_bool(raw, sel("setOpaque:"), 1);
+            msg_void_f64(raw, sel("setContentsScale:"), scale as f64);
+            msg_void_rect(
+                raw,
+                sel("setFrame:"),
+                Patch::frame(piece.bounds, physical, scale),
+            );
+            msg_void_id(raw, sel("setContents:"), piece.surface.raw);
+            Some(Self {
+                raw,
+                _surface: piece.surface,
+            })
+        }
+    }
+}
+
+impl Drop for BasePiece {
+    fn drop(&mut self) {
+        unsafe {
+            msg_void(self.raw, sel("removeFromSuperlayer"));
+            msg_void_id(self.raw, sel("setContents:"), null_mut());
+            msg_void(self.raw, sel("release"));
+        }
+    }
+}
+
 struct BaseLayer {
     raw: Id,
     backing: BaseBacking,
+    pieces: Vec<BasePiece>,
 }
 
 impl BaseLayer {
@@ -135,7 +180,11 @@ impl BaseLayer {
             msg_void_bool(raw, sel("setOpaque:"), 1);
             msg_void_id(raw, sel("setContents:"), backing.raw());
             msg_void_id_u64(root, sel("insertSublayer:atIndex:"), raw, 0);
-            Some(Self { raw, backing })
+            Some(Self {
+                raw,
+                backing,
+                pieces: Vec::new(),
+            })
         }
     }
 
@@ -164,12 +213,41 @@ impl BaseLayer {
         images: &dyn ImageEngine,
         cache: &MeasureCache,
     ) -> bool {
+        if let Some(mosaic) = scene.mosaic(text, images, cache) {
+            let bounds = scene.bounds();
+            let physical = (
+                (bounds.2 - bounds.0) as usize,
+                (bounds.3 - bounds.1) as usize,
+            );
+            let pieces = mosaic
+                .pieces
+                .into_iter()
+                .map(|piece| unsafe { BasePiece::new(piece, physical, scene.scale()) })
+                .collect::<Option<Vec<_>>>();
+            if let Some(pieces) = pieces {
+                unsafe {
+                    let transaction = class("CATransaction");
+                    msg_void(transaction, sel("begin"));
+                    msg_void_bool(transaction, sel("setDisableActions:"), 1);
+                    self.size(size, scene.scale());
+                    msg_void_id(self.raw, sel("setContents:"), mosaic.background.raw);
+                    for piece in &pieces {
+                        msg_void_id(self.raw, sel("addSublayer:"), piece.raw);
+                    }
+                    self.pieces = pieces;
+                    self.backing = BaseBacking::Surface(mosaic.background);
+                    msg_void(transaction, sel("commit"));
+                }
+                return true;
+            }
+        }
         if let Some(surface) = software_patch::Surface::from_scene(scene, text, images, cache) {
             unsafe {
                 self.size(size, scene.scale());
                 msg_void_id(self.raw, sel("setContents:"), surface.raw);
             }
             self.backing = BaseBacking::Surface(surface);
+            self.pieces.clear();
             true
         } else {
             unsafe { self.paint(scene.raster(text, images), size, scene.scale()) }
@@ -185,12 +263,14 @@ impl BaseLayer {
             msg_void_id(self.raw, sel("setContents:"), backing.raw());
         }
         self.backing = backing;
+        self.pieces.clear();
         true
     }
 }
 
 impl Drop for BaseLayer {
     fn drop(&mut self) {
+        self.pieces.clear();
         unsafe {
             msg_void(self.raw, sel("removeFromSuperlayer"));
             msg_void_id(self.raw, sel("setContents:"), null_mut());
@@ -286,7 +366,7 @@ impl NativePatch {
             msg_void_bool(layer, sel("setOpaque:"), 1);
             msg_void_bool(layer, sel("setHidden:"), 1);
             msg_void_f64(layer, sel("setContentsScale:"), scale as f64);
-            msg_void_id_u64(root, sel("insertSublayer:atIndex:"), layer, 0);
+            msg_void_id(root, sel("addSublayer:"), layer);
             Some(Self {
                 layer,
                 backing: software_patch::Backing::default(),
@@ -956,6 +1036,79 @@ mod tests {
                 drop(presenter);
                 msg_void(layer, sel("release"));
             }
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn a_native_static_base_does_not_store_uniform_space_per_pixel() {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let size = Size {
+                width: 1280.0,
+                height: 800.0,
+            };
+            let mut commands = vec![
+                DrawCommand::FillRect {
+                    rect: rect(0.0, 0.0, 1280.0, 800.0),
+                    color: Color::WHITE,
+                    corner_radius: Corners::all(6.0),
+                },
+                DrawCommand::StrokeRect {
+                    rect: rect(0.0, 0.0, 1280.0, 800.0),
+                    color: Color::hex(0x3080ff),
+                    corner_radius: Corners::all(6.0),
+                    width: 1.0,
+                },
+            ];
+            for row in 0..20 {
+                commands.push(DrawCommand::TextLine {
+                    origin: Point {
+                        x: 12.0,
+                        y: 12.0 + row as f64 * 24.0,
+                    },
+                    content: "the same text and every border pixel".into(),
+                    range: (0, 36),
+                    color: Color::BLACK,
+                    font: FontSpec::DEFAULT,
+                });
+            }
+            let display = DisplayList::from(commands);
+            for scale in [1, 2] {
+                let mut presenter = WindowPresenter::attach(layer, scale as f64).unwrap();
+                presenter.present(
+                    &display,
+                    size,
+                    scale,
+                    Color::BLACK,
+                    &PixelFont,
+                    &RawImages::default(),
+                    false,
+                );
+                let Strategy::Native(native) = &presenter.strategy else {
+                    panic!("bounded scene remains native")
+                };
+                assert!(matches!(native.state, NativeState::Patched(_)));
+                let bytes = match &native.base.backing {
+                    BaseBacking::Surface(surface) => surface.allocated_bytes(),
+                    BaseBacking::Image(_) => panic!("the native scene must share opaque surfaces"),
+                };
+                let bytes = bytes
+                    + native
+                        .base
+                        .pieces
+                        .iter()
+                        .map(|piece| piece._surface.allocated_bytes())
+                        .sum::<usize>();
+                assert!(
+                    bytes < 1280 * 800 * scale * scale * 2,
+                    "uniform space must not require a full-size surface: {bytes} bytes at scale {scale}"
+                );
+                drop(presenter);
+            }
+            msg_void(layer, sel("release"));
             objc_autoreleasePoolPop(pool);
         }
     }
