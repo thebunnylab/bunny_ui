@@ -579,6 +579,12 @@ impl Presenter {
         self.active
     }
 
+    /// Once the bands are visible, only this stationary picture is needed
+    /// behind them. The partition has proved full opaque viewport coverage.
+    pub(super) fn outside(&self) -> Option<&DisplayList> {
+        self.prior.as_ref().filter(|_| self.active).map(|scene| &scene.outside)
+    }
+
     pub(super) fn discard_trial(&mut self) {
         if !self.active {
             self.prior = None;

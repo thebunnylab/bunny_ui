@@ -249,6 +249,7 @@ struct Native {
     base: BaseLayer,
     ink: Option<BaseLayer>,
     bands: scroll_bands::Presenter,
+    outside_checked: bool,
     boxes: MeasureCache,
     state: NativeState,
 }
@@ -365,6 +366,7 @@ impl WindowPresenter {
                 base,
                 ink: None,
                 bands: scroll_bands::Presenter::default(),
+                outside_checked: false,
                 boxes: MeasureCache::default(),
                 state: NativeState::Choosing,
             })),
@@ -480,6 +482,18 @@ impl WindowPresenter {
                         })
                     }
                 {
+                    if !native.outside_checked {
+                        // Compatible bands keep the outside picture unchanged.
+                        // Retire the original full-window backing only after
+                        // the opaque viewport is successfully visible. Refusal
+                        // keeps it; no allocation retry runs on every scroll.
+                        native.outside_checked = true;
+                        if let Some(scene) = native.bands.outside().and_then(|outside| {
+                            SparseScene::new(outside, physical, scale, text, &native.boxes)
+                        }) {
+                            native.paint_sparse(scene, size, scale, text, images);
+                        }
+                    }
                     native.state =
                         NativeState::Bands((Rc::new(display.clone()), physical, scale, canvas));
                     return;
@@ -769,6 +783,16 @@ mod tests {
                         "no queue exists to wake at rest"
                     );
                     assert!(presenter.rest());
+                    #[cfg(target_arch = "aarch64")]
+                    if offset != 0.0 {
+                        let Strategy::Native(native) = &presenter.strategy else {
+                            unreachable!()
+                        };
+                        assert!(
+                            matches!(&native.base.backing, BaseBacking::Surface(surface) if surface.size == (1, 1)),
+                            "the opaque bands replace the viewport pixels; their base retains only the outside scene"
+                        );
+                    }
                 }
                 drop(presenter);
             }
@@ -946,6 +970,7 @@ mod tests {
                 ink: None,
                 base: BaseLayer::new(layer).unwrap(),
                 bands: scroll_bands::Presenter::default(),
+                outside_checked: false,
                 boxes: MeasureCache::default(),
                 state: NativeState::Choosing,
             };

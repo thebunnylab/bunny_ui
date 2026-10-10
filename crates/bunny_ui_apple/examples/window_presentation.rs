@@ -292,36 +292,87 @@ mod macos {
             let mut native = WindowPresenter::attach(native_layer, 1.0).unwrap();
             msg_arg(view, sel("setLayer:"), native_layer);
             native.prime(SIZE.width, SIZE.height, 1);
-            let viewport = Rect {
-                origin: Point { x: 0.0, y: 0.0 },
-                size: SIZE,
-            };
-            let mut bands = vec![DrawCommand::PushClip {
-                rect: viewport,
-                corner_radius: Corners::ZERO,
-            }];
-            for (y, color) in [(0.0, RED), (120.0, GREEN)] {
-                bands.push(DrawCommand::FillRect {
-                    rect: Rect {
-                        origin: Point { x: 0.0, y },
-                        size: Size {
-                            width: SIZE.width,
-                            height: 120.0,
+            let band_scene = |offset: f64| {
+                let mut commands = vec![
+                    DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point { x: 0.0, y: 0.0 },
+                            size: SIZE,
                         },
+                        color: Color::WHITE,
+                        corner_radius: Corners::ZERO,
                     },
-                    color,
-                    corner_radius: Corners::ZERO,
-                });
-            }
-            bands.push(DrawCommand::PopClip);
-            let bands = DisplayList::from(bands);
-            for label in ["native owned pixels", "native repeated pixels"] {
-                native.present(&bands, SIZE, 1, Color::BLACK, &PixelFont, &images, false);
+                    DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point { x: 0.0, y: 0.0 },
+                            size: Size {
+                                width: 8.0,
+                                height: 8.0,
+                            },
+                        },
+                        color: Color::BLACK,
+                        corner_radius: Corners::ZERO,
+                    },
+                    DrawCommand::PushClip {
+                        rect: Rect {
+                            origin: Point { x: 16.0, y: 0.0 },
+                            size: Size {
+                                width: 288.0,
+                                height: SIZE.height,
+                            },
+                        },
+                        corner_radius: Corners::ZERO,
+                    },
+                ];
+                for row in -1..3 {
+                    commands.push(DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point {
+                                x: 16.0,
+                                y: row as f64 * 120.0 - offset,
+                            },
+                            size: Size {
+                                width: 288.0,
+                                height: 120.0,
+                            },
+                        },
+                        color: if row % 2 == 0 { RED } else { GREEN },
+                        corner_radius: Corners::ZERO,
+                    });
+                }
+                commands.push(DrawCommand::PopClip);
+                DisplayList::from(commands)
+            };
+            for (offset, base, patch, label) in [
+                (0.0, GREEN, RED, "native owned pixels"),
+                (0.0, GREEN, RED, "native repeated pixels"),
+                (120.0, RED, GREEN, "native bands after retiring full base"),
+                (0.0, GREEN, RED, "native bands reverse after retirement"),
+            ] {
+                native.present(
+                    &band_scene(offset),
+                    SIZE,
+                    1,
+                    Color::BLACK,
+                    &PixelFont,
+                    &images,
+                    false,
+                );
                 assert!(
                     msg_id(native_layer, sel("device")).is_null(),
                     "the image stays native"
                 );
-                expect(window, GREEN, RED, label);
+                expect(window, base, patch, label);
+                assert!(
+                    sample(window, 310, 80)
+                        .iter()
+                        .all(|channel| *channel >= 128),
+                    "the outside background is still white"
+                );
+                assert!(
+                    sample(window, 4, 4).iter().all(|channel| *channel < 128),
+                    "the outside foreground survives base retirement"
+                );
             }
             assert!(native.rest());
             expect(window, GREEN, RED, "native idle pixels");
