@@ -374,6 +374,40 @@ mod macos {
                     "the outside foreground survives base retirement"
                 );
             }
+            for height in [60.0, 20.0, 100.0] {
+                let mut commands = band_scene(0.0).as_slice().to_vec();
+                commands.push(DrawCommand::FillRect {
+                    rect: Rect {
+                        origin: Point { x: 290.0, y: 10.0 },
+                        size: Size { width: 4.0, height },
+                    },
+                    color: Color::BLACK,
+                    corner_radius: Corners::ZERO,
+                });
+                native.present(
+                    &DisplayList::from(commands),
+                    SIZE,
+                    1,
+                    Color::BLACK,
+                    &PixelFont,
+                    &images,
+                    false,
+                );
+                expect(window, GREEN, RED, "native decoration over unchanged rows");
+                let pixel = sample(window, 292, 40);
+                if height > 30.0 {
+                    assert!(
+                        pixel.iter().all(|channel| *channel < 64),
+                        "the new thumb is visible: {pixel:?}"
+                    );
+                } else {
+                    assert!(
+                        pixel[0] > 128 && pixel[1] < 128,
+                        "the shortened thumb reveals the exact row: {pixel:?}"
+                    );
+                }
+                assert!(msg_id(native_layer, sel("device")).is_null());
+            }
             assert!(native.rest());
             expect(window, GREEN, RED, "native idle pixels");
             native.present(
@@ -422,6 +456,100 @@ mod macos {
             expect(window, RED, Color::WHITE, "promotion after sparse image");
             drop(sparse);
             msg_void(sparse_layer, sel("release"));
+            let growing_layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let mut growing = WindowPresenter::attach(growing_layer, 1.0).unwrap();
+            msg_arg(view, sel("setLayer:"), growing_layer);
+            growing.prime(SIZE.width, SIZE.height, 1);
+            for rows in [0, 1, 2, 4, 5, 2, 0] {
+                let mut commands = vec![
+                    DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point { x: 0.0, y: 0.0 },
+                            size: SIZE,
+                        },
+                        color: Color::WHITE,
+                        corner_radius: Corners::ZERO,
+                    },
+                    DrawCommand::PushClip {
+                        rect: Rect {
+                            origin: Point { x: 0.0, y: 0.0 },
+                            size: SIZE,
+                        },
+                        corner_radius: Corners::ZERO,
+                    },
+                ];
+                for row in 0..rows {
+                    commands.push(DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point {
+                                x: 0.0,
+                                y: row as f64 * 48.0,
+                            },
+                            size: Size {
+                                width: SIZE.width,
+                                height: 48.0,
+                            },
+                        },
+                        color: if row % 2 == 0 { RED } else { GREEN },
+                        corner_radius: Corners::ZERO,
+                    });
+                    for (x, width, color) in [(80.0, 16.0, GREEN), (104.0, 4.0, Color::WHITE)] {
+                        commands.push(DrawCommand::FillRect {
+                            rect: Rect {
+                                origin: Point {
+                                    x,
+                                    y: row as f64 * 48.0 + 8.0,
+                                },
+                                size: Size {
+                                    width,
+                                    height: 16.0,
+                                },
+                            },
+                            color,
+                            corner_radius: Corners::ZERO,
+                        });
+                    }
+                }
+                commands.push(DrawCommand::PopClip);
+                growing.present(
+                    &DisplayList::from(commands),
+                    SIZE,
+                    1,
+                    Color::BLACK,
+                    &PixelFont,
+                    &images,
+                    false,
+                );
+                assert!(
+                    msg_id(growing_layer, sel("device")).is_null(),
+                    "bounded growth remains native"
+                );
+                expect(
+                    window,
+                    if rows > 3 { GREEN } else { Color::WHITE },
+                    if rows > 1 { GREEN } else { Color::WHITE },
+                    &format!("native growing rows={rows}"),
+                );
+                if rows > 0 {
+                    let first = sample(window, 200, 20);
+                    assert!(
+                        first[0] >= 128 && first[1] < 128 && first[2] < 128,
+                        "the first row is present"
+                    );
+                    let foreground = sample(window, 86, 14);
+                    assert!(
+                        foreground[0] < 128 && foreground[1] >= 128 && foreground[2] < 128,
+                        "cropped foreground is visible"
+                    );
+                    let gap = sample(window, 100, 12);
+                    assert!(
+                        gap.iter().zip(&first).all(|(a, b)| a.abs_diff(*b) <= 2),
+                        "the native background and the opaque raster must have the same color: {gap:?}, {first:?}"
+                    );
+                }
+            }
+            drop(growing);
+            msg_void(growing_layer, sel("release"));
             msg_arg(window, sel("orderOut:"), null_mut());
             msg_bool(window, sel("setReleasedWhenClosed:"), 0);
             msg_void(window, sel("close"));

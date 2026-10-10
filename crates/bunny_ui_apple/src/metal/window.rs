@@ -215,20 +215,28 @@ impl SparseScene {
         {
             return None;
         }
-        let ink = match list_damage(
-            std::slice::from_ref(background),
-            display.as_slice(),
-            scale,
-            physical,
-            PATCH_COMMANDS,
-            boxes,
-            text,
-        ) {
-            ListDamage::Same => None,
-            ListDamage::Rect(rect) => Some(software_patch::Scene::new(
-                display, rect, scale, *color, text, boxes,
-            )?),
-            ListDamage::Whole => return None,
+        let ink = if display.as_slice()[1..]
+            .iter()
+            .all(|command| matches!(command, DrawCommand::PushClip { .. } | DrawCommand::PopClip))
+        {
+            // Clip stack changes without drawing do not alter the background.
+            None
+        } else {
+            match list_damage(
+                std::slice::from_ref(background),
+                display.as_slice(),
+                scale,
+                physical,
+                PATCH_COMMANDS,
+                boxes,
+                text,
+            ) {
+                ListDamage::Same => None,
+                ListDamage::Rect(rect) => Some(software_patch::Scene::new(
+                    display, rect, scale, *color, text, boxes,
+                )?),
+                ListDamage::Whole => return None,
+            }
         };
         Some(Self {
             color: *color,
@@ -453,6 +461,17 @@ impl WindowPresenter {
             && native
                 .bands
                 .seed(display, physical, scale, canvas, text, &native.boxes);
+        // A proved empty viewport has no ink layer to cover later bands.
+        // Keep the seeded partition while avoiding a full-window allocation
+        // that an allocator could retain even after the first rows arrive.
+        if bands
+            && let Some(scene) = SparseScene::new(display, physical, scale, text, &native.boxes)
+            && scene.ink.is_none()
+            && native.paint_sparse(scene, size, scale, text, images)
+        {
+            native.state = NativeState::Bands((Rc::new(display.clone()), physical, scale, canvas));
+            return;
+        }
         if matches!(native.state, NativeState::Choosing)
             && !live
             && !bands
@@ -853,6 +872,136 @@ mod tests {
             assert!(
                 matches!(presenter.strategy, Strategy::Metal(_)),
                 "an unsupported update promotes once"
+            );
+            drop(presenter);
+            msg_void(layer, sel("release"));
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    #[test]
+    fn an_empty_native_viewport_never_allocates_a_full_window_backing() {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            for scale in [1, 2] {
+                let mut presenter = WindowPresenter::attach(layer, scale as f64).unwrap();
+                let size = Size {
+                    width: 1280.0,
+                    height: 800.0,
+                };
+                let display = DisplayList::from(vec![
+                    DrawCommand::FillRect {
+                        rect: rect(0.0, 0.0, 1280.0, 800.0),
+                        color: Color::WHITE,
+                        corner_radius: Corners::ZERO,
+                    },
+                    DrawCommand::PushClip {
+                        rect: rect(0.0, 0.0, 1280.0, 800.0),
+                        corner_radius: Corners::ZERO,
+                    },
+                    DrawCommand::PopClip,
+                ]);
+                presenter.present(
+                    &display,
+                    size,
+                    scale,
+                    Color::WHITE,
+                    &PixelFont,
+                    &RawImages::default(),
+                    false,
+                );
+                let Strategy::Native(native) = &presenter.strategy else {
+                    panic!("the empty viewport must stay native")
+                };
+                assert!(
+                    matches!(native.state, NativeState::Bands(_)),
+                    "preserve the seeded viewport for subsequent rows"
+                );
+                #[cfg(target_arch = "aarch64")]
+                assert!(
+                    matches!(&native.base.backing, BaseBacking::Surface(surface) if surface.size == (1, 1)),
+                    "a uniform empty viewport needs just one background pixel"
+                );
+                assert!(msg_id(layer, sel("device")).is_null());
+                assert!(presenter.rest());
+                drop(presenter);
+            }
+            msg_void(layer, sel("release"));
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    #[test]
+    fn a_runtime_list_can_grow_natively_but_a_broad_rewrite_promotes() {
+        use bunny_ui::prelude::*;
+        #[derive(Clone)]
+        struct List {
+            count: State<usize>,
+            ink: State<Color>,
+        }
+        impl Component for List {
+            fn body(self) -> impl View {
+                virtual_list(
+                    self.count.get(),
+                    |row| format!("row-{row}"),
+                    |row| {
+                        text(format!("A line of text {row}"))
+                            .frame_aligned(800.0, 28.0, Alignment::Leading)
+                            .background_color(Color::hex(0xeeeeee))
+                    },
+                )
+                .row_height(28.0)
+                .font_size(13.0)
+                .foreground_color(self.ink.get())
+                .background_color(Color::WHITE)
+            }
+        }
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let mut presenter = WindowPresenter::attach(layer, 1.0).unwrap();
+            let text = Rc::new(crate::text::CoreTextEngine::new());
+            let runtime = Runtime::new().text_engine(text.clone());
+            let list = List {
+                count: State::new(0),
+                ink: State::new(Color::BLACK),
+            };
+            let size = Size {
+                width: 800.0,
+                height: 600.0,
+            };
+            for count in 0..24 {
+                list.count.set(count);
+                let display = runtime.display_frame(&list, size);
+                presenter.present(
+                    &display,
+                    size,
+                    1,
+                    Color::WHITE,
+                    &*text,
+                    &RawImages::default(),
+                    false,
+                );
+                assert!(
+                    msg_id(layer, sel("device")).is_null(),
+                    "append {count} should use bounded new rows: {display:?}"
+                );
+            }
+            list.ink.set(Color::hex(0xff0000));
+            let display = runtime.display_frame(&list, size);
+            presenter.present(
+                &display,
+                size,
+                1,
+                Color::WHITE,
+                &*text,
+                &RawImages::default(),
+                false,
+            );
+            assert!(
+                matches!(presenter.strategy, Strategy::Metal(_)),
+                "repainting every row exceeds the CPU update budget"
             );
             drop(presenter);
             msg_void(layer, sel("release"));

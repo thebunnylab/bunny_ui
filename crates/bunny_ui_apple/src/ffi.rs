@@ -89,7 +89,7 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_void_id(obj: Id, sel: Sel, a: Id);
     #[link_name = "objc_msgSend"]
-    fn msg_void_id_id(obj: Id, sel: Sel, a: Id, b: Id);
+    pub(crate) fn msg_void_id_id(obj: Id, sel: Sel, a: Id, b: Id);
     #[link_name = "objc_msgSend"]
     fn msg_bool_sel(obj: Id, sel: Sel, a: Sel) -> i8;
     #[link_name = "objc_msgSend"]
@@ -114,6 +114,7 @@ unsafe extern "C" {}
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     pub fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
+    pub fn CGColorCreate(space: *mut c_void, components: *const f64) -> *mut c_void;
     pub fn CGColorSpaceRelease(space: *mut c_void);
     pub fn CGContextDrawImage(context: Id, rect: CGRect, image: Id);
     pub fn CGContextSetInterpolationQuality(context: Id, quality: i32);

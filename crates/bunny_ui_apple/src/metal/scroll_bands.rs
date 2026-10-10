@@ -1,4 +1,5 @@
-//! Opaque bands can scroll by moving their retained pixels. Admission is
+//! Opaque bands scroll by moving retained pixels, and growing lists paint
+//! only bounded new rows. Uniform empty space needs one pixel. Admission is
 //! deliberately narrower than the display language; every refusal returns
 //! to a whole Metal frame. No layout node or application identity is needed.
 
@@ -112,7 +113,12 @@ impl Band {
             return None;
         }
         let rect = snapped(*rect, scale)?;
-        if (rect.2 - rect.0) * (rect.3 - rect.1) > MAX_PIXELS as i64 {
+        let budget = if commands.len() == 1 {
+            MAX_TOTAL_PIXELS
+        } else {
+            MAX_PIXELS
+        };
+        if (rect.2 - rect.0) * (rect.3 - rect.1) > budget as i64 {
             return None;
         }
         let mut clips = Vec::new();
@@ -133,6 +139,11 @@ impl Band {
                             bounds.3.min(clip.3),
                         );
                     }
+                    // Every admitted row spans the viewport width. The
+                    // viewport clips horizontal glyph overhang, including
+                    // text placed flush against its left edge.
+                    bounds.0 = bounds.0.max(rect.0);
+                    bounds.2 = bounds.2.min(rect.2);
                     if bounds.0 < bounds.2 && bounds.1 < bounds.3 && !contains(rect, bounds) {
                         return None;
                     }
@@ -156,6 +167,59 @@ impl Band {
         Some(Self { rect, display })
     }
 
+    fn solid(&self) -> Option<Color> {
+        match self.display.as_slice() {
+            [DrawCommand::FillRect { color, .. }] => Some(*color),
+            _ => None,
+        }
+    }
+
+    fn raster_pixels(&self) -> usize {
+        if self.solid().is_some() {
+            1
+        } else {
+            ((self.rect.2 - self.rect.0) * (self.rect.3 - self.rect.1)) as usize
+        }
+    }
+
+    /// A second layer earns its cost only when it removes at least half
+    /// the row's backing. Its pixels include the opaque background, so
+    /// compositor blending cannot change the text raster's appearance.
+    fn foreground(
+        &self,
+        scale: usize,
+        text: &dyn TextEngine,
+        cache: &MeasureCache,
+    ) -> Option<(Color, software_patch::Scene)> {
+        let commands = self.display.as_slice();
+        let DrawCommand::FillRect { color, .. } = commands.first()? else {
+            return None;
+        };
+        let size = (
+            (self.rect.2 - self.rect.0) as usize,
+            (self.rect.3 - self.rect.1) as usize,
+        );
+        let ListDamage::Rect(bounds) = list_damage(
+            &commands[..1],
+            commands,
+            scale,
+            size,
+            PATCH_COMMANDS,
+            cache,
+            text,
+        ) else {
+            return None;
+        };
+        let pixels = (bounds.2 - bounds.0).checked_mul(bounds.3 - bounds.1)?;
+        if pixels <= 0 || pixels.checked_mul(2)? > (size.0 * size.1) as i64 {
+            return None;
+        }
+        Some((
+            *color,
+            software_patch::Scene::new(&self.display, bounds, scale, *color, text, cache)?,
+        ))
+    }
+
     fn same_pixels(&self, other: &Self) -> bool {
         self.rect.2 - self.rect.0 == other.rect.2 - other.rect.0
             && self.rect.3 - self.rect.1 == other.rect.3 - other.rect.1
@@ -163,14 +227,21 @@ impl Band {
     }
 }
 
+type OverlayPaint = (DamageRect, software_patch::Scene);
+
 /// A proved partition: the viewport is completely covered by opaque,
 /// disjoint bands. Everything above them either stays outside or is a
 /// bounded overlay painted from the complete scene.
 struct Scene {
+    physical: (usize, usize),
+    scale: usize,
+    canvas: Color,
+    source: DisplayList,
+    decoration: (usize, usize, usize),
     viewport: DamageRect,
     bands: Vec<Band>,
     outside: DisplayList,
-    overlay: Option<(DamageRect, software_patch::Scene)>,
+    overlay: Option<OverlayPaint>,
 }
 
 impl Scene {
@@ -218,6 +289,7 @@ impl Scene {
         }
         let mut depth = 0usize;
         let mut first = None;
+        let mut first_row = None;
         let mut bands = Vec::new();
         let mut end = None;
         for (at, command) in commands.iter().enumerate().skip(start + 1) {
@@ -245,6 +317,7 @@ impl Scene {
                     // Layout may keep text whose conservative bounds cross
                     // the clip even after its background has left it.
                     first = Some(at);
+                    first_row.get_or_insert(at);
                 }
                 _ => {}
             }
@@ -253,26 +326,97 @@ impl Scene {
             }
         }
         let end = end?;
-        let first = first?;
-        // A scroll decoration can be inside the viewport's final clip.
-        // Its geometry, not its role or size, separates it from the last
-        // opaque band. The suffix paints above every band in either case.
-        let last_rect = ink(commands.get(first)?, scale, text, cache)?;
         let mut tail = end;
-        let mut depth = 0usize;
-        for (at, command) in commands.iter().enumerate().take(end).skip(first + 1) {
-            match command {
-                DrawCommand::PushClip { .. } => depth += 1,
-                DrawCommand::PopClip => depth = depth.checked_sub(1)?,
-                _ if depth == 0 && !contains(last_rect, ink(command, scale, text, cache)?) => {
-                    tail = at;
-                    break;
+        if let Some(first) = first {
+            // Decorations after the last row remain above the partition.
+            let last_rect = ink(commands.get(first)?, scale, text, cache)?;
+            let mut depth = 0usize;
+            for (at, command) in commands.iter().enumerate().take(end).skip(first + 1) {
+                match command {
+                    DrawCommand::PushClip { .. } => depth += 1,
+                    DrawCommand::PopClip => depth = depth.checked_sub(1)?,
+                    _ if depth == 0 => {
+                        let bounds = ink(command, scale, text, cache)?;
+                        let clipped = (
+                            bounds.0.max(viewport.0),
+                            bounds.1.max(viewport.1),
+                            bounds.2.min(viewport.2),
+                            bounds.3.min(viewport.3),
+                        );
+                        if clipped.0 < clipped.2
+                            && clipped.1 < clipped.3
+                            && !contains(last_rect, clipped)
+                        {
+                            tail = at;
+                            break;
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
+            }
+            bands.push(Band::new(&commands[first..tail], scale, text, cache)?);
+        } else if start + 1 != end {
+            // No opaque row may silently discard text in an empty viewport.
+            return None;
+        }
+        let top = bands.first().map_or(viewport.3, |band| band.rect.1);
+        let bottom = bands.last().map_or(viewport.3, |band| band.rect.3);
+        if top > viewport.1 || bottom < viewport.3 {
+            if first_row.is_some_and(|first| first != start + 1) {
+                return None;
+            }
+            // Prove the paint beneath every uncovered pixel is one opaque
+            // color. Any overlapping ink invalidates it until a later opaque
+            // fill covers the complete viewport again.
+            let mut background = Some(canvas);
+            for command in &commands[..start] {
+                let bounds = ink(command, scale, text, cache)?;
+                if intersects(bounds, viewport) {
+                    background = match command {
+                        DrawCommand::FillRect {
+                            color,
+                            corner_radius,
+                            ..
+                        } if color.a == 255
+                            && corner_radius.is_zero()
+                            && contains(bounds, viewport) =>
+                        {
+                            Some(*color)
+                        }
+                        _ => None,
+                    };
+                }
+            }
+            let color = background?;
+            let blank = |y0, y1| {
+                Band::new(
+                    &[DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: bunny_ui::layout::Point {
+                                x: viewport.0 as f64 / scale as f64,
+                                y: y0 as f64 / scale as f64,
+                            },
+                            size: Size {
+                                width: (viewport.2 - viewport.0) as f64 / scale as f64,
+                                height: (y1 - y0) as f64 / scale as f64,
+                            },
+                        },
+                        color,
+                        corner_radius: bunny_ui::layout::Corners::ZERO,
+                    }],
+                    scale,
+                    text,
+                    cache,
+                )
+            };
+            if top > viewport.1 {
+                bands.insert(0, blank(viewport.1, top.min(viewport.3))?);
+            }
+            if bottom < viewport.3 {
+                bands.push(blank(bottom.max(viewport.1), viewport.3)?);
             }
         }
-        bands.push(Band::new(&commands[first..tail], scale, text, cache)?);
-        if bands.len() < 2 || bands.len() > MAX_BANDS {
+        if bands.is_empty() || bands.len() > MAX_BANDS {
             return None;
         }
         let mut total = 0i64;
@@ -291,7 +435,34 @@ impl Scene {
         {
             return None;
         }
+        let (extra, overlay) =
+            Self::decoration(display, (tail, end), viewport, scale, canvas, text, cache)?;
         let mut outside = commands[..start].to_vec();
+        outside.extend(extra);
+        Some(Self {
+            physical,
+            scale,
+            canvas,
+            source: display.clone(),
+            decoration: (start, tail, end),
+            viewport,
+            bands,
+            outside: DisplayList::from(outside),
+            overlay,
+        })
+    }
+
+    fn decoration(
+        display: &DisplayList,
+        (tail, end): (usize, usize),
+        viewport: DamageRect,
+        scale: usize,
+        canvas: Color,
+        text: &dyn TextEngine,
+        cache: &MeasureCache,
+    ) -> Option<(Vec<DrawCommand>, Option<OverlayPaint>)> {
+        let commands = display.as_slice();
+        let mut outside = Vec::new();
         let mut overlay: Option<DamageRect> = None;
         // Tail clips are conservatively refused. A later opaque pane may
         // cover the viewport, but a sampled or unbounded effect never may.
@@ -332,18 +503,64 @@ impl Scene {
             }
         }
         let overlay = match overlay {
-            Some(rect) => Some((
-                rect,
-                software_patch::Scene::new(display, rect, scale, canvas, text, cache)?,
-            )),
+            Some(rect) => {
+                // A narrow decoration fits a stable viewport-height strip.
+                // Its raster work stays bounded, and changing thumb heights
+                // can reuse storage immediately after the retirement grace.
+                // Wider overlays keep the smaller grid-aligned backing.
+                let strip_pixels = (rect.2 - rect.0) * (viewport.3 - viewport.1);
+                let (top, bottom) = if strip_pixels <= 16 * 1024 {
+                    (viewport.1, viewport.3)
+                } else {
+                    (
+                        (rect.1.div_euclid(PATCH_GRID) * PATCH_GRID).max(viewport.1),
+                        ((rect.3 + PATCH_GRID - 1).div_euclid(PATCH_GRID) * PATCH_GRID)
+                            .min(viewport.3),
+                    )
+                };
+                let rect = (rect.0, top, rect.2, bottom);
+                Some((
+                    rect,
+                    software_patch::Scene::new(display, rect, scale, canvas, text, cache)?,
+                ))
+            }
             None => None,
         };
-        Some(Self {
-            viewport,
-            bands,
-            outside: DisplayList::from(outside),
-            overlay,
-        })
+        Some((outside, overlay))
+    }
+
+    /// The row commands and their clips are unchanged. Only bounded paint
+    /// above that partition may change; the outside picture stays exact.
+    fn updated_decoration(
+        &self,
+        display: &DisplayList,
+        physical: (usize, usize),
+        scale: usize,
+        canvas: Color,
+        text: &dyn TextEngine,
+        cache: &MeasureCache,
+    ) -> Option<Option<OverlayPaint>> {
+        let (start, tail, end) = self.decoration;
+        let commands = display.as_slice();
+        if physical != self.physical
+            || scale != self.scale
+            || canvas != self.canvas
+            || commands.len() != self.source.len()
+            || commands[..tail] != self.source.as_slice()[..tail]
+            || !matches!(commands[end], DrawCommand::PopClip)
+        {
+            return None;
+        }
+        let (outside, overlay) = Self::decoration(
+            display,
+            (tail, end),
+            self.viewport,
+            scale,
+            canvas,
+            text,
+            cache,
+        )?;
+        (outside.as_slice() == &self.outside.as_slice()[start..]).then_some(overlay)
     }
 
     fn compatible(&self, other: &Self) -> bool {
@@ -353,6 +570,17 @@ impl Scene {
     fn translation(&self, old: &Self) -> Option<i64> {
         if !self.compatible(old) {
             return None;
+        }
+        // A changing scroll decoration need not search every pair of rows.
+        // Equal pixels at equal positions prove the stationary partition.
+        if self.bands.len() == old.bands.len()
+            && self
+                .bands
+                .iter()
+                .zip(&old.bands)
+                .all(|(band, prior)| band.rect == prior.rect && band.same_pixels(prior))
+        {
+            return Some(0);
         }
         // Full pixel equality is the identity. Repeated labels and duplicate
         // rows are valid; they cannot select a wrong backing by key collision.
@@ -462,17 +690,26 @@ struct Surfaces {
 }
 impl Surfaces {
     fn retire(&mut self, surface: software_patch::Surface, observed_use: bool) {
-        if self.retired.len() < 12 {
-            self.retired.push(Retired {
-                surface,
-                frame: self.frame,
-                at: Instant::now(),
-                observed_use,
-            });
+        // Retain recent dimensions when the scene evolves. Releasing an
+        // obsolete reference is safe even while CA still owns that surface;
+        // reuse below still requires observed use and the full grace period.
+        if self.retired.len() == 12 {
+            self.retired.remove(0);
         }
+        self.retired.push(Retired {
+            surface,
+            frame: self.frame,
+            at: Instant::now(),
+            observed_use,
+        });
     }
     fn prepare(&mut self, bitmap: &Bitmap) -> Option<software_patch::Surface> {
         let size = (bitmap.width(), bitmap.height());
+        // A frequently reused size must not pin unrelated obsolete sizes.
+        // Expiration needs only advancing frames, not an idle timer. Dropping
+        // our reference never overwrites pixels still retained by CA.
+        self.retired
+            .retain(|retired| self.frame.saturating_sub(retired.frame) <= 12);
         // As with drawable retirement, let a presentation land before
         // trusting its cross-process use count. An unobserved surface
         // might still be pending: it is released, never overwritten. The
@@ -499,6 +736,7 @@ struct Layer {
     raw: Id,
     surface: Option<software_patch::Surface>,
     observed_use: bool,
+    inset: Option<Box<Layer>>,
 }
 impl Layer {
     unsafe fn new(scale: usize) -> Option<Self> {
@@ -514,10 +752,52 @@ impl Layer {
                 raw,
                 surface: None,
                 observed_use: false,
+                inset: None,
             })
         }
     }
 }
+impl Layer {
+    /// Prepare a detached row: a device-RGB color with an opaque cropped
+    /// child. `surface` remains owned by this row's normal retirement path.
+    unsafe fn set_inset(
+        &mut self,
+        color: Color,
+        bounds: DamageRect,
+        physical: (usize, usize),
+        scale: usize,
+        surface: Id,
+    ) -> bool {
+        unsafe {
+            let Some(child) = Layer::new(scale) else {
+                return false;
+            };
+            let space = crate::ffi::CGColorSpaceCreateDeviceRGB();
+            if space.is_null() {
+                return false;
+            }
+            let components =
+                [color.r, color.g, color.b, color.a].map(|channel| channel as f64 / 255.0);
+            let native_color = crate::ffi::CGColorCreate(space, components.as_ptr());
+            crate::ffi::CGColorSpaceRelease(space);
+            if native_color.is_null() {
+                return false;
+            }
+            msg_void_id(self.raw, sel("setBackgroundColor:"), native_color);
+            CFRelease(native_color);
+            msg_void_id(child.raw, sel("setContents:"), surface);
+            msg_void_rect(
+                child.raw,
+                sel("setFrame:"),
+                Patch::frame(bounds, physical, scale),
+            );
+            msg_void_id(self.raw, sel("addSublayer:"), child.raw);
+            self.inset = Some(Box::new(child));
+            true
+        }
+    }
+}
+
 impl Drop for Layer {
     fn drop(&mut self) {
         unsafe {
@@ -540,6 +820,12 @@ struct Shown {
 struct Overlay {
     bitmap: Bitmap,
     layer: Layer,
+}
+
+enum PreparedOverlay {
+    Hidden,
+    Reuse(usize),
+    Fresh(Box<Overlay>),
 }
 
 pub(super) struct Frame<'a> {
@@ -567,10 +853,16 @@ pub(super) struct Presenter {
 }
 
 impl Presenter {
-    /// Seeds the same generic admission from an already rasterized native base.
-    pub(super) fn seed(&mut self, display: &DisplayList, physical: (usize, usize),
-                      scale: usize, canvas: Color, text: &dyn TextEngine,
-                      boxes: &MeasureCache) -> bool {
+    /// Seeds the same generic admission from the initial native frame.
+    pub(super) fn seed(
+        &mut self,
+        display: &DisplayList,
+        physical: (usize, usize),
+        scale: usize,
+        canvas: Color,
+        text: &dyn TextEngine,
+        boxes: &MeasureCache,
+    ) -> bool {
         self.prior = Scene::new(display, physical, scale, canvas, text, boxes);
         self.prior.is_some()
     }
@@ -582,7 +874,10 @@ impl Presenter {
     /// Once the bands are visible, only this stationary picture is needed
     /// behind them. The partition has proved full opaque viewport coverage.
     pub(super) fn outside(&self) -> Option<&DisplayList> {
-        self.prior.as_ref().filter(|_| self.active).map(|scene| &scene.outside)
+        self.prior
+            .as_ref()
+            .filter(|_| self.active)
+            .map(|scene| &scene.outside)
     }
 
     pub(super) fn discard_trial(&mut self) {
@@ -609,43 +904,88 @@ impl Presenter {
         self.offset = 0;
     }
 
-    /// Preparation is fallible and changes no visible layer. Only after all
-    /// entering bands and the overlay have backing does one transaction move
-    /// the viewport and replace its departing children.
-    pub(super) unsafe fn present(&mut self, frame: Frame<'_>) -> bool {
-        let Frame {
-            root,
-            display,
-            physical,
-            scale,
-            canvas,
-            text,
-            images,
-            boxes,
-        } = frame;
-        let Some(scene) = Scene::new(display, physical, scale, canvas, text, boxes) else {
-            self.prior = None;
-            return false;
+    fn prepare_overlay(
+        overlays: &[Overlay],
+        surfaces: &mut Surfaces,
+        paint: Option<&OverlayPaint>,
+        scale: usize,
+        text: &dyn TextEngine,
+        images: &dyn ImageEngine,
+    ) -> Option<PreparedOverlay> {
+        let Some((_, paint)) = paint else {
+            return Some(PreparedOverlay::Hidden);
         };
-        let Some(dy) = self
-            .prior
-            .as_ref()
-            .and_then(|prior| scene.translation(prior))
-        else {
-            self.prior = Some(scene);
-            return false;
-        };
-        if !self.active && dy == 0 {
-            self.prior = Some(scene);
-            return false;
+        let bitmap = paint.raster(text, images);
+        if let Some(at) = overlays.iter().position(|o| {
+            o.bitmap.width() == bitmap.width()
+                && o.bitmap.height() == bitmap.height()
+                && o.bitmap.pixels() == bitmap.pixels()
+        }) {
+            return Some(PreparedOverlay::Reuse(at));
         }
-        let offset = if self.active { self.offset + dy } else { 0 };
-        // Periodically rebase through the normal whole frame instead of
-        // letting layer coordinates grow without bound on a long scroll.
-        if offset.unsigned_abs() > 1_000_000 {
-            self.prior = None;
-            return false;
+        let surface = surfaces.prepare(&bitmap)?;
+        let mut layer = unsafe { Layer::new(scale)? };
+        unsafe { msg_void_id(layer.raw, sel("setContents:"), surface.raw) };
+        layer.surface = Some(surface);
+        Some(PreparedOverlay::Fresh(Box::new(Overlay { bitmap, layer })))
+    }
+
+    unsafe fn show_overlay(
+        &mut self,
+        prepared: PreparedOverlay,
+        rect: Option<DamageRect>,
+        root: Id,
+        viewport: Id,
+        physical: (usize, usize),
+        scale: usize,
+    ) -> Option<(software_patch::Surface, bool)> {
+        unsafe {
+            let overlay = match prepared {
+                PreparedOverlay::Hidden => None,
+                PreparedOverlay::Reuse(at) => Some(at),
+                PreparedOverlay::Fresh(fresh) => {
+                    // Immediately above the viewport, below native islands.
+                    crate::ffi::msg_void_id_id(
+                        root,
+                        sel("insertSublayer:above:"),
+                        fresh.layer.raw,
+                        viewport,
+                    );
+                    self.overlays.push(*fresh);
+                    Some(self.overlays.len() - 1)
+                }
+            };
+            for (at, kept) in self.overlays.iter().enumerate() {
+                msg_void_bool(
+                    kept.layer.raw,
+                    sel("setHidden:"),
+                    (Some(at) != overlay) as i8,
+                );
+                if Some(at) == overlay
+                    && let Some(rect) = rect
+                {
+                    msg_void_rect(
+                        kept.layer.raw,
+                        sel("setFrame:"),
+                        Patch::frame(rect, physical, scale),
+                    );
+                }
+            }
+            // Three exact pixel variants handle small movements and returns.
+            if self.overlays.len() > 3 {
+                let at = (0..self.overlays.len()).find(|at| Some(*at) != overlay)?;
+                let mut old = self.overlays.remove(at);
+                return old
+                    .layer
+                    .surface
+                    .take()
+                    .map(|surface| (surface, old.layer.observed_use));
+            }
+            None
         }
+    }
+
+    fn advance_surfaces(&mut self) {
         self.surfaces.frame += 1;
         for shown in &mut self.shown {
             shown.layer.observed_use = shown.layer.observed_use
@@ -663,32 +1003,161 @@ impl Presenter {
                     .as_ref()
                     .is_some_and(|surface| surface.busy());
         }
+    }
+
+    /// Preparation is fallible and changes no visible layer. Only after all
+    /// entering bands and the overlay have backing does one transaction move
+    /// the viewport and replace its departing children.
+    pub(super) unsafe fn present(&mut self, frame: Frame<'_>) -> bool {
+        let Frame {
+            root,
+            display,
+            physical,
+            scale,
+            canvas,
+            text,
+            images,
+            boxes,
+        } = frame;
+        if self.active
+            && let Some(overlay) = self.prior.as_ref().and_then(|prior| {
+                prior.updated_decoration(display, physical, scale, canvas, text, boxes)
+            })
+        {
+            // The complete row/clip prefix and outside picture are identical.
+            // Reuse the partition and its layers; only update the decoration.
+            let Some(viewport) = self.viewport.as_ref().map(|layer| layer.raw) else {
+                return false;
+            };
+            self.advance_surfaces();
+            let cached = CachedText {
+                engine: text,
+                cache: &self.cache,
+            };
+            let Some(prepared) = Self::prepare_overlay(
+                &self.overlays,
+                &mut self.surfaces,
+                overlay.as_ref(),
+                scale,
+                &cached,
+                images,
+            ) else {
+                return false;
+            };
+            let retired = unsafe {
+                let transaction = class("CATransaction");
+                msg_void(transaction, sel("begin"));
+                msg_void_bool(transaction, sel("setDisableActions:"), 1);
+                let retired = self.show_overlay(
+                    prepared,
+                    overlay.as_ref().map(|(rect, _)| *rect),
+                    root,
+                    viewport,
+                    physical,
+                    scale,
+                );
+                msg_void(transaction, sel("commit"));
+                retired
+            };
+            if let Some((surface, observed_use)) = retired {
+                self.surfaces.retire(surface, observed_use);
+            }
+            if let Some(prior) = &mut self.prior {
+                prior.source = display.clone();
+                prior.overlay = overlay;
+            }
+            return true;
+        }
+        let Some(scene) = Scene::new(display, physical, scale, canvas, text, boxes) else {
+            self.prior = None;
+            return false;
+        };
+        let prior = self.prior.as_ref();
+        if !prior.is_some_and(|prior| scene.compatible(prior)) {
+            self.prior = Some(scene);
+            return false;
+        }
+        let translation = prior.and_then(|prior| scene.translation(prior));
+        let dy = translation.unwrap_or(0);
+        if translation.is_none() {
+            // A stationary list may append or edit a few rows. It must not
+            // turn a broad filter/replacement into a CPU repaint of every row.
+            let pixels: usize = scene
+                .bands
+                .iter()
+                .filter(|band| {
+                    !self
+                        .shown
+                        .iter()
+                        .any(|old| old.band.rect == band.rect && band.same_pixels(&old.band))
+                })
+                .map(Band::raster_pixels)
+                .sum();
+            if pixels > MAX_PIXELS {
+                self.prior = Some(scene);
+                return false;
+            }
+        }
+        let offset = if self.active { self.offset + dy } else { 0 };
+        // Periodically rebase through the normal whole frame instead of
+        // letting layer coordinates grow without bound on a long scroll.
+        if offset.unsigned_abs() > 1_000_000 {
+            self.prior = None;
+            return false;
+        }
+        self.advance_surfaces();
         let cached = CachedText {
             engine: text,
             cache: &self.cache,
         };
+        // A stationary row already retains its rendered pixels in its layer.
+        // Cache source rasters only while translating rows, where labels may
+        // recur across entering bands; do not keep a second stationary copy.
+        let row_text: &dyn TextEngine = if dy == 0 { text } else { &cached };
         let mut matched = vec![false; self.shown.len()];
         let mut plan = Vec::with_capacity(scene.bands.len());
-        for band in &scene.bands {
-            let old = self.shown.iter().enumerate().position(|(i, shown)| {
+        for (index, band) in scene.bands.iter().enumerate() {
+            let matches = |i: usize, shown: &Shown| {
                 !matched[i]
                     && band.rect.1 == shown.band.rect.1 + dy
                     && band.same_pixels(&shown.band)
-            });
+            };
+            let old = self
+                .shown
+                .get(index)
+                .filter(|shown| matches(index, shown))
+                .map(|_| index)
+                .or_else(|| {
+                    self.shown
+                        .iter()
+                        .enumerate()
+                        .position(|(i, shown)| matches(i, shown))
+                });
             if let Some(at) = old {
                 matched[at] = true;
                 plan.push(Prepared::Reuse(at));
                 continue;
             }
-            let bitmap = rasterize_with(
-                &band.display,
-                (band.rect.2 - band.rect.0) as usize,
-                (band.rect.3 - band.rect.1) as usize,
-                scale,
-                canvas,
-                &cached,
-                images,
-            );
+            // Cropping saves retained pixels for stationary lists. During
+            // motion, whole entering rows avoid repeating that analysis.
+            let foreground = (dy == 0)
+                .then(|| band.foreground(scale, row_text, boxes))
+                .flatten();
+            let bitmap = match &foreground {
+                Some((_, scene)) => scene.raster(row_text, images),
+                None => match band.solid() {
+                    Some(color) => Bitmap::new(1, 1, color),
+                    None => rasterize_with(
+                        &band.display,
+                        (band.rect.2 - band.rect.0) as usize,
+                        (band.rect.3 - band.rect.1) as usize,
+                        scale,
+                        canvas,
+                        row_text,
+                        images,
+                    ),
+                },
+            };
             let Some(surface) = self.surfaces.prepare(&bitmap) else {
                 return false;
             };
@@ -696,37 +1165,30 @@ impl Presenter {
                 return false;
             };
             unsafe {
-                msg_void_id(layer.raw, sel("setContents:"), surface.raw);
+                if let Some((color, scene)) = foreground {
+                    let physical = (
+                        (band.rect.2 - band.rect.0) as usize,
+                        (band.rect.3 - band.rect.1) as usize,
+                    );
+                    if !layer.set_inset(color, scene.bounds(), physical, scale, surface.raw) {
+                        return false;
+                    }
+                } else {
+                    msg_void_id(layer.raw, sel("setContents:"), surface.raw);
+                }
             }
             layer.surface = Some(surface);
             plan.push(Prepared::Fresh(layer));
         }
-        let mut fresh_overlay = None;
-        let overlay = if let Some((_, paint)) = &scene.overlay {
-            let bitmap = paint.raster(&cached, images);
-            match self.overlays.iter().position(|o| {
-                o.bitmap.width() == bitmap.width()
-                    && o.bitmap.height() == bitmap.height()
-                    && o.bitmap.pixels() == bitmap.pixels()
-            }) {
-                Some(at) => Some(at),
-                None => {
-                    let Some(surface) = self.surfaces.prepare(&bitmap) else {
-                        return false;
-                    };
-                    let Some(mut layer) = (unsafe { Layer::new(scale) }) else {
-                        return false;
-                    };
-                    unsafe {
-                        msg_void_id(layer.raw, sel("setContents:"), surface.raw);
-                    }
-                    layer.surface = Some(surface);
-                    fresh_overlay = Some(Overlay { bitmap, layer });
-                    Some(self.overlays.len())
-                }
-            }
-        } else {
-            None
+        let Some(overlay) = Self::prepare_overlay(
+            &self.overlays,
+            &mut self.surfaces,
+            scene.overlay.as_ref(),
+            scale,
+            &cached,
+            images,
+        ) else {
+            return false;
         };
         if self.viewport.is_none() {
             let Some(layer) = (unsafe { Layer::new(scale) }) else {
@@ -813,37 +1275,15 @@ impl Presenter {
                 }
                 drop(shown);
             }
-            if let Some(fresh) = fresh_overlay {
-                // Immediately above the viewport, still below native islands.
-                msg_void_id_u64(root, sel("insertSublayer:atIndex:"), fresh.layer.raw, 1);
-                self.overlays.push(fresh);
-            }
-            for (at, kept) in self.overlays.iter().enumerate() {
-                msg_void_bool(
-                    kept.layer.raw,
-                    sel("setHidden:"),
-                    (Some(at) != overlay) as i8,
-                );
-                if Some(at) == overlay
-                    && let Some((rect, _)) = &scene.overlay
-                {
-                    msg_void_rect(
-                        kept.layer.raw,
-                        sel("setFrame:"),
-                        Patch::frame(*rect, physical, scale),
-                    );
-                }
-            }
-            // The selected overlay is last when added. Old ones are hidden;
-            // retaining three exact pixel variants handles small movements.
-            if self.overlays.len() > 3 {
-                let at = (0..self.overlays.len()).find(|at| Some(*at) != overlay);
-                if let Some(at) = at {
-                    let mut old = self.overlays.remove(at);
-                    if let Some(surface) = old.layer.surface.take() {
-                        retired.push((surface, old.layer.observed_use));
-                    }
-                }
+            if let Some(surface) = self.show_overlay(
+                overlay,
+                scene.overlay.as_ref().map(|(rect, _)| *rect),
+                root,
+                viewport_raw,
+                physical,
+                scale,
+            ) {
+                retired.push(surface);
             }
             msg_void(transaction, sel("commit"));
         }
@@ -873,6 +1313,86 @@ mod tests {
     }
     use bunny_ui::image_engine::RawImages;
     use bunny_ui::text_engine::PixelFont;
+
+    #[test]
+    fn stationary_row_surfaces_do_not_keep_duplicate_text_rasters() {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let root = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
+            let boxes = MeasureCache::default();
+            let images = RawImages::default();
+            let mut presenter = Presenter::default();
+            assert!(presenter.seed(
+                &growing_scene(0),
+                (800, 600),
+                1,
+                Color::WHITE,
+                &PixelFont,
+                &boxes
+            ));
+            for rows in [1, 2, 3] {
+                assert!(presenter.present(Frame {
+                    root,
+                    display: &growing_scene(rows),
+                    physical: (800, 600),
+                    scale: 1,
+                    canvas: Color::WHITE,
+                    text: &PixelFont,
+                    images: &images,
+                    boxes: &boxes
+                }));
+            }
+            assert_eq!(
+                presenter.cache.bytes.get(),
+                0,
+                "unchanged stationary rows already own their visible pixels"
+            );
+            drop(presenter);
+            msg_void(root, sel("release"));
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    #[test]
+    fn unused_retired_dimensions_expire_as_the_scene_advances() {
+        let mut pool = Surfaces::default();
+        pool.retire(software_patch::Surface::new_opaque((7, 2)).unwrap(), true);
+        pool.frame = 20;
+        let _ = pool.prepare(&Bitmap::new(3, 2, Color::WHITE)).unwrap();
+        assert!(
+            pool.retired.is_empty(),
+            "obsolete dimensions should not remain pinned by a busy cache of another size"
+        );
+    }
+
+    #[test]
+    fn retired_surfaces_follow_recent_sizes_instead_of_freezing_the_pool() {
+        let mut pool = Surfaces::default();
+        for width in 1..=12 {
+            pool.retire(
+                software_patch::Surface::new_opaque((width, 2)).unwrap(),
+                true,
+            );
+        }
+        let recent = software_patch::Surface::new_opaque((20, 2)).unwrap();
+        let raw = recent.raw;
+        // Prevent address recycling from hiding a discarded surface.
+        unsafe { crate::ffi::CFRetain(raw) };
+        pool.retire(recent, true);
+        // Model compositor use that has ended and the required grace period;
+        // no wall-clock wait or concurrent reader is involved in this test.
+        pool.frame = 4;
+        for retired in &mut pool.retired {
+            retired.at = Instant::now() - Duration::from_secs(1);
+        }
+        let reused = pool.prepare(&Bitmap::new(20, 2, Color::WHITE)).unwrap();
+        unsafe { CFRelease(raw) };
+        assert_eq!(
+            reused.raw, raw,
+            "recent compatible storage must remain reusable when the pool fills"
+        );
+        assert!(pool.retired.len() < 12);
+    }
 
     fn scene(offset: f64, duplicate: bool) -> DisplayList {
         let mut commands = vec![
@@ -922,6 +1442,165 @@ mod tests {
         DisplayList::from(commands)
     }
 
+    fn growing_scene(rows: usize) -> DisplayList {
+        let mut commands = vec![
+            DrawCommand::FillRect {
+                rect: rect(0.0, 0.0, 800.0, 600.0),
+                color: Color::WHITE,
+                corner_radius: Corners::ZERO,
+            },
+            DrawCommand::PushClip {
+                rect: rect(16.0, 16.0, 768.0, 560.0),
+                corner_radius: Corners::ZERO,
+            },
+        ];
+        for row in 0..rows {
+            let y = 16.0 + row as f64 * 28.0;
+            commands.push(DrawCommand::FillRect {
+                rect: rect(16.0, y, 768.0, 28.0),
+                color: Color::hex(0xeeeeee),
+                corner_radius: Corners::ZERO,
+            });
+            commands.push(DrawCommand::TextLine {
+                origin: Point {
+                    x: 24.0,
+                    y: y + 4.0,
+                },
+                content: "new line".into(),
+                range: (0, 8),
+                color: Color::BLACK,
+                font: FontSpec::DEFAULT,
+            });
+        }
+        commands.push(DrawCommand::PopClip);
+        DisplayList::from(commands)
+    }
+
+    #[test]
+    fn a_growing_list_keeps_its_proved_empty_space_without_missing_pixels() {
+        let cache = MeasureCache::default();
+        for scale in [1, 2] {
+            for rows in [0, 1, 2, 10, 20] {
+                let display = growing_scene(rows);
+                let size = (800 * scale, 600 * scale);
+                let admitted = Scene::new(&display, size, scale, Color::WHITE, &PixelFont, &cache)
+                    .expect("the uncovered prefix background is uniform");
+                let whole = rasterize_with(
+                    &display,
+                    size.0,
+                    size.1,
+                    scale,
+                    Color::WHITE,
+                    &PixelFont,
+                    &RawImages::default(),
+                );
+                let mut composed = whole.pixels().to_vec();
+                // Poison the viewport first: the bands must cover ALL of it,
+                // including the empty tail, rather than relying on old pixels.
+                let vp = admitted.viewport;
+                for y in vp.1..vp.3 {
+                    for x in vp.0..vp.2 {
+                        composed[y as usize * size.0 + x as usize] = 0;
+                    }
+                }
+                for band in &admitted.bands {
+                    let tile = rasterize_with(
+                        &band.display,
+                        (band.rect.2 - band.rect.0) as usize,
+                        (band.rect.3 - band.rect.1) as usize,
+                        scale,
+                        Color::WHITE,
+                        &PixelFont,
+                        &RawImages::default(),
+                    );
+                    for y in band.rect.1.max(vp.1)..band.rect.3.min(vp.3) {
+                        for x in vp.0..vp.2 {
+                            composed[y as usize * size.0 + x as usize] =
+                                tile.pixels()[(y - band.rect.1) as usize * tile.width()
+                                    + (x - band.rect.0) as usize];
+                        }
+                    }
+                }
+                assert_eq!(composed, whole.pixels(), "scale={scale}, rows={rows}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_wide_row_keeps_only_its_foreground_pixels() {
+        let cache = MeasureCache::default();
+        for scale in [1, 2] {
+            let display = growing_scene(1);
+            let scene = Scene::new(
+                &display,
+                (800 * scale, 600 * scale),
+                scale,
+                Color::WHITE,
+                &PixelFont,
+                &cache,
+            )
+            .unwrap();
+            let band = &scene.bands[0];
+            let (color, foreground) = band
+                .foreground(scale, &PixelFont, &cache)
+                .expect("the short text leaves most of its row uniform");
+            let physical = (
+                (band.rect.2 - band.rect.0) as usize,
+                (band.rect.3 - band.rect.1) as usize,
+            );
+            let whole = rasterize_with(
+                &band.display,
+                physical.0,
+                physical.1,
+                scale,
+                Color::WHITE,
+                &PixelFont,
+                &RawImages::default(),
+            );
+            let patch = foreground.raster(&PixelFont, &RawImages::default());
+            assert!(patch.width() * patch.height() * 2 < whole.width() * whole.height());
+            let mut composed = Bitmap::new(physical.0, physical.1, color).pixels().to_vec();
+            let (x0, y0, x1, y1) = foreground.bounds();
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    composed[y as usize * physical.0 + x as usize] =
+                        patch.pixels()[(y - y0) as usize * patch.width() + (x - x0) as usize];
+                }
+            }
+            assert_eq!(composed, whole.pixels());
+        }
+    }
+
+    #[test]
+    fn uncovered_text_and_nonuniform_backgrounds_are_not_empty_space() {
+        let cache = MeasureCache::default();
+        for rows in [0, 1, 2] {
+            for inside in [false, true] {
+                let mut commands = growing_scene(rows).as_slice().to_vec();
+                commands.insert(
+                    if inside { 2 } else { 1 },
+                    DrawCommand::FillRect {
+                        rect: rect(20.0, 400.0, 40.0, 30.0),
+                        color: Color::BLACK,
+                        corner_radius: Corners::ZERO,
+                    },
+                );
+                assert!(
+                    Scene::new(
+                        &DisplayList::from(commands),
+                        (800, 600),
+                        1,
+                        Color::WHITE,
+                        &PixelFont,
+                        &cache
+                    )
+                    .is_none(),
+                    "rows={rows}, inside={inside}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn composed_bands_match_whole_pixels_at_two_scales_and_fractional_origins() {
         let cache = MeasureCache::default();
@@ -961,8 +1640,7 @@ mod tests {
                     }
                 }
                 if let Some((rect, overlay)) = &admitted.overlay {
-                    let tile =
-                        overlay.raster(&PixelFont, &RawImages::default());
+                    let tile = overlay.raster(&PixelFont, &RawImages::default());
                     for y in rect.1..rect.3 {
                         for x in rect.0..rect.2 {
                             composed[y as usize * size.0 + x as usize] = tile.pixels()
@@ -973,6 +1651,126 @@ mod tests {
                 assert_eq!(composed, whole.pixels(), "scale={scale} offset={offset}");
             }
         }
+    }
+
+    #[test]
+    fn decoration_updates_preserve_the_partition_and_refuse_changed_rows() {
+        let cache = MeasureCache::default();
+        for scale in [1, 2] {
+            let first = scene(0.0, false);
+            let prior = Scene::new(
+                &first,
+                (180 * scale, 130 * scale),
+                scale,
+                Color::WHITE,
+                &PixelFont,
+                &cache,
+            )
+            .unwrap();
+            let mut commands = first.as_slice().to_vec();
+            let Some(DrawCommand::FillRect { rect: thumb, .. }) = commands.last_mut() else {
+                unreachable!()
+            };
+            thumb.size.height -= 1.0;
+            let second = DisplayList::from(commands.clone());
+            let update = prior
+                .updated_decoration(
+                    &second,
+                    (180 * scale, 130 * scale),
+                    scale,
+                    Color::WHITE,
+                    &PixelFont,
+                    &cache,
+                )
+                .expect("only the decoration changed");
+            let (bounds, paint) = update.unwrap();
+            let whole = rasterize_with(
+                &second,
+                180 * scale,
+                130 * scale,
+                scale,
+                Color::WHITE,
+                &PixelFont,
+                &RawImages::default(),
+            );
+            let bitmap = paint.raster(&PixelFont, &RawImages::default());
+            for y in bounds.1..bounds.3 {
+                for x in bounds.0..bounds.2 {
+                    assert_eq!(
+                        whole.pixels()[y as usize * whole.width() + x as usize],
+                        bitmap.pixels()
+                            [(y - bounds.1) as usize * bitmap.width() + (x - bounds.0) as usize]
+                    );
+                }
+            }
+            let DrawCommand::TextLine { color, .. } = &mut commands[3] else {
+                unreachable!()
+            };
+            *color = Color::WHITE;
+            assert!(
+                prior
+                    .updated_decoration(
+                        &DisplayList::from(commands),
+                        (180 * scale, 130 * scale),
+                        scale,
+                        Color::WHITE,
+                        &PixelFont,
+                        &cache
+                    )
+                    .is_none(),
+                "row changes require a new partition proof"
+            );
+            let mut commands = first.as_slice().to_vec();
+            let Some(DrawCommand::FillRect { rect: r, .. }) = commands.last_mut() else {
+                unreachable!()
+            };
+            *r = rect(0.0, 0.0, 4.0, 4.0);
+            assert!(
+                prior
+                    .updated_decoration(
+                        &DisplayList::from(commands),
+                        (180 * scale, 130 * scale),
+                        scale,
+                        Color::WHITE,
+                        &PixelFont,
+                        &cache
+                    )
+                    .is_none(),
+                "changes outside the viewport require a whole scene proof"
+            );
+        }
+    }
+
+    #[test]
+    fn a_one_pixel_thumb_change_keeps_the_overlay_backing_size() {
+        let cache = MeasureCache::default();
+        let first = scene(0.0, false);
+        let mut second = first.as_slice().to_vec();
+        let Some(DrawCommand::FillRect { rect, .. }) = second.last_mut() else {
+            unreachable!()
+        };
+        rect.size.height -= 1.0;
+        let a = Scene::new(&first, (180, 130), 1, Color::WHITE, &PixelFont, &cache).unwrap();
+        let b = Scene::new(
+            &DisplayList::from(second),
+            (180, 130),
+            1,
+            Color::WHITE,
+            &PixelFont,
+            &cache,
+        )
+        .unwrap();
+        let (a_bounds, a_paint) = a.overlay.unwrap();
+        let (b_bounds, b_paint) = b.overlay.unwrap();
+        assert_eq!(
+            a_bounds, b_bounds,
+            "the surface can be reused across small geometry changes"
+        );
+        assert_ne!(
+            a_paint.raster(&PixelFont, &RawImages::default()).pixels(),
+            b_paint.raster(&PixelFont, &RawImages::default()).pixels(),
+            "the exact thumb pixels still change"
+        );
     }
 
     #[test]
