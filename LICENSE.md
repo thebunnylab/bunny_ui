@@ -41,6 +41,14 @@ A product is "Noncommercial" when:
    support, hosting, or additional features, or distributing it as part of
    or to promote a paid product or service.
 
+## Additional Permission: Project Templates
+
+The files in `crates/bunny_cli/templates/`, and every file the `bunny`
+command-line tool writes into a project from them, are also available
+under the Zero-Clause BSD License, as `crates/bunny_cli/templates/LICENSE`
+states, so a project created with `bunny new` is entirely its author's.
+Gradle's wrapper files among them keep Gradle's own license.
+
 ---
 
 # PolyForm Perimeter License 1.0.1

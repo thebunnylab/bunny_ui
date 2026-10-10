@@ -1,0 +1,28 @@
+<!doctype html>
+<!-- The app's page. It is yours to edit: `bunny` fills the @BUNNY_…@
+     markers on each build — the one at the end of the body becomes the
+     app's wasm and the framework's glue. The app draws into #app, sized
+     by this page's own CSS. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>@BUNNY_APP_NAME@</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+      #app {
+        position: fixed;
+        inset: 0;
+        outline: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app" tabindex="0"></div>
+    @BUNNY_SCRIPTS@
+  </body>
+</html>

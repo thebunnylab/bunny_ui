@@ -1,0 +1,21 @@
+[package]
+name = "bunny-cli"
+version.workspace = true
+edition.workspace = true
+description = "The bunny command — create, check and run bunny-ui apps on macOS, iOS, Windows, Linux, Android and the web"
+license-file.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["bunny-ui", "cli", "gui", "mobile", "scaffold"]
+categories = ["command-line-utilities", "development-tools", "gui"]
+# The templates are data the binary embeds: without them `cargo install`
+# would build a `bunny new` with nothing to write.
+include = ["src/**", "templates/**", "README.md"]
+
+[lib]
+name = "bunny_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bunny"
+path = "src/main.rs"
