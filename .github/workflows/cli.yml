@@ -120,6 +120,10 @@ jobs:
           rustup toolchain install 1.98.1 --profile minimal
           rustup override set 1.98.1
           rustup target add wasm32-unknown-unknown aarch64-linux-android
+      - name: The Android platform the template compiles against
+        # the runner's SDK has its terms accepted; this is a no-op when
+        # the image already carries the platform
+        run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36"'
       - name: The web's site and a signed App Bundle and APK
         # the runner's Android SDK, NDK and JDK; the test makes a
         # throwaway upload key with keytool
