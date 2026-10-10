@@ -3,6 +3,8 @@ name = "bunny-ui-ios"
 version = "0.1.0"
 edition.workspace = true
 description = "bunny-ui iOS shell — UIKit window, touches and the soft keyboard over the shared Apple half, dependency-free Objective-C FFI"
+license-file.workspace = true
+repository.workspace = true
 # every example is declared below with a platform-suffixed artifact
 # name; discovery would re-add the bare names and bring back the
 # collision the Linux shell already paid for

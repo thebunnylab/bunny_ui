@@ -21,17 +21,23 @@ members = [
 
 [workspace.package]
 edition = "2024"
+license-file = "LICENSE.md"
+repository = "https://github.com/thebunnylab/bunny_ui"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-bunny-ui = { path = "crates/bunny_ui", default-features = false }
-bunny-ui-apple = { path = "crates/bunny_ui_apple" }
-bunny-ui-vulkan = { path = "crates/bunny_ui_vulkan" }
+# the published crates carry a version next to the path: crates.io
+# resolves by version, the workspace by path
+bunny-ui = { path = "crates/bunny_ui", version = "0.1.0", default-features = false }
+bunny-ui-apple = { path = "crates/bunny_ui_apple", version = "0.1.0" }
+bunny-ui-vulkan = { path = "crates/bunny_ui_vulkan", version = "0.1.0" }
 countries-core = { path = "crates/countries_core" }
 
 countries-pure = { path = "apps/countries_pure" }
-motor = { path = "crates/motor" }
+# `motor` was taken on crates.io: the package publishes as
+# `bunny-ui-motor`, and the key keeps every `use motor::` as it was
+motor = { package = "bunny-ui-motor", path = "crates/motor", version = "0.1.0" }
 
 # The wasm shipping profile — small over fast at the download border.
 # The plain release profile stays untouched: it is the benchmarks'
