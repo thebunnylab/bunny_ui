@@ -7,7 +7,7 @@ description = "The arena's own apps: the scenes every framework is measured on, 
 
 [dependencies]
 serde_json.workspace = true
-bunny-ui = { path = "../../crates/bunny_ui", features = ["gpu"] }
+bunny-ui = { package = "bunny-ui-core", path = "../../crates/bunny_ui", features = ["gpu"] }
 bunny-ui-macos = { path = "../../crates/bunny_ui_macos" }
 
 [[bin]]

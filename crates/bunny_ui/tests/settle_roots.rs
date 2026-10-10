@@ -4,6 +4,8 @@
 //! one surface and then another used to have the second one's settle
 //! skipped (its tasks never ran) and its layout answered with the first
 //! surface's frame.
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use bunny_ui::layout::{Proposal, Size};
 use bunny_ui::prelude::*;
 use bunny_ui::runtime::Runtime;
