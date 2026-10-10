@@ -115,6 +115,26 @@ fn new_in_an_app_adds_only_what_is_missing() {
     assert!(text(&out.stdout).contains("already has every platform"));
 }
 
+/// `doctor` and `devices` ask the real machine; what they answer varies,
+/// but always as valid JSON with the sections every host has.
+#[test]
+fn doctor_and_devices_answer_in_json() {
+    let here = scratch("doctor");
+    let out = bunny(&["doctor", "--json", "-p", "web"], &here);
+    assert!(matches!(out.status.code(), Some(0 | 1)), "{}", text(&out.stderr));
+    let report = bunny_cli::json::parse(text(&out.stdout).trim()).expect("doctor --json is JSON");
+    let sections: Vec<&str> = report.as_array().iter().filter_map(|section| section.str_at(&["section"])).collect();
+    assert_eq!(sections, vec!["rust", "web", "devices"]);
+
+    let out = bunny(&["devices", "--json"], &here);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let devices = bunny_cli::json::parse(text(&out.stdout).trim()).expect("devices --json is JSON");
+    assert!(devices.as_array().iter().any(|device| device.str_at(&["id"]) == Some("web")));
+
+    let out = bunny(&["doctor", "-p", "tvos"], &here);
+    assert_eq!(out.status.code(), Some(2));
+}
+
 #[test]
 fn names_with_quotes_stay_valid_toml() {
     let here = scratch("quotes");
