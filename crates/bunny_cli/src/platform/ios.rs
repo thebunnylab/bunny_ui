@@ -31,19 +31,23 @@ pub fn simulator_target() -> &'static str {
 pub struct App {
     pub path: PathBuf,
     pub bundle_id: String,
+    /// The binary cargo made, outside the bundle.
+    pub binary: PathBuf,
 }
 
 /// Builds the app for the Simulator and assembles its bundle.
 pub fn build_simulator(project: &Project, options: &Options) -> Result<App> {
+    build_simulator_with(project, options, &[])
+}
+
+/// [`build_simulator`] with more features.
+pub fn build_simulator_with(project: &Project, options: &Options, more_features: &[String]) -> Result<App> {
     let id = project.require_id()?;
     let bin = project.require_bin()?;
     let plist_path = project.platform_dir("ios")?.join("Info.plist");
-    let template = std::fs::read_to_string(&plist_path).map_err(crate::error::at(&plist_path))?;
-    let minimum = super::plist_string(&template, "MinimumOSVersion").unwrap_or_else(|| String::from("17.0"));
-    check_minimum(&minimum)?;
-    let mut env = project.build_env();
-    // the binary's own floor, the plist's
-    env.push((String::from("IPHONEOS_DEPLOYMENT_TARGET"), minimum.clone().into()));
+    let env = build_env(project)?;
+    let mut features = options.features.clone();
+    features.extend(more_features.iter().cloned());
     let built = cargo::build(&cargo::Build {
         manifest: project.manifest.clone(),
         package: project.package.clone(),
@@ -51,7 +55,7 @@ pub fn build_simulator(project: &Project, options: &Options) -> Result<App> {
         release: options.release,
         profile: None,
         target: Some(simulator_target().to_string()),
-        features: options.features.clone(),
+        features,
         env,
         rustc_args: Vec::new(),
         quiet: false,
@@ -76,7 +80,20 @@ pub fn build_simulator(project: &Project, options: &Options) -> Result<App> {
         ],
     )?;
     std::fs::write(app.join("Info.plist"), plist).map_err(crate::error::at(&app))?;
-    Ok(App { path: app, bundle_id })
+    Ok(App { path: app, bundle_id, binary: built.artifact })
+}
+
+/// What every build for the Simulator carries: who the app is, and the
+/// binary's floor — the plist's `MinimumOSVersion`. A build of the app's
+/// library alone carries the same, or cargo builds the framework again.
+pub fn build_env(project: &Project) -> Result<Vec<(String, std::ffi::OsString)>> {
+    let plist_path = project.platform_dir("ios")?.join("Info.plist");
+    let template = std::fs::read_to_string(&plist_path).map_err(crate::error::at(&plist_path))?;
+    let minimum = super::plist_string(&template, "MinimumOSVersion").unwrap_or_else(|| String::from("17.0"));
+    check_minimum(&minimum)?;
+    let mut env = project.build_env();
+    env.push((String::from("IPHONEOS_DEPLOYMENT_TARGET"), minimum.into()));
+    Ok(env)
 }
 
 fn check_minimum(minimum: &str) -> Result<()> {
@@ -96,6 +113,16 @@ fn check_minimum(minimum: &str) -> Result<()> {
 /// in this terminal. The app's environment is this one's `BUNNY_*` and
 /// `RUST_BACKTRACE`, the way the desktop app gets it.
 pub fn launch_simulator(device: &Device, app: &App, options: &Options) -> Result<Option<Box<dyn Session>>> {
+    launch_simulator_with(device, app, options, &[])
+}
+
+/// [`launch_simulator`], with more of the app's environment.
+pub fn launch_simulator_with(
+    device: &Device,
+    app: &App,
+    options: &Options,
+    app_env: &[(String, std::ffi::OsString)],
+) -> Result<Option<Box<dyn Session>>> {
     // installing over a running app relaunches the OLD binary: end it first
     let _ = process::run("xcrun", &["simctl", "terminate", &device.id, &app.bundle_id], QUICK);
     let installed = process::run("xcrun", &["simctl", "install", &device.id, &app.path.to_string_lossy()], QUICK)
@@ -114,6 +141,9 @@ pub fn launch_simulator(device: &Device, app: &App, options: &Options) -> Result
     command.args(&options.args).stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
     for (key, value) in child_env(std::env::vars_os()) {
         command.env(key, value);
+    }
+    for (key, value) in app_env {
+        command.env(format!("SIMCTL_CHILD_{key}"), value);
     }
     if options.detach {
         let out = command.output().map_err(|error| Error::new(format!("simctl: {error}")))?;

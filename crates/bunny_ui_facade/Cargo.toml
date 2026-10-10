@@ -28,10 +28,11 @@ canvas = ["bunny-ui-core/canvas"]
 svg = ["bunny-ui-core/svg"]
 gpu = ["bunny-ui-core/gpu"]
 codec = ["bunny-ui-core/codec"]
-# Hot reload, for `bunny run` on macOS and Linux: the framework comes in
-# as one shared library the app links, and `app!` writes the entry that
-# each new build of the app's code is loaded by. `bunny run` turns it on
-# for a debug run of an app; no other build needs it.
+# Hot reload, for `bunny run`: the framework comes in as one shared
+# library the app links, and `app!` writes the entry that each new build
+# of the app's code is loaded by. `bunny run` turns it on for a debug run
+# of an app on the desktop, the iOS Simulator or Android; no other build
+# needs it, and the web has no use for it.
 hot = ["shell", "dep:bunny-ui-dylib", "dep:bunny-ui-hot"]
 
 [dependencies]
@@ -56,8 +57,8 @@ bunny-ui-android = { workspace = true, optional = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 bunny-ui-web = { workspace = true, optional = true }
 
-# Hot reload loads new code where the platform lets a debug build do so.
-[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+# Hot reload loads new code wherever a native debug build runs.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bunny-ui-dylib = { workspace = true, optional = true }
 bunny-ui-hot = { workspace = true, optional = true }
 

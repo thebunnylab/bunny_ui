@@ -24,5 +24,14 @@ bunny-ui-hot.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 bunny-ui-macos.workspace = true
 
+[target.'cfg(target_os = "ios")'.dependencies]
+bunny-ui-ios.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+bunny-ui-windows.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 bunny-ui-linux.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+bunny-ui-android.workspace = true

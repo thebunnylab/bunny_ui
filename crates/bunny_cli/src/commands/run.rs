@@ -1,6 +1,7 @@
 //! `bunny run`: build the app for a device, start it there, and keep it
-//! running — its output in this terminal, a save swapping its code on
-//! this computer (hot reload), `R` to restart, `q` to stop.
+//! running — its output in this terminal, a save swapping its code
+//! (hot reload) or, in the browser, rebuilding the page; `R` to
+//! restart, `q` to stop.
 
 use std::time::{Duration, Instant};
 
@@ -8,6 +9,7 @@ use crate::args::{HELP, Matches, Opt};
 use crate::commands::doctor;
 use crate::devices::{self, Device, Kind, Platform, State};
 use crate::error::{Error, Result};
+use crate::hot::watch::Watch;
 use crate::hot::{Change, Hot, Missed};
 use crate::keys::{INTERRUPT, Keys};
 use crate::platform::{self, Options, Session};
@@ -26,10 +28,12 @@ terminal. Without -d it runs on this computer; -d takes an id or a name from
 booted first. `-d web` serves the page and opens the browser; a new build
 reloads it, and the page's console errors show here.
 
-On macOS and Linux, a debug run on this computer reloads hot: a save builds
-the app's library again and swaps the code of the running app, which keeps
-its state. An edit that reaches a type starts the state of the app's own
-types over; a change to Cargo.toml, build.rs or src/main.rs restarts the app.
+A debug run reloads hot — on this computer, in the iOS Simulator and on
+Android: a save builds the app's library again and swaps the code of the
+running app, which keeps its state. An edit that reaches a type starts the
+state of the app's own types over; a change to Cargo.toml, build.rs or
+src/main.rs restarts the app. In the browser, a save rebuilds the page and
+reloads it.
 
 While it runs: r reloads now (restarts, where there is no hot reload), R
 restarts the app with the code as it is now, q stops it.";
@@ -73,10 +77,10 @@ pub fn run(matches: &Matches) -> Result<()> {
         open: !matches.flag("no-open"),
         server: None,
     };
-    let hot = device.kind == Kind::Desktop && !options.release && !options.detach && !matches.flag("no-hot");
+    let hot = device.platform != Platform::Web && !options.release && !options.detach && !matches.flag("no-hot");
     let mut target = Runner::new(&project, &device, options, web)?;
     if hot {
-        match Hot::prepare(&project, &target.options) {
+        match Hot::prepare(&project, &target.options, &device) {
             Ok(hot) => target.hot = Some(hot),
             Err(why) => println!("{}", term::dim(&format!("no hot reload: {why} · r restarts the app"))),
         }
@@ -118,6 +122,8 @@ struct Runner<'a> {
     web: Web,
     /// Hot reload, when this run has it.
     hot: Option<Hot>,
+    /// The page's sources: a save rebuilds the page and reloads it.
+    page: Option<Watch>,
 }
 
 /// The browser's half: the server outlives every rebuild, and the page
@@ -135,7 +141,8 @@ impl<'a> Runner<'a> {
         match (device.platform, device.kind) {
             (Platform::Web, _) if options.detach => Err(Error::usage("the page needs `bunny run` to serve it: run it without --detach")),
             (_, Kind::Desktop | Kind::Browser) | (Platform::Ios, Kind::Simulator) | (Platform::Android, _) => {
-                Ok(Runner { project, device, options, web, hot: None })
+                let page = (device.platform == Platform::Web).then(|| Watch::new(&project.dir));
+                Ok(Runner { project, device, options, web, hot: None, page })
             }
             (Platform::Ios, _) => Err(Error::new("running on an iPhone needs signing, which `bunny` does not do yet")
                 .hint("run on a simulator meanwhile: bunny run -d ios")),
@@ -147,6 +154,11 @@ impl<'a> Runner<'a> {
     /// Builds and starts the app (`None`: started detached).
     fn start(&mut self) -> Result<Option<Box<dyn Session>>> {
         let began = Instant::now();
+        if let Some(hot) = self.hot.as_mut() {
+            let session = hot.start()?;
+            announce(began, self.device);
+            return Ok(Some(session));
+        }
         let session = match (self.device.platform, self.device.kind) {
             (Platform::Web, _) => {
                 let site = platform::web::build(self.project, &self.options, true)?;
@@ -172,11 +184,6 @@ impl<'a> Runner<'a> {
                 let toolchain = platform::android::Toolchain::find()?;
                 let apk = platform::android::build(self.project, &self.options, &toolchain, &self.device.id)?;
                 let session = platform::android::launch(&toolchain, &self.device.id, &apk, &self.options)?;
-                announce(began, self.device);
-                session
-            }
-            (_, Kind::Desktop) if self.hot.is_some() => {
-                let session = self.hot.as_mut().map(Hot::start).transpose()?;
                 announce(began, self.device);
                 session
             }
@@ -234,11 +241,14 @@ const LOOK: Duration = Duration::from_millis(150);
 fn watch(runner: &mut Runner, session: Box<dyn Session>) -> Result<()> {
     let mut keys = Keys::start();
     let hot = runner.hot.is_some();
-    match (keys.is_some(), hot) {
-        (true, true) => println!("{}", term::dim("a save reloads the app · r reload · R restart · q quit · h help")),
-        (true, false) => println!("{}", term::dim("r restart · q quit · h help")),
-        (false, true) => println!("{}", term::dim("a save reloads the app")),
-        (false, false) => {}
+    let page = runner.page.is_some();
+    match (keys.is_some(), hot, page) {
+        (true, true, _) => println!("{}", term::dim("a save reloads the app · r reload · R restart · q quit · h help")),
+        (true, false, true) => println!("{}", term::dim("a save rebuilds the page · r rebuild · q quit · h help")),
+        (true, false, false) => println!("{}", term::dim("r restart · q quit · h help")),
+        (false, true, _) => println!("{}", term::dim("a save reloads the app")),
+        (false, false, true) => println!("{}", term::dim("a save rebuilds the page")),
+        (false, false, false) => {}
     }
     raw(&mut keys);
     let mut app = Some(session);
@@ -256,9 +266,9 @@ fn watch(runner: &mut Runner, session: Box<dyn Session>) -> Result<()> {
             println!("{}", term::dim("save a fix or press R to start it again · q quit"));
             raw(&mut keys);
         }
-        if hot && looked.elapsed() >= LOOK {
+        if (hot || page) && looked.elapsed() >= LOOK {
             looked = Instant::now();
-            match (runner.hot.as_mut().and_then(Hot::poll), app.as_mut()) {
+            match (saved(runner), app.as_mut()) {
                 (None, _) => {}
                 (Some(Change::Code), Some(running)) => {
                     if let Some(why) = reload(runner, running.as_mut(), &mut keys) {
@@ -308,6 +318,18 @@ fn watch(runner: &mut Runner, session: Box<dyn Session>) -> Result<()> {
     }
 }
 
+/// What the saves since the last look ask for: a hot reload, or — in
+/// the browser — a new build of the page.
+fn saved(runner: &mut Runner) -> Option<Change> {
+    if let Some(hot) = runner.hot.as_mut() {
+        return hot.poll();
+    }
+    let changed = runner.page.as_mut()?.changed();
+    let first = changed.first()?;
+    let relative = first.strip_prefix(&runner.project.dir).unwrap_or(first);
+    Some(Change::Restart(format!("{} changed", relative.display())))
+}
+
 /// A hot reload of the code as it is now. `Some(why)`: only a restart
 /// carries the change.
 fn reload(runner: &mut Runner, app: &mut dyn Session, keys: &mut Option<Keys>) -> Option<String> {
@@ -342,8 +364,9 @@ fn restart(
     if let Some(mut running) = app {
         running.stop();
     }
+    let verb = if runner.page.is_some() { "rebuilding the page" } else { "restarting" };
     match why {
-        Some(why) => println!("{}", term::bold(&format!("{why}: restarting…"))),
+        Some(why) => println!("{}", term::bold(&format!("{why}: {verb}…"))),
         None => println!("{}", term::bold("Restarting…")),
     }
     let started = match runner.start() {

@@ -44,7 +44,8 @@
 //! theme, depends on `bunny-ui` with `default-features = false`: the
 //! views without a shell, the window left to the application.
 //!
-//! `bunny run` reloads an app hot on macOS and Linux. It builds the app
+//! `bunny run` reloads an app hot on the desktop, the iOS Simulator and
+//! Android. It builds the app
 //! with the `hot` feature: the framework comes in as one shared library,
 //! and [`app!`] makes each new build of the app's library loadable by
 //! the running app, which keeps its state. An app does not turn the
@@ -58,7 +59,7 @@ mod entry;
 // Naming the crate is what links it: without the name, the compiler
 // would link the framework into the app statically and leave the shared
 // library out.
-#[cfg(all(feature = "hot", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(feature = "hot", any(target_os = "macos", target_os = "ios", target_os = "windows", target_os = "linux", target_os = "android")))]
 extern crate bunny_ui_dylib as _;
 
 pub use bunny_ui_core::*;

@@ -115,11 +115,14 @@ dependencies = [
 name = "bunny-ui-dylib"
 version = "0.2.0"
 dependencies = [
+ "bunny-ui-android",
  "bunny-ui-core",
  "bunny-ui-hot",
+ "bunny-ui-ios",
  "bunny-ui-linux",
  "bunny-ui-macos",
  "bunny-ui-motor",
+ "bunny-ui-windows",
 ]
 
 [[package]]

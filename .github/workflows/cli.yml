@@ -5,6 +5,8 @@ on:
     paths:
       - 'crates/bunny_cli/**'
       - 'crates/bunny_ui_facade/**'
+      - 'crates/bunny_ui_hot/**'
+      - 'crates/bunny_ui_dylib/**'
       - 'crates/bunny_ui_web/glue/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -69,3 +71,36 @@ jobs:
             x86_64-pc-windows-msvc x86_64-unknown-linux-gnu
       - name: bunny new, then cargo on the host and every target
         run: cargo test -p bunny-cli --locked --test new_project -- --ignored
+
+  hot-reload:
+    name: hot reload loads new code (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, windows-2025, macos-26]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Pinned compiler
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
+      - name: The Linux shell's link-time libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb1-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-shm0-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libdbus-1-dev libsecret-1-dev libfontconfig-dev libfreetype-dev libharfbuzz-dev
+      - name: Two generations into a running app, without a window
+        # the binary on the framework's shared library loads each build of
+        # the app's library and draws it as text (BUNNY_HOT_CHECK): the
+        # load, the entry and the swap on every desktop, no screen needed
+        run: cargo test -p bunny-cli --locked --test hot_reload -- --ignored
