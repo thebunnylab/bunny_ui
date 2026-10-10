@@ -2,3 +2,7 @@
 /build
 /app/build
 /local.properties
+# the upload key and its passwords: never in git
+/key.properties
+*.jks
+*.keystore

@@ -1,6 +1,8 @@
 //! `bunny build` on a project `bunny new` writes: the web's site with
-//! its files named after their content, and — on a Mac — the app bundle,
-//! signed ad hoc, and its disk image.
+//! its files named after their content; on a Mac, the app bundle, signed
+//! ad hoc, and its disk image; and, with `BUNNY_TEST_ANDROID` set on a
+//! machine with the Android SDK, NDK and a JDK, the signed App Bundle and
+//! APK for arm64-v8a.
 //!
 //! Slow — it builds the framework for release — so it runs on request:
 //! `cargo test -p bunny-cli --test build -- --ignored`.
@@ -57,6 +59,32 @@ fn a_new_project_builds_its_packages() {
         let info = fs::read_to_string(out.join("build-info.json")).unwrap();
         assert!(info.contains("\"signed_by\": \"ad hoc\"") || info.contains("Developer ID"), "{info}");
         assert!(fs::read_to_string(out.join("build.log")).unwrap().contains("$ codesign"));
+    }
+
+    if std::env::var_os("BUNNY_TEST_ANDROID").is_some() {
+        // a throwaway upload key, the way the build's hint makes one
+        let keystore = here.join("upload.jks");
+        let keytool = std::env::var_os("JAVA_HOME")
+            .map(|home| Path::new(&home).join("bin").join(format!("keytool{}", std::env::consts::EXE_SUFFIX)))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| PathBuf::from("keytool"));
+        let made = Command::new(keytool)
+            .args(["-genkeypair", "-storepass", "test1234", "-keypass", "test1234", "-alias", "upload"])
+            .args(["-keyalg", "RSA", "-keysize", "2048", "-validity", "10000", "-dname", "CN=bunny test", "-keystore"])
+            .arg(&keystore)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        let properties = format!("storeFile={}\nstorePassword=test1234\nkeyAlias=upload\nkeyPassword=test1234\n", keystore.display());
+        fs::write(app.join("android/key.properties"), properties.replace('\\', "/")).unwrap();
+
+        bunny(&app, &["build", "android", "--abi", "arm64-v8a", "--build-number", "5"]);
+        let out = app.join("build/android");
+        for file in ["shipped-0.1.0.aab", "shipped-0.1.0.apk", "native-debug-symbols.zip"] {
+            assert!(out.join(file).is_file(), "{file} is missing");
+        }
+        let info = fs::read_to_string(out.join("build-info.json")).unwrap();
+        assert!(info.contains("versionCode='5'") && info.contains("name='io.bunny.shipped'"), "{info}");
     }
     let _ = fs::remove_dir_all(&here);
 }

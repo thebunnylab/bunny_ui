@@ -3,6 +3,7 @@
 //! `build/<platform>/`, next to a `build-info.json` that says what each
 //! file is and a `build.log` with every command that made them.
 
+pub mod android;
 pub mod macos;
 pub mod web;
 
@@ -31,6 +32,9 @@ pub struct Options {
     pub universal: bool,
     /// macOS: a disk image next to the app.
     pub dmg: bool,
+    /// Android: the ABIs to build for — none named, every one bunny-ui
+    /// supports.
+    pub abis: Vec<String>,
 }
 
 /// Who signs a macOS app.
@@ -63,11 +67,24 @@ impl Log {
 
     /// Runs `program`, its command line and its answer kept.
     pub fn run<S: AsRef<OsStr>>(&mut self, program: &str, args: &[S], timeout: Duration) -> Result<Output> {
+        self.run_with(program, args, &[], timeout)
+    }
+
+    /// [`Log::run`] with more environment — which the log leaves out:
+    /// it may hold a password.
+    pub fn run_with<S: AsRef<OsStr>>(
+        &mut self,
+        program: &str,
+        args: &[S],
+        env: &[(&str, &OsStr)],
+        timeout: Duration,
+    ) -> Result<Output> {
         let line: Vec<String> = std::iter::once(program.to_string())
             .chain(args.iter().map(|arg| quote(&arg.as_ref().to_string_lossy())))
             .collect();
         self.text.push_str(&format!("$ {}\n", line.join(" ")));
-        let out = process::run(program, args, timeout).map_err(|error| Error::new(format!("{program}: {error}")))?;
+        let out = process::run_in(program, args, None, env, timeout)
+            .map_err(|error| Error::new(format!("{program}: {error}")))?;
         for text in [&out.stdout, &out.stderr] {
             if !text.trim().is_empty() {
                 self.text.push_str(text.trim_end());

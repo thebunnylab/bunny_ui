@@ -2,3 +2,4 @@
 //! standard library alone.
 
 pub mod sha;
+pub mod zip;

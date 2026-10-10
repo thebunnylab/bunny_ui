@@ -18,7 +18,7 @@ bunny build macos    # a signed app and its disk image, to hand out
 | --- | --- |
 | `bunny new` | Create an app with every platform's files in place |
 | `bunny run` | Build the app for a device and run it, its output here; a save reloads it hot, `R` restarts, `q` stops |
-| `bunny build` | Build the app to ship: a site for the web, a signed and notarized app for macOS |
+| `bunny build` | Build the app to ship: a site for the web, a signed and notarized app for macOS, a signed bundle for Google Play |
 | `bunny doctor` | Check what this machine needs for each platform — and offer to install what it can |
 | `bunny setup android` | Install the Android toolchain — SDK, NDK, emulator, a JDK — without Android Studio |
 | `bunny devices` | List where the app can run: this computer, the browser, simulators, emulators, phones |
@@ -131,6 +131,18 @@ override them for one build.
   and the ticket stapled to it and to the app. `--universal` builds for Apple
   silicon and Intel, `--no-dmg` stops at the app, `--no-codesign` leaves it
   unsigned.
+- **`android`** — `<package>-<version>.aab` for Google Play and `.apk` for a
+  direct install, for arm64-v8a and x86_64 (`--abi` picks). cargo builds the
+  app's library for each ABI; `bunny` strips it with the NDK's `llvm-strip`
+  and keeps the whole one in `native-debug-symbols.zip`, which Play Console
+  reads crash reports against. The project's Gradle packs and signs with the
+  upload key from `android/key.properties` (`storeFile`, read from
+  `android/`, `storePassword`, `keyAlias`, `keyPassword` — kept out of git) or
+  from `BUNNY_ANDROID_KEYSTORE`, `_KEYSTORE_PASSWORD`, `_KEY_ALIAS` and
+  `_KEY_PASSWORD`; the passwords reach Gradle through its environment, never a
+  command line. A release without a key stops, with the `keytool` line that
+  makes one. `apksigner`, `zipalign -P 16` (the 16 KB pages Play requires) and
+  `aapt2` check the APK.
 
 ## `bunny setup android`
 
@@ -140,4 +152,4 @@ and creates an emulator, and a JDK for Gradle (Temurin, checked against its
 SHA-256). The Android SDK's terms are shown for you to accept before anything is
 installed (`--accept-android-terms` for CI); Google's usage metrics stay off.
 
-Coming next: iPhones, and `bunny build` for iOS, Android, Windows and Linux.
+Coming next: iPhones, and `bunny build` for iOS, Windows and Linux.

@@ -364,16 +364,16 @@ fn android_section(toolchain: &Option<rust::Rust>, env: &android::Env) -> Sectio
             &[SETUP],
         )),
     }
-    for (path, title, package) in [
-        (android::adb(&sdk), "platform-tools (adb)", "platform-tools"),
-        (android::emulator(&sdk), "the emulator", "emulator"),
-    ] {
-        if path.is_file() {
-            section.checks.push(Check::ok(title));
-        } else {
-            let _ = package;
-            section.checks.push(Check::fail(format!("No {title}"), &[SETUP]));
-        }
+    if android::adb(&sdk).is_file() {
+        section.checks.push(Check::ok("platform-tools (adb)"));
+    } else {
+        section.checks.push(Check::fail("No platform-tools (adb)", &[SETUP]));
+    }
+    // a build needs no emulator, and neither does a phone
+    if android::emulator(&sdk).is_file() {
+        section.checks.push(Check::ok("the emulator"));
+    } else {
+        section.checks.push(Check::warn("No emulator (a phone with USB debugging works, and a build needs none)", &[SETUP]));
     }
     if android::has_platform(&sdk) {
         section.checks.push(Check::ok(format!("Android {} platform (API {})", android::COMPILE_SDK, android::COMPILE_SDK)));
