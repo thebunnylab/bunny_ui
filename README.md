@@ -34,7 +34,7 @@ bunny-ui = { version = "0.2", default-features = false }
 ## Quick look
 
 ```rust
-use bunny_ui::layout::Size;
+// src/lib.rs
 use bunny_ui::prelude::*;
 
 #[derive(Clone, Copy)]
@@ -51,17 +51,28 @@ impl Component for Counter {
     }
 }
 
+fn home() -> impl View {
+    Counter { count: State::new(0) }
+}
+
+bunny_ui::app!(home, bunny_ui::AppConfig::new().size(280.0, 180.0));
+```
+
+```rust
+// src/main.rs
 fn main() {
-    let counter = Counter { count: State::new(0) };
-    bunny_ui::run_window("Counter", Size { width: 280.0, height: 180.0 }, counter);
+    counter::run()
 }
 ```
 
 The text node records the read. A tap changes the state and updates that node
 without running the component body again. `text(self.count)` also binds directly;
-`text!("Count: {}", self.count)` adds formatting. The same `main` opens a native
-window on macOS, iOS, Windows, Linux and Android; the web starts from the page
-(`bunny_ui::platform::start`).
+`text!("Count: {}", self.count)` adds formatting.
+
+`app!` writes the entry each platform expects: `run()` opens the native window on
+macOS, iOS, Windows and Linux, the same `run` starts the Android activity, and
+the web gets the `start` export its page boots. The desktop and iOS build the
+binary; Android and the web build the library.
 
 ## Signals and subscriptions
 
