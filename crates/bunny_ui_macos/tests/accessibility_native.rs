@@ -31,6 +31,8 @@ mod probe {
         #[link_name = "objc_msgSend"]
         fn point_object(object: Id, selector: Sel, point: CGPoint) -> Id;
         #[link_name = "objc_msgSend"]
+        fn rectangle_object(object: Id, selector: Sel, frame: CGRect) -> Id;
+        #[link_name = "objc_msgSend"]
         fn set_point(object: Id, selector: Sel, point: CGPoint);
         #[link_name = "objc_msgSend"]
         fn allowed(object: Id, selector: Sel, requested: Sel) -> i8;
@@ -38,6 +40,8 @@ mod probe {
         fn void(object: Id, selector: Sel);
         #[link_name = "objc_msgSend"]
         fn set_object(object: Id, selector: Sel, value: Id);
+        #[link_name = "objc_msgSend"]
+        fn bool_object(object: Id, selector: Sel, value: Id) -> i8;
         #[link_name = "objc_msgSend"]
         fn set_bool(object: Id, selector: Sel, value: i8);
     }
@@ -166,6 +170,71 @@ mod probe {
                 },
             );
             assert_eq!(hit, field, "native hit testing and screen bounds agree");
+            let native = rectangle_object(
+                object(class("NSButton"), sel("alloc")),
+                sel("initWithFrame:"),
+                CGRect {
+                    origin: CGPoint { x: 20.0, y: 20.0 },
+                    size: bunny_ui_apple::ffi::CGSize {
+                        width: 180.0,
+                        height: 30.0,
+                    },
+                },
+            );
+            set_object(
+                native,
+                sel("setTitle:"),
+                bunny_ui_apple::ffi::ns_string("Hosted control"),
+            );
+            set_object(view, sel("addSubview:"), native);
+            // AppKit exposes the button's cell rather than its NSView.
+            let native_element = named(view, "Hosted control");
+            assert_eq!(
+                property(native_element, "accessibilityRole").as_deref(),
+                Some("AXButton")
+            );
+            let native_frame = rectangle(native_element, sel("accessibilityFrame"));
+            assert!(native_frame.size.width > 0.0 && native_frame.size.height > 0.0);
+            assert_eq!(
+                point_object(
+                    view,
+                    sel("accessibilityHitTest:"),
+                    CGPoint {
+                        x: native_frame.origin.x + native_frame.size.width / 2.0,
+                        y: native_frame.origin.y + native_frame.size.height / 2.0,
+                    }
+                ),
+                native_element,
+                "native hosted controls keep AppKit hit testing"
+            );
+            void(native, sel("removeFromSuperview"));
+            void(native, sel("release"));
+            let native_editor = rectangle_object(
+                object(class("NSTextField"), sel("alloc")),
+                sel("initWithFrame:"),
+                CGRect {
+                    origin: CGPoint { x: 20.0, y: 60.0 },
+                    size: bunny_ui_apple::ffi::CGSize {
+                        width: 180.0,
+                        height: 30.0,
+                    },
+                },
+            );
+            set_object(view, sel("addSubview:"), native_editor);
+            assert_eq!(
+                bool_object(window, sel("makeFirstResponder:"), native_editor),
+                1
+            );
+            let native_focus = object(native_editor, sel("accessibilityFocusedUIElement"));
+            assert!(!native_focus.is_null() && native_focus != view);
+            assert_eq!(
+                object(view, sel("accessibilityFocusedUIElement")),
+                native_focus,
+                "native hosted editors keep their accessibility focus"
+            );
+            assert_eq!(bool_object(window, sel("makeFirstResponder:"), view), 1);
+            void(native_editor, sel("removeFromSuperview"));
+            void(native_editor, sel("release"));
             let window_frame = rectangle(window, sel("frame"));
             set_point(
                 window,

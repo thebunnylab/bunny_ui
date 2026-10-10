@@ -38,9 +38,13 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn append(object: Id, selector: Sel, value: Id);
     #[link_name = "objc_msgSend"]
-    fn is_kind(object: Id, selector: Sel, value: Id) -> i8;
+    fn predicate(object: Id, selector: Sel, value: Id) -> i8;
+    #[link_name = "objc_msgSend"]
+    fn boolean(object: Id, selector: Sel) -> i8;
     #[link_name = "objc_msgSendSuper"]
     fn super_object(object: *const Super, selector: Sel) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn hit_object(object: Id, selector: Sel, point: CGPoint) -> Id;
 }
 
 #[repr(C)]
@@ -466,6 +470,32 @@ extern "C" fn view_focused(this: Id, _: Sel) -> Id {
         return this;
     };
     surface.activate();
+    // A hosted native editor owns its first responder and its own AX focus.
+    // Retained Bunny fields use this view as first responder instead.
+    unsafe {
+        let mut responder = msg_id(msg_id(this, sel("window")), sel("firstResponder"));
+        // AppKit's shared field editor speaks for its owning text control.
+        if predicate(responder, sel("isKindOfClass:"), class("NSText")) != 0
+            && boolean(responder, sel("isFieldEditor")) != 0
+        {
+            let owner = msg_id(responder, sel("delegate"));
+            if predicate(owner, sel("isKindOfClass:"), class("NSView")) != 0
+                && predicate(owner, sel("isDescendantOf:"), this) != 0
+            {
+                responder = owner;
+            }
+        }
+        if responder != this
+            && predicate(responder, sel("isKindOfClass:"), class("NSView")) != 0
+            && predicate(responder, sel("isDescendantOf:"), this) != 0
+        {
+            let focused = msg_id(responder, sel("accessibilityFocusedUIElement"));
+            if !focused.is_null() {
+                return focused;
+            }
+        }
+    }
+
     surface
         .elements
         .borrow()
@@ -473,22 +503,40 @@ extern "C" fn view_focused(this: Id, _: Sel) -> Id {
         .find(|element| element.node.borrow().focused)
         .map_or(this, |element| element.object)
 }
+fn contains(frame: CGRect, point: CGPoint) -> bool {
+    point.x >= frame.origin.x
+        && point.y >= frame.origin.y
+        && point.x < frame.origin.x + frame.size.width
+        && point.y < frame.origin.y + frame.size.height
+}
 extern "C" fn view_hit(this: Id, _: Sel, point: CGPoint) -> Id {
     let Some(surface) = surface(this) else {
         return this;
     };
     surface.activate();
+    // Native hosted controls expose AppKit's own elements (for example an
+    // NSButtonCell), which may perform deeper hit testing than their view.
+    unsafe {
+        let native = super_object(
+            &Super {
+                receiver: this,
+                superclass: class("NSView"),
+            },
+            sel("accessibilityChildren"),
+        );
+        for index in (0..count(native, sel("count"))).rev() {
+            let child = object_at(native, sel("objectAtIndex:"), index);
+            if contains(msg_rect(child, sel("accessibilityFrame")), point) {
+                let hit = hit_object(child, sel("accessibilityHitTest:"), point);
+                return if hit.is_null() { child } else { hit };
+            }
+        }
+    }
     let elements = surface.elements.borrow().clone();
     elements
         .iter()
         .rev()
-        .find(|element| {
-            let frame = element.frame();
-            point.x >= frame.origin.x
-                && point.y >= frame.origin.y
-                && point.x < frame.origin.x + frame.size.width
-                && point.y < frame.origin.y + frame.size.height
-        })
+        .find(|element| contains(element.frame(), point))
         .map_or(this, |element| element.object)
 }
 extern "C" fn element_alive(this: Id, _: Sel) -> i8 {
@@ -566,7 +614,7 @@ extern "C" fn element_set_focus(this: Id, _: Sel, focused: i8) {
 extern "C" fn element_set_value(this: Id, _: Sel, value: Id) {
     if let Some(element) = element(this)
         && !value.is_null()
-        && unsafe { is_kind(value, sel("isKindOfClass:"), class("NSString")) } != 0
+        && unsafe { predicate(value, sel("isKindOfClass:"), class("NSString")) } != 0
     {
         let text = unsafe { super::text_argument_to_string(value) };
         element.action(Action::SetText(text));

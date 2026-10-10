@@ -62,7 +62,8 @@ reject actions even if a client still retains their former native objects.
 After installing the new snapshot, the adapter sends AppKit notifications for
 changed names, values, focus, membership and geometry. An unchanged scene sends no
 notification and queries schedule no idle frames. Native views embedded inside
-Bunny views keep their AppKit accessibility children. The adapter adds no crate
+Bunny views keep their AppKit accessibility children, hit testing and focus,
+including the owning control of AppKit's shared field editor. The adapter adds no crate
 dependency and stays inside the existing macOS FFI boundary.
 
 `cargo test -p bunny-ui-macos --test accessibility_native --locked` runs a
