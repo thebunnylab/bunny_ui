@@ -1,0 +1,28 @@
+[package]
+name = "bunny-ui-dylib"
+version.workspace = true
+edition.workspace = true
+description = "bunny-ui as one shared library — what `bunny run` links an app's debug build against for hot reload; no other build needs it"
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["bunny-ui", "hot-reload", "gui"]
+categories = ["gui", "development-tools"]
+
+# One Rust dylib with the whole framework inside: the core, the motor,
+# the hot reload and the shell of the target. The app's binary and every
+# generation `bunny run` loads link it, so each thread-local of the
+# framework — where the state lives — exists once in the process.
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+bunny-ui.workspace = true
+motor.workspace = true
+bunny-ui-hot.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+bunny-ui-macos.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bunny-ui-linux.workspace = true
