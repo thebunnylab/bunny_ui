@@ -1,14 +1,21 @@
-//! Hot reload in `bunny run`, on macOS and Linux: a save swaps the code
-//! of the running app, and the app keeps its state.
+//! Hot reload in `bunny run`: a save swaps the code of the running app,
+//! and the app keeps its state — on this computer, in the iOS Simulator
+//! and on Android.
 //!
-//! A session builds the app twice to start. The binary links the
-//! framework as one shared library (`bunny-ui-dylib`, brought in by the
-//! `hot` feature of `bunny-ui`); the app's library builds as a shared
-//! library of its own — the first *generation* — and the binary loads it
-//! before its first frame. After each save, `bunny run` builds the
+//! A session builds the app with the `hot` feature of `bunny-ui`: the
+//! framework links as one shared library (`bunny-ui-dylib`), and the
+//! app's library builds as a shared library of its own — the first
+//! *generation*. On the desktop and in the Simulator, the binary loads
+//! that generation before its first frame; on Android, the APK's library
+//! is the first generation. After each save, `bunny run` builds the
 //! library again, which takes a moment because the framework is built
-//! already, and tells the app on its standard input to load the new
-//! generation (`bunny-ui-hot` is the other end).
+//! already, and hands the running app the new generation (`bunny-ui-hot`
+//! is the other end): the path, where the app can read this computer's
+//! files, or the bytes, on Android.
+//!
+//! The app calls back on a socket this side listens on: the loopback,
+//! which the Simulator shares with the computer, or, on Android, an
+//! abstract socket that `adb reverse` carries here.
 //!
 //! An edit that reaches a type gets a new salt ([`classify`]). A change
 //! the library cannot carry restarts the app: `Cargo.toml`, `build.rs`,
@@ -18,19 +25,24 @@
 pub mod classify;
 pub mod watch;
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use crate::cargo::{self, Target};
+use crate::devices::{Device, Kind, Platform};
 use crate::error::{Error, Result};
 use crate::json::{self, Value};
-use crate::platform::{self, ChildSession, Options, Session};
+use crate::platform::{self, ChildSession, Options, Session, android, ios};
 use crate::process;
 use crate::project::Project;
+use crate::term;
 use crate::toolchains;
 use classify::Reach;
 use watch::Watch;
@@ -38,26 +50,45 @@ use watch::Watch;
 /// How long the app may take to swap to a generation.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long a started app may take to call back.
+const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The abstract socket an Android app calls back on (`bunny-ui-hot`'s).
+const ANDROID_SOCKET: &str = "bunny-hot";
+
+/// Where the hot app runs.
+enum Place {
+    /// This computer.
+    Desktop,
+    /// A booted iOS Simulator.
+    Simulator(Device),
+    /// An Android device or emulator.
+    Android { toolchain: android::Toolchain, serial: String },
+}
+
 /// One `bunny run` with hot reload: how it builds the app, and the code
 /// the running app has.
 pub struct Hot {
     project: Project,
     options: Options,
-    /// The host's triple, named outright: without it, cargo links the
-    /// binary against the framework twice — statically and through the
-    /// shared library — and refuses.
+    place: Place,
+    /// The triple, named outright even for this computer: without it,
+    /// cargo links the binary against the framework twice — statically
+    /// and through the shared library — and refuses.
     target: String,
-    /// The toolchain's own libraries: the standard library that a Rust
-    /// shared library links, and the app with it.
+    /// The environment and the compiler flags of every build for the
+    /// place: a generation built with others builds the framework again.
+    env: Vec<(String, OsString)>,
+    rustc_args: Vec<String>,
+    /// The toolchain's standard library for the target: a Rust shared
+    /// library links it, and the app with it.
     std_libs: PathBuf,
-    /// Where the build put the framework's shared library.
-    libs: PathBuf,
     /// `bunny-ui/hot`, by the name the app's manifest gives bunny-ui.
     feature: String,
     /// Where the generations go, each under a name of its own: a library
     /// loaded once is never loaded again from the same file.
     generations: PathBuf,
-    next: u32,
+    next: Cell<u32>,
     salt: u32,
     /// The library's sources as the running generation was built from
     /// them.
@@ -94,26 +125,39 @@ pub enum Missed {
 }
 
 impl Hot {
-    /// Hot reload for the app on this computer — or why it has none, to
-    /// follow "no hot reload: ".
-    pub fn prepare(project: &Project, options: &Options) -> std::result::Result<Hot, String> {
-        if !cfg!(any(target_os = "macos", target_os = "linux")) {
-            return Err(String::from("it comes to this platform later"));
-        }
+    /// Hot reload for the app on `device` — or why it has none, to follow
+    /// "no hot reload: ".
+    pub fn prepare(project: &Project, options: &Options, device: &Device) -> std::result::Result<Hot, String> {
         if !project.has_lib {
             return Err(String::from("it builds the app's code from src/lib.rs, and this app has none"));
         }
         let rust = toolchains::rust::detect().ok_or_else(|| String::from("rustc did not answer"))?;
-        let feature = hot_feature(project, &rust.host)?;
-        let generations = project.out_dir("hot", &rust.host, false).join("generations");
+        let (place, target, env, rustc_args) = match (device.platform, device.kind) {
+            (_, Kind::Desktop) => (Place::Desktop, rust.host.clone(), project.build_env(), Vec::new()),
+            (Platform::Ios, Kind::Simulator) => {
+                let env = ios::build_env(project).map_err(|error| error.message)?;
+                (Place::Simulator(device.clone()), ios::simulator_target().to_string(), env, Vec::new())
+            }
+            (Platform::Android, _) => {
+                let toolchain = android::Toolchain::find().map_err(|error| error.message)?;
+                let (_, triple) = android::abi(&toolchain, &device.id).map_err(|error| error.message)?;
+                let env = android::cargo_env(project, &toolchain, triple);
+                (Place::Android { toolchain, serial: device.id.clone() }, triple.to_string(), env, android::page_args())
+            }
+            _ => return Err(format!("{} does not load new code yet", device.name)),
+        };
+        let feature = hot_feature(project, &target)?;
+        let generations = project.out_dir("hot", &target, false).join("generations");
         platform::fresh_dir(&generations).map_err(|error| error.message)?;
         Ok(Hot {
-            std_libs: rust.sysroot.join("lib/rustlib").join(&rust.host).join("lib"),
-            libs: PathBuf::new(),
-            target: rust.host,
+            std_libs: rust.sysroot.join("lib/rustlib").join(&target).join("lib"),
+            place,
+            target,
+            env,
+            rustc_args,
             feature,
             generations,
-            next: 1,
+            next: Cell::new(1),
             salt: 1,
             sources: BTreeMap::new(),
             watch: Watch::new(&project.dir),
@@ -122,19 +166,49 @@ impl Hot {
         })
     }
 
-    /// Builds the binary and the first generation, and starts the app.
+    /// Builds the app with its first generation, and starts it.
     pub fn start(&mut self) -> Result<Box<dyn Session>> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|error| Error::new(format!("no port for the app to call back on: {error}")))?;
+        let port = listener.local_addr().map(|address| address.port()).unwrap_or_default().to_string();
         // what the build reads, looked at before it: a save during the
         // build is a change the next look finds
         self.watch = Watch::new(&self.project.dir);
         let sources = read_sources(&self.project.dir);
-        let (executable, built) =
-            platform::desktop::build_with(&self.project, &self.options, Some(&self.target), std::slice::from_ref(&self.feature))?;
-        self.libs = built.parent().map(|dir| dir.join("deps")).unwrap_or_default();
-        let (generation, _) = self.build_generation(self.salt)?;
-        let session = launch(&executable, &generation, &[&self.std_libs, &self.libs], &self.options)?;
+        let feature = std::slice::from_ref(&self.feature);
+        let (app, bytes) = match &self.place {
+            Place::Desktop => {
+                let (executable, built) = platform::desktop::build_with(&self.project, &self.options, Some(&self.target), feature)?;
+                let (generation, _) = self.build_generation(self.salt)?;
+                let env = [("BUNNY_HOT_PORT", OsString::from(&port)), ("BUNNY_HOT_GENERATION", generation.into_os_string())];
+                (launch(&executable, &env, &[self.std_libs.clone(), deps(&built)], &self.options)?, false)
+            }
+            Place::Simulator(device) => {
+                let app = ios::build_simulator_with(&self.project, &self.options, feature)?;
+                let (generation, _) = self.build_generation(self.salt)?;
+                let libs = std::env::join_paths([self.std_libs.clone(), deps(&app.binary)]).unwrap_or_default();
+                let env = [
+                    (String::from("BUNNY_HOT_PORT"), OsString::from(&port)),
+                    (String::from("BUNNY_HOT_GENERATION"), generation.into_os_string()),
+                    (String::from("DYLD_LIBRARY_PATH"), libs),
+                ];
+                let session = ios::launch_simulator_with(device, &app, &self.options, &env)?;
+                (session.ok_or_else(|| Error::new("the app started detached"))?, false)
+            }
+            Place::Android { toolchain, serial } => {
+                let hot = android::HotBuild { feature: &self.feature, salt: self.salt, std_libs: &self.std_libs };
+                let apk = android::build_with(&self.project, &self.options, toolchain, serial, Some(hot))?;
+                let socket = format!("localabstract:{ANDROID_SOCKET}");
+                let reversed = toolchain.adb(serial, &["reverse", &socket, &format!("tcp:{port}")])?;
+                if !reversed.ok() {
+                    println!("{}", term::warn(&format!("adb reverse failed: {}", reversed.stderr.trim())));
+                }
+                let session = android::launch(toolchain, serial, &apk, &self.options)?;
+                (session.ok_or_else(|| Error::new("the app started detached"))?, true)
+            }
+        };
         self.sources = sources;
-        Ok(session)
+        Ok(call_back(listener, app, bytes))
     }
 
     /// What the saves since the last look ask for — `None` when nothing
@@ -170,9 +244,11 @@ impl Hot {
 
     /// The library as a shared library of its own, salted, copied under a
     /// new name — and the dependencies the build compiled again.
-    fn build_generation(&mut self, salt: u32) -> Result<(PathBuf, Vec<String>)> {
+    fn build_generation(&self, salt: u32) -> Result<(PathBuf, Vec<String>)> {
         let mut features = self.options.features.clone();
         features.push(self.feature.clone());
+        let mut rustc_args = self.rustc_args.clone();
+        rustc_args.extend([String::from("-C"), format!("metadata=bunny-salt-{salt}")]);
         let built = cargo::build(&cargo::Build {
             manifest: self.project.manifest.clone(),
             package: self.project.package.clone(),
@@ -181,24 +257,30 @@ impl Hot {
             profile: None,
             target: Some(self.target.clone()),
             features,
-            env: self.project.build_env(),
-            rustc_args: vec![String::from("-C"), format!("metadata=bunny-salt-{salt}")],
+            env: self.env.clone(),
+            rustc_args,
             quiet: true,
         })?;
         let extension = built.artifact.extension().map(|ext| ext.to_string_lossy().into_owned()).unwrap_or_default();
-        let generation = self.generations.join(format!("generation-{}.{extension}", self.next));
-        self.next += 1;
+        let number = self.next.replace(self.next.get() + 1);
+        let generation = self.generations.join(format!("generation-{number}.{extension}"));
         std::fs::copy(&built.artifact, &generation)
             .map_err(|error| Error::new(format!("{} → {}: {error}", built.artifact.display(), generation.display())))?;
         Ok((generation, built.rebuilt))
     }
 }
 
+/// cargo's `deps` folder next to an artifact: where the framework's
+/// shared library is.
+fn deps(artifact: &Path) -> PathBuf {
+    artifact.parent().map(|dir| dir.join("deps")).unwrap_or_default()
+}
+
 /// `bunny-ui/hot`, by the name the app gives bunny-ui — when the
 /// bunny-ui it resolves to has hot reload.
-fn hot_feature(project: &Project, host: &str) -> std::result::Result<String, String> {
+fn hot_feature(project: &Project, target: &str) -> std::result::Result<String, String> {
     let manifest = project.manifest.to_string_lossy().into_owned();
-    let args = ["metadata", "--format-version", "1", "--filter-platform", host, "--manifest-path", manifest.as_str()];
+    let args = ["metadata", "--format-version", "1", "--filter-platform", target, "--manifest-path", manifest.as_str()];
     let out = process::run_in("cargo", &args, Some(&project.dir), &[], Duration::from_secs(120))
         .map_err(|error| format!("cargo: {error}"))?;
     if !out.ok() {
@@ -268,26 +350,23 @@ fn read_sources(dir: &Path) -> BTreeMap<PathBuf, String> {
     sources
 }
 
-/// The running app, with a line to it: `load` orders go in on its
-/// standard input, and its answers come back among its output.
-struct HotApp {
-    app: ChildSession,
-    input: ChildStdin,
-    answers: Receiver<String>,
-    /// The app took its first generation: it takes the next ones too.
-    hot: bool,
-}
-
-/// Starts the binary on its first generation. Its output comes to this
-/// terminal, but for the answers to `bunny run`.
-fn launch(executable: &Path, generation: &Path, libs: &[&Path], options: &Options) -> Result<Box<dyn Session>> {
+/// Starts the binary on this computer, its output in this terminal.
+fn launch(executable: &Path, env: &[(&str, OsString)], libs: &[PathBuf], options: &Options) -> Result<Box<dyn Session>> {
     let mut command = Command::new(executable);
-    command.args(&options.args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
-    command.env("BUNNY_HOT_GENERATION", generation);
+    command.args(&options.args).stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    for (key, value) in env {
+        command.env(key, value);
+    }
     // the shared libraries the binary links: the framework, and the
     // standard library of the toolchain that built it
-    let variable = if cfg!(target_os = "macos") { "DYLD_LIBRARY_PATH" } else { "LD_LIBRARY_PATH" };
-    let mut paths: Vec<PathBuf> = libs.iter().map(|dir| dir.to_path_buf()).collect();
+    let variable = if cfg!(target_os = "macos") {
+        "DYLD_LIBRARY_PATH"
+    } else if cfg!(windows) {
+        "PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    };
+    let mut paths = libs.to_vec();
     if let Some(existing) = std::env::var_os(variable) {
         paths.extend(std::env::split_paths(&existing));
     }
@@ -297,38 +376,79 @@ fn launch(executable: &Path, generation: &Path, libs: &[&Path], options: &Option
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         command.env("RUST_BACKTRACE", "1");
     }
-    let mut child =
+    let child =
         command.spawn().map_err(|error| Error::new(format!("{} did not start: {error}", executable.display())))?;
-    let input = child.stdin.take().ok_or_else(|| Error::new("the app's input did not open"))?;
-    let output = child.stdout.take().ok_or_else(|| Error::new("the app's output did not open"))?;
-    let (sender, answers) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(output);
-        let mut line = Vec::new();
-        while reader.read_until(b'\n', &mut line).is_ok_and(|read| read > 0) {
-            let text = String::from_utf8_lossy(&line);
-            match text.strip_prefix("@@bunny-hot ") {
-                Some(answer) => {
-                    let _ = sender.send(answer.trim_end().to_string());
+    Ok(Box::new(ChildSession { child, on_stop: None }))
+}
+
+/// Waits for the started app to call back, and answers the session that
+/// talks to it. An app that never calls runs on, without hot reload.
+fn call_back(listener: TcpListener, mut app: Box<dyn Session>, bytes: bool) -> Box<dyn Session> {
+    let off = |why: &str| println!("{}", term::warn(&format!("hot reload is off: {why} — r restarts the app")));
+    if listener.set_nonblocking(true).is_err() {
+        off("the port did not open");
+        return app;
+    }
+    let until = Instant::now() + CALL_TIMEOUT;
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if app.wait(Duration::from_millis(50)).is_some() {
+                    return app;
                 }
-                None => {
-                    let mut out = std::io::stdout().lock();
-                    let _ = out.write_all(&line);
-                    let _ = out.flush();
+                if Instant::now() >= until {
+                    off("the app did not call back");
+                    return app;
                 }
             }
-            line.clear();
+            Err(error) => {
+                off(&format!("the app's call did not land: {error}"));
+                return app;
+            }
         }
-    });
-    let mut app = HotApp { app: ChildSession { child, on_stop: None }, input, answers, hot: true };
-    if let Err(why) = app.answer(LOAD_TIMEOUT) {
-        app.hot = false;
-        println!("{}", crate::term::warn(&format!("hot reload is off: {why} — r restarts the app")));
+    };
+    match HotApp::new(app, stream, bytes) {
+        Ok(hot) => Box::new(hot),
+        Err((app, why)) => {
+            off(&why);
+            app
+        }
     }
-    Ok(Box::new(app))
+}
+
+/// The running app, with a line to it.
+struct HotApp {
+    app: Box<dyn Session>,
+    line: TcpStream,
+    answers: Receiver<String>,
+    /// The app reads no file of this computer: a generation goes as
+    /// bytes, not as a path.
+    bytes: bool,
 }
 
 impl HotApp {
+    /// The app on the line, once it said how it started.
+    fn new(app: Box<dyn Session>, line: TcpStream, bytes: bool) -> std::result::Result<HotApp, (Box<dyn Session>, String)> {
+        let reading = match line.set_nonblocking(false).and_then(|()| line.try_clone()) {
+            Ok(reading) => reading,
+            Err(error) => return Err((app, format!("the line to the app broke: {error}"))),
+        };
+        let (sender, answers) = mpsc::channel();
+        std::thread::spawn(move || {
+            for answer in BufReader::new(reading).lines().map_while(std::result::Result::ok) {
+                if sender.send(answer).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut hot = HotApp { app, line, answers, bytes };
+        match hot.answer(LOAD_TIMEOUT) {
+            Ok(_) => Ok(hot),
+            Err(why) => Err((hot.app, why)),
+        }
+    }
+
     /// The app's answer to the last order: how long its swap took.
     fn answer(&mut self, timeout: Duration) -> std::result::Result<Duration, String> {
         let until = Instant::now() + timeout;
@@ -337,7 +457,7 @@ impl HotApp {
                 Ok(answer) => return parse_answer(&answer),
                 Err(RecvTimeoutError::Disconnected) => return Err(String::from("the app stopped")),
                 Err(RecvTimeoutError::Timeout) => {
-                    if matches!(self.app.child.try_wait(), Ok(Some(_))) {
+                    if self.app.wait(Duration::ZERO).is_some() {
                         return Err(String::from("the app stopped"));
                     }
                     if Instant::now() >= until {
@@ -347,16 +467,28 @@ impl HotApp {
             }
         }
     }
+
+    fn send(&mut self, generation: &Path) -> std::io::Result<()> {
+        if self.bytes {
+            let bytes = std::fs::read(generation)?;
+            writeln!(self.line, "take {}", bytes.len())?;
+            self.line.write_all(&bytes)?;
+        } else {
+            writeln!(self.line, "load {}", generation.display())?;
+        }
+        self.line.flush()
+    }
 }
 
-/// `loaded <n> <ms>`, or `failed <why>`.
+/// `loaded <n> <ms>`, `ready`, or `failed <why>`.
 fn parse_answer(answer: &str) -> std::result::Result<Duration, String> {
-    match answer.split_once(' ') {
-        Some(("loaded", rest)) => {
+    match answer.split_once(' ').unwrap_or((answer, "")) {
+        ("loaded", rest) => {
             let millis = rest.split_whitespace().nth(1).and_then(|ms| ms.parse().ok()).unwrap_or(0);
             Ok(Duration::from_millis(millis))
         }
-        Some(("failed", why)) => Err(why.to_string()),
+        ("ready", _) => Ok(Duration::ZERO),
+        ("failed", why) => Err(why.to_string()),
         _ => Err(format!("the app answered {answer:?}")),
     }
 }
@@ -367,18 +499,15 @@ impl Session for HotApp {
     }
 
     fn stop(&mut self) {
+        let _ = self.line.shutdown(std::net::Shutdown::Both);
         self.app.stop();
     }
 
     fn load(&mut self, generation: &Path) -> Option<std::result::Result<Duration, String>> {
-        if !self.hot {
-            return None;
-        }
         // an answer that came too late for its order is not this one's
         while self.answers.try_recv().is_ok() {}
-        let sent = writeln!(self.input, "load {}", generation.display()).and_then(|()| self.input.flush());
-        if sent.is_err() {
-            return Some(Err(String::from("the app stopped")));
+        if let Err(error) = self.send(generation) {
+            return Some(Err(format!("the line to the app broke: {error}")));
         }
         Some(self.answer(LOAD_TIMEOUT))
     }
@@ -413,6 +542,7 @@ mod tests {
     #[test]
     fn the_answers_of_the_app_are_read() {
         assert_eq!(parse_answer("loaded 3 164"), Ok(Duration::from_millis(164)));
+        assert_eq!(parse_answer("ready"), Ok(Duration::ZERO));
         assert_eq!(parse_answer("failed it has no entry"), Err(String::from("it has no entry")));
         assert!(parse_answer("hello").is_err());
     }

@@ -47,7 +47,7 @@ impl Toolchain {
         Ok(Toolchain { sdk, ndk, jdk, adb })
     }
 
-    fn adb(&self, serial: &str, args: &[&str]) -> Result<process::Output> {
+    pub fn adb(&self, serial: &str, args: &[&str]) -> Result<process::Output> {
         let mut full = vec!["-s", serial];
         full.extend_from_slice(args);
         process::run(&self.adb, &full, Duration::from_secs(120)).map_err(|error| Error::new(format!("adb: {error}")))
@@ -61,7 +61,7 @@ pub struct Apk {
 }
 
 /// The device's ABI and the Rust target that builds for it.
-fn abi(toolchain: &Toolchain, serial: &str) -> Result<(String, &'static str)> {
+pub fn abi(toolchain: &Toolchain, serial: &str) -> Result<(String, &'static str)> {
     let out = toolchain.adb(serial, &["shell", "getprop", "ro.product.cpu.abi"])?;
     let abi = out.stdout.trim().to_string();
     let triple = match abi.as_str() {
@@ -75,22 +75,36 @@ fn abi(toolchain: &Toolchain, serial: &str) -> Result<(String, &'static str)> {
     Ok((abi, triple))
 }
 
+/// What a hot build adds to the APK (`bunny run`, hot reload): the
+/// feature that links the framework's shared library, the salt of the
+/// first generation, and the folder of the standard library that shared
+/// library links.
+pub struct HotBuild<'a> {
+    pub feature: &'a str,
+    pub salt: u32,
+    pub std_libs: &'a Path,
+}
+
 /// Builds the shared object for the device and packs the APK.
 pub fn build(project: &Project, options: &Options, toolchain: &Toolchain, serial: &str) -> Result<Apk> {
+    build_with(project, options, toolchain, serial, None)
+}
+
+/// [`build`], or a hot build: the app's library is the first generation
+/// — built exactly as the next ones are, so their types are its types —
+/// and the APK carries the framework's shared library and the standard
+/// library next to it.
+pub fn build_with(project: &Project, options: &Options, toolchain: &Toolchain, serial: &str, hot: Option<HotBuild>) -> Result<Apk> {
     let id = project.require_id()?;
     let package = ids::android_id(id);
     let gradle_dir = project.platform_dir("android")?;
     let (abi, triple) = abi(toolchain, serial)?;
-
-    // the NDK's compiler driver links; its archiver serves any C a
-    // dependency builds. Both for this target only.
-    let clang = toolchain.ndk.clang(triple, android::MIN_SDK);
-    let upper = triple.to_uppercase().replace('-', "_");
-    let lower = triple.replace('-', "_");
-    let mut env = project.build_env();
-    env.push((format!("CARGO_TARGET_{upper}_LINKER"), clang.clone().into()));
-    env.push((format!("CC_{lower}"), clang.into()));
-    env.push((format!("AR_{lower}"), toolchain.ndk.llvm("llvm-ar").into()));
+    let mut features = options.features.clone();
+    let mut rustc_args = page_args();
+    if let Some(hot) = &hot {
+        features.push(hot.feature.to_string());
+        rustc_args.extend([String::from("-C"), format!("metadata=bunny-salt-{}", hot.salt)]);
+    }
     let built = cargo::build(&cargo::Build {
         manifest: project.manifest.clone(),
         package: project.package.clone(),
@@ -98,11 +112,9 @@ pub fn build(project: &Project, options: &Options, toolchain: &Toolchain, serial
         release: options.release,
         profile: None,
         target: Some(triple.to_string()),
-        features: options.features.clone(),
-        env,
-        // 16 KB pages, which Android 15 devices may use and Play requires;
-        // after `--`, so it reaches this crate alone and survives RUSTFLAGS
-        rustc_args: vec![String::from("-C"), String::from("link-arg=-Wl,-z,max-page-size=16384")],
+        features,
+        env: cargo_env(project, toolchain, triple),
+        rustc_args,
         quiet: false,
     })?;
     let shared = built.artifact;
@@ -113,6 +125,12 @@ pub fn build(project: &Project, options: &Options, toolchain: &Toolchain, serial
     let jni = project.out_dir("android", "jniLibs", options.release);
     super::fresh_dir(&jni.join(&abi))?;
     super::copy_binary(&shared, &jni.join(&abi).join(&file))?;
+    if let Some(hot) = &hot {
+        for library in hot_libraries(&shared, hot.std_libs)? {
+            let name = library.file_name().unwrap_or_default();
+            super::copy_binary(&library, &jni.join(&abi).join(name))?;
+        }
+    }
     write_properties(&gradle_dir, &[
         ("sdk.dir", toolchain.sdk.display().to_string()),
         ("bunny.applicationId", package.clone()),
@@ -129,6 +147,42 @@ pub fn build(project: &Project, options: &Options, toolchain: &Toolchain, serial
         return Err(Error::new(format!("Gradle finished without {}", path.display())));
     }
     Ok(Apk { path, package })
+}
+
+/// The environment of every cargo build for the device: who the app is,
+/// and the NDK's compiler driver to link with and its archiver for any C
+/// a dependency builds — both for this target only.
+pub fn cargo_env(project: &Project, toolchain: &Toolchain, triple: &str) -> Vec<(String, std::ffi::OsString)> {
+    let clang = toolchain.ndk.clang(triple, android::MIN_SDK);
+    let upper = triple.to_uppercase().replace('-', "_");
+    let lower = triple.replace('-', "_");
+    let mut env = project.build_env();
+    env.push((format!("CARGO_TARGET_{upper}_LINKER"), clang.clone().into()));
+    env.push((format!("CC_{lower}"), clang.into()));
+    env.push((format!("AR_{lower}"), toolchain.ndk.llvm("llvm-ar").into()));
+    env
+}
+
+/// 16 KB pages, which Android 15 devices may use and Play requires;
+/// after `--`, so the flag reaches the app's crate alone and survives
+/// RUSTFLAGS.
+pub fn page_args() -> Vec<String> {
+    vec![String::from("-C"), String::from("link-arg=-Wl,-z,max-page-size=16384")]
+}
+
+/// The shared libraries a hot app's library links: the framework's, next
+/// to it in cargo's `deps`, and the toolchain's standard library.
+fn hot_libraries(shared: &Path, std_libs: &Path) -> Result<Vec<PathBuf>> {
+    let framework = shared.parent().map(|dir| dir.join("deps").join("libbunny_ui_dylib.so")).unwrap_or_default();
+    if !framework.is_file() {
+        return Err(Error::new(format!("the hot build made no {}", framework.display())));
+    }
+    let mut libraries = vec![framework];
+    let entries = std::fs::read_dir(std_libs).map_err(error::at(std_libs))?;
+    libraries.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+        path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("libstd-") && name.ends_with(".so"))
+    }));
+    Ok(libraries)
 }
 
 /// The activity's entry is in the shared object, or the system finds

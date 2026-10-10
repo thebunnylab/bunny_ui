@@ -16,7 +16,7 @@ bunny run -d web     # in the browser
 | Command | |
 | --- | --- |
 | `bunny new` | Create an app with every platform's files in place |
-| `bunny run` | Build the app for a device and run it, its output here; a save reloads it hot on this computer, `R` restarts, `q` stops |
+| `bunny run` | Build the app for a device and run it, its output here; a save reloads it hot, `R` restarts, `q` stops |
 | `bunny doctor` | Check what this machine needs for each platform — and offer to install what it can |
 | `bunny setup android` | Install the Android toolchain — SDK, NDK, emulator, a JDK — without Android Studio |
 | `bunny devices` | List where the app can run: this computer, the browser, simulators, emulators, phones |
@@ -55,14 +55,19 @@ the app exits on its own, `bunny run` exits with its code.
 
 ### Hot reload
 
-On macOS and Linux, a debug run on this computer reloads hot: save a file and
-the running app takes the new code and keeps its state — the counter keeps its
-count, the text field its text, a `view_model` its model, a `.task` keeps
-running. `r` reloads at once, without a save.
+A debug run reloads hot — on this computer (macOS, Linux, Windows), in the iOS
+Simulator and on Android: save a file and the running app takes the new code
+and keeps its state — the counter keeps its count, the text field its text, a
+`view_model` its model, a `.task` keeps running. `r` reloads at once, without a
+save. In the browser, a save rebuilds the page and reloads it, its state
+starting over.
 
 `bunny` builds the framework once per session as one shared library
 (`bunny-ui-dylib`, the `hot` feature of `bunny-ui`), and after each save it
 builds only the app's library, which the app loads next to the code it has.
+The app calls `bunny run` back on a socket — on the loopback, or on Android
+through `adb reverse` — and takes each new build there: by its path, or, on
+Android, as bytes it writes to its own folder first.
 
 - An edit inside function bodies keeps all the state. An edit that reaches a
   type — a field, a signature, a new item — gives the new build new types: the
@@ -105,5 +110,4 @@ and creates an emulator, and a JDK for Gradle (Temurin, checked against its
 SHA-256). The Android SDK's terms are shown for you to accept before anything is
 installed (`--accept-android-terms` for CI); Google's usage metrics stay off.
 
-Coming next: hot reload on Windows, the simulators and Android, iPhones, and
-`bunny build` for release packages.
+Coming next: iPhones, and `bunny build` for release packages.
