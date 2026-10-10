@@ -1,7 +1,7 @@
 //! The terminal: color and marks when a person reads it, plain text when
 //! a script or a file does.
 
-use std::io::IsTerminal;
+use std::io::{BufRead, IsTerminal, Write};
 use std::sync::OnceLock;
 
 /// Whether standard output is painted — decided once, the way
@@ -76,5 +76,26 @@ pub fn print_error(message: &str, hint: Option<&str>) {
         for line in hint.lines() {
             eprintln!("  {line}");
         }
+    }
+}
+
+/// A yes-or-no question on the terminal. `default` is what a bare Enter
+/// means; the END of the input — a closed stdin, a script that ran out
+/// of answers — is always no, never the default: nothing is installed
+/// on an answer nobody gave.
+pub fn confirm(question: &str, default: bool) -> bool {
+    print!("{question}");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    match std::io::stdin().lock().read_line(&mut answer) {
+        Ok(0) | Err(_) => {
+            println!();
+            false
+        }
+        Ok(_) => match answer.trim().to_ascii_lowercase().as_str() {
+            "" => default,
+            "y" | "yes" => true,
+            _ => false,
+        },
     }
 }

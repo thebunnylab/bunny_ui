@@ -44,6 +44,14 @@ pub const COMMANDS: &[Command] = &[
         run: commands::doctor::run,
     },
     Command {
+        name: "setup",
+        summary: commands::setup::SUMMARY,
+        usage: commands::setup::USAGE,
+        about: commands::setup::ABOUT,
+        options: commands::setup::OPTIONS,
+        run: commands::setup::run,
+    },
+    Command {
         name: "devices",
         summary: commands::devices::DEVICES_SUMMARY,
         usage: commands::devices::DEVICES_USAGE,
