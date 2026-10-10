@@ -5,6 +5,11 @@
 //! AppKit callbacks only read their snapshots or enqueue existing shell events;
 //! they never borrow a running frame. The first query requests semantic capture.
 //! Notifications are emitted after every changed snapshot has been installed.
+//!
+//! ## Production gotchas
+//! Native callbacks and destructors can run during main-thread teardown after
+//! the weak lookup maps have been destroyed. Missing maps then mean retired
+//! objects; dropping native ownership must still release the AppKit objects.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -271,7 +276,7 @@ impl Surface {
 
 impl Drop for Surface {
     fn drop(&mut self) {
-        SURFACES.with(|all| {
+        let _ = SURFACES.try_with(|all| {
             all.borrow_mut().remove(&(self.view as usize));
         });
         for element in self.elements.get_mut() {
@@ -347,7 +352,7 @@ impl Element {
 }
 impl Drop for Element {
     fn drop(&mut self) {
-        ELEMENTS.with(|all| {
+        let _ = ELEMENTS.try_with(|all| {
             all.borrow_mut().remove(&(self.object as usize));
         });
         unsafe {
@@ -418,11 +423,16 @@ impl Target {
 // =============================================================================
 
 fn surface(object: Id) -> Option<Rc<Surface>> {
-    SURFACES.with(|all| all.borrow().get(&(object as usize)).and_then(Weak::upgrade))
+    SURFACES
+        .try_with(|all| all.borrow().get(&(object as usize)).and_then(Weak::upgrade))
+        .ok()
+        .flatten()
 }
 fn element(object: Id) -> Option<Rc<Element>> {
     ELEMENTS
-        .with(|all| all.borrow().get(&(object as usize)).and_then(Weak::upgrade))
+        .try_with(|all| all.borrow().get(&(object as usize)).and_then(Weak::upgrade))
+        .ok()
+        .flatten()
         .filter(|element| element.alive.get())
 }
 fn empty() -> Id {

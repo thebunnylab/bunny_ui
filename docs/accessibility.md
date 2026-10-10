@@ -67,7 +67,8 @@ dependency and stays inside the existing macOS FFI boundary.
 
 `cargo test -p bunny-ui-macos --test accessibility_native --locked` runs a
 main-thread AppKit probe against real windows and selectors. It checks live edits,
-identity, screen bounds, modals, password redaction and retired objects. This
+identity, screen bounds, modals, password redaction, retired objects and
+main-thread exit with an accessible window still open. This
 in-process probe does not require permission to control other applications. It
 is distinct from an external AX client dump or a human VoiceOver workflow.
 

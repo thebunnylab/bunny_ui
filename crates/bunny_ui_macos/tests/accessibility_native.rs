@@ -109,7 +109,7 @@ mod probe {
         }
     }
 
-    pub fn run() {
+    pub fn run(teardown: bool) {
         let app = App::new();
         let runtime = Rc::new(app.runtime());
         let form = Form {
@@ -137,6 +137,10 @@ mod probe {
                 .unwrap();
             let view = object(window, sel("contentView"));
             let field = named(view, "Description");
+            if teardown {
+                println!("Leaving an accessible window open for main-thread teardown.");
+                return;
+            }
             assert_eq!(
                 property(field, "accessibilityRole").as_deref(),
                 Some("AXTextField")
@@ -171,9 +175,18 @@ mod probe {
                     y: window_frame.origin.y + 10.0,
                 },
             );
+            // AppKit can constrain the requested origin on a small screen.
+            // The accessible geometry must track the actual window movement.
+            let moved_window = rectangle(window, sel("frame"));
+            let dx = moved_window.origin.x - window_frame.origin.x;
+            let dy = moved_window.origin.y - window_frame.origin.y;
+            assert!(
+                dx.abs() > 0.01 || dy.abs() > 0.01,
+                "the window actually moved"
+            );
             let moved = rectangle(field, sel("accessibilityFrame"));
-            assert!((moved.origin.x - initial_frame.origin.x - 10.0).abs() < 0.01);
-            assert!((moved.origin.y - initial_frame.origin.y - 10.0).abs() < 0.01);
+            assert!((moved.origin.x - initial_frame.origin.x - dx).abs() < 0.01);
+            assert!((moved.origin.y - initial_frame.origin.y - dy).abs() < 0.01);
             assert_eq!(object(field, sel("accessibilityWindow")), window);
             assert_eq!(
                 allowed(
@@ -328,7 +341,16 @@ mod probe {
 
 #[cfg(target_os = "macos")]
 fn main() {
-    probe::run();
+    if std::env::args().any(|argument| argument == "--teardown-witness") {
+        probe::run(true);
+        return;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--teardown-witness")
+        .status()
+        .unwrap();
+    assert!(status.success(), "native thread teardown failed: {status}");
+    probe::run(false);
 }
 #[cfg(not(target_os = "macos"))]
 fn main() {}
