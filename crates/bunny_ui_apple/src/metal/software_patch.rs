@@ -284,6 +284,41 @@ fn opaque_rgb10(rgba: u32) -> [u8; 4] {
     ((channel(24) << 20) | (channel(16) << 10) | channel(8)).to_le_bytes()
 }
 
+/// A validated borrowed rectangle, retaining the source stride. Cropping a
+/// native backing needs no intermediate bitmap or second rasterization.
+#[derive(Clone, Copy)]
+pub(super) struct PixelRegion<'a> {
+    bitmap: &'a Bitmap,
+    rect: (usize, usize, usize, usize),
+}
+
+impl<'a> PixelRegion<'a> {
+    pub(super) fn new(bitmap: &'a Bitmap, rect: (usize, usize, usize, usize)) -> Option<Self> {
+        (rect.0 < rect.2
+            && rect.1 < rect.3
+            && rect.2 <= bitmap.width()
+            && rect.3 <= bitmap.height())
+        .then_some(Self { bitmap, rect })
+    }
+
+    pub(super) fn whole(bitmap: &'a Bitmap) -> Option<Self> {
+        Self::new(bitmap, (0, 0, bitmap.width(), bitmap.height()))
+    }
+
+    pub(super) fn size(self) -> (usize, usize) {
+        (self.rect.2 - self.rect.0, self.rect.3 - self.rect.1)
+    }
+
+    fn rows(self) -> impl Iterator<Item = &'a [u32]> {
+        self.bitmap
+            .pixels()
+            .chunks_exact(self.bitmap.width())
+            .skip(self.rect.1)
+            .take(self.rect.3 - self.rect.1)
+            .map(move |row| &row[self.rect.0..self.rect.2])
+    }
+}
+
 pub(super) struct Surface {
     pub(super) raw: Id,
     pub(super) size: (usize, usize),
@@ -349,12 +384,16 @@ impl Surface {
     }
 
     pub(super) fn write(&self, bitmap: &Bitmap) -> bool {
-        if self.size != (bitmap.width(), bitmap.height()) {
+        PixelRegion::whole(bitmap).is_some_and(|pixels| self.write_pixels(pixels))
+    }
+
+    pub(super) fn write_pixels(&self, pixels: PixelRegion<'_>) -> bool {
+        if self.size != pixels.size() {
             return false;
         }
         #[cfg(target_arch = "aarch64")]
         if self.format == SurfaceFormat::OpaqueRgb10
-            && bitmap.pixels().iter().any(|pixel| pixel & 0xff != 0xff)
+            && pixels.rows().flatten().any(|pixel| pixel & 0xff != 0xff)
         {
             return false;
         }
@@ -366,7 +405,7 @@ impl Surface {
             let stride = IOSurfaceGetBytesPerRow(self.raw);
             let valid = !base.is_null() && stride >= self.size.0 * 4;
             if valid {
-                for (row, pixels) in bitmap.pixels().chunks_exact(self.size.0).enumerate() {
+                for (row, pixels) in pixels.rows().enumerate() {
                     let output =
                         std::slice::from_raw_parts_mut(base.add(row * stride), self.size.0 * 4);
                     match self.format {
@@ -445,6 +484,58 @@ mod tests {
         layout::Corners,
         text_engine::{FontSpec, PixelFont},
     };
+
+    #[test]
+    fn a_cropped_surface_reads_the_source_stride_without_copying_padding() {
+        let display = DisplayList::from(vec![DrawCommand::FillRect {
+            rect: Rect {
+                origin: Point { x: 2.0, y: 1.0 },
+                size: Size {
+                    width: 1.0,
+                    height: 2.0,
+                },
+            },
+            color: Color::BLACK,
+            corner_radius: Corners::ZERO,
+        }]);
+        let bitmap = rasterize_with(
+            &display,
+            5,
+            4,
+            1,
+            Color::WHITE,
+            &PixelFont,
+            &RawImages::default(),
+        );
+        let region = PixelRegion::new(&bitmap, (1, 1, 4, 3)).unwrap();
+        assert_eq!(region.size(), (3, 2));
+        assert_eq!(
+            region.rows().next().unwrap().as_ptr(),
+            bitmap.pixels()[6..].as_ptr()
+        );
+        let surface = Surface::new(region.size()).unwrap();
+        assert!(surface.write_pixels(region));
+        let actual = unsafe {
+            assert_eq!(IOSurfaceLock(surface.raw, 0, null_mut()), 0);
+            let base = IOSurfaceGetBaseAddress(surface.raw).cast::<u8>();
+            let stride = IOSurfaceGetBytesPerRow(surface.raw);
+            let bytes = (0..2)
+                .flat_map(|row| std::slice::from_raw_parts(base.add(row * stride), 12).to_vec())
+                .collect::<Vec<_>>();
+            assert_eq!(IOSurfaceUnlock(surface.raw, 0, null_mut()), 0);
+            bytes
+        };
+        let expected = region
+            .rows()
+            .flatten()
+            .flat_map(|rgba| rgba.rotate_right(8).to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert!(PixelRegion::new(&bitmap, (0, 0, 0, 2)).is_none());
+        assert!(PixelRegion::new(&bitmap, (4, 1, 6, 2)).is_none());
+        assert!(PixelRegion::new(&bitmap, (1, 3, 4, usize::MAX)).is_none());
+        assert!(!surface.write_pixels(PixelRegion::whole(&bitmap).unwrap()));
+    }
 
     #[test]
     fn every_sdr_byte_has_an_exact_opaque_rgb10_code() {

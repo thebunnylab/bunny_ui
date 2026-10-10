@@ -884,6 +884,41 @@ pub fn rasterize_with(
     rasterize_over(display, width, height, scale, background, text, images, None)
 }
 
+/// A single opaque square fill needs no transparent canvas around its ink.
+/// Use the rasterizer's own scaling and snapping so clipping and negative
+/// half-pixel origins stay byte-for-byte equivalent to the whole raster.
+/// Other paint keeps the general path, including translucent/rounded edges.
+pub(crate) fn compact_live_fill(
+    display: &DisplayList,
+    physical: (usize, usize),
+    scale: usize,
+) -> Option<(Point, Bitmap)> {
+    let [DrawCommand::FillRect { rect, color, corner_radius }] = display.as_slice() else {
+        return None;
+    };
+    if scale == 0 || color.a != 255 || !corner_radius.is_zero() {
+        return None;
+    }
+    let scaled = scale_rect(*rect, scale as f64);
+    if ![scaled.origin.x, scaled.origin.y, scaled.size.width, scaled.size.height]
+        .iter().all(|value| value.is_finite())
+    {
+        return None;
+    }
+    let (x0, y0, x1, y1) = Bitmap::snap(scaled);
+    let x0 = x0.max(0);
+    let y0 = y0.max(0);
+    let x1 = x1.min(i64::try_from(physical.0).ok()?);
+    let y1 = y1.min(i64::try_from(physical.1).ok()?);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some((
+        Point { x: x0 as f64 / scale as f64, y: y0 as f64 / scale as f64 },
+        Bitmap::new((x1 - x0) as usize, (y1 - y0) as usize, *color),
+    ))
+}
+
 /// The superset box of everything a list paints, in LOGICAL points —
 /// how a presenter that gives a slice its own surface sizes that
 /// surface by the CONTENT instead of the window (a toast's segment

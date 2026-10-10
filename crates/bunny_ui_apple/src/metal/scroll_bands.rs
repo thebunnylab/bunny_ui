@@ -89,6 +89,26 @@ fn ink(
     }
 }
 
+/// Keep every non-background pixel, including antialiased glyph edges.
+/// An all-background patch reduces to one pixel of the same solid color.
+fn foreground_ink(bitmap: &Bitmap, background: Color) -> (usize, usize, usize, usize) {
+    let packed = u32::from_be_bytes([background.r, background.g, background.b, background.a]);
+    let mut bounds: Option<(usize, usize, usize, usize)> = None;
+    for (y, row) in bitmap.pixels().chunks_exact(bitmap.width()).enumerate() {
+        if let Some(first) = row.iter().position(|pixel| *pixel != packed) {
+            let last = row
+                .iter()
+                .rposition(|pixel| *pixel != packed)
+                .unwrap_or(first);
+            bounds = Some(match bounds {
+                None => (first, y, last + 1, y + 1),
+                Some((x0, y0, x1, _)) => (x0.min(first), y0, x1.max(last + 1), y + 1),
+            });
+        }
+    }
+    bounds.unwrap_or((0, 0, 1, 1))
+}
+
 struct Band {
     rect: DamageRect,
     display: DisplayList,
@@ -704,7 +724,14 @@ impl Surfaces {
         });
     }
     fn prepare(&mut self, bitmap: &Bitmap) -> Option<software_patch::Surface> {
-        let size = (bitmap.width(), bitmap.height());
+        self.prepare_pixels(software_patch::PixelRegion::whole(bitmap)?)
+    }
+
+    fn prepare_pixels(
+        &mut self,
+        pixels: software_patch::PixelRegion<'_>,
+    ) -> Option<software_patch::Surface> {
+        let size = pixels.size();
         // A frequently reused size must not pin unrelated obsolete sizes.
         // Expiration needs only advancing frames, not an idle timer. Dropping
         // our reference never overwrites pixels still retained by CA.
@@ -728,7 +755,7 @@ impl Surfaces {
             Some(at) => self.retired.swap_remove(at).surface,
             None => software_patch::Surface::new_opaque(size)?,
         };
-        surface.write(bitmap).then_some(surface)
+        surface.write_pixels(pixels).then_some(surface)
     }
 }
 
@@ -1158,19 +1185,37 @@ impl Presenter {
                     ),
                 },
             };
-            let Some(surface) = self.surfaces.prepare(&bitmap) else {
+            let (region, inset) = match foreground {
+                Some((color, scene)) => {
+                    let crop = foreground_ink(&bitmap, color);
+                    let bounds = scene.bounds();
+                    let rect = (
+                        bounds.0 + crop.0 as i64,
+                        bounds.1 + crop.1 as i64,
+                        bounds.0 + crop.2 as i64,
+                        bounds.1 + crop.3 as i64,
+                    );
+                    (
+                        software_patch::PixelRegion::new(&bitmap, crop),
+                        Some((color, rect)),
+                    )
+                }
+                None => (software_patch::PixelRegion::whole(&bitmap), None),
+            };
+            let Some(surface) = region.and_then(|pixels| self.surfaces.prepare_pixels(pixels))
+            else {
                 return false;
             };
             let Some(mut layer) = (unsafe { Layer::new(scale) }) else {
                 return false;
             };
             unsafe {
-                if let Some((color, scene)) = foreground {
+                if let Some((color, bounds)) = inset {
                     let physical = (
                         (band.rect.2 - band.rect.0) as usize,
                         (band.rect.3 - band.rect.1) as usize,
                     );
-                    if !layer.set_inset(color, scene.bounds(), physical, scale, surface.raw) {
+                    if !layer.set_inset(color, bounds, physical, scale, surface.raw) {
                         return false;
                     }
                 } else {
@@ -1560,11 +1605,16 @@ mod tests {
             let patch = foreground.raster(&PixelFont, &RawImages::default());
             assert!(patch.width() * patch.height() * 2 < whole.width() * whole.height());
             let mut composed = Bitmap::new(physical.0, physical.1, color).pixels().to_vec();
-            let (x0, y0, x1, y1) = foreground.bounds();
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    composed[y as usize * physical.0 + x as usize] =
-                        patch.pixels()[(y - y0) as usize * patch.width() + (x - x0) as usize];
+            let (x0, y0, _, _) = foreground.bounds();
+            let crop = foreground_ink(&patch, color);
+            assert!(
+                (crop.2 - crop.0) * (crop.3 - crop.1) < patch.width() * patch.height(),
+                "conservative glyph bounds contain removable padding"
+            );
+            for y in crop.1..crop.3 {
+                for x in crop.0..crop.2 {
+                    composed[(y0 as usize + y) * physical.0 + x0 as usize + x] =
+                        patch.pixels()[y * patch.width() + x];
                 }
             }
             assert_eq!(composed, whole.pixels());

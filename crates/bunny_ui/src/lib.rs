@@ -3095,20 +3095,21 @@ mod tests {
         let _ = runtime.display_frame(&Caret, narrow);
         let seed = runtime.live_islands_all(1);
         assert_eq!(seed.len(), 1, "the first present seeds the surface");
-        assert_eq!(seed[0].width, 100, "at the window's width");
+        assert_eq!(seed[0].width, 2, "only the opaque caret needs storage");
         // an unchanged frame still costs no raster — the whole point of
         // the ledger, and it must survive this fix
         assert!(runtime.live_islands_all(1).is_empty());
 
         // the window grows. The box paints the SAME two-by-twelve bar,
-        // so the picture is byte for byte what it was — and the surface
-        // is now 300 wide with 100 points of pixels in it
+        // so the cropped picture is unchanged. The ledger still owes a
+        // fresh size decision instead of stretching the preceding texture.
         let wide = crate::layout::Size { width: 300.0, height: 40.0 };
         let _ = runtime.display_frame(&Caret, wide);
         let grown = runtime.live_islands_all(1);
         assert_eq!(grown.len(), 1, "a box that grew owes new pixels");
-        assert_eq!(grown[0].width, 300, "rasterized at the NEW size");
-        assert_eq!(grown[0].frame.size.width, 300.0, "and placed at it");
+        assert_eq!(grown[0].width, 2, "the new size still contains the whole caret");
+        assert_eq!(grown[0].frame.size.width, 2.0, "placed without stretching");
+        assert_eq!(grown[0].rgba, seed[0].rgba);
         // and settling at the new size goes quiet again
         assert!(runtime.live_islands_all(1).is_empty());
 
@@ -3116,8 +3117,19 @@ mod tests {
         // screen re-rasters, because those are new pixels too
         let retina = runtime.live_islands_all(2);
         assert_eq!(retina.len(), 1, "a new scale is new pixels");
-        assert_eq!(retina[0].width, 600);
+        assert_eq!(retina[0].width, 4);
+        assert_eq!(retina[0].height, 24);
+        assert_eq!(retina[0].frame, grown[0].frame);
         assert!(runtime.live_islands_all(2).is_empty());
+
+        // Same physical canvas, different device scale: the caret still
+        // occupies two logical points and needs a different number of pixels.
+        let double = crate::layout::Size { width: 600.0, height: 80.0 };
+        let _ = runtime.display_frame(&Caret, double);
+        let low_density = runtime.live_islands_all(1);
+        assert_eq!(low_density.len(), 1);
+        assert_eq!((low_density[0].width, low_density[0].height), (2, 12));
+        assert_eq!(low_density[0].frame, retina[0].frame);
     }
 
     /// A mark anchored to the TOP does not move when the window grows
