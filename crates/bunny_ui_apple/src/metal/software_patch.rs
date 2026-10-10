@@ -497,6 +497,10 @@ unsafe extern "C" {
     fn IOSurfaceCreate(properties: Id) -> Id;
     fn IOSurfaceSetValue(surface: Id, key: Id, value: Id);
     static kIOSurfaceColorSpace: Id;
+    static kIOSurfaceWidth: Id;
+    static kIOSurfaceHeight: Id;
+    static kIOSurfaceBytesPerElement: Id;
+    static kIOSurfacePixelFormat: Id;
     fn IOSurfaceIsInUse(surface: Id) -> u8;
     fn IOSurfaceLock(surface: Id, options: u32, seed: *mut u32) -> i32;
     fn IOSurfaceUnlock(surface: Id, options: u32, seed: *mut u32) -> i32;
@@ -632,14 +636,14 @@ impl Surface {
                 return None;
             }
             for (key, value) in [
-                ("IOSurfaceWidth", size.0 as u64),
-                ("IOSurfaceHeight", size.1 as u64),
-                ("IOSurfaceBytesPerElement", 4),
-                ("IOSurfacePixelFormat", u64::from(format.code())),
+                (kIOSurfaceWidth, size.0 as u64),
+                (kIOSurfaceHeight, size.1 as u64),
+                (kIOSurfaceBytesPerElement, 4),
+                (kIOSurfacePixelFormat, u64::from(format.code())),
             ] {
                 let number =
                     msg_id_u64(class("NSNumber"), sel("numberWithUnsignedLongLong:"), value);
-                msg_void_id_id(properties, sel("setObject:forKey:"), number, ns_string(key));
+                msg_void_id_id(properties, sel("setObject:forKey:"), number, key);
             }
             let raw = IOSurfaceCreate(properties);
             if raw.is_null() {
