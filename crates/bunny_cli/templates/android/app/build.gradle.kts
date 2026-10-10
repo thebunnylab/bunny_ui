@@ -1,3 +1,7 @@
+// `java` alone names the project's Java extension in a Gradle script,
+// not the JDK's package: the class is imported by its full name
+import java.util.Properties
+
 plugins {
     id("com.android.application")
 }
@@ -6,7 +10,7 @@ plugins {
 // `bunny run -d android` and `bunny build android` write on every build
 // from Cargo.toml's [package.metadata.bunny]: this file stays the same
 // for every app, and yours to change.
-val bunnyProperties = java.util.Properties().apply {
+val bunnyProperties = Properties().apply {
     val file = rootProject.file("local.properties")
     if (file.exists()) file.inputStream().use { load(it) }
 }
@@ -39,7 +43,8 @@ android {
         getByName("main") {
             // the shared objects cargo built, one folder per ABI, under
             // the project's target/
-            jniLibs.setSrcDirs(listOf(bunny("jniLibsDir")))
+            jniLibs.directories.clear()
+            jniLibs.directories.add(bunny("jniLibsDir"))
         }
     }
 

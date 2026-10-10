@@ -128,14 +128,11 @@ pub fn run(matches: &Matches) -> Result<()> {
     let ndk = packages::newest_listed_ndk(&available).ok_or_else(|| {
         Error::new("the Android CLI lists no NDK").hint("`android sdk list --all` shows what it offers")
     })?;
-    let abi = if cfg!(target_arch = "aarch64") { "arm64-v8a" } else { "x86_64" };
-    let image = packages::listed_image(&available, android::COMPILE_SDK, abi);
     let separator = if ndk.contains(';') { ";" } else { "/" };
     let platform = format!("platforms{separator}android-{}", android::COMPILE_SDK);
-    let mut install = vec!["sdk", "install", "platform-tools", "emulator", platform.as_str(), ndk.as_str()];
-    if let Some(image) = &image {
-        install.push(image);
-    }
+    // the system image is `emulator create`'s to choose: it installs the one
+    // its device profile runs on
+    let install = vec!["sdk", "install", "platform-tools", "emulator", platform.as_str(), ndk.as_str()];
     step(&format!("Installing {}", install[2..].join(", ")));
     android.run(&install)?;
     if !plan.avd {
@@ -239,8 +236,8 @@ fn show(plan: &Plan) {
             None => format!("JDK {} (Temurin), about 200 MB, into {}", packages::JDK_MAJOR, plan.home.join("jdk").display()),
         },
     );
-    item(false, format!("platform-tools, emulator, Android {} platform, the newest NDK, a system image — about 3 GB", android::COMPILE_SDK));
-    item(plan.avd, String::from("an emulator"));
+    item(false, format!("platform-tools, emulator, Android {} platform, the newest NDK — about 2 GB", android::COMPILE_SDK));
+    item(plan.avd, String::from("an emulator, with its system image — about 1.5 GB"));
     if !plan.targets.is_empty() {
         item(false, format!("Rust targets: {}", plan.targets.join(", ")));
     }

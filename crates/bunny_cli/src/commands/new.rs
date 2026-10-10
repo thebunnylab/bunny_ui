@@ -280,9 +280,8 @@ fn print(plan: &Plan, report: &Report) {
         println!();
         println!("Next:");
         println!("    cd {shown}");
-        println!("    bunny run          {}", term::dim("the app, on this computer"));
-        println!("    bunny run -d ios   {}", term::dim("in the iOS Simulator"));
-        println!("    bunny run -d web   {}", term::dim("in the browser"));
-        println!("    bunny doctor       {}", term::dim("what each platform still needs on this machine"));
+        println!("    bunny run                       {}", term::dim("the app, on this computer"));
+        println!("    bunny run -d ios|android|web    {}", term::dim("a simulator, an emulator, the browser"));
+        println!("    bunny doctor                    {}", term::dim("what each platform still needs on this machine"));
     }
 }

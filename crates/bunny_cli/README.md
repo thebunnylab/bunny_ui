@@ -9,6 +9,7 @@ bunny new my_app
 cd my_app
 bunny run            # on this computer
 bunny run -d ios     # in the iOS Simulator
+bunny run -d android # on an Android emulator or phone
 bunny run -d web     # in the browser
 ```
 
@@ -17,6 +18,7 @@ bunny run -d web     # in the browser
 | `bunny new` | Create an app with every platform's files in place |
 | `bunny run` | Build the app for a device and run it, its output here; `r` restarts, `q` stops |
 | `bunny doctor` | Check what this machine needs for each platform — and offer to install what it can |
+| `bunny setup android` | Install the Android toolchain — SDK, NDK, emulator, a JDK — without Android Studio |
 | `bunny devices` | List where the app can run: this computer, the browser, simulators, emulators, phones |
 | `bunny emulators` | List the simulators and emulators, and start one (`--launch`) |
 
@@ -63,5 +65,19 @@ framework's — and serves it at `http://localhost:8080/` (`--web-port`,
 `--web-hostname`, `--no-open`). A new build reloads the page by itself, and the
 page's console errors, a wasm panic among them, show in the terminal.
 
-Coming next: Android in `bunny run`, hot reload on `r`, iPhones, and
-`bunny build` for release packages.
+On Android (`-d android`, or an emulator's name), `bunny` links the library with
+the NDK for the device's CPU, writes `android/local.properties` with the app's
+names and paths, lets the project's Gradle pack the APK, installs it with adb
+and starts it, following the log of the app's process and the system's crash
+reports.
+
+## `bunny setup android`
+
+Android without Android Studio: `bunny setup android` fetches Google's Android
+CLI, which installs the platform tools, the emulator, the platform and the NDK
+and creates an emulator, and a JDK for Gradle (Temurin, checked against its
+SHA-256). The Android SDK's terms are shown for you to accept before anything is
+installed (`--accept-android-terms` for CI); Google's usage metrics stay off.
+
+Coming next: hot reload on `r`, iPhones, and `bunny build` for release
+packages.

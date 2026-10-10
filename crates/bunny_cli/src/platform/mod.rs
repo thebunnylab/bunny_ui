@@ -1,6 +1,7 @@
 //! Each platform's way to build the app, put it where it runs, and start
 //! it — and the running app `bunny run` watches.
 
+pub mod android;
 pub mod desktop;
 pub mod ios;
 pub mod web;

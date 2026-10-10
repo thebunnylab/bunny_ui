@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# For an app, `bunny run -d android` does this (crates/bunny_cli); this lane builds the framework's own examples.
 # An example of the Android shell on the emulator: build its cdylib for
 # aarch64-linux-android with the NDK's own linker, wrap it in an APK
 # over a pure NativeActivity (Gradle), install and launch, then follow

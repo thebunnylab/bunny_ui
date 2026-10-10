@@ -117,11 +117,13 @@ impl<'a> Runner<'a> {
     fn new(project: &'a Project, device: &'a Device, options: Options, web: Web) -> Result<Runner<'a>> {
         match (device.platform, device.kind) {
             (Platform::Web, _) if options.detach => Err(Error::usage("the page needs `bunny run` to serve it: run it without --detach")),
-            (_, Kind::Desktop | Kind::Browser) | (Platform::Ios, Kind::Simulator) => Ok(Runner { project, device, options, web }),
+            (_, Kind::Desktop | Kind::Browser) | (Platform::Ios, Kind::Simulator) | (Platform::Android, _) => {
+                Ok(Runner { project, device, options, web })
+            }
             (Platform::Ios, _) => Err(Error::new("running on an iPhone needs signing, which `bunny` does not do yet")
                 .hint("run on a simulator meanwhile: bunny run -d ios")),
             (platform, _) => Err(Error::new(format!("`bunny run` does not run {} apps yet", platform.title()))
-                .hint("it runs on this computer, the iOS Simulator and the browser; Android is coming")),
+                .hint("it runs on this computer, the iOS Simulator, Android and the browser")),
         }
     }
 
@@ -148,6 +150,13 @@ impl<'a> Runner<'a> {
                     }
                 }
                 Some(Box::new(Page) as Box<dyn Session>)
+            }
+            (Platform::Android, _) => {
+                let toolchain = platform::android::Toolchain::find()?;
+                let apk = platform::android::build(self.project, &self.options, &toolchain, &self.device.id)?;
+                let session = platform::android::launch(&toolchain, &self.device.id, &apk, &self.options)?;
+                announce(began, self.device);
+                session
             }
             (_, Kind::Desktop) => {
                 let executable = platform::desktop::build(self.project, &self.options)?;
