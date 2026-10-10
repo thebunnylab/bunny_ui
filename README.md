@@ -31,6 +31,14 @@ library or a theme, leaves the shell to the application:
 bunny-ui = { version = "0.2", default-features = false }
 ```
 
+To start an app with every platform's files already in place, the `bunny`
+command creates one:
+
+```bash
+cargo install bunny-cli
+bunny new my_app
+```
+
 ## Quick look
 
 ```rust
@@ -313,6 +321,7 @@ cargo test --features svg   # the icon converter's parser rides the flag
 The core lives in `crates/bunny_ui` and publishes as `bunny-ui-core`;
 `crates/bunny_ui_facade` publishes as `bunny-ui`, the crate an application
 adds. Each platform shell is its own crate, and the facade picks it by target.
+`crates/bunny_cli` is the `bunny` command (`bunny-cli`).
 
 ## Demos
 

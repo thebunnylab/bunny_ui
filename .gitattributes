@@ -1,3 +1,8 @@
 # Baked SPIR-V is bytes, never text — no newline normalization may
 # ever touch it (the drift test compares byte-for-byte).
 *.spv binary
+
+# The templates `bunny new` writes are copied byte for byte: no checkout
+# may rewrite their line endings — a gradlew with CRLF does not run, and
+# a gradlew.bat with bare LF loses its labels.
+crates/bunny_cli/templates/** -text
