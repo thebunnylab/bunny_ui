@@ -106,3 +106,23 @@ jobs:
         # the app's library and draws it as text (BUNNY_HOT_CHECK): the
         # load, the entry and the swap on every desktop, no screen needed
         run: cargo test -p bunny-cli --locked --test hot_reload -- --ignored
+
+  android-build:
+    name: bunny build android
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Pinned compiler and the targets
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
+          rustup target add wasm32-unknown-unknown aarch64-linux-android
+      - name: The web's site and a signed App Bundle and APK
+        # the runner's Android SDK, NDK and JDK; the test makes a
+        # throwaway upload key with keytool
+        env:
+          BUNNY_TEST_ANDROID: "1"
+        run: cargo test -p bunny-cli --locked --test build -- --ignored

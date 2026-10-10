@@ -141,7 +141,7 @@ pub fn build_with(project: &Project, options: &Options, toolchain: &Toolchain, s
         ("bunny.appLabel", project.name.clone()),
         ("bunny.jniLibsDir", jni.display().to_string()),
     ])?;
-    gradle(&gradle_dir, toolchain, "assembleDebug")?;
+    gradle(&gradle_dir, toolchain, &["assembleDebug"], &[])?;
     let path = gradle_dir.join("app/build/outputs/apk/debug/app-debug.apk");
     if !path.is_file() {
         return Err(Error::new(format!("Gradle finished without {}", path.display())));
@@ -187,7 +187,7 @@ fn hot_libraries(shared: &Path, std_libs: &Path) -> Result<Vec<PathBuf>> {
 
 /// The activity's entry is in the shared object, or the system finds
 /// nothing to start and closes the app without a word.
-fn check_entry(toolchain: &Toolchain, shared: &Path) -> Result<()> {
+pub fn check_entry(toolchain: &Toolchain, shared: &Path) -> Result<()> {
     let nm = toolchain.ndk.llvm("llvm-nm");
     let args = [std::ffi::OsStr::new("-D"), std::ffi::OsStr::new("--defined-only"), shared.as_os_str()];
     let out = process::run(&nm, &args, QUICK)
@@ -201,7 +201,7 @@ fn check_entry(toolchain: &Toolchain, shared: &Path) -> Result<()> {
 
 /// `android/local.properties`, rewritten only when it changes — Gradle
 /// and Android Studio both watch it.
-fn write_properties(dir: &Path, values: &[(&str, String)]) -> Result<()> {
+pub fn write_properties(dir: &Path, values: &[(&str, String)]) -> Result<()> {
     let mut text = String::from("# Written by `bunny` on every build, from Cargo.toml. Not yours to edit.\n");
     for (key, value) in values {
         text.push_str(&format!("{key}={}\n", escape_property(value)));
@@ -239,7 +239,11 @@ pub fn escape_property(value: &str) -> String {
     out
 }
 
-fn gradle(dir: &Path, toolchain: &Toolchain, task: &str) -> Result<()> {
+/// Runs the project's Gradle wrapper on `tasks`, with more environment —
+/// a release's signing, as `ORG_GRADLE_PROJECT_*` properties Gradle
+/// reads and no process list shows.
+pub fn gradle(dir: &Path, toolchain: &Toolchain, tasks: &[&str], env: &[(String, String)]) -> Result<()> {
+    let task = tasks.join(" ");
     println!("{}", term::dim(&format!("Gradle {task} (its first run downloads Gradle itself)…")));
     let mut command = if cfg!(windows) {
         let mut command = Command::new("cmd");
@@ -248,8 +252,12 @@ fn gradle(dir: &Path, toolchain: &Toolchain, task: &str) -> Result<()> {
     } else {
         Command::new(dir.join("gradlew"))
     };
+    for (key, value) in env {
+        command.env(key, value);
+    }
     let status = command
-        .args(["--console=plain", "-q", task])
+        .args(["--console=plain", "-q"])
+        .args(tasks)
         .current_dir(dir)
         .env("JAVA_HOME", &toolchain.jdk.home)
         .env("ANDROID_HOME", &toolchain.sdk)

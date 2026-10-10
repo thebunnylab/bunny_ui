@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::project::Project;
 use crate::term;
 
-pub const SUMMARY: &str = "Build the app to ship: a site for the web, a signed app for macOS";
+pub const SUMMARY: &str = "Build the app to ship: a site for the web, a signed app for macOS, a bundle for Google Play";
 
 pub const USAGE: &str = "bunny build <PLATFORM> [OPTIONS]";
 
@@ -24,10 +24,14 @@ build.log (every command that made them).
   macos   <Name>.app and <Name>-<version>.dmg, signed with the keychain's
           Developer ID Application identity (or ad hoc, without one) and
           notarized when a notarytool profile or an API key is at hand
+  android <package>-<version>.aab for Google Play and .apk for a direct
+          install, signed with the upload key from android/key.properties
+          (or BUNNY_ANDROID_*), checked by apksigner and zipalign, and the
+          native debug symbols Play Console reads crash reports against
 
 The version and the build number come from Cargo.toml: `version`, and
 `build` in [package.metadata.bunny]; --build-name and --build-number
-override them for one build. iOS, Android, Windows and Linux come next.";
+override them for one build. iOS, Windows and Linux come next.";
 
 pub const OPTIONS: &[Opt] = &[
     Opt::flag("debug", "Build without optimizations"),
@@ -41,21 +45,23 @@ pub const OPTIONS: &[Opt] = &[
     Opt::value("notary-profile", "NAME", "macOS: the notarytool keychain profile (default: $BUNNY_MACOS_NOTARY_PROFILE)"),
     Opt::flag("universal", "macOS: one binary for Apple silicon and Intel"),
     Opt::flag("no-dmg", "macOS: the app alone, without a disk image"),
+    Opt::value("abi", "LIST", "Android: the ABIs to build for (default: arm64-v8a,x86_64)"),
     HELP,
 ];
 
 pub fn run(matches: &Matches) -> Result<()> {
     let platform = match matches.positionals.as_slice() {
         [platform] => platform.as_str(),
-        [] => return Err(Error::usage("name the platform: bunny build web, or bunny build macos")),
+        [] => return Err(Error::usage("name the platform: bunny build web, macos or android")),
         [_, extra, ..] => return Err(Error::usage(format!("`{extra}`: build one platform at a time"))),
     };
     let checked = match platform {
         "web" => Platform::Web,
         "macos" => Platform::Macos,
-        "ios" | "android" | "windows" | "linux" => {
+        "android" => Platform::Android,
+        "ios" | "windows" | "linux" => {
             return Err(Error::new(format!("`bunny build {platform}` comes later"))
-                .hint("bunny build web and bunny build macos are here; `bunny run` runs on every platform"));
+                .hint("bunny build web, macos and android are here; `bunny run` runs on every platform"));
         }
         other => {
             return Err(Error::usage(format!("`{other}` is not a platform: web, macos, ios, android, windows or linux")));
@@ -82,10 +88,13 @@ pub fn run(matches: &Matches) -> Result<()> {
         notarize: matches.flag("notarize"),
         universal: matches.flag("universal"),
         dmg: !matches.flag("no-dmg"),
+        abis: matches.values("abi").iter().flat_map(|list| list.split(',')).map(str::trim).filter(|abi| !abi.is_empty()).map(String::from).collect(),
     };
     doctor::preflight(checked)?;
-    if checked == Platform::Macos {
-        build::macos::check(&project, &options)?;
+    match checked {
+        Platform::Macos => build::macos::check(&project, &options)?,
+        Platform::Android => build::android::check(&project, &options)?,
+        _ => {}
     }
     println!("{}", term::bold(&format!("Building {} {} ({}) for {platform}…", project.name, project.version, project.build)));
     let out = build::out_dir(&project, platform)?;
@@ -93,6 +102,7 @@ pub fn run(matches: &Matches) -> Result<()> {
     let mut info = Info::new(&project, platform, &options);
     let built = match checked {
         Platform::Web => build::web::build(&project, &options, &out, &mut log, &mut info),
+        Platform::Android => build::android::build(&project, &options, &out, &mut log, &mut info),
         _ => build::macos::build(&project, &options, &out, &mut log, &mut info),
     };
     // the log is written whatever happened: it is what explains a failure
