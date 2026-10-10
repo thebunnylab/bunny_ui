@@ -3,7 +3,7 @@
 //! deadline, so a phone that does not answer costs seconds, not the
 //! command.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -442,7 +442,7 @@ fn boot_emulator(device: &Device) -> Result<Device> {
 
 /// Starts a program that outlives this one — an emulator stays up after
 /// `bunny` exits, as Android Studio leaves it.
-fn spawn_detached(program: &PathBuf, args: &[&str]) -> std::io::Result<()> {
+pub fn spawn_detached<S: AsRef<std::ffi::OsStr>>(program: &Path, args: &[S]) -> std::io::Result<()> {
     let mut command = Command::new(program);
     command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(unix)]
