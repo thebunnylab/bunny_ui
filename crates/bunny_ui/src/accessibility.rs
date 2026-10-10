@@ -84,6 +84,9 @@ pub struct Node {
     pub value: Option<Arc<str>>,
     /// Visible bounds in runtime layout coordinates (points, top-left origin).
     pub bounds: Rect,
+    /// Overlay identity when this node belongs to a separate native surface.
+    /// `None` identifies the main content view. Bounds remain in root layout coordinates.
+    pub surface: Option<Rc<str>>,
     /// Whether this field currently owns keyboard focus.
     pub focused: bool,
     /// Whether a text field accepts multiple lines.
@@ -142,11 +145,18 @@ pub(crate) struct Placed {
     pub label: Arc<str>,
     pub value: Option<Arc<str>>,
     pub bounds: Option<Rect>,
+    pub surface: Option<Rc<str>>,
     pub multiline: bool,
 }
 
 impl Semantics {
-    pub(crate) fn collect(&self, start: usize, bounds: Option<Rect>, nodes: &mut Vec<Placed>) {
+    pub(crate) fn collect(
+        &self,
+        start: usize,
+        bounds: Option<Rect>,
+        surface: &Option<Rc<str>>,
+        nodes: &mut Vec<Placed>,
+    ) {
         // A modal descendant may have removed what preceded it.
         let start = start.min(nodes.len());
         match self {
@@ -163,6 +173,7 @@ impl Semantics {
                     label: content.get(),
                     value: None,
                     bounds,
+                    surface: surface.clone(),
                     multiline: false,
                 });
             }
@@ -185,6 +196,7 @@ impl Semantics {
                         label,
                         value: None,
                         bounds,
+                        surface: surface.clone(),
                         multiline: false,
                     });
                 }
@@ -241,6 +253,7 @@ impl State {
                     label: Arc::clone(&placed.label),
                     value: placed.value.clone(),
                     bounds,
+                    surface: placed.surface.clone(),
                     focused: false,
                     multiline: placed.multiline,
                 })

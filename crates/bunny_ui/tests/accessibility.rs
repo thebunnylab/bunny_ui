@@ -195,6 +195,10 @@ fn password_values_are_redacted_and_modal_controls_are_the_only_targets() {
     let tree = runtime.accessibility_tree();
     assert_eq!(tree.nodes().len(), 1);
     assert_eq!(tree.nodes()[0].label.as_ref(), "In modal");
+    assert_eq!(
+        tree.nodes()[0].surface.as_deref(),
+        Some(runtime.overlays()[0].path.as_str())
+    );
     assert!(
         runtime
             .accessibility_action(behind, Action::Activate)

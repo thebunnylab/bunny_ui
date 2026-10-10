@@ -3817,6 +3817,7 @@ pub const SPLIT_GRIP: Px = 6.0;
 #[derive(Default, Debug)]
 pub struct Placement {
     accessibility_viewport: Option<Rect>,
+    accessibility_surface: Option<Rc<str>>,
     pub(crate) accessibility: Vec<crate::accessibility::Placed>,
     pub frames: Frames,
     pub display: DisplayList,
@@ -5335,9 +5336,11 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
             },
         };
         let start = out.display.len();
+        let accessibility_surface = out.accessibility_surface.replace(Rc::from(queued.path.as_str()));
         let accessibility_viewport = out.accessibility_viewport.replace(frame);
         queued.node.place(frame, &fit, env, out);
         out.accessibility_viewport = accessibility_viewport;
+        out.accessibility_surface = accessibility_surface;
         let end = out.display.len();
         out.overlays.push(OverlayPlacement {
             path: queued.path,
@@ -6267,7 +6270,7 @@ impl LayoutNode {
         }
         if env.accessibility && let Some(semantics) = self.carried_hints().and_then(|hints| hints.semantics.as_ref()) {
             let bounds = out.accessible_bounds(frame);
-            semantics.collect(semantic_start, bounds, &mut out.accessibility);
+            semantics.collect(semantic_start, bounds, &out.accessibility_surface, &mut out.accessibility);
         }
     }
 
@@ -6279,7 +6282,7 @@ impl LayoutNode {
                 child.place(frame, fit, env, out);
                 if env.accessibility {
                     let bounds = out.accessible_bounds(frame);
-                    semantics.collect(start, bounds, &mut out.accessibility);
+                    semantics.collect(start, bounds, &out.accessibility_surface, &mut out.accessibility);
                 }
             }
             // visual leaves: the draw list is born here
@@ -6353,7 +6356,7 @@ impl LayoutNode {
                             role: if *secret { crate::accessibility::Role::PasswordField } else { crate::accessibility::Role::TextField },
                             label: Arc::clone(placeholder),
                             value: (!*secret).then(|| Arc::clone(content)),
-                            bounds: Some(bounds), multiline: *multiline,
+                            bounds: Some(bounds), surface: out.accessibility_surface.clone(), multiline: *multiline,
                         });
                     }
                 }

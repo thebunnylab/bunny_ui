@@ -837,6 +837,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let window = ffi::lend_hand(|| {
         ffi::create_window(title, cg_size(size), spec.min.map(cg_size), chrome.scene(), spec.manners)
     });
+    let accessibility = Rc::new(ffi::Accessibility::new(window));
     // a task that lands on a worker thread asks the main run loop for
     // one more turn; the frame it takes drains the queue on its way
     ffi::install_wake_source();
@@ -1553,6 +1554,24 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
         }
     });
+    // The semantic presenter follows EVERY pixel path, including a retained
+    // GPU frame whose early return correctly painted nothing new.
+    let present = Rc::new({
+        let paint = present;
+        let accessibility = Rc::clone(&accessibility);
+        let panels = Rc::clone(&panels);
+        let dialogs = Rc::clone(&dialogs);
+        move |runtime: &Runtime, display, via| {
+            paint(runtime, display, via);
+            let panels = panels.borrow();
+            let dialogs = dialogs.borrow();
+            let surfaces: Vec<_> = runtime.overlays().iter().filter_map(|overlay| {
+                panels.get(&overlay.path).or_else(|| dialogs.get(&overlay.path))
+                    .map(|handle| (overlay.path.clone(), *handle, overlay.frame))
+            }).collect();
+            accessibility.update(runtime, window, &surfaces);
+        }
+    });
     // `BUNNY_FRAME_AUDIT=1`: a wake the engine says needs no frame draws
     // one anyway, and the two pictures are compared. A difference is a
     // frame the gate would have lost — `X what=missed-frame` on the tape
@@ -1692,6 +1711,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // live boxes do — a layer and the window frame land in
             // different beats, and a drag shows the difference
             runtime.set_thumb_layers(metal::active() && !window.in_live_resize());
+            if accessibility.requested() { runtime.set_accessibility_enabled(true); }
             let display = runtime.display_frame(root, Size { width, height });
             if frame_stats {
                 let stats = bunny_ui::stats::take();
@@ -2047,6 +2067,15 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
         }
         match event {
+        AppEvent::AccessibilityEnable => {
+            runtime.set_accessibility_enabled(true);
+            blit(runtime, root, trace::Origin::Input);
+        }
+        AppEvent::AccessibilityAction { id, action } => {
+            if runtime.accessibility_action(id, action).is_ok() {
+                blit(runtime, root, trace::Origin::Input);
+            }
+        }
         AppEvent::Redraw => blit(runtime, root, trace::Origin::Redraw),
         // the Redraw that follows presents it
         AppEvent::WindowState { maximized } => {

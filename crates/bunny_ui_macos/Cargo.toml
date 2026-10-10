@@ -26,3 +26,8 @@ test = true
 [package.metadata.docs.rs]
 default-target = "aarch64-apple-darwin"
 targets = ["aarch64-apple-darwin"]
+
+# AppKit must run on the process main thread, not a Rust test worker.
+[[test]]
+name = "accessibility_native"
+harness = false
