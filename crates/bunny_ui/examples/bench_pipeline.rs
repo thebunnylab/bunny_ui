@@ -1,7 +1,7 @@
 //! The frame harness — the pipeline's performance ruler, headless.
 //!
 //! ```sh
-//! cargo run --release -p bunny-ui --example bench_pipeline
+//! cargo run --release -p bunny-ui-core --example bench_pipeline
 //! ```
 //!
 //! Measures the PER-FRAME cost of each kind of interaction over a real
@@ -14,6 +14,8 @@
 //! Text metrics come from the `PixelFont` (deterministic on any
 //! machine); rasterization with a platform font is the same path with
 //! another engine and is measured in the shell.
+
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};

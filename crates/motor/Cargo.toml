@@ -1,6 +1,6 @@
 [package]
 name = "bunny-ui-motor"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "The state, identity and environment engine behind bunny-ui"
 license-file.workspace = true

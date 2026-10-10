@@ -1,6 +1,6 @@
 [package]
 name = "bunny-ui-android"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "bunny-ui Android shell — a NativeActivity, its touches and the soft keyboard, presented by the shared Vulkan tier or the CPU floor, with hand-written FFI and JNI and not a single dependency"
 license-file.workspace = true
@@ -50,3 +50,9 @@ crate-type = ["cdylib"]
 name = "life_window_android"
 path = "examples/life_window.rs"
 crate-type = ["cdylib"]
+
+# Its API exists only on its own platform; docs.rs builds on Linux
+# by default and would publish an empty page.
+[package.metadata.docs.rs]
+default-target = "aarch64-linux-android"
+targets = ["aarch64-linux-android"]

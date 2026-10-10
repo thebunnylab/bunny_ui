@@ -937,7 +937,7 @@ fn rules(shape: Shape) -> impl View<Arity = Single> {
 }
 
 const DEMOS: [(&str, &str); 6] = [
-    ("cargo run -p bunny-ui --example counter_headless", "Prints a small interface to the terminal."),
+    ("cargo run -p bunny-ui-core --example counter_headless", "Prints a small interface to the terminal."),
     ("cargo run -p bunny-ui-macos --example counter_window", "Opens a native macOS window."),
     (
         "cargo run -p bunny-ui-macos --example git_window",

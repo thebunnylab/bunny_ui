@@ -1,7 +1,7 @@
 //! The frame ruler: a dashboard-shaped scene, one WHOLE frame per sample.
 //!
 //! ```sh
-//! cargo run --release -p bunny-ui --example bench_frame
+//! cargo run --release -p bunny-ui-core --example bench_frame
 //! ```
 //!
 //! `bench_pipeline` times `layout` on a small finder. This harness times
@@ -17,6 +17,8 @@
 //! table from [`bunny_ui::stats`] in a separate pass, so the timers never
 //! pay into the wall numbers. Text metrics come from the `PixelFont`:
 //! the allocation counts are the same on every machine.
+
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
 
 use bunny_ui::action::Modifiers;
 use bunny_ui::prelude::*;

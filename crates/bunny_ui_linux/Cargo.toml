@@ -1,6 +1,6 @@
 [package]
 name = "bunny-ui-linux"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "bunny-ui Linux shell — a Wayland window and its input, presented by the shared Vulkan tier or the CPU floor, with hand-written FFI and not a single dependency"
 license-file.workspace = true
