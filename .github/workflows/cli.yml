@@ -71,6 +71,8 @@ jobs:
             x86_64-pc-windows-msvc x86_64-unknown-linux-gnu
       - name: bunny new, then cargo on the host and every target
         run: cargo test -p bunny-cli --locked --test new_project -- --ignored
+      - name: bunny build web and macos on a new project
+        run: cargo test -p bunny-cli --locked --test build -- --ignored
 
   hot-reload:
     name: hot reload loads new code (${{ matrix.runner }})

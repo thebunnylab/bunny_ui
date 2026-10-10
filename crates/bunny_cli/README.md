@@ -11,12 +11,14 @@ bunny run            # on this computer
 bunny run -d ios     # in the iOS Simulator
 bunny run -d android # on an Android emulator or phone
 bunny run -d web     # in the browser
+bunny build macos    # a signed app and its disk image, to hand out
 ```
 
 | Command | |
 | --- | --- |
 | `bunny new` | Create an app with every platform's files in place |
 | `bunny run` | Build the app for a device and run it, its output here; a save reloads it hot, `R` restarts, `q` stops |
+| `bunny build` | Build the app to ship: a site for the web, a signed and notarized app for macOS |
 | `bunny doctor` | Check what this machine needs for each platform — and offer to install what it can |
 | `bunny setup android` | Install the Android toolchain — SDK, NDK, emulator, a JDK — without Android Studio |
 | `bunny devices` | List where the app can run: this computer, the browser, simulators, emulators, phones |
@@ -102,6 +104,34 @@ names and paths, lets the project's Gradle pack the APK, installs it with adb
 and starts it, following the log of the app's process and the system's crash
 reports.
 
+## `bunny build`
+
+`bunny build <platform>` builds the app for release and packs it the way the
+platform hands it out, under `build/<platform>/`. Next to the package,
+`build-info.json` says what each file is and how it was made, and `build.log`
+holds every command that made them, with their answers. The version and the
+build number come from `Cargo.toml`; `--build-name` and `--build-number`
+override them for one build.
+
+- **`web`** — the page as a folder any static host serves. The wasm comes from
+  the `web` profile when the workspace has one, and goes through `wasm-opt -Oz`
+  when binaryen is installed. The files `bunny` adds to the page (the wasm and
+  the glue) are named after their content, and a `_headers` file (Netlify,
+  Cloudflare Pages) keeps them cached for a year while `index.html` is asked
+  for every time.
+- **`macos`** — `<Name>.app` and `<Name>-<version>.dmg`. The bundle carries
+  `macos/Info.plist` filled in and the icon from `macos/AppIcon.icns`, or from
+  `macos/AppIcon.png` at 1024 × 1024. A Developer ID Application identity from
+  the keychain signs it with the hardened runtime (`--sign` names one, and
+  `macos/entitlements.plist` is used when it exists); without one the app is
+  signed ad hoc and runs only on this Mac. With a notarytool keychain profile
+  (`xcrun notarytool store-credentials`, then `--notary-profile` or
+  `BUNNY_MACOS_NOTARY_PROFILE`) or an App Store Connect API key
+  (`BUNNY_MACOS_NOTARY_KEY`, `_KEY_ID`, `_ISSUER`), the disk image is notarized
+  and the ticket stapled to it and to the app. `--universal` builds for Apple
+  silicon and Intel, `--no-dmg` stops at the app, `--no-codesign` leaves it
+  unsigned.
+
 ## `bunny setup android`
 
 Android without Android Studio: `bunny setup android` fetches Google's Android
@@ -110,4 +140,4 @@ and creates an emulator, and a JDK for Gradle (Temurin, checked against its
 SHA-256). The Android SDK's terms are shown for you to accept before anything is
 installed (`--accept-android-terms` for CI); Google's usage metrics stay off.
 
-Coming next: iPhones, and `bunny build` for release packages.
+Coming next: iPhones, and `bunny build` for iOS, Android, Windows and Linux.
