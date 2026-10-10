@@ -4,6 +4,8 @@
 //! dirty binding's key used to be taken and dropped on every pixel-path
 //! frame, and the kept measure above it answered with the old size until
 //! some body happened to run.
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use bunny_ui::layout::{Proposal, Size};
 use bunny_ui::prelude::*;
 use bunny_ui::runtime::Runtime;

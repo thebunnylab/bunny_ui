@@ -9,7 +9,7 @@ verbs the glue answers; a page the build painted serializes it at rest.
 The core pins it — `a_video_host_places_and_marks_like_a_webview`,
 `a_video_creates_once_and_rewires_only_on_a_changed_stream`,
 `a_video_host_lowers_to_a_video_that_fills`, the ABI pin and the import
-coverage of every glue — and `cargo test -p bunny-ui` is that proof;
+coverage of every glue — and `cargo test -p bunny-ui-core` is that proof;
 `cargo check -p bunny-ui-web --target wasm32-unknown-unknown` is the
 shell's. The four native shells refuse it by name and keep the box. A
 camera in a real browser has not stood in front of it yet: that
@@ -176,7 +176,7 @@ another day.
 ## The proof
 
 ```bash
-cargo test -p bunny-ui                                        # placement, patch, lowering, ABI 11, glue coverage
+cargo test -p bunny-ui-core                                        # placement, patch, lowering, ABI 11, glue coverage
 cargo check -p bunny-ui-web --target wasm32-unknown-unknown   # the shell: canvas and the GPU tier
 cargo check -p bunny-ui-web --target wasm32-unknown-unknown --no-default-features --features canvas
 cargo check -p bunny-ui-macos                                 # the refusals compile — and the other three shells

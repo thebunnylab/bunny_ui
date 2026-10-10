@@ -6,7 +6,7 @@ version = 4
 name = "arena"
 version = "0.1.0"
 dependencies = [
- "bunny-ui",
+ "bunny-ui-core",
  "bunny-ui-macos",
  "serde_json",
 ]
@@ -27,7 +27,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "bench-web"
 version = "0.1.0"
 dependencies = [
- "bunny-ui",
+ "bunny-ui-core",
  "bunny-ui-web",
 ]
 
@@ -66,16 +66,22 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bunny-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "bunny-ui-motor",
+ "bunny-ui-android",
+ "bunny-ui-core",
+ "bunny-ui-ios",
+ "bunny-ui-linux",
+ "bunny-ui-macos",
+ "bunny-ui-web",
+ "bunny-ui-windows",
 ]
 
 [[package]]
 name = "bunny-ui-android"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "bunny-ui",
+ "bunny-ui-core",
  "bunny-ui-vulkan",
  "countries-core",
  "countries-pure",
@@ -83,9 +89,9 @@ dependencies = [
 
 [[package]]
 name = "bunny-ui-apple"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "bunny-ui",
+ "bunny-ui-core",
  "foreign-types",
  "metal",
  "pollster",
@@ -93,20 +99,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "bunny-ui-ios"
-version = "0.1.0"
+name = "bunny-ui-core"
+version = "0.2.0"
 dependencies = [
- "bunny-ui",
+ "bunny-ui-motor",
+]
+
+[[package]]
+name = "bunny-ui-ios"
+version = "0.2.0"
+dependencies = [
  "bunny-ui-apple",
+ "bunny-ui-core",
  "countries-core",
  "countries-pure",
 ]
 
 [[package]]
 name = "bunny-ui-linux"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "bunny-ui",
+ "bunny-ui-core",
  "bunny-ui-vulkan",
  "countries-core",
  "countries-pure",
@@ -114,37 +127,37 @@ dependencies = [
 
 [[package]]
 name = "bunny-ui-macos"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "bunny-ui",
  "bunny-ui-apple",
+ "bunny-ui-core",
  "countries-core",
  "countries-pure",
 ]
 
 [[package]]
 name = "bunny-ui-motor"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "bunny-ui-vulkan"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "bunny-ui",
+ "bunny-ui-core",
 ]
 
 [[package]]
 name = "bunny-ui-web"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "bunny-ui",
+ "bunny-ui-core",
 ]
 
 [[package]]
 name = "bunny-ui-windows"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "bunny-ui",
+ "bunny-ui-core",
  "countries-core",
  "countries-pure",
 ]
@@ -230,7 +243,7 @@ dependencies = [
 name = "countries-pure"
 version = "0.1.0"
 dependencies = [
- "bunny-ui",
+ "bunny-ui-core",
  "countries-core",
 ]
 
@@ -259,7 +272,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 name = "finder-web"
 version = "0.1.0"
 dependencies = [
- "bunny-ui",
+ "bunny-ui-core",
  "bunny-ui-web",
 ]
 
@@ -384,7 +397,7 @@ dependencies = [
 name = "landing-web"
 version = "0.1.0"
 dependencies = [
- "bunny-ui",
+ "bunny-ui-core",
  "bunny-ui-web",
 ]
 
