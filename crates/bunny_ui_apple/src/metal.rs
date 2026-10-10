@@ -2389,8 +2389,9 @@ pub struct MetalPresenter {
     /// The window rests: set by [`MetalPresenter::rest`], cleared by the
     /// next frame that paints.
     resting: bool,
-    /// Whether the layer currently presents inside the CATransaction —
-    /// toggled ON only during live resize.
+    /// Once a frame needs a Core Animation transaction, this layer keeps
+    /// that contract for its lifetime. An outer transaction may still own
+    /// a pending present when another frame arrives.
     transactional: bool,
     /// The scene texture and the blur pyramid, made on the first frame
     /// that carries glass and remade whenever the drawable resizes. A
@@ -2498,27 +2499,23 @@ impl MetalPresenter {
         }
     }
 
-    /// Flips the layer's present contract and remembers it. The flag
-    /// has to be set BEFORE the drawable it governs is asked for: a
-    /// drawable taken under the asynchronous contract and then
-    /// presented inside the transaction is the one frame the layer
-    /// stretches from the size it used to have.
-    pub fn set_transactional(&mut self, live: bool) {
-        if live == self.transactional {
+    /// Requires transactional presentation before acquiring a drawable.
+    /// Once enabled, the contract remains in force for this layer's lifetime;
+    /// `false` means this caller does not require it, not that it can be reset.
+    ///
+    /// A nested commit does not finish an outer Core Animation transaction.
+    /// Switching back to asynchronous presentation can discard both a pending
+    /// first frame and its replacement, leaving only the later patch layers
+    /// visible. The drawable's submission must use this retained contract too.
+    pub fn set_transactional(&mut self, required: bool) {
+        if !required || self.transactional {
             return;
         }
-        crate::trace::mark(
-            "X",
-            format_args!("what=sync-{}", if live { "on" } else { "off" }),
-        );
+        crate::trace::mark("X", format_args!("what=sync-on"));
         unsafe {
-            msg_void_bool(
-                self.layer,
-                self.stack.sels.set_presents_with_transaction,
-                live as i8,
-            );
+            msg_void_bool(self.layer, self.stack.sels.set_presents_with_transaction, 1);
         }
-        self.transactional = live;
+        self.transactional = true;
     }
 
     /// Waits out every in-flight frame — the precondition of an atlas
@@ -2791,12 +2788,13 @@ impl MetalPresenter {
                 staging: self.ground.staging_buffer(),
                 live_copies: &self.ground.pending,
             });
-            // live resize presents INSIDE the CATransaction: commit,
-            // wait for the schedule, present — layer content and window
-            // frame land together (the anti-tear toggle). A frame that
-            // takes a patch down does the same with the patch. Every
-            // other frame presents async, no stall.
-            if live || hiding {
+            // Once the layer has presented inside a transaction, every
+            // later drawable follows that contract, including ordinary
+            // frames after a native handoff or live resize. Using the
+            // command-buffer present while the layer is transactional
+            // loses the frame. Layers that never needed coordination
+            // still present asynchronously.
+            if self.transactional {
                 msg_void(command, self.stack.sels.commit);
                 msg_void(command, self.stack.sels.wait_scheduled);
                 let transaction = class("CATransaction");
