@@ -352,17 +352,17 @@ fn android_section(toolchain: &Option<rust::Rust>, env: &android::Env) -> Sectio
         return section;
     };
     section.title = format!("Android (SDK at {})", sdk.display());
-    let sdkmanager = android::sdkmanager(&sdk);
-    let manager = if sdkmanager.is_file() {
-        format!("\"{}\"", sdkmanager.display())
-    } else {
-        String::from("sdkmanager")
-    };
-    if !sdkmanager.is_file() {
-        section.checks.push(Check::warn(
-            "No SDK command-line tools: `doctor` can only name the packages, not install them",
-            &["bunny setup android   — installs them, and whatever else is missing"],
-        ));
+    // Google's Android CLI manages the SDK now; the older command-line
+    // tools still count
+    let manager = android::bunny_home(env)
+        .and_then(|home| crate::commands::setup::find_cli(&home))
+        .or_else(|| Some(android::sdkmanager(&sdk)).filter(|path| path.is_file()));
+    match &manager {
+        Some(path) => section.checks.push(Check::ok(format!("SDK manager at {}", path.display()))),
+        None => section.checks.push(Check::warn(
+            "No SDK manager (Google's Android CLI): nothing can add a missing package",
+            &[SETUP],
+        )),
     }
     for (path, title, package) in [
         (android::adb(&sdk), "platform-tools (adb)", "platform-tools"),
@@ -371,7 +371,8 @@ fn android_section(toolchain: &Option<rust::Rust>, env: &android::Env) -> Sectio
         if path.is_file() {
             section.checks.push(Check::ok(title));
         } else {
-            section.checks.push(Check::fail(format!("No {title}"), &[&format!("{manager} \"{package}\"")]));
+            let _ = package;
+            section.checks.push(Check::fail(format!("No {title}"), &[SETUP]));
         }
     }
     if android::has_platform(&sdk) {
@@ -379,11 +380,11 @@ fn android_section(toolchain: &Option<rust::Rust>, env: &android::Env) -> Sectio
     } else {
         section.checks.push(Check::fail(
             format!("No Android API {} platform", android::COMPILE_SDK),
-            &[&format!("{manager} \"platforms;android-{}\"", android::COMPILE_SDK)],
+            &[SETUP],
         ));
     }
     if !android::licenses_accepted(&sdk) {
-        section.checks.push(Check::fail("The SDK licenses are not accepted", &[&format!("{manager} --licenses")]));
+        section.checks.push(Check::fail("The SDK's terms are not accepted", &[SETUP]));
     }
     match android::ndk(env, Some(&sdk)) {
         Some(ndk) => {
@@ -413,10 +414,7 @@ fn android_section(toolchain: &Option<rust::Rust>, env: &android::Env) -> Sectio
         if avds.is_empty() {
             section.checks.push(Check::warn(
                 "No emulator created (a phone with USB debugging works too)",
-                &[
-                    &format!("{manager} \"{}\"", android::suggested_image()),
-                    &format!("avdmanager create avd -n bunny -k \"{}\"", android::suggested_image()),
-                ],
+                &[SETUP],
             ));
         } else {
             section.checks.push(Check::ok(format!("Emulators: {}", avds.join(", "))));
@@ -424,6 +422,9 @@ fn android_section(toolchain: &Option<rust::Rust>, env: &android::Env) -> Sectio
     }
     section
 }
+
+/// The fix for any missing piece of the Android toolchain.
+const SETUP: &str = "bunny setup android   — installs what is missing, without Android Studio";
 
 fn jdk_check(section: &mut Section, env: &android::Env) {
     match android::jdk(env) {

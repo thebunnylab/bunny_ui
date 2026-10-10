@@ -83,19 +83,6 @@ pub fn newest_listed_ndk(packages: &[String]) -> Option<String> {
         .cloned()
 }
 
-/// The system image for API `api` and `abi`, with Google's APIs and
-/// without the Play Store (which forbids root and `run-as` tricks).
-pub fn listed_image(packages: &[String], api: u32, abi: &str) -> Option<String> {
-    let wanted = [String::from("system-images"), format!("android-{api}"), String::from("google_apis"), abi.to_string()];
-    packages
-        .iter()
-        .find(|path| {
-            let parts: Vec<&str> = path.split(['/', ';']).collect();
-            parts == wanted.iter().map(String::as_str).collect::<Vec<_>>()
-        })
-        .cloned()
-}
-
 /// The newest stable NDK's package: `ndk;30.0.16248370`.
 pub fn newest_ndk(xml: &str) -> Option<String> {
     stable_packages(xml, |path| path.starts_with("ndk;"))
@@ -154,15 +141,10 @@ mod tests {
                     system-images/android-36/google_apis_playstore/arm64-v8a | 7 | Play\n  platforms/android-36 | 2 |\n";
         let packages = listed_packages(text);
         assert_eq!(newest_listed_ndk(&packages).as_deref(), Some("ndk/30.0.16248370"));
-        assert_eq!(
-            listed_image(&packages, 36, "arm64-v8a").as_deref(),
-            Some("system-images/android-36/google_apis/arm64-v8a")
-        );
         assert!(packages.contains(&String::from("platforms/android-36")));
         // the older spelling still reads
         let old = listed_packages("ndk;26.1.1 system-images;android-36;google_apis;x86_64");
         assert_eq!(newest_listed_ndk(&old).as_deref(), Some("ndk;26.1.1"));
-        assert_eq!(listed_image(&old, 36, "x86_64").as_deref(), Some("system-images;android-36;google_apis;x86_64"));
     }
 
     #[test]
