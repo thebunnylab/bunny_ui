@@ -262,7 +262,9 @@ fn android_devices(sdk: &Path) -> Vec<Device> {
     let adb = android::adb(sdk);
     let mut devices = Vec::new();
     let mut running_avds = Vec::new();
-    if let Ok(out) = process::run(&adb, &["devices", "-l"], QUICK)
+    let ask_adb = adb_may_start() || adb_server_running();
+    if ask_adb
+        && let Ok(out) = process::run(&adb, &["devices", "-l"], QUICK)
         && out.ok()
     {
         for entry in parse_adb_devices(&out.stdout) {
@@ -305,6 +307,24 @@ fn android_devices(sdk: &Path) -> Vec<Device> {
         }
     }
     devices
+}
+
+/// Whether asking adb may start its server. On Windows the server
+/// inherits this process's open handles: a pipe a script reads `bunny`'s
+/// output through would stay open — and the script wait — for as long as
+/// the server lives. There `bunny` starts it only from a terminal, and
+/// otherwise asks a server that is already running.
+fn adb_may_start() -> bool {
+    use std::io::IsTerminal;
+    !cfg!(windows) || (std::io::stdout().is_terminal() && std::io::stderr().is_terminal())
+}
+
+/// An adb server answers on its port (`ANDROID_ADB_SERVER_PORT`, 5037 by
+/// default).
+fn adb_server_running() -> bool {
+    let port = std::env::var("ANDROID_ADB_SERVER_PORT").ok().and_then(|port| port.parse::<u16>().ok()).unwrap_or(5037);
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok()
 }
 
 /// The first line of an `adb -s SERIAL …` answer.
