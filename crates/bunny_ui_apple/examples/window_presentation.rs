@@ -374,7 +374,7 @@ mod macos {
                     "the outside foreground survives base retirement"
                 );
             }
-            for height in [60.0, 20.0, 100.0] {
+            for height in [60.0, 60.01, 60.0, 20.0, 20.01, 20.0, 100.0, 100.0] {
                 let mut commands = band_scene(0.0).as_slice().to_vec();
                 commands.push(DrawCommand::FillRect {
                     rect: Rect {

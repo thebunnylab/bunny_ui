@@ -873,6 +873,8 @@ pub(super) struct Presenter {
     viewport: Option<Layer>,
     shown: Vec<Shown>,
     overlays: Vec<Overlay>,
+    // Identifies the layer painted by prior.overlay, not a failed trial scene.
+    overlay_shown: Option<Id>,
     cache: RasterCache,
     surfaces: Surfaces,
     offset: i64,
@@ -890,6 +892,7 @@ impl Presenter {
         text: &dyn TextEngine,
         boxes: &MeasureCache,
     ) -> bool {
+        self.overlay_shown = None;
         self.prior = Scene::new(display, physical, scale, canvas, text, boxes);
         self.prior.is_some()
     }
@@ -927,6 +930,7 @@ impl Presenter {
         self.prior = None;
         self.shown.clear();
         self.overlays.clear();
+        self.overlay_shown = None;
         self.cache = RasterCache::default();
         self.offset = 0;
     }
@@ -934,6 +938,7 @@ impl Presenter {
     fn prepare_overlay(
         overlays: &[Overlay],
         surfaces: &mut Surfaces,
+        previous: Option<(&OverlayPaint, Id)>,
         paint: Option<&OverlayPaint>,
         scale: usize,
         text: &dyn TextEngine,
@@ -942,6 +947,15 @@ impl Presenter {
         let Some((_, paint)) = paint else {
             return Some(PreparedOverlay::Hidden);
         };
+        // Patch coordinates already express the exact snapped pixel geometry.
+        // Reuse the last presented picture before allocating/rasterizing a
+        // bitmap; different commands still use the exact pixel cache below.
+        if let Some(((_, prior), shown)) = previous
+            && paint.matches(prior)
+            && let Some(at) = overlays.iter().position(|o| o.layer.raw == shown)
+        {
+            return Some(PreparedOverlay::Reuse(at));
+        }
         let bitmap = paint.raster(text, images);
         if let Some(at) = overlays.iter().position(|o| {
             o.bitmap.width() == bitmap.width()
@@ -982,6 +996,7 @@ impl Presenter {
                     Some(self.overlays.len() - 1)
                 }
             };
+            self.overlay_shown = overlay.map(|at| self.overlays[at].layer.raw);
             for (at, kept) in self.overlays.iter().enumerate() {
                 msg_void_bool(
                     kept.layer.raw,
@@ -1064,6 +1079,10 @@ impl Presenter {
             let Some(prepared) = Self::prepare_overlay(
                 &self.overlays,
                 &mut self.surfaces,
+                self.prior
+                    .as_ref()
+                    .and_then(|prior| prior.overlay.as_ref())
+                    .zip(self.overlay_shown),
                 overlay.as_ref(),
                 scale,
                 &cached,
@@ -1101,6 +1120,7 @@ impl Presenter {
         };
         let prior = self.prior.as_ref();
         if !prior.is_some_and(|prior| scene.compatible(prior)) {
+            self.overlay_shown = None;
             self.prior = Some(scene);
             return false;
         }
@@ -1121,6 +1141,7 @@ impl Presenter {
                 .map(Band::raster_pixels)
                 .sum();
             if pixels > MAX_PIXELS {
+                self.overlay_shown = None;
                 self.prior = Some(scene);
                 return false;
             }
@@ -1228,6 +1249,10 @@ impl Presenter {
         let Some(overlay) = Self::prepare_overlay(
             &self.overlays,
             &mut self.surfaces,
+            self.prior
+                .as_ref()
+                .and_then(|prior| prior.overlay.as_ref())
+                .zip(self.overlay_shown),
             scene.overlay.as_ref(),
             scale,
             &cached,
@@ -1358,6 +1383,83 @@ mod tests {
     }
     use bunny_ui::image_engine::RawImages;
     use bunny_ui::text_engine::PixelFont;
+
+    #[test]
+    fn unchanged_decoration_pixels_do_not_raster_again() {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            for scale in [1, 2] {
+                let root = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
+                let boxes = MeasureCache::default();
+                let images = RawImages::default();
+                let mut presenter = Presenter::default();
+                let physical = (180 * scale, 130 * scale);
+                let mut commands = scene(0.0, false).as_slice().to_vec();
+                commands.push(DrawCommand::TextLine {
+                    origin: Point { x: 154.5, y: 50.5 },
+                    content: "X".into(),
+                    range: (0, 1),
+                    color: Color::BLACK,
+                    font: FontSpec::DEFAULT,
+                });
+                let display = DisplayList::from(commands.clone());
+                assert!(presenter.seed(
+                    &display,
+                    physical,
+                    scale,
+                    Color::WHITE,
+                    &PixelFont,
+                    &boxes
+                ));
+                macro_rules! frame {
+                    ($display:expr) => {
+                        Frame {
+                            root,
+                            display: $display,
+                            physical,
+                            scale,
+                            canvas: Color::WHITE,
+                            text: &PixelFont,
+                            images: &images,
+                            boxes: &boxes,
+                        }
+                    };
+                }
+                assert!(presenter.present(frame!(&display)));
+                let raster_requests = presenter.cache.tick.get();
+                assert!(raster_requests > 0, "the overlay actually rasterizes text");
+                for delta in [0.0, 0.01, 0.02] {
+                    let DrawCommand::FillRect { rect, .. } = &mut commands[display.len() - 2]
+                    else {
+                        unreachable!()
+                    };
+                    rect.size.height = 20.0 + delta;
+                    let next = DisplayList::from(commands.clone());
+                    assert!(presenter.present(frame!(&next)));
+                    assert_eq!(
+                        presenter.cache.tick.get(),
+                        raster_requests,
+                        "a repeated physical picture must not replay its text raster"
+                    );
+                    assert_eq!(presenter.overlays.len(), 1);
+                }
+                let DrawCommand::TextLine { color, .. } = commands.last_mut().unwrap() else {
+                    unreachable!()
+                };
+                *color = Color::hex(0xff0000);
+                let changed = DisplayList::from(commands);
+                assert!(presenter.present(frame!(&changed)));
+                assert!(
+                    presenter.cache.tick.get() > raster_requests,
+                    "changed paint must still rasterize"
+                );
+                assert_eq!(presenter.overlays.len(), 2);
+                drop(presenter);
+                msg_void(root, sel("release"));
+            }
+            objc_autoreleasePoolPop(pool);
+        }
+    }
 
     #[test]
     fn stationary_row_surfaces_do_not_keep_duplicate_text_rasters() {
