@@ -280,6 +280,7 @@ fn print(plan: &Plan, report: &Report) {
         println!();
         println!("Next:");
         println!("    cd {shown}");
-        println!("    cargo run");
+        println!("    bunny doctor    {}", term::dim("what each platform still needs on this machine"));
+        println!("    cargo run       {}", term::dim("the app, on this computer"));
     }
 }

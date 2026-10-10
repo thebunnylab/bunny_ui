@@ -50,6 +50,10 @@ pub fn yellow(text: &str) -> String {
     paint(painted(), "33", text)
 }
 
+pub fn red(text: &str) -> String {
+    paint(painted(), "31", text)
+}
+
 pub fn cyan(text: &str) -> String {
     paint(painted(), "36", text)
 }

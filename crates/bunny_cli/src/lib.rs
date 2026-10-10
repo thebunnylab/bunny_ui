@@ -11,10 +11,14 @@
 pub mod args;
 pub mod cli;
 pub mod commands;
+pub mod devices;
 pub mod error;
 pub mod ids;
+pub mod json;
+pub mod process;
 pub mod template;
 pub mod templates;
 pub mod term;
+pub mod toolchains;
 
 pub use cli::main;

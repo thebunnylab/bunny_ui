@@ -18,14 +18,40 @@ pub struct Command {
     pub run: fn(&Matches) -> Result<()>,
 }
 
-pub const COMMANDS: &[Command] = &[Command {
-    name: "new",
-    summary: commands::new::SUMMARY,
-    usage: commands::new::USAGE,
-    about: commands::new::ABOUT,
-    options: commands::new::OPTIONS,
-    run: commands::new::run,
-}];
+pub const COMMANDS: &[Command] = &[
+    Command {
+        name: "new",
+        summary: commands::new::SUMMARY,
+        usage: commands::new::USAGE,
+        about: commands::new::ABOUT,
+        options: commands::new::OPTIONS,
+        run: commands::new::run,
+    },
+    Command {
+        name: "doctor",
+        summary: commands::doctor::SUMMARY,
+        usage: commands::doctor::USAGE,
+        about: commands::doctor::ABOUT,
+        options: commands::doctor::OPTIONS,
+        run: commands::doctor::run,
+    },
+    Command {
+        name: "devices",
+        summary: commands::devices::DEVICES_SUMMARY,
+        usage: commands::devices::DEVICES_USAGE,
+        about: commands::devices::DEVICES_ABOUT,
+        options: commands::devices::DEVICES_OPTIONS,
+        run: commands::devices::devices,
+    },
+    Command {
+        name: "emulators",
+        summary: commands::devices::EMULATORS_SUMMARY,
+        usage: commands::devices::EMULATORS_USAGE,
+        about: commands::devices::EMULATORS_ABOUT,
+        options: commands::devices::EMULATORS_OPTIONS,
+        run: commands::devices::emulators,
+    },
+];
 
 /// The program: the arguments in, an exit code out — 0, 1 for a failure,
 /// 2 for a command line that could not be read.
