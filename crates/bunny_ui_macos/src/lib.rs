@@ -42,9 +42,6 @@ pub use metal::OffscreenGpu;
 /// what it wants and the driver runs at the fastest pace any window wants;
 /// the pacer hears back whether a display beat runs at all.
 fn sync_frame_driver(runtime: &Runtime, pacer: &FramePacer, window: usize) {
-    if runtime.garbage_pending() {
-        ffi::request_collection();
-    }
     let wanted = if pacer.warm() {
         ffi::DriverPace::Full
     } else {
@@ -859,9 +856,6 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     runtime.set_overlay_layers(metal::active());
     // the cursor AppKit puts back between two of the shell's turns
     ffi::install_cursor_keeper();
-    // Release retired trees after the current turn's presentation, without
-    // waiting for a later timer or waking an otherwise resting application.
-    ffi::install_idle_collection();
     // two owners: the keyboard gate and the event handler
     let root = Rc::new(root);
 
@@ -2164,11 +2158,6 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // same, and then nothing is rebuilt and nothing is drawn
             if runtime.set_system_locale(bunny_ui_apple::ffi::preferred_locale()) {
                 blit(runtime, root, trace::Origin::Redraw);
-            }
-        }
-        AppEvent::Collect => {
-            if runtime.garbage_pending() {
-                runtime.collect_garbage();
             }
         }
         AppEvent::MemoryPressure => {
