@@ -282,9 +282,7 @@ impl Surface {
                 .collect::<Vec<_>>()
         };
         for provider in retired {
-            unsafe {
-                UiaDisconnectProvider(provider.simple());
-            }
+            disconnect(&provider);
         }
         Ok(previous)
     }
@@ -301,9 +299,7 @@ impl Surface {
             .map(|mut all| std::mem::take(&mut *all))
             .unwrap_or_default();
         for provider in providers.into_values() {
-            unsafe {
-                UiaDisconnectProvider(provider.simple());
-            }
+            disconnect(&provider);
         }
     }
     fn notify(self: &Arc<Self>, previous: Arc<Snapshot>) {
@@ -400,6 +396,13 @@ impl Surface {
         }
     }
 }
+fn disconnect(provider: &Owned) {
+    let result = unsafe { UiaDisconnectProvider(provider.simple()) };
+    if result < 0 {
+        eprintln!("bunny_ui: UIA disconnect refused: {result:#x}");
+    }
+}
+
 fn notify_property(
     provider: &Owned,
     property: i32,
