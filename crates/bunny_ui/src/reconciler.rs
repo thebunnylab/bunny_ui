@@ -925,6 +925,11 @@ pub(crate) fn begin_pass(dirty: HashSet<String>) {
     let patience = if HOST_COLLECTS.with(Cell::get) { IDLE_HOST_PATIENCE } else { GARBAGE_PATIENCE };
     if buried != 0 && pass_no - buried >= patience {
         free_garbage();
+    } else if REPLACED_TEXT_BYTES.with(Cell::get) >= REPLACED_TEXT_BUDGET {
+        // Large edits cannot leave many whole document versions waiting
+        // for the next idle. Only obsolete layout trees fall here; retired
+        // entries and their read graph still wait for the host's sweep.
+        release_replaced_layouts();
     }
     PASS.with(|pass| {
         *pass.borrow_mut() = PassState {
@@ -1173,9 +1178,9 @@ pub(crate) fn finish_entry(
             let slot = match last {
                 Some(old) => {
                     live.unindex(path, &old);
-                    // the tree of the last run waits for the idle with the
-                    // entries that left: a list that runs again replaces a
-                    // node per row, and the frame must not pay their frees
+                    // Defer the previous tree: a list can replace a node
+                    // per row. Only large document-version pressure asks
+                    // an earlier pass to release these obsolete layouts.
                     if let Some(held) = old.slot.held.take() {
                         REPLACED.with(|replaced| replaced.borrow_mut().push(held));
                         note_buried();
@@ -2241,6 +2246,9 @@ thread_local! {
     static GRAVEYARD: RefCell<Vec<Box<Entry>>> = const { RefCell::new(Vec::new()) };
     /// The trees re-runs replaced, waiting for the same idle moment.
     static REPLACED: RefCell<Vec<Rc<Held>>> = const { RefCell::new(Vec::new()) };
+    /// Bytes in immutable field snapshots replaced since the last release
+    /// of old layout trees. This is allocation pressure, not live heap size.
+    static REPLACED_TEXT_BYTES: Cell<usize> = const { Cell::new(0) };
     /// The pass that buried the oldest garbage still waiting; 0 when
     /// nothing waits.
     static BURIED_AT: Cell<u64> = const { Cell::new(0) };
@@ -2248,6 +2256,15 @@ thread_local! {
     /// idle between two clicks? Then the valve waits for it as long as
     /// [`IDLE_HOST_PATIENCE`]. A newborn runtime has not been asked yet.
     static HOST_COLLECTS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Bound document-version pressure independently of the host's idle cadence.
+/// Small fields keep the deferred-free policy; a megabyte of replaced text
+/// asks the next existing pass to release obsolete layouts, without a timer.
+const REPLACED_TEXT_BUDGET: usize = 1024 * 1024;
+
+pub(crate) fn note_replaced_text(bytes: usize) {
+    REPLACED_TEXT_BYTES.with(|pending| pending.set(pending.get().saturating_add(bytes)));
 }
 
 /// How many passes garbage waits for an idle moment. A page goes idle
@@ -2305,7 +2322,22 @@ fn free_garbage() -> usize {
 /// The replaced trees, out of their list — to be dropped by the caller,
 /// with no borrow of the list held while they fall.
 fn take_replaced() -> Vec<Rc<Held>> {
+    REPLACED_TEXT_BYTES.with(|pending| pending.set(0));
     REPLACED.with(|replaced| std::mem::take(&mut *replaced.borrow_mut()))
+}
+
+/// Free obsolete trees without reallocating their queue on each large edit.
+/// A destructor can retire more work: retain the empty storage only when
+/// no such replacement queue appeared while the trees were being dropped.
+fn release_replaced_layouts() {
+    let mut replaced = take_replaced();
+    replaced.clear();
+    REPLACED.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        if pending.is_empty() && pending.capacity() == 0 {
+            *pending = replaced;
+        }
+    });
 }
 
 /// The bindings retired since the last collection, taken apart: their
@@ -2941,6 +2973,32 @@ mod tests {
         assert_eq!(replaced(), 0);
         let printed = runtime.render(&page);
         assert!(printed.contains("line 4") && printed.contains("line 5"), "the slot still holds today's tree: {printed}");
+    }
+
+    #[test]
+    fn document_pressure_releases_replaced_layouts_without_sweeping_retired_entries() {
+        let page = Lines { lines: State::new(lines(1..=3)) };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        collect_garbage();
+        page.lines.set(lines(4..=5));
+        runtime.render(&page);
+        assert_eq!(replaced_len(), 1);
+        assert_eq!(graveyard_len(), 3);
+        assert_eq!(motor::identity::retired_count(), 3);
+
+        note_replaced_text(REPLACED_TEXT_BUDGET - 1);
+        runtime.render(&page);
+        assert_eq!(replaced_len(), 1, "small snapshot pressure still waits for idle");
+        note_replaced_text(1);
+        let printed = runtime.render(&page);
+        assert!(printed.contains("line 4") && printed.contains("line 5"));
+        assert_eq!(replaced_len(), 0);
+        assert_eq!(graveyard_len(), 3, "the entries stay deferred");
+        assert_eq!(motor::identity::retired_count(), 3, "no read-graph sweep ran");
+        assert_eq!(REPLACED_TEXT_BYTES.with(Cell::get), 0);
+        assert_eq!(collect_garbage(), 3);
+        assert!(!runtime.slow_tick_needed());
     }
 
     /// A page frees what left when it goes idle. A host that never goes

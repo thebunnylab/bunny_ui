@@ -148,3 +148,33 @@ fn the_first_input_method_read_also_consumes_the_predecessor() {
     assert_eq!(snapshot.selected, (snapshot.text.encode_utf16().count(), 0));
     assert!(old.upgrade().is_none(), "even a full count no longer needs its predecessor");
 }
+
+#[test]
+fn a_large_note_does_not_accumulate_obsolete_layout_snapshots_between_idles() {
+    use std::sync::Arc;
+
+    let panel = Panel { note: State::new("line — é 日本 🦀\n".repeat(70_000)) };
+    let runtime = Runtime::new();
+    let window = Size { width: 400.0, height: 300.0 };
+    runtime.display_frame(&panel, window);
+    let path = runtime.layout(&panel, Proposal::exact(window)).hits[0].0.clone();
+    runtime.focus(&path);
+    runtime.key(EditCommand::End(false));
+    let external = runtime.ime_snapshot().unwrap();
+    let oldest = Arc::downgrade(&external.text);
+    runtime.collect_garbage();
+    let mut generations = Vec::new();
+    for inserted in ["é", "🦀", "日本", "\n"] {
+        assert!(runtime.key(EditCommand::Insert(inserted.into())).applied);
+        runtime.display_frame(&panel, window);
+        let snapshot = runtime.ime_snapshot().unwrap();
+        assert!(snapshot.text.starts_with(&*external.text));
+        assert_eq!(snapshot.selected, (snapshot.text.encode_utf16().count(), 0));
+        generations.push(Arc::downgrade(&snapshot.text));
+    }
+    assert!(oldest.upgrade().is_some(), "the caller's snapshot remains valid");
+    drop(external);
+    assert!(oldest.upgrade().is_none(), "obsolete layouts must not pin the original megabyte-scale document");
+    assert!(generations[0].upgrade().is_none(), "an intermediate version is also released before the host's next idle");
+    assert!(generations.last().unwrap().upgrade().is_some(), "the current scene retains its document");
+}
