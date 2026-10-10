@@ -37,6 +37,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod accessibility;
 pub mod action;
 pub mod anim;
 pub mod bind;

@@ -79,11 +79,15 @@ impl View for Text {
             }
             (fixed, true) => RenderNode::leaf(format!("Text({:?})", fixed.get())),
         });
+        let semantics = crate::accessibility::capturing().then(motor::identity::cursor_scope_rc)
+            .flatten().map(|path| Rc::new(
+            crate::accessibility::Semantics::Text { path, content: content.clone() }
+        ));
         out.push_layout(LayoutNode::Text {
             content,
             highlights: None,
             truncation: None,
-            hints: Default::default(),
+            hints: crate::layout::ElementHints { semantics, ..Default::default() },
             action: None,
         });
     }
@@ -152,6 +156,10 @@ where
         // included — the hit-rect becomes the whole chrome, not just the label.
         // The chrome is the target itself, and paints by its own hover
         let theme = crate::theme::current();
+        let semantics = crate::accessibility::capturing().then_some(target.as_ref())
+            .flatten().map(|path| Rc::new(
+            crate::accessibility::Semantics::Button { path: Rc::clone(path) }
+        ));
         out.push_layout(LayoutNode::Styled {
             props: VisualProps {
                 background: Some(theme.control),
@@ -170,7 +178,7 @@ where
                 },
                 child: Box::new(wrap_layout(layouts)),
             }),
-            hints: Default::default(),
+            hints: crate::layout::ElementHints { semantics, ..Default::default() },
             action: target,
         });
     }

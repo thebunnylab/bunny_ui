@@ -1,0 +1,56 @@
+# Native accessibility foundation
+
+The core can project text, buttons and editable fields from the retained scene
+into `bunny_ui::accessibility::Tree`. This is the data boundary for native
+adapters. It does not by itself expose an application to VoiceOver, UIA or AT-SPI.
+
+A shell opts in with `runtime.set_accessibility_enabled(true)` before its next
+frame. After `display_frame`, `accessibility_tree()` returns the placed nodes in
+reading order. Collection schedules no timer. Activating or deactivating it
+rebuilds retained view metadata through the existing environment invalidation
+path; application state remains in the identity arena. With collection disabled,
+ordinary text and buttons allocate no semantic metadata.
+
+Text supplies its displayed words. A button combines the names in its label
+without exposing those words as duplicate children. A field defaults to its
+placeholder as its name and exports its current value separately. A secret field
+has role `PasswordField` and never exports its value. Names can be overridden
+with a fixed or reactive source:
+
+```rust,ignore
+text_field("Description", expense.description.binding())
+    .accessibility_label(expense.localized_description_label)
+```
+
+`accessibility_label` names exactly one semantic element. Label each control
+inside a multi-control container separately. `accessibility_hidden()` removes
+decorative content from this projection; it changes neither paint nor ordinary
+input behavior. These modifiers preserve layout and do not create DOM elements.
+
+Bounds use layout points with a top-left origin. Window and scroll clipping
+exclude unreachable geometry. Modal content replaces the covered controls in
+the projection. Overlays use their own placed content bounds. A partially
+clipped button keeps its complete name even when some label text is outside
+the visible area.
+
+`NodeId` is opaque and scoped to an exposed lifetime. Keyed reorders preserve it;
+an element that leaves the projection and later returns receives a new handle.
+Disabling collection retires all exposed handles. An adapter must release its
+removed native elements rather than retain them by position. Handles from a
+different runtime cannot address the same control.
+
+`accessibility_action(id, action)` validates the handle and supported action,
+then uses the real control's callback or editing path. Buttons support
+`Activate`; editable fields support `Focus` and `SetText`. Unsupported and
+unavailable requests return distinct errors. Successful actions request a
+frame. Snapshots report current keyboard focus without requesting a frame.
+
+## Remaining adapter work
+
+Native protocol bridges and change notifications are not included yet. The
+projection is a flat sequence of exposed leaves, not a complete document model.
+It does not yet describe custom controls, checkboxes, sliders, read-only or
+disabled states, rich-text ranges, selection APIs, validation messages or
+virtualized offscreen navigation. It does not implement keyboard navigation
+between buttons. Its snapshots are not evidence of screen-reader usability.
+Native AX/UIA/AT-SPI dumps and separate human workflows remain necessary.

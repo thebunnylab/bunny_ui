@@ -668,6 +668,8 @@ pub struct LayoutEnv<'a> {
     /// PAINT and nothing else, because a modality decides chrome and
     /// never geometry.
     pub touch: bool,
+    /// Collect native accessibility semantics during this placement.
+    pub accessibility: bool,
 }
 
 impl LayoutEnv<'_> {
@@ -839,6 +841,8 @@ pub enum LayoutNode {
     /// `path`, which is the only thing the runtime needs to hand the
     /// size over.
     Measured { path: String, child: Box<LayoutNode> },
+    /// Semantic information with no effect on geometry or paint.
+    Accessible { semantics: crate::accessibility::Semantics, child: Box<LayoutNode> },
     /// Fills whatever the proposal gives (Rectangle).
     Fill,
     /// `hints` are what an `.element(…)` over the stack says
@@ -1269,6 +1273,8 @@ pub enum LayoutNode {
 /// Public in name only, like the slot beside it.
 #[derive(Clone, Debug, Default)]
 pub struct ElementHints {
+    /// Native semantics are independent of DOM hints and their folding rules.
+    pub(crate) semantics: Option<Rc<crate::accessibility::Semantics>>,
     pub(crate) tag: Option<Rc<str>>,
     pub(crate) class: Option<Rc<str>>,
     /// The id and the href, the rare words: one shared record, so
@@ -1342,6 +1348,13 @@ impl Address {
 }
 
 impl LayoutNode {
+    pub(crate) fn without_semantics(&self) -> &Self {
+        match self {
+            Self::Accessible { child, .. } => child.without_semantics(),
+            node => node,
+        }
+    }
+
     /// The hints a stack, a text or a style carries itself — `None` for
     /// any other node. A reference to a retained boundary keeps its own,
     /// read where the reference is.
@@ -2602,7 +2615,8 @@ impl LayoutNode {
             LayoutNode::Overlay { layer, child, .. } => {
                 layer.collect_quiet(held) && child.collect_quiet(held)
             }
-            LayoutNode::Padding { child, .. }
+            LayoutNode::Accessible { child, .. }
+            | LayoutNode::Padding { child, .. }
             | LayoutNode::Frame { child, .. }
             | LayoutNode::MaxFrame { child, .. }
             | LayoutNode::FlexFrame { child, .. }
@@ -3802,6 +3816,8 @@ pub const SPLIT_GRIP: Px = 6.0;
 
 #[derive(Default, Debug)]
 pub struct Placement {
+    accessibility_viewport: Option<Rect>,
+    pub(crate) accessibility: Vec<crate::accessibility::Placed>,
     pub frames: Frames,
     pub display: DisplayList,
     /// A Dom frame with no live island skips the display list — the
@@ -3915,6 +3931,18 @@ pub struct Placement {
 }
 
 impl Placement {
+    fn accessible_bounds(&self, frame: Rect) -> Option<Rect> {
+        let frame = match self.accessibility_viewport {
+            Some(viewport) => frame.intersection(viewport)?,
+            None => frame,
+        };
+        match self.clip.last() {
+            Some(clip) => frame.intersection(*clip),
+            None => Some(frame),
+        }
+    }
+
+
     /// A placement seeded with an inherited ink — an island placed
     /// LOCALLY still paints with the foreground its subtree sits in.
     pub(crate) fn with_ink(ink: Color) -> Placement {
@@ -3927,6 +3955,7 @@ impl Placement {
     pub(crate) fn with_capture(size: Size, ink: Color) -> Placement {
         Placement {
             foreground: vec![ink],
+            accessibility_viewport: Some(Rect { origin: Point::default(), size }),
             dom: Some(crate::dom::DomCapture::new(size)),
             keep_unseen: true,
             ..Placement::default()
@@ -4177,6 +4206,7 @@ pub struct Thumb {
 /// the draw list and the interaction targets.
 #[derive(Debug)]
 pub struct LayoutResult {
+    pub(crate) accessibility: Vec<crate::accessibility::Placed>,
     pub size: Size,
     pub frames: Frames,
     pub display: DisplayList,
@@ -4280,6 +4310,7 @@ pub(crate) fn layout_in(
             dialog_frames: None,
             scale: 1.0,
             touch: false,
+            accessibility: false,
         },
     )
 }
@@ -4376,6 +4407,7 @@ pub(crate) fn layout_placing(
         Rect { origin: Point { x: insets.leading, y: insets.top }, size: insets.inset(window).size };
     let mut out = Placement {
         keep_unseen,
+        accessibility_viewport: Some(window),
         thumb_layers: !keep_unseen && thumb_layers(),
         ..Placement::default()
     };
@@ -4437,6 +4469,7 @@ pub(crate) fn layout_placing(
     let thumbs = lift_thumbs(&mut out, &env);
     LayoutResult {
         size,
+        accessibility: out.accessibility,
         frames: out.frames,
         display: out.display,
         hits: out.hits,
@@ -4773,6 +4806,7 @@ pub fn layout_dom(
 ) -> (LayoutResult, crate::dom::DomNode) {
     let (size, fit) = root.measure(proposal, &env);
     let mut out = Placement {
+        accessibility_viewport: Some(window_bounds(proposal, size)),
         dom: Some(crate::dom::DomCapture::new(size)),
         skip_display: !collect_display,
         keep_unseen: true,
@@ -4787,6 +4821,7 @@ pub fn layout_dom(
     (
         LayoutResult {
             size,
+            accessibility: out.accessibility,
             frames: out.frames,
             display: out.display,
             hits: out.hits,
@@ -5300,7 +5335,9 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
             },
         };
         let start = out.display.len();
+        let accessibility_viewport = out.accessibility_viewport.replace(frame);
         queued.node.place(frame, &fit, env, out);
+        out.accessibility_viewport = accessibility_viewport;
         let end = out.display.len();
         out.overlays.push(OverlayPlacement {
             path: queued.path,
@@ -5532,7 +5569,8 @@ impl LayoutNode {
             LayoutNode::Boundary { children, .. } => Self::boundary_is_flexible(children, axis, enclosing_main),
             // a probe is not a box: it answers for its child in every
             // direction, or measuring a view would change it
-            LayoutNode::Measured { child, .. } => child.is_flexible(axis, enclosing_main),
+            LayoutNode::Accessible { child, .. }
+            | LayoutNode::Measured { child, .. } => child.is_flexible(axis, enclosing_main),
             // the app answers for its own box, per axis (the default is
             // yes on both, the same answer a Rectangle gives)
             LayoutNode::Custom { element, .. } => element.element().flexible(axis),
@@ -5608,7 +5646,8 @@ impl LayoutNode {
             LayoutNode::Boundary { children, .. } => {
                 children.first().and_then(|child| child.first_baseline(env))
             }
-            LayoutNode::Measured { child, .. } => child.first_baseline(env),
+            LayoutNode::Accessible { child, .. }
+            | LayoutNode::Measured { child, .. } => child.first_baseline(env),
             LayoutNode::BoundaryRef { slot, .. } => {
                 slot.with_layout(|layout| layout.and_then(|node| node.first_baseline(env)))
             }
@@ -6179,6 +6218,8 @@ impl LayoutNode {
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
+            LayoutNode::Accessible { child, .. } => child.measure(proposal, env),
+
             LayoutNode::Measured { child, .. } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Children(vec![(size, fit)]))
@@ -6215,6 +6256,7 @@ impl LayoutNode {
     }
 
     pub(crate) fn place(&self, frame: Rect, fit: &Fit, env: &LayoutEnv<'_>, out: &mut Placement) {
+        let semantic_start = out.accessibility.len();
         // a stack, a text or a style that carries its action is the
         // target an `Interactive` around it was, at its own frame
         match self.carried_action() {
@@ -6223,11 +6265,23 @@ impl LayoutNode {
             }
             None => self.place_node(frame, fit, env, out),
         }
+        if env.accessibility && let Some(semantics) = self.carried_hints().and_then(|hints| hints.semantics.as_ref()) {
+            let bounds = out.accessible_bounds(frame);
+            semantics.collect(semantic_start, bounds, &mut out.accessibility);
+        }
     }
 
     /// The node itself, its own action aside.
     fn place_node(&self, frame: Rect, fit: &Fit, env: &LayoutEnv<'_>, out: &mut Placement) {
         match (self, fit.unshared()) {
+            (LayoutNode::Accessible { semantics, child }, _) => {
+                let start = out.accessibility.len();
+                child.place(frame, fit, env, out);
+                if env.accessibility {
+                    let bounds = out.accessible_bounds(frame);
+                    semantics.collect(start, bounds, &mut out.accessibility);
+                }
+            }
             // visual leaves: the draw list is born here
             (LayoutNode::Text { content, highlights, truncation, .. }, Fit::Leaf) => {
                 let content = content.get();
@@ -6291,6 +6345,18 @@ impl LayoutNode {
                 },
                 Fit::Leaf,
             ) => {
+                if env.accessibility {
+                    let bounds = out.accessible_bounds(frame);
+                    if let Some(bounds) = bounds.filter(|bounds| !bounds.is_empty()) {
+                        out.accessibility.push(crate::accessibility::Placed {
+                            path: Rc::from(path.as_str()),
+                            role: if *secret { crate::accessibility::Role::PasswordField } else { crate::accessibility::Role::TextField },
+                            label: Arc::clone(placeholder),
+                            value: (!*secret).then(|| Arc::clone(content)),
+                            bounds: Some(bounds), multiline: *multiline,
+                        });
+                    }
+                }
                 let multiline = *multiline;
                 let secret = *secret;
                 // Everything below draws and measures the string the
@@ -6974,6 +7040,7 @@ impl LayoutNode {
                 // the line the modal draws: everything recorded from
                 // here on is ABOVE it, and the walk back stops at the
                 // mark instead of reaching under it
+                out.accessibility.clear();
                 out.modal_floor = Some(ModalFloor {
                     hits: out.hits.len(),
                     scrolls: out.scrolls.len(),
@@ -7423,6 +7490,7 @@ impl LayoutNode {
                     // recorded from now on is ABOVE, and the walk back
                     // stops at this mark instead of reaching under it
                     if *modal && index > 0 {
+                        out.accessibility.clear();
                         out.modal_floor = Some(ModalFloor {
                             hits: out.hits.len(),
                             scrolls: out.scrolls.len(),
@@ -10676,6 +10744,7 @@ mod tests {
             dialog_frames: None,
             scale: 1.0,
             touch: false,
+            accessibility: false,
         };
         node.measure(proposal, &env)
     }
@@ -10713,6 +10782,7 @@ mod tests {
                 dialog_frames: None,
                 scale: 1.0,
                 touch: false,
+            accessibility: false,
             },
         )
     }
@@ -10773,6 +10843,7 @@ mod tests {
             dialog_frames: None,
             scale: 1.0,
             touch: false,
+            accessibility: false,
         };
         let region = |width: Px| LayoutNode::Scroll {
             commanded: None,
@@ -11107,6 +11178,7 @@ mod tests {
             dialog_frames: None,
             scale: 1.0,
             touch: false,
+            accessibility: false,
         };
         let region = || LayoutNode::Scroll {
             commanded: None,
@@ -11182,6 +11254,7 @@ mod tests {
             dialog_frames: None,
             scale: 1.0,
             touch: false,
+            accessibility: false,
         };
 
         let root = LayoutNode::Scroll {
