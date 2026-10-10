@@ -32,7 +32,8 @@ impl Escape {
         }
     }
 
-    fn apply(self, value: &str) -> String {
+    /// The value as this escape writes it.
+    pub fn apply(self, value: &str) -> String {
         match self {
             Escape::Raw => value.to_string(),
             Escape::Toml => {
