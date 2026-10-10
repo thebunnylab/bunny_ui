@@ -74,7 +74,7 @@ run_tests() {
     if grep -q '^codec' /work/crates/bunny_ui/Cargo.toml; then
         core_features=$core_features,codec
     fi
-    cargo test --no-fail-fast -p bunny-ui --features "$core_features" || status=1
+    cargo test --no-fail-fast -p bunny-ui-core --features "$core_features" || status=1
     cargo test --no-fail-fast -p bunny-ui-linux -p bunny-ui-vulkan || status=1
     return $status
 }

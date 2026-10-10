@@ -3,6 +3,8 @@
 //! frame — and no block of memory kept per wake. These tests mount what
 //! a product window mounts at rest and count.
 
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
