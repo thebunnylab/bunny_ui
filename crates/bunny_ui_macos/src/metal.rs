@@ -1,7 +1,7 @@
 //! The Mac's layer presenter: native opaque bands until a scene needs
 //! Metal, and the existing GPU backend after that one-way promotion.
 //! This module owns where each window's presenter lives and how its
-//! `CAMetalLayer` reaches an `NSView`.
+//! native root layer reaches an `NSView`.
 //!
 //! The presenter itself — the stack, the shaders, the atlas, the frame
 //! — is the shared Apple half ([`bunny_ui_apple::metal`]). This module
@@ -54,7 +54,7 @@ thread_local! {
 /// freed by the display's own refresh, milliseconds away.
 const CONGESTED_MS: f64 = 1.5;
 
-/// Grafts the CAMetalLayer onto the view — called by `create_window`
+/// Grafts the native root layer onto the view — called by `create_window`
 /// BEFORE `setWantsLayer:`, so the view becomes layer-HOSTING and
 /// `drawRect:` never runs. Returns false (and touches nothing) when the
 /// layer path is explicitly refused or cannot come up; the caller
@@ -85,13 +85,13 @@ pub(crate) fn try_install_view(view: Id, scale: f64, width: f64, height: f64) ->
     }
 }
 
-/// Builds a presenter over a fresh CAMetalLayer on `view`, or answers
+/// Builds a presenter over a fresh CALayer on `view`, or answers
 /// `None` when the GPU road is refused or cannot come up. Touches the
 /// view only on `Some`: the layer is configured first, grafted second,
 /// and primed (the anti-flash clear) once it hangs from the view.
 fn graft(view: Id, scale: f64, width: f64, height: f64) -> Option<MetalPresenter> {
     unsafe {
-        let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+        let layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
         if layer.is_null() {
             return None;
         }

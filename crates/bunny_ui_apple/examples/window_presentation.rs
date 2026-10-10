@@ -47,6 +47,10 @@ mod macos {
         #[link_name = "objc_msgSend"]
         fn msg_id_arg(o: Id, s: Sel, a: Id) -> Id;
         #[link_name = "objc_msgSend"]
+        fn msg_id_index(o: Id, s: Sel, a: u64) -> Id;
+        #[link_name = "objc_msgSend"]
+        fn msg_kind(o: Id, s: Sel, class: Id) -> i8;
+        #[link_name = "objc_msgSend"]
         fn msg_color(o: Id, s: Sel, x: i64, y: i64) -> Id;
         #[link_name = "objc_msgSend"]
         fn msg_rgba(o: Id, s: Sel, r: *mut f64, g: *mut f64, b: *mut f64, a: *mut f64);
@@ -55,6 +59,16 @@ mod macos {
     unsafe extern "C" {
         fn CGWindowListCreateImage(r: CGRect, options: u32, window: u32, image_options: u32) -> Id;
         fn CGImageRelease(image: Id);
+    }
+
+    unsafe fn has_metal_child(layer: Id) -> bool {
+        unsafe {
+            let children = msg_id(layer, sel("sublayers"));
+            (0..msg_integer(children, sel("count")) as u64).any(|index| {
+                let child = msg_id_index(children, sel("objectAtIndex:"), index);
+                msg_kind(child, sel("isKindOfClass:"), class("CAMetalLayer")) != 0
+            })
+        }
     }
 
     const SIZE: Size = Size {
@@ -197,7 +211,7 @@ mod macos {
                 sel("initWithFrame:"),
                 frame,
             );
-            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
             let mut presenter = WindowPresenter::attach(layer, 1.0).expect("Metal-capable desktop");
             msg_arg(view, sel("setLayer:"), layer);
             msg_bool(view, sel("setWantsLayer:"), 1);
@@ -288,7 +302,7 @@ mod macos {
             drop(presenter);
             // A fresh native presenter must retain its original bitmap after
             // the caller returns, and still promote transactionally later.
-            let native_layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let native_layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
             let mut native = WindowPresenter::attach(native_layer, 1.0).unwrap();
             msg_arg(view, sel("setLayer:"), native_layer);
             native.prime(SIZE.width, SIZE.height, 1);
@@ -359,7 +373,7 @@ mod macos {
                     false,
                 );
                 assert!(
-                    msg_id(native_layer, sel("device")).is_null(),
+                    !has_metal_child(native_layer),
                     "the image stays native"
                 );
                 expect(window, base, patch, label);
@@ -406,7 +420,7 @@ mod macos {
                         "the shortened thumb reveals the exact row: {pixel:?}"
                     );
                 }
-                assert!(msg_id(native_layer, sel("device")).is_null());
+                assert!(!has_metal_child(native_layer));
             }
             assert!(native.rest());
             expect(window, GREEN, RED, "native idle pixels");
@@ -422,7 +436,7 @@ mod macos {
             expect(window, GREEN, Color::WHITE, "promotion after native image");
             drop(native);
             msg_void(native_layer, sel("release"));
-            let sparse_layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let sparse_layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
             let mut sparse = WindowPresenter::attach(sparse_layer, 1.0).unwrap();
             msg_arg(view, sel("setLayer:"), sparse_layer);
             sparse.prime(SIZE.width, SIZE.height, 1);
@@ -437,7 +451,7 @@ mod macos {
                     false,
                 );
                 assert!(
-                    msg_id(sparse_layer, sel("device")).is_null(),
+                    !has_metal_child(sparse_layer),
                     "the sparse base stays native"
                 );
                 expect(window, GREEN, Color::WHITE, label);
@@ -456,7 +470,7 @@ mod macos {
             expect(window, RED, Color::WHITE, "promotion after sparse image");
             drop(sparse);
             msg_void(sparse_layer, sel("release"));
-            let growing_layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let growing_layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
             let mut growing = WindowPresenter::attach(growing_layer, 1.0).unwrap();
             msg_arg(view, sel("setLayer:"), growing_layer);
             growing.prime(SIZE.width, SIZE.height, 1);
@@ -521,7 +535,7 @@ mod macos {
                     false,
                 );
                 assert!(
-                    msg_id(growing_layer, sel("device")).is_null(),
+                    !has_metal_child(growing_layer),
                     "bounded growth remains native"
                 );
                 expect(
@@ -550,7 +564,7 @@ mod macos {
             }
             drop(growing);
             msg_void(growing_layer, sel("release"));
-            let patch_layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let patch_layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
             let mut patched = WindowPresenter::attach(patch_layer, 1.0).unwrap();
             msg_arg(view, sel("setLayer:"), patch_layer);
             patched.prime(SIZE.width, SIZE.height, 1);
@@ -583,7 +597,7 @@ mod macos {
                 ]);
                 patched.present(&display, SIZE, 1, Color::BLACK, &PixelFont, &images, false);
                 assert!(
-                    msg_id(patch_layer, sel("device")).is_null(),
+                    !has_metal_child(patch_layer),
                     "small patches keep the native base"
                 );
                 expect(window, GREEN, expected, label);
@@ -606,7 +620,7 @@ mod macos {
                 false,
             );
             assert!(
-                !msg_id(patch_layer, sel("device")).is_null(),
+                has_metal_child(patch_layer),
                 "a broad rewrite promotes"
             );
             expect(window, RED, GREEN, "native patched promotion");

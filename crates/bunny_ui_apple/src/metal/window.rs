@@ -576,13 +576,104 @@ enum Strategy {
     Metal(Box<Metal>),
 }
 
+/// Created only on promotion. The native root can remain a plain CALayer,
+/// avoiding CAMetalLayer's eager driver initialization for native scenes.
+struct MetalLayer {
+    raw: Id,
+    size: Size,
+}
+
+impl MetalLayer {
+    unsafe fn new(root: Id, size: Size) -> Option<Self> {
+        unsafe {
+            let raw = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            if raw.is_null() {
+                return None;
+            }
+            kill_layer_actions(raw);
+            let mut layer = Self {
+                raw,
+                size: Size {
+                    width: -1.0,
+                    height: -1.0,
+                },
+            };
+            layer.resize(size);
+            // The native cover stays above the new, initially empty layer.
+            msg_void_id_u64(root, sel("insertSublayer:atIndex:"), raw, 0);
+            Some(layer)
+        }
+    }
+
+    fn resize(&mut self, size: Size) {
+        if self.size != size {
+            unsafe {
+                msg_void_rect(
+                    self.raw,
+                    sel("setFrame:"),
+                    CGRect {
+                        origin: CGPoint { x: 0.0, y: 0.0 },
+                        size: CGSize {
+                            width: size.width,
+                            height: size.height,
+                        },
+                    },
+                );
+            }
+            self.size = size;
+        }
+    }
+}
+
+impl Drop for MetalLayer {
+    fn drop(&mut self) {
+        unsafe {
+            msg_void(self.raw, sel("removeFromSuperlayer"));
+            msg_void(self.raw, sel("release"));
+        }
+    }
+}
+
+#[allow(clashing_extern_declarations)]
+unsafe extern "C" {
+    #[link_name = "objc_msgSend"]
+    fn layer_is_kind_of(layer: Id, selector: Sel, class: Id) -> i8;
+}
+
 /// The native cover remains owned until the first GPU frame succeeds.
 struct Metal {
     presenter: MetalPresenter,
     cover: Option<Box<Native>>,
+    // Drop after the presenter and its in-flight resources. Existing callers
+    // supplying a CAMetalLayer keep their borrowed root instead.
+    layer: Option<MetalLayer>,
 }
 
 impl Metal {
+    unsafe fn attach(root: Id, scale: f64, size: Size) -> Option<Self> {
+        unsafe {
+            let layer = if layer_is_kind_of(root, sel("isKindOfClass:"), class("CAMetalLayer")) != 0
+            {
+                None
+            } else {
+                Some(MetalLayer::new(root, size)?)
+            };
+            let target = layer.as_ref().map_or(root, |layer| layer.raw);
+            let presenter = MetalPresenter::attach(target, scale)?;
+            Some(Self {
+                presenter,
+                cover: None,
+                layer,
+            })
+        }
+    }
+
+    fn resize(&mut self, size: Size) {
+        if let Some(layer) = &mut self.layer {
+            layer.resize(size);
+        }
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "same presentation boundary as MetalPresenter"
@@ -597,6 +688,7 @@ impl Metal {
         images: &dyn ImageEngine,
         live: bool,
     ) {
+        self.resize(size);
         if self.cover.is_none() {
             self.presenter
                 .present(display, size, scale, canvas, text, images, live);
@@ -630,8 +722,8 @@ impl WindowPresenter {
     /// existing CPU backend; no Metal device or queue is created here.
     ///
     /// # Safety
-    /// `layer` must be a live `CAMetalLayer` owned by the calling main
-    /// thread and must outlive this presenter.
+    /// `layer` must be a live `CALayer` (or an existing `CAMetalLayer`) owned
+    /// by the calling main thread and must outlive this presenter.
     pub unsafe fn attach(layer: Id, scale: f64) -> Option<Self> {
         if layer.is_null() || std::env::var("BUNNY_PRESENT").ok().as_deref() == Some("cpu") {
             return None;
@@ -659,7 +751,10 @@ impl WindowPresenter {
     pub fn prime(&mut self, width: f64, height: f64, scale: usize) {
         match &mut self.strategy {
             Strategy::Native(native) => unsafe { native.base.size(Size { width, height }, scale) },
-            Strategy::Metal(metal) => metal.presenter.prime(width, height, scale),
+            Strategy::Metal(metal) => {
+                metal.resize(Size { width, height });
+                metal.presenter.prime(width, height, scale);
+            }
         }
     }
 
@@ -845,7 +940,7 @@ impl WindowPresenter {
                 return;
             }
         }
-        let Some(metal) = MetalPresenter::attach(self.layer, scale as f64) else {
+        let Some(metal) = (unsafe { Metal::attach(self.layer, scale as f64, size) }) else {
             // The Metal backend already reports why it refused. Keep the
             // software fallback, including after a previously native frame.
             native.state = NativeState::Software(None);
@@ -867,10 +962,7 @@ impl WindowPresenter {
         };
         let prior = std::mem::replace(
             &mut self.strategy,
-            Strategy::Metal(Box::new(Metal {
-                presenter: metal,
-                cover: None,
-            })),
+            Strategy::Metal(Box::new(metal)),
         );
         if let Strategy::Metal(metal) = &mut self.strategy {
             if let Strategy::Native(native) = prior {
@@ -1624,6 +1716,82 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_native_root_creates_one_owned_metal_child_only_when_needed() {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let root = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
+            let mut presenter = WindowPresenter::attach(root, 1.0).unwrap();
+            let size = Size {
+                width: 180.0,
+                height: 130.0,
+            };
+            presenter.present(
+                &scene(0.0),
+                size,
+                1,
+                Color::WHITE,
+                &PixelFont,
+                &RawImages::default(),
+                false,
+            );
+            assert!(matches!(presenter.strategy, Strategy::Native(_)));
+            let children = msg_id(root, sel("sublayers"));
+            assert_eq!(
+                msg_u64(children, sel("count")),
+                1,
+                "only the native base exists"
+            );
+            presenter.present(
+                &DisplayList::default(),
+                size,
+                1,
+                Color::WHITE,
+                &PixelFont,
+                &RawImages::default(),
+                false,
+            );
+            let Strategy::Metal(metal) = &presenter.strategy else {
+                panic!("unsupported paint promotes")
+            };
+            let layer = metal.layer.as_ref().expect("owned Metal child").raw;
+            assert_eq!(msg_id(layer, sel("superlayer")), root);
+            assert!(!msg_id(layer, sel("device")).is_null());
+            assert!(metal.cover.is_none());
+            for (width, height, scale) in [(240.0, 170.0, 2), (180.0, 130.0, 1)] {
+                let size = Size { width, height };
+                presenter.present(
+                    &scene(0.0),
+                    size,
+                    scale,
+                    Color::WHITE,
+                    &PixelFont,
+                    &RawImages::default(),
+                    true,
+                );
+                let Strategy::Metal(metal) = &presenter.strategy else {
+                    panic!("one-way promotion")
+                };
+                let child = metal.layer.as_ref().unwrap();
+                assert_eq!(child.raw, layer, "resize reuses the same child");
+                assert_eq!(child.size, size);
+                assert_eq!(
+                    metal.presenter.physical,
+                    (width as usize * scale, height as usize * scale)
+                );
+            }
+            presenter.rest();
+            drop(presenter);
+            assert_eq!(
+                msg_u64(msg_id(root, sel("sublayers")), sel("count")),
+                0,
+                "drop detaches the owned Metal child"
+            );
+            msg_void(root, sel("release"));
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    #[test]
     fn leaving_band_admission_promotes_once_and_keeps_the_metal_strategy() {
         unsafe {
             let pool = objc_autoreleasePoolPush();
@@ -1728,77 +1896,85 @@ mod tests {
     fn an_aborted_first_gpu_frame_keeps_the_native_cover() {
         unsafe {
             let pool = objc_autoreleasePoolPush();
-            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
-            let native = Native {
-                ink: None,
-                base: BaseLayer::new(layer).unwrap(),
-                bands: scroll_bands::Presenter::default(),
-                outside_checked: false,
-                boxes: MeasureCache::default(),
-                state: NativeState::Choosing,
-            };
-            let mut metal = Metal {
-                presenter: MetalPresenter::attach(layer, 1.0).unwrap(),
-                cover: Some(Box::new(native)),
-            };
-            metal.present(
-                &DisplayList::default(),
-                Size {
-                    width: 0.0,
-                    height: 0.0,
-                },
-                1,
-                Color::WHITE,
-                &PixelFont,
-                &RawImages::default(),
-                false,
-            );
-            assert!(
-                metal.cover.is_some(),
-                "an aborted frame must not uncover black"
-            );
-            metal.present(
-                &scene(0.0),
-                Size {
-                    width: 180.0,
-                    height: 130.0,
-                },
-                1,
-                Color::WHITE,
-                &PixelFont,
-                &RawImages::default(),
-                false,
-            );
-            assert!(metal.cover.is_none(), "a presented frame removes the cover");
-            assert!(metal.presenter.transactional);
-            // The handoff can still belong to an outer AppKit transaction.
-            // A caller no longer requiring coordination cannot undo it.
-            metal.presenter.set_transactional(false);
-            assert!(metal.presenter.transactional);
-            let prior = metal.presenter.retained.clone().unwrap().0;
-            let cursor = metal.presenter.cursor;
-            metal.present(
-                &scene(0.0),
-                Size {
-                    width: 180.0,
-                    height: 130.0,
-                },
-                1,
-                Color::WHITE,
-                &PixelFont,
-                &RawImages::default(),
-                false,
-            );
-            assert!(Rc::ptr_eq(
-                &prior,
-                &metal.presenter.retained.as_ref().unwrap().0
-            ));
-            assert_eq!(
-                cursor, metal.presenter.cursor,
-                "a repeated frame still skips encoding"
-            );
-            drop(metal);
-            msg_void(layer, sel("release"));
+            for root_kind in ["CALayer", "CAMetalLayer"] {
+                let layer = msg_id(msg_id(class(root_kind), sel("alloc")), sel("init"));
+                let native = Native {
+                    ink: None,
+                    base: BaseLayer::new(layer).unwrap(),
+                    bands: scroll_bands::Presenter::default(),
+                    outside_checked: false,
+                    boxes: MeasureCache::default(),
+                    state: NativeState::Choosing,
+                };
+                let mut metal = Metal::attach(
+                    layer,
+                    1.0,
+                    Size {
+                        width: 180.0,
+                        height: 130.0,
+                    },
+                )
+                .unwrap();
+                metal.cover = Some(Box::new(native));
+                metal.present(
+                    &DisplayList::default(),
+                    Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    1,
+                    Color::WHITE,
+                    &PixelFont,
+                    &RawImages::default(),
+                    false,
+                );
+                assert!(
+                    metal.cover.is_some(),
+                    "an aborted frame must not uncover black"
+                );
+                metal.present(
+                    &scene(0.0),
+                    Size {
+                        width: 180.0,
+                        height: 130.0,
+                    },
+                    1,
+                    Color::WHITE,
+                    &PixelFont,
+                    &RawImages::default(),
+                    false,
+                );
+                assert!(metal.cover.is_none(), "a presented frame removes the cover");
+                assert!(metal.presenter.transactional);
+                // The handoff can still belong to an outer AppKit transaction.
+                // A caller no longer requiring coordination cannot undo it.
+                metal.presenter.set_transactional(false);
+                assert!(metal.presenter.transactional);
+                let prior = metal.presenter.retained.clone().unwrap().0;
+                let cursor = metal.presenter.cursor;
+                metal.present(
+                    &scene(0.0),
+                    Size {
+                        width: 180.0,
+                        height: 130.0,
+                    },
+                    1,
+                    Color::WHITE,
+                    &PixelFont,
+                    &RawImages::default(),
+                    false,
+                );
+                assert!(Rc::ptr_eq(
+                    &prior,
+                    &metal.presenter.retained.as_ref().unwrap().0
+                ));
+                assert_eq!(
+                    cursor, metal.presenter.cursor,
+                    "a repeated frame still skips encoding"
+                );
+                drop(metal);
+                msg_void(layer, sel("release"));
+            }
             objc_autoreleasePoolPop(pool);
         }
     }
