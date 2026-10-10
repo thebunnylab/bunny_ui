@@ -18,7 +18,7 @@ bunny build macos    # a signed app and its disk image, to hand out
 | --- | --- |
 | `bunny new` | Create an app with every platform's files in place |
 | `bunny run` | Build the app for a device and run it, its output here; a save reloads it hot, `R` restarts, `q` stops |
-| `bunny build` | Build the app to ship: a site for the web, a signed and notarized app for macOS, a signed bundle for Google Play |
+| `bunny build` | Build the app to ship: a site, a signed and notarized Mac app, a Google Play bundle, a Windows zip, a Linux tarball |
 | `bunny doctor` | Check what this machine needs for each platform — and offer to install what it can |
 | `bunny setup android` | Install the Android toolchain — SDK, NDK, emulator, a JDK — without Android Studio |
 | `bunny devices` | List where the app can run: this computer, the browser, simulators, emulators, phones |
@@ -143,6 +143,22 @@ override them for one build.
   command line. A release without a key stops, with the `keytool` line that
   makes one. `apksigner`, `zipalign -P 16` (the 16 KB pages Play requires) and
   `aapt2` check the APK.
+- **`windows`** — `<package>.exe` and a zip of it, built on Windows. The C
+  runtime is linked in, so the app needs no Visual C++ Redistributable, and the
+  executable carries resources `bunny` writes itself: the icon from
+  `windows/AppIcon.ico`, the version its properties show, and a manifest with
+  per-monitor DPI, the common controls of version 6, UTF-8 as the code page and
+  long paths. `bunny` reads the executable back to check the subsystem (no
+  console window in a release), the DLLs it imports and the resources. With a
+  certificate in `BUNNY_WINDOWS_PFX` (and `BUNNY_WINDOWS_PFX_PASSWORD`),
+  signtool signs it, timestamped by `BUNNY_WINDOWS_TIMESTAMP` (DigiCert's by
+  default).
+- **`linux`** — `<package>-<version>-linux-<arch>.tar.gz`, built on Linux: the
+  binary, a `.desktop` entry, the icon from `linux/AppIcon.png`, a README and an
+  `install.sh` that puts them in `~/.local` (or the prefix given). The entry, the
+  icon and `StartupWMClass` are named by the app's id, the one its window gives
+  Wayland and X11. The libraries the binary needs are read from it and named as
+  Debian, Fedora and Arch packages, in `build-info.json` and the README.
 
 ## `bunny setup android`
 
@@ -152,4 +168,4 @@ and creates an emulator, and a JDK for Gradle (Temurin, checked against its
 SHA-256). The Android SDK's terms are shown for you to accept before anything is
 installed (`--accept-android-terms` for CI); Google's usage metrics stay off.
 
-Coming next: iPhones, and `bunny build` for iOS, Windows and Linux.
+Coming next: iPhones, and `bunny build ios`.

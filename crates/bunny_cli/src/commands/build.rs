@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::project::Project;
 use crate::term;
 
-pub const SUMMARY: &str = "Build the app to ship: a site for the web, a signed app for macOS, a bundle for Google Play";
+pub const SUMMARY: &str = "Build the app to ship: a site, a signed Mac app, a Google Play bundle, a Windows zip, a Linux tarball";
 
 pub const USAGE: &str = "bunny build <PLATFORM> [OPTIONS]";
 
@@ -28,10 +28,17 @@ build.log (every command that made them).
           install, signed with the upload key from android/key.properties
           (or BUNNY_ANDROID_*), checked by apksigner and zipalign, and the
           native debug symbols Play Console reads crash reports against
+  windows <Name>.exe with its icon, version and manifest, the C runtime
+          linked in, and a zip of it; signed when BUNNY_WINDOWS_PFX names a
+          certificate
+  linux   <package>-<version>-linux-<arch>.tar.gz: the binary, its .desktop
+          entry and icon, and an install.sh; the packages it needs, per
+          distribution
 
 The version and the build number come from Cargo.toml: `version`, and
 `build` in [package.metadata.bunny]; --build-name and --build-number
-override them for one build. iOS, Windows and Linux come next.";
+override them for one build. Windows and Linux build on their own
+system; iOS comes next.";
 
 pub const OPTIONS: &[Opt] = &[
     Opt::flag("debug", "Build without optimizations"),
@@ -52,16 +59,18 @@ pub const OPTIONS: &[Opt] = &[
 pub fn run(matches: &Matches) -> Result<()> {
     let platform = match matches.positionals.as_slice() {
         [platform] => platform.as_str(),
-        [] => return Err(Error::usage("name the platform: bunny build web, macos or android")),
+        [] => return Err(Error::usage("name the platform: bunny build web, macos, android, windows or linux")),
         [_, extra, ..] => return Err(Error::usage(format!("`{extra}`: build one platform at a time"))),
     };
     let checked = match platform {
         "web" => Platform::Web,
         "macos" => Platform::Macos,
         "android" => Platform::Android,
-        "ios" | "windows" | "linux" => {
-            return Err(Error::new(format!("`bunny build {platform}` comes later"))
-                .hint("bunny build web, macos and android are here; `bunny run` runs on every platform"));
+        "windows" => Platform::Windows,
+        "linux" => Platform::Linux,
+        "ios" => {
+            return Err(Error::new("`bunny build ios` comes later")
+                .hint("bunny build web, macos, android, windows and linux are here; `bunny run -d ios` runs in the Simulator"));
         }
         other => {
             return Err(Error::usage(format!("`{other}` is not a platform: web, macos, ios, android, windows or linux")));
@@ -90,11 +99,17 @@ pub fn run(matches: &Matches) -> Result<()> {
         dmg: !matches.flag("no-dmg"),
         abis: matches.values("abi").iter().flat_map(|list| list.split(',')).map(str::trim).filter(|abi| !abi.is_empty()).map(String::from).collect(),
     };
-    doctor::preflight(checked)?;
+    // a desktop app is built on its own system: say so before listing
+    // what this one lacks to build for another
     match checked {
         Platform::Macos => build::macos::check(&project, &options)?,
-        Platform::Android => build::android::check(&project, &options)?,
+        Platform::Windows => build::windows::check(&project)?,
+        Platform::Linux => build::linux::check(&project)?,
         _ => {}
+    }
+    doctor::preflight(checked)?;
+    if checked == Platform::Android {
+        build::android::check(&project, &options)?;
     }
     println!("{}", term::bold(&format!("Building {} {} ({}) for {platform}…", project.name, project.version, project.build)));
     let out = build::out_dir(&project, platform)?;
@@ -103,6 +118,8 @@ pub fn run(matches: &Matches) -> Result<()> {
     let built = match checked {
         Platform::Web => build::web::build(&project, &options, &out, &mut log, &mut info),
         Platform::Android => build::android::build(&project, &options, &out, &mut log, &mut info),
+        Platform::Windows => build::windows::build(&project, &options, &out, &mut log, &mut info),
+        Platform::Linux => build::linux::build(&project, &options, &out, &mut log, &mut info),
         _ => build::macos::build(&project, &options, &out, &mut log, &mut info),
     };
     // the log is written whatever happened: it is what explains a failure

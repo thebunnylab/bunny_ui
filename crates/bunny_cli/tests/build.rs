@@ -1,8 +1,10 @@
 //! `bunny build` on a project `bunny new` writes: the web's site with
 //! its files named after their content; on a Mac, the app bundle, signed
-//! ad hoc, and its disk image; and, with `BUNNY_TEST_ANDROID` set on a
-//! machine with the Android SDK, NDK and a JDK, the signed App Bundle and
-//! APK for arm64-v8a.
+//! ad hoc, and its disk image; on Windows, the executable with its
+//! resources and its zip; on Linux, the tarball with the `.desktop`
+//! entry; and, with `BUNNY_TEST_ANDROID` set on a machine with the
+//! Android SDK, NDK and a JDK, the signed App Bundle and APK for
+//! arm64-v8a.
 //!
 //! Slow — it builds the framework for release — so it runs on request:
 //! `cargo test -p bunny-cli --test build -- --ignored`.
@@ -59,6 +61,33 @@ fn a_new_project_builds_its_packages() {
         let info = fs::read_to_string(out.join("build-info.json")).unwrap();
         assert!(info.contains("\"signed_by\": \"ad hoc\"") || info.contains("Developer ID"), "{info}");
         assert!(fs::read_to_string(out.join("build.log")).unwrap().contains("$ codesign"));
+    }
+
+    if cfg!(windows) {
+        bunny(&app, &["build", "windows", "--build-number", "9"]);
+        let out = app.join("build/windows");
+        assert!(out.join("shipped.exe").is_file() && out.join("Shipped-0.1.0-windows-x64.zip").is_file());
+        let info = fs::read_to_string(out.join("build-info.json")).unwrap();
+        assert!(info.contains("\"subsystem\": \"windows\""), "a release opens no console: {info}");
+        assert!(!info.to_ascii_lowercase().contains("vcruntime"), "the C runtime is linked in: {info}");
+        if std::env::var_os("BUNNY_WINDOWS_PFX").is_some() {
+            assert!(!info.contains("\"signed_by\": \"nobody\""), "the certificate signed it: {info}");
+        }
+    }
+
+    if cfg!(target_os = "linux") {
+        bunny(&app, &["build", "linux"]);
+        let out = app.join("build/linux");
+        let arch = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
+        let archive = out.join(format!("shipped-0.1.0-linux-{arch}.tar.gz"));
+        assert!(out.join("shipped").is_file() && archive.is_file());
+        let info = fs::read_to_string(out.join("build-info.json")).unwrap();
+        assert!(info.contains("libwayland-client"), "{info}");
+        let listed = Command::new("tar").arg("-tzf").arg(&archive).output().unwrap();
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        for entry in ["shipped-0.1.0/bin/shipped", "shipped-0.1.0/share/applications/io.bunny.shipped.desktop", "shipped-0.1.0/install.sh"] {
+            assert!(listed.lines().any(|line| line == entry), "{entry} is not in the archive:\n{listed}");
+        }
     }
 
     if std::env::var_os("BUNNY_TEST_ANDROID").is_some() {
