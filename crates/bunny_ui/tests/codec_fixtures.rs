@@ -5,6 +5,8 @@
 
 #![cfg(feature = "codec")]
 
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use bunny_ui::codec::{self, jpeg, png};
 
 macro_rules! fixture {

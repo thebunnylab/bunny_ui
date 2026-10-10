@@ -45,6 +45,15 @@ def diagnostic_keys(log, source):
     return diagnostics
 
 
+def package_names(source):
+    """Each workspace package's name, by its directory under the root."""
+    metadata = json.loads(subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1"],
+                                         cwd=source, check=True, capture_output=True, text=True).stdout)
+    root = Path(metadata["workspace_root"])
+    return {Path(package["manifest_path"]).parent.relative_to(root).as_posix(): package["name"]
+            for package in metadata["packages"]}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True, type=Path)
@@ -56,6 +65,11 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     record = {"packages": arguments.package, "strict_runs": {}}
     keys = {}
+    # A package is the same package on both revisions by its directory, not
+    # its name: a rename (bunny-ui → bunny-ui-core) must still compare the
+    # same code. One the baseline lacks has nothing to compare against.
+    directories = {name: directory for directory, name in package_names(arguments.candidate.resolve()).items()}
+    baseline_names = package_names(arguments.baseline.resolve())
     for name, source in (("baseline", arguments.baseline), ("candidate", arguments.candidate)):
         source = source.resolve()
         record["strict_runs"][name] = {}
@@ -63,12 +77,16 @@ def main():
         # A failing core invocation can stop Cargo before it reaches a native
         # dependent. Each touched package must therefore run independently.
         for package in arguments.package:
+            invoked = package if name == "candidate" else baseline_names.get(directories[package])
+            if invoked is None:
+                record["strict_runs"][name][package] = {"exit_code": None, "diagnostics": []}
+                continue
             # Retain independently compilable targets after one fails. Without
             # this, a library error can cancel its test target and make inherited
             # test-only warnings appear new on whichever revision ran farther.
             command = ["cargo", "clippy", "--locked", "--all-targets", "--all-features", "--keep-going",
                        "--no-deps", "--message-format=json", "--target-dir", str(output / (name + "-target")),
-                       "-p", package, "--", "-D", "warnings"]
+                       "-p", invoked, "--", "-D", "warnings"]
             log = output / (name + "-" + package + ".jsonl")
             with log.open("w", encoding="utf-8") as stream:
                 result = subprocess.run(command, cwd=source, stdout=stream, stderr=subprocess.STDOUT)
