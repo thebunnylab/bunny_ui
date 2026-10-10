@@ -84,7 +84,7 @@ pub(crate) mod viewport;
 pub mod views;
 pub mod words;
 
-pub use runtime::request_frame;
+pub use runtime::{code_changed, request_frame};
 
 /// `text!("Count: {}", self.count)` — the built-in `format!` of text,
 /// and a text that reads for itself: the format runs in a closure the

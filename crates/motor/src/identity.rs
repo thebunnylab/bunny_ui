@@ -97,6 +97,8 @@ struct Registry {
     anchors: HashMap<AnchorKey, (usize, u32, u64)>,
     /// Per-pass counters: how many `State::new` of each type each scope has done.
     seqs: HashMap<(String, TypeId), u32>,
+    /// Per-pass counters by name ([`ordinal`]).
+    ordinals: HashMap<(String, String), u32>,
     /// view → dependencies read in its LAST body (persists across passes).
     reads_by_view: HashMap<String, HashSet<DepKey>>,
     /// inverted index: dependency → reader views.
@@ -170,7 +172,20 @@ struct Registry {
     paint_readers: HashMap<DepKey, Few<Rc<str>>>,
     /// The boxes a write reached since the last frame took them.
     dirty_paints: HashSet<Rc<str>>,
+    /// The code of the views changed since the last pass ([`code_changed`]):
+    /// the next pass finds the effect slots again by where they are in
+    /// the source, not by line.
+    code_changed: bool,
+    /// During the pass after a code change: the slots a callsite left,
+    /// by group, the lowest line first — handed out in order, one per
+    /// callsite of the group the new code declares ([`moved_slot`]).
+    moved_slots: Option<HashMap<MovedGroup, std::collections::VecDeque<Rc<dyn std::any::Any>>>>,
 }
+
+/// The slots one callsite group owns: the scope, the source file, the
+/// column, and the type of the slot. An edit above a callsite moves its
+/// line and keeps the rest.
+type MovedGroup = (String, &'static str, u32, TypeId);
 
 impl Registry {
     /// The cursor's segments, read back from the joined path: each open
@@ -373,7 +388,11 @@ pub fn begin_pass() {
         registry.skips_asked = !registry.owners.is_empty();
         registry.reran.clear();
         registry.seqs.clear();
+        registry.ordinals.clear();
         clear_view_reads(&mut registry, ROOT_READER);
+        if std::mem::take(&mut registry.code_changed) {
+            registry.moved_slots = Some(HashMap::default());
+        }
     });
 }
 
@@ -389,6 +408,9 @@ pub fn end_pass() -> Vec<String> {
         // the pass is over: a write from here on is nobody's own
         registry.serving = false;
         registry.served.clear();
+        // the slots the new code did not declare again go with the old
+        // code — a task among them is cancelled as its handle drops
+        registry.moved_slots = None;
         // the root stays readable until the next begin_pass (the runtime
         // consults it to scope dirty state and effects)
         let Some(root) = registry.pass_root.clone() else {
@@ -1079,6 +1101,24 @@ pub(crate) fn claim_anchor(type_id: TypeId) -> Claim {
     })
 }
 
+/// How many times this pass already counted `name` in the current
+/// scope: 0 the first time, then 1, 2… The counts start over with every
+/// pass, the way the `State` anchors count — a body that declares the
+/// same thing twice tells the two apart by this number. Outside a pass
+/// it is always 0.
+pub fn ordinal(name: &str) -> u32 {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        if !registry.pass_active {
+            return 0;
+        }
+        let scope = current_scope(&registry);
+        let count = registry.ordinals.entry((scope, name.to_string())).or_insert(0);
+        *count += 1;
+        *count - 1
+    })
+}
+
 pub(crate) fn fulfill_anchor(token: AnchorToken, index: usize, generation: u32, dep: u64) {
     let Some(key) = token.key else {
         return; // app scope: no anchor, no owner, lives forever
@@ -1742,12 +1782,19 @@ pub fn scoped_effect_slot<V: 'static>(site: impl Into<Site>) -> Rc<RefCell<Optio
         let mut registry = registry.borrow_mut();
         let scope = current_scope(&registry);
         let key = (site, scope.clone());
-        if let Some(any) = registry.effect_cells.get(&key).cloned()
+        let moved = match site {
+            Site::Caller(location) if registry.moved_slots.is_some() => {
+                moved_slot::<RefCell<Option<V>>>(&mut registry, &scope, location)
+            }
+            _ => None,
+        };
+        if moved.is_none()
+            && let Some(any) = registry.effect_cells.get(&key).cloned()
             && let Ok(cell) = any.downcast::<RefCell<Option<V>>>()
         {
             return cell;
         }
-        let cell: Rc<RefCell<Option<V>>> = Rc::new(RefCell::new(None));
+        let cell: Rc<RefCell<Option<V>>> = moved.unwrap_or_else(|| Rc::new(RefCell::new(None)));
         registry.effect_cells.insert(key.clone(), cell.clone());
         if scope != APP_SCOPE {
             let pass_no = registry.pass_no;
@@ -1757,6 +1804,47 @@ pub fn scoped_effect_slot<V: 'static>(site: impl Into<Site>) -> Rc<RefCell<Optio
         }
         cell
     })
+}
+
+/// Says that the code of the views changed under the runtime — a hot
+/// reload loaded new code next to the old. An edit above a `.task` or an
+/// `.on_change` moves the line its slot is keyed by. In the next pass, a
+/// callsite the new code declares takes the slot of the old callsite
+/// with the same file, column and slot type, in the order of their
+/// lines: an edit that moves lines keeps the running task and the value
+/// the change detection saw. A slot no callsite takes goes away at the
+/// end of that pass.
+pub fn code_changed() {
+    REGISTRY.with(|registry| registry.borrow_mut().code_changed = true);
+}
+
+/// The slot the old code left for this callsite, taken out of the table
+/// — the first one of its group not taken yet, in the order of the old
+/// lines. The first callsite of a group to ask collects the group.
+fn moved_slot<C: 'static>(registry: &mut Registry, scope: &str, location: &'static std::panic::Location<'static>) -> Option<Rc<C>> {
+    let group: MovedGroup = (scope.to_string(), location.file(), location.column(), TypeId::of::<C>());
+    if !registry.moved_slots.as_ref()?.contains_key(&group) {
+        let mut left: Vec<((Site, String), u32)> = registry
+            .effect_cells
+            .iter()
+            .filter_map(|(key, cell)| match key.0 {
+                Site::Caller(old)
+                    if key.1 == scope
+                        && old.file() == location.file()
+                        && old.column() == location.column()
+                        && (**cell).type_id() == TypeId::of::<C>() =>
+                {
+                    Some((key.clone(), old.line()))
+                }
+                _ => None,
+            })
+            .collect();
+        left.sort_by_key(|(_, line)| *line);
+        let cells = left.into_iter().filter_map(|(key, _)| registry.effect_cells.remove(&key)).collect();
+        registry.moved_slots.as_mut()?.insert(group.clone(), cells);
+    }
+    let cell = registry.moved_slots.as_mut()?.get_mut(&group)?.pop_front()?;
+    cell.downcast::<C>().ok()
 }
 
 #[cfg(test)]
@@ -2375,5 +2463,70 @@ mod reach_tests {
         let kept = state.update_if(|value| (false, *value));
         assert_eq!(kept, 4);
         assert_eq!(scene_epoch(), scene, "it did not change, it did not write");
+    }
+}
+
+#[cfg(test)]
+mod moved_code_tests {
+    use super::*;
+    use std::panic::Location;
+
+    #[track_caller]
+    fn here() -> &'static Location<'static> {
+        Location::caller()
+    }
+
+    /// One pass that declares a slot of `i32` at each site, in order —
+    /// what a body does with two `.on_change` of the same value type.
+    fn pass(sites: &[&'static Location<'static>]) -> Vec<Rc<RefCell<Option<i32>>>> {
+        begin_pass();
+        let cells = {
+            let _root = enter("Moved");
+            sites.iter().map(|site| scoped_effect_slot::<i32>(*site)).collect()
+        };
+        let _ = end_pass();
+        cells
+    }
+
+    #[test]
+    fn after_a_code_change_a_moved_callsite_keeps_its_slot() {
+        // the same column, lines apart: the edit inserted lines above
+        let first = here();
+        let other = here();
+        let moved = here();
+        let later = here();
+        assert_eq!((first.column(), moved.column()), (other.column(), later.column()));
+
+        let cells = pass(&[first, other]);
+        *cells[0].borrow_mut() = Some(1);
+        *cells[1].borrow_mut() = Some(2);
+
+        // without a code change, a new line is a new callsite
+        let fresh = pass(&[moved]);
+        assert_eq!(*fresh[0].borrow(), None);
+
+        let cells = pass(&[first, other]);
+        *cells[0].borrow_mut() = Some(1);
+        code_changed();
+        let kept = pass(&[moved, later]);
+        assert_eq!(*kept[0].borrow(), Some(1), "the first callsite of the group takes the first old slot");
+        assert_eq!(*kept[1].borrow(), Some(2), "the second takes the second, in the order of the old lines");
+
+        // the pass after is an ordinary one again: the new lines are the keys
+        let again = pass(&[moved, later]);
+        assert!(Rc::ptr_eq(&again[0], &kept[0]) && Rc::ptr_eq(&again[1], &kept[1]));
+    }
+
+    #[test]
+    fn a_slot_the_new_code_does_not_declare_goes_with_the_old_code() {
+        let first = here();
+        let other = here();
+        let cells = pass(&[first, other]);
+        let dropped = Rc::downgrade(&cells[1]);
+        drop(cells);
+        code_changed();
+        let kept = pass(&[first]);
+        assert_eq!(kept.len(), 1);
+        assert!(dropped.upgrade().is_none(), "the slot nobody took is gone after the pass");
     }
 }

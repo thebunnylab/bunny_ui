@@ -300,6 +300,9 @@ pub struct Runtime {
     /// the retention ONCE (tokens read in a body are baked into the
     /// scene).
     theme_version: Cell<u64>,
+    /// The code version the last pass saw ([`code_changed`]): new code
+    /// rebuilds the retention once, the way a new theme does.
+    code_version: Cell<u64>,
     /// The app keymap: key pattern → action. Runtime config (like the
     /// text engine), not retention — bind is a declaration of intent.
     keymap: RefCell<HashMap<KeyPattern, ActionId>>,
@@ -1523,6 +1526,7 @@ impl Runtime {
             webview_eval_next: Cell::new(0),
             live_ledger: RefCell::new(motor::hash::FxHashMap::default()),
             theme_version: Cell::new(crate::theme::version()),
+            code_version: Cell::new(code_version()),
             keymap: RefCell::new(HashMap::default()),
             scoped_keymap: RefCell::new(HashMap::default()),
             chords: RefCell::new(Vec::new()),
@@ -1666,6 +1670,13 @@ impl Runtime {
         let theme_version = crate::theme::version();
         if self.theme_version.get() != theme_version {
             self.theme_version.set(theme_version);
+            reconciler::clear();
+        }
+        // new code: every body runs again, the new code in place of the
+        // old — the state stays where it is
+        let code_version = code_version();
+        if self.code_version.get() != code_version {
+            self.code_version.set(code_version);
             reconciler::clear();
         }
         // the same for a moved environment: a body that read the size
@@ -4781,6 +4792,7 @@ impl Runtime {
             wrote: motor::identity::scene_epoch() != self.settled_epoch.get(),
             paints: motor::identity::has_dirty_paints(),
             theme: crate::theme::version() != self.theme_version.get(),
+            code: code_version() != self.code_version.get(),
             environment: self.env_moved.get(),
             insets: self.last_insets.get() != self.frame_insets(),
             webview: reconciler::has_webview_commands(),
@@ -7276,6 +7288,7 @@ impl Runtime {
             && motor::identity::scene_epoch() == self.settled_epoch.get()
             && !motor::task::has_ready()
             && crate::theme::version() == self.theme_version.get()
+            && code_version() == self.code_version.get()
             && !self.env_moved.get()
             && self.last_insets.get() == self.frame_insets()
             && !self.has_pending_dirty()
@@ -7313,6 +7326,7 @@ impl Runtime {
     fn stable_boundary(&self, root: std::any::TypeId) -> Option<String> {
         (self.last_root_type.get() == Some(root)
             && crate::theme::version() == self.theme_version.get()
+            && code_version() == self.code_version.get()
             && !self.env_moved.get()
             && !self.has_pending_dirty())
         .then(|| self.root_boundary.borrow().clone())
@@ -7340,6 +7354,29 @@ thread_local! {
 /// it.
 pub fn request_frame() {
     FRAME_REQUESTED.with(|flag| flag.set(true));
+}
+
+thread_local! {
+    /// How many times the code of the views changed on this thread.
+    static CODE_VERSION: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Says that the code of the views changed while the app runs — a hot
+/// reload loaded a new build of the app next to the old one. The next
+/// pass of every runtime on this thread runs every body again, with the
+/// new code, and the state stays: a `State` keeps its value, a
+/// `view_model` its model, a `.task` keeps running. An edit that moved
+/// lines keeps the `.task` and `.on_change` slots too.
+///
+/// What the old code already started keeps the old code: a running
+/// task, a closure a state holds.
+pub fn code_changed() {
+    CODE_VERSION.with(|version| version.set(version.get() + 1));
+    motor::identity::code_changed();
+}
+
+fn code_version() -> u64 {
+    CODE_VERSION.with(Cell::get)
 }
 
 /// What the engine retains, counted — the sizes of every table that
@@ -7497,6 +7534,8 @@ pub struct FrameNeed {
     pub paints: bool,
     /// The theme moved.
     pub theme: bool,
+    /// The code of the views changed ([`code_changed`]).
+    pub code: bool,
     /// The environment moved.
     pub environment: bool,
     /// The safe area or the keyboard inset moved.
@@ -7520,6 +7559,7 @@ impl FrameNeed {
             || self.wrote
             || self.paints
             || self.theme
+            || self.code
             || self.environment
             || self.insets
             || self.webview
