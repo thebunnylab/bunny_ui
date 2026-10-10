@@ -582,11 +582,10 @@ fn state(value: &Provider) -> Result<Available, Hresult> {
     let (snapshot, node) = surface.read(value.key)?;
     Ok((surface, snapshot, node))
 }
-unsafe extern "system" fn options(this: Object, out: *mut i32) -> Hresult {
-    output(out, 0, || {
-        state(unsafe { provider(this) })?;
-        Ok(2 | 32)
-    }) // ServerSideProvider | UseComThreading
+unsafe extern "system" fn options(_this: Object, out: *mut i32) -> Hresult {
+    // Immutable COM metadata remains available during disconnect/retirement,
+    // just like QueryInterface. Only element data and actions become unavailable.
+    output(out, 0, || Ok(2 | 32)) // ServerSideProvider | UseComThreading
 }
 unsafe extern "system" fn pattern(this: Object, pattern: i32, out: *mut Object) -> Hresult {
     output(out, ptr::null_mut(), || {
@@ -998,6 +997,9 @@ mod tests {
             assert!(result.is_null());
             release(still_queryable);
             assert_eq!(invoke(button.simple()), UNAVAILABLE);
+            let mut flags = 0;
+            assert_eq!(options(button.simple(), &mut flags), OK);
+            assert_eq!(flags, 2 | 32);
         }
         assert_eq!(
             unsafe { provider(field.simple()) }

@@ -790,6 +790,14 @@ mod probe {
             rows: State::new(vec![1, 2]),
             modal: State::new(first_modal),
         };
+        let keeper_title = format!("Bunny UIA keeper {}", std::process::id());
+        app.open(
+            WindowSpec::titled(keeper_title.clone()).size(160.0, 100.0),
+            Rc::new(app.runtime()),
+            text("UIA pump keeper"),
+        );
+        let keeper = unsafe { FindWindowW(ptr::null(), wide(&keeper_title).as_ptr()) };
+        assert_ne!(keeper, 0);
         let title = format!("Bunny UIA witness {}", std::process::id());
         app.open(
             WindowSpec::titled(title.clone()).size(480.0, 640.0),
@@ -829,6 +837,9 @@ mod probe {
             let result = std::panic::catch_unwind(|| unsafe { client(window, first_modal) });
             unsafe {
                 PostMessageW(window, 0x0010, 0, 0);
+                // Keep the STA pump alive while UIA queries and releases the
+                // first window's retired objects. Join only after COM returns.
+                PostMessageW(keeper, 0x0010, 0, 0);
             } // WM_CLOSE, our own window
             result
         });
