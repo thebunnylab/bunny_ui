@@ -119,6 +119,12 @@ unsafe extern "C" {
     pub fn CGContextSetInterpolationQuality(context: Id, quality: i32);
     pub fn CGImageRelease(image: Id);
     pub fn CGDataProviderCreateWithCFData(data: *const c_void) -> *mut c_void;
+    pub fn CGDataProviderCreateWithData(
+        info: *mut c_void,
+        data: *const c_void,
+        size: usize,
+        release: Option<unsafe extern "C" fn(*mut c_void, *const c_void, usize)>,
+    ) -> *mut c_void;
     pub fn CGDataProviderRelease(provider: *mut c_void);
     #[allow(clippy::too_many_arguments)]
     pub fn CGImageCreate(

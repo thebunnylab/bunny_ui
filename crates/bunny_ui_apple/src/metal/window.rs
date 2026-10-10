@@ -3,6 +3,7 @@
 
 use super::*;
 use bunny_ui::raster::{Bitmap, rasterize_with};
+use std::sync::Arc;
 
 const MAX_BASE_PIXELS: usize = 8 * 1024 * 1024;
 
@@ -11,7 +12,7 @@ const MAX_BASE_PIXELS: usize = 8 * 1024 * 1024;
 struct OpaqueBase(Id);
 
 impl OpaqueBase {
-    fn new(bitmap: &Bitmap) -> Option<Self> {
+    fn new(bitmap: &Arc<Bitmap>) -> Option<Self> {
         if bitmap.width() == 0
             || bitmap.height() == 0
             || bitmap.pixels().iter().any(|pixel| pixel & 255 != 255)
@@ -19,10 +20,22 @@ impl OpaqueBase {
             return None;
         }
         let stride = bitmap.width().checked_mul(4)?;
-        let pixels = bitmap.to_rgba_bytes();
+        let bytes = bitmap
+            .pixels()
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())?;
+        // The provider owns a strong reference, including after a layer retains
+        // the image. Its release callback may run on a compositor thread.
+        let owner = Arc::into_raw(Arc::clone(bitmap));
         unsafe {
-            let provider = crate::ffi::owned_provider(pixels.as_ptr(), pixels.len());
+            let provider = crate::ffi::CGDataProviderCreateWithData(
+                owner.cast_mut().cast(),
+                bitmap.pixels().as_ptr().cast(),
+                bytes,
+                Some(release_bitmap),
+            );
             if provider.is_null() {
+                drop(Arc::from_raw(owner));
                 return None;
             }
             let space = crate::ffi::CGColorSpaceCreateDeviceRGB();
@@ -30,7 +43,14 @@ impl OpaqueBase {
                 crate::ffi::CGDataProviderRelease(provider);
                 return None;
             }
-            // kCGImageAlphaNoneSkipLast: RGBX bytes, no transparency.
+            // Bitmap stores 0xRRGGBBAA words. Describe their native byte order
+            // instead of allocating an RGBA byte copy and then a CFData copy.
+            // kCGImageAlphaNoneSkipLast keeps the same opaque RGBX semantics.
+            let byte_order = if cfg!(target_endian = "little") {
+                2 << 12
+            } else {
+                4 << 12
+            };
             let image = crate::ffi::CGImageCreate(
                 bitmap.width(),
                 bitmap.height(),
@@ -38,7 +58,7 @@ impl OpaqueBase {
                 32,
                 stride,
                 space,
-                5,
+                5 | byte_order,
                 provider,
                 std::ptr::null(),
                 false,
@@ -49,6 +69,12 @@ impl OpaqueBase {
             (!image.is_null()).then(|| Self(image))
         }
     }
+}
+
+// `info` is exactly the Arc reference transferred to a successful provider.
+// The callback only releases that immutable allocation; it touches no UI state.
+unsafe extern "C" fn release_bitmap(info: *mut c_void, _: *const c_void, _: usize) {
+    unsafe { drop(Arc::from_raw(info.cast::<Bitmap>())) };
 }
 
 impl Drop for OpaqueBase {
@@ -63,12 +89,13 @@ enum BaseBacking {
 }
 
 impl BaseBacking {
-    fn new(bitmap: &Bitmap) -> Option<Self> {
-        if let Some(image) = OpaqueBase::new(bitmap) {
+    fn new(bitmap: Bitmap) -> Option<Self> {
+        let bitmap = Arc::new(bitmap);
+        if let Some(image) = OpaqueBase::new(&bitmap) {
             return Some(Self::Image(image));
         }
         let surface = software_patch::Surface::new((bitmap.width(), bitmap.height()))?;
-        surface.write(bitmap).then_some(Self::Surface(surface))
+        surface.write(&bitmap).then_some(Self::Surface(surface))
     }
 
     fn raw(&self) -> Id {
@@ -87,7 +114,7 @@ struct BaseLayer {
 impl BaseLayer {
     unsafe fn new(root: Id) -> Option<Self> {
         unsafe {
-            let backing = BaseBacking::new(&Bitmap::new(1, 1, bunny_ui::theme::canvas()))?;
+            let backing = BaseBacking::new(Bitmap::new(1, 1, bunny_ui::theme::canvas()))?;
             let raw = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
             if raw.is_null() {
                 return None;
@@ -117,7 +144,7 @@ impl BaseLayer {
         }
     }
 
-    unsafe fn paint(&mut self, bitmap: &Bitmap, size: Size, scale: usize) -> bool {
+    unsafe fn paint(&mut self, bitmap: Bitmap, size: Size, scale: usize) -> bool {
         let Some(backing) = BaseBacking::new(bitmap) else {
             return false;
         };
@@ -346,7 +373,7 @@ impl WindowPresenter {
         if admitted {
             let bitmap =
                 rasterize_with(display, physical.0, physical.1, scale, canvas, text, images);
-            if unsafe { native.base.paint(&bitmap, size, scale) } {
+            if unsafe { native.base.paint(bitmap, size, scale) } {
                 let kept = (Rc::new(display.clone()), physical, scale, canvas);
                 native.state = match native.state {
                     NativeState::Software(_) => NativeState::Software(Some(kept)),
@@ -362,7 +389,7 @@ impl WindowPresenter {
             unsafe { native.bands.hide() };
             let bitmap =
                 rasterize_with(display, physical.0, physical.1, scale, canvas, text, images);
-            if unsafe { native.base.paint(&bitmap, size, scale) } {
+            if unsafe { native.base.paint(bitmap, size, scale) } {
                 native.state = NativeState::Software(Some((
                     Rc::new(display.clone()),
                     physical,
@@ -483,8 +510,42 @@ mod tests {
     }
 
     #[test]
+    fn the_static_image_keeps_the_original_allocation_until_its_last_owner() {
+        let bitmap = Arc::new(Bitmap::new(2, 2, Color::hex(0x123456)));
+        let lifetime = Arc::downgrade(&bitmap);
+        let image = OpaqueBase::new(&bitmap).unwrap();
+        drop(bitmap);
+        assert!(
+            lifetime.upgrade().is_some(),
+            "the image must own the original pixels, not a copy"
+        );
+        unsafe { crate::ffi::CFRetain(image.0) };
+        let retained = OpaqueBase(image.0);
+        drop(image);
+        assert!(
+            lifetime.upgrade().is_some(),
+            "CoreAnimation may retain the image after presentation"
+        );
+        drop(retained);
+        assert!(
+            lifetime.upgrade().is_none(),
+            "the final image release frees the pixels"
+        );
+    }
+
+    #[test]
     fn the_static_image_owns_its_bytes_and_refuses_transparency() {
         unsafe extern "C" {
+            fn CGBitmapContextCreate(
+                data: *mut c_void,
+                width: usize,
+                height: usize,
+                bits: usize,
+                stride: usize,
+                space: Id,
+                info: u32,
+            ) -> Id;
+            fn CGContextRelease(context: Id);
             fn CGImageGetAlphaInfo(image: Id) -> u32;
             fn CGImageGetDataProvider(image: Id) -> Id;
             fn CGDataProviderCopyData(provider: Id) -> Id;
@@ -492,7 +553,7 @@ mod tests {
             fn CFDataGetBytePtr(data: *const std::ffi::c_void) -> *const u8;
         }
         let image = {
-            let bitmap = Bitmap::new(2, 2, Color::hex(0x123456));
+            let bitmap = Arc::new(Bitmap::new(2, 2, Color::hex(0x123456)));
             OpaqueBase::new(&bitmap).unwrap()
         };
         unsafe {
@@ -502,9 +563,29 @@ mod tests {
             assert_eq!(CFDataGetLength(data), 16);
             assert_eq!(
                 std::slice::from_raw_parts(CFDataGetBytePtr(data), 16),
-                &[0x12, 0x34, 0x56, 0xff].repeat(4)
+                &0x123456ff_u32.to_ne_bytes().repeat(4)
             );
             CFRelease(data);
+            // Reading provider bytes alone cannot catch a wrong byte-order tag.
+            // Ask Quartz to interpret the image into an ordinary RGBA context.
+            let mut rgba = [0_u8; 16];
+            let space = crate::ffi::CGColorSpaceCreateDeviceRGB();
+            let context = CGBitmapContextCreate(rgba.as_mut_ptr().cast(), 2, 2, 8, 8, space, 1);
+            assert!(!context.is_null());
+            crate::ffi::CGContextDrawImage(
+                context,
+                CGRect {
+                    origin: CGPoint { x: 0.0, y: 0.0 },
+                    size: CGSize {
+                        width: 2.0,
+                        height: 2.0,
+                    },
+                },
+                image.0,
+            );
+            CGContextRelease(context);
+            crate::ffi::CGColorSpaceRelease(space);
+            assert_eq!(rgba.as_slice(), [0x12, 0x34, 0x56, 0xff].repeat(4));
         }
         let transparent = Bitmap::new(
             2,
@@ -516,9 +597,21 @@ mod tests {
                 a: 128,
             },
         );
-        assert!(OpaqueBase::new(&transparent).is_none());
+        assert!(
+            OpaqueBase::new(&Arc::new(Bitmap::new(
+                2,
+                2,
+                Color {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 0
+                }
+            )))
+            .is_none()
+        );
         assert!(matches!(
-            BaseBacking::new(&transparent),
+            BaseBacking::new(transparent),
             Some(BaseBacking::Surface(_))
         ));
     }

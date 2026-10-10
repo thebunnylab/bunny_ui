@@ -286,6 +286,57 @@ mod macos {
             }
             expect(window, GREEN, Color::WHITE, "retained while idle");
             drop(presenter);
+            // A fresh native presenter must retain its original bitmap after
+            // the caller returns, and still promote transactionally later.
+            let native_layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let mut native = WindowPresenter::attach(native_layer, 1.0).unwrap();
+            msg_arg(view, sel("setLayer:"), native_layer);
+            native.prime(SIZE.width, SIZE.height, 1);
+            let viewport = Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: SIZE,
+            };
+            let mut bands = vec![DrawCommand::PushClip {
+                rect: viewport,
+                corner_radius: Corners::ZERO,
+            }];
+            for (y, color) in [(0.0, RED), (120.0, GREEN)] {
+                bands.push(DrawCommand::FillRect {
+                    rect: Rect {
+                        origin: Point { x: 0.0, y },
+                        size: Size {
+                            width: SIZE.width,
+                            height: 120.0,
+                        },
+                    },
+                    color,
+                    corner_radius: Corners::ZERO,
+                });
+            }
+            bands.push(DrawCommand::PopClip);
+            let bands = DisplayList::from(bands);
+            for label in ["native owned pixels", "native repeated pixels"] {
+                native.present(&bands, SIZE, 1, Color::BLACK, &PixelFont, &images, false);
+                assert!(
+                    msg_id(native_layer, sel("device")).is_null(),
+                    "the image stays native"
+                );
+                expect(window, GREEN, RED, label);
+            }
+            assert!(native.rest());
+            expect(window, GREEN, RED, "native idle pixels");
+            native.present(
+                &scene(GREEN, Color::WHITE),
+                SIZE,
+                1,
+                Color::BLACK,
+                &PixelFont,
+                &images,
+                false,
+            );
+            expect(window, GREEN, Color::WHITE, "promotion after native image");
+            drop(native);
+            msg_void(native_layer, sel("release"));
             msg_arg(window, sel("orderOut:"), null_mut());
             msg_bool(window, sel("setReleasedWhenClosed:"), 0);
             msg_void(window, sel("close"));
