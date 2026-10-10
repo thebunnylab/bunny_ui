@@ -54,6 +54,7 @@ pub fn build_simulator(project: &Project, options: &Options) -> Result<App> {
         features: options.features.clone(),
         env,
         rustc_args: Vec::new(),
+        quiet: false,
     })?;
     let exe_name = built.artifact.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     let app = project.out_dir("ios", "iphonesimulator", options.release).join(format!("{exe_name}.app"));

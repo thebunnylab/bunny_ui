@@ -43,10 +43,23 @@
 //! A crate that only builds views, such as a component library or a
 //! theme, depends on `bunny-ui` with `default-features = false`: the
 //! views without a shell, the window left to the application.
+//!
+//! `bunny run` reloads an app hot on macOS and Linux. It builds the app
+//! with the `hot` feature: the framework comes in as one shared library,
+//! and [`app!`] makes each new build of the app's library loadable by
+//! the running app, which keeps its state. An app does not turn the
+//! feature on itself.
 
 #![forbid(unsafe_code)]
 
 mod entry;
+
+// A hot build reaches the framework through its one shared library.
+// Naming the crate is what links it: without the name, the compiler
+// would link the framework into the app statically and leave the shared
+// library out.
+#[cfg(all(feature = "hot", any(target_os = "macos", target_os = "linux")))]
+extern crate bunny_ui_dylib as _;
 
 pub use bunny_ui_core::*;
 pub use entry::{__private, AppConfig};

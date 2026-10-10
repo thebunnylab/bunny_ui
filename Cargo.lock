@@ -74,6 +74,8 @@ version = "0.2.0"
 dependencies = [
  "bunny-ui-android",
  "bunny-ui-core",
+ "bunny-ui-dylib",
+ "bunny-ui-hot",
  "bunny-ui-ios",
  "bunny-ui-linux",
  "bunny-ui-macos",
@@ -106,6 +108,25 @@ dependencies = [
 name = "bunny-ui-core"
 version = "0.2.0"
 dependencies = [
+ "bunny-ui-motor",
+]
+
+[[package]]
+name = "bunny-ui-dylib"
+version = "0.2.0"
+dependencies = [
+ "bunny-ui-core",
+ "bunny-ui-hot",
+ "bunny-ui-linux",
+ "bunny-ui-macos",
+ "bunny-ui-motor",
+]
+
+[[package]]
+name = "bunny-ui-hot"
+version = "0.2.0"
+dependencies = [
+ "bunny-ui-core",
  "bunny-ui-motor",
 ]
 

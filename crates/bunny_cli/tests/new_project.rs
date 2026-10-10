@@ -1,6 +1,7 @@
 //! A project `bunny new` writes, compiled for real: for the host and for
-//! every target installed here, against this checkout's bunny-ui, and
-//! its web build opened up to see the export the page boots.
+//! every target installed here, against this checkout's bunny-ui; its
+//! web build opened up to see the export the page boots, and its hot
+//! build to see the entry a generation exports.
 //!
 //! Slow — it builds the framework — so it runs on request:
 //! `cargo test -p bunny-cli --test new_project -- --ignored`.
@@ -30,9 +31,12 @@ fn installed(target: &str) -> bool {
 /// Runs cargo in the project; fails on an error or on a warning in the
 /// app's own files (the framework's are its own business).
 fn cargo(app: &Path, args: &[&str]) {
+    // what follows `--` is the compiler's
+    let split = args.iter().position(|arg| *arg == "--").unwrap_or(args.len());
     let out = Command::new("cargo")
-        .args(args)
+        .args(&args[..split])
         .arg("--message-format=short")
+        .args(&args[split..])
         .current_dir(app)
         .env("CARGO_TARGET_DIR", repo().join("target/bunny-e2e"))
         .env("BUNNY_APP_NAME", "Ada \"Bunny\" App")
@@ -76,7 +80,33 @@ fn a_new_project_builds_everywhere() {
             assert!(exports.iter().any(|export| export == name), "{name} missing from {exports:?}");
         }
     }
+
+    // the hot build of `bunny run` on this computer: the binary on the
+    // framework's shared library, and a generation with its entry
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
+        let host = host();
+        let hot = ["--features", "bunny-ui/hot", "--target", host.as_str()];
+        cargo(&app, &[&["build", "--bin", "e2e_app"][..], &hot].concat());
+        cargo(&app, &[&["rustc", "--lib", "--crate-type", "cdylib"][..], &hot, &["--", "-C", "metadata=bunny-salt-1"]].concat());
+        let debug = repo().join("target/bunny-e2e").join(&host).join("debug");
+        let library = if cfg!(target_os = "macos") { "libe2e_app.dylib" } else { "libe2e_app.so" };
+        let generation = fs::read(debug.join(library)).unwrap();
+        assert!(holds(&generation, b"bunny_hot_entry_v1"), "the generation exports its entry");
+        let binary = fs::read(debug.join("e2e_app")).unwrap();
+        assert!(holds(&binary, b"libbunny_ui_dylib"), "the binary links the framework's shared library");
+    }
     let _ = fs::remove_dir_all(&here);
+}
+
+/// The host's triple, as rustc says it.
+fn host() -> String {
+    let out = Command::new("rustc").arg("-vV").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.lines().find_map(|line| line.strip_prefix("host:")).unwrap().trim().to_string()
+}
+
+fn holds(bytes: &[u8], needle: &[u8]) -> bool {
+    bytes.windows(needle.len()).any(|window| window == needle)
 }
 
 /// The names in a wasm module's export section.

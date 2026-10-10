@@ -82,10 +82,16 @@ jobs:
           # `app!` writes the Android activity's symbol and the page's
           # export; the facade's own test forbids `unsafe`, so each check
           # proves the expansion builds in an app that keeps that lint.
-          rustup target add aarch64-linux-android wasm32-unknown-unknown aarch64-apple-ios
+          rustup target add aarch64-linux-android wasm32-unknown-unknown aarch64-apple-ios \
+            x86_64-unknown-linux-gnu
           for target in aarch64-linux-android wasm32-unknown-unknown aarch64-apple-ios; do
             cargo check -p bunny-ui --locked --all-targets --target "$target"
           done
+          # the hot build `bunny run` makes, on the two desktops that
+          # load new code: the app links the framework's shared library,
+          # so the triple is named outright, as `bunny run` names it
+          cargo test -p bunny-ui --locked --all-targets --features hot --target aarch64-apple-darwin
+          cargo check -p bunny-ui --locked --all-targets --features hot --target x86_64-unknown-linux-gnu
       - name: macOS shell, normal and paranoid; iOS build
         if: runner.os == 'macOS'
         run: |

@@ -21,6 +21,9 @@ use std::rc::Rc;
 
 /// Initializes and retains a presentation model at this component callsite.
 ///
+/// The model is found again by its type and its place in the source, the
+/// line left out: an edit that moves lines during a hot reload keeps it.
+///
 /// The model is an ordinary `Clone` struct; `State`-only models can be `Copy`.
 /// A parent rerender keeps the model and its properties. Unmounting its owner
 /// releases the model and all state created by its initializer.
@@ -34,9 +37,18 @@ pub fn view_model<M: Clone + 'static>(initialize: impl FnOnce() -> M) -> M {
         motor::identity::cursor_scope_rc().is_some(),
         "view_model() must be declared inside a component rendered by a Runtime"
     );
+    // The model's scope is named by its type and its place in the source
+    // without the line: an edit above the call moves the line, and a hot
+    // reload keeps the model and the state its initializer made. The
+    // count tells apart two calls the name alone does not.
     let site = Location::caller();
-    let _scope = motor::identity::enter(format!("@model({site})"));
-    let slot = motor::identity::scoped_effect_slot::<M>(site);
+    let name = format!("@model({}@{}:{})", std::any::type_name::<M>(), site.file(), site.column());
+    let segment = match motor::identity::ordinal(&name) {
+        0 => name,
+        nth => format!("{name}#{nth}"),
+    };
+    let _scope = motor::identity::enter(segment);
+    let slot = motor::identity::scoped_effect_slot::<M>("model");
     let existing = slot.borrow().clone();
     if let Some(model) = existing {
         // Its initializer did not run, so the state's nested owners were not

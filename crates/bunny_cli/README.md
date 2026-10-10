@@ -16,7 +16,7 @@ bunny run -d web     # in the browser
 | Command | |
 | --- | --- |
 | `bunny new` | Create an app with every platform's files in place |
-| `bunny run` | Build the app for a device and run it, its output here; `r` restarts, `q` stops |
+| `bunny run` | Build the app for a device and run it, its output here; a save reloads it hot on this computer, `R` restarts, `q` stops |
 | `bunny doctor` | Check what this machine needs for each platform — and offer to install what it can |
 | `bunny setup android` | Install the Android toolchain — SDK, NDK, emulator, a JDK — without Android Studio |
 | `bunny devices` | List where the app can run: this computer, the browser, simulators, emulators, phones |
@@ -50,8 +50,34 @@ under the Zero-Clause BSD License (`templates/LICENSE`).
 device — an id or a name from `bunny devices`, or a platform (`-d ios` boots
 the iPhone simulator on the newest iOS if none is running). Before building it
 checks the machine as `bunny doctor` does, and offers to install a missing Rust
-target. While the app runs, `r` or `R` rebuilds and restarts it, `q` stops it;
-when the app exits on its own, `bunny run` exits with its code.
+target. While the app runs, `R` rebuilds and restarts it, `q` stops it; when
+the app exits on its own, `bunny run` exits with its code.
+
+### Hot reload
+
+On macOS and Linux, a debug run on this computer reloads hot: save a file and
+the running app takes the new code and keeps its state — the counter keeps its
+count, the text field its text, a `view_model` its model, a `.task` keeps
+running. `r` reloads at once, without a save.
+
+`bunny` builds the framework once per session as one shared library
+(`bunny-ui-dylib`, the `hot` feature of `bunny-ui`), and after each save it
+builds only the app's library, which the app loads next to the code it has.
+
+- An edit inside function bodies keeps all the state. An edit that reaches a
+  type — a field, a signature, a new item — gives the new build new types: the
+  state that holds the app's own types (`State<Vec<Todo>>`) starts over, the
+  state of other types (`State<i32>`, `State<String>`) stays.
+- A change to `Cargo.toml`, `build.rs` or `src/main.rs` restarts the app; so
+  does a reload that finds another crate of the workspace changed.
+- What the old code started keeps the old code: a running `.task`, a closure a
+  state holds. `R` starts them over with the new code.
+- A build error leaves the app on the code it had. A crash waits for the fix:
+  save it, and the app starts again.
+
+`--no-hot` turns it off. On macOS, each new build is checked by the system the
+first time it loads (about 0.2 s); adding the terminal under System Settings ›
+Privacy & Security › Developer Tools skips the check.
 
 On macOS, an app with a `macos/` folder runs inside a bundle (`<Name>.app`
 under `target/bunny/`), so notifications and its name in the menu bar work. On
@@ -79,5 +105,5 @@ and creates an emulator, and a JDK for Gradle (Temurin, checked against its
 SHA-256). The Android SDK's terms are shown for you to accept before anything is
 installed (`--accept-android-terms` for CI); Google's usage metrics stay off.
 
-Coming next: hot reload on `r`, iPhones, and `bunny build` for release
-packages.
+Coming next: hot reload on Windows, the simulators and Android, iPhones, and
+`bunny build` for release packages.

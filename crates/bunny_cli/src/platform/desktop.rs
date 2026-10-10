@@ -17,22 +17,32 @@ use crate::toolchains::QUICK;
 
 /// Builds the app and answers the executable to start.
 pub fn build(project: &Project, options: &Options) -> Result<PathBuf> {
+    Ok(build_with(project, options, None, &[])?.0)
+}
+
+/// [`build`] for a target triple named outright, with more features:
+/// the executable to start, and the one cargo made — inside a bundle,
+/// they are two files.
+pub fn build_with(project: &Project, options: &Options, target: Option<&str>, more_features: &[String]) -> Result<(PathBuf, PathBuf)> {
     let bin = project.require_bin()?;
+    let mut features = options.features.clone();
+    features.extend(more_features.iter().cloned());
     let built = cargo::build(&cargo::Build {
         manifest: project.manifest.clone(),
         package: project.package.clone(),
         what: Target::Bin(bin.to_string()),
         release: options.release,
         profile: None,
-        target: None,
-        features: options.features.clone(),
+        target: target.map(String::from),
+        features,
         env: project.build_env(),
         rustc_args: Vec::new(),
+        quiet: false,
     })?;
     if cfg!(target_os = "macos") && project.dir.join("macos").is_dir() {
-        return bundle(project, &built.artifact, options.release);
+        return Ok((bundle(project, &built.artifact, options.release)?, built.artifact));
     }
-    Ok(built.artifact)
+    Ok((built.artifact.clone(), built.artifact))
 }
 
 /// The app inside `<Name>.app`: the binary under its cargo name, the

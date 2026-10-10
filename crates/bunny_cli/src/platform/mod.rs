@@ -32,6 +32,12 @@ pub trait Session {
     fn wait(&mut self, timeout: Duration) -> Option<Option<i32>>;
     /// Ends the app.
     fn stop(&mut self);
+    /// Loads a new build of the app's code into the running app — a hot
+    /// reload — and answers how long the app took to swap to it. `None`:
+    /// this app cannot take new code while it runs.
+    fn load(&mut self, _generation: &Path) -> Option<std::result::Result<Duration, String>> {
+        None
+    }
 }
 
 /// A session that is one child process, with what else ends the app.

@@ -686,11 +686,42 @@ thread_local! {
     /// Every read and write of a state looks its arena up here, so the
     /// key is hashed the cheap way: a `TypeId` is the compiler's, never an
     /// outside caller's.
-    static ARENAS: RefCell<FxHashMap<TypeId, Rc<dyn Any>>> = RefCell::new(FxHashMap::default());
+    static ARENAS: RefCell<FxHashMap<TypeId, Arena>> = RefCell::new(FxHashMap::default());
     /// How the sweep frees without knowing `T`: one function pointer per
     /// type, registered when the arena is born.
     static FREERS: RefCell<FxHashMap<TypeId, fn(usize)>> = RefCell::new(FxHashMap::default());
     static NEXT_DEP: Cell<u64> = const { Cell::new(0) };
+}
+
+/// One type's arena, and — in a debug build — the shape of the type that
+/// made it.
+struct Arena {
+    cell: Rc<dyn Any>,
+    #[cfg(debug_assertions)]
+    shape: Shape,
+}
+
+/// What a value of the arena's type occupies. A hot reload loads new
+/// code next to the old: a type it edited keeps its `TypeId` when the
+/// build kept its salt, and a value of the old shape read as the new
+/// one is memory read wrong. `bunny run` changes the salt when an edit
+/// reaches a type, so the new type gets an arena of its own; this check
+/// is the guard behind that rule — a size or an alignment that moved
+/// stops the app with a message, not with corrupt memory. It cannot see
+/// a change behind a pointer (`Vec<T>` keeps its size whatever `T` is).
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Shape {
+    size: usize,
+    align: usize,
+    name: &'static str,
+}
+
+#[cfg(debug_assertions)]
+impl Shape {
+    fn of<T>() -> Shape {
+        Shape { size: std::mem::size_of::<T>(), align: std::mem::align_of::<T>(), name: std::any::type_name::<T>() }
+    }
 }
 
 fn with_arena<T: 'static, R>(f: impl FnOnce(&mut TypedArena<T>) -> R) -> R {
@@ -712,18 +743,34 @@ fn with_arena_ref<T: 'static, R>(f: impl FnOnce(&TypedArena<T>) -> R) -> R {
 fn arena_cell<T: 'static>() -> Rc<RefCell<TypedArena<T>>> {
     ARENAS.with(|arenas| {
         let mut arenas = arenas.borrow_mut();
-        arenas
-            .entry(TypeId::of::<T>())
-            .or_insert_with(|| {
-                FREERS.with(|freers| {
-                    freers.borrow_mut().insert(TypeId::of::<T>(), free_typed::<T>)
-                });
-                Rc::new(RefCell::new(TypedArena::<T>::new())) as Rc<dyn Any>
-            })
+        let arena = arenas.entry(TypeId::of::<T>()).or_insert_with(|| {
+            FREERS.with(|freers| freers.borrow_mut().insert(TypeId::of::<T>(), free_typed::<T>));
+            Arena {
+                cell: Rc::new(RefCell::new(TypedArena::<T>::new())) as Rc<dyn Any>,
+                #[cfg(debug_assertions)]
+                shape: Shape::of::<T>(),
+            }
+        });
+        #[cfg(debug_assertions)]
+        check_shape(arena.shape, Shape::of::<T>());
+        arena
+            .cell
             .clone()
             .downcast::<RefCell<TypedArena<T>>>()
             .expect("an arena registered by TypeId is always its own type")
     })
+}
+
+#[cfg(debug_assertions)]
+fn check_shape(made: Shape, now: Shape) {
+    if made.size != now.size || made.align != now.align {
+        panic!(
+            "`{}` changed its shape while the app ran ({} bytes aligned to {} became {} bytes aligned \
+             to {}): the state the old code made cannot be read by the new code. Restart the app \
+             (R in `bunny run`)",
+            now.name, made.size, made.align, now.size, now.align,
+        );
+    }
 }
 
 fn free_typed<T: 'static>(index: usize) {
@@ -1399,5 +1446,19 @@ mod tests {
         let values = EnvironmentValues::default();
         assert_eq!(values.layoutDirection, LayoutDirection::LeftToRight);
         assert_eq!(Context::default().environment::<LayoutDirection>(), LayoutDirection::LeftToRight);
+    }
+
+    /// A type that kept its `TypeId` across a hot reload but not its
+    /// size stops the app with the type's name; the same shape passes.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_type_that_changed_shape_stops_the_app() {
+        check_shape(Shape::of::<(u8, u16)>(), Shape::of::<(u8, u16)>());
+        let made = Shape::of::<u8>();
+        let now = Shape { name: "app::Todo", ..Shape::of::<String>() };
+        let stopped = std::panic::catch_unwind(|| check_shape(made, now)).expect_err("a moved size must stop");
+        let message = stopped.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(message.contains("`app::Todo` changed its shape"), "{message}");
+        assert!(message.contains("Restart the app"), "{message}");
     }
 }
