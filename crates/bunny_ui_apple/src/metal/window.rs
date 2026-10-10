@@ -197,7 +197,6 @@ impl Metal {
             }
             msg_void(transaction, sel("commit"));
         }
-        self.presenter.set_transactional(live);
     }
 }
 
@@ -404,7 +403,8 @@ impl WindowPresenter {
             Strategy::Metal(m) => m.presenter.offer_drawables(),
         }
     }
-    /// Keeps native frames transactional and forwards the Metal contract.
+    /// Keeps native frames transactional and forwards any requirement to
+    /// Metal. Once required, that layer keeps its transactional contract.
     pub fn set_transactional(&mut self, live: bool) {
         if let Strategy::Metal(m) = &mut self.strategy {
             m.presenter.set_transactional(live);
@@ -709,6 +709,33 @@ mod tests {
                 false,
             );
             assert!(metal.cover.is_none(), "a presented frame removes the cover");
+            assert!(metal.presenter.transactional);
+            // The handoff can still belong to an outer AppKit transaction.
+            // A caller no longer requiring coordination cannot undo it.
+            metal.presenter.set_transactional(false);
+            assert!(metal.presenter.transactional);
+            let prior = metal.presenter.retained.clone().unwrap().0;
+            let cursor = metal.presenter.cursor;
+            metal.present(
+                &scene(0.0),
+                Size {
+                    width: 180.0,
+                    height: 130.0,
+                },
+                1,
+                Color::WHITE,
+                &PixelFont,
+                &RawImages::default(),
+                false,
+            );
+            assert!(Rc::ptr_eq(
+                &prior,
+                &metal.presenter.retained.as_ref().unwrap().0
+            ));
+            assert_eq!(
+                cursor, metal.presenter.cursor,
+                "a repeated frame still skips encoding"
+            );
             drop(metal);
             msg_void(layer, sel("release"));
             objc_autoreleasePoolPop(pool);
