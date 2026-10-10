@@ -42,9 +42,10 @@ bunny new my_app
 ## Quick look
 
 ```rust
-// src/lib.rs
+// src/main.rs
 use bunny_ui::prelude::*;
 
+// A component: its state, and the body that shows it.
 #[derive(Clone, Copy)]
 struct Counter {
     count: State<i32>,
@@ -59,28 +60,30 @@ impl Component for Counter {
     }
 }
 
+// The first view the app shows.
 fn home() -> impl View {
     Counter { count: State::new(0) }
 }
 
+// Writes `run()`: it opens the window and puts `home()` in it.
 bunny_ui::app!(home, bunny_ui::AppConfig::new().size(280.0, 180.0));
-```
 
-```rust
-// src/main.rs
 fn main() {
-    counter::run()
+    run()
 }
 ```
 
-The text node records the read. A tap changes the state and updates that node
-without running the component body again. `text(self.count)` also binds directly;
-`text!("Count: {}", self.count)` adds formatting.
+`main` calls `run()`, `run()` opens the window, the window shows `home()`, and
+`home()` builds the `Counter`. The text node records the read: a tap changes the
+state and updates that node without running the body again. `text(self.count)`
+also binds directly; `text!("Count: {}", self.count)` adds formatting.
 
-`app!` writes the entry each platform expects: `run()` opens the native window on
-macOS, iOS, Windows and Linux, the same `run` starts the Android activity, and
-the web gets the `start` export its page boots. The desktop and iOS build the
-binary; Android and the web build the library.
+That file runs on macOS, Windows, Linux and iOS. A project from `bunny new`
+keeps the same code in `src/lib.rs`, and `src/main.rs` is the one line
+`my_app::run()` — the package's name, and the `run` that `app!` wrote. Android
+and the web start from the library, not from a `main`: `app!` writes their
+entries too, the Android activity and the page's `start` export. `bunny run`
+reloads that library hot.
 
 ## Signals and subscriptions
 
