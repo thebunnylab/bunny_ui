@@ -775,7 +775,13 @@ mod probe {
             )
             .padding()
             .sheet(self.modal.binding(), move |_| {
-                erased(button(text("Dismiss modal"), move || self.modal.set(false)).padding())
+                erased(
+                    button(text("Dismiss modal"), move || {
+                        println!("UIA model: modal dismiss callback");
+                        self.modal.set(false);
+                    })
+                    .padding(),
+                )
             })
         }
     }

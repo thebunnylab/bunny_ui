@@ -48,6 +48,7 @@ struct Surface {
     window: Hwnd,
     queue: Arc<Queue>,
     alive: AtomicBool,
+    closing: AtomicBool,
     snapshot: Mutex<Arc<Snapshot>>,
     providers: Mutex<HashMap<Key, Owned>>,
 }
@@ -81,11 +82,21 @@ impl Accessibility {
     }
     fn register(&self, window: Hwnd) -> Arc<Surface> {
         let mut all = self.surfaces.borrow_mut();
+        // HWND numbers may be recycled after WM_DESTROY, including while one
+        // presentation closes an overlay and opens another. A retired surface
+        // never becomes the new window's identity.
+        if all
+            .get(&window)
+            .is_some_and(|surface| !surface.alive.load(Ordering::Acquire))
+        {
+            all.remove(&window);
+        }
         Arc::clone(all.entry(window).or_insert_with(|| {
             let surface = Arc::new(Surface {
                 window,
                 queue: Arc::clone(&self.queue),
                 alive: AtomicBool::new(true),
+                closing: AtomicBool::new(false),
                 snapshot: Mutex::new(Arc::new(Snapshot::default())),
                 providers: Mutex::new(HashMap::new()),
             });
@@ -179,7 +190,7 @@ impl Request {
         let Some(surface) = self.surface.upgrade() else {
             return false;
         };
-        if surface.read(self.key).is_err() {
+        if surface.closing.load(Ordering::Acquire) || surface.read(self.key).is_err() {
             return false;
         }
         if let Key::Node(id) = self.key
@@ -200,6 +211,15 @@ impl Request {
     }
 }
 pub(super) fn drain(window: Hwnd) {
+    // Outbound COM can pump messages inside a frame. The general shell
+    // dispatcher substitutes a repaint for reentrant events; accessibility
+    // requests must remain queued until their owning handler can accept them.
+    if super::HANDLER.with(|handler| handler.try_borrow().is_err()) {
+        unsafe {
+            super::PostMessageW(window, MESSAGE, 0, 0);
+        }
+        return;
+    }
     let Some(surface) = surface(window) else {
         return;
     };
@@ -225,6 +245,9 @@ pub(super) fn get_object(window: Hwnd, wparam: usize, lparam: isize) -> Option<i
         return None;
     } // UiaRootObjectId
     let surface = surface(window)?;
+    if surface.closing.load(Ordering::Acquire) {
+        return None;
+    }
     if !surface.queue.requested.swap(true, Ordering::AcqRel) {
         super::dispatch_at(surface.queue.owner, super::AppEvent::AccessibilityEnable);
     }
@@ -251,55 +274,72 @@ impl Surface {
         Ok((snapshot.clone(), node))
     }
     fn provider(self: &Arc<Self>, key: Key) -> Result<Owned, Hresult> {
-        let (_, node) = self.read(key)?;
+        // Serialize membership and cache creation with snapshot publication.
+        let snapshot = self.snapshot.lock().map_err(|_| FAILED)?;
+        let role = match key {
+            Key::Root => None,
+            Key::Node(id) => Some(
+                snapshot
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == id)
+                    .ok_or(UNAVAILABLE)?
+                    .role,
+            ),
+        };
         let mut all = self.providers.lock().map_err(|_| FAILED)?;
         if !self.alive.load(Ordering::Acquire) {
             return Err(UNAVAILABLE);
         }
         Ok(all
             .entry(key)
-            .or_insert_with(|| Owned::new(self, key, node.map(|node| node.role)))
+            .or_insert_with(|| Owned::new(self, key, role))
             .clone())
     }
     fn replace(&self, snapshot: Snapshot) -> Result<Arc<Snapshot>, Hresult> {
-        let previous = {
-            let mut current = self.snapshot.lock().map_err(|_| FAILED)?;
-            std::mem::replace(&mut *current, Arc::new(snapshot))
+        let survives = |key: &Key| match key {
+            Key::Root => true,
+            Key::Node(id) => snapshot.nodes.iter().any(|node| node.id == *id),
         };
-        let retired = {
-            let snapshot = self.snapshot.lock().map_err(|_| FAILED)?;
-            let mut all = self.providers.lock().map_err(|_| FAILED)?;
-            let keys: Vec<_> = all
-                .keys()
-                .filter(|key| match key {
-                    Key::Root => false,
-                    Key::Node(id) => !snapshot.nodes.iter().any(|node| node.id == *id),
-                })
-                .copied()
-                .collect();
-            keys.into_iter()
-                .filter_map(|key| all.remove(&key))
-                .collect::<Vec<_>>()
+        let retired: Vec<_> = {
+            let all = self.providers.lock().map_err(|_| FAILED)?;
+            all.iter()
+                .filter(|(key, _)| !survives(key))
+                .map(|(_, provider)| provider.clone())
+                .collect()
         };
+        // UIA asks for runtime identity/root metadata DURING disconnect. Keep
+        // the old projection and provider cache available until it finishes.
+        // Core has already published the new frame, so retired action IDs are
+        // still refused by Runtime if a callback enqueues one during cleanup.
         for provider in retired {
             disconnect(&provider);
         }
-        Ok(previous)
+        let mut current = self.snapshot.lock().map_err(|_| FAILED)?;
+        let mut providers = self.providers.lock().map_err(|_| FAILED)?;
+        providers.retain(|key, _| survives(key));
+        Ok(std::mem::replace(&mut *current, Arc::new(snapshot)))
     }
     fn retire(&self) {
-        if !self.alive.swap(false, Ordering::AcqRel) {
+        if self.closing.swap(true, Ordering::AcqRel) {
             return;
         }
+        // Stop root rediscovery and actions before outbound COM cleanup, while
+        // leaving identity queries valid for UiaDisconnectProvider itself.
         let _ = SURFACES.try_with(|all| {
             all.borrow_mut().remove(&self.window);
         });
         let providers = self
             .providers
             .lock()
-            .map(|mut all| std::mem::take(&mut *all))
+            .map(|all| all.values().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
-        for provider in providers.into_values() {
+        for provider in providers {
             disconnect(&provider);
+        }
+        self.alive.store(false, Ordering::Release);
+        if let Ok(mut providers) = self.providers.lock() {
+            providers.clear();
         }
     }
     fn notify(self: &Arc<Self>, previous: Arc<Snapshot>) {
@@ -766,7 +806,10 @@ fn enqueue(value: &Provider, action: Action) -> Hresult {
     let Ok(mut requests) = surface.queue.requests.lock() else {
         return FAILED;
     };
-    if !surface.queue.alive.load(Ordering::Acquire) || !surface.alive.load(Ordering::Acquire) {
+    if !surface.queue.alive.load(Ordering::Acquire)
+        || !surface.alive.load(Ordering::Acquire)
+        || surface.closing.load(Ordering::Acquire)
+    {
         return UNAVAILABLE;
     }
     requests.push(Request {
@@ -947,6 +990,7 @@ mod tests {
                 requests: Mutex::new(Vec::new()),
             }),
             alive: AtomicBool::new(true),
+            closing: AtomicBool::new(false),
             snapshot: Mutex::new(Arc::new(Snapshot {
                 nodes,
                 origin: (0.0, 0.0),
@@ -1074,6 +1118,27 @@ mod tests {
             assert!(value.is_null());
         }
     }
+    #[test]
+    fn recycled_window_handles_get_new_surfaces_and_reentrant_actions_stay_queued() {
+        let owner = Accessibility::new(WindowHandle { hwnd: 0 });
+        let old = owner.register(0);
+        old.alive.store(false, Ordering::Release);
+        let current = owner.register(0);
+        assert!(!Arc::ptr_eq(&old, &current));
+        assert!(old.read(Key::Root).is_err());
+        assert!(current.read(Key::Root).is_ok());
+        current.queue.requests.lock().unwrap().push(Request {
+            surface: Arc::downgrade(&current),
+            key: Key::Root,
+            action: Action::Focus,
+        });
+        super::super::HANDLER.with(|handler| {
+            let _frame = handler.borrow_mut();
+            drain(0);
+        });
+        assert_eq!(current.queue.requests.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn retirement_is_checked_again_before_an_accepted_action_reaches_runtime() {
         let (surface, button, _, _) = fixture();
