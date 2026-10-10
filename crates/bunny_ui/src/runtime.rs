@@ -63,7 +63,7 @@ pub struct LiveBlit {
     /// box's layer on it.
     pub path: String,
     /// The rect the pixels cover, in LAYOUT coordinates (the visible
-    /// window of the box).
+    /// window of the box, possibly cropped to its opaque ink).
     pub frame: Rect,
     /// Physical pixel size of `rgba`.
     pub width: usize,
@@ -72,12 +72,16 @@ pub struct LiveBlit {
     pub rgba: Vec<u8>,
 }
 
-/// What one live box left on its own surface: the picture it painted
-/// and the PHYSICAL size those pixels were rasterized at. A step is
-/// dropped only when both still hold — same picture, same size.
+/// What one live box left on its own surface: the picture, full physical
+/// canvas and device scale. Its cropped paint also follows layout-only moves.
+/// A step is dropped only while the picture and raster geometry still match.
 struct LiveCell {
     display: Vec<crate::layout::DrawCommand>,
     physical: (usize, usize),
+    scale: usize,
+    aligned: bool,
+    /// Painted region relative to the visible box; retained for layout-only moves.
+    paint: Rect,
 }
 
 /// The wait between a hover and its bubble — armed by the pointer,
@@ -4338,17 +4342,22 @@ impl Runtime {
     fn utf16_before(&self, path: &str, text: &std::sync::Arc<str>, byte: usize) -> usize {
         let byte = crate::text_input::clamp_to_boundary(text, byte);
         let mut memo = self.utf16_memo.borrow_mut();
-        let from = memo.as_ref().and_then(|(kept, at, units)| {
-            if std::sync::Arc::ptr_eq(kept, text) {
-                return Some((*at, *units));
-            }
-            let cell = reconciler::editor_text(path)?;
-            let cell = cell.borrow();
-            let lent = cell.as_ref()?;
-            let (old, shared) = lent.from.as_ref()?;
-            (std::sync::Arc::ptr_eq(&lent.text, text) && std::sync::Arc::ptr_eq(old, kept) && *at <= *shared)
-                .then_some((*at, *units))
-        });
+        let from = match memo.as_ref() {
+            Some((kept, at, units)) if std::sync::Arc::ptr_eq(kept, text) => Some((*at, *units)),
+            _ => reconciler::editor_text(path).and_then(|cell| {
+                let mut cell = cell.borrow_mut();
+                let lent = cell.as_mut()?;
+                if !std::sync::Arc::ptr_eq(&lent.text, text) {
+                    return None;
+                }
+                // This read installs the current version in the memo below.
+                // Its predecessor is a one-use bridge, not editing history;
+                // consume it even when no old memo can accelerate the count.
+                let (old, shared) = lent.from.take()?;
+                let (kept, at, units) = memo.as_ref()?;
+                (std::sync::Arc::ptr_eq(&old, kept) && *at <= shared).then_some((*at, *units))
+            }),
+        };
         let bytes = text.as_bytes();
         let units = match from {
             Some((at, units)) if at <= byte => units + crate::text_input::utf16_len(&bytes[at..byte]),
@@ -5602,19 +5611,24 @@ impl Runtime {
     /// its mark along) without repainting a pixel.
     #[cfg(feature = "canvas")]
     pub fn live_frames(&self) -> Vec<(String, crate::layout::Rect)> {
+        let ledger = self.live_ledger.borrow();
         self.last_customs
             .borrow()
             .iter()
             .filter(|placement| placement.is_island())
             .map(|placement| {
+                let paint = ledger.get(placement.path.as_str()).map_or(
+                    Rect { origin: Point::ZERO, size: placement.visible.size },
+                    |cell| cell.paint,
+                );
                 (
                     placement.path.clone(),
                     crate::layout::Rect {
                         origin: crate::layout::Point {
-                            x: placement.frame.origin.x + placement.visible.origin.x,
-                            y: placement.frame.origin.y + placement.visible.origin.y,
+                            x: placement.frame.origin.x + placement.visible.origin.x + paint.origin.x,
+                            y: placement.frame.origin.y + placement.visible.origin.y + paint.origin.y,
                         },
-                        size: placement.visible.size,
+                        size: paint.size,
                     },
                 )
             })
@@ -5902,39 +5916,77 @@ impl Runtime {
                 ((placement.visible.size.width.round() as usize) * scale).max(1),
                 ((placement.visible.size.height.round() as usize) * scale).max(1),
             );
+            let origin = Point {
+                x: placement.frame.origin.x + placement.visible.origin.x,
+                y: placement.frame.origin.y + placement.visible.origin.y,
+            };
+            let factor = scale as f64;
+            // A crop must not change texture filtering at a fractional layer
+            // edge. Only pixel-aligned, unstretched boxes take this path.
+            let aligned = scale != 0
+                && [origin.x * factor, origin.y * factor]
+                    .iter().all(|edge| edge.is_finite() && *edge == edge.round())
+                && placement.visible.size.width * factor == physical.0 as f64
+                && placement.visible.size.height * factor == physical.1 as f64;
             // the SIZE counts as much as the picture: a box that grew
             // without changing what it draws still owes its surface new
             // pixels, or the surface stretches the old ones
             if ledger
                 .get(path)
-                .is_some_and(|last| last.display == display.as_slice() && last.physical == physical)
+                .is_some_and(|last| {
+                    last.display == display.as_slice()
+                        && last.physical == physical
+                        && last.scale == scale
+                        && last.aligned == aligned
+                })
             {
                 continue;
             }
+            let compact = if aligned {
+                crate::raster::compact_live_fill(&display, physical, scale)
+            } else {
+                None
+            };
+            let (paint, bitmap) = if let Some((offset, bitmap)) = compact {
+                (
+                    Rect {
+                        origin: offset,
+                        size: crate::layout::Size {
+                            width: bitmap.width() as f64 / factor,
+                            height: bitmap.height() as f64 / factor,
+                        },
+                    },
+                    bitmap,
+                )
+            } else {
+                (
+                    Rect { origin: Point::ZERO, size: placement.visible.size },
+                    crate::raster::rasterize_with(
+                        &display,
+                        physical.0,
+                        physical.1,
+                        scale,
+                        crate::layout::Color::rgba(0, 0, 0, 0),
+                        &*self.text,
+                        &*self.images,
+                    ),
+                )
+            };
             ledger.insert(
                 Rc::clone(path),
-                LiveCell { display: display.as_slice().to_vec(), physical },
-            );
-            let bitmap = crate::raster::rasterize_with(
-                &display,
-                physical.0,
-                physical.1,
-                scale,
-                crate::layout::Color::rgba(0, 0, 0, 0),
-                &*self.text,
-                &*self.images,
+                LiveCell { display: display.as_slice().to_vec(), physical, scale, aligned, paint },
             );
             blits.push(LiveBlit {
                 path: placement.path.clone(),
                 frame: crate::layout::Rect {
                     origin: crate::layout::Point {
-                        x: placement.frame.origin.x + placement.visible.origin.x,
-                        y: placement.frame.origin.y + placement.visible.origin.y,
+                        x: origin.x + paint.origin.x,
+                        y: origin.y + paint.origin.y,
                     },
-                    size: placement.visible.size,
+                    size: paint.size,
                 },
-                width: physical.0,
-                height: physical.1,
+                width: bitmap.width(),
+                height: bitmap.height(),
                 rgba: bitmap.to_rgba_bytes(),
             });
         }

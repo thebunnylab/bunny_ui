@@ -47,6 +47,10 @@ mod macos {
         #[link_name = "objc_msgSend"]
         fn msg_id_arg(o: Id, s: Sel, a: Id) -> Id;
         #[link_name = "objc_msgSend"]
+        fn msg_id_index(o: Id, s: Sel, a: u64) -> Id;
+        #[link_name = "objc_msgSend"]
+        fn msg_kind(o: Id, s: Sel, class: Id) -> i8;
+        #[link_name = "objc_msgSend"]
         fn msg_color(o: Id, s: Sel, x: i64, y: i64) -> Id;
         #[link_name = "objc_msgSend"]
         fn msg_rgba(o: Id, s: Sel, r: *mut f64, g: *mut f64, b: *mut f64, a: *mut f64);
@@ -55,6 +59,16 @@ mod macos {
     unsafe extern "C" {
         fn CGWindowListCreateImage(r: CGRect, options: u32, window: u32, image_options: u32) -> Id;
         fn CGImageRelease(image: Id);
+    }
+
+    unsafe fn has_metal_child(layer: Id) -> bool {
+        unsafe {
+            let children = msg_id(layer, sel("sublayers"));
+            (0..msg_integer(children, sel("count")) as u64).any(|index| {
+                let child = msg_id_index(children, sel("objectAtIndex:"), index);
+                msg_kind(child, sel("isKindOfClass:"), class("CAMetalLayer")) != 0
+            })
+        }
     }
 
     const SIZE: Size = Size {
@@ -197,7 +211,7 @@ mod macos {
                 sel("initWithFrame:"),
                 frame,
             );
-            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
             let mut presenter = WindowPresenter::attach(layer, 1.0).expect("Metal-capable desktop");
             msg_arg(view, sel("setLayer:"), layer);
             msg_bool(view, sel("setWantsLayer:"), 1);
@@ -286,6 +300,332 @@ mod macos {
             }
             expect(window, GREEN, Color::WHITE, "retained while idle");
             drop(presenter);
+            // A fresh native presenter must retain its original bitmap after
+            // the caller returns, and still promote transactionally later.
+            let native_layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
+            let mut native = WindowPresenter::attach(native_layer, 1.0).unwrap();
+            msg_arg(view, sel("setLayer:"), native_layer);
+            native.prime(SIZE.width, SIZE.height, 1);
+            let band_scene = |offset: f64| {
+                let mut commands = vec![
+                    DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point { x: 0.0, y: 0.0 },
+                            size: SIZE,
+                        },
+                        color: Color::WHITE,
+                        corner_radius: Corners::ZERO,
+                    },
+                    DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point { x: 0.0, y: 0.0 },
+                            size: Size {
+                                width: 8.0,
+                                height: 8.0,
+                            },
+                        },
+                        color: Color::BLACK,
+                        corner_radius: Corners::ZERO,
+                    },
+                    DrawCommand::PushClip {
+                        rect: Rect {
+                            origin: Point { x: 16.0, y: 0.0 },
+                            size: Size {
+                                width: 288.0,
+                                height: SIZE.height,
+                            },
+                        },
+                        corner_radius: Corners::ZERO,
+                    },
+                ];
+                for row in -1..3 {
+                    commands.push(DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point {
+                                x: 16.0,
+                                y: row as f64 * 120.0 - offset,
+                            },
+                            size: Size {
+                                width: 288.0,
+                                height: 120.0,
+                            },
+                        },
+                        color: if row % 2 == 0 { RED } else { GREEN },
+                        corner_radius: Corners::ZERO,
+                    });
+                }
+                commands.push(DrawCommand::PopClip);
+                DisplayList::from(commands)
+            };
+            for (offset, base, patch, label) in [
+                (0.0, GREEN, RED, "native owned pixels"),
+                (0.0, GREEN, RED, "native repeated pixels"),
+                (120.0, RED, GREEN, "native bands after retiring full base"),
+                (0.0, GREEN, RED, "native bands reverse after retirement"),
+            ] {
+                native.present(
+                    &band_scene(offset),
+                    SIZE,
+                    1,
+                    Color::BLACK,
+                    &PixelFont,
+                    &images,
+                    false,
+                );
+                assert!(
+                    !has_metal_child(native_layer),
+                    "the image stays native"
+                );
+                expect(window, base, patch, label);
+                assert!(
+                    sample(window, 310, 80)
+                        .iter()
+                        .all(|channel| *channel >= 128),
+                    "the outside background is still white"
+                );
+                assert!(
+                    sample(window, 4, 4).iter().all(|channel| *channel < 128),
+                    "the outside foreground survives base retirement"
+                );
+            }
+            for height in [60.0, 60.01, 60.0, 20.0, 20.01, 20.0, 100.0, 100.0] {
+                let mut commands = band_scene(0.0).as_slice().to_vec();
+                commands.push(DrawCommand::FillRect {
+                    rect: Rect {
+                        origin: Point { x: 290.0, y: 10.0 },
+                        size: Size { width: 4.0, height },
+                    },
+                    color: Color::BLACK,
+                    corner_radius: Corners::ZERO,
+                });
+                native.present(
+                    &DisplayList::from(commands),
+                    SIZE,
+                    1,
+                    Color::BLACK,
+                    &PixelFont,
+                    &images,
+                    false,
+                );
+                expect(window, GREEN, RED, "native decoration over unchanged rows");
+                let pixel = sample(window, 292, 40);
+                if height > 30.0 {
+                    assert!(
+                        pixel.iter().all(|channel| *channel < 64),
+                        "the new thumb is visible: {pixel:?}"
+                    );
+                } else {
+                    assert!(
+                        pixel[0] > 128 && pixel[1] < 128,
+                        "the shortened thumb reveals the exact row: {pixel:?}"
+                    );
+                }
+                assert!(!has_metal_child(native_layer));
+            }
+            assert!(native.rest());
+            expect(window, GREEN, RED, "native idle pixels");
+            native.present(
+                &scene(GREEN, Color::WHITE),
+                SIZE,
+                1,
+                Color::BLACK,
+                &PixelFont,
+                &images,
+                false,
+            );
+            expect(window, GREEN, Color::WHITE, "promotion after native image");
+            drop(native);
+            msg_void(native_layer, sel("release"));
+            let sparse_layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
+            let mut sparse = WindowPresenter::attach(sparse_layer, 1.0).unwrap();
+            msg_arg(view, sel("setLayer:"), sparse_layer);
+            sparse.prime(SIZE.width, SIZE.height, 1);
+            for label in ["sparse native image", "sparse repeated image"] {
+                sparse.present(
+                    &scene(GREEN, Color::WHITE),
+                    SIZE,
+                    1,
+                    Color::BLACK,
+                    &PixelFont,
+                    &images,
+                    false,
+                );
+                assert!(
+                    !has_metal_child(sparse_layer),
+                    "the sparse base stays native"
+                );
+                expect(window, GREEN, Color::WHITE, label);
+            }
+            assert!(sparse.rest());
+            expect(window, GREEN, Color::WHITE, "sparse idle image");
+            sparse.present(
+                &scene(RED, Color::WHITE),
+                SIZE,
+                1,
+                Color::BLACK,
+                &PixelFont,
+                &images,
+                false,
+            );
+            expect(window, RED, Color::WHITE, "promotion after sparse image");
+            drop(sparse);
+            msg_void(sparse_layer, sel("release"));
+            let growing_layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
+            let mut growing = WindowPresenter::attach(growing_layer, 1.0).unwrap();
+            msg_arg(view, sel("setLayer:"), growing_layer);
+            growing.prime(SIZE.width, SIZE.height, 1);
+            for rows in [0, 1, 2, 4, 5, 2, 0] {
+                let mut commands = vec![
+                    DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point { x: 0.0, y: 0.0 },
+                            size: SIZE,
+                        },
+                        color: Color::WHITE,
+                        corner_radius: Corners::ZERO,
+                    },
+                    DrawCommand::PushClip {
+                        rect: Rect {
+                            origin: Point { x: 0.0, y: 0.0 },
+                            size: SIZE,
+                        },
+                        corner_radius: Corners::ZERO,
+                    },
+                ];
+                for row in 0..rows {
+                    commands.push(DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point {
+                                x: 0.0,
+                                y: row as f64 * 48.0,
+                            },
+                            size: Size {
+                                width: SIZE.width,
+                                height: 48.0,
+                            },
+                        },
+                        color: if row % 2 == 0 { RED } else { GREEN },
+                        corner_radius: Corners::ZERO,
+                    });
+                    for (x, width, color) in [(80.0, 16.0, GREEN), (104.0, 4.0, Color::WHITE)] {
+                        commands.push(DrawCommand::FillRect {
+                            rect: Rect {
+                                origin: Point {
+                                    x,
+                                    y: row as f64 * 48.0 + 8.0,
+                                },
+                                size: Size {
+                                    width,
+                                    height: 16.0,
+                                },
+                            },
+                            color,
+                            corner_radius: Corners::ZERO,
+                        });
+                    }
+                }
+                commands.push(DrawCommand::PopClip);
+                growing.present(
+                    &DisplayList::from(commands),
+                    SIZE,
+                    1,
+                    Color::BLACK,
+                    &PixelFont,
+                    &images,
+                    false,
+                );
+                assert!(
+                    !has_metal_child(growing_layer),
+                    "bounded growth remains native"
+                );
+                expect(
+                    window,
+                    if rows > 3 { GREEN } else { Color::WHITE },
+                    if rows > 1 { GREEN } else { Color::WHITE },
+                    &format!("native growing rows={rows}"),
+                );
+                if rows > 0 {
+                    let first = sample(window, 200, 20);
+                    assert!(
+                        first[0] >= 128 && first[1] < 128 && first[2] < 128,
+                        "the first row is present"
+                    );
+                    let foreground = sample(window, 86, 14);
+                    assert!(
+                        foreground[0] < 128 && foreground[1] >= 128 && foreground[2] < 128,
+                        "cropped foreground is visible"
+                    );
+                    let gap = sample(window, 100, 12);
+                    assert!(
+                        gap.iter().zip(&first).all(|(a, b)| a.abs_diff(*b) <= 2),
+                        "the native background and the opaque raster must have the same color: {gap:?}, {first:?}"
+                    );
+                }
+            }
+            drop(growing);
+            msg_void(growing_layer, sel("release"));
+            let patch_layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
+            let mut patched = WindowPresenter::attach(patch_layer, 1.0).unwrap();
+            msg_arg(view, sel("setLayer:"), patch_layer);
+            patched.prime(SIZE.width, SIZE.height, 1);
+            for (x, width, expected, label) in [
+                (32.0, 64.0, RED, "native rounded base"),
+                (32.0, 16.0, GREEN, "native patch shrinks ink"),
+                (96.0, 32.0, GREEN, "native patch moves ink"),
+                (32.0, 64.0, RED, "native patch returns to base"),
+            ] {
+                let display = DisplayList::from(vec![
+                    DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point::ZERO,
+                            size: SIZE,
+                        },
+                        color: GREEN,
+                        corner_radius: Corners::all(12.0),
+                    },
+                    DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point { x, y: 32.0 },
+                            size: Size {
+                                width,
+                                height: 32.0,
+                            },
+                        },
+                        color: RED,
+                        corner_radius: Corners::ZERO,
+                    },
+                ]);
+                patched.present(&display, SIZE, 1, Color::BLACK, &PixelFont, &images, false);
+                assert!(
+                    !has_metal_child(patch_layer),
+                    "small patches keep the native base"
+                );
+                expect(window, GREEN, expected, label);
+                let moved = sample(window, 110, 48);
+                assert_eq!(
+                    moved[0] >= 128,
+                    x == 96.0,
+                    "the moved patch is visible without a trail"
+                );
+            }
+            assert!(patched.rest());
+            expect(window, GREEN, RED, "native patched idle");
+            patched.present(
+                &scene(RED, GREEN),
+                SIZE,
+                1,
+                Color::BLACK,
+                &PixelFont,
+                &images,
+                false,
+            );
+            assert!(
+                has_metal_child(patch_layer),
+                "a broad rewrite promotes"
+            );
+            expect(window, RED, GREEN, "native patched promotion");
+            drop(patched);
+            msg_void(patch_layer, sel("release"));
             msg_arg(window, sel("orderOut:"), null_mut());
             msg_bool(window, sel("setReleasedWhenClosed:"), 0);
             msg_void(window, sel("close"));

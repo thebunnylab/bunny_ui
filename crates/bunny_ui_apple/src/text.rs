@@ -104,12 +104,6 @@ unsafe extern "C" {
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
-    fn CGDataProviderCreateWithData(
-        info: *mut c_void,
-        data: *const u8,
-        size: usize,
-        release: *const c_void,
-    ) -> *mut c_void;
     fn CGDataProviderRelease(provider: *mut c_void);
     fn CGFontCreateWithDataProvider(provider: *mut c_void) -> *mut c_void;
 }
@@ -403,11 +397,11 @@ impl CoreTextEngine {
         // just registered stays invisible for the life of the app.
         self.fonts.borrow_mut().clear();
         unsafe {
-            let provider = CGDataProviderCreateWithData(
+            let provider = crate::ffi::CGDataProviderCreateWithData(
                 std::ptr::null_mut(),
-                bytes.as_ptr(),
+                bytes.as_ptr().cast(),
                 bytes.len(),
-                std::ptr::null(),
+                None,
             );
             if provider.is_null() {
                 return false;

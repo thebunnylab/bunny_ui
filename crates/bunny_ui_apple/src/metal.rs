@@ -15,8 +15,9 @@
 //! handler would be the only concurrent code in the codebase.
 //!
 //! On macOS, [`WindowPresenter`] starts bounded opaque scroll scenes on
-//! native layers and creates this GPU backend only when their paint needs
-//! it. Promotion is one-way and transactional. iOS uses Metal immediately.
+//! native layers, as well as bounded foregrounds over a solid background.
+//! It creates this GPU backend only when their paint needs it. Promotion
+//! is one-way and transactional. iOS uses Metal immediately.
 //! `BUNNY_PRESENT=cpu` keeps the explicit CPU backend; failure to initialize
 //! Metal reports the cause and retains the software fallback.
 //!

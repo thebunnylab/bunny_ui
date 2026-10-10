@@ -6154,8 +6154,10 @@ impl LayoutNode {
                     flips: props.flips.unwrap_or(env.flips),
                     ..*env
                 };
-                let (size, fit) = child.measure(proposal, &env);
-                (size, Fit::Wrapped(size, Box::new(fit)))
+                // Styling changes the inherited environment, not the child's
+                // geometry. Keep its fit directly instead of boxing a duplicate
+                // handoff at every style layer and retained measurement.
+                child.measure(proposal, &env)
             }
 
             // the animation scope never touches geometry — by type
@@ -7599,7 +7601,7 @@ impl LayoutNode {
                 out.pop_clip();
             }
 
-            (LayoutNode::Styled { props, child, .. }, Fit::Wrapped(_, fit)) => {
+            (LayoutNode::Styled { props, child, .. }, fit) => {
                 // the nearest styled EATS the color scope: its colors
                 // move, deeper styled nodes paint plain (no shared-key
                 // thrash between siblings of one scope)
@@ -10646,6 +10648,10 @@ mod tests {
 
     /// Measures a node with the tests' default environment (PixelFont).
     fn measure_with_defaults(node: &LayoutNode, proposal: Proposal) -> Size {
+        measure_fit_with_defaults(node, proposal).0
+    }
+
+    fn measure_fit_with_defaults(node: &LayoutNode, proposal: Proposal) -> (Size, Fit) {
         let engine = PixelFont;
         let images = RawImages::default();
         let cache = MeasureCache::default();
@@ -10671,7 +10677,7 @@ mod tests {
             scale: 1.0,
             touch: false,
         };
-        node.measure(proposal, &env).0
+        node.measure(proposal, &env)
     }
 
     /// Full layout with a pointer stamped into the env — how tests drive
@@ -11306,6 +11312,25 @@ mod tests {
             DrawCommand::StrokeRect { color, width, .. }
                 if *color == Color::hex(0x445566) && *width == 2.0
         ));
+    }
+
+    #[test]
+    fn nested_styles_do_not_duplicate_the_child_measure_tree() {
+        let proposal = Proposal::exact(Size { width: 320.0, height: 240.0 });
+        for child in [text(8), stack(Axis::Vertical, CrossAlign::Start, vec![text(3), text(7)])] {
+            let (size, fit) = measure_fit_with_defaults(&child, proposal);
+            let original = layout(&child, proposal);
+            let mut wrapped = child;
+            for _ in 0..16 {
+                wrapped = styled(VisualProps::default(), wrapped);
+                let (styled_size, styled_fit) = measure_fit_with_defaults(&wrapped, proposal);
+                assert_eq!(styled_size, size);
+                assert!(styled_fit.same_as(&fit),
+                    "transparent styles must reuse the child's fit, not allocate another boxed tree");
+                assert_eq!(layout(&wrapped, proposal).display.as_slice(), original.display.as_slice(),
+                    "removing measure wrappers cannot change placement or pixels");
+            }
+        }
     }
 
     #[test]

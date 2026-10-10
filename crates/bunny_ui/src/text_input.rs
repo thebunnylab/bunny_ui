@@ -465,6 +465,9 @@ pub(crate) fn lend_text(
             return kept.text.clone();
         }
     }
+    if let Some(old) = lent.as_ref() {
+        crate::reconciler::note_replaced_text(old.text.len());
+    }
     let fresh: std::sync::Arc<str> = std::sync::Arc::from(value);
     // what the field's own edits left of the old text travels with the new
     let from = lent.take().and_then(|old| old.kept_before.map(|before| (old.text, before)));
