@@ -597,16 +597,18 @@ impl Runtime {
         Rc::clone(&self.images)
     }
 
-    /// Moves the keyboard to the field the app NAMED with `.id(…)`.
+    /// Moves the keyboard to the field or focusable control named with `.id(…)`.
     ///
     /// A field's identity path is structural — the scene's prefix, then every
     /// wrapper down to it — so an app that wants to put the caret somewhere
     /// (a form's Tab walk, a screen that opens with one box already live)
     /// would have to spell a path it does not own. It owns the NAME, and this
-    /// resolves it against the last layout's fields.
+    /// resolves it against the last layout's fields and custom controls.
+    /// An exact field name wins. Otherwise, the name must contain exactly one
+    /// visible custom control that accepts keys and does not leave them behind.
     ///
-    /// `false` when nothing laid out under that name — before the first
-    /// frame there are no fields to reach.
+    /// `false` when no eligible control, or several custom controls, match the
+    /// name. Before the first frame there are no controls to reach.
     pub fn focus_named(&self, id: &str) -> bool {
         let tail = format!("[{id}]");
         let path = self
@@ -615,6 +617,24 @@ impl Runtime {
             .iter()
             .find(|field| field.path.ends_with(&tail))
             .map(|field| field.path.clone());
+        let path = path.or_else(|| {
+            let customs = self.last_customs.borrow();
+            let dom_customs = self.dom_customs.borrow();
+            let mut matches = customs
+                .iter()
+                .chain(dom_customs.iter().map(|(_, placement)| placement))
+                .filter(|placement| {
+                    let element = placement.element.element();
+                    placement.path.split('/').any(|segment| segment == tail)
+                        && placement.visible.size.width > 0.0
+                        && placement.visible.size.height > 0.0
+                        && element.accepts_keys()
+                        && !element.leaves_keyboard()
+                });
+            let first = matches.next()?;
+            // A name around several custom controls is not a focus target.
+            matches.next().is_none().then(|| first.path.clone())
+        });
         match path {
             Some(path) => {
                 self.focus(&path);
@@ -2205,6 +2225,31 @@ impl Runtime {
             && (self.close_menu() || self.cancel_drag())
         {
             return crate::custom::Response::handled();
+        }
+        // A captured custom gesture can be cancelled before it takes focus:
+        // custom boxes normally borrow the keyboard on release. Give Escape
+        // to the hand's owner before the previously focused box or keymap.
+        if *pattern == KeyPattern::key(crate::action::Key::Escape) {
+            let grabbed = self.interaction.borrow().element_grab.clone();
+            if let Some(placement) = grabbed.as_deref().and_then(|path| self.custom_at(path)) {
+                let response = self.deliver(
+                    &placement,
+                    crate::custom::ElementEvent::Key(stroke),
+                );
+                if response.handled {
+                    {
+                        let mut interaction = self.interaction.borrow_mut();
+                        interaction.element_grab = None;
+                        interaction.pressed = None;
+                    }
+                    self.dirty_island_of(&placement.path);
+                    self.frame_asked.set(true);
+                    return response;
+                }
+                if self.focus.borrow().as_deref() == Some(placement.path.as_str()) {
+                    return response; // Do not deliver one ignored Escape twice.
+                }
+            }
         }
         // a field of MANY lines owns `⌘↵`: the bare break is its
         // newline, so its submit has to be the chord — and the app
