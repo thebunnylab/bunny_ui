@@ -55,6 +55,10 @@ bunny-ui-web = { workspace = true, optional = true }
 name = "counter"
 required-features = ["shell"]
 
+[[test]]
+name = "app_macro"
+required-features = ["shell"]
+
 # One page per platform, each with the shell that target compiles.
 [package.metadata.docs.rs]
 targets = [

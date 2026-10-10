@@ -50,9 +50,10 @@ const decoder = new TextDecoder();
 const EXPECTED_ABI = 20;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
-// before this script loads; the finder's binary is the default. The
-// entry export follows the same door (`window.BUNNY_START`).
-const WASM_URL = window.BUNNY_WASM || "finder_web.wasm";
+// before this script loads (`bunny run` and `bunny build` write it);
+// there is no default — a page that names none says so. The entry
+// export follows the same door (`window.BUNNY_START`).
+const WASM_URL = window.BUNNY_WASM;
 const START_EXPORT = window.BUNNY_START || "start_dom";
 // `?stats` on the page URL: the glue accumulates its apply-side wall
 // time in `window.__bunnyApply` — the column the wasm cannot see.
@@ -1827,27 +1828,13 @@ const imports = {
       new Uint8Array(wasm.memory.buffer, out, width * height * 4).set(pixels);
     },
   },
-  // The APP's own door to the network, in its own module: the engine
-  // opens no socket, and the answer goes back through an export the
-  // app declared. A failed fetch answers with an empty body — the task
-  // decides what that means.
-  app: {
-    js_fetch(pointer, length) {
-      const url = decoder.decode(
-        new Uint8Array(wasm.memory.buffer, pointer, length),
-      );
-      fetch(url)
-        .then((response) => (response.ok ? response.text() : ""))
-        .catch(() => "")
-        .then((text) => {
-          const bytes = new TextEncoder().encode(text);
-          const out = wasm.bunny_alloc(bytes.length);
-          new Uint8Array(wasm.memory.buffer, out, bytes.length).set(bytes);
-          wasm.finder_fetched(out, bytes.length);
-        });
-    },
-  },
 };
+
+// The page's own import modules, merged in before the boot: an app
+// whose wasm imports from a module of its own (`app`, say) hands the
+// functions over as `window.BUNNY_IMPORTS = { app: { … } }`, and they
+// reach the instance back through `window.__bunny`.
+Object.assign(imports, window.BUNNY_IMPORTS || {});
 
 // The box the page gives its mount. The engine pins the mount at the
 // size it laid out, so the page's own answer — its stylesheet's — is
@@ -1865,7 +1852,18 @@ function pageBox() {
 let mounted = [0, 0];
 
 const bootOpened = performance.now();
-WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
+// No wasm named, no boot: the page says what is missing instead of
+// fetching a file that is not there.
+function missingWasm() {
+  const notice = document.createElement("pre");
+  notice.textContent = "This page names no wasm: set window.BUNNY_WASM before the glue loads.";
+  app.replaceChildren(notice);
+  return new Error(notice.textContent);
+}
+const booting = WASM_URL
+  ? WebAssembly.instantiateStreaming(fetch(WASM_URL), imports)
+  : Promise.reject(missingWasm());
+booting.then(
   ({ instance }) => {
     wasm = instance.exports;
     if (typeof gpuAttach === "function") gpuAttach(wasm);
