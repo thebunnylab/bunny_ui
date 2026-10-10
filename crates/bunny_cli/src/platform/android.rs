@@ -242,16 +242,22 @@ pub fn escape_property(value: &str) -> String {
 /// Runs the project's Gradle wrapper on `tasks`, with more environment —
 /// a release's signing, as `ORG_GRADLE_PROJECT_*` properties Gradle
 /// reads and no process list shows.
+///
+/// The wrapper's jar runs on the JDK's own `java`, the way `gradlew` ends
+/// up running it, with no shell between: `gradlew` is a `/bin/sh` script,
+/// and the `sh` of Debian and Ubuntu (dash) drops from the environment
+/// every variable whose name has a dot — the signing's among them.
 pub fn gradle(dir: &Path, toolchain: &Toolchain, tasks: &[&str], env: &[(String, String)]) -> Result<()> {
     let task = tasks.join(" ");
     println!("{}", term::dim(&format!("Gradle {task} (its first run downloads Gradle itself)…")));
-    let mut command = if cfg!(windows) {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "gradlew.bat"]);
-        command
-    } else {
-        Command::new(dir.join("gradlew"))
-    };
+    let wrapper = dir.join("gradle/wrapper/gradle-wrapper.jar");
+    if !wrapper.is_file() {
+        return Err(Error::new(format!("{} is missing", wrapper.display())).hint("the project's android/ folder came from `bunny new`; add it again with `bunny new . --platforms android`"));
+    }
+    let java = toolchain.jdk.home.join("bin").join(if cfg!(windows) { "java.exe" } else { "java" });
+    let mut command = Command::new(java);
+    // what `gradlew` gives the wrapper's JVM
+    command.args(["-Xmx64m", "-Xms64m", "-Dorg.gradle.appname=gradlew", "-jar"]).arg(&wrapper);
     for (key, value) in env {
         command.env(key, value);
     }
@@ -263,7 +269,7 @@ pub fn gradle(dir: &Path, toolchain: &Toolchain, tasks: &[&str], env: &[(String,
         .env("ANDROID_HOME", &toolchain.sdk)
         .stdin(Stdio::null())
         .status()
-        .map_err(|error| Error::new(format!("gradlew: {error}")))?;
+        .map_err(|error| Error::new(format!("Gradle's wrapper: {error}")))?;
     if !status.success() {
         return Err(Error::new(format!("Gradle {task} failed")).hint("the output above says why"));
     }

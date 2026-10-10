@@ -223,6 +223,11 @@ pub fn build(project: &Project, options: &Options, out: &Path, log: &mut Log, in
     let aab = outputs.join("bundle").join(&lower).join(format!("app-{lower}.aab"));
     let apk = outputs.join("apk").join(&lower).join(format!("app-{lower}.apk"));
     let base = format!("{}-{}", project.package, project.version);
+    let unsigned = outputs.join("apk").join(&lower).join(format!("app-{lower}-unsigned.apk"));
+    if !apk.is_file() && unsigned.is_file() {
+        return Err(Error::new("Gradle packed the app without signing it: the upload key did not reach it")
+            .hint("build.log lists the build; android/app/build.gradle.kts must not set its own signingConfig for release"));
+    }
     for (from, name) in [(&aab, format!("{base}.aab")), (&apk, format!("{base}.apk"))] {
         if !from.is_file() {
             return Err(Error::new(format!("Gradle finished without {}", from.display())));
@@ -238,6 +243,22 @@ pub fn build(project: &Project, options: &Options, out: &Path, log: &mut Log, in
     }
     info.field("abis", &abi_list.join(" "));
     verify(&toolchain, &out.join(format!("{base}.apk")), log, info)?;
+    verify_bundle(&toolchain, &out.join(format!("{base}.aab")), log)?;
+    Ok(())
+}
+
+/// The App Bundle is signed: Gradle names it the same signed or not, and
+/// Play refuses an unsigned one. A bundle is a jar to `jarsigner`.
+fn verify_bundle(toolchain: &Toolchain, aab: &Path, log: &mut Log) -> Result<()> {
+    let jarsigner = toolchain.jdk.home.join("bin").join(if cfg!(windows) { "jarsigner.exe" } else { "jarsigner" });
+    if !jarsigner.is_file() {
+        log.note("no jarsigner in the JDK: the App Bundle's signature is not checked");
+        return Ok(());
+    }
+    let out = log.run(&jarsigner.to_string_lossy(), &[OsStr::new("-verify"), aab.as_os_str()], QUICK)?;
+    if !out.ok() || !out.stdout.contains("jar verified") {
+        return Err(Error::new("the App Bundle is not signed").hint("build.log has jarsigner's answer"));
+    }
     Ok(())
 }
 
