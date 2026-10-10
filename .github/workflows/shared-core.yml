@@ -8,6 +8,7 @@ on:
       - 'crates/bunny_ui_apple/**'
       - 'crates/bunny_ui_macos/**'
       - 'crates/bunny_ui_windows/**'
+      - 'crates/bunny_ui_linux/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/check-clippy-regressions.py'

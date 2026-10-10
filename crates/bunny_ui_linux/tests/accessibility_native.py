@@ -90,16 +90,16 @@ try:
 
     stale = named("Row 2")
     assert named("Remove row").get_action_iface().do_action(0)
-    unavailable(lambda: stale.get_action_iface().do_action(0))
+    unavailable(lambda: Atspi.Action.do_action(stale, 0))
     assert named("Open modal").get_action_iface().do_action(0)
     dismiss = wait_for(lambda: named("Dismiss modal"), "modal not exposed")
     assert named("Updated name") is None
-    unavailable(lambda: updated.get_editable_text_iface().set_text_contents("blocked"))
+    unavailable(lambda: Atspi.EditableText.set_text_contents(updated, "blocked"))
     assert dismiss.get_action_iface().do_action(0)
     restored = wait_for(lambda: named("Updated name"), "form not restored")
     assert Atspi.Text.get_text(restored, 0, -1) == "Dinner 👩‍🚀"
     assert named("Close form").get_action_iface().do_action(0)
-    unavailable(lambda: restored.get_editable_text_iface().set_text_contents("closed"))
+    unavailable(lambda: Atspi.EditableText.set_text_contents(restored, "closed"))
     restored.clear_cache()
     unavailable(restored.get_name)
     print("AT-SPI removal, modal isolation and closed-window safety passed", flush=True)

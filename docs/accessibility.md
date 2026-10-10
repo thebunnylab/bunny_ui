@@ -1,4 +1,4 @@
-# Accessibility semantics and macOS bridge
+# Accessibility semantics and native bridges
 
 The core can project text, buttons and editable fields from the retained scene
 into `bunny_ui::accessibility::Tree`. This is the data boundary for native
@@ -73,9 +73,44 @@ main-thread exit with an accessible window still open. This
 in-process probe does not require permission to control other applications. It
 is distinct from an external AX client dump or a human VoiceOver workflow.
 
+## Linux adapter
+
+The Linux shell registers an AT-SPI application on the system accessibility bus,
+using the libdbus library already linked by the shell. Its descriptor participates
+in both the X11 and Wayland event loops, including write readiness for queued
+replies. Requests run on the UI thread between native dispatches. No accessibility
+timer, Rust dependency or separate form model is introduced.
+
+The first client query enables retained capture. Main windows and overlay surfaces
+have distinct roots; leaves retain their object paths while their `NodeId` is
+exposed. Accessible and Application properties describe the current objects.
+Component exposes bounds, hit testing and field focus; Action invokes buttons;
+Text reads Unicode scalar ranges; EditableText replaces a field's whole contents.
+Unsupported operations return a D-Bus error. Text selection, caret offsets,
+character geometry and partial edits are not implemented yet.
+
+Passwords expose the password role and an empty readable text value and count.
+No password text enters a bus reply or change event. Removed nodes and closed
+windows reject requests. Name, text, focus, membership and visible-data events
+follow snapshot installation. Embedded NUL scalars in labels are represented by
+U+FFFD because D-Bus strings cannot carry NUL; the remaining text is preserved.
+
+X11 screen coordinates come from the actual window or panel's server origin.
+Both backends support window-relative coordinates. Wayland screen-coordinate
+queries return NotSupported: its ordinary surface protocol supplies no global
+window position. WPE content is currently a painted texture and does not yet
+expose an embedded AT-SPI plug. A missing bus is reported at initialization;
+a disconnected bus is reported and removed from the poll, without terminating
+the app. Automatic reconnection is not yet implemented.
+
+`bash scripts/check-linux-accessibility.sh` uses a separate libatspi client
+(Python GI) against real Bunny windows, an isolated session bus, Xvfb and headless
+Weston. It runs both backends in normal and paranoid modes. This is a native
+protocol witness, not a human Orca workflow or a complete desktop qualification.
+
 ## Remaining work
 
-Windows UIA and Linux AT-SPI bridges are not included yet. The core projection
+The Windows UIA adapter is delivered in a separate change. The core projection
 is a flat sequence of exposed leaves, not a complete document model.
 It does not yet describe custom controls, checkboxes, sliders, read-only or
 disabled states, rich-text ranges, selection APIs, validation messages or

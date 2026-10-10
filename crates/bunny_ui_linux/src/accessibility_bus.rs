@@ -417,3 +417,42 @@ impl Drop for Connection {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_codec_round_trips_method_arguments() {
+        let message = Message::call(
+            c"org.a11y.Bus",
+            c"/org/a11y/bus",
+            c"org.a11y.Bus",
+            c"GetAddress",
+        )
+        .unwrap();
+        let values = vec![
+            Value::text("Dinner 👩‍🚀"),
+            Value::I32(-1),
+            Value::U32(9),
+            Value::Bool(true),
+            Value::reference(":1.7", "/org/a11y/atspi/accessible/root"),
+            Value::Variant(Box::new(Value::I32(8))),
+        ];
+        message.append(&values).unwrap();
+        assert_eq!(message.args().unwrap(), values);
+    }
+
+    #[test]
+    fn embedded_nul_preserves_the_label_suffix() {
+        let message = Message::call(
+            c"org.a11y.Bus",
+            c"/org/a11y/bus",
+            c"org.a11y.Bus",
+            c"GetAddress",
+        )
+        .unwrap();
+        message.append(&[Value::text("before\0after")]).unwrap();
+        assert_eq!(message.args().unwrap(), vec![Value::text("before�after")]);
+    }
+}

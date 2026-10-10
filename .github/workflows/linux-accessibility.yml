@@ -39,3 +39,35 @@ jobs:
           rustc --version --verbose
       - name: Native AT-SPI, X11 and Wayland, normal and paranoid
         run: bash scripts/check-linux-accessibility.sh
+      - name: Linux shell, normal and paranoid
+        run: |
+          dbus-run-session -- cargo test -p bunny-ui-linux --locked --all-targets
+          BUNNY_PARANOID=all dbus-run-session -- cargo test -p bunny-ui-linux --locked --all-targets
+      - name: Core and facade on Linux
+        run: |
+          cargo test -p bunny-ui-core --locked --all-targets
+          BUNNY_PARANOID=all cargo test -p bunny-ui-core --locked --all-targets
+          cargo test -p bunny-ui-core --locked --all-targets --all-features
+          BUNNY_PARANOID=all cargo test -p bunny-ui-core --locked --all-targets --all-features
+          cargo test -p bunny-ui --locked --all-targets
+          cargo test -p bunny-ui --locked --doc
+          cargo check -p bunny-ui --locked --all-targets --no-default-features
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha || '4eb9dc9e64cb6994989e9975640a76d81772965d' }}
+          path: .ci-base
+          persist-credentials: false
+      - name: Strict lint diagnostic comparison
+        run: |
+          rustup override set 1.98.1 --path .ci-base
+          python3 scripts/check-clippy-regressions.py --baseline .ci-base --output lint-evidence \
+            --package bunny-ui-core --package bunny-ui-linux
+      - name: Preserve strict lint results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: strict-lint-linux
+          path: |
+            lint-evidence/*.jsonl
+            lint-evidence/comparison.json
+          if-no-files-found: warn
