@@ -6,7 +6,7 @@
 //! fails (that platform will not build); the exit code is 1 when one
 //! fails, so a CI step can gate on it.
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::IsTerminal;
 use std::process::Command;
 use std::thread;
 
@@ -125,7 +125,7 @@ pub fn run(matches: &Matches) -> Result<()> {
         let targets = missing_targets(&sections);
         let asking = !targets.is_empty() && can_ask() && process::which("rustup").is_some();
         print(&sections, verbose, !asking);
-        if asking && ask(&format!("Install {} with rustup now? [Y/n] ", targets.join(" "))) {
+        if asking && term::confirm(&format!("Install {} with rustup now? [Y/n] ", targets.join(" ")), true) {
             println!();
             install_targets(&targets)?;
             sections = check(&platforms);
@@ -149,16 +149,6 @@ fn can_ask() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
-/// A yes-or-no question; Enter is yes.
-fn ask(question: &str) -> bool {
-    print!("{question}");
-    let _ = std::io::stdout().flush();
-    let mut answer = String::new();
-    if std::io::stdin().lock().read_line(&mut answer).is_err() {
-        return false;
-    }
-    matches!(answer.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes")
-}
 
 fn chosen_platforms(matches: &Matches) -> Result<Vec<Platform>> {
     let buildable = Platform::buildable();
@@ -237,7 +227,7 @@ pub fn preflight(platform: Platform) -> Result<()> {
         && process::which("rustup").is_some()
     {
         print(std::slice::from_ref(&checked), false, false);
-        if ask(&format!("Install {} with rustup now? [Y/n] ", checked.missing_targets.join(" "))) {
+        if term::confirm(&format!("Install {} with rustup now? [Y/n] ", checked.missing_targets.join(" ")), true) {
             install_targets(&checked.missing_targets)?;
             checked = section(platform, &toolchain, &env);
         }
@@ -353,7 +343,7 @@ fn android_section(toolchain: &Option<rust::Rust>, env: &android::Env) -> Sectio
         section.checks.push(Check::fail(
             "No Android SDK (looked at ANDROID_HOME, ANDROID_SDK_ROOT and Android Studio's place)",
             &[
-                "install Android Studio: https://developer.android.com/studio — its first run installs the SDK",
+                "bunny setup android   — the SDK, NDK, emulator and a JDK, no Android Studio needed",
                 "or point ANDROID_HOME at an SDK you already have",
             ],
         ));
@@ -371,7 +361,7 @@ fn android_section(toolchain: &Option<rust::Rust>, env: &android::Env) -> Sectio
     if !sdkmanager.is_file() {
         section.checks.push(Check::warn(
             "No SDK command-line tools: `doctor` can only name the packages, not install them",
-            &["Android Studio › Settings › Languages & Frameworks › Android SDK › SDK Tools › Android SDK Command-line Tools"],
+            &["bunny setup android   — installs them, and whatever else is missing"],
         ));
     }
     for (path, title, package) in [
@@ -409,10 +399,7 @@ fn android_section(toolchain: &Option<rust::Rust>, env: &android::Env) -> Sectio
         }
         None => section.checks.push(Check::fail(
             "No NDK: Rust links Android apps with its compilers",
-            &[
-                &format!("{manager} --list | grep \"ndk;\"   — then install the newest: {manager} \"ndk;<version>\""),
-                "or Android Studio › SDK Manager › SDK Tools › NDK (Side by side)",
-            ],
+            &["bunny setup android   — installs the newest stable NDK"],
         )),
     }
     jdk_check(&mut section, env);
@@ -449,7 +436,7 @@ fn jdk_check(section: &mut Section, env: &android::Env) {
         )),
         None => section.checks.push(Check::fail(
             "No JDK: Gradle packages the app with it",
-            &["Android Studio bundles one; or install JDK 17+ and set JAVA_HOME"],
+            &["bunny setup android   — installs one (Temurin) under ~/.bunny", "or install JDK 17+ and set JAVA_HOME"],
         )),
     }
 }

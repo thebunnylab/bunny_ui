@@ -3,6 +3,7 @@
 //! what is there and say the same thing when it is not.
 
 pub mod android;
+pub mod android_packages;
 pub mod apple;
 pub mod linux;
 pub mod rust;

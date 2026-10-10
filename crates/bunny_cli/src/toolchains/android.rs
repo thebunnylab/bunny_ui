@@ -35,14 +35,35 @@ impl Env {
     }
 }
 
-/// The SDK: `ANDROID_HOME`, then `ANDROID_SDK_ROOT`, then where Android
-/// Studio installs it on this kind of host.
+/// The SDK: `ANDROID_HOME`, then `ANDROID_SDK_ROOT`, then the place
+/// every tool looks on this kind of host (where `bunny setup android`
+/// installs it, and Android Studio would).
 pub fn sdk_root(env: &Env) -> Option<PathBuf> {
     let named = ["ANDROID_HOME", "ANDROID_SDK_ROOT"].into_iter().filter_map(|key| env.var(key).map(PathBuf::from));
     named.chain(default_sdk(env)).find(|path| path.is_dir())
 }
 
-fn default_sdk(env: &Env) -> Option<PathBuf> {
+/// `~/.bunny`: what `bunny` installs for itself (a JDK, downloads).
+pub fn bunny_home(env: &Env) -> Option<PathBuf> {
+    env.home.as_ref().map(|home| home.join(".bunny"))
+}
+
+/// The JDKs `bunny setup android` installed, under `~/.bunny/jdk`.
+fn bunny_jdks(env: &Env) -> Vec<PathBuf> {
+    let Some(dir) = bunny_home(env).map(|home| home.join("jdk")) else { return Vec::new() };
+    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter_map(|path| {
+            // a macOS JDK keeps its home inside the bundle layout
+            [path.join("Contents/Home"), path].into_iter().find(|home| home.join("bin").join(exe("java", ".exe")).is_file())
+        })
+        .collect()
+}
+
+/// Where the SDK goes when none is there.
+pub fn default_sdk(env: &Env) -> Option<PathBuf> {
     if cfg!(windows) {
         return env.var("LOCALAPPDATA").map(|local| Path::new(local).join("Android").join("Sdk"));
     }
@@ -88,19 +109,30 @@ pub fn ndk(env: &Env, sdk: Option<&Path>) -> Option<Ndk> {
     })
 }
 
-/// The compilers' folder for this host. The NDK ships `darwin-x86_64`
-/// for every Mac — universal binaries — so Apple silicon finds it too.
+/// The compilers' folder for this host. The NDK has shipped
+/// `darwin-x86_64` for every Mac (universal binaries), `linux-x86_64` and
+/// `windows-x86_64`; a folder of the same system under another CPU name
+/// is taken too, should a release rename it.
 fn prebuilt_bin(root: &Path) -> Option<PathBuf> {
     let prebuilt = root.join("toolchains/llvm/prebuilt");
-    let tag = if cfg!(target_os = "macos") {
-        "darwin-x86_64"
+    let system = if cfg!(target_os = "macos") {
+        "darwin-"
     } else if cfg!(windows) {
-        "windows-x86_64"
+        "windows-"
     } else {
-        "linux-x86_64"
+        "linux-"
     };
-    let bin = prebuilt.join(tag).join("bin");
-    bin.is_dir().then_some(bin)
+    let exact = prebuilt.join(format!("{system}x86_64")).join("bin");
+    if exact.is_dir() {
+        return Some(exact);
+    }
+    fs::read_dir(&prebuilt)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(system)))
+        .map(|path| path.join("bin"))
+        .filter(|bin| bin.is_dir())
 }
 
 /// `Pkg.Revision` out of the NDK's `source.properties`.
@@ -161,14 +193,18 @@ pub struct Jdk {
     pub version: u32,
 }
 
-/// The JDK Gradle will run on: `JAVA_HOME`, then the one bundled with
-/// Android Studio, then the system's (`java_home` on macOS, `java` on
-/// the PATH). The first that answers is the one.
+/// The JDK Gradle will run on: `JAVA_HOME`, then the one `bunny setup
+/// android` installed, then the one bundled with Android Studio, then the
+/// system's (`java_home` on macOS, `java` on the PATH). The first that
+/// answers is the one.
 pub fn jdk(env: &Env) -> Option<Jdk> {
     let java = exe("java", ".exe");
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(home) = env.var("JAVA_HOME") {
         candidates.push(Path::new(home).join("bin").join(&java));
+    }
+    for home in bunny_jdks(env) {
+        candidates.push(home.join("bin").join(&java));
     }
     for studio in studio_jbr(env) {
         candidates.push(studio.join("bin").join(&java));
