@@ -1868,6 +1868,7 @@ pub(crate) fn show_window(window: u32) {
 /// backing and the window itself go, in that order. The last window
 /// out ends the road.
 pub(crate) fn close_top_level(window: u32) {
+    crate::ffi::accessibility::retire_window(window as usize);
     crate::webview::teardown(window as usize);
     crate::vk::teardown(window as usize);
     crate::gl::teardown(window as usize);
@@ -2628,6 +2629,17 @@ pub(crate) fn window_origin_logical(window: u32) -> (f64, f64) {
         let scale = window_ref(client, window).map(|w| w.scale).unwrap_or(1) as f64;
         let origin = window_root_origin(client, window);
         (origin.0 as f64 / scale, origin.1 as f64 / scale)
+    })
+}
+
+/// Actual server origin for a main window or one of its native panels.
+pub(crate) fn accessibility_origin(window: u32, panel: Option<usize>) -> Option<(i32, i32)> {
+    with_x(|client| {
+        let window = match panel {
+            Some(index) => client.panels.get(index)?.as_ref()?.window,
+            None => window_ref(client, window)?.id,
+        };
+        Some(root_origin_of(client, window))
     })
 }
 
@@ -3574,6 +3586,7 @@ pub(crate) fn run() {
             PollFd { fd, events: POLLIN, revents: 0 },
             PollFd { fd: wake_fd, events: POLLIN, revents: 0 },
         ];
+        crate::ffi::accessibility::prepare(&mut fds);
         // the engine's own descriptors ride this poll (see the wayland
         // door)
         let timeout = match crate::webview::pump_prepare(&mut fds) {
@@ -3614,6 +3627,7 @@ pub(crate) fn run() {
         crate::webview::deliver_pending();
         // a window a verb or the manager asked to close, now
         settle_closes();
+        crate::ffi::accessibility::pump();
     }
     teardown();
 }
