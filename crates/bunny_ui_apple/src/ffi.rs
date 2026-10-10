@@ -373,26 +373,44 @@ pub unsafe fn owned_provider(bytes: *const u8, length: usize) -> *mut c_void {
 /// transaction. The dictionary answers at the layer, for every
 /// transaction; NSNull is CoreAnimation's own word for "no action".
 pub unsafe fn kill_layer_actions(layer: Id) {
-    unsafe {
-        let null = msg_id(class("NSNull"), sel("null"));
-        let actions = msg_id(class("NSMutableDictionary"), sel("dictionary"));
-        for key in [
-            "bounds",
-            "position",
-            "frame",
-            "contents",
-            "contentsScale",
-            "hidden",
-            "sublayers",
-            "onOrderIn",
-            "onOrderOut",
-            "transform",
-        ] {
-            let key = ns_string(key);
-            msg_void_id_id(actions, sel("setObject:forKey:"), null, key);
-        }
-        msg_void_id(layer, sel("setActions:"), actions);
+    let apply = |actions: &LayerActions| unsafe {
+        msg_void_id(layer, sel("setActions:"), actions.0);
+    };
+    if LAYER_ACTIONS.try_with(apply).is_err() {
+        // A late destructor may create a layer after the cache was dropped.
+        // Keep the original behavior there instead of resurrecting a TLS.
+        apply(&unsafe { LayerActions::new() });
     }
+}
+
+/// CALayer copies its actions property. An immutable dictionary's copy is
+/// another reference to the same table, so every layer shares these entries.
+struct LayerActions(Id);
+
+impl LayerActions {
+    unsafe fn new() -> Self {
+        unsafe {
+            let null = msg_id(class("NSNull"), sel("null"));
+            let actions = msg_id(class("NSMutableDictionary"), sel("dictionary"));
+            for key in [
+                "bounds", "position", "frame", "contents", "contentsScale",
+                "hidden", "sublayers", "onOrderIn", "onOrderOut", "transform",
+            ] {
+                msg_void_id_id(actions, sel("setObject:forKey:"), null, ns_string(key));
+            }
+            Self(msg_id(actions, sel("copy")))
+        }
+    }
+}
+
+impl Drop for LayerActions {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.0) };
+    }
+}
+
+thread_local! {
+    static LAYER_ACTIONS: LayerActions = unsafe { LayerActions::new() };
 }
 
 /// The run loop source a background thread knocks on. It lives in a
@@ -489,6 +507,72 @@ pub fn wake_from_any_thread() {
 #[cfg(test)]
 mod name_tests {
     use super::*;
+
+    #[allow(clashing_extern_declarations)]
+    unsafe extern "C" {
+        #[link_name = "objc_msgSend"]
+        fn msg_id_arg(object: Id, selector: Sel, argument: Id) -> Id;
+        #[link_name = "objc_msgSend"]
+        fn msg_void(object: Id, selector: Sel);
+    }
+
+    #[test]
+    fn layers_share_immutable_actions_beyond_the_creation_pool() {
+        unsafe {
+            let outer = objc_autoreleasePoolPush();
+            let inner = objc_autoreleasePoolPush();
+            let first = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
+            let second = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
+            kill_layer_actions(first);
+            kill_layer_actions(second);
+            let actions = msg_id(first, sel("actions"));
+            assert!(!actions.is_null());
+            assert_eq!(actions, msg_id(second, sel("actions")),
+                "each layer must retain the same immutable table, not copy ten entries");
+            objc_autoreleasePoolPop(inner);
+            // Replacing one layer's actions cannot mutate the shared table.
+            msg_void_id(first, sel("setActions:"), std::ptr::null_mut());
+            msg_void(first, sel("release"));
+            assert_eq!(msg_id(second, sel("actions")), actions);
+            assert_eq!(msg_u64(actions, sel("count")), 10);
+            let null = msg_id(class("NSNull"), sel("null"));
+            for key in ["bounds", "position", "frame", "contents", "contentsScale",
+                "hidden", "sublayers", "onOrderIn", "onOrderOut", "transform"] {
+                assert_eq!(msg_id_arg(actions, sel("objectForKey:"), ns_string(key)), null);
+            }
+            assert!(msg_id_arg(actions, sel("objectForKey:"), ns_string("opacity")).is_null(),
+                "sharing cannot change which actions are disabled");
+            msg_void(second, sel("release"));
+            objc_autoreleasePoolPop(outer);
+        }
+    }
+
+    #[test]
+    fn layer_actions_still_work_after_the_thread_cache_is_destroyed() {
+        struct Late;
+        impl Drop for Late {
+            fn drop(&mut self) {
+                assert!(LAYER_ACTIONS.try_with(|_| {}).is_err());
+                unsafe {
+                    let pool = objc_autoreleasePoolPush();
+                    let layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
+                    kill_layer_actions(layer);
+                    assert_eq!(msg_u64(msg_id(layer, sel("actions")), sel("count")), 10);
+                    msg_void(layer, sel("release"));
+                    objc_autoreleasePoolPop(pool);
+                }
+            }
+        }
+        thread_local! { static LATE_LAYER: Late = const { Late }; }
+        std::thread::spawn(|| {
+            LATE_LAYER.with(|_| {});
+            unsafe {
+                let pool = objc_autoreleasePoolPush();
+                LAYER_ACTIONS.with(|_| {});
+                objc_autoreleasePoolPop(pool);
+            }
+        }).join().expect("late layer creation remains valid");
+    }
 
     #[test]
     fn a_name_asked_while_a_thread_ends_is_still_answered() {
