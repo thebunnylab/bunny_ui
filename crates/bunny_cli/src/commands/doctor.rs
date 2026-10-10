@@ -6,6 +6,7 @@
 //! fails (that platform will not build); the exit code is 1 when one
 //! fails, so a CI step can gate on it.
 
+use std::io::{BufRead, IsTerminal, Write};
 use std::process::Command;
 use std::thread;
 
@@ -13,6 +14,7 @@ use crate::args::{HELP, Matches, Opt};
 use crate::devices::{self, Platform, State};
 use crate::error::{Error, Result};
 use crate::json;
+use crate::process;
 use crate::term;
 use crate::toolchains::{android, apple, linux, rust, windows};
 
@@ -29,7 +31,7 @@ build.";
 pub const OPTIONS: &[Opt] = &[
     Opt::value("platform", "NAME", "Check only this platform (repeatable): macos, ios, windows, linux, android, web")
         .short('p'),
-    Opt::flag("fix", "Install the missing Rust targets, then check again"),
+    Opt::flag("fix", "Install the missing Rust targets without asking, then check again"),
     Opt::flag("verbose", "Show every check, not only the problems").short('v'),
     Opt::flag("json", "Print the checks as JSON"),
     HELP,
@@ -106,9 +108,10 @@ impl Section {
 
 pub fn run(matches: &Matches) -> Result<()> {
     let platforms = chosen_platforms(matches)?;
+    let verbose = matches.flag("verbose");
     let mut sections = check(&platforms);
     if matches.flag("fix") {
-        let targets: Vec<&str> = sections.iter().flat_map(|section| section.missing_targets.iter().copied()).collect();
+        let targets = missing_targets(&sections);
         if !targets.is_empty() {
             install_targets(&targets)?;
             sections = check(&platforms);
@@ -117,13 +120,44 @@ pub fn run(matches: &Matches) -> Result<()> {
     if matches.flag("json") {
         println!("{}", to_json(&sections));
     } else {
-        print(&sections, matches.flag("verbose"));
+        // a person at a terminal is asked, not sent off to type another
+        // command; a script never is (it has `--fix`)
+        let targets = missing_targets(&sections);
+        let asking = !targets.is_empty() && can_ask() && process::which("rustup").is_some();
+        print(&sections, verbose, !asking);
+        if asking && ask(&format!("Install {} with rustup now? [Y/n] ", targets.join(" "))) {
+            println!();
+            install_targets(&targets)?;
+            sections = check(&platforms);
+            print(&sections, verbose, true);
+        }
     }
     if sections.iter().any(|section| section.status() == Status::Fail) {
         // the report is the message; the exit code is the verdict
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// The Rust targets the sections lack — what `rustup` can fix at once.
+fn missing_targets(sections: &[Section]) -> Vec<&'static str> {
+    sections.iter().flat_map(|section| section.missing_targets.iter().copied()).collect()
+}
+
+/// Someone is at the terminal to answer.
+fn can_ask() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// A yes-or-no question; Enter is yes.
+fn ask(question: &str) -> bool {
+    print!("{question}");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().lock().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes")
 }
 
 fn chosen_platforms(matches: &Matches) -> Result<Vec<Platform>> {
@@ -481,7 +515,9 @@ fn install_targets(targets: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn print(sections: &[Section], verbose: bool) {
+/// The report. `mention_fix` names `--fix` when Rust targets are
+/// missing — unless the person is about to be asked instead.
+fn print(sections: &[Section], verbose: bool, mention_fix: bool) {
     for section in sections {
         let status = section.status();
         println!("[{}] {}", status.mark(), term::bold(&section.title));
@@ -503,7 +539,8 @@ fn print(sections: &[Section], verbose: bool) {
         (0, _) => println!("{}", term::ok("Every platform builds; the notes above are worth a look.")),
         _ => {
             let missing: usize = sections.iter().map(|section| section.missing_targets.len()).sum();
-            let tail = if missing > 0 { " `bunny doctor --fix` installs the missing Rust targets." } else { "" };
+            let tail =
+                if missing > 0 && mention_fix { " `bunny doctor --fix` installs the missing Rust targets." } else { "" };
             println!("{} {failing} section{} cannot build yet.{tail}", Status::Fail.mark(), if failing == 1 { "" } else { "s" });
         }
     }
