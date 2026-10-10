@@ -93,3 +93,58 @@ fn a_keystroke_in_a_long_note_copies_it_once() {
         );
     }
 }
+
+#[test]
+fn an_input_method_read_and_collection_release_the_previous_text_version() {
+    use std::sync::Arc;
+
+    let panel = Panel { note: State::new("line — é 日本 🦀\n".repeat(300)) };
+    let runtime = Runtime::new();
+    let window = Size { width: 400.0, height: 300.0 };
+    runtime.display_frame(&panel, window);
+    let path = runtime.layout(&panel, Proposal::exact(window)).hits[0].0.clone();
+    runtime.focus(&path);
+    runtime.key(EditCommand::End(false));
+    for inserted in ["🦀", "é", "\n", "日本"] {
+        let old = runtime.ime_snapshot().expect("focused editor");
+        let lifetime = Arc::downgrade(&old.text);
+        let old_units = old.selected.0;
+        assert!(runtime.key(EditCommand::Insert(inserted.into())).applied);
+        runtime.display_frame(&panel, window);
+        let current = runtime.ime_snapshot().expect("edited field");
+        assert_eq!(current.selected, (old_units + inserted.encode_utf16().count(), 0));
+        assert!(current.text.starts_with(&*old.text), "an external snapshot remains immutable");
+        // The native host collects the replaced layout after presenting.
+        // An outstanding snapshot must survive that same collection.
+        runtime.collect_garbage();
+        assert!(lifetime.upgrade().is_some());
+        drop(old);
+        assert!(lifetime.upgrade().is_none(), "the IME bridge must not retain the consumed predecessor after the old layout is collected");
+        assert_eq!(runtime.ime_snapshot().unwrap().selected, current.selected);
+    }
+}
+
+#[test]
+fn the_first_input_method_read_also_consumes_the_predecessor() {
+    use std::sync::Arc;
+    use bunny_ui::layout::DrawCommand;
+
+    let panel = Panel { note: State::new("é 日本 🦀\n".repeat(300)) };
+    let runtime = Runtime::new();
+    let window = Size { width: 400.0, height: 300.0 };
+    let display = runtime.display_frame(&panel, window);
+    let old = display.iter().find_map(|command| match command {
+        DrawCommand::TextLine { content, .. } => Some(Arc::downgrade(content)),
+        _ => None,
+    }).expect("the field painted its shared text");
+    drop(display);
+    let path = runtime.layout(&panel, Proposal::exact(window)).hits[0].0.clone();
+    runtime.focus(&path);
+    runtime.key(EditCommand::End(false));
+    assert!(runtime.key(EditCommand::Insert("x".into())).applied);
+    runtime.display_frame(&panel, window);
+    runtime.collect_garbage();
+    let snapshot = runtime.ime_snapshot().expect("first input-method read");
+    assert_eq!(snapshot.selected, (snapshot.text.encode_utf16().count(), 0));
+    assert!(old.upgrade().is_none(), "even a full count no longer needs its predecessor");
+}

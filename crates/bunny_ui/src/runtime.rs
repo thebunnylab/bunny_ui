@@ -4331,17 +4331,22 @@ impl Runtime {
     fn utf16_before(&self, path: &str, text: &std::sync::Arc<str>, byte: usize) -> usize {
         let byte = crate::text_input::clamp_to_boundary(text, byte);
         let mut memo = self.utf16_memo.borrow_mut();
-        let from = memo.as_ref().and_then(|(kept, at, units)| {
-            if std::sync::Arc::ptr_eq(kept, text) {
-                return Some((*at, *units));
-            }
-            let cell = reconciler::editor_text(path)?;
-            let cell = cell.borrow();
-            let lent = cell.as_ref()?;
-            let (old, shared) = lent.from.as_ref()?;
-            (std::sync::Arc::ptr_eq(&lent.text, text) && std::sync::Arc::ptr_eq(old, kept) && *at <= *shared)
-                .then_some((*at, *units))
-        });
+        let from = match memo.as_ref() {
+            Some((kept, at, units)) if std::sync::Arc::ptr_eq(kept, text) => Some((*at, *units)),
+            _ => reconciler::editor_text(path).and_then(|cell| {
+                let mut cell = cell.borrow_mut();
+                let lent = cell.as_mut()?;
+                if !std::sync::Arc::ptr_eq(&lent.text, text) {
+                    return None;
+                }
+                // This read installs the current version in the memo below.
+                // Its predecessor is a one-use bridge, not editing history;
+                // consume it even when no old memo can accelerate the count.
+                let (old, shared) = lent.from.take()?;
+                let (kept, at, units) = memo.as_ref()?;
+                (std::sync::Arc::ptr_eq(&old, kept) && *at <= shared).then_some((*at, *units))
+            }),
+        };
         let bytes = text.as_bytes();
         let units = match from {
             Some((at, units)) if at <= byte => units + crate::text_input::utf16_len(&bytes[at..byte]),
