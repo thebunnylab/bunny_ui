@@ -1,5 +1,6 @@
-//! Zip archives, written — the stored kind, without compression: what
-//! Play Console reads native debug symbols from, and every unzip opens.
+//! Zip archives, written: each file deflated (RFC 1951), or stored when
+//! deflating would not shrink it — what Play Console reads native debug
+//! symbols from, what a Windows app is handed out in.
 
 use std::io::Write;
 
@@ -21,38 +22,41 @@ pub fn crc32(bytes: &[u8]) -> u32 {
 }
 
 /// A zip with `files` — each a path inside the archive, with `/` between
-/// its parts, and its bytes — stored as they are.
+/// its parts, and its bytes.
 pub fn write(out: &mut impl Write, files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
     let mut central = Vec::new();
     let mut offset = 0u32;
     for (name, bytes) in files {
         let crc = crc32(bytes);
         let size = u32::try_from(bytes.len()).map_err(|_| std::io::Error::other(format!("{name} is too big for a zip")))?;
+        let deflated = super::deflate::deflate(bytes);
+        let (method, data): (u16, &[u8]) = if deflated.len() < bytes.len() { (8, &deflated) } else { (0, bytes) };
+        let packed = data.len() as u32;
         let name_len = name.len() as u16;
         // the local header, then the bytes
         let mut local = Vec::with_capacity(30 + name.len());
         local.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
         local.extend_from_slice(&20u16.to_le_bytes()); // version needed
         local.extend_from_slice(&0x0800u16.to_le_bytes()); // names are UTF-8
-        local.extend_from_slice(&0u16.to_le_bytes()); // stored
-        local.extend_from_slice(&0u32.to_le_bytes()); // time and date
+        local.extend_from_slice(&method.to_le_bytes());
+        local.extend_from_slice(&DOS_TIME.to_le_bytes());
         local.extend_from_slice(&crc.to_le_bytes());
-        local.extend_from_slice(&size.to_le_bytes());
+        local.extend_from_slice(&packed.to_le_bytes());
         local.extend_from_slice(&size.to_le_bytes());
         local.extend_from_slice(&name_len.to_le_bytes());
         local.extend_from_slice(&0u16.to_le_bytes());
         local.extend_from_slice(name.as_bytes());
         out.write_all(&local)?;
-        out.write_all(bytes)?;
+        out.write_all(data)?;
         // its entry in the central directory
         central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
         central.extend_from_slice(&20u16.to_le_bytes()); // made by
         central.extend_from_slice(&20u16.to_le_bytes()); // version needed
         central.extend_from_slice(&0x0800u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&method.to_le_bytes());
+        central.extend_from_slice(&DOS_TIME.to_le_bytes());
         central.extend_from_slice(&crc.to_le_bytes());
-        central.extend_from_slice(&size.to_le_bytes());
+        central.extend_from_slice(&packed.to_le_bytes());
         central.extend_from_slice(&size.to_le_bytes());
         central.extend_from_slice(&name_len.to_le_bytes());
         central.extend_from_slice(&[0u8; 6]); // extra, comment, disk
@@ -61,7 +65,7 @@ pub fn write(out: &mut impl Write, files: &[(String, Vec<u8>)]) -> std::io::Resu
         central.extend_from_slice(&offset.to_le_bytes());
         central.extend_from_slice(name.as_bytes());
         offset = offset
-            .checked_add(local.len() as u32 + size)
+            .checked_add(local.len() as u32 + packed)
             .ok_or_else(|| std::io::Error::other("the zip outgrew 4 GB"))?;
     }
     out.write_all(&central)?;
@@ -76,6 +80,10 @@ pub fn write(out: &mut impl Write, files: &[(String, Vec<u8>)]) -> std::io::Resu
     end.extend_from_slice(&0u16.to_le_bytes()); // comment
     out.write_all(&end)
 }
+
+/// 1 January 1980, midnight — the first moment a zip can say. Every
+/// entry carries it, so the same files make the same archive.
+const DOS_TIME: u32 = (1 << 5 | 1) << 16;
 
 #[cfg(test)]
 mod tests {
@@ -104,7 +112,28 @@ mod tests {
         assert_eq!(&bytes[central..central + 4], &0x0201_4b50u32.to_le_bytes());
         let name_len = u16::from_le_bytes([bytes[central + 28], bytes[central + 29]]) as usize;
         assert_eq!(&bytes[central + 46..central + 46 + name_len], b"arm64-v8a/libapp.so");
-        // and the first file's bytes follow its local header
+        // and the first file's bytes follow its local header — stored:
+        // eight bytes do not deflate smaller
         assert_eq!(&bytes[30 + 19..30 + 19 + 8], b"\x7fELF one");
+    }
+
+    /// The system's unzip opens it and finds every file whole, where
+    /// there is one.
+    #[cfg(unix)]
+    #[test]
+    fn unzip_reads_it() {
+        let dir = std::env::temp_dir().join(format!("bunny-zip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = b"a deflated file, a deflated file, ".repeat(300);
+        let mut bytes = Vec::new();
+        write(&mut bytes, &[(String::from("Notes/notes.exe"), big.clone()), (String::from("Notes/tiny.txt"), b"hi".to_vec())]).unwrap();
+        let path = dir.join("app.zip");
+        std::fs::write(&path, &bytes).unwrap();
+        let Ok(out) = std::process::Command::new("unzip").arg("-p").arg(&path).arg("Notes/notes.exe").output() else { return };
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.stdout, big);
+        let tested = std::process::Command::new("unzip").arg("-tq").arg(&path).output().unwrap();
+        assert!(tested.status.success());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

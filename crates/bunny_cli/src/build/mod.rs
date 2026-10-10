@@ -4,8 +4,10 @@
 //! file is and a `build.log` with every command that made them.
 
 pub mod android;
+pub mod linux;
 pub mod macos;
 pub mod web;
+pub mod windows;
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
