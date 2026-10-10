@@ -728,6 +728,10 @@ mod probe {
             let length = if raw.is_null() { 0 } else { SysStringLen(raw) };
             println!("UIA closed read: HRESULT={hr:#x}, returned UTF-16 units={length}");
             assert_eq!(
+                hr, 0x80040201u32 as i32,
+                "disconnected reads must report UIA_E_ELEMENTNOTAVAILABLE"
+            );
+            assert_eq!(
                 length, 0,
                 "closed provider must not export its former value"
             );
@@ -736,7 +740,10 @@ mod probe {
             let replacement = SysAllocStringLen(words.as_ptr(), (words.len() - 1) as u32);
             let hr = (current_value.table::<ValuePattern>().set)(current_value.0, replacement);
             SysFreeString(replacement);
-            assert!(hr < 0, "closed provider must refuse writes");
+            assert_eq!(
+                hr, 0x80040201u32 as i32,
+                "disconnected writes must report UIA_E_ELEMENTNOTAVAILABLE"
+            );
             println!("UIA closed write: HRESULT={hr:#x}");
             println!(
                 "UIA native client: roles, value/focus/actions, dynamic names, stable IDs, password, moved bounds, modal exclusion, retired and closed providers verified"
