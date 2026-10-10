@@ -592,6 +592,15 @@ GPU frame and leaves in the same transaction. A window that has required Metal
 keeps it; this is not a promise of zero CPU for every scene or after promotion.
 The explicit CPU override, iOS renderer and offscreen GPU are unchanged.
 
+The Metal presentation contract must survive that handoff. Once a layer needs
+transactional presentation, later frames retain it and submit through the same
+transactional path. An inner commit may still belong to an outer AppKit
+transaction: resetting the flag between two startup frames can discard both,
+leaving a gray window with only its independent live/patch regions visible.
+The `window_presentation` Apple example reproduces this ordering in a real
+window and checks visible startup, repeated/partial frames, resize and retained
+pixels after resource release. It adds no redraw source or idle timer.
+
 The fixed six-pair table-rest observation compares the retained prior build
 with the native-base candidate on the same machine and 10,000-row fixture.
 Each process runs for 20 seconds; two kernel-counter reads cover 10–18 seconds
