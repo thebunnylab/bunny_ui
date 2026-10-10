@@ -10,6 +10,8 @@ reading order. Collection schedules no timer. Activating or deactivating it
 rebuilds retained view metadata through the existing environment invalidation
 path; application state remains in the identity arena. With collection disabled,
 ordinary text and buttons allocate no semantic metadata.
+For named scenes, capture and environment invalidation rebuild only the owning
+scene. Other windows keep their retained callbacks until their own next frame.
 
 Text supplies its displayed words. A button combines the names in its label
 without exposing those words as duplicate children. A field defaults to its
