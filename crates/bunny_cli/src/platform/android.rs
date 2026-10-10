@@ -103,6 +103,7 @@ pub fn build(project: &Project, options: &Options, toolchain: &Toolchain, serial
         // 16 KB pages, which Android 15 devices may use and Play requires;
         // after `--`, so it reaches this crate alone and survives RUSTFLAGS
         rustc_args: vec![String::from("-C"), String::from("link-arg=-Wl,-z,max-page-size=16384")],
+        quiet: false,
     })?;
     let shared = built.artifact;
     check_entry(toolchain, &shared)?;

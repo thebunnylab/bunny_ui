@@ -61,6 +61,7 @@ pub fn build(project: &Project, options: &Options, dev: bool) -> Result<Site> {
         features: options.features.clone(),
         env: project.build_env(),
         rustc_args: Vec::new(),
+        quiet: false,
     })?;
     let bytes = fs::read(&built.artifact).map_err(error::at(&built.artifact))?;
     let exports = wasm::exports(&bytes).map_err(|why| Error::new(format!("{}: {why}", built.artifact.display())))?;

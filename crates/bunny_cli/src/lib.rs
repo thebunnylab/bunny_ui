@@ -15,6 +15,7 @@ pub mod commands;
 pub mod devices;
 pub mod error;
 pub mod formats;
+pub mod hot;
 pub mod ids;
 pub mod json;
 pub mod keys;

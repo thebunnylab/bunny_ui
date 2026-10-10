@@ -47,6 +47,8 @@ pub struct Build {
     /// Passed to rustc for the final crate alone (after `--`): a flag
     /// that does not rebuild the dependencies.
     pub rustc_args: Vec<String>,
+    /// Without cargo's progress lines: only what the compiler says.
+    pub quiet: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -67,6 +69,10 @@ pub struct Built {
     /// The folder of every resolved package that matters to `bunny` —
     /// where `bunny-ui-web`'s glue lives.
     pub packages: Vec<(String, PathBuf)>,
+    /// The other packages' targets this build compiled again, by name —
+    /// a dependency that changed. The rest were fresh from an earlier
+    /// build.
+    pub rebuilt: Vec<String>,
 }
 
 /// Runs the build. Cargo's progress and diagnostics go straight to the
@@ -100,6 +106,9 @@ pub fn build(spec: &Build) -> Result<Built> {
         command.arg("--features").arg(spec.features.join(","));
     }
     command.arg("--message-format=json-render-diagnostics");
+    if spec.quiet {
+        command.arg("--quiet");
+    }
     if std::io::stderr().is_terminal() {
         command.arg("--color=always");
     }
@@ -113,6 +122,7 @@ pub fn build(spec: &Build) -> Result<Built> {
     let mut child = command.spawn().map_err(|error| Error::new(format!("cargo: {error}")))?;
     let mut artifact = None;
     let mut packages = Vec::new();
+    let mut rebuilt = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         for line in BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
             let Ok(message) = json::parse(&line) else { continue };
@@ -125,6 +135,9 @@ pub fn build(spec: &Build) -> Result<Built> {
             };
             if let Some(dir) = Path::new(manifest).parent() {
                 packages.push((name.to_string(), dir.to_path_buf()));
+            }
+            if message.get("fresh").and_then(Value::as_bool) == Some(false) && Path::new(manifest) != spec.manifest {
+                rebuilt.push(name.to_string());
             }
             if Path::new(manifest) != spec.manifest {
                 continue;
@@ -154,5 +167,5 @@ pub fn build(spec: &Build) -> Result<Built> {
         return Err(Error::new("the build failed"));
     }
     let artifact = artifact.ok_or_else(|| Error::new("cargo built nothing `bunny` can run"))?;
-    Ok(Built { artifact, packages })
+    Ok(Built { artifact, packages, rebuilt })
 }
