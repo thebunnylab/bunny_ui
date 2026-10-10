@@ -298,3 +298,14 @@ The first demo prints a small interface to the terminal. The second opens a nati
 - Views are plain values. State lives in typed arenas behind small handles.
 - A render pass runs only the views that read changed state.
 - The layout protocol is a proposal from the parent and a response from the child.
+
+## License
+
+Bunny UI is source-available under the [PolyForm Perimeter License 1.0.1](LICENSE.md) with two additional permissions. In short:
+
+- **Build with it freely.** Applications, commercial ones included, can use Bunny UI without asking. Development tools such as IDEs count as applications.
+- **Sell what you build on top.** Component libraries, themes, templates and plugins that depend on Bunny UI from crates.io may be sold, as long as they don't copy its source or present themselves as a replacement for it.
+- **Fork it for free.** Forks and ports are welcome when nobody earns money from them: no sale, no paid support, hosting or premium features, no bundling into a paid product.
+- **Don't sell it as a competitor.** Offering a fork, port or rewrite built from this code as a commercial alternative to Bunny UI is not allowed.
+
+Extensions may say they are "for Bunny UI"; names that suggest an official product, such as "Bunny UI Pro", are reserved. [LICENSE.md](LICENSE.md) holds the binding terms; this summary does not replace them.
