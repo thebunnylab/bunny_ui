@@ -2177,7 +2177,7 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
         };
         unsafe {
             request(toplevel, 2, &mut [WlArgument { s: title_c.as_ptr() }]);
-            request(toplevel, 3, &mut [arg_s(c"bunny_ui")]);
+            request(toplevel, 3, &mut [arg_s(&crate::life::app_id())]); // set_app_id
             if !options.resizable {
                 // one size: the minimum and the maximum are the size
                 // asked for, and the compositor refuses the grab and the
@@ -2965,7 +2965,7 @@ fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height:
                     // over the window, floated by a tiling compositor
                     request(toplevel, 1, &mut [arg_o(parent_toplevel)]); // set_parent
                     request(toplevel, 2, &mut [WlArgument { s: dialog.title.as_ptr() }]);
-                    request(toplevel, 3, &mut [arg_s(c"bunny_ui")]);
+                    request(toplevel, 3, &mut [arg_s(&crate::life::app_id())]); // set_app_id
                     request(
                         toplevel,
                         8, // set_min_size

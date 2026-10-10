@@ -1,0 +1,36 @@
+//! The whole app lives in this library. `bunny_ui::app!` at the bottom
+//! starts it on every platform: the window on the desktop and iOS, the
+//! activity on Android, the page on the web. `src/main.rs` only calls
+//! `run()`.
+
+#![forbid(unsafe_code)]
+
+use bunny_ui::prelude::*;
+
+/// A counter: one piece of state, a label that reads it, a button that
+/// changes it. A tap updates the label alone — the body does not run
+/// again.
+#[derive(Clone, Copy)]
+struct Counter {
+    count: State<i32>,
+}
+
+impl Component for Counter {
+    fn body(self) -> impl View {
+        vstack!(
+            text("Hello from bunny-ui").font(Font::Title),
+            text!("You tapped {} times", self.count),
+            spacer(),
+            button(text("Tap me"), move || self.count.add(1)),
+        )
+        .alignment(HorizontalAlignment::Leading)
+        .padding()
+    }
+}
+
+/// The first view the app shows.
+fn home() -> impl View {
+    Counter { count: State::new(0) }
+}
+
+bunny_ui::app!(home, bunny_ui::AppConfig::new().size(420.0, 640.0));

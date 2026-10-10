@@ -1,11 +1,8 @@
-//! The counter from one `main` on every native platform: the facade
-//! picks the shell, the application never names one.
+//! The counter from one line on every platform: `app!` writes the entry
+//! each target expects, and the application never names a shell.
 //!
 //! cargo run -p bunny-ui --example counter
 
-#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
-
-use bunny_ui::layout::Size;
 use bunny_ui::prelude::*;
 
 #[derive(Clone, Copy)]
@@ -25,11 +22,12 @@ impl Component for Counter {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn main() {
-    let counter = Counter { count: State::new(0) };
-    bunny_ui::run_window("bunny_ui", Size { width: 280.0, height: 180.0 }, counter);
+fn home() -> impl View {
+    Counter { count: State::new(0) }
 }
 
-#[cfg(target_arch = "wasm32")]
-fn main() {} // the web starts from the page: `bunny_ui::platform::start`
+bunny_ui::app!(home, bunny_ui::AppConfig::new().title("bunny_ui").size(280.0, 180.0));
+
+fn main() {
+    run()
+}

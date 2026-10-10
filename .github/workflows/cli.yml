@@ -1,0 +1,167 @@
+name: CLI
+
+on:
+  pull_request:
+    paths:
+      - 'crates/bunny_cli/**'
+      - 'crates/bunny_ui_facade/**'
+      - 'crates/bunny_ui_hot/**'
+      - 'crates/bunny_ui_dylib/**'
+      - 'crates/bunny_ui_web/glue/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.gitattributes'
+      - '.github/workflows/cli.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, windows-2025, macos-26]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Pinned compiler
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component clippy
+          rustup override set 1.98.1
+      - name: Tests and strict lints
+        run: |
+          cargo test -p bunny-cli --locked
+          cargo clippy -p bunny-cli --locked --all-targets -- -D warnings
+      - name: The published crate carries its templates
+        run: |
+          # `cargo install` builds from the package: a template left out
+          # of it is a `bunny new` with nothing to write
+          # (compared with `/` and without `\r`, however the host prints paths)
+          cargo package -p bunny-cli --locked --list --allow-dirty | tr -d '\r' | tr '\\' '/' > package.txt
+          for file in templates/android/gradlew templates/app/Cargo.toml.tmpl templates/LICENSE; do
+            grep -qx "$file" package.txt || { echo "missing from the package: $file"; cat package.txt; exit 1; }
+          done
+
+  new-project:
+    name: a new project builds everywhere
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Pinned compiler and the targets
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
+          rustup target add wasm32-unknown-unknown aarch64-linux-android aarch64-apple-ios \
+            x86_64-pc-windows-msvc x86_64-unknown-linux-gnu
+      - name: bunny new, then cargo on the host and every target
+        run: cargo test -p bunny-cli --locked --test new_project -- --ignored
+      - name: bunny build web and macos on a new project
+        run: cargo test -p bunny-cli --locked --test build -- --ignored
+
+  hot-reload:
+    name: hot reload loads new code (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, windows-2025, macos-26]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Pinned compiler
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
+      - name: The Linux shell's link-time libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb1-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-shm0-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libdbus-1-dev libsecret-1-dev libfontconfig-dev libfreetype-dev libharfbuzz-dev
+      - name: Two generations into a running app, without a window
+        # the binary on the framework's shared library loads each build of
+        # the app's library and draws it as text (BUNNY_HOT_CHECK): the
+        # load, the entry and the swap on every desktop, no screen needed
+        run: cargo test -p bunny-cli --locked --test hot_reload -- --ignored
+
+  android-build:
+    name: bunny build linux and android
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Pinned compiler and the targets
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
+          rustup target add wasm32-unknown-unknown aarch64-linux-android
+      - name: The Linux shell's link-time libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb1-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-shm0-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libdbus-1-dev libsecret-1-dev libfontconfig-dev libfreetype-dev libharfbuzz-dev
+      - name: The Android platform the template compiles against
+        # the runner's SDK has its terms accepted; this is a no-op when
+        # the image already carries the platform
+        run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36"'
+      - name: The web's site, the Linux tarball, a signed App Bundle and APK
+        # the runner's Android SDK, NDK and JDK; the test makes a
+        # throwaway upload key with keytool
+        env:
+          BUNNY_TEST_ANDROID: "1"
+        run: cargo test -p bunny-cli --locked --test build -- --ignored
+
+  windows-build:
+    name: bunny build windows
+    runs-on: windows-2025
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Pinned compiler and the web's target
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
+          rustup target add wasm32-unknown-unknown
+      - name: A throwaway code-signing certificate
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=bunny test" -CertStoreLocation Cert:\CurrentUser\My
+          $password = ConvertTo-SecureString -String "test1234" -Force -AsPlainText
+          $pfx = Join-Path $env:RUNNER_TEMP "bunny-test.pfx"
+          Export-PfxCertificate -Cert $cert -FilePath $pfx -Password $password | Out-Null
+          "BUNNY_WINDOWS_PFX=$pfx" >> $env:GITHUB_ENV
+          "BUNNY_WINDOWS_PFX_PASSWORD=test1234" >> $env:GITHUB_ENV
+      - name: The web's site and the signed executable with its resources
+        run: cargo test -p bunny-cli --locked --test build -- --ignored

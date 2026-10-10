@@ -31,12 +31,21 @@ library or a theme, leaves the shell to the application:
 bunny-ui = { version = "0.2", default-features = false }
 ```
 
+To start an app with every platform's files already in place, the `bunny`
+command creates one:
+
+```bash
+cargo install bunny-cli
+bunny new my_app
+```
+
 ## Quick look
 
 ```rust
-use bunny_ui::layout::Size;
+// src/main.rs
 use bunny_ui::prelude::*;
 
+// A component: its state, and the body that shows it.
 #[derive(Clone, Copy)]
 struct Counter {
     count: State<i32>,
@@ -51,17 +60,30 @@ impl Component for Counter {
     }
 }
 
+// The first view the app shows.
+fn home() -> impl View {
+    Counter { count: State::new(0) }
+}
+
+// Writes `run()`: it opens the window and puts `home()` in it.
+bunny_ui::app!(home, bunny_ui::AppConfig::new().size(280.0, 180.0));
+
 fn main() {
-    let counter = Counter { count: State::new(0) };
-    bunny_ui::run_window("Counter", Size { width: 280.0, height: 180.0 }, counter);
+    run()
 }
 ```
 
-The text node records the read. A tap changes the state and updates that node
-without running the component body again. `text(self.count)` also binds directly;
-`text!("Count: {}", self.count)` adds formatting. The same `main` opens a native
-window on macOS, iOS, Windows, Linux and Android; the web starts from the page
-(`bunny_ui::platform::start`).
+`main` calls `run()`, `run()` opens the window, the window shows `home()`, and
+`home()` builds the `Counter`. The text node records the read: a tap changes the
+state and updates that node without running the body again. `text(self.count)`
+also binds directly; `text!("Count: {}", self.count)` adds formatting.
+
+That file runs on macOS, Windows, Linux and iOS. A project from `bunny new`
+keeps the same code in `src/lib.rs`, and `src/main.rs` is the one line
+`my_app::run()` — the package's name, and the `run` that `app!` wrote. Android
+and the web start from the library, not from a `main`: `app!` writes their
+entries too, the Android activity and the page's `start` export. `bunny run`
+reloads that library hot.
 
 ## Signals and subscriptions
 
@@ -302,6 +324,7 @@ cargo test --features svg   # the icon converter's parser rides the flag
 The core lives in `crates/bunny_ui` and publishes as `bunny-ui-core`;
 `crates/bunny_ui_facade` publishes as `bunny-ui`, the crate an application
 adds. Each platform shell is its own crate, and the facade picks it by target.
+`crates/bunny_cli` is the `bunny` command (`bunny-cli`).
 
 ## Demos
 

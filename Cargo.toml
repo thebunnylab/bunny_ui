@@ -4,6 +4,9 @@ members = [
     "crates/motor",
     "crates/bunny_ui",
     "crates/bunny_ui_facade",
+    "crates/bunny_ui_hot",
+    "crates/bunny_ui_dylib",
+    "crates/bunny_cli",
     "crates/bunny_ui_apple",
     "crates/bunny_ui_vulkan",
     "crates/bunny_ui_android",
@@ -47,6 +50,8 @@ bunny-ui-windows = { path = "crates/bunny_ui_windows", version = "0.2.0" }
 bunny-ui-linux = { path = "crates/bunny_ui_linux", version = "0.2.0" }
 bunny-ui-android = { path = "crates/bunny_ui_android", version = "0.2.0" }
 bunny-ui-web = { path = "crates/bunny_ui_web", version = "0.2.0" }
+bunny-ui-hot = { path = "crates/bunny_ui_hot", version = "0.2.0" }
+bunny-ui-dylib = { path = "crates/bunny_ui_dylib", version = "0.2.0" }
 countries-core = { path = "crates/countries_core" }
 
 countries-pure = { path = "apps/countries_pure" }

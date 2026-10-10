@@ -3,11 +3,10 @@
 //! This is the crate an application adds. It re-exports the core
 //! (`bunny_ui_core`) whole and, with the default `shell` feature, the
 //! shell of the target it compiles for: macOS, iOS, Windows, Linux,
-//! Android or the web. On every native one the same `main` opens the
-//! window:
+//! Android or the web. One line starts the app on all of them —
+//! [`app!`] writes the entry each target expects:
 //!
 //! ```no_run
-//! use bunny_ui::layout::Size;
 //! use bunny_ui::prelude::*;
 //!
 //! #[derive(Clone, Copy)]
@@ -24,23 +23,47 @@
 //!     }
 //! }
 //!
+//! fn home() -> impl View {
+//!     Counter { count: State::new(0) }
+//! }
+//!
+//! bunny_ui::app!(home, bunny_ui::AppConfig::new().size(280.0, 180.0));
+//!
 //! fn main() {
-//!     let counter = Counter { count: State::new(0) };
-//!     bunny_ui::run_window("Counter", Size { width: 280.0, height: 180.0 }, counter);
+//!     run()
 //! }
 //! ```
 //!
-//! What a shell offers beyond that one window — who draws a desktop
-//! window's title bar, several windows, the Android activity, the web's
-//! start functions — lives in `platform`, the shell crate itself.
+//! Underneath, `run_window` opens the window on every native platform
+//! with the same signature. What a shell offers beyond that one window
+//! — who draws a desktop window's title bar, several windows, the
+//! Android activity, the web's start functions — lives in `platform`,
+//! the shell crate itself.
 //!
 //! A crate that only builds views, such as a component library or a
 //! theme, depends on `bunny-ui` with `default-features = false`: the
 //! views without a shell, the window left to the application.
+//!
+//! `bunny run` reloads an app hot on the desktop, the iOS Simulator and
+//! Android. It builds the app
+//! with the `hot` feature: the framework comes in as one shared library,
+//! and [`app!`] makes each new build of the app's library loadable by
+//! the running app, which keeps its state. An app does not turn the
+//! feature on itself.
 
 #![forbid(unsafe_code)]
 
+mod entry;
+
+// A hot build reaches the framework through its one shared library.
+// Naming the crate is what links it: without the name, the compiler
+// would link the framework into the app statically and leave the shared
+// library out.
+#[cfg(all(feature = "hot", any(target_os = "macos", target_os = "ios", target_os = "windows", target_os = "linux", target_os = "android")))]
+extern crate bunny_ui_dylib as _;
+
 pub use bunny_ui_core::*;
+pub use entry::{__private, AppConfig};
 
 /// The shell of this target, whole.
 #[cfg(all(feature = "shell", target_os = "macos"))]

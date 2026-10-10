@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A pure android.app.NativeActivity: the system dlopens the app's
+     shared object and calls ANativeActivity_onCreate, which
+     `bunny_ui::app!` defines; there is no Java. configChanges keeps the
+     activity alive across a rotation and the theme switch — the shell
+     hears them as events. The ${…} values come from local.properties,
+     which `bunny` writes on every build. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-feature android:name="android.hardware.vulkan.level" android:required="false" />
+
+    <!-- the shell asks the person at the first post (API 33+); this
+         line is what lets it ask -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- enableOnBackInvokedCallback="false": the back gesture reaches the
+         activity as the back key, which the shell hears, instead of the
+         predictive animation a target of API 36 would play -->
+    <application
+        android:allowBackup="false"
+        android:enableOnBackInvokedCallback="false"
+        android:hasCode="false"
+        android:label="${bunnyAppLabel}"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+        <activity
+            android:name="android.app.NativeActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|locale|layoutDirection"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="${bunnyLibName}" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
