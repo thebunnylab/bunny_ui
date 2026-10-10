@@ -1,5 +1,6 @@
 //! A window may start with native opaque bands or a sparse foreground over
-//! a solid base, without a Metal queue. Unsupported updates promote once,
+//! a solid base, or a bounded frame with small native patches, without a
+//! Metal queue. Unsupported updates promote once,
 //! in one transaction, keeping the native cover until a GPU frame succeeds.
 
 use super::*;
@@ -246,10 +247,153 @@ impl SparseScene {
     }
 }
 
+/// One native patch is measured against the immutable base, never the last
+/// patch, so moving or shrinking ink cannot expose stale pixels underneath.
+struct NativePatch {
+    layer: Id,
+    backing: software_patch::Backing,
+    scene: Option<software_patch::Scene>,
+}
+
+impl NativePatch {
+    unsafe fn new(root: Id, scale: usize) -> Option<Self> {
+        unsafe {
+            let layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
+            if layer.is_null() {
+                return None;
+            }
+            kill_layer_actions(layer);
+            msg_void_bool(layer, sel("setOpaque:"), 1);
+            msg_void_bool(layer, sel("setHidden:"), 1);
+            msg_void_f64(layer, sel("setContentsScale:"), scale as f64);
+            msg_void_id_u64(root, sel("insertSublayer:atIndex:"), layer, 0);
+            Some(Self {
+                layer,
+                backing: software_patch::Backing::default(),
+                scene: None,
+            })
+        }
+    }
+
+    unsafe fn paint(
+        &mut self,
+        scene: software_patch::Scene,
+        physical: (usize, usize),
+        text: &dyn TextEngine,
+        images: &dyn ImageEngine,
+    ) -> bool {
+        unsafe {
+            let surface = if self
+                .scene
+                .as_ref()
+                .is_some_and(|prior| prior.matches(&scene))
+            {
+                None
+            } else {
+                let bitmap = scene.raster(text, images);
+                let Some(surface) = self.backing.prepare(&bitmap) else {
+                    return false;
+                };
+                Some(surface)
+            };
+            let transaction = class("CATransaction");
+            msg_void(transaction, sel("begin"));
+            msg_void_bool(transaction, sel("setDisableActions:"), 1);
+            if let Some(surface) = surface {
+                msg_void_rect(
+                    self.layer,
+                    sel("setFrame:"),
+                    Patch::frame(scene.bounds(), physical, scene.scale()),
+                );
+                msg_void_id(self.layer, sel("setContents:"), surface);
+            }
+            msg_void_bool(self.layer, sel("setHidden:"), 0);
+            msg_void(transaction, sel("commit"));
+            self.scene = Some(scene);
+            true
+        }
+    }
+}
+
+impl Drop for NativePatch {
+    fn drop(&mut self) {
+        unsafe {
+            msg_void(self.layer, sel("removeFromSuperlayer"));
+            msg_void_id(self.layer, sel("setContents:"), null_mut());
+            msg_void(self.layer, sel("release"));
+        }
+    }
+}
+
+struct NativeUpdates {
+    base: KeptFrame,
+    current: KeptFrame,
+    patch: Option<NativePatch>,
+}
+
+impl NativeUpdates {
+    fn present(&mut self, frame: scroll_bands::Frame<'_>) -> bool {
+        let scroll_bands::Frame {
+            root,
+            display,
+            physical,
+            scale,
+            canvas,
+            text,
+            images,
+            boxes,
+        } = frame;
+        if self.base.1 != physical || self.base.2 != scale || self.base.3 != canvas {
+            return false;
+        }
+        let damage = list_damage(
+            self.base.0.as_slice(),
+            display.as_slice(),
+            scale,
+            physical,
+            PATCH_COMMANDS,
+            boxes,
+            text,
+        );
+        match damage {
+            ListDamage::Same => {
+                if let Some(patch) = &self.patch {
+                    unsafe { msg_void_bool(patch.layer, sel("setHidden:"), 1) };
+                }
+                self.current = self.base.clone();
+                true
+            }
+            ListDamage::Rect(rect) => {
+                let Some(rect) = patch_box(rect, physical) else {
+                    return false;
+                };
+                let Some(scene) =
+                    software_patch::Scene::new(display, rect, scale, canvas, text, boxes)
+                else {
+                    return false;
+                };
+                if self.patch.is_none() {
+                    self.patch = unsafe { NativePatch::new(root, scale) };
+                }
+                let Some(patch) = &mut self.patch else {
+                    return false;
+                };
+                if !unsafe { patch.paint(scene, physical, text, images) } {
+                    return false;
+                }
+                self.current = (Rc::new(display.clone()), physical, scale, canvas);
+                true
+            }
+            ListDamage::Whole => false,
+        }
+    }
+}
+
 enum NativeState {
     Choosing,
     Bands(KeptFrame),
     Sparse(KeptFrame),
+    Patched(Box<NativeUpdates>),
     Software(Option<KeptFrame>),
 }
 
@@ -446,6 +590,12 @@ impl WindowPresenter {
                     && *c == canvas
                     && prior.as_slice() == display.as_slice()
             }
+            NativeState::Patched(held) => {
+                held.current.1 == physical
+                    && held.current.2 == scale
+                    && held.current.3 == canvas
+                    && held.current.0.as_slice() == display.as_slice()
+            }
             NativeState::Software(prior) => frame_repeats(prior, display, physical, scale, canvas),
         };
         if repeats {
@@ -479,6 +629,36 @@ impl WindowPresenter {
             && native.paint_sparse(scene, size, scale, text, images)
         {
             native.state = NativeState::Sparse((Rc::new(display.clone()), physical, scale, canvas));
+            return;
+        }
+        if matches!(native.state, NativeState::Choosing)
+            && !live
+            && !bands
+            && let Some(scene) =
+                software_patch::Scene::base(display, physical, scale, canvas, text, &native.boxes)
+            && unsafe { native.base.paint(scene.raster(text, images), size, scale) }
+        {
+            let base = (Rc::new(display.clone()), physical, scale, canvas);
+            native.state = NativeState::Patched(Box::new(NativeUpdates {
+                current: base.clone(),
+                base,
+                patch: None,
+            }));
+            return;
+        }
+        if let NativeState::Patched(updates) = &mut native.state
+            && !live
+            && updates.present(scroll_bands::Frame {
+                root: native.base.raw,
+                display,
+                physical,
+                scale,
+                canvas,
+                text,
+                images,
+                boxes: &native.boxes,
+            })
+        {
             return;
         }
         let admitted = match &native.state {
@@ -519,7 +699,7 @@ impl WindowPresenter {
                 }
                 false
             }
-            NativeState::Sparse(_) => false,
+            NativeState::Sparse(_) | NativeState::Patched(_) => false,
             NativeState::Software(_) => true,
         };
         if admitted {
@@ -660,6 +840,187 @@ mod tests {
             corner_radius: Corners::ZERO,
         });
         DisplayList::from(commands)
+    }
+
+    #[test]
+    fn a_bounded_native_editor_keeps_small_edits_off_metal() {
+        use bunny_ui::prelude::*;
+        #[derive(Clone)]
+        struct Editor {
+            text: State<String>,
+        }
+        impl Component for Editor {
+            fn body(self) -> impl View {
+                text_editor("", self.text.binding())
+                    .font_family("Menlo")
+                    .font_size(13.0)
+                    .auto_focus()
+            }
+        }
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            for (rows, scale) in [(400, 1), (30_000, 1), (400, 2), (30_000, 2)] {
+                let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+                let text = Rc::new(crate::text::CoreTextEngine::new());
+                let runtime = Runtime::new().text_engine(text.clone());
+                runtime.drop_unseen();
+                let editor = Editor {
+                    text: State::new(
+                        (0..rows)
+                            .map(|row| format!("Line {row}: the editor keeps a long document.\n"))
+                            .collect(),
+                    ),
+                };
+                let size = Size {
+                    width: 1280.0,
+                    height: 800.0,
+                };
+                let mut presenter = WindowPresenter::attach(layer, scale as f64).unwrap();
+                for step in 0..6 {
+                    if step > 0 {
+                        let edit = if step % 2 == 1 {
+                            EditCommand::Insert("x".into())
+                        } else {
+                            EditCommand::Backspace
+                        };
+                        assert!(runtime.key(edit).applied);
+                    }
+                    let display = runtime.display_frame(&editor, size);
+                    presenter.present(
+                        &display,
+                        size,
+                        scale,
+                        bunny_ui::theme::canvas(),
+                        &*text,
+                        &RawImages::default(),
+                        false,
+                    );
+                    assert!(
+                        matches!(presenter.strategy, Strategy::Native(_)),
+                        "rows={rows}, scale={scale}, edit={step} must not allocate a Metal queue"
+                    );
+                    assert!(msg_id(layer, sel("device")).is_null());
+                }
+                assert!(presenter.rest());
+                drop(presenter);
+                msg_void(layer, sel("release"));
+            }
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    #[test]
+    fn native_patches_reconstruct_moving_and_shrinking_ink_against_the_base() {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let size = Size {
+                width: 320.0,
+                height: 240.0,
+            };
+            let display = |x, word: &str| {
+                DisplayList::from(vec![
+                    DrawCommand::FillRect {
+                        rect: rect(0.0, 0.0, 320.0, 240.0),
+                        color: Color::WHITE,
+                        corner_radius: Corners::all(5.0),
+                    },
+                    DrawCommand::PushClip {
+                        rect: rect(0.0, 0.0, 320.0, 240.0),
+                        corner_radius: Corners::all(5.0),
+                    },
+                    DrawCommand::TextLine {
+                        origin: Point { x, y: 30.5 },
+                        content: word.into(),
+                        range: (0, word.len()),
+                        color: Color::BLACK,
+                        font: FontSpec::DEFAULT,
+                    },
+                    DrawCommand::PopClip,
+                ])
+            };
+            for scale in [1, 2] {
+                let mut presenter = WindowPresenter::attach(layer, scale as f64).unwrap();
+                let physical = (320 * scale, 240 * scale);
+                for (x, word) in [
+                    (20.5, "old"),
+                    (20.5, "new longer"),
+                    (80.5, "new"),
+                    (20.5, "old"),
+                    (0.5, "clipped"),
+                ] {
+                    let commands = display(x, word);
+                    presenter.present(
+                        &commands,
+                        size,
+                        scale,
+                        Color::BLACK,
+                        &PixelFont,
+                        &RawImages::default(),
+                        false,
+                    );
+                    let Strategy::Native(native) = &presenter.strategy else {
+                        panic!("small changes stay native")
+                    };
+                    let NativeState::Patched(held) = &native.state else {
+                        panic!("rounded base uses native patches")
+                    };
+                    let mut composed = rasterize_with(
+                        &held.base.0,
+                        physical.0,
+                        physical.1,
+                        scale,
+                        Color::BLACK,
+                        &PixelFont,
+                        &RawImages::default(),
+                    )
+                    .to_rgba_bytes();
+                    if held.current.0.as_slice() != held.base.0.as_slice() {
+                        let patch = held.patch.as_ref().unwrap().scene.as_ref().unwrap();
+                        let pixels = patch.raster(&PixelFont, &RawImages::default());
+                        let bytes = pixels.to_rgba_bytes();
+                        let bounds = patch.bounds();
+                        for row in 0..pixels.height() {
+                            let to =
+                                ((bounds.1 as usize + row) * physical.0 + bounds.0 as usize) * 4;
+                            let from = row * pixels.width() * 4;
+                            composed[to..to + pixels.width() * 4]
+                                .copy_from_slice(&bytes[from..from + pixels.width() * 4]);
+                        }
+                    }
+                    let expected = rasterize_with(
+                        &commands,
+                        physical.0,
+                        physical.1,
+                        scale,
+                        Color::BLACK,
+                        &PixelFont,
+                        &RawImages::default(),
+                    )
+                    .to_rgba_bytes();
+                    assert_eq!(composed, expected, "scale={scale}, x={x}, word={word}");
+                }
+                // A resize cannot stretch the old base/patch composition.
+                presenter.present(
+                    &display(0.5, "clipped"),
+                    Size {
+                        width: 400.0,
+                        height: 300.0,
+                    },
+                    scale,
+                    Color::BLACK,
+                    &PixelFont,
+                    &RawImages::default(),
+                    false,
+                );
+                assert!(matches!(presenter.strategy, Strategy::Metal(_)));
+                drop(presenter);
+                // Detach the device before exercising the next native seed.
+                msg_void_id(layer, sel("setDevice:"), null_mut());
+            }
+            msg_void(layer, sel("release"));
+            objc_autoreleasePoolPop(pool);
+        }
     }
 
     #[test]

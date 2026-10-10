@@ -11,6 +11,12 @@ const MAX_COMMANDS: usize = 64;
 const MAX_TEXT_BYTES: usize = 4096;
 const MAX_SURFACES: usize = 3;
 
+struct RasterBudget {
+    surface: usize,
+    text: usize,
+    paint: Option<usize>,
+}
+
 /// The bounded, translated scene that paints an entire opaque patch.
 pub(super) struct Scene {
     display: DisplayList,
@@ -29,13 +35,67 @@ impl Scene {
         text: &dyn TextEngine,
         cache: &MeasureCache,
     ) -> Option<Self> {
+        Self::with_budget(
+            display,
+            rect,
+            scale,
+            canvas,
+            text,
+            cache,
+            RasterBudget {
+                surface: MAX_PIXELS,
+                text: MAX_PIXELS,
+                paint: None,
+            },
+        )
+    }
+
+    /// A bounded first frame can seed a native base without a Metal queue.
+    /// Later frames still obey the much smaller patch budget.
+    pub(super) fn base(
+        display: &DisplayList,
+        physical: (usize, usize),
+        scale: usize,
+        canvas: Color,
+        text: &dyn TextEngine,
+        cache: &MeasureCache,
+    ) -> Option<Self> {
+        Self::with_budget(
+            display,
+            (
+                0,
+                0,
+                i64::try_from(physical.0).ok()?,
+                i64::try_from(physical.1).ok()?,
+            ),
+            scale,
+            canvas,
+            text,
+            cache,
+            RasterBudget {
+                surface: 8 * 1024 * 1024,
+                text: 2 * 1024 * 1024,
+                paint: Some(16 * 1024 * 1024),
+            },
+        )
+    }
+
+    fn with_budget(
+        display: &DisplayList,
+        rect: DamageRect,
+        scale: usize,
+        canvas: Color,
+        text: &dyn TextEngine,
+        cache: &MeasureCache,
+        budget: RasterBudget,
+    ) -> Option<Self> {
         let width = usize::try_from(rect.2.checked_sub(rect.0)?).ok()?;
         let height = usize::try_from(rect.3.checked_sub(rect.1)?).ok()?;
         if scale == 0
             || canvas.a != 255
             || width == 0
             || height == 0
-            || width.checked_mul(height)? > MAX_PIXELS
+            || width.checked_mul(height)? > budget.surface
         {
             return None;
         }
@@ -57,12 +117,33 @@ impl Scene {
         }
         let mut bytes = 0usize;
         let mut text_pixels = 0usize;
+        let mut paint_pixels = 0usize;
         for command in lifted.iter() {
             match command {
-                DrawCommand::FillRect { .. }
-                | DrawCommand::StrokeRect { .. }
-                | DrawCommand::PushClip { .. }
-                | DrawCommand::PopClip => {}
+                DrawCommand::FillRect { rect, .. } | DrawCommand::StrokeRect { rect, .. } => {
+                    if let Some(limit) = budget.paint {
+                        if ![
+                            rect.origin.x,
+                            rect.origin.y,
+                            rect.size.width,
+                            rect.size.height,
+                        ]
+                        .iter()
+                        .all(|value| value.is_finite())
+                        {
+                            return None;
+                        }
+                        if let Some(visible) = rect.intersection(logical) {
+                            let width = (visible.size.width * factor).ceil().max(0.0) as usize;
+                            let height = (visible.size.height * factor).ceil().max(0.0) as usize;
+                            paint_pixels = paint_pixels.checked_add(width.checked_mul(height)?)?;
+                            if paint_pixels > limit {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                DrawCommand::PushClip { .. } | DrawCommand::PopClip => {}
                 DrawCommand::TextLine {
                     range,
                     content,
@@ -80,7 +161,7 @@ impl Scene {
                     let width = (metrics.width * factor).ceil().max(0.0) as usize;
                     let height = (metrics.height() * factor).ceil().max(0.0) as usize;
                     text_pixels = text_pixels.checked_add(width.checked_mul(height)?)?;
-                    if text_pixels > MAX_PIXELS {
+                    if text_pixels > budget.text {
                         return None;
                     }
                 }

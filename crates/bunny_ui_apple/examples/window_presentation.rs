@@ -550,6 +550,68 @@ mod macos {
             }
             drop(growing);
             msg_void(growing_layer, sel("release"));
+            let patch_layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let mut patched = WindowPresenter::attach(patch_layer, 1.0).unwrap();
+            msg_arg(view, sel("setLayer:"), patch_layer);
+            patched.prime(SIZE.width, SIZE.height, 1);
+            for (x, width, expected, label) in [
+                (32.0, 64.0, RED, "native rounded base"),
+                (32.0, 16.0, GREEN, "native patch shrinks ink"),
+                (96.0, 32.0, GREEN, "native patch moves ink"),
+                (32.0, 64.0, RED, "native patch returns to base"),
+            ] {
+                let display = DisplayList::from(vec![
+                    DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point::ZERO,
+                            size: SIZE,
+                        },
+                        color: GREEN,
+                        corner_radius: Corners::all(12.0),
+                    },
+                    DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point { x, y: 32.0 },
+                            size: Size {
+                                width,
+                                height: 32.0,
+                            },
+                        },
+                        color: RED,
+                        corner_radius: Corners::ZERO,
+                    },
+                ]);
+                patched.present(&display, SIZE, 1, Color::BLACK, &PixelFont, &images, false);
+                assert!(
+                    msg_id(patch_layer, sel("device")).is_null(),
+                    "small patches keep the native base"
+                );
+                expect(window, GREEN, expected, label);
+                let moved = sample(window, 110, 48);
+                assert_eq!(
+                    moved[0] >= 128,
+                    x == 96.0,
+                    "the moved patch is visible without a trail"
+                );
+            }
+            assert!(patched.rest());
+            expect(window, GREEN, RED, "native patched idle");
+            patched.present(
+                &scene(RED, GREEN),
+                SIZE,
+                1,
+                Color::BLACK,
+                &PixelFont,
+                &images,
+                false,
+            );
+            assert!(
+                !msg_id(patch_layer, sel("device")).is_null(),
+                "a broad rewrite promotes"
+            );
+            expect(window, RED, GREEN, "native patched promotion");
+            drop(patched);
+            msg_void(patch_layer, sel("release"));
             msg_arg(window, sel("orderOut:"), null_mut());
             msg_bool(window, sel("setReleasedWhenClosed:"), 0);
             msg_void(window, sel("close"));
