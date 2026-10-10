@@ -121,6 +121,7 @@ macro_rules! __bunny_entry {
         const _: () = {
             $crate::platform::activity!($run);
         };
+        $crate::__bunny_hot_entry!($root);
     };
 }
 
@@ -147,27 +148,29 @@ macro_rules! __bunny_entry {
     };
 }
 
-/// The desktop and iOS: `main` calls `run`, nothing more to export.
+/// The desktop and iOS: `main` calls `run`; only a hot build exports
+/// anything.
 #[cfg(all(
     feature = "shell",
-    any(target_os = "macos", target_os = "ios", target_os = "windows", target_os = "linux"),
-    not(all(feature = "hot", any(target_os = "macos", target_os = "linux"))),
+    any(target_os = "macos", target_os = "ios", target_os = "windows", target_os = "linux")
 ))]
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __bunny_entry {
-    ($run:ident, $root:expr, $config:expr) => {};
+    ($run:ident, $root:expr, $config:expr) => {
+        $crate::__bunny_hot_entry!($root);
+    };
 }
 
-/// A hot build on the desktop (`bunny run`): `main` calls `run`, and
-/// each build of the app's library exports the entry of a generation —
-/// what the running app loads after a save. A function in the Rust ABI:
-/// only an app built by the same compiler loads it.
-#[cfg(all(feature = "shell", feature = "hot", any(target_os = "macos", target_os = "linux")))]
+/// A hot build (`bunny run`): each build of the app's library exports the
+/// entry of a generation — what the running app loads after a save. A
+/// function in the Rust ABI: only an app built by the same compiler
+/// loads it.
+#[cfg(all(feature = "hot", any(target_os = "macos", target_os = "ios", target_os = "windows", target_os = "linux", target_os = "android")))]
 #[doc(hidden)]
 #[macro_export]
-macro_rules! __bunny_entry {
-    ($run:ident, $root:expr, $config:expr) => {
+macro_rules! __bunny_hot_entry {
+    ($root:expr) => {
         const _: () = {
             fn root() -> $crate::__private::hot::Root {
                 $crate::__private::hot::Root::new(($root)())
@@ -179,6 +182,14 @@ macro_rules! __bunny_entry {
             }
         };
     };
+}
+
+/// Any other build exports no generation.
+#[cfg(not(all(feature = "hot", any(target_os = "macos", target_os = "ios", target_os = "windows", target_os = "linux", target_os = "android"))))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bunny_hot_entry {
+    ($root:expr) => {};
 }
 
 /// No shell, or a target without one: an app has nowhere to start.
@@ -213,7 +224,7 @@ pub mod __private {
     use bunny_ui_core::view::View;
 
     /// The part of hot reload inside the app.
-    #[cfg(all(feature = "hot", any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(feature = "hot", any(target_os = "macos", target_os = "ios", target_os = "windows", target_os = "linux", target_os = "android")))]
     pub use bunny_ui_hot as hot;
 
     /// Says who the app is, then opens its window with the first view.
@@ -226,7 +237,7 @@ pub mod __private {
             target_os = "linux",
             target_os = "android",
         ),
-        not(all(feature = "hot", any(target_os = "macos", target_os = "linux"))),
+        not(feature = "hot"),
     ))]
     pub fn run<V: View>(identity: Identity, config: AppConfig, root: impl FnOnce() -> V) {
         set_identity(identity);
@@ -238,11 +249,16 @@ pub mod __private {
     /// `bunny run` names, and each save brings the next one. The first
     /// view is built again with each generation's code, inside the pass,
     /// so the state it makes is found again — `root` runs more than once.
-    #[cfg(all(feature = "shell", feature = "hot", any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(feature = "shell", all(feature = "hot", any(target_os = "macos", target_os = "ios", target_os = "windows", target_os = "linux", target_os = "android"))))]
     pub fn run<V: View>(identity: Identity, config: AppConfig, root: impl Fn() -> V + 'static) {
         set_identity(identity);
         let title = config.title.unwrap_or_else(|| identity.name.to_string());
-        let root = hot::start(move || hot::Root::new(root()));
+        // Android names no folder an app may write but the activity's own
+        #[cfg(target_os = "android")]
+        let scratch = crate::platform::data_dir();
+        #[cfg(not(target_os = "android"))]
+        let scratch = None;
+        let root = hot::start(move || hot::Root::new(root()), scratch);
         crate::run_window(&title, config.size, root)
     }
 

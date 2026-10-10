@@ -15,5 +15,14 @@ pub use motor;
 #[cfg(target_os = "macos")]
 pub use bunny_ui_macos as platform;
 
+#[cfg(target_os = "ios")]
+pub use bunny_ui_ios as platform;
+
+#[cfg(target_os = "windows")]
+pub use bunny_ui_windows as platform;
+
 #[cfg(target_os = "linux")]
 pub use bunny_ui_linux as platform;
+
+#[cfg(target_os = "android")]
+pub use bunny_ui_android as platform;
