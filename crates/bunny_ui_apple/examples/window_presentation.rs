@@ -1,0 +1,307 @@
+//! Visible-window regression for a native-to-Metal handoff inside an outer
+//! Core Animation transaction. Run on an unlocked macOS desktop:
+//!
+//! `cargo run -p bunny-ui-apple --example window_presentation`
+//!
+//! Two startup frames arrive before the outer transaction commits. The last
+//! must be visible without input, including after a repeated frame, a small
+//! patch and an idle resource offer. The probe reads only its own window;
+//! capture unavailability is an error, never a successful pixel check.
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use bunny_ui::image_engine::RawImages;
+    use bunny_ui::layout::{Color, Corners, DisplayList, DrawCommand, Point, Rect, Size};
+    use bunny_ui::text_engine::PixelFont;
+    use bunny_ui_apple::ffi::{
+        CGPoint, CGRect, CGSize, Id, Sel, class, objc_autoreleasePoolPop, objc_autoreleasePoolPush,
+        sel,
+    };
+    use bunny_ui_apple::metal::WindowPresenter;
+    use std::ptr::null_mut;
+    use std::time::{Duration, Instant};
+
+    #[link(name = "AppKit", kind = "framework")]
+    unsafe extern "C" {}
+    #[allow(clashing_extern_declarations)]
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        #[link_name = "objc_msgSend"]
+        fn msg_id(o: Id, s: Sel) -> Id;
+        #[link_name = "objc_msgSend"]
+        fn msg_void(o: Id, s: Sel);
+        #[link_name = "objc_msgSend"]
+        fn msg_arg(o: Id, s: Sel, a: Id);
+        #[link_name = "objc_msgSend"]
+        fn msg_bool(o: Id, s: Sel, a: i8);
+        #[link_name = "objc_msgSend"]
+        fn msg_size(o: Id, s: Sel, a: CGSize);
+        #[link_name = "objc_msgSend"]
+        fn msg_rect(o: Id, s: Sel, a: CGRect) -> Id;
+        #[link_name = "objc_msgSend"]
+        fn msg_window(o: Id, s: Sel, a: CGRect, style: u64, backing: u64, defer: i8) -> Id;
+        #[link_name = "objc_msgSend"]
+        fn msg_date(o: Id, s: Sel, a: f64) -> Id;
+        #[link_name = "objc_msgSend"]
+        fn msg_integer(o: Id, s: Sel) -> i64;
+        #[link_name = "objc_msgSend"]
+        fn msg_id_arg(o: Id, s: Sel, a: Id) -> Id;
+        #[link_name = "objc_msgSend"]
+        fn msg_color(o: Id, s: Sel, x: i64, y: i64) -> Id;
+        #[link_name = "objc_msgSend"]
+        fn msg_rgba(o: Id, s: Sel, r: *mut f64, g: *mut f64, b: *mut f64, a: *mut f64);
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGWindowListCreateImage(r: CGRect, options: u32, window: u32, image_options: u32) -> Id;
+        fn CGImageRelease(image: Id);
+    }
+
+    const SIZE: Size = Size {
+        width: 320.0,
+        height: 240.0,
+    };
+    const RED: Color = Color::hex(0xff0000);
+    const GREEN: Color = Color::hex(0x00ff00);
+
+    fn scene(base: Color, patch: Color) -> DisplayList {
+        DisplayList::from(vec![
+            DrawCommand::FillRect {
+                rect: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: SIZE,
+                },
+                color: base,
+                corner_radius: Corners::ZERO,
+            },
+            DrawCommand::FillRect {
+                rect: Rect {
+                    origin: Point { x: 32.0, y: 32.0 },
+                    size: Size {
+                        width: 32.0,
+                        height: 32.0,
+                    },
+                },
+                color: patch,
+                corner_radius: Corners::ZERO,
+            },
+        ])
+    }
+
+    // This executable owns the AppKit main thread. No event handlers, timers,
+    // clicks or redraw requests can repair the submitted frame while it waits.
+    unsafe fn pump() {
+        unsafe {
+            let until = msg_date(class("NSDate"), sel("dateWithTimeIntervalSinceNow:"), 0.05);
+            msg_arg(
+                msg_id(class("NSRunLoop"), sel("currentRunLoop")),
+                sel("runUntilDate:"),
+                until,
+            );
+        }
+    }
+
+    unsafe fn sample(window: Id, x: i64, y: i64) -> [u8; 3] {
+        unsafe {
+            // IncludingWindow | BoundsIgnoreFraming | NominalResolution:
+            // only this process's window, with coordinates in window points.
+            let image = CGWindowListCreateImage(
+                CGRect {
+                    origin: CGPoint {
+                        x: f64::INFINITY,
+                        y: f64::INFINITY,
+                    },
+                    size: CGSize {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                },
+                8,
+                msg_integer(window, sel("windowNumber")) as u32,
+                1 | 16,
+            );
+            assert!(!image.is_null(), "own-window capture unavailable");
+            let bitmap = msg_id_arg(
+                msg_id(class("NSBitmapImageRep"), sel("alloc")),
+                sel("initWithCGImage:"),
+                image,
+            );
+            let color = msg_color(bitmap, sel("colorAtX:y:"), x, y);
+            let rgb = msg_id_arg(
+                color,
+                sel("colorUsingColorSpace:"),
+                msg_id(class("NSColorSpace"), sel("sRGBColorSpace")),
+            );
+            assert!(!rgb.is_null(), "capture must convert to sRGB");
+            let (mut r, mut g, mut b, mut a) = (0.0, 0.0, 0.0, 0.0);
+            msg_rgba(
+                rgb,
+                sel("getRed:green:blue:alpha:"),
+                &mut r,
+                &mut g,
+                &mut b,
+                &mut a,
+            );
+            msg_void(bitmap, sel("release"));
+            CGImageRelease(image);
+            [r, g, b].map(|channel| (channel * 255.0).round() as u8)
+        }
+    }
+
+    unsafe fn expect(window: Id, base: Color, patch: Color, label: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            unsafe { pump() };
+            let actual = unsafe { [sample(window, 200, 150), sample(window, 48, 48)] };
+            let expected = [[base.r, base.g, base.b], [patch.r, patch.g, patch.b]];
+            // This is a presence test, not colorimetric parity. Saturated
+            // red/green and dark/white markers have distinct channel masks
+            // after the display profile's conversion too.
+            if actual
+                .iter()
+                .flatten()
+                .zip(expected.iter().flatten())
+                .all(|(a, b)| (*a >= 128) == (*b >= 128))
+            {
+                println!("{label}: {actual:?}");
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{label}: visible {actual:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    pub fn run() {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let app = msg_id(class("NSApplication"), sel("sharedApplication"));
+            let frame = CGRect {
+                origin: CGPoint { x: 100.0, y: 100.0 },
+                size: CGSize {
+                    width: SIZE.width,
+                    height: SIZE.height,
+                },
+            };
+            let window = msg_window(
+                msg_id(class("NSWindow"), sel("alloc")),
+                sel("initWithContentRect:styleMask:backing:defer:"),
+                frame,
+                0,
+                2,
+                0,
+            );
+            let view = msg_rect(
+                msg_id(class("NSView"), sel("alloc")),
+                sel("initWithFrame:"),
+                frame,
+            );
+            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let mut presenter = WindowPresenter::attach(layer, 1.0).expect("Metal-capable desktop");
+            msg_arg(view, sel("setLayer:"), layer);
+            msg_bool(view, sel("setWantsLayer:"), 1);
+            msg_arg(window, sel("setContentView:"), view);
+            presenter.prime(SIZE.width, SIZE.height, 1);
+            msg_void(window, sel("orderFrontRegardless"));
+            msg_void(app, sel("finishLaunching"));
+            let images = RawImages::default();
+            let transaction = class("CATransaction");
+            msg_void(transaction, sel("begin"));
+            for base in [RED, GREEN] {
+                presenter.present(
+                    &scene(base, Color::WHITE),
+                    SIZE,
+                    1,
+                    Color::BLACK,
+                    &PixelFont,
+                    &images,
+                    false,
+                );
+            }
+            msg_void(transaction, sel("commit"));
+            expect(window, GREEN, Color::WHITE, "coalesced startup");
+            for (label, patch) in [
+                ("repeat", Color::WHITE),
+                ("patch", Color::BLACK),
+                ("restored patch", Color::WHITE),
+            ] {
+                presenter.present(
+                    &scene(GREEN, patch),
+                    SIZE,
+                    1,
+                    Color::BLACK,
+                    &PixelFont,
+                    &images,
+                    false,
+                );
+                expect(window, GREEN, patch, label);
+            }
+            // Several whole frames reuse the drawable pool after coordination.
+            for base in [RED, GREEN, RED, GREEN] {
+                presenter.present(
+                    &scene(base, Color::WHITE),
+                    SIZE,
+                    1,
+                    Color::BLACK,
+                    &PixelFont,
+                    &images,
+                    true,
+                );
+                presenter.set_transactional(false);
+                expect(window, base, Color::WHITE, "whole frame after coordination");
+            }
+            for size in [
+                Size {
+                    width: 384.0,
+                    height: 288.0,
+                },
+                SIZE,
+            ] {
+                msg_size(
+                    window,
+                    sel("setContentSize:"),
+                    CGSize {
+                        width: size.width,
+                        height: size.height,
+                    },
+                );
+                presenter.present(
+                    &scene(GREEN, Color::WHITE),
+                    size,
+                    1,
+                    Color::BLACK,
+                    &PixelFont,
+                    &images,
+                    true,
+                );
+                presenter.set_transactional(false);
+                expect(window, GREEN, Color::WHITE, "resize");
+            }
+            presenter.rest();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !presenter.offer_drawables() {
+                assert!(Instant::now() < deadline, "drawable release did not settle");
+                pump();
+            }
+            expect(window, GREEN, Color::WHITE, "retained while idle");
+            drop(presenter);
+            msg_arg(window, sel("orderOut:"), null_mut());
+            msg_bool(window, sel("setReleasedWhenClosed:"), 0);
+            msg_void(window, sel("close"));
+            msg_void(view, sel("release"));
+            msg_void(layer, sel("release"));
+            msg_void(window, sel("release"));
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn main() {
+    macos::run();
+}
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    panic!("window_presentation requires a macOS desktop");
+}
