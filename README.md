@@ -2,6 +2,8 @@
 
 A declarative UI framework for Rust with fine-grained reactivity, inspired by SwiftUI.
 
+**Website:** [ui.bunny.rs](https://ui.bunny.rs)
+
 Write views as value types and let reads establish their reactive dependencies.
 `State<T>` is Bunny UI's signal primitive: changing a value invalidates its
 subscribers. A text node can subscribe directly, so a counter update can change
