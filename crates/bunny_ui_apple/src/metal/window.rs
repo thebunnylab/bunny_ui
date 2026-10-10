@@ -1,5 +1,6 @@
-//! A window may start on the existing native band Strategy without creating
-//! a Metal queue. Unsupported paint promotes it once, in one transaction.
+//! A window may start with native opaque bands or a sparse foreground over
+//! a solid base, without a Metal queue. Unsupported updates promote once,
+//! in one transaction, keeping the native cover until a GPU frame succeeds.
 
 use super::*;
 use bunny_ui::raster::{Bitmap, rasterize_with};
@@ -90,6 +91,16 @@ enum BaseBacking {
 
 impl BaseBacking {
     fn new(bitmap: Bitmap) -> Option<Self> {
+        // The same intrinsically opaque surface used by scroll bands can
+        // also carry the static base without a second image upload backing.
+        #[cfg(target_arch = "aarch64")]
+        if bitmap.pixels().iter().all(|pixel| pixel & 255 == 255)
+            && let Some(surface) =
+                software_patch::Surface::new_opaque((bitmap.width(), bitmap.height()))
+            && surface.write(&bitmap)
+        {
+            return Some(Self::Surface(surface));
+        }
         let bitmap = Arc::new(bitmap);
         if let Some(image) = OpaqueBase::new(&bitmap) {
             return Some(Self::Image(image));
@@ -167,17 +178,114 @@ impl Drop for BaseLayer {
     }
 }
 
+/// A solid background plus a bounded opaque patch can stay native even
+/// without a scroll partition. The remaining picture is retained unchanged;
+/// any update outside this contract promotes through the usual handoff.
+struct SparseScene {
+    color: Color,
+    ink: Option<software_patch::Scene>,
+    physical: (usize, usize),
+}
+
+impl SparseScene {
+    fn new(
+        display: &DisplayList,
+        physical: (usize, usize),
+        scale: usize,
+        text: &dyn TextEngine,
+        boxes: &MeasureCache,
+    ) -> Option<Self> {
+        use bunny_ui::layout::DrawCommand;
+        let background = display.as_slice().first()?;
+        let DrawCommand::FillRect {
+            rect,
+            color,
+            corner_radius,
+        } = background
+        else {
+            return None;
+        };
+        if scale == 0
+            || color.a != 255
+            || !corner_radius.is_zero()
+            || rect.origin.x != 0.0
+            || rect.origin.y != 0.0
+            || rect.size.width * scale as f64 != physical.0 as f64
+            || rect.size.height * scale as f64 != physical.1 as f64
+        {
+            return None;
+        }
+        let ink = match list_damage(
+            std::slice::from_ref(background),
+            display.as_slice(),
+            scale,
+            physical,
+            PATCH_COMMANDS,
+            boxes,
+            text,
+        ) {
+            ListDamage::Same => None,
+            ListDamage::Rect(rect) => Some(software_patch::Scene::new(
+                display, rect, scale, *color, text, boxes,
+            )?),
+            ListDamage::Whole => return None,
+        };
+        Some(Self {
+            color: *color,
+            ink,
+            physical,
+        })
+    }
+}
+
 enum NativeState {
     Choosing,
     Bands(KeptFrame),
+    Sparse(KeptFrame),
     Software(Option<KeptFrame>),
 }
 
 struct Native {
     base: BaseLayer,
+    ink: Option<BaseLayer>,
     bands: scroll_bands::Presenter,
     boxes: MeasureCache,
     state: NativeState,
+}
+
+impl Native {
+    fn paint_sparse(
+        &mut self,
+        scene: SparseScene,
+        size: Size,
+        scale: usize,
+        text: &dyn TextEngine,
+        images: &dyn ImageEngine,
+    ) -> bool {
+        let ink = if let Some(paint) = scene.ink {
+            let bitmap = paint.raster(text, images);
+            let Some(mut layer) = (unsafe { BaseLayer::new(self.base.raw) }) else {
+                return false;
+            };
+            let frame = Patch::frame(paint.bounds(), scene.physical, scale);
+            let patch_size = Size {
+                width: frame.size.width,
+                height: frame.size.height,
+            };
+            if !unsafe { layer.paint(bitmap, patch_size, scale) } {
+                return false;
+            }
+            unsafe { msg_void_rect(layer.raw, sel("setFrame:"), frame) };
+            Some(layer)
+        } else {
+            None
+        };
+        if !unsafe { self.base.paint(Bitmap::new(1, 1, scene.color), size, scale) } {
+            return false;
+        }
+        self.ink = ink;
+        true
+    }
 }
 
 enum Strategy {
@@ -227,7 +335,7 @@ impl Metal {
     }
 }
 
-/// A macOS window's native-band Strategy, with one-way promotion to Metal.
+/// A macOS window's native Strategy, with one-way promotion to Metal.
 /// The scene contract decides; no application identity enters admission.
 pub struct WindowPresenter {
     layer: Id,
@@ -255,6 +363,7 @@ impl WindowPresenter {
             layer,
             strategy: Strategy::Native(Box::new(Native {
                 base,
+                ink: None,
                 bands: scroll_bands::Presenter::default(),
                 boxes: MeasureCache::default(),
                 state: NativeState::Choosing,
@@ -321,7 +430,7 @@ impl WindowPresenter {
         };
         let repeats = match &native.state {
             NativeState::Choosing => false,
-            NativeState::Bands((prior, p, s, c)) => {
+            NativeState::Bands((prior, p, s, c)) | NativeState::Sparse((prior, p, s, c)) => {
                 *p == physical
                     && *s == scale
                     && *c == canvas
@@ -333,17 +442,26 @@ impl WindowPresenter {
             return;
         }
         native.boxes.begin_frame();
+        let bands = matches!(native.state, NativeState::Choosing)
+            && !live
+            && physical
+                .0
+                .checked_mul(physical.1)
+                .is_some_and(|n| n <= MAX_BASE_PIXELS)
+            && native
+                .bands
+                .seed(display, physical, scale, canvas, text, &native.boxes);
+        if matches!(native.state, NativeState::Choosing)
+            && !live
+            && !bands
+            && let Some(scene) = SparseScene::new(display, physical, scale, text, &native.boxes)
+            && native.paint_sparse(scene, size, scale, text, images)
+        {
+            native.state = NativeState::Sparse((Rc::new(display.clone()), physical, scale, canvas));
+            return;
+        }
         let admitted = match &native.state {
-            NativeState::Choosing => {
-                !live
-                    && physical
-                        .0
-                        .checked_mul(physical.1)
-                        .is_some_and(|n| n <= MAX_BASE_PIXELS)
-                    && native
-                        .bands
-                        .seed(display, physical, scale, canvas, text, &native.boxes)
-            }
+            NativeState::Choosing => bands,
             NativeState::Bands((_, p, s, c)) => {
                 if !live
                     && *p == physical
@@ -368,6 +486,7 @@ impl WindowPresenter {
                 }
                 false
             }
+            NativeState::Sparse(_) => false,
             NativeState::Software(_) => true,
         };
         if admitted {
@@ -390,6 +509,7 @@ impl WindowPresenter {
             let bitmap =
                 rasterize_with(display, physical.0, physical.1, scale, canvas, text, images);
             if unsafe { native.base.paint(bitmap, size, scale) } {
+                native.ink = None;
                 native.state = NativeState::Software(Some((
                     Rc::new(display.clone()),
                     physical,
@@ -658,6 +778,65 @@ mod tests {
     }
 
     #[test]
+    fn a_sparse_opaque_base_stays_native_until_its_pixels_change() {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let mut presenter = WindowPresenter::attach(layer, 1.0).unwrap();
+            let size = Size {
+                width: 1280.0,
+                height: 800.0,
+            };
+            let display = DisplayList::from(vec![
+                DrawCommand::FillRect {
+                    rect: rect(0.0, 0.0, 1280.0, 800.0),
+                    color: Color::BLACK,
+                    corner_radius: Corners::ZERO,
+                },
+                DrawCommand::TextLine {
+                    origin: Point { x: 12.0, y: 12.0 },
+                    content: "small heading".into(),
+                    range: (0, 13),
+                    color: Color::WHITE,
+                    font: FontSpec::DEFAULT,
+                },
+            ]);
+            for _ in 0..2 {
+                presenter.present(
+                    &display,
+                    size,
+                    1,
+                    Color::BLACK,
+                    &PixelFont,
+                    &RawImages::default(),
+                    false,
+                );
+                assert!(
+                    msg_id(layer, sel("device")).is_null(),
+                    "a bounded heading over an opaque background needs no GPU queue"
+                );
+                assert!(presenter.rest());
+            }
+            presenter.present(
+                &DisplayList::default(),
+                size,
+                1,
+                Color::BLACK,
+                &PixelFont,
+                &RawImages::default(),
+                false,
+            );
+            assert!(
+                matches!(presenter.strategy, Strategy::Metal(_)),
+                "an unsupported update promotes once"
+            );
+            drop(presenter);
+            msg_void(layer, sel("release"));
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    #[test]
     fn leaving_band_admission_promotes_once_and_keeps_the_metal_strategy() {
         unsafe {
             let pool = objc_autoreleasePoolPush();
@@ -764,6 +943,7 @@ mod tests {
             let pool = objc_autoreleasePoolPush();
             let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
             let native = Native {
+                ink: None,
                 base: BaseLayer::new(layer).unwrap(),
                 bands: scroll_bands::Presenter::default(),
                 boxes: MeasureCache::default(),

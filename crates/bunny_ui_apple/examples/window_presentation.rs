@@ -337,6 +337,40 @@ mod macos {
             expect(window, GREEN, Color::WHITE, "promotion after native image");
             drop(native);
             msg_void(native_layer, sel("release"));
+            let sparse_layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let mut sparse = WindowPresenter::attach(sparse_layer, 1.0).unwrap();
+            msg_arg(view, sel("setLayer:"), sparse_layer);
+            sparse.prime(SIZE.width, SIZE.height, 1);
+            for label in ["sparse native image", "sparse repeated image"] {
+                sparse.present(
+                    &scene(GREEN, Color::WHITE),
+                    SIZE,
+                    1,
+                    Color::BLACK,
+                    &PixelFont,
+                    &images,
+                    false,
+                );
+                assert!(
+                    msg_id(sparse_layer, sel("device")).is_null(),
+                    "the sparse base stays native"
+                );
+                expect(window, GREEN, Color::WHITE, label);
+            }
+            assert!(sparse.rest());
+            expect(window, GREEN, Color::WHITE, "sparse idle image");
+            sparse.present(
+                &scene(RED, Color::WHITE),
+                SIZE,
+                1,
+                Color::BLACK,
+                &PixelFont,
+                &images,
+                false,
+            );
+            expect(window, RED, Color::WHITE, "promotion after sparse image");
+            drop(sparse);
+            msg_void(sparse_layer, sel("release"));
             msg_arg(window, sel("orderOut:"), null_mut());
             msg_bool(window, sel("setReleasedWhenClosed:"), 0);
             msg_void(window, sel("close"));
