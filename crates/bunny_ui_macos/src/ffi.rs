@@ -288,6 +288,8 @@ pub enum AppEvent {
     /// The system says memory is short (a warning or worse): the caches
     /// go — decoded images, the fallen entries waiting for the idle.
     MemoryPressure,
+    /// The main loop finished its work and can release retired trees.
+    Collect,
     /// The system's languages or region moved
     /// (`NSCurrentLocaleDidChangeNotification`): every window reads the
     /// preferred list again, and one whose locale moved draws a frame.
@@ -542,7 +544,8 @@ fn hold(queue: &mut std::collections::VecDeque<(usize, AppEvent)>, source: usize
             }
             (AppEvent::Wake, AppEvent::Wake)
             | (AppEvent::Blink, AppEvent::Blink)
-            | (AppEvent::Tasks, AppEvent::Tasks) => return,
+            | (AppEvent::Tasks, AppEvent::Tasks)
+            | (AppEvent::Collect, AppEvent::Collect) => return,
             _ => {}
         }
     }
@@ -3434,6 +3437,51 @@ pub(crate) fn yield_cursor() {
 /// `kCFRunLoopBeforeWaiting`: the loop ran what it had and is about to sleep.
 const BEFORE_WAITING: u64 = 1 << 5;
 
+thread_local! {
+    static COLLECTION_PENDING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Schedule collection at the next natural idle boundary. This does not
+/// wake the loop or start a timer; the slow clock remains the fallback
+/// for a tracking loop that never enters the default mode.
+pub(crate) fn request_collection() {
+    COLLECTION_PENDING.with(|pending| pending.set(true));
+}
+
+pub(crate) fn install_idle_collection() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| unsafe {
+        let observer = CFRunLoopObserverCreate(
+            std::ptr::null_mut(),
+            BEFORE_WAITING,
+            1,
+            2_147_482_999,
+            idle_collection,
+            std::ptr::null_mut(),
+        );
+        if !observer.is_null() {
+            CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopDefaultMode);
+            CFRelease(observer);
+        }
+    });
+}
+
+extern "C" fn idle_collection(_observer: Id, _activity: u64, _info: *mut c_void) {
+    collect_before_sleep();
+}
+
+fn collect_before_sleep() {
+    // A modal panel may run a nested loop inside a handler. Leave its
+    // request armed until the outer handler has returned; do not queue
+    // collection while a scene is still in the middle of changing.
+    if DISPATCHING.with(Cell::get) || LENDING.with(Cell::get) {
+        return;
+    }
+    if COLLECTION_PENDING.with(|pending| pending.replace(false)) {
+        dispatch_all(AppEvent::Collect);
+    }
+}
+
 static CURSOR_KEEPER: Once = Once::new();
 
 /// Keeps the scene's cursor between the shell's own turns.
@@ -4836,6 +4884,80 @@ mod tests {
             vec!["wake", "still inside", "redraw"],
             "the raised event arrives AFTER the handler that raised it, and it arrives",
         );
+    }
+
+    #[test]
+    fn idle_collection_releases_retired_text_once_and_preserves_live_snapshots() {
+        use bunny_ui::prelude::*;
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct Note { value: State<String> }
+        impl Component for Note {
+            fn body(self) -> impl View {
+                text_editor("note", self.value.binding()).frame(400.0, 300.0)
+            }
+        }
+        let runtime = Rc::new(Runtime::new());
+        let note = Note { value: State::new("é 日本 🦀\n".repeat(300)) };
+        let size = bunny_ui::layout::Size { width: 400.0, height: 300.0 };
+        runtime.display_frame(&note, size);
+        let path = runtime.layout(&note, bunny_ui::layout::Proposal::exact(size)).hits[0].0.clone();
+        runtime.focus(&path);
+        runtime.key(EditCommand::End(false));
+        let old = runtime.ime_snapshot().unwrap();
+        let lifetime = Arc::downgrade(&old.text);
+        runtime.key(EditCommand::Insert("x".into()));
+        runtime.display_frame(&note, size);
+        let current = runtime.ime_snapshot().unwrap();
+        let calls = Rc::new(Cell::new(0));
+        set_handler(Box::new({
+            let runtime = runtime.clone();
+            let calls = calls.clone();
+            move |event| {
+                assert!(matches!(event, AppEvent::Collect));
+                calls.set(calls.get() + 1);
+                runtime.collect_garbage();
+            }
+        }));
+        assert!(runtime.garbage_pending());
+        request_collection();
+        request_collection();
+        collect_before_sleep();
+        assert_eq!(calls.get(), 1, "one collection for the completed turn");
+        assert!(!runtime.garbage_pending());
+        assert!(lifetime.upgrade().is_some(), "the caller's snapshot still owns its text");
+        drop(old);
+        assert!(lifetime.upgrade().is_none(), "the retired layout no longer owns the old document");
+        assert_eq!(current.selected.0, current.text.encode_utf16().count());
+        collect_before_sleep();
+        assert_eq!(calls.get(), 1, "an idle app gets no repeated collection event");
+        HANDLER.with(|handler| handler.borrow_mut().take());
+    }
+
+    #[test]
+    fn a_nested_loop_does_not_collect_inside_a_window_handler() {
+        use std::rc::Rc;
+        let calls = Rc::new(Cell::new(0));
+        set_handler(Box::new({
+            let calls = calls.clone();
+            move |event| match event {
+                AppEvent::Wake => {
+                    request_collection();
+                    collect_before_sleep();
+                    assert_eq!(calls.get(), 0);
+                    assert!(COLLECTION_PENDING.with(Cell::get));
+                }
+                AppEvent::Collect => calls.set(calls.get() + 1),
+                _ => panic!("unexpected event"),
+            }
+        }));
+        dispatch_all(AppEvent::Wake);
+        assert_eq!(calls.get(), 0, "a nested loop must not queue a collection behind the handler");
+        collect_before_sleep();
+        assert_eq!(calls.get(), 1, "the outer loop collects when its handler has returned");
+        HANDLER.with(|handler| handler.borrow_mut().take());
     }
 
     /// The selector pain 34's fix stands on. `charactersIgnoringModifiers`
