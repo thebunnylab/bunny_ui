@@ -1,0 +1,71 @@
+name: CLI
+
+on:
+  pull_request:
+    paths:
+      - 'crates/bunny_cli/**'
+      - 'crates/bunny_ui_facade/**'
+      - 'crates/bunny_ui_web/glue/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.gitattributes'
+      - '.github/workflows/cli.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, windows-2025, macos-26]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Pinned compiler
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component clippy
+          rustup override set 1.98.1
+      - name: Tests and strict lints
+        run: |
+          cargo test -p bunny-cli --locked
+          cargo clippy -p bunny-cli --locked --all-targets -- -D warnings
+      - name: The published crate carries its templates
+        run: |
+          # `cargo install` builds from the package: a template left out
+          # of it is a `bunny new` with nothing to write
+          # (compared with `/` and without `\r`, however the host prints paths)
+          cargo package -p bunny-cli --locked --list --allow-dirty | tr -d '\r' | tr '\\' '/' > package.txt
+          for file in templates/android/gradlew templates/app/Cargo.toml.tmpl templates/LICENSE; do
+            grep -qx "$file" package.txt || { echo "missing from the package: $file"; cat package.txt; exit 1; }
+          done
+
+  new-project:
+    name: a new project builds everywhere
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Pinned compiler and the targets
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
+          rustup target add wasm32-unknown-unknown aarch64-linux-android aarch64-apple-ios \
+            x86_64-pc-windows-msvc x86_64-unknown-linux-gnu
+      - name: bunny new, then cargo on the host and every target
+        run: cargo test -p bunny-cli --locked --test new_project -- --ignored

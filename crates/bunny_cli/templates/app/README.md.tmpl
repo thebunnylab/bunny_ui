@@ -1,0 +1,27 @@
+# @BUNNY_APP_NAME@
+
+A [bunny-ui](https://github.com/thebunnylab/bunny_ui) app.
+
+## Run it
+
+```bash
+bunny run              # on this computer
+bunny run -d ios       # in the iOS Simulator
+bunny run -d android   # on an Android emulator or phone
+bunny run -d web       # in the browser
+```
+
+`bunny doctor` says what each platform still needs on this machine, and
+`bunny devices` lists where the app can run. On the desktop, `cargo run`
+works too.
+
+## Where things are
+
+- `src/lib.rs` — the app. `bunny_ui::app!` at its end starts it on every
+  platform.
+- `src/main.rs` — the desktop and iOS entry; it only calls `run()`.
+- `Cargo.toml` — `[package.metadata.bunny]` holds the name people read and
+  the id every platform files the app under.
+- `android/`, `ios/`, `macos/`, `web/` — each platform's own files. They are
+  yours to edit; `bunny` fills the `@BUNNY_…@` markers in them on every
+  build, and keeps `.bunny-template` to know which template they came from.
