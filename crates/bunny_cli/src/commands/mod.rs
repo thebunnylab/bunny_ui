@@ -3,3 +3,4 @@
 pub mod devices;
 pub mod doctor;
 pub mod new;
+pub mod run;

@@ -9,13 +9,17 @@
 #![forbid(unsafe_code)]
 
 pub mod args;
+pub mod cargo;
 pub mod cli;
 pub mod commands;
 pub mod devices;
 pub mod error;
 pub mod ids;
 pub mod json;
+pub mod keys;
+pub mod platform;
 pub mod process;
+pub mod project;
 pub mod template;
 pub mod templates;
 pub mod term;

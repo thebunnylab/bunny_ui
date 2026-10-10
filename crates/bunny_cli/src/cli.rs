@@ -28,6 +28,14 @@ pub const COMMANDS: &[Command] = &[
         run: commands::new::run,
     },
     Command {
+        name: "run",
+        summary: commands::run::SUMMARY,
+        usage: commands::run::USAGE,
+        about: commands::run::ABOUT,
+        options: commands::run::OPTIONS,
+        run: commands::run::run,
+    },
+    Command {
         name: "doctor",
         summary: commands::doctor::SUMMARY,
         usage: commands::doctor::USAGE,

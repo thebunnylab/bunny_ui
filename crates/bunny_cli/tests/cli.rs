@@ -135,6 +135,18 @@ fn doctor_and_devices_answer_in_json() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+/// `run` outside an app says where to go; `-d` with a name nothing
+/// matches says where to look.
+#[test]
+fn run_outside_an_app_points_the_way() {
+    let here = scratch("run");
+    let out = bunny(&["run"], &here);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("bunny new my_app"), "{}", text(&out.stderr));
+    let out = bunny(&["run", "--help"], &here);
+    assert!(text(&out.stdout).contains("-d, --device <DEVICE>"));
+}
+
 #[test]
 fn names_with_quotes_stay_valid_toml() {
     let here = scratch("quotes");

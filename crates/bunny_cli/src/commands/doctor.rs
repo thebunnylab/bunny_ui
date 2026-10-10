@@ -199,14 +199,7 @@ pub fn check(platforms: &[Platform]) -> Vec<Section> {
             .iter()
             .map(|platform| {
                 let platform = *platform;
-                scope.spawn(move || match platform {
-                    Platform::Macos => macos(),
-                    Platform::Ios => ios(toolchain),
-                    Platform::Windows => windows_section(),
-                    Platform::Linux => linux_section(),
-                    Platform::Android => android_section(toolchain, env),
-                    Platform::Web => web(toolchain),
-                })
+                scope.spawn(move || section(platform, toolchain, env))
             })
             .collect();
         let devices = scope.spawn(devices::discover);
@@ -217,6 +210,51 @@ pub fn check(platforms: &[Platform]) -> Vec<Section> {
         }
         sections
     })
+}
+
+/// One platform's checks.
+fn section(platform: Platform, toolchain: &Option<rust::Rust>, env: &android::Env) -> Section {
+    match platform {
+        Platform::Macos => macos(),
+        Platform::Ios => ios(toolchain),
+        Platform::Windows => windows_section(),
+        Platform::Linux => linux_section(),
+        Platform::Android => android_section(toolchain, env),
+        Platform::Web => web(toolchain),
+    }
+}
+
+/// What `bunny run` and `bunny build` check before building for
+/// `platform`: the same checks as `doctor`, the same offer to install a
+/// missing Rust target, and the same fixes when the build cannot go on.
+pub fn preflight(platform: Platform) -> Result<()> {
+    let toolchain = rust::detect();
+    let env = android::Env::current();
+    let mut checked = section(platform, &toolchain, &env);
+    if checked.status() == Status::Fail
+        && !checked.missing_targets.is_empty()
+        && can_ask()
+        && process::which("rustup").is_some()
+    {
+        print(std::slice::from_ref(&checked), false, false);
+        if ask(&format!("Install {} with rustup now? [Y/n] ", checked.missing_targets.join(" "))) {
+            install_targets(&checked.missing_targets)?;
+            checked = section(platform, &toolchain, &env);
+        }
+    }
+    if checked.status() == Status::Fail {
+        let failing: Vec<&Check> = checked.checks.iter().filter(|check| check.status == Status::Fail).collect();
+        let mut hint = String::new();
+        for check in &failing {
+            hint.push_str(&format!("{} {}\n", Status::Fail.mark(), check.title));
+            for fix in &check.fixes {
+                hint.push_str(&format!("  → {fix}\n"));
+            }
+        }
+        hint.push_str(&format!("`bunny doctor -p {}` checks again", platform.key()));
+        return Err(Error::new(format!("this machine cannot build for {} yet", platform.title())).hint(hint));
+    }
+    Ok(())
 }
 
 fn rust_section(toolchain: &Option<rust::Rust>) -> Section {
