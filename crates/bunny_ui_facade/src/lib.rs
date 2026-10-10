@@ -3,11 +3,10 @@
 //! This is the crate an application adds. It re-exports the core
 //! (`bunny_ui_core`) whole and, with the default `shell` feature, the
 //! shell of the target it compiles for: macOS, iOS, Windows, Linux,
-//! Android or the web. On every native one the same `main` opens the
-//! window:
+//! Android or the web. One line starts the app on all of them —
+//! [`app!`] writes the entry each target expects:
 //!
 //! ```no_run
-//! use bunny_ui::layout::Size;
 //! use bunny_ui::prelude::*;
 //!
 //! #[derive(Clone, Copy)]
@@ -24,15 +23,22 @@
 //!     }
 //! }
 //!
+//! fn home() -> impl View {
+//!     Counter { count: State::new(0) }
+//! }
+//!
+//! bunny_ui::app!(home, bunny_ui::AppConfig::new().size(280.0, 180.0));
+//!
 //! fn main() {
-//!     let counter = Counter { count: State::new(0) };
-//!     bunny_ui::run_window("Counter", Size { width: 280.0, height: 180.0 }, counter);
+//!     run()
 //! }
 //! ```
 //!
-//! What a shell offers beyond that one window — who draws a desktop
-//! window's title bar, several windows, the Android activity, the web's
-//! start functions — lives in `platform`, the shell crate itself.
+//! Underneath, `run_window` opens the window on every native platform
+//! with the same signature. What a shell offers beyond that one window
+//! — who draws a desktop window's title bar, several windows, the
+//! Android activity, the web's start functions — lives in `platform`,
+//! the shell crate itself.
 //!
 //! A crate that only builds views, such as a component library or a
 //! theme, depends on `bunny-ui` with `default-features = false`: the
@@ -40,7 +46,10 @@
 
 #![forbid(unsafe_code)]
 
+mod entry;
+
 pub use bunny_ui_core::*;
+pub use entry::{__private, AppConfig};
 
 /// The shell of this target, whole.
 #[cfg(all(feature = "shell", target_os = "macos"))]

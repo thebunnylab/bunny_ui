@@ -1815,7 +1815,7 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, options: crate
                 title.len() as u32,
                 title.as_ptr().cast(),
             );
-            let class = b"bunny_ui\0bunny_ui\0";
+            let class = crate::life::wm_class();
             xcb_change_property(
                 client.connection,
                 PROP_MODE_REPLACE,
@@ -2277,7 +2277,7 @@ pub(crate) fn create_dialog(
             set(client.atoms.wm_protocols, ATOM_ATOM, 32, 1, (&raw const client.atoms.wm_delete_window).cast());
             set(client.atoms.net_wm_name, client.atoms.utf8_string, 8, title.len() as u32, title.as_ptr().cast());
             set(ATOM_WM_NAME, ATOM_STRING, 8, title.len() as u32, title.as_ptr().cast());
-            let class = b"bunny_ui\0bunny_ui\0";
+            let class = crate::life::wm_class();
             set(ATOM_WM_CLASS, ATOM_STRING, 8, class.len() as u32, class.as_ptr().cast());
             // the place and the size are the program's own; the floor
             // is the spec's
