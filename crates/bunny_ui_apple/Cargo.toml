@@ -1,6 +1,6 @@
 [package]
 name = "bunny-ui-apple"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "bunny-ui Apple half — CoreText, ImageIO, Security and Metal through dependency-free Objective-C FFI, shared by the macOS and iOS shells"
 license-file.workspace = true
@@ -30,3 +30,9 @@ optional = true
 # the codecs of the house, so ImageIO can judge them (tests/codec_parity.rs)
 bunny-ui = { workspace = true, features = ["canvas", "gpu", "codec"] }
 pollster = "0.4"
+
+# Its API exists only on its own platform; docs.rs builds on Linux
+# by default and would publish an empty page.
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets = ["aarch64-apple-darwin"]

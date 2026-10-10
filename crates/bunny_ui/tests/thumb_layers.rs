@@ -8,6 +8,8 @@
 //! every range the scene keeps into its list still points at the commands it
 //! named.
 
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use bunny_ui::custom::{CustomElement, PaintCtx, Painter, custom};
 use bunny_ui::layout::{Color, DisplayList, DrawCommand, Point, Proposal, Rect, Side, Size};
 use bunny_ui::prelude::*;

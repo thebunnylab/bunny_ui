@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'crates/bunny_ui/**'
+      - 'crates/bunny_ui_facade/**'
       - 'crates/bunny_ui_apple/**'
       - 'crates/bunny_ui_macos/**'
       - 'crates/bunny_ui_windows/**'
@@ -57,12 +58,12 @@ jobs:
           cargo --version
       - name: Core default, normal and paranoid
         run: |
-          cargo test -p bunny-ui --locked --all-targets
-          BUNNY_PARANOID=all cargo test -p bunny-ui --locked --all-targets
+          cargo test -p bunny-ui-core --locked --all-targets
+          BUNNY_PARANOID=all cargo test -p bunny-ui-core --locked --all-targets
       - name: Core production features, normal and paranoid
         run: |
-          cargo test -p bunny-ui --locked --all-targets --all-features
-          BUNNY_PARANOID=all cargo test -p bunny-ui --locked --all-targets --all-features
+          cargo test -p bunny-ui-core --locked --all-targets --all-features
+          BUNNY_PARANOID=all cargo test -p bunny-ui-core --locked --all-targets --all-features
       - name: Native platform, normal and paranoid
         env:
           PLATFORM: ${{ matrix.platform }}
@@ -70,6 +71,11 @@ jobs:
           # Retain the actual adapter witness on successful parity tests too.
           cargo test -p "$PLATFORM" --locked --all-targets -- --nocapture
           BUNNY_PARANOID=all cargo test -p "$PLATFORM" --locked --all-targets -- --nocapture
+      - name: Facade, with the runner's shell and without one
+        run: |
+          cargo test -p bunny-ui --locked --all-targets
+          cargo test -p bunny-ui --locked --doc
+          cargo check -p bunny-ui --locked --all-targets --no-default-features
       - name: macOS shell, normal and paranoid; iOS build
         if: runner.os == 'macOS'
         run: |
@@ -83,7 +89,7 @@ jobs:
         run: |
           # Each strict exit code stays visible, including inherited failures.
           # New diagnostics fail this separate regression gate.
-          packages=(--package bunny-ui --package "$PLATFORM")
+          packages=(--package bunny-ui-core --package "$PLATFORM")
           if [ "$RUNNER_OS" = macOS ]; then
             packages+=(--package bunny-ui-macos)
           fi
