@@ -41,6 +41,8 @@ impl Mode {
 pub struct Site {
     pub dir: PathBuf,
     pub mode: Mode,
+    /// The wasm's file name in `dir`.
+    pub wasm: String,
 }
 
 /// Builds the app for the browser and assembles its page. `dev` adds the
@@ -92,28 +94,32 @@ pub fn build(project: &Project, options: &Options, dev: bool) -> Result<Site> {
     fs::write(dir.join(&wasm_name), &bytes).map_err(error::at(&dir))?;
     let web = project.platform_dir("web")?;
     copy_tree(&web, &dir, &web.join("index.html"))?;
+    // each build's files under the same names, a stamp in the query: the
+    // browser fetches them again after a build
     let stamp = format!("{:08x}", templates::fnv64(&bytes) as u32);
-    let page = page(&fs::read_to_string(web.join("index.html")).map_err(error::at(&web))?, &project.name, &wasm_name, mode, &stamp, dev)?;
+    let scripts: Vec<String> = mode.scripts().iter().map(|script| format!("{script}?v={stamp}")).collect();
+    let template = fs::read_to_string(web.join("index.html")).map_err(error::at(&web))?;
+    let page = page(&template, &project.name, &format!("{wasm_name}?v={stamp}"), &scripts, dev)?;
     fs::write(dir.join("index.html"), page).map_err(error::at(&dir))?;
-    Ok(Site { dir, mode })
+    Ok(Site { dir, mode, wasm: wasm_name })
 }
 
 /// The project's page with its markers filled: the name, and the scripts
-/// that boot the wasm.
-pub fn page(template_text: &str, name: &str, wasm: &str, mode: Mode, stamp: &str, dev: bool) -> Result<String> {
+/// that boot the wasm — `wasm` and `scripts` as the page names them.
+pub fn page(template_text: &str, name: &str, wasm: &str, scripts: &[String], dev: bool) -> Result<String> {
     if !template_text.contains("id=\"app\"") {
         return Err(Error::new("web/index.html has no element with id=\"app\"").hint("the app draws into <div id=\"app\"></div>"));
     }
-    let mut scripts = String::new();
+    let mut tags = String::new();
     if dev {
-        scripts.push_str("<script src=\"/__bunny/dev.js\"></script>\n    ");
+        tags.push_str("<script src=\"/__bunny/dev.js\"></script>\n    ");
     }
-    scripts.push_str(&format!("<script>window.BUNNY_WASM = \"{wasm}?v={stamp}\";</script>"));
-    for script in mode.scripts() {
-        scripts.push_str(&format!("\n    <script src=\"{script}?v={stamp}\"></script>"));
+    tags.push_str(&format!("<script>window.BUNNY_WASM = \"{wasm}\";</script>"));
+    for script in scripts {
+        tags.push_str(&format!("\n    <script src=\"{script}\"></script>"));
     }
     let name = Escape::Xml.apply(name);
-    template::render("web/index.html", template_text, &[("APP_NAME", &name), ("SCRIPTS", &scripts)], Escape::Raw)
+    template::render("web/index.html", template_text, &[("APP_NAME", &name), ("SCRIPTS", &tags)], Escape::Raw)
 }
 
 fn package_dir(packages: &[(String, PathBuf)], name: &str) -> Option<PathBuf> {
@@ -185,22 +191,26 @@ mod tests {
 
     const PAGE: &str = "<title>@BUNNY_APP_NAME@</title>\n<div id=\"app\"></div>\n    @BUNNY_SCRIPTS@\n";
 
+    fn named(mode: Mode, suffix: &str) -> Vec<String> {
+        mode.scripts().iter().map(|script| format!("{script}{suffix}")).collect()
+    }
+
     #[test]
     fn the_page_boots_the_wasm_with_its_glue() {
-        let page = page(PAGE, "Tom & Jerry", "notes.wasm", Mode::Canvas, "1a2b3c4d", true).unwrap();
+        let page = page(PAGE, "Tom & Jerry", "notes.wasm?v=1a2b3c4d", &named(Mode::Canvas, "?v=1a2b3c4d"), true).unwrap();
         assert!(page.contains("<title>Tom &amp; Jerry</title>"));
         let dev = page.find("/__bunny/dev.js").unwrap();
         let wasm = page.find("window.BUNNY_WASM = \"notes.wasm?v=1a2b3c4d\"").unwrap();
         let surface = page.find("surface.js?v=1a2b3c4d").unwrap();
         let glue = page.find("\"glue.js?v=1a2b3c4d\"").unwrap();
         assert!(dev < wasm && wasm < surface && surface < glue, "{page}");
-        let dom = super::page(PAGE, "N", "n.wasm", Mode::Dom, "0", false).unwrap();
+        let dom = super::page(PAGE, "N", "n.wasm", &named(Mode::Dom, ""), false).unwrap();
         assert!(dom.contains("glue_dom.js") && !dom.contains("surface.js") && !dom.contains("dev.js"));
     }
 
     #[test]
     fn a_page_without_the_app_element_is_refused() {
-        assert!(page("<body>@BUNNY_SCRIPTS@</body>", "N", "n.wasm", Mode::Canvas, "0", true).is_err());
+        assert!(page("<body>@BUNNY_SCRIPTS@</body>", "N", "n.wasm", &[], true).is_err());
     }
 
     #[test]

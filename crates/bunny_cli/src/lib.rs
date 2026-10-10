@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod args;
+pub mod build;
 pub mod cargo;
 pub mod cli;
 pub mod commands;
