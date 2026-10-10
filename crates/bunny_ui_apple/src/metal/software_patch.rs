@@ -202,6 +202,60 @@ impl Scene {
         self.canvas
     }
 
+    /// Emits opaque bands without allocating a full-window scratch bitmap.
+    pub(super) fn raster_bands(
+        &self,
+        text: &dyn TextEngine,
+        images: &dyn ImageEngine,
+        cache: &MeasureCache,
+        mut paint: impl FnMut(usize, &Bitmap) -> bool,
+    ) -> bool {
+        let rows = MAX_PIXELS / self.size.0;
+        if rows == 0 {
+            return false;
+        }
+        if self.size.1 <= rows {
+            return paint(0, &self.raster(text, images));
+        }
+        let factor = self.scale as f64;
+        for y in (0..self.size.1).step_by(rows) {
+            let height = rows.min(self.size.1 - y);
+            let rect = (0, y as i64, self.size.0 as i64, (y + height) as i64);
+            let Some(candidates) = measured_candidates(&self.display, rect, factor, text, cache)
+            else {
+                return false;
+            };
+            let logical = Rect {
+                origin: Point {
+                    x: 0.0,
+                    y: y as f64 / factor,
+                },
+                size: Size {
+                    width: self.size.0 as f64 / factor,
+                    height: height as f64 / factor,
+                },
+            };
+            let lifted = carve_covering(&candidates, (0, candidates.len()), logical)
+                .map_or_else(DisplayList::default, |(_, display)| display);
+            let Some(display) = patch_coordinates(&lifted, rect, factor) else {
+                return false;
+            };
+            let bitmap = rasterize_with(
+                &display,
+                self.size.0,
+                height,
+                self.scale,
+                self.canvas,
+                text,
+                images,
+            );
+            if !paint(y, &bitmap) {
+                return false;
+            }
+        }
+        true
+    }
+
     pub(super) fn raster(&self, text: &dyn TextEngine, images: &dyn ImageEngine) -> Bitmap {
         rasterize_with(
             &self.display,
@@ -460,6 +514,21 @@ impl Surface {
         }
     }
 
+    /// Build a fresh surface in bounded scratch bands before it is visible.
+    pub(super) fn from_scene(
+        scene: &Scene,
+        text: &dyn TextEngine,
+        images: &dyn ImageEngine,
+        cache: &MeasureCache,
+    ) -> Option<Self> {
+        let surface = Self::new_opaque(scene.size)?;
+        scene
+            .raster_bands(text, images, cache, |y, bitmap| {
+                PixelRegion::whole(bitmap).is_some_and(|pixels| surface.write_rows(y, pixels))
+            })
+            .then_some(surface)
+    }
+
     pub(super) fn busy(&self) -> bool {
         unsafe { IOSurfaceIsInUse(self.raw) != 0 }
     }
@@ -470,6 +539,13 @@ impl Surface {
 
     pub(super) fn write_pixels(&self, pixels: PixelRegion<'_>) -> bool {
         if self.size != pixels.size() {
+            return false;
+        }
+        self.write_rows(0, pixels)
+    }
+
+    fn write_rows(&self, y: usize, pixels: PixelRegion<'_>) -> bool {
+        if pixels.size().0 != self.size.0 || y > self.size.1 || pixels.size().1 > self.size.1 - y {
             return false;
         }
         #[cfg(target_arch = "aarch64")]
@@ -487,8 +563,10 @@ impl Surface {
             let valid = !base.is_null() && stride >= self.size.0 * 4;
             if valid {
                 for (row, pixels) in pixels.rows().enumerate() {
-                    let output =
-                        std::slice::from_raw_parts_mut(base.add(row * stride), self.size.0 * 4);
+                    let output = std::slice::from_raw_parts_mut(
+                        base.add((row + y) * stride),
+                        self.size.0 * 4,
+                    );
                     match self.format {
                         SurfaceFormat::Bgra8 => {
                             for (rgba, bgra) in pixels.iter().zip(output.as_chunks_mut::<4>().0) {
@@ -565,6 +643,120 @@ mod tests {
         layout::Corners,
         text_engine::{FontSpec, PixelFont},
     };
+
+    #[test]
+    fn native_base_raster_bands_are_bounded_and_match_the_whole_scene() {
+        let display = DisplayList::from(vec![
+            DrawCommand::FillRect {
+                rect: Rect {
+                    origin: Point { x: -0.5, y: -0.5 },
+                    size: Size {
+                        width: 514.0,
+                        height: 378.0,
+                    },
+                },
+                color: Color::WHITE,
+                corner_radius: Corners::all(17.5),
+            },
+            DrawCommand::PushClip {
+                rect: Rect {
+                    origin: Point { x: 12.5, y: 20.5 },
+                    size: Size {
+                        width: 475.0,
+                        height: 333.0,
+                    },
+                },
+                corner_radius: Corners::all(12.5),
+            },
+            DrawCommand::FillRect {
+                rect: Rect {
+                    origin: Point { x: 40.5, y: 40.5 },
+                    size: Size {
+                        width: 440.0,
+                        height: 280.0,
+                    },
+                },
+                color: Color::rgba(200, 40, 80, 123),
+                corner_radius: Corners::all(14.5),
+            },
+            DrawCommand::StrokeRect {
+                rect: Rect {
+                    origin: Point { x: 4.5, y: 112.5 },
+                    size: Size {
+                        width: 490.0,
+                        height: 170.0,
+                    },
+                },
+                color: Color::rgba(0, 40, 200, 170),
+                corner_radius: Corners::all(8.5),
+                width: 2.5,
+            },
+            DrawCommand::TextLine {
+                origin: Point { x: -0.5, y: 249.5 },
+                content: "crossing the band boundary".into(),
+                range: (0, 26),
+                color: Color::BLACK,
+                font: FontSpec::DEFAULT,
+            },
+            DrawCommand::PopClip,
+        ]);
+        for scale in [1, 2, 3] {
+            let size = (513 * scale, 377 * scale);
+            let cache = MeasureCache::default();
+            let scene =
+                Scene::base(&display, size, scale, Color::BLACK, &PixelFont, &cache).unwrap();
+            let expected = scene.raster(&PixelFont, &RawImages::default());
+            let mut actual = vec![0; size.0 * size.1];
+            let mut next = 0;
+            assert!(scene.raster_bands(
+                &PixelFont,
+                &RawImages::default(),
+                &cache,
+                |row, bitmap| {
+                    assert_eq!(row, next, "bands cover the canvas exactly once");
+                    assert!(
+                        bitmap.width() * bitmap.height() <= MAX_PIXELS,
+                        "a native base must not allocate a whole-window scratch bitmap"
+                    );
+                    next += bitmap.height();
+                    actual[row * size.0..next * size.0].copy_from_slice(bitmap.pixels());
+                    true
+                }
+            ));
+            assert_eq!(next, size.1);
+            assert_eq!(actual, expected.pixels(), "scale {scale}");
+            let surface =
+                Surface::from_scene(&scene, &PixelFont, &RawImages::default(), &cache).unwrap();
+            let actual = unsafe {
+                assert_eq!(IOSurfaceLock(surface.raw, 0, null_mut()), 0);
+                let base = IOSurfaceGetBaseAddress(surface.raw).cast::<u8>();
+                let stride = IOSurfaceGetBytesPerRow(surface.raw);
+                let bytes = (0..size.1)
+                    .flat_map(|row| {
+                        std::slice::from_raw_parts(base.add(row * stride), size.0 * 4).to_vec()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(IOSurfaceUnlock(surface.raw, 0, null_mut()), 0);
+                bytes
+            };
+            let expected = expected
+                .pixels()
+                .iter()
+                .flat_map(|rgba| match surface.format {
+                    SurfaceFormat::Bgra8 => rgba.rotate_right(8).to_le_bytes(),
+                    #[cfg(target_arch = "aarch64")]
+                    SurfaceFormat::OpaqueRgb10 => opaque_rgb10(*rgba),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual, expected,
+                "all rows reach the native surface at scale {scale}"
+            );
+            let row = Bitmap::new(size.0, 1, Color::WHITE);
+            assert!(!surface.write_rows(size.1, PixelRegion::whole(&row).unwrap()));
+            assert!(!surface.write_rows(usize::MAX, PixelRegion::whole(&row).unwrap()));
+        }
+    }
 
     #[test]
     fn a_cropped_surface_reads_the_source_stride_without_copying_padding() {

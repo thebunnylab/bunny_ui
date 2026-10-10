@@ -156,6 +156,26 @@ impl BaseLayer {
         }
     }
 
+    unsafe fn paint_scene(
+        &mut self,
+        scene: &software_patch::Scene,
+        size: Size,
+        text: &dyn TextEngine,
+        images: &dyn ImageEngine,
+        cache: &MeasureCache,
+    ) -> bool {
+        if let Some(surface) = software_patch::Surface::from_scene(scene, text, images, cache) {
+            unsafe {
+                self.size(size, scene.scale());
+                msg_void_id(self.raw, sel("setContents:"), surface.raw);
+            }
+            self.backing = BaseBacking::Surface(surface);
+            true
+        } else {
+            unsafe { self.paint(scene.raster(text, images), size, scene.scale()) }
+        }
+    }
+
     unsafe fn paint(&mut self, bitmap: Bitmap, size: Size, scale: usize) -> bool {
         let Some(backing) = BaseBacking::new(bitmap) else {
             return false;
@@ -332,6 +352,36 @@ struct NativeUpdates {
 }
 
 impl NativeUpdates {
+    /// The immutable base needs only the spans it painted, not every hidden
+    /// byte of an old document. Current frames retain their cheap shared list.
+    fn new(display: &DisplayList, physical: (usize, usize), scale: usize, canvas: Color) -> Self {
+        let commands = display
+            .iter()
+            .cloned()
+            .map(|mut command| {
+                if let bunny_ui::layout::DrawCommand::TextLine { content, range, .. } = &mut command
+                    && content.len() > 4096
+                    && range.1 - range.0 < content.len() / 4
+                {
+                    *content = Arc::from(&content[range.0..range.1]);
+                    *range = (0, content.len());
+                }
+                command
+            })
+            .collect::<Vec<_>>();
+        let base = (
+            Rc::new(DisplayList::from(commands)),
+            physical,
+            scale,
+            canvas,
+        );
+        Self {
+            current: base.clone(),
+            base,
+            patch: None,
+        }
+    }
+
     fn present(&mut self, frame: scroll_bands::Frame<'_>) -> bool {
         let scroll_bands::Frame {
             root,
@@ -636,14 +686,15 @@ impl WindowPresenter {
             && !bands
             && let Some(scene) =
                 software_patch::Scene::base(display, physical, scale, canvas, text, &native.boxes)
-            && unsafe { native.base.paint(scene.raster(text, images), size, scale) }
+            && unsafe {
+                native
+                    .base
+                    .paint_scene(&scene, size, text, images, &native.boxes)
+            }
         {
-            let base = (Rc::new(display.clone()), physical, scale, canvas);
-            native.state = NativeState::Patched(Box::new(NativeUpdates {
-                current: base.clone(),
-                base,
-                patch: None,
-            }));
+            native.state = NativeState::Patched(Box::new(NativeUpdates::new(
+                display, physical, scale, canvas,
+            )));
             return;
         }
         if let NativeState::Patched(updates) = &mut native.state
@@ -905,6 +956,55 @@ mod tests {
                 drop(presenter);
                 msg_void(layer, sel("release"));
             }
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    #[test]
+    fn a_native_base_witness_releases_hidden_document_bytes() {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
+            let size = Size {
+                width: 320.0,
+                height: 240.0,
+            };
+            let mut presenter = WindowPresenter::attach(layer, 1.0).unwrap();
+            let document: Arc<str> =
+                format!("first visible line{}", "hidden text".repeat(100_000)).into();
+            let lifetime = Arc::downgrade(&document);
+            for content in [document, Arc::from("other visible line")] {
+                let display = DisplayList::from(vec![
+                    DrawCommand::FillRect {
+                        rect: rect(0.0, 0.0, 320.0, 240.0),
+                        color: Color::WHITE,
+                        corner_radius: Corners::all(5.0),
+                    },
+                    DrawCommand::TextLine {
+                        origin: Point { x: 20.0, y: 30.0 },
+                        content,
+                        range: (0, 18),
+                        color: Color::BLACK,
+                        font: FontSpec::DEFAULT,
+                    },
+                ]);
+                presenter.present(
+                    &display,
+                    size,
+                    1,
+                    Color::BLACK,
+                    &PixelFont,
+                    &RawImages::default(),
+                    false,
+                );
+            }
+            assert!(matches!(presenter.strategy, Strategy::Native(_)));
+            assert!(
+                lifetime.upgrade().is_none(),
+                "the immutable paint witness must not pin the original document"
+            );
+            drop(presenter);
+            msg_void(layer, sel("release"));
             objc_autoreleasePoolPop(pool);
         }
     }
