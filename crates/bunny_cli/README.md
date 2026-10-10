@@ -9,6 +9,7 @@ bunny new my_app
 cd my_app
 bunny run            # on this computer
 bunny run -d ios     # in the iOS Simulator
+bunny run -d web     # in the browser
 ```
 
 | Command | |
@@ -55,5 +56,12 @@ under `target/bunny/`), so notifications and its name in the menu bar work. On
 the iOS Simulator, `bunny` assembles the `.app` from `ios/Info.plist`, installs
 it and streams its console; `BUNNY_*` and `RUST_BACKTRACE` reach the app.
 
-Coming next: the web and Android in `bunny run`, hot reload on `r`, iPhones,
-and `bunny build` for release packages.
+In the browser (`-d web`), `bunny` builds the app's library for wasm, puts the
+page together — the project's `web/` with `index.html` filled in, and the glue
+of the very `bunny-ui-web` cargo resolved, its ABI checked against the
+framework's — and serves it at `http://localhost:8080/` (`--web-port`,
+`--web-hostname`, `--no-open`). A new build reloads the page by itself, and the
+page's console errors, a wasm panic among them, show in the terminal.
+
+Coming next: Android in `bunny run`, hot reload on `r`, iPhones, and
+`bunny build` for release packages.

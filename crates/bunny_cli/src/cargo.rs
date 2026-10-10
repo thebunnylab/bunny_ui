@@ -38,6 +38,8 @@ pub struct Build {
     pub package: String,
     pub what: Target,
     pub release: bool,
+    /// A custom profile (`web`), in place of dev or release.
+    pub profile: Option<String>,
     /// A cross target triple; `None` builds for this machine.
     pub target: Option<String>,
     pub features: Vec<String>,
@@ -82,8 +84,14 @@ pub fn build(spec: &Build) -> Result<Built> {
             command.arg("--bin").arg(name);
         }
     }
-    if spec.release {
-        command.arg("--release");
+    match &spec.profile {
+        Some(profile) => {
+            command.arg("--profile").arg(profile);
+        }
+        None if spec.release => {
+            command.arg("--release");
+        }
+        None => {}
     }
     if let Some(target) = &spec.target {
         command.arg("--target").arg(target);

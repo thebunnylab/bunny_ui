@@ -23,6 +23,7 @@ pub fn build(project: &Project, options: &Options) -> Result<PathBuf> {
         package: project.package.clone(),
         what: Target::Bin(bin.to_string()),
         release: options.release,
+        profile: None,
         target: None,
         features: options.features.clone(),
         env: project.build_env(),

@@ -17,6 +17,8 @@ pub struct Project {
     pub manifest: PathBuf,
     /// The package's folder: where `android/`, `ios/`, `web/` live.
     pub dir: PathBuf,
+    /// The workspace's root: where cargo reads the profiles from.
+    pub workspace_root: PathBuf,
     pub target_dir: PathBuf,
     /// The binary `run` starts on the desktop and iOS.
     pub bin: Option<String>,
@@ -34,6 +36,7 @@ impl Project {
     pub fn discover(dir: &Path, package: Option<&str>) -> Result<Project> {
         let metadata = cargo::metadata(dir, None)?;
         let target_dir = PathBuf::from(metadata.str_at(&["target_directory"]).unwrap_or("target"));
+        let workspace_root = PathBuf::from(metadata.str_at(&["workspace_root"]).unwrap_or("."));
         let packages = metadata.get("packages").map(Value::as_array).unwrap_or_default();
         let absolute = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
         let chosen = match package {
@@ -58,10 +61,10 @@ impl Project {
                 }
             }
         };
-        Project::from_package(chosen, target_dir)
+        Project::from_package(chosen, workspace_root, target_dir)
     }
 
-    fn from_package(package: &Value, target_dir: PathBuf) -> Result<Project> {
+    fn from_package(package: &Value, workspace_root: PathBuf, target_dir: PathBuf) -> Result<Project> {
         let name = package.str_at(&["name"]).unwrap_or_default().to_string();
         let manifest = PathBuf::from(package.str_at(&["manifest_path"]).unwrap_or_default());
         let dir = manifest.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -93,6 +96,7 @@ impl Project {
             package: name,
             manifest,
             dir,
+            workspace_root,
             target_dir,
             bin,
             has_lib,
@@ -100,6 +104,13 @@ impl Project {
             id,
             build,
         })
+    }
+
+    /// Whether the workspace defines the web's shipping profile — cargo
+    /// reads profiles from the root manifest only.
+    pub fn has_web_profile(&self) -> bool {
+        std::fs::read_to_string(self.workspace_root.join("Cargo.toml"))
+            .is_ok_and(|manifest| manifest.lines().any(|line| line.trim() == "[profile.web]"))
     }
 
     /// The id, which a phone needs before anything is installed on it.
@@ -158,7 +169,7 @@ mod tests {
     use crate::json;
 
     fn package(text: &str) -> Project {
-        Project::from_package(&json::parse(text).unwrap(), PathBuf::from("/t")).unwrap()
+        Project::from_package(&json::parse(text).unwrap(), PathBuf::from("/w"), PathBuf::from("/t")).unwrap()
     }
 
     #[test]

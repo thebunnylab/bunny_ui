@@ -20,9 +20,11 @@ pub mod keys;
 pub mod platform;
 pub mod process;
 pub mod project;
+pub mod serve;
 pub mod template;
 pub mod templates;
 pub mod term;
 pub mod toolchains;
+pub mod wasm;
 
 pub use cli::main;

@@ -3,6 +3,7 @@
 
 pub mod desktop;
 pub mod ios;
+pub mod web;
 
 use std::fs;
 use std::path::Path;

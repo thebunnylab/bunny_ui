@@ -49,6 +49,7 @@ pub fn build_simulator(project: &Project, options: &Options) -> Result<App> {
         package: project.package.clone(),
         what: Target::Bin(bin.to_string()),
         release: options.release,
+        profile: None,
         target: Some(simulator_target().to_string()),
         features: options.features.clone(),
         env,

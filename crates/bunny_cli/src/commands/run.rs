@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 use crate::keys::{INTERRUPT, Keys};
 use crate::platform::{self, Options, Session};
 use crate::project::Project;
+use crate::serve::Server;
 use crate::term;
 
 pub const SUMMARY: &str = "Run the app on this computer, a simulator, an emulator or a phone";
@@ -21,7 +22,8 @@ pub const ABOUT: &str = "\
 Builds the app for a device and starts it there, its output in this
 terminal. Without -d it runs on this computer; -d takes an id or a name from
 `bunny devices`, or a platform (ios, macos…) — a simulator that is off is
-booted first.
+booted first. `-d web` serves the page and opens the browser; a new build
+reloads it, and the page's console errors show here.
 
 While it runs: r or R restarts it with the code as it is now, q stops it.";
 
@@ -31,6 +33,9 @@ pub const OPTIONS: &[Opt] = &[
     Opt::value("features", "LIST", "Cargo features to turn on (repeatable)"),
     Opt::value("package", "NAME", "The app to run, in a workspace of several").short('p'),
     Opt::flag("detach", "Start the app and return, without watching it"),
+    Opt::value("web-port", "PORT", "The port the page is served on (default: 8080, or the next free one)"),
+    Opt::value("web-hostname", "HOST", "The address the page is served on (default: 127.0.0.1)"),
+    Opt::flag("no-open", "Serve the page without opening a browser"),
     HELP,
 ];
 
@@ -51,7 +56,16 @@ pub fn run(matches: &Matches) -> Result<()> {
         println!("Starting {}…", term::bold(&device.name));
         devices::boot(&device)?
     };
-    let mut target = Runner::new(&project, &device, options)?;
+    let web = Web {
+        host: matches.value("web-hostname").unwrap_or("127.0.0.1").to_string(),
+        port: match matches.value("web-port") {
+            Some(port) => port.parse().map_err(|_| Error::usage(format!("`--web-port {port}` is not a port")))?,
+            None => 8080,
+        },
+        open: !matches.flag("no-open"),
+        server: None,
+    };
+    let mut target = Runner::new(&project, &device, options, web)?;
     println!("{}", term::bold(&format!("Building {} for {}…", project.name, device.name)));
     let Some(mut session) = target.start()? else {
         println!("{}", term::dim("detached: the app runs on its own"));
@@ -86,16 +100,28 @@ struct Runner<'a> {
     project: &'a Project,
     device: &'a Device,
     options: Options,
+    web: Web,
+}
+
+/// The browser's half: the server outlives every rebuild, and the page
+/// reloads itself when one lands.
+#[derive(Default)]
+struct Web {
+    host: String,
+    port: u16,
+    open: bool,
+    server: Option<Server>,
 }
 
 impl<'a> Runner<'a> {
-    fn new(project: &'a Project, device: &'a Device, options: Options) -> Result<Runner<'a>> {
+    fn new(project: &'a Project, device: &'a Device, options: Options, web: Web) -> Result<Runner<'a>> {
         match (device.platform, device.kind) {
-            (_, Kind::Desktop) | (Platform::Ios, Kind::Simulator) => Ok(Runner { project, device, options }),
+            (Platform::Web, _) if options.detach => Err(Error::usage("the page needs `bunny run` to serve it: run it without --detach")),
+            (_, Kind::Desktop | Kind::Browser) | (Platform::Ios, Kind::Simulator) => Ok(Runner { project, device, options, web }),
             (Platform::Ios, _) => Err(Error::new("running on an iPhone needs signing, which `bunny` does not do yet")
                 .hint("run on a simulator meanwhile: bunny run -d ios")),
             (platform, _) => Err(Error::new(format!("`bunny run` does not run {} apps yet", platform.title()))
-                .hint("it runs on this computer and the iOS Simulator; the rest is coming")),
+                .hint("it runs on this computer, the iOS Simulator and the browser; Android is coming")),
         }
     }
 
@@ -103,6 +129,26 @@ impl<'a> Runner<'a> {
     fn start(&mut self) -> Result<Option<Box<dyn Session>>> {
         let began = Instant::now();
         let session = match (self.device.platform, self.device.kind) {
+            (Platform::Web, _) => {
+                let site = platform::web::build(self.project, &self.options, true)?;
+                match &self.web.server {
+                    Some(server) => {
+                        server.reload();
+                        announce(began, self.device);
+                    }
+                    None => {
+                        let server = Server::start(site.dir, &self.web.host, self.web.port)
+                            .map_err(|error| Error::new(format!("the page could not be served: {error}")))?;
+                        announce(began, self.device);
+                        println!("{}", term::bold(&format!("    {}", server.url())));
+                        if self.web.open {
+                            platform::web::open(&server.url());
+                        }
+                        self.web.server = Some(server);
+                    }
+                }
+                Some(Box::new(Page) as Box<dyn Session>)
+            }
             (_, Kind::Desktop) => {
                 let executable = platform::desktop::build(self.project, &self.options)?;
                 announce(began, self.device);
@@ -117,6 +163,18 @@ impl<'a> Runner<'a> {
         };
         Ok(session)
     }
+}
+
+/// The page in the browser: it ends when the person closes `bunny run`.
+struct Page;
+
+impl Session for Page {
+    fn wait(&mut self, timeout: Duration) -> Option<Option<i32>> {
+        std::thread::sleep(timeout);
+        None
+    }
+
+    fn stop(&mut self) {}
 }
 
 fn announce(began: Instant, device: &Device) {
