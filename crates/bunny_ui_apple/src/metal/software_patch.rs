@@ -364,29 +364,8 @@ impl Scene {
                 canvas: self.canvas,
             });
         }
-        // The raster witness needs only visible line bytes, never a large
-        // document allocation kept alive by a small range into that document.
-        let long_line = |command: &DrawCommand| {
-            matches!(command,
-            DrawCommand::TextLine { content, range, .. }
-                if content.len() > 4096 && range.1 - range.0 < content.len() / 4)
-        };
-        let display = if self.display.iter().any(long_line) {
-            let mut commands = self.display.as_slice().to_vec();
-            for command in &mut commands {
-                if long_line(command)
-                    && let DrawCommand::TextLine { content, range, .. } = command
-                {
-                    *content = std::sync::Arc::from(&content[range.0..range.1]);
-                    *range = (0, content.len());
-                }
-            }
-            DisplayList::from(commands)
-        } else {
-            self.display.clone()
-        };
         let raster = retained.as_mut().expect("initialized raster");
-        raster.surface.frame(display, text, images);
+        raster.surface.frame(self.display.clone(), text, images);
         raster.surface.bitmap()
     }
 
@@ -489,7 +468,18 @@ pub(super) fn patch_coordinates(
                 DrawCommand::FillRect { rect: bounds, .. }
                 | DrawCommand::StrokeRect { rect: bounds, .. }
                 | DrawCommand::PushClip { rect: bounds, .. } => *bounds = rect(*bounds),
-                DrawCommand::TextLine { origin, .. } => *origin = point(*origin),
+                DrawCommand::TextLine {
+                    origin, content, range, ..
+                } => {
+                    *origin = point(*origin);
+                    // Native scenes can outlive their source frame, including
+                    // hidden patches. Retain only the visible text of a large
+                    // document, before any scene or raster witness owns it.
+                    if content.len() > 4096 && range.1 - range.0 < content.len() / 4 {
+                        *content = std::sync::Arc::from(&content[range.0..range.1]);
+                        *range = (0, content.len());
+                    }
+                }
                 DrawCommand::PopClip => {}
                 DrawCommand::Gradient { .. }
                 | DrawCommand::Backdrop { .. }
@@ -1263,6 +1253,59 @@ mod tests {
                     expected.pixels()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_retained_patch_scene_owns_only_visible_document_bytes() {
+        for scale in [1, 2, 3] {
+            let content: std::sync::Arc<str> =
+                ("hidden\n".repeat(4096) + "visible é🎨" + &"\nhidden".repeat(4096)).into();
+            let original = std::sync::Arc::downgrade(&content);
+            let start = "hidden\n".len() * 4096;
+            let end = start + "visible é🎨".len();
+            let display = DisplayList::from(vec![DrawCommand::TextLine {
+                origin: Point { x: 1.5, y: 2.5 },
+                content,
+                range: (start, end),
+                color: Color::BLACK,
+                font: FontSpec::DEFAULT,
+            }]);
+            let rect = (0, 0, 160 * scale as i64, 40 * scale as i64);
+            let expected = rasterize_with(
+                &display,
+                160 * scale,
+                40 * scale,
+                scale,
+                Color::WHITE,
+                &PixelFont,
+                &RawImages::default(),
+            );
+            let scene = Scene::new(
+                &display,
+                rect,
+                scale,
+                Color::WHITE,
+                &PixelFont,
+                &MeasureCache::default(),
+            )
+            .unwrap();
+            drop(display);
+            assert!(
+                original.upgrade().is_none(),
+                "a cached or hidden native patch must not pin a whole old document"
+            );
+            assert_eq!(
+                scene.raster(&PixelFont, &RawImages::default()).pixels(),
+                expected.pixels()
+            );
+            let mut retained = None;
+            assert_eq!(
+                scene
+                    .raster_in(&mut retained, &PixelFont, &RawImages::default())
+                    .pixels(),
+                expected.pixels()
+            );
         }
     }
 
