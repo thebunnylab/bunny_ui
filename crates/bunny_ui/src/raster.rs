@@ -1482,8 +1482,8 @@ impl Surface {
             bounds: Vec::new(),
             primed: false,
             cache: crate::text_engine::MeasureCache::default(),
-            rgba: vec![0; width * height * 4],
-            rgba_pending: vec![(0, 0, width as i64, height as i64)],
+            rgba: Vec::new(),
+            rgba_pending: Vec::new(),
         }
     }
 
@@ -1715,8 +1715,25 @@ impl Surface {
 
         self.display = display;
         self.bounds = new_bounds;
-        self.rgba_pending.extend(damage.iter().copied());
+        if !self.rgba.is_empty() {
+            self.rgba_pending.extend(damage.iter().copied());
+            if self.rgba_pending.len() > 8 {
+                let all = self.rgba_pending.iter().copied().reduce(union).expect("non-empty damage");
+                self.rgba_pending.clear();
+                self.rgba_pending.push(all);
+            }
+        }
         damage
+    }
+
+    /// Bitmap consumers never allocate a second pixel representation. A late
+    /// first byte read synchronizes the current whole picture, not its history.
+    fn prepare_rgba(&mut self) {
+        if self.rgba.is_empty() {
+            self.rgba.resize(self.bitmap.width * self.bitmap.height * 4, 0);
+            self.rgba_pending.clear();
+            self.rgba_pending.push(self.whole());
+        }
     }
 
     /// [`Surface::rgba`] for a surface cleared to NOTHING: the blend
@@ -1725,6 +1742,7 @@ impl Surface {
     /// damage-only like the rest. A surface is synced one way or the
     /// other for its whole life.
     pub fn rgba_straight(&mut self) -> &[u8] {
+        self.prepare_rgba();
         let width = self.bitmap.width;
         for &(x0, y0, x1, y1) in &self.rgba_pending {
             let x0 = x0.clamp(0, width as i64) as usize;
@@ -1760,6 +1778,7 @@ impl Surface {
     /// buffer is returned for the backend to blit from — persistent, so
     /// the backend can also present PARTIALLY from the same pointer.
     pub fn rgba(&mut self) -> &[u8] {
+        self.prepare_rgba();
         let width = self.bitmap.width;
         for &(x0, y0, x1, y1) in &self.rgba_pending {
             let x0 = x0.clamp(0, width as i64) as usize;
@@ -2260,6 +2279,40 @@ mod tests {
                 line(12.0, 34.0, "beta", Color::BLACK),
             ]),
         ]
+    }
+
+    #[test]
+    fn bitmap_only_frames_keep_no_rgba_mirror_or_damage_history() {
+        for straight in [false, true] {
+            let canvas = if straight { Color { r: 0, g: 0, b: 0, a: 0 } } else { Color::WHITE };
+            let mut surface = Surface::new(64, 32, 1, canvas);
+            let mut last = DisplayList::default();
+            for index in 0..100 {
+                last = list(vec![fill(8.0 + f64::from(index % 9), 8.0, 20.0, 16.0,
+                    Color { r: 180, g: 70, b: 40, a: 120 })]);
+                surface.frame(last.clone(), &PixelFont, &RawImages::default());
+                assert_eq!(surface.rgba.capacity(), 0, "bitmap readers do not need a byte mirror");
+                assert!(surface.rgba_pending.is_empty(), "unrequested mirrors need no damage history");
+            }
+            let oracle = rasterize(&last, 64, 32, canvas).to_rgba_bytes();
+            if straight {
+                assert_eq!(surface.rgba_straight(), unpremultiplied(&oracle));
+            } else {
+                assert_eq!(surface.rgba(), oracle);
+            }
+        }
+    }
+
+    #[test]
+    fn delayed_mirror_reads_keep_bounded_damage_and_all_changed_pixels() {
+        let mut surface = Surface::new(120, 80, 1, Color::CANVAS);
+        assert_eq!(surface.rgba(), Bitmap::new(120, 80, Color::CANVAS).to_rgba_bytes());
+        let frames = hover_frames();
+        for index in 0..100 {
+            surface.frame(frames[index % 3].clone(), &PixelFont, &RawImages::default());
+            assert!(surface.rgba_pending.len() <= 8, "delayed readers must not retain every frame");
+        }
+        assert_eq!(surface.rgba(), rasterize(&frames[0], 120, 80, Color::CANVAS).to_rgba_bytes());
     }
 
     #[test]

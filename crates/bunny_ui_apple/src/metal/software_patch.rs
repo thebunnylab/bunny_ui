@@ -26,6 +26,14 @@ pub(super) struct Scene {
     canvas: Color,
 }
 
+/// One bounded working bitmap; native surfaces retain presented variants.
+pub(super) struct Raster {
+    surface: bunny_ui::raster::Surface,
+    size: (usize, usize),
+    scale: usize,
+    canvas: Color,
+}
+
 pub(super) struct BasePiece {
     pub(super) surface: Surface,
     pub(super) bounds: DamageRect,
@@ -333,6 +341,53 @@ impl Scene {
             }
         }
         true
+    }
+
+    pub(super) fn raster_in<'a>(
+        &self,
+        retained: &'a mut Option<Raster>,
+        text: &dyn TextEngine,
+        images: &dyn ImageEngine,
+    ) -> &'a Bitmap {
+        if !retained.as_ref().is_some_and(|old| {
+            old.size == self.size && old.scale == self.scale && old.canvas == self.canvas
+        }) {
+            *retained = Some(Raster {
+                surface: bunny_ui::raster::Surface::new(
+                    self.size.0,
+                    self.size.1,
+                    self.scale,
+                    self.canvas,
+                ),
+                size: self.size,
+                scale: self.scale,
+                canvas: self.canvas,
+            });
+        }
+        // The raster witness needs only visible line bytes, never a large
+        // document allocation kept alive by a small range into that document.
+        let long_line = |command: &DrawCommand| {
+            matches!(command,
+            DrawCommand::TextLine { content, range, .. }
+                if content.len() > 4096 && range.1 - range.0 < content.len() / 4)
+        };
+        let display = if self.display.iter().any(long_line) {
+            let mut commands = self.display.as_slice().to_vec();
+            for command in &mut commands {
+                if long_line(command)
+                    && let DrawCommand::TextLine { content, range, .. } = command
+                {
+                    *content = std::sync::Arc::from(&content[range.0..range.1]);
+                    *range = (0, content.len());
+                }
+            }
+            DisplayList::from(commands)
+        } else {
+            self.display.clone()
+        };
+        let raster = retained.as_mut().expect("initialized raster");
+        raster.surface.frame(display, text, images);
+        raster.surface.bitmap()
     }
 
     pub(super) fn raster(&self, text: &dyn TextEngine, images: &dyn ImageEngine) -> Bitmap {
@@ -651,6 +706,40 @@ impl Surface {
             return false;
         }
         self.write_rows(0, pixels)
+    }
+
+    /// Compare the immutable presented backing without retaining a CPU copy.
+    /// The conversion is the same lossless encoding used by write_pixels.
+    pub(super) fn matches_pixels(&self, pixels: PixelRegion<'_>) -> bool {
+        if pixels.size() != self.size {
+            return false;
+        }
+        unsafe {
+            const READ_ONLY: u32 = 1;
+            if IOSurfaceLock(self.raw, READ_ONLY, null_mut()) != 0 {
+                return false;
+            }
+            let base = IOSurfaceGetBaseAddress(self.raw).cast::<u8>();
+            let stride = IOSurfaceGetBytesPerRow(self.raw);
+            let matches = !base.is_null()
+                && stride >= self.size.0 * 4
+                && pixels.rows().enumerate().all(|(row, pixels)| {
+                    let native =
+                        std::slice::from_raw_parts(base.add(row * stride), self.size.0 * 4);
+                    pixels
+                        .iter()
+                        .zip(native.as_chunks::<4>().0)
+                        .all(|(rgba, bytes)| match self.format {
+                            SurfaceFormat::Bgra8 => rgba.rotate_right(8).to_le_bytes() == *bytes,
+                            #[cfg(target_arch = "aarch64")]
+                            SurfaceFormat::OpaqueRgb10 => {
+                                rgba & 0xff == 0xff && opaque_rgb10(*rgba) == *bytes
+                            }
+                        })
+                });
+            let unlocked = IOSurfaceUnlock(self.raw, READ_ONLY, null_mut()) == 0;
+            matches && unlocked
+        }
     }
 
     fn write_rows(&self, y: usize, pixels: PixelRegion<'_>) -> bool {
@@ -1089,6 +1178,124 @@ mod tests {
         assert!(PixelRegion::new(&bitmap, (4, 1, 6, 2)).is_none());
         assert!(PixelRegion::new(&bitmap, (1, 3, 4, usize::MAX)).is_none());
         assert!(!surface.write_pixels(PixelRegion::whole(&bitmap).unwrap()));
+    }
+
+    #[test]
+    fn shared_pixel_comparison_is_exact_without_a_cpu_copy() {
+        for make in [Surface::new, Surface::new_opaque] {
+            let surface = make((5, 3)).unwrap();
+            for color in [Color::BLACK, Color::WHITE, Color::hex(0x123456)] {
+                let bitmap = Bitmap::new(5, 3, color);
+                assert!(surface.write(&bitmap));
+                assert!(surface.matches_pixels(PixelRegion::whole(&bitmap).unwrap()));
+                let changed = Bitmap::new(
+                    5,
+                    3,
+                    Color {
+                        b: color.b ^ 1,
+                        ..color
+                    },
+                );
+                assert!(!surface.matches_pixels(PixelRegion::whole(&changed).unwrap()));
+                let alpha = Bitmap::new(5, 3, Color { a: 254, ..color });
+                assert!(!surface.matches_pixels(PixelRegion::whole(&alpha).unwrap()));
+                assert!(
+                    !surface.matches_pixels(PixelRegion::whole(&Bitmap::new(4, 3, color)).unwrap())
+                );
+                assert!(
+                    surface.matches_pixels(PixelRegion::whole(&bitmap).unwrap()),
+                    "comparison must never modify shared pixels"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_patch_pixels_match_full_raster_through_shape_and_scale_changes() {
+        let mut retained = None;
+        for scale in [1, 2, 3, 1] {
+            for (height, alpha, radius) in [(20.0, 120, 3.0), (9.5, 180, 3.0), (20.0, 120, 0.0)] {
+                let display = DisplayList::from(vec![
+                    DrawCommand::PushClip {
+                        rect: Rect {
+                            origin: Point { x: 1.5, y: 2.5 },
+                            size: Size {
+                                width: 24.0,
+                                height: 25.0,
+                            },
+                        },
+                        corner_radius: Corners::all(2.0),
+                    },
+                    DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point { x: 2.5, y: 4.5 },
+                            size: Size { width: 6.0, height },
+                        },
+                        color: Color {
+                            r: 60,
+                            g: 140,
+                            b: 200,
+                            a: alpha,
+                        },
+                        corner_radius: Corners::all(radius),
+                    },
+                    DrawCommand::PopClip,
+                ]);
+                let s = scale as i64;
+                let scene = Scene::new(
+                    &display,
+                    (0, 0, 32 * s, 32 * s),
+                    scale,
+                    if alpha == 180 {
+                        Color::BLACK
+                    } else {
+                        Color::WHITE
+                    },
+                    &PixelFont,
+                    &MeasureCache::default(),
+                )
+                .unwrap();
+                let expected = scene.raster(&PixelFont, &RawImages::default());
+                assert_eq!(
+                    scene
+                        .raster_in(&mut retained, &PixelFont, &RawImages::default())
+                        .pixels(),
+                    expected.pixels()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_incremental_patch_witness_does_not_pin_hidden_document_bytes() {
+        let mut retained = None;
+        let original = {
+            let content: std::sync::Arc<str> = ("visible".to_owned() + &"x".repeat(32768)).into();
+            let weak = std::sync::Arc::downgrade(&content);
+            let display = DisplayList::from(vec![DrawCommand::TextLine {
+                origin: Point { x: 1.0, y: 1.0 },
+                content,
+                range: (0, 7),
+                color: Color::BLACK,
+                font: FontSpec::DEFAULT,
+            }]);
+            let scene = Scene::new(
+                &display,
+                (0, 0, 80, 32),
+                1,
+                Color::WHITE,
+                &PixelFont,
+                &MeasureCache::default(),
+            )
+            .unwrap();
+            scene.raster_in(&mut retained, &PixelFont, &RawImages::default());
+            weak
+        };
+        assert!(retained.is_some());
+        assert!(
+            original.upgrade().is_none(),
+            "only the seven visible bytes belong to the raster witness"
+        );
     }
 
     #[test]

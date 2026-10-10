@@ -845,8 +845,15 @@ struct Shown {
     layer: Layer,
 }
 struct Overlay {
-    bitmap: Bitmap,
     layer: Layer,
+}
+
+#[derive(Default)]
+struct Overlays {
+    layers: Vec<Overlay>,
+    // The layer painted by prior.overlay, not a failed trial scene.
+    shown: Option<Id>,
+    raster: Option<software_patch::Raster>,
 }
 
 enum PreparedOverlay {
@@ -872,9 +879,7 @@ pub(super) struct Presenter {
     prior: Option<Scene>,
     viewport: Option<Layer>,
     shown: Vec<Shown>,
-    overlays: Vec<Overlay>,
-    // Identifies the layer painted by prior.overlay, not a failed trial scene.
-    overlay_shown: Option<Id>,
+    overlays: Overlays,
     cache: RasterCache,
     surfaces: Surfaces,
     offset: i64,
@@ -892,7 +897,7 @@ impl Presenter {
         text: &dyn TextEngine,
         boxes: &MeasureCache,
     ) -> bool {
-        self.overlay_shown = None;
+        self.overlays.shown = None;
         self.prior = Scene::new(display, physical, scale, canvas, text, boxes);
         self.prior.is_some()
     }
@@ -922,53 +927,55 @@ impl Presenter {
             if let Some(viewport) = &self.viewport {
                 msg_void_bool(viewport.raw, sel("setHidden:"), 1);
             }
-            for overlay in &self.overlays {
+            for overlay in &self.overlays.layers {
                 msg_void_bool(overlay.layer.raw, sel("setHidden:"), 1);
             }
         }
         self.active = false;
         self.prior = None;
         self.shown.clear();
-        self.overlays.clear();
-        self.overlay_shown = None;
+        self.overlays = Overlays::default();
         self.cache = RasterCache::default();
         self.offset = 0;
     }
 
     fn prepare_overlay(
-        overlays: &[Overlay],
+        overlays: &mut Overlays,
         surfaces: &mut Surfaces,
-        previous: Option<(&OverlayPaint, Id)>,
+        previous: Option<&OverlayPaint>,
         paint: Option<&OverlayPaint>,
         scale: usize,
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
     ) -> Option<PreparedOverlay> {
         let Some((_, paint)) = paint else {
+            overlays.raster = None;
             return Some(PreparedOverlay::Hidden);
         };
         // Patch coordinates already express the exact snapped pixel geometry.
         // Reuse the last presented picture before allocating/rasterizing a
         // bitmap; different commands still use the exact pixel cache below.
-        if let Some(((_, prior), shown)) = previous
+        if let Some(((_, prior), shown)) = previous.zip(overlays.shown)
             && paint.matches(prior)
-            && let Some(at) = overlays.iter().position(|o| o.layer.raw == shown)
+            && let Some(at) = overlays.layers.iter().position(|o| o.layer.raw == shown)
         {
             return Some(PreparedOverlay::Reuse(at));
         }
-        let bitmap = paint.raster(text, images);
-        if let Some(at) = overlays.iter().position(|o| {
-            o.bitmap.width() == bitmap.width()
-                && o.bitmap.height() == bitmap.height()
-                && o.bitmap.pixels() == bitmap.pixels()
+        let bitmap = paint.raster_in(&mut overlays.raster, text, images);
+        let pixels = software_patch::PixelRegion::whole(bitmap)?;
+        if let Some(at) = overlays.layers.iter().position(|o| {
+            o.layer
+                .surface
+                .as_ref()
+                .is_some_and(|surface| surface.matches_pixels(pixels))
         }) {
             return Some(PreparedOverlay::Reuse(at));
         }
-        let surface = surfaces.prepare(&bitmap)?;
+        let surface = surfaces.prepare(bitmap)?;
         let mut layer = unsafe { Layer::new(scale)? };
         unsafe { msg_void_id(layer.raw, sel("setContents:"), surface.raw) };
         layer.surface = Some(surface);
-        Some(PreparedOverlay::Fresh(Box::new(Overlay { bitmap, layer })))
+        Some(PreparedOverlay::Fresh(Box::new(Overlay { layer })))
     }
 
     unsafe fn show_overlay(
@@ -992,12 +999,12 @@ impl Presenter {
                         fresh.layer.raw,
                         viewport,
                     );
-                    self.overlays.push(*fresh);
-                    Some(self.overlays.len() - 1)
+                    self.overlays.layers.push(*fresh);
+                    Some(self.overlays.layers.len() - 1)
                 }
             };
-            self.overlay_shown = overlay.map(|at| self.overlays[at].layer.raw);
-            for (at, kept) in self.overlays.iter().enumerate() {
+            self.overlays.shown = overlay.map(|at| self.overlays.layers[at].layer.raw);
+            for (at, kept) in self.overlays.layers.iter().enumerate() {
                 msg_void_bool(
                     kept.layer.raw,
                     sel("setHidden:"),
@@ -1014,9 +1021,9 @@ impl Presenter {
                 }
             }
             // Three exact pixel variants handle small movements and returns.
-            if self.overlays.len() > 3 {
-                let at = (0..self.overlays.len()).find(|at| Some(*at) != overlay)?;
-                let mut old = self.overlays.remove(at);
+            if self.overlays.layers.len() > 3 {
+                let at = (0..self.overlays.layers.len()).find(|at| Some(*at) != overlay)?;
+                let mut old = self.overlays.layers.remove(at);
                 return old
                     .layer
                     .surface
@@ -1037,7 +1044,7 @@ impl Presenter {
                     .as_ref()
                     .is_some_and(|surface| surface.busy());
         }
-        for overlay in &mut self.overlays {
+        for overlay in &mut self.overlays.layers {
             overlay.layer.observed_use = overlay.layer.observed_use
                 || overlay
                     .layer
@@ -1077,12 +1084,9 @@ impl Presenter {
                 cache: &self.cache,
             };
             let Some(prepared) = Self::prepare_overlay(
-                &self.overlays,
+                &mut self.overlays,
                 &mut self.surfaces,
-                self.prior
-                    .as_ref()
-                    .and_then(|prior| prior.overlay.as_ref())
-                    .zip(self.overlay_shown),
+                self.prior.as_ref().and_then(|prior| prior.overlay.as_ref()),
                 overlay.as_ref(),
                 scale,
                 &cached,
@@ -1120,7 +1124,7 @@ impl Presenter {
         };
         let prior = self.prior.as_ref();
         if !prior.is_some_and(|prior| scene.compatible(prior)) {
-            self.overlay_shown = None;
+            self.overlays.shown = None;
             self.prior = Some(scene);
             return false;
         }
@@ -1141,7 +1145,7 @@ impl Presenter {
                 .map(Band::raster_pixels)
                 .sum();
             if pixels > MAX_PIXELS {
-                self.overlay_shown = None;
+                self.overlays.shown = None;
                 self.prior = Some(scene);
                 return false;
             }
@@ -1247,12 +1251,9 @@ impl Presenter {
             plan.push(Prepared::Fresh(layer));
         }
         let Some(overlay) = Self::prepare_overlay(
-            &self.overlays,
+            &mut self.overlays,
             &mut self.surfaces,
-            self.prior
-                .as_ref()
-                .and_then(|prior| prior.overlay.as_ref())
-                .zip(self.overlay_shown),
+            self.prior.as_ref().and_then(|prior| prior.overlay.as_ref()),
             scene.overlay.as_ref(),
             scale,
             &cached,
@@ -1441,7 +1442,25 @@ mod tests {
                         raster_requests,
                         "a repeated physical picture must not replay its text raster"
                     );
-                    assert_eq!(presenter.overlays.len(), 1);
+                    assert_eq!(presenter.overlays.layers.len(), 1);
+                }
+                // A smaller thumb no longer touches the separate glyph below it.
+                for height in [10.0, 9.0] {
+                    let DrawCommand::FillRect { rect, .. } = &mut commands[display.len() - 2]
+                    else {
+                        unreachable!()
+                    };
+                    rect.size.height = height;
+                    let next = DisplayList::from(commands.clone());
+                    let before = presenter.cache.tick.get();
+                    assert!(presenter.present(frame!(&next)));
+                    if height == 9.0 {
+                        assert_eq!(
+                            presenter.cache.tick.get(),
+                            before,
+                            "small decoration damage must not replay a distant glyph"
+                        );
+                    }
                 }
                 let DrawCommand::TextLine { color, .. } = commands.last_mut().unwrap() else {
                     unreachable!()
@@ -1453,7 +1472,7 @@ mod tests {
                     presenter.cache.tick.get() > raster_requests,
                     "changed paint must still rasterize"
                 );
-                assert_eq!(presenter.overlays.len(), 2);
+                assert!(presenter.overlays.layers.len() <= 3);
                 drop(presenter);
                 msg_void(root, sel("release"));
             }
