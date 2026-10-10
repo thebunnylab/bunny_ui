@@ -5453,9 +5453,17 @@ impl LayoutNode {
             // a split FILLS the offer on both axes — its whole job is
             // dividing the room it was given
             LayoutNode::Split { .. } => true,
-            LayoutNode::Scroll { axes, .. } => match axis {
-                Axis::Vertical => axes.vertical(),
-                Axis::Horizontal => axes.horizontal(),
+            // A scrolling axis takes the offered viewport. Across it, the
+            // child still decides: a horizontal region containing a table's
+            // vertical list needs height, while a single text line does not.
+            // Dropping that appetite makes a stack measure the entire list
+            // unbounded and turns every row into a visible row.
+            LayoutNode::Scroll { axes, child, .. } => {
+                let travels = match axis {
+                    Axis::Vertical => axes.vertical(),
+                    Axis::Horizontal => axes.horizontal(),
+                };
+                travels || child.is_flexible(axis, enclosing_main)
             },
             // Flexible so the waterfall OFFERS it the room; it answers with
             // less when its child needs less, and the surplus goes back.
