@@ -492,15 +492,21 @@ impl View for TextField {
                                         .reduce(|(a, b), (s, e)| (a.min(s), b.max(e)));
                                     let kept = span.map(|(start, end)| value[start..end].to_owned());
                                     // the first byte this edit can touch: the span it
-                                    // replaces, or the caret — one character before it
-                                    // for a backspace
-                                    touched = match (span, &command) {
-                                        (Some((start, _)), _) => start,
-                                        (None, crate::text_input::EditCommand::Backspace) => {
-                                            crate::text_input::previous_boundary(value, state.caret)
+                                    // replaces, or the grapheme boundary first touched
+                                    // by a deletion (a native caret may sit inside it)
+                                    let edit_start = match &command {
+                                        crate::text_input::EditCommand::Backspace if state.selection().is_none() => {
+                                            crate::grapheme::previous(value, state.caret)
                                         }
-                                        (None, _) => state.caret.min(value.len()),
+                                        crate::text_input::EditCommand::Delete if state.selection().is_none() => {
+                                            crate::grapheme::floor(value, state.caret)
+                                        }
+                                        _ => state.caret,
                                     };
+                                    // Committing marked text may join it to the
+                                    // preceding cluster: deletion can begin BEFORE
+                                    // the marked range the IME originally supplied.
+                                    touched = span.map_or(edit_start, |(start, _)| start.min(edit_start));
                                     output = crate::text_input::apply(value, state, command);
                                     value.len() != before
                                         || span.zip(kept).is_some_and(|((start, end), kept)| {
