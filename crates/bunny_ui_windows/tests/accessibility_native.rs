@@ -680,16 +680,26 @@ mod probe {
             until("native value event", || events.saw(30045, "Dinner 👩‍🚀"));
             until("native name event", || events.saw(30005, "Updated name"));
             println!("UIA native property events: name and value changes delivered");
+            println!("UIA phase: unsubscribe start");
             drop(events);
+            println!("UIA phase: unsubscribed");
+            println!("UIA phase: locate retiring row");
             let row = named(&client, &root, "Row 2");
+            println!("UIA phase: retiring row located");
             let removed = pattern(&row, 10000, &INVOKE_IID);
+            println!("UIA phase: remove-row invoke start");
             invoke(&named(&client, &root, "Remove row"));
+            println!("UIA phase: remove-row invoke accepted");
+            println!("UIA phase: wait row removal");
             until("row removed", || find(&client, &root, "Row 2").is_none());
+            println!("UIA phase: row removed");
             assert!(
                 (removed.table::<InvokePattern>().invoke)(removed.0) < 0,
                 "retired provider must refuse invocation"
             );
+            println!("UIA phase: open-modal invoke start");
             invoke(&named(&client, &root, "Open modal"));
+            println!("UIA phase: open-modal invoke accepted");
             let mut dismiss = None;
             until("modal exposed", || {
                 dismiss = modal(&client, window);
@@ -699,14 +709,20 @@ mod probe {
                 find(&client, &root, "Updated name").is_none(),
                 "modal excludes background fields"
             );
+            println!("UIA phase: dismiss-modal invoke start");
             invoke(&dismiss.unwrap());
+            println!("UIA phase: dismiss-modal invoke accepted");
             until("modal dismissed", || {
                 find(&client, &root, "Updated name").is_some()
             });
             let current = named(&client, &root, "Updated name");
             let current_value = pattern(&current, 10002, &VALUE_IID);
+            println!("UIA phase: window-close post");
             assert_ne!(PostMessageW(window, 0x0010, 0, 0), 0);
+            println!("UIA phase: window-close posted");
+            println!("UIA phase: wait window close");
             until("window closed", || IsWindow(window) == 0);
+            println!("UIA phase: window closed");
             let mut raw = ptr::null_mut();
             assert!(
                 (current_value.table::<ValuePattern>().get)(current_value.0, &mut raw) < 0,
@@ -817,6 +833,7 @@ mod probe {
             result
         });
         app.run();
+        println!("UIA phase: window pump returned");
         if let Err(reason) = worker.join().unwrap() {
             std::panic::resume_unwind(reason);
         }
