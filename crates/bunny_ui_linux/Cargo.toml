@@ -18,6 +18,10 @@ bunny-ui-vulkan.workspace = true
 countries-core.workspace = true
 countries-pure.workspace = true
 
+[[test]]
+name = "accessibility_native"
+harness = false
+
 # the example FILES are deliberate twins of the other shells', but the
 # artifact names carry the platform: three crates emitting the same
 # `counter_window.exe` race the Windows linker's file lock (LNK1104)
