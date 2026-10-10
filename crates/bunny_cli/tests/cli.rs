@@ -81,7 +81,8 @@ fn new_writes_a_project_for_every_platform() {
     assert!(app.join(".gitignore").is_file());
     for platform in ["android", "ios", "macos", "web"] {
         let stamp = fs::read_to_string(app.join(platform).join(".bunny-template")).unwrap();
-        assert!(stamp.contains(&format!("template {platform} 1")), "{stamp}");
+        let revision = bunny_cli::templates::platform(platform).unwrap().revision;
+        assert!(stamp.contains(&format!("template {platform} {revision}\n")), "{stamp}");
     }
     assert!(app.join("android/.gitignore").is_file());
     assert!(app.join("android/gradle/wrapper/gradle-wrapper.jar").is_file());

@@ -65,7 +65,8 @@ pub const APP: Set = Set {
 
 pub const ANDROID: Set = Set {
     name: "android",
-    revision: 1,
+    // 2: .gitignore keeps the upload key and its passwords out of git
+    revision: 2,
     files: &[
         template!("android/build.gradle.kts"),
         template!("android/gitignore"),
@@ -142,6 +143,54 @@ pub fn stamp(set: &Set) -> String {
     out
 }
 
+/// A platform folder's stamp, read back.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Stamp {
+    pub template: String,
+    pub revision: u32,
+    /// Each file the folder was written with: its hash then, and its
+    /// path in the folder, with `/`.
+    pub files: Vec<(u64, String)>,
+}
+
+impl Stamp {
+    pub fn parse(text: &str) -> Option<Stamp> {
+        let mut stamp = Stamp { template: String::new(), revision: 0, files: Vec::new() };
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let mut parts = line.splitn(3, ' ');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some("template"), Some(name), Some(revision)) => {
+                    stamp.template = name.to_string();
+                    stamp.revision = revision.trim().parse().ok()?;
+                }
+                (Some("file"), Some(hash), Some(path)) => {
+                    stamp.files.push((u64::from_str_radix(hash, 16).ok()?, path.trim_end().to_string()));
+                }
+                _ => {}
+            }
+        }
+        (!stamp.template.is_empty()).then_some(stamp)
+    }
+
+    /// The hash `path` had when the folder was written.
+    pub fn hash(&self, path: &str) -> Option<u64> {
+        self.files.iter().find(|(_, file)| file == path).map(|(hash, _)| *hash)
+    }
+}
+
+/// The set's content in one number: every path and every byte. A test
+/// pins it next to the revision, so a template edited without a new
+/// revision fails the build.
+pub fn fingerprint(set: &Set) -> u64 {
+    let mut all = Vec::new();
+    for template in set.files {
+        all.extend_from_slice(template.path.as_bytes());
+        all.push(0);
+        all.extend_from_slice(&fnv64(template.bytes).to_le_bytes());
+    }
+    fnv64(&all)
+}
+
 /// FNV-1a over the bytes with `\r\n` read as `\n`: a checkout that
 /// converted line endings is not a file someone edited.
 pub fn fnv64(bytes: &[u8]) -> u64 {
@@ -210,10 +259,44 @@ mod tests {
         assert_ne!(fnv64(b"a\rb"), fnv64(b"ab"));
     }
 
+    /// Each set's revision and the content it was given at — a template
+    /// edited without bumping its set's revision fails here, with the
+    /// number to write.
+    #[test]
+    fn a_changed_template_has_a_new_revision() {
+        const PINNED: &[(&str, u32, u64)] = &[
+            ("android", 2, 0xcfae_01f0_446d_c454),
+            ("ios", 1, 0x5cb1_ed55_1838_24b1),
+            ("macos", 1, 0x87ec_9f66_1e42_0e8f),
+            ("web", 1, 0x95b0_b2a8_d63d_f2ce),
+        ];
+        for set in PLATFORMS {
+            let (_, revision, pinned) = PINNED.iter().find(|(name, ..)| *name == set.name).expect("every set is pinned");
+            let now = fingerprint(set);
+            assert!(
+                *revision == set.revision && *pinned == now,
+                "templates/{} changed: bump its revision in templates.rs (it is {}), then pin ({:?}, {}, {now:#018x})",
+                set.name,
+                set.revision,
+                set.name,
+                set.revision.max(*revision),
+            );
+        }
+    }
+
+    #[test]
+    fn a_stamp_reads_back() {
+        let stamp = Stamp::parse(&stamp(&ANDROID)).unwrap();
+        assert_eq!((stamp.template.as_str(), stamp.revision), ("android", ANDROID.revision));
+        assert_eq!(stamp.files.len(), ANDROID.files.len());
+        assert_eq!(stamp.hash("gradlew"), Some(fnv64(ANDROID.files.iter().find(|t| t.path.ends_with("gradlew")).unwrap().bytes)));
+        assert_eq!(Stamp::parse("# nothing here\n"), None);
+    }
+
     #[test]
     fn the_stamp_lists_every_file() {
         let stamp = stamp(&ANDROID);
-        assert!(stamp.contains("template android 1\n"));
+        assert!(stamp.contains(&format!("template android {}\n", ANDROID.revision)));
         assert!(stamp.contains(" gradlew\n") && stamp.contains(" app/src/main/AndroidManifest.xml\n"));
         assert_eq!(stamp.lines().filter(|line| line.starts_with("file ")).count(), ANDROID.files.len());
     }

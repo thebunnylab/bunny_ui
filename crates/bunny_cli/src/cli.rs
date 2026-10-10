@@ -44,6 +44,14 @@ pub const COMMANDS: &[Command] = &[
         run: commands::build::run,
     },
     Command {
+        name: "upgrade",
+        summary: commands::upgrade::SUMMARY,
+        usage: commands::upgrade::USAGE,
+        about: commands::upgrade::ABOUT,
+        options: commands::upgrade::OPTIONS,
+        run: commands::upgrade::run,
+    },
+    Command {
         name: "doctor",
         summary: commands::doctor::SUMMARY,
         usage: commands::doctor::USAGE,

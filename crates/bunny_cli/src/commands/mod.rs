@@ -6,3 +6,4 @@ pub mod doctor;
 pub mod new;
 pub mod run;
 pub mod setup;
+pub mod upgrade;
