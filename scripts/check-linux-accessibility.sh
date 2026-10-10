@@ -33,11 +33,13 @@ test -n "$fixture"
 failures=0
 for backend in x11 wayland; do
   for paranoid in '' all; do
-    echo "AT-SPI backend=$backend paranoid=${paranoid:-off}"
-    if ! BUNNY_BACKEND="$backend" BUNNY_PARANOID="$paranoid" timeout 45s \
-      /usr/bin/python3 crates/bunny_ui_linux/tests/accessibility_native.py "$fixture"; then
-      failures=$((failures + 1))
-    fi
+    for modal_first in 0 1; do
+      echo "AT-SPI backend=$backend paranoid=${paranoid:-off} modal-first=$modal_first"
+      if ! BUNNY_BACKEND="$backend" BUNNY_PARANOID="$paranoid" BUNNY_PROBE_MODAL_FIRST="$modal_first" timeout 45s \
+        /usr/bin/python3 crates/bunny_ui_linux/tests/accessibility_native.py "$fixture"; then
+        failures=$((failures + 1))
+      fi
+    done
   done
 done
 exit "$failures"

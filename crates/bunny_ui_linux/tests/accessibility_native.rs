@@ -73,7 +73,9 @@ fn main() {
             password: State::new("never-export-this".into()),
             presses: State::new(0),
             rows: State::new(vec![1, 2]),
-            modal: State::new(false),
+            modal: State::new(
+                std::env::var("BUNNY_PROBE_MODAL_FIRST").is_ok_and(|value| value == "1"),
+            ),
             close,
         },
     );

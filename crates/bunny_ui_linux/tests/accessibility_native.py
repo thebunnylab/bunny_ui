@@ -7,7 +7,7 @@ import time
 import gi
 
 gi.require_version("Atspi", "2.0")
-from gi.repository import Atspi, GLib
+from gi.repository import Atspi, Gio, GLib
 
 
 def descendants(node):
@@ -49,11 +49,43 @@ try:
         return next((node for node in descendants(desktop)
                      if node.get_name() == name), None)
 
+    if os.environ.get("BUNNY_PROBE_MODAL_FIRST") == "1":
+        modal = wait_for(lambda: named("Dismiss modal"), "initial modal not exposed")
+        assert named("Description") is None
+        assert modal.get_action_iface().do_action(0)
+        print("AT-SPI first query reached the initial modal", flush=True)
+
     field = wait_for(lambda: named("Description"), "native AT-SPI accessible element missing: Description")
     assert field.get_role() == Atspi.Role.ENTRY
     assert Atspi.Text.get_text(field, 0, -1) == "Lunch"
     print("AT-SPI discovery: Description, ENTRY, Lunch", flush=True)
     identity = field.get_accessible_id()
+    session = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    address = session.call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress",
+                                None, None, Gio.DBusCallFlags.NONE, 3000, None).unpack()[0]
+    wire = Gio.DBusConnection.new_for_address_sync(address,
+        Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+        None, None)
+    names = wire.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ListNames",
+                          None, None, Gio.DBusCallFlags.NONE, 3000, None).unpack()[0]
+    bus_name = None
+    for name in names:
+        if not name.startswith(":"):
+            continue
+        pid = wire.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetConnectionUnixProcessID",
+                             GLib.Variant("(s)", (name,)), None, Gio.DBusCallFlags.NONE, 3000, None).unpack()[0]
+        if pid == process.pid:
+            bus_name = name
+            break
+    assert bus_name is not None, "fixture did not own an accessibility-bus connection"
+
+    def wire_unavailable(path, interface, method, arguments):
+        try:
+            wire.call_sync(bus_name, path, interface, method, arguments, None, Gio.DBusCallFlags.NONE, 3000, None)
+        except GLib.Error as error:
+            assert Gio.DBusError.get_remote_error(error) == "org.freedesktop.DBus.Error.UnknownObject", error
+            return
+        raise AssertionError("retired object accepted a direct D-Bus request")
     assert field.get_component_iface().grab_focus()
     field.clear_cache()
     assert field.get_state_set().contains(Atspi.StateType.FOCUSED)
@@ -89,19 +121,29 @@ try:
         assert value is False, f"retired accessible operation succeeded: {value!r}"
 
     stale = named("Row 2")
+    stale_path = stale.get_accessible_id()
     assert named("Remove row").get_action_iface().do_action(0)
     unavailable(lambda: Atspi.Action.do_action(stale, 0))
+    wire_unavailable(stale_path, "org.a11y.atspi.Action", "DoAction", GLib.Variant("(i)", (0,)))
     assert named("Open modal").get_action_iface().do_action(0)
     dismiss = wait_for(lambda: named("Dismiss modal"), "modal not exposed")
     assert named("Updated name") is None
     unavailable(lambda: Atspi.EditableText.set_text_contents(updated, "blocked"))
+    wire_unavailable(identity, "org.a11y.atspi.EditableText", "SetTextContents", GLib.Variant("(s)", ("blocked",)))
     assert dismiss.get_action_iface().do_action(0)
     restored = wait_for(lambda: named("Updated name"), "form not restored")
     assert Atspi.Text.get_text(restored, 0, -1) == "Dinner 👩‍🚀"
+    restored_path = restored.get_accessible_id()
     assert named("Close form").get_action_iface().do_action(0)
     unavailable(lambda: Atspi.EditableText.set_text_contents(restored, "closed"))
     restored.clear_cache()
-    unavailable(restored.get_name)
+    # libatspi normalizes a defunct object's name to an empty string. The
+    # separate wire assertion below requires the server's exact error.
+    try:
+        assert restored.get_name() == ""
+    except GLib.Error:
+        pass
+    wire_unavailable(restored_path, "org.freedesktop.DBus.Properties", "Get", GLib.Variant("(ss)", ("org.a11y.atspi.Accessible", "Name")))
     print("AT-SPI removal, modal isolation and closed-window safety passed", flush=True)
 finally:
     process.terminate()
