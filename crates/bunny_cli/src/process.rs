@@ -6,6 +6,8 @@ use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -50,23 +52,10 @@ pub fn run_in<S: AsRef<OsStr>>(
     let mut child = command.spawn()?;
     // both pipes drain on threads of their own: a program that fills one
     // while we wait on the other would never finish
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let out = thread::spawn(move || {
-        let mut text = Vec::new();
-        if let Some(pipe) = stdout.as_mut() {
-            let _ = pipe.read_to_end(&mut text);
-        }
-        text
-    });
-    let err = thread::spawn(move || {
-        let mut text = Vec::new();
-        if let Some(pipe) = stderr.as_mut() {
-            let _ = pipe.read_to_end(&mut text);
-        }
-        text
-    });
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
     let started = Instant::now();
+    let mut killed = false;
     let code = loop {
         if let Some(status) = child.try_wait()? {
             break status.code();
@@ -74,13 +63,53 @@ pub fn run_in<S: AsRef<OsStr>>(
         if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
+            killed = true;
             break None;
         }
         thread::sleep(Duration::from_millis(15));
     };
-    let stdout = String::from_utf8_lossy(&out.join().unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&err.join().unwrap_or_default()).into_owned();
+    // The program is gone, but a process it started can still hold the
+    // pipes open — a daemon it launched (adb's server), a grandchild a
+    // kill did not reach (dash runs `sleep` as a child). Its output is
+    // not this program's: the readers get a moment to finish, never more.
+    let grace = if killed { Duration::from_millis(100) } else { Duration::from_secs(2) };
+    let until = Instant::now() + grace;
+    let stdout = stdout.take(until);
+    let stderr = stderr.take(until);
     Ok(Output { code, stdout, stderr })
+}
+
+/// A pipe read on a thread of its own, into a buffer shared with the
+/// caller — so the caller can stop waiting while the pipe is still open.
+struct Drain {
+    buffer: Arc<Mutex<Vec<u8>>>,
+    done: mpsc::Receiver<()>,
+}
+
+fn drain(pipe: Option<impl Read + Send + 'static>) -> Drain {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let (finished, done) = mpsc::channel();
+    let shared = Arc::clone(&buffer);
+    thread::spawn(move || {
+        if let Some(mut pipe) = pipe {
+            let mut chunk = [0u8; 8192];
+            while let Ok(length @ 1..) = pipe.read(&mut chunk) {
+                shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).extend_from_slice(&chunk[..length]);
+            }
+        }
+        let _ = finished.send(());
+    });
+    Drain { buffer, done }
+}
+
+impl Drain {
+    /// What was read by the time the pipe closed, or by `until` if it
+    /// stays open — the reader is left to finish on its own.
+    fn take(self, until: Instant) -> String {
+        let _ = self.done.recv_timeout(until.saturating_duration_since(Instant::now()));
+        let bytes = std::mem::take(&mut *self.buffer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 }
 
 /// The program's full path on the PATH, the way a shell would find it
@@ -135,9 +164,22 @@ mod tests {
         let out = run("sh", &["-c", "echo out; echo err >&2; exit 3"], Duration::from_secs(5)).unwrap();
         assert_eq!((out.code, out.stdout.as_str(), out.stderr.as_str()), (Some(3), "out\n", "err\n"));
         let started = Instant::now();
-        let out = run("sh", &["-c", "sleep 30"], Duration::from_millis(200)).unwrap();
+        // `; true` keeps `sh` from replacing itself with `sleep` (dash never
+        // does): the grandchild outlives the kill and holds the pipes open
+        let out = run("sh", &["-c", "sleep 30; true"], Duration::from_millis(200)).unwrap();
         assert_eq!(out.code, None);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A program that exits leaving a daemon on its pipes (`adb` starting
+    /// its server) answers with what it printed, not when the daemon dies.
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_on_the_pipes_does_not_hold_the_answer() {
+        let started = Instant::now();
+        let out = run("sh", &["-c", "sleep 30 & echo started"], Duration::from_secs(20)).unwrap();
+        assert_eq!((out.code, out.stdout.as_str()), (Some(0), "started\n"));
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }
 
     #[test]
