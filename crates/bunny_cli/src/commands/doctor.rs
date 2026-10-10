@@ -109,12 +109,15 @@ impl Section {
 pub fn run(matches: &Matches) -> Result<()> {
     let platforms = chosen_platforms(matches)?;
     let verbose = matches.flag("verbose");
+    let app = app_section();
     let mut sections = check(&platforms);
+    sections.extend(app.clone());
     if matches.flag("fix") {
         let targets = missing_targets(&sections);
         if !targets.is_empty() {
             install_targets(&targets)?;
             sections = check(&platforms);
+            sections.extend(app.clone());
         }
     }
     if matches.flag("json") {
@@ -129,6 +132,7 @@ pub fn run(matches: &Matches) -> Result<()> {
             println!();
             install_targets(&targets)?;
             sections = check(&platforms);
+            sections.extend(app.clone());
             print(&sections, verbose, true);
         }
     }
@@ -200,6 +204,37 @@ pub fn check(platforms: &[Platform]) -> Vec<Section> {
         }
         sections
     })
+}
+
+/// The app `doctor` runs in, when it runs in one: whether its platform
+/// folders follow this `bunny`'s templates.
+fn app_section() -> Option<Section> {
+    use crate::templates::{PLATFORMS, STAMP, Stamp};
+    let cwd = std::env::current_dir().ok()?;
+    let project = crate::project::Project::discover(&cwd, None).ok()?;
+    let mut section =
+        Section { key: "app", title: format!("This app ({})", project.name), checks: Vec::new(), missing_targets: Vec::new() };
+    for set in PLATFORMS {
+        let folder = project.dir.join(set.name);
+        if !folder.is_dir() {
+            continue;
+        }
+        let stamp = std::fs::read_to_string(folder.join(STAMP)).ok().and_then(|text| Stamp::parse(&text));
+        section.checks.push(match stamp {
+            Some(stamp) if stamp.revision >= set.revision => {
+                Check::ok(format!("{}/ follows template {}", set.name, stamp.revision))
+            }
+            Some(stamp) => Check::warn(
+                format!("{}/ follows template {}; this bunny writes {}", set.name, stamp.revision, set.revision),
+                &["bunny upgrade   — your edits stay; the template's lands beside them"],
+            ),
+            None => Check::warn(
+                format!("{}/ has no {STAMP}: bunny cannot tell your edits from the template", set.name),
+                &["bunny upgrade   — keeps every file that differs, writes the template's beside it"],
+            ),
+        });
+    }
+    (!section.checks.is_empty()).then_some(section)
 }
 
 /// One platform's checks.

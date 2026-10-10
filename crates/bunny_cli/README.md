@@ -19,6 +19,7 @@ bunny build macos    # a signed app and its disk image, to hand out
 | `bunny new` | Create an app with every platform's files in place |
 | `bunny run` | Build the app for a device and run it, its output here; a save reloads it hot, `R` restarts, `q` stops |
 | `bunny build` | Build the app to ship: a site, a signed and notarized Mac app, a Google Play bundle, a Windows zip, a Linux tarball |
+| `bunny upgrade` | Bring the platform folders up to this `bunny`'s templates, your edits kept |
 | `bunny doctor` | Check what this machine needs for each platform — and offer to install what it can |
 | `bunny setup android` | Install the Android toolchain — SDK, NDK, emulator, a JDK — without Android Studio |
 | `bunny devices` | List where the app can run: this computer, the browser, simulators, emulators, phones |
@@ -159,6 +160,18 @@ override them for one build.
   icon and `StartupWMClass` are named by the app's id, the one its window gives
   Wayland and X11. The libraries the binary needs are read from it and named as
   Debian, Fedora and Arch packages, in `build-info.json` and the README.
+
+## `bunny upgrade`
+
+Each platform folder `bunny new` writes keeps a stamp, `.bunny-template`: the
+template's revision and the hash every file had then. `bunny upgrade` brings
+the folders up to the templates of the `bunny` that runs it. A file you never
+edited is replaced; a file you edited, which the new template also changed,
+stays yours, and the template's version is written beside it as
+`<file>.bunny-new` for you to merge. A file the template adds is written, one
+you removed stays removed, and `src/` and `Cargo.toml` are never touched.
+`--dry-run` says what would change. `bunny doctor`, run inside an app, says
+when a folder follows an older template.
 
 ## `bunny setup android`
 
