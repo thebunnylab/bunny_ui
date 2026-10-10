@@ -3,7 +3,7 @@
 fn main() {
     use bunny_ui::prelude::*;
     use bunny_ui_linux::{App, WindowSpec};
-    use std::rc::Rc;
+    use std::{cell::Cell, rc::Rc};
 
     if std::env::var_os("BUNNY_ACCESSIBILITY_PROBE").is_none() {
         println!(
@@ -11,7 +11,7 @@ fn main() {
         );
         return;
     }
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     struct Form {
         name: State<String>,
         value: State<String>,
@@ -19,6 +19,7 @@ fn main() {
         presses: State<u32>,
         rows: State<Vec<u32>>,
         modal: State<bool>,
+        close: Rc<dyn Fn()>,
     }
     impl Component for Form {
         fn body(self) -> impl View {
@@ -34,6 +35,7 @@ fn main() {
                 }),
                 button(text("Open modal"), move || self.modal.set(true)),
                 button(text("Remove row"), move || self.rows.set(vec![1])),
+                button(text("Close form"), move || (self.close)()),
                 for_each(
                     self.rows,
                     |id| id.to_string(),
@@ -50,7 +52,19 @@ fn main() {
         }
     }
     let app = App::new();
-    app.open(
+    let main_id = Rc::new(Cell::new(None));
+    let close: Rc<dyn Fn()> = Rc::new({
+        let app = app.clone();
+        let main_id = Rc::clone(&main_id);
+        move || {
+            app.close(
+                main_id
+                    .get()
+                    .expect("form is mounted before its close action"),
+            )
+        }
+    });
+    let id = app.open(
         WindowSpec::titled("Bunny AT-SPI witness").size(480.0, 640.0),
         Rc::new(app.runtime()),
         Form {
@@ -60,7 +74,14 @@ fn main() {
             presses: State::new(0),
             rows: State::new(vec![1, 2]),
             modal: State::new(false),
+            close,
         },
+    );
+    main_id.set(Some(id));
+    app.open(
+        WindowSpec::titled("AT-SPI keeper").size(160.0, 120.0),
+        Rc::new(app.runtime()),
+        text("Keeper"),
     );
     app.run();
 }
