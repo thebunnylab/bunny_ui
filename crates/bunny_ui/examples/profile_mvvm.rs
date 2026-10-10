@@ -1,4 +1,6 @@
 //! An editable MVVM form. The domain has no UI imports or reactive types.
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use bunny_ui::prelude::*;
 
 mod domain {

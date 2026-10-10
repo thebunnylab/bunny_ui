@@ -6,7 +6,7 @@ holds (a camera's or a decoder's texture, RGBA or BGRA) rides the same
 linear road with no copy at all. One texture per feed, sized to the
 picture, replaced in place when the generation moves, scaled into its
 box by a linear sampler; the shared atlas never hears of it and the
-collector is never asked. `cargo test -p bunny-ui --features gpu --lib
+collector is never asked. `cargo test -p bunny-ui-core --features gpu --lib
 gpu::walk` proves the allocator on any machine, `cargo test -p
 bunny-ui-apple --lib metal` proves the pixels against the oracle on a
 Mac, and the WebGL2 tier proves itself at install with a feed in its
@@ -157,8 +157,8 @@ image(frame.image()).resizable().aspect_ratio(ContentMode::Fill)
 ## Proof
 
 ```
-cargo test -p bunny-ui --features gpu --lib gpu::walk
-cargo test -p bunny-ui --lib image_engine
+cargo test -p bunny-ui-core --features gpu --lib gpu::walk
+cargo test -p bunny-ui-core --lib image_engine
 cargo test -p bunny-ui-apple --lib metal
 cargo test -p bunny-ui-apple --lib surface
 cargo test -p bunny-ui-apple --features wgpu-surface --lib surface

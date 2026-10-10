@@ -10,6 +10,8 @@
 //! a copy of it, or a copy grown into a larger one — never the frame's
 //! bookkeeping, nor the table of the note's lines.
 
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 

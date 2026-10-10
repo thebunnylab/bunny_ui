@@ -1,4 +1,6 @@
 //! MVVM with a plain presentation struct, independent properties and commands.
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use bunny_ui::prelude::*;
 
 #[derive(Clone, Copy)]
