@@ -30,6 +30,7 @@ struct Node {
     value: Option<Arc<str>>,
     bounds: Rect,
     focused: bool,
+    multiline: bool,
 }
 #[derive(Clone, Default)]
 struct Snapshot {
@@ -138,6 +139,7 @@ impl Accessibility {
                         value: node.value.clone(),
                         bounds: node.bounds,
                         focused: node.focused,
+                        multiline: node.multiline,
                     })
                     .collect(),
                 origin: super::scene_origin(surface.window),
@@ -589,10 +591,13 @@ unsafe extern "system" fn options(this: Object, out: *mut i32) -> Hresult {
 unsafe extern "system" fn pattern(this: Object, pattern: i32, out: *mut Object) -> Hresult {
     output(out, ptr::null_mut(), || {
         let value = unsafe { provider(this) };
-        state(value)?;
+        let (_, _, node) = state(value)?;
         let iid = match pattern {
             INVOKE_PATTERN if value.role == Some(Role::Button) => &INVOKE,
-            VALUE_PATTERN if matches!(value.role, Some(Role::TextField | Role::PasswordField)) => {
+            VALUE_PATTERN
+                if matches!(value.role, Some(Role::TextField | Role::PasswordField))
+                    && node.is_some_and(|node| !node.multiline) =>
+            {
                 &VALUE
             }
             _ => return Ok(ptr::null_mut()),
@@ -608,14 +613,20 @@ unsafe extern "system" fn property(this: Object, property: i32, out: *mut Varian
         match property {
             BOUNDS => Variant::bounds(surface.bounds(&snapshot, node.as_ref())?),
             FRAMEWORK => Variant::string("Bunny UI"),
-            CONTROL | CONTENT | ENABLED => Ok(Variant::boolean(true)),
-            OFFSCREEN => Ok(Variant::boolean(false)),
+            CONTROL | CONTENT => Ok(Variant::boolean(true)),
             _ => {
                 let Some(node) = node else {
                     return Ok(Variant::empty());
                 };
                 match property {
                     NAME => Variant::string(&node.label),
+                    ENABLED => Ok(Variant::boolean(unsafe {
+                        abi::IsWindowEnabled(surface.window) != 0
+                    })),
+                    OFFSCREEN => Ok(Variant::boolean(unsafe {
+                        abi::IsIconic(surface.window) != 0
+                            || super::IsWindowVisible(surface.window) == 0
+                    })),
                     CONTROL_TYPE => Ok(Variant::integer(match node.role {
                         Role::Text => 50020,
                         Role::Button => 50000,
@@ -631,11 +642,12 @@ unsafe extern "system" fn property(this: Object, property: i32, out: *mut Varian
                     ))),
                     PASSWORD => Ok(Variant::boolean(node.role == Role::PasswordField)),
                     VALUE_VALUE if node.role == Role::PasswordField => Err(DENIED),
-                    VALUE_VALUE if node.role == Role::TextField => {
+                    VALUE_VALUE if node.role == Role::TextField && !node.multiline => {
                         Variant::string(node.value.as_deref().unwrap_or(""))
                     }
                     VALUE_READ_ONLY
-                        if matches!(node.role, Role::TextField | Role::PasswordField) =>
+                        if matches!(node.role, Role::TextField | Role::PasswordField)
+                            && !node.multiline =>
                     {
                         Ok(Variant::boolean(false))
                     }
@@ -731,9 +743,12 @@ unsafe extern "system" fn embedded(this: Object, out: *mut *mut SafeArray) -> Hr
     })
 }
 fn enqueue(value: &Provider, action: Action) -> Hresult {
-    let Ok((surface, _, _)) = state(value) else {
+    let Ok((surface, _, node)) = state(value) else {
         return UNAVAILABLE;
     };
+    if matches!(action, Action::SetText(_)) && node.is_some_and(|node| node.multiline) {
+        return UNSUPPORTED;
+    }
     let supported = matches!(
         (value.role, &action),
         (Some(Role::Button), Action::Activate)
@@ -829,6 +844,9 @@ unsafe extern "system" fn get_value(this: Object, out: *mut *mut u16) -> Hresult
     output(out, ptr::null_mut(), || {
         let (_, _, node) = state(unsafe { provider(this) })?;
         let node = node.ok_or(UNSUPPORTED)?;
+        if node.multiline {
+            return Err(UNSUPPORTED);
+        }
         if node.role == Role::PasswordField {
             return Err(DENIED);
         }
@@ -884,7 +902,7 @@ static VALUE_VTABLE: ValueVtbl = ValueVtbl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bunny_ui::prelude::{State, button, text, text_field, vstack};
+    use bunny_ui::prelude::{State, button, text, text_editor, text_field, vstack};
 
     fn fixture() -> (Arc<Surface>, Owned, Owned, Owned) {
         let runtime = Runtime::new();
@@ -893,7 +911,9 @@ mod tests {
         let root = vstack!(
             button(text("Save"), || {}),
             text_field("Description", value.binding()),
-            text("Read only")
+            text("Read only"),
+            text_field("Password", value.binding()).secret(true),
+            text_editor("Notes", value.binding())
         );
         let _ = runtime.display_frame(
             &root,
@@ -913,6 +933,7 @@ mod tests {
                 value: node.value.clone(),
                 bounds: node.bounds,
                 focused: node.focused,
+                multiline: node.multiline,
             })
             .collect();
         let surface = Arc::new(Surface {
@@ -1016,6 +1037,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn secret_values_are_denied_and_multiline_editors_do_not_claim_value_pattern() {
+        let (surface, _, _, _) = fixture();
+        let (snapshot, _) = surface.read(Key::Root).unwrap();
+        let password = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.role == Role::PasswordField)
+            .unwrap();
+        let password = surface.provider(Key::Node(password.id)).unwrap();
+        let multiline = snapshot.nodes.iter().find(|node| node.multiline).unwrap();
+        let multiline = surface.provider(Key::Node(multiline.id)).unwrap();
+        unsafe {
+            let mut value = ptr::dangling_mut::<u16>();
+            assert_eq!(get_value(password.simple(), &mut value), DENIED);
+            assert!(value.is_null());
+            let mut property_value = Variant::empty();
+            assert_eq!(
+                property(password.simple(), VALUE_VALUE, &mut property_value),
+                DENIED
+            );
+            assert_eq!(property_value.kind, 0);
+            let mut pattern_value = ptr::dangling_mut::<std::ffi::c_void>();
+            assert_eq!(
+                pattern(multiline.simple(), VALUE_PATTERN, &mut pattern_value),
+                OK
+            );
+            assert!(pattern_value.is_null());
+            assert_eq!(get_value(multiline.simple(), &mut value), UNSUPPORTED);
+            assert!(value.is_null());
+        }
+    }
     #[test]
     fn retirement_is_checked_again_before_an_accepted_action_reaches_runtime() {
         let (surface, button, _, _) = fixture();

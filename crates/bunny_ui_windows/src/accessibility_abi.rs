@@ -229,6 +229,8 @@ struct GuiThreadInfo {
 }
 #[link(name = "user32", kind = "raw-dylib")]
 unsafe extern "system" {
+    pub(super) fn IsWindowEnabled(window: Hwnd) -> i32;
+    pub(super) fn IsIconic(window: Hwnd) -> i32;
     fn GetWindowThreadProcessId(window: Hwnd, process: *mut u32) -> u32;
     fn GetGUIThreadInfo(thread: u32, info: *mut GuiThreadInfo) -> i32;
 }

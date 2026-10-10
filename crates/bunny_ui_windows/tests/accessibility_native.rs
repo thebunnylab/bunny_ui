@@ -9,6 +9,7 @@ mod probe {
     type Object = *mut c_void;
     type Hresult = i32;
     #[repr(C)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
     struct Guid {
         d1: u32,
         d2: u16,
@@ -58,6 +59,19 @@ mod probe {
         focused: unsafe extern "system" fn(Object, *mut Object) -> Hresult,
         unused: [usize; 14],
         property_condition: unsafe extern "system" fn(Object, i32, Variant, *mut Object) -> Hresult,
+        // CreatePropertyConditionEx through RemoveAutomationEventHandler, slots 24..33.
+        unused_conditions_events: [usize; 10],
+        add_properties: unsafe extern "system" fn(
+            Object,
+            Object,
+            i32,
+            Object,
+            Object,
+            *const i32,
+            i32,
+        ) -> Hresult,
+        add_properties_array: usize,
+        remove_properties: unsafe extern "system" fn(Object, Object, Object) -> Hresult,
     }
     #[repr(C)]
     struct Element {
@@ -167,6 +181,159 @@ mod probe {
         fn drop(&mut self) {
             unsafe {
                 (self.table::<Unknown>().release)(self.0);
+            }
+        }
+    }
+    type Received = std::sync::Arc<std::sync::Mutex<Vec<(i32, String)>>>;
+    #[repr(C)]
+    struct EventTable {
+        unknown: Unknown,
+        property: unsafe extern "system" fn(Object, Object, i32, Variant) -> Hresult,
+    }
+    #[repr(C)]
+    struct EventSink {
+        table: *const EventTable,
+        refs: std::sync::atomic::AtomicU32,
+        received: Received,
+    }
+    unsafe extern "system" fn event_query(
+        this: Object,
+        iid: *const Guid,
+        out: *mut Object,
+    ) -> Hresult {
+        if out.is_null() {
+            return 0x80004003u32 as i32;
+        }
+        unsafe {
+            *out = ptr::null_mut();
+        }
+        if iid.is_null() {
+            return 0x80004003u32 as i32;
+        }
+        let unknown = Guid {
+            d1: 0,
+            d2: 0,
+            d3: 0,
+            d4: [0xc0, 0, 0, 0, 0, 0, 0, 0x46],
+        };
+        let handler = Guid {
+            d1: 0x40cd37d4,
+            d2: 0xc756,
+            d3: 0x4b0c,
+            d4: [0x8c, 0x6f, 0xbd, 0xdf, 0xee, 0xb1, 0x3b, 0x50],
+        };
+        if unsafe { *iid } != unknown && unsafe { *iid } != handler {
+            return 0x80004002u32 as i32;
+        }
+        unsafe {
+            event_retain(this);
+            *out = this;
+        }
+        0
+    }
+    unsafe extern "system" fn event_retain(this: Object) -> u32 {
+        unsafe { &*(this as *const EventSink) }
+            .refs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+    unsafe extern "system" fn event_release(this: Object) -> u32 {
+        let old = unsafe { &*(this as *const EventSink) }
+            .refs
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+        if old == 1 {
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            unsafe {
+                drop(Box::from_raw(this as *mut EventSink));
+            }
+        }
+        old - 1
+    }
+    unsafe extern "system" fn event_property(
+        this: Object,
+        _sender: Object,
+        property: i32,
+        value: Variant,
+    ) -> Hresult {
+        let text = if value.kind == 8 && value.data[0] != 0 {
+            unsafe {
+                String::from_utf16_lossy(std::slice::from_raw_parts(
+                    value.data[0] as *const u16,
+                    SysStringLen(value.data[0] as *const u16) as usize,
+                ))
+            }
+        } else {
+            String::new()
+        };
+        let sink = unsafe { &*(this as *const EventSink) };
+        match sink.received.lock() {
+            Ok(mut events) => {
+                events.push((property, text));
+                0
+            }
+            Err(_) => 0x80004005u32 as i32,
+        }
+    }
+    static EVENT_TABLE: EventTable = EventTable {
+        unknown: Unknown {
+            query: event_query,
+            retain: event_retain,
+            release: event_release,
+        },
+        property: event_property,
+    };
+    struct Events<'a> {
+        client: &'a Owned,
+        element: &'a Owned,
+        sink: Owned,
+        received: Received,
+    }
+    impl<'a> Events<'a> {
+        unsafe fn subscribe(client: &'a Owned, element: &'a Owned) -> Self {
+            let received = Received::default();
+            let sink = Owned(
+                Box::into_raw(Box::new(EventSink {
+                    table: &EVENT_TABLE,
+                    refs: std::sync::atomic::AtomicU32::new(1),
+                    received: std::sync::Arc::clone(&received),
+                }))
+                .cast(),
+            );
+            let properties = [30005, 30045, 30008];
+            unsafe {
+                succeeded((client.table::<Client>().add_properties)(
+                    client.0,
+                    element.0,
+                    1,
+                    ptr::null_mut(),
+                    sink.0,
+                    properties.as_ptr(),
+                    properties.len() as i32,
+                ));
+            }
+            Self {
+                client,
+                element,
+                sink,
+                received,
+            }
+        }
+        fn saw(&self, property: i32, value: &str) -> bool {
+            self.received
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.0 == property && event.1 == value)
+        }
+    }
+    impl Drop for Events<'_> {
+        fn drop(&mut self) {
+            unsafe {
+                (self.client.table::<Client>().remove_properties)(
+                    self.client.0,
+                    self.element.0,
+                    self.sink.0,
+                );
             }
         }
     }
@@ -397,11 +564,17 @@ mod probe {
             let field = named(&client, &root, "Description");
             assert_eq!(read_string(&field, 30045), "Lunch");
             assert_eq!(read_integer(&field, 30003, 3), 50004);
+            let events = Events::subscribe(&client, &field);
             let stable = identity(&field);
             assert!(!stable.is_empty());
             let text = named(&client, &root, "Native UIA witness");
             assert_eq!(read_integer(&text, 30003, 3), 50020);
             let initial = bounds(&field);
+            println!(
+                "UIA before: name={:?}, value={:?}, runtime={stable:?}, bounds={initial:?}",
+                read_string(&field, 30005),
+                read_string(&field, 30045)
+            );
             assert_eq!(initial.len(), 4);
             assert!(initial[2] > 0.0 && initial[3] > 0.0);
             let mut old = NativeRect::default();
@@ -468,8 +641,13 @@ mod probe {
             let secret = pattern(&password, 10002, &VALUE_IID);
             let mut raw = ptr::null_mut();
             let hr = (secret.table::<ValuePattern>().get)(secret.0, &mut raw);
-            assert!(hr < 0, "password value must be denied");
-            assert!(raw.is_null());
+            // UIA may normalize a refused Value property into an empty BSTR.
+            // Test the security boundary at the client and the exact HRESULT
+            // separately at the provider ABI; never allow nonempty output.
+            let length = if raw.is_null() { 0 } else { SysStringLen(raw) };
+            println!("UIA password read: HRESULT={hr:#x}, returned UTF-16 units={length}");
+            assert_eq!(length, 0, "password must not be exported by UIA");
+            SysFreeString(raw);
             let mut secret_property = Variant::empty();
             let hr =
                 (password.table::<Element>().property)(password.0, 30045, &mut secret_property);
@@ -492,6 +670,17 @@ mod probe {
                 stable,
                 "identity survives name and value changes"
             );
+            println!(
+                "UIA after edit/invoke: name={:?}, value={:?}, runtime={:?}, bounds={:?}",
+                read_string(&field, 30005),
+                read_string(&field, 30045),
+                identity(&field),
+                bounds(&field)
+            );
+            until("native value event", || events.saw(30045, "Dinner 👩‍🚀"));
+            until("native name event", || events.saw(30005, "Updated name"));
+            println!("UIA native property events: name and value changes delivered");
+            drop(events);
             let row = named(&client, &root, "Row 2");
             let removed = pattern(&row, 10000, &INVOKE_IID);
             invoke(&named(&client, &root, "Remove row"));
@@ -566,6 +755,15 @@ mod probe {
         }
     }
     pub fn run() {
+        let mta_host = std::env::args().any(|arg| arg == "--mta-host");
+        let _host_apartment = if mta_host {
+            unsafe {
+                succeeded(CoInitializeEx(ptr::null_mut(), 0));
+            }
+            Some(Apartment)
+        } else {
+            None
+        };
         let app = App::new();
         let first_modal = std::env::args().any(|arg| arg == "--modal-first");
         let form = Form {
@@ -627,12 +825,23 @@ mod probe {
             assert_eq!(form.presses.get(), 1, "stale row did not call its callback");
             assert_eq!(form.password.get(), "never-export-this");
             assert!(!form.modal.get());
-            assert!(
-                std::process::Command::new(std::env::current_exe().unwrap())
-                    .arg("--modal-first")
-                    .status()
-                    .unwrap()
-                    .success()
+            if !mta_host {
+                for mode in ["--modal-first", "--mta-host"] {
+                    assert!(
+                        std::process::Command::new(std::env::current_exe().unwrap())
+                            .arg(mode)
+                            .status()
+                            .unwrap()
+                            .success(),
+                        "UIA subprocess {mode}"
+                    );
+                }
+            }
+            println!(
+                "UIA model: Description={:?}, presses={}, secret unchanged; host={}",
+                form.value.get(),
+                form.presses.get(),
+                if mta_host { "MTA" } else { "STA" }
             );
         }
     }
