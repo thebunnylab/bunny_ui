@@ -253,6 +253,7 @@ pub struct App {
 /// gate, the crown's gates. The app installs ONE of each with the
 /// door and routes by the window the event arrived at.
 struct Slot {
+    presentation: RefCell<Option<bunny_ui::presentation::backend::PresentationSource>>,
     window: usize,
     handle: ffi::WindowHandle,
     /// The window's own scene — what a locale the app pins reaches.
@@ -320,7 +321,14 @@ impl AppInner {
     }
 
     fn buried(&self, window: usize) {
-        self.slots.borrow_mut().retain(|slot| slot.window != window);
+        self.slots.borrow_mut().retain(|slot| {
+            if slot.window == window {
+                slot.presentation.borrow_mut().take();
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -372,6 +380,29 @@ impl App {
         (slot.handler.borrow_mut())(AppEvent::Redraw);
         ffi::show_window(slot.handle);
         WindowId(slot.window)
+    }
+
+    /// Observe future presentation receipts for one feed in this window.
+    /// Only one observer is attached per window; replacement closes the old one.
+    /// The event capacity is clamped to 1–256. Dropping the consumer disables
+    /// tracking. CPU/native-compositing and unimplemented platforms explicitly
+    /// report unavailable; see `bunny_ui::presentation` for timestamp limits.
+    /// Returns `None` when the window is no longer open.
+    #[must_use]
+    pub fn observe_feed(
+        &self,
+        id: WindowId,
+        feed: bunny_ui::image_engine::FeedKey,
+        capacity: usize,
+    ) -> Option<bunny_ui::presentation::FeedPresentation> {
+        let slots = self.inner.slots.borrow();
+        let slot = slots.iter().find(|slot| slot.window == id.0)?;
+        let (observer, source) = bunny_ui::presentation::backend::channel(feed, capacity);
+        source
+            .sender()
+            .unavailable(bunny_ui::presentation::Unavailable::UnsupportedPlatform);
+        *slot.presentation.borrow_mut() = Some(source);
+        Some(observer)
     }
 
     /// Closes the window. The last one out quits the app.
@@ -1534,6 +1565,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // this slot's own handler, then shown — on wayland the first
     // presenting commit IS the reveal, so the window never flashes
     Rc::new(Slot {
+        presentation: RefCell::new(None),
         window: window.raw_window(),
         handle: window,
         runtime,
