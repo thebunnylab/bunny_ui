@@ -203,7 +203,7 @@ pub struct Slider {
 /// use bunny_ui_core::prelude::*;
 /// let value = State::new(10.0);
 /// let range = SliderRange::new(1.0..=60.0)?.with_step(1.0)?;
-/// let rate = slider(value.binding(), range);
+/// let rate = slider(value.binding(), range).frame_width(220.0).id("rate");
 /// # Ok::<(), SliderRangeError>(())
 /// ```
 #[must_use]

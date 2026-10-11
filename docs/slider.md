@@ -10,7 +10,7 @@ use bunny_ui::prelude::*;
 
 fn rate_control(rate: State<f64>) -> Result<impl View, SliderRangeError> {
     let domain = SliderRange::new(1.0..=60.0)?.with_step(1.0)?;
-    Ok(slider(rate.binding(), domain).width(220.0).id("rate"))
+    Ok(slider(rate.binding(), domain).frame_width(220.0).id("rate"))
 }
 ```
 
