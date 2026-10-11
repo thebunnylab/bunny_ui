@@ -43,3 +43,20 @@ one complete quiet interval before it disappears, using the shell's existing
 clock. Read/Copy queries preserve the phase. Custom elements keep ownership of
 their blink behavior, and a window without caret or other pending work still
 parks its clock.
+
+Default Left/Right and Shift+Left/Right follow extended grapheme clusters, and
+Backspace/Delete remove one complete cluster when no range is selected. A family
+emoji, flag, skin-tone sequence or decomposed accent stays whole. An unselected
+native caret inside a cluster removes that containing cluster. Explicit selection
+and IME composition ranges retain their UTF-16/scalar contract; content is never
+normalized. Word commands retain their existing character classes, and horizontal
+movement remains logical rather than visual BiDi navigation.
+
+The boundary rules are Unicode 17.0.0 / UAX #29 revision 47. The core has no new
+dependency. All 766 official GraphemeBreakTest cases exercise the public edit API
+forward, backward and from interior scalar positions. Generated property inputs
+and BLAKE3 hashes are pinned in `scripts/unicode-grapheme-sources.json`; regeneration
+uses `scripts/generate-grapheme-tables.py` with those downloaded files and the
+build-time Python package `blake3==1.0.8`. The Unicode data license is retained
+beside the test corpus. Ordinary ASCII edits inspect local boundaries; regional
+indicator parity can require scanning the preceding indicator run.

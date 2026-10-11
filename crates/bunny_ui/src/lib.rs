@@ -78,6 +78,7 @@ pub mod stats;
 pub mod text_engine;
 pub mod text_value;
 pub mod text_input;
+mod grapheme;
 pub mod theme;
 pub mod touch;
 pub mod view;
