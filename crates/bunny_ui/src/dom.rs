@@ -6983,6 +6983,7 @@ mod tests {
                 tag: Some(tag.into()),
                 class: Some(class.into()),
                 address: Some(Rc::new(crate::layout::Address {
+                    control: None,
                     dom_id: Some(id.into()),
                     href: None,
                 })),

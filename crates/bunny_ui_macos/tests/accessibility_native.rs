@@ -84,6 +84,8 @@ mod probe {
         presses: State<u32>,
         rows: State<Vec<u32>>,
         modal: State<bool>,
+        checked: State<bool>,
+        disabled: State<bool>,
     }
     impl Component for Form {
         fn body(self) -> impl View {
@@ -94,7 +96,13 @@ mod probe {
                 button(text("Save"), move || {
                     self.presses.add(1);
                     self.name.set("Updated name".into());
-                }),
+                })
+                .disabled(self.disabled.get()),
+                checkbox(text("Reimbursable"), self.checked.binding())
+                    .disabled(self.disabled.get()),
+                button(text("Toggle controls"), move || self
+                    .disabled
+                    .set(!self.disabled.get())),
                 button(text("Open modal"), move || self.modal.set(true)),
                 button(text("Remove row"), move || self.rows.set(vec![1])),
                 for_each(
@@ -121,6 +129,8 @@ mod probe {
             value: State::new("Lunch".into()),
             password: State::new("never-export-this".into()),
             presses: State::new(0),
+            checked: State::new(false),
+            disabled: State::new(false),
             rows: State::new(vec![1, 2]),
             modal: State::new(false),
         };
@@ -296,6 +306,60 @@ mod probe {
                 field,
                 "a changing name keeps the native object"
             );
+            let check = named(view, "Reimbursable");
+            let save = named(view, "Save");
+            assert_eq!(
+                property(check, "accessibilityRole").as_deref(),
+                Some("AXCheckBox")
+            );
+            assert_eq!(
+                boolean(object(check, sel("accessibilityValue")), sel("boolValue")),
+                0
+            );
+            set_bool(check, sel("setAccessibilityFocused:"), 1);
+            assert_eq!(boolean(check, sel("isAccessibilityFocused")), 1);
+            assert_eq!(boolean(check, sel("accessibilityPerformPress")), 1);
+            assert!(form.checked.get());
+            assert_eq!(
+                boolean(object(check, sel("accessibilityValue")), sel("boolValue")),
+                1
+            );
+            assert_eq!(
+                boolean(
+                    named(view, "Toggle controls"),
+                    sel("accessibilityPerformPress")
+                ),
+                1
+            );
+            assert_eq!(boolean(check, sel("isAccessibilityEnabled")), 0);
+            assert_eq!(boolean(save, sel("isAccessibilityEnabled")), 0);
+            assert_eq!(boolean(check, sel("isAccessibilityFocused")), 0);
+            assert_eq!(boolean(check, sel("accessibilityPerformPress")), 0);
+            assert_eq!(boolean(save, sel("accessibilityPerformPress")), 0);
+            assert_eq!(
+                allowed(
+                    check,
+                    sel("isAccessibilitySelectorAllowed:"),
+                    sel("setAccessibilityFocused:")
+                ),
+                0
+            );
+            assert_eq!(form.presses.get(), 1);
+            assert!(form.checked.get());
+            assert_eq!(
+                boolean(
+                    named(view, "Toggle controls"),
+                    sel("accessibilityPerformPress")
+                ),
+                1
+            );
+            assert_eq!(named(view, "Reimbursable"), check);
+            assert_eq!(boolean(check, sel("isAccessibilityEnabled")), 1);
+            set_bool(save, sel("setAccessibilityFocused:"), 1);
+            assert_eq!(boolean(save, sel("isAccessibilityFocused")), 1);
+            println!(
+                "NSAccessibility checkbox value, focus, disabled rejection and stable identity passed"
+            );
             let removed = object(named(view, "Row 2"), sel("retain"));
             assert_eq!(
                 boolean(named(view, "Remove row"), sel("accessibilityPerformPress")),
@@ -349,7 +413,14 @@ mod probe {
                     "NSAccessibility role={:?} label={:?} value={:?} focused={}",
                     property(node, "accessibilityRole"),
                     property(node, "accessibilityLabel"),
-                    property(node, "accessibilityValue"),
+                    if property(node, "accessibilityRole").as_deref() == Some("AXCheckBox") {
+                        Some(
+                            boolean(object(node, sel("accessibilityValue")), sel("boolValue"))
+                                .to_string(),
+                        )
+                    } else {
+                        property(node, "accessibilityValue")
+                    },
                     boolean(node, sel("isAccessibilityFocused"))
                 );
             }

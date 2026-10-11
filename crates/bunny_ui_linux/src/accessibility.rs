@@ -89,6 +89,7 @@ impl Entry {
             Kind::Control(node) => match node.role {
                 Role::Text => (29, "label"),
                 Role::Button => (43, "push button"),
+                Role::Checkbox => (7, "check box"),
                 Role::TextField => (79, "entry"),
                 Role::PasswordField => (40, "password text"),
             },
@@ -98,7 +99,7 @@ impl Entry {
         let mut result = vec![ACCESSIBLE, COMPONENT];
         if let Kind::Control(node) = &self.kind {
             match node.role {
-                Role::Button => result.push(ACTION),
+                Role::Button | Role::Checkbox => result.push(ACTION),
                 Role::Text => result.push(TEXT),
                 Role::TextField | Role::PasswordField => result.extend([TEXT, EDITABLE]),
             }
@@ -112,17 +113,38 @@ impl Entry {
             _ => "",
         }
     }
-    fn state(&self) -> u32 {
+    fn state(&self) -> u64 {
+        // AT-SPI StateType: enabled, sensitive, showing and visible. The
+        // second word carries CHECKABLE (41); checkboxes are not editable text.
         let mut bits = (1 << 8) | (1 << 24) | (1 << 25) | (1 << 30);
         if let Kind::Control(node) = &self.kind {
+            if !node.enabled {
+                bits &= !((1 << 8) | (1 << 24));
+            }
             if node.supports(&Action::Focus) {
-                bits |= (1 << 7) | (1 << 11) | (1 << if node.multiline { 17 } else { 26 });
+                bits |= 1 << 11;
+            }
+            if matches!(node.role, Role::TextField | Role::PasswordField) {
+                bits |= (1 << 7) | (1 << if node.multiline { 17 } else { 26 });
+            }
+            if node.checked.is_some() {
+                bits |= 1 << 41;
+            }
+            if node.checked == Some(true) {
+                bits |= 1 << 4;
             }
             if node.focused {
                 bits |= 1 << 12;
             }
         }
         bits
+    }
+    fn action_name(&self) -> &'static str {
+        if matches!(&self.kind, Kind::Control(node) if node.role == Role::Checkbox) {
+            "toggle"
+        } else {
+            "click"
+        }
     }
     fn extents(&self, coordinates: u32) -> Result<[i32; 4], Failure> {
         let scale = self.handle.scale_factor();
@@ -390,17 +412,23 @@ impl Service {
                             Value::text(&current.name),
                         );
                     }
-                    if previous.state() != current.state()
-                        && (previous.state() ^ current.state()) & (1 << 12) != 0
-                    {
-                        self.event(
-                            &current.path,
-                            c"StateChanged",
-                            "focused",
-                            i32::from(current.state() & (1 << 12) != 0),
-                            0,
-                            Value::I32(0),
-                        );
+                    for (bit, detail) in [
+                        (4, "checked"),
+                        (8, "enabled"),
+                        (11, "focusable"),
+                        (12, "focused"),
+                        (24, "sensitive"),
+                    ] {
+                        if (previous.state() ^ current.state()) & (1 << bit) != 0 {
+                            self.event(
+                                &current.path,
+                                c"StateChanged",
+                                detail,
+                                i32::from(current.state() & (1 << bit) != 0),
+                                0,
+                                Value::I32(0),
+                            );
+                        }
                     }
                     if previous.text() != current.text() {
                         self.event(
@@ -578,7 +606,10 @@ impl Service {
                 )]),
                 ("GetState", []) => Ok(vec![Value::Array(
                     c"u",
-                    vec![Value::U32(entry.map_or(0, Entry::state)), Value::U32(0)],
+                    vec![
+                        Value::U32(entry.map_or(0, Entry::state) as u32),
+                        Value::U32((entry.map_or(0, Entry::state) >> 32) as u32),
+                    ],
                 )]),
                 ("GetRelationSet", []) => Ok(vec![Value::Array(c"(ua(so))", Vec::new())]),
                 ("GetAttributes", []) => Ok(vec![Value::Array(c"{ss}", Vec::new())]),
@@ -620,7 +651,7 @@ impl Service {
         match (interface.as_str(), member.as_str(), args.as_slice()) {
             (ACTION, "DoAction", [Value::I32(0)]) => perform(Action::Activate),
             (ACTION, "GetName" | "GetLocalizedName", [Value::I32(0)]) => {
-                Ok(vec![Value::text("click")])
+                Ok(vec![Value::text(entry.action_name())])
             }
             (ACTION, "GetDescription" | "GetKeyBinding", [Value::I32(0)]) => {
                 Ok(vec![Value::text("")])
@@ -628,7 +659,7 @@ impl Service {
             (ACTION, "GetActions", []) => Ok(vec![Value::Array(
                 c"(sss)",
                 vec![Value::Struct(vec![
-                    Value::text("click"),
+                    Value::text(entry.action_name()),
                     Value::text(""),
                     Value::text(""),
                 ])],
