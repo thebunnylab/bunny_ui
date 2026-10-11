@@ -126,6 +126,19 @@ try:
             return
         assert value is False, f"retired accessible operation succeeded: {value!r}"
 
+    def rejected_range_set(path, number, expected_error):
+        # Some libatspi versions unref a null reply on a failed Value write.
+        # Inspect the server's precise error without crashing the client and
+        # leaving its fixture alive for the next backend/mode case.
+        try:
+            wire.call_sync(bus_name, path, "org.freedesktop.DBus.Properties", "Set",
+                GLib.Variant("(ssv)", ("org.a11y.atspi.Value", "CurrentValue", GLib.Variant("d", number))),
+                None, Gio.DBusCallFlags.NONE, 3000, None)
+        except GLib.Error as error:
+            assert Gio.DBusError.get_remote_error(error) == expected_error, error
+            return
+        raise AssertionError("invalid, disabled or retired range accepted a numeric write")
+
     slider = named("Refresh rate")
     slider_id = slider.get_accessible_id()
     assert slider.get_role() == Atspi.Role.SLIDER
@@ -145,7 +158,7 @@ try:
     assert Atspi.Value.set_current_value(slider, 0.2)
     assert abs(Atspi.Value.get_current_value(slider) - 0.3) < 1e-12
     for invalid in [float("nan"), float("inf"), -0.1, 1.1]:
-        unavailable(lambda: Atspi.Value.set_current_value(slider, invalid))
+        rejected_range_set(slider_id, invalid, "org.freedesktop.DBus.Error.InvalidArgs")
         assert abs(Atspi.Value.get_current_value(slider) - 0.3) < 1e-12
     assert Atspi.Component.grab_focus(slider)
     slider.clear_cache()
@@ -173,7 +186,7 @@ try:
     slider.clear_cache()
     assert not slider.get_state_set().contains(Atspi.StateType.ENABLED)
     assert not slider.get_state_set().contains(Atspi.StateType.EDITABLE)
-    unavailable(lambda: Atspi.Value.set_current_value(slider, 1.0))
+    rejected_range_set(slider_id, 1.0, "org.freedesktop.DBus.Error.NotSupported")
     unavailable(lambda: Atspi.Action.do_action(slider, 0))
     unavailable(lambda: Atspi.Component.grab_focus(slider))
     assert abs(Atspi.Value.get_current_value(slider) - 0.3) < 1e-12
@@ -206,7 +219,7 @@ try:
     dismiss = wait_for(lambda: named("Dismiss modal"), "modal not exposed")
     assert named("Updated name") is None
     assert named("Refresh rate") is None
-    unavailable(lambda: Atspi.Value.set_current_value(slider, 1.0))
+    rejected_range_set(slider_id, 1.0, "org.freedesktop.DBus.Error.UnknownObject")
     wire_unavailable(slider_id, "org.freedesktop.DBus.Properties", "Set", GLib.Variant("(ssv)", ("org.a11y.atspi.Value", "CurrentValue", GLib.Variant("d", 1.0))))
     wire_unavailable(check_id, "org.a11y.atspi.Action", "DoAction", GLib.Variant("(i)", (0,)))
     unavailable(lambda: Atspi.EditableText.set_text_contents(updated, "blocked"))
