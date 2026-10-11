@@ -209,6 +209,7 @@ struct Slot {
     /// The window's own scene — what a locale the app pins reaches.
     runtime: Rc<Runtime>,
     handler: RefCell<Box<dyn FnMut(AppEvent)>>,
+    pending: RefCell<std::collections::VecDeque<AppEvent>>,
     key_gate: RefCell<Box<dyn FnMut(&ffi::KeyStroke) -> bool>>,
     /// The bar's answer to a menu key — Alt alone, F10, an Alt chord.
     menu_gate: RefCell<Box<dyn FnMut(bunny_ui::menu::MenuKey) -> bool>>,
@@ -218,6 +219,23 @@ struct Slot {
     on_web: Box<dyn Fn(webview::WebviewEvent)>,
     /// Files dragged in from the system: previewed, dropped, or gone.
     file_drag: Box<dyn Fn(f64, f64, Vec<std::path::PathBuf>, filedrop::FileDrag) -> bool>,
+}
+
+impl Slot {
+    /// The first frame runs directly, outside the global dispatcher. Native
+    /// child creation can synchronously report activation during that frame;
+    /// replay those events after its scene borrow ends instead of reentering it.
+    fn dispatch(&self, event: AppEvent) {
+        self.pending.borrow_mut().push_back(event);
+        let Ok(mut handler) = self.handler.try_borrow_mut() else {
+            return;
+        };
+        loop {
+            let event = self.pending.borrow_mut().pop_front();
+            let Some(event) = event else { break };
+            handler(event);
+        }
+    }
 }
 
 /// This shell holds MORE THAN ONE window — the detachable composer,
@@ -311,7 +329,7 @@ impl App {
         // its own first frame, through its OWN handler and not the
         // global road: a window is very often opened from inside an
         // event, and the road is busy carrying that event
-        (slot.handler.borrow_mut())(AppEvent::Redraw);
+        slot.dispatch(AppEvent::Redraw);
         // painted, then shown — a window never flashes unpainted
         ffi::show_window(slot.handle);
         id
@@ -508,8 +526,7 @@ impl AppInner {
             for slot in app.live() {
                 // source 0 is a beat every window shares
                 if source == 0 || slot.window == source {
-                    let mut handler = slot.handler.borrow_mut();
-                    handler(event.clone());
+                    slot.dispatch(event.clone());
                 }
             }
             if gone {
@@ -1689,6 +1706,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         handle: window,
         runtime,
         handler: RefCell::new(handler),
+        pending: RefCell::default(),
         key_gate: RefCell::new(key_gate),
         menu_gate: RefCell::new(menu_gate),
         drag_gate,
