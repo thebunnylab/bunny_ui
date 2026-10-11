@@ -619,7 +619,7 @@ extern "C" fn element_maximum(this: Id, _: Sel) -> Id {
 fn range_number(this: Id, read: fn(bunny_ui::accessibility::RangeValue) -> f64) -> Id {
     element(this)
         .and_then(|element| element.node.borrow().range)
-        .map_or(empty(), |range| unsafe {
+        .map_or_else(empty, |range| unsafe {
             number_double(class("NSNumber"), sel("numberWithDouble:"), read(range))
         })
 }
