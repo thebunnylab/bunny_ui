@@ -26,6 +26,11 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::time::Instant;
 
+#[path = "accessibility_bus.rs"]
+mod bus;
+#[path = "appearance.rs"]
+pub(super) mod appearance;
+
 #[path = "accessibility.rs"]
 pub(crate) mod accessibility;
 
@@ -1871,6 +1876,8 @@ pub enum TouchPhase {
 
 #[derive(Clone)]
 pub enum AppEvent {
+    /// A live application-wide portal observation.
+    AppearanceChanged(Option<bunny_ui::theme::Appearance>),
     /// Captured native geometry addressed to its non-recycled scene lifetime.
     GeometryChanged(bunny_ui::window::GeometryObservation),
     /// Native dialog facts scoped to their presentation lease.
@@ -3957,7 +3964,6 @@ struct DbusIter {
 
 const DBUS_TYPE_STRING: c_int = 115; // 's'
 const DBUS_TYPE_VARIANT: c_int = 118; // 'v'
-const DBUS_TYPE_UINT32: c_int = 117; // 'u'
 const DBUS_TYPE_BOOLEAN: c_int = 98; // 'b'
 const DBUS_BUS_SESSION: c_int = 0;
 
@@ -4017,20 +4023,6 @@ fn portal_read(namespace: &CStr, key: &CStr) -> Option<(c_int, u64)> {
         dbus_connection_close(connection);
         dbus_connection_unref(connection);
         value.flatten()
-    }
-}
-
-/// The standardized appearance key: 1 = dark, 2 = light, 0 = no say.
-pub fn os_prefers_dark() -> Option<bool> {
-    let (kind, value) = portal_read(c"org.freedesktop.appearance", c"color-scheme")?;
-    (kind == DBUS_TYPE_UINT32).then(|| color_scheme_wants_dark(value as u32)).flatten()
-}
-
-fn color_scheme_wants_dark(scheme: u32) -> Option<bool> {
-    match scheme {
-        1 => Some(true),
-        2 => Some(false),
-        _ => None,
     }
 }
 
@@ -5641,6 +5633,7 @@ pub fn run() {
                 PollFd { fd: wake_fd, events: POLLIN, revents: 0 },
             ];
             accessibility::prepare(&mut fds);
+            appearance::prepare(&mut fds);
             // the engine's own descriptors ride this poll: a page's
             // frame, a signal, a message — all land on this thread
             let timeout = match crate::webview::pump_prepare(&mut fds) {
@@ -5658,6 +5651,8 @@ pub fn run() {
                 let mut drain = [0u8; 64];
                 while read(wake_fd, drain.as_mut_ptr().cast(), drain.len()) > 0 {}
             }
+            accessibility::after(&fds);
+            appearance::after(&fds);
             crate::webview::pump_after(&mut fds);
             wl_display_dispatch_pending(display);
             if wl_display_get_error(display) != 0 {
@@ -5666,6 +5661,7 @@ pub fn run() {
             }
         }
         drain_protocol_events();
+        appearance::pump();
         if wake_woke {
             dispatch(AppEvent::Wake);
         }
@@ -6482,13 +6478,7 @@ mod tests {
         assert_eq!(resolve_scale(&[3], &[(3, 0)]), 1, "a zero scale clamps to one");
     }
 
-    #[test]
-    fn the_color_scheme_reads_its_three_answers() {
-        assert_eq!(color_scheme_wants_dark(1), Some(true), "one is dark");
-        assert_eq!(color_scheme_wants_dark(2), Some(false), "two is light");
-        assert_eq!(color_scheme_wants_dark(0), None, "zero has no say");
-        assert_eq!(color_scheme_wants_dark(9), None, "the future has no say either");
-    }
+
 
     #[test]
     fn the_text_input_tables_match_their_xml() {

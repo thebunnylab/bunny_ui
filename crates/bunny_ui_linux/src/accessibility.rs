@@ -13,8 +13,7 @@
 //! Wayland exposes window-relative geometry, never invented screen positions.
 //! WPE pixels do not yet expose an embedded accessibility plug.
 
-#[path = "accessibility_bus.rs"]
-mod bus;
+use super::bus;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -934,22 +933,20 @@ fn service() -> Option<Rc<Service>> {
         .flatten()
 }
 
-/// Adds the bus descriptor, including write readiness for queued replies.
+/// Adds libdbus-owned watches for queued reads and replies.
 pub(crate) fn prepare(fds: &mut Vec<super::PollFd>) {
     if let Some(service) = service()
         && service.connected.get()
-        && let Some(fd) = service.connection.fd()
     {
-        fds.push(super::PollFd {
-            fd,
-            events: super::POLLIN
-                | if service.connection.wants_write() {
-                    4
-                } else {
-                    0
-                },
-            revents: 0,
-        });
+        service.connection.prepare(fds);
+    }
+}
+/// Reports descriptor readiness without dispatching accessibility actions.
+pub fn after(fds: &[super::PollFd]) {
+    if let Some(service) = service()
+        && service.connected.get()
+    {
+        service.connection.after(fds);
     }
 }
 /// Runs outside display dispatch, with no borrowed runtime or platform client.

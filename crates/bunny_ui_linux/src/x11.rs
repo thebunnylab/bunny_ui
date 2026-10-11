@@ -3607,6 +3607,7 @@ pub(crate) fn run() {
             PollFd { fd: wake_fd, events: POLLIN, revents: 0 },
         ];
         crate::ffi::accessibility::prepare(&mut fds);
+        crate::ffi::appearance::prepare(&mut fds);
         // the engine's own descriptors ride this poll (see the wayland
         // door)
         let timeout = match crate::webview::pump_prepare(&mut fds) {
@@ -3619,12 +3620,15 @@ pub(crate) fn run() {
             let mut drain = [0u8; 64];
             unsafe { while read(wake_fd, drain.as_mut_ptr().cast(), drain.len()) > 0 {} }
         }
+        crate::ffi::accessibility::after(&fds);
+        crate::ffi::appearance::after(&fds);
         crate::webview::pump_after(&mut fds);
         if unsafe { xcb_connection_has_error(connection) } != 0 {
             eprintln!("bunny_ui x11: the connection died");
             break;
         }
         drain_events();
+        crate::ffi::appearance::pump();
         if wake_woke {
             dispatch(AppEvent::Wake);
         }

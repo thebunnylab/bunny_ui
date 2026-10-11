@@ -140,8 +140,9 @@ mod native {
             )
             .await;
             let version = theme::version();
-            for mode in ["set", "type", "key", "path", "rogue"] {
-                portal.control(mode, 2);
+            portal.control("set", 2);
+            for mode in ["type", "key", "path", "rogue"] {
+                portal.control(mode, 1);
             }
             task::sleep(Duration::from_millis(100)).await;
             assert_eq!(

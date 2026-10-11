@@ -2,12 +2,16 @@
 //!
 //! The bus owns encoding and validation. Connections and messages never leave
 //! their UI thread; the shell polls their descriptor alongside its display.
+//! Watch ownership follows the libdbus main-loop contract:
+//! <https://dbus.freedesktop.org/doc/api/html/group__DBusWatch.html>
 
+use super::PollFd;
+use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr::NonNull;
 
-use super::super::{DbusError, DbusIter};
-use super::super::{
+use super::{DbusError, DbusIter};
+use super::{
     dbus_bus_get_private, dbus_connection_close, dbus_connection_send_with_reply_and_block,
     dbus_connection_unref, dbus_error_free, dbus_error_init, dbus_message_iter_append_basic,
     dbus_message_iter_get_arg_type, dbus_message_iter_get_basic, dbus_message_iter_init,
@@ -21,8 +25,18 @@ unsafe extern "C" {
     fn dbus_bus_register(connection: *mut c_void, error: *mut DbusError) -> c_int;
     fn dbus_bus_get_unique_name(connection: *mut c_void) -> *const c_char;
     fn dbus_connection_set_exit_on_disconnect(connection: *mut c_void, exit: c_int);
-    fn dbus_connection_get_unix_fd(connection: *mut c_void, fd: *mut c_int) -> c_int;
-    fn dbus_connection_get_outgoing_size(connection: *mut c_void) -> std::ffi::c_long;
+    fn dbus_connection_set_watch_functions(
+        connection: *mut c_void,
+        add: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int,
+        remove: unsafe extern "C" fn(*mut c_void, *mut c_void),
+        toggled: unsafe extern "C" fn(*mut c_void, *mut c_void),
+        data: *mut c_void,
+        free: Option<unsafe extern "C" fn(*mut c_void)>,
+    ) -> c_int;
+    fn dbus_watch_get_enabled(watch: *mut c_void) -> c_int;
+    fn dbus_watch_get_unix_fd(watch: *mut c_void) -> c_int;
+    fn dbus_watch_get_flags(watch: *mut c_void) -> u32;
+    fn dbus_watch_handle(watch: *mut c_void, flags: u32) -> c_int;
     fn dbus_connection_read_write(connection: *mut c_void, timeout: c_int) -> c_int;
     fn dbus_connection_pop_message(connection: *mut c_void) -> *mut c_void;
     fn dbus_connection_send(
@@ -42,6 +56,7 @@ unsafe extern "C" {
         member: *const c_char,
     ) -> *mut c_void;
     fn dbus_message_get_type(message: *mut c_void) -> c_int;
+    fn dbus_message_get_sender(message: *mut c_void) -> *const c_char;
     fn dbus_message_get_path(message: *mut c_void) -> *const c_char;
     fn dbus_message_get_interface(message: *mut c_void) -> *const c_char;
     fn dbus_message_get_member(message: *mut c_void) -> *const c_char;
@@ -82,7 +97,7 @@ impl Drop for Error {
     }
 }
 
-/// Values used by the AT-SPI interfaces. Container signatures describe their
+/// Values used by the AT-SPI and portal interfaces. Container signatures describe their
 /// elements, including the empty-array case; structs derive their signature.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Value {
@@ -242,6 +257,9 @@ impl Message {
     pub(super) fn reply_serial(&self) -> u32 {
         unsafe { dbus_message_get_reply_serial(self.0.as_ptr()) }
     }
+    pub(super) fn sender(&self) -> String {
+        unsafe { string(dbus_message_get_sender(self.0.as_ptr())) }
+    }
     pub(super) fn path(&self) -> String {
         unsafe { string(dbus_message_get_path(self.0.as_ptr())) }
     }
@@ -333,19 +351,51 @@ unsafe fn string(pointer: *const c_char) -> String {
     }
 }
 
-pub(super) struct Connection(NonNull<c_void>);
+type Watches = RefCell<Vec<*mut c_void>>;
+unsafe extern "C" fn add_watch(watch: *mut c_void, data: *mut c_void) -> c_int {
+    unsafe { &*data.cast::<Watches>() }.borrow_mut().push(watch);
+    1
+}
+unsafe extern "C" fn remove_watch(watch: *mut c_void, data: *mut c_void) {
+    unsafe { &*data.cast::<Watches>() }
+        .borrow_mut()
+        .retain(|item| *item != watch);
+}
+const unsafe extern "C" fn toggle_watch(_watch: *mut c_void, _data: *mut c_void) {
+    // prepare reads the current enabled state and flags directly from libdbus.
+}
+
+pub(super) struct Connection(NonNull<c_void>, Box<Watches>);
 impl Connection {
     fn own(pointer: *mut c_void, error: &Error) -> Result<Self, String> {
         let connection = NonNull::new(pointer).ok_or_else(|| error.reason())?;
         unsafe { dbus_connection_set_exit_on_disconnect(connection.as_ptr(), 0) };
-        Ok(Self(connection))
+        let mut result = Self(connection, Box::default());
+        // libdbus retains this stable allocation until connection destruction;
+        // callbacks run only on this UI thread, outside any list borrow.
+        let data = std::ptr::from_mut(result.1.as_mut()).cast();
+        if unsafe {
+            dbus_connection_set_watch_functions(
+                connection.as_ptr(),
+                add_watch,
+                remove_watch,
+                toggle_watch,
+                data,
+                None,
+            )
+        } == 0
+        {
+            return Err("D-Bus watch allocation failed".into());
+        }
+        Ok(result)
     }
     pub(super) fn accessibility() -> Result<Self, String> {
         let address = match std::env::var("AT_SPI_BUS_ADDRESS") {
             Ok(address) if !address.is_empty() => address,
             _ => {
                 let mut error = Error::new();
-                let session = Self::own(unsafe { dbus_bus_get_private(0, &mut error.0) }, &error)?;
+                let session =
+                    Self::own(unsafe { dbus_bus_get_private(0, &raw mut error.0) }, &error)?;
                 let request = Message::call(
                     c"org.a11y.Bus",
                     c"/org/a11y/bus",
@@ -387,12 +437,59 @@ impl Connection {
     pub(super) fn name(&self) -> String {
         unsafe { string(dbus_bus_get_unique_name(self.0.as_ptr())) }
     }
-    pub(super) fn fd(&self) -> Option<c_int> {
-        let mut fd = -1;
-        (unsafe { dbus_connection_get_unix_fd(self.0.as_ptr(), &mut fd) } != 0).then_some(fd)
+    pub(super) fn session() -> Result<Self, String> {
+        let mut error = Error::new();
+        Self::own(unsafe { dbus_bus_get_private(0, &raw mut error.0) }, &error)
     }
-    pub(super) fn wants_write(&self) -> bool {
-        unsafe { dbus_connection_get_outgoing_size(self.0.as_ptr()) > 0 }
+    pub(super) fn call(&self, request: &Message) -> Result<Message, String> {
+        let mut error = Error::new();
+        let pointer = unsafe {
+            dbus_connection_send_with_reply_and_block(
+                self.0.as_ptr(),
+                request.0.as_ptr(),
+                250,
+                &mut error.0,
+            )
+        };
+        NonNull::new(pointer)
+            .map(Message)
+            .ok_or_else(|| error.reason())
+    }
+    pub(super) fn prepare(&self, fds: &mut Vec<PollFd>) {
+        for &watch in self.1.borrow().iter() {
+            if unsafe { dbus_watch_get_enabled(watch) } == 0 {
+                continue;
+            }
+            let flags = unsafe { dbus_watch_get_flags(watch) };
+            fds.push(PollFd {
+                fd: unsafe { dbus_watch_get_unix_fd(watch) },
+                events: i16::from(flags & 1 != 0) | (i16::from(flags & 2 != 0) << 2),
+                revents: 0,
+            });
+        }
+    }
+    pub(super) fn after(&self, fds: &[PollFd]) {
+        // Handling one watch may remove any other watch. Never dereference a
+        // snapshot entry after its removal callback; no borrow crosses handle.
+        let watches = self.1.borrow().clone();
+        for watch in watches {
+            if !self.1.borrow().contains(&watch) || unsafe { dbus_watch_get_enabled(watch) } == 0 {
+                continue;
+            }
+            let fd = unsafe { dbus_watch_get_unix_fd(watch) };
+            let events = fds
+                .iter()
+                .filter(|item| item.fd == fd)
+                .fold(0, |events, item| events | item.revents);
+            let flags = u32::from(events & 1 != 0)
+                | (u32::from(events & 4 != 0) << 1)
+                | (u32::from(events & 8 != 0) << 2)
+                | (u32::from(events & 16 != 0) << 3);
+            let flags = flags & (unsafe { dbus_watch_get_flags(watch) } | 4 | 8);
+            if flags != 0 {
+                unsafe { dbus_watch_handle(watch, flags) };
+            }
+        }
     }
     pub(super) fn pump(&self) -> bool {
         unsafe { dbus_connection_read_write(self.0.as_ptr(), 0) != 0 }

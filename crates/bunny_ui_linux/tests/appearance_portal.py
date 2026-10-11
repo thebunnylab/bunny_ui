@@ -28,7 +28,9 @@ def handle(conn, sender, path, interface, method, parameters, invocation):
     global value
     if interface == IFACE:
         assert method == 'Read'
-        assert parameters.unpack() == ('org.freedesktop.appearance', 'color-scheme')
+        if parameters.unpack() != ('org.freedesktop.appearance', 'color-scheme'):
+            invocation.return_dbus_error('org.freedesktop.portal.Error.NotFound', 'Unknown setting')
+            return
         invocation.return_value(GLib.Variant('(v)', (GLib.Variant('v', GLib.Variant('u', value)),)))
         return
     mode, number = parameters.unpack()
