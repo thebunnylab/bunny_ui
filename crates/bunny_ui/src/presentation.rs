@@ -138,6 +138,16 @@ impl FeedPresentation {
     }
 }
 
+impl Drop for FeedPresentation {
+    fn drop(&mut self) {
+        // A callback may already hold an upgraded Arc. Closing explicitly
+        // prevents that temporary owner from keeping the subscription active.
+        let mut state = lock(&self.state);
+        state.phase = Phase::Closed;
+        state.pending.clear();
+    }
+}
+
 struct State {
     feed: FeedKey,
     capacity: usize,
@@ -461,5 +471,28 @@ pub mod backend {
             drawable_id,
             host_time_seconds,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FeedKey, backend, lock};
+    use std::sync::Arc;
+
+    #[test]
+    fn dropping_listener_closes_even_while_a_callback_holds_the_queue() {
+        let (observer, source) = backend::channel(FeedKey::new(1), 16);
+        let sender = source.sender();
+        let _ = sender.submitted(1);
+        let ticket = sender.commit(1).unwrap();
+        // Stand in for a native callback that upgraded its weak handle just
+        // before the consumer went away. Arc liveness alone is not subscription liveness.
+        let callback_state = Arc::clone(&observer.state);
+        drop(observer);
+        assert!(sender.feed().is_none());
+        ticket.rendered(true);
+        ticket.presented(1.0, 1);
+        assert_eq!(lock(&callback_state).presented, 0);
+        assert!(lock(&callback_state).pending.is_empty());
     }
 }
