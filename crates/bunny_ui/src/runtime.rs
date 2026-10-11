@@ -153,6 +153,7 @@ impl CaretPhase {
 }
 
 pub struct Runtime {
+    accessibility: RefCell<crate::accessibility::State>,
     /// The environment every body reads. Behind a cell because the
     /// shell moves it at runtime — a rotation flips the size class —
     /// and a moved environment rebuilds the retention on the next pass,
@@ -1521,6 +1522,7 @@ impl Runtime {
             caret_phase: Cell::new(CaretPhase::Visible),
             utf16_memo: RefCell::new(None),
             goal_column: Cell::new(None),
+            accessibility: RefCell::new(crate::accessibility::State::default()),
             last_fields: RefCell::new(Vec::new()),
             last_splits: RefCell::new(Vec::new()),
             last_customs: RefCell::new(Vec::new()),
@@ -1621,6 +1623,7 @@ impl Runtime {
     /// views the walk missed, effect-queue reassembly, and the sweep.
     /// Returns both outputs (print and layout) still holding references.
     fn render_pass<R: View>(&self, root: &R) -> NodeList {
+        let _accessibility = crate::accessibility::CaptureScope::enter(self.accessibility.borrow().enabled);
         // virtualized bodies read LAST frame's region geometry (offset
         // taken NOW — a wheel that just moved it must reach the window
         // math) — published fresh before every pass
@@ -5077,6 +5080,7 @@ impl Runtime {
             live: None,
             scale: self.device_scale.get(),
             touch: self.touch_modality.get(),
+            accessibility: self.accessibility.borrow().enabled,
             anim: None,
             overlay_bounds: self.overlay_bounds.get(),
             dialog_frames: Some(&dialogs),
@@ -5206,6 +5210,7 @@ impl Runtime {
             live: None,
             scale: self.device_scale.get(),
             touch: self.touch_modality.get(),
+            accessibility: self.accessibility.borrow().enabled,
             anim: None,
             overlay_bounds: self.overlay_bounds.get(),
             dialog_frames: Some(&dialogs),
@@ -7078,6 +7083,7 @@ impl Runtime {
             dialog_frames: Some(&dialogs),
             scale: self.device_scale.get(),
             touch: self.touch_modality.get(),
+            accessibility: self.accessibility.borrow().enabled,
         };
         let stage = if dom {
             crate::stats::Stage::Capture
@@ -7108,6 +7114,7 @@ impl Runtime {
         self.last_scrolls.borrow_mut().clone_from(&result.scrolls);
         self.last_modal_floor.set(result.modal_floor);
         self.last_fields.borrow_mut().clone_from(&result.fields);
+        self.accessibility.borrow_mut().update(&result.accessibility);
         self.last_splits.borrow_mut().clone_from(&result.splits);
         self.last_customs.borrow_mut().clone_from(&result.customs);
         self.last_hosts.borrow_mut().clone_from(&result.hosts);
@@ -7705,5 +7712,53 @@ impl Runtime {
     pub fn external_drag_exited(&self) {
         self.enter_scene();
         self.note_drag_preview(None, 0.0, 0.0);
+    }
+}
+
+
+impl Runtime {
+    /// Enables collection for a native accessibility adapter. The next frame
+    /// publishes the tree; disabling immediately retires its exposed handles.
+    pub fn set_accessibility_enabled(&self, enabled: bool) {
+        let mut state = self.accessibility.borrow_mut();
+        if state.enabled == enabled { return; }
+        state.enabled = enabled;
+        // The retained scene must gain or release its optional metadata.
+        // This uses the same state-preserving rebuild as an environment change.
+        self.env_moved.set(true);
+        if !enabled { state.clear(); }
+        self.frame_asked.set(true);
+    }
+
+    /// The last placed semantic tree, with the current keyboard focus.
+    pub fn accessibility_tree(&self) -> crate::accessibility::Tree {
+        self.accessibility.borrow().snapshot(self.focus.borrow().as_deref())
+    }
+
+    /// Applies an assistive-technology request through the control's existing
+    /// input path. Stale handles and unsupported role/action pairs are rejected.
+    pub fn accessibility_action(&self, id: crate::accessibility::NodeId, action: crate::accessibility::Action)
+        -> Result<(), crate::accessibility::ActionError>
+    {
+        use crate::accessibility::{Action, ActionError};
+        let tree = self.accessibility_tree();
+        let node = tree.node(id).ok_or(ActionError::Unavailable)?;
+        if !node.supports(&action) { return Err(ActionError::Unsupported); }
+        self.enter_scene();
+        let applied = match action {
+            Action::Activate => reconciler::run_action(&node.path, 1),
+            Action::Focus => {
+                if self.field_at(&node.path).is_none() { return Err(ActionError::Unavailable); }
+                self.focus(&node.path);
+                true
+            }
+            Action::SetText(text) => {
+                if self.field_at(&node.path).is_none() { return Err(ActionError::Unavailable); }
+                self.focus(&node.path);
+                self.key(EditCommand::SelectAll);
+                self.key(EditCommand::Insert(text)).applied
+            }
+        };
+        if applied { self.frame_asked.set(true); Ok(()) } else { Err(ActionError::Unavailable) }
     }
 }

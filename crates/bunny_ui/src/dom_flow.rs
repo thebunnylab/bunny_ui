@@ -807,8 +807,8 @@ impl Walk<'_> {
                 // layer, a transition — those keep their box
                 // (a text that wears hints or an action stood behind their
                 // wrapper, and a style over a wrapper keeps its box)
-                if matches!(**child, LayoutNode::Text { .. })
-                    && child.is_bare()
+                if matches!(child.without_semantics(), LayoutNode::Text { .. })
+                    && child.without_semantics().is_bare()
                     && !states
                     && !inheriting
                     && turned.is_none()
@@ -1125,7 +1125,8 @@ impl Walk<'_> {
             // would mean observing the element, which is a road of its
             // own — and a number invented here would be worse than no
             // number at all.
-            LayoutNode::Measured { child, .. } => self.lower_into(child, out),
+            LayoutNode::Accessible { child, .. }
+            | LayoutNode::Measured { child, .. } => self.lower_into(child, out),
 
             LayoutNode::Boundary { path, children, .. } => {
                 if self.promise(path, false, out).is_none() {
@@ -2459,6 +2460,7 @@ mod tests {
             align: CrossAlign::Center,
             children: vec![text_node("x")],
             hints: crate::layout::ElementHints {
+                semantics: None,
                 tag: Some(crate::modifier::hint("td")),
                 class: Some(crate::modifier::hint("cell")),
                 address: None,
@@ -2485,6 +2487,7 @@ mod tests {
         use crate::layout::VisualProps;
         let ink = VisualProps { foreground: Some(Color::hex(0x336699)), ..VisualProps::default() };
         let hinted = |tag: &str| crate::layout::ElementHints {
+            semantics: None,
             tag: Some(crate::modifier::hint(tag)),
             class: None,
             address: None,

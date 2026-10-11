@@ -96,6 +96,19 @@ pub trait ViewExt: View<Arity = Single> + Sized {
 
     /// `.font_weight(Weight::ExtraBold)` — a weight by name. Only the
     /// weight travels, so the size and the design of the scope survive;
+    /// Overrides the accessible name of the single control or text below.
+    /// Reactive labels update independently of the component body. On a
+    /// container with several controls, label each control separately.
+    fn accessibility_label(self, label: impl crate::text_value::IntoText) -> Modified<Self> {
+        Modified { base: self, modifier: Modifier::AccessibilityLabel(label.into_text().0) }
+    }
+
+    /// Excludes the subtree from assistive technology (for decorative content).
+    /// It does not change visibility or pointer/keyboard behavior.
+    fn accessibility_hidden(self) -> Modified<Self> {
+        Modified { base: self, modifier: Modifier::AccessibilityHidden }
+    }
+
     /// `.bold()` is the same door with `Weight::Bold` spelled for you.
     ///
     /// Every platform that renders a NUMBER renders all six. CoreText
