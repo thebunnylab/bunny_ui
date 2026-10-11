@@ -43,6 +43,10 @@ unsafe extern "C" {
     fn boolean(object: Id, selector: Sel) -> i8;
     #[link_name = "objc_msgSend"]
     fn number_bool(object: Id, selector: Sel, value: i8) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn number_double(object: Id, selector: Sel, value: f64) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn double_value(object: Id, selector: Sel) -> f64;
     #[link_name = "objc_msgSendSuper"]
     fn super_object(object: *const Super, selector: Sel) -> Id;
     #[link_name = "objc_msgSend"]
@@ -398,7 +402,11 @@ fn changes(previous: Option<&Node>, current: &Node) -> impl Iterator<Item = Noti
             .is_some_and(|old| old.label != current.label)
             .then_some(Notification::Title),
         previous
-            .is_some_and(|old| value_of(old) != value_of(current) || old.checked != current.checked)
+            .is_some_and(|old| {
+                value_of(old) != value_of(current)
+                    || old.checked != current.checked
+                    || old.range != current.range
+            })
             .then_some(Notification::Value),
         previous
             .is_some_and(|old| old.enabled != current.enabled)
@@ -559,6 +567,7 @@ extern "C" fn element_role(this: Id, _: Sel) -> Id {
             Role::Text => "AXStaticText",
             Role::Button => "AXButton",
             Role::Checkbox => "AXCheckBox",
+            Role::Slider => "AXSlider",
             Role::TextField | Role::PasswordField => "AXTextField",
         })
     }
@@ -594,7 +603,31 @@ extern "C" fn element_value(this: Id, _: Sel) -> Id {
             number_bool(class("NSNumber"), sel("numberWithBool:"), i8::from(checked))
         };
     }
+    if let Some(range) = node.range {
+        return unsafe {
+            number_double(class("NSNumber"), sel("numberWithDouble:"), range.value())
+        };
+    }
     value_of(&node).map_or(empty(), |value| unsafe { ns_string(value) })
+}
+extern "C" fn element_minimum(this: Id, _: Sel) -> Id {
+    range_number(this, bunny_ui::accessibility::RangeValue::minimum)
+}
+extern "C" fn element_maximum(this: Id, _: Sel) -> Id {
+    range_number(this, bunny_ui::accessibility::RangeValue::maximum)
+}
+fn range_number(this: Id, read: fn(bunny_ui::accessibility::RangeValue) -> f64) -> Id {
+    element(this)
+        .and_then(|element| element.node.borrow().range)
+        .map_or_else(empty, |range| unsafe {
+            number_double(class("NSNumber"), sel("numberWithDouble:"), read(range))
+        })
+}
+extern "C" fn element_increment(this: Id, _: Sel) -> i8 {
+    i8::from(element(this).is_some_and(|element| element.action(Action::Increment)))
+}
+extern "C" fn element_decrement(this: Id, _: Sel) -> i8 {
+    i8::from(element(this).is_some_and(|element| element.action(Action::Decrement)))
 }
 extern "C" fn element_identifier(this: Id, _: Sel) -> Id {
     element(this).map_or(empty(), |element| unsafe {
@@ -626,10 +659,17 @@ extern "C" fn element_set_focus(this: Id, _: Sel, focused: i8) {
     }
 }
 extern "C" fn element_set_value(this: Id, _: Sel, value: Id) {
-    if let Some(element) = element(this)
-        && !value.is_null()
-        && unsafe { predicate(value, sel("isKindOfClass:"), class("NSString")) } != 0
-    {
+    let Some(element) = element(this) else {
+        return;
+    };
+    if value.is_null() {
+        return;
+    }
+    if unsafe { predicate(value, sel("isKindOfClass:"), class("NSNumber")) } != 0 {
+        element.action(Action::SetValue(unsafe {
+            double_value(value, sel("doubleValue"))
+        }));
+    } else if unsafe { predicate(value, sel("isKindOfClass:"), class("NSString")) } != 0 {
         let text = unsafe { super::text_argument_to_string(value) };
         element.action(Action::SetText(text));
     }
@@ -644,8 +684,23 @@ extern "C" fn element_allowed(this: Id, _: Sel, selector: Sel) -> i8 {
     }
     if selector == unsafe { sel("setAccessibilityValue:") } {
         return i8::from(
-            node.enabled && matches!(node.role, Role::TextField | Role::PasswordField),
+            node.enabled
+                && matches!(
+                    node.role,
+                    Role::TextField | Role::PasswordField | Role::Slider
+                ),
         );
+    }
+    if selector == unsafe { sel("accessibilityPerformIncrement") } {
+        return i8::from(node.supports(&Action::Increment));
+    }
+    if selector == unsafe { sel("accessibilityPerformDecrement") } {
+        return i8::from(node.supports(&Action::Decrement));
+    }
+    if selector == unsafe { sel("accessibilityMinValue") }
+        || selector == unsafe { sel("accessibilityMaxValue") }
+    {
+        return i8::from(node.range.is_some());
     }
     if selector == unsafe { sel("setAccessibilityFocused:") } {
         return i8::from(node.supports(&Action::Focus));
@@ -720,6 +775,26 @@ pub(super) unsafe fn register_view(view: Id) {
             ),
             ("accessibilityLabel", element_label as *const c_void, c"@@:"),
             ("accessibilityValue", element_value as *const c_void, c"@@:"),
+            (
+                "accessibilityMinValue",
+                element_minimum as *const c_void,
+                c"@@:",
+            ),
+            (
+                "accessibilityMaxValue",
+                element_maximum as *const c_void,
+                c"@@:",
+            ),
+            (
+                "accessibilityPerformIncrement",
+                element_increment as *const c_void,
+                c"c@:",
+            ),
+            (
+                "accessibilityPerformDecrement",
+                element_decrement as *const c_void,
+                c"c@:",
+            ),
             (
                 "accessibilityIdentifier",
                 element_identifier as *const c_void,
@@ -837,6 +912,36 @@ mod tests {
         assert_eq!(
             changes(None, after.node(field).unwrap()).collect::<Vec<_>>(),
             [Notification::Focus]
+        );
+    }
+    #[test]
+    fn numeric_value_changes_notify_once_and_unchanged_ranges_stay_quiet() {
+        let runtime = Runtime::new();
+        runtime.set_accessibility_enabled(true);
+        let value = State::new(0.3);
+        let control = slider(
+            value.binding(),
+            SliderRange::new(0.0..=1.0).unwrap().with_step(0.3).unwrap(),
+        )
+        .accessibility_label("Refresh rate");
+        let size = Size {
+            width: 220.0,
+            height: 32.0,
+        };
+        runtime.display_frame(&control, size);
+        let before = runtime.accessibility_tree();
+        runtime
+            .accessibility_action(before.nodes()[0].id, Action::Increment)
+            .unwrap();
+        runtime.display_frame(&control, size);
+        let after = runtime.accessibility_tree();
+        assert_eq!(
+            changes(Some(&before.nodes()[0]), &after.nodes()[0]).collect::<Vec<_>>(),
+            [Notification::Value]
+        );
+        assert_eq!(
+            changes(Some(&after.nodes()[0]), &after.nodes()[0]).count(),
+            0
         );
     }
 }
