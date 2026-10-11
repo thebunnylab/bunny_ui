@@ -759,3 +759,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "text_geometry_tests.rs"]
+mod geometry_tests;
