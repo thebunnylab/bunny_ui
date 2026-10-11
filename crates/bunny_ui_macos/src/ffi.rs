@@ -568,7 +568,7 @@ pub fn queue_dialog_geometry(event: bunny_ui::window::DialogGeometryObservation)
     PENDING.with(|queue| {
         queue
             .borrow_mut()
-            .push_back((0, AppEvent::DialogGeometryChanged(event)))
+            .push_back((0, AppEvent::DialogGeometryChanged(event)));
     });
     wake_from_any_thread();
 }

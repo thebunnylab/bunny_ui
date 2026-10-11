@@ -28,19 +28,39 @@ unsafe extern "system" {
 thread_local! { static SOURCES: RefCell<HashMap<usize, Rc<GeometryEvents>>> = RefCell::new(HashMap::new()); }
 thread_local! {
     static PENDING: RefCell<VecDeque<(Hwnd, AppEvent)>> = const { RefCell::new(VecDeque::new()) };
+    static DIALOG_PENDING: RefCell<VecDeque<bunny_ui::window::DialogGeometryObservation>> = const { RefCell::new(VecDeque::new()) };
     static DIALOGS: RefCell<HashMap<Hwnd, (Hwnd, Weak<DialogGeometrySession>)>> = RefCell::new(HashMap::new());
     static DELIVERING: Cell<bool> = const { Cell::new(false) };
+    static DELIVERING_DIALOGS: Cell<bool> = const { Cell::new(false) };
     static MUTATING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Enqueues without entering application code during a native or renderer borrow.
 pub fn queue_dialog_geometry(event: bunny_ui::window::DialogGeometryObservation) {
-    PENDING.with(|pending| {
-        pending
-            .borrow_mut()
-            .push_back((0, AppEvent::DialogGeometryChanged(event)))
-    });
+    DIALOG_PENDING.with(|pending| pending.borrow_mut().push_back(event));
     super::wake_from_any_thread();
+}
+
+/// Delivers only from a posted wake, after the frame and its native calls return.
+/// Ordinary geometry drains can run synchronously inside `ShowWindow`/`SetWindowPos`.
+pub(super) fn drain_dialogs() {
+    struct Delivery;
+    impl Drop for Delivery {
+        fn drop(&mut self) {
+            DELIVERING_DIALOGS.with(|flag| flag.set(false));
+        }
+    }
+    if !HANDLER.with(|handler| handler.try_borrow_mut().is_ok())
+        || DELIVERING_DIALOGS.with(|flag| flag.replace(true))
+    {
+        return;
+    }
+    let _delivery = Delivery;
+    loop {
+        let next = DIALOG_PENDING.with(|pending| pending.borrow_mut().pop_front());
+        let Some(event) = next else { break };
+        dispatch_at(0, AppEvent::DialogGeometryChanged(event));
+    }
 }
 
 pub(super) fn bind_dialog(hwnd: Hwnd, parent: Hwnd, session: Option<Rc<DialogGeometrySession>>) {
@@ -108,7 +128,7 @@ pub fn forget_geometry(window: usize, id: WindowId) {
             DIALOGS.with(|sources| {
                 sources
                     .borrow_mut()
-                    .retain(|_, (parent, _)| usize::from_ne_bytes(parent.to_ne_bytes()) != window)
+                    .retain(|_, (parent, _)| usize::from_ne_bytes(parent.to_ne_bytes()) != window);
             });
         }
     });
@@ -179,7 +199,7 @@ pub(super) fn notify(hwnd: Hwnd) {
         PENDING.with(|pending| {
             pending
                 .borrow_mut()
-                .push_back((hwnd, AppEvent::GeometryChanged(observation)))
+                .push_back((hwnd, AppEvent::GeometryChanged(observation)));
         });
         drain();
     }
@@ -384,6 +404,24 @@ fn restore_hwnd(hwnd: Hwnd, placement: WindowPlacement) -> Result<(), WindowErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn synchronous_dispatch_cannot_deliver_a_dialog_capture() {
+        let controller = bunny_ui::window::DialogGeometry::new();
+        let session = controller.begin().unwrap();
+        let observed =
+            WindowGeometry::new(WindowSize::new(470.0, 310.0).unwrap(), None, 1.0).unwrap();
+        super::super::set_handler(Box::new(|event| {
+            if let AppEvent::DialogGeometryChanged(event) = event {
+                event.deliver();
+            }
+        }));
+        queue_dialog_geometry(session.capture(Ok(observed)).unwrap());
+        super::super::dispatch(AppEvent::Redraw);
+        assert_eq!(controller.geometry(), None);
+        drain_dialogs();
+        assert_eq!(controller.geometry(), Some(observed));
+    }
+
     #[test]
     fn native_frame_rejects_overflow_and_empty_dimensions() {
         assert!(

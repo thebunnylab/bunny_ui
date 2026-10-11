@@ -112,7 +112,7 @@ pub fn forget_geometry(window: usize, id: WindowId) {
             DIALOGS.with(|dialogs| {
                 dialogs
                     .borrow_mut()
-                    .retain(|_, source| source.parent != window)
+                    .retain(|_, source| source.parent != window);
             });
         }
     });

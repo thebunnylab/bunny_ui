@@ -47,7 +47,7 @@ pub use geometry_ops::{
 };
 
 /// X11 has its own event registry; its panel index names the same host slot.
-pub(super) fn notify_dialog_geometry(index: usize) {
+pub fn notify_dialog_geometry(index: usize) {
     dialog_geometry_ops::notify(index);
 }
 

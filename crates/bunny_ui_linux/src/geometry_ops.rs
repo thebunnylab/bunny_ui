@@ -20,7 +20,7 @@ pub fn queue_dialog_geometry(event: bunny_ui::window::DialogGeometryObservation)
     PENDING.with(|pending| {
         pending
             .borrow_mut()
-            .push_back((0, AppEvent::DialogGeometryChanged(event)))
+            .push_back((0, AppEvent::DialogGeometryChanged(event)));
     });
     super::wake_from_any_thread();
 }
@@ -73,7 +73,7 @@ pub(super) fn notify(window: usize) {
         PENDING.with(|pending| {
             pending
                 .borrow_mut()
-                .push_back((window, AppEvent::GeometryChanged(observation)))
+                .push_back((window, AppEvent::GeometryChanged(observation)));
         });
         drain();
     }

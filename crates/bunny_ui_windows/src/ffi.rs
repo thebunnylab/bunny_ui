@@ -2718,6 +2718,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
         }
         WM_APP_WAKE => {
             dispatch(AppEvent::Wake);
+            geometry_ops::drain_dialogs();
             0
         }
         WM_APP_REPRESENT => {
