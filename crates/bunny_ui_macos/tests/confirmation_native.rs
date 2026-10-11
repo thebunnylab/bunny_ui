@@ -196,12 +196,14 @@ mod probe {
             ] {
                 eprintln!("confirmation stage: button {label}");
                 let confirmation = running.confirm(subject, question()).unwrap();
+                eprintln!("confirmation stage: request queued {label}");
                 assert_eq!(confirmation.kind(), ConfirmationKind::AppKitSheet);
                 assert!(matches!(
                     running.confirm(subject, question()),
                     Err(ConfirmationError::AlreadyOpen)
                 ));
                 wait_sheet("Confirmation subject", true).await;
+                eprintln!("confirmation stage: sheet attached {label}");
                 unsafe {
                     let default = object(sheet("Confirmation subject"), sel("defaultButtonCell"));
                     assert_eq!(
@@ -304,6 +306,15 @@ fn main() {
             break;
         }
         if std::time::Instant::now() >= deadline {
+            // Sample only this fixture's child before the watchdog retires it.
+            // Native stalls need the platform stack, not a longer timeout.
+            if let Ok(sample) = std::process::Command::new("/usr/bin/sample")
+                .args([&child.id().to_string(), "1", "1", "-file", "/dev/stdout"])
+                .output()
+            {
+                eprintln!("{}", String::from_utf8_lossy(&sample.stdout));
+                eprintln!("{}", String::from_utf8_lossy(&sample.stderr));
+            }
             child.kill().unwrap();
             child.wait().unwrap();
             panic!("confirmation event loop did not complete");
