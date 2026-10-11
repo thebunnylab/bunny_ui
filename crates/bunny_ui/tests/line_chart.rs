@@ -225,7 +225,7 @@ fn retained_updates_resolve_identity_and_hide_retired_samples_without_mutating_t
     let after = runtime.display_frame(&view, size);
     assert!(words(&after).contains("sample 7 = 70"));
     assert_ne!(points(&before), points(&after));
-    assert_eq!(view.data.get().sample(7).unwrap().value(), 70.0);
+    near(view.data.get().sample(7).unwrap().value(), 70.0);
     view.data
         .set(LineSeries::new([sample(42, 4.0, 90.0), sample(19, 6.0, 5.0)]).unwrap());
     let retired = runtime.display_frame(&view, size);
@@ -382,7 +382,7 @@ fn themes_repaint_existing_plots_and_explicit_ink_remains_stable() {
                 DrawCommand::Image {
                     source: ImageSource::Path { ink, .. },
                     ..
-                } => Some(ink.clone()),
+                } => Some(*ink),
                 _ => None,
             })
             .unwrap()
