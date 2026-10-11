@@ -6,7 +6,7 @@
 //! and control roles. Actions return through the runtime's existing input
 //! paths. Collection is demand driven and schedules no timer.
 //!
-//! This projection covers text, buttons, checkboxes and editable fields. It is not
+//! This projection covers text, buttons, checkboxes, sliders and editable fields. It is not
 //! a native accessibility adapter: custom controls, virtualized offscreen
 //! navigation and platform protocols need their own integration.
 
@@ -37,6 +37,8 @@ pub enum Role {
     Button,
     /// A two-state control with a toggle action.
     Checkbox,
+    /// A bounded numeric control.
+    Slider,
     /// An editable text value.
     TextField,
     /// An editable secret whose value is never exported.
@@ -44,7 +46,7 @@ pub enum Role {
 }
 
 /// A request from assistive technology to a real control.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     /// Invoke a button or toggle a checkbox through its existing callback.
     Activate,
@@ -52,6 +54,12 @@ pub enum Action {
     Focus,
     /// Replace a field's whole value using its existing editing path.
     SetText(String),
+    /// Increase a range by one keyboard step, stopping at its upper endpoint.
+    Increment,
+    /// Decrease a range by one keyboard step, stopping at its lower endpoint.
+    Decrement,
+    /// Set a finite in-domain number, using the control's pointer snapping rule.
+    SetValue(f64),
 }
 
 /// Why a native action could not be applied.
@@ -61,6 +69,8 @@ pub enum ActionError {
     Unavailable,
     /// The role does not implement the requested action.
     Unsupported,
+    /// The numeric request is nonfinite or outside the control's domain.
+    InvalidValue,
 }
 
 impl std::fmt::Display for ActionError {
@@ -68,10 +78,75 @@ impl std::fmt::Display for ActionError {
         f.write_str(match self {
             Self::Unavailable => "the accessible element is no longer available",
             Self::Unsupported => "the accessible element does not support this action",
+            Self::InvalidValue => "the accessible range value must be finite and within its bounds",
         })
     }
 }
 impl std::error::Error for ActionError {}
+
+/// An immutable numeric snapshot with finite bounds, value and keyboard steps.
+/// Constructed from a validated slider domain; reading never changes its binding.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RangeValue {
+    minimum: f64,
+    maximum: f64,
+    value: f64,
+    small_change: f64,
+    large_change: f64,
+}
+impl RangeValue {
+    /// Projects a validated domain and the same bounded value the slider paints.
+    /// NaN displays at the minimum; other out-of-domain values clamp to an endpoint.
+    #[cfg(feature = "canvas")]
+    #[must_use]
+    pub fn new(range: crate::slider::SliderRange, value: f64) -> Self {
+        let minimum = range.lower();
+        let maximum = range.upper();
+        let span = maximum - minimum;
+        let small_change = range.step().unwrap_or(span / 100.0).min(span);
+        Self {
+            minimum,
+            maximum,
+            value: if value.is_nan() {
+                minimum
+            } else {
+                value.clamp(minimum, maximum)
+            },
+            small_change,
+            large_change: (small_change * 10.0).min(span),
+        }
+    }
+    /// Inclusive lower endpoint.
+    #[must_use]
+    pub const fn minimum(self) -> f64 {
+        self.minimum
+    }
+    /// Inclusive upper endpoint.
+    #[must_use]
+    pub const fn maximum(self) -> f64 {
+        self.maximum
+    }
+    /// Current bounded visual value, which need not lie on a discrete step.
+    #[must_use]
+    pub const fn value(self) -> f64 {
+        self.value
+    }
+    /// Nominal arrow-key change, capped to the span; endpoint steps can be shorter.
+    #[must_use]
+    pub const fn small_change(self) -> f64 {
+        self.small_change
+    }
+    /// Nominal page-key change, capped to the span.
+    #[must_use]
+    pub const fn large_change(self) -> f64 {
+        self.large_change
+    }
+    /// Whether a numeric set request is finite and inside the inclusive domain.
+    #[must_use]
+    pub fn contains(self, value: f64) -> bool {
+        value.is_finite() && (self.minimum..=self.maximum).contains(&value)
+    }
+}
 
 /// One exposed leaf. Containers are currently implicit in reading order.
 #[derive(Clone, Debug, PartialEq)]
@@ -95,6 +170,8 @@ pub struct Node {
     pub enabled: bool,
     /// The checkbox's value; absent for other roles.
     pub checked: Option<bool>,
+    /// Numeric state for a slider; absent for other roles.
+    pub range: Option<RangeValue>,
     /// Whether a text field accepts multiple lines.
     pub multiline: bool,
     pub(crate) path: Rc<str>,
@@ -103,10 +180,16 @@ pub struct Node {
 impl Node {
     /// Whether this role supports an action. Availability is rechecked on use.
     pub fn supports(&self, action: &Action) -> bool {
-        self.enabled && matches!(
-            (self.role, action),
-            (Role::Button | Role::Checkbox, Action::Activate | Action::Focus)
-                | (
+        self.enabled
+            && matches!(
+                (self.role, action),
+                (
+                    Role::Button | Role::Checkbox,
+                    Action::Activate | Action::Focus
+                ) | (
+                    Role::Slider,
+                    Action::Focus | Action::Increment | Action::Decrement | Action::SetValue(_)
+                ) | (
                     Role::TextField | Role::PasswordField,
                     Action::Focus | Action::SetText(_)
                 )
@@ -150,6 +233,7 @@ pub enum Semantics {
 pub(crate) struct Placed {
     pub enabled: bool,
     pub checked: Option<bool>,
+    pub range: Option<RangeValue>,
     pub path: Rc<str>,
     pub role: Role,
     pub label: Arc<str>,
@@ -178,7 +262,9 @@ impl Semantics {
             }
             Self::Text { path, content } => {
                 nodes.push(Placed {
-                    enabled: true, checked: None,
+                    enabled: true,
+                    checked: None,
+                    range: None,
                     path: Rc::clone(path),
                     role: Role::Text,
                     label: content.get(),
@@ -206,7 +292,9 @@ impl Semantics {
                 nodes.truncate(start);
                 {
                     nodes.push(Placed {
-                        enabled, checked,
+                        enabled,
+                        checked,
+                        range: None,
                         path: Rc::clone(path),
                         role: if checked.is_some() { Role::Checkbox } else { Role::Button },
                         label,
@@ -265,6 +353,7 @@ impl State {
                 Some(Node {
                     enabled: placed.enabled,
                     checked: placed.checked,
+                    range: placed.range,
                     id,
                     path: Rc::clone(&placed.path),
                     role: placed.role,
