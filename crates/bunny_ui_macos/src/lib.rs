@@ -14,6 +14,7 @@ pub mod drive;
 mod ffi;
 mod life;
 mod menu;
+mod objc_bool;
 mod metal;
 pub mod webview;
 

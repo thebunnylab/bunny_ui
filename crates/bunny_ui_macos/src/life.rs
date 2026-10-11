@@ -16,6 +16,7 @@ use std::ptr::null_mut;
 
 use bunny_ui::app::{AppEvent, emit};
 
+use crate::objc_bool::ObjcBool;
 use crate::ffi::{
     Id, Sel, class, class_addMethod, class_addProtocol, objc_allocateClassPair, objc_getProtocol,
     objc_registerClassPair, sel,
@@ -92,9 +93,9 @@ pub(crate) fn install() {
 /// `applicationShouldHandleReopen:hasVisibleWindows:` — the Dock icon,
 /// or a second launch of a bundled app: a reopen with no arguments.
 /// YES lets AppKit do its own part (unminiaturize, show).
-extern "C" fn bridge_reopen(_this: Id, _sel: Sel, _app: Id, _visible: i8) -> i8 {
+extern "C" fn bridge_reopen(_this: Id, _sel: Sel, _app: Id, _visible: ObjcBool) -> ObjcBool {
     emit(AppEvent::Reopened { arguments: Vec::new() });
-    1
+    ObjcBool::YES
 }
 
 /// `application:openURLs:` — a url the system handed this app: each
@@ -145,7 +146,7 @@ fn delegate() -> Id {
                 (
                     "applicationShouldHandleReopen:hasVisibleWindows:",
                     bridge_reopen as *const c_void,
-                    "B@:@B",
+                    if cfg!(target_arch = "aarch64") { "B@:@B" } else { "c@:@c" },
                 ),
                 ("application:openURLs:", bridge_open_urls as *const c_void, "v@:@@"),
                 ("bunnyWillSleep:", bridge_will_sleep as *const c_void, "v@:@"),

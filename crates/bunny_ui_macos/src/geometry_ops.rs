@@ -1,5 +1,6 @@
 //! Capture `AppKit` geometry at notification time and restore into live work areas.
 
+use super::ObjcBool;
 use super::{
     AppEvent, CGPoint, CGRect, CGSize, Id, Sel, WINDOWS, class, dispatch_from, msg_f64, msg_id,
     msg_rect, msg_rect_rect, msg_u64, msg_void_rect_bool, sel,
@@ -185,7 +186,7 @@ pub fn restore_window_placement(
             .map(|(_, work)| work)
             .ok_or(WindowError::GeometryUnavailable)?;
         let target = fit(frame, work, size(window as Id, sel("minSize")));
-        msg_void_rect_bool(window as Id, sel("setFrame:display:"), target, 1);
+        msg_void_rect_bool(window as Id, sel("setFrame:display:"), target, ObjcBool::YES);
     }
     Ok(())
 }

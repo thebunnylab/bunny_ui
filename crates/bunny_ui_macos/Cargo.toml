@@ -15,6 +15,12 @@ bunny-ui-apple.workspace = true
 countries-core.workspace = true
 countries-pure.workspace = true
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Checked Objective-C consumers catch callback ABI/encoding disagreements.
+objc2 = "=0.6.5"
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSArray", "NSEnumerator", "NSString", "NSGeometry"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSWindow", "NSView", "NSResponder", "objc2-core-foundation"] }
+
 # the present tape reader carries its own golden-tape tests; the other
 # examples stay on autodiscovery
 [[example]]
@@ -46,4 +52,8 @@ harness = false
 
 [[test]]
 name = "window_geometry"
+harness = false
+
+[[test]]
+name = "objc_bool_native"
 harness = false
