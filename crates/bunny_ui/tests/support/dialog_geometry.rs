@@ -251,9 +251,12 @@ fn run(path: &Path, fresh: bool) {
                             let runtime = weak.upgrade().unwrap();
                             let path = runtime.overlays()[0].path.clone();
                             let lease = runtime.dialog_geometry_session(&path).unwrap();
+                            println!("Closing the first window from its dialog geometry callback");
                             app.close(parent);
                             assert!(lease.capture(value).is_none(), "destroyed parent invalidates even a retained runtime");
                             complete.set(true);
+                            assert_eq!(app.windows().len(), 1, "the independent driver window remains alive");
+                            println!("Parent close returned; awaiting the surviving window's task clock");
                         }
                     }
                 });

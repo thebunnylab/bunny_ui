@@ -1521,8 +1521,13 @@ fn unregister_top_level(hwnd: Hwnd) -> usize {
             }
         }
     }
-    if driver().hwnd.load(Ordering::Acquire) == hwnd {
-        driver().hwnd.store(heir, Ordering::Release);
+    let clock = driver();
+    // Posting and handing the clock to another window share this lock. A tick
+    // queued to the dying HWND will never acknowledge its in-flight latch.
+    let _running = clock.running.lock().expect("driver lock");
+    if clock.hwnd.load(Ordering::Acquire) == hwnd {
+        clock.hwnd.store(heir, Ordering::Release);
+        clock.in_flight.store(false, Ordering::Release);
         // the slow beat is the driver's too, and moves house with it
         if let Some(step) = SLOW_STEP.with(Cell::get)
             && heir != 0
@@ -1919,10 +1924,15 @@ fn driver() -> &'static Driver {
                 if unsafe { DwmFlush() } < 0 {
                     std::thread::sleep(std::time::Duration::from_millis(16));
                 }
-                let hwnd = shared.hwnd.load(Ordering::Acquire);
-                if hwnd != 0 && !shared.in_flight.swap(true, Ordering::AcqRel) {
-                    unsafe {
-                        PostMessageW(hwnd, WM_APP_FRAME, 0, 0);
+                // Serialize the address/latch/post with window handoff, so a
+                // tick for the retired window cannot strand the new owner.
+                let running = shared.running.lock().expect("driver lock");
+                if *running {
+                    let hwnd = shared.hwnd.load(Ordering::Acquire);
+                    if hwnd != 0 && !shared.in_flight.swap(true, Ordering::AcqRel)
+                        && unsafe { PostMessageW(hwnd, WM_APP_FRAME, 0, 0) } == 0
+                    {
+                        shared.in_flight.store(false, Ordering::Release);
                     }
                 }
             }
