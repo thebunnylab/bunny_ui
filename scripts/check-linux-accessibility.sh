@@ -43,6 +43,11 @@ for backend in x11 wayland; do
       cargo test -p bunny-ui-linux --locked --test window_relationships; then
       failures=$((failures + 1))
     fi
+    echo "Window geometry backend=$backend paranoid=${paranoid:-off}"
+    if ! BUNNY_BACKEND="$backend" BUNNY_PARANOID="$paranoid" BUNNY_WINDOW_GEOMETRY_PROBE=1 timeout 100s \
+      cargo test -p bunny-ui-linux --locked --test window_geometry; then
+      failures=$((failures + 1))
+    fi
     if [[ $backend == x11 ]]; then
       if ! BUNNY_BACKEND=x11 BUNNY_PARANOID="$paranoid" timeout 45s \
         cargo test -p bunny-ui-linux --locked --lib relationship_property_round_trip -- --ignored --nocapture; then

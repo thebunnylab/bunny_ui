@@ -47,6 +47,9 @@ mod modal;
 #[path = "window_ops.rs"]
 mod window_ops;
 pub use window_ops::{focus_window, set_window_parent};
+#[path = "geometry_ops.rs"]
+mod geometry_ops;
+pub use geometry_ops::{register_geometry, forget_geometry, window_geometry, restore_window_placement};
 
 use bunny_ui::action::ActionId;
 use bunny_ui::menu::Pick;
@@ -215,6 +218,8 @@ unsafe extern "C" {
 /// display-link tick reaches every window that wants it.
 #[derive(Clone)]
 pub enum AppEvent {
+    /// Captured native geometry addressed to its non-recycled scene lifetime.
+    GeometryChanged(bunny_ui::window::GeometryObservation),
     /// A native assistive-technology client first queried this window.
     AccessibilityEnable,
     /// A validated native element requests an action on its retained control.
@@ -588,6 +593,27 @@ fn dispatch_from(source: usize, event: AppEvent) {
         let Some((source, event)) = next else { break };
         dispatch_from(source, event);
     }
+}
+
+/// Native placement can synchronously notify while `AppKit` still uses its frame.
+/// Preserve those facts and let user callbacks run after the operation returns.
+pub fn defer_events<T>(work: impl FnOnce() -> T) -> T {
+    struct Deferred(bool);
+    impl Drop for Deferred {
+        fn drop(&mut self) { DISPATCHING.with(|flag| flag.set(self.0)); }
+    }
+    let held = DISPATCHING.with(|flag| flag.replace(true));
+    let deferred = Deferred(held);
+    let result = work();
+    drop(deferred);
+    if !held {
+        loop {
+            let next = PENDING.with(|queue| queue.borrow_mut().pop_front());
+            let Some((source, event)) = next else { break };
+            dispatch_from(source, event);
+        }
+    }
+    result
 }
 
 /// An event that waits behind a running handler joins the line — and a
@@ -1396,7 +1422,12 @@ extern "C" fn bunny_window_did_change_backing(_this: Id, _sel: Sel, note: Id) {
 // them apart: a drag on the left or top edge moves the origin AND
 // the size, so `move` and `resize` both arrive on every step.
 fn window_frame_changed(note: Id, kind: &str) {
+    defer_events(|| window_frame_changed_inner(note, kind));
+}
+
+fn window_frame_changed_inner(note: Id, kind: &str) {
     let window = unsafe { msg_id(note, sel("object")) };
+    geometry_ops::notify(window as usize);
     if crate::trace::active() {
         unsafe {
             let view = msg_id(window, sel("contentView"));

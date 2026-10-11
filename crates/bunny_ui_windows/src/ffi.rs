@@ -21,6 +21,9 @@ pub(crate) use accessibility::{Accessibility, Request as AccessibilityRequest};
 #[path = "window_ops.rs"]
 mod window_ops;
 pub use window_ops::{focus_window, set_window_parent};
+#[path = "geometry_ops.rs"]
+mod geometry_ops;
+pub use geometry_ops::{register_geometry, forget_geometry, window_geometry, restore_window_placement};
 
 // MARK: - Win32 ABI surface (the platform headers, transcribed)
 
@@ -653,6 +656,8 @@ pub(crate) fn com_init() {
 /// beats to each of them.
 #[derive(Clone)]
 pub enum AppEvent {
+    /// Captured native geometry addressed to its non-recycled scene lifetime.
+    GeometryChanged(bunny_ui::window::GeometryObservation),
     /// First UIA query enables semantic collection.
     AccessibilityEnable,
     /// A validated COM request returns to the scene thread.
@@ -1625,6 +1630,7 @@ pub fn dispatch(event: AppEvent) {
             handler(event);
         }
     });
+    geometry_ops::drain();
 }
 
 // MARK: - DPI metrics (one funnel)
@@ -2180,6 +2186,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 return 0;
             }
             refresh_metrics(hwnd);
+            geometry_ops::notify(hwnd);
             // the platform's word on the window itself, BEFORE the frame
             // that shows it: a scene-drawn caption swaps the square for
             // the restore glyph in the same composition as the new size
@@ -2214,6 +2221,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 }
             }
             refresh_metrics(hwnd);
+            geometry_ops::notify(hwnd);
             dispatch_at(hwnd, AppEvent::Redraw);
             0
         }
@@ -2442,6 +2450,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_MOVE => {
+            geometry_ops::notify(hwnd);
             if is_top_level(hwnd) {
                 // the engine repositions its own popups — a select
                 // dropdown, autofill — after the parent's move lands

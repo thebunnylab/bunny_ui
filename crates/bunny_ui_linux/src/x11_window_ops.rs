@@ -34,7 +34,7 @@ unsafe extern "C" {
     fn xcb_request_check(connection: *mut Connection, cookie: Cookie) -> *mut GenericError;
 }
 
-fn checked(
+pub(super) fn checked(
     connection: *mut Connection,
     cookie: Cookie,
     operation: &'static str,

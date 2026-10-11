@@ -32,6 +32,20 @@ pub(crate) mod accessibility;
 #[path = "window_ops.rs"]
 mod window_ops;
 pub use window_ops::{focus_window, set_window_parent};
+#[path = "geometry_ops.rs"]
+mod geometry_ops;
+pub use geometry_ops::{register_geometry, forget_geometry, window_geometry, restore_window_placement};
+
+/// Captures an X11 notification outside its client registry borrow.
+pub fn notify_geometry(window: usize) {
+    geometry_ops::notify(window);
+}
+
+/// Records actual Wayland EGL buffer size after a successful swap, outside GL's
+/// registry borrow at delivery time. X11 geometry comes from native configure.
+pub fn observe_gl_geometry(window: usize, physical: (usize, usize), scale: usize) {
+    if !is_x11() { geometry_ops::observe_buffer(window, physical, scale); }
+}
 
 // MARK: - libc floor (the only raw syscalls the shell needs)
 
@@ -1380,6 +1394,9 @@ struct Window {
     xdg_surface: *mut Proxy,
     toplevel: *mut Proxy,
     logical: (f64, f64),
+    /// Last configured or committed size; requests change only `logical`.
+    observed_size: Option<(f64, f64)>,
+    size_authority: geometry_ops::SizeAuthority,
     map: MapState,
     /// The size the role staged for the next `xdg_surface.configure`.
     pending_size: Option<(i32, i32)>,
@@ -1823,6 +1840,8 @@ pub enum TouchPhase {
 
 #[derive(Clone)]
 pub enum AppEvent {
+    /// Captured native geometry addressed to its non-recycled scene lifetime.
+    GeometryChanged(bunny_ui::window::GeometryObservation),
     Redraw,
     /// This window closed — by its button, the compositor, or the app;
     /// its slot retires. Delivered at the window, before it is gone.
@@ -1917,6 +1936,7 @@ pub fn dispatch(event: AppEvent) {
             handler(event);
         }
     });
+    geometry_ops::drain();
 }
 
 // MARK: - connect and the registry census
@@ -2286,6 +2306,8 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
             xdg_surface,
             toplevel,
             logical: (width, height),
+            observed_size: None,
+            size_authority: geometry_ops::SizeAuthority::Client,
             map: MapState::default(),
             pending_size: None,
             scale: 1,
@@ -2401,7 +2423,8 @@ fn apply_toplevel_configure(
 ) -> Option<(usize, bool)> {
     let win = window_where(client, |w| w.toplevel as usize == toplevel_ptr)?;
     // zero means "your choice": keep what we have
-    win.pending_size = (width > 0 && height > 0).then_some((width, height));
+    win.pending_size = (width > 0 || height > 0).then_some((width, height));
+    win.size_authority = geometry_ops::SizeAuthority::from_states(states);
     const STATE_MAXIMIZED: u32 = 1;
     const STATE_RESIZING: u32 = 3;
     win.maximized = states.contains(&STATE_MAXIMIZED);
@@ -2426,12 +2449,14 @@ fn apply_surface_configure(
     let mapped = win.map.mapped();
     let mut resized = false;
     if let Some((w, h)) = staged {
-        let logical = (w as f64, h as f64);
+        let logical = (if w > 0 { f64::from(w) } else { win.logical.0 },
+            if h > 0 { f64::from(h) } else { win.logical.1 });
         if logical != win.logical {
             win.logical = logical;
             resized = true;
         }
     }
+    win.observed_size = Some(win.logical);
     Some((win.surface as usize, resized, first, mapped, win.presents))
 }
 
@@ -3397,6 +3422,7 @@ fn wait_release(client: &mut Client, addr: usize) {
 }
 
 fn present_rows(addr: usize, width: usize, height: usize, rgba: &[u8], damage: &[(i64, i64, i64, i64)]) {
+    let before = with_client(|client| window_ref(client, addr).and_then(|win| win.observed_size));
     with_client(|client| {
         if !window_ref(client, addr).is_some_and(|w| w.map.can_attach()) {
             return;
@@ -3436,7 +3462,7 @@ fn present_rows(addr: usize, width: usize, height: usize, rgba: &[u8], damage: &
         let buffer = backing.buffer;
         unsafe {
             let surface_version = wl_proxy_get_version(win.surface);
-            if win.scale > 1 && surface_version >= 3 {
+            if surface_version >= 3 {
                 request(win.surface, 8, &mut [arg_i(win.scale as i32)]);
             }
             request(win.surface, 1, &mut [arg_o(buffer), arg_i(0), arg_i(0)]);
@@ -3477,10 +3503,13 @@ fn present_rows(addr: usize, width: usize, height: usize, rgba: &[u8], damage: &
             wl_display_flush(display);
         }
         win.map.on_present();
+        win.observed_size = geometry_ops::committed_size(width, height, win.scale);
         win.presents += 1;
         client.presents += 1;
         window_ops::restore_parents(client);
     });
+    let after = with_client(|client| window_ref(client, addr).and_then(|win| win.observed_size));
+    if before != after { geometry_ops::notify(addr); }
 }
 
 // MARK: - cursor (theme tier; the shape protocol joins on compositors that have it)
@@ -4654,7 +4683,7 @@ pub(crate) fn gpu_pre_present(window: usize, scale: usize) -> bool {
             return false;
         }
         unsafe {
-            if scale > 1 && wl_proxy_get_version(win.surface) >= 3 {
+            if wl_proxy_get_version(win.surface) >= 3 {
                 request(win.surface, 8, &mut [arg_i(scale as i32)]);
             }
             // every presenting commit carries a frame callback; `done`
@@ -4743,6 +4772,7 @@ fn drain_protocol_events() {
                 else {
                     continue;
                 };
+                geometry_ops::notify(addr);
                 if resized || first {
                     // a new size, or the window's very first configure:
                     // the reveal
@@ -5458,24 +5488,20 @@ fn update_scale_all() {
 }
 
 /// Applies an edit to the window's scale inputs and re-resolves the
-/// ladder. True when the lattice actually moved — the caller asks for
+/// ladder. True when the exact factor or the raster lattice moved — the caller asks for
 /// the fresh frame, or not (a window being set up draws soon anyway).
 fn update_scale(addr: usize, edit: impl FnOnce(&mut Window)) -> bool {
-    with_client(|client| {
+    let changed = with_client(|client| {
         let outputs: Vec<(u32, i32)> =
             client.outputs.iter().map(|output| (output.name, output.scale)).collect();
         let Some(win) = window_at(client, addr) else { return false };
         edit(win);
         let (scale, factor) =
             scale_ladder(win.preferred_120, win.preferred_buffer, &win.entered, &outputs);
-        win.factor = factor;
-        if scale != win.scale {
-            win.scale = scale;
-            true
-        } else {
-            false
-        }
-    })
+        geometry_ops::set_scale(&mut win.scale, &mut win.factor, scale, factor)
+    });
+    if changed { geometry_ops::notify(addr); }
+    changed
 }
 
 /// The pump: prepare-read integration of the wayland fd plus the
@@ -5822,6 +5848,8 @@ pub fn set_window_visibility(
                 WindowVisibility::Shown => {
                     win.map = MapState::AwaitingConfigure;
                     win.pending_size = None;
+                    win.observed_size = None;
+                    win.size_authority = geometry_ops::SizeAuthority::Client;
                     win.maximized = false;
                     win.resizing = false;
                     request(

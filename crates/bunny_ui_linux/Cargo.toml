@@ -97,3 +97,7 @@ harness = false
 [[test]]
 name = "window_relationships"
 harness = false
+
+[[test]]
+name = "window_geometry"
+harness = false

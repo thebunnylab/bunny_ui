@@ -1869,6 +1869,7 @@ impl GlPresenter {
             return Presented::Ok;
         }
         crate::ffi::gpu_note_present(self.window);
+        crate::ffi::observe_gl_geometry(self.window, physical, scale);
         self.retained = Some((display.clone(), physical, scale, canvas));
         Presented::Ok
     }

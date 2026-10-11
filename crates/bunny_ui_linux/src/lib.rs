@@ -221,8 +221,10 @@ impl WindowSpec {
 
 use bunny_ui::window::{Lifecycle, Relationships};
 mod window_api;
+mod window_geometry;
 pub use bunny_ui::window::{
-    CloseAction, WindowError, WindowId, WindowParent, WindowParentKind, WindowVisibility,
+    CloseAction, DesktopPosition, DesktopSpace, WindowError, WindowGeometry, WindowId,
+    WindowParent, WindowParentKind, WindowPlacement, WindowSize, WindowVisibility,
 };
 
 /// Whether this shell opens more than one window at a time — it does:
@@ -301,6 +303,12 @@ impl AppInner {
         }));
         let app = Rc::clone(self);
         ffi::set_handler(Box::new(move |event| {
+            if let AppEvent::GeometryChanged(observation) = event {
+                if let Some(slot) = app.live().into_iter().find(|slot| slot.lifecycle.id() == observation.id()) {
+                    slot.lifecycle.geometry_events().observe_captured(&observation);
+                }
+                return;
+            }
             let source = ffi::event_source();
             let closing = matches!(event, AppEvent::WindowClosed);
             for slot in app.live() {
@@ -339,6 +347,8 @@ impl AppInner {
 
     fn buried(&self, window: usize) {
         if let Some(slot) = self.slots.borrow().iter().find(|slot| slot.window == window) {
+            slot.lifecycle.geometry_events().retire();
+            ffi::forget_geometry(slot.window, slot.lifecycle.id());
             self.relationships.retire(slot.lifecycle.id());
         }
         self.slots.borrow_mut().retain(|slot| slot.window != window);
@@ -390,6 +400,7 @@ impl App {
     pub fn open(&self, spec: WindowSpec, runtime: Rc<Runtime>, root: impl View) -> WindowId {
         let slot = mount(&spec, runtime, root);
         self.inner.relationships.register(slot.lifecycle.id());
+        ffi::register_geometry(slot.window, Rc::clone(slot.lifecycle.geometry_events()));
         self.inner.slots.borrow_mut().push(Rc::clone(&slot));
         self.inner.route();
         (slot.handler.borrow_mut())(AppEvent::Redraw);
@@ -401,6 +412,8 @@ impl App {
     pub fn close(&self, id: WindowId) {
         self.close_children(id);
         if let Some(slot) = self.slot(id) {
+            slot.lifecycle.geometry_events().retire();
+            ffi::forget_geometry(slot.window, id);
             ffi::close_top_level(slot.window);
             self.inner.relationships.retire(id);
             self.inner
@@ -1411,7 +1424,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             alt_tap.borrow_mut().interrupted();
         }
         match event {
-            AppEvent::Redraw => blit(runtime, root, ORIGIN_REDRAW),
+            AppEvent::GeometryChanged(_) => return,
+        AppEvent::Redraw => blit(runtime, root, ORIGIN_REDRAW),
             AppEvent::WindowClosed => {}
             AppEvent::DialogClose { panel } => {
                 // its ✕ or the compositor: the window did NOT close — the

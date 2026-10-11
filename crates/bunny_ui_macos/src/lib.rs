@@ -448,8 +448,10 @@ impl WindowSpec {
 
 use bunny_ui::window::{Lifecycle, Relationships};
 mod window_api;
+mod window_geometry;
 pub use bunny_ui::window::{
-    CloseAction, WindowError, WindowId, WindowParent, WindowParentKind, WindowVisibility,
+    CloseAction, DesktopPosition, DesktopSpace, WindowError, WindowGeometry, WindowId,
+    WindowParent, WindowParentKind, WindowPlacement, WindowSize, WindowVisibility,
 };
 
 /// This shell holds MORE THAN ONE window — the detachable composer,
@@ -610,6 +612,7 @@ impl App {
     pub fn open(&self, spec: WindowSpec, runtime: Rc<Runtime>, root: impl View) -> WindowId {
         let slot = mount(&spec, runtime, root);
         self.inner.relationships.register(slot.lifecycle.id());
+        ffi::register_geometry(slot.window, Rc::clone(slot.lifecycle.geometry_events()));
         let id = slot.lifecycle.id();
         self.inner.slots.borrow_mut().push(slot.clone());
         self.inner.clone().route();
@@ -630,6 +633,8 @@ impl App {
         // notification does NOT re-enter the scene: this is usually
         // called from inside the handler of the very window that asked
         if let Some(slot) = self.slot(id) {
+            slot.lifecycle.geometry_events().retire();
+            ffi::forget_geometry(slot.window, id);
             ffi::lend_hand(|| ffi::close_top_level(slot.window));
             self.inner.relationships.retire(id);
             self.inner
@@ -819,6 +824,12 @@ impl AppInner {
         }));
         let app = Rc::clone(&self);
         ffi::set_handler(Box::new(move |event| {
+            if let AppEvent::GeometryChanged(observation) = event {
+                if let Some(slot) = app.live().into_iter().find(|slot| slot.lifecycle.id() == observation.id()) {
+                    slot.lifecycle.geometry_events().observe_captured(&observation);
+                }
+                return;
+            }
             let source = ffi::event_source();
             let gone = matches!(event, AppEvent::WindowClosed);
             let spoke = matches!(event, AppEvent::Locale);
@@ -896,6 +907,8 @@ impl AppInner {
     /// Drops the slot of a window that has gone.
     fn buried(&self, window: usize) {
         if let Some(slot) = self.slots.borrow().iter().find(|slot| slot.window == window) {
+            slot.lifecycle.geometry_events().retire();
+            ffi::forget_geometry(slot.window, slot.lifecycle.id());
             self.relationships.retire(slot.lifecycle.id());
         }
         self.slots.borrow_mut().retain(|slot| slot.window != window);
@@ -2233,6 +2246,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 blit(runtime, root, trace::Origin::Input);
             }
         }
+        AppEvent::GeometryChanged(_) => return,
         AppEvent::Redraw => blit(runtime, root, trace::Origin::Redraw),
         // the Redraw that follows presents it
         AppEvent::WindowState { maximized } => {

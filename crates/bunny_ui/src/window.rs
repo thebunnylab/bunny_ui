@@ -8,7 +8,11 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod geometry;
 mod relationships;
+#[doc(hidden)]
+pub use geometry::{GeometryEvents, GeometryObservation};
+pub use geometry::{DesktopPosition, DesktopSpace, WindowGeometry, WindowPlacement, WindowSize};
 #[doc(hidden)]
 pub use relationships::{RelationshipChange, Relationships};
 
@@ -55,6 +59,10 @@ pub enum WindowError {
     HiddenWindow,
     /// The window system declined the activation request.
     FocusDenied,
+    /// Invalid size, coordinates, scale or a mismatched desktop coordinate space.
+    InvalidGeometry(&'static str),
+    /// The native window has not supplied usable geometry in its current state.
+    GeometryUnavailable,
     /// A native operation failed with its platform error code.
     NativeFailure {
         /// The native operation that failed.
@@ -77,6 +85,8 @@ impl std::fmt::Display for WindowError {
             }
             Self::HiddenWindow => f.write_str("window or its owner is explicitly hidden"),
             Self::FocusDenied => f.write_str("window system declined activation"),
+            Self::InvalidGeometry(reason) => write!(f, "invalid window geometry: {reason}"),
+            Self::GeometryUnavailable => f.write_str("window geometry is not yet available"),
             Self::NativeFailure { operation, code } => {
                 write!(f, "{operation} failed: native error {code}")
             }
@@ -133,6 +143,7 @@ pub struct Lifecycle {
     deciding: Cell<bool>,
     hidden: Cell<bool>,
     owner_hidden: Cell<bool>,
+    geometry_events: Rc<GeometryEvents>,
 }
 
 impl Default for Lifecycle {
@@ -147,6 +158,7 @@ impl Default for Lifecycle {
             .expect("window identity space exhausted; identities cannot be reused");
         Self {
             id: WindowId(id),
+            geometry_events: Rc::new(GeometryEvents::new(WindowId(id))),
             handler: RefCell::new(None),
             deciding: Cell::new(false),
             hidden: Cell::new(false),
@@ -156,6 +168,12 @@ impl Default for Lifecycle {
 }
 
 impl Lifecycle {
+    /// Native geometry observations belonging to this window lifetime.
+    #[must_use]
+    pub const fn geometry_events(&self) -> &Rc<GeometryEvents> {
+        &self.geometry_events
+    }
+
     /// The immutable identity belonging to this backend slot.
     #[must_use]
     pub const fn id(&self) -> WindowId {
