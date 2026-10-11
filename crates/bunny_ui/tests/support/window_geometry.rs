@@ -121,18 +121,20 @@ fn run() {
                 assert!(first < second, "reentrant native observations retain order");
                 println!("Reentrant restoration complete");
                 app.clear_geometry_handler(child).unwrap();
-                app.hide(parent).unwrap();
-                app.show(parent).unwrap();
-                println!("Parent remap requested: {:?}", app.geometry(child));
-                let mut last_remap = None;
-                until(|| {
-                    let current = app.geometry(child);
-                    if last_remap.as_ref() != Some(&current) {
-                        println!("Remap geometry transition: {current:?}");
-                        last_remap = Some(current.clone());
-                    }
-                    current.is_ok_and(|value| matches_size(value, 430.0, 280.0))
-                }).await;
+                for cycle in 1..=3 {
+                    app.hide(parent).unwrap();
+                    app.show(parent).unwrap();
+                    println!("Parent remap {cycle} requested: {:?}", app.geometry(child));
+                    let mut last_remap = None;
+                    until(|| {
+                        let current = app.geometry(child);
+                        if last_remap.as_ref() != Some(&current) {
+                            println!("Remap geometry transition: {current:?}");
+                            last_remap = Some(current.clone());
+                        }
+                        current.is_ok_and(|value| matches_size(value, 430.0, 280.0))
+                    }).await;
+                }
                 if let Some(position) = initial.position() {
                     let missing = DesktopPosition::new(30_000.0, 30_000.0, position.space()).unwrap();
                     app.restore_placement(child, WindowPlacement::new(WindowSize::new(380.0, 250.0).unwrap(), Some(missing))).unwrap();

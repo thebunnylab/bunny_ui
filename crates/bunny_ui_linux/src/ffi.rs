@@ -32,6 +32,8 @@ pub(crate) mod accessibility;
 #[path = "window_ops.rs"]
 mod window_ops;
 pub use window_ops::{focus_window, set_window_parent};
+#[path = "window_mapping.rs"]
+mod window_mapping;
 #[path = "geometry_ops.rs"]
 mod geometry_ops;
 pub use geometry_ops::{register_geometry, forget_geometry, window_geometry, restore_window_placement};
@@ -2646,8 +2648,12 @@ unsafe fn destroy_window_proxies(win: Window) {
         if !win.fractional.is_null() {
             destroy(win.fractional, 0); // before the surface it watches
         }
-        destroy(win.toplevel, 0);
-        destroy(win.xdg_surface, 0);
+        if !win.toplevel.is_null() {
+            destroy(win.toplevel, 0);
+        }
+        if !win.xdg_surface.is_null() {
+            destroy(win.xdg_surface, 0);
+        }
         if let Some(backing) = win.backing {
             destroy(backing.buffer, 0);
             destroy(backing.pool, 1);
@@ -4028,6 +4034,9 @@ fn crown_execute(window: usize, take: CrownTake, x: f64, y: f64) -> bool {
         let seat = client.seat;
         let serial = client.serials.press;
         let Some(win) = window_ref(client, window) else { return false };
+        if win.map.hidden() {
+            return false;
+        }
         // a grab (move, resize, the menu) needs the seat that pressed;
         // the window's own buttons and the maximize toggle need none —
         // a compositor with no seat (a headless one) still closes
@@ -4734,6 +4743,9 @@ pub(crate) fn gpu_limit_size(window: usize, max_px: usize) {
         let Some(win) = window_at(client, window) else { return };
         let logical = (max_px / win.scale.max(1)) as i32;
         win.max_size = Some((logical, logical));
+        if win.toplevel.is_null() {
+            return;
+        }
         unsafe {
             request(win.toplevel, 7, &mut [arg_i(logical), arg_i(logical)]);
             wl_display_flush(client.display);
@@ -5829,10 +5841,10 @@ pub fn set_window_visibility(
             window_ops::unmap(&mut client.window_ops, window);
             suspend_window_panels(client, window);
         }
-        let win = window_at(client, window).ok_or(WindowError::StaleWindow)?;
-        unsafe {
-            match visibility {
-                WindowVisibility::Hidden => {
+        match visibility {
+            WindowVisibility::Hidden => {
+                let win = window_at(client, window).ok_or(WindowError::StaleWindow)?;
+                unsafe {
                     win.map = MapState::Hidden;
                     if !win.frame_callback.is_null() {
                         wl_proxy_destroy(win.frame_callback);
@@ -5845,38 +5857,10 @@ pub fn set_window_visibility(
                     );
                     request(win.surface, 6, &mut no_args());
                 }
-                WindowVisibility::Shown => {
-                    win.map = MapState::AwaitingConfigure;
-                    win.pending_size = None;
-                    win.observed_size = None;
-                    win.size_authority = geometry_ops::SizeAuthority::Client;
-                    win.maximized = false;
-                    win.resizing = false;
-                    request(
-                        win.toplevel,
-                        2,
-                        &mut [WlArgument {
-                            s: win.title.as_ptr(),
-                        }],
-                    );
-                    request(win.toplevel, 3, &mut [arg_s(&crate::life::app_id())]);
-                    if let Some((w, h)) = win.min_size {
-                        request(win.toplevel, 8, &mut [arg_i(w), arg_i(h)]);
-                    }
-                    if let Some((w, h)) = win.max_size {
-                        request(win.toplevel, 7, &mut [arg_i(w), arg_i(h)]);
-                    }
-                    if !win.decoration.is_null() {
-                        request(
-                            win.decoration,
-                            1,
-                            &mut [arg_u(if win.scene { 1 } else { 2 })],
-                        );
-                    }
-                    // The initial commit after unmap must contain no buffer.
-                    request(win.surface, 6, &mut no_args());
-                }
             }
+            WindowVisibility::Shown => window_mapping::remap(client, window)?,
+        }
+        unsafe {
             wl_display_flush(client.display);
         }
         // Unmapping discards native parenting. Record the absent relation now

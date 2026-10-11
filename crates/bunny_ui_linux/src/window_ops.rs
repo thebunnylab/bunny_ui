@@ -132,6 +132,12 @@ pub fn set_window_parent(
         let child = window_ref(client, window)
             .ok_or(WindowError::StaleWindow)?
             .toplevel;
+        if child.is_null() {
+            return Err(WindowError::NativeFailure {
+                operation: "xdg_toplevel.set_parent: role unavailable after failed remap",
+                code: -1,
+            });
+        }
         unsafe {
             request(child, 1, &mut [arg_o(native)]);
             wl_display_flush(client.display);
@@ -161,6 +167,9 @@ pub(super) fn restore_parents(client: &mut Client) {
         .iter()
         .filter_map(|(&child, &parent)| {
             let child_window = window_ref(client, child)?;
+            if child_window.toplevel.is_null() {
+                return None;
+            }
             let parent_window = window_ref(client, parent).filter(|win| win.map.mapped());
             let value = parent_window.map(|_| parent);
             (client.window_ops.applied.get(&child) != Some(&value)).then_some((
