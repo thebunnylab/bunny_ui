@@ -124,7 +124,15 @@ fn run() {
                 app.hide(parent).unwrap();
                 app.show(parent).unwrap();
                 println!("Parent remap requested: {:?}", app.geometry(child));
-                until(|| app.geometry(child).is_ok_and(|value| matches_size(value, 430.0, 280.0))).await;
+                let mut last_remap = None;
+                until(|| {
+                    let current = app.geometry(child);
+                    if last_remap.as_ref() != Some(&current) {
+                        println!("Remap geometry transition: {current:?}");
+                        last_remap = Some(current.clone());
+                    }
+                    current.is_ok_and(|value| matches_size(value, 430.0, 280.0))
+                }).await;
                 if let Some(position) = initial.position() {
                     let missing = DesktopPosition::new(30_000.0, 30_000.0, position.space()).unwrap();
                     app.restore_placement(child, WindowPlacement::new(WindowSize::new(380.0, 250.0).unwrap(), Some(missing))).unwrap();
