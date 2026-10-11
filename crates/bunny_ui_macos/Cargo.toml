@@ -31,3 +31,7 @@ targets = ["aarch64-apple-darwin"]
 [[test]]
 name = "accessibility_native"
 harness = false
+
+[[test]]
+name = "window_lifecycle"
+harness = false

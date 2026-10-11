@@ -1520,8 +1520,24 @@ fn unregister_top_level(hwnd: Hwnd) -> usize {
     TOP_LEVEL.with(|windows| windows.borrow().len())
 }
 
-/// Asks the platform to close a top-level window — the app's own
-/// `close`. The destroy road does the burying.
+type CloseGate = std::rc::Rc<dyn Fn(usize) -> bool>;
+
+thread_local! {
+    static CLOSE_GATE: RefCell<Option<CloseGate>> = const { RefCell::new(None) };
+}
+
+/// Installs the owning application's user-close decision gate.
+pub fn set_close_gate(gate: CloseGate) {
+    CLOSE_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+}
+
+/// Queries application policy outside any platform registry borrow.
+pub fn allow_close(window: usize) -> bool {
+    let gate = CLOSE_GATE.with(|slot| slot.borrow().clone());
+    gate.is_none_or(|gate| gate(window))
+}
+
+/// Explicit teardown, bypassing the native user-close policy.
 pub fn close_top_level(window: usize) {
     let hwnd = window as Hwnd;
     if hwnd != 0 && is_top_level(hwnd) {
@@ -2777,8 +2793,10 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 ask_represent(owner_of(hwnd));
                 return 0;
             }
-            unsafe {
-                DestroyWindow(hwnd);
+            if !is_top_level(hwnd) || allow_close(usize::from_ne_bytes(hwnd.to_ne_bytes())) {
+                unsafe {
+                    DestroyWindow(hwnd);
+                }
             }
             0
         }
@@ -4083,6 +4101,40 @@ impl WindowHandle {
             }
         }
     }
+}
+
+/// Reads native visibility for a registered top-level window.
+pub fn window_visibility(
+    window: usize,
+) -> Result<bunny_ui::window::WindowVisibility, bunny_ui::window::WindowError> {
+    use bunny_ui::window::{WindowError, WindowVisibility};
+    let hwnd = Hwnd::from_ne_bytes(window.to_ne_bytes());
+    if !is_top_level(hwnd) {
+        return Err(WindowError::StaleWindow);
+    }
+    Ok(if unsafe { IsWindowVisible(hwnd) } != 0 {
+        WindowVisibility::Shown
+    } else {
+        WindowVisibility::Hidden
+    })
+}
+
+/// Changes native visibility without retiring the window lifetime.
+pub fn set_window_visibility(
+    window: usize,
+    visibility: bunny_ui::window::WindowVisibility,
+) -> Result<(), bunny_ui::window::WindowError> {
+    if window_visibility(window)? == visibility {
+        return Ok(());
+    }
+    let command = match visibility {
+        bunny_ui::window::WindowVisibility::Shown => SW_SHOW,
+        bunny_ui::window::WindowVisibility::Hidden => SW_HIDE,
+    };
+    unsafe {
+        ShowWindow(Hwnd::from_ne_bytes(window.to_ne_bytes()), command);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

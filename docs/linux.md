@@ -194,6 +194,14 @@ raised from a running app, the counts kept apart, the FIRST window
 closed with the app still standing, then the survivors closed and the
 road ending by itself.
 
+`hide`/`show` preserve the scene and keep the wake pipe alive with all windows
+hidden. X11 unmaps/maps the retained window. Wayland commits a null buffer,
+retires native child surfaces while retaining their logical slots, and forbids
+CPU/GPU attachment until a fresh show/configure/ack. Show restores the xdg
+metadata and size limits discarded by unmapping; child surfaces are rebuilt
+on the next presentation. See [retained visibility](life.md#retained-visibility-and-close-requests)
+for close policy, lifetime IDs and qualification boundaries.
+
 ## Fonts
 
 The text engine is fontconfig, FreeType and HarfBuzz. A family the

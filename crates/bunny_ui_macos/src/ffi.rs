@@ -410,6 +410,57 @@ pub fn close_top_level(window: usize) {
     unsafe { msg_void(window as Id, sel("close")) };
 }
 
+type CloseGate = std::rc::Rc<dyn Fn(usize) -> bool>;
+
+thread_local! {
+    static CLOSE_GATE: RefCell<Option<CloseGate>> = const { RefCell::new(None) };
+}
+
+/// Installs the owning application's user-close decision gate.
+pub fn set_close_gate(gate: CloseGate) {
+    CLOSE_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+}
+
+extern "C" fn bunny_window_should_close(_this: Id, _sel: Sel, sender: Id) -> i8 {
+    let gate = CLOSE_GATE.with(|slot| slot.borrow().clone());
+    i8::from(gate.is_none_or(|gate| gate(sender as usize)))
+}
+
+/// Reads native visibility for a registered top-level window.
+pub fn window_visibility(
+    window: usize,
+) -> Result<bunny_ui::window::WindowVisibility, bunny_ui::window::WindowError> {
+    use bunny_ui::window::{WindowError, WindowVisibility};
+    if !WINDOWS.with(|windows| windows.borrow().iter().any(|(live, _, _)| *live == window)) {
+        return Err(WindowError::StaleWindow);
+    }
+    Ok(
+        if unsafe { msg_bool(window as Id, sel("isVisible")) } != 0 {
+            WindowVisibility::Shown
+        } else {
+            WindowVisibility::Hidden
+        },
+    )
+}
+
+/// Changes native visibility without retiring the window lifetime.
+pub fn set_window_visibility(
+    window: usize,
+    visibility: bunny_ui::window::WindowVisibility,
+) -> Result<(), bunny_ui::window::WindowError> {
+    if window_visibility(window)? == visibility {
+        return Ok(());
+    }
+    let selector = match visibility {
+        bunny_ui::window::WindowVisibility::Shown => "makeKeyAndOrderFront:",
+        bunny_ui::window::WindowVisibility::Hidden => "orderOut:",
+    };
+    unsafe {
+        msg_void_id(window as Id, sel(selector), std::ptr::null_mut());
+    }
+    Ok(())
+}
+
 /// Starts the app's beat on this window: the caret's blink half-period
 /// and the display link that paces animation, both delivered by
 /// selector to the window's own delegate on the main run loop.
@@ -2273,6 +2324,13 @@ unsafe fn register_classes() {
             sel("windowWillClose:"),
             bunny_window_will_close as *const c_void,
             types.as_ptr(),
+        );
+        let close_bool = CString::new("c@:@").expect("type encoding");
+        class_addMethod(
+            delegate,
+            sel("windowShouldClose:"),
+            bunny_window_should_close as *const c_void,
+            close_bool.as_ptr(),
         );
         objc_registerClassPair(delegate);
 

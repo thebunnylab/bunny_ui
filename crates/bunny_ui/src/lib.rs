@@ -53,6 +53,7 @@ pub mod ext;
 pub mod font_file;
 pub mod glass;
 pub mod app;
+pub mod window;
 pub mod host;
 pub mod icon;
 pub mod image_engine;
