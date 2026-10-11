@@ -169,3 +169,20 @@ that id gives it the app's name and icon, and a click on a toast of an
 app that already EXITED needs a COM server the registry knows — both
 the app's own setup. Linux announces sleep only where logind runs,
 which is where a laptop runs.
+
+## Native window presentation regression
+
+On macOS, each top-level window and pooled dialog has its own presenter,
+addressed by its content view. Opening a second window cannot replace the
+first window's layer; closing one releases only its presenter. Resize
+transactions and drawable back-pressure follow that same view.
+
+Run `python3 crates/bunny_ui_macos/tests/window_presenters.py --output /tmp/window-pixels`
+on a macOS desktop with window-capture access. The probe uses the public `App`
+API, changes independent scenes, closes/reopens secondary windows, then closes
+the original window and updates its survivor. It checks the actual captured
+window colors and last-window exit. It sends no keyboard or mouse input. A
+capture denial fails qualification; the script does not turn it into a skip.
+`BUNNY_PRESENT=cpu` exercises the explicit CPU fallback with the same probe.
+The output directory must be fresh, so a stage acknowledgement cannot come
+from an earlier run.

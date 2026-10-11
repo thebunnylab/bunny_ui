@@ -390,6 +390,7 @@ fn forget_window(window: usize) {
     // already moved, which is the compounding this file's oldest comment
     // about the lights exists to prevent.
     if let Some(view) = view {
+        crate::metal::forget_view(view as Id);
         BACKING.with(|store| store.borrow_mut().remove(&view));
         PANEL_ORIGINS.with(|origins| origins.borrow_mut().remove(&view));
     }
@@ -1270,12 +1271,14 @@ extern "C" fn bunny_magnify(this: Id, _sel: Sel, event: Id) {
 /// comes before the first resized frame, and that is the point: the
 /// presenter arms its transaction here, so the whole drag runs under
 /// one contract instead of catching up on the second step.
-extern "C" fn bunny_window_will_start_live_resize(_this: Id, _sel: Sel, _note: Id) {
-    crate::metal::arm_transaction(true);
+extern "C" fn bunny_window_will_start_live_resize(_this: Id, _sel: Sel, note: Id) {
+    let view = unsafe { msg_id(msg_id(note, sel("object")), sel("contentView")) };
+    crate::metal::arm_transaction_view(view, true);
 }
 
 extern "C" fn bunny_window_did_end_live_resize(_this: Id, _sel: Sel, note: Id) {
-    crate::metal::arm_transaction(false);
+    let view = unsafe { msg_id(msg_id(note, sel("object")), sel("contentView")) };
+    crate::metal::arm_transaction_view(view, false);
     // the hand let go: one more frame NOW, so everything that held
     // back during the drag — a hosted engine's throttled size, the
     // live layers coming home — lands exact without waiting for the
@@ -4038,7 +4041,7 @@ pub fn create_dialog(
         // resizes, and a CPU raster of its whole content on every step
         // of the drag is what made one lag its own corner. Refused or
         // failed, the view stays on the CPU road (blit_partial).
-        let _ = crate::metal::try_install_view(
+        let _ = crate::metal::try_install(
             view,
             msg_f64(parent.window, sel("backingScaleFactor")),
             width,
