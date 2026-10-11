@@ -216,6 +216,7 @@ unsafe extern "system" {
     fn GetWindow(hwnd: Hwnd, relation: u32) -> Hwnd;
     fn GetParent(hwnd: Hwnd) -> Hwnd;
     fn ShowWindow(hwnd: Hwnd, cmd: i32) -> i32;
+    fn ShowOwnedPopups(hwnd: Hwnd, show: i32) -> i32;
     fn UpdateWindow(hwnd: Hwnd) -> i32;
     fn InvalidateRect(hwnd: Hwnd, rect: *const Rect, erase: i32) -> i32;
     fn GetClientRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
@@ -2755,6 +2756,12 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_ACTIVATE => {
+            // Moving focus between a scene and its own dialog is not leaving
+            // that scene. WM_ACTIVATE's lParam identifies the receiving window.
+            let owner = scene_owner(hwnd);
+            if (wparam & 0xFFFF) == WA_INACTIVE && owner != 0 && scene_owner(lparam) == owner {
+                return 0;
+            }
             dispatch_at(hwnd, activation(wparam));
             0
         }
@@ -4131,8 +4138,18 @@ pub fn set_window_visibility(
         bunny_ui::window::WindowVisibility::Shown => SW_SHOW,
         bunny_ui::window::WindowVisibility::Hidden => SW_HIDE,
     };
+    let hwnd = Hwnd::from_ne_bytes(window.to_ne_bytes());
+    let shown = i32::from(visibility == bunny_ui::window::WindowVisibility::Shown);
+    // Owned dialogs and layered popups are top-level windows, not child HWNDs.
+    // This API remembers which were visible, so showing does not resurrect
+    // panels that were already hidden before the owner was hidden.
+    if unsafe { ShowOwnedPopups(hwnd, shown) } == 0 {
+        return Err(bunny_ui::window::WindowError::Unsupported(
+            "Win32 could not change owned popup visibility",
+        ));
+    }
     unsafe {
-        ShowWindow(Hwnd::from_ne_bytes(window.to_ne_bytes()), command);
+        ShowWindow(hwnd, command);
     }
     Ok(())
 }

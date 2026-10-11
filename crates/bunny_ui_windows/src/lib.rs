@@ -1473,6 +1473,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         }
     });
 
+    let handler_lifecycle = Rc::clone(&lifecycle);
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
@@ -1536,7 +1537,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // platform's own — and the decorations freeze: they
                 // animate for eyes that are on them (the mac's rule)
                 runtime.set_loops_paused(true);
-                if runtime.dismiss_all_overlays() {
+                if !handler_lifecycle.is_hidden() && runtime.dismiss_all_overlays() {
                     blit(runtime, root);
                 }
                 // a frozen loop asks for no frames: the beat parks
