@@ -166,6 +166,8 @@ cargo run -p bunny-ui-core --example profile_mvvm
 
 The canvas-backed [slider](docs/slider.md) binds a scalar value to a validated
 range, with pointer capture, keyboard adjustment, disabled state and RTL input.
+[Line charts](docs/line-charts.md) plot validated live snapshots, with compact
+sparklines and optional pointer/keyboard sample inspection.
 
 ## Work that waits
 

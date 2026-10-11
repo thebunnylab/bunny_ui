@@ -57,6 +57,8 @@ pub mod host;
 pub mod icon;
 pub mod image_engine;
 pub mod layout;
+#[cfg(feature = "canvas")]
+pub mod line_chart;
 pub mod menu;
 mod loans;
 pub mod modifier;
