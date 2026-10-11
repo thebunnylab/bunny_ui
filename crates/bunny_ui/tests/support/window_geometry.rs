@@ -26,7 +26,10 @@ async fn until(mut ready: impl FnMut() -> bool) {
         }
         task::sleep(Duration::from_millis(10)).await;
     }
-    assert!(ready(), "native geometry condition did not arrive");
+    assert!(
+        ready(),
+        "native geometry condition did not arrive; see preceding observation stage"
+    );
 }
 
 fn run() {
@@ -104,6 +107,7 @@ fn run() {
                     let seen = Rc::clone(&seen);
                     let requested = Cell::new(false);
                     move |id, value| {
+                        println!("Reentrant observation: {value:?}");
                         seen.borrow_mut().push(value);
                         if matches_size(value, 400.0, 260.0) && !requested.replace(true) {
                             app.restore_placement(id, placement(430.0, 280.0)).unwrap();
@@ -115,9 +119,11 @@ fn run() {
                 let first = seen.borrow().iter().position(|value| matches_size(*value, 400.0, 260.0)).unwrap();
                 let second = seen.borrow().iter().position(|value| matches_size(*value, 430.0, 280.0)).unwrap();
                 assert!(first < second, "reentrant native observations retain order");
+                println!("Reentrant restoration complete");
                 app.clear_geometry_handler(child).unwrap();
                 app.hide(parent).unwrap();
                 app.show(parent).unwrap();
+                println!("Parent remap requested: {:?}", app.geometry(child));
                 until(|| app.geometry(child).is_ok_and(|value| matches_size(value, 430.0, 280.0))).await;
                 if let Some(position) = initial.position() {
                     let missing = DesktopPosition::new(30_000.0, 30_000.0, position.space()).unwrap();
