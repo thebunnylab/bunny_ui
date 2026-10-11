@@ -55,6 +55,10 @@ pub enum Modifier {
     Blur(f64),
     IgnoresSafeArea,
     Hidden,
+    /// A reactive accessible name for one semantic element.
+    AccessibilityLabel(crate::bind::TextSource),
+    /// Decorative content excluded from the accessibility tree.
+    AccessibilityHidden,
     Equatable,
 
     // MARK: - Visuals (pure data → `Styled` in the scene)
@@ -282,6 +286,8 @@ impl Modifier {
             Modifier::Resizable => " [.resizable()]".into(),
             Modifier::Blur(radius) => format!(" [.blur(radius: {radius})]"),
             Modifier::IgnoresSafeArea => " [.ignoresSafeArea()]".into(),
+            Modifier::AccessibilityLabel(_) => " [.accessibility_label()]".into(),
+            Modifier::AccessibilityHidden => " [.accessibility_hidden()]".into(),
             Modifier::Hidden => " [.hidden()]".into(),
             Modifier::Equatable => " [.equatable()]".into(),
             Modifier::BackgroundColor(color) => format!(" [.background({color})]"),
@@ -423,6 +429,9 @@ fn rewrite_scroll_node(
     ) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        LayoutNode::Accessible { semantics, child } => LayoutNode::Accessible {
+            semantics, child: Box::new(rewrite_scroll_node(*child, rewrite)),
+        },
         // a node that wears hints or an action stood behind their
         // wrapper, which no rewrite crosses: it is left as it was left
         marked if !marked.is_bare() => marked,
@@ -518,6 +527,9 @@ fn rewrite_field_node(
     rewrite: &impl Fn(FieldParts) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        LayoutNode::Accessible { semantics, child } => LayoutNode::Accessible {
+            semantics, child: Box::new(rewrite_field_node(*child, rewrite)),
+        },
         // a node that wears hints or an action stood behind their
         // wrapper, which no rewrite crosses: it is left as it was left
         marked if !marked.is_bare() => marked,
@@ -608,6 +620,9 @@ fn rewrite_pixel_node(
     icon: &impl Fn(crate::icon::Symbol, bool, bool) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        LayoutNode::Accessible { semantics, child } => LayoutNode::Accessible {
+            semantics, child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
+        },
         // a node that wears hints or an action stood behind their
         // wrapper, which no rewrite crosses: it is left as it was left
         marked if !marked.is_bare() => marked,
@@ -675,11 +690,16 @@ fn rewrite_text_node(
     ) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        LayoutNode::Accessible { semantics, child } => LayoutNode::Accessible {
+            semantics, child: Box::new(rewrite_text_node(*child, rewrite)),
+        },
         // a node that wears hints or an action stood behind their
         // wrapper, which no rewrite crosses: it is left as it was left
         marked if !marked.is_bare() => marked,
-        LayoutNode::Text { content, highlights, truncation, .. } => {
-            rewrite(content, highlights, truncation)
+        LayoutNode::Text { content, highlights, truncation, hints, .. } => {
+            let mut rewritten = rewrite(content, highlights, truncation);
+            if let Some(kept) = rewritten.carried_hints_mut() { kept.semantics = hints.semantics; }
+            rewritten
         }
         LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
             props,
@@ -1023,6 +1043,20 @@ fn apply(
     mark: usize,
 ) {
     match modifier {
+        Modifier::AccessibilityLabel(source) if crate::accessibility::capturing() => {
+            let label = {
+                let _scope = motor::identity::enter("#accessibility-label");
+                source.place()
+            };
+            out.wrap_layout_from(mark, |node| LayoutNode::Accessible {
+                semantics: crate::accessibility::Semantics::Label(label.clone()),
+                child: Box::new(node),
+            });
+        }
+        Modifier::AccessibilityHidden if crate::accessibility::capturing() => out.wrap_layout_from(mark, |node| LayoutNode::Accessible {
+            semantics: crate::accessibility::Semantics::Hidden,
+            child: Box::new(node),
+        }),
         Modifier::OnAppear(action) | Modifier::OnTapGesture(action) => action(),
         Modifier::Effect { effect, .. } => {
             // The effect sees the subtree's environment — the pump only

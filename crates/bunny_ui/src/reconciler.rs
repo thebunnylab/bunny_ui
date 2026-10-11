@@ -2605,6 +2605,31 @@ fn sweep_under(
     }
 }
 
+/// Rebuilds one named scene without retiring its state or another window's
+/// callbacks. Unlike an unmount, invalidation preserves the identity/read graph
+/// until the new pass replaces it; the owning runtime immediately renders next.
+pub(crate) fn clear_under(root: &str) {
+    let was_current = ASSEMBLED_ROOT.with(|slot| {
+        slot.borrow().as_deref().is_some_and(|active| covers(root, active))
+    });
+    RETAINED.with(|retained| {
+        let mut retained = retained.borrow_mut();
+        LIVE.with(|live| {
+            let mut live = live.borrow_mut();
+            for (path, entry) in retained.extract_if(.., |path, _| covers(root, path)) {
+                live.unindex(&path, &entry);
+            }
+            if was_current {
+                live.drop_root_region();
+            }
+        });
+    });
+    if was_current {
+        ASSEMBLED_ROOT.with(|slot| *slot.borrow_mut() = None);
+        ASSEMBLED_AT.with(|slot| slot.set(None));
+    }
+}
+
 /// Drops the whole retention — the next pass runs every body (the
 /// tests' `render_full`; the state in the identity arenas stays).
 pub(crate) fn clear() {

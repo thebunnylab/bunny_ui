@@ -153,6 +153,7 @@ impl CaretPhase {
 }
 
 pub struct Runtime {
+    accessibility: RefCell<crate::accessibility::State>,
     /// The environment every body reads. Behind a cell because the
     /// shell moves it at runtime — a rotation flips the size class —
     /// and a moved environment rebuilds the retention on the next pass,
@@ -596,16 +597,18 @@ impl Runtime {
         Rc::clone(&self.images)
     }
 
-    /// Moves the keyboard to the field the app NAMED with `.id(…)`.
+    /// Moves the keyboard to the field or focusable control named with `.id(…)`.
     ///
     /// A field's identity path is structural — the scene's prefix, then every
     /// wrapper down to it — so an app that wants to put the caret somewhere
     /// (a form's Tab walk, a screen that opens with one box already live)
     /// would have to spell a path it does not own. It owns the NAME, and this
-    /// resolves it against the last layout's fields.
+    /// resolves it against the last layout's fields and custom controls.
+    /// An exact field name wins. Otherwise, the name must contain exactly one
+    /// visible custom control that accepts keys and does not leave them behind.
     ///
-    /// `false` when nothing laid out under that name — before the first
-    /// frame there are no fields to reach.
+    /// `false` when no eligible control, or several custom controls, match the
+    /// name. Before the first frame there are no controls to reach.
     pub fn focus_named(&self, id: &str) -> bool {
         let tail = format!("[{id}]");
         let path = self
@@ -614,6 +617,24 @@ impl Runtime {
             .iter()
             .find(|field| field.path.ends_with(&tail))
             .map(|field| field.path.clone());
+        let path = path.or_else(|| {
+            let customs = self.last_customs.borrow();
+            let dom_customs = self.dom_customs.borrow();
+            let mut matches = customs
+                .iter()
+                .chain(dom_customs.iter().map(|(_, placement)| placement))
+                .filter(|placement| {
+                    let element = placement.element.element();
+                    placement.path.split('/').any(|segment| segment == tail)
+                        && placement.visible.size.width > 0.0
+                        && placement.visible.size.height > 0.0
+                        && element.accepts_keys()
+                        && !element.leaves_keyboard()
+                });
+            let first = matches.next()?;
+            // A name around several custom controls is not a focus target.
+            matches.next().is_none().then(|| first.path.clone())
+        });
         match path {
             Some(path) => {
                 self.focus(&path);
@@ -1520,6 +1541,7 @@ impl Runtime {
             caret_phase: Cell::new(CaretPhase::Visible),
             utf16_memo: RefCell::new(None),
             goal_column: Cell::new(None),
+            accessibility: RefCell::new(crate::accessibility::State::default()),
             last_fields: RefCell::new(Vec::new()),
             last_splits: RefCell::new(Vec::new()),
             last_customs: RefCell::new(Vec::new()),
@@ -1615,10 +1637,21 @@ impl Runtime {
         self.ctx.borrow().clone()
     }
 
+    /// Environment, theme and code rebuild only this runtime's retained scene.
+    /// Other windows may receive input before their next frame and must keep
+    /// the callbacks corresponding to the picture they still display.
+    fn invalidate_scene(&self) {
+        match self.scene.as_deref() {
+            Some(scene) => reconciler::clear_under(scene),
+            None => reconciler::clear(),
+        }
+    }
+
     /// One incremental pass: walk with skips, isolated re-runs of dirty
     /// views the walk missed, effect-queue reassembly, and the sweep.
     /// Returns both outputs (print and layout) still holding references.
     fn render_pass<R: View>(&self, root: &R) -> NodeList {
+        let _accessibility = crate::accessibility::CaptureScope::enter(self.accessibility.borrow().enabled);
         // virtualized bodies read LAST frame's region geometry (offset
         // taken NOW — a wheel that just moved it must reach the window
         // math) — published fresh before every pass
@@ -1672,19 +1705,19 @@ impl Runtime {
         let theme_version = crate::theme::version();
         if self.theme_version.get() != theme_version {
             self.theme_version.set(theme_version);
-            reconciler::clear();
+            self.invalidate_scene();
         }
         // new code: every body runs again, the new code in place of the
         // old — the state stays where it is
         let code_version = code_version();
         if self.code_version.get() != code_version {
             self.code_version.set(code_version);
-            reconciler::clear();
+            self.invalidate_scene();
         }
         // the same for a moved environment: a body that read the size
         // class baked its answer into the scene it retained
         if self.env_moved.replace(false) {
-            reconciler::clear();
+            self.invalidate_scene();
         }
         effects::reset();
         // the dirt this pass serves leaves the registry now: what a body
@@ -2203,6 +2236,31 @@ impl Runtime {
             && (self.close_menu() || self.cancel_drag())
         {
             return crate::custom::Response::handled();
+        }
+        // A captured custom gesture can be cancelled before it takes focus:
+        // custom boxes normally borrow the keyboard on release. Give Escape
+        // to the hand's owner before the previously focused box or keymap.
+        if *pattern == KeyPattern::key(crate::action::Key::Escape) {
+            let grabbed = self.interaction.borrow().element_grab.clone();
+            if let Some(placement) = grabbed.as_deref().and_then(|path| self.custom_at(path)) {
+                let response = self.deliver(
+                    &placement,
+                    crate::custom::ElementEvent::Key(stroke),
+                );
+                if response.handled {
+                    {
+                        let mut interaction = self.interaction.borrow_mut();
+                        interaction.element_grab = None;
+                        interaction.pressed = None;
+                    }
+                    self.dirty_island_of(&placement.path);
+                    self.frame_asked.set(true);
+                    return response;
+                }
+                if self.focus.borrow().as_deref() == Some(placement.path.as_str()) {
+                    return response; // Do not deliver one ignored Escape twice.
+                }
+            }
         }
         // a field of MANY lines owns `⌘↵`: the bare break is its
         // newline, so its submit has to be the chord — and the app
@@ -5079,6 +5137,7 @@ impl Runtime {
             live: None,
             scale: self.device_scale.get(),
             touch: self.touch_modality.get(),
+            accessibility: self.accessibility.borrow().enabled,
             anim: None,
             overlay_bounds: self.overlay_bounds.get(),
             dialog_frames: Some(&dialogs),
@@ -5208,6 +5267,7 @@ impl Runtime {
             live: None,
             scale: self.device_scale.get(),
             touch: self.touch_modality.get(),
+            accessibility: self.accessibility.borrow().enabled,
             anim: None,
             overlay_bounds: self.overlay_bounds.get(),
             dialog_frames: Some(&dialogs),
@@ -7080,6 +7140,7 @@ impl Runtime {
             dialog_frames: Some(&dialogs),
             scale: self.device_scale.get(),
             touch: self.touch_modality.get(),
+            accessibility: self.accessibility.borrow().enabled,
         };
         let stage = if dom {
             crate::stats::Stage::Capture
@@ -7110,6 +7171,7 @@ impl Runtime {
         self.last_scrolls.borrow_mut().clone_from(&result.scrolls);
         self.last_modal_floor.set(result.modal_floor);
         self.last_fields.borrow_mut().clone_from(&result.fields);
+        self.accessibility.borrow_mut().update(&result.accessibility);
         self.last_splits.borrow_mut().clone_from(&result.splits);
         self.last_customs.borrow_mut().clone_from(&result.customs);
         self.last_hosts.borrow_mut().clone_from(&result.hosts);
@@ -7707,6 +7769,54 @@ impl Runtime {
     pub fn external_drag_exited(&self) {
         self.enter_scene();
         self.note_drag_preview(None, 0.0, 0.0);
+    }
+}
+
+
+impl Runtime {
+    /// Enables collection for a native accessibility adapter. The next frame
+    /// publishes the tree; disabling immediately retires its exposed handles.
+    pub fn set_accessibility_enabled(&self, enabled: bool) {
+        let mut state = self.accessibility.borrow_mut();
+        if state.enabled == enabled { return; }
+        state.enabled = enabled;
+        // The retained scene must gain or release its optional metadata.
+        // This uses the same state-preserving rebuild as an environment change.
+        self.env_moved.set(true);
+        if !enabled { state.clear(); }
+        self.frame_asked.set(true);
+    }
+
+    /// The last placed semantic tree, with the current keyboard focus.
+    pub fn accessibility_tree(&self) -> crate::accessibility::Tree {
+        self.accessibility.borrow().snapshot(self.focus.borrow().as_deref())
+    }
+
+    /// Applies an assistive-technology request through the control's existing
+    /// input path. Stale handles and unsupported role/action pairs are rejected.
+    pub fn accessibility_action(&self, id: crate::accessibility::NodeId, action: crate::accessibility::Action)
+        -> Result<(), crate::accessibility::ActionError>
+    {
+        use crate::accessibility::{Action, ActionError};
+        let tree = self.accessibility_tree();
+        let node = tree.node(id).ok_or(ActionError::Unavailable)?;
+        if !node.supports(&action) { return Err(ActionError::Unsupported); }
+        self.enter_scene();
+        let applied = match action {
+            Action::Activate => reconciler::run_action(&node.path, 1),
+            Action::Focus => {
+                if self.field_at(&node.path).is_none() { return Err(ActionError::Unavailable); }
+                self.focus(&node.path);
+                true
+            }
+            Action::SetText(text) => {
+                if self.field_at(&node.path).is_none() { return Err(ActionError::Unavailable); }
+                self.focus(&node.path);
+                self.key(EditCommand::SelectAll);
+                self.key(EditCommand::Insert(text)).applied
+            }
+        };
+        if applied { self.frame_asked.set(true); Ok(()) } else { Err(ActionError::Unavailable) }
     }
 }
 
