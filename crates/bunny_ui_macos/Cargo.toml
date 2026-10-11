@@ -57,3 +57,7 @@ harness = false
 [[test]]
 name = "objc_bool_native"
 harness = false
+
+[[test]]
+name = "window_startup"
+harness = false

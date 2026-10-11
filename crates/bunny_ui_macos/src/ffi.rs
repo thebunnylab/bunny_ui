@@ -2,9 +2,10 @@
 //!
 //! This module is the project's sanctioned `unsafe` border: the
 //! Objective-C runtime is called through `objc_msgSend` re-declared with
-//! the concrete signature of each message (on arm64 there is ONE single
-//! entry point for all messages — small structs go and come back in
-//! registers, no `_stret` variant), and two classes are born at runtime
+//! the concrete signature of each message. `CGRect` returns use
+//! `objc_msgSend_stret` on `x86_64`; arm64 uses `objc_msgSend` for every
+//! return type. `CGPoint` and `CGSize` stay in registers on both targets.
+//! Two classes are born at runtime
 //! via `objc_allocateClassPair`/`class_addMethod`:
 //!
 //! - `BunnyView` (NSView) — receives the full pointer cycle
@@ -84,7 +85,8 @@ unsafe extern "C" {
     fn msg_id_cstr(obj: Id, sel: Sel, a: *const c_char) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_point(obj: Id, sel: Sel) -> CGPoint;
-    #[link_name = "objc_msgSend"]
+    #[cfg_attr(target_arch = "aarch64", link_name = "objc_msgSend")]
+    #[cfg_attr(target_arch = "x86_64", link_name = "objc_msgSend_stret")]
     fn msg_rect(obj: Id, sel: Sel) -> CGRect;
     #[link_name = "objc_msgSend"]
     fn msg_init_rect(obj: Id, sel: Sel, rect: CGRect) -> Id;
@@ -128,7 +130,8 @@ unsafe extern "C" {
     ) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_bool_sel(obj: Id, sel: Sel, a: Sel) -> ObjcBool;
-    #[link_name = "objc_msgSend"]
+    #[cfg_attr(target_arch = "aarch64", link_name = "objc_msgSend")]
+    #[cfg_attr(target_arch = "x86_64", link_name = "objc_msgSend_stret")]
     fn msg_rect_rect(obj: Id, sel: Sel, rect: CGRect) -> CGRect;
     #[link_name = "objc_msgSend"]
     fn msg_id_id_sel(obj: Id, sel: Sel, target: Id, selector: Sel) -> Id;
