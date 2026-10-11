@@ -217,6 +217,27 @@ app that already EXITED needs a COM server the registry knows — both
 the app's own setup. Linux announces sleep only where logind runs,
 which is where a laptop runs.
 
+## macOS dialog modality
+
+`.dialog` creates a child `NSWindow` with framework-managed modality. It is
+not an AppKit sheet or an OS-modal session. Each scene owns its ordered
+dialog stack: its parent and lower dialogs refuse key/main status, while
+independent scenes remain eligible. The stack follows layout order, including
+when a pooled dialog reopens. Ending modality restores each standard button's
+previous enabled state; it cannot enable a prohibited minimize button.
+
+Opening requests focus for the top dialog. Closing the key dialog requests
+focus for the remaining top dialog or its parent; a background dismissal
+does not request focus away from another scene. The OS decides whether to
+grant those requests. Closing a parent retires only its own modal scope.
+
+`cargo test -p bunny-ui-macos --test window_modality` runs the public dialog
+API on the process main thread and inspects real AppKit eligibility and button
+state. It covers independent modal scopes, nesting, repeated reopen, retained
+hide/show and parent teardown. These observations do not verify synthetic
+pointer blocking, granted focus, visible pixels or mixed-display DPI; those
+require the separate native interaction qualification.
+
 ## Native window presentation regression
 
 On macOS, each top-level window and pooled dialog has its own presenter,

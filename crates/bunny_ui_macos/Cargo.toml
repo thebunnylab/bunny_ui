@@ -35,3 +35,7 @@ harness = false
 [[test]]
 name = "window_lifecycle"
 harness = false
+
+[[test]]
+name = "window_modality"
+harness = false

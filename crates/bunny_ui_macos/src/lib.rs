@@ -1223,32 +1223,14 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     })
                     .map(|(path, _)| path.clone())
                     .collect();
+                let mut focus_dialog = dead_dialogs.iter().any(|path| {
+                    dialog_store.get(path).is_some_and(ffi::WindowHandle::is_key)
+                });
                 for path in &dead_dialogs {
                     if let Some(dialog) = dialog_store.get(path) {
                         ffi::lend_hand(|| dialog.close_panel(&window));
                     }
                     dialog_surfaces.borrow_mut().remove(path);
-                }
-                if !dead_dialogs.is_empty() {
-                    // the keyboard goes to the window still standing on
-                    // top — an ask answered over Settings hands the keys
-                    // back to Settings, not to the workbench under both —
-                    // and only when none stands does the modal hold end.
-                    // The flag drops FIRST: the make-key asks the parent
-                    // `canBecomeKeyWindow`, and the answer has to already
-                    // be yes. Safe over a fullscreen parent too — its
-                    // space is the one on screen, so re-keying it
-                    // switches nothing.
-                    let standing = overlays.iter().rev().find_map(|overlay| {
-                        dialog_store.get(&overlay.path).filter(|dialog| dialog.is_visible())
-                    });
-                    ffi::lend_hand(|| match standing {
-                        Some(dialog) => dialog.make_key_with_view(),
-                        None => {
-                            ffi::end_window_modal(&window);
-                            window.make_key_with_view();
-                        }
-                    });
                 }
                 for overlay in &overlays {
                     // a dialog or an alert presents on a REAL window, not
@@ -1302,12 +1284,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                                 window.layout_rect_to_screen(x, y, w, h),
                             );
                             if opening {
-                                // the modal ceremony: the parent's
-                                // lights go dark, its key is refused,
-                                // and the keyboard moves into the
-                                // dialog
-                                ffi::begin_window_modal(&window);
-                                dialog.make_key_with_view();
+                                // Order in now; focus only after the complete
+                                // stack reflects layout's modal floor.
+                                dialog.order_front();
+                                focus_dialog = true;
                             }
                         });
                         dialog.set_scene_origin(x, y);
@@ -1481,6 +1461,20 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         &[(0, 0, panel_physical.0 as i64, panel_physical.1 as i64)],
                     );
                 }
+                let ordered: Vec<_> = overlays
+                    .iter()
+                    .filter_map(|overlay| {
+                        dialog_store.get(&overlay.path).filter(|dialog| dialog.is_visible()).copied()
+                    })
+                    .collect();
+                ffi::lend_hand(|| {
+                    ffi::set_window_modals(&window, &ordered);
+                    // A background dismissal must not steal another scene's
+                    // keyboard. Opening a dialog is an explicit focus request.
+                    if focus_dialog {
+                        ordered.last().unwrap_or(&window).make_key_with_view();
+                    }
+                });
             }
             traced.stage("O", format_args!("panels={}", overlays.len()));
             if metal::active(window.view()) {
