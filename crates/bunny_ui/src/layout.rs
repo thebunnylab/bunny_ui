@@ -6441,7 +6441,9 @@ impl LayoutNode {
                     let bounds = out.accessible_bounds(frame);
                     if let Some(bounds) = bounds.filter(|bounds| !bounds.is_empty()) {
                         out.accessibility.push(crate::accessibility::Placed {
-                            enabled: true, checked: None,
+                            enabled: true,
+                            checked: None,
+                            range: None,
                             path: Rc::from(path.as_str()),
                             role: if *secret { crate::accessibility::Role::PasswordField } else { crate::accessibility::Role::TextField },
                             label: Arc::clone(placeholder),
@@ -6823,8 +6825,27 @@ impl LayoutNode {
             }
 
             (LayoutNode::Custom { path, element }, Fit::Leaf) => {
-                let focusable = !path.is_empty() && out.can_reveal_focus(frame)
-                    && element.element().accepts_keys() && !element.element().leaves_keyboard();
+                if env.accessibility
+                    && !path.is_empty()
+                    && let Some(range) = element.element().accessibility_range()
+                {
+                    out.accessibility.push(crate::accessibility::Placed {
+                        enabled: element.element().accepts_keys(),
+                        checked: None,
+                        range: Some(range),
+                        path: Rc::from(path.as_str()),
+                        role: crate::accessibility::Role::Slider,
+                        label: Arc::from(""),
+                        value: None,
+                        bounds: out.accessible_bounds(frame),
+                        surface: out.accessibility_surface.clone(),
+                        multiline: false,
+                    });
+                }
+                let focusable = !path.is_empty()
+                    && out.can_reveal_focus(frame)
+                    && element.element().accepts_keys()
+                    && !element.element().leaves_keyboard();
                 if focusable {
                     out.focus_order.push(FocusStop {
                         path: Rc::from(path.as_str()), frame,

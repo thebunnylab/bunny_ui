@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::rc::{Rc, Weak};
 
-use bunny_ui::accessibility::{Action, Node, NodeId, Role};
+use bunny_ui::accessibility::{Action, Node, NodeId, RangeValue, Role};
 use bunny_ui::layout::{Point, Rect, Size};
 use bunny_ui::prelude::Runtime;
 use bus::{Connection, Message, Value};
@@ -33,6 +33,7 @@ const APPLICATION: &str = "org.a11y.atspi.Application";
 const COMPONENT: &str = "org.a11y.atspi.Component";
 const ACTION: &str = "org.a11y.atspi.Action";
 const TEXT: &str = "org.a11y.atspi.Text";
+const VALUE: &str = "org.a11y.atspi.Value";
 const EDITABLE: &str = "org.a11y.atspi.EditableText";
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 
@@ -90,6 +91,7 @@ impl Entry {
                 Role::Text => (29, "label"),
                 Role::Button => (43, "push button"),
                 Role::Checkbox => (7, "check box"),
+                Role::Slider => (51, "slider"),
                 Role::TextField => (79, "entry"),
                 Role::PasswordField => (40, "password text"),
             },
@@ -101,6 +103,7 @@ impl Entry {
             match node.role {
                 Role::Button | Role::Checkbox => result.push(ACTION),
                 Role::Text => result.push(TEXT),
+                Role::Slider => result.extend([VALUE, ACTION]),
                 Role::TextField | Role::PasswordField => result.extend([TEXT, EDITABLE]),
             }
         }
@@ -127,6 +130,9 @@ impl Entry {
             if matches!(node.role, Role::TextField | Role::PasswordField) {
                 bits |= (1 << 7) | (1 << if node.multiline { 17 } else { 26 });
             }
+            if node.role == Role::Slider && node.enabled {
+                bits |= 1 << 7;
+            }
             if node.checked.is_some() {
                 bits |= 1 << 41;
             }
@@ -139,11 +145,24 @@ impl Entry {
         }
         bits
     }
-    fn action_name(&self) -> &'static str {
-        if matches!(&self.kind, Kind::Control(node) if node.role == Role::Checkbox) {
-            "toggle"
-        } else {
-            "click"
+    fn range(&self) -> Option<RangeValue> {
+        match &self.kind {
+            Kind::Control(node) => node.range,
+            _ => None,
+        }
+    }
+    fn actions(&self) -> &'static [(&'static str, Action)] {
+        match &self.kind {
+            Kind::Control(node) => match node.role {
+                Role::Slider => &[
+                    ("increment", Action::Increment),
+                    ("decrement", Action::Decrement),
+                ],
+                Role::Checkbox => &[("toggle", Action::Activate)],
+                Role::Button => &[("click", Action::Activate)],
+                _ => &[],
+            },
+            _ => &[],
         }
     }
     fn extents(&self, coordinates: u32) -> Result<[i32; 4], Failure> {
@@ -225,6 +244,25 @@ impl Accessibility {
         {
             callback();
         }
+    }
+    fn perform(&self, entry: &Entry, action: Action) -> Result<Vec<Value>, Failure> {
+        let Kind::Control(node) = &entry.kind else {
+            return Err(Failure::Unsupported);
+        };
+        self.runtime
+            .accessibility_action(node.id, action)
+            .map_err(|error| {
+                if std::env::var_os("BUNNY_ATSPI_TRACE").is_some() {
+                    eprintln!("AT-SPI runtime refused {}: {error}", node.id.get());
+                }
+                match error {
+                    bunny_ui::accessibility::ActionError::Unavailable => Failure::Unavailable,
+                    bunny_ui::accessibility::ActionError::Unsupported => Failure::Unsupported,
+                    bunny_ui::accessibility::ActionError::InvalidValue => Failure::Arguments,
+                }
+            })?;
+        self.redraw();
+        Ok(vec![Value::Bool(true)])
     }
     fn activate(&self) {
         if !self.capture.replace(true) {
@@ -414,6 +452,7 @@ impl Service {
                     }
                     for (bit, detail) in [
                         (4, "checked"),
+                        (7, "editable"),
                         (8, "enabled"),
                         (11, "focusable"),
                         (12, "focused"),
@@ -429,6 +468,18 @@ impl Service {
                                 Value::I32(0),
                             );
                         }
+                    }
+                    if previous.range() != current.range()
+                        && let Some(range) = current.range()
+                    {
+                        self.event(
+                            &current.path,
+                            c"PropertyChange",
+                            "accessible-value",
+                            0,
+                            0,
+                            Value::F64(range.value()),
+                        );
                     }
                     if previous.text() != current.text() {
                         self.event(
@@ -576,6 +627,24 @@ impl Service {
             return Err(Failure::Unavailable);
         }
         if interface == PROPERTIES {
+            if let (
+                "Set",
+                [
+                    Value::String(interface),
+                    Value::String(name),
+                    Value::Variant(value),
+                ],
+            ) = (member.as_str(), args.as_slice())
+                && interface == VALUE
+                && name == "CurrentValue"
+            {
+                let Value::F64(number) = **value else {
+                    return Err(Failure::Arguments);
+                };
+                let (owner, entry) = owner_entry.as_ref().ok_or(Failure::Unavailable)?;
+                owner.perform(entry, Action::SetValue(number))?;
+                return Ok(Vec::new());
+            }
             return self.property_call(&path, entry, &member, &args);
         }
         let supported = entry.map_or_else(|| vec![ACCESSIBLE, APPLICATION], Entry::interfaces);
@@ -629,40 +698,41 @@ impl Service {
             };
         }
         let (owner, entry) = owner_entry.ok_or(Failure::Unavailable)?;
-        let perform = |action| {
-            let Kind::Control(node) = &entry.kind else {
-                return Err(Failure::Unsupported);
-            };
-            owner
-                .runtime
-                .accessibility_action(node.id, action)
-                .map_err(|error| {
-                    if std::env::var_os("BUNNY_ATSPI_TRACE").is_some() {
-                        eprintln!("AT-SPI runtime refused {}: {error}", node.id.get());
-                    }
-                    match error {
-                        bunny_ui::accessibility::ActionError::Unavailable => Failure::Unavailable,
-                        bunny_ui::accessibility::ActionError::Unsupported => Failure::Unsupported,
-                    }
-                })?;
-            owner.redraw();
-            Ok(vec![Value::Bool(true)])
-        };
+        let perform = |action| owner.perform(&entry, action);
         match (interface.as_str(), member.as_str(), args.as_slice()) {
-            (ACTION, "DoAction", [Value::I32(0)]) => perform(Action::Activate),
-            (ACTION, "GetName" | "GetLocalizedName", [Value::I32(0)]) => {
-                Ok(vec![Value::text(entry.action_name())])
+            (ACTION, "DoAction", [Value::I32(index)]) => {
+                let (_, action) = entry
+                    .actions()
+                    .get(usize::try_from(*index).map_err(|_| Failure::Arguments)?)
+                    .ok_or(Failure::Arguments)?;
+                perform(action.clone())
             }
-            (ACTION, "GetDescription" | "GetKeyBinding", [Value::I32(0)]) => {
-                Ok(vec![Value::text("")])
+            (
+                ACTION,
+                "GetName" | "GetLocalizedName" | "GetDescription" | "GetKeyBinding",
+                [Value::I32(index)],
+            ) => {
+                let (name, _) = entry
+                    .actions()
+                    .get(usize::try_from(*index).map_err(|_| Failure::Arguments)?)
+                    .ok_or(Failure::Arguments)?;
+                Ok(vec![Value::text(
+                    if matches!(member.as_str(), "GetName" | "GetLocalizedName") {
+                        name
+                    } else {
+                        ""
+                    },
+                )])
             }
             (ACTION, "GetActions", []) => Ok(vec![Value::Array(
                 c"(sss)",
-                vec![Value::Struct(vec![
-                    Value::text(entry.action_name()),
-                    Value::text(""),
-                    Value::text(""),
-                ])],
+                entry
+                    .actions()
+                    .iter()
+                    .map(|(name, _)| {
+                        Value::Struct(vec![Value::text(*name), Value::text(""), Value::text("")])
+                    })
+                    .collect(),
             )]),
             (EDITABLE, "SetTextContents", [Value::String(text)]) => {
                 perform(Action::SetText(text.clone()))
@@ -766,6 +836,14 @@ impl Service {
                         "Id",
                     ],
                     ACTION => &["NActions", "version"],
+                    VALUE => &[
+                        "MinimumValue",
+                        "MaximumValue",
+                        "MinimumIncrement",
+                        "CurrentValue",
+                        "Text",
+                        "version",
+                    ],
                     TEXT => &["CharacterCount", "version"],
                     COMPONENT | EDITABLE => &["version"],
                     _ => return Err(Failure::Unsupported),
@@ -839,7 +917,20 @@ impl Service {
             (APPLICATION, "AtspiVersion") => Ok(Value::text("2.1")),
             (APPLICATION, "Id") => Ok(Value::I32(self.id.get())),
             (APPLICATION, "InterfaceVersion") | (_, "version") => Ok(Value::U32(1)),
-            (ACTION, "NActions") => Ok(Value::I32(1)),
+            (ACTION, "NActions") => Ok(Value::I32(
+                entry.ok_or(Failure::Unavailable)?.actions().len() as i32,
+            )),
+            (VALUE, name) => {
+                let range = entry.and_then(Entry::range).ok_or(Failure::Unsupported)?;
+                match name {
+                    "MinimumValue" => Ok(Value::F64(range.minimum())),
+                    "MaximumValue" => Ok(Value::F64(range.maximum())),
+                    "MinimumIncrement" => Ok(Value::F64(range.small_change())),
+                    "CurrentValue" => Ok(Value::F64(range.value())),
+                    "Text" => Ok(Value::text(range.value().to_string())),
+                    _ => Err(Failure::Unsupported),
+                }
+            }
             (TEXT, "CharacterCount") => Ok(Value::I32(text_len(
                 entry.ok_or(Failure::Unavailable)?.text(),
             ))),

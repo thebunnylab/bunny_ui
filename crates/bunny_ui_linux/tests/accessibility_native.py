@@ -40,7 +40,7 @@ try:
         events.append(event.type)
 
     listener = Atspi.EventListener.new(record)
-    for kind in ["object:property-change:accessible-name", "object:text-changed", "object:state-changed:focused", "object:children-changed", "object:state-changed:checked", "object:state-changed:enabled"]:
+    for kind in ["object:property-change:accessible-name", "object:property-change:accessible-value", "object:text-changed", "object:state-changed:focused", "object:children-changed", "object:state-changed:checked", "object:state-changed:enabled"]:
         assert listener.register(kind)
     desktop = Atspi.get_desktop(0)
 
@@ -126,6 +126,35 @@ try:
             return
         assert value is False, f"retired accessible operation succeeded: {value!r}"
 
+    slider = named("Refresh rate")
+    slider_id = slider.get_accessible_id()
+    assert slider.get_role() == Atspi.Role.SLIDER
+    assert slider.get_state_set().contains(Atspi.StateType.EDITABLE)
+    assert Atspi.Value.get_minimum_value(slider) == 0.0
+    assert Atspi.Value.get_maximum_value(slider) == 1.0
+    assert abs(Atspi.Value.get_minimum_increment(slider) - 0.3) < 1e-12
+    assert slider.get_action_iface().get_n_actions() == 2
+    assert slider.get_action_iface().get_action_name(0) == "increment"
+    assert slider.get_action_iface().get_action_name(1) == "decrement"
+    for expected in [0.3, 0.6, 0.9, 1.0, 1.0]:
+        assert Atspi.Action.do_action(slider, 0)
+        assert abs(Atspi.Value.get_current_value(slider) - expected) < 1e-12
+    for expected in [0.9, 0.6, 0.3, 0.0, 0.0]:
+        assert Atspi.Action.do_action(slider, 1)
+        assert abs(Atspi.Value.get_current_value(slider) - expected) < 1e-12
+    assert Atspi.Value.set_current_value(slider, 0.2)
+    assert abs(Atspi.Value.get_current_value(slider) - 0.3) < 1e-12
+    for invalid in [float("nan"), float("inf"), -0.1, 1.1]:
+        unavailable(lambda: Atspi.Value.set_current_value(slider, invalid))
+        assert abs(Atspi.Value.get_current_value(slider) - 0.3) < 1e-12
+    assert Atspi.Component.grab_focus(slider)
+    slider.clear_cache()
+    assert slider.get_state_set().contains(Atspi.StateType.FOCUSED)
+    assert named("Refresh rate").get_accessible_id() == slider_id
+    wait_for(lambda: True if any("accessible-value" in event for event in events) else None,
+             "AT-SPI numeric value event was not delivered")
+    print("AT-SPI Value bounds, steps, increment/decrement, numeric validation, focus and notifications passed", flush=True)
+
     check = named("Reimbursable")
     check_id = check.get_accessible_id()
     assert check.get_role() == Atspi.Role.CHECK_BOX
@@ -141,6 +170,13 @@ try:
     assert check.get_state_set().contains(Atspi.StateType.CHECKED)
     assert named("Toggle controls").get_action_iface().do_action(0)
     check.clear_cache()
+    slider.clear_cache()
+    assert not slider.get_state_set().contains(Atspi.StateType.ENABLED)
+    assert not slider.get_state_set().contains(Atspi.StateType.EDITABLE)
+    unavailable(lambda: Atspi.Value.set_current_value(slider, 1.0))
+    unavailable(lambda: Atspi.Action.do_action(slider, 0))
+    unavailable(lambda: Atspi.Component.grab_focus(slider))
+    assert abs(Atspi.Value.get_current_value(slider) - 0.3) < 1e-12
     assert not check.get_state_set().contains(Atspi.StateType.ENABLED)
     assert not check.get_state_set().contains(Atspi.StateType.SENSITIVE)
     assert not check.get_state_set().contains(Atspi.StateType.FOCUSED)
@@ -169,6 +205,9 @@ try:
     assert named("Open modal").get_action_iface().do_action(0)
     dismiss = wait_for(lambda: named("Dismiss modal"), "modal not exposed")
     assert named("Updated name") is None
+    assert named("Refresh rate") is None
+    unavailable(lambda: Atspi.Value.set_current_value(slider, 1.0))
+    wire_unavailable(slider_id, "org.freedesktop.DBus.Properties", "Set", GLib.Variant("(ssv)", ("org.a11y.atspi.Value", "CurrentValue", GLib.Variant("d", 1.0))))
     wire_unavailable(check_id, "org.a11y.atspi.Action", "DoAction", GLib.Variant("(i)", (0,)))
     unavailable(lambda: Atspi.EditableText.set_text_contents(updated, "blocked"))
     wire_unavailable(identity, "org.a11y.atspi.EditableText", "SetTextContents", GLib.Variant("(s)", ("blocked",)))
