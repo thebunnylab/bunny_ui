@@ -32,19 +32,27 @@ pub fn os_appearance() -> Option<Appearance> {
             return None;
         }
         let names = msg_id(class("NSMutableArray"), sel("array"));
-        msg_void_id(names, sel("addObject:"), ns_string("NSAppearanceNameAqua"));
-        msg_void_id(
-            names,
-            sel("addObject:"),
-            ns_string("NSAppearanceNameDarkAqua"),
-        );
+        // Match accessibility variants explicitly instead of relying on their
+        // ancestry mapping through the two ordinary Aqua appearances.
+        for name in [
+            "NSAppearanceNameAccessibilityHighContrastDarkAqua",
+            "NSAppearanceNameAccessibilityHighContrastAqua",
+            "NSAppearanceNameDarkAqua",
+            "NSAppearanceNameAqua",
+        ] {
+            msg_void_id(names, sel("addObject:"), ns_string(name));
+        }
         let best = msg_id_arg(appearance, sel("bestMatchFromAppearancesWithNames:"), names);
         if best.is_null() {
             return None;
         }
         match text_argument_to_string(best).as_str() {
-            "NSAppearanceNameAqua" => Some(Appearance::Light),
-            "NSAppearanceNameDarkAqua" => Some(Appearance::Dark),
+            "NSAppearanceNameAqua" | "NSAppearanceNameAccessibilityHighContrastAqua" => {
+                Some(Appearance::Light)
+            }
+            "NSAppearanceNameDarkAqua" | "NSAppearanceNameAccessibilityHighContrastDarkAqua" => {
+                Some(Appearance::Dark)
+            }
             _ => None,
         }
     }

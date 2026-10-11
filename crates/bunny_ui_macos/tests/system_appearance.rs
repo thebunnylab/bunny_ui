@@ -11,7 +11,7 @@ mod native {
     use bunny_ui_macos::{App, WindowSpec};
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSAppearance, NSAppearanceCustomization, NSApplication};
-    use objc2_foundation::NSString;
+    use objc2_foundation::{NSArray, NSString};
     use std::{cell::Cell, rc::Rc, time::Duration};
 
     #[derive(Clone)]
@@ -26,10 +26,17 @@ mod native {
     }
     fn change(app: &NSApplication, name: &str) {
         let appearance = NSAppearance::appearanceNamed(&NSString::from_str(name)).unwrap();
+        let names = ["NSAppearanceNameAqua", "NSAppearanceNameDarkAqua"].map(NSString::from_str);
+        let best =
+            appearance.bestMatchFromAppearancesWithNames(&NSArray::from_retained_slice(&names));
+        eprintln!("Independent AppKit two-name match for {name}: {best:?}");
         app.setAppearance(Some(&appearance));
+        let effective = app.effectiveAppearance();
+        let effective_match =
+            effective.bestMatchFromAppearancesWithNames(&NSArray::from_retained_slice(&names));
         eprintln!(
-            "Requested {name}; native application now {}",
-            app.effectiveAppearance().name()
+            "Requested {name}; native application now {}; effective two-name match={effective_match:?}",
+            effective.name()
         );
     }
     async fn until(stage: &str, native: &NSApplication, mut ready: impl FnMut() -> bool) {
@@ -109,6 +116,17 @@ mod native {
             .await;
             assert_eq!(theme::current(), custom);
             println!("High-contrast dark was observed without overwriting custom tokens");
+            change(&native, "NSAppearanceNameAccessibilityHighContrastAqua");
+            until("high-contrast light transition", &native, || {
+                first_seen.get() == Some(Appearance::Light) && second_seen.get() == Some(Appearance::Light)
+            }).await;
+            assert_eq!(theme::current(), custom);
+            change(&native, "NSAppearanceNameDarkAqua");
+            until("ordinary dark transition", &native, || {
+                first_seen.get() == Some(Appearance::Dark) && second_seen.get() == Some(Appearance::Dark)
+            }).await;
+            assert_eq!(theme::current(), custom);
+            println!("Both high-contrast variants and ordinary dark were observed with pinned native windows");
             theme::follow_system();
             assert_eq!(theme::current(), Theme::dark());
             let third_seen = Rc::new(Cell::new(None));
