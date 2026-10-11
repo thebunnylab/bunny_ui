@@ -9,7 +9,7 @@ mod probe {
     use bunny_ui::window::{
         ConfirmationError, ConfirmationKind, ConfirmationResponse, ConfirmationSpec,
     };
-    use bunny_ui_apple::ffi::{CGPoint, Id, Sel, class, ns_string, sel};
+    use bunny_ui_apple::ffi::{CGPoint, CGSize, Id, Sel, class, ns_string, sel};
     use bunny_ui_macos::{App, WindowError, WindowSpec};
 
     #[cfg(target_arch = "aarch64")]
@@ -36,6 +36,12 @@ mod probe {
         #[link_name = "objc_msgSend"]
         fn is_kind(value: Id, selector: Sel, class: Id) -> NativeBool;
         #[link_name = "objc_msgSend"]
+        fn image_size(value: Id, selector: Sel, size: CGSize) -> Id;
+        #[link_name = "objc_msgSend"]
+        fn image_name(value: Id, selector: Sel, name: Id) -> NativeBool;
+        #[link_name = "objc_msgSend"]
+        fn release(value: Id, selector: Sel);
+        #[link_name = "objc_msgSend"]
         fn number(value: Id, selector: Sel) -> isize;
         #[link_name = "objc_msgSend"]
         fn key_event(
@@ -52,6 +58,38 @@ mod probe {
             repeat: NativeBool,
             code: u16,
         ) -> Id;
+    }
+
+    // This unbundled fixture supplies its own application icon. NSAlert's nib
+    // otherwise asks IconServices synchronously; that service can stall in the
+    // Intel runner. The native sheet, controls and event loop stay unchanged.
+    struct ApplicationIcon(Id);
+
+    impl ApplicationIcon {
+        fn install() -> Self {
+            unsafe {
+                let icon = image_size(
+                    object(class("NSImage"), sel("alloc")),
+                    sel("initWithSize:"),
+                    CGSize {
+                        width: 32.0,
+                        height: 32.0,
+                    },
+                );
+                assert!(!icon.is_null());
+                assert_ne!(
+                    image_name(icon, sel("setName:"), ns_string("NSApplicationIcon")) as u8,
+                    0
+                );
+                Self(icon)
+            }
+        }
+    }
+
+    impl Drop for ApplicationIcon {
+        fn drop(&mut self) {
+            unsafe { release(self.0, sel("release")) };
+        }
     }
 
     fn text_of(string: Id) -> String {
@@ -87,6 +125,10 @@ mod probe {
             );
             task::sleep(Duration::from_millis(10)).await;
         }
+        assert!(
+            Instant::now() < deadline,
+            "native sheet transition exceeded its deadline"
+        );
     }
 
     fn button(view: Id, label: &str) -> Option<Id> {
@@ -157,6 +199,7 @@ mod probe {
 
     pub fn run() {
         eprintln!("confirmation stage: create windows");
+        let _icon = ApplicationIcon::install();
         let app = App::new();
         app.set_locale(Some(Locale::new("pt-BR")));
         let guard = app.open(

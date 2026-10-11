@@ -37,6 +37,14 @@ owned message box. Linux Escape or a window dismissal yields `Dismissed`;
 Return invokes No, and Tab visits the retained controls. A focused affirmative
 button remains available through its normal activation and accessibility paths.
 
+AppKit constructs `NSAlert` on the UI thread. Its nib can synchronously ask the
+system IconServices service for the application icon before showing a sheet.
+An unavailable service can therefore delay initial construction, especially for
+unbundled executables. The asynchronous response contract does not bound that
+OS initialization time. The protocol fixture registers its own process-local
+`NSApplicationIcon` image to isolate this branding dependency; it still creates
+and exercises the real AppKit sheet and controls.
+
 The future is not `Send` and cannot be cloned. Dropping it, or calling `cancel`,
 requests dismissal. A presented operation finishes only after native teardown;
 its owner remains reserved until then. Earlier cancellation wins over a later
