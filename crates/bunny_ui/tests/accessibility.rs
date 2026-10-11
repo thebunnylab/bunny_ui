@@ -47,6 +47,77 @@ const SIZE: Size = Size {
 };
 
 #[test]
+fn an_initial_modal_action_survives_another_window_frame() {
+    let app = ProtectedForm {
+        password: State::new("secret".into()),
+        show_sheet: State::new(true),
+        count: State::new(0),
+    };
+    let runtime = Runtime::scene("modal-owner");
+    runtime.set_accessibility_enabled(true);
+    runtime.display_frame(&app, SIZE);
+    let button = runtime
+        .accessibility_tree()
+        .nodes()
+        .iter()
+        .find(|node| node.label.as_ref() == "In modal")
+        .unwrap()
+        .id;
+    assert!(
+        runtime
+            .accessibility_action(button, Action::Activate)
+            .is_ok(),
+        "the initial modal is actionable before switching scenes"
+    );
+    let other = Runtime::scene("other-window");
+    other.set_accessibility_enabled(true);
+    other.display_frame(&text("Keeper"), SIZE);
+    assert!(
+        runtime
+            .accessibility_action(button, Action::Activate)
+            .is_ok()
+    );
+    assert_eq!(app.count.get(), 20);
+    other.set_environment(|values| values.locale = Locale::new("fr-FR"));
+    other.display_frame(&text("Keeper"), SIZE);
+    assert!(
+        runtime
+            .accessibility_action(button, Action::Activate)
+            .is_ok()
+    );
+    bunny_ui::code_changed();
+    other.display_frame(&text("Keeper"), SIZE);
+    assert!(
+        runtime
+            .accessibility_action(button, Action::Activate)
+            .is_ok()
+    );
+    bunny_ui::theme::install(bunny_ui::theme::Theme::dark());
+    other.display_frame(&text("Keeper"), SIZE);
+    assert!(
+        runtime
+            .accessibility_action(button, Action::Activate)
+            .is_ok()
+    );
+    runtime.display_frame(&app, SIZE);
+    assert_eq!(
+        app.count.get(),
+        50,
+        "scene invalidation preserves the real model"
+    );
+    assert_eq!(
+        runtime
+            .accessibility_tree()
+            .nodes()
+            .iter()
+            .find(|node| node.label.as_ref() == "In modal")
+            .unwrap()
+            .id,
+        button
+    );
+}
+
+#[test]
 fn semantic_names_values_and_actions_follow_the_real_controls() {
     let app = Form::new();
     let runtime = Runtime::new();

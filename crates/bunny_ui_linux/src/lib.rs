@@ -261,6 +261,7 @@ struct Slot {
     key_gate: RefCell<Box<dyn FnMut(&ffi::KeyStroke) -> bool>>,
     drag_gate: Box<dyn Fn(f64, f64) -> bool>,
     control_gate: Box<dyn Fn(f64, f64) -> Option<ffi::ControlHit>>,
+    _accessibility_refresh: Rc<dyn Fn()>,
 }
 
 struct AppInner {
@@ -581,6 +582,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             min: spec.min.map(|min| (min.width, min.height)),
         },
     );
+    let accessibility = ffi::accessibility::Accessibility::new(Rc::clone(&runtime), window.raw_window());
     // the bar: the compositor's where it offers one, the house's own
     // where it does not — decided BEFORE the GPU installs, because the
     // crown's corners want an alpha ground
@@ -645,6 +647,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         let surface = Rc::clone(&surface);
         let panels = Rc::clone(&panels);
         let dialogs = Rc::clone(&dialogs);
+        let accessibility = Rc::clone(&accessibility);
+        let title = spec.title.to_string();
         move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| {
             (|| {
             let (width, height) = window.content_size();
@@ -878,6 +882,32 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 }
             }
             })();
+            // Decorator after every pixel path, including GPU early returns.
+            // Register every surface even before semantic capture is requested.
+            let (width, height) = window.content_size();
+            let mut semantic_surfaces = vec![ffi::accessibility::Surface {
+                key: None, handle: window,
+                origin: bunny_ui::layout::Point { x: 0.0, y: 0.0 },
+                size: Size { width, height }, title: title.clone(),
+            }];
+            for overlay in runtime.overlays() {
+                let dialog = dialogs.borrow().get(&overlay.path).copied();
+                let panel = panels.borrow().get(&overlay.path).copied();
+                let (handle, origin, size) = if let Some(dialog) = dialog {
+                    (dialog.handle, dialog.origin, overlay.frame.size)
+                } else if let Some(panel) = panel {
+                    const BLEED: f64 = 32.0;
+                    (panel, bunny_ui::layout::Point { x: overlay.frame.origin.x - BLEED, y: overlay.frame.origin.y - BLEED },
+                        Size { width: overlay.frame.size.width + 2.0 * BLEED, height: overlay.frame.size.height + 2.0 * BLEED })
+                } else { continue };
+                let title = match &overlay.surface {
+                    bunny_ui::layout::OverlaySurface::Window(spec) => spec.title.to_string(),
+                    bunny_ui::layout::OverlaySurface::Alert(spec) => spec.title.to_string(),
+                    bunny_ui::layout::OverlaySurface::Layer => String::new(),
+                };
+                semantic_surfaces.push(ffi::accessibility::Surface { key: Some(overlay.path), handle, origin, size, title });
+            }
+            accessibility.publish(semantic_surfaces);
             // the page's next frame comes after this one went up: the
             // engine is paced by the shell's own present
             webview::frame_presented(window.raw_window());
@@ -1026,6 +1056,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // frame that presented nothing still tells the driver what it
     // wants, which is what starts the beat after a cold wait.
     let unpaced = std::env::var("BUNNY_PACING").is_ok_and(|value| value == "off");
+    let accessibility_refresh: Rc<dyn Fn()> = Rc::new({
+        let runtime = Rc::clone(&runtime);
+        let root = Rc::clone(&root);
+        let blit = blit.clone();
+        move || blit(&runtime, &*root, ORIGIN_REDRAW)
+    });
+    accessibility.set_refresh(&accessibility_refresh);
     let soon = {
         let blit = blit.clone();
         let pacer = Rc::clone(&pacer);
@@ -1504,6 +1541,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         key_gate: RefCell::new(key_gate),
         drag_gate,
         control_gate,
+        _accessibility_refresh: accessibility_refresh,
     })
 }
 

@@ -1,4 +1,4 @@
-# Accessibility semantics and macOS bridge
+# Accessibility semantics and native bridges
 
 The core can project text, buttons and editable fields from the retained scene
 into `bunny_ui::accessibility::Tree`. This is the data boundary for native
@@ -10,6 +10,8 @@ reading order. Collection schedules no timer. Activating or deactivating it
 rebuilds retained view metadata through the existing environment invalidation
 path; application state remains in the identity arena. With collection disabled,
 ordinary text and buttons allocate no semantic metadata.
+For named scenes, capture and environment invalidation rebuild only the owning
+scene. Other windows keep their retained callbacks until their own next frame.
 
 Text supplies its displayed words. A button combines the names in its label
 without exposing those words as duplicate children. A field defaults to its
@@ -73,10 +75,79 @@ main-thread exit with an accessible window still open. This
 in-process probe does not require permission to control other applications. It
 is distinct from an external AX client dump or a human VoiceOver workflow.
 
+## Windows adapter
+
+The Win32 shell answers `WM_GETOBJECT` with a UI Automation fragment root for
+each scene and overlay window. The first UIA request enables semantic collection,
+including a request directed at an already-open modal. Text, buttons and fields
+expose their native control types, names, physical screen bounds and stable
+runtime IDs. Buttons expose Invoke; single-line fields expose Value and keyboard focus.
+Multiline editors expose focus but require the still-unimplemented Text pattern
+for text access; they do not claim Value pattern support.
+Password fields set IsPassword and refuse value reads.
+
+COM providers hold immutable owned snapshots behind synchronization; they never
+borrow Runtime, views or application bindings. They support callbacks from an
+MTA as well as a normal STA host. Action methods validate and queue requests to
+the owning window's event loop; the handler rechecks the exposed identity before
+using the real callback or editing path. A successful call means that the request
+was accepted; clients observe the resulting frame or change event. A request
+whose target disappears before dispatch is discarded. Removed elements and
+closed windows disconnect their providers and refuse subsequent requests.
+
+Snapshot publication follows every presentation path. Name, value, focus,
+geometry and tree membership changes emit UIA notifications when clients are
+listening; there is no accessibility polling timer. Native HWND children keep
+their Windows providers, navigation, hit testing and focus. The adapter uses
+system UIAutomationCore and OleAuto APIs inside the existing Win32 FFI boundary
+and adds no Rust dependency.
+
+`cargo test -p bunny-ui-windows --test accessibility_native --locked` runs a real
+IUIAutomation client on a separate MTA thread while the app pumps its window
+messages. Its fixture checks model edits, invocation, focus, dynamic names,
+runtime identity, password redaction, moved bounds, native child interoperability,
+modal exclusion and first-query activation, events, and retired/closed objects.
+Subprocesses exercise an already-MTA host and first access to an open modal.
+This protocol test is distinct from a human NVDA workflow.
+
+## Linux adapter
+
+The Linux shell registers an AT-SPI application on the system accessibility bus,
+using the libdbus library already linked by the shell. Its descriptor participates
+in both the X11 and Wayland event loops, including write readiness for queued
+replies. Requests run on the UI thread between native dispatches. No accessibility
+timer, Rust dependency or separate form model is introduced.
+
+The first client query enables retained capture. Main windows and overlay surfaces
+have distinct roots; leaves retain their object paths while their `NodeId` is
+exposed. Accessible and Application properties describe the current objects.
+Component exposes bounds, hit testing and field focus; Action invokes buttons;
+Text reads Unicode scalar ranges; EditableText replaces a field's whole contents.
+Unsupported operations return a D-Bus error. Text selection, caret offsets,
+character geometry and partial edits are not implemented yet.
+
+Passwords expose the password role and an empty readable text value and count.
+No password text enters a bus reply or change event. Removed nodes and closed
+windows reject requests. Name, text, focus, membership and visible-data events
+follow snapshot installation. Embedded NUL scalars in labels are represented by
+U+FFFD because D-Bus strings cannot carry NUL; the remaining text is preserved.
+
+X11 screen coordinates come from the actual window or panel's server origin.
+Both backends support window-relative coordinates. Wayland screen-coordinate
+queries return NotSupported: its ordinary surface protocol supplies no global
+window position. WPE content is currently a painted texture and does not yet
+expose an embedded AT-SPI plug. A missing bus is reported at initialization;
+a disconnected bus is reported and removed from the poll, without terminating
+the app. Automatic reconnection is not yet implemented.
+
+`bash scripts/check-linux-accessibility.sh` uses a separate libatspi client
+(Python GI) against real Bunny windows, an isolated session bus, Xvfb and headless
+Weston. It runs both backends in normal and paranoid modes. This is a native
+protocol witness, not a human Orca workflow or a complete desktop qualification.
+
 ## Remaining work
 
-Windows UIA and Linux AT-SPI bridges are not included yet. The core projection
-is a flat sequence of exposed leaves, not a complete document model.
+The core projection is a flat sequence of exposed leaves, not a complete document model.
 It does not yet describe custom controls, checkboxes, sliders, read-only or
 disabled states, rich-text ranges, selection APIs, validation messages or
 virtualized offscreen navigation. It does not implement keyboard navigation

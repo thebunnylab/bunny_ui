@@ -1619,6 +1619,16 @@ impl Runtime {
         self.ctx.borrow().clone()
     }
 
+    /// Environment, theme and code rebuild only this runtime's retained scene.
+    /// Other windows may receive input before their next frame and must keep
+    /// the callbacks corresponding to the picture they still display.
+    fn invalidate_scene(&self) {
+        match self.scene.as_deref() {
+            Some(scene) => reconciler::clear_under(scene),
+            None => reconciler::clear(),
+        }
+    }
+
     /// One incremental pass: walk with skips, isolated re-runs of dirty
     /// views the walk missed, effect-queue reassembly, and the sweep.
     /// Returns both outputs (print and layout) still holding references.
@@ -1677,19 +1687,19 @@ impl Runtime {
         let theme_version = crate::theme::version();
         if self.theme_version.get() != theme_version {
             self.theme_version.set(theme_version);
-            reconciler::clear();
+            self.invalidate_scene();
         }
         // new code: every body runs again, the new code in place of the
         // old — the state stays where it is
         let code_version = code_version();
         if self.code_version.get() != code_version {
             self.code_version.set(code_version);
-            reconciler::clear();
+            self.invalidate_scene();
         }
         // the same for a moved environment: a body that read the size
         // class baked its answer into the scene it retained
         if self.env_moved.replace(false) {
-            reconciler::clear();
+            self.invalidate_scene();
         }
         effects::reset();
         // the dirt this pass serves leaves the registry now: what a body
