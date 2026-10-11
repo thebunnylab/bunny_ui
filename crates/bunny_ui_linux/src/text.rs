@@ -1,5 +1,5 @@
 //! The linux text engine: fontconfig finds the face, FreeType rasters
-//! it, FriBidi orders directional runs and HarfBuzz shapes them. These are
+//! it, `FriBidi` orders directional runs and `HarfBuzz` shapes them. These are
 //! platform libraries, bound by hand — no bindings crate.
 //!
 //! The border discipline: HarfBuzz and fontconfig are driven through
