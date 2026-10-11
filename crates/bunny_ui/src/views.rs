@@ -21,7 +21,9 @@
 //! first, behavior (closures) last.
 
 #[cfg(feature = "canvas")]
-pub use crate::line_chart::{ChartDomain, ChartError, LineChart, LineSample, LineSeries, line_chart};
+pub use crate::line_chart::{
+    ChartDomain, ChartError, LineChart, LineSample, LineSeries, line_chart,
+};
 #[cfg(feature = "canvas")]
 pub use crate::slider::{Slider, SliderRange, SliderRangeError, slider};
 
