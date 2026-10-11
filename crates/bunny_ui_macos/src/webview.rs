@@ -53,7 +53,8 @@ unsafe extern "C" {
     fn msg_id_u64(obj: Id, sel: Sel, a: u64) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_f64(obj: Id, sel: Sel) -> f64;
-    #[link_name = "objc_msgSend"]
+    #[cfg_attr(target_arch = "aarch64", link_name = "objc_msgSend")]
+    #[cfg_attr(target_arch = "x86_64", link_name = "objc_msgSend_stret")]
     fn msg_rect(obj: Id, sel: Sel) -> CGRect;
     #[link_name = "objc_msgSend"]
     fn msg_point_point_id(obj: Id, sel: Sel, point: CGPoint, view: Id) -> CGPoint;
