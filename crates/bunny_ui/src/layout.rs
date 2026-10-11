@@ -4482,43 +4482,7 @@ pub(crate) fn layout_placing(
         place_overlays(container, &env, &mut other);
         crate::stats::restore(counted);
         let (full, cut) = if keep_unseen { (&out, &other) } else { (&other, &out) };
-        let seen = full.display.seen_only();
-        assert!(
-            seen.as_slice() == cut.display.as_slice(),
-            "paranoid(seen): the placement's cut and the filter of the full list differ — {} commands against {} (the full list holds {})",
-            cut.display.len(),
-            seen.len(),
-            full.display.len(),
-        );
-        // a quiet child left unplaced records its own boundaries and not the
-        // ones nested in it: the cut's frames are the full placement's, in
-        // order, with some left out — never one moved, never one invented
-        let mut all = full.frames.entries.iter();
-        let frames_agree = cut.frames.entries.iter().all(|kept| all.any(|entry| entry == kept));
-        // …and a hover group off the glass is not asked whether it paints a
-        // hover nobody can give it
-        let groups_agree = cut.sensitive_groups.iter().all(|group| full.sensitive_groups.contains(group));
-        assert!(
-            full.hits == cut.hits
-                && frames_agree
-                && groups_agree
-                && full.scrolls.len() == cut.scrolls.len()
-                && full.fields.len() == cut.fields.len()
-                && full.focus_order == cut.focus_order
-                && full.focus_floor == cut.focus_floor
-                && full.focus_scope == cut.focus_scope
-                && full.customs.len() == cut.customs.len()
-                && full.hosts.len() == cut.hosts.len()
-                && full.tooltips.len() == cut.tooltips.len()
-                && full.menus.len() == cut.menus.len()
-                && full.drag_sources.len() == cut.drag_sources.len()
-                && full.drops.len() == cut.drops.len()
-                && full.overlays.len() == cut.overlays.len()
-                && full.misses == cut.misses
-                && full.drag_regions == cut.drag_regions
-                && full.hover_sensitive == cut.hover_sensitive,
-            "paranoid(seen): the cut moved something other than the draw list",
-        );
+        assert_seen_placement(full, cut);
     }
     let thumbs = lift_thumbs(&mut out, &env);
     LayoutResult {
@@ -4547,6 +4511,47 @@ pub(crate) fn layout_placing(
         drops: out.drops,
         thumbs,
     }
+}
+
+// A paint cut must preserve input ownership and placement geometry.
+fn assert_seen_placement(full: &Placement, cut: &Placement) {
+    let seen = full.display.seen_only();
+    assert!(
+        seen.as_slice() == cut.display.as_slice(),
+        "paranoid(seen): the placement's cut and the filter of the full list differ — {} commands against {} (the full list holds {})",
+        cut.display.len(),
+        seen.len(),
+        full.display.len(),
+    );
+    // a quiet child left unplaced records its own boundaries and not the
+    // ones nested in it: the cut's frames are the full placement's, in
+    // order, with some left out — never one moved, never one invented
+    let mut all = full.frames.entries.iter();
+    let frames_agree = cut.frames.entries.iter().all(|kept| all.any(|entry| entry == kept));
+    // …and a hover group off the glass is not asked whether it paints a
+    // hover nobody can give it
+    let groups_agree = cut.sensitive_groups.iter().all(|group| full.sensitive_groups.contains(group));
+    assert!(
+        full.hits == cut.hits
+            && frames_agree
+            && groups_agree
+            && full.scrolls.len() == cut.scrolls.len()
+            && full.fields.len() == cut.fields.len()
+            && full.focus_order == cut.focus_order
+            && full.focus_floor == cut.focus_floor
+            && full.focus_scope == cut.focus_scope
+            && full.customs.len() == cut.customs.len()
+            && full.hosts.len() == cut.hosts.len()
+            && full.tooltips.len() == cut.tooltips.len()
+            && full.menus.len() == cut.menus.len()
+            && full.drag_sources.len() == cut.drag_sources.len()
+            && full.drops.len() == cut.drops.len()
+            && full.overlays.len() == cut.overlays.len()
+            && full.misses == cut.misses
+            && full.drag_regions == cut.drag_regions
+            && full.hover_sensitive == cut.hover_sensitive,
+        "paranoid(seen): the cut moved something other than the draw list",
+    );
 }
 
 /// The thumbs a layer of their own shows exactly as the scene would, taken
