@@ -72,6 +72,8 @@ pub mod pacing;
 mod paranoid;
 mod reconciler;
 pub mod runtime;
+#[cfg(feature = "canvas")]
+pub mod slider;
 pub mod ssr;
 pub mod state_ext;
 pub mod stats;

@@ -164,6 +164,9 @@ cargo run -p bunny-ui-core --example counter_mvvm
 cargo run -p bunny-ui-core --example profile_mvvm
 ```
 
+The canvas-backed [slider](docs/slider.md) binds a scalar value to a validated
+range, with pointer capture, keyboard adjustment, disabled state and RTL input.
+
 ## Work that waits
 
 A view can own asynchronous work. `.task` starts it on the view's first

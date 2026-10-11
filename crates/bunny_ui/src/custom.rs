@@ -846,7 +846,9 @@ pub enum ElementEvent {
     /// The pointer left the box (or the window).
     PointerExited,
     /// A keystroke, while the box has focus — arrows, Enter, Tab and
-    /// the shortcuts, exactly as the keymap spells them. What the box
+    /// the shortcuts, exactly as the keymap spells them. Escape also reaches
+    /// a box that currently captures the pointer, before the focused box;
+    /// handling it ends that capture without a release action. What the box
     /// ignores goes on to the app's key bindings.
     ///
     /// The stroke carries BOTH questions: `pattern` names the key, and
