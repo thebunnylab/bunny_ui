@@ -64,6 +64,7 @@ pub fn package(library: &str) -> Option<(&'static str, &'static str, &'static st
         "libfontconfig" => ("libfontconfig1", "fontconfig", "fontconfig"),
         "libfreetype" => ("libfreetype6", "freetype", "freetype2"),
         "libharfbuzz" => ("libharfbuzz0b", "harfbuzz", "harfbuzz"),
+        "libfribidi" => ("libfribidi0", "fribidi", "fribidi"),
         "libEGL" | "libGLESv2" | "libGL" => ("libegl1", "mesa-libEGL", "libglvnd"),
         "libvulkan" => ("libvulkan1", "vulkan-loader", "vulkan-icd-loader"),
         _ => return Some(("?", "?", "?")),
@@ -118,6 +119,7 @@ mod tests {
     #[test]
     fn a_library_is_its_distributions_package() {
         assert_eq!(package("libfreetype.so.6"), Some(("libfreetype6", "freetype", "freetype2")));
+        assert_eq!(package("libfribidi.so.0"), Some(("libfribidi0", "fribidi", "fribidi")));
         assert_eq!(package("libc.so.6"), None);
         assert_eq!(package("ld-linux-x86-64.so.2"), None);
     }

@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl build-essential pkg-config git procps \
     libxcb1-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-shm0-dev \
     libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-    libdbus-1-dev libsecret-1-dev libfontconfig-dev libfreetype-dev libharfbuzz-dev \
+    libdbus-1-dev libsecret-1-dev libfontconfig-dev libfreetype-dev libharfbuzz-dev libfribidi-dev \
     libegl1 libgles2 libgl1-mesa-dri libegl-mesa0 libwayland-egl1 \
     mesa-vulkan-drivers vulkan-tools \
     wayland-protocols wayland-utils weston xvfb xauth x11-utils dbus dbus-daemon \

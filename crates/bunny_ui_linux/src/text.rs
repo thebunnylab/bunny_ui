@@ -1,6 +1,6 @@
 //! The linux text engine: fontconfig finds the face, FreeType rasters
-//! it, HarfBuzz shapes the line. All three are the platform's own
-//! libraries, bound by hand — no bindings crate.
+//! it, `FriBidi` orders directional runs and `HarfBuzz` shapes them. These are
+//! platform libraries, bound by hand — no bindings crate.
 //!
 //! The border discipline: HarfBuzz and fontconfig are driven through
 //! API calls only (their objects stay opaque); FreeType's contract IS
@@ -12,6 +12,9 @@
 //! Rasters come out STRAIGHT alpha in physical pixels, the trait's
 //! law. The gray road is straight by construction (coverage × color);
 //! only color-emoji bitmaps arrive premultiplied and get undone.
+
+#[path = "text_bidi.rs"]
+mod bidi;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -157,6 +160,7 @@ unsafe extern "C" {
         item_length: c_int,
     );
     fn hb_buffer_guess_segment_properties(buffer: *mut c_void);
+    fn hb_buffer_set_direction(buffer: *mut c_void, direction: c_uint);
     fn hb_shape(font: *mut c_void, buffer: *mut c_void, features: *const c_void, count: c_uint);
     fn hb_buffer_get_glyph_infos(buffer: *mut c_void, length: *mut c_uint) -> *mut HbGlyphInfo;
     fn hb_buffer_get_glyph_positions(buffer: *mut c_void, length: *mut c_uint) -> *mut HbGlyphPos;
@@ -436,78 +440,102 @@ impl FreeTypeEngine {
         opened
     }
 
-    /// Shapes the whole line. The text splits into maximal runs by
-    /// "does the primary face cover this char" (charmap probe); the
-    /// uncovered runs shape with a fontconfig-charset fallback face —
-    /// basic per-run fallback, the documented v1 scope.
-    /// `tracking` is 26.6 units of extra advance after EVERY glyph, in
-    /// the same scale as the key's face — what the design calls tracking.
+    /// Resolve visual directional runs, then partition each by font coverage.
+    /// Each `HarfBuzz` buffer still receives logical UTF-8 with full text context.
+    /// `tracking` adds 26.6 units after every glyph at the key's scale.
     fn shape(&self, text: &str, key: &FaceKey, tracking: i64) -> Option<(Vec<Shaped>, i64)> {
+        let directions = match bidi::runs(text) {
+            Ok(runs) => runs,
+            Err(error) => {
+                eprintln!("bunny_ui_linux: {error}");
+                return None;
+            }
+        };
+        let text_length = c_int::try_from(text.len()).ok()?;
         let primary = self.face(key)?;
-        let mut runs: Vec<(Face, std::ops::Range<usize>)> = Vec::new();
-        let mut run_start = 0;
+        let mut shaped = Vec::new();
+        let mut pen: i64 = 0;
+        for directional in directions {
+            let mut runs = self.face_runs(text, directional.bytes, key, primary);
+            // Font fallback may split a single RTL span. Its fragments must
+            // also be visited right-to-left; reversing UTF-8 would corrupt
+            // clusters and joining, so only the list of logical spans moves.
+            if directional.direction == bidi::Direction::RightToLeft {
+                runs.reverse();
+            }
+            let direction = match directional.direction {
+                bidi::Direction::LeftToRight => 4, // HB_DIRECTION_LTR
+                bidi::Direction::RightToLeft => 5, // HB_DIRECTION_RTL
+            };
+            for (face, range) in runs {
+                let start = c_uint::try_from(range.start).ok()?;
+                let length = c_int::try_from(range.len()).ok()?;
+                unsafe {
+                    let buffer = hb_buffer_create();
+                    hb_buffer_add_utf8(buffer, text.as_ptr().cast(), text_length, start, length);
+                    hb_buffer_set_direction(buffer, direction);
+                    hb_buffer_guess_segment_properties(buffer);
+                    hb_shape(face.hb, buffer, std::ptr::null(), 0);
+                    let mut count = 0;
+                    let infos = hb_buffer_get_glyph_infos(buffer, &raw mut count);
+                    let mut pos_count = 0;
+                    let positions = hb_buffer_get_glyph_positions(buffer, &raw mut pos_count);
+                    for i in 0..count.min(pos_count) as usize {
+                        let info = *infos.add(i);
+                        let position = *positions.add(i);
+                        shaped.push(Shaped {
+                            face,
+                            glyph: info.codepoint,
+                            #[cfg(test)]
+                            cluster: info.cluster,
+                            x: pen + i64::from(position.x_offset),
+                            y: i64::from(position.y_offset),
+                        });
+                        pen += i64::from(position.x_advance) + tracking;
+                    }
+                    hb_buffer_destroy(buffer);
+                }
+            }
+        }
+        Some((shaped, pen))
+    }
+
+    /// The existing primary-versus-fallback policy, within one direction span.
+    fn face_runs(
+        &self,
+        text: &str,
+        range: std::ops::Range<usize>,
+        key: &FaceKey,
+        primary: Face,
+    ) -> Vec<(Face, std::ops::Range<usize>)> {
+        let mut runs = Vec::new();
+        let mut run_start = range.start;
         let mut run_covered = true;
-        for (at, ch) in text.char_indices() {
-            let covered = ch == ' '
-                || unsafe { FT_Get_Char_Index(primary.ft, ch as u64) } != 0;
-            if at == 0 {
+        for (relative, ch) in text[range.clone()].char_indices() {
+            let at = range.start + relative;
+            let covered = ch == ' ' || unsafe { FT_Get_Char_Index(primary.ft, u64::from(ch)) } != 0;
+            if at == range.start {
                 run_covered = covered;
             } else if covered != run_covered {
-                runs.push((
-                    if run_covered {
-                        primary
-                    } else {
-                        self.fallback_for(text, run_start, key, primary)
-                    },
-                    run_start..at,
-                ));
+                let face = if run_covered {
+                    primary
+                } else {
+                    self.fallback_for(text, run_start, key, primary)
+                };
+                runs.push((face, run_start..at));
                 run_start = at;
                 run_covered = covered;
             }
         }
-        if !text.is_empty() {
-            runs.push((
-                if run_covered {
-                    primary
-                } else {
-                    self.fallback_for(text, run_start, key, primary)
-                },
-                run_start..text.len(),
-            ));
+        if run_start < range.end {
+            let face = if run_covered {
+                primary
+            } else {
+                self.fallback_for(text, run_start, key, primary)
+            };
+            runs.push((face, run_start..range.end));
         }
-        let mut shaped = Vec::new();
-        let mut pen: i64 = 0;
-        for (face, range) in runs {
-            unsafe {
-                let buffer = hb_buffer_create();
-                hb_buffer_add_utf8(
-                    buffer,
-                    text.as_ptr().cast(),
-                    text.len() as c_int,
-                    range.start as c_uint,
-                    (range.end - range.start) as c_int,
-                );
-                hb_buffer_guess_segment_properties(buffer);
-                hb_shape(face.hb, buffer, std::ptr::null(), 0);
-                let mut count = 0;
-                let infos = hb_buffer_get_glyph_infos(buffer, &mut count);
-                let mut pos_count = 0;
-                let positions = hb_buffer_get_glyph_positions(buffer, &mut pos_count);
-                for i in 0..count.min(pos_count) as usize {
-                    let info = *infos.add(i);
-                    let position = *positions.add(i);
-                    shaped.push(Shaped {
-                        face,
-                        glyph: info.codepoint,
-                        x: pen + position.x_offset as i64,
-                        y: position.y_offset as i64,
-                    });
-                    pen += position.x_advance as i64 + tracking;
-                }
-                hb_buffer_destroy(buffer);
-            }
-        }
-        Some((shaped, pen))
+        runs
     }
 
     fn fallback_for(&self, text: &str, at: usize, key: &FaceKey, primary: Face) -> Face {
@@ -545,6 +573,8 @@ fn fixed_26_6(points: f64) -> i64 {
 struct Shaped {
     face: Face,
     glyph: u32,
+    #[cfg(test)]
+    cluster: u32,
     /// 26.6 pen position (x includes the run base and the offset).
     x: i64,
     y: i64,
@@ -850,3 +880,7 @@ mod tests {
         assert!(ink(&raster) > 0, "the fallback face left ink");
     }
 }
+
+#[cfg(test)]
+#[path = "text_bidi_tests.rs"]
+mod bidi_tests;
