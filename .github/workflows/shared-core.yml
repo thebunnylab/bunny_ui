@@ -57,6 +57,13 @@ jobs:
           rustup override set 1.98.1
           rustc --version --verbose
           cargo --version
+      - name: Native platform, normal and paranoid
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          # Retain the actual adapter witness on successful parity tests too.
+          cargo test -p "$PLATFORM" --locked --all-targets -- --nocapture
+          BUNNY_PARANOID=all cargo test -p "$PLATFORM" --locked --all-targets -- --nocapture
       - name: Core default, normal and paranoid
         run: |
           cargo test -p bunny-ui-core --locked --all-targets
@@ -65,13 +72,6 @@ jobs:
         run: |
           cargo test -p bunny-ui-core --locked --all-targets --all-features
           BUNNY_PARANOID=all cargo test -p bunny-ui-core --locked --all-targets --all-features
-      - name: Native platform, normal and paranoid
-        env:
-          PLATFORM: ${{ matrix.platform }}
-        run: |
-          # Retain the actual adapter witness on successful parity tests too.
-          cargo test -p "$PLATFORM" --locked --all-targets -- --nocapture
-          BUNNY_PARANOID=all cargo test -p "$PLATFORM" --locked --all-targets -- --nocapture
       - name: Facade, with the runner's shell and without one
         run: |
           cargo test -p bunny-ui --locked --all-targets
