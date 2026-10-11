@@ -11,6 +11,10 @@ pub(super) struct ModalScopes {
 }
 
 impl ModalScopes {
+    pub(super) fn top(&self, parent: usize) -> Option<usize> {
+        self.stacks.get(&parent).and_then(|stack| stack.last()).copied()
+    }
+
     pub(super) fn set(&mut self, parent: usize, stack: Vec<usize>) {
         if stack.is_empty() {
             self.forget(parent);

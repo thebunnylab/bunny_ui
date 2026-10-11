@@ -39,3 +39,7 @@ harness = false
 [[test]]
 name = "window_modality"
 harness = false
+
+[[test]]
+name = "window_relationships"
+harness = false

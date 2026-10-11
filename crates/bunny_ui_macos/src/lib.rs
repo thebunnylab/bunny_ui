@@ -446,8 +446,11 @@ impl WindowSpec {
     }
 }
 
-use bunny_ui::window::Lifecycle;
-pub use bunny_ui::window::{CloseAction, WindowError, WindowId, WindowVisibility};
+use bunny_ui::window::{Lifecycle, Relationships};
+mod window_api;
+pub use bunny_ui::window::{
+    CloseAction, WindowError, WindowId, WindowParent, WindowParentKind, WindowVisibility,
+};
 
 /// This shell holds MORE THAN ONE window — the detachable composer,
 /// the second workbench. The three shells answer this differently and
@@ -514,6 +517,7 @@ pub struct App {
 /// The half the platform gates hold: they outlive any borrow of the
 /// app, so what they capture is a handle and never a reference.
 struct AppInner {
+    relationships: Relationships,
     slots: RefCell<Vec<Rc<Slot>>>,
     routed: std::cell::Cell<bool>,
     scenes: std::cell::Cell<usize>,
@@ -544,6 +548,7 @@ impl App {
         bunny_ui::clipboard::install_image_reader(ffi::clipboard_read_image);
         App {
             inner: Rc::new(AppInner {
+                relationships: Relationships::default(),
                 slots: RefCell::new(Vec::new()),
                 routed: std::cell::Cell::new(false),
                 scenes: std::cell::Cell::new(0),
@@ -604,6 +609,7 @@ impl App {
     /// Raises a window on `runtime`, showing `root`.
     pub fn open(&self, spec: WindowSpec, runtime: Rc<Runtime>, root: impl View) -> WindowId {
         let slot = mount(&spec, runtime, root);
+        self.inner.relationships.register(slot.lifecycle.id());
         let id = slot.lifecycle.id();
         self.inner.slots.borrow_mut().push(slot.clone());
         self.inner.clone().route();
@@ -618,12 +624,14 @@ impl App {
 
     /// Closes a window. The app stays up unless it was the last.
     pub fn close(&self, id: WindowId) {
+        self.close_children(id);
         // the delegate still runs (the window leaves the registry and
         // the frame beat moves house if it lived here), but its
         // notification does NOT re-enter the scene: this is usually
         // called from inside the handler of the very window that asked
         if let Some(slot) = self.slot(id) {
             ffi::lend_hand(|| ffi::close_top_level(slot.window));
+            self.inner.relationships.retire(id);
             self.inner
                 .slots
                 .borrow_mut()
@@ -650,32 +658,37 @@ impl App {
             .cloned()
     }
 
-    /// Hides a live window without destroying its scene. Repeating it is harmless.
+    /// Hides a live window and its descendants without destroying their scenes.
+    /// Explicit child hide requests survive a later parent show. A descendant
+    /// failure can leave earlier windows changed; retrying is safe.
     ///
     /// # Errors
-    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    /// Returns `StaleWindow` for a closed or foreign ID, or a native failure.
     pub fn hide(&self, id: WindowId) -> Result<(), WindowError> {
         let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
         let previous = slot.lifecycle.set_hidden(true);
-        let result =
-            ffi::lend_hand(|| ffi::set_window_visibility(slot.window, WindowVisibility::Hidden));
-        if result.is_err() {
+        if let Err(error) = self.refresh_window_visibility(id) {
             slot.lifecycle.set_hidden(previous);
+            return Err(error);
         }
-        result
+        self.refresh_child_visibility(id)
     }
 
-    /// Shows a retained window and requests activation, subject to OS policy.
+    /// Shows a retained window unless an owning ancestor is hidden.
+    /// Descendants preserve their own explicit hide requests. Native activation
+    /// remains subject to OS policy. A descendant failure can leave earlier
+    /// windows changed; retrying is safe.
     ///
     /// # Errors
-    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    /// Returns `StaleWindow` for a closed or foreign ID, or a native failure.
     pub fn show(&self, id: WindowId) -> Result<(), WindowError> {
         let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
-        ffi::lend_hand(|| ffi::set_window_visibility(slot.window, WindowVisibility::Shown))?;
-        slot.lifecycle.set_hidden(false);
-        slot.runtime.request_frame();
-        ffi::wake_from_any_thread();
-        Ok(())
+        let previous = slot.lifecycle.set_hidden(false);
+        if let Err(error) = self.refresh_window_visibility(id) {
+            slot.lifecycle.set_hidden(previous);
+            return Err(error);
+        }
+        self.refresh_child_visibility(id)
     }
 
     /// Reports native visibility; this does not mean unobscured or focused.
@@ -726,6 +739,8 @@ impl App {
             .decide()?;
         if action == CloseAction::Hide && self.slot(id).is_some() {
             self.hide(id)?;
+        } else if action == CloseAction::Close {
+            self.close_children(id);
         }
         Ok(action)
     }
@@ -880,6 +895,9 @@ impl AppInner {
 
     /// Drops the slot of a window that has gone.
     fn buried(&self, window: usize) {
+        if let Some(slot) = self.slots.borrow().iter().find(|slot| slot.window == window) {
+            self.relationships.retire(slot.lifecycle.id());
+        }
         self.slots.borrow_mut().retain(|slot| slot.window != window);
     }
 

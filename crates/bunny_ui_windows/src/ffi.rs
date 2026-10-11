@@ -18,6 +18,10 @@ use std::sync::{Condvar, Mutex, OnceLock};
 mod accessibility;
 pub(crate) use accessibility::{Accessibility, Request as AccessibilityRequest};
 
+#[path = "window_ops.rs"]
+mod window_ops;
+pub use window_ops::{focus_window, set_window_parent};
+
 // MARK: - Win32 ABI surface (the platform headers, transcribed)
 
 pub type Hwnd = isize;

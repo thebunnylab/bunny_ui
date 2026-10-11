@@ -44,6 +44,10 @@ pub(crate) use accessibility::Accessibility;
 #[path = "modal.rs"]
 mod modal;
 
+#[path = "window_ops.rs"]
+mod window_ops;
+pub use window_ops::{focus_window, set_window_parent};
+
 use bunny_ui::action::ActionId;
 use bunny_ui::menu::Pick;
 
@@ -523,6 +527,9 @@ fn owning_window(window: Id) -> usize {
     for _ in 0..8 {
         if window.is_null() {
             return 0;
+        }
+        if WINDOWS.with(|windows| windows.borrow().iter().any(|(live, _, _)| *live == window as usize)) {
+            return window as usize;
         }
         let parent = unsafe { msg_id(window, sel("parentWindow")) };
         if parent.is_null() {

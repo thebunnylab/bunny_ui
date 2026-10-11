@@ -29,6 +29,10 @@ use std::time::Instant;
 #[path = "accessibility.rs"]
 pub(crate) mod accessibility;
 
+#[path = "window_ops.rs"]
+mod window_ops;
+pub use window_ops::{focus_window, set_window_parent};
+
 // MARK: - libc floor (the only raw syscalls the shell needs)
 
 #[repr(C)]
@@ -275,6 +279,7 @@ enum Iface {
     Decoration,
     Pinch,
     FractionalScale,
+    ActivationToken,
     CoreSurface,
     CoreSeat,
     CoreOutput,
@@ -297,6 +302,8 @@ pub(crate) struct Protocols {
     pinch: &'static WlInterface,
     fractional_manager: &'static WlInterface,
     fractional: &'static WlInterface,
+    activation: &'static WlInterface,
+    activation_token: &'static WlInterface,
 }
 
 /// The xdg-shell message rows, transcribed from the installed
@@ -518,9 +525,10 @@ fn build_protocols() -> Protocols {
             .chain(decoration_spec())
             .chain(pointer_gestures_spec())
             .chain(fractional_scale_spec())
+            .chain(window_ops::activation_spec())
             .collect();
     // pass 1: stable homes, filled with placeholders
-    let slots: &'static mut [WlInterface; 13] = Box::leak(Box::new(std::array::from_fn(|_| {
+    let slots: &'static mut [WlInterface; 15] = Box::leak(Box::new(std::array::from_fn(|_| {
         WlInterface {
             name: c"".as_ptr(),
             version: 0,
@@ -541,6 +549,7 @@ fn build_protocols() -> Protocols {
             Iface::Decoration => unsafe { base.add(8) },
             Iface::Pinch => unsafe { base.add(10) },
             Iface::FractionalScale => unsafe { base.add(12) },
+            Iface::ActivationToken => unsafe { base.add(14) },
             Iface::CoreSurface => &raw const wl_surface_interface,
             Iface::CoreSeat => &raw const wl_seat_interface,
             Iface::CoreOutput => &raw const wl_output_interface,
@@ -592,6 +601,8 @@ fn build_protocols() -> Protocols {
         pinch: &slots[10],
         fractional_manager: &slots[11],
         fractional: &slots[12],
+        activation: &slots[13],
+        activation_token: &slots[14],
     }
 }
 
@@ -747,6 +758,7 @@ const PANEL_KIND_TOPLEVEL: usize = 3;
 /// NOTHING but this queue — state and marshalling stay outside, so a
 /// roundtrip can never re-enter a borrow.
 enum Ev {
+    ActivationDone { id: usize, token: CString },
     Global { name: u32, interface: String, version: u32 },
     GlobalRemove { name: u32 },
     Ping { serial: u32 },
@@ -757,7 +769,7 @@ enum Ev {
     /// 2 = the server.
     DecorationMode { decoration_ptr: usize, mode: u32 },
     /// The keyboard came to, or left, one of our surfaces.
-    KeyboardEnter { surface_ptr: usize },
+    KeyboardEnter { serial: u32, surface_ptr: usize },
     KeyboardLeave { surface_ptr: usize },
     /// The input method came to, or left, one of our surfaces.
     ImeEnter { surface_ptr: usize },
@@ -787,7 +799,7 @@ enum Ev {
     PreferredBufferScale { surface_ptr: usize, scale: i32 },
     /// The seat said what it has — the touch device is asked for here.
     SeatCapabilities { caps: u32 },
-    TouchDown { surface_ptr: usize, id: i32, x: f64, y: f64 },
+    TouchDown { serial: u32, surface_ptr: usize, id: i32, x: f64, y: f64 },
     TouchUp { id: i32 },
     TouchMotion { id: i32, x: f64, y: f64 },
     TouchFrame,
@@ -908,6 +920,7 @@ unsafe extern "C" fn dispatcher(
         }
         TAG_TOUCH => match opcode {
             0 => push_ev(Ev::TouchDown {
+                serial: unsafe { arg(0).u },
                 surface_ptr: unsafe { arg(2).o } as usize,
                 id: unsafe { arg(3).i },
                 x: fixed_to_f64(unsafe { arg(4).f }),
@@ -971,7 +984,7 @@ unsafe extern "C" fn dispatcher(
                 fd: unsafe { arg(1).h },
                 size: unsafe { arg(2).u },
             }),
-            1 => push_ev(Ev::KeyboardEnter { surface_ptr: unsafe { arg(1).o } as usize }),
+            1 => push_ev(Ev::KeyboardEnter { serial: unsafe { arg(0).u }, surface_ptr: unsafe { arg(1).o } as usize }),
             2 => push_ev(Ev::KeyboardLeave { surface_ptr: unsafe { arg(1).o } as usize }),
             3 => push_ev(Ev::KeyboardKey {
                 serial: unsafe { arg(0).u },
@@ -1051,6 +1064,11 @@ unsafe extern "C" fn dispatcher(
             1 => push_ev(Ev::ImeLeave { surface_ptr: unsafe { arg(0).o } as usize }),
             _ => {} // delete_surrounding(4): documented gap
         },
+        tag if tag >= window_ops::ACTIVATION_TAG_BASE => {
+            if opcode == 0 {
+                push_ev(Ev::ActivationDone { id: tag - window_ops::ACTIVATION_TAG_BASE, token: unsafe { CStr::from_ptr(arg(0).s) }.to_owned() });
+            }
+        }
         tag if tag >= PANEL_TAG_BASE => {
             let index = (tag - PANEL_TAG_BASE) >> 2;
             match tag & 0x3 {
@@ -1653,6 +1671,7 @@ impl Panel {
 }
 
 struct Client {
+    window_ops: window_ops::WindowOps,
     display: *mut Display,
     registry: *mut Proxy,
     compositor: *mut Proxy,
@@ -1962,6 +1981,7 @@ fn connect() {
         1,
         TAG_SYNC,
     );
+    let activation = bind(c"xdg_activation_v1", protocols.activation, 1, TAG_SYNC);
     assert!(!compositor.is_null(), "wl_compositor is mandatory");
     assert!(!shm.is_null(), "wl_shm is mandatory");
     assert!(!wm_base.is_null(), "xdg_wm_base is mandatory");
@@ -2087,6 +2107,7 @@ fn connect() {
 
     CLIENT.with(|slot| {
         *slot.borrow_mut() = Some(Client {
+            window_ops: window_ops::WindowOps::new(activation),
             display,
             registry,
             compositor,
@@ -2535,6 +2556,7 @@ pub fn close_top_level(window: usize) {
     crate::vk::teardown(window);
     crate::gl::teardown(window);
     with_client(|client| {
+        window_ops::retire(client, window);
         // children before the parent — the protocol's teardown law: the
         // popups first (one may hang from a dialog), then the dialogs
         for dialogs in [false, true] {
@@ -2543,7 +2565,7 @@ pub fn close_top_level(window: usize) {
                     panel.owner == window && panel.role.dialog().is_some() == dialogs
                 }) && let Some(panel) = slot.take()
                 {
-                    unsafe { teardown_panel(panel) };
+                    unsafe { teardown_panel(panel, &mut client.window_ops) };
                 }
             }
         }
@@ -2762,7 +2784,7 @@ impl WindowHandle {
                         (at != index).then(|| panel.role.reborn().map(|role| (panel.owner, role)))
                     });
                     if let Some(panel) = slot.take() {
-                        unsafe { teardown_panel(panel) };
+                        unsafe { teardown_panel(panel, &mut client.window_ops) };
                     }
                     // a hosted popup keeps its slot — the pool still
                     // holds its handle and re-presents it, parentless
@@ -2866,6 +2888,7 @@ pub fn create_dialog(
         fixed,
     };
     with_client(|client| {
+        window_ops::cancel(&mut client.window_ops, owner);
         client.panels.push(Some(Panel::new(owner, Role::Dialog(dialog))));
         WindowHandle { window: owner, panel: client.panels.len() }
     })
@@ -2878,7 +2901,8 @@ pub fn create_dialog(
 const XDG_ANCHOR_TOP_LEFT: u32 = 5;
 const XDG_GRAVITY_BOTTOM_RIGHT: u32 = 8;
 
-unsafe fn teardown_panel(panel: Panel) {
+unsafe fn teardown_panel(panel: Panel, state: &mut window_ops::WindowOps) {
+    window_ops::forget_surface(state, panel.owner, panel.surface as usize);
     unsafe {
         if !panel.popup.is_null() {
             destroy(panel.popup, 0);
@@ -2958,7 +2982,7 @@ fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height:
         if moved && let Some(role) = panel.role.reborn() {
             let owner = panel.owner;
             let dead = std::mem::replace(panel, Panel::new(owner, role));
-            unsafe { teardown_panel(dead) };
+            unsafe { teardown_panel(dead, &mut client.window_ops) };
         }
         if let Some(dialog) = panel.role.dialog_mut() {
             dialog.logical = (w, h);
@@ -3455,6 +3479,7 @@ fn present_rows(addr: usize, width: usize, height: usize, rgba: &[u8], damage: &
         win.map.on_present();
         win.presents += 1;
         client.presents += 1;
+        window_ops::restore_parents(client);
     });
 }
 
@@ -4661,6 +4686,7 @@ pub(crate) fn gpu_note_present(window: usize) {
             win.presents += 1;
         }
         client.presents += 1;
+        window_ops::restore_parents(client);
     });
 }
 
@@ -4696,6 +4722,7 @@ fn drain_protocol_events() {
             return;
         };
         match ev {
+            Ev::ActivationDone { id, token } => with_client(|client| window_ops::activate(client, id, &token)),
             Ev::Ping { serial } => with_client(|client| unsafe {
                 request(client.wm_base, 3, &mut [arg_u(serial)]);
             }),
@@ -4795,6 +4822,7 @@ fn drain_protocol_events() {
             Ev::PointerEnter { serial, surface_ptr, x, y } => {
                 let (x, y) = with_client(|client| {
                     client.serials.enter = serial;
+                    client.window_ops.input = Some((serial, surface_ptr));
                     // which of our surfaces the pointer entered decides
                     // the translation of everything that follows
                     client.pointer_focus = target_of(client, surface_ptr);
@@ -4849,6 +4877,7 @@ fn drain_protocol_events() {
             Ev::PointerButton { serial, time_ms, button, pressed } => {
                 let (x, y, focus, on) = with_client(|client| {
                     client.serials.record_button(serial, pressed);
+                    if pressed { window_ops::pointer_input(client, serial); }
                     let local = client.pointer_pos;
                     let (x, y) = translate_pointer(client, local.0, local.1);
                     let on = match client.pointer_focus {
@@ -4909,7 +4938,8 @@ fn drain_protocol_events() {
                     };
                 }
             }),
-            Ev::TouchDown { surface_ptr, id, x, y } => with_client(|client| {
+            Ev::TouchDown { serial, surface_ptr, id, x, y } => with_client(|client| {
+                client.window_ops.input = Some((serial, surface_ptr));
                 // fingers on the main window only — a panel takes none
                 if let Target::Window(owner) = target_of(client, surface_ptr) {
                     client.touch_live.push((id, x, y, owner));
@@ -5080,7 +5110,7 @@ fn drain_protocol_events() {
                     let reborn =
                         slot.as_ref().and_then(|panel| Some((panel.owner, panel.role.reborn()?)));
                     if let Some(panel) = slot.take() {
-                        unsafe { teardown_panel(panel) };
+                        unsafe { teardown_panel(panel, &mut client.window_ops) };
                     }
                     if let Some((owner, role)) = reborn {
                         *slot = Some(Panel::new(owner, role));
@@ -5214,7 +5244,9 @@ fn drain_protocol_events() {
             }
             // a dialog holding the keyboard types into its OWNER's
             // runtime — the scene the dialog is a slice of
-            Ev::KeyboardEnter { surface_ptr } => with_client(|client| {
+            Ev::KeyboardEnter { serial, surface_ptr } => with_client(|client| {
+                client.window_ops.keyboard_surface = surface_ptr;
+                client.window_ops.input = Some((serial, surface_ptr));
                 client.keyboard_focus = window_of_surface(client, surface_ptr);
             }),
             Ev::KeyboardLeave { surface_ptr } => {
@@ -5276,6 +5308,7 @@ fn drain_protocol_events() {
                 // the native event it is; the scene's road stays shut
                 let raw = with_client(|client| {
                     client.serials.record_key(serial, pressed);
+                    if pressed { client.window_ops.input = Some((serial, client.window_ops.keyboard_surface)); }
                     let keycode = key + 8;
                     crate::webview::RawKey {
                         window: client.keyboard_focus,
@@ -5607,14 +5640,15 @@ fn teardown() {
     crate::vk::teardown_all();
     crate::gl::teardown_all();
     CLIENT.with(|slot| {
-        let Some(client) = slot.borrow_mut().take() else { return };
+        let Some(mut client) = slot.borrow_mut().take() else { return };
         unsafe {
             // children before the parent — the protocol's teardown law
             for slot in client.panels {
                 if let Some(panel) = slot {
-                    teardown_panel(panel);
+                    teardown_panel(panel, &mut client.window_ops);
                 }
             }
+            window_ops::teardown(client.window_ops);
             for win in client.windows {
                 destroy_window_proxies(win);
             }
@@ -5745,7 +5779,7 @@ fn suspend_window_panels(client: &mut Client, window: usize) {
             replacement.scene_origin = panel.scene_origin;
             if let Some(old) = slot.replace(replacement) {
                 unsafe {
-                    teardown_panel(old);
+                    teardown_panel(old, &mut client.window_ops);
                 }
             }
         }
@@ -5766,6 +5800,7 @@ pub fn set_window_visibility(
     }
     with_client(|client| {
         if visibility == WindowVisibility::Hidden {
+            window_ops::unmap(&mut client.window_ops, window);
             suspend_window_panels(client, window);
         }
         let win = window_at(client, window).ok_or(WindowError::StaleWindow)?;
@@ -5816,6 +5851,9 @@ pub fn set_window_visibility(
             }
             wl_display_flush(client.display);
         }
+        // Unmapping discards native parenting. Record the absent relation now
+        // so the parent's first remapped presentation reapplies it.
+        window_ops::restore_parents(client);
         Ok(())
     })?;
     if visibility == WindowVisibility::Hidden {
