@@ -37,6 +37,8 @@ jobs:
           rustup toolchain install 1.98.1 --profile minimal --component clippy
           rustup override set 1.98.1
           rustc --version --verbose
+      - name: Native text direction regressions
+        run: cargo test -p bunny-ui-linux --locked --lib mixed_direction -- --nocapture
       - name: Native AT-SPI, X11 and Wayland, normal and paranoid
         run: bash scripts/check-linux-accessibility.sh
       - name: Linux shell, normal and paranoid

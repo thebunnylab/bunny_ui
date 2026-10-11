@@ -850,3 +850,7 @@ mod tests {
         assert!(ink(&raster) > 0, "the fallback face left ink");
     }
 }
+
+#[cfg(test)]
+#[path = "text_bidi_tests.rs"]
+mod bidi_tests;
