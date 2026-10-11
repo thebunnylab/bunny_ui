@@ -29,7 +29,7 @@ use std::time::Instant;
 #[path = "accessibility_bus.rs"]
 mod bus;
 #[path = "appearance.rs"]
-pub(super) mod appearance;
+pub mod appearance;
 
 #[path = "accessibility.rs"]
 pub(crate) mod accessibility;

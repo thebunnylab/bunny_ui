@@ -348,6 +348,6 @@ visible pixels, or observation of a system-settings interaction.
 The Linux `system_appearance` fixture uses an isolated fake portal on a real
 session bus, native X11/Wayland windows and normal/paranoid runs in
 `scripts/check-linux-accessibility.sh`. It checks initial/live values, explicit
-palette ownership, malformed/unrelated signals, service loss/reacquisition and
+palette ownership, malformed/unrelated signals, service loss/reacquisition, session-bus disconnect and
 surviving windows. This verifies protocol integration and scene evaluation,
 not an actual desktop settings panel, physical input or presented pixels.

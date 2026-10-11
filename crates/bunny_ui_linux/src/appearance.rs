@@ -210,6 +210,7 @@ pub fn pump() {
             return None;
         };
         if !monitor.connection.pump() {
+            eprintln!("bunny_ui_linux: portal session bus disconnected");
             *slot = Some(Err("session bus disconnected".into()));
             return None;
         }

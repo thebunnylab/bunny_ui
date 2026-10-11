@@ -1,5 +1,6 @@
 """Isolated Settings protocol fixture; never connects to a user's portal."""
 import os
+import signal
 from gi.repository import Gio, GLib
 
 BUS = 'org.freedesktop.portal.Desktop'
@@ -40,6 +41,10 @@ def handle(conn, sender, path, interface, method, parameters, invocation):
     elif mode == 'acquire':
         value = number
         assert name_call('RequestName', '(su)', (BUS, 0)).unpack() == (1,)
+    elif mode == 'disconnect':
+        # This fixture is launched inside its own nested dbus-run-session.
+        pid = name_call('GetConnectionUnixProcessID', '(s)', ('org.freedesktop.DBus',)).unpack()[0]
+        GLib.timeout_add(100, lambda: os.kill(pid, signal.SIGTERM))
     else:
         if mode == 'set':
             value = number

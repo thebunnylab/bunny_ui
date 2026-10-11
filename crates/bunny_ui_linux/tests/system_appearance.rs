@@ -199,6 +199,27 @@ mod native {
             until("survivors", &surviving, initial).await;
             portal.control("set", 0);
             until("no-preference", &surviving, absent).await;
+            theme::install(custom);
+            portal.control("set", 1);
+            until(
+                "before-disconnect",
+                &surviving,
+                Seen {
+                    appearance: Some(Appearance::Dark),
+                    palette: custom,
+                },
+            )
+            .await;
+            portal.control("disconnect", 0);
+            until(
+                "bus-disconnected",
+                &surviving,
+                Seen {
+                    appearance: None,
+                    palette: custom,
+                },
+            )
+            .await;
             println!(
                 "PORTAL_APPEARANCE passed backend={} physical_input=false",
                 bunny_ui_linux::drive::backend()
@@ -215,7 +236,19 @@ mod native {
 fn main() {
     #[cfg(target_os = "linux")]
     if std::env::var_os("BUNNY_PORTAL_APPEARANCE_PROBE").is_some() {
-        native::run();
+        if std::env::args().any(|arg| arg == "--portal-child") {
+            native::run();
+        } else {
+            // Each fixture owns its bus; the disconnect case must never stop
+            // the enclosing test suite's session or a desktop session bus.
+            let result = std::process::Command::new("dbus-run-session")
+                .arg("--")
+                .arg(std::env::current_exe().unwrap())
+                .arg("--portal-child")
+                .status()
+                .unwrap();
+            assert!(result.success(), "isolated portal fixture failed: {result}");
+        }
         return;
     }
     println!(
