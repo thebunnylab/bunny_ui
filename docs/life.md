@@ -324,9 +324,19 @@ prevent the application observer from delivering changes. Windows reports
 its initial registry preference and refreshes it on
 [`WM_SETTINGCHANGE`](https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-settingchange).
 iOS trait and Android configuration events use the same ownership policy.
-Linux reports the initial portal preference; **live Linux portal changes are
-not wired yet**. Shells without an appearance adapter leave the observation
-unavailable. No polling or new runtime dependency is involved.
+Linux subscribes before reading the initial portal preference and receives
+[`Settings.SettingChanged`](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Settings.html)
+through the X11 and Wayland event loops. The UI thread owns one private session
+connection and polls libdbus-provided watches, including outgoing readiness.
+Messages must match the current portal owner, object, interface, key and type.
+No preference and unknown numeric schemes become `None`; malformed or unrelated
+signals do not replace a valid observation. Portal owner loss clears the value;
+reacquisition reads the new owner's current value with a bounded request.
+An installed portal can activate on the initial Read. A missing or disconnected
+session bus remains unavailable until process restart. Native scenes receive
+changes outside bus and display borrows. No settings timer, background thread
+or new runtime dependency is involved. Shells without an appearance adapter
+leave the observation unavailable.
 
 `cargo test -p bunny-ui-core --test system_appearance --all-features` covers
 palette ownership and retained scenes. `cargo test -p bunny-ui-macos --test
@@ -334,3 +344,10 @@ system_appearance` changes only the test process's application appearance and
 checks native callback delivery, later windows and teardown of the first window.
 It does not change the user's system preferences or claim physical input,
 visible pixels, or observation of a system-settings interaction.
+
+The Linux `system_appearance` fixture uses an isolated fake portal on a real
+session bus, native X11/Wayland windows and normal/paranoid runs in
+`scripts/check-linux-accessibility.sh`. It checks initial/live values, explicit
+palette ownership, malformed/unrelated signals, service loss/reacquisition, session-bus disconnect and
+surviving windows. This verifies protocol integration and scene evaluation,
+not an actual desktop settings panel, physical input or presented pixels.

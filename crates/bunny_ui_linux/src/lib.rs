@@ -313,6 +313,9 @@ impl AppInner {
                 }
                 return;
             }
+            if let AppEvent::AppearanceChanged(value) = event {
+                bunny_ui::theme::observe_system_appearance(value);
+            }
             let source = ffi::event_source();
             let closing = matches!(event, AppEvent::WindowClosed);
             for slot in app.live() {
@@ -772,10 +775,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // raster on refusal — and the window is still unmapped, so the
     // first frame (whichever road) IS the reveal
     ffi::install_gpu(&window);
-    // Initial portal observation. Live SettingChanged delivery remains unwired.
-    bunny_ui::theme::observe_system_appearance(
-        ffi::os_prefers_dark().map(bunny_ui::theme::Appearance::from_dark),
-    );
+    ffi::appearance::install();
     runtime.set_reduce_motion(!ffi::animations_enabled());
     // the environment's languages reach the scene before its first
     // frame; a locale the app pinned (`App::set_locale`) stands over
@@ -1446,6 +1446,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // was already on screen, dozens of times a second, at rest. A
             // change the engine cannot see asks by hand
             // (`bunny_ui::request_frame`).
+            AppEvent::AppearanceChanged(_) => {
+                if runtime.needs_frame() { soon(runtime, root, ORIGIN_WAKE); }
+            }
             AppEvent::Wake => {
                 runtime.poll_tasks();
                 if runtime.needs_frame() || webview::fresh(window.raw_window()) {
