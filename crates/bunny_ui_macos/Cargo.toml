@@ -61,3 +61,7 @@ harness = false
 [[test]]
 name = "window_startup"
 harness = false
+
+[[test]]
+name = "dialog_geometry"
+harness = false

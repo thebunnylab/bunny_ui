@@ -21,6 +21,8 @@ use crate::action::{
     ALERT_CANCEL, ALERT_CONTEXT, ALERT_DEFAULT, ActionId, KeyPattern, OVERLAY_CONTEXT,
     OVERLAY_DISMISS,
 };
+mod dialog_geometry;
+
 use crate::effects;
 use crate::menu::{Edit, Pick};
 use crate::layout::{
@@ -475,6 +477,7 @@ pub struct Runtime {
     /// reopening lands where the reader left the window (the session's
     /// memory — a fresh runtime starts centered again).
     dialog_frames: RefCell<HashMap<String, Rect>>,
+    dialog_geometry: dialog_geometry::Registry,
     /// The alerts the last layout placed, by overlay path. An alert's
     /// window reports its travels into `dialog_frames` like a dialog's,
     /// but an alert remembers no spot: the pass it closes, its entry
@@ -1597,6 +1600,7 @@ impl Runtime {
             last_thumbs: RefCell::new(Vec::new()),
             overlay_bounds: Cell::new(None),
             dialog_frames: RefCell::new(HashMap::default()),
+            dialog_geometry: dialog_geometry::Registry::default(),
             open_alerts: RefCell::new(Vec::new()),
             device_scale: Cell::new(1.0),
             safe_area: Cell::new(crate::layout::Edges::ZERO),
@@ -5174,6 +5178,12 @@ impl Runtime {
         });
         drop(boxes);
         drop(dom);
+        self.dialog_geometry.sync(
+            output
+                .dialogs
+                .iter()
+                .map(|(path, controller)| (path.as_str(), controller)),
+        );
         self.seed_island_boxes(&output.scene, &output.islands_walked);
         *self.dom_customs.borrow_mut() = output.customs.clone();
         drop(offsets);
@@ -7187,6 +7197,16 @@ impl Runtime {
         self.last_hosts.borrow_mut().clone_from(&result.hosts);
         self.last_overlays.borrow_mut().clone_from(&result.overlays);
         self.forget_answered_alerts(&result.overlays);
+        self.dialog_geometry
+            .sync(result.overlays.iter().filter_map(|overlay| {
+                if let crate::layout::OverlaySurface::Window(spec) = &overlay.surface {
+                    spec.geometry
+                        .as_ref()
+                        .map(|controller| (overlay.path.as_str(), controller))
+                } else {
+                    None
+                }
+            }));
         self.last_tooltips.borrow_mut().clone_from(&result.tooltips);
         self.last_menus.borrow_mut().clone_from(&result.menus);
         self.last_drag_sources.borrow_mut().clone_from(&result.drag_sources);

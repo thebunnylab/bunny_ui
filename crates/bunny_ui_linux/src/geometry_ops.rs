@@ -11,8 +11,18 @@ use std::{
 
 thread_local! {
     static SOURCES: RefCell<HashMap<usize, Rc<GeometryEvents>>> = RefCell::new(HashMap::new());
-    static PENDING: RefCell<VecDeque<(usize, bunny_ui::window::GeometryObservation)>> = const { RefCell::new(VecDeque::new()) };
+    static PENDING: RefCell<VecDeque<(usize, AppEvent)>> = const { RefCell::new(VecDeque::new()) };
     static DELIVERING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Defers dialog facts past all native and renderer borrows.
+pub fn queue_dialog_geometry(event: bunny_ui::window::DialogGeometryObservation) {
+    PENDING.with(|pending| {
+        pending
+            .borrow_mut()
+            .push_back((0, AppEvent::DialogGeometryChanged(event)));
+    });
+    super::wake_from_any_thread();
 }
 
 /// Registers the lifetime before native observations can reach the application.
@@ -29,12 +39,13 @@ pub fn forget_geometry(window: usize, id: WindowId) {
             .is_some_and(|events| events.id() == id)
         {
             sources.borrow_mut().remove(&window);
+            super::dialog_geometry_ops::forget_parent(window);
         }
     });
     PENDING.with(|pending| {
         pending
             .borrow_mut()
-            .retain(|(_, observation)| observation.id() != id);
+            .retain(|(_, event)| !matches!(event, AppEvent::GeometryChanged(observation) if observation.id() == id));
     });
 }
 
@@ -59,7 +70,11 @@ pub(super) fn notify(window: usize) {
         && let Ok(value) = window_geometry(window)
         && let Some(observation) = events.capture(value)
     {
-        PENDING.with(|pending| pending.borrow_mut().push_back((window, observation)));
+        PENDING.with(|pending| {
+            pending
+                .borrow_mut()
+                .push_back((window, AppEvent::GeometryChanged(observation)));
+        });
         drain();
     }
 }
@@ -80,10 +95,10 @@ pub(super) fn drain() {
     let _delivery = Delivery;
     loop {
         let next = PENDING.with(|pending| pending.borrow_mut().pop_front());
-        let Some((window, observation)) = next else {
+        let Some((window, event)) = next else {
             break;
         };
-        dispatch_at(window, AppEvent::GeometryChanged(observation));
+        dispatch_at(window, event);
     }
 }
 

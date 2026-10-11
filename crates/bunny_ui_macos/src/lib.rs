@@ -634,6 +634,7 @@ impl App {
         // notification does NOT re-enter the scene: this is usually
         // called from inside the handler of the very window that asked
         if let Some(slot) = self.slot(id) {
+            slot.runtime.retire_dialog_geometry();
             slot.lifecycle.geometry_events().retire();
             ffi::forget_geometry(slot.window, id);
             ffi::lend_hand(|| ffi::close_top_level(slot.window));
@@ -825,6 +826,10 @@ impl AppInner {
         }));
         let app = Rc::clone(&self);
         ffi::set_handler(Box::new(move |event| {
+            if let AppEvent::DialogGeometryChanged(observation) = event {
+                observation.deliver();
+                return;
+            }
             if let AppEvent::GeometryChanged(observation) = event {
                 if let Some(slot) = app.live().into_iter().find(|slot| slot.lifecycle.id() == observation.id()) {
                     slot.lifecycle.geometry_events().observe_captured(&observation);
@@ -907,7 +912,13 @@ impl AppInner {
 
     /// Drops the slot of a window that has gone.
     fn buried(&self, window: usize) {
-        if let Some(slot) = self.slots.borrow().iter().find(|slot| slot.window == window) {
+        if let Some(slot) = self
+            .slots
+            .borrow()
+            .iter()
+            .find(|slot| slot.window == window)
+        {
+            slot.runtime.retire_dialog_geometry();
             slot.lifecycle.geometry_events().retire();
             ffi::forget_geometry(slot.window, slot.lifecycle.id());
             self.relationships.retire(slot.lifecycle.id());
@@ -987,6 +998,7 @@ const fn cg_size(size: Size) -> ffi::CGSize {
 }
 
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
+    runtime.set_dialog_geometry_dispatch(ffi::queue_dialog_geometry);
     let lifecycle = Rc::new(Lifecycle::default());
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
@@ -1322,6 +1334,19 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                                 focus_dialog = true;
                             }
                         });
+                        if dialog.bind_dialog_geometry(
+                            &window,
+                            runtime.dialog_geometry_session(&overlay.path),
+                        ) {
+                            let (x, y, width, height) = dialog.content_rect_in_layout(&window);
+                            runtime.set_dialog_frame(
+                                &overlay.path,
+                                bunny_ui::layout::Rect {
+                                    origin: bunny_ui::layout::Point { x, y },
+                                    size: Size { width, height },
+                                },
+                            );
+                        }
                         dialog.set_scene_origin(x, y);
                         if opening {
                             // the hover painted at open time froze over
@@ -2247,7 +2272,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 blit(runtime, root, trace::Origin::Input);
             }
         }
-        AppEvent::GeometryChanged(_) => return,
+        AppEvent::GeometryChanged(_) | AppEvent::DialogGeometryChanged(_) => return,
         AppEvent::Redraw => blit(runtime, root, trace::Origin::Redraw),
         // the Redraw that follows presents it
         AppEvent::WindowState { maximized } => {
@@ -2261,6 +2286,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
         }
         AppEvent::WindowClosed => {
+            runtime.retire_dialog_geometry();
             // Nothing to take down by hand: the popover panels and the
             // dialogs are CHILDREN of this window and AppKit closes
             // them with it, and the slot the app drops right after this

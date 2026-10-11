@@ -42,7 +42,8 @@ mod window_ops;
 pub use window_ops::{focus_window, set_window_parent};
 #[path = "x11_geometry_ops.rs"]
 mod geometry_ops;
-pub use geometry_ops::{window_geometry, restore_window_placement};
+pub use geometry_ops::{dialog_geometry, restore_dialog_placement};
+pub use geometry_ops::{restore_window_placement, window_geometry};
 
 // MARK: - libc floor additions (SysV shared memory + free — the
 // wayland door never needed either; the rest borrows ffi's floor)
@@ -3148,10 +3149,15 @@ fn interpret(event: *mut GenericEvent) -> Step {
                     dialog.granted = Some(granted);
                     dialog.asked = (width as usize, height as usize);
                 }
-                Some((owner, changed))
+                Some((index, owner, changed))
             });
-            if let Some((owner, changed)) = dialog {
-                return if changed { Step::Deliver(owner, AppEvent::Redraw) } else { Step::Silence };
+            if let Some((index, owner, changed)) = dialog {
+                crate::ffi::notify_dialog_geometry(index);
+                return if changed {
+                    Step::Deliver(owner, AppEvent::Redraw)
+                } else {
+                    Step::Silence
+                };
             }
             let resized = with_x(|client| {
                 let Some(win) = window_at(client, window) else { return false };

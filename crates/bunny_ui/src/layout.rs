@@ -3243,8 +3243,8 @@ pub struct ScrollRegion {
 pub enum OverlaySurface {
     /// The in-scene layer — the road every popover and sheet rides.
     Layer,
-    /// A real titled window, wearing the spec.
-    Window(DialogSpec),
+    /// A real titled window. Its rare spec is shared to keep every retained node small.
+    Window(Rc<DialogSpec>),
     /// A real window with an alert's manners, wearing the spec.
     Alert(AlertSpec),
 }
@@ -3290,6 +3290,8 @@ pub struct DialogSpec {
     /// the floor.
     pub open: Option<Size>,
     pub chrome: DialogChrome,
+    /// Optional native placement restoration and observation, owned by the app.
+    pub geometry: Option<crate::window::DialogGeometry>,
 }
 
 impl DialogSpec {
@@ -3301,6 +3303,7 @@ impl DialogSpec {
             min: Size { width: 320.0, height: 240.0 },
             open: None,
             chrome: DialogChrome::Native,
+            geometry: None,
         }
     }
 
@@ -3316,6 +3319,14 @@ impl DialogSpec {
     /// under the floor opens at the floor.
     pub fn opens_at(mut self, width: Px, height: Px) -> Self {
         self.open = Some(Size { width, height });
+        self
+    }
+
+    /// Restores and observes native content placement through a persistent controller.
+    /// Layout-local frames are not global desktop coordinates.
+    #[must_use]
+    pub fn geometry(mut self, geometry: crate::window::DialogGeometry) -> Self {
+        self.geometry = Some(geometry);
         self
     }
 
@@ -3946,6 +3957,26 @@ pub struct Placement {
 }
 
 impl Placement {
+    /// Controllers declared inside an exact DOM subtree or canvas island.
+    pub(crate) fn dialog_geometry(
+        &self,
+    ) -> impl Iterator<Item = (&str, &crate::window::DialogGeometry)> {
+        self.overlay_queue
+            .iter()
+            .map(|overlay| (overlay.path.as_str(), &overlay.surface))
+            .chain(
+                self.overlays
+                    .iter()
+                    .map(|overlay| (overlay.path.as_str(), &overlay.surface)),
+            )
+            .filter_map(|(path, surface)| match surface {
+                OverlaySurface::Window(spec) => {
+                    spec.geometry.as_ref().map(|controller| (path, controller))
+                }
+                _ => None,
+            })
+    }
+
     fn accessible_bounds(&self, frame: Rect) -> Option<Rect> {
         let frame = match self.accessibility_viewport {
             Some(viewport) => frame.intersection(viewport)?,

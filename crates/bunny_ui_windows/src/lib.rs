@@ -348,6 +348,7 @@ impl App {
     pub fn close(&self, id: WindowId) {
         self.close_children(id);
         if let Some(slot) = self.slot(id) {
+            slot.runtime.retire_dialog_geometry();
             slot.lifecycle.geometry_events().retire();
             ffi::forget_geometry(slot.window, id);
             ffi::close_top_level(slot.window);
@@ -542,6 +543,10 @@ impl AppInner {
         }));
         let app = Rc::clone(&self);
         ffi::set_handler(Box::new(move |event| {
+            if let AppEvent::DialogGeometryChanged(observation) = event {
+                observation.deliver();
+                return;
+            }
             if let AppEvent::GeometryChanged(observation) = event {
                 if let Some(slot) = app.live().into_iter().find(|slot| slot.lifecycle.id() == observation.id()) {
                     slot.lifecycle.geometry_events().observe_captured(&observation);
@@ -611,7 +616,13 @@ impl AppInner {
 
     /// Drops the slot of a window that has gone.
     fn buried(&self, window: usize) {
-        if let Some(slot) = self.slots.borrow().iter().find(|slot| slot.window == window) {
+        if let Some(slot) = self
+            .slots
+            .borrow()
+            .iter()
+            .find(|slot| slot.window == window)
+        {
+            slot.runtime.retire_dialog_geometry();
             slot.lifecycle.geometry_events().retire();
             ffi::forget_geometry(slot.window, slot.lifecycle.id());
             self.relationships.retire(slot.lifecycle.id());
@@ -644,6 +655,7 @@ pub fn run_window_chrome(
 /// long as it does — the frame path, the pools, the gates and the event
 /// handler — into a slot the [`App`] holds and routes to.
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
+    runtime.set_dialog_geometry_dispatch(ffi::queue_dialog_geometry);
     let lifecycle = Rc::new(Lifecycle::default());
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
@@ -1010,6 +1022,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                             );
                         }
                     }
+                    dialog.bind_dialog_geometry(
+                        window,
+                        runtime.dialog_geometry_session(&overlay.path),
+                    );
                     // layout follows the real window: the frame the reader
                     // left it at is what the next pass lays out against
                     let (rx, ry, rw, rh) = dialog.screen_rect_to_layout(dialog.client_rect_screen());
@@ -1525,8 +1541,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // holding it back leaves the compositor stretching a stale
             // frame. A worker's wake mid-drag polls on the next turn
             // instead of racing the one presenter (the mac's law).
-            AppEvent::GeometryChanged(_) => return,
-        AppEvent::Redraw => blit(runtime, root),
+            AppEvent::GeometryChanged(_) | AppEvent::DialogGeometryChanged(_) => return,
+            AppEvent::Redraw => blit(runtime, root),
             // the Redraw that follows presents it
             AppEvent::WindowState { maximized } => {
                 let _ = runtime.set_window_state(bunny_ui::prelude::WindowState { maximized });
@@ -1734,7 +1750,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
             // the app buries the slot by the source; the window itself
             // has nothing left to draw
-            AppEvent::WindowClosed => {}
+            AppEvent::WindowClosed => runtime.retire_dialog_geometry(),
         }
         // A hidden scene can dirty state and then await another timer. Keep the
         // task clock armed even when that turn deliberately skips presentation.

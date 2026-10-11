@@ -23,7 +23,10 @@ mod window_ops;
 pub use window_ops::{focus_window, set_window_parent};
 #[path = "geometry_ops.rs"]
 mod geometry_ops;
-pub use geometry_ops::{register_geometry, forget_geometry, window_geometry, restore_window_placement};
+pub use geometry_ops::{
+    forget_geometry, queue_dialog_geometry, register_geometry, restore_window_placement,
+    window_geometry,
+};
 
 // MARK: - Win32 ABI surface (the platform headers, transcribed)
 
@@ -658,6 +661,8 @@ pub(crate) fn com_init() {
 pub enum AppEvent {
     /// Captured native geometry addressed to its non-recycled scene lifetime.
     GeometryChanged(bunny_ui::window::GeometryObservation),
+    /// Captured dialog geometry, bound to its current presentation.
+    DialogGeometryChanged(bunny_ui::window::DialogGeometryObservation),
     /// First UIA query enables semantic collection.
     AccessibilityEnable,
     /// A validated COM request returns to the scene thread.
@@ -1516,8 +1521,13 @@ fn unregister_top_level(hwnd: Hwnd) -> usize {
             }
         }
     }
-    if driver().hwnd.load(Ordering::Acquire) == hwnd {
-        driver().hwnd.store(heir, Ordering::Release);
+    let clock = driver();
+    // Posting and handing the clock to another window share this lock. A tick
+    // queued to the dying HWND will never acknowledge its in-flight latch.
+    let _running = clock.running.lock().expect("driver lock");
+    if clock.hwnd.load(Ordering::Acquire) == hwnd {
+        clock.hwnd.store(heir, Ordering::Release);
+        clock.in_flight.store(false, Ordering::Release);
         // the slow beat is the driver's too, and moves house with it
         if let Some(step) = SLOW_STEP.with(Cell::get)
             && heir != 0
@@ -1914,10 +1924,15 @@ fn driver() -> &'static Driver {
                 if unsafe { DwmFlush() } < 0 {
                     std::thread::sleep(std::time::Duration::from_millis(16));
                 }
-                let hwnd = shared.hwnd.load(Ordering::Acquire);
-                if hwnd != 0 && !shared.in_flight.swap(true, Ordering::AcqRel) {
-                    unsafe {
-                        PostMessageW(hwnd, WM_APP_FRAME, 0, 0);
+                // Serialize the address/latch/post with window handoff, so a
+                // tick for the retired window cannot strand the new owner.
+                let running = shared.running.lock().expect("driver lock");
+                if *running {
+                    let hwnd = shared.hwnd.load(Ordering::Acquire);
+                    if hwnd != 0 && !shared.in_flight.swap(true, Ordering::AcqRel)
+                        && unsafe { PostMessageW(hwnd, WM_APP_FRAME, 0, 0) } == 0
+                    {
+                        shared.in_flight.store(false, Ordering::Release);
                     }
                 }
             }
@@ -2179,6 +2194,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             // it, and a dispatch would re-enter the handler running it.
             if is_dialog(hwnd) {
                 refresh_metrics(hwnd);
+                geometry_ops::notify_dialog(hwnd);
                 ask_represent(owner_of(hwnd));
                 return 0;
             }
@@ -2198,7 +2214,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_DPICHANGED => {
-            if !is_top_level(hwnd) {
+            if !is_top_level(hwnd) && !is_dialog(hwnd) {
                 // layered panels are raw screen pixels — the owner's
                 // funnel rescales them on its next present
                 return 0;
@@ -2222,7 +2238,11 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             }
             refresh_metrics(hwnd);
             geometry_ops::notify(hwnd);
-            dispatch_at(hwnd, AppEvent::Redraw);
+            if is_dialog(hwnd) {
+                ask_represent(owner_of(hwnd));
+            } else {
+                dispatch_at(hwnd, AppEvent::Redraw);
+            }
             0
         }
         WM_PAINT => {
@@ -2708,6 +2728,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
         }
         WM_APP_WAKE => {
             dispatch(AppEvent::Wake);
+            geometry_ops::drain_dialogs();
             0
         }
         WM_APP_REPRESENT => {
@@ -2821,6 +2842,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_DESTROY => {
+            geometry_ops::forget_dialog(hwnd);
             accessibility::destroy(hwnd);
             BACKING.with(|stores| {
                 if let Some(mut backing) = stores.borrow_mut().remove(&hwnd) {
@@ -3137,6 +3159,15 @@ pub struct WindowHandle {
 }
 
 impl WindowHandle {
+    /// Binds a native dialog to its runtime-owned presentation lease.
+    pub fn bind_dialog_geometry(
+        &self,
+        parent: Self,
+        session: Option<std::rc::Rc<bunny_ui::window::DialogGeometrySession>>,
+    ) {
+        geometry_ops::bind_dialog(self.hwnd, parent.hwnd, session);
+    }
+
     /// The window as an address — what an event's source is compared
     /// against, and the app's own handle for it.
     pub fn raw_window(&self) -> usize {

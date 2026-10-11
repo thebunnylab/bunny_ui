@@ -225,6 +225,8 @@ unsafe extern "C" {
 pub enum AppEvent {
     /// Captured native geometry addressed to its non-recycled scene lifetime.
     GeometryChanged(bunny_ui::window::GeometryObservation),
+    /// A native dialog fact scoped to its current presentation and subscription.
+    DialogGeometryChanged(bunny_ui::window::DialogGeometryObservation),
     /// A native assistive-technology client first queried this window.
     AccessibilityEnable,
     /// A validated native element requests an action on its retained control.
@@ -559,6 +561,16 @@ pub fn dispatch_to(window: Id, event: AppEvent) {
 /// worker's wake. The app fans it out.
 pub fn dispatch_all(event: AppEvent) {
     dispatch_from(0, event);
+}
+
+/// Preserve dialog facts even during `lend_hand`; callbacks run on a later dispatch.
+pub fn queue_dialog_geometry(event: bunny_ui::window::DialogGeometryObservation) {
+    PENDING.with(|queue| {
+        queue
+            .borrow_mut()
+            .push_back((0, AppEvent::DialogGeometryChanged(event)));
+    });
+    wake_from_any_thread();
 }
 
 fn dispatch_from(source: usize, event: AppEvent) {
@@ -1717,6 +1729,7 @@ extern "C" fn bunny_dialog_should_close(_this: Id, _sel: Sel, sender: Id) -> Obj
 /// dialog's content inside it.
 extern "C" fn bunny_dialog_frame_changed(_this: Id, _sel: Sel, note: Id) {
     let window = unsafe { msg_id(note, sel("object")) };
+    geometry_ops::notify_dialog(window as usize);
     place_traffic_lights(window);
     dispatch_to(window, AppEvent::Redraw);
 }
@@ -2457,6 +2470,12 @@ unsafe fn register_classes() {
             bunny_dialog_frame_changed as *const c_void,
             types.as_ptr(),
         );
+        class_addMethod(
+            dialog,
+            sel("windowDidChangeBackingProperties:"),
+            bunny_dialog_frame_changed as *const c_void,
+            types.as_ptr(),
+        );
         // the drag's two ends: the presenter's contract goes on before
         // the first resized frame and comes off with the exact final one
         class_addMethod(
@@ -2498,6 +2517,20 @@ pub struct WindowHandle {
 }
 
 impl WindowHandle {
+    /// Binds this native dialog to one runtime-owned presentation.
+    pub fn bind_dialog_geometry(
+        &self,
+        parent: &Self,
+        session: Option<std::rc::Rc<bunny_ui::window::DialogGeometrySession>>,
+    ) -> bool {
+        geometry_ops::bind_dialog(
+            self.window as usize,
+            self.view,
+            parent.window as usize,
+            session,
+        )
+    }
+
     /// The content view — the key a grafted presenter is filed under.
     pub(crate) fn view(&self) -> Id {
         self.view

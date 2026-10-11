@@ -1150,7 +1150,7 @@ fn apply(
                     path: path.clone(),
                     content: Rc::new(wrap_layout(dialog_layouts.clone())),
                     child: Box::new(base),
-                    surface: crate::layout::OverlaySurface::Window((**spec).clone()),
+                    surface: crate::layout::OverlaySurface::Window(Rc::new((**spec).clone())),
                 }),
                 None => out.wrap_layout_from(mark, |base| LayoutNode::Layered {
                     align: CrossAlign::Center,
