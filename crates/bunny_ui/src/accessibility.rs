@@ -6,7 +6,7 @@
 //! and control roles. Actions return through the runtime's existing input
 //! paths. Collection is demand driven and schedules no timer.
 //!
-//! This first projection covers text, buttons and editable fields. It is not
+//! This projection covers text, buttons, checkboxes and editable fields. It is not
 //! a native accessibility adapter: custom controls, virtualized offscreen
 //! navigation and platform protocols need their own integration.
 
@@ -35,6 +35,8 @@ pub enum Role {
     Text,
     /// A control with a press action.
     Button,
+    /// A two-state control with a toggle action.
+    Checkbox,
     /// An editable text value.
     TextField,
     /// An editable secret whose value is never exported.
@@ -44,9 +46,9 @@ pub enum Role {
 /// A request from assistive technology to a real control.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// Invoke a button's existing callback.
+    /// Invoke a button or toggle a checkbox through its existing callback.
     Activate,
-    /// Give the keyboard to an editable field.
+    /// Give the keyboard to a focusable control.
     Focus,
     /// Replace a field's whole value using its existing editing path.
     SetText(String),
@@ -87,8 +89,12 @@ pub struct Node {
     /// Overlay identity when this node belongs to a separate native surface.
     /// `None` identifies the main content view. Bounds remain in root layout coordinates.
     pub surface: Option<Rc<str>>,
-    /// Whether this field currently owns keyboard focus.
+    /// Whether this control currently owns keyboard focus.
     pub focused: bool,
+    /// Whether the control can be operated.
+    pub enabled: bool,
+    /// The checkbox's value; absent for other roles.
+    pub checked: Option<bool>,
     /// Whether a text field accepts multiple lines.
     pub multiline: bool,
     pub(crate) path: Rc<str>,
@@ -97,9 +103,9 @@ pub struct Node {
 impl Node {
     /// Whether this role supports an action. Availability is rechecked on use.
     pub fn supports(&self, action: &Action) -> bool {
-        matches!(
+        self.enabled && matches!(
             (self.role, action),
-            (Role::Button, Action::Activate)
+            (Role::Button | Role::Checkbox, Action::Activate | Action::Focus)
                 | (
                     Role::TextField | Role::PasswordField,
                     Action::Focus | Action::SetText(_)
@@ -132,6 +138,8 @@ pub enum Semantics {
     Text { path: Rc<str>, content: TextSource },
     /// A button whose default name comes from its text descendants.
     Button { path: Rc<str> },
+    /// Built-in button or checkbox state. A checked value identifies a checkbox.
+    Control { path: Rc<str>, enabled: bool, checked: Option<bool> },
     /// Overrides the name when exactly one semantic element is below it.
     Label(TextSource),
     /// Excludes decorative descendants from assistive technology.
@@ -140,6 +148,8 @@ pub enum Semantics {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Placed {
+    pub enabled: bool,
+    pub checked: Option<bool>,
     pub path: Rc<str>,
     pub role: Role,
     pub label: Arc<str>,
@@ -168,6 +178,7 @@ impl Semantics {
             }
             Self::Text { path, content } => {
                 nodes.push(Placed {
+                    enabled: true, checked: None,
                     path: Rc::clone(path),
                     role: Role::Text,
                     label: content.get(),
@@ -177,7 +188,11 @@ impl Semantics {
                     multiline: false,
                 });
             }
-            Self::Button { path } => {
+            Self::Button { path } | Self::Control { path, .. } => {
+                let (enabled, checked) = match self {
+                    Self::Control { enabled, checked, .. } => (*enabled, *checked),
+                    _ => (true, None),
+                };
                 let label = match &nodes[start..] {
                     [only] => Arc::clone(&only.label),
                     many => many
@@ -191,8 +206,9 @@ impl Semantics {
                 nodes.truncate(start);
                 {
                     nodes.push(Placed {
+                        enabled, checked,
                         path: Rc::clone(path),
-                        role: Role::Button,
+                        role: if checked.is_some() { Role::Checkbox } else { Role::Button },
                         label,
                         value: None,
                         bounds,
@@ -247,6 +263,8 @@ impl State {
                         })
                     });
                 Some(Node {
+                    enabled: placed.enabled,
+                    checked: placed.checked,
                     id,
                     path: Rc::clone(&placed.path),
                     role: placed.role,
@@ -265,7 +283,7 @@ impl State {
     pub fn snapshot(&self, focused: Option<&str>) -> Tree {
         let mut tree = self.tree.clone();
         for node in &mut tree.nodes {
-            node.focused = matches!(node.role, Role::TextField | Role::PasswordField)
+            node.focused = node.supports(&Action::Focus)
                 && focused == Some(node.path.as_ref());
         }
         tree
