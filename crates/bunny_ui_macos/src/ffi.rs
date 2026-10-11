@@ -41,6 +41,16 @@ pub(crate) use bunny_ui_apple::ffi::{
 mod accessibility;
 pub(crate) use accessibility::Accessibility;
 
+#[path = "modal.rs"]
+mod modal;
+
+#[path = "window_ops.rs"]
+mod window_ops;
+pub use window_ops::{focus_window, set_window_parent};
+#[path = "geometry_ops.rs"]
+mod geometry_ops;
+pub use geometry_ops::{register_geometry, forget_geometry, window_geometry, restore_window_placement};
+
 use bunny_ui::action::ActionId;
 use bunny_ui::menu::Pick;
 
@@ -208,6 +218,8 @@ unsafe extern "C" {
 /// display-link tick reaches every window that wants it.
 #[derive(Clone)]
 pub enum AppEvent {
+    /// Captured native geometry addressed to its non-recycled scene lifetime.
+    GeometryChanged(bunny_ui::window::GeometryObservation),
     /// A native assistive-technology client first queried this window.
     AccessibilityEnable,
     /// A validated native element requests an action on its retained control.
@@ -381,6 +393,7 @@ impl Default for Manners {
 /// which is to say on the very next frame. That crash is what this
 /// function exists to have already prevented.
 fn forget_window(window: usize) {
+    update_modal_scopes(|scopes| scopes.forget(window));
     // a window that closed wants no beat
     BEAT_WANTS.with(|wants| wants.borrow_mut().retain(|(open, _)| *open != window));
     let blinking = BLINK_WANTS.with(|wants| wants.borrow_mut().remove(window));
@@ -520,6 +533,9 @@ fn owning_window(window: Id) -> usize {
         if window.is_null() {
             return 0;
         }
+        if WINDOWS.with(|windows| windows.borrow().iter().any(|(live, _, _)| *live == window as usize)) {
+            return window as usize;
+        }
         let parent = unsafe { msg_id(window, sel("parentWindow")) };
         if parent.is_null() {
             return window as usize;
@@ -577,6 +593,27 @@ fn dispatch_from(source: usize, event: AppEvent) {
         let Some((source, event)) = next else { break };
         dispatch_from(source, event);
     }
+}
+
+/// Native placement can synchronously notify while `AppKit` still uses its frame.
+/// Preserve those facts and let user callbacks run after the operation returns.
+pub fn defer_events<T>(work: impl FnOnce() -> T) -> T {
+    struct Deferred(bool);
+    impl Drop for Deferred {
+        fn drop(&mut self) { DISPATCHING.with(|flag| flag.set(self.0)); }
+    }
+    let held = DISPATCHING.with(|flag| flag.replace(true));
+    let deferred = Deferred(held);
+    let result = work();
+    drop(deferred);
+    if !held {
+        loop {
+            let next = PENDING.with(|queue| queue.borrow_mut().pop_front());
+            let Some((source, event)) = next else { break };
+            dispatch_from(source, event);
+        }
+    }
+    result
 }
 
 /// An event that waits behind a running handler joins the line — and a
@@ -1385,7 +1422,12 @@ extern "C" fn bunny_window_did_change_backing(_this: Id, _sel: Sel, note: Id) {
 // them apart: a drag on the left or top edge moves the origin AND
 // the size, so `move` and `resize` both arrive on every step.
 fn window_frame_changed(note: Id, kind: &str) {
+    defer_events(|| window_frame_changed_inner(note, kind));
+}
+
+fn window_frame_changed_inner(note: Id, kind: &str) {
     let window = unsafe { msg_id(note, sel("object")) };
+    geometry_ops::notify(window as usize);
     if crate::trace::active() {
         unsafe {
             let view = msg_id(window, sel("contentView"));
@@ -1578,44 +1620,72 @@ pub fn place_traffic_lights(window: Id) {
     }
 }
 
+#[derive(Default)]
+struct ModalWindows {
+    scopes: modal::ModalScopes,
+    disabled: HashMap<usize, [bool; 3]>,
+}
+
 thread_local! {
-    /// True while a dialog holds the app window-modal: the MAIN window
-    /// answers `canBecomeKeyWindow` with NO, so a click on it cannot
-    /// pull the keyboard out of the dialog — the JetBrains manner.
-    static MODAL_BLOCKED: Cell<bool> = const { Cell::new(false) };
+    // Only the parent and lower dialogs in this scene refuse key/main.
+    // Native addresses stay inside the main-thread AppKit boundary.
+    static MODAL_WINDOWS: RefCell<ModalWindows> = RefCell::default();
 }
 
-/// `BunnyWindow`'s answer to "may I become key" — YES, a titled
-/// window's own answer, until a dialog holds the app modal. The
-/// subclass exists for this one question.
-extern "C" fn bunny_window_can_become_key(_this: Id, _sel: Sel) -> i8 {
-    i8::from(!MODAL_BLOCKED.with(Cell::get))
+extern "C" fn bunny_window_can_become_key(this: Id, _sel: Sel) -> i8 {
+    i8::from(!MODAL_WINDOWS.with(|state| state.borrow().scopes.is_blocked(this as usize)))
 }
 
-/// Holds the app window-modal under a dialog: the parent's three
-/// traffic lights go dark (disabled, not hidden — the JetBrains bar)
-/// and the parent refuses key. No nested run loop is involved; the
-/// scene's own modal floor already swallows the parent's input.
-pub fn begin_window_modal(parent: &WindowHandle) {
-    MODAL_BLOCKED.with(|blocked| blocked.set(true));
-    set_standard_buttons_enabled(parent, false);
+/// Mirrors layout's modal order before making its top window key. These
+/// are child windows with framework-managed modality, not `AppKit` sheets.
+pub fn set_window_modals(parent: &WindowHandle, dialogs: &[WindowHandle]) {
+    update_modal_scopes(|scopes| {
+        scopes.set(
+            parent.raw_window(),
+            dialogs.iter().map(WindowHandle::raw_window).collect(),
+        );
+    });
 }
 
-/// The reverse, on the dialog's way out. It runs BEFORE the parent is
-/// made key again — the make-key asks `canBecomeKeyWindow`, and the
-/// answer has to already be yes.
-pub fn end_window_modal(parent: &WindowHandle) {
-    MODAL_BLOCKED.with(|blocked| blocked.set(false));
-    set_standard_buttons_enabled(parent, true);
+fn update_modal_scopes(change: impl FnOnce(&mut modal::ModalScopes)) {
+    let (restore, block) = MODAL_WINDOWS.with(|state| {
+        let mut state = state.borrow_mut();
+        change(&mut state.scopes);
+        let blocked: Vec<_> = state.scopes.blocked().collect();
+        let restore: Vec<_> = state
+            .disabled
+            .iter()
+            .filter(|(window, _)| !blocked.contains(window))
+            .map(|(&window, &buttons)| (window, buttons))
+            .collect();
+        for (window, _) in &restore {
+            state.disabled.remove(window);
+        }
+        let block: Vec<_> = blocked
+            .into_iter()
+            .filter(|window| !state.disabled.contains_key(window))
+            .collect();
+        (restore, block)
+    });
+    // AppKit may synchronously ask for key eligibility during a transition.
+    // No registry borrow survives an Objective-C call.
+    for (window, buttons) in restore {
+        set_standard_buttons(window, buttons);
+    }
+    for window in block {
+        let buttons = WINDOW_BUTTONS.map(|kind| unsafe {
+            let button = msg_id_u64(window as Id, sel("standardWindowButton:"), kind);
+            !button.is_null() && msg_bool(button, sel("isEnabled")) != 0
+        });
+        MODAL_WINDOWS.with(|state| state.borrow_mut().disabled.insert(window, buttons));
+        set_standard_buttons(window, [false; 3]);
+    }
 }
 
-/// Enables or disables the window's three standard buttons. The
-/// placement loop above only ever moves frames, so a disabled button
-/// stays disabled through every re-place.
-fn set_standard_buttons_enabled(window: &WindowHandle, enabled: bool) {
-    unsafe {
-        for kind in WINDOW_BUTTONS {
-            let button = msg_id_u64(window.window, sel("standardWindowButton:"), kind);
+fn set_standard_buttons(window: usize, enabled: [bool; 3]) {
+    for (kind, enabled) in WINDOW_BUTTONS.into_iter().zip(enabled) {
+        unsafe {
+            let button = msg_id_u64(window as Id, sel("standardWindowButton:"), kind);
             if !button.is_null() {
                 msg_void_bool(button, sel("setEnabled:"), i8::from(enabled));
             }
@@ -2334,8 +2404,8 @@ unsafe fn register_classes() {
         );
         objc_registerClassPair(delegate);
 
-        // the MAIN window's subclass — one question answered, nothing
-        // else touched: under a dialog it refuses to become key
+        // Top levels and dialogs share eligibility: only the top modal
+        // of a scene can become key while unrelated scenes stay usable.
         let bare_bool = CString::new("c@:").expect("type encoding");
         let window = objc_allocateClassPair(
             class("NSWindow"),
@@ -3001,6 +3071,11 @@ impl WindowHandle {
         unsafe { msg_bool(self.window, sel("isVisible")) != 0 }
     }
 
+    /// Whether `AppKit` currently gives this window keyboard focus.
+    pub fn is_key(&self) -> bool {
+        unsafe { msg_bool(self.window, sel("isKeyWindow")) != 0 }
+    }
+
     /// Re-adopts a pooled dialog on reopen — the child tie was cut
     /// when it closed.
     pub fn attach_to(&self, parent: &WindowHandle) {
@@ -3015,6 +3090,11 @@ impl WindowHandle {
             msg_void_id(self.window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
             msg_void_id(self.window, sel("makeFirstResponder:"), self.view);
         }
+    }
+
+    /// Shows a dialog while the shell assembles its scene's modal stack.
+    pub fn order_front(&self) {
+        unsafe { msg_void_id(self.window, sel("orderFront:"), std::ptr::null_mut()) };
     }
 
     /// The `NSWindow` as an address — what a delegate callback names
@@ -4055,7 +4135,7 @@ pub fn create_dialog(
             // its content's (the shell sets the frame layout fitted)
             DialogManners::Ask => (1 | (1 << 15), None, true),
         };
-        let window = msg_id(class("NSWindow"), sel("alloc"));
+        let window = msg_id(class("BunnyWindow"), sel("alloc"));
         let window = msg_init_window(
             window,
             sel("initWithContentRect:styleMask:backing:defer:"),
@@ -4183,6 +4263,7 @@ impl WindowHandle {
     /// panel object stays reusable-dead (released when the process
     /// goes) — panels are few and pooled by path.
     pub fn close_panel(&self, parent: &WindowHandle) {
+        update_modal_scopes(|scopes| scopes.end(self.raw_window()));
         unsafe {
             // the ACTUAL holder, not the caller's guess: a dropdown
             // born inside a dialog is the DIALOG's child, and the

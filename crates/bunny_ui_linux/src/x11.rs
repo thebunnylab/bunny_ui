@@ -37,6 +37,13 @@ use crate::ffi::{
     Keyboard, PollFd, O_CLOEXEC, O_NONBLOCK, POLLIN,
 };
 
+#[path = "x11_window_ops.rs"]
+mod window_ops;
+pub use window_ops::{focus_window, set_window_parent};
+#[path = "x11_geometry_ops.rs"]
+mod geometry_ops;
+pub use geometry_ops::{window_geometry, restore_window_placement};
+
 // MARK: - libc floor additions (SysV shared memory + free — the
 // wayland door never needed either; the rest borrows ffi's floor)
 
@@ -775,6 +782,7 @@ fn size_hints_min(width: u32, height: u32) -> [u32; 18] {
 
 /// Every atom this door speaks, interned in one batch at connect.
 pub(crate) struct Atoms {
+    pub(crate) net_active_window: u32,
     pub(crate) wm_protocols: u32,
     pub(crate) wm_delete_window: u32,
     pub(crate) net_wm_name: u32,
@@ -796,7 +804,7 @@ pub(crate) struct Atoms {
     pub(crate) net_wm_window_type_normal: u32,
 }
 
-const ATOM_NAMES: [&CStr; 16] = [
+const ATOM_NAMES: [&CStr; 17] = [
     c"WM_PROTOCOLS",
     c"WM_DELETE_WINDOW",
     c"_NET_WM_NAME",
@@ -813,6 +821,7 @@ const ATOM_NAMES: [&CStr; 16] = [
     c"WM_CHANGE_STATE",
     c"_NET_WM_WINDOW_TYPE",
     c"_NET_WM_WINDOW_TYPE_NORMAL",
+    c"_NET_ACTIVE_WINDOW",
 ];
 
 use std::ffi::CStr;
@@ -835,6 +844,7 @@ fn intern_atoms(connection: *mut Connection) -> Atoms {
         }
     }
     Atoms {
+        net_active_window: atoms[16],
         wm_protocols: atoms[0],
         wm_delete_window: atoms[1],
         net_wm_name: atoms[2],
@@ -3156,6 +3166,7 @@ fn interpret(event: *mut GenericEvent) -> Step {
                     false
                 }
             });
+            crate::ffi::notify_geometry(window as usize);
             if resized {
                 Step::Deliver(window, AppEvent::Redraw)
             } else {

@@ -30,3 +30,11 @@ harness = false
 [[test]]
 name = "window_lifecycle"
 harness = false
+
+[[test]]
+name = "window_relationships"
+harness = false
+
+[[test]]
+name = "window_geometry"
+harness = false

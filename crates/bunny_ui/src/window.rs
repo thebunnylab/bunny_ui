@@ -8,6 +8,14 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod geometry;
+mod relationships;
+#[doc(hidden)]
+pub use geometry::{GeometryEvents, GeometryObservation};
+pub use geometry::{DesktopPosition, DesktopSpace, WindowGeometry, WindowPlacement, WindowSize};
+#[doc(hidden)]
+pub use relationships::{RelationshipChange, Relationships};
+
 /// One window lifetime. Only an owning shell can associate it with a live scene.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WindowId(usize);
@@ -36,13 +44,32 @@ pub enum WindowVisibility {
     Hidden,
 }
 
-/// A rejected operation leaves the identified window unchanged.
+/// Why a desktop window operation could not complete.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowError {
     /// The ID is closed or belongs to another application.
     StaleWindow,
     /// This window's close callback is already executing.
     CloseInProgress,
+    /// The requested parent would create a cycle, including self-parenting.
+    RelationshipCycle,
+    /// A native relationship change is already in progress for this app.
+    RelationshipInProgress,
+    /// This window or an owning ancestor was explicitly hidden.
+    HiddenWindow,
+    /// The window system declined the activation request.
+    FocusDenied,
+    /// Invalid size, coordinates, scale or a mismatched desktop coordinate space.
+    InvalidGeometry(&'static str),
+    /// The native window has not supplied usable geometry in its current state.
+    GeometryUnavailable,
+    /// A native operation failed with its platform error code.
+    NativeFailure {
+        /// The native operation that failed.
+        operation: &'static str,
+        /// The platform's error code.
+        code: i64,
+    },
     /// The backend cannot provide this operation in the stated situation.
     Unsupported(&'static str),
 }
@@ -52,12 +79,59 @@ impl std::fmt::Display for WindowError {
         match self {
             Self::StaleWindow => f.write_str("window is closed or belongs to another application"),
             Self::CloseInProgress => f.write_str("window close callback is already executing"),
+            Self::RelationshipCycle => f.write_str("window parent would create a cycle"),
+            Self::RelationshipInProgress => {
+                f.write_str("window relationship change is in progress")
+            }
+            Self::HiddenWindow => f.write_str("window or its owner is explicitly hidden"),
+            Self::FocusDenied => f.write_str("window system declined activation"),
+            Self::InvalidGeometry(reason) => write!(f, "invalid window geometry: {reason}"),
+            Self::GeometryUnavailable => f.write_str("window geometry is not yet available"),
+            Self::NativeFailure { operation, code } => {
+                write!(f, "{operation} failed: native error {code}")
+            }
             Self::Unsupported(reason) => write!(f, "window operation is unsupported: {reason}"),
         }
     }
 }
 
 impl std::error::Error for WindowError {}
+
+/// The native relationship requested for a separate top-level scene.
+/// None of these relationships alone makes the window modal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowParentKind {
+    /// An `AppKit` child window, ordered above its parent.
+    AppKitChild,
+    /// A Win32 owned top-level window, not an embedded child control.
+    Win32Owner,
+    /// An X11 `WM_TRANSIENT_FOR` hint, subject to window-manager policy.
+    X11Transient,
+    /// A Wayland `xdg_toplevel.set_parent` request, subject to compositor policy.
+    WaylandParent,
+}
+
+/// A successfully requested native relationship and its owning scene.
+/// The window system still decides placement and focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowParent {
+    window: WindowId,
+    kind: WindowParentKind,
+}
+
+impl WindowParent {
+    /// The owning window's lifetime.
+    #[must_use]
+    pub const fn window(self) -> WindowId {
+        self.window
+    }
+
+    /// The native mechanism used by this backend.
+    #[must_use]
+    pub const fn kind(self) -> WindowParentKind {
+        self.kind
+    }
+}
 
 type Handler = Rc<RefCell<dyn FnMut(WindowId) -> CloseAction>>;
 
@@ -68,6 +142,8 @@ pub struct Lifecycle {
     handler: RefCell<Option<Handler>>,
     deciding: Cell<bool>,
     hidden: Cell<bool>,
+    owner_hidden: Cell<bool>,
+    geometry_events: Rc<GeometryEvents>,
 }
 
 impl Default for Lifecycle {
@@ -82,24 +158,37 @@ impl Default for Lifecycle {
             .expect("window identity space exhausted; identities cannot be reused");
         Self {
             id: WindowId(id),
+            geometry_events: Rc::new(GeometryEvents::new(WindowId(id))),
             handler: RefCell::new(None),
             deciding: Cell::new(false),
             hidden: Cell::new(false),
+            owner_hidden: Cell::new(false),
         }
     }
 }
 
 impl Lifecycle {
+    /// Native geometry observations belonging to this window lifetime.
+    #[must_use]
+    pub const fn geometry_events(&self) -> &Rc<GeometryEvents> {
+        &self.geometry_events
+    }
+
     /// The immutable identity belonging to this backend slot.
     #[must_use]
     pub const fn id(&self) -> WindowId {
         self.id
     }
 
-    /// Whether the owning shell explicitly suspended native presentation.
+    /// Whether this window or an owning ancestor suspended presentation.
     #[must_use]
     pub const fn is_hidden(&self) -> bool {
-        self.hidden.get()
+        self.hidden.get() || self.owner_hidden.get()
+    }
+
+    /// Updates inherited visibility without erasing an explicit hide request.
+    pub fn set_owner_hidden(&self, hidden: bool) {
+        self.owner_hidden.set(hidden);
     }
 
     /// Records a shell visibility transition; returns the previous state.
