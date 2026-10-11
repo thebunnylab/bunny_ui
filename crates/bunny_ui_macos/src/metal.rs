@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::layout::{Color, DisplayList, Size};
 use bunny_ui::text_engine::TextEngine;
-use bunny_ui_apple::metal::WindowPresenter as MetalPresenter;
 pub use bunny_ui_apple::metal::OffscreenGpu;
+use bunny_ui_apple::metal::WindowPresenter as MetalPresenter;
 
 use crate::ffi::{Id, Sel, class, sel};
 
@@ -33,19 +33,17 @@ unsafe extern "C" {
     fn msg_void_id(obj: Id, sel: Sel, a: Id);
 }
 
+/// Rendering and pacing belong to the same view. A second top-level window
+/// must never replace the first window's layer or consume its back-pressure.
+struct Presenter {
+    renderer: MetalPresenter,
+    congested: bool,
+}
+
 thread_local! {
-    /// The main window's presenter.
-    static PRESENTER: RefCell<Option<MetalPresenter>> = const { RefCell::new(None) };
-    /// One presenter per grafted DIALOG view (D127: a dialog is a real
-    /// window, and a real window resizes on the GPU road like the main
-    /// one — a CPU raster of a whole 1220×820 dialog on every step of a
-    /// drag was the difference between a fluid workbench and a dialog
-    /// that lagged its own corner).
-    static VIEW_PRESENTERS: RefCell<HashMap<usize, MetalPresenter>> =
+    /// Every top-level and pooled dialog view owns one presenter.
+    static VIEW_PRESENTERS: RefCell<HashMap<usize, Presenter>> =
         RefCell::new(HashMap::new());
-    /// Did a present of the main window WAIT for a drawable since the last
-    /// beat asked? ([`take_congested`])
-    static CONGESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A present that waited this long for a drawable, in milliseconds, found
@@ -61,28 +59,28 @@ const CONGESTED_MS: f64 = 1.5;
 /// proceeds with the CPU path. Metal itself initializes on demand.
 pub(crate) fn try_install(view: Id, scale: f64, width: f64, height: f64) -> bool {
     match graft(view, scale, width, height) {
-        Some(presenter) => {
-            PRESENTER.with(|slot| *slot.borrow_mut() = Some(presenter));
+        Some(renderer) => {
+            VIEW_PRESENTERS.with(|slot| {
+                slot.borrow_mut().insert(
+                    view as usize,
+                    Presenter {
+                        renderer,
+                        congested: false,
+                    },
+                );
+            });
             true
         }
         None => false,
     }
 }
 
-/// The same graft on a DIALOG's view — a window of its own, presented
-/// by its own layer and its own presenter, keyed by the view (a dialog
-/// is pooled reusable-dead and never re-grafted). False leaves the view
-/// on the CPU road, exactly as before.
-pub(crate) fn try_install_view(view: Id, scale: f64, width: f64, height: f64) -> bool {
-    match graft(view, scale, width, height) {
-        Some(presenter) => {
-            VIEW_PRESENTERS.with(|slot| {
-                slot.borrow_mut().insert(view as usize, presenter);
-            });
-            true
-        }
-        None => false,
-    }
+/// A closed top-level view releases only its own presenter. Pooled dialog
+/// views remain registered while reusable, just as their native windows do.
+pub fn forget_view(view: Id) {
+    VIEW_PRESENTERS.with(|slot| {
+        slot.borrow_mut().remove(&(view as usize));
+    });
 }
 
 /// Builds a presenter over a fresh CALayer on `view`, or answers
@@ -105,12 +103,15 @@ fn graft(view: Id, scale: f64, width: f64, height: f64) -> Option<MetalPresenter
     }
 }
 
-/// Diagnostics: the main window's atlas counts, and how many dialog
-/// presenters stand beside it. `None` on the CPU road.
-pub(crate) fn retained_counts() -> Option<(bunny_ui_apple::metal::AtlasCounts, usize)> {
-    PRESENTER
-        .with(|slot| slot.borrow().as_ref().map(|presenter| presenter.atlas_counts()))
-        .map(|atlas| (atlas, VIEW_PRESENTERS.with(|slot| slot.borrow().len())))
+/// Diagnostics: this view's atlas counts and the total live presenter count.
+/// `None` when this particular view uses the CPU road.
+pub fn retained_counts(view: Id) -> Option<(bunny_ui_apple::metal::AtlasCounts, usize)> {
+    VIEW_PRESENTERS.with(|slot| {
+        let presenters = slot.borrow();
+        presenters
+            .get(&(view as usize))
+            .map(|presenter| (presenter.renderer.atlas_counts(), presenters.len()))
+    })
 }
 
 /// Every window's presenter rests — its frames in flight let go, its atlas
@@ -125,17 +126,10 @@ pub(crate) fn rest() {
 /// Runs `f` on every window's presenter; true when every one answered true.
 fn each_presenter(f: impl Fn(&mut MetalPresenter) -> bool) -> bool {
     let mut all = true;
-    PRESENTER.with(|slot| {
-        if let Ok(mut slot) = slot.try_borrow_mut()
-            && let Some(presenter) = slot.as_mut()
-        {
-            all &= f(presenter);
-        }
-    });
     VIEW_PRESENTERS.with(|slot| {
         if let Ok(mut presenters) = slot.try_borrow_mut() {
             for presenter in presenters.values_mut() {
-                all &= f(presenter);
+                all &= f(&mut presenter.renderer);
             }
         }
     });
@@ -181,14 +175,22 @@ extern "C" fn offer_again(context: *mut std::ffi::c_void) {
 
 /// True when this window presents by GPU — the shell branches ONCE per
 /// frame on this, never mid-flight.
-pub(crate) fn active() -> bool {
-    PRESENTER.with(|slot| slot.borrow().is_some())
+pub fn active(view: Id) -> bool {
+    VIEW_PRESENTERS.with(|slot| slot.borrow().contains_key(&(view as usize)))
 }
 
-/// Presents one frame on a grafted DIALOG view. False when the view was
+/// Whether any view owns a presenter, for the application-wide rest timer.
+pub fn any_active() -> bool {
+    VIEW_PRESENTERS.with(|slot| !slot.borrow().is_empty())
+}
+
+/// Presents one frame on a grafted top-level or dialog view. False when it was
 /// never grafted, and the caller takes the CPU road for it. `live` is
-/// the dialog's own word on its resize.
-#[allow(clippy::too_many_arguments)]
+/// the addressed window's own word on its resize.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one native frame carries its view, geometry, engines and resize state"
+)]
 pub(crate) fn present_view(
     view: Id,
     display: &DisplayList,
@@ -204,66 +206,34 @@ pub(crate) fn present_view(
         let Some(presenter) = presenters.get_mut(&(view as usize)) else {
             return false;
         };
-        presenter.present(display, size, scale, canvas, text, images, live);
+        presenter
+            .renderer
+            .present(display, size, scale, canvas, text, images, live);
+        let waited = presenter.renderer.drawable_wait_ms();
+        if !live && waited > CONGESTED_MS {
+            presenter.congested = true;
+            bunny_ui_apple::trace::mark("X", format_args!("what=line-full wait={waited:.1}"));
+        }
         true
     })
 }
 
-/// [`arm_transaction`] for a grafted dialog view — the dialog's own
-/// delegate speaks for its own drag. A view on the CPU road is a no-op.
+/// Arms the addressed view's transaction before its first resize frame.
+/// A CPU view is a no-op; a dialog or another top-level view stays untouched.
 pub(crate) fn arm_transaction_view(view: Id, live: bool) {
     VIEW_PRESENTERS.with(|slot| {
         if let Some(presenter) = slot.borrow_mut().get_mut(&(view as usize)) {
-            presenter.set_transactional(live);
+            presenter.renderer.set_transactional(live);
         }
     });
 }
 
-/// Requires the layer's transactional present, from AppKit's
-/// own word that a drag is starting. It arrives BEFORE the first
-/// resized frame, which is the only moment early enough: by the time a
-/// frame observes `inLiveResize` the window has already grown, and a
-/// drawable of the old size stretched to the new bounds is what the
-/// eye reads as the whole UI drawn twice. After the drag, the layer retains
-/// its contract so a pending transaction cannot lose its drawable.
-pub(crate) fn arm_transaction(live: bool) {
-    PRESENTER.with(|slot| {
-        if let Some(presenter) = slot.borrow_mut().as_mut() {
-            presenter.set_transactional(live);
-        }
-    });
-}
-
-/// The GPU twin of the Surface + blit path: same display list in, one
-/// presented frame out. `text` is the frame's engine — the atlas
-/// rasterizes through it, exactly like the CPU compositor. `live` is
-/// the window's word on whether a resize drag is under way.
-pub(crate) fn present_window(
-    display: &DisplayList,
-    size: Size,
-    scale: usize,
-    canvas: Color,
-    text: &dyn TextEngine,
-    images: &dyn ImageEngine,
-    live: bool,
-) {
-    PRESENTER.with(|slot| {
-        if let Some(presenter) = slot.borrow_mut().as_mut() {
-            presenter.present(display, size, scale, canvas, text, images, live);
-            // a live resize presents inside the window's own transaction
-            // and waits by design: that wait says nothing about the line
-            let waited = presenter.drawable_wait_ms();
-            if !live && waited > CONGESTED_MS {
-                CONGESTED.with(|flag| flag.set(true));
-                bunny_ui_apple::trace::mark("X", format_args!("what=line-full wait={waited:.1}"));
-            }
-        }
-    });
-}
-
-/// Did a present wait for the display since this was last asked? The frame
-/// pacer holds one beat for a yes (`FramePacer::congested`), and the line of
-/// frames in front of the display drains.
-pub(crate) fn take_congested() -> bool {
-    CONGESTED.with(|flag| flag.replace(false))
+/// Did this view wait for a drawable since its pacer last asked? A sibling's
+/// traffic must not consume or introduce back-pressure for this window.
+pub fn take_congested(view: Id) -> bool {
+    VIEW_PRESENTERS.with(|slot| {
+        slot.borrow_mut()
+            .get_mut(&(view as usize))
+            .is_some_and(|presenter| std::mem::take(&mut presenter.congested))
+    })
 }
