@@ -1361,6 +1361,9 @@ where
 /// lists already scroll themselves; this is for everything else that
 /// overflows: `.horizontal()` goes sideways (an editor without wrap, a
 /// terminal line), `.both_axes()` travels freely (a spreadsheet).
+/// On the other axis, the child's flexibility reaches the enclosing stack:
+/// a horizontal region around a vertical list fills the available height,
+/// while one around a single fixed-height line keeps that line's height.
 #[derive(Clone)]
 pub struct ScrollView<C> {
     content: C,
