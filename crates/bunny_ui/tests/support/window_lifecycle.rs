@@ -145,8 +145,11 @@ fn policies(native_close: NativeClose) {
     println!(
         "native lifecycle policies, retained draft, repeated hide/show and stale handles passed"
     );
-    // Keep the final window alive until ordinary process teardown; dedicated
-    // subprocess probes separately witness final-close exit and all-hidden wake.
+    // Release the final native window while its platform services still live.
+    // Dedicated subprocesses separately witness default-close exit and wake.
+    app.quit();
+    app.run();
+    assert!(app.windows().is_empty());
 }
 
 fn wake() {
