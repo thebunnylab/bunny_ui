@@ -37,6 +37,10 @@ pub(crate) use bunny_ui_apple::ffi::{
     sel, sel_getName, text_argument_to_string, wake_from_any_thread,
 };
 
+#[path = "accessibility.rs"]
+mod accessibility;
+pub(crate) use accessibility::Accessibility;
+
 use bunny_ui::action::ActionId;
 use bunny_ui::menu::Pick;
 
@@ -204,6 +208,10 @@ unsafe extern "C" {
 /// display-link tick reaches every window that wants it.
 #[derive(Clone)]
 pub enum AppEvent {
+    /// A native assistive-technology client first queried this window.
+    AccessibilityEnable,
+    /// A validated native element requests an action on its retained control.
+    AccessibilityAction { id: bunny_ui::accessibility::NodeId, action: bunny_ui::accessibility::Action },
     MouseDown { x: f64, y: f64, clicks: u8, modifiers: bunny_ui::action::Modifiers },
     /// The right button (or a two-finger tap): the context-menu press.
     RightMouseDown { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
@@ -1957,6 +1965,7 @@ unsafe fn register_classes() {
             CString::new("BunnyView").expect("name").as_ptr(),
             0,
         );
+        accessibility::register_view(view);
         class_addMethod(
             view,
             sel("mouseDown:"),

@@ -37,6 +37,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod accessibility;
 pub mod action;
 pub mod anim;
 pub mod bind;
@@ -71,12 +72,15 @@ pub mod pacing;
 mod paranoid;
 mod reconciler;
 pub mod runtime;
+#[cfg(feature = "canvas")]
+pub mod slider;
 pub mod ssr;
 pub mod state_ext;
 pub mod stats;
 pub mod text_engine;
 pub mod text_value;
 pub mod text_input;
+mod grapheme;
 pub mod theme;
 pub mod touch;
 pub mod view;

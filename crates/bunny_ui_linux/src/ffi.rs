@@ -26,6 +26,9 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::time::Instant;
 
+#[path = "accessibility.rs"]
+pub(crate) mod accessibility;
+
 // MARK: - libc floor (the only raw syscalls the shell needs)
 
 #[repr(C)]
@@ -2485,6 +2488,7 @@ impl WindowHandle {
 /// window this shell holds. The pump leaves on its next turn, and the
 /// process returns from `run`.
 pub fn close_top_level(window: usize) {
+    accessibility::retire_window(window);
     if is_x11() {
         return crate::x11::close_top_level(window as u32);
     }
@@ -5434,6 +5438,7 @@ pub fn run() {
                 PollFd { fd: wl_display_get_fd(display), events: POLLIN, revents: 0 },
                 PollFd { fd: wake_fd, events: POLLIN, revents: 0 },
             ];
+            accessibility::prepare(&mut fds);
             // the engine's own descriptors ride this poll: a page's
             // frame, a signal, a message — all land on this thread
             let timeout = match crate::webview::pump_prepare(&mut fds) {
@@ -5491,6 +5496,7 @@ pub fn run() {
         crate::webview::deliver_pending();
         // a window a verb or the compositor asked to close, now
         settle_closes();
+        accessibility::pump();
     }
     teardown();
 }
