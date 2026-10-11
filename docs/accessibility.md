@@ -1,6 +1,6 @@
 # Accessibility semantics and native bridges
 
-The core can project text, buttons and editable fields from the retained scene
+The core can project text, buttons, checkboxes and editable fields from the retained scene
 into `bunny_ui::accessibility::Tree`. This is the data boundary for native
 adapters. It does not by itself expose an application to VoiceOver, UIA or AT-SPI.
 
@@ -44,7 +44,10 @@ different runtime cannot address the same control.
 
 `accessibility_action(id, action)` validates the handle and supported action,
 then uses the real control's callback or editing path. Buttons support
-`Activate`; editable fields support `Focus` and `SetText`. Unsupported and
+`Activate` and `Focus`; checkboxes support `Activate` (toggle) and `Focus`;
+editable fields support `Focus` and `SetText`. Disabled controls retain their
+semantic nodes with `enabled = false` and reject actions. Checkboxes expose
+`checked: Some(bool)` separately from text values. Unsupported and
 unavailable requests return distinct errors. Successful actions request a
 frame. Snapshots report current keyboard focus without requesting a frame.
 
@@ -60,6 +63,8 @@ layout bounds to screen coordinates, reports keyboard focus and forwards support
 press, focus and value edits through the shell's existing event queue. Secure
 fields expose `AXSecureTextField` with no value. Removed controls and closed windows
 reject actions even if a client still retains their former native objects.
+Checkboxes expose `AXCheckBox` and an `NSNumber` value, with value-change
+notifications. Both buttons and checkboxes expose focus and enabled state.
 
 After installing the new snapshot, the adapter sends AppKit notifications for
 changed names, values, focus, membership and geometry. An unchanged scene sends no
@@ -81,7 +86,9 @@ The Win32 shell answers `WM_GETOBJECT` with a UI Automation fragment root for
 each scene and overlay window. The first UIA request enables semantic collection,
 including a request directed at an already-open modal. Text, buttons and fields
 expose their native control types, names, physical screen bounds and stable
-runtime IDs. Buttons expose Invoke; single-line fields expose Value and keyboard focus.
+runtime IDs. Buttons expose Invoke; checkboxes expose Toggle and ToggleState;
+single-line fields expose Value. All three control types expose keyboard focus
+and enabled state. Toggle and enabled changes emit property notifications.
 Multiline editors expose focus but require the still-unimplemented Text pattern
 for text access; they do not claim Value pattern support.
 Password fields set IsPassword and refuse value reads.
@@ -121,7 +128,9 @@ timer, Rust dependency or separate form model is introduced.
 The first client query enables retained capture. Main windows and overlay surfaces
 have distinct roots; leaves retain their object paths while their `NodeId` is
 exposed. Accessible and Application properties describe the current objects.
-Component exposes bounds, hit testing and field focus; Action invokes buttons;
+Component exposes bounds, hit testing and control focus; Action invokes buttons
+and toggles checkboxes. Checkboxes expose CHECKABLE/CHECKED states and changes;
+disabled controls omit ENABLED/SENSITIVE and reject actions.
 Text reads Unicode scalar ranges; EditableText replaces a field's whole contents.
 Unsupported operations return a D-Bus error. Text selection, caret offsets,
 character geometry and partial edits are not implemented yet.

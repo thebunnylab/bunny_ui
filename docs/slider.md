@@ -26,9 +26,11 @@ it does not roll the binding back. Releasing after cancellation adds no write.
 
 A pointer release inside the control takes keyboard focus. An application can
 also call `runtime.focus_named("rate")` after layout, including in element mode,
-and use that name in its own Tab order. An exact text-field name retains
-priority; a name wrapping several focusable custom controls is ambiguous and
-returns `false`. Naming does not register an automatic Tab order.
+and use that name in its own navigation policy. Native Tab/Shift+Tab traversal
+includes enabled sliders in layout reading order; their unhandled Tab stroke
+moves to the next control. An exact text-field name retains priority; a name
+wrapping several focusable controls is ambiguous and returns `false`. See
+[keyboard controls](keyboard-controls.md) for traversal and scroll reveal.
 
 | Key | Effect |
 | --- | --- |

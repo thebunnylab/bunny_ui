@@ -1651,6 +1651,11 @@ pub(crate) fn hover_watched() -> bool {
     LIVE.with(|live| live.borrow().hover_keys > 0)
 }
 
+/// Whether the retained target still has an activation callback.
+pub fn has_action(path: &str) -> bool {
+    LIVE.with(|live| live.borrow().click(path).is_some())
+}
+
 /// Fires the target's action (the key comes from the hit-test).
 /// `false` = target not registered (the identity died between frame and
 /// click — harmless).

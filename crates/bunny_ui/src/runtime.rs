@@ -271,6 +271,9 @@ pub struct Runtime {
     /// The fields of the last layout (geometry + effective font) —
     /// click-to-position and IME sync measure through here.
     last_fields: RefCell<Vec<FieldPlacement>>,
+    last_focus_order: RefCell<Vec<crate::layout::FocusStop>>,
+    last_focus_floor: Cell<usize>,
+    navigation_scopes: RefCell<Vec<(Rc<str>, Option<String>)>>,
     /// The splits of the last layout — a divider drag maps the pointer
     /// back to a lane extent through this geometry.
     last_splits: RefCell<Vec<crate::layout::SplitPlacement>>,
@@ -603,45 +606,121 @@ impl Runtime {
     /// wrapper down to it — so an app that wants to put the caret somewhere
     /// (a form's Tab walk, a screen that opens with one box already live)
     /// would have to spell a path it does not own. It owns the NAME, and this
-    /// resolves it against the last layout's fields and custom controls.
+    /// resolves it against the last layout's eligible controls.
     /// An exact field name wins. Otherwise, the name must contain exactly one
-    /// visible custom control that accepts keys and does not leave them behind.
+    /// eligible control. Native scroll regions reveal an offscreen target.
     ///
-    /// `false` when no eligible control, or several custom controls, match the
+    /// `false` when no eligible control, or several controls, match the
     /// name. Before the first frame there are no controls to reach.
     pub fn focus_named(&self, id: &str) -> bool {
+        self.enter_scene();
         let tail = format!("[{id}]");
-        let path = self
-            .last_fields
-            .borrow()
-            .iter()
-            .find(|field| field.path.ends_with(&tail))
-            .map(|field| field.path.clone());
-        let path = path.or_else(|| {
-            let customs = self.last_customs.borrow();
-            let dom_customs = self.dom_customs.borrow();
-            let mut matches = customs
-                .iter()
-                .chain(dom_customs.iter().map(|(_, placement)| placement))
-                .filter(|placement| {
-                    let element = placement.element.element();
-                    placement.path.split('/').any(|segment| segment == tail)
-                        && placement.visible.size.width > 0.0
-                        && placement.visible.size.height > 0.0
-                        && element.accepts_keys()
-                        && !element.leaves_keyboard()
-                });
-            let first = matches.next()?;
-            // A name around several custom controls is not a focus target.
-            matches.next().is_none().then(|| first.path.clone())
-        });
-        match path {
-            Some(path) => {
-                self.focus(&path);
-                true
+        let stop = {
+            let order = self.last_focus_order.borrow();
+            let available = &order[self.last_focus_floor.get()..];
+            let exact = available.iter().find(|stop| {
+                stop.path.ends_with(&tail) && reconciler::has_editor(&stop.path)
+            });
+            if let Some(stop) = exact {
+                Some(stop.clone())
+            } else {
+                let mut matches = available.iter().filter(|stop| stop.path.split('/').any(|segment| segment == tail));
+                let first = matches.next();
+                if matches.next().is_some() { return false; }
+                first.cloned()
             }
-            None => false,
+        };
+        if let Some(stop) = stop {
+            self.focus_stop(&stop);
+            return true;
         }
+        // Flow-DOM custom islands are placed by the browser, outside the
+        // native layout walk. Preserve their named-focus door.
+        let path = {
+            let customs = self.dom_customs.borrow();
+            let mut matches = customs.iter().map(|(_, placement)| placement).filter(|placement| {
+                placement.path.split('/').any(|segment| segment == tail)
+                    && !placement.visible.is_empty()
+                    && placement.element.element().accepts_keys()
+                    && !placement.element.element().leaves_keyboard()
+            });
+            let first = matches.next();
+            if matches.next().is_some() { return false; }
+            first.map(|placement| placement.path.clone())
+        };
+        path.is_some_and(|path| { self.focus(&path); true })
+    }
+
+    fn focus_stop(&self, stop: &crate::layout::FocusStop) {
+        self.focus(&stop.path);
+        let mut region = stop.region;
+        let mut wanted = stop.frame;
+        while let Some(placed) = region.and_then(|index| self.last_scrolls.borrow().get(index).cloned()) {
+            let before = self.scroll_offset(&placed.path);
+            self.reveal_in(&placed, wanted);
+            let after = self.scroll_offset(&placed.path);
+            if placed.direction.is_rtl() { wanted.origin.x += after.x - before.x; }
+            else { wanted.origin.x -= after.x - before.x; }
+            wanted.origin.y -= after.y - before.y;
+            region = placed.parent;
+        }
+    }
+
+    fn traverse_focus(&self, backwards: bool) -> bool {
+        let stop = {
+            let order = self.last_focus_order.borrow();
+            let order = &order[self.last_focus_floor.get()..];
+            if order.is_empty() { return false; }
+            let held = self.focus.borrow();
+            let current = order.iter().position(|stop| Some(stop.path.as_ref()) == held.as_deref());
+            let next = match (current, backwards) {
+                (Some(0) | None, true) => order.len() - 1,
+                (Some(index), true) => index - 1,
+                (Some(index), false) => (index + 1) % order.len(),
+                (None, false) => 0,
+            };
+            order[next].clone()
+        };
+        self.focus_stop(&stop);
+        true
+    }
+
+    /// A popup or modal layer owns its controls until it closes. Remember the
+    /// previous owner independently of individual popup controls, so Tab can
+    /// move inside the popup without losing the return address.
+    fn sync_navigation_scope(&self, result: &crate::layout::LayoutResult) -> bool {
+        let held = self.focused();
+        let (changed, restore) = {
+            let mut scopes = self.navigation_scopes.borrow_mut();
+            if scopes.last().map(|(scope, _)| scope) == result.focus_scope.as_ref() {
+                (false, None)
+            } else {
+                let mut restore = None;
+                let returning = result.focus_scope.is_none()
+                    || scopes.iter().any(|(scope, _)| Some(scope) == result.focus_scope.as_ref());
+                if returning {
+                    while scopes.last().map(|(scope, _)| scope) != result.focus_scope.as_ref() {
+                        if let Some((_, lender)) = scopes.pop() { restore = lender; } else { break; }
+                    }
+                } else if let Some(scope) = &result.focus_scope {
+                    scopes.push((Rc::clone(scope), held.clone()));
+                }
+                (true, restore)
+            }
+        };
+        let available = &result.focus_order[result.focus_floor..];
+        if let Some(stop) = restore.and_then(|path| available.iter().find(|stop| stop.path.as_ref() == path)) {
+            self.focus_stop(stop);
+            return true;
+        }
+        if result.focus_scope.is_some()
+            && !available.iter().any(|stop| Some(stop.path.as_ref()) == held.as_deref())
+            && !held.as_deref().is_some_and(|path| reconciler::declares(path, ALERT_CONTEXT))
+        {
+            if let Some(stop) = available.first() { self.focus_stop(stop); }
+            else if held.is_some() { self.blur(); }
+        }
+        changed || self.focused() != held
     }
 
     /// The identity path `rel` has inside this scene — what an app hands
@@ -1543,6 +1622,9 @@ impl Runtime {
             goal_column: Cell::new(None),
             accessibility: RefCell::new(crate::accessibility::State::default()),
             last_fields: RefCell::new(Vec::new()),
+            last_focus_order: RefCell::new(Vec::new()),
+            last_focus_floor: Cell::new(0),
+            navigation_scopes: RefCell::new(Vec::new()),
             last_splits: RefCell::new(Vec::new()),
             last_customs: RefCell::new(Vec::new()),
             last_hosts: RefCell::new(Vec::new()),
@@ -2325,15 +2407,41 @@ impl Runtime {
                 }
             }
         }
-        let Some(placement) = self.focused_custom() else {
-            return crate::custom::Response::ignored();
-        };
-        let response = self.deliver(&placement, crate::custom::ElementEvent::Key(stroke));
-        if response.handled {
-            self.caret_phase.set(CaretPhase::Visible);
-            self.dirty_island_of(&placement.path);
+        if let Some(placement) = self.focused_custom() {
+            let response = self.deliver(&placement, crate::custom::ElementEvent::Key(stroke));
+            if response.handled {
+                self.caret_phase.set(CaretPhase::Visible);
+                self.dirty_island_of(&placement.path);
+                return response;
+            }
         }
-        response
+        self.control_key(pattern)
+    }
+
+    fn control_key(&self, pattern: &KeyPattern) -> crate::custom::Response {
+        if pattern.is_plain() && pattern.key == crate::action::Key::Tab
+            && self.traverse_focus(pattern.shift)
+        {
+            return crate::custom::Response::handled();
+        }
+        if pattern.is_plain() && !pattern.shift {
+            let control = {
+                let order = self.last_focus_order.borrow();
+                let held = self.focus.borrow();
+                order[self.last_focus_floor.get()..].iter()
+                    .find(|stop| Some(stop.path.as_ref()) == held.as_deref())
+                    .and_then(|stop| stop.control.map(|state| (Rc::clone(&stop.path), state)))
+            };
+            if let Some((path, state)) = control
+                && (pattern.key == crate::action::Key::Char(' ')
+                    || (pattern.key == crate::action::Key::Enter && state.checked.is_none()))
+                && reconciler::run_action(&path, 1)
+            {
+                self.frame_asked.set(true);
+                return crate::custom::Response::handled();
+            }
+        }
+        crate::custom::Response::ignored()
     }
 
     /// Button down: ARMS pressed on the target under the point — no
@@ -2636,11 +2744,17 @@ impl Runtime {
         // the exception (`.leaves_keyboard()`): a menu's row, a toolbar
         // button, and the keyboard stays where it was
         if !fired.as_deref().is_some_and(reconciler::leaves_keyboard) {
-            match fired.as_deref().and_then(reconciler::copy_owner) {
+            let control = fired.as_deref().and_then(|path| {
+                self.last_focus_order.borrow().iter().find(|stop| stop.path.as_ref() == path && stop.control.is_some()).cloned()
+            });
+            match control {
+                Some(stop) => self.focus_stop(&stop),
+                None => match fired.as_deref().and_then(reconciler::copy_owner) {
                 Some(owner) => self.focus_element(&owner),
                 None => {
                     self.blur();
                 }
+                },
             }
         }
         fired.filter(|_| activated)
@@ -3835,10 +3949,10 @@ impl Runtime {
         });
         *self.focus.borrow_mut() = Some(path.to_string());
         self.sync_field_focus();
-        self.carets
-            .borrow_mut()
-            .entry(path.to_string())
-            .or_insert(CaretState { caret: usize::MAX, anchor: None, marked: None });
+        if reconciler::has_editor(path) {
+            self.carets.borrow_mut().entry(path.to_string())
+                .or_insert(CaretState { caret: usize::MAX, anchor: None, marked: None });
+        }
         if !moved {
             return;
         }
@@ -4328,7 +4442,8 @@ impl Runtime {
 
     fn caret_blinks(&self) -> bool {
         self.focus.borrow().as_deref().is_some_and(|path| {
-            !reconciler::answers_copy(path) || self.custom_at(path).is_some()
+            !self.last_focus_order.borrow().iter().any(|stop| stop.path.as_ref() == path && stop.control.is_some())
+                && (!reconciler::answers_copy(path) || self.custom_at(path).is_some())
         })
     }
 
@@ -6713,7 +6828,7 @@ impl Runtime {
                 | self.apply_measures(&result)
                 | self.apply_row_anchors()
                 | self.apply_tail_follow(&result);
-            let focused = self.apply_auto_focus(&result);
+            let focused = self.sync_navigation_scope(&result) | self.apply_auto_focus(&result);
             // a miss measured on the round a target just moved is
             // spurious — it audited the PRE-jump offset; the relayout
             // below re-audits against the real one
@@ -6988,6 +7103,9 @@ impl Runtime {
             return true;
         }
         for field in &result.fields {
+            if result.focus_scope.is_some() && !result.focus_order[result.focus_floor..]
+                .iter().any(|stop| stop.path.as_ref() == field.path)
+            { continue; }
             if self.claim_auto_focus(&field.path, field.auto_focus) {
                 // This layout has retained the field's geometry. Reveal the
                 // focused caret now, before the first frame or keystroke.
@@ -7002,6 +7120,9 @@ impl Runtime {
         // Each (box, beat) fires once, so the user can focus away and stay
         // away until the app beats again.
         for placement in &result.customs {
+            if result.focus_scope.is_some() && !result.focus_order[result.focus_floor..]
+                .iter().any(|stop| stop.path.as_ref() == placement.path)
+            { continue; }
             // an overlay island shares its box's element: the keyboard goes
             // to the box, never to the island
             if placement.overlay {
@@ -7180,7 +7301,14 @@ impl Runtime {
         self.last_sensitive_groups.borrow_mut().clone_from(&result.sensitive_groups);
         self.last_scrolls.borrow_mut().clone_from(&result.scrolls);
         self.last_modal_floor.set(result.modal_floor);
+        let lost_control = self.focused().is_some_and(|path| {
+            self.last_focus_order.borrow().iter().any(|stop| stop.path.as_ref() == path)
+                && !result.focus_order.iter().any(|stop| stop.path.as_ref() == path)
+        });
+        if lost_control { self.blur(); }
         self.last_fields.borrow_mut().clone_from(&result.fields);
+        self.last_focus_order.borrow_mut().clone_from(&result.focus_order);
+        self.last_focus_floor.set(result.focus_floor);
         self.accessibility.borrow_mut().update(&result.accessibility);
         self.last_splits.borrow_mut().clone_from(&result.splits);
         self.last_customs.borrow_mut().clone_from(&result.customs);
@@ -7700,6 +7828,7 @@ impl FrameNeed {
 /// view that answers a copy holds it by its `.on_copy`.
 fn input_lives(path: &str) -> bool {
     reconciler::has_editor(path)
+        || reconciler::has_action(path)
         || reconciler::has_custom(path)
         || reconciler::declares(path, ALERT_CONTEXT)
         || reconciler::answers_copy(path)
@@ -7815,8 +7944,9 @@ impl Runtime {
         let applied = match action {
             Action::Activate => reconciler::run_action(&node.path, 1),
             Action::Focus => {
-                if self.field_at(&node.path).is_none() { return Err(ActionError::Unavailable); }
-                self.focus(&node.path);
+                let stop = self.last_focus_order.borrow().iter().skip(self.last_focus_floor.get())
+                    .find(|stop| stop.path == node.path).cloned().ok_or(ActionError::Unavailable)?;
+                self.focus_stop(&stop);
                 true
             }
             Action::SetText(text) => {

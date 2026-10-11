@@ -131,6 +131,8 @@ const BUTTON_PAD_V: f64 = 6.0;
 pub struct Button<L, F> {
     label: L,
     action: F,
+    disabled: bool,
+    checked: Option<bool>,
 }
 
 impl<L, F> View for Button<L, F>
@@ -144,14 +146,16 @@ where
         let mut label = NodeList::new();
         self.label.render_into(ctx, &mut label);
         let (prints, layouts) = label.into_parts();
-        out.push(RenderNode::branch(crate::view::print_label("Button"), prints));
+        out.push(RenderNode::branch(crate::view::print_label(if self.checked.is_some() { "Checkbox" } else { "Button" }), prints));
 
         // inside a pass, the button is an interaction target: the frame joins
         // the hit-test under the identity path, and the action stays registered
         // in the reconciler (retained like the effects — skipped view, live button)
         let target = motor::identity::cursor_scope_rc().inspect(|path| {
-            let action = self.action.clone();
-            crate::reconciler::attribute_action(Rc::clone(path), Rc::new(move |_| action()));
+            if !self.disabled {
+                let action = self.action.clone();
+                crate::reconciler::attribute_action(Rc::clone(path), Rc::new(move |_| action()));
+            }
         });
 
         // the default chrome lives in the SCENE (the print stays as it was):
@@ -161,7 +165,9 @@ where
         let theme = crate::theme::current();
         let semantics = crate::accessibility::capturing().then_some(target.as_ref())
             .flatten().map(|path| Rc::new(
-            crate::accessibility::Semantics::Button { path: Rc::clone(path) }
+            crate::accessibility::Semantics::Control {
+                path: Rc::clone(path), enabled: !self.disabled, checked: self.checked,
+            }
         ));
         out.push_layout(LayoutNode::Styled {
             props: VisualProps {
@@ -169,6 +175,7 @@ where
                 background_hovered: Some(theme.control_hovered),
                 background_pressed: Some(theme.control_pressed),
                 corner_radius: Some(Corners::all(BUTTON_RADIUS)),
+                opacity: self.disabled.then_some(0.5),
                 ..VisualProps::default()
             }
             .shared(),
@@ -181,7 +188,14 @@ where
                 },
                 child: Box::new(wrap_layout(layouts)),
             }),
-            hints: crate::layout::ElementHints { semantics, ..Default::default() },
+            hints: crate::layout::ElementHints {
+                semantics,
+                address: Some(crate::layout::Address::shared(crate::layout::Address {
+                    control: Some(crate::layout::ControlState { enabled: !self.disabled, checked: self.checked }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
             action: target,
         });
     }
@@ -193,7 +207,15 @@ where
 {
     /// Pressing the button, for the headless demo.
     pub fn tap(&self) {
-        (self.action)();
+        if !self.disabled { (self.action)(); }
+    }
+
+    /// A disabled button remains visible to assistive technology but cannot
+    /// receive focus or activate through pointer, keyboard or native actions.
+    #[must_use]
+    pub const fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
     }
 }
 
@@ -205,7 +227,48 @@ where
     L: View,
     F: Fn() + Clone + 'static,
 {
-    Button { label, action }
+    Button { label, action, disabled: false, checked: None }
+}
+
+/// A labelled two-state control backed by the application's boolean binding.
+#[derive(Clone)]
+pub struct Checkbox<L> {
+    label: L,
+    value: Binding<bool>,
+    disabled: bool,
+}
+
+impl<L> Checkbox<L> {
+    /// Prevent focus and activation while preserving the label and checked state.
+    #[must_use]
+    pub const fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+}
+
+impl<L: View + Clone> View for Checkbox<L> {
+    type Arity = Single;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let checked = self.value.wrappedValue();
+        let value = self.value.clone();
+        let label = crate::hstack!(
+            text(if checked { "☑" } else { "☐" }).accessibility_hidden(),
+            self.label.clone(),
+        );
+        Button {
+            label,
+            action: move || value.set(!value.wrappedValue()),
+            disabled: self.disabled,
+            checked: Some(checked),
+        }.render_into(ctx, out);
+    }
+}
+
+/// A checkbox toggles with Space and publishes its checked state to native AT.
+pub const fn checkbox<L: View + Clone>(label: L, value: Binding<bool>) -> Checkbox<L> {
+    Checkbox { label, value, disabled: false }
 }
 
 /// `TextField("Placeholder", text: $binding)` — a field of one line, or
