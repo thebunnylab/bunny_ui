@@ -1,8 +1,31 @@
 //! Safe scene operations over the native window adapter.
 
 use crate::{App, WindowError, WindowId, WindowParent, WindowVisibility, ffi};
+use bunny_ui::window::{Confirmation, ConfirmationError, ConfirmationSpec};
 
 impl App {
+    /// Queues an owner-bound Win32 Yes/No box after the UI handler returns.
+    /// No is the default and Escape answer. Windows supplies the button labels.
+    /// Timers and other windows keep running inside the native message loop.
+    ///
+    /// # Errors
+    /// Rejects stale, foreign, hidden or modal-blocked owners and duplicate
+    /// requests. Hook or message-box creation failures resolve through the future.
+    pub fn confirm(
+        &self,
+        id: WindowId,
+        spec: ConfirmationSpec,
+    ) -> Result<Confirmation, ConfirmationError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        if slot.lifecycle.is_hidden() {
+            return Err(WindowError::HiddenWindow.into());
+        }
+        ffi::confirmation_available(slot.window)?;
+        let (confirmation, request) = slot.confirmation.start(spec)?;
+        ffi::queue_confirmation(slot.window, request);
+        Ok(confirmation)
+    }
+
     /// Requests activation of a live singleton under window-system policy.
     /// This is a request, not proof of foreground focus. Explicitly hidden
     /// owners must be shown first. macOS and Windows respect native modal scope;
@@ -89,6 +112,7 @@ impl App {
             .is_some_and(|parent| parent.lifecycle.is_hidden());
         slot.lifecycle.set_owner_hidden(owner_hidden);
         let visibility = if slot.lifecycle.is_hidden() {
+            slot.confirmation.cancel(WindowError::HiddenWindow.into());
             WindowVisibility::Hidden
         } else {
             WindowVisibility::Shown

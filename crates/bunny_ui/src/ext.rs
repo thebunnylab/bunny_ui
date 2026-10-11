@@ -1495,7 +1495,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
             base: self,
             modifier: Modifier::Alert {
                 is_presented,
-                spec,
+                spec: Box::new(spec),
                 content: Rc::new(content),
             },
         }

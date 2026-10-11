@@ -3396,12 +3396,19 @@ pub struct AlertSpec {
     /// The content's width. Its height is the content's own answer at
     /// this width.
     pub width: Px,
+    /// Native acknowledgement token used by the framework confirmation adapter.
+    #[doc(hidden)]
+    pub confirmation_token: Option<std::num::NonZeroUsize>,
 }
 
 impl AlertSpec {
     /// An ask named `title`, laid out `width` points wide.
     pub fn new(title: impl Into<Arc<str>>, width: Px) -> Self {
-        Self { title: title.into(), width }
+        Self {
+            title: title.into(),
+            width,
+            confirmation_token: None,
+        }
     }
 }
 

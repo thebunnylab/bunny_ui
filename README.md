@@ -87,6 +87,9 @@ and the web start from the library, not from a `main`: `app!` writes their
 entries too, the Android activity and the page's `start` export. `bunny run`
 reloads that library hot.
 
+Desktop scenes can ask owner-bound Yes/No questions with
+[asynchronous confirmations](docs/confirmations.md).
+
 ## Signals and subscriptions
 
 The API calls its signal `State<T>`. The subscription belongs to the place that

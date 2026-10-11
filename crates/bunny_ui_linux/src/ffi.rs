@@ -1977,6 +1977,7 @@ pub fn dispatch(event: AppEvent) {
         }
     });
     geometry_ops::drain();
+    crate::confirmation::drain();
 }
 
 // MARK: - connect and the registry census
@@ -2981,8 +2982,35 @@ pub fn create_dialog(
     };
     with_client(|client| {
         window_ops::cancel(&mut client.window_ops, owner);
-        client.panels.push(Some(Panel::new(owner, Role::Dialog(dialog))));
-        WindowHandle { window: owner, panel: client.panels.len() }
+        client
+            .panels
+            .push(Some(Panel::new(owner, Role::Dialog(dialog))));
+        WindowHandle {
+            window: owner,
+            panel: client.panels.len(),
+        }
+    })
+}
+
+/// The fixture waits for observed native geometry, not only a retained overlay.
+#[cfg(test)]
+pub fn confirmation_geometry(
+    handle: WindowHandle,
+) -> Result<bunny_ui::window::WindowGeometry, bunny_ui::window::WindowError> {
+    use bunny_ui::window::WindowError;
+    let index = handle.panel_slot().ok_or(WindowError::StaleWindow)?;
+    if is_x11() {
+        return crate::x11::dialog_geometry(index);
+    }
+    with_client(|client| {
+        client
+            .panels
+            .get(index)
+            .and_then(Option::as_ref)
+            .and_then(|panel| panel.role.dialog())
+            .ok_or(WindowError::StaleWindow)?
+            .observed
+            .ok_or(WindowError::GeometryUnavailable)
     })
 }
 

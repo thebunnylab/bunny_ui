@@ -38,6 +38,11 @@ for backend in x11 wayland; do
       cargo test -p bunny-ui-linux --locked --test system_appearance; then
       failures=$((failures + 1))
     fi
+    echo "Native confirmation backend=$backend paranoid=${paranoid:-off}"
+    if ! BUNNY_BACKEND="$backend" BUNNY_PARANOID="$paranoid" timeout 45s \
+      cargo test -p bunny-ui-linux --locked --lib confirmation_native_protocol -- --ignored --nocapture; then
+      failures=$((failures + 1))
+    fi
     echo "Window lifecycle backend=$backend paranoid=${paranoid:-off}"
     if ! BUNNY_BACKEND="$backend" BUNNY_PARANOID="$paranoid" BUNNY_WINDOW_LIFECYCLE_PROBE=1 timeout 100s \
       cargo test -p bunny-ui-linux --locked --test window_lifecycle; then
