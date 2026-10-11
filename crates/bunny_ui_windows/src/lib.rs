@@ -1164,11 +1164,15 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     });
     // Semantics follow every pixel path, including retained GPU early returns.
     let present = Rc::new({
+        let lifecycle = Rc::clone(&lifecycle);
         let paint = present;
         let accessibility = Rc::clone(&accessibility);
         let panels = Rc::clone(&panels);
         let dialogs = Rc::clone(&dialogs);
         move |runtime: &Runtime, display| {
+            if lifecycle.is_hidden() {
+                return;
+            }
             paint(runtime, display);
             let surfaces: Vec<_> = {
                 let panels = panels.borrow();
@@ -1699,6 +1703,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // has nothing left to draw
             AppEvent::WindowClosed => {}
         }
+        // A hidden scene can dirty state and then await another timer. Keep the
+        // task clock armed even when that turn deliberately skips presentation.
+        ffi::want_pace(window.raw_window(), pace_of(runtime));
     });
 
     Rc::new(Slot {

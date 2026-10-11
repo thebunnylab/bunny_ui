@@ -168,6 +168,8 @@ fn wake() {
         assert_eq!(reader.recv().await, Some("worker arrived"));
         assert_eq!(awakened.visibility(id), Ok(WindowVisibility::Hidden));
         value.set("after wake".into());
+        task::sleep(Duration::from_millis(200)).await;
+        assert_eq!(awakened.visibility(id), Ok(WindowVisibility::Hidden));
         awakened.show(id).unwrap();
         assert_eq!(awakened.visibility(id), Ok(WindowVisibility::Shown));
         assert_eq!(value.get(), "after wake");
@@ -245,14 +247,18 @@ pub fn child_surfaces(visible_children: fn(&str) -> usize) {
     let running = app.clone();
     task::spawn(async move {
         task::sleep(Duration::from_millis(200)).await;
+        eprintln!("Lifecycle children: initial frame settled");
         let before = visible_children("Lifecycle parent");
         assert!(before >= 2, "dialog and its popup are actually visible: {before}");
+        eprintln!("Lifecycle children: hiding parent with {before} visible surfaces");
         running.hide(id).unwrap();
         assert_eq!(visible_children("Lifecycle parent"), 0, "hiding the owner hides every descendant");
+        eprintln!("Lifecycle children: hidden; mutating draft and awaiting timer");
         value.set("changed while hidden".into());
         runtime.request_frame();
         task::sleep(Duration::from_millis(200)).await;
         assert_eq!(visible_children("Lifecycle parent"), 0, "background work must not reveal an overlay");
+        eprintln!("Lifecycle children: timer woke; showing parent");
         running.show(id).unwrap();
         task::sleep(Duration::from_millis(200)).await;
         assert_eq!(visible_children("Lifecycle parent"), before, "show restores retained child surfaces");

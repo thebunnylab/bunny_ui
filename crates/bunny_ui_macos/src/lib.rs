@@ -1691,11 +1691,15 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // The semantic presenter follows EVERY pixel path, including a retained
     // GPU frame whose early return correctly painted nothing new.
     let present = Rc::new({
+        let lifecycle = Rc::clone(&lifecycle);
         let paint = present;
         let accessibility = Rc::clone(&accessibility);
         let panels = Rc::clone(&panels);
         let dialogs = Rc::clone(&dialogs);
         move |runtime: &Runtime, display, via| {
+            if lifecycle.is_hidden() {
+                return;
+            }
             paint(runtime, display, via);
             let panels = panels.borrow();
             let dialogs = dialogs.borrow();

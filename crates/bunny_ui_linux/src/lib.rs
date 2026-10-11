@@ -777,12 +777,16 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // present takes a READY display list to the window — the tick path
     // reuses it without paying settle or effects
     let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList)> = Rc::new({
+        let lifecycle = Rc::clone(&lifecycle);
         let surface = Rc::clone(&surface);
         let panels = Rc::clone(&panels);
         let dialogs = Rc::clone(&dialogs);
         let accessibility = Rc::clone(&accessibility);
         let title = spec.title.to_string();
         move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| {
+            if lifecycle.is_hidden() {
+                return;
+            }
             (|| {
             let (width, height) = window.content_size();
             let scale = window.scale();
