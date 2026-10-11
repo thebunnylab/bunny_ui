@@ -39,7 +39,17 @@ mod window_mapping;
 mod window_scale_tests;
 #[path = "geometry_ops.rs"]
 mod geometry_ops;
-pub use geometry_ops::{register_geometry, forget_geometry, window_geometry, restore_window_placement};
+#[path = "dialog_geometry_ops.rs"]
+mod dialog_geometry_ops;
+pub use geometry_ops::{
+    forget_geometry, queue_dialog_geometry, register_geometry, restore_window_placement,
+    window_geometry,
+};
+
+/// X11 has its own event registry; its panel index names the same host slot.
+pub(super) fn notify_dialog_geometry(index: usize) {
+    dialog_geometry_ops::notify(index);
+}
 
 /// Captures an X11 notification outside its client registry borrow.
 pub fn notify_geometry(window: usize) {
@@ -1616,6 +1626,12 @@ struct Dialog {
     /// configure that commits it.
     pending: Option<(f64, f64)>,
     pending_maximized: bool,
+    pending_authority: geometry_ops::SizeAuthority,
+    size_authority: geometry_ops::SizeAuthority,
+    /// Restoration is a layout target, not an observed configure or commit.
+    requested: Option<(f64, f64)>,
+    /// Actual content size and scale of the last committed native buffer.
+    observed: Option<bunny_ui::window::WindowGeometry>,
     /// The size the compositor granted — the frame layout follows.
     /// `None` until it names one: the dialog then keeps its own.
     granted: Option<(f64, f64)>,
@@ -1639,12 +1655,18 @@ impl Dialog {
                 Some((f64::from(width).max(self.min.0), f64::from(height).max(self.min.1)));
         }
         self.pending_maximized = states.contains(&MAXIMIZED);
+        self.pending_authority = geometry_ops::SizeAuthority::from_states(states);
     }
 
     /// The xdg configure commits what the toplevel said. `true` when the
     /// granted size changed — the owner must lay the dialog out again.
     fn commit(&mut self) -> bool {
         self.maximized = self.pending_maximized;
+        self.size_authority = self.pending_authority;
+        if self.pending.is_some() || self.size_authority == geometry_ops::SizeAuthority::Compositor
+        {
+            self.requested = None;
+        }
         match self.pending.take() {
             Some(granted) if self.granted != Some(granted) => {
                 self.granted = Some(granted);
@@ -1851,6 +1873,8 @@ pub enum TouchPhase {
 pub enum AppEvent {
     /// Captured native geometry addressed to its non-recycled scene lifetime.
     GeometryChanged(bunny_ui::window::GeometryObservation),
+    /// Native dialog facts scoped to their presentation lease.
+    DialogGeometryChanged(bunny_ui::window::DialogGeometryObservation),
     Redraw,
     /// This window closed — by its button, the compositor, or the app;
     /// its slot retires. Delivered at the window, before it is gone.
@@ -2810,6 +2834,7 @@ impl WindowHandle {
         if self.panel == 0 {
             return;
         }
+        dialog_geometry_ops::forget(self.panel - 1);
         if is_x11() {
             return crate::x11::close_panel(self.panel - 1);
         }
@@ -2845,6 +2870,16 @@ impl WindowHandle {
         });
     }
 
+    /// Binds this native panel slot to one runtime-owned dialog presentation.
+    pub fn bind_dialog_geometry(
+        &self,
+        session: Option<std::rc::Rc<bunny_ui::window::DialogGeometrySession>>,
+    ) -> bool {
+        self.panel
+            .checked_sub(1)
+            .is_some_and(|index| dialog_geometry_ops::bind(index, self.window, session))
+    }
+
     /// The size the compositor granted this dialog's window, in points —
     /// `None` until it names one (or for a handle that is no dialog). The
     /// frame layout follows it: the window drives, the content follows.
@@ -2862,7 +2897,7 @@ impl WindowHandle {
                 .get(self.panel - 1)
                 .and_then(Option::as_ref)
                 .and_then(|panel| panel.role.dialog())
-                .and_then(|dialog| dialog.granted)
+                .and_then(|dialog| dialog.requested.or(dialog.granted))
         })
     }
 }
@@ -2928,6 +2963,10 @@ pub fn create_dialog(
         decoration: std::ptr::null_mut(),
         pending: None,
         pending_maximized: false,
+        pending_authority: geometry_ops::SizeAuthority::Client,
+        size_authority: geometry_ops::SizeAuthority::Client,
+        requested: None,
+        observed: None,
         granted: None,
         maximized: false,
         logical: (0.0, 0.0),
@@ -2983,6 +3022,7 @@ unsafe fn teardown_panel(panel: Panel, state: &mut window_ops::WindowOps) {
 
 fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height: usize, rgba: &[u8]) {
     let (x, y, w, h) = rect;
+    let mut geometry_changed = false;
     with_client(|client| {
         let owner = client.panels.get(index).and_then(|p| p.as_ref()).map_or(0, |p| p.owner);
         let (mut parent_surface, mut parent_xdg, mut parent_logical, parent_toplevel, scale) =
@@ -3227,10 +3267,13 @@ fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height:
             return;
         }
         unsafe {
-            flush_panel_pixels(client.shm, panel, width, height, &bytes, scale);
+            geometry_changed = flush_panel_pixels(client.shm, panel, width, height, &bytes, scale);
             wl_display_flush(client.display);
         }
     });
+    if geometry_changed {
+        dialog_geometry_ops::notify(index);
+    }
 }
 
 /// Writes the premultiplied pixels into the panel's shm and commits.
@@ -3241,7 +3284,7 @@ unsafe fn flush_panel_pixels(
     height: usize,
     bytes: &[u8],
     scale: usize,
-) {
+) -> bool {
     unsafe {
         let stale = panel
             .backing
@@ -3257,10 +3300,12 @@ unsafe fn flush_panel_pixels(
             const ARGB8888: u32 = 0;
             panel.backing = make_backing(shm, width, height, ARGB8888, TAG_SYNC);
         }
-        let Some(backing) = panel.backing.as_mut() else { return };
+        let Some(backing) = panel.backing.as_mut() else {
+            return false;
+        };
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), backing.map, bytes.len().min(backing.len));
         let surface_version = wl_proxy_get_version(panel.surface);
-        if scale > 1 && surface_version >= 3 {
+        if surface_version >= 3 {
             request(panel.surface, 8, &mut [arg_i(scale as i32)]);
         }
         request(panel.surface, 1, &mut [arg_o(backing.buffer), arg_i(0), arg_i(0)]);
@@ -3274,6 +3319,32 @@ unsafe fn flush_panel_pixels(
             request(panel.surface, 2, &mut [arg_i(0), arg_i(0), arg_i(i32::MAX), arg_i(i32::MAX)]);
         }
         request(panel.surface, 6, &mut no_args());
+        let actual_scale = if surface_version >= 3 { scale } else { 1 };
+        let observed =
+            geometry_ops::committed_size(width, height, actual_scale).and_then(|(w, h)| {
+                bunny_ui::window::WindowSize::new(w, h)
+                    .ok()
+                    .and_then(|size| {
+                        bunny_ui::window::WindowGeometry::new(
+                            size,
+                            None,
+                            u32::try_from(actual_scale).map(f64::from).ok()?,
+                        )
+                        .ok()
+                    })
+            });
+        if let Some(dialog) = panel.role.dialog_mut() {
+            let previous = std::mem::replace(&mut dialog.observed, observed);
+            if let Some(observed) = observed {
+                let size = (observed.size().width(), observed.size().height());
+                if dialog.requested == Some(size) {
+                    dialog.requested = None;
+                    dialog.granted = Some(size);
+                }
+            }
+            return previous != observed;
+        }
+        false
     }
 }
 
@@ -5060,6 +5131,7 @@ fn drain_protocol_events() {
                 }
             }
             Ev::PanelConfigure { index, serial } => {
+                let mut geometry_changed = false;
                 let resized = with_client(|client| {
                     let shm = client.shm;
                     let owner =
@@ -5077,12 +5149,16 @@ fn drain_protocol_events() {
                         .then_some(owner);
                     if let Some((width, height, bytes)) = panel.staged.take() {
                         unsafe {
-                            flush_panel_pixels(shm, panel, width, height, &bytes, scale);
+                            geometry_changed =
+                                flush_panel_pixels(shm, panel, width, height, &bytes, scale);
                             wl_display_flush(client.display);
                         }
                     }
                     resized
                 });
+                if geometry_changed {
+                    dialog_geometry_ops::notify(index);
+                }
                 // the frame follows the window: the owner lays the
                 // dialog out again at the size it was given
                 if let Some(owner) = resized {
@@ -5822,6 +5898,10 @@ fn suspend_window_panels(client: &mut Client, window: usize) {
                     decoration: std::ptr::null_mut(),
                     pending: None,
                     pending_maximized: false,
+                    pending_authority: geometry_ops::SizeAuthority::Client,
+                    size_authority: geometry_ops::SizeAuthority::Client,
+                    requested: None,
+                    observed: None,
                     granted: None,
                     maximized: false,
                     logical: d.logical,
@@ -6274,11 +6354,37 @@ mod tests {
             decoration: std::ptr::null_mut(),
             pending: None,
             pending_maximized: false,
+            pending_authority: geometry_ops::SizeAuthority::Client,
+            size_authority: geometry_ops::SizeAuthority::Client,
+            requested: None,
+            observed: None,
             granted: None,
             maximized: false,
             logical: (0.0, 0.0),
             fixed: false,
         }
+    }
+
+    #[test]
+    fn dialog_requests_and_configures_do_not_fabricate_buffer_observations() {
+        let mut account = dialog((280.0, 180.0));
+        account.requested = Some((470.0, 310.0));
+        account.hear(0, 0, &[]);
+        account.commit();
+        assert_eq!(account.requested, Some((470.0, 310.0)));
+        assert_eq!(account.observed, None);
+        account.hear(900, 700, &[1]);
+        assert_eq!(account.size_authority, geometry_ops::SizeAuthority::Client);
+        account.commit();
+        assert_eq!(
+            account.size_authority,
+            geometry_ops::SizeAuthority::Compositor
+        );
+        assert_eq!(account.requested, None);
+        assert_eq!(
+            account.observed, None,
+            "only an actual buffer commit can set the observation"
+        );
     }
 
     /// The compositor's first word is usually 0 × 0 — the dialog opens

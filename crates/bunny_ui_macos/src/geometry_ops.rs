@@ -6,10 +6,14 @@ use super::{
     msg_rect, msg_rect_rect, msg_u64, msg_void_rect_bool, sel,
 };
 use bunny_ui::window::{
-    DesktopPosition, DesktopSpace, GeometryEvents, WindowError, WindowGeometry, WindowId,
-    WindowPlacement, WindowSize,
+    DesktopPosition, DesktopSpace, DialogGeometrySession, GeometryEvents, WindowError,
+    WindowGeometry, WindowId, WindowPlacement, WindowSize,
 };
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    rc::{Rc, Weak},
+};
 
 #[allow(
     clashing_extern_declarations,
@@ -23,7 +27,74 @@ unsafe extern "C" {
     fn at(value: Id, selector: Sel, index: u64) -> Id;
 }
 
-thread_local! { static SOURCES: RefCell<HashMap<usize, Rc<GeometryEvents>>> = RefCell::new(HashMap::new()); }
+thread_local! {
+    static SOURCES: RefCell<HashMap<usize, Rc<GeometryEvents>>> = RefCell::new(HashMap::new());
+    static DIALOGS: RefCell<HashMap<usize, DialogSource>> = RefCell::new(HashMap::new());
+}
+
+struct DialogSource {
+    parent: usize,
+    view: Id,
+    session: Weak<DialogGeometrySession>,
+}
+
+pub(super) fn bind_dialog(
+    window: usize,
+    view: Id,
+    parent: usize,
+    session: Option<Rc<DialogGeometrySession>>,
+) -> bool {
+    let changed = DIALOGS.with(|sources| {
+        let mut sources = sources.borrow_mut();
+        if let Some(session) = &session {
+            let weak = Rc::downgrade(session);
+            if sources
+                .get(&window)
+                .is_some_and(|source| source.session.ptr_eq(&weak))
+            {
+                return false;
+            }
+            sources.insert(
+                window,
+                DialogSource {
+                    parent,
+                    view,
+                    session: weak,
+                },
+            );
+            true
+        } else {
+            sources.remove(&window);
+            false
+        }
+    });
+    if changed && let Some(session) = session {
+        if let Some(placement) = session.take_restoration()
+            && let Err(error) = super::lend_hand(|| restore(window, view, placement))
+            && let Some(event) = session.capture(Err(error))
+        {
+            super::queue_dialog_geometry(event);
+        }
+        notify_dialog(window);
+    }
+    changed
+}
+
+pub(super) fn notify_dialog(window: usize) {
+    let source = DIALOGS.with(|sources| {
+        sources.borrow().get(&window).and_then(|source| {
+            source
+                .session
+                .upgrade()
+                .map(|session| (source.view, session))
+        })
+    });
+    if let Some((view, session)) = source
+        && let Some(event) = session.capture(geometry(window, view))
+    {
+        super::queue_dialog_geometry(event);
+    }
+}
 
 /// Binds observations to a stable lifetime before the scene starts delivering events.
 pub fn register_geometry(window: usize, events: Rc<GeometryEvents>) {
@@ -38,6 +109,11 @@ pub fn forget_geometry(window: usize, id: WindowId) {
         let mut sources = sources.borrow_mut();
         if sources.get(&window).is_some_and(|events| events.id() == id) {
             sources.remove(&window);
+            DIALOGS.with(|dialogs| {
+                dialogs
+                    .borrow_mut()
+                    .retain(|_, source| source.parent != window)
+            });
         }
     });
 }
@@ -67,7 +143,10 @@ fn primary_frame() -> Result<CGRect, WindowError> {
 
 /// Reads the real content viewport and screen position without emitting an event.
 pub fn window_geometry(window: usize) -> Result<WindowGeometry, WindowError> {
-    let view = view(window)?;
+    geometry(window, view(window)?)
+}
+
+fn geometry(window: usize, view: Id) -> Result<WindowGeometry, WindowError> {
     let primary = primary_frame()?;
     unsafe {
         let bounds = msg_rect(view, sel("bounds"));
@@ -140,7 +219,10 @@ pub fn restore_window_placement(
     window: usize,
     placement: WindowPlacement,
 ) -> Result<(), WindowError> {
-    view(window)?;
+    restore(window, view(window)?, placement)
+}
+
+fn restore(window: usize, view: Id, placement: WindowPlacement) -> Result<(), WindowError> {
     if placement
         .position()
         .is_some_and(|position| position.space() != DesktopSpace::AppKitPoints)
@@ -151,7 +233,7 @@ pub fn restore_window_placement(
     }
     let position = match placement.position() {
         Some(position) => position,
-        None => window_geometry(window)?
+        None => geometry(window, view)?
             .position()
             .ok_or(WindowError::GeometryUnavailable)?,
     };

@@ -303,6 +303,10 @@ impl AppInner {
         }));
         let app = Rc::clone(self);
         ffi::set_handler(Box::new(move |event| {
+            if let AppEvent::DialogGeometryChanged(observation) = event {
+                observation.deliver();
+                return;
+            }
             if let AppEvent::GeometryChanged(observation) = event {
                 if let Some(slot) = app.live().into_iter().find(|slot| slot.lifecycle.id() == observation.id()) {
                     slot.lifecycle.geometry_events().observe_captured(&observation);
@@ -346,7 +350,13 @@ impl AppInner {
     }
 
     fn buried(&self, window: usize) {
-        if let Some(slot) = self.slots.borrow().iter().find(|slot| slot.window == window) {
+        if let Some(slot) = self
+            .slots
+            .borrow()
+            .iter()
+            .find(|slot| slot.window == window)
+        {
+            slot.runtime.retire_dialog_geometry();
             slot.lifecycle.geometry_events().retire();
             ffi::forget_geometry(slot.window, slot.lifecycle.id());
             self.relationships.retire(slot.lifecycle.id());
@@ -412,6 +422,7 @@ impl App {
     pub fn close(&self, id: WindowId) {
         self.close_children(id);
         if let Some(slot) = self.slot(id) {
+            slot.runtime.retire_dialog_geometry();
             slot.lifecycle.geometry_events().retire();
             ffi::forget_geometry(slot.window, id);
             ffi::close_top_level(slot.window);
@@ -731,6 +742,7 @@ struct DialogWindow {
 /// as long as it does — the frame path, the pools, the gates and the
 /// event handler — into a slot the app routes to.
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
+    runtime.set_dialog_geometry_dispatch(ffi::queue_dialog_geometry);
     let lifecycle = Rc::new(Lifecycle::default());
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
@@ -896,48 +908,40 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         bunny_ui::layout::OverlaySurface::Layer => None,
                     };
                     if let Some((title, min, scene, fixed)) = asked {
-                        let dialog =
-                            dialog_store.entry(overlay.path.clone()).or_insert_with(|| {
-                                DialogWindow {
-                                    handle: ffi::create_dialog(
-                                        &window,
-                                        title,
-                                        min,
-                                        scene,
-                                        (
-                                            frame.origin.x,
-                                            frame.origin.y,
-                                            frame.size.width,
-                                            frame.size.height,
-                                        ),
-                                        fixed,
-                                    ),
-                                    origin: frame.origin,
-                                }
-                            });
+                        let dialog = dialog_store.entry(overlay.path.clone()).or_insert_with(|| {
+                            DialogWindow {
+                                handle: ffi::create_dialog(
+                                    &window, title, min, scene,
+                                    (frame.origin.x, frame.origin.y, frame.size.width, frame.size.height),
+                                    fixed,
+                                ),
+                                origin: frame.origin,
+                            }
+                        });
                         dialog.origin = frame.origin;
                         let (x, y) = (frame.origin.x, frame.origin.y);
-                        let (w, h) = (frame.size.width, frame.size.height);
+                        let changed = dialog.handle.bind_dialog_geometry(
+                            runtime.dialog_geometry_session(&overlay.path),
+                        );
+                        let (w, h) = dialog.handle.dialog_size()
+                            .unwrap_or((frame.size.width, frame.size.height));
+                        if changed {
+                            runtime.set_dialog_frame(&overlay.path, bunny_ui::layout::Rect {
+                                origin: frame.origin,
+                                size: Size { width: w, height: h },
+                            });
+                        }
                         dialog.handle.set_scene_origin(x, y);
                         let slice = full_display.translated_slice(overlay.display, -x, -y);
                         let physical =
                             ((w * scale as f64).round() as usize, (h * scale as f64).round() as usize);
-                        // the window's own ground under the content — a
-                        // toplevel has no parent pixels to show through
+                        // A native dialog has no parent pixels to show through.
                         let bitmap = bunny_ui::raster::rasterize_with(
-                            &slice,
-                            physical.0,
-                            physical.1,
-                            scale,
-                            canvas,
-                            &*runtime.text(),
-                            &*runtime.images(),
+                            &slice, physical.0, physical.1, scale, canvas,
+                            &*runtime.text(), &*runtime.images(),
                         );
                         dialog.handle.present_layered(
-                            (x, y, w, h),
-                            physical.0,
-                            physical.1,
-                            &bitmap.to_rgba_bytes(),
+                            (x, y, w, h), physical.0, physical.1, &bitmap.to_rgba_bytes(),
                         );
                         continue;
                     }
@@ -1424,9 +1428,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             alt_tap.borrow_mut().interrupted();
         }
         match event {
-            AppEvent::GeometryChanged(_) => return,
-        AppEvent::Redraw => blit(runtime, root, ORIGIN_REDRAW),
-            AppEvent::WindowClosed => {}
+            AppEvent::GeometryChanged(_) | AppEvent::DialogGeometryChanged(_) => return,
+            AppEvent::Redraw => blit(runtime, root, ORIGIN_REDRAW),
+            AppEvent::WindowClosed => runtime.retire_dialog_geometry(),
             AppEvent::DialogClose { panel } => {
                 // its ✕ or the compositor: the window did NOT close — the
                 // overlay's dismissal flips the app's binding, and the

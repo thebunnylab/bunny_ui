@@ -146,11 +146,10 @@ fn origin(client: &XClient, window: u32) -> Result<(i16, i16), WindowError> {
     }
 }
 
-fn observed(client: &XClient, window: u32) -> Result<WindowGeometry, WindowError> {
-    let win = window_ref(client, window).ok_or(WindowError::StaleWindow)?;
+fn observed(client: &XClient, window: u32, scale: usize) -> Result<WindowGeometry, WindowError> {
     let native = geometry(client, window)?;
     let (x, y) = origin(client, window)?;
-    let scale = u32::try_from(win.scale)
+    let scale = u32::try_from(scale)
         .map(f64::from)
         .map_err(|_| WindowError::GeometryUnavailable)?;
     let size = WindowSize::new(
@@ -164,7 +163,15 @@ fn observed(client: &XClient, window: u32) -> Result<WindowGeometry, WindowError
 
 /// Queries the actual server content size and root-space origin.
 pub fn window_geometry(window: u32) -> Result<WindowGeometry, WindowError> {
-    with_x(|client| observed(client, window))
+    with_x(|client| {
+        observed(
+            client,
+            window,
+            window_ref(client, window)
+                .ok_or(WindowError::StaleWindow)?
+                .scale,
+        )
+    })
 }
 
 fn atom(client: &XClient, name: &std::ffi::CStr) -> Result<u32, WindowError> {
@@ -317,63 +324,109 @@ pub fn restore_window_placement(
     placement: WindowPlacement,
 ) -> Result<(), WindowError> {
     with_x(|client| {
-        let current = observed(client, window)?;
-        if placement
-            .position()
-            .is_some_and(|position| position.space() != DesktopSpace::X11Pixels)
-        {
-            return Err(WindowError::InvalidGeometry(
-                "position is not in X11 root pixels",
-            ));
-        }
-        let position = placement
-            .position()
-            .or_else(|| current.position())
-            .ok_or(WindowError::GeometryUnavailable)?;
-        let scale = current.scale_factor();
-        let size_hints = atom(client, c"WM_SIZE_HINTS")?;
-        let mut hints = property(client, window, c"WM_NORMAL_HINTS", size_hints)?
-            .unwrap_or_else(|| vec![0; 18]);
-        if hints.len() < 15 {
-            return Err(WindowError::GeometryUnavailable);
-        }
-        hints.resize(18, 0);
-        let minimum = if hints[0] & (1 << 4) != 0 {
-            (f64::from(hints[5].max(1)), f64::from(hints[6].max(1)))
-        } else {
-            (1.0, 1.0)
-        };
-        let maximum = if hints[0] & (1 << 5) != 0 {
-            (f64::from(hints[7]), f64::from(hints[8]))
-        } else {
-            (f64::from(u16::MAX), f64::from(u16::MAX))
-        };
-        if minimum.0 > maximum.0 || minimum.1 > maximum.1 {
-            return Err(WindowError::GeometryUnavailable);
-        }
-        let extents = match property(client, window, c"_NET_FRAME_EXTENTS", 6)? {
-            None => undecorated_extents(client, window)?,
-            Some(values) => {
-                let [left, right, top, bottom] = values.as_slice() else {
-                    return Err(WindowError::GeometryUnavailable);
-                };
-                [*left, *right, *top, *bottom].map(f64::from)
-            }
-        };
-        let target = fit(
-            Bounds {
-                x: position.x().round(),
-                y: position.y().round(),
-                width: (placement.size().width() * scale).round(),
-                height: (placement.size().height() * scale).round(),
-            },
-            work_area(client)?,
-            extents,
-            minimum,
-            maximum,
-        )?;
-        send_placement(client, window, target, hints, size_hints)
+        restore(
+            client,
+            window,
+            window_ref(client, window)
+                .ok_or(WindowError::StaleWindow)?
+                .scale,
+            placement,
+        )
     })
+}
+
+pub fn dialog_geometry(index: usize) -> Result<WindowGeometry, WindowError> {
+    with_x(|client| {
+        let (window, scale) = dialog(client, index)?;
+        observed(client, window, scale)
+    })
+}
+
+pub fn restore_dialog_placement(
+    index: usize,
+    placement: WindowPlacement,
+) -> Result<(), WindowError> {
+    with_x(|client| {
+        let (window, scale) = dialog(client, index)?;
+        restore(client, window, scale, placement)
+    })
+}
+
+fn dialog(client: &XClient, index: usize) -> Result<(u32, usize), WindowError> {
+    let panel = client
+        .panels
+        .get(index)
+        .and_then(Option::as_ref)
+        .ok_or(WindowError::StaleWindow)?;
+    panel.role.dialog().ok_or(WindowError::StaleWindow)?;
+    let scale = window_ref(client, panel.owner)
+        .ok_or(WindowError::StaleWindow)?
+        .scale;
+    Ok((panel.window, scale))
+}
+
+fn restore(
+    client: &XClient,
+    window: u32,
+    scale: usize,
+    placement: WindowPlacement,
+) -> Result<(), WindowError> {
+    let current = observed(client, window, scale)?;
+    if placement
+        .position()
+        .is_some_and(|position| position.space() != DesktopSpace::X11Pixels)
+    {
+        return Err(WindowError::InvalidGeometry(
+            "position is not in X11 root pixels",
+        ));
+    }
+    let position = placement
+        .position()
+        .or_else(|| current.position())
+        .ok_or(WindowError::GeometryUnavailable)?;
+    let scale = current.scale_factor();
+    let size_hints = atom(client, c"WM_SIZE_HINTS")?;
+    let mut hints =
+        property(client, window, c"WM_NORMAL_HINTS", size_hints)?.unwrap_or_else(|| vec![0; 18]);
+    if hints.len() < 15 {
+        return Err(WindowError::GeometryUnavailable);
+    }
+    hints.resize(18, 0);
+    let minimum = if hints[0] & (1 << 4) != 0 {
+        (f64::from(hints[5].max(1)), f64::from(hints[6].max(1)))
+    } else {
+        (1.0, 1.0)
+    };
+    let maximum = if hints[0] & (1 << 5) != 0 {
+        (f64::from(hints[7]), f64::from(hints[8]))
+    } else {
+        (f64::from(u16::MAX), f64::from(u16::MAX))
+    };
+    if minimum.0 > maximum.0 || minimum.1 > maximum.1 {
+        return Err(WindowError::GeometryUnavailable);
+    }
+    let extents = match property(client, window, c"_NET_FRAME_EXTENTS", 6)? {
+        None => undecorated_extents(client, window)?,
+        Some(values) => {
+            let [left, right, top, bottom] = values.as_slice() else {
+                return Err(WindowError::GeometryUnavailable);
+            };
+            [*left, *right, *top, *bottom].map(f64::from)
+        }
+    };
+    let target = fit(
+        Bounds {
+            x: position.x().round(),
+            y: position.y().round(),
+            width: (placement.size().width() * scale).round(),
+            height: (placement.size().height() * scale).round(),
+        },
+        work_area(client)?,
+        extents,
+        minimum,
+        maximum,
+    )?;
+    send_placement(client, window, target, hints, size_hints)
 }
 
 fn send_placement(

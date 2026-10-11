@@ -8,8 +8,12 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod dialog_geometry;
 mod geometry;
 mod relationships;
+pub use dialog_geometry::DialogGeometry;
+#[doc(hidden)]
+pub use dialog_geometry::{DialogGeometryObservation, DialogGeometrySession};
 #[doc(hidden)]
 pub use geometry::{GeometryEvents, GeometryObservation};
 pub use geometry::{DesktopPosition, DesktopSpace, WindowGeometry, WindowPlacement, WindowSize};
@@ -63,6 +67,8 @@ pub enum WindowError {
     InvalidGeometry(&'static str),
     /// The native window has not supplied usable geometry in its current state.
     GeometryUnavailable,
+    /// A dialog geometry controller is already attached to another presentation.
+    GeometryInUse,
     /// A native operation failed with its platform error code.
     NativeFailure {
         /// The native operation that failed.
@@ -87,6 +93,9 @@ impl std::fmt::Display for WindowError {
             Self::FocusDenied => f.write_str("window system declined activation"),
             Self::InvalidGeometry(reason) => write!(f, "invalid window geometry: {reason}"),
             Self::GeometryUnavailable => f.write_str("window geometry is not yet available"),
+            Self::GeometryInUse => {
+                f.write_str("dialog geometry already has an active presentation")
+            }
             Self::NativeFailure { operation, code } => {
                 write!(f, "{operation} failed: native error {code}")
             }

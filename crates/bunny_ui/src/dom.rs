@@ -1775,7 +1775,7 @@ impl DomLowering {
         let mut fresh = 0;
         let mut fresh_classes = 0;
         for (path, record) in groups {
-            let reads_its_class = record.class_binding.is_some();
+            let reads_its_class = record.class_binding().is_some();
             if self.group_paths.insert(path, record).is_none() {
                 fresh += 1;
                 fresh_classes += usize::from(reads_its_class);
@@ -8699,7 +8699,14 @@ mod size_tests {
         assert!(size_of::<Option<super::DomLayout>>() <= 84, "DomLayout grew: a length is an f32");
         // a stack, a text and a style carry their hints and their action,
         // the text the widest: a wrapper for each was a box per row
-        assert!(size_of::<crate::layout::LayoutNode>() <= 120, "LayoutNode grew: box the rare payload");
+        assert!(
+            size_of::<crate::layout::LayoutNode>() <= 120,
+            "LayoutNode grew: box the rare payload"
+        );
+        assert!(
+            size_of::<crate::dom_flow::GroupRecord>() <= 48,
+            "GroupRecord grew: share rare attachments off the row"
+        );
         // a patch list is thousands long on a create: its slot must stay
         // small, the fat records boxed
         assert!(size_of::<super::DomPatch>() <= 96, "DomPatch grew: box the record, not the list");

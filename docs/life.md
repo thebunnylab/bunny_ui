@@ -217,6 +217,51 @@ app that already EXITED needs a COM server the registry knows — both
 the app's own setup. Linux announces sleep only where logind runs,
 which is where a laptop runs.
 
+## Persistent dialog placement
+
+A `.dialog` can opt into native placement with
+`DialogSpec::titled("Inspector").geometry(controller.clone())`, where
+`controller` is `bunny_ui::window::DialogGeometry`. Keep one controller per
+independently open dialog. `DialogGeometry::new()` retains the usual initial
+placement; `DialogGeometry::restoring(saved_placement)` requests a saved content
+frame. Minimum sizes and available desktop work areas still apply. Alerts
+retain their ordinary centered, content-sized policy.
+
+`controller.on_change(|result| { ... })` receives actual native geometry or a
+restoration error on the UI thread, outside native and renderer borrows. Save
+successful `WindowGeometry::placement()` values in the application's own
+storage, including the `DesktopSpace` tag; pass one back when constructing the
+controller in a fresh process. The framework adds no serialization or storage
+dependency. `geometry()` retains the last actual observation after dismissal;
+reopening prefers it to the original restoration request. A request alone never
+populates this getter. `last_error()` retains the last failure of the current
+presentation even if later native observations succeed.
+
+Each opening owns a separate presentation lease. Dismissal, controller
+replacement and parent destruction invalidate its queued events, including
+when the app retains the runtime or AppKit pools the native window. Replacing
+or clearing the callback invalidates events captured for the old subscription.
+Callbacks may close or reopen windows; reentrant observations retain their
+order and only consecutive identical results are suppressed. Simultaneously
+attaching one controller to multiple presentations reports `GeometryInUse` and
+leaves the original presentation's lease intact.
+
+AppKit positions use points relative to the primary display's top-left; Win32
+and X11 positions use their tagged desktop/root pixels. A position from a
+different desktop space is rejected before changing size. Wayland rejects
+requests containing global position. Its dialog size and scale observations
+come from actual native buffer commits, independently of the pending layout
+request. A compositor-controlled size cannot be replaced by a client request.
+Scene-only hosts, including DOM flow and canvas islands, explicitly report
+`Unsupported` and produce no native geometry.
+
+The `dialog_geometry` native test covers restore, close/reopen, live controller
+replacement, invalid coordinate spaces, minimum sizes, missing displays,
+closing the parent from a callback and persistence into a second process.
+Linux runs with `BUNNY_DIALOG_GEOMETRY_PROBE=1` under the X11/Wayland display
+harness. These are native API observations, not physical input, pixel,
+screen-reader or mixed-display qualification.
+
 ## macOS dialog modality
 
 `.dialog` creates a child `NSWindow` with framework-managed modality. It is

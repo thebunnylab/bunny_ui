@@ -7,13 +7,13 @@ use super::{
     is_top_level, wears_scene_chrome,
 };
 use bunny_ui::window::{
-    DesktopPosition, DesktopSpace, GeometryEvents, WindowError, WindowGeometry, WindowId,
-    WindowPlacement, WindowSize,
+    DesktopPosition, DesktopSpace, DialogGeometrySession, GeometryEvents, WindowError,
+    WindowGeometry, WindowId, WindowPlacement, WindowSize,
 };
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
-    rc::Rc,
+    rc::{Rc, Weak},
 };
 
 #[link(name = "user32", kind = "raw-dylib")]
@@ -27,9 +27,69 @@ unsafe extern "system" {
 
 thread_local! { static SOURCES: RefCell<HashMap<usize, Rc<GeometryEvents>>> = RefCell::new(HashMap::new()); }
 thread_local! {
-    static PENDING: RefCell<VecDeque<(Hwnd, bunny_ui::window::GeometryObservation)>> = const { RefCell::new(VecDeque::new()) };
+    static PENDING: RefCell<VecDeque<(Hwnd, AppEvent)>> = const { RefCell::new(VecDeque::new()) };
+    static DIALOGS: RefCell<HashMap<Hwnd, (Hwnd, Weak<DialogGeometrySession>)>> = RefCell::new(HashMap::new());
     static DELIVERING: Cell<bool> = const { Cell::new(false) };
     static MUTATING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Enqueues without entering application code during a native or renderer borrow.
+pub fn queue_dialog_geometry(event: bunny_ui::window::DialogGeometryObservation) {
+    PENDING.with(|pending| {
+        pending
+            .borrow_mut()
+            .push_back((0, AppEvent::DialogGeometryChanged(event)))
+    });
+    super::wake_from_any_thread();
+}
+
+pub(super) fn bind_dialog(hwnd: Hwnd, parent: Hwnd, session: Option<Rc<DialogGeometrySession>>) {
+    let changed = DIALOGS.with(|sources| {
+        let mut sources = sources.borrow_mut();
+        if let Some(session) = &session {
+            let weak = Rc::downgrade(session);
+            if sources.get(&hwnd).is_some_and(|(_, old)| old.ptr_eq(&weak)) {
+                return false;
+            }
+            sources.insert(hwnd, (parent, weak));
+            true
+        } else {
+            sources.remove(&hwnd);
+            false
+        }
+    });
+    if changed && let Some(session) = session {
+        if let Some(placement) = session.take_restoration()
+            && let Err(error) = restore_hwnd(hwnd, placement)
+            && let Some(event) = session.capture(Err(error))
+        {
+            queue_dialog_geometry(event);
+        }
+        notify_dialog(hwnd);
+    }
+}
+
+pub(super) fn forget_dialog(hwnd: Hwnd) {
+    let source = DIALOGS.with(|sources| sources.borrow_mut().remove(&hwnd));
+    if let Some((_, session)) = source
+        && let Some(session) = session.upgrade()
+    {
+        session.retire();
+    }
+}
+
+pub(super) fn notify_dialog(hwnd: Hwnd) {
+    let session = DIALOGS.with(|sources| {
+        sources
+            .borrow()
+            .get(&hwnd)
+            .and_then(|(_, session)| session.upgrade())
+    });
+    if let Some(session) = session
+        && let Some(event) = session.capture(geometry(hwnd))
+    {
+        queue_dialog_geometry(event);
+    }
 }
 
 /// Associates future observations with a non-recycled scene identity.
@@ -45,12 +105,17 @@ pub fn forget_geometry(window: usize, id: WindowId) {
         let mut sources = sources.borrow_mut();
         if sources.get(&window).is_some_and(|events| events.id() == id) {
             sources.remove(&window);
+            DIALOGS.with(|sources| {
+                sources
+                    .borrow_mut()
+                    .retain(|_, (parent, _)| usize::from_ne_bytes(parent.to_ne_bytes()) != window)
+            });
         }
     });
     PENDING.with(|pending| {
         pending
             .borrow_mut()
-            .retain(|(_, observation)| observation.id() != id);
+            .retain(|(_, event)| !matches!(event, AppEvent::GeometryChanged(observation) if observation.id() == id));
     });
 }
 
@@ -70,7 +135,10 @@ fn failure(operation: &'static str) -> WindowError {
 
 /// Reads client pixels, content origin and exact DPI without inventing geometry.
 pub fn window_geometry(window: usize) -> Result<WindowGeometry, WindowError> {
-    let hwnd = live(window)?;
+    geometry(live(window)?)
+}
+
+fn geometry(hwnd: Hwnd) -> Result<WindowGeometry, WindowError> {
     let mut rect = Rect::default();
     let mut origin = Point { x: 0, y: 0 };
     unsafe {
@@ -101,13 +169,18 @@ pub fn window_geometry(window: usize) -> Result<WindowGeometry, WindowError> {
 
 /// Captures the native fact before the dispatcher can defer its delivery.
 pub(super) fn notify(hwnd: Hwnd) {
+    notify_dialog(hwnd);
     let window = usize::from_ne_bytes(hwnd.to_ne_bytes());
     let events = SOURCES.with(|sources| sources.borrow().get(&window).cloned());
     if let Some(events) = events
         && let Ok(geometry) = window_geometry(window)
         && let Some(observation) = events.capture(geometry)
     {
-        PENDING.with(|pending| pending.borrow_mut().push_back((hwnd, observation)));
+        PENDING.with(|pending| {
+            pending
+                .borrow_mut()
+                .push_back((hwnd, AppEvent::GeometryChanged(observation)))
+        });
         drain();
     }
 }
@@ -129,10 +202,10 @@ pub(super) fn drain() {
     let _delivery = Delivery;
     loop {
         let next = PENDING.with(|pending| pending.borrow_mut().pop_front());
-        let Some((hwnd, observation)) = next else {
+        let Some((hwnd, event)) = next else {
             break;
         };
-        dispatch_at(hwnd, AppEvent::GeometryChanged(observation));
+        dispatch_at(hwnd, event);
     }
 }
 
@@ -270,14 +343,16 @@ pub fn restore_window_placement(
     }
     let previous = MUTATING.with(|flag| flag.replace(true));
     let mutation = Mutation(previous);
-    let result = restore(window, placement);
+    let result = live(window).and_then(|hwnd| restore_hwnd(hwnd, placement));
     drop(mutation);
     drain();
     result
 }
 
-fn restore(window: usize, placement: WindowPlacement) -> Result<(), WindowError> {
-    let hwnd = live(window)?;
+fn restore_hwnd(hwnd: Hwnd, placement: WindowPlacement) -> Result<(), WindowError> {
+    if !is_top_level(hwnd) && !super::is_dialog(hwnd) {
+        return Err(WindowError::StaleWindow);
+    }
     if placement
         .position()
         .is_some_and(|position| position.space() != DesktopSpace::Win32Pixels)
@@ -286,7 +361,7 @@ fn restore(window: usize, placement: WindowPlacement) -> Result<(), WindowError>
             "desktop position is not in Win32 pixels",
         ));
     }
-    let current = window_geometry(window)?;
+    let current = geometry(hwnd)?;
     let position = placement
         .position()
         .or_else(|| current.position())
@@ -296,7 +371,9 @@ fn restore(window: usize, placement: WindowPlacement) -> Result<(), WindowError>
     apply(hwnd, placement.size(), position, dpi, work)?;
     // A cross-monitor move may synchronously change DPI. Recompute content
     // dimensions once at the granted DPI, retaining the selected work area.
-    let hwnd = live(window)?;
+    if !is_top_level(hwnd) && !super::is_dialog(hwnd) {
+        return Err(WindowError::StaleWindow);
+    }
     let granted_dpi = unsafe { GetDpiForWindow(hwnd) };
     if granted_dpi != 0 && granted_dpi != dpi {
         apply(hwnd, placement.size(), position, granted_dpi, work)?;
