@@ -4,7 +4,8 @@
 //! the caret and the selection. The internal indices are BYTE offsets
 //! always on a `char` boundary; the IME boundary speaks UTF-16 — the
 //! conversion lives here, ONCE, instead of copied into every handmade
-//! field.
+//! field. Default horizontal movement and unselected deletion use extended
+//! grapheme clusters; explicit native ranges and composition stay scalar-aligned.
 
 /// A field's caret + selection anchor, per identity. `caret` is the
 /// active point; `anchor` marks the other side of the selection (None =
@@ -322,24 +323,27 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
         }
         EditCommand::Backspace => {
             if !remove_selection(text, state) && state.caret > 0 {
-                let start = previous_boundary(text, state.caret);
-                text.replace_range(start..state.caret, "");
+                let start = crate::grapheme::previous(text, state.caret);
+                let end = crate::grapheme::ceil(text, state.caret);
+                text.replace_range(start..end, "");
                 state.caret = start;
             }
         }
         EditCommand::Delete => {
             if !remove_selection(text, state) && state.caret < text.len() {
-                let end = next_boundary(text, state.caret);
-                text.replace_range(state.caret..end, "");
+                let start = crate::grapheme::floor(text, state.caret);
+                let end = crate::grapheme::next(text, state.caret);
+                text.replace_range(start..end, "");
+                state.caret = start;
             }
         }
         EditCommand::Left(select) => {
-            let target = previous_boundary(text, state.caret);
+            let target = crate::grapheme::previous(text, state.caret);
             let collapse = state.selection().map(|(start, _)| start).unwrap_or(target);
             moved(state, select, target, collapse);
         }
         EditCommand::Right(select) => {
-            let target = next_boundary(text, state.caret);
+            let target = crate::grapheme::next(text, state.caret);
             let collapse = state.selection().map(|(_, end)| end).unwrap_or(target);
             moved(state, select, target, collapse);
         }

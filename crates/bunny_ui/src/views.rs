@@ -82,11 +82,15 @@ impl View for Text {
             }
             (fixed, true) => RenderNode::leaf(format!("Text({:?})", fixed.get())),
         });
+        let semantics = crate::accessibility::capturing().then(motor::identity::cursor_scope_rc)
+            .flatten().map(|path| Rc::new(
+            crate::accessibility::Semantics::Text { path, content: content.clone() }
+        ));
         out.push_layout(LayoutNode::Text {
             content,
             highlights: None,
             truncation: None,
-            hints: Default::default(),
+            hints: crate::layout::ElementHints { semantics, ..Default::default() },
             action: None,
         });
     }
@@ -155,6 +159,10 @@ where
         // included — the hit-rect becomes the whole chrome, not just the label.
         // The chrome is the target itself, and paints by its own hover
         let theme = crate::theme::current();
+        let semantics = crate::accessibility::capturing().then_some(target.as_ref())
+            .flatten().map(|path| Rc::new(
+            crate::accessibility::Semantics::Button { path: Rc::clone(path) }
+        ));
         out.push_layout(LayoutNode::Styled {
             props: VisualProps {
                 background: Some(theme.control),
@@ -173,7 +181,7 @@ where
                 },
                 child: Box::new(wrap_layout(layouts)),
             }),
-            hints: Default::default(),
+            hints: crate::layout::ElementHints { semantics, ..Default::default() },
             action: target,
         });
     }
@@ -495,15 +503,21 @@ impl View for TextField {
                                         .reduce(|(a, b), (s, e)| (a.min(s), b.max(e)));
                                     let kept = span.map(|(start, end)| value[start..end].to_owned());
                                     // the first byte this edit can touch: the span it
-                                    // replaces, or the caret — one character before it
-                                    // for a backspace
-                                    touched = match (span, &command) {
-                                        (Some((start, _)), _) => start,
-                                        (None, crate::text_input::EditCommand::Backspace) => {
-                                            crate::text_input::previous_boundary(value, state.caret)
+                                    // replaces, or the grapheme boundary first touched
+                                    // by a deletion (a native caret may sit inside it)
+                                    let edit_start = match &command {
+                                        crate::text_input::EditCommand::Backspace if state.selection().is_none() => {
+                                            crate::grapheme::previous(value, state.caret)
                                         }
-                                        (None, _) => state.caret.min(value.len()),
+                                        crate::text_input::EditCommand::Delete if state.selection().is_none() => {
+                                            crate::grapheme::floor(value, state.caret)
+                                        }
+                                        _ => state.caret,
                                     };
+                                    // Committing marked text may join it to the
+                                    // preceding cluster: deletion can begin BEFORE
+                                    // the marked range the IME originally supplied.
+                                    touched = span.map_or(edit_start, |(start, _)| start.min(edit_start));
                                     output = crate::text_input::apply(value, state, command);
                                     value.len() != before
                                         || span.zip(kept).is_some_and(|((start, end), kept)| {
@@ -1350,6 +1364,9 @@ where
 /// lists already scroll themselves; this is for everything else that
 /// overflows: `.horizontal()` goes sideways (an editor without wrap, a
 /// terminal line), `.both_axes()` travels freely (a spreadsheet).
+/// On the other axis, the child's flexibility reaches the enclosing stack:
+/// a horizontal region around a vertical list fills the available height,
+/// while one around a single fixed-height line keeps that line's height.
 #[derive(Clone)]
 pub struct ScrollView<C> {
     content: C,
