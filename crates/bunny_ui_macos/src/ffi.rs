@@ -1317,6 +1317,14 @@ extern "C" fn bunny_window_did_resize(_this: Id, _sel: Sel, note: Id) {
     window_frame_changed(note, "resize");
 }
 
+extern "C" fn bunny_window_occlusion_changed(_this: Id, _sel: Sel, note: Id) {
+    unsafe {
+        let window = msg_id(note, sel("object"));
+        let view = msg_id(window, sel("contentView"));
+        crate::metal::observation_visibility_changed(view);
+    }
+}
+
 extern "C" fn bunny_window_did_move(_this: Id, _sel: Sel, note: Id) {
     window_frame_changed(note, "move");
 }
@@ -2192,6 +2200,12 @@ unsafe fn register_classes() {
             class("NSObject"),
             CString::new("BunnyDelegate").expect("name").as_ptr(),
             0,
+        );
+        class_addMethod(
+            delegate,
+            sel("windowDidChangeOcclusionState:"),
+            bunny_window_occlusion_changed as *const c_void,
+            types.as_ptr(),
         );
         class_addMethod(
             delegate,

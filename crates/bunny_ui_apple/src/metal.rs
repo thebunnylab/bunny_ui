@@ -53,6 +53,7 @@ use crate::ffi::{CFRelease, CFRetain, CGPoint, CGRect, CGSize, Id, Sel, class, e
 
 #[cfg(target_os = "macos")]
 mod software_patch;
+mod presentation;
 #[cfg(target_os = "macos")]
 mod scroll_bands;
 #[cfg(target_os = "macos")]
@@ -2356,6 +2357,7 @@ impl Drop for Patch {
 }
 
 pub struct MetalPresenter {
+    observation: Option<bunny_ui::presentation::backend::PresentationSender>,
     stack: MetalStack,
     layer: Id,
     physical: (usize, usize),
@@ -2601,6 +2603,9 @@ impl MetalPresenter {
         images: &dyn ImageEngine,
         live: bool,
     ) {
+        let observation = self.observation.as_ref().and_then(|sender| {
+            bunny_ui::presentation::backend::FrameObservation::begin(sender, display)
+        });
         unsafe {
             let pool = objc_autoreleasePoolPush();
             let physical = (
@@ -2610,6 +2615,9 @@ impl MetalPresenter {
             self.drawable_wait_ms = 0.0;
             if physical.0 == 0 || physical.1 == 0 {
                 // a zero drawable is an abort, not a frame
+                if let Some(attempt) = observation {
+                    attempt.unavailable(bunny_ui::presentation::Unavailable::NoDrawable);
+                }
                 objc_autoreleasePoolPop(pool);
                 return;
             }
@@ -2754,6 +2762,9 @@ impl MetalPresenter {
             let drawable = msg_id(self.layer, self.stack.sels.next_drawable);
             self.drawable_wait_ms = crate::trace::clock_ms() - asked;
             if drawable.is_null() {
+                if let Some(attempt) = observation {
+                    attempt.unavailable(bunny_ui::presentation::Unavailable::NoDrawable);
+                }
                 objc_autoreleasePoolPop(pool);
                 return;
             }
@@ -2789,6 +2800,9 @@ impl MetalPresenter {
                 staging: self.ground.staging_buffer(),
                 live_copies: &self.ground.pending,
             });
+            if let Some(attempt) = observation {
+                presentation::observe(drawable, command, attempt, &self.atlas, &self.batches);
+            }
             // Once the layer has presented inside a transaction, every
             // later drawable follows that contract, including ordinary
             // frames after a native handoff or live resize. Using the
@@ -3088,6 +3102,7 @@ impl MetalPresenter {
         }
         let device = stack.device;
         Some(MetalPresenter {
+            observation: None,
             stack,
             layer,
             physical: (0, 0),

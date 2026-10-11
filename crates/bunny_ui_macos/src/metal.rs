@@ -44,6 +44,10 @@ thread_local! {
     /// Every top-level and pooled dialog view owns one presenter.
     static VIEW_PRESENTERS: RefCell<HashMap<usize, Presenter>> =
         RefCell::new(HashMap::new());
+    // Independent from the renderer's mutable borrow: synchronous AppKit
+    // occlusion notifications must invalidate a ticket even during encoding.
+    static FEED_OBSERVERS: RefCell<HashMap<usize, bunny_ui::presentation::backend::PresentationSender>> =
+        RefCell::new(HashMap::new());
 }
 
 /// A present that waited this long for a drawable, in milliseconds, found
@@ -78,6 +82,11 @@ pub(crate) fn try_install(view: Id, scale: f64, width: f64, height: f64) -> bool
 /// A closed top-level view releases only its own presenter. Pooled dialog
 /// views remain registered while reusable, just as their native windows do.
 pub fn forget_view(view: Id) {
+    FEED_OBSERVERS.with(|observers| {
+        if let Some(sender) = observers.borrow_mut().remove(&(view as usize)) {
+            sender.suspend();
+        }
+    });
     VIEW_PRESENTERS.with(|slot| {
         slot.borrow_mut().remove(&(view as usize));
     });
@@ -100,6 +109,60 @@ fn graft(view: Id, scale: f64, width: f64, height: f64) -> Option<MetalPresenter
         msg_void_id(view, sel("setLayer:"), layer);
         presenter.prime(width, height, scale.round().max(1.0) as usize);
         Some(presenter)
+    }
+}
+
+/// Attach a weak observer to this view only. The owning Slot keeps the close guard.
+pub fn observe_feed(view: Id, sender: bunny_ui::presentation::backend::PresentationSender) {
+    VIEW_PRESENTERS.with(|slot| {
+        if let Some(presenter) = slot.borrow_mut().get_mut(&(view as usize)) {
+            FEED_OBSERVERS.with(|observers| {
+                observers.borrow_mut().insert(view as usize, sender.clone());
+            });
+            presenter.renderer.observe_feed(sender);
+            refresh_observation_visibility(view, &mut presenter.renderer);
+        } else {
+            sender.unavailable(bunny_ui::presentation::Unavailable::Cpu);
+        }
+    });
+}
+
+#[allow(clashing_extern_declarations)]
+#[link(name = "objc", kind = "dylib")]
+unsafe extern "C" {
+    #[link_name = "objc_msgSend"]
+    fn observation_bool(object: Id, selector: Sel) -> i8;
+    #[link_name = "objc_msgSend"]
+    fn observation_u64(object: Id, selector: Sel) -> u64;
+}
+
+fn refresh_observation_visibility(view: Id, renderer: &mut MetalPresenter) {
+    if !renderer.observing_feed() {
+        return;
+    }
+    let visible = unsafe {
+        let window = msg_id(view, sel("window"));
+        !window.is_null()
+            && observation_bool(window, sel("isVisible")) != 0
+            && observation_u64(window, sel("occlusionState")) & 2 != 0
+    };
+    renderer.observation_visibility(visible);
+}
+
+pub fn observation_visibility_changed(view: Id) {
+    let sender = FEED_OBSERVERS.with(|observers| observers.borrow().get(&(view as usize)).cloned());
+    if let Some(sender) = sender
+        && sender.feed().is_some()
+    {
+        let visible = unsafe {
+            let window = msg_id(view, sel("window"));
+            !window.is_null()
+                && observation_bool(window, sel("isVisible")) != 0
+                && observation_u64(window, sel("occlusionState")) & 2 != 0
+        };
+        if !visible {
+            sender.suspend();
+        }
     }
 }
 
@@ -206,6 +269,7 @@ pub(crate) fn present_view(
         let Some(presenter) = presenters.get_mut(&(view as usize)) else {
             return false;
         };
+        refresh_observation_visibility(view, &mut presenter.renderer);
         presenter
             .renderer
             .present(display, size, scale, canvas, text, images, live);

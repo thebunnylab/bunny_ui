@@ -56,6 +56,7 @@ pub mod app;
 pub mod host;
 pub mod icon;
 pub mod image_engine;
+pub mod presentation;
 pub mod layout;
 pub mod menu;
 mod loans;
