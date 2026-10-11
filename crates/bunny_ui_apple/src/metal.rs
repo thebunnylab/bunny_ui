@@ -57,6 +57,10 @@ mod software_patch;
 mod scroll_bands;
 #[cfg(target_os = "macos")]
 mod window;
+#[cfg(test)]
+mod upload_tests;
+mod uploads;
+use uploads::{LiveUpload, poll_uploads};
 #[cfg(target_os = "macos")]
 pub use window::WindowPresenter;
 
@@ -1006,11 +1010,17 @@ impl MetalStack {
     unsafe fn encode_frame(&self, frame: EncodeFrame) -> Id {
         unsafe {
             let command = msg_id(self.queue, self.sels.command_buffer);
+            if command.is_null() {
+                return null_mut();
+            }
             // the feeds' new bytes land first, from the slot's staging
             // buffer, on the queue — after every earlier frame that still
             // samples the textures, before this one does
             if !frame.live_copies.is_empty() {
                 let blit = msg_id(command, self.sels.blit_encoder);
+                if blit.is_null() {
+                    return null_mut();
+                }
                 for copy in frame.live_copies {
                     msg_void_blit(
                         blit,
@@ -1574,6 +1584,7 @@ struct Staging {
 /// moves them.
 #[derive(Clone, Copy)]
 struct LiveCopy {
+    id: u64,
     texture: Id,
     offset: u64,
     per_row: u64,
@@ -1631,14 +1642,22 @@ impl MetalGround {
     /// The frame about to walk stages into ring slot `index` — whose
     /// previous command buffer has completed, so its buffer is free and
     /// the buffers it retired can go.
-    fn begin_slot(&mut self, index: usize) {
+    fn begin_slot(&mut self, index: usize, atlas: &mut RunAtlas) {
+        // Only committed copies leave `pending`. A failed drawable or encoder
+        // abandons these bytes; retry even when the feed generation is unchanged.
+        for copy in self.pending.drain(..) {
+            for entry in atlas.live.values_mut() {
+                if entry.id == copy.id {
+                    entry.stale = true;
+                }
+            }
+        }
         self.slot = index;
         let staging = &mut self.staging[index];
         staging.cursor = 0;
         for buffer in staging.retired.drain(..) {
             unsafe { msg_void(buffer, sel("release")) };
         }
-        self.pending.clear();
     }
 
     /// Room for `bytes` in the slot's staging buffer, 256-aligned —
@@ -1803,6 +1822,7 @@ impl AtlasGround for MetalGround {
         // one copy per texture per frame — the newest bytes win
         self.pending.retain(|copy| copy.texture != texture);
         self.pending.push(LiveCopy {
+            id,
             texture,
             offset,
             per_row: per_row as u64,
@@ -1831,11 +1851,22 @@ struct FrameSlot {
     capacity: usize,
     command: Id,
     native: Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    uploads: Vec<LiveUpload>,
+    #[cfg(test)]
+    failed_upload_for_test: bool,
 }
 
 impl FrameSlot {
-    const fn empty() -> FrameSlot {
-        FrameSlot { buffer: null_mut(), capacity: 0, command: null_mut(), native: Vec::new() }
+    const fn empty() -> Self {
+        Self {
+            buffer: null_mut(),
+            capacity: 0,
+            command: null_mut(),
+            native: Vec::new(),
+            uploads: Vec::new(),
+            #[cfg(test)]
+            failed_upload_for_test: false,
+        }
     }
 }
 
@@ -1884,13 +1915,28 @@ unsafe fn mark_gpu_time(command: Id, sels: &Sels) {
 /// A free slot from a ring: polled by `status`, oldest-first. When all
 /// ride the GPU (a burst above the refresh rate), waits for the oldest
 /// — bounded by one sub-millisecond frame.
-fn acquire_slot(slots: &mut [FrameSlot; 3], cursor: &mut usize, sels: &Sels) -> usize {
+struct AcquiredSlot {
+    index: usize,
+    retry: bool,
+}
+
+fn acquire_slot(
+    slots: &mut [FrameSlot; 3],
+    cursor: &mut usize,
+    sels: &Sels,
+    atlas: &mut RunAtlas,
+) -> AcquiredSlot {
     unsafe {
         for offset in 0..slots.len() {
             let index = (*cursor + offset) % slots.len();
-            let free = slots[index].command.is_null()
-                || msg_u64(slots[index].command, sels.status) >= STATUS_COMPLETED;
+            let status = if slots[index].command.is_null() {
+                STATUS_COMPLETED
+            } else {
+                msg_u64(slots[index].command, sels.status)
+            };
+            let free = status >= STATUS_COMPLETED;
             if free {
+                let retry = slots[index].settle_uploads(status, atlas);
                 if !slots[index].command.is_null() {
                     mark_gpu_time(slots[index].command, sels);
                     msg_void(slots[index].command, sels.release);
@@ -1898,17 +1944,19 @@ fn acquire_slot(slots: &mut [FrameSlot; 3], cursor: &mut usize, sels: &Sels) -> 
                     slots[index].native.clear();
                 }
                 *cursor = (index + 1) % slots.len();
-                return index;
+                return AcquiredSlot { index, retry };
             }
         }
         let index = *cursor;
         msg_void(slots[index].command, sels.wait_completed);
+        let status = msg_u64(slots[index].command, sels.status);
+        let retry = slots[index].settle_uploads(status, atlas);
         mark_gpu_time(slots[index].command, sels);
         msg_void(slots[index].command, sels.release);
         slots[index].command = null_mut();
         slots[index].native.clear();
         *cursor = (index + 1) % slots.len();
-        index
+        AcquiredSlot { index, retry }
     }
 }
 
@@ -2454,6 +2502,7 @@ impl MetalPresenter {
     /// are the drawables off screen ([`MetalPresenter::offer_drawables`]);
     /// false when that has to wait for the last present to land.
     pub fn rest(&mut self) -> bool {
+        let mut retry = false;
         unsafe {
             for slot in &mut self.slots {
                 if slot.command.is_null() {
@@ -2462,12 +2511,19 @@ impl MetalPresenter {
                 if msg_u64(slot.command, self.stack.sels.status) < STATUS_COMPLETED {
                     msg_void(slot.command, self.stack.sels.wait_completed);
                 }
+                retry |= slot.settle_uploads(
+                    msg_u64(slot.command, self.stack.sels.status),
+                    &mut self.atlas,
+                );
                 mark_gpu_time(slot.command, &self.stack.sels);
                 msg_void(slot.command, self.stack.sels.release);
                 slot.command = null_mut();
                 slot.native.clear();
             }
             self.ground.rest();
+        }
+        if retry {
+            self.forget_failed_frame();
         }
         self.resting = true;
         self.offer_drawables()
@@ -2522,14 +2578,37 @@ impl MetalPresenter {
     /// Waits out every in-flight frame — the precondition of an atlas
     /// reset (the one moment texel space is reused).
     fn drain_slots(&mut self) {
+        let mut retry = false;
         unsafe {
             for slot in &mut self.slots {
                 if !slot.command.is_null() {
                     msg_void(slot.command, self.stack.sels.wait_completed);
+                    retry |= slot.settle_uploads(
+                        msg_u64(slot.command, self.stack.sels.status),
+                        &mut self.atlas,
+                    );
                     msg_void(slot.command, self.stack.sels.release);
                     slot.command = null_mut();
                     slot.native.clear();
                 }
+            }
+        }
+        if retry {
+            self.forget_failed_frame();
+        }
+    }
+
+    /// A failed live upload invalidates cached display/patch equality too:
+    /// the next identical display list must walk and upload again.
+    fn forget_failed_frame(&mut self) {
+        self.retained = None;
+        self.base = None;
+        self.previous = None;
+        for patch in &mut self.patches {
+            patch.held = None;
+            #[cfg(target_os = "macos")]
+            {
+                patch.software_scene = None;
             }
         }
     }
@@ -2608,6 +2687,9 @@ impl MetalPresenter {
                 (size.height.round().max(0.0) as usize) * scale,
             );
             self.drawable_wait_ms = 0.0;
+            if poll_uploads(&mut self.slots, &mut self.atlas, &self.stack.sels) {
+                self.forget_failed_frame();
+            }
             if physical.0 == 0 || physical.1 == 0 {
                 // a zero drawable is an abort, not a frame
                 objc_autoreleasePoolPop(pool);
@@ -2637,7 +2719,11 @@ impl MetalPresenter {
             }
             // what the frame changes against the window's own layer — a
             // live resize is always whole
-            let plan = if live || rows_active { Plan::Whole } else { self.plan(display, physical, scale, canvas, text) };
+            let mut plan = if live || rows_active {
+                Plan::Whole
+            } else {
+                self.plan(display, physical, scale, canvas, text)
+            };
             #[cfg(target_os = "macos")]
             if plan != Plan::Whole { self.scroll_bands.discard_trial(); }
             if plan == Plan::Same {
@@ -2720,9 +2806,22 @@ impl MetalPresenter {
             }
             // the slot FIRST: the walk stages the feeds' bytes into its
             // buffer, which is free only once its last frame completed
-            let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
-            self.ground.begin_slot(index);
+            let acquired = acquire_slot(
+                &mut self.slots,
+                &mut self.cursor,
+                &self.stack.sels,
+                &mut self.atlas,
+            );
+            let index = acquired.index;
+            if acquired.retry {
+                self.forget_failed_frame();
+                plan = Plan::Whole;
+            }
+            self.ground.begin_slot(index, &mut self.atlas);
             self.build_with_retries(display, scale, physical, text, images);
+            if self.base.is_none() {
+                plan = Plan::Whole;
+            }
             if let Plan::Patch(rect) = plan {
                 // glass reads the whole scene, so a frame that carries a
                 // pane repaints whole (the diff refuses one already)
@@ -2789,6 +2888,10 @@ impl MetalPresenter {
                 staging: self.ground.staging_buffer(),
                 live_copies: &self.ground.pending,
             });
+            if command.is_null() {
+                objc_autoreleasePoolPop(pool);
+                return;
+            }
             // Once the layer has presented inside a transaction, every
             // later drawable follows that contract, including ordinary
             // frames after a native handoff or live resize. Using the
@@ -2812,6 +2915,7 @@ impl MetalPresenter {
                 msg_void(command, self.stack.sels.commit);
             }
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
+            self.slots[index].submitted_uploads(&mut self.ground, &self.atlas);
             self.drawables.presented(drawable);
             // a new base: what the patches hold was measured against the
             // old one
@@ -3011,6 +3115,9 @@ impl MetalPresenter {
                 staging: self.ground.staging_buffer(),
                 live_copies: &self.ground.pending,
             });
+            if command.is_null() {
+                return false;
+            }
             msg_void(command, self.stack.sels.commit);
             msg_void(command, self.stack.sels.wait_scheduled);
             let transaction = class("CATransaction");
@@ -3030,6 +3137,7 @@ impl MetalPresenter {
             patch.held = Some((held.clone(), rect));
             patch.drawables.presented(drawable);
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
+            self.slots[index].submitted_uploads(&mut self.ground, &self.atlas);
             crate::trace::mark(
                 "Q",
                 format_args!(
@@ -3235,6 +3343,10 @@ impl OffscreenGpu {
             for slot in &mut self.slots {
                 if !slot.command.is_null() {
                     msg_void(slot.command, self.stack.sels.wait_completed);
+                    slot.settle_uploads(
+                        msg_u64(slot.command, self.stack.sels.status),
+                        &mut self.atlas,
+                    );
                     msg_void(slot.command, self.stack.sels.release);
                     slot.command = null_mut();
                     slot.native.clear();
@@ -3255,8 +3367,15 @@ impl OffscreenGpu {
         unsafe {
             let pool = objc_autoreleasePoolPush();
             // the slot first, as the window does: the feeds stage into it
-            let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
-            self.ground.begin_slot(index);
+            poll_uploads(&mut self.slots, &mut self.atlas, &self.stack.sels);
+            let index = acquire_slot(
+                &mut self.slots,
+                &mut self.cursor,
+                &self.stack.sels,
+                &mut self.atlas,
+            )
+            .index;
+            self.ground.begin_slot(index, &mut self.atlas);
             self.walk(display, scale, text, images);
             let (sprite_offset, glass_offset) = upload_frame(
                 &mut self.slots[index],
@@ -3294,8 +3413,13 @@ impl OffscreenGpu {
                 staging: self.ground.staging_buffer(),
                 live_copies: &self.ground.pending,
             });
+            if command.is_null() {
+                objc_autoreleasePoolPop(pool);
+                return;
+            }
             msg_void(command, self.stack.sels.commit);
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
+            self.slots[index].submitted_uploads(&mut self.ground, &self.atlas);
             if wait {
                 msg_void(command, self.stack.sels.wait_completed);
             }
@@ -3349,6 +3473,9 @@ impl OffscreenGpu {
     /// `display` into a target of the box's own size — the patch a
     /// window presents over its last whole frame — and returns its RGBA
     /// bytes, row by row.
+    ///
+    /// Returns an empty vector if a command or upload encoder is unavailable;
+    /// pending feed generations retry on the next render.
     pub fn patch_rgba(
         &mut self,
         display: &DisplayList,
@@ -3361,8 +3488,15 @@ impl OffscreenGpu {
         let (width, height) = (rect.2 - rect.0, rect.3 - rect.1);
         unsafe {
             let pool = objc_autoreleasePoolPush();
-            let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
-            self.ground.begin_slot(index);
+            poll_uploads(&mut self.slots, &mut self.atlas, &self.stack.sels);
+            let index = acquire_slot(
+                &mut self.slots,
+                &mut self.cursor,
+                &self.stack.sels,
+                &mut self.atlas,
+            )
+            .index;
+            self.ground.begin_slot(index, &mut self.atlas);
             self.walk(display, scale, text, images);
             let (sprite_offset, glass_offset) = upload_frame(
                 &mut self.slots[index],
@@ -3390,9 +3524,15 @@ impl OffscreenGpu {
                 staging: self.ground.staging_buffer(),
                 live_copies: &self.ground.pending,
             });
+            if command.is_null() {
+                msg_void(target, self.stack.sels.release);
+                objc_autoreleasePoolPop(pool);
+                return Vec::new();
+            }
             msg_void(command, self.stack.sels.commit);
             msg_void(command, self.stack.sels.wait_completed);
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
+            self.slots[index].submitted_uploads(&mut self.ground, &self.atlas);
             let bytes = read_target(target, width, height, &self.stack.sels);
             msg_void(target, self.stack.sels.release);
             objc_autoreleasePoolPop(pool);
