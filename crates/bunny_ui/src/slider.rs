@@ -7,8 +7,9 @@
 //! state. This control requires `canvas`; element-mode web uses a canvas island.
 //!
 //! ## Production gotchas
-//! Native assistive-technology range semantics are not exposed yet. Provide a
-//! visible label/value; this primitive alone is not accessibility qualification.
+//! Give the control an `accessibility_label` and a visible label/value. Native
+//! range semantics are available; protocol support alone is not human
+//! screen-reader qualification.
 //! Nonfinite or out-of-range binding values are represented at a bounded visual
 //! position but stay untouched until an interaction writes a valid value.
 
@@ -309,6 +310,36 @@ impl CustomElement for SliderElement {
     }
     fn accepts_keys(&self) -> bool {
         !self.slider.disabled
+    }
+    fn accessibility_range(&self) -> Option<crate::accessibility::RangeValue> {
+        Some(crate::accessibility::RangeValue::new(
+            self.slider.range,
+            self.slider.value.wrappedValue(),
+        ))
+    }
+    fn accessibility_action(
+        &self,
+        action: &crate::accessibility::Action,
+    ) -> Result<(), crate::accessibility::ActionError> {
+        use crate::accessibility::{Action, ActionError};
+        if self.slider.disabled {
+            return Err(ActionError::Unsupported);
+        }
+        let range = self.slider.range;
+        let value = self.slider.value.wrappedValue();
+        let next = match *action {
+            Action::Increment => range.advance(value, true, 1.0),
+            Action::Decrement => range.advance(value, false, 1.0),
+            Action::SetValue(requested) => {
+                if !requested.is_finite() || !(range.lower..=range.upper).contains(&requested) {
+                    return Err(ActionError::InvalidValue);
+                }
+                range.snap(requested)
+            }
+            _ => return Err(ActionError::Unsupported),
+        };
+        self.write(next);
+        Ok(())
     }
     fn takes_text(&self) -> bool {
         false

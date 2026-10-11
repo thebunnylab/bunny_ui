@@ -284,6 +284,11 @@ fn read_values(source: &mut DbusIter, depth: usize) -> Result<Vec<Value>, String
                     Value::Path(text)
                 }
             }
+            100 => {
+                let mut n = 0.0f64;
+                unsafe { dbus_message_iter_get_basic(source, (&raw mut n).cast()) };
+                Value::F64(n)
+            }
             105 => {
                 let mut n = 0i32;
                 unsafe { dbus_message_iter_get_basic(source, (&raw mut n).cast()) };

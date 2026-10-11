@@ -7949,6 +7949,11 @@ impl Runtime {
                 self.focus_stop(&stop);
                 true
             }
+            Action::Increment | Action::Decrement | Action::SetValue(_) => {
+                let placement = self.custom_at(&node.path).ok_or(ActionError::Unavailable)?;
+                placement.element.element().accessibility_action(&action)?;
+                true
+            }
             Action::SetText(text) => {
                 if self.field_at(&node.path).is_none() { return Err(ActionError::Unavailable); }
                 self.focus(&node.path);
