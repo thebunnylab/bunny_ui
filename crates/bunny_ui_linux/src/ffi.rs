@@ -1164,6 +1164,10 @@ impl MapState {
         matches!(self, Self::Hidden)
     }
 
+    const fn awaits_buffer(&self) -> bool {
+        matches!(self, Self::Configured { mapped: false })
+    }
+
     fn on_present(&mut self) {
         if self.can_attach() {
             *self = Self::Configured { mapped: true };
@@ -2545,6 +2549,14 @@ pub struct WindowHandle {
 }
 
 impl WindowHandle {
+    /// A newly configured Wayland mapping needs a buffer even when the retained
+    /// display list has no pixel damage. An unmap detached its previous buffer.
+    pub fn needs_mapping_buffer(&self) -> bool {
+        !is_x11() && with_client(|client| {
+            window_ref(client, self.window).is_some_and(|win| win.map.awaits_buffer())
+        })
+    }
+
     fn toplevel(window: usize) -> WindowHandle {
         WindowHandle { window, panel: 0 }
     }
@@ -6212,13 +6224,17 @@ mod tests {
     #[test]
     fn unmapping_blocks_buffers_and_old_configures_until_explicit_remap() {
         let mut map = MapState::default();
+        assert!(!map.awaits_buffer());
         map.on_configure();
+        assert!(map.awaits_buffer());
         map.on_present();
+        assert!(!map.awaits_buffer());
         assert!(map.mapped());
         map = MapState::Hidden;
         map.on_configure();
         map.on_present();
         assert!(map.hidden());
+        assert!(!map.awaits_buffer());
         assert!(!map.can_attach());
         map = MapState::AwaitingConfigure;
         map.on_present();
@@ -6226,9 +6242,11 @@ mod tests {
         assert!(!map.can_attach());
         map.on_configure();
         assert!(map.can_attach());
+        assert!(map.awaits_buffer());
         assert!(!map.mapped());
         map.on_present();
         assert!(map.mapped());
+        assert!(!map.awaits_buffer());
     }
 
     #[test]

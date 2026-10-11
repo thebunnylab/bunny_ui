@@ -1020,7 +1020,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 return;
             }
             let mut slot = surface.borrow_mut();
-            let stale = match &*slot {
+            let stale = window.needs_mapping_buffer() || match &*slot {
                 Some((retained, retained_scale, retained_canvas)) => {
                     retained.bitmap().width() != physical.0
                         || retained.bitmap().height() != physical.1
