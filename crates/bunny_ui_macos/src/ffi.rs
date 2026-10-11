@@ -40,6 +40,10 @@ pub(crate) use bunny_ui_apple::ffi::{
 
 use crate::objc_bool::{self, ObjcBool};
 
+#[path = "appearance.rs"]
+mod appearance;
+pub use appearance::os_appearance;
+
 #[path = "accessibility.rs"]
 mod accessibility;
 pub(crate) use accessibility::Accessibility;
@@ -149,6 +153,8 @@ unsafe extern "C" {
     fn msg_void_id_i64_id(obj: Id, sel: Sel, a: Id, b: i64, c: Id);
     #[link_name = "objc_msgSendSuper"]
     fn msg_super_bool_id(sup: *const ObjcSuper, sel: Sel, a: Id) -> ObjcBool;
+    #[link_name = "objc_msgSendSuper"]
+    fn msg_super_void(sup: *const ObjcSuper, sel: Sel);
     #[link_name = "objc_msgSend"]
     fn msg_void_rect_bool(obj: Id, sel: Sel, rect: CGRect, flag: ObjcBool);
     #[link_name = "objc_msgSend"]
@@ -223,6 +229,8 @@ unsafe extern "C" {
 /// display-link tick reaches every window that wants it.
 #[derive(Clone)]
 pub enum AppEvent {
+    /// Deferred application-effective appearance observed by `AppKit`.
+    AppearanceChanged(Option<bunny_ui::theme::Appearance>),
     /// Captured native geometry addressed to its non-recycled scene lifetime.
     GeometryChanged(bunny_ui::window::GeometryObservation),
     /// A native dialog fact scoped to its current presentation and subscription.
@@ -678,6 +686,7 @@ pub fn dispatch(event: AppEvent) {
 /// A knock from another thread lands here, on the main thread, as one
 /// more beat for every window.
 extern "C" fn perform_wake(_info: *mut c_void) {
+    appearance::deliver();
     dispatch_all(AppEvent::Wake);
 }
 
@@ -2104,6 +2113,7 @@ unsafe fn register_classes() {
             0,
         );
         accessibility::register_view(view);
+        appearance::register(view);
         class_addMethod(
             view,
             sel("mouseDown:"),

@@ -334,15 +334,10 @@ fn mount(runtime: Rc<Runtime>, root: impl View, app: Rc<AppInner>) {
     runtime.drop_unseen();
     // the road, chosen ONCE per window: the GPU, or the floor
     ffi::install_gpu();
-    // the season's mirrors: reduce-motion always follows the system
-    // (accessibility is never the app's to refuse); the theme follows
-    // ONLY while the app has not chosen one — an installed theme means
-    // the scene owns its colors and the shell stays out
-    let mirror_theme = bunny_ui::theme::version() == 0;
     let (dark, compact, _) = ffi::config();
-    if mirror_theme && dark == Some(true) {
-        bunny_ui::theme::install(bunny_ui::theme::Theme::dark());
-    }
+    bunny_ui::theme::observe_system_appearance(
+        dark.map(bunny_ui::theme::Appearance::from_dark),
+    );
     runtime.set_reduce_motion(ffi::reduce_motion());
     // the configuration's languages reach the scene before its first
     // frame; a locale the app pinned (`App::set_locale`) stands over
@@ -510,17 +505,9 @@ fn mount(runtime: Rc<Runtime>, root: impl View, app: Rc<AppInner>) {
                 }
             }
             AppEvent::Config { dark, compact, scale } => {
-                if mirror_theme && let Some(wants_dark) = dark {
-                    let is_dark =
-                        bunny_ui::theme::current().canvas == bunny_ui::theme::Theme::dark().canvas;
-                    if wants_dark != is_dark {
-                        bunny_ui::theme::install(if wants_dark {
-                            bunny_ui::theme::Theme::dark()
-                        } else {
-                            bunny_ui::theme::Theme::light()
-                        });
-                    }
-                }
+                bunny_ui::theme::observe_system_appearance(
+                    dark.map(bunny_ui::theme::Appearance::from_dark),
+                );
                 runtime.set_size_class(size_class(compact));
                 runtime.set_device_scale(scale as f64);
                 // a change of language is a configuration change too (the

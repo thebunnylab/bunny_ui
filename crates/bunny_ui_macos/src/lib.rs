@@ -836,6 +836,9 @@ impl AppInner {
                 }
                 return;
             }
+            if let AppEvent::AppearanceChanged(appearance) = event {
+                bunny_ui::theme::observe_system_appearance(appearance);
+            }
             let source = ffi::event_source();
             let gone = matches!(event, AppEvent::WindowClosed);
             let spoke = matches!(event, AppEvent::Locale);
@@ -1015,6 +1018,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let window = ffi::lend_hand(|| {
         ffi::create_window(title, cg_size(size), spec.min.map(cg_size), chrome.scene(), spec.manners)
     });
+    bunny_ui::theme::observe_system_appearance(ffi::os_appearance());
     let accessibility = Rc::new(ffi::Accessibility::new(window));
     // a task that lands on a worker thread asks the main run loop for
     // one more turn; the frame it takes drains the queue on its way
@@ -2377,6 +2381,11 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     // new deadline, and the driver's pace follows it
                     sync_frame_driver(runtime, &handler_pacer, window_id);
                 }
+            }
+        }
+        AppEvent::AppearanceChanged(_) => {
+            if runtime.needs_frame() {
+                blit(runtime, root, trace::Origin::Redraw);
             }
         }
         AppEvent::Locale => {

@@ -772,16 +772,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // raster on refusal — and the window is still unmapped, so the
     // first frame (whichever road) IS the reveal
     ffi::install_gpu(&window);
-    // the season's mirrors: reduce-motion always follows the system
-    // (accessibility is never the app's to refuse); the theme follows
-    // ONLY while the app has not chosen one — an installed theme means
-    // the scene owns its colors and the shell stays out. Where no
-    // portal runs (this compositor), both keep their defaults; the
-    // live change signal joins at the real-desktop pass.
-    let mirror_theme = bunny_ui::theme::version() == 0;
-    if mirror_theme && ffi::os_prefers_dark() == Some(true) {
-        bunny_ui::theme::install(bunny_ui::theme::Theme::dark());
-    }
+    // Initial portal observation. Live SettingChanged delivery remains unwired.
+    bunny_ui::theme::observe_system_appearance(
+        ffi::os_prefers_dark().map(bunny_ui::theme::Appearance::from_dark),
+    );
     runtime.set_reduce_motion(!ffi::animations_enabled());
     // the environment's languages reach the scene before its first
     // frame; a locale the app pinned (`App::set_locale`) stands over

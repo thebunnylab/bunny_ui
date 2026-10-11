@@ -299,3 +299,37 @@ capture denial fails qualification; the script does not turn it into a skip.
 `BUNNY_PRESENT=cpu` exercises the explicit CPU fallback with the same probe.
 The output directory must be fresh, so a stage acknowledgement cannot come
 from an earlier run.
+
+## System appearance and palette ownership
+
+`theme::system_appearance()` returns the latest `Option<Appearance>` reported
+by the native shell. Read it inside a component body to derive custom colors;
+changed observations invalidate retained bodies in every runtime. `None` means
+unavailable or no preference, not an observed light appearance.
+
+The built-in tokens initially follow the system. `theme::install(palette)`
+selects application-owned tokens; later native changes remain observable but
+cannot overwrite that palette. `theme::follow_system()` opts back into automatic
+light/dark tokens using the latest observation, with light as the documented
+fallback for `None`. Repeated identical native reports are inert. Ownership is
+process/UI-thread policy, independent of the version counter and which window
+opened first.
+
+macOS captures application-effective appearance at window creation and on
+[`viewDidChangeEffectiveAppearance`](https://developer.apple.com/documentation/appkit/nsview/viewdidchangeeffectiveappearance()).
+It uses AppKit's best-match operation for light/dark, including high-contrast
+variants, and defers scene delivery onto the existing main-loop wake. A
+window-specific native override is not a new system preference. Windows reports
+its initial registry preference and refreshes it on
+[`WM_SETTINGCHANGE`](https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-settingchange).
+iOS trait and Android configuration events use the same ownership policy.
+Linux reports the initial portal preference; **live Linux portal changes are
+not wired yet**. Shells without an appearance adapter leave the observation
+unavailable. No polling or new runtime dependency is involved.
+
+`cargo test -p bunny-ui-core --test system_appearance --all-features` covers
+palette ownership and retained scenes. `cargo test -p bunny-ui-macos --test
+system_appearance` changes only the test process's application appearance and
+checks native callback delivery, later windows and teardown of the first window.
+It does not change the user's system preferences or claim physical input,
+visible pixels, or observation of a system-settings interaction.

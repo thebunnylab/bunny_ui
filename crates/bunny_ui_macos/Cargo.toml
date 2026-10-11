@@ -19,7 +19,7 @@ countries-pure.workspace = true
 # Checked Objective-C consumers catch callback ABI/encoding disagreements.
 objc2 = "=0.6.5"
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSArray", "NSEnumerator", "NSString", "NSGeometry"] }
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSWindow", "NSView", "NSResponder", "objc2-core-foundation"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSAppearance", "NSWindow", "NSView", "NSResponder", "objc2-core-foundation"] }
 
 # the present tape reader carries its own golden-tape tests; the other
 # examples stay on autodiscovery
@@ -64,4 +64,8 @@ harness = false
 
 [[test]]
 name = "dialog_geometry"
+harness = false
+
+[[test]]
+name = "system_appearance"
 harness = false
