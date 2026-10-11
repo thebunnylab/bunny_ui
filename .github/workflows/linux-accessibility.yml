@@ -30,7 +30,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxcb1-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-shm0-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libdbus-1-dev libsecret-1-dev \
-            libfontconfig-dev libfreetype-dev libharfbuzz-dev fonts-dejavu fonts-noto-color-emoji \
+            libfontconfig-dev libfreetype-dev libharfbuzz-dev libfribidi-dev fonts-dejavu fonts-liberation fonts-noto-color-emoji b3sum \
             wayland-protocols weston xvfb dbus-x11 at-spi2-core python3-gi gir1.2-atspi-2.0
       - name: Pinned compiler
         run: |
@@ -38,7 +38,13 @@ jobs:
           rustup override set 1.98.1
           rustc --version --verbose
       - name: Native text direction regressions
-        run: cargo test -p bunny-ui-linux --locked --lib mixed_direction -- --nocapture
+        run: |
+          pkg-config --modversion fribidi harfbuzz freetype2 fontconfig
+          for family in 'DejaVu Sans' 'DejaVu Sans Mono' 'Liberation Sans'; do
+            font_path="$(fc-match -f '%{file}' "$family")"
+            b3sum "$font_path"
+          done
+          cargo test -p bunny-ui-linux --locked --lib mixed_direction -- --nocapture
       - name: Native AT-SPI, X11 and Wayland, normal and paranoid
         run: bash scripts/check-linux-accessibility.sh
       - name: Linux shell, normal and paranoid
