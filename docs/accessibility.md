@@ -169,6 +169,13 @@ the app. Automatic reconnection is not yet implemented.
 Weston. It runs both backends in normal and paranoid modes. This is a native
 protocol witness, not a human Orca workflow or a complete desktop qualification.
 
+The libatspi 2.52 client used by the Linux witness aborts in its Value setter
+when a rejected write returns a D-Bus error. Valid queries and writes still run
+through libatspi; invalid, disabled and retired writes are checked with direct
+D-Bus calls so their exact error and unchanged value remain observable. The
+adapter preserves rejection rather than returning a false success. This client
+compatibility limit remains relevant to human assistive-technology acceptance.
+
 ## Remaining work
 
 The core projection is a flat sequence of exposed leaves, not a complete document model.
