@@ -40,7 +40,7 @@ try:
         events.append(event.type)
 
     listener = Atspi.EventListener.new(record)
-    for kind in ["object:property-change:accessible-name", "object:text-changed", "object:state-changed:focused", "object:children-changed"]:
+    for kind in ["object:property-change:accessible-name", "object:text-changed", "object:state-changed:focused", "object:children-changed", "object:state-changed:checked", "object:state-changed:enabled"]:
         assert listener.register(kind)
     desktop = Atspi.get_desktop(0)
 
@@ -126,6 +126,37 @@ try:
             return
         assert value is False, f"retired accessible operation succeeded: {value!r}"
 
+    check = named("Reimbursable")
+    check_id = check.get_accessible_id()
+    assert check.get_role() == Atspi.Role.CHECK_BOX
+    assert check.get_state_set().contains(Atspi.StateType.CHECKABLE)
+    assert not check.get_state_set().contains(Atspi.StateType.CHECKED)
+    assert not check.get_state_set().contains(Atspi.StateType.EDITABLE)
+    assert check.get_action_iface().get_action_name(0) == "toggle"
+    assert check.get_component_iface().grab_focus()
+    check.clear_cache()
+    assert check.get_state_set().contains(Atspi.StateType.FOCUSED)
+    assert check.get_action_iface().do_action(0)
+    check.clear_cache()
+    assert check.get_state_set().contains(Atspi.StateType.CHECKED)
+    assert named("Toggle controls").get_action_iface().do_action(0)
+    check.clear_cache()
+    assert not check.get_state_set().contains(Atspi.StateType.ENABLED)
+    assert not check.get_state_set().contains(Atspi.StateType.SENSITIVE)
+    assert not check.get_state_set().contains(Atspi.StateType.FOCUSED)
+    unavailable(lambda: Atspi.Action.do_action(check, 0))
+    unavailable(lambda: Atspi.Component.grab_focus(check))
+    unavailable(lambda: Atspi.Action.do_action(named("Save"), 0))
+    assert named("Toggle controls").get_action_iface().do_action(0)
+    assert named("Reimbursable").get_accessible_id() == check_id
+    check.clear_cache()
+    assert check.get_state_set().contains(Atspi.StateType.CHECKED)
+    assert check.get_state_set().contains(Atspi.StateType.ENABLED)
+    wait_for(lambda: True if any("checked" in event for event in events) and any("enabled" in event for event in events) else None,
+             "AT-SPI checkbox checked/enabled events were not delivered")
+    assert named("Save").get_component_iface().grab_focus()
+    print("AT-SPI checkbox role, checked/enabled states, toggle, focus and notifications passed", flush=True)
+
     stale = named("Row 2")
     stale_path = stale.get_accessible_id()
     assert named("Reverse rows").get_action_iface().do_action(0)
@@ -138,6 +169,7 @@ try:
     assert named("Open modal").get_action_iface().do_action(0)
     dismiss = wait_for(lambda: named("Dismiss modal"), "modal not exposed")
     assert named("Updated name") is None
+    wire_unavailable(check_id, "org.a11y.atspi.Action", "DoAction", GLib.Variant("(i)", (0,)))
     unavailable(lambda: Atspi.EditableText.set_text_contents(updated, "blocked"))
     wire_unavailable(identity, "org.a11y.atspi.EditableText", "SetTextContents", GLib.Variant("(s)", ("blocked",)))
     assert dismiss.get_action_iface().do_action(0)
