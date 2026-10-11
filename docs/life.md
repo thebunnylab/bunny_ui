@@ -139,6 +139,53 @@ iOS `run` hands the process
 to UIKit, which never returns, and on Android it hands the window to
 the activity, which was running already, and returns.
 
+## Retained visibility and close requests
+
+The desktop shells expose `App::hide`, `show` and `visibility` for a live
+`WindowId`. Hiding preserves the runtime, editor draft and logical focus;
+background tasks still wake through the app's existing channel. Native
+presentation, including child dialogs and popups, stays suspended until show.
+An ID denotes one lifetime, not a reusable native address: a stale or foreign
+ID returns `WindowError::StaleWindow`. Explicit `close` on such an ID is a no-op.
+
+```rust
+use bunny_ui::window::{CloseAction, WindowVisibility};
+
+// The app retains this window and its editor when its close button is used.
+app.on_close_requested(main, |_| CloseAction::Hide)?;
+match app.visibility(main)? {
+    WindowVisibility::Shown => app.hide(main)?,
+    WindowVisibility::Hidden => app.show(main)?,
+}
+// Quit and explicit close bypass the user-close policy.
+app.quit();
+```
+
+`CloseAction::Close` is the default. `Cancel` keeps the window open while, for
+example, a save prompt is answered; the application later calls `close` after
+Save/Discard, or leaves it open after Cancel. `request_close` runs the same
+policy as the native close button. A policy can replace or remove itself,
+open another window, or explicitly close its own window. Recursive requests
+for the same window return `WindowError::CloseInProgress`; native recursion
+cancels. `clear_close_handler` restores default handling. Closing the last
+window retains the shell's usual exit behavior; hiding the last does not exit.
+
+`Shown` means submitted to the window system. It does not promise unobscured
+pixels, focus, successful foreground activation or human interaction. Wayland
+show starts a fresh configure/ack/map cycle; buffers cannot attach while
+hidden or before that configure. The shell restores title, app ID and size
+constraints and rebuilds retained child surfaces after unmapping. On macOS,
+Windows and X11 the native window remains allocated while ordered out/hidden
+or unmapped. Mobile shells do not expose this desktop lifecycle contract.
+
+The native `window_lifecycle` test uses subprocesses to witness policy,
+retained drafts, stale IDs, callback reentrancy, all-hidden worker wake and
+final exit. AppKit `performClose` and Win32 `WM_CLOSE` exercise native request
+routing. The Linux probe uses a real compositor/server for mapping and the
+public close request for policy; it does not prove a compositor-generated
+close action. These checks do not replace physical input, tray/global-hotkey
+interaction or human assistive-technology testing.
+
 ## What each platform answers
 
 | | macOS | Windows | Linux | iOS | Android |

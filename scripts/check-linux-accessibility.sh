@@ -33,6 +33,11 @@ test -n "$fixture"
 failures=0
 for backend in x11 wayland; do
   for paranoid in '' all; do
+    echo "Window lifecycle backend=$backend paranoid=${paranoid:-off}"
+    if ! BUNNY_BACKEND="$backend" BUNNY_PARANOID="$paranoid" BUNNY_WINDOW_LIFECYCLE_PROBE=1 timeout 100s \
+      cargo test -p bunny-ui-linux --locked --test window_lifecycle; then
+      failures=$((failures + 1))
+    fi
     for modal_first in 0 1; do
       echo "AT-SPI backend=$backend paranoid=${paranoid:-off} modal-first=$modal_first"
       if ! BUNNY_BACKEND="$backend" BUNNY_PARANOID="$paranoid" BUNNY_PROBE_MODAL_FIRST="$modal_first" timeout 45s \

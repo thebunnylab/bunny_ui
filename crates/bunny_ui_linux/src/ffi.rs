@@ -1101,24 +1101,35 @@ unsafe extern "C" fn dispatcher(
 /// commits. Violations are FATAL protocol errors, so the machine is
 /// the single authority.
 #[derive(Default)]
-struct MapState {
-    configured: bool,
-    mapped: bool,
+enum MapState {
+    Hidden,
+    #[default]
+    AwaitingConfigure,
+    Configured {
+        mapped: bool,
+    },
 }
 
 impl MapState {
-    /// A configure arrived; ack is always owed.
     fn on_configure(&mut self) {
-        self.configured = true;
+        if matches!(self, Self::AwaitingConfigure) {
+            *self = Self::Configured { mapped: false };
+        }
     }
 
     fn can_attach(&self) -> bool {
-        self.configured
+        matches!(self, Self::Configured { .. })
+    }
+    const fn mapped(&self) -> bool {
+        matches!(self, Self::Configured { mapped: true })
+    }
+    const fn hidden(&self) -> bool {
+        matches!(self, Self::Hidden)
     }
 
     fn on_present(&mut self) {
-        if self.configured {
-            self.mapped = true;
+        if self.can_attach() {
+            *self = Self::Configured { mapped: true };
         }
     }
 }
@@ -1344,6 +1355,9 @@ struct Backing {
 }
 
 struct Window {
+    title: std::ffi::CString,
+    min_size: Option<(i32, i32)>,
+    max_size: Option<(i32, i32)>,
     surface: *mut Proxy,
     xdg_surface: *mut Proxy,
     toplevel: *mut Proxy,
@@ -2178,6 +2192,8 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
                 TAG_TOPLEVEL,
             )
         };
+        let mut min_size = None;
+        let mut max_size = None;
         unsafe {
             request(toplevel, 2, &mut [WlArgument { s: title_c.as_ptr() }]);
             request(toplevel, 3, &mut [arg_s(&crate::life::app_id())]); // set_app_id
@@ -2186,12 +2202,15 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
                 // asked for, and the compositor refuses the grab and the
                 // maximize verb of its own accord
                 let (w, h) = (width.round() as i32, height.round() as i32);
+                min_size = Some((w, h));
+                max_size = Some((w, h));
                 request(toplevel, 8, &mut [arg_i(w), arg_i(h)]); // set_min_size
                 request(toplevel, 7, &mut [arg_i(w), arg_i(h)]); // set_max_size
             } else if let Some((min_width, min_height)) = options.min {
                 // a floor alone: the grab stops there, and no maximum is
                 // said, so the maximize verb stays the compositor's
                 let (w, h) = (min_width.round() as i32, min_height.round() as i32);
+                min_size = Some((w, h));
                 request(toplevel, 8, &mut [arg_i(w), arg_i(h)]); // set_min_size
             }
         }
@@ -2239,6 +2258,9 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
             wl_display_flush(client.display);
         }
         client.windows.push(Window {
+            title: title_c.clone(),
+            min_size,
+            max_size,
             surface,
             xdg_surface,
             toplevel,
@@ -2343,7 +2365,7 @@ fn absorb_setup(addr: usize) -> bool {
         q.extend(kept);
         q.extend(tail);
     });
-    with_client(|client| window_ref(client, addr).is_some_and(|win| win.map.configured))
+    with_client(|client| window_ref(client, addr).is_some_and(|win| win.map.can_attach()))
 }
 
 /// The toplevel's word: a size (zero = our choice) and the states.
@@ -2376,11 +2398,11 @@ fn apply_surface_configure(
     serial: u32,
 ) -> Option<(usize, bool, bool, bool, u64)> {
     let win = window_where(client, |w| w.xdg_surface as usize == xdg_ptr)?;
-    let first = !win.map.configured;
+    let first = !win.map.can_attach();
     let staged = win.pending_size.take();
     win.map.on_configure();
     unsafe { request(win.xdg_surface, 4, &mut [arg_u(serial)]) };
-    let mapped = win.map.mapped;
+    let mapped = win.map.mapped();
     let mut resized = false;
     if let Some((w, h)) = staged {
         let logical = (w as f64, h as f64);
@@ -2484,9 +2506,24 @@ impl WindowHandle {
     }
 }
 
-/// Asks the road to end — what the app's `close` spends on the one
-/// window this shell holds. The pump leaves on its next turn, and the
-/// process returns from `run`.
+type CloseGate = std::rc::Rc<dyn Fn(usize) -> bool>;
+
+thread_local! {
+    static CLOSE_GATE: RefCell<Option<CloseGate>> = const { RefCell::new(None) };
+}
+
+/// Installs the owning application's user-close decision gate.
+pub fn set_close_gate(gate: CloseGate) {
+    CLOSE_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+}
+
+/// Queries application policy outside any platform registry borrow.
+pub fn allow_close(window: usize) -> bool {
+    let gate = CLOSE_GATE.with(|slot| slot.borrow().clone());
+    gate.is_none_or(|gate| gate(window))
+}
+
+/// Explicit teardown; the last native window ends the event loop.
 pub fn close_top_level(window: usize) {
     accessibility::retire_window(window);
     if is_x11() {
@@ -2542,8 +2579,10 @@ pub(crate) fn settle_closes() {
     loop {
         let next = with_client(|client| client.close_requested.pop());
         let Some(window) = next else { break };
-        dispatch_at(window, AppEvent::WindowClosed);
-        close_top_level(window);
+        if allow_close(window) {
+            dispatch_at(window, AppEvent::WindowClosed);
+            close_top_level(window);
+        }
     }
 }
 
@@ -4637,8 +4676,9 @@ pub(crate) fn gpu_limit_size(window: usize, max_px: usize) {
         return;
     }
     with_client(|client| {
-        let Some(win) = window_ref(client, window) else { return };
+        let Some(win) = window_at(client, window) else { return };
         let logical = (max_px / win.scale.max(1)) as i32;
+        win.max_size = Some((logical, logical));
         unsafe {
             request(win.toplevel, 7, &mut [arg_i(logical), arg_i(logical)]);
             wl_display_flush(client.display);
@@ -5652,6 +5692,147 @@ fn teardown() {
 
 // MARK: - tests
 
+/// Reads native visibility for a registered top-level window.
+pub fn window_visibility(
+    window: usize,
+) -> Result<bunny_ui::window::WindowVisibility, bunny_ui::window::WindowError> {
+    use bunny_ui::window::{WindowError, WindowVisibility};
+    if is_x11() {
+        return crate::x11::window_visibility(u32::try_from(window).map_err(|_| WindowError::StaleWindow)?);
+    }
+    with_client(|client| {
+        window_ref(client, window)
+            .map(|win| {
+                if win.map.hidden() {
+                    WindowVisibility::Hidden
+                } else {
+                    WindowVisibility::Shown
+                }
+            })
+            .ok_or(WindowError::StaleWindow)
+    })
+}
+
+/// Rebuild native child surfaces on remap, retaining their logical overlay slots.
+fn suspend_window_panels(client: &mut Client, window: usize) {
+    // Popups first and in reverse creation order; dialogs follow their children.
+    for dialogs in [false, true] {
+        for slot in client.panels.iter_mut().rev() {
+            let Some(panel) = slot
+                .as_ref()
+                .filter(|p| p.owner == window && p.role.dialog().is_some() == dialogs)
+            else {
+                continue;
+            };
+            let role = match &panel.role {
+                Role::Popup { host } => Role::Popup { host: *host },
+                Role::Chip => Role::Chip,
+                Role::Dialog(d) => Role::Dialog(Dialog {
+                    title: d.title.clone(),
+                    min: d.min,
+                    scene: d.scene,
+                    toplevel: std::ptr::null_mut(),
+                    decoration: std::ptr::null_mut(),
+                    pending: None,
+                    pending_maximized: false,
+                    granted: None,
+                    maximized: false,
+                    logical: d.logical,
+                    fixed: d.fixed,
+                }),
+            };
+            let mut replacement = Panel::new(window, role);
+            replacement.scene_origin = panel.scene_origin;
+            if let Some(old) = slot.replace(replacement) {
+                unsafe {
+                    teardown_panel(old);
+                }
+            }
+        }
+    }
+}
+
+/// Changes native visibility without retiring the window lifetime.
+pub fn set_window_visibility(
+    window: usize,
+    visibility: bunny_ui::window::WindowVisibility,
+) -> Result<(), bunny_ui::window::WindowError> {
+    use bunny_ui::window::{WindowError, WindowVisibility};
+    if is_x11() {
+        return crate::x11::set_window_visibility(u32::try_from(window).map_err(|_| WindowError::StaleWindow)?, visibility);
+    }
+    if window_visibility(window)? == visibility {
+        return Ok(());
+    }
+    with_client(|client| {
+        if visibility == WindowVisibility::Hidden {
+            suspend_window_panels(client, window);
+        }
+        let win = window_at(client, window).ok_or(WindowError::StaleWindow)?;
+        unsafe {
+            match visibility {
+                WindowVisibility::Hidden => {
+                    win.map = MapState::Hidden;
+                    if !win.frame_callback.is_null() {
+                        wl_proxy_destroy(win.frame_callback);
+                        win.frame_callback = std::ptr::null_mut();
+                    }
+                    request(
+                        win.surface,
+                        1,
+                        &mut [arg_o(std::ptr::null_mut()), arg_i(0), arg_i(0)],
+                    );
+                    request(win.surface, 6, &mut no_args());
+                }
+                WindowVisibility::Shown => {
+                    win.map = MapState::AwaitingConfigure;
+                    win.pending_size = None;
+                    win.maximized = false;
+                    win.resizing = false;
+                    request(
+                        win.toplevel,
+                        2,
+                        &mut [WlArgument {
+                            s: win.title.as_ptr(),
+                        }],
+                    );
+                    request(win.toplevel, 3, &mut [arg_s(&crate::life::app_id())]);
+                    if let Some((w, h)) = win.min_size {
+                        request(win.toplevel, 8, &mut [arg_i(w), arg_i(h)]);
+                    }
+                    if let Some((w, h)) = win.max_size {
+                        request(win.toplevel, 7, &mut [arg_i(w), arg_i(h)]);
+                    }
+                    if !win.decoration.is_null() {
+                        request(
+                            win.decoration,
+                            1,
+                            &mut [arg_u(if win.scene { 1 } else { 2 })],
+                        );
+                    }
+                    // The initial commit after unmap must contain no buffer.
+                    request(win.surface, 6, &mut no_args());
+                }
+            }
+            wl_display_flush(client.display);
+        }
+        Ok(())
+    })?;
+    if visibility == WindowVisibility::Hidden {
+        // Settle pre-unmap configures without dispatching scene callbacks. They
+        // must not satisfy the next mapping's fresh configure requirement.
+        let display = with_client(|client| client.display);
+        unsafe {
+            wl_display_roundtrip(display);
+        }
+        absorb_setup(window);
+    } else {
+        crate::vk::invalidate(window);
+        crate::gl::invalidate(window);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5976,16 +6157,41 @@ mod tests {
     }
 
     #[test]
+    fn unmapping_blocks_buffers_and_old_configures_until_explicit_remap() {
+        let mut map = MapState::default();
+        map.on_configure();
+        map.on_present();
+        assert!(map.mapped());
+        map = MapState::Hidden;
+        map.on_configure();
+        map.on_present();
+        assert!(map.hidden());
+        assert!(!map.can_attach());
+        map = MapState::AwaitingConfigure;
+        map.on_present();
+        assert!(!map.mapped());
+        assert!(!map.can_attach());
+        map.on_configure();
+        assert!(map.can_attach());
+        assert!(!map.mapped());
+        map.on_present();
+        assert!(map.mapped());
+    }
+
+    #[test]
     fn the_map_dance_holds_its_order() {
         let mut map = MapState::default();
         assert!(!map.can_attach(), "a buffer before the first configure is a protocol error");
         map.on_present();
-        assert!(!map.mapped, "a present that could not attach maps nothing");
+        assert!(
+            !map.mapped(),
+            "a present that could not attach maps nothing"
+        );
         map.on_configure();
         assert!(map.can_attach());
-        assert!(!map.mapped, "configured is not yet mapped");
+        assert!(!map.mapped(), "configured is not yet mapped");
         map.on_present();
-        assert!(map.mapped, "the first real present maps the window");
+        assert!(map.mapped(), "the first real present maps the window");
     }
 
     fn dialog(min: (f64, f64)) -> Dialog {
