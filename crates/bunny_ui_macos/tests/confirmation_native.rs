@@ -156,6 +156,7 @@ mod probe {
     }
 
     pub fn run() {
+        eprintln!("confirmation stage: create windows");
         let app = App::new();
         app.set_locale(Some(Locale::new("pt-BR")));
         let guard = app.open(
@@ -180,8 +181,10 @@ mod probe {
         app.show(subject).unwrap();
         drop(app.confirm(subject, question()).unwrap());
 
+        eprintln!("confirmation stage: queue probe");
         let running = app.clone();
         task::spawn(async move {
+            eprintln!("confirmation stage: initial timer");
             task::sleep(Duration::from_millis(50)).await;
             assert!(
                 sheet("Confirmation subject").is_null(),
@@ -191,6 +194,7 @@ mod probe {
                 ("Sim", ConfirmationResponse::Yes),
                 ("Não", ConfirmationResponse::No),
             ] {
+                eprintln!("confirmation stage: button {label}");
                 let confirmation = running.confirm(subject, question()).unwrap();
                 assert_eq!(confirmation.kind(), ConfirmationKind::AppKitSheet);
                 assert!(matches!(
@@ -210,17 +214,22 @@ mod probe {
                 task::sleep(Duration::from_millis(40)).await;
                 running.hide(guard).unwrap();
                 running.show(guard).unwrap();
+                eprintln!("confirmation stage: activate {label}");
                 answer("Confirmation subject", label);
                 assert_eq!(confirmation.await, Ok(expected));
+                eprintln!("confirmation stage: completed {label}");
                 wait_sheet("Confirmation subject", false).await;
             }
+            eprintln!("confirmation stage: keyboard");
             for (characters, code) in [("\u{1b}", 53), ("\r", 36), ("\u{3}", 76)] {
                 let confirmation = running.confirm(subject, question()).unwrap();
                 wait_sheet("Confirmation subject", true).await;
+                eprintln!("confirmation stage: key {code}");
                 key("Confirmation subject", characters, code);
                 assert_eq!(confirmation.await, Ok(ConfirmationResponse::No), "Return, Enter and Escape are negative");
                 wait_sheet("Confirmation subject", false).await;
             }
+            eprintln!("confirmation stage: simultaneous owners");
             let subject_answer = running.confirm(subject, question()).unwrap();
             let guard_answer = running.confirm(guard, question()).unwrap();
             wait_sheet("Confirmation subject", true).await;
@@ -235,6 +244,7 @@ mod probe {
             assert_eq!(subject_answer.await, Ok(ConfirmationResponse::Yes));
             wait_sheet("Confirmation subject", false).await;
 
+            eprintln!("confirmation stage: explicit cancellation");
             let mut confirmation = running.confirm(subject, question()).unwrap();
             wait_sheet("Confirmation subject", true).await;
             assert!(confirmation.cancel());
@@ -243,11 +253,13 @@ mod probe {
 
             let confirmation = running.confirm(subject, question()).unwrap();
             wait_sheet("Confirmation subject", true).await;
+            eprintln!("confirmation stage: active drop");
             drop(confirmation);
             wait_sheet("Confirmation subject", false).await;
 
             let confirmation = running.confirm(subject, question()).unwrap();
             wait_sheet("Confirmation subject", true).await;
+            eprintln!("confirmation stage: hide owner");
             running.hide(subject).unwrap();
             assert_eq!(
                 confirmation.await,
@@ -258,6 +270,7 @@ mod probe {
 
             let confirmation = running.confirm(subject, question()).unwrap();
             wait_sheet("Confirmation subject", true).await;
+            eprintln!("confirmation stage: close owner");
             running.close(subject);
             assert_eq!(confirmation.await, Err(ConfirmationError::OwnerClosed));
             assert!(matches!(
@@ -269,6 +282,7 @@ mod probe {
             );
             running.quit();
         }).detach();
+        eprintln!("confirmation stage: enter event loop");
         app.run();
     }
 }
