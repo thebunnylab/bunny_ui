@@ -3,6 +3,7 @@ name: Shared core correctness
 on:
   pull_request:
     paths:
+      - 'crates/motor/**'
       - 'crates/bunny_ui/**'
       - 'crates/bunny_ui_facade/**'
       - 'crates/bunny_ui_apple/**'
@@ -56,6 +57,10 @@ jobs:
           rustup override set 1.98.1
           rustc --version --verbose
           cargo --version
+      - name: Task executor, normal and paranoid
+        run: |
+          cargo test -p bunny-ui-motor --locked --all-targets
+          BUNNY_PARANOID=all cargo test -p bunny-ui-motor --locked --all-targets
       - name: Core default, normal and paranoid
         run: |
           cargo test -p bunny-ui-core --locked --all-targets
@@ -109,7 +114,7 @@ jobs:
         run: |
           # Each strict exit code stays visible, including inherited failures.
           # New diagnostics fail this separate regression gate.
-          packages=(--package bunny-ui-core --package "$PLATFORM")
+          packages=(--package bunny-ui-motor --package bunny-ui-core --package "$PLATFORM")
           if [ "$RUNNER_OS" = macOS ]; then
             packages+=(--package bunny-ui-macos)
           fi
