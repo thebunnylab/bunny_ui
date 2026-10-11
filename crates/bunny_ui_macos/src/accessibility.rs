@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 use std::rc::{Rc, Weak};
 
+use super::objc_bool::{self, ObjcBool};
 use super::{
     AppEvent, CGPoint, CGRect, CGSize, Id, Sel, WindowHandle, class, class_addMethod, dispatch_to,
     msg_id, msg_rect, msg_void, ns_string, objc_allocateClassPair, objc_registerClassPair, sel,
@@ -38,9 +39,9 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn append(object: Id, selector: Sel, value: Id);
     #[link_name = "objc_msgSend"]
-    fn predicate(object: Id, selector: Sel, value: Id) -> i8;
+    fn predicate(object: Id, selector: Sel, value: Id) -> ObjcBool;
     #[link_name = "objc_msgSend"]
-    fn boolean(object: Id, selector: Sel) -> i8;
+    fn boolean(object: Id, selector: Sel) -> ObjcBool;
     #[link_name = "objc_msgSendSuper"]
     fn super_object(object: *const Super, selector: Sel) -> Id;
     #[link_name = "objc_msgSend"]
@@ -459,8 +460,8 @@ extern "C" fn view_children(this: Id, _: Sel) -> Id {
     surface.activate();
     surface.children()
 }
-extern "C" fn view_element(this: Id, _: Sel) -> i8 {
-    i8::from(surface(this).is_some())
+extern "C" fn view_element(this: Id, _: Sel) -> ObjcBool {
+    ObjcBool::new(surface(this).is_some())
 }
 extern "C" fn view_role(_: Id, _: Sel) -> Id {
     unsafe { ns_string("AXGroup") }
@@ -475,19 +476,19 @@ extern "C" fn view_focused(this: Id, _: Sel) -> Id {
     unsafe {
         let mut responder = msg_id(msg_id(this, sel("window")), sel("firstResponder"));
         // AppKit's shared field editor speaks for its owning text control.
-        if predicate(responder, sel("isKindOfClass:"), class("NSText")) != 0
-            && boolean(responder, sel("isFieldEditor")) != 0
+        if predicate(responder, sel("isKindOfClass:"), class("NSText")).get()
+            && boolean(responder, sel("isFieldEditor")).get()
         {
             let owner = msg_id(responder, sel("delegate"));
-            if predicate(owner, sel("isKindOfClass:"), class("NSView")) != 0
-                && predicate(owner, sel("isDescendantOf:"), this) != 0
+            if predicate(owner, sel("isKindOfClass:"), class("NSView")).get()
+                && predicate(owner, sel("isDescendantOf:"), this).get()
             {
                 responder = owner;
             }
         }
         if responder != this
-            && predicate(responder, sel("isKindOfClass:"), class("NSView")) != 0
-            && predicate(responder, sel("isDescendantOf:"), this) != 0
+            && predicate(responder, sel("isKindOfClass:"), class("NSView")).get()
+            && predicate(responder, sel("isDescendantOf:"), this).get()
         {
             let focused = msg_id(responder, sel("accessibilityFocusedUIElement"));
             if !focused.is_null() {
@@ -539,8 +540,8 @@ extern "C" fn view_hit(this: Id, _: Sel, point: CGPoint) -> Id {
         .find(|element| contains(element.frame(), point))
         .map_or(this, |element| element.object)
 }
-extern "C" fn element_alive(this: Id, _: Sel) -> i8 {
-    i8::from(element(this).is_some())
+extern "C" fn element_alive(this: Id, _: Sel) -> ObjcBool {
+    ObjcBool::new(element(this).is_some())
 }
 extern "C" fn element_role(this: Id, _: Sel) -> Id {
     let Some(element) = element(this) else {
@@ -598,14 +599,14 @@ extern "C" fn element_window(this: Id, command: Sel) -> Id {
 extern "C" fn element_frame(this: Id, _: Sel) -> CGRect {
     element(this).map_or_else(empty_frame, |element| element.frame())
 }
-extern "C" fn element_focused(this: Id, _: Sel) -> i8 {
-    i8::from(element(this).is_some_and(|element| element.node.borrow().focused))
+extern "C" fn element_focused(this: Id, _: Sel) -> ObjcBool {
+    ObjcBool::new(element(this).is_some_and(|element| element.node.borrow().focused))
 }
-extern "C" fn element_press(this: Id, _: Sel) -> i8 {
-    i8::from(element(this).is_some_and(|element| element.action(Action::Activate)))
+extern "C" fn element_press(this: Id, _: Sel) -> ObjcBool {
+    ObjcBool::new(element(this).is_some_and(|element| element.action(Action::Activate)))
 }
-extern "C" fn element_set_focus(this: Id, _: Sel, focused: i8) {
-    if focused != 0
+extern "C" fn element_set_focus(this: Id, _: Sel, focused: ObjcBool) {
+    if focused.get()
         && let Some(element) = element(this)
     {
         element.action(Action::Focus);
@@ -614,27 +615,27 @@ extern "C" fn element_set_focus(this: Id, _: Sel, focused: i8) {
 extern "C" fn element_set_value(this: Id, _: Sel, value: Id) {
     if let Some(element) = element(this)
         && !value.is_null()
-        && unsafe { predicate(value, sel("isKindOfClass:"), class("NSString")) } != 0
+        && unsafe { predicate(value, sel("isKindOfClass:"), class("NSString")) }.get()
     {
         let text = unsafe { super::text_argument_to_string(value) };
         element.action(Action::SetText(text));
     }
 }
-extern "C" fn element_allowed(this: Id, _: Sel, selector: Sel) -> i8 {
+extern "C" fn element_allowed(this: Id, _: Sel, selector: Sel) -> ObjcBool {
     let Some(element) = element(this) else {
-        return 0;
+        return ObjcBool::NO;
     };
     let node = element.node.borrow();
     if selector == unsafe { sel("accessibilityPerformPress") } {
-        return i8::from(node.role == Role::Button);
+        return ObjcBool::new(node.role == Role::Button);
     }
     if selector == unsafe { sel("setAccessibilityValue:") }
         || selector == unsafe { sel("setAccessibilityFocused:") }
     {
-        return i8::from(matches!(node.role, Role::TextField | Role::PasswordField));
+        return ObjcBool::new(matches!(node.role, Role::TextField | Role::PasswordField));
     }
     let name = unsafe { CStr::from_ptr(sel_getName(selector)) }.to_bytes();
-    i8::from(!name.starts_with(b"setAccessibility") && !name.starts_with(b"accessibilityPerform"))
+    ObjcBool::new(!name.starts_with(b"setAccessibility") && !name.starts_with(b"accessibilityPerform"))
 }
 
 // =============================================================================
@@ -658,7 +659,7 @@ pub(super) unsafe fn register_view(view: Id) {
             (
                 "isAccessibilityElement",
                 view_element as *const c_void,
-                c"c@:",
+                objc_bool::GETTER,
             ),
             ("accessibilityRole", view_role as *const c_void, c"@@:"),
             (
@@ -683,12 +684,12 @@ pub(super) unsafe fn register_view(view: Id) {
             (
                 "isAccessibilityElement",
                 element_alive as *const c_void,
-                c"c@:",
+                objc_bool::GETTER,
             ),
             (
                 "isAccessibilityEnabled",
                 element_alive as *const c_void,
-                c"c@:",
+                objc_bool::GETTER,
             ),
             ("accessibilityRole", element_role as *const c_void, c"@@:"),
             (
@@ -731,17 +732,17 @@ pub(super) unsafe fn register_view(view: Id) {
             (
                 "isAccessibilityFocused",
                 element_focused as *const c_void,
-                c"c@:",
+                objc_bool::GETTER,
             ),
             (
                 "accessibilityPerformPress",
                 element_press as *const c_void,
-                c"c@:",
+                objc_bool::GETTER,
             ),
             (
                 "setAccessibilityFocused:",
                 element_set_focus as *const c_void,
-                c"v@:c",
+                objc_bool::SETTER,
             ),
             (
                 "setAccessibilityValue:",
@@ -751,7 +752,7 @@ pub(super) unsafe fn register_view(view: Id) {
             (
                 "isAccessibilitySelectorAllowed:",
                 element_allowed as *const c_void,
-                c"c@::",
+                objc_bool::SELECTOR,
             ),
         ] {
             class_addMethod(class, sel(name), method, types.as_ptr());

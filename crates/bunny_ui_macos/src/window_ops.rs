@@ -1,4 +1,5 @@
 //! Native requests for registered, independently routed scenes.
+use super::ObjcBool;
 use super::{
     Id, MODAL_WINDOWS, WINDOWS, class, lend_hand, msg_bool, msg_id, msg_void_bool, msg_void_id,
     msg_void_id_i64, sel,
@@ -47,13 +48,13 @@ pub fn focus_window(window: usize) -> Result<(), WindowError> {
     lend_hand(|| unsafe {
         let mut ancestor = live;
         while !ancestor.is_null() {
-            if msg_bool(ancestor, sel("isMiniaturized")) != 0 {
+            if msg_bool(ancestor, sel("isMiniaturized")).get() {
                 msg_void_id(ancestor, sel("deminiaturize:"), std::ptr::null_mut());
             }
             ancestor = msg_id(ancestor, sel("parentWindow"));
         }
         let app = msg_id(class("NSApplication"), sel("sharedApplication"));
-        msg_void_bool(app, sel("activateIgnoringOtherApps:"), 0);
+        msg_void_bool(app, sel("activateIgnoringOtherApps:"), ObjcBool::NO);
         msg_void_id(target, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
         msg_void_id(
             target,

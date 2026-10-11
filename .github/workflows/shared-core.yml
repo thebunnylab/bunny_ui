@@ -108,6 +108,10 @@ jobs:
         run: |
           cargo test -p bunny-ui-macos --locked --all-targets
           BUNNY_PARANOID=all cargo test -p bunny-ui-macos --locked --all-targets
+          # BOOL uses a different ABI on Intel macOS. Compile the complete
+          # shell/test boundary; native Intel execution needs its own host.
+          rustup target add x86_64-apple-darwin
+          cargo check -p bunny-ui-macos --locked --all-targets --target x86_64-apple-darwin
           rustup target add aarch64-apple-ios
           cargo check -p bunny-ui-ios --locked --target aarch64-apple-ios
       - name: Strict lint diagnostic comparison
