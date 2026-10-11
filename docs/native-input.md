@@ -6,6 +6,16 @@ The policy interprets physical strokes and can decorate native edit commands;
 it does not introduce a custom editor surface. Keep one policy per document,
 rather than constructing it during every render.
 
+`multiline_text_alignment` also aligns editable text in single-line fields and
+each visual line of a multiline editor. Leading and trailing follow the scene's
+layout direction; center uses the remaining padded width equally on each side.
+Use trailing alignment with a monospaced font and fixed fractional digits for a
+numeric column. Painting, pointer placement, selection, composition underlines
+and native UTF-16 caret/range queries share that line origin. The placeholder
+aligns independently of an empty editor's insertion point. Overflow still follows
+the text's own reading direction and scrolls to reveal the caret. These rules do
+not add visual BiDi navigation or OpenType tabular-number features.
+
 `takes_text` decides whether printable keys enter the platform text/IME path.
 `key` receives the layout's actual typed character before application bindings.
 A consumed stroke updates both the binding and native caret and requests a frame,

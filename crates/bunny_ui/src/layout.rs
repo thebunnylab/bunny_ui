@@ -3625,6 +3625,8 @@ pub struct FieldPlacement {
     /// padding. The runtime keeps the caret inside THIS; the padding
     /// itself stays layout's business.
     pub run: Rect,
+    /// Left edge of the first displayed line and top of its line box.
+    /// Later visual lines resolve alignment from their own widths.
     pub text_origin: Point,
     pub font: FontSpec,
     /// When the field asks for the keyboard by itself.
@@ -3637,12 +3639,14 @@ pub struct FieldPlacement {
     /// fits is anchored ([`field_run_x`]). A line's OWN direction is its
     /// first letter's, decided by whoever reads it.
     pub direction: LayoutDirection,
+    /// Alignment within the padded run; absent means direction-relative leading.
+    pub text_align: Option<motor::views::TextAlignment>,
 }
 
 /// Where a field's run of `text_width` starts inside `run` — the frame
 /// minus the field's padding — scrolled by `offset_x`. A line that fits
-/// is anchored at the SCENE's leading edge, the right one when the
-/// scene reads right to left; a line that overflows scrolls by its OWN
+/// follows the requested alignment relative to the SCENE's direction;
+/// absent alignment means leading. A line that overflows scrolls by its OWN
 /// reading direction, so offset zero always shows the text's start and
 /// the caret's reveal counts in logical units either way. The answer is
 /// the run's LEFT edge, which is what a `TextLine` and every reader of
@@ -3652,11 +3656,21 @@ pub(crate) fn field_run_x(
     run: Rect,
     offset_x: Px,
     text_width: Px,
+    alignment: Option<motor::views::TextAlignment>,
     anchor_rtl: bool,
     line_rtl: bool,
 ) -> Px {
     if text_width <= run.size.width {
-        if anchor_rtl { run.origin.x + run.size.width - text_width } else { run.origin.x }
+        use motor::views::TextAlignment;
+        let room = run.size.width - text_width;
+        let shift = match (alignment, anchor_rtl) {
+            (None | Some(TextAlignment::Leading), false)
+            | (Some(TextAlignment::Trailing), true) => 0.0,
+            (Some(TextAlignment::Center), _) => room / 2.0,
+            (None | Some(TextAlignment::Leading), true)
+            | (Some(TextAlignment::Trailing), false) => room,
+        };
+        run.origin.x + shift
     } else if line_rtl {
         run.origin.x + run.size.width - text_width + offset_x
     } else {
@@ -6529,11 +6543,13 @@ impl LayoutNode {
                 let anchor_rtl = env.rtl();
                 let line_geometry = |start: usize, end: usize| -> (Px, Px, bool) {
                     let line_rtl = crate::text_input::reads_right_to_left(&sample[start..end]);
-                    if !anchor_rtl && !line_rtl {
+                    if !anchor_rtl && !line_rtl
+                        && matches!(env.text_align, None | Some(motor::views::TextAlignment::Leading))
+                    {
                         return (text_origin.x, 0.0, false);
                     }
                     let line_w = width_of(start, end);
-                    (field_run_x(run, offset.x, line_w, anchor_rtl, line_rtl), line_w, line_rtl)
+                    (field_run_x(run, offset.x, line_w, env.text_align, anchor_rtl, line_rtl), line_w, line_rtl)
                 };
                 let color = if content.is_empty() {
                     theme.placeholder
@@ -6648,7 +6664,13 @@ impl LayoutNode {
                     // the boundary the caret stands at — and a caret that
                     // covers the NEXT character covers it on the side the
                     // line continues to, the left on a right-to-left line
-                    let (line_x, line_w, line_rtl) = line_geometry(start, end);
+                    // An empty editor's insertion point aligns an empty run,
+                    // independently of the placeholder's visible width.
+                    let (line_x, line_w, line_rtl) = if content.is_empty() {
+                        (field_run_x(run, 0.0, 0.0, env.text_align, anchor_rtl, false), 0.0, false)
+                    } else {
+                        line_geometry(start, end)
+                    };
                     let boundary =
                         field_glyph_x(line_x, line_w, line_rtl, width_of(start, caret.max(start)));
                     let origin = Point {
@@ -6697,13 +6719,17 @@ impl LayoutNode {
                     path: path.clone(),
                     frame,
                     run,
-                    text_origin,
+                    text_origin: Point {
+                        x: line_geometry(lines[0].0, lines[0].1).0,
+                        y: text_origin.y,
+                    },
                     font: env.font,
                     line_height: line_h,
                     multiline,
                     auto_focus: *auto_focus,
                     secret,
                     direction: env.direction,
+                    text_align: env.text_align,
                 });
             }
 

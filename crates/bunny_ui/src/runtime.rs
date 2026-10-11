@@ -3987,7 +3987,9 @@ impl Runtime {
     ) -> (Px, Px, bool) {
         let anchor_rtl = field.direction.is_rtl();
         let line_rtl = crate::text_input::reads_right_to_left(line);
-        if !anchor_rtl && !line_rtl {
+        if !anchor_rtl && !line_rtl
+            && matches!(field.text_align, None | Some(motor::views::TextAlignment::Leading))
+        {
             return (field.text_origin.x, 0.0, false);
         }
         let width = self.cache.get_or_measure(line, &field.font, &*self.text).width;
@@ -3997,7 +3999,7 @@ impl Runtime {
         } else {
             self.scroll_offsets.borrow().get(path).map_or(0.0, |offset| offset.x)
         };
-        (crate::layout::field_run_x(field.run, offset_x, width, anchor_rtl, line_rtl), width, line_rtl)
+        (crate::layout::field_run_x(field.run, offset_x, width, field.text_align, anchor_rtl, line_rtl), width, line_rtl)
     }
 
     /// The pointer's distance along one visual line of a field, from the
@@ -4049,8 +4051,17 @@ impl Runtime {
         byte: usize,
     ) -> Rect {
         let byte = crate::text_input::clamp_index(text, byte);
+        // Native ranges name the real string, but their rectangles follow
+        // the displayed bullets, just like pointer placement and painting.
+        let masked;
+        let (text, byte) = if field.secret {
+            masked = std::sync::Arc::from(crate::text_input::masked(text));
+            (&masked, crate::text_input::masked_index(text, byte))
+        } else {
+            (text, byte)
+        };
         let (start, end, row) = if field.multiline {
-            let lines = self.wrap(text, Some(text), field);
+            let lines = self.wrap(text, (!field.secret).then_some(text), field);
             let row = crate::layout::line_of(&lines, byte);
             let (start, end) = lines.get(row).copied().unwrap_or((0, text.len()));
             (start.min(byte), end.max(byte), row)
@@ -4448,10 +4459,9 @@ impl Runtime {
         if !field.frame.contains(x, y) {
             return None;
         }
-        let mut probe = CaretState::default();
-        let text = reconciler::read_editor(&path, &mut probe)?;
-        let along = self.field_line_x(&field, &path, &text, x);
-        let byte = caret_from_x(&text, along, &field.font, &*self.text, &self.cache);
+        // Use the pointer's visual row and the same aligned (or masked) run
+        // as ordinary clicking, including wrapped and vertically scrolled text.
+        let (text, byte, _) = self.caret_under(&path, x, y)?;
         Some(crate::text_input::byte_to_utf16(&text, byte))
     }
 
