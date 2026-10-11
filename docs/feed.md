@@ -232,7 +232,11 @@ source. No elapsed-time resource-release heuristic issues receipts.
 Only whole-frame Metal drawables with a clipped-in live RGBA feed draw qualify
 for that path. The final atlas generation must match after upload retries;
 stale or failed uploads cannot borrow the requested generation's identity.
-Native bands, CPU drawing, partial or reused patches, faded/mirrored feeds,
+The receipt's own command must also encode a complete upload of that texture
+through valid blit and paint encoders. Merely reusing a cached generation is
+`NoCurrentUpload`: its earlier command may have failed or been abandoned before
+submission. Observation does not force a reupload to manufacture a receipt.
+Native bands, CPU drawing, glass passes, partial or reused patches, faded/mirrored feeds,
 native-surface imports, and Windows/Wayland/X11 presentation currently report
 unavailable. Enabling observation preserves the selected rendering strategy.
 Hidden or AppKit-occluded windows suspend tickets, including callbacks racing

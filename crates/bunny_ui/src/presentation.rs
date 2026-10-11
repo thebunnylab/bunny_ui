@@ -30,6 +30,9 @@ pub enum Unavailable {
     UnsupportedSnapshot,
     /// The GPU texture does not contain the requested generation.
     UploadFailed,
+    /// This command has no verified fresh upload of the selected generation.
+    /// Cached pixels may depend on an earlier failed or abandoned command.
+    NoCurrentUpload,
     /// Three earlier observations still await the platform. No drop is inferred.
     Backpressure,
     /// No drawable was available; no native commit was observed.

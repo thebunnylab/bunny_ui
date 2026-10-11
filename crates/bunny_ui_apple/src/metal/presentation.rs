@@ -1,8 +1,9 @@
 //! The only native receipt source here is `MTLDrawable`'s presented handler.
 //! Blocks own weak scalar tickets, never windows, drawables, or image storage.
 
-use super::{Id, Sel, c_void, msg_f64, msg_u64, msg_void_id, sel};
+use super::{EncodedFrame, Id, MetalGround, Sel, c_void, msg_f64, msg_u64, msg_void_id, sel};
 use bunny_ui::gpu::walk::{FrameBatches, RunAtlas};
+use bunny_ui::image_engine::FeedKey;
 use bunny_ui::presentation::Unavailable;
 use bunny_ui::presentation::backend::{FrameObservation, PresentationTicket};
 
@@ -89,13 +90,27 @@ fn block(ticket: PresentationTicket) -> PresentedBlock {
 /// `MTLDrawable` borrowed for this call; Metal copies the block before returning.
 pub(super) unsafe fn observe(
     drawable: Id,
-    command: Id,
+    encoded: EncodedFrame,
     attempt: FrameObservation,
     atlas: &RunAtlas,
     batches: &FrameBatches,
+    ground: &MetalGround,
 ) {
+    let command = encoded.command;
     if command.is_null() {
         attempt.unavailable(Unavailable::CommandUnavailable);
+        return;
+    }
+    if !batches.glass.is_empty() {
+        attempt.unavailable(Unavailable::NativeCompositing);
+        return;
+    }
+    if !encoded.feed_uploads_encoded
+        || !attempt
+            .feed()
+            .is_some_and(|feed| uploaded_in_frame(feed, atlas, ground))
+    {
+        attempt.unavailable(Unavailable::NoCurrentUpload);
         return;
     }
     for selector in ["addPresentedHandler:", "presentedTime", "drawableID"] {
@@ -124,6 +139,20 @@ pub(super) unsafe fn observe(
             (&raw const block).cast_mut().cast(),
         );
     };
+}
+
+fn uploaded_in_frame(feed: FeedKey, atlas: &RunAtlas, ground: &MetalGround) -> bool {
+    let Some(entry) = atlas.live.get(&feed.raw()) else {
+        return false;
+    };
+    let Some(texture) = ground.textures.get(&entry.id) else {
+        return false;
+    };
+    ground.pending.iter().any(|copy| {
+        copy.texture == *texture
+            && copy.width == u64::from(entry.width)
+            && copy.height == u64::from(entry.height)
+    })
 }
 
 #[cfg(test)]
@@ -159,5 +188,50 @@ mod tests {
         );
         unsafe { _Block_release(copied.cast()) };
         drop(source);
+    }
+    #[test]
+    fn cached_generation_without_a_current_upload_is_not_a_receipt_source() {
+        use crate::metal::OffscreenGpu;
+        use bunny_ui::image_engine::RawImages;
+        use bunny_ui::layout::{Color, DisplayList, DrawCommand, Point, Rect, Size};
+        use bunny_ui::text_engine::PixelFont;
+        let Some(mut gpu) = OffscreenGpu::new(8, 8) else {
+            return;
+        };
+        let feed = ImageFeed::new();
+        feed.push((1, 1), vec![255, 0, 0, 255]);
+        let display: DisplayList = vec![DrawCommand::Image {
+            rect: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 8.0,
+                    height: 8.0,
+                },
+            },
+            source: feed.source(),
+        }]
+        .into();
+        gpu.present_wait(&display, 1, Color::WHITE, &PixelFont, &RawImages::default());
+        assert!(uploaded_in_frame(feed.key(), &gpu.atlas, &gpu.ground));
+        // A new staging slot has no bytes for this generation, even though
+        // the cache still names it. A prior upload may have been abandoned.
+        gpu.ground.begin_slot(1);
+        assert!(!uploaded_in_frame(feed.key(), &gpu.atlas, &gpu.ground));
+        assert_eq!(gpu.atlas.live[&feed.key().raw()].generation, 1);
+        feed.push((1, 1), vec![0, 255, 0, 255]);
+        let next: DisplayList = vec![DrawCommand::Image {
+            rect: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 8.0,
+                    height: 8.0,
+                },
+            },
+            source: feed.source(),
+        }]
+        .into();
+        gpu.walk(&next, 1, &PixelFont, &RawImages::default());
+        assert!(uploaded_in_frame(feed.key(), &gpu.atlas, &gpu.ground));
+        assert_eq!(gpu.atlas.live[&feed.key().raw()].generation, 2);
     }
 }

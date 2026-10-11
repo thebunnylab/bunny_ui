@@ -13,6 +13,12 @@ pub struct FrameObservation {
 }
 
 impl FrameObservation {
+    /// Selected scalar slot, without retaining its image source.
+    #[must_use]
+    pub fn feed(&self) -> Option<crate::image_engine::FeedKey> {
+        self.sender.feed()
+    }
+
     #[must_use]
     pub fn begin(sender: &PresentationSender, display: &DisplayList) -> Option<Self> {
         let feed = sender.feed()?;
