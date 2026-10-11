@@ -1381,6 +1381,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let handler_pacer = Rc::clone(&pacer);
     let handler_dialogs = Rc::clone(&dialogs);
     let held = Cell::new(Modifiers::NONE);
+    let handler_lifecycle = Rc::clone(&lifecycle);
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
@@ -1443,7 +1444,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // the user switched away: popovers close like the
                 // platform's own, and a page lets the keyboard go
                 webview::unfocus();
-                if runtime.dismiss_all_overlays() {
+                if !handler_lifecycle.is_hidden() && runtime.dismiss_all_overlays() {
                     blit(runtime, root, ORIGIN_KEY);
                 }
             }

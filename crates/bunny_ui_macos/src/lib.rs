@@ -2178,6 +2178,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     });
     let frame_clock = Instant::now();
     let mut last_display_beat = None;
+    let handler_lifecycle = Rc::clone(&lifecycle);
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
@@ -2348,7 +2349,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // only ever fires on the parent) — and the decorations
             // freeze: they animate for eyes that are on them
             runtime.set_loops_paused(true);
-            if runtime.dismiss_all_overlays() {
+            if !handler_lifecycle.is_hidden() && runtime.dismiss_all_overlays() {
                 blit(runtime, root, trace::Origin::Input);
             } else {
                 sync_frame_driver(runtime, &handler_pacer, window_id);
