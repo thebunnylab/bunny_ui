@@ -357,14 +357,13 @@ pub struct Runtime {
     touch_fresh: Cell<bool>,
     /// The shell drives the task clock by the wall ([`Runtime::drive_tasks_by_wall`]):
     /// a sleeper's deadline is the shell's own alarm, never a reason to
-    /// run the display link.
-    task_driver: Cell<bool>,
+    /// run the display link. The executor owns the shared wall anchor;
+    /// opening another scene must never restart or multiply that clock.
+    task_driver: RefCell<Option<motor::task::WallClock>>,
     /// Can the shell show a box's overlay on a layer of its own?
     overlay_layers: Cell<bool>,
     /// Can the shell show a scrollbar's thumb on a layer of its own?
     thumb_layers: Cell<bool>,
-    /// When the task clock was last brought up to the wall.
-    task_clock_last: Cell<Option<std::time::Instant>>,
     /// The size last HANDED to each measurement probe. A probe fires on
     /// change and only on change: a view at rest costs nothing, and a
     /// handler that writes state cannot spin against its own report.
@@ -1563,10 +1562,9 @@ impl Runtime {
             modifier_sink: RefCell::new(None),
             key_sink: RefCell::new(None),
             touch_fresh: Cell::new(false),
-            task_driver: Cell::new(false),
+            task_driver: RefCell::new(None),
             overlay_layers: Cell::new(false),
             thumb_layers: Cell::new(false),
-            task_clock_last: Cell::new(None),
             pending_aged: Cell::new(false),
             wheel_latch: RefCell::new(None),
             measures: RefCell::new(HashMap::default()),
@@ -4809,7 +4807,7 @@ impl Runtime {
         // the engine's clock moves with the frames: a sleeping task
         // wakes here, and its waker asks the shell for a settled turn
         // (this path only repaints, and a task needs the bodies)
-        if self.task_driver.get() {
+        if self.task_driver.borrow().is_some() {
             // the wall is the task clock: a beat brings it up to now
             self.advance_tasks_to_now();
         } else {
@@ -4885,7 +4883,7 @@ impl Runtime {
         // clock is the frame tick — the shell's driver stays awake; so
         // does a finger whose meaning the clock decides, and a fling
         self.animator.borrow().wants_frame()
-            || (!self.task_driver.get() && motor::task::has_timers())
+            || (self.task_driver.borrow().is_none() && motor::task::has_timers())
             || self.touch.borrow().alive()
     }
 
@@ -4916,7 +4914,7 @@ impl Runtime {
         }
         // a shell with an alarm of its own for the sleepers asks the
         // display for nothing on their account
-        if self.task_driver.get() {
+        if self.task_driver.borrow().is_some() {
             return pace;
         }
         let Some(left) = motor::task::next_timer_in() else {
@@ -4941,9 +4939,18 @@ impl Runtime {
     /// ([`Runtime::next_task_wake`]) — never a reason to run the display
     /// link, which used to beat at full rate for a poller thirty
     /// milliseconds away, and to wake every other sleeper with it.
+    /// All wall-driven scenes on the thread share one executor clock.
+    /// Registering another scene synchronizes it without resetting sleepers.
     pub fn drive_tasks_by_wall(&self) {
-        self.task_driver.set(true);
-        self.task_clock_last.set(Some(std::time::Instant::now()));
+        self.drive_tasks_at(std::time::Instant::now());
+    }
+
+    fn drive_tasks_at(&self, now: std::time::Instant) {
+        if self.task_driver.borrow().is_some() {
+            self.advance_tasks_at(now);
+        } else {
+            self.task_driver.replace(Some(motor::task::WallClock::new(now)));
+        }
     }
 
     /// Brings the task clock up to the wall: every sleeper whose deadline
@@ -4951,16 +4958,11 @@ impl Runtime {
     /// that does not drive the clock ([`Runtime::drive_tasks_by_wall`])
     /// gets `false` and nothing moves; its beats move the clock.
     pub fn advance_tasks_to_now(&self) -> bool {
-        if !self.task_driver.get() {
-            return false;
-        }
-        let now = std::time::Instant::now();
-        let last = self.task_clock_last.replace(Some(now));
-        let elapsed = last.map_or(0.0, |last| now.saturating_duration_since(last).as_secs_f64());
-        if elapsed <= 0.0 {
-            return false;
-        }
-        motor::task::advance(elapsed)
+        self.advance_tasks_at(std::time::Instant::now())
+    }
+
+    fn advance_tasks_at(&self, now: std::time::Instant) -> bool {
+        self.task_driver.borrow().as_ref().is_some_and(|clock| clock.advance_to(now))
     }
 
     /// Seconds until the nearest sleeper's deadline, by the task clock —
@@ -7817,3 +7819,7 @@ impl Runtime {
         if applied { self.frame_asked.set(true); Ok(()) } else { Err(ActionError::Unavailable) }
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_clock_tests.rs"]
+mod clock_tests;

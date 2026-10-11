@@ -12,10 +12,11 @@
 //! Nothing here is unsafe: the waker comes from `Arc<impl Wake>` and the
 //! future rides a `Pin<Box<…>>`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Wake, Waker};
 
@@ -100,6 +101,9 @@ struct Executor {
     /// moves time by hand and never really waits.
     timers: HashMap<u64, (f64, Waker)>,
     clock: f64,
+    /// The scenes own their wall driver. This weak reference lets sleepers
+    /// synchronize before taking a deadline without keeping a dead host alive.
+    wall_clock: Weak<Cell<std::time::Instant>>,
 }
 
 thread_local! {
@@ -240,14 +244,18 @@ impl std::fmt::Debug for Spawned {
 
 // MARK: - Waiting
 
-/// Waits `duration` before going on. The clock is the frame tick's, so
-/// a task that sleeps keeps the shell's driver awake until it wakes —
-/// the price of a debounce, and the reason to keep them short.
+/// Waits `duration` before going on.
+///
+/// Native wall drivers synchronize at creation, so synchronous work before
+/// this call cannot shorten the wait.
+/// A headless host advances the manual clock; a native shell can schedule
+/// its next alarm without keeping the display link running.
 ///
 /// The recipe a search field wants: `.task_id(query, || async move {
 /// sleep(Duration::from_millis(250)).await; … })` — every keystroke
 /// restarts the task, so only the last one ever reaches the work.
 pub fn sleep(duration: std::time::Duration) -> Sleep {
+    synchronize_wall_clock();
     EXECUTOR.with(|executor| {
         let mut executor = executor.borrow_mut();
         executor.next += 1;
@@ -306,6 +314,54 @@ pub fn advance(dt: f64) -> bool {
         waker.wake();
     }
     woke
+}
+
+/// Keeps the shared executor on wall time while a native scene drives it.
+///
+/// Every driver on the UI thread shares the same monotonic anchor. Dropping
+/// the last driver returns task creation to the deterministic manual clock.
+#[must_use = "keep the driver alive while the native scene uses wall time"]
+pub struct WallClock {
+    anchor: Rc<Cell<std::time::Instant>>,
+}
+
+impl WallClock {
+    /// Joins the thread's existing clock, or establishes its first anchor.
+    /// Registration observes `now`; it never restarts an existing deadline.
+    pub fn new(now: std::time::Instant) -> Self {
+        let anchor = EXECUTOR.with(|executor| {
+            let mut executor = executor.borrow_mut();
+            if let Some(anchor) = executor.wall_clock.upgrade() {
+                anchor
+            } else {
+                let anchor = Rc::new(Cell::new(now));
+                executor.wall_clock = Rc::downgrade(&anchor);
+                anchor
+            }
+        });
+        let driver = Self { anchor };
+        let _ = driver.advance_to(now);
+        driver
+    }
+
+    /// Observes `now` once across all drivers. Equal or backwards readings do
+    /// nothing, including leaving the anchor unchanged; recovery cannot count
+    /// the same interval twice. Animation and touch clocks are independent.
+    #[must_use]
+    pub fn advance_to(&self, now: std::time::Instant) -> bool {
+        let Some(elapsed) = now.checked_duration_since(self.anchor.get()) else { return false };
+        self.anchor.set(now);
+        !elapsed.is_zero() && advance(elapsed.as_secs_f64())
+    }
+}
+
+/// A sleeper may be created after synchronous work inside a task poll. Bring
+/// the clock up to the instant it starts, not merely the poll's older timestamp.
+fn synchronize_wall_clock() {
+    let anchor = EXECUTOR.with(|executor| executor.borrow().wall_clock.upgrade());
+    if let Some(anchor) = anchor {
+        let _ = WallClock { anchor }.advance_to(std::time::Instant::now());
+    }
 }
 
 /// Is anyone sleeping? The shell keeps its frame driver awake while
@@ -478,6 +534,7 @@ mod tests {
             executor.tasks.clear();
             executor.timers.clear();
             executor.clock = 0.0;
+            executor.wall_clock = Weak::new();
             executor.shared = Arc::default();
         });
     }
