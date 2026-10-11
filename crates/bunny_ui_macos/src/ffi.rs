@@ -40,6 +40,10 @@ pub(crate) use bunny_ui_apple::ffi::{
 
 use crate::objc_bool::{self, ObjcBool};
 
+#[path = "appearance.rs"]
+mod appearance;
+pub use appearance::os_appearance;
+
 #[path = "accessibility.rs"]
 mod accessibility;
 pub(crate) use accessibility::Accessibility;
@@ -150,6 +154,8 @@ unsafe extern "C" {
     #[link_name = "objc_msgSendSuper"]
     fn msg_super_bool_id(sup: *const ObjcSuper, sel: Sel, a: Id) -> ObjcBool;
     #[link_name = "objc_msgSend"]
+    fn msg_observe(obj: Id, sel: Sel, observer: Id, key: Id, options: usize, context: *mut c_void);
+    #[link_name = "objc_msgSend"]
     fn msg_void_rect_bool(obj: Id, sel: Sel, rect: CGRect, flag: ObjcBool);
     #[link_name = "objc_msgSend"]
     fn msg_void_i64(obj: Id, sel: Sel, a: i64);
@@ -223,6 +229,8 @@ unsafe extern "C" {
 /// display-link tick reaches every window that wants it.
 #[derive(Clone)]
 pub enum AppEvent {
+    /// Deferred application-effective appearance observed by `AppKit`.
+    AppearanceChanged(Option<bunny_ui::theme::Appearance>),
     /// Captured native geometry addressed to its non-recycled scene lifetime.
     GeometryChanged(bunny_ui::window::GeometryObservation),
     /// A native dialog fact scoped to its current presentation and subscription.
@@ -678,6 +686,7 @@ pub fn dispatch(event: AppEvent) {
 /// A knock from another thread lands here, on the main thread, as one
 /// more beat for every window.
 extern "C" fn perform_wake(_info: *mut c_void) {
+    appearance::deliver();
     dispatch_all(AppEvent::Wake);
 }
 
@@ -685,6 +694,7 @@ extern "C" fn perform_wake(_info: *mut c_void) {
 /// on the main thread, while the window is being built.
 pub fn install_wake_source() {
     bunny_ui_apple::ffi::install_wake_source(perform_wake);
+    appearance::install();
 }
 
 /// The system says memory is short: every window hears it on the main

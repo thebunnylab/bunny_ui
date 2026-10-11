@@ -674,14 +674,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // raster on refusal — and the window has not shown yet, so the
     // first frame (whichever road) lands before anyone looks
     ffi::install_gpu(&window);
-    // the season's mirrors: reduce-motion always follows the system
-    // (accessibility is never the app's to refuse); the theme follows
-    // ONLY while the app has not chosen one — an installed theme means
-    // the scene owns its colors and the shell stays out
-    let mirror_theme = bunny_ui::theme::version() == 0;
-    if mirror_theme && ffi::os_uses_light_theme() == Some(false) {
-        bunny_ui::theme::install(bunny_ui::theme::Theme::dark());
-    }
+    // Native preference is independent of an application-owned palette.
+    bunny_ui::theme::observe_system_appearance(
+        ffi::os_uses_light_theme().map(|light| bunny_ui::theme::Appearance::from_dark(!light)),
+    );
     runtime.set_reduce_motion(!ffi::animations_enabled());
     // the system's display languages reach the scene before its first
     // frame; a locale the app pinned (`App::set_locale`) stands over them
@@ -1571,18 +1567,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // the display languages are a setting like the rest: read
                 // again, and a list that did not move rebuilds nothing
                 runtime.set_system_locale(ffi::preferred_locale());
-                if mirror_theme {
-                    let wants_dark = ffi::os_uses_light_theme() == Some(false);
-                    let is_dark =
-                        bunny_ui::theme::current().canvas == bunny_ui::theme::Theme::dark().canvas;
-                    if wants_dark != is_dark {
-                        bunny_ui::theme::install(if wants_dark {
-                            bunny_ui::theme::Theme::dark()
-                        } else {
-                            bunny_ui::theme::Theme::light()
-                        });
-                    }
-                }
+                bunny_ui::theme::observe_system_appearance(
+                    ffi::os_uses_light_theme().map(|light| bunny_ui::theme::Appearance::from_dark(!light)),
+                );
                 blit(runtime, root);
             }
             AppEvent::ResignKey => {
