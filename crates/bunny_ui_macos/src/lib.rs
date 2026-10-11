@@ -67,7 +67,7 @@ fn sync_frame_driver(runtime: &Runtime, pacer: &FramePacer, window: usize) {
         static PARKED: Cell<bool> = const { Cell::new(false) };
     }
     let parked = wanted == ffi::DriverPace::Off;
-    if PARKED.with(|last| last.replace(parked)) != parked && parked && metal::active() {
+    if PARKED.with(|last| last.replace(parked)) != parked && parked && metal::any_active() {
         metal::rest();
     }
     // the `D` line: the driver's pace, when it changes — a tape of a
@@ -854,7 +854,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     runtime.drive_tasks_by_wall();
     // a box's overlay — a caret — rides a layer of its own on the GPU
     // road: a blink repaints the layer, and the window behind it stands
-    runtime.set_overlay_layers(metal::active());
+    runtime.set_overlay_layers(metal::active(window.view()));
     // the cursor AppKit puts back between two of the shell's turns
     ffi::install_cursor_keeper();
     // two owners: the keyboard gate and the event handler
@@ -1349,7 +1349,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 }
             }
             traced.stage("O", format_args!("panels={}", overlays.len()));
-            if metal::active() {
+            if metal::active(window.view()) {
                 // GPU present: the same display list, no Surface in the
                 // path — the drawable is the frame. The LIVE boxes are
                 // carved out: their commands would churn the atlas on
@@ -1379,7 +1379,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 let mut carve = live.clone();
                 carve.extend(segment_ranges.iter().copied());
                 if carve.is_empty() {
-                    metal::present_window(
+                    metal::present_view(window.view(),
                         &display,
                         Size { width, height },
                         scale,
@@ -1389,7 +1389,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         live_resize,
                     );
                 } else {
-                    metal::present_window(
+                    metal::present_view(window.view(),
                         &display.without_slices(&carve),
                         Size { width, height },
                         scale,
@@ -1476,7 +1476,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
             traced.stage(
                 "M",
-                format_args!("sync={}", u8::from(metal::active() && live_resize)),
+                format_args!("sync={}", u8::from(metal::active(window.view()) && live_resize)),
             );
             // the segments themselves: rasterized only when their
             // commands changed (the ledger's answer, the beneaths'
@@ -1710,7 +1710,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // While the window changes size the thumbs come home, as the
             // live boxes do — a layer and the window frame land in
             // different beats, and a drag shows the difference
-            runtime.set_thumb_layers(metal::active() && !window.in_live_resize());
+            runtime.set_thumb_layers(metal::active(window.view()) && !window.in_live_resize());
             if accessibility.requested() { runtime.set_accessibility_enabled(true); }
             let display = runtime.display_frame(root, Size { width, height });
             if frame_stats {
@@ -1743,7 +1743,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 let (frames, last_ms) = kept_line.get();
                 let now = trace::clock_ms();
                 if frames % 256 == 0 || now - last_ms >= 10_000.0 {
-                    let atlas = metal::retained_counts()
+                    let atlas = metal::retained_counts(window.view())
                         .map(|(atlas, presenters)| format!(" · atlas {atlas} · presenters {presenters}"))
                         .unwrap_or_default();
                     trace::mark(
@@ -2158,7 +2158,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     // never redraws; a plain box that read it takes the
                     // frame's road
                     let (blits, plain) = runtime.repaint_dirty_paints(window.scale());
-                    if plain || !metal::active() || window.in_live_resize() {
+                    if plain || !metal::active(window.view()) || window.in_live_resize() {
                         soon(runtime, root, trace::Origin::Wake);
                     } else {
                         present_live_blits(&window, runtime, blits);
@@ -2362,7 +2362,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             let layered = blinked
                 && !explained
                 && !chorded
-                && metal::active()
+                && metal::active(window.view())
                 && !window.in_live_resize()
                 && !dialog_resizing();
             let overlay = if layered { runtime.blink_overlay(window.scale()) } else { None };
@@ -2416,7 +2416,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // nothing.
             // a present that waited for the display found the line of
             // frames in front of it full: this beat is held, and it drains
-            if metal::take_congested() && !unpaced {
+            if metal::take_congested(window.view()) && !unpaced {
                 handler_pacer.congested();
             }
             let beat = handler_pacer.beat(handler_resizing());
@@ -2425,7 +2425,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 blit(runtime, root, trace::Origin::Frame);
             } else if moved.scene {
                 let (width, height) = window.content_size();
-                runtime.set_thumb_layers(metal::active() && !window.in_live_resize());
+                runtime.set_thumb_layers(metal::active(window.view()) && !window.in_live_resize());
                 let display = runtime.animation_frame(root, Size { width, height });
                 handler_present(runtime, display, trace::Origin::Frame);
                 // a spring or a fling moved content under a still hand
@@ -2433,7 +2433,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             } else if moved.islands {
                 // mid-resize the boxes are in the drawable, not on
                 // layers — a step repaints the scene like any other
-                if metal::active() && !window.in_live_resize() {
+                if metal::active(window.view()) && !window.in_live_resize() {
                     let scale = window.scale();
                     // the flip is into the world the boxes were PLACED
                     // in, not the one the view measures — mid-resize

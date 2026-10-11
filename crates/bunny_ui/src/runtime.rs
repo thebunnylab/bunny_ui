@@ -357,14 +357,13 @@ pub struct Runtime {
     touch_fresh: Cell<bool>,
     /// The shell drives the task clock by the wall ([`Runtime::drive_tasks_by_wall`]):
     /// a sleeper's deadline is the shell's own alarm, never a reason to
-    /// run the display link.
-    task_driver: Cell<bool>,
+    /// run the display link. The executor owns the shared wall anchor;
+    /// opening another scene must never restart or multiply that clock.
+    task_driver: RefCell<Option<motor::task::WallClock>>,
     /// Can the shell show a box's overlay on a layer of its own?
     overlay_layers: Cell<bool>,
     /// Can the shell show a scrollbar's thumb on a layer of its own?
     thumb_layers: Cell<bool>,
-    /// When the task clock was last brought up to the wall.
-    task_clock_last: Cell<Option<std::time::Instant>>,
     /// The size last HANDED to each measurement probe. A probe fires on
     /// change and only on change: a view at rest costs nothing, and a
     /// handler that writes state cannot spin against its own report.
@@ -598,16 +597,18 @@ impl Runtime {
         Rc::clone(&self.images)
     }
 
-    /// Moves the keyboard to the field the app NAMED with `.id(…)`.
+    /// Moves the keyboard to the field or focusable control named with `.id(…)`.
     ///
     /// A field's identity path is structural — the scene's prefix, then every
     /// wrapper down to it — so an app that wants to put the caret somewhere
     /// (a form's Tab walk, a screen that opens with one box already live)
     /// would have to spell a path it does not own. It owns the NAME, and this
-    /// resolves it against the last layout's fields.
+    /// resolves it against the last layout's fields and custom controls.
+    /// An exact field name wins. Otherwise, the name must contain exactly one
+    /// visible custom control that accepts keys and does not leave them behind.
     ///
-    /// `false` when nothing laid out under that name — before the first
-    /// frame there are no fields to reach.
+    /// `false` when no eligible control, or several custom controls, match the
+    /// name. Before the first frame there are no controls to reach.
     pub fn focus_named(&self, id: &str) -> bool {
         let tail = format!("[{id}]");
         let path = self
@@ -616,6 +617,24 @@ impl Runtime {
             .iter()
             .find(|field| field.path.ends_with(&tail))
             .map(|field| field.path.clone());
+        let path = path.or_else(|| {
+            let customs = self.last_customs.borrow();
+            let dom_customs = self.dom_customs.borrow();
+            let mut matches = customs
+                .iter()
+                .chain(dom_customs.iter().map(|(_, placement)| placement))
+                .filter(|placement| {
+                    let element = placement.element.element();
+                    placement.path.split('/').any(|segment| segment == tail)
+                        && placement.visible.size.width > 0.0
+                        && placement.visible.size.height > 0.0
+                        && element.accepts_keys()
+                        && !element.leaves_keyboard()
+                });
+            let first = matches.next()?;
+            // A name around several custom controls is not a focus target.
+            matches.next().is_none().then(|| first.path.clone())
+        });
         match path {
             Some(path) => {
                 self.focus(&path);
@@ -1543,10 +1562,9 @@ impl Runtime {
             modifier_sink: RefCell::new(None),
             key_sink: RefCell::new(None),
             touch_fresh: Cell::new(false),
-            task_driver: Cell::new(false),
+            task_driver: RefCell::new(None),
             overlay_layers: Cell::new(false),
             thumb_layers: Cell::new(false),
-            task_clock_last: Cell::new(None),
             pending_aged: Cell::new(false),
             wheel_latch: RefCell::new(None),
             measures: RefCell::new(HashMap::default()),
@@ -2218,6 +2236,31 @@ impl Runtime {
             && (self.close_menu() || self.cancel_drag())
         {
             return crate::custom::Response::handled();
+        }
+        // A captured custom gesture can be cancelled before it takes focus:
+        // custom boxes normally borrow the keyboard on release. Give Escape
+        // to the hand's owner before the previously focused box or keymap.
+        if *pattern == KeyPattern::key(crate::action::Key::Escape) {
+            let grabbed = self.interaction.borrow().element_grab.clone();
+            if let Some(placement) = grabbed.as_deref().and_then(|path| self.custom_at(path)) {
+                let response = self.deliver(
+                    &placement,
+                    crate::custom::ElementEvent::Key(stroke),
+                );
+                if response.handled {
+                    {
+                        let mut interaction = self.interaction.borrow_mut();
+                        interaction.element_grab = None;
+                        interaction.pressed = None;
+                    }
+                    self.dirty_island_of(&placement.path);
+                    self.frame_asked.set(true);
+                    return response;
+                }
+                if self.focus.borrow().as_deref() == Some(placement.path.as_str()) {
+                    return response; // Do not deliver one ignored Escape twice.
+                }
+            }
         }
         // a field of MANY lines owns `⌘↵`: the bare break is its
         // newline, so its submit has to be the chord — and the app
@@ -4764,7 +4807,7 @@ impl Runtime {
         // the engine's clock moves with the frames: a sleeping task
         // wakes here, and its waker asks the shell for a settled turn
         // (this path only repaints, and a task needs the bodies)
-        if self.task_driver.get() {
+        if self.task_driver.borrow().is_some() {
             // the wall is the task clock: a beat brings it up to now
             self.advance_tasks_to_now();
         } else {
@@ -4840,7 +4883,7 @@ impl Runtime {
         // clock is the frame tick — the shell's driver stays awake; so
         // does a finger whose meaning the clock decides, and a fling
         self.animator.borrow().wants_frame()
-            || (!self.task_driver.get() && motor::task::has_timers())
+            || (self.task_driver.borrow().is_none() && motor::task::has_timers())
             || self.touch.borrow().alive()
     }
 
@@ -4871,7 +4914,7 @@ impl Runtime {
         }
         // a shell with an alarm of its own for the sleepers asks the
         // display for nothing on their account
-        if self.task_driver.get() {
+        if self.task_driver.borrow().is_some() {
             return pace;
         }
         let Some(left) = motor::task::next_timer_in() else {
@@ -4896,9 +4939,18 @@ impl Runtime {
     /// ([`Runtime::next_task_wake`]) — never a reason to run the display
     /// link, which used to beat at full rate for a poller thirty
     /// milliseconds away, and to wake every other sleeper with it.
+    /// All wall-driven scenes on the thread share one executor clock.
+    /// Registering another scene synchronizes it without resetting sleepers.
     pub fn drive_tasks_by_wall(&self) {
-        self.task_driver.set(true);
-        self.task_clock_last.set(Some(std::time::Instant::now()));
+        self.drive_tasks_at(std::time::Instant::now());
+    }
+
+    fn drive_tasks_at(&self, now: std::time::Instant) {
+        if self.task_driver.borrow().is_some() {
+            self.advance_tasks_at(now);
+        } else {
+            self.task_driver.replace(Some(motor::task::WallClock::new(now)));
+        }
     }
 
     /// Brings the task clock up to the wall: every sleeper whose deadline
@@ -4906,16 +4958,11 @@ impl Runtime {
     /// that does not drive the clock ([`Runtime::drive_tasks_by_wall`])
     /// gets `false` and nothing moves; its beats move the clock.
     pub fn advance_tasks_to_now(&self) -> bool {
-        if !self.task_driver.get() {
-            return false;
-        }
-        let now = std::time::Instant::now();
-        let last = self.task_clock_last.replace(Some(now));
-        let elapsed = last.map_or(0.0, |last| now.saturating_duration_since(last).as_secs_f64());
-        if elapsed <= 0.0 {
-            return false;
-        }
-        motor::task::advance(elapsed)
+        self.advance_tasks_at(std::time::Instant::now())
+    }
+
+    fn advance_tasks_at(&self, now: std::time::Instant) -> bool {
+        self.task_driver.borrow().as_ref().is_some_and(|clock| clock.advance_to(now))
     }
 
     /// Seconds until the nearest sleeper's deadline, by the task clock —
@@ -7772,3 +7819,7 @@ impl Runtime {
         if applied { self.frame_asked.set(true); Ok(()) } else { Err(ActionError::Unavailable) }
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_clock_tests.rs"]
+mod clock_tests;

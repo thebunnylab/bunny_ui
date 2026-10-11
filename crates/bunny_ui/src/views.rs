@@ -20,6 +20,9 @@
 //! callsite, like Swift's omitted argument. Signature convention: content
 //! first, behavior (closures) last.
 
+#[cfg(feature = "canvas")]
+pub use crate::slider::{Slider, SliderRange, SliderRangeError, slider};
+
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::rc::Rc;
