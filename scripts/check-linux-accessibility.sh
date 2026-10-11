@@ -53,6 +53,11 @@ for backend in x11 wayland; do
         cargo test -p bunny-ui-linux --locked --lib relationship_property_round_trip -- --ignored --nocapture; then
         failures=$((failures + 1))
       fi
+    else
+      if ! BUNNY_BACKEND=wayland BUNNY_PARANOID="$paranoid" timeout 45s \
+        cargo test -p bunny-ui-linux --locked --lib buffer_scale_reset_reaches_the_wayland_wire -- --ignored --nocapture; then
+        failures=$((failures + 1))
+      fi
     fi
     for modal_first in 0 1; do
       echo "AT-SPI backend=$backend paranoid=${paranoid:-off} modal-first=$modal_first"

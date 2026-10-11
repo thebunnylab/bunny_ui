@@ -34,6 +34,9 @@ mod window_ops;
 pub use window_ops::{focus_window, set_window_parent};
 #[path = "window_mapping.rs"]
 mod window_mapping;
+#[cfg(test)]
+#[path = "window_scale_tests.rs"]
+mod window_scale_tests;
 #[path = "geometry_ops.rs"]
 mod geometry_ops;
 pub use geometry_ops::{register_geometry, forget_geometry, window_geometry, restore_window_placement};
@@ -2458,7 +2461,7 @@ fn apply_surface_configure(
             resized = true;
         }
     }
-    win.observed_size = Some(win.logical);
+    win.observed_size = geometry_ops::configured_size(staged, win.observed_size);
     Some((win.surface as usize, resized, first, mapped, win.presents))
 }
 

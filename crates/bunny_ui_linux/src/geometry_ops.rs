@@ -187,6 +187,29 @@ pub(super) fn committed_size(width: usize, height: usize, scale: usize) -> Optio
     ))
 }
 
+/// A zero configure axis delegates sizing to the client; it does not confirm
+/// that the current layout request has reached the compositor. Preserve only
+/// a previously observed axis until an actual buffer commit supplies it.
+pub(super) fn configured_size(
+    staged: Option<(i32, i32)>,
+    observed: Option<(f64, f64)>,
+) -> Option<(f64, f64)> {
+    let Some((width, height)) = staged else {
+        return observed;
+    };
+    let width = if width > 0 {
+        Some(f64::from(width))
+    } else {
+        observed.map(|size| size.0)
+    }?;
+    let height = if height > 0 {
+        Some(f64::from(height))
+    } else {
+        observed.map(|size| size.1)
+    }?;
+    Some((width, height))
+}
+
 /// OpenGL calls this only after a successful buffer swap, with its actual buffer.
 pub(super) fn observe_buffer(window: usize, physical: (usize, usize), scale: usize) {
     let observed = committed_size(physical.0, physical.1, scale);
@@ -220,6 +243,22 @@ mod tests {
         assert_eq!(committed_size(721, 480, 1), Some((721.0, 480.0)));
         assert_eq!(committed_size(0, 480, 2), None);
         assert_eq!(committed_size(721, 480, 0), None);
+    }
+
+    #[test]
+    fn client_chosen_configure_axes_do_not_confirm_an_uncommitted_request() {
+        assert_eq!(configured_size(None, None), None);
+        assert_eq!(configured_size(Some((0, 0)), None), None);
+        assert_eq!(configured_size(Some((400, 0)), None), None);
+        assert_eq!(
+            configured_size(Some((400, 260)), None),
+            Some((400.0, 260.0))
+        );
+        let prior = Some((320.0, 200.0));
+        assert_eq!(configured_size(None, prior), prior);
+        assert_eq!(configured_size(Some((0, 0)), prior), prior);
+        assert_eq!(configured_size(Some((400, 0)), prior), Some((400.0, 200.0)));
+        assert_eq!(configured_size(Some((0, 260)), prior), Some((320.0, 260.0)));
     }
 
     #[test]
