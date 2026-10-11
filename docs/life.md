@@ -315,11 +315,12 @@ fallback for `None`. Repeated identical native reports are inert. Ownership is
 process/UI-thread policy, independent of the version counter and which window
 opened first.
 
-macOS captures application-effective appearance at window creation and on
-[`viewDidChangeEffectiveAppearance`](https://developer.apple.com/documentation/appkit/nsview/viewdidchangeeffectiveappearance()).
+macOS captures application-effective appearance at window creation and observes
+[`NSApplication.effectiveAppearance` with KVO](https://developer.apple.com/documentation/uikit/supporting-dark-mode-in-your-interface).
 It uses AppKit's best-match operation for light/dark, including high-contrast
 variants, and defers scene delivery onto the existing main-loop wake. A
-window-specific native override is not a new system preference. Windows reports
+window-specific native override is not a new system preference and cannot
+prevent the application observer from delivering changes. Windows reports
 its initial registry preference and refreshes it on
 [`WM_SETTINGCHANGE`](https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-settingchange).
 iOS trait and Android configuration events use the same ownership policy.

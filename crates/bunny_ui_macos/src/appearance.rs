@@ -1,13 +1,14 @@
 //! Observe application appearance without changing the user's system preferences.
 //!
-//! Native view callbacks enqueue a broadcast for the existing main-loop wake.
+//! Application KVO callbacks enqueue a broadcast for the existing main-loop wake.
 //! They never enter application scenes synchronously inside an `AppKit` mutation.
 use super::{
-    AppEvent, Id, ObjcSuper, Sel, class, class_addMethod, msg_id, msg_id_arg, msg_super_void,
-    msg_void_id, ns_string, sel, text_argument_to_string, wake_from_any_thread,
+    AppEvent, Id, Sel, class, class_addMethod, msg_id, msg_id_arg, msg_observe, msg_void_id,
+    ns_string, objc_allocateClassPair, objc_registerClassPair, sel, text_argument_to_string,
+    wake_from_any_thread,
 };
 use bunny_ui::theme::Appearance;
-use std::{cell::RefCell, collections::VecDeque, ffi::c_void};
+use std::{cell::RefCell, collections::VecDeque, ffi::c_void, sync::Once};
 
 thread_local! {
     static PENDING: RefCell<VecDeque<Option<Appearance>>> = const { RefCell::new(VecDeque::new()) };
@@ -49,27 +50,43 @@ pub fn os_appearance() -> Option<Appearance> {
     }
 }
 
-pub(super) unsafe fn register(view: Id) {
-    // The registered selector takes no arguments and returns void on both ABIs.
-    unsafe {
+/// One observer retained for the process-lifetime native application. Window
+/// overrides and teardown cannot stop application-level appearance delivery.
+pub(super) fn install() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| unsafe {
+        let observer_class =
+            objc_allocateClassPair(class("NSObject"), c"BunnyAppearanceObserver".as_ptr(), 0);
         class_addMethod(
-            view,
-            sel("viewDidChangeEffectiveAppearance"),
+            observer_class,
+            sel("observeValueForKeyPath:ofObject:change:context:"),
             changed as *const c_void,
-            c"v@:".as_ptr(),
+            c"v@:@@@^v".as_ptr(),
         );
-    }
+        objc_registerClassPair(observer_class);
+        // Own this one native observer as long as NSApplication itself. Neither
+        // Rust TLS teardown nor a window closing can release it under KVO.
+        let observer = msg_id(msg_id(observer_class, sel("alloc")), sel("init"));
+        let app = msg_id(class("NSApplication"), sel("sharedApplication"));
+        msg_observe(
+            app,
+            sel("addObserver:forKeyPath:options:context:"),
+            observer,
+            ns_string("effectiveAppearance"),
+            0,
+            std::ptr::null_mut(),
+        );
+    });
 }
 
-extern "C" fn changed(this: Id, selector: Sel) {
-    // Preserve NSView's appearance bookkeeping before capturing the app snapshot.
-    unsafe {
-        let parent = ObjcSuper {
-            receiver: this,
-            class: class("NSView"),
-        };
-        msg_super_void(&raw const parent, selector);
-    }
+extern "C" fn changed(
+    _this: Id,
+    _selector: Sel,
+    _key: Id,
+    _object: Id,
+    _change: Id,
+    _context: *mut c_void,
+) {
     let appearance = os_appearance();
     // Unlike synthetic input, this observation survives lend_hand (e.g. a new
     // native window). Deferral also avoids re-entering a mutably borrowed scene.

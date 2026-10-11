@@ -10,7 +10,7 @@ mod native {
     use bunny_ui::theme::{self, Appearance, Theme};
     use bunny_ui_macos::{App, WindowSpec};
     use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSAppearance, NSApplication};
+    use objc2_app_kit::{NSAppearance, NSAppearanceCustomization, NSApplication};
     use objc2_foundation::NSString;
     use std::{cell::Cell, rc::Rc, time::Duration};
 
@@ -19,6 +19,7 @@ mod native {
     impl Component for Reader {
         fn body(self) -> impl View {
             let appearance = theme::system_appearance();
+            eprintln!("Scene appearance: {appearance:?}");
             self.0.set(appearance);
             text(format!("Observed {appearance:?}")).foreground_color(theme::fg())
         }
@@ -26,15 +27,33 @@ mod native {
     fn change(app: &NSApplication, name: &str) {
         let appearance = NSAppearance::appearanceNamed(&NSString::from_str(name)).unwrap();
         app.setAppearance(Some(&appearance));
+        eprintln!(
+            "Requested {name}; native application now {}",
+            app.effectiveAppearance().name()
+        );
     }
-    async fn until(mut ready: impl FnMut() -> bool) {
+    async fn until(stage: &str, native: &NSApplication, mut ready: impl FnMut() -> bool) {
         for _ in 0..500 {
             if ready() {
                 return;
             }
             task::sleep(Duration::from_millis(10)).await;
         }
-        assert!(ready(), "appearance did not reach the native scenes");
+        for window in native.windows().iter() {
+            eprintln!(
+                "At {stage}: window={} visible={} view-appearance={:?}",
+                window.title(),
+                window.isVisible(),
+                window
+                    .contentView()
+                    .map(|view| view.effectiveAppearance().name())
+            );
+        }
+        assert!(
+            ready(),
+            "{stage}: appearance did not reach the native scenes; core={:?}",
+            theme::system_appearance()
+        );
     }
     pub fn run() {
         let app = App::new();
@@ -63,7 +82,7 @@ mod native {
         let driver = app.clone();
         task::spawn(async move {
             change(&native, "NSAppearanceNameAqua");
-            until(|| {
+            until("light transition", &native, || {
                 first_seen.get() == Some(Appearance::Light)
                     && second_seen.get() == Some(Appearance::Light)
             })
@@ -75,8 +94,15 @@ mod native {
                 ..Theme::light()
             };
             theme::install(custom);
+            // App appearance remains observable even when native windows pin their
+            // own appearance and therefore receive no effective-view transition.
+            let light =
+                NSAppearance::appearanceNamed(&NSString::from_str("NSAppearanceNameAqua")).unwrap();
+            for window in native.windows().iter() {
+                window.setAppearance(Some(&light));
+            }
             change(&native, "NSAppearanceNameAccessibilityHighContrastDarkAqua");
-            until(|| {
+            until("high-contrast dark transition", &native, || {
                 first_seen.get() == Some(Appearance::Dark)
                     && second_seen.get() == Some(Appearance::Dark)
             })
@@ -95,19 +121,16 @@ mod native {
             driver.close(first);
             assert_eq!(driver.windows(), vec![second, third]);
             change(&native, "NSAppearanceNameAqua");
-            until(|| {
+            until("surviving windows transition", &native, || {
                 second_seen.get() == Some(Appearance::Light)
                     && third_seen.get() == Some(Appearance::Light)
             })
             .await;
             assert_eq!(theme::current(), Theme::light());
             let before = theme::version();
-            // Real AppKit duplicate notifications exercise the registered callback.
-            for window in native.windows().iter() {
-                if let Some(view) = window.contentView() {
-                    view.viewDidChangeEffectiveAppearance();
-                }
-            }
+            // Duplicate application assignments leave the observation unchanged.
+            change(&native, "NSAppearanceNameAqua");
+            change(&native, "NSAppearanceNameAqua");
             task::sleep(Duration::from_millis(50)).await;
             assert_eq!(theme::version(), before);
             native.setAppearance(previous.as_deref());
@@ -141,13 +164,13 @@ fn main() {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "native appearance regression: {status}");
             let output = String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();
+            print!("{output}");
+            assert!(status.success(), "native appearance regression: {status}");
             assert!(
                 output.contains(COMPLETE),
                 "appearance fixture exited before completing its assertions"
             );
-            print!("{output}");
             break;
         }
         if Instant::now() >= deadline {

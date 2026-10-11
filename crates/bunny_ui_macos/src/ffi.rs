@@ -153,8 +153,8 @@ unsafe extern "C" {
     fn msg_void_id_i64_id(obj: Id, sel: Sel, a: Id, b: i64, c: Id);
     #[link_name = "objc_msgSendSuper"]
     fn msg_super_bool_id(sup: *const ObjcSuper, sel: Sel, a: Id) -> ObjcBool;
-    #[link_name = "objc_msgSendSuper"]
-    fn msg_super_void(sup: *const ObjcSuper, sel: Sel);
+    #[link_name = "objc_msgSend"]
+    fn msg_observe(obj: Id, sel: Sel, observer: Id, key: Id, options: usize, context: *mut c_void);
     #[link_name = "objc_msgSend"]
     fn msg_void_rect_bool(obj: Id, sel: Sel, rect: CGRect, flag: ObjcBool);
     #[link_name = "objc_msgSend"]
@@ -694,6 +694,7 @@ extern "C" fn perform_wake(_info: *mut c_void) {
 /// on the main thread, while the window is being built.
 pub fn install_wake_source() {
     bunny_ui_apple::ffi::install_wake_source(perform_wake);
+    appearance::install();
 }
 
 /// The system says memory is short: every window hears it on the main
@@ -2113,7 +2114,6 @@ unsafe fn register_classes() {
             0,
         );
         accessibility::register_view(view);
-        appearance::register(view);
         class_addMethod(
             view,
             sel("mouseDown:"),
