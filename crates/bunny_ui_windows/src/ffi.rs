@@ -18,8 +18,13 @@ use std::sync::{Condvar, Mutex, OnceLock};
 mod accessibility;
 pub(crate) use accessibility::{Accessibility, Request as AccessibilityRequest};
 
+#[path = "confirmation.rs"]
+mod confirmation;
 #[path = "window_ops.rs"]
 mod window_ops;
+pub use confirmation::{
+    available as confirmation_available, defer as defer_confirmations, queue as queue_confirmation,
+};
 pub use window_ops::{focus_window, set_window_parent};
 #[path = "geometry_ops.rs"]
 mod geometry_ops;
@@ -1641,6 +1646,7 @@ pub fn dispatch(event: AppEvent) {
         }
     });
     geometry_ops::drain();
+    confirmation::drain();
 }
 
 // MARK: - DPI metrics (one funnel)

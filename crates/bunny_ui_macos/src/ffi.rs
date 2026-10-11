@@ -33,16 +33,19 @@ pub(crate) use bunny_ui_apple::ffi::{
     CFRelease, CGColorSpaceCreateDeviceRGB, CGColorSpaceRelease, CGContextDrawImage,
     CGContextSetInterpolationQuality, CGImageRelease, CGPoint, CGRect, CGSize, Id, NS_NOT_FOUND,
     NSRange, NSRunLoopCommonModes, ObjcSuper, Sel, class, class_addMethod, class_addProtocol,
-    kill_layer_actions, modifiers_of, objc_allocateClassPair, objc_autoreleasePoolPop,
-    objc_autoreleasePoolPush, objc_getProtocol, objc_registerClassPair, ns_string, owned_provider,
-    sel, sel_getName, text_argument_to_string, wake_from_any_thread,
+    kill_layer_actions, modifiers_of, ns_string, objc_allocateClassPair, objc_autoreleasePoolPop,
+    objc_autoreleasePoolPush, objc_getProtocol, objc_registerClassPair, owned_provider, sel,
+    sel_getName, text_argument_to_string, wake_from_any_thread,
 };
 
 use crate::objc_bool::{self, ObjcBool};
 
 #[path = "appearance.rs"]
 mod appearance;
+#[path = "confirmation.rs"]
+mod confirmation;
 pub use appearance::os_appearance;
+pub use confirmation::{available as confirmation_available, queue as queue_confirmation};
 
 #[path = "accessibility.rs"]
 mod accessibility;
@@ -617,6 +620,7 @@ fn dispatch_from(source: usize, event: AppEvent) {
         let Some((source, event)) = next else { break };
         dispatch_from(source, event);
     }
+    confirmation::drain();
 }
 
 /// Native placement can synchronously notify while `AppKit` still uses its frame.
@@ -688,6 +692,7 @@ pub fn dispatch(event: AppEvent) {
 extern "C" fn perform_wake(_info: *mut c_void) {
     appearance::deliver();
     dispatch_all(AppEvent::Wake);
+    confirmation::drain();
 }
 
 /// Opens the run-loop door a background thread knocks on. Called once,

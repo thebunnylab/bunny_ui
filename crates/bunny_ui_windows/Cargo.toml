@@ -42,3 +42,7 @@ harness = false
 [[test]]
 name = "dialog_geometry"
 harness = false
+
+[[test]]
+name = "confirmation_native"
+harness = false

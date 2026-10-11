@@ -207,6 +207,7 @@ pub use bunny_ui::window::{
 /// these and routes every event to the one it belongs to.
 struct Slot {
     lifecycle: Rc<Lifecycle>,
+    confirmation: bunny_ui::window::ConfirmationSlot,
     /// The `HWND` as an address — what an event's source is compared
     /// against.
     window: usize,
@@ -231,6 +232,7 @@ impl Slot {
     /// child creation can synchronously report activation during that frame;
     /// replay those events after its scene borrow ends instead of reentering it.
     fn dispatch(&self, event: AppEvent) {
+        let _confirmation = ffi::defer_confirmations();
         self.pending.borrow_mut().push_back(event);
         let Ok(mut handler) = self.handler.try_borrow_mut() else {
             return;
@@ -348,6 +350,7 @@ impl App {
     pub fn close(&self, id: WindowId) {
         self.close_children(id);
         if let Some(slot) = self.slot(id) {
+            slot.confirmation.owner_closed();
             slot.runtime.retire_dialog_geometry();
             slot.lifecycle.geometry_events().retire();
             ffi::forget_geometry(slot.window, id);
@@ -548,8 +551,14 @@ impl AppInner {
                 return;
             }
             if let AppEvent::GeometryChanged(observation) = event {
-                if let Some(slot) = app.live().into_iter().find(|slot| slot.lifecycle.id() == observation.id()) {
-                    slot.lifecycle.geometry_events().observe_captured(&observation);
+                if let Some(slot) = app
+                    .live()
+                    .into_iter()
+                    .find(|slot| slot.lifecycle.id() == observation.id())
+                {
+                    slot.lifecycle
+                        .geometry_events()
+                        .observe_captured(&observation);
                 }
                 return;
             }
@@ -558,6 +567,9 @@ impl AppInner {
             for slot in app.live() {
                 // source 0 is a beat every window shares
                 if source == 0 || slot.window == source {
+                    if gone {
+                        slot.confirmation.owner_closed();
+                    }
                     slot.dispatch(event.clone());
                 }
             }
@@ -657,6 +669,10 @@ pub fn run_window_chrome(
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     runtime.set_dialog_geometry_dispatch(ffi::queue_dialog_geometry);
     let lifecycle = Rc::new(Lifecycle::default());
+    let confirmation = bunny_ui::window::ConfirmationSlot::new(
+        lifecycle.id(),
+        bunny_ui::window::ConfirmationKind::Win32MessageBox,
+    );
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
     runtime.drop_unseen();
@@ -1746,6 +1762,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
 
     Rc::new(Slot {
         lifecycle,
+        confirmation,
         window: window.raw_window(),
         handle: window,
         runtime,

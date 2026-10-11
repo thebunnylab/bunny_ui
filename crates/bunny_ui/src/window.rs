@@ -8,15 +8,24 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod confirmation;
+mod confirmation_alert;
 mod dialog_geometry;
 mod geometry;
 mod relationships;
+pub use confirmation::{
+    Confirmation, ConfirmationError, ConfirmationKind, ConfirmationResponse, ConfirmationSpec,
+};
+#[doc(hidden)]
+pub use confirmation::{ConfirmationRequest, ConfirmationSlot};
+#[doc(hidden)]
+pub use confirmation_alert::FrameworkConfirmation;
 pub use dialog_geometry::DialogGeometry;
 #[doc(hidden)]
 pub use dialog_geometry::{DialogGeometryObservation, DialogGeometrySession};
+pub use geometry::{DesktopPosition, DesktopSpace, WindowGeometry, WindowPlacement, WindowSize};
 #[doc(hidden)]
 pub use geometry::{GeometryEvents, GeometryObservation};
-pub use geometry::{DesktopPosition, DesktopSpace, WindowGeometry, WindowPlacement, WindowSize};
 #[doc(hidden)]
 pub use relationships::{RelationshipChange, Relationships};
 

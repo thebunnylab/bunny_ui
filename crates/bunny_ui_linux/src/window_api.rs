@@ -89,6 +89,8 @@ impl App {
             .is_some_and(|parent| parent.lifecycle.is_hidden());
         slot.lifecycle.set_owner_hidden(owner_hidden);
         let visibility = if slot.lifecycle.is_hidden() {
+            slot.confirmation.cancel(WindowError::HiddenWindow.into());
+            crate::confirmation::dismiss(&slot.confirmation, &slot.confirmation_dialogs);
             WindowVisibility::Hidden
         } else {
             WindowVisibility::Shown

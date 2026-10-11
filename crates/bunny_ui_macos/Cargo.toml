@@ -69,3 +69,7 @@ harness = false
 [[test]]
 name = "system_appearance"
 harness = false
+
+[[test]]
+name = "confirmation_native"
+harness = false

@@ -466,6 +466,7 @@ type FileDragFn = Box<dyn Fn(f64, f64, Vec<std::path::PathBuf>, ffi::FileDrag) -
 /// these and routes every event to the one it belongs to.
 struct Slot {
     lifecycle: Rc<Lifecycle>,
+    confirmation: bunny_ui::window::ConfirmationSlot,
     /// The `NSWindow` as an address — what an event's source is
     /// compared against.
     window: usize,
@@ -634,6 +635,7 @@ impl App {
         // notification does NOT re-enter the scene: this is usually
         // called from inside the handler of the very window that asked
         if let Some(slot) = self.slot(id) {
+            slot.confirmation.owner_closed();
             slot.runtime.retire_dialog_geometry();
             slot.lifecycle.geometry_events().retire();
             ffi::forget_geometry(slot.window, id);
@@ -845,6 +847,9 @@ impl AppInner {
             for slot in app.live() {
                 // source 0 is a beat every window shares
                 if source == 0 || slot.window == source {
+                    if gone {
+                        slot.confirmation.owner_closed();
+                    }
                     let mut handler = slot.handler.borrow_mut();
                     handler(event.clone());
                 }
@@ -990,19 +995,34 @@ fn why(need: bunny_ui::runtime::FrameNeed) -> String {
         (need.insets, "insets"),
         (need.webview, "webview"),
     ];
-    let named: Vec<&str> = reasons.iter().filter(|(on, _)| *on).map(|(_, name)| *name).collect();
-    if named.is_empty() { "-".to_string() } else { named.join("+") }
+    let named: Vec<&str> = reasons
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, name)| *name)
+        .collect();
+    if named.is_empty() {
+        "-".to_string()
+    } else {
+        named.join("+")
+    }
 }
 
 /// A layout size in AppKit's own struct — the one crossing `create_window`
 /// takes. Both types are foreign here, so it is a function, not a `From`.
 const fn cg_size(size: Size) -> ffi::CGSize {
-    ffi::CGSize { width: size.width, height: size.height }
+    ffi::CGSize {
+        width: size.width,
+        height: size.height,
+    }
 }
 
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     runtime.set_dialog_geometry_dispatch(ffi::queue_dialog_geometry);
     let lifecycle = Rc::new(Lifecycle::default());
+    let confirmation = bunny_ui::window::ConfirmationSlot::new(
+        lifecycle.id(),
+        bunny_ui::window::ConfirmationKind::AppKitSheet,
+    );
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
     runtime.drop_unseen();
@@ -2754,6 +2774,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
 
     Rc::new(Slot {
         lifecycle,
+        confirmation,
         window: window.raw_window(),
         runtime,
         handler: RefCell::new(handler),

@@ -1,8 +1,32 @@
 //! Safe scene operations over the native window adapter.
 
 use crate::{App, WindowError, WindowId, WindowParent, WindowVisibility, ffi};
+use bunny_ui::window::{Confirmation, ConfirmationError, ConfirmationSpec};
 
 impl App {
+    /// Presents an owner-attached Yes/No sheet without blocking the UI executor.
+    /// No is the default and Escape answer. Dropping the returned future closes
+    /// its sheet; hiding or closing the owner resolves with a typed error.
+    ///
+    /// # Errors
+    /// Rejects a stale, foreign or hidden owner and an existing confirmation or
+    /// modal presentation. Later native failures resolve through the future.
+    pub fn confirm(
+        &self,
+        id: WindowId,
+        spec: ConfirmationSpec,
+    ) -> Result<Confirmation, ConfirmationError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        if slot.lifecycle.is_hidden() {
+            return Err(WindowError::HiddenWindow.into());
+        }
+        ffi::confirmation_available(slot.window)?;
+        let (confirmation, request) = slot.confirmation.start(spec)?;
+        let words = bunny_ui::words::Words::for_locale(&slot.runtime.locale());
+        ffi::queue_confirmation(slot.window, request, &words);
+        Ok(confirmation)
+    }
+
     /// Requests activation of a live singleton under window-system policy.
     /// This is a request, not proof of foreground focus. Explicitly hidden
     /// owners must be shown first. macOS and Windows respect native modal scope;
@@ -89,6 +113,7 @@ impl App {
             .is_some_and(|parent| parent.lifecycle.is_hidden());
         slot.lifecycle.set_owner_hidden(owner_hidden);
         let visibility = if slot.lifecycle.is_hidden() {
+            slot.confirmation.cancel(WindowError::HiddenWindow.into());
             WindowVisibility::Hidden
         } else {
             WindowVisibility::Shown

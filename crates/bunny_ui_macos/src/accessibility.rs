@@ -42,6 +42,8 @@ unsafe extern "C" {
     fn predicate(object: Id, selector: Sel, value: Id) -> ObjcBool;
     #[link_name = "objc_msgSend"]
     fn boolean(object: Id, selector: Sel) -> ObjcBool;
+    #[link_name = "objc_msgSend"]
+    fn number_bool(object: Id, selector: Sel, value: ObjcBool) -> Id;
     #[link_name = "objc_msgSendSuper"]
     fn super_object(object: *const Super, selector: Sel) -> Id;
     #[link_name = "objc_msgSend"]
@@ -397,8 +399,11 @@ fn changes(previous: Option<&Node>, current: &Node) -> impl Iterator<Item = Noti
             .is_some_and(|old| old.label != current.label)
             .then_some(Notification::Title),
         previous
-            .is_some_and(|old| value_of(old) != value_of(current))
+            .is_some_and(|old| value_of(old) != value_of(current) || old.checked != current.checked)
             .then_some(Notification::Value),
+        previous
+            .is_some_and(|old| old.enabled != current.enabled)
+            .then_some(Notification::Layout),
         (current.focused && previous.is_none_or(|old| !old.focused)).then_some(Notification::Focus),
     ]
     .into_iter()
@@ -543,6 +548,9 @@ extern "C" fn view_hit(this: Id, _: Sel, point: CGPoint) -> Id {
 extern "C" fn element_alive(this: Id, _: Sel) -> ObjcBool {
     ObjcBool::new(element(this).is_some())
 }
+extern "C" fn element_enabled(this: Id, _: Sel) -> ObjcBool {
+    ObjcBool::new(element(this).is_some_and(|element| element.node.borrow().enabled))
+}
 extern "C" fn element_role(this: Id, _: Sel) -> Id {
     let Some(element) = element(this) else {
         return empty();
@@ -551,6 +559,7 @@ extern "C" fn element_role(this: Id, _: Sel) -> Id {
         ns_string(match element.node.borrow().role {
             Role::Text => "AXStaticText",
             Role::Button => "AXButton",
+            Role::Checkbox => "AXCheckBox",
             Role::TextField | Role::PasswordField => "AXTextField",
         })
     }
@@ -581,6 +590,11 @@ extern "C" fn element_value(this: Id, _: Sel) -> Id {
         return empty();
     };
     let node = element.node.borrow();
+    if let Some(checked) = node.checked {
+        return unsafe {
+            number_bool(class("NSNumber"), sel("numberWithBool:"), ObjcBool::new(checked))
+        };
+    }
     value_of(&node).map_or(empty(), |value| unsafe { ns_string(value) })
 }
 extern "C" fn element_identifier(this: Id, _: Sel) -> Id {
@@ -627,12 +641,15 @@ extern "C" fn element_allowed(this: Id, _: Sel, selector: Sel) -> ObjcBool {
     };
     let node = element.node.borrow();
     if selector == unsafe { sel("accessibilityPerformPress") } {
-        return ObjcBool::new(node.role == Role::Button);
+        return ObjcBool::new(node.supports(&Action::Activate));
     }
-    if selector == unsafe { sel("setAccessibilityValue:") }
-        || selector == unsafe { sel("setAccessibilityFocused:") }
-    {
-        return ObjcBool::new(matches!(node.role, Role::TextField | Role::PasswordField));
+    if selector == unsafe { sel("setAccessibilityValue:") } {
+        return ObjcBool::new(
+            node.enabled && matches!(node.role, Role::TextField | Role::PasswordField),
+        );
+    }
+    if selector == unsafe { sel("setAccessibilityFocused:") } {
+        return ObjcBool::new(node.supports(&Action::Focus));
     }
     let name = unsafe { CStr::from_ptr(sel_getName(selector)) }.to_bytes();
     ObjcBool::new(!name.starts_with(b"setAccessibility") && !name.starts_with(b"accessibilityPerform"))
@@ -688,7 +705,7 @@ pub(super) unsafe fn register_view(view: Id) {
             ),
             (
                 "isAccessibilityEnabled",
-                element_alive as *const c_void,
+                element_enabled as *const c_void,
                 objc_bool::GETTER,
             ),
             ("accessibilityRole", element_role as *const c_void, c"@@:"),
