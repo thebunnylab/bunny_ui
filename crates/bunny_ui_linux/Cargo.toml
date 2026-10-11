@@ -105,3 +105,7 @@ harness = false
 [[test]]
 name = "dialog_geometry"
 harness = false
+
+[[test]]
+name = "system_appearance"
+harness = false
