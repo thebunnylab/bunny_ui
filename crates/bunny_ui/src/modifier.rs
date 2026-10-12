@@ -241,6 +241,107 @@ pub enum Modifier {
 }
 
 impl Modifier {
+    /// The method that made this modifier, as the app wrote it — the word
+    /// a site carries (`crate::provenance`). A tuple variant's arguments
+    /// are not the name; `FrameWH` is `.frame(…)` and `PaddingLength` is
+    /// `.padding(…)` to the reader.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Modifier::Font { .. } => "font",
+            Modifier::Bold => "bold",
+            Modifier::Italic => "italic",
+            Modifier::Padding => "padding",
+            Modifier::PaddingLength { .. } => "padding",
+            Modifier::PaddingEdge { .. } => "padding_edge",
+            Modifier::FrameWH { .. } => "frame",
+            Modifier::FrameWidth { .. } => "frame_width",
+            Modifier::FrameHeight { .. } => "frame_height",
+            Modifier::Tracking { .. } => "tracking",
+            Modifier::FrameMax { .. } => "frame_max",
+            Modifier::FrameFlex { .. } => "frame_flex",
+            Modifier::HugHeight => "hug_height",
+            Modifier::NavigationTitle { .. } => "navigation_title",
+            Modifier::NavigationBarTitle { .. } => "navigation_bar_title",
+            Modifier::ListStyle { .. } => "list_style",
+            Modifier::ProgressViewStyle { .. } => "progress_view_style",
+            Modifier::NavigationViewStyle => "navigation_view_style",
+            Modifier::MultilineTextAlignment { .. } => "multiline_text_alignment",
+            Modifier::Blur { .. } => "blur",
+            Modifier::IgnoresSafeArea => "ignores_safe_area",
+            Modifier::Hidden => "hidden",
+            Modifier::AccessibilityLabel { .. } => "accessibility_label",
+            Modifier::AccessibilityHidden => "accessibility_hidden",
+            Modifier::Equatable => "equatable",
+            Modifier::BackgroundColor { .. } => "background_color",
+            Modifier::BackgroundGradient { .. } => "background_gradient",
+            Modifier::ForegroundColor { .. } => "foreground_color",
+            Modifier::Border { .. } => "border",
+            Modifier::CornerRadius { .. } => "corner_radius",
+            Modifier::Clipped => "clipped",
+            Modifier::Tooltip { .. } => "tooltip",
+            Modifier::ContextMenu { .. } => "context_menu",
+            Modifier::OnContextClick { .. } => "on_context_click",
+            Modifier::OnDrag { .. } => "on_drag",
+            Modifier::OnDrop { .. } => "on_drop",
+            Modifier::Monospaced => "monospaced",
+            Modifier::FontFamily { .. } => "font_family",
+            Modifier::FontSize { .. } => "font_size",
+            Modifier::LineHeight { .. } => "line_height",
+            Modifier::FontWeight { .. } => "font_weight",
+            Modifier::BackgroundHovered { .. } => "background_hovered",
+            Modifier::Opacity { .. } => "opacity",
+            Modifier::OpacityHovered { .. } => "opacity_hovered",
+            Modifier::OpacityPressed { .. } => "opacity_pressed",
+            Modifier::HoverGroup => "hover_group",
+            Modifier::GroupHovered => "group_hovered",
+            Modifier::BackgroundPressed { .. } => "background_pressed",
+            Modifier::ForegroundHovered { .. } => "foreground_hovered",
+            Modifier::ForegroundPressed { .. } => "foreground_pressed",
+            Modifier::Highlight { .. } => "highlight",
+            Modifier::TruncationMode { .. } => "truncation_mode",
+            Modifier::ScrollTarget { .. } => "scroll_target",
+            Modifier::OnMeasure { .. } => "on_measure",
+            Modifier::AutoFocus => "auto_focus",
+            Modifier::AutoFocusBeat { .. } => "auto_focus_beat",
+            Modifier::SelectOnBeat { .. } => "select_on_beat",
+            Modifier::Shadow { .. } => "shadow",
+            Modifier::Glass { .. } => "glass",
+            Modifier::Resizable => "resizable",
+            Modifier::AspectRatio { .. } => "aspect_ratio",
+            Modifier::Animated { .. } => "animated",
+            Modifier::Looping { .. } => "looping",
+            Modifier::Rendering { .. } => "rendering",
+            Modifier::KeyContext { .. } => "key_context",
+            Modifier::LeavesKeyboard => "leaves_keyboard",
+            Modifier::KeyContextFocused { .. } => "key_context_focused",
+            Modifier::WindowDragRegion => "window_drag_region",
+            Modifier::WindowControl { .. } => "window_control",
+            Modifier::ElementHint { .. } => "element",
+            Modifier::LayoutMode { .. } => "layout_mode",
+            Modifier::OnClick { .. } => "on_click",
+            Modifier::OnHover { .. } => "on_hover",
+            Modifier::OnCopy { .. } => "on_copy",
+            Modifier::OnAction { .. } => "on_action",
+            Modifier::OnAppear { .. } => "on_appear",
+            Modifier::OnTapGesture { .. } => "on_tap_gesture",
+            Modifier::Id { .. } => "id",
+            Modifier::Effect { .. } => "effect",
+            Modifier::Sheet { .. } => "sheet",
+            Modifier::Dialog { .. } => "dialog",
+            Modifier::Alert { .. } => "alert",
+            Modifier::Popover { .. } => "popover",
+            Modifier::EnvSet { .. } => "inject",
+            Modifier::Custom { .. } => "modifier",
+            Modifier::Searchable => "searchable",
+            Modifier::Refreshable => "refreshable",
+            Modifier::Toolbar => "toolbar",
+            Modifier::AttachEnvironmentOverrides => "attach_environment_overrides",
+            Modifier::AttachEnvironmentOverridesOnChange => "attach_environment_overrides_on_change",
+            Modifier::NavigationDestination => "navigation_destination",
+            Modifier::FlipsForRightToLeftLayoutDirection { .. } => "flips_for_right_to_left_layout_direction",
+        }
+    }
+
     /// The `[.name(detail)]` appended to the rendered node's line.
     fn suffix(&self) -> String {
         match self {
@@ -811,6 +912,17 @@ fn hints_over(hints: &mut crate::layout::ElementHints, outer: [&Option<Rc<str>>;
 pub struct Modified<C> {
     pub(crate) base: C,
     pub(crate) modifier: Modifier,
+    /// Where the modifier was called (`crate::provenance`).
+    pub(crate) site: crate::provenance::Site,
+}
+
+impl<C> Modified<C> {
+    /// A modifier over its base, sited at the caller — every `ViewExt`
+    /// method is `#[track_caller]`, so the site is the app's own line.
+    #[track_caller]
+    pub(crate) fn new(base: C, modifier: Modifier) -> Self {
+        Self { base, modifier, site: crate::provenance::here() }
+    }
 }
 
 /// What `.on_drop(…)` answers: the view, taking a typed drag — and one
@@ -948,10 +1060,12 @@ impl<C: View<Arity = Single>> View for Modified<C> {
         // `.modifier(…)` re-renders through the custom modifier's own
         // body(content:), and marks the node — the recomputable blur path.
         if let Modifier::Custom(custom) = &self.modifier {
+            let mark = out.layout_mark();
             let applied = custom.apply(ctx, crate::erased::erased(self.base.clone()));
             let mut nodes = NodeList::new();
             applied.render_into(ctx, &mut nodes);
             seal_custom(&**custom, nodes, out);
+            crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Modifier, Some(self.modifier.name()));
             return;
         }
 
@@ -959,12 +1073,14 @@ impl<C: View<Arity = Single>> View for Modified<C> {
         // must carry the name while the subtree declares its state,
         // its animations and its hit paths.
         if let Modifier::Id(name) = &self.modifier {
+            let mark = out.layout_mark();
             let mut nodes = NodeList::new();
             {
                 let _frame = motor::identity::enter(named_segment(name));
                 self.base.render_into(ctx, &mut nodes);
             }
             seal_id(name, nodes, out);
+            crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Modifier, Some("id"));
             return;
         }
 
@@ -992,6 +1108,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
         // generic-free, so it lives in ONE function instead of
         // one copy per chain in the program
         apply(&self.modifier, ctx, base_ctx, out, mark);
+        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Modifier, Some(self.modifier.name()));
     }
 }
 

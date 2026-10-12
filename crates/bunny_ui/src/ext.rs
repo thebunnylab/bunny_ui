@@ -36,11 +36,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     // MARK: - Formatting
 
     /// `.font(.title)`
+    #[track_caller]
     fn font(self, font: Font) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Font(font),
-        }
+        Modified::new(self, Modifier::Font(font))
     }
 
     /// `.font(.system(size: 9))` — a measure the preset scale does not
@@ -48,11 +46,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// the weight and the design in scope. A `.font(.title)` CLOSER to
     /// the view brings its own size and wins: the nearest patch always
     /// does.
+    #[track_caller]
     fn font_size(self, size: f64) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::FontSize(size),
-        }
+        Modified::new(self, Modifier::FontSize(size))
     }
 
     /// `.tracking(-1.2)` — the space after every character, in points:
@@ -74,11 +70,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// it for now — they measure and draw the same run they always did,
     /// which is a run without the spacing, never a run that measures one
     /// way and paints another.
+    #[track_caller]
     fn tracking(self, points: f64) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Tracking(Tracking::Points(points)),
-        }
+        Modified::new(self, Modifier::Tracking(Tracking::Points(points)))
     }
 
     /// `.tracking_em(0.22)` — the same measure said in EM of the size
@@ -87,11 +81,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// The em resolves against the font the run actually gets, so a
     /// wordmark keeps its letterspacing when the size changes and the
     /// call site never multiplies anything.
+    #[track_caller]
     fn tracking_em(self, em: f64) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Tracking(Tracking::Em(em)),
-        }
+        Modified::new(self, Modifier::Tracking(Tracking::Em(em)))
     }
 
     /// `.font_weight(Weight::ExtraBold)` — a weight by name. Only the
@@ -99,14 +91,16 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// Overrides the accessible name of the single control or text below.
     /// Reactive labels update independently of the component body. On a
     /// container with several controls, label each control separately.
+    #[track_caller]
     fn accessibility_label(self, label: impl crate::text_value::IntoText) -> Modified<Self> {
-        Modified { base: self, modifier: Modifier::AccessibilityLabel(label.into_text().0) }
+        Modified::new(self, Modifier::AccessibilityLabel(label.into_text().source))
     }
 
     /// Excludes the subtree from assistive technology (for decorative content).
     /// It does not change visibility or pointer/keyboard behavior.
+    #[track_caller]
     fn accessibility_hidden(self) -> Modified<Self> {
-        Modified { base: self, modifier: Modifier::AccessibilityHidden }
+        Modified::new(self, Modifier::AccessibilityHidden)
     }
 
     /// `.bold()` is the same door with `Weight::Bold` spelled for you.
@@ -115,11 +109,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// carries one emphasized face for the whole top half of the scale,
     /// so on the desktop Semibold and heavier read as one bold until the
     /// descriptor road lands.
+    #[track_caller]
     fn font_weight(self, weight: crate::text_engine::Weight) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::FontWeight(weight),
-        }
+        Modified::new(self, Modifier::FontWeight(weight))
     }
 
     /// `.line_height(24.0)` — the box each line steps by, in points, the
@@ -128,11 +120,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// value and centring the glyphs in the taller box (the CSS
     /// half-leading). Inherited, so a column sets the rhythm once. A
     /// field's caret, selection and scroll step use the same line box.
+    #[track_caller]
     fn line_height(self, height: f64) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::LineHeight(height),
-        }
+        Modified::new(self, Modifier::LineHeight(height))
     }
 
     /// `.id("source-control")` — the view takes a NAME in the identity.
@@ -150,24 +140,20 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     ///
     /// The name must not contain `/`, `[` or `]` — the punctuation the
     /// path itself is built from.
+    #[track_caller]
     fn id(self, name: impl Into<std::rc::Rc<str>>) -> Modified<Self> {
         let name = name.into();
         debug_assert!(
             !name.contains(['/', '[', ']']),
             "an id names a view; it must not spell the path's own punctuation: {name:?}"
         );
-        Modified {
-            base: self,
-            modifier: Modifier::Id(name),
-        }
+        Modified::new(self, Modifier::Id(name))
     }
 
     /// `.bold()`
+    #[track_caller]
     fn bold(self) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Bold,
-        }
+        Modified::new(self, Modifier::Bold)
     }
 
     /// `.italic()` — the text leans. Only the SLANT travels, like
@@ -177,55 +163,43 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// The lean is CONTENT where an editor uses it: a preview tab says
     /// "you are only looking" by leaning its label, and a reader who
     /// cannot see it cannot tell the tab from a permanent one.
+    #[track_caller]
     fn italic(self) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Italic,
-        }
+        Modified::new(self, Modifier::Italic)
     }
 
     /// `.padding()`
+    #[track_caller]
     fn padding(self) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Padding,
-        }
+        Modified::new(self, Modifier::Padding)
     }
 
     /// `.padding(12)` — uniform with an explicit measure.
+    #[track_caller]
     fn padding_length(self, length: f64) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::PaddingLength(length),
-        }
+        Modified::new(self, Modifier::PaddingLength(length))
     }
 
     /// `.padding(.bottom, 40)`
+    #[track_caller]
     fn padding_edge(self, edge: Edge, length: f64) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::PaddingEdge(edge, length),
-        }
+        Modified::new(self, Modifier::PaddingEdge(edge, length))
     }
 
     /// `.frame(width: 120, height: 80)` — the box is exact and the
     /// content CENTRES in it, as SwiftUI's does.
+    #[track_caller]
     fn frame(self, width: f64, height: f64) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::FrameWH(width, height, Alignment::Center),
-        }
+        Modified::new(self, Modifier::FrameWH(width, height, Alignment::Center))
     }
 
     /// `.frame(width: 120)` — exact on one axis, natural on the other.
     /// The panel column and the fixed-height row live here; `frame_max`
     /// is a CEILING, not a size, and quietly hands back what the content
     /// does not use.
+    #[track_caller]
     fn frame_width(self, width: f64) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::FrameWidth(width, Alignment::Center),
-        }
+        Modified::new(self, Modifier::FrameWidth(width, Alignment::Center))
     }
 
     /// `.frame(width: 132, height: 30, alignment: .leading)` — the exact
@@ -242,36 +216,28 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// AMONG THEMSELVES and never moves the block inside its frame — a
     /// one-line cell comes out identical with it and without it. What
     /// places the block is this, the `alignment:` of the frame itself.
+    #[track_caller]
     fn frame_aligned(self, width: f64, height: f64, alignment: Alignment) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::FrameWH(width, height, alignment),
-        }
+        Modified::new(self, Modifier::FrameWH(width, height, alignment))
     }
 
     /// `.frame(width: 132, alignment: .leading)` — the single-axis twin of
     /// [`ViewExt::frame_aligned`], for the lane whose height is the row's.
+    #[track_caller]
     fn frame_width_aligned(self, width: f64, alignment: Alignment) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::FrameWidth(width, alignment),
-        }
+        Modified::new(self, Modifier::FrameWidth(width, alignment))
     }
 
     /// `.frame(height: 80)` — the vertical sibling of [`ViewExt::frame_width`].
+    #[track_caller]
     fn frame_height(self, height: f64) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::FrameHeight(height),
-        }
+        Modified::new(self, Modifier::FrameHeight(height))
     }
 
     /// `.frame(maxWidth: .infinity, maxHeight: 60, alignment: .leading)`
+    #[track_caller]
     fn frame_max(self, max_width: f64, max_height: f64, alignment: Alignment) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::FrameMax(max_width, max_height, alignment),
-        }
+        Modified::new(self, Modifier::FrameMax(max_width, max_height, alignment))
     }
 
     /// A flexible box with a floor: it fills what it is proposed, never
@@ -283,11 +249,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// that answered its longest text would be a different width on every
     /// row. Floored, every row's lane is the same width; proposed a pane
     /// wider than the floors, the lanes share it.
+    #[track_caller]
     fn frame_flex(self, min_width: f64, min_height: f64, alignment: Alignment) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::FrameFlex(min_width, min_height, alignment),
-        }
+        Modified::new(self, Modifier::FrameFlex(min_width, min_height, alignment))
     }
 
     /// The box takes what its CONTENT needs vertically, never more
@@ -296,83 +260,63 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// FRAME but places the child at its own size, so a child taller
     /// than the ceiling quietly overflows it; a hug cannot, because
     /// the content's answer IS the frame.
+    #[track_caller]
     fn hug_height(self) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::HugHeight,
-        }
+        Modified::new(self, Modifier::HugHeight)
     }
 
     /// `.navigationTitle("…")`
+    #[track_caller]
     fn navigation_title(self, title: impl Into<String>) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::NavigationTitle(title.into()),
-        }
+        Modified::new(self, Modifier::NavigationTitle(title.into()))
     }
 
     /// `.navigationBarTitle("…")`
+    #[track_caller]
     fn nav_bar_title(self, title: impl Into<String>) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::NavigationBarTitle(title.into()),
-        }
+        Modified::new(self, Modifier::NavigationBarTitle(title.into()))
     }
 
     /// `.listStyle(.grouped)`
+    #[track_caller]
     fn list_style(self, style: ListStyle) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::ListStyle(style),
-        }
+        Modified::new(self, Modifier::ListStyle(style))
     }
 
     /// `.progressViewStyle(.circular)`
+    #[track_caller]
     fn progress_style(self, style: ProgressViewStyle) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::ProgressViewStyle(style),
-        }
+        Modified::new(self, Modifier::ProgressViewStyle(style))
     }
 
     /// `.multilineTextAlignment(.center)`
+    #[track_caller]
     fn multiline_text_alignment(self, alignment: TextAlignment) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::MultilineTextAlignment(alignment),
-        }
+        Modified::new(self, Modifier::MultilineTextAlignment(alignment))
     }
 
     /// `.aspectRatio(contentMode: .fit)`
+    #[track_caller]
     fn aspect_ratio(self, mode: ContentMode) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::AspectRatio(mode),
-        }
+        Modified::new(self, Modifier::AspectRatio(mode))
     }
 
     /// `.resizable()`
+    #[track_caller]
     fn resizable(self) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Resizable,
-        }
+        Modified::new(self, Modifier::Resizable)
     }
 
     /// `.blur(radius: 10)`
+    #[track_caller]
     fn blur(self, radius: f64) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Blur(radius),
-        }
+        Modified::new(self, Modifier::Blur(radius))
     }
 
     /// `.ignoresSafeArea()`
+    #[track_caller]
     fn ignores_safe_area(self) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::IgnoresSafeArea,
-        }
+        Modified::new(self, Modifier::IgnoresSafeArea)
     }
 
     /// `.background(UnitPoint::CENTER, view)` — the twin of
@@ -382,6 +326,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// For a flat color or a ramp reach for `.background_color(…)` and
     /// `.background_gradient(…)` — those are properties of the box and
     /// cost no node at all. This one is for a VIEW.
+    #[track_caller]
     fn background<C: View<Arity = Single>>(
         self,
         at: crate::layout::UnitPoint,
@@ -419,6 +364,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// rule lets the press through to what is underneath.
     ///
     /// [`UnitPoint`]: crate::layout::UnitPoint
+    #[track_caller]
     fn overlay<C: View<Arity = Single>>(
         self,
         at: crate::layout::UnitPoint,
@@ -428,22 +374,18 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     }
 
     /// `.hidden()`
+    #[track_caller]
     fn hidden(self) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Hidden,
-        }
+        Modified::new(self, Modifier::Hidden)
     }
 
     // MARK: - Visuals (semantic node properties — `Styled` in the scene)
 
     /// `.background(Color.red)` — a solid color as a node property (the
     /// content `.background { view }` is the other method).
+    #[track_caller]
     fn background_color(self, color: Color) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::BackgroundColor(color),
-        }
+        Modified::new(self, Modifier::BackgroundColor(color))
     }
 
     /// `.background(RadialGradient(…))` — a two-stop ramp behind the
@@ -459,11 +401,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// // a bar with a sheen
     /// .background_gradient(Gradient::linear(TOP_INK, BOTTOM_INK))
     /// ```
+    #[track_caller]
     fn background_gradient(self, gradient: crate::layout::Gradient) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::BackgroundGradient(gradient),
-        }
+        Modified::new(self, Modifier::BackgroundGradient(gradient))
     }
 
     /// `.rendering(Rendering::Gpu)` — on the web's element lowering
@@ -476,28 +416,22 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// `<tr>`, a `<td>`, a `<button>`. Semantic HTML when the page
     /// wants it; every other lowering ignores the hint, the way a
     /// pixel target ignores `.rendering()`.
+    #[track_caller]
     fn element(self, tag: impl AsRef<str>) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::ElementHint(Some(crate::modifier::hint(tag.as_ref())), None, None, None),
-        }
+        Modified::new(self, Modifier::ElementHint(Some(crate::modifier::hint(tag.as_ref())), None, None, None))
     }
 
     /// The Dom element's `class` attribute — for a stylesheet the
     /// page brings, or a harness that looks elements up by it.
+    #[track_caller]
     fn css_class(self, class: impl AsRef<str>) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::ElementHint(None, Some(crate::modifier::hint(class.as_ref())), None, None),
-        }
+        Modified::new(self, Modifier::ElementHint(None, Some(crate::modifier::hint(class.as_ref())), None, None))
     }
 
     /// The Dom element's `id` attribute.
+    #[track_caller]
     fn element_id(self, id: impl AsRef<str>) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::ElementHint(None, None, Some(crate::modifier::hint(id.as_ref())), None),
-        }
+        Modified::new(self, Modifier::ElementHint(None, None, Some(crate::modifier::hint(id.as_ref())), None))
     }
 
     /// A link: the Dom lowering builds an `<a href>` for this view, so
@@ -506,16 +440,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// element whose [`ViewExt::element_id`] is `name`. The pixel
     /// targets have no address bar and ignore it, as they ignore
     /// `.element(…)`.
+    #[track_caller]
     fn link(self, url: impl AsRef<str>) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::ElementHint(
-                Some(crate::modifier::hint("a")),
-                None,
-                None,
-                Some(std::rc::Rc::from(url.as_ref())),
-            ),
-        }
+        Modified::new(self, Modifier::ElementHint( Some(crate::modifier::hint("a")), None, None, Some(std::rc::Rc::from(url.as_ref())), ))
     }
 
     /// The element lowering keeps the ENGINE's layout for this
@@ -523,19 +450,15 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// pixel parity with the canvas where the design demands it.
     /// The flow around it never notices.
     #[cfg(feature = "canvas")]
+    #[track_caller]
     fn layout(self, mode: crate::layout::LayoutMode) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::LayoutMode(mode),
-        }
+        Modified::new(self, Modifier::LayoutMode(mode))
     }
 
     #[cfg(feature = "canvas")]
+    #[track_caller]
     fn rendering(self, mode: crate::layout::Rendering) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Rendering(mode),
-        }
+        Modified::new(self, Modifier::Rendering(mode))
     }
 
     /// `.looping(9.6)` — the custom boxes below paint by a repeating
@@ -550,38 +473,30 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// rate — the eye sees the travel per step, not the rate. Reduced
     /// motion shows the resting frame and never starts the clock; a
     /// window out front freezes it.
+    #[track_caller]
     fn looping(self, spec: impl Into<crate::anim::Loop>) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Looping(spec.into()),
-        }
+        Modified::new(self, Modifier::Looping(spec.into()))
     }
 
     /// `.animated(Spring::smooth())` — colors under this view move
     /// through the spring when they change (state, hover) instead of
     /// jumping. Put it AFTER the props it animates; the nearest styled
     /// below consumes the scope.
+    #[track_caller]
     fn animated(self, spring: crate::anim::Spring) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Animated(spring),
-        }
+        Modified::new(self, Modifier::Animated(spring))
     }
 
     /// `.foregroundColor(.secondary)` — inherited by the text below.
+    #[track_caller]
     fn foreground_color(self, color: Color) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::ForegroundColor(color),
-        }
+        Modified::new(self, Modifier::ForegroundColor(color))
     }
 
     /// `.border(Color.gray, width: 1)` — a frame inward from the edge.
+    #[track_caller]
     fn border(self, color: Color, width: f64) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Border(color, width),
-        }
+        Modified::new(self, Modifier::Border(color, width))
     }
 
     /// `.cornerRadius(8)` — rounds THIS node's background.
@@ -589,11 +504,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// One number rounds all four corners. A [`crate::layout::Corners`]
     /// rounds only the ones it names, for a box that continues into its
     /// neighbour: `.corner_radius(Corners::top(6.0))`.
+    #[track_caller]
     fn corner_radius(self, radius: impl Into<crate::layout::Corners>) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::CornerRadius(radius.into()),
-        }
+        Modified::new(self, Modifier::CornerRadius(radius.into()))
     }
 
     /// `.tooltip(…)` — hovering this view long enough shows a small
@@ -604,6 +517,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// ```ignore
     /// icon(symbol::SIDEBAR).tooltip("Toggle sidebar — \u{2318}B")
     /// ```
+    #[track_caller]
     fn tooltip(self, text: impl Into<std::sync::Arc<str>>) -> Modified<Self> {
         self.tooltip_side(text, crate::layout::Side::Bottom)
     }
@@ -611,12 +525,13 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// [`Self::tooltip`] with the side the bubble prefers — a vertical
     /// rail reads best with `Side::Trailing`. No room flips it, like
     /// every anchored overlay.
+    #[track_caller]
     fn tooltip_side(
         self,
         text: impl Into<std::sync::Arc<str>>,
         side: crate::layout::Side,
     ) -> Modified<Self> {
-        Modified { base: self, modifier: Modifier::Tooltip(text.into(), side) }
+        Modified::new(self, Modifier::Tooltip(text.into(), side))
     }
 
     /// `.context_menu(…)` — a right press (a two-finger tap, a long
@@ -633,8 +548,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     ///     menu_item("Delete", move || delete(id)),
     /// ])
     /// ```
+    #[track_caller]
     fn context_menu(self, items: Vec<crate::views::MenuItem>) -> Modified<Self> {
-        Modified { base: self, modifier: Modifier::ContextMenu(items.into()) }
+        Modified::new(self, Modifier::ContextMenu(items.into()))
     }
 
     /// `.on_context_click(…)` — the right press inside this view reaches the
@@ -655,11 +571,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// ```ignore
     /// row.on_context_click(move |at| shell.open_menu(entries(), 220.0, at))
     /// ```
+    #[track_caller]
     fn on_context_click(self, action: impl Fn(crate::layout::Point) + 'static) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::OnContextClick(crate::layout::ContextClick(Rc::new(action))),
-        }
+        Modified::new(self, Modifier::OnContextClick(crate::layout::ContextClick(Rc::new(action))))
     }
 
     /// `.on_drag(…)` — pressing this view and moving past the
@@ -670,14 +584,12 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// ```ignore
     /// tab.on_drag(move || drag(TabDrag { pane, index }, title.clone()))
     /// ```
+    #[track_caller]
     fn on_drag(
         self,
         payload: impl Fn() -> crate::views::DragPayload + 'static,
     ) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::OnDrag(crate::layout::DragBuilder(std::rc::Rc::new(payload))),
-        }
+        Modified::new(self, Modifier::OnDrag(crate::layout::DragBuilder(std::rc::Rc::new(payload))))
     }
 
     /// `.on_drop(…)` — while a drag of the closure's type is over this
@@ -695,6 +607,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// ```ignore
     /// pane.on_drop(move |tab: &TabDrag| adopt(tab))
     /// ```
+    #[track_caller]
     fn on_drop<T: 'static>(self, action: impl Fn(&T) + 'static) -> DropTargetView<Self> {
         self.on_drop_at(move |value: &T, _| action(value))
     }
@@ -711,6 +624,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     ///     shell.drop_on_pane(tab, pane, pane_drop_zone(x, y))
     /// })
     /// ```
+    #[track_caller]
     fn on_drop_at<T: 'static>(
         self,
         action: impl Fn(&T, crate::layout::DropPoint) + 'static,
@@ -733,16 +647,15 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// children in: panels with backgrounds of their own stop leaking
     /// over the curve. Put it anywhere in the chain — it fuses into
     /// the same node the radius rides, so the order never matters.
+    #[track_caller]
     fn clipped(self) -> Modified<Self> {
-        Modified { base: self, modifier: Modifier::Clipped }
+        Modified::new(self, Modifier::Clipped)
     }
 
     /// `.monospaced()` — swaps the inherited font's design (grids).
+    #[track_caller]
     fn monospaced(self) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Monospaced,
-        }
+        Modified::new(self, Modifier::Monospaced)
     }
 
     /// `.font_family("Menlo")` — the face by name, for a scene that
@@ -753,49 +666,39 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// A name the engine cannot shape falls back to the system's own
     /// face, the way it does everywhere. `Runtime::font_families()`
     /// says which names an engine can answer.
+    #[track_caller]
     fn font_family(self, name: &str) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::FontFamily(crate::text_engine::Family::named(name)),
-        }
+        Modified::new(self, Modifier::FontFamily(crate::text_engine::Family::named(name)))
     }
 
     /// Alternate background under the nearest interactive target's hover
     /// (list rows, chips) — pure paint, layout untouched (the LAW).
+    #[track_caller]
     fn background_hovered(self, color: Color) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::BackgroundHovered(color),
-        }
+        Modified::new(self, Modifier::BackgroundHovered(color))
     }
 
     /// Alternate background under pressed — the pair of
     /// [`ViewExt::background_hovered`].
+    #[track_caller]
     fn background_pressed(self, color: Color) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::BackgroundPressed(color),
-        }
+        Modified::new(self, Modifier::BackgroundPressed(color))
     }
 
     /// Alternate INK under the nearest interactive target's hover: a
     /// faint glyph that brightens when the pointer arrives. It reaches
     /// every text below, the way `.foreground_color` does, and it is
     /// paint only — the measure never hears about it (the LAW).
+    #[track_caller]
     fn foreground_hovered(self, color: Color) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::ForegroundHovered(color),
-        }
+        Modified::new(self, Modifier::ForegroundHovered(color))
     }
 
     /// Alternate ink under pressed — the pair of
     /// [`ViewExt::foreground_hovered`].
+    #[track_caller]
     fn foreground_pressed(self, color: Color) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::ForegroundPressed(color),
-        }
+        Modified::new(self, Modifier::ForegroundPressed(color))
     }
 
     /// `.opacity(…)` — everything the subtree paints fades by this
@@ -805,20 +708,23 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// Two stacked children with opposite fades are how a mark
     /// REPLACES another without the scene changing what it contains —
     /// the modified dot that becomes a close mark under the pointer.
+    #[track_caller]
     fn opacity(self, value: f64) -> Modified<Self> {
-        Modified { base: self, modifier: Modifier::Opacity(value) }
+        Modified::new(self, Modifier::Opacity(value))
     }
 
     /// The fade under the nearest interactive target's hover — or
     /// under the GROUP's, with [`ViewExt::group_hovered`].
+    #[track_caller]
     fn opacity_hovered(self, value: f64) -> Modified<Self> {
-        Modified { base: self, modifier: Modifier::OpacityHovered(value) }
+        Modified::new(self, Modifier::OpacityHovered(value))
     }
 
     /// The fade under pressed — the pair of
     /// [`ViewExt::opacity_hovered`].
+    #[track_caller]
     fn opacity_pressed(self, value: f64) -> Modified<Self> {
-        Modified { base: self, modifier: Modifier::OpacityPressed(value) }
+        Modified::new(self, Modifier::OpacityPressed(value))
     }
 
     /// `.hover_group()` — this view PUBLISHES its pointer state to
@@ -829,21 +735,24 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// it sits, so the order of the modifiers stays irrelevant. A view
     /// with no target of its own becomes one — a card that is only
     /// hovered still lights what is inside it.
+    #[track_caller]
     fn hover_group(self) -> Modified<Self> {
-        Modified { base: self, modifier: Modifier::HoverGroup }
+        Modified::new(self, Modifier::HoverGroup)
     }
 
     /// `.group_hovered()` — this view's hover and pressed paint follows
     /// the nearest [`ViewExt::hover_group`] above it instead of the
     /// target it belongs to. It retargets every state this view
     /// declares at once: background, ink and fade.
+    #[track_caller]
     fn group_hovered(self) -> Modified<Self> {
-        Modified { base: self, modifier: Modifier::GroupHovered }
+        Modified::new(self, Modifier::GroupHovered)
     }
 
     /// `.onClick { … }` — the view becomes a pointer target WITHOUT the
     /// `Button` chrome: same action retention, same up-inside. It is the
     /// clickable list row.
+    #[track_caller]
     fn on_click(self, action: impl Fn() + 'static) -> Modified<Self> {
         self.on_click_count(move |_| action())
     }
@@ -867,11 +776,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// one — a view nothing can hit is a view nothing can hover. It
     /// fires ONCE per change: `true` when the pointer arrives, `false`
     /// when it leaves, and never twice for the same answer.
+    #[track_caller]
     fn on_hover(self, action: impl Fn(bool) + 'static) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::OnHover(std::rc::Rc::new(move |inside| action(inside != 0))),
-        }
+        Modified::new(self, Modifier::OnHover(std::rc::Rc::new(move |inside| action(inside != 0))))
     }
 
     /// `.on_copy { … }` — a read-only view that answers the platform's
@@ -892,8 +799,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     ///
     /// The view becomes a pointer target, as `.on_click` makes one. A Cut
     /// is refused: the view is read-only.
+    #[track_caller]
     fn on_copy(self, answer: impl Fn() -> Option<String> + 'static) -> Modified<Self> {
-        Modified { base: self, modifier: Modifier::OnCopy(std::rc::Rc::new(answer)) }
+        Modified::new(self, Modifier::OnCopy(std::rc::Rc::new(answer)))
     }
 
     /// The same target, told HOW MANY clicks the press carried: 1, then
@@ -914,11 +822,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     ///
     /// This and `.on_click` are the SAME registration: the last one in
     /// a chain is the one that fires.
+    #[track_caller]
     fn on_click_count(self, action: impl Fn(u8) + 'static) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::OnClick(Rc::new(action)),
-        }
+        Modified::new(self, Modifier::OnClick(Rc::new(action)))
     }
 
     /// Only the SECOND click of a double — the explorer row that opens
@@ -929,6 +835,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// It sits on [`ViewExt::on_click_count`], the way `.on_drop` sits
     /// on `.on_drop_at` — the same one registration, so a view takes
     /// this OR a click door, never both.
+    #[track_caller]
     fn on_double_click(self, action: impl Fn() + 'static) -> Modified<Self> {
         self.on_click_count(move |clicks| {
             if clicks == 2 {
@@ -942,11 +849,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// the innermost wins. Retained like the click actions: a skipped
     /// view responds. The key arrives through the `Runtime`'s keymap
     /// (`bind` + the shell's gate).
+    #[track_caller]
     fn on_action(self, id: ActionId, handler: impl Fn() + 'static) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::OnAction(id, Rc::new(handler)),
-        }
+        Modified::new(self, Modifier::OnAction(id, Rc::new(handler)))
     }
 
     /// `.on_measure(|size| …)` — the size this view RESOLVED to, handed
@@ -981,49 +886,39 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     ///
     /// Not in flow mode: there the BROWSER lays out, so this side has
     /// no resolved size to hand over and the probe stays quiet.
+    #[track_caller]
     fn on_measure(self, report: impl Fn(crate::layout::Size) + 'static) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::OnMeasure(Rc::new(report)),
-        }
+        Modified::new(self, Modifier::OnMeasure(Rc::new(report)))
     }
 
     /// Paints stretches of the TEXT in another color (byte ranges into
     /// the content) — a finder's match highlight. Only affects `text(…)`.
+    #[track_caller]
     fn highlight(self, ranges: Vec<(usize, usize)>, color: Color) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Highlight(Rc::new(ranges), color),
-        }
+        Modified::new(self, Modifier::Highlight(Rc::new(ranges), color))
     }
 
     /// `.truncationMode(.middle)` — turns wrapping off: the text becomes
     /// ONE line with an ellipsis at the chosen spot when it does not fit.
+    #[track_caller]
     fn truncation_mode(self, mode: crate::layout::Truncation) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::TruncationMode(mode),
-        }
+        Modified::new(self, Modifier::TruncationMode(mode))
     }
 
     /// The scroll region follows this item id: when the id CHANGES, the
     /// region scrolls just enough to reveal the row (keyboard selection
     /// stays visible); the wheel stays sovereign in between.
+    #[track_caller]
     fn scroll_target(self, id: impl Into<String>) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::ScrollTarget(id.into()),
-        }
+        Modified::new(self, Modifier::ScrollTarget(id.into()))
     }
 
     /// The field receives focus on its FIRST appearance — and never
     /// again (a user blur is final; remount under the same identity
     /// does not re-focus).
+    #[track_caller]
     fn auto_focus(self) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::AutoFocus,
-        }
+        Modified::new(self, Modifier::AutoFocus)
     }
 
     /// The field takes the keyboard on each NEW `beat` — from whoever
@@ -1046,11 +941,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// went — the keys go back to whoever held them before the beat, if
     /// that input is still on screen. A field the keyboard already left
     /// gives nothing back: the reader's own move stands.
+    #[track_caller]
     fn auto_focus_beat(self, beat: u64) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::AutoFocusBeat(beat),
-        }
+        Modified::new(self, Modifier::AutoFocusBeat(beat))
     }
 
     /// [`ViewExt::auto_focus_beat`], and each new beat also selects the
@@ -1061,29 +954,23 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// find does, whether the keys were in the editor or already in the
     /// query. A plain beat leaves the caret where the reader left it,
     /// which is right for a field the app merely hands the keys to.
+    #[track_caller]
     fn select_on_beat(self, beat: u64) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::SelectOnBeat(beat),
-        }
+        Modified::new(self, Modifier::SelectOnBeat(beat))
     }
 
     /// A soft shadow behind the view — panel-grade halo with the house
     /// ink (quadratic falloff, paints outside the frame only).
+    #[track_caller]
     fn shadow(self, radius: f64) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Shadow(radius, crate::layout::Color::rgba(0, 0, 0, 80)),
-        }
+        Modified::new(self, Modifier::Shadow(radius, crate::layout::Color::rgba(0, 0, 0, 80)))
     }
 
     /// [`ViewExt::shadow`] with an explicit color (tinted halos, deeper
     /// panels).
+    #[track_caller]
     fn shadow_color(self, radius: f64, color: crate::layout::Color) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Shadow(radius, color),
-        }
+        Modified::new(self, Modifier::Shadow(radius, color))
     }
 
 
@@ -1104,11 +991,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// The view's own halo goes INTO the pane, because a halo paints
     /// first and it overlaps. To keep a halo out, hang it on a wrapper
     /// view.
+    #[track_caller]
     fn glass(self, glass: crate::layout::Glass) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Glass(Box::new(glass)),
-        }
+        Modified::new(self, Modifier::Glass(Box::new(glass)))
     }
 
     /// [`ViewExt::glass`] with the tuned material — the short way to
@@ -1117,17 +1002,20 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// ```ignore
     /// panel.corner_radius(28.0).liquid_glass().backdrop_blur(16.0)
     /// ```
+    #[track_caller]
     fn liquid_glass(self) -> Modified<Self> {
         self.glass(crate::layout::Glass::regular())
     }
 
     /// The blur radius of this view's backdrop. It turns the material
     /// on if it is not on already, like every `backdrop_*` method.
+    #[track_caller]
     fn backdrop_blur(self, sigma: f64) -> Modified<Self> {
         self.glass(crate::layout::Glass::regular().blur(sigma))
     }
 
     /// The tint composited over the blurred backdrop.
+    #[track_caller]
     fn backdrop_tint(self, color: crate::layout::Color) -> Modified<Self> {
         self.glass(crate::layout::Glass::regular().tint(color))
     }
@@ -1135,17 +1023,20 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// How far inward the rim bends the backdrop, and by how much. An
     /// `amount` of zero makes a flat pane — blur and tint only, which
     /// is what a nested panel and text-heavy glass want.
+    #[track_caller]
     fn backdrop_refraction(self, band: f64, amount: f64) -> Modified<Self> {
         self.glass(crate::layout::Glass::regular().refraction(band, amount))
     }
 
     /// The per-channel spread of the rim displacement. `0.0`, the tuned
     /// value, has no fringe.
+    #[track_caller]
     fn backdrop_chromatic_aberration(self, amount: f64) -> Modified<Self> {
         self.glass(crate::layout::Glass::regular().chromatic(amount))
     }
 
     /// The specular rim: its colour, its band and its strength.
+    #[track_caller]
     fn backdrop_highlight(
         self,
         color: crate::layout::Color,
@@ -1157,24 +1048,28 @@ pub trait ViewExt: View<Arity = Single> + Sized {
 
     /// The saturation of this view's backdrop. `1.0` leaves it as it
     /// is; above that keeps colour alive through a heavy blur.
+    #[track_caller]
     fn backdrop_saturation(self, saturation: f64) -> Modified<Self> {
         self.glass(crate::layout::Glass::regular().saturation(saturation))
     }
 
     /// The brightness of this view's backdrop. `1.0` leaves it as it
     /// is.
+    #[track_caller]
     fn backdrop_brightness(self, brightness: f64) -> Modified<Self> {
         self.glass(crate::layout::Glass::regular().brightness(brightness))
     }
 
     /// A flat additive white over the whole pane — the uniform half of
     /// a touch sheen. `0.0`, the default, adds nothing.
+    #[track_caller]
     fn backdrop_sheen(self, sheen: f64) -> Modified<Self> {
         self.glass(crate::layout::Glass::regular().sheen(sheen))
     }
 
     /// A pool of light in the pane: where it sits, its radius as a
     /// fraction of the pane's smaller side, and its peak white.
+    #[track_caller]
     fn backdrop_spot(
         self,
         center: crate::layout::UnitPoint,
@@ -1194,18 +1089,17 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// editor, and a menu that took the keyboard to click on would copy
     /// from nobody. A box of the app's own says the same with
     /// `CustomElement::leaves_keyboard`; this is the view's door.
+    #[track_caller]
     fn leaves_keyboard(self) -> Modified<Self> {
-        Modified { base: self, modifier: Modifier::LeavesKeyboard }
+        Modified::new(self, Modifier::LeavesKeyboard)
     }
 
     /// Declares a key context ACTIVE while this view is mounted —
     /// `Runtime::bind_in(context, …)` bindings answer only then. The
     /// palette closes, its keys go quiet.
+    #[track_caller]
     fn key_context(self, name: &'static str) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::KeyContext(name),
-        }
+        Modified::new(self, Modifier::KeyContext(name))
     }
 
     /// Declares a key context active while the KEYBOARD is inside this
@@ -1224,29 +1118,23 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// A focused declaration that nobody's keyboard is in is simply not
     /// active — the global map and the other contexts answer as if it
     /// were not there.
+    #[track_caller]
     fn key_context_focused(self, name: &'static str) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::KeyContextFocused(name),
-        }
+        Modified::new(self, Modifier::KeyContextFocused(name))
     }
 
     // MARK: - Interaction
 
     /// `.onTapGesture { … }` — in the headless runtime it fires on render.
+    #[track_caller]
     fn on_tap(self, action: impl Fn() + 'static) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::OnTapGesture(Rc::new(action)),
-        }
+        Modified::new(self, Modifier::OnTapGesture(Rc::new(action)))
     }
 
     /// `.onAppear { … }` — fires on render (motor parity).
+    #[track_caller]
     fn on_appear(self, action: impl Fn() + 'static) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::OnAppear(Rc::new(action)),
-        }
+        Modified::new(self, Modifier::OnAppear(Rc::new(action)))
     }
 
     /// `.onChange(of:initial:) { old, new in … }`
@@ -1266,6 +1154,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
 
     /// `.onChange` with an explicit site — for helpers that emit the same
     /// callsite for uses that need distinct slots.
+    #[track_caller]
     fn on_change_keyed<V: Clone + PartialEq + 'static>(
         self,
         site: impl Into<Site>,
@@ -1273,14 +1162,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         initial: bool,
         action: impl Fn(&V, &V) + 'static,
     ) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Effect {
-                name: "onChange",
-                detail: "()",
-                effect: effects::change_effect(site.into(), of, initial, action),
-            },
-        }
+        Modified::new(self, Modifier::Effect { name: "onChange", detail: "()", effect: effects::change_effect(site.into(), of, initial, action), })
     }
 
     /// `.onReceive(publisher) { value in … }`
@@ -1301,20 +1183,14 @@ pub trait ViewExt: View<Arity = Single> + Sized {
 
     /// `.onReceive` with an explicit site — same case as
     /// [`ViewExt::on_change_keyed`].
+    #[track_caller]
     fn on_receive_keyed<V: Clone + PartialEq + 'static>(
         self,
         site: impl Into<Site>,
         publisher: impl IntoPublisher<V>,
         action: impl Fn(V) + 'static,
     ) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Effect {
-                name: "onReceive",
-                detail: "()",
-                effect: effects::receive_effect(site.into(), publisher.into_publisher(), action),
-            },
-        }
+        Modified::new(self, Modifier::Effect { name: "onReceive", detail: "()", effect: effects::receive_effect(site.into(), publisher.into_publisher(), action), })
     }
 
     /// `.task { await … }` — work that belongs to this view. It starts
@@ -1364,6 +1240,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
 
     /// `.task` with an explicit site — same case as
     /// [`ViewExt::on_change_keyed`].
+    #[track_caller]
     fn task_keyed<F>(
         self,
         site: impl Into<Site>,
@@ -1373,48 +1250,32 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     where
         F: AsyncFn() + 'static,
     {
-        Modified {
-            base: self,
-            modifier: Modifier::Effect {
-                name: "task",
-                detail: if id.is_some() { "(id:)" } else { "()" },
-                effect: effects::task_effect(site.into(), id, start),
-            },
-        }
+        Modified::new(self, Modifier::Effect { name: "task", detail: if id.is_some() { "(id:)" } else { "()" }, effect: effects::task_effect(site.into(), id, start), })
     }
 
     /// `.searchable(text: $searchText)`
+    #[track_caller]
     fn searchable(self, _text: Binding<String>) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Searchable,
-        }
+        Modified::new(self, Modifier::Searchable)
     }
 
     /// `.refreshable { … }` — a user gesture; inert headless.
+    #[track_caller]
     fn refreshable(self, _action: impl Fn() + 'static) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Refreshable,
-        }
+        Modified::new(self, Modifier::Refreshable)
     }
 
     /// `.sheet(isPresented: $flag) { … }` — the content is the erased
     /// boundary: mounts only when presented (close it with [`erased`]).
     ///
     /// [`erased`]: crate::erased::erased
+    #[track_caller]
     fn sheet(
         self,
         is_presented: Binding<bool>,
         content: impl Fn(&Context) -> Erased + 'static,
     ) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Sheet {
-                is_presented,
-                content: Rc::new(content),
-            },
-        }
+        Modified::new(self, Modifier::Sheet { is_presented, content: Rc::new(content), })
     }
 
     /// `.dialog(isPresented: $flag, spec) { … }` — a modal layer that,
@@ -1431,20 +1292,14 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// dismissal. The dialog opens centered at `spec.min` and the
     /// shell remembers where the user leaves it for as long as the
     /// runtime lives.
+    #[track_caller]
     fn dialog(
         self,
         is_presented: Binding<bool>,
         spec: crate::layout::DialogSpec,
         content: impl Fn(&Context) -> Erased + 'static,
     ) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Dialog {
-                is_presented,
-                spec: Box::new(spec),
-                content: Rc::new(content),
-            },
-        }
+        Modified::new(self, Modifier::Dialog { is_presented, spec: Box::new(spec), content: Rc::new(content), })
     }
 
     /// `.alert(isPresented: $flag, spec) { … }` — a modal ASK: a real
@@ -1485,31 +1340,23 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// ```
     ///
     /// [`ALERT_DEFAULT`]: crate::action::ALERT_DEFAULT
+    #[track_caller]
     fn alert(
         self,
         is_presented: Binding<bool>,
         spec: crate::layout::AlertSpec,
         content: impl Fn(&Context) -> Erased + 'static,
     ) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Alert {
-                is_presented,
-                spec,
-                content: Rc::new(content),
-            },
-        }
+        Modified::new(self, Modifier::Alert { is_presented, spec, content: Rc::new(content), })
     }
 
     /// Marks THIS view as a window-drag handle: on a chrome-less
     /// desktop window (`Chrome::Scene`), pressing it where no button
     /// wins drags the window — the scene's own title bar. Shells
     /// without a window to drag ignore it honestly (web, headless).
+    #[track_caller]
     fn window_drag_region(self) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::WindowDragRegion,
-        }
+        Modified::new(self, Modifier::WindowDragRegion)
     }
 
     /// Marks THIS view as one of the window's own buttons on a
@@ -1517,11 +1364,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// close closes, maximize offers the system's snap flyout — and
     /// the press never reaches the scene. Shells with native chrome
     /// ignore it honestly.
+    #[track_caller]
     fn window_control(self, control: crate::layout::WindowControl) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::WindowControl(control),
-        }
+        Modified::new(self, Modifier::WindowControl(control))
     }
 
     /// An anchored popover: THIS view is the anchor, `side` the
@@ -1535,21 +1380,14 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     ///     details_card(&item).erased()
     /// })
     /// ```
+    #[track_caller]
     fn popover(
         self,
         is_presented: Binding<bool>,
         side: crate::layout::Side,
         content: impl Fn(&Context) -> Erased + 'static,
     ) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Popover {
-                is_presented,
-                side,
-                on_dismiss: None,
-                content: Rc::new(content),
-            },
-        }
+        Modified::new(self, Modifier::Popover { is_presented, side, on_dismiss: None, content: Rc::new(content), })
     }
 
     /// [`Self::popover`] with a dismissal callback: it runs after ANY
@@ -1557,6 +1395,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// outside press, Escape, a scrolled-away anchor, an app switch.
     /// The app clearing the binding itself does not count (it already
     /// knows).
+    #[track_caller]
     fn popover_on_dismiss(
         self,
         is_presented: Binding<bool>,
@@ -1564,80 +1403,51 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         on_dismiss: impl Fn() + 'static,
         content: impl Fn(&Context) -> Erased + 'static,
     ) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Popover {
-                is_presented,
-                side,
-                on_dismiss: Some(Rc::new(on_dismiss)),
-                content: Rc::new(content),
-            },
-        }
+        Modified::new(self, Modifier::Popover { is_presented, side, on_dismiss: Some(Rc::new(on_dismiss)), content: Rc::new(content), })
     }
 
     /// `.toolbar { … }` — inert in the fake runtime, as in the motor.
+    #[track_caller]
     fn toolbar(self, _items: impl View) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Toolbar,
-        }
+        Modified::new(self, Modifier::Toolbar)
     }
 
     // MARK: - Data & environment
 
     /// `.inject(diContainer)`
+    #[track_caller]
     fn inject<T: 'static>(self, container: Rc<T>) -> Modified<Self> {
         let detail = format!("({})", short_type_name::<T>());
-        Modified {
-            base: self,
-            modifier: Modifier::EnvSet {
-                name: "inject",
-                detail,
-                set: Rc::new(move |values: &mut motor::state::EnvironmentValues| {
-                    values.injected = Some(container.clone());
-                }),
-            },
-        }
+        Modified::new(self, Modifier::EnvSet { name: "inject", detail, set: Rc::new(move |values: &mut motor::state::EnvironmentValues| { values.injected = Some(container.clone()); }), })
     }
 
     /// `.environment(\.key, value)` — one closure writes the value the
     /// subtree reads. A preview forces a phone's size class on a desktop
     /// this way; the shell's own report reaches the whole tree through
     /// `Runtime::set_environment` instead.
+    #[track_caller]
     fn environment(
         self,
         set: impl Fn(&mut motor::state::EnvironmentValues) + 'static,
     ) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::EnvSet { name: "environment", detail: "(…)".into(), set: Rc::new(set) },
-        }
+        Modified::new(self, Modifier::EnvSet { name: "environment", detail: "(…)".into(), set: Rc::new(set) })
     }
 
     /// `.modelContainer(container)`
+    #[track_caller]
     fn model_container<T: ProvidesQueries + 'static>(self, container: Rc<T>) -> Modified<Self> {
         let source = container.querySource();
-        Modified {
-            base: self,
-            modifier: Modifier::EnvSet {
-                name: "modelContainer",
-                detail: "(…)".into(),
-                set: Rc::new(move |values: &mut motor::state::EnvironmentValues| {
-                    values.querySource = Some(source.clone());
-                }),
-            },
-        }
+        Modified::new(self, Modifier::EnvSet { name: "modelContainer", detail: "(…)".into(), set: Rc::new(move |values: &mut motor::state::EnvironmentValues| { values.querySource = Some(source.clone()); }), })
     }
 
     /// `.modifier(RootViewAppearance(…))` — re-applied on every render.
+    #[track_caller]
     fn modifier(self, custom: impl crate::erased::CustomModifier + 'static) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Custom(Rc::new(custom)),
-        }
+        Modified::new(self, Modifier::Custom(Rc::new(custom)))
     }
 
     /// `.query(searchText:results:) { search in Query(…) }` — the fake @Query.
+    #[track_caller]
     fn query<T: Clone + PartialEq + 'static>(
         self,
         search_text: String,
@@ -1676,14 +1486,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
                 false
             }
         });
-        Modified {
-            base: self,
-            modifier: Modifier::Effect {
-                name: "query",
-                detail: "(searchText: …, results: $…)",
-                effect,
-            },
-        }
+        Modified::new(self, Modifier::Effect { name: "query", detail: "(searchText: …, results: $…)", effect, })
     }
 
     // MARK: - Inert parity
@@ -1691,43 +1494,33 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// `.navigationDestination(for:) { … }` — inert (the fake
     /// NavigationPath carries only descriptions; the destination does not
     /// mount).
+    #[track_caller]
     fn navigation_destination(self) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::NavigationDestination,
-        }
+        Modified::new(self, Modifier::NavigationDestination)
     }
 
     /// `.navigationViewStyle(.stack)`
+    #[track_caller]
     fn navigation_view_style(self) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::NavigationViewStyle,
-        }
+        Modified::new(self, Modifier::NavigationViewStyle)
     }
 
     /// `.attachEnvironmentOverrides()`
+    #[track_caller]
     fn attach_environment_overrides(self) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::AttachEnvironmentOverrides,
-        }
+        Modified::new(self, Modifier::AttachEnvironmentOverrides)
     }
 
     /// `.attachEnvironmentOverrides(onChange: …)`
+    #[track_caller]
     fn attach_environment_overrides_on_change(self) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::AttachEnvironmentOverridesOnChange,
-        }
+        Modified::new(self, Modifier::AttachEnvironmentOverridesOnChange)
     }
 
     /// `.flipsForRightToLeftLayoutDirection(true)`
+    #[track_caller]
     fn flips_for_right_to_left_layout_direction(self, flips: bool) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::FlipsForRightToLeftLayoutDirection(flips),
-        }
+        Modified::new(self, Modifier::FlipsForRightToLeftLayoutDirection(flips))
     }
 }
 

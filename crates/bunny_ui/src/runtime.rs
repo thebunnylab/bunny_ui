@@ -178,6 +178,9 @@ pub struct Runtime {
     /// in paint order — the hit-test
     /// map for pointer events.
     last_hits: RefCell<Vec<(String, Rect)>>,
+    /// The sited nodes of the last layout (`crate::provenance`) — empty
+    /// unless [`Runtime::record_sites`] turned recording on.
+    last_sites: RefCell<Vec<crate::provenance::SitePlacement>>,
     /// Which of those hits paint a pointer state (indices into
     /// `last_hits`), and which hover groups do — the last layout's
     /// answer to "would a hover HERE change the picture?".
@@ -1593,6 +1596,7 @@ impl Runtime {
             last_root: RefCell::new(None),
             last_root_type: Cell::new(None),
             last_hits: RefCell::new(Vec::new()),
+            last_sites: RefCell::new(Vec::new()),
             last_hover_sensitive: RefCell::new(Vec::new()),
             last_sensitive_groups: RefCell::new(Vec::new()),
             hover_move_had_more: Cell::new(false),
@@ -5454,6 +5458,26 @@ impl Runtime {
         self.last_hits.borrow().clone()
     }
 
+    /// Record where every node was written (`crate::provenance`): from the
+    /// next pass on, each builder and modifier wraps its node in its site
+    /// and the layout keeps a placement per site. Turn it on BEFORE the
+    /// first pass — a boundary the reconciler already retained keeps the
+    /// nodes it built until its body runs again. Off, a pass is the pass
+    /// it always was.
+    pub fn record_sites(&self, on: bool) {
+        crate::provenance::set_recording(on);
+        if !on {
+            self.last_sites.borrow_mut().clear();
+        }
+    }
+
+    /// Every sited node the last layout placed, with its frame in the
+    /// scene's coordinates — the table a tool maps a click or a caret
+    /// through. Empty unless [`Runtime::record_sites`] is on.
+    pub fn sites(&self) -> Vec<crate::provenance::SitePlacement> {
+        self.last_sites.borrow().clone()
+    }
+
     /// Dom mode: every island's element id, origin and size in the
     /// layout's frame — the probe's way from a hit to a canvas point.
     pub fn island_frames(&self) -> Vec<(u32, Px, Px, Px, Px)> {
@@ -7297,6 +7321,7 @@ impl Runtime {
         // `clone_from`, not a fresh clone: the tables keep their capacity
         // from frame to frame, and the paths inside keep their buffers
         self.last_hits.borrow_mut().clone_from(&result.hits);
+        self.last_sites.borrow_mut().clone_from(&result.sites);
         self.last_hover_sensitive.borrow_mut().clone_from(&result.hover_sensitive);
         self.last_sensitive_groups.borrow_mut().clone_from(&result.sensitive_groups);
         self.last_scrolls.borrow_mut().clone_from(&result.scrolls);
