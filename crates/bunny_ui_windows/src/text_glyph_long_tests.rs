@@ -228,23 +228,50 @@ fn paragraph_long_native_joining_discrepancy_is_not_candidate_parity() {
 }
 
 #[test]
-fn paragraph_native_capacity_estimate_has_no_cliff_before_the_input_limit() {
+fn paragraph_glyph_buffer_growth_caps_at_the_native_count() {
     let engine = DirectWriteEngine::new();
+    let factories = engine.factories.as_ref().unwrap();
+    let shaper = Shaper::new(factories).unwrap();
     let font = FontSpec::DEFAULT;
-    for length in [43_679, 43_680, 65_535] {
-        let text = "a".repeat(length);
-        let layout = tests::reference_layout(&engine, &text, &font);
-        let mut expected: Vec<_> = raster::reference_records(&layout)
-            .iter()
-            .flat_map(clusters)
-            .collect();
-        expected.sort_by_key(|cluster| cluster.source.start);
-        let actual = tests::shape(&engine, &text, &font);
-        assert!(difference("capacity boundary", actual, &expected).is_none());
-        let content = TextContent::from(text.as_str());
-        let line = content.line(0..text.len()).unwrap();
-        assert!(engine.measure_paragraph_line(&line, &font).unwrap().width > 0.0);
-    }
+    let text = "a".repeat(4096);
+    let prepared = Prepared::new(factories, &text).unwrap();
+    let layout = tests::reference_layout(&engine, &text, &font);
+    let mut expected: Vec<_> = raster::reference_records(&layout)
+        .iter()
+        .flat_map(clusters)
+        .collect();
+    expected.sort_by_key(|cluster| cluster.source.start);
+    engine
+        .with_slot(&font, |slot| {
+            let base = BaseFont::new(slot, &font).unwrap();
+            let face = create_face(&base.font).unwrap();
+            // SAFETY: the immutable prepared source retains its native locale.
+            let locale = unsafe { &(*prepared.source.as_ptr()).locale };
+            let input = Input {
+                text: prepared.utf16(),
+                script: prepared.scripts[0],
+                level: prepared.levels[0].resolved,
+                face: &face,
+                em_size: native_float(font.size).unwrap(),
+                locale,
+            };
+            // Exercise the clamp itself independently of the native text-length
+            // limit. The previous 65536 count makes this same short input fail.
+            let output = shaper.produce(&input, 0.0, usize::MAX).unwrap();
+            let run = Run {
+                source: 0..prepared.utf16().len(),
+                face,
+                em_size: native_float(font.size).unwrap(),
+                level: prepared.levels[0].resolved,
+                visibility: Visibility::Ink,
+                clusters: output.clusters,
+                glyphs: output.glyphs,
+                advances: output.advances,
+                offsets: output.offsets,
+            };
+            assert!(difference("capacity clamp", vec![run], &expected).is_none());
+        })
+        .unwrap();
 }
 
 // Characterize the native ABI before choosing a production split policy. Only
@@ -273,6 +300,14 @@ fn paragraph_long_native_capacity_and_safe_boundary_witness() {
                 (4096, 8208),
                 (4096, 65_535),
                 (4096, 65_536),
+                (16_384, 65_535),
+                (32_767, 65_535),
+                (32_768, 65_535),
+                (43_679, 65_535),
+                (43_680, 65_535),
+                (65_534, 65_535),
+                (65_535, 65_535),
+                (65_536, 65_535),
                 (text.len(), 65_535),
                 (text.len(), 65_536),
                 (text.len(), text.len() * 2 + 16),
