@@ -967,7 +967,8 @@ pub fn list_bounds(
                 );
             }
             DrawCommand::TextLine { origin, content, range, font, .. } => {
-                let metrics = cache.get_or_measure(&content[range.0..range.1], font, text);
+                let Ok(line) = content.line(range.0..range.1) else { continue };
+                let metrics = cache.get_or_measure_paragraph(&line, font, text);
                 // a point of slack per edge: measure vs raster
                 // rounding never crosses it, and a superset is safe
                 fold(
@@ -1210,8 +1211,8 @@ pub fn rasterize_over(
                 corner_radius * factor,
             ),
             DrawCommand::TextLine { origin, content, range, color, font } => {
-                let slice = &content[range.0..range.1];
-                if let Some(raster) = text.raster_line(slice, font, *color, scale) {
+                let Ok(line) = content.line(range.0..range.1) else { continue };
+                if let Some(raster) = text.raster_paragraph_line(&line, font, *color, scale) {
                     bitmap.composite_text(origin.x, origin.y, scale, &raster);
                 }
             }
@@ -1305,7 +1306,8 @@ fn command_box(
             (x0 - reach, y0 - reach, x1 + reach, y1 + reach)
         }
         DrawCommand::TextLine { origin, content, range, font, .. } => {
-            let metrics = cache.get_or_measure(&content[range.0..range.1], font, text);
+            let line = content.line(range.0..range.1).ok()?;
+            let metrics = cache.get_or_measure_paragraph(&line, font, text);
             let x = (origin.x * factor).round() as i64;
             let y = (origin.y * factor).round() as i64;
             // +2px of slack per edge: measure vs raster rounding
@@ -1688,8 +1690,8 @@ impl Surface {
                         )
                     }
                     DrawCommand::TextLine { origin, content, range, color, font } => {
-                        let slice = &content[range.0..range.1];
-                        if let Some(raster) = text.raster_line(slice, font, *color, self.scale) {
+                        let Ok(line) = content.line(range.0..range.1) else { continue };
+                        if let Some(raster) = text.raster_paragraph_line(&line, font, *color, self.scale) {
                             self.bitmap.composite_text(origin.x, origin.y, self.scale, &raster);
                         }
                     }
@@ -1830,7 +1832,7 @@ mod tests {
         // right, and the island sits to its LEFT — still no
         flanking.push(DrawCommand::TextLine {
             origin: Point { x: 430.0, y: 10.0 },
-            content: std::sync::Arc::from("dock"),
+            content: crate::text_source::TextContent::from("dock"),
             range: (0, 4),
             color: crate::layout::Color { r: 10, g: 10, b: 10, a: 255 },
             font: FontSpec::DEFAULT,
@@ -1893,7 +1895,7 @@ mod tests {
         });
         tail.push(DrawCommand::TextLine {
             origin: Point { x: 28.0, y: 781.0 },
-            content: std::sync::Arc::from("task/branch"),
+            content: crate::text_source::TextContent::from("task/branch"),
             range: (0, 11),
             color: ink,
             font: FontSpec::DEFAULT,
@@ -1983,7 +1985,7 @@ mod tests {
         let mut display = DisplayList::default();
         display.push(DrawCommand::TextLine {
             origin: Point { x: 0.0, y: 0.0 },
-            content: std::sync::Arc::from("1"),
+            content: crate::text_source::TextContent::from("1"),
             range: (0, 1),
             color: Color::BLACK,
             font: crate::text_engine::FontSpec::DEFAULT,
@@ -2234,7 +2236,7 @@ mod tests {
     fn line(x: f64, y: f64, text: &str, color: Color) -> DrawCommand {
         DrawCommand::TextLine {
             origin: Point { x, y },
-            content: std::sync::Arc::from(text),
+            content: crate::text_source::TextContent::from(text),
             range: (0, text.len()),
             color,
             font: crate::text_engine::FontSpec::DEFAULT,
@@ -2444,7 +2446,7 @@ mod tests {
                         let index = at(&mut roll, push + 1, pop);
                         if let DrawCommand::TextLine { content, range, .. } = &mut next[index] {
                             let word = words[roll(words.len())];
-                            *content = std::sync::Arc::from(word);
+                            *content = crate::text_source::TextContent::from(word);
                             *range = (0, word.len());
                         }
                     }

@@ -483,6 +483,7 @@ impl PaintCtx<'_> {
 /// the glyph atlas, the damage diff, the GPU and CPU parity.
 pub struct Painter<'a> {
     display: &'a mut DisplayList,
+    cache: &'a MeasureCache,
     origin: Point,
     font: FontSpec,
     ink: Color,
@@ -494,8 +495,9 @@ impl<'a> Painter<'a> {
         origin: Point,
         font: FontSpec,
         ink: Color,
+        cache: &'a MeasureCache,
     ) -> Painter<'a> {
-        Painter { display, origin, font, ink }
+        Painter { display, cache, origin, font, ink }
     }
 
     fn shift(&self, rect: Rect) -> Rect {
@@ -611,7 +613,7 @@ impl<'a> Painter<'a> {
         }
         self.display.push(DrawCommand::TextLine {
             origin: self.at(origin),
-            content,
+            content: self.cache.owned_text_content(content),
             range,
             color,
             font,

@@ -1982,6 +1982,9 @@ struct Tile {
 /// (growing once to the cap) and walks the frame again.
 struct AtlasFull;
 
+// Source keys have their own budget; GPU texels are managed independently.
+const ATLAS_SOURCE_LIMIT: usize = 16 * 1024 * 1024;
+
 /// One cached run: the engine's raster uploaded as chunk tiles. The
 /// color sits IN the key — the engine bakes it, which keeps emoji true
 /// and byte parity possible; a theme flip mints new tiles and the old
@@ -1990,7 +1993,7 @@ struct RunEntry {
     font: FontKey,
     color: u32,
     scale: u32,
-    content: String,
+    content: Option<bunny_ui::text_source::ParagraphLine>,
     tiles: Vec<Tile>,
     width: u32,
     height: u32,
@@ -2002,7 +2005,7 @@ fn packed_color(color: Color) -> u32 {
 
 /// The lookup hash — computed WITHOUT allocating (typing must never pay
 /// a String per warm frame); collisions resolve by comparing the entry.
-fn run_hash(font: FontKey, color: u32, scale: u32, content: &str) -> u64 {
+fn run_hash(font: FontKey, color: u32, scale: u32, content: &bunny_ui::text_source::ParagraphLine) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     font.hash(&mut hasher);
     color.hash(&mut hasher);
@@ -2028,6 +2031,8 @@ struct RunAtlas {
     size: u32,
     packer: ShelfPacker,
     entries: HashMap<u64, Vec<RunEntry>>,
+    source_weight: usize,
+    transient: Option<RunEntry>,
     /// Resampled images riding the SHARED texture, keyed by
     /// (source key, physical width, physical height) — icons and
     /// thumbnails, the many and the hot.
@@ -2168,6 +2173,8 @@ impl RunAtlas {
             size: ATLAS_INITIAL_SIZE,
             packer: ShelfPacker::new(ATLAS_INITIAL_SIZE, ATLAS_INITIAL_SIZE),
             entries: HashMap::new(),
+            source_weight: 0,
+            transient: None,
             images: HashMap::new(),
             dedicated: HashMap::new(),
             live: HashMap::new(),
@@ -2206,6 +2213,8 @@ impl RunAtlas {
             self.packer.reset();
         }
         self.entries.clear();
+        self.source_weight = 0;
+        self.transient = None;
         self.images.clear();
         // the dedicated textures ride the same collector: the caller
         // drained the GPU before any reset, so releasing here is safe
@@ -2323,25 +2332,27 @@ impl RunAtlas {
     /// nothing to paint (the CPU path skips those too).
     fn resolve(
         &mut self,
-        slice: &str,
+        line: &bunny_ui::text_source::ParagraphLine,
         font: &FontSpec,
         color: Color,
         scale: usize,
         engine: &dyn TextEngine,
     ) -> Result<Option<&RunEntry>, AtlasFull> {
+        self.transient = None;
+        let scale_key = u32::try_from(scale).map_err(|_| AtlasFull)?;
         let key = font.key();
         let packed = packed_color(color);
-        let hash = run_hash(key, packed, scale as u32, slice);
+        let hash = run_hash(key, packed, scale_key, line);
         let warm = self.entries.get(&hash).is_some_and(|bucket| {
             bucket.iter().any(|entry| {
                 entry.font == key
                     && entry.color == packed
-                    && entry.scale == scale as u32
-                    && entry.content == slice
+                    && entry.scale == scale_key
+                    && entry.content.as_ref() == Some(line)
             })
         });
         if !warm {
-            let Some(raster) = engine.raster_line(slice, font, color, scale) else {
+            let Some(raster) = engine.raster_paragraph_line(line, font, color, scale) else {
                 return Ok(None);
             };
             if !self.ensure_texture() {
@@ -2367,15 +2378,29 @@ impl RunAtlas {
                 tiles.push(Tile { x, y, width: chunk_width, height });
                 chunk_x += chunk_width;
             }
-            self.entries.entry(hash).or_default().push(RunEntry {
+            let mut entry = RunEntry {
                 font: key,
                 color: packed,
-                scale: scale as u32,
-                content: slice.to_string(),
+                scale: scale_key,
+                content: Some(line.clone()),
                 tiles,
                 width,
                 height,
-            });
+            };
+            // Metadata eviction never touches uploaded texels or frame instances.
+            // Oversized context is never retained; its tiles still serve this draw.
+            let weight = line.paragraph().text().len().saturating_mul(24).saturating_add(256);
+            if weight > ATLAS_SOURCE_LIMIT {
+                entry.content = None;
+                self.transient = Some(entry);
+                return Ok(self.transient.as_ref());
+            }
+            if self.source_weight + weight > ATLAS_SOURCE_LIMIT {
+                self.entries.clear();
+                self.source_weight = 0;
+            }
+            self.source_weight += weight;
+            self.entries.entry(hash).or_default().push(entry);
         }
         let entry = self
             .entries
@@ -2384,11 +2409,11 @@ impl RunAtlas {
                 bucket.iter().find(|entry| {
                     entry.font == key
                         && entry.color == packed
-                        && entry.scale == scale as u32
-                        && entry.content == slice
+                        && entry.scale == scale_key
+                        && entry.content.as_ref() == Some(line)
                 })
             })
-            .expect("a run just resolved lives in the atlas");
+            .ok_or(AtlasFull)?;
         Ok(Some(entry))
     }
 
@@ -2834,8 +2859,8 @@ fn build_frame(
             }
             DrawCommand::TextLine { origin, content, range, color, font } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
-                let slice = &content[range.0..range.1];
-                let Some(entry) = atlas.resolve(slice, font, *color, scale, engine)? else {
+                let Ok(line) = content.line(range.0..range.1) else { continue };
+                let Some(entry) = atlas.resolve(&line, font, *color, scale, engine)? else {
                     continue;
                 };
                 // the composite_text mirror: one snap of the logical

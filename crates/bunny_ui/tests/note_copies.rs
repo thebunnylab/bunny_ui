@@ -134,7 +134,7 @@ fn the_first_input_method_read_also_consumes_the_predecessor() {
     let window = Size { width: 400.0, height: 300.0 };
     let display = runtime.display_frame(&panel, window);
     let old = display.iter().find_map(|command| match command {
-        DrawCommand::TextLine { content, .. } => Some(Arc::downgrade(content)),
+        DrawCommand::TextLine { content, .. } => Some(Arc::downgrade(content.source())),
         _ => None,
     }).expect("the field painted its shared text");
     drop(display);

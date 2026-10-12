@@ -3524,7 +3524,7 @@ mod tests {
         };
         let line = |x: f64, y: f64, text: &str| DrawCommand::TextLine {
             origin: Point { x, y },
-            content: std::sync::Arc::from(text),
+            content: bunny_ui::text_source::TextContent::from(text),
             range: (0, text.len()),
             color: Color::BLACK,
             font: bunny_ui::text_engine::FontSpec::DEFAULT,

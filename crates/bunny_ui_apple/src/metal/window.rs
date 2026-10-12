@@ -432,8 +432,8 @@ struct NativeUpdates {
 }
 
 impl NativeUpdates {
-    /// The immutable base needs only the spans it painted, not every hidden
-    /// byte of an old document. Current frames retain their cheap shared list.
+    /// The immutable base retains the paragraphs that shape its visible spans.
+    /// Unrelated paragraphs of an old document can be released.
     fn new(display: &DisplayList, physical: (usize, usize), scale: usize, canvas: Color) -> Self {
         let commands = display
             .iter()
@@ -442,9 +442,11 @@ impl NativeUpdates {
                 if let bunny_ui::layout::DrawCommand::TextLine { content, range, .. } = &mut command
                     && content.len() > 4096
                     && range.1 - range.0 < content.len() / 4
+                    && let Ok(line) = content.line(range.0..range.1)
                 {
-                    *content = Arc::from(&content[range.0..range.1]);
-                    *range = (0, content.len());
+                    let bytes = line.bytes();
+                    *content = line.paragraph().clone().into();
+                    *range = (bytes.start, bytes.end);
                 }
                 command
             })
@@ -1227,7 +1229,7 @@ mod tests {
                     },
                     DrawCommand::TextLine {
                         origin: Point { x: 20.0, y: 30.0 },
-                        content,
+                        content: content.into(),
                         range: (0, 18),
                         color: Color::BLACK,
                         font: FontSpec::DEFAULT,

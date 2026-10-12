@@ -19,6 +19,10 @@ use std::sync::Arc;
 use motor::hash::FxHashMap as HashMap;
 
 use crate::layout::{Color, Px};
+use crate::text_source::{ContentCache, ParagraphLine, TextContent};
+
+#[path = "text_context_cache.rs"]
+mod context_cache;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Weight {
@@ -291,6 +295,29 @@ pub struct TextRaster {
 /// The boundary: who measures and draws text. Object-safe on purpose —
 /// `Rc<dyn TextEngine>` is the shape that crosses the `Runtime`.
 pub trait TextEngine {
+    /// Measure a validated line with its complete paragraph context.
+    /// Custom engines keep isolated-line behavior by default; this fallback
+    /// does not establish bidirectional paragraph support.
+    fn measure_paragraph_line(&self, line: &ParagraphLine, font: &FontSpec) -> LineMetrics {
+        self.measure_line(line.text(), font)
+    }
+
+    /// Raster the same contextual line used by measurement and editing.
+    /// The compatibility default calls the existing isolated-line entry.
+    fn raster_paragraph_line(
+        &self, line: &ParagraphLine, font: &FontSpec, color: Color, scale: usize,
+    ) -> Option<TextRaster> {
+        self.raster_line(line.text(), font, color, scale)
+    }
+
+    /// Editing cells relative to the visible line, resolved with its paragraph.
+    /// The compatibility default preserves legacy line-only geometry.
+    fn paragraph_line_geometry(
+        &self, line: &ParagraphLine, font: &FontSpec,
+    ) -> Option<crate::text_geometry::LineGeometry> {
+        self.line_geometry(line.text(), font)
+    }
+
     /// Editable geometry from the same complete line used by measurement and
     /// raster. Native adapters return scalar cells in logical UTF-8 order;
     /// unsupported engines keep the legacy prefix-based editing fallback.
@@ -792,6 +819,8 @@ type BreakLines = std::rc::Rc<Vec<(usize, usize)>>;
 /// unrepresentable).
 #[derive(Default)]
 pub struct MeasureCache {
+    contents: RefCell<ContentCache>,
+    contextual: RefCell<context_cache::ContextCache>,
     /// The cache clock: one tick per layout pass — entry age is measured
     /// against it.
     frame: std::cell::Cell<u32>,
@@ -859,7 +888,7 @@ impl MeasureCache {
 
     /// Diagnostics: the entries in both maps.
     pub fn len(&self) -> usize {
-        self.entries.get()
+        self.entries.get() + self.contextual.borrow().len()
     }
 
     /// Diagnostics: no entry at all.
@@ -903,6 +932,46 @@ impl MeasureCache {
             + lines.values().map(HashMap::len).sum::<usize>()
             + breaks.values().map(HashMap::len).sum::<usize>();
         self.entries.set(kept);
+    }
+
+    /// Index this shared source once and reuse unchanged paragraph values.
+    pub fn text_content(&self, text: &Arc<str>) -> TextContent {
+        self.contents.borrow_mut().get(text)
+    }
+
+    pub(crate) fn owned_text_content(&self, text: Arc<str>) -> TextContent {
+        self.contents.borrow_mut().take(text)
+    }
+
+    /// Measure a line without discarding its paragraph or aliasing equal
+    /// visible slices from different directional contexts.
+    pub fn get_or_measure_paragraph(
+        &self, line: &ParagraphLine, font: &FontSpec, engine: &dyn TextEngine,
+    ) -> LineMetrics {
+        let key = font.key();
+        if let Some(metrics) = self.contextual.borrow().metrics(key, line) {
+            crate::stats::note_measure(true);
+            return metrics;
+        }
+        crate::stats::note_measure(false);
+        let value = engine.measure_paragraph_line(line, font);
+        self.contextual.borrow_mut().set_metrics(key, line, value);
+        value
+    }
+
+    /// Cache contextual native geometry, including an unsupported answer.
+    pub fn get_or_paragraph_geometry(
+        &self, line: &ParagraphLine, font: &FontSpec, engine: &dyn TextEngine,
+    ) -> Option<std::rc::Rc<crate::text_geometry::LineGeometry>> {
+        let key = font.key();
+        match self.contextual.borrow().geometry(key, line) {
+            context_cache::Geometry::Unqueried => {}
+            context_cache::Geometry::Unsupported => return None,
+            context_cache::Geometry::Ready(value) => return Some(value),
+        }
+        let value = engine.paragraph_line_geometry(line, font).map(std::rc::Rc::new);
+        self.contextual.borrow_mut().set_geometry(key, line, value.clone());
+        value
     }
 
     /// Cache the complete line's native geometry, including unsupported answers.

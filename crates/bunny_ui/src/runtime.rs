@@ -6173,6 +6173,7 @@ impl Runtime {
                     origin,
                     placement.font,
                     placement.ink,
+                    &self.cache,
                 );
                 motor::identity::begin_paint(&placement.path);
                 let _ = owner.element.element().paint_overlay(&ctx, &mut painter);
@@ -6203,6 +6204,7 @@ impl Runtime {
                     origin,
                     placement.font,
                     placement.ink,
+                    &self.cache,
                 );
                 motor::identity::begin_paint(&placement.path);
                 placement.element.element().paint(&ctx, &mut painter);

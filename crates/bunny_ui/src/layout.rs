@@ -2500,12 +2500,12 @@ pub enum DrawCommand {
     /// One already-wrapped line of text. `origin` is the TOP-left of the
     /// line box (the engine converts to baseline internally); `font` is
     /// the effective inherited font. The painted span is
-    /// `content[range.0..range.1]` — a SLICE of the node's whole content
-    /// (the `Rc` clones cheap; no String is born per line on the hot
-    /// path).
+    /// `content[range.0..range.1]`, with the complete containing paragraph
+    /// retained for native shaping. The scalar-aligned range cannot cross LF.
+    /// Cloning the indexed source shares its paragraph values across lines.
     TextLine {
         origin: Point,
-        content: Arc<str>,
+        content: crate::text_source::TextContent,
         range: (usize, usize),
         color: Color,
         font: FontSpec,
@@ -2527,13 +2527,11 @@ pub enum DrawCommand {
     PopClip,
 }
 
-/// Two commands are equal when they paint alike. Every kind compares
-/// field by field, except a line of text: it compares the span it paints,
-/// not the content it slices that span from. A keystroke gives the whole
-/// note a new string, and the lines it did not touch still paint the same
-/// pixels — so the diffs that keep a frame (the presenters' skip, the
-/// retained surface, a patch) see one changed line, not the screen. It is
-/// cheaper too: a line compares its own bytes, never the note's.
+/// Two commands are equal when they paint alike. A text line compares its
+/// complete paragraph and paragraph-relative range: changing an embedding or
+/// isolate before a soft break can change every following visual line. Edits
+/// to unrelated hard paragraphs preserve equality. Shared values and cached
+/// paragraph hashes keep repeated comparisons independent of document size.
 impl PartialEq for DrawCommand {
     fn eq(&self, other: &DrawCommand) -> bool {
         use DrawCommand::*;
@@ -2555,8 +2553,9 @@ impl PartialEq for DrawCommand {
             TextLine { origin, content, range, color, font } => matches!(other,
                 TextLine { origin: o, content: t, range: g, color: c, font: f }
                     if origin == o && color == c && font == f
-                        && ((Arc::ptr_eq(content, t) && range == g)
-                            || content[range.0..range.1] == t[g.0..g.1])),
+                        && ((Arc::ptr_eq(content.source(), t.source()) && range == g)
+                            || matches!((content.line(range.0..range.1), t.line(g.0..g.1)),
+                                (Ok(a), Ok(b)) if a == b))),
             Image { rect, source } => matches!(other,
                 Image { rect: r, source: s } if rect == r && source == s),
             PushClip { rect, corner_radius } => matches!(other,
@@ -2778,7 +2777,7 @@ impl DrawCommand {
             DrawCommand::TextLine { origin, content, range, color, font } => {
                 DrawCommand::TextLine {
                     origin: Point { x: origin.x + by.x, y: origin.y + by.y },
-                    content: Arc::clone(content),
+                    content: content.clone(),
                     range: *range,
                     color: *color,
                     font: *font,
@@ -4777,7 +4776,8 @@ fn reaches(command: &DrawCommand, target: Rect, env: &LayoutEnv<'_>) -> bool {
     }
     match command {
         DrawCommand::TextLine { origin, content, range, font, .. } => {
-            let metrics = env.cache.get_or_measure(&content[range.0..range.1], font, env.text);
+            let Ok(line) = content.line(range.0..range.1) else { return false };
+            let metrics = env.cache.get_or_measure_paragraph(&line, font, env.text);
             // two points of slack each way: measure and raster round apart
             let ink = Rect {
                 origin: Point { x: origin.x - 2.0, y: origin.y - 2.0 },
@@ -7065,6 +7065,7 @@ impl LayoutNode {
                                 Point::ZERO,
                                 env.font,
                                 ink,
+                                env.cache,
                             );
                             crate::stats::note_paint();
                             motor::identity::begin_paint(path.as_str());
@@ -7113,7 +7114,7 @@ impl LayoutNode {
                 if !replayed {
                     let mut scratch = std::mem::take(&mut out.unseen);
                     let target = if unseen { &mut scratch } else { &mut out.display };
-                    let mut painter = crate::custom::Painter::new(target, frame.origin, env.font, ink);
+                    let mut painter = crate::custom::Painter::new(target, frame.origin, env.font, ink, env.cache);
                     crate::stats::note_paint();
                     motor::identity::begin_paint(path.as_str());
                     element.element().paint(&ctx, &mut painter);
@@ -7151,7 +7152,7 @@ impl LayoutNode {
                     let overlay_from = out.display.len();
                     out.push_clip(frame, 0.0);
                     let mut painter =
-                        crate::custom::Painter::new(&mut out.display, frame.origin, env.font, ink);
+                        crate::custom::Painter::new(&mut out.display, frame.origin, env.font, ink, env.cache);
                     let island = overlay_path(path);
                     motor::identity::begin_paint(&island);
                     let covered = element.element().paint_overlay(&ctx, &mut painter);
@@ -8836,7 +8837,7 @@ fn place_text(
         let cut = env.cache.get_or_measure(&composed, &env.font, env.text).width;
         out.draw(DrawCommand::TextLine {
             origin: Point { x: frame.origin.x + slide(cut), y: top },
-            content: composed,
+            content: env.cache.text_content(&composed),
             range: (0, length),
             color: base_color,
             font: env.font,
@@ -8861,7 +8862,7 @@ fn place_text(
                     x: frame.origin.x + slide(cut),
                     y: top + line_index as Px * advance,
                 },
-                content: composed,
+                content: env.cache.text_content(&composed),
                 range: (0, length),
                 color: base_color,
                 font: env.font,
@@ -8977,7 +8978,7 @@ fn emit_text_runs(
     let (line_start, line_end) = line;
     let whole = || DrawCommand::TextLine {
         origin,
-        content: content.clone(),
+        content: env.cache.text_content(content),
         range: (line_start, line_end),
         color: base_color,
         font: env.font,
@@ -9032,7 +9033,7 @@ fn emit_text_runs(
         };
         out.draw(DrawCommand::TextLine {
             origin: Point { x, y: origin.y },
-            content: content.clone(),
+            content: env.cache.text_content(content),
             range: (start, end),
             color: if hot { highlight.color } else { base_color },
             font: env.font,
@@ -9424,7 +9425,7 @@ mod tests {
         // to slice; the lines it did not touch still paint alike
         let line = |content: &Arc<str>, range: (usize, usize), y: f64| DrawCommand::TextLine {
             origin: Point { x: 8.0, y },
-            content: content.clone(),
+            content: content.clone().into(),
             range,
             color: Color::BLACK,
             font: FontSpec::DEFAULT,

@@ -111,7 +111,7 @@ pub fn scene(index: u32) -> (DisplayList, &'static str) {
         _ => {
             display.push(DrawCommand::TextLine {
                 origin: Point { x: 12.0, y: 40.0 },
-                content: std::sync::Arc::from("parity"),
+                content: "parity".into(),
                 range: (0, 6),
                 color: Color::rgba(30, 30, 40, 255),
                 font: crate::text_engine::FontSpec::DEFAULT,
@@ -146,7 +146,7 @@ pub fn bench_scene(logical: Size, nudge: f64) -> DisplayList {
         });
         display.push(DrawCommand::TextLine {
             origin: Point { x: 18.0, y: y + 12.0 },
-            content: std::sync::Arc::from("file_0000.rs"),
+            content: "file_0000.rs".into(),
             range: (0, 12),
             color: Color::rgba(30, 30, 40, 255),
             font: crate::text_engine::FontSpec::DEFAULT,

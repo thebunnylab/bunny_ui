@@ -358,6 +358,9 @@ pub const ATLAS_KEEP_WALKS: u64 = 8;
 #[derive(Debug)]
 pub struct AtlasFull;
 
+// Source keys have their own budget; GPU texels are managed independently.
+const ATLAS_SOURCE_LIMIT: usize = 16 * 1024 * 1024;
+
 /// One cached run: the engine's raster uploaded as chunk tiles. The
 /// color sits IN the key — the engine bakes it, which keeps emoji true
 /// and byte parity possible; a theme flip mints new tiles and the old
@@ -366,7 +369,7 @@ pub struct RunEntry {
     font: FontKey,
     color: u32,
     scale: u32,
-    content: String,
+    content: Option<crate::text_source::ParagraphLine>,
     pub tiles: Vec<Tile>,
     pub width: u32,
     pub height: u32,
@@ -381,7 +384,7 @@ fn packed_color(color: Color) -> u32 {
 
 /// The lookup hash — computed WITHOUT allocating (typing must never pay
 /// a String per warm frame); collisions resolve by comparing the entry.
-fn run_hash(font: FontKey, color: u32, scale: u32, content: &str) -> u64 {
+fn run_hash(font: FontKey, color: u32, scale: u32, content: &crate::text_source::ParagraphLine) -> u64 {
     // every text line of every presented frame passes here: the house
     // hash, not SipHash
     let mut hasher = motor::hash::FxHasher::default();
@@ -438,6 +441,8 @@ pub struct RunAtlas {
     pub size: u32,
     pub packer: ShelfPacker,
     pub entries: HashMap<u64, Vec<RunEntry>>,
+    source_weight: usize,
+    transient: Option<RunEntry>,
     pub images: HashMap<(u64, u32, u32), ImageEntry>,
     /// Images too big for a shelf get a texture of their own. Capped;
     /// overflow rides the same reset the atlas already does — but only
@@ -489,6 +494,8 @@ impl RunAtlas {
             size: ATLAS_INITIAL_SIZE,
             packer: ShelfPacker::new(ATLAS_INITIAL_SIZE, ATLAS_INITIAL_SIZE),
             entries: HashMap::new(),
+            source_weight: 0,
+            transient: None,
             images: HashMap::new(),
             dedicated: HashMap::new(),
             live: HashMap::new(),
@@ -525,6 +532,8 @@ impl RunAtlas {
             self.packer.reset();
         }
         self.entries.clear();
+        self.source_weight = 0;
+        self.transient = None;
         self.images.clear();
         for entry in self.dedicated.values() {
             ground.drop_dedicated(entry.id);
@@ -629,19 +638,41 @@ impl RunAtlas {
         scale: usize,
         engine: &dyn TextEngine,
     ) -> Result<Option<&RunEntry>, AtlasFull> {
+        let content = crate::text_source::TextContent::from(slice);
+        let Ok(line) = content.line(0..slice.len()) else { return Ok(None) };
+        self.resolve_paragraph(ground, &line, font, color, scale, engine)
+    }
+
+    /// Resolve a line whose cache identity retains its complete paragraph.
+    ///
+    /// # Errors
+    /// Returns `AtlasFull` if the scale cannot be represented or the shared
+    /// texture cannot accommodate this run. Source-budget eviction alone never
+    /// requests a texture reset or reuses in-flight texels.
+    pub fn resolve_paragraph(
+        &mut self,
+        ground: &mut dyn AtlasGround,
+        line: &crate::text_source::ParagraphLine,
+        font: &FontSpec,
+        color: Color,
+        scale: usize,
+        engine: &dyn TextEngine,
+    ) -> Result<Option<&RunEntry>, AtlasFull> {
+        self.transient = None;
+        let scale_key = u32::try_from(scale).map_err(|_| AtlasFull)?;
         let key = font.key();
         let packed = packed_color(color);
-        let hash = run_hash(key, packed, scale as u32, slice);
+        let hash = run_hash(key, packed, scale_key, line);
         let warm = self.entries.get(&hash).is_some_and(|bucket| {
             bucket.iter().any(|entry| {
                 entry.font == key
                     && entry.color == packed
-                    && entry.scale == scale as u32
-                    && entry.content == slice
+                    && entry.scale == scale_key
+                    && entry.content.as_ref() == Some(line)
             })
         });
         if !warm {
-            let Some(raster) = engine.raster_line(slice, font, color, scale) else {
+            let Some(raster) = engine.raster_paragraph_line(line, font, color, scale) else {
                 return Ok(None);
             };
             if !ground.ensure_shared(self.size) {
@@ -667,16 +698,30 @@ impl RunAtlas {
                 tiles.push(Tile { x, y, width: chunk_width, height });
                 chunk_x += chunk_width;
             }
-            self.entries.entry(hash).or_default().push(RunEntry {
+            let mut entry = RunEntry {
                 font: key,
                 color: packed,
-                scale: scale as u32,
-                content: slice.to_string(),
+                scale: scale_key,
+                content: Some(line.clone()),
                 tiles,
                 width,
                 height,
                 walk: self.walk,
-            });
+            };
+            // Metadata eviction never touches uploaded texels or frame instances.
+            // Oversized context is never retained; its tiles still serve this draw.
+            let weight = line.paragraph().text().len().saturating_mul(24).saturating_add(256);
+            if weight > ATLAS_SOURCE_LIMIT {
+                entry.content = None;
+                self.transient = Some(entry);
+                return Ok(self.transient.as_ref());
+            }
+            if self.source_weight + weight > ATLAS_SOURCE_LIMIT {
+                self.entries.clear();
+                self.source_weight = 0;
+            }
+            self.source_weight += weight;
+            self.entries.entry(hash).or_default().push(entry);
         }
         let walk = self.walk;
         let entry = self
@@ -686,11 +731,11 @@ impl RunAtlas {
                 bucket.iter_mut().find(|entry| {
                     entry.font == key
                         && entry.color == packed
-                        && entry.scale == scale as u32
-                        && entry.content == slice
+                        && entry.scale == scale_key
+                        && entry.content.as_ref() == Some(line)
                 })
             })
-            .expect("a run just resolved lives in the atlas");
+            .ok_or(AtlasFull)?;
         // read this walk: the collector keeps what a recent walk read
         entry.walk = walk;
         Ok(Some(&*entry))
@@ -744,6 +789,9 @@ impl RunAtlas {
             !bucket.is_empty()
         });
         self.images.retain(|_, image| !on_freed(&image.tiles));
+        self.source_weight = self.entries.values().flatten().map(|entry| {
+            entry.content.as_ref().map_or(0, |line| line.paragraph().text().len().saturating_mul(24).saturating_add(256))
+        }).sum();
         self.packer.free_shelves(&freed);
         freed.len()
     }
@@ -1277,7 +1325,8 @@ pub fn build_frame(
             }
             DrawCommand::TextLine { origin, content, range, color, font } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
-                let slice = &content[range.0..range.1];
+                let Ok(line) = content.line(range.0..range.1) else { continue };
+                let slice = line.text();
                 // the composite_text mirror: one snap of the logical
                 // origin, texels copied 1:1 from there
                 let base_x = (origin.x * factor).round() as i64;
@@ -1297,7 +1346,7 @@ pub fn build_frame(
                 if base_x + reach_x <= clip.0 || base_y + reach_y <= clip.1 {
                     continue;
                 }
-                let Some(entry) = atlas.resolve(ground, slice, font, *color, scale, engine)?
+                let Some(entry) = atlas.resolve_paragraph(ground, &line, font, *color, scale, engine)?
                 else {
                     continue;
                 };
@@ -1658,7 +1707,7 @@ mod tests {
         });
         display.push(DrawCommand::TextLine {
             origin: crate::layout::Point { x: 14.0, y: 32.0 },
-            content: std::sync::Arc::from("hi"),
+            content: crate::text_source::TextContent::from("hi"),
             range: (0, 2),
             color: Color::rgba(240, 240, 240, 255),
             font: FontSpec::DEFAULT,
@@ -1696,7 +1745,7 @@ mod tests {
         });
         display.push(DrawCommand::TextLine {
             origin: crate::layout::Point { x: 4.0, y: y + 2.0 },
-            content: std::sync::Arc::from(word),
+            content: crate::text_source::TextContent::from(word),
             range: (0, word.len()),
             color: Color::rgba(240, 240, 240, 255),
             font: FontSpec::DEFAULT,
@@ -1843,7 +1892,7 @@ mod tests {
                 display.push(DrawCommand::TextLine {
                     origin: crate::layout::Point { x: 12.0, y: row as f64 * 20.0 },
                     range: (0, label.len()),
-                    content: std::sync::Arc::from(label),
+                    content: crate::text_source::TextContent::from(label),
                     color: Color::rgba(240, 240, 240, 255),
                     font: FontSpec::DEFAULT,
                 });
@@ -1853,7 +1902,7 @@ mod tests {
             display.push(DrawCommand::TextLine {
                 origin: crate::layout::Point { x: 400.0, y: 1120.0 },
                 range: (0, aside.len()),
-                content: std::sync::Arc::from(aside),
+                content: crate::text_source::TextContent::from(aside),
                 color: Color::rgba(240, 240, 240, 255),
                 font: FontSpec::DEFAULT,
             });
@@ -2217,17 +2266,17 @@ mod tests {
             atlas.begin_walk();
             atlas.resolve(&mut ground, "the run still read", &font, Color::BLACK, 2, &engine).unwrap();
         }
-        let old_before = atlas.entries.values().flatten().filter(|entry| entry.content.starts_with("an old")).count();
+        let old_before = atlas.entries.values().flatten().filter(|entry| entry.content.as_ref().is_some_and(|line| line.text().starts_with("an old"))).count();
         assert_eq!(old_before, 50);
         let freed = atlas.evict_stale(ATLAS_KEEP_WALKS);
         assert!(freed >= 1, "shelves nobody read are given back: {freed}");
         assert!(freed < shelves, "the shelf of the run still read stands");
         assert_eq!(atlas.packer.next_y, rows_used, "no reset: the shelves keep their rows");
         assert_eq!(ground.drops, 0, "no reset: the texture stands");
-        let old_after = atlas.entries.values().flatten().filter(|entry| entry.content.starts_with("an old")).count();
+        let old_after = atlas.entries.values().flatten().filter(|entry| entry.content.as_ref().is_some_and(|line| line.text().starts_with("an old"))).count();
         assert!(old_after < old_before, "the old runs on the freed shelves are forgotten: {old_after} of {old_before}");
         assert!(
-            atlas.entries.values().flatten().any(|entry| entry.content == "the run still read"),
+            atlas.entries.values().flatten().any(|entry| entry.content.as_ref().is_some_and(|line| line.text() == "the run still read")),
             "the run still read stands"
         );
         // the freed shelves take new tiles at their left edge
@@ -2238,3 +2287,7 @@ mod tests {
         assert_eq!(atlas.packer.next_y, rows_used, "on a freed shelf, not a new row");
     }
 }
+
+#[cfg(test)]
+#[path = "paragraph_cache_tests.rs"]
+mod paragraph_tests;

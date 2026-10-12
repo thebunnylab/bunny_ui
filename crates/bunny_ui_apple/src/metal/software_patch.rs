@@ -172,7 +172,8 @@ impl Scene {
                     if bytes > MAX_TEXT_BYTES {
                         return None;
                     }
-                    let metrics = cache.get_or_measure(&content[range.0..range.1], font, text);
+                    let line = content.line(range.0..range.1).ok()?;
+                    let metrics = cache.get_or_measure_paragraph(&line, font, text);
                     if !metrics.width.is_finite() || !metrics.height().is_finite() {
                         return None;
                     }
@@ -404,12 +405,12 @@ fn measured_candidates(
             ..
         } = command
         {
-            let line = content.get(range.0..range.1)?;
+            let line = content.line(range.0..range.1).ok()?;
             // Do not shape an unbounded line just to decide to reject it.
-            if line.len() > MAX_TEXT_BYTES {
+            if line.text().len() > MAX_TEXT_BYTES {
                 return None;
             }
-            let metrics = cache.get_or_measure(line, font, text);
+            let metrics = cache.get_or_measure_paragraph(&line, font, text);
             let x = (origin.x * factor).round();
             let y = (origin.y * factor).round();
             let width = (metrics.width * factor).ceil();
@@ -473,11 +474,14 @@ pub(super) fn patch_coordinates(
                 } => {
                     *origin = point(*origin);
                     // Native scenes can outlive their source frame, including
-                    // hidden patches. Retain only the visible text of a large
-                    // document, before any scene or raster witness owns it.
-                    if content.len() > 4096 && range.1 - range.0 < content.len() / 4 {
-                        *content = std::sync::Arc::from(&content[range.0..range.1]);
-                        *range = (0, content.len());
+                    // hidden patches. Retain the complete shaping paragraph of
+                    // a large document before a scene or raster witness owns it.
+                    if content.len() > 4096 && range.1 - range.0 < content.len() / 4
+                        && let Ok(line) = content.line(range.0..range.1)
+                    {
+                        let bytes = line.bytes();
+                        *content = line.paragraph().clone().into();
+                        *range = (bytes.start, bytes.end);
                     }
                 }
                 DrawCommand::PopClip => {}
@@ -1270,7 +1274,7 @@ mod tests {
             let end = start + "visible é🎨".len();
             let display = DisplayList::from(vec![DrawCommand::TextLine {
                 origin: Point { x: 1.5, y: 2.5 },
-                content,
+                content: content.into(),
                 range: (start, end),
                 color: Color::BLACK,
                 font: FontSpec::DEFAULT,
@@ -1321,7 +1325,7 @@ mod tests {
             let weak = std::sync::Arc::downgrade(&content);
             let display = DisplayList::from(vec![DrawCommand::TextLine {
                 origin: Point { x: 1.0, y: 1.0 },
-                content,
+                content: content.into(),
                 range: (0, 7),
                 color: Color::BLACK,
                 font: FontSpec::DEFAULT,
@@ -1781,7 +1785,9 @@ mod tests {
         }
         let text = Counting(std::cell::Cell::new(0));
         let cache = MeasureCache::default();
-        cache.get_or_measure("cached", &FontSpec::DEFAULT, &text);
+        let source = bunny_ui::text_source::TextContent::from("cached");
+        let line = source.line(0..source.len()).unwrap();
+        cache.get_or_measure_paragraph(&line, &FontSpec::DEFAULT, &text);
         let mut commands = vec![fill()];
         for x in [8.0, 600.0] {
             commands.push(DrawCommand::TextLine {

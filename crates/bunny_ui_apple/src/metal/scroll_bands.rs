@@ -8,6 +8,7 @@ use bunny_ui::layout::{DrawCommand, Rect};
 use bunny_ui::raster::{Bitmap, rasterize_with};
 use bunny_ui::text_engine::{FontKey, FontSpec, LineMetrics, TextRaster};
 use std::cell::{Cell, RefCell};
+use bunny_ui::text_source::{ParagraphLine, TextContent};
 use std::time::{Duration, Instant};
 
 const MAX_BANDS: usize = 128;
@@ -59,11 +60,11 @@ fn ink(
             font,
             ..
         } => {
-            let line = content.get(range.0..range.1)?;
-            if line.len() > 4096 {
+            let line = content.line(range.0..range.1).ok()?;
+            if line.text().len() > 4096 {
                 return None;
             }
-            let metrics = cache.get_or_measure(line, font, text);
+            let metrics = cache.get_or_measure_paragraph(&line, font, text);
             let factor = scale as f64;
             let x = (origin.x * factor).round();
             let y = (origin.y * factor).round();
@@ -620,8 +621,9 @@ impl Scene {
     }
 }
 
-type RasterKey = (FontKey, [u8; 4], usize, String);
+type RasterKey = (FontKey, [u8; 4], usize, ParagraphLine);
 struct CachedRaster {
+    weight: usize,
     pixels: TextRaster,
     used: u64,
 }
@@ -652,9 +654,22 @@ impl TextEngine for CachedText<'_> {
     fn measure_line(&self, line: &str, font: &FontSpec) -> LineMetrics {
         self.engine.measure_line(line, font)
     }
-    fn raster_line(
+    fn line_geometry(&self, text: &str, font: &FontSpec) -> Option<bunny_ui::text_geometry::LineGeometry> {
+        self.engine.line_geometry(text, font)
+    }
+    fn measure_paragraph_line(&self, line: &ParagraphLine, font: &FontSpec) -> LineMetrics {
+        self.engine.measure_paragraph_line(line, font)
+    }
+    fn paragraph_line_geometry(&self, line: &ParagraphLine, font: &FontSpec) -> Option<bunny_ui::text_geometry::LineGeometry> {
+        self.engine.paragraph_line_geometry(line, font)
+    }
+    fn raster_line(&self, text: &str, font: &FontSpec, color: Color, scale: usize) -> Option<TextRaster> {
+        let content = TextContent::from(text);
+        self.raster_paragraph_line(&content.line(0..text.len()).ok()?, font, color, scale)
+    }
+    fn raster_paragraph_line(
         &self,
-        line: &str,
+        line: &ParagraphLine,
         font: &FontSpec,
         color: Color,
         scale: usize,
@@ -666,28 +681,31 @@ impl TextEngine for CachedText<'_> {
             font.key(),
             [color.r, color.g, color.b, color.a],
             scale,
-            line.to_owned(),
+            line.clone(),
         );
         let mut entries = cache.entries.borrow_mut();
         if let Some(raster) = entries.get_mut(&key) {
             raster.used = tick;
             return Some(copy_raster(&raster.pixels));
         }
-        let raster = self.engine.raster_line(line, font, color, scale)?;
+        let raster = self.engine.raster_paragraph_line(line, font, color, scale)?;
         const LIMIT: usize = 2 * 1024 * 1024;
-        if raster.rgba.len() <= LIMIT {
-            while cache.bytes.get() + raster.rgba.len() > LIMIT || entries.len() >= 256 {
+        // The key retains paragraph text and its lazy scalar map as well as pixels.
+        let weight = raster.rgba.len().saturating_add(line.paragraph().text().len().saturating_mul(24)).saturating_add(256);
+        if weight <= LIMIT {
+            while cache.bytes.get() + weight > LIMIT || entries.len() >= 256 {
                 let key = entries
                     .iter()
                     .min_by_key(|(_, raster)| raster.used)
                     .map(|(key, _)| key.clone())?;
                 let old = entries.remove(&key)?;
-                cache.bytes.set(cache.bytes.get() - old.pixels.rgba.len());
+                cache.bytes.set(cache.bytes.get() - old.weight);
             }
-            cache.bytes.set(cache.bytes.get() + raster.rgba.len());
+            cache.bytes.set(cache.bytes.get() + weight);
             entries.insert(
                 key,
                 CachedRaster {
+                    weight,
                     pixels: copy_raster(&raster),
                     used: tick,
                 },
@@ -2083,3 +2101,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "paragraph_cache_tests.rs"]
+mod paragraph_tests;
