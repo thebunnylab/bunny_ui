@@ -315,3 +315,6 @@ fn paragraph_original_context_windows_refuse_split_clusters_and_oversized_graphe
     assert!(error.contains("oversized original context"), "{error}");
     eprintln!("original-context explicit refusal: {error}");
 }
+
+#[path = "text_glyph_dependency_tests.rs"]
+mod dependencies;
