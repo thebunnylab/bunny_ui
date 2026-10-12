@@ -77,6 +77,11 @@ impl<'a> Renderer<'a> {
             return Err(failure("glyph origin"));
         }
         let glyphs = GlyphRun::from_run(run, range)?;
+        // GetGlyphs/GetGlyphPlacements can return visible control glyphs even
+        // for SCRIPT_SHAPES_NO_VISUAL. Layout must honor that native flag.
+        if run.visibility == super::super::Visibility::Control {
+            return Ok(());
+        }
         match &self.mode {
             Mode::Native(context) => {
                 // SAFETY: the context, brush and all glyph buffers have owners

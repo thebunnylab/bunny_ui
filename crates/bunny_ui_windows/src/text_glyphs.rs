@@ -161,6 +161,11 @@ impl Shaper {
                     face,
                     em_size,
                     level,
+                    visibility: if script.shapes & 1 == 0 {
+                        Visibility::Ink
+                    } else {
+                        Visibility::Control
+                    },
                     clusters: output.clusters,
                     glyphs: output.glyphs,
                     advances: output.advances,
@@ -372,11 +377,17 @@ struct Input<'a> {
     em_size: f32,
     locale: &'a [u16],
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Visibility {
+    Ink,
+    Control,
+}
 struct Run {
     source: Range<usize>,
     face: Com<ffi::Face>,
     em_size: f32,
     level: u8,
+    visibility: Visibility,
     clusters: Vec<u16>,
     glyphs: Vec<u16>,
     advances: Vec<f32>,
@@ -384,6 +395,9 @@ struct Run {
 }
 impl Run {
     fn width(&self) -> f64 {
+        if self.visibility == Visibility::Control {
+            return 0.0;
+        }
         self.advances
             .iter()
             .map(|&advance| f64::from(advance))

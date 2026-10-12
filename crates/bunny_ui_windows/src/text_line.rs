@@ -141,7 +141,11 @@ fn append_clusters(
             .advances
             .get(glyphs.clone())
             .ok_or_else(|| preparation("line glyph cluster bounds"))?;
-        let width: f64 = advances.iter().map(|&value| f64::from(value)).sum();
+        let width: f64 = if run.visibility == glyphs::Visibility::Control {
+            0.0
+        } else {
+            advances.iter().map(|&value| f64::from(value)).sum()
+        };
         let source = run.source.start + position..run.source.start + end;
         // A retained joiner may share its glyph with a visible letter. Reorder
         // their indivisible native cluster by that letter, never cut its shape.

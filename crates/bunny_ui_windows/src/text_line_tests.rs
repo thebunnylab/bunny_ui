@@ -88,15 +88,12 @@ fn paragraph_line_levels_and_order_match_independent_native_wraps() {
     let factories = engine.factories.as_ref().unwrap();
     let mut discrepancies = Vec::new();
     for text in [
-        "\u{202e}ab  \u{202c}",
-        "\u{202e}ab  \u{2069}\u{202c}",
         "\u{202e}abc def ghi jkl mno\u{202c}",
         "\u{202d}אבג דהו זחט יכל מנס\u{202c}",
         "abc \u{2067}אבג (123) דהו\u{2069} xyz",
         "abc العربية 123 אבג def",
         "אבג\u{2003}\u{2002}דהו\u{2003}\u{2002}",
         "\u{202e}ab 😀 cd ef gh\u{202c}  ",
-        "\u{202e}ab  \u{2069}\u{202c}\ncd ef",
         "\u{202e}ab  \u{2029}cd ef",
     ] {
         let prepared = Prepared::new(factories, text).unwrap();
@@ -214,13 +211,17 @@ fn paragraph_line_visual_clusters_match_native_positions_without_reshaping_joine
     }
 }
 
-fn reference_pixels(surface: &glyphs::raster::Surface, layout: &Com<IDWriteTextLayout>) -> Vec<u8> {
+fn reference_pixels(
+    surface: &glyphs::raster::Surface,
+    layout: &Com<IDWriteTextLayout>,
+    color: crate::text::Color,
+) -> Vec<u8> {
     use crate::text::{D2D1_DRAW_TEXT_COLOR_FONT, D2dColor, D2dPoint};
     let ink = D2dColor {
-        r: 0.0,
-        g: 0.0,
-        b: 0.0,
-        a: 1.0,
+        r: f32::from(color.r) / 255.0,
+        g: f32::from(color.g) / 255.0,
+        b: f32::from(color.b) / 255.0,
+        a: f32::from(color.a) / 255.0,
     };
     surface
         .paint(|target| {
@@ -276,7 +277,7 @@ fn paragraph_line_visual_spans_match_independent_wrapped_native_pixels() {
             let (layout, ranges) = wrapped_layout(&engine, text, width);
             for scale in [1.0_f32, 2.0] {
                 let surface = Surface::new(factories, 640, 640, scale).unwrap();
-                let expected = reference_pixels(&surface, &layout);
+                let expected = reference_pixels(&surface, &layout, Color::BLACK);
                 let actual = engine
                     .with_slot(&font, |slot| {
                         let base = glyphs::BaseFont::new(slot, &font).unwrap();
@@ -355,5 +356,49 @@ fn pixel_diagnostics(expected: &[u8], actual: &[u8]) {
             }
         }
         eprintln!("{label} nonempty rows: {rows:?}");
+    }
+}
+
+#[test]
+fn paragraph_line_unicode_l1_records_native_trailing_format_control_divergence() {
+    let engine = DirectWriteEngine::new();
+    for text in [
+        "\u{202e}ab  \u{202c}",
+        "\u{202e}ab  \u{2069}\u{202c}",
+        "\u{202e}ab  \u{2069}\u{202c}\ncd ef",
+    ] {
+        let prepared = Prepared::new(engine.factories.as_ref().unwrap(), text).unwrap();
+        let (layout, ranges) = wrapped_layout(&engine, text, 130.0);
+        let levels = prepared.line_levels(ranges[0].clone()).unwrap();
+        assert_eq!(&levels[1..5], &[1, 1, 0, 0]);
+        let mut visible = [
+            (1, levels[1]),
+            (2, levels[2]),
+            (3, levels[3]),
+            (4, levels[4]),
+        ];
+        bidi::reorder(&mut visible, |&(_, level)| level);
+        assert_eq!(visible.map(|(index, _)| index), [2, 1, 3, 4]);
+        let mut native: Vec<_> = (1..5).map(|index| (index, hit(&layout, index))).collect();
+        native.sort_by(|a, b| a.1.left.total_cmp(&b.1.left));
+        let order: Vec<_> = native.iter().map(|(index, _)| *index).collect();
+        // Unicode 17 BidiTest RLO L WS PDF (source manifest) requires WS=0.
+        // Server 2025 keeps WS=1 before a retained PDF, putting it before the
+        // letters. Preserve this exact discrepancy rather than using that native
+        // result as the normative oracle or claiming whole-corpus native parity.
+        if order == [2, 1, 3, 4] {
+            assert_eq!(hit(&layout, 3).bidi_level, 0);
+        } else {
+            assert_eq!(
+                order,
+                [4, 3, 2, 1],
+                "unclassified native L1 divergence: {text:?}"
+            );
+            assert_eq!(hit(&layout, 3).bidi_level, 1);
+            assert_eq!(hit(&layout, 4).bidi_level, 1);
+            eprintln!(
+                "Unicode17 L1/native divergence: {text:?}; normative [2,1,3,4], native {order:?}"
+            );
+        }
     }
 }

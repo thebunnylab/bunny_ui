@@ -57,3 +57,17 @@ fn paragraph_line_l2_reverses_through_missing_intermediate_levels() {
         );
     }
 }
+
+#[test]
+fn paragraph_line_l1_matches_official_unicode_17_trailing_pdf_case() {
+    // Unicode 17 BidiTest.txt, line 111785: RLO L WS PDF; 3
+    // @Levels: x 1 0 x; @Reorder: 1 2 (auto-LTR and explicit-LTR).
+    // Explicit formatting levels marked x are excluded by the official oracle.
+    let classes = [Class::Retained, Class::Other, Class::Reset, Class::Retained];
+    let mut levels = [0, 1, 1, 0];
+    reset_line(&classes, &mut levels, 0);
+    assert_eq!(&levels[1..3], &[1, 0]);
+    let mut visible = [(1, levels[1]), (2, levels[2])];
+    reorder(&mut visible, |&(_, level)| level);
+    assert_eq!(visible.map(|(index, _)| index), [1, 2]);
+}
