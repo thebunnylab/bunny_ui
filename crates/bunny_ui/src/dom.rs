@@ -328,6 +328,13 @@ pub struct DomLook {
     /// the radius already on the box: the browser cuts the subtree to
     /// the curve as a LAYER, its own native rounded clip.
     pub clip: bool,
+    /// `.hidden()` — the glue's `visibility:hidden`: the box keeps its
+    /// place in the flow, paints nothing and takes no pointer, as the
+    /// pixel pipelines keep the place and skip the subtree. Flow is a
+    /// CSS layout, so a box left out would not keep its place — the
+    /// sibling would move up — which is why the capture's answer
+    /// cannot be the flow's.
+    pub hidden: bool,
     /// `.opacity(…)` and its two states. In THIS mode the fade is a
     /// real LAYER — the browser composites the subtree once — which is
     /// strictly better than the per-command multiply the pixel
@@ -385,6 +392,7 @@ impl DomLook {
         focus_border: None,
         placeholder_color: None,
         clip: false,
+        hidden: false,
         opacity: None,
         hover_opacity: None,
         pressed_opacity: None,
@@ -409,6 +417,7 @@ impl DomLook {
             focus_border: None,
             placeholder_color: None,
             clip: props.clip,
+            hidden: props.hidden,
             opacity: props.opacity,
             hover_opacity: props.opacity_hovered,
             pressed_opacity: props.opacity_pressed,
@@ -433,6 +442,7 @@ impl DomLook {
             || props.corner_radius.is_some()
             || props.shadow.is_some()
             || props.clip
+            || props.hidden
             || props.opacity.is_some()
             || props.opacity_hovered.is_some()
             || props.opacity_pressed.is_some()
@@ -2069,6 +2079,7 @@ fn look_hash(node: &DomNode) -> u64 {
     style.shadow.map(|(radius, color)| (radius.to_bits(), u32::from_be_bytes([color.r, color.g, color.b, color.a]))).hash(&mut hasher);
     style.transition.map(|(response, damping)| (response.to_bits(), damping.to_bits())).hash(&mut hasher);
     style.clip.hash(&mut hasher);
+    style.hidden.hash(&mut hasher);
     hash_f64(style.opacity, &mut hasher);
     hash_f64(style.hover_opacity, &mut hasher);
     hash_f64(style.pressed_opacity, &mut hasher);
@@ -3953,6 +3964,10 @@ pub const ABI_VERSION: u32 = 20;
 ///                      capture time, because an element has one
 ///                      background colour and the tint sits under
 ///                      whatever the box paints itself
+///                   24 hidden (no payload — the bit IS the value):
+///                      visibility:hidden, the box keeps its place in
+///                      the flow and paints nothing, as `.hidden()`
+///                      does in the pixel pipelines
 ///   6 set text      u32 rgba, u8 inherits ink (1 = no color of its
 ///                   own — the box above owns both states),
 ///                   f32 size, u8 weight, u8 mono, u8 italic,
@@ -4368,6 +4383,10 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
     if style.pass_through {
         // payload-free, like the clip bit: the bit IS the value
         mask |= 1 << 21;
+    }
+    if style.hidden {
+        // payload-free, like the clip bit: the bit IS the value
+        mask |= 1 << 24;
     }
     if style.glass.is_some() {
         mask |= 1 << 23;
@@ -6605,6 +6624,7 @@ mod tests {
             focus_border: Some(Color::hex(0x8899AA)),
             placeholder_color: Some(Color::hex(0x99AABB)),
             clip: true,
+            hidden: false,
             opacity: Some(0.5),
             hover_opacity: Some(0.75),
             pressed_opacity: Some(0.25),
@@ -6632,15 +6652,15 @@ mod tests {
             inherits_face: false,
         });
         let plain = flow_row("c");
-        assert_eq!(look_hash(&boxed), 0x14d3_3cb5_f0e2_1ffa);
-        assert_eq!(look_hash(&words), 0xaeb5_8869_66cf_63d7);
-        assert_eq!(look_hash(&plain), 0x5727_5724_1e9c_57df);
+        assert_eq!(look_hash(&boxed), 0xc6a2_35e5_858f_ec6f);
+        assert_eq!(look_hash(&words), 0x80c1_7ab4_826a_edc3);
+        assert_eq!(look_hash(&plain), 0xe7fd_ea19_a8cf_c332);
         // the element's own parts wear the same rule
         boxed.style.interactive = Some(Rc::from("a/b"));
         boxed.style.set_tooltip(Some(Arc::from("tip")));
         boxed.style.set_group_owner(Some(9));
         boxed.layout.as_mut().expect("flow").slot_y = Some(40.0);
-        assert_eq!(look_hash(&boxed), 0x14d3_3cb5_f0e2_1ffa);
+        assert_eq!(look_hash(&boxed), 0xc6a2_35e5_858f_ec6f);
     }
 
     #[test]
@@ -6661,6 +6681,28 @@ mod tests {
         let mut expected = without.clone();
         expected[MASK_AT + 1] |= 0x40;
         assert_eq!(with, expected);
+    }
+
+    /// `.hidden()` on the web: a payload-free bit of its own, past the
+    /// glass's, and a look that is nothing but hidden is still a look —
+    /// so a hidden text keeps its box in the flow rather than lowering
+    /// as inline ink.
+    #[test]
+    fn a_hidden_box_sets_the_visibility_bit_and_nothing_else() {
+        let bare = DomLook { background: Some(Color::hex(0x123456)), ..DomLook::default() };
+        let unseen = DomLook { hidden: true, ..bare.clone() };
+        assert_ne!(DomLook { hidden: true, ..DomLook::NONE }, DomLook::NONE, "a hidden-only look is a look");
+        let without = encode(&[define(bare)]);
+        let with = encode(&[define(unseen)]);
+        assert_eq!(with.len(), without.len(), "the bit carries no payload");
+        let mask = u32::from_le_bytes([with[MASK_AT], with[MASK_AT + 1], with[MASK_AT + 2], with[MASK_AT + 3]]);
+        assert_eq!(mask & (1 << 24), 1 << 24, "bit 24 says the box is unseen");
+        let mut expected = without.clone();
+        expected[MASK_AT + 3] |= 0x01;
+        assert_eq!(with, expected);
+        let props = VisualProps { hidden: true, ..VisualProps::default() };
+        assert!(DomLook::paints(&props), "a hidden text keeps its box in the flow, never inline ink");
+        assert_eq!(DomLook::from_props(&props), DomLook { hidden: true, ..DomLook::NONE });
     }
 
     #[test]
