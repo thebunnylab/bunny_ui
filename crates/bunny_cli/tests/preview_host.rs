@@ -5,7 +5,7 @@
 //! Every step prints `@@bunny-timing <step> <ms>`, and under
 //! `BUNNY_TIMING_STRICT=1` the budgets of NFR-STUDIO-1 are asserted:
 //! a warm start to the first frame within 3 s, a save to its frame within
-//! 800 ms, a click to its frame within 20 ms.
+//! 800 ms, a click and an override to their frames within 20 ms each.
 //!
 //! Slow — it builds the framework as a shared library — so it runs on
 //! request: `cargo test -p bunny-cli --test preview_host -- --ignored`.
@@ -16,7 +16,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use bunny_cli::preview::{Event, Options, Preview, Step};
-use bunny_ui_preview::wire::{Frame, PointerKind, Selection, ToHost, ToIde, Traits};
+use bunny_ui_preview::wire::{Frame, OverrideOp, Patch, PointerKind, Selection, SiteKey, ToHost, ToIde, Traits};
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().to_path_buf()
@@ -160,6 +160,35 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
     });
     timing("click", began.elapsed(), Some(Duration::from_millis(20)));
     assert!(frame.seq >= 2);
+
+    // an override: the stack's padding replaced, the picture moving before any build
+    let padding = frame
+        .sites
+        .iter()
+        .find(|site| site.modifier.is_some_and(|name| frame.strings.get(name as usize).is_some_and(|name| name == "padding")))
+        .expect("the padding has a site");
+    let site = SiteKey { file: frame.strings[padding.file.expect("a recorded site") as usize].clone(), line: padding.line, column: padding.column };
+    let text_x = |frame: &Frame| {
+        frame.commands.iter().find_map(|command| match command {
+            bunny_ui_preview::wire::Draw::TextLine { origin, .. } => Some(origin.x),
+            _ => None,
+        })
+    };
+    let before = text_x(&frame).expect("a text line");
+    let began = Instant::now();
+    live.send(&ToHost::Override { id: home.id.clone(), site: site.clone(), op: OverrideOp::Replace, patch: Patch::PaddingLength(64.0) }).unwrap();
+    let frame = expect(&mut live, Duration::from_secs(10), |message| match message {
+        ToIde::Frame(frame) if frame.preview == "home_preview" && text_x(frame).is_some_and(|x| x != before) => Some(frame.clone()),
+        _ => None,
+    });
+    timing("override", began.elapsed(), Some(Duration::from_millis(20)));
+    assert!(text_x(&frame).unwrap() > before, "the text moved right under the wider padding");
+    live.send(&ToHost::ClearOverrides { id: home.id.clone() }).unwrap();
+    let frame = expect(&mut live, Duration::from_secs(10), |message| match message {
+        ToIde::Frame(frame) if frame.preview == "home_preview" && text_x(frame) == Some(before) => Some(frame.clone()),
+        _ => None,
+    });
+    assert!(says(&frame, "You tapped 1 times"), "the count survived the override: {:?}", frame.strings);
 
     // a save: the label changes, the count stays
     let lib = app.join("src/lib.rs");

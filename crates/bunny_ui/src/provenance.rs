@@ -37,14 +37,124 @@
 //! - **A folded modifier is still two sites.** `.padding().padding()`
 //!   folds into one `Padding` node when recording is off; on, each keeps
 //!   its wrapper and the geometry stays the same.
+//!
+//! ## Overrides
+//!
+//! The other direction of the canvas: a tool puts a modifier on a site
+//! before the code says so ([`set_overrides`], keyed by [`SiteKey`]), and
+//! the next pass shows it — a `Replace` stands in for the modifier written
+//! at the site, an `Append` goes on top of whatever the site renders, a
+//! `Hide` keeps the node's place and paints nothing. The table is the
+//! thread's, versioned like the theme: a moved table rebuilds every
+//! runtime's retention once (the nodes baked the modifiers they were built
+//! with), and [`clear_overrides`] puts the code back in charge. Cost when
+//! empty: one `Cell` read per seal.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 pub use motor::runtime::Site;
+use motor::state::Context;
 
 use crate::layout::{LayoutNode, Rect};
+use crate::modifier::Modifier;
 use crate::view::NodeList;
+
+// =============================================================================
+// Overrides — a modifier put on a site before the code says so
+// =============================================================================
+
+/// Where a node was written, as a key a tool names it by: the file, the
+/// line and the column of its call site.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SiteKey {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+impl SiteKey {
+    /// The key of a site the compiler recorded; a site the framework
+    /// named itself has none.
+    pub fn of(site: Site) -> Option<SiteKey> {
+        match site {
+            Site::Caller(location) => Some(SiteKey { file: location.file().to_string(), line: location.line(), column: location.column() }),
+            Site::Named(_) => None,
+        }
+    }
+}
+
+/// What an override does at its site — the designer's gesture on the
+/// picture before the real edit is compiled.
+#[derive(Clone)]
+pub enum Override {
+    /// The modifier written at the site stands aside for this one (a
+    /// modifier site only; on a builder's site it appends).
+    Replace(Modifier),
+    /// This modifier goes on top of what the site renders.
+    Append(Modifier),
+    /// The node keeps its place and paints nothing.
+    Hide,
+}
+
+impl std::fmt::Debug for Override {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Override::Replace(modifier) => write!(f, "Replace({})", modifier.name()),
+            Override::Append(modifier) => write!(f, "Append({})", modifier.name()),
+            Override::Hide => f.write_str("Hide"),
+        }
+    }
+}
+
+thread_local! {
+    static OVERRIDES: RefCell<HashMap<SiteKey, Vec<Override>>> = RefCell::new(HashMap::new());
+    static OVERRIDES_VERSION: Cell<u64> = const { Cell::new(0) };
+    static HAS_OVERRIDES: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Replaces the thread's overrides with these, and bumps the version
+/// every runtime compares — the next pass rebuilds the retention once,
+/// the way an installed theme does, since the nodes baked the modifiers
+/// they were built with. Several overrides on one site apply in order.
+pub fn set_overrides(overrides: impl IntoIterator<Item = (SiteKey, Override)>) {
+    let mut table: HashMap<SiteKey, Vec<Override>> = HashMap::new();
+    for (site, override_) in overrides {
+        table.entry(site).or_default().push(override_);
+    }
+    HAS_OVERRIDES.with(|has| has.set(!table.is_empty()));
+    OVERRIDES.with(|current| *current.borrow_mut() = table);
+    OVERRIDES_VERSION.with(|version| version.set(version.get() + 1));
+}
+
+/// Takes every override away; the code says what the picture shows again.
+pub fn clear_overrides() {
+    set_overrides(std::iter::empty());
+}
+
+/// The overrides' version — whoever retains what they built compares it.
+pub fn overrides_version() -> u64 {
+    OVERRIDES_VERSION.with(Cell::get)
+}
+
+/// The overrides at `site`, when the table has any.
+pub(crate) fn overrides_at(site: Site) -> Option<Vec<Override>> {
+    if !HAS_OVERRIDES.with(Cell::get) {
+        return None;
+    }
+    let key = SiteKey::of(site)?;
+    OVERRIDES.with(|table| table.borrow().get(&key).cloned())
+}
+
+/// The modifier a `Replace` at `site` puts in place of the one written
+/// there — the first, when several.
+pub(crate) fn replacement_at(site: Site) -> Option<Modifier> {
+    overrides_at(site)?.into_iter().find_map(|override_| match override_ {
+        Override::Replace(modifier) => Some(modifier),
+        Override::Append(_) | Override::Hide => None,
+    })
+}
 
 /// What kind of node a site made — the word a tool shows beside the line.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -156,7 +266,21 @@ pub(crate) fn here() -> Site {
 /// Wrap the node a builder or a modifier left at `mark` in its site, when
 /// recording; nothing otherwise, so a pass that nobody is watching is the
 /// pass it always was.
-pub(crate) fn seal(out: &mut NodeList, mark: usize, site: Site, kind: NodeKind, modifier: Option<&'static str>) {
+pub(crate) fn seal(ctx: &Context, out: &mut NodeList, mark: usize, site: Site, kind: NodeKind, modifier: Option<&'static str>) {
+    // the overrides on this site go on top of what it rendered: an
+    // appended modifier, or the node hidden. A `Replace` on a modifier's
+    // site was taken by the modifier's own render; on a builder's it is
+    // an append, since there is nothing to stand aside.
+    if let Some(overrides) = overrides_at(site) {
+        for override_ in &overrides {
+            match override_ {
+                Override::Append(added) => crate::modifier::apply(added, ctx, ctx, out, mark),
+                Override::Replace(added) if modifier.is_none() => crate::modifier::apply(added, ctx, ctx, out, mark),
+                Override::Replace(_) => {}
+                Override::Hide => crate::modifier::apply(&Modifier::Hidden, ctx, ctx, out, mark),
+            }
+        }
+    }
     if !recording() {
         return;
     }

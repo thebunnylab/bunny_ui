@@ -322,6 +322,11 @@ pub struct Runtime {
     /// The code version the last pass saw ([`code_changed`]): new code
     /// rebuilds the retention once, the way a new theme does.
     code_version: Cell<u64>,
+    /// The overrides version the last pass saw
+    /// ([`crate::provenance::set_overrides`]): a moved table rebuilds the
+    /// retention once, the way a new theme does — the nodes baked the
+    /// modifiers they were built with.
+    overrides_version: Cell<u64>,
     /// The app keymap: key pattern → action. Runtime config (like the
     /// text engine), not retention — bind is a declaration of intent.
     keymap: RefCell<HashMap<KeyPattern, ActionId>>,
@@ -1690,6 +1695,7 @@ impl Runtime {
             theme: RefCell::new(None),
             theme_moved: Cell::new(false),
             code_version: Cell::new(code_version()),
+            overrides_version: Cell::new(crate::provenance::overrides_version()),
             keymap: RefCell::new(HashMap::default()),
             scoped_keymap: RefCell::new(HashMap::default()),
             chords: RefCell::new(Vec::new()),
@@ -1852,6 +1858,13 @@ impl Runtime {
         let code_version = code_version();
         if self.code_version.get() != code_version {
             self.code_version.set(code_version);
+            self.invalidate_scene();
+        }
+        // the same for a moved override table: the retained nodes carry
+        // the modifiers of the last table
+        let overrides_version = crate::provenance::overrides_version();
+        if self.overrides_version.get() != overrides_version {
+            self.overrides_version.set(overrides_version);
             self.invalidate_scene();
         }
         // the same for a moved environment: a body that read the size
@@ -5046,6 +5059,7 @@ impl Runtime {
             paints: motor::identity::has_dirty_paints(),
             theme: crate::theme::version() != self.theme_version.get(),
             code: code_version() != self.code_version.get(),
+            overrides: crate::provenance::overrides_version() != self.overrides_version.get(),
             environment: self.env_moved.get(),
             insets: self.last_insets.get() != self.frame_insets(),
             webview: reconciler::has_webview_commands(),
@@ -7630,6 +7644,7 @@ impl Runtime {
             && !motor::task::has_ready()
             && crate::theme::version() == self.theme_version.get()
             && code_version() == self.code_version.get()
+            && crate::provenance::overrides_version() == self.overrides_version.get()
             && !self.env_moved.get()
             && self.last_insets.get() == self.frame_insets()
             && !self.has_pending_dirty()
@@ -7668,6 +7683,7 @@ impl Runtime {
         (self.last_root_type.get() == Some(root)
             && crate::theme::version() == self.theme_version.get()
             && code_version() == self.code_version.get()
+            && crate::provenance::overrides_version() == self.overrides_version.get()
             && !self.env_moved.get()
             && !self.has_pending_dirty())
         .then(|| self.root_boundary.borrow().clone())
@@ -7877,6 +7893,8 @@ pub struct FrameNeed {
     pub theme: bool,
     /// The code of the views changed ([`code_changed`]).
     pub code: bool,
+    /// The override table moved ([`crate::provenance::set_overrides`]).
+    pub overrides: bool,
     /// The environment moved.
     pub environment: bool,
     /// The safe area or the keyboard inset moved.
@@ -7901,6 +7919,7 @@ impl FrameNeed {
             || self.paints
             || self.theme
             || self.code
+            || self.overrides
             || self.environment
             || self.insets
             || self.webview
