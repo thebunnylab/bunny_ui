@@ -1,0 +1,11 @@
+{
+  "unicode": "17.0.0",
+  "uax9_revision": 51,
+  "inputs": [
+    {
+      "file": "DerivedBidiClass.txt",
+      "url": "https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedBidiClass.txt",
+      "blake3": "fa9bb7a5d7727057ff0e100b4a757cddab232950e37ae43e6a041f37fb3ef18f"
+    }
+  ]
+}

@@ -428,7 +428,7 @@ impl Output {
     }
 }
 
-fn validate_range(text: &[u16], range: &Range<usize>) -> Result<(), TextError> {
+pub(super) fn validate_range(text: &[u16], range: &Range<usize>) -> Result<(), TextError> {
     let boundary = |index| {
         index == text.len()
             || text
@@ -467,7 +467,7 @@ fn buffer<T: Default + Clone>(length: usize, operation: &'static str) -> Result<
 
 #[cfg(test)]
 #[path = "text_glyphs_tests.rs"]
-mod tests;
+pub(super) mod tests;
 
 /// DirectWrite FLOATs round layout precision at the native boundary. Reject
 /// non-finite/out-of-range inputs before that intentional precision conversion.

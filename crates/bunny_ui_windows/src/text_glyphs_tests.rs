@@ -11,7 +11,7 @@ fn engine() -> DirectWriteEngine {
 // Independent high-level layout: it performs its own analysis, fallback and
 // glyph production. Apply style/spacing explicitly because legacy layout ignores
 // the FontSpec tracking and uses an upright format even for italic metrics.
-pub(super) fn reference_layout(
+pub(in crate::text::analysis) fn reference_layout(
     engine: &DirectWriteEngine,
     text: &str,
     font: &FontSpec,

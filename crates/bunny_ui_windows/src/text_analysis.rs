@@ -17,6 +17,12 @@ mod callbacks;
 #[path = "text_glyphs.rs"]
 mod glyphs;
 
+#[path = "text_bidi.rs"]
+mod bidi;
+
+#[path = "text_line.rs"]
+mod line;
+
 const ENGINE: &str = "DirectWrite";
 const OK: Hresult = 0;
 const NO_INTERFACE: Hresult = -2_147_467_262; // E_NOINTERFACE
@@ -115,12 +121,17 @@ struct Prepared {
     source: Com<Source>,
     scripts: Vec<Script>,
     levels: Vec<Levels>,
+    classes: Vec<bidi::Class>,
 }
 impl Prepared {
     fn new(factories: &Factories, text: &str) -> Result<Self, TextError> {
         // UTF-16 never has more units than valid UTF-8 has bytes. Check the
         // native bound before allocating either native input or output arrays.
         u32::try_from(text.len()).map_err(|_| TextError::IndexOverflow { engine: ENGINE })?;
+        let classes = text
+            .chars()
+            .flat_map(|c| std::iter::repeat_n(bidi::Class::of(c), c.len_utf16()))
+            .collect();
         let text: Arc<[u16]> = text.encode_utf16().collect::<Vec<_>>().into();
         let source = Source::new(text, factories.locale.clone().into())?;
         let (scripts, levels) = analyze(factories, &source)?;
@@ -128,6 +139,7 @@ impl Prepared {
             source,
             scripts,
             levels,
+            classes,
         })
     }
 
