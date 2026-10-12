@@ -281,5 +281,31 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
     let png = fs::read(pictures.join("home_preview.png")).expect("the picture was written");
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     assert_eq!(&png[16..24], &[0, 0, 1, 64, 0, 0, 0, 200], "320x200 at scale 1");
+
+    // goldens: the first `--snapshot` writes one, the second finds it the
+    // same, and a padding moved fails by name with the box
+    let goldens = here.join("goldens");
+    let snapshot = |label: &str| {
+        let began = Instant::now();
+        let out = Command::new(env!("CARGO_BIN_EXE_bunny"))
+            .args(["preview", "--snapshot"])
+            .arg(&goldens)
+            .args(["--engine", "house", "--size", "320x200", "home_preview"])
+            .current_dir(&app)
+            .output()
+            .unwrap();
+        timing(label, began.elapsed(), None);
+        (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    };
+    let (ok, said) = snapshot("snapshot_new");
+    assert!(ok && said.contains("new, kept as the golden"), "{said}");
+    let (ok, said) = snapshot("snapshot_same");
+    assert!(ok && said.contains("same"), "{said}");
+    let source = fs::read_to_string(&lib).unwrap();
+    assert!(source.contains(".padding()"), "{source}");
+    fs::write(&lib, source.replace(".padding()", ".padding_length(40.0)")).unwrap();
+    let (ok, said) = snapshot("snapshot_differs");
+    assert!(!ok, "{said}");
+    assert!(said.contains("home_preview.png") && said.contains("pixel(s) differ in a") && said.contains("box at ("), "{said}");
     let _ = fs::remove_dir_all(&here);
 }

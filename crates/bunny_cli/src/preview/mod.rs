@@ -49,6 +49,9 @@ pub struct Options {
     pub features: Vec<String>,
     /// The package, in a workspace of several.
     pub package: Option<String>,
+    /// What the host's process is given beside the lane's own variables
+    /// — `BUNNY_PREVIEW_ENGINE=house` asks for the deterministic engines.
+    pub env: Vec<(String, OsString)>,
 }
 
 /// What the lane says, in order.
@@ -165,12 +168,9 @@ fn start(project: Project, options: Options, events: &mut Vec<Event>) -> Step {
         os: None,
     };
     let run = platform::Options { release: false, features: options.features.clone(), args: Vec::new(), detach: false };
-    let extra = Extra {
-        features: vec![String::from("bunny-ui/preview")],
-        env: vec![(String::from("BUNNY_PREVIEW_PORT"), OsString::from(port.to_string()))],
-        process_group: true,
-        diagnostics: Diagnostics::Collect,
-    };
+    let mut env = vec![(String::from("BUNNY_PREVIEW_PORT"), OsString::from(port.to_string()))];
+    env.extend(options.env.iter().cloned());
+    let extra = Extra { features: vec![String::from("bunny-ui/preview")], env, process_group: true, diagnostics: Diagnostics::Collect };
     let mut hot = match Hot::prepare_with(&project, &run, &device, extra) {
         Ok(hot) => hot,
         Err(why) => return failed(project, options, why, events),
