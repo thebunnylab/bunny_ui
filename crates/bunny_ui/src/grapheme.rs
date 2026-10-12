@@ -165,3 +165,68 @@ pub(crate) fn ceil(text: &str, index: usize) -> usize {
         next(text, index)
     }
 }
+
+/// All extended grapheme boundaries in one forward pass. Geometry needs the
+/// complete line; repeated backward RI/Indic scans would make that quadratic.
+pub fn boundaries(text: &str) -> Vec<usize> {
+    use Gcb::{Control, Cr, Extend, L, Lf, Lv, Lvt, Prepend, RegionalIndicator, SpacingMark, T, V, Zwj};
+    let mut result = vec![0];
+    let mut left = None;
+    let mut regional_run = 0usize;
+    let mut pictograph_extend = false;
+    let mut pictograph_zwj = false;
+    let mut indic_consonant = false;
+    let mut indic_linker = false;
+    for (byte, character) in text.char_indices() {
+        let right = gcb(character);
+        let indic = incb(character);
+        let picture = pictographic(character);
+        let boundary = match (left, right) {
+            (None, _) | (Some(Cr), Lf) => false,
+            (Some(Cr | Lf | Control), _) | (_, Cr | Lf | Control) => true,
+            _ => {
+                let hangul = matches!(
+                    (left, right),
+                    (Some(L), L | V | Lv | Lvt) | (Some(Lv | V), V | T) | (Some(Lvt | T), T)
+                );
+                let extension = matches!(
+                    (left, right),
+                    (_, Extend | Zwj | SpacingMark) | (Some(Prepend), _)
+                );
+                let conjunct = indic == Incb::Consonant && indic_consonant && indic_linker;
+                let emoji = left == Some(Zwj) && pictograph_zwj && picture;
+                let regional = left == Some(RegionalIndicator)
+                    && right == RegionalIndicator
+                    && !regional_run.is_multiple_of(2);
+                !(hangul || extension || conjunct || emoji || regional)
+            }
+        };
+        if boundary {
+            result.push(byte);
+        }
+        regional_run = if right == RegionalIndicator {
+            regional_run + 1
+        } else {
+            0
+        };
+        pictograph_zwj = right == Zwj && pictograph_extend;
+        pictograph_extend = picture || (right == Extend && pictograph_extend);
+        match indic {
+            Incb::Consonant => {
+                indic_consonant = true;
+                indic_linker = false;
+            }
+            Incb::Linker if indic_consonant => indic_linker = true,
+            Incb::Extend => (),
+            _ => {
+                indic_consonant = false;
+                indic_linker = false;
+            }
+        }
+        left = Some(right);
+    }
+    if !text.is_empty() {
+        result.push(text.len());
+    }
+    result
+}

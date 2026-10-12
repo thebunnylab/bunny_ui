@@ -37,14 +37,14 @@ jobs:
           rustup toolchain install 1.98.1 --profile minimal --component clippy
           rustup override set 1.98.1
           rustc --version --verbose
-      - name: Native text direction regressions
+      - name: Native text geometry and direction regressions
         run: |
           pkg-config --modversion fribidi harfbuzz freetype2 fontconfig
           for family in 'DejaVu Sans' 'DejaVu Sans Mono' 'Liberation Sans'; do
             font_path="$(fc-match -f '%{file}' "$family")"
             b3sum "$font_path"
           done
-          cargo test -p bunny-ui-linux --locked --lib mixed_direction -- --nocapture
+          cargo test -p bunny-ui-linux --locked --lib mixed_ -- --nocapture
       - name: Native AT-SPI, X11 and Wayland, normal and paranoid
         run: bash scripts/check-linux-accessibility.sh
       - name: Linux shell, normal and paranoid
