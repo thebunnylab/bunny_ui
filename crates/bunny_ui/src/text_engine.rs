@@ -792,7 +792,8 @@ pub struct MeasureCache {
     floor: Option<usize>,
     lines: RefCell<HashMap<FontKey, HashMap<String, (LineMetrics, std::cell::Cell<u32>)>>>,
     geometry: RefCell<HashMap<FontKey, HashMap<String, CachedGeometry>>>,
-    breaks: RefCell<HashMap<(FontKey, u32), HashMap<String, (BreakLines, std::cell::Cell<u32>)>>>,
+    breaks:
+        RefCell<HashMap<(FontKey, u32), HashMap<String, (BreakLines, std::cell::Cell<u32>)>>>,
     /// Multi-line fields, by path: their lines at the widths they were
     /// laid out at ([`MeasureCache::field_lines`]).
     fields: RefCell<HashMap<String, Vec<FieldLines>>>,
