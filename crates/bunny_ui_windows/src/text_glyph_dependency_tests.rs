@@ -324,3 +324,6 @@ fn paragraph_production_never_silently_restarts_a_contextual_cascade() {
         }
     }
 }
+
+#[path = "text_fullshape_tests.rs"]
+mod fullshape;

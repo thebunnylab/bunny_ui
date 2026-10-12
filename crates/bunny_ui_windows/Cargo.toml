@@ -17,6 +17,11 @@ bunny-ui = { workspace = true, features = ["canvas", "gpu", "codec"] }
 countries-core.workspace = true
 countries-pure.workspace = true
 
+# Experimental native parity probes only; the shipping adapter keeps its
+# existing dependency graph until complete shaping/metrics evidence exists.
+[target.'cfg(windows)'.dev-dependencies]
+harfrust = { git = "https://github.com/harfbuzz/harfrust", rev = "ca987b0446cdaca104ae1baed22865ca1046864f" }
+
 # Its API exists only on its own platform; docs.rs builds on Linux
 # by default and would publish an empty page.
 [package.metadata.docs.rs]

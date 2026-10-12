@@ -206,8 +206,10 @@ jobs:
           BUNNY_PARANOID=all cargo test -p bunny-ui-windows --locked --lib paragraph_long_simple_spans_preserve_native_clusters_and_tracking -- --nocapture
       - name: Native complex continuation, normal and paranoid
         run: |
-          cargo test -p bunny-ui-windows --locked --lib text::analysis::glyphs::long_tests::continuation:: -- --nocapture
-          BUNNY_PARANOID=all cargo test -p bunny-ui-windows --locked --lib text::analysis::glyphs::long_tests::continuation:: -- --nocapture
+          test_status=0
+          cargo test -p bunny-ui-windows --locked --lib text::analysis::glyphs::long_tests::continuation:: -- --nocapture || test_status=$?
+          BUNNY_PARANOID=all cargo test -p bunny-ui-windows --locked --lib text::analysis::glyphs::long_tests::continuation:: -- --nocapture || test_status=$?
+          exit "$test_status"
       - name: Native paragraph selection, normal and paranoid
         run: |
           test_status=0
