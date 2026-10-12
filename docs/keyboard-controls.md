@@ -17,7 +17,10 @@ Custom elements participate when `accepts_keys()` is true and
 the same eligibility and scroll reveal. An exact field name retains priority;
 a name enclosing multiple eligible controls is otherwise ambiguous. Controls
 behind the active popup or modal cannot be focused by this method. Closing a
-popup returns focus to its previous owner when that control still exists.
+popup returns focus to its previous owner when that control still exists. A
+popover that places no control — a completion list, a preview card — is a
+picture beside the keyboard's owner, not a dialog: it opens no scope, focus
+stays where it was, and the walk never enters it.
 
 ```rust,ignore
 vstack!(
