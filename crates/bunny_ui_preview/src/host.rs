@@ -41,8 +41,10 @@
 //!   polls tasks per turn but keeps the engine's manual clock, so an
 //!   animation driven by a sleep stands still. A frame asked for by state
 //!   or a task's result is rendered on the next turn.
-//! - Overrides arrive and are kept per scene; they take effect once the
-//!   core's override road lands (the site-keyed patches of D424).
+//! - Overrides are kept per scene and put on the thread's one table
+//!   (`provenance::set_overrides`) whenever they move: a site shared by
+//!   two scenes — the two variants of one preview — moves in both, which
+//!   is what a designer dragging a padding wants to see.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -59,6 +61,8 @@ use bunny_ui_core::prelude::*;
 use bunny_ui_core::preview::Traits;
 use bunny_ui_core::text_engine::TextEngine;
 use bunny_ui_hot::preview::preview_entry;
+
+use bunny_ui_core::provenance::{self, Override, SiteKey};
 
 use crate::convert;
 use crate::scan;
@@ -304,12 +308,14 @@ impl Host {
                 if let Some(scene) = self.scene(&id) {
                     scene.overrides.push((site, op, patch));
                     scene.dirty = true;
+                    self.push_overrides();
                 }
             }
             ToHost::ClearOverrides { id } => {
                 if let Some(scene) = self.scene(&id) {
                     scene.overrides.clear();
                     scene.dirty = true;
+                    self.push_overrides();
                 }
             }
             ToHost::RequestSnapshot { id } => {
@@ -356,6 +362,22 @@ impl Host {
             }
         }
         self.scenes = kept;
+        self.push_overrides();
+    }
+
+    /// Every scene's overrides, on the thread's one table.
+    fn push_overrides(&self) {
+        provenance::set_overrides(self.scenes.iter().flat_map(|scene| {
+            scene.overrides.iter().map(|(site, op, patch)| {
+                let key = SiteKey { file: site.file.clone(), line: site.line, column: site.column };
+                let override_ = match op {
+                    wire::OverrideOp::Replace => Override::Replace(convert::modifier(*patch)),
+                    wire::OverrideOp::Append => Override::Append(convert::modifier(*patch)),
+                    wire::OverrideOp::Hide => Override::Hide,
+                };
+                (key, override_)
+            })
+        }));
     }
 
     fn open(&mut self, id: &str, ident: &str, variant: u32, traits: Traits) -> Scene {

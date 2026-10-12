@@ -2306,6 +2306,12 @@ pub struct VisualProps {
     /// (the LAW: hover swaps paint, never content).
     pub opacity_hovered: Option<f64>,
     pub opacity_pressed: Option<f64>,
+    /// `.hidden()` — the box keeps its place and shows no pixel: no
+    /// command of its subtree reaches the list, not even for a reader
+    /// that keeps the unseen (hidden is by design, not by the glass),
+    /// and no hit inside it exists. Paint only, like the rest: the box
+    /// measures and lays out exactly as it would.
+    pub hidden: bool,
     /// `.group_hovered()` — this box's hover and pressed paint follows
     /// the nearest `.hover_group()` above it, not the interactive
     /// target it belongs to.
@@ -2352,6 +2358,7 @@ impl VisualProps {
             opacity: self.opacity.or(outer.opacity),
             opacity_hovered: self.opacity_hovered.or(outer.opacity_hovered),
             opacity_pressed: self.opacity_pressed.or(outer.opacity_pressed),
+            hidden: self.hidden || outer.hidden,
             from_group: self.from_group || outer.from_group,
         }
     }
@@ -4139,6 +4146,20 @@ impl Placement {
         if !self.skip_display && self.muted == 0 {
             self.display.push(DrawCommand::PopClip);
         }
+    }
+
+    /// Opens a box that shows no pixel — `.hidden()`. Muted like a box
+    /// under an empty clip, and under one, so no hit inside it exists;
+    /// but muted for EVERY reader, the one that keeps the unseen
+    /// included: a hidden box is hidden by design, not by the glass.
+    fn push_hidden(&mut self, at: Point) {
+        self.muted += 1;
+        self.push_clip(Rect { origin: at, size: Size::default() }, Corners::default());
+    }
+
+    fn pop_hidden(&mut self) {
+        self.pop_clip();
+        self.muted = self.muted.saturating_sub(1);
     }
 
     fn current_clip(&self) -> Option<Rect> {
@@ -7856,6 +7877,20 @@ impl LayoutNode {
                     anim: env.anim.map(|scope| AnimScope { colors: false, ..scope }),
                     ..*env
                 };
+                // `.hidden()`: the box keeps its place and shows no pixel.
+                // Under the pixel pipelines it places muted — its sites,
+                // sensors and tails still happen, into a list nobody
+                // reads. An element capture makes nothing of it: the
+                // browser shows nothing of a box that is not there, and
+                // the frames around it keep its place
+                if props.hidden {
+                    if out.dom.is_none() {
+                        out.push_hidden(frame.origin);
+                        child.place(frame, fit, &env, out);
+                        out.pop_hidden();
+                    }
+                    return;
+                }
                 // the animator paints the value in flight, never the
                 // target — it seeds, retargets and snaps behind this
                 let animated = |slot, color| match (colors, env.animator) {

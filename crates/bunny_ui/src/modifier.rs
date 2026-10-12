@@ -54,6 +54,7 @@ pub enum Modifier {
     MultilineTextAlignment(TextAlignment),
     Blur(f64),
     IgnoresSafeArea,
+    /// `.hidden()` — laid out as it would be, painted and hit as nothing.
     Hidden,
     /// A reactive accessible name for one semantic element.
     AccessibilityLabel(crate::bind::TextSource),
@@ -1065,7 +1066,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             let mut nodes = NodeList::new();
             applied.render_into(ctx, &mut nodes);
             seal_custom(&**custom, nodes, out);
-            crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Modifier, Some(self.modifier.name()));
+            crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Modifier, Some(self.modifier.name()));
             return;
         }
 
@@ -1080,7 +1081,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 self.base.render_into(ctx, &mut nodes);
             }
             seal_id(name, nodes, out);
-            crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Modifier, Some("id"));
+            crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Modifier, Some("id"));
             return;
         }
 
@@ -1106,9 +1107,13 @@ impl<C: View<Arity = Single>> View for Modified<C> {
 
         // …and everything the modifier does AFTER the base is
         // generic-free, so it lives in ONE function instead of
-        // one copy per chain in the program
-        apply(&self.modifier, ctx, base_ctx, out, mark);
-        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Modifier, Some(self.modifier.name()));
+        // one copy per chain in the program — unless a tool put a
+        // replacement on this site, which then stands in for it
+        match crate::provenance::replacement_at(self.site) {
+            Some(replacement) => apply(&replacement, ctx, base_ctx, out, mark),
+            None => apply(&self.modifier, ctx, base_ctx, out, mark),
+        }
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Modifier, Some(self.modifier.name()));
     }
 }
 
@@ -1152,7 +1157,7 @@ fn seal_custom(custom: &dyn crate::erased::CustomModifier, mut nodes: NodeList, 
 /// modifiers an app writes. It was thirty-six copies and a third of
 /// all the code in the web build.
 #[inline(never)]
-fn apply(
+pub(crate) fn apply(
     modifier: &Modifier,
     ctx: &Context,
     base_ctx: &Context,
@@ -1687,6 +1692,7 @@ fn apply(
             mark,
             VisualProps { opacity_pressed: Some(*value), ..VisualProps::default() },
         ),
+        Modifier::Hidden => wrap_styled(out, mark, VisualProps { hidden: true, ..VisualProps::default() }),
         Modifier::GroupHovered => wrap_styled(
             out,
             mark,

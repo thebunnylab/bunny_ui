@@ -80,7 +80,7 @@ impl View for Text {
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         self.render_unsited(ctx, out);
-        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Text, None);
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Text, None);
     }
 }
 
@@ -167,7 +167,7 @@ where
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         self.render_unsited(ctx, out);
-        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Button, None);
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Button, None);
     }
 }
 
@@ -483,7 +483,7 @@ impl View for TextField {
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         self.render_unsited(ctx, out);
-        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Field, None);
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Field, None);
     }
 }
 
@@ -1023,7 +1023,7 @@ impl View for Spacer {
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         self.render_unsited(ctx, out);
-        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Spacer, None);
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Spacer, None);
     }
 }
 
@@ -1059,7 +1059,7 @@ impl View for Rectangle {
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         self.render_unsited(ctx, out);
-        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Rectangle, None);
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Rectangle, None);
     }
 }
 
@@ -1138,7 +1138,7 @@ impl View for Image {
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         self.render_unsited(ctx, out);
-        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Image, None);
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Image, None);
     }
 }
 
@@ -1202,7 +1202,7 @@ impl View for Icon {
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         self.render_unsited(ctx, out);
-        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Icon, None);
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Icon, None);
     }
 }
 
@@ -1648,7 +1648,7 @@ impl<C: View> View for ScrollView<C> {
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         self.render_unsited(ctx, out);
-        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Scroll, None);
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Scroll, None);
     }
 }
 
@@ -1895,7 +1895,7 @@ impl<C: View> View for VStack<C> {
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         self.render_unsited(ctx, out);
-        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::VStack, None);
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::VStack, None);
     }
 }
 
@@ -1958,7 +1958,7 @@ impl<C: View> View for HStack<C> {
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         self.render_unsited(ctx, out);
-        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::HStack, None);
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::HStack, None);
     }
 }
 
@@ -2062,7 +2062,7 @@ impl<C: View> View for ZStack<C> {
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         self.render_unsited(ctx, out);
-        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::ZStack, None);
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::ZStack, None);
     }
 }
 
@@ -2143,7 +2143,7 @@ impl<C: View> View for TupleView<C> {
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         self.render_unsited(ctx, out);
-        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Tuple, None);
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Tuple, None);
     }
 }
 
@@ -2185,7 +2185,7 @@ where
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         self.render_unsited(ctx, out);
-        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::List, None);
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::List, None);
     }
 }
 
@@ -2429,7 +2429,7 @@ where
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         self.render_unsited(ctx, out);
-        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::VirtualList, None);
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::VirtualList, None);
     }
 }
 
@@ -3221,7 +3221,7 @@ impl<H: View, C: View> View for Section<H, C> {
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let mark = out.layout_mark();
         self.render_unsited(ctx, out);
-        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Section, None);
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Section, None);
     }
 }
 
