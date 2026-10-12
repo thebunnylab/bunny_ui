@@ -148,13 +148,18 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         remaining
     }
 }
-unsafe extern "system" fn disabled(_: *mut Renderer, _: *mut c_void, output: *mut i32) -> Hresult {
+unsafe extern "system" fn disabled(
+    this: *mut Renderer,
+    _: *mut c_void,
+    output: *mut i32,
+) -> Hresult {
     if output.is_null() {
         return -2_147_467_261;
     }
-    // SAFETY: the native caller supplies its BOOL output.
+    // SAFETY: the native caller supplies its BOOL output and live renderer.
+    // Glyph snapshots need no pixel snapping; pixel traces preserve it.
     unsafe {
-        *output = 0;
+        *output = i32::from(!(*this).trace);
     }
     0
 }
@@ -264,8 +269,9 @@ pub(in crate::text::analysis::glyphs) fn collect(
     layout: &Com<IDWriteTextLayout>,
 ) -> Vec<NativeRun> {
     #[repr(C)]
-    struct HeightTable {
-        prefix: [usize; 29],
+    struct BoundsTable {
+        prefix: [usize; 28],
+        set_width: unsafe extern "system" fn(*mut c_void, f32) -> Hresult,
         set_height: unsafe extern "system" fn(*mut c_void, f32) -> Hresult,
     }
     let mut metrics = DwriteTextMetrics::default();
@@ -277,14 +283,19 @@ pub(in crate::text::analysis::glyphs) fn collect(
             &raw mut metrics
         )));
     }
-    // The shared legacy helper uses a 1e9-DIP layout box. Keep this glyph
-    // oracle's height close to its measured content; at small font sizes the
-    // oversized box can produce valid metrics but no DrawGlyphRun callbacks.
-    // This does not alter width, text, wrapping, font or paragraph direction.
+    // The shared legacy helper uses a 1e9-DIP layout box. Use measured bounds
+    // for this glyph-only oracle, without changing text, font, wrapping or
+    // paragraph direction. Native no-wrap layout still owns every source unit.
     assert!(metrics.height.is_finite() && metrics.height >= 0.0);
-    // SAFETY: pinned IDWriteTextLayout::SetMaxHeight slot 29, with a live layout.
+    assert!(metrics.width_including_trailing_whitespace.is_finite());
+    assert!(metrics.width_including_trailing_whitespace >= 0.0);
+    // SAFETY: pinned IDWriteTextLayout slots 28/29, with a live layout.
     unsafe {
-        let pointer = layout.as_ptr().cast::<*const HeightTable>();
+        let pointer = layout.as_ptr().cast::<*const BoundsTable>();
+        assert!(com_ok(((*(*pointer)).set_width)(
+            layout.as_ptr().cast(),
+            metrics.width_including_trailing_whitespace + 16.0
+        )));
         assert!(com_ok(((*(*pointer)).set_height)(
             layout.as_ptr().cast(),
             metrics.height + 16.0
