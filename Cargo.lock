@@ -79,6 +79,7 @@ dependencies = [
  "bunny-ui-ios",
  "bunny-ui-linux",
  "bunny-ui-macos",
+ "bunny-ui-preview",
  "bunny-ui-preview-macros",
  "bunny-ui-web",
  "bunny-ui-windows",
@@ -173,6 +174,7 @@ name = "bunny-ui-preview"
 version = "0.2.1"
 dependencies = [
  "bunny-ui-core",
+ "bunny-ui-hot",
 ]
 
 [[package]]

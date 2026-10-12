@@ -38,7 +38,7 @@ hot = ["shell", "dep:bunny-ui-dylib", "dep:bunny-ui-hot"]
 # answers its view and traits, for the preview host Studio and `bunny
 # preview` run. `bunny preview` turns it on with `hot`; a plain build
 # keeps the functions and exports nothing.
-preview = ["dep:bunny-ui-hot"]
+preview = ["dep:bunny-ui-hot", "dep:bunny-ui-preview", "bunny-ui-preview/host"]
 
 [dependencies]
 bunny-ui-core.workspace = true
@@ -69,10 +69,15 @@ bunny-ui-web = { workspace = true, optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bunny-ui-dylib = { workspace = true, optional = true }
 bunny-ui-hot = { workspace = true, optional = true }
+bunny-ui-preview = { workspace = true, optional = true }
 
 [[example]]
 name = "counter"
 required-features = ["shell"]
+
+[[example]]
+name = "preview"
+required-features = ["shell", "preview"]
 
 [[test]]
 name = "app_macro"

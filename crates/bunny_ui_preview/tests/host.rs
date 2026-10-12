@@ -1,0 +1,204 @@
+//! The host against hand-written entries exported from this very binary:
+//! it lists them, renders the variants a selection asks for, keeps the
+//! other scenes rendering when one panics, and answers the small talk.
+
+#![cfg(not(target_arch = "wasm32"))]
+
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::rc::Rc;
+
+use bunny_ui_core as bunny_ui;
+use bunny_ui::prelude::*;
+use bunny_ui_hot::preview::{Meta, Output, PreviewEntry};
+use bunny_ui_preview::host::{Config, Engines, Host};
+use bunny_ui_preview::wire::{self, Selection, ToHost, ToIde, Traits};
+
+#[derive(Clone)]
+struct Card;
+
+impl Component for Card {
+    fn body(self) -> impl View {
+        vstack!(text!("card").foreground_color(theme::fg())).padding_length(8.0).background_color(theme::canvas())
+    }
+}
+
+#[derive(Clone)]
+struct Boom;
+
+impl Component for Boom {
+    fn body(self) -> impl View {
+        if true {
+            panic!("the preview that cannot be built");
+        }
+        text("never")
+    }
+}
+
+fn make_card() -> Output {
+    Output::of(Card)
+}
+
+fn make_boom() -> Output {
+    Output::of(Boom)
+}
+
+static CARD: PreviewEntry = PreviewEntry::new(
+    Meta { ident: "card", name: "Card", scope: "Cards", example: "card", module: "host", file: "src/lib.rs", line: 3 },
+    make_card,
+);
+static BOOM: PreviewEntry = PreviewEntry::new(
+    Meta { ident: "boom", name: "Boom", scope: "Cards", example: "boom", module: "host", file: "src/lib.rs", line: 8 },
+    make_boom,
+);
+
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+pub fn bunny_preview__card() -> &'static PreviewEntry {
+    &CARD
+}
+
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+pub fn bunny_preview__boom() -> &'static PreviewEntry {
+    &BOOM
+}
+
+/// A manifest directory whose `src/lib.rs` the scan reads: the two
+/// previews above, and one the binary does not export.
+fn manifest_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("bunny-preview-host-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "use bunny_ui::prelude::*;\n\n#[preview(name = \"Card\", scope = \"Cards\")]\nfn card() -> impl View { text(\"\") }\n\n#[preview(name = \"Boom\", scope = \"Cards\")]\nfn boom() -> impl View { text(\"\") }\n\n#[preview]\nfn ghost() -> impl View { text(\"\") }\n",
+    )
+    .unwrap();
+    dir
+}
+
+fn host() -> (Host, Rc<RefCell<Vec<ToIde>>>) {
+    let seen: Rc<RefCell<Vec<ToIde>>> = Rc::new(RefCell::new(Vec::new()));
+    let sink = Rc::clone(&seen);
+    let host = Host::new(
+        Engines::house(),
+        Config { package: String::from("host"), manifest_dir: manifest_dir(), framework: "test" },
+        Box::new(move |message| sink.borrow_mut().push(message)),
+    );
+    (host, seen)
+}
+
+fn frames(seen: &Rc<RefCell<Vec<ToIde>>>) -> Vec<wire::Frame> {
+    seen.borrow_mut()
+        .drain(..)
+        .filter_map(|message| match message {
+            ToIde::Frame(frame) => Some(frame),
+            _ => None,
+        })
+        .collect()
+}
+
+fn fills(frame: &wire::Frame) -> Vec<wire::Color> {
+    frame
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            wire::Draw::FillRect { color, .. } => Some(*color),
+            _ => None,
+        })
+        .collect()
+}
+
+fn select(ident: &str, traits: Traits) -> ToHost {
+    ToHost::Select(vec![Selection { id: format!("src/lib.rs#{ident}"), ident: ident.to_string(), traits }])
+}
+
+#[test]
+fn hello_lists_what_the_binary_exports_and_names_what_it_does_not() {
+    let (mut host, seen) = host();
+    host.hello();
+    let messages = seen.borrow_mut().drain(..).collect::<Vec<_>>();
+    assert!(matches!(&messages[0], ToIde::Hello { wire: 1, package, .. } if package == "host"));
+    match &messages[1] {
+        ToIde::Ready { generation: 0, previews, missing } => {
+            let idents: Vec<&str> = previews.iter().map(|p| p.ident.as_str()).collect();
+            assert_eq!(idents, ["card", "boom"]);
+            assert_eq!(previews[0].id, "src/lib.rs#card");
+            assert_eq!(previews[0].scope, "Cards");
+            assert_eq!(previews[0].traits, Traits::default());
+            assert_eq!(missing, &["ghost"]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_both_selection_renders_two_scenes_in_their_own_tokens_and_only_once() {
+    let (mut host, seen) = host();
+    host.handle(select("card", Traits { scheme: wire::Scheme::Both, ..Traits::default() }));
+    assert_eq!(host.scene_ids(), [(String::from("src/lib.rs#card"), 0), (String::from("src/lib.rs#card"), 1)]);
+    assert!(host.tick(), "nothing sent: {:?} poisoned: {:?}", seen.borrow(), host.poisoned());
+    let rendered = frames(&seen);
+    assert_eq!(rendered.len(), 2);
+    assert_eq!((rendered[0].variant, rendered[1].variant), (0, 1));
+    let light: wire::Color = Theme::light().canvas.into();
+    let dark: wire::Color = Theme::dark().canvas.into();
+    assert!(fills(&rendered[0]).contains(&light));
+    assert!(fills(&rendered[1]).contains(&dark));
+    assert_eq!(rendered[0].background, light);
+    assert_eq!(rendered[1].background, dark);
+    assert!(rendered[0].size.width > 0.0 && rendered[0].size.height > 0.0, "fits: the view's own size");
+    assert!(!rendered[0].sites.is_empty(), "sites ride the frame");
+    // settled: nothing more to send
+    assert!(!host.tick());
+    assert!(frames(&seen).is_empty());
+    // a retrait moves the scene and sends again
+    host.handle(ToHost::Retrait { id: String::from("src/lib.rs#card"), traits: Traits { scheme: wire::Scheme::Both, size: wire::Sizing::Fixed(wire::Size { width: 200.0, height: 100.0 }), ..Traits::default() } });
+    assert!(host.tick(), "nothing sent: {:?} poisoned: {:?}", seen.borrow(), host.poisoned());
+    let again = frames(&seen);
+    assert_eq!(again.len(), 2);
+    assert_eq!(again[0].size, wire::Size { width: 200.0, height: 100.0 });
+    assert_eq!(again[0].seq, 2);
+}
+
+#[test]
+fn a_panic_in_one_scene_is_reported_and_the_other_keeps_rendering() {
+    let (mut host, seen) = host();
+    host.handle(ToHost::Select(vec![
+        Selection { id: String::from("src/lib.rs#card"), ident: String::from("card"), traits: Traits::default() },
+        Selection { id: String::from("src/lib.rs#boom"), ident: String::from("boom"), traits: Traits::default() },
+    ]));
+    host.tick();
+    let messages = seen.borrow_mut().drain(..).collect::<Vec<_>>();
+    assert!(messages.iter().any(|m| matches!(m, ToIde::Frame(frame) if frame.preview == "card")), "{messages:?}");
+    assert!(messages.iter().any(|m| matches!(m, ToIde::Panicked { preview, message } if preview == "boom" && message.contains("cannot be built"))), "{messages:?}");
+    assert_eq!(host.poisoned(), ["src/lib.rs#boom"]);
+    // the card renders on, poisoned scene left alone
+    host.handle(ToHost::Resize { id: String::from("src/lib.rs#card"), size: wire::Size { width: 120.0, height: 60.0 } });
+    assert!(host.tick(), "nothing sent: {:?} poisoned: {:?}", seen.borrow(), host.poisoned());
+    let rendered = frames(&seen);
+    assert_eq!(rendered.len(), 1);
+    assert_eq!(rendered[0].preview, "card");
+    assert_eq!(rendered[0].size, wire::Size { width: 120.0, height: 60.0 });
+}
+
+#[test]
+fn the_small_talk_is_answered() {
+    let (mut host, seen) = host();
+    host.handle(ToHost::Ping { nonce: 9 });
+    host.handle(ToHost::RequestSnapshot { id: String::from("x") });
+    host.handle(ToHost::Forget { keys: vec![1] });
+    let messages = seen.borrow_mut().drain(..).collect::<Vec<_>>();
+    assert!(matches!(messages[0], ToIde::Pong { nonce: 9 }));
+    assert!(matches!(&messages[1], ToIde::Status { text } if text.contains("snapshots")));
+    host.handle(select("card", Traits::default()));
+    host.handle(ToHost::Override {
+        id: String::from("src/lib.rs#card"),
+        site: wire::SiteKey { file: String::from("src/lib.rs"), line: 3, column: 1 },
+        op: wire::OverrideOp::Replace,
+        patch: wire::Patch::Padding,
+    });
+    assert_eq!(host.overrides_of("src/lib.rs#card"), 1);
+    host.handle(ToHost::ClearOverrides { id: String::from("src/lib.rs#card") });
+    assert_eq!(host.overrides_of("src/lib.rs#card"), 0);
+}

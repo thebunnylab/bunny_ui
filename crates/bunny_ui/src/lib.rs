@@ -147,7 +147,7 @@ macro_rules! zstack {
 /// worker thread (or a browser callback) hands its results over.
 pub mod task {
     pub use motor::task::{
-        Receiver, Recv, SendError, Sender, Sleep, Spawned, channel, sleep, spawn,
+        Receiver, Recv, SendError, Sender, Sleep, Spawned, advance, channel, poll_ready, set_wake_hook, sleep, spawn,
     };
 }
 
