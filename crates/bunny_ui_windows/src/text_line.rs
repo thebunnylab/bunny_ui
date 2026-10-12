@@ -4,6 +4,9 @@ use super as glyphs;
 use super::{Prepared, TextError, bidi, preparation};
 use std::ops::Range;
 
+#[path = "text_line_geometry.rs"]
+mod geometry;
+
 impl Prepared {
     fn line_levels(&self, range: Range<usize>) -> Result<Vec<u8>, TextError> {
         glyphs::validate_range(self.utf16(), &range)?;
@@ -23,6 +26,7 @@ impl Prepared {
 /// Owned logical glyphs plus atomic clusters placed in visual order. Shaping
 /// levels remain on Run; line-reset levels are used solely for L2 placement.
 pub(super) struct VisualLine {
+    source: Range<usize>,
     pub(super) runs: Vec<glyphs::Run>,
     pub(super) clusters: Vec<Cluster>,
     pub(super) width: f64,
@@ -98,6 +102,7 @@ impl VisualLine {
             return Err(preparation("line visual width"));
         }
         Ok(Self {
+            source: range,
             runs,
             clusters,
             width,

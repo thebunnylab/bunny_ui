@@ -33,7 +33,16 @@ fn wrapped_layout(
         size: 21.0,
         ..FontSpec::DEFAULT
     };
-    let layout = glyphs::tests::reference_layout(engine, text, &font);
+    wrapped_layout_with_font(engine, text, width, &font)
+}
+
+pub(super) fn wrapped_layout_with_font(
+    engine: &DirectWriteEngine,
+    text: &str,
+    width: f32,
+    font: &FontSpec,
+) -> (Com<IDWriteTextLayout>, Vec<Range<usize>>) {
+    let layout = glyphs::tests::reference_layout(engine, text, font);
     let mut metrics = vec![Metrics::default(); text.encode_utf16().count() + 1];
     let mut count = 0;
     // SAFETY: exact verified SDK slots, live native layout and initialized
