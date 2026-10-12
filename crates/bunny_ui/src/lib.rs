@@ -184,7 +184,8 @@ pub mod prelude {
         VisualProps,
     };
     pub use crate::theme::{self, Theme};
-    pub use crate::preview::{Device, Preview, Scheme, Sizing, Traits};
+    // `Device` stays qualified (`preview::Device`): a shell's own `Device` meets the prelude in its tests
+    pub use crate::preview::{Preview, Scheme, Sizing, Traits};
     pub use crate::words::{self, Word, Words};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Tracking, Weight};
     pub use crate::text_input::{CaretState, EditCommand, KeyboardType};
