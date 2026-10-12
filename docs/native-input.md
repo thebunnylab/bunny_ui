@@ -105,3 +105,8 @@ translated by its shaped origin; otherwise it divides the cluster advance by
 scalar. This is an explicit approximation inside a cluster, not recovered font
 metadata. Paragraph-aware wrapping, visual horizontal motion, actual OS IME
 input and human assistive-technology validation remain separate work.
+
+Native CI retains compiler, OS/runner image and BLAKE3 hashes of machine font
+files beside its test logs. This inventories available font inputs; it does not
+assert that every file was selected by the shaper, and it copies no font binary.
+The recorder reuses the Unicode tooling's build-time `blake3==1.0.8` package.
