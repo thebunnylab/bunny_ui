@@ -137,6 +137,27 @@ fn paragraph_at_native_cuts(
         .unwrap()
 }
 
+fn production_difference(
+    engine: &DirectWriteEngine,
+    prepared: &Prepared,
+    font: &FontSpec,
+    expected: &[Cluster],
+    label: &str,
+) -> Option<String> {
+    let production = engine
+        .with_slot(font, |slot| {
+            let base = BaseFont::new(slot, font).unwrap();
+            Shaper::new(engine.factories.as_ref().unwrap())
+                .unwrap()
+                .shape(prepared, 0..prepared.utf16().len(), &base, font)
+        })
+        .unwrap();
+    match production {
+        Ok(runs) => difference(label, runs, expected),
+        Err(error) => Some(format!("{label}: {error:?}")),
+    }
+}
+
 #[test]
 fn paragraph_long_native_safe_cut_continuation_matches_complete_source() {
     let engine = DirectWriteEngine::new();
@@ -194,6 +215,13 @@ fn paragraph_long_native_safe_cut_continuation_matches_complete_source() {
                         failures.push(format!("{label}: {error:?}"));
                     }
                 }
+            }
+            let label = format!("production {name}, tracking={tracking}");
+            if let Some(error) = production_difference(&engine, &prepared, &font, &expected, &label)
+            {
+                failures.push(error);
+            } else {
+                eprintln!("native production parity: {label}");
             }
         }
     }

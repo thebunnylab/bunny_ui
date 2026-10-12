@@ -6,8 +6,9 @@
 //! their owning face. The line module applies visual L1/L2 ordering without
 //! changing those shaping buffers, then supplies runtime geometry and raster.
 //! Complete font-resolved spans classified natively as simple may use bounded
-//! glyph calls. Complex spans retain their shaping context and report native
-//! input/count failures until a verified continuation policy is available.
+//! glyph calls. Complex spans retain complete native calls when supported;
+//! otherwise only finalized native dependency and cluster boundaries permit
+//! continuation. Unbroken dependencies remain explicit preparation failures.
 
 use super::{
     Analyzer, Com, Factories, Guid, Hresult, Prepared, Script, Source, TextError, bidi, com_ok,
@@ -21,6 +22,9 @@ use std::ops::Range;
 #[path = "text_glyphs_ffi.rs"]
 mod ffi;
 
+#[path = "text_glyph_chunks.rs"]
+mod chunks;
+
 #[path = "text_glyph_raster.rs"]
 mod raster;
 
@@ -32,8 +36,8 @@ pub(super) use line::VisualLine;
 // native count limit, not the number of representable u16 index values.
 const MAX_GLYPHS: usize = u16::MAX as usize;
 // Match the conservative size observed in native whole-layout glyph runs.
-// This is a work bound for proven-simple spans, not a universal native maximum.
-const SIMPLE_CHUNK_UNITS: usize = 16_000;
+// This bounds probes and proven-simple spans, not a universal native maximum.
+const CHUNK_UNITS: usize = 16_000;
 const INSUFFICIENT_BUFFER: Hresult = -2_147_024_774; // HRESULT_FROM_WIN32(122)
 
 pub(super) struct BaseFont {
@@ -162,36 +166,12 @@ impl Shaper {
                     em_size,
                     locale,
                 };
-                let chunk_size = self.shaping_chunk_size(&input)?;
-                let mut chunk_start = source.start;
-                for units in input.text.chunks(chunk_size) {
-                    let source = chunk_start..chunk_start + units.len();
-                    validate_range(text, &source)?;
-                    let chunk = Input {
-                        text: units,
-                        ..input
-                    };
-                    let capacity = units.len().saturating_mul(3) / 2 + 16;
-                    let output = self.produce(&chunk, tracking, capacity.min(MAX_GLYPHS))?;
-                    runs.try_reserve(1)
-                        .map_err(|_| preparation("glyph run allocation"))?;
-                    chunk_start = source.end;
-                    runs.push(Run {
-                        source,
-                        face: face.clone(),
-                        em_size,
-                        level,
-                        visibility: if script.shapes & 1 == 0 {
-                            Visibility::Ink
-                        } else {
-                            Visibility::Control
-                        },
-                        clusters: output.clusters,
-                        glyphs: output.glyphs,
-                        advances: output.advances,
-                        offsets: output.offsets,
-                    });
-                }
+                let visibility = if script.shapes & 1 == 0 {
+                    Visibility::Ink
+                } else {
+                    Visibility::Control
+                };
+                self.shape_span(&input, tracking, source, visibility, &mut runs)?;
                 position += mapped;
             }
         }
@@ -199,7 +179,7 @@ impl Shaper {
     }
 
     fn shaping_chunk_size(&self, input: &Input<'_>) -> Result<usize, TextError> {
-        if input.text.len() <= SIMPLE_CHUNK_UNITS {
+        if input.text.len() <= CHUNK_UNITS {
             return Ok(input.text.len());
         }
         let length =
@@ -229,7 +209,7 @@ impl Shaper {
         // and standard OpenType dependencies from a simple span. A simple
         // prefix is insufficient: every source unit must have been classified.
         Ok(if simple != 0 && read == length {
-            SIMPLE_CHUNK_UNITS
+            CHUNK_UNITS
         } else {
             input.text.len()
         })
