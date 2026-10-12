@@ -5,7 +5,9 @@
 //! a save in a sibling crate's body reloaded too, and a type moved there
 //! a restart, said.
 //! Then `bunny preview --png` takes a picture of the same preview through
-//! the host's snapshot door. Every step prints `@@bunny-timing <step> <ms>`, and under
+//! the host's snapshot door — and, on the Mac, of a preview holding a
+//! page, the page's own pixels where its box stood. Every step prints
+//! `@@bunny-timing <step> <ms>`, and under
 //! `BUNNY_TIMING_STRICT=1` the budgets of NFR-STUDIO-1 are asserted:
 //! a warm start to the first frame within 3 s, a save to its frame within
 //! 800 ms, a click and an override to their frames within 20 ms each.
@@ -281,6 +283,35 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
     let png = fs::read(pictures.join("home_preview.png")).expect("the picture was written");
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     assert_eq!(&png[16..24], &[0, 0, 1, 64, 0, 0, 0, 200], "320x200 at scale 1");
+
+    // a page: on the Mac the host's shell pictures a webview through an
+    // offscreen desk, and the picture paints the page where the
+    // placeholder was — red, as the document says
+    if cfg!(target_os = "macos") {
+        let source = fs::read_to_string(&lib).unwrap();
+        fs::write(
+            &lib,
+            format!(
+                "{source}\n/// A page from memory, in a box.\n#[bunny_ui::preview]\nfn page_preview() -> impl View {{\n    vstack!(webview_html(\"<body style=\\\"margin:0;background:#ff0000\\\"></body>\", \"\", NetworkPolicy::Deny).frame(200.0, 100.0))\n}}\n"
+            ),
+        )
+        .unwrap();
+        let began = Instant::now();
+        let out = Command::new(env!("CARGO_BIN_EXE_bunny"))
+            .args(["preview", "--png"])
+            .arg(&pictures)
+            .args(["--size", "200x100", "page_preview"])
+            .current_dir(&app)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        timing("page_png", began.elapsed(), None);
+        let png = fs::read(pictures.join("page_preview.png")).expect("the page's picture was written");
+        let (width, height, rgba) = bunny_cli::formats::png::decode(&png).expect("a png the house wrote");
+        assert_eq!((width, height), (200, 100));
+        let at = ((50 * 200) + 100) * 4;
+        assert_eq!(&rgba[at..at + 4], &[255, 0, 0, 255], "the page's red where the box stood");
+    }
 
     // goldens: the first `--snapshot` writes one, the second finds it the
     // same, and a padding moved fails by name with the box

@@ -313,9 +313,9 @@ pub mod __private {
     /// when it runs. Only a `preview` build has one.
     #[cfg(all(feature = "preview", not(target_arch = "wasm32")))]
     fn preview_host(preview: PreviewConfig) {
-        use bunny_ui_preview::host::{Config, Mode, serve};
+        use bunny_ui_preview::host::{Config, Mode, serve_with};
         if let Some(mode) = Mode::from_env() {
-            serve(
+            serve_with(
                 mode,
                 engines(),
                 Config {
@@ -323,6 +323,7 @@ pub mod __private {
                     manifest_dir: std::path::PathBuf::from(preview.manifest_dir),
                     framework: env!("CARGO_PKG_VERSION"),
                 },
+                pictures(),
             );
         }
     }
@@ -336,7 +337,7 @@ pub mod __private {
     /// pair a snapshot golden is made with on every OS.
     #[cfg(all(feature = "preview", feature = "shell", target_os = "macos"))]
     fn engines() -> bunny_ui_preview::host::Engines {
-        if std::env::var_os("BUNNY_PREVIEW_ENGINE").is_some_and(|engine| engine == "house") {
+        if house() {
             return bunny_ui_preview::host::Engines::house();
         }
         bunny_ui_preview::host::Engines {
@@ -348,6 +349,58 @@ pub mod __private {
     #[cfg(all(feature = "preview", not(all(feature = "shell", target_os = "macos")), not(target_arch = "wasm32")))]
     fn engines() -> bunny_ui_preview::host::Engines {
         bunny_ui_preview::host::Engines::house()
+    }
+
+    /// `BUNNY_PREVIEW_ENGINE=house`: the deterministic engines, and no
+    /// door to the platform's views — a golden must be the same on
+    /// every OS, and a page's pixels are the platform's.
+    #[cfg(all(feature = "preview", feature = "shell", target_os = "macos"))]
+    fn house() -> bool {
+        std::env::var_os("BUNNY_PREVIEW_ENGINE").is_some_and(|engine| engine == "house")
+    }
+
+    /// The door to the pictures of the platform's views: the macOS
+    /// shell's offscreen desk, where the shell is the Mac's — and none
+    /// under the house engines, where a page stays the placeholder it
+    /// is everywhere else.
+    #[cfg(all(feature = "preview", feature = "shell", target_os = "macos"))]
+    fn pictures() -> Option<Box<dyn bunny_ui_preview::host::Pictures>> {
+        if house() {
+            return None;
+        }
+        Some(Box::new(Desk(crate::platform::pictures::Desk::open())))
+    }
+
+    #[cfg(all(feature = "preview", not(all(feature = "shell", target_os = "macos")), not(target_arch = "wasm32")))]
+    fn pictures() -> Option<Box<dyn bunny_ui_preview::host::Pictures>> {
+        None
+    }
+
+    /// The macOS desk behind the host's door.
+    #[cfg(all(feature = "preview", feature = "shell", target_os = "macos"))]
+    struct Desk(crate::platform::pictures::Desk);
+
+    #[cfg(all(feature = "preview", feature = "shell", target_os = "macos"))]
+    impl bunny_ui_preview::host::Pictures for Desk {
+        fn picture(
+            &mut self,
+            id: bunny_ui_preview::host::HostId<'_>,
+            placement: &bunny_ui_core::layout::HostPlacement,
+        ) -> Option<bunny_ui_core::image_engine::ImageSource> {
+            self.0.picture(id.scene, placement)
+        }
+
+        fn turn(&mut self) -> bool {
+            self.0.turn()
+        }
+
+        fn busy(&self) -> bool {
+            self.0.busy()
+        }
+
+        fn sweep(&mut self, alive: &[bunny_ui_preview::host::HostId<'_>]) {
+            self.0.sweep(|scene, path| alive.iter().any(|id| id.scene == scene && id.path == path));
+        }
     }
 
     /// The part of hot reload inside the app — and the preview entries a

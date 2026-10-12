@@ -39,8 +39,11 @@
 //!   the tool caches it until the host says `Forget`. A `Native` image —
 //!   a platform surface — has no bytes to send, and a webview or a video
 //!   is a `HostBox` on the frame: the tool draws a placeholder there
-//!   unless the host's shell gave it a picture (`host::Pictures`), which
-//!   then rides the frame as an image where the box stood.
+//!   unless the host's shell gave it a picture (`host::Pictures` — the
+//!   macOS shell's offscreen desk does, under the facade), which then
+//!   rides the frame as an image where the box stood, and again each
+//!   time the page's pixels move. A snapshot asked while a page loads
+//!   waits for its picture, up to five seconds.
 //! - Text arrives wrapped: a `TextLine` is one already-broken line in the
 //!   host's font metrics. The tool paints it; it does not shape it again.
 //! - Fonts are named on the wire (the family's name, empty for the system

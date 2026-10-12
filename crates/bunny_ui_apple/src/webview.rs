@@ -86,6 +86,10 @@ unsafe extern "C" {
 pub enum WebviewEvent {
     /// The engine committed a navigation — link clicks included.
     Navigated { path: String, url: String },
+    /// The engine finished loading what it committed — the page's load
+    /// event fired, and the page stands as the engine shows it. A
+    /// picture taken now is the page, not its first paint.
+    Loaded { path: String, url: String },
     /// A link in a DOCUMENT was activated. The engine did not follow
     /// it: the document stays, and the app hears the url.
     Linked { path: String, url: String },
@@ -266,6 +270,24 @@ extern "C" fn bridge_committed(_this: Id, _sel: Sel, view: Id, _navigation: Id) 
         }
         let url = to_string(msg_id(url, sel("absoluteString")));
         dispatch(WebviewEvent::Navigated { path, url });
+    }
+}
+
+/// `webView:didFinishNavigation:` — the load event fired: the page is
+/// what the engine shows, and a picture of it is the page. A view the
+/// shell no longer files (swept between the ask and the answer)
+/// reports nothing.
+extern "C" fn bridge_finished(_this: Id, _sel: Sel, view: Id, _navigation: Id) {
+    let Some(path) = key_of(view) else {
+        return;
+    };
+    unsafe {
+        let url = msg_id(view, sel("URL"));
+        if url.is_null() {
+            return;
+        }
+        let url = to_string(msg_id(url, sel("absoluteString")));
+        dispatch(WebviewEvent::Loaded { path, url });
     }
 }
 
@@ -450,6 +472,12 @@ fn bridge() -> Id {
                 bridge,
                 sel("webView:didCommitNavigation:"),
                 bridge_committed as *const c_void,
+                message_types.as_ptr(),
+            );
+            class_addMethod(
+                bridge,
+                sel("webView:didFinishNavigation:"),
+                bridge_finished as *const c_void,
                 message_types.as_ptr(),
             );
             let failure_types = CString::new("v@:@@@").expect("type encoding");
@@ -718,6 +746,35 @@ pub fn update(path: &str, view: Id, spec: &HostSpec) {
             }
         }
     }
+}
+
+/// The spec's fingerprint — what a shell compares to know whether a
+/// mounted page must be re-instructed: a changed url, script set or
+/// declared hook re-instructs, the same spec never does. A document
+/// stamps by its digest, never by its pages (the letter is the app's
+/// to hold, not the stamp's to copy every frame); the separators are
+/// control characters no url or script spells. `full_motion` rides for
+/// symmetry — this backend does not serve MediaEmulation (WKWebView
+/// offers no public override), but the stamp must not lie about what
+/// the spec says. A video spec stamps empty: nothing mounts for it.
+pub fn stamp(spec: &HostSpec) -> String {
+    let HostSpec::Webview { url, document, scripts, console, requests, full_motion } = spec else {
+        return String::new();
+    };
+    let mut stamp = String::from(&**url);
+    if let Some(document) = document {
+        stamp.push('\u{3}');
+        stamp.push_str(&format!("{:016x}", document.digest));
+    }
+    stamp.push('\u{2}');
+    stamp.push(if *console { 'c' } else { '-' });
+    stamp.push(if *requests { 'r' } else { '-' });
+    stamp.push(if *full_motion { 'm' } else { '-' });
+    for script in scripts.iter() {
+        stamp.push('\u{1}');
+        stamp.push_str(script);
+    }
+    stamp
 }
 
 /// Where the engine is right now — the committed url, the same string
