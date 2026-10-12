@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use bunny_ui_core as bunny_ui;
 use bunny_ui::image_engine::ImageSource;
 use bunny_ui::prelude::*;
-use bunny_ui::preview::{Preview, Traits as CoreTraits};
+use bunny_ui::preview::{Device, Preview, Traits as CoreTraits};
 use bunny_ui_preview::convert::{core_traits, image_ref, image_source, lower, modifier, raise, resource, site_box, traits};
 use bunny_ui_preview::wire::{self, Strings};
 
