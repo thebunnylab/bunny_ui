@@ -15,6 +15,14 @@
 //! swaps the app's — and the state a preview made survives, anchored under
 //! the host's own boundary. Each new generation sends a new `Ready`.
 //!
+//! A platform view's box — a webview, a video — rides every frame as a
+//! `HostBox` with its kind and its rect, so the tool draws an honest
+//! placeholder where the platform would composite its view. A shell
+//! that can picture such a view hands the host a [`Pictures`] door, and
+//! the picture is spliced into the display list where the host stood
+//! (`DisplayList::with_host_pixels`); without a door the box is all
+//! there is, and the placeholder is the truth.
+//!
 //! A panic inside one preview's pass is caught at that scene's boundary:
 //! the tool hears `Panicked { preview }`, the scene shows the message
 //! until the next generation, and the other scenes keep rendering. A panic
@@ -55,14 +63,15 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use bunny_ui_core::image_engine::ImageEngine;
+use bunny_ui_core::host::HostSpec;
+use bunny_ui_core::image_engine::{ImageEngine, ImageSource};
 use bunny_ui_core::layout::{Proposal, Size};
 use bunny_ui_core::prelude::*;
 use bunny_ui_core::preview::Traits;
 use bunny_ui_core::text_engine::TextEngine;
 use bunny_ui_hot::preview::preview_entry;
 
-use bunny_ui_core::layout::DisplayList;
+use bunny_ui_core::layout::{DisplayList, HostPlacement};
 use bunny_ui_core::provenance::{self, Override, SiteKey, SitePlacement};
 
 use crate::convert;
@@ -82,6 +91,11 @@ impl Engines {
         Engines { text: Rc::new(PixelFont), images: Rc::new(bunny_ui_core::image_engine::RawImages::default()) }
     }
 }
+
+/// A shell's door to the pixels of a platform view: the page a webview
+/// shows, the frame a video is on — by the host's placement, `None`
+/// where the shell has no picture to give.
+pub type Pictures = Box<dyn Fn(&HostPlacement) -> Option<ImageSource>>;
 
 /// What the host says about the app it runs.
 #[derive(Clone, Debug)]
@@ -152,12 +166,13 @@ struct Sent {
     size: Size,
     commands: Vec<wire::Draw>,
     sites: Vec<wire::SiteBox>,
+    hosts: Vec<wire::HostBox>,
     strings: Vec<String>,
 }
 
 impl Sent {
-    fn same(&self, size: Size, commands: &[wire::Draw], sites: &[wire::SiteBox], strings: &[String]) -> bool {
-        self.size == size && self.commands == commands && self.sites == sites && self.strings == strings
+    fn same(&self, size: Size, commands: &[wire::Draw], sites: &[wire::SiteBox], hosts: &[wire::HostBox], strings: &[String]) -> bool {
+        self.size == size && self.commands == commands && self.sites == sites && self.hosts == hosts && self.strings == strings
     }
 }
 
@@ -166,7 +181,16 @@ struct Pass {
     size: Size,
     display: DisplayList,
     sites: Vec<SitePlacement>,
+    hosts: Vec<HostPlacement>,
     body_passes: u32,
+}
+
+/// The word a platform view's box carries on the wire.
+fn host_kind(spec: &HostSpec) -> &'static str {
+    match spec {
+        HostSpec::Webview { .. } => "webview",
+        HostSpec::Video { .. } => "video",
+    }
 }
 
 thread_local! {
@@ -219,13 +243,15 @@ pub struct Host {
     sent_resources: HashSet<u64>,
     generation: u32,
     sink: Box<dyn FnMut(ToIde)>,
+    /// A shell's pictures of its platform views, when it has them.
+    pictures: Option<Pictures>,
 }
 
 impl Host {
     /// A host that sends through `sink`. Installs the pass guard.
     pub fn new(engines: Engines, config: Config, sink: Box<dyn FnMut(ToIde)>) -> Host {
         guard_passes();
-        Host { engines, config, scenes: Vec::new(), next_scene: 0, sent_resources: HashSet::new(), generation: bunny_ui_hot::generation(), sink }
+        Host { engines, config, scenes: Vec::new(), next_scene: 0, sent_resources: HashSet::new(), generation: bunny_ui_hot::generation(), sink, pictures: None }
     }
 
     /// `Hello`, then the first `Ready`.
@@ -271,6 +297,17 @@ impl Host {
             }
         }
         (self.sink)(ToIde::Ready { generation: self.generation, previews, missing });
+    }
+
+    /// The host with a shell's pictures of its platform views: each
+    /// spliced into the frame where its host stood, and sent as the
+    /// resource it is. Without one the boxes ride the frame alone.
+    pub fn with_pictures(mut self, pictures: Pictures) -> Host {
+        self.pictures = Some(pictures);
+        for scene in &mut self.scenes {
+            scene.dirty = true;
+        }
+        self
     }
 
     /// One message from the tool.
@@ -506,8 +543,9 @@ impl Host {
             };
             let display = scene.runtime.display_frame(&root, size);
             let sites = scene.runtime.sites();
+            let hosts = scene.runtime.hosts();
             let stats = bunny_ui_core::stats::take();
-            Pass { size, display, sites, body_passes: stats.body_passes }
+            Pass { size, display, sites, hosts, body_passes: stats.body_passes }
         }));
         IN_PASS.with(|flag| flag.set(false));
         match outcome {
@@ -551,13 +589,28 @@ impl Host {
     fn render(&mut self, index: usize) -> bool {
         let began = Instant::now();
         self.scenes[index].dirty = false;
-        let Some(Pass { size, display, sites, body_passes }) = self.pass(index) else { return false };
+        let Some(Pass { size, display, sites, hosts, body_passes }) = self.pass(index) else { return false };
+        // a shell with pictures of its platform views: each spliced where
+        // its host stood, so the tool paints the page and not a placeholder
+        let display = match &self.pictures {
+            Some(door) => {
+                let pictures: Vec<(usize, bunny_ui_core::layout::Rect, ImageSource)> =
+                    hosts.iter().filter_map(|host| door(host).map(|picture| (host.mark, host.frame, picture))).collect();
+                if pictures.is_empty() { display } else { display.with_host_pixels(&pictures) }
+            }
+            None => display,
+        };
         let scene = &self.scenes[index];
         let mut strings = wire::Strings::new();
         let (commands, images) = convert::lower(&display, &mut strings);
         let sites: Vec<wire::SiteBox> = sites.iter().map(|placement| convert::site_box(placement, &mut strings)).collect();
+        let hosts: Vec<wire::HostBox> = hosts
+            .iter()
+            .enumerate()
+            .map(|(index, host)| wire::HostBox { index: index as u32, kind: strings.intern(host_kind(&host.spec)), frame: host.frame.into() })
+            .collect();
         let table = strings.into_table();
-        if scene.last.as_ref().is_some_and(|last| last.same(size, &commands, &sites, &table)) {
+        if scene.last.as_ref().is_some_and(|last| last.same(size, &commands, &sites, &hosts, &table)) {
             return false;
         }
         for image in images {
@@ -584,7 +637,7 @@ impl Host {
             strings: table.clone(),
             commands: commands.clone(),
             sites: sites.clone(),
-            hosts: Vec::new(),
+            hosts: hosts.clone(),
             metrics: wire::Metrics {
                 build_ms: 0.0,
                 layout_ms: began.elapsed().as_secs_f64() * 1000.0,
@@ -592,7 +645,7 @@ impl Host {
                 commands: commands.len() as u32,
             },
         };
-        scene.last = Some(Sent { size, commands, sites, strings: table });
+        scene.last = Some(Sent { size, commands, sites, hosts, strings: table });
         (self.sink)(ToIde::Frame(frame));
         true
     }
