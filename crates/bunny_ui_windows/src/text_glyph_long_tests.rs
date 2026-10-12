@@ -355,3 +355,35 @@ fn paragraph_long_native_capacity_and_safe_boundary_witness() {
         }
     }).unwrap();
 }
+
+#[test]
+fn paragraph_native_reference_retains_ascii_at_font_and_length_boundaries() {
+    let engine = DirectWriteEngine::new();
+    let mut failures = Vec::new();
+    for size in [12.0, 13.0, 19.0] {
+        let font = FontSpec {
+            size,
+            ..FontSpec::DEFAULT
+        };
+        for length in [1, 32, 1024, 2048, 4095, 4096, 4097, 8192, 16384] {
+            let text = "a".repeat(length);
+            let layout = tests::reference_layout(&engine, &text, &font);
+            let records = raster::reference_records(&layout);
+            let units: usize = records.iter().map(|run| run.source.len()).sum();
+            let glyphs: usize = records.iter().map(|run| run.glyphs.len()).sum();
+            eprintln!(
+                "ASCII reference size={size}, length={length}, units={units}, glyphs={glyphs}, runs={}",
+                records.len()
+            );
+            if units != length || glyphs != length {
+                failures.push(format!(
+                    "size={size}, length={length}, units={units}, glyphs={glyphs}"
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "independent ASCII reference failures: {failures:#?}"
+    );
+}

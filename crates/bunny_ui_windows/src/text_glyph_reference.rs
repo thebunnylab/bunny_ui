@@ -14,6 +14,8 @@ struct Renderer {
     references: AtomicU32,
     scale: f32,
     trace: bool,
+    callbacks: AtomicU32,
+    empty_callbacks: AtomicU32,
     records: RefCell<Vec<NativeRun>>,
 }
 // DWRITE_GLYPH_RUN_DESCRIPTION from the same pinned dwrite.h. Text positions
@@ -197,6 +199,10 @@ unsafe extern "system" fn glyphs(
     description: *const c_void,
     _: *mut c_void,
 ) -> Hresult {
+    // SAFETY: the native caller holds this synchronous renderer alive.
+    unsafe {
+        (*this).callbacks.fetch_add(1, Ordering::Relaxed);
+    }
     if run.is_null() {
         return -2_147_467_261;
     }
@@ -205,6 +211,12 @@ unsafe extern "system" fn glyphs(
     unsafe {
         let run = &*run;
         if run.count == 0 {
+            (*this).empty_callbacks.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "empty native glyph callback: em_size={}, description_present={}",
+                run.em_size,
+                !description.is_null()
+            );
             return 0;
         }
         if run.indices.is_null() || run.advances.is_null() || run.offsets.is_null() {
@@ -328,19 +340,23 @@ fn draw(layout: &Com<IDWriteTextLayout>, scale: f32, trace: bool) -> Vec<NativeR
         references: AtomicU32::new(1),
         scale,
         trace,
+        callbacks: AtomicU32::new(0),
+        empty_callbacks: AtomicU32::new(0),
         records: RefCell::new(Vec::new()),
     })))
     .unwrap();
     // SAFETY: exact IDWriteTextLayout::Draw slot and an owned text renderer.
     unsafe {
         let pointer = layout.as_ptr().cast::<Layout>();
-        assert!(com_ok(((*(*pointer).vtbl).draw)(
-            pointer,
-            std::ptr::null_mut(),
-            renderer.as_ptr(),
-            8.0,
-            8.0
-        )));
+        let status =
+            ((*(*pointer).vtbl).draw)(pointer, std::ptr::null_mut(), renderer.as_ptr(), 8.0, 8.0);
+        eprintln!(
+            "native draw: thread={:?}, status={status:#x}, callbacks={}, empty={}",
+            std::thread::current().name(),
+            (*renderer.as_ptr()).callbacks.load(Ordering::Relaxed),
+            (*renderer.as_ptr()).empty_callbacks.load(Ordering::Relaxed)
+        );
+        assert!(com_ok(status));
         assert_eq!((*renderer.as_ptr()).references.load(Ordering::Acquire), 1);
         (*renderer.as_ptr()).records.take()
     }

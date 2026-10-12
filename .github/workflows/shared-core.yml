@@ -1,4 +1,5 @@
 name: Shared core correctness
+run-name: ${{ inputs.windows_text_probe && 'Windows text probe' || 'Shared core correctness' }}
 
 on:
   pull_request:
@@ -16,12 +17,17 @@ on:
       - 'scripts/record-native-text-environment.py'
       - '.github/workflows/shared-core.yml'
   workflow_dispatch:
+    inputs:
+      windows_text_probe:
+        description: Run only Windows correctness and legacy color jobs; not full CI acceptance
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: shared-core-${{ github.ref }}
+  group: shared-core-${{ github.ref }}-${{ inputs.windows_text_probe && 'probe' || 'full' }}
   cancel-in-progress: true
 
 jobs:
@@ -30,11 +36,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: windows-2025
-            platform: bunny-ui-windows
-          - runner: macos-26
-            platform: bunny-ui-apple
+        # PRs and default dispatch keep the full matrix. A manual probe cannot
+        # cancel that matrix and is explicitly named as partial verification.
+        include: ${{ fromJSON(inputs.windows_text_probe && '[{"runner":"windows-2025","platform":"bunny-ui-windows"}]' || '[{"runner":"windows-2025","platform":"bunny-ui-windows"},{"runner":"macos-26","platform":"bunny-ui-apple"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     defaults:
