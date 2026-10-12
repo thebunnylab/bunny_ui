@@ -85,6 +85,20 @@ impl Component for Tapper {
     }
 }
 
+/// A page: the OS webview in a box.
+#[derive(Clone)]
+struct Page;
+
+impl Component for Page {
+    fn body(self) -> impl View {
+        vstack!(text("docs"), webview("https://docs.example.test").frame(160.0, 90.0))
+    }
+}
+
+fn make_page() -> Output {
+    Output::of(Page)
+}
+
 fn make_zoomer() -> Output {
     Output::of(Zoomer { scale: State::new(1.0) })
 }
@@ -110,6 +124,16 @@ static TAPPER: PreviewEntry = PreviewEntry::new(
     Meta { ident: "tapper", name: "Tapper", scope: "Gestures", example: "tapper", module: "host", file: "src/lib.rs", line: 14 },
     make_tapper,
 );
+static PAGE: PreviewEntry = PreviewEntry::new(
+    Meta { ident: "page", name: "Page", scope: "Hosts", example: "page", module: "host", file: "src/lib.rs", line: 17 },
+    make_page,
+);
+
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+pub fn bunny_preview__page() -> &'static PreviewEntry {
+    &PAGE
+}
 
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
@@ -142,7 +166,7 @@ fn manifest_dir() -> PathBuf {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
         dir.join("src/lib.rs"),
-        "use bunny_ui::prelude::*;\n\n#[preview(name = \"Card\", scope = \"Cards\")]\nfn card() -> impl View { text(\"\") }\n\n#[preview(name = \"Boom\", scope = \"Cards\")]\nfn boom() -> impl View { text(\"\") }\n\n#[preview]\nfn ghost() -> impl View { text(\"\") }\n\n#[preview(name = \"Zoomer\", scope = \"Gestures\")]\nfn zoomer() -> impl View { text(\"\") }\n\n#[preview(name = \"Tapper\", scope = \"Gestures\")]\nfn tapper() -> impl View { text(\"\") }\n",
+        "use bunny_ui::prelude::*;\n\n#[preview(name = \"Card\", scope = \"Cards\")]\nfn card() -> impl View { text(\"\") }\n\n#[preview(name = \"Boom\", scope = \"Cards\")]\nfn boom() -> impl View { text(\"\") }\n\n#[preview]\nfn ghost() -> impl View { text(\"\") }\n\n#[preview(name = \"Zoomer\", scope = \"Gestures\")]\nfn zoomer() -> impl View { text(\"\") }\n\n#[preview(name = \"Tapper\", scope = \"Gestures\")]\nfn tapper() -> impl View { text(\"\") }\n\n#[preview(name = \"Page\", scope = \"Hosts\")]\nfn page() -> impl View { text(\"\") }\n",
     )
     .unwrap();
     dir
@@ -193,7 +217,7 @@ fn hello_lists_what_the_binary_exports_and_names_what_it_does_not() {
     match &messages[1] {
         ToIde::Ready { generation: 0, previews, missing } => {
             let idents: Vec<&str> = previews.iter().map(|p| p.ident.as_str()).collect();
-            assert_eq!(idents, ["card", "boom", "zoomer", "tapper"]);
+            assert_eq!(idents, ["card", "boom", "zoomer", "tapper", "page"]);
             assert_eq!(previews[0].id, "src/lib.rs#card");
             assert_eq!(previews[0].scope, "Cards");
             assert_eq!(previews[0].traits, Traits::default());
@@ -417,3 +441,43 @@ fn a_touch_on_the_button_counts() {
     assert!(says(&frame, "taps 1"), "{:?}", frame.strings);
 }
 
+/// A webview's box rides the frame with its kind and rect, and no
+/// picture — the tool's placeholder is the truth — until a shell's
+/// door answers, when the picture is spliced where the box stood and
+/// sent as the resource it is.
+#[test]
+fn a_host_box_rides_the_frame_and_a_door_fills_it() {
+    let (mut host, seen) = host();
+    host.handle(select("page", fixed(200.0, 140.0)));
+    assert!(host.tick());
+    let frame = frames(&seen).remove(0);
+    assert_eq!(frame.hosts.len(), 1, "{:?}", frame.hosts);
+    let webview = frame.hosts[0].clone();
+    assert_eq!(frame.strings.get(webview.kind as usize).map(String::as_str), Some("webview"));
+    assert_eq!((webview.frame.size.width, webview.frame.size.height), (160.0, 90.0));
+    assert!(!frame.commands.iter().any(|command| matches!(command, wire::Draw::Image { .. })), "no door, no picture");
+
+    let mut host = host.with_pictures(Box::new(|placement| {
+        assert!(matches!(placement.spec, bunny_ui::host::HostSpec::Webview { .. }));
+        Some(bunny_ui::image_engine::ImageSource::Rgba { key: 77, size: (2, 2), rgba: Rc::from(vec![9u8; 16]) })
+    }));
+    assert!(host.tick(), "the door's picture is a new frame");
+    let messages = seen.borrow_mut().drain(..).collect::<Vec<_>>();
+    assert!(
+        messages.iter().any(|message| matches!(message, ToIde::Resource(wire::Resource { key: 77, kind: wire::ResourceKind::Rgba { size: (2, 2), .. } }))),
+        "the picture travels once as a resource: {messages:?}"
+    );
+    let frame = messages
+        .iter()
+        .find_map(|message| match message {
+            ToIde::Frame(frame) => Some(frame.clone()),
+            _ => None,
+        })
+        .expect("a frame followed");
+    assert!(
+        frame.commands.iter().any(|command| matches!(command, wire::Draw::Image { rect, image } if *rect == webview.frame && image.key == 77)),
+        "the picture is drawn where the box stood: {:?}",
+        frame.commands
+    );
+    assert_eq!(frame.hosts.len(), 1, "the box still rides the frame");
+}

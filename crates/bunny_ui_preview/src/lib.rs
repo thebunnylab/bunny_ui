@@ -28,16 +28,19 @@
 //!   wire's and back, a `Patch` to a `Modifier`.
 //! - With the `host` feature, [`host`]: the runner an app becomes under
 //!   `bunny preview` — one scene per selected variant, the panic boundary,
-//!   the serving loop, the headless check, and a snapshot on request: the
+//!   the serving loop, the headless check, a snapshot on request (the
 //!   frame's pixels through the scene's own engines, what `bunny preview
-//!   --png` writes.
+//!   --png` writes), the boxes of the platform's views on every frame
+//!   and a door for their pictures.
 //!
 //! ## Production gotchas
 //!
 //! - A resource (an image's pixels, a vector icon) travels once per key;
 //!   the tool caches it until the host says `Forget`. A `Native` image —
-//!   a platform surface — has no bytes to send: the tool draws a
-//!   placeholder in its frame until the host ships a snapshot of it.
+//!   a platform surface — has no bytes to send, and a webview or a video
+//!   is a `HostBox` on the frame: the tool draws a placeholder there
+//!   unless the host's shell gave it a picture (`host::Pictures`), which
+//!   then rides the frame as an image where the box stood.
 //! - Text arrives wrapped: a `TextLine` is one already-broken line in the
 //!   host's font metrics. The tool paints it; it does not shape it again.
 //! - Fonts are named on the wire (the family's name, empty for the system
