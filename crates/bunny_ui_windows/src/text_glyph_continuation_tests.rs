@@ -377,3 +377,6 @@ fn paragraph_native_cut_flags_record_substitution_and_placement_stages() {
         }).unwrap();
     }
 }
+
+#[path = "text_glyph_joining_tests.rs"]
+mod joining;
