@@ -13,6 +13,17 @@ fn reference(
     color: Color,
     scale: f32,
 ) -> Vec<u8> {
+    reference_path(engine, text, font, color, scale, false)
+}
+
+fn reference_path(
+    engine: &DirectWriteEngine,
+    text: &str,
+    font: &FontSpec,
+    color: Color,
+    scale: f32,
+    via_context4: bool,
+) -> Vec<u8> {
     let surface = Surface::new(engine.factories.as_ref().unwrap(), 640, 160, scale).unwrap();
     let layout = reference_layout(engine, text, font);
     let color = D2dColor {
@@ -27,13 +38,27 @@ fn reference(
             // SAFETY: high-level full TextLayout is the independent pixel reference;
             // its own native analysis/shaping pipeline is untouched.
             unsafe {
-                ((*(*target.as_ptr()).vtbl).draw_text_layout)(
-                    target.as_ptr(),
-                    D2dPoint { x: 8.0, y: 8.0 },
-                    layout.as_ptr(),
-                    brush.as_ptr(),
-                    D2D1_DRAW_TEXT_COLOR_FONT,
-                );
+                if via_context4 {
+                    let context: Com<native::Context4> =
+                        ffi::query(target, &CONTEXT4, "reference native context4").unwrap();
+                    ((*(*context.as_ptr()).vtbl).draw_layout)(
+                        context.as_ptr(),
+                        D2dPoint { x: 8.0, y: 8.0 },
+                        layout.as_ptr(),
+                        brush.as_ptr(),
+                        std::ptr::null_mut(),
+                        0,
+                        D2D1_DRAW_TEXT_COLOR_FONT,
+                    );
+                } else {
+                    ((*(*target.as_ptr()).vtbl).draw_text_layout)(
+                        target.as_ptr(),
+                        D2dPoint { x: 8.0, y: 8.0 },
+                        layout.as_ptr(),
+                        brush.as_ptr(),
+                        D2D1_DRAW_TEXT_COLOR_FONT,
+                    );
+                }
             }
             Ok(())
         })
@@ -255,6 +280,16 @@ fn paragraph_raster_translated_svg_bitmap_and_colr_paths_match_native_pixels() {
         for text in ["a", "b", "c", "e", "abce"] {
             let expected = reference(&engine, text, &font, ink, scale);
             let actual = rendered(&engine, text, &font, ink, scale, 1);
+            if actual != expected {
+                let native4 = reference_path(&engine, text, &font, ink, scale, true);
+                let modern = rendered(&engine, text, &font, ink, scale, 0);
+                eprintln!(
+                    "context4 layout matches reference={}, translated={}, modern glyphs match reference={}",
+                    native4 == expected,
+                    native4 == actual,
+                    modern == expected
+                );
+            }
             assert_pixels(
                 &expected,
                 &actual,

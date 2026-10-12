@@ -69,7 +69,16 @@ pub(super) struct Context4 {
 }
 #[repr(C)]
 pub(super) struct Context4Vtbl {
-    _prefix_0_110: [usize; 111],
+    _prefix_0_109: [usize; 110],
+    pub(super) draw_layout: unsafe extern "system" fn(
+        *mut Context4,
+        D2dPoint,
+        *mut crate::text::IDWriteTextLayout,
+        *mut ID2D1Brush,
+        *mut c_void,
+        u32,
+        u32,
+    ),
     pub(super) draw_bitmap:
         unsafe extern "system" fn(*mut Context4, u32, D2dPoint, *const GlyphRun<'_>, u32, u32),
     pub(super) draw_svg: unsafe extern "system" fn(
