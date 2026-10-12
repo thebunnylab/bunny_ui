@@ -46,7 +46,7 @@ pub fn clusters_stay_whole(engine: &dyn TextEngine) {
         let text = clusters.concat();
         let allowed = boundaries(clusters);
         for width in [0.0, 1.0, 8.0, 32.0, 80.0] {
-            let lines = break_lines(&text, &font, width, engine, &MeasureCache::default());
+            let lines = break_lines(&text, &font, width, engine, &MeasureCache::default()).unwrap();
             check_ranges(&text, &allowed, &lines);
         }
     }
@@ -62,7 +62,8 @@ pub fn clusters_stay_whole(engine: &dyn TextEngine) {
             width / 2.0,
             engine,
             &MeasureCache::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             lines,
             [(0, cluster.len())],
@@ -88,8 +89,8 @@ pub fn retained_editor_keeps_atomic_lines(engine: Rc<dyn TextEngine>) {
         let text = clusters.concat();
         let allowed = boundaries(clusters);
         content.set(text.clone());
-        runtime.display_frame(&view, size);
-        let layout = runtime.layout(&view, Proposal::exact(size));
+        runtime.display_frame(&view, size).unwrap();
+        let layout = runtime.layout(&view, Proposal::exact(size)).unwrap();
         let ranges: Vec<_> = layout
             .display
             .iter()
@@ -102,18 +103,18 @@ pub fn retained_editor_keeps_atomic_lines(engine: Rc<dyn TextEngine>) {
             .collect();
         check_ranges(&text, &allowed, &ranges);
         assert!(runtime.focus_named("editor"));
-        runtime.key(EditCommand::Home(false));
+        runtime.key(EditCommand::Home(false)).unwrap();
         for _ in 0..=ranges.len() {
-            let caret = runtime.ime_snapshot().unwrap().selected.0;
+            let caret = runtime.ime_snapshot().unwrap().unwrap().selected.0;
             assert!(
                 allowed.contains(&utf16_to_byte(&text, caret)),
                 "vertical motion split a cluster"
             );
-            runtime.key(EditCommand::Down(false));
+            runtime.key(EditCommand::Down(false)).unwrap();
         }
-        runtime.key(EditCommand::SelectAll);
+        runtime.key(EditCommand::SelectAll).unwrap();
         assert_eq!(
-            runtime.key(EditCommand::Copy).output.as_deref(),
+            runtime.key(EditCommand::Copy).unwrap().output.as_deref(),
             Some(text.as_str())
         );
     }

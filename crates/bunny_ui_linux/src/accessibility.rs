@@ -643,6 +643,10 @@ impl Service {
                     match error {
                         bunny_ui::accessibility::ActionError::Unavailable => Failure::Unavailable,
                         bunny_ui::accessibility::ActionError::Unsupported => Failure::Unsupported,
+                        bunny_ui::accessibility::ActionError::Text(error) => {
+                            eprintln!("bunny_ui: accessible text operation failed: {error}");
+                            Failure::Text(error)
+                        }
                     }
                 })?;
             owner.redraw();
@@ -930,6 +934,7 @@ fn locale() -> String {
 
 #[derive(Debug, PartialEq)]
 enum Failure {
+    Text(bunny_ui::text_error::TextError),
     Unavailable,
     Unsupported,
     Arguments,
@@ -937,6 +942,10 @@ enum Failure {
 impl Failure {
     fn details(&self) -> (&'static CStr, &'static CStr) {
         match self {
+            Self::Text(_) => (
+                c"org.freedesktop.DBus.Error.Failed",
+                c"Native text operation failed",
+            ),
             Self::Unavailable => (
                 c"org.freedesktop.DBus.Error.UnknownObject",
                 c"The accessible object is no longer available",

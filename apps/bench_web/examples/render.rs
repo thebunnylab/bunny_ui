@@ -8,12 +8,13 @@
 
 use bunny_ui::layout::Size;
 
-fn main() {
+fn main() -> Result<(), bunny_ui::text_error::TextError> {
     let page = bunny_ui::ssr::render_document(
         &bench_web::bench(),
         Size { width: 760.0, height: 640.0 },
         "bench_web.wasm",
         "glue_dom.js?v=5",
-    );
+    )?;
     println!("{page}");
+    Ok(())
 }

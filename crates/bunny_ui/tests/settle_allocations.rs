@@ -132,10 +132,10 @@ where
     stats::set_alloc_probe(Some(made));
     let runtime = Runtime::new();
     let page = Page { items: State::new(Rc::new(Vec::new())), body };
-    let _ = runtime.dom_frame(&page, SIZE);
+    let _ = runtime.dom_frame(&page, SIZE).unwrap();
     page.items.set(items(count));
     let _ = stats::take();
-    let _ = runtime.dom_frame(&page, SIZE);
+    let _ = runtime.dom_frame(&page, SIZE).unwrap();
     stats::take().allocs(stage)
 }
 

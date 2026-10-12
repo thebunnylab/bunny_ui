@@ -3,6 +3,7 @@ use super::*;
 mod support;
 use bunny_ui::image_engine::RawImages;
 use bunny_ui::layout::Point;
+use bunny_ui::text_source::TextContent;
 use support::{ContextEngine, contextual_line};
 
 #[test]
@@ -18,11 +19,12 @@ fn paragraph_cached_decorator_forwards_context_and_does_not_alias_rasters() {
     let font = FontSpec::DEFAULT;
     let mut images = Vec::new();
     for line in [&a, &b, &a, &b] {
-        assert!(cached.measure_paragraph_line(line, &font).width > 0.0);
-        assert!(cached.paragraph_line_geometry(line, &font).is_some());
+        assert!(cached.measure_paragraph_line(line, &font).unwrap().width > 0.0);
+        assert!(cached.paragraph_line_geometry(line, &font).unwrap().is_some());
         images.push(
             cached
                 .raster_paragraph_line(line, &font, Color::BLACK, 1)
+                .unwrap()
                 .unwrap(),
         );
     }
@@ -36,6 +38,7 @@ fn paragraph_cached_decorator_forwards_context_and_does_not_alias_rasters() {
     let oversized = source.line(0..1).unwrap();
     cached
         .raster_paragraph_line(&oversized, &font, Color::BLACK, 1)
+        .unwrap()
         .unwrap();
     assert_eq!(
         cache.entries.borrow().len(),
@@ -76,7 +79,8 @@ fn paragraph_patch_compaction_keeps_context_and_releases_unrelated_document() {
             Color::WHITE,
             &engine,
             &RawImages::default(),
-        );
+        )
+        .unwrap();
         let compact = software_patch::patch_coordinates(&display, physical, factor).unwrap();
         assert_eq!(display.as_slice(), compact.as_slice());
         let DrawCommand::TextLine { content, range, .. } = &compact.as_slice()[0] else {
@@ -86,7 +90,7 @@ fn paragraph_patch_compaction_keeps_context_and_releases_unrelated_document() {
             content.line(range.0..range.1).unwrap().paragraph().text(),
             "\u{202e}abc def\u{202c}"
         );
-        let scene = software_patch::Scene::new(
+        let scene = software_patch::Scene::prepare_scene(
             &display,
             physical,
             scale,
@@ -94,17 +98,19 @@ fn paragraph_patch_compaction_keeps_context_and_releases_unrelated_document() {
             &engine,
             &MeasureCache::default(),
         )
+        .unwrap()
         .unwrap();
         drop(display);
         assert!(lifetime.upgrade().is_none());
         assert_eq!(
-            scene.raster(&engine, &RawImages::default()).pixels(),
+            scene.raster(&engine, &RawImages::default()).unwrap().pixels(),
             expected.pixels()
         );
         let mut retained = None;
         assert_eq!(
             scene
                 .raster_in(&mut retained, &engine, &RawImages::default())
+                .unwrap()
                 .pixels(),
             expected.pixels()
         );

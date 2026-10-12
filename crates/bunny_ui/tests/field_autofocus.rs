@@ -14,9 +14,10 @@ fn a_long_auto_focused_editor_reveals_its_caret_before_the_first_key() {
         width: 240.0,
         height: 160.0,
     };
-    runtime.display_frame(&view, size);
+    runtime.display_frame(&view, size).unwrap();
     let caret = runtime
         .ime_snapshot()
+        .unwrap()
         .expect("auto-focused editor")
         .caret_rect;
     assert!(
@@ -29,8 +30,9 @@ fn a_long_auto_focused_editor_reveals_its_caret_before_the_first_key() {
         offset.y > 0.0,
         "the initial viewport must follow the end caret"
     );
-    assert!(runtime.key(EditCommand::Insert("x".into())).applied);
-    runtime.display_frame(&view, size);
+    assert!(runtime.key(EditCommand::Insert("x".into())).unwrap()
+            .applied);
+    runtime.display_frame(&view, size).unwrap();
     assert_eq!(
         runtime.scroll_offset(&path).y,
         offset.y,

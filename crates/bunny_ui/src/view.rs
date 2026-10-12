@@ -693,7 +693,8 @@ mod tests {
                 BASE.with(|cell| cell.set(base));
                 DEEPEST.with(|cell| cell.set(base));
                 let _ = runtime
-                    .settled_layout(&root, Proposal::exact(Size { width: 900.0, height: 700.0 }));
+                    .settled_layout(&root, Proposal::exact(Size { width: 900.0, height: 700.0 }))
+                    .unwrap();
                 let deepest = DEEPEST.with(|cell| cell.get());
                 (base - deepest) / depth
             })

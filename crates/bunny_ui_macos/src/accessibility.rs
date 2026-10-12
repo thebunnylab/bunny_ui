@@ -810,7 +810,7 @@ mod tests {
             width: 480.0,
             height: 640.0,
         };
-        runtime.display_frame(&app, size);
+        runtime.display_frame(&app, size).unwrap();
         let before = runtime.accessibility_tree();
         let field = before
             .nodes()
@@ -821,7 +821,7 @@ mod tests {
         app.label.set("After".into());
         app.value.set("Dinner".into());
         runtime.accessibility_action(field, Action::Focus).unwrap();
-        runtime.display_frame(&app, size);
+        runtime.display_frame(&app, size).unwrap();
         let after = runtime.accessibility_tree();
         assert_eq!(
             changes(Some(&before.nodes()[0]), &after.nodes()[0]).collect::<Vec<_>>(),

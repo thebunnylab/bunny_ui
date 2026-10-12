@@ -4774,7 +4774,7 @@ mod tests {
     #[test]
     fn the_first_frame_mounts_the_whole_scene() {
         let (runtime, view, size) = mini();
-        let patches = runtime.dom_frame(&view, size);
+        let patches = runtime.dom_frame(&view, size).unwrap();
 
         assert!(matches!(patches[0], DomPatch::SetSize { id: 0, .. }));
         let creates: Vec<_> = patches
@@ -4805,9 +4805,7 @@ mod tests {
             known.push(*id);
         }
         // the interactive rows carry their action paths
-        let interactive = patches.iter().any(|patch| {
-            matches!(patch, DomPatch::SetPath { path: Some(_), .. })
-        });
+        let interactive = patches.iter().any(|patch| matches!(patch, DomPatch::SetPath { path: Some(_), .. }));
         assert!(interactive, "rows are clickable in the scene");
     }
 
@@ -4834,13 +4832,13 @@ mod tests {
                 .collect()
         };
         let (runtime, view, size) = mini();
-        let first = runtime.dom_frame(&view, size);
+        let first = runtime.dom_frame(&view, size).unwrap();
         assert!(matches!(first[0], DomPatch::SetSize { id: 0, .. }), "the mount's size still leads");
         assert_eq!(languages(&first), [(0, "en".to_string(), LayoutDirection::LeftToRight)]);
-        let still = runtime.dom_frame(&view, size);
+        let still = runtime.dom_frame(&view, size).unwrap();
         assert!(languages(&still).is_empty(), "a still frame says nothing: {still:?}");
         runtime.set_system_locale(Locale::new("ar"));
-        let moved = runtime.dom_frame(&view, size);
+        let moved = runtime.dom_frame(&view, size).unwrap();
         assert_eq!(languages(&moved), [(0, "ar".to_string(), LayoutDirection::RightToLeft)]);
     }
 
@@ -4873,10 +4871,11 @@ mod tests {
     #[test]
     fn a_hover_frame_diffs_to_zero_patches() {
         let (runtime, view, size) = mini();
-        let _ = runtime.dom_frame(&view, size);
+        let _ = runtime.dom_frame(&view, size).unwrap();
 
         // find a row to hover over — the layout knows the hit targets
-        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         let target = result
             .hits
             .iter()
@@ -4885,19 +4884,20 @@ mod tests {
                 (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0)
             })
             .expect("row1 is clickable");
-        assert!(runtime.pointer_moved(target.0, target.1, false), "the hover state flipped");
+        assert!(runtime.pointer_moved(target.0, target.1, false).unwrap(), "the hover state flipped");
 
-        let patches = runtime.dom_frame(&view, size);
-        assert_eq!(patches, vec![], "hover is the browser's — the scene never moves");
+        let patches = runtime.dom_frame(&view, size).unwrap();
+        assert_eq!(patches, vec![], "hover is the browser's — the scene never moves"
+        );
     }
 
     #[test]
     fn a_selection_change_patches_only_the_two_looks() {
         let (runtime, view, size) = mini();
-        let _ = runtime.dom_frame(&view, size);
+        let _ = runtime.dom_frame(&view, size).unwrap();
 
         view.selected.set(1);
-        let patches = runtime.dom_frame(&view, size);
+        let patches = runtime.dom_frame(&view, size).unwrap();
 
         assert!(!patches.is_empty());
         // a look the page has not seen is defined once; the rows wear
@@ -4914,10 +4914,10 @@ mod tests {
     #[test]
     fn a_removed_row_leaves_and_nothing_mounts() {
         let (runtime, view, size) = mini();
-        let _ = runtime.dom_frame(&view, size);
+        let _ = runtime.dom_frame(&view, size).unwrap();
 
         view.count.set(2);
-        let patches = runtime.dom_frame(&view, size);
+        let patches = runtime.dom_frame(&view, size).unwrap();
 
         let removes = patches.iter().filter(|p| matches!(p, DomPatch::Remove { .. })).count();
         let creates = patches.iter().filter(|p| matches!(p, DomPatch::Create { .. })).count();
@@ -4950,7 +4950,7 @@ mod tests {
         let runtime = Runtime::new();
         let view = Outer { gap: State::new(4.0) };
         let size = Size { width: 200.0, height: 150.0 };
-        let mount = runtime.dom_frame(&view, size);
+        let mount = runtime.dom_frame(&view, size).unwrap();
         let inner_group = mount
             .iter()
             .filter_map(|patch| match patch {
@@ -4961,7 +4961,7 @@ mod tests {
             .expect("Inner mounted as a group");
 
         view.gap.set(12.0);
-        let patches = runtime.dom_frame(&view, size);
+        let patches = runtime.dom_frame(&view, size).unwrap();
 
         // under the flow the browser reflows: the padded node changes
         // its ONE look (defined, then worn), and the component beside
@@ -4984,7 +4984,7 @@ mod tests {
     fn a_browser_scroll_echoes_to_silence() {
         let (runtime, view, size) = mini();
         view.count.set(30);
-        let mount = runtime.dom_frame(&view, size);
+        let mount = runtime.dom_frame(&view, size).unwrap();
         let scroll_id = mount
             .iter()
             .find_map(|patch| match patch {
@@ -4994,7 +4994,7 @@ mod tests {
             .expect("a scroll region mounted");
 
         runtime.dom_scrolled(scroll_id, 0.0, 40.0);
-        let patches = runtime.dom_frame(&view, size);
+        let patches = runtime.dom_frame(&view, size).unwrap();
         assert!(patches.is_empty(), "the echo stays silent: {patches:?}");
     }
 
@@ -5023,7 +5023,7 @@ mod tests {
         let runtime = Runtime::new();
         let page = Page { at: State::new(Point::default()) };
         let size = Size { width: 200.0, height: 150.0 };
-        let mount = runtime.dom_frame(&page, size);
+        let mount = runtime.dom_frame(&page, size).unwrap();
         let scroll_id = mount
             .iter()
             .find_map(|patch| match patch {
@@ -5035,13 +5035,13 @@ mod tests {
         // the browser scrolled: the binding hears where it landed, and
         // the echo is still silent
         runtime.dom_scrolled(scroll_id, 0.0, 40.0);
-        let echo = runtime.dom_frame(&page, size);
+        let echo = runtime.dom_frame(&page, size).unwrap();
         assert_eq!(page.at.get(), Point { x: 0.0, y: 40.0 }, "the app was told");
         assert!(echo.is_empty(), "and the echo stays silent: {echo:?}");
 
         // the app commands: one patch, and it is the offset
         page.at.set(Point { x: 0.0, y: 260.0 });
-        let commanded = runtime.dom_frame(&page, size);
+        let commanded = runtime.dom_frame(&page, size).unwrap();
         assert!(
             commanded.iter().any(|patch| matches!(
                 patch,
@@ -5060,16 +5060,15 @@ mod tests {
             fn body(self) -> impl View {
                 // the flow's one requirement: the app DECLARES the row
                 // extent (the browser owns layout; nothing measures)
-                virtual_list(10_000, |row| format!("row{row}"), |row| {
-                    text(format!("item {row}"))
-                })
+                virtual_list(10_000, |row| format!("row{row}"), |row| text(format!("item {row}")),
+                )
                 .row_height(20.0)
             }
         }
 
         let runtime = Runtime::new();
         let size = Size { width: 200.0, height: 150.0 };
-        let mount = runtime.dom_frame(&Big, size);
+        let mount = runtime.dom_frame(&Big, size).unwrap();
         let scroll_id = mount
             .iter()
             .find_map(|patch| match patch {
@@ -5079,7 +5078,7 @@ mod tests {
             .expect("the region mounted");
 
         runtime.dom_scrolled(scroll_id, 0.0, 50_000.0);
-        let patches = runtime.dom_frame(&Big, size);
+        let patches = runtime.dom_frame(&Big, size).unwrap();
 
         let created: Vec<u32> = patches
             .iter()
@@ -5128,7 +5127,7 @@ mod tests {
         let runtime = Runtime::new();
         let view = WithField { query: State::new(String::new()) };
         let size = Size { width: 200.0, height: 60.0 };
-        let mount = runtime.dom_frame(&view, size);
+        let mount = runtime.dom_frame(&view, size).unwrap();
         let chrome = mount.iter().any(|patch| {
             matches!(patch, DomPatch::DefineRule { style, .. }
                 if style.focus_border.is_some()
@@ -5137,8 +5136,9 @@ mod tests {
         });
         assert!(chrome, "the input mounts wearing the theme: {mount:?}");
 
-        assert!(runtime.key(crate::text_input::EditCommand::Insert("x".into())).applied);
-        let patches = runtime.dom_frame(&view, size);
+        assert!(runtime.key(crate::text_input::EditCommand::Insert("x".into())).unwrap()
+                .applied);
+        let patches = runtime.dom_frame(&view, size).unwrap();
         assert_eq!(patches.len(), 1, "the input mirrors the content: {patches:?}");
         match &patches[0] {
             DomPatch::SetField { field, .. } => assert_eq!(field.content.as_ref(), "x"),
@@ -5175,6 +5175,7 @@ mod tests {
             let runtime = Runtime::new();
             runtime
                 .dom_frame(root, size)
+                .unwrap()
                 .into_iter()
                 .find_map(|patch| match patch {
                     DomPatch::Create { kind, .. } if kind != CreateKind::Group => Some(kind),
@@ -5220,7 +5221,9 @@ mod tests {
         }
 
         let runtime = Runtime::new();
-        let patches = runtime.dom_frame(&Panel, Size { width: 200.0, height: 100.0 });
+        let patches = runtime.dom_frame(&Panel, Size { width: 200.0, height: 100.0 },
+            )
+            .unwrap();
         let style = patches
             .iter()
             .find_map(|patch| match patch {
@@ -5249,7 +5252,8 @@ mod tests {
         }
 
         let runtime = Runtime::new();
-        let patches = runtime.dom_frame(&Hoverable, Size { width: 100.0, height: 50.0 });
+        let patches = runtime.dom_frame(&Hoverable, Size { width: 100.0, height: 50.0 })
+            .unwrap();
         let hovered = patches.iter().any(|patch| {
             matches!(patch, DomPatch::DefineRule { style, .. } if style.hover_background.is_some())
         });
@@ -5275,7 +5279,7 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = Size { width: 100.0, height: 50.0 };
-        let patches = runtime.dom_frame(&CloseGlyph, size);
+        let patches = runtime.dom_frame(&CloseGlyph, size).unwrap();
 
         // the box declares both inks; the browser owns the swap
         let ink = patches
@@ -5298,14 +5302,15 @@ mod tests {
         // the LAW still holds: hovering patches nothing
         let target = runtime
             .layout(&CloseGlyph, crate::layout::Proposal::exact(size))
+            .unwrap()
             .hits
             .last()
             .map(|(_, rect)| {
                 (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0)
             })
             .expect("the glyph is a target");
-        assert!(runtime.pointer_moved(target.0, target.1, false), "the hover state flipped");
-        assert_eq!(runtime.dom_frame(&CloseGlyph, size), vec![], "hover is the browser's");
+        assert!(runtime.pointer_moved(target.0, target.1, false).unwrap(), "the hover state flipped");
+        assert_eq!(runtime.dom_frame(&CloseGlyph, size).unwrap(), vec![], "hover is the browser's");
     }
 
     #[cfg(feature = "canvas")]
@@ -5331,7 +5336,7 @@ mod tests {
         let runtime = Runtime::new();
         let view = WithIsland { level: State::new(10.0) };
         let size = Size { width: 120.0, height: 80.0 };
-        let mount = runtime.dom_frame(&view, size);
+        let mount = runtime.dom_frame(&view, size).unwrap();
 
         let canvases = mount
             .iter()
@@ -5343,11 +5348,13 @@ mod tests {
         // the subtree below the island is PIXELS — no box mounts for it
         let boxes = mount
             .iter()
-            .filter(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Box, .. }))
+            .filter(|patch| {
+                matches!(patch, DomPatch::Create { kind: CreateKind::Box, .. })
+            })
             .count();
         assert_eq!(boxes, 0, "the styled inside drew, never lowered: {mount:?}");
 
-        let islands = runtime.dom_islands(1);
+        let islands = runtime.dom_islands(1).unwrap();
         assert_eq!(islands.len(), 1);
         assert_eq!(
             (islands[0].width, islands[0].height),
@@ -5360,19 +5367,19 @@ mod tests {
         );
 
         // an unchanged frame re-rasters nothing
-        let _ = runtime.dom_frame(&view, size);
-        assert!(runtime.dom_islands(1).is_empty(), "clean pixels stay put");
+        let _ = runtime.dom_frame(&view, size).unwrap();
+        assert!(runtime.dom_islands(1).unwrap().is_empty(), "clean pixels stay put");
 
         // content change → the island redraws (and only the island)
         view.level.set(40.0);
-        let patches = runtime.dom_frame(&view, size);
+        let patches = runtime.dom_frame(&view, size).unwrap();
         assert!(
             patches
                 .iter()
                 .all(|patch| !matches!(patch, DomPatch::Create { .. } | DomPatch::Remove { .. })),
             "no structure churn on a redraw: {patches:?}"
         );
-        assert_eq!(runtime.dom_islands(1).len(), 1, "fresh pixels follow the state");
+        assert_eq!(runtime.dom_islands(1).unwrap().len(), 1, "fresh pixels follow the state");
     }
 
     /// Rows that each hold an island leave — one alone, then the rest
@@ -5409,19 +5416,21 @@ mod tests {
         let runtime = Runtime::new();
         let page = Swatches { ids: State::new(Rc::new(vec![1, 2, 3, 4])) };
         let size = Size { width: 120.0, height: 80.0 };
-        let mount = runtime.dom_frame(&page, size);
-        let canvases = mount.iter().filter(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Canvas, .. })).count();
+        let mount = runtime.dom_frame(&page, size).unwrap();
+        let canvases = mount.iter().filter(|patch| {
+                matches!(patch, DomPatch::Create { kind: CreateKind::Canvas, .. })
+            }).count();
         assert_eq!(canvases, 4, "an island a row: {mount:?}");
 
         // one row leaves alone, then the rest together, before a single
         // pixel was asked for
         page.ids.set(Rc::new(vec![1, 3, 4]));
-        let patches = runtime.dom_frame(&page, size);
+        let patches = runtime.dom_frame(&page, size).unwrap();
         assert!(patches.iter().any(|patch| matches!(patch, DomPatch::Remove { .. })), "{patches:?}");
         page.ids.set(Rc::new(Vec::new()));
-        let patches = runtime.dom_frame(&page, size);
+        let patches = runtime.dom_frame(&page, size).unwrap();
         assert!(patches.iter().any(|patch| matches!(patch, DomPatch::RemoveChildren { .. })), "{patches:?}");
-        assert!(runtime.dom_islands(1).is_empty(), "the islands that left are not painted");
+        assert!(runtime.dom_islands(1).unwrap().is_empty(), "the islands that left are not painted");
         assert!(runtime.island_frames().is_empty());
     }
 
@@ -5457,16 +5466,16 @@ mod tests {
         let size = Size { width: 240.0, height: 120.0 };
         let count = State::new(0usize);
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&Island { count }, size);
-        let first = runtime.dom_islands(1);
+        let _ = runtime.dom_frame(&Island { count }, size).unwrap();
+        let first = runtime.dom_islands(1).unwrap();
         assert_eq!(first.len(), 1, "one island");
         let (width, height) = (first[0].width, first[0].height);
         assert_eq!(first[0].dirty, (0, 0, width as u32, height as u32), "the first frame is the whole box");
         assert_eq!(first[0].rgba.len(), width * height * 4);
 
         count.set(1);
-        let _ = runtime.dom_frame(&Island { count }, size);
-        let second = runtime.dom_islands(1);
+        let _ = runtime.dom_frame(&Island { count }, size).unwrap();
+        let second = runtime.dom_islands(1).unwrap();
         assert_eq!(second.len(), 1, "the island changed");
         let (x, y, dirty_width, dirty_height) = second[0].dirty;
         assert!(
@@ -5477,8 +5486,9 @@ mod tests {
 
         // the strip is what a fresh runtime paints there
         let fresh = Runtime::new();
-        let _ = fresh.dom_frame(&Island { count: State::new(1usize) }, size);
-        let whole = fresh.dom_islands(1).remove(0);
+        let _ = fresh.dom_frame(&Island { count: State::new(1usize) }, size)
+            .unwrap();
+        let whole = fresh.dom_islands(1).unwrap().remove(0);
         let mut expected = Vec::new();
         for row in y..y + dirty_height {
             let from = (row as usize * width + x as usize) * 4;
@@ -5487,8 +5497,8 @@ mod tests {
         assert_eq!(second[0].rgba, expected, "the strip matches a full repaint byte for byte");
 
         // nothing moved: nothing ships
-        let _ = runtime.dom_frame(&Island { count }, size);
-        assert!(runtime.dom_islands(1).is_empty(), "an identical frame blits nothing");
+        let _ = runtime.dom_frame(&Island { count }, size).unwrap();
+        assert!(runtime.dom_islands(1).unwrap().is_empty(), "an identical frame blits nothing");
     }
 
     #[test]
@@ -5509,7 +5519,7 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = Size { width: 120.0, height: 80.0 };
-        let mount = runtime.dom_frame(&WithFlexIsland, size);
+        let mount = runtime.dom_frame(&WithFlexIsland, size).unwrap();
         let canvas_id = mount
             .iter()
             .find_map(|patch| match patch {
@@ -5517,21 +5527,21 @@ mod tests {
                 _ => None,
             })
             .expect("the island mounted");
-        let _ = runtime.dom_islands(1);
+        let _ = runtime.dom_islands(1).unwrap();
 
         // the browser gave the flexible element ITS box
         assert!(
             runtime.dom_island_box(canvas_id, 300.0, 40.0),
             "a fresh box is news"
         );
-        let patches = runtime.dom_frame(&WithFlexIsland, size);
+        let patches = runtime.dom_frame(&WithFlexIsland, size).unwrap();
         assert!(
             patches
                 .iter()
                 .all(|patch| !matches!(patch, DomPatch::Create { .. } | DomPatch::Remove { .. })),
             "the element already belongs to the browser — only pixels move: {patches:?}"
         );
-        let islands = runtime.dom_islands(1);
+        let islands = runtime.dom_islands(1).unwrap();
         assert_eq!(islands.len(), 1, "fresh pixels at the reported size");
         assert_eq!((islands[0].width, islands[0].height), (300, 40));
 
@@ -5571,7 +5581,7 @@ mod tests {
         let size = Size { width: 240.0, height: 120.0 };
         let count = State::new(0usize);
         let runtime = Runtime::new();
-        let mount = runtime.dom_frame(&FineIsland { count }, size);
+        let mount = runtime.dom_frame(&FineIsland { count }, size).unwrap();
         let fine = 24.0 + 2.0 * 0.1;
         assert!(f64::from(fine as f32) != fine, "the box is finer than an f32");
         assert!(
@@ -5585,7 +5595,7 @@ mod tests {
 
         // a walk the island takes part in, with nothing in it changed
         count.set(1);
-        let _ = runtime.dom_frame(&FineIsland { count }, size);
+        let _ = runtime.dom_frame(&FineIsland { count }, size).unwrap();
         assert!(runtime.dom_island_lists(1).is_empty(), "the same box, the same pixels");
     }
 
@@ -5626,7 +5636,7 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = Size { width: 240.0, height: 120.0 };
-        let mount = runtime.dom_frame(&WithHungryIsland, size);
+        let mount = runtime.dom_frame(&WithHungryIsland, size).unwrap();
         let canvas_id = mount
             .iter()
             .find_map(|patch| match patch {
@@ -5644,12 +5654,12 @@ mod tests {
                 )
             });
         assert!(stretched, "width is the browser's, height is pinned: {mount:?}");
-        let _ = runtime.dom_islands(1);
+        let _ = runtime.dom_islands(1).unwrap();
 
         // the browser stretched the element and the observer reported
         assert!(runtime.dom_island_box(canvas_id, 500.0, 30.0));
-        let _ = runtime.dom_frame(&WithHungryIsland, size);
-        let islands = runtime.dom_islands(1);
+        let _ = runtime.dom_frame(&WithHungryIsland, size).unwrap();
+        let islands = runtime.dom_islands(1).unwrap();
         assert_eq!(islands.len(), 1);
         assert_eq!((islands[0].width, islands[0].height), (500, 30));
     }
@@ -5675,7 +5685,8 @@ mod tests {
         }
 
         let runtime = Runtime::new();
-        let mount = runtime.dom_frame(&Chips, Size { width: 272.0, height: 200.0 });
+        let mount = runtime.dom_frame(&Chips, Size { width: 272.0, height: 200.0 })
+            .unwrap();
         let wraps = mount.iter().any(|patch| {
             matches!(
                 patch,
@@ -5709,7 +5720,9 @@ mod tests {
         }
 
         let runtime = Runtime::new();
-        let mount = runtime.dom_frame(&Page, Size { width: 300.0, height: 200.0 });
+        let mount = runtime.dom_frame(&Page, Size { width: 300.0, height: 200.0 },
+            )
+            .unwrap();
         let looks: Vec<(CreateKind, Option<&DomText>)> = mount
             .iter()
             .filter_map(|patch| match patch {
@@ -5769,7 +5782,9 @@ mod tests {
         }
 
         let runtime = Runtime::new();
-        let mount = runtime.dom_frame(&Cell, Size { width: 100.0, height: 40.0 });
+        let mount = runtime.dom_frame(&Cell, Size { width: 100.0, height: 40.0 },
+            )
+            .unwrap();
         let hints: Vec<&DomHints> = mount
             .iter()
             .filter_map(|patch| match patch {
@@ -5807,11 +5822,14 @@ mod tests {
         }
 
         let runtime = Runtime::new();
-        let mount = runtime.dom_frame(&Link, Size { width: 300.0, height: 100.0 });
+        let mount = runtime.dom_frame(&Link, Size { width: 300.0, height: 100.0 })
+            .unwrap();
         let a_ids: Vec<u32> = mount
             .iter()
             .filter_map(|patch| match patch {
-                DomPatch::Create { id, hints, .. } if hints.tag.as_deref() == Some("a") => Some(*id),
+                DomPatch::Create { id, hints, .. } if hints.tag.as_deref() == Some("a") => {
+                    Some(*id)
+                }
                 _ => None,
             })
             .collect();
@@ -5824,7 +5842,9 @@ mod tests {
         let span = mount
             .iter()
             .find_map(|patch| match patch {
-                DomPatch::Create { id, hints, .. } if hints.tag.as_deref() == Some("span") => Some(*id),
+                DomPatch::Create { id, hints, .. } if hints.tag.as_deref() == Some("span") => {
+                    Some(*id)
+                }
                 _ => None,
             })
             .expect("the span mounted");
@@ -5864,7 +5884,9 @@ mod tests {
         }
 
         let runtime = Runtime::new();
-        let mount = runtime.dom_frame(&Tables, Size { width: 600.0, height: 400.0 });
+        let mount = runtime.dom_frame(&Tables, Size { width: 600.0, height: 400.0 },
+            )
+            .unwrap();
         let parent_of = |class: &str| {
             mount
                 .iter()
@@ -5920,7 +5942,8 @@ mod tests {
         }
 
         let runtime = Runtime::new();
-        let mount = runtime.dom_frame(&Paned, Size { width: 400.0, height: 300.0 });
+        let mount = runtime.dom_frame(&Paned, Size { width: 400.0, height: 300.0 })
+            .unwrap();
         // the first element under the root carries the offer
         let first = mount
             .iter()
@@ -5981,7 +6004,7 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = Size { width: 760.0, height: 640.0 };
-        let mount = runtime.dom_frame(&Pane, size);
+        let mount = runtime.dom_frame(&Pane, size).unwrap();
         let canvas_id = mount
             .iter()
             .find_map(|patch| match patch {
@@ -5989,14 +6012,14 @@ mod tests {
                 _ => None,
             })
             .expect("the island mounted");
-        let _ = runtime.dom_islands(1);
+        let _ = runtime.dom_islands(1).unwrap();
 
         assert!(
             runtime.dom_island_box(canvas_id, 682.0, 46.0),
             "the report is news"
         );
-        let _ = runtime.dom_frame(&Pane, size);
-        let islands = runtime.dom_islands(1);
+        let _ = runtime.dom_frame(&Pane, size).unwrap();
+        let islands = runtime.dom_islands(1).unwrap();
         assert_eq!(islands.len(), 1, "the report re-rastered the island");
         assert_eq!((islands[0].width, islands[0].height), (682, 46));
     }
@@ -6082,7 +6105,7 @@ mod tests {
             mark: State::new(0.0),
             note: State::new(std::sync::Arc::from("")),
         };
-        let mount = runtime.dom_frame(&view, size);
+        let mount = runtime.dom_frame(&view, size).unwrap();
         let canvas_id = mount
             .iter()
             .find_map(|patch| match patch {
@@ -6090,7 +6113,7 @@ mod tests {
                 _ => None,
             })
             .expect("the island mounted");
-        let _ = runtime.dom_islands(1);
+        let _ = runtime.dom_islands(1).unwrap();
 
         // the press lands in the box's own coordinates
         assert!(runtime.dom_island_pointer(canvas_id, 0, 25.0, 10.0, false));
@@ -6098,13 +6121,13 @@ mod tests {
         assert!(runtime.dom_island_pointer(canvas_id, 2, 25.0, 10.0, false));
 
         // the release handed it the keyboard: typing reaches the box
-        let answer = runtime.key(EditCommand::Insert("hi".into()));
+        let answer = runtime.key(EditCommand::Insert("hi".into())).unwrap();
         assert!(answer.applied, "the focused box types");
         assert_eq!(view.note.get().as_ref(), "hi");
 
         // and the pixels follow the state
-        let _ = runtime.dom_frame(&view, size);
-        assert_eq!(runtime.dom_islands(1).len(), 1, "fresh pixels follow the press");
+        let _ = runtime.dom_frame(&view, size).unwrap();
+        assert_eq!(runtime.dom_islands(1).unwrap().len(), 1, "fresh pixels follow the press");
     }
 
     #[test]
@@ -6169,10 +6192,12 @@ mod tests {
         let view = Gallery { source: State::new(tiny_image(10)) };
         let size = Size { width: 100.0, height: 60.0 };
 
-        let patches = runtime.dom_frame(&view, size);
+        let patches = runtime.dom_frame(&view, size).unwrap();
         let creates = patches
             .iter()
-            .filter(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Image, .. }))
+            .filter(|patch| {
+                matches!(patch, DomPatch::Create { kind: CreateKind::Image, .. })
+            })
             .count();
         assert_eq!(creates, 1, "one element for one image: {patches:?}");
         assert!(
@@ -6185,11 +6210,11 @@ mod tests {
         );
 
         // the same source again: nothing moves
-        assert_eq!(runtime.dom_frame(&view, size), vec![]);
+        assert_eq!(runtime.dom_frame(&view, size).unwrap(), vec![]);
 
         // a new source under the same geometry is ONE image patch
         view.source.set(tiny_image(11));
-        let patches = runtime.dom_frame(&view, size);
+        let patches = runtime.dom_frame(&view, size).unwrap();
         assert_eq!(patches.len(), 1, "{patches:?}");
         assert!(matches!(
             &patches[0],
@@ -6213,10 +6238,10 @@ mod tests {
         let runtime = Runtime::new();
         let view = Sized { width: State::new(24.0) };
         let size = Size { width: 100.0, height: 60.0 };
-        let _ = runtime.dom_frame(&view, size);
+        let _ = runtime.dom_frame(&view, size).unwrap();
 
         view.width.set(48.0);
-        let patches = runtime.dom_frame(&view, size);
+        let patches = runtime.dom_frame(&view, size).unwrap();
         assert!(!patches.is_empty());
         for patch in &patches {
             assert!(
@@ -6252,7 +6277,7 @@ mod tests {
         let runtime = Runtime::new();
         let view = Swaps { image_on: State::new(true) };
         let size = Size { width: 100.0, height: 60.0 };
-        let patches = runtime.dom_frame(&view, size);
+        let patches = runtime.dom_frame(&view, size).unwrap();
         let image_id = patches
             .iter()
             .find_map(|patch| match patch {
@@ -6262,7 +6287,7 @@ mod tests {
             .expect("the image mounted");
 
         view.image_on.set(false);
-        let patches = runtime.dom_frame(&view, size);
+        let patches = runtime.dom_frame(&view, size).unwrap();
         // the swapped subtree leaves whole (one remove on its root
         // covers the image inside — or its parent empties, when it was
         // the only child) and the replacement mounts fresh — nothing
@@ -6304,7 +6329,7 @@ mod tests {
     fn an_image_inside_an_island_stays_pixels() {
         let runtime = Runtime::new();
         let size = Size { width: 40.0, height: 20.0 };
-        let patches = runtime.dom_frame(&Isle, size);
+        let patches = runtime.dom_frame(&Isle, size).unwrap();
         assert!(
             !patches
                 .iter()
@@ -6319,7 +6344,7 @@ mod tests {
             1
         );
         // and the island's pixels carry the image
-        let islands = runtime.dom_islands(1);
+        let islands = runtime.dom_islands(1).unwrap();
         assert_eq!(islands.len(), 1);
         assert!(
             islands[0].rgba.chunks(4).any(|pixel| pixel[3] != 0),
@@ -6352,6 +6377,7 @@ mod tests {
         let size = Size { width: 200.0, height: 120.0 };
         let mounted: Vec<u32> = runtime
             .dom_frame(&view, size)
+            .unwrap()
             .iter()
             .filter_map(|patch| match patch {
                 DomPatch::Create { id, .. } => Some(*id),
@@ -6363,7 +6389,7 @@ mod tests {
         // portal: outside every scroll element, last in paint order —
         // and never touches the siblings that were already there
         view.open.set(true);
-        let patches = runtime.dom_frame(&view, size);
+        let patches = runtime.dom_frame(&view, size).unwrap();
         let top_level: Vec<(u32, u32)> = patches
             .iter()
             .filter_map(|patch| match patch {
@@ -6403,7 +6429,7 @@ mod tests {
         // closing removes the portal and unwraps the anchor — nothing
         // beyond those two subtrees moves
         view.open.set(false);
-        let patches = runtime.dom_frame(&view, size);
+        let patches = runtime.dom_frame(&view, size).unwrap();
         assert!(!patches.is_empty());
         assert!(
             patches.iter().any(|patch| matches!(
@@ -6430,7 +6456,9 @@ mod tests {
             }
         }
         let runtime = Runtime::new();
-        let patches = runtime.dom_frame(&Glow, Size { width: 100.0, height: 60.0 });
+        let patches = runtime.dom_frame(&Glow, Size { width: 100.0, height: 60.0 },
+            )
+            .unwrap();
         let style = patches
             .iter()
             .find_map(|patch| match patch {
@@ -6788,7 +6816,7 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = Size { width: 100.0, height: 50.0 };
-        let patches = runtime.dom_frame(&CloseButton, size);
+        let patches = runtime.dom_frame(&CloseButton, size).unwrap();
 
         // the box declares both inks; the browser owns the swap
         let ink = patches
@@ -6803,22 +6831,21 @@ mod tests {
         assert_eq!(ink, (Some(FAINT), Some(BRIGHT)));
         // and the glyph takes NO color of its own — currentColor
         // inherits through, exactly the law the text keeps
-        let inherits = patches.iter().any(|patch| {
-            matches!(patch, DomPatch::SetIcon { icon, .. } if icon.inherits_ink)
-        });
+        let inherits = patches.iter().any(|patch| matches!(patch, DomPatch::SetIcon { icon, .. } if icon.inherits_ink));
         assert!(inherits, "the glyph inherits its ink: {patches:#?}");
 
         // the LAW still holds: hovering patches nothing
         let target = runtime
             .layout(&CloseButton, crate::layout::Proposal::exact(size))
+            .unwrap()
             .hits
             .last()
             .map(|(_, rect)| {
                 (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0)
             })
             .expect("the glyph is a target");
-        assert!(runtime.pointer_moved(target.0, target.1, false), "the hover state flipped");
-        assert_eq!(runtime.dom_frame(&CloseButton, size), vec![], "hover is the browser's");
+        assert!(runtime.pointer_moved(target.0, target.1, false).unwrap(), "the hover state flipped");
+        assert_eq!(runtime.dom_frame(&CloseButton, size).unwrap(), vec![], "hover is the browser's");
     }
 
     #[test]
@@ -6837,20 +6864,22 @@ mod tests {
         let runtime = Runtime::new();
         let view = Tinted { ink: State::new(Color::hex(0x333333)) };
         let size = Size { width: 60.0, height: 40.0 };
-        let mount = runtime.dom_frame(&view, size);
+        let mount = runtime.dom_frame(&view, size).unwrap();
         let creates = mount
             .iter()
-            .filter(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Icon, .. }))
+            .filter(|patch| {
+                matches!(patch, DomPatch::Create { kind: CreateKind::Icon, .. })
+            })
             .count();
         assert_eq!(creates, 1, "one element for one glyph: {mount:?}");
 
         // the same scene again: nothing moves
-        assert_eq!(runtime.dom_frame(&view, size), vec![]);
+        assert_eq!(runtime.dom_frame(&view, size).unwrap(), vec![]);
 
         // a re-tint is ONE icon patch — the geometry never re-travels
         // in a style, and no other element hears about it
         view.ink.set(Color::hex(0xAA2211));
-        let patches = runtime.dom_frame(&view, size);
+        let patches = runtime.dom_frame(&view, size).unwrap();
         assert_eq!(patches.len(), 1, "{patches:#?}");
         assert!(matches!(
             &patches[0],
@@ -6873,7 +6902,9 @@ mod tests {
         }
 
         let runtime = Runtime::new();
-        let patches = runtime.dom_frame(&Panel, Size { width: 200.0, height: 80.0 });
+        let patches = runtime.dom_frame(&Panel, Size { width: 200.0, height: 80.0 },
+            )
+            .unwrap();
         let glass = patches
             .iter()
             .find_map(|patch| match patch {
@@ -6951,19 +6982,19 @@ mod tests {
         // world one, alive and invalidating
         let first = Lamp { on: State::new(false) };
         let elder = Runtime::new();
-        assert!(!elder.dom_frame(&first, size).is_empty(), "the first world mounts");
+        assert!(!elder.dom_frame(&first, size).unwrap().is_empty(), "the first world mounts");
         first.on.set(true);
         assert!(
-            !elder.dom_frame(&first, size).is_empty(),
+            !elder.dom_frame(&first, size).unwrap().is_empty(),
             "the first world invalidates"
         );
 
         // world two: the same shape, new states, a new runtime
         let second = Lamp { on: State::new(false) };
         let newborn = Runtime::new();
-        assert!(!newborn.dom_frame(&second, size).is_empty(), "the second world mounts");
+        assert!(!newborn.dom_frame(&second, size).unwrap().is_empty(), "the second world mounts");
         second.on.set(true);
-        let patches = newborn.dom_frame(&second, size);
+        let patches = newborn.dom_frame(&second, size).unwrap();
         assert!(
             !patches.is_empty(),
             "the second world invalidates — its reads bind to living states"
@@ -7786,9 +7817,8 @@ mod tests {
         impl Component for Follows {
             fn body(self) -> impl View {
                 let selected = self.selected.get();
-                virtual_list(1_000, |row| format!("r{row}"), |row| {
-                    text(format!("item {row}"))
-                })
+                virtual_list(1_000, |row| format!("r{row}"), |row| text(format!("item {row}")),
+                )
                 .row_height(20.0)
                 .reveal(selected)
             }
@@ -7797,10 +7827,10 @@ mod tests {
         let runtime = Runtime::new();
         let view = Follows { selected: State::new(0) };
         let size = Size { width: 200.0, height: 100.0 };
-        let _ = runtime.dom_frame(&view, size);
+        let _ = runtime.dom_frame(&view, size).unwrap();
 
         view.selected.set(500);
-        let patches = runtime.dom_frame(&view, size);
+        let patches = runtime.dom_frame(&view, size).unwrap();
         let scrolled = patches.iter().find_map(|patch| match patch {
             DomPatch::SetScroll { y, .. } => Some(*y),
             _ => None,
@@ -7833,13 +7863,13 @@ mod tests {
         let view = Wordy { flip: State::new(false) };
         let size = Size { width: 120.0, height: 200.0 };
         let _ = crate::stats::take();
-        let _ = runtime.dom_frame(&view, size);
+        let _ = runtime.dom_frame(&view, size).unwrap();
         let mount = crate::stats::take();
         assert_eq!(mount.measure_misses, 0, "the mount never measured");
         assert_eq!(mount.measure_hits, 0, "not even a warm hit");
 
         view.flip.set(true);
-        let _ = runtime.dom_frame(&view, size);
+        let _ = runtime.dom_frame(&view, size).unwrap();
         let update = crate::stats::take();
         assert_eq!(update.measure_misses + update.measure_hits, 0, "nor the update");
     }
@@ -7887,11 +7917,11 @@ mod tests {
         let runtime = Runtime::new();
         let view = Grid { cells: std::rc::Rc::new((0..50).map(|_| State::new(false)).collect()) };
         let size = Size { width: 200.0, height: 400.0 };
-        let _ = runtime.dom_frame(&view, size);
+        let _ = runtime.dom_frame(&view, size).unwrap();
 
         let _ = crate::stats::take();
         view.cells[7].set(true);
-        let patches = runtime.dom_frame(&view, size);
+        let patches = runtime.dom_frame(&view, size).unwrap();
         let stats = crate::stats::take();
 
         assert_eq!(patches.len(), 3, "the flip is a look defined, worn, and the words: {patches:?}");
@@ -7938,7 +7968,7 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = Size { width: 200.0, height: 200.0 };
-        let patches = runtime.dom_frame(&Mixed, size);
+        let patches = runtime.dom_frame(&Mixed, size).unwrap();
 
         // the exact interior speaks geometry: transforms and sizes
         let transforms =
@@ -7956,7 +7986,7 @@ mod tests {
         assert_eq!(flow_texts, 4, "{patches:#?}");
         // a second frame with nothing changed is silent — the exact
         // subtree diffs like everything else
-        assert!(runtime.dom_frame(&Mixed, size).is_empty());
+        assert!(runtime.dom_frame(&Mixed, size).unwrap().is_empty());
     }
 
     // MARK: - Action paths told against their row
@@ -8050,7 +8080,7 @@ mod tests {
         let size = Size { width: 400.0, height: 400.0 };
         let page = Counters { rows: State::new(counted(1..5)) };
         let runtime = Runtime::new();
-        let mount = runtime.dom_frame(&page, size);
+        let mount = runtime.dom_frame(&page, size).unwrap();
         let mut replay = crate::ssr::Replay::new(size);
         replay.apply(&mount);
         assert_clicks_resolve(&replay, &runtime);
@@ -8061,7 +8091,9 @@ mod tests {
         let clones: Vec<&str> = mount
             .iter()
             .filter_map(|patch| match patch {
-                DomPatch::Clone { base, .. } => Some(base.as_deref().expect("every copy here is a base")),
+                DomPatch::Clone { base, .. } => {
+                    Some(base.as_deref().expect("every copy here is a base"))
+                }
                 _ => None,
             })
             .collect();
@@ -8110,7 +8142,7 @@ mod tests {
 
         // rows appended later copy the same template the same way
         page.rows.set(appended(&page.rows.get(), &counted(5..7)));
-        let appended = runtime.dom_frame(&page, size);
+        let appended = runtime.dom_frame(&page, size).unwrap();
         replay.apply(&appended);
         assert_clicks_resolve(&replay, &runtime);
         assert_eq!(
@@ -8130,17 +8162,17 @@ mod tests {
         let page = Counters { rows: State::new(counted(1..5)) };
         let runtime = Runtime::new();
         let mut replay = crate::ssr::Replay::new(size);
-        let mount = runtime.dom_frame(&page, size);
+        let mount = runtime.dom_frame(&page, size).unwrap();
         replay.apply(&mount);
         assert_clicks_resolve(&replay, &runtime);
 
         page.rows.set(Rc::new(Vec::new()));
-        replay.apply(&runtime.dom_frame(&page, size));
+        replay.apply(&runtime.dom_frame(&page, size).unwrap());
         assert!(runtime.dom_action_paths().is_empty(), "the clear leaves no target");
         assert!(replay.action_paths().is_empty(), "{}", replay.html());
 
         page.rows.set(counted(5..9));
-        let run = runtime.dom_frame(&page, size);
+        let run = runtime.dom_frame(&page, size).unwrap();
         replay.apply(&run);
         assert_clicks_resolve(&replay, &runtime);
         // built as the mount built its rows: row 5 whole (seven
@@ -8208,7 +8240,7 @@ mod tests {
         let size = Size { width: 400.0, height: 400.0 };
         let page = Badges { rows: State::new(counted(1..5)), picked: State::new(0) };
         let runtime = Runtime::new();
-        let mount = runtime.dom_frame(&page, size);
+        let mount = runtime.dom_frame(&page, size).unwrap();
         let mut replay = crate::ssr::Replay::new(size);
         replay.apply(&mount);
         assert_clicks_resolve(&replay, &runtime);
@@ -8288,14 +8320,14 @@ mod tests {
         let page = Folds { rows: State::new(folds(1..5)) };
         let runtime = Runtime::new();
         let mut replay = crate::ssr::Replay::new(size);
-        replay.apply(&runtime.dom_frame(&page, size));
+        replay.apply(&runtime.dom_frame(&page, size).unwrap());
         assert_clicks_resolve(&replay, &runtime);
 
         // row 2 (a copy) and row 1 (the template) open
         for row in [2, 1] {
             let unfold = target_of(&replay, "unfold", row);
             assert!(runtime.dom_action(&unfold, 1), "{unfold}");
-            let patches = runtime.dom_frame(&page, size);
+            let patches = runtime.dom_frame(&page, size).unwrap();
             let paths: Vec<usize> = patches
                 .iter()
                 .filter_map(|patch| match patch {
@@ -8316,16 +8348,16 @@ mod tests {
 
         // rows mounted after the change, and a row closing again
         page.rows.set(appended(&rows, &folds(5..8)));
-        let appended = runtime.dom_frame(&page, size);
+        let appended = runtime.dom_frame(&page, size).unwrap();
         replay.apply(&appended);
         assert_clicks_resolve(&replay, &runtime);
         let fold = target_of(&replay, "fold", 2);
         assert!(runtime.dom_action(&fold, 1));
-        replay.apply(&runtime.dom_frame(&page, size));
+        replay.apply(&runtime.dom_frame(&page, size).unwrap());
         assert_clicks_resolve(&replay, &runtime);
         let unfold = target_of(&replay, "unfold", 6);
         assert!(runtime.dom_action(&unfold, 1));
-        replay.apply(&runtime.dom_frame(&page, size));
+        replay.apply(&runtime.dom_frame(&page, size).unwrap());
         assert_clicks_resolve(&replay, &runtime);
         assert!(page.rows.get()[5].open.get(), "row 6 opened through its resolved path");
     }
@@ -8337,23 +8369,23 @@ mod tests {
     fn a_served_page_resolves_clicks_as_a_mounted_one() {
         let size = Size { width: 400.0, height: 400.0 };
         let page = Counters { rows: State::new(counted(1..4)) };
-        let served = crate::ssr::render(&page, size);
+        let served = crate::ssr::render(&page, size).unwrap();
         assert!(served.html.contains("data-base=\""), "{}", served.html);
         assert!(served.html.contains("data-path=\"~/"), "{}", served.html);
 
         let runtime = Runtime::new();
         let mut replay = crate::ssr::Replay::new(size);
-        replay.apply(&runtime.dom_frame(&page, size));
+        replay.apply(&runtime.dom_frame(&page, size).unwrap());
         assert_eq!(replay.html(), served.html, "the mount and the served page are one tree");
         assert_clicks_resolve(&replay, &runtime);
 
         // the browser adopts the served page, and the next change lands
         // on it — the served bases still hold the paths below them
         let hydrated = Runtime::new();
-        hydrated.dom_adopt(&page, size);
-        assert!(hydrated.dom_frame(&page, size).is_empty());
+        hydrated.dom_adopt(&page, size).unwrap();
+        assert!(hydrated.dom_frame(&page, size).unwrap().is_empty());
         page.rows.set(appended(&page.rows.get(), &counted(4..6)));
-        replay.apply(&hydrated.dom_frame(&page, size));
+        replay.apply(&hydrated.dom_frame(&page, size).unwrap());
         assert_clicks_resolve(&replay, &hydrated);
         let more = target_of(&replay, "more", 2);
         assert!(hydrated.dom_action(&more, 1));

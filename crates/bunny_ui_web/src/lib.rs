@@ -145,6 +145,26 @@ thread_local! {
         const { std::cell::Cell::new(bunny_ui::stats::FrameStats::new()) };
 }
 
+#[cfg(feature = "gpu")]
+type FrameError = bunny_ui::gpu::walk::RenderError;
+#[cfg(not(feature = "gpu"))]
+type FrameError = bunny_ui::text_error::TextError;
+
+/// JS callbacks cannot carry a Rust error. Report it through the existing
+/// console door, clear unavailable IME geometry, and consume a failed edit.
+fn native_event<T, E: std::fmt::Display>(result: Result<T, E>, unavailable: T) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            let message = format!("native operation failed: {error}");
+            unsafe { js_panic(message.as_ptr(), message.len()) };
+            TEXT_CARET.with(|slot| slot.set((false, 0.0, 0.0, 0.0, 0)));
+            KEY_TAKEN.with(|slot| slot.set(true));
+            unavailable
+        }
+    }
+}
+
 fn now_ms() -> f64 {
     unsafe { js_now() }
 }
@@ -304,16 +324,17 @@ fn pattern(key: bunny_ui::action::Key, mods: u32) -> KeyPattern {
 /// One stroke, in the desktop gate's order: the focused escape hatch
 /// first, then the keymap, then the field's editing vocabulary. `true`
 /// = something changed and the frame is worth presenting.
-fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
+fn stroke(runtime: &Runtime, pattern: KeyPattern) -> Result<bool, FrameError> {
+        Ok({
     use bunny_ui::action::Key;
-    let taken = runtime.key_stroke(&pattern);
+    let taken = runtime.key_stroke(&pattern)?;
     if taken.handled {
         // a copy hands the text back for the platform's clipboard — the
         // mac shell's rule, on the road the browser allows it
         if let Some(text) = taken.text {
             clipboard_write(&text);
         }
-        return true;
+        return Ok(true);
     }
     // a field of MANY lines owns the bare break and the bare vertical
     // arrows, before any binding — and only it: a one-line field
@@ -328,9 +349,9 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
             Key::Down => Some(EditCommand::Down(pattern.shift)),
             _ => None,
         }
-        && runtime.key(command).applied
+        && runtime.key(command)?.applied
     {
-        return true;
+        return Ok(true);
     }
     // typing is never stolen by a binding — but only whoever holds the
     // keyboard AND is taking text is typing (a modal box in command
@@ -339,10 +360,10 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
     let typing = !mid_chord && runtime.focus_takes_text() && pattern.is_text_input();
     if !typing {
         match runtime.chord(&pattern) {
-            KeyMatch::Action(action) if runtime.dispatch_action(action) => return true,
+            KeyMatch::Action(action) if runtime.dispatch_action(action) => return Ok(true),
             // the stroke opened (or let go of) a sequence: it is spent,
             // and a which-key panel may have just changed
-            KeyMatch::Pending => return true,
+            KeyMatch::Pending => return Ok(true),
             _ => {}
         }
     }
@@ -356,38 +377,41 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
         Key::Char('a') if pattern.command => Some(EditCommand::SelectAll),
         // cmd-c / cmd-x: the field's output goes to the platform
         Key::Char('c') if pattern.command => {
-            if let Some(text) = runtime.key(EditCommand::Copy).output {
+            if let Some(text) = runtime.key(EditCommand::Copy)?.output {
                 clipboard_write(&text);
             }
-            return false;
+            return Ok(false);
         }
         Key::Char('x') if pattern.command => {
-            let cut = runtime.key(EditCommand::Cut);
+            let cut = runtime.key(EditCommand::Cut)?;
             if let Some(text) = &cut.output {
                 clipboard_write(text);
             }
-            return cut.output.is_some();
+            return Ok(cut.output.is_some());
         }
         // cmd-v is NOT an edit here: a page cannot read the clipboard on a
         // keystroke, so the text arrives through the browser's own `paste`
         // event (the glue forwards it as text) — the stroke is spent
         // without inserting, or a paste would land twice
-        Key::Char('v') if pattern.command => return false,
-        Key::Escape => return runtime.blur(),
+        Key::Char('v') if pattern.command => return Ok(false),
+        Key::Escape => return Ok(runtime.blur()),
         _ => None,
     };
     match edit {
-        Some(edit) => runtime.key(edit).applied,
+        Some(edit) => runtime.key(edit)?.applied,
         None => false,
     }
+        })
 }
 
 /// Where the keyboard is taking text, for the glue's editable: whether a
 /// field or a box holds the keyboard and takes text, and the caret.
-fn note_text_caret(runtime: &Runtime) {
+fn note_text_caret(runtime: &Runtime) -> Result<(), FrameError> {
+        Ok({
     let takes = runtime.focus_takes_text();
     let caret = takes
         .then(|| runtime.ime_snapshot())
+        .transpose()?
         .flatten()
         .map(|snapshot| {
             let rect = snapshot.caret_rect;
@@ -396,6 +420,7 @@ fn note_text_caret(runtime: &Runtime) {
     let (x, y, height) = caret.unwrap_or((0.0, 0.0, 16.0));
     let keys = keyboard_code(runtime.focus_keyboard_type());
     TEXT_CARET.with(|slot| slot.set((takes, x, y, height, keys)));
+        })
 }
 
 /// The glue's number for the keys a field asks for — the index of its
@@ -547,7 +572,7 @@ enum Event {
 }
 
 struct Shell {
-    handle: Box<dyn FnMut(Event)>,
+    handle: Box<dyn FnMut(Event) -> Result<(), FrameError>>,
 }
 
 thread_local! {
@@ -647,7 +672,7 @@ fn dispatch(event: Event) {
     // nothing on the normal road re-enters.
     let taken = SHELL.with(|slot| slot.borrow_mut().take());
     if let Some(mut shell) = taken {
-        (shell.handle)(event);
+        native_event((shell.handle)(event), ());
         // Put it back, unless the handler booted a fresh shell in place.
         SHELL.with(|slot| {
             let mut slot = slot.borrow_mut();
@@ -727,15 +752,15 @@ pub fn start_with(
     let drawn = Rc::clone(&drew);
 
     let present = move |runtime: &Runtime,
-                            root: &dyn Fn(&Runtime, Size) -> bunny_ui::layout::DisplayList,
+                            root: &dyn Fn(&Runtime, Size) -> Result<bunny_ui::layout::DisplayList, bunny_ui::text_error::TextError>,
                             size: Size,
                             scale: usize,
-                            surface: &mut Option<(Surface, usize, Color)>| {
-        drawn.set(true);
+                            surface: &mut Option<(Surface, usize, Color)>|  -> Result<(), FrameError> {
+        Ok({
         let canvas = bunny_ui::theme::canvas();
         let physical =
             ((size.width.round() as usize) * scale, (size.height.round() as usize) * scale);
-        let display = root(runtime, size);
+        let display = root(runtime, size)?;
         // the hosts first, as the desktops do: the page's elements over
         // the canvas follow the layout the list was built from
         sync_hosts(runtime);
@@ -751,12 +776,13 @@ pub fn start_with(
                 canvas,
                 &*runtime.text(),
                 &*runtime.images(),
-            );
+            )?;
+            drawn.set(true);
             note_presented();
             if runtime.wants_frame() {
                 unsafe { js_request_frame() };
             }
-            return;
+            return Ok(());
         }
         let stale = match &*surface {
             Some((retained, kept_scale, kept_canvas)) => {
@@ -771,7 +797,8 @@ pub fn start_with(
             *surface = Some((Surface::new(physical.0, physical.1, scale, canvas), scale, canvas));
         }
         let (retained, _, _) = surface.as_mut().expect("surface for the frame");
-        let damage = retained.frame(display, &*runtime.text(), &*runtime.images());
+        let damage = retained.frame(display, &*runtime.text(), &*runtime.images())?;
+        drawn.set(true);
         if !damage.is_empty() || stale {
             let (width, height) = (retained.bitmap().width(), retained.bitmap().height());
             let rgba = retained.rgba();
@@ -781,9 +808,11 @@ pub fn start_with(
         if runtime.wants_frame() {
             unsafe { js_request_frame() };
         }
-    };
+            })
+};
 
-    let handle = Box::new(move |event: Event| {
+    let handle = Box::new(move |event: Event|  -> Result<(), FrameError> {
+        Ok({
         let full =
             |runtime: &Runtime, size: Size| runtime.display_frame(&root, size);
         let tick =
@@ -794,10 +823,10 @@ pub fn start_with(
             // since the last. A key, a press and a release cannot — they
             // draw before the handler returns, as they always did.
             Event::PointerMove { x, y, modifiers } => {
-                if runtime.pointer_moved(x, y, modifiers)
+                if runtime.pointer_moved(x, y, modifiers)?
                     && pacer.ask(ORIGIN_POINTER, Urgency::Soon, false) == Verdict::Draw
                 {
-                    present(&runtime, &full, size, scale, &mut surface);
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
                 point_cursor(&runtime);
             }
@@ -805,14 +834,14 @@ pub fn start_with(
             // close the warm period a move may have opened — no empty
             // beats follow a click
             Event::PointerDown { x, y, clicks, modifiers } => {
-                if runtime.pointer_clicked(x, y, clicks, modifiers) {
-                    present(&runtime, &full, size, scale, &mut surface);
+                if runtime.pointer_clicked(x, y, clicks, modifiers)? {
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
                 pacer.rest();
             }
             Event::PointerUp { x, y } => {
                 let _ = runtime.pointer_released(x, y);
-                present(&runtime, &full, size, scale, &mut surface);
+                present(&runtime, &full, size, scale, &mut surface)?;
                 pacer.rest();
             }
             // A landing that changed nothing visible may still have put the
@@ -820,8 +849,8 @@ pub fn start_with(
             // that waits to see whether the finger meant to scroll. The
             // turn's end hears `wants_frame` and keeps the beat for it.
             Event::TouchBegan { id, x, y, taps } => {
-                if runtime.touch_began(id, x, y, taps) {
-                    present(&runtime, &full, size, scale, &mut surface);
+                if runtime.touch_began(id, x, y, taps)? {
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
             }
             // a pan is the wheel's road under a finger, and it folds into
@@ -832,37 +861,37 @@ pub fn start_with(
                 let taken = runtime.magnify(x, y, ratio);
                 MAGNIFY_TAKEN.with(|slot| slot.set(taken));
                 if taken && pacer.ask(ORIGIN_POINTER, Urgency::Soon, false) == Verdict::Draw {
-                    present(&runtime, &full, size, scale, &mut surface);
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
             }
             Event::TouchMoved { id, x, y } => {
-                if runtime.touch_moved(id, x, y)
+                if runtime.touch_moved(id, x, y)?
                     && pacer.ask(ORIGIN_POINTER, Urgency::Soon, false) == Verdict::Draw
                 {
-                    present(&runtime, &full, size, scale, &mut surface);
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
             }
             Event::TouchEnded { id, x, y } => {
                 // the lift may fire; the pressed visual always clears
-                let _ = runtime.touch_ended(id, x, y);
-                present(&runtime, &full, size, scale, &mut surface);
+                let _ = runtime.touch_ended(id, x, y)?;
+                present(&runtime, &full, size, scale, &mut surface)?;
             }
             Event::TouchCancelled { id } => {
-                if runtime.touch_cancelled(id) {
-                    present(&runtime, &full, size, scale, &mut surface);
+                if runtime.touch_cancelled(id)? {
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
             }
             Event::Keyboard { overlap } => {
                 // the root lays itself out above the keys, as on the phones
                 runtime.set_keyboard_inset(overlap);
                 if runtime.needs_frame() {
-                    present(&runtime, &full, size, scale, &mut surface);
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
             }
             Event::KeyboardDismissed => {
                 // the phones' rule: the keys going away lets the field go
                 if runtime.blur() {
-                    present(&runtime, &full, size, scale, &mut surface);
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
             }
             Event::Wheel { x, y, dx, dy, modifiers } => {
@@ -873,35 +902,35 @@ pub fn start_with(
                 if runtime.wheel_with(x, y, -dx, -dy, modifiers, bunny_ui::custom::WheelPhase::Changed)
                     && pacer.ask(ORIGIN_WHEEL, Urgency::Soon, false) == Verdict::Draw
                 {
-                    present(&runtime, &full, size, scale, &mut surface);
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
             }
             Event::Text(text) => {
-                if runtime.key(EditCommand::Insert(text)).applied {
-                    present(&runtime, &full, size, scale, &mut surface);
+                if runtime.key(EditCommand::Insert(text))?.applied {
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
             }
             Event::Marked(text) => {
                 // the caret stands at the composition's end, the way
                 // every input system leaves it while the reader types
                 let caret = text.encode_utf16().count();
-                if runtime.key(EditCommand::SetMarked { text, caret_utf16: (caret, 0) }).applied {
-                    present(&runtime, &full, size, scale, &mut surface);
+                if runtime.key(EditCommand::SetMarked { text, caret_utf16: (caret, 0) })?.applied {
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
             }
-            Event::TextCaret => note_text_caret(&runtime),
+            Event::TextCaret => note_text_caret(&runtime)?,
             Event::KeyChar(character, mods) => {
-                if stroke(&runtime, pattern(bunny_ui::action::Key::Char(character.to_ascii_lowercase()), mods)) {
-                    present(&runtime, &full, size, scale, &mut surface);
+                if stroke(&runtime, pattern(bunny_ui::action::Key::Char(character.to_ascii_lowercase()), mods))? {
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
             }
             Event::Key(code, mods) => {
                 let Some(key) = named_key(code) else {
-                    return;
+                    return Ok(());
                 };
-                if stroke(&runtime, pattern(key, mods)) {
+                if stroke(&runtime, pattern(key, mods))? {
                     KEY_TAKEN.with(|taken| taken.set(true));
-                    present(&runtime, &full, size, scale, &mut surface);
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
             }
             Event::Frame { dt, elapsed } => {
@@ -911,18 +940,18 @@ pub fn start_with(
                 // springs lose nothing — and a finger whose meaning the
                 // clock decided (a hold that became a press or a menu)
                 // reached the app, so that frame settles like a press does.
-                let moved = runtime.tick_clocked(dt, elapsed);
+                let moved = runtime.tick_clocked(dt, elapsed)?;
                 if pacer.beat(false) == Beat::Draw || moved.input {
-                    present(&runtime, &full, size, scale, &mut surface);
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 } else if moved.any() {
-                    present(&runtime, &tick, size, scale, &mut surface);
+                    present(&runtime, &tick, size, scale, &mut surface)?;
                 }
             }
             Event::Resize { width, height, scale: ratio } => {
                 size = Size { width, height };
                 scale = (ratio.round() as usize).max(1);
                 runtime.set_device_scale(scale as f64);
-                present(&runtime, &full, size, scale, &mut surface);
+                present(&runtime, &full, size, scale, &mut surface)?;
             }
             Event::TooltipTick => {
                 // the same slow beat ages a sequence in the air: two
@@ -930,23 +959,23 @@ pub fn start_with(
                 // wheel's latch: two ticks with no wheel end the gesture
                 runtime.wheel_tick();
                 if runtime.tooltip_tick() | runtime.chord_tick() {
-                    present(&runtime, &full, size, scale, &mut surface);
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
             }
             Event::ContextClick { x, y, modifiers } => {
                 // the box under the pointer hears it first
                 if runtime.button_pressed(x, y, bunny_ui::custom::PointerButton::Secondary, modifiers) {
-                    present(&runtime, &full, size, scale, &mut surface);
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
             }
             Event::ButtonDown { x, y, button, modifiers } => {
                 if runtime.button_pressed(x, y, button, modifiers) {
-                    present(&runtime, &full, size, scale, &mut surface);
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
             }
             Event::Modifiers(mods) => {
                 if runtime.modifiers_changed(held(mods)) {
-                    present(&runtime, &full, size, scale, &mut surface);
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
             }
             // the canvas shell drives every animation itself, so the
@@ -968,9 +997,9 @@ pub fn start_with(
                 // the layout reflows around the fresh intrinsic size and
                 // the paint asks the engine again — one full frame, settle
                 // included
-                present(&runtime, &full, size, scale, &mut surface);
+                present(&runtime, &full, size, scale, &mut surface)?;
             }
-            Event::Repaint => present(&runtime, &full, size, scale, &mut surface),
+            Event::Repaint => present(&runtime, &full, size, scale, &mut surface)?,
             Event::Idle => {
                 // the page is idle: free what the frames removed
                 runtime.collect_garbage();
@@ -989,7 +1018,7 @@ pub fn start_with(
                 if runtime.needs_frame()
                     && pacer.ask(ORIGIN_WAKE, Urgency::Soon, false) == Verdict::Draw
                 {
-                    present(&runtime, &full, size, scale, &mut surface);
+                    present(&runtime, &full, size, scale, &mut surface)?;
                 }
             }
             // Dom-mode traffic — this shell rasterizes, nothing to do
@@ -1014,7 +1043,8 @@ pub fn start_with(
             unsafe { js_request_frame() };
         }
         pacer.set_beating(beating);
-    });
+            })
+});
     SHELL.with(|slot| {
         *slot.borrow_mut() = Some(Shell { handle });
     });
@@ -1075,12 +1105,15 @@ fn start_dom_with(
     if hydrate {
         // the page shipped painted: adopt it, and let the first frame
         // agree in silence
-        runtime.dom_adopt(&root, size);
+        if !native_event(runtime.dom_adopt(&root, size).map(|_| true), false) {
+            return;
+        }
     }
 
     // patches first, then any island whose pixels changed — the
     // element exists before its bitmap arrives
-    fn present(runtime: &Runtime, patches: Vec<bunny_ui::dom::DomPatch>, scale: usize) {
+    fn present(runtime: &Runtime, patches: Vec<bunny_ui::dom::DomPatch>, scale: usize) -> Result<(), FrameError> {
+        Ok({
         if !patches.is_empty() {
             let bytes = bunny_ui::dom::encode(&patches);
             unsafe { js_apply_patches(bytes.as_ptr(), bytes.len()) };
@@ -1108,12 +1141,12 @@ fn start_dom_with(
                     Color::rgba(0, 0, 0, 0),
                     &*runtime.text(),
                     &*runtime.images(),
-                );
+                )?;
             }
-            return;
+            return Ok(());
         }
         #[cfg(feature = "canvas")]
-        for island in runtime.dom_islands(scale) {
+        for island in runtime.dom_islands(scale)? {
             let (x, y, dirty_width, dirty_height) = island.dirty;
             unsafe {
                 js_island_rect(
@@ -1130,28 +1163,30 @@ fn start_dom_with(
         }
         #[cfg(not(feature = "canvas"))]
         let _ = scale;
-    }
+            })
+}
 
-    let handle = Box::new(move |event: Event| {
+    let handle = Box::new(move |event: Event|  -> Result<(), FrameError> {
+        Ok({
         match event {
             Event::PointerDown { x, y, clicks, modifiers } => {
-                let _ = runtime.pointer_clicked(x, y, clicks, modifiers);
+                let _ = runtime.pointer_clicked(x, y, clicks, modifiers)?;
                 // the glue asks this next: a press on a drag source is
                 // the ONLY thing that opens the move door in this mode
                 DRAG_ARMED.with(|armed| armed.set(runtime.drag_armed()));
-                present(&runtime, runtime.dom_frame(&root, size), scale);
+                present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
             }
             Event::PointerUp { x, y } => {
                 let _ = runtime.pointer_released(x, y);
                 DRAG_ARMED.with(|armed| armed.set(false));
-                present(&runtime, runtime.dom_frame(&root, size), scale);
+                present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
             }
             Event::DomScroll { id, x, y } => {
                 // the browser moved: the offset folds into the engine
                 // AND the retained scene (the diff meets its own echo),
                 // and the region's window body re-runs
                 runtime.dom_scrolled(id, x, y);
-                present(&runtime, runtime.dom_frame(&root, size), scale);
+                present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
             }
             Event::DomViewport { id, width, height } => {
                 // stored for the next window math — no frame of its own
@@ -1161,30 +1196,30 @@ fn start_dom_with(
                 // a flexible island's real box — news re-measures the
                 // island against it; an echo costs nothing
                 if runtime.dom_island_box(id, width, height) {
-                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                    present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
                 }
             }
             Event::IslandPointer { id, kind, x, y, mods } => {
                 // the canvas's own coordinates, routed to the app's
                 // box under the point — the pixels follow its answer
                 if runtime.dom_island_pointer(id, kind, x, y, held(mods)) {
-                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                    present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
                 }
             }
             Event::Action { path, clicks } => {
                 // the browser resolved the press; the engine runs the
                 // handler and the frame follows
                 runtime.dom_action(&path, clicks);
-                present(&runtime, runtime.dom_frame(&root, size), scale);
+                present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
             }
             Event::Field { path, value, caret } => {
                 if runtime.sync_field(&path, &value, caret) {
-                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                    present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
                 }
             }
             Event::Resize { width, height, .. } => {
                 size = Size { width, height };
-                present(&runtime, runtime.dom_frame(&root, size), scale);
+                present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
             }
             Event::TooltipTick => {
                 // the same slow beat ages a sequence in the air: two
@@ -1192,65 +1227,65 @@ fn start_dom_with(
                 // wheel's latch: two ticks with no wheel end the gesture
                 runtime.wheel_tick();
                 if runtime.tooltip_tick() | runtime.chord_tick() {
-                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                    present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
                 }
             }
             Event::ContextClick { x, y, modifiers } => {
                 if runtime.button_pressed(x, y, bunny_ui::custom::PointerButton::Secondary, modifiers) {
-                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                    present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
                 }
             }
             Event::ImageReady | Event::Wake | Event::Repaint => {
                 // geometry reflows around the fresh intrinsic size (or
                 // around what a task just wrote); the <img> elements
                 // themselves paint on their own
-                present(&runtime, runtime.dom_frame(&root, size), scale);
+                present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
             }
             Event::Key(code, mods) => {
                 // the browser owns the <input>s here; the strokes that
                 // matter to US are the focused island's and the
                 // keymap's (Escape dismisses a popover through it)
                 let Some(key) = named_key(code) else {
-                    return;
+                    return Ok(());
                 };
-                if stroke(&runtime, pattern(key, mods)) {
+                if stroke(&runtime, pattern(key, mods))? {
                     KEY_TAKEN.with(|taken| taken.set(true));
-                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                    present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
                 }
             }
             Event::KeyChar(character, mods) => {
-                if stroke(&runtime, pattern(bunny_ui::action::Key::Char(character.to_ascii_lowercase()), mods)) {
-                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                if stroke(&runtime, pattern(bunny_ui::action::Key::Char(character.to_ascii_lowercase()), mods))? {
+                    present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
                 }
             }
             Event::Text(text) => {
                 // a focused island types through the same door the
                 // desktop uses; a field's text never comes this way
                 // (the <input> owns it and syncs through bunny_field)
-                if runtime.key(EditCommand::Insert(text)).applied {
-                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                if runtime.key(EditCommand::Insert(text))?.applied {
+                    present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
                 }
             }
             Event::Marked(text) => {
                 let caret = text.encode_utf16().count();
-                if runtime.key(EditCommand::SetMarked { text, caret_utf16: (caret, 0) }).applied {
-                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                if runtime.key(EditCommand::SetMarked { text, caret_utf16: (caret, 0) })?.applied {
+                    present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
                 }
             }
-            Event::TextCaret => note_text_caret(&runtime),
+            Event::TextCaret => note_text_caret(&runtime)?,
             // a pointer MOVE reaches us in this mode only between a
             // press that armed a drag and its release (the glue opens
             // the door and closes it) — so a drag works here too and
             // the zero-patch hover stays untouched, by construction
             Event::PointerMove { x, y, modifiers } => {
-                if runtime.pointer_moved(x, y, modifiers) {
-                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                if runtime.pointer_moved(x, y, modifiers)? {
+                    present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
                 }
                 DRAG_ARMED.with(|armed| armed.set(runtime.drag_armed()));
             }
             Event::Modifiers(mods) => {
                 if runtime.modifiers_changed(held(mods)) {
-                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                    present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
                 }
             }
             // The reader's own answer about motion. Springs stay the
@@ -1274,10 +1309,10 @@ fn start_dom_with(
             // decoration tick beside real elements without the page
             // re-laying itself out around it.
             Event::Frame { dt, .. } => {
-                let moved = runtime.tick(dt);
+                let moved = runtime.tick(dt)?;
                 if moved.islands {
                     #[cfg(feature = "canvas")]
-                    for island in runtime.dom_islands(scale) {
+                    for island in runtime.dom_islands(scale)? {
                         let (x, y, dirty_width, dirty_height) = island.dirty;
                         unsafe {
                             js_island_rect(
@@ -1296,7 +1331,7 @@ fn start_dom_with(
                 // a scene that moved is a real frame — but in this mode
                 // only the clocks tick, so this is the rare road
                 if moved.scene {
-                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                    present(&runtime, runtime.dom_frame(&root, size)?, scale)?;
                 }
                 if runtime.wants_frame() {
                     unsafe { js_request_frame() };
@@ -1312,7 +1347,8 @@ fn start_dom_with(
             // mode — nothing to do on our side of the border
             _ => {}
         }
-    });
+            })
+});
     SHELL.with(|slot| {
         *slot.borrow_mut() = Some(Shell { handle });
     });
@@ -1823,8 +1859,9 @@ pub extern "C" fn bunny_gpu_forced() {
 #[cfg(feature = "gpu")]
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_gpu_selftest(packed: u32) -> u32 {
+    native_event((|| -> Result<u32, FrameError> { Ok({
     if !gpu::active() {
-        return 0;
+        return Ok(0);
     }
     let colour = bunny_ui::layout::Color {
         r: (packed >> 24) as u8,
@@ -1842,13 +1879,14 @@ pub extern "C" fn bunny_gpu_selftest(packed: u32) -> u32 {
         colour,
         &*runtime.text(),
         &*runtime.images(),
-    );
+    )?;
     let rgba = gpu::read_rgba((4, 4));
     let at = (1 * 4 + 1) * 4;
     ((rgba[at] as u32) << 24)
         | ((rgba[at + 1] as u32) << 16)
         | ((rgba[at + 2] as u32) << 8)
         | rgba[at + 3] as u32
+    }) })(), u32::MAX)
 }
 
 // MARK: - Parity against the oracle
@@ -1862,6 +1900,7 @@ pub extern "C" fn bunny_gpu_selftest(packed: u32) -> u32 {
 #[cfg(feature = "gpu")]
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_gpu_parity(scene: u32) -> u32 {
+    native_event((|| -> Result<u32, FrameError> { Ok({
     use bunny_ui::layout::{Color, Size};
 
     let size = Size { width: 120.0, height: 80.0 };
@@ -1873,7 +1912,7 @@ pub extern "C" fn bunny_gpu_parity(scene: u32) -> u32 {
         (size.width as usize * scale) as u32,
         (size.height as usize * scale) as u32,
     );
-    gpu::present_window(None, &display, size, scale, canvas, &*runtime.text(), &*runtime.images());
+    gpu::present_window(None, &display, size, scale, canvas, &*runtime.text(), &*runtime.images())?;
     let mine = gpu::read_rgba(physical);
     let theirs = bunny_ui::raster::rasterize_with(
         &display,
@@ -1883,12 +1922,12 @@ pub extern "C" fn bunny_gpu_parity(scene: u32) -> u32 {
         canvas,
         &*runtime.text(),
         &*runtime.images(),
-    )
+    )?
     .to_rgba_bytes();
 
     if mine.len() != theirs.len() {
         gpu::say(&format!("parity {name}: sizes differ"));
-        return 255;
+        return Ok(255);
     }
     let mut worst = 0u8;
     let mut beyond_one = 0usize;
@@ -1906,6 +1945,7 @@ pub extern "C" fn bunny_gpu_parity(scene: u32) -> u32 {
         mine.len()
     ));
     worst as u32
+    }) })(), u32::MAX)
 }
 
 /// One timed present of a full-window scene, in milliseconds.
@@ -1927,6 +1967,7 @@ pub extern "C" fn bunny_gpu_parity(scene: u32) -> u32 {
 #[cfg(feature = "gpu")]
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_bench_present(road: u32, width: u32, height: u32, samples: u32) -> f64 {
+    native_event((|| -> Result<f64, FrameError> { Ok({
     use bunny_ui::layout::{Color, Size};
 
     let scale = 2usize;
@@ -1949,16 +1990,16 @@ pub extern "C" fn bunny_bench_present(road: u32, width: u32, height: u32, sample
                 gpu::present_window(
                     None, &display, logical, scale, canvas,
                     &*runtime.text(), &*runtime.images(),
-                );
+                )?;
             }
             1 => {
                 let mut fresh =
                     bunny_ui::raster::Surface::new(physical.0, physical.1, scale, canvas);
-                let _ = fresh.frame(display, &*runtime.text(), &*runtime.images());
+                let _ = fresh.frame(display, &*runtime.text(), &*runtime.images())?;
                 let _ = fresh.rgba();
             }
             _ => {
-                let _ = surface.frame(display, &*runtime.text(), &*runtime.images());
+                let _ = surface.frame(display, &*runtime.text(), &*runtime.images())?;
                 let _ = surface.rgba();
             }
         }
@@ -1966,4 +2007,5 @@ pub extern "C" fn bunny_bench_present(road: u32, width: u32, height: u32, sample
     }
     best.sort_by(|a, b| a.partial_cmp(b).expect("no nan on a clock"));
     best[best.len() / 2]
+    }) })(), f64::NAN)
 }

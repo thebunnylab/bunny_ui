@@ -7,6 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 
+use bunny_ui::gpu::walk::RenderError;
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::layout::{Color, DisplayList, Size};
 use bunny_ui::text_engine::TextEngine;
@@ -85,7 +86,7 @@ fn present_with(
     canvas: Color,
     text: &dyn TextEngine,
     images: &dyn ImageEngine,
-) -> Presented {
+) -> Result<Presented, RenderError> {
     presenter.present(
         display,
         size,
@@ -106,14 +107,18 @@ pub(crate) fn present_window(
     canvas: Color,
     text: &dyn TextEngine,
     images: &dyn ImageEngine,
-) {
-    let outcome = PRESENTER.with(|slot| {
-        slot.borrow_mut().get_mut(&window).map(|presenter| {
-            present_with(window, presenter, display, size, scale, canvas, text, images)
+) -> Result<(), RenderError> {
+    let outcome = PRESENTER
+        .with(|slot| {
+            slot.borrow_mut().get_mut(&window).map(|presenter| {
+                present_with(
+                    window, presenter, display, size, scale, canvas, text, images,
+                )
+            })
         })
-    });
+        .transpose()?;
     match outcome {
-        None | Some(Presented::Ok) => return,
+        None | Some(Presented::Ok) => return Ok(()),
         // on the desktop a lost surface is a lost window: both losses
         // rebuild the presenter once, then step down
         Some(Presented::SurfaceLost) | Some(Presented::DeviceLost) => {}
@@ -121,14 +126,25 @@ pub(crate) fn present_window(
     teardown(window);
     if !RECREATE_SPENT.with(|spent| spent.replace(true)) {
         if let Some(mut presenter) = install(window) {
-            present_with(window, &mut presenter, display, size, scale, canvas, text, images);
+            present_with(
+                window,
+                &mut presenter,
+                display,
+                size,
+                scale,
+                canvas,
+                text,
+                images,
+            )?;
             PRESENTER.with(|slot| slot.borrow_mut().insert(window, presenter));
-            return;
+            return Ok(());
         }
     }
     // the gl tier below catches the window for the rest of its life
     eprintln!("bunny_ui vk: the device is lost — stepping down the ladder");
     let _ = crate::gl::try_install(window);
+
+    Ok(())
 }
 
 /// Lets a window's presenter go — swapchain, surface, device and
@@ -199,7 +215,7 @@ mod tests {
         .padding_length(10.0)
         .background_color(Color::hex(0xFFFFFF))
         .corner_radius(9.0);
-        let display = runtime.display_frame(&root, logical);
+        let display = runtime.display_frame(&root, logical).unwrap();
         let cpu = rasterize_with(
             &display,
             physical.0,
@@ -209,9 +225,11 @@ mod tests {
             &engine,
             &RawImages::default(),
         )
+        .unwrap()
         .to_rgba_bytes();
         let mut gpu = OffscreenVk::new(physical.0, physical.1).expect("offscreen gpu");
-        gpu.present_wait(&display, scale, Color::CANVAS, &engine, &RawImages::default());
+        gpu.present_wait(&display, scale, Color::CANVAS, &engine, &RawImages::default())
+        .unwrap();
         assert_close(&gpu.read_rgba(), &cpu, 2, "freetype runs");
     }
 }

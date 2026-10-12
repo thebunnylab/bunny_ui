@@ -27,6 +27,7 @@ impl Component for Room {
 fn x_of(runtime: &Runtime, view: &impl View, name: &str) -> f64 {
     runtime
         .settled_layout(view, Proposal::exact(SIZE))
+        .unwrap()
         .hits
         .iter()
         .find(|(path, _)| path.contains(name))
@@ -39,10 +40,10 @@ fn a_seam_written_lays_out_with_no_body_between() {
     let seam = State::new(200.0);
     let runtime = Runtime::new();
     let room = Room { seam };
-    let _ = runtime.display_frame(&room, SIZE);
+    let _ = runtime.display_frame(&room, SIZE).unwrap();
     let before = x_of(&runtime, &room, "[b]");
     seam.set(300.0);
-    let _ = runtime.display_frame(&room, SIZE);
+    let _ = runtime.display_frame(&room, SIZE).unwrap();
     assert!(runtime.body_runs().is_empty(), "a seam write ran a body: {:?}", runtime.body_runs());
     let after = x_of(&runtime, &room, "[b]");
     assert!((after - before - 100.0).abs() < 1.0, "lane B moved with the seam: {before} -> {after}");
@@ -53,10 +54,11 @@ fn a_drag_of_the_grip_moves_the_seam_and_runs_no_body() {
     let seam = State::new(200.0);
     let runtime = Runtime::new();
     let room = Room { seam };
-    let _ = runtime.display_frame(&room, SIZE);
-    assert!(runtime.pointer_pressed(200.5, 100.0), "the grip took the press");
-    let _ = runtime.pointer_moved(240.5, 100.0, Modifiers::default());
-    let _ = runtime.display_frame(&room, SIZE);
+    let _ = runtime.display_frame(&room, SIZE).unwrap();
+    assert!(runtime.pointer_pressed(200.5, 100.0).unwrap(), "the grip took the press");
+    let _ = runtime.pointer_moved(240.5, 100.0, Modifiers::default())
+        .unwrap();
+    let _ = runtime.display_frame(&room, SIZE).unwrap();
     assert!(runtime.body_runs().is_empty(), "a seam drag ran a body: {:?}", runtime.body_runs());
     assert!((seam.get() - 240.0).abs() < 1.5, "the seam followed the hand: {}", seam.get());
     runtime.pointer_released(240.5, 100.0);

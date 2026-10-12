@@ -215,12 +215,13 @@ fn main() {
     let runtime = Runtime::new();
     runtime.bind(KeyPattern::key(Key::Down), SELECT_NEXT);
     runtime.settle(&finder);
-    runtime.layout(&finder, viewport);
+    runtime.layout(&finder, viewport).unwrap();
 
     // focus the field (typing goes through the editor's real path)
-    let result = runtime.layout(&finder, viewport);
+    let result = runtime.layout(&finder, viewport).unwrap();
     let field = result.fields.first().expect("field").clone();
-    runtime.pointer_pressed(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0);
+    runtime.pointer_pressed(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0)
+        .unwrap();
     runtime.pointer_released(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0);
 
     let mut reports = Vec::new();
@@ -228,7 +229,7 @@ fn main() {
     // 1. COLD frame: retention discarded, all bodies + layout
     reports.push(measure("cold_full (build+layout)", 3, 40, usize::MAX, || {
         runtime.render_full(&finder);
-        runtime.layout(&finder, viewport);
+        runtime.layout(&finder, viewport).unwrap();
     }));
 
     // bodies of a mutation's FIRST frame pass: the layout with pending
@@ -236,28 +237,28 @@ fn main() {
     // settle right after only confirms)
     let first_pass_bodies = |mutate: &dyn Fn()| {
         mutate();
-        runtime.layout(&finder, viewport);
+        runtime.layout(&finder, viewport).unwrap();
         let bodies = runtime.body_runs().len();
         runtime.settle(&finder);
-        runtime.layout(&finder, viewport);
+        runtime.layout(&finder, viewport).unwrap();
         bodies
     };
 
     // 2. typed key: editor → binding → incremental re-render + layout
     let typing_bodies =
-        first_pass_bodies(&|| _ = runtime.key(EditCommand::Insert("e".into())));
-    let _ = runtime.key(EditCommand::Backspace);
+        first_pass_bodies(&|| _ = runtime.key(EditCommand::Insert("e".into())).unwrap());
+    let _ = runtime.key(EditCommand::Backspace).unwrap();
     runtime.settle(&finder);
     let mut forward = true;
     let typing = measure("keystroke (filter+layout)", 5, 200, 0, || {
         if forward {
-            runtime.key(EditCommand::Insert("e".into()));
+            runtime.key(EditCommand::Insert("e".into())).unwrap();
         } else {
-            runtime.key(EditCommand::Backspace);
+            runtime.key(EditCommand::Backspace).unwrap();
         }
         forward = !forward;
         runtime.settle(&finder);
-        runtime.layout(&finder, viewport);
+        runtime.layout(&finder, viewport).unwrap();
     });
     reports.push(Report { bodies: typing_bodies, ..typing });
 
@@ -267,38 +268,39 @@ fn main() {
     let selection = measure("select_next (dispatch+layout)", 5, 200, 0, || {
         runtime.dispatch_action(select);
         runtime.settle(&finder);
-        runtime.layout(&finder, viewport);
+        runtime.layout(&finder, viewport).unwrap();
     });
     reports.push(Report { bodies: selection_bodies, ..selection });
 
     // 4. hover: stamp + layout, ZERO bodies by contract (no render at all)
-    let result = runtime.layout(&finder, viewport);
+    let result = runtime.layout(&finder, viewport).unwrap();
     let row = result.hits.get(1).expect("row").1;
     let mut inside = true;
     let hover = measure("hover (stamp+layout)", 5, 200, 0, || {
         let y = row.origin.y + row.size.height / 2.0;
-        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 }, false);
+        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 }, false)
+            .unwrap();
         inside = !inside;
-        runtime.layout(&finder, viewport);
+        runtime.layout(&finder, viewport).unwrap();
     });
     reports.push(Report { bodies: 0, ..hover });
 
     // 5. wheel: engine offset + layout, zero render
-    runtime.key(EditCommand::SelectAll);
-    runtime.key(EditCommand::Backspace); // the full list back
+    runtime.key(EditCommand::SelectAll).unwrap();
+    runtime.key(EditCommand::Backspace).unwrap(); // the full list back
     runtime.settle(&finder);
-    runtime.layout(&finder, viewport);
+    runtime.layout(&finder, viewport).unwrap();
     let mut down = true;
     reports.push(measure("wheel (offset+layout)", 5, 200, 0, || {
         runtime.wheel(320.0, 300.0, 0.0, if down { -8.0 } else { 8.0 });
         down = !down;
-        runtime.layout(&finder, viewport);
+        runtime.layout(&finder, viewport).unwrap();
     }));
 
     // 6. pure rasterization of the display list (760×640 @2x, PixelFont)
-    let laid_out = runtime.layout(&finder, viewport);
+    let laid_out = runtime.layout(&finder, viewport).unwrap();
     reports.push(measure("raster 1520×1280 (paint)", 3, 60, 0, || {
-        let bitmap = rasterize_scaled(&laid_out.display, 1520, 1280, 2, Color::CANVAS);
+        let bitmap = rasterize_scaled(&laid_out.display, 1520, 1280, 2, Color::CANVAS).unwrap();
         std::hint::black_box(bitmap.width());
     }));
 
@@ -308,26 +310,34 @@ fn main() {
     use bunny_ui::raster::Surface;
     use bunny_ui::text_engine::PixelFont;
     let mut surface = Surface::new(1520, 1280, 2, Color::CANVAS);
-    surface.frame(runtime.layout(&finder, viewport).display, &PixelFont, &RawImages::default());
-    let row = runtime.layout(&finder, viewport).hits.get(1).expect("row").1;
+    surface.frame(runtime.layout(&finder, viewport).unwrap().display, &PixelFont, &RawImages::default(),
+        )
+        .unwrap();
+    let row = runtime.layout(&finder, viewport)
+        .unwrap().hits.get(1).expect("row").1;
     let mut inside = true;
     reports.push(measure("hover repaint (damage)", 3, 200, 0, || {
         let y = row.origin.y + row.size.height / 2.0;
-        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 }, false);
+        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 }, false)
+            .unwrap();
         inside = !inside;
-        let damage = surface.frame(runtime.layout(&finder, viewport).display, &PixelFont, &RawImages::default());
+        let damage = surface.frame(runtime.layout(&finder, viewport).unwrap().display, &PixelFont, &RawImages::default(),
+            )
+            .unwrap();
         std::hint::black_box(damage.len());
     }));
     let mut forward = true;
     reports.push(measure("keystroke repaint (damage)", 3, 200, 0, || {
         if forward {
-            runtime.key(EditCommand::Insert("e".into()));
+            runtime.key(EditCommand::Insert("e".into())).unwrap();
         } else {
-            runtime.key(EditCommand::Backspace);
+            runtime.key(EditCommand::Backspace).unwrap();
         }
         forward = !forward;
         runtime.settle(&finder);
-        let damage = surface.frame(runtime.layout(&finder, viewport).display, &PixelFont, &RawImages::default());
+        let damage = surface.frame(runtime.layout(&finder, viewport).unwrap().display, &PixelFont, &RawImages::default(),
+            )
+            .unwrap();
         std::hint::black_box(damage.len());
     }));
 

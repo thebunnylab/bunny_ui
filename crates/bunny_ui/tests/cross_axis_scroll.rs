@@ -34,7 +34,7 @@ impl Component for Sheet {
 }
 
 fn laid(runtime: &Runtime, sheet: &impl View, size: Size) -> LayoutResult {
-    runtime.layout(sheet, Proposal::exact(size))
+    runtime.layout(sheet, Proposal::exact(size)).unwrap()
 }
 
 fn assert_windowed(layout: &LayoutResult, size: Size) {

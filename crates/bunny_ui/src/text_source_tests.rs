@@ -140,21 +140,26 @@ fn paragraph_source_measurement_cache_uses_context_and_font() {
         fn measure_line(&self, _: &str, _: &FontSpec) -> LineMetrics {
             panic!("the contextual cache must call the contextual boundary");
         }
-        fn measure_paragraph_line(&self, line: &ParagraphLine, font: &FontSpec) -> LineMetrics {
+        fn measure_paragraph_line(&self, line: &ParagraphLine, font: &FontSpec) -> Result<LineMetrics, crate::text_error::TextError> {
+            Ok({
             self.0.set(self.0.get() + 1);
             let mut result = PixelFont.measure_line(line.text(), font);
             if line.paragraph().text().starts_with('\u{202e}') {
                 result.width += 10.0;
             }
             result
+        })
         }
         fn paragraph_line_geometry(
             &self,
             _: &ParagraphLine,
             _: &FontSpec,
-        ) -> Option<crate::text_geometry::LineGeometry> {
+        ) -> Result<Option<crate::text_geometry::LineGeometry>, crate::text_error::TextError>
+        {
+            Ok({
             self.1.set(self.1.get() + 1);
             None
+            })
         }
         fn raster_line(&self, _: &str, _: &FontSpec, _: Color, _: usize) -> Option<TextRaster> {
             None
@@ -169,24 +174,28 @@ fn paragraph_source_measurement_cache_uses_context_and_font() {
     let b = b.line(start..start + 3).unwrap();
     let font = FontSpec::DEFAULT;
     for _ in 0..3 {
-        let x = cache.get_or_measure_paragraph(&a, &font, &engine);
-        let y = cache.get_or_measure_paragraph(&b, &font, &engine);
+        let x = cache.get_or_measure_paragraph(&a, &font, &engine).unwrap();
+        let y = cache.get_or_measure_paragraph(&b, &font, &engine).unwrap();
         assert!((x.width - y.width - 10.0).abs() < 0.01);
         assert!(
             cache
                 .get_or_paragraph_geometry(&a, &font, &engine)
+                .unwrap()
                 .is_none()
         );
         assert!(
             cache
                 .get_or_paragraph_geometry(&b, &font, &engine)
+                .unwrap()
                 .is_none()
         );
     }
     assert_eq!((engine.0.get(), engine.1.get()), (2, 2));
     let changed = FontSpec { size: 24.0, ..font };
-    cache.get_or_measure_paragraph(&a, &changed, &engine);
-    cache.get_or_paragraph_geometry(&a, &changed, &engine);
+    cache.get_or_measure_paragraph(&a, &changed, &engine)
+        .unwrap();
+    cache.get_or_paragraph_geometry(&a, &changed, &engine)
+        .unwrap();
     assert_eq!((engine.0.get(), engine.1.get()), (3, 3));
 }
 
@@ -198,17 +207,18 @@ fn paragraph_source_legacy_engine_defaults_remain_callable() {
     let line = content.line(7..10).unwrap();
     let font = FontSpec::DEFAULT;
     assert_eq!(
-        PixelFont.measure_paragraph_line(&line, &font),
+        PixelFont.measure_paragraph_line(&line, &font).unwrap(),
         PixelFont.measure_line("abc", &font)
     );
     let contextual = PixelFont
         .raster_paragraph_line(&line, &font, Color::BLACK, 1)
+        .unwrap()
         .unwrap();
     let legacy = PixelFont
         .raster_line("abc", &font, Color::BLACK, 1)
         .unwrap();
     assert_eq!(contextual.rgba, legacy.rgba);
-    assert!(PixelFont.paragraph_line_geometry(&line, &font).is_none());
+    assert!(PixelFont.paragraph_line_geometry(&line, &font).unwrap().is_none());
 }
 
 #[test]

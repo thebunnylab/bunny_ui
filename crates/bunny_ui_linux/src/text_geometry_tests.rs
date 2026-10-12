@@ -34,7 +34,8 @@ fn mixed_geometry_runtime_matches_native_hebrew_glyph_positions() {
                 width: 600.,
                 height: 100.,
             }),
-        );
+        )
+            .unwrap();
         let field = &layout.fields[0];
         assert!(runtime.focus_named("field"));
         let byte = text.find('ב').unwrap();
@@ -45,9 +46,10 @@ fn mixed_geometry_runtime_matches_native_hebrew_glyph_positions() {
         assert!(glyph.rtl);
         let expected = field.text_origin.x + px(glyph.pen + glyph.advance);
         let utf16 = bunny_ui::text_input::byte_to_utf16(text, byte);
-        close(runtime.ime_rect_for(utf16).unwrap().origin.x, expected);
+        close(runtime.ime_rect_for(utf16).unwrap().unwrap().origin.x, expected);
         assert_eq!(
-            runtime.ime_index_at(expected, field.run.origin.y + 5.),
+            runtime.ime_index_at(expected, field.run.origin.y + 5.)
+                .unwrap(),
             Some(utf16)
         );
     }

@@ -55,23 +55,33 @@ pub enum Action {
 }
 
 /// Why a native action could not be applied.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ActionError {
     /// The node is no longer exposed by this runtime.
     Unavailable,
     /// The role does not implement the requested action.
     Unsupported,
+    /// Native text geometry failed while applying the edit.
+    Text(crate::text_error::TextError),
 }
 
 impl std::fmt::Display for ActionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Unavailable => "the accessible element is no longer available",
-            Self::Unsupported => "the accessible element does not support this action",
-        })
+        match self {
+            Self::Unavailable => f.write_str("the accessible element is no longer available"),
+            Self::Unsupported => f.write_str("the accessible element does not support this action"),
+            Self::Text(error) => error.fmt(f),
+        }
     }
 }
-impl std::error::Error for ActionError {}
+impl std::error::Error for ActionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Text(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// One exposed leaf. Containers are currently implicit in reading order.
 #[derive(Clone, Debug, PartialEq)]

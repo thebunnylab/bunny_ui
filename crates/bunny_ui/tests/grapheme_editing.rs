@@ -196,28 +196,29 @@ fn retained_field_deletion_invalidates_the_whole_cluster_for_ime() {
                 width: 300.0,
                 height: 50.0,
             });
-            let frame = runtime.layout(&field, proposal);
+            let frame = runtime.layout(&field, proposal).unwrap();
             runtime.focus(&frame.hits.last().unwrap().0);
-            runtime.key(EditCommand::Home(false));
+            runtime.key(EditCommand::Home(false)).unwrap();
             for _ in 0..steps {
-                runtime.key(EditCommand::Right(false));
+                runtime.key(EditCommand::Right(false)).unwrap();
             }
             runtime.key(EditCommand::SetMarked {
                 text: marked.into(),
                 caret_utf16: (position, 0),
-            });
+            })
+                .unwrap();
             if commit {
-                runtime.key(EditCommand::Unmark);
+                runtime.key(EditCommand::Unmark).unwrap();
             }
             runtime.render_stable(&field);
-            runtime.layout(&field, proposal);
-            let before = runtime.ime_snapshot().unwrap();
+            runtime.layout(&field, proposal).unwrap();
+            let before = runtime.ime_snapshot().unwrap().unwrap();
             assert_eq!(before.selected, (3, 0));
             assert_eq!(before.text.as_ref(), expected);
-            assert!(runtime.key(command).applied);
+            assert!(runtime.key(command).unwrap().applied);
             runtime.render_stable(&field);
-            runtime.layout(&field, proposal);
-            let after = runtime.ime_snapshot().unwrap();
+            runtime.layout(&field, proposal).unwrap();
+            let after = runtime.ime_snapshot().unwrap().unwrap();
             assert_eq!(after.text.as_ref(), "az");
             assert_eq!(after.selected, (1, 0));
             assert_eq!(value.get(), "az");

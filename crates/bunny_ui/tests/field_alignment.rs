@@ -14,6 +14,7 @@ fn frame(runtime: &Runtime, view: &impl View) -> LayoutResult {
             height: 100.0,
         }),
     )
+        .unwrap()
 }
 
 fn close(actual: f64, expected: f64) {
@@ -78,7 +79,7 @@ fn fitting_text_honors_each_alignment_and_scene_direction() {
                 close(field.text_origin.x, x);
                 assert!(runtime.focus_named("field"));
                 let start = if value == "אבג" { x + width } else { x };
-                close(runtime.ime_rect_for(0).unwrap().origin.x, start);
+                close(runtime.ime_rect_for(0).unwrap().unwrap().origin.x, start);
             }
         }
     }
@@ -133,20 +134,20 @@ fn pointer_caret_selection_and_utf16_rectangles_follow_aligned_text() {
         let field = &layout.fields[0];
         let x = expected_left(field.run, 32.0, alignment, false);
         let y = field.run.origin.y + field.line_height / 2.0;
-        runtime.pointer_pressed(x + 16.0, y);
+        runtime.pointer_pressed(x + 16.0, y).unwrap();
         runtime.pointer_released(x + 16.0, y);
         let layout = frame(&runtime, &view);
-        assert_eq!(runtime.ime_snapshot().unwrap().selected, (3, 0));
+        assert_eq!(runtime.ime_snapshot().unwrap().unwrap().selected, (3, 0));
         close(
-            runtime.ime_snapshot().unwrap().caret_rect.origin.x,
+            runtime.ime_snapshot().unwrap().unwrap().caret_rect.origin.x,
             x + 16.0,
         );
-        close(runtime.ime_rect_for(3).unwrap().origin.x, x + 16.0);
-        assert_eq!(runtime.ime_index_at(x + 16.0, y), Some(3));
+        close(runtime.ime_rect_for(3).unwrap().unwrap().origin.x, x + 16.0);
+        assert_eq!(runtime.ime_index_at(x + 16.0, y).unwrap(), Some(3));
         assert!(layout.display.iter().any(|command| matches!(command,
             DrawCommand::FillRect { rect, color, .. } if *color == Color::BLACK
             && (rect.origin.x - (x + 16.0)).abs() < 0.001 && rect.size.width < 2.0)));
-        runtime.key(EditCommand::SelectAll);
+        runtime.key(EditCommand::SelectAll).unwrap();
         let selected = frame(&runtime, &view);
         assert!(selected.display.iter().any(|command| matches!(command,
             DrawCommand::FillRect { rect, .. } if (rect.origin.x - x).abs() < 0.001
@@ -164,18 +165,19 @@ fn composition_underline_and_native_range_share_the_aligned_origin() {
         .id("field");
     frame(&runtime, &view);
     assert!(runtime.focus_named("field"));
-    runtime.key(EditCommand::SelectAll);
+    runtime.key(EditCommand::SelectAll).unwrap();
     runtime.key(EditCommand::SetMarked {
         text: "日本".into(),
-        caret_utf16: (1, 0),
-    });
+            caret_utf16: (1, 0),
+    })
+        .unwrap();
     let layout = frame(&runtime, &view);
     let field = &layout.fields[0];
     let x = field.run.origin.x + field.run.size.width - 16.0;
-    let ime = runtime.ime_snapshot().unwrap();
+    let ime = runtime.ime_snapshot().unwrap().unwrap();
     assert_eq!(ime.marked, Some((0, 2)));
     close(ime.caret_rect.origin.x, x + 8.0);
-    close(runtime.ime_rect_for(0).unwrap().origin.x, x);
+    close(runtime.ime_rect_for(0).unwrap().unwrap().origin.x, x);
     assert!(layout.display.iter().any(|command| matches!(command,
         DrawCommand::FillRect { rect, .. } if (rect.origin.x - x).abs() < 0.001
         && (rect.size.width - 16.0).abs() < 0.001 && (rect.size.height - 1.0).abs() < 0.001)));
@@ -198,12 +200,12 @@ fn multiline_rows_use_their_own_width_for_pointer_and_native_lookup() {
     close(drawn[1].1.x, right - 24.0);
     let x = right - 8.0;
     let y = field.run.origin.y + field.line_height * 1.5;
-    runtime.pointer_pressed(x, y);
+    runtime.pointer_pressed(x, y).unwrap();
     runtime.pointer_released(x, y);
     frame(&runtime, &view);
-    assert_eq!(runtime.ime_snapshot().unwrap().selected, (10, 0));
-    close(runtime.ime_rect_for(10).unwrap().origin.x, x);
-    assert_eq!(runtime.ime_index_at(x, y), Some(10));
+    assert_eq!(runtime.ime_snapshot().unwrap().unwrap().selected, (10, 0));
+    close(runtime.ime_rect_for(10).unwrap().unwrap().origin.x, x);
+    assert_eq!(runtime.ime_index_at(x, y).unwrap(), Some(10));
 }
 
 #[test]
@@ -224,18 +226,19 @@ fn overflowing_lines_keep_the_caret_visible_in_both_reading_directions() {
             frame(&runtime, &view);
             assert!(runtime.focus_named("field"));
             for command in [EditCommand::End(false), EditCommand::Home(false)] {
-                runtime.key(command);
+                runtime.key(command).unwrap();
                 let layout = frame(&runtime, &view);
                 let field = &layout.fields[0];
-                let caret = runtime.ime_snapshot().unwrap().caret_rect;
+                let caret = runtime.ime_snapshot().unwrap().unwrap().caret_rect;
                 assert!(caret.origin.x >= field.frame.origin.x);
                 assert!(
                     caret.origin.x + caret.size.width
                         <= field.frame.origin.x + field.frame.size.width
                 );
                 assert_eq!(
-                    runtime.ime_index_at(caret.origin.x, caret.origin.y + 4.0),
-                    Some(runtime.ime_snapshot().unwrap().selected.0)
+                    runtime.ime_index_at(caret.origin.x, caret.origin.y + 4.0)
+                        .unwrap(),
+                    Some(runtime.ime_snapshot().unwrap().unwrap().selected.0)
                 );
             }
         }
@@ -255,7 +258,7 @@ fn empty_aligned_field_keeps_caret_and_ime_at_the_same_insertion_point() {
     let layout = frame(&runtime, &view);
     let run = layout.fields[0].run;
     let x = run.origin.x + run.size.width;
-    close(runtime.ime_snapshot().unwrap().caret_rect.origin.x, x);
+    close(runtime.ime_snapshot().unwrap().unwrap().caret_rect.origin.x, x);
     assert!(layout.display.iter().any(|command| matches!(command,
         DrawCommand::FillRect { rect, color, .. } if *color == Color::BLACK
         && (rect.origin.x - x).abs() < 0.001 && rect.size.width < 2.0)));
@@ -283,8 +286,8 @@ fn soft_wrapped_last_line_uses_its_own_alignment_for_native_lookup() {
     close(drawn[1].1.x, right - 8.0);
     assert!(runtime.focus_named("field"));
     let y = field.run.origin.y + field.line_height * 1.5;
-    assert_eq!(runtime.ime_index_at(right, y), Some(9));
-    close(runtime.ime_rect_for(9).unwrap().origin.x, right);
+    assert_eq!(runtime.ime_index_at(right, y).unwrap(), Some(9));
+    close(runtime.ime_rect_for(9).unwrap().unwrap().origin.x, right);
 }
 
 #[test]
@@ -298,15 +301,16 @@ fn secret_field_uses_mask_direction_for_aligned_native_geometry() {
         .id("field");
     frame(&runtime, &view);
     assert!(runtime.focus_named("field"));
-    runtime.key(EditCommand::Home(false));
+    runtime.key(EditCommand::Home(false)).unwrap();
     let layout = frame(&runtime, &view);
     let drawn = lines(&layout);
     assert_eq!(drawn[0].0, "•••");
     let x = drawn[0].1.x;
-    close(runtime.ime_snapshot().unwrap().caret_rect.origin.x, x);
-    close(runtime.ime_rect_for(1).unwrap().origin.x, x + 8.0);
+    close(runtime.ime_snapshot().unwrap().unwrap().caret_rect.origin.x, x);
+    close(runtime.ime_rect_for(1).unwrap().unwrap().origin.x, x + 8.0);
     assert_eq!(
-        runtime.ime_index_at(x + 8.0, layout.fields[0].run.origin.y + 4.0),
+        runtime.ime_index_at(x + 8.0, layout.fields[0].run.origin.y + 4.0)
+            .unwrap(),
         Some(1)
     );
 }

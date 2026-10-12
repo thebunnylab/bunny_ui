@@ -1338,7 +1338,8 @@ mod tests {
         let ink = Color::hex(0x3B82F6);
         let runtime = Runtime::new();
         let view = Screen { seen: Rc::clone(&seen), color: ink };
-        runtime.layout(&view, Proposal { width: Some(50.0), height: Some(20.0) });
+        runtime.layout(&view, Proposal { width: Some(50.0), height: Some(20.0) })
+            .unwrap();
         let (_, font, painted) = seen.get().expect("the surface painted");
         assert_eq!(font.size, 9.0);
         assert_eq!(painted, ink);
@@ -1376,7 +1377,7 @@ mod tests {
         }
         let runtime = Runtime::new();
         let size = Size { width: 60.0, height: 40.0 };
-        let mount = runtime.dom_frame(&Screen, size);
+        let mount = runtime.dom_frame(&Screen, size).unwrap();
         let canvases = mount
             .iter()
             .filter(|patch| {
@@ -1387,15 +1388,15 @@ mod tests {
             })
             .count();
         assert_eq!(canvases, 1, "one surface, one canvas: {mount:?}");
-        let islands = runtime.dom_islands(1);
+        let islands = runtime.dom_islands(1).unwrap();
         assert_eq!(islands.len(), 1);
         assert!(
             islands[0].rgba.chunks_exact(4).any(|pixel| pixel[3] > 0),
             "the island carries the app's ink"
         );
         // a second frame with nothing changed asks for no pixels
-        assert!(runtime.dom_frame(&Screen, size).is_empty());
-        assert!(runtime.dom_islands(1).is_empty(), "unchanged pixels never re-raster");
+        assert!(runtime.dom_frame(&Screen, size).unwrap().is_empty());
+        assert!(runtime.dom_islands(1).unwrap().is_empty(), "unchanged pixels never re-raster");
     }
 
     /// A surface that writes down every event it is told about.
@@ -1441,10 +1442,12 @@ mod tests {
         let log = Rc::new(std::cell::RefCell::new(Vec::new()));
         let runtime = Runtime::new();
         let view = Screen { log: Rc::clone(&log) };
-        runtime.layout(&view, Proposal { width: Some(200.0), height: Some(100.0) });
+        runtime.layout(&view, Proposal { width: Some(200.0), height: Some(100.0) })
+            .unwrap();
 
-        assert!(runtime.pointer_pressed(20.0, 20.0), "the press lands in the box");
-        runtime.pointer_moved(300.0, 300.0, false);
+        assert!(runtime.pointer_pressed(20.0, 20.0).unwrap(),
+            "the press lands in the box");
+        runtime.pointer_moved(300.0, 300.0, false).unwrap();
         assert_eq!(runtime.pointer_released(300.0, 300.0), None, "no action fires under it");
         let seen = log.borrow().clone();
         assert_eq!(
@@ -1484,8 +1487,9 @@ mod tests {
         let fired = Rc::new(Cell::new(false));
         let runtime = Runtime::new();
         let view = Screen { fired: Rc::clone(&fired) };
-        runtime.layout(&view, Proposal { width: Some(120.0), height: Some(60.0) });
-        runtime.pointer_pressed(60.0, 30.0);
+        runtime.layout(&view, Proposal { width: Some(120.0), height: Some(60.0) })
+            .unwrap();
+        runtime.pointer_pressed(60.0, 30.0).unwrap();
         runtime.pointer_released(60.0, 30.0);
         assert!(!fired.get(), "the box owns its own frame");
     }
@@ -1518,7 +1522,8 @@ mod tests {
         let takes_wheel = Rc::new(Cell::new(false));
         let runtime = Runtime::new();
         let view = Scrolled { log: Rc::clone(&log), takes_wheel: Rc::clone(&takes_wheel) };
-        runtime.layout(&view, Proposal { width: Some(60.0), height: Some(80.0) });
+        runtime.layout(&view, Proposal { width: Some(60.0), height: Some(80.0) })
+            .unwrap();
 
         // the box ignores the wheel: the list around it scrolls
         assert!(runtime.wheel(30.0, 40.0, 0.0, -20.0), "the region took the turn");
@@ -1557,11 +1562,11 @@ mod tests {
         let runtime = Runtime::new();
         let view = Page { log: Rc::clone(&log) };
         let proposal = Proposal { width: Some(60.0), height: Some(80.0) };
-        runtime.layout(&view, proposal);
+        runtime.layout(&view, proposal).unwrap();
 
         // the page scrolls a box that takes the wheel under the pointer
         assert!(runtime.wheel(30.0, 40.0, 0.0, -100.0));
-        runtime.layout(&view, proposal);
+        runtime.layout(&view, proposal).unwrap();
         assert!(runtime.wheel(30.0, 40.0, 0.0, -20.0));
         assert!(log.borrow().is_empty(), "the gesture is the page's: the box hears nothing");
         assert_eq!(runtime.scroll_offset("Page").y, 120.0);
@@ -1571,7 +1576,7 @@ mod tests {
         runtime.wheel_tick();
         runtime.wheel_tick();
         runtime.set_scroll_offset("Page", Point { x: 0.0, y: 100.0 });
-        runtime.layout(&view, proposal);
+        runtime.layout(&view, proposal).unwrap();
         assert!(runtime.wheel(30.0, 40.0, 0.0, -20.0));
         assert!(matches!(log.borrow().last(), Some(ElementEvent::Wheel { .. })));
         assert_eq!(runtime.scroll_offset("Page").y, 100.0, "the box took it");
@@ -1591,8 +1596,9 @@ mod tests {
         let log = Rc::new(std::cell::RefCell::new(Vec::new()));
         let runtime = Runtime::new();
         let view = Screen { log: Rc::clone(&log) };
-        runtime.layout(&view, Proposal { width: Some(40.0), height: Some(40.0) });
-        runtime.pointer_moved(12.0, 8.0, false);
+        runtime.layout(&view, Proposal { width: Some(40.0), height: Some(40.0) })
+            .unwrap();
+        runtime.pointer_moved(12.0, 8.0, false).unwrap();
         assert_eq!(
             log.borrow().last(),
             Some(&ElementEvent::PointerMoved {
@@ -1666,20 +1672,18 @@ mod tests {
             display
                 .iter()
                 .filter_map(|command| match command {
-                    DrawCommand::TextLine { content, origin, .. } => {
-                        Some((content.to_string(), *origin))
-                    }
+                    DrawCommand::TextLine { content, origin, .. } => Some((content.to_string(), *origin)),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
         };
 
-        assert!(rows(&runtime.display_frame(&screen, size)).is_empty(), "nothing is open");
+        assert!(rows(&runtime.display_frame(&screen, size).unwrap()).is_empty(), "nothing is open");
 
         // a press at (50, 40) of the scene is (30, 20) of the box
-        runtime.pointer_clicked(50.0, 40.0, 1, false);
+        runtime.pointer_clicked(50.0, 40.0, 1, false).unwrap();
         runtime.pointer_released(50.0, 40.0);
-        let open = rows(&runtime.display_frame(&screen, size));
+        let open = rows(&runtime.display_frame(&screen, size).unwrap());
         let first = open
             .iter()
             .find(|(label, _)| label == "Concept")
@@ -1693,17 +1697,17 @@ mod tests {
 
         // a press ANYWHERE while it is open closes it, and the box under
         // it never hears that press — AppKit's own manners
-        runtime.pointer_clicked(250.0, 170.0, 1, false);
+        runtime.pointer_clicked(250.0, 170.0, 1, false).unwrap();
         runtime.pointer_released(250.0, 170.0);
-        assert!(rows(&runtime.display_frame(&screen, size)).is_empty(), "closed");
+        assert!(rows(&runtime.display_frame(&screen, size).unwrap()).is_empty(), "closed");
         assert!(minted.borrow().is_empty(), "and nothing fired");
 
         // the same gesture 30pt to the right opens the menu 30pt to the
         // right: the point the box handed over was its OWN, and it
         // landed where the hand was in the SCENE
-        runtime.pointer_clicked(80.0, 40.0, 1, false);
+        runtime.pointer_clicked(80.0, 40.0, 1, false).unwrap();
         runtime.pointer_released(80.0, 40.0);
-        let moved = rows(&runtime.display_frame(&screen, size));
+        let moved = rows(&runtime.display_frame(&screen, size).unwrap());
         let second = moved
             .iter()
             .find(|(label, _)| label == "Concept")
@@ -1713,10 +1717,11 @@ mod tests {
         assert_eq!(second.y, first.y);
 
         // a press on the row fires it — on the DOWN, as a menu does
-        runtime.pointer_clicked(second.x + 2.0, second.y + 2.0, 1, false);
+        runtime.pointer_clicked(second.x + 2.0, second.y + 2.0, 1, false)
+            .unwrap();
         assert_eq!(&*minted.borrow(), &["concept"]);
         assert!(
-            rows(&runtime.display_frame(&screen, size)).is_empty(),
+            rows(&runtime.display_frame(&screen, size).unwrap()).is_empty(),
             "and the menu is gone with it",
         );
     }
@@ -1750,12 +1755,13 @@ mod tests {
         }
 
         let runtime = Runtime::new();
-        runtime.layout(&Screen, Proposal { width: Some(200.0), height: Some(100.0) });
+        runtime.layout(&Screen, Proposal { width: Some(200.0), height: Some(100.0) })
+            .unwrap();
 
-        runtime.pointer_moved(120.0, 50.0, false);
+        runtime.pointer_moved(120.0, 50.0, false).unwrap();
         assert_eq!(runtime.hovered_cursor(), Some(crate::layout::Cursor::Cell));
 
-        runtime.pointer_moved(12.0, 50.0, false);
+        runtime.pointer_moved(12.0, 50.0, false).unwrap();
         assert_eq!(
             runtime.hovered_cursor(),
             Some(crate::layout::Cursor::Arrow),
@@ -1816,16 +1822,17 @@ mod tests {
         for reach in [true, false] {
             let runtime = Runtime::new();
             let screen = Screen { reach };
-            runtime.layout(&screen, Proposal { width: Some(200.0), height: Some(100.0) });
+            runtime.layout(&screen, Proposal { width: Some(200.0), height: Some(100.0) })
+                .unwrap();
 
-            runtime.pointer_moved(100.0, 50.0, false);
+            runtime.pointer_moved(100.0, 50.0, false).unwrap();
             assert_eq!(runtime.hovered_cursor(), Some(Corner), "over the grip");
-            runtime.pointer_moved(150.0, 80.0, false);
+            runtime.pointer_moved(150.0, 80.0, false).unwrap();
             assert_eq!(runtime.hovered_cursor(), Some(Cell), "a free hand: the box under it");
 
-            runtime.pointer_moved(100.0, 50.0, false);
-            runtime.pointer_pressed(100.0, 50.0);
-            runtime.pointer_moved(150.0, 80.0, false);
+            runtime.pointer_moved(100.0, 50.0, false).unwrap();
+            runtime.pointer_pressed(100.0, 50.0).unwrap();
+            runtime.pointer_moved(150.0, 80.0, false).unwrap();
             let held = if reach { Corner } else { Cell };
             assert_eq!(runtime.hovered_cursor(), Some(held), "held past the edge (reach: {reach})");
 
@@ -1886,33 +1893,33 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = Size { width: 200.0, height: 200.0 };
-        let laid = runtime.layout(&Screen, Proposal::exact(size));
+        let laid = runtime.layout(&Screen, Proposal::exact(size)).unwrap();
         let prose = laid.customs[0].frame;
 
         let (x, y) = center(hit(&laid, "copy"));
-        runtime.pointer_moved(x, y, false);
+        runtime.pointer_moved(x, y, false).unwrap();
         assert!(prose.contains(x, y), "the button floats over the text");
         assert_eq!(runtime.hovered_cursor(), None, "the button's own rule, not the text's");
         assert!(runtime.interaction().hovered.is_some(), "and that rule is the hand");
-        runtime.pointer_moved(x, y + 40.0, false);
+        runtime.pointer_moved(x, y + 40.0, false).unwrap();
         assert_eq!(runtime.hovered_cursor(), Some(Text), "beside the button: the text");
 
         // the page slides under the header, and the text's frame with it
         let region = laid.scrolls[0].path.clone();
         runtime.set_scroll_offset(&region, Point { x: 0.0, y: 100.0 });
-        let laid = runtime.layout(&Screen, Proposal::exact(size));
+        let laid = runtime.layout(&Screen, Proposal::exact(size)).unwrap();
         let (x, y) = center(hit(&laid, "header"));
         assert!(laid.customs[0].frame.contains(x, y), "the text's frame runs under the header");
-        runtime.pointer_moved(x, y, false);
+        runtime.pointer_moved(x, y, false).unwrap();
         assert_eq!(runtime.hovered_cursor(), None, "the scroller clipped the text away from it");
 
         // a menu opened over the text covers it
         let (x, y) = (40.0, 150.0);
-        runtime.pointer_moved(x, y, false);
+        runtime.pointer_moved(x, y, false).unwrap();
         assert_eq!(runtime.hovered_cursor(), Some(Text));
-        runtime.pointer_clicked(x, y, 1, false);
+        runtime.pointer_clicked(x, y, 1, false).unwrap();
         runtime.pointer_released(x, y);
-        let laid = runtime.layout(&Screen, Proposal::exact(size));
+        let laid = runtime.layout(&Screen, Proposal::exact(size)).unwrap();
         let menu = laid
             .overlays
             .iter()
@@ -1921,7 +1928,7 @@ mod tests {
             .frame;
         let (x, y) = center(menu);
         assert!(laid.customs[0].frame.contains(x, y), "the menu lies over the text");
-        runtime.pointer_moved(x, y, false);
+        runtime.pointer_moved(x, y, false).unwrap();
         assert_eq!(runtime.hovered_cursor(), None, "over the menu the text says nothing");
     }
 
@@ -1966,21 +1973,24 @@ mod tests {
         let editor = MiniEditor::default();
         let runtime = Runtime::new();
         let screen = Screen { editor: editor.clone() };
-        runtime.layout(&screen, Proposal { width: Some(200.0), height: Some(80.0) });
-        runtime.pointer_pressed(10.0, 20.0);
+        runtime.layout(&screen, Proposal { width: Some(200.0), height: Some(80.0) })
+            .unwrap();
+        runtime.pointer_pressed(10.0, 20.0).unwrap();
         runtime.pointer_released(10.0, 20.0);
         let typing = runtime.focused().expect("the click handed the editor the keys");
-        assert!(runtime.key(EditCommand::Insert("ab".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("ab".into())).unwrap()
+                .applied);
 
-        runtime.pointer_pressed(100.0, 43.0);
-        runtime.pointer_moved(100.0, 70.0, false);
+        runtime.pointer_pressed(100.0, 43.0).unwrap();
+        runtime.pointer_moved(100.0, 70.0, false).unwrap();
         runtime.pointer_released(100.0, 70.0);
         assert_eq!(runtime.focused(), Some(typing), "the grip let go, the editor kept the keys");
-        assert!(runtime.key(EditCommand::Insert("c".into())).applied, "and the typing goes on");
+        assert!(runtime.key(EditCommand::Insert("c".into()))
+                .unwrap().applied, "and the typing goes on");
         assert_eq!(&*editor.text.borrow(), "abc");
         assert_eq!(editor.focus_log.borrow().as_slice(), &[true], "nothing told it the keys left");
 
-        runtime.pointer_pressed(100.0, 49.0);
+        runtime.pointer_pressed(100.0, 49.0).unwrap();
         runtime.pointer_released(100.0, 49.0);
         assert_eq!(runtime.focused(), None, "a plain box drops them, as a page does");
     }
@@ -2006,8 +2016,9 @@ mod tests {
         let log = Rc::new(std::cell::RefCell::new(Vec::new()));
         let runtime = Runtime::new();
         let view = Screen { log: Rc::clone(&log) };
-        runtime.layout(&view, Proposal { width: Some(40.0), height: Some(40.0) });
-        runtime.pointer_moved(12.0, 8.0, held);
+        runtime.layout(&view, Proposal { width: Some(40.0), height: Some(40.0) })
+            .unwrap();
+        runtime.pointer_moved(12.0, 8.0, held).unwrap();
         assert_eq!(
             log.borrow().last(),
             Some(&ElementEvent::PointerMoved {
@@ -2018,8 +2029,8 @@ mod tests {
         );
 
         // a press keeps the grab, and the drag's moves say it too
-        runtime.pointer_clicked(12.0, 8.0, 1, held);
-        runtime.pointer_moved(90.0, 90.0, held);
+        runtime.pointer_clicked(12.0, 8.0, 1, held).unwrap();
+        runtime.pointer_moved(90.0, 90.0, held).unwrap();
         assert_eq!(
             log.borrow().last(),
             Some(&ElementEvent::PointerMoved {
@@ -2031,7 +2042,7 @@ mod tests {
         );
 
         // letting go of the key is a move like any other
-        runtime.pointer_moved(90.0, 90.0, false);
+        runtime.pointer_moved(90.0, 90.0, false).unwrap();
         assert_eq!(
             log.borrow().last(),
             Some(&ElementEvent::PointerMoved {
@@ -2097,31 +2108,34 @@ mod tests {
         let commander = Commander::default();
         let runtime = Runtime::new();
         let view = Commanding { box_: commander.clone() };
-        runtime.layout(&view, Proposal { width: Some(200.0), height: Some(40.0) });
+        runtime.layout(&view, Proposal { width: Some(200.0), height: Some(40.0) })
+            .unwrap();
 
         // a plain press: nothing held, and the box can say so in one
         // question instead of four
-        runtime.pointer_clicked(10.0, 20.0, 1, Modifiers::NONE);
+        runtime.pointer_clicked(10.0, 20.0, 1, Modifiers::NONE)
+            .unwrap();
         assert_eq!(commander.pressed.borrow()[0], Modifiers::NONE);
         assert!(!commander.pressed.borrow()[0].any());
 
         // command and a click is a jump to a definition in one box and
         // nothing at all in the next: the framework spends none of it
         let command = Modifiers { command: true, ..Modifiers::NONE };
-        runtime.pointer_clicked(10.0, 20.0, 1, command);
+        runtime.pointer_clicked(10.0, 20.0, 1, command).unwrap();
         assert_eq!(commander.pressed.borrow()[1], command);
         assert!(commander.pressed.borrow()[1].any());
 
         // shift extends a selection from the caret — the one the
         // framework DOES read, and it still reaches the box
-        runtime.pointer_clicked(10.0, 20.0, 1, Modifiers::SHIFT);
+        runtime.pointer_clicked(10.0, 20.0, 1, Modifiers::SHIFT)
+            .unwrap();
         assert_eq!(commander.pressed.borrow()[2], Modifiers::SHIFT);
 
         // the door the press road carried before it could carry the
         // rest: a bare bool still means shift, and nothing else
-        runtime.pointer_clicked(10.0, 20.0, 1, true);
+        runtime.pointer_clicked(10.0, 20.0, 1, true).unwrap();
         assert_eq!(commander.pressed.borrow()[3], Modifiers::SHIFT);
-        runtime.pointer_clicked(10.0, 20.0, 1, false);
+        runtime.pointer_clicked(10.0, 20.0, 1, false).unwrap();
         assert_eq!(commander.pressed.borrow()[4], Modifiers::NONE);
     }
 
@@ -2132,8 +2146,9 @@ mod tests {
         let commander = Commander::default();
         let runtime = Runtime::new();
         let view = Commanding { box_: commander.clone() };
-        runtime.layout(&view, Proposal { width: Some(200.0), height: Some(40.0) });
-        runtime.pointer_pressed(10.0, 20.0);
+        runtime.layout(&view, Proposal { width: Some(200.0), height: Some(40.0) })
+            .unwrap();
+        runtime.pointer_pressed(10.0, 20.0).unwrap();
         runtime.pointer_released(10.0, 20.0);
         assert!(runtime.focused().is_some(), "the box took the keyboard");
 
@@ -2142,7 +2157,8 @@ mod tests {
         // TYPED is a dollar sign, and no table in the app could know
         // that: on another layout a dollar comes off another key.
         let four = KeyPattern { shift: true, ..KeyPattern::key(Key::Char('4')) };
-        assert!(runtime.key_stroke(Stroke::new(four, Some('$'))).handled);
+        assert!(runtime.key_stroke(Stroke::new(four, Some('$')))
+                .unwrap().handled);
         assert_eq!(
             commander.seen.borrow().as_slice(),
             &[(Key::Char('4'), Some('$'))],
@@ -2154,14 +2170,17 @@ mod tests {
         // every platform asked under command answers with the key's own
         // character, which would be a lie about what reached the screen
         let chord = KeyPattern { shift: true, ..KeyPattern::command(Key::Char('4')) };
-        assert!(runtime.key_stroke(Stroke::new(chord, Some('$'))).handled);
+        assert!(runtime.key_stroke(Stroke::new(chord, Some('$'))).unwrap()
+                .handled);
         assert_eq!(commander.seen.borrow()[1], (Key::Char('4'), None), "a chord types nothing");
         let ctrl = KeyPattern { shift: true, ..KeyPattern::control(Key::Char('4')) };
-        assert!(runtime.key_stroke(Stroke::new(ctrl, Some('$'))).handled);
+        assert!(runtime.key_stroke(Stroke::new(ctrl, Some('$'))).unwrap()
+                .handled);
         assert_eq!(commander.seen.borrow()[2], (Key::Char('4'), None));
 
         // and a key the platform gave no character for says so plainly
-        assert!(runtime.key_stroke(KeyPattern::key(Key::Down)).handled);
+        assert!(runtime.key_stroke(KeyPattern::key(Key::Down)).unwrap()
+                .handled);
         assert_eq!(commander.seen.borrow()[3], (Key::Down, None));
     }
 
@@ -2270,8 +2289,9 @@ mod tests {
         let editor = MiniEditor::default();
         let runtime = Runtime::new();
         let view = Editing { editor: editor.clone() };
-        runtime.layout(&view, Proposal { width: Some(200.0), height: Some(80.0) });
-        runtime.pointer_pressed(10.0, 30.0);
+        runtime.layout(&view, Proposal { width: Some(200.0), height: Some(80.0) })
+            .unwrap();
+        runtime.pointer_pressed(10.0, 30.0).unwrap();
         runtime.pointer_released(10.0, 30.0);
         (runtime, editor)
     }
@@ -2283,14 +2303,17 @@ mod tests {
         assert_eq!(editor.focus_log.borrow().as_slice(), &[true]);
 
         // typing, pasting and the commit of a composition are all Text
-        assert!(runtime.key(EditCommand::Insert("let ".into())).applied);
-        assert!(runtime.key(EditCommand::Insert("x".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("let ".into())).unwrap()
+                .applied);
+        assert!(runtime.key(EditCommand::Insert("x".into()))
+                .unwrap().applied);
         assert_eq!(&*editor.text.borrow(), "let x");
 
         // the strokes come through the gate's door
         assert!(
             runtime
                 .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Backspace))
+                .unwrap()
                 .handled
         );
         assert_eq!(&*editor.text.borrow(), "let ");
@@ -2301,21 +2324,21 @@ mod tests {
         // what the box took at the gate never arrives again as an edit,
         // and what the box ignores is the keymap's
         let (runtime, editor) = focused_editor();
-        assert!(!runtime.key(EditCommand::Backspace).applied, "the gate owns the strokes");
-        assert!(!runtime.key(EditCommand::Left(false)).applied);
+        assert!(!runtime.key(EditCommand::Backspace).unwrap().applied, "the gate owns the strokes");
+        assert!(!runtime.key(EditCommand::Left(false)).unwrap().applied);
         assert!(editor.text.borrow().is_empty());
 
         const NEXT: crate::action::ActionId = crate::action::ActionId("test.next");
         let pattern = crate::action::KeyPattern::key(crate::action::Key::Down);
         runtime.bind(pattern, NEXT);
-        assert!(!runtime.key_stroke(&pattern).handled, "the editor ignores Down");
+        assert!(!runtime.key_stroke(&pattern).unwrap().handled, "the editor ignores Down");
         assert_eq!(runtime.match_key(&pattern), Some(NEXT), "so the keymap answers");
     }
 
     #[test]
     fn the_box_answers_the_input_system() {
         let (runtime, editor) = focused_editor();
-        runtime.key(EditCommand::Insert("ab".into()));
+        runtime.key(EditCommand::Insert("ab".into())).unwrap();
 
         // a live composition, and the marked range comes back
         assert!(
@@ -2324,22 +2347,24 @@ mod tests {
                     text: "に".into(),
                     caret_utf16: (0, 1)
                 })
+                .unwrap()
                 .applied
         );
-        let snapshot = runtime.ime_snapshot().expect("the box answers");
+        let snapshot = runtime.ime_snapshot().unwrap().expect("the box answers");
         assert_eq!(&*snapshot.text, "abに");
         assert!(snapshot.marked.is_some(), "the composition is live");
         // the caret rect crossed from the box's coordinates into the
         // scene's: the box sits under one line of text
         assert_eq!(snapshot.caret_rect.origin, Point { x: 3.0 * COLUMN, y: crate::layout::LINE_H });
-        assert!(runtime.key(EditCommand::Unmark).applied);
-        assert!(runtime.ime_snapshot().unwrap().marked.is_none());
+        assert!(runtime.key(EditCommand::Unmark).unwrap().applied);
+        assert!(runtime.ime_snapshot().unwrap().unwrap().marked.is_none());
 
         // the questions the input system asks about geometry
-        assert_eq!(runtime.ime_index_at(2.0 * COLUMN, 20.0), Some(2));
-        assert_eq!(runtime.ime_index_at(2.0 * COLUMN, 400.0), None, "outside the box");
+        assert_eq!(runtime.ime_index_at(2.0 * COLUMN, 20.0).unwrap(), Some(2));
+        assert_eq!(runtime.ime_index_at(2.0 * COLUMN, 400.0).unwrap(),
+            None, "outside the box");
         assert_eq!(
-            runtime.ime_rect_for(1).map(|rect| rect.origin),
+            runtime.ime_rect_for(1).unwrap().map(|rect| rect.origin),
             Some(Point { x: COLUMN, y: crate::layout::LINE_H })
         );
         assert_eq!(&*editor.text.borrow(), "abに");
@@ -2348,10 +2373,10 @@ mod tests {
     #[test]
     fn a_copy_hands_the_selection_to_the_shell() {
         let (runtime, _) = focused_editor();
-        runtime.key(EditCommand::Insert("copy me".into()));
-        assert_eq!(runtime.key(EditCommand::Copy).output.as_deref(), Some("copy me"));
-        assert_eq!(runtime.key(EditCommand::Cut).output.as_deref(), Some("copy me"));
-        assert_eq!(runtime.key(EditCommand::Copy).output.as_deref(), Some(""));
+        runtime.key(EditCommand::Insert("copy me".into())).unwrap();
+        assert_eq!(runtime.key(EditCommand::Copy).unwrap().output.as_deref(), Some("copy me"));
+        assert_eq!(runtime.key(EditCommand::Cut).unwrap().output.as_deref(), Some("copy me"));
+        assert_eq!(runtime.key(EditCommand::Copy).unwrap().output.as_deref(), Some(""));
     }
 
     #[test]
@@ -2360,19 +2385,19 @@ mod tests {
         let runtime = Runtime::new();
         let view = Editing { editor: editor.clone() };
         let proposal = Proposal { width: Some(200.0), height: Some(80.0) };
-        runtime.layout(&view, proposal);
-        runtime.pointer_pressed(10.0, 30.0);
+        runtime.layout(&view, proposal).unwrap();
+        runtime.pointer_pressed(10.0, 30.0).unwrap();
         runtime.pointer_released(10.0, 30.0);
 
         assert!(runtime.blink(), "a focused box blinks");
-        runtime.layout(&view, proposal);
+        runtime.layout(&view, proposal).unwrap();
         assert!(!editor.caret_shown.get(), "the box paints the phase it was told");
         assert!(runtime.blink());
-        runtime.layout(&view, proposal);
+        runtime.layout(&view, proposal).unwrap();
         assert!(editor.caret_shown.get());
 
         // a click above the box (on plain text) drops the keyboard
-        runtime.pointer_pressed(10.0, 5.0);
+        runtime.pointer_pressed(10.0, 5.0).unwrap();
         runtime.pointer_released(10.0, 5.0);
         assert_eq!(runtime.focused(), None);
         assert_eq!(editor.focus_log.borrow().as_slice(), &[true, false]);
@@ -2403,12 +2428,12 @@ mod tests {
         let runtime = Runtime::new();
         let view = Beating { editor: editor.clone() };
         let proposal = Proposal { width: Some(200.0), height: Some(80.0) };
-        runtime.layout(&view, proposal);
+        runtime.layout(&view, proposal).unwrap();
         let taken = runtime.focused().expect("the beat handed the box the keyboard");
         assert_eq!(editor.focus_log.borrow().as_slice(), &[true], "and the box heard it arrive");
 
         // a re-layout is not a second arrival
-        runtime.layout(&view, proposal);
+        runtime.layout(&view, proposal).unwrap();
         assert_eq!(editor.focus_log.borrow().as_slice(), &[true]);
 
         // the keyboard moving on by the focus road is heard leaving too
@@ -2431,13 +2456,15 @@ mod tests {
         let log = Rc::new(std::cell::RefCell::new(Vec::new()));
         let runtime = Runtime::new();
         let view = Screen { log: Rc::clone(&log) };
-        runtime.layout(&view, Proposal { width: Some(40.0), height: Some(40.0) });
-        runtime.pointer_pressed(10.0, 10.0);
+        runtime.layout(&view, Proposal { width: Some(40.0), height: Some(40.0) })
+            .unwrap();
+        runtime.pointer_pressed(10.0, 10.0).unwrap();
         runtime.pointer_released(10.0, 10.0);
         assert_eq!(runtime.focused(), None);
         assert!(
             !runtime
                 .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Enter))
+                .unwrap()
                 .handled,
             "no focus, no keys"
         );
@@ -2452,9 +2479,11 @@ mod tests {
         let (runtime, editor) = focused_editor();
         let view = Editing { editor: editor.clone() };
         runtime.settle(&view);
-        runtime.layout(&view, Proposal { width: Some(200.0), height: Some(80.0) });
+        runtime.layout(&view, Proposal { width: Some(200.0), height: Some(80.0) })
+            .unwrap();
         assert_eq!(runtime.focused().as_deref(), Some("Editing/#1"));
-        assert!(runtime.key(EditCommand::Insert("still here".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("still here".into())).unwrap()
+                .applied);
         assert_eq!(&*editor.text.borrow(), "still here");
     }
 
@@ -2478,8 +2507,8 @@ mod tests {
         let runtime = Runtime::new();
         let view = Screen { editor: MiniEditor::default(), gone: State::new(false) };
         let proposal = Proposal { width: Some(200.0), height: Some(80.0) };
-        runtime.layout(&view, proposal);
-        runtime.pointer_pressed(10.0, 10.0);
+        runtime.layout(&view, proposal).unwrap();
+        runtime.pointer_pressed(10.0, 10.0).unwrap();
         runtime.pointer_released(10.0, 10.0);
         assert!(runtime.focused().is_some());
 
@@ -2491,6 +2520,7 @@ mod tests {
     /// Lays a node out at an exact proposal.
     fn layout_root(root: &LayoutNode, width: Px, height: Px) -> crate::layout::LayoutResult {
         crate::layout::layout(root, Proposal { width: Some(width), height: Some(height) })
+        .unwrap()
     }
 
     /// The painter's ramp resolves against the SHIFTED rect: what an
@@ -2516,7 +2546,8 @@ mod tests {
                 child: Box::new(node(Ramp)),
             },
             Proposal { width: Some(120.0), height: Some(60.0) },
-        );
+        )
+        .unwrap();
         let (rect, paint) = result
             .display
             .iter()
@@ -2566,7 +2597,8 @@ mod tests {
         let result = crate::layout::layout(
             &node(Badge),
             Proposal { width: Some(40.0), height: Some(20.0) },
-        );
+        )
+        .unwrap();
         let source = result
             .display
             .iter()

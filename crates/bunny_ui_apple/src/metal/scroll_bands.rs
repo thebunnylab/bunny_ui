@@ -8,7 +8,7 @@ use bunny_ui::layout::{DrawCommand, Rect};
 use bunny_ui::raster::{Bitmap, rasterize_with};
 use bunny_ui::text_engine::{FontKey, FontSpec, LineMetrics, TextRaster};
 use std::cell::{Cell, RefCell};
-use bunny_ui::text_source::{ParagraphLine, TextContent};
+use bunny_ui::text_source::ParagraphLine;
 use std::time::{Duration, Instant};
 
 const MAX_BANDS: usize = 128;
@@ -48,8 +48,8 @@ fn ink(
     scale: usize,
     text: &dyn TextEngine,
     cache: &MeasureCache,
-) -> Option<DamageRect> {
-    match command {
+) -> Result<Option<DamageRect>, bunny_ui::text_error::TextError> {
+    Ok(match command {
         DrawCommand::FillRect { rect, .. } | DrawCommand::StrokeRect { rect, .. } => {
             snapped(*rect, scale)
         }
@@ -60,11 +60,11 @@ fn ink(
             font,
             ..
         } => {
-            let line = content.line(range.0..range.1).ok()?;
+            let line = content.line(range.0..range.1)?;
             if line.text().len() > 4096 {
-                return None;
+                return Ok(None);
             }
-            let metrics = cache.get_or_measure_paragraph(&line, font, text);
+            let metrics = cache.get_or_measure_paragraph(&line, font, text)?;
             let factor = scale as f64;
             let x = (origin.x * factor).round();
             let y = (origin.y * factor).round();
@@ -77,7 +77,7 @@ fn ink(
                 || h < 0.0
                 || w * h > MAX_PIXELS as f64
             {
-                return None;
+                return Ok(None);
             }
             Some((
                 x as i64 - 2,
@@ -87,7 +87,7 @@ fn ink(
             ))
         }
         _ => None,
-    }
+    })
 }
 
 /// Keep every non-background pixel, including antialiased glyph edges.
@@ -116,42 +116,53 @@ struct Band {
 }
 
 impl Band {
-    fn new(
+    fn prepare_band(
         commands: &[DrawCommand],
         scale: usize,
         text: &dyn TextEngine,
         cache: &MeasureCache,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, bunny_ui::text_error::TextError> {
         let DrawCommand::FillRect {
             rect,
             color,
             corner_radius,
-        } = commands.first()?
+        } = (match commands.first() {
+            Some(value) => value,
+            None => return Ok(None),
+        })
         else {
-            return None;
+            return Ok(None);
         };
         if color.a != 255 || !corner_radius.is_zero() || commands.len() > 64 {
-            return None;
+            return Ok(None);
         }
-        let rect = snapped(*rect, scale)?;
+        let Some(rect) = snapped(*rect, scale) else { return Ok(None) };
         let budget = if commands.len() == 1 {
             MAX_TOTAL_PIXELS
         } else {
             MAX_PIXELS
         };
         if (rect.2 - rect.0) * (rect.3 - rect.1) > budget as i64 {
-            return None;
+            return Ok(None);
         }
         let mut clips = Vec::new();
         let mut text_bytes = 0usize;
         for command in commands {
             match command {
-                DrawCommand::PushClip { rect, .. } => clips.push(snapped(*rect, scale)?),
+                DrawCommand::PushClip { rect, .. } => clips.push(
+                    match snapped(*rect, scale) {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    },
+                ),
                 DrawCommand::PopClip => {
-                    clips.pop()?;
+                    (match clips.pop() {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    });
                 }
                 _ => {
-                    let mut bounds = ink(command, scale, text, cache)?;
+                    let Some(mut bounds) = ink(command, scale, text, cache)? else { return Ok(None) };
                     for clip in &clips {
                         bounds = (
                             bounds.0.max(clip.0),
@@ -166,26 +177,34 @@ impl Band {
                     bounds.0 = bounds.0.max(rect.0);
                     bounds.2 = bounds.2.min(rect.2);
                     if bounds.0 < bounds.2 && bounds.1 < bounds.3 && !contains(rect, bounds) {
-                        return None;
+                        return Ok(None);
                     }
                     if let DrawCommand::TextLine { range, .. } = command {
-                        text_bytes = text_bytes.checked_add(range.1.checked_sub(range.0)?)?;
+                        text_bytes = match text_bytes.checked_add(
+                            match range.1.checked_sub(range.0) {
+                                Some(value) => value,
+                                None => return Ok(None),
+                            },
+                        ) {
+                            Some(value) => value,
+                            None => return Ok(None),
+                        };
                         if text_bytes > 4096 {
-                            return None;
+                            return Ok(None);
                         }
                     }
                 }
             }
         }
         if !clips.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let display = software_patch::patch_coordinates(
+        let Some(display) = software_patch::patch_coordinates(
             &DisplayList::from(commands.to_vec()),
             rect,
             scale as f64,
-        )?;
-        Some(Self { rect, display })
+        ) else { return Ok(None) };
+        Ok(Some(Self { rect, display }))
     }
 
     fn solid(&self) -> Option<Color> {
@@ -211,10 +230,13 @@ impl Band {
         scale: usize,
         text: &dyn TextEngine,
         cache: &MeasureCache,
-    ) -> Option<(Color, software_patch::Scene)> {
+    ) -> Result<Option<(Color, software_patch::Scene)>, bunny_ui::text_error::TextError> {
         let commands = self.display.as_slice();
-        let DrawCommand::FillRect { color, .. } = commands.first()? else {
-            return None;
+        let DrawCommand::FillRect { color, .. } = (match commands.first() {
+            Some(value) => value,
+            None => return Ok(None),
+        }) else {
+            return Ok(None);
         };
         let size = (
             (self.rect.2 - self.rect.0) as usize,
@@ -228,17 +250,33 @@ impl Band {
             PATCH_COMMANDS,
             cache,
             text,
-        ) else {
-            return None;
+        )?
+        else {
+            return Ok(None);
         };
-        let pixels = (bounds.2 - bounds.0).checked_mul(bounds.3 - bounds.1)?;
-        if pixels <= 0 || pixels.checked_mul(2)? > (size.0 * size.1) as i64 {
-            return None;
+        let Some(pixels) = (bounds.2 - bounds.0).checked_mul(bounds.3 - bounds.1) else { return Ok(None) };
+        if pixels <= 0
+            || (match pixels.checked_mul(2) {
+                Some(value) => value,
+                None => return Ok(None),
+            }) > (size.0 * size.1) as i64
+        {
+            return Ok(None);
         }
-        Some((
+        Ok(Some((
             *color,
-            software_patch::Scene::new(&self.display, bounds, scale, *color, text, cache)?,
-        ))
+            (match software_patch::Scene::prepare_scene(
+                &self.display,
+                bounds,
+                scale,
+                *color,
+                text,
+                cache,
+            )? {
+                Some(value) => value,
+                None => return Ok(None),
+            }),
+        )))
     }
 
     fn same_pixels(&self, other: &Self) -> bool {
@@ -249,6 +287,11 @@ impl Band {
 }
 
 type OverlayPaint = (DamageRect, software_patch::Scene);
+
+struct Decoration {
+    outside: Vec<DrawCommand>,
+    overlay: Option<OverlayPaint>,
+}
 
 /// A proved partition: the viewport is completely covered by opaque,
 /// disjoint bands. Everything above them either stays outside or is a
@@ -266,16 +309,16 @@ struct Scene {
 }
 
 impl Scene {
-    fn new(
+    fn prepare_scene(
         display: &DisplayList,
         physical: (usize, usize),
         scale: usize,
         canvas: Color,
         text: &dyn TextEngine,
         cache: &MeasureCache,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, bunny_ui::text_error::TextError> {
         if scale == 0 || canvas.a != 255 || display.len() > 4096 {
-            return None;
+            return Ok(None);
         }
         // A backdrop reads other paint, and an image may update its pixels
         // without changing its identity. Neither can be proved stationary.
@@ -288,25 +331,25 @@ impl Scene {
                     | DrawCommand::Shadow { .. }
             )
         }) {
-            return None;
+            return Ok(None);
         }
         let commands = display.as_slice();
-        let start = commands
+        let Some(start) = commands
             .iter()
-            .position(|c| matches!(c, DrawCommand::PushClip { .. }))?;
+            .position(|c| matches!(c, DrawCommand::PushClip { .. })) else { return Ok(None) };
         let DrawCommand::PushClip {
             rect,
             corner_radius,
         } = commands[start]
         else {
-            return None;
+            return Ok(None);
         };
         if !corner_radius.is_zero() {
-            return None;
+            return Ok(None);
         }
-        let viewport = snapped(rect, scale)?;
+        let Some(viewport) = snapped(rect, scale) else { return Ok(None) };
         if !contains((0, 0, physical.0 as i64, physical.1 as i64), viewport) {
-            return None;
+            return Ok(None);
         }
         let mut depth = 0usize;
         let mut first = None;
@@ -332,7 +375,12 @@ impl Scene {
                         .is_some_and(|r| r.0 == viewport.0 && r.2 == viewport.2) =>
                 {
                     if let Some(first) = first {
-                        bands.push(Band::new(&commands[first..at], scale, text, cache)?);
+                        bands.push(
+                            match Band::prepare_band(&commands[first..at], scale, text, cache)? {
+                                Some(value) => value,
+                                None => return Ok(None),
+                            },
+                        );
                     }
                     // Earlier ink is behind the complete opaque partition.
                     // Layout may keep text whose conservative bounds cross
@@ -343,21 +391,36 @@ impl Scene {
                 _ => {}
             }
             if bands.len() >= MAX_BANDS {
-                return None;
+                return Ok(None);
             }
         }
-        let end = end?;
+        let Some(end) = end else { return Ok(None) };
         let mut tail = end;
         if let Some(first) = first {
             // Decorations after the last row remain above the partition.
-            let last_rect = ink(commands.get(first)?, scale, text, cache)?;
+            let Some(last_rect) = ink(
+                match commands.get(first) {
+                    Some(value) => value,
+                    None => return Ok(None),
+                },
+                scale,
+                text,
+                cache,
+            )? else { return Ok(None) };
             let mut depth = 0usize;
             for (at, command) in commands.iter().enumerate().take(end).skip(first + 1) {
                 match command {
                     DrawCommand::PushClip { .. } => depth += 1,
-                    DrawCommand::PopClip => depth = depth.checked_sub(1)?,
+                    DrawCommand::PopClip => {
+                        depth = match depth.checked_sub(1) {
+                            Some(value) => value,
+                            None => return Ok(None),
+                        }
+                    }
                     _ if depth == 0 => {
-                        let bounds = ink(command, scale, text, cache)?;
+                        let Some(bounds) = ink(command, scale, text, cache)? else {
+                            return Ok(None);
+                        };
                         let clipped = (
                             bounds.0.max(viewport.0),
                             bounds.1.max(viewport.1),
@@ -375,23 +438,28 @@ impl Scene {
                     _ => {}
                 }
             }
-            bands.push(Band::new(&commands[first..tail], scale, text, cache)?);
+            bands.push(
+                match Band::prepare_band(&commands[first..tail], scale, text, cache)? {
+                    Some(value) => value,
+                    None => return Ok(None),
+                },
+            );
         } else if start + 1 != end {
             // No opaque row may silently discard text in an empty viewport.
-            return None;
+            return Ok(None);
         }
         let top = bands.first().map_or(viewport.3, |band| band.rect.1);
         let bottom = bands.last().map_or(viewport.3, |band| band.rect.3);
         if top > viewport.1 || bottom < viewport.3 {
             if first_row.is_some_and(|first| first != start + 1) {
-                return None;
+                return Ok(None);
             }
             // Prove the paint beneath every uncovered pixel is one opaque
             // color. Any overlapping ink invalidates it until a later opaque
             // fill covers the complete viewport again.
             let mut background = Some(canvas);
             for command in &commands[..start] {
-                let bounds = ink(command, scale, text, cache)?;
+                let Some(bounds) = ink(command, scale, text, cache)? else { return Ok(None) };
                 if intersects(bounds, viewport) {
                     background = match command {
                         DrawCommand::FillRect {
@@ -408,9 +476,9 @@ impl Scene {
                     };
                 }
             }
-            let color = background?;
+            let Some(color) = background else { return Ok(None) };
             let blank = |y0, y1| {
-                Band::new(
+                Band::prepare_band(
                     &[DrawCommand::FillRect {
                         rect: Rect {
                             origin: bunny_ui::layout::Point {
@@ -431,14 +499,25 @@ impl Scene {
                 )
             };
             if top > viewport.1 {
-                bands.insert(0, blank(viewport.1, top.min(viewport.3))?);
+                bands.insert(
+                    0,
+                    match blank(viewport.1, top.min(viewport.3))? {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    },
+                );
             }
             if bottom < viewport.3 {
-                bands.push(blank(bottom.max(viewport.1), viewport.3)?);
+                bands.push(
+                    match blank(bottom.max(viewport.1), viewport.3)? {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    },
+                );
             }
         }
         if bands.is_empty() || bands.len() > MAX_BANDS {
-            return None;
+            return Ok(None);
         }
         let mut total = 0i64;
         for (i, band) in bands.iter().enumerate() {
@@ -446,21 +525,30 @@ impl Scene {
                 || band.rect.2 != viewport.2
                 || (i > 0 && bands[i - 1].rect.3 != band.rect.1)
             {
-                return None;
+                return Ok(None);
             }
             total += (band.rect.2 - band.rect.0) * (band.rect.3 - band.rect.1);
         }
         if total > MAX_TOTAL_PIXELS as i64
-            || bands.first()?.rect.1 > viewport.1
-            || bands.last()?.rect.3 < viewport.3
+            || (match bands.first() {
+                Some(value) => value,
+                None => return Ok(None),
+            })
+            .rect
+            .1 > viewport.1
+            || (match bands.last() {
+                Some(value) => value,
+                None => return Ok(None),
+            })
+            .rect
+            .3 < viewport.3
         {
-            return None;
+            return Ok(None);
         }
-        let (extra, overlay) =
-            Self::decoration(display, (tail, end), viewport, scale, canvas, text, cache)?;
+        let Some(Decoration { outside: extra, overlay }) = Self::decoration(display, (tail, end), viewport, scale, canvas, text, cache)? else { return Ok(None) };
         let mut outside = commands[..start].to_vec();
         outside.extend(extra);
-        Some(Self {
+        Ok(Some(Self {
             physical,
             scale,
             canvas,
@@ -470,7 +558,7 @@ impl Scene {
             bands,
             outside: DisplayList::from(outside),
             overlay,
-        })
+        }))
     }
 
     fn decoration(
@@ -481,7 +569,8 @@ impl Scene {
         canvas: Color,
         text: &dyn TextEngine,
         cache: &MeasureCache,
-    ) -> Option<(Vec<DrawCommand>, Option<OverlayPaint>)> {
+    ) -> Result<Option<Decoration>, bunny_ui::text_error::TextError>
+    {
         let commands = display.as_slice();
         let mut outside = Vec::new();
         let mut overlay: Option<DamageRect> = None;
@@ -492,7 +581,7 @@ impl Scene {
             .map(|c| (c, true))
             .chain(commands[end + 1..].iter().map(|c| (c, false)));
         for (command, clipped) in suffix {
-            let raw = ink(command, scale, text, cache)?;
+            let Some(raw) = ink(command, scale, text, cache)? else { return Ok(None) };
             let bounds = if clipped {
                 (
                     raw.0.max(viewport.0),
@@ -508,7 +597,7 @@ impl Scene {
             }
             if intersects(bounds, viewport) {
                 if !contains(viewport, bounds) {
-                    return None;
+                    return Ok(None);
                 }
                 overlay = Some(match overlay {
                     None => bounds,
@@ -542,12 +631,17 @@ impl Scene {
                 let rect = (rect.0, top, rect.2, bottom);
                 Some((
                     rect,
-                    software_patch::Scene::new(display, rect, scale, canvas, text, cache)?,
+                    (match software_patch::Scene::prepare_scene(
+                        display, rect, scale, canvas, text, cache,
+                    )? {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    }),
                 ))
             }
             None => None,
         };
-        Some((outside, overlay))
+        Ok(Some(Decoration { outside, overlay }))
     }
 
     /// The row commands and their clips are unchanged. Only bounded paint
@@ -560,7 +654,7 @@ impl Scene {
         canvas: Color,
         text: &dyn TextEngine,
         cache: &MeasureCache,
-    ) -> Option<Option<OverlayPaint>> {
+    ) -> Result<Option<Option<OverlayPaint>>, bunny_ui::text_error::TextError> {
         let (start, tail, end) = self.decoration;
         let commands = display.as_slice();
         if physical != self.physical
@@ -570,9 +664,9 @@ impl Scene {
             || commands[..tail] != self.source.as_slice()[..tail]
             || !matches!(commands[end], DrawCommand::PopClip)
         {
-            return None;
+            return Ok(None);
         }
-        let (outside, overlay) = Self::decoration(
+        let Some(Decoration { outside, overlay }) = Self::decoration(
             display,
             (tail, end),
             self.viewport,
@@ -580,8 +674,8 @@ impl Scene {
             canvas,
             text,
             cache,
-        )?;
-        (outside.as_slice() == &self.outside.as_slice()[start..]).then_some(overlay)
+        )? else { return Ok(None) };
+        Ok((outside.as_slice() == &self.outside.as_slice()[start..]).then_some(overlay))
     }
 
     fn compatible(&self, other: &Self) -> bool {
@@ -657,15 +751,29 @@ impl TextEngine for CachedText<'_> {
     fn line_geometry(&self, text: &str, font: &FontSpec) -> Option<bunny_ui::text_geometry::LineGeometry> {
         self.engine.line_geometry(text, font)
     }
-    fn measure_paragraph_line(&self, line: &ParagraphLine, font: &FontSpec) -> LineMetrics {
+    fn measure_paragraph_line(
+        &self,
+        line: &ParagraphLine,
+        font: &FontSpec,
+    ) -> Result<LineMetrics, bunny_ui::text_error::TextError> {
         self.engine.measure_paragraph_line(line, font)
     }
-    fn paragraph_line_geometry(&self, line: &ParagraphLine, font: &FontSpec) -> Option<bunny_ui::text_geometry::LineGeometry> {
+    fn paragraph_line_geometry(
+        &self,
+        line: &ParagraphLine,
+        font: &FontSpec,
+    ) -> Result<Option<bunny_ui::text_geometry::LineGeometry>, bunny_ui::text_error::TextError>
+    {
         self.engine.paragraph_line_geometry(line, font)
     }
-    fn raster_line(&self, text: &str, font: &FontSpec, color: Color, scale: usize) -> Option<TextRaster> {
-        let content = TextContent::from(text);
-        self.raster_paragraph_line(&content.line(0..text.len()).ok()?, font, color, scale)
+    fn raster_line(
+        &self,
+        text: &str,
+        font: &FontSpec,
+        color: Color,
+        scale: usize,
+    ) -> Option<TextRaster> {
+        self.engine.raster_line(text, font, color, scale)
     }
     fn raster_paragraph_line(
         &self,
@@ -673,7 +781,7 @@ impl TextEngine for CachedText<'_> {
         font: &FontSpec,
         color: Color,
         scale: usize,
-    ) -> Option<TextRaster> {
+    ) -> Result<Option<TextRaster>, bunny_ui::text_error::TextError> {
         let cache = self.cache;
         let tick = cache.tick.get().wrapping_add(1);
         cache.tick.set(tick);
@@ -686,19 +794,33 @@ impl TextEngine for CachedText<'_> {
         let mut entries = cache.entries.borrow_mut();
         if let Some(raster) = entries.get_mut(&key) {
             raster.used = tick;
-            return Some(copy_raster(&raster.pixels));
+            return Ok(Some(copy_raster(&raster.pixels)));
         }
-        let raster = self.engine.raster_paragraph_line(line, font, color, scale)?;
+        let Some(raster) = self
+            .engine
+            .raster_paragraph_line(line, font, color, scale)?
+        else {
+            return Ok(None);
+        };
         const LIMIT: usize = 2 * 1024 * 1024;
         // The key retains paragraph text and its lazy scalar map as well as pixels.
-        let weight = raster.rgba.len().saturating_add(line.paragraph().text().len().saturating_mul(24)).saturating_add(256);
+        let weight = raster
+            .rgba
+            .len()
+            .saturating_add(line.paragraph().text().len().saturating_mul(24))
+            .saturating_add(256);
         if weight <= LIMIT {
             while cache.bytes.get() + weight > LIMIT || entries.len() >= 256 {
-                let key = entries
+                let Some(key) = entries
                     .iter()
                     .min_by_key(|(_, raster)| raster.used)
-                    .map(|(key, _)| key.clone())?;
-                let old = entries.remove(&key)?;
+                    .map(|(key, _)| key.clone())
+                else {
+                    break;
+                };
+                let Some(old) = entries.remove(&key) else {
+                    break;
+                };
                 cache.bytes.set(cache.bytes.get() - old.weight);
             }
             cache.bytes.set(cache.bytes.get() + weight);
@@ -711,7 +833,7 @@ impl TextEngine for CachedText<'_> {
                 },
             );
         }
-        Some(raster)
+        Ok(Some(raster))
     }
 }
 
@@ -914,10 +1036,10 @@ impl Presenter {
         canvas: Color,
         text: &dyn TextEngine,
         boxes: &MeasureCache,
-    ) -> bool {
+    ) -> Result<bool, bunny_ui::text_error::TextError> {
         self.overlays.shown = None;
-        self.prior = Scene::new(display, physical, scale, canvas, text, boxes);
-        self.prior.is_some()
+        self.prior = Scene::prepare_scene(display, physical, scale, canvas, text, boxes)?;
+        Ok(self.prior.is_some())
     }
 
     pub(super) fn active(&self) -> bool {
@@ -965,10 +1087,10 @@ impl Presenter {
         scale: usize,
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) -> Option<PreparedOverlay> {
+    ) -> Result<Option<PreparedOverlay>, bunny_ui::text_error::TextError> {
         let Some((_, paint)) = paint else {
             overlays.raster = None;
-            return Some(PreparedOverlay::Hidden);
+            return Ok(Some(PreparedOverlay::Hidden));
         };
         // Patch coordinates already express the exact snapped pixel geometry.
         // Reuse the last presented picture before allocating/rasterizing a
@@ -977,23 +1099,28 @@ impl Presenter {
             && paint.matches(prior)
             && let Some(at) = overlays.layers.iter().position(|o| o.layer.raw == shown)
         {
-            return Some(PreparedOverlay::Reuse(at));
+            return Ok(Some(PreparedOverlay::Reuse(at)));
         }
-        let bitmap = paint.raster_in(&mut overlays.raster, text, images);
-        let pixels = software_patch::PixelRegion::whole(bitmap)?;
+        let bitmap = paint.raster_in(&mut overlays.raster, text, images)?;
+        let Some(pixels) = software_patch::PixelRegion::whole(bitmap) else { return Ok(None) };
         if let Some(at) = overlays.layers.iter().position(|o| {
             o.layer
                 .surface
                 .as_ref()
                 .is_some_and(|surface| surface.matches_pixels(pixels))
         }) {
-            return Some(PreparedOverlay::Reuse(at));
+            return Ok(Some(PreparedOverlay::Reuse(at)));
         }
-        let surface = surfaces.prepare(bitmap)?;
-        let mut layer = unsafe { Layer::new(scale)? };
+        let Some(surface) = surfaces.prepare(bitmap) else { return Ok(None) };
+        let mut layer = unsafe {
+            match Layer::new(scale) {
+                Some(value) => value,
+                None => return Ok(None),
+            }
+        };
         unsafe { msg_void_id(layer.raw, sel("setContents:"), surface.raw) };
         layer.surface = Some(surface);
-        Some(PreparedOverlay::Fresh(Box::new(Overlay { layer })))
+        Ok(Some(PreparedOverlay::Fresh(Box::new(Overlay { layer }))))
     }
 
     unsafe fn show_overlay(
@@ -1075,7 +1202,10 @@ impl Presenter {
     /// Preparation is fallible and changes no visible layer. Only after all
     /// entering bands and the overlay have backing does one transaction move
     /// the viewport and replace its departing children.
-    pub(super) unsafe fn present(&mut self, frame: Frame<'_>) -> bool {
+    pub(super) unsafe fn present(
+        &mut self,
+        frame: Frame<'_>,
+    ) -> Result<bool, bunny_ui::text_error::TextError> {
         let Frame {
             root,
             display,
@@ -1087,14 +1217,19 @@ impl Presenter {
             boxes,
         } = frame;
         if self.active
-            && let Some(overlay) = self.prior.as_ref().and_then(|prior| {
-                prior.updated_decoration(display, physical, scale, canvas, text, boxes)
-            })
+            && let Some(overlay) = self
+                .prior
+                .as_ref()
+                .map(|prior| {
+                    prior.updated_decoration(display, physical, scale, canvas, text, boxes)
+                })
+                .transpose()?
+                .flatten()
         {
             // The complete row/clip prefix and outside picture are identical.
             // Reuse the partition and its layers; only update the decoration.
             let Some(viewport) = self.viewport.as_ref().map(|layer| layer.raw) else {
-                return false;
+                return Ok(false);
             };
             self.advance_surfaces();
             let cached = CachedText {
@@ -1109,8 +1244,9 @@ impl Presenter {
                 scale,
                 &cached,
                 images,
-            ) else {
-                return false;
+            )?
+            else {
+                return Ok(false);
             };
             let retired = unsafe {
                 let transaction = class("CATransaction");
@@ -1134,17 +1270,18 @@ impl Presenter {
                 prior.source = display.clone();
                 prior.overlay = overlay;
             }
-            return true;
+            return Ok(true);
         }
-        let Some(scene) = Scene::new(display, physical, scale, canvas, text, boxes) else {
+        let Some(scene) = Scene::prepare_scene(display, physical, scale, canvas, text, boxes)?
+        else {
             self.prior = None;
-            return false;
+            return Ok(false);
         };
         let prior = self.prior.as_ref();
         if !prior.is_some_and(|prior| scene.compatible(prior)) {
             self.overlays.shown = None;
             self.prior = Some(scene);
-            return false;
+            return Ok(false);
         }
         let translation = prior.and_then(|prior| scene.translation(prior));
         let dy = translation.unwrap_or(0);
@@ -1165,7 +1302,7 @@ impl Presenter {
             if pixels > MAX_PIXELS {
                 self.overlays.shown = None;
                 self.prior = Some(scene);
-                return false;
+                return Ok(false);
             }
         }
         let offset = if self.active { self.offset + dy } else { 0 };
@@ -1173,7 +1310,7 @@ impl Presenter {
         // letting layer coordinates grow without bound on a long scroll.
         if offset.unsigned_abs() > 1_000_000 {
             self.prior = None;
-            return false;
+            return Ok(false);
         }
         self.advance_surfaces();
         let cached = CachedText {
@@ -1212,9 +1349,10 @@ impl Presenter {
             // motion, whole entering rows avoid repeating that analysis.
             let foreground = (dy == 0)
                 .then(|| band.foreground(scale, row_text, boxes))
+                .transpose()?
                 .flatten();
             let bitmap = match &foreground {
-                Some((_, scene)) => scene.raster(row_text, images),
+                Some((_, scene)) => scene.raster(row_text, images)?,
                 None => match band.solid() {
                     Some(color) => Bitmap::new(1, 1, color),
                     None => rasterize_with(
@@ -1225,7 +1363,7 @@ impl Presenter {
                         canvas,
                         row_text,
                         images,
-                    ),
+                    )?,
                 },
             };
             let (region, inset) = match foreground {
@@ -1247,10 +1385,10 @@ impl Presenter {
             };
             let Some(surface) = region.and_then(|pixels| self.surfaces.prepare_pixels(pixels))
             else {
-                return false;
+                return Ok(false);
             };
             let Some(mut layer) = (unsafe { Layer::new(scale) }) else {
-                return false;
+                return Ok(false);
             };
             unsafe {
                 if let Some((color, bounds)) = inset {
@@ -1259,7 +1397,7 @@ impl Presenter {
                         (band.rect.3 - band.rect.1) as usize,
                     );
                     if !layer.set_inset(color, bounds, physical, scale, surface.raw) {
-                        return false;
+                        return Ok(false);
                     }
                 } else {
                     msg_void_id(layer.raw, sel("setContents:"), surface.raw);
@@ -1276,17 +1414,18 @@ impl Presenter {
             scale,
             &cached,
             images,
-        ) else {
-            return false;
+        )?
+        else {
+            return Ok(false);
         };
         if self.viewport.is_none() {
             let Some(layer) = (unsafe { Layer::new(scale) }) else {
-                return false;
+                return Ok(false);
             };
             self.viewport = Some(layer);
         }
         let Some(viewport) = &self.viewport else {
-            return false;
+            return Ok(false);
         };
         let viewport_raw = viewport.raw;
         let mut retired = Vec::new();
@@ -1386,7 +1525,7 @@ impl Presenter {
             "Q",
             format_args!("scroll-bands rows={} dy={dy}", self.shown.len()),
         );
-        true
+        Ok(true)
     }
 }
 
@@ -1429,7 +1568,9 @@ mod tests {
                     Color::WHITE,
                     &PixelFont,
                     &boxes
-                ));
+                )
+                        .unwrap()
+                );
                 macro_rules! frame {
                     ($display:expr) => {
                         Frame {
@@ -1444,7 +1585,7 @@ mod tests {
                         }
                     };
                 }
-                assert!(presenter.present(frame!(&display)));
+                assert!(presenter.present(frame!(&display)).unwrap());
                 let raster_requests = presenter.cache.tick.get();
                 assert!(raster_requests > 0, "the overlay actually rasterizes text");
                 for delta in [0.0, 0.01, 0.02] {
@@ -1454,7 +1595,7 @@ mod tests {
                     };
                     rect.size.height = 20.0 + delta;
                     let next = DisplayList::from(commands.clone());
-                    assert!(presenter.present(frame!(&next)));
+                    assert!(presenter.present(frame!(&next)).unwrap());
                     assert_eq!(
                         presenter.cache.tick.get(),
                         raster_requests,
@@ -1471,7 +1612,7 @@ mod tests {
                     rect.size.height = height;
                     let next = DisplayList::from(commands.clone());
                     let before = presenter.cache.tick.get();
-                    assert!(presenter.present(frame!(&next)));
+                    assert!(presenter.present(frame!(&next)).unwrap());
                     if height == 9.0 {
                         assert_eq!(
                             presenter.cache.tick.get(),
@@ -1485,7 +1626,7 @@ mod tests {
                 };
                 *color = Color::hex(0xff0000);
                 let changed = DisplayList::from(commands);
-                assert!(presenter.present(frame!(&changed)));
+                assert!(presenter.present(frame!(&changed)).unwrap());
                 assert!(
                     presenter.cache.tick.get() > raster_requests,
                     "changed paint must still rasterize"
@@ -1513,7 +1654,9 @@ mod tests {
                 Color::WHITE,
                 &PixelFont,
                 &boxes
-            ));
+            )
+                    .unwrap()
+            );
             for rows in [1, 2, 3] {
                 assert!(presenter.present(Frame {
                     root,
@@ -1524,7 +1667,8 @@ mod tests {
                     text: &PixelFont,
                     images: &images,
                     boxes: &boxes
-                }));
+                })
+                        .unwrap());
             }
             assert_eq!(
                 presenter.cache.bytes.get(),
@@ -1667,7 +1811,8 @@ mod tests {
             for rows in [0, 1, 2, 10, 20] {
                 let display = growing_scene(rows);
                 let size = (800 * scale, 600 * scale);
-                let admitted = Scene::new(&display, size, scale, Color::WHITE, &PixelFont, &cache)
+                let admitted = Scene::prepare_scene(&display, size, scale, Color::WHITE, &PixelFont, &cache)
+                    .unwrap()
                     .expect("the uncovered prefix background is uniform");
                 let whole = rasterize_with(
                     &display,
@@ -1677,7 +1822,8 @@ mod tests {
                     Color::WHITE,
                     &PixelFont,
                     &RawImages::default(),
-                );
+                )
+                .unwrap();
                 let mut composed = whole.pixels().to_vec();
                 // Poison the viewport first: the bands must cover ALL of it,
                 // including the empty tail, rather than relying on old pixels.
@@ -1696,7 +1842,8 @@ mod tests {
                         Color::WHITE,
                         &PixelFont,
                         &RawImages::default(),
-                    );
+                    )
+                    .unwrap();
                     for y in band.rect.1.max(vp.1)..band.rect.3.min(vp.3) {
                         for x in vp.0..vp.2 {
                             composed[y as usize * size.0 + x as usize] =
@@ -1715,7 +1862,7 @@ mod tests {
         let cache = MeasureCache::default();
         for scale in [1, 2] {
             let display = growing_scene(1);
-            let scene = Scene::new(
+            let scene = Scene::prepare_scene(
                 &display,
                 (800 * scale, 600 * scale),
                 scale,
@@ -1723,10 +1870,12 @@ mod tests {
                 &PixelFont,
                 &cache,
             )
+            .unwrap()
             .unwrap();
             let band = &scene.bands[0];
             let (color, foreground) = band
                 .foreground(scale, &PixelFont, &cache)
+                .unwrap()
                 .expect("the short text leaves most of its row uniform");
             let physical = (
                 (band.rect.2 - band.rect.0) as usize,
@@ -1740,8 +1889,10 @@ mod tests {
                 Color::WHITE,
                 &PixelFont,
                 &RawImages::default(),
-            );
-            let patch = foreground.raster(&PixelFont, &RawImages::default());
+            )
+            .unwrap();
+            let patch = foreground.raster(&PixelFont, &RawImages::default())
+                .unwrap();
             assert!(patch.width() * patch.height() * 2 < whole.width() * whole.height());
             let mut composed = Bitmap::new(physical.0, physical.1, color).pixels().to_vec();
             let (x0, y0, _, _) = foreground.bounds();
@@ -1775,7 +1926,7 @@ mod tests {
                     },
                 );
                 assert!(
-                    Scene::new(
+                    Scene::prepare_scene(
                         &DisplayList::from(commands),
                         (800, 600),
                         1,
@@ -1783,6 +1934,7 @@ mod tests {
                         &PixelFont,
                         &cache
                     )
+                    .unwrap()
                     .is_none(),
                     "rows={rows}, inside={inside}"
                 );
@@ -1797,7 +1949,8 @@ mod tests {
             for offset in [0.0, 0.5, 17.0, 24.5, 48.0] {
                 let display = scene(offset, false);
                 let size = (180 * scale, 130 * scale);
-                let admitted = Scene::new(&display, size, scale, Color::WHITE, &PixelFont, &cache)
+                let admitted = Scene::prepare_scene(&display, size, scale, Color::WHITE, &PixelFont, &cache)
+                    .unwrap()
                     .expect("opaque bands");
                 let whole = rasterize_with(
                     &display,
@@ -1807,7 +1960,8 @@ mod tests {
                     Color::WHITE,
                     &PixelFont,
                     &RawImages::default(),
-                );
+                )
+                .unwrap();
                 let mut composed = whole.pixels().to_vec();
                 let vp = admitted.viewport;
                 for band in &admitted.bands {
@@ -1819,7 +1973,8 @@ mod tests {
                         Color::WHITE,
                         &PixelFont,
                         &RawImages::default(),
-                    );
+                    )
+                    .unwrap();
                     for y in band.rect.1.max(vp.1)..band.rect.3.min(vp.3) {
                         for x in vp.0..vp.2 {
                             composed[y as usize * size.0 + x as usize] =
@@ -1829,7 +1984,7 @@ mod tests {
                     }
                 }
                 if let Some((rect, overlay)) = &admitted.overlay {
-                    let tile = overlay.raster(&PixelFont, &RawImages::default());
+                    let tile = overlay.raster(&PixelFont, &RawImages::default()).unwrap();
                     for y in rect.1..rect.3 {
                         for x in rect.0..rect.2 {
                             composed[y as usize * size.0 + x as usize] = tile.pixels()
@@ -1847,7 +2002,7 @@ mod tests {
         let cache = MeasureCache::default();
         for scale in [1, 2] {
             let first = scene(0.0, false);
-            let prior = Scene::new(
+            let prior = Scene::prepare_scene(
                 &first,
                 (180 * scale, 130 * scale),
                 scale,
@@ -1855,6 +2010,7 @@ mod tests {
                 &PixelFont,
                 &cache,
             )
+            .unwrap()
             .unwrap();
             let mut commands = first.as_slice().to_vec();
             let Some(DrawCommand::FillRect { rect: thumb, .. }) = commands.last_mut() else {
@@ -1871,6 +2027,7 @@ mod tests {
                     &PixelFont,
                     &cache,
                 )
+                .unwrap()
                 .expect("only the decoration changed");
             let (bounds, paint) = update.unwrap();
             let whole = rasterize_with(
@@ -1881,8 +2038,9 @@ mod tests {
                 Color::WHITE,
                 &PixelFont,
                 &RawImages::default(),
-            );
-            let bitmap = paint.raster(&PixelFont, &RawImages::default());
+            )
+            .unwrap();
+            let bitmap = paint.raster(&PixelFont, &RawImages::default()).unwrap();
             for y in bounds.1..bounds.3 {
                 for x in bounds.0..bounds.2 {
                     assert_eq!(
@@ -1906,6 +2064,7 @@ mod tests {
                         &PixelFont,
                         &cache
                     )
+                    .unwrap()
                     .is_none(),
                 "row changes require a new partition proof"
             );
@@ -1924,6 +2083,7 @@ mod tests {
                         &PixelFont,
                         &cache
                     )
+                    .unwrap()
                     .is_none(),
                 "changes outside the viewport require a whole scene proof"
             );
@@ -1939,8 +2099,9 @@ mod tests {
             unreachable!()
         };
         rect.size.height -= 1.0;
-        let a = Scene::new(&first, (180, 130), 1, Color::WHITE, &PixelFont, &cache).unwrap();
-        let b = Scene::new(
+        let a = Scene::prepare_scene(&first, (180, 130), 1, Color::WHITE, &PixelFont, &cache).unwrap()
+            .unwrap();
+        let b = Scene::prepare_scene(
             &DisplayList::from(second),
             (180, 130),
             1,
@@ -1948,6 +2109,7 @@ mod tests {
             &PixelFont,
             &cache,
         )
+        .unwrap()
         .unwrap();
         let (a_bounds, a_paint) = a.overlay.unwrap();
         let (b_bounds, b_paint) = b.overlay.unwrap();
@@ -1956,8 +2118,9 @@ mod tests {
             "the surface can be reused across small geometry changes"
         );
         assert_ne!(
-            a_paint.raster(&PixelFont, &RawImages::default()).pixels(),
-            b_paint.raster(&PixelFont, &RawImages::default()).pixels(),
+            a_paint.raster(&PixelFont, &RawImages::default()).unwrap()
+                .pixels(),
+            b_paint.raster(&PixelFont, &RawImages::default()).unwrap().pixels(),
             "the exact thumb pixels still change"
         );
     }
@@ -1966,7 +2129,7 @@ mod tests {
     fn row_reuse_tracks_translation_in_both_directions_including_duplicate_rows() {
         let cache = MeasureCache::default();
         for duplicate in [false, true] {
-            let a = Scene::new(
+            let a = Scene::prepare_scene(
                 &scene(0.0, duplicate),
                 (180, 130),
                 1,
@@ -1974,8 +2137,9 @@ mod tests {
                 &PixelFont,
                 &cache,
             )
+            .unwrap()
             .expect("first");
-            let b = Scene::new(
+            let b = Scene::prepare_scene(
                 &scene(24.0, duplicate),
                 (180, 130),
                 1,
@@ -1983,6 +2147,7 @@ mod tests {
                 &PixelFont,
                 &cache,
             )
+            .unwrap()
             .expect("second");
             assert_eq!(b.translation(&a), Some(-24));
             assert_eq!(a.translation(&b), Some(24));
@@ -1990,7 +2155,7 @@ mod tests {
             if let DrawCommand::TextLine { color, .. } = &mut changed[3] {
                 *color = Color::hex(0xff0011);
             }
-            let changed = Scene::new(
+            let changed = Scene::prepare_scene(
                 &DisplayList::from(changed),
                 (180, 130),
                 1,
@@ -1998,6 +2163,7 @@ mod tests {
                 &PixelFont,
                 &cache,
             )
+            .unwrap()
             .expect("local change");
             assert!(!changed.bands[0].same_pixels(&b.bands[0]));
         }
@@ -2026,7 +2192,7 @@ mod tests {
                 }
             }
             assert!(
-                Scene::new(
+                Scene::prepare_scene(
                     &DisplayList::from(commands),
                     (180, 130),
                     1,
@@ -2034,6 +2200,7 @@ mod tests {
                     &PixelFont,
                     &cache
                 )
+                .unwrap()
                 .is_none(),
                 "case={case}"
             );
@@ -2078,15 +2245,16 @@ mod tests {
             width: 400.0,
             height: 300.0,
         };
-        let first = runtime.settled_layout(&List, bunny_ui::layout::Proposal::exact(size));
+        let first = runtime.settled_layout(&List, bunny_ui::layout::Proposal::exact(size))
+            .unwrap();
         let path = first.scrolls[0].path.clone();
         let cache = MeasureCache::default();
         for offset in [0.0, 6.0, 24.0, 180.0, 24.0] {
             runtime.set_scroll_offset(&path, Point { x: 0.0, y: offset });
-            let display = runtime.display_frame(&List, size);
+            let display = runtime.display_frame(&List, size).unwrap();
             for scale in [1, 2] {
                 assert!(
-                    Scene::new(
+                    Scene::prepare_scene(
                         &display,
                         (400 * scale, 300 * scale),
                         scale,
@@ -2094,6 +2262,7 @@ mod tests {
                         &*text,
                         &cache
                     )
+                    .unwrap()
                     .is_some(),
                     "runtime list refused at scale={scale}, offset={offset}: {display:?}"
                 );

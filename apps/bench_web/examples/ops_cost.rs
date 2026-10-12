@@ -101,7 +101,7 @@ fn cycles(rounds: usize) {
         create(&app, &runtime, 1_000);
         report(&format!("{round}: after create"));
         app.rows.set(Rc::new(Vec::new()));
-        let _ = runtime.dom_frame(&app, SIZE);
+        let _ = runtime.dom_frame(&app, SIZE).expect("benchmark frame");
         report(&format!("{round}: after clear"));
         runtime.collect_garbage();
         report(&format!("{round}: after collect"));
@@ -129,7 +129,7 @@ fn fresh() -> (Runtime, App) {
     };
     // the empty page, mounted: what the harness's page looks like
     // before its first click
-    let _ = runtime.dom_frame(&app, SIZE);
+    let _ = runtime.dom_frame(&app, SIZE).expect("benchmark frame");
     (runtime, app)
 }
 
@@ -137,7 +137,7 @@ fn create(app: &App, runtime: &Runtime, count: usize) {
     let from = app.next_id.get();
     app.rows.set(Rc::new(seeds(from, count)));
     app.next_id.set(from + count);
-    let _ = runtime.dom_frame(app, SIZE);
+    let _ = runtime.dom_frame(app, SIZE).expect("benchmark frame");
 }
 
 /// One official operation: how the page is prepared (untimed), and the
@@ -228,7 +228,7 @@ fn measure(op: &Op) -> Sample {
     let (allocs_before, bytes_before) = allocations();
     let started = now_ms();
     (op.run)(&app);
-    let patches = runtime.dom_frame(&app, SIZE);
+    let patches = runtime.dom_frame(&app, SIZE).expect("benchmark frame");
     let total_ms = now_ms() - started;
     let (allocs_after, bytes_after) = allocations();
     let stats = stats::take();
@@ -265,7 +265,7 @@ fn alloc_sites(every: usize) {
     // the page warm: one create and clear before the one that counts
     create(&app, &runtime, 1_000);
     app.rows.set(Rc::new(Vec::new()));
-    let _ = runtime.dom_frame(&app, SIZE);
+    let _ = runtime.dom_frame(&app, SIZE).expect("benchmark frame");
     SAMPLE_EVERY.store(every, Ordering::Relaxed);
     let before = ALLOCS.load(Ordering::Relaxed);
     create(&app, &runtime, 1_000);

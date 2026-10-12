@@ -48,7 +48,7 @@ use std::ffi::{c_void, CString};
 use std::hash::{Hash, Hasher};
 use std::ptr::{null, null_mut};
 
-use bunny_ui::gpu::walk::ShelfPacker;
+use bunny_ui::gpu::walk::{AtlasFull, RenderError, ShelfPacker};
 use bunny_ui::image_engine::{ImageEngine, ImageRaster, ImageSource, raster_source};
 use bunny_ui::layout::{Color, Corners, DisplayList, DrawCommand, Rect, Size};
 use bunny_ui::raster::physical_extent;
@@ -1978,9 +1978,6 @@ struct Tile {
 }
 
 
-/// The atlas is full — the caller drains the in-flight frames, resets
-/// (growing once to the cap) and walks the frame again.
-struct AtlasFull;
 
 // Source keys have their own budget; GPU texels are managed independently.
 const ATLAS_SOURCE_LIMIT: usize = 16 * 1024 * 1024;
@@ -2337,7 +2334,7 @@ impl RunAtlas {
         color: Color,
         scale: usize,
         engine: &dyn TextEngine,
-    ) -> Result<Option<&RunEntry>, AtlasFull> {
+    ) -> Result<Option<&RunEntry>, RenderError> {
         self.transient = None;
         let scale_key = u32::try_from(scale).map_err(|_| AtlasFull)?;
         let key = font.key();
@@ -2352,11 +2349,11 @@ impl RunAtlas {
             })
         });
         if !warm {
-            let Some(raster) = engine.raster_paragraph_line(line, font, color, scale) else {
+            let Some(raster) = engine.raster_paragraph_line(line, font, color, scale)? else {
                 return Ok(None);
             };
             if !self.ensure_texture() {
-                return Err(AtlasFull);
+                return Err(RenderError::AtlasFull);
             }
             let width = raster.width as u32;
             let height = raster.height as u32;
@@ -2365,7 +2362,7 @@ impl RunAtlas {
             while chunk_x < width {
                 let chunk_width = (width - chunk_x).min(ATLAS_CHUNK_WIDTH);
                 let Some((x, y)) = self.packer.place(chunk_width, height) else {
-                    return Err(AtlasFull);
+                    return Err(RenderError::AtlasFull);
                 };
                 self.upload_tile(
                     x,
@@ -2375,7 +2372,12 @@ impl RunAtlas {
                     unsafe { raster.rgba.as_ptr().add(chunk_x as usize * 4) },
                     (raster.width * 4) as u32,
                 );
-                tiles.push(Tile { x, y, width: chunk_width, height });
+                tiles.push(Tile {
+                    x,
+                    y,
+                    width: chunk_width,
+                    height,
+                });
                 chunk_x += chunk_width;
             }
             let mut entry = RunEntry {
@@ -2389,7 +2391,12 @@ impl RunAtlas {
             };
             // Metadata eviction never touches uploaded texels or frame instances.
             // Oversized context is never retained; its tiles still serve this draw.
-            let weight = line.paragraph().text().len().saturating_mul(24).saturating_add(256);
+            let weight = line
+                .paragraph()
+                .text()
+                .len()
+                .saturating_mul(24)
+                .saturating_add(256);
             if weight > ATLAS_SOURCE_LIMIT {
                 entry.content = None;
                 self.transient = Some(entry);
@@ -2673,7 +2680,7 @@ fn build_frame(
     images: &dyn ImageEngine,
     atlas: &mut RunAtlas,
     batches: &mut FrameBatches,
-) -> Result<(), AtlasFull> {
+) -> Result<(), RenderError> {
     atlas.begin_walk();
     batches.rects.clear();
     batches.sprites.clear();
@@ -2693,8 +2700,14 @@ fn build_frame(
     let mut glass_batch: Option<Box4> = None;
     for command in display.iter() {
         match command {
-            DrawCommand::FillRect { rect, color, corner_radius } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
+            DrawCommand::FillRect {
+                rect,
+                color,
+                corner_radius,
+            } => {
+                let Some(clip) = effective_clip(&clips, whole) else {
+                    continue;
+                };
                 let snapped = snap_scaled(*rect, factor);
                 if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
                     continue;
@@ -2704,10 +2717,21 @@ fn build_frame(
                 }
                 let radii = corner_clamp(corner_radius * factor, snapped);
                 push_rect(out, snapped, clip, *color, radii, 0.0, KIND_FILL, 0.0);
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
+                note_run(
+                    &mut batches.runs,
+                    RunKind::Rects,
+                    round_of(&clips),
+                    out.len() - 1,
+                );
             }
-            DrawCommand::Backdrop { rect, glass, corner_radius } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
+            DrawCommand::Backdrop {
+                rect,
+                glass,
+                corner_radius,
+            } => {
+                let Some(clip) = effective_clip(&clips, whole) else {
+                    continue;
+                };
                 let snapped = snap_scaled(*rect, factor);
                 if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
                     continue;
@@ -2718,7 +2742,12 @@ fn build_frame(
                 let radii = corner_clamp(corner_radius * factor, snapped);
                 let paint = glass.scaled(factor);
                 batches.glass.push(GlassInstance {
-                    rect: [snapped.0 as f32, snapped.1 as f32, snapped.2 as f32, snapped.3 as f32],
+                    rect: [
+                        snapped.0 as f32,
+                        snapped.1 as f32,
+                        snapped.2 as f32,
+                        snapped.3 as f32,
+                    ],
                     clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
                     radii: wire_radii(radii),
                     lens: [
@@ -2758,8 +2787,14 @@ fn build_frame(
                     &mut glass_batch,
                 );
             }
-            DrawCommand::Gradient { rect, paint, corner_radius } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
+            DrawCommand::Gradient {
+                rect,
+                paint,
+                corner_radius,
+            } => {
+                let Some(clip) = effective_clip(&clips, whole) else {
+                    continue;
+                };
                 let snapped = snap_scaled(*rect, factor);
                 if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
                     continue;
@@ -2802,26 +2837,41 @@ fn build_frame(
                     // the line's two ends fill the four numbers the
                     // struct still had: its start in the params, its
                     // end in the point — the quad stays the box
-                    bunny_ui::layout::GradientPaint::Linear { start, end, from, to } => {
-                        push_gradient(
-                            out,
-                            snapped,
-                            clip,
-                            from,
-                            to,
-                            radii,
-                            0.0,
-                            start.x,
-                            start.y,
-                            (end.x, end.y),
-                            KIND_LINEAR,
-                        )
-                    }
+                    bunny_ui::layout::GradientPaint::Linear {
+                        start,
+                        end,
+                        from,
+                        to,
+                    } => push_gradient(
+                        out,
+                        snapped,
+                        clip,
+                        from,
+                        to,
+                        radii,
+                        0.0,
+                        start.x,
+                        start.y,
+                        (end.x, end.y),
+                        KIND_LINEAR,
+                    ),
                 }
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
+                note_run(
+                    &mut batches.runs,
+                    RunKind::Rects,
+                    round_of(&clips),
+                    out.len() - 1,
+                );
             }
-            DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
+            DrawCommand::StrokeRect {
+                rect,
+                color,
+                width,
+                corner_radius,
+            } => {
+                let Some(clip) = effective_clip(&clips, whole) else {
+                    continue;
+                };
                 let snapped = snap_scaled(*rect, factor);
                 if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
                     continue;
@@ -2833,11 +2883,32 @@ fn build_frame(
                 // one device pixel, rounded once
                 let thickness = (width * factor).max(1.0).round();
                 let radii = corner_clamp(corner_radius * factor, snapped);
-                push_rect(out, snapped, clip, *color, radii, thickness, KIND_STROKE, 0.0);
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
+                push_rect(
+                    out,
+                    snapped,
+                    clip,
+                    *color,
+                    radii,
+                    thickness,
+                    KIND_STROKE,
+                    0.0,
+                );
+                note_run(
+                    &mut batches.runs,
+                    RunKind::Rects,
+                    round_of(&clips),
+                    out.len() - 1,
+                );
             }
-            DrawCommand::Shadow { rect, radius, color, corner_radius } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
+            DrawCommand::Shadow {
+                rect,
+                radius,
+                color,
+                corner_radius,
+            } => {
+                let Some(clip) = effective_clip(&clips, whole) else {
+                    continue;
+                };
                 let snapped = snap_scaled(*rect, factor);
                 // reach stays unrounded for the falloff; its rounding
                 // only sizes the quad (the cpu loop bound) — any pixel
@@ -2854,12 +2925,36 @@ fn build_frame(
                 if box_intersect(expanded, clip).is_none() {
                     continue;
                 }
-                push_rect(out, expanded, clip, *color, corner, reach, KIND_SHADOW, reach_px as f64);
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
+                push_rect(
+                    out,
+                    expanded,
+                    clip,
+                    *color,
+                    corner,
+                    reach,
+                    KIND_SHADOW,
+                    reach_px as f64,
+                );
+                note_run(
+                    &mut batches.runs,
+                    RunKind::Rects,
+                    round_of(&clips),
+                    out.len() - 1,
+                );
             }
-            DrawCommand::TextLine { origin, content, range, color, font } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
-                let Ok(line) = content.line(range.0..range.1) else { continue };
+            DrawCommand::TextLine {
+                origin,
+                content,
+                range,
+                color,
+                font,
+            } => {
+                let Some(clip) = effective_clip(&clips, whole) else {
+                    continue;
+                };
+                let line = content
+                    .line(range.0..range.1)
+                    .map_err(bunny_ui::text_error::TextError::from)?;
                 let Some(entry) = atlas.resolve(&line, font, *color, scale, engine)? else {
                     continue;
                 };
@@ -2867,8 +2962,12 @@ fn build_frame(
                 // origin, texels copied 1:1 from there
                 let base_x = (origin.x * factor).round() as i64;
                 let base_y = (origin.y * factor).round() as i64;
-                let dest =
-                    (base_x, base_y, base_x + entry.width as i64, base_y + entry.height as i64);
+                let dest = (
+                    base_x,
+                    base_y,
+                    base_x + entry.width as i64,
+                    base_y + entry.height as i64,
+                );
                 if box_intersect(dest, clip).is_none() {
                     continue;
                 }
@@ -2885,7 +2984,12 @@ fn build_frame(
                         continue;
                     }
                     batches.sprites.push(SpriteInstance {
-                        dest: [chunk.0 as f32, chunk.1 as f32, chunk.2 as f32, chunk.3 as f32],
+                        dest: [
+                            chunk.0 as f32,
+                            chunk.1 as f32,
+                            chunk.2 as f32,
+                            chunk.3 as f32,
+                        ],
                         tex: [
                             tile.x as f32,
                             tile.y as f32,
@@ -2903,7 +3007,9 @@ fn build_frame(
                 }
             }
             DrawCommand::Image { rect, source } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
+                let Some(clip) = effective_clip(&clips, whole) else {
+                    continue;
+                };
                 let width = physical_extent(rect.size.width, scale) as u32;
                 let height = physical_extent(rect.size.height, scale) as u32;
                 if width == 0 || height == 0 {
@@ -2913,7 +3019,12 @@ fn build_frame(
                 // origin, texels pasted 1:1 from there
                 let base_x = (rect.origin.x * factor).round() as i64;
                 let base_y = (rect.origin.y * factor).round() as i64;
-                let dest = (base_x, base_y, base_x + width as i64, base_y + height as i64);
+                let dest = (
+                    base_x,
+                    base_y,
+                    base_x + width as i64,
+                    base_y + height as i64,
+                );
                 if box_intersect(dest, clip).is_none() {
                     continue;
                 }
@@ -2945,12 +3056,7 @@ fn build_frame(
                                     (tile.x + tile.width) as f32,
                                     (tile.y + tile.height) as f32,
                                 ],
-                                clip: [
-                                    clip.0 as f32,
-                                    clip.1 as f32,
-                                    clip.2 as f32,
-                                    clip.3 as f32,
-                                ],
+                                clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
                             });
                             note_run(
                                 &mut batches.runs,
@@ -3004,7 +3110,10 @@ fn build_frame(
                     }
                 }
             }
-            DrawCommand::PushClip { rect, corner_radius } => {
+            DrawCommand::PushClip {
+                rect,
+                corner_radius,
+            } => {
                 let snapped = snap_scaled(*rect, factor);
                 let cut = match clips.last().copied() {
                     Some((top, _)) => box_intersect(snapped, top)
@@ -3495,7 +3604,7 @@ impl D3dPresenter {
         physical: (usize, usize),
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) {
+    ) -> Result<(), RenderError> {
         for attempt in 0..3 {
             match build_frame(
                 display,
@@ -3506,19 +3615,18 @@ impl D3dPresenter {
                 &mut self.atlas,
                 &mut self.batches,
             ) {
-                Ok(()) => return,
-                Err(AtlasFull) => {
+                Ok(()) => return Ok(()),
+                Err(RenderError::Text(error)) => return Err(RenderError::Text(error)),
+                Err(RenderError::AtlasFull) => {
                     if attempt == 2 {
-                        // pathological frame: keep the rects, drop the
-                        // rest of the text — never a crash
-                        eprintln!("bunny_ui d3d: atlas overflow survived two resets");
-                        return;
+                        return Err(RenderError::AtlasFull);
                     }
                     drain_slots(&mut self.slots, self.stack.context.as_ptr());
                     self.atlas.reset(true);
                 }
             }
-        }
+        };
+        Ok(())
     }
 
     /// One frame: walk the list, upload, resize the swapchain if the
@@ -3533,19 +3641,19 @@ impl D3dPresenter {
         canvas: Color,
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) -> Presented {
+    ) -> Result<Presented, RenderError> {
         let physical = (
             (size.width * scale as f64).round().max(0.0) as usize,
             (size.height * scale as f64).round().max(0.0) as usize,
         );
         if physical.0 == 0 || physical.1 == 0 {
             // a zero target is an abort, not a frame
-            return Presented::Ok;
+            return Ok(Presented::Ok);
         }
         if frame_repeats(&self.retained, display, physical, scale, canvas) {
             // the caret blink and friends land here every half second —
             // nothing changed, nothing encodes
-            return Presented::Ok;
+            return Ok(Presented::Ok);
         }
         let swapchain = self.swapchain.as_ptr();
         if self.occluded {
@@ -3553,16 +3661,16 @@ impl D3dPresenter {
             // that changed; until it does, the frame work is skipped
             let hr = unsafe { ((*(*swapchain).vtbl).present)(swapchain, 0, PRESENT_TEST) };
             if hr == STATUS_OCCLUDED {
-                return Presented::Ok;
+                return Ok(Presented::Ok);
             }
             if !com_ok(hr) {
-                return Presented::DeviceLost;
+                return Ok(Presented::DeviceLost);
             }
             self.occluded = false;
         }
         let client = crate::ffi::client_px_of(self.hwnd);
         if client.0 == 0 || client.1 == 0 {
-            return Presented::Ok;
+            return Ok(Presented::Ok);
         }
         let context = self.stack.context.as_ptr();
         let device = self.stack.device.as_ptr();
@@ -3575,9 +3683,14 @@ impl D3dPresenter {
                 let none: *mut Rtv = null_mut();
                 ((*(*context).vtbl).om_set_render_targets)(context, 1, &none, null_mut());
                 if !com_ok(((*(*swapchain).vtbl).resize_buffers)(
-                    swapchain, 0, client.0, client.1, FORMAT_UNKNOWN, 0,
+                    swapchain,
+                    0,
+                    client.0,
+                    client.1,
+                    FORMAT_UNKNOWN,
+                    0,
                 )) {
-                    return Presented::DeviceLost;
+                    return Ok(Presented::DeviceLost);
                 }
             }
             self.client = client;
@@ -3591,7 +3704,7 @@ impl D3dPresenter {
                     &IID_TEXTURE2D,
                     &mut texture,
                 )) {
-                    return Presented::DeviceLost;
+                    return Ok(Presented::DeviceLost);
                 }
                 let texture = Com::from_raw(texture as *mut Texture2d)
                     .expect("the swapchain answered with a buffer");
@@ -3602,7 +3715,7 @@ impl D3dPresenter {
                     null(),
                     &mut rtv,
                 )) {
-                    return Presented::DeviceLost;
+                    return Ok(Presented::DeviceLost);
                 }
                 self.rtv = Com::from_raw(rtv);
             }
@@ -3636,10 +3749,10 @@ impl D3dPresenter {
                         null(),
                         &mut texture,
                     )) {
-                        return Presented::DeviceLost;
+                        return Ok(Presented::DeviceLost);
                     }
                     let Some(texture) = Com::from_raw(texture) else {
-                        return Presented::DeviceLost;
+                        return Ok(Presented::DeviceLost);
                     };
                     let mut rtv: *mut Rtv = null_mut();
                     if !com_ok(((*(*device).vtbl).create_render_target_view)(
@@ -3648,9 +3761,11 @@ impl D3dPresenter {
                         null(),
                         &mut rtv,
                     )) {
-                        return Presented::DeviceLost;
+                        return Ok(Presented::DeviceLost);
                     }
-                    let Some(rtv) = Com::from_raw(rtv) else { return Presented::DeviceLost };
+                    let Some(rtv) = Com::from_raw(rtv) else {
+                        return Ok(Presented::DeviceLost);
+                    };
                     let mut srv: *mut Srv = null_mut();
                     if !com_ok(((*(*device).vtbl).create_shader_resource_view)(
                         device,
@@ -3658,20 +3773,25 @@ impl D3dPresenter {
                         null(),
                         &mut srv,
                     )) {
-                        return Presented::DeviceLost;
+                        return Ok(Presented::DeviceLost);
                     }
-                    let Some(srv) = Com::from_raw(srv) else { return Presented::DeviceLost };
+                    let Some(srv) = Com::from_raw(srv) else {
+                        return Ok(Presented::DeviceLost);
+                    };
                     self.intermediate = Some((texture, rtv, srv, physical));
                 }
             }
         } else {
             self.intermediate = None;
         }
-        self.build_with_retries(display, scale, physical, text, images);
+        self.build_with_retries(display, scale, physical, text, images)?;
         // a frame with glass needs a scene of its own to read; a frame
         // without one never asks for the textures
         if !self.batches.glass.is_empty()
-            && self.glass.as_ref().is_none_or(|targets| targets.size != physical)
+            && self
+                .glass
+                .as_ref()
+                .is_none_or(|targets| targets.size != physical)
         {
             self.glass = unsafe { GlassTargets::new(device, physical) };
             if self.glass.is_none() {
@@ -3680,7 +3800,7 @@ impl D3dPresenter {
         }
         let index = acquire_slot(&mut self.slots, &mut self.cursor, context);
         if !upload_frame(&mut self.slots[index], device, context, &self.batches) {
-            return Presented::DeviceLost;
+            return Ok(Presented::DeviceLost);
         }
         let backbuffer = self.rtv.as_ref().expect("the view was just made").as_ptr();
         let target = self
@@ -3699,7 +3819,9 @@ impl D3dPresenter {
                 &self.batches.rounds,
                 self.atlas.srv(),
                 &self.batches.textures,
-                self.glass.as_ref().filter(|_| !self.batches.glass.is_empty()),
+                self.glass
+                    .as_ref()
+                    .filter(|_| !self.batches.glass.is_empty()),
             );
             if let Some((_, _, srv, _)) = &self.intermediate {
                 // the StretchBlt of the GPU road: one bilinear triangle
@@ -3740,13 +3862,13 @@ impl D3dPresenter {
             // reveal re-presents in full
             self.occluded = true;
             self.retained = None;
-            return Presented::Ok;
+            return Ok(Presented::Ok);
         }
         if !com_ok(hr) {
-            return Presented::DeviceLost;
+            return Ok(Presented::DeviceLost);
         }
         self.retained = Some((display.clone(), physical, scale, canvas));
-        Presented::Ok
+        Ok(Presented::Ok)
     }
 }
 
@@ -3851,12 +3973,12 @@ fn install(hwnd: Hwnd) -> Option<D3dPresenter> {
 /// forever; any failure to come up (no hardware device, no compiler
 /// DLL, a shader that does not compile) prints one line and falls back
 /// — a window never fails to open because of D3D.
-pub(crate) fn try_install(hwnd: Hwnd) -> bool {
+pub(crate) fn try_install(hwnd: Hwnd) -> Result<bool, RenderError> {
     if std::env::var("BUNNY_PRESENT").ok().as_deref() == Some("cpu") {
-        return false;
+        return Ok(false);
     }
     let Some(mut presenter) = install(hwnd) else {
-        return false;
+        return Ok(false);
     };
     // anti-flash: the first clear happens before the window shows — a
     // virgin swapchain would flash black (or worse, white) on show
@@ -3869,11 +3991,11 @@ pub(crate) fn try_install(hwnd: Hwnd) -> bool {
         bunny_ui::theme::canvas(),
         &bunny_ui::text_engine::PixelFont,
         &bunny_ui::image_engine::RawImages::default(),
-    );
+    )?;
     PRESENTER.with(|slot| {
         slot.borrow_mut().insert(hwnd, presenter);
     });
-    true
+    Ok(true)
 }
 
 /// True when this window presents by GPU — the shell branches per frame
@@ -3897,23 +4019,25 @@ pub(crate) fn present_window(
     canvas: Color,
     text: &dyn TextEngine,
     images: &dyn ImageEngine,
-) {
-    let outcome = PRESENTER.with(|slot| {
-        slot.borrow_mut()
-            .get_mut(&hwnd)
-            .map(|presenter| presenter.present(display, size, scale, canvas, text, images))
-    });
+) -> Result<(), RenderError> {
+    let outcome = PRESENTER
+        .with(|slot| {
+            slot.borrow_mut()
+                .get_mut(&hwnd)
+                .map(|presenter| presenter.present(display, size, scale, canvas, text, images))
+        })
+        .transpose()?;
     if outcome != Some(Presented::DeviceLost) {
-        return;
+        return Ok(());
     }
     PRESENTER.with(|slot| slot.borrow_mut().remove(&hwnd));
     if !RECREATE_SPENT.with(|spent| spent.replace(true)) {
         if let Some(mut presenter) = install(hwnd) {
-            presenter.present(display, size, scale, canvas, text, images);
+            presenter.present(display, size, scale, canvas, text, images)?;
             PRESENTER.with(|slot| {
                 slot.borrow_mut().insert(hwnd, presenter);
             });
-            return;
+            return Ok(());
         }
     }
     eprintln!("bunny_ui d3d: the device is lost — presenting by cpu");
@@ -3921,6 +4045,8 @@ pub(crate) fn present_window(
     // asks again on its own — the demotion itself asks, so the CPU
     // road's first frame arrives now, not at the next keystroke
     crate::ffi::ask_represent(hwnd);
+
+    Ok(())
 }
 
 /// Forgets the retained frame so the next present re-encodes in full —
@@ -4052,7 +4178,7 @@ impl OffscreenD3d {
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
         wait: bool,
-    ) {
+    ) -> Result<(), RenderError> {
         let context = self.stack.context.as_ptr();
         let device = self.stack.device.as_ptr();
         for attempt in 0..3 {
@@ -4066,10 +4192,10 @@ impl OffscreenD3d {
                 &mut self.batches,
             ) {
                 Ok(()) => break,
-                Err(AtlasFull) => {
+                Err(RenderError::Text(error)) => return Err(RenderError::Text(error)),
+                Err(RenderError::AtlasFull) => {
                     if attempt == 2 {
-                        eprintln!("bunny_ui d3d: atlas overflow survived two resets");
-                        break;
+                        return Err(RenderError::AtlasFull);
                     }
                     drain_slots(&mut self.slots, context);
                     self.atlas.reset(true);
@@ -4087,7 +4213,7 @@ impl OffscreenD3d {
         }
         let index = acquire_slot(&mut self.slots, &mut self.cursor, context);
         if !upload_frame(&mut self.slots[index], device, context, &self.batches) {
-            return;
+            return Ok(());
         }
         unsafe {
             self.stack.encode_frame(
@@ -4101,7 +4227,9 @@ impl OffscreenD3d {
                 &self.batches.rounds,
                 self.atlas.srv(),
                 &self.batches.textures,
-                self.glass.as_ref().filter(|_| !self.batches.glass.is_empty()),
+                self.glass
+                    .as_ref()
+                    .filter(|_| !self.batches.glass.is_empty()),
             );
         }
         mark_in_flight(&mut self.slots[index], device, context);
@@ -4113,10 +4241,14 @@ impl OffscreenD3d {
             }
             self.slots[index].in_flight = false;
         }
+        Ok(())
     }
 
     /// Renders and WAITS — determinism for tests and honest numbers for
     /// the bench (walk + upload + encode + GPU time, nothing hidden).
+    ///
+    /// # Errors
+    /// Returns a text error or atlas exhaustion if the frame cannot be prepared.
     pub fn present_wait(
         &mut self,
         display: &DisplayList,
@@ -4124,13 +4256,18 @@ impl OffscreenD3d {
         canvas: Color,
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) {
-        self.present_inner(display, scale, canvas, text, images, true);
+    ) -> Result<(), RenderError> {
+        self.present_inner(display, scale, canvas, text, images, true)?;
+
+        Ok(())
     }
 
     /// Renders and RETURNS after the submit — the CPU-side cost of a
     /// production present (a window submits and moves on; the ring
     /// keeps the in-flight frames safe).
+    ///
+    /// # Errors
+    /// Returns a text error or atlas exhaustion if the frame cannot be prepared.
     pub fn present_nowait(
         &mut self,
         display: &DisplayList,
@@ -4138,8 +4275,10 @@ impl OffscreenD3d {
         canvas: Color,
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) {
-        self.present_inner(display, scale, canvas, text, images, false);
+    ) -> Result<(), RenderError> {
+        self.present_inner(display, scale, canvas, text, images, false)?;
+
+        Ok(())
     }
 
     /// The atlas footprint — how many cached runs, images and dedicated
@@ -4249,7 +4388,7 @@ mod tests {
     ) -> (Vec<u8>, Vec<u8>) {
         report_adapter(&gpu.stack.device);
         let runtime = Runtime::new();
-        let display = runtime.display_frame(root, logical);
+        let display = runtime.display_frame(root, logical).unwrap();
         let cpu = rasterize_with(
             &display,
             gpu.width,
@@ -4259,8 +4398,10 @@ mod tests {
             &PixelFont,
             &RawImages::default(),
         )
+        .unwrap()
         .to_rgba_bytes();
-        gpu.present_wait(&display, scale, canvas, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, scale, canvas, &PixelFont, &RawImages::default())
+            .unwrap();
         (gpu.read_rgba(), cpu)
     }
 
@@ -4333,7 +4474,8 @@ mod tests {
         // loudly (the lesson the text engine taught)
         let canvas = Color::hex(0x18181D);
         let mut gpu = OffscreenD3d::new(16, 16).expect("offscreen gpu");
-        gpu.present_wait(&DisplayList::default(), 2, canvas, &PixelFont, &RawImages::default());
+        gpu.present_wait(&DisplayList::default(), 2, canvas, &PixelFont, &RawImages::default())
+        .unwrap();
         let bytes = gpu.read_rgba();
         assert_eq!(bytes.len(), 16 * 16 * 4);
         for pixel in bytes.chunks_exact(4) {
@@ -4585,8 +4727,8 @@ mod tests {
         // must present again
         let runtime = Runtime::new();
         let logical = Size { width: 100.0, height: 60.0 };
-        let quiet = runtime.display_frame(&text("still"), logical);
-        let changed = runtime.display_frame(&text("moved"), logical);
+        let quiet = runtime.display_frame(&text("still"), logical).unwrap();
+        let changed = runtime.display_frame(&text("moved"), logical).unwrap();
         let retained = Some((quiet.clone(), (200usize, 120usize), 2usize, Color::CANVAS));
         assert!(frame_repeats(&retained, &quiet, (200, 120), 2, Color::CANVAS));
         assert!(!frame_repeats(&retained, &changed, (200, 120), 2, Color::CANVAS));
@@ -4638,7 +4780,7 @@ mod tests {
         .padding_length(10.0)
         .background_color(Color::hex(0xFFFFFF))
         .corner_radius(9.0);
-        let display = runtime.display_frame(&root, logical);
+        let display = runtime.display_frame(&root, logical).unwrap();
         let cpu = rasterize_with(
             &display,
             physical.0,
@@ -4648,9 +4790,11 @@ mod tests {
             &engine,
             &RawImages::default(),
         )
+        .unwrap()
         .to_rgba_bytes();
         let mut gpu = OffscreenD3d::new(physical.0, physical.1).expect("offscreen gpu");
-        gpu.present_wait(&display, scale, Color::CANVAS, &engine, &RawImages::default());
+        gpu.present_wait(&display, scale, Color::CANVAS, &engine, &RawImages::default())
+        .unwrap();
         assert_close(&gpu.read_rgba(), &cpu, 2, "directwrite runs");
     }
 
@@ -4681,12 +4825,15 @@ mod tests {
         let root = vstack((text("warm"), text("frame")));
         let logical = Size { width: 120.0, height: 60.0 };
         let runtime = Runtime::new();
-        let display = runtime.display_frame(&root, logical);
+        let display = runtime.display_frame(&root, logical).unwrap();
         let mut gpu = OffscreenD3d::new(240, 120).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default(),
+        )
+        .unwrap();
         let first = gpu.atlas_footprint();
         assert!(first.0 > 0, "the frame rasterized runs into the atlas");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default())
+        .unwrap();
         let second = gpu.atlas_footprint();
         assert_eq!(first, second, "an identical frame must not mint new tiles");
     }
@@ -4759,13 +4906,16 @@ mod tests {
         }
         let runtime = Runtime::new();
         let root = image_scene();
-        let display = runtime.display_frame(&root, Size { width: 320.0, height: 400.0 });
+        let display = runtime.display_frame(&root, Size { width: 320.0, height: 400.0 })
+            .unwrap();
         let engine = RawImages::default();
         let mut gpu = OffscreenD3d::new(640, 800).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         let first = gpu.atlas_footprint();
         assert!(first.0 >= 3, "atlas icon + cover + dedicated photo: {first:?}");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         assert_eq!(first, gpu.atlas_footprint(), "a warm frame re-uploads nothing");
     }
 
@@ -4806,15 +4956,20 @@ mod tests {
         let logical = Size { width: 640.0, height: 140.0 };
         let engine = RawImages::default();
         let mut gpu = OffscreenD3d::new(1280, 280).expect("offscreen gpu");
-        let first = Runtime::new().display_frame(&crowd_scene(10), logical);
-        gpu.present_wait(&first, 2, Color::CANVAS, &PixelFont, &engine);
+        let first = Runtime::new().display_frame(&crowd_scene(10), logical)
+            .unwrap();
+        gpu.present_wait(&first, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         assert_eq!(gpu.atlas.dedicated.len(), 12, "every photo of the frame keeps its texture");
-        gpu.present_wait(&first, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&first, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         assert_eq!(gpu.atlas.dedicated.len(), 12, "a warm frame past the cap asks no collector");
         // twelve OTHER photos: the first twelve are stale, the cap asks
         // for the collector, and the map holds only what this frame reads
-        let second = Runtime::new().display_frame(&crowd_scene(50), logical);
-        gpu.present_wait(&second, 2, Color::CANVAS, &PixelFont, &engine);
+        let second = Runtime::new().display_frame(&crowd_scene(50), logical)
+            .unwrap();
+        gpu.present_wait(&second, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         assert_eq!(gpu.atlas.dedicated.len(), 12, "the collector took the stale textures");
     }
 
@@ -4828,7 +4983,9 @@ mod tests {
         // shelf per exact height wanted more rows than the atlas has, and
         // the frame went out without its last fifty paths
         let paths: Vec<_> = (0..100u64)
-            .map(|i| image(gradient_source(200 + i)).resizable().frame(40.0, 10.0 + i as f64))
+            .map(|i| {
+                image(gradient_source(200 + i)).resizable().frame(40.0, 10.0 + i as f64)
+            })
             .collect();
         let root = zstack(paths);
         let logical = Size { width: 60.0, height: 120.0 };
@@ -4838,9 +4995,10 @@ mod tests {
             "hundred-heights scene diverged (max channel delta {})",
             max_channel_delta(&gpu, &cpu)
         );
-        let display = Runtime::new().display_frame(&root, logical);
+        let display = Runtime::new().display_frame(&root, logical).unwrap();
         let mut gpu = OffscreenD3d::new(120, 240).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default())
+        .unwrap();
         assert_eq!(gpu.atlas.images.len(), 100, "every path rode the shelves");
         assert!(gpu.atlas.dedicated.is_empty(), "none needed a texture of its own");
     }
@@ -4853,7 +5011,9 @@ mod tests {
         // seventy shelf-sized photos, more than the shelves hold: the
         // overflow takes textures of its own and the frame goes out whole
         let photos: Vec<_> = (0..70u64)
-            .map(|i| image(gradient_source(300 + i)).resizable().frame(500.0, 125.0))
+            .map(|i| {
+                image(gradient_source(300 + i)).resizable().frame(500.0, 125.0)
+            })
             .collect();
         let root = zstack(photos);
         let logical = Size { width: 500.0, height: 125.0 };
@@ -4863,9 +5023,11 @@ mod tests {
             "full-shelf scene diverged (max channel delta {})",
             max_channel_delta(&gpu, &cpu)
         );
-        let display = Runtime::new().display_frame(&root, logical);
+        let display = Runtime::new().display_frame(&root, logical).unwrap();
         let mut gpu = OffscreenD3d::new(1000, 250).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default(),
+        )
+        .unwrap();
         assert_eq!(gpu.atlas.images.len() + gpu.atlas.dedicated.len(), 70, "every photo is somewhere");
         assert!(!gpu.atlas.dedicated.is_empty(), "the overflow took textures of its own");
     }
@@ -4940,13 +5102,16 @@ mod tests {
         }
         let runtime = Runtime::new();
         let root = icon_scene();
-        let display = runtime.display_frame(&root, Size { width: 120.0, height: 160.0 });
+        let display = runtime.display_frame(&root, Size { width: 120.0, height: 160.0 })
+            .unwrap();
         let engine = RawImages::default();
         let mut gpu = OffscreenD3d::new(240, 320).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         let first = gpu.atlas_footprint();
         assert!(first.0 >= 4, "four tinted tiles at least: {first:?}");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         assert_eq!(first, gpu.atlas_footprint(), "the tinted keys cache, never thrash");
     }
 

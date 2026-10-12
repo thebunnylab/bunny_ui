@@ -212,8 +212,8 @@ impl BaseLayer {
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
         cache: &MeasureCache,
-    ) -> bool {
-        if let Some(mosaic) = scene.mosaic(text, images, cache) {
+    ) -> Result<bool, RenderError> {
+        if let Some(mosaic) = scene.mosaic(text, images, cache)? {
             let bounds = scene.bounds();
             let physical = (
                 (bounds.2 - bounds.0) as usize,
@@ -238,23 +238,31 @@ impl BaseLayer {
                     self.backing = BaseBacking::Surface(mosaic.background);
                     msg_void(transaction, sel("commit"));
                 }
-                return true;
+                return Ok(true);
             }
         }
-        if let Some(surface) = software_patch::Surface::from_scene(scene, text, images, cache) {
-            unsafe {
-                self.size(size, scene.scale());
-                msg_void_id(self.raw, sel("setContents:"), surface.raw);
-            }
-            self.backing = BaseBacking::Surface(surface);
-            self.pieces.clear();
-            true
-        } else {
-            unsafe { self.paint(scene.raster(text, images), size, scene.scale()) }
-        }
+        Ok(
+            if let Some(surface) = software_patch::Surface::from_scene(scene, text, images, cache)?
+            {
+                unsafe {
+                    self.size(size, scene.scale());
+                    msg_void_id(self.raw, sel("setContents:"), surface.raw);
+                }
+                self.backing = BaseBacking::Surface(surface);
+                self.pieces.clear();
+                true
+            } else {
+                unsafe { self.paint(scene.raster(text, images)?, size, scene.scale()) }
+            },
+        )
     }
 
-    unsafe fn paint(&mut self, bitmap: Bitmap, size: Size, scale: usize) -> bool {
+    unsafe fn paint(
+        &mut self,
+        bitmap: Bitmap,
+        size: Size,
+        scale: usize,
+    ) -> bool {
         let Some(backing) = BaseBacking::new(bitmap) else {
             return false;
         };
@@ -289,22 +297,22 @@ struct SparseScene {
 }
 
 impl SparseScene {
-    fn new(
+    fn prepare_sparse(
         display: &DisplayList,
         physical: (usize, usize),
         scale: usize,
         text: &dyn TextEngine,
         boxes: &MeasureCache,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, RenderError> {
         use bunny_ui::layout::DrawCommand;
-        let background = display.as_slice().first()?;
+        let Some(background) = display.as_slice().first() else { return Ok(None) };
         let DrawCommand::FillRect {
             rect,
             color,
             corner_radius,
         } = background
         else {
-            return None;
+            return Ok(None);
         };
         if scale == 0
             || color.a != 255
@@ -314,7 +322,7 @@ impl SparseScene {
             || rect.size.width * scale as f64 != physical.0 as f64
             || rect.size.height * scale as f64 != physical.1 as f64
         {
-            return None;
+            return Ok(None);
         }
         let ink = if display.as_slice()[1..]
             .iter()
@@ -331,19 +339,25 @@ impl SparseScene {
                 PATCH_COMMANDS,
                 boxes,
                 text,
-            ) {
+            )? {
                 ListDamage::Same => None,
-                ListDamage::Rect(rect) => Some(software_patch::Scene::new(
-                    display, rect, scale, *color, text, boxes,
-                )?),
-                ListDamage::Whole => return None,
+                ListDamage::Rect(rect) => {
+                    let Some(scene) = software_patch::Scene::prepare_scene(
+                        display, rect, scale, *color, text, boxes,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    Some(scene)
+                }
+                ListDamage::Whole => return Ok(None),
             }
         };
-        Some(Self {
+        Ok(Some(Self {
             color: *color,
             ink,
             physical,
-        })
+        }))
     }
 }
 
@@ -381,8 +395,8 @@ impl NativePatch {
         physical: (usize, usize),
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) -> bool {
-        unsafe {
+    ) -> Result<bool, RenderError> {
+        Ok(unsafe {
             let surface = if self
                 .scene
                 .as_ref()
@@ -390,9 +404,9 @@ impl NativePatch {
             {
                 None
             } else {
-                let bitmap = scene.raster(text, images);
+                let bitmap = scene.raster(text, images)?;
                 let Some(surface) = self.backing.prepare(&bitmap) else {
-                    return false;
+                    return Ok(false);
                 };
                 Some(surface)
             };
@@ -411,7 +425,7 @@ impl NativePatch {
             msg_void(transaction, sel("commit"));
             self.scene = Some(scene);
             true
-        }
+        })
     }
 }
 
@@ -464,7 +478,7 @@ impl NativeUpdates {
         }
     }
 
-    fn present(&mut self, frame: scroll_bands::Frame<'_>) -> bool {
+    fn present(&mut self, frame: scroll_bands::Frame<'_>) -> Result<bool, RenderError> {
         let scroll_bands::Frame {
             root,
             display,
@@ -476,7 +490,7 @@ impl NativeUpdates {
             boxes,
         } = frame;
         if self.base.1 != physical || self.base.2 != scale || self.base.3 != canvas {
-            return false;
+            return Ok(false);
         }
         let damage = list_damage(
             self.base.0.as_slice(),
@@ -486,8 +500,8 @@ impl NativeUpdates {
             PATCH_COMMANDS,
             boxes,
             text,
-        );
-        match damage {
+        )?;
+        Ok(match damage {
             ListDamage::Same => {
                 if let Some(patch) = &self.patch {
                     unsafe { msg_void_bool(patch.layer, sel("setHidden:"), 1) };
@@ -497,27 +511,28 @@ impl NativeUpdates {
             }
             ListDamage::Rect(rect) => {
                 let Some(rect) = patch_box(rect, physical) else {
-                    return false;
+                    return Ok(false);
                 };
-                let Some(scene) =
-                    software_patch::Scene::new(display, rect, scale, canvas, text, boxes)
+                let Some(scene) = software_patch::Scene::prepare_scene(
+                    display, rect, scale, canvas, text, boxes,
+                )?
                 else {
-                    return false;
+                    return Ok(false);
                 };
                 if self.patch.is_none() {
                     self.patch = unsafe { NativePatch::new(root, scale) };
                 }
                 let Some(patch) = &mut self.patch else {
-                    return false;
+                    return Ok(false);
                 };
-                if !unsafe { patch.paint(scene, physical, text, images) } {
-                    return false;
+                if !unsafe { patch.paint(scene, physical, text, images)? } {
+                    return Ok(false);
                 }
                 self.current = (Rc::new(display.clone()), physical, scale, canvas);
                 true
             }
             ListDamage::Whole => false,
-        }
+        })
     }
 }
 
@@ -546,11 +561,11 @@ impl Native {
         scale: usize,
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) -> bool {
+    ) -> Result<bool, RenderError> {
         let ink = if let Some(paint) = scene.ink {
-            let bitmap = paint.raster(text, images);
+            let bitmap = paint.raster(text, images)?;
             let Some(mut layer) = (unsafe { BaseLayer::new(self.base.raw) }) else {
-                return false;
+                return Ok(false);
             };
             let frame = Patch::frame(paint.bounds(), scene.physical, scale);
             let patch_size = Size {
@@ -558,18 +573,21 @@ impl Native {
                 height: frame.size.height,
             };
             if !unsafe { layer.paint(bitmap, patch_size, scale) } {
-                return false;
+                return Ok(false);
             }
             unsafe { msg_void_rect(layer.raw, sel("setFrame:"), frame) };
             Some(layer)
         } else {
             None
         };
-        if !unsafe { self.base.paint(Bitmap::new(1, 1, scene.color), size, scale) } {
-            return false;
+        if !unsafe {
+            self.base
+                .paint(Bitmap::new(1, 1, scene.color), size, scale)
+        } {
+            return Ok(false);
         }
         self.ink = ink;
-        true
+        Ok(true)
     }
 }
 
@@ -689,26 +707,27 @@ impl Metal {
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
         live: bool,
-    ) {
+    ) -> Result<(), RenderError> {
         self.resize(size);
         if self.cover.is_none() {
             self.presenter
-                .present(display, size, scale, canvas, text, images, live);
-            return;
+                .present(display, size, scale, canvas, text, images, live)?;
+            return Ok(());
         }
         unsafe {
             let transaction = class("CATransaction");
             msg_void(transaction, sel("begin"));
             msg_void_bool(transaction, sel("setDisableActions:"), 1);
             self.presenter
-                .present(display, size, scale, canvas, text, images, true);
+                .present(display, size, scale, canvas, text, images, true)?;
             // A missing drawable is an aborted frame. Keep the old content
             // until a later present succeeds instead of uncovering black.
             if self.presenter.retained.is_some() {
                 self.cover.take();
             }
             msg_void(transaction, sel("commit"));
-        }
+        };
+        Ok(())
     }
 }
 
@@ -750,14 +769,18 @@ impl WindowPresenter {
     }
 
     /// Primes the window with its canvas without starting a GPU queue.
-    pub fn prime(&mut self, width: f64, height: f64, scale: usize) {
+    ///
+    /// # Errors
+    /// Returns a text error or atlas exhaustion if the frame cannot be prepared.
+    pub fn prime(&mut self, width: f64, height: f64, scale: usize) -> Result<(), RenderError> {
         match &mut self.strategy {
             Strategy::Native(native) => unsafe { native.base.size(Size { width, height }, scale) },
             Strategy::Metal(metal) => {
                 metal.resize(Size { width, height });
-                metal.presenter.prime(width, height, scale);
+                metal.presenter.prime(width, height, scale)?;
             }
         }
+        Ok(())
     }
 
     /// Presents the scene or promotes to the existing Metal renderer when
@@ -766,6 +789,9 @@ impl WindowPresenter {
         clippy::too_many_arguments,
         reason = "same presentation boundary as MetalPresenter"
     )]
+    ///
+    /// # Errors
+    /// Returns a text error or atlas exhaustion if the frame cannot be prepared.
     pub fn present(
         &mut self,
         display: &DisplayList,
@@ -775,10 +801,11 @@ impl WindowPresenter {
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
         live: bool,
-    ) {
-        let pool = unsafe { objc_autoreleasePoolPush() };
-        self.present_inner(display, size, scale, canvas, text, images, live);
-        unsafe { objc_autoreleasePoolPop(pool) };
+    ) -> Result<(), RenderError> {
+        let _pool = AutoreleasePool::new();
+        self.present_inner(display, size, scale, canvas, text, images, live)?;
+
+        Ok(())
     }
 
     #[allow(
@@ -794,20 +821,20 @@ impl WindowPresenter {
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
         live: bool,
-    ) {
+    ) -> Result<(), RenderError> {
         if let Strategy::Metal(metal) = &mut self.strategy {
-            metal.present(display, size, scale, canvas, text, images, live);
-            return;
+            metal.present(display, size, scale, canvas, text, images, live)?;
+            return Ok(());
         }
         let physical = (
             (size.width.round().max(0.0) as usize).saturating_mul(scale),
             (size.height.round().max(0.0) as usize).saturating_mul(scale),
         );
         if scale == 0 || physical.0 == 0 || physical.1 == 0 {
-            return;
+            return Ok(());
         }
         let Strategy::Native(native) = &mut self.strategy else {
-            return;
+            return Ok(());
         };
         let repeats = match &native.state {
             NativeState::Choosing => false,
@@ -826,7 +853,7 @@ impl WindowPresenter {
             NativeState::Software(prior) => frame_repeats(prior, display, physical, scale, canvas),
         };
         if repeats {
-            return;
+            return Ok(());
         }
         native.boxes.begin_frame();
         let bands = matches!(native.state, NativeState::Choosing)
@@ -837,42 +864,44 @@ impl WindowPresenter {
                 .is_some_and(|n| n <= MAX_BASE_PIXELS)
             && native
                 .bands
-                .seed(display, physical, scale, canvas, text, &native.boxes);
+                .seed(display, physical, scale, canvas, text, &native.boxes)?;
         // A proved empty viewport has no ink layer to cover later bands.
         // Keep the seeded partition while avoiding a full-window allocation
         // that an allocator could retain even after the first rows arrive.
         if bands
-            && let Some(scene) = SparseScene::new(display, physical, scale, text, &native.boxes)
+            && let Some(scene) =
+                SparseScene::prepare_sparse(display, physical, scale, text, &native.boxes)?
             && scene.ink.is_none()
-            && native.paint_sparse(scene, size, scale, text, images)
+            && native.paint_sparse(scene, size, scale, text, images)?
         {
             native.state = NativeState::Bands((Rc::new(display.clone()), physical, scale, canvas));
-            return;
-        }
-        if matches!(native.state, NativeState::Choosing)
-            && !live
-            && !bands
-            && let Some(scene) = SparseScene::new(display, physical, scale, text, &native.boxes)
-            && native.paint_sparse(scene, size, scale, text, images)
-        {
-            native.state = NativeState::Sparse((Rc::new(display.clone()), physical, scale, canvas));
-            return;
+            return Ok(());
         }
         if matches!(native.state, NativeState::Choosing)
             && !live
             && !bands
             && let Some(scene) =
-                software_patch::Scene::base(display, physical, scale, canvas, text, &native.boxes)
+                SparseScene::prepare_sparse(display, physical, scale, text, &native.boxes)?
+            && native.paint_sparse(scene, size, scale, text, images)?
+        {
+            native.state = NativeState::Sparse((Rc::new(display.clone()), physical, scale, canvas));
+            return Ok(());
+        }
+        if matches!(native.state, NativeState::Choosing)
+            && !live
+            && !bands
+            && let Some(scene) =
+                software_patch::Scene::base(display, physical, scale, canvas, text, &native.boxes)?
             && unsafe {
                 native
                     .base
-                    .paint_scene(&scene, size, text, images, &native.boxes)
+                    .paint_scene(&scene, size, text, images, &native.boxes)?
             }
         {
             native.state = NativeState::Patched(Box::new(NativeUpdates::new(
                 display, physical, scale, canvas,
             )));
-            return;
+            return Ok(());
         }
         if let NativeState::Patched(updates) = &mut native.state
             && !live
@@ -885,9 +914,9 @@ impl WindowPresenter {
                 text,
                 images,
                 boxes: &native.boxes,
-            })
+            })?
         {
-            return;
+            return Ok(());
         }
         let admitted = match &native.state {
             NativeState::Choosing => bands,
@@ -906,7 +935,7 @@ impl WindowPresenter {
                             text,
                             images,
                             boxes: &native.boxes,
-                        })
+                        })?
                     }
                 {
                     if !native.outside_checked {
@@ -915,15 +944,27 @@ impl WindowPresenter {
                         // the opaque viewport is successfully visible. Refusal
                         // keeps it; no allocation retry runs on every scroll.
                         native.outside_checked = true;
-                        if let Some(scene) = native.bands.outside().and_then(|outside| {
-                            SparseScene::new(outside, physical, scale, text, &native.boxes)
-                        }) {
-                            native.paint_sparse(scene, size, scale, text, images);
+                        if let Some(scene) = native
+                            .bands
+                            .outside()
+                            .map(|outside| {
+                                SparseScene::prepare_sparse(
+                                    outside,
+                                    physical,
+                                    scale,
+                                    text,
+                                    &native.boxes,
+                                )
+                            })
+                            .transpose()?
+                            .flatten()
+                        {
+                            native.paint_sparse(scene, size, scale, text, images)?;
                         }
                     }
                     native.state =
                         NativeState::Bands((Rc::new(display.clone()), physical, scale, canvas));
-                    return;
+                    return Ok(());
                 }
                 false
             }
@@ -932,14 +973,14 @@ impl WindowPresenter {
         };
         if admitted {
             let bitmap =
-                rasterize_with(display, physical.0, physical.1, scale, canvas, text, images);
+                rasterize_with(display, physical.0, physical.1, scale, canvas, text, images)?;
             if unsafe { native.base.paint(bitmap, size, scale) } {
                 let kept = (Rc::new(display.clone()), physical, scale, canvas);
                 native.state = match native.state {
                     NativeState::Software(_) => NativeState::Software(Some(kept)),
                     _ => NativeState::Bands(kept),
                 };
-                return;
+                return Ok(());
             }
         }
         let Some(metal) = (unsafe { Metal::attach(self.layer, scale as f64, size) }) else {
@@ -948,7 +989,7 @@ impl WindowPresenter {
             native.state = NativeState::Software(None);
             unsafe { native.bands.hide() };
             let bitmap =
-                rasterize_with(display, physical.0, physical.1, scale, canvas, text, images);
+                rasterize_with(display, physical.0, physical.1, scale, canvas, text, images)?;
             if unsafe { native.base.paint(bitmap, size, scale) } {
                 native.ink = None;
                 native.state = NativeState::Software(Some((
@@ -960,18 +1001,16 @@ impl WindowPresenter {
             } else {
                 eprintln!("bunny_ui: native fallback could not allocate its visible frame");
             }
-            return;
+            return Ok(());
         };
-        let prior = std::mem::replace(
-            &mut self.strategy,
-            Strategy::Metal(Box::new(metal)),
-        );
+        let prior = std::mem::replace(&mut self.strategy, Strategy::Metal(Box::new(metal)));
         if let Strategy::Metal(metal) = &mut self.strategy {
             if let Strategy::Native(native) = prior {
                 metal.cover = Some(native);
             }
-            metal.present(display, size, scale, canvas, text, images, live);
+            metal.present(display, size, scale, canvas, text, images, live)?;
         }
+        Ok(())
     }
 
     /// Offers idle GPU resources only after the Metal Strategy was needed.
@@ -1108,9 +1147,9 @@ mod tests {
                         } else {
                             EditCommand::Backspace
                         };
-                        assert!(runtime.key(edit).applied);
+                        assert!(runtime.key(edit).unwrap().applied);
                     }
-                    let display = runtime.display_frame(&editor, size);
+                    let display = runtime.display_frame(&editor, size).unwrap();
                     presenter.present(
                         &display,
                         size,
@@ -1119,7 +1158,8 @@ mod tests {
                         &*text,
                         &RawImages::default(),
                         false,
-                    );
+                        )
+                        .unwrap();
                     assert!(
                         matches!(presenter.strategy, Strategy::Native(_)),
                         "rows={rows}, scale={scale}, edit={step} must not allocate a Metal queue"
@@ -1180,7 +1220,8 @@ mod tests {
                     &PixelFont,
                     &RawImages::default(),
                     false,
-                );
+                )
+                    .unwrap();
                 let Strategy::Native(native) = &presenter.strategy else {
                     panic!("bounded scene remains native")
                 };
@@ -1243,7 +1284,8 @@ mod tests {
                     &PixelFont,
                     &RawImages::default(),
                     false,
-                );
+                )
+                    .unwrap();
             }
             assert!(matches!(presenter.strategy, Strategy::Native(_)));
             assert!(
@@ -1305,7 +1347,8 @@ mod tests {
                         &PixelFont,
                         &RawImages::default(),
                         false,
-                    );
+                    )
+                        .unwrap();
                     let Strategy::Native(native) = &presenter.strategy else {
                         panic!("small changes stay native")
                     };
@@ -1321,10 +1364,11 @@ mod tests {
                         &PixelFont,
                         &RawImages::default(),
                     )
+                    .unwrap()
                     .to_rgba_bytes();
                     if held.current.0.as_slice() != held.base.0.as_slice() {
                         let patch = held.patch.as_ref().unwrap().scene.as_ref().unwrap();
-                        let pixels = patch.raster(&PixelFont, &RawImages::default());
+                        let pixels = patch.raster(&PixelFont, &RawImages::default()).unwrap();
                         let bytes = pixels.to_rgba_bytes();
                         let bounds = patch.bounds();
                         for row in 0..pixels.height() {
@@ -1344,6 +1388,7 @@ mod tests {
                         &PixelFont,
                         &RawImages::default(),
                     )
+                    .unwrap()
                     .to_rgba_bytes();
                     assert_eq!(composed, expected, "scale={scale}, x={x}, word={word}");
                 }
@@ -1359,7 +1404,8 @@ mod tests {
                     &PixelFont,
                     &RawImages::default(),
                     false,
-                );
+                )
+                    .unwrap();
                 assert!(matches!(presenter.strategy, Strategy::Metal(_)));
                 drop(presenter);
                 // Detach the device before exercising the next native seed.
@@ -1484,7 +1530,7 @@ mod tests {
             let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
             for scale in [1, 2] {
                 let mut presenter = WindowPresenter::attach(layer, scale as f64).unwrap();
-                presenter.prime(180.0, 130.0, scale);
+                presenter.prime(180.0, 130.0, scale).unwrap();
                 assert!(
                     msg_id(layer, sel("device")).is_null(),
                     "the prime is native"
@@ -1501,7 +1547,8 @@ mod tests {
                         &PixelFont,
                         &RawImages::default(),
                         false,
-                    );
+                        )
+                        .unwrap();
                     assert!(
                         matches!(&presenter.strategy, Strategy::Native(n) if matches!(n.state, NativeState::Bands(_)))
                     );
@@ -1561,7 +1608,8 @@ mod tests {
                     &PixelFont,
                     &RawImages::default(),
                     false,
-                );
+                )
+                    .unwrap();
                 assert!(
                     msg_id(layer, sel("device")).is_null(),
                     "a bounded heading over an opaque background needs no GPU queue"
@@ -1576,7 +1624,8 @@ mod tests {
                 &PixelFont,
                 &RawImages::default(),
                 false,
-            );
+            )
+                .unwrap();
             assert!(
                 matches!(presenter.strategy, Strategy::Metal(_)),
                 "an unsupported update promotes once"
@@ -1618,7 +1667,8 @@ mod tests {
                     &PixelFont,
                     &RawImages::default(),
                     false,
-                );
+                )
+                    .unwrap();
                 let Strategy::Native(native) = &presenter.strategy else {
                     panic!("the empty viewport must stay native")
                 };
@@ -1681,7 +1731,7 @@ mod tests {
             };
             for count in 0..24 {
                 list.count.set(count);
-                let display = runtime.display_frame(&list, size);
+                let display = runtime.display_frame(&list, size).unwrap();
                 presenter.present(
                     &display,
                     size,
@@ -1690,14 +1740,15 @@ mod tests {
                     &*text,
                     &RawImages::default(),
                     false,
-                );
+                )
+                    .unwrap();
                 assert!(
                     msg_id(layer, sel("device")).is_null(),
                     "append {count} should use bounded new rows: {display:?}"
                 );
             }
             list.ink.set(Color::hex(0xff0000));
-            let display = runtime.display_frame(&list, size);
+            let display = runtime.display_frame(&list, size).unwrap();
             presenter.present(
                 &display,
                 size,
@@ -1706,7 +1757,8 @@ mod tests {
                 &*text,
                 &RawImages::default(),
                 false,
-            );
+                )
+                .unwrap();
             assert!(
                 matches!(presenter.strategy, Strategy::Metal(_)),
                 "repainting every row exceeds the CPU update budget"
@@ -1735,7 +1787,8 @@ mod tests {
                 &PixelFont,
                 &RawImages::default(),
                 false,
-            );
+            )
+                .unwrap();
             assert!(matches!(presenter.strategy, Strategy::Native(_)));
             let children = msg_id(root, sel("sublayers"));
             assert_eq!(
@@ -1751,7 +1804,8 @@ mod tests {
                 &PixelFont,
                 &RawImages::default(),
                 false,
-            );
+            )
+                .unwrap();
             let Strategy::Metal(metal) = &presenter.strategy else {
                 panic!("unsupported paint promotes")
             };
@@ -1769,7 +1823,8 @@ mod tests {
                     &PixelFont,
                     &RawImages::default(),
                     true,
-                );
+                )
+                    .unwrap();
                 let Strategy::Metal(metal) = &presenter.strategy else {
                     panic!("one-way promotion")
                 };
@@ -1812,7 +1867,8 @@ mod tests {
                 &PixelFont,
                 &images,
                 false,
-            );
+            )
+                .unwrap();
             assert!(matches!(presenter.strategy, Strategy::Native(_)));
             presenter.present(
                 &DisplayList::default(),
@@ -1822,7 +1878,8 @@ mod tests {
                 &PixelFont,
                 &images,
                 false,
-            );
+            )
+                .unwrap();
             assert!(matches!(presenter.strategy, Strategy::Metal(_)));
             assert!(!msg_id(layer, sel("device")).is_null());
             presenter.present(
@@ -1833,7 +1890,8 @@ mod tests {
                 &PixelFont,
                 &images,
                 false,
-            );
+            )
+                .unwrap();
             assert!(matches!(presenter.strategy, Strategy::Metal(_)));
             presenter.rest();
             drop(presenter);
@@ -1874,7 +1932,8 @@ mod tests {
                     &PixelFont,
                     &RawImages::default(),
                     false,
-                );
+                )
+                    .unwrap();
                 // Motion plus the changed presentation contract must not
                 // reuse an old viewport or old scale as a native band.
                 presenter.present(
@@ -1885,7 +1944,8 @@ mod tests {
                     &PixelFont,
                     &RawImages::default(),
                     live,
-                );
+                    )
+                    .unwrap();
                 assert!(matches!(presenter.strategy, Strategy::Metal(_)));
                 drop(presenter);
                 msg_void(layer, sel("release"));
@@ -1929,7 +1989,8 @@ mod tests {
                     &PixelFont,
                     &RawImages::default(),
                     false,
-                );
+                )
+                    .unwrap();
                 assert!(
                     metal.cover.is_some(),
                     "an aborted frame must not uncover black"
@@ -1945,7 +2006,8 @@ mod tests {
                     &PixelFont,
                     &RawImages::default(),
                     false,
-                );
+                )
+                    .unwrap();
                 assert!(metal.cover.is_none(), "a presented frame removes the cover");
                 assert!(metal.presenter.transactional);
                 // The handoff can still belong to an outer AppKit transaction.
@@ -1965,7 +2027,8 @@ mod tests {
                     &PixelFont,
                     &RawImages::default(),
                     false,
-                );
+                )
+                    .unwrap();
                 assert!(Rc::ptr_eq(
                     &prior,
                     &metal.presenter.retained.as_ref().unwrap().0

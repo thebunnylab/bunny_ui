@@ -54,7 +54,13 @@ pub fn run<V: View<Arity = Single>>(
             eprintln!("SCENE_STATE_ERROR no native viewport");
             return;
         };
-        let layout = observed.settled_layout(&copy, Proposal::exact(size));
+        let layout = match observed.settled_layout(&copy, Proposal::exact(size)) {
+            Ok(layout) => layout,
+            Err(error) => {
+                eprintln!("SCENE_STATE_ERROR layout: {error}");
+                return;
+            }
+        };
         let mut value = geometry(kind, &layout, &observed);
         value["content"] = content();
         println!("{marker} {} {value}", unix_ms());

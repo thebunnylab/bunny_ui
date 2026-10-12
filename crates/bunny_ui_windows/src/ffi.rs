@@ -3041,7 +3041,7 @@ pub fn create_window(
 /// the headless tests build windows on arbitrary test threads, where a
 /// swapchain would be dead weight wearing DXGI's cross-thread locks.
 pub fn install_gpu(window: &WindowHandle) {
-    let _ = crate::d3d::try_install(window.hwnd);
+    crate::native_event(crate::d3d::try_install(window.hwnd), false);
 }
 
 /// Shows the window after the first present (the anti-flash order).

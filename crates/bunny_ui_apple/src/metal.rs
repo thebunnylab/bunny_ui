@@ -39,7 +39,7 @@ use std::ptr::null_mut;
 use std::rc::Rc;
 
 use bunny_ui::gpu::walk::{
-    AtlasFull, AtlasGround, DrawRun, FrameBatches, GLASS_MAX_LEVEL, GlassInstance, RectInstance,
+    RenderError, AtlasGround, DrawRun, FrameBatches, GLASS_MAX_LEVEL, GlassInstance, RectInstance,
     RoundClip, RunAtlas, RunKind, SpriteInstance, build_frame, ATLAS_KEEP_WALKS,
 };
 use bunny_ui::image_engine::ImageEngine;
@@ -59,6 +59,21 @@ mod scroll_bands;
 mod window;
 #[cfg(target_os = "macos")]
 pub use window::WindowPresenter;
+
+/// Balances the thread-local native pool on success and every early error.
+struct AutoreleasePool(*mut c_void);
+impl AutoreleasePool {
+    fn new() -> Self {
+        // SAFETY: the guard cannot move between threads and drains in this scope.
+        Self(unsafe { objc_autoreleasePoolPush() })
+    }
+}
+impl Drop for AutoreleasePool {
+    fn drop(&mut self) {
+        // SAFETY: this guard owns the pool pushed on this thread.
+        unsafe { objc_autoreleasePoolPop(self.0) };
+    }
+}
 
 // MARK: - FFI border
 
@@ -921,9 +936,8 @@ impl MetalStack {
     fn create(format: u64) -> Option<MetalStack> {
         unsafe {
             let device = default_device()?;
-            let pool = objc_autoreleasePoolPush();
+            let _pool = AutoreleasePool::new();
             let result = Self::build(device, format);
-            objc_autoreleasePoolPop(pool);
             if let Err(reason) = &result {
                 eprintln!("bunny_ui metal: {reason} — presenting by cpu");
             }
@@ -2543,7 +2557,7 @@ impl MetalPresenter {
         physical: (usize, usize),
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) {
+    ) -> Result<(), RenderError> {
         self.ground.clear_native();
         for attempt in 0..4 {
             match build_frame(
@@ -2556,13 +2570,19 @@ impl MetalPresenter {
                 &mut self.atlas,
                 &mut self.batches,
             ) {
-                Ok(()) => return,
-                Err(AtlasFull) => {
+                Ok(()) => return Ok(()),
+                Err(RenderError::Text(error)) => {
+                    self.drain_slots();
+                    self.atlas.reset(&mut self.ground, false);
+                    self.ground.pending.clear();
+                    return Err(RenderError::Text(error));
+                },
+                Err(RenderError::AtlasFull) => {
                     if attempt == 3 {
-                        // pathological frame: keep the rects, drop the
-                        // rest of the text — never a crash
-                        eprintln!("bunny_ui metal: atlas overflow survived three resets");
-                        return;
+                        self.drain_slots();
+                        self.atlas.reset(&mut self.ground, false);
+                        self.ground.pending.clear();
+                        return Err(RenderError::AtlasFull);
                     }
                     // the cheap road first: shelves nobody read for a while
                     // are given back with no drain and no re-raster of what
@@ -2571,7 +2591,10 @@ impl MetalPresenter {
                     if attempt == 0 {
                         let freed = self.atlas.evict_stale(ATLAS_KEEP_WALKS);
                         if freed > 0 {
-                            crate::trace::mark("X", format_args!("what=atlas-evict shelves={freed}"));
+                            crate::trace::mark(
+                                "X",
+                                format_args!("what=atlas-evict shelves={freed}"),
+                            );
                             continue;
                         }
                     }
@@ -2581,6 +2604,7 @@ impl MetalPresenter {
                 }
             }
         }
+        Err(RenderError::AtlasFull)
     }
 
     /// One frame: walk the list, upload, resize the drawable if the
@@ -2591,6 +2615,9 @@ impl MetalPresenter {
     /// resized by the hand right now (a live resize on the Mac) — the
     /// frame then presents inside the transaction. A platform whose
     /// surface never resizes under a drag passes `false`.
+    ///
+    /// # Errors
+    /// Returns a text error or atlas exhaustion if the frame cannot be prepared.
     pub fn present(
         &mut self,
         display: &DisplayList,
@@ -2600,9 +2627,9 @@ impl MetalPresenter {
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
         live: bool,
-    ) {
+    ) -> Result<(), RenderError> {
         unsafe {
-            let pool = objc_autoreleasePoolPush();
+            let _pool = AutoreleasePool::new();
             let physical = (
                 (size.width.round().max(0.0) as usize) * scale,
                 (size.height.round().max(0.0) as usize) * scale,
@@ -2610,14 +2637,12 @@ impl MetalPresenter {
             self.drawable_wait_ms = 0.0;
             if physical.0 == 0 || physical.1 == 0 {
                 // a zero drawable is an abort, not a frame
-                objc_autoreleasePoolPop(pool);
-                return;
+                return Ok(());
             }
             if frame_repeats(&self.retained, display, physical, scale, canvas) {
                 // the caret blink and friends land here every half
                 // second — nothing changed, nothing encodes
-                objc_autoreleasePoolPop(pool);
-                return;
+                return Ok(());
             }
             self.boxes.begin_frame();
             #[cfg(target_os = "macos")]
@@ -2625,21 +2650,41 @@ impl MetalPresenter {
             #[cfg(not(target_os = "macos"))]
             let rows_active = false;
             #[cfg(target_os = "macos")]
-            if !live && physical == self.physical && scale == self.scale
+            if !live
+                && physical == self.physical
+                && scale == self.scale
                 && self.base.as_ref().is_some_and(|(_, _, _, c)| *c == canvas)
                 && !self.patches.iter().any(|p| p.shown.is_some())
-                && self.scroll_bands.present(scroll_bands::Frame { root: self.layer, display, physical, scale, canvas, text, images, boxes: &self.boxes })
+                && self.scroll_bands.present(scroll_bands::Frame {
+                    root: self.layer,
+                    display,
+                    physical,
+                    scale,
+                    canvas,
+                    text,
+                    images,
+                    boxes: &self.boxes,
+                })?
             {
                 self.retained = Some((Rc::new(display.clone()), physical, scale, canvas));
-                if !self.resting { self.rest(); } else { self.offer_drawables(); }
-                objc_autoreleasePoolPop(pool);
-                return;
+                if !self.resting {
+                    self.rest();
+                } else {
+                    self.offer_drawables();
+                }
+                return Ok(());
             }
             // what the frame changes against the window's own layer — a
             // live resize is always whole
-            let plan = if live || rows_active { Plan::Whole } else { self.plan(display, physical, scale, canvas, text) };
+            let plan = if live || rows_active {
+                Plan::Whole
+            } else {
+                self.plan(display, physical, scale, canvas, text)?
+            };
             #[cfg(target_os = "macos")]
-            if plan != Plan::Whole { self.scroll_bands.discard_trial(); }
+            if plan != Plan::Whole {
+                self.scroll_bands.discard_trial();
+            }
             if plan == Plan::Same {
                 // the window's layer already shows this frame (a stroke
                 // undone, a hover gone): the patch over it steps aside
@@ -2654,15 +2699,16 @@ impl MetalPresenter {
                     msg_void(transaction, sel("commit"));
                 }
                 self.retained = self.base.clone();
-                objc_autoreleasePoolPop(pool);
-                return;
+                return Ok(());
             }
             // a frame that comes back over the same base: the patch that
             // holds its box shows again, the other steps aside — one
             // transaction, nothing walked, nothing encoded
             if let Plan::Patch(rect) = plan
                 && let Some(again) = self.patches.iter().position(|patch| {
-                    patch.held.as_ref().is_some_and(|(held, box_)| *box_ == rect && held.as_slice() == display.as_slice())
+                    patch.held.as_ref().is_some_and(|(held, box_)| {
+                        *box_ == rect && held.as_slice() == display.as_slice()
+                    })
                 })
             {
                 self.previous = self.patch_on_screen();
@@ -2671,7 +2717,11 @@ impl MetalPresenter {
                 for (at, patch) in self.patches.iter_mut().enumerate() {
                     if at == again {
                         if patch.shown != Some(rect) {
-                            msg_void_rect(patch.layer, sel("setFrame:"), Patch::frame(rect, physical, scale));
+                            msg_void_rect(
+                                patch.layer,
+                                sel("setFrame:"),
+                                Patch::frame(rect, physical, scale),
+                            );
                             msg_void_bool(patch.layer, sel("setHidden:"), 0);
                             patch.shown = Some(rect);
                         }
@@ -2680,19 +2730,30 @@ impl MetalPresenter {
                     }
                 }
                 msg_void(transaction, sel("commit"));
-                let held = self.patches[again].held.as_ref().map(|(held, _)| held.clone());
+                let held = self.patches[again]
+                    .held
+                    .as_ref()
+                    .map(|(held, _)| held.clone());
                 self.retained = held.map(|held| (held, physical, scale, canvas));
-                crate::trace::mark("Q", format_args!("box={},{},{},{} again", rect.0, rect.1, rect.2, rect.3));
-                objc_autoreleasePoolPop(pool);
-                return;
+                crate::trace::mark(
+                    "Q",
+                    format_args!("box={},{},{},{} again", rect.0, rect.1, rect.2, rect.3),
+                );
+                return Ok(());
             }
             #[cfg(target_os = "macos")]
             if let Plan::Patch(rect) = plan
-                && let Some(scene) = software_patch::Scene::new(display, rect, scale, canvas, text, &self.boxes)
-                && self.present_software_patch(scene, display, physical, text, images)
+                && let Some(scene) = software_patch::Scene::prepare_scene(
+                    display,
+                    rect,
+                    scale,
+                    canvas,
+                    text,
+                    &self.boxes,
+                )?
+                && self.present_software_patch(scene, display, physical, text, images)?
             {
-                objc_autoreleasePoolPop(pool);
-                return;
+                return Ok(());
             }
             if !self.ground.wake() {
                 // the system took the atlas while the window rested: its
@@ -2722,7 +2783,7 @@ impl MetalPresenter {
             // buffer, which is free only once its last frame completed
             let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
             self.ground.begin_slot(index);
-            self.build_with_retries(display, scale, physical, text, images);
+            self.build_with_retries(display, scale, physical, text, images)?;
             if let Plan::Patch(rect) = plan {
                 // glass reads the whole scene, so a frame that carries a
                 // pane repaints whole (the diff refuses one already)
@@ -2730,8 +2791,7 @@ impl MetalPresenter {
                     let held = Rc::new(display.clone());
                     if self.present_patch(index, rect, canvas, physical, scale, &held) {
                         self.retained = Some((held, physical, scale, canvas));
-                        objc_autoreleasePoolPop(pool);
-                        return;
+                                return Ok(());
                     }
                 }
             }
@@ -2754,8 +2814,7 @@ impl MetalPresenter {
             let drawable = msg_id(self.layer, self.stack.sels.next_drawable);
             self.drawable_wait_ms = crate::trace::clock_ms() - asked;
             if drawable.is_null() {
-                objc_autoreleasePoolPop(pool);
-                return;
+                return Ok(());
             }
             let drawable_texture = msg_id(drawable, self.stack.sels.texture);
             self.resting = false;
@@ -2765,7 +2824,9 @@ impl MetalPresenter {
             // over at the end. A frame without glass never asks for
             // one, and never pays for one
             self.ensure_glass(physical);
-            let pyramid = (!self.batches.glass.is_empty()).then_some(()).and(self.glass.as_ref());
+            let pyramid = (!self.batches.glass.is_empty())
+                .then_some(())
+                .and(self.glass.as_ref());
             let (target, present_to) = match pyramid {
                 Some(textures) => (textures.scene, drawable_texture),
                 None => (drawable_texture, null_mut()),
@@ -2802,7 +2863,9 @@ impl MetalPresenter {
                 msg_void(transaction, sel("begin"));
                 msg_void(drawable, self.stack.sels.present);
                 #[cfg(target_os = "macos")]
-                if rows_active { self.scroll_bands.hide(); }
+                if rows_active {
+                    self.scroll_bands.hide();
+                }
                 for patch in &mut self.patches {
                     patch.hide();
                 }
@@ -2818,14 +2881,16 @@ impl MetalPresenter {
             for patch in &mut self.patches {
                 patch.held = None;
                 #[cfg(target_os = "macos")]
-                { patch.software_scene = None; }
+                {
+                    patch.software_scene = None;
+                }
             }
             self.previous = None;
             let kept = (Rc::new(display.clone()), physical, scale, canvas);
             self.base = Some(kept.clone());
             self.retained = Some(kept);
-            objc_autoreleasePoolPop(pool);
         }
+        Ok(())
     }
 
     /// The frame a shown patch holds — what the screen shows over the base.
@@ -2847,26 +2912,30 @@ impl MetalPresenter {
         scale: usize,
         canvas: Color,
         text: &dyn TextEngine,
-    ) -> Plan {
+    ) -> Result<Plan, RenderError> {
         let Some((base, base_physical, base_scale, base_canvas)) = &self.base else {
-            return Plan::Whole;
+            return Ok(Plan::Whole);
         };
         if *base_physical != physical || *base_scale != scale || *base_canvas != canvas {
-            return Plan::Whole;
+            return Ok(Plan::Whole);
         }
-        match list_damage(
-            base.as_slice(),
-            display.as_slice(),
-            scale,
-            physical,
-            PATCH_COMMANDS,
-            &self.boxes,
-            text,
-        ) {
-            ListDamage::Same => Plan::Same,
-            ListDamage::Whole => Plan::Whole,
-            ListDamage::Rect(damage) => patch_box(damage, physical).map_or(Plan::Whole, Plan::Patch),
-        }
+        Ok(
+            match list_damage(
+                base.as_slice(),
+                display.as_slice(),
+                scale,
+                physical,
+                PATCH_COMMANDS,
+                &self.boxes,
+                text,
+            )? {
+                ListDamage::Same => Plan::Same,
+                ListDamage::Whole => Plan::Whole,
+                ListDamage::Rect(damage) => {
+                    patch_box(damage, physical).map_or(Plan::Whole, Plan::Patch)
+                }
+            },
+        )
     }
 
     /// Keep at most two patches per strategy: one on screen and one
@@ -2895,14 +2964,18 @@ impl MetalPresenter {
         physical: (usize, usize),
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) -> bool {
-        unsafe {
+    ) -> Result<bool, RenderError> {
+        Ok(unsafe {
             let rect = scene.bounds();
             let scale = scene.scale();
             let canvas = scene.canvas();
             if let Some(same) = self.patches.iter().position(|patch| {
-                patch.shown == Some(rect) && patch.held.is_some()
-                    && patch.software_scene.as_ref().is_some_and(|held| held.matches(&scene))
+                patch.shown == Some(rect)
+                    && patch.held.is_some()
+                    && patch
+                        .software_scene
+                        .as_ref()
+                        .is_some_and(|held| held.matches(&scene))
             }) {
                 // Logical geometry changed, but no physical pixel did. Keep
                 // the visible surface untouched and advance the frame witness.
@@ -2910,12 +2983,19 @@ impl MetalPresenter {
                 let held = Rc::new(display.clone());
                 self.patches[same].held = Some((held.clone(), rect));
                 self.retained = Some((held, physical, scale, canvas));
-                crate::trace::mark("Q", format_args!("box={},{},{},{} unchanged", rect.0, rect.1, rect.2, rect.3));
-                return true;
+                crate::trace::mark(
+                    "Q",
+                    format_args!("box={},{},{},{} unchanged", rect.0, rect.1, rect.2, rect.3),
+                );
+                return Ok(true);
             }
-            let bitmap = scene.raster(text, images);
-            let Some(target) = self.patch_target(display, scale, PatchKind::Software) else { return false; };
-            let Some(surface) = self.patches[target].software.prepare(&bitmap) else { return false; };
+            let bitmap = scene.raster(text, images)?;
+            let Some(target) = self.patch_target(display, scale, PatchKind::Software) else {
+                return Ok(false);
+            };
+            let Some(surface) = self.patches[target].software.prepare(&bitmap) else {
+                return Ok(false);
+            };
             self.previous = self.patch_on_screen();
             let held = Rc::new(display.clone());
             let transaction = class("CATransaction");
@@ -2923,7 +3003,11 @@ impl MetalPresenter {
             for (index, patch) in self.patches.iter_mut().enumerate() {
                 if index == target {
                     msg_void_f64(patch.layer, sel("setContentsScale:"), scale as f64);
-                    msg_void_rect(patch.layer, sel("setFrame:"), Patch::frame(rect, physical, scale));
+                    msg_void_rect(
+                        patch.layer,
+                        sel("setFrame:"),
+                        Patch::frame(rect, physical, scale),
+                    );
                     msg_void_id(patch.layer, sel("setContents:"), surface);
                     msg_void_bool(patch.layer, sel("setHidden:"), 0);
                     patch.scale = scale;
@@ -2937,9 +3021,12 @@ impl MetalPresenter {
             msg_void(transaction, sel("commit"));
             self.patches[target].software_scene = Some(scene);
             self.retained = Some((held, physical, scale, canvas));
-            crate::trace::mark("Q", format_args!("box={},{},{},{} software", rect.0, rect.1, rect.2, rect.3));
+            crate::trace::mark(
+                "Q",
+                format_args!("box={},{},{},{} software", rect.0, rect.1, rect.2, rect.3),
+            );
             true
-        }
+        })
     }
 
     /// Presents `rect` of the frame just walked into slot `index`
@@ -3144,7 +3231,10 @@ impl MetalPresenter {
     /// The anti-flash frame: one clear at the size the surface will
     /// show, BEFORE it shows. A virgin `CAMetalLayer` flashes black on
     /// its first appearance otherwise.
-    pub fn prime(&mut self, width: f64, height: f64, scale: usize) {
+    ///
+    /// # Errors
+    /// Returns a text error or atlas exhaustion if the frame cannot be prepared.
+    pub fn prime(&mut self, width: f64, height: f64, scale: usize) -> Result<(), RenderError> {
         self.present(
             &DisplayList::default(),
             Size { width, height },
@@ -3153,7 +3243,9 @@ impl MetalPresenter {
             &bunny_ui::text_engine::PixelFont,
             &bunny_ui::image_engine::RawImages::default(),
             false,
-        );
+        )?;
+
+        Ok(())
     }
 }
 
@@ -3204,7 +3296,13 @@ impl OffscreenGpu {
 
     /// Walks the frame into the batches, resetting the atlas on overflow
     /// as the window does.
-    fn walk(&mut self, display: &DisplayList, scale: usize, text: &dyn TextEngine, images: &dyn ImageEngine) {
+    fn walk(
+        &mut self,
+        display: &DisplayList,
+        scale: usize,
+        text: &dyn TextEngine,
+        images: &dyn ImageEngine,
+    ) -> Result<(), RenderError> {
         self.ground.clear_native();
         for attempt in 0..4 {
             match build_frame(
@@ -3217,17 +3315,26 @@ impl OffscreenGpu {
                 &mut self.atlas,
                 &mut self.batches,
             ) {
-                Ok(()) => break,
-                Err(AtlasFull) => {
+                Ok(()) => return Ok(()),
+                Err(RenderError::Text(error)) => {
+                    self.drain();
+                    self.atlas.reset(&mut self.ground, false);
+                    self.ground.pending.clear();
+                    return Err(RenderError::Text(error));
+                },
+                Err(RenderError::AtlasFull) => {
                     if attempt == 3 {
-                        eprintln!("bunny_ui metal: atlas overflow survived three resets");
-                        break;
+                        self.drain();
+                        self.atlas.reset(&mut self.ground, false);
+                        self.ground.pending.clear();
+                        return Err(RenderError::AtlasFull);
                     }
                     self.drain();
                     self.atlas.reset(&mut self.ground, true);
                 }
             }
         }
+        Err(RenderError::AtlasFull)
     }
 
     fn drain(&mut self) {
@@ -3251,13 +3358,13 @@ impl OffscreenGpu {
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
         wait: bool,
-    ) {
+    ) -> Result<(), RenderError> {
         unsafe {
-            let pool = objc_autoreleasePoolPush();
+            let _pool = AutoreleasePool::new();
             // the slot first, as the window does: the feeds stage into it
             let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
             self.ground.begin_slot(index);
-            self.walk(display, scale, text, images);
+            self.walk(display, scale, text, images)?;
             let (sprite_offset, glass_offset) = upload_frame(
                 &mut self.slots[index],
                 self.stack.device,
@@ -3274,7 +3381,9 @@ impl OffscreenGpu {
                     false,
                 );
             }
-            let pyramid = (!self.batches.glass.is_empty()).then_some(()).and(self.glass.as_ref());
+            let pyramid = (!self.batches.glass.is_empty())
+                .then_some(())
+                .and(self.glass.as_ref());
             self.slots[index].native = self.ground.native.values().cloned().collect();
             let textures = self.ground.bound(&self.batches.textures);
             let command = self.stack.encode_frame(EncodeFrame {
@@ -3299,13 +3408,16 @@ impl OffscreenGpu {
             if wait {
                 msg_void(command, self.stack.sels.wait_completed);
             }
-            objc_autoreleasePoolPop(pool);
-        }
+        };
+        Ok(())
     }
 
     /// Renders and WAITS — determinism for tests and honest numbers for
     /// the bench (walk + upload + encode + commit + GPU time, nothing
     /// hidden).
+    ///
+    /// # Errors
+    /// Returns a text error or atlas exhaustion if the frame cannot be prepared.
     pub fn present_wait(
         &mut self,
         display: &DisplayList,
@@ -3313,13 +3425,18 @@ impl OffscreenGpu {
         canvas: Color,
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) {
-        self.present_inner(display, scale, canvas, text, images, true);
+    ) -> Result<(), RenderError> {
+        self.present_inner(display, scale, canvas, text, images, true)?;
+
+        Ok(())
     }
 
     /// Renders and RETURNS after the commit — the CPU-side cost of a
     /// production present (a window commits and moves on; the ring keeps
     /// the in-flight frames safe).
+    ///
+    /// # Errors
+    /// Returns a text error or atlas exhaustion if the frame cannot be prepared.
     pub fn present_nowait(
         &mut self,
         display: &DisplayList,
@@ -3327,8 +3444,10 @@ impl OffscreenGpu {
         canvas: Color,
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) {
-        self.present_inner(display, scale, canvas, text, images, false);
+    ) -> Result<(), RenderError> {
+        self.present_inner(display, scale, canvas, text, images, false)?;
+
+        Ok(())
     }
 
     /// The atlas footprint — how many cached runs, images and dedicated
@@ -3349,6 +3468,9 @@ impl OffscreenGpu {
     /// `display` into a target of the box's own size — the patch a
     /// window presents over its last whole frame — and returns its RGBA
     /// bytes, row by row.
+    ///
+    /// # Errors
+    /// Returns a text error or atlas exhaustion if the frame cannot be prepared.
     pub fn patch_rgba(
         &mut self,
         display: &DisplayList,
@@ -3357,13 +3479,13 @@ impl OffscreenGpu {
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
         rect: (usize, usize, usize, usize),
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, RenderError> {
         let (width, height) = (rect.2 - rect.0, rect.3 - rect.1);
-        unsafe {
-            let pool = objc_autoreleasePoolPush();
+        Ok(unsafe {
+            let _pool = AutoreleasePool::new();
             let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
             self.ground.begin_slot(index);
-            self.walk(display, scale, text, images);
+            self.walk(display, scale, text, images)?;
             let (sprite_offset, glass_offset) = upload_frame(
                 &mut self.slots[index],
                 self.stack.device,
@@ -3395,9 +3517,8 @@ impl OffscreenGpu {
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
             let bytes = read_target(target, width, height, &self.stack.sels);
             msg_void(target, self.stack.sels.release);
-            objc_autoreleasePoolPop(pool);
             bytes
-        }
+        })
     }
 }
 
@@ -3405,7 +3526,7 @@ impl OffscreenGpu {
 /// Apple-Silicon premise of the module).
 unsafe fn readable_target(device: Id, width: usize, height: usize) -> Option<Id> {
     unsafe {
-        let pool = objc_autoreleasePoolPush();
+        let _pool = AutoreleasePool::new();
         let descriptor = msg_id_u64_u64_u64_bool(
             class("MTLTextureDescriptor"),
             sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
@@ -3421,7 +3542,6 @@ unsafe fn readable_target(device: Id, width: usize, height: usize) -> Option<Id>
         );
         msg_void_u64(descriptor, sel("setStorageMode:"), STORAGE_MODE_SHARED);
         let target = msg_id_arg(device, sel("newTextureWithDescriptor:"), descriptor);
-        objc_autoreleasePoolPop(pool);
         (!target.is_null()).then_some(target)
     }
 }
@@ -3465,6 +3585,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rejected_text_does_not_cache_an_unsubmitted_live_generation() {
+        use bunny_ui::image_engine::FeedKey;
+        use bunny_ui::layout::DrawCommand;
+        use bunny_ui::text_engine::{FontSpec, LineMetrics, PixelFont, TextRaster};
+        use bunny_ui::text_error::TextError;
+        use bunny_ui::text_source::{ParagraphLine, TextContent};
+        use std::cell::Cell;
+
+        struct RefusingText(Cell<bool>);
+        impl TextEngine for RefusingText {
+            fn measure_line(&self, text: &str, font: &FontSpec) -> LineMetrics {
+                PixelFont.measure_line(text, font)
+            }
+            fn raster_line(&self, text: &str, font: &FontSpec, color: Color, scale: usize) -> Option<TextRaster> {
+                PixelFont.raster_line(text, font, color, scale)
+            }
+            fn raster_paragraph_line(&self, line: &ParagraphLine, font: &FontSpec, color: Color, scale: usize) -> Result<Option<TextRaster>, TextError> {
+                if self.0.get() {
+                    return Err(TextError::Rasterization { engine: "test", operation: "text after live image" });
+                }
+                Ok(PixelFont.raster_line(line.text(), font, color, scale))
+            }
+        }
+        if !device_present() { return; }
+        let engine = RefusingText(Cell::new(false));
+        let images = RawImages::default();
+        let frame = |generation, text: &str, rgba: [u8; 4]| DisplayList::from(vec![
+            DrawCommand::Image {
+                rect: Rect { origin: Point { x: 0.0, y: 0.0 }, size: Size { width: 20.0, height: 20.0 } },
+                source: ImageSource::feed(FeedKey::new(0xFA11), generation, (2, 2), rgba.repeat(4)),
+            },
+            DrawCommand::TextLine {
+                origin: Point { x: 3.0, y: 27.0 }, content: TextContent::from(text),
+                range: (0, text.len()), font: FontSpec::DEFAULT, color: Color::BLACK,
+            },
+        ]);
+        let mut gpu = OffscreenGpu::new(180, 60).expect("offscreen Metal");
+        gpu.present_wait(&frame(1, "before", [255, 0, 0, 255]), 1, Color::WHITE, &engine, &images).unwrap();
+        let before = gpu.read_rgba();
+        let next = frame(2, "after", [0, 0, 255, 255]);
+        engine.0.set(true);
+        assert!(matches!(gpu.present_wait(&next, 1, Color::WHITE, &engine, &images), Err(RenderError::Text(_))));
+        assert_eq!(gpu.read_rgba(), before, "a refused frame does not publish");
+        assert!(gpu.ground.pending.is_empty(), "unsubmitted live writes are discarded");
+        engine.0.set(false);
+        gpu.present_wait(&next, 1, Color::WHITE, &engine, &images).unwrap();
+        let expected = rasterize_with(&next, 180, 60, 1, Color::WHITE, &engine, &images).unwrap().to_rgba_bytes();
+        assert_close(&gpu.read_rgba(), &expected, 2, "live generation after text refusal");
+    }
+
     /// Renders the same scene by both backends: the GPU offscreen target
     /// and the CPU raster oracle, byte-comparable RGBA out of each.
     fn scene_bytes(
@@ -3478,11 +3649,14 @@ mod tests {
             (logical.height.round() as usize) * scale,
         );
         let runtime = Runtime::new();
-        let display = runtime.display_frame(root, logical);
-        let cpu = rasterize_with(&display, physical.0, physical.1, scale, canvas, &PixelFont, &RawImages::default())
+        let display = runtime.display_frame(root, logical).unwrap();
+        let cpu = rasterize_with(&display, physical.0, physical.1, scale, canvas, &PixelFont, &RawImages::default(),
+        )
+        .unwrap()
             .to_rgba_bytes();
         let mut gpu = OffscreenGpu::new(physical.0, physical.1).expect("offscreen gpu");
-        gpu.present_wait(&display, scale, canvas, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, scale, canvas, &PixelFont, &RawImages::default())
+            .unwrap();
         (gpu.read_rgba(), cpu)
     }
 
@@ -3569,18 +3743,25 @@ mod tests {
         for (from, to) in pairs {
             let old = patch_scene(from.0, from.1, from.2);
             let new = patch_scene(to.0, to.1, to.2);
-            gpu.present_wait(&new, scale, Color::CANVAS, &PixelFont, &RawImages::default());
+            gpu.present_wait(&new, scale, Color::CANVAS, &PixelFont, &RawImages::default())
+            .unwrap();
             let whole = gpu.read_rgba();
-            gpu.present_wait(&old, scale, Color::CANVAS, &PixelFont, &RawImages::default());
+            gpu.present_wait(&old, scale, Color::CANVAS, &PixelFont, &RawImages::default(),
+            )
+            .unwrap();
             let base = gpu.read_rgba();
             let ListDamage::Rect(damage) =
-                list_damage(old.as_slice(), new.as_slice(), scale, physical, 64, &cache, &PixelFont)
+                list_damage(old.as_slice(), new.as_slice(), scale, physical, 64, &cache, &PixelFont,
+            )
+            .unwrap()
             else {
                 panic!("{from:?} -> {to:?} boxes");
             };
             for rect in [damage, snap_patch(damage, physical).expect("on the window")] {
                 let rect = (rect.0 as usize, rect.1 as usize, rect.2 as usize, rect.3 as usize);
-                let patch = gpu.patch_rgba(&new, scale, Color::CANVAS, &PixelFont, &RawImages::default(), rect);
+                let patch = gpu.patch_rgba(&new, scale, Color::CANVAS, &PixelFont, &RawImages::default(), rect,
+                    )
+                    .unwrap();
                 let row = (rect.2 - rect.0) * 4;
                 let mut composed = base.clone();
                 for y in rect.1..rect.3 {
@@ -3614,14 +3795,19 @@ mod tests {
                 }).collect::<Vec<_>>());
             let physical = (160 * scale, 100 * scale);
             let mut gpu = OffscreenGpu::new(physical.0, physical.1).expect("offscreen GPU");
-            gpu.present_wait(&display, scale, Color::CANVAS, &text, &RawImages::default());
+            gpu.present_wait(&display, scale, Color::CANVAS, &text, &RawImages::default())
+                .unwrap();
             let gpu = gpu.read_rgba();
-            let full = rasterize_with(&display, physical.0, physical.1, scale, Color::CANVAS, &text, &RawImages::default());
+            let full = rasterize_with(&display, physical.0, physical.1, scale, Color::CANVAS, &text, &RawImages::default(),
+            )
+            .unwrap();
             for logical in [(0, 0, 64, 64), (64, 0, 128, 64), (0, 64, 160, 100)] {
                 let s = scale as i64;
                 let rect = (logical.0*s, logical.1*s, logical.2*s, logical.3*s);
-                let scene = software_patch::Scene::new(&display, rect, scale, Color::CANVAS, &text, &MeasureCache::default()).expect("bounded simple scene");
-                let patch = scene.raster(&text, &RawImages::default());
+                let scene = software_patch::Scene::prepare_scene(&display, rect, scale, Color::CANVAS, &text, &MeasureCache::default(),
+                )
+                .unwrap().expect("bounded simple scene");
+                let patch = scene.raster(&text, &RawImages::default()).unwrap();
                 let mut gpu_crop = Vec::new();
                 for y in rect.1..rect.3 {
                     for x in rect.0..rect.2 {
@@ -3649,8 +3835,10 @@ mod tests {
         for scale in [1, 2] {
             let physical = (160 * scale, 100 * scale);
             let mut gpu = OffscreenGpu::new(physical.0, physical.1).expect("offscreen GPU");
-            gpu.present_wait(&display, scale, Color::CANVAS, &text, &RawImages::default());
-            let cpu = rasterize_with(&display, physical.0, physical.1, scale, Color::CANVAS, &text, &RawImages::default());
+            gpu.present_wait(&display, scale, Color::CANVAS, &text, &RawImages::default())
+                .unwrap();
+            let cpu = rasterize_with(&display, physical.0, physical.1, scale, Color::CANVAS, &text, &RawImages::default())
+            .unwrap();
             // An integer texel edge times a reciprocal just below one
             // selected the previous column. Menlo at scale 1 exposed a
             // 184-level error, while the older scale-2 scene passed.
@@ -3700,7 +3888,8 @@ mod tests {
         // either alias corrupts the readback loudly
         let canvas = Color::hex(0x18181D);
         let mut gpu = OffscreenGpu::new(16, 16).expect("offscreen gpu");
-        gpu.present_wait(&DisplayList::default(), 2, canvas, &PixelFont, &RawImages::default());
+        gpu.present_wait(&DisplayList::default(), 2, canvas, &PixelFont, &RawImages::default())
+        .unwrap();
         let bytes = gpu.read_rgba();
         assert_eq!(bytes.len(), 16 * 16 * 4);
         for pixel in bytes.chunks_exact(4) {
@@ -4001,8 +4190,8 @@ mod tests {
         // must present again
         let runtime = Runtime::new();
         let logical = Size { width: 100.0, height: 60.0 };
-        let quiet = runtime.display_frame(&text("still"), logical);
-        let changed = runtime.display_frame(&text("moved"), logical);
+        let quiet = runtime.display_frame(&text("still"), logical).unwrap();
+        let changed = runtime.display_frame(&text("moved"), logical).unwrap();
         let retained = Some((Rc::new(quiet.clone()), (200usize, 120usize), 2usize, Color::CANVAS));
         assert!(frame_repeats(&retained, &quiet, (200, 120), 2, Color::CANVAS));
         assert!(!frame_repeats(&retained, &changed, (200, 120), 2, Color::CANVAS));
@@ -4053,11 +4242,14 @@ mod tests {
         .padding_length(10.0)
         .background_color(Color::hex(0xFFFFFF))
         .corner_radius(9.0);
-        let display = runtime.display_frame(&root, logical);
-        let cpu = rasterize_with(&display, physical.0, physical.1, scale, Color::CANVAS, &engine, &RawImages::default())
+        let display = runtime.display_frame(&root, logical).unwrap();
+        let cpu = rasterize_with(&display, physical.0, physical.1, scale, Color::CANVAS, &engine, &RawImages::default(),
+        )
+        .unwrap()
             .to_rgba_bytes();
         let mut gpu = OffscreenGpu::new(physical.0, physical.1).expect("offscreen gpu");
-        gpu.present_wait(&display, scale, Color::CANVAS, &engine, &RawImages::default());
+        gpu.present_wait(&display, scale, Color::CANVAS, &engine, &RawImages::default())
+        .unwrap();
         assert_close(&gpu.read_rgba(), &cpu, 2, "core-text runs");
     }
 
@@ -4088,12 +4280,15 @@ mod tests {
         let root = vstack((text("warm"), text("frame")));
         let logical = Size { width: 120.0, height: 60.0 };
         let runtime = Runtime::new();
-        let display = runtime.display_frame(&root, logical);
+        let display = runtime.display_frame(&root, logical).unwrap();
         let mut gpu = OffscreenGpu::new(240, 120).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default(),
+        )
+        .unwrap();
         let first = gpu.atlas_footprint();
         assert!(first.0 > 0, "the frame rasterized runs into the atlas");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default())
+        .unwrap();
         let second = gpu.atlas_footprint();
         assert_eq!(first, second, "an identical frame must not mint new tiles");
     }
@@ -4166,13 +4361,16 @@ mod tests {
         }
         let runtime = Runtime::new();
         let root = image_scene();
-        let display = runtime.display_frame(&root, Size { width: 320.0, height: 400.0 });
+        let display = runtime.display_frame(&root, Size { width: 320.0, height: 400.0 })
+            .unwrap();
         let engine = RawImages::default();
         let mut gpu = OffscreenGpu::new(640, 800).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         let first = gpu.atlas_footprint();
         assert!(first.0 >= 3, "atlas icon + cover + dedicated photo: {first:?}");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         assert_eq!(first, gpu.atlas_footprint(), "a warm frame re-uploads nothing");
     }
 
@@ -4213,15 +4411,20 @@ mod tests {
         let logical = Size { width: 640.0, height: 140.0 };
         let engine = RawImages::default();
         let mut gpu = OffscreenGpu::new(1280, 280).expect("offscreen gpu");
-        let first = Runtime::new().display_frame(&crowd_scene(10), logical);
-        gpu.present_wait(&first, 2, Color::CANVAS, &PixelFont, &engine);
+        let first = Runtime::new().display_frame(&crowd_scene(10), logical)
+            .unwrap();
+        gpu.present_wait(&first, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         assert_eq!(gpu.atlas.dedicated.len(), 12, "every photo of the frame keeps its texture");
-        gpu.present_wait(&first, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&first, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         assert_eq!(gpu.atlas.dedicated.len(), 12, "a warm frame past the cap asks no collector");
         // twelve OTHER photos: the first twelve are stale, the cap asks
         // for the collector, and the map holds only what this frame reads
-        let second = Runtime::new().display_frame(&crowd_scene(50), logical);
-        gpu.present_wait(&second, 2, Color::CANVAS, &PixelFont, &engine);
+        let second = Runtime::new().display_frame(&crowd_scene(50), logical)
+            .unwrap();
+        gpu.present_wait(&second, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         assert_eq!(gpu.atlas.dedicated.len(), 12, "the collector took the stale textures");
     }
 
@@ -4235,7 +4438,9 @@ mod tests {
         // shelf per exact height wanted more rows than the atlas has, and
         // the frame went out without its last fifty paths
         let paths: Vec<_> = (0..100u64)
-            .map(|i| image(gradient_source(200 + i)).resizable().frame(40.0, 10.0 + i as f64))
+            .map(|i| {
+                image(gradient_source(200 + i)).resizable().frame(40.0, 10.0 + i as f64)
+            })
             .collect();
         let root = zstack(paths);
         let logical = Size { width: 60.0, height: 120.0 };
@@ -4245,9 +4450,10 @@ mod tests {
             "hundred-heights scene diverged (max channel delta {})",
             max_channel_delta(&gpu, &cpu)
         );
-        let display = Runtime::new().display_frame(&root, logical);
+        let display = Runtime::new().display_frame(&root, logical).unwrap();
         let mut gpu = OffscreenGpu::new(120, 240).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default())
+        .unwrap();
         assert_eq!(gpu.atlas.images.len(), 100, "every path rode the shelves");
         assert!(gpu.atlas.dedicated.is_empty(), "none needed a texture of its own");
     }
@@ -4260,7 +4466,9 @@ mod tests {
         // seventy shelf-sized photos, more than the shelves hold: the
         // overflow takes textures of its own and the frame goes out whole
         let photos: Vec<_> = (0..70u64)
-            .map(|i| image(gradient_source(300 + i)).resizable().frame(500.0, 125.0))
+            .map(|i| {
+                image(gradient_source(300 + i)).resizable().frame(500.0, 125.0)
+            })
             .collect();
         let root = zstack(photos);
         let logical = Size { width: 500.0, height: 125.0 };
@@ -4270,9 +4478,11 @@ mod tests {
             "full-shelf scene diverged (max channel delta {})",
             max_channel_delta(&gpu, &cpu)
         );
-        let display = Runtime::new().display_frame(&root, logical);
+        let display = Runtime::new().display_frame(&root, logical).unwrap();
         let mut gpu = OffscreenGpu::new(1000, 250).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default(),
+        )
+        .unwrap();
         assert_eq!(gpu.atlas.images.len() + gpu.atlas.dedicated.len(), 70, "every photo is somewhere");
         assert!(!gpu.atlas.dedicated.is_empty(), "the overflow took textures of its own");
     }
@@ -4355,8 +4565,10 @@ mod tests {
             let display = runtime.display_frame(
                 &image(&feed).resizable().frame(300.0, 200.0),
                 Size { width: 320.0, height: 240.0 },
-            );
-            gpu.present_nowait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+            )
+                .unwrap();
+            gpu.present_nowait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+                .unwrap();
         }
         gpu.drain();
         assert_eq!(gpu.atlas.live.len(), 1, "one live texture for one feed");
@@ -4383,8 +4595,10 @@ mod tests {
             let display = runtime.display_frame(
                 &vstack((crowd_scene(10), image(&feed).resizable().frame(200.0, 150.0))),
                 Size { width: 600.0, height: 300.0 },
-            );
-            gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+            )
+                .unwrap();
+            gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+                .unwrap();
         }
         assert_eq!(gpu.atlas.dedicated.len(), 12, "the crowd keeps its textures");
         assert_eq!(gpu.atlas.live.len(), 1);
@@ -4403,13 +4617,17 @@ mod tests {
         let shown = Runtime::new().display_frame(
             &image(&feed).resizable().frame(50.0, 50.0),
             Size { width: 100.0, height: 100.0 },
-        );
-        gpu.present_wait(&shown, 2, Color::CANVAS, &PixelFont, &engine);
+        )
+            .unwrap();
+        gpu.present_wait(&shown, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         assert_eq!(gpu.atlas.live.len(), 1);
         let empty = Runtime::new()
-            .display_frame(&spacer().frame(100.0, 100.0), Size { width: 100.0, height: 100.0 });
+            .display_frame(&spacer().frame(100.0, 100.0), Size { width: 100.0, height: 100.0 })
+            .unwrap();
         for _ in 0..=bunny_ui::gpu::walk::LIVE_IDLE_WALKS {
-            gpu.present_wait(&empty, 2, Color::CANVAS, &PixelFont, &engine);
+            gpu.present_wait(&empty, 2, Color::CANVAS, &PixelFont, &engine)
+                .unwrap();
         }
         assert!(gpu.atlas.live.is_empty(), "the texture was given back");
         assert!(gpu.ground.textures.is_empty(), "and the ground released it");
@@ -4535,13 +4753,16 @@ mod tests {
         }
         let runtime = Runtime::new();
         let root = icon_scene();
-        let display = runtime.display_frame(&root, Size { width: 120.0, height: 160.0 });
+        let display = runtime.display_frame(&root, Size { width: 120.0, height: 160.0 })
+            .unwrap();
         let engine = RawImages::default();
         let mut gpu = OffscreenGpu::new(240, 320).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         let first = gpu.atlas_footprint();
         assert!(first.0 >= 4, "four tinted tiles at least: {first:?}");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         assert_eq!(first, gpu.atlas_footprint(), "the tinted keys cache, never thrash");
     }
 

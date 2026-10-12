@@ -82,6 +82,7 @@ pub mod state_ext;
 pub mod stats;
 pub mod text_source;
 pub mod text_engine;
+pub mod text_error;
 pub mod text_geometry;
 pub mod text_value;
 pub mod text_input;
@@ -686,36 +687,36 @@ mod tests {
         let chip = Chip { on: State::new(false) };
         let runtime = Runtime::new();
         // mount seeds silently: the animated frame IS the plain frame
-        let mounted = runtime.display_frame(&chip, size);
+        let mounted = runtime.display_frame(&chip, size).unwrap();
         assert_eq!(fill_of(&mounted), OFF, "first appearance does not animate");
         assert!(!runtime.wants_frame());
 
         // the state flips: the same frame still paints the OLD color —
         // motion starts on the next tick, not with a jump
         chip.on.set(true);
-        let flipped = runtime.display_frame(&chip, size);
+        let flipped = runtime.display_frame(&chip, size).unwrap();
         assert_eq!(fill_of(&flipped), OFF, "the flip frame holds the start value");
         assert!(runtime.wants_frame(), "the spring is armed");
 
         // one tick: the color is in flight, strictly between the ends
-        assert!(runtime.tick(1.0 / 120.0).scene);
-        let moving = fill_of(&runtime.animation_frame(&chip, size));
+        assert!(runtime.tick(1.0 / 120.0).unwrap().scene);
+        let moving = fill_of(&runtime.animation_frame(&chip, size).unwrap());
         assert_ne!(moving, OFF);
         assert_ne!(moving, ON);
 
         // run it dry: bounded, and the settle SNAPS bit-exact
         let mut guard = 0;
         while runtime.wants_frame() && guard < 600 {
-            runtime.tick(1.0 / 120.0);
-            let _ = runtime.animation_frame(&chip, size);
+            runtime.tick(1.0 / 120.0).unwrap();
+            let _ = runtime.animation_frame(&chip, size).unwrap();
             guard += 1;
         }
         assert!(guard < 600, "the spring settles");
-        let settled = runtime.animation_frame(&chip, size);
+        let settled = runtime.animation_frame(&chip, size).unwrap();
 
         let plain = Plain { on: State::new(true) };
         let control = Runtime::new();
-        let target = control.display_frame(&plain, size);
+        let target = control.display_frame(&plain, size).unwrap();
         assert_eq!(
             settled.as_slice(),
             target.as_slice(),
@@ -739,7 +740,7 @@ mod tests {
                             vec![1],
                             |row| format!("row{row}"),
                             move |_| text_field("type…", self.value.binding()),
-                        ),
+                    ),
                     )
                 } else {
                     Either::Second(text("plain"))
@@ -750,9 +751,10 @@ mod tests {
         let size = crate::layout::Size { width: 200.0, height: 100.0 };
         let swap = Swap { editing: State::new(true), value: State::new("hi".into()) };
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&swap, size);
+        let _ = runtime.display_frame(&swap, size).unwrap();
         let field = runtime
             .layout(&swap, crate::layout::Proposal::exact(size))
+            .unwrap()
             .fields
             .first()
             .expect("field placed")
@@ -764,12 +766,12 @@ mod tests {
 
         // the arm swaps: the field's identity dies — focus and caret go
         swap.editing.set(false);
-        let _ = runtime.display_frame(&swap, size);
+        let _ = runtime.display_frame(&swap, size).unwrap();
         assert_eq!(runtime.focused(), None, "a dead field cannot own the keyboard");
 
         // the offset SURVIVES the unmount: remounting restores it
         swap.editing.set(true);
-        let _ = runtime.display_frame(&swap, size);
+        let _ = runtime.display_frame(&swap, size).unwrap();
         assert_eq!(runtime.scroll_offset("Swap/@First").y, 3.0);
     }
 
@@ -789,26 +791,30 @@ mod tests {
         let size = crate::layout::Size { width: 200.0, height: 60.0 };
         let form = Form { value: State::new("hello".to_string()) };
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&form, size);
+        let _ = runtime.display_frame(&form, size).unwrap();
         let field = runtime
             .layout(&form, crate::layout::Proposal::exact(size))
+            .unwrap()
             .fields
             .first()
             .expect("the field placed")
             .clone();
         runtime.focus(&field.path);
-        let _ = runtime.display_frame(&form, size);
+        let _ = runtime.display_frame(&form, size).unwrap();
 
         // pixel font: 8px per glyph — 20px in sits inside glyph 2
         let index = runtime
             .ime_index_at(field.text_origin.x + 20.0, field.frame.origin.y + 4.0)
+            .unwrap()
             .expect("inside the field");
         assert_eq!(index, 2);
         // outside the field there is no index
-        assert!(runtime.ime_index_at(field.frame.origin.x - 5.0, 500.0).is_none());
+        assert!(runtime.ime_index_at(field.frame.origin.x - 5.0, 500.0).unwrap()
+                .is_none());
 
         // the rect for index 2 sits two glyphs in
-        let rect = runtime.ime_rect_for(2).expect("focused field answers");
+        let rect = runtime.ime_rect_for(2)
+            .unwrap().expect("focused field answers");
         assert_eq!(rect.origin.x, field.text_origin.x + 16.0);
         assert!(rect.size.height > 0.0);
     }
@@ -840,7 +846,8 @@ mod tests {
 
         let runtime = Runtime::new();
         let frame = runtime
-            .display_frame(&Sheet, crate::layout::Size { width: 300.0, height: 200.0 });
+            .display_frame(&Sheet, crate::layout::Size { width: 300.0, height: 200.0 })
+            .unwrap();
         let bands: Vec<crate::layout::Rect> = frame
             .iter()
             .filter_map(|command| match command {
@@ -889,16 +896,14 @@ mod tests {
 
         let runtime = Runtime::new();
         let frame = runtime
-            .display_frame(&Sheet, crate::layout::Size { width: 300.0, height: 200.0 });
+            .display_frame(&Sheet, crate::layout::Size { width: 300.0, height: 200.0 })
+            .unwrap();
         let run = |needle: &str| {
             frame
                 .iter()
                 .find_map(|command| match command {
                     crate::layout::DrawCommand::TextLine { content, color, font, .. }
-                        if content.as_ref() == needle =>
-                    {
-                        Some((*color, font.size))
-                    }
+                        if content.as_ref() == needle => Some((*color, font.size)),
                     _ => None,
                 })
                 .expect("the run paints")
@@ -940,6 +945,7 @@ mod tests {
             let runtime = Runtime::new();
             runtime
                 .display_frame(&sheet, crate::layout::Size { width: 300.0, height: 200.0 })
+                .unwrap()
                 .iter()
                 .filter_map(|command| match command {
                     crate::layout::DrawCommand::FillRect { rect, color, .. } if *color == ink => {
@@ -985,7 +991,9 @@ mod tests {
                     ],
                     3,
                     |row| row.to_string(),
-                    |row, col| text(if col == 0 { format!("name{row}") } else { "9".into() }),
+                    |row, col| {
+                        text(if col == 0 { format!("name{row}") } else { "9".into() })
+                    },
                 )
                 .row_height(32.0)
                 .header_height(28.0)
@@ -1000,7 +1008,7 @@ mod tests {
         let runtime = Runtime::new();
         let sheet = Sheet { opened: Rc::clone(&opened) };
         let size = crate::layout::Size { width: 300.0, height: 200.0 };
-        let frame = runtime.display_frame(&sheet, size);
+        let frame = runtime.display_frame(&sheet, size).unwrap();
 
         // the trailing column ends on its lane's edge, one padding in:
         // lane 100..160, the run of one character 8 wide, 8 of padding
@@ -1008,10 +1016,7 @@ mod tests {
             .iter()
             .find_map(|command| match command {
                 crate::layout::DrawCommand::TextLine { origin, content, .. }
-                    if content.as_ref() == "9" =>
-                {
-                    Some(origin.x)
-                }
+                    if content.as_ref() == "9" => Some(origin.x),
                 _ => None,
             })
             .expect("the number paints");
@@ -1020,7 +1025,7 @@ mod tests {
         // a press in the SECOND column still opens the row: the click is
         // the band's, not the cell's
         let (x, y) = (130.0, 28.0 + 32.0 + 16.0);
-        runtime.pointer_clicked(x, y, 1, false);
+        runtime.pointer_clicked(x, y, 1, false).unwrap();
         runtime.pointer_released(x, y);
         assert_eq!(&*opened.borrow(), &[1], "one closure, one row, wherever it was pressed");
     }
@@ -1047,9 +1052,11 @@ mod tests {
 
         let wide = Runtime::new()
             .layout(&Headline(false), crate::layout::Proposal::unspecified())
+            .unwrap()
             .size;
         let closed = Runtime::new()
             .layout(&Headline(true), crate::layout::Proposal::unspecified())
+            .unwrap()
             .size;
 
         assert_eq!(wide.width, 168.0);
@@ -1058,8 +1065,8 @@ mod tests {
         // and in a 160pt column the loose one takes a second line while
         // the closed one stays on the first — which is the whole case
         let column = crate::layout::Proposal { width: Some(160.0), height: None };
-        let loose_h = Runtime::new().layout(&Headline(false), column).size.height;
-        let closed_h = Runtime::new().layout(&Headline(true), column).size.height;
+        let loose_h = Runtime::new().layout(&Headline(false), column).unwrap().size.height;
+        let closed_h = Runtime::new().layout(&Headline(true), column).unwrap().size.height;
         assert!(loose_h > closed_h, "{loose_h} > {closed_h}: the loose run wraps");
     }
 
@@ -1101,9 +1108,7 @@ mod tests {
 
         impl Component for Lane {
             fn body(self) -> impl View {
-                let cell = move |value: &'static str| {
-                    text(value).frame_width_aligned(132.0, self.0)
-                };
+                let cell = move |value: &'static str| text(value).frame_width_aligned(132.0, self.0);
                 vstack!(cell("Ada"), cell("Augusta Ada King"))
             }
         }
@@ -1135,18 +1140,15 @@ mod tests {
                 .iter()
                 .find_map(|command| match command {
                     crate::layout::DrawCommand::TextLine { origin, content, .. }
-                        if content.as_ref() == needle =>
-                    {
-                        Some(origin.x)
-                    }
+                        if content.as_ref() == needle => Some(origin.x),
                     _ => None,
                 })
                 .expect("the cell paints")
         };
         let lane = |align: Alignment| {
-            move |runtime: &Runtime| runtime.display_frame(&Lane(align), size)
+            move |runtime: &Runtime| runtime.display_frame(&Lane(align), size).unwrap()
         };
-        let multiline = move |runtime: &Runtime| runtime.display_frame(&Multiline, size);
+        let multiline = move |runtime: &Runtime| runtime.display_frame(&Multiline, size).unwrap();
 
         // one edge, every row — a 3-character value and a 16-character
         // one begin at the same x
@@ -1185,16 +1187,13 @@ mod tests {
 
         let size = crate::layout::Size { width: 200.0, height: 60.0 };
         let runtime = Runtime::new();
-        let frame = runtime.display_frame(&Rowline, size);
+        let frame = runtime.display_frame(&Rowline, size).unwrap();
         let line_y = |needle: &str| {
             frame
                 .iter()
                 .find_map(|command| match command {
                     crate::layout::DrawCommand::TextLine { origin, content, .. }
-                        if content.as_ref() == needle =>
-                    {
-                        Some(origin.y)
-                    }
+                        if content.as_ref() == needle => Some(origin.y),
                     _ => None,
                 })
                 .expect("the text paints")
@@ -1210,9 +1209,8 @@ mod tests {
 
         impl Component for Big {
             fn body(self) -> impl View {
-                virtual_list(10_000, |row| format!("row{row}"), |row| {
-                    text(format!("item {row}"))
-                })
+                virtual_list(10_000, |row| format!("row{row}"), |row| text(format!("item {row}")),
+                )
             }
         }
 
@@ -1220,23 +1218,22 @@ mod tests {
         let lines = |display: &crate::layout::DisplayList| {
             display
                 .iter()
-                .filter(|command| {
-                    matches!(command, crate::layout::DrawCommand::TextLine { .. })
-                })
+                .filter(|command| matches!(command, crate::layout::DrawCommand::TextLine { .. }))
                 .count()
         };
 
         let runtime = Runtime::new();
         // first frame: no geometry yet — the fixed first window rules
-        let mounted = runtime.display_frame(&Big, size);
+        let mounted = runtime.display_frame(&Big, size).unwrap();
         assert!(lines(&mounted) <= 256, "first window is bounded");
         // second frame: the retained geometry shrinks the window to the
         // viewport plus one viewport of buffer on each side
-        let settled = runtime.display_frame(&Big, size);
+        let settled = runtime.display_frame(&Big, size).unwrap();
         let visible = lines(&settled);
         assert!(visible < 40, "window-sized, not count-sized: {visible}");
         // the scroll geometry still sees ALL ten thousand rows
-        let result = runtime.layout(&Big, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&Big, crate::layout::Proposal::exact(size))
+            .unwrap();
         let region = result.scrolls.first().expect("the region exists");
         assert_eq!(region.content.height, 16.0 * 10_000.0);
         assert_eq!(region.row_extent, Some(16.0));
@@ -1258,9 +1255,8 @@ mod tests {
         struct Deep;
         impl Component for Deep {
             fn body(self) -> impl View {
-                virtual_list(10_000, |row| format!("row{row}"), |row| {
-                    text(format!("file_{row:04}.rs")).frame_height(28.0)
-                })
+                virtual_list(10_000, |row| format!("row{row}"), |row| text(format!("file_{row:04}.rs")).frame_height(28.0),
+                )
                 // the shape the finder ships: a row that MEASURES 28
                 // and a declaration that says 29
                 .row_height(29.0)
@@ -1268,14 +1264,15 @@ mod tests {
         }
         let size = crate::layout::Size { width: 300.0, height: 640.0 };
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&Deep, size);
-        let result = runtime.layout(&Deep, crate::layout::Proposal::exact(size));
+        let _ = runtime.display_frame(&Deep, size).unwrap();
+        let result = runtime.layout(&Deep, crate::layout::Proposal::exact(size))
+            .unwrap();
         let region = result.scrolls.first().expect("the region exists").clone();
 
         for step in 1..=40 {
             let offset = step as f64 * size.height;
             runtime.set_scroll_offset(&region.path, crate::layout::Point { x: 0.0, y: offset });
-            let display = runtime.display_frame(&Deep, size);
+            let display = runtime.display_frame(&Deep, size).unwrap();
             // the deepest text the frame drew, in the region's own space
             let lowest = display
                 .iter()
@@ -1299,16 +1296,16 @@ mod tests {
         struct Varied;
         impl Component for Varied {
             fn body(self) -> impl View {
-                virtual_list(300, |row| format!("row{row}"), |row| {
-                    text(format!("item {row}"))
-                })
+                virtual_list(300, |row| format!("row{row}"), |row| text(format!("item {row}")),
+                )
                 .row_height_with(|row| if row % 3 == 0 { 40.0 } else { 20.0 })
             }
         }
         let size = crate::layout::Size { width: 200.0, height: 100.0 };
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&Varied, size);
-        let result = runtime.layout(&Varied, crate::layout::Proposal::exact(size));
+        let _ = runtime.display_frame(&Varied, size).unwrap();
+        let result = runtime.layout(&Varied, crate::layout::Proposal::exact(size))
+            .unwrap();
         let region = result.scrolls.first().expect("the region exists");
         // one hundred tall rows, two hundred short ones — the closure
         // is the authority and the extent stays honest to all of them
@@ -1324,7 +1321,8 @@ mod tests {
         let region_path = region.path.clone();
         runtime
             .set_scroll_offset(&region_path, crate::layout::Point { x: 0.0, y: 4000.0 });
-        let result = runtime.layout(&Varied, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&Varied, crate::layout::Proposal::exact(size))
+            .unwrap();
         // offset 4000 = fifty groups of (40+20+20) — row 150 starts there
         let frame = result
             .frames
@@ -1334,9 +1332,7 @@ mod tests {
         let lines = result
             .display
             .iter()
-            .filter(|command| {
-                matches!(command, crate::layout::DrawCommand::TextLine { .. })
-            })
+            .filter(|command| matches!(command, crate::layout::DrawCommand::TextLine { .. }))
             .count();
         assert!(lines < 40, "window-sized, not count-sized: {lines}");
     }
@@ -1366,8 +1362,9 @@ mod tests {
         let size = crate::layout::Size { width: 200.0, height: 300.0 };
         let transcript = Transcript { reply: State::new(40.0) };
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&transcript, size);
-        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        let _ = runtime.display_frame(&transcript, size).unwrap();
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size))
+            .unwrap();
         let top = |result: &crate::layout::LayoutResult, row: usize| {
             result.frames.find(&format!("[entry{row}]")).expect("the row is on the glass").origin.y
         };
@@ -1386,8 +1383,9 @@ mod tests {
         // the reply streams in and grows: the rows under it move in the
         // frame it grew, with nobody asking for a remeasure
         transcript.reply.set(100.0);
-        let _ = runtime.display_frame(&transcript, size);
-        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        let _ = runtime.display_frame(&transcript, size).unwrap();
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size))
+            .unwrap();
         assert_eq!(top(&result, 2), 120.0);
     }
 
@@ -1403,22 +1401,23 @@ mod tests {
         impl Component for Transcript {
             fn body(self) -> impl View {
                 let grown = self.grown.get();
-                virtual_list(100, |row| format!("entry{row}"), move |row| {
-                    spacer().frame_height(if row == 9 && grown { 90.0 } else { 30.0 })
-                })
+                virtual_list(100, |row| format!("entry{row}"), move |row| spacer().frame_height(if row == 9 && grown { 90.0 } else { 30.0 }),
+                )
                 .measured_rows(30.0)
             }
         }
         let size = crate::layout::Size { width: 200.0, height: 150.0 };
         let transcript = Transcript { grown: State::new(false) };
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&transcript, size);
-        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        let _ = runtime.display_frame(&transcript, size).unwrap();
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size))
+            .unwrap();
         let path = result.scrolls.first().expect("the region exists").path.clone();
         // row 10 at the top of the glass
         runtime.set_scroll_offset(&path, crate::layout::Point { x: 0.0, y: 300.0 });
-        let _ = runtime.display_frame(&transcript, size);
-        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        let _ = runtime.display_frame(&transcript, size).unwrap();
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size))
+            .unwrap();
         let on_glass = |result: &crate::layout::LayoutResult| {
             result.frames.find("[entry10]").expect("row 10 is on the glass").origin.y
         };
@@ -1426,8 +1425,9 @@ mod tests {
 
         // row 9, just above, grows by sixty points
         transcript.grown.set(true);
-        let _ = runtime.display_frame(&transcript, size);
-        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        let _ = runtime.display_frame(&transcript, size).unwrap();
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size))
+            .unwrap();
         assert_eq!(runtime.scroll_offset(&path).y, 360.0, "the offset took the difference");
         assert_eq!(on_glass(&result), 0.0, "and row 10 stayed where the reader was looking");
     }
@@ -1444,9 +1444,8 @@ mod tests {
         }
         impl Component for Transcript {
             fn body(self) -> impl View {
-                virtual_list(self.entries.get(), |row| format!("entry{row}"), |_| {
-                    spacer().frame_height(40.0)
-                })
+                virtual_list(self.entries.get(), |row| format!("entry{row}"), |_| spacer().frame_height(40.0),
+                )
                 .measured_rows(40.0)
                 .follow_tail(self.following.binding())
             }
@@ -1455,8 +1454,9 @@ mod tests {
         let transcript = Transcript { entries: State::new(20), following: State::new(true) };
         let runtime = Runtime::new();
         let frame = |runtime: &Runtime| {
-            let _ = runtime.display_frame(&transcript, size);
+            let _ = runtime.display_frame(&transcript, size).unwrap();
             runtime.layout(&transcript, crate::layout::Proposal::exact(size))
+                .unwrap()
         };
         let result = frame(&runtime);
         let path = result.scrolls.first().expect("the region exists").path.clone();
@@ -1511,8 +1511,9 @@ mod tests {
         let size = crate::layout::Size { width: 200.0, height: 300.0 };
         let transcript = Transcript { built: std::rc::Rc::default(), following: State::new(true) };
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&transcript, size);
-        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        let _ = runtime.display_frame(&transcript, size).unwrap();
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size))
+            .unwrap();
         let built = transcript.built.borrow();
         let oldest = built.iter().copied().min().expect("rows were built");
         // a tall screen and its buffer of the tail, at forty points a row
@@ -1539,9 +1540,8 @@ mod tests {
             fn body(self) -> impl View {
                 let first = self.first.get();
                 // a row is as tall as what it holds, wherever the window puts it
-                virtual_list(100, move |row| format!("entry{}", first + row), move |row| {
-                    spacer().frame_height(20.0 * (1 + (first + row) % 3) as f64)
-                })
+                virtual_list(100, move |row| format!("entry{}", first + row), move |row| spacer().frame_height(20.0 * (1 + (first + row) % 3) as f64),
+                )
                 .measured_rows(40.0)
                 .first_row(first)
             }
@@ -1550,14 +1550,16 @@ mod tests {
         let size = crate::layout::Size { width: 200.0, height: 150.0 };
         let transcript = Transcript { first: State::new(0) };
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&transcript, size);
-        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        let _ = runtime.display_frame(&transcript, size).unwrap();
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size))
+            .unwrap();
         let path = result.scrolls.first().expect("the region exists").path.clone();
         // ordinal ten at the top of the glass
         let above: f64 = (0..10).map(tall).sum();
         runtime.set_scroll_offset(&path, crate::layout::Point { x: 0.0, y: above });
-        let _ = runtime.display_frame(&transcript, size);
-        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        let _ = runtime.display_frame(&transcript, size).unwrap();
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size))
+            .unwrap();
         let on_glass = |result: &crate::layout::LayoutResult| {
             result.frames.find("[entry10]").expect("ordinal ten is on the glass").origin.y
         };
@@ -1565,8 +1567,9 @@ mod tests {
 
         // three rows leave the head
         transcript.first.set(3);
-        let _ = runtime.display_frame(&transcript, size);
-        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        let _ = runtime.display_frame(&transcript, size).unwrap();
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size))
+            .unwrap();
         let dropped: f64 = (0..3).map(tall).sum();
         assert_eq!(runtime.scroll_offset(&path).y, above - dropped, "the scroll took the dropped rows");
         assert_eq!(on_glass(&result), 0.0, "and the reader's row stayed where they were looking");
@@ -1585,9 +1588,8 @@ mod tests {
         impl Component for Transcript {
             fn body(self) -> impl View {
                 let first = self.first.get();
-                virtual_list(50, move |row| format!("entry{}", first + row), move |row| {
-                    spacer().frame_height(20.0 * (1 + (first + row) % 3) as f64)
-                })
+                virtual_list(50, move |row| format!("entry{}", first + row), move |row| spacer().frame_height(20.0 * (1 + (first + row) % 3) as f64),
+                )
                 .measured_rows(40.0)
                 .first_row(first)
                 .follow_tail(self.following.binding())
@@ -1597,8 +1599,9 @@ mod tests {
         let transcript = Transcript { first: State::new(0), following: State::new(true) };
         let runtime = Runtime::new();
         let frame = |runtime: &Runtime| {
-            let _ = runtime.display_frame(&transcript, size);
+            let _ = runtime.display_frame(&transcript, size).unwrap();
             runtime.layout(&transcript, crate::layout::Proposal::exact(size))
+                .unwrap()
         };
         let _ = frame(&runtime);
         let _ = frame(&runtime);
@@ -1650,8 +1653,9 @@ mod tests {
         let transcript = Transcript { reply: State::new(40.0), following: State::new(true) };
         let runtime = Runtime::new();
         let frame = |runtime: &Runtime| {
-            let _ = runtime.display_frame(&transcript, size);
+            let _ = runtime.display_frame(&transcript, size).unwrap();
             runtime.layout(&transcript, crate::layout::Proposal::exact(size))
+                .unwrap()
         };
         let at_the_end = |result: &crate::layout::LayoutResult| {
             let newest =
@@ -1721,15 +1725,15 @@ mod tests {
         let panel = Panel { reply: State::new(40.0) };
         crate::paranoid::force(crate::paranoid::MEMO);
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&panel, size);
-        let _ = runtime.display_frame(&panel, size);
+        let _ = runtime.display_frame(&panel, size).unwrap();
+        let _ = runtime.display_frame(&panel, size).unwrap();
 
         // at rest: three frames, and no boundary above the list is asked
         // again — the paranoid check confirms every kept answer against
         // a fresh measure
         let _ = crate::stats::take();
         for _ in 0..3 {
-            let _ = runtime.display_frame(&panel, size);
+            let _ = runtime.display_frame(&panel, size).unwrap();
         }
         let stats = crate::stats::take();
         assert_eq!(stats.measures_made, 0, "a transcript at rest measured a boundary afresh: {stats:?}");
@@ -1739,12 +1743,12 @@ mod tests {
         // the boundaries above measure again, and settle again after
         panel.reply.set(100.0);
         let _ = crate::stats::take();
-        let _ = runtime.display_frame(&panel, size);
+        let _ = runtime.display_frame(&panel, size).unwrap();
         let stats = crate::stats::take();
         assert!(stats.measures_made >= 1, "a grown row re-measured the boundaries above: {stats:?}");
-        let _ = runtime.display_frame(&panel, size);
+        let _ = runtime.display_frame(&panel, size).unwrap();
         let _ = crate::stats::take();
-        let _ = runtime.display_frame(&panel, size);
+        let _ = runtime.display_frame(&panel, size).unwrap();
         let stats = crate::stats::take();
         assert_eq!(stats.measures_made, 0, "and the list settled again: {stats:?}");
     }
@@ -1755,17 +1759,17 @@ mod tests {
         struct Pinned;
         impl Component for Pinned {
             fn body(self) -> impl View {
-                virtual_list(300, |row| format!("row{row}"), |row| {
-                    text(format!("item {row}"))
-                })
+                virtual_list(300, |row| format!("row{row}"), |row| text(format!("item {row}")),
+                )
                 .row_height_with(|row| if row % 3 == 0 { 40.0 } else { 20.0 })
                 .reveal(250)
             }
         }
         let size = crate::layout::Size { width: 200.0, height: 100.0 };
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&Pinned, size);
-        let result = runtime.layout(&Pinned, crate::layout::Proposal::exact(size));
+        let _ = runtime.display_frame(&Pinned, size).unwrap();
+        let result = runtime.layout(&Pinned, crate::layout::Proposal::exact(size))
+            .unwrap();
         let frame = result.frames.find("[row250]").expect("the pinned row exists");
         assert!(
             frame.origin.y >= -1.0 && frame.origin.y < 100.0,
@@ -1781,22 +1785,22 @@ mod tests {
         }
         impl Component for Shrinking {
             fn body(self) -> impl View {
-                virtual_list(self.count.get(), |row| format!("row{row}"), |row| {
-                    text(format!("item {row}"))
-                })
+                virtual_list(self.count.get(), |row| format!("row{row}"), |row| text(format!("item {row}")),
+                )
                 .row_height_with(|row| if row % 3 == 0 { 40.0 } else { 20.0 })
             }
         }
         let size = crate::layout::Size { width: 200.0, height: 100.0 };
         let runtime = Runtime::new();
         let view = Shrinking { count: State::new(300) };
-        let _ = runtime.display_frame(&view, size);
-        let _ = runtime.display_frame(&view, size);
+        let _ = runtime.display_frame(&view, size).unwrap();
+        let _ = runtime.display_frame(&view, size).unwrap();
 
         // stale offsets (len 301) no longer describe count 50 — the
         // window falls back and the geometry re-answers honestly
         view.count.set(50);
-        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         let region = result.scrolls.first().expect("the region survives");
         assert_eq!(region.content.height, 17.0 * 40.0 + 33.0 * 20.0);
     }
@@ -1808,9 +1812,8 @@ mod tests {
 
         impl Component for VirtualTen {
             fn body(self) -> impl View {
-                virtual_list(10, |row| format!("row{row}"), |row| {
-                    text(format!("item {row}"))
-                })
+                virtual_list(10, |row| format!("row{row}"), |row| text(format!("item {row}")),
+                )
             }
         }
 
@@ -1830,8 +1833,8 @@ mod tests {
         let size = crate::layout::Size { width: 200.0, height: 400.0 };
         let virtual_runtime = Runtime::new();
         let dense_runtime = Runtime::new();
-        let virtual_frame = virtual_runtime.display_frame(&VirtualTen, size);
-        let dense_frame = dense_runtime.display_frame(&DenseTen, size);
+        let virtual_frame = virtual_runtime.display_frame(&VirtualTen, size).unwrap();
+        let dense_frame = dense_runtime.display_frame(&DenseTen, size).unwrap();
         assert_eq!(
             virtual_frame.as_slice(),
             dense_frame.as_slice(),
@@ -1846,9 +1849,8 @@ mod tests {
 
         impl Component for Empty {
             fn body(self) -> impl View {
-                virtual_list(0, |row| format!("row{row}"), |row| {
-                    text(format!("item {row}"))
-                })
+                virtual_list(0, |row| format!("row{row}"), |row| text(format!("item {row}")),
+                )
             }
         }
 
@@ -1857,15 +1859,14 @@ mod tests {
 
         impl Component for One {
             fn body(self) -> impl View {
-                virtual_list(1, |row| format!("row{row}"), |row| {
-                    text(format!("item {row}"))
-                })
+                virtual_list(1, |row| format!("row{row}"), |row| text(format!("item {row}")),
+                )
             }
         }
 
         let size = crate::layout::Size { width: 200.0, height: 100.0 };
         let runtime = Runtime::new();
-        let empty = runtime.display_frame(&Empty, size);
+        let empty = runtime.display_frame(&Empty, size).unwrap();
         assert_eq!(
             empty
                 .iter()
@@ -1875,14 +1876,15 @@ mod tests {
                 .count(),
             0
         );
-        let one = Runtime::new().display_frame(&One, size);
+        let one = Runtime::new().display_frame(&One, size).unwrap();
         assert!(one.iter().any(|command| matches!(
             command,
             crate::layout::DrawCommand::TextLine { .. }
         )));
         // degenerate viewport: nothing to see, nothing to break
         let flat = Runtime::new()
-            .display_frame(&One, crate::layout::Size { width: 200.0, height: 0.0 });
+            .display_frame(&One, crate::layout::Size { width: 200.0, height: 0.0 })
+            .unwrap();
         let _ = flat.len();
     }
 
@@ -1910,7 +1912,8 @@ mod tests {
 
         let size = crate::layout::Size { width: 400.0, height: 300.0 };
         let runtime = Runtime::new();
-        let result = runtime.layout(&Launcher, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&Launcher, crate::layout::Proposal::exact(size))
+            .unwrap();
         let region = result.scrolls.first().expect("the list scrolls");
         assert!(
             region.frame.size.height <= 300.0,
@@ -1947,14 +1950,14 @@ mod tests {
         let narrow = crate::layout::Size { width: 300.0, height: 100.0 };
         let wide = crate::layout::Size { width: 500.0, height: 100.0 };
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&Trailing, narrow);
-        let _ = runtime.display_frame(&Trailing, narrow);
+        let _ = runtime.display_frame(&Trailing, narrow).unwrap();
+        let _ = runtime.display_frame(&Trailing, narrow).unwrap();
 
         // a resize is not an animation: the very first frame at the new
         // size paints exactly where a fresh runtime would — no flight,
         // no trail behind a live-resizing window
-        let resized = runtime.display_frame(&Trailing, wide);
-        let fresh = Runtime::new().display_frame(&Trailing, wide);
+        let resized = runtime.display_frame(&Trailing, wide).unwrap();
+        let fresh = Runtime::new().display_frame(&Trailing, wide).unwrap();
         assert_eq!(
             resized.as_slice(),
             fresh.as_slice(),
@@ -2001,11 +2004,11 @@ mod tests {
             visible: State::new(StdRc::new((0..10_000).collect())),
         };
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&finder, size);
-        let _ = runtime.display_frame(&finder, size);
+        let _ = runtime.display_frame(&finder, size).unwrap();
+        let _ = runtime.display_frame(&finder, size).unwrap();
         // a violent wheel: thousands of px in one event
         assert!(runtime.wheel(50.0, 100.0, 0.0, -50000.0));
-        let frame = runtime.display_frame(&finder, size);
+        let frame = runtime.display_frame(&finder, size).unwrap();
         let lines = frame
             .iter()
             .filter_map(|command| match command {
@@ -2029,30 +2032,27 @@ mod tests {
 
         impl Component for Big {
             fn body(self) -> impl View {
-                virtual_list(10_000, |row| format!("row{row}"), |row| {
-                    text(format!("item {row}"))
-                })
+                virtual_list(10_000, |row| format!("row{row}"), |row| text(format!("item {row}")),
+                )
             }
         }
 
         let size = crate::layout::Size { width: 200.0, height: 100.0 };
         let has_line = |display: &crate::layout::DisplayList, needle: &str| {
             display.iter().any(|command| match command {
-                crate::layout::DrawCommand::TextLine { content, .. } => {
-                    content.as_ref() == needle
-                }
+                crate::layout::DrawCommand::TextLine { content, .. } => content.as_ref() == needle,
                 _ => false,
             })
         };
 
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&Big, size);
-        let _ = runtime.display_frame(&Big, size);
+        let _ = runtime.display_frame(&Big, size).unwrap();
+        let _ = runtime.display_frame(&Big, size).unwrap();
         // a jump FAR past the buffer: the retained window cannot cover
         // it — the miss invalidates the boundary and the same frame
         // re-materializes around the new offset
         runtime.set_scroll_offset("Big", crate::layout::Point { x: 0.0, y: 8000.0 });
-        let jumped = runtime.display_frame(&Big, size);
+        let jumped = runtime.display_frame(&Big, size).unwrap();
         assert!(
             has_line(&jumped, "item 500"),
             "the window re-materialized around row 500"
@@ -2072,9 +2072,8 @@ mod tests {
 
         impl Component for Picker {
             fn body(self) -> impl View {
-                virtual_list(10_000, |row| format!("row{row}"), |row| {
-                    text(format!("item {row}"))
-                })
+                virtual_list(10_000, |row| format!("row{row}"), |row| text(format!("item {row}")),
+                )
                 .reveal(self.selected.get())
             }
         }
@@ -2082,14 +2081,14 @@ mod tests {
         let size = crate::layout::Size { width: 200.0, height: 100.0 };
         let picker = Picker { selected: State::new(0) };
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&picker, size);
+        let _ = runtime.display_frame(&picker, size).unwrap();
         assert_eq!(runtime.scroll_offset("Picker").y, 0.0);
 
         // the selection jumps to row 9000: the pin gives the follow-up
         // a real frame, the offset bottom-aligns it, and the window
         // re-materializes around it — all inside one frame
         picker.selected.set(9000);
-        let jumped = runtime.display_frame(&picker, size);
+        let jumped = runtime.display_frame(&picker, size).unwrap();
         assert_eq!(
             runtime.scroll_offset("Picker").y,
             9000.0 * 16.0 + 16.0 - 100.0,
@@ -2103,7 +2102,7 @@ mod tests {
         }));
         // the wheel stays sovereign afterwards
         assert!(runtime.wheel(10.0, 10.0, 0.0, 32.0));
-        let _ = runtime.display_frame(&picker, size);
+        let _ = runtime.display_frame(&picker, size).unwrap();
         assert_eq!(runtime.scroll_offset("Picker").y, 9000.0 * 16.0 + 16.0 - 132.0);
     }
 
@@ -2130,7 +2129,7 @@ mod tests {
         let size = crate::layout::Size { width: 200.0, height: 100.0 };
         let runtime = Runtime::new();
         APPEARED.with(|log| log.borrow_mut().clear());
-        let _ = runtime.display_frame(&Lazy, size);
+        let _ = runtime.display_frame(&Lazy, size).unwrap();
         runtime.pump();
         let first_mount =
             APPEARED.with(|log| log.borrow().iter().filter(|row| **row == 0).count());
@@ -2138,11 +2137,11 @@ mod tests {
 
         // jump far away: the old window unmounts (lazy, by contract)…
         runtime.set_scroll_offset("Lazy", crate::layout::Point { x: 0.0, y: 8000.0 });
-        let _ = runtime.display_frame(&Lazy, size);
+        let _ = runtime.display_frame(&Lazy, size).unwrap();
         runtime.pump();
         // …and coming back REMOUNTS row 0: onAppear fires again
         runtime.set_scroll_offset("Lazy", crate::layout::Point { x: 0.0, y: 0.0 });
-        let _ = runtime.display_frame(&Lazy, size);
+        let _ = runtime.display_frame(&Lazy, size).unwrap();
         runtime.pump();
         let reborn =
             APPEARED.with(|log| log.borrow().iter().filter(|row| **row == 0).count());
@@ -2162,30 +2161,30 @@ mod tests {
         impl Component for Shrinker {
             fn body(self) -> impl View {
                 let count = self.count.get();
-                virtual_list(count, |row| format!("row{row}"), |row| {
-                    text(format!("item {row}"))
-                })
+                virtual_list(count, |row| format!("row{row}"), |row| text(format!("item {row}")),
+                )
             }
         }
 
         let size = crate::layout::Size { width: 200.0, height: 100.0 };
         let shrinker = Shrinker { count: State::new(10_000) };
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&shrinker, size);
+        let _ = runtime.display_frame(&shrinker, size).unwrap();
         runtime.set_scroll_offset("Shrinker", crate::layout::Point { x: 0.0, y: 8000.0 });
-        let _ = runtime.display_frame(&shrinker, size);
+        let _ = runtime.display_frame(&shrinker, size).unwrap();
 
         // the filter empties almost everything: the window clamps, the
         // retained offset re-clamps at place, the content shrinks
         shrinker.count.set(5);
-        let shrunk = runtime.display_frame(&shrinker, size);
+        let shrunk = runtime.display_frame(&shrinker, size).unwrap();
         assert!(shrunk.iter().any(|command| match command {
             crate::layout::DrawCommand::TextLine { content, .. } => {
                 content.as_ref() == "item 0"
             }
             _ => false,
         }));
-        let result = runtime.layout(&shrinker, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&shrinker, crate::layout::Proposal::exact(size))
+            .unwrap();
         assert_eq!(result.scrolls.first().expect("region").content.height, 80.0);
     }
 
@@ -2206,6 +2205,7 @@ mod tests {
 
         let ink: Vec<(f64, f64)> = runtime
             .layout(&strip, Proposal::unspecified())
+            .unwrap()
             .display
             .iter()
             .filter_map(|command| match command {
@@ -2328,11 +2328,13 @@ mod tests {
         // steps the lines by 24 and splits the 8pt of extra leading, so
         // the first line sits 4 down.
         let para = text("aaa bbb").line_height(24.0).frame_width(30.0);
-        let stepped = line_tops(&runtime.layout(&para, Proposal::unspecified()).display);
+        let stepped = line_tops(&runtime.layout(&para, Proposal::unspecified()).unwrap()
+                .display);
         assert_eq!(stepped, vec![4.0, 28.0], "each line steps by 24, centred by a 4pt half-leading");
         // and with no line height the lines step by the face's own 16
         let plain = text("aaa bbb").frame_width(30.0);
-        let bare = line_tops(&runtime.layout(&plain, Proposal::unspecified()).display);
+        let bare = line_tops(&runtime.layout(&plain, Proposal::unspecified()).unwrap()
+                .display);
         assert_eq!(bare, vec![0.0, 16.0], "unset, the old face box stands");
     }
 
@@ -2349,17 +2351,19 @@ mod tests {
         };
         for (pitch, tops) in [(24.0, vec![9.0, 33.0, 57.0]), (12.0, vec![3.0, 15.0, 27.0])] {
             let view = vstack((text_editor("", note.binding()),)).line_height(pitch);
-            let result = runtime.layout(&view, Proposal::unspecified());
+            let result = runtime.layout(&view, Proposal::unspecified()).unwrap();
             let field = result.fields.first().expect("the editor is placed");
             assert_eq!(field.line_height, pitch, "the editor inherits its column's line box");
             assert_eq!(field.frame.size.height, 3.0 * pitch + 10.0, "natural size uses the same pitch");
             assert_eq!(runs(&result), tops, "each glyph splits the positive or negative half-leading");
         }
-        let plain = runtime.layout(&vstack((text_editor("", note.binding()),)), Proposal::unspecified());
+        let plain = runtime.layout(&vstack((text_editor("", note.binding()),)), Proposal::unspecified())
+            .unwrap();
         assert_eq!(plain.fields[0].line_height, 16.0);
         assert_eq!(plain.fields[0].frame.size.height, 58.0);
         assert_eq!(runs(&plain), vec![5.0, 21.0, 37.0]);
-        let one = runtime.layout(&vstack((text_field("", note.binding()),)).line_height(24.0), Proposal::unspecified());
+        let one = runtime.layout(&vstack((text_field("", note.binding()),)).line_height(24.0), Proposal::unspecified())
+            .unwrap();
         assert_eq!(one.fields[0].line_height, 24.0);
         assert_eq!(one.fields[0].frame.size.height, 34.0);
         assert_eq!(runs(&one), vec![9.0]);
@@ -2380,26 +2384,36 @@ mod tests {
         let view = Panel { note: State::new("alpha\nbeta\ngamma".to_string()) };
         runtime.render_stable(&view);
         let viewport = Proposal::exact(Size { width: 120.0, height: 56.0 });
-        let result = runtime.layout(&view, viewport);
+        let result = runtime.layout(&view, viewport).unwrap();
         let field = result.fields.first().expect("the editor is placed").clone();
-        assert!(runtime.pointer_clicked(field.run.origin.x, field.run.origin.y + 26.0, 1, false));
-        assert_eq!(runtime.ime_snapshot().expect("focused editor").selected, (6, 0));
-        assert!(runtime.key(EditCommand::End(false)).applied);
-        let tail = runtime.layout(&view, viewport);
-        assert_eq!(runtime.ime_snapshot().expect("focused editor").selected, (16, 0));
+        assert!(runtime.pointer_clicked(field.run.origin.x, field.run.origin.y + 26.0, 1, false)
+                .unwrap()
+        );
+        assert_eq!(runtime.ime_snapshot().unwrap().expect("focused editor").selected, (6, 0));
+        assert!(runtime.key(EditCommand::End(false)).unwrap().applied);
+        let tail = runtime.layout(&view, viewport).unwrap();
+        assert_eq!(runtime.ime_snapshot()
+                .unwrap().expect("focused editor").selected, (16, 0));
         assert_eq!(runtime.scroll_offset(&field.path).y, 26.0, "the last line fits the padded viewport");
         let caret = tail.display.iter().find_map(|command| match command {
-            DrawCommand::FillRect { rect, color, .. } if *color == crate::theme::current().caret => Some(*rect),
-            _ => None,
+            DrawCommand::FillRect { rect, color, .. } if *color == crate::theme::current().caret =>
+                {
+                    Some(*rect)
+                }
+                _ => None,
         }).expect("the focused editor paints a caret");
         assert_eq!(caret.origin.y, 27.0);
         assert_eq!(caret.size.height, 24.0, "caret covers the declared line box");
-        assert_eq!(runtime.ime_snapshot().expect("focused editor").caret_rect, caret);
-        assert!(runtime.key(EditCommand::SelectAll).applied);
-        let selected = runtime.layout(&view, viewport);
+        assert_eq!(runtime.ime_snapshot().unwrap()
+                .expect("focused editor").caret_rect, caret);
+        assert!(runtime.key(EditCommand::SelectAll).unwrap().applied);
+        let selected = runtime.layout(&view, viewport).unwrap();
         let bands = selected.display.iter().filter_map(|command| match command {
-            DrawCommand::FillRect { rect, color, .. } if *color == crate::theme::current().selection => Some(rect.size.height),
-            _ => None,
+            DrawCommand::FillRect { rect, color, .. } if *color == crate::theme::current().selection =>
+                {
+                    Some(rect.size.height)
+                }
+                _ => None,
         }).collect::<Vec<_>>();
         assert!(!bands.is_empty());
         assert!(bands.iter().all(|height| *height == 24.0), "selection uses the same line box");
@@ -2419,10 +2433,10 @@ mod tests {
         let panel = Panel { note: State::new("a\n".repeat(20)) };
         runtime.render_stable(&panel);
         let viewport = Proposal::exact(Size { width: 120.0, height: 20.0 });
-        let first = runtime.layout(&panel, viewport);
+        let first = runtime.layout(&panel, viewport).unwrap();
         let path = first.fields.first().expect("the editor is placed").path.clone();
         runtime.set_scroll_offset(&path, Point { x: 0.0, y: 10.0 });
-        let scrolled = runtime.layout(&panel, viewport);
+        let scrolled = runtime.layout(&panel, viewport).unwrap();
         let tops = scrolled.display.iter().filter_map(|command| match command {
             DrawCommand::TextLine { origin, .. } => Some(origin.y),
             _ => None,
@@ -2566,12 +2580,12 @@ mod tests {
                 .unwrap_or_default()
         };
 
-        let before = runtime.layout(&view, viewport);
+        let before = runtime.layout(&view, viewport).unwrap();
         let git = path_of(&before, "[git]");
         assert!(git.contains("[git]"), "the name is in the address: {git}");
 
         view.extra.set(true);
-        let after = runtime.layout(&view, viewport);
+        let after = runtime.layout(&view, viewport).unwrap();
         assert_eq!(path_of(&after, "[git]"), git, "a new sibling above renames nothing");
         assert!(
             runtime.render_stable(&view).contains("[.id(\"git\")]"),
@@ -2607,7 +2621,7 @@ mod tests {
 
         // 200ms of frames: still waiting
         for _ in 0..12 {
-            runtime.tick(1.0 / 60.0);
+            runtime.tick(1.0 / 60.0).unwrap();
         }
         runtime.render_stable(&view);
         assert_eq!(view.searched.get(), 0, "not yet");
@@ -2616,13 +2630,13 @@ mod tests {
         view.typed.set(2);
         runtime.render_stable(&view);
         for _ in 0..12 {
-            runtime.tick(1.0 / 60.0);
+            runtime.tick(1.0 / 60.0).unwrap();
         }
         runtime.render_stable(&view);
         assert_eq!(view.searched.get(), 0, "the restart threw the wait away");
 
         for _ in 0..4 {
-            runtime.tick(1.0 / 60.0);
+            runtime.tick(1.0 / 60.0).unwrap();
         }
         runtime.render_stable(&view);
         assert_eq!(view.searched.get(), 2, "the last keystroke is the one that searched");
@@ -2689,7 +2703,8 @@ mod tests {
         };
 
         let runtime = Runtime::new();
-        runtime.layout(&list, Proposal::exact(Size { width: 200.0, height: 100.0 }));
+        runtime.layout(&list, Proposal::exact(Size { width: 200.0, height: 100.0 }))
+            .unwrap();
         assert_eq!(
             asked.get(),
             0,
@@ -2802,6 +2817,7 @@ mod tests {
             .alignment(alignment);
             runtime
                 .layout(&row, Proposal::exact(Size { width: 120.0, height: 20.0 }))
+                .unwrap()
                 .display
                 .iter()
                 .find_map(|command| match command {
@@ -2831,9 +2847,8 @@ mod tests {
             fn body(self) -> impl View {
                 let items =
                     if self.flipped.get() { vec!["b", "a"] } else { vec!["a", "b"] };
-                for_each(items, |id| id.to_string(), |id| {
-                    text(*id).animated(Spring::smooth())
-                })
+                for_each(items, |id| id.to_string(), |id| text(*id).animated(Spring::smooth()),
+                )
             }
         }
 
@@ -2843,10 +2858,7 @@ mod tests {
                 .iter()
                 .find_map(|command| match command {
                     crate::layout::DrawCommand::TextLine { origin, content, .. }
-                        if content.as_ref() == needle =>
-                    {
-                        Some(origin.y)
-                    }
+                        if content.as_ref() == needle => Some(origin.y),
                     _ => None,
                 })
                 .expect("the row paints its text")
@@ -2854,21 +2866,21 @@ mod tests {
 
         let board = Board { flipped: State::new(false) };
         let runtime = Runtime::new();
-        let mounted = runtime.display_frame(&board, size);
+        let mounted = runtime.display_frame(&board, size).unwrap();
         assert_eq!(line_of(&mounted, "a"), 0.0);
         assert_eq!(line_of(&mounted, "b"), 16.0);
         assert!(!runtime.wants_frame(), "mount seeds at rest");
 
         // the flip: same frame still paints the OLD positions
         board.flipped.set(true);
-        let held = runtime.display_frame(&board, size);
+        let held = runtime.display_frame(&board, size).unwrap();
         assert_eq!(line_of(&held, "a"), 0.0, "the flight starts from rest");
         assert_eq!(line_of(&held, "b"), 16.0);
         assert!(runtime.wants_frame());
 
         // in flight: strictly between the endpoints
-        runtime.tick(1.0 / 120.0);
-        let flying = runtime.animation_frame(&board, size);
+        runtime.tick(1.0 / 120.0).unwrap();
+        let flying = runtime.animation_frame(&board, size).unwrap();
         let a = line_of(&flying, "a");
         let b = line_of(&flying, "b");
         assert!(a > 0.0 && a < 16.0, "a slides down: {a}");
@@ -2877,15 +2889,16 @@ mod tests {
         // run dry: the settled frame IS the plain frame
         let mut guard = 0;
         while runtime.wants_frame() && guard < 600 {
-            runtime.tick(1.0 / 120.0);
-            let _ = runtime.animation_frame(&board, size);
+            runtime.tick(1.0 / 120.0).unwrap();
+            let _ = runtime.animation_frame(&board, size).unwrap();
             guard += 1;
         }
         assert!(guard < 600, "the slide settles");
-        let settled = runtime.animation_frame(&board, size);
+        let settled = runtime.animation_frame(&board, size).unwrap();
         let control = Runtime::new();
         let target =
-            control.display_frame(&Board { flipped: State::new(true) }, size);
+            control.display_frame(&Board { flipped: State::new(true) }, size)
+            .unwrap();
         assert_eq!(settled.as_slice(), target.as_slice());
     }
 
@@ -2920,7 +2933,7 @@ mod tests {
 
         let size = crate::layout::Size { width: 20.0, height: 20.0 };
         let runtime = Runtime::new();
-        let mounted = runtime.display_frame(&Mark, size);
+        let mounted = runtime.display_frame(&Mark, size).unwrap();
         assert_eq!(red_of(&mounted), 0, "the clock seeds on the still frame");
         assert!(runtime.wants_frame(), "a live loop keeps frames coming");
         assert_eq!(
@@ -2930,29 +2943,29 @@ mod tests {
         );
 
         // inside the first step: nothing anywhere
-        assert!(!runtime.tick(0.1).any());
-        assert!(runtime.live_islands(1).is_empty());
+        assert!(!runtime.tick(0.1).unwrap().any());
+        assert!(runtime.live_islands(1).unwrap().is_empty());
 
         // crossing a step: the island repaints, the scene never asked
-        let moved = runtime.tick(0.16);
+        let moved = runtime.tick(0.16).unwrap();
         assert!(moved.islands && !moved.scene, "a loop never asks for layout");
-        let blits = runtime.live_islands(1);
+        let blits = runtime.live_islands(1).unwrap();
         assert_eq!(blits.len(), 1);
         let first = &blits[0];
         assert_eq!((first.width, first.height), (20, 20));
         assert_eq!(first.frame.size.width, 20.0);
         assert_eq!(first.rgba[0], 64, "the pixels carry the quarter phase");
-        assert!(runtime.live_islands(1).is_empty(), "the step was drained");
+        assert!(runtime.live_islands(1).unwrap().is_empty(), "the step was drained");
 
         // the next step paints a DIFFERENT picture
-        assert!(runtime.tick(0.25).islands);
-        let second = runtime.live_islands(1);
+        assert!(runtime.tick(0.25).unwrap().islands);
+        let second = runtime.live_islands(1).unwrap();
         assert_eq!(second.len(), 1);
         assert_ne!(second[0].rgba[0], first.rgba[0]);
 
         // an ordinary scene frame paints the CURRENT phase — the box
         // never jumps back when the app changes around it
-        let scene = runtime.animation_frame(&Mark, size);
+        let scene = runtime.animation_frame(&Mark, size).unwrap();
         assert_eq!(red_of(&scene), second[0].rgba[0]);
     }
 
@@ -2978,7 +2991,7 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = crate::layout::Size { width: 120.0, height: 20.0 };
-        let full = runtime.display_frame(&Bar, size);
+        let full = runtime.display_frame(&Bar, size).unwrap();
         let slices = runtime.live_slices();
         assert_eq!(slices.len(), 1, "one live box, one slice");
         // the scene DOES hold the box — carving is a choice, and a
@@ -3026,12 +3039,12 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = crate::layout::Size { width: 8.0, height: 8.0 };
-        let _ = runtime.display_frame(&Steady, size);
-        assert!(runtime.tick(0.15).islands);
-        assert_eq!(runtime.live_islands(1).len(), 1, "the first step seeds the ledger");
-        assert!(runtime.tick(0.1).islands);
+        let _ = runtime.display_frame(&Steady, size).unwrap();
+        assert!(runtime.tick(0.15).unwrap().islands);
+        assert_eq!(runtime.live_islands(1).unwrap().len(), 1, "the first step seeds the ledger");
+        assert!(runtime.tick(0.1).unwrap().islands);
         assert!(
-            runtime.live_islands(1).is_empty(),
+            runtime.live_islands(1).unwrap().is_empty(),
             "the ledger drops a step that paints the same picture"
         );
     }
@@ -3056,17 +3069,17 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = crate::layout::Size { width: 12.0, height: 12.0 };
-        let _ = runtime.display_frame(&Mark, size);
+        let _ = runtime.display_frame(&Mark, size).unwrap();
         // the first ordinary present seeds the surface...
-        assert_eq!(runtime.live_islands_all(1).len(), 1);
+        assert_eq!(runtime.live_islands_all(1).unwrap().len(), 1);
         // ...and the next one (a wake, a poll — no step between them)
         // rasters NOTHING: the ledger answers for the app's chatter
-        assert!(runtime.live_islands_all(1).is_empty());
+        assert!(runtime.live_islands_all(1).unwrap().is_empty());
         // the placement is still re-announced for the layer to follow
         assert_eq!(runtime.live_frames().len(), 1);
         // a real step still repaints exactly once
-        assert!(runtime.tick(0.3).islands);
-        assert_eq!(runtime.live_islands(1).len(), 1);
+        assert!(runtime.tick(0.3).unwrap().islands);
+        assert_eq!(runtime.live_islands(1).unwrap().len(), 1);
     }
 
     /// A live box owns a surface, and a surface holds the pixels it was
@@ -3101,41 +3114,41 @@ mod tests {
 
         let runtime = Runtime::new();
         let narrow = crate::layout::Size { width: 100.0, height: 40.0 };
-        let _ = runtime.display_frame(&Caret, narrow);
-        let seed = runtime.live_islands_all(1);
+        let _ = runtime.display_frame(&Caret, narrow).unwrap();
+        let seed = runtime.live_islands_all(1).unwrap();
         assert_eq!(seed.len(), 1, "the first present seeds the surface");
         assert_eq!(seed[0].width, 2, "only the opaque caret needs storage");
         // an unchanged frame still costs no raster — the whole point of
         // the ledger, and it must survive this fix
-        assert!(runtime.live_islands_all(1).is_empty());
+        assert!(runtime.live_islands_all(1).unwrap().is_empty());
 
         // the window grows. The box paints the SAME two-by-twelve bar,
         // so the cropped picture is unchanged. The ledger still owes a
         // fresh size decision instead of stretching the preceding texture.
         let wide = crate::layout::Size { width: 300.0, height: 40.0 };
-        let _ = runtime.display_frame(&Caret, wide);
-        let grown = runtime.live_islands_all(1);
+        let _ = runtime.display_frame(&Caret, wide).unwrap();
+        let grown = runtime.live_islands_all(1).unwrap();
         assert_eq!(grown.len(), 1, "a box that grew owes new pixels");
         assert_eq!(grown[0].width, 2, "the new size still contains the whole caret");
         assert_eq!(grown[0].frame.size.width, 2.0, "placed without stretching");
         assert_eq!(grown[0].rgba, seed[0].rgba);
         // and settling at the new size goes quiet again
-        assert!(runtime.live_islands_all(1).is_empty());
+        assert!(runtime.live_islands_all(1).unwrap().is_empty());
 
         // the same law for the SCALE: dragging the window to a retina
         // screen re-rasters, because those are new pixels too
-        let retina = runtime.live_islands_all(2);
+        let retina = runtime.live_islands_all(2).unwrap();
         assert_eq!(retina.len(), 1, "a new scale is new pixels");
         assert_eq!(retina[0].width, 4);
         assert_eq!(retina[0].height, 24);
         assert_eq!(retina[0].frame, grown[0].frame);
-        assert!(runtime.live_islands_all(2).is_empty());
+        assert!(runtime.live_islands_all(2).unwrap().is_empty());
 
         // Same physical canvas, different device scale: the caret still
         // occupies two logical points and needs a different number of pixels.
         let double = crate::layout::Size { width: 600.0, height: 80.0 };
-        let _ = runtime.display_frame(&Caret, double);
-        let low_density = runtime.live_islands_all(1);
+        let _ = runtime.display_frame(&Caret, double).unwrap();
+        let low_density = runtime.live_islands_all(1).unwrap();
         assert_eq!(low_density.len(), 1);
         assert_eq!((low_density[0].width, low_density[0].height), (2, 12));
         assert_eq!(low_density[0].frame, retina[0].frame);
@@ -3168,12 +3181,15 @@ mod tests {
         }
 
         let runtime = Runtime::new();
-        let short = runtime.display_frame(&Bar, crate::layout::Size { width: 400.0, height: 300.0 });
+        let short = runtime.display_frame(&Bar, crate::layout::Size { width: 400.0, height: 300.0 })
+            .unwrap();
         let _ = short;
         let before = runtime.live_frames();
         assert_eq!(before.len(), 1);
 
-        let _ = runtime.display_frame(&Bar, crate::layout::Size { width: 400.0, height: 900.0 });
+        let _ = runtime.display_frame(&Bar, crate::layout::Size { width: 400.0, height: 900.0 },
+            )
+            .unwrap();
         let after = runtime.live_frames();
         assert_eq!(
             after[0].1.origin, before[0].1.origin,
@@ -3205,19 +3221,19 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = crate::layout::Size { width: 200.0, height: 60.0 };
-        let _ = runtime.display_frame(&Mark, size);
-        assert_eq!(runtime.live_islands_all(1).len(), 1, "the first present seeds it");
-        assert!(runtime.live_islands_all(1).is_empty(), "and the next one costs nothing");
+        let _ = runtime.display_frame(&Mark, size).unwrap();
+        assert_eq!(runtime.live_islands_all(1).unwrap().len(), 1, "the first present seeds it");
+        assert!(runtime.live_islands_all(1).unwrap().is_empty(), "and the next one costs nothing");
 
         // the shell took the surfaces away — the box was drawn into the
         // scene while the window changed size
         runtime.forget_live_surfaces();
         assert_eq!(
-            runtime.live_islands_all(1).len(),
+            runtime.live_islands_all(1).unwrap().len(),
             1,
             "the surface is gone, so the picture is owed again",
         );
-        assert!(runtime.live_islands_all(1).is_empty(), "and then it settles");
+        assert!(runtime.live_islands_all(1).unwrap().is_empty(), "and then it settles");
     }
 
     #[test]
@@ -3240,7 +3256,7 @@ mod tests {
         let runtime = Runtime::new();
         assert_eq!(runtime.last_viewport(), None, "nothing was laid out yet");
         let size = crate::layout::Size { width: 220.0, height: 140.0 };
-        let _ = runtime.display_frame(&Mark, size);
+        let _ = runtime.display_frame(&Mark, size).unwrap();
         assert_eq!(
             runtime.last_viewport(),
             Some(size),
@@ -3269,7 +3285,7 @@ mod tests {
         let runtime = Runtime::new();
         runtime.set_reduce_motion(true);
         let size = crate::layout::Size { width: 20.0, height: 20.0 };
-        let mounted = runtime.display_frame(&Mark, size);
+        let mounted = runtime.display_frame(&Mark, size).unwrap();
         let red = mounted
             .iter()
             .find_map(|command| match command {
@@ -3279,7 +3295,7 @@ mod tests {
             .expect("the box paints its fill");
         assert_eq!(red, 128, "the resting frame, not the start of the loop");
         assert!(!runtime.wants_frame(), "no clock runs for a reduced-motion user");
-        assert!(!runtime.tick(1.0).any());
+        assert!(!runtime.tick(1.0).unwrap().any());
         assert_eq!(runtime.frame_pace(), crate::anim::FramePace::Idle);
     }
 
@@ -3315,21 +3331,21 @@ mod tests {
 
         let size = crate::layout::Size { width: 100.0, height: 100.0 };
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&Rows, size);
+        let _ = runtime.display_frame(&Rows, size).unwrap();
         assert!(!runtime.wants_frame());
 
         // a wheel scroll moves the anchor, not the springs
         assert!(runtime.wheel(10.0, 10.0, 0.0, -40.0));
-        let scrolled = runtime.display_frame(&Rows, size);
+        let scrolled = runtime.display_frame(&Rows, size).unwrap();
         assert!(
             !runtime.wants_frame(),
             "scrolling is 1:1 — no spring armed by the offset"
         );
 
         let control = Runtime::new();
-        let _ = control.display_frame(&Plain, size);
+        let _ = control.display_frame(&Plain, size).unwrap();
         assert!(control.wheel(10.0, 10.0, 0.0, -40.0));
-        let plain = control.display_frame(&Plain, size);
+        let plain = control.display_frame(&Plain, size).unwrap();
         assert_eq!(scrolled.as_slice(), plain.as_slice());
     }
 
@@ -3357,26 +3373,26 @@ mod tests {
         let size = crate::layout::Size { width: 100.0, height: 48.0 };
         let revealer = Revealer { selected: State::new(0) };
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&revealer, size);
+        let _ = runtime.display_frame(&revealer, size).unwrap();
         assert_eq!(runtime.scroll_offset("Revealer").y, 0.0);
 
         // the reveal flies instead of snapping
         revealer.selected.set(8);
-        let _ = runtime.display_frame(&revealer, size);
+        let _ = runtime.display_frame(&revealer, size).unwrap();
         assert_eq!(
             runtime.scroll_offset("Revealer").y,
             0.0,
             "the offset has not jumped"
         );
         assert!(runtime.wants_frame(), "the flight is armed");
-        runtime.tick(1.0 / 120.0);
+        runtime.tick(1.0 / 120.0).unwrap();
         let mid = runtime.scroll_offset("Revealer").y;
         assert!(mid > 0.0, "the offset is moving: {mid}");
 
         let mut guard = 0;
         while runtime.wants_frame() && guard < 600 {
-            runtime.tick(1.0 / 120.0);
-            let _ = runtime.animation_frame(&revealer, size);
+            runtime.tick(1.0 / 120.0).unwrap();
+            let _ = runtime.animation_frame(&revealer, size).unwrap();
             guard += 1;
         }
         assert!(guard < 600, "the reveal settles");
@@ -3386,7 +3402,7 @@ mod tests {
 
         // a new flight, and the wheel kills it mid-air
         revealer.selected.set(2);
-        let _ = runtime.display_frame(&revealer, size);
+        let _ = runtime.display_frame(&revealer, size).unwrap();
         assert!(runtime.wants_frame());
         assert!(runtime.wheel(10.0, 10.0, 0.0, 8.0));
         assert!(!runtime.wants_frame(), "the wheel is sovereign");
@@ -3417,9 +3433,9 @@ mod tests {
         let size = crate::layout::Size { width: 80.0, height: 32.0 };
         let framed = Framed { on: State::new(false) };
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&framed, size);
+        let _ = runtime.display_frame(&framed, size).unwrap();
         framed.on.set(true);
-        let _ = runtime.display_frame(&framed, size);
+        let _ = runtime.display_frame(&framed, size).unwrap();
         assert!(runtime.wants_frame(), "the border is in flight");
 
         // …but a child component's colors are its own business: the
@@ -3449,9 +3465,9 @@ mod tests {
 
         let outer = Outer { inner: Inner { on: State::new(false) } };
         let sealed = Runtime::new();
-        let _ = sealed.display_frame(&outer, size);
+        let _ = sealed.display_frame(&outer, size).unwrap();
         outer.inner.on.set(true);
-        let flipped = sealed.display_frame(&outer, size);
+        let flipped = sealed.display_frame(&outer, size).unwrap();
         let fill = flipped
             .iter()
             .find_map(|command| match command {
@@ -3487,9 +3503,9 @@ mod tests {
         let chip = Chip { on: State::new(false) };
         let runtime = Runtime::new();
         runtime.set_reduce_motion(true);
-        let _ = runtime.display_frame(&chip, size);
+        let _ = runtime.display_frame(&chip, size).unwrap();
         chip.on.set(true);
-        let flipped = runtime.display_frame(&chip, size);
+        let flipped = runtime.display_frame(&chip, size).unwrap();
         let fill = flipped
             .iter()
             .find_map(|command| match command {
@@ -3499,7 +3515,7 @@ mod tests {
             .expect("the chip paints a background");
         assert_eq!(fill, ON, "reduce motion jumps to the target");
         assert!(!runtime.wants_frame());
-        assert!(!runtime.tick(1.0 / 120.0).any());
+        assert!(!runtime.tick(1.0 / 120.0).unwrap().any());
     }
 
     #[test]
@@ -3508,7 +3524,7 @@ mod tests {
         // animation reports no repaint and no wish for a next frame —
         // the shell parks the display link on this answer
         let runtime = Runtime::new();
-        assert!(!runtime.tick(1.0 / 120.0).any());
+        assert!(!runtime.tick(1.0 / 120.0).unwrap().any());
         assert!(!runtime.wants_frame());
     }
 
@@ -3526,9 +3542,9 @@ mod tests {
         let runtime = Runtime::new();
         let size = crate::layout::Size { width: 200.0, height: 100.0 };
         // a real event frame mounts the tree (settle + layout)
-        let event_frame = runtime.display_frame(&Label, size);
+        let event_frame = runtime.display_frame(&Label, size).unwrap();
         // the tick frame: layout only — same pixels, zero bodies
-        let tick_frame = runtime.animation_frame(&Label, size);
+        let tick_frame = runtime.animation_frame(&Label, size).unwrap();
         assert!(runtime.body_runs().is_empty(), "a tick never runs a body");
         assert_eq!(tick_frame.as_slice(), event_frame.as_slice());
     }
@@ -3553,9 +3569,9 @@ mod tests {
         let page = Page { count: State::new(0) };
         let size = crate::layout::Size { width: 200.0, height: 100.0 };
         for runtime in [Runtime::new(), Runtime::scene("w0")] {
-            let mounted = runtime.display_frame(&page, size);
+            let mounted = runtime.display_frame(&page, size).unwrap();
             let _ = crate::stats::take();
-            let again = runtime.animation_frame(&page, size);
+            let again = runtime.animation_frame(&page, size).unwrap();
             let stats = crate::stats::take();
             assert_eq!(stats.body_passes, 0, "a stable frame runs no pass");
             assert_eq!(stats.assemblies, 0, "and rebuilds no table");
@@ -3563,7 +3579,7 @@ mod tests {
 
             // a change still gets its pass, and the picture follows
             page.count.set(page.count.get() + 1);
-            let changed = runtime.display_frame(&page, size);
+            let changed = runtime.display_frame(&page, size).unwrap();
             assert_ne!(changed.as_slice(), mounted.as_slice(), "the new count is on screen");
         }
     }
@@ -3597,21 +3613,21 @@ mod tests {
         crate::paranoid::force(crate::paranoid::ASSEMBLE);
         for runtime in [Runtime::new(), Runtime::scene("w0")] {
             counter.label.set(1);
-            let _ = runtime.display_frame(&counter, size);
+            let _ = runtime.display_frame(&counter, size).unwrap();
             let _ = crate::stats::take();
             for _ in 0..3 {
-                let _ = runtime.display_frame(&counter, size);
+                let _ = runtime.display_frame(&counter, size).unwrap();
             }
             assert_eq!(crate::stats::take().assemblies, 0, "three clean frames, no table rebuilt");
 
-            runtime.pointer_clicked(100.0, 30.0, 1, false);
+            runtime.pointer_clicked(100.0, 30.0, 1, false).unwrap();
             runtime.pointer_released(100.0, 30.0);
             assert_eq!(counter.pressed.get(), 1, "the kept table still answers");
 
             counter.label.set(7);
-            let _ = runtime.display_frame(&counter, size);
+            let _ = runtime.display_frame(&counter, size).unwrap();
             assert!(crate::stats::take().entries_indexed >= 1, "a body ran: its registrations entered the tables");
-            runtime.pointer_clicked(100.0, 30.0, 1, false);
+            runtime.pointer_clicked(100.0, 30.0, 1, false).unwrap();
             runtime.pointer_released(100.0, 30.0);
             assert_eq!(counter.pressed.get(), 7, "the new closure answers the same frame");
         }
@@ -3646,7 +3662,7 @@ mod tests {
         let size = crate::layout::Size { width: 200.0, height: 60.0 };
         let runtime = Runtime::scene("w0");
         assert!(runtime.needs_frame(), "a newborn scene needs its first frame");
-        let _ = runtime.display_frame(&feed, size);
+        let _ = runtime.display_frame(&feed, size).unwrap();
 
         // a turn of tasks that wrote nothing
         runtime.poll_tasks();
@@ -3656,7 +3672,7 @@ mod tests {
         feed.seen.set(1);
         let need = runtime.frame_need();
         assert!(need.dirty && need.wrote, "{need:?}");
-        let _ = runtime.display_frame(&feed, size);
+        let _ = runtime.display_frame(&feed, size).unwrap();
         assert!(!runtime.needs_frame(), "the frame served it");
 
         // a write NO view reads, that an `on_change` watches: only a
@@ -3664,20 +3680,20 @@ mod tests {
         feed.quiet.set(5);
         let need = runtime.frame_need();
         assert!(need.wrote && !need.dirty, "{need:?}");
-        let _ = runtime.display_frame(&feed, size);
+        let _ = runtime.display_frame(&feed, size).unwrap();
         assert_eq!(feed.heard.get(), 5, "the watcher fired on that frame");
 
         // the engine doors that move what a frame shows
         runtime.set_scroll_offset("w0/Feed", crate::layout::Point { x: 0.0, y: 4.0 });
         assert!(runtime.frame_need().asked, "a programmatic scroll");
-        let _ = runtime.display_frame(&feed, size);
+        let _ = runtime.display_frame(&feed, size).unwrap();
         assert!(!runtime.needs_frame());
 
         // …and the ones a shell calls on EVERY frame ask only when the
         // answer is new, or a frame would always ask for the next
         runtime.set_device_scale(2.0);
         assert!(runtime.frame_need().asked);
-        let _ = runtime.display_frame(&feed, size);
+        let _ = runtime.display_frame(&feed, size).unwrap();
         runtime.set_device_scale(2.0);
         runtime.set_overlay_bounds(None);
         assert!(!runtime.needs_frame(), "the same answers ask for nothing");
@@ -3685,17 +3701,17 @@ mod tests {
         // a task that changed data the engine cannot see says so
         crate::request_frame();
         assert!(runtime.frame_need().asked);
-        let _ = runtime.display_frame(&feed, size);
+        let _ = runtime.display_frame(&feed, size).unwrap();
         assert!(!runtime.needs_frame());
 
         // the environment, the insets
         runtime.set_environment(|_| {});
         assert!(runtime.frame_need().environment);
-        let _ = runtime.display_frame(&feed, size);
+        let _ = runtime.display_frame(&feed, size).unwrap();
         runtime.set_keyboard_inset(120.0);
         let need = runtime.frame_need();
         assert!(need.insets || need.environment, "{need:?}");
-        let _ = runtime.display_frame(&feed, size);
+        let _ = runtime.display_frame(&feed, size).unwrap();
         assert!(!runtime.needs_frame());
     }
 
@@ -3748,16 +3764,16 @@ mod tests {
         for lit in [false, true] {
             let rows = Rows { lit };
             let runtime = Runtime::scene("w0");
-            let _ = runtime.display_frame(&rows, size);
-            runtime.pointer_moved(100.0, 50.0, false);
-            let first = runtime.display_frame(&rows, size);
+            let _ = runtime.display_frame(&rows, size).unwrap();
+            runtime.pointer_moved(100.0, 50.0, false).unwrap();
+            let first = runtime.display_frame(&rows, size).unwrap();
             assert_eq!(paints_hot(&first), lit, "the row under the pointer is lit only when it can be");
             let before = runtime.interaction().hovered;
 
             // one whole row of travel: another row is under the pointer
             let _ = crate::stats::take();
             assert!(runtime.wheel(100.0, 50.0, 0.0, -20.0));
-            let scrolled = runtime.display_frame(&rows, size);
+            let scrolled = runtime.display_frame(&rows, size).unwrap();
             let stats = crate::stats::take();
             let after = runtime.interaction().hovered;
             assert_ne!(before, after, "the target stays honest: the re-read always runs");
@@ -3788,7 +3804,9 @@ mod tests {
             }
         }
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&Page, Size { width: 200.0, height: 100.0 });
+        let _ = runtime.display_frame(&Page, Size { width: 200.0, height: 100.0 },
+            )
+            .unwrap();
         let slot = crate::reconciler::slot_of("Page");
         let font = crate::text_engine::FontSpec { size: 13.0, ..crate::text_engine::FontSpec::DEFAULT };
         let keys: Vec<MeasureKey> = [
@@ -3802,18 +3820,20 @@ mod tests {
         .into_iter()
         .map(|(width, height)| MeasureKey { proposal: Proposal { width, height }, font, line_height: None })
         .collect();
-        let answer = |_: &crate::layout::LayoutNode| (Size { width: 360.0, height: 42.0 }, Fit::Leaf);
+        let answer = |_: &crate::layout::LayoutNode| {
+            Ok((Size { width: 360.0, height: 42.0 }, Fit::Leaf))
+        };
 
         let _ = crate::stats::take();
         for key in &keys {
-            let _ = crate::reconciler::measure_retained(&slot, "Page", *key, answer);
+            let _ = crate::reconciler::measure_retained(&slot, "Page", *key, answer).unwrap();
         }
         let first = crate::stats::take();
         assert_eq!(first.measures_made, 6, "six questions, six measures the first time: {first:?}");
 
         let _ = crate::stats::take();
         for key in &keys {
-            let _ = crate::reconciler::measure_retained(&slot, "Page", *key, answer);
+            let _ = crate::reconciler::measure_retained(&slot, "Page", *key, answer).unwrap();
         }
         let again = crate::stats::take();
         assert_eq!(again.measures_made, 0, "the same six questions are all answered from what was kept: {again:?}");
@@ -3861,12 +3881,12 @@ mod tests {
         let size = crate::layout::Size { width: 600.0, height: 200.0 };
         crate::paranoid::force(crate::paranoid::MEMO);
         let runtime = Runtime::scene("w0");
-        let narrow = runtime.display_frame(&page, size);
+        let narrow = runtime.display_frame(&page, size).unwrap();
 
         // clean frames: one question at the root, answered from what was kept
         let _ = crate::stats::take();
         for _ in 0..3 {
-            let again = runtime.display_frame(&page, size);
+            let again = runtime.display_frame(&page, size).unwrap();
             assert_eq!(again.as_slice(), narrow.as_slice());
         }
         let stats = crate::stats::take();
@@ -3877,7 +3897,7 @@ mod tests {
         // the middle keep their entries — and must not keep their measures
         page.wide.set(true);
         let _ = crate::stats::take();
-        let wide = runtime.display_frame(&page, size);
+        let wide = runtime.display_frame(&page, size).unwrap();
         let stats = crate::stats::take();
         assert!(stats.measures_made >= 1, "the boundaries above the leaf were measured again: {stats:?}");
         assert_ne!(wide.as_slice(), narrow.as_slice(), "the wider label moved the bar beside it");
@@ -3889,10 +3909,7 @@ mod tests {
                 .iter()
                 .find_map(|command| match command {
                     crate::layout::DrawCommand::TextLine { origin, content, .. }
-                        if &**content == "|" =>
-                    {
-                        Some(origin.x)
-                    }
+                        if &**content == "|" => Some(origin.x),
                     _ => None,
                 })
                 .expect("the bar is drawn")
@@ -3951,12 +3968,12 @@ mod tests {
                 stable,
             };
             let runtime = Runtime::scene("w0");
-            let first = runtime.display_frame(&holder, size);
+            let first = runtime.display_frame(&holder, size).unwrap();
             let asked = holder.asked.get();
             if stable {
                 // it promised its answer hangs on the question alone, and
                 // it keeps the promise: it is not asked again
-                let second = runtime.display_frame(&holder, size);
+                let second = runtime.display_frame(&holder, size).unwrap();
                 // (the paranoid check measures again on purpose: it is the
                 // one reader allowed to ask twice)
                 if !crate::paranoid::on(crate::paranoid::MEMO) {
@@ -3966,7 +3983,7 @@ mod tests {
             } else {
                 // the document grows with NO state write
                 holder.height.set(120.0);
-                let second = runtime.display_frame(&holder, size);
+                let second = runtime.display_frame(&holder, size).unwrap();
                 assert!(holder.asked.get() > asked, "its own measure: asked on every frame");
                 assert_ne!(second.as_slice(), first.as_slice(), "the label below moved down");
             }
@@ -4027,15 +4044,15 @@ mod tests {
         let frames = |kept: bool| {
             let page = Page { version: State::new(1), painted: Rc::new(Cell::new(0)), kept };
             let runtime = Runtime::scene(if kept { "kept" } else { "plain" });
-            let mut pictures = vec![runtime.display_frame(&page, size)];
+            let mut pictures = vec![runtime.display_frame(&page, size).unwrap()];
             for _ in 0..4 {
                 assert!(runtime.wheel(100.0, 150.0, 0.0, -10.0));
-                pictures.push(runtime.display_frame(&page, size));
+                pictures.push(runtime.display_frame(&page, size).unwrap());
             }
             let painted_while_scrolling = page.painted.get();
             // the data moved: the app says so with a new version
             page.version.set(2);
-            pictures.push(runtime.display_frame(&page, size));
+            pictures.push(runtime.display_frame(&page, size).unwrap());
             (pictures, painted_while_scrolling, page.painted.get())
         };
 
@@ -4069,11 +4086,11 @@ mod tests {
 
         let runtime = Runtime::scene("w0");
         let size = crate::layout::Size { width: 300.0, height: 100.0 };
-        let first = runtime.display_frame(&First, size);
+        let first = runtime.display_frame(&First, size).unwrap();
         // the stable frame of the NEW root must not answer with the old
         // boundary, which the retention still holds
         runtime.render_stable(&Second);
-        let second = runtime.animation_frame(&Second, size);
+        let second = runtime.animation_frame(&Second, size).unwrap();
         assert_ne!(second.as_slice(), first.as_slice(), "the second root is what is laid out");
     }
 
@@ -4179,7 +4196,7 @@ mod tests {
         runtime.render_stable(&screen);
 
         let viewport = Proposal { width: Some(200.0), height: Some(100.0) };
-        let result = runtime.layout(&screen, viewport);
+        let result = runtime.layout(&screen, viewport).unwrap();
 
         assert_eq!(result.size.height, 100.0);
         let screen_frame = result.frames.get("Screen").unwrap();
@@ -4191,7 +4208,7 @@ mod tests {
         // change the state → only the Title re-runs (fine invalidation) and
         // the next layout reflects the new text — with the REST from the cache
         screen.title.count.set(42);
-        let result = runtime.layout(&screen, viewport);
+        let result = runtime.layout(&screen, viewport).unwrap();
         assert_eq!(runtime.body_runs(), vec!["Screen/#0/Title".to_string()]);
         let title = result.frames.get("Screen/#0/Title").unwrap();
         // "count: 42" = 9 chars × 8px — the frame follows the content
@@ -4222,7 +4239,7 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&bench);
         let viewport = Proposal::exact(Size { width: 1200.0, height: 700.0 });
-        let result = runtime.layout(&bench, viewport);
+        let result = runtime.layout(&bench, viewport).unwrap();
 
         // the grip is where the seam is
         let (grip_path, grip) = result
@@ -4234,10 +4251,10 @@ mod tests {
         let grip_center_x = grip.origin.x + grip.size.width / 2.0;
 
         // press the grip, drag right: the binding follows the pointer
-        assert!(runtime.pointer_pressed(grip_center_x, 300.0));
-        assert!(runtime.pointer_moved(400.0, 300.0, false));
+        assert!(runtime.pointer_pressed(grip_center_x, 300.0).unwrap());
+        assert!(runtime.pointer_moved(400.0, 300.0, false).unwrap());
         assert_eq!(bench.seam.get(), 400.0);
-        let dragged = runtime.layout(&bench, viewport);
+        let dragged = runtime.layout(&bench, viewport).unwrap();
         let moved = dragged
             .hits
             .iter()
@@ -4247,12 +4264,12 @@ mod tests {
         assert!((moved.1.origin.x + moved.1.size.width / 2.0 - 400.5).abs() < 0.75);
 
         // past the floor the clamp holds — and a release fires nothing
-        runtime.pointer_moved(5.0, 300.0, false);
+        runtime.pointer_moved(5.0, 300.0, false).unwrap();
         assert_eq!(bench.seam.get(), 120.0);
         assert_eq!(runtime.pointer_released(5.0, 300.0), None);
 
         // after the release the pointer is free again: moving does not drag
-        runtime.pointer_moved(700.0, 300.0, false);
+        runtime.pointer_moved(700.0, 300.0, false).unwrap();
         assert_eq!(bench.seam.get(), 120.0);
         let _ = grip_path;
     }
@@ -4281,7 +4298,7 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&bench);
         let viewport = Proposal::exact(Size { width: 1200.0, height: 700.0 });
-        let result = runtime.layout(&bench, viewport);
+        let result = runtime.layout(&bench, viewport).unwrap();
 
         // The seam sits 248 from the TRAILING edge, not from the leading one.
         let grip = result
@@ -4295,8 +4312,8 @@ mod tests {
 
         // Drag it LEFT and the dock gets wider — the pointer names the
         // dock's edge, and the dock is what the binding holds.
-        assert!(runtime.pointer_pressed(centre, 300.0));
-        assert!(runtime.pointer_moved(800.0, 300.0, false));
+        assert!(runtime.pointer_pressed(centre, 300.0).unwrap());
+        assert!(runtime.pointer_moved(800.0, 300.0, false).unwrap());
         assert!(
             (bench.seam.get() - (1199.0 - 800.0)).abs() < 1.0,
             "the far lane is what was written: {}",
@@ -4305,7 +4322,7 @@ mod tests {
 
         // The floors still name the lanes: pushing the grip at the window's
         // edge cannot squeeze the LEADING lane under its own floor.
-        runtime.pointer_moved(10.0, 300.0, false);
+        runtime.pointer_moved(10.0, 300.0, false).unwrap();
         assert!(
             (bench.seam.get() - (1199.0 - 320.0)).abs() < 1.0,
             "the editor keeps its 320: {}",
@@ -4336,7 +4353,9 @@ mod tests {
         // and the grip sits on its middle, half a point past the lane
         let lane = |width: f64| {
             let result =
-                runtime.layout(&panes, Proposal::exact(Size { width, height: 400.0 }));
+                runtime.layout(&panes, Proposal::exact(Size { width, height: 400.0 }),
+                )
+                .unwrap();
             let grip = result
                 .hits
                 .iter()
@@ -4367,7 +4386,8 @@ mod tests {
         runtime.render_stable(&pinned);
         let pinned_lane = |width: f64| {
             let result =
-                runtime.layout(&pinned, Proposal::exact(Size { width, height: 400.0 }));
+                runtime.layout(&pinned, Proposal::exact(Size { width, height: 400.0 }))
+                .unwrap();
             let grip = result
                 .hits
                 .iter()
@@ -4405,7 +4425,9 @@ mod tests {
         let bench = Bench { dock: State::new(200.0), pane: State::new(200.0) };
         let runtime = Runtime::new();
         runtime.render_stable(&bench);
-        let result = runtime.layout(&bench, Proposal::exact(Size { width: 800.0, height: 400.0 }));
+        let result = runtime.layout(&bench, Proposal::exact(Size { width: 800.0, height: 400.0 }),
+            )
+            .unwrap();
         let grips: Vec<_> = result
             .hits
             .iter()
@@ -4436,7 +4458,7 @@ mod tests {
         // hovering a grip names the way THAT seam travels
         for (path, rect) in &grips {
             let (x, y) = centre(*rect);
-            runtime.pointer_moved(x, y, false);
+            runtime.pointer_moved(x, y, false).unwrap();
             let want = match rect.size.height > rect.size.width {
                 true => Axis::Horizontal,
                 false => Axis::Vertical,
@@ -4447,16 +4469,16 @@ mod tests {
         // and a drag under way keeps it, even while the hand runs
         // ahead of the seam and off every hit in the scene
         let (x, y) = centre(stacked_rect);
-        runtime.pointer_pressed(x, y);
+        runtime.pointer_pressed(x, y).unwrap();
         // the drag holds the SPLIT's path; the grip's suffix was the hit
         assert_eq!(
             runtime.interaction().split_drag.as_deref(),
             stacked.strip_suffix("/#split"),
         );
-        runtime.pointer_moved(x, y - 90.0, false);
+        runtime.pointer_moved(x, y - 90.0, false).unwrap();
         assert_eq!(runtime.seam_axis(), Some(Axis::Vertical), "the drag keeps the resizer");
         runtime.pointer_released(x, y - 90.0);
-        runtime.pointer_moved(5.0, 5.0, false);
+        runtime.pointer_moved(5.0, 5.0, false).unwrap();
         assert_eq!(runtime.seam_axis(), None, "and the release gives it back");
     }
 
@@ -4479,7 +4501,7 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&panes);
         let viewport = Proposal::exact(Size { width: 1001.0, height: 700.0 });
-        let result = runtime.layout(&panes, viewport);
+        let result = runtime.layout(&panes, viewport).unwrap();
         let grip = result
             .hits
             .iter()
@@ -4488,16 +4510,16 @@ mod tests {
             .1;
         let grip_center_x = grip.origin.x + grip.size.width / 2.0;
 
-        assert!(runtime.pointer_pressed(grip_center_x, 300.0));
+        assert!(runtime.pointer_pressed(grip_center_x, 300.0).unwrap());
         // the pointer names points; what lands in the binding is a share
-        assert!(runtime.pointer_moved(250.0, 300.0, false));
+        assert!(runtime.pointer_moved(250.0, 300.0, false).unwrap());
         assert_eq!(panes.share.get(), Fraction(0.25));
 
         // the floor is RELATIVE — a tenth of the pair, not a number of
         // points, so it holds at every window size
-        runtime.pointer_moved(1.0, 300.0, false);
+        runtime.pointer_moved(1.0, 300.0, false).unwrap();
         assert_eq!(panes.share.get(), Fraction(0.1));
-        runtime.pointer_moved(2000.0, 300.0, false);
+        runtime.pointer_moved(2000.0, 300.0, false).unwrap();
         assert_eq!(panes.share.get(), Fraction(0.9));
         assert_eq!(runtime.pointer_released(2000.0, 300.0), None);
     }
@@ -4525,13 +4547,15 @@ mod tests {
         let runtime = Runtime::new();
         let read = || {
             runtime.render_stable(&card);
-            let result = runtime.layout(&card, viewport);
+            let result = runtime.layout(&card, viewport).unwrap();
             let alphas: Vec<u8> = result
                 .display
                 .iter()
                 .filter_map(|command| match command {
                     DrawCommand::FillRect { color, .. }
-                    | DrawCommand::TextLine { color, .. } => Some(color.a),
+                    | DrawCommand::TextLine { color, .. } => {
+                        Some(color.a)
+                    }
                     _ => None,
                 })
                 .collect();
@@ -4583,8 +4607,8 @@ mod tests {
         let mark_alpha = || {
             runtime.render_stable(&chip);
             // the pointer sits over the label, well clear of the mark
-            runtime.pointer_moved(6.0, 8.0, false);
-            let result = runtime.layout(&chip, viewport);
+            runtime.pointer_moved(6.0, 8.0, false).unwrap();
+            let result = runtime.layout(&chip, viewport).unwrap();
             result
                 .display
                 .iter()
@@ -4606,7 +4630,7 @@ mod tests {
         // hovered target is the group or anything under it, so the mark
         // does not blink out from under the pointer on its way there
         runtime.render_stable(&chip);
-        let result = runtime.layout(&chip, viewport);
+        let result = runtime.layout(&chip, viewport).unwrap();
         let mark_rect = result
             .hits
             .iter()
@@ -4614,8 +4638,9 @@ mod tests {
             .map(|(_, rect)| *rect)
             .next_back()
             .expect("the mark is a target of its own");
-        runtime.pointer_moved(mark_rect.origin.x + 2.0, mark_rect.origin.y + 2.0, false);
-        let over = runtime.layout(&chip, viewport);
+        runtime.pointer_moved(mark_rect.origin.x + 2.0, mark_rect.origin.y + 2.0, false)
+            .unwrap();
+        let over = runtime.layout(&chip, viewport).unwrap();
         let alpha = over
             .display
             .iter()
@@ -4673,7 +4698,7 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&ledger);
         let viewport = Proposal::exact(Size { width: 300.0, height: 200.0 });
-        let result = runtime.layout(&ledger, viewport);
+        let result = runtime.layout(&ledger, viewport).unwrap();
 
         let region = result.scrolls.first().expect("the box sits in a region").clone();
         assert_eq!(region.content.height, 4000.0, "the region sees the CONTENT extent");
@@ -4692,11 +4717,15 @@ mod tests {
         // the thumb travels WITH the hand: the press remembers where
         // inside the band it landed, so nothing jumps on the first move
         let grab_y = thumb.origin.y + 4.0;
-        assert!(runtime.pointer_pressed(thumb.origin.x + 2.0, grab_y));
-        assert!(runtime.pointer_moved(thumb.origin.x + 2.0, grab_y + 1.0, false));
+        assert!(runtime.pointer_pressed(thumb.origin.x + 2.0, grab_y)
+                .unwrap()
+        );
+        assert!(runtime.pointer_moved(thumb.origin.x + 2.0, grab_y + 1.0, false)
+                .unwrap());
         let after_one = runtime.scroll_offset(&region.path).y;
         assert!(after_one > 0.0 && after_one < 100.0, "one point of thumb is a small step: {after_one}");
-        assert!(runtime.pointer_moved(thumb.origin.x + 2.0, 10_000.0, false));
+        assert!(runtime.pointer_moved(thumb.origin.x + 2.0, 10_000.0, false)
+                .unwrap());
         assert_eq!(
             runtime.scroll_offset(&region.path).y,
             3800.0,
@@ -4704,7 +4733,7 @@ mod tests {
         );
         assert_eq!(runtime.pointer_released(thumb.origin.x + 2.0, 10_000.0), None);
         // after the release the pointer is free again
-        runtime.pointer_moved(150.0, 100.0, false);
+        runtime.pointer_moved(150.0, 100.0, false).unwrap();
         assert_eq!(runtime.scroll_offset(&region.path).y, 3800.0);
     }
 
@@ -4746,7 +4775,7 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&ledger);
         let viewport = Proposal::exact(Size { width: 300.0, height: 200.0 });
-        let result = runtime.layout(&ledger, viewport);
+        let result = runtime.layout(&ledger, viewport).unwrap();
         let path = result.scrolls.first().expect("a region").path.clone();
         assert_eq!(runtime.scroll_offset(&path).y, 0.0, "row zero already shows");
 
@@ -4754,7 +4783,7 @@ mod tests {
         // SHORTEST way that shows it
         ledger.caret.set(80.0);
         runtime.render_stable(&ledger);
-        runtime.layout(&ledger, viewport);
+        runtime.layout(&ledger, viewport).unwrap();
         assert_eq!(runtime.scroll_offset(&path).y, 1420.0, "bottom-aligned, not centred");
 
         // the hand turns the wheel with the caret where it was: a
@@ -4763,7 +4792,7 @@ mod tests {
         let after_wheel = runtime.scroll_offset(&path).y;
         assert!(after_wheel < 1420.0, "the wheel moved: {after_wheel}");
         runtime.render_stable(&ledger);
-        runtime.layout(&ledger, viewport);
+        runtime.layout(&ledger, viewport).unwrap();
         assert_eq!(runtime.scroll_offset(&path).y, after_wheel, "and it stayed moved");
     }
 
@@ -4793,7 +4822,8 @@ mod tests {
         }
 
         let runtime = Runtime::new();
-        let patches = runtime.dom_frame(&Ledger, Size { width: 300.0, height: 200.0 });
+        let patches = runtime.dom_frame(&Ledger, Size { width: 300.0, height: 200.0 })
+            .unwrap();
         let canvas = patches
             .iter()
             .find_map(|patch| match patch {
@@ -4811,9 +4841,7 @@ mod tests {
         let height = patches
             .iter()
             .find_map(|patch| match patch {
-                crate::dom::DomPatch::SetBox { id, width: None, height, .. } if *id == canvas => {
-                    Some(*height)
-                }
+                crate::dom::DomPatch::SetBox { id, width: None, height, .. } if *id == canvas => Some(*height),
                 _ => None,
             })
             .expect("the island is sized");
@@ -4840,15 +4868,16 @@ mod tests {
         let row = Row { seen: Rc::new(RefCell::new(Vec::new())) };
         let runtime = Runtime::new();
         runtime.render_stable(&row);
-        let result = runtime.layout(&row, Proposal::exact(Size { width: 200.0, height: 40.0 }));
+        let result = runtime.layout(&row, Proposal::exact(Size { width: 200.0, height: 40.0 }))
+            .unwrap();
         let (_, rect) = result.hits.first().expect("the row is a target").clone();
         let (x, y) = (rect.origin.x + 2.0, rect.origin.y + 2.0);
 
         // a real double click is TWO press/release pairs, and the
         // platform's count climbs across them
-        runtime.pointer_clicked(x, y, 1, false);
+        runtime.pointer_clicked(x, y, 1, false).unwrap();
         runtime.pointer_released(x, y);
-        runtime.pointer_clicked(x, y, 2, false);
+        runtime.pointer_clicked(x, y, 2, false).unwrap();
         runtime.pointer_released(x, y);
         assert_eq!(*row.seen.borrow(), vec![1, 2]);
     }
@@ -4881,12 +4910,13 @@ mod tests {
         let row = Row { plain: Rc::new(Cell::new(0)), doubled: Rc::new(Cell::new(0)) };
         let runtime = Runtime::new();
         runtime.render_stable(&row);
-        let result = runtime.layout(&row, Proposal::exact(Size { width: 300.0, height: 40.0 }));
+        let result = runtime.layout(&row, Proposal::exact(Size { width: 300.0, height: 40.0 }))
+            .unwrap();
         let targets: Vec<_> = result.hits.iter().map(|(_, rect)| *rect).collect();
         let double_click = |rect: crate::layout::Rect| {
             let (x, y) = (rect.origin.x + 2.0, rect.origin.y + 2.0);
             for clicks in [1, 2] {
-                runtime.pointer_clicked(x, y, clicks, false);
+                runtime.pointer_clicked(x, y, clicks, false).unwrap();
                 runtime.pointer_released(x, y);
             }
         };
@@ -4901,7 +4931,7 @@ mod tests {
         let rect = targets[1];
         let (x, y) = (rect.origin.x + 2.0, rect.origin.y + 2.0);
         for clicks in [1, 2, 3] {
-            runtime.pointer_clicked(x, y, clicks, false);
+            runtime.pointer_clicked(x, y, clicks, false).unwrap();
             runtime.pointer_released(x, y);
         }
         assert_eq!(row.doubled.get(), 2, "one more double inside the triple, not two");
@@ -4933,11 +4963,12 @@ mod tests {
         let board = Board { seen: Rc::new(RefCell::new(Vec::new())) };
         let runtime = Runtime::new();
         runtime.render_stable(&board);
-        let result = runtime.layout(&board, Proposal::exact(Size { width: 300.0, height: 40.0 }));
+        let result = runtime.layout(&board, Proposal::exact(Size { width: 300.0, height: 40.0 }))
+            .unwrap();
         let targets: Vec<_> = result.hits.iter().map(|(_, rect)| *rect).collect();
         let click = |rect: crate::layout::Rect, clicks: u8| {
             let (x, y) = (rect.origin.x + 2.0, rect.origin.y + 2.0);
-            runtime.pointer_clicked(x, y, clicks, false);
+            runtime.pointer_clicked(x, y, clicks, false).unwrap();
             runtime.pointer_released(x, y);
         };
 
@@ -5030,15 +5061,16 @@ mod tests {
         let runtime = Runtime::new();
         let viewport = Proposal::exact(Size { width: 600.0, height: 400.0 });
         runtime.render_stable(&bench);
-        let result = runtime.layout(&bench, viewport);
+        let result = runtime.layout(&bench, viewport).unwrap();
         let pane = result.customs.first().expect("the box is placed").frame;
-        runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0)
+            .unwrap();
         runtime.pointer_released(pane.origin.x + 10.0, pane.origin.y + 10.0);
         let held = runtime.focused().expect("the click focused the pane");
 
         bench.split.set(true);
         runtime.render_stable(&bench);
-        runtime.layout(&bench, viewport);
+        runtime.layout(&bench, viewport).unwrap();
 
         // two twins wear the name, so nobody inherits the keyboard —
         // and the hold does NOT stay on the box that is gone
@@ -5050,9 +5082,10 @@ mod tests {
         assert_ne!(runtime.focused().as_deref(), Some(held.as_str()));
 
         // and the app can act on that: focusing again lands for real
-        let split = runtime.layout(&bench, viewport);
+        let split = runtime.layout(&bench, viewport).unwrap();
         let left = split.customs.first().expect("the panes are placed").frame;
-        runtime.pointer_pressed(left.origin.x + 10.0, left.origin.y + 10.0);
+        runtime.pointer_pressed(left.origin.x + 10.0, left.origin.y + 10.0)
+            .unwrap();
         runtime.pointer_released(left.origin.x + 10.0, left.origin.y + 10.0);
         assert!(runtime.focused().is_some(), "a fresh click still focuses");
     }
@@ -5129,9 +5162,10 @@ mod tests {
 
         let viewport = Proposal::exact(Size { width: 400.0, height: 200.0 });
         runtime.render_stable(&bench);
-        let result = runtime.layout(&bench, viewport);
+        let result = runtime.layout(&bench, viewport).unwrap();
         let box_rect = result.customs.first().expect("the box is placed").frame;
-        runtime.pointer_pressed(box_rect.origin.x + 5.0, box_rect.origin.y + 5.0);
+        runtime.pointer_pressed(box_rect.origin.x + 5.0, box_rect.origin.y + 5.0)
+            .unwrap();
         runtime.pointer_released(box_rect.origin.x + 5.0, box_rect.origin.y + 5.0);
         assert!(runtime.focused().is_some(), "the click focused the box");
 
@@ -5148,7 +5182,7 @@ mod tests {
         let pattern = KeyPattern::key(Key::Char('d'));
         assert!(pattern.is_text_input(), "`d` is a bare character");
         assert!(
-            !runtime.key_stroke(&pattern).handled,
+            !runtime.key_stroke(&pattern).unwrap().handled,
             "the box ignores it, so the keymap gets its turn",
         );
         let action = match runtime.chord(&pattern) {
@@ -5218,19 +5252,21 @@ mod tests {
         let runtime = Runtime::new();
         let viewport = Proposal::exact(Size { width: 600.0, height: 400.0 });
         runtime.render_stable(&bench);
-        let result = runtime.layout(&bench, viewport);
+        let result = runtime.layout(&bench, viewport).unwrap();
         let box_rect = result.customs.first().expect("the box is placed").frame;
-        runtime.pointer_pressed(box_rect.origin.x + 10.0, box_rect.origin.y + 10.0);
+        runtime.pointer_pressed(box_rect.origin.x + 10.0, box_rect.origin.y + 10.0)
+            .unwrap();
         runtime.pointer_released(box_rect.origin.x + 10.0, box_rect.origin.y + 10.0);
         assert!(runtime.focused().is_some(), "the click focused the box");
-        assert!(runtime.key(EditCommand::Insert("a".into())).applied, "and it types");
+        assert!(runtime.key(EditCommand::Insert("a".into())).unwrap()
+                .applied, "and it types");
 
         // the tree edit ABOVE: the pane gets wrapped in a split
         bench.split.set(true);
         runtime.render_stable(&bench);
-        runtime.layout(&bench, viewport);
+        runtime.layout(&bench, viewport).unwrap();
         assert!(
-            runtime.key(EditCommand::Insert("b".into())).applied,
+            runtime.key(EditCommand::Insert("b".into())).unwrap().applied,
             "PAIN 23: the keyboard survives a tree edit above"
         );
     }
@@ -5269,24 +5305,27 @@ mod tests {
         let runtime = Runtime::new();
         let viewport = Proposal::exact(Size { width: 600.0, height: 400.0 });
         runtime.render_stable(&bench);
-        let result = runtime.layout(&bench, viewport);
+        let result = runtime.layout(&bench, viewport).unwrap();
         let (path, rect) = result.hits.last().expect("the field is a target").clone();
-        runtime.pointer_clicked(rect.origin.x + 8.0, rect.origin.y + 8.0, 1, false);
+        runtime.pointer_clicked(rect.origin.x + 8.0, rect.origin.y + 8.0, 1, false)
+            .unwrap();
         runtime.pointer_released(rect.origin.x + 8.0, rect.origin.y + 8.0);
         assert_eq!(runtime.focused(), Some(path.clone()));
-        assert!(runtime.key(EditCommand::Insert("deco".into())).applied);
-        assert!(runtime.key(EditCommand::Left(false)).applied);
-        assert!(runtime.key(EditCommand::Left(false)).applied);
+        assert!(runtime.key(EditCommand::Insert("deco".into())).unwrap()
+                .applied);
+        assert!(runtime.key(EditCommand::Left(false)).unwrap().applied);
+        assert!(runtime.key(EditCommand::Left(false)).unwrap().applied);
 
         // the tree edit ABOVE: every positional segment below it shifts
         bench.split.set(true);
         runtime.render_stable(&bench);
-        runtime.layout(&bench, viewport);
+        runtime.layout(&bench, viewport).unwrap();
 
         let moved = runtime.focused().expect("the keyboard stayed somewhere");
         assert_ne!(moved, path, "the address moved with the tree");
         assert!(
-            runtime.key(EditCommand::Insert("!".into())).applied,
+            runtime.key(EditCommand::Insert("!".into()))
+                .unwrap().applied,
             "PAIN 23: the field types through a split above it",
         );
         // and the CARET went with it — the keyboard surviving in the
@@ -5309,14 +5348,15 @@ mod tests {
 
         let gone = Gone { here: State::new(true), name: State::new(String::new()) };
         runtime.render_stable(&gone);
-        let result = runtime.layout(&gone, viewport);
+        let result = runtime.layout(&gone, viewport).unwrap();
         let rect = result.hits.last().expect("the field is a target").1;
-        runtime.pointer_clicked(rect.origin.x + 8.0, rect.origin.y + 8.0, 1, false);
+        runtime.pointer_clicked(rect.origin.x + 8.0, rect.origin.y + 8.0, 1, false)
+            .unwrap();
         runtime.pointer_released(rect.origin.x + 8.0, rect.origin.y + 8.0);
         assert!(runtime.focused().is_some());
         gone.here.set(false);
         runtime.render_stable(&gone);
-        runtime.layout(&gone, viewport);
+        runtime.layout(&gone, viewport).unwrap();
         assert_eq!(runtime.focused(), None, "a dead field answers None, never its old path");
     }
 
@@ -5371,15 +5411,16 @@ mod tests {
         let runtime = Runtime::new();
         let viewport = Proposal::exact(Size { width: 600.0, height: 400.0 });
         runtime.render_stable(&bench);
-        let result = runtime.layout(&bench, viewport);
+        let result = runtime.layout(&bench, viewport).unwrap();
         let rect = result.customs.first().expect("the box is placed").frame;
-        runtime.pointer_pressed(rect.origin.x + 10.0, rect.origin.y + 10.0);
+        runtime.pointer_pressed(rect.origin.x + 10.0, rect.origin.y + 10.0)
+            .unwrap();
         runtime.pointer_released(rect.origin.x + 10.0, rect.origin.y + 10.0);
         assert_eq!(*bench.log.borrow(), vec![true], "one focus, on the click");
 
         bench.split.set(true);
         runtime.render_stable(&bench);
-        runtime.layout(&bench, viewport);
+        runtime.layout(&bench, viewport).unwrap();
         assert_eq!(*bench.log.borrow(), vec![true], "and nothing at all on the split");
     }
 
@@ -5419,15 +5460,16 @@ mod tests {
         let runtime = Runtime::new();
         let viewport = Proposal::exact(Size { width: 600.0, height: 400.0 });
         runtime.render_stable(&bench);
-        let result = runtime.layout(&bench, viewport);
+        let result = runtime.layout(&bench, viewport).unwrap();
         let rect = result.customs.first().expect("a box").frame;
-        runtime.pointer_pressed(rect.origin.x + 10.0, rect.origin.y + 10.0);
+        runtime.pointer_pressed(rect.origin.x + 10.0, rect.origin.y + 10.0)
+            .unwrap();
         runtime.pointer_released(rect.origin.x + 10.0, rect.origin.y + 10.0);
         assert!(runtime.focused().is_some());
 
         bench.twin.set(true);
         runtime.render_stable(&bench);
-        runtime.layout(&bench, viewport);
+        runtime.layout(&bench, viewport).unwrap();
         assert_eq!(runtime.focused(), None, "two names, no winner");
     }
 
@@ -5463,16 +5505,17 @@ mod tests {
         let runtime = Runtime::new();
         let viewport = Proposal::exact(Size { width: 600.0, height: 400.0 });
         runtime.render_stable(&bench);
-        let result = runtime.layout(&bench, viewport);
+        let result = runtime.layout(&bench, viewport).unwrap();
         let rect = result.customs.first().expect("a box").frame;
-        runtime.pointer_pressed(rect.origin.x + 10.0, rect.origin.y + 10.0);
+        runtime.pointer_pressed(rect.origin.x + 10.0, rect.origin.y + 10.0)
+            .unwrap();
         runtime.pointer_released(rect.origin.x + 10.0, rect.origin.y + 10.0);
         assert!(runtime.focused().is_some());
 
         // no name, nothing to follow — the keyboard goes, honestly
         bench.split.set(true);
         runtime.render_stable(&bench);
-        runtime.layout(&bench, viewport);
+        runtime.layout(&bench, viewport).unwrap();
         assert_eq!(runtime.focused(), None);
     }
 
@@ -5508,10 +5551,10 @@ mod tests {
         let runtime = Runtime::new();
         let viewport = Proposal::exact(Size { width: 600.0, height: 400.0 });
         runtime.render_stable(&bench);
-        let result = runtime.layout(&bench, viewport);
+        let result = runtime.layout(&bench, viewport).unwrap();
         let field = result.fields.first().expect("the field is placed").clone();
         runtime.focus(&field.path);
-        runtime.key(EditCommand::Insert("!".into()));
+        runtime.key(EditCommand::Insert("!".into())).unwrap();
         assert_eq!(bench.query.get(), "hello!");
 
         // the tree above changes shape: the field keeps the keyboard
@@ -5519,9 +5562,9 @@ mod tests {
         // one did instead of at the start
         bench.split.set(true);
         runtime.render_stable(&bench);
-        runtime.layout(&bench, viewport);
+        runtime.layout(&bench, viewport).unwrap();
         assert!(runtime.focused().is_some(), "the keyboard followed the name");
-        runtime.key(EditCommand::Insert("?".into()));
+        runtime.key(EditCommand::Insert("?".into())).unwrap();
         assert_eq!(bench.query.get(), "hello!?", "and so did the caret");
     }
 
@@ -5560,12 +5603,11 @@ mod tests {
             runtime.render_stable(&strip);
             runtime
                 .layout(&strip, viewport)
+                .unwrap()
                 .display
                 .iter()
                 .find_map(|command| match command {
-                    DrawCommand::TextLine { content, origin, .. } if &**content == "other" => {
-                        Some(origin.x)
-                    }
+                    DrawCommand::TextLine { content, origin, .. } if &**content == "other" => Some(origin.x),
                     _ => None,
                 })
                 .expect("the sibling is drawn")
@@ -5608,6 +5650,7 @@ mod tests {
             runtime.render_stable(&card);
             runtime
                 .layout(&card, viewport)
+                .unwrap()
                 .display
                 .iter()
                 .find_map(|command| match command {
@@ -5652,7 +5695,8 @@ mod tests {
 
         let runtime = Runtime::new();
         runtime.render_stable(&Bar);
-        let result = runtime.layout(&Bar, Proposal::exact(Size { width: 400.0, height: 60.0 }));
+        let result = runtime.layout(&Bar, Proposal::exact(Size { width: 400.0, height: 60.0 }))
+            .unwrap();
         let rule = result
             .display
             .iter()
@@ -5688,7 +5732,8 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&Both);
         let result =
-            runtime.layout(&Both, Proposal::exact(Size { width: 200.0, height: 40.0 }));
+            runtime.layout(&Both, Proposal::exact(Size { width: 200.0, height: 40.0 }))
+            .unwrap();
         let index = |red: bool| {
             result
                 .display
@@ -5731,7 +5776,9 @@ mod tests {
         }
 
         let runtime = Runtime::new();
-        let patches = runtime.dom_frame(&Row, Size { width: 200.0, height: 40.0 });
+        let patches = runtime.dom_frame(&Row, Size { width: 200.0, height: 40.0 },
+            )
+            .unwrap();
         let styles: Vec<crate::dom::DomLook> = patches
             .iter()
             .filter_map(|patch| match patch {
@@ -5781,7 +5828,8 @@ mod tests {
         let result = runtime.layout(
             &Panel,
             crate::layout::Proposal::exact(Size { width: 200.0, height: 100.0 }),
-        );
+        )
+            .unwrap();
         let region = result.scrolls.first().expect("the region survived the layer");
         assert_eq!(
             region.target.as_deref(),
@@ -5813,7 +5861,7 @@ mod tests {
         runtime.render_stable(&tapper);
 
         let viewport = Proposal::exact(Size { width: 200.0, height: 100.0 });
-        let result = runtime.layout(&tapper, viewport);
+        let result = runtime.layout(&tapper, viewport).unwrap();
 
         // the button is among the hit-test targets; a "click" at its center
         // resolves to the action key
@@ -5832,7 +5880,7 @@ mod tests {
         // firing the action changes the state; the next frame re-runs ONLY the
         // Tapper and the layout reflects the new text — the live loop, headless
         assert!(runtime.activate(key));
-        let result = runtime.layout(&tapper, viewport);
+        let result = runtime.layout(&tapper, viewport).unwrap();
         assert_eq!(runtime.body_runs(), vec!["Tapper".to_string()]);
         let title = result.frames.get("Tapper").unwrap();
         // with nothing flexible in the body, the root answers its natural
@@ -5843,7 +5891,7 @@ mod tests {
 
         // and a click on a SKIPPED view's frame keeps working (the
         // action is retained like the effects)
-        let result = runtime.layout(&tapper, viewport);
+        let result = runtime.layout(&tapper, viewport).unwrap();
         assert!(runtime.body_runs().is_empty(), "everything from the cache");
         let (path, _) = result.hits.last().unwrap().clone();
         assert!(runtime.activate(&path));
@@ -5859,7 +5907,8 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&tapper);
         let result =
-            runtime.layout(&tapper, Proposal::exact(Size { width: 200.0, height: 100.0 }));
+            runtime.layout(&tapper, Proposal::exact(Size { width: 200.0, height: 100.0 }))
+            .unwrap();
         let (_, rect) = result.hits.last().expect("the button registers a target").clone();
         let cx = rect.origin.x + rect.size.width / 2.0;
         let cy = rect.origin.y + rect.size.height / 2.0;
@@ -5886,10 +5935,10 @@ mod tests {
 
         let (runtime, tapper, cx, cy) = pressable();
         let viewport = Proposal::exact(Size { width: 200.0, height: 100.0 });
-        let cold = runtime.layout(&tapper, viewport);
+        let cold = runtime.layout(&tapper, viewport).unwrap();
 
-        assert!(runtime.pointer_moved(cx, cy, false), "entering the target changes the state");
-        let hot = runtime.layout(&tapper, viewport);
+        assert!(runtime.pointer_moved(cx, cy, false).unwrap(), "entering the target changes the state");
+        let hot = runtime.layout(&tapper, viewport).unwrap();
         assert!(runtime.body_runs().is_empty(), "hover repaints with ZERO bodies");
 
         // the LAW: byte-identical frames under any interaction
@@ -5909,7 +5958,7 @@ mod tests {
         assert_ne!(backgrounds(&cold), backgrounds(&hot), "the paint changes");
 
         // 1px within the same target: nothing to repaint
-        assert!(!runtime.pointer_moved(cx + 1.0, cy, false));
+        assert!(!runtime.pointer_moved(cx + 1.0, cy, false).unwrap());
     }
 
     #[test]
@@ -5948,29 +5997,29 @@ mod tests {
                 .expect("the glyph paints")
         };
 
-        let cold = runtime.layout(&CloseGlyph, viewport);
+        let cold = runtime.layout(&CloseGlyph, viewport).unwrap();
         assert_eq!(ink(&cold), FAINT, "at rest the glyph stays faint");
         let (_, target) = cold.hits.last().expect("the glyph is a target").clone();
         let cx = target.origin.x + target.size.width / 2.0;
         let cy = target.origin.y + target.size.height / 2.0;
 
-        runtime.pointer_moved(cx, cy, false);
-        let hot = runtime.layout(&CloseGlyph, viewport);
+        runtime.pointer_moved(cx, cy, false).unwrap();
+        let hot = runtime.layout(&CloseGlyph, viewport).unwrap();
         assert_eq!(ink(&hot), BRIGHT, "the pointer brightens it");
         // the LAW: ink is paint — no frame moves under the pointer
         for (path, frame) in cold.frames.iter() {
             assert_eq!(Some(frame), hot.frames.get(path));
         }
 
-        runtime.pointer_pressed(cx, cy);
-        assert_eq!(ink(&runtime.layout(&CloseGlyph, viewport)), SUNK, "press sinks it");
+        runtime.pointer_pressed(cx, cy).unwrap();
+        assert_eq!(ink(&runtime.layout(&CloseGlyph, viewport).unwrap()), SUNK, "press sinks it");
     }
 
     #[test]
     fn up_inside_fires_and_down_alone_does_not() {
         let (runtime, tapper, cx, cy) = pressable();
 
-        assert!(runtime.pointer_pressed(cx, cy));
+        assert!(runtime.pointer_pressed(cx, cy).unwrap());
         assert!(
             runtime.render_stable(&tapper).contains("count: 0"),
             "down alone does not fire"
@@ -5983,9 +6032,9 @@ mod tests {
     fn release_outside_never_fires() {
         let (runtime, tapper, cx, cy) = pressable();
 
-        runtime.pointer_pressed(cx, cy);
+        runtime.pointer_pressed(cx, cy).unwrap();
         assert_eq!(runtime.pointer_released(199.0, 99.0), None, "released outside");
-        runtime.pointer_pressed(199.0, 99.0);
+        runtime.pointer_pressed(199.0, 99.0).unwrap();
         assert_eq!(runtime.pointer_released(cx, cy), None, "press outside, up inside");
         assert!(runtime.render_stable(&tapper).contains("count: 0"));
     }
@@ -5994,13 +6043,13 @@ mod tests {
     fn drag_out_and_back_rearms_the_press() {
         let (runtime, tapper, cx, cy) = pressable();
 
-        runtime.pointer_pressed(cx, cy);
-        runtime.pointer_moved(199.0, 99.0, false);
+        runtime.pointer_pressed(cx, cy).unwrap();
+        runtime.pointer_moved(199.0, 99.0, false).unwrap();
         assert!(
             runtime.interaction().hovered.is_none(),
             "dragging out releases the visual"
         );
-        runtime.pointer_moved(cx, cy, false);
+        runtime.pointer_moved(cx, cy, false).unwrap();
         assert_eq!(
             runtime.interaction().hovered,
             runtime.interaction().pressed,
@@ -6014,10 +6063,11 @@ mod tests {
     fn pointer_exited_clears_the_hover() {
         let (runtime, _tapper, cx, cy) = pressable();
 
-        runtime.pointer_moved(cx, cy, false);
+        runtime.pointer_moved(cx, cy, false).unwrap();
         assert!(runtime.pointer_exited());
         assert!(runtime.interaction().hovered.is_none());
-        assert!(!runtime.pointer_exited(), "already clear — nothing to repaint");
+        assert!(!runtime.pointer_exited(), "already clear — nothing to repaint"
+        );
     }
 
     #[test]
@@ -6026,15 +6076,13 @@ mod tests {
 
         let runtime = Runtime::new();
         let view = text("ab").corner_radius(5.0).background_color(Color::hex(0x123456));
-        let result = runtime.layout(&view, Proposal::unspecified());
+        let result = runtime.layout(&view, Proposal::unspecified()).unwrap();
 
         let fills: Vec<(Color, crate::layout::Corners)> = result
             .display
             .iter()
             .filter_map(|command| match command {
-                DrawCommand::FillRect { color, corner_radius, .. } => {
-                    Some((*color, *corner_radius))
-                }
+                DrawCommand::FillRect { color, corner_radius, .. } => Some((*color, *corner_radius)),
                 _ => None,
             })
             .collect();
@@ -6053,7 +6101,7 @@ mod tests {
         let view = text("ab")
             .background_color(Color::hex(0x111111))
             .background_color(Color::hex(0x222222));
-        let result = runtime.layout(&view, Proposal::unspecified());
+        let result = runtime.layout(&view, Proposal::unspecified()).unwrap();
 
         let fills: Vec<Color> = result
             .display
@@ -6078,11 +6126,13 @@ mod tests {
         let outer = runtime.layout(
             &text("ab").padding_length(10.0).background_color(Color::BLACK),
             Proposal::unspecified(),
-        );
+        )
+            .unwrap();
         let inner = runtime.layout(
             &text("ab").background_color(Color::BLACK).padding_length(10.0),
             Proposal::unspecified(),
-        );
+            )
+            .unwrap();
 
         let fill_rect = |result: &crate::layout::LayoutResult| -> Rect {
             result
@@ -6134,7 +6184,7 @@ mod tests {
 
         let runtime = Runtime::new();
         runtime.render_stable(&One);
-        let result = runtime.layout(&One, Proposal::unspecified());
+        let result = runtime.layout(&One, Proposal::unspecified()).unwrap();
 
         // the chrome background comes before the label text, with the corners
         let mut fill_before_text = false;
@@ -6183,7 +6233,7 @@ mod tests {
         runtime.drop_unseen();
         runtime.render_stable(&rows);
         let viewport = Proposal::exact(Size { width: 120.0, height: 100.0 });
-        let result = runtime.layout(&rows, viewport);
+        let result = runtime.layout(&rows, viewport).unwrap();
 
         assert_eq!(result.scrolls.len(), 1, "the List is a region with identity");
         let path = result.scrolls[0].path.clone();
@@ -6200,7 +6250,7 @@ mod tests {
         // the offset applies in layout: every row moved up 60 — row 5 sits
         // where row 1.25 sat — and the rows that left the window left the
         // list with it
-        let scrolled = runtime.layout(&rows, viewport);
+        let scrolled = runtime.layout(&rows, viewport).unwrap();
         let line_y = |wanted: &str| {
             scrolled.display.iter().find_map(|command| match command {
                 DrawCommand::TextLine { origin, content, .. } if &**content == wanted => Some(origin.y),
@@ -6214,7 +6264,7 @@ mod tests {
         // by structural identity
         rows.flip.set(true);
         runtime.render_stable(&rows);
-        let after = runtime.layout(&rows, viewport);
+        let after = runtime.layout(&rows, viewport).unwrap();
         assert_eq!(runtime.scroll_offset(&path).y, 60.0);
         let row_5 = after.display.iter().find_map(|command| match command {
             DrawCommand::TextLine { origin, content, .. } if &**content == "row 5" => Some(origin.y),
@@ -6224,7 +6274,7 @@ mod tests {
 
         // programmatic scrolling counts in the SAME frame
         runtime.set_scroll_offset(&path, crate::layout::Point { x: 0.0, y: 8.0 });
-        let programmatic = runtime.layout(&rows, viewport);
+        let programmatic = runtime.layout(&rows, viewport).unwrap();
         let line_y = programmatic
             .display
             .iter()
@@ -6259,14 +6309,16 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&form);
         let viewport = Proposal::exact(Size { width: 240.0, height: 100.0 });
-        let result = runtime.layout(&form, viewport);
+        let result = runtime.layout(&form, viewport).unwrap();
 
         // empty: the placeholder paints in its own color, no focus
-        let has_placeholder = result.display.iter().any(|command| matches!(
+        let has_placeholder = result.display.iter().any(|command| {
+            matches!(
             command,
             DrawCommand::TextLine { color, content, range, .. }
                 if *color == Color::PLACEHOLDER && &content[range.0..range.1] == "Your name"
-        ));
+        )
+        });
         assert!(has_placeholder);
 
         // clicking the field focuses (up-inside → editor → focus)
@@ -6275,17 +6327,18 @@ mod tests {
             rect.origin.x + rect.size.width / 2.0,
             rect.origin.y + rect.size.height / 2.0,
         );
-        runtime.pointer_pressed(cx, cy);
+        runtime.pointer_pressed(cx, cy).unwrap();
         assert_eq!(runtime.pointer_released(cx, cy), Some(field_path.clone()));
         assert_eq!(runtime.focused(), Some(field_path.clone()));
 
         // typing flows through the binding: the TITLE (another view) sees the change
-        assert!(runtime.key(EditCommand::Insert("Deco".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("Deco".into())).unwrap()
+                .applied);
         let printed = runtime.render_stable(&form);
         assert!(printed.contains("hello Deco"), "{printed}");
 
         // the focused frame paints caret and focus border
-        let focused_frame = runtime.layout(&form, viewport);
+        let focused_frame = runtime.layout(&form, viewport).unwrap();
         assert!(focused_frame.display.iter().any(|command| matches!(
             command,
             DrawCommand::FillRect { rect, color, .. }
@@ -6297,21 +6350,22 @@ mod tests {
         )));
 
         // editing continues: backspace eats the "o"
-        assert!(runtime.key(EditCommand::Backspace).applied);
+        assert!(runtime.key(EditCommand::Backspace).unwrap().applied);
         assert!(runtime.render_stable(&form).contains("hello Dec"));
 
         // copy/cut extract through the output (the clipboard bridge)
-        assert!(runtime.key(EditCommand::SelectAll).applied);
-        assert_eq!(runtime.key(EditCommand::Copy).output.as_deref(), Some("Dec"));
-        assert_eq!(runtime.key(EditCommand::Cut).output.as_deref(), Some("Dec"));
+        assert!(runtime.key(EditCommand::SelectAll).unwrap().applied);
+        assert_eq!(runtime.key(EditCommand::Copy).unwrap().output.as_deref(), Some("Dec"));
+        assert_eq!(runtime.key(EditCommand::Cut).unwrap().output.as_deref(), Some("Dec"));
         assert!(!runtime.render_stable(&form).contains("hello Dec"), "the cut removed it");
-        assert!(runtime.key(EditCommand::Insert("Dec".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("Dec".into())).unwrap()
+                .applied);
 
         // clicking outside removes focus; keying without focus does nothing
-        runtime.pointer_pressed(239.0, 99.0);
+        runtime.pointer_pressed(239.0, 99.0).unwrap();
         runtime.pointer_released(239.0, 99.0);
         assert_eq!(runtime.focused(), None);
-        assert!(!runtime.key(EditCommand::Insert("x".into())).applied);
+        assert!(!runtime.key(EditCommand::Insert("x".into())).unwrap().applied);
         assert!(runtime.render_stable(&form).contains("hello Dec"));
     }
 
@@ -6336,7 +6390,7 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&form);
         let viewport = Proposal::exact(Size { width: 240.0, height: 60.0 });
-        let result = runtime.layout(&form, viewport);
+        let result = runtime.layout(&form, viewport).unwrap();
 
         // the box cuts what it holds: a clip with the field's own
         // corner, around the field's own frame
@@ -6379,16 +6433,19 @@ mod tests {
         let home = text_x(&result);
 
         // a string that fits leaves the run at home
-        runtime.pointer_pressed(frame.origin.x + 4.0, frame.origin.y + 4.0);
+        runtime.pointer_pressed(frame.origin.x + 4.0, frame.origin.y + 4.0)
+            .unwrap();
         runtime.pointer_released(frame.origin.x + 4.0, frame.origin.y + 4.0);
         assert_eq!(runtime.focused(), Some(field_path.clone()));
-        assert!(runtime.key(EditCommand::Insert("short".into())).applied);
-        assert_eq!(text_x(&runtime.layout(&form, viewport)), home, "five cells fit");
+        assert!(runtime.key(EditCommand::Insert("short".into())).unwrap()
+                .applied);
+        assert_eq!(text_x(&runtime.layout(&form, viewport).unwrap()), home, "five cells fit");
 
         // past the right edge the run walks left, and the caret stays
         // inside the box that holds it
-        assert!(runtime.key(EditCommand::Insert(" and then some more".into())).applied);
-        let scrolled = runtime.layout(&form, viewport);
+        assert!(runtime.key(EditCommand::Insert(" and then some more".into())).unwrap()
+                .applied);
+        let scrolled = runtime.layout(&form, viewport).unwrap();
         let offset = runtime.scroll_offset(&field_path).x;
         assert!(offset > 0.0, "the run moved: {offset}");
         assert_eq!(text_x(&scrolled), home - offset);
@@ -6397,10 +6454,7 @@ mod tests {
             .iter()
             .filter_map(|command| match command {
                 DrawCommand::FillRect { rect, corner_radius, .. }
-                    if rect.size.width < 2.0 && !corner_radius.is_zero() =>
-                {
-                    Some(rect.origin.x)
-                }
+                    if rect.size.width < 2.0 && !corner_radius.is_zero() => Some(rect.origin.x),
                 _ => None,
             })
             .last()
@@ -6411,18 +6465,18 @@ mod tests {
         );
 
         // Home walks the caret back and the run comes home with it
-        assert!(runtime.key(EditCommand::Home(false)).applied);
+        assert!(runtime.key(EditCommand::Home(false)).unwrap().applied);
         assert_eq!(runtime.scroll_offset(&field_path).x, 0.0);
-        assert_eq!(text_x(&runtime.layout(&form, viewport)), home);
+        assert_eq!(text_x(&runtime.layout(&form, viewport).unwrap()), home);
 
         // and a run scrolled to the end never leaves a gap when the
         // text shrinks under it: the clamp is the placement's, so it
         // holds even for an offset written against an older string
-        assert!(runtime.key(EditCommand::End(false)).applied);
+        assert!(runtime.key(EditCommand::End(false)).unwrap().applied);
         let end = runtime.scroll_offset(&field_path).x;
         assert!(end > 0.0);
         runtime.set_scroll_offset(&field_path, Point { x: end + 500.0, y: 0.0 });
-        let clamped = runtime.layout(&form, viewport);
+        let clamped = runtime.layout(&form, viewport).unwrap();
         assert_eq!(text_x(&clamped), home - end, "the clamp is the box's, not the caret's");
     }
 
@@ -6447,29 +6501,30 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&form);
         let viewport = Proposal::exact(Size { width: 240.0, height: 60.0 });
-        let result = runtime.layout(&form, viewport);
+        let result = runtime.layout(&form, viewport).unwrap();
         let (path, frame) = result.hits.last().expect("the field is a target").clone();
         let run_x = frame.origin.x + 8.0;
         let y = frame.origin.y + frame.size.height / 2.0;
         let at = |byte: usize| run_x + 8.0 * byte as f64;
         let selected = || {
-            let snapshot = runtime.ime_snapshot().expect("a focused field answers the platform");
+            let snapshot = runtime.ime_snapshot().unwrap()
+                .expect("a focused field answers the platform");
             snapshot.selected
         };
 
         // the press focuses and puts the caret under the pointer — a
         // field acts on the DOWN, and there is nothing selected yet
-        assert!(runtime.pointer_clicked(at(2), y, 1, false));
+        assert!(runtime.pointer_clicked(at(2), y, 1, false).unwrap());
         assert_eq!(runtime.focused(), Some(path.clone()));
         assert_eq!(selected(), (2, 0), "the anchor is armed, the selection empty");
 
         // the hand sweeps: the anchor holds and the caret walks
-        assert!(runtime.pointer_moved(at(9), y, false));
+        assert!(runtime.pointer_moved(at(9), y, false).unwrap());
         assert_eq!(selected(), (2, 7));
         // backwards past the anchor still reads as one range
-        assert!(runtime.pointer_moved(at(0), y, false));
+        assert!(runtime.pointer_moved(at(0), y, false).unwrap());
         assert_eq!(selected(), (0, 2));
-        assert!(runtime.pointer_moved(at(9), y, false));
+        assert!(runtime.pointer_moved(at(9), y, false).unwrap());
 
         // the release changes nothing — and it still names the field
         assert_eq!(runtime.pointer_released(at(9), y), Some(path.clone()));
@@ -6477,7 +6532,7 @@ mod tests {
         assert_eq!(runtime.focused(), Some(path.clone()), "and the keyboard stayed");
 
         // the selection is PAINTED, not just held
-        let painted = runtime.layout(&form, viewport);
+        let painted = runtime.layout(&form, viewport).unwrap();
         assert!(painted.display.iter().any(|command| matches!(
             command,
             DrawCommand::FillRect { rect, color, .. }
@@ -6486,22 +6541,22 @@ mod tests {
 
         // a move with the button up sweeps nothing
         assert_eq!(selected(), (2, 7));
-        runtime.pointer_moved(at(1), y, false);
+        runtime.pointer_moved(at(1), y, false).unwrap();
         assert_eq!(selected(), (2, 7), "the sweep ended with the button");
 
         // two clicks take the word under the pointer, three take the line
-        runtime.pointer_clicked(at(8), y, 2, false);
-        runtime.pointer_moved(at(8) + 0.5, y, false);
+        runtime.pointer_clicked(at(8), y, 2, false).unwrap();
+        runtime.pointer_moved(at(8) + 0.5, y, false).unwrap();
         assert_eq!(selected(), (6, 5), "held jitter preserves the entire word");
-        runtime.layout(&form, viewport);
+        runtime.layout(&form, viewport).unwrap();
         assert_eq!(
             selected(),
             (6, 5),
             "layout replay preserves the entire word"
         );
-        runtime.pointer_moved(at(2), y, false);
+        runtime.pointer_moved(at(2), y, false).unwrap();
         assert_eq!(selected(), (0, 11), "backward drag takes whole words");
-        runtime.pointer_moved(at(8), y, false);
+        runtime.pointer_moved(at(8), y, false).unwrap();
         assert_eq!(
             selected(),
             (6, 5),
@@ -6509,10 +6564,10 @@ mod tests {
         );
         runtime.pointer_released(at(8), y);
         assert_eq!(selected(), (6, 5), "the word `world`");
-        runtime.pointer_clicked(at(8), y, 3, false);
-        runtime.pointer_moved(at(8) + 0.5, y, false);
+        runtime.pointer_clicked(at(8), y, 3, false).unwrap();
+        runtime.pointer_moved(at(8) + 0.5, y, false).unwrap();
         assert_eq!(selected(), (0, 11), "held jitter preserves the entire line");
-        runtime.layout(&form, viewport);
+        runtime.layout(&form, viewport).unwrap();
         assert_eq!(
             selected(),
             (0, 11),
@@ -6523,29 +6578,31 @@ mod tests {
 
         // shift+click extends from where the selection stood instead of
         // dropping a fresh caret
-        runtime.pointer_clicked(at(2), y, 1, false);
+        runtime.pointer_clicked(at(2), y, 1, false).unwrap();
         runtime.pointer_released(at(2), y);
-        runtime.pointer_clicked(at(5), y, 1, true);
+        runtime.pointer_clicked(at(5), y, 1, true).unwrap();
         runtime.pointer_released(at(5), y);
         assert_eq!(selected(), (2, 3), "shift kept the anchor at 2");
 
         // typing replaces what the mouse took — the two halves are one
         // caret, not two
-        assert!(runtime.key(EditCommand::Insert("HEY".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("HEY".into())).unwrap()
+                .applied);
         assert!(runtime.render_stable(&form).contains("heHEY world"));
 
         // and a sweep that leaves the box rolls the run under it
-        assert!(runtime.key(EditCommand::SelectAll).applied);
+        assert!(runtime.key(EditCommand::SelectAll).unwrap().applied);
         const LONG: &str = "a string far longer than the box can hold";
-        assert!(runtime.key(EditCommand::Insert(LONG.into())).applied);
+        assert!(runtime.key(EditCommand::Insert(LONG.into())).unwrap()
+                .applied);
         // typing at the tail left the run scrolled; Home brings it back
-        assert!(runtime.key(EditCommand::Home(false)).applied);
-        runtime.layout(&form, viewport);
+        assert!(runtime.key(EditCommand::Home(false)).unwrap().applied);
+        runtime.layout(&form, viewport).unwrap();
         assert_eq!(runtime.scroll_offset(&path).x, 0.0);
-        runtime.pointer_clicked(frame.origin.x + 12.0, y, 1, false);
+        runtime.pointer_clicked(frame.origin.x + 12.0, y, 1, false).unwrap();
         assert_eq!(runtime.scroll_offset(&path).x, 0.0, "the press is inside the box");
         let out = frame.origin.x + frame.size.width + 400.0;
-        assert!(runtime.pointer_moved(out, y, false));
+        assert!(runtime.pointer_moved(out, y, false).unwrap());
         assert!(
             runtime.scroll_offset(&path).x > 0.0,
             "the run followed the hand out of the box",
@@ -6583,7 +6640,7 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&panel);
         let viewport = Proposal::exact(Size { width: 240.0, height: 200.0 });
-        let result = runtime.layout(&panel, viewport);
+        let result = runtime.layout(&panel, viewport).unwrap();
 
         let box_of = |result: &crate::layout::LayoutResult, tall: bool| {
             result
@@ -6624,25 +6681,29 @@ mod tests {
 
         // a press picks the line by its Y — the second run, not the first
         let second = note_frame.origin.y + 5.0 + 20.0;
-        assert!(runtime.pointer_clicked(note_frame.origin.x + 8.0, second, 1, false));
+        assert!(runtime.pointer_clicked(note_frame.origin.x + 8.0, second, 1, false)
+                .unwrap()
+        );
         assert_eq!(runtime.focused(), Some(note_path.clone()));
         assert_eq!(
-            runtime.ime_snapshot().expect("focused").selected,
+            runtime.ime_snapshot().unwrap().expect("focused").selected,
             (14, 0),
             "the caret landed at the start of the second line",
         );
 
         // and a third click takes THAT line, not the whole note
-        runtime.pointer_clicked(note_frame.origin.x + 8.0, second, 3, false);
+        runtime.pointer_clicked(note_frame.origin.x + 8.0, second, 3, false)
+            .unwrap();
         runtime.pointer_released(note_frame.origin.x + 8.0, second);
-        assert_eq!(runtime.ime_snapshot().expect("focused").selected, (14, 13));
+        assert_eq!(runtime.ime_snapshot().unwrap().expect("focused").selected, (14, 13));
 
         // more text does not grow the box: it rolls inside it
-        assert!(runtime.key(EditCommand::SelectAll).applied);
+        assert!(runtime.key(EditCommand::SelectAll).unwrap().applied);
         assert!(runtime.key(EditCommand::Insert(
             "alpha bravo charlie delta echo foxtrot golf hotel india".into()
-        )).applied);
-        let grown = runtime.layout(&panel, viewport);
+        )).unwrap()
+                .applied);
+        let grown = runtime.layout(&panel, viewport).unwrap();
         assert_eq!(box_of(&grown, true).1.size.height, 72.0, "the box held");
         assert!(
             runtime.scroll_offset(&note_path).y > 0.0,
@@ -6651,12 +6712,12 @@ mod tests {
         // and the rolled offset is a whole number of lines' worth, never
         // past the end of the text
         let offset = runtime.scroll_offset(&note_path).y;
-        assert!(runtime.key(EditCommand::Home(false)).applied);
+        assert!(runtime.key(EditCommand::Home(false)).unwrap().applied);
         assert_eq!(runtime.scroll_offset(&note_path).y, 0.0, "Home brought it back");
         assert!(offset > 0.0);
 
         // the one-line field beside it kept its own natural height
-        let (_, name_frame) = box_of(&runtime.layout(&panel, viewport), false);
+        let (_, name_frame) = box_of(&runtime.layout(&panel, viewport).unwrap(), false);
         assert_eq!(name_frame.size.height, 26.0);
         assert_eq!(name_path, name_path);
     }
@@ -6691,7 +6752,8 @@ mod tests {
         fn box_of(root: &impl View, viewport: Proposal) -> crate::layout::Rect {
             let runtime = Runtime::new();
             runtime.render_stable(root);
-            runtime.layout(root, viewport).hits.last().expect("the field is a target").1
+            runtime.layout(root, viewport).unwrap()
+                .hits.last().expect("the field is a target").1
         }
 
         // the many-line field is the only flexible one in the stack, so
@@ -6779,21 +6841,23 @@ mod tests {
             };
             let runtime = Runtime::new();
             runtime.render_stable(&panel);
-            let result = runtime.layout(&panel, Proposal::exact(Size { width: 300.0, height: 300.0 }));
+            let result = runtime.layout(&panel, Proposal::exact(Size { width: 300.0, height: 300.0 }))
+                .unwrap();
 
             assert!(runtime.focus_named("composer"));
-            assert!(runtime.paste(), "the picture landed");
+            assert!(runtime.paste().unwrap(), "the picture landed");
             assert_eq!(panel.attached.borrow().as_slice(), [png.clone()]);
             assert_eq!(panel.prompt.get(), "", "and no text followed it");
 
             assert!(runtime.focus_named("note"));
-            assert!(runtime.paste());
+            assert!(runtime.paste().unwrap());
             assert_eq!(panel.note.get(), "pasted text", "a field with no door pastes the text");
 
             let canvas = result.customs.first().expect("the box is placed").frame;
-            runtime.pointer_pressed(canvas.origin.x + 5.0, canvas.origin.y + 5.0);
+            runtime.pointer_pressed(canvas.origin.x + 5.0, canvas.origin.y + 5.0)
+                .unwrap();
             runtime.pointer_released(canvas.origin.x + 5.0, canvas.origin.y + 5.0);
-            assert!(runtime.paste());
+            assert!(runtime.paste().unwrap());
             let expected = if box_takes { "image/png" } else { "pasted text" };
             assert_eq!(panel.heard.borrow().as_slice(), [expected.to_string()]);
         }
@@ -6825,20 +6889,24 @@ mod tests {
         let composer = Composer { prompt: State::new("@re".to_string()), completing: State::new(true) };
         let runtime = Runtime::new();
         runtime.render_stable(&composer);
-        runtime.layout(&composer, Proposal::exact(Size { width: 300.0, height: 120.0 }));
+        runtime.layout(&composer, Proposal::exact(Size { width: 300.0, height: 120.0 }))
+            .unwrap();
         assert!(runtime.focus_named("composer"));
 
-        assert!(!runtime.key(EditCommand::Up(false)).applied, "↑ walks the list");
-        assert!(!runtime.key(EditCommand::Down(false)).applied, "↓ walks the list");
-        assert!(!runtime.key(EditCommand::Newline).applied, "Enter accepts the row");
-        assert!(runtime.key(EditCommand::Insert("a".into())).applied, "the query keeps growing");
-        assert!(runtime.key(EditCommand::Up(true)).applied, "a shifted arrow still selects");
+        assert!(!runtime.key(EditCommand::Up(false)).unwrap().applied, "↑ walks the list"
+        );
+        assert!(!runtime.key(EditCommand::Down(false)).unwrap().applied, "↓ walks the list"
+        );
+        assert!(!runtime.key(EditCommand::Newline).unwrap().applied, "Enter accepts the row");
+        assert!(runtime.key(EditCommand::Insert("a".into())).unwrap()
+                .applied, "the query keeps growing");
+        assert!(runtime.key(EditCommand::Up(true)).unwrap().applied, "a shifted arrow still selects");
         assert_eq!(composer.prompt.get(), "@rea");
 
         // the list closes: the three come back, read at the stroke
         composer.completing.set(false);
-        assert!(runtime.key(EditCommand::Newline).applied, "the break is the field's again");
-        assert!(runtime.key(EditCommand::Up(false)).applied);
+        assert!(runtime.key(EditCommand::Newline).unwrap().applied, "the break is the field's again");
+        assert!(runtime.key(EditCommand::Up(false)).unwrap().applied);
         assert!(composer.prompt.get().contains('\n'));
     }
 
@@ -6882,15 +6950,18 @@ mod tests {
         let viewport = Proposal::exact(Size { width: 320.0, height: 260.0 });
         let lay = || {
             runtime.render_stable(&tab);
-            runtime.layout(&tab, viewport)
+            runtime.layout(&tab, viewport).unwrap()
         };
         let press_grid = |result: &crate::layout::LayoutResult| {
             let grid = result.customs.first().expect("the grid is placed").frame;
-            runtime.pointer_pressed(grid.origin.x + 10.0, grid.origin.y + 10.0);
+            runtime.pointer_pressed(grid.origin.x + 10.0, grid.origin.y + 10.0)
+                .unwrap();
             runtime.pointer_released(grid.origin.x + 10.0, grid.origin.y + 10.0);
             runtime.focused().expect("a press on the grid holds the keys")
         };
-        let focused_field = || runtime.focused().is_some_and(|path| path.ends_with("[filter]"));
+        let focused_field = || {
+            runtime.focused().is_some_and(|path| path.ends_with("[filter]"))
+        };
 
         // the first appearance focused the field; the grid takes the keys
         let result = lay();
@@ -6959,7 +7030,7 @@ mod tests {
         let viewport = Proposal::exact(Size { width: 320.0, height: 280.0 });
         let lay = || {
             runtime.render_stable(&desk);
-            runtime.layout(&desk, viewport)
+            runtime.layout(&desk, viewport).unwrap()
         };
         let press = |result: &crate::layout::LayoutResult, name: &str| {
             let tail = format!("[{name}]");
@@ -6969,11 +7040,14 @@ mod tests {
                 .find(|placement| placement.path.ends_with(&tail))
                 .expect("the pane is placed")
                 .frame;
-            runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0);
+            runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0)
+                .unwrap();
             runtime.pointer_released(pane.origin.x + 10.0, pane.origin.y + 10.0);
             runtime.focused().expect("a press on a pane holds the keys")
         };
-        let holds_query = || runtime.focused().is_some_and(|path| path.ends_with("[query]"));
+        let holds_query = || {
+            runtime.focused().is_some_and(|path| path.ends_with("[query]"))
+        };
 
         // the reader works in the editor
         let result = lay();
@@ -7053,35 +7127,39 @@ mod tests {
         let viewport = Proposal::exact(Size { width: 320.0, height: 200.0 });
         let lay = || {
             runtime.render_stable(&bar);
-            runtime.layout(&bar, viewport)
+            runtime.layout(&bar, viewport).unwrap()
         };
         let result = lay();
         let pane = result.customs.iter().find(|p| p.path.ends_with("[editor]")).expect("placed").frame;
-        runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0)
+            .unwrap();
         runtime.pointer_released(pane.origin.x + 10.0, pane.origin.y + 10.0);
-        let holds_query = || runtime.focused().is_some_and(|path| path.ends_with("[query]"));
+        let holds_query = || {
+            runtime.focused().is_some_and(|path| path.ends_with("[query]"))
+        };
 
         // the editor holds the keys; ⌘F beats: the query takes them, selected
         bar.beat.set(1);
         lay();
         assert!(holds_query(), "the beat takes the keys from the editor");
-        assert!(runtime.key(EditCommand::Insert("b".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("b".into())).unwrap()
+                .applied);
         assert_eq!(bar.query.get(), "b", "typing replaced the selected query");
 
         // the query already holds the keys; ⌘F again: selected again
-        assert!(runtime.key(EditCommand::Insert("ar".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("ar".into())).unwrap().applied);
         assert_eq!(bar.query.get(), "bar");
         bar.beat.set(2);
         lay();
         assert!(holds_query());
-        assert!(runtime.key(EditCommand::Insert("baz".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("baz".into())).unwrap().applied);
         assert_eq!(bar.query.get(), "baz", "a beat on the holder selects as well");
 
         // a plain beat moves the keys and selects nothing
         bar.selecting.set(false);
         bar.beat.set(3);
         lay();
-        assert!(runtime.key(EditCommand::Insert("!".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("!".into())).unwrap().applied);
         assert_eq!(bar.query.get(), "baz!", "a plain beat leaves the caret where it was");
     }
 
@@ -7127,20 +7205,24 @@ mod tests {
         let viewport = Proposal::exact(Size { width: 320.0, height: 200.0 });
         let lay = || {
             runtime.render_stable(&bar);
-            runtime.layout(&bar, viewport)
+            runtime.layout(&bar, viewport).unwrap()
         };
         let result = lay();
         let pane = result.customs.iter().find(|p| p.path.ends_with("[editor]")).expect("placed").frame;
-        runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0)
+            .unwrap();
         runtime.pointer_released(pane.origin.x + 10.0, pane.origin.y + 10.0);
         let editor = runtime.focused().expect("the editor holds the keys");
-        let holds_query = || runtime.focused().is_some_and(|path| path.ends_with("[query]"));
+        let holds_query = || {
+            runtime.focused().is_some_and(|path| path.ends_with("[query]"))
+        };
 
         bar.beat.set(1);
         lay();
         assert!(holds_query(), "⌘F borrowed the keys");
-        assert!(runtime.key(EditCommand::Insert("foo".into())).applied);
-        assert!(runtime.key(EditCommand::Newline).applied, "the field took its own key");
+        assert!(runtime.key(EditCommand::Insert("foo".into())).unwrap()
+                .applied);
+        assert!(runtime.key(EditCommand::Newline).unwrap().applied, "the field took its own key");
         assert_eq!(bar.committed.get(), 1, "the submit ran");
         assert_eq!(runtime.focused(), Some(editor.clone()), "and the keys went back to the editor");
         lay();
@@ -7151,7 +7233,7 @@ mod tests {
         bar.beat.set(2);
         lay();
         assert!(holds_query());
-        assert!(runtime.key(EditCommand::Newline).applied);
+        assert!(runtime.key(EditCommand::Newline).unwrap().applied);
         assert_eq!(bar.committed.get(), 2);
         assert!(holds_query(), "no yield, no hand-back");
     }
@@ -7204,7 +7286,7 @@ mod tests {
         let viewport = Proposal::exact(Size { width: 320.0, height: 280.0 });
         let lay = || {
             runtime.render_stable(&desk);
-            runtime.layout(&desk, viewport)
+            runtime.layout(&desk, viewport).unwrap()
         };
         let holds = |name: &str| {
             let tail = format!("[{name}]");
@@ -7218,7 +7300,8 @@ mod tests {
 
         let result = lay();
         let pane = result.customs.first().expect("the editor is placed").frame;
-        runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0)
+            .unwrap();
         runtime.pointer_released(pane.origin.x + 10.0, pane.origin.y + 10.0);
         let editor = runtime.focused().expect("the editor holds the keys");
 
@@ -7275,7 +7358,7 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&panel);
         let viewport = Proposal::exact(Size { width: 240.0, height: 200.0 });
-        let result = runtime.layout(&panel, viewport);
+        let result = runtime.layout(&panel, viewport).unwrap();
         let box_of = |result: &crate::layout::LayoutResult, tall: bool| {
             result
                 .hits
@@ -7292,51 +7375,54 @@ mod tests {
 
         // the break belongs to the many-line field
         let (x, y) = into(note_frame);
-        runtime.pointer_clicked(x, y, 1, false);
+        runtime.pointer_clicked(x, y, 1, false).unwrap();
         runtime.pointer_released(x, y);
-        assert!(runtime.key(EditCommand::Insert("ab".into())).applied);
-        assert!(runtime.key(EditCommand::Newline).applied, "the note takes a break");
-        assert!(runtime.key(EditCommand::Insert("cd".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("ab".into())).unwrap()
+                .applied);
+        assert!(runtime.key(EditCommand::Newline).unwrap().applied, "the note takes a break");
+        assert!(runtime.key(EditCommand::Insert("cd".into())).unwrap().applied);
         assert_eq!(panel.note.get(), "ab\ncd", "the break landed in the app's own string");
 
         // and NOT to the one-line one: it declines, so the app's binding
         // hears the stroke and `\u{2318}\u{21a9}` keeps meaning commit
         let (x, y) = into(name_frame);
-        runtime.pointer_clicked(x, y, 1, false);
+        runtime.pointer_clicked(x, y, 1, false).unwrap();
         runtime.pointer_released(x, y);
-        assert!(!runtime.key(EditCommand::Newline).applied, "a one-line field declines");
-        assert!(!runtime.key(EditCommand::Up(false)).applied, "and the arrows too");
+        assert!(!runtime.key(EditCommand::Newline).unwrap().applied, "a one-line field declines");
+        assert!(!runtime.key(EditCommand::Up(false)).unwrap().applied, "and the arrows too");
         assert_eq!(panel.name.get(), "deco", "untouched");
 
         // a paste of many lines into the one-line field arrives flat
-        assert!(runtime.key(EditCommand::SelectAll).applied);
-        assert!(runtime.key(EditCommand::Insert("two\nlines".into())).applied);
+        assert!(runtime.key(EditCommand::SelectAll).unwrap().applied);
+        assert!(runtime.key(EditCommand::Insert("two\nlines".into())).unwrap().applied);
         assert_eq!(panel.name.get(), "two lines");
 
         // the vertical arrows walk the note's visual lines and KEEP the
         // column across a short one
         let (x, y) = into(note_frame);
-        runtime.pointer_clicked(x, y, 1, false);
+        runtime.pointer_clicked(x, y, 1, false).unwrap();
         runtime.pointer_released(x, y);
         // three lines of twelve, one and twelve cells — none of them
         // wide enough to wrap inside the box
-        assert!(runtime.key(EditCommand::SelectAll).applied);
-        assert!(runtime.key(EditCommand::Insert("first line x\ny\nthird line z".into())).applied);
-        let selected = || runtime.ime_snapshot().expect("focused").selected;
+        assert!(runtime.key(EditCommand::SelectAll).unwrap().applied);
+        assert!(runtime.key(EditCommand::Insert("first line x\ny\nthird line z".into())).unwrap()
+                .applied);
+        let selected = || runtime.ime_snapshot().unwrap().expect("focused").selected;
         assert_eq!(selected(), (27, 0), "at the tail of the third line, column twelve");
-        assert!(runtime.key(EditCommand::Up(false)).applied);
-        assert_eq!(selected(), (14, 0), "the short line has no column twelve — its end");
-        assert!(runtime.key(EditCommand::Up(false)).applied);
+        assert!(runtime.key(EditCommand::Up(false)).unwrap().applied);
+        assert_eq!(selected(), (14, 0), "the short line has no column twelve — its end"
+        );
+        assert!(runtime.key(EditCommand::Up(false)).unwrap().applied);
         assert_eq!(selected(), (12, 0), "and the column came back on the long one");
-        assert!(runtime.key(EditCommand::Down(true)).applied);
+        assert!(runtime.key(EditCommand::Down(true)).unwrap().applied);
         assert_eq!(selected(), (12, 2), "shift extends the walk");
 
         // off the top is the start of the note; off the bottom, the end
-        assert!(runtime.key(EditCommand::Up(false)).applied);
-        assert!(runtime.key(EditCommand::Up(false)).applied);
+        assert!(runtime.key(EditCommand::Up(false)).unwrap().applied);
+        assert!(runtime.key(EditCommand::Up(false)).unwrap().applied);
         assert_eq!(selected(), (0, 0));
         for _ in 0..4 {
-            assert!(runtime.key(EditCommand::Down(false)).applied);
+            assert!(runtime.key(EditCommand::Down(false)).unwrap().applied);
         }
         assert_eq!(selected(), (27, 0));
     }
@@ -7375,22 +7461,23 @@ mod tests {
         let menu = Menu { log: Rc::new(RefCell::new(Vec::new())) };
         let runtime = Runtime::new();
         runtime.render_stable(&menu);
-        runtime.layout(&menu, Proposal::exact(Size { width: 200.0, height: 100.0 }));
+        runtime.layout(&menu, Proposal::exact(Size { width: 200.0, height: 100.0 }))
+            .unwrap();
 
         // the pointer arrives on the first row: the flyout opens, which
         // is the whole gesture a submenu is made of
-        runtime.pointer_moved(100.0, 20.0, false);
+        runtime.pointer_moved(100.0, 20.0, false).unwrap();
         assert_eq!(menu.log.borrow().as_slice(), &["servers in"]);
 
         // moving INSIDE the same row says nothing new: it fires on the
         // CHANGE, not on the pointer
-        runtime.pointer_moved(120.0, 30.0, false);
+        runtime.pointer_moved(120.0, 30.0, false).unwrap();
         assert_eq!(menu.log.borrow().len(), 1, "still once");
 
         // onto the second row, and the ORDER is the point: the row the
         // pointer left hears it FIRST, so two flyouts are never open at
         // the same moment
-        runtime.pointer_moved(100.0, 60.0, false);
+        runtime.pointer_moved(100.0, 60.0, false).unwrap();
         assert_eq!(
             menu.log.borrow().as_slice(),
             &["servers in", "servers out", "extensions in"],
@@ -7442,10 +7529,10 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&rows);
         let viewport = Proposal::exact(Size { width: 200.0, height: 100.0 });
-        runtime.layout(&rows, viewport);
+        runtime.layout(&rows, viewport).unwrap();
 
         // the hand lands on the third row and STAYS there
-        runtime.pointer_moved(100.0, 50.0, false);
+        runtime.pointer_moved(100.0, 50.0, false).unwrap();
         assert_eq!(rows.log.borrow().as_slice(), &["row 2".to_string()]);
 
         // the wheel slides the list by two rows under it. Nothing about
@@ -7457,7 +7544,8 @@ mod tests {
             Size { width: 200.0, height: 100.0 },
             1,
             crate::layout::Color::rgb(0, 0, 0),
-        );
+        )
+            .unwrap();
         assert_eq!(
             rows.log.borrow().as_slice(),
             &["row 2".to_string(), "row 4".to_string()],
@@ -7599,22 +7687,24 @@ mod tests {
                 width: 200.0,
                 height: 80.0,
             }),
-        );
+        )
+            .unwrap();
         let path = &layout.hits.first().expect("field target").0;
         runtime.focus(path);
         assert!(runtime.focus_takes_text());
-        runtime.key(EditCommand::Insert("é🦀".into()));
-        assert!(runtime.key_stroke(KeyPattern::key(Key::Escape)).handled);
+        runtime.key(EditCommand::Insert("é🦀".into())).unwrap();
+        assert!(runtime.key_stroke(KeyPattern::key(Key::Escape)).unwrap().handled);
         assert!(!runtime.focus_takes_text());
         assert!(
             runtime
                 .key_stroke(Stroke::new(KeyPattern::key(Key::Char('x')), Some('x')))
+                .unwrap()
                 .handled
         );
         assert_eq!(panel.note.get(), "é");
         runtime.render_stable(&panel);
         assert!(!runtime.focus_takes_text(), "redraw retains the policy");
-        assert!(runtime.key_stroke(KeyPattern::command(Key::Enter)).handled);
+        assert!(runtime.key_stroke(KeyPattern::command(Key::Enter)).unwrap().handled);
         assert_eq!(panel.sent.get(), 1);
     }
 
@@ -7636,22 +7726,22 @@ mod tests {
         let runtime = Runtime::new();
         let proposal = Proposal::exact(Size { width: 200.0, height: 80.0 });
         runtime.render_stable(&panel);
-        let layout = runtime.layout(&panel, proposal);
+        let layout = runtime.layout(&panel, proposal).unwrap();
         let path = layout.hits.first().expect("field target").0.clone();
         runtime.focus(&path);
         // the caret goes home, then a shift-move selects the "a"
-        runtime.key(EditCommand::Home(false));
-        runtime.key(EditCommand::Right(true));
+        runtime.key(EditCommand::Home(false)).unwrap();
+        runtime.key(EditCommand::Right(true)).unwrap();
         assert_eq!(panel.writes.get(), 0, "moves and selections write nothing");
-        let _ = runtime.ime_snapshot();
+        let _ = runtime.ime_snapshot().unwrap();
         assert_eq!(panel.writes.get(), 0, "a read writes nothing");
         // one byte over one byte: the length stands, the text does not
-        assert!(runtime.key(EditCommand::Insert("x".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("x".into())).unwrap().applied);
         assert_eq!(panel.note.get(), "xbc");
         assert_eq!(panel.writes.get(), 1, "the equal-length edit was written");
         // a backspace at the start changes nothing and writes nothing
-        runtime.key(EditCommand::Home(false));
-        runtime.key(EditCommand::Backspace);
+        runtime.key(EditCommand::Home(false)).unwrap();
+        runtime.key(EditCommand::Backspace).unwrap();
         assert_eq!(panel.note.get(), "xbc");
         assert_eq!(panel.writes.get(), 1, "an edit that changed nothing wrote nothing");
     }
@@ -7668,12 +7758,13 @@ mod tests {
                 text_editor("note", self.note.binding()).frame(400.0, 300.0)
             }
         }
-        let note: String = (0..300).map(|line| format!("line {line} — é 日本 🦀\n")).collect();
+        let note: String = (0..300).map(|line| format!("line {line} — é 日本 🦀\n"))
+            .collect();
         let panel = Panel { note: State::new(note) };
         let runtime = Runtime::new();
         let proposal = Proposal::exact(Size { width: 400.0, height: 300.0 });
         runtime.render_stable(&panel);
-        let layout = runtime.layout(&panel, proposal);
+        let layout = runtime.layout(&panel, proposal).unwrap();
         let path = layout.hits.first().expect("field target").0.clone();
         runtime.focus(&path);
         let mut seed: u64 = 0x0071_6f75_6e74;
@@ -7686,20 +7777,20 @@ mod tests {
             match roll(9) {
                 0..=2 => {
                     let word = words[roll(words.len() as u64) as usize];
-                    runtime.key(EditCommand::Insert(word.into()));
+                    runtime.key(EditCommand::Insert(word.into())).unwrap();
                 }
                 3 | 4 => {
-                    runtime.key(EditCommand::Backspace);
+                    runtime.key(EditCommand::Backspace).unwrap();
                 }
                 5 => {
-                    runtime.key(EditCommand::Left(false));
+                    runtime.key(EditCommand::Left(false)).unwrap();
                 }
                 6 => {
-                    runtime.key(EditCommand::Right(false));
+                    runtime.key(EditCommand::Right(false)).unwrap();
                 }
                 7 => {
                     for _ in 0..roll(40) {
-                        runtime.key(EditCommand::Left(false));
+                        runtime.key(EditCommand::Left(false)).unwrap();
                     }
                 }
                 _ => {
@@ -7709,8 +7800,9 @@ mod tests {
                 }
             }
             runtime.render_stable(&panel);
-            let _ = runtime.layout(&panel, proposal);
-            let snapshot = runtime.ime_snapshot().expect("the focused note answers the input method");
+            let _ = runtime.layout(&panel, proposal).unwrap();
+            let snapshot = runtime.ime_snapshot()
+                .unwrap().expect("the focused note answers the input method");
             let text = panel.note.get();
             let caret = crate::text_input::clamp_index(&text, runtime.caret_for(&path).caret);
             let units: usize = text[..caret].chars().map(char::len_utf16).sum();
@@ -7746,21 +7838,25 @@ mod tests {
         }
         // two thousand lines, some of them long enough to wrap
         let note: String = (0..2000)
-            .map(|line| if line % 9 == 0 { format!("{} {line}\n", "a long line that wraps".repeat(4)) } else { format!("line {line}\n") })
+            .map(|line| {
+                if line % 9 == 0 { format!("{} {line}\n", "a long line that wraps".repeat(4)) } else { format!("line {line}\n") }
+            })
             .collect();
         let engine = Rc::new(Longest(Cell::new(0)));
         let panel = Panel { note: State::new(note.clone()) };
         let runtime = Runtime::new().text_engine(engine.clone());
         let proposal = Proposal::exact(Size { width: 400.0, height: 300.0 });
         runtime.render_stable(&panel);
-        let layout = runtime.layout(&panel, proposal);
+        let layout = runtime.layout(&panel, proposal).unwrap();
         let path = layout.hits.first().expect("field target").0.clone();
         runtime.focus(&path);
         for stroke in 0..20 {
-            runtime.key(EditCommand::Insert(if stroke % 5 == 4 { "\n".into() } else { "x".into() }));
+            runtime.key(EditCommand::Insert(if stroke % 5 == 4 { "\n".into() } else { "x".into() }))
+                .unwrap();
             runtime.render_stable(&panel);
-            let _ = runtime.layout(&panel, proposal);
-            let snapshot = runtime.ime_snapshot().expect("the focused note answers the input method");
+            let _ = runtime.layout(&panel, proposal).unwrap();
+            let snapshot = runtime.ime_snapshot()
+                .unwrap().expect("the focused note answers the input method");
             assert!(snapshot.caret_rect.size.height > 0.0);
         }
         assert_eq!(panel.note.get().len(), note.len() + 20, "every stroke landed");
@@ -7801,14 +7897,16 @@ mod tests {
                 width: 200.0,
                 height: 160.0,
             }),
-        );
+        )
+            .unwrap();
         assert_eq!(laid.fields.len(), 3);
         for field in laid.fields.iter().take(2) {
             runtime.pointer_moved(
                 field.frame.origin.x + 10.0,
                 field.frame.origin.y + 10.0,
                 false,
-            );
+            )
+                .unwrap();
             assert_eq!(runtime.hovered_cursor(), Some(Cursor::Text));
         }
         let covered = &laid.fields[2];
@@ -7816,19 +7914,20 @@ mod tests {
             covered.frame.origin.x + covered.frame.size.width / 2.0,
             covered.frame.origin.y + covered.frame.size.height / 2.0,
             false,
-        );
+        )
+            .unwrap();
         assert_ne!(
             runtime.hovered_cursor(),
             Some(Cursor::Text),
             "overlay button wins over covered input"
         );
-        runtime.pointer_moved(10.0, 150.0, false);
+        runtime.pointer_moved(10.0, 150.0, false).unwrap();
         assert_ne!(
             runtime.hovered_cursor(),
             Some(Cursor::Text),
             "chrome is not text"
         );
-        runtime.pointer_moved(500.0, 500.0, false);
+        runtime.pointer_moved(500.0, 500.0, false).unwrap();
         assert_eq!(runtime.hovered_cursor(), None);
     }
 
@@ -7879,9 +7978,10 @@ mod tests {
                 width: 40.0,
                 height: 26.0,
             });
-            let laid = runtime.settled_layout(&view, proposal);
+            let laid = runtime.settled_layout(&view, proposal).unwrap();
             runtime.focus(&laid.fields[0].path);
-            runtime.key(crate::text_input::EditCommand::Home(false));
+            runtime.key(crate::text_input::EditCommand::Home(false))
+                .unwrap();
             if value == "abcdef" {
                 let field = &laid.fields[0];
                 let lines = crate::text_engine::break_lines(
@@ -7890,10 +7990,12 @@ mod tests {
                     field.run.size.width,
                     &*runtime.text(),
                     &crate::text_engine::MeasureCache::default(),
-                );
+                )
+                .unwrap();
                 assert!(lines.len() > 1, "fixture must wrap: {field:?}");
                 for _ in 0..lines[1].0 {
-                    runtime.key(crate::text_input::EditCommand::Right(false));
+                    runtime.key(crate::text_input::EditCommand::Right(false))
+                        .unwrap();
                 }
             }
             for (key, block, underline) in [
@@ -7902,8 +8004,8 @@ mod tests {
                 (Key::Char('R'), false, true),
                 (Key::Char('i'), false, false),
             ] {
-                assert!(runtime.key_stroke(KeyPattern::key(key)).handled);
-                let laid = runtime.settled_layout(&view, proposal);
+                assert!(runtime.key_stroke(KeyPattern::key(key)).unwrap().handled);
+                let laid = runtime.settled_layout(&view, proposal).unwrap();
                 let rect = laid
                     .display
                     .iter()
@@ -7956,7 +8058,8 @@ mod tests {
                 width: 100.0,
                 height: 40.0,
             }),
-        );
+        )
+            .unwrap();
         let files = ExternalPaths(vec!["/tmp/é.png".into(), "/tmp/note.txt".into()]);
         assert!(runtime.external_drag(20.0, 20.0, &files));
         assert_eq!(panel.count.get(), 0, "hover never attaches");
@@ -7983,38 +8086,40 @@ mod tests {
             height: 100.0,
         });
         runtime.render_stable(&note);
-        let laid = runtime.layout(&note, proposal);
+        let laid = runtime.layout(&note, proposal).unwrap();
         let (_, frame) = laid.hits.last().expect("field");
         let x = frame.origin.x + 8.0;
         let y = frame.origin.y + 9.0;
-        let selected = || runtime.ime_snapshot().expect("focused").selected;
+        let selected = || runtime.ime_snapshot().unwrap().expect("focused").selected;
         // The previous caret is on another line, not at the selected word.
-        runtime.pointer_clicked(x + 24.0, y + 32.0, 1, false);
+        runtime.pointer_clicked(x + 24.0, y + 32.0, 1, false)
+            .unwrap();
         runtime.pointer_released(x + 24.0, y + 32.0);
-        runtime.pointer_clicked(x + 64.0, y, 2, false);
-        runtime.pointer_moved(x + 64.5, y, false);
-        runtime.layout(&note, proposal);
+        runtime.pointer_clicked(x + 64.0, y, 2, false).unwrap();
+        runtime.pointer_moved(x + 64.5, y, false).unwrap();
+        runtime.layout(&note, proposal).unwrap();
         assert_eq!(selected(), (6, 4), "the entire accented word, in UTF-16");
-        runtime.pointer_moved(x + 96.0, y, false);
+        runtime.pointer_moved(x + 96.0, y, false).unwrap();
         assert_eq!(selected(), (6, 10), "forward word drag");
-        runtime.pointer_moved(x + 16.0, y, false);
+        runtime.pointer_moved(x + 16.0, y, false).unwrap();
         assert_eq!(
             selected(),
             (0, 10),
             "reverse word drag keeps the original word"
         );
         runtime.pointer_released(x + 16.0, y);
-        runtime.pointer_clicked(x + 24.0, y + 16.0, 3, false);
-        runtime.pointer_moved(x + 24.5, y + 16.0, false);
-        runtime.layout(&note, proposal);
+        runtime.pointer_clicked(x + 24.0, y + 16.0, 3, false)
+            .unwrap();
+        runtime.pointer_moved(x + 24.5, y + 16.0, false).unwrap();
+        runtime.layout(&note, proposal).unwrap();
         assert_eq!(selected(), (17, 11), "only the clicked line, in full");
-        runtime.pointer_moved(x + 8.0, y, false);
+        runtime.pointer_moved(x + 8.0, y, false).unwrap();
         assert_eq!(selected(), (0, 28), "reverse drag keeps complete lines");
-        runtime.pointer_moved(x + 8.0, y + 32.0, false);
+        runtime.pointer_moved(x + 8.0, y + 32.0, false).unwrap();
         assert_eq!(selected(), (17, 16), "forward drag keeps complete lines");
         runtime.pointer_cancelled();
-        runtime.pointer_clicked(x + 16.0, y, 1, false);
-        runtime.pointer_moved(x + 32.0, y, false);
+        runtime.pointer_clicked(x + 16.0, y, 1, false).unwrap();
+        runtime.pointer_moved(x + 32.0, y, false).unwrap();
         assert_eq!(
             selected(),
             (2, 2),
@@ -8052,46 +8157,50 @@ mod tests {
                 width: 300.0,
                 height: 100.0,
             }),
-        );
-        runtime.key(EditCommand::Insert("one café\nlast line".into()));
-        assert!(runtime.key_stroke(KeyPattern::command(Key::Left)).handled);
+        )
+            .unwrap();
+        runtime.key(EditCommand::Insert("one café\nlast line".into()))
+            .unwrap();
+        assert!(runtime.key_stroke(KeyPattern::command(Key::Left))
+                .unwrap().handled);
         let mut select_end = KeyPattern::command(Key::Right);
         select_end.shift = true;
-        assert!(runtime.key_stroke(select_end).handled);
+        assert!(runtime.key_stroke(select_end).unwrap().handled);
         assert_eq!(
-            runtime.key(EditCommand::Copy).output.as_deref(),
+            runtime.key(EditCommand::Copy).unwrap().output.as_deref(),
             Some("last line")
         );
         let mut word = KeyPattern::key(Key::Left);
         word.option = true;
-        assert!(runtime.key_stroke(word).handled);
+        assert!(runtime.key_stroke(word).unwrap().handled);
         word.shift = true;
-        assert!(runtime.key_stroke(word).handled);
+        assert!(runtime.key_stroke(word).unwrap().handled);
         assert_eq!(
-            runtime.key(EditCommand::Copy).output.as_deref(),
+            runtime.key(EditCommand::Copy).unwrap().output.as_deref(),
             Some("last ")
         );
-        runtime.key_stroke(KeyPattern::command(Key::Up));
+        runtime.key_stroke(KeyPattern::command(Key::Up)).unwrap();
         let mut word = KeyPattern::key(Key::Right);
         word.option = true;
-        runtime.key_stroke(word);
+        runtime.key_stroke(word).unwrap();
         word.shift = true;
-        runtime.key_stroke(word);
+        runtime.key_stroke(word).unwrap();
         assert_eq!(
-            runtime.key(EditCommand::Copy).output.as_deref(),
+            runtime.key(EditCommand::Copy).unwrap().output.as_deref(),
             Some(" café")
         );
-        runtime.key_stroke(KeyPattern::command(Key::Down));
+        runtime.key_stroke(KeyPattern::command(Key::Down)).unwrap();
         let mut newline = KeyPattern::key(Key::Enter);
         newline.shift = true;
-        assert!(runtime.key_stroke(newline).handled);
+        assert!(runtime.key_stroke(newline).unwrap().handled);
         assert_eq!(chat.value.get(), "one café\nlast line\n");
         assert_eq!(chat.sends.get(), 0);
-        assert!(runtime.key_stroke(KeyPattern::key(Key::Enter)).handled);
+        assert!(runtime.key_stroke(KeyPattern::key(Key::Enter)).unwrap()
+                .handled);
         assert_eq!(chat.sends.get(), 1);
         assert_eq!(chat.value.get(), "one café\nlast line\n");
         // Native input bridges can deliver the command rather than a stroke.
-        assert!(runtime.key(EditCommand::Newline).applied);
+        assert!(runtime.key(EditCommand::Newline).unwrap().applied);
         assert_eq!(chat.sends.get(), 2);
     }
 
@@ -8117,23 +8226,27 @@ mod tests {
                 width: 80.0,
                 height: 200.0,
             }),
-        );
+        )
+            .unwrap();
         runtime.key(EditCommand::Insert(
             "first line\nsecond third fourth".into(),
-        ));
+        ))
+            .unwrap();
         runtime.settled_layout(
             &note,
             Proposal::exact(Size {
                 width: 80.0,
                 height: 200.0,
             }),
-        );
-        runtime.key_stroke(KeyPattern::command(Key::Left));
+        )
+            .unwrap();
+        runtime.key_stroke(KeyPattern::command(Key::Left)).unwrap();
         let mut end = KeyPattern::command(Key::Right);
         end.shift = true;
-        runtime.key_stroke(end);
+        runtime.key_stroke(end).unwrap();
         let selected = runtime
             .key(EditCommand::Copy)
+            .unwrap()
             .output
             .expect("last logical line");
         assert_eq!(selected, "second third fourth");
@@ -8182,7 +8295,8 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&panel);
         let result =
-            runtime.layout(&panel, Proposal::exact(Size { width: 240.0, height: 240.0 }));
+            runtime.layout(&panel, Proposal::exact(Size { width: 240.0, height: 240.0 }))
+            .unwrap();
         // by the slot each field holds in the body — a one-line field
         // keeps its natural height whatever box it is given, so the
         // three cannot be told apart by size
@@ -8195,38 +8309,41 @@ mod tests {
                 .expect("the field is a target")
         };
         let click = |(x, y): (f64, f64)| {
-            runtime.pointer_clicked(x, y, 1, false);
+            runtime.pointer_clicked(x, y, 1, false).unwrap();
             runtime.pointer_released(x, y);
         };
         let (note, name, bare) = (field_of("#0"), field_of("#1"), field_of("#2"));
 
         // the one-line field: the bare Enter IS its submit
         click(name);
-        assert!(runtime.key(EditCommand::Insert("deco".into())).applied);
-        assert!(runtime.key(EditCommand::Newline).applied, "the field took its own key");
+        assert!(runtime.key(EditCommand::Insert("deco".into())).unwrap()
+                .applied);
+        assert!(runtime.key(EditCommand::Newline).unwrap().applied, "the field took its own key");
         assert_eq!(panel.sent.get(), 1, "and the app heard it");
         assert_eq!(panel.name.get(), "deco", "a submit is not an edit");
 
         // and the chord stays the app's there: one door per field
         assert!(
-            !runtime.key_stroke(&KeyPattern::command(Key::Enter)).handled,
+            !runtime.key_stroke(&KeyPattern::command(Key::Enter)).unwrap()
+                .handled,
             "the chord over a one-line field belongs to the app"
         );
         assert_eq!(panel.sent.get(), 1);
 
         // a field that named no handler declines exactly as it always did
         click(bare);
-        assert!(!runtime.key(EditCommand::Newline).applied, "no handler, no door");
+        assert!(!runtime.key(EditCommand::Newline).unwrap().applied, "no handler, no door");
 
         // the many-line field keeps Enter for its break...
         click(note);
-        assert!(runtime.key(EditCommand::Insert("ab".into())).applied);
-        assert!(runtime.key(EditCommand::Newline).applied);
+        assert!(runtime.key(EditCommand::Insert("ab".into())).unwrap()
+                .applied);
+        assert!(runtime.key(EditCommand::Newline).unwrap().applied);
         assert_eq!(panel.note.get(), "ab\n", "Enter is still the break");
         assert_eq!(panel.committed.get(), 0, "and a break is not a submit");
 
         // ...and puts its own key on the chord, before the keymap
-        assert!(runtime.key_stroke(&KeyPattern::command(Key::Enter)).handled);
+        assert!(runtime.key_stroke(&KeyPattern::command(Key::Enter)).unwrap().handled);
         assert_eq!(panel.committed.get(), 1);
         assert_eq!(panel.note.get(), "ab\n", "the chord left the note alone");
     }
@@ -8375,32 +8492,32 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&table);
         let viewport = Proposal::exact(Size { width: 300.0, height: 200.0 });
-        let result = runtime.layout(&table, viewport);
+        let result = runtime.layout(&table, viewport).unwrap();
         let (table_path, rows) = copy_targets(&result.hits);
         assert_eq!(rows.len(), 2);
 
         // nothing holds the keyboard yet: a copy answers nothing
-        let copied = runtime.key(EditCommand::Copy);
+        let copied = runtime.key(EditCommand::Copy).unwrap();
         assert!(!copied.applied);
         assert_eq!(copied.output, None);
 
         // the row's click picks it, and the keyboard stays on its TABLE
         let (x, y) = rows[1];
-        runtime.pointer_pressed(x, y);
+        runtime.pointer_pressed(x, y).unwrap();
         runtime.pointer_released(x, y);
         assert_eq!(table.picked.get(), Some(1));
         assert_eq!(runtime.focused(), Some(table_path.clone()), "first responder follows the click");
         // a frame goes by, as one always does between a click and a key:
         // the keyboard is still the table's
         runtime.render_stable(&table);
-        runtime.layout(&table, viewport);
+        runtime.layout(&table, viewport).unwrap();
         assert_eq!(runtime.focused(), Some(table_path.clone()), "a frame does not take the keyboard away");
-        let copied = runtime.key(EditCommand::Copy);
+        let copied = runtime.key(EditCommand::Copy).unwrap();
         assert!(copied.applied);
         assert_eq!(copied.output.as_deref(), Some("beta\t2"));
 
         // read-only: a cut takes nothing, and there is no caret to blink
-        let cut = runtime.key(EditCommand::Cut);
+        let cut = runtime.key(EditCommand::Cut).unwrap();
         assert!(!cut.applied);
         assert_eq!(cut.output, None);
         assert!(!runtime.blink(), "a copy target asks for no caret repaint");
@@ -8408,23 +8525,23 @@ mod tests {
         assert!(!runtime.slow_tick_needed(), "a copy target does not keep the clock awake");
 
         // another row, another answer
-        runtime.layout(&table, viewport);
+        runtime.layout(&table, viewport).unwrap();
         let (x, y) = rows[0];
-        runtime.pointer_pressed(x, y);
+        runtime.pointer_pressed(x, y).unwrap();
         runtime.pointer_released(x, y);
-        assert_eq!(runtime.key(EditCommand::Copy).output.as_deref(), Some("alpha\t1"));
+        assert_eq!(runtime.key(EditCommand::Copy).unwrap().output.as_deref(), Some("alpha\t1"));
 
         // a click on nothing lets the keyboard go, and a copy answers nothing
-        runtime.pointer_pressed(299.0, 199.0);
+        runtime.pointer_pressed(299.0, 199.0).unwrap();
         runtime.pointer_released(299.0, 199.0);
         assert_eq!(runtime.focused(), None);
-        assert_eq!(runtime.key(EditCommand::Copy).output, None);
+        assert_eq!(runtime.key(EditCommand::Copy).unwrap().output, None);
 
         // and Escape (the shells' blur) lets it go too
-        runtime.pointer_pressed(x, y);
+        runtime.pointer_pressed(x, y).unwrap();
         runtime.pointer_released(x, y);
         assert!(runtime.blur());
-        assert_eq!(runtime.key(EditCommand::Copy).output, None);
+        assert_eq!(runtime.key(EditCommand::Copy).unwrap().output, None);
     }
 
     #[test]
@@ -8442,13 +8559,14 @@ mod tests {
 
         let runtime = Runtime::new();
         runtime.render_stable(&Empty);
-        let result = runtime.layout(&Empty, Proposal::exact(Size { width: 200.0, height: 100.0 }));
+        let result = runtime.layout(&Empty, Proposal::exact(Size { width: 200.0, height: 100.0 }))
+            .unwrap();
         let (path, rect) = result.hits.last().expect("the copy target is a pointer target").clone();
         let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
-        runtime.pointer_pressed(x, y);
+        runtime.pointer_pressed(x, y).unwrap();
         runtime.pointer_released(x, y);
         assert_eq!(runtime.focused(), Some(path), "the keyboard lands even with nothing selected");
-        let copied = runtime.key(EditCommand::Copy);
+        let copied = runtime.key(EditCommand::Copy).unwrap();
         assert!(!copied.applied, "nothing selected is not a copy");
         assert_eq!(copied.output, None, "and the clipboard keeps what it had");
     }
@@ -8498,16 +8616,16 @@ mod tests {
         assert!(runtime.menu_answers(Pick::Command(QUIT)), "and so does the host's");
         assert!(!runtime.menu_answers(Pick::Command(NOBODY)), "nothing mounted: dark");
 
-        assert!(runtime.menu_pick(Pick::Command(SAVE)));
+        assert!(runtime.menu_pick(Pick::Command(SAVE)).unwrap());
         assert_eq!(page.saved.get(), 1, "the item ran its action");
-        assert!(runtime.menu_pick(Pick::Command(QUIT)));
+        assert!(runtime.menu_pick(Pick::Command(QUIT)).unwrap());
         assert_eq!(quits.get(), 1);
-        assert!(!runtime.menu_pick(Pick::Command(NOBODY)), "a dark item runs nothing");
+        assert!(!runtime.menu_pick(Pick::Command(NOBODY)).unwrap(), "a dark item runs nothing");
 
         page.mounted.set(false);
         runtime.render_stable(&page);
         assert!(!runtime.menu_answers(Pick::Command(SAVE)), "gone with its view");
-        assert!(!runtime.menu_pick(Pick::Command(SAVE)));
+        assert!(!runtime.menu_pick(Pick::Command(SAVE)).unwrap());
         assert_eq!(page.saved.get(), 1);
         assert!(runtime.menu_answers(Pick::Command(QUIT)), "the host's outlives the view");
     }
@@ -8546,7 +8664,7 @@ mod tests {
         let page = Page { open: State::new(false), saved: State::new(0) };
         let lay = || {
             runtime.render_stable(&page);
-            runtime.layout(&page, Proposal::exact(WINDOW))
+            runtime.layout(&page, Proposal::exact(WINDOW)).unwrap()
         };
         lay();
         assert!(runtime.menu_answers(Pick::Command(SAVE)));
@@ -8554,12 +8672,12 @@ mod tests {
         page.open.set(true);
         lay();
         assert!(!runtime.menu_answers(Pick::Command(SAVE)), "the ask holds the bar");
-        assert!(!runtime.menu_pick(Pick::Command(SAVE)));
+        assert!(!runtime.menu_pick(Pick::Command(SAVE)).unwrap());
         assert_eq!(page.saved.get(), 0, "nothing decided behind the ask's back");
 
         page.open.set(false);
         lay();
-        assert!(runtime.menu_pick(Pick::Command(SAVE)), "answered, the bar is the page's again");
+        assert!(runtime.menu_pick(Pick::Command(SAVE)).unwrap(), "answered, the bar is the page's again");
         assert_eq!(page.saved.get(), 1);
     }
 
@@ -8584,31 +8702,32 @@ mod tests {
         let form = Form { name: State::new("Deco".to_owned()) };
         let runtime = Runtime::new();
         runtime.render_stable(&form);
-        let result = runtime.layout(&form, Proposal::exact(Size { width: 240.0, height: 80.0 }));
+        let result = runtime.layout(&form, Proposal::exact(Size { width: 240.0, height: 80.0 }))
+            .unwrap();
         let answers = |edit: Edit| runtime.menu_answers(Pick::Edit(edit));
 
         assert!(Edit::ALL.into_iter().all(|edit| !answers(edit)), "nobody holds the keyboard");
-        assert!(!runtime.menu_pick(Pick::Edit(Edit::Copy)));
+        assert!(!runtime.menu_pick(Pick::Edit(Edit::Copy)).unwrap());
 
         let (_, rect) = result.hits.last().expect("the field is a target").clone();
         let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
-        runtime.pointer_pressed(x, y);
+        runtime.pointer_pressed(x, y).unwrap();
         runtime.pointer_released(x, y);
         for edit in [Edit::Cut, Edit::Copy, Edit::Paste, Edit::SelectAll] {
             assert!(answers(edit), "{edit:?} answers in a field");
         }
         assert!(!answers(Edit::Undo) && !answers(Edit::Redo), "a field keeps no history");
 
-        assert!(runtime.menu_pick(Pick::Edit(Edit::SelectAll)));
-        assert!(runtime.menu_pick(Pick::Edit(Edit::Copy)));
+        assert!(runtime.menu_pick(Pick::Edit(Edit::SelectAll)).unwrap());
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Copy)).unwrap());
         assert_eq!(crate::clipboard::read().as_deref(), Some("Deco"), "the copy reached the clipboard");
-        assert!(runtime.menu_pick(Pick::Edit(Edit::Cut)));
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Cut)).unwrap());
         runtime.render_stable(&form);
         assert_eq!(form.name.get(), "", "the cut took the text");
-        assert!(runtime.menu_pick(Pick::Edit(Edit::Paste)));
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Paste)).unwrap());
         runtime.render_stable(&form);
         assert_eq!(form.name.get(), "Deco", "the paste read it back");
-        assert!(!runtime.menu_pick(Pick::Edit(Edit::Undo)), "dark, so it runs nothing");
+        assert!(!runtime.menu_pick(Pick::Edit(Edit::Undo)).unwrap(), "dark, so it runs nothing");
     }
 
     /// A read-only view that copies answers Copy from the menu, and nothing
@@ -8621,17 +8740,18 @@ mod tests {
         let table = CopyTable { picked: State::new(None) };
         let runtime = Runtime::new();
         runtime.render_stable(&table);
-        let result = runtime.layout(&table, Proposal::exact(Size { width: 300.0, height: 200.0 }));
+        let result = runtime.layout(&table, Proposal::exact(Size { width: 300.0, height: 200.0 }))
+            .unwrap();
         let (_, rows) = copy_targets(&result.hits);
         let (x, y) = rows[1];
-        runtime.pointer_pressed(x, y);
+        runtime.pointer_pressed(x, y).unwrap();
         runtime.pointer_released(x, y);
 
         assert!(runtime.menu_answers(Pick::Edit(Edit::Copy)));
         for edit in [Edit::Undo, Edit::Redo, Edit::Cut, Edit::Paste, Edit::SelectAll] {
             assert!(!runtime.menu_answers(Pick::Edit(edit)), "{edit:?} is dark over a read-only view");
         }
-        assert!(runtime.menu_pick(Pick::Edit(Edit::Copy)));
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Copy)).unwrap());
         assert_eq!(crate::clipboard::read().as_deref(), Some("beta\t2"));
     }
 
@@ -8655,16 +8775,17 @@ mod tests {
         let form = Form { key: State::new("sk-secret".to_owned()) };
         let runtime = Runtime::new();
         runtime.render_stable(&form);
-        let result = runtime.layout(&form, Proposal::exact(Size { width: 240.0, height: 80.0 }));
+        let result = runtime.layout(&form, Proposal::exact(Size { width: 240.0, height: 80.0 }))
+            .unwrap();
         let (_, rect) = result.hits.last().expect("the field is a target").clone();
         let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
-        runtime.pointer_pressed(x, y);
+        runtime.pointer_pressed(x, y).unwrap();
         runtime.pointer_released(x, y);
 
         assert!(!runtime.menu_answers(Pick::Edit(Edit::Copy)));
         assert!(!runtime.menu_answers(Pick::Edit(Edit::Cut)));
         assert!(runtime.menu_answers(Pick::Edit(Edit::Paste)), "what enters is not what leaks");
-        assert!(!runtime.menu_pick(Pick::Edit(Edit::Copy)));
+        assert!(!runtime.menu_pick(Pick::Edit(Edit::Copy)).unwrap());
         assert_eq!(crate::clipboard::read(), None, "nothing left the box");
     }
 
@@ -8713,16 +8834,18 @@ mod tests {
         let bench = Bench { heard: Rc::new(RefCell::new(Vec::new())) };
         let runtime = Runtime::new();
         runtime.render_stable(&bench);
-        let result = runtime.layout(&bench, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let result = runtime.layout(&bench, Proposal::exact(Size { width: 400.0, height: 300.0 }))
+            .unwrap();
         let frame = result.customs.first().expect("the box is placed").frame;
-        runtime.pointer_pressed(frame.origin.x + 10.0, frame.origin.y + 10.0);
+        runtime.pointer_pressed(frame.origin.x + 10.0, frame.origin.y + 10.0)
+            .unwrap();
         runtime.pointer_released(frame.origin.x + 10.0, frame.origin.y + 10.0);
 
         assert!(Edit::ALL.into_iter().all(|edit| runtime.menu_answers(Pick::Edit(edit))), "a box may take any edit");
-        assert!(runtime.menu_pick(Pick::Edit(Edit::Undo)), "its own undo answered");
-        assert!(runtime.menu_pick(Pick::Edit(Edit::Copy)));
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Undo)).unwrap(), "its own undo answered");
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Copy)).unwrap());
         assert_eq!(crate::clipboard::read().as_deref(), Some("fn main() {}"));
-        assert!(!runtime.menu_pick(Pick::Edit(Edit::Redo)), "declined, and no field stands behind it");
+        assert!(!runtime.menu_pick(Pick::Edit(Edit::Redo)).unwrap(), "declined, and no field stands behind it");
         assert_eq!(
             *bench.heard.borrow(),
             [Edit::Undo.stroke(), Edit::Copy.stroke(), Edit::Redo.stroke()],
@@ -8798,11 +8921,12 @@ mod tests {
             let viewport = Proposal::exact(Size { width: 300.0, height: 200.0 });
             let lay = || {
                 runtime.render_stable(&page);
-                runtime.layout(&page, viewport)
+                runtime.layout(&page, viewport).unwrap()
             };
             let result = lay();
             let (field, rect) = result.hits.iter().find(|(path, _)| path.contains("name")).cloned().expect("the field");
-            runtime.pointer_pressed(rect.origin.x + 4.0, rect.origin.y + 4.0);
+            runtime.pointer_pressed(rect.origin.x + 4.0, rect.origin.y + 4.0)
+                .unwrap();
             runtime.pointer_released(rect.origin.x + 4.0, rect.origin.y + 4.0);
             assert_eq!(runtime.focused().as_deref(), Some(field.as_str()), "the field holds the keys");
 
@@ -8849,24 +8973,27 @@ mod tests {
         let page = Page { name: State::new(String::new()), chrome: State::new(0), plain: State::new(0) };
         let runtime = Runtime::new();
         runtime.render_stable(&page);
-        let result = runtime.layout(&page, Proposal::exact(Size { width: 300.0, height: 200.0 }));
-        let centre = |rect: &crate::layout::Rect| (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
+        let result = runtime.layout(&page, Proposal::exact(Size { width: 300.0, height: 200.0 }))
+            .unwrap();
+        let centre = |rect: &crate::layout::Rect| {
+            (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0)
+        };
         let (field, field_rect) = result.hits.iter().find(|(path, _)| path.contains("name")).cloned().expect("the field");
         let mut targets: Vec<_> = result.hits.iter().filter(|(path, _)| !path.contains("name")).cloned().collect();
         targets.sort_by(|a, b| a.1.origin.y.total_cmp(&b.1.origin.y));
         let (x, y) = centre(&field_rect);
-        runtime.pointer_pressed(x, y);
+        runtime.pointer_pressed(x, y).unwrap();
         runtime.pointer_released(x, y);
         assert_eq!(runtime.focused().as_deref(), Some(field.as_str()));
 
         let (x, y) = centre(&targets[0].1);
-        runtime.pointer_pressed(x, y);
+        runtime.pointer_pressed(x, y).unwrap();
         runtime.pointer_released(x, y);
         assert_eq!(page.chrome.get(), 1, "the chrome's action ran");
         assert_eq!(runtime.focused().as_deref(), Some(field.as_str()), "and the field kept the keyboard");
 
         let (x, y) = centre(&targets[1].1);
-        runtime.pointer_pressed(x, y);
+        runtime.pointer_pressed(x, y).unwrap();
         runtime.pointer_released(x, y);
         assert_eq!(page.plain.get(), 1);
         assert_eq!(runtime.focused(), None, "a plain button takes the keyboard away");
@@ -8903,10 +9030,12 @@ mod tests {
         let lay = || {
             runtime.render_stable(&page);
             runtime.layout(&page, Proposal::exact(Size { width: 300.0, height: 200.0 }))
+                .unwrap()
         };
         let result = lay();
         let (field, rect) = result.hits.iter().find(|(path, _)| path.contains("name")).cloned().expect("the field");
-        runtime.pointer_pressed(rect.origin.x + 4.0, rect.origin.y + 4.0);
+        runtime.pointer_pressed(rect.origin.x + 4.0, rect.origin.y + 4.0)
+            .unwrap();
         runtime.pointer_released(rect.origin.x + 4.0, rect.origin.y + 4.0);
         assert!(!runtime.give_back_keyboard(), "nothing borrowed, nothing to give back");
 
@@ -8947,10 +9076,10 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&holder);
         let viewport = Proposal::exact(Size { width: 300.0, height: 200.0 });
-        let result = runtime.layout(&holder, viewport);
+        let result = runtime.layout(&holder, viewport).unwrap();
         let (table_path, rows) = copy_targets(&result.hits);
         let (x, y) = rows[1];
-        runtime.pointer_pressed(x, y);
+        runtime.pointer_pressed(x, y).unwrap();
         runtime.pointer_released(x, y);
         assert_eq!(runtime.focused(), Some(table_path));
 
@@ -8958,12 +9087,12 @@ mod tests {
         holder.other.set(1);
         runtime.render(&holder);
         assert!(!runtime.body_runs().iter().any(|run| run == "CopyTable"), "the table was skipped");
-        assert_eq!(runtime.key(EditCommand::Copy).output.as_deref(), Some("beta\t2"));
+        assert_eq!(runtime.key(EditCommand::Copy).unwrap().output.as_deref(), Some("beta\t2"));
 
         // unmounted, the answer is swept with the entry
         holder.mounted.set(false);
         runtime.render_stable(&holder);
-        assert_eq!(runtime.key(EditCommand::Copy).output, None, "an unmounted table does not answer");
+        assert_eq!(runtime.key(EditCommand::Copy).unwrap().output, None, "an unmounted table does not answer");
     }
 
     /// A host mounts a TABLE outside the tree: the shape ninety actions
@@ -9104,14 +9233,13 @@ mod tests {
         let runtime = Runtime::new();
         let bar = Bar { url: State::new("https://{{host}}/v1".to_string()) };
         let result = runtime
-            .settled_layout(&bar, Proposal::exact(Size { width: 400.0, height: 40.0 }));
+            .settled_layout(&bar, Proposal::exact(Size { width: 400.0, height: 40.0 }))
+            .unwrap();
         let inks: Vec<(Color, String)> = result
             .display
             .iter()
             .filter_map(|command| match command {
-                DrawCommand::TextLine { content, range, color, .. } => {
-                    Some((*color, content[range.0..range.1].to_string()))
-                }
+                DrawCommand::TextLine { content, range, color, .. } => Some((*color, content[range.0..range.1].to_string())),
                 _ => None,
             })
             .collect();
@@ -9143,7 +9271,8 @@ mod tests {
         let runtime = Runtime::new();
         let bar = Bar { url: State::new(String::new()) };
         let result = runtime
-            .settled_layout(&bar, Proposal::exact(Size { width: 400.0, height: 40.0 }));
+            .settled_layout(&bar, Proposal::exact(Size { width: 400.0, height: 40.0 }))
+            .unwrap();
         let runs = result
             .display
             .iter()
@@ -9179,7 +9308,7 @@ mod tests {
         let boxes = |bare: bool| {
             let runtime = Runtime::new();
             let cell = Cell { value: State::new("value".to_string()), bare };
-            let result = runtime.settled_layout(&cell, room);
+            let result = runtime.settled_layout(&cell, room).unwrap();
             let fills = result
                 .display
                 .iter()
@@ -9192,9 +9321,7 @@ mod tests {
                 .count();
             let round = result.display.iter().any(|command| match command {
                 DrawCommand::FillRect { corner_radius, .. }
-                | DrawCommand::StrokeRect { corner_radius, .. } => {
-                    *corner_radius != Corners::ZERO
-                }
+                | DrawCommand::StrokeRect { corner_radius, .. } => *corner_radius != Corners::ZERO,
                 _ => false,
             });
             (fills, strokes, round)
@@ -9249,7 +9376,8 @@ mod tests {
         let runtime = Runtime::new();
         let strip = Strip { lane: State::new(0.0) };
         let _ = runtime
-            .settled_layout(&strip, Proposal::exact(Size { width: ROW, height: 40.0 }));
+            .settled_layout(&strip, Proposal::exact(Size { width: ROW, height: 40.0 }))
+            .unwrap();
         assert_eq!(
             strip.lane.get(),
             CONTENT,
@@ -9283,19 +9411,22 @@ mod tests {
             fn body(self) -> impl View {
                 text("the page under it").frame(WINDOW.width, WINDOW.height).sheet(
                     self.open.binding(),
-                    |_| crate::erased::erased(text("the palette").frame(300.0, 200.0)),
-                )
+                    |_| {
+                        crate::erased::erased(text("the palette").frame(300.0, 200.0))
+                    })
             }
         }
 
         let runtime = Runtime::new();
         let page = Page { open: State::new(false) };
 
-        let shut = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let shut = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         assert!(shut.overlays.is_empty(), "nothing is presented while it is closed");
 
         page.open.set(true);
-        let open = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let open = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         assert_eq!(open.overlays.len(), 1, "the sheet is presented on its own");
 
         let sheet = &open.overlays[0];
@@ -9347,7 +9478,8 @@ mod tests {
 
         let runtime = Runtime::new();
         let result =
-            runtime.settled_layout(&Dock, Proposal::exact(Size { width: LANE, height: 60.0 }));
+            runtime.settled_layout(&Dock, Proposal::exact(Size { width: LANE, height: 60.0 }))
+            .unwrap();
         let leftmost = result
             .display
             .iter()
@@ -9403,7 +9535,8 @@ mod tests {
             let runtime = Runtime::new();
             let composer = Composer { label: State::new(0.0), send: State::new(0.0) };
             let result = runtime
-                .settled_layout(&composer, Proposal::exact(Size { width, height: 40.0 }));
+                .settled_layout(&composer, Proposal::exact(Size { width, height: 40.0 }))
+                .unwrap();
             let painted = result
                 .display
                 .iter()
@@ -9427,7 +9560,9 @@ mod tests {
         assert_eq!(tight_send, SEND, "the button is never pushed off the row");
         assert!(tight_label < wide_label, "the label yielded: {tight_label} < {wide_label}");
         assert!(tight_label + SEND <= 260.0 + 0.5, "the row holds them both");
-        assert!(tight_text.ends_with('…'), "and it says it was cut: {tight_text:?}");
+        assert!(tight_text.ends_with('…'),
+            "and it says it was cut: {tight_text:?}"
+        );
     }
 
     /// A text taller than its room paints what FITS, inside the box,
@@ -9461,14 +9596,13 @@ mod tests {
 
         let runtime = Runtime::new();
         let result =
-            runtime.settled_layout(&Card, Proposal::exact(Size { width: 200.0, height: BOX }));
+            runtime.settled_layout(&Card, Proposal::exact(Size { width: 200.0, height: BOX }))
+            .unwrap();
         let painted: Vec<(f64, String)> = result
             .display
             .iter()
             .filter_map(|command| match command {
-                DrawCommand::TextLine { origin, content, range, .. } => {
-                    Some((origin.y, content[range.0..range.1].to_string()))
-                }
+                DrawCommand::TextLine { origin, content, range, .. } => Some((origin.y, content[range.0..range.1].to_string())),
                 _ => None,
             })
             .collect();
@@ -9534,18 +9668,20 @@ mod tests {
         let whole = Runtime::new();
         let shell = Runtime::new();
         shell.drop_unseen();
-        let whole = whole.settled_layout(&Page, Proposal::exact(size));
-        let shell = shell.settled_layout(&Page, Proposal::exact(size));
+        let whole = whole.settled_layout(&Page, Proposal::exact(size)).unwrap();
+        let shell = shell.settled_layout(&Page, Proposal::exact(size)).unwrap();
         let has_last_row = |list: &crate::layout::DisplayList| {
-            list.iter().any(|command| matches!(command,
+            list.iter().any(|command| {
+                matches!(command,
                 crate::layout::DrawCommand::TextLine { content, range, .. }
-                    if &content[range.0..range.1] == "probe row 19"))
+                    if &content[range.0..range.1] == "probe row 19")
+            })
         };
         assert!(has_last_row(&whole.display), "paranoid checks must retain the probe's offscreen words");
         assert!(!has_last_row(&shell.display), "the shell still drops unseen draw commands");
         assert!(whole.display.len() > shell.display.len());
         let paint = |list: &crate::layout::DisplayList| {
-            crate::raster::rasterize_scaled(list, 240, 60, 1, Color::WHITE)
+            crate::raster::rasterize_scaled(list, 240, 60, 1, Color::WHITE).unwrap()
         };
         assert_eq!(paint(&whole.display).pixels(), paint(&shell.display).pixels());
         crate::paranoid::release();
@@ -9615,7 +9751,8 @@ mod tests {
         for offset in [0.0, 7.0, 33.5, 120.25, 611.0, 100_000.0] {
             let mut lists = Vec::new();
             for runtime in [&cut, &whole] {
-                let first = runtime.settled_layout(&Page, Proposal::exact(size));
+                let first = runtime.settled_layout(&Page, Proposal::exact(size))
+                    .unwrap();
                 let region = first
                     .scrolls
                     .iter()
@@ -9624,15 +9761,17 @@ mod tests {
                     .path
                     .clone();
                 runtime.set_scroll_offset(&region, Point { x: 0.0, y: offset });
-                lists.push(runtime.settled_layout(&Page, Proposal::exact(size)).display);
+                lists.push(runtime.settled_layout(&Page, Proposal::exact(size)).unwrap().display);
             }
             assert!(lists[0].len() < lists[1].len(), "offset {offset}: the cut dropped nothing");
             dropped += lists[1].len() - lists[0].len();
             for scale in [1usize, 2] {
                 let (width, height) = (size.width as usize * scale, size.height as usize * scale);
                 let ground = Color::rgba(12, 12, 14, 255);
-                let seen = crate::raster::rasterize_scaled(&lists[0], width, height, scale, ground);
-                let all = crate::raster::rasterize_scaled(&lists[1], width, height, scale, ground);
+                let seen = crate::raster::rasterize_scaled(&lists[0], width, height, scale, ground)
+                    .unwrap();
+                let all = crate::raster::rasterize_scaled(&lists[1], width, height, scale, ground)
+                    .unwrap();
                 assert!(
                     seen.pixels() == all.pixels(),
                     "offset {offset} at {scale}×: the cut changed a pixel ({} commands against {})",
@@ -9697,10 +9836,10 @@ mod tests {
         let runtime = Runtime::new();
         runtime.drop_unseen();
         let size = Proposal::exact(Size { width: 240.0, height: 200.0 });
-        let _ = runtime.settled_layout(&page, size);
+        let _ = runtime.settled_layout(&page, size).unwrap();
         let _ = crate::stats::take();
         let before = page.painted.get();
-        let result = runtime.settled_layout(&page, size);
+        let result = runtime.settled_layout(&page, size).unwrap();
         let stats = crate::stats::take();
         if !crate::paranoid::on(crate::paranoid::SEEN) {
             // (the paranoid check places every scene a second time, whole)
@@ -9712,7 +9851,7 @@ mod tests {
         assert!(far.origin.y > 3000.0, "{far:?}");
         // …so a scroll-to finds it, and the wheel's region brings it
         page.target.set("row-250".to_string());
-        let revealed = runtime.settled_layout(&page, size);
+        let revealed = runtime.settled_layout(&page, size).unwrap();
         let shown = revealed.frames.find("[row-250]").expect("row 250 has a frame");
         assert!(
             shown.origin.y >= 0.0 && shown.origin.y + shown.size.height <= 200.0,
@@ -9754,7 +9893,8 @@ mod tests {
         // as a shell mounts it: the list holds what the glass can show
         runtime.drop_unseen();
         let result =
-            runtime.settled_layout(&Page, Proposal::exact(Size { width: 200.0, height: 36.0 }));
+            runtime.settled_layout(&Page, Proposal::exact(Size { width: 200.0, height: 36.0 }))
+            .unwrap();
         // the paragraph is there to scroll through: the region's extent is
         // every line of it. The LIST holds the lines its window shows and
         // no more — what no pixel can show is not drawn
@@ -9772,10 +9912,13 @@ mod tests {
         // …and the lines further down are drawn when the wheel brings them
         assert!(runtime.wheel(100.0, 18.0, 0.0, -48.0));
         let scrolled =
-            runtime.settled_layout(&Page, Proposal::exact(Size { width: 200.0, height: 36.0 }));
+            runtime.settled_layout(&Page, Proposal::exact(Size { width: 200.0, height: 36.0 }))
+            .unwrap();
         let first = |result: &crate::layout::LayoutResult| {
             result.display.iter().find_map(|command| match command {
-                DrawCommand::TextLine { content, range, .. } => Some(content[range.0..range.1].to_string()),
+                DrawCommand::TextLine { content, range, .. } => {
+                    Some(content[range.0..range.1].to_string())
+                }
                 _ => None,
             })
         };
@@ -9818,7 +9961,8 @@ mod tests {
         let runtime = Runtime::new();
         let strip = Strip { lane: State::new(0.0) };
         let _ = runtime
-            .settled_layout(&strip, Proposal::exact(Size { width: ROW, height: 40.0 }));
+            .settled_layout(&strip, Proposal::exact(Size { width: ROW, height: 40.0 }))
+            .unwrap();
         assert_eq!(
             strip.lane.get(),
             ROW - SPACING,
@@ -9857,7 +10001,8 @@ mod tests {
         let runtime = Runtime::new();
         let strip = Strip { lane: State::new(0.0) };
         let _ = runtime
-            .settled_layout(&strip, Proposal::exact(Size { width: 1000.0, height: 40.0 }));
+            .settled_layout(&strip, Proposal::exact(Size { width: 1000.0, height: 40.0 }))
+            .unwrap();
         assert_eq!(
             strip.lane.get(),
             500.0,
@@ -9893,7 +10038,8 @@ mod tests {
         let runtime = Runtime::new();
         let strip = Strip { left: State::new(0.0), right: State::new(0.0) };
         let _ = runtime
-            .settled_layout(&strip, Proposal::exact(Size { width: 1000.0, height: 40.0 }));
+            .settled_layout(&strip, Proposal::exact(Size { width: 1000.0, height: 40.0 }))
+            .unwrap();
         assert_eq!(
             (strip.left.get(), strip.right.get()),
             (500.0, 500.0),
@@ -9938,18 +10084,18 @@ mod tests {
         };
         let room = Proposal::exact(Size { width: 400.0, height: 400.0 });
 
-        let _ = runtime.settled_layout(&page, room);
+        let _ = runtime.settled_layout(&page, room).unwrap();
         assert_eq!(page.measured.get().height, 60.0, "three lines of twenty");
         assert_eq!(page.reports.get(), 1);
 
         // a view at REST says nothing: a probe that fired every frame
         // would dirty the world forever
-        let _ = runtime.settled_layout(&page, room);
+        let _ = runtime.settled_layout(&page, room).unwrap();
         assert_eq!(page.reports.get(), 1, "a size that did not change is not news");
 
         // and a size that changes reports the new one, once
         page.lines.set(5);
-        let _ = runtime.settled_layout(&page, room);
+        let _ = runtime.settled_layout(&page, room).unwrap();
         assert_eq!(page.measured.get().height, 100.0);
         assert_eq!(page.reports.get(), 2);
     }
@@ -9983,7 +10129,8 @@ mod tests {
         let runtime = Runtime::new();
         let card = Card { natural: State::new(0.0) };
         let result = runtime
-            .settled_layout(&card, Proposal::exact(Size { width: 400.0, height: 400.0 }));
+            .settled_layout(&card, Proposal::exact(Size { width: 400.0, height: 400.0 }))
+            .unwrap();
         assert_eq!(card.natural.get(), 180.0, "nine lines of twenty, unrestricted");
         // the FRAME this pass produced already carries the cap — the
         // 400 the first pass used never reaches a pixel
@@ -10016,7 +10163,8 @@ mod tests {
         let runtime = Runtime::new();
         let page = Page { top: State::new(0.0), bottom: State::new(0.0) };
         let _ = runtime
-            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 400.0 }));
+            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 400.0 }))
+            .unwrap();
         assert_eq!((page.top.get(), page.bottom.get()), (30.0, 70.0));
     }
 
@@ -10041,7 +10189,8 @@ mod tests {
 
         let runtime = Runtime::new();
         let _ = runtime
-            .settled_layout(&Page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+            .settled_layout(&Page, Proposal::exact(Size { width: 400.0, height: 300.0 }))
+            .unwrap();
         let hosts = runtime.hosts();
         assert_eq!(hosts.len(), 1);
         let HostSpec::Webview { url, .. } = &hosts[0].spec else {
@@ -10073,7 +10222,8 @@ mod tests {
 
         let runtime = Runtime::new();
         let _ = runtime
-            .settled_layout(&Page, Proposal::exact(Size { width: 200.0, height: 150.0 }));
+            .settled_layout(&Page, Proposal::exact(Size { width: 200.0, height: 150.0 }))
+            .unwrap();
         let hosts = runtime.hosts();
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].frame.size.height, 400.0, "the box keeps its declared height");
@@ -10121,7 +10271,7 @@ mod tests {
 
         let window = Proposal::exact(Size { width: 300.0, height: 190.0 });
         let runtime = Runtime::new();
-        let result = runtime.settled_layout(&Call, window);
+        let result = runtime.settled_layout(&Call, window).unwrap();
         let hosts = runtime.hosts();
         assert_eq!(hosts.len(), 1);
         let feed = &hosts[0];
@@ -10140,7 +10290,7 @@ mod tests {
 
         // the webview twin in the same scene places identically
         let twin = Runtime::new();
-        let _ = twin.settled_layout(&Page, window);
+        let _ = twin.settled_layout(&Page, window).unwrap();
         let page = &twin.hosts()[0];
         assert_eq!(
             (feed.frame, feed.visible, feed.region.is_some(), feed.mark),
@@ -10180,7 +10330,8 @@ mod tests {
 
         let runtime = Runtime::new();
         let page = Page { open: State::new(false) };
-        let _ = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let _ = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         let path = runtime.hosts()[0].path.clone();
         // the region is 150 tall, centred in the 300 of the window:
         // rows 75 to 225 are the page's window, the box below is cut
@@ -10189,7 +10340,8 @@ mod tests {
         assert_eq!(runtime.host_at(200.0, 250.0), None, "the region's window ends at 225");
 
         page.open.set(true);
-        let _ = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let _ = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         assert_eq!(runtime.host_at(200.0, 100.0), None, "under a sheet the page is out of reach");
     }
 
@@ -10208,16 +10360,17 @@ mod tests {
             fn body(self) -> impl View {
                 zstack!(
                     webview("https://example.test/"),
-                    text("saving…")
-                        .padding_length(8.0)
-                        .background_color(Color { r: 30, g: 30, b: 30, a: 255 })
+                    text("saving…").padding_length(8.0).background_color(Color {
+                        r: 30, g: 30, b: 30, a: 255 })
                 )
             }
         }
 
         let runtime = Runtime::new();
         let result = runtime
-            .settled_layout(&Layered, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+            .settled_layout(&Layered, Proposal::exact(Size { width: 400.0, height: 300.0 }),
+            )
+            .unwrap();
         let segments = runtime.host_segments(result.display.len());
         assert_eq!(segments.len(), 1, "one host, one tail: {segments:?}");
         let (path, (start, end)) = segments[0].clone();
@@ -10234,7 +10387,8 @@ mod tests {
         }
         let runtime = Runtime::new();
         let result = runtime
-            .settled_layout(&Plain, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+            .settled_layout(&Plain, Proposal::exact(Size { width: 400.0, height: 300.0 }))
+            .unwrap();
         assert!(
             runtime.host_segments(result.display.len()).is_empty(),
             "nothing painted after the host — nothing to lift, nothing to pay"
@@ -10270,13 +10424,13 @@ mod tests {
         let runtime = Runtime::new();
         let page = Outer { room: State::new(300.0) };
         let proposal = Proposal::exact(Size { width: 400.0, height: 300.0 });
-        let _ = runtime.settled_layout(&page, proposal);
+        let _ = runtime.settled_layout(&page, proposal).unwrap();
         assert_eq!(runtime.hosts()[0].frame.size.width, 300.0);
 
         // the outer re-runs and hands down a different width; the
         // pane's body is skipped, and the host still places, resized
         page.room.set(180.0);
-        let _ = runtime.settled_layout(&page, proposal);
+        let _ = runtime.settled_layout(&page, proposal).unwrap();
         let runs = runtime.body_runs();
         assert!(
             !runs.iter().any(|path| path.ends_with("Pane")),
@@ -10324,7 +10478,8 @@ mod tests {
             fetched: State::new(String::new()),
         };
         let _ = runtime
-            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }))
+            .unwrap();
         let hosts = runtime.hosts();
         let path = hosts[0].path.clone();
         let HostSpec::Webview { scripts, console, requests, full_motion, .. } = &hosts[0].spec
@@ -10387,7 +10542,9 @@ mod tests {
             pasted: State::new(String::new()),
         };
         let _ = runtime
-            .settled_layout(&composer, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+            .settled_layout(&composer, Proposal::exact(Size { width: 400.0, height: 300.0 }),
+            )
+            .unwrap();
         let hosts = runtime.hosts();
         let path = hosts[0].path.clone();
         let HostSpec::Webview { url, document, .. } = &hosts[0].spec else {
@@ -10450,7 +10607,8 @@ mod tests {
         let runtime = Runtime::new();
         let page = Page { url: State::new(String::new()) };
         let result = runtime
-            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }))
+            .unwrap();
         let field = &result.fields[0];
         assert!(field.frame.size.height > 0.0, "the field has a box");
         let bottom = field.frame.origin.y + field.frame.size.height;
@@ -10482,7 +10640,9 @@ mod tests {
         let runtime = Runtime::new();
         let page = Page { handle: WebviewHandle::new(), title: State::new(String::new()) };
         let _ = runtime
-            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }),
+            )
+            .unwrap();
         let path = runtime.hosts()[0].path.clone();
 
         page.handle.navigate("https://example.test/next");
@@ -10555,7 +10715,8 @@ mod tests {
         let page =
             Page { landed: State::new(String::new()), refused: State::new(String::new()) };
         let _ = runtime
-            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }))
+            .unwrap();
         let path = runtime.hosts()[0].path.clone();
 
         assert!(runtime.webview_navigate_failed(
@@ -10583,7 +10744,8 @@ mod tests {
         let runtime = Runtime::new();
         let watcher = Watcher { refused: State::new(String::new()) };
         let _ = runtime
-            .settled_layout(&watcher, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+            .settled_layout(&watcher, Proposal::exact(Size { width: 400.0, height: 300.0 }))
+            .unwrap();
         let path = runtime.hosts()[0].path.clone();
         assert!(runtime.webview_navigate_failed(&path, "https://gone.test/", "no route"));
         assert_eq!(watcher.refused.get(), "no route");
@@ -10612,7 +10774,9 @@ mod tests {
         let runtime = Runtime::new();
         let page = Page { handle: WebviewHandle::new() };
         let _ = runtime
-            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }),
+            )
+            .unwrap();
         let path = runtime.hosts()[0].path.clone();
 
         page.handle.click(12.0, 40.0);
@@ -10703,13 +10867,13 @@ mod tests {
         let runtime = Runtime::new();
         let page = Outer { room: State::new(300.0), seen: State::new(0.0) };
         let room = Proposal::exact(Size { width: 400.0, height: 400.0 });
-        let _ = runtime.settled_layout(&page, room);
+        let _ = runtime.settled_layout(&page, room).unwrap();
         assert_eq!(page.seen.get(), 300.0);
 
         // the outer re-runs and hands down a different width; the inner
         // body is SKIPPED, and the probe still reports the new size
         page.room.set(180.0);
-        let _ = runtime.settled_layout(&page, room);
+        let _ = runtime.settled_layout(&page, room).unwrap();
         let runs = runtime.body_runs();
         assert!(
             !runs.iter().any(|path| path.ends_with("Inner")),
@@ -10745,24 +10909,28 @@ mod tests {
         let page = Page { at: State::new(Point::default()) };
         let size = Size { width: 200.0, height: 100.0 };
         let path = "Page";
-        let _ = runtime.settled_layout(&page, Proposal::exact(size));
+        let _ = runtime.settled_layout(&page, Proposal::exact(size))
+            .unwrap();
 
         // the wheel is sovereign, and the binding hears where it landed
         assert!(runtime.wheel(100.0, 50.0, 0.0, -60.0));
-        let _ = runtime.settled_layout(&page, Proposal::exact(size));
+        let _ = runtime.settled_layout(&page, Proposal::exact(size))
+            .unwrap();
         assert_eq!(runtime.scroll_offset(path).y, 60.0);
         assert_eq!(page.at.get().y, 60.0, "the app reads a true offset");
 
         // and the app can say WHERE: the middle of the window, which
         // no reveal could express
         page.at.set(Point { x: 0.0, y: 320.0 });
-        let _ = runtime.settled_layout(&page, Proposal::exact(size));
+        let _ = runtime.settled_layout(&page, Proposal::exact(size))
+            .unwrap();
         assert_eq!(runtime.scroll_offset(path).y, 320.0, "the region went there");
 
         // a value past the end comes home already clamped: the app's
         // state and the region never disagree about where it is
         page.at.set(Point { x: 0.0, y: 9000.0 });
-        let _ = runtime.settled_layout(&page, Proposal::exact(size));
+        let _ = runtime.settled_layout(&page, Proposal::exact(size))
+            .unwrap();
         let travel = 40.0 * 20.0 - 100.0;
         assert_eq!(runtime.scroll_offset(path).y, travel);
         assert_eq!(page.at.get().y, travel, "clamped, and the app was told");
@@ -10770,7 +10938,8 @@ mod tests {
         // a frame that changes nothing writes nothing — a region at
         // rest must not dirty the world every pass
         let before = page.at.get();
-        let _ = runtime.settled_layout(&page, Proposal::exact(size));
+        let _ = runtime.settled_layout(&page, Proposal::exact(size))
+            .unwrap();
         assert_eq!(page.at.get(), before);
     }
 
@@ -10794,9 +10963,11 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = Size { width: 200.0, height: 100.0 };
-        let _ = runtime.settled_layout(&Page, Proposal::exact(size));
+        let _ = runtime.settled_layout(&Page, Proposal::exact(size))
+            .unwrap();
         assert!(runtime.wheel(100.0, 50.0, 0.0, -40.0));
-        let _ = runtime.settled_layout(&Page, Proposal::exact(size));
+        let _ = runtime.settled_layout(&Page, Proposal::exact(size))
+            .unwrap();
         assert_eq!(runtime.scroll_offset("Page").y, 40.0);
     }
 
@@ -10883,11 +11054,13 @@ mod tests {
 
         // focus the field and type — the filter shrinks to 1 ("beta")
         let result =
-            runtime.layout(&palette, Proposal::exact(Size { width: 200.0, height: 80.0 }));
+            runtime.layout(&palette, Proposal::exact(Size { width: 200.0, height: 80.0 }))
+            .unwrap();
         let (_, rect) = result.hits.first().unwrap().clone();
-        runtime.pointer_pressed(rect.origin.x + 4.0, rect.origin.y + 4.0);
+        runtime.pointer_pressed(rect.origin.x + 4.0, rect.origin.y + 4.0)
+            .unwrap();
         runtime.pointer_released(rect.origin.x + 4.0, rect.origin.y + 4.0);
-        runtime.key(EditCommand::Insert("bet".into()));
+        runtime.key(EditCommand::Insert("bet".into())).unwrap();
         runtime.render_stable(&palette);
 
         // the re-registered handler captured the NEW count: wrap at 1
@@ -10943,12 +11116,12 @@ mod tests {
                 .unwrap()
         };
 
-        let light = runtime.layout(&Chip, viewport);
+        let light = runtime.layout(&Chip, viewport).unwrap();
         assert_eq!(control_of(&light), Theme::light().control);
         assert_eq!(text_of(&light), Theme::light().accent);
 
         theme::install(Theme::dark());
-        let dark = runtime.layout(&Chip, viewport);
+        let dark = runtime.layout(&Chip, viewport).unwrap();
         assert_eq!(control_of(&dark), Theme::dark().control, "chrome re-read");
         assert_eq!(text_of(&dark), Theme::dark().accent, "body token re-read");
 
@@ -10981,11 +11154,12 @@ mod tests {
         assert!(runtime.render_stable(&counter).contains("Count: 0"));
 
         let result =
-            runtime.layout(&counter, Proposal::exact(Size { width: 200.0, height: 100.0 }));
+            runtime.layout(&counter, Proposal::exact(Size { width: 200.0, height: 100.0 }))
+            .unwrap();
         let (_, rect) = result.hits.last().unwrap().clone();
         let cx = rect.origin.x + rect.size.width / 2.0;
         let cy = rect.origin.y + rect.size.height / 2.0;
-        runtime.pointer_pressed(cx, cy);
+        runtime.pointer_pressed(cx, cy).unwrap();
         runtime.pointer_released(cx, cy);
 
         // `text!` reads for itself: the click moves the label, and NO body
@@ -11016,43 +11190,51 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&form);
         let viewport = Proposal::exact(Size { width: 240.0, height: 40.0 });
-        let result = runtime.layout(&form, viewport);
+        let result = runtime.layout(&form, viewport).unwrap();
         let (path, rect) = result.hits.last().unwrap().clone();
         let _ = path;
-        runtime.pointer_pressed(rect.origin.x + 4.0, rect.origin.y + 4.0);
+        runtime.pointer_pressed(rect.origin.x + 4.0, rect.origin.y + 4.0)
+            .unwrap();
         runtime.pointer_released(rect.origin.x + 4.0, rect.origin.y + 4.0);
 
         // live composition: the text enters MARKED (underlined, in the binding)
-        let mark = EditCommand::SetMarked { text: "にほん".into(), caret_utf16: (3, 0) };
-        assert!(runtime.key(mark).applied);
+        let mark = EditCommand::SetMarked { text: "にほん".into(),
+            caret_utf16: (3, 0),
+        };
+        assert!(runtime.key(mark).unwrap().applied);
         assert!(runtime.render_stable(&form).contains("にほん"));
-        let composing = runtime.layout(&form, viewport);
+        let composing = runtime.layout(&form, viewport).unwrap();
         let underline = |result: &crate::layout::LayoutResult| {
             result
                 .display
                 .iter()
-                .filter(|command| matches!(
+                .filter(|command| {
+                    matches!(
                     command,
                     DrawCommand::FillRect { rect, color, .. }
                         if *color == Color::BLACK && rect.size.height == 1.0
-                ))
+                )
+                })
                 .count()
         };
         assert_eq!(underline(&composing), 1, "the composition paints underlined");
 
         // the snapshot speaks UTF-16 with the platform
-        let snapshot = runtime.ime_snapshot().expect("focused field");
+        let snapshot = runtime.ime_snapshot().unwrap().expect("focused field");
         assert_eq!(snapshot.marked, Some((0, 3)));
         assert_eq!(snapshot.selected, (3, 0), "caret collapsed at the end of the composition");
 
         // the commit swaps the marked text for the final text and the underline goes away
-        assert!(runtime.key(EditCommand::Insert("日本".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("日本".into()))
+                .unwrap()
+                .applied
+        );
         let committed = runtime.render_stable(&form);
         assert!(committed.contains("日本"), "{committed}");
         assert!(!committed.contains("にほん"));
-        let after = runtime.layout(&form, viewport);
+        let after = runtime.layout(&form, viewport).unwrap();
         assert_eq!(underline(&after), 0);
-        assert_eq!(runtime.ime_snapshot().unwrap().marked, None);
+        assert_eq!(runtime.ime_snapshot().unwrap().unwrap().marked, None);
     }
 
     #[test]
@@ -11075,7 +11257,7 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&form);
         let viewport = Proposal::exact(Size { width: 240.0, height: 40.0 });
-        let result = runtime.layout(&form, viewport);
+        let result = runtime.layout(&form, viewport).unwrap();
         let field = result.fields.first().expect("field placed").clone();
 
         // click in the middle of "abcdef" (PixelFont: 8px/char): between c and d
@@ -11083,12 +11265,12 @@ mod tests {
         assert!(!runtime.slow_tick_needed(), "an unfocused field has no clock work");
         let x = field.text_origin.x + 3.0 * 8.0 + 2.0;
         let y = field.frame.origin.y + field.frame.size.height / 2.0;
-        runtime.pointer_pressed(x, y);
+        runtime.pointer_pressed(x, y).unwrap();
         runtime.pointer_released(x, y);
         assert_eq!(runtime.focused(), Some(field.path.clone()));
         assert!(runtime.slow_tick_needed(), "the focused caret arms the clock");
         // typing at the clicked point proves the position without exposing the index
-        runtime.key(EditCommand::Insert("X".into()));
+        runtime.key(EditCommand::Insert("X".into())).unwrap();
         assert!(runtime.render_stable(&form).contains("abcXdef"));
 
         // blink: the tick toggles the caret paint without touching anything else
@@ -11096,26 +11278,28 @@ mod tests {
             result
                 .display
                 .iter()
-                .filter(|command| matches!(
+                .filter(|command| {
+                    matches!(
                     command,
                     DrawCommand::FillRect { rect, color, .. }
                         if *color == Color::BLACK && rect.size.width < 2.0
-                ))
+                )
+                })
                 .count()
         };
-        let visible = runtime.layout(&form, viewport);
+        let visible = runtime.layout(&form, viewport).unwrap();
         assert_eq!(caret_count(&visible), 1);
         assert!(!runtime.blink(), "the first beat after typing keeps the caret solid");
         assert!(runtime.blink(), "a quiet field starts its idle blink");
-        let hidden = runtime.layout(&form, viewport);
+        let hidden = runtime.layout(&form, viewport).unwrap();
         assert_eq!(caret_count(&hidden), 0, "off half-period");
         assert!(runtime.blink());
-        let back = runtime.layout(&form, viewport);
+        let back = runtime.layout(&form, viewport).unwrap();
         assert_eq!(caret_count(&back), 1);
         // typing goes back to solid even in the off half-period
         runtime.blink();
-        runtime.key(EditCommand::Insert("!".into()));
-        let typing = runtime.layout(&form, viewport);
+        runtime.key(EditCommand::Insert("!".into())).unwrap();
+        let typing = runtime.layout(&form, viewport).unwrap();
         assert_eq!(caret_count(&typing), 1, "an active caret does not blink");
         // without focus, the tick requests no repaint
         runtime.blur();
@@ -11152,7 +11336,8 @@ mod tests {
         }
 
         let runtime = Runtime::new().text_engine(Rc::new(Wide));
-        let result = runtime.layout(&text("abcd"), Proposal::unspecified());
+        let result = runtime.layout(&text("abcd"), Proposal::unspecified())
+            .unwrap();
         assert_eq!(result.size, Size { width: 40.0, height: 20.0 });
     }
 
@@ -11176,7 +11361,9 @@ mod tests {
 
         let runtime = Runtime::new();
         runtime.render_stable(&Stacked);
-        let result = runtime.layout(&Stacked, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let result = runtime.layout(&Stacked, Proposal::exact(Size { width: 400.0, height: 300.0 }),
+            )
+            .unwrap();
         let region = |suffix: &str| {
             result
                 .scrolls
@@ -11222,7 +11409,8 @@ mod tests {
         let anchored = Anchored { open: State::new(true) };
         let runtime = Runtime::new();
         runtime.render_stable(&anchored);
-        let result = runtime.layout(&anchored, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let result = runtime.layout(&anchored, Proposal::exact(Size { width: 400.0, height: 300.0 }))
+            .unwrap();
         let find = |suffix: &str| {
             result.scrolls.iter().find(|r| r.path.ends_with(suffix)).expect("region").clone()
         };
@@ -11259,7 +11447,7 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = Size { width: 400.0, height: 300.0 };
-        let layout = || runtime.layout(&Dashboard, Proposal::exact(size));
+        let layout = || runtime.layout(&Dashboard, Proposal::exact(size)).unwrap();
         runtime.render_stable(&Dashboard);
         let result = layout();
         let path = |suffix: &str| {
@@ -11316,7 +11504,8 @@ mod tests {
         layout();
         assert!(runtime.wheel(x, y, 0.0, -200.0));
         layout();
-        runtime.pointer_clicked(x, y, 1, crate::action::Modifiers::NONE);
+        runtime.pointer_clicked(x, y, 1, crate::action::Modifiers::NONE)
+            .unwrap();
         runtime.pointer_released(x, y);
         assert!(runtime.wheel(x, y, 0.0, -10.0));
         assert_eq!(runtime.scroll_offset(&legend).y, 50.0, "a press ends the gesture");
@@ -11348,7 +11537,8 @@ mod tests {
         let stage = Stage { behind: State::new(0), open: State::new(true) };
         let runtime = Runtime::new();
         runtime.render_stable(&stage);
-        let result = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let result = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }))
+            .unwrap();
         let page = result
             .scrolls
             .iter()
@@ -11370,10 +11560,10 @@ mod tests {
 
         // the pointer stops at the same line: a press straight through
         // the card used to reach the page's own action
-        runtime.pointer_pressed(200.0, 150.0);
+        runtime.pointer_pressed(200.0, 150.0).unwrap();
         runtime.pointer_released(200.0, 150.0);
         assert_eq!(stage.behind.get(), 0, "the card is not a window onto what it covers");
-        runtime.pointer_pressed(20.0, 20.0);
+        runtime.pointer_pressed(20.0, 20.0).unwrap();
         runtime.pointer_released(20.0, 20.0);
         assert_eq!(stage.behind.get(), 0, "and neither is the room beside it");
 
@@ -11387,10 +11577,11 @@ mod tests {
         // as long as the sheet does
         stage.open.set(false);
         runtime.render_stable(&stage);
-        let _ = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let _ = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }))
+            .unwrap();
         assert!(runtime.wheel(200.0, 150.0, 0.0, -60.0), "the page takes the wheel back");
         assert!(runtime.scroll_offset(&page).y > 0.0);
-        runtime.pointer_pressed(200.0, 150.0);
+        runtime.pointer_pressed(200.0, 150.0).unwrap();
         runtime.pointer_released(200.0, 150.0);
         assert_eq!(stage.behind.get(), 1, "and its action fires again");
     }
@@ -11430,10 +11621,11 @@ mod tests {
         let stage = Stage { behind: State::new(0), confirmed: State::new(0) };
         let runtime = Runtime::new();
         runtime.render_stable(&stage);
-        let _ = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let _ = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }))
+            .unwrap();
 
         // dead centre is the card: its own action fires
-        runtime.pointer_pressed(200.0, 150.0);
+        runtime.pointer_pressed(200.0, 150.0).unwrap();
         runtime.pointer_released(200.0, 150.0);
         assert_eq!(stage.confirmed.get(), 1, "the sheet's own button works");
         assert_eq!(stage.behind.get(), 0, "and nothing reached the page");
@@ -11470,10 +11662,11 @@ mod tests {
         let stage = Stage { open: State::new(true), behind: State::new(0) };
         let runtime = Runtime::new();
         runtime.render_stable(&stage);
-        let _ = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let _ = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }))
+            .unwrap();
 
         // the far corner: outside the card, inside the window
-        runtime.pointer_pressed(20.0, 20.0);
+        runtime.pointer_pressed(20.0, 20.0).unwrap();
         runtime.pointer_released(20.0, 20.0);
         runtime.render_stable(&stage);
         assert!(stage.open.get(), "the sheet is still up");
@@ -11512,6 +11705,7 @@ mod tests {
         fn label(runtime: &Runtime) -> String {
             runtime
                 .display_frame(&Pane, VIEWPORT)
+                .unwrap()
                 .iter()
                 .find_map(|command| match command {
                     crate::layout::DrawCommand::TextLine { content, .. } => {
@@ -11523,7 +11717,7 @@ mod tests {
         }
 
         fn press(runtime: &Runtime) {
-            runtime.pointer_pressed(100.0, 30.0);
+            runtime.pointer_pressed(100.0, 30.0).unwrap();
             runtime.pointer_released(100.0, 30.0);
         }
 
@@ -11589,7 +11783,8 @@ mod tests {
         let two = Pane { arms: Rc::new(Cell::new(0)) };
 
         let settle = |runtime: &Runtime, pane: &Pane| {
-            let _ = runtime.settled_layout(pane, Proposal::exact(VIEWPORT));
+            let _ = runtime.settled_layout(pane, Proposal::exact(VIEWPORT))
+                .unwrap();
             runtime.pump();
             runtime.poll_tasks();
         };
@@ -11602,7 +11797,7 @@ mod tests {
         // while the second is the one that rendered last. Every one of these
         // makes the first scene current again.
         for _ in 0..20 {
-            first.pointer_pressed(100.0, 30.0);
+            first.pointer_pressed(100.0, 30.0).unwrap();
             first.pointer_released(100.0, 30.0);
             first.pump();
             first.poll_tasks();
@@ -11660,12 +11855,11 @@ mod tests {
         fn runs(runtime: &Runtime, form: &Form) -> Vec<String> {
             runtime
                 .settled_layout(form, Proposal::exact(VIEWPORT))
+                .unwrap()
                 .display
                 .iter()
                 .filter_map(|command| match command {
-                    DrawCommand::TextLine { content, .. } => {
-                        Some(content.as_ref().to_string())
-                    }
+                    DrawCommand::TextLine { content, .. } => Some(content.as_ref().to_string()),
                     _ => None,
                 })
                 .collect()
@@ -11676,10 +11870,10 @@ mod tests {
         let _ = runs(&runtime, &form);
 
         // the press takes the keyboard, and the typing lands
-        runtime.pointer_pressed(60.0, 20.0);
+        runtime.pointer_pressed(60.0, 20.0).unwrap();
         runtime.pointer_released(60.0, 20.0);
         assert!(runtime.focused().is_some(), "the press took the keyboard");
-        assert!(runtime.key(EditCommand::Insert(SECRET.into())).applied);
+        assert!(runtime.key(EditCommand::Insert(SECRET.into())).unwrap().applied);
 
         let painted = runs(&runtime, &form);
         assert!(
@@ -11696,16 +11890,16 @@ mod tests {
         // a click at the very start of the run puts the caret at the
         // front of the STRING — the mask is measured, the answer is
         // carried home
-        runtime.pointer_pressed(10.0, 20.0);
+        runtime.pointer_pressed(10.0, 20.0).unwrap();
         runtime.pointer_released(10.0, 20.0);
-        assert!(runtime.key(EditCommand::Insert("+".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("+".into())).unwrap().applied);
         assert_eq!(form.password.get(), format!("+{SECRET}"), "the caret landed at the front");
 
         // the two commands that would carry it out are refused, and a
         // refused cut deletes nothing
-        assert!(runtime.key(EditCommand::SelectAll).applied);
-        assert_eq!(runtime.key(EditCommand::Copy).output, None, "no copy");
-        assert_eq!(runtime.key(EditCommand::Cut).output, None, "no cut");
+        assert!(runtime.key(EditCommand::SelectAll).unwrap().applied);
+        assert_eq!(runtime.key(EditCommand::Copy).unwrap().output, None, "no copy");
+        assert_eq!(runtime.key(EditCommand::Cut).unwrap().output, None, "no cut");
         assert_eq!(
             form.password.get(),
             format!("+{SECRET}"),
@@ -11748,7 +11942,8 @@ mod tests {
         // before the first layout there is nothing laid out to reach
         assert!(!runtime.focus_named("two"), "no frame, no field");
 
-        let _ = runtime.settled_layout(&form, Proposal::exact(VIEWPORT));
+        let _ = runtime.settled_layout(&form, Proposal::exact(VIEWPORT))
+            .unwrap();
         assert!(runtime.focus_named("two"), "the name resolved");
         let focused = runtime.focused().expect("something holds the keyboard");
         assert!(focused.contains("[two]"), "and it is the one asked for: {focused}");
@@ -11784,7 +11979,8 @@ mod tests {
 
         let form = Form { email: State::new(String::new()), note: State::new(String::new()) };
         let runtime = Runtime::new();
-        let _ = runtime.settled_layout(&form, Proposal::exact(Size { width: 300.0, height: 120.0 }));
+        let _ = runtime.settled_layout(&form, Proposal::exact(Size { width: 300.0, height: 120.0 }))
+            .unwrap();
         assert_eq!(runtime.focus_keyboard_type(), KeyboardType::Text, "no focus, the letters");
         assert!(runtime.focus_named("email"));
         assert_eq!(runtime.focus_keyboard_type(), KeyboardType::Email, "the address keys");
@@ -11832,7 +12028,8 @@ mod tests {
             heard: Rc::clone(&heard),
         };
         let runtime = Runtime::new();
-        let laid = runtime.settled_layout(&form, Proposal::exact(VIEWPORT));
+        let laid = runtime.settled_layout(&form, Proposal::exact(VIEWPORT))
+            .unwrap();
         let two = laid
             .fields
             .iter()
@@ -11842,14 +12039,14 @@ mod tests {
         let (x, y) = (two.origin.x + 8.0, two.origin.y + two.size.height / 2.0);
 
         // a click on the field's own line
-        runtime.pointer_clicked(x, y, 1, false);
+        runtime.pointer_clicked(x, y, 1, false).unwrap();
         runtime.pointer_released(x, y);
         assert!(heard.borrow().is_empty(), "the word never comes inside the press");
         runtime.poll_tasks();
         assert_eq!(*heard.borrow(), vec![("two", true)], "the field the keyboard reached");
 
         // the same field again: the keyboard did not move
-        runtime.pointer_clicked(x, y, 1, false);
+        runtime.pointer_clicked(x, y, 1, false).unwrap();
         runtime.pointer_released(x, y);
         runtime.poll_tasks();
         assert_eq!(heard.borrow().len(), 1, "a field that holds the keyboard hears nothing new");
@@ -11902,7 +12099,8 @@ mod tests {
 
         let runtime = Runtime::new();
         let page = Page { open: State::new(true) };
-        let result = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let result = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
 
         assert_eq!(result.overlays.len(), 1, "the dialog is presented on its own");
         let dialog = &result.overlays[0];
@@ -11951,7 +12149,8 @@ mod tests {
 
         let runtime = Runtime::new();
         let page = Page { open: State::new(true) };
-        let first = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let first = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         let dialog = &first.overlays[0];
         assert_eq!(dialog.frame.size, Size { width: 900.0, height: 600.0 }, "opens at the named size");
         assert_eq!(
@@ -11970,7 +12169,8 @@ mod tests {
             &path,
             Rect { origin: Point { x: 10.0, y: 10.0 }, size: Size { width: 400.0, height: 300.0 } },
         );
-        let shrunk = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let shrunk = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         assert_eq!(
             shrunk.overlays[0].frame.size,
             Size { width: 400.0, height: 300.0 },
@@ -12009,7 +12209,8 @@ mod tests {
 
         let runtime = Runtime::new();
         let page = Page { open: State::new(true) };
-        let first = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let first = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         let path = first.overlays[0].path.clone();
 
         // the reader dragged and grew the window
@@ -12018,7 +12219,8 @@ mod tests {
             size: Size { width: 500.0, height: 400.0 },
         };
         runtime.set_dialog_frame(&path, held);
-        let moved = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let moved = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         assert_eq!(moved.overlays[0].frame, held, "layout follows the window");
 
         // a frame under the minimum floors at it — the origin is
@@ -12027,7 +12229,8 @@ mod tests {
             &path,
             Rect { origin: Point { x: 40.0, y: 50.0 }, size: Size { width: 100.0, height: 80.0 } },
         );
-        let floored = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let floored = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         assert_eq!(
             floored.overlays[0].frame.size,
             Size { width: 300.0, height: 200.0 },
@@ -12064,7 +12267,8 @@ mod tests {
 
         let runtime = Runtime::new();
         let page = Page { open: State::new(true) };
-        let first = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let first = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         let path = first.overlays[0].path.clone();
 
         let held = Rect {
@@ -12074,11 +12278,13 @@ mod tests {
         runtime.set_dialog_frame(&path, held);
 
         page.open.set(false);
-        let shut = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let shut = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         assert!(shut.overlays.is_empty(), "closed is closed");
 
         page.open.set(true);
-        let reopened = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let reopened = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         assert_eq!(reopened.overlays[0].frame, held, "the reopen lands where it left");
     }
 
@@ -12116,7 +12322,8 @@ mod tests {
 
         let runtime = Runtime::new();
         let page = Page { open: State::new(true), menu: State::new(true) };
-        let both = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let both = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         assert_eq!(both.overlays.len(), 2, "the dialog, then its dropdown above it");
 
         assert!(runtime.dismiss_all_overlays(), "something closed");
@@ -12150,13 +12357,15 @@ mod tests {
 
         let runtime = Runtime::new();
         let page = Page { open: State::new(true) };
-        let result = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let result = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         let path = result.overlays[0].path.clone();
 
         assert!(runtime.dismiss_overlay(&path), "the dismissal answered");
         runtime.render_stable(&page);
         assert!(!page.open.get(), "the binding closed");
-        let after = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let after = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         assert!(after.overlays.is_empty(), "and the dialog is gone");
     }
 
@@ -12190,10 +12399,11 @@ mod tests {
         let stage = Stage { open: State::new(true), behind: State::new(0) };
         let runtime = Runtime::new();
         runtime.render_stable(&stage);
-        let _ = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let _ = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }))
+            .unwrap();
 
         // the far corner: outside the dialog, on the inert parent
-        runtime.pointer_pressed(20.0, 20.0);
+        runtime.pointer_pressed(20.0, 20.0).unwrap();
         runtime.pointer_released(20.0, 20.0);
         runtime.render_stable(&stage);
         assert!(stage.open.get(), "the dialog is still up");
@@ -12224,14 +12434,17 @@ mod tests {
                 text("the page").frame(WINDOW.width, WINDOW.height).alert(
                     self.open.binding(),
                     AlertSpec::new("Unsaved Changes", 300.0),
-                    move |_| erased(text("ask").frame(200.0, if tall.get() { 140.0 } else { 90.0 })),
+                    move |_| {
+                        erased(text("ask").frame(200.0, if tall.get() { 140.0 } else { 90.0 }))
+                    },
                 )
             }
         }
 
         let runtime = Runtime::new();
         let page = Page { open: State::new(true), tall: State::new(false) };
-        let first = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let first = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         assert_eq!(first.overlays.len(), 1, "the ask is presented on its own");
         let alert = &first.overlays[0];
         let OverlaySurface::Alert(spec) = &alert.surface else {
@@ -12250,7 +12463,8 @@ mod tests {
             &path,
             Rect { origin: Point { x: 40.0, y: 50.0 }, size: Size { width: 900.0, height: 20.0 } },
         );
-        let moved = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let moved = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         assert_eq!(
             moved.overlays[0].frame,
             Rect { origin: Point { x: 40.0, y: 50.0 }, size: Size { width: 300.0, height: 90.0 } },
@@ -12259,7 +12473,8 @@ mod tests {
 
         // a taller ask grows the window where it stands
         page.tall.set(true);
-        let grown = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let grown = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         assert_eq!(grown.overlays[0].frame.size, Size { width: 300.0, height: 140.0 });
         assert_eq!(grown.overlays[0].frame.origin, Point { x: 40.0, y: 50.0 });
 
@@ -12270,9 +12485,11 @@ mod tests {
 
         // answered, it forgets the spot: the next ask opens centred
         page.open.set(false);
-        assert!(runtime.settled_layout(&page, Proposal::exact(WINDOW)).overlays.is_empty());
+        assert!(runtime.settled_layout(&page, Proposal::exact(WINDOW)).unwrap()
+                .overlays.is_empty());
         page.open.set(true);
-        let again = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let again = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         assert_eq!(
             again.overlays[0].frame.origin,
             Point { x: 250.0, y: 230.0 },
@@ -12341,7 +12558,7 @@ mod tests {
         let page = Page { open: State::new(false), answer: State::new("none"), heard: State::new(0) };
         let lay = || {
             runtime.render_stable(&page);
-            runtime.layout(&page, Proposal::exact(WINDOW))
+            runtime.layout(&page, Proposal::exact(WINDOW)).unwrap()
         };
         let press = |pattern: KeyPattern| match runtime.chord(&pattern) {
             KeyMatch::Action(action) => {
@@ -12362,7 +12579,8 @@ mod tests {
         assert_eq!(runtime.chord(KeyPattern::command(Key::Char('k'))), KeyMatch::Pending);
         ask("none");
         assert_eq!(press(KeyPattern::command(Key::Char('t'))), None, "the chord died under the ask");
-        assert_eq!(press(KeyPattern::command(Key::Char('w'))), None, "⌘W reaches nothing under it");
+        assert_eq!(press(KeyPattern::command(Key::Char('w'))), None, "⌘W reaches nothing under it"
+        );
         assert_eq!(page.heard.get(), 0, "the page heard neither");
 
         // Return presses the default button
@@ -12427,11 +12645,12 @@ mod tests {
         let viewport = Proposal::exact(Size { width: 320.0, height: 240.0 });
         let lay = || {
             runtime.render_stable(&desk);
-            runtime.layout(&desk, viewport)
+            runtime.layout(&desk, viewport).unwrap()
         };
         let result = lay();
         let pane = result.customs.first().expect("the pane is placed").frame;
-        runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0)
+            .unwrap();
         runtime.pointer_released(pane.origin.x + 10.0, pane.origin.y + 10.0);
         let editor = runtime.focused().expect("a press on the pane holds the keys");
 
@@ -12442,7 +12661,7 @@ mod tests {
         assert_eq!(runtime.focused(), Some(alert.clone()), "the alert holds the keyboard");
         assert!(!runtime.focus_takes_text(), "and types nothing");
         assert!(
-            !runtime.key_stroke(KeyPattern::key(Key::Enter)).handled,
+            !runtime.key_stroke(KeyPattern::key(Key::Enter)).unwrap().handled,
             "no box under the ask hears a stroke",
         );
         lay();
@@ -12501,11 +12720,13 @@ mod tests {
 
         let runtime = Runtime::new();
         let page = Page { menu: State::new(true), asking: State::new(false), dismissed: State::new(0) };
-        let open = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let open = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         assert_eq!(open.overlays.len(), 1, "the dropdown floats over the page");
 
         page.asking.set(true);
-        let asked = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let asked = runtime.settled_layout(&page, Proposal::exact(WINDOW))
+            .unwrap();
         assert!(!page.menu.get(), "the ask closed the dropdown");
         assert_eq!(page.dismissed.get(), 1, "through the dropdown's own dismissal");
         assert_eq!(asked.overlays.len(), 1, "and the alert stands alone");
@@ -12537,7 +12758,8 @@ mod tests {
         let stage = Misplaced { open: State::new(true) };
         let runtime = Runtime::new();
         runtime.render_stable(&stage);
-        let result = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let result = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }))
+            .unwrap();
         let list = result
             .scrolls
             .iter()
@@ -12576,7 +12798,9 @@ mod tests {
 
         let runtime = Runtime::new();
         runtime.render_stable(&Nest);
-        let result = runtime.layout(&Nest, Proposal::exact(Size { width: 300.0, height: 300.0 }));
+        let result = runtime.layout(&Nest, Proposal::exact(Size { width: 300.0, height: 300.0 }),
+            )
+            .unwrap();
         let find = |suffix: &str| {
             result.scrolls.iter().find(|r| r.path.ends_with(suffix)).expect("region").clone()
         };
@@ -12647,9 +12871,11 @@ mod tests {
         }
 
         let runtime = Runtime::new().text_engine(Rc::new(ByFamily));
-        let plain = runtime.layout(&text("abcd"), Proposal::unspecified());
+        let plain = runtime.layout(&text("abcd"), Proposal::unspecified())
+            .unwrap();
         assert_eq!(plain.size, Size { width: 40.0, height: 20.0 });
-        let named = runtime.layout(&text("abcd").font_family("Menlo"), Proposal::unspecified());
+        let named = runtime.layout(&text("abcd").font_family("Menlo"), Proposal::unspecified())
+            .unwrap();
         assert_eq!(named.size, Size { width: 80.0, height: 20.0 }, "the face crossed");
 
         // the roster is the ENGINE's word, and an engine with one face
@@ -12663,7 +12889,7 @@ mod tests {
 
         let runtime = Runtime::new();
         let view = vstack((text("big"), text("small").font(Font::Caption))).font(Font::Title);
-        let result = runtime.layout(&view, Proposal::unspecified());
+        let result = runtime.layout(&view, Proposal::unspecified()).unwrap();
 
         let sizes: Vec<f64> = result
             .display
@@ -12688,7 +12914,7 @@ mod tests {
             text("badge").font_size(9.0).bold(),
             text("mark").font_size(26.0),
         ));
-        let result = runtime.layout(&view, Proposal::unspecified());
+        let result = runtime.layout(&view, Proposal::unspecified()).unwrap();
 
         let fonts: Vec<(f64, Weight)> = result
             .display
@@ -12720,7 +12946,7 @@ mod tests {
             empty().frame(40.0, 20.0).background_color(Color::hex(0x112233))
                 .corner_radius(Corners::bottom(6.0)),
         ));
-        let result = runtime.layout(&view, Proposal::unspecified());
+        let result = runtime.layout(&view, Proposal::unspecified()).unwrap();
         let radii: Vec<Corners> = result
             .display
             .iter()
@@ -12744,19 +12970,21 @@ mod tests {
             .background_color(Color::BLACK)
             .corner_radius(sheet)
             .padding_length(4.0);
-        let bitmap = runtime.paint(&band, Size { width: 48.0, height: 28.0 });
+        let bitmap = runtime.paint(&band, Size { width: 48.0, height: 28.0 })
+            .unwrap();
         let ink = |x: usize, y: usize| bitmap.pixel(x, y) != bitmap.pixel(47, 27);
         assert!(!ink(4, 4), "the top left corner is cut away");
         assert!(!ink(43, 4), "so is the top right");
-        assert!(ink(4, 23), "the bottom left is SQUARE — the band continues below");
+        assert!(ink(4, 23), "the bottom left is SQUARE — the band continues below"
+        );
         assert!(ink(43, 23), "and so is the bottom right");
     }
 
     #[test]
     fn the_paint_knows_the_screen_scale_and_can_land_on_a_whole_pixel() {
+        use crate::custom::custom;
         use crate::custom::{CustomElement, Metrics, PaintCtx, Painter};
         use crate::layout::{Point, Proposal, Rect, Size};
-        use crate::custom::custom;
         use std::cell::Cell;
         use std::rc::Rc;
 
@@ -12810,7 +13038,7 @@ mod tests {
         let size = Size { width: 16.0, height: 16.0 };
 
         // no shell said anything: one point is one pixel
-        let plain = runtime.paint(&sheet, size);
+        let plain = runtime.paint(&sheet, size).unwrap();
         assert_eq!(SEEN.with(|seen| seen.get()), 1.0, "the default scale is 1");
         let rows = |bitmap: &crate::raster::Bitmap, height: usize| {
             (0..height).filter(|&y| bitmap.pixel(0, y) != bitmap.pixel(0, 0)).count()
@@ -12820,7 +13048,7 @@ mod tests {
         // a retina screen: the SAME code paints a thinner line, still
         // exactly one physical row — the half point of sharpness the
         // app cannot ask for without the number
-        let retina = runtime.paint_at_scale(&sheet, size, 2);
+        let retina = runtime.paint_at_scale(&sheet, size, 2).unwrap();
         assert_eq!(SEEN.with(|seen| seen.get()), 2.0, "the shell's scale reaches the paint");
         assert_eq!(retina.height(), 32, "the bitmap is physical");
         assert_eq!(rows(&retina, 32), 1, "still one row, now half a point tall");
@@ -12895,7 +13123,7 @@ mod tests {
         runtime.render_stable(&badge);
 
         let size = Size { width: 64.0, height: 16.0 };
-        let bitmap = runtime.paint(&badge, size);
+        let bitmap = runtime.paint(&badge, size).unwrap();
 
         let white = bitmap.pixel(63, 15).unwrap();
         let ink_count = |bitmap: &crate::raster::Bitmap| {
@@ -12909,7 +13137,7 @@ mod tests {
 
         // the state changes → incremental re-render → the bitmap changes with it
         badge.n.set(42);
-        let after = ink_count(&runtime.paint(&badge, size));
+        let after = ink_count(&runtime.paint(&badge, size).unwrap());
         assert!(after > before, "\"n: 42\" has more ink than \"n: 0\"");
     }
 
@@ -12973,14 +13201,14 @@ mod tests {
         let rows = Rows { selected: State::new(0) };
         let runtime = Runtime::new();
         runtime.settle(&rows);
-        let result = runtime.layout(&rows, viewport);
+        let result = runtime.layout(&rows, viewport).unwrap();
         let region = result.scrolls.first().expect("scroll region").path.clone();
         assert_eq!(runtime.scroll_offset(&region).y, 0.0, "row0 already visible: no scroll");
 
         // selection jumps below the fold: the region follows, bottom-aligned
         rows.selected.set(8);
         runtime.settle(&rows);
-        runtime.layout(&rows, viewport);
+        runtime.layout(&rows, viewport).unwrap();
         let offset = runtime.scroll_offset(&region).y;
         assert_eq!(offset, 8.0 * 16.0 + 16.0 - 48.0, "row8 bottom-aligned into view");
 
@@ -12988,7 +13216,7 @@ mod tests {
         runtime.wheel(60.0, 24.0, 0.0, 30.0);
         let wheeled = runtime.scroll_offset(&region).y;
         assert_ne!(wheeled, offset, "the wheel moved the region");
-        runtime.layout(&rows, viewport);
+        runtime.layout(&rows, viewport).unwrap();
         assert_eq!(
             runtime.scroll_offset(&region).y,
             wheeled,
@@ -12998,7 +13226,7 @@ mod tests {
         // target changes again: reveal wins again
         rows.selected.set(0);
         runtime.settle(&rows);
-        runtime.layout(&rows, viewport);
+        runtime.layout(&rows, viewport).unwrap();
         assert_eq!(runtime.scroll_offset(&region).y, 0.0, "row0 top-aligned back into view");
     }
 
@@ -13021,17 +13249,17 @@ mod tests {
         let form = Form { name: State::new(String::new()) };
         let runtime = Runtime::new();
         runtime.settle(&form);
-        runtime.layout(&form, viewport);
+        runtime.layout(&form, viewport).unwrap();
         let path = runtime.focused().expect("first appearance focuses the field");
 
         // typing goes straight in — the field already owns the keyboard
-        assert!(runtime.key(EditCommand::Insert("d".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("d".into())).unwrap().applied);
         assert_eq!(form.name.get(), "d");
 
         // a user blur is final: the next frames never steal focus back
         runtime.blur();
         runtime.settle(&form);
-        runtime.layout(&form, viewport);
+        runtime.layout(&form, viewport).unwrap();
         assert_eq!(runtime.focused(), None, "auto focus fires once per identity");
         let _ = path;
     }
@@ -13067,19 +13295,19 @@ mod tests {
 
         // palette closed: the scoped binding is silent, the global answers
         runtime.settle(&app);
-        runtime.layout(&app, viewport);
+        runtime.layout(&app, viewport).unwrap();
         assert_eq!(runtime.match_key(&escape), Some(GLOBAL), "context down, global wins");
 
         // palette mounts: its binding takes the same key over the global
         app.palette_open.set(true);
         runtime.settle(&app);
-        runtime.layout(&app, viewport);
+        runtime.layout(&app, viewport).unwrap();
         assert_eq!(runtime.match_key(&escape), Some(CLOSE), "mounted context wins the key");
 
         // palette unmounts: the sweep deactivates the context
         app.palette_open.set(false);
         runtime.settle(&app);
-        runtime.layout(&app, viewport);
+        runtime.layout(&app, viewport).unwrap();
         assert_eq!(runtime.match_key(&escape), Some(GLOBAL), "unmounted context goes quiet");
     }
 
@@ -13118,7 +13346,7 @@ mod tests {
         runtime.bind(escape, EDITOR_ESCAPE);
         runtime.bind_in("agent", escape, DENY);
         runtime.settle(&bench);
-        runtime.layout(&bench, viewport);
+        runtime.layout(&bench, viewport).unwrap();
 
         assert_eq!(runtime.match_key(&escape), Some(EDITOR_ESCAPE), "nobody holds the keyboard");
         assert_eq!(runtime.active_contexts(), vec!["dock"], "mounted, and nothing more");
@@ -13164,7 +13392,8 @@ mod tests {
         runtime.bind_in("palette", escape, CLOSE);
         runtime.bind_sequence(&[k, s_key], KEYMAP);
         runtime.settle(&App);
-        runtime.layout(&App, Proposal::exact(Size { width: 200.0, height: 100.0 }));
+        runtime.layout(&App, Proposal::exact(Size { width: 200.0, height: 100.0 }))
+            .unwrap();
         let heard: Rc<RefCell<Vec<KeyReport>>> = Rc::default();
         {
             let heard = Rc::clone(&heard);
@@ -13213,7 +13442,7 @@ mod tests {
         let app = App { editing: State::new(false) };
         let runtime = Runtime::new();
         runtime.settle(&app);
-        runtime.layout(&app, viewport);
+        runtime.layout(&app, viewport).unwrap();
 
         let k = KeyPattern::command(Key::Char('k'));
         let s_key = KeyPattern::command(Key::Char('s'));
@@ -13257,7 +13486,7 @@ mod tests {
 
         // the hand leaving for the pointer drops it too
         assert_eq!(runtime.chord(&k), KeyMatch::Pending);
-        runtime.pointer_pressed(10.0, 10.0);
+        runtime.pointer_pressed(10.0, 10.0).unwrap();
         assert!(runtime.pending_chord().is_empty(), "a press ends the chord");
 
         // and the slow clock ages it out: the SECOND tick drops it, the
@@ -13277,7 +13506,7 @@ mod tests {
         assert_eq!(runtime.chord(&i), KeyMatch::None, "the editor is not up");
         app.editing.set(true);
         runtime.settle(&app);
-        runtime.layout(&app, viewport);
+        runtime.layout(&app, viewport).unwrap();
         assert_eq!(runtime.chord(&k), KeyMatch::Pending);
         assert_eq!(runtime.chord(&i), KeyMatch::Action(QUICK_DOC));
 
@@ -13417,7 +13646,7 @@ mod tests {
         let app = App { card: State::new(true) };
         let runtime = Runtime::new();
         runtime.settle(&app);
-        runtime.layout(&app, viewport);
+        runtime.layout(&app, viewport).unwrap();
 
         // a cascade goes in: one global layer and one scoped
         let save = KeyPattern::command(Key::Char('s'));
@@ -13481,11 +13710,12 @@ mod tests {
         let app = App { dark: State::new(false) };
         let runtime = Runtime::new();
         runtime.settle(&app);
-        let target = runtime.layout(&app, Proposal::exact(size)).hits.first().expect("toggle").1;
+        let target = runtime.layout(&app, Proposal::exact(size)).unwrap().hits.first().expect("toggle").1;
         let (x, y) = (target.origin.x + 4.0, target.origin.y + 4.0);
         let panel = |runtime: &Runtime| {
             runtime
                 .display_frame(&app, size)
+                .unwrap()
                 .iter()
                 .find_map(|command| match command {
                     DrawCommand::FillRect { color, .. } => Some(*color),
@@ -13495,13 +13725,13 @@ mod tests {
         };
 
         let light = panel(&runtime);
-        runtime.pointer_pressed(x, y);
+        runtime.pointer_pressed(x, y).unwrap();
         runtime.pointer_released(x, y);
         let dark = panel(&runtime);
         assert_ne!(dark, light, "ONE click reskins the scene");
         assert_eq!(dark, Theme::dark().panel, "the dark panel token landed");
 
-        runtime.pointer_pressed(x, y);
+        runtime.pointer_pressed(x, y).unwrap();
         runtime.pointer_released(x, y);
         assert_eq!(panel(&runtime), light, "one more click swaps it back");
         theme::install(Theme::light());
@@ -13539,7 +13769,9 @@ mod tests {
         runtime.settle(&Rows);
 
         let mut surface = Surface::new(120, 80, 1, Color::CANVAS);
-        let first = surface.frame(runtime.layout(&Rows, viewport).display, &PixelFont, &RawImages::default());
+        let first = surface.frame(runtime.layout(&Rows, viewport).unwrap().display, &PixelFont, &RawImages::default(),
+            )
+            .unwrap();
         assert_eq!(first, vec![(0, 0, 120, 80)], "first frame damages everything");
 
         // hover the second row: the frame through the REAL pipeline
@@ -13547,14 +13779,17 @@ mod tests {
         // pixels match a full repaint byte for byte
         let target = runtime
             .layout(&Rows, viewport)
+            .unwrap()
             .hits
             .get(1)
             .expect("second row is a pointer target")
             .1;
-        runtime.pointer_moved(target.origin.x + 4.0, target.origin.y + 4.0, false);
-        let result = runtime.layout(&Rows, viewport);
-        let oracle = rasterize_scaled(&result.display, 120, 80, 1, Color::CANVAS);
-        let damage = surface.frame(result.display, &PixelFont, &RawImages::default());
+        runtime.pointer_moved(target.origin.x + 4.0, target.origin.y + 4.0, false)
+            .unwrap();
+        let result = runtime.layout(&Rows, viewport).unwrap();
+        let oracle = rasterize_scaled(&result.display, 120, 80, 1, Color::CANVAS).unwrap();
+        let damage = surface.frame(result.display, &PixelFont, &RawImages::default())
+            .unwrap();
 
         assert_eq!(surface.bitmap().pixels(), oracle.pixels(), "golden: incremental == full");
         assert_eq!(damage.len(), 1, "one row hovered, one rect: {damage:?}");
@@ -13596,7 +13831,8 @@ mod tests {
                 width: 200.0,
                 height: 200.0,
             }),
-        );
+        )
+            .unwrap();
         assert_eq!(result.control_regions.len(), 1, "one button, one region");
         let (control, region) = result.control_regions[0];
         assert_eq!(control, WindowControl::Close);
@@ -13635,7 +13871,8 @@ mod tests {
                 width: 200.0,
                 height: 200.0,
             }),
-        );
+            )
+            .unwrap();
         assert_eq!(result.drag_regions.len(), 1, "one bar, one region");
         let bar = result.drag_regions[0];
         assert_eq!((bar.size.width, bar.size.height), (200.0, 40.0));
@@ -13717,7 +13954,7 @@ mod tests {
         // the anchor sits at (80, 80)–(100, 100); the overlay is 40×30
         let frame = |index: usize| {
             view.side.set(index);
-            let result = runtime.layout(&view, window());
+            let result = runtime.layout(&view, window()).unwrap();
             assert_eq!(result.overlays.len(), 1, "one open popover");
             result.overlays[0].frame
         };
@@ -13736,7 +13973,7 @@ mod tests {
         // anchor at y 160–180: below wants 186..216, past the window —
         // the frame flips above instead
         let (runtime, view) = opened(Side::Bottom, 160.0);
-        let result = runtime.layout(&view, window());
+        let result = runtime.layout(&view, window()).unwrap();
         assert_eq!(result.overlays[0].frame.origin.y, 124.0, "flipped above the anchor");
     }
 
@@ -13762,7 +13999,7 @@ mod tests {
             }
             Wide { open: State::new(true) }
         };
-        let result = runtime.layout(&view, window());
+        let result = runtime.layout(&view, window()).unwrap();
         // centered would start at -5; the clamp holds the left edge
         assert_eq!(result.overlays[0].frame.origin.x, 0.0, "clamped to the container");
     }
@@ -13776,7 +14013,7 @@ mod tests {
             origin: crate::layout::Point { x: -100.0, y: -100.0 },
             size: crate::layout::Size { width: 400.0, height: 400.0 },
         }));
-        let result = runtime.layout(&view, window());
+        let result = runtime.layout(&view, window()).unwrap();
         let frame = result.overlays[0].frame;
         assert_eq!(frame.origin.y, 186.0, "no flip — the screen has room");
         assert!(
@@ -13803,7 +14040,7 @@ mod tests {
         }
         let runtime = Runtime::new();
         let view = Covered { open: State::new(true) };
-        let result = runtime.layout(&view, window());
+        let result = runtime.layout(&view, window()).unwrap();
 
         let overlay = &result.overlays[0];
         // the slice is a SUFFIX of the display list
@@ -13860,7 +14097,7 @@ mod tests {
     fn a_popover_escapes_a_scroll_clip() {
         let runtime = Runtime::new();
         let view = RowAnchored { open: State::new(true) };
-        let result = runtime.layout(&view, window());
+        let result = runtime.layout(&view, window()).unwrap();
         let overlay = &result.overlays[0];
         // the popover paints, and its slice sits AFTER every clip of
         // the walk — the scroll viewport cannot cut it
@@ -13878,10 +14115,10 @@ mod tests {
     #[test]
     fn a_press_outside_closes_and_consumes() {
         let (runtime, view) = opened(Side::Bottom, 80.0);
-        let _ = runtime.layout(&view, window());
+        let _ = runtime.layout(&view, window()).unwrap();
 
         // outside the popover (and over nothing clickable): closes
-        assert!(runtime.pointer_pressed(5.0, 5.0), "the press repaints");
+        assert!(runtime.pointer_pressed(5.0, 5.0).unwrap(), "the press repaints");
         assert!(!view.open.get(), "the popover closed");
         // the press was CONSUMED: nothing armed, so the release fires
         // nothing either
@@ -13889,12 +14126,13 @@ mod tests {
 
         // reopen; a press INSIDE stays open
         view.open.set(true);
-        let result = runtime.layout(&view, window());
+        let result = runtime.layout(&view, window()).unwrap();
         let frame = result.overlays[0].frame;
         runtime.pointer_pressed(
             frame.origin.x + frame.size.width / 2.0,
             frame.origin.y + frame.size.height / 2.0,
-        );
+        )
+            .unwrap();
         assert!(view.open.get(), "a press inside never dismisses");
     }
 
@@ -13917,9 +14155,8 @@ mod tests {
                             erased(
                                 spacer()
                                     .frame(30.0, 20.0)
-                                    .popover(inner.binding(), Side::Trailing, |_| {
-                                        erased(spacer().frame(20.0, 20.0))
-                                    }),
+                                    .popover(inner.binding(), Side::Trailing, |_| erased(spacer().frame(20.0, 20.0)),
+                            ),
                             )
                         },
                     ),
@@ -13929,7 +14166,7 @@ mod tests {
         let runtime = Runtime::new();
         let view =
             Nested { outer: State::new(true), inner: State::new(true) };
-        let result = runtime.layout(&view, window());
+        let result = runtime.layout(&view, window()).unwrap();
         assert_eq!(result.overlays.len(), 2, "both popovers open");
 
         let escape = KeyPattern::key(Key::Escape);
@@ -13939,12 +14176,12 @@ mod tests {
         assert!(!view.inner.get(), "the INNERMOST closes first");
         assert!(view.outer.get(), "the outer stays");
 
-        let _ = runtime.layout(&view, window());
+        let _ = runtime.layout(&view, window()).unwrap();
         assert!(runtime.dispatch_action(runtime.match_key(&escape).expect("still bound")));
         assert!(!view.outer.get(), "the second escape closes the outer");
 
         // with nothing open, escape stops matching (the context died)
-        let _ = runtime.layout(&view, window());
+        let _ = runtime.layout(&view, window()).unwrap();
         assert_eq!(runtime.match_key(&escape), None, "no popover, no binding");
     }
 
@@ -13952,13 +14189,13 @@ mod tests {
     fn a_scrolled_away_anchor_dismisses_its_popover() {
         let runtime = Runtime::new();
         let view = RowAnchored { open: State::new(true) };
-        let result = runtime.layout(&view, window());
+        let result = runtime.layout(&view, window()).unwrap();
         assert!(view.open.get());
 
         // roll the anchor out of the viewport; the follow-up closes it
         let region = result.scrolls.first().expect("a scroll region").path.clone();
         runtime.set_scroll_offset(&region, crate::layout::Point { x: 0.0, y: 300.0 });
-        let result = runtime.layout(&view, window());
+        let result = runtime.layout(&view, window()).unwrap();
         assert!(!view.open.get(), "the orphaned popover closed");
         assert!(result.overlays.is_empty(), "and the relayout dropped it");
     }
@@ -13986,23 +14223,23 @@ mod tests {
         }
         let runtime = Runtime::new();
         let view = Told { open: State::new(true), told: State::new(0) };
-        let _ = runtime.layout(&view, window());
+        let _ = runtime.layout(&view, window()).unwrap();
 
         // door one: the outside press
-        runtime.pointer_pressed(5.0, 5.0);
+        runtime.pointer_pressed(5.0, 5.0).unwrap();
         assert_eq!(view.told.get(), 1);
         assert!(!view.open.get());
 
         // door two: escape
         view.open.set(true);
-        let _ = runtime.layout(&view, window());
+        let _ = runtime.layout(&view, window()).unwrap();
         let escape = KeyPattern::key(Key::Escape);
         assert!(runtime.dispatch_action(runtime.match_key(&escape).expect("bound")));
         assert_eq!(view.told.get(), 2);
 
         // door three: the app switch — every open popover closes
         view.open.set(true);
-        let _ = runtime.layout(&view, window());
+        let _ = runtime.layout(&view, window()).unwrap();
         assert!(runtime.dismiss_all_overlays());
         assert_eq!(view.told.get(), 3);
         assert!(!view.open.get());
@@ -14010,9 +14247,9 @@ mod tests {
         // the app clearing the binding itself does not count — it
         // already knows
         view.open.set(true);
-        let _ = runtime.layout(&view, window());
+        let _ = runtime.layout(&view, window()).unwrap();
         view.open.set(false);
-        let _ = runtime.layout(&view, window());
+        let _ = runtime.layout(&view, window()).unwrap();
         assert_eq!(view.told.get(), 3, "self-service closing is not a dismissal");
     }
 
@@ -14021,7 +14258,7 @@ mod tests {
         let closed = {
             let (runtime, view) = opened(Side::Bottom, 80.0);
             view.open.set(false);
-            runtime.layout(&view, window()).display
+            runtime.layout(&view, window()).unwrap().display
         };
         let bare = {
             #[derive(Clone)]
@@ -14031,7 +14268,7 @@ mod tests {
                     vstack!(spacer().frame(180.0, 80.0), spacer().frame(20.0, 20.0))
                 }
             }
-            Runtime::new().layout(&Bare, window()).display
+            Runtime::new().layout(&Bare, window()).unwrap().display
         };
         assert_eq!(closed.as_slice(), bare.as_slice(), "closed = not there, byte for byte");
     }
@@ -14048,7 +14285,7 @@ mod tests {
             fit,
         };
         let size = |node: &LayoutNode, width: Option<f64>, height: Option<f64>| {
-            layout(node, Proposal { width, height }).size
+            layout(node, Proposal { width, height }).unwrap().size
         };
 
         // rigid: the intrinsic size, 1 pixel = 1 point, proposal ignored
@@ -14122,11 +14359,11 @@ mod tests {
             .aspect_ratio(ContentMode::Fit);
 
         let proposal = Proposal { width: Some(60.0), height: None };
-        let before = runtime.layout(&root, proposal);
+        let before = runtime.layout(&root, proposal).unwrap();
         assert_eq!(before.size, Size::default(), "undecoded measures zero");
 
         engine.ready.set(true);
-        let after = runtime.layout(&root, proposal);
+        let after = runtime.layout(&root, proposal).unwrap();
         assert_eq!(
             after.size,
             Size { width: 60.0, height: 20.0 },
@@ -14153,7 +14390,8 @@ mod tests {
                 fit: Some(ContentMode::Fill),
             }),
         };
-        let result = layout(&node, Proposal { width: Some(60.0), height: Some(40.0) });
+        let result = layout(&node, Proposal { width: Some(60.0), height: Some(40.0) })
+        .unwrap();
         let rect = result
             .display
             .iter()
@@ -14166,7 +14404,7 @@ mod tests {
         assert!(rect.origin.x < 0.0, "spills left of the frame: {rect:?}");
 
         let bitmap =
-            crate::raster::rasterize_scaled(&result.display, 60, 40, 1, Color::WHITE);
+            crate::raster::rasterize_scaled(&result.display, 60, 40, 1, Color::WHITE).unwrap();
         assert_eq!(bitmap.pixel(10, 20), Some(0xFF00_00FF), "inside the frame: red");
         assert_eq!(bitmap.pixel(30, 20), Some(0xFFFF_FFFF), "outside the frame: canvas");
     }
@@ -14192,14 +14430,16 @@ mod tests {
         let overlay_count = |runtime: &Runtime| {
             runtime
                 .layout(&Rail, crate::layout::Proposal::exact(size))
+                .unwrap()
                 .overlays
                 .iter()
                 .filter(|overlay| overlay.path == TOOLTIP_PATH)
                 .count()
         };
         // prime the retained geometry, then hover the labelled view
-        let _ = runtime.layout(&Rail, crate::layout::Proposal::exact(size));
-        runtime.pointer_moved(10.0, 8.0, false);
+        let _ = runtime.layout(&Rail, crate::layout::Proposal::exact(size))
+            .unwrap();
+        runtime.pointer_moved(10.0, 8.0, false).unwrap();
         assert!(runtime.slow_tick_needed(), "the tooltip wait arms the clock");
         assert_eq!(overlay_count(&runtime), 0, "no bubble before the wait");
         // the first beat only ages the wait
@@ -14210,7 +14450,8 @@ mod tests {
         assert!(runtime.tooltip_tick(), "the second beat shows the bubble");
         runtime.collect_garbage();
         assert!(!runtime.slow_tick_needed(), "a shown tooltip no longer waits on the clock");
-        let result = runtime.layout(&Rail, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&Rail, crate::layout::Proposal::exact(size))
+            .unwrap();
         let bubble = result
             .overlays
             .iter()
@@ -14225,16 +14466,14 @@ mod tests {
             .skip(bubble.display.0)
             .take(bubble.display.1 - bubble.display.0)
             .filter_map(|command| match command {
-                crate::layout::DrawCommand::TextLine { content, .. } => {
-                    Some(content.to_string())
-                }
+                crate::layout::DrawCommand::TextLine { content, .. } => Some(content.to_string()),
                 _ => None,
             })
             .collect();
         assert_eq!(says, vec!["Settings".to_string()]);
 
         // moving OFF the anchor takes the bubble with it
-        assert!(runtime.pointer_moved(10.0, 60.0, false), "leaving repaints");
+        assert!(runtime.pointer_moved(10.0, 60.0, false).unwrap(), "leaving repaints");
         assert_eq!(overlay_count(&runtime), 0, "the bubble left with the pointer");
     }
 
@@ -14258,22 +14497,24 @@ mod tests {
         let runtime = Runtime::new();
         let view = Two { count: State::new(0) };
         let size = Size { width: 200.0, height: 120.0 };
-        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         // show the bubble over the first line
-        runtime.pointer_moved(10.0, 8.0, false);
+        runtime.pointer_moved(10.0, 8.0, false).unwrap();
         runtime.tooltip_tick();
         assert!(runtime.tooltip_tick(), "the bubble is up");
         // pressing the OTHER line must still arm and fire — a popover
         // would have eaten this press; the tooltip must not
         let button = runtime
             .layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap()
             .hits
             .last()
             .map(|(_, rect)| {
                 (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0)
             })
             .expect("the button is a target");
-        runtime.pointer_pressed(button.0, button.1);
+        runtime.pointer_pressed(button.0, button.1).unwrap();
         runtime.pointer_released(button.0, button.1);
         assert_eq!(view.count.get(), 1, "the press reached the button");
     }
@@ -14289,13 +14530,14 @@ mod tests {
         }
         let runtime = Runtime::new();
         let size = Size { width: 100.0, height: 40.0 };
-        let _ = runtime.layout(&One, crate::layout::Proposal::exact(size));
-        runtime.pointer_moved(10.0, 8.0, false);
-        runtime.pointer_pressed(10.0, 8.0);
+        let _ = runtime.layout(&One, crate::layout::Proposal::exact(size))
+            .unwrap();
+        runtime.pointer_moved(10.0, 8.0, false).unwrap();
+        runtime.pointer_pressed(10.0, 8.0).unwrap();
         assert!(!runtime.tooltip_tick(), "a press ends the wait");
         assert!(!runtime.tooltip_tick());
         runtime.pointer_released(10.0, 8.0);
-        runtime.pointer_moved(10.0, 8.0, false);
+        runtime.pointer_moved(10.0, 8.0, false).unwrap();
         runtime.wheel(10.0, 8.0, 0.0, 3.0);
         assert!(!runtime.tooltip_tick(), "a wheel ends the wait");
         assert!(!runtime.tooltip_tick());
@@ -14315,7 +14557,8 @@ mod tests {
             }
         }
         let runtime = Runtime::new();
-        let patches = runtime.dom_frame(&Chevron, Size { width: 100.0, height: 40.0 });
+        let patches = runtime.dom_frame(&Chevron, Size { width: 100.0, height: 40.0 })
+            .unwrap();
         let landed = patches.iter().any(|patch| {
             matches!(patch, crate::dom::DomPatch::SetMarks { tooltip: Some(_), .. })
         });
@@ -14338,7 +14581,7 @@ mod tests {
         }
         let runtime = Runtime::new();
         let size = Size { width: 300.0, height: 40.0 };
-        let patches = runtime.dom_frame(&Chip, size);
+        let patches = runtime.dom_frame(&Chip, size).unwrap();
         let faded = patches
             .iter()
             .find_map(|patch| match patch {
@@ -14364,12 +14607,15 @@ mod tests {
         // browser flips the rules on its own
         let hit = runtime
             .layout(&Chip, crate::layout::Proposal::exact(size))
+            .unwrap()
             .hits
             .first()
             .expect("the chip is a target")
             .1;
-        assert!(runtime.pointer_moved(hit.origin.x + 2.0, hit.origin.y + 2.0, false));
-        assert_eq!(runtime.dom_frame(&Chip, size), vec![], "a group hover is zero patches");
+        assert!(runtime.pointer_moved(hit.origin.x + 2.0, hit.origin.y + 2.0, false)
+                .unwrap()
+        );
+        assert_eq!(runtime.dom_frame(&Chip, size).unwrap(), vec![], "a group hover is zero patches");
     }
 
     #[test]
@@ -14383,7 +14629,7 @@ mod tests {
         }
         let runtime = Runtime::new();
         let size = Size { width: 100.0, height: 40.0 };
-        let patches = runtime.dom_frame(&Labelled, size);
+        let patches = runtime.dom_frame(&Labelled, size).unwrap();
         let tooltip = patches
             .iter()
             .find_map(|patch| match patch {
@@ -14468,7 +14714,8 @@ mod tests {
             let pane = Pane { heard: Rc::clone(&heard), answers };
             let runtime = Runtime::new();
             runtime.render_stable(&pane);
-            let result = runtime.layout(&pane, crate::layout::Proposal::exact(size));
+            let result = runtime.layout(&pane, crate::layout::Proposal::exact(size))
+                .unwrap();
             let frame = result.customs.first().expect("the box is placed").frame;
             let (x, y) = (frame.origin.x + 20.0, frame.origin.y + 20.0);
 
@@ -14529,7 +14776,8 @@ mod tests {
         let root = Root { heard: Rc::clone(&heard) };
         let runtime = Runtime::new();
         runtime.render_stable(&root);
-        runtime.layout(&root, crate::layout::Proposal::exact(Size { width: 300.0, height: 200.0 }));
+        runtime.layout(&root, crate::layout::Proposal::exact(Size { width: 300.0, height: 200.0 }))
+            .unwrap();
 
         runtime.wheel_with(20.0, 20.0, 0.0, -12.0, Modifiers::SHIFT, WheelPhase::Began);
         runtime.wheel_with(20.0, 20.0, 0.0, -4.0, Modifiers::SHIFT, WheelPhase::Ended);
@@ -14572,14 +14820,16 @@ mod tests {
         let runtime = Runtime::new();
         let view = Row { opened: State::new(0) };
         let size = Size { width: 300.0, height: 200.0 };
-        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
 
         // a right press outside every region changes nothing
         assert!(!runtime.context_click(200.0, 150.0));
 
         // inside: the menu opens at the pointer
         assert!(runtime.context_click(30.0, 8.0));
-        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         let menu = result
             .overlays
             .iter()
@@ -14592,9 +14842,7 @@ mod tests {
             .iter()
             .skip(menu.display.0)
             .filter_map(|command| match command {
-                crate::layout::DrawCommand::TextLine { content, .. } => {
-                    Some(content.to_string())
-                }
+                crate::layout::DrawCommand::TextLine { content, .. } => Some(content.to_string()),
                 _ => None,
             })
             .collect();
@@ -14602,34 +14850,39 @@ mod tests {
 
         // hovering the first row highlights it and quiets the scene
         let row_y = menu.frame.origin.y + 5.0 + 12.0;
-        runtime.pointer_moved(menu.frame.origin.x + 20.0, row_y, false);
+        runtime.pointer_moved(menu.frame.origin.x + 20.0, row_y, false)
+            .unwrap();
         let stamped = runtime.interaction();
         assert_eq!(stamped.menu.as_ref().and_then(|open| open.hovered), Some(0));
         assert_eq!(stamped.hovered, None, "the scene under the menu goes quiet");
 
         // the pick fires ON THE DOWN and the menu closes
-        assert!(runtime.pointer_pressed(menu.frame.origin.x + 20.0, row_y));
+        assert!(runtime.pointer_pressed(menu.frame.origin.x + 20.0, row_y)
+                .unwrap());
         assert_eq!(view.opened.get(), 1, "the action ran");
         assert!(runtime.interaction().menu.is_none(), "the menu closed");
 
         // reopen, then a press OUTSIDE closes, consumes, and fires
         // nothing — AppKit manners
         runtime.context_click(30.0, 8.0);
-        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
-        assert!(runtime.pointer_pressed(250.0, 180.0));
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
+        assert!(runtime.pointer_pressed(250.0, 180.0).unwrap());
         assert_eq!(view.opened.get(), 1, "nothing underneath activated");
         assert!(runtime.interaction().menu.is_none());
 
         // reopen, Escape closes through the stroke gate
         runtime.context_click(30.0, 8.0);
         let handled = runtime
-            .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape));
+            .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape))
+            .unwrap();
         assert!(handled.handled, "Escape closed the menu");
         assert!(runtime.interaction().menu.is_none());
 
         // reopen, a wheel closes (content would slide under it)
         runtime.context_click(30.0, 8.0);
-        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         runtime.wheel(150.0, 100.0, 0.0, 5.0);
         assert!(runtime.interaction().menu.is_none());
     }
@@ -14663,7 +14916,8 @@ mod tests {
         let runtime = Runtime::new();
         let view = Row { at: State::new(None) };
         let size = Size { width: 300.0, height: 200.0 };
-        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
 
         // Outside every region: nothing, as before.
         assert!(!runtime.context_click(200.0, 150.0));
@@ -14673,7 +14927,8 @@ mod tests {
         assert!(runtime.context_click(30.0, 8.0));
         assert_eq!(view.at.get(), Some((30.0, 8.0)));
         // …and no menu of the runtime's own opened over it.
-        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         assert!(
             !result
                 .overlays
@@ -14711,7 +14966,8 @@ mod tests {
         let runtime = Runtime::new();
         let view = Nest { heard: State::new(0), picked: State::new(0) };
         let size = Size { width: 300.0, height: 200.0 };
-        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
 
         // Over the inner row: the app's door.
         assert!(runtime.context_click(30.0, 8.0));
@@ -14745,9 +15001,11 @@ mod tests {
         let runtime = Runtime::new();
         let view = One { fired: State::new(0) };
         let size = Size { width: 300.0, height: 200.0 };
-        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         runtime.context_click(20.0, 8.0);
-        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         let menu = result
             .overlays
             .iter()
@@ -14755,7 +15013,9 @@ mod tests {
             .expect("open");
         // the divider band: past the first row, inside the gap
         let divider_y = menu.frame.origin.y + 5.0 + 24.0 + 4.0;
-        assert!(runtime.pointer_pressed(menu.frame.origin.x + 20.0, divider_y));
+        assert!(runtime.pointer_pressed(menu.frame.origin.x + 20.0, divider_y)
+                .unwrap()
+        );
         assert_eq!(view.fired.get(), 0, "a divider fires nothing");
         assert!(runtime.interaction().menu.is_none(), "but the press still closes");
     }
@@ -14804,14 +15064,16 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = Size { width: 300.0, height: 200.0 };
-        let result = runtime.layout(&Card, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&Card, crate::layout::Proposal::exact(size))
+            .unwrap();
         let chip = result
             .tooltips
             .iter()
             .find(|region| region.rect.size.width == 60.0)
             .expect("the chip explains itself")
             .rect;
-        runtime.pointer_moved(chip.origin.x + 4.0, chip.origin.y + 4.0, false);
+        runtime.pointer_moved(chip.origin.x + 4.0, chip.origin.y + 4.0, false)
+            .unwrap();
         for _ in 0..40 {
             runtime.tooltip_tick();
         }
@@ -14840,15 +15102,18 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = Size { width: 300.0, height: 200.0 };
-        let result = runtime.layout(&Card, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&Card, crate::layout::Proposal::exact(size))
+            .unwrap();
         let chip = result
             .drag_sources
             .iter()
             .find(|region| region.rect.size.width == 60.0)
             .expect("the chip lifts")
             .rect;
-        runtime.pointer_pressed(chip.origin.x + 4.0, chip.origin.y + 4.0);
-        runtime.pointer_moved(chip.origin.x + 4.0, chip.origin.y + 40.0, false);
+        runtime.pointer_pressed(chip.origin.x + 4.0, chip.origin.y + 4.0)
+            .unwrap();
+        runtime.pointer_moved(chip.origin.x + 4.0, chip.origin.y + 40.0, false)
+            .unwrap();
         let label = runtime.interaction().drag.map(|live| live.label.to_string());
         assert_eq!(label.as_deref(), Some("chip"));
     }
@@ -14915,26 +15180,30 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&board);
         let size = Size { width: 300.0, height: 200.0 };
-        let result = runtime.layout(&board, Proposal::exact(size));
+        let result = runtime.layout(&board, Proposal::exact(size)).unwrap();
 
         // both regions cover the same 200x80 box: only the nesting can
         // decide, which is the whole of pain 36
         let same: Vec<_> = result
             .drops
             .iter()
-            .filter(|region| region.frame.size == (Size { width: 200.0, height: 80.0 }))
+            .filter(|region| {
+                region.frame.size == (Size { width: 200.0, height: 80.0 })
+            })
             .collect();
         assert_eq!(same.len(), 2, "the catcher and the pane share a box: {same:?}");
         let target = same[0].frame;
 
         let chip = result.drag_sources.first().expect("the tab lifts").rect;
-        runtime.pointer_pressed(chip.origin.x + 2.0, chip.origin.y + 2.0);
-        runtime.pointer_moved(chip.origin.x + 2.0, chip.origin.y + 30.0, false);
+        runtime.pointer_pressed(chip.origin.x + 2.0, chip.origin.y + 2.0)
+            .unwrap();
+        runtime.pointer_moved(chip.origin.x + 2.0, chip.origin.y + 30.0, false)
+            .unwrap();
         let (x, y) = (
             target.origin.x + target.size.width / 2.0,
             target.origin.y + target.size.height / 2.0,
         );
-        runtime.pointer_moved(x, y, false);
+        runtime.pointer_moved(x, y, false).unwrap();
         runtime.pointer_released(x, y);
 
         assert_eq!(board.on_catcher.get(), 7, "the catcher is inside, so it catches");
@@ -14960,7 +15229,8 @@ mod tests {
         let view =
             NestedBoard { on_chip: State::new(usize::MAX), on_pane: State::new(usize::MAX) };
         let size = Size { width: 300.0, height: 200.0 };
-        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         (runtime, view, size)
     }
 
@@ -14969,7 +15239,8 @@ mod tests {
         // the invariant itself, with no pointer in sight: an ancestor is
         // recorded BEFORE the subtree it holds
         let (runtime, view, size) = nested_board();
-        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         assert_eq!(result.drops.len(), 2);
         let (pane, chip) = (result.drops[0].frame, result.drops[1].frame);
         assert_eq!(pane.size, Size { width: 200.0, height: 80.0 }, "the outer comes first");
@@ -14986,14 +15257,17 @@ mod tests {
     #[test]
     fn the_innermost_drop_target_takes_the_drop() {
         let (runtime, view, size) = nested_board();
-        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         let source = result.drag_sources.first().expect("the chip lifts").rect;
         let (chip, _) = chip_and_pane(&result);
 
-        runtime.pointer_pressed(source.origin.x + 4.0, source.origin.y + 4.0);
-        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0, false);
+        runtime.pointer_pressed(source.origin.x + 4.0, source.origin.y + 4.0)
+            .unwrap();
+        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0, false)
+            .unwrap();
         let (x, y) = (chip.origin.x + 4.0, chip.origin.y + 4.0);
-        runtime.pointer_moved(x, y, false);
+        runtime.pointer_moved(x, y, false).unwrap();
         runtime.pointer_released(x, y);
 
         assert_eq!(view.on_chip.get(), 7, "the chip took its own drop");
@@ -15004,14 +15278,17 @@ mod tests {
     fn a_drop_outside_the_inner_target_still_reaches_the_ancestor() {
         // the ancestor keeps the ground its children do not cover
         let (runtime, view, size) = nested_board();
-        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         let source = result.drag_sources.first().expect("the chip lifts").rect;
         let (_, pane) = chip_and_pane(&result);
 
-        runtime.pointer_pressed(source.origin.x + 4.0, source.origin.y + 4.0);
-        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0, false);
+        runtime.pointer_pressed(source.origin.x + 4.0, source.origin.y + 4.0)
+            .unwrap();
+        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0, false)
+            .unwrap();
         let (x, y) = (pane.origin.x + 4.0, pane.origin.y + pane.size.height - 4.0);
-        runtime.pointer_moved(x, y, false);
+        runtime.pointer_moved(x, y, false).unwrap();
         runtime.pointer_released(x, y);
 
         assert_eq!(view.on_pane.get(), 7);
@@ -15046,7 +15323,8 @@ mod tests {
         let runtime = Runtime::new();
         let view = Mixed { landed: State::new(usize::MAX) };
         let size = Size { width: 300.0, height: 200.0 };
-        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         let source = result.drag_sources.first().expect("it lifts").rect;
         let chip = result
             .drops
@@ -15055,10 +15333,12 @@ mod tests {
             .expect("the wrong-typed chip is still a region")
             .frame;
 
-        runtime.pointer_pressed(source.origin.x + 4.0, source.origin.y + 4.0);
-        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0, false);
+        runtime.pointer_pressed(source.origin.x + 4.0, source.origin.y + 4.0)
+            .unwrap();
+        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0, false)
+            .unwrap();
         let (x, y) = (chip.origin.x + 4.0, chip.origin.y + 4.0);
-        runtime.pointer_moved(x, y, false);
+        runtime.pointer_moved(x, y, false).unwrap();
         runtime.pointer_released(x, y);
 
         assert_eq!(view.landed.get(), 3, "the pane caught what the chip cannot take");
@@ -15067,14 +15347,19 @@ mod tests {
     #[test]
     fn the_ring_follows_the_innermost_target_and_paints_over_the_child() {
         let (runtime, view, size) = nested_board();
-        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         let source = result.drag_sources.first().expect("the chip lifts").rect;
         let (chip, _) = chip_and_pane(&result);
 
-        runtime.pointer_pressed(source.origin.x + 4.0, source.origin.y + 4.0);
-        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0, false);
-        runtime.pointer_moved(chip.origin.x + 4.0, chip.origin.y + 4.0, false);
-        let over = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        runtime.pointer_pressed(source.origin.x + 4.0, source.origin.y + 4.0)
+            .unwrap();
+        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0, false)
+            .unwrap();
+        runtime.pointer_moved(chip.origin.x + 4.0, chip.origin.y + 4.0, false)
+            .unwrap();
+        let over = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
 
         let accent = crate::theme::current().accent;
         let rings: Vec<(usize, crate::layout::Rect)> = over
@@ -15083,10 +15368,7 @@ mod tests {
             .enumerate()
             .filter_map(|(index, command)| match command {
                 crate::layout::DrawCommand::StrokeRect { rect, color, width, .. }
-                    if *color == accent && *width == 2.0 =>
-                {
-                    Some((index, *rect))
-                }
+                    if *color == accent && *width == 2.0 => Some((index, *rect)),
                 _ => None,
             })
             .collect();
@@ -15113,14 +15395,15 @@ mod tests {
             wrong: State::new(0),
         };
         let size = Size { width: 300.0, height: 200.0 };
-        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         (runtime, view, size)
     }
 
     #[test]
     fn a_click_that_never_moves_stays_a_click() {
         let (runtime, view, _) = drag_board();
-        runtime.pointer_pressed(20.0, 8.0);
+        runtime.pointer_pressed(20.0, 8.0).unwrap();
         runtime.pointer_released(20.0, 8.0);
         assert_eq!(view.clicked.get(), 1, "the press never lifted");
         assert!(runtime.interaction().drag.is_none());
@@ -15131,12 +15414,13 @@ mod tests {
         use crate::layout::DRAG_LABEL_PATH;
         let (runtime, view, size) = drag_board();
         // press on the tab, move past the threshold: the drag lifts
-        runtime.pointer_pressed(20.0, 8.0);
-        assert!(runtime.pointer_moved(30.0, 20.0, false), "the lift repaints");
+        runtime.pointer_pressed(20.0, 8.0).unwrap();
+        assert!(runtime.pointer_moved(30.0, 20.0, false).unwrap(), "the lift repaints");
         let live = runtime.interaction().drag.expect("a drag is live");
         assert_eq!(&*live.label, "tab 2");
         // the chip follows the cursor as an overlay
-        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         let chip = result
             .overlays
             .iter()
@@ -15147,9 +15431,7 @@ mod tests {
             .iter()
             .skip(chip.display.0)
             .filter_map(|command| match command {
-                crate::layout::DrawCommand::TextLine { content, .. } => {
-                    Some(content.to_string())
-                }
+                crate::layout::DrawCommand::TextLine { content, .. } => Some(content.to_string()),
                 _ => None,
             })
             .collect();
@@ -15163,9 +15445,10 @@ mod tests {
             .rect;
         let (cx, cy) =
             (target.origin.x + target.size.width / 2.0, target.origin.y + target.size.height / 2.0);
-        assert!(runtime.pointer_moved(cx, cy, false));
+        assert!(runtime.pointer_moved(cx, cy, false).unwrap());
         assert_eq!(runtime.interaction().drag.unwrap().over, Some(target));
-        let ringed = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let ringed = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         let accent = crate::theme::current().accent;
         assert!(
             ringed.display.iter().any(|command| matches!(
@@ -15186,9 +15469,10 @@ mod tests {
     #[test]
     fn a_wrong_type_never_lights_nor_lands() {
         let (runtime, view, size) = drag_board();
-        runtime.pointer_pressed(20.0, 8.0);
-        runtime.pointer_moved(30.0, 20.0, false);
-        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        runtime.pointer_pressed(20.0, 8.0).unwrap();
+        runtime.pointer_moved(30.0, 20.0, false).unwrap();
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         let trash = result
             .drops
             .iter()
@@ -15197,7 +15481,7 @@ mod tests {
             .rect;
         let (cx, cy) =
             (trash.origin.x + trash.size.width / 2.0, trash.origin.y + trash.size.height / 2.0);
-        runtime.pointer_moved(cx, cy, false);
+        runtime.pointer_moved(cx, cy, false).unwrap();
         assert_eq!(runtime.interaction().drag.unwrap().over, None, "the types do not meet");
         runtime.pointer_released(cx, cy);
         assert_eq!(view.wrong.get(), 0, "nothing landed");
@@ -15207,11 +15491,12 @@ mod tests {
     #[test]
     fn escape_sends_the_drag_home() {
         let (runtime, view, _) = drag_board();
-        runtime.pointer_pressed(20.0, 8.0);
-        runtime.pointer_moved(60.0, 40.0, false);
+        runtime.pointer_pressed(20.0, 8.0).unwrap();
+        runtime.pointer_moved(60.0, 40.0, false).unwrap();
         assert!(runtime.interaction().drag.is_some());
         let handled = runtime
-            .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape));
+            .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape))
+            .unwrap();
         assert!(handled.handled);
         assert!(runtime.interaction().drag.is_none());
         runtime.pointer_released(60.0, 40.0);
@@ -15271,24 +15556,26 @@ mod tests {
             focused: State::new(0),
             downs: Rc::new(Cell::new(0)),
         };
-        let _ = runtime.layout(&pane, crate::layout::Proposal::exact(size));
+        let _ = runtime.layout(&pane, crate::layout::Proposal::exact(size))
+            .unwrap();
         // the old manners: the box swallows, the pane never hears
-        runtime.pointer_pressed(60.0, 40.0);
+        runtime.pointer_pressed(60.0, 40.0).unwrap();
         runtime.pointer_released(60.0, 40.0);
         assert_eq!(pane.downs.get(), 1, "the box heard the press");
         assert_eq!(pane.focused.get(), 0, "a handled press stops, as ever");
 
         // the new answer: handled AND rising — one click does both
         pane.rises.set(true);
-        let _ = runtime.layout(&pane, crate::layout::Proposal::exact(size));
-        runtime.pointer_pressed(60.0, 40.0);
+        let _ = runtime.layout(&pane, crate::layout::Proposal::exact(size))
+            .unwrap();
+        runtime.pointer_pressed(60.0, 40.0).unwrap();
         let fired = runtime.pointer_released(60.0, 40.0);
         assert_eq!(pane.downs.get(), 2, "the box still heard the press");
         assert_eq!(pane.focused.get(), 1, "and the pane's click fired");
         assert!(fired.is_some());
 
         // released OUTSIDE the pane: the risen press dies quietly
-        runtime.pointer_pressed(60.0, 40.0);
+        runtime.pointer_pressed(60.0, 40.0).unwrap();
         runtime.pointer_released(150.0, 95.0);
         assert_eq!(pane.focused.get(), 1, "up-outside is button manners");
     }
@@ -15314,7 +15601,8 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = Size { width: 140.0, height: 80.0 };
-        let result = runtime.layout(&Sheet, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&Sheet, crate::layout::Proposal::exact(size))
+            .unwrap();
         let region = result.scrolls.first().expect("the region registered");
         assert!(region.content.width > 120.0, "the content keeps its width");
         assert!(region.content.height > 60.0, "and its height");
@@ -15323,6 +15611,7 @@ mod tests {
         assert!(runtime.wheel(60.0, 30.0, -4.0, -6.0));
         let offsets = runtime
             .layout(&Sheet, crate::layout::Proposal::exact(size))
+            .unwrap()
             .scrolls
             .first()
             .map(|_| ())
@@ -15330,7 +15619,8 @@ mod tests {
         let _ = offsets;
         // a huge wheel pins to the far corner instead of flying off
         runtime.wheel(60.0, 30.0, -100_000.0, -100_000.0);
-        let pinned = runtime.layout(&Sheet, crate::layout::Proposal::exact(size));
+        let pinned = runtime.layout(&Sheet, crate::layout::Proposal::exact(size))
+            .unwrap();
         let region = pinned.scrolls.first().unwrap();
         // both thumbs paint: the vertical lane hugs the right edge,
         // the horizontal one lies along the bottom
@@ -15366,7 +15656,8 @@ mod tests {
         }
         let runtime = Runtime::new();
         let size = Size { width: 120.0, height: 40.0 };
-        let _ = runtime.layout(&Line, crate::layout::Proposal::exact(size));
+        let _ = runtime.layout(&Line, crate::layout::Proposal::exact(size))
+            .unwrap();
         // dy alone finds no travel; dx moves it
         assert!(!runtime.wheel(50.0, 12.0, 0.0, -5.0), "no vertical travel to take");
         assert!(runtime.wheel(50.0, 12.0, -5.0, 0.0), "sideways is the whole point");
@@ -15397,7 +15688,8 @@ mod tests {
         // as a shell mounts it: the list holds what the glass can show
         runtime.drop_unseen();
         let size = Size { width: 280.0, height: 140.0 };
-        let result = runtime.layout(&Sheet, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&Sheet, crate::layout::Proposal::exact(size))
+            .unwrap();
 
         // two regions: the sideways sheet and the vertical rows
         assert_eq!(result.scrolls.len(), 2, "{:?}", result.scrolls);
@@ -15446,17 +15738,15 @@ mod tests {
 
         // a vertical wheel moves the rows and leaves the header put
         assert!(runtime.wheel(100.0, 80.0, 0.0, -52.0));
-        let scrolled = runtime.layout(&Sheet, crate::layout::Proposal::exact(size));
+        let scrolled = runtime.layout(&Sheet, crate::layout::Proposal::exact(size))
+            .unwrap();
         let first_cell_y = scrolled
             .display
             .iter()
             .find_map(|command| match command {
                 crate::layout::DrawCommand::TextLine { origin, content, .. }
-                    if content.starts_with("r2c") =>
-                {
-                    Some(origin.y)
-                }
-                _ => None,
+                    if content.starts_with("r2c") => Some(origin.y),
+            _ => None,
             });
         assert!(first_cell_y.is_some(), "row 2 rode into view");
         let header_y = scrolled
@@ -15464,10 +15754,7 @@ mod tests {
             .iter()
             .find_map(|command| match command {
                 crate::layout::DrawCommand::TextLine { origin, content, .. }
-                    if &**content == "Name" =>
-                {
-                    Some(origin.y)
-                }
+                    if &**content == "Name" => Some(origin.y),
                 _ => None,
             })
             .expect("the header stays");
@@ -15480,10 +15767,7 @@ mod tests {
                 .iter()
                 .find_map(|command| match command {
                     crate::layout::DrawCommand::TextLine { origin, content, .. }
-                        if &**content == "Name" =>
-                    {
-                        Some(origin.x)
-                    }
+                        if &**content == "Name" => Some(origin.x),
                     _ => None,
                 })
                 .expect("the header is painted")
@@ -15494,17 +15778,15 @@ mod tests {
                 .iter()
                 .find_map(|command| match command {
                     crate::layout::DrawCommand::TextLine { origin, content, .. }
-                        if content.starts_with("r2c0") =>
-                    {
-                        Some(origin.x)
-                    }
+                        if content.starts_with("r2c0") => Some(origin.x),
                     _ => None,
                 })
                 .expect("the cell is painted")
         };
         let before = (name_x(&scrolled), cell_x(&scrolled));
         assert!(runtime.wheel(100.0, 80.0, -60.0, 0.0));
-        let slid = runtime.layout(&Sheet, crate::layout::Proposal::exact(size));
+        let slid = runtime.layout(&Sheet, crate::layout::Proposal::exact(size))
+            .unwrap();
         assert_eq!(name_x(&slid), before.0 - 60.0, "the header slid with its columns");
         assert_eq!(cell_x(&slid), before.1 - 60.0, "and the rows slid in step");
         assert_eq!(headers(&slid), ["Name", "Kind", "Size"], "and the wheel brought a third title");
@@ -15552,7 +15834,8 @@ mod tests {
         let runtime = Runtime::new();
         let view = Board { landed: State::new((0, 0)), zone: State::new(None) };
         let size = Size { width: 220.0, height: 160.0 };
-        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         let target = result.drops.first().expect("the body accepts").frame;
         let source = result.drag_sources.first().expect("the tab lifts").rect;
 
@@ -15560,14 +15843,16 @@ mod tests {
         runtime.pointer_pressed(
             source.origin.x + source.size.width / 2.0,
             source.origin.y + source.size.height / 2.0,
-        );
-        runtime.pointer_moved(source.origin.x + 30.0, source.origin.y + 30.0, false);
+        )
+            .unwrap();
+        runtime.pointer_moved(source.origin.x + 30.0, source.origin.y + 30.0, false)
+            .unwrap();
         assert!(runtime.interaction().drag.is_some(), "the drag lifted");
         let quarter = (
             target.origin.x + target.size.width * 0.25,
             target.origin.y + target.size.height * 0.75,
         );
-        runtime.pointer_moved(quarter.0, quarter.1, false);
+        runtime.pointer_moved(quarter.0, quarter.1, false).unwrap();
         // the preview heard the place WHILE the drag moves — this is
         // the whole of pain 31: the veil can be painted now
         assert_eq!(view.zone.get(), Some((25, 75)), "the hand reports its quarter");
@@ -15575,11 +15860,14 @@ mod tests {
         // the framework's ring stands down for a box that previews
         let ringed = runtime
             .layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap()
             .display
             .iter()
-            .any(|command| matches!(command,
+            .any(|command| {
+                matches!(command,
                 crate::layout::DrawCommand::StrokeRect { color, width, .. }
-                    if *color == crate::theme::current().accent && *width == 2.0));
+                    if *color == crate::theme::current().accent && *width == 2.0)
+            });
         assert!(!ringed, "the app paints its own preview, so the ring keeps quiet");
 
         // the release lands the value AND the place, and closes the
@@ -15620,7 +15908,8 @@ mod tests {
         let runtime = Runtime::new();
         let view = Board { seen: State::new(Vec::new()) };
         let size = Size { width: 120.0, height: 200.0 };
-        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         let target = result.drops.first().expect("a target").frame;
         let source = result.drag_sources.first().expect("the tab lifts").rect;
         let inside = (
@@ -15631,19 +15920,24 @@ mod tests {
         runtime.pointer_pressed(
             source.origin.x + source.size.width / 2.0,
             source.origin.y + source.size.height / 2.0,
-        );
+        )
+            .unwrap();
         // lift sideways, away from the target below
-        runtime.pointer_moved(source.origin.x + 40.0, source.origin.y, false);
-        runtime.pointer_moved(inside.0, inside.1, false);
+        runtime.pointer_moved(source.origin.x + 40.0, source.origin.y, false)
+            .unwrap();
+        runtime.pointer_moved(inside.0, inside.1, false).unwrap();
         assert_eq!(view.seen.get(), vec!["over".to_string()], "entering speaks once");
 
         // moving WITHIN the same box does not re-enter, it just moves
-        runtime.pointer_moved(inside.0 + 4.0, inside.1 + 4.0, false);
+        runtime.pointer_moved(inside.0 + 4.0, inside.1 + 4.0, false)
+            .unwrap();
         assert_eq!(view.seen.get(), vec!["over".to_string(), "over".to_string()]);
 
         // leaving the box: exactly ONE None, no matter how far it goes
-        runtime.pointer_moved(inside.0, target.origin.y + target.size.height + 30.0, false);
-        runtime.pointer_moved(inside.0, target.origin.y + target.size.height + 40.0, false);
+        runtime.pointer_moved(inside.0, target.origin.y + target.size.height + 30.0, false)
+            .unwrap();
+        runtime.pointer_moved(inside.0, target.origin.y + target.size.height + 40.0, false)
+            .unwrap();
         let log = view.seen.get();
         assert_eq!(log.last().map(String::as_str), Some("left"));
         assert_eq!(
@@ -15653,10 +15947,11 @@ mod tests {
         );
 
         // back in, then Escape — the preview must not be left hanging
-        runtime.pointer_moved(inside.0, inside.1, false);
+        runtime.pointer_moved(inside.0, inside.1, false).unwrap();
         assert_eq!(view.seen.get().last().map(String::as_str), Some("over"));
         let handled =
-            runtime.key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape));
+            runtime.key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape))
+            .unwrap();
         assert!(handled.handled, "escape cancelled the drag");
         assert_eq!(view.seen.get().last().map(String::as_str), Some("left"),
             "a cancelled drag closes the preview");
@@ -15694,10 +15989,12 @@ mod tests {
         let runtime = Runtime::new();
         let view = Board { at: State::new(None) };
         let size = Size { width: 120.0, height: 200.0 };
-        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         // scroll the target halfway up under its clip
         let region = runtime
             .layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap()
             .scrolls
             .first()
             .map(|region| region.path.clone())
@@ -15705,7 +16002,8 @@ mod tests {
         // all the way down: the target's top now sits ABOVE the clip,
         // so its visible slice starts twenty points into its own box
         runtime.set_scroll_offset(&region, crate::layout::Point { x: 0.0, y: 80.0 });
-        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap();
         let target = result.drops.first().expect("the target is placed");
         assert!(
             target.rect.size.height < target.frame.size.height,
@@ -15720,8 +16018,10 @@ mod tests {
         runtime.pointer_pressed(
             source.origin.x + source.size.width / 2.0,
             source.origin.y + source.size.height / 2.0,
-        );
-        runtime.pointer_moved(source.origin.x + 30.0, source.origin.y + 20.0, false);
+        )
+            .unwrap();
+        runtime.pointer_moved(source.origin.x + 30.0, source.origin.y + 20.0, false)
+            .unwrap();
         let visible_top = (target.rect.origin.x + 10.0, target.rect.origin.y + 1.0);
         runtime.pointer_released(visible_top.0, visible_top.1);
         let (local_y, height) = view.at.get().expect("it landed");
@@ -15754,34 +16054,41 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = Size { width: 120.0, height: 120.0 };
-        let mount = runtime.dom_frame(&Board, size);
+        let mount = runtime.dom_frame(&Board, size).unwrap();
         let accent = crate::theme::current().accent;
         let ringed = |patches: &[crate::dom::DomPatch]| {
-            patches.iter().any(|patch| matches!(patch,
+            patches.iter().any(|patch| {
+                matches!(patch,
                 crate::dom::DomPatch::DefineRule { style, .. }
-                    if style.border == Some((accent, 2.0))))
+                    if style.border == Some((accent, 2.0)))
+            })
         };
         assert!(!ringed(&mount), "no drag, no ring");
 
         // the drag lifts through the very door the element mode opens
-        let geometry = runtime.layout(&Board, crate::layout::Proposal::exact(size));
+        let geometry = runtime.layout(&Board, crate::layout::Proposal::exact(size))
+            .unwrap();
         let source = geometry.drag_sources.first().expect("the tab lifts").rect;
         let target = geometry.drops.first().expect("the pane accepts").rect;
         runtime.pointer_pressed(
             source.origin.x + source.size.width / 2.0,
             source.origin.y + source.size.height / 2.0,
+        )
+            .unwrap();
+        assert!(runtime.drag_armed(), "the press armed it — this is what the glue asks"
         );
-        assert!(runtime.drag_armed(), "the press armed it — this is what the glue asks");
-        runtime.pointer_moved(source.origin.x + 40.0, source.origin.y, false);
+        runtime.pointer_moved(source.origin.x + 40.0, source.origin.y, false)
+            .unwrap();
         runtime.pointer_moved(
             target.origin.x + target.size.width / 2.0,
             target.origin.y + target.size.height / 2.0,
             false,
-        );
+        )
+            .unwrap();
         assert!(runtime.interaction().drag.is_some(), "the drag is live in this mode too");
 
         // the ring reached the browser as a bordered box
-        let over = runtime.dom_frame(&Board, size);
+        let over = runtime.dom_frame(&Board, size).unwrap();
         assert!(ringed(&over), "the ring is an element: {over:#?}");
 
         // and it leaves with the gesture
@@ -15789,7 +16096,7 @@ mod tests {
             target.origin.x + target.size.width / 2.0,
             target.origin.y + target.size.height / 2.0,
         );
-        let after = runtime.dom_frame(&Board, size);
+        let after = runtime.dom_frame(&Board, size).unwrap();
         assert!(
             after.iter().any(|patch| matches!(patch, crate::dom::DomPatch::Remove { .. })),
             "the ring element dies with the drag: {after:#?}"
@@ -15824,7 +16131,9 @@ mod tests {
 
         let runtime = Runtime::new();
         let result =
-            runtime.layout(&Tabs, crate::layout::Proposal::exact(Size { width: 200.0, height: 180.0 }));
+            runtime.layout(&Tabs, crate::layout::Proposal::exact(Size { width: 200.0, height: 180.0 }),
+            )
+            .unwrap();
         let fonts: Vec<(String, FontSpec)> = result
             .display
             .iter()
@@ -15845,7 +16154,8 @@ mod tests {
         // and never a face design
         assert_eq!(fonts[3].1.slant, Slant::Italic, "lean, then role");
         assert_eq!(fonts[3].1.size, 12.0, "and the role still sized it");
-        assert_eq!(fonts[4].1.slant, Slant::Italic, "role, then lean — the silent one");
+        assert_eq!(fonts[4].1.slant, Slant::Italic, "role, then lean — the silent one"
+        );
         assert_eq!(fonts[4].1.size, 12.0);
         assert_eq!(fonts[3].1, fonts[4].1, "the same sentence, either way round");
         assert_eq!(
@@ -15887,7 +16197,8 @@ mod tests {
             .multiline_text_alignment(TextAlignment::Center)
             .frame_width(40.0);
         assert_eq!(
-            line_lefts(&runtime.layout(&centred, Proposal::unspecified()).display),
+            line_lefts(&runtime.layout(&centred, Proposal::unspecified()).unwrap()
+                    .display),
             vec![12.0, 4.0],
             "each line centres on its own width"
         );
@@ -15895,13 +16206,14 @@ mod tests {
             .multiline_text_alignment(TextAlignment::Trailing)
             .frame_width(40.0);
         assert_eq!(
-            line_lefts(&runtime.layout(&trailing, Proposal::unspecified()).display),
+            line_lefts(&runtime.layout(&trailing, Proposal::unspecified()).unwrap()
+                    .display),
             vec![24.0, 8.0]
         );
         // unset, every line starts at the leading edge, as they always did
         let plain = text("aa bbbb").frame_width(40.0);
         assert_eq!(
-            line_lefts(&runtime.layout(&plain, Proposal::unspecified()).display),
+            line_lefts(&runtime.layout(&plain, Proposal::unspecified()).unwrap().display),
             vec![0.0, 0.0]
         );
     }
@@ -16100,24 +16412,25 @@ mod tests {
         let view = Board { saw: Rc::clone(&saw) };
         let runtime = Runtime::new();
         let size = Size { width: 100.0, height: 100.0 };
-        let _ = runtime.display_frame(&view, size);
+        let _ = runtime.display_frame(&view, size).unwrap();
 
         assert!(!runtime.last_input_was_touch(), "a runtime nobody has touched reads as a mouse");
 
-        runtime.touch_began(1, 50.0, 50.0, 1);
-        runtime.touch_ended(1, 50.0, 50.0);
+        runtime.touch_began(1, 50.0, 50.0, 1).unwrap();
+        runtime.touch_ended(1, 50.0, 50.0).unwrap();
         assert_eq!(saw.get(), Some(true), "the finger's press says so to the box");
         assert!(runtime.last_input_was_touch(), "and the modality outlives the gesture");
 
         saw.set(None);
-        runtime.pointer_clicked(50.0, 50.0, 1, crate::action::Modifiers::NONE);
+        runtime.pointer_clicked(50.0, 50.0, 1, crate::action::Modifiers::NONE)
+            .unwrap();
         assert_eq!(saw.get(), Some(false), "a mouse click is a mouse");
         assert!(!runtime.last_input_was_touch(), "the hand changed and the chrome follows");
 
         // …and back, because the machine did not change — the hand did
-        runtime.touch_began(2, 50.0, 50.0, 1);
+        runtime.touch_began(2, 50.0, 50.0, 1).unwrap();
         assert!(runtime.last_input_was_touch());
-        runtime.touch_ended(2, 50.0, 50.0);
+        runtime.touch_ended(2, 50.0, 50.0).unwrap();
     }
 
     /// **A frame does not speak for the hand.** A finger is down and a
@@ -16199,23 +16512,23 @@ mod tests {
         let view = Board { moves: Rc::clone(&moves) };
         let runtime = Runtime::new();
         let size = Size { width: 100.0, height: 100.0 };
-        let _ = runtime.display_frame(&view, size);
+        let _ = runtime.display_frame(&view, size).unwrap();
 
-        runtime.touch_began(1, 50.0, 50.0, 1);
+        runtime.touch_began(1, 50.0, 50.0, 1).unwrap();
         assert!(runtime.last_input_was_touch(), "the finger is on the glass");
 
         // every step of a drag paints, and the paint is where this broke
-        let _ = runtime.display_frame(&view, size);
+        let _ = runtime.display_frame(&view, size).unwrap();
         assert!(
             runtime.last_input_was_touch(),
             "a frame is not an input: the hand is still the one that pressed",
         );
 
-        runtime.touch_moved(1, 40.0, 50.0);
-        let _ = runtime.display_frame(&view, size);
-        runtime.touch_moved(1, 30.0, 50.0);
+        runtime.touch_moved(1, 40.0, 50.0).unwrap();
+        let _ = runtime.display_frame(&view, size).unwrap();
+        runtime.touch_moved(1, 30.0, 50.0).unwrap();
         assert_eq!(moves.get(), 2, "and the box that took the press hears every move");
-        runtime.touch_ended(1, 30.0, 50.0);
+        runtime.touch_ended(1, 30.0, 50.0).unwrap();
     }
 
     #[test]
@@ -16236,19 +16549,20 @@ mod tests {
         let view = Tapper { count: State::new(0) };
         let runtime = Runtime::new();
         let size = Size { width: 200.0, height: 100.0 };
-        let _ = runtime.display_frame(&view, size);
+        let _ = runtime.display_frame(&view, size).unwrap();
         let (_, rect) = runtime
             .layout(&view, Proposal::exact(size))
+            .unwrap()
             .hits
             .first()
             .cloned()
             .expect("the button is a target");
         let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
 
-        assert!(runtime.touch_began(1, x, y, 1), "the press paints at once");
+        assert!(runtime.touch_began(1, x, y, 1).unwrap(), "the press paints at once");
         assert!(runtime.interaction().pressed.is_some(), "nothing here pans: the press is sure");
         assert!(runtime.wants_frame(), "a still press listens for a menu until the hold is spent");
-        runtime.touch_ended(1, x, y);
+        runtime.touch_ended(1, x, y).unwrap();
         assert_eq!(view.count.get(), 1, "the lift fired");
         let after = runtime.interaction();
         assert_eq!(after.pressed, None);
@@ -16271,36 +16585,36 @@ mod tests {
         impl Component for Rows {
             fn body(self) -> impl View {
                 let fired = self.fired;
-                list((0..100).collect::<Vec<usize>>(), |row| format!("row{row}"), move |row| {
-                    button(text(format!("item {row}")), move || fired.add(1))
-                })
+                list((0..100).collect::<Vec<usize>>(), |row| format!("row{row}"), move |row| button(text(format!("item {row}")), move || fired.add(1)),
+                )
             }
         }
 
         let view = Rows { fired: State::new(0) };
         let runtime = Runtime::new();
         let size = Size { width: 200.0, height: 100.0 };
-        let _ = runtime.display_frame(&view, size);
+        let _ = runtime.display_frame(&view, size).unwrap();
         let region = runtime
             .layout(&view, Proposal::exact(size))
+            .unwrap()
             .scrolls
             .first()
             .expect("the list is a region")
             .path
             .clone();
 
-        assert!(!runtime.touch_began(1, 10.0, 80.0, 1), "over a list the press waits");
+        assert!(!runtime.touch_began(1, 10.0, 80.0, 1).unwrap(), "over a list the press waits");
         assert!(runtime.wants_frame(), "the hold is on the clock");
         assert_eq!(
             runtime.frame_pace(),
             FramePace::Display,
             "and on the LINK: nothing animates and nothing sleeps, but the clock is what              decides what this touch turns out to be — a hold, a drag, a fling — and a beat              of its own would decide it late"
         );
-        assert!(!runtime.touch_moved(1, 10.0, 78.0), "inside the slop nothing moves");
+        assert!(!runtime.touch_moved(1, 10.0, 78.0).unwrap(), "inside the slop nothing moves");
         assert_eq!(runtime.scroll_offset(&region).y, 0.0);
-        assert!(runtime.touch_moved(1, 10.0, 60.0), "past the slop the content slides");
+        assert!(runtime.touch_moved(1, 10.0, 60.0).unwrap(), "past the slop the content slides");
         assert_eq!(runtime.scroll_offset(&region).y, 20.0, "the whole excursion, not the rest of it");
-        runtime.touch_ended(1, 10.0, 60.0);
+        runtime.touch_ended(1, 10.0, 60.0).unwrap();
         assert_eq!(view.fired.get(), 0, "the row never fired");
         assert_eq!(runtime.interaction().pressed, None);
         assert_eq!(runtime.frame_pace(), FramePace::Idle, "a slow lift has no fling");
@@ -16332,20 +16646,20 @@ mod tests {
         let view = Page { fired: State::new(0) };
         let runtime = Runtime::new();
         let size = Size { width: 200.0, height: 200.0 };
-        let _ = runtime.display_frame(&view, size);
-        let result = runtime.layout(&view, Proposal::exact(size));
+        let _ = runtime.display_frame(&view, size).unwrap();
+        let result = runtime.layout(&view, Proposal::exact(size)).unwrap();
         let region = result.scrolls.first().expect("the list is a region").path.clone();
         let (_, rect) = result.hits.first().cloned().expect("the button is a target");
         let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
 
-        assert!(runtime.touch_began(1, x, y, 1));
+        assert!(runtime.touch_began(1, x, y, 1).unwrap());
         assert!(runtime.interaction().pressed.is_some(), "no region under the button: sure press");
         // a drag well past the slop, ending inside the button's own box
         let edge = rect.origin.x + rect.size.width - 1.0;
-        runtime.touch_moved(1, x + 300.0, y + 300.0);
+        runtime.touch_moved(1, x + 300.0, y + 300.0).unwrap();
         assert_eq!(runtime.interaction().hovered, None, "dragged out: the pressed paint drops");
-        runtime.touch_moved(1, edge, y);
-        runtime.touch_ended(1, edge, y);
+        runtime.touch_moved(1, edge, y).unwrap();
+        runtime.touch_ended(1, edge, y).unwrap();
         assert_eq!(view.fired.get(), 1, "released inside: the button fires once");
         assert_eq!(runtime.scroll_offset(&region), Point::ZERO, "the list below never moved");
     }
@@ -16371,19 +16685,20 @@ mod tests {
         }
 
         let runtime = Runtime::new();
-        let _ = runtime.display_frame(&Row, Size { width: 300.0, height: 200.0 });
+        let _ = runtime.display_frame(&Row, Size { width: 300.0, height: 200.0 })
+            .unwrap();
         let (step, beat) = (1.0 / 30.0, 1.0 / 8.0);
 
-        runtime.touch_began(1, 30.0, 8.0, 1);
+        runtime.touch_began(1, 30.0, 8.0, 1).unwrap();
         // the driver slept five seconds before the finger came: one step of
         // that gap counts, never the nap
-        runtime.tick_clocked(step, 5.0);
+        runtime.tick_clocked(step, 5.0).unwrap();
         assert!(runtime.interaction().menu.is_none(), "a fresh touch is not a long press");
         for _ in 0..3 {
-            runtime.tick_clocked(step, beat);
+            runtime.tick_clocked(step, beat).unwrap();
         }
         assert!(runtime.interaction().menu.is_none(), "0.41 seconds of finger");
-        runtime.tick_clocked(step, beat);
+        runtime.tick_clocked(step, beat).unwrap();
         assert!(runtime.interaction().menu.is_some(), "0.53: the menu opens under the finger");
     }
 
@@ -16411,29 +16726,29 @@ mod tests {
         let view = Row { opened: State::new(0) };
         let runtime = Runtime::new();
         let size = Size { width: 300.0, height: 200.0 };
-        let _ = runtime.display_frame(&view, size);
+        let _ = runtime.display_frame(&view, size).unwrap();
 
-        assert!(!runtime.touch_began(1, 30.0, 8.0, 1), "over a scroll the press waits");
-        let early = runtime.tick(0.3);
+        assert!(!runtime.touch_began(1, 30.0, 8.0, 1).unwrap(), "over a scroll the press waits");
+        let early = runtime.tick(0.3).unwrap();
         assert!(!early.input, "not yet");
         assert!(runtime.interaction().menu.is_none());
-        let held = runtime.tick(0.3);
+        let held = runtime.tick(0.3).unwrap();
         assert!(held.input, "the clock reached the app: a settled frame is due");
         assert!(runtime.interaction().menu.is_some(), "the menu opened where the finger holds");
-        runtime.touch_ended(1, 30.0, 8.0);
+        runtime.touch_ended(1, 30.0, 8.0).unwrap();
         assert!(runtime.interaction().menu.is_some(), "the lift after a menu is spent");
         assert_eq!(view.opened.get(), 0);
 
         // the next tap picks the first row
-        let result = runtime.layout(&view, Proposal::exact(size));
+        let result = runtime.layout(&view, Proposal::exact(size)).unwrap();
         let menu = result
             .overlays
             .iter()
             .find(|overlay| overlay.path == MENU_PATH)
             .expect("the menu is an overlay");
         let (x, y) = (menu.frame.origin.x + 20.0, menu.frame.origin.y + 5.0 + 12.0);
-        runtime.touch_began(2, x, y, 1);
-        runtime.touch_ended(2, x, y);
+        runtime.touch_began(2, x, y, 1).unwrap();
+        runtime.touch_ended(2, x, y).unwrap();
         assert_eq!(view.opened.get(), 1, "the row fired");
         assert!(runtime.interaction().menu.is_none(), "and the menu closed");
     }
@@ -16461,23 +16776,24 @@ mod tests {
         let view = Form { value: State::new("hello world".into()) };
         let runtime = Runtime::new();
         let size = Size { width: 300.0, height: 200.0 };
-        let _ = runtime.display_frame(&view, size);
+        let _ = runtime.display_frame(&view, size).unwrap();
         let field = runtime
             .layout(&view, Proposal::exact(size))
+            .unwrap()
             .fields
             .first()
             .expect("the field is placed")
             .frame;
         let (x, y) = (field.origin.x + 10.0, field.origin.y + field.size.height / 2.0);
 
-        runtime.touch_began(1, x, y, 1);
+        runtime.touch_began(1, x, y, 1).unwrap();
         assert_eq!(runtime.focused(), None, "a finger that may pan focuses nothing yet");
-        let _ = runtime.tick(0.3);
-        let held = runtime.tick(0.3);
+        let _ = runtime.tick(0.3).unwrap();
+        let held = runtime.tick(0.3).unwrap();
         assert!(held.input);
         assert!(runtime.focused().is_some(), "the hold pressed: the field took the keyboard");
         assert!(runtime.interaction().field_drag.is_some(), "and the sweep is open");
-        runtime.touch_ended(1, x, y);
+        runtime.touch_ended(1, x, y).unwrap();
         assert!(runtime.focused().is_some(), "the lift keeps the focus");
     }
 
@@ -16493,32 +16809,32 @@ mod tests {
         }
         impl Component for Rows {
             fn body(self) -> impl View {
-                list((0..self.rows).collect::<Vec<usize>>(), |row| format!("row{row}"), |row| {
-                    text(format!("item {row}"))
-                })
+                list((0..self.rows).collect::<Vec<usize>>(), |row| format!("row{row}"), |row| text(format!("item {row}")),
+                )
             }
         }
 
         let view = Rows { rows };
         let runtime = Runtime::new();
         let size = Size { width: 200.0, height: 100.0 };
-        let _ = runtime.display_frame(&view, size);
+        let _ = runtime.display_frame(&view, size).unwrap();
         let region = runtime
             .layout(&view, Proposal::exact(size))
+            .unwrap()
             .scrolls
             .first()
             .expect("the list is a region")
             .path
             .clone();
 
-        runtime.touch_began(1, 10.0, 90.0, 1);
+        runtime.touch_began(1, 10.0, 90.0, 1).unwrap();
         let mut y = 90.0;
         for _ in 0..3 {
             y -= 20.0;
-            runtime.touch_moved(1, 10.0, y);
-            let _ = runtime.tick(1.0 / 60.0);
+            runtime.touch_moved(1, 10.0, y).unwrap();
+            let _ = runtime.tick(1.0 / 60.0).unwrap();
         }
-        runtime.touch_ended(1, 10.0, y);
+        runtime.touch_ended(1, 10.0, y).unwrap();
         let lifted = runtime.scroll_offset(&region).y;
         assert!(runtime.wants_frame(), "a fast lift flings");
         assert_eq!(runtime.frame_pace(), FramePace::Display);
@@ -16526,7 +16842,7 @@ mod tests {
         let mut last = lifted;
         let mut ticks = 0;
         while runtime.wants_frame() {
-            let _ = runtime.tick(1.0 / 60.0);
+            let _ = runtime.tick(1.0 / 60.0).unwrap();
             let now = runtime.scroll_offset(&region).y;
             assert!(now >= last, "a fling never turns back");
             last = now;
@@ -16577,8 +16893,8 @@ mod tests {
         let view = Form { value: State::new("hi".into()), count: State::new(0) };
         let runtime = Runtime::new();
         let size = Size { width: 200.0, height: 200.0 };
-        let _ = runtime.display_frame(&view, size);
-        let result = runtime.layout(&view, Proposal::exact(size));
+        let _ = runtime.display_frame(&view, size).unwrap();
+        let result = runtime.layout(&view, Proposal::exact(size)).unwrap();
         let placed = result.fields.first().expect("the field is placed");
         let field = placed.path.clone();
         runtime.focus(&field);
@@ -16590,9 +16906,9 @@ mod tests {
             .expect("the button is a target below the field");
         let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
 
-        assert!(runtime.touch_began(1, x, y, 1));
+        assert!(runtime.touch_began(1, x, y, 1).unwrap());
         assert!(runtime.interaction().pressed.is_some());
-        assert!(runtime.touch_cancelled(1), "the pressed paint clears");
+        assert!(runtime.touch_cancelled(1).unwrap(), "the pressed paint clears");
         assert_eq!(runtime.interaction().pressed, None);
         assert_eq!(view.count.get(), 0, "nothing fired");
         assert_eq!(runtime.focused().as_deref(), Some(field.as_str()), "the focus stayed");
@@ -16639,16 +16955,16 @@ mod tests {
         let view = Map { scale: scale.clone(), at: at.clone() };
         let runtime = Runtime::new();
         let size = Size { width: 400.0, height: 300.0 };
-        let _ = runtime.display_frame(&view, size);
+        let _ = runtime.display_frame(&view, size).unwrap();
 
         // two fingers a hundred apart spread to two hundred: twice
-        runtime.touch_began(1, 100.0, 100.0, 1);
-        runtime.touch_began(2, 200.0, 100.0, 1);
-        assert!(runtime.touch_moved(2, 300.0, 100.0), "the box took the zoom");
+        runtime.touch_began(1, 100.0, 100.0, 1).unwrap();
+        runtime.touch_began(2, 200.0, 100.0, 1).unwrap();
+        assert!(runtime.touch_moved(2, 300.0, 100.0).unwrap(), "the box took the zoom");
         assert_eq!(scale.get(), 2.0);
         assert_eq!(at.get(), Point { x: 200.0, y: 100.0 }, "at the point between the fingers");
-        runtime.touch_ended(1, 100.0, 100.0);
-        runtime.touch_ended(2, 300.0, 100.0);
+        runtime.touch_ended(1, 100.0, 100.0).unwrap();
+        runtime.touch_ended(2, 300.0, 100.0).unwrap();
 
         // the trackpad speaks the same door
         assert!(runtime.magnify(150.0, 150.0, 1.5));
@@ -16719,13 +17035,14 @@ mod tests {
             let heard = Rc::new(RefCell::new(Vec::new()));
             let view = Office { heard: heard.clone(), knows_cancel, grabs };
             let runtime = Runtime::new();
-            let _ = runtime.display_frame(&view, Size { width: 400.0, height: 300.0 });
+            let _ = runtime.display_frame(&view, Size { width: 400.0, height: 300.0 })
+                .unwrap();
 
-            runtime.touch_began(1, 100.0, 100.0, 1);
-            runtime.touch_began(2, 200.0, 100.0, 1);
-            assert!(runtime.touch_moved(2, 300.0, 100.0), "the pair zooms");
-            runtime.touch_ended(1, 100.0, 100.0);
-            runtime.touch_ended(2, 300.0, 100.0);
+            runtime.touch_began(1, 100.0, 100.0, 1).unwrap();
+            runtime.touch_began(2, 200.0, 100.0, 1).unwrap();
+            assert!(runtime.touch_moved(2, 300.0, 100.0).unwrap(), "the pair zooms");
+            runtime.touch_ended(1, 100.0, 100.0).unwrap();
+            runtime.touch_ended(2, 300.0, 100.0).unwrap();
             assert_eq!(*heard.borrow(), heard_then, "grabs {grabs}, knows a cancel {knows_cancel}");
         }
     }
@@ -16780,22 +17097,23 @@ mod tests {
         let view = Sketch { downs: downs.clone(), drags: drags.clone() };
         let runtime = Runtime::new();
         let size = Size { width: 200.0, height: 200.0 };
-        let _ = runtime.display_frame(&view, size);
+        let _ = runtime.display_frame(&view, size).unwrap();
         let region = runtime
             .layout(&view, Proposal::exact(size))
+            .unwrap()
             .scrolls
             .first()
             .expect("the scroll is a region")
             .path
             .clone();
 
-        runtime.touch_began(1, 50.0, 50.0, 1);
+        runtime.touch_began(1, 50.0, 50.0, 1).unwrap();
         assert_eq!(downs.get(), 1, "the box heard the press at once");
-        runtime.touch_moved(1, 50.0, 80.0);
-        runtime.touch_moved(1, 50.0, 120.0);
+        runtime.touch_moved(1, 50.0, 80.0).unwrap();
+        runtime.touch_moved(1, 50.0, 120.0).unwrap();
         assert_eq!(drags.get(), 2, "and every move, pressed");
         assert_eq!(runtime.scroll_offset(&region), Point::ZERO, "the region never scrolled");
-        runtime.touch_ended(1, 50.0, 120.0);
+        runtime.touch_ended(1, 50.0, 120.0).unwrap();
     }
 
     // MARK: - The safe area: the root lays out inside it
@@ -16817,7 +17135,7 @@ mod tests {
         let runtime = Runtime::new();
         let size = Size { width: 390.0, height: 844.0 };
         runtime.set_safe_area(Edges { top: 59.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
-        let display = runtime.display_frame(&Page, size);
+        let display = runtime.display_frame(&Page, size).unwrap();
         let fill = display
             .iter()
             .find_map(|command| match command {
@@ -16856,7 +17174,7 @@ mod tests {
         let runtime = Runtime::new();
         let size = Size { width: 390.0, height: 844.0 };
         runtime.set_safe_area(Edges { top: 59.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
-        let display = runtime.display_frame(&Page, size);
+        let display = runtime.display_frame(&Page, size).unwrap();
         let fill = display
             .iter()
             .find_map(|command| match command {
@@ -16902,11 +17220,11 @@ mod tests {
         }
 
         let size = Size { width: 300.0, height: 200.0 };
-        let untouched = Runtime::new().display_frame(&Page, size);
+        let untouched = Runtime::new().display_frame(&Page, size).unwrap();
         let told = Runtime::new();
         told.set_safe_area(Edges::ZERO);
-        let told = told.display_frame(&Page, size);
-        let reclaiming = Runtime::new().display_frame(&Reclaiming, size);
+        let told = told.display_frame(&Page, size).unwrap();
+        let reclaiming = Runtime::new().display_frame(&Reclaiming, size).unwrap();
         assert_eq!(untouched.as_slice(), told.as_slice());
         assert_eq!(untouched.as_slice(), reclaiming.as_slice());
     }
@@ -16939,14 +17257,14 @@ mod tests {
         let runtime = Runtime::new();
         let size = Size { width: 390.0, height: 844.0 };
         runtime.set_safe_area(Edges { top: 59.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
-        assert_eq!(height_of(&runtime.display_frame(&Page, size)), 751.0);
+        assert_eq!(height_of(&runtime.display_frame(&Page, size).unwrap()), 751.0);
         runtime.set_keyboard_inset(336.0);
-        assert_eq!(height_of(&runtime.display_frame(&Page, size)), 844.0 - 59.0 - 336.0);
+        assert_eq!(height_of(&runtime.display_frame(&Page, size).unwrap()), 844.0 - 59.0 - 336.0);
         // a keyboard shorter than the home indicator changes nothing
         runtime.set_keyboard_inset(20.0);
-        assert_eq!(height_of(&runtime.display_frame(&Page, size)), 751.0);
+        assert_eq!(height_of(&runtime.display_frame(&Page, size).unwrap()), 751.0);
         runtime.set_keyboard_inset(0.0);
-        assert_eq!(height_of(&runtime.display_frame(&Page, size)), 751.0);
+        assert_eq!(height_of(&runtime.display_frame(&Page, size).unwrap()), 751.0);
     }
 
     /// The tables are in window coordinates: a button first in the root
@@ -16968,19 +17286,20 @@ mod tests {
         let runtime = Runtime::new();
         let size = Size { width: 390.0, height: 844.0 };
         runtime.set_safe_area(Edges { top: 59.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
-        let _ = runtime.display_frame(&view, size);
+        let _ = runtime.display_frame(&view, size).unwrap();
         let (_, rect) = runtime
             .layout(&view, crate::layout::Proposal::exact(size))
+            .unwrap()
             .hits
             .first()
             .cloned()
             .expect("the button is a target");
         assert_eq!(rect.origin.y, 59.0, "the button's hit sits under the safe area's top");
-        runtime.pointer_pressed(10.0, 30.0);
+        runtime.pointer_pressed(10.0, 30.0).unwrap();
         runtime.pointer_released(10.0, 30.0);
         assert_eq!(view.count.get(), 0, "a press in the notch's band reaches nothing");
         let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
-        runtime.pointer_pressed(x, y);
+        runtime.pointer_pressed(x, y).unwrap();
         runtime.pointer_released(x, y);
         assert_eq!(view.count.get(), 1, "a press on the button fires");
     }
@@ -17009,12 +17328,15 @@ mod tests {
         let runtime = Runtime::new();
         let size = Size { width: 390.0, height: 844.0 };
         runtime.set_safe_area(Edges { top: 59.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
-        let display = runtime.display_frame(&Page, size);
+        let display = runtime.display_frame(&Page, size).unwrap();
         let rect_of = |wanted: Color| {
             display
                 .iter()
                 .find_map(|command| match command {
-                    crate::layout::DrawCommand::FillRect { rect, color, .. } if *color == wanted => Some(*rect),
+                    crate::layout::DrawCommand::FillRect { rect, color, .. } if *color == wanted =>
+                    {
+                        Some(*rect)
+                    }
                     _ => None,
                 })
                 .expect("the box paints")
@@ -17071,19 +17393,19 @@ mod tests {
         let runtime = Runtime::new();
         let desktop = Size { width: 1280.0, height: 800.0 };
         let phone = Size { width: 390.0, height: 844.0 };
-        assert_eq!(first_line(&runtime.display_frame(&Workbench, desktop)), "desktop");
-        let _ = runtime.display_frame(&Workbench, desktop);
+        assert_eq!(first_line(&runtime.display_frame(&Workbench, desktop).unwrap()), "desktop");
+        let _ = runtime.display_frame(&Workbench, desktop).unwrap();
         assert!(runtime.body_runs().is_empty(), "a still window runs no body");
         assert!(!runtime.needs_frame(), "and asks for none");
 
         // the resize is read in the frame it happens in, by its reader
         // alone, once — the size was written before the frame settled
         let _ = crate::reconciler::take_frame_runs();
-        assert_eq!(first_line(&runtime.display_frame(&Workbench, phone)), "portrait");
+        assert_eq!(first_line(&runtime.display_frame(&Workbench, phone).unwrap()), "portrait");
         let ran = crate::reconciler::take_frame_runs();
         assert_eq!(ran.len(), 1, "one body ran, once: {ran:?}");
         assert!(ran[0].ends_with("Chassis"), "the reader: {ran:?}");
-        let _ = runtime.display_frame(&Workbench, phone);
+        let _ = runtime.display_frame(&Workbench, phone).unwrap();
         assert!(runtime.body_runs().is_empty(), "and settled");
     }
 
@@ -17103,9 +17425,12 @@ mod tests {
         let line = |runtime: &Runtime| {
             runtime
                 .display_frame(&Caption, size)
+                .unwrap()
                 .iter()
                 .find_map(|command| match command {
-                    crate::layout::DrawCommand::TextLine { content, .. } => Some(content.to_string()),
+                    crate::layout::DrawCommand::TextLine { content, .. } => {
+                        Some(content.to_string())
+                    }
                     _ => None,
                 })
                 .expect("the caption paints")
@@ -17148,16 +17473,16 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = Size { width: 390.0, height: 844.0 };
-        assert_eq!(first_line(&runtime.display_frame(&Adaptive, size)), "wide", "regular by default");
+        assert_eq!(first_line(&runtime.display_frame(&Adaptive, size).unwrap()), "wide", "regular by default");
         // a still frame runs no body
-        let _ = runtime.display_frame(&Adaptive, size);
+        let _ = runtime.display_frame(&Adaptive, size).unwrap();
         assert!(runtime.body_runs().is_empty(), "nothing moved, nothing ran");
 
         // the move rebuilds the retention: the body that read the class
         // runs again inside the settle, and the scene says so
         runtime.set_environment(|values| values.horizontalSizeClass = SizeClass::Compact);
-        assert_eq!(first_line(&runtime.display_frame(&Adaptive, size)), "narrow");
-        let _ = runtime.display_frame(&Adaptive, size);
+        assert_eq!(first_line(&runtime.display_frame(&Adaptive, size).unwrap()), "narrow");
+        let _ = runtime.display_frame(&Adaptive, size).unwrap();
         assert!(runtime.body_runs().is_empty(), "and settled");
 
         // a subtree forces its own answer
@@ -17168,7 +17493,7 @@ mod tests {
                 Adaptive.environment(|values| values.horizontalSizeClass = SizeClass::Compact)
             }
         }
-        assert_eq!(first_line(&Runtime::new().display_frame(&Preview, size)), "narrow");
+        assert_eq!(first_line(&Runtime::new().display_frame(&Preview, size).unwrap()), "narrow");
     }
 
     // MARK: - The locale reaches the body
@@ -17180,12 +17505,12 @@ mod tests {
     fn a_system_locale_moves_the_environment_once() {
         let runtime = Runtime::new();
         let size = Size { width: 300.0, height: 200.0 };
-        let _ = runtime.display_frame(&text("hi"), size);
+        let _ = runtime.display_frame(&text("hi"), size).unwrap();
         assert!(!runtime.frame_need().environment);
         assert!(runtime.set_system_locale(Locale::parse("pt-BR,en")), "the first report is news");
         assert!(runtime.frame_need().environment);
         assert_eq!(runtime.locale().as_str(), "pt-BR,en");
-        let _ = runtime.display_frame(&text("hi"), size);
+        let _ = runtime.display_frame(&text("hi"), size).unwrap();
         assert!(!runtime.set_system_locale(Locale::parse("pt-BR,en")), "the same report is not");
         assert!(!runtime.frame_need().environment, "and costs no frame");
     }
@@ -17256,12 +17581,12 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = Size { width: 300.0, height: 200.0 };
-        assert_eq!(first_line(&runtime.display_frame(&Greeting, size)), "hello");
-        let _ = runtime.display_frame(&Greeting, size);
+        assert_eq!(first_line(&runtime.display_frame(&Greeting, size).unwrap()), "hello");
+        let _ = runtime.display_frame(&Greeting, size).unwrap();
         assert!(runtime.body_runs().is_empty(), "nothing moved, nothing ran");
         runtime.set_system_locale(Locale::parse("pt-BR,en"));
-        assert_eq!(first_line(&runtime.display_frame(&Greeting, size)), "oi");
-        let _ = runtime.display_frame(&Greeting, size);
+        assert_eq!(first_line(&runtime.display_frame(&Greeting, size).unwrap()), "oi");
+        let _ = runtime.display_frame(&Greeting, size).unwrap();
         assert!(runtime.body_runs().is_empty(), "and settled");
     }
 
@@ -17294,7 +17619,7 @@ mod tests {
     fn a_size_class_that_did_not_move_costs_nothing() {
         let runtime = Runtime::new();
         let size = Size { width: 390.0, height: 844.0 };
-        let _ = runtime.display_frame(&text("hi"), size);
+        let _ = runtime.display_frame(&text("hi"), size).unwrap();
         assert!(!runtime.set_size_class(SizeClass::Regular), "regular already");
         assert!(!runtime.frame_need().environment);
         assert!(runtime.set_size_class(SizeClass::Compact));
@@ -17342,7 +17667,9 @@ mod tests {
             }
         }
         let runtime = Runtime::new();
-        let lefts = text_lefts(&runtime.display_frame(&Scene, Size { width: 100.0, height: 100.0 }));
+        let lefts = text_lefts(&runtime.display_frame(&Scene, Size { width: 100.0, height: 100.0 })
+                .unwrap(),
+        );
         assert_eq!(
             lefts,
             [("a".into(), 0.0), ("bb".into(), 8.0), ("a".into(), 16.0), ("bb".into(), 0.0)],
@@ -17367,7 +17694,9 @@ mod tests {
         }
         let runtime = Runtime::new();
         assert!(runtime.set_layout_direction(Some(LayoutDirection::RightToLeft)));
-        let lefts = text_lefts(&runtime.display_frame(&Scene, Size { width: 100.0, height: 100.0 }));
+        let lefts = text_lefts(&runtime.display_frame(&Scene, Size { width: 100.0, height: 100.0 })
+                .unwrap(),
+        );
         assert_eq!(
             lefts,
             [("a".into(), 92.0), ("bb".into(), 76.0), ("a".into(), 76.0), ("bb".into(), 84.0)],
@@ -17395,7 +17724,7 @@ mod tests {
         use crate::layout::{Proposal, Size};
         let size = Size { width: 100.0, height: 50.0 };
         let left_of = |runtime: &Runtime, word: &str| {
-            text_lefts(&runtime.display_frame(&Strip, size))
+            text_lefts(&runtime.display_frame(&Strip, size).unwrap())
                 .into_iter()
                 .find(|(content, _)| content == word)
                 .map(|(_, x)| x)
@@ -17403,7 +17732,7 @@ mod tests {
         };
         let ltr = Runtime::new();
         ltr.render_stable(&Strip);
-        let path = ltr.layout(&Strip, Proposal::exact(size)).scrolls[0].path.clone();
+        let path = ltr.layout(&Strip, Proposal::exact(size)).unwrap().scrolls[0].path.clone();
         assert_eq!(left_of(&ltr, "aaaaaaaaaa"), 0.0, "left to right, the strip starts at the left");
         assert!(ltr.wheel(50.0, 8.0, -40.0, 0.0), "a turn toward the right shows the rest");
         assert_eq!(ltr.scroll_offset(&path).x, 40.0);
@@ -17412,7 +17741,7 @@ mod tests {
         let rtl = Runtime::new();
         rtl.set_layout_direction(Some(LayoutDirection::RightToLeft));
         rtl.render_stable(&Strip);
-        let _ = rtl.layout(&Strip, Proposal::exact(size));
+        let _ = rtl.layout(&Strip, Proposal::exact(size)).unwrap();
         assert_eq!(left_of(&rtl, "aaaaaaaaaa"), 20.0, "the first word ends at the right edge");
         assert_eq!(left_of(&rtl, "cccccccccc"), -140.0, "the last hangs out past the left");
         assert!(!rtl.wheel(50.0, 8.0, -40.0, 0.0), "a turn toward the right has nothing earlier to show");
@@ -17432,7 +17761,7 @@ mod tests {
         runtime.set_layout_direction(Some(LayoutDirection::RightToLeft));
         runtime.render_stable(&Strip);
         let viewport = Proposal::exact(Size { width: 100.0, height: 50.0 });
-        let result = runtime.layout(&Strip, viewport);
+        let result = runtime.layout(&Strip, viewport).unwrap();
         let path = result.scrolls[0].path.clone();
         let thumb = result
             .hits
@@ -17446,11 +17775,11 @@ mod tests {
             "the thumb starts at the right end of its track"
         );
         let (grab_x, y) = (thumb.origin.x + 4.0, thumb.origin.y + 2.0);
-        assert!(runtime.pointer_pressed(grab_x, y));
-        assert!(runtime.pointer_moved(grab_x - 1.0, y, false), "a point to the left is a step");
+        assert!(runtime.pointer_pressed(grab_x, y).unwrap());
+        assert!(runtime.pointer_moved(grab_x - 1.0, y, false).unwrap(), "a point to the left is a step");
         let after_one = runtime.scroll_offset(&path).x;
         assert!(after_one > 0.0 && after_one < 50.0, "one point of thumb is a small step: {after_one}");
-        assert!(runtime.pointer_moved(-10_000.0, y, false));
+        assert!(runtime.pointer_moved(-10_000.0, y, false).unwrap());
         assert_eq!(runtime.scroll_offset(&path).x, 140.0, "the far end is the far end");
         assert_eq!(runtime.pointer_released(-10_000.0, y), None);
     }
@@ -17483,12 +17812,12 @@ mod tests {
                 .expect("the seam registers a grip");
             grip.origin.x + grip.size.width / 2.0
         };
-        let center = grip_center(&runtime.layout(&bench, viewport));
+        let center = grip_center(&runtime.layout(&bench, viewport).unwrap());
         assert!((center - 939.5).abs() < 1.0, "the seam stands 260 from the RIGHT edge: {center}");
-        assert!(runtime.pointer_pressed(center, 300.0));
-        assert!(runtime.pointer_moved(800.0, 300.0, false));
+        assert!(runtime.pointer_pressed(center, 300.0).unwrap());
+        assert!(runtime.pointer_moved(800.0, 300.0, false).unwrap());
         assert_eq!(bench.seam.get(), 400.0, "the lane on the right is as wide as the pointer's reach from the right");
-        let moved = grip_center(&runtime.layout(&bench, viewport));
+        let moved = grip_center(&runtime.layout(&bench, viewport).unwrap());
         assert!((moved - 799.5).abs() < 1.0, "and the seam followed: {moved}");
     }
 
@@ -17523,7 +17852,7 @@ mod tests {
         // the column hugs the right edge, so the anchor sits at (100, 80)–(120, 100)
         let frame = |index: usize| {
             view.side.set(index);
-            let result = runtime.layout(&view, window);
+            let result = runtime.layout(&view, window).unwrap();
             assert_eq!(result.overlays.len(), 1, "one open popover");
             result.overlays[0].frame
         };
@@ -17558,16 +17887,19 @@ mod tests {
             let runtime = Runtime::new();
             runtime.set_layout_direction(Some(direction));
             let size = Size { width: 400.0, height: 120.0 };
-            let result = runtime.layout(&Rail, crate::layout::Proposal::exact(size));
+            let result = runtime.layout(&Rail, crate::layout::Proposal::exact(size))
+                .unwrap();
             let anchor = result
                 .tooltips
                 .first()
                 .expect("the gear explains itself")
                 .rect;
-            runtime.pointer_moved(anchor.origin.x + 5.0, anchor.origin.y + 5.0, false);
+            runtime.pointer_moved(anchor.origin.x + 5.0, anchor.origin.y + 5.0, false)
+                .unwrap();
             runtime.tooltip_tick();
             assert!(runtime.tooltip_tick(), "the second beat shows the bubble");
-            let result = runtime.layout(&Rail, crate::layout::Proposal::exact(size));
+            let result = runtime.layout(&Rail, crate::layout::Proposal::exact(size))
+                .unwrap();
             let bubble = result
                 .overlays
                 .iter()
@@ -17601,9 +17933,11 @@ mod tests {
             let runtime = Runtime::new();
             runtime.set_layout_direction(Some(direction));
             runtime.render_stable(&Pane);
-            let _ = runtime.layout(&Pane, crate::layout::Proposal::exact(size));
+            let _ = runtime.layout(&Pane, crate::layout::Proposal::exact(size))
+                .unwrap();
             assert!(runtime.button_pressed(250.0, 50.0, PointerButton::Secondary, Modifiers::NONE));
-            let result = runtime.layout(&Pane, crate::layout::Proposal::exact(size));
+            let result = runtime.layout(&Pane, crate::layout::Proposal::exact(size))
+                .unwrap();
             let panel = result
                 .overlays
                 .iter()
@@ -17646,7 +17980,7 @@ mod tests {
         let bands = crate::layout::Edges { top: 0.0, trailing: 30.0, bottom: 0.0, leading: 10.0 };
         let ltr = Runtime::new();
         ltr.set_safe_area(bands);
-        assert_eq!(text_lefts(&ltr.display_frame(&Reader, size)), [("10:30".into(), 10.0)]);
+        assert_eq!(text_lefts(&ltr.display_frame(&Reader, size).unwrap()), [("10:30".into(), 10.0)]);
 
         let rtl = Runtime::new();
         rtl.set_layout_direction(Some(LayoutDirection::RightToLeft));
@@ -17654,7 +17988,7 @@ mod tests {
         // the body reads the right band as leading; the row still fills the
         // window's inner width, 10 from the left and 30 from the right, and
         // its first word ends on the right band
-        assert_eq!(text_lefts(&rtl.display_frame(&Reader, size)), [("30:10".into(), 70.0 - 40.0)]);
+        assert_eq!(text_lefts(&rtl.display_frame(&Reader, size).unwrap()), [("30:10".into(), 70.0 - 40.0)]);
     }
 
     /// A box hears which way the scene around it reads — in its paint and
@@ -17700,10 +18034,12 @@ mod tests {
             let runtime = Runtime::new();
             runtime.set_layout_direction(Some(direction));
             runtime.render_stable(&pane);
-            let _ = runtime.display_frame(&pane, size);
-            let result = runtime.layout(&pane, crate::layout::Proposal::exact(size));
+            let _ = runtime.display_frame(&pane, size).unwrap();
+            let result = runtime.layout(&pane, crate::layout::Proposal::exact(size))
+                .unwrap();
             let frame = result.customs.first().expect("the box is placed").frame;
-            runtime.pointer_moved(frame.origin.x + 20.0, frame.origin.y + 20.0, false);
+            runtime.pointer_moved(frame.origin.x + 20.0, frame.origin.y + 20.0, false)
+                .unwrap();
             let heard = heard.borrow();
             let rtl = direction.is_rtl();
             assert_eq!(heard.painted_rtl, Some(rtl), "the paint knows");
@@ -17737,13 +18073,13 @@ mod tests {
         }
         let size = Size { width: 40.0, height: 40.0 };
         let plain = Runtime::new();
-        let drawn = image_sources(&plain.display_frame(&Disclosure, size));
+        let drawn = image_sources(&plain.display_frame(&Disclosure, size).unwrap());
         assert_eq!(drawn.len(), 1, "one glyph");
         assert!(matches!(drawn[0], ImageSource::Symbol { .. }), "left to right, the glyph itself");
 
         let mirrored = Runtime::new();
         mirrored.set_layout_direction(Some(LayoutDirection::RightToLeft));
-        let flipped = image_sources(&mirrored.display_frame(&Disclosure, size));
+        let flipped = image_sources(&mirrored.display_frame(&Disclosure, size).unwrap());
         assert_eq!(flipped.len(), 1, "one glyph");
         assert!(matches!(flipped[0], ImageSource::Mirrored { .. }), "right to left, in a mirror");
         assert_eq!(flipped[0].mirrored(), drawn[0], "of the same glyph");
@@ -17769,7 +18105,9 @@ mod tests {
         }
         let runtime = Runtime::new();
         runtime.set_layout_direction(Some(LayoutDirection::RightToLeft));
-        let sources = image_sources(&runtime.display_frame(&Rail, Size { width: 40.0, height: 120.0 }));
+        let sources = image_sources(&runtime.display_frame(&Rail, Size { width: 40.0, height: 120.0 })
+                .unwrap(),
+        );
         assert_eq!(sources.len(), 3);
         assert!(matches!(sources[0], ImageSource::Symbol { .. }), "nobody asked: the face stays");
         assert!(matches!(sources[1], ImageSource::Mirrored { .. }), "the parent asked");
@@ -17789,7 +18127,9 @@ mod tests {
     /// The field's run — where its text line starts — and its placement.
     fn field_run(runtime: &Runtime, form: &Form) -> (f64, crate::layout::FieldPlacement) {
         use crate::layout::{DrawCommand, Proposal, Size};
-        let result = runtime.layout(form, Proposal::exact(Size { width: 240.0, height: 60.0 }));
+        let result = runtime.layout(form, Proposal::exact(Size { width: 240.0, height: 60.0 }),
+            )
+            .unwrap();
         let field = result.fields.first().expect("the field is placed").clone();
         let x = result
             .display
@@ -17827,22 +18167,25 @@ mod tests {
     fn a_hebrew_line_puts_the_caret_at_its_logical_place() {
         use crate::text_input::EditCommand;
         // four letters, 8 px each in the house font: a run of 32
-        let form = Form { name: State::new("שלום".to_string()) };
+        let form = Form { name: State::new("שלום".to_string()),
+        };
         let runtime = Runtime::new();
         runtime.render_stable(&form);
         let (x, field) = field_run(&runtime, &form);
         assert_eq!(x, field.run.origin.x, "anchored at the scene's left edge");
         let y = field.frame.origin.y + field.frame.size.height / 2.0;
         // a click at the LEFT end of the line is a click at its end
-        runtime.pointer_pressed(field.run.origin.x + 1.0, y);
+        runtime.pointer_pressed(field.run.origin.x + 1.0, y)
+            .unwrap();
         runtime.pointer_released(field.run.origin.x + 1.0, y);
-        let caret = runtime.ime_snapshot().expect("focused").caret_rect.origin.x;
+        let caret = runtime.ime_snapshot().unwrap().expect("focused").caret_rect.origin.x;
         assert_eq!(caret, field.run.origin.x, "after the last letter: the left end");
         // one step back toward the start walks RIGHT, one letter
-        runtime.key(EditCommand::Left(false));
-        let caret = runtime.ime_snapshot().expect("focused").caret_rect.origin.x;
+        runtime.key(EditCommand::Left(false)).unwrap();
+        let caret = runtime.ime_snapshot()
+            .unwrap().expect("focused").caret_rect.origin.x;
         assert_eq!(caret, field.run.origin.x + 8.0);
-        assert_eq!(runtime.ime_rect_for(3).expect("a rect").origin.x, field.run.origin.x + 8.0);
+        assert_eq!(runtime.ime_rect_for(3).unwrap().expect("a rect").origin.x, field.run.origin.x + 8.0);
     }
 
     /// A click in a right-to-left line lands on the byte under the hand:
@@ -17850,27 +18193,28 @@ mod tests {
     #[test]
     fn a_click_in_an_rtl_field_lands_on_the_byte_under_the_hand() {
         use crate::text_input::EditCommand;
-        let form = Form { name: State::new("שלום".to_string()) };
+        let form = Form { name: State::new("שלום".to_string()),
+        };
         let runtime = Runtime::new();
         runtime.render_stable(&form);
         let (_, field) = field_run(&runtime, &form);
         let y = field.frame.origin.y + field.frame.size.height / 2.0;
         // a point just inside the right end: before the first letter
         let start = field.run.origin.x + 31.0;
-        runtime.pointer_pressed(start, y);
+        runtime.pointer_pressed(start, y).unwrap();
         runtime.pointer_released(start, y);
-        runtime.key(EditCommand::Insert("א".into()));
+        runtime.key(EditCommand::Insert("א".into())).unwrap();
         assert_eq!(form.name.get(), "אשלום");
         // five letters now, a run of 40: a point between the second and
         // the third letter from the right
         let (_, field) = field_run(&runtime, &form);
         let between = field.run.origin.x + 40.0 - 17.0;
-        runtime.pointer_pressed(between, y);
+        runtime.pointer_pressed(between, y).unwrap();
         runtime.pointer_released(between, y);
-        runtime.key(EditCommand::Insert("ב".into()));
+        runtime.key(EditCommand::Insert("ב".into())).unwrap();
         assert_eq!(form.name.get(), "אשבלום");
         // six letters now: three stand to the right of the same point
-        assert_eq!(runtime.ime_index_at(between, y), Some(3), "the index under the hand, in UTF-16");
+        assert_eq!(runtime.ime_index_at(between, y).unwrap(), Some(3), "the index under the hand, in UTF-16");
     }
 
     /// The shell's insets reach a BODY, and the keyboard's band stays its
@@ -17909,15 +18253,15 @@ mod tests {
 
         let runtime = Runtime::new();
         let size = Size { width: 390.0, height: 844.0 };
-        assert_eq!(first_line(&runtime.display_frame(&Reader, size)), "0 0 0", "a desktop has none");
+        assert_eq!(first_line(&runtime.display_frame(&Reader, size).unwrap()), "0 0 0", "a desktop has none");
 
         runtime.set_safe_area(Edges { top: 59.0, trailing: 0.0, bottom: 34.0, leading: 0.0 });
         assert_eq!(
-            first_line(&runtime.display_frame(&Reader, size)),
+            first_line(&runtime.display_frame(&Reader, size).unwrap()),
             "59 34 0",
             "the phone's bands reach the body",
         );
-        let _ = runtime.display_frame(&Reader, size);
+        let _ = runtime.display_frame(&Reader, size).unwrap();
         assert!(runtime.body_runs().is_empty(), "and settle");
 
         // The keyboard rises: its own number moves and the safe area's does
@@ -17925,13 +18269,13 @@ mod tests {
         // needed the merged number could compute it and a body that needs
         // them apart could not recover them.
         runtime.set_keyboard_inset(291.0);
-        assert_eq!(first_line(&runtime.display_frame(&Reader, size)), "59 34 291");
+        assert_eq!(first_line(&runtime.display_frame(&Reader, size).unwrap()), "59 34 291");
 
         // An unchanged value costs nothing: no environment move, no re-run.
-        let _ = runtime.display_frame(&Reader, size);
+        let _ = runtime.display_frame(&Reader, size).unwrap();
         runtime.set_safe_area(Edges { top: 59.0, trailing: 0.0, bottom: 34.0, leading: 0.0 });
         runtime.set_keyboard_inset(291.0);
-        let _ = runtime.display_frame(&Reader, size);
+        let _ = runtime.display_frame(&Reader, size).unwrap();
         assert!(runtime.body_runs().is_empty(), "nothing moved, nothing ran");
     }
 
@@ -17962,17 +18306,17 @@ mod tests {
         let view = Row { opened: State::new(0) };
         let runtime = Runtime::new();
         let size = Size { width: 300.0, height: 200.0 };
-        let _ = runtime.display_frame(&view, size);
+        let _ = runtime.display_frame(&view, size).unwrap();
 
-        runtime.touch_began(1, 30.0, 8.0, 1);
+        runtime.touch_began(1, 30.0, 8.0, 1).unwrap();
         assert!(runtime.wants_frame(), "a still press listens for the menu on the clock");
-        let _ = runtime.tick(0.3);
+        let _ = runtime.tick(0.3).unwrap();
         assert!(runtime.interaction().menu.is_none());
-        let held = runtime.tick(0.3);
+        let held = runtime.tick(0.3).unwrap();
         assert!(held.input, "the clock reached the app");
         assert!(runtime.interaction().menu.is_some(), "the menu opened under the finger");
         assert_eq!(runtime.interaction().pressed, None, "the press was taken back");
-        runtime.touch_ended(1, 30.0, 8.0);
+        runtime.touch_ended(1, 30.0, 8.0).unwrap();
         assert!(runtime.interaction().menu.is_some(), "the lift after a menu is spent");
         assert_eq!(view.opened.get(), 0);
     }
@@ -18007,7 +18351,7 @@ mod tests {
         let runtime = Runtime::new();
         let size = Size { width: 402.0, height: 874.0 };
         runtime.set_safe_area(Edges { top: 62.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
-        let display = runtime.display_frame(&Page, size);
+        let display = runtime.display_frame(&Page, size).unwrap();
         let rect_of = |wanted: Color| {
             display
                 .iter()
@@ -18092,7 +18436,7 @@ mod input_focus_policy_tests {
             width: 400.0,
             height: 200.0,
         });
-        let _ = runtime.settled_layout(&view, proposal);
+        let _ = runtime.settled_layout(&view, proposal).unwrap();
         assert!(runtime.focus_named("one"));
         assert!(runtime.focus_named("one"));
         assert_eq!(*first.0.borrow(), [true]);
@@ -18103,20 +18447,20 @@ mod input_focus_policy_tests {
         assert_eq!(*second.0.borrow(), [true, false]);
         runtime.focus_named("one");
         view.wrapped.set(true);
-        let _ = runtime.settled_layout(&view, proposal);
+        let _ = runtime.settled_layout(&view, proposal).unwrap();
         assert_eq!(
             *first.0.borrow(),
             [true, false, true],
             "migration preserves focus"
         );
         view.enabled.set(false);
-        let _ = runtime.settled_layout(&view, proposal);
+        let _ = runtime.settled_layout(&view, proposal).unwrap();
         assert_eq!(*first.0.borrow(), [true, false, true, false]);
         view.enabled.set(true);
-        let _ = runtime.settled_layout(&view, proposal);
+        let _ = runtime.settled_layout(&view, proposal).unwrap();
         assert_eq!(*first.0.borrow(), [true, false, true, false, true]);
         view.shown.set(false);
-        let _ = runtime.settled_layout(&view, proposal);
+        let _ = runtime.settled_layout(&view, proposal).unwrap();
         assert_eq!(*first.0.borrow(), [true, false, true, false, true, false]);
         assert!(runtime.focused().is_none());
     }

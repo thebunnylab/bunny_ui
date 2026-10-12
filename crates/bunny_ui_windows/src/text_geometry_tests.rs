@@ -54,7 +54,8 @@ fn mixed_geometry_runtime_matches_native_range_boxes() {
                 width: 600.,
                 height: 100.,
             }),
-        );
+        )
+            .unwrap();
         let field = &layout.fields[0];
         runtime.focus_named("field");
         let byte = text.find('ב').unwrap();
@@ -64,9 +65,10 @@ fn mixed_geometry_runtime_matches_native_range_boxes() {
         let native = &boxes[0];
         assert_eq!(native.bidi_level % 2, 1);
         let expected = field.text_origin.x + f64::from(native.left + native.width);
-        close(runtime.ime_rect_for(index).unwrap().origin.x, expected);
+        close(runtime.ime_rect_for(index).unwrap().unwrap().origin.x, expected);
         assert_eq!(
-            runtime.ime_index_at(expected, field.run.origin.y + 5.),
+            runtime.ime_index_at(expected, field.run.origin.y + 5.)
+                .unwrap(),
             Some(index)
         );
     }

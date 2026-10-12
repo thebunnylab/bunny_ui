@@ -15,12 +15,13 @@ fn typing_stays_solid_and_idle_blinking_resumes_without_a_new_clock() {
         height: 40.0,
     });
     runtime.render_stable(&view);
-    let field = runtime.layout(&view, proposal).fields[0].path.clone();
+    let field = runtime.layout(&view, proposal).unwrap().fields[0].path.clone();
     runtime.focus(&field);
     let visible = || {
         runtime.render_stable(&view);
         runtime
             .layout(&view, proposal)
+            .unwrap()
             .display
             .iter()
             .any(|command| {
@@ -30,7 +31,8 @@ fn typing_stays_solid_and_idle_blinking_resumes_without_a_new_clock() {
     };
     assert!(visible());
     for _ in 0..8 {
-        assert!(runtime.key(EditCommand::Insert("x".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("x".into())).unwrap()
+                .applied);
         assert!(
             !runtime.blink(),
             "a beat immediately after field input must not hide its caret"
@@ -39,21 +41,22 @@ fn typing_stays_solid_and_idle_blinking_resumes_without_a_new_clock() {
     }
     assert!(runtime.blink(), "the next quiet beat starts the off phase");
     assert!(!visible());
-    assert!(runtime.key(EditCommand::Read).applied);
-    assert!(runtime.key(EditCommand::Copy).applied);
+    assert!(runtime.key(EditCommand::Read).unwrap().applied);
+    assert!(runtime.key(EditCommand::Copy).unwrap().applied);
     assert!(!visible(), "observational reads must not restart the caret");
     assert!(runtime.blink());
     assert!(visible());
     assert!(runtime.blink());
     assert!(!visible());
-    assert!(runtime.key(EditCommand::Insert("!".into())).applied);
+    assert!(runtime.key(EditCommand::Insert("!".into())).unwrap()
+            .applied);
     assert!(visible(), "input immediately restores a hidden caret");
     assert!(!runtime.blink());
     assert!(visible());
     assert!(runtime.blink());
     assert!(!visible());
     assert_eq!(
-        &*runtime.ime_snapshot().expect("focused field").text,
+        &*runtime.ime_snapshot().unwrap().expect("focused field").text,
         "xxxxxxxx!"
     );
     runtime.blur();

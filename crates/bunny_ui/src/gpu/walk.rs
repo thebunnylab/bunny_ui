@@ -358,6 +358,45 @@ pub const ATLAS_KEEP_WALKS: u64 = 8;
 #[derive(Debug)]
 pub struct AtlasFull;
 
+/// A frame could not be prepared for presentation.
+#[derive(Debug)]
+pub enum RenderError {
+    /// GPU texture capacity can be retried after draining and resetting it.
+    AtlasFull,
+    /// Native text failed; resetting the atlas cannot repair this failure.
+    Text(crate::text_error::TextError),
+}
+
+impl From<AtlasFull> for RenderError {
+    fn from(_: AtlasFull) -> Self {
+        Self::AtlasFull
+    }
+}
+
+impl From<crate::text_error::TextError> for RenderError {
+    fn from(error: crate::text_error::TextError) -> Self {
+        Self::Text(error)
+    }
+}
+
+impl std::fmt::Display for RenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AtlasFull => f.write_str("the GPU atlas is full"),
+            Self::Text(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for RenderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Text(error) => Some(error),
+            Self::AtlasFull => None,
+        }
+    }
+}
+
 // Source keys have their own budget; GPU texels are managed independently.
 const ATLAS_SOURCE_LIMIT: usize = 16 * 1024 * 1024;
 
@@ -629,6 +668,9 @@ impl RunAtlas {
     /// The tiles for one run — warm from the map, or rasterized by the
     /// engine, chunked and uploaded. `Ok(None)` means the engine had
     /// nothing to paint (the CPU path skips those too).
+    ///
+    /// # Errors
+    /// Returns a text error or atlas exhaustion if the frame cannot be prepared.
     pub fn resolve(
         &mut self,
         ground: &mut dyn AtlasGround,
@@ -637,9 +679,11 @@ impl RunAtlas {
         color: Color,
         scale: usize,
         engine: &dyn TextEngine,
-    ) -> Result<Option<&RunEntry>, AtlasFull> {
+    ) -> Result<Option<&RunEntry>, RenderError> {
         let content = crate::text_source::TextContent::from(slice);
-        let Ok(line) = content.line(0..slice.len()) else { return Ok(None) };
+        let line = content
+            .line(0..slice.len())
+            .map_err(crate::text_error::TextError::from)?;
         self.resolve_paragraph(ground, &line, font, color, scale, engine)
     }
 
@@ -657,7 +701,7 @@ impl RunAtlas {
         color: Color,
         scale: usize,
         engine: &dyn TextEngine,
-    ) -> Result<Option<&RunEntry>, AtlasFull> {
+    ) -> Result<Option<&RunEntry>, RenderError> {
         self.transient = None;
         let scale_key = u32::try_from(scale).map_err(|_| AtlasFull)?;
         let key = font.key();
@@ -672,11 +716,11 @@ impl RunAtlas {
             })
         });
         if !warm {
-            let Some(raster) = engine.raster_paragraph_line(line, font, color, scale) else {
+            let Some(raster) = engine.raster_paragraph_line(line, font, color, scale)? else {
                 return Ok(None);
             };
             if !ground.ensure_shared(self.size) {
-                return Err(AtlasFull);
+                return Err(RenderError::AtlasFull);
             }
             let width = raster.width as u32;
             let height = raster.height as u32;
@@ -685,7 +729,7 @@ impl RunAtlas {
             while chunk_x < width {
                 let chunk_width = (width - chunk_x).min(ATLAS_CHUNK_WIDTH);
                 let Some((x, y)) = self.packer.place(chunk_width, height) else {
-                    return Err(AtlasFull);
+                    return Err(RenderError::AtlasFull);
                 };
                 ground.upload_shared(
                     x,
@@ -695,7 +739,12 @@ impl RunAtlas {
                     &raster.rgba[chunk_x as usize * 4..],
                     raster.width as u32,
                 );
-                tiles.push(Tile { x, y, width: chunk_width, height });
+                tiles.push(Tile {
+                    x,
+                    y,
+                    width: chunk_width,
+                    height,
+                });
                 chunk_x += chunk_width;
             }
             let mut entry = RunEntry {
@@ -710,7 +759,12 @@ impl RunAtlas {
             };
             // Metadata eviction never touches uploaded texels or frame instances.
             // Oversized context is never retained; its tiles still serve this draw.
-            let weight = line.paragraph().text().len().saturating_mul(24).saturating_add(256);
+            let weight = line
+                .paragraph()
+                .text()
+                .len()
+                .saturating_mul(24)
+                .saturating_add(256);
             if weight > ATLAS_SOURCE_LIMIT {
                 entry.content = None;
                 self.transient = Some(entry);
@@ -1130,6 +1184,9 @@ pub struct FrameBatches {
 /// `Err(AtlasFull)` asks the caller to drain, reset the atlas and walk
 /// again.
 #[allow(clippy::too_many_arguments)]
+///
+/// # Errors
+/// Returns a text error or atlas exhaustion if the frame cannot be prepared.
 pub fn build_frame(
     ground: &mut dyn AtlasGround,
     display: &DisplayList,
@@ -1139,7 +1196,7 @@ pub fn build_frame(
     images: &dyn ImageEngine,
     atlas: &mut RunAtlas,
     batches: &mut FrameBatches,
-) -> Result<(), AtlasFull> {
+) -> Result<(), RenderError> {
     atlas.begin_walk();
     batches.rects.clear();
     batches.sprites.clear();
@@ -1159,8 +1216,14 @@ pub fn build_frame(
     let mut glass_batch: Option<Box4> = None;
     for command in display.iter() {
         match command {
-            DrawCommand::FillRect { rect, color, corner_radius } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
+            DrawCommand::FillRect {
+                rect,
+                color,
+                corner_radius,
+            } => {
+                let Some(clip) = effective_clip(&clips, whole) else {
+                    continue;
+                };
                 let snapped = snap_scaled(*rect, factor);
                 if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
                     continue;
@@ -1170,10 +1233,22 @@ pub fn build_frame(
                 }
                 let radii = corner_clamp(corner_radius * factor, snapped);
                 push_rect(out, snapped, clip, *color, radii, 0.0, KIND_FILL, 0.0);
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1, rect_box(&out[out.len() - 1]));
+                note_run(
+                    &mut batches.runs,
+                    RunKind::Rects,
+                    round_of(&clips),
+                    out.len() - 1,
+                    rect_box(&out[out.len() - 1]),
+                );
             }
-            DrawCommand::Backdrop { rect, glass, corner_radius } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
+            DrawCommand::Backdrop {
+                rect,
+                glass,
+                corner_radius,
+            } => {
+                let Some(clip) = effective_clip(&clips, whole) else {
+                    continue;
+                };
                 let snapped = snap_scaled(*rect, factor);
                 if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
                     continue;
@@ -1184,7 +1259,12 @@ pub fn build_frame(
                 let radii = corner_clamp(corner_radius * factor, snapped);
                 let paint = glass.scaled(factor);
                 batches.glass.push(GlassInstance {
-                    rect: [snapped.0 as f32, snapped.1 as f32, snapped.2 as f32, snapped.3 as f32],
+                    rect: [
+                        snapped.0 as f32,
+                        snapped.1 as f32,
+                        snapped.2 as f32,
+                        snapped.3 as f32,
+                    ],
                     clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
                     radii: wire_radii(radii),
                     lens: [
@@ -1224,8 +1304,14 @@ pub fn build_frame(
                     &mut glass_batch,
                 );
             }
-            DrawCommand::Gradient { rect, paint, corner_radius } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
+            DrawCommand::Gradient {
+                rect,
+                paint,
+                corner_radius,
+            } => {
+                let Some(clip) = effective_clip(&clips, whole) else {
+                    continue;
+                };
                 let snapped = snap_scaled(*rect, factor);
                 if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
                     continue;
@@ -1268,26 +1354,42 @@ pub fn build_frame(
                     // the line's two ends fill the four numbers the
                     // struct still had: its start in the params, its
                     // end in the point — the quad stays the box
-                    crate::layout::GradientPaint::Linear { start, end, from, to } => {
-                        push_gradient(
-                            out,
-                            snapped,
-                            clip,
-                            from,
-                            to,
-                            radii,
-                            0.0,
-                            start.x,
-                            start.y,
-                            (end.x, end.y),
-                            KIND_LINEAR,
-                        )
-                    }
+                    crate::layout::GradientPaint::Linear {
+                        start,
+                        end,
+                        from,
+                        to,
+                    } => push_gradient(
+                        out,
+                        snapped,
+                        clip,
+                        from,
+                        to,
+                        radii,
+                        0.0,
+                        start.x,
+                        start.y,
+                        (end.x, end.y),
+                        KIND_LINEAR,
+                    ),
                 }
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1, rect_box(&out[out.len() - 1]));
+                note_run(
+                    &mut batches.runs,
+                    RunKind::Rects,
+                    round_of(&clips),
+                    out.len() - 1,
+                    rect_box(&out[out.len() - 1]),
+                );
             }
-            DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
+            DrawCommand::StrokeRect {
+                rect,
+                color,
+                width,
+                corner_radius,
+            } => {
+                let Some(clip) = effective_clip(&clips, whole) else {
+                    continue;
+                };
                 let snapped = snap_scaled(*rect, factor);
                 if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
                     continue;
@@ -1299,11 +1401,33 @@ pub fn build_frame(
                 // one device pixel, rounded once
                 let thickness = (width * factor).max(1.0).round();
                 let radii = corner_clamp(corner_radius * factor, snapped);
-                push_rect(out, snapped, clip, *color, radii, thickness, KIND_STROKE, 0.0);
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1, rect_box(&out[out.len() - 1]));
+                push_rect(
+                    out,
+                    snapped,
+                    clip,
+                    *color,
+                    radii,
+                    thickness,
+                    KIND_STROKE,
+                    0.0,
+                );
+                note_run(
+                    &mut batches.runs,
+                    RunKind::Rects,
+                    round_of(&clips),
+                    out.len() - 1,
+                    rect_box(&out[out.len() - 1]),
+                );
             }
-            DrawCommand::Shadow { rect, radius, color, corner_radius } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
+            DrawCommand::Shadow {
+                rect,
+                radius,
+                color,
+                corner_radius,
+            } => {
+                let Some(clip) = effective_clip(&clips, whole) else {
+                    continue;
+                };
                 let snapped = snap_scaled(*rect, factor);
                 // reach stays unrounded for the falloff; its rounding
                 // only sizes the quad (the cpu loop bound) — any pixel
@@ -1320,12 +1444,37 @@ pub fn build_frame(
                 if box_intersect(expanded, clip).is_none() {
                     continue;
                 }
-                push_rect(out, expanded, clip, *color, corner, reach, KIND_SHADOW, reach_px as f64);
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1, rect_box(&out[out.len() - 1]));
+                push_rect(
+                    out,
+                    expanded,
+                    clip,
+                    *color,
+                    corner,
+                    reach,
+                    KIND_SHADOW,
+                    reach_px as f64,
+                );
+                note_run(
+                    &mut batches.runs,
+                    RunKind::Rects,
+                    round_of(&clips),
+                    out.len() - 1,
+                    rect_box(&out[out.len() - 1]),
+                );
             }
-            DrawCommand::TextLine { origin, content, range, color, font } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
-                let Ok(line) = content.line(range.0..range.1) else { continue };
+            DrawCommand::TextLine {
+                origin,
+                content,
+                range,
+                color,
+                font,
+            } => {
+                let Some(clip) = effective_clip(&clips, whole) else {
+                    continue;
+                };
+                let line = content
+                    .line(range.0..range.1)
+                    .map_err(crate::text_error::TextError::from)?;
                 let slice = line.text();
                 // the composite_text mirror: one snap of the logical
                 // origin, texels copied 1:1 from there
@@ -1346,12 +1495,17 @@ pub fn build_frame(
                 if base_x + reach_x <= clip.0 || base_y + reach_y <= clip.1 {
                     continue;
                 }
-                let Some(entry) = atlas.resolve_paragraph(ground, &line, font, *color, scale, engine)?
+                let Some(entry) =
+                    atlas.resolve_paragraph(ground, &line, font, *color, scale, engine)?
                 else {
                     continue;
                 };
-                let dest =
-                    (base_x, base_y, base_x + entry.width as i64, base_y + entry.height as i64);
+                let dest = (
+                    base_x,
+                    base_y,
+                    base_x + entry.width as i64,
+                    base_y + entry.height as i64,
+                );
                 if box_intersect(dest, clip).is_none() {
                     continue;
                 }
@@ -1368,7 +1522,12 @@ pub fn build_frame(
                         continue;
                     }
                     batches.sprites.push(SpriteInstance {
-                        dest: [chunk.0 as f32, chunk.1 as f32, chunk.2 as f32, chunk.3 as f32],
+                        dest: [
+                            chunk.0 as f32,
+                            chunk.1 as f32,
+                            chunk.2 as f32,
+                            chunk.3 as f32,
+                        ],
                         tex: [
                             tile.x as f32,
                             tile.y as f32,
@@ -1387,7 +1546,9 @@ pub fn build_frame(
                 }
             }
             DrawCommand::Image { rect, source } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
+                let Some(clip) = effective_clip(&clips, whole) else {
+                    continue;
+                };
                 let width = physical_extent(rect.size.width, scale) as u32;
                 let height = physical_extent(rect.size.height, scale) as u32;
                 if width == 0 || height == 0 {
@@ -1397,7 +1558,12 @@ pub fn build_frame(
                 // origin, texels pasted 1:1 from there
                 let base_x = (rect.origin.x * factor).round() as i64;
                 let base_y = (rect.origin.y * factor).round() as i64;
-                let dest = (base_x, base_y, base_x + width as i64, base_y + height as i64);
+                let dest = (
+                    base_x,
+                    base_y,
+                    base_x + width as i64,
+                    base_y + height as i64,
+                );
                 if box_intersect(dest, clip).is_none() {
                     continue;
                 }
@@ -1429,12 +1595,7 @@ pub fn build_frame(
                                     (tile.x + tile.width) as f32,
                                     (tile.y + tile.height) as f32,
                                 ],
-                                clip: [
-                                    clip.0 as f32,
-                                    clip.1 as f32,
-                                    clip.2 as f32,
-                                    clip.3 as f32,
-                                ],
+                                clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
                             });
                             note_run(
                                 &mut batches.runs,
@@ -1491,7 +1652,10 @@ pub fn build_frame(
                     }
                 }
             }
-            DrawCommand::PushClip { rect, corner_radius } => {
+            DrawCommand::PushClip {
+                rect,
+                corner_radius,
+            } => {
                 let snapped = snap_scaled(*rect, factor);
                 let cut = match clips.last().copied() {
                     Some((top, _)) => box_intersect(snapped, top)
@@ -2030,8 +2194,8 @@ mod tests {
             );
             match walked {
                 Ok(()) => return true,
-                Err(AtlasFull) if attempt < 3 => atlas.reset(ground, true),
-                Err(AtlasFull) => return false,
+                Err(RenderError::AtlasFull) if attempt < 3 => atlas.reset(ground, true),
+                Err(RenderError::AtlasFull | RenderError::Text(_)) => return false,
             }
         }
         false

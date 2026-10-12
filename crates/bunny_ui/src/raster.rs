@@ -852,26 +852,48 @@ fn scale_rect(rect: Rect, scale: f64) -> Rect {
 
 /// Paints the list in order — whoever comes later paints on top. Text
 /// comes from the house pixel font (the default engine).
-pub fn rasterize(display: &DisplayList, width: usize, height: usize, background: Color) -> Bitmap {
+///
+/// # Errors
+/// Returns a text or range error if contextual text cannot be prepared or used.
+pub fn rasterize(
+    display: &DisplayList,
+    width: usize,
+    height: usize,
+    background: Color,
+) -> Result<Bitmap, crate::text_error::TextError> {
     rasterize_scaled(display, width, height, 1, background)
 }
 
 /// Like [`rasterize`], but with `width`/`height` in PHYSICAL pixels and
 /// the display list's logical coordinates multiplied by `scale` — the
 /// retina path (the backend asks the window for its scale factor).
+///
+/// # Errors
+/// Returns a text or range error if contextual text cannot be prepared or used.
 pub fn rasterize_scaled(
     display: &DisplayList,
     width: usize,
     height: usize,
     scale: usize,
     background: Color,
-) -> Bitmap {
-    rasterize_with(display, width, height, scale, background, &PixelFont, &RawImages::default())
+) -> Result<Bitmap, crate::text_error::TextError> {
+    rasterize_with(
+        display,
+        width,
+        height,
+        scale,
+        background,
+        &PixelFont,
+        &RawImages::default(),
+    )
 }
 
 /// The full path: paints the list with the frame's [`TextEngine`] and
 /// [`ImageEngine`] — it is what the `Runtime` calls (the house engines
 /// in headless, the platform's on a shell).
+///
+/// # Errors
+/// Returns a text or range error if contextual text cannot be prepared or used.
 pub fn rasterize_with(
     display: &DisplayList,
     width: usize,
@@ -880,8 +902,10 @@ pub fn rasterize_with(
     background: Color,
     text: &dyn TextEngine,
     images: &dyn ImageEngine,
-) -> Bitmap {
-    rasterize_over(display, width, height, scale, background, text, images, None)
+) -> Result<Bitmap, crate::text_error::TextError> {
+    rasterize_over(
+        display, width, height, scale, background, text, images, None,
+    )
 }
 
 /// A single opaque square fill needs no transparent canvas around its ink.
@@ -924,10 +948,13 @@ pub(crate) fn compact_live_fill(
 /// surface by the CONTENT instead of the window (a toast's segment
 /// rasterizes a toast, never a screen). Clips are ignored on purpose:
 /// a superset stays safe. `None` = the list paints nothing at all.
+///
+/// # Errors
+/// Returns a text or range error if contextual text cannot be prepared or used.
 pub fn list_bounds(
     display: &DisplayList,
     text: &dyn TextEngine,
-) -> Option<crate::layout::Rect> {
+) -> Result<Option<crate::layout::Rect>, crate::text_error::TextError> {
     let cache = crate::text_engine::MeasureCache::default();
     let mut bounds: Option<(f64, f64, f64, f64)> = None;
     let mut fold = |x0: f64, y0: f64, x1: f64, y1: f64| {
@@ -966,9 +993,15 @@ pub fn list_bounds(
                     rect.origin.y + rect.size.height + reach,
                 );
             }
-            DrawCommand::TextLine { origin, content, range, font, .. } => {
-                let Ok(line) = content.line(range.0..range.1) else { continue };
-                let metrics = cache.get_or_measure_paragraph(&line, font, text);
+            DrawCommand::TextLine {
+                origin,
+                content,
+                range,
+                font,
+                ..
+            } => {
+                let line = content.line(range.0..range.1)?;
+                let metrics = cache.get_or_measure_paragraph(&line, font, text)?;
                 // a point of slack per edge: measure vs raster
                 // rounding never crosses it, and a superset is safe
                 fold(
@@ -981,10 +1014,13 @@ pub fn list_bounds(
             DrawCommand::PushClip { .. } | DrawCommand::PopClip => {}
         }
     }
-    bounds.map(|(x0, y0, x1, y1)| crate::layout::Rect {
+    Ok(bounds.map(|(x0, y0, x1, y1)| crate::layout::Rect {
         origin: Point { x: x0, y: y0 },
-        size: crate::layout::Size { width: x1 - x0, height: y1 - y0 },
-    })
+        size: crate::layout::Size {
+            width: x1 - x0,
+            height: y1 - y0,
+        },
+    }))
 }
 
 /// Does anything `display[range]` paints land inside `rect`? The
@@ -1166,7 +1202,13 @@ pub fn carve_covering(
 ///
 /// Its dimensions must match `width` × `height`; a mismatch is ignored rather
 /// than stretched.
-#[expect(clippy::too_many_arguments, reason = "a rasterizer takes what it takes")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a rasterizer takes what it takes"
+)]
+///
+/// # Errors
+/// Returns a text or range error if contextual text cannot be prepared or used.
 pub fn rasterize_over(
     display: &DisplayList,
     width: usize,
@@ -1176,7 +1218,7 @@ pub fn rasterize_over(
     text: &dyn TextEngine,
     images: &dyn ImageEngine,
     beneath: Option<&Bitmap>,
-) -> Bitmap {
+) -> Result<Bitmap, crate::text_error::TextError> {
     let mut bitmap = Bitmap::new(width, height, background);
     bitmap.beneath = beneath
         .filter(|under| under.width == width && under.height == height)
@@ -1184,35 +1226,60 @@ pub fn rasterize_over(
     let factor = scale as f64;
     for command in display.iter() {
         match command {
-            DrawCommand::FillRect { rect, color, corner_radius } => {
-                bitmap.fill_rect(scale_rect(*rect, factor), *color, corner_radius * factor)
-            }
-            DrawCommand::Gradient { rect, paint, corner_radius } => bitmap.fill_gradient(
+            DrawCommand::FillRect {
+                rect,
+                color,
+                corner_radius,
+            } => bitmap.fill_rect(scale_rect(*rect, factor), *color, corner_radius * factor),
+            DrawCommand::Gradient {
+                rect,
+                paint,
+                corner_radius,
+            } => bitmap.fill_gradient(
                 scale_rect(*rect, factor),
                 paint.scaled(factor),
                 corner_radius * factor,
             ),
-            DrawCommand::Backdrop { rect, glass, corner_radius } => bitmap.glass_pane(
+            DrawCommand::Backdrop {
+                rect,
+                glass,
+                corner_radius,
+            } => bitmap.glass_pane(
                 scale_rect(*rect, factor),
                 glass.scaled(factor),
                 corner_radius * factor,
             ),
-            DrawCommand::StrokeRect { rect, color, width, corner_radius } => bitmap
-                .stroke_rect(
-                    scale_rect(*rect, factor),
-                    *color,
-                    width * factor,
-                    corner_radius * factor,
-                ),
-            DrawCommand::Shadow { rect, radius, color, corner_radius } => bitmap.shadow_rect(
+            DrawCommand::StrokeRect {
+                rect,
+                color,
+                width,
+                corner_radius,
+            } => bitmap.stroke_rect(
+                scale_rect(*rect, factor),
+                *color,
+                width * factor,
+                corner_radius * factor,
+            ),
+            DrawCommand::Shadow {
+                rect,
+                radius,
+                color,
+                corner_radius,
+            } => bitmap.shadow_rect(
                 scale_rect(*rect, factor),
                 *color,
                 radius * factor,
                 corner_radius * factor,
             ),
-            DrawCommand::TextLine { origin, content, range, color, font } => {
-                let Ok(line) = content.line(range.0..range.1) else { continue };
-                if let Some(raster) = text.raster_paragraph_line(&line, font, *color, scale) {
+            DrawCommand::TextLine {
+                origin,
+                content,
+                range,
+                color,
+                font,
+            } => {
+                let line = content.line(range.0..range.1)?;
+                if let Some(raster) = text.raster_paragraph_line(&line, font, *color, scale)? {
                     bitmap.composite_text(origin.x, origin.y, scale, &raster);
                 }
             }
@@ -1247,13 +1314,14 @@ pub fn rasterize_over(
                     );
                 }
             }
-            DrawCommand::PushClip { rect, corner_radius } => {
-                bitmap.push_clip(scale_rect(*rect, factor), corner_radius * factor)
-            }
+            DrawCommand::PushClip {
+                rect,
+                corner_radius,
+            } => bitmap.push_clip(scale_rect(*rect, factor), corner_radius * factor),
             DrawCommand::PopClip => bitmap.pop_clip(),
         }
     }
-    bitmap
+    Ok(bitmap)
 }
 
 // MARK: - Surface (incremental repaint by damage regions)
@@ -1294,7 +1362,7 @@ fn command_box(
     whole: DamageRect,
     cache: &crate::text_engine::MeasureCache,
     text: &dyn TextEngine,
-) -> Option<DamageRect> {
+) -> Result<Option<DamageRect>, crate::text_error::TextError> {
     let raw = match command {
         DrawCommand::FillRect { rect, .. }
         | DrawCommand::StrokeRect { rect, .. }
@@ -1305,9 +1373,15 @@ fn command_box(
             let reach = (radius * factor).max(1.0).round() as i64;
             (x0 - reach, y0 - reach, x1 + reach, y1 + reach)
         }
-        DrawCommand::TextLine { origin, content, range, font, .. } => {
-            let line = content.line(range.0..range.1).ok()?;
-            let metrics = cache.get_or_measure_paragraph(&line, font, text);
+        DrawCommand::TextLine {
+            origin,
+            content,
+            range,
+            font,
+            ..
+        } => {
+            let line = content.line(range.0..range.1)?;
+            let metrics = cache.get_or_measure_paragraph(&line, font, text)?;
             let x = (origin.x * factor).round() as i64;
             let y = (origin.y * factor).round() as i64;
             // +2px of slack per edge: measure vs raster rounding
@@ -1326,13 +1400,16 @@ fn command_box(
         // nested cuts only ever REMOVE coverage). Identical clips
         // in the prefix and suffix contribute nothing, as ever.
         DrawCommand::PushClip { rect, .. } => Bitmap::snap(scale_rect(*rect, factor)),
-        DrawCommand::PopClip => return None,
+        DrawCommand::PopClip => return Ok(None),
     };
     let clipped = match clip {
-        Some(clip) => intersect(raw, clip)?,
+        Some(clip) => match intersect(raw, clip) {
+            Some(clipped) => clipped,
+            None => return Ok(None),
+        },
         None => raw,
     };
-    intersect(clipped, whole)
+    Ok(intersect(clipped, whole))
 }
 
 /// Walks `commands[..upto]` keeping the physical clip stack; calls
@@ -1341,18 +1418,17 @@ fn walk_clips(
     commands: &[DrawCommand],
     upto: usize,
     factor: f64,
-    mut visit: impl FnMut(usize, Option<DamageRect>),
-) {
+    mut visit: impl FnMut(usize, Option<DamageRect>) -> Result<(), crate::text_error::TextError>,
+) -> Result<(), crate::text_error::TextError> {
     let mut stack: Vec<DamageRect> = Vec::new();
     for (index, command) in commands[..upto].iter().enumerate() {
-        visit(index, stack.last().copied());
+        visit(index, stack.last().copied())?;
         match command {
             DrawCommand::PushClip { rect, .. } => {
                 let snapped = Bitmap::snap(scale_rect(*rect, factor));
                 let top = match stack.last().copied() {
-                    Some(top) => {
-                        intersect(snapped, top).unwrap_or((snapped.0, snapped.1, snapped.0, snapped.1))
-                    }
+                    Some(top) => intersect(snapped, top)
+                        .unwrap_or((snapped.0, snapped.1, snapped.0, snapped.1)),
                     None => snapped,
                 };
                 stack.push(top);
@@ -1363,6 +1439,7 @@ fn walk_clips(
             _ => {}
         }
     }
+    Ok(())
 }
 
 /// What a list paints differently from the one already on screen — the
@@ -1388,6 +1465,9 @@ pub enum ListDamage {
 /// answered `Whole` before one box is measured. Changes that land
 /// outside every clip (a row appended below the fold) box to nothing,
 /// and the answer is `Same`.
+///
+/// # Errors
+/// Returns a text or range error if contextual text cannot be prepared or used.
 pub fn list_damage(
     old: &[DrawCommand],
     new: &[DrawCommand],
@@ -1396,13 +1476,13 @@ pub fn list_damage(
     limit: usize,
     cache: &crate::text_engine::MeasureCache,
     text: &dyn TextEngine,
-) -> ListDamage {
+) -> Result<ListDamage, crate::text_error::TextError> {
     let mut prefix = 0;
     while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
         prefix += 1;
     }
     if prefix == old.len() && prefix == new.len() {
-        return ListDamage::Same;
+        return Ok(ListDamage::Same);
     }
     let mut suffix = 0;
     while suffix < old.len() - prefix
@@ -1412,10 +1492,13 @@ pub fn list_damage(
         suffix += 1;
     }
     if (old.len() - prefix - suffix) + (new.len() - prefix - suffix) > limit {
-        return ListDamage::Whole;
+        return Ok(ListDamage::Whole);
     }
-    if new.iter().any(|command| matches!(command, DrawCommand::Backdrop { .. })) {
-        return ListDamage::Whole;
+    if new
+        .iter()
+        .any(|command| matches!(command, DrawCommand::Backdrop { .. }))
+    {
+        return Ok(ListDamage::Whole);
     }
     let factor = scale as f64;
     let whole = (0, 0, size.0 as i64, size.1 as i64);
@@ -1423,17 +1506,18 @@ pub fn list_damage(
     for (list, end) in [(old, old.len() - suffix), (new, new.len() - suffix)] {
         walk_clips(list, end, factor, |index, clip| {
             if index < prefix {
-                return;
+                return Ok(());
             }
-            if let Some(found) = command_box(&list[index], clip, factor, whole, cache, text) {
+            if let Some(found) = command_box(&list[index], clip, factor, whole, cache, text)? {
                 damage = Some(damage.map_or(found, |seen| union(seen, found)));
             }
-        });
+            Ok(())
+        })?;
     }
-    match damage {
+    Ok(match damage {
         Some(rect) => ListDamage::Rect(rect),
         None => ListDamage::Same,
-    }
+    })
 }
 
 /// A retained paint target: the previous frame's bitmap, its display
@@ -1504,8 +1588,15 @@ impl Surface {
         command: &DrawCommand,
         clip: Option<DamageRect>,
         text: &dyn TextEngine,
-    ) -> Option<DamageRect> {
-        command_box(command, clip, self.scale as f64, self.whole(), &self.cache, text)
+    ) -> Result<Option<DamageRect>, crate::text_error::TextError> {
+        command_box(
+            command,
+            clip,
+            self.scale as f64,
+            self.whole(),
+            &self.cache,
+            text,
+        )
     }
 
     /// Walks `commands[..upto]` keeping the physical clip stack; calls
@@ -1514,20 +1605,23 @@ impl Surface {
         &self,
         commands: &[DrawCommand],
         upto: usize,
-        visit: impl FnMut(usize, Option<DamageRect>),
-    ) {
+        visit: impl FnMut(usize, Option<DamageRect>) -> Result<(), crate::text_error::TextError>,
+    ) -> Result<(), crate::text_error::TextError> {
         walk_clips(commands, upto, self.scale as f64, visit)
     }
 
     /// Paints the new frame incrementally and returns the damaged rects
     /// (physical) — what the backend needs to blit. An identical list
     /// returns no damage and touches no pixel.
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
     pub fn frame(
         &mut self,
         display: DisplayList,
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) -> Vec<DamageRect> {
+    ) -> Result<Vec<DamageRect>, crate::text_error::TextError> {
         self.cache.begin_frame();
         let old = self.display.as_slice();
         let new = display.as_slice();
@@ -1537,9 +1631,9 @@ impl Surface {
         while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
             prefix += 1;
         }
-        if prefix == old.len() && prefix == new.len() {
+        if self.primed && prefix == old.len() && prefix == new.len() {
             self.display = display;
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut suffix = 0;
         while suffix < old.len() - prefix
@@ -1556,15 +1650,20 @@ impl Surface {
         new_bounds.extend_from_slice(&self.bounds[..prefix.min(self.bounds.len())]);
         self.walk_clips(new, new.len() - suffix, |index, clip| {
             if index >= prefix {
-                new_bounds.push(self.command_bounds(&new[index], clip, text));
+                new_bounds.push(self.command_bounds(&new[index], clip, text)?);
             }
-        });
+            Ok(())
+        })?;
         new_bounds.extend_from_slice(&self.bounds[self.bounds.len() - suffix..]);
         debug_assert_eq!(new_bounds.len(), new.len(), "one box per command");
 
         // damage = old middle boxes ∪ new middle boxes
         let mut candidates: Vec<DamageRect> = Vec::new();
-        candidates.extend(self.bounds[prefix..self.bounds.len() - suffix].iter().flatten());
+        candidates.extend(
+            self.bounds[prefix..self.bounds.len() - suffix]
+                .iter()
+                .flatten(),
+        );
         candidates.extend(new_bounds[prefix..new.len() - suffix].iter().flatten());
 
         // a pane of glass READS what is under it: a change anywhere in
@@ -1575,13 +1674,19 @@ impl Surface {
         loop {
             let mut grew = false;
             for (index, command) in new.iter().enumerate() {
-                let DrawCommand::Backdrop { glass, .. } = command else { continue };
+                let DrawCommand::Backdrop { glass, .. } = command else {
+                    continue;
+                };
                 let (Some(bounds), false) = (new_bounds[index], panes.contains(&index)) else {
                     continue;
                 };
                 let reach = (glass.reach() * self.scale as f64).ceil() as i64;
-                let watch =
-                    (bounds.0 - reach, bounds.1 - reach, bounds.2 + reach, bounds.3 + reach);
+                let watch = (
+                    bounds.0 - reach,
+                    bounds.1 - reach,
+                    bounds.2 + reach,
+                    bounds.3 + reach,
+                );
                 if candidates.iter().any(|rect| touches(watch, *rect)) {
                     candidates.push(bounds);
                     panes.push(index);
@@ -1623,13 +1728,39 @@ impl Surface {
             }
         }
         if damage.len() > 8 {
-            let all = damage.iter().copied().reduce(union).expect("non-empty damage");
+            let all = damage
+                .iter()
+                .copied()
+                .reduce(union)
+                .expect("non-empty damage");
             damage = vec![all];
         }
         if !self.primed {
             // first frame: the window has no pixels at all — blit it whole
-            self.primed = true;
             damage = vec![self.whole()];
+        }
+
+        let mut text_rasters = std::collections::BTreeMap::new();
+        for (index, command) in new.iter().enumerate() {
+            let DrawCommand::TextLine {
+                content,
+                range,
+                color,
+                font,
+                ..
+            } = command
+            else {
+                continue;
+            };
+            if !new_bounds[index]
+                .is_some_and(|bounds| damage.iter().any(|rect| touches(bounds, *rect)))
+            {
+                continue;
+            }
+            let line = content.line(range.0..range.1)?;
+            if let Some(raster) = text.raster_paragraph_line(&line, font, *color, self.scale)? {
+                text_rasters.insert(index, raster);
+            }
         }
 
         // clear + clipped replay: paint commands skip when their box
@@ -1641,8 +1772,12 @@ impl Surface {
             self.bitmap.push_clip_physical(rect);
             for (index, command) in new.iter().enumerate() {
                 match command {
-                    DrawCommand::PushClip { rect, corner_radius } => {
-                        self.bitmap.push_clip(scale_rect(*rect, factor), corner_radius * factor);
+                    DrawCommand::PushClip {
+                        rect,
+                        corner_radius,
+                    } => {
+                        self.bitmap
+                            .push_clip(scale_rect(*rect, factor), corner_radius * factor);
                         continue;
                     }
                     DrawCommand::PopClip => {
@@ -1656,46 +1791,65 @@ impl Surface {
                     continue;
                 }
                 match command {
-                    DrawCommand::FillRect { rect, color, corner_radius } => self
-                        .bitmap
-                        .fill_rect(scale_rect(*rect, factor), *color, corner_radius * factor),
-                    DrawCommand::Gradient { rect, paint, corner_radius } => {
-                        self.bitmap.fill_gradient(
-                            scale_rect(*rect, factor),
-                            paint.scaled(factor),
-                            corner_radius * factor,
-                        )
-                    }
-                    DrawCommand::Backdrop { rect, glass, corner_radius } => {
-                        self.bitmap.glass_pane(
-                            scale_rect(*rect, factor),
-                            glass.scaled(factor),
-                            corner_radius * factor,
-                        )
-                    }
-                    DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
-                        self.bitmap.stroke_rect(
-                            scale_rect(*rect, factor),
-                            *color,
-                            width * factor,
-                            corner_radius * factor,
-                        )
-                    }
-                    DrawCommand::Shadow { rect, radius, color, corner_radius } => {
-                        self.bitmap.shadow_rect(
-                            scale_rect(*rect, factor),
-                            *color,
-                            radius * factor,
-                            corner_radius * factor,
-                        )
-                    }
-                    DrawCommand::TextLine { origin, content, range, color, font } => {
-                        let Ok(line) = content.line(range.0..range.1) else { continue };
-                        if let Some(raster) = text.raster_paragraph_line(&line, font, *color, self.scale) {
-                            self.bitmap.composite_text(origin.x, origin.y, self.scale, &raster);
+                    DrawCommand::FillRect {
+                        rect,
+                        color,
+                        corner_radius,
+                    } => self.bitmap.fill_rect(
+                        scale_rect(*rect, factor),
+                        *color,
+                        corner_radius * factor,
+                    ),
+                    DrawCommand::Gradient {
+                        rect,
+                        paint,
+                        corner_radius,
+                    } => self.bitmap.fill_gradient(
+                        scale_rect(*rect, factor),
+                        paint.scaled(factor),
+                        corner_radius * factor,
+                    ),
+                    DrawCommand::Backdrop {
+                        rect,
+                        glass,
+                        corner_radius,
+                    } => self.bitmap.glass_pane(
+                        scale_rect(*rect, factor),
+                        glass.scaled(factor),
+                        corner_radius * factor,
+                    ),
+                    DrawCommand::StrokeRect {
+                        rect,
+                        color,
+                        width,
+                        corner_radius,
+                    } => self.bitmap.stroke_rect(
+                        scale_rect(*rect, factor),
+                        *color,
+                        width * factor,
+                        corner_radius * factor,
+                    ),
+                    DrawCommand::Shadow {
+                        rect,
+                        radius,
+                        color,
+                        corner_radius,
+                    } => self.bitmap.shadow_rect(
+                        scale_rect(*rect, factor),
+                        *color,
+                        radius * factor,
+                        corner_radius * factor,
+                    ),
+                    DrawCommand::TextLine { origin, .. } => {
+                        if let Some(raster) = text_rasters.get(&index) {
+                            self.bitmap
+                                .composite_text(origin.x, origin.y, self.scale, raster);
                         }
                     }
-                    DrawCommand::Image { rect: image_rect, source } => {
+                    DrawCommand::Image {
+                        rect: image_rect,
+                        source,
+                    } => {
                         let width = physical_extent(image_rect.size.width, self.scale);
                         let height = physical_extent(image_rect.size.height, self.scale);
                         if let Some(raster) = raster_source(images, source, width, height) {
@@ -1715,17 +1869,23 @@ impl Surface {
             self.bitmap.pop_clip();
         }
 
+        self.primed = true;
         self.display = display;
         self.bounds = new_bounds;
         if !self.rgba.is_empty() {
             self.rgba_pending.extend(damage.iter().copied());
             if self.rgba_pending.len() > 8 {
-                let all = self.rgba_pending.iter().copied().reduce(union).expect("non-empty damage");
+                let all = self
+                    .rgba_pending
+                    .iter()
+                    .copied()
+                    .reduce(union)
+                    .expect("non-empty damage");
                 self.rgba_pending.clear();
                 self.rgba_pending.push(all);
             }
         }
-        damage
+        Ok(damage)
     }
 
     /// Bitmap consumers never allocate a second pixel representation. A late
@@ -1953,7 +2113,8 @@ mod tests {
             crate::layout::Color::rgba(0, 0, 0, 0),
             &crate::text_engine::PixelFont,
             &crate::image_engine::RawImages::default(),
-        );
+        )
+        .unwrap();
         let straight = crate::raster::unpremultiplied(&bitmap.to_rgba_bytes());
         assert_eq!(
             &straight[..4],
@@ -1990,7 +2151,7 @@ mod tests {
             color: Color::BLACK,
             font: crate::text_engine::FontSpec::DEFAULT,
         });
-        let bitmap = rasterize(&display, 8, 16, Color::WHITE);
+        let bitmap = rasterize(&display, 8, 16, Color::WHITE).unwrap();
 
         let ink = super::pack(Color::BLACK);
         let picture = portrait(&bitmap, 0, 0, 8, 16, ink);
@@ -2011,7 +2172,7 @@ mod tests {
             color: Color::FILL,
             corner_radius: Corners::ZERO,
         });
-        let bitmap = rasterize(&display, 8, 8, Color::WHITE);
+        let bitmap = rasterize(&display, 8, 8, Color::WHITE).unwrap();
 
         let fill = super::pack(Color::FILL);
         let white = super::pack(Color::WHITE);
@@ -2034,7 +2195,7 @@ mod tests {
             color: Color { r: 0, g: 0, b: 255, a: 128 },
             corner_radius: Corners::ZERO,
         });
-        let bitmap = rasterize(&display, 1, 1, Color::WHITE);
+        let bitmap = rasterize(&display, 1, 1, Color::WHITE).unwrap();
 
         // r = g = round(255·127/255) = 127; b = 255; a = 128 + 127 = 255
         assert_eq!(bitmap.pixel(0, 0), Some(0x7F7F_FFFF));
@@ -2057,7 +2218,7 @@ mod tests {
             color: Color { r: 1, g: 2, b: 3, a: 255 },
             corner_radius: Corners::ZERO,
         });
-        let bitmap = rasterize(&display, 1, 1, Color::WHITE);
+        let bitmap = rasterize(&display, 1, 1, Color::WHITE).unwrap();
 
         assert_eq!(bitmap.pixel(0, 0), Some(super::pack(Color { r: 1, g: 2, b: 3, a: 255 })));
     }
@@ -2073,7 +2234,7 @@ mod tests {
             color: Color::BLACK,
             corner_radius: Corners::all(3.0),
         });
-        let bitmap = rasterize(&display, 8, 8, Color::WHITE);
+        let bitmap = rasterize(&display, 8, 8, Color::WHITE).unwrap();
 
         let ink = super::pack(Color::BLACK);
         let white = super::pack(Color::WHITE);
@@ -2098,7 +2259,7 @@ mod tests {
             width: 2.0,
             corner_radius: Corners::ZERO,
         });
-        let bitmap = rasterize(&display, 6, 6, Color::WHITE);
+        let bitmap = rasterize(&display, 6, 6, Color::WHITE).unwrap();
 
         assert_eq!(bitmap.pixel(0, 0), bitmap.pixel(3, 0), "corner == top");
         assert_eq!(bitmap.pixel(0, 3), bitmap.pixel(3, 0), "side == top");
@@ -2150,8 +2311,8 @@ mod tests {
         let mut flat = DisplayList::default();
         flat.push(DrawCommand::FillRect { rect: box_rect, color: ink, corner_radius: Corners::all(9.0) });
         assert_eq!(
-            rasterize(&ramp, 60, 40, Color::CANVAS).pixels(),
-            rasterize(&flat, 60, 40, Color::CANVAS).pixels(),
+            rasterize(&ramp, 60, 40, Color::CANVAS).unwrap().pixels(),
+            rasterize(&flat, 60, 40, Color::CANVAS).unwrap().pixels(),
             "one ramp with one color is a fill"
         );
     }
@@ -2170,7 +2331,7 @@ mod tests {
             crate::layout::Gradient::radial(inner, outer).resolve(box_rect),
             0.0,
         ));
-        let bitmap = rasterize(&display, 40, 40, Color::CANVAS);
+        let bitmap = rasterize(&display, 40, 40, Color::CANVAS).unwrap();
         let (r, g, b, _) = channels(&bitmap, 20, 20);
         assert!(r > 240 && b < 16, "the centre is the inner color: {r},{g},{b}");
         let (r, _, b, _) = channels(&bitmap, 0, 0);
@@ -2198,7 +2359,7 @@ mod tests {
             crate::layout::Gradient::linear(from, to).resolve(box_rect),
             0.0,
         ));
-        let bitmap = rasterize(&display, 20, 40, Color::CANVAS);
+        let bitmap = rasterize(&display, 20, 40, Color::CANVAS).unwrap();
         let (top, _, _, _) = channels(&bitmap, 10, 0);
         let (middle, _, _, _) = channels(&bitmap, 10, 20);
         let (bottom, _, _, _) = channels(&bitmap, 10, 39);
@@ -2226,7 +2387,7 @@ mod tests {
                 .resolve(box_rect),
             0.0,
         ));
-        let bitmap = rasterize(&display, 40, 8, Color::WHITE);
+        let bitmap = rasterize(&display, 40, 8, Color::WHITE).unwrap();
         let (r, g, b, _) = channels(&bitmap, 20, 4);
         // halfway over white: the hue survives (red still leads blue's
         // neighbourhood, green stays the lowest channel)
@@ -2292,11 +2453,12 @@ mod tests {
             for index in 0..100 {
                 last = list(vec![fill(8.0 + f64::from(index % 9), 8.0, 20.0, 16.0,
                     Color { r: 180, g: 70, b: 40, a: 120 })]);
-                surface.frame(last.clone(), &PixelFont, &RawImages::default());
+                surface.frame(last.clone(), &PixelFont, &RawImages::default())
+                    .unwrap();
                 assert_eq!(surface.rgba.capacity(), 0, "bitmap readers do not need a byte mirror");
                 assert!(surface.rgba_pending.is_empty(), "unrequested mirrors need no damage history");
             }
-            let oracle = rasterize(&last, 64, 32, canvas).to_rgba_bytes();
+            let oracle = rasterize(&last, 64, 32, canvas).unwrap().to_rgba_bytes();
             if straight {
                 assert_eq!(surface.rgba_straight(), unpremultiplied(&oracle));
             } else {
@@ -2311,10 +2473,11 @@ mod tests {
         assert_eq!(surface.rgba(), Bitmap::new(120, 80, Color::CANVAS).to_rgba_bytes());
         let frames = hover_frames();
         for index in 0..100 {
-            surface.frame(frames[index % 3].clone(), &PixelFont, &RawImages::default());
+            surface.frame(frames[index % 3].clone(), &PixelFont, &RawImages::default())
+                .unwrap();
             assert!(surface.rgba_pending.len() <= 8, "delayed readers must not retain every frame");
         }
-        assert_eq!(surface.rgba(), rasterize(&frames[0], 120, 80, Color::CANVAS).to_rgba_bytes());
+        assert_eq!(surface.rgba(), rasterize(&frames[0], 120, 80, Color::CANVAS).unwrap().to_rgba_bytes());
     }
 
     #[test]
@@ -2357,8 +2520,9 @@ mod tests {
         for frames in sequences {
             let mut surface = Surface::new(120, 80, 1, Color::CANVAS);
             for frame in frames {
-                let oracle = rasterize(&frame, 120, 80, Color::CANVAS);
-                surface.frame(frame, &PixelFont, &RawImages::default());
+                let oracle = rasterize(&frame, 120, 80, Color::CANVAS).unwrap();
+                surface.frame(frame, &PixelFont, &RawImages::default())
+                    .unwrap();
                 assert_eq!(
                     surface.bitmap().pixels(),
                     oracle.pixels(),
@@ -2372,8 +2536,10 @@ mod tests {
     fn an_identical_frame_damages_nothing() {
         let mut surface = Surface::new(120, 80, 1, Color::CANVAS);
         let frames = hover_frames();
-        surface.frame(frames[0].clone(), &PixelFont, &RawImages::default());
-        let damage = surface.frame(frames[0].clone(), &PixelFont, &RawImages::default());
+        surface.frame(frames[0].clone(), &PixelFont, &RawImages::default())
+            .unwrap();
+        let damage = surface.frame(frames[0].clone(), &PixelFont, &RawImages::default())
+            .unwrap();
         assert!(damage.is_empty(), "same list, no damage: {damage:?}");
     }
 
@@ -2472,10 +2638,12 @@ mod tests {
                 }
                 let old = list(current.clone());
                 let new = list(next.clone());
-                let before = rasterize_scaled(&old, width, height, scale, Color::CANVAS);
-                let after = rasterize_scaled(&new, width, height, scale, Color::CANVAS);
+                let before = rasterize_scaled(&old, width, height, scale, Color::CANVAS).unwrap();
+                let after = rasterize_scaled(&new, width, height, scale, Color::CANVAS).unwrap();
                 let answer =
-                    list_damage(old.as_slice(), new.as_slice(), scale, (width, height), 64, &cache, &PixelFont);
+                    list_damage(old.as_slice(), new.as_slice(), scale, (width, height), 64, &cache, &PixelFont,
+                )
+                .unwrap();
                 let inside = |x: usize, y: usize| match answer {
                     ListDamage::Rect((x0, y0, x1, y1)) => {
                         (x as i64) >= x0 && (x as i64) < x1 && (y as i64) >= y0 && (y as i64) < y1
@@ -2513,7 +2681,7 @@ mod tests {
         let mut new = old.clone();
         let pop = new.iter().position(|c| matches!(c, DrawCommand::PopClip)).unwrap();
         new.insert(pop, line(10.0, 64.0, "below the fold", Color::BLACK));
-        let answer = list_damage(&old, &new, 2, (240, 160), 64, &cache, &PixelFont);
+        let answer = list_damage(&old, &new, 2, (240, 160), 64, &cache, &PixelFont).unwrap();
         assert_eq!(answer, ListDamage::Same);
     }
 
@@ -2523,7 +2691,7 @@ mod tests {
         let rows = |shift: f64| -> Vec<DrawCommand> {
             (0..40).map(|i| fill(0.0, i as f64 * 4.0 + shift, 120.0, 3.0, Color::BLACK)).collect()
         };
-        assert_eq!(list_damage(&rows(0.0), &rows(1.0), 1, (120, 80), 64, &cache, &PixelFont), ListDamage::Whole);
+        assert_eq!(list_damage(&rows(0.0), &rows(1.0), 1, (120, 80), 64, &cache, &PixelFont).unwrap(), ListDamage::Whole);
         assert_eq!(cache.len(), 0, "nothing was measured");
         let mut glass = damage_scene();
         let pane = Rect { origin: Point { x: 0.0, y: 0.0 }, size: Size { width: 40.0, height: 40.0 } };
@@ -2536,7 +2704,7 @@ mod tests {
         if let DrawCommand::FillRect { color, .. } = &mut moved[7] {
             *color = Color::BLACK;
         }
-        assert_eq!(list_damage(&glass, &moved, 1, (120, 80), 64, &cache, &PixelFont), ListDamage::Whole);
+        assert_eq!(list_damage(&glass, &moved, 1, (120, 80), 64, &cache, &PixelFont).unwrap(), ListDamage::Whole);
     }
 
     #[test]
@@ -2551,11 +2719,12 @@ mod tests {
             width: 2.0,
             corner_radius: Corners::all(12.0),
         });
-        let bitmap = rasterize(&display, 60, 60, Color::WHITE);
+        let bitmap = rasterize(&display, 60, 60, Color::WHITE).unwrap();
 
         let white = super::pack(Color::WHITE);
         let ink = |x: usize, y: usize| bitmap.pixel(x, y) != Some(white);
-        assert!(!ink(11, 11), "the square corner is OUTSIDE the curve — no straight bar");
+        assert!(!ink(11, 11), "the square corner is OUTSIDE the curve — no straight bar"
+        );
         // the arc: points at ~radius distance from the corner center (22, 22)
         assert!(ink(22, 10), "top bar starts after the corner");
         assert!(ink(13, 14), "the ring passes through the diagonal of the arc");
@@ -2578,7 +2747,7 @@ mod tests {
             color: Color::rgba(0, 0, 0, 200),
             corner_radius: Corners::all(10.0),
         });
-        let bitmap = rasterize(&display, 70, 70, Color::WHITE);
+        let bitmap = rasterize(&display, 70, 70, Color::WHITE).unwrap();
 
         let white = super::pack(Color::WHITE);
         assert_ne!(
@@ -2602,7 +2771,7 @@ mod tests {
             color: Color::rgba(0, 0, 0, 200),
             corner_radius: Corners::ZERO,
         });
-        let bitmap = rasterize(&display, 60, 60, Color::WHITE);
+        let bitmap = rasterize(&display, 60, 60, Color::WHITE).unwrap();
 
         let white = super::pack(Color::WHITE);
         assert_eq!(bitmap.pixel(30, 30), Some(white), "the inside belongs to the view");
@@ -2635,9 +2804,11 @@ mod tests {
             display.push(fill(30.0, 30.0, 20.0, 20.0, Color::WHITE));
             display
         };
-        surface.frame(with(false), &PixelFont, &RawImages::default());
-        let damage = surface.frame(with(true), &PixelFont, &RawImages::default());
-        let oracle = rasterize(&with(true), 80, 80, Color::CANVAS);
+        surface.frame(with(false), &PixelFont, &RawImages::default())
+            .unwrap();
+        let damage = surface.frame(with(true), &PixelFont, &RawImages::default())
+            .unwrap();
+        let oracle = rasterize(&with(true), 80, 80, Color::CANVAS).unwrap();
         assert_eq!(surface.bitmap().pixels(), oracle.pixels(), "golden with shadow");
         let (x0, y0, x1, y1) = damage[0];
         assert!(x0 <= 22 && y0 <= 22 && x1 >= 58 && y1 >= 58, "halo box damaged: {damage:?}");
@@ -2649,7 +2820,8 @@ mod tests {
         // even though only damaged rects are converted
         let mut surface = Surface::new(120, 80, 1, Color::CANVAS);
         for frame in hover_frames() {
-            surface.frame(frame, &PixelFont, &RawImages::default());
+            surface.frame(frame, &PixelFont, &RawImages::default())
+                .unwrap();
             let full = surface.bitmap().to_rgba_bytes();
             assert_eq!(surface.rgba(), &full[..], "mirror == full conversion");
         }
@@ -2659,9 +2831,11 @@ mod tests {
     fn a_hover_swap_damages_only_the_row() {
         let mut surface = Surface::new(120, 80, 1, Color::CANVAS);
         let frames = hover_frames();
-        let first = surface.frame(frames[0].clone(), &PixelFont, &RawImages::default());
+        let first = surface.frame(frames[0].clone(), &PixelFont, &RawImages::default())
+            .unwrap();
         assert_eq!(first, vec![(0, 0, 120, 80)], "first frame damages the whole surface");
-        let damage = surface.frame(frames[1].clone(), &PixelFont, &RawImages::default());
+        let damage = surface.frame(frames[1].clone(), &PixelFont, &RawImages::default())
+            .unwrap();
         assert_eq!(damage.len(), 1, "one row changed, one rect: {damage:?}");
         let (x0, y0, x1, y1) = damage[0];
         // the changed row lives at (8, 32)–(112, 52); text slack may pad
@@ -2694,8 +2868,10 @@ mod tests {
             display
         };
         let mut surface = Surface::new(100, 40, 1, Color::CANVAS);
-        surface.frame(paint(60), &PixelFont, &RawImages::default());
-        let damage = surface.frame(paint(200), &PixelFont, &RawImages::default());
+        surface.frame(paint(60), &PixelFont, &RawImages::default())
+            .unwrap();
+        let damage = surface.frame(paint(200), &PixelFont, &RawImages::default())
+            .unwrap();
         assert_eq!(damage, vec![(10, 10, 26, 26)], "only the image rect repaints");
         // and the pixels landed: the new seed shows at the center
         assert_eq!(surface.bitmap().pixel(18, 18), Some(0xC8C8_C8FF), "seed 200 everywhere");
@@ -2720,7 +2896,7 @@ mod tests {
             fill(0.0, 0.0, 12.0, 12.0, Color::BLACK),
             DrawCommand::PopClip,
         ]);
-        let bitmap = rasterize(&display, 12, 12, Color::WHITE);
+        let bitmap = rasterize(&display, 12, 12, Color::WHITE).unwrap();
         let picture = portrait(&bitmap, 0, 0, 12, 12, super::pack(Color::BLACK));
         assert_eq!(
             picture,
@@ -2750,7 +2926,7 @@ mod tests {
             fill(1.0, 1.0, 14.0, 14.0, Color::BLACK),
             DrawCommand::PopClip,
         ]);
-        let bitmap = rasterize(&display, 16, 16, Color::WHITE);
+        let bitmap = rasterize(&display, 16, 16, Color::WHITE).unwrap();
         let black = super::pack(Color::BLACK);
         let white = super::pack(Color::WHITE);
         // the dead corner is untouched canvas
@@ -2777,7 +2953,7 @@ mod tests {
             line(0.0, 0.0, "88", Color::BLACK),
             DrawCommand::PopClip,
         ]);
-        let bitmap = rasterize(&display, 24, 24, Color::WHITE);
+        let bitmap = rasterize(&display, 24, 24, Color::WHITE).unwrap();
         let white = super::pack(Color::WHITE);
         // the notch (outside the arc) shows canvas even where the
         // glyph would have inked; one pixel in, the arc already blends
@@ -2805,7 +2981,7 @@ mod tests {
             },
             DrawCommand::PopClip,
         ]);
-        let bitmap = rasterize(&display, 12, 12, Color::WHITE);
+        let bitmap = rasterize(&display, 12, 12, Color::WHITE).unwrap();
         let white = super::pack(Color::WHITE);
         assert_eq!(bitmap.pixel(0, 0), Some(white), "the notch stays canvas");
         assert_ne!(bitmap.pixel(6, 6), Some(white), "the body lands");
@@ -2830,7 +3006,7 @@ mod tests {
             DrawCommand::PopClip,
             DrawCommand::PopClip,
         ]);
-        let bitmap = rasterize(&display, 16, 16, Color::WHITE);
+        let bitmap = rasterize(&display, 16, 16, Color::WHITE).unwrap();
         let black = super::pack(Color::BLACK);
         let white = super::pack(Color::WHITE);
         assert_eq!(bitmap.pixel(0, 0), Some(white), "the island curve holds");
@@ -2845,7 +3021,7 @@ mod tests {
             DrawCommand::PopClip,
             DrawCommand::PopClip,
         ]);
-        let bitmap = rasterize(&nested, 16, 16, Color::WHITE);
+        let bitmap = rasterize(&nested, 16, 16, Color::WHITE).unwrap();
         assert_eq!(bitmap.pixel(4, 4), Some(white), "the inner curve bends its own corner");
         assert_eq!(bitmap.pixel(10, 10), Some(black));
     }
@@ -2887,8 +3063,9 @@ mod tests {
         ];
         let mut surface = Surface::new(40, 40, 1, Color::CANVAS);
         for frame in frames {
-            let oracle = rasterize(&frame, 40, 40, Color::CANVAS);
-            surface.frame(frame, &PixelFont, &RawImages::default());
+            let oracle = rasterize(&frame, 40, 40, Color::CANVAS).unwrap();
+            surface.frame(frame, &PixelFont, &RawImages::default())
+                .unwrap();
             assert_eq!(
                 surface.bitmap().pixels(),
                 oracle.pixels(),
@@ -2938,7 +3115,7 @@ mod tests {
     fn a_pane_flattens_the_stripes_under_it_and_leaves_the_rest_alone() {
         let mut display = stripes(120, 80, 8);
         display.push(pane(box_at(30.0, 20.0, 60.0, 40.0), Glass::frosted(), 0.0));
-        let bitmap = rasterize(&display, 120, 80, Color::WHITE);
+        let bitmap = rasterize(&display, 120, 80, Color::WHITE).unwrap();
 
         // outside the pane the stripes keep their full contrast
         let outside: Vec<f64> = (0..16).map(|x| luma(bitmap.pixel(x, 4).expect("pixel"))).collect();
@@ -2978,7 +3155,7 @@ mod tests {
                 corner_radius: Corners::ZERO,
             });
             display.push(pane(box_at(30.0, 20.0, 80.0, 40.0), glass, 0.0));
-            rasterize(&display, 160, 80, Color::WHITE)
+            rasterize(&display, 160, 80, Color::WHITE).unwrap()
         };
         let still = scene(lens.refraction(24.0, 0.0));
         let bent = scene(lens.refraction(24.0, 20.0));
@@ -2995,7 +3172,7 @@ mod tests {
         let scene = |glass: Glass| {
             let mut display = stripes(160, 80, 10);
             display.push(pane(box_at(20.0, 20.0, 120.0, 100.0), glass, 0.0));
-            rasterize(&display, 160, 140, Color::WHITE)
+            rasterize(&display, 160, 140, Color::WHITE).unwrap()
         };
         let base = Glass::regular().tint(Color::rgba(0, 0, 0, 0)).highlight(Color::WHITE, 0.0, 0.0);
         // the same BAND on both, so the two only disagree about the
@@ -3028,7 +3205,7 @@ mod tests {
             Glass::regular().refraction(0.0, 0.0).highlight(Color::WHITE, 6.0, 1.0),
             24.0,
         ));
-        let bitmap = rasterize(&display, 120, 120, Color::WHITE);
+        let bitmap = rasterize(&display, 120, 120, Color::WHITE).unwrap();
 
         // three points at the same depth (about 3px in) on three
         // corners of the arc — the band is 6, so a deeper sample would
@@ -3052,9 +3229,9 @@ mod tests {
             color: Color::BLACK,
             corner_radius: Corners::ZERO,
         });
-        let plain = rasterize(&display, 80, 80, Color::WHITE);
+        let plain = rasterize(&display, 80, 80, Color::WHITE).unwrap();
         display.push(pane(box_at(10.0, 10.0, 60.0, 60.0), Glass::regular(), 20.0));
-        let rounded = rasterize(&display, 80, 80, Color::WHITE);
+        let rounded = rasterize(&display, 80, 80, Color::WHITE).unwrap();
 
         // the box's own corner, outside the arc: the pane never got there
         assert_eq!(rounded.pixel(11, 11), plain.pixel(11, 11), "outside the arc");
@@ -3071,7 +3248,7 @@ mod tests {
                 corner_radius: Corners::ZERO,
             });
             display.push(pane(box_at(10.0, 10.0, 60.0, 60.0), glass, 0.0));
-            rasterize(&display, 80, 80, Color::WHITE)
+            rasterize(&display, 80, 80, Color::WHITE).unwrap()
         };
         let quiet = scene(Glass::regular());
         let sheened = scene(Glass::regular().sheen(0.25));
@@ -3102,13 +3279,13 @@ mod tests {
         };
         let mut surface = Surface::new(120, 80, 1, Color::WHITE);
         let images = crate::image_engine::RawImages::default();
-        surface.frame(frame(Color::BLACK), &PixelFont, &images);
-        let damage = surface.frame(frame(Color::hex(0x3B82F6)), &PixelFont, &images);
+        surface.frame(frame(Color::BLACK), &PixelFont, &images)
+            .unwrap();
+        let damage = surface.frame(frame(Color::hex(0x3B82F6)), &PixelFont, &images)
+            .unwrap();
 
         assert!(!damage.is_empty(), "a changed box under glass is not a silent frame");
-        let covered = damage.iter().any(|rect| {
-            rect.0 <= 20 && rect.1 <= 20 && rect.2 >= 80 && rect.3 >= 60
-        });
+        let covered = damage.iter().any(|rect| rect.0 <= 20 && rect.1 <= 20 && rect.2 >= 80 && rect.3 >= 60);
         assert!(covered, "the whole pane repaints, not just the box that moved: {damage:?}");
     }
 

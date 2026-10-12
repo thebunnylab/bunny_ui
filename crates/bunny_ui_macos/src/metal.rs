@@ -98,7 +98,12 @@ fn graft(view: Id, scale: f64, width: f64, height: f64) -> Option<MetalPresenter
             return None;
         };
         msg_void_id(view, sel("setLayer:"), layer);
-        presenter.prime(width, height, scale.round().max(1.0) as usize);
+        crate::native_event(
+            presenter
+                .prime(width, height, scale.round().max(1.0) as usize)
+                .map(|()| Some(())),
+            None,
+        )?;
         Some(presenter)
     }
 }
@@ -200,21 +205,21 @@ pub(crate) fn present_view(
     text: &dyn TextEngine,
     images: &dyn ImageEngine,
     live: bool,
-) -> bool {
+) -> Result<bool, bunny_ui::gpu::walk::RenderError> {
     VIEW_PRESENTERS.with(|slot| {
         let mut presenters = slot.borrow_mut();
         let Some(presenter) = presenters.get_mut(&(view as usize)) else {
-            return false;
+            return Ok(false);
         };
         presenter
             .renderer
-            .present(display, size, scale, canvas, text, images, live);
+            .present(display, size, scale, canvas, text, images, live)?;
         let waited = presenter.renderer.drawable_wait_ms();
         if !live && waited > CONGESTED_MS {
             presenter.congested = true;
             bunny_ui_apple::trace::mark("X", format_args!("what=line-full wait={waited:.1}"));
         }
-        true
+        Ok(true)
     })
 }
 

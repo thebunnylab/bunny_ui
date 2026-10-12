@@ -130,7 +130,10 @@ pub(crate) struct GroupRecord {
 
 /// Lowers the semantic tree to a flow scene. The root is the mount
 /// point (id 0): the theme's canvas, the window's box.
-pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
+pub(crate) fn lower(
+    root: &LayoutNode,
+    env: &FlowEnv,
+) -> Result<FlowOutput, crate::text_error::TextError> {
     let mut walk = Walk {
         env,
         changed: ChangedIndex::new(env.changed),
@@ -169,7 +172,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         promised_fill: None,
     };
     let mut children = Vec::new();
-    walk.lower_into(root, &mut children);
+    walk.lower_into(root, &mut children)?;
     // the mount point is a one-slot column and the window's box is
     // the offer — a flexible app takes it
     Walk::stamp_fill(root, &mut children);
@@ -197,7 +200,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         id: 0,
         rule: 0,
     };
-    FlowOutput {
+    Ok(FlowOutput {
         scene,
         display: walk.display,
         fields: walk.fields,
@@ -205,7 +208,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         groups: walk.groups_out,
         hits: walk.hits,
         islands_walked: walk.islands_walked,
-    }
+    })
 }
 
 /// The bodies that ran this frame, indexed for the one question a
@@ -528,7 +531,11 @@ impl Walk<'_> {
     /// stack, a text or a style carries itself lowers as the wrappers it
     /// replaces did: its action arms the box it opens, and its hints are
     /// stamped on what it lowered to.
-    fn lower_into(&mut self, tree: &LayoutNode, out: &mut Vec<DomNode>) {
+    fn lower_into(
+        &mut self,
+        tree: &LayoutNode,
+        out: &mut Vec<DomNode>,
+    ) -> Result<(), crate::text_error::TextError> {
         if tree.is_bare() {
             return self.lower_node(tree, out);
         }
@@ -536,26 +543,38 @@ impl Walk<'_> {
         match tree.carried_action() {
             Some(path) => {
                 self.pending_interactive = Some(std::rc::Rc::clone(path));
-                self.lower_node(tree, out);
+                self.lower_node(tree, out)?;
                 self.pending_interactive = None;
             }
-            None => self.lower_node(tree, out),
+            None => self.lower_node(tree, out)?,
         }
-        if let Some(hints) = tree.carried_hints()
-            && !hints.is_empty()
-        {
-            let (dom_id, href) = match hints.address.as_deref() {
-                Some(address) => (address.dom_id.clone(), address.href.clone()),
-                None => (None, None),
-            };
-            Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &dom_id, &href);
-        }
+
+            if let Some(hints) = tree.carried_hints()
+                && !hints.is_empty()
+            {
+                let (dom_id, href) = match hints.address.as_deref() {
+                    Some(address) => (address.dom_id.clone(), address.href.clone()),
+                    None => (None, None),
+                };
+                Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &dom_id, &href);
+            }
+        Ok(())
     }
 
     /// The node itself, what it carries aside.
-    fn lower_node(&mut self, tree: &LayoutNode, out: &mut Vec<DomNode>) {
+    fn lower_node(
+        &mut self,
+        tree: &LayoutNode,
+        out: &mut Vec<DomNode>,
+    ) -> Result<(), crate::text_error::TextError> {
         match tree {
-            LayoutNode::Stack { axis, spacing, align, children, .. } => {
+            LayoutNode::Stack {
+                axis,
+                spacing,
+                align,
+                children,
+                ..
+            } => {
                 let kind = match axis {
                     Axis::Vertical => DomKind::FlexColumn,
                     Axis::Horizontal => DomKind::FlexRow,
@@ -567,7 +586,9 @@ impl Walk<'_> {
                 // lands here the way it lands on a styled box
                 container.style.interactive = self.pending_interactive.take();
                 container.style.set_tooltip(self.pending_tooltip.take());
-                container.style.set_transition(self.pending_transition.take());
+                container
+                    .style
+                    .set_transition(self.pending_transition.take());
                 let layout = container.layout.as_mut().expect("flow node");
                 if *spacing != 0.0 {
                     layout.gap = Some(*spacing as f32);
@@ -582,7 +603,7 @@ impl Walk<'_> {
                 }
                 for child in children {
                     let opened = container.children.len();
-                    self.lower_into(child, &mut container.children);
+                    self.lower_into(child, &mut container.children)?;
                     if open_column {
                         // a spacer or an open frame grows itself; here
                         // it keeps its content's height instead
@@ -624,11 +645,18 @@ impl Walk<'_> {
             // a row that wraps is the browser's own: a flex row that
             // wraps its items, with the gaps in both directions — the
             // lines break where the items' own widths say, as here
-            LayoutNode::Flow { spacing, line_spacing, align, children } => {
+            LayoutNode::Flow {
+                spacing,
+                line_spacing,
+                align,
+                children,
+            } => {
                 let container = placed(out, node(DomKind::FlexRow));
                 container.style.interactive = self.pending_interactive.take();
                 container.style.set_tooltip(self.pending_tooltip.take());
-                container.style.set_transition(self.pending_transition.take());
+                container
+                    .style
+                    .set_transition(self.pending_transition.take());
                 let layout = container.layout.as_mut().expect("flow node");
                 if *spacing != 0.0 {
                     layout.gap = Some(*spacing as f32);
@@ -636,7 +664,7 @@ impl Walk<'_> {
                 layout.align = Some(align_code(*align));
                 layout.wrap = Some(*line_spacing as f32);
                 for child in children {
-                    self.lower_into(child, &mut container.children);
+                    self.lower_into(child, &mut container.children)?;
                 }
             }
             // In flow mode there is no native child view to cross and
@@ -646,21 +674,27 @@ impl Walk<'_> {
                 let container = placed(out, node(DomKind::Layers));
                 container.layout.as_mut().expect("flow node").align =
                     Some(align_code(crate::layout::CrossAlign::Center));
-                self.lower_into(child, &mut container.children);
-                self.lower_into(content, &mut container.children);
+                self.lower_into(child, &mut container.children)?;
+                self.lower_into(content, &mut container.children)?;
             }
-            LayoutNode::Layered { align, children, .. } => {
+            LayoutNode::Layered {
+                align, children, ..
+            } => {
                 let container = placed(out, node(DomKind::Layers));
-                container.layout.as_mut().expect("flow node").align =
-                    Some(align_code(*align));
+                container.layout.as_mut().expect("flow node").align = Some(align_code(*align));
                 for child in children {
-                    self.lower_into(child, &mut container.children);
+                    self.lower_into(child, &mut container.children)?;
                 }
             }
             LayoutNode::Padding { edges, child } => {
-                let Edges { top, leading, bottom, trailing } = *edges;
+                let Edges {
+                    top,
+                    leading,
+                    bottom,
+                    trailing,
+                } = *edges;
                 let mut lowered = Vec::new();
-                self.lower_into(child, &mut lowered);
+                self.lower_into(child, &mut lowered)?;
                 // FOLD: a padding around one pure layout node becomes
                 // that node's own padding (nested edges sum). Styled
                 // boxes never fold — their background must stay tight
@@ -683,7 +717,7 @@ impl Walk<'_> {
                         sum(was_leading, leading),
                     ));
                     out.append(&mut lowered);
-                    return;
+                    return Ok(());
                 }
                 let container = placed(out, node(DomKind::FlexColumn));
                 container.layout.as_mut().expect("flow node").padding =
@@ -692,7 +726,12 @@ impl Walk<'_> {
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(container);
             }
-            LayoutNode::Frame { width, height, align, child } => {
+            LayoutNode::Frame {
+                width,
+                height,
+                align,
+                child,
+            } => {
                 let outer_slot = self.slot;
                 self.slot = (*width, *height);
                 let outer_unbounded = self.unbounded;
@@ -710,7 +749,7 @@ impl Walk<'_> {
                     // the flow (Exact restores it)
                     layout.align = Some(align_code(*align));
                 }
-                self.lower_into(child, &mut container.children);
+                self.lower_into(child, &mut container.children)?;
                 self.slot = outer_slot;
                 self.unbounded = outer_unbounded;
                 Self::stamp_fill(child, &mut container.children);
@@ -722,15 +761,21 @@ impl Walk<'_> {
             // to grow already takes what its content needs, and the cap that
             // rides above it is a `max-height` on the frame outside. So the
             // node passes through and the child lowers as itself.
-            LayoutNode::Hug { child, .. } => self.lower_into(child, out),
+            LayoutNode::Hug { child, .. } => self.lower_into(child, out)?,
 
-            LayoutNode::MaxFrame { max_width, max_height, align, child } => {
+            LayoutNode::MaxFrame {
+                max_width,
+                max_height,
+                align,
+                child,
+            } => {
                 let container = placed(out, node(DomKind::FlexColumn));
                 {
                     let layout = container.layout.as_mut().expect("flow node");
                     // the wire carries f32: a ceiling past what it holds
                     // (`f64::MAX`, "no ceiling, but not open") is none
-                    let ceiling = |length: f64| Some(length as f32).filter(|length| length.is_finite());
+                    let ceiling =
+                        |length: f64| Some(length as f32).filter(|length| length.is_finite());
                     layout.max_width = ceiling(*max_width);
                     layout.max_height = ceiling(*max_height);
                     // a frame open on BOTH axes fills whatever holds it.
@@ -744,7 +789,7 @@ impl Walk<'_> {
                     }
                     layout.align = Some(align_code(*align));
                 }
-                self.lower_into(child, &mut container.children);
+                self.lower_into(child, &mut container.children)?;
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(container);
                 Self::stamp_across(child, &mut container.children);
@@ -761,7 +806,7 @@ impl Walk<'_> {
                     layout.grow = true;
                     layout.align = Some(align_code(*align));
                 }
-                self.lower_into(child, &mut container.children);
+                self.lower_into(child, &mut container.children)?;
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(container);
                 Self::stamp_across(child, &mut container.children);
@@ -794,12 +839,13 @@ impl Walk<'_> {
                 // a style that turns the direction opens an ISLAND: its box
                 // says so, and the browser reads everything under it the
                 // island's way
-                let turned = props.direction.filter(|direction| *direction != outer_direction);
+                let turned = props
+                    .direction
+                    .filter(|direction| *direction != outer_direction);
 
-                let states = props.foreground_hovered.is_some()
-                    || props.foreground_pressed.is_some();
-                let inheriting =
-                    !self.ink_scopes.is_empty() && props.foreground.is_some();
+                let states =
+                    props.foreground_hovered.is_some() || props.foreground_pressed.is_some();
+                let inheriting = !self.ink_scopes.is_empty() && props.foreground.is_some();
                 // an ink-only style over a text owns no element: the text
                 // takes the ink itself, as it always did, and the box
                 // that would have carried nothing is not made. A state
@@ -816,14 +862,15 @@ impl Walk<'_> {
                     && self.pending_transition.is_none()
                     && !DomLook::paints(props)
                 {
-                    self.ink.push(props.foreground.unwrap_or_else(|| self.current_ink()));
-                    self.lower_into(child, out);
+                    self.ink
+                        .push(props.foreground.unwrap_or_else(|| self.current_ink()));
+                    self.lower_into(child, out)?;
                     self.ink.pop();
                     self.font = outer_font;
                     self.line_height = outer_line_height;
                     self.text_align = outer_text_align;
                     self.direction = outer_direction;
-                    return;
+                    return Ok(());
                 }
                 let boxed = placed(out, node(DomKind::Box));
                 if let (Some(direction), Some(layout)) = (turned, boxed.layout.as_mut()) {
@@ -843,13 +890,21 @@ impl Walk<'_> {
                 if self.direction.is_rtl() {
                     look.gradient = look.gradient.map(crate::layout::Gradient::flipped);
                 }
-                let marks = DomMarks { tooltip: self.pending_tooltip.take(), group_owner: None };
+                let marks = DomMarks {
+                    tooltip: self.pending_tooltip.take(),
+                    group_owner: None,
+                };
                 // the tint is the half of the material an ELEMENT owns:
                 // it sits under whatever the box paints itself, because
                 // an element has one background colour. The tint never
                 // rides the wire on its own — it folds in here
                 if let Some(glass) = props.glass {
-                    let tint = glass.resolve(crate::layout::Rect { origin: crate::layout::Point { x: 0.0, y: 0.0 }, size: crate::layout::Size::default() }).tint;
+                    let tint = glass
+                        .resolve(crate::layout::Rect {
+                            origin: crate::layout::Point { x: 0.0, y: 0.0 },
+                            size: crate::layout::Size::default(),
+                        })
+                        .tint;
                     look.background = crate::dom::GlassFilter::under(tint, look.background);
                     look.hover_background = look
                         .hover_background
@@ -878,7 +933,7 @@ impl Walk<'_> {
                     boxed.face = Some(self.face_record(self.font));
                     self.declared = self.font;
                 }
-                self.lower_into(child, &mut boxed.children);
+                self.lower_into(child, &mut boxed.children)?;
                 self.declared = outer_declared;
                 if states {
                     self.ink_scopes.pop();
@@ -891,24 +946,32 @@ impl Walk<'_> {
                 Self::stamp_fill(child, &mut boxed.children);
                 Self::inherit_stretch(boxed);
             }
-            LayoutNode::Text { content, highlights, truncation, .. } => {
+            LayoutNode::Text {
+                content,
+                highlights,
+                truncation,
+                ..
+            } => {
                 // a text that reads for itself carries its binding into
                 // the scene: the lowering patches it by key when a write
                 // reaches it, and no walk comes this way for that
                 let binding = content.bound().cloned();
-                let text = placed(out, node(DomKind::Text(DomText {
-                    content: content.get(),
-                    color: self.current_ink(),
-                    inherits_ink: !self.ink_scopes.is_empty(),
-                    font: self.font,
-                    line_height: self.line_height.map(|height| height as f32),
-                    text_align: self.text_align,
-                    highlights: highlights
-                        .as_ref()
-                        .map(|h| (std::rc::Rc::clone(&h.ranges), h.color)),
-                    truncation: *truncation,
-                    inherits_face: self.font == self.declared,
-                })));
+                let text = placed(
+                    out,
+                    node(DomKind::Text(DomText {
+                        content: content.get(),
+                        color: self.current_ink(),
+                        inherits_ink: !self.ink_scopes.is_empty(),
+                        font: self.font,
+                        line_height: self.line_height.map(|height| height as f32),
+                        text_align: self.text_align,
+                        highlights: highlights
+                            .as_ref()
+                            .map(|h| (std::rc::Rc::clone(&h.ranges), h.color)),
+                        truncation: *truncation,
+                        inherits_face: self.font == self.declared,
+                    })),
+                );
                 text.style.interactive = self.pending_interactive.take();
                 text.style.set_tooltip(self.pending_tooltip.take());
                 text.binding = binding.map(crate::dom::NodeBinding::Text);
@@ -929,15 +992,18 @@ impl Walk<'_> {
             } => {
                 self.fields.push((path.clone(), *auto_focus));
                 let theme = crate::theme::current();
-                let field = placed(out, node(DomKind::Field(Box::new(crate::dom::DomField {
-                    path: path.clone(),
-                    content: content.clone(),
-                    placeholder: placeholder.clone(),
-                    secret: *secret,
-                    font: self.font,
-                    color: self.current_ink(),
-                    multiline: *multiline,
-                }))));
+                let field = placed(
+                    out,
+                    node(DomKind::Field(Box::new(crate::dom::DomField {
+                        path: path.clone(),
+                        content: content.clone(),
+                        placeholder: placeholder.clone(),
+                        secret: *secret,
+                        font: self.font,
+                        color: self.current_ink(),
+                        multiline: *multiline,
+                    }))),
+                );
                 field.style = DomStyle::of_look(DomLook {
                     background: (!*bare).then_some(theme.field),
                     border: (!*bare).then_some((theme.field_border, 1.0)),
@@ -951,14 +1017,24 @@ impl Walk<'_> {
             // a feed has no bytes an `<img>` could name: it is painted,
             // as an island, by the road that scales it on the GPU
             #[cfg(feature = "canvas")]
-            LayoutNode::Image { source: Some(crate::image_engine::ImageSource::Feed { .. }), .. } => {
-                out.push(self.island(tree, None));
+            LayoutNode::Image {
+                source: Some(crate::image_engine::ImageSource::Feed { .. }),
+                ..
+            } => {
+                out.push(self.island(tree, None)?);
             }
             #[cfg(not(feature = "canvas"))]
-            LayoutNode::Image { source: Some(crate::image_engine::ImageSource::Feed { .. }), .. } => {
+            LayoutNode::Image {
+                source: Some(crate::image_engine::ImageSource::Feed { .. }),
+                ..
+            } => {
                 out.push(node(DomKind::Box));
             }
-            LayoutNode::Image { source, fit, resizable } => {
+            LayoutNode::Image {
+                source,
+                fit,
+                resizable,
+            } => {
                 match source {
                     Some(source) => {
                         // the walk never measures, so nothing else asks
@@ -968,10 +1044,7 @@ impl Walk<'_> {
                         if let Some(env) = &self.env.layout {
                             let _ = crate::image_engine::intrinsic_of(env.images, source);
                         }
-                        let cover = matches!(
-                            fit,
-                            Some(motor::views::ContentMode::Fill)
-                        );
+                        let cover = matches!(fit, Some(motor::views::ContentMode::Fill));
                         let mut picture = node(DomKind::Image(crate::dom::DomImage {
                             key: source.key(),
                             cover,
@@ -1002,7 +1075,15 @@ impl Walk<'_> {
                     forced: *forced,
                 })));
             }
-            LayoutNode::Scroll { path, target, commanded, child, axes, fill, .. } => {
+            LayoutNode::Scroll {
+                path,
+                target,
+                commanded,
+                child,
+                axes,
+                fill,
+                ..
+            } => {
                 // a region the app holds in a binding takes the app's
                 // value: here the BROWSER is the clamp and the scroll
                 // observer writes back what it settled on, so a value
@@ -1016,11 +1097,14 @@ impl Walk<'_> {
                         .copied()
                         .unwrap_or_default()
                 });
-                let scroll = placed(out, node(DomKind::Scroll {
-                    path: path.clone(),
-                    offset: (offset.x, offset.y),
-                    target: target.clone(),
-                }));
+                let scroll = placed(
+                    out,
+                    node(DomKind::Scroll {
+                        path: path.clone(),
+                        offset: (offset.x, offset.y),
+                        target: target.clone(),
+                    }),
+                );
                 {
                     let layout = scroll.layout.as_mut().expect("flow node");
                     // the leftover length is the scroller's, and the
@@ -1034,7 +1118,7 @@ impl Walk<'_> {
                 // unless the region lays it out at its own
                 let outer_unbounded = self.unbounded;
                 self.unbounded = axes.vertical() && !*fill;
-                self.lower_into(child, &mut lowered);
+                self.lower_into(child, &mut lowered)?;
                 self.unbounded = outer_unbounded;
                 match lowered.as_slice() {
                     // a virtual stack IS the content already — no
@@ -1049,7 +1133,13 @@ impl Walk<'_> {
                     }
                 }
             }
-            LayoutNode::VirtualStack { row_extent, count, children, heights, measured } => {
+            LayoutNode::VirtualStack {
+                row_extent,
+                count,
+                children,
+                heights,
+                measured,
+            } => {
                 // the ONE number the browser cannot give: each row's
                 // slot and the total, prefix sums — arithmetic, never
                 // measure. Summed once and read for every row on the
@@ -1084,7 +1174,7 @@ impl Walk<'_> {
                 content.layout.as_mut().expect("flow node").height = Some(total as f32);
                 for (index, child) in children {
                     let opened = content.children.len();
-                    self.lower_into(child, &mut content.children);
+                    self.lower_into(child, &mut content.children)?;
                     for row in &mut content.children[opened..] {
                         if let Some(layout) = row.layout.as_mut() {
                             layout.slot_y = Some(start_of(*index) as f32);
@@ -1092,7 +1182,12 @@ impl Walk<'_> {
                     }
                 }
             }
-            LayoutNode::Split { axis, at: seam, children, .. } => {
+            LayoutNode::Split {
+                axis,
+                at: seam,
+                children,
+                ..
+            } => {
                 let at = &seam.value();
                 let kind = match axis {
                     Axis::Horizontal => DomKind::FlexRow,
@@ -1101,7 +1196,7 @@ impl Walk<'_> {
                 let container = placed(out, node(kind));
                 if let [a, b] = children.as_slice() {
                     let opened = container.children.len();
-                    self.lower_into(a, &mut container.children);
+                    self.lower_into(a, &mut container.children)?;
                     for lane in &mut container.children[opened..] {
                         if let Some(layout) = lane.layout.as_mut() {
                             match axis {
@@ -1111,7 +1206,7 @@ impl Walk<'_> {
                         }
                     }
                     let opened = container.children.len();
-                    self.lower_into(b, &mut container.children);
+                    self.lower_into(b, &mut container.children)?;
                     for lane in &mut container.children[opened..] {
                         if let Some(layout) = lane.layout.as_mut() {
                             layout.grow = true;
@@ -1125,12 +1220,13 @@ impl Walk<'_> {
             // would mean observing the element, which is a road of its
             // own — and a number invented here would be worse than no
             // number at all.
-            LayoutNode::Accessible { child, .. }
-            | LayoutNode::Measured { child, .. } => self.lower_into(child, out),
+            LayoutNode::Accessible { child, .. } | LayoutNode::Measured { child, .. } => {
+                self.lower_into(child, out)?;
+            }
 
             LayoutNode::Boundary { path, children, .. } => {
                 if self.promise(path, false, out).is_none() {
-                    self.lower_group(path, children, out);
+                    self.lower_group(path, children, out)?;
                 }
             }
             LayoutNode::BoundaryRef { path, slot, hints } => {
@@ -1145,7 +1241,10 @@ impl Walk<'_> {
                 // and the tree, a thousand of them in as many places in
                 // memory for a list, is not read
                 self.promised_fill = if slot.holds() {
-                    debug_assert!(crate::reconciler::is_retained(path), "the frame reached a boundary that left: {path}");
+                    debug_assert!(
+                        crate::reconciler::is_retained(path),
+                        "the frame reached a boundary that left: {path}"
+                    );
                     self.promise(path, true, out)
                 } else {
                     None
@@ -1157,19 +1256,24 @@ impl Walk<'_> {
                     // block of four nodes per row, filled with one and
                     // copied out. A missing entry keeps the identity
                     // anchor so the diff can match later
-                    let found = slot.with_layout(|tree| match tree {
-                        Some(LayoutNode::Boundary { path, children, .. }) => {
-                            self.lower_group(path, children, out);
-                            true
-                        }
-                        Some(tree) => {
-                            self.lower_into(tree, out);
-                            true
-                        }
-                        None => false,
-                    });
+                    let found =
+                        slot.with_layout(|tree| -> Result<bool, crate::text_error::TextError> {
+                            Ok(match tree {
+                                Some(LayoutNode::Boundary { path, children, .. }) => {
+                                    self.lower_group(path, children, out)?;
+                                    true
+                                }
+                                Some(tree) => {
+                                    self.lower_into(tree, out)?;
+                                    true
+                                }
+                                None => false,
+                            })
+                        })?;
                     if !found {
-                        out.push(node(DomKind::Group { path: std::rc::Rc::clone(path) }));
+                        out.push(node(DomKind::Group {
+                            path: std::rc::Rc::clone(path),
+                        }));
                     }
                     // what the walk below left here is not this
                     // reference's: it was lowered, not promised
@@ -1179,20 +1283,20 @@ impl Walk<'_> {
                 // as the wrapper they replace would stamp them
                 if !hints.is_empty() {
                     let (dom_id, href) = match hints.address.as_deref() {
-                Some(address) => (address.dom_id.clone(), address.href.clone()),
-                None => (None, None),
-            };
-            Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &dom_id, &href);
+                        Some(address) => (address.dom_id.clone(), address.href.clone()),
+                        None => (None, None),
+                    };
+                    Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &dom_id, &href);
                 }
             }
             LayoutNode::Interactive { path, child } => {
                 self.pending_interactive = Some(std::rc::Rc::clone(path));
-                self.lower_into(child, out);
+                self.lower_into(child, out)?;
                 self.pending_interactive = None;
             }
             LayoutNode::Animated { spec, child, .. } => {
                 self.pending_transition = Some((spec.response, spec.damping));
-                self.lower_into(child, out);
+                self.lower_into(child, out)?;
                 self.pending_transition = None;
             }
             LayoutNode::BoundaryHint { class } => {
@@ -1206,14 +1310,14 @@ impl Walk<'_> {
                 // rule: the browser owns the wait, so a tooltip costs
                 // no patch and no clock
                 self.pending_tooltip = Some(text.clone());
-                self.lower_into(child, out);
+                self.lower_into(child, out)?;
                 self.pending_tooltip = None;
             }
             LayoutNode::HoverGroup { path, child } => {
                 let key = crate::layout::group_key(path);
                 let opened = out.len();
                 self.groups.push(key);
-                self.lower_into(child, out);
+                self.lower_into(child, out)?;
                 self.groups.pop();
                 // the owner names itself; the followers below point
                 // their selectors at it
@@ -1221,16 +1325,21 @@ impl Walk<'_> {
                     owner.style.set_group_owner(Some(key));
                 }
             }
-            LayoutNode::Overlay { behind, layer, child, .. } => {
+            LayoutNode::Overlay {
+                behind,
+                layer,
+                child,
+                ..
+            } => {
                 // one grid cell, both in it — the browser stacks them
                 // in document order
                 let cell = placed(out, node(DomKind::Layers));
                 self.overlay_depth += 1;
                 let mut over = Vec::new();
-                self.lower_into(layer, &mut over);
+                self.lower_into(layer, &mut over)?;
                 self.overlay_depth -= 1;
                 let mut under = Vec::new();
-                self.lower_into(child, &mut under);
+                self.lower_into(child, &mut under)?;
                 if *behind {
                     cell.children.extend(over);
                     cell.children.extend(under);
@@ -1242,25 +1351,29 @@ impl Walk<'_> {
             LayoutNode::Live { child, .. } => {
                 // the clock belongs to the pixel modes; here the
                 // browser animates from the transition specs
-                self.lower_into(child, out);
+                self.lower_into(child, out)?;
             }
             LayoutNode::ControlRegion { child, .. } => {
                 // a window control means nothing in a browser tab
-                self.lower_into(child, out);
+                self.lower_into(child, out)?;
             }
             LayoutNode::ContextSource { child, .. } => {
                 // the runtime opens the menu off the right press; the
                 // element tree carries nothing for it
-                self.lower_into(child, out);
+                self.lower_into(child, out)?;
             }
             LayoutNode::DragSource { child, .. } => {
-                self.lower_into(child, out);
+                self.lower_into(child, out)?;
             }
             LayoutNode::DropTarget { child, .. } => {
-                let ringed =
-                    self.env.drop_rings.get(self.drops_seen).copied().unwrap_or(false);
+                let ringed = self
+                    .env
+                    .drop_rings
+                    .get(self.drops_seen)
+                    .copied()
+                    .unwrap_or(false);
                 self.drops_seen += 1;
-                self.lower_into(child, out);
+                self.lower_into(child, out)?;
                 // element mode never reads the draw list, so the ring
                 // must be an ELEMENT here — a box with a border, born
                 // with the drag and dying with it, and the LATER
@@ -1278,20 +1391,26 @@ impl Walk<'_> {
             }
             LayoutNode::DragRegion { child } => {
                 // a window drag region means nothing in a browser tab
-                self.lower_into(child, out);
+                self.lower_into(child, out)?;
             }
             LayoutNode::IgnoresSafeArea { child } => {
                 // the browser keeps its own safe area outside the tab
-                self.lower_into(child, out);
+                self.lower_into(child, out)?;
             }
-            LayoutNode::Hinted { tag, class, dom_id, href, child } => {
+            LayoutNode::Hinted {
+                tag,
+                class,
+                dom_id,
+                href,
+                child,
+            } => {
                 let opened = out.len();
-                self.lower_into(child, out);
+                self.lower_into(child, out)?;
                 Self::stamp_hints(&mut out[opened..], tag, class, dom_id, href);
             }
             #[cfg(feature = "canvas")]
             LayoutNode::ExactLayout { child } => {
-                out.push(self.exact(child));
+                out.push(self.exact(child)?);
             }
             #[cfg(not(feature = "canvas"))]
             LayoutNode::ExactLayout { .. } => {
@@ -1299,11 +1418,11 @@ impl Walk<'_> {
             }
             #[cfg(feature = "canvas")]
             LayoutNode::Island { path, child } => {
-                out.push(self.island(child, path.as_deref()));
+                out.push(self.island(child, path.as_deref())?);
             }
             #[cfg(feature = "canvas")]
             LayoutNode::Custom { path, .. } => {
-                out.push(self.island(tree, Some(path.as_str())));
+                out.push(self.island(tree, Some(path.as_str()))?);
             }
             // without the canvas feature the claiming APIs are gone,
             // so these arms are unreachable by construction — an
@@ -1318,29 +1437,38 @@ impl Walk<'_> {
             // and the island contract is the one the DOM already
             // enforces
             LayoutNode::Host { spec, .. } => {
-                let frame = placed(out, node(match spec {
-                    // a document rides SEALED: the browser's sandbox
-                    // with no powers holds it as `srcdoc`, its policy at
-                    // its head — never the url, which the policy forbade
-                    crate::host::HostSpec::Webview { url, document, .. } => match document {
-                        Some(document) => DomKind::Iframe {
-                            src: std::rc::Rc::from(document.sealed()),
-                            sealed: true,
+                let frame = placed(
+                    out,
+                    node(match spec {
+                        // a document rides SEALED: the browser's sandbox
+                        // with no powers holds it as `srcdoc`, its policy at
+                        // its head — never the url, which the policy forbade
+                        crate::host::HostSpec::Webview { url, document, .. } => match document {
+                            Some(document) => DomKind::Iframe {
+                                src: std::rc::Rc::from(document.sealed()),
+                                sealed: true,
+                            },
+                            None => DomKind::Iframe {
+                                src: std::rc::Rc::clone(url),
+                                sealed: false,
+                            },
                         },
-                        None => DomKind::Iframe { src: std::rc::Rc::clone(url), sealed: false },
-                    },
-                    // the stream rides by its handle; the glue finds it
-                    // in the page's registry — the stream itself never
-                    // crossed into the engine
-                    crate::host::HostSpec::Video { stream, mirrored, cover, corner_radius } => {
-                        DomKind::Video {
+                        // the stream rides by its handle; the glue finds it
+                        // in the page's registry — the stream itself never
+                        // crossed into the engine
+                        crate::host::HostSpec::Video {
+                            stream,
+                            mirrored,
+                            cover,
+                            corner_radius,
+                        } => DomKind::Video {
                             stream: stream.0,
                             mirrored: *mirrored,
                             cover: *cover,
                             radius: *corner_radius as f32,
-                        }
-                    }
-                }));
+                        },
+                    }),
+                );
                 let layout = frame.layout.as_mut().expect("flow node");
                 // a host is a filler on both axes by construction — it
                 // grows along the stack and stretches across it; a
@@ -1348,13 +1476,23 @@ impl Walk<'_> {
                 layout.grow = true;
                 layout.stretch = true;
             }
-            LayoutNode::Anchored { path, side, overlay, child } => {
+            LayoutNode::Anchored {
+                path,
+                side,
+                overlay,
+                child,
+            } => {
                 // the anchor gets an IDENTITY the glue can find: a
                 // group wrapped around the child, keyed off the
                 // popover's own path
                 let anchor_path = format!("{path}/#anchor");
-                let anchor = placed(out, node(DomKind::Group { path: std::rc::Rc::from(anchor_path.as_str()) }));
-                self.lower_into(child, &mut anchor.children);
+                let anchor = placed(
+                    out,
+                    node(DomKind::Group {
+                        path: std::rc::Rc::from(anchor_path.as_str()),
+                    }),
+                );
+                self.lower_into(child, &mut anchor.children)?;
 
                 // the side as the window sees it — the glue positions
                 // physically and knows nothing of the direction; here the
@@ -1372,10 +1510,11 @@ impl Walk<'_> {
                 });
                 // the CARD lowers under the portal — the overlay is a
                 // whole subtree, not a marker
-                self.lower_into(overlay, &mut popover.children);
+                self.lower_into(overlay, &mut popover.children)?;
                 self.overlays.push(popover);
             }
         }
+        Ok(())
     }
 
     /// The hints stamp whatever their child lowered to — one node in
@@ -1447,15 +1586,28 @@ impl Walk<'_> {
 
     /// A boundary's group, lowered again: its children walked, and the
     /// record of what it was lowered in filed for the next walk.
-    fn lower_group(&mut self, path: &std::rc::Rc<str>, children: &[LayoutNode], out: &mut Vec<DomNode>) {
+    fn lower_group(
+        &mut self,
+        path: &std::rc::Rc<str>,
+        children: &[LayoutNode],
+        out: &mut Vec<DomNode>,
+    ) -> Result<(), crate::text_error::TextError> {
         let env = self.filed_env();
-        let group = placed(out, node(DomKind::Group { path: std::rc::Rc::clone(path) }));
+        let group = placed(
+            out,
+            node(DomKind::Group {
+                path: std::rc::Rc::clone(path),
+            }),
+        );
         // room for the nodes, and only for them: what the body says about
         // its own element lowers to none, and the vector is the one the
         // retention keeps — a slot too many was a node's worth of memory
         // held by every row of a list
         group.children.reserve_exact(
-            children.iter().filter(|child| !matches!(child, LayoutNode::BoundaryHint { .. })).count(),
+            children
+                .iter()
+                .filter(|child| !matches!(child, LayoutNode::BoundaryHint { .. }))
+                .count(),
         );
         let outer_pending = self.pending_boundary_class.take();
         let drops_before = self.drops_seen;
@@ -1466,7 +1618,7 @@ impl Walk<'_> {
         self.runs_below = outer_runs && self.changed.above_a_run.contains(&**path);
         for child in children {
             let opened = group.children.len();
-            self.lower_into(child, &mut group.children);
+            self.lower_into(child, &mut group.children)?;
             // a kept boundary promised from its reference wears the fill
             // its record kept: its tree is not read again to ask
             match (child, self.promised_fill.take()) {
@@ -1489,8 +1641,7 @@ impl Walk<'_> {
         if let Some((class, binding)) = self.pending_boundary_class.take() {
             // the body spoke about its own element: an empty
             // class clears, anything else attributes
-            group.hints.class =
-                (!class.is_empty()).then(|| std::rc::Rc::from(class.as_str()));
+            group.hints.class = (!class.is_empty()).then(|| std::rc::Rc::from(class.as_str()));
             class_binding = binding;
         }
         group.binding = class_binding.clone().map(crate::dom::NodeBinding::Class);
@@ -1506,6 +1657,8 @@ impl Walk<'_> {
                 drops: self.drops_seen - drops_before,
             },
         ));
+
+        Ok(())
     }
 
     /// The engine PROPOSES a wrapper's box to its interior; a block
@@ -1668,22 +1821,25 @@ impl Walk<'_> {
     /// machinery the whole mode once ran on — and splices the result
     /// under a relative box the flow sizes and carries. Pixel parity
     /// with the canvas, by construction: same measure, same place.
-    fn exact(&mut self, subtree: &LayoutNode) -> DomNode {
+    fn exact(&mut self, subtree: &LayoutNode) -> Result<DomNode, crate::text_error::TextError> {
         let Some(env) = self.env.layout else {
-            return node(DomKind::Box);
+            return Ok(node(DomKind::Box));
         };
         let proposal = crate::layout::Proposal {
             width: self.slot.0,
             height: self.slot.1,
         };
-        let (size, fit) = subtree.measure(proposal, &env);
+        let (size, fit) = subtree.measure(proposal, &env)?;
         let mut placement = crate::layout::Placement::with_capture(size, self.current_ink());
         subtree.place(
-            crate::layout::Rect { origin: Point::default(), size },
+            crate::layout::Rect {
+                origin: Point::default(),
+                size,
+            },
             &fit,
             &env,
             &mut placement,
-        );
+        )?;
         // the interior arrives ABSOLUTE (geometry on every node); the
         // wrapper is a Content box — position:relative by creation —
         // sized by our answer, carried by the flow like any other box
@@ -1696,7 +1852,7 @@ impl Walk<'_> {
         }
         wrapper.children = captured.children;
         self.display.extend(placement.display);
-        wrapper
+        Ok(wrapper)
     }
 
     /// A canvas island: the engine measures and paints ITS OWN pixels,
@@ -1704,10 +1860,18 @@ impl Walk<'_> {
     /// locally — the subtree places at its own origin, so the commands
     /// are island-local by construction and the element gets a fixed
     /// box the browser never argues with.
-    fn island(&mut self, subtree: &LayoutNode, path: Option<&str>) -> DomNode {
+    fn island(
+        &mut self,
+        subtree: &LayoutNode,
+        path: Option<&str>,
+    ) -> Result<DomNode, crate::text_error::TextError> {
         let path: Option<std::rc::Rc<str>> = path.map(std::rc::Rc::from);
         let Some(env) = self.env.layout else {
-            return node(DomKind::Canvas { origin: (0.0, 0.0), display: (0, 0), path });
+            return Ok(node(DomKind::Canvas {
+                origin: (0.0, 0.0),
+                display: (0, 0),
+                path,
+            }));
         };
         // a flexible axis belongs to the browser: once it reported a
         // box, the island measures against THAT — the pixels and the
@@ -1727,7 +1891,7 @@ impl Walk<'_> {
             width: reported.map(|(w, _)| w).or(self.slot.0),
             height: reported.map(|(_, h)| h).or(self.slot.1),
         };
-        let (measured, fit) = subtree.measure(proposal, &env);
+        let (measured, fit) = subtree.measure(proposal, &env)?;
         // which axes FOLLOW the proposal? offer a different box and
         // watch what moves — a moved axis belongs to the browser:
         // `align-self: stretch`, no pinned size, and every resize
@@ -1736,7 +1900,7 @@ impl Walk<'_> {
             width: Some(proposal.width.unwrap_or(measured.width) + 97.0),
             height: Some(proposal.height.unwrap_or(measured.height) + 97.0),
         };
-        let (moved, _) = subtree.measure(shifted, &env);
+        let (moved, _) = subtree.measure(shifted, &env)?;
         let hungry = (
             (moved.width - measured.width).abs() > 0.5,
             (moved.height - measured.height).abs() > 0.5,
@@ -1762,11 +1926,14 @@ impl Walk<'_> {
         let start = self.display.len();
         let mut placement = crate::layout::Placement::with_ink(self.current_ink());
         subtree.place(
-            crate::layout::Rect { origin: Point::default(), size },
+            crate::layout::Rect {
+                origin: Point::default(),
+                size,
+            },
             &fit,
             &env,
             &mut placement,
-        );
+        )?;
         self.display.extend(placement.display);
         // the boxes inside this island keep their LOCAL frames — the
         // pointer door routes the browser's canvas coordinates by them
@@ -1794,7 +1961,7 @@ impl Walk<'_> {
         // reads it, but the island ledger sizes the pixels by it
         island.width = size.width;
         island.height = size.height;
-        island
+        Ok(island)
     }
 }
 
@@ -1854,8 +2021,10 @@ mod tests {
             hints: Default::default(),
             action: None,
         };
-        let groups = lower(&tree, &env_fixture(&offsets)).groups;
-        let env = |name: &str| &groups.iter().find(|(path, _)| &**path == name).expect("a record").1.env;
+        let groups = lower(&tree, &env_fixture(&offsets)).unwrap().groups;
+        let env = |name: &str| {
+            &groups.iter().find(|(path, _)| &**path == name).expect("a record").1.env
+        };
         assert!(std::rc::Rc::ptr_eq(env("a"), env("b")) && std::rc::Rc::ptr_eq(env("b"), env("c")), "one record");
         assert!(!std::rc::Rc::ptr_eq(env("c"), env("d")), "the pressed group's environment is its own");
         assert_ne!(**env("c"), **env("d"));
@@ -1909,7 +2078,7 @@ mod tests {
             LayoutNode::Styled { props: paper.shared(), child: Box::new(scroll()), hints: Default::default(), action: None },
         ]);
         let offsets = HashMap::default();
-        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let scene = lower(&tree, &env_fixture(&offsets)).unwrap().scene;
         let lowered = &scene.children[0].children;
         assert_eq!(lowered.len(), 7, "{lowered:#?}");
         for (at, node) in lowered.iter().enumerate() {
@@ -2029,11 +2198,11 @@ mod tests {
         };
         let offsets = HashMap::default();
         let env = env_fixture_in(&offsets, LayoutDirection::RightToLeft);
-        let output = lower(&island(LayoutDirection::LeftToRight), &env);
+        let output = lower(&island(LayoutDirection::LeftToRight), &env).unwrap();
         let mut boxes = Vec::new();
         boxes_with_direction(&output.scene, &mut boxes);
         assert_eq!(boxes, [Some(LayoutDirection::LeftToRight)], "the island's box names its direction");
-        let output = lower(&island(LayoutDirection::RightToLeft), &env);
+        let output = lower(&island(LayoutDirection::RightToLeft), &env).unwrap();
         let mut boxes = Vec::new();
         boxes_with_direction(&output.scene, &mut boxes);
         assert!(boxes.is_empty(), "the same direction opens no island: {boxes:?}");
@@ -2057,9 +2226,10 @@ mod tests {
             child: Box::new(text_node("anchor")),
         };
         let offsets = HashMap::default();
-        let ltr = lower(&anchored, &env_fixture(&offsets));
+        let ltr = lower(&anchored, &env_fixture(&offsets)).unwrap();
         assert_eq!(popover_side(&ltr.scene), Some(2), "left of the anchor");
-        let rtl = lower(&anchored, &env_fixture_in(&offsets, LayoutDirection::RightToLeft));
+        let rtl = lower(&anchored, &env_fixture_in(&offsets, LayoutDirection::RightToLeft))
+        .unwrap();
         assert_eq!(popover_side(&rtl.scene), Some(3), "right of the anchor");
     }
 
@@ -2084,7 +2254,7 @@ mod tests {
         };
         let offsets = HashMap::default();
         let start_x = |env: &FlowEnv| {
-            let output = lower(&washed, env);
+            let output = lower(&washed, env).unwrap();
             let boxed = &output.scene.children[0];
             match boxed.style.look().gradient {
                 Some(crate::layout::Gradient::Linear { start, .. }) => start.x,
@@ -2127,7 +2297,7 @@ mod tests {
         };
         let offsets = HashMap::default();
         let code = |align: CrossAlign| {
-            let scene = lower(&lane(align), &env_fixture(&offsets)).scene;
+            let scene = lower(&lane(align), &env_fixture(&offsets)).unwrap().scene;
             scene.children[0].layout.as_ref().expect("flow").align
         };
 
@@ -2163,7 +2333,7 @@ mod tests {
             action: None,
         };
         let offsets = HashMap::default();
-        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let scene = lower(&tree, &env_fixture(&offsets)).unwrap().scene;
         let row = &scene.children[0];
         let pane = &row.children[1];
         assert!(
@@ -2201,7 +2371,7 @@ mod tests {
             },
         };
         let offsets = HashMap::default();
-        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let scene = lower(&tree, &env_fixture(&offsets)).unwrap().scene;
         let pane = &scene.children[0];
         match &pane.kind {
             DomKind::Iframe { src, sealed: true } => {
@@ -2229,7 +2399,7 @@ mod tests {
             },
         };
         let offsets = HashMap::default();
-        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let scene = lower(&tree, &env_fixture(&offsets)).unwrap().scene;
         let feed = &scene.children[0];
         assert_eq!(
             feed.kind,
@@ -2254,7 +2424,7 @@ mod tests {
             action: None,
         };
         let offsets = HashMap::default();
-        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let scene = lower(&tree, &env_fixture(&offsets)).unwrap().scene;
         let column = &scene.children[0];
         assert!(matches!(column.kind, DomKind::FlexColumn));
         let layout = column.layout.as_ref().expect("flow");
@@ -2292,7 +2462,7 @@ mod tests {
             action: None,
         };
         let offsets = HashMap::default();
-        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let scene = lower(&tree, &env_fixture(&offsets)).unwrap().scene;
         fn walk(node: &DomNode) {
             assert!(node.layout.is_some(), "every flow node speaks records");
             assert_eq!((node.x, node.y, node.width, node.height).1, 0.0);
@@ -2328,7 +2498,7 @@ mod tests {
             measured: None,
         };
         let offsets = HashMap::default();
-        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let scene = lower(&tree, &env_fixture(&offsets)).unwrap().scene;
         let content = &scene.children[0];
         assert!(matches!(content.kind, DomKind::Content));
         assert_eq!(
@@ -2370,7 +2540,7 @@ mod tests {
             measured: None,
         };
         let offsets = HashMap::default();
-        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let scene = lower(&tree, &env_fixture(&offsets)).unwrap().scene;
         let content = &scene.children[0];
         // 334 rows of forty (0, 3, …, 999) and 666 of twenty
         let height = content.layout.as_ref().expect("flow").height;
@@ -2410,7 +2580,7 @@ mod tests {
         };
         let offsets = HashMap::default();
         let _ = crate::stats::take();
-        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let scene = lower(&tree, &env_fixture(&offsets)).unwrap().scene;
         let content = &scene.children[0];
         assert_eq!(content.layout.as_ref().expect("flow").height, Some(30_000.0));
         let slots: Vec<_> = content
@@ -2421,7 +2591,7 @@ mod tests {
         assert_eq!(slots, vec![Some(29_940.0), Some(29_970.0)]);
         assert_eq!(asked.get(), 0, "the closure is never walked");
         assert_eq!(crate::stats::take().rows_summed, 1000, "the cache summed its rows once");
-        let _ = lower(&tree, &env_fixture(&offsets));
+        let _ = lower(&tree, &env_fixture(&offsets)).unwrap();
         assert_eq!(crate::stats::take().rows_summed, 0, "and kept them");
     }
 
@@ -2440,7 +2610,7 @@ mod tests {
             action: None,
         };
         let offsets = HashMap::default();
-        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let scene = lower(&tree, &env_fixture(&offsets)).unwrap().scene;
         let boxed = &scene.children[0];
         assert_eq!(boxed.style.look().color, Some(Color::hex(0x888888)));
         let DomKind::Text(text) = &boxed.children[0].kind else {
@@ -2468,7 +2638,7 @@ mod tests {
             action: Some(std::rc::Rc::from("Row/#1")),
         };
         let offsets = HashMap::default();
-        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let scene = lower(&tree, &env_fixture(&offsets)).unwrap().scene;
         let [cell] = scene.children.as_slice() else {
             panic!("one cell: {:?}", scene.children);
         };
@@ -2505,7 +2675,7 @@ mod tests {
             action: None,
         };
         let offsets = HashMap::default();
-        let scene = lower(&over_hinted, &env_fixture(&offsets)).scene;
+        let scene = lower(&over_hinted, &env_fixture(&offsets)).unwrap().scene;
         let boxed = &scene.children[0];
         assert!(matches!(boxed.kind, DomKind::Box), "the style keeps its box: {boxed:?}");
         assert_eq!(boxed.children[0].hints.tag.as_deref(), Some("a"));
@@ -2516,7 +2686,7 @@ mod tests {
             hints: hinted("td"),
             action: None,
         };
-        let scene = lower(&hinted_style, &env_fixture(&offsets)).scene;
+        let scene = lower(&hinted_style, &env_fixture(&offsets)).unwrap().scene;
         let text = &scene.children[0];
         assert!(matches!(text.kind, DomKind::Text(_)), "the ink folds into the text: {text:?}");
         assert_eq!(text.hints.tag.as_deref(), Some("td"));
@@ -2539,7 +2709,7 @@ mod tests {
             action: None,
         };
         let offsets = HashMap::default();
-        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let scene = lower(&tree, &env_fixture(&offsets)).unwrap().scene;
         let last = scene.children.last().expect("the portal");
         assert!(matches!(
             &last.kind,
@@ -2590,7 +2760,7 @@ mod tests {
         let made: Vec<Item> = (1..=5).map(|id| Item { id, seen: State::new(0) }).collect();
         let table = Table { rows: State::new(std::rc::Rc::new(made.clone())) };
         let runtime = crate::runtime::Runtime::new();
-        let _ = runtime.dom_frame(&table, size);
+        let _ = runtime.dom_frame(&table, size).unwrap();
         let _ = crate::stats::take();
         let moves = |patches: &[crate::dom::DomPatch]| {
             patches.iter().filter(|p| matches!(p, crate::dom::DomPatch::Move { .. })).count()
@@ -2600,7 +2770,7 @@ mod tests {
         let mut order = made.clone();
         order.swap(1, 3);
         table.rows.set(std::rc::Rc::new(order.clone()));
-        let patches = runtime.dom_frame(&table, size);
+        let patches = runtime.dom_frame(&table, size).unwrap();
         assert_eq!(crate::stats::take().diff_reused, 5, "every row kept: {patches:?}");
         assert_eq!((moves(&patches), patches.len()), (2, 2), "{patches:?}");
 
@@ -2608,7 +2778,7 @@ mod tests {
         order.swap(0, 4);
         table.rows.set(std::rc::Rc::new(order));
         made[2].seen.set(1);
-        let patches = runtime.dom_frame(&table, size);
+        let patches = runtime.dom_frame(&table, size).unwrap();
         assert_eq!(crate::stats::take().diff_reused, 4, "the rows that did not run: {patches:?}");
         assert!(
             patches.iter().any(|p| matches!(
@@ -2658,7 +2828,9 @@ mod tests {
         impl Component for Column {
             fn body(self) -> impl View {
                 let tall = self.tall;
-                for_each(self.ids, |id| id.to_string(), move |id| if tall { Either::First(Tall) } else { Either::Second(Short(*id)) })
+                for_each(self.ids, |id| id.to_string(), move |id| {
+                        if tall { Either::First(Tall) } else { Either::Second(Short(*id)) }
+                    })
             }
         }
 
@@ -2666,10 +2838,10 @@ mod tests {
         for tall in [true, false] {
             let column = Column { ids: State::new(std::rc::Rc::new(vec![1, 2, 3, 4, 5])), tall };
             let runtime = crate::runtime::Runtime::new();
-            let _ = runtime.dom_frame(&column, size);
+            let _ = runtime.dom_frame(&column, size).unwrap();
             let _ = crate::stats::take();
             column.ids.set(std::rc::Rc::new(vec![1, 4, 3, 2, 5]));
-            let patches = runtime.dom_frame(&column, size);
+            let patches = runtime.dom_frame(&column, size).unwrap();
             assert_eq!(crate::stats::take().diff_reused, 5, "every row kept (tall {tall}): {patches:?}");
             assert!(
                 !patches.is_empty() && patches.iter().all(|p| matches!(p, crate::dom::DomPatch::Move { .. })),
@@ -2703,38 +2875,39 @@ mod tests {
 
         impl Component for Table {
             fn body(self) -> impl View {
-                for_each(self.rows, |id| id.to_string(), |id| {
-                    Row(*id).element("tr").css_class("row")
-                })
+                for_each(self.rows, |id| id.to_string(), |id| Row(*id).element("tr").css_class("row"),
+                )
             }
         }
 
         let size = crate::layout::Size { width: 400.0, height: 300.0 };
         let table = Table { rows: State::new(std::rc::Rc::new(vec![1, 2, 3, 4, 5])) };
         let runtime = crate::runtime::Runtime::new();
-        let _ = runtime.dom_frame(&table, size);
+        let _ = runtime.dom_frame(&table, size).unwrap();
         let hinted_refs = || {
             crate::reconciler::slot_of("Table/Keyed").with_layout(|tree| match tree {
                 Some(LayoutNode::Boundary { children, .. }) => children
                     .iter()
-                    .filter(|row| matches!(
+                    .filter(|row| {
+                        matches!(
                         row,
                         LayoutNode::BoundaryRef { hints, .. }
                             if hints.tag.as_deref() == Some("tr")
                                 && hints.class.as_deref() == Some("row")
                                 && hints.address.is_none()
-                    ))
+                    )
+                    })
                     .count(),
                 other => panic!("the list's retained tree: {other:?}"),
             })
         };
         assert_eq!(hinted_refs(), 5, "every row a hinted reference, no wrapper");
-        let page = crate::ssr::render(&table, size);
+        let page = crate::ssr::render(&table, size).unwrap();
         assert_eq!(page.html.matches("<tr ").count(), 5, "{}", page.html);
         assert_eq!(page.html.matches("class=\"row ").count(), 5, "{}", page.html);
 
         table.rows.set(std::rc::Rc::new(vec![1, 4, 3, 2, 5]));
-        let patches = runtime.dom_frame(&table, size);
+        let patches = runtime.dom_frame(&table, size).unwrap();
         assert_eq!(hinted_refs(), 5, "the list re-ran: its rows are references again");
         assert_eq!(patches.len(), 2, "{patches:?}");
         assert!(
@@ -2766,7 +2939,7 @@ mod tests {
         let count = State::new(0);
         let root = Page { count }.element("main").css_class("page");
         let runtime = crate::runtime::Runtime::new();
-        let mount = runtime.dom_frame(&root, size);
+        let mount = runtime.dom_frame(&root, size).unwrap();
         assert!(
             mount.iter().any(|p| matches!(
                 p,
@@ -2776,10 +2949,10 @@ mod tests {
             )),
             "{mount:?}"
         );
-        let quiet = runtime.dom_frame(&root, size);
+        let quiet = runtime.dom_frame(&root, size).unwrap();
         assert!(quiet.is_empty(), "nothing changed, nothing is said: {quiet:?}");
         count.set(1);
-        let counted = runtime.dom_frame(&root, size);
+        let counted = runtime.dom_frame(&root, size).unwrap();
         assert!(
             !counted.iter().any(|p| matches!(p, crate::dom::DomPatch::SetHints { .. })),
             "the page keeps its class: {counted:?}"
@@ -2812,13 +2985,11 @@ mod tests {
 
         let runtime = crate::runtime::Runtime::new();
         let size = crate::layout::Size { width: 600.0, height: 300.0 };
-        let mount = runtime.dom_frame(&Card, size);
+        let mount = runtime.dom_frame(&Card, size).unwrap();
         let canvas = mount
             .iter()
             .find_map(|patch| match patch {
-                crate::dom::DomPatch::Create { id, kind: crate::dom::CreateKind::Canvas, .. } => {
-                    Some(*id)
-                }
+                crate::dom::DomPatch::Create { id, kind: crate::dom::CreateKind::Canvas, .. } => Some(*id),
                 _ => None,
             })
             .expect("the island mounted");
@@ -2848,7 +3019,7 @@ mod tests {
         };
         let offsets = HashMap::default();
         let plain = |tree: &LayoutNode| {
-            let scene = lower(tree, &env_fixture(&offsets)).scene;
+            let scene = lower(tree, &env_fixture(&offsets)).unwrap().scene;
             scene.children[0].layout.as_ref().expect("flow").plain
         };
         assert!(plain(&row(0.0)), "a sentence flows as one block");
@@ -2876,7 +3047,7 @@ mod tests {
             action: None,
         };
         let offsets = HashMap::default();
-        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let scene = lower(&tree, &env_fixture(&offsets)).unwrap().scene;
         let band = scene.children[0].children[0].layout.as_ref().expect("flow");
         assert!(!band.grow, "no flex on the column's axis: {band:?}");
         assert!(band.stretch, "the column takes it edge to edge: {band:?}");
@@ -2902,7 +3073,7 @@ mod tests {
             }),
         };
         let offsets = HashMap::default();
-        let scene = lower(&rule, &env_fixture(&offsets)).scene;
+        let scene = lower(&rule, &env_fixture(&offsets)).unwrap().scene;
         let row = scene.children[0].children[0].layout.as_ref().expect("flow");
         assert!(row.stretch, "the row reaches the frame's edges: {row:?}");
     }
@@ -2945,7 +3116,7 @@ mod tests {
             child: Box::new(page),
         };
         let offsets = HashMap::default();
-        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let scene = lower(&tree, &env_fixture(&offsets)).unwrap().scene;
         let content = &scene.children[0].children[0];
         let column = &content.children[0];
         let section = column.children[0].layout.as_ref().expect("flow");
@@ -2966,7 +3137,7 @@ mod tests {
             child: Box::new(text_node("words")),
         };
         let offsets = HashMap::default();
-        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let scene = lower(&tree, &env_fixture(&offsets)).unwrap().scene;
         let frame = scene.children[0].layout.as_ref().expect("flow");
         assert_eq!(frame.max_width, Some(500.0));
         assert_eq!(frame.max_height, None, "{frame:?}");
@@ -2990,7 +3161,7 @@ mod tests {
         };
         let offsets = HashMap::default();
         let lowered = |resizable| {
-            let scene = lower(&picture(resizable), &env_fixture(&offsets)).scene;
+            let scene = lower(&picture(resizable), &env_fixture(&offsets)).unwrap().scene;
             scene.children[0].children[0].layout.clone().expect("flow")
         };
         let held = lowered(true);

@@ -72,12 +72,15 @@ impl Bench {
     }
 
     fn frame(&self) -> usize {
-        self.runtime.display_frame(&self.root, VIEWPORT).len()
+        self.runtime.display_frame(&self.root, VIEWPORT).unwrap()
+            .len()
     }
 }
 
 fn scenarios(tag: &str, scene: bool, legend_rows: usize, full: bool) -> (Vec<harness::Report>, Vec<harness::StageRow>) {
-    let runtime = || if scene { Runtime::scene("w0") } else { Runtime::new() };
+    let runtime = || {
+        if scene { Runtime::scene("w0") } else { Runtime::new() }
+    };
     let mut reports = Vec::new();
     let mut rows = Vec::new();
     let label = |name: &str| format!("{tag} {name}");
@@ -121,7 +124,8 @@ fn scenarios(tag: &str, scene: bool, legend_rows: usize, full: bool) -> (Vec<har
         ("wheel, pointer on hover rows", OVER_ROWS, OVER_ROWS),
     ] {
         let bench = Bench::new(runtime(), legend_rows);
-        bench.runtime.pointer_moved(at.0, at.1, Modifiers::NONE);
+        bench.runtime.pointer_moved(at.0, at.1, Modifiers::NONE)
+            .unwrap();
         bench.frame();
         let mut turn = 0usize;
         let mut step = || {
@@ -178,8 +182,8 @@ fn scenarios(tag: &str, scene: bool, legend_rows: usize, full: bool) -> (Vec<har
                 bench.frame();
             }
             ticks += 1;
-            bench.runtime.tick(1.0 / 120.0);
-            bench.runtime.animation_frame(&bench.root, VIEWPORT).len()
+            bench.runtime.tick(1.0 / 120.0).unwrap();
+            bench.runtime.animation_frame(&bench.root, VIEWPORT).unwrap().len()
         };
         reports.push(measure(label("tick (a flight, no body)"), WARMUP, FRAMES, || (), &mut step));
         rows.push(stages(label("tick (a flight, no body)"), FRAMES, || (), &mut step));

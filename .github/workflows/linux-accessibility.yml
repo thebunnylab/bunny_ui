@@ -5,6 +5,7 @@ on:
     paths:
       - 'crates/bunny_ui/**'
       - 'crates/bunny_ui_linux/**'
+      - 'crates/bunny_ui_vulkan/**'
       - 'scripts/check-linux-accessibility.sh'
       - 'scripts/record-native-text-environment.py'
       - '.github/workflows/linux-accessibility.yml'
@@ -91,3 +92,29 @@ jobs:
           name: native-text-linux
           path: native-text-environment.json
           if-no-files-found: error
+
+  vulkan-recovery:
+    name: Vulkan frame recovery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      BUNNY_REQUIRE_VULKAN: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Native Vulkan loader and software device
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers vulkan-tools
+          vulkaninfo --summary
+      - name: Pinned compiler
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
+          rustc --version --verbose
+      - name: Refused text preserves the frame and retries staged tiles
+        run: |
+          cargo test -p bunny-ui-vulkan --locked --lib rejected_text_discards_unsubmitted_tiles_before_the_same_frame_retries -- --nocapture
+          BUNNY_PARANOID=all cargo test -p bunny-ui-vulkan --locked --lib rejected_text_discards_unsubmitted_tiles_before_the_same_frame_retries -- --nocapture

@@ -233,7 +233,7 @@ fn main() {
     reports.push(measure("mount (build+capture+diff)", 2, 30, || (), || {
         let (table, runtime) = fresh();
         {
-        let patches = runtime.dom_frame(&table, size);
+        let patches = runtime.dom_frame(&table, size).unwrap();
         std::hint::black_box(encode(&patches).len());
         patches.len()
     }
@@ -241,7 +241,7 @@ fn main() {
     stage_rows.push(stages("mount", 30, || {
         let (table, runtime) = fresh();
         {
-        let patches = runtime.dom_frame(&table, size);
+        let patches = runtime.dom_frame(&table, size).unwrap();
         std::hint::black_box(encode(&patches).len());
         patches.len()
     }
@@ -249,14 +249,14 @@ fn main() {
 
     // the steady fixture every update scenario shares
     let (table, runtime) = fresh();
-    let _ = runtime.dom_frame(&table, size);
+    let _ = runtime.dom_frame(&table, size).unwrap();
 
     // 2. toggle ONE row: the O(change) question in one number
     let toggles = table.toggles.clone();
     reports.push(measure("toggle 1 row", 5, 51, || (), || {
         toggles[5].set(!toggles[5].get());
         {
-        let patches = runtime.dom_frame(&table, size);
+        let patches = runtime.dom_frame(&table, size).unwrap();
         std::hint::black_box(encode(&patches).len());
         patches.len()
     }
@@ -264,7 +264,7 @@ fn main() {
     stage_rows.push(stages("toggle 1 row", 51, || {
         toggles[5].set(!toggles[5].get());
         {
-        let patches = runtime.dom_frame(&table, size);
+        let patches = runtime.dom_frame(&table, size).unwrap();
         std::hint::black_box(encode(&patches).len());
         patches.len()
     }
@@ -276,7 +276,7 @@ fn main() {
             toggle.set(!toggle.get());
         }
         {
-        let patches = runtime.dom_frame(&table, size);
+        let patches = runtime.dom_frame(&table, size).unwrap();
         std::hint::black_box(encode(&patches).len());
         patches.len()
     }
@@ -286,7 +286,7 @@ fn main() {
             toggle.set(!toggle.get());
         }
         {
-        let patches = runtime.dom_frame(&table, size);
+        let patches = runtime.dom_frame(&table, size).unwrap();
         std::hint::black_box(encode(&patches).len());
         patches.len()
     }
@@ -302,12 +302,12 @@ fn main() {
         50,
         || {
             filtered.set(true);
-            let _ = runtime.dom_frame(&table, size);
+            let _ = runtime.dom_frame(&table, size).unwrap();
         },
         || {
             filtered.set(false);
             {
-        let patches = runtime.dom_frame(&table, size);
+        let patches = runtime.dom_frame(&table, size).unwrap();
         std::hint::black_box(encode(&patches).len());
         patches.len()
     }
@@ -319,12 +319,12 @@ fn main() {
         50,
         || {
             filtered.set(false);
-            let _ = runtime.dom_frame(&table, size);
+            let _ = runtime.dom_frame(&table, size).unwrap();
         },
         || {
             filtered.set(true);
             {
-        let patches = runtime.dom_frame(&table, size);
+        let patches = runtime.dom_frame(&table, size).unwrap();
         std::hint::black_box(encode(&patches).len());
         patches.len()
     }
@@ -333,7 +333,7 @@ fn main() {
     stage_rows.push(stages("filter flip", 50, || {
         filtered.set(!filtered.get());
         {
-        let patches = runtime.dom_frame(&table, size);
+        let patches = runtime.dom_frame(&table, size).unwrap();
         std::hint::black_box(encode(&patches).len());
         patches.len()
     }
@@ -341,12 +341,12 @@ fn main() {
 
     // 5. sustained toggles over the FULL table: frames in one second
     filtered.set(false);
-    let _ = runtime.dom_frame(&table, size);
+    let _ = runtime.dom_frame(&table, size).unwrap();
     let deadline = Instant::now();
     let mut sustained = 0u64;
     while deadline.elapsed().as_secs_f64() < 1.0 {
         toggles[sustained as usize % ROWS].set(!toggles[sustained as usize % ROWS].get());
-        let _ = runtime.dom_frame(&table, size);
+        let _ = runtime.dom_frame(&table, size).unwrap();
         sustained += 1;
     }
 

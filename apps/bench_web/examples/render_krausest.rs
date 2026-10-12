@@ -9,11 +9,11 @@
 
 use bunny_ui::layout::Size;
 
-fn main() {
+fn main() -> Result<(), bunny_ui::text_error::TextError> {
     let page = bunny_ui::ssr::render(
         &bench_web::keyed::app(),
         Size { width: 1200.0, height: 800.0 },
-    );
+    )?;
     println!(
         "<!DOCTYPE html>\n<html lang=\"{lang}\" dir=\"{dir}\">\n<head>\n    <meta charset=\"utf-8\"/>\n    \
          <title>bunny_ui-\"keyed\"</title>\n    \
@@ -26,4 +26,5 @@ fn main() {
         css = page.css,
         html = page.html,
     );
+    Ok(())
 }

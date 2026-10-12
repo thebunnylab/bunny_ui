@@ -44,9 +44,16 @@ fn main() {
         if !done && ready.replace(true) {
             return;
         }
-        let Some(snapshot) = observer.ime_snapshot() else {
-            eprintln!("EDITOR_STATE_ERROR no focused editor");
-            return;
+        let snapshot = match observer.ime_snapshot() {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                eprintln!("EDITOR_STATE_ERROR no focused editor");
+                return;
+            }
+            Err(error) => {
+                eprintln!("EDITOR_STATE_ERROR native text: {error}");
+                return;
+            }
         };
         let kind = if done { "EDITOR_DONE" } else { "EDITOR_READY" };
         let result = if done {

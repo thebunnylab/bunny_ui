@@ -29,12 +29,14 @@ fn paragraph_rendering_context_only_edit_damages_and_repaints_the_line() {
         let engine = ContextEngine::default();
         let mut surface = Surface::new(80 * scale, 32 * scale, scale, Color::WHITE);
         let first = DisplayList::from(vec![command(&a)]);
-        surface.frame(first, &engine, &RawImages::default());
+        surface.frame(first, &engine, &RawImages::default())
+            .unwrap();
         let before = surface.bitmap().pixels().to_vec();
         let next = DisplayList::from(vec![command(&b)]);
         assert!(
             !surface
                 .frame(next.clone(), &engine, &RawImages::default())
+                .unwrap()
                 .is_empty()
         );
         let expected = rasterize_with(
@@ -45,12 +47,14 @@ fn paragraph_rendering_context_only_edit_damages_and_repaints_the_line() {
             Color::WHITE,
             &engine,
             &RawImages::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(surface.bitmap().pixels(), expected.pixels());
         assert_ne!(before, expected.pixels());
         assert!(
             surface
                 .frame(next, &engine, &RawImages::default())
+                .unwrap()
                 .is_empty()
         );
     }

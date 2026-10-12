@@ -25,7 +25,7 @@ use std::cell::{Cell, RefCell};
 
 use bunny_ui::gpu::shaders::PRELUDE_300ES;
 use bunny_ui::gpu::walk::{
-    build_frame, AtlasGround, FrameBatches, GlassInstance, RectInstance, RunAtlas, RunKind,
+    build_frame, RenderError, AtlasGround, FrameBatches, GlassInstance, RectInstance, RunAtlas, RunKind,
     SpriteInstance, GLASS_MAX_LEVEL,
 };
 use bunny_ui::image_engine::PixelFormat;
@@ -313,9 +313,13 @@ fn tiles_survive() -> bool {
     // a scene of its own: runtimes on one thread take turns at the input
     // tables by their roots' names, and the page's is never this one
     let runtime = bunny_ui::runtime::Runtime::scene("bunny-gpu-probe");
-    let display = runtime.display_frame(&bunny_ui::custom::custom(probe), size);
+    let Some(display) = crate::native_event(runtime.display_frame(&bunny_ui::custom::custom(probe), size).map(Some), None) else {
+        return false;
+    };
     let black = Color { r: 0, g: 0, b: 0, a: 255 };
-    present_window(None, &display, size, 1, black, &*runtime.text(), &*runtime.images());
+    if !crate::native_event(present_window(None, &display, size, 1, black, &*runtime.text(), &*runtime.images()).map(|()| true), false) {
+        return false;
+    }
     let rgba = read_rgba((18, PROBE_TALL));
     let near = |x: usize, y: usize, want: [u8; 4]| {
         let at = (y * 18 + x) * 4;
@@ -978,14 +982,14 @@ pub(crate) fn present_window(
     canvas: Color,
     text: &dyn TextEngine,
     images: &dyn ImageEngine,
-) {
+) -> Result<(), RenderError> {
     let physical = island.map(|(_, box4)| box4).unwrap_or((
         ((size.width.round() as usize) * scale).max(1) as u32,
         ((size.height.round() as usize) * scale).max(1) as u32,
     ));
-    TIER.with(|slot| {
+    TIER.with(|slot| -> Result<(), RenderError> {
         let mut slot = slot.borrow_mut();
-        let Some(tier) = slot.as_mut() else { return };
+        let Some(tier) = slot.as_mut() else { return Ok(()) };
         if tier.physical != physical {
             tier.physical = physical;
             unsafe { gl_resize(physical.0, physical.1) };
@@ -1002,7 +1006,8 @@ pub(crate) fn present_window(
                     walked = true;
                     break;
                 }
-                Err(_) => {
+                Err(RenderError::Text(error)) => return Err(RenderError::Text(error)),
+                Err(RenderError::AtlasFull) => {
                     let grow = attempt == 0 && tier.max_texture >= 4096;
                     let Tier { ground, atlas, .. } = tier;
                     atlas.reset(ground, grow);
@@ -1010,8 +1015,7 @@ pub(crate) fn present_window(
             }
         }
         if !walked {
-            say("bunny gl: the atlas overflowed twice - the frame is short");
-            return;
+            return Err(RenderError::AtlasFull);
         }
 
         // a pane READS what is under it, so a frame that holds one
@@ -1179,7 +1183,8 @@ pub(crate) fn present_window(
             unsafe { gl_island_blit(id, physical.0, physical.1) };
         }
         unsafe { gl_flush() };
-    });
+        Ok(())
+    })
 }
 
 pub(crate) const GL_FRAMEBUFFER: u32 = 0x8D40;

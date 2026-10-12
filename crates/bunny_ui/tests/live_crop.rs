@@ -56,8 +56,8 @@ fn an_opaque_live_fill_keeps_only_its_ink_and_matches_the_full_raster() {
                 width: 80.0,
                 height: 50.0,
             };
-            let display = runtime.display_frame(&view, size);
-            let mut blits = runtime.live_islands_all(scale);
+            let display = runtime.display_frame(&view, size).unwrap();
+            let mut blits = runtime.live_islands_all(scale).unwrap();
             assert_eq!(blits.len(), 1);
             let blit = blits.remove(0);
             assert!(
@@ -70,7 +70,8 @@ fn an_opaque_live_fill_keeps_only_its_ink_and_matches_the_full_raster() {
                 50 * scale,
                 scale,
                 Color::rgba(0, 0, 0, 0),
-            );
+            )
+            .unwrap();
             assert_eq!(
                 composed(&blit, size, scale),
                 expected.to_rgba_bytes(),
@@ -82,7 +83,7 @@ fn an_opaque_live_fill_keeps_only_its_ink_and_matches_the_full_raster() {
                 "ordinary placement must not expand the cropped layer"
             );
             assert!(
-                runtime.live_islands_all(scale).is_empty(),
+                runtime.live_islands_all(scale).unwrap().is_empty(),
                 "an unchanged picture stays quiet"
             );
         }
@@ -113,13 +114,13 @@ fn a_compact_live_surface_moves_with_layout_without_repainting() {
     let view = Shift {
         offset: offset.clone(),
     };
-    let _ = runtime.display_frame(&view, size);
-    let first = runtime.live_islands_all(1).remove(0);
+    let _ = runtime.display_frame(&view, size).unwrap();
+    let first = runtime.live_islands_all(1).unwrap().remove(0);
     assert_eq!(first.width, 12);
     let before = runtime.live_frames().remove(0).1;
     offset.set(57.0);
-    let _ = runtime.display_frame(&view, size);
-    assert!(runtime.live_islands_all(1).is_empty());
+    let _ = runtime.display_frame(&view, size).unwrap();
+    assert!(runtime.live_islands_all(1).unwrap().is_empty());
     let after = runtime.live_frames().remove(0).1;
     assert_eq!(after.size, before.size);
     assert_eq!(after.origin.x - before.origin.x, 50.0);
@@ -137,18 +138,18 @@ fn fractional_placement_restores_the_full_texture_without_stale_cropping() {
     let view = Shift {
         offset: offset.clone(),
     };
-    let _ = runtime.display_frame(&view, size);
-    assert_eq!(runtime.live_islands_all(1).remove(0).width, 12);
+    let _ = runtime.display_frame(&view, size).unwrap();
+    assert_eq!(runtime.live_islands_all(1).unwrap().remove(0).width, 12);
     offset.set(7.5);
-    let _ = runtime.display_frame(&view, size);
-    let full = runtime.live_islands_all(1).remove(0);
+    let _ = runtime.display_frame(&view, size).unwrap();
+    let full = runtime.live_islands_all(1).unwrap().remove(0);
     assert_eq!(
         full.width, 80,
         "fractional edges need the old filtering neighborhood"
     );
     assert_eq!(runtime.live_frames()[0].1, full.frame);
-    assert!(runtime.live_islands_all(1).is_empty());
+    assert!(runtime.live_islands_all(1).unwrap().is_empty());
     offset.set(8.0);
-    let _ = runtime.display_frame(&view, size);
-    assert_eq!(runtime.live_islands_all(1).remove(0).width, 12);
+    let _ = runtime.display_frame(&view, size).unwrap();
+    assert_eq!(runtime.live_islands_all(1).unwrap().remove(0).width, 12);
 }

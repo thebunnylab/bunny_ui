@@ -1003,7 +1003,9 @@ pub fn install_gpu() -> bool {
         eprintln!("bunny_ui ios: the GPU road did not come up — nothing paints on this device");
         return false;
     };
-    presenter.prime(bounds.size.width, bounds.size.height, scale.round().max(1.0) as usize);
+    if !crate::native_event(presenter.prime(bounds.size.width, bounds.size.height, scale.round().max(1.0) as usize).map(|()| true), false) {
+        return false;
+    }
     PRESENTER.with(|slot| *slot.borrow_mut() = Some(presenter));
     true
 }
@@ -1016,15 +1018,16 @@ pub fn present(
     canvas: Color,
     text: &dyn TextEngine,
     images: &dyn ImageEngine,
-) {
+) -> Result<(), bunny_ui::gpu::walk::RenderError> {
     if BACKGROUNDED.with(Cell::get) {
-        return;
+        return Ok(());
     }
-    PRESENTER.with(|slot| {
+    PRESENTER.with(|slot| -> Result<(), bunny_ui::gpu::walk::RenderError> {
         if let Some(presenter) = slot.borrow_mut().as_mut() {
-            presenter.present(display, size, scale, canvas, text, images, false);
+            presenter.present(display, size, scale, canvas, text, images, false)?;
         }
-    });
+        Ok(())
+    })
 }
 
 // MARK: - The classes

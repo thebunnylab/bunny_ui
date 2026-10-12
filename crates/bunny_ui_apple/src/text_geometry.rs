@@ -107,44 +107,60 @@ pub(super) fn line_geometry(
         return None;
     }
     let line = OwnedLine(raw);
-    let units = text.encode_utf16().count();
-    let mut leading = vec![None; units];
-    let mut trailing = vec![None; units];
-    for edge in caret_edges(line.0) {
-        let table = if edge.leading {
-            &mut leading
-        } else {
-            &mut trailing
-        };
-        if let Some(slot) = table.get_mut(edge.index) {
-            *slot = Some(edge.offset);
-        }
-    }
-    let offset = |index: usize| -> Option<f64> {
-        let index = isize::try_from(index).ok()?;
-        // SAFETY: a live complete CTLine and a scalar-aligned UTF-16 index.
-        Some(unsafe { CTLineGetOffsetForStringIndex(line.0, index, std::ptr::null_mut()) })
-    };
-    let mut cells = Vec::new();
-    let mut at = 0;
-    for (byte, character) in text.char_indices() {
-        let end = at + character.len_utf16();
-        let before = leading[at].or_else(|| offset(at))?;
-        let after = trailing[end - 1].or_else(|| offset(end))?;
-        match TextCell::new(byte..byte + character.len_utf8(), before, after) {
-            Ok(cell) => cells.push(cell),
-            Err(error) => {
-                eprintln!("bunny_ui_apple: {error}");
-                return None;
-            }
-        }
-        at = end;
-    }
-    match LineGeometry::new(text, cells) {
-        Ok(geometry) => Some(geometry),
+    match from_line(line.0, text, 0) {
+        Ok(value) => Some(value),
         Err(error) => {
             eprintln!("bunny_ui_apple: {error}");
             None
         }
     }
+}
+
+/// Map paragraph-global native indices to line-local UTF-8 cells.
+pub(super) fn from_line(
+    line: CTLineRef,
+    text: &str,
+    start: usize,
+) -> Result<LineGeometry, bunny_ui::text_error::TextError> {
+    use bunny_ui::text_error::TextError;
+    let units = text.encode_utf16().count();
+    let mut leading = vec![None; units];
+    let mut trailing = vec![None; units];
+    for edge in caret_edges(line) {
+        let table = if edge.leading {
+            &mut leading
+        } else {
+            &mut trailing
+        };
+        if let Some(slot) = edge
+            .index
+            .checked_sub(start)
+            .and_then(|index| table.get_mut(index))
+        {
+            *slot = Some(edge.offset);
+        }
+    }
+    let offset = |index: usize| -> Option<f64> {
+        let index = isize::try_from(start.checked_add(index)?).ok()?;
+        // SAFETY: a live complete CTLine and a scalar-aligned UTF-16 index.
+        Some(unsafe { CTLineGetOffsetForStringIndex(line, index, std::ptr::null_mut()) })
+    };
+    let mut cells = Vec::new();
+    let mut at = 0;
+    for (byte, character) in text.char_indices() {
+        let end = at + character.len_utf16();
+        let before = leading[at]
+            .or_else(|| offset(at))
+            .ok_or(TextError::IndexOverflow { engine: "CoreText" })?;
+        let after = trailing[end - 1]
+            .or_else(|| offset(end))
+            .ok_or(TextError::IndexOverflow { engine: "CoreText" })?;
+        cells.push(TextCell::new(
+            byte..byte + character.len_utf8(),
+            before,
+            after,
+        )?);
+        at = end;
+    }
+    LineGeometry::new(text, cells).map_err(Into::into)
 }

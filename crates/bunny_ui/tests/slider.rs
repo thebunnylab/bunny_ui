@@ -35,16 +35,17 @@ fn frame(runtime: &Runtime, view: Control) -> bunny_ui::layout::LayoutResult {
             height: 32.0,
         }),
     )
+        .unwrap()
 }
 fn near(actual: f64, expected: f64) {
     assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
 }
 fn click(runtime: &Runtime, x: f64) {
-    runtime.pointer_pressed(x, 16.0);
+    runtime.pointer_pressed(x, 16.0).unwrap();
     runtime.pointer_released(x, 16.0);
 }
 fn key(runtime: &Runtime, key: Key) {
-    assert!(runtime.key_stroke(KeyPattern::key(key)).handled);
+    assert!(runtime.key_stroke(KeyPattern::key(key)).unwrap().handled);
 }
 
 #[test]
@@ -95,23 +96,23 @@ fn track_click_drag_capture_and_release_update_the_binding() {
     near(view.value.get(), 1.0);
     click(&runtime, 210.0);
     near(view.value.get(), 60.0);
-    runtime.pointer_pressed(110.0, 16.0);
+    runtime.pointer_pressed(110.0, 16.0).unwrap();
     near(view.value.get(), 31.0);
-    runtime.pointer_moved(-100.0, 16.0, false);
+    runtime.pointer_moved(-100.0, 16.0, false).unwrap();
     near(view.value.get(), 1.0);
-    runtime.pointer_moved(400.0, 16.0, false);
+    runtime.pointer_moved(400.0, 16.0, false).unwrap();
     near(view.value.get(), 60.0);
     runtime.pointer_released(400.0, 16.0);
-    runtime.pointer_moved(10.0, 16.0, false);
+    runtime.pointer_moved(10.0, 16.0, false).unwrap();
     near(view.value.get(), 60.0);
 }
 
 #[test]
 fn pressing_the_thumb_keeps_the_grab_offset_without_a_jump() {
     let (runtime, view) = setup(SliderRange::new(0.0..=100.0).unwrap(), 50.0);
-    runtime.pointer_pressed(115.0, 16.0);
+    runtime.pointer_pressed(115.0, 16.0).unwrap();
     near(view.value.get(), 50.0);
-    runtime.pointer_moved(135.0, 16.0, false);
+    runtime.pointer_moved(135.0, 16.0, false).unwrap();
     near(view.value.get(), 60.0);
     runtime.pointer_released(135.0, 16.0);
 }
@@ -173,26 +174,27 @@ fn right_to_left_mirrors_pointer_and_horizontal_keys_only() {
 #[test]
 fn disabled_and_escape_stop_writes_including_mid_gesture() {
     let (runtime, view) = setup(SliderRange::new(0.0..=100.0).unwrap(), 50.0);
-    runtime.pointer_pressed(110.0, 16.0);
-    runtime.pointer_moved(130.0, 16.0, false);
+    runtime.pointer_pressed(110.0, 16.0).unwrap();
+    runtime.pointer_moved(130.0, 16.0, false).unwrap();
     near(view.value.get(), 60.0);
     key(&runtime, Key::Escape);
-    runtime.pointer_moved(170.0, 16.0, false);
+    runtime.pointer_moved(170.0, 16.0, false).unwrap();
     near(view.value.get(), 60.0);
     runtime.pointer_released(170.0, 16.0);
     view.disabled.set(true);
     frame(&runtime, view);
     click(&runtime, 210.0);
     near(view.value.get(), 60.0);
-    assert!(!runtime.key_stroke(KeyPattern::key(Key::End)).handled);
+    assert!(!runtime.key_stroke(KeyPattern::key(Key::End)).unwrap()
+            .handled);
     assert!(runtime.focused().is_none());
     view.disabled.set(false);
     frame(&runtime, view);
-    runtime.pointer_pressed(50.0, 16.0);
+    runtime.pointer_pressed(50.0, 16.0).unwrap();
     near(view.value.get(), 20.0);
     view.disabled.set(true);
     frame(&runtime, view);
-    runtime.pointer_moved(170.0, 16.0, false);
+    runtime.pointer_moved(170.0, 16.0, false).unwrap();
     runtime.pointer_released(170.0, 16.0);
     near(view.value.get(), 20.0);
 }
@@ -225,7 +227,8 @@ fn paint_never_rewrites_external_or_nonfinite_values() {
                 width: 220.0,
                 height: 32.0,
             }),
-        );
+        )
+            .unwrap();
         assert!(!laid.display.is_empty());
         for command in laid.display.iter() {
             if let bunny_ui::layout::DrawCommand::FillRect { rect, .. } = command {
@@ -259,7 +262,8 @@ fn keyboard_reads_latest_binding_and_geometry_tracks_resize() {
             width: 420.0,
             height: 32.0,
         }),
-    );
+    )
+        .unwrap();
     click(&runtime, 210.0);
     near(value.get(), 50.0);
     click(&runtime, 410.0);
@@ -275,7 +279,7 @@ fn thumb_press_preserves_an_unsnapped_external_value_and_keyboard_remains_numeri
             .unwrap(),
         33.0,
     );
-    runtime.pointer_pressed(76.0, 16.0);
+    runtime.pointer_pressed(76.0, 16.0).unwrap();
     near(view.value.get(), 33.0);
     runtime.pointer_released(76.0, 16.0);
     assert!(
@@ -291,12 +295,12 @@ fn thumb_press_preserves_an_unsnapped_external_value_and_keyboard_remains_numeri
 #[test]
 fn touch_capture_cancels_without_late_motion_or_a_commit_on_release() {
     let (runtime, view) = setup(SliderRange::new(0.0..=100.0).unwrap(), 50.0);
-    runtime.touch_began(41, 110.0, 16.0, 1);
-    runtime.touch_moved(41, 150.0, 16.0);
+    runtime.touch_began(41, 110.0, 16.0, 1).unwrap();
+    runtime.touch_moved(41, 150.0, 16.0).unwrap();
     near(view.value.get(), 70.0);
-    runtime.touch_cancelled(41);
-    runtime.touch_moved(41, 200.0, 16.0);
-    runtime.touch_ended(41, 200.0, 16.0);
+    runtime.touch_cancelled(41).unwrap();
+    runtime.touch_moved(41, 200.0, 16.0).unwrap();
+    runtime.touch_ended(41, 200.0, 16.0).unwrap();
     near(view.value.get(), 70.0);
 }
 
@@ -323,7 +327,8 @@ fn a_disabled_slider_declines_named_focus() {
     frame(&runtime, view);
     runtime.blur();
     assert!(!runtime.focus_named("rate"));
-    assert!(!runtime.key_stroke(KeyPattern::key(Key::Right)).handled);
+    assert!(!runtime.key_stroke(KeyPattern::key(Key::Right)).unwrap()
+            .handled);
     near(view.value.get(), 10.0);
 }
 
@@ -347,9 +352,9 @@ fn retained_frames_move_the_thumb_after_an_external_value_change() {
         width: 220.0,
         height: 32.0,
     };
-    let before = thumb(&runtime.display_frame(&view, size));
+    let before = thumb(&runtime.display_frame(&view, size).unwrap());
     view.value.set(100.0);
-    let after = thumb(&runtime.display_frame(&view, size));
+    let after = thumb(&runtime.display_frame(&view, size).unwrap());
     near(after - before, 200.0);
 }
 
@@ -374,7 +379,8 @@ fn repeated_endpoint_keys_do_not_emit_redundant_binding_writes() {
             width: 220.0,
             height: 32.0,
         }),
-    );
+    )
+        .unwrap();
     runtime.focus(&layout.customs[0].path);
     for _ in 0..4 {
         key(&runtime, Key::Right);
@@ -451,13 +457,15 @@ fn captured_escape_is_delivered_once_and_cancels_a_risen_parent_click() {
                 width: 100.0,
                 height: 40.0,
             }),
-        );
+        )
+            .unwrap();
         if !handles {
             runtime.focus(&layout.customs[0].path);
         }
-        runtime.pointer_pressed(10.0, 10.0);
+        runtime.pointer_pressed(10.0, 10.0).unwrap();
         assert_eq!(
-            runtime.key_stroke(KeyPattern::key(Key::Escape)).handled,
+            runtime.key_stroke(KeyPattern::key(Key::Escape))
+                .unwrap().handled,
             handles
         );
         assert_eq!(escapes.get(), 1);
@@ -502,7 +510,8 @@ fn named_focus_rejects_ambiguous_groups_and_prefers_an_exact_field() {
                 width: 440.0,
                 height: 80.0,
             }),
-        );
+        )
+            .unwrap();
         assert_eq!(runtime.focus_named("group"), with_field);
         assert_eq!(runtime.focus_takes_text(), with_field);
         assert!(!runtime.focus_named("missing"));
@@ -526,7 +535,8 @@ fn element_mode_canvas_island_can_be_focused_by_name() {
             width: 220.0,
             height: 32.0,
         },
-    );
+    )
+        .unwrap();
     assert!(runtime.focus_named("rate"));
     key(&runtime, Key::Right);
     near(page.value.get(), 11.0);

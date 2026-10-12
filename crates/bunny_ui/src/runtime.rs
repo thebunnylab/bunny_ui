@@ -57,6 +57,13 @@ pub struct ImeSnapshot {
     pub caret_rect: Rect,
 }
 
+/// A pointer hit keeps the held text and its visual row together.
+struct FieldPointer {
+    text: std::sync::Arc<str>,
+    hit: CaretHit,
+    line: (usize, usize),
+}
+
 /// One live box whose picture changed on a clock step: where it sits
 /// and the fresh pixels. The shell presents it on the box's OWN
 /// surface — the window behind it never redraws.
@@ -1957,29 +1964,42 @@ impl Runtime {
     /// The runtime remembers them, so a hover that re-resolves after a
     /// layout — content sliding under a still hand — replays the move
     /// the way it really was.
-    pub fn pointer_moved(&self, x: Px, y: Px, modifiers: impl Into<crate::action::Modifiers>) -> bool {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn pointer_moved(
+        &self,
+        x: Px,
+        y: Px,
+        modifiers: impl Into<crate::action::Modifiers>,
+    ) -> Result<bool, crate::text_error::TextError> {
         self.enter_scene();
         self.note_pointer_source();
         let modifiers = modifiers.into();
         self.pointer_modifiers.set(modifiers);
         let (repaint, told) = self.watching_hover(|| self.pointer_moved_road(x, y, modifiers));
-        repaint || told
+        Ok(repaint? || told)
     }
 
-    fn pointer_moved_road(&self, x: Px, y: Px, modifiers: crate::action::Modifiers) -> bool {
+    fn pointer_moved_road(
+        &self,
+        x: Px,
+        y: Px,
+        modifiers: crate::action::Modifiers,
+    ) -> Result<bool, crate::text_error::TextError> {
         // a live divider drag owns the pointer: the move becomes a lane
         // extent, the retained writer reaches the binding, and the app's
         // state change re-lays the frame — hover stays untouched
         let dragging = self.interaction.borrow().split_drag.clone();
         if let Some(path) = dragging {
             self.interaction.borrow_mut().pointer = Some(Point { x, y });
-            return self.drag_split(&path, x, y);
+            return Ok(self.drag_split(&path, x, y));
         }
         // a thumb under the hand owns the pointer the same way
         let thumb = self.interaction.borrow().thumb_drag.clone();
         if let Some(thumb) = thumb {
             self.interaction.borrow_mut().pointer = Some(Point { x, y });
-            return self.drag_thumb(&thumb, x, y);
+            return Ok(self.drag_thumb(&thumb, x, y));
         }
         // a field under a sweeping hand owns the pointer the same way:
         // the anchor stays where the press dropped it and the caret
@@ -1999,22 +2019,25 @@ impl Runtime {
             self.interaction.borrow_mut().pointer = Some(Point { x, y });
             if let Some(placement) = self.custom_at(&path) {
                 let at = Self::local(&placement, x, y);
-                let event =
-                    crate::custom::ElementEvent::PointerMoved { at, pressed: true, modifiers };
-                return self.deliver(&placement, event).handled;
+                let event = crate::custom::ElementEvent::PointerMoved {
+                    at,
+                    pressed: true,
+                    modifiers,
+                };
+                return Ok(self.deliver(&placement, event).handled);
             }
             // the box left the scene mid-drag: the gesture ends with it
             self.interaction.borrow_mut().element_grab = None;
-            return false;
+            return Ok(false);
         }
         // a live (or lifting) drag owns the move whole
         if let Some(repaint) = self.note_drag_move(x, y) {
-            return repaint;
+            return Ok(repaint);
         }
         // an open menu sits above the scene: a move inside it moves
         // the row highlight and nothing underneath hears a thing
         if let Some(repaint) = self.note_menu_hover(x, y) {
-            return repaint;
+            return Ok(repaint);
         }
         let target = self.hover_target(x, y);
         let mut interaction = self.interaction.borrow_mut();
@@ -2032,8 +2055,11 @@ impl Runtime {
         let used = match over {
             Some(placement) => {
                 let at = Self::local(&placement, x, y);
-                let event =
-                    crate::custom::ElementEvent::PointerMoved { at, pressed: false, modifiers };
+                let event = crate::custom::ElementEvent::PointerMoved {
+                    at,
+                    pressed: false,
+                    modifiers,
+                };
                 self.deliver(&placement, event).handled
             }
             None => false,
@@ -2042,7 +2068,7 @@ impl Runtime {
         // never touches it — a region explains, it does not intercept
         let explained = self.note_tooltip_hover(x, y);
         self.hover_move_had_more.set(used || explained);
-        changed || used || explained
+        Ok(changed || used || explained)
     }
 
     /// The pointer over an OPEN menu: the row under it highlights and
@@ -2311,7 +2337,13 @@ impl Runtime {
     /// `.on_submit` asked for. The answer's `text` is what a copy
     /// hands the platform's clipboard; `handled: false` sends the
     /// stroke on to the app's bindings.
-    pub fn key_stroke(&self, stroke: impl Into<crate::action::Stroke>) -> crate::custom::Response {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn key_stroke(
+        &self,
+        stroke: impl Into<crate::action::Stroke>,
+    ) -> Result<crate::custom::Response, crate::text_error::TextError> {
         self.enter_scene();
         let stroke = stroke.into();
         let pattern = &stroke.pattern;
@@ -2320,7 +2352,7 @@ impl Runtime {
         if *pattern == KeyPattern::key(crate::action::Key::Escape)
             && (self.close_menu() || self.cancel_drag())
         {
-            return crate::custom::Response::handled();
+            return Ok(crate::custom::Response::handled());
         }
         // A captured custom gesture can be cancelled before it takes focus:
         // custom boxes normally borrow the keyboard on release. Give Escape
@@ -2328,10 +2360,7 @@ impl Runtime {
         if *pattern == KeyPattern::key(crate::action::Key::Escape) {
             let grabbed = self.interaction.borrow().element_grab.clone();
             if let Some(placement) = grabbed.as_deref().and_then(|path| self.custom_at(path)) {
-                let response = self.deliver(
-                    &placement,
-                    crate::custom::ElementEvent::Key(stroke),
-                );
+                let response = self.deliver(&placement, crate::custom::ElementEvent::Key(stroke));
                 if response.handled {
                     {
                         let mut interaction = self.interaction.borrow_mut();
@@ -2340,10 +2369,10 @@ impl Runtime {
                     }
                     self.dirty_island_of(&placement.path);
                     self.frame_asked.set(true);
-                    return response;
+                    return Ok(response);
                 }
                 if self.focus.borrow().as_deref() == Some(placement.path.as_str()) {
-                    return response; // Do not deliver one ignored Escape twice.
+                    return Ok(response); // Do not deliver one ignored Escape twice.
                 }
             }
         }
@@ -2356,7 +2385,7 @@ impl Runtime {
                 && self.field_at(&path).is_some_and(|field| field.multiline)
                 && self.submit(&path).applied
             {
-                return crate::custom::Response::handled();
+                return Ok(crate::custom::Response::handled());
             }
         }
         if let Some(path) = self.focused() {
@@ -2366,8 +2395,8 @@ impl Runtime {
                 self.caret_phase.set(CaretPhase::Held);
                 self.frame_asked.set(true);
                 self.goal_column.set(None);
-                self.reveal_caret(&path);
-                return crate::custom::Response::handled();
+                self.reveal_caret(&path)?;
+                return Ok(crate::custom::Response::handled());
             }
         }
         if let Some(path) = self.focused()
@@ -2404,9 +2433,9 @@ impl Runtime {
             if let Some(edit) = edit {
                 // A one-line field must not consume Shift+Enter as text.
                 let multiline = self.field_at(&path).is_some_and(|field| field.multiline);
-                if (!matches!(edit, EditCommand::Insert(_)) || multiline) && self.key(edit).applied
+                if (!matches!(edit, EditCommand::Insert(_)) || multiline) && self.key(edit)?.applied
                 {
-                    return crate::custom::Response::handled();
+                    return Ok(crate::custom::Response::handled());
                 }
             }
         }
@@ -2415,10 +2444,10 @@ impl Runtime {
             if response.handled {
                 self.caret_phase.set(CaretPhase::Visible);
                 self.dirty_island_of(&placement.path);
-                return response;
+                return Ok(response);
             }
         }
-        self.control_key(pattern)
+        Ok(self.control_key(pattern))
     }
 
     fn control_key(&self, pattern: &KeyPattern) -> crate::custom::Response {
@@ -2450,7 +2479,10 @@ impl Runtime {
     /// Button down: ARMS pressed on the target under the point — no
     /// action fires here (up-inside is button semantics). `true` =
     /// repaint.
-    pub fn pointer_pressed(&self, x: Px, y: Px) -> bool {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn pointer_pressed(&self, x: Px, y: Px) -> Result<bool, crate::text_error::TextError> {
         self.enter_scene();
         self.pointer_clicked(x, y, 1, false)
     }
@@ -2469,20 +2501,24 @@ impl Runtime {
     /// not the framework's to spend: command and a click is a jump to a
     /// definition in one box and nothing in the next, and only the box
     /// under the pointer knows which.
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
     pub fn pointer_clicked(
         &self,
         x: Px,
         y: Px,
         clicks: u8,
         modifiers: impl Into<crate::action::Modifiers>,
-    ) -> bool {
+    ) -> Result<bool, crate::text_error::TextError> {
         self.enter_scene();
         self.note_pointer_source();
         // a press is a new intent: the scroll gesture is over
         self.wheel_latch.borrow_mut().take();
         let modifiers = modifiers.into();
-        let (repaint, told) = self.watching_hover(|| self.pointer_clicked_road(x, y, clicks, modifiers));
-        repaint || told
+        let (repaint, told) =
+            self.watching_hover(|| self.pointer_clicked_road(x, y, clicks, modifiers));
+        Ok(repaint? || told)
     }
 
     fn pointer_clicked_road(
@@ -2491,7 +2527,7 @@ impl Runtime {
         y: Px,
         clicks: u8,
         modifiers: crate::action::Modifiers,
-    ) -> bool {
+    ) -> Result<bool, crate::text_error::TextError> {
         let shift = modifiers.shift;
         // the hand left the keyboard: a sequence in the air goes with
         // it, the way it does in every editor that has chords
@@ -2502,14 +2538,10 @@ impl Runtime {
         if self.interaction.borrow().menu.is_some() {
             let picked = self.menu_row_at(x, y).and_then(|(row, _)| row);
             let action = picked.and_then(|index| {
-                self.menu_items.borrow().as_ref().and_then(|items| {
-                    match items.get(index) {
-                        Some(crate::views::MenuItem::Action { action, .. }) => {
-                            Some(action.clone())
-                        }
+                self.menu_items.borrow().as_ref().and_then(|items| match items.get(index) {
+                        Some(crate::views::MenuItem::Action { action, .. }) => Some(action.clone()),
                         _ => None,
-                    }
-                })
+                    })
             });
             self.close_menu();
             if let Some(action) = action {
@@ -2517,7 +2549,7 @@ impl Runtime {
                 // next layout sees a world without the menu
                 action();
             }
-            return true;
+            return Ok(true);
         }
         // a press on a drag source ARMS the lift — and the press goes
         // on: a click that never moves stays a click
@@ -2554,7 +2586,7 @@ impl Runtime {
         };
         if let Some(path) = outside {
             reconciler::run_action(&format!("{path}/#dismiss"), 1);
-            return true;
+            return Ok(true);
         }
         // ONE write, above every branch that can arm a target — the
         // risen press of a box, the thumb, the seam and the ordinary
@@ -2585,7 +2617,7 @@ impl Runtime {
                 let above = self.hit_above(&placement.path, x, y);
                 self.interaction.borrow_mut().pressed = above;
             }
-            return true;
+            return Ok(true);
         }
         // a press on a thumb takes the pointer until the release: the
         // region travels with the hand, and nothing arms (a thumb has
@@ -2595,7 +2627,7 @@ impl Runtime {
             interaction.pointer = Some(Point { x, y });
             interaction.thumb_drag = Some(drag);
             interaction.pressed = None;
-            return true;
+            return Ok(true);
         }
         // a press on a grip band starts the divider drag — nothing arms
         // (a divider has no up-inside action to mis-fire)
@@ -2604,7 +2636,7 @@ impl Runtime {
             interaction.pointer = Some(Point { x, y });
             interaction.split_drag = Some(grip.to_string());
             interaction.pressed = None;
-            return true;
+            return Ok(true);
         }
         // a press on a field takes the keyboard AND opens a selection.
         // The field is the one target that acts on the DOWN: first
@@ -2614,20 +2646,20 @@ impl Runtime {
         // release, so a sweep that leaves the box stays one gesture
         if let Some(path) = target.as_deref().filter(|path| reconciler::has_editor(path)) {
             let path = path.to_string();
-            self.select_at(&path, x, y, clicks, shift);
+            self.select_at(&path, x, y, clicks, shift)?;
             let mut interaction = self.interaction.borrow_mut();
             interaction.pointer = Some(Point { x, y });
             interaction.hovered = Some(path.clone());
             interaction.pressed = None;
             interaction.field_drag = Some(path);
-            return true;
+            return Ok(true);
         }
         let mut interaction = self.interaction.borrow_mut();
         interaction.pointer = Some(Point { x, y });
         let changed = interaction.pressed != target || interaction.hovered != target;
         interaction.hovered = target.clone();
         interaction.pressed = target;
-        changed || explained
+        Ok(changed || explained)
     }
 
     /// Button up: fires the action IF released inside the pressed
@@ -2924,32 +2956,53 @@ impl Runtime {
     /// repaint. What the touch MEANS is decided by [`crate::touch`] and
     /// performed through the pointer's own doors; the shell only
     /// forwards.
-    pub fn touch_began(&self, id: u64, x: Px, y: Px, taps: u8) -> bool {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn touch_began(
+        &self,
+        id: u64,
+        x: Px,
+        y: Px,
+        taps: u8,
+    ) -> Result<bool, crate::text_error::TextError> {
         // a new finger is a new gesture: the pan asks again what is
         // under its anchor
         self.wheel_latch.borrow_mut().take();
         self.touch_fresh.set(true);
-        let gestures = self.touch.borrow_mut().began(id, Point { x, y }, taps, self);
-        self.perform_touch(gestures).0
+        let gestures = self
+            .touch
+            .borrow_mut()
+            .began(id, Point { x, y }, taps, self);
+        Ok(self.perform_touch(gestures)?.0)
     }
 
     /// A finger moved.
-    pub fn touch_moved(&self, id: u64, x: Px, y: Px) -> bool {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn touch_moved(&self, id: u64, x: Px, y: Px) -> Result<bool, crate::text_error::TextError> {
         let gestures = self.touch.borrow_mut().moved(id, Point { x, y });
-        self.perform_touch(gestures).0
+        Ok(self.perform_touch(gestures)?.0)
     }
 
     /// A finger lifted.
-    pub fn touch_ended(&self, id: u64, x: Px, y: Px) -> bool {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn touch_ended(&self, id: u64, x: Px, y: Px) -> Result<bool, crate::text_error::TextError> {
         let gestures = self.touch.borrow_mut().ended(id, Point { x, y });
-        self.perform_touch(gestures).0
+        Ok(self.perform_touch(gestures)?.0)
     }
 
     /// The system took the finger: a press in flight is cancelled and
     /// fires nothing, a pan never flings.
-    pub fn touch_cancelled(&self, id: u64) -> bool {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn touch_cancelled(&self, id: u64) -> Result<bool, crate::text_error::TextError> {
         let gestures = self.touch.borrow_mut().cancelled(id);
-        self.perform_touch(gestures).0
+        Ok(self.perform_touch(gestures)?.0)
     }
 
     /// Performs what the recognizer said, with the recognizer
@@ -2962,15 +3015,21 @@ impl Runtime {
     /// event it is handling, which is the one moment the answer has to
     /// be right. The guard is what keeps the pointer doors below from
     /// reading their own call as a mouse.
-    fn perform_touch(&self, gestures: Vec<crate::touch::Gesture>) -> (bool, bool) {
+    fn perform_touch(
+        &self,
+        gestures: Vec<crate::touch::Gesture>,
+    ) -> Result<(bool, bool), crate::text_error::TextError> {
         self.touch_modality.set(true);
         self.in_touch.set(true);
-        let answer = self.perform_touch_inner(gestures);
+        let answer = self.perform_touch_inner(gestures)?;
         self.in_touch.set(false);
-        answer
+        Ok(answer)
     }
 
-    fn perform_touch_inner(&self, gestures: Vec<crate::touch::Gesture>) -> (bool, bool) {
+    fn perform_touch_inner(
+        &self,
+        gestures: Vec<crate::touch::Gesture>,
+    ) -> Result<(bool, bool), crate::text_error::TextError> {
         use crate::touch::Gesture;
         let mut repaint = false;
         let mut input = false;
@@ -2979,11 +3038,11 @@ impl Runtime {
                 Gesture::Press { at, taps, held } => {
                     self.press_held.set(held);
                     repaint |=
-                        self.pointer_clicked(at.x, at.y, taps, crate::action::Modifiers::NONE);
+                        self.pointer_clicked(at.x, at.y, taps, crate::action::Modifiers::NONE)?;
                     input = true;
                 }
                 Gesture::Move { at } => {
-                    repaint |= self.pointer_moved(at.x, at.y, crate::action::Modifiers::NONE);
+                    repaint |= self.pointer_moved(at.x, at.y, crate::action::Modifiers::NONE)?;
                 }
                 Gesture::Release { at } => {
                     self.pointer_released(at.x, at.y);
@@ -3012,7 +3071,7 @@ impl Runtime {
                 Gesture::Magnify { at, scale } => repaint |= self.magnify(at.x, at.y, scale),
             }
         }
-        (repaint, input)
+        Ok((repaint, input))
     }
 
     /// A press that ends without a release — the system took the
@@ -3766,39 +3825,44 @@ impl Runtime {
     /// it run as the field's own command. The clipboard is handled here: a
     /// copy or a cut writes it and a paste reads it, so a shell has no half
     /// of its own to add.
-    pub fn menu_pick(&self, pick: Pick) -> bool {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn menu_pick(&self, pick: Pick) -> Result<bool, crate::text_error::TextError> {
         if !self.menu_answers(pick) {
-            return false;
+            return Ok(false);
         }
-        match pick {
+        Ok(match pick {
             Pick::Command(action) => self.dispatch_action(action),
-            Pick::Edit(edit) => self.menu_edit(edit),
-        }
+            Pick::Edit(edit) => self.menu_edit(edit)?,
+        })
     }
 
     /// [`Runtime::menu_pick`] for an edit the window answers.
-    fn menu_edit(&self, edit: Edit) -> bool {
-        let taken = self.key_stroke(edit.stroke());
+    fn menu_edit(&self, edit: Edit) -> Result<bool, crate::text_error::TextError> {
+        let taken = self.key_stroke(edit.stroke())?;
         if taken.handled {
             if let Some(text) = taken.text {
                 crate::clipboard::write(&text);
             }
-            return true;
+            return Ok(true);
         }
-        let handed = |command: EditCommand| match self.key(command).output {
-            Some(text) => {
-                crate::clipboard::write(&text);
-                true
-            }
-            None => false,
+        let handed = |command: EditCommand| -> Result<bool, crate::text_error::TextError> {
+            Ok(match self.key(command)?.output {
+                Some(text) => {
+                    crate::clipboard::write(&text);
+                    true
+                }
+                None => false,
+            })
         };
-        match edit {
-            Edit::Copy => handed(EditCommand::Copy),
-            Edit::Cut => handed(EditCommand::Cut),
-            Edit::Paste => self.paste(),
-            Edit::SelectAll => self.key(EditCommand::SelectAll).applied,
+        Ok(match edit {
+            Edit::Copy => handed(EditCommand::Copy)?,
+            Edit::Cut => handed(EditCommand::Cut)?,
+            Edit::Paste => self.paste()?,
+            Edit::SelectAll => self.key(EditCommand::SelectAll)?.applied,
             Edit::Undo | Edit::Redo => false,
-        }
+        })
     }
 
     /// Is an alert asking in this window? While one is, the keymap answers
@@ -3981,13 +4045,20 @@ impl Runtime {
     /// clicks take the word under the pointer, three take the line. And
     /// `shift` keeps the anchor where it already was, which is the
     /// keyboard's own extend done with the mouse.
-    fn select_at(&self, path: &str, x: Px, y: Px, clicks: u8, shift: bool) {
+    fn select_at(
+        &self,
+        path: &str,
+        x: Px,
+        y: Px,
+        clicks: u8,
+        shift: bool,
+    ) -> Result<(), crate::text_error::TextError> {
         self.caret_phase.set(CaretPhase::Held);
         self.goal_column.set(None);
         let held = self.focus.borrow().as_deref() == Some(path);
         *self.focus.borrow_mut() = Some(path.to_string());
         self.sync_field_focus();
-        let Some((text, hit, line)) = self.caret_under(path, x, y) else {
+        let Some(FieldPointer { text, hit, line }) = self.caret_under(path, x, y)? else {
             self.carets
                 .borrow_mut()
                 .entry(path.to_string())
@@ -3997,7 +4068,7 @@ impl Runtime {
                     anchor: None,
                     marked: None,
                 });
-            return;
+            return Ok(());
         };
         let caret = hit.byte;
         let previous = self.carets.borrow().get(path).copied().unwrap_or_default();
@@ -4039,16 +4110,18 @@ impl Runtime {
         self.field_unit_anchor
             .set((clicks >= 2).then_some((state.anchor.unwrap_or(state.caret), state.caret)));
         self.carets.borrow_mut().insert(path.to_string(), state);
-        self.reveal_caret(path);
+        self.reveal_caret(path)?;
+
+        Ok(())
     }
 
     /// A move with the button down: the caret walks to the pointer and
     /// the anchor stays put. `true` = the selection moved and the frame
     /// must repaint.
-    fn sweep_to(&self, path: &str, x: Px, y: Px) -> bool {
+    fn sweep_to(&self, path: &str, x: Px, y: Px) -> Result<bool, crate::text_error::TextError> {
         self.goal_column.set(None);
-        let Some((text, hit, line)) = self.caret_under(path, x, y) else {
-            return false;
+        let Some(FieldPointer { text, hit, line }) = self.caret_under(path, x, y)? else {
+            return Ok(false);
         };
         let mut state = self.carets.borrow().get(path).copied().unwrap_or_default();
         let caret = hit.byte;
@@ -4076,15 +4149,15 @@ impl Runtime {
             hit.affinity
         };
         if state.caret == caret && state.anchor == Some(anchor) && state.affinity == affinity {
-            return false;
+            return Ok(false);
         }
         state.anchor = Some(anchor);
         state.caret = caret;
         state.affinity = affinity;
         self.carets.borrow_mut().insert(path.to_string(), state);
         self.caret_phase.set(CaretPhase::Held);
-        self.reveal_caret(path);
-        true
+        self.reveal_caret(path)?;
+        Ok(true)
     }
 
     /// What the pointer names inside a field: its text, the byte under
@@ -4101,9 +4174,12 @@ impl Runtime {
         path: &str,
         x: Px,
         y: Px,
-    ) -> Option<(std::sync::Arc<str>, CaretHit, (usize, usize))> {
+    ) -> Result<Option<FieldPointer>, crate::text_error::TextError>
+    {
         let mut probe = CaretState::default();
-        let text = reconciler::read_editor(path, &mut probe)?;
+        let Some(text) = reconciler::read_editor(path, &mut probe) else {
+            return Ok(None);
+        };
         let placement = self.field_at(path);
         // a secret field draws bullets, and a bullet is not as wide as
         // the character it stands for: the pointer has to be resolved
@@ -4111,29 +4187,29 @@ impl Runtime {
         // the app holds. Same character, both ways.
         let secret = placement.as_ref().is_some_and(|field| field.secret);
         let shown = crate::text_input::displayed_shared(
-            &text, secret, placement.as_ref().is_some_and(|field| field.multiline),
+            &text,
+            secret,
+            placement.as_ref().is_some_and(|field| field.multiline),
         );
         let seen: &str = &shown;
         let home = |index: usize| {
-            if secret { crate::text_input::unmasked_index(&text, index) } else { index }
+            if secret {
+                crate::text_input::unmasked_index(&text, index)
+            } else {
+                index
+            }
         };
         let source = self.cache.text_content(&shown);
         let whole = (0, text.len());
         let (caret, line) = match placement {
             Some(field) if field.multiline => {
-                let lines = self.wrap(seen, (!secret).then_some(&text), &field);
+                let lines = self.wrap(seen, (!secret).then_some(&text), &field)?;
                 let row = ((y - field.text_origin.y) / field.line_height).floor();
                 let row = (row.max(0.0) as usize).min(lines.len().saturating_sub(1));
                 let (start, end) = lines[row];
-                let line = source.line(start..end).ok()?;
-                let along = self.field_line_x(&field, path, &line, x);
-                let hit = line_hit(
-                    &line,
-                    along,
-                    &field.font,
-                    &*self.text,
-                    &self.cache,
-                );
+                let line = source.line(start..end)?;
+                let along = self.field_line_x(&field, path, &line, x)?;
+                let hit = line_hit(&line, along, &field.font, &*self.text, &self.cache)?;
                 (
                     CaretHit {
                         byte: home(start + hit.byte),
@@ -4143,9 +4219,9 @@ impl Runtime {
                 )
             }
             Some(field) => {
-                let line = source.line(0..source.len()).ok()?;
-                let along = self.field_line_x(&field, path, &line, x);
-                let hit = line_hit(&line, along, &field.font, &*self.text, &self.cache);
+                let line = source.line(0..source.len())?;
+                let along = self.field_line_x(&field, path, &line, x)?;
+                let hit = line_hit(&line, along, &field.font, &*self.text, &self.cache)?;
                 (
                     CaretHit {
                         byte: home(hit.byte),
@@ -4164,7 +4240,7 @@ impl Runtime {
                 whole,
             ),
         };
-        Some((text, caret, line))
+        Ok(Some(FieldPointer { text, hit: caret, line }))
     }
 
     /// Where one visual line of a field starts, how wide it is and which
@@ -4174,20 +4250,34 @@ impl Runtime {
         field: &crate::layout::FieldPlacement,
         path: &str,
         line: &ParagraphLine,
-    ) -> (Px, Px, bool) {
+    ) -> Result<(Px, Px, bool), crate::text_error::TextError> {
         let anchor_rtl = field.direction.is_rtl();
         let line_rtl = crate::text_input::reads_right_to_left(line.paragraph().text());
         let width = self
             .cache
-            .get_or_measure_paragraph(line, &field.font, &*self.text)
+            .get_or_measure_paragraph(line, &field.font, &*self.text)?
             .width;
         // a wrapped field never rolls sideways; a one-line one does
         let offset_x = if field.multiline {
             0.0
         } else {
-            self.scroll_offsets.borrow().get(path).map_or(0.0, |offset| offset.x)
+            self.scroll_offsets
+                .borrow()
+                .get(path)
+                .map_or(0.0, |offset| offset.x)
         };
-        (crate::layout::field_run_x(field.run, offset_x, width, field.text_align, anchor_rtl, line_rtl), width, line_rtl)
+        Ok((
+            crate::layout::field_run_x(
+                field.run,
+                offset_x,
+                width,
+                field.text_align,
+                anchor_rtl,
+                line_rtl,
+            ),
+            width,
+            line_rtl,
+        ))
     }
 
     /// The pointer's distance from the visual left origin of the shaped line.
@@ -4197,9 +4287,9 @@ impl Runtime {
         path: &str,
         line: &ParagraphLine,
         x: Px,
-    ) -> Px {
-        let (line_x, _, _) = self.field_line(field, path, line);
-        x - line_x
+    ) -> Result<Px, crate::text_error::TextError> {
+        let (line_x, _, _) = self.field_line(field, path, line)?;
+        Ok(x - line_x)
     }
 
     /// The geometry the last layout recorded for a field.
@@ -4214,15 +4304,23 @@ impl Runtime {
         text: &str,
         shared: Option<&std::sync::Arc<str>>,
         field: &crate::layout::FieldPlacement,
-    ) -> std::rc::Rc<Vec<(usize, usize)>> {
-        if field.multiline {
+    ) -> Result<std::rc::Rc<Vec<(usize, usize)>>, crate::text_error::TextError> {
+        Ok(if field.multiline {
             // the field's own lines, kept between its edits — the same
             // state the placement reads and writes; the shared text finds
             // them by pointer, never by comparing the note
-            self.cache.field_lines(&field.path, text, shared, &field.font, field.run.size.width, &*self.text)
+            self.cache.field_lines(
+                &field.path,
+                text,
+                shared,
+                &field.font,
+                field.run.size.width,
+                &*self.text,
+            )?
         } else {
-            self.cache.get_or_break(text, &field.font, field.run.size.width, &*self.text)
-        }
+            self.cache
+                .get_or_break(text, &field.font, field.run.size.width, &*self.text)?
+        })
     }
 
     /// Where a byte of a field's text stands, as a caret-wide rect in the
@@ -4235,22 +4333,26 @@ impl Runtime {
         text: &std::sync::Arc<str>,
         byte: usize,
         affinity: CaretAffinity,
-    ) -> Option<Rect> {
+    ) -> Result<Option<Rect>, crate::text_error::TextError> {
         let byte = crate::text_input::clamp_index(text, byte);
         // Native ranges name the real string, but their rectangles follow
         // the displayed bullets, just like pointer placement and painting.
         let shown = crate::text_input::displayed_shared(text, field.secret, field.multiline);
-        let byte = if field.secret { crate::text_input::masked_index(text, byte) } else { byte };
+        let byte = if field.secret {
+            crate::text_input::masked_index(text, byte)
+        } else {
+            byte
+        };
         let text = &shown;
         let (start, end, row) = if field.multiline {
-            let lines = self.wrap(text, (!field.secret).then_some(text), field);
+            let lines = self.wrap(text, (!field.secret).then_some(text), field)?;
             let row = crate::layout::line_of(&lines, byte);
             let (start, end) = lines.get(row).copied().unwrap_or((0, text.len()));
             (start.min(byte), end.max(byte), row)
         } else {
             (0, text.len(), 0)
         };
-        let line = self.cache.text_content(text).line(start..end).ok()?;
+        let line = self.cache.text_content(text).line(start..end)?;
         let head = line_caret_x(
             &line,
             byte - start,
@@ -4258,15 +4360,18 @@ impl Runtime {
             &field.font,
             &*self.text,
             &self.cache,
-        );
-        let (line_x, _, _) = self.field_line(field, &field.path, &line);
-        Some(Rect {
+        )?;
+        let (line_x, _, _) = self.field_line(field, &field.path, &line)?;
+        Ok(Some(Rect {
             origin: Point {
                 x: line_x + head,
                 y: field.text_origin.y + row as Px * field.line_height,
             },
-            size: crate::layout::Size { width: 1.5, height: field.line_height },
-        })
+            size: crate::layout::Size {
+                width: 1.5,
+                height: field.line_height,
+            },
+        }))
     }
 
     /// The run follows the caret: the field scrolls its own text so the
@@ -4277,21 +4382,31 @@ impl Runtime {
     ///
     /// A one-line field rolls sideways; a wrapped one has nothing to
     /// give sideways and rolls DOWN, one visual line at a time.
-    fn reveal_caret(&self, path: &str) {
+    fn reveal_caret(&self, path: &str) -> Result<(), crate::text_error::TextError> {
         // before the first layout there is no box to scroll inside
-        let Some(field) = self.field_at(path) else { return };
+        let Some(field) = self.field_at(path) else {
+            return Ok(());
+        };
         let mut probe = CaretState::default();
         let Some(lent) = reconciler::read_editor(path, &mut probe) else {
-            return;
+            return Ok(());
         };
         let state = self.carets.borrow().get(path).copied().unwrap_or_default();
         let caret = crate::text_input::clamp_index(&lent, state.caret);
         // what scrolls is what is drawn: bullets for a secret field
         let shown = crate::text_input::displayed(&lent, field.secret, field.multiline);
         let text = shown.as_ref();
-        let caret = if field.secret { crate::text_input::masked_index(&lent, caret) } else { caret };
-        let mut offset =
-            self.scroll_offsets.borrow().get(path).copied().unwrap_or_default();
+        let caret = if field.secret {
+            crate::text_input::masked_index(&lent, caret)
+        } else {
+            caret
+        };
+        let mut offset = self
+            .scroll_offsets
+            .borrow()
+            .get(path)
+            .copied()
+            .unwrap_or_default();
         // the caret leaving through one edge pulls the run back; through
         // the other it pushes — with the caret's own width of room, so
         // the bar itself is never half eaten by the border. And it never
@@ -4307,7 +4422,7 @@ impl Runtime {
             at_offset.clamp(0.0, (full - box_extent).max(0.0))
         };
         if field.multiline {
-            let lines = self.wrap(text, (!field.secret).then_some(&lent), &field);
+            let lines = self.wrap(text, (!field.secret).then_some(&lent), &field)?;
             let row = crate::layout::caret_line(&lines, caret, reconciler::field_caret_shape(path));
             offset.x = 0.0;
             offset.y = follow(
@@ -4319,7 +4434,10 @@ impl Runtime {
             );
         } else {
             // Single-line presentation replaces LF with spaces of the same encoded length.
-            let paragraph = self.cache.paragraph(text).expect("single-line presentation has no LF");
+            let paragraph = self
+                .cache
+                .paragraph(text)
+                .expect("single-line presentation has no LF");
             let line = paragraph.full_line();
             let visual = line_caret_x(
                 &line,
@@ -4328,10 +4446,10 @@ impl Runtime {
                 &field.font,
                 &*self.text,
                 &self.cache,
-            );
+            )?;
             let full = self
                 .cache
-                .get_or_measure_paragraph(&line, &field.font, &*self.text)
+                .get_or_measure_paragraph(&line, &field.font, &*self.text)?
                 .width;
             let caret_x = if crate::text_input::reads_right_to_left(text) {
                 full - visual
@@ -4346,23 +4464,29 @@ impl Runtime {
                 full,
             );
         }
-        self.scroll_offsets.borrow_mut().insert(path.to_string(), offset);
+        self.scroll_offsets
+            .borrow_mut()
+            .insert(path.to_string(), offset);
+
+        Ok(())
     }
 
     /// Enter, offered to the focused field. A many-line field takes it
     /// as a break; a one-line one declines, and the stroke goes on to
     /// the app's bindings — which is why `⌘↵` still commits.
-    fn insert_break(&self, path: &str) -> Edited {
+    fn insert_break(&self, path: &str) -> Result<Edited, crate::text_error::TextError> {
         if reconciler::field_submits_on_enter(path) {
-            return self.submit(path);
+            return Ok(self.submit(path));
         }
-        match self.field_at(path).is_some_and(|field| field.multiline) {
-            true => self.key(EditCommand::Insert("\n".into())),
-            // a one-line field has no break to take, so the bare
-            // stroke is its SUBMIT — and where the app named none it
-            // still declines, the way it always did
-            false => self.submit(path),
-        }
+        Ok(
+            match self.field_at(path).is_some_and(|field| field.multiline) {
+                true => self.key(EditCommand::Insert("\n".into()))?,
+                // a one-line field has no break to take, so the bare
+                // stroke is its SUBMIT — and where the app named none it
+                // still declines, the way it always did
+                false => self.submit(path),
+            },
+        )
     }
 
     /// The field's own key, offered to `.on_submit`. A field that
@@ -4388,39 +4512,62 @@ impl Runtime {
     /// top it goes home, off the bottom to the end, the way a text view
     /// does everywhere. A one-line field declines, so a list under a
     /// search box still navigates with the arrows.
-    fn walk_line(&self, path: &str, down: bool, select: bool) -> Edited {
-        let declined = Edited { applied: false, output: None };
+    fn walk_line(
+        &self,
+        path: &str,
+        down: bool,
+        select: bool,
+    ) -> Result<Edited, crate::text_error::TextError> {
+        let declined = Edited {
+            applied: false,
+            output: None,
+        };
         let Some(field) = self.field_at(path).filter(|field| field.multiline) else {
-            return declined;
+            return Ok(declined);
         };
         let mut probe = CaretState::default();
         let Some(text) = reconciler::read_editor(path, &mut probe) else {
-            return declined;
+            return Ok(declined);
         };
         let shown = crate::text_input::displayed_shared(&text, field.secret, field.multiline);
-        let lines = self.wrap(&shown, Some(&shown), &field);
+        let lines = self.wrap(&shown, Some(&shown), &field)?;
         let source = self.cache.text_content(&shown);
         let mut state = self.carets.borrow().get(path).copied().unwrap_or_default();
         let real_caret = crate::text_input::clamp_index(&text, state.caret);
-        let caret = if field.secret { crate::text_input::masked_index(&text, real_caret) } else { real_caret };
-        let home = |byte| if field.secret { crate::text_input::unmasked_index(&text, byte) } else { byte };
+        let caret = if field.secret {
+            crate::text_input::masked_index(&text, real_caret)
+        } else {
+            real_caret
+        };
+        let home = |byte| {
+            if field.secret {
+                crate::text_input::unmasked_index(&text, byte)
+            } else {
+                byte
+            }
+        };
         let row = crate::layout::line_of(&lines, caret);
         // the column the walk keeps: taken from where the caret stands
         // and RETAINED, so crossing a short line does not lose it
-        let column = self.goal_column.get().unwrap_or_else(|| {
-            let (start, end) = lines[row];
-            // The cache supplies validated ranges from this source's wrap table.
-            let line = source.line(start..end).expect("wrapped field line belongs to its source");
-            self.field_line(&field, path, &line).0
-                + line_caret_x(
-                    &line,
-                    caret - start,
-                    state.affinity,
-                    &field.font,
-                    &*self.text,
-                    &self.cache,
-                )
-        });
+        let column = match self.goal_column.get() {
+            Some(column) => column,
+            None => {
+                let (start, end) = lines[row];
+                // The cache supplies validated ranges from this source's wrap table.
+                let line = source
+                    .line(start..end)
+                    .expect("wrapped field line belongs to its source");
+                self.field_line(&field, path, &line)?.0
+                    + line_caret_x(
+                        &line,
+                        caret - start,
+                        state.affinity,
+                        &field.font,
+                        &*self.text,
+                        &self.cache,
+                    )?
+            }
+        };
         let target = match (down, row) {
             (true, row) => row + 1,
             (false, 0) => usize::MAX,
@@ -4428,9 +4575,9 @@ impl Runtime {
         };
         let landed = match lines.get(target) {
             Some(&(start, end)) => {
-                let Ok(line) = source.line(start..end) else { return declined };
-                let local = column - self.field_line(&field, path, &line).0;
-                let hit = line_hit(&line, local, &field.font, &*self.text, &self.cache);
+                let line = source.line(start..end)?;
+                let local = column - self.field_line(&field, path, &line)?.0;
+                let hit = line_hit(&line, local, &field.font, &*self.text, &self.cache)?;
                 CaretHit {
                     byte: home(start + hit.byte),
                     ..hit
@@ -4454,9 +4601,12 @@ impl Runtime {
         state.marked = None;
         self.carets.borrow_mut().insert(path.to_string(), state);
         self.caret_phase.set(CaretPhase::Held);
-        self.reveal_caret(path);
+        self.reveal_caret(path)?;
         self.goal_column.set(Some(column));
-        Edited { applied: true, output: None }
+        Ok(Edited {
+            applied: true,
+            output: None,
+        })
     }
 
     /// Publish focus transitions once, after dropping every runtime borrow.
@@ -4566,23 +4716,31 @@ impl Runtime {
     /// The IME snapshot of the focused field — `None` without focus.
     /// Indices already in UTF-16 at the framework edge; the caret rect
     /// comes from the geometry retained from the last layout.
-    pub fn ime_snapshot(&self) -> Option<ImeSnapshot> {
-        let path = self.focus.borrow().clone()?;
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn ime_snapshot(&self) -> Result<Option<ImeSnapshot>, crate::text_error::TextError> {
+        let Some(path) = self.focus.borrow().clone() else {
+            return Ok(None);
+        };
         // the app's box answers for itself; only the caret rect
         // changes hands, from the box's coordinates into the scene's
         if let Some(placement) = self.custom_at(&path) {
-            let metrics =
-                crate::custom::Metrics::new(&*self.text, &self.cache, placement.font);
-            let context = placement.element.element().ime(&metrics)?;
-            return Some(ImeSnapshot {
+            let metrics = crate::custom::Metrics::new(&*self.text, &self.cache, placement.font);
+            let Some(context) = placement.element.element().ime(&metrics) else {
+                return Ok(None);
+            };
+            return Ok(Some(ImeSnapshot {
                 text: context.text.into(),
                 selected: context.selected,
                 marked: context.marked,
                 caret_rect: Self::to_layout(&placement, context.caret_rect),
-            });
+            }));
         }
         let mut probe = CaretState::default();
-        let text = reconciler::read_editor(&path, &mut probe)?;
+        let Some(text) = reconciler::read_editor(&path, &mut probe) else {
+            return Ok(None);
+        };
         let state = self.carets.borrow().get(&path).copied().unwrap_or_default();
 
         let caret = crate::text_input::clamp_index(&text, state.caret);
@@ -4593,25 +4751,33 @@ impl Runtime {
             let head = self.utf16_before(&path, &text, start);
             let start = crate::text_input::clamp_to_boundary(&text, start);
             let end = crate::text_input::clamp_to_boundary(&text, end.max(start));
-            (head, crate::text_input::utf16_len(&text.as_bytes()[start..end]))
+            (
+                head,
+                crate::text_input::utf16_len(&text.as_bytes()[start..end]),
+            )
         };
         let selected = span(start, end);
         let marked = state.marked.map(|(start, end)| span(start, end));
 
-        let field = self
+        let Some(field) = self
             .last_fields
             .borrow()
             .iter()
             .find(|field| field.path == path)
-            .cloned()?;
-        let caret_rect = self.field_byte_rect(&field, &text, caret, state.affinity)?;
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let Some(caret_rect) = self.field_byte_rect(&field, &text, caret, state.affinity)? else {
+            return Ok(None);
+        };
 
-        Some(ImeSnapshot {
+        Ok(Some(ImeSnapshot {
             text,
             selected,
             marked,
             caret_rect,
-        })
+        }))
     }
 
     /// A field's caret, for tests that check what the input method is told.
@@ -4657,52 +4823,76 @@ impl Runtime {
     /// off the field or without focus. The input system's
     /// characterIndexForPoint (dictionary lookup by mouse) answers
     /// through this.
-    pub fn ime_index_at(&self, x: Px, y: Px) -> Option<usize> {
-        let path = self.focus.borrow().clone()?;
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn ime_index_at(
+        &self,
+        x: Px,
+        y: Px,
+    ) -> Result<Option<usize>, crate::text_error::TextError> {
+        let Some(path) = self.focus.borrow().clone() else {
+            return Ok(None);
+        };
         if let Some(placement) = self.custom_at(&path) {
             if !placement.frame.contains(x, y) {
-                return None;
+                return Ok(None);
             }
             let local = Self::local(&placement, x, y);
-            let metrics =
-                crate::custom::Metrics::new(&*self.text, &self.cache, placement.font);
-            return placement.element.element().ime_index_at(local, &metrics);
+            let metrics = crate::custom::Metrics::new(&*self.text, &self.cache, placement.font);
+            return Ok(placement.element.element().ime_index_at(local, &metrics));
         }
-        let field = self
+        let Some(field) = self
             .last_fields
             .borrow()
             .iter()
             .find(|field| field.path == path)
-            .cloned()?;
+            .cloned()
+        else {
+            return Ok(None);
+        };
         if !field.frame.contains(x, y) {
-            return None;
+            return Ok(None);
         }
         // Use the pointer's visual row and the same aligned (or masked) run
         // as ordinary clicking, including wrapped and vertically scrolled text.
-        let (text, hit, _) = self.caret_under(&path, x, y)?;
-        Some(crate::text_input::byte_to_utf16(&text, hit.byte))
+        let Some(FieldPointer { text, hit, .. }) = self.caret_under(&path, x, y)? else {
+            return Ok(None);
+        };
+        Ok(Some(crate::text_input::byte_to_utf16(&text, hit.byte)))
     }
 
     /// The caret-shaped rect at a UTF-16 index of the focused field, in
     /// LAYOUT coordinates — the real answer for a ranged
     /// firstRectForCharacterRange (the candidate window placed at the
     /// COMPOSITION's start, not always at the caret).
-    pub fn ime_rect_for(&self, utf16: usize) -> Option<Rect> {
-        let path = self.focus.borrow().clone()?;
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn ime_rect_for(&self, utf16: usize) -> Result<Option<Rect>, crate::text_error::TextError> {
+        let Some(path) = self.focus.borrow().clone() else {
+            return Ok(None);
+        };
         if let Some(placement) = self.custom_at(&path) {
-            let metrics =
-                crate::custom::Metrics::new(&*self.text, &self.cache, placement.font);
-            let rect = placement.element.element().ime_rect_for(utf16, &metrics)?;
-            return Some(Self::to_layout(&placement, rect));
+            let metrics = crate::custom::Metrics::new(&*self.text, &self.cache, placement.font);
+            let Some(rect) = placement.element.element().ime_rect_for(utf16, &metrics) else {
+                return Ok(None);
+            };
+            return Ok(Some(Self::to_layout(&placement, rect)));
         }
-        let field = self
+        let Some(field) = self
             .last_fields
             .borrow()
             .iter()
             .find(|field| field.path == path)
-            .cloned()?;
+            .cloned()
+        else {
+            return Ok(None);
+        };
         let mut probe = CaretState::default();
-        let text = reconciler::read_editor(&path, &mut probe)?;
+        let Some(text) = reconciler::read_editor(&path, &mut probe) else {
+            return Ok(None);
+        };
         let byte = crate::text_input::utf16_to_byte(&text, utf16);
         let affinity = self
             .carets
@@ -4748,10 +4938,16 @@ impl Runtime {
 
     /// Applies an edit command to the focused field. The binding write
     /// already dirtied whoever reads; typing returns the caret to solid.
-    pub fn key(&self, command: EditCommand) -> Edited {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn key(&self, command: EditCommand) -> Result<Edited, crate::text_error::TextError> {
         self.enter_scene();
         let Some(path) = self.focus.borrow().clone() else {
-            return Edited { applied: false, output: None };
+            return Ok(Edited {
+                applied: false,
+                output: None,
+            });
         };
         // a secret field is refused the two commands that would carry
         // what it holds out of it. A cut is refused WHOLE — it does not
@@ -4761,7 +4957,10 @@ impl Runtime {
         if matches!(command, EditCommand::Copy | EditCommand::Cut)
             && self.field_at(&path).is_some_and(|field| field.secret)
         {
-            return Edited { applied: false, output: None };
+            return Ok(Edited {
+                applied: false,
+                output: None,
+            });
         }
         // a read-only view that answers a copy (`.on_copy`) holds the
         // keyboard with no caret, and Copy is the one command it takes:
@@ -4769,14 +4968,22 @@ impl Runtime {
         if matches!(command, EditCommand::Copy)
             && let Some(answer) = reconciler::run_copy(&path)
         {
-            return Edited { applied: answer.is_some(), output: answer };
+            return Ok(Edited {
+                applied: answer.is_some(),
+                output: answer,
+            });
         }
         // the same three, handed to the app's navigation while it asks:
         // a completion open over a composer walks and accepts with them
-        if matches!(command, EditCommand::Newline | EditCommand::Up(false) | EditCommand::Down(false))
-            && reconciler::field_intercepts_nav(&path)
+        if matches!(
+            command,
+            EditCommand::Newline | EditCommand::Up(false) | EditCommand::Down(false)
+        ) && reconciler::field_intercepts_nav(&path)
         {
-            return Edited { applied: false, output: None };
+            return Ok(Edited {
+                applied: false,
+                output: None,
+            });
         }
         // three commands a headless model cannot answer: they need the
         // wrap, and the wrap is geometry. A field that declines lets
@@ -4784,7 +4991,7 @@ impl Runtime {
         // Enter and of the vertical arrows
         match command {
             EditCommand::Newline => return self.insert_break(&path),
-            EditCommand::Submit => return self.submit(&path),
+            EditCommand::Submit => return Ok(self.submit(&path)),
             EditCommand::Up(select) => return self.walk_line(&path, false, select),
             EditCommand::Down(select) => return self.walk_line(&path, true, select),
             // any other command is a fresh start for the walk's column
@@ -4807,7 +5014,10 @@ impl Runtime {
                 // door: the gate offered it before the keymap
                 other => {
                     let _ = other;
-                    return Edited { applied: false, output: None };
+                    return Ok(Edited {
+                        applied: false,
+                        output: None,
+                    });
                 }
             };
             let response = self.deliver(&placement, event);
@@ -4815,23 +5025,32 @@ impl Runtime {
                 self.caret_phase.set(CaretPhase::Visible);
                 self.dirty_island_of(&placement.path);
             }
-            return Edited { applied: response.handled, output: response.text };
+            return Ok(Edited {
+                applied: response.handled,
+                output: response.text,
+            });
         }
         let mut state = self.carets.borrow().get(&path).copied().unwrap_or_default();
         // outside the map borrow: the editor writes to the binding and
         // can re-enter the runtime
         let observational = matches!(command, EditCommand::Read | EditCommand::Copy);
-        match reconciler::run_editor(&path, command, &mut state) {
+        Ok(match reconciler::run_editor(&path, command, &mut state) {
             Some(output) => {
                 self.carets.borrow_mut().insert(path.clone(), state);
                 if !observational {
                     self.caret_phase.set(CaretPhase::Held);
                 }
-                self.reveal_caret(&path);
-                Edited { applied: true, output }
+                self.reveal_caret(&path)?;
+                Edited {
+                    applied: true,
+                    output,
+                }
             }
-            None => Edited { applied: false, output: None },
-        }
+            None => Edited {
+                applied: false,
+                output: None,
+            },
+        })
     }
 
     /// The shell's door for a paste — ⌘V, Ctrl+V — into whoever holds the
@@ -4844,18 +5063,22 @@ impl Runtime {
     /// never pays for reading an image. `true` = the paste landed.
     ///
     /// [`ElementEvent::PasteImage`]: crate::custom::ElementEvent::PasteImage
-    pub fn paste(&self) -> bool {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn paste(&self) -> Result<bool, crate::text_error::TextError> {
         self.enter_scene();
         let Some(path) = self.focus.borrow().clone() else {
-            return false;
+            return Ok(false);
         };
         if let Some(placement) = self.custom_at(&path) {
             if let Some(image) = crate::clipboard::read_image() {
-                let response = self.deliver(&placement, crate::custom::ElementEvent::PasteImage(image));
+                let response =
+                    self.deliver(&placement, crate::custom::ElementEvent::PasteImage(image));
                 if response.handled {
                     self.caret_phase.set(CaretPhase::Visible);
                     self.dirty_island_of(&placement.path);
-                    return true;
+                    return Ok(true);
                 }
             }
         } else if let Some(take) = reconciler::field_paste_image(&path)
@@ -4863,12 +5086,12 @@ impl Runtime {
         {
             take(image);
             self.frame_asked.set(true);
-            return true;
+            return Ok(true);
         }
-        match crate::clipboard::read() {
-            Some(text) => self.key(EditCommand::Insert(text)).applied,
+        Ok(match crate::clipboard::read() {
+            Some(text) => self.key(EditCommand::Insert(text))?.applied,
             None => false,
-        }
+        })
     }
 
     /// A full frame for the shell: settle, layout at the viewport,
@@ -4877,14 +5100,17 @@ impl Runtime {
     /// hover re-resolves against the new hits and runs ONE extra pass —
     /// interaction always resolved BEFORE the pass that paints it.
     #[cfg(feature = "canvas")]
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
     pub fn frame(
         &self,
         root: &impl View,
         size: crate::layout::Size,
         scale: usize,
         background: crate::layout::Color,
-    ) -> crate::raster::Bitmap {
-        let display = self.display_frame(root, size);
+    ) -> Result<crate::raster::Bitmap, crate::text_error::TextError> {
+        let display = self.display_frame(root, size)?;
         crate::raster::rasterize_with(
             &display,
             (size.width.round() as usize) * scale,
@@ -4902,11 +5128,14 @@ impl Runtime {
     /// its retained [`Surface`] and blits only the damage.
     ///
     /// [`Surface`]: crate::raster::Surface
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
     pub fn display_frame<R: View>(
         &self,
         root: &R,
         size: crate::layout::Size,
-    ) -> crate::layout::DisplayList {
+    ) -> Result<crate::layout::DisplayList, crate::text_error::TextError> {
         // the size is known before the settle: the settle's own pass reads
         // it, and a reader runs once for a resize and never with a stale one
         self.note_viewport(crate::layout::Proposal::exact(size));
@@ -4917,14 +5146,14 @@ impl Runtime {
             reconciler::clear_measures_above(&key);
         }
         self.settle(root);
-        let mut result = self.layout(root, crate::layout::Proposal::exact(size));
-        if let Some(again) = self.reread_hover(root, size, &result) {
+        let mut result = self.layout(root, crate::layout::Proposal::exact(size))?;
+        if let Some(again) = self.reread_hover(root, size, &result)? {
             result = again;
         }
         // every box painted with the values as they stand: what a write
         // reached since the last frame is shown
         let _ = motor::identity::take_dirty_paints();
-        result.display
+        Ok(result.display)
     }
 
     /// The pointer re-read of a frame, and the second layout when the
@@ -4942,41 +5171,46 @@ impl Runtime {
         root: &impl View,
         size: crate::layout::Size,
         first: &crate::layout::LayoutResult,
-    ) -> Option<crate::layout::LayoutResult> {
-        crate::stats::time(crate::stats::Stage::Hover, || {
-            let point = self.hover_reread()?;
-            let before = self.interaction.borrow().hovered.clone();
-            self.hover_move_had_more.set(true);
-            let modifiers = self.pointer_modifiers.get();
-            // `pointer_moved`, with the two halves of its answer apart
-            self.enter_scene();
-            let (repaint, told) =
-                self.watching_hover(|| self.pointer_moved_road(point.x, point.y, modifiers));
-            if !repaint && !told {
-                return None;
-            }
-            // a box that used the move, a tooltip that moved, an
-            // `.on_hover` that fired, a road that never reached the hover
-            // at all (a drag, a menu): all of those are the old answer
-            let only_the_target_changed = !told && !self.hover_move_had_more.get();
-            let after = self.interaction.borrow().hovered.clone();
-            if only_the_target_changed
-                && !self.hover_paints(before.as_deref())
-                && !self.hover_paints(after.as_deref())
-            {
-                if crate::paranoid::on(crate::paranoid::HOVER) {
-                    let again = self.layout(root, crate::layout::Proposal::exact(size));
-                    assert!(
-                        again.display.as_slice() == first.display.as_slice(),
-                        "a hover that no box paints changed the picture: {before:?} -> {after:?}"
-                    );
+    ) -> Result<Option<crate::layout::LayoutResult>, crate::text_error::TextError> {
+        crate::stats::time(
+            crate::stats::Stage::Hover,
+            || -> Result<_, crate::text_error::TextError> {
+                let Some(point) = self.hover_reread() else {
+                    return Ok(None);
+                };
+                let before = self.interaction.borrow().hovered.clone();
+                self.hover_move_had_more.set(true);
+                let modifiers = self.pointer_modifiers.get();
+                // `pointer_moved`, with the two halves of its answer apart
+                self.enter_scene();
+                let (repaint, told) =
+                    self.watching_hover(|| self.pointer_moved_road(point.x, point.y, modifiers));
+                if !repaint? && !told {
+                    return Ok(None);
                 }
-                return None;
-            }
-            crate::stats::note_hover_relayout();
-            let again = self.layout(root, crate::layout::Proposal::exact(size));
-            Some(again)
-        })
+                // a box that used the move, a tooltip that moved, an
+                // `.on_hover` that fired, a road that never reached the hover
+                // at all (a drag, a menu): all of those are the old answer
+                let only_the_target_changed = !told && !self.hover_move_had_more.get();
+                let after = self.interaction.borrow().hovered.clone();
+                if only_the_target_changed
+                    && !self.hover_paints(before.as_deref())
+                    && !self.hover_paints(after.as_deref())
+                {
+                    if crate::paranoid::on(crate::paranoid::HOVER) {
+                        let again = self.layout(root, crate::layout::Proposal::exact(size))?;
+                        assert!(
+                            again.display.as_slice() == first.display.as_slice(),
+                            "a hover that no box paints changed the picture: {before:?} -> {after:?}"
+                        );
+                    }
+                    return Ok(None);
+                }
+                crate::stats::note_hover_relayout();
+                let again = self.layout(root, crate::layout::Proposal::exact(size))?;
+                Ok(Some(again))
+            },
+        )
     }
 
     /// Would a hover on this target change the picture the last layout
@@ -5022,7 +5256,10 @@ impl Runtime {
     /// moved: `scene` asks for a layout frame, `islands` only repaints
     /// the looping boxes. With nothing animating the call is free — the
     /// shell pauses its frame driver while both stay false.
-    pub fn tick(&self, dt: f64) -> crate::anim::Ticked {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn tick(&self, dt: f64) -> Result<crate::anim::Ticked, crate::text_error::TextError> {
         self.tick_clocked(dt, dt)
     }
 
@@ -5038,7 +5275,14 @@ impl Runtime {
     /// its gap: the beat before it may be from before the finger, and a
     /// driver that slept through a quiet scene must not hand a fresh
     /// touch the whole nap as holding.
-    pub fn tick_clocked(&self, dt: f64, elapsed: f64) -> crate::anim::Ticked {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn tick_clocked(
+        &self,
+        dt: f64,
+        elapsed: f64,
+    ) -> Result<crate::anim::Ticked, crate::text_error::TextError> {
         // the engine's clock moves with the frames: a sleeping task
         // wakes here, and its waker asks the shell for a settled turn
         // (this path only repaints, and a task needs the bodies)
@@ -5059,15 +5303,19 @@ impl Runtime {
         }
         // the finger's clock: a hold ages into a menu or a press by the
         // hand's own time, a fling slides the content one more step
-        let hand = if self.touch_fresh.replace(false) { elapsed.min(dt) } else { elapsed };
+        let hand = if self.touch_fresh.replace(false) {
+            elapsed.min(dt)
+        } else {
+            elapsed
+        };
         let gestures = self.touch.borrow_mut().tick_timed(dt, hand.max(0.0), self);
         let mut moved = moved;
         if !gestures.is_empty() {
-            let (repaint, input) = self.perform_touch(gestures);
+            let (repaint, input) = self.perform_touch(gestures)?;
             moved.scene |= repaint;
             moved.input |= input;
         }
-        moved
+        Ok(moved)
     }
 
     /// Why the scene needs a frame, reason by reason — the question a
@@ -5236,23 +5484,26 @@ impl Runtime {
     /// the real-event path (the documented contract). Hover still
     /// re-resolves: content slides under a still pointer while
     /// something animates.
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
     pub fn animation_frame<R: View>(
         &self,
         root: &R,
         size: crate::layout::Size,
-    ) -> crate::layout::DisplayList {
+    ) -> Result<crate::layout::DisplayList, crate::text_error::TextError> {
         // a tick reads a binding a write reached, like any frame
         // a bound text that read a new value is sized anew above it: the
         // boundaries over it kept a measure by the old one
         for key in crate::bind::settle_dirty() {
             reconciler::clear_measures_above(&key);
         }
-        let mut result = self.layout(root, crate::layout::Proposal::exact(size));
-        if let Some(again) = self.reread_hover(root, size, &result) {
+        let mut result = self.layout(root, crate::layout::Proposal::exact(size))?;
+        if let Some(again) = self.reread_hover(root, size, &result)? {
             result = again;
         }
         let _ = motor::identity::take_dirty_paints();
-        result.display
+        Ok(result.display)
     }
 
     /// The frame in DOM mode: settle, then the same convergence loop
@@ -5268,11 +5519,14 @@ impl Runtime {
     /// hover never re-resolves (the glue sends no pointer moves —
     /// `:hover` belongs to the browser, and the scene is pointer-
     /// invariant by construction).
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
     pub fn dom_frame<R: View>(
         &self,
         root: &R,
         size: crate::layout::Size,
-    ) -> Vec<crate::dom::DomPatch> {
+    ) -> Result<Vec<crate::dom::DomPatch>, crate::text_error::TextError> {
         self.note_viewport(crate::layout::Proposal::exact(size));
         // the bindings a write reached go stale before anything reads
         // them: a walk that meets one reads it again, and the ones no
@@ -5312,11 +5566,13 @@ impl Runtime {
         let rings = self.drop_rings();
         let rings_held = *self.last_drop_rings.borrow() == rings;
         *self.last_drop_rings.borrow_mut() = rings.clone();
-        let stable_root = rings_held.then(|| self.stable_boundary(std::any::TypeId::of::<R>())).flatten();
+        let stable_root = rings_held
+            .then(|| self.stable_boundary(std::any::TypeId::of::<R>()))
+            .flatten();
         let tree = match stable_root {
             Some(path) => {
                 reconciler::note_stable_frame();
-{
+                {
                     let slot = reconciler::slot_of(&path);
                     crate::layout::LayoutNode::BoundaryRef {
                         path: Rc::from(path.as_str()),
@@ -5354,7 +5610,8 @@ impl Runtime {
             caret_visible: self.caret_phase.get().visible(),
         };
         self.cache.begin_frame();
-        self.last_proposal.set(Some(crate::layout::Proposal::exact(size)));
+        self.last_proposal
+            .set(Some(crate::layout::Proposal::exact(size)));
         let offsets = self.scroll_offsets.borrow();
         let dialogs = self.dialog_frames.borrow();
         let env = LayoutEnv {
@@ -5396,7 +5653,7 @@ impl Runtime {
         };
         let output = crate::stats::time(crate::stats::Stage::Capture, || {
             crate::dom_flow::lower(&tree, &flow)
-        });
+        })?;
         drop(boxes);
         drop(dom);
         self.seed_island_boxes(&output.scene, &output.islands_walked);
@@ -5422,7 +5679,7 @@ impl Runtime {
         if let Some(patch) = dom.note_language(locale.identifier(), self.layout_direction()) {
             patches.push(patch);
         }
-        patches
+        Ok(patches)
     }
 
     /// Hydration's engine half: run the same frame the build ran and
@@ -5430,7 +5687,14 @@ impl Runtime {
     /// holds these elements, ids assigned by the same pre-order. The
     /// next [`Runtime::dom_frame`] diffs against a page that is
     /// already true and says nothing.
-    pub fn dom_adopt<R: View>(&self, root: &R, size: crate::layout::Size) {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn dom_adopt<R: View>(
+        &self,
+        root: &R,
+        size: crate::layout::Size,
+    ) -> Result<(), crate::text_error::TextError> {
         // the build's frame knew its window: a body that bends with the
         // width must see the same one here, or it adopts another scene
         self.note_viewport(crate::layout::Proposal::exact(size));
@@ -5444,11 +5708,13 @@ impl Runtime {
         let rings = self.drop_rings();
         let rings_held = *self.last_drop_rings.borrow() == rings;
         *self.last_drop_rings.borrow_mut() = rings.clone();
-        let stable_root = rings_held.then(|| self.stable_boundary(std::any::TypeId::of::<R>())).flatten();
+        let stable_root = rings_held
+            .then(|| self.stable_boundary(std::any::TypeId::of::<R>()))
+            .flatten();
         let tree = match stable_root {
             Some(path) => {
                 reconciler::note_stable_frame();
-{
+                {
                     let slot = reconciler::slot_of(&path);
                     crate::layout::LayoutNode::BoundaryRef {
                         path: Rc::from(path.as_str()),
@@ -5484,7 +5750,8 @@ impl Runtime {
             caret_visible: self.caret_phase.get().visible(),
         };
         self.cache.begin_frame();
-        self.last_proposal.set(Some(crate::layout::Proposal::exact(size)));
+        self.last_proposal
+            .set(Some(crate::layout::Proposal::exact(size)));
         let offsets = self.scroll_offsets.borrow();
         let dialogs = self.dialog_frames.borrow();
         let env = LayoutEnv {
@@ -5525,7 +5792,7 @@ impl Runtime {
             island_boxes: &boxes,
             drop_rings: &rings,
         };
-        let output = crate::dom_flow::lower(&tree, &flow);
+        let output = crate::dom_flow::lower(&tree, &flow)?;
         drop(boxes);
         drop(dom);
         self.seed_island_boxes(&output.scene, &output.islands_walked);
@@ -5540,6 +5807,8 @@ impl Runtime {
         // so the first frame says nothing about it either
         let locale = self.locale();
         let _ = dom.note_language(locale.identifier(), self.layout_direction());
+
+        Ok(())
     }
 
     /// A click resolved by the BROWSER: the glue walked up from the
@@ -5721,7 +5990,13 @@ impl Runtime {
     /// rasterized at `scale` and ready to blit. Empty when the scene
     /// has no islands or nothing inside one moved.
     #[cfg(feature = "canvas")]
-    pub fn dom_islands(&self, scale: usize) -> Vec<crate::dom::IslandFrame> {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn dom_islands(
+        &self,
+        scale: usize,
+    ) -> Result<Vec<crate::dom::IslandFrame>, crate::text_error::TextError> {
         let lists = self.dom_island_lists(scale);
         let mut surfaces = self.island_surfaces.borrow_mut();
         // an island that left takes its surface along
@@ -5748,8 +6023,10 @@ impl Runtime {
                     ),
                 );
             }
-            let surface = surfaces.get_mut(&island.id).expect("the surface just placed");
-            let damage = surface.frame(island.display, &*self.text, &*self.images);
+            let surface = surfaces
+                .get_mut(&island.id)
+                .expect("the surface just placed");
+            let damage = surface.frame(island.display, &*self.text, &*self.images)?;
             let Some((x0, y0, x1, y1)) = crate::raster::damage_union(&damage) else {
                 continue;
             };
@@ -5777,7 +6054,7 @@ impl Runtime {
                 dirty: (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32),
             });
         }
-        frames
+        Ok(frames)
     }
 
     /// Which drop targets a live drag rings, in walk order — the flow
@@ -5840,44 +6117,75 @@ impl Runtime {
     /// frame's road, and the shell draws a frame. The dirty paints are
     /// taken either way: the frame repaints everything.
     #[cfg(feature = "canvas")]
-    pub fn repaint_dirty_paints(&self, scale: usize) -> (Vec<LiveBlit>, bool) {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn repaint_dirty_paints(
+        &self,
+        scale: usize,
+    ) -> Result<(Vec<LiveBlit>, bool), crate::text_error::TextError> {
         let dirty = motor::identity::take_dirty_paints();
         if dirty.is_empty() {
-            return (Vec::new(), false);
+            return Ok((Vec::new(), false));
         }
         let (islands, plain): (Vec<Rc<str>>, Vec<Rc<str>>) = {
             let customs = self.last_customs.borrow();
             dirty.into_iter().partition(|path| {
-                customs.iter().any(|placement| placement.is_island() && *placement.path == **path)
+                customs
+                    .iter()
+                    .any(|placement| placement.is_island() && *placement.path == **path)
             })
         };
-        let blits = if islands.is_empty() { Vec::new() } else { self.live_repaint(scale, &islands) };
-        (blits, !plain.is_empty())
+        let blits = if islands.is_empty() {
+            Vec::new()
+        } else {
+            self.live_repaint(scale, &islands)?
+        };
+        Ok((blits, !plain.is_empty()))
     }
 
     /// The focused box's overlay, repainted at the caret's new phase —
     /// the blink's road when the box has an overlay island. `None` when
     /// it has none: the shell draws a frame, as it always did.
     #[cfg(feature = "canvas")]
-    pub fn blink_overlay(&self, scale: usize) -> Option<Vec<LiveBlit>> {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn blink_overlay(
+        &self,
+        scale: usize,
+    ) -> Result<Option<Vec<LiveBlit>>, crate::text_error::TextError> {
         let island: Rc<str> = {
             let focus = self.focus.borrow();
-            let focus = focus.as_deref()?;
+            let Some(focus) = focus.as_deref() else {
+                return Ok(None);
+            };
             let customs = self.last_customs.borrow();
             let island = format!("{focus}/overlay");
-            if !customs.iter().any(|placement| placement.overlay && placement.path == island) {
-                return None;
+            if !customs
+                .iter()
+                .any(|placement| placement.overlay && placement.path == island)
+            {
+                return Ok(None);
             }
             Rc::from(island.as_str())
         };
-        Some(self.live_repaint(scale, std::slice::from_ref(&island)))
+        Ok(Some(
+            self.live_repaint(scale, std::slice::from_ref(&island))?,
+        ))
     }
 
     #[cfg(feature = "canvas")]
-    pub fn live_islands(&self, scale: usize) -> Vec<LiveBlit> {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn live_islands(
+        &self,
+        scale: usize,
+    ) -> Result<Vec<LiveBlit>, crate::text_error::TextError> {
         let dirty = self.animator.borrow_mut().take_dirty_loops();
         if dirty.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         self.live_repaint(scale, &dirty)
     }
@@ -5889,7 +6197,13 @@ impl Runtime {
     /// that wakes often (a file watch, a poll) never pays the mark
     /// again for a frame that left it alone.
     #[cfg(feature = "canvas")]
-    pub fn live_islands_all(&self, scale: usize) -> Vec<LiveBlit> {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn live_islands_all(
+        &self,
+        scale: usize,
+    ) -> Result<Vec<LiveBlit>, crate::text_error::TextError> {
         let paths: Vec<Rc<str>> = self
             .last_customs
             .borrow()
@@ -5898,7 +6212,7 @@ impl Runtime {
             .map(|placement| Rc::from(placement.path.as_str()))
             .collect();
         if paths.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         self.live_repaint(scale, &paths)
     }
@@ -6121,7 +6435,11 @@ impl Runtime {
     }
 
     #[cfg(feature = "canvas")]
-    fn live_repaint(&self, scale: usize, dirty: &[Rc<str>]) -> Vec<LiveBlit> {
+    fn live_repaint(
+        &self,
+        scale: usize,
+        dirty: &[Rc<str>],
+    ) -> Result<Vec<LiveBlit>, crate::text_error::TextError> {
         let customs = self.last_customs.borrow();
         let mut ledger = self.live_ledger.borrow_mut();
         // the ledger lives exactly as long as the placed live boxes
@@ -6140,7 +6458,10 @@ impl Runtime {
                 continue;
             };
             let phase = match placement.live {
-                Some(spec) => self.animator.borrow_mut().resolve_phase(&placement.path, spec),
+                Some(spec) => self
+                    .animator
+                    .borrow_mut()
+                    .resolve_phase(&placement.path, spec),
                 None => 0.0,
             };
             let mut display = crate::layout::DisplayList::default();
@@ -6148,7 +6469,10 @@ impl Runtime {
                 // an overlay paints in its BOX's coordinates: the painter's
                 // origin puts the box's top-left where it stands relative to
                 // the overlay's own pixels
-                let box_path = placement.path.strip_suffix("/overlay").unwrap_or(&placement.path);
+                let box_path = placement
+                    .path
+                    .strip_suffix("/overlay")
+                    .unwrap_or(&placement.path);
                 let Some(owner) = customs.iter().find(|owner| owner.path == box_path) else {
                     continue;
                 };
@@ -6224,21 +6548,19 @@ impl Runtime {
             // edge. Only pixel-aligned, unstretched boxes take this path.
             let aligned = scale != 0
                 && [origin.x * factor, origin.y * factor]
-                    .iter().all(|edge| edge.is_finite() && *edge == edge.round())
+                    .iter()
+                    .all(|edge| edge.is_finite() && *edge == edge.round())
                 && placement.visible.size.width * factor == physical.0 as f64
                 && placement.visible.size.height * factor == physical.1 as f64;
             // the SIZE counts as much as the picture: a box that grew
             // without changing what it draws still owes its surface new
             // pixels, or the surface stretches the old ones
-            if ledger
-                .get(path)
-                .is_some_and(|last| {
-                    last.display == display.as_slice()
-                        && last.physical == physical
-                        && last.scale == scale
-                        && last.aligned == aligned
-                })
-            {
+            if ledger.get(path).is_some_and(|last| {
+                last.display == display.as_slice()
+                    && last.physical == physical
+                    && last.scale == scale
+                    && last.aligned == aligned
+            }) {
                 continue;
             }
             let compact = if aligned {
@@ -6259,7 +6581,10 @@ impl Runtime {
                 )
             } else {
                 (
-                    Rect { origin: Point::ZERO, size: placement.visible.size },
+                    Rect {
+                        origin: Point::ZERO,
+                        size: placement.visible.size,
+                    },
                     crate::raster::rasterize_with(
                         &display,
                         physical.0,
@@ -6268,12 +6593,18 @@ impl Runtime {
                         crate::layout::Color::rgba(0, 0, 0, 0),
                         &*self.text,
                         &*self.images,
-                    ),
+                    )?,
                 )
             };
             ledger.insert(
                 Rc::clone(path),
-                LiveCell { display: display.as_slice().to_vec(), physical, scale, aligned, paint },
+                LiveCell {
+                    display: display.as_slice().to_vec(),
+                    physical,
+                    scale,
+                    aligned,
+                    paint,
+                },
             );
             blits.push(LiveBlit {
                 path: placement.path.clone(),
@@ -6289,7 +6620,7 @@ impl Runtime {
                 rgba: bitmap.to_rgba_bytes(),
             });
         }
-        blits
+        Ok(blits)
     }
 
     /// The browser scrolled: the offset lands in the engine AND in
@@ -6904,11 +7235,14 @@ impl Runtime {
     /// out what the last pass built. A screen whose data arrives through
     /// `.task` stays empty forever under a bare `layout` loop, which is
     /// exactly what a headless probe writes first.
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
     pub fn settled_layout(
         &self,
         root: &impl View,
         proposal: crate::layout::Proposal,
-    ) -> crate::layout::LayoutResult {
+    ) -> Result<crate::layout::LayoutResult, crate::text_error::TextError> {
         self.settle(root);
         self.layout(root, proposal)
     }
@@ -6920,12 +7254,15 @@ impl Runtime {
     /// It lays out; it does not settle. Effects and tasks belong to
     /// [`Runtime::settle`] — see [`Runtime::settled_layout`] for the
     /// pair a probe wants.
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
     pub fn layout(
         &self,
         root: &impl View,
         proposal: crate::layout::Proposal,
-    ) -> crate::layout::LayoutResult {
-        let mut result = self.layout_once(root, proposal);
+    ) -> Result<crate::layout::LayoutResult, crate::text_error::TextError> {
+        let mut result = self.layout_once(root, proposal)?;
         // follow-ups, capped: a scroll target that CHANGED moves its
         // region's offset; a field's first `.auto_focus()` takes the
         // keyboard; a virtualized window that missed re-materializes
@@ -6940,7 +7277,7 @@ impl Runtime {
                 | self.apply_measures(&result)
                 | self.apply_row_anchors()
                 | self.apply_tail_follow(&result);
-            let focused = self.sync_navigation_scope(&result) | self.apply_auto_focus(&result);
+            let focused = self.sync_navigation_scope(&result) | self.apply_auto_focus(&result)?;
             // a miss measured on the round a target just moved is
             // spurious — it audited the PRE-jump offset; the relayout
             // below re-audits against the real one
@@ -6955,9 +7292,9 @@ impl Runtime {
             if !moved && !focused && !missed && !orphaned {
                 break;
             }
-            result = self.layout_once(root, proposal);
+            result = self.layout_once(root, proposal)?;
         }
-        result
+        Ok(result)
     }
 
     /// Closes every popover whose anchor no longer intersects its clip
@@ -7178,7 +7515,10 @@ impl Runtime {
     /// `.auto_focus()` (blur is final, remounting does not re-focus), once
     /// per beat for `.auto_focus_beat` — then the boxes' beats. An alert
     /// that just opened comes before all of them.
-    fn apply_auto_focus(&self, result: &crate::layout::LayoutResult) -> bool {
+    fn apply_auto_focus(
+        &self,
+        result: &crate::layout::LayoutResult,
+    ) -> Result<bool, crate::text_error::TextError> {
         // An alert takes the keyboard the pass it opens, from whoever
         // holds it, and on LOAN (`crate::loans`): answering it gives the
         // keys back, so the editor that held them before the ask holds
@@ -7190,7 +7530,11 @@ impl Runtime {
             if !matches!(overlay.surface, crate::layout::OverlaySurface::Alert(_)) {
                 continue;
             }
-            if !self.auto_focused.borrow_mut().insert(format!("{}#alert", overlay.path)) {
+            if !self
+                .auto_focused
+                .borrow_mut()
+                .insert(format!("{}#alert", overlay.path))
+            {
                 continue;
             }
             let lender = self.focus.borrow().clone();
@@ -7212,17 +7556,21 @@ impl Runtime {
                 self.loans.borrow_mut().lend(&overlay.path, &lender);
             }
             self.focus(&overlay.path);
-            return true;
+            return Ok(true);
         }
         for field in &result.fields {
-            if result.focus_scope.is_some() && !result.focus_order[result.focus_floor..]
-                .iter().any(|stop| stop.path.as_ref() == field.path)
-            { continue; }
+            if result.focus_scope.is_some()
+                && !result.focus_order[result.focus_floor..]
+                    .iter()
+                    .any(|stop| stop.path.as_ref() == field.path)
+            {
+                continue;
+            }
             if self.claim_auto_focus(&field.path, field.auto_focus) {
                 // This layout has retained the field's geometry. Reveal the
                 // focused caret now, before the first frame or keystroke.
-                self.reveal_caret(&field.path);
-                return true;
+                self.reveal_caret(&field.path)?;
+                return Ok(true);
             }
         }
         // A custom box's auto-focus is KEYED: each new beat is one explicit
@@ -7232,9 +7580,13 @@ impl Runtime {
         // Each (box, beat) fires once, so the user can focus away and stay
         // away until the app beats again.
         for placement in &result.customs {
-            if result.focus_scope.is_some() && !result.focus_order[result.focus_floor..]
-                .iter().any(|stop| stop.path.as_ref() == placement.path)
-            { continue; }
+            if result.focus_scope.is_some()
+                && !result.focus_order[result.focus_floor..]
+                    .iter()
+                    .any(|stop| stop.path.as_ref() == placement.path)
+            {
+                continue;
+            }
             // an overlay island shares its box's element: the keyboard goes
             // to the box, never to the island
             if placement.overlay {
@@ -7259,18 +7611,18 @@ impl Runtime {
                     self.loans.borrow_mut().lend(&placement.path, &lender);
                 }
                 self.focus_via(&placement.path, Some(placement));
-                return true;
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 
     fn layout_once(
         &self,
         root: &impl View,
         proposal: crate::layout::Proposal,
-    ) -> crate::layout::LayoutResult {
-        self.layout_once_with(root, proposal, false, true).0
+    ) -> Result<crate::layout::LayoutResult, crate::text_error::TextError> {
+        Ok(self.layout_once_with(root, proposal, false, true)?.0)
     }
 
     /// One layout pass, optionally with the Dom capture riding it.
@@ -7280,7 +7632,10 @@ impl Runtime {
         proposal: crate::layout::Proposal,
         dom: bool,
         collect_display: bool,
-    ) -> (crate::layout::LayoutResult, Option<crate::dom::DomNode>) {
+    ) -> Result<
+        (crate::layout::LayoutResult, Option<crate::dom::DomNode>),
+        crate::text_error::TextError,
+    > {
         // every call walks measure+place (the stable-root shortcut
         // skips BODIES, not geometry) — so every call counts
         crate::stats::note_layout_pass();
@@ -7306,7 +7661,7 @@ impl Runtime {
             Some(path) => {
                 // the observable contract holds: THIS frame ran zero bodies
                 reconciler::note_stable_frame();
-{
+                {
                     let slot = reconciler::slot_of(&path);
                     crate::layout::LayoutNode::BoundaryRef {
                         path: Rc::from(path.as_str()),
@@ -7354,8 +7709,8 @@ impl Runtime {
         // an inset change is a resize too: the keyboard rising moves
         // geometry because the window did, and nothing wobbles for it
         let insets = self.frame_insets();
-        let resized = self.last_proposal.get() != Some(proposal)
-            || self.last_insets.get() != insets;
+        let resized =
+            self.last_proposal.get() != Some(proposal) || self.last_insets.get() != insets;
         self.last_proposal.set(Some(proposal));
         self.last_insets.set(insets);
         {
@@ -7393,15 +7748,18 @@ impl Runtime {
         let (result, scene) = crate::stats::time(stage, || {
             if dom {
                 let (result, scene) =
-                    crate::layout::layout_dom(&tree, proposal, env, collect_display);
-                (result, Some(scene))
+                    crate::layout::layout_dom(&tree, proposal, env, collect_display)?;
+                Ok::<_, crate::text_error::TextError>((result, Some(scene)))
             } else {
                 // Paranoid cross-checks preserve the runtime's public choice:
                 // probes keep offscreen words; shells request the cut.
                 let drop = self.drops_unseen.get();
-                (crate::layout::layout_placing(&tree, proposal, env, insets, !drop), None)
+                Ok((
+                    crate::layout::layout_placing(&tree, proposal, env, insets, !drop)?,
+                    None,
+                ))
             }
-        });
+        })?;
         crate::stats::note_display(result.display.len());
         drop(offsets);
         drop(dialogs);
@@ -7409,19 +7767,35 @@ impl Runtime {
         // `clone_from`, not a fresh clone: the tables keep their capacity
         // from frame to frame, and the paths inside keep their buffers
         self.last_hits.borrow_mut().clone_from(&result.hits);
-        self.last_hover_sensitive.borrow_mut().clone_from(&result.hover_sensitive);
-        self.last_sensitive_groups.borrow_mut().clone_from(&result.sensitive_groups);
+        self.last_hover_sensitive
+            .borrow_mut()
+            .clone_from(&result.hover_sensitive);
+        self.last_sensitive_groups
+            .borrow_mut()
+            .clone_from(&result.sensitive_groups);
         self.last_scrolls.borrow_mut().clone_from(&result.scrolls);
         self.last_modal_floor.set(result.modal_floor);
         let lost_control = self.focused().is_some_and(|path| {
-            self.last_focus_order.borrow().iter().any(|stop| stop.path.as_ref() == path)
-                && !result.focus_order.iter().any(|stop| stop.path.as_ref() == path)
+            self.last_focus_order
+                .borrow()
+                .iter()
+                .any(|stop| stop.path.as_ref() == path)
+                && !result
+                    .focus_order
+                    .iter()
+                    .any(|stop| stop.path.as_ref() == path)
         });
-        if lost_control { self.blur(); }
+        if lost_control {
+            self.blur();
+        }
         self.last_fields.borrow_mut().clone_from(&result.fields);
-        self.last_focus_order.borrow_mut().clone_from(&result.focus_order);
+        self.last_focus_order
+            .borrow_mut()
+            .clone_from(&result.focus_order);
         self.last_focus_floor.set(result.focus_floor);
-        self.accessibility.borrow_mut().update(&result.accessibility);
+        self.accessibility
+            .borrow_mut()
+            .update(&result.accessibility);
         self.last_splits.borrow_mut().clone_from(&result.splits);
         self.last_customs.borrow_mut().clone_from(&result.customs);
         self.last_hosts.borrow_mut().clone_from(&result.hosts);
@@ -7429,17 +7803,23 @@ impl Runtime {
         self.forget_answered_alerts(&result.overlays);
         self.last_tooltips.borrow_mut().clone_from(&result.tooltips);
         self.last_menus.borrow_mut().clone_from(&result.menus);
-        self.last_drag_sources.borrow_mut().clone_from(&result.drag_sources);
+        self.last_drag_sources
+            .borrow_mut()
+            .clone_from(&result.drag_sources);
         self.last_drops.borrow_mut().clone_from(&result.drops);
-        self.last_drag_regions.borrow_mut().clone_from(&result.drag_regions);
-        self.last_control_regions.borrow_mut().clone_from(&result.control_regions);
+        self.last_drag_regions
+            .borrow_mut()
+            .clone_from(&result.drag_regions);
+        self.last_control_regions
+            .borrow_mut()
+            .clone_from(&result.control_regions);
         self.last_thumbs.borrow_mut().clone_from(&result.thumbs);
         // an applied-target memory whose region left the scene goes
         // with it — live regions keep theirs (the wheel stays sovereign)
         self.scroll_targets
             .borrow_mut()
             .retain(|path, _| result.scrolls.iter().any(|region| region.path == *path));
-        (result, scene)
+        Ok((result, scene))
     }
 
     /// Forces every body (drops the retention before the pass) — the
@@ -7454,23 +7834,33 @@ impl Runtime {
     /// proposal and rasterization of the display list — what the
     /// platform backend blits to the window.
     #[cfg(feature = "canvas")]
-    pub fn paint(&self, root: &impl View, size: crate::layout::Size) -> crate::raster::Bitmap {
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
+    pub fn paint(
+        &self,
+        root: &impl View,
+        size: crate::layout::Size,
+    ) -> Result<crate::raster::Bitmap, crate::text_error::TextError> {
         self.paint_at_scale(root, size, 1)
     }
 
     /// [`Runtime::paint`] at retina: layout in logical points, bitmap
     /// in physical pixels (`size × scale`).
     #[cfg(feature = "canvas")]
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
     pub fn paint_at_scale(
         &self,
         root: &impl View,
         size: crate::layout::Size,
         scale: usize,
-    ) -> crate::raster::Bitmap {
+    ) -> Result<crate::raster::Bitmap, crate::text_error::TextError> {
         // the pass paints for THIS screen: a box that snaps to the
         // pixel grid reads the same number the rasterizer will use
         self.set_device_scale(scale as Px);
-        let result = self.layout(root, crate::layout::Proposal::exact(size));
+        let result = self.layout(root, crate::layout::Proposal::exact(size))?;
         crate::raster::rasterize_with(
             &result.display,
             (size.width.round() as usize) * scale,
@@ -8045,30 +8435,54 @@ impl Runtime {
 
     /// Applies an assistive-technology request through the control's existing
     /// input path. Stale handles and unsupported role/action pairs are rejected.
-    pub fn accessibility_action(&self, id: crate::accessibility::NodeId, action: crate::accessibility::Action)
-        -> Result<(), crate::accessibility::ActionError>
-    {
+    ///
+    /// # Errors
+    /// Reports unavailable controls, unsupported actions and native text failures
+    /// encountered while applying the request.
+    pub fn accessibility_action(
+        &self,
+        id: crate::accessibility::NodeId,
+        action: crate::accessibility::Action,
+    ) -> Result<(), crate::accessibility::ActionError> {
         use crate::accessibility::{Action, ActionError};
         let tree = self.accessibility_tree();
         let node = tree.node(id).ok_or(ActionError::Unavailable)?;
-        if !node.supports(&action) { return Err(ActionError::Unsupported); }
+        if !node.supports(&action) {
+            return Err(ActionError::Unsupported);
+        }
         self.enter_scene();
         let applied = match action {
             Action::Activate => reconciler::run_action(&node.path, 1),
             Action::Focus => {
-                let stop = self.last_focus_order.borrow().iter().skip(self.last_focus_floor.get())
-                    .find(|stop| stop.path == node.path).cloned().ok_or(ActionError::Unavailable)?;
+                let stop = self
+                    .last_focus_order
+                    .borrow()
+                    .iter()
+                    .skip(self.last_focus_floor.get())
+                    .find(|stop| stop.path == node.path)
+                    .cloned()
+                    .ok_or(ActionError::Unavailable)?;
                 self.focus_stop(&stop);
                 true
             }
             Action::SetText(text) => {
-                if self.field_at(&node.path).is_none() { return Err(ActionError::Unavailable); }
+                if self.field_at(&node.path).is_none() {
+                    return Err(ActionError::Unavailable);
+                }
                 self.focus(&node.path);
-                self.key(EditCommand::SelectAll);
-                self.key(EditCommand::Insert(text)).applied
+                self.key(EditCommand::SelectAll)
+                    .map_err(ActionError::Text)?;
+                self.key(EditCommand::Insert(text))
+                    .map_err(ActionError::Text)?
+                    .applied
             }
         };
-        if applied { self.frame_asked.set(true); Ok(()) } else { Err(ActionError::Unavailable) }
+        if applied {
+            self.frame_asked.set(true);
+            Ok(())
+        } else {
+            Err(ActionError::Unavailable)
+        }
     }
 }
 

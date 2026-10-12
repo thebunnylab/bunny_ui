@@ -42,7 +42,7 @@ use bunny_ui::layout::{Color, DisplayList, Size};
 use bunny_ui::text_engine::TextEngine;
 
 use bunny_ui::gpu::walk::{
-    build_frame, AtlasFull, AtlasGround, DrawRun, FrameBatches, GlassInstance, RectInstance,
+    build_frame, RenderError, AtlasGround, DrawRun, FrameBatches, GlassInstance, RectInstance,
     RoundClip, RunAtlas, RunKind, SpriteInstance, GLASS_MAX_LEVEL, ATLAS_KEEP_WALKS,
 };
 
@@ -2753,6 +2753,23 @@ impl VkGround {
     }
 }
 
+/// A failed walk never submits its staged copies. Forget their cache entries
+/// only after older frames stop sampling the textures; otherwise a retry would
+/// treat uninitialized tiles or an unstaged live generation as already uploaded.
+fn discard_staged_frame(
+    stack: &VkStack,
+    slots: &mut [VkSlot; 3],
+    atlas: &mut RunAtlas,
+    ground: &mut VkGround,
+) {
+    drain_all(stack, slots);
+    let mut view = VkGroundView { stack, ground };
+    atlas.reset(&mut view, false);
+    ground.pending.clear();
+    ground.staging_cursor = 0;
+    ground.overflow = false;
+}
+
 /// The ground seam a walk sees, bound to one stack + one VkGround.
 struct VkGroundView<'a> {
     stack: &'a VkStack,
@@ -3864,6 +3881,9 @@ impl VkPresenter {
     /// `post()` runs after a present the WSI accepted. Detached, with no
     /// swapchain, the frame paints nothing and answers `Ok`.
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// # Errors
+    /// Returns a text error or atlas exhaustion if the frame cannot be prepared.
     pub fn present(
         &mut self,
         display: &DisplayList,
@@ -3874,16 +3894,16 @@ impl VkPresenter {
         images: &dyn ImageEngine,
         pre: &mut dyn FnMut(usize) -> bool,
         post: &mut dyn FnMut(),
-    ) -> Presented {
+    ) -> Result<Presented, RenderError> {
         if self.swapchain.is_none() {
-            return Presented::Ok;
+            return Ok(Presented::Ok);
         }
         let physical = (
             (size.width * scale as f64).round().max(0.0) as usize,
             (size.height * scale as f64).round().max(0.0) as usize,
         );
         if physical.0 == 0 || physical.1 == 0 {
-            return Presented::Ok;
+            return Ok(Presented::Ok);
         }
         // a frame at a size the swapchain was not built for, on a surface
         // that takes its size FROM the swapchain: rebuilt before anything
@@ -3892,10 +3912,10 @@ impl VkPresenter {
         if asked.is_some_and(|asked| moved(self.stack.door, asked, physical))
             && !self.recreate_swapchain(physical)
         {
-            return Presented::DeviceLost;
+            return Ok(Presented::DeviceLost);
         }
         if frame_repeats(&self.retained, display, physical, scale, canvas) {
-            return Presented::Ok;
+            return Ok(Presented::Ok);
         }
         // the slot first: its fence guards the staging arena the walk
         // is about to fill
@@ -3905,9 +3925,14 @@ impl VkPresenter {
         // walk with retries; staging overflow grows the arena, atlas
         // overflow runs the copying collector
         for attempt in 0..4 {
-            self.ground
-                .bind_staging(self.slots[index].staging_map, self.slots[index].staging_capacity);
-            let mut view = VkGroundView { stack: &self.stack, ground: &mut self.ground };
+            self.ground.bind_staging(
+                self.slots[index].staging_map,
+                self.slots[index].staging_capacity,
+            );
+            let mut view = VkGroundView {
+                stack: &self.stack,
+                ground: &mut self.ground,
+            };
             let walked = build_frame(
                 &mut view,
                 display,
@@ -3918,7 +3943,15 @@ impl VkPresenter {
                 &mut self.atlas,
                 &mut self.batches,
             );
+            if let Err(RenderError::Text(error)) = walked {
+                discard_staged_frame(&self.stack, &mut self.slots, &mut self.atlas, &mut self.ground);
+                return Err(RenderError::Text(error));
+            }
             if self.ground.overflow {
+                if attempt == 3 {
+                    discard_staged_frame(&self.stack, &mut self.slots, &mut self.atlas, &mut self.ground);
+                    return Err(RenderError::AtlasFull);
+                }
                 // the arena refused an upload — a run, or a dedicated
                 // texture the walk then reported as AtlasFull: the arena
                 // grows, and every entry goes, since the refused ones sit
@@ -3926,39 +3959,54 @@ impl VkPresenter {
                 let needed = self.ground.staging_capacity * 2;
                 drain_all(&self.stack, &mut self.slots);
                 if !self.slots[index].grow_staging(&self.stack, needed) {
-                    return Presented::DeviceLost;
+                    return Ok(Presented::DeviceLost);
                 }
-                let mut view = VkGroundView { stack: &self.stack, ground: &mut self.ground };
+                let mut view = VkGroundView {
+                    stack: &self.stack,
+                    ground: &mut self.ground,
+                };
                 self.atlas.reset(&mut view, false);
                 continue;
             }
             match walked {
                 Ok(()) => break,
-                Err(AtlasFull) => {
+                Err(RenderError::Text(error)) => return Err(RenderError::Text(error)),
+                Err(RenderError::AtlasFull) => {
                     if attempt == 3 {
-                        eprintln!("bunny_ui vk: atlas overflow survived the resets");
-                        break;
+                        discard_staged_frame(&self.stack, &mut self.slots, &mut self.atlas, &mut self.ground);
+                    return Err(RenderError::AtlasFull);
                     }
                     // the cheap road first: shelves nobody read for a while
                     // are given back with no drain and no re-raster
-                    if attempt == 0 && self.atlas.evict_stale(ATLAS_KEEP_WALKS) > 0 {
+                    if attempt == 0
+                        && self.ground.pending.is_empty()
+                        && self.atlas.evict_stale(ATLAS_KEEP_WALKS) > 0 {
                         continue;
                     }
                     drain_all(&self.stack, &mut self.slots);
-                    let mut view =
-                        VkGroundView { stack: &self.stack, ground: &mut self.ground };
+                    let mut view = VkGroundView {
+                        stack: &self.stack,
+                        ground: &mut self.ground,
+                    };
                     self.atlas.reset(&mut view, true);
                 }
             }
         }
         if !upload_instances(&self.stack, &mut self.slots[index], &self.batches) {
-            return Presented::DeviceLost;
+            return Ok(Presented::DeviceLost);
         }
         // acquire; a stale swapchain rebuilds once and retries
         let mut image_index = 0u32;
         for attempt in 0..2 {
-            let wsi = self.stack.wsi.as_ref().expect("a window stack keeps its WSI");
-            let handle = self.swapchain.as_ref().map_or(0, |swapchain| swapchain.handle);
+            let wsi = self
+                .stack
+                .wsi
+                .as_ref()
+                .expect("a window stack keeps its WSI");
+            let handle = self
+                .swapchain
+                .as_ref()
+                .map_or(0, |swapchain| swapchain.handle);
             let acquired = unsafe {
                 (wsi.acquire_next_image)(
                     self.stack.device,
@@ -3973,17 +4021,20 @@ impl VkPresenter {
                 VK_SUCCESS | VK_SUBOPTIMAL_KHR => break,
                 VK_ERROR_OUT_OF_DATE_KHR if attempt == 0 => {
                     if !self.recreate_swapchain(physical) {
-                        return Presented::DeviceLost;
+                        return Ok(Presented::DeviceLost);
                     }
                 }
-                VK_ERROR_SURFACE_LOST_KHR => return Presented::SurfaceLost,
-                VK_ERROR_DEVICE_LOST => return Presented::DeviceLost,
-                _ => return Presented::Ok,
+                VK_ERROR_SURFACE_LOST_KHR => return Ok(Presented::SurfaceLost),
+                VK_ERROR_DEVICE_LOST => return Ok(Presented::DeviceLost),
+                _ => return Ok(Presented::Ok),
             }
         }
         let corner_mask = self.scene.then_some(8.0 * scale as f64);
         self.ensure_glass();
-        let swapchain = self.swapchain.as_ref().expect("the image was acquired from a swapchain");
+        let swapchain = self
+            .swapchain
+            .as_ref()
+            .expect("the image was acquired from a swapchain");
         record_frame(
             &self.stack,
             &mut self.ground,
@@ -3993,7 +4044,9 @@ impl VkPresenter {
             canvas,
             &self.batches,
             corner_mask,
-            self.glass.as_ref().filter(|_| !self.batches.glass.is_empty()),
+            self.glass
+                .as_ref()
+                .filter(|_| !self.batches.glass.is_empty()),
         );
         unsafe {
             (self.stack.fns.end_command_buffer)(self.slots[index].command);
@@ -4015,15 +4068,18 @@ impl VkPresenter {
                 &submit,
                 self.slots[index].fence,
             )) {
-                return Presented::DeviceLost;
+                return Ok(Presented::DeviceLost);
             }
             self.slots[index].in_flight = true;
             // the same envelope every tier wears: the shell's
             // pre-present rides before the WSI commit, the note after
             if !pre(scale) {
-                return Presented::Ok;
+                return Ok(Presented::Ok);
             }
-            let handle = self.swapchain.as_ref().map_or(0, |swapchain| swapchain.handle);
+            let handle = self
+                .swapchain
+                .as_ref()
+                .map_or(0, |swapchain| swapchain.handle);
             let present = PresentInfo {
                 s_type: ST_PRESENT_INFO_KHR,
                 p_next: std::ptr::null(),
@@ -4034,7 +4090,11 @@ impl VkPresenter {
                 image_indices: &image_index,
                 results: std::ptr::null_mut(),
             };
-            let wsi = self.stack.wsi.as_ref().expect("a window stack keeps its WSI");
+            let wsi = self
+                .stack
+                .wsi
+                .as_ref()
+                .expect("a window stack keeps its WSI");
             let presented = (wsi.queue_present)(self.stack.queue, &present);
             match presented {
                 VK_SUCCESS => {}
@@ -4049,14 +4109,14 @@ impl VkPresenter {
                         let _ = self.recreate_swapchain(physical);
                     }
                 }
-                VK_ERROR_SURFACE_LOST_KHR => return Presented::SurfaceLost,
-                VK_ERROR_DEVICE_LOST => return Presented::DeviceLost,
-                _ => return Presented::Ok,
+                VK_ERROR_SURFACE_LOST_KHR => return Ok(Presented::SurfaceLost),
+                VK_ERROR_DEVICE_LOST => return Ok(Presented::DeviceLost),
+                _ => return Ok(Presented::Ok),
             }
         }
         post();
         self.retained = Some((display.clone(), physical, scale, canvas));
-        Presented::Ok
+        Ok(Presented::Ok)
     }
 
     fn recreate_swapchain(&mut self, wanted: (usize, usize)) -> bool {
@@ -4472,14 +4532,19 @@ impl OffscreenVk {
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
         wait: bool,
-    ) {
+    ) -> Result<(), RenderError> {
         let index = self.cursor;
         self.cursor = (self.cursor + 1) % self.slots.len();
         wait_slot(&self.stack, &mut self.slots[index]);
         for attempt in 0..4 {
-            self.ground
-                .bind_staging(self.slots[index].staging_map, self.slots[index].staging_capacity);
-            let mut view = VkGroundView { stack: &self.stack, ground: &mut self.ground };
+            self.ground.bind_staging(
+                self.slots[index].staging_map,
+                self.slots[index].staging_capacity,
+            );
+            let mut view = VkGroundView {
+                stack: &self.stack,
+                ground: &mut self.ground,
+            };
             let walked = build_frame(
                 &mut view,
                 display,
@@ -4490,42 +4555,60 @@ impl OffscreenVk {
                 &mut self.atlas,
                 &mut self.batches,
             );
+            if let Err(RenderError::Text(error)) = walked {
+                discard_staged_frame(&self.stack, &mut self.slots, &mut self.atlas, &mut self.ground);
+                return Err(RenderError::Text(error));
+            }
             if self.ground.overflow {
+                if attempt == 3 {
+                    discard_staged_frame(&self.stack, &mut self.slots, &mut self.atlas, &mut self.ground);
+                    return Err(RenderError::AtlasFull);
+                }
                 // the same law as the window's: the arena grows and every
                 // entry goes, whatever the walk answered
                 let needed = self.ground.staging_capacity * 2;
                 drain_all(&self.stack, &mut self.slots);
                 if !self.slots[index].grow_staging(&self.stack, needed) {
-                    return;
+                    return Ok(());
                 }
-                let mut view = VkGroundView { stack: &self.stack, ground: &mut self.ground };
+                let mut view = VkGroundView {
+                    stack: &self.stack,
+                    ground: &mut self.ground,
+                };
                 self.atlas.reset(&mut view, false);
                 continue;
             }
             match walked {
                 Ok(()) => break,
-                Err(AtlasFull) => {
+                Err(RenderError::Text(error)) => return Err(RenderError::Text(error)),
+                Err(RenderError::AtlasFull) => {
                     if attempt == 3 {
-                        eprintln!("bunny_ui vk: atlas overflow survived the resets");
-                        break;
+                        discard_staged_frame(&self.stack, &mut self.slots, &mut self.atlas, &mut self.ground);
+                    return Err(RenderError::AtlasFull);
                     }
                     // the cheap road first: shelves nobody read for a while
                     // are given back with no drain and no re-raster
-                    if attempt == 0 && self.atlas.evict_stale(ATLAS_KEEP_WALKS) > 0 {
+                    if attempt == 0
+                        && self.ground.pending.is_empty()
+                        && self.atlas.evict_stale(ATLAS_KEEP_WALKS) > 0 {
                         continue;
                     }
                     drain_all(&self.stack, &mut self.slots);
-                    let mut view =
-                        VkGroundView { stack: &self.stack, ground: &mut self.ground };
+                    let mut view = VkGroundView {
+                        stack: &self.stack,
+                        ground: &mut self.ground,
+                    };
                     self.atlas.reset(&mut view, true);
                 }
             }
         }
         if !upload_instances(&self.stack, &mut self.slots[index], &self.batches) {
-            return;
+            return Ok(());
         }
         if !self.batches.glass.is_empty() && self.glass.is_none() {
-            self.glass = self.stack.glass_targets((self.width as u32, self.height as u32));
+            self.glass = self
+                .stack
+                .glass_targets((self.width as u32, self.height as u32));
         }
         record_frame(
             &self.stack,
@@ -4536,12 +4619,14 @@ impl OffscreenVk {
             canvas,
             &self.batches,
             None,
-            self.glass.as_ref().filter(|_| !self.batches.glass.is_empty()),
+            self.glass
+                .as_ref()
+                .filter(|_| !self.batches.glass.is_empty()),
         );
         // the readback tail rides the same command buffer: the pass
         // ended in TRANSFER_SRC (the offscreen final layout) — copy
         // into the host buffer before the fence signals
-        unsafe {
+        Ok(unsafe {
             let region = BufferImageCopy {
                 buffer_offset: 0,
                 buffer_row_length: 0,
@@ -4573,12 +4658,7 @@ impl OffscreenVk {
                 signal_count: 0,
                 signal_semaphores: std::ptr::null(),
             };
-            (self.stack.fns.queue_submit)(
-                self.stack.queue,
-                1,
-                &submit,
-                self.slots[index].fence,
-            );
+            (self.stack.fns.queue_submit)(self.stack.queue, 1, &submit, self.slots[index].fence);
             self.slots[index].in_flight = true;
             if wait {
                 (self.stack.fns.wait_for_fences)(
@@ -4590,9 +4670,12 @@ impl OffscreenVk {
                 );
                 self.slots[index].in_flight = false;
             }
-        }
+        })
     }
 
+    ///
+    /// # Errors
+    /// Returns a text error or atlas exhaustion if the frame cannot be prepared.
     pub fn present_wait(
         &mut self,
         display: &DisplayList,
@@ -4600,10 +4683,15 @@ impl OffscreenVk {
         canvas: Color,
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) {
-        self.present_inner(display, scale, canvas, text, images, true);
+    ) -> Result<(), RenderError> {
+        self.present_inner(display, scale, canvas, text, images, true)?;
+
+        Ok(())
     }
 
+    ///
+    /// # Errors
+    /// Returns a text error or atlas exhaustion if the frame cannot be prepared.
     pub fn present_nowait(
         &mut self,
         display: &DisplayList,
@@ -4611,8 +4699,10 @@ impl OffscreenVk {
         canvas: Color,
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) {
-        self.present_inner(display, scale, canvas, text, images, false);
+    ) -> Result<(), RenderError> {
+        self.present_inner(display, scale, canvas, text, images, false)?;
+
+        Ok(())
     }
 
     #[cfg(test)]
@@ -4667,9 +4757,58 @@ mod tests {
         static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let present = *PRESENT.get_or_init(|| OffscreenVk::new(4, 4).is_some());
         if !present {
+            assert!(
+                std::env::var_os("BUNNY_REQUIRE_VULKAN").is_none(),
+                "BUNNY_REQUIRE_VULKAN requires a working native Vulkan device"
+            );
             eprintln!("no vulkan device — skipping");
         }
         present
+    }
+
+    #[test]
+    fn rejected_text_discards_unsubmitted_tiles_before_the_same_frame_retries() {
+        use bunny_ui::text_engine::{FontSpec, LineMetrics, PixelFont, TextRaster};
+        use bunny_ui::layout::DrawCommand;
+        use bunny_ui::text_error::TextError;
+        use bunny_ui::text_source::{ParagraphLine, TextContent};
+        use std::cell::Cell;
+
+        struct RefusingText(Cell<bool>);
+        impl TextEngine for RefusingText {
+            fn measure_line(&self, text: &str, font: &FontSpec) -> LineMetrics {
+                PixelFont.measure_line(text, font)
+            }
+            fn raster_line(&self, text: &str, font: &FontSpec, color: Color, scale: usize) -> Option<TextRaster> {
+                PixelFont.raster_line(text, font, color, scale)
+            }
+            fn raster_paragraph_line(&self, line: &ParagraphLine, font: &FontSpec, color: Color, scale: usize) -> Result<Option<TextRaster>, TextError> {
+                if self.0.get() && line.text() == "second" {
+                    return Err(TextError::Rasterization { engine: "test", operation: "second tile" });
+                }
+                Ok(PixelFont.raster_line(line.text(), font, color, scale))
+            }
+        }
+        if !device_present() { return; }
+        let engine = RefusingText(Cell::new(true));
+        let images = RawImages::default();
+        let mut gpu = OffscreenVk::new(180, 60).expect("offscreen Vulkan");
+        gpu.present_wait(&DisplayList::default(), 1, Color::WHITE, &engine, &images).unwrap();
+        let before = gpu.read_rgba();
+        let display = DisplayList::from([("first", 2.0), ("second", 27.0)].into_iter().map(|(text, y)| {
+            DrawCommand::TextLine {
+                origin: Point { x: 3.0, y }, content: TextContent::from(text),
+                range: (0, text.len()), font: FontSpec::DEFAULT, color: Color::BLACK,
+            }
+        }).collect::<Vec<_>>());
+        assert!(matches!(gpu.present_wait(&display, 1, Color::WHITE, &engine, &images), Err(RenderError::Text(_))));
+        assert_eq!(gpu.read_rgba(), before, "a refused frame must not clear or submit");
+        assert!(gpu.ground.pending.is_empty());
+        assert_eq!(gpu.atlas_footprint().0, 0, "the first tile was staged, not uploaded");
+        engine.0.set(false);
+        gpu.present_wait(&display, 1, Color::WHITE, &engine, &images).unwrap();
+        let expected = rasterize_with(&display, 180, 60, 1, Color::WHITE, &engine, &images).unwrap().to_rgba_bytes();
+        assert_close(&gpu.read_rgba(), &expected, 2, "retry after text refusal");
     }
 
     /// The bar the material must clear, for the renderer under the
@@ -4702,7 +4841,7 @@ mod tests {
             (logical.height.round() as usize) * scale,
         );
         let runtime = Runtime::new();
-        let display = runtime.display_frame(root, logical);
+        let display = runtime.display_frame(root, logical).unwrap();
         let cpu = rasterize_with(
             &display,
             physical.0,
@@ -4712,9 +4851,11 @@ mod tests {
             &PixelFont,
             &RawImages::default(),
         )
+        .unwrap()
         .to_rgba_bytes();
         let mut gpu = OffscreenVk::new(physical.0, physical.1).expect("offscreen gpu");
-        gpu.present_wait(&display, scale, canvas, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, scale, canvas, &PixelFont, &RawImages::default())
+            .unwrap();
         (gpu.read_rgba(), cpu)
     }
 
@@ -4755,7 +4896,8 @@ mod tests {
         // readback loudly (the lesson the text engine taught)
         let canvas = Color::hex(0x18181D);
         let mut gpu = OffscreenVk::new(16, 16).expect("offscreen gpu");
-        gpu.present_wait(&DisplayList::default(), 2, canvas, &PixelFont, &RawImages::default());
+        gpu.present_wait(&DisplayList::default(), 2, canvas, &PixelFont, &RawImages::default())
+        .unwrap();
         let bytes = gpu.read_rgba();
         assert_eq!(bytes.len(), 16 * 16 * 4);
         for pixel in bytes.chunks_exact(4) {
@@ -5049,12 +5191,15 @@ mod tests {
         let root = vstack((text("warm"), text("frame")));
         let logical = Size { width: 120.0, height: 60.0 };
         let runtime = Runtime::new();
-        let display = runtime.display_frame(&root, logical);
+        let display = runtime.display_frame(&root, logical).unwrap();
         let mut gpu = OffscreenVk::new(240, 120).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default(),
+        )
+        .unwrap();
         let first = gpu.atlas_footprint();
         assert!(first.0 > 0, "the frame rasterized runs into the atlas");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default())
+        .unwrap();
         let second = gpu.atlas_footprint();
         assert_eq!(first, second, "an identical frame must not mint new tiles");
     }
@@ -5127,13 +5272,16 @@ mod tests {
         }
         let runtime = Runtime::new();
         let root = image_scene();
-        let display = runtime.display_frame(&root, Size { width: 320.0, height: 400.0 });
+        let display = runtime.display_frame(&root, Size { width: 320.0, height: 400.0 })
+            .unwrap();
         let engine = RawImages::default();
         let mut gpu = OffscreenVk::new(640, 800).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         let first = gpu.atlas_footprint();
         assert!(first.0 >= 3, "atlas icon + cover + dedicated photo: {first:?}");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         assert_eq!(first, gpu.atlas_footprint(), "a warm frame re-uploads nothing");
     }
 
@@ -5206,13 +5354,16 @@ mod tests {
         }
         let runtime = Runtime::new();
         let root = icon_scene();
-        let display = runtime.display_frame(&root, Size { width: 120.0, height: 160.0 });
+        let display = runtime.display_frame(&root, Size { width: 120.0, height: 160.0 })
+            .unwrap();
         let engine = RawImages::default();
         let mut gpu = OffscreenVk::new(240, 320).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         let first = gpu.atlas_footprint();
         assert!(first.0 >= 4, "four tinted tiles at least: {first:?}");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         assert_eq!(first, gpu.atlas_footprint(), "the tinted keys cache, never thrash");
     }
 

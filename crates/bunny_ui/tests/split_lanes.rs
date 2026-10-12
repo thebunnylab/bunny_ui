@@ -35,6 +35,7 @@ impl Component for Room {
 fn hit_path(runtime: &Runtime, view: &impl View, name: &str) -> Option<String> {
     runtime
         .settled_layout(view, Proposal::exact(SIZE))
+        .unwrap()
         .hits
         .iter()
         .find(|(path, _)| path.contains(name))
@@ -46,8 +47,8 @@ fn a_hidden_trailing_lane_gives_the_leading_one_the_whole_room() {
     let seam = State::new(200.0);
     let runtime = Runtime::new();
     let split = hsplit(seam.binding(), text!("alone"), text!("the dock")).hide_trailing(true);
-    let shown = runtime.display_frame(&split, SIZE);
-    let alone = Runtime::new().display_frame(&text!("alone"), SIZE);
+    let shown = runtime.display_frame(&split, SIZE).unwrap();
+    let alone = Runtime::new().display_frame(&text!("alone"), SIZE).unwrap();
     assert_eq!(shown.as_slice(), alone.as_slice(), "the leading lane alone is the whole picture");
 }
 
@@ -56,8 +57,8 @@ fn a_hidden_leading_lane_gives_the_trailing_one_the_whole_room() {
     let seam = State::new(200.0);
     let runtime = Runtime::new();
     let split = hsplit(seam.binding(), text!("the dock"), text!("alone")).hide_leading(true);
-    let shown = runtime.display_frame(&split, SIZE);
-    let alone = Runtime::new().display_frame(&text!("alone"), SIZE);
+    let shown = runtime.display_frame(&split, SIZE).unwrap();
+    let alone = Runtime::new().display_frame(&text!("alone"), SIZE).unwrap();
     assert_eq!(shown.as_slice(), alone.as_slice(), "the trailing lane alone is the whole picture");
 }
 
@@ -67,15 +68,15 @@ fn a_lane_keeps_its_place_while_the_other_hides_and_returns() {
     let dock_open = State::new(true);
     let runtime = Runtime::new();
     let room = Room { seam, dock_open };
-    let _ = runtime.display_frame(&room, SIZE);
+    let _ = runtime.display_frame(&room, SIZE).unwrap();
     let surface = hit_path(&runtime, &room, "[surface]").expect("the surface is a hit");
     assert!(hit_path(&runtime, &room, "[dock]").is_some(), "the dock shows");
     dock_open.set(false);
-    let _ = runtime.display_frame(&room, SIZE);
+    let _ = runtime.display_frame(&room, SIZE).unwrap();
     assert_eq!(hit_path(&runtime, &room, "[surface]").as_deref(), Some(surface.as_str()), "the surface stayed where it was");
     assert!(hit_path(&runtime, &room, "[dock]").is_none(), "the dock is gone");
     dock_open.set(true);
-    let _ = runtime.display_frame(&room, SIZE);
+    let _ = runtime.display_frame(&room, SIZE).unwrap();
     assert_eq!(hit_path(&runtime, &room, "[surface]").as_deref(), Some(surface.as_str()), "the surface is still the same lane");
     assert!(hit_path(&runtime, &room, "[dock]").is_some(), "the dock came back");
 }

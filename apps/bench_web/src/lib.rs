@@ -525,7 +525,7 @@ pub mod keyed {
         fn a_row_is_the_markup_the_harness_reads() {
             let page = app();
             page.rows.set(Rc::new(build(1, 2)));
-            let served = bunny_ui::ssr::render(&page, bunny_ui::layout::Size { width: 1200.0, height: 800.0 });
+            let served = bunny_ui::ssr::render(&page, bunny_ui::layout::Size { width: 1200.0, height: 800.0 }).expect("benchmark frame");
             let html = &served.html;
             let rows: Vec<&str> = html.split("<tr").skip(1).collect();
             assert_eq!(rows.len(), 2, "{html}");
@@ -545,7 +545,7 @@ pub mod keyed {
         /// One frame, replayed on the page the way the glue applies it:
         /// every target on it must send the path the engine knows it by.
         fn frame(page: &App, runtime: &bunny_ui::runtime::Runtime, replay: &mut bunny_ui::ssr::Replay) {
-            replay.apply(&runtime.dom_frame(page, SIZE));
+            replay.apply(&runtime.dom_frame(page, SIZE).expect("benchmark frame"));
             assert_eq!(replay.action_paths(), runtime.dom_action_paths());
         }
 

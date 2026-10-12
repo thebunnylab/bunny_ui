@@ -45,27 +45,32 @@ fn plain(key: &str, runs: State<u32>) -> impl View {
 fn a_plain_root_rebuilt_with_another_task_starts_it() {
     let runtime = Runtime::new();
     let runs = State::new(0u32);
-    let _ = runtime.settled_layout(&plain("first", runs), Proposal::exact(SIZE));
+    let _ = runtime.settled_layout(&plain("first", runs), Proposal::exact(SIZE))
+        .unwrap();
     assert_eq!(runs.get(), 1, "the first task ran in the first settle");
     // nothing was written through state: the caller simply built another
     // root, with another task under another key — a quiet settle would
     // never have seen it
-    let _ = runtime.settled_layout(&plain("second", runs), Proposal::exact(SIZE));
+    let _ = runtime.settled_layout(&plain("second", runs), Proposal::exact(SIZE))
+        .unwrap();
     assert_eq!(runs.get(), 2, "a plain root rebuilt with another task starts that task");
 }
 
 fn hit(runtime: &Runtime, view: &impl View, name: &str) -> bool {
-    runtime.settled_layout(view, Proposal::exact(SIZE)).hits.iter().any(|(path, _)| path.contains(name))
+    runtime.settled_layout(view, Proposal::exact(SIZE)).unwrap().hits.iter().any(|(path, _)| path.contains(name))
 }
 
 #[test]
 fn a_second_root_on_the_same_runtime_settles_and_lays_out_as_itself() {
     let runtime = Runtime::new();
-    let _ = runtime.settled_layout(&First, Proposal::exact(SIZE));
-    let _ = runtime.settled_layout(&First, Proposal::exact(SIZE));
+    let _ = runtime.settled_layout(&First, Proposal::exact(SIZE))
+        .unwrap();
+    let _ = runtime.settled_layout(&First, Proposal::exact(SIZE))
+        .unwrap();
     let landed = State::new(false);
     let second = Second { landed };
-    let laid = runtime.settled_layout(&second, Proposal::exact(SIZE));
+    let laid = runtime.settled_layout(&second, Proposal::exact(SIZE))
+        .unwrap();
     assert!(landed.get(), "the second root's task ran in its own settle");
     assert!(laid.hits.iter().any(|(path, _)| path.contains("[second-root]")), "the frame is the second root's: {:?}", laid.hits);
     assert!(!laid.hits.iter().any(|(path, _)| path.contains("[first-root]")), "the first root's frame was served for the second");

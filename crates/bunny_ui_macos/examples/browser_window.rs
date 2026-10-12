@@ -472,7 +472,9 @@ fn drive_the_page(handle: &WebviewHandle) {
             modifiers: Modifiers::NONE,
         });
         beat().await;
-        println!("[{}] the hand is done — the page's menu is open, escape closes it", stamp());
+        println!("[{}] the hand is done — the page's menu is open, escape closes it",
+            stamp()
+        );
     })
     .detach();
 }

@@ -60,6 +60,7 @@ fn frame(runtime: &Runtime, view: &impl View) -> LayoutResult {
             height: 100.,
         }),
     )
+        .unwrap()
 }
 fn close(actual: f64, expected: f64) {
     assert!(
@@ -95,20 +96,21 @@ fn pointer_drag_preserves_both_sides_of_the_same_logical_boundary() {
     let layout = frame(&runtime, &view);
     let field = &layout.fields[0];
     let (x, y) = (field.text_origin.x, field.run.origin.y + 5.);
-    runtime.pointer_pressed(x + 40., y);
-    close(runtime.ime_snapshot().unwrap().caret_rect.origin.x, x + 40.);
-    assert_eq!(runtime.ime_snapshot().unwrap().selected, (2, 0));
+    runtime.pointer_pressed(x + 40., y).unwrap();
+    close(runtime.ime_snapshot().unwrap().unwrap().caret_rect.origin.x, x + 40.);
+    assert_eq!(runtime.ime_snapshot().unwrap().unwrap().selected, (2, 0));
     assert!(
-        runtime.pointer_moved(x + 20., y, false),
+        runtime.pointer_moved(x + 20., y, false).unwrap(),
         "affinity changes even when the byte does not"
     );
-    close(runtime.ime_snapshot().unwrap().caret_rect.origin.x, x + 20.);
-    assert_eq!(runtime.ime_snapshot().unwrap().selected, (2, 0));
-    runtime.pointer_moved(x + 30., y, false);
-    assert_eq!(runtime.ime_snapshot().unwrap().selected, (2, 1));
-    assert_eq!(runtime.key(EditCommand::Copy).output.as_deref(), Some("א"));
+    close(runtime.ime_snapshot().unwrap().unwrap().caret_rect.origin.x, x + 20.);
+    assert_eq!(runtime.ime_snapshot().unwrap().unwrap().selected, (2, 0));
+    runtime.pointer_moved(x + 30., y, false).unwrap();
+    assert_eq!(runtime.ime_snapshot().unwrap().unwrap().selected, (2, 1));
+    assert_eq!(runtime.key(EditCommand::Copy).unwrap().output.as_deref(), Some("א")
+    );
     runtime.pointer_released(x + 30., y);
-    close(runtime.ime_rect_for(3).unwrap().origin.x, x + 30.);
+    close(runtime.ime_rect_for(3).unwrap().unwrap().origin.x, x + 30.);
 }
 
 #[test]
@@ -120,18 +122,20 @@ fn partial_selection_and_composition_keep_the_visual_hole() {
         .id("field");
     let first = frame(&runtime, &view);
     runtime.sync_field(&first.fields[0].path, "abאבcd", 1);
-    runtime.key(EditCommand::Right(true));
-    runtime.key(EditCommand::Right(true));
+    runtime.key(EditCommand::Right(true)).unwrap();
+    runtime.key(EditCommand::Right(true)).unwrap();
     let selected = frame(&runtime, &view);
     assert_eq!(bands(&selected, 15.), vec![(10., 10.), (30., 10.)]);
-    assert_eq!(runtime.key(EditCommand::Copy).output.as_deref(), Some("bא"));
+    assert_eq!(runtime.key(EditCommand::Copy).unwrap().output.as_deref(), Some("bא")
+    );
     runtime.key(EditCommand::SetMarked {
         text: "bא".into(),
         caret_utf16: (1, 0),
-    });
+    })
+        .unwrap();
     let marked = frame(&runtime, &view);
     assert_eq!(bands(&marked, 1.), vec![(10., 10.), (30., 10.)]);
-    let snapshot = runtime.ime_snapshot().unwrap();
+    let snapshot = runtime.ime_snapshot().unwrap().unwrap();
     assert_eq!(snapshot.marked, Some((1, 2)));
     assert_eq!(snapshot.selected, (2, 0));
     close(
@@ -204,13 +208,13 @@ fn vertical_navigation_keeps_the_visual_column_after_each_line_alignment() {
             .id("field");
         let first = frame(&runtime, &view);
         runtime.sync_field(&first.fields[0].path, "abאבcd\nabcd", 2);
-        let x = runtime.ime_snapshot().unwrap().caret_rect.origin.x;
-        assert!(runtime.key(EditCommand::Down(false)).applied);
-        assert_eq!(runtime.ime_snapshot().unwrap().selected, (7 + column, 0));
-        close(runtime.ime_snapshot().unwrap().caret_rect.origin.x, x);
-        runtime.key(EditCommand::Up(false));
-        assert_eq!(runtime.ime_snapshot().unwrap().selected, (2, 0));
-        close(runtime.ime_snapshot().unwrap().caret_rect.origin.x, x);
+        let x = runtime.ime_snapshot().unwrap().unwrap().caret_rect.origin.x;
+        assert!(runtime.key(EditCommand::Down(false)).unwrap().applied);
+        assert_eq!(runtime.ime_snapshot().unwrap().unwrap().selected, (7 + column, 0));
+        close(runtime.ime_snapshot().unwrap().unwrap().caret_rect.origin.x, x);
+        runtime.key(EditCommand::Up(false)).unwrap();
+        assert_eq!(runtime.ime_snapshot().unwrap().unwrap().selected, (2, 0));
+        close(runtime.ime_snapshot().unwrap().unwrap().caret_rect.origin.x, x);
     }
 }
 
@@ -229,10 +233,10 @@ fn horizontal_reveal_tracks_visual_positions_in_both_paragraph_directions() {
         let path = first.fields[0].path.clone();
         for (index, local) in indices {
             runtime.sync_field(&path, text, index);
-            runtime.key(EditCommand::Read);
+            runtime.key(EditCommand::Read).unwrap();
             // Read triggers the same reveal path without changing affinity.
             let current = frame(&runtime, &view);
-            let point = runtime.ime_snapshot().unwrap().caret_rect.origin.x;
+            let point = runtime.ime_snapshot().unwrap().unwrap().caret_rect.origin.x;
             close(point, current.fields[0].text_origin.x + local);
             let run = current.fields[0].run;
             assert!(
@@ -256,13 +260,15 @@ fn mask_geometry_maps_surrogate_units_back_to_the_original_text() {
     let painted = frame(&runtime, &view);
     let field = &painted.fields[0];
     let x = field.text_origin.x;
-    close(runtime.ime_rect_for(3).unwrap().origin.x, x + 20.);
+    close(runtime.ime_rect_for(3).unwrap().unwrap().origin.x, x + 20.);
     assert_eq!(
-        runtime.ime_index_at(x + 10., field.run.origin.y + 5.),
+        runtime.ime_index_at(x + 10., field.run.origin.y + 5.)
+            .unwrap(),
         Some(1)
     );
     assert_eq!(
-        runtime.ime_index_at(x + 20., field.run.origin.y + 5.),
+        runtime.ime_index_at(x + 20., field.run.origin.y + 5.)
+            .unwrap(),
         Some(3)
     );
 }

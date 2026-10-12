@@ -124,9 +124,9 @@ fn manual_ticks_remain_deterministic_and_wall_driver_registration_is_idempotent(
         let sleeper = wait_for(300);
         assert!(!scene.advance_tasks_to_now());
         remaining(0.3);
-        scene.tick(0.1);
+        scene.tick(0.1).unwrap();
         remaining(0.2);
-        scene.tick_clocked(0.05, 10.0);
+        scene.tick_clocked(0.05, 10.0).unwrap();
         remaining(0.15);
         drop(sleeper);
         let base = injected_epoch();
@@ -157,7 +157,7 @@ fn the_last_wall_driver_releases_automatic_time_and_a_new_host_starts_fresh() {
         drop(sleeper);
         let manual = Runtime::new();
         let sleeper = wait_for(300);
-        manual.tick(0.1);
+        manual.tick(0.1).unwrap();
         remaining(0.2);
         let next = Runtime::scene("new-host");
         next.drive_tasks_at(at(base, 10_000));

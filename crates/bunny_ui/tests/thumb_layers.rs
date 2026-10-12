@@ -59,11 +59,11 @@ fn fills(display: &DisplayList, rect: Rect) -> usize {
 fn a_thumb_nothing_covers_leaves_the_list_for_a_layer() {
     let chat = Chat { lines: State::new(40) };
     let drawn = shell(false);
-    let painted = drawn.display_frame(&chat, WINDOW);
+    let painted = drawn.display_frame(&chat, WINDOW).unwrap();
     assert!(drawn.thumbs().is_empty(), "no layers asked, none given");
 
     let layered = shell(true);
-    let lifted = layered.display_frame(&chat, WINDOW);
+    let lifted = layered.display_frame(&chat, WINDOW).unwrap();
     let thumbs = layered.thumbs();
     assert_eq!(thumbs.len(), 1, "one region, one thumb");
     let thumb = thumbs[0];
@@ -80,11 +80,11 @@ fn a_list_that_grows_below_the_fold_is_the_same_list() {
     let lines = State::new(40);
     let chat = Chat { lines };
     let runtime = shell(true);
-    let before = runtime.display_frame(&chat, WINDOW);
+    let before = runtime.display_frame(&chat, WINDOW).unwrap();
     let thumb = runtime.thumbs();
 
     lines.set(41);
-    let after = runtime.display_frame(&chat, WINDOW);
+    let after = runtime.display_frame(&chat, WINDOW).unwrap();
     assert_eq!(before.as_slice(), after.as_slice(), "nothing on the glass changed but the thumb");
     let moved = runtime.thumbs();
     assert_eq!(moved.len(), 1);
@@ -94,9 +94,9 @@ fn a_list_that_grows_below_the_fold_is_the_same_list() {
     let lines = State::new(40);
     let chat = Chat { lines };
     let runtime = shell(false);
-    let before = runtime.display_frame(&chat, WINDOW);
+    let before = runtime.display_frame(&chat, WINDOW).unwrap();
     lines.set(41);
-    let after = runtime.display_frame(&chat, WINDOW);
+    let after = runtime.display_frame(&chat, WINDOW).unwrap();
     assert_ne!(before.as_slice(), after.as_slice(), "the drawn thumb changed the list");
 }
 
@@ -117,10 +117,12 @@ fn a_thumb_under_later_paint_stays_in_the_scene() {
     }
 
     let runtime = shell(true);
-    let display = runtime.display_frame(&Veiled { lines: State::new(40) }, WINDOW);
+    let display = runtime.display_frame(&Veiled { lines: State::new(40) }, WINDOW)
+        .unwrap();
     assert!(runtime.thumbs().is_empty(), "a veil painted after it covers it");
     let reference = shell(true);
-    let _ = reference.display_frame(&Chat { lines: State::new(40) }, WINDOW);
+    let _ = reference.display_frame(&Chat { lines: State::new(40) }, WINDOW)
+        .unwrap();
     let rect = reference.thumbs()[0].rect;
     assert_eq!(fills(&display, rect), 1, "so the scene paints it, under the veil");
 }
@@ -142,14 +144,16 @@ fn a_thumb_in_a_rounded_corner_stays_in_the_scene() {
     // the thumb starts six points down the trailing edge: a curve of
     // twelve cuts into it, a curve of four does not reach it
     let round = shell(true);
-    let display = round.display_frame(&Card { lines: State::new(40), radius: 12.0 }, WINDOW);
+    let display = round.display_frame(&Card { lines: State::new(40), radius: 12.0 }, WINDOW)
+        .unwrap();
     assert!(round.thumbs().is_empty(), "the curve may take its pixels");
     assert!(
         display.iter().any(|command| matches!(command, DrawCommand::FillRect { rect, .. } if rect.size.width == 4.0)),
         "it is painted under the curve"
     );
     let gentle = shell(true);
-    let _ = gentle.display_frame(&Card { lines: State::new(40), radius: 4.0 }, WINDOW);
+    let _ = gentle.display_frame(&Card { lines: State::new(40), radius: 4.0 }, WINDOW)
+        .unwrap();
     assert_eq!(gentle.thumbs().len(), 1, "clear of the curve, it lifts");
 }
 
@@ -165,8 +169,9 @@ fn a_popover_keeps_its_thumb_and_its_slice() {
             scroll(text("page").frame(400.0, 4000.0)).id("page").popover(
                 self.open.binding(),
                 Side::Trailing,
-                move |_| erased(scroll(text("list").frame(160.0, 900.0)).id("pop").frame(180.0, 120.0)),
-            )
+                move |_| {
+                    erased(scroll(text("list").frame(160.0, 900.0)).id("pop").frame(180.0, 120.0))
+                })
         }
     }
 
@@ -175,7 +180,7 @@ fn a_popover_keeps_its_thumb_and_its_slice() {
         let anchored = Anchored { open: State::new(true) };
         let runtime = shell(layers);
         runtime.render_stable(&anchored);
-        let result = runtime.layout(&anchored, viewport);
+        let result = runtime.layout(&anchored, viewport).unwrap();
         let overlay = result.overlays.first().expect("the popover is placed").clone();
         let slice = result.display.as_slice()[overlay.display.0..overlay.display.1].to_vec();
         (slice, runtime.thumbs(), result.display.len())
@@ -215,7 +220,7 @@ fn a_live_box_after_a_lifted_thumb_keeps_its_slice() {
         let view = Beside { lines: State::new(40) };
         let runtime = shell(layers);
         runtime.render_stable(&view);
-        let result = runtime.layout(&view, viewport);
+        let result = runtime.layout(&view, viewport).unwrap();
         let placement = result.customs.first().expect("the box is placed").clone();
         (result.display.as_slice()[placement.slice.0..placement.slice.1].to_vec(), runtime.thumbs())
     };
@@ -248,7 +253,8 @@ fn a_thumb_on_one_fill_takes_its_colour_and_on_many_stays() {
 
     // every row the same colour, the whole width: one ground
     let plain = shell(true);
-    let _ = plain.display_frame(&Rows { lines: State::new(40), striped: false }, WINDOW);
+    let _ = plain.display_frame(&Rows { lines: State::new(40), striped: false }, WINDOW)
+        .unwrap();
     let thumbs = plain.thumbs();
     assert_eq!(thumbs.len(), 1, "one ground under it");
     let theme = bunny_ui::theme::current();
@@ -256,7 +262,8 @@ fn a_thumb_on_one_fill_takes_its_colour_and_on_many_stays() {
 
     // stripes: the thumb stands on two colours, and the scene paints it
     let striped = shell(true);
-    let display = striped.display_frame(&Rows { lines: State::new(40), striped: true }, WINDOW);
+    let display = striped.display_frame(&Rows { lines: State::new(40), striped: true }, WINDOW)
+        .unwrap();
     assert!(striped.thumbs().is_empty(), "two colours under it");
     assert!(
         display.iter().any(|command| matches!(command, DrawCommand::FillRect { color, .. } if *color == theme.scrollbar)),
@@ -282,9 +289,11 @@ fn a_line_that_runs_under_the_thumb_keeps_it_in_the_scene() {
     }
 
     let short = shell(true);
-    let _ = short.display_frame(&Long { lines: State::new(40), width: 4 }, WINDOW);
+    let _ = short.display_frame(&Long { lines: State::new(40), width: 4 }, WINDOW)
+        .unwrap();
     assert_eq!(short.thumbs().len(), 1, "short lines end long before the thumb");
     let long = shell(true);
-    let _ = long.display_frame(&Long { lines: State::new(40), width: 400 }, WINDOW);
+    let _ = long.display_frame(&Long { lines: State::new(40), width: 400 }, WINDOW)
+        .unwrap();
     assert!(long.thumbs().is_empty(), "a line under the thumb mixes what it stands on");
 }

@@ -190,19 +190,19 @@ pub(crate) struct Request {
     action: Action,
 }
 impl Request {
-    pub fn apply(&self, runtime: &Runtime) -> bool {
+    pub fn apply(&self, runtime: &Runtime) -> Result<bool, bunny_ui::text_error::TextError> {
         let Some(surface) = self.surface.upgrade() else {
-            return false;
+            return Ok(false);
         };
         if surface.closing.load(Ordering::Acquire) || surface.read(self.key).is_err() {
-            return false;
+            return Ok(false);
         }
-        if let Key::Node(id) = self.key
-            && runtime
-                .accessibility_action(id, self.action.clone())
-                .is_err()
-        {
-            return false;
+        if let Key::Node(id) = self.key {
+            match runtime.accessibility_action(id, self.action.clone()) {
+                Ok(()) => {}
+                Err(bunny_ui::accessibility::ActionError::Text(error)) => return Err(error),
+                Err(_) => return Ok(false),
+            }
         }
         if matches!(self.action, Action::Focus | Action::SetText(_)) {
             // UI thread only. SetFocus gives the real window keyboard input;
@@ -211,7 +211,7 @@ impl Request {
                 super::SetFocus(surface.window);
             }
         }
-        true
+        Ok(true)
     }
 }
 pub(super) fn drain(window: Hwnd) {
@@ -1013,7 +1013,8 @@ mod tests {
                 width: 480.0,
                 height: 480.0,
             },
-        );
+        )
+            .unwrap();
         let tree = runtime.accessibility_tree();
         let nodes: Vec<_> = tree
             .nodes()
@@ -1197,7 +1198,7 @@ mod tests {
             action: Action::Activate,
         };
         surface.alive.store(false, Ordering::Release);
-        assert!(!request.apply(&Runtime::new()));
+        assert!(!request.apply(&Runtime::new()).unwrap());
         let mut out = Variant::empty();
         assert_eq!(
             unsafe { property(button.simple(), NAME, &mut out) },

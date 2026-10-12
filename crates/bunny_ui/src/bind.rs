@@ -466,7 +466,7 @@ mod frame_tests {
         }
 
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&Plain { id: 7 }, SIZE);
+        let _ = runtime.dom_frame(&Plain { id: 7 }, SIZE).unwrap();
         assert_eq!(super::live_count(), 0, "no binding was made");
         let [_, _, _, view_bindings, binding_reads, _, _] = motor::identity::registry_counts();
         assert_eq!((view_bindings, binding_reads), (0, 0), "and nothing was filed");
@@ -475,7 +475,7 @@ mod frame_tests {
 
         let label = Label { count: State::new(3) };
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&label, SIZE);
+        let _ = runtime.dom_frame(&label, SIZE).unwrap();
         assert_eq!(super::live_count(), 1, "a text that reads is a binding");
         let [_, _, _, view_bindings, binding_reads, _, _] = motor::identity::registry_counts();
         assert_eq!((view_bindings, binding_reads), (1, 1), "its read filed under its key, the key under its body");
@@ -497,14 +497,13 @@ mod frame_tests {
         }
 
         let runtime = Runtime::new();
-        let mount = runtime.dom_frame(&Pair { count: State::new(1) }, SIZE);
+        let mount = runtime.dom_frame(&Pair { count: State::new(1) }, SIZE)
+            .unwrap();
         // the texts' own looks (the root and a box declare a face too)
         let families: Vec<Option<std::sync::Arc<str>>> = mount
             .iter()
             .filter_map(|patch| match patch {
-                DomPatch::DefineRule { kind: crate::dom::CreateKind::Text, text: Some(text), .. } => {
-                    Some(text.font.family.name())
-                }
+                DomPatch::DefineRule { kind: crate::dom::CreateKind::Text, text: Some(text), .. } => Some(text.font.family.name()),
                 _ => None,
             })
             .collect();
@@ -562,16 +561,14 @@ mod frame_tests {
             patches
                 .iter()
                 .filter_map(|patch| match patch {
-                    DomPatch::DefineRule { kind: crate::dom::CreateKind::Text, text: Some(text), .. } => {
-                        Some((text.font.family.name(), text.font.size))
-                    }
+                    DomPatch::DefineRule { kind: crate::dom::CreateKind::Text, text: Some(text), .. } => Some((text.font.family.name(), text.font.size)),
                     _ => None,
                 })
                 .collect()
         };
         let runtime = Runtime::new();
         let page = Page { rows: State::new(items(&[1, 2])) };
-        let mount = runtime.dom_frame(&page, SIZE);
+        let mount = runtime.dom_frame(&page, SIZE).unwrap();
         let faces = faces_of(&mount);
         assert!(faces.len() >= 2, "{mount:?}");
         assert!(
@@ -584,9 +581,9 @@ mod frame_tests {
         // then — under the same family
         let runtime = Runtime::new();
         let page = Page { rows: State::new(items(&[])) };
-        let _ = runtime.dom_frame(&page, SIZE);
+        let _ = runtime.dom_frame(&page, SIZE).unwrap();
         page.rows.set(items(&[1, 2]));
-        let update = runtime.dom_frame(&page, SIZE);
+        let update = runtime.dom_frame(&page, SIZE).unwrap();
         let later = faces_of(&update);
         assert!(later.len() >= 2, "the first rows define their looks: {update:?}");
         assert!(
@@ -598,10 +595,10 @@ mod frame_tests {
         // table, the first rows arrive by the click — the same face
         let runtime = Runtime::new();
         let page = Page { rows: State::new(items(&[])) };
-        runtime.dom_adopt(&page, SIZE);
-        assert!(runtime.dom_frame(&page, SIZE).is_empty(), "the adopted page is already true");
+        runtime.dom_adopt(&page, SIZE).unwrap();
+        assert!(runtime.dom_frame(&page, SIZE).unwrap().is_empty(), "the adopted page is already true");
         page.rows.set(items(&[1, 2]));
-        let update = runtime.dom_frame(&page, SIZE);
+        let update = runtime.dom_frame(&page, SIZE).unwrap();
         let adopted = faces_of(&update);
         assert!(adopted.len() >= 2, "the first rows define their looks: {update:?}");
         assert!(
@@ -641,11 +638,13 @@ mod frame_tests {
 
         let runtime = Runtime::new();
         let page = Page { rows: State::new(items(&[1, 2, 3, 4, 5, 6, 7])) };
-        let mount = runtime.dom_frame(&page, SIZE);
+        let mount = runtime.dom_frame(&page, SIZE).unwrap();
         let frame = stats::take();
         let groups = mount
             .iter()
-            .filter(|patch| matches!(patch, DomPatch::Create { kind: crate::dom::CreateKind::Group, .. }))
+            .filter(|patch| {
+                matches!(patch, DomPatch::Create { kind: crate::dom::CreateKind::Group, .. })
+            })
             .count();
         let clones = mount.iter().filter(|patch| matches!(patch, DomPatch::Clone { .. })).count();
         // rows 1 and 3 are the two templates; 2, 4, 5, 7 clone the first,
@@ -668,12 +667,12 @@ mod frame_tests {
     fn a_bound_label_is_one_text_patch_and_no_body() {
         let label = Label { count: State::new(1) };
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&label, SIZE);
+        let _ = runtime.dom_frame(&label, SIZE).unwrap();
         let _ = stats::take();
 
         label.count.set(2);
         assert!(runtime.needs_frame(), "the write asks for a frame");
-        let patches = runtime.dom_frame(&label, SIZE);
+        let patches = runtime.dom_frame(&label, SIZE).unwrap();
         let frame = stats::take();
         assert!(runtime.body_runs().is_empty(), "no body ran: {:?}", runtime.body_runs());
         assert_eq!(frame.capture_nodes, 0, "the walk built nothing");
@@ -690,9 +689,9 @@ mod frame_tests {
     fn a_bound_label_moves_the_pixels_with_no_body() {
         let label = Label { count: State::new(1) };
         let runtime = Runtime::new();
-        let before = runtime.display_frame(&label, SIZE);
+        let before = runtime.display_frame(&label, SIZE).unwrap();
         label.count.set(2);
-        let after = runtime.display_frame(&label, SIZE);
+        let after = runtime.display_frame(&label, SIZE).unwrap();
         assert!(runtime.body_runs().is_empty(), "the measure read the new value itself");
         assert_ne!(before.as_slice(), after.as_slice(), "and the picture moved");
     }
@@ -712,11 +711,11 @@ mod frame_tests {
     fn a_bound_class_flips_the_element_alone() {
         let flag = Flag { on: State::new(false) };
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&flag, SIZE);
+        let _ = runtime.dom_frame(&flag, SIZE).unwrap();
         let _ = stats::take();
 
         flag.on.set(true);
-        let patches = runtime.dom_frame(&flag, SIZE);
+        let patches = runtime.dom_frame(&flag, SIZE).unwrap();
         assert!(runtime.body_runs().is_empty());
         assert_eq!(stats::take().binding_updates, 1);
         match patches.as_slice() {
@@ -724,7 +723,7 @@ mod frame_tests {
             other => panic!("one class patch, got {other:?}"),
         }
         flag.on.set(false);
-        let patches = runtime.dom_frame(&flag, SIZE);
+        let patches = runtime.dom_frame(&flag, SIZE).unwrap();
         assert!(matches!(patches.as_slice(), [DomPatch::SetHints { class: None, .. }]), "{patches:?}");
     }
 
@@ -746,9 +745,9 @@ mod frame_tests {
 
         let tagged = Tagged { on: State::new(false), id: 7 };
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&tagged, SIZE);
+        let _ = runtime.dom_frame(&tagged, SIZE).unwrap();
         tagged.on.set(true);
-        let patches = runtime.dom_frame(&tagged, SIZE);
+        let patches = runtime.dom_frame(&tagged, SIZE).unwrap();
         match patches.as_slice() {
             [DomPatch::SetHints { class: Some(class), .. }] => assert_eq!(&**class, "tag-7"),
             other => panic!("one class patch, got {other:?}"),
@@ -790,13 +789,15 @@ mod frame_tests {
     fn rows_of_one_shape_mount_as_clones_of_the_first() {
         let table = Table { rows: State::new(items(&[1, 2, 3, 4, 5])) };
         let runtime = Runtime::new();
-        let patches = runtime.dom_frame(&table, SIZE);
+        let patches = runtime.dom_frame(&table, SIZE).unwrap();
         let frame = stats::take();
         // the first row mounts whole and becomes the template; the four
         // after it are one clone each, with their own words
         let groups = patches
             .iter()
-            .filter(|patch| matches!(patch, DomPatch::Create { kind: crate::dom::CreateKind::Group, .. }))
+            .filter(|patch| {
+                matches!(patch, DomPatch::Create { kind: crate::dom::CreateKind::Group, .. })
+            })
             .count();
         let clones = patches.iter().filter(|patch| matches!(patch, DomPatch::Clone { .. })).count();
         let words: Vec<&str> = patches
@@ -816,20 +817,20 @@ mod frame_tests {
 
         // the served page agrees: a clone is the template's subtree with
         // the copy's words, numbered as a fresh mount numbers them
-        let page = crate::ssr::render(&table, SIZE);
+        let page = crate::ssr::render(&table, SIZE).unwrap();
         assert_eq!(page.html.matches("row ").count(), 5, "{}", page.html);
         for id in 1..=5 {
             assert!(page.html.contains(&format!("row {id}")), "{}", page.html);
         }
         // and a mount over the served page adopts it in silence
         let fresh = Runtime::new();
-        fresh.dom_adopt(&table, SIZE);
-        assert!(fresh.dom_frame(&table, SIZE).is_empty(), "adoption says nothing");
+        fresh.dom_adopt(&table, SIZE).unwrap();
+        assert!(fresh.dom_frame(&table, SIZE).unwrap().is_empty(), "adoption says nothing");
 
         // a sixth row of the shape is one clone and one word
         let _ = stats::take();
         table.rows.set(items(&[1, 2, 3, 4, 5, 6]));
-        let patches = runtime.dom_frame(&table, SIZE);
+        let patches = runtime.dom_frame(&table, SIZE).unwrap();
         assert!(
             matches!(patches.as_slice(), [DomPatch::Clone { .. }, DomPatch::SetContent { text, .. }] if &**text == "row 6"),
             "{patches:?}"
@@ -839,10 +840,10 @@ mod frame_tests {
         // first one made mounts whole, and every other one is compared
         // with the row made just before it — one shape hashed, not five
         table.rows.set(items(&[]));
-        let _ = runtime.dom_frame(&table, SIZE);
+        let _ = runtime.dom_frame(&table, SIZE).unwrap();
         let _ = stats::take();
         table.rows.set(items(&[7, 8, 9, 10, 11]));
-        let patches = runtime.dom_frame(&table, SIZE);
+        let patches = runtime.dom_frame(&table, SIZE).unwrap();
         let frame = stats::take();
         let clones = patches.iter().filter(|patch| matches!(patch, DomPatch::Clone { .. })).count();
         assert_eq!(clones, 4, "{patches:?}");
@@ -867,13 +868,13 @@ mod frame_tests {
     fn a_template_never_holds_another_templates_root() {
         let table = Table { rows: State::new(items(&[1, 2, 3, 4, 5])) };
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&table, SIZE);
+        let _ = runtime.dom_frame(&table, SIZE).unwrap();
         // a row joins (the list's live instance changes), then every row
         // leaves, then rows of the same shape come back
         table.rows.set(items(&[1, 2, 3, 4, 5, 6]));
-        let _ = runtime.dom_frame(&table, SIZE);
+        let _ = runtime.dom_frame(&table, SIZE).unwrap();
         table.rows.set(items(&[]));
-        let cleared = runtime.dom_frame(&table, SIZE);
+        let cleared = runtime.dom_frame(&table, SIZE).unwrap();
         let gone: Vec<(u32, u32)> = cleared
             .iter()
             .flat_map(|patch| match patch {
@@ -883,7 +884,7 @@ mod frame_tests {
             .collect();
         assert!(!gone.is_empty(), "the rows left in one op: {cleared:?}");
         table.rows.set(items(&[7, 8, 9]));
-        let refilled = runtime.dom_frame(&table, SIZE);
+        let refilled = runtime.dom_frame(&table, SIZE).unwrap();
         for patch in &refilled {
             if let DomPatch::Clone { template, .. } = patch {
                 assert!(
@@ -903,13 +904,13 @@ mod frame_tests {
     fn a_keyed_list_reads_its_rows_and_renders_each_once() {
         let table = Table { rows: State::new(items(&[1, 2, 3, 4, 5])) };
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&table, SIZE);
+        let _ = runtime.dom_frame(&table, SIZE).unwrap();
         // the table, the list and every row once
         assert_eq!(stats::take().entries_indexed, 7, "every row once at the mount");
 
         // a swap: the list re-runs, no row does, and the wire carries two moves
         table.rows.set(items(&[1, 4, 3, 2, 5]));
-        let patches = runtime.dom_frame(&table, SIZE);
+        let patches = runtime.dom_frame(&table, SIZE).unwrap();
         let frame = stats::take();
         assert_eq!(frame.entries_indexed, 1, "the list's own body, and no row's");
         assert_eq!(frame.diff_reused, 5, "every row kept wholesale");
@@ -919,7 +920,7 @@ mod frame_tests {
         // a new key runs its row, and only it — mounted as a clone of
         // the rows already there
         table.rows.set(items(&[1, 4, 3, 2, 5, 6]));
-        let patches = runtime.dom_frame(&table, SIZE);
+        let patches = runtime.dom_frame(&table, SIZE).unwrap();
         assert_eq!(stats::take().entries_indexed, 2, "the list and the new row");
         let groups = patches
             .iter()
@@ -935,14 +936,14 @@ mod frame_tests {
 
         // a key that left takes its row along
         table.rows.set(items(&[1, 3, 2, 5, 6]));
-        let patches = runtime.dom_frame(&table, SIZE);
+        let patches = runtime.dom_frame(&table, SIZE).unwrap();
         assert_eq!(stats::take().entries_indexed, 1, "the list alone");
         assert!(matches!(patches.as_slice(), [DomPatch::Remove { .. }]), "{patches:?}");
 
         // every row leaves: the list is emptied in one op, and the ids
         // it forgets are the rows' own, in a few ranges
         table.rows.set(items(&[]));
-        let patches = runtime.dom_frame(&table, SIZE);
+        let patches = runtime.dom_frame(&table, SIZE).unwrap();
         match patches.as_slice() {
             [DomPatch::RemoveChildren { forget, .. }] => {
                 let forgotten: u32 = forget.iter().map(|(start, end)| end - start).sum();
@@ -955,9 +956,9 @@ mod frame_tests {
         // and rows that replace every old one: one op empties, then the
         // new ones mount — nothing is removed one by one
         table.rows.set(items(&[7, 8]));
-        let _ = runtime.dom_frame(&table, SIZE);
+        let _ = runtime.dom_frame(&table, SIZE).unwrap();
         table.rows.set(items(&[9, 10, 11]));
-        let patches = runtime.dom_frame(&table, SIZE);
+        let patches = runtime.dom_frame(&table, SIZE).unwrap();
         assert!(matches!(patches.first(), Some(DomPatch::RemoveChildren { .. })), "{patches:?}");
         assert!(!patches.iter().any(|patch| matches!(patch, DomPatch::Remove { .. })), "{patches:?}");
         let mounted = patches
@@ -996,12 +997,12 @@ mod frame_tests {
     fn a_kept_row_is_lowered_again_when_its_environment_moves() {
         let shelf = Shelf { rows: State::new(items(&[1, 2, 3])), head: State::new(1), big: State::new(false) };
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&shelf, SIZE);
+        let _ = runtime.dom_frame(&shelf, SIZE).unwrap();
         let _ = stats::take();
 
         // the shelf re-runs for its head: the rows are promises, not walks
         shelf.head.set(2);
-        let patches = runtime.dom_frame(&shelf, SIZE);
+        let patches = runtime.dom_frame(&shelf, SIZE).unwrap();
         let frame = stats::take();
         assert_eq!(frame.entries_indexed, 2, "the shelf and the list, no row");
         assert_eq!(frame.diff_reused, 3, "the rows were kept: {patches:?}");
@@ -1011,7 +1012,7 @@ mod frame_tests {
         // are lowered again, in their new environment — no body of
         // theirs runs for it
         shelf.big.set(true);
-        let patches = runtime.dom_frame(&shelf, SIZE);
+        let patches = runtime.dom_frame(&shelf, SIZE).unwrap();
         let frame = stats::take();
         assert_eq!(frame.entries_indexed, 2, "still no row body");
         assert_eq!(frame.diff_reused, 0, "a moved environment keeps nothing: {patches:?}");
@@ -1082,18 +1083,18 @@ mod tests {
         let rows = State::new(Rc::new(Vec::new()));
         let runtime = Runtime::new();
         let size = Size { width: 400.0, height: 300.0 };
-        let _ = runtime.dom_frame(&Page { rows }, size);
+        let _ = runtime.dom_frame(&Page { rows }, size).unwrap();
         let empty_boundaries = crate::reconciler::retained_len();
         let empty_bindings = live_count();
 
         let seeds: Vec<Row> = (1..=5).map(|id| Row { id, label: State::new(Rc::from("one")) }).collect();
         rows.set(Rc::new(seeds));
-        let _ = runtime.dom_frame(&Page { rows }, size);
+        let _ = runtime.dom_frame(&Page { rows }, size).unwrap();
         assert_eq!(crate::reconciler::retained_len(), empty_boundaries + 5, "five rows retained");
         assert_eq!(live_count(), empty_bindings + 5, "five bound labels");
 
         rows.set(Rc::new(Vec::new()));
-        let _ = runtime.dom_frame(&Page { rows }, size);
+        let _ = runtime.dom_frame(&Page { rows }, size).unwrap();
         assert_eq!(crate::reconciler::retained_len(), empty_boundaries, "the rows left the retention");
         let counts = motor::identity::registry_counts();
         assert_eq!(counts[3], 0, "no view keeps bindings: {counts:?}");
@@ -1116,10 +1117,10 @@ mod tests {
         let seeds = labelled(1..=3);
         let rows = State::new(Rc::new(seeds.clone()));
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&Page { rows }, size);
+        let _ = runtime.dom_frame(&Page { rows }, size).unwrap();
 
         rows.set(Rc::new(Vec::new()));
-        let _ = runtime.dom_frame(&Page { rows }, size);
+        let _ = runtime.dom_frame(&Page { rows }, size).unwrap();
         assert_eq!(motor::identity::retired_count(), 3, "retired, not yet unpicked");
 
         seeds[1].label.set(Rc::from("written after it left"));
@@ -1127,7 +1128,7 @@ mod tests {
         let need = runtime.frame_need();
         assert!(!need.bindings && !need.dirty, "no frame is asked for a row that left: {need:?}");
         let _ = stats::take();
-        let patches = runtime.dom_frame(&Page { rows }, size);
+        let patches = runtime.dom_frame(&Page { rows }, size).unwrap();
         assert!(patches.is_empty(), "nothing to patch: {patches:?}");
         assert_eq!(stats::take().binding_updates, 0);
 
@@ -1168,13 +1169,13 @@ mod tests {
         let rows = State::new(Rc::clone(&all));
         let page = Restoring { rows, all: Rc::clone(&all) };
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&page, size);
+        let _ = runtime.dom_frame(&page, size).unwrap();
         let mounted = live_count();
 
         // row 2 leaves, and the same frame's effect puts it back
         rows.set(Rc::new(vec![all[0], all[2]]));
         let _ = stats::take();
-        let _ = runtime.dom_frame(&page, size);
+        let _ = runtime.dom_frame(&page, size).unwrap();
         assert!(stats::take().body_passes >= 2, "it left and came back in one frame");
         assert_eq!(rows.get().len(), 3, "the effect put it back");
         assert_eq!(motor::identity::retired_count(), 0, "the key is a live binding's again");
@@ -1183,7 +1184,7 @@ mod tests {
         assert_eq!(live_count(), mounted, "the idle kept the new bindings");
         all[1].label.set(Rc::from("row 2, written"));
         assert!(has_dirty(), "the write reaches the binding made again");
-        let patches = runtime.dom_frame(&page, size);
+        let patches = runtime.dom_frame(&page, size).unwrap();
         let texts: Vec<&str> = patches
             .iter()
             .filter_map(|patch| match patch {
@@ -1195,10 +1196,10 @@ mod tests {
 
         // and the same, a frame later: the key comes back before an idle
         rows.set(Rc::new(vec![all[0], all[2]]));
-        let _ = runtime.dom_frame(&page, size);
+        let _ = runtime.dom_frame(&page, size).unwrap();
         runtime.collect_garbage();
         all[1].label.set(Rc::from("row 2, again"));
-        let patches = runtime.dom_frame(&page, size);
+        let patches = runtime.dom_frame(&page, size).unwrap();
         assert!(
             patches.iter().any(|patch| matches!(patch, crate::dom::DomPatch::SetContent { text, .. } if &**text == "row 2, again")),
             "{patches:?}"
@@ -1215,18 +1216,20 @@ mod tests {
         let size = Size { width: 400.0, height: 300.0 };
         let rows = State::new(Rc::new(Vec::new()));
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&Page { rows }, size);
+        let _ = runtime.dom_frame(&Page { rows }, size).unwrap();
         let empty = runtime.dom_tables();
         rows.set(Rc::new(labelled(1..=3)));
-        let _ = runtime.dom_frame(&Page { rows }, size);
+        let _ = runtime.dom_frame(&Page { rows }, size).unwrap();
         let full = runtime.dom_tables();
         assert!(full.0 > empty.0 && full.1 > empty.1, "rows bind and group: {empty:?} -> {full:?}");
 
         rows.set(Rc::new(Vec::new()));
-        let patches = runtime.dom_frame(&Page { rows }, size);
+        let patches = runtime.dom_frame(&Page { rows }, size).unwrap();
         let removals: Vec<&crate::dom::DomPatch> = patches
             .iter()
-            .filter(|patch| matches!(patch, crate::dom::DomPatch::RemoveChildren { .. } | crate::dom::DomPatch::Remove { .. }))
+            .filter(|patch| {
+                matches!(patch, crate::dom::DomPatch::RemoveChildren { .. } | crate::dom::DomPatch::Remove { .. })
+            })
             .collect();
         assert!(matches!(removals.as_slice(), [crate::dom::DomPatch::RemoveChildren { .. }]), "one word: {patches:?}");
         assert_eq!(runtime.dom_tables(), full, "the rows' groups and bindings wait for the idle");
@@ -1244,15 +1247,15 @@ mod tests {
         let size = Size { width: 400.0, height: 300.0 };
         let rows = State::new(Rc::new(Vec::new()));
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&Page { rows }, size);
+        let _ = runtime.dom_frame(&Page { rows }, size).unwrap();
         let empty = runtime.dom_tables();
         rows.set(Rc::new(labelled(1..=3)));
-        let _ = runtime.dom_frame(&Page { rows }, size);
+        let _ = runtime.dom_frame(&Page { rows }, size).unwrap();
         rows.set(Rc::new(Vec::new()));
-        let _ = runtime.dom_frame(&Page { rows }, size);
+        let _ = runtime.dom_frame(&Page { rows }, size).unwrap();
         assert_ne!(runtime.dom_tables(), empty, "waiting for the idle");
 
-        let patches = runtime.dom_frame(&Page { rows }, size);
+        let patches = runtime.dom_frame(&Page { rows }, size).unwrap();
         assert!(patches.is_empty(), "nothing moved: {patches:?}");
         assert_eq!(runtime.dom_tables(), empty, "the next frame took them out");
         assert!(runtime.garbage_pending(), "and left the freeing to the idle");
@@ -1268,14 +1271,14 @@ mod tests {
         let size = Size { width: 400.0, height: 300.0 };
         let rows = State::new(Rc::new(labelled(1..=3)));
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&Page { rows }, size);
+        let _ = runtime.dom_frame(&Page { rows }, size).unwrap();
         runtime.collect_garbage();
         assert!(!runtime.garbage_pending(), "nothing waits: {}", runtime.retained_counts());
 
         let mut swapped = (*rows.get()).clone();
         swapped.swap(0, 2);
         rows.set(Rc::new(swapped));
-        let _ = runtime.dom_frame(&Page { rows }, size);
+        let _ = runtime.dom_frame(&Page { rows }, size).unwrap();
         assert_eq!(crate::reconciler::graveyard_len(), 0, "no row left");
         assert!(runtime.garbage_pending(), "the tree the list replaced waits for the idle");
         let counts = runtime.retained_counts();
@@ -1284,7 +1287,7 @@ mod tests {
         assert!(!runtime.garbage_pending(), "{}", runtime.retained_counts());
 
         rows.set(Rc::new(Vec::new()));
-        let _ = runtime.dom_frame(&Page { rows }, size);
+        let _ = runtime.dom_frame(&Page { rows }, size).unwrap();
         let counts = runtime.retained_counts();
         assert_eq!(counts.graveyard, 3, "the rows' entries: {counts}");
         assert_eq!(counts.bindings_retired, 3, "their bindings: {counts}");
@@ -1316,11 +1319,11 @@ mod tests {
         let seeds = labelled(1..=3);
         let rows = State::new(Rc::new(seeds.clone()));
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&Page { rows }, size);
+        let _ = runtime.dom_frame(&Page { rows }, size).unwrap();
 
         seeds[1].label.set(Rc::from("written as it leaves"));
         rows.set(Rc::new(vec![seeds[0], seeds[2]]));
-        let patches = runtime.dom_frame(&Page { rows }, size);
+        let patches = runtime.dom_frame(&Page { rows }, size).unwrap();
         assert!(patches.iter().any(|patch| matches!(patch, crate::dom::DomPatch::Remove { .. })), "row 2 left: {patches:?}");
         assert!(
             !patches.iter().any(|patch| matches!(patch, crate::dom::DomPatch::SetContent { .. })),
@@ -1359,10 +1362,10 @@ mod tests {
         let size = Size { width: 400.0, height: 300.0 };
         let page = Flagged { flag: State::new(false), label: State::new(Rc::from("first")) };
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&page, size);
+        let _ = runtime.dom_frame(&page, size).unwrap();
 
         page.flag.set(true);
-        let patches = runtime.dom_frame(&page, size);
+        let patches = runtime.dom_frame(&page, size).unwrap();
         assert!(
             patches.iter().any(|patch| matches!(
                 patch,
@@ -1373,7 +1376,7 @@ mod tests {
         runtime.collect_garbage();
 
         page.label.set(Rc::from("second"));
-        let patches = runtime.dom_frame(&page, size);
+        let patches = runtime.dom_frame(&page, size).unwrap();
         assert!(
             patches.iter().any(|patch| matches!(patch, crate::dom::DomPatch::SetContent { text, .. } if &**text == "second")),
             "the new text is still patched by its key: {patches:?}"

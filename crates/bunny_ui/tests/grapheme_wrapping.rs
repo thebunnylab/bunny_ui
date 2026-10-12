@@ -49,7 +49,8 @@ fn every_unicode_17_fixture_only_soft_wraps_at_declared_boundaries() {
                 width,
                 &PixelFont,
                 &MeasureCache::default(),
-            );
+            )
+            .unwrap();
             let mut next = 0;
             for (start, end) in lines {
                 assert_eq!(start, next, "Unicode line {}: lost bytes", line + 1);
@@ -88,7 +89,8 @@ fn hard_newlines_empty_lines_and_ascii_word_policy_remain_stable() {
                 width,
                 &PixelFont,
                 &MeasureCache::default()
-            ),
+            )
+            .unwrap(),
             expected
         );
     }
@@ -111,14 +113,16 @@ fn incremental_rewrap_matches_fresh_unicode_wrapping() {
                 &FontSpec::DEFAULT,
                 width,
                 &PixelFont,
-            );
+            )
+                .unwrap();
             let fresh = break_lines(
                 content,
                 &FontSpec::DEFAULT,
                 width,
                 &PixelFont,
                 &MeasureCache::default(),
-            );
+            )
+            .unwrap();
             assert_eq!(*kept, fresh, "{content:?} at {width}");
         }
     }

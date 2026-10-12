@@ -395,9 +395,11 @@ mod tests {
         let display = Runtime::new().display_frame(
             root,
             Size { width: size.0 as f64, height: size.1 as f64 },
-        );
+        )
+            .unwrap();
         let mut gpu = OffscreenGpu::new(size.0, size.1).expect("offscreen gpu");
-        gpu.present_wait(&display, 1, Color::CANVAS, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, 1, Color::CANVAS, &PixelFont, &RawImages::default())
+        .unwrap();
         gpu.read_rgba()
     }
 
@@ -522,13 +524,17 @@ mod tests {
             feed.push((2, 2), PIXELS.to_vec());
             let runtime = Runtime::new();
             let size = Size { width: 40.0, height: 32.0 };
-            let root = |source| image(source).resizable().frame(64.0, 48.0).clipped().frame(40.0, 32.0);
-            let native = runtime.display_frame(&root(frame.image()), size);
-            let reference = runtime.display_frame(&root(feed.source()), size);
+            let root = |source| {
+                image(source).resizable().frame(64.0, 48.0).clipped().frame(40.0, 32.0)
+            };
+            let native = runtime.display_frame(&root(frame.image()), size).unwrap();
+            let reference = runtime.display_frame(&root(feed.source()), size).unwrap();
             let mut gpu = OffscreenGpu::new(40, 32).unwrap();
-            gpu.present_wait(&native, 1, Color::CANVAS, &PixelFont, &RawImages::default());
+            gpu.present_wait(&native, 1, Color::CANVAS, &PixelFont, &RawImages::default())
+                .unwrap();
             let actual = gpu.read_rgba();
-            gpu.present_wait(&reference, 1, Color::CANVAS, &PixelFont, &RawImages::default());
+            gpu.present_wait(&reference, 1, Color::CANVAS, &PixelFont, &RawImages::default())
+            .unwrap();
             assert_eq!(
                 actual,
                 gpu.read_rgba(),
@@ -550,8 +556,10 @@ mod tests {
                 let frame = finish(&device, pending);
                 let root = image(frame.image()).resizable().frame(32.0, 32.0);
                 let display =
-                    runtime.display_frame(&root, Size { width: 32.0, height: 32.0 });
-                gpu.present_wait(&display, 1, Color::CANVAS, &PixelFont, &RawImages::default());
+                    runtime.display_frame(&root, Size { width: 32.0, height: 32.0 })
+                    .unwrap();
+                gpu.present_wait(&display, 1, Color::CANVAS, &PixelFont, &RawImages::default())
+                .unwrap();
             }
             assert!(pool.slot_count() <= POOL_LIMIT_FOR_TESTS);
         }

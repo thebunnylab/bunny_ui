@@ -33,19 +33,21 @@ fn assert_native_caret(text: &str, utf16: usize, pointer: bool) {
             width: 600.0,
             height: 100.0,
         }),
-    );
+    )
+        .unwrap();
     let field = &layout.fields[0];
     assert!(runtime.focus_named("field"));
     let native = field.text_origin.x + native_offset(&engine, text, &field.font, utf16);
     if pointer {
         let y = field.run.origin.y + field.line_height / 2.0;
         assert_eq!(
-            runtime.ime_index_at(native, y),
+            runtime.ime_index_at(native, y).unwrap(),
             Some(utf16),
             "native pointer index for {text:?}"
         );
     } else {
-        let actual = runtime.ime_rect_for(utf16).expect("focused field").origin.x;
+        let actual = runtime.ime_rect_for(utf16)
+            .unwrap().expect("focused field").origin.x;
         assert!(
             (actual - native).abs() < 0.01,
             "native caret for {text:?} at UTF-16 {utf16}: expected {native}, got {actual}"
@@ -133,9 +135,11 @@ fn mixed_geometry_wrapped_rows_match_their_native_line_and_alignment() {
                 width: 130.0,
                 height: 150.0,
             }),
-        );
+        )
+            .unwrap();
         runtime.focus_named("field");
         let mut checked = 0;
+        let mut context_changed = 0;
         for command in layout.display.iter() {
             if let DrawCommand::TextLine {
                 content,
@@ -152,15 +156,30 @@ fn mixed_geometry_wrapped_rows_match_their_native_line_and_alignment() {
                 {
                     let unit = bunny_ui::text_input::byte_to_utf16(line, local);
                     let global = bunny_ui::text_input::byte_to_utf16(text, range.0 + local);
-                    let expected = origin.x + native_offset(&engine, line, font, unit);
-                    assert!(
-                        (runtime.ime_rect_for(global).unwrap().origin.x - expected).abs() < 0.01
+                    let isolated = native_offset(&engine, line, font, unit);
+                    let contextual = super::paragraph_tests::paragraph_offset(
+                        &engine,
+                        text,
+                        range.0..range.1,
+                        font,
+                        global,
                     );
-                    assert_eq!(runtime.ime_index_at(expected, origin.y + 5.0), Some(global));
+                    context_changed += usize::from((isolated - contextual).abs() > 0.01);
+                    // Soft wrapping keeps the paragraph base direction and its
+                    // resolved neutrals. A standalone substring is a different oracle.
+                    let expected = origin.x + contextual;
+                    assert!(
+                        (runtime.ime_rect_for(global).unwrap().unwrap().origin.x - expected).abs() < 0.01
+                    );
+                    assert_eq!(runtime.ime_index_at(expected, origin.y + 5.0).unwrap(), Some(global));
                     checked += 1;
                 }
             }
         }
+        assert!(
+            context_changed > 0,
+            "the fixture distinguishes paragraph context from isolated lines"
+        );
         assert!(
             checked >= 6,
             "all repeated mixed runs across wrapped lines were checked"

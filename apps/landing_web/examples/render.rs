@@ -18,9 +18,9 @@ use bunny_ui::prelude::Locale;
 /// at another size gets the difference as patches once the wasm runs.
 const SERVED: Size = Size { width: 1440.0, height: 900.0 };
 
-fn main() {
+fn main() -> Result<(), bunny_ui::text_error::TextError> {
     let locale = Locale::parse(&std::env::var("LANDING_LOCALE").unwrap_or_default());
-    let page = bunny_ui::ssr::render_in(&landing_web::landing(), SERVED, &locale);
+    let page = bunny_ui::ssr::render_in(&landing_web::landing(), SERVED, &locale)?;
     let version = std::env::var("LANDING_VERSION").unwrap_or_else(|_| "1".into());
     let html = include_str!("../page.html")
         .replace("{css}", &page.css)
@@ -29,4 +29,5 @@ fn main() {
         .replace("{dir}", page.dir)
         .replace("{version}", &version);
     print!("{html}");
+    Ok(())
 }

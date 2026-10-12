@@ -72,6 +72,26 @@ fn paragraph_line(
     }
 }
 
+/// Independent SDK oracle shared by mixed-line alignment checks. Native string
+/// indices refer to the original paragraph even when the line starts later.
+pub(super) fn paragraph_offset(
+    engine: &CoreTextEngine,
+    text: &str,
+    range: Range<usize>,
+    font: &FontSpec,
+    utf16: usize,
+) -> f64 {
+    let line = paragraph_line(engine, text, range, font);
+    // SAFETY: the retained line was made for this original paragraph range.
+    unsafe {
+        CTLineGetOffsetForStringIndex(
+            line.0,
+            isize::try_from(utf16).unwrap(),
+            std::ptr::null_mut(),
+        )
+    }
+}
+
 fn wrapped_carets_match_paragraph(text: &str, width: f64) {
     let engine = Rc::new(CoreTextEngine::new());
     let runtime = Runtime::new().text_engine(engine.clone());
@@ -84,8 +104,8 @@ fn wrapped_carets_match_paragraph(text: &str, width: f64) {
         width,
         height: 400.0,
     };
-    runtime.display_frame(&view, size);
-    let layout = runtime.layout(&view, Proposal::exact(size));
+    runtime.display_frame(&view, size).unwrap();
+    let layout = runtime.layout(&view, Proposal::exact(size)).unwrap();
     assert!(runtime.focus_named("editor"));
     let mut rows = 0;
     let mut checked = 0;
@@ -122,7 +142,7 @@ fn wrapped_carets_match_paragraph(text: &str, width: f64) {
             // SAFETY: a live native line and scalar-aligned UTF-16 index in its source range.
             let expected = origin.x
                 + unsafe { CTLineGetOffsetForStringIndex(native.0, index, std::ptr::null_mut()) };
-            let observed = runtime.ime_rect_for(unit).unwrap().origin.x;
+            let observed = runtime.ime_rect_for(unit).unwrap().unwrap().origin.x;
             checked += 1;
             if (observed - expected).abs() > 0.01 {
                 mismatches.push(format!(
@@ -160,4 +180,104 @@ fn paragraph_bracket_context_survives_soft_wraps() {
 #[test]
 fn paragraph_plain_latin_position_control() {
     wrapped_carets_match_paragraph("abc def ghi jkl mno", 70.0);
+}
+
+#[test]
+fn prepared_paragraph_ranges_keep_original_native_indices() {
+    use bunny_ui::text_geometry::CaretAffinity;
+    use bunny_ui::text_source::TextContent;
+    let engine = CoreTextEngine::new();
+    let font = FontSpec::DEFAULT;
+    for text in [
+        "😀 \u{202e}abc def ghi\u{202c}",
+        "😀 \u{202d}אבג דהו זחט\u{202c}",
+        "אבג (abc def ghi) דהו",
+        "אבג \u{2066}abc def ghi\u{2069} דהו",
+    ] {
+        let source = TextContent::from(text);
+        let start = text.find("def").or_else(|| text.find("דהו")).unwrap();
+        let stop = start
+            + text[start..]
+                .chars()
+                .take(3)
+                .map(char::len_utf8)
+                .sum::<usize>();
+        let line = source.line(start..stop).unwrap();
+        let reference = paragraph_line(&engine, text, start..stop, &font);
+        let measured = engine.try_measure_paragraph_line(&line, &font).unwrap();
+        // SAFETY: a retained oracle CTLine and optional omitted font metrics.
+        let expected_width = unsafe {
+            CTLineGetTypographicBounds(
+                reference.0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!((measured.width - expected_width).abs() < 0.001);
+        let geometry = engine
+            .try_paragraph_line_geometry(&line, &font)
+            .unwrap()
+            .unwrap();
+        let middle = text[start..stop].chars().next().unwrap().len_utf8();
+        let index = isize::try_from(byte_to_utf16(text, start + middle)).unwrap();
+        // SAFETY: an original-source UTF-16 scalar boundary in the retained oracle line.
+        let expected_x =
+            unsafe { CTLineGetOffsetForStringIndex(reference.0, index, std::ptr::null_mut()) };
+        assert!((geometry.caret_x(middle, CaretAffinity::Downstream) - expected_x).abs() < 0.001);
+    }
+}
+
+#[test]
+fn prepared_paragraph_empty_range_never_draws_the_remaining_paragraph() {
+    use bunny_ui::text_source::TextContent;
+    let engine = CoreTextEngine::new();
+    let source = TextContent::from("\u{202e}abc def\u{202c}");
+    let start = source.find("def").unwrap();
+    let empty = source.line(start..start).unwrap();
+    let metrics = engine
+        .try_measure_paragraph_line(&empty, &FontSpec::DEFAULT)
+        .unwrap();
+    assert!(metrics.width.abs() < f64::EPSILON);
+    assert!(metrics.height() > 0.0);
+    assert!(
+        engine
+            .try_raster_paragraph_line(&empty, &FontSpec::DEFAULT, Color::BLACK, 2)
+            .unwrap()
+            .is_none()
+    );
+    let geometry = engine
+        .try_paragraph_line_geometry(&empty, &FontSpec::DEFAULT)
+        .unwrap()
+        .unwrap();
+    assert!(geometry.selection_spans(0..0).is_empty());
+}
+
+#[test]
+fn prepared_paragraph_pixels_follow_carried_override_at_both_scales() {
+    use bunny_ui::text_source::TextContent;
+    let engine = CoreTextEngine::new();
+    let font = FontSpec::DEFAULT;
+    let source = TextContent::from("\u{202e}abc def ghi\u{202c}");
+    let start = source.find("def").unwrap();
+    let line = source.line(start..start + 3).unwrap();
+    for scale in [1, 2] {
+        let color = Color::rgb(71, 33, 190);
+        let actual = engine
+            .try_raster_paragraph_line(&line, &font, color, scale)
+            .unwrap()
+            .unwrap();
+        let expected = engine
+            .raster_line("\u{202e}def\u{202c}", &font, color, scale)
+            .unwrap();
+        assert_eq!(
+            (actual.width, actual.height, actual.baseline),
+            (expected.width, expected.height, expected.baseline)
+        );
+        assert_eq!(actual.rgba, expected.rgba);
+        assert_ne!(
+            actual.rgba,
+            engine.raster_line("def", &font, color, scale).unwrap().rgba
+        );
+    }
 }

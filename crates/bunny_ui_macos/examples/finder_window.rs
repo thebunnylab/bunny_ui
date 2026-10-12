@@ -189,7 +189,9 @@ impl Component for Finder {
 
         let header = hstack!(
             icon(symbol::CHEVRON_RIGHT).font(Font::Headline).foreground_color(theme::accent()),
-            text_field("Search files by name…", self.query.binding()).monospaced().auto_focus(),
+            text_field("Search files by name…", self.query.binding())
+                .monospaced()
+                .auto_focus(),
         )
         .spacing(10.0)
         .alignment(VerticalAlignment::Center)

@@ -42,6 +42,20 @@
 
 mod ffi;
 
+/// Native callbacks have no Rust error slot. Record a failed operation and
+/// answer unavailable (or consume an already-started edit); never substitute
+/// isolated text geometry or publish a partially prepared frame.
+fn native_event<T, E: Into<bunny_ui::gpu::walk::RenderError>>(result: Result<T, E>, unavailable: T) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            let error = error.into();
+            eprintln!("bunny_ui: native operation failed: {error}");
+            unavailable
+        }
+    }
+}
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -433,12 +447,13 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
         Rc::new(RefCell::new(std::collections::HashMap::new()));
     // present takes a READY display list to the screen — the tick path
     // reuses it without paying settle or effects
-    let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList)> = Rc::new({
+    let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList) -> Result<(), bunny_ui::gpu::walk::RenderError>> = Rc::new({
         let segments_kept = Rc::clone(&segments_kept);
-        move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| {
+        move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| -> Result<(), bunny_ui::gpu::walk::RenderError> {
+            Ok({
             let (width, height) = ffi::view_size();
             if width <= 0.0 || height <= 0.0 {
-                return;
+                return Ok(());
             }
             let scale = ffi::view_scale();
             // the native hosts FIRST — before the drawable's present: a
@@ -533,7 +548,7 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                 let mut standing: Vec<String> = Vec::new();
                 for (host, slice) in &segments {
                     // the surface is the CONTENT's box, never the window
-                    let Some(bounds) = bunny_ui::raster::list_bounds(slice, &*runtime.text())
+                    let Some(bounds) = bunny_ui::raster::list_bounds(slice, &*runtime.text())?
                     else {
                         continue; // nothing paints — nothing to lift
                     };
@@ -569,7 +584,7 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                         &*runtime.text(),
                         &*runtime.images(),
                         None,
-                    );
+                    )?;
                     ffi::segment_blit(
                         host,
                         host,
@@ -598,12 +613,14 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                 bunny_ui::theme::canvas(),
                 &*runtime.text(),
                 &*runtime.images(),
-            );
-        }
+            )?;
+                    })
+}
     });
     let blit = {
         let present = Rc::clone(&present);
-        move |runtime: &Runtime, root: &_| {
+        move |runtime: &Runtime, root: &_| -> Result<(), bunny_ui::gpu::walk::RenderError> {
+            Ok({
             // the webview commands are spent BEFORE the frame renders,
             // so the state an expired eval writes lands in THIS layout.
             // An op whose page is not mounted answers immediately —
@@ -662,8 +679,8 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
             runtime.set_device_scale(ffi::view_scale() as f64);
             // the WHOLE view: the safe area is the layout's, applied
             // by the core, and overlays position inside it
-            let display = runtime.display_frame(root, Size { width, height });
-            present(runtime, display);
+            let display = runtime.display_frame(root, Size { width, height })?;
+            present(runtime, display)?;
             // the keyboard follows the focus: a field that took it wants
             // the keys — the ones it asks for — and a scene with none
             // wants them gone
@@ -672,7 +689,8 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
             // wake or park the frame driver — the event may have
             // started (or finished) an animation, or a finger's clock
             sync_frame_driver(runtime);
-        }
+                    })
+}
     };
 
     // the gate: keymap BEFORE the keyboard's own road — bare chars pass
@@ -684,22 +702,23 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
         let root = Rc::clone(&root);
         let blit = blit.clone();
         move |stroke: Stroke| {
+            native_event((|| -> Result<bool, bunny_ui::gpu::walk::RenderError> { Ok({
             let pattern = stroke.pattern;
             // MID-CHORD the keyboard belongs to the keymap: the stroke
             // that finishes `cmd-k s` is not typing
             let mid_chord = !runtime.pending_chord().is_empty();
             if !mid_chord && runtime.focus_takes_text() && pattern.is_text_input() {
-                return false;
+                return Ok(false);
             }
             // a focused escape hatch owns its strokes: an editor's
             // arrows, Enter and Tab are its own
-            let taken = runtime.key_stroke(stroke);
+            let taken = runtime.key_stroke(stroke)?;
             if taken.handled {
                 if let Some(text) = taken.text {
                     ffi::clipboard_write(&text);
                 }
-                blit(&runtime, &*root);
-                return true;
+                blit(&runtime, &*root)?;
+                return Ok(true);
             }
             // a field of MANY lines owns the bare vertical arrows before
             // any binding — the break arrives by the keyboard's road
@@ -710,26 +729,27 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                     Key::Down => Some(EditCommand::Down(pattern.shift)),
                     _ => None,
                 }
-                && runtime.key(command).applied
+                && runtime.key(command)?.applied
             {
-                blit(&runtime, &*root);
-                return true;
+                blit(&runtime, &*root)?;
+                return Ok(true);
             }
             let action = match runtime.chord(stroke) {
                 KeyMatch::Action(action) => action,
                 KeyMatch::Pending => {
-                    blit(&runtime, &*root);
-                    return true;
+                    blit(&runtime, &*root)?;
+                    return Ok(true);
                 }
-                KeyMatch::None => return false,
+                KeyMatch::None => return Ok(false),
             };
             if runtime.dispatch_action(action) {
-                blit(&runtime, &*root);
+                blit(&runtime, &*root)?;
                 true
             } else {
                 false
             }
-        }
+        }) })(), true)
+}
     });
     let key_gate: Box<dyn FnMut(&ffi::KeyStroke) -> bool> = Box::new({
         let offer = Rc::clone(&offer);
@@ -749,15 +769,17 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
         let blit = blit.clone();
         let offer = Rc::clone(&offer);
         move |pick, stroke: Option<KeyPattern>| {
+            native_event((|| -> Result<bool, bunny_ui::gpu::walk::RenderError> { Ok({
             if stroke.is_some_and(|stroke| offer(Stroke::from(stroke))) {
-                return true;
+                return Ok(true);
             }
-            let ran = runtime.menu_pick(pick);
+            let ran = runtime.menu_pick(pick)?;
             if ran {
-                blit(&runtime, &*root);
+                blit(&runtime, &*root)?;
             }
             ran
-        }
+        }) })(), true)
+}
     }));
     ffi::set_menu_answers(Box::new({
         let runtime = Rc::clone(&runtime);
@@ -771,6 +793,7 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
         let root = Rc::clone(&root);
         let blit = blit.clone();
         move |event| {
+            native_event((|| -> Result<(), bunny_ui::gpu::walk::RenderError> { Ok({
             use webview::WebviewEvent;
             let woke = match event {
                 WebviewEvent::Navigated { path, url } => runtime.webview_navigated(&path, &url),
@@ -796,9 +819,10 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                 ),
             };
             if woke {
-                blit(&runtime, &*root);
+                blit(&runtime, &*root)?;
             }
-        }
+        }) })(), ())
+}
     });
 
     let handler_runtime = Rc::clone(&runtime);
@@ -808,13 +832,14 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
     // every event but the clocks, one line each, on stderr
     let trace = std::env::var_os("BUNNY_IOS_TRACE").is_some();
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
+            native_event((|| -> Result<(), bunny_ui::gpu::walk::RenderError> { Ok({
         let runtime = &handler_runtime;
         let root = &*handler_root;
         if trace && !matches!(event, AppEvent::Blink | AppEvent::Frame { .. }) {
             eprintln!("bunny_ui ios: {event:?}");
         }
         match event {
-            AppEvent::Redraw => blit(runtime, root),
+            AppEvent::Redraw => blit(runtime, root)?,
             // The work always lands: the tasks are polled. The FRAME is for a
             // turn that changed something. Most wakes change nothing — a poll
             // that found no news, a sleeper that went back to sleep — and a
@@ -825,7 +850,7 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
             AppEvent::Wake => {
                 runtime.poll_tasks();
                 if runtime.needs_frame() {
-                    blit(runtime, root);
+                    blit(runtime, root)?;
                 } else {
                     // no frame — but a task may have gone to sleep with a
                     // new deadline, and the driver's pace follows it
@@ -840,12 +865,12 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                     let _ = runtime.display_frame(root, {
                         let (width, height) = ffi::view_size();
                         Size { width, height }
-                    });
+                    })?;
                 }
             }
             AppEvent::Foreground => {
                 runtime.set_loops_paused(false);
-                blit(runtime, root);
+                blit(runtime, root)?;
             }
             AppEvent::MemoryWarning => {
                 if let Some(release) = &memory {
@@ -865,41 +890,41 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                     }
                 }
                 runtime.set_size_class(size_class(compact));
-                blit(runtime, root);
+                blit(runtime, root)?;
             }
             AppEvent::SafeArea { top, left, bottom, right } => {
                 runtime.set_safe_area(edges(top, left, bottom, right));
-                blit(runtime, root);
+                blit(runtime, root)?;
             }
             AppEvent::Keyboard { overlap } => {
                 runtime.set_keyboard_inset(overlap);
-                blit(runtime, root);
+                blit(runtime, root)?;
             }
             // a touch that changed nothing visible may still have put
             // the finger on the clock (a hold that may become a menu) —
             // the driver syncs either way
             AppEvent::TouchBegan { id, x, y, taps } => {
-                if runtime.touch_began(id, x, y, taps) {
-                    blit(runtime, root);
+                if runtime.touch_began(id, x, y, taps)? {
+                    blit(runtime, root)?;
                 } else {
                     sync_frame_driver(runtime);
                 }
             }
             AppEvent::TouchMoved { id, x, y } => {
-                if runtime.touch_moved(id, x, y) {
-                    blit(runtime, root);
+                if runtime.touch_moved(id, x, y)? {
+                    blit(runtime, root)?;
                 } else {
                     sync_frame_driver(runtime);
                 }
             }
             AppEvent::TouchEnded { id, x, y } => {
                 // the lift may fire; the pressed visual always clears
-                let _ = runtime.touch_ended(id, x, y);
-                blit(runtime, root);
+                let _ = runtime.touch_ended(id, x, y)?;
+                blit(runtime, root)?;
             }
             AppEvent::TouchCancelled { id } => {
-                if runtime.touch_cancelled(id) {
-                    blit(runtime, root);
+                if runtime.touch_cancelled(id)? {
+                    blit(runtime, root)?;
                 } else {
                     sync_frame_driver(runtime);
                 }
@@ -913,18 +938,18 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                 } else {
                     EditCommand::Insert(text)
                 };
-                if runtime.key(command).applied {
-                    blit(runtime, root);
+                if runtime.key(command)?.applied {
+                    blit(runtime, root)?;
                 }
             }
             AppEvent::DeleteBackward => {
-                if runtime.key(EditCommand::Backspace).applied {
-                    blit(runtime, root);
+                if runtime.key(EditCommand::Backspace)?.applied {
+                    blit(runtime, root)?;
                 }
             }
             AppEvent::Modifiers(held) => {
                 if runtime.modifiers_changed(held) {
-                    blit(runtime, root);
+                    blit(runtime, root)?;
                 }
             }
             AppEvent::Key(stroke) => {
@@ -938,26 +963,26 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                     0x29 => {
                         // esc releases the keyboard
                         if runtime.blur() {
-                            blit(runtime, root);
+                            blit(runtime, root)?;
                         }
                         None
                     }
                     0x04 if stroke.command => Some(EditCommand::SelectAll), // ⌘A
                     0x06 if stroke.command => {
                         // ⌘C — the field's output goes to the system
-                        if let Some(text) = runtime.key(EditCommand::Copy).output {
+                        if let Some(text) = runtime.key(EditCommand::Copy)?.output {
                             ffi::clipboard_write(&text);
                         }
                         None
                     }
                     0x1B if stroke.command => {
                         // ⌘X
-                        let cut = runtime.key(EditCommand::Cut);
+                        let cut = runtime.key(EditCommand::Cut)?;
                         if let Some(text) = &cut.output {
                             ffi::clipboard_write(text);
                         }
                         if cut.output.is_some() {
-                            blit(runtime, root);
+                            blit(runtime, root)?;
                         }
                         None
                     }
@@ -965,9 +990,9 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                     _ => None,
                 };
                 if let Some(edit) = edit
-                    && runtime.key(edit).applied
+                    && runtime.key(edit)?.applied
                 {
-                    blit(runtime, root);
+                    blit(runtime, root)?;
                 }
             }
             AppEvent::Blink => {
@@ -980,7 +1005,7 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                 // the scroll gesture
                 runtime.wheel_tick();
                 if blinked || explained || chorded {
-                    blit(runtime, root);
+                    blit(runtime, root)?;
                 }
             }
             AppEvent::Frame { dt, elapsed } => {
@@ -988,20 +1013,21 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                 // only — zero bodies on a stable tree. A finger the
                 // clock decided for reached the app: that frame settles.
                 // A finger's hold reads the wall; the springs, the step
-                let ticked = runtime.tick_clocked(dt, elapsed);
+                let ticked = runtime.tick_clocked(dt, elapsed)?;
                 if ticked.input {
-                    blit(runtime, root);
+                    blit(runtime, root)?;
                 } else {
                     if ticked.any() {
                         let (width, height) = ffi::view_size();
-                        let display = runtime.animation_frame(root, Size { width, height });
-                        handler_present(runtime, display);
+                        let display = runtime.animation_frame(root, Size { width, height })?;
+                        handler_present(runtime, display)?;
                     }
                     sync_frame_driver(runtime);
                 }
             }
         }
-    });
+    }) })(), ())
+});
 
     ffi::set_key_gate(key_gate);
     ffi::set_handler(handler);

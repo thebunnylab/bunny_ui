@@ -358,11 +358,12 @@ fn main() {
     let runtime = Runtime::new().text_engine(engine.clone());
     runtime.bind(KeyPattern::key(Key::Down), SELECT_NEXT);
     runtime.settle(&finder);
-    runtime.layout(&finder, viewport);
+    runtime.layout(&finder, viewport).unwrap();
 
-    let result = runtime.layout(&finder, viewport);
+    let result = runtime.layout(&finder, viewport).unwrap();
     let field = result.fields.first().expect("field").clone();
-    runtime.pointer_pressed(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0);
+    runtime.pointer_pressed(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0)
+        .unwrap();
     runtime.pointer_released(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0);
 
     let mut reports = Vec::new();
@@ -370,37 +371,38 @@ fn main() {
     let mut forward = true;
     reports.push(measure("keystroke (filter+layout)", 5, 200, || {
         if forward {
-            runtime.key(EditCommand::Insert("e".into()));
+            runtime.key(EditCommand::Insert("e".into())).unwrap();
         } else {
-            runtime.key(EditCommand::Backspace);
+            runtime.key(EditCommand::Backspace).unwrap();
         }
         forward = !forward;
         runtime.settle(&finder);
-        runtime.layout(&finder, viewport);
+        runtime.layout(&finder, viewport).unwrap();
     }));
 
     let select = runtime.match_key(&KeyPattern::key(Key::Down)).unwrap();
     reports.push(measure("select_next (dispatch+layout)", 5, 200, || {
         runtime.dispatch_action(select);
         runtime.settle(&finder);
-        runtime.layout(&finder, viewport);
+        runtime.layout(&finder, viewport).unwrap();
     }));
 
-    let result = runtime.layout(&finder, viewport);
+    let result = runtime.layout(&finder, viewport).unwrap();
     let row = result.hits.get(1).expect("row").1;
     let mut inside = true;
     reports.push(measure("hover (stamp+layout)", 5, 200, || {
         let y = row.origin.y + row.size.height / 2.0;
-        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 }, false);
+        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 }, false)
+            .unwrap();
         inside = !inside;
-        runtime.layout(&finder, viewport);
+        runtime.layout(&finder, viewport).unwrap();
     }));
 
     let mut down = true;
     reports.push(measure("wheel (offset+layout)", 5, 200, || {
         runtime.wheel(320.0, 300.0, 0.0, if down { -8.0 } else { 8.0 });
         down = !down;
-        runtime.layout(&finder, viewport);
+        runtime.layout(&finder, viewport).unwrap();
     }));
 
     // the tick path: springs mid-flight, ZERO bodies — the engine-side
@@ -414,22 +416,24 @@ fn main() {
     let anim_runtime = Runtime::new().text_engine(engine.clone());
     let window = Size { width: 760.0, height: 640.0 };
     anim_runtime.settle(&animated);
-    anim_runtime.layout(&animated, viewport);
+    anim_runtime.layout(&animated, viewport).unwrap();
     let mut ticks = 0usize;
     reports.push(measure("animated frame (tick+layout)", 5, 200, || {
         if ticks % 24 == 0 {
             animated.selected.set(ticks / 24 % 12 + 1);
-            let _ = anim_runtime.display_frame(&animated, window);
+            let _ = anim_runtime.display_frame(&animated, window).unwrap();
         }
         ticks += 1;
-        anim_runtime.tick(1.0 / 120.0);
-        std::hint::black_box(anim_runtime.animation_frame(&animated, window).len());
+        anim_runtime.tick(1.0 / 120.0).unwrap();
+        std::hint::black_box(anim_runtime.animation_frame(&animated, window).unwrap().len());
     }));
 
-    let laid_out = runtime.layout(&finder, viewport);
+    let laid_out = runtime.layout(&finder, viewport).unwrap();
     reports.push(measure("raster 1520×1280 @2x (paint)", 3, 60, || {
         let bitmap =
-            rasterize_with(&laid_out.display, 1520, 1280, 2, Color::CANVAS, &*engine, &RawImages::default());
+            rasterize_with(&laid_out.display, 1520, 1280, 2, Color::CANVAS, &*engine, &RawImages::default(),
+        )
+        .unwrap();
         std::hint::black_box(bitmap.width());
     }));
 
@@ -437,26 +441,33 @@ fn main() {
     // only the damage — the full frame above is the ceiling it beats
     use bunny_ui::raster::Surface;
     let mut surface = Surface::new(1520, 1280, 2, Color::CANVAS);
-    surface.frame(runtime.layout(&finder, viewport).display, &*engine, &RawImages::default());
-    let row = runtime.layout(&finder, viewport).hits.get(1).expect("row").1;
+    surface.frame(runtime.layout(&finder, viewport).unwrap().display, &*engine, &RawImages::default())
+        .unwrap();
+    let row = runtime.layout(&finder, viewport)
+        .unwrap().hits.get(1).expect("row").1;
     let mut inside = true;
     reports.push(measure("hover repaint (damage)", 3, 200, || {
         let y = row.origin.y + row.size.height / 2.0;
-        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 }, false);
+        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 }, false)
+            .unwrap();
         inside = !inside;
-        let damage = surface.frame(runtime.layout(&finder, viewport).display, &*engine, &RawImages::default());
+        let damage = surface.frame(runtime.layout(&finder, viewport).unwrap().display, &*engine, &RawImages::default(),
+            )
+            .unwrap();
         std::hint::black_box(damage.len());
     }));
     let mut forward = true;
     reports.push(measure("keystroke repaint (damage)", 3, 200, || {
         if forward {
-            runtime.key(EditCommand::Insert("e".into()));
+            runtime.key(EditCommand::Insert("e".into())).unwrap();
         } else {
-            runtime.key(EditCommand::Backspace);
+            runtime.key(EditCommand::Backspace).unwrap();
         }
         forward = !forward;
         runtime.settle(&finder);
-        let damage = surface.frame(runtime.layout(&finder, viewport).display, &*engine, &RawImages::default());
+        let damage = surface.frame(runtime.layout(&finder, viewport).unwrap().display, &*engine, &RawImages::default(),
+            )
+            .unwrap();
         std::hint::black_box(damage.len());
     }));
 
@@ -465,21 +476,25 @@ fn main() {
     let mut inside = true;
     reports.push(measure("hover present (repaint+rgba)", 3, 200, || {
         let y = row.origin.y + row.size.height / 2.0;
-        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 }, false);
+        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 }, false)
+            .unwrap();
         inside = !inside;
-        surface.frame(runtime.layout(&finder, viewport).display, &*engine, &RawImages::default());
+        surface.frame(runtime.layout(&finder, viewport).unwrap().display, &*engine, &RawImages::default(),
+            )
+            .unwrap();
         std::hint::black_box(surface.rgba().len());
     }));
     // the OLD presentation cost, for the record: full byte conversion
     let bitmap = rasterize_with(
-        &runtime.layout(&finder, viewport).display,
+        &runtime.layout(&finder, viewport).unwrap().display,
         1520,
         1280,
         2,
         Color::CANVAS,
         &*engine,
         &RawImages::default(),
-    );
+    )
+    .unwrap();
     reports.push(measure("full rgba conversion (old blit)", 3, 60, || {
         std::hint::black_box(bitmap.to_rgba_bytes().len());
     }));
@@ -490,14 +505,19 @@ fn main() {
     use bunny_ui_windows::OffscreenD3d;
     if let Some(mut gpu) = OffscreenD3d::new(1520, 1280) {
         // warm the atlas first — steady state is the story
-        gpu.present_wait(&laid_out.display, 2, Color::CANVAS, &*engine, &RawImages::default());
+        gpu.present_wait(&laid_out.display, 2, Color::CANVAS, &*engine, &RawImages::default())
+        .unwrap();
         reports.push(measure("present GPU 1520×1280 (full)", 3, 200, || {
-            gpu.present_wait(&laid_out.display, 2, Color::CANVAS, &*engine, &RawImages::default());
+            gpu.present_wait(&laid_out.display, 2, Color::CANVAS, &*engine, &RawImages::default(),
+            )
+            .unwrap();
         }));
         // the cpu-side cost alone: commit and move on, like a window
         // does — the twin of a present that never waits for the gpu
         reports.push(measure("present GPU (encode, no wait)", 3, 200, || {
-            gpu.present_nowait(&laid_out.display, 2, Color::CANVAS, &*engine, &RawImages::default());
+            gpu.present_nowait(&laid_out.display, 2, Color::CANVAS, &*engine, &RawImages::default(),
+            )
+            .unwrap();
         }));
 
         // an animated frame END TO END: tick + layout + encode — the
@@ -506,12 +526,13 @@ fn main() {
         reports.push(measure("animated frame (tick+layout+encode)", 3, 200, || {
             if gpu_ticks % 24 == 0 {
                 animated.selected.set(gpu_ticks / 24 % 12 + 1);
-                let _ = anim_runtime.display_frame(&animated, window);
+                let _ = anim_runtime.display_frame(&animated, window).unwrap();
             }
             gpu_ticks += 1;
-            anim_runtime.tick(1.0 / 120.0);
-            let display = anim_runtime.animation_frame(&animated, window);
-            gpu.present_nowait(&display, 2, Color::CANVAS, &*engine, &RawImages::default());
+            anim_runtime.tick(1.0 / 120.0).unwrap();
+            let display = anim_runtime.animation_frame(&animated, window).unwrap();
+            gpu.present_nowait(&display, 2, Color::CANVAS, &*engine, &RawImages::default())
+                    .unwrap();
         }));
     }
 
@@ -535,31 +556,32 @@ fn main() {
     };
     let big_runtime = Runtime::new().text_engine(engine.clone());
     big_runtime.settle(&big_finder);
-    big_runtime.layout(&big_finder, viewport);
-    big_runtime.layout(&big_finder, viewport);
-    let result = big_runtime.layout(&big_finder, viewport);
+    big_runtime.layout(&big_finder, viewport).unwrap();
+    big_runtime.layout(&big_finder, viewport).unwrap();
+    let result = big_runtime.layout(&big_finder, viewport).unwrap();
     let field = result.fields.first().expect("field").clone();
-    big_runtime.pointer_pressed(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0);
+    big_runtime.pointer_pressed(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0)
+        .unwrap();
     big_runtime.pointer_released(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0);
 
     let mut forward = true;
     reports.push(measure("keystroke 10k (filter+layout)", 5, 200, || {
         if forward {
-            big_runtime.key(EditCommand::Insert("e".into()));
+            big_runtime.key(EditCommand::Insert("e".into())).unwrap();
         } else {
-            big_runtime.key(EditCommand::Backspace);
+            big_runtime.key(EditCommand::Backspace).unwrap();
         }
         forward = !forward;
         refilter(&big_finder);
         big_runtime.settle(&big_finder);
-        big_runtime.layout(&big_finder, viewport);
+        big_runtime.layout(&big_finder, viewport).unwrap();
     }));
 
     let mut down = true;
     reports.push(measure("wheel 10k (offset+layout)", 5, 200, || {
         big_runtime.wheel(320.0, 300.0, 0.0, if down { -8.0 } else { 8.0 });
         down = !down;
-        big_runtime.layout(&big_finder, viewport);
+        big_runtime.layout(&big_finder, viewport).unwrap();
     }));
 
     let mut far = true;
@@ -567,26 +589,31 @@ fn main() {
         big_finder.selected.set(if far { 9_999 } else { 0 });
         far = !far;
         big_runtime.settle(&big_finder);
-        big_runtime.layout(&big_finder, viewport);
+        big_runtime.layout(&big_finder, viewport).unwrap();
     }));
 
     reports.push(measure("layout 10k (no change)", 5, 200, || {
-        std::hint::black_box(big_runtime.layout(&big_finder, viewport).display.len());
+        std::hint::black_box(big_runtime.layout(&big_finder, viewport).unwrap().display.len());
     }));
 
     // editor-class window: where a cpu full frame stops scaling and the
     // gpu must not care — the same scene laid out at 3024×1964 logical
     let editor = Proposal::exact(Size { width: 3024.0, height: 1964.0 });
-    let editor_layout = runtime.layout(&finder, editor);
+    let editor_layout = runtime.layout(&finder, editor).unwrap();
     reports.push(measure("raster 6048×3928 @2x (paint)", 3, 20, || {
         let bitmap =
-            rasterize_with(&editor_layout.display, 6048, 3928, 2, Color::CANVAS, &*engine, &RawImages::default());
+            rasterize_with(&editor_layout.display, 6048, 3928, 2, Color::CANVAS, &*engine, &RawImages::default(),
+        )
+        .unwrap();
         std::hint::black_box(bitmap.width());
     }));
     if let Some(mut gpu) = OffscreenD3d::new(6048, 3928) {
-        gpu.present_wait(&editor_layout.display, 2, Color::CANVAS, &*engine, &RawImages::default());
+        gpu.present_wait(&editor_layout.display, 2, Color::CANVAS, &*engine, &RawImages::default())
+        .unwrap();
         reports.push(measure("present GPU 6048×3928 (full)", 3, 100, || {
-            gpu.present_wait(&editor_layout.display, 2, Color::CANVAS, &*engine, &RawImages::default());
+            gpu.present_wait(&editor_layout.display, 2, Color::CANVAS, &*engine, &RawImages::default(),
+            )
+            .unwrap();
         }));
     }
 

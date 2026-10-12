@@ -19,6 +19,7 @@ use std::sync::Arc;
 use motor::hash::FxHashMap as HashMap;
 
 use crate::layout::{Color, Px};
+use crate::text_error::TextError;
 use crate::text_source::{ContentCache, Paragraph, ParagraphLine, TextContent, TextRangeError};
 
 #[path = "text_context_cache.rs"]
@@ -298,24 +299,33 @@ pub trait TextEngine {
     /// Measure a validated line with its complete paragraph context.
     /// Custom engines keep isolated-line behavior by default; this fallback
     /// does not establish bidirectional paragraph support.
-    fn measure_paragraph_line(&self, line: &ParagraphLine, font: &FontSpec) -> LineMetrics {
-        self.measure_line(line.text(), font)
+    ///
+    /// # Errors
+    /// An adapter returns its preparation or measurement error.
+    fn measure_paragraph_line(&self, line: &ParagraphLine, font: &FontSpec) -> Result<LineMetrics, TextError> {
+        Ok(self.measure_line(line.text(), font))
     }
 
     /// Raster the same contextual line used by measurement and editing.
     /// The compatibility default calls the existing isolated-line entry.
+    ///
+    /// # Errors
+    /// An adapter returns its preparation or rasterization error; empty ink is `Ok(None)`.
     fn raster_paragraph_line(
         &self, line: &ParagraphLine, font: &FontSpec, color: Color, scale: usize,
-    ) -> Option<TextRaster> {
-        self.raster_line(line.text(), font, color, scale)
+    ) -> Result<Option<TextRaster>, TextError> {
+        Ok(self.raster_line(line.text(), font, color, scale))
     }
 
     /// Editing cells relative to the visible line, resolved with its paragraph.
     /// The compatibility default preserves legacy line-only geometry.
+    ///
+    /// # Errors
+    /// An adapter returns its preparation or geometry error; unsupported geometry is `Ok(None)`.
     fn paragraph_line_geometry(
         &self, line: &ParagraphLine, font: &FontSpec,
-    ) -> Option<crate::text_geometry::LineGeometry> {
-        self.line_geometry(line.text(), font)
+    ) -> Result<Option<crate::text_geometry::LineGeometry>, TextError> {
+        Ok(self.line_geometry(line.text(), font))
     }
 
     /// Editable geometry from the same complete line used by measurement and
@@ -530,18 +540,18 @@ pub(crate) fn line_caret_x(
     font: &FontSpec,
     engine: &dyn TextEngine,
     cache: &MeasureCache,
-) -> Px {
-    if let Some(geometry) = cache.get_or_paragraph_geometry(line, font, engine) {
-        return geometry.caret_x(byte, affinity);
+) -> Result<Px, TextError> {
+    if let Some(geometry) = cache.get_or_paragraph_geometry(line, font, engine)? {
+        return Ok(geometry.caret_x(byte, affinity));
     }
     let text = line.text();
     let byte = crate::text_input::clamp_to_boundary(text, byte);
     let head = cache.get_or_measure(&text[..byte], font, engine).width;
-    if crate::text_input::reads_right_to_left(text) {
-        cache.get_or_measure_paragraph(line, font, engine).width - head
+    Ok(if crate::text_input::reads_right_to_left(text) {
+        cache.get_or_measure_paragraph(line, font, engine)?.width - head
     } else {
         head
-    }
+    })
 }
 
 /// Resolve a visual coordinate and retain its native directional affinity.
@@ -551,20 +561,20 @@ pub(crate) fn line_hit(
     font: &FontSpec,
     engine: &dyn TextEngine,
     cache: &MeasureCache,
-) -> crate::text_geometry::CaretHit {
-    if let Some(geometry) = cache.get_or_paragraph_geometry(line, font, engine) {
-        return geometry.hit_test(x);
+) -> Result<crate::text_geometry::CaretHit, TextError> {
+    if let Some(geometry) = cache.get_or_paragraph_geometry(line, font, engine)? {
+        return Ok(geometry.hit_test(x));
     }
     let text = line.text();
     let along = if crate::text_input::reads_right_to_left(text) {
-        cache.get_or_measure_paragraph(line, font, engine).width - x
+        cache.get_or_measure_paragraph(line, font, engine)?.width - x
     } else {
         x
     };
-    crate::text_geometry::CaretHit {
+    Ok(crate::text_geometry::CaretHit {
         byte: caret_from_x(text, along, font, engine, cache),
         affinity: crate::text_geometry::CaretAffinity::Downstream,
-    }
+    })
 }
 
 /// Disjoint visual selection bands of the complete line, in local coordinates.
@@ -574,17 +584,17 @@ pub(crate) fn line_spans(
     font: &FontSpec,
     engine: &dyn TextEngine,
     cache: &MeasureCache,
-) -> Vec<std::ops::Range<Px>> {
-    if let Some(geometry) = cache.get_or_paragraph_geometry(line, font, engine) {
-        return geometry.selection_spans(bytes);
+) -> Result<Vec<std::ops::Range<Px>>, TextError> {
+    if let Some(geometry) = cache.get_or_paragraph_geometry(line, font, engine)? {
+        return Ok(geometry.selection_spans(bytes));
     }
     if bytes.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let affinity = crate::text_geometry::CaretAffinity::Downstream;
-    let a = line_caret_x(line, bytes.start, affinity, font, engine, cache);
-    let b = line_caret_x(line, bytes.end, affinity, font, engine, cache);
-    std::iter::once(a.min(b)..a.max(b)).collect()
+    let a = line_caret_x(line, bytes.start, affinity, font, engine, cache)?;
+    let b = line_caret_x(line, bytes.end, affinity, font, engine, cache)?;
+    Ok(std::iter::once(a.min(b)..a.max(b)).collect())
 }
 
 // MARK: - Line breaking (shape borrowed from the engine, breaking ours)
@@ -594,13 +604,16 @@ pub(crate) fn line_spans(
 /// breaks at extended grapheme boundaries (never less than one cluster). A
 /// cluster wider than the line overflows intact. Spaces hang at the end of the
 /// line (they do not force a break — the classic behavior).
+///
+/// # Errors
+/// Returns a text or range error if contextual text cannot be prepared or used.
 pub fn break_lines(
     text: &str,
     font: &FontSpec,
     max_width: Px,
     engine: &dyn TextEngine,
     cache: &MeasureCache,
-) -> Vec<(usize, usize)> {
+) -> Result<Vec<(usize, usize)>, TextError> {
     let mut lines = Vec::new();
     let mut paragraph = 0usize;
     loop {
@@ -611,9 +624,11 @@ pub fn break_lines(
             .find('\n')
             .map(|offset| paragraph + offset)
             .unwrap_or(text.len());
-        wrap_paragraph(text, paragraph, stop, font, max_width, engine, cache, &mut lines);
+        wrap_paragraph(
+            text, paragraph, stop, font, max_width, engine, cache, &mut lines,
+        )?;
         if stop == text.len() {
-            return lines;
+            return Ok(lines);
         }
         paragraph = stop + 1;
     }
@@ -632,27 +647,39 @@ fn wrap_paragraph(
     engine: &dyn TextEngine,
     cache: &MeasureCache,
     lines: &mut Vec<(usize, usize)>,
-) {
+) -> Result<(), TextError> {
     let text_paragraph = &text[start..stop];
     // The printable-ASCII bound avoids preparing thousands of short note rows.
-    if text_paragraph.is_empty() || (text_paragraph.bytes().all(|byte| (0x20..0x7f).contains(&byte))
-        && u32::try_from(text_paragraph.len()).is_ok_and(|count| cache.ascii_advance(font, engine) * Px::from(count) <= max_width))
+    if text_paragraph.is_empty()
+        || (text_paragraph
+            .bytes()
+            .all(|byte| (0x20..0x7f).contains(&byte))
+            && u32::try_from(text_paragraph.len()).is_ok_and(|count| {
+                cache.ascii_advance(font, engine) * Px::from(count) <= max_width
+            }))
     {
         lines.push((start, stop));
-        return;
+        return Ok(());
     }
     // The caller delimits this range at hard LF boundaries.
-    let paragraph = cache.paragraph(text_paragraph).expect("wrap input is one hard paragraph");
-    if cache.get_or_measure_paragraph(&paragraph.full_line(), font, engine).width <= max_width {
+    let paragraph = cache
+        .paragraph(text_paragraph)
+        .expect("wrap input is one hard paragraph");
+    if cache
+        .get_or_measure_paragraph(&paragraph.full_line(), font, engine)?
+        .width
+        <= max_width
+    {
         lines.push((start, stop));
-        return;
+        return Ok(());
     }
     // All candidates below come from the paragraph's grapheme table, so they
     // are ordered, scalar-aligned and confined to this LF-delimited paragraph.
-    let measure = |from: usize, to: usize| {
-        let line = paragraph.line(from - start..to - start)
+    let measure = |from: usize, to: usize| -> Result<Px, TextError> {
+        let line = paragraph
+            .line(from - start..to - start)
             .expect("wrap candidates are validated grapheme boundaries of this paragraph");
-        cache.get_or_measure_paragraph(&line, font, engine).width
+        Ok(cache.get_or_measure_paragraph(&line, font, engine)?.width)
     };
     // Resolve boundaries once for this paragraph: every token and forced
     // break must use them, including spaces carrying combining marks. The
@@ -671,7 +698,7 @@ fn wrap_paragraph(
         }
 
         if !is_space {
-            let width = measure(line_start, byte(token_end));
+            let width = measure(line_start, byte(token_end))?;
             if width > max_width && byte(cursor) > line_start {
                 // The spaces already walked hang at the previous line's end.
                 lines.push((line_start, byte(cursor)));
@@ -683,8 +710,7 @@ fn wrap_paragraph(
                 // narrower scalar prefix would corrupt the visible character.
                 let mut end = cursor + 1;
                 for candidate in cursor + 2..=token_end {
-                    if measure(line_start, byte(candidate)) > max_width
-                    {
+                    if measure(line_start, byte(candidate))? > max_width {
                         break;
                     }
                     end = candidate;
@@ -702,6 +728,7 @@ fn wrap_paragraph(
     if line_start < stop {
         lines.push((line_start, stop));
     }
+    Ok(())
 }
 
 /// How many leading bytes two strings share — compared in blocks, which
@@ -747,7 +774,7 @@ fn rewrap(
     max_width: Px,
     engine: &dyn TextEngine,
     cache: &MeasureCache,
-) -> Vec<(usize, usize)> {
+) -> Result<Vec<(usize, usize)>, TextError> {
     let (a, b) = (old.as_bytes(), new.as_bytes());
     let prefix = common_prefix(a, b);
     let suffix = common_suffix(a, b, a.len().min(b.len()) - prefix);
@@ -755,7 +782,10 @@ fn rewrap(
     // one the edit begins in to the end of the one it ends in (a break
     // typed at the end of a line takes the next paragraph along, which
     // costs one more wrap and keeps the rule simple)
-    let start = b[..prefix].iter().rposition(|&byte| byte == b'\n').map_or(0, |at| at + 1);
+    let start = b[..prefix]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |at| at + 1);
     let changed_end = b.len() - suffix;
     let end_new = b[changed_end..]
         .iter()
@@ -769,8 +799,12 @@ fn rewrap(
     lines.extend_from_slice(&old_lines[..head]);
     let mut paragraph = start;
     loop {
-        let stop = new[paragraph..end_new].find('\n').map_or(end_new, |at| paragraph + at);
-        wrap_paragraph(new, paragraph, stop, font, max_width, engine, cache, &mut lines);
+        let stop = new[paragraph..end_new]
+            .find('\n')
+            .map_or(end_new, |at| paragraph + at);
+        wrap_paragraph(
+            new, paragraph, stop, font, max_width, engine, cache, &mut lines,
+        )?;
         if stop == end_new {
             break;
         }
@@ -778,9 +812,12 @@ fn rewrap(
     }
     let grown = b.len() as isize - a.len() as isize;
     lines.extend(old_lines[tail..].iter().map(|&(line_start, line_end)| {
-        ((line_start as isize + grown) as usize, (line_end as isize + grown) as usize)
+        (
+            (line_start as isize + grown) as usize,
+            (line_end as isize + grown) as usize,
+        )
     }));
-    lines
+    Ok(lines)
 }
 
 // MARK: - Measurement cache
@@ -926,17 +963,29 @@ impl MeasureCache {
     }
 
     /// Natural width and font box across the text's hard paragraphs.
-    pub(crate) fn measure_text(&self, text: &str, font: &FontSpec, engine: &dyn TextEngine) -> LineMetrics {
-        let mut result = LineMetrics { width: 0.0, ascent: 0.0, descent: 0.0 };
+    pub(crate) fn measure_text(
+        &self,
+        text: &str,
+        font: &FontSpec,
+        engine: &dyn TextEngine,
+    ) -> Result<LineMetrics, TextError> {
+        let mut result = LineMetrics {
+            width: 0.0,
+            ascent: 0.0,
+            descent: 0.0,
+        };
         for part in text.split('\n') {
             // split excludes the LF separators, including on empty final paragraphs.
-            let line = self.paragraph(part).expect("split yields one hard paragraph").full_line();
-            let metrics = self.get_or_measure_paragraph(&line, font, engine);
+            let line = self
+                .paragraph(part)
+                .expect("split yields one hard paragraph")
+                .full_line();
+            let metrics = self.get_or_measure_paragraph(&line, font, engine)?;
             result.width = result.width.max(metrics.width);
             result.ascent = result.ascent.max(metrics.ascent);
             result.descent = result.descent.max(metrics.descent);
         }
-        result
+        Ok(result)
     }
 
     /// Index this shared source once and reuse unchanged paragraph values.
@@ -950,33 +999,49 @@ impl MeasureCache {
 
     /// Measure a line without discarding its paragraph or aliasing equal
     /// visible slices from different directional contexts.
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
     pub fn get_or_measure_paragraph(
-        &self, line: &ParagraphLine, font: &FontSpec, engine: &dyn TextEngine,
-    ) -> LineMetrics {
+        &self,
+        line: &ParagraphLine,
+        font: &FontSpec,
+        engine: &dyn TextEngine,
+    ) -> Result<LineMetrics, TextError> {
         let key = font.key();
         if let Some(metrics) = self.contextual.borrow().metrics(key, line) {
             crate::stats::note_measure(true);
-            return metrics;
+            return Ok(metrics);
         }
         crate::stats::note_measure(false);
-        let value = engine.measure_paragraph_line(line, font);
+        let value = engine.measure_paragraph_line(line, font)?;
         self.contextual.borrow_mut().set_metrics(key, line, value);
-        value
+        Ok(value)
     }
 
     /// Cache contextual native geometry, including an unsupported answer.
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
     pub fn get_or_paragraph_geometry(
-        &self, line: &ParagraphLine, font: &FontSpec, engine: &dyn TextEngine,
-    ) -> Option<std::rc::Rc<crate::text_geometry::LineGeometry>> {
+        &self,
+        line: &ParagraphLine,
+        font: &FontSpec,
+        engine: &dyn TextEngine,
+    ) -> Result<Option<std::rc::Rc<crate::text_geometry::LineGeometry>>, TextError> {
         let key = font.key();
         match self.contextual.borrow().geometry(key, line) {
             context_cache::Geometry::Unqueried => {}
-            context_cache::Geometry::Unsupported => return None,
-            context_cache::Geometry::Ready(value) => return Some(value),
+            context_cache::Geometry::Unsupported => return Ok(None),
+            context_cache::Geometry::Ready(value) => return Ok(Some(value)),
         }
-        let value = engine.paragraph_line_geometry(line, font).map(std::rc::Rc::new);
-        self.contextual.borrow_mut().set_geometry(key, line, value.clone());
-        value
+        let value = engine
+            .paragraph_line_geometry(line, font)?
+            .map(std::rc::Rc::new);
+        self.contextual
+            .borrow_mut()
+            .set_geometry(key, line, value.clone());
+        Ok(value)
     }
 
     /// Cache the complete line's native geometry, including unsupported answers.
@@ -1039,13 +1104,16 @@ impl MeasureCache {
     }
 
     /// The text's breaks for THIS width (quantized in thousandths).
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
     pub fn get_or_break(
         &self,
         text: &str,
         font: &FontSpec,
         max_width: Px,
         engine: &dyn TextEngine,
-    ) -> BreakLines {
+    ) -> Result<BreakLines, TextError> {
         let mode = (font.key(), (max_width * 1000.0).round() as u32);
         if let Some((broken, used)) = self
             .breaks
@@ -1054,16 +1122,15 @@ impl MeasureCache {
             .and_then(|by_text| by_text.get(text))
         {
             used.set(self.frame.get());
-            return broken.clone();
+            return Ok(broken.clone());
         }
-        let broken = std::rc::Rc::new(break_lines(text, font, max_width, engine, self));
-        self.breaks
-            .borrow_mut()
-            .entry(mode)
-            .or_default()
-            .insert(text.to_string(), (broken.clone(), std::cell::Cell::new(self.frame.get())));
+        let broken = std::rc::Rc::new(break_lines(text, font, max_width, engine, self)?);
+        self.breaks.borrow_mut().entry(mode).or_default().insert(
+            text.to_string(),
+            (broken.clone(), std::cell::Cell::new(self.frame.get())),
+        );
         self.entries.set(self.entries.get() + 1);
-        broken
+        Ok(broken)
     }
 
     /// A multi-line field's visual lines — what [`MeasureCache::get_or_break`]
@@ -1074,6 +1141,9 @@ impl MeasureCache {
     /// being typed, and the cache holds one copy of the text per field,
     /// not one per keystroke. `shared` is the caller's own handle on the
     /// text, adopted so the next frame's question is a pointer compare.
+    ///
+    /// # Errors
+    /// Returns a text or range error if contextual text cannot be prepared or used.
     pub fn field_lines(
         &self,
         path: &str,
@@ -1082,31 +1152,41 @@ impl MeasureCache {
         font: &FontSpec,
         max_width: Px,
         engine: &dyn TextEngine,
-    ) -> BreakLines {
+    ) -> Result<BreakLines, TextError> {
         let mode = (font.key(), (max_width * 1000.0).round() as u32);
         let now = self.frame.get();
         let owned = || shared.cloned().unwrap_or_else(|| Arc::from(text));
         let mut fields = self.fields.borrow_mut();
-        if let Some(kept) = fields.get_mut(path).and_then(|all| all.iter_mut().find(|kept| kept.mode == mode)) {
+        if let Some(kept) = fields
+            .get_mut(path)
+            .and_then(|all| all.iter_mut().find(|kept| kept.mode == mode))
+        {
             kept.used.set(now);
-            let same = shared.is_some_and(|handle| Arc::ptr_eq(handle, &kept.text)) || *kept.text == *text;
+            let same =
+                shared.is_some_and(|handle| Arc::ptr_eq(handle, &kept.text)) || *kept.text == *text;
             if !same {
-                let lines = rewrap(&kept.text, &kept.lines, text, font, max_width, engine, self);
+                let lines = rewrap(&kept.text, &kept.lines, text, font, max_width, engine, self)?;
                 kept.lines = std::rc::Rc::new(lines);
             }
             if !same || shared.is_some() {
                 kept.text = owned();
             }
-            return kept.lines.clone();
+            return Ok(kept.lines.clone());
         }
-        let lines = std::rc::Rc::new(break_lines(text, font, max_width, engine, self));
-        let fresh = FieldLines { mode, text: owned(), lines: lines.clone(), used: std::cell::Cell::new(now) };
+        let lines = std::rc::Rc::new(break_lines(text, font, max_width, engine, self)?);
+        let fresh = FieldLines {
+            mode,
+            text: owned(),
+            lines: lines.clone(),
+            used: std::cell::Cell::new(now),
+        };
         match fields.get_mut(path) {
             Some(all) => {
                 // a field seen at more widths than it keeps forgets the
                 // one it used longest ago
                 if all.len() >= FIELD_WIDTHS_KEPT
-                    && let Some(oldest) = (0..all.len()).max_by_key(|&at| now.wrapping_sub(all[at].used.get()))
+                    && let Some(oldest) =
+                        (0..all.len()).max_by_key(|&at| now.wrapping_sub(all[at].used.get()))
                 {
                     all.swap_remove(oldest);
                 }
@@ -1116,7 +1196,7 @@ impl MeasureCache {
                 fields.insert(path.to_string(), vec![fresh]);
             }
         }
-        lines
+        Ok(lines)
     }
 
     /// The widest printable ASCII glyph of `font`, with a margin for the
@@ -1185,7 +1265,7 @@ mod tests {
             let width = [24.0, 40.0, 64.0, 100.0, 1000.0][dice.below(5)];
             let old_len = dice.below(40);
             let old = words(&mut dice, old_len);
-            let old_lines = break_lines(&old, &font, width, &PixelFont, &cache);
+            let old_lines = break_lines(&old, &font, width, &PixelFont, &cache).unwrap();
             // an edit: a run replaced by another, anywhere (char boundaries)
             let bounds: Vec<usize> = old.char_indices().map(|(at, _)| at).chain([old.len()]).collect();
             let first = dice.below(bounds.len());
@@ -1194,9 +1274,10 @@ mod tests {
             let inserted_len = dice.below(6);
             let inserted = words(&mut dice, inserted_len);
             let new = format!("{}{}{}", &old[..from], inserted, &old[to..]);
-            let rewrapped = rewrap(&old, &old_lines, &new, &font, width, &PixelFont, &cache);
-            let fresh = break_lines(&new, &font, width, &PixelFont, &cache);
-            assert_eq!(rewrapped, fresh, "round {round}: {old:?} → {new:?} at width {width}");
+            let rewrapped = rewrap(&old, &old_lines, &new, &font, width, &PixelFont, &cache).unwrap();
+            let fresh = break_lines(&new, &font, width, &PixelFont, &cache).unwrap();
+            assert_eq!(rewrapped, fresh, "round {round}: {old:?} → {new:?} at width {width}"
+            );
         }
     }
 
@@ -1209,8 +1290,9 @@ mod tests {
             cache.begin_frame();
             note.insert(note.len() / 2, if stroke % 7 == 6 { '\n' } else { 'x' });
             let text: Arc<str> = Arc::from(note.as_str());
-            let kept = cache.field_lines("note", &text, Some(&text), &font, 200.0, &PixelFont);
-            assert_eq!(*kept, break_lines(&note, &font, 200.0, &PixelFont, &cache), "stroke {stroke}");
+            let kept = cache.field_lines("note", &text, Some(&text), &font, 200.0, &PixelFont)
+                .unwrap();
+            assert_eq!(*kept, break_lines(&note, &font, 200.0, &PixelFont, &cache).unwrap(), "stroke {stroke}");
         }
         assert_eq!(cache.fields.borrow().len(), 1, "one field");
         assert_eq!(cache.fields.borrow()["note"].len(), 1, "one width, one text");
@@ -1225,13 +1307,13 @@ mod tests {
     fn a_short_ascii_paragraph_is_one_line_without_shaping() {
         let cache = MeasureCache::default();
         let font = FontSpec::DEFAULT;
-        let lines = break_lines("short\nlines\nhere", &font, 1000.0, &PixelFont, &cache);
+        let lines = break_lines("short\nlines\nhere", &font, 1000.0, &PixelFont, &cache).unwrap();
         assert_eq!(lines, vec![(0, 5), (6, 11), (12, 16)]);
         assert_eq!(cache.len(), 0, "the bound decided: no string was measured");
         // a paragraph past the bound (30 × 5 cells × 8 px × 1.05) that
         // still fits is measured once, whole
         let long = "word ".repeat(30);
-        let lines = break_lines(&long, &font, 1230.0, &PixelFont, &cache);
+        let lines = break_lines(&long, &font, 1230.0, &PixelFont, &cache).unwrap();
         assert_eq!(lines, vec![(0, long.len())]);
         assert_eq!(cache.len(), 1, "one measure of the whole paragraph");
     }
@@ -1241,14 +1323,17 @@ mod tests {
         let cache = MeasureCache::default();
         cache.begin_frame();
 
-        let wide = cache.get_or_break("aa bb cc", &FontSpec::DEFAULT, 100.0, &PixelFont);
+        let wide = cache.get_or_break("aa bb cc", &FontSpec::DEFAULT, 100.0, &PixelFont)
+            .unwrap();
         assert_eq!(wide.len(), 1, "fits whole");
-        let narrow = cache.get_or_break("aa bb cc", &FontSpec::DEFAULT, 40.0, &PixelFont);
+        let narrow = cache.get_or_break("aa bb cc", &FontSpec::DEFAULT, 40.0, &PixelFont)
+            .unwrap();
         assert_eq!(narrow.len(), 2, "widths NEVER share an entry");
 
         // age: the next frame returns the SAME allocation
         cache.begin_frame();
-        let promoted = cache.get_or_break("aa bb cc", &FontSpec::DEFAULT, 40.0, &PixelFont);
+        let promoted = cache.get_or_break("aa bb cc", &FontSpec::DEFAULT, 40.0, &PixelFont)
+            .unwrap();
         assert!(std::rc::Rc::ptr_eq(&narrow, &promoted));
     }
 

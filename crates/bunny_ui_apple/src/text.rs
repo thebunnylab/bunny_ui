@@ -23,6 +23,8 @@
 
 #[path = "text_geometry.rs"]
 mod geometry;
+#[path = "text_paragraph.rs"]
+mod paragraph;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -368,11 +370,15 @@ unsafe fn make_line(text: &str, font: CTFontRef, spec: &FontSpec) -> CTLineRef {
 /// The Mac text engine. Single-thread, like the rest of the shell.
 pub struct CoreTextEngine {
     fonts: RefCell<HashMap<FontKey, OwnedFont>>,
+    paragraphs: RefCell<paragraph::ParagraphCache>,
 }
 
 impl CoreTextEngine {
     pub fn new() -> Self {
-        CoreTextEngine { fonts: RefCell::new(HashMap::new()) }
+        CoreTextEngine {
+            fonts: RefCell::new(HashMap::new()),
+            paragraphs: RefCell::default(),
+        }
     }
 
     /// Add a face this process SHIPS to the ones it can shape.
@@ -399,6 +405,7 @@ impl CoreTextEngine {
         // this call cached the fallback it got. Drop it, or the very face
         // just registered stays invisible for the life of the app.
         self.fonts.borrow_mut().clear();
+        *self.paragraphs.borrow_mut() = paragraph::ParagraphCache::default();
         unsafe {
             let provider = crate::ffi::CGDataProviderCreateWithData(
                 std::ptr::null_mut(),
@@ -467,6 +474,31 @@ unsafe fn cf_string_out(string: CFStringRef) -> Option<String> {
 }
 
 impl TextEngine for CoreTextEngine {
+    fn measure_paragraph_line(
+        &self,
+        line: &bunny_ui::text_source::ParagraphLine,
+        font: &FontSpec,
+    ) -> Result<LineMetrics, bunny_ui::text_error::TextError> {
+        self.try_measure_paragraph_line(line, font)
+    }
+    fn paragraph_line_geometry(
+        &self,
+        line: &bunny_ui::text_source::ParagraphLine,
+        font: &FontSpec,
+    ) -> Result<Option<bunny_ui::text_geometry::LineGeometry>, bunny_ui::text_error::TextError>
+    {
+        self.try_paragraph_line_geometry(line, font)
+    }
+    fn raster_paragraph_line(
+        &self,
+        line: &bunny_ui::text_source::ParagraphLine,
+        font: &FontSpec,
+        color: Color,
+        scale: usize,
+    ) -> Result<Option<TextRaster>, bunny_ui::text_error::TextError> {
+        self.try_raster_paragraph_line(line, font, color, scale)
+    }
+
     fn line_geometry(
         &self,
         text: &str,
@@ -672,7 +704,7 @@ mod tests {
         let engine = CoreTextEngine::new();
         let cache = MeasureCache::default();
         let text = "hello world hello world";
-        let lines = break_lines(text, &FontSpec::DEFAULT, 60.0, &engine, &cache);
+        let lines = break_lines(text, &FontSpec::DEFAULT, 60.0, &engine, &cache).unwrap();
 
         assert!(lines.len() > 1, "60px does not hold the sentence: {lines:?}");
         // contiguous coverage of the whole text, breaks on clean boundaries

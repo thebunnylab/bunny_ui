@@ -117,8 +117,8 @@ fn mount() -> (Runtime, Page) {
     let runtime = Runtime::new();
     runtime.set_overlay_layers(true);
     // the first frame mounts the tasks and paints everything
-    let _ = runtime.display_frame(&page, SIZE);
-    let _ = runtime.display_frame(&page, SIZE);
+    let _ = runtime.display_frame(&page, SIZE).unwrap();
+    let _ = runtime.display_frame(&page, SIZE).unwrap();
     let _ = stats::take();
     (runtime, page)
 }
@@ -126,11 +126,11 @@ fn mount() -> (Runtime, Page) {
 /// One wake of the shell's: the clock moves, the sleepers due run, and the
 /// engine is asked whether a frame is owed — the Wake road, headless.
 fn wake(runtime: &Runtime, page: &Page, dt: f64) -> bunny_ui::runtime::FrameNeed {
-    let _ = runtime.tick(dt);
+    let _ = runtime.tick(dt).unwrap();
     runtime.poll_tasks();
     let need = runtime.frame_need();
     if need.any() {
-        let _ = runtime.display_frame(page, SIZE);
+        let _ = runtime.display_frame(page, SIZE).unwrap();
     }
     need
 }
@@ -173,7 +173,7 @@ fn a_value_only_a_box_paints_repaints_the_box_not_the_scene() {
     assert!(need.paints && !need.wrote && !need.dirty, "{need:?}");
     assert!(need.only_paints(), "{need:?}");
     // the box has no overlay island: the frame's road, once
-    let (blits, plain) = runtime.repaint_dirty_paints(1);
+    let (blits, plain) = runtime.repaint_dirty_paints(1).unwrap();
     assert!(blits.is_empty());
     assert!(plain);
 }

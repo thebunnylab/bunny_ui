@@ -1345,15 +1345,17 @@ pub fn present(
     canvas: Color,
     text: &dyn TextEngine,
     images: &dyn ImageEngine,
-) {
+) -> Result<(), bunny_ui::gpu::walk::RenderError> {
+        Ok({
     if BACKGROUNDED.with(Cell::get) || WINDOW.with(Cell::get).is_null() {
-        return;
+        return Ok(());
     }
     match ROAD.with(Cell::get) {
         Road::None => {}
-        Road::Vulkan => present_vulkan(display, size, scale, canvas, text, images),
-        Road::Cpu => present_cpu(display, size, scale, canvas, text, images),
+        Road::Vulkan => present_vulkan(display, size, scale, canvas, text, images)?,
+        Road::Cpu => present_cpu(display, size, scale, canvas, text, images)?,
     }
+        })
 }
 
 fn present_vulkan(
@@ -1363,7 +1365,8 @@ fn present_vulkan(
     canvas: Color,
     text: &dyn TextEngine,
     images: &dyn ImageEngine,
-) {
+) -> Result<(), bunny_ui::gpu::walk::RenderError> {
+        Ok({
     let present_once = || {
         PRESENTER.with(|slot| {
             slot.borrow_mut().as_mut().map(|presenter| {
@@ -1371,7 +1374,7 @@ fn present_vulkan(
             })
         })
     };
-    match present_once() {
+    match present_once().transpose()? {
         None | Some(Presented::Ok) => {}
         Some(Presented::SurfaceLost) => {
             // the surface went with a window; the one standing now
@@ -1385,25 +1388,26 @@ fn present_vulkan(
                 })
             });
             if attached {
-                let _ = present_once();
+                let _ = present_once().transpose()?;
             } else {
                 aerr!("the surface is lost and the window refuses another — the CPU floor takes over");
                 PRESENTER.with(|slot| drop(slot.borrow_mut().take()));
                 install_cpu();
-                present_cpu(display, size, scale, canvas, text, images);
+                present_cpu(display, size, scale, canvas, text, images)?;
             }
         }
         Some(Presented::DeviceLost) => {
             PRESENTER.with(|slot| drop(slot.borrow_mut().take()));
             if !RECREATE_SPENT.with(|spent| spent.replace(true)) && install_gpu() {
-                let _ = present_once();
-                return;
+                let _ = present_once().transpose()?;
+                return Ok(());
             }
             aerr!("the vulkan device is lost — the CPU floor takes over");
             install_cpu();
-            present_cpu(display, size, scale, canvas, text, images);
+            present_cpu(display, size, scale, canvas, text, images)?;
         }
     }
+        })
 }
 
 /// The floor: the retained surface rasterizes what changed, and the
@@ -1417,15 +1421,16 @@ fn present_cpu(
     canvas: Color,
     text: &dyn TextEngine,
     images: &dyn ImageEngine,
-) {
+) -> Result<(), bunny_ui::gpu::walk::RenderError> {
+        Ok({
     let physical = (
         (size.width * scale as f64).round().max(0.0) as usize,
         (size.height * scale as f64).round().max(0.0) as usize,
     );
     if physical.0 == 0 || physical.1 == 0 {
-        return;
+        return Ok(());
     }
-    CPU.with(|slot| {
+    CPU.with(|slot| -> Result<(), bunny_ui::gpu::walk::RenderError> {
         let mut slot = slot.borrow_mut();
         let stale = match &*slot {
             Some((retained, retained_scale, retained_canvas)) => {
@@ -1445,12 +1450,14 @@ fn present_cpu(
             ));
         }
         let (retained, _, _) = slot.as_mut().expect("surface for the frame");
-        let damage = retained.frame(display.clone(), text, images);
+        let damage = retained.frame(display.clone(), text, images)?;
         if damage.is_empty() && !fresh {
-            return;
+            return Ok(());
         }
         blit(retained.bitmap().width(), retained.bitmap().height(), retained.rgba());
-    });
+        Ok(())
+    })?;
+        })
 }
 
 /// Copies an RGBA picture into the window's next buffer and posts it.

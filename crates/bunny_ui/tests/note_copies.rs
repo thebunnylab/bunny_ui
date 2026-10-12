@@ -67,17 +67,19 @@ fn a_keystroke_in_a_long_note_copies_it_once() {
     let panel = Panel { note: State::new(note) };
     let runtime = Runtime::new();
     let window = Size { width: 400.0, height: 300.0 };
-    runtime.display_frame(&panel, window);
-    let layout = runtime.layout(&panel, Proposal::exact(window));
+    runtime.display_frame(&panel, window).unwrap();
+    let layout = runtime.layout(&panel, Proposal::exact(window)).unwrap();
     let path = layout.hits.first().expect("the field is a target").0.clone();
     runtime.focus(&path);
     // the frame a shell draws after a stroke — the edit, the bodies, the
     // layout and the picture — and the input method's read of the field
     let stroke = |text: &str| {
         let before = copied();
-        assert!(runtime.key(EditCommand::Insert(text.into())).applied);
-        runtime.display_frame(&panel, window);
-        let snapshot = runtime.ime_snapshot().expect("the focused note answers the input method");
+        assert!(runtime.key(EditCommand::Insert(text.into())).unwrap()
+                .applied);
+        runtime.display_frame(&panel, window).unwrap();
+        let snapshot = runtime.ime_snapshot()
+            .unwrap().expect("the focused note answers the input method");
         assert_eq!(snapshot.text.len(), panel.note.with(String::len), "the snapshot is the note");
         copied() - before
     };
@@ -98,20 +100,23 @@ fn a_keystroke_in_a_long_note_copies_it_once() {
 fn an_input_method_read_and_collection_release_the_previous_text_version() {
     use std::sync::Arc;
 
-    let panel = Panel { note: State::new("line — é 日本 🦀\n".repeat(300)) };
+    let panel = Panel { note: State::new("line — é 日本 🦀\n".repeat(300)),
+    };
     let runtime = Runtime::new();
     let window = Size { width: 400.0, height: 300.0 };
-    runtime.display_frame(&panel, window);
-    let path = runtime.layout(&panel, Proposal::exact(window)).hits[0].0.clone();
+    runtime.display_frame(&panel, window).unwrap();
+    let path = runtime.layout(&panel, Proposal::exact(window))
+        .unwrap().hits[0].0.clone();
     runtime.focus(&path);
-    runtime.key(EditCommand::End(false));
+    runtime.key(EditCommand::End(false)).unwrap();
     for inserted in ["🦀", "é", "\n", "日本"] {
-        let old = runtime.ime_snapshot().expect("focused editor");
+        let old = runtime.ime_snapshot().unwrap().expect("focused editor");
         let lifetime = Arc::downgrade(&old.text);
         let old_units = old.selected.0;
-        assert!(runtime.key(EditCommand::Insert(inserted.into())).applied);
-        runtime.display_frame(&panel, window);
-        let current = runtime.ime_snapshot().expect("edited field");
+        assert!(runtime.key(EditCommand::Insert(inserted.into())).unwrap()
+                .applied);
+        runtime.display_frame(&panel, window).unwrap();
+        let current = runtime.ime_snapshot().unwrap().expect("edited field");
         assert_eq!(current.selected, (old_units + inserted.encode_utf16().count(), 0));
         assert!(current.text.starts_with(&*old.text), "an external snapshot remains immutable");
         // The native host collects the replaced layout after presenting.
@@ -120,31 +125,35 @@ fn an_input_method_read_and_collection_release_the_previous_text_version() {
         assert!(lifetime.upgrade().is_some());
         drop(old);
         assert!(lifetime.upgrade().is_none(), "the IME bridge must not retain the consumed predecessor after the old layout is collected");
-        assert_eq!(runtime.ime_snapshot().unwrap().selected, current.selected);
+        assert_eq!(runtime.ime_snapshot().unwrap().unwrap().selected, current.selected);
     }
 }
 
 #[test]
 fn the_first_input_method_read_also_consumes_the_predecessor() {
-    use std::sync::Arc;
     use bunny_ui::layout::DrawCommand;
+    use std::sync::Arc;
 
-    let panel = Panel { note: State::new("é 日本 🦀\n".repeat(300)) };
+    let panel = Panel { note: State::new("é 日本 🦀\n".repeat(300)),
+    };
     let runtime = Runtime::new();
     let window = Size { width: 400.0, height: 300.0 };
-    let display = runtime.display_frame(&panel, window);
+    let display = runtime.display_frame(&panel, window).unwrap();
     let old = display.iter().find_map(|command| match command {
         DrawCommand::TextLine { content, .. } => Some(Arc::downgrade(content.source())),
         _ => None,
     }).expect("the field painted its shared text");
     drop(display);
-    let path = runtime.layout(&panel, Proposal::exact(window)).hits[0].0.clone();
+    let path = runtime.layout(&panel, Proposal::exact(window)).unwrap()
+        .hits[0].0.clone();
     runtime.focus(&path);
-    runtime.key(EditCommand::End(false));
-    assert!(runtime.key(EditCommand::Insert("x".into())).applied);
-    runtime.display_frame(&panel, window);
+    runtime.key(EditCommand::End(false)).unwrap();
+    assert!(runtime.key(EditCommand::Insert("x".into())).unwrap()
+            .applied);
+    runtime.display_frame(&panel, window).unwrap();
     runtime.collect_garbage();
-    let snapshot = runtime.ime_snapshot().expect("first input-method read");
+    let snapshot = runtime.ime_snapshot()
+        .unwrap().expect("first input-method read");
     assert_eq!(snapshot.selected, (snapshot.text.encode_utf16().count(), 0));
     assert!(old.upgrade().is_none(), "even a full count no longer needs its predecessor");
 }
@@ -153,21 +162,24 @@ fn the_first_input_method_read_also_consumes_the_predecessor() {
 fn a_large_note_does_not_accumulate_obsolete_layout_snapshots_between_idles() {
     use std::sync::Arc;
 
-    let panel = Panel { note: State::new("line — é 日本 🦀\n".repeat(70_000)) };
+    let panel = Panel { note: State::new("line — é 日本 🦀\n".repeat(70_000)),
+    };
     let runtime = Runtime::new();
     let window = Size { width: 400.0, height: 300.0 };
-    runtime.display_frame(&panel, window);
-    let path = runtime.layout(&panel, Proposal::exact(window)).hits[0].0.clone();
+    runtime.display_frame(&panel, window).unwrap();
+    let path = runtime.layout(&panel, Proposal::exact(window))
+        .unwrap().hits[0].0.clone();
     runtime.focus(&path);
-    runtime.key(EditCommand::End(false));
-    let external = runtime.ime_snapshot().unwrap();
+    runtime.key(EditCommand::End(false)).unwrap();
+    let external = runtime.ime_snapshot().unwrap().unwrap();
     let oldest = Arc::downgrade(&external.text);
     runtime.collect_garbage();
     let mut generations = Vec::new();
     for inserted in ["é", "🦀", "日本", "\n"] {
-        assert!(runtime.key(EditCommand::Insert(inserted.into())).applied);
-        runtime.display_frame(&panel, window);
-        let snapshot = runtime.ime_snapshot().unwrap();
+        assert!(runtime.key(EditCommand::Insert(inserted.into())).unwrap()
+                .applied);
+        runtime.display_frame(&panel, window).unwrap();
+        let snapshot = runtime.ime_snapshot().unwrap().unwrap();
         assert!(snapshot.text.starts_with(&*external.text));
         assert_eq!(snapshot.selected, (snapshot.text.encode_utf16().count(), 0));
         generations.push(Arc::downgrade(&snapshot.text));

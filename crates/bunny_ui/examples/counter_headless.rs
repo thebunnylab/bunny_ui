@@ -53,10 +53,10 @@ fn main() {
 
     let size = Size { width: 160.0, height: 72.0 };
     println!("── count = 0 ──");
-    print!("{}", portrait(&runtime.paint(&counter, size)));
+    print!("{}", portrait(&runtime.paint(&counter, size).unwrap()));
 
     // three taps later (the rebuilt body revives the button through identity)
     counter.count.update(|n| *n += 3);
     println!("── count = 3 (after interaction) ──");
-    print!("{}", portrait(&runtime.paint(&counter, size)));
+    print!("{}", portrait(&runtime.paint(&counter, size).unwrap()));
 }

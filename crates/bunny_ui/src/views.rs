@@ -3375,7 +3375,7 @@ mod once_per_key_tests {
                 operate(&page, step - 1);
             }
             let _ = stats::take();
-            let patches = runtime.dom_frame(&page, SIZE);
+            let patches = runtime.dom_frame(&page, SIZE).unwrap();
             let frame = stats::take();
             seen.push(format!("{patches:?} ran {} reused {}", frame.entries_indexed, frame.diff_reused));
             built.push(page.built.replace(0));
@@ -3416,13 +3416,13 @@ mod once_per_key_tests {
         OWN.with(|own| own.borrow_mut().clear());
         let page = page(true, false, Shape::Plain, &[1, 2, 3]);
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&page, SIZE);
+        let _ = runtime.dom_frame(&page, SIZE).unwrap();
         let inner_of_2 = INNER.with(|inner| inner.borrow()[1]);
         let own_of_2 = OWN.with(|own| own.borrow()[1]);
         page.built.set(0);
         for step in [3, 4] {
             operate(&page, step);
-            let _ = runtime.dom_frame(&page, SIZE);
+            let _ = runtime.dom_frame(&page, SIZE).unwrap();
         }
         assert_eq!(page.built.get(), 0, "both frames kept every row");
         page.marks.borrow()[&2].set(99);
@@ -3439,14 +3439,14 @@ mod once_per_key_tests {
     fn a_kept_row_written_in_the_same_frame_runs() {
         let page = page(true, false, Shape::Plain, &[1, 2, 3, 4]);
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&page, SIZE);
+        let _ = runtime.dom_frame(&page, SIZE).unwrap();
         page.built.set(0);
         let mut now = (*page.items.get()).clone();
         now.swap(0, 3);
         now[1].label.set(Rc::from("written"));
         page.items.set(Rc::new(now));
         let _ = stats::take();
-        let _ = runtime.dom_frame(&page, SIZE);
+        let _ = runtime.dom_frame(&page, SIZE).unwrap();
         assert_eq!(stats::take().entries_indexed, 3, "the list, the written row and the component in it ran");
         assert_eq!(page.built.get(), 1, "the written row was built, and only it");
         let printed = runtime.render(&page);
@@ -3460,10 +3460,10 @@ mod once_per_key_tests {
     fn a_list_whose_rows_file_registrations_with_it_builds_every_row() {
         let page = page(true, false, Shape::Registers, &[1, 2, 3]);
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&page, SIZE);
+        let _ = runtime.dom_frame(&page, SIZE).unwrap();
         page.built.set(0);
         operate(&page, 3);
-        let _ = runtime.dom_frame(&page, SIZE);
+        let _ = runtime.dom_frame(&page, SIZE).unwrap();
         assert_eq!(page.built.get(), 3, "every row built again");
         assert!(crate::reconciler::context_active("line", None), "the rows still declare their context");
     }
@@ -3551,7 +3551,7 @@ mod once_per_key_tests {
                     page.items.set(Rc::new(items(&[1, 2])));
                 }
                 page.stand.set(stand);
-                seen.push(format!("{:?}", shown.dom_frame(&page, SIZE)));
+                seen.push(format!("{:?}", shown.dom_frame(&page, SIZE).unwrap()));
                 seen.push(printed.render(&page));
             }
             seen
@@ -3572,13 +3572,13 @@ mod once_per_key_tests {
             INNER.with(|inner| inner.borrow_mut().clear());
             let page = page(once, false, Shape::Plain, &[1, 2, 3, 4, 5, 6]);
             let runtime = Runtime::new();
-            let _ = runtime.dom_frame(&page, SIZE);
+            let _ = runtime.dom_frame(&page, SIZE).unwrap();
             let (moved, stayed) = INNER.with(|inner| (inner.borrow()[1], inner.borrow()[2]));
             // rows 2 and 5 trade places, row 3 keeps its own
             operate(&page, 0);
             moved.set(7);
             stayed.set(8);
-            let patches = format!("{:?}", runtime.dom_frame(&page, SIZE));
+            let patches = format!("{:?}", runtime.dom_frame(&page, SIZE).unwrap());
             for taps in ["taps 7", "taps 8"] {
                 assert!(patches.contains(taps), "the frame patched {taps:?} (once {once}): {patches}");
             }

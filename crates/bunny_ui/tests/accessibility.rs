@@ -55,7 +55,7 @@ fn an_initial_modal_action_survives_another_window_frame() {
     };
     let runtime = Runtime::scene("modal-owner");
     runtime.set_accessibility_enabled(true);
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     let button = runtime
         .accessibility_tree()
         .nodes()
@@ -71,7 +71,7 @@ fn an_initial_modal_action_survives_another_window_frame() {
     );
     let other = Runtime::scene("other-window");
     other.set_accessibility_enabled(true);
-    other.display_frame(&text("Keeper"), SIZE);
+    other.display_frame(&text("Keeper"), SIZE).unwrap();
     assert!(
         runtime
             .accessibility_action(button, Action::Activate)
@@ -79,27 +79,27 @@ fn an_initial_modal_action_survives_another_window_frame() {
     );
     assert_eq!(app.count.get(), 20);
     other.set_environment(|values| values.locale = Locale::new("fr-FR"));
-    other.display_frame(&text("Keeper"), SIZE);
+    other.display_frame(&text("Keeper"), SIZE).unwrap();
     assert!(
         runtime
             .accessibility_action(button, Action::Activate)
             .is_ok()
     );
     bunny_ui::code_changed();
-    other.display_frame(&text("Keeper"), SIZE);
+    other.display_frame(&text("Keeper"), SIZE).unwrap();
     assert!(
         runtime
             .accessibility_action(button, Action::Activate)
             .is_ok()
     );
     bunny_ui::theme::install(bunny_ui::theme::Theme::dark());
-    other.display_frame(&text("Keeper"), SIZE);
+    other.display_frame(&text("Keeper"), SIZE).unwrap();
     assert!(
         runtime
             .accessibility_action(button, Action::Activate)
             .is_ok()
     );
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     assert_eq!(
         app.count.get(),
         50,
@@ -122,7 +122,7 @@ fn semantic_names_values_and_actions_follow_the_real_controls() {
     let app = Form::new();
     let runtime = Runtime::new();
     runtime.set_accessibility_enabled(true);
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     let tree = runtime.accessibility_tree();
     let field = tree
         .nodes()
@@ -147,7 +147,7 @@ fn semantic_names_values_and_actions_follow_the_real_controls() {
     );
     assert_eq!(app.value.get(), "Dinner");
     app.title.set("Expense description".into());
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     let tree = runtime.accessibility_tree();
     let field = tree.node(field_id).unwrap();
     assert_eq!(field.label.as_ref(), "Expense description");
@@ -159,7 +159,7 @@ fn keyed_reordering_keeps_identity_and_removed_actions_are_rejected() {
     let app = Form::new();
     let runtime = Runtime::new();
     runtime.set_accessibility_enabled(true);
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     let row = runtime
         .accessibility_tree()
         .nodes()
@@ -168,7 +168,7 @@ fn keyed_reordering_keeps_identity_and_removed_actions_are_rejected() {
         .unwrap()
         .id;
     app.rows.set(vec![2, 1]);
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     assert_eq!(
         runtime
             .accessibility_tree()
@@ -181,7 +181,7 @@ fn keyed_reordering_keeps_identity_and_removed_actions_are_rejected() {
     assert!(runtime.accessibility_action(row, Action::Activate).is_ok());
     assert_eq!(app.count.get(), 2);
     app.rows.set(vec![1]);
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     assert!(runtime.accessibility_tree().node(row).is_none());
     assert!(!runtime.accessibility_action(row, Action::Activate).is_ok());
     assert_eq!(app.count.get(), 2);
@@ -191,10 +191,10 @@ fn keyed_reordering_keeps_identity_and_removed_actions_are_rejected() {
 fn collection_is_opt_in_and_does_not_change_the_picture() {
     let app = Form::new();
     let runtime = Runtime::new();
-    let before = runtime.display_frame(&app, SIZE);
+    let before = runtime.display_frame(&app, SIZE).unwrap();
     assert!(runtime.accessibility_tree().nodes().is_empty());
     runtime.set_accessibility_enabled(true);
-    let after = runtime.display_frame(&app, SIZE);
+    let after = runtime.display_frame(&app, SIZE).unwrap();
     assert_eq!(before.as_slice(), after.as_slice());
     assert!(!runtime.accessibility_tree().nodes().is_empty());
     runtime.set_accessibility_enabled(false);
@@ -229,7 +229,7 @@ fn password_values_are_redacted_and_modal_controls_are_the_only_targets() {
     };
     let runtime = Runtime::new();
     runtime.set_accessibility_enabled(true);
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     let tree = runtime.accessibility_tree();
     assert!(!format!("{tree:?}").contains("unexportable"));
     assert!(
@@ -262,7 +262,7 @@ fn password_values_are_redacted_and_modal_controls_are_the_only_targets() {
         .unwrap()
         .id;
     app.show_sheet.set(true);
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     let tree = runtime.accessibility_tree();
     assert_eq!(tree.nodes().len(), 1);
     assert_eq!(tree.nodes()[0].label.as_ref(), "In modal");
@@ -286,7 +286,7 @@ fn unsupported_actions_do_not_move_focus_or_call_a_different_control() {
     let app = Form::new();
     let runtime = Runtime::new();
     runtime.set_accessibility_enabled(true);
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     let tree = runtime.accessibility_tree();
     let save = tree
         .nodes()
@@ -308,7 +308,7 @@ fn a_removed_then_reinserted_key_cannot_inherit_an_old_native_handle() {
     let app = Form::new();
     let runtime = Runtime::new();
     runtime.set_accessibility_enabled(true);
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     let old = runtime
         .accessibility_tree()
         .nodes()
@@ -317,9 +317,9 @@ fn a_removed_then_reinserted_key_cannot_inherit_an_old_native_handle() {
         .unwrap()
         .id;
     app.rows.set(vec![1]);
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     app.rows.set(vec![1, 2]);
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     let current = runtime
         .accessibility_tree()
         .nodes()
@@ -357,7 +357,7 @@ fn explicit_names_do_not_replace_values_or_duplicate_button_labels() {
     };
     let runtime = Runtime::new();
     runtime.set_accessibility_enabled(true);
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     let tree = runtime.accessibility_tree();
     assert_eq!(tree.nodes().len(), 3);
     assert_eq!(tree.nodes()[0].label.as_ref(), "Explicit name");
@@ -367,7 +367,7 @@ fn explicit_names_do_not_replace_values_or_duplicate_button_labels() {
     assert_eq!(tree.nodes()[2].label.as_ref(), "Value");
     app.title.set("Changed title".into());
     app.value.set("Changed value".into());
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     assert_eq!(
         runtime.accessibility_tree().nodes()[2].label.as_ref(),
         "Changed value"
@@ -398,7 +398,8 @@ fn scrolling_exposes_only_intersecting_controls_with_clipped_bounds() {
             width: 120.0,
             height: 80.0,
         },
-    );
+    )
+        .unwrap();
     let tree = runtime.accessibility_tree();
     assert_eq!(tree.nodes().len(), 1, "{tree:?}");
     assert_eq!(tree.nodes()[0].label.as_ref(), "Visible");
@@ -412,8 +413,8 @@ fn handles_are_scoped_to_their_runtime_and_disabling_retires_them() {
     let app = Form::new();
     first.set_accessibility_enabled(true);
     second.set_accessibility_enabled(true);
-    first.display_frame(&app, SIZE);
-    second.display_frame(&app, SIZE);
+    first.display_frame(&app, SIZE).unwrap();
+    second.display_frame(&app, SIZE).unwrap();
     let id = first
         .accessibility_tree()
         .nodes()
@@ -425,7 +426,7 @@ fn handles_are_scoped_to_their_runtime_and_disabling_retires_them() {
     first.set_accessibility_enabled(false);
     assert!(first.accessibility_action(id, Action::Activate).is_err());
     first.set_accessibility_enabled(true);
-    first.display_frame(&app, SIZE);
+    first.display_frame(&app, SIZE).unwrap();
     assert!(first.accessibility_action(id, Action::Activate).is_err());
     let current = first
         .accessibility_tree()
@@ -445,14 +446,14 @@ fn snapshots_do_not_schedule_idle_frames_and_repeated_frames_keep_handles() {
     let app = Form::new();
     let runtime = Runtime::new();
     runtime.set_accessibility_enabled(true);
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     let before = runtime.accessibility_tree();
     assert!(!runtime.needs_frame());
     for _ in 0..5 {
         assert_eq!(runtime.accessibility_tree(), before);
     }
     assert!(!runtime.needs_frame());
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     assert_eq!(runtime.accessibility_tree(), before);
     assert!(!runtime.needs_frame());
 }
@@ -463,7 +464,7 @@ fn set_text_replaces_the_whole_value_even_during_ime_composition() {
     let app = Form::new();
     let runtime = Runtime::new();
     runtime.set_accessibility_enabled(true);
-    runtime.display_frame(&app, SIZE);
+    runtime.display_frame(&app, SIZE).unwrap();
     let field = runtime
         .accessibility_tree()
         .nodes()
@@ -475,7 +476,8 @@ fn set_text_replaces_the_whole_value_even_during_ime_composition() {
     runtime.key(EditCommand::SetMarked {
         text: " composing".into(),
         caret_utf16: (2, 0),
-    });
+    })
+        .unwrap();
     runtime
         .accessibility_action(field, Action::SetText("replacement".into()))
         .unwrap();
@@ -503,7 +505,8 @@ fn the_window_viewport_excludes_controls_beyond_its_content_area() {
             width: 120.0,
             height: 80.0,
         },
-    );
+    )
+        .unwrap();
     let tree = runtime.accessibility_tree();
     assert!(
         !tree
@@ -536,7 +539,8 @@ fn a_partly_visible_button_keeps_the_name_of_its_clipped_label() {
             width: 200.0,
             height: 40.0,
         },
-    );
+    )
+        .unwrap();
     let tree = runtime.accessibility_tree();
     assert_eq!(tree.nodes().len(), 1);
     assert_eq!(tree.nodes()[0].role, Role::Button);

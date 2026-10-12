@@ -35,7 +35,10 @@ pub struct SsrPage {
 /// mount — the same patches a browser would receive, applied to a toy
 /// tree here. [`render_in`] renders in a locale of the server's
 /// choosing.
-pub fn render(root: &impl View, size: Size) -> SsrPage {
+///
+/// # Errors
+/// Returns a text or range error if contextual text cannot be prepared or used.
+pub fn render(root: &impl View, size: Size) -> Result<SsrPage, crate::text_error::TextError> {
     render_in(root, size, &Locale::default())
 }
 
@@ -45,10 +48,17 @@ pub fn render(root: &impl View, size: Size) -> SsrPage {
 /// the mount wears its `lang` and `dir`. The glue sends the mount's own
 /// language before the start, so the adopt runs in the language the
 /// page was built in and only the reader's own report moves it.
-pub fn render_in(root: &impl View, size: Size, locale: &Locale) -> SsrPage {
+///
+/// # Errors
+/// Returns a text or range error if contextual text cannot be prepared or used.
+pub fn render_in(
+    root: &impl View,
+    size: Size,
+    locale: &Locale,
+) -> Result<SsrPage, crate::text_error::TextError> {
     let runtime = Runtime::new();
     runtime.set_locale(Some(locale.clone()));
-    let patches = runtime.dom_frame(root, size);
+    let patches = runtime.dom_frame(root, size)?;
     let mut tree = Tree::new(size);
     for patch in &patches {
         tree.apply(patch);
@@ -65,32 +75,53 @@ pub fn render_in(root: &impl View, size: Size, locale: &Locale) -> SsrPage {
         ":where(#app) :where(a){color:inherit;text-decoration:none}".to_string(),
     ];
     css.extend(tree.rules.values().cloned());
-    SsrPage {
+    Ok(SsrPage {
         html: tree.serialize_root(),
         css: css.join("\n"),
         lang: runtime.locale().identifier().to_string(),
-        dir: if runtime.layout_direction().is_rtl() { "rtl" } else { "ltr" },
-    }
+        dir: if runtime.layout_direction().is_rtl() {
+            "rtl"
+        } else {
+            "ltr"
+        },
+    })
 }
 
 /// A whole document: the page, its stylesheet, and the boot scripts.
 /// `wasm` names the binary the glue will fetch; the mount carries
 /// `data-hydrate` so the glue adopts instead of rebuilding.
-pub fn render_document(root: &impl View, size: Size, wasm: &str, glue: &str) -> String {
-    render_document_in(root, size, wasm, glue, &Locale::default())
+///
+/// # Errors
+/// Returns a text or range error if contextual text cannot be prepared or used.
+pub fn render_document(
+    root: &impl View,
+    size: Size,
+    wasm: &str,
+    glue: &str,
+) -> Result<String, crate::text_error::TextError> {
+    render_document_in(
+        root,
+        size,
+        wasm,
+        glue,
+        &Locale::default(),
+    )
 }
 
 /// [`render_document`] in `locale`: the document's root says the
 /// language and the direction too.
+///
+/// # Errors
+/// Returns a text or range error if contextual text cannot be prepared or used.
 pub fn render_document_in(
     root: &impl View,
     size: Size,
     wasm: &str,
     glue: &str,
     locale: &Locale,
-) -> String {
-    let page = render_in(root, size, locale);
-    format!(
+) -> Result<String, crate::text_error::TextError> {
+    let page = render_in(root, size, locale)?;
+    Ok(format!(
         "<!doctype html>\n<html lang=\"{lang}\" dir=\"{dir}\">\n  <head>\n    <meta charset=\"utf-8\" />\n    \
          <style>\nhtml,body{{margin:0;height:100%;background:#101216;display:grid;place-items:center}}\n\
          #app{{position:relative;width:{width}px;height:{height}px;overflow:hidden}}\n{css}\n</style>\n  </head>\n  <body>\n    \
@@ -102,7 +133,7 @@ pub fn render_document_in(
         height = size.height,
         css = page.css,
         html = page.html,
-    )
+    ))
 }
 
 /// The page kept alive across frames: the toy tree a build renders
@@ -1215,7 +1246,8 @@ mod tests {
     #[test]
     fn the_mount_wears_the_language_and_the_direction() {
         let size = Size { width: 300.0, height: 200.0 };
-        let page = render(&Page { on: State::new(false) }, size);
+        let page = render(&Page { on: State::new(false) }, size)
+        .unwrap();
         assert!(page.html.contains("lang=\"en\""), "{}", page.html);
         assert!(page.html.contains("dir=\"ltr\""), "{}", page.html);
     }
@@ -1289,8 +1321,11 @@ mod tests {
     #[test]
     fn a_page_renders_to_stable_html() {
         let size = Size { width: 300.0, height: 200.0 };
-        let first = render(&Page { on: State::new(false) }, size);
-        let second = render(&Page { on: State::new(false) }, size);
+        let first = render(&Page { on: State::new(false) }, size)
+        .unwrap();
+        let second = render(&Page { on: State::new(false) }, size,
+        )
+        .unwrap();
         assert_eq!(first.html, second.html, "deterministic bytes");
         assert!(first.html.contains("data-hydrate=\"1\""));
         assert!(first.html.contains("data-width=\"300\""), "the served box");
@@ -1305,7 +1340,9 @@ mod tests {
     #[test]
     fn a_served_page_in_arabic_is_already_rtl() {
         let size = Size { width: 300.0, height: 200.0 };
-        let page = render_in(&Page { on: State::new(false) }, size, &Locale::new("ar"));
+        let page = render_in(&Page { on: State::new(false) }, size, &Locale::new("ar"),
+        )
+        .unwrap();
         assert_eq!((page.lang.as_str(), page.dir), ("ar", "rtl"));
         assert!(page.html.contains("lang=\"ar\""), "{}", page.html);
         assert!(page.html.contains("dir=\"rtl\""), "{}", page.html);
@@ -1315,18 +1352,22 @@ mod tests {
             "page.wasm",
             "glue_dom.js",
             &Locale::parse("ar,en"),
-        );
+        )
+        .unwrap();
         assert!(document.contains("<html lang=\"ar\" dir=\"rtl\">"), "{document}");
-        let english = render(&Page { on: State::new(false) }, size);
+        let english = render(&Page { on: State::new(false) }, size,
+        )
+        .unwrap();
         assert_eq!((english.lang.as_str(), english.dir), ("en", "ltr"));
-        assert!(render_document(&Page { on: State::new(false) }, size, "w", "g").contains("<html lang=\"en\" dir=\"ltr\">"));
+        assert!(render_document(&Page { on: State::new(false) }, size, "w", "g").unwrap().contains("<html lang=\"en\" dir=\"ltr\">"));
     }
 
     /// The locale a page is sealed in is the whole list's first tag.
     #[test]
     fn a_page_is_sealed_in_its_language() {
         let size = Size { width: 300.0, height: 200.0 };
-        let page = render_in(&Page { on: State::new(false) }, size, &Locale::parse("pt-BR,en"));
+        let page = render_in(&Page { on: State::new(false) }, size, &Locale::parse("pt-BR,en"))
+        .unwrap();
         assert_eq!((page.lang.as_str(), page.dir), ("pt-BR", "ltr"));
         assert!(page.html.contains("lang=\"pt-BR\""));
     }
@@ -1340,19 +1381,19 @@ mod tests {
         let built = Page { on: State::new(false) };
         let runtime = Runtime::new();
         runtime.set_locale(Some(Locale::new("ar")));
-        let mount = runtime.dom_frame(&built, size);
+        let mount = runtime.dom_frame(&built, size).unwrap();
         assert!(mount.iter().any(|patch| matches!(patch, DomPatch::SetLanguage { .. })));
 
         let served = Page { on: State::new(false) };
         let fresh = Runtime::new();
         fresh.set_locale(Some(Locale::new("ar")));
-        fresh.dom_adopt(&served, size);
-        let first = fresh.dom_frame(&served, size);
+        fresh.dom_adopt(&served, size).unwrap();
+        let first = fresh.dom_frame(&served, size).unwrap();
         assert!(first.is_empty(), "the adopted page is already true, language included: {first:?}");
         // the reader's own report moves it: one patch on the mount
         fresh.set_locale(None);
         assert!(fresh.set_system_locale(Locale::new("en")));
-        let moved = fresh.dom_frame(&served, size);
+        let moved = fresh.dom_frame(&served, size).unwrap();
         assert!(
             moved.iter().any(|patch| matches!(patch, DomPatch::SetLanguage { dir, .. } if !dir.is_rtl())),
             "{moved:?}"
@@ -1366,19 +1407,19 @@ mod tests {
         let size = Size { width: 300.0, height: 200.0 };
         let built = Page { on: State::new(false) };
         let runtime = Runtime::new();
-        let mount = runtime.dom_frame(&built, size);
+        let mount = runtime.dom_frame(&built, size).unwrap();
         assert!(!mount.is_empty());
 
         // the same state, a new world: adopt, then diff
         let served = Page { on: State::new(false) };
         let fresh = Runtime::new();
-        fresh.dom_adopt(&served, size);
-        let first = fresh.dom_frame(&served, size);
+        fresh.dom_adopt(&served, size).unwrap();
+        let first = fresh.dom_frame(&served, size).unwrap();
         assert!(first.is_empty(), "the adopted page is already true: {first:?}");
 
         // and the page is LIVE: a state change speaks normally
         served.on.set(true);
-        let patches = fresh.dom_frame(&served, size);
+        let patches = fresh.dom_frame(&served, size).unwrap();
         assert!(!patches.is_empty());
     }
 
@@ -1407,7 +1448,8 @@ mod tests {
             }
         }
 
-        let page = render(&Placed, Size { width: 200.0, height: 200.0 });
+        let page = render(&Placed, Size { width: 200.0, height: 200.0 })
+        .unwrap();
         for served in [
             // the flow's wrapper: a pinned box, at the wire's precision
             "style=\"height:60.70000076293945px;width:120.30000305175781px\"",
@@ -1436,7 +1478,8 @@ mod tests {
             }
         }
 
-        let page = render(&Badge, Size { width: 200.0, height: 200.0 });
+        let page = render(&Badge, Size { width: 200.0, height: 200.0 })
+        .unwrap();
         assert!(page.css.contains(">*{grid-area:1/1}"), "{}", page.css);
         assert!(page.css.contains("justify-items:center"), "{}", page.css);
     }
@@ -1458,7 +1501,8 @@ mod tests {
             (7u64 << 32) | 9,
             vec![0u8; 4],
         );
-        let page = render(&Picture(source), Size { width: 200.0, height: 200.0 });
+        let page = render(&Picture(source), Size { width: 200.0, height: 200.0 })
+        .unwrap();
         assert!(page.html.contains("data-img=\"7:9\""), "{}", page.html);
     }
 
@@ -1478,7 +1522,8 @@ mod tests {
             }
         }
 
-        let page = render(&Links, Size { width: 200.0, height: 200.0 });
+        let page = render(&Links, Size { width: 200.0, height: 200.0 })
+        .unwrap();
         assert!(
             page.html.contains("href=\"https://example.com/a?b=1&amp;c=2\""),
             "{}",
@@ -1502,7 +1547,8 @@ mod tests {
             }
         }
 
-        let page = render(&Eyebrow, Size { width: 200.0, height: 200.0 });
+        let page = render(&Eyebrow, Size { width: 200.0, height: 200.0 })
+        .unwrap();
         assert!(page.css.contains("letter-spacing:2px"), "{}", page.css);
     }
 
@@ -1524,7 +1570,8 @@ mod tests {
             }
         }
 
-        let page = render(&Link, Size { width: 200.0, height: 200.0 });
+        let page = render(&Link, Size { width: 200.0, height: 200.0 })
+        .unwrap();
         let rule = page
             .css
             .lines()
@@ -1554,9 +1601,9 @@ mod tests {
 
         let size = Size { width: 1200.0, height: 800.0 };
         let built = Runtime::new();
-        assert!(!built.dom_frame(&Shaped, size).is_empty());
+        assert!(!built.dom_frame(&Shaped, size).unwrap().is_empty());
         let fresh = Runtime::new();
-        fresh.dom_adopt(&Shaped, size);
-        assert_eq!(fresh.dom_frame(&Shaped, size), Vec::new(), "the served page is already true");
+        fresh.dom_adopt(&Shaped, size).unwrap();
+        assert_eq!(fresh.dom_frame(&Shaped, size).unwrap(), Vec::new(), "the served page is already true");
     }
 }

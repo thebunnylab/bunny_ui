@@ -838,13 +838,18 @@ pub(crate) fn measure_retained(
     slot: &Slot,
     path: &str,
     key: crate::layout::MeasureKey,
-    measure: impl FnOnce(&LayoutNode) -> (crate::layout::Size, crate::layout::Fit),
-) -> (crate::layout::Size, crate::layout::Fit) {
+    measure: impl FnOnce(
+        &LayoutNode,
+    ) -> Result<
+        (crate::layout::Size, crate::layout::Fit),
+        crate::text_error::TextError,
+    >,
+) -> Result<(crate::layout::Size, crate::layout::Fit), crate::text_error::TextError> {
     use crate::layout::Fit;
 
     let Some(held) = slot.held() else {
         debug_assert!(false, "layout reference without retention: {path}");
-        return (crate::layout::Size::default(), Fit::Leaf);
+        return Ok((crate::layout::Size::default(), Fit::Leaf));
     };
     let kept = held
         .measures_kept
@@ -855,28 +860,32 @@ pub(crate) fn measure_retained(
     if let Some((size, fit)) = kept {
         crate::stats::note_measure_kept(true);
         if crate::paranoid::on(crate::paranoid::MEMO) {
-            let (fresh_size, fresh_fit) = measure(&held.layout);
+            let (fresh_size, fresh_fit) = measure(&held.layout)?;
             assert!(
                 fresh_size == size && fresh_fit.same_as(&fit),
                 "a kept measure of `{path}` is stale: kept {size:?}, fresh {fresh_size:?}"
             );
         }
-        return (size, Fit::Shared(fit));
+        return Ok((size, Fit::Shared(fit)));
     }
     crate::stats::note_measure_kept(false);
     let poison = crate::layout::measure_poison();
-    let (size, fit) = measure(&held.layout);
+    let (size, fit) = measure(&held.layout)?;
     if crate::layout::measure_poison() != poison {
         // something below answers by its own rules: ask again next frame
-        return (size, fit);
+        return Ok((size, fit));
     }
     let fit = Rc::new(fit);
     let mut kept = held.measures_kept.borrow_mut();
     if kept.len() == KEPT_MEASURES {
         kept.remove(0);
     }
-    kept.push(KeptMeasure { key, size, fit: Rc::clone(&fit) });
-    (size, Fit::Shared(fit))
+    kept.push(KeptMeasure {
+        key,
+        size,
+        fit: Rc::clone(&fit),
+    });
+    Ok((size, Fit::Shared(fit)))
 }
 
 /// Something under `path` changed size without a body of its own running
@@ -3645,7 +3654,9 @@ mod tests {
     fn a_frame_files_no_name_and_a_print_after_it_names_every_boundary() {
         let page = Lines { lines: State::new(lines(1..=2)) };
         let runtime = Runtime::new();
-        let _ = runtime.dom_frame(&page, crate::layout::Size { width: 400.0, height: 300.0 });
+        let _ = runtime.dom_frame(&page, crate::layout::Size { width: 400.0, height: 300.0 },
+            )
+            .unwrap();
         let named: Vec<String> = RETAINED.with(|retained| {
             retained.borrow().iter().filter(|(_, entry)| !entry.node.line.is_empty()).map(|(path, _)| path.to_string()).collect()
         });
@@ -3735,19 +3746,19 @@ mod tests {
         let page = Toggles { toggles };
         let runtime = Runtime::new();
         let size = crate::layout::Size { width: 400.0, height: 300.0 };
-        let _ = runtime.dom_frame(&page, size);
+        let _ = runtime.dom_frame(&page, size).unwrap();
         assert_eq!(TOGGLE_RUNS.with(Cell::get), 3, "three rows mounted");
         check("mounted");
 
         // the rows re-run on their own: their entries are replaced
         on.set(true);
-        let _ = runtime.dom_frame(&page, size);
+        let _ = runtime.dom_frame(&page, size).unwrap();
         assert_eq!(TOGGLE_RUNS.with(Cell::get), 6, "the three rows ran again");
         check("re-run");
 
         // the list re-runs: the kept rows are skipped, a new one mounts
         toggles.set(Rc::new((1..=4).map(|id| Toggle { id, on }).collect()));
-        let _ = runtime.dom_frame(&page, size);
+        let _ = runtime.dom_frame(&page, size).unwrap();
         assert_eq!(TOGGLE_RUNS.with(Cell::get), 7, "the new row alone ran");
         check("a row added");
     }

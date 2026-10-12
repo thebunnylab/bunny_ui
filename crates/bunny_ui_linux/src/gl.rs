@@ -55,7 +55,7 @@ use bunny_ui::layout::{Color, DisplayList, Size};
 use bunny_ui::text_engine::TextEngine;
 
 use bunny_ui::gpu::walk::{
-    build_frame, AtlasFull, AtlasGround, DrawRun, FrameBatches, GlassInstance, RectInstance,
+    build_frame, RenderError, AtlasGround, DrawRun, FrameBatches, GlassInstance, RectInstance,
     RoundClip, RunAtlas, RunKind, SpriteInstance, GLASS_MAX_LEVEL,
 };
 
@@ -1742,9 +1742,12 @@ impl GlPresenter {
         physical: (usize, usize),
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) {
+    ) -> Result<(), RenderError> {
         for attempt in 0..3 {
-            let mut ground = GlGround { gl: &self.stack.gl, shared: &mut self.shared };
+            let mut ground = GlGround {
+                gl: &self.stack.gl,
+                shared: &mut self.shared,
+            };
             match build_frame(
                 &mut ground,
                 display,
@@ -1755,21 +1758,22 @@ impl GlPresenter {
                 &mut self.atlas,
                 &mut self.batches,
             ) {
-                Ok(()) => return,
-                Err(AtlasFull) => {
+                Ok(()) => return Ok(()),
+                Err(RenderError::Text(error)) => return Err(RenderError::Text(error)),
+                Err(RenderError::AtlasFull) => {
                     if attempt == 2 {
-                        // pathological frame: keep the rects, drop the
-                        // rest of the text — never a crash
-                        eprintln!("bunny_ui gl: atlas overflow survived two resets");
-                        return;
+                        return Err(RenderError::AtlasFull);
                     }
                     drain_slots(&self.stack.gl, &mut self.slots);
-                    let mut ground =
-                        GlGround { gl: &self.stack.gl, shared: &mut self.shared };
+                    let mut ground = GlGround {
+                        gl: &self.stack.gl,
+                        shared: &mut self.shared,
+                    };
                     self.atlas.reset(&mut ground, true);
                 }
             }
-        }
+        };
+        Ok(())
     }
 
     /// One frame: walk the list, upload, resize the EGL window if the
@@ -1784,27 +1788,32 @@ impl GlPresenter {
         canvas: Color,
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) -> Presented {
+    ) -> Result<Presented, RenderError> {
         let physical = (
             (size.width * scale as f64).round().max(0.0) as usize,
             (size.height * scale as f64).round().max(0.0) as usize,
         );
         if physical.0 == 0 || physical.1 == 0 {
             // a zero target is an abort, not a frame
-            return Presented::Ok;
+            return Ok(Presented::Ok);
         }
         if frame_repeats(&self.retained, display, physical, scale, canvas) {
             // the caret blink and friends land here every half second —
             // nothing changed, nothing encodes, nothing commits
-            return Presented::Ok;
+            return Ok(Presented::Ok);
         }
         let egl = &self.stack.egl.egl;
         // another window's context may be current: this frame is ours
         let bound = unsafe {
-            (egl.make_current)(self.stack.display, self.egl_surface, self.egl_surface, self.stack.context)
+            (egl.make_current)(
+                self.stack.display,
+                self.egl_surface,
+                self.egl_surface,
+                self.stack.context,
+            )
         };
         if bound == 0 {
-            return Presented::DeviceLost;
+            return Ok(Presented::DeviceLost);
         }
         if physical != self.buffer {
             // wayland resizes its egl window in place; the x11 surface
@@ -1822,10 +1831,10 @@ impl GlPresenter {
             }
             self.buffer = physical;
         }
-        self.build_with_retries(display, scale, physical, text, images);
+        self.build_with_retries(display, scale, physical, text, images)?;
         let index = acquire_slot(&self.stack.gl, &mut self.slots, &mut self.cursor);
         if !upload_frame(&mut self.slots[index], &self.stack.gl, &self.batches) {
-            return Presented::DeviceLost;
+            return Ok(Presented::DeviceLost);
         }
         // the scene's corners round at the same radius the CPU road
         // masks; a maximized scene fills its edges like the CPU too
@@ -1835,7 +1844,9 @@ impl GlPresenter {
         self.ensure_glass(physical);
         unsafe {
             (self.stack.gl.bind_framebuffer)(GL_FRAMEBUFFER, 0);
-            let glass = (!self.batches.glass.is_empty()).then_some(()).and(self.glass.as_ref());
+            let glass = (!self.batches.glass.is_empty())
+                .then_some(())
+                .and(self.glass.as_ref());
             self.stack.encode_frame(
                 (physical.0 as f32, physical.1 as f32),
                 canvas,
@@ -1856,21 +1867,21 @@ impl GlPresenter {
             // not configured yet: encoding was free, committing is not
             // legal — the next redraw lands the frame
             mark_in_flight(&self.stack.gl, &mut self.slots[index]);
-            return Presented::Ok;
+            return Ok(Presented::Ok);
         }
         let swapped = unsafe { (egl.swap_buffers)(self.stack.display, self.egl_surface) };
         mark_in_flight(&self.stack.gl, &mut self.slots[index]);
         if swapped == 0 {
             let error = unsafe { (egl.get_error)() };
             if error == EGL_CONTEXT_LOST {
-                return Presented::DeviceLost;
+                return Ok(Presented::DeviceLost);
             }
             // any other swap failure: skip the frame, keep the road
-            return Presented::Ok;
+            return Ok(Presented::Ok);
         }
         crate::ffi::gpu_note_present(self.window);
         self.retained = Some((display.clone(), physical, scale, canvas));
-        Presented::Ok
+        Ok(Presented::Ok)
     }
 }
 
@@ -2027,24 +2038,28 @@ pub(crate) fn present_window(
     canvas: Color,
     text: &dyn TextEngine,
     images: &dyn ImageEngine,
-) {
-    let outcome = PRESENTER.with(|slot| {
-        slot.borrow_mut()
-            .get_mut(&window)
-            .map(|presenter| presenter.present(display, size, scale, canvas, text, images))
-    });
+) -> Result<(), RenderError> {
+    let outcome = PRESENTER
+        .with(|slot| {
+            slot.borrow_mut()
+                .get_mut(&window)
+                .map(|presenter| presenter.present(display, size, scale, canvas, text, images))
+        })
+        .transpose()?;
     if outcome != Some(Presented::DeviceLost) {
-        return;
+        return Ok(());
     }
     teardown(window);
     if !RECREATE_SPENT.with(|spent| spent.replace(true)) {
         if let Some(mut presenter) = install(window) {
-            presenter.present(display, size, scale, canvas, text, images);
+            presenter.present(display, size, scale, canvas, text, images)?;
             PRESENTER.with(|slot| slot.borrow_mut().insert(window, presenter));
-            return;
+            return Ok(());
         }
     }
     eprintln!("bunny_ui gl: the context is lost — presenting by cpu");
+
+    Ok(())
 }
 
 /// Releases the presenter before the wayland surface dies. The order is
@@ -2173,9 +2188,12 @@ impl OffscreenGl {
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
         wait: bool,
-    ) {
+    ) -> Result<(), RenderError> {
         for attempt in 0..3 {
-            let mut ground = GlGround { gl: &self.stack.gl, shared: &mut self.shared };
+            let mut ground = GlGround {
+                gl: &self.stack.gl,
+                shared: &mut self.shared,
+            };
             match build_frame(
                 &mut ground,
                 display,
@@ -2187,21 +2205,23 @@ impl OffscreenGl {
                 &mut self.batches,
             ) {
                 Ok(()) => break,
-                Err(AtlasFull) => {
+                Err(RenderError::Text(error)) => return Err(RenderError::Text(error)),
+                Err(RenderError::AtlasFull) => {
                     if attempt == 2 {
-                        eprintln!("bunny_ui gl: atlas overflow survived two resets");
-                        break;
+                        return Err(RenderError::AtlasFull);
                     }
                     drain_slots(&self.stack.gl, &mut self.slots);
-                    let mut ground =
-                        GlGround { gl: &self.stack.gl, shared: &mut self.shared };
+                    let mut ground = GlGround {
+                        gl: &self.stack.gl,
+                        shared: &mut self.shared,
+                    };
                     self.atlas.reset(&mut ground, true);
                 }
             }
         }
         let index = acquire_slot(&self.stack.gl, &mut self.slots, &mut self.cursor);
         if !upload_frame(&mut self.slots[index], &self.stack.gl, &self.batches) {
-            return;
+            return Ok(());
         }
         if !self.batches.glass.is_empty() && self.glass.is_none() {
             self.glass = unsafe {
@@ -2210,7 +2230,9 @@ impl OffscreenGl {
         }
         unsafe {
             (self.stack.gl.bind_framebuffer)(GL_FRAMEBUFFER, self.framebuffer);
-            let glass = (!self.batches.glass.is_empty()).then_some(()).and(self.glass.as_ref());
+            let glass = (!self.batches.glass.is_empty())
+                .then_some(())
+                .and(self.glass.as_ref());
             self.stack.encode_frame(
                 (self.width as f32, self.height as f32),
                 canvas,
@@ -2237,10 +2259,14 @@ impl OffscreenGl {
             }
             self.slots[index].in_flight = false;
         }
+        Ok(())
     }
 
     /// Renders and WAITS — determinism for tests and honest numbers for
     /// the bench (walk + upload + encode + GPU time, nothing hidden).
+    ///
+    /// # Errors
+    /// Returns a text error or atlas exhaustion if the frame cannot be prepared.
     pub fn present_wait(
         &mut self,
         display: &DisplayList,
@@ -2248,13 +2274,18 @@ impl OffscreenGl {
         canvas: Color,
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) {
-        self.present_inner(display, scale, canvas, text, images, true);
+    ) -> Result<(), RenderError> {
+        self.present_inner(display, scale, canvas, text, images, true)?;
+
+        Ok(())
     }
 
     /// Renders and RETURNS after the submit — the CPU-side cost of a
     /// production present (a window submits and moves on; the ring
     /// keeps the in-flight frames safe).
+    ///
+    /// # Errors
+    /// Returns a text error or atlas exhaustion if the frame cannot be prepared.
     pub fn present_nowait(
         &mut self,
         display: &DisplayList,
@@ -2262,8 +2293,10 @@ impl OffscreenGl {
         canvas: Color,
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) {
-        self.present_inner(display, scale, canvas, text, images, false);
+    ) -> Result<(), RenderError> {
+        self.present_inner(display, scale, canvas, text, images, false)?;
+
+        Ok(())
     }
 
     /// The atlas footprint — how many cached runs, images and dedicated
@@ -2362,7 +2395,7 @@ mod tests {
             (logical.height.round() as usize) * scale,
         );
         let runtime = Runtime::new();
-        let display = runtime.display_frame(root, logical);
+        let display = runtime.display_frame(root, logical).unwrap();
         let cpu = rasterize_with(
             &display,
             physical.0,
@@ -2372,9 +2405,11 @@ mod tests {
             &PixelFont,
             &RawImages::default(),
         )
+        .unwrap()
         .to_rgba_bytes();
         let mut gpu = OffscreenGl::new(physical.0, physical.1).expect("offscreen gpu");
-        gpu.present_wait(&display, scale, canvas, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, scale, canvas, &PixelFont, &RawImages::default())
+            .unwrap();
         (gpu.read_rgba(), cpu)
     }
 
@@ -2425,7 +2460,8 @@ mod tests {
         // readback loudly (the lesson the text engine taught)
         let canvas = Color::hex(0x18181D);
         let mut gpu = OffscreenGl::new(16, 16).expect("offscreen gpu");
-        gpu.present_wait(&DisplayList::default(), 2, canvas, &PixelFont, &RawImages::default());
+        gpu.present_wait(&DisplayList::default(), 2, canvas, &PixelFont, &RawImages::default())
+        .unwrap();
         let bytes = gpu.read_rgba();
         assert_eq!(bytes.len(), 16 * 16 * 4);
         for pixel in bytes.chunks_exact(4) {
@@ -2677,8 +2713,8 @@ mod tests {
         // must present again
         let runtime = Runtime::new();
         let logical = Size { width: 100.0, height: 60.0 };
-        let quiet = runtime.display_frame(&text("still"), logical);
-        let changed = runtime.display_frame(&text("moved"), logical);
+        let quiet = runtime.display_frame(&text("still"), logical).unwrap();
+        let changed = runtime.display_frame(&text("moved"), logical).unwrap();
         let retained = Some((quiet.clone(), (200usize, 120usize), 2usize, Color::CANVAS));
         assert!(frame_repeats(&retained, &quiet, (200, 120), 2, Color::CANVAS));
         assert!(!frame_repeats(&retained, &changed, (200, 120), 2, Color::CANVAS));
@@ -2730,7 +2766,7 @@ mod tests {
         .padding_length(10.0)
         .background_color(Color::hex(0xFFFFFF))
         .corner_radius(9.0);
-        let display = runtime.display_frame(&root, logical);
+        let display = runtime.display_frame(&root, logical).unwrap();
         let cpu = rasterize_with(
             &display,
             physical.0,
@@ -2740,9 +2776,11 @@ mod tests {
             &engine,
             &RawImages::default(),
         )
+        .unwrap()
         .to_rgba_bytes();
         let mut gpu = OffscreenGl::new(physical.0, physical.1).expect("offscreen gpu");
-        gpu.present_wait(&display, scale, Color::CANVAS, &engine, &RawImages::default());
+        gpu.present_wait(&display, scale, Color::CANVAS, &engine, &RawImages::default())
+        .unwrap();
         assert_close(&gpu.read_rgba(), &cpu, 2, "freetype runs");
     }
 
@@ -2773,12 +2811,15 @@ mod tests {
         let root = vstack((text("warm"), text("frame")));
         let logical = Size { width: 120.0, height: 60.0 };
         let runtime = Runtime::new();
-        let display = runtime.display_frame(&root, logical);
+        let display = runtime.display_frame(&root, logical).unwrap();
         let mut gpu = OffscreenGl::new(240, 120).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default(),
+        )
+        .unwrap();
         let first = gpu.atlas_footprint();
         assert!(first.0 > 0, "the frame rasterized runs into the atlas");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default())
+        .unwrap();
         let second = gpu.atlas_footprint();
         assert_eq!(first, second, "an identical frame must not mint new tiles");
     }
@@ -2851,13 +2892,16 @@ mod tests {
         }
         let runtime = Runtime::new();
         let root = image_scene();
-        let display = runtime.display_frame(&root, Size { width: 320.0, height: 400.0 });
+        let display = runtime.display_frame(&root, Size { width: 320.0, height: 400.0 })
+            .unwrap();
         let engine = RawImages::default();
         let mut gpu = OffscreenGl::new(640, 800).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         let first = gpu.atlas_footprint();
         assert!(first.0 >= 3, "atlas icon + cover + dedicated photo: {first:?}");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         assert_eq!(first, gpu.atlas_footprint(), "a warm frame re-uploads nothing");
     }
 
@@ -2930,13 +2974,16 @@ mod tests {
         }
         let runtime = Runtime::new();
         let root = icon_scene();
-        let display = runtime.display_frame(&root, Size { width: 120.0, height: 160.0 });
+        let display = runtime.display_frame(&root, Size { width: 120.0, height: 160.0 })
+            .unwrap();
         let engine = RawImages::default();
         let mut gpu = OffscreenGl::new(240, 320).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         let first = gpu.atlas_footprint();
         assert!(first.0 >= 4, "four tinted tiles at least: {first:?}");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine)
+            .unwrap();
         assert_eq!(first, gpu.atlas_footprint(), "the tinted keys cache, never thrash");
     }
 

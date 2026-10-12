@@ -17,6 +17,97 @@ struct RasterBudget {
     paint: Option<usize>,
 }
 
+impl RasterBudget {
+    /// Refuse excessive work before allocating pixels; native text failures
+    /// remain errors so admission cannot silently select a different shaper.
+    fn permits(
+        &self,
+        display: &DisplayList,
+        logical: Rect,
+        factor: f64,
+        text: &dyn TextEngine,
+        cache: &MeasureCache,
+    ) -> Result<bool, bunny_ui::text_error::TextError> {
+        let mut bytes = 0usize;
+        let mut text_pixels = 0usize;
+        let mut paint_pixels = 0usize;
+        for command in display.iter() {
+            match command {
+                DrawCommand::FillRect { rect, .. } | DrawCommand::StrokeRect { rect, .. } => {
+                    if let Some(limit) = self.paint {
+                        if ![
+                            rect.origin.x,
+                            rect.origin.y,
+                            rect.size.width,
+                            rect.size.height,
+                        ]
+                        .iter()
+                        .all(|value| value.is_finite())
+                        {
+                            return Ok(false);
+                        }
+                        if let Some(visible) = rect.intersection(logical) {
+                            let width = (visible.size.width * factor).ceil().max(0.0) as usize;
+                            let height = (visible.size.height * factor).ceil().max(0.0) as usize;
+                            let Some(total) = width
+                                .checked_mul(height)
+                                .and_then(|pixels| paint_pixels.checked_add(pixels))
+                            else {
+                                return Ok(false);
+                            };
+                            paint_pixels = total;
+                            if paint_pixels > limit {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
+                DrawCommand::PushClip { .. } | DrawCommand::PopClip => {}
+                DrawCommand::TextLine {
+                    range,
+                    content,
+                    font,
+                    ..
+                } => {
+                    let Some(total) = range
+                        .1
+                        .checked_sub(range.0)
+                        .and_then(|length| bytes.checked_add(length))
+                    else {
+                        return Ok(false);
+                    };
+                    bytes = total;
+                    if bytes > MAX_TEXT_BYTES {
+                        return Ok(false);
+                    }
+                    let line = content.line(range.0..range.1)?;
+                    let metrics = cache.get_or_measure_paragraph(&line, font, text)?;
+                    if !metrics.width.is_finite() || !metrics.height().is_finite() {
+                        return Ok(false);
+                    }
+                    let width = (metrics.width * factor).ceil().max(0.0) as usize;
+                    let height = (metrics.height() * factor).ceil().max(0.0) as usize;
+                    let Some(total) = width
+                        .checked_mul(height)
+                        .and_then(|pixels| text_pixels.checked_add(pixels))
+                    else {
+                        return Ok(false);
+                    };
+                    text_pixels = total;
+                    if text_pixels > self.text {
+                        return Ok(false);
+                    }
+                }
+                DrawCommand::Gradient { .. }
+                | DrawCommand::Backdrop { .. }
+                | DrawCommand::Shadow { .. }
+                | DrawCommand::Image { .. } => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+}
+
 /// The bounded, translated scene that paints an entire opaque patch.
 pub(super) struct Scene {
     display: DisplayList,
@@ -45,14 +136,14 @@ pub(super) struct Mosaic {
 }
 
 impl Scene {
-    pub(super) fn new(
+    pub(super) fn prepare_scene(
         display: &DisplayList,
         rect: DamageRect,
         scale: usize,
         canvas: Color,
         text: &dyn TextEngine,
         cache: &MeasureCache,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, bunny_ui::text_error::TextError> {
         Self::with_budget(
             display,
             rect,
@@ -77,14 +168,20 @@ impl Scene {
         canvas: Color,
         text: &dyn TextEngine,
         cache: &MeasureCache,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, bunny_ui::text_error::TextError> {
         Self::with_budget(
             display,
             (
                 0,
                 0,
-                i64::try_from(physical.0).ok()?,
-                i64::try_from(physical.1).ok()?,
+                (match i64::try_from(physical.0).ok() {
+                    Some(value) => value,
+                    None => return Ok(None),
+                }),
+                (match i64::try_from(physical.1).ok() {
+                    Some(value) => value,
+                    None => return Ok(None),
+                }),
             ),
             scale,
             canvas,
@@ -106,16 +203,30 @@ impl Scene {
         text: &dyn TextEngine,
         cache: &MeasureCache,
         budget: RasterBudget,
-    ) -> Option<Self> {
-        let width = usize::try_from(rect.2.checked_sub(rect.0)?).ok()?;
-        let height = usize::try_from(rect.3.checked_sub(rect.1)?).ok()?;
+    ) -> Result<Option<Self>, bunny_ui::text_error::TextError> {
+        let Some(width) = rect
+            .2
+            .checked_sub(rect.0)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(height) = rect
+            .3
+            .checked_sub(rect.1)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return Ok(None);
+        };
         if scale == 0
             || canvas.a != 255
             || width == 0
             || height == 0
-            || width.checked_mul(height)? > budget.surface
+            || width
+                .checked_mul(height)
+                .is_none_or(|pixels| pixels > budget.surface)
         {
-            return None;
+            return Ok(None);
         }
         let factor = scale as f64;
         let logical = Rect {
@@ -128,76 +239,28 @@ impl Scene {
                 height: height as f64 / factor,
             },
         };
-        let candidates = measured_candidates(display, rect, factor, text, cache)?;
-        let (_, lifted) = carve_covering(&candidates, (0, candidates.len()), logical)?;
+        let Some(candidates) = measured_candidates(display, rect, factor, text, cache)? else {
+            return Ok(None);
+        };
+        let Some((_, lifted)) = carve_covering(&candidates, (0, candidates.len()), logical) else {
+            return Ok(None);
+        };
         if lifted.len() > MAX_COMMANDS {
-            return None;
+            return Ok(None);
         }
-        let mut bytes = 0usize;
-        let mut text_pixels = 0usize;
-        let mut paint_pixels = 0usize;
-        for command in lifted.iter() {
-            match command {
-                DrawCommand::FillRect { rect, .. } | DrawCommand::StrokeRect { rect, .. } => {
-                    if let Some(limit) = budget.paint {
-                        if ![
-                            rect.origin.x,
-                            rect.origin.y,
-                            rect.size.width,
-                            rect.size.height,
-                        ]
-                        .iter()
-                        .all(|value| value.is_finite())
-                        {
-                            return None;
-                        }
-                        if let Some(visible) = rect.intersection(logical) {
-                            let width = (visible.size.width * factor).ceil().max(0.0) as usize;
-                            let height = (visible.size.height * factor).ceil().max(0.0) as usize;
-                            paint_pixels = paint_pixels.checked_add(width.checked_mul(height)?)?;
-                            if paint_pixels > limit {
-                                return None;
-                            }
-                        }
-                    }
-                }
-                DrawCommand::PushClip { .. } | DrawCommand::PopClip => {}
-                DrawCommand::TextLine {
-                    range,
-                    content,
-                    font,
-                    ..
-                } => {
-                    bytes = bytes.checked_add(range.1.checked_sub(range.0)?)?;
-                    if bytes > MAX_TEXT_BYTES {
-                        return None;
-                    }
-                    let line = content.line(range.0..range.1).ok()?;
-                    let metrics = cache.get_or_measure_paragraph(&line, font, text);
-                    if !metrics.width.is_finite() || !metrics.height().is_finite() {
-                        return None;
-                    }
-                    let width = (metrics.width * factor).ceil().max(0.0) as usize;
-                    let height = (metrics.height() * factor).ceil().max(0.0) as usize;
-                    text_pixels = text_pixels.checked_add(width.checked_mul(height)?)?;
-                    if text_pixels > budget.text {
-                        return None;
-                    }
-                }
-                DrawCommand::Gradient { .. }
-                | DrawCommand::Backdrop { .. }
-                | DrawCommand::Shadow { .. }
-                | DrawCommand::Image { .. } => return None,
-            }
+        if !budget.permits(&lifted, logical, factor, text, cache)? {
+            return Ok(None);
         }
-        let display = patch_coordinates(&lifted, rect, factor)?;
-        Some(Self {
+        let Some(display) = patch_coordinates(&lifted, rect, factor) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
             display,
             size: (width, height),
             rect,
             scale,
             canvas,
-        })
+        }))
     }
 
     /// Equal normalized commands prove equal pixels at the same destination.
@@ -229,7 +292,7 @@ impl Scene {
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
         cache: &MeasureCache,
-    ) -> Option<Mosaic> {
+    ) -> Result<Option<Mosaic>, bunny_ui::text_error::TextError> {
         let color = self
             .display
             .iter()
@@ -241,15 +304,19 @@ impl Scene {
             })
             .max_by(|a, b| a.0.total_cmp(&b.0))
             .map_or(self.canvas, |(_, color)| color);
-        let background = Surface::new_opaque((1, 1))?;
+        let Some(background) = Surface::new_opaque((1, 1)) else { return Ok(None) };
         if !background.write(&Bitmap::new(1, 1, color)) {
-            return None;
+            return Ok(None);
         }
         let mut bytes = background.allocated_bytes();
         // Native layers have a cost too: retain pieces only when their
         // real surface allocations save at least one quarter of the picture.
-        let limit = self.size.0.checked_mul(self.size.1)?.checked_mul(3)?;
-        let column = 256usize.checked_mul(self.scale)?;
+        let Some(limit) = (match self.size.0.checked_mul(self.size.1) {
+            Some(value) => value,
+            None => return Ok(None),
+        })
+        .checked_mul(3) else { return Ok(None) };
+        let Some(column) = 256usize.checked_mul(self.scale) else { return Ok(None) };
         let mut pieces = Vec::new();
         let complete = self.raster_bands(text, images, cache, |y, bitmap| {
             for x in (0..bitmap.width()).step_by(column) {
@@ -286,8 +353,8 @@ impl Scene {
                 });
             }
             true
-        });
-        complete.then_some(Mosaic { background, pieces })
+        })?;
+        Ok(complete.then_some(Mosaic { background, pieces }))
     }
 
     /// Emits opaque bands without allocating a full-window scratch bitmap.
@@ -297,21 +364,21 @@ impl Scene {
         images: &dyn ImageEngine,
         cache: &MeasureCache,
         mut paint: impl FnMut(usize, &Bitmap) -> bool,
-    ) -> bool {
+    ) -> Result<bool, bunny_ui::text_error::TextError> {
         let rows = MAX_PIXELS / self.size.0;
         if rows == 0 {
-            return false;
+            return Ok(false);
         }
         if self.size.1 <= rows {
-            return paint(0, &self.raster(text, images));
+            return Ok(paint(0, &self.raster(text, images)?));
         }
         let factor = self.scale as f64;
         for y in (0..self.size.1).step_by(rows) {
             let height = rows.min(self.size.1 - y);
             let rect = (0, y as i64, self.size.0 as i64, (y + height) as i64);
-            let Some(candidates) = measured_candidates(&self.display, rect, factor, text, cache)
+            let Some(candidates) = measured_candidates(&self.display, rect, factor, text, cache)?
             else {
-                return false;
+                return Ok(false);
             };
             let logical = Rect {
                 origin: Point {
@@ -326,7 +393,7 @@ impl Scene {
             let lifted = carve_covering(&candidates, (0, candidates.len()), logical)
                 .map_or_else(DisplayList::default, |(_, display)| display);
             let Some(display) = patch_coordinates(&lifted, rect, factor) else {
-                return false;
+                return Ok(false);
             };
             let bitmap = rasterize_with(
                 &display,
@@ -336,12 +403,12 @@ impl Scene {
                 self.canvas,
                 text,
                 images,
-            );
+            )?;
             if !paint(y, &bitmap) {
-                return false;
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 
     pub(super) fn raster_in<'a>(
@@ -349,7 +416,7 @@ impl Scene {
         retained: &'a mut Option<Raster>,
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
-    ) -> &'a Bitmap {
+    ) -> Result<&'a Bitmap, bunny_ui::text_error::TextError> {
         if !retained.as_ref().is_some_and(|old| {
             old.size == self.size && old.scale == self.scale && old.canvas == self.canvas
         }) {
@@ -366,11 +433,15 @@ impl Scene {
             });
         }
         let raster = retained.as_mut().expect("initialized raster");
-        raster.surface.frame(self.display.clone(), text, images);
-        raster.surface.bitmap()
+        raster.surface.frame(self.display.clone(), text, images)?;
+        Ok(raster.surface.bitmap())
     }
 
-    pub(super) fn raster(&self, text: &dyn TextEngine, images: &dyn ImageEngine) -> Bitmap {
+    pub(super) fn raster(
+        &self,
+        text: &dyn TextEngine,
+        images: &dyn ImageEngine,
+    ) -> Result<Bitmap, bunny_ui::text_error::TextError> {
         rasterize_with(
             &self.display,
             self.size.0,
@@ -394,7 +465,7 @@ fn measured_candidates(
     factor: f64,
     text: &dyn TextEngine,
     cache: &MeasureCache,
-) -> Option<DisplayList> {
+) -> Result<Option<DisplayList>, bunny_ui::text_error::TextError> {
     let mut commands = Vec::with_capacity(display.len());
     for command in display.iter() {
         if let DrawCommand::TextLine {
@@ -405,12 +476,12 @@ fn measured_candidates(
             ..
         } = command
         {
-            let line = content.line(range.0..range.1).ok()?;
+            let line = content.line(range.0..range.1)?;
             // Do not shape an unbounded line just to decide to reject it.
             if line.text().len() > MAX_TEXT_BYTES {
-                return None;
+                return Ok(None);
             }
-            let metrics = cache.get_or_measure_paragraph(&line, font, text);
+            let metrics = cache.get_or_measure_paragraph(&line, font, text)?;
             let x = (origin.x * factor).round();
             let y = (origin.y * factor).round();
             let width = (metrics.width * factor).ceil();
@@ -419,7 +490,7 @@ fn measured_candidates(
                 || metrics.width < 0.0
                 || metrics.height() < 0.0
             {
-                return None;
+                return Ok(None);
             }
             // The same two physical pixels of rounding slack as the
             // damage oracle. Clips can only remove ink from this bound.
@@ -433,7 +504,7 @@ fn measured_candidates(
         }
         commands.push(command.clone());
     }
-    Some(DisplayList::from(commands))
+    Ok(Some(DisplayList::from(commands)))
 }
 
 // The whole raster snaps in window coordinates. Rounding a translated
@@ -678,13 +749,13 @@ impl Surface {
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
         cache: &MeasureCache,
-    ) -> Option<Self> {
-        let surface = Self::new_opaque(scene.size)?;
-        scene
+    ) -> Result<Option<Self>, bunny_ui::text_error::TextError> {
+        let Some(surface) = Self::new_opaque(scene.size) else { return Ok(None) };
+        Ok(scene
             .raster_bands(text, images, cache, |y, bitmap| {
                 PixelRegion::whole(bitmap).is_some_and(|pixels| surface.write_rows(y, pixels))
-            })
-            .then_some(surface)
+            })?
+            .then_some(surface))
     }
 
     pub(super) fn allocated_bytes(&self) -> usize {
@@ -867,9 +938,11 @@ mod tests {
             },
         ]);
         let cache = MeasureCache::default();
-        let scene = Scene::base(&display, (800, 600), 1, Color::WHITE, &PixelFont, &cache).unwrap();
+        let scene = Scene::base(&display, (800, 600), 1, Color::WHITE, &PixelFont, &cache).unwrap()
+            .unwrap();
         let mosaic = scene
             .mosaic(&PixelFont, &RawImages::default(), &cache)
+            .unwrap()
             .expect("a moderate scene can save surface storage");
         let bytes = mosaic.background.allocated_bytes()
             + mosaic
@@ -958,9 +1031,11 @@ mod tests {
                 &PixelFont,
                 &cache,
             )
+            .unwrap()
             .unwrap();
             let mosaic = scene
                 .mosaic(&PixelFont, &RawImages::default(), &cache)
+                .unwrap()
                 .unwrap();
             let mut actual = vec![pixels(&mosaic.background)[0]; scene.size.0 * scene.size.1];
             let mut touched = vec![false; actual.len()];
@@ -986,7 +1061,8 @@ mod tests {
             }
             assert_eq!(
                 actual,
-                scene.raster(&PixelFont, &RawImages::default()).pixels(),
+                scene.raster(&PixelFont, &RawImages::default()).unwrap()
+                    .pixels(),
                 "scale {scale}"
             );
         }
@@ -1003,10 +1079,12 @@ mod tests {
             });
         }
         let dense = DisplayList::from(dense);
-        let scene = Scene::base(&dense, (800, 600), 1, Color::WHITE, &PixelFont, &cache).unwrap();
+        let scene = Scene::base(&dense, (800, 600), 1, Color::WHITE, &PixelFont, &cache).unwrap()
+            .unwrap();
         assert!(
             scene
                 .mosaic(&PixelFont, &RawImages::default(), &cache)
+                .unwrap()
                 .is_none(),
             "dense paint keeps the full native surface"
         );
@@ -1072,8 +1150,9 @@ mod tests {
             let size = (513 * scale, 377 * scale);
             let cache = MeasureCache::default();
             let scene =
-                Scene::base(&display, size, scale, Color::BLACK, &PixelFont, &cache).unwrap();
-            let expected = scene.raster(&PixelFont, &RawImages::default());
+                Scene::base(&display, size, scale, Color::BLACK, &PixelFont, &cache).unwrap()
+                .unwrap();
+            let expected = scene.raster(&PixelFont, &RawImages::default()).unwrap();
             let mut actual = vec![0; size.0 * size.1];
             let mut next = 0;
             assert!(scene.raster_bands(
@@ -1090,11 +1169,14 @@ mod tests {
                     actual[row * size.0..next * size.0].copy_from_slice(bitmap.pixels());
                     true
                 }
-            ));
+            )
+                    .unwrap()
+            );
             assert_eq!(next, size.1);
             assert_eq!(actual, expected.pixels(), "scale {scale}");
             let surface =
-                Surface::from_scene(&scene, &PixelFont, &RawImages::default(), &cache).unwrap();
+                Surface::from_scene(&scene, &PixelFont, &RawImages::default(), &cache)
+                .unwrap().unwrap();
             let actual = unsafe {
                 assert_eq!(IOSurfaceLock(surface.raw, 0, null_mut()), 0);
                 let base = IOSurfaceGetBaseAddress(surface.raw).cast::<u8>();
@@ -1147,7 +1229,8 @@ mod tests {
             Color::WHITE,
             &PixelFont,
             &RawImages::default(),
-        );
+        )
+        .unwrap();
         let region = PixelRegion::new(&bitmap, (1, 1, 4, 3)).unwrap();
         assert_eq!(region.size(), (3, 2));
         assert_eq!(
@@ -1240,7 +1323,7 @@ mod tests {
                     DrawCommand::PopClip,
                 ]);
                 let s = scale as i64;
-                let scene = Scene::new(
+                let scene = Scene::prepare_scene(
                     &display,
                     (0, 0, 32 * s, 32 * s),
                     scale,
@@ -1252,11 +1335,13 @@ mod tests {
                     &PixelFont,
                     &MeasureCache::default(),
                 )
+                .unwrap()
                 .unwrap();
-                let expected = scene.raster(&PixelFont, &RawImages::default());
+                let expected = scene.raster(&PixelFont, &RawImages::default()).unwrap();
                 assert_eq!(
                     scene
                         .raster_in(&mut retained, &PixelFont, &RawImages::default())
+                        .unwrap()
                         .pixels(),
                     expected.pixels()
                 );
@@ -1288,8 +1373,9 @@ mod tests {
                 Color::WHITE,
                 &PixelFont,
                 &RawImages::default(),
-            );
-            let scene = Scene::new(
+            )
+            .unwrap();
+            let scene = Scene::prepare_scene(
                 &display,
                 rect,
                 scale,
@@ -1297,6 +1383,7 @@ mod tests {
                 &PixelFont,
                 &MeasureCache::default(),
             )
+            .unwrap()
             .unwrap();
             drop(display);
             assert!(
@@ -1304,13 +1391,15 @@ mod tests {
                 "a cached or hidden native patch must not pin a whole old document"
             );
             assert_eq!(
-                scene.raster(&PixelFont, &RawImages::default()).pixels(),
+                scene.raster(&PixelFont, &RawImages::default()).unwrap()
+                    .pixels(),
                 expected.pixels()
             );
             let mut retained = None;
             assert_eq!(
                 scene
                     .raster_in(&mut retained, &PixelFont, &RawImages::default())
+                    .unwrap()
                     .pixels(),
                 expected.pixels()
             );
@@ -1330,7 +1419,7 @@ mod tests {
                 color: Color::BLACK,
                 font: FontSpec::DEFAULT,
             }]);
-            let scene = Scene::new(
+            let scene = Scene::prepare_scene(
                 &display,
                 (0, 0, 80, 32),
                 1,
@@ -1338,8 +1427,10 @@ mod tests {
                 &PixelFont,
                 &MeasureCache::default(),
             )
+            .unwrap()
             .unwrap();
-            scene.raster_in(&mut retained, &PixelFont, &RawImages::default());
+            scene.raster_in(&mut retained, &PixelFont, &RawImages::default())
+                .unwrap();
             weak
         };
         assert!(retained.is_some());
@@ -1422,7 +1513,7 @@ mod tests {
     fn software_work_is_bounded_and_unsupported_ink_stays_on_metal() {
         let display = DisplayList::from(vec![fill()]);
         assert!(
-            Scene::new(
+            Scene::prepare_scene(
                 &display,
                 (0, 0, 128, 128),
                 1,
@@ -1430,10 +1521,11 @@ mod tests {
                 &PixelFont,
                 &MeasureCache::default()
             )
+            .unwrap()
             .is_some()
         );
         assert!(
-            Scene::new(
+            Scene::prepare_scene(
                 &display,
                 (0, 0, 640, 640),
                 1,
@@ -1441,10 +1533,11 @@ mod tests {
                 &PixelFont,
                 &MeasureCache::default()
             )
+            .unwrap()
             .is_none()
         );
         assert!(
-            Scene::new(
+            Scene::prepare_scene(
                 &display,
                 (0, 0, 128, 128),
                 0,
@@ -1452,10 +1545,11 @@ mod tests {
                 &PixelFont,
                 &MeasureCache::default()
             )
+            .unwrap()
             .is_none()
         );
         assert!(
-            Scene::new(
+            Scene::prepare_scene(
                 &display,
                 (0, 0, 128, 128),
                 1,
@@ -1463,11 +1557,12 @@ mod tests {
                 &PixelFont,
                 &MeasureCache::default()
             )
+            .unwrap()
             .is_none()
         );
         let commands = DisplayList::from(vec![fill(); MAX_COMMANDS + 1]);
         assert!(
-            Scene::new(
+            Scene::prepare_scene(
                 &commands,
                 (0, 0, 128, 128),
                 1,
@@ -1475,6 +1570,7 @@ mod tests {
                 &PixelFont,
                 &MeasureCache::default()
             )
+            .unwrap()
             .is_none()
         );
         let long = DisplayList::from(vec![DrawCommand::TextLine {
@@ -1485,7 +1581,7 @@ mod tests {
             font: FontSpec::DEFAULT,
         }]);
         assert!(
-            Scene::new(
+            Scene::prepare_scene(
                 &long,
                 (0, 0, 128, 128),
                 1,
@@ -1493,6 +1589,7 @@ mod tests {
                 &PixelFont,
                 &MeasureCache::default()
             )
+            .unwrap()
             .is_none()
         );
         let huge_glyph = DisplayList::from(vec![DrawCommand::TextLine {
@@ -1506,7 +1603,7 @@ mod tests {
             },
         }]);
         assert!(
-            Scene::new(
+            Scene::prepare_scene(
                 &huge_glyph,
                 (0, 0, 128, 128),
                 1,
@@ -1514,6 +1611,7 @@ mod tests {
                 &crate::CoreTextEngine::new(),
                 &MeasureCache::default()
             )
+            .unwrap()
             .is_none()
         );
         let unsupported = DrawCommand::Shadow {
@@ -1530,7 +1628,7 @@ mod tests {
         };
         let shadow = DisplayList::from(vec![fill(), unsupported]);
         assert!(
-            Scene::new(
+            Scene::prepare_scene(
                 &shadow,
                 (0, 0, 128, 128),
                 1,
@@ -1538,6 +1636,7 @@ mod tests {
                 &PixelFont,
                 &MeasureCache::default()
             )
+            .unwrap()
             .is_none()
         );
     }
@@ -1551,8 +1650,9 @@ mod tests {
             Color::WHITE,
             text,
             &RawImages::default(),
-        );
-        let scene = Scene::new(
+        )
+        .unwrap();
+        let scene = Scene::prepare_scene(
             display,
             rect,
             scale,
@@ -1560,8 +1660,9 @@ mod tests {
             text,
             &MeasureCache::default(),
         )
+        .unwrap()
         .expect("a bounded supported scene admits a software patch");
-        let patch = scene.raster(text, &RawImages::default());
+        let patch = scene.raster(text, &RawImages::default()).unwrap();
         for y in rect.1..rect.3 {
             for x in rect.0..rect.2 {
                 assert_eq!(
@@ -1758,7 +1859,7 @@ mod tests {
             },
         ]);
         assert!(
-            Scene::new(
+            Scene::prepare_scene(
                 &display,
                 (600, 0, 608, 32),
                 1,
@@ -1766,6 +1867,7 @@ mod tests {
                 &UnknownExtent,
                 &MeasureCache::default()
             )
+            .unwrap()
             .is_none()
         );
     }
@@ -1787,7 +1889,8 @@ mod tests {
         let cache = MeasureCache::default();
         let source = bunny_ui::text_source::TextContent::from("cached");
         let line = source.line(0..source.len()).unwrap();
-        cache.get_or_measure_paragraph(&line, &FontSpec::DEFAULT, &text);
+        cache.get_or_measure_paragraph(&line, &FontSpec::DEFAULT, &text)
+            .unwrap();
         let mut commands = vec![fill()];
         for x in [8.0, 600.0] {
             commands.push(DrawCommand::TextLine {
@@ -1802,7 +1905,7 @@ mod tests {
         for _ in 0..3 {
             cache.begin_frame();
             assert!(
-                Scene::new(&display, (600, 0, 640, 32), 1, Color::WHITE, &text, &cache).is_some()
+                Scene::prepare_scene(&display, (600, 0, 640, 32), 1, Color::WHITE, &text, &cache).unwrap().is_some()
             );
         }
         assert_eq!(
@@ -1843,7 +1946,7 @@ mod tests {
         for scale in [1, 2] {
             let s = scale as i64;
             let scene = |display: &DisplayList| {
-                Scene::new(
+                Scene::prepare_scene(
                     display,
                     (0, 0, 24 * s, 24 * s),
                     scale,
@@ -1851,17 +1954,20 @@ mod tests {
                     &PixelFont,
                     &MeasureCache::default(),
                 )
+                .unwrap()
                 .expect("bounded fractional scene")
             };
             let first = scene(&first);
             let pixels = first
                 .raster(&PixelFont, &RawImages::default())
+                .unwrap()
                 .to_rgba_bytes();
             let same = scene(&same);
             assert!(first.matches(&same), "scale {scale}");
             assert_eq!(
                 pixels,
                 same.raster(&PixelFont, &RawImages::default())
+                    .unwrap()
                     .to_rgba_bytes()
             );
             for changed in [
@@ -1875,6 +1981,7 @@ mod tests {
                     pixels,
                     changed
                         .raster(&PixelFont, &RawImages::default())
+                        .unwrap()
                         .to_rgba_bytes()
                 );
             }
@@ -1899,7 +2006,7 @@ mod tests {
                 color: Color::WHITE.fade(),
                 corner_radius: Corners::ZERO,
             }]);
-            Scene::new(
+            Scene::prepare_scene(
                 &display,
                 rect,
                 scale,
@@ -1907,11 +2014,13 @@ mod tests {
                 &PixelFont,
                 &MeasureCache::default(),
             )
+            .unwrap()
             .expect("bounded translucent ink on an opaque canvas")
         };
         let first = scene((0, 0, 8, 8), 1, Color::WHITE);
         let pixels = first
             .raster(&PixelFont, &RawImages::default())
+            .unwrap()
             .to_rgba_bytes();
         for changed in [
             scene((8, 0, 16, 8), 1, Color::WHITE),
@@ -1921,6 +2030,7 @@ mod tests {
                 pixels,
                 changed
                     .raster(&PixelFont, &RawImages::default())
+                    .unwrap()
                     .to_rgba_bytes()
             );
             assert!(!first.matches(&changed));
@@ -1931,6 +2041,7 @@ mod tests {
             pixels,
             changed
                 .raster(&PixelFont, &RawImages::default())
+                .unwrap()
                 .to_rgba_bytes()
         );
     }
@@ -1970,7 +2081,8 @@ mod tests {
                 Color::hex(0x123456),
                 &PixelFont,
                 &RawImages::default(),
-            );
+            )
+            .unwrap();
             let first = backing.prepare(&bitmap).expect("first surface");
             let first_busy = InUse::new(first);
             let second = backing.prepare(&bitmap).expect("second surface");

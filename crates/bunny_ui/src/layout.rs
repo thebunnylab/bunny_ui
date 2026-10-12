@@ -3717,8 +3717,11 @@ pub fn line_of(lines: &[(usize, usize)], byte: usize) -> usize {
 /// long one is as wide as its widest paragraph, each measured on its own
 /// and kept — shaping a document as one line would be the cost of the
 /// document, and the widest paragraph is the honest width anyway.
-fn note_natural_width(sample: &str, env: &LayoutEnv<'_>) -> Px {
-    env.cache.measure_text(sample, &env.font, env.text).width
+fn note_natural_width(
+    sample: &str,
+    env: &LayoutEnv<'_>,
+) -> Result<Px, crate::text_error::TextError> {
+    Ok(env.cache.measure_text(sample, &env.font, env.text)?.width)
 }
 
 /// Block/underline carets cover the next glyph at a soft wrap. Keep this
@@ -4304,7 +4307,13 @@ pub struct LayoutResult {
 /// [`layout_with`]).
 ///
 /// [`PixelFont`]: crate::text_engine::PixelFont
-pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
+///
+/// # Errors
+/// Returns a text or range error if contextual text cannot be prepared or used.
+pub fn layout(
+    root: &LayoutNode,
+    proposal: Proposal,
+) -> Result<LayoutResult, crate::text_error::TextError> {
     layout_in(root, proposal, LayoutDirection::LeftToRight)
 }
 
@@ -4314,7 +4323,7 @@ pub(crate) fn layout_in(
     root: &LayoutNode,
     proposal: Proposal,
     direction: LayoutDirection,
-) -> LayoutResult {
+) -> Result<LayoutResult, crate::text_error::TextError> {
     let engine = PixelFont;
     let images = RawImages::default();
     let cache = MeasureCache::default();
@@ -4348,7 +4357,14 @@ pub(crate) fn layout_in(
 }
 
 /// Runs both phases with the frame's environment.
-pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> LayoutResult {
+///
+/// # Errors
+/// Returns a text or range error if contextual text cannot be prepared or used.
+pub fn layout_with(
+    root: &LayoutNode,
+    proposal: Proposal,
+    env: LayoutEnv,
+) -> Result<LayoutResult, crate::text_error::TextError> {
     layout_with_insets(root, proposal, env, Edges::ZERO)
 }
 
@@ -4389,12 +4405,15 @@ impl SafeFrame {
 /// window coordinates, so a hit-test needs no translation. Overlays
 /// position inside the safe rect too. With [`Edges::ZERO`] this is
 /// [`layout_with`], byte for byte.
+///
+/// # Errors
+/// Returns a text or range error if contextual text cannot be prepared or used.
 pub fn layout_with_insets(
     root: &LayoutNode,
     proposal: Proposal,
     env: LayoutEnv,
     insets: Edges,
-) -> LayoutResult {
+) -> Result<LayoutResult, crate::text_error::TextError> {
     layout_placing(root, proposal, env, insets, true)
 }
 
@@ -4408,12 +4427,17 @@ pub(crate) fn layout_placing(
     env: LayoutEnv,
     insets: Edges,
     keep_unseen: bool,
-) -> LayoutResult {
+) -> Result<LayoutResult, crate::text_error::TextError> {
     let inner = Proposal {
-        width: proposal.width.map(|width| (width - insets.horizontal()).max(0.0)),
-        height: proposal.height.map(|height| (height - insets.vertical()).max(0.0)),
+        width: proposal
+            .width
+            .map(|width| (width - insets.horizontal()).max(0.0)),
+        height: proposal
+            .height
+            .map(|height| (height - insets.vertical()).max(0.0)),
     };
-    let (size, fit) = crate::stats::time(crate::stats::Stage::Measure, || root.measure(inner, &env));
+    let (size, fit) =
+        crate::stats::time(crate::stats::Stage::Measure, || root.measure(inner, &env))?;
     // the root stands at the leading inset — the right one in a scene
     // that reads right to left, where a root wider than the window
     // spills LEFT, as a left-to-right one spills right
@@ -4421,7 +4445,13 @@ pub(crate) fn layout_placing(
         Some(width) if env.rtl() => insets.leading + (width - size.width),
         _ => insets.leading,
     };
-    let safe = Rect { origin: Point { x: root_x, y: insets.top }, size };
+    let safe = Rect {
+        origin: Point {
+            x: root_x,
+            y: insets.top,
+        },
+        size,
+    };
     // the window: the proposal where it was proposed, the root's answer
     // plus the insets where it was open
     let window = Rect {
@@ -4435,8 +4465,13 @@ pub(crate) fn layout_placing(
     // of every scroll clip. Their default container is the WINDOW's
     // safe rect (the proposal), never the root's answer — a small scene
     // must not shrink the room a popover positions in.
-    let container =
-        Rect { origin: Point { x: insets.leading, y: insets.top }, size: insets.inset(window).size };
+    let container = Rect {
+        origin: Point {
+            x: insets.leading,
+            y: insets.top,
+        },
+        size: insets.inset(window).size,
+    };
     let mut out = Placement {
         keep_unseen,
         accessibility_viewport: Some(window),
@@ -4444,8 +4479,10 @@ pub(crate) fn layout_placing(
         ..Placement::default()
     };
     out.safe = (insets != Edges::ZERO).then_some(SafeFrame { window, safe });
-    crate::stats::time(crate::stats::Stage::Place, || root.place(safe, &fit, &env, &mut out));
-    place_overlays(container, &env, &mut out);
+    crate::stats::time(crate::stats::Stage::Place, || {
+        root.place(safe, &fit, &env, &mut out)
+    })?;
+    place_overlays(container, &env, &mut out)?;
     if crate::paranoid::on(crate::paranoid::SEEN) {
         // the claim of the cut: the list is the FULL list with what no
         // pixel can show taken out, and nothing else in the placement
@@ -4460,17 +4497,23 @@ pub(crate) fn layout_placing(
         };
         // the check places the scene again: its counts are nobody's
         let counted = crate::stats::snapshot();
-        root.place(safe, &fit, &env, &mut other);
-        place_overlays(container, &env, &mut other);
+        root.place(safe, &fit, &env, &mut other)?;
+        place_overlays(container, &env, &mut other)?;
         crate::stats::restore(counted);
-        let (full, cut) = if keep_unseen { (&out, &other) } else { (&other, &out) };
+        let (full, cut) = if keep_unseen {
+            (&out, &other)
+        } else {
+            (&other, &out)
+        };
         assert_seen_placement(full, cut);
     }
-    let thumbs = lift_thumbs(&mut out, &env);
-    LayoutResult {
+    let thumbs = lift_thumbs(&mut out, &env)?;
+    Ok(LayoutResult {
         size,
         accessibility: out.accessibility,
-        focus_order: out.focus_order, focus_floor: out.focus_floor, focus_scope: out.focus_scope,
+        focus_order: out.focus_order,
+        focus_floor: out.focus_floor,
+        focus_scope: out.focus_scope,
         frames: out.frames,
         display: out.display,
         hits: out.hits,
@@ -4492,7 +4535,7 @@ pub(crate) fn layout_placing(
         drag_sources: out.drag_sources,
         drops: out.drops,
         thumbs,
-    }
+    })
 }
 
 // A paint cut must preserve input ownership and placement geometry.
@@ -4554,10 +4597,13 @@ fn assert_seen_placement(full: &Placement, cut: &Placement) {
 ///
 /// The lifted commands leave the list, and every range kept into it — the
 /// live boxes' slices, the popovers' — moves with them.
-fn lift_thumbs(out: &mut Placement, env: &LayoutEnv<'_>) -> Vec<Thumb> {
+fn lift_thumbs(
+    out: &mut Placement,
+    env: &LayoutEnv<'_>,
+) -> Result<Vec<Thumb>, crate::text_error::TextError> {
     let marks = std::mem::take(&mut out.thumb_marks);
     if marks.is_empty() || !out.hosts.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     struct Candidate {
         at: usize,
@@ -4595,7 +4641,11 @@ fn lift_thumbs(out: &mut Placement, env: &LayoutEnv<'_>) -> Vec<Thumb> {
         .iter()
         .filter(|&&at| at < end)
         .filter_map(|&at| match &commands[at] {
-            DrawCommand::FillRect { rect, color, corner_radius } => {
+            DrawCommand::FillRect {
+                rect,
+                color,
+                corner_radius,
+            } => {
                 let pixels = snap(*rect);
                 let vertical = rect.size.height >= rect.size.width;
                 let (along, across) = if vertical {
@@ -4619,12 +4669,18 @@ fn lift_thumbs(out: &mut Placement, env: &LayoutEnv<'_>) -> Vec<Thumb> {
         })
         .collect();
     let customs = &out.customs;
-    let carved =
-        |index: usize| customs.iter().any(|custom| index >= custom.slice.0 && index < custom.slice.1);
+    let carved = |index: usize| {
+        customs
+            .iter()
+            .any(|custom| index >= custom.slice.0 && index < custom.slice.1)
+    };
     let mut clips: Vec<(Rect, Corners)> = Vec::new();
     for (index, command) in commands.iter().enumerate() {
         match command {
-            DrawCommand::PushClip { rect, corner_radius } => {
+            DrawCommand::PushClip {
+                rect,
+                corner_radius,
+            } => {
                 clips.push((*rect, *corner_radius));
                 continue;
             }
@@ -4640,10 +4696,15 @@ fn lift_thumbs(out: &mut Placement, env: &LayoutEnv<'_>) -> Vec<Thumb> {
             // whole inside the clip and clear of every curve over it
             let open = || {
                 clip.is_none_or(|clip| rect_within(thumb, clip))
-                    && clips.iter().all(|(rect, corners)| clear_of_corners(thumb, *rect, *corners))
+                    && clips
+                        .iter()
+                        .all(|(rect, corners)| clear_of_corners(thumb, *rect, *corners))
             };
             if index == candidate.at {
-                let one = candidate.ground.as_ref().is_some_and(|runs| runs.len() == 1);
+                let one = candidate
+                    .ground
+                    .as_ref()
+                    .is_some_and(|runs| runs.len() == 1);
                 candidate.clear = one && open() && !carved(index);
                 continue;
             }
@@ -4659,7 +4720,7 @@ fn lift_thumbs(out: &mut Placement, env: &LayoutEnv<'_>) -> Vec<Thumb> {
                 },
                 None => thumb,
             };
-            if !reaches(command, target, env) {
+            if !reaches(command, target, env)? {
                 continue;
             }
             if index > candidate.at {
@@ -4670,13 +4731,23 @@ fn lift_thumbs(out: &mut Placement, env: &LayoutEnv<'_>) -> Vec<Thumb> {
             // under it: a fill across its whole width paints a stretch of
             // its length; anything else mixes what it stands on
             let crossed = match command {
-                DrawCommand::FillRect { rect, color, corner_radius }
-                    if clips.iter().all(|(rect, corners)| clear_of_corners(thumb, *rect, *corners))
-                        && clear_of_corners(thumb, *rect, *corner_radius) =>
+                DrawCommand::FillRect {
+                    rect,
+                    color,
+                    corner_radius,
+                } if clips
+                    .iter()
+                    .all(|(rect, corners)| clear_of_corners(thumb, *rect, *corners))
+                    && clear_of_corners(thumb, *rect, *corner_radius) =>
                 {
                     let fill = snap(*rect);
                     let fill = match clip.map(snap) {
-                        Some(cut) => (fill.0.max(cut.0), fill.1.max(cut.1), fill.2.min(cut.2), fill.3.min(cut.3)),
+                        Some(cut) => (
+                            fill.0.max(cut.0),
+                            fill.1.max(cut.1),
+                            fill.2.min(cut.2),
+                            fill.3.min(cut.3),
+                        ),
                         None => fill,
                     };
                     let (along, across) = if candidate.vertical {
@@ -4707,7 +4778,7 @@ fn lift_thumbs(out: &mut Placement, env: &LayoutEnv<'_>) -> Vec<Thumb> {
     }
     candidates.retain(|candidate| candidate.clear);
     if candidates.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let lifted: Vec<usize> = candidates.iter().map(|candidate| candidate.at).collect();
     out.display.remove_sorted(&lifted);
@@ -4718,17 +4789,20 @@ fn lift_thumbs(out: &mut Placement, env: &LayoutEnv<'_>) -> Vec<Thumb> {
     for overlay in &mut out.overlays {
         overlay.display = (moved(overlay.display.0), moved(overlay.display.1));
     }
-    candidates
+    Ok(candidates
         .into_iter()
         .map(|candidate| Thumb {
             rect: candidate.rect,
             color: blend(
-                candidate.ground.and_then(|runs| runs.first().map(|run| run.2)).unwrap_or(floor),
+                candidate
+                    .ground
+                    .and_then(|runs| runs.first().map(|run| run.2))
+                    .unwrap_or(floor),
                 candidate.color,
             ),
             radius: candidate.radius,
         })
-        .collect()
+        .collect())
 }
 
 /// A fill over the stretch `from..to` of a thumb's length: the runs under
@@ -4763,25 +4837,49 @@ fn paint_runs(runs: &mut Vec<(i64, i64, Color)>, from: i64, to: i64, ink: Color)
 /// Can `command` put ink inside `target`? [`DrawCommand::may_reach`], with
 /// two answers made exact: a line of text reaches as far as it measures, not
 /// to the window's edge, and a stroke paints its band, not the box inside it.
-fn reaches(command: &DrawCommand, target: Rect, env: &LayoutEnv<'_>) -> bool {
+fn reaches(
+    command: &DrawCommand,
+    target: Rect,
+    env: &LayoutEnv<'_>,
+) -> Result<bool, crate::text_error::TextError> {
     if !command.may_reach(target) {
-        return false;
+        return Ok(false);
     }
-    match command {
-        DrawCommand::TextLine { origin, content, range, font, .. } => {
-            let Ok(line) = content.line(range.0..range.1) else { return false };
-            let metrics = env.cache.get_or_measure_paragraph(&line, font, env.text);
+    Ok(match command {
+        DrawCommand::TextLine {
+            origin,
+            content,
+            range,
+            font,
+            ..
+        } => {
+            let line = content.line(range.0..range.1)?;
+            let metrics = env.cache.get_or_measure_paragraph(&line, font, env.text)?;
             // two points of slack each way: measure and raster round apart
             let ink = Rect {
-                origin: Point { x: origin.x - 2.0, y: origin.y - 2.0 },
-                size: Size { width: metrics.width + 4.0, height: metrics.height() + 4.0 },
+                origin: Point {
+                    x: origin.x - 2.0,
+                    y: origin.y - 2.0,
+                },
+                size: Size {
+                    width: metrics.width + 4.0,
+                    height: metrics.height() + 4.0,
+                },
             };
             ink.intersection(target).is_some()
         }
-        DrawCommand::StrokeRect { rect, width, corner_radius, .. } => {
+        DrawCommand::StrokeRect {
+            rect,
+            width,
+            corner_radius,
+            ..
+        } => {
             let inset = width / 2.0 + 1.0;
             let inner = Rect {
-                origin: Point { x: rect.origin.x + inset, y: rect.origin.y + inset },
+                origin: Point {
+                    x: rect.origin.x + inset,
+                    y: rect.origin.y + inset,
+                },
                 size: Size {
                     width: rect.size.width - 2.0 * inset,
                     height: rect.size.height - 2.0 * inset,
@@ -4792,7 +4890,7 @@ fn reaches(command: &DrawCommand, target: Rect, env: &LayoutEnv<'_>) -> bool {
                 || !clear_of_corners(target, *rect, *corner_radius)
         }
         _ => true,
-    }
+    })
 }
 
 /// `over` painted on `ground` the way the GPU blends a fill: straight
@@ -4841,13 +4939,16 @@ fn clear_of_corners(rect: Rect, clip: Rect, corners: Corners) -> bool {
 /// Runs both phases WITH the Dom capture on: the same walk, plus the
 /// semantic scene collected on the way ([`crate::dom`]). The regular
 /// [`layout_with`] never pays for the sink.
+///
+/// # Errors
+/// Returns a text or range error if contextual text cannot be prepared or used.
 pub fn layout_dom(
     root: &LayoutNode,
     proposal: Proposal,
     env: LayoutEnv,
     collect_display: bool,
-) -> (LayoutResult, crate::dom::DomNode) {
-    let (size, fit) = root.measure(proposal, &env);
+) -> Result<(LayoutResult, crate::dom::DomNode), crate::text_error::TextError> {
+    let (size, fit) = root.measure(proposal, &env)?;
     let mut out = Placement {
         accessibility_viewport: Some(window_bounds(proposal, size)),
         dom: Some(crate::dom::DomCapture::new(size)),
@@ -4855,17 +4956,31 @@ pub fn layout_dom(
         keep_unseen: true,
         ..Placement::default()
     };
-    root.place(Rect { origin: Point::default(), size }, &fit, &env, &mut out);
+    root.place(
+        Rect {
+            origin: Point::default(),
+            size,
+        },
+        &fit,
+        &env,
+        &mut out,
+    )?;
     // the capture is still open at the root here, so every popover
     // mounts as the root's LAST child — outside every scroll element,
     // stacked on top by document order: the portal, by construction
-    place_overlays(window_bounds(proposal, size), &env, &mut out);
-    let scene = out.dom.take().expect("the capture stays for the whole walk").finish();
-    (
+    place_overlays(window_bounds(proposal, size), &env, &mut out)?;
+    let scene = out
+        .dom
+        .take()
+        .expect("the capture stays for the whole walk")
+        .finish();
+    Ok((
         LayoutResult {
             size,
             accessibility: out.accessibility,
-        focus_order: out.focus_order, focus_floor: out.focus_floor, focus_scope: out.focus_scope,
+            focus_order: out.focus_order,
+            focus_floor: out.focus_floor,
+            focus_scope: out.focus_scope,
             frames: out.frames,
             display: out.display,
             hits: out.hits,
@@ -4889,7 +5004,7 @@ pub fn layout_dom(
             thumbs: Vec::new(),
         },
         scene,
-    )
+    ))
 }
 
 /// The image's answer to a proposal. Not decoded yet (`None`
@@ -5268,7 +5383,11 @@ fn tooltip_node(text: Arc<str>) -> LayoutNode {
     }
 }
 
-fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
+fn place_overlays(
+    viewport: Rect,
+    env: &LayoutEnv<'_>,
+    out: &mut Placement,
+) -> Result<(), crate::text_error::TextError> {
     let container = env.overlay_bounds.unwrap_or(viewport);
     let mut placed = 0;
     while !out.overlay_queue.is_empty() && placed < OVERLAY_CAP {
@@ -5277,7 +5396,10 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
         // the overlay reads the way its anchor did, not the way the root
         // does: a popover of a right-to-left island lays out from the
         // right inside a scene that reads from the left
-        let env = &LayoutEnv { direction: queued.direction, ..*env };
+        let env = &LayoutEnv {
+            direction: queued.direction,
+            ..*env
+        };
         let proposal = Proposal {
             width: Some(container.size.width),
             height: Some(container.size.height),
@@ -5332,10 +5454,17 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
             // (the reader may drag an alert; nothing resizes one), and
             // a first open centres it like the sheet it degrades to.
             (None, OverlaySurface::Alert(spec)) => {
-                let (natural, _) = queued
-                    .node
-                    .measure(Proposal { width: Some(spec.width), height: None }, env);
-                let size = Size { width: spec.width, height: natural.height };
+                let (natural, _) = queued.node.measure(
+                    Proposal {
+                        width: Some(spec.width),
+                        height: None,
+                    },
+                    env,
+                )?;
+                let size = Size {
+                    width: spec.width,
+                    height: natural.height,
+                };
                 let held = env
                     .dialog_frames
                     .and_then(|frames| frames.get(&queued.path));
@@ -5365,13 +5494,14 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
                 height: Some(room.size.height),
             },
         };
-        let (size, fit) = queued.node.measure(proposal, env);
+        let (size, fit) = queued.node.measure(proposal, env)?;
         let frame = match (&window_frame, queued.side) {
             (Some(frame), _) => *frame,
             (None, Some(side)) => anchored_frame(queued.anchor, side, size, container),
             (None, None) => Rect {
                 origin: Point {
-                    x: room.origin.x + align_offset(room.size.width, size.width, CrossAlign::Center),
+                    x: room.origin.x
+                        + align_offset(room.size.width, size.width, CrossAlign::Center),
                     y: room.origin.y
                         + align_offset(room.size.height, size.height, CrossAlign::Center),
                 },
@@ -5381,9 +5511,11 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
         let start = out.display.len();
         out.focus_floor = out.focus_order.len();
         out.focus_scope = Some(Rc::from(queued.path.as_str()));
-        let accessibility_surface = out.accessibility_surface.replace(Rc::from(queued.path.as_str()));
+        let accessibility_surface = out
+            .accessibility_surface
+            .replace(Rc::from(queued.path.as_str()));
         let accessibility_viewport = out.accessibility_viewport.replace(frame);
-        queued.node.place(frame, &fit, env, out);
+        queued.node.place(frame, &fit, env, out)?;
         out.accessibility_viewport = accessibility_viewport;
         out.accessibility_surface = accessibility_surface;
         let end = out.display.len();
@@ -5400,29 +5532,41 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
     // runtime will close it, and its rows highlight from the stamp
     if let Some(open) = env.stamp.interaction.menu.clone() {
         // the panel reads the way the region it opened from does
-        let env = &LayoutEnv { direction: open.direction, ..*env };
+        let env = &LayoutEnv {
+            direction: open.direction,
+            ..*env
+        };
         let node = menu_node(&open, env);
         // natural width, floored at the house minimum; the height is
         // the rows' own
         let (natural, _) = node.measure(
-            Proposal { width: None, height: Some(container.size.height) },
+            Proposal {
+                width: None,
+                height: Some(container.size.height),
+            },
             env,
-        );
+        )?;
         let size = Size {
             width: natural.width.max(MENU_MIN_W).min(container.size.width),
             height: natural.height.min(container.size.height),
         };
         let (_, fit) = node.measure(
-            Proposal { width: Some(size.width), height: Some(size.height) },
+            Proposal {
+                width: Some(size.width),
+                height: Some(size.height),
+            },
             env,
-        );
+        )?;
         let frame = menu_frame(open.at, size, container, env.rtl());
         let start = out.display.len();
-        node.place(frame, &fit, env, out);
+        node.place(frame, &fit, env, out)?;
         let end = out.display.len();
         out.overlays.push(OverlayPlacement {
             path: MENU_PATH.to_string(),
-            anchor: Rect { origin: open.at, size: Size::default() },
+            anchor: Rect {
+                origin: open.at,
+                size: Size::default(),
+            },
             frame,
             display: (start, end),
             anchor_visible: true,
@@ -5438,11 +5582,18 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
             width: Some(container.size.width),
             height: Some(container.size.height),
         };
-        let (size, fit) = node.measure(proposal, env);
+        let (size, fit) = node.measure(proposal, env)?;
         // off the pointer's trailing side: the right, or the left in a
         // right-to-left scene, so the hand never covers the label
-        let x = if env.rtl() { live.at.x - 14.0 - size.width } else { live.at.x + 14.0 };
-        let at = Point { x, y: live.at.y + 16.0 };
+        let x = if env.rtl() {
+            live.at.x - 14.0 - size.width
+        } else {
+            live.at.x + 14.0
+        };
+        let at = Point {
+            x,
+            y: live.at.y + 16.0,
+        };
         let clamp = |value: Px, low: Px, high: Px| value.min(high).max(low);
         let frame = Rect {
             origin: Point {
@@ -5460,11 +5611,14 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
             size,
         };
         let start = out.display.len();
-        node.place(frame, &fit, env, out);
+        node.place(frame, &fit, env, out)?;
         let end = out.display.len();
         out.overlays.push(OverlayPlacement {
             path: DRAG_LABEL_PATH.to_string(),
-            anchor: Rect { origin: live.at, size: Size::default() },
+            anchor: Rect {
+                origin: live.at,
+                size: Size::default(),
+            },
             frame,
             display: (start, end),
             anchor_visible: true,
@@ -5473,26 +5627,28 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
     }
     // the tooltip lands LAST — above every popover, outside every
     // clip, and on the desktop it leaves the window like they do
-    if let Some((text, side, anchor)) = env.stamp.interaction.tooltip.clone() {
-        let node = tooltip_node(text);
-        let proposal = Proposal {
-            width: Some(container.size.width),
-            height: Some(container.size.height),
-        };
-        let (size, fit) = node.measure(proposal, env);
-        let frame = anchored_frame(anchor, side, size, container);
-        let start = out.display.len();
-        node.place(frame, &fit, env, out);
-        let end = out.display.len();
-        out.overlays.push(OverlayPlacement {
-            path: TOOLTIP_PATH.to_string(),
-            anchor,
-            frame,
-            display: (start, end),
-            anchor_visible: true,
-            surface: OverlaySurface::Layer,
-        });
-    }
+
+        if let Some((text, side, anchor)) = env.stamp.interaction.tooltip.clone() {
+            let node = tooltip_node(text);
+            let proposal = Proposal {
+                width: Some(container.size.width),
+                height: Some(container.size.height),
+            };
+            let (size, fit) = node.measure(proposal, env)?;
+            let frame = anchored_frame(anchor, side, size, container);
+            let start = out.display.len();
+            node.place(frame, &fit, env, out)?;
+            let end = out.display.len();
+            out.overlays.push(OverlayPlacement {
+                path: TOOLTIP_PATH.to_string(),
+                anchor,
+                frame,
+                display: (start, end),
+                anchor_visible: true,
+                surface: OverlaySurface::Layer,
+            });
+        }
+    Ok(())
 }
 
 /// The cover rect: the smallest rect with the intrinsic ratio that
@@ -5649,11 +5805,18 @@ impl LayoutNode {
     /// the caller then uses the bottom edge (the rule for baselineless
     /// boxes). Only the baseline alignment walks this; everyone else
     /// pays nothing.
-    fn first_baseline(&self, env: &LayoutEnv<'_>) -> Option<Px> {
-        match self {
+    fn first_baseline(
+        &self,
+        env: &LayoutEnv<'_>,
+    ) -> Result<Option<Px>, crate::text_error::TextError> {
+        Ok(match self {
             LayoutNode::Text { content, .. } => {
                 let content = content.get();
-                Some(env.cache.measure_text(&content, &env.font, env.text).ascent)
+                Some(
+                    env.cache
+                        .measure_text(&content, &env.font, env.text)?
+                        .ascent,
+                )
             }
             LayoutNode::Field { .. } => {
                 let metrics = env.cache.get_or_measure("0", &env.font, env.text);
@@ -5668,9 +5831,9 @@ impl LayoutNode {
                     flips: props.flips.unwrap_or(env.flips),
                     ..*env
                 };
-                child.first_baseline(&env)
+                child.first_baseline(&env)?
             }
-            LayoutNode::Overlay { child, .. } => child.first_baseline(env),
+            LayoutNode::Overlay { child, .. } => child.first_baseline(env)?,
             LayoutNode::Animated { child, .. }
             | LayoutNode::Island { child, .. }
             | LayoutNode::Live { child, .. }
@@ -5688,34 +5851,49 @@ impl LayoutNode {
             | LayoutNode::Hinted { child, .. }
             | LayoutNode::Frame { child, .. }
             | LayoutNode::FlexFrame { child, .. }
-            | LayoutNode::Hug { child, .. } => child.first_baseline(env),
+            | LayoutNode::Hug { child, .. } => child.first_baseline(env)?,
             // lane A leads the seam — its text sets the shared line
-            LayoutNode::Split { children, .. } => {
-                children.first().and_then(|child| child.first_baseline(env))
+            LayoutNode::Split { children, .. } => children
+                .first()
+                .map(|child| child.first_baseline(env))
+                .transpose()?
+                .flatten(),
+            LayoutNode::Padding { edges, child } => child
+                .first_baseline(env)?
+                .map(|baseline| baseline + edges.top),
+            LayoutNode::Stack { children, .. } | LayoutNode::Flow { children, .. } => children
+                .first()
+                .map(|child| child.first_baseline(env))
+                .transpose()?
+                .flatten(),
+            LayoutNode::Boundary { children, .. } => children
+                .first()
+                .map(|child| child.first_baseline(env))
+                .transpose()?
+                .flatten(),
+            LayoutNode::Accessible { child, .. } | LayoutNode::Measured { child, .. } => {
+                child.first_baseline(env)?
             }
-            LayoutNode::Padding { edges, child } => {
-                child.first_baseline(env).map(|baseline| baseline + edges.top)
-            }
-            LayoutNode::Stack { children, .. } | LayoutNode::Flow { children, .. } => {
-                children.first().and_then(|child| child.first_baseline(env))
-            }
-            LayoutNode::Boundary { children, .. } => {
-                children.first().and_then(|child| child.first_baseline(env))
-            }
-            LayoutNode::Accessible { child, .. }
-            | LayoutNode::Measured { child, .. } => child.first_baseline(env),
-            LayoutNode::BoundaryRef { slot, .. } => {
-                slot.with_layout(|layout| layout.and_then(|node| node.first_baseline(env)))
-            }
+            LayoutNode::BoundaryRef { slot, .. } => slot
+                .with_layout(|layout| layout.map(|node| node.first_baseline(env)).transpose())?
+                .flatten(),
             _ => None,
-        }
+        })
     }
 
-    pub(crate) fn measure(&self, proposal: Proposal, env: &LayoutEnv<'_>) -> (Size, Fit) {
-        match self {
-            LayoutNode::Text { content, truncation, .. } => {
+    pub(crate) fn measure(
+        &self,
+        proposal: Proposal,
+        env: &LayoutEnv<'_>,
+    ) -> Result<(Size, Fit), crate::text_error::TextError> {
+        Ok(match self {
+            LayoutNode::Text {
+                content,
+                truncation,
+                ..
+            } => {
                 let content = content.get();
-                let metrics = env.cache.measure_text(&content, &env.font, env.text);
+                let metrics = env.cache.measure_text(&content, &env.font, env.text)?;
                 let natural = metrics.width;
                 let hard_lines = content.bytes().filter(|byte| *byte == b'\n').count() + 1;
                 // the line box a paragraph steps by: the face's own box,
@@ -5728,10 +5906,14 @@ impl LayoutNode {
                 let size = match proposal.width {
                     Some(width) if width > 0.0 && (width < natural || hard_lines > 1) => {
                         if truncation.is_some() {
-                            Size { width, height: advance }
+                            Size {
+                                width,
+                                height: advance,
+                            }
                         } else {
-                            let lines =
-                                env.cache.get_or_break(&content, &env.font, width, env.text);
+                            let lines = env
+                                .cache
+                                .get_or_break(&content, &env.font, width, env.text)?;
                             // A paragraph told how tall it may be answers
                             // that, not what it wishes it were. Answering
                             // the wish is what put a card's text over the
@@ -5745,13 +5927,19 @@ impl LayoutNode {
                             // of text keeps growing.
                             Size {
                                 width: width.min(natural),
-                                height: rows_that_fit(lines.len(), advance, proposal.height)
-                                    as Px
+                                height: rows_that_fit(lines.len(), advance, proposal.height) as Px
                                     * advance,
                             }
                         }
                     }
-                    _ => Size { width: natural, height: std::iter::repeat_n(advance, rows_that_fit(hard_lines, advance, proposal.height)).sum() },
+                    _ => Size {
+                        width: natural,
+                        height: std::iter::repeat_n(
+                            advance,
+                            rows_that_fit(hard_lines, advance, proposal.height),
+                        )
+                        .sum(),
+                    },
                 };
                 (size, Fit::Leaf)
             }
@@ -5764,7 +5952,14 @@ impl LayoutNode {
                 (size, Fit::Leaf)
             }
 
-            LayoutNode::Field { path, content: held, placeholder, multiline, secret, .. } => {
+            LayoutNode::Field {
+                path,
+                content: held,
+                placeholder,
+                multiline,
+                secret,
+                ..
+            } => {
                 let shown = crate::text_input::displayed(held, *secret, *multiline);
                 let content = shown.as_ref();
                 let hint = crate::text_input::displayed(placeholder, false, *multiline);
@@ -5785,21 +5980,32 @@ impl LayoutNode {
                     let line_h = env.line_height.unwrap_or_else(|| {
                         env.cache.get_or_measure("0", &env.font, env.text).height()
                     });
-                    let width = proposal
-                        .width
-                        .unwrap_or_else(|| note_natural_width(sample, env) + 2.0 * FIELD_PAD_H);
-                    let height = proposal.height.unwrap_or_else(|| {
-                        let inner = (width - 2.0 * FIELD_PAD_H).max(1.0);
-                        let lines =
-                            env.cache.field_lines(path, sample, shared, &env.font, inner, env.text);
-                        lines.len() as Px * line_h + 2.0 * FIELD_PAD_V
-                    });
+                    let width = match proposal.width {
+                        Some(width) => width,
+                        None => note_natural_width(sample, env)? + 2.0 * FIELD_PAD_H,
+                    };
+                    let height = match proposal.height {
+                        Some(height) => height,
+                        None => {
+                            let inner = (width - 2.0 * FIELD_PAD_H).max(1.0);
+                            let lines = env
+                                .cache
+                                .field_lines(path, sample, shared, &env.font, inner, env.text)?;
+                            lines.len() as Px * line_h + 2.0 * FIELD_PAD_V
+                        }
+                    };
                     (Size { width, height }, Fit::Leaf)
                 } else {
-                    let metrics = env.cache.measure_text(sample, &env.font, env.text);
+                    let metrics = env.cache.measure_text(sample, &env.font, env.text)?;
                     let width = proposal.width.unwrap_or(metrics.width + 2.0 * FIELD_PAD_H);
                     let line_h = env.line_height.unwrap_or(metrics.height());
-                    (Size { width, height: line_h + 2.0 * FIELD_PAD_V }, Fit::Leaf)
+                    (
+                        Size {
+                            width,
+                            height: line_h + 2.0 * FIELD_PAD_V,
+                        },
+                        Fit::Leaf,
+                    )
                 }
             }
 
@@ -5829,10 +6035,17 @@ impl LayoutNode {
                 Fit::Leaf,
             ),
 
-            LayoutNode::Image { source, resizable, fit } => {
+            LayoutNode::Image {
+                source,
+                resizable,
+                fit,
+            } => {
                 let size = match source {
                     // the print-parity stub keeps the old rigid box
-                    None => Size { width: 40.0, height: 40.0 },
+                    None => Size {
+                        width: 40.0,
+                        height: 40.0,
+                    },
                     Some(source) => {
                         let intrinsic = intrinsic_of(&*env.images, source);
                         // a size that is not known yet arrives later, with
@@ -5849,82 +6062,100 @@ impl LayoutNode {
             LayoutNode::Icon { resizable, .. } => {
                 // a synchronous square — no decode, no reflow, ever
                 let side = crate::icon::natural_size(&env.font) as u32;
-                (image_size(Some((side, side)), *resizable, None, proposal), Fit::Leaf)
+                (
+                    image_size(Some((side, side)), *resizable, None, proposal),
+                    Fit::Leaf,
+                )
             }
 
             // the child's geometry IS the node's — a sheet floats over
             // it and never enlarges what it covers
             LayoutNode::Sheet { child, .. } => {
-                let (size, fit) = child.measure(proposal, env);
+                let (size, fit) = child.measure(proposal, env)?;
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
             // the anchor's geometry IS the node's — the overlay never
             // participates in the measure
             LayoutNode::Anchored { child, .. } => {
-                let (size, fit) = child.measure(proposal, env);
+                let (size, fit) = child.measure(proposal, env)?;
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
             LayoutNode::DragRegion { child } => {
-                let (size, fit) = child.measure(proposal, env);
+                let (size, fit) = child.measure(proposal, env)?;
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
             LayoutNode::IgnoresSafeArea { child } => {
-                let (size, fit) = child.measure(proposal, env);
+                let (size, fit) = child.measure(proposal, env)?;
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
             LayoutNode::ControlRegion { child, .. } => {
-                let (size, fit) = child.measure(proposal, env);
+                let (size, fit) = child.measure(proposal, env)?;
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
             LayoutNode::Tooltip { child, .. } => {
-                let (size, fit) = child.measure(proposal, env);
+                let (size, fit) = child.measure(proposal, env)?;
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
             LayoutNode::ContextSource { child, .. } => {
-                let (size, fit) = child.measure(proposal, env);
+                let (size, fit) = child.measure(proposal, env)?;
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
             LayoutNode::DragSource { child, .. } | LayoutNode::DropTarget { child, .. } => {
-                let (size, fit) = child.measure(proposal, env);
+                let (size, fit) = child.measure(proposal, env)?;
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
             LayoutNode::Hinted { child, .. } => {
-                let (size, fit) = child.measure(proposal, env);
+                let (size, fit) = child.measure(proposal, env)?;
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
             LayoutNode::BoundaryHint { .. } => (Size::default(), Fit::Leaf),
 
             LayoutNode::ExactLayout { child } => {
-                let (size, fit) = child.measure(proposal, env);
+                let (size, fit) = child.measure(proposal, env)?;
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
-            LayoutNode::Stack { axis, spacing, children, .. } => {
-                measure_stack(*axis, *spacing, children, proposal, env)
-            }
+            LayoutNode::Stack {
+                axis,
+                spacing,
+                children,
+                ..
+            } => measure_stack(*axis, *spacing, children, proposal, env)?,
 
-            LayoutNode::Flow { spacing, line_spacing, children, .. } => {
-                measure_flow(*spacing, *line_spacing, children, proposal, env)
-            }
+            LayoutNode::Flow {
+                spacing,
+                line_spacing,
+                children,
+                ..
+            } => measure_flow(*spacing, *line_spacing, children, proposal, env)?,
 
-            LayoutNode::VirtualStack { row_extent, count, children, heights, measured: cache } => {
-                let child_proposal = Proposal { width: proposal.width, height: None };
+            LayoutNode::VirtualStack {
+                row_extent,
+                count,
+                children,
+                heights,
+                measured: cache,
+            } => {
+                let child_proposal = Proposal {
+                    width: proposal.width,
+                    height: None,
+                };
                 let measured: Vec<(usize, Size, Fit)> = children
                     .iter()
                     .map(|(index, child)| {
-                        let (size, fit) = child.measure(child_proposal, env);
-                        (*index, size, fit)
+                        let (size, fit) = child.measure(child_proposal, env)?;
+                        Ok((*index, size, fit))
                     })
-                    .collect();
+                    .collect::<Result<_, crate::text_error::TextError>>()?;
                 // rows that measure themselves: what the glass shows is
                 // kept, so the offsets below count every row seen at
                 // what it really is — and a row above the viewport that
@@ -5948,9 +6179,14 @@ impl LayoutNode {
                     let starts = cache.offsets(*count);
                     let mut owed = 0.0;
                     for (index, size, _) in &measured {
-                        let Some(before) = cache.record(*index, size.height) else { continue };
+                        let Some(before) = cache.record(*index, size.height) else {
+                            continue;
+                        };
                         cache_moved = true;
-                        if starts.get(*index).is_some_and(|start| *start < offset - SETTLED) {
+                        if starts
+                            .get(*index)
+                            .is_some_and(|start| *start < offset - SETTLED)
+                        {
                             owed += size.height - before;
                         }
                     }
@@ -5996,7 +6232,10 @@ impl LayoutNode {
                         }
                         let total = *offsets.last().expect("offsets carry the total");
                         (
-                            Size { width, height: total },
+                            Size {
+                                width,
+                                height: total,
+                            },
                             Fit::Virtual {
                                 row_extent: 0.0,
                                 children: measured,
@@ -6015,7 +6254,10 @@ impl LayoutNode {
                             .unwrap_or(*row_extent)
                             .max(0.0);
                         (
-                            Size { width, height: row * *count as Px },
+                            Size {
+                                width,
+                                height: row * *count as Px,
+                            },
                             Fit::Virtual {
                                 row_extent: row,
                                 children: measured,
@@ -6028,20 +6270,27 @@ impl LayoutNode {
 
             LayoutNode::Overlay { layer, child, .. } => {
                 // the base answers ALONE — the layer never enters a max
-                let (size, base_fit) = child.measure(proposal, env);
+                let (size, base_fit) = child.measure(proposal, env)?;
                 // and the layer negotiates against the RESOLVED box, so
                 // a `Fill` inside it takes exactly what the base took
-                let (layer_size, layer_fit) = layer.measure(Proposal::exact(size), env);
-                (size, Fit::Children(vec![(size, base_fit), (layer_size, layer_fit)]))
+                let (layer_size, layer_fit) = layer.measure(Proposal::exact(size), env)?;
+                (
+                    size,
+                    Fit::Children(vec![(size, base_fit), (layer_size, layer_fit)]),
+                )
             }
 
             LayoutNode::Layered { children, .. } => {
-                let mut measured: Vec<(Size, Fit)> =
-                    children.iter().map(|child| child.measure(proposal, env)).collect();
-                let mut size = measured.iter().fold(Size::default(), |acc, (size, _)| Size {
-                    width: acc.width.max(size.width),
-                    height: acc.height.max(size.height),
-                });
+                let mut measured: Vec<(Size, Fit)> = children
+                    .iter()
+                    .map(|child| child.measure(proposal, env))
+                    .collect::<Result<_, _>>()?;
+                let mut size = measured
+                    .iter()
+                    .fold(Size::default(), |acc, (size, _)| Size {
+                        width: acc.width.max(size.width),
+                        height: acc.height.max(size.height),
+                    });
                 // The stack's last pass, on both axes at once: a layer too
                 // big to shrink decides the box, and a layer that CAN take
                 // that box was measured against a smaller one. Centring it
@@ -6060,7 +6309,7 @@ impl LayoutNode {
                         width: Some(if wider { size.width } else { answered.width }),
                         height: Some(if taller { size.height } else { answered.height }),
                     };
-                    measured[index] = child.measure(asked, env);
+                    measured[index] = child.measure(asked, env)?;
                     size.width = size.width.max(measured[index].0.width);
                     size.height = size.height.max(measured[index].0.height);
                 }
@@ -6068,16 +6317,15 @@ impl LayoutNode {
             }
 
             LayoutNode::Padding { edges, child } => {
-                let inset = |length: Option<Px>, total: Px| {
-                    length.map(|length| (length - total).max(0.0))
-                };
+                let inset =
+                    |length: Option<Px>, total: Px| length.map(|length| (length - total).max(0.0));
                 let (child_size, fit) = child.measure(
                     Proposal {
                         width: inset(proposal.width, edges.horizontal()),
                         height: inset(proposal.height, edges.vertical()),
                     },
                     env,
-                );
+                )?;
                 let size = Size {
                     width: child_size.width + edges.horizontal(),
                     height: child_size.height + edges.vertical(),
@@ -6085,14 +6333,19 @@ impl LayoutNode {
                 (size, Fit::Wrapped(child_size, Box::new(fit)))
             }
 
-            LayoutNode::Frame { width, height, child, .. } => {
+            LayoutNode::Frame {
+                width,
+                height,
+                child,
+                ..
+            } => {
                 let (child_size, fit) = child.measure(
                     Proposal {
                         width: width.or(proposal.width),
                         height: height.or(proposal.height),
                     },
                     env,
-                );
+                )?;
                 let size = Size {
                     width: width.unwrap_or(child_size.width),
                     height: height.unwrap_or(child_size.height),
@@ -6100,7 +6353,12 @@ impl LayoutNode {
                 (size, Fit::Wrapped(child_size, Box::new(fit)))
             }
 
-            LayoutNode::MaxFrame { max_width, max_height, child, .. } => {
+            LayoutNode::MaxFrame {
+                max_width,
+                max_height,
+                child,
+                ..
+            } => {
                 let cap = |proposed: Option<Px>, max: Px| match proposed {
                     Some(length) => Some(length.min(max)),
                     None if max.is_finite() => Some(max),
@@ -6112,7 +6370,7 @@ impl LayoutNode {
                         height: cap(proposal.height, *max_height),
                     },
                     env,
-                );
+                )?;
                 // ∞ = fill what was proposed; finite = a ceiling over the child
                 let resolve = |proposed: Option<Px>, max: Px, child_len: Px| {
                     if max.is_infinite() {
@@ -6128,7 +6386,12 @@ impl LayoutNode {
                 (size, Fit::Wrapped(child_size, Box::new(fit)))
             }
 
-            LayoutNode::FlexFrame { min_width, min_height, child, .. } => {
+            LayoutNode::FlexFrame {
+                min_width,
+                min_height,
+                child,
+                ..
+            } => {
                 // proposed: the proposal, floored; unproposed: the floor
                 // itself — a zero floor hugs the content on that axis
                 let floor = |proposed: Option<Px>, min: Px| match proposed {
@@ -6140,7 +6403,7 @@ impl LayoutNode {
                     width: floor(proposal.width, *min_width),
                     height: floor(proposal.height, *min_height),
                 };
-                let (child_size, fit) = child.measure(offer, env);
+                let (child_size, fit) = child.measure(offer, env)?;
                 let size = Size {
                     width: offer.width.unwrap_or(child_size.width),
                     height: offer.height.unwrap_or(child_size.height),
@@ -6156,7 +6419,7 @@ impl LayoutNode {
                         height: if vertical { None } else { proposal.height },
                     },
                     env,
-                );
+                )?;
                 let clamp = |offered: Option<Px>, natural: Px| {
                     offered.map_or(natural, |offered| natural.min(offered))
                 };
@@ -6175,16 +6438,26 @@ impl LayoutNode {
                 (size, Fit::Wrapped(child_size, Box::new(fit)))
             }
 
-            LayoutNode::Scroll { axes, fill, child, .. } => {
+            LayoutNode::Scroll {
+                axes, fill, child, ..
+            } => {
                 // the scrolling axes stay OPEN — the content takes its
                 // natural extent there and the region travels through it
                 let (content, fit) = child.measure(
                     Proposal {
-                        width: if axes.horizontal() { None } else { proposal.width },
-                        height: if axes.vertical() { None } else { proposal.height },
+                        width: if axes.horizontal() {
+                            None
+                        } else {
+                            proposal.width
+                        },
+                        height: if axes.vertical() {
+                            None
+                        } else {
+                            proposal.height
+                        },
                     },
                     env,
-                );
+                )?;
                 let size = Size {
                     width: proposal.width.unwrap_or(content.width),
                     height: proposal.height.unwrap_or(content.height),
@@ -6199,11 +6472,25 @@ impl LayoutNode {
                         || (axes.vertical() && content.height < size.height))
                 {
                     let again = Proposal {
-                        width: if axes.horizontal() { Some(content.width.max(size.width)) } else { proposal.width },
-                        height: if axes.vertical() { Some(content.height.max(size.height)) } else { proposal.height },
+                        width: if axes.horizontal() {
+                            Some(content.width.max(size.width))
+                        } else {
+                            proposal.width
+                        },
+                        height: if axes.vertical() {
+                            Some(content.height.max(size.height))
+                        } else {
+                            proposal.height
+                        },
                     };
-                    let (grown, fit) = child.measure(again, env);
-                    (Size { width: grown.width.max(content.width), height: grown.height.max(content.height) }, fit)
+                    let (grown, fit) = child.measure(again, env)?;
+                    (
+                        Size {
+                            width: grown.width.max(content.width),
+                            height: grown.height.max(content.height),
+                        },
+                        fit,
+                    )
                 } else {
                     (content, fit)
                 };
@@ -6214,8 +6501,16 @@ impl LayoutNode {
                 // document.
                 let content = if *fill {
                     Size {
-                        width: if axes.horizontal() { content.width.max(size.width) } else { content.width },
-                        height: if axes.vertical() { content.height.max(size.height) } else { content.height },
+                        width: if axes.horizontal() {
+                            content.width.max(size.width)
+                        } else {
+                            content.width
+                        },
+                        height: if axes.vertical() {
+                            content.height.max(size.height)
+                        } else {
+                            content.height
+                        },
                     }
                 } else {
                     content
@@ -6223,15 +6518,29 @@ impl LayoutNode {
                 (size, Fit::ScrollContent(content, Box::new(fit)))
             }
 
-            LayoutNode::Split { axis, unit, at, min_a, min_b, trailing, children, .. } => {
-                measure_split(
-                    *axis, *unit, at.value(), *min_a, *min_b, *trailing, children, proposal, env,
-                )
-            }
+            LayoutNode::Split {
+                axis,
+                unit,
+                at,
+                min_a,
+                min_b,
+                trailing,
+                children,
+                ..
+            } => measure_split(
+                *axis,
+                *unit,
+                at.value(),
+                *min_a,
+                *min_b,
+                *trailing,
+                children,
+                proposal,
+                env,
+            )?,
 
-            LayoutNode::Interactive { child, .. }
-            | LayoutNode::HoverGroup { child, .. } => {
-                let (size, fit) = child.measure(proposal, env);
+            LayoutNode::Interactive { child, .. } | LayoutNode::HoverGroup { child, .. } => {
+                let (size, fit) = child.measure(proposal, env)?;
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
@@ -6249,32 +6558,32 @@ impl LayoutNode {
                 // Styling changes the inherited environment, not the child's
                 // geometry. Keep its fit directly instead of boxing a duplicate
                 // handoff at every style layer and retained measurement.
-                child.measure(proposal, &env)
+                child.measure(proposal, &env)?
             }
 
             // the animation scope never touches geometry — by type
             LayoutNode::Animated { child, .. } => {
-                let (size, fit) = child.measure(proposal, env);
+                let (size, fit) = child.measure(proposal, env)?;
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
             // the island claims a renderer, never a pixel of geometry
             LayoutNode::Island { child, .. } => {
-                let (size, fit) = child.measure(proposal, env);
+                let (size, fit) = child.measure(proposal, env)?;
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
             // the loop claims a clock, never a pixel of geometry — the
             // measure of a looping box is phase-blind by contract
             LayoutNode::Live { child, .. } => {
-                let (size, fit) = child.measure(proposal, env);
+                let (size, fit) = child.measure(proposal, env)?;
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
-            LayoutNode::Accessible { child, .. } => child.measure(proposal, env),
+            LayoutNode::Accessible { child, .. } => child.measure(proposal, env)?,
 
             LayoutNode::Measured { child, .. } => {
-                let (size, fit) = child.measure(proposal, env);
+                let (size, fit) = child.measure(proposal, env)?;
                 (size, Fit::Children(vec![(size, fit)]))
             }
 
@@ -6282,11 +6591,10 @@ impl LayoutNode {
                 // a boundary with one child is transparent; with several,
                 // the children stack vertically (the implicit TupleView)
                 if children.len() == 1 {
-                    let (size, fit) = children[0].measure(proposal, env);
+                    let (size, fit) = children[0].measure(proposal, env)?;
                     (size, Fit::Children(vec![(size, fit)]))
                 } else {
-                    let (size, fit) =
-                        measure_stack(Axis::Vertical, 0.0, children, proposal, env);
+                    let (size, fit) = measure_stack(Axis::Vertical, 0.0, children, proposal, env)?;
                     (size, fit)
                 }
             }
@@ -6302,22 +6610,39 @@ impl LayoutNode {
             // new entry (no kept answer), and clears the answers of the
             // boundaries above it, whose size may hang on its own.
             LayoutNode::BoundaryRef { path, slot, .. } => {
-                let key = MeasureKey { proposal, font: env.font, line_height: env.line_height };
-                crate::reconciler::measure_retained(slot, path, key, |node| node.measure(proposal, env))
+                let key = MeasureKey {
+                    proposal,
+                    font: env.font,
+                    line_height: env.line_height,
+                };
+                crate::reconciler::measure_retained(slot, path, key, |node| {
+                    node.measure(proposal, env)
+                })?
             }
-        }
+        })
     }
 
-    pub(crate) fn place(&self, frame: Rect, fit: &Fit, env: &LayoutEnv<'_>, out: &mut Placement) {
+    pub(crate) fn place(
+        &self,
+        frame: Rect,
+        fit: &Fit,
+        env: &LayoutEnv<'_>,
+        out: &mut Placement,
+    ) -> Result<(), crate::text_error::TextError> {
         let semantic_start = out.accessibility.len();
         let control = self.carried_hints().and_then(ElementHints::control);
         let target = self.carried_action();
         if let (Some(state), Some(path)) = (control, target)
-            && state.enabled && out.can_reveal_focus(frame)
+            && state.enabled
+            && out.can_reveal_focus(frame)
         {
             out.focus_order.push(FocusStop {
-                path: Rc::clone(path), frame,
-                region: out.scrolls.iter().rposition(|region| Some(&region.path) == out.region_stack.last()),
+                path: Rc::clone(path),
+                frame,
+                region: out
+                    .scrolls
+                    .iter()
+                    .rposition(|region| Some(&region.path) == out.region_stack.last()),
                 control: Some(state),
             });
         }
@@ -6325,39 +6650,78 @@ impl LayoutNode {
         // target an `Interactive` around it was, at its own frame
         match target.filter(|_| control.is_none_or(|state| state.enabled)) {
             Some(path) => {
-                place_target(path, frame, env, out, |out| self.place_node(frame, fit, env, out));
+                place_target(path, frame, env, out, |out| {
+                    self.place_node(frame, fit, env, out)
+                })?;
             }
-            None => self.place_node(frame, fit, env, out),
+            None => self.place_node(frame, fit, env, out)?,
         }
         if let (Some(state), Some(path)) = (control, target)
-            && state.enabled && env.stamp.focus == Some(path.as_ref())
+            && state.enabled
+            && env.stamp.focus == Some(path.as_ref())
         {
             out.draw(DrawCommand::StrokeRect {
-                rect: frame, color: crate::theme::current().focus, width: 2.0,
+                rect: frame,
+                color: crate::theme::current().focus,
+                width: 2.0,
                 corner_radius: Corners::all(6.0),
             });
         }
-        if env.accessibility && let Some(semantics) = self.carried_hints().and_then(|hints| hints.semantics.as_ref()) {
-            let bounds = out.accessible_bounds(frame);
-            semantics.collect(semantic_start, bounds, &out.accessibility_surface, &mut out.accessibility);
-        }
+
+            if env.accessibility
+                && let Some(semantics) = self
+                    .carried_hints()
+                    .and_then(|hints| hints.semantics.as_ref())
+            {
+                let bounds = out.accessible_bounds(frame);
+                semantics.collect(
+                    semantic_start,
+                    bounds,
+                    &out.accessibility_surface,
+                    &mut out.accessibility,
+                );
+            }
+        Ok(())
     }
 
     /// The node itself, its own action aside.
-    fn place_node(&self, frame: Rect, fit: &Fit, env: &LayoutEnv<'_>, out: &mut Placement) {
+    fn place_node(
+        &self,
+        frame: Rect,
+        fit: &Fit,
+        env: &LayoutEnv<'_>,
+        out: &mut Placement,
+    ) -> Result<(), crate::text_error::TextError> {
         match (self, fit.unshared()) {
             (LayoutNode::Accessible { semantics, child }, _) => {
                 let start = out.accessibility.len();
-                child.place(frame, fit, env, out);
+                child.place(frame, fit, env, out)?;
                 if env.accessibility {
                     let bounds = out.accessible_bounds(frame);
-                    semantics.collect(start, bounds, &out.accessibility_surface, &mut out.accessibility);
+                    semantics.collect(
+                        start,
+                        bounds,
+                        &out.accessibility_surface,
+                        &mut out.accessibility,
+                    );
                 }
             }
             // visual leaves: the draw list is born here
-            (LayoutNode::Text { content, highlights, truncation, .. }, Fit::Leaf) => {
+            (
+                LayoutNode::Text {
+                    content,
+                    highlights,
+                    truncation,
+                    ..
+                },
+                Fit::Leaf,
+            ) => {
                 let content = content.get();
-                let color = out.foreground.last().copied().unwrap_or_else(|| crate::theme::current().fg);
+                let color = out
+                    .foreground
+                    .last()
+                    .copied()
+                    .unwrap_or_else(|| crate::theme::current().fg);
                 if let Some(dom) = out.dom.as_mut() {
                     // the WHOLE content, unwrapped: the browser re-breaks
                     // lines inside the same box with the same measures
@@ -6388,7 +6752,7 @@ impl LayoutNode {
                     color,
                     env,
                     out,
-                );
+                )?;
             }
 
             (LayoutNode::Fill, Fit::Leaf) => {
@@ -6421,12 +6785,19 @@ impl LayoutNode {
                     let bounds = out.accessible_bounds(frame);
                     if let Some(bounds) = bounds.filter(|bounds| !bounds.is_empty()) {
                         out.accessibility.push(crate::accessibility::Placed {
-                            enabled: true, checked: None,
+                            enabled: true,
+                            checked: None,
                             path: Rc::from(path.as_str()),
-                            role: if *secret { crate::accessibility::Role::PasswordField } else { crate::accessibility::Role::TextField },
+                            role: if *secret {
+                                crate::accessibility::Role::PasswordField
+                            } else {
+                                crate::accessibility::Role::TextField
+                            },
                             label: Arc::clone(placeholder),
                             value: (!*secret).then(|| Arc::clone(content)),
-                            bounds: Some(bounds), surface: out.accessibility_surface.clone(), multiline: *multiline,
+                            bounds: Some(bounds),
+                            surface: out.accessibility_surface.clone(),
+                            multiline: *multiline,
                         });
                     }
                 }
@@ -6450,11 +6821,7 @@ impl LayoutNode {
                     // and the THEME chrome rides the node's style (the
                     // same tokens the pixel paint below reads)
                     let theme = crate::theme::current();
-                    let color = out
-                        .foreground
-                        .last()
-                        .copied()
-                        .unwrap_or(theme.fg);
+                    let color = out.foreground.last().copied().unwrap_or(theme.fg);
                     if let Some(dom) = out.dom.as_mut() {
                         dom.leaf_styled(
                             crate::dom::DomKind::Field(Box::new(crate::dom::DomField {
@@ -6473,8 +6840,7 @@ impl LayoutNode {
                             crate::dom::DomLook {
                                 background: (!*bare).then_some(theme.field),
                                 border: (!*bare).then_some((theme.field_border, 1.0)),
-                                corner_radius: (!*bare)
-                                    .then_some(Corners::all(FIELD_RADIUS)),
+                                corner_radius: (!*bare).then_some(Corners::all(FIELD_RADIUS)),
                                 focus_border: (!*bare).then_some(theme.focus),
                                 placeholder_color: Some(theme.placeholder),
                                 ..crate::dom::DomLook::default()
@@ -6487,8 +6853,12 @@ impl LayoutNode {
                 // string outside the editor) — the tree never carried any
                 // of this
                 let focused = env.stamp.focus == Some(path.as_str());
-                let state =
-                    env.stamp.carets.get(path.as_str()).copied().unwrap_or_default();
+                let state = env
+                    .stamp
+                    .carets
+                    .get(path.as_str())
+                    .copied()
+                    .unwrap_or_default();
                 // the caret and the selection index the string the app
                 // HOLDS; what is drawn is the string the field SHOWS.
                 // The two agree character by character, and this is the
@@ -6516,7 +6886,11 @@ impl LayoutNode {
                 let theme = crate::theme::current();
                 // a bare field paints no ground of its own: the caller's
                 // background is the ground, and a grid cell has none
-                let radius = if *bare { Corners::ZERO } else { Corners::all(FIELD_RADIUS) };
+                let radius = if *bare {
+                    Corners::ZERO
+                } else {
+                    Corners::all(FIELD_RADIUS)
+                };
                 if !*bare {
                     out.draw(DrawCommand::FillRect {
                         rect: frame,
@@ -6526,11 +6900,18 @@ impl LayoutNode {
                 }
                 // the placeholder walks the SAME path as the real text:
                 // same origin, same font, same breaks — only the ink drops
-                let sample: &Arc<str> = if content.is_empty() { placeholder } else { content };
+                let sample: &Arc<str> = if content.is_empty() {
+                    placeholder
+                } else {
+                    content
+                };
                 let source = env.cache.text_content(sample);
                 // The field's own wrap table supplies scalar-aligned LF-local ranges.
-                let shaped_line = |start, end| source.line(start..end)
-                    .expect("field visual ranges come from this source's wrap table");
+                let shaped_line = |start, end| {
+                    source
+                        .line(start..end)
+                        .expect("field visual ranges come from this source's wrap table")
+                };
                 // a many-line field asks a PROBE for the line height
                 // instead of measuring a whole note as one line; a
                 // one-line field measures what it draws, as it always did
@@ -6538,7 +6919,7 @@ impl LayoutNode {
                     if multiline { "0" } else { sample },
                     &env.font,
                     env.text,
-                );
+                )?;
                 // The line box owns caret, selection and scroll geometry;
                 // the font keeps its own raster, centred by half-leading.
                 let line_h = env.line_height.unwrap_or(metrics.height());
@@ -6550,7 +6931,14 @@ impl LayoutNode {
                 let single = [(0usize, sample.len())];
                 let broken;
                 let lines: &[(usize, usize)] = if multiline {
-                    broken = env.cache.field_lines(path, sample, Some(sample), &env.font, inner, env.text);
+                    broken = env.cache.field_lines(
+                        path,
+                        sample,
+                        Some(sample),
+                        &env.font,
+                        inner,
+                        env.text,
+                    )?;
                     &broken
                 } else {
                     &single
@@ -6562,8 +6950,11 @@ impl LayoutNode {
                 // against THIS frame: a field that widens never leaves
                 // a gap after the last glyph. A wrapped field has
                 // nothing to give sideways, so it only ever rolls down
-                let overflow_x =
-                    if multiline { 0.0 } else { (metrics.width - inner).max(0.0) };
+                let overflow_x = if multiline {
+                    0.0
+                } else {
+                    (metrics.width - inner).max(0.0)
+                };
                 let overflow_y = (lines.len() as Px * line_h - inner_h).max(0.0);
                 let scroll = env.scroll_offsets.get(path).copied().unwrap_or_default();
                 let offset = Point {
@@ -6575,35 +6966,59 @@ impl LayoutNode {
                     y: frame.origin.y + FIELD_PAD_V - offset.y,
                 };
                 let run = Rect {
-                    origin: Point { x: frame.origin.x + FIELD_PAD_H, y: frame.origin.y + FIELD_PAD_V },
-                    size: Size { width: inner, height: inner_h },
+                    origin: Point {
+                        x: frame.origin.x + FIELD_PAD_H,
+                        y: frame.origin.y + FIELD_PAD_V,
+                    },
+                    size: Size {
+                        width: inner,
+                        height: inner_h,
+                    },
                 };
                 // everything the field writes is cut by its own box:
                 // a string longer than the field stops at the border
                 // instead of painting over the neighbour
                 out.push_clip(frame, if *bare { 0.0 } else { FIELD_RADIUS });
                 let width_of = |from: usize, to: usize| {
-                    env.cache.get_or_measure_paragraph(&shaped_line(from, to), &env.font, env.text).width
+                    env.cache
+                        .get_or_measure_paragraph(&shaped_line(from, to), &env.font, env.text)
+                        .map(|metrics| metrics.width)
                 };
                 // where a line starts and which way it reads: anchored by
                 // the SCENE, read by its first letter. A left-to-right line
                 // in a left-to-right scene is where it always was and
                 // measures nothing new; every other line knows its width
                 let anchor_rtl = env.rtl();
-                let line_placement = |start: usize, end: usize| -> (Px, Px, bool) {
-                    let line_rtl = crate::text_input::reads_right_to_left(shaped_line(start, end).paragraph().text());
-                    if !anchor_rtl
-                        && !line_rtl
-                        && matches!(
-                            env.text_align,
-                            None | Some(motor::views::TextAlignment::Leading)
-                        )
-                    {
-                        return (text_origin.x, 0.0, false);
-                    }
-                    let line_w = width_of(start, end);
-                    (field_run_x(run, offset.x, line_w, env.text_align, anchor_rtl, line_rtl), line_w, line_rtl)
-                };
+                let line_placement =
+                    |start: usize,
+                     end: usize|
+                     -> Result<(Px, Px, bool), crate::text_error::TextError> {
+                        let line_rtl = crate::text_input::reads_right_to_left(
+                            shaped_line(start, end).paragraph().text(),
+                        );
+                        if !anchor_rtl
+                            && !line_rtl
+                            && matches!(
+                                env.text_align,
+                                None | Some(motor::views::TextAlignment::Leading)
+                            )
+                        {
+                            return Ok((text_origin.x, 0.0, false));
+                        }
+                        let line_w = width_of(start, end)?;
+                        Ok((
+                            field_run_x(
+                                run,
+                                offset.x,
+                                line_w,
+                                env.text_align,
+                                anchor_rtl,
+                                line_rtl,
+                            ),
+                            line_w,
+                            line_rtl,
+                        ))
+                    };
                 let color = if content.is_empty() {
                     theme.placeholder
                 } else {
@@ -6618,7 +7033,8 @@ impl LayoutNode {
                 let first = if line_h > 0.0 {
                     let before = ((paint_bottom - line_h) / line_h).ceil().max(0.0) as usize;
                     (((frame.origin.y - text_origin.y) / line_h).floor().max(0.0) as usize)
-                        .saturating_sub(1).saturating_sub(before)
+                        .saturating_sub(1)
+                        .saturating_sub(before)
                 } else {
                     0
                 };
@@ -6630,7 +7046,7 @@ impl LayoutNode {
                     if y + paint_bottom <= frame.origin.y {
                         continue;
                     }
-                    let (line_x, _, line_rtl) = line_placement(start, end);
+                    let (line_x, _, line_rtl) = line_placement(start, end)?;
                     let line = shaped_line(start, end);
                     let spans = |head: usize, tail: usize| {
                         crate::text_engine::line_spans(
@@ -6650,11 +7066,11 @@ impl LayoutNode {
                         // empty line would show nothing at all
                         let over = to > end && from <= end;
                         if head < tail || over {
-                            let mut bands = spans(head, tail);
+                            let mut bands = spans(head, tail)?;
                             if over {
                                 // A selected paragraph separator occupies the visual
                                 // end of the line, beyond its text advance.
-                                let edge = if line_rtl { 0.0 } else { width_of(start, end) };
+                                let edge = if line_rtl { 0.0 } else { width_of(start, end)? };
                                 bands.push(if line_rtl {
                                     edge - line_h / 2.0..edge
                                 } else {
@@ -6687,11 +7103,14 @@ impl LayoutNode {
                             sample,
                             (start, end),
                             highlights.as_ref().filter(|_| !content.is_empty()),
-                            Point { x: line_x, y: y + leading },
+                            Point {
+                                x: line_x,
+                                y: y + leading,
+                            },
                             color,
                             env,
                             out,
-                        );
+                        )?;
                     }
                     // the live composition gets the IME underline (the
                     // caret's ink — the composition's visual pair)
@@ -6699,7 +7118,7 @@ impl LayoutNode {
                         let head = from.clamp(start, end);
                         let tail = to.clamp(start, end);
                         if head < tail {
-                            for band in spans(head, tail) {
+                            for band in spans(head, tail)? {
                                 out.draw(DrawCommand::FillRect {
                                     rect: Rect {
                                         origin: Point {
@@ -6740,10 +7159,13 @@ impl LayoutNode {
                             false,
                         )
                     } else {
-                        line_placement(start, end)
+                        line_placement(start, end)?
                     };
                     let line = if content.is_empty() {
-                        env.cache.paragraph("").expect("empty text contains no LF").full_line()
+                        env.cache
+                            .paragraph("")
+                            .expect("empty text contains no LF")
+                            .full_line()
                     } else {
                         shaped_line(start, end)
                     };
@@ -6755,7 +7177,7 @@ impl LayoutNode {
                         &env.font,
                         env.text,
                         env.cache,
-                    );
+                    )?;
                     let mut bands = if shape == CaretShape::Bar {
                         vec![boundary..boundary + FIELD_CARET_W]
                     } else if let Some(next) = next {
@@ -6765,7 +7187,7 @@ impl LayoutNode {
                             &env.font,
                             env.text,
                             env.cache,
-                        )
+                        )?
                     } else {
                         let width = env
                             .cache
@@ -6821,7 +7243,7 @@ impl LayoutNode {
                                 theme.field,
                                 env,
                                 out,
-                            );
+                            )?;
                             out.pop_clip();
                         }
                     }
@@ -6830,7 +7252,11 @@ impl LayoutNode {
                 if !*bare {
                     out.draw(DrawCommand::StrokeRect {
                         rect: frame,
-                        color: if focused { theme.focus } else { theme.field_border },
+                        color: if focused {
+                            theme.focus
+                        } else {
+                            theme.field_border
+                        },
                         width: 1.0,
                         corner_radius: radius,
                     });
@@ -6849,7 +7275,7 @@ impl LayoutNode {
                     frame,
                     run,
                     text_origin: Point {
-                        x: line_placement(lines[0].0, lines[0].1).0,
+                        x: line_placement(lines[0].0, lines[0].1)?.0,
                         y: text_origin.y,
                     },
                     font: env.font,
@@ -6862,8 +7288,12 @@ impl LayoutNode {
                 });
                 if out.can_reveal_focus(frame) {
                     out.focus_order.push(FocusStop {
-                        path: Rc::from(path.as_str()), frame,
-                        region: out.scrolls.iter().rposition(|region| Some(&region.path) == out.region_stack.last()),
+                        path: Rc::from(path.as_str()),
+                        frame,
+                        region: out
+                            .scrolls
+                            .iter()
+                            .rposition(|region| Some(&region.path) == out.region_stack.last()),
                         control: None,
                     });
                 }
@@ -6884,12 +7314,18 @@ impl LayoutNode {
             }
 
             (LayoutNode::Custom { path, element }, Fit::Leaf) => {
-                let focusable = !path.is_empty() && out.can_reveal_focus(frame)
-                    && element.element().accepts_keys() && !element.element().leaves_keyboard();
+                let focusable = !path.is_empty()
+                    && out.can_reveal_focus(frame)
+                    && element.element().accepts_keys()
+                    && !element.element().leaves_keyboard();
                 if focusable {
                     out.focus_order.push(FocusStop {
-                        path: Rc::from(path.as_str()), frame,
-                        region: out.scrolls.iter().rposition(|region| Some(&region.path) == out.region_stack.last()),
+                        path: Rc::from(path.as_str()),
+                        frame,
+                        region: out
+                            .scrolls
+                            .iter()
+                            .rposition(|region| Some(&region.path) == out.region_stack.last()),
                         control: None,
                     });
                 }
@@ -6899,10 +7335,16 @@ impl LayoutNode {
                 // from it. No clip above means all of the box shows;
                 // a clip that misses the box means none of it does.
                 let window = out.current_clip().map_or(
-                    Rect { origin: Point::ZERO, size: frame.size },
+                    Rect {
+                        origin: Point::ZERO,
+                        size: frame.size,
+                    },
                     |clip| {
                         clip.intersection(frame).map_or(
-                            Rect { origin: Point::ZERO, size: Size::default() },
+                            Rect {
+                                origin: Point::ZERO,
+                                size: Size::default(),
+                            },
                             |clip| Rect {
                                 origin: Point {
                                     x: clip.origin.x - frame.origin.x,
@@ -6919,9 +7361,7 @@ impl LayoutNode {
                 // box without identity holds the still frame.
                 let phase = match env.live {
                     Some(spec) if !path.is_empty() => match env.animator {
-                        Some(animator) => {
-                            animator.borrow_mut().resolve_phase(path, spec)
-                        }
+                        Some(animator) => animator.borrow_mut().resolve_phase(path, spec),
                         None => spec.quantise(spec.still),
                     },
                     Some(spec) => spec.quantise(spec.still),
@@ -6933,9 +7373,9 @@ impl LayoutNode {
                 let placed = if path.is_empty() {
                     None
                 } else {
-                    let visible = out.current_clip().map_or(Some(frame), |clip| {
-                        frame.intersection(clip)
-                    });
+                    let visible = out
+                        .current_clip()
+                        .map_or(Some(frame), |clip| frame.intersection(clip));
                     if let Some(visible) = visible {
                         out.hits.push((path.to_string(), visible));
                     }
@@ -6954,7 +7394,9 @@ impl LayoutNode {
                             direction: env.direction,
                         });
                         Some(out.customs.len() - 1)
-                    } else { None }
+                    } else {
+                        None
+                    }
                 };
                 // what the app paints is PIXELS: on the element lowering
                 // the box becomes a canvas island, and the island slices
@@ -6984,10 +7426,8 @@ impl LayoutNode {
                 // the overlay's island road: open when the shell can layer
                 // it, for a box with a name, outside a loop, on the pixel
                 // world (the element world has islands of its own)
-                let layered = overlay_layers()
-                    && env.live.is_none()
-                    && placed.is_some()
-                    && out.dom.is_none();
+                let layered =
+                    overlay_layers() && env.live.is_none() && placed.is_some() && out.dom.is_none();
                 let ctx = crate::custom::PaintCtx {
                     frame,
                     visible: window,
@@ -7006,9 +7446,9 @@ impl LayoutNode {
                 // replayed at its place. Never a box that moves on its own:
                 // one under a loop, one that holds the keyboard, one on the
                 // element lowering.
-                let kept = element
-                    .cached_version()
-                    .filter(|_| env.live.is_none() && !focused && out.dom.is_none() && !path.is_empty());
+                let kept = element.cached_version().filter(|_| {
+                    env.live.is_none() && !focused && out.dom.is_none() && !path.is_empty()
+                });
                 // a box NO PIXEL can show — its clip came out empty. One that
                 // keeps its picture promised that its paint is only a
                 // picture, so there is nothing to do. Any other box may read
@@ -7018,95 +7458,112 @@ impl LayoutNode {
                 let unseen = out.muted > 0;
                 let painted_from = out.display.len();
                 let replayed = unseen && kept.is_some();
-                let replayed = replayed || kept.is_some_and(|version| {
-                    let theme = crate::theme::version();
-                    let fresh = |picture: &Picture| {
-                        picture.version == version
-                            && picture.size == frame.size
-                            && picture.scale == env.scale
-                            && picture.font == env.font
-                            && picture.ink == ink
-                            && picture.theme == theme
-                            && picture.touch == env.touch
-                    };
-                    let known = PICTURES.with(|pictures| {
-                        pictures.borrow().get(path.as_str()).filter(|picture| fresh(picture)).map(
-                            |picture| picture.commands.clone(),
-                        )
-                    });
-                    let commands = match known {
-                        Some(commands) => commands,
-                        None => {
-                            // painted WHOLE, at the origin: the kept picture
-                            // serves every place the box is scrolled to
-                            let whole = crate::custom::PaintCtx {
-                                frame: Rect { origin: Point::ZERO, size: frame.size },
-                                visible: Rect { origin: Point::ZERO, size: frame.size },
-                                metrics: crate::custom::Metrics::new(env.text, env.cache, env.font),
-                                focused: false,
-                                caret_visible: false,
-                                phase: 0.0,
-                                scale: env.scale,
-                                touch: env.touch,
-                                overlay_layered: layered,
-                                direction: env.direction,
-                            };
-                            let mut recorded = DisplayList::default();
-                            let mut painter = crate::custom::Painter::new(
-                                &mut recorded,
-                                Point::ZERO,
-                                env.font,
-                                ink,
-                                env.cache,
-                            );
-                            crate::stats::note_paint();
-                            motor::identity::begin_paint(path.as_str());
-                            element.element().paint(&whole, &mut painter);
-                            motor::identity::end_paint();
-                            let movable =
-                                recorded.iter().all(|command| command.translated(Point::ZERO).is_some());
-                            let commands: Option<Rc<[DrawCommand]>> =
-                                movable.then(|| recorded.commands.into());
-                            PICTURES.with(|pictures| {
-                                let mut pictures = pictures.borrow_mut();
-                                if pictures.len() >= KEPT_PICTURES {
-                                    pictures.clear();
-                                }
-                                pictures.insert(
-                                    path.clone(),
-                                    Picture {
-                                        version,
+                let replayed = replayed
+                    || kept.is_some_and(|version| {
+                        let theme = crate::theme::version();
+                        let fresh = |picture: &Picture| {
+                            picture.version == version
+                                && picture.size == frame.size
+                                && picture.scale == env.scale
+                                && picture.font == env.font
+                                && picture.ink == ink
+                                && picture.theme == theme
+                                && picture.touch == env.touch
+                        };
+                        let known = PICTURES.with(|pictures| {
+                            pictures
+                                .borrow()
+                                .get(path.as_str())
+                                .filter(|picture| fresh(picture))
+                                .map(|picture| picture.commands.clone())
+                        });
+                        let commands = match known {
+                            Some(commands) => commands,
+                            None => {
+                                // painted WHOLE, at the origin: the kept picture
+                                // serves every place the box is scrolled to
+                                let whole = crate::custom::PaintCtx {
+                                    frame: Rect {
+                                        origin: Point::ZERO,
                                         size: frame.size,
-                                        scale: env.scale,
-                                        font: env.font,
-                                        ink,
-                                        theme,
-                                        touch: env.touch,
-                                        commands: commands.clone(),
                                     },
+                                    visible: Rect {
+                                        origin: Point::ZERO,
+                                        size: frame.size,
+                                    },
+                                    metrics: crate::custom::Metrics::new(
+                                        env.text, env.cache, env.font,
+                                    ),
+                                    focused: false,
+                                    caret_visible: false,
+                                    phase: 0.0,
+                                    scale: env.scale,
+                                    touch: env.touch,
+                                    overlay_layered: layered,
+                                    direction: env.direction,
+                                };
+                                let mut recorded = DisplayList::default();
+                                let mut painter = crate::custom::Painter::new(
+                                    &mut recorded,
+                                    Point::ZERO,
+                                    env.font,
+                                    ink,
+                                    env.cache,
                                 );
-                            });
-                            commands
-                        }
-                    };
-                    match commands {
-                        Some(commands) => {
-                            crate::stats::note_picture_replayed();
-                            for command in commands.iter() {
-                                if let Some(placed) = command.translated(frame.origin) {
-                                    out.display.push(placed);
-                                }
+                                crate::stats::note_paint();
+                                motor::identity::begin_paint(path.as_str());
+                                element.element().paint(&whole, &mut painter);
+                                motor::identity::end_paint();
+                                let movable = recorded
+                                    .iter()
+                                    .all(|command| command.translated(Point::ZERO).is_some());
+                                let commands: Option<Rc<[DrawCommand]>> =
+                                    movable.then(|| recorded.commands.into());
+                                PICTURES.with(|pictures| {
+                                    let mut pictures = pictures.borrow_mut();
+                                    if pictures.len() >= KEPT_PICTURES {
+                                        pictures.clear();
+                                    }
+                                    pictures.insert(
+                                        path.clone(),
+                                        Picture {
+                                            version,
+                                            size: frame.size,
+                                            scale: env.scale,
+                                            font: env.font,
+                                            ink,
+                                            theme,
+                                            touch: env.touch,
+                                            commands: commands.clone(),
+                                        },
+                                    );
+                                });
+                                commands
                             }
-                            true
+                        };
+                        match commands {
+                            Some(commands) => {
+                                crate::stats::note_picture_replayed();
+                                for command in commands.iter() {
+                                    if let Some(placed) = command.translated(frame.origin) {
+                                        out.display.push(placed);
+                                    }
+                                }
+                                true
+                            }
+                            // it paints what cannot be moved: the old road
+                            None => false,
                         }
-                        // it paints what cannot be moved: the old road
-                        None => false,
-                    }
-                });
+                    });
                 if !replayed {
                     let mut scratch = std::mem::take(&mut out.unseen);
-                    let target = if unseen { &mut scratch } else { &mut out.display };
-                    let mut painter = crate::custom::Painter::new(target, frame.origin, env.font, ink, env.cache);
+                    let target = if unseen {
+                        &mut scratch
+                    } else {
+                        &mut out.display
+                    };
+                    let mut painter =
+                        crate::custom::Painter::new(target, frame.origin, env.font, ink, env.cache);
                     crate::stats::note_paint();
                     motor::identity::begin_paint(path.as_str());
                     element.element().paint(&ctx, &mut painter);
@@ -7143,8 +7600,13 @@ impl LayoutNode {
                 if layered && !unseen && !out.skip_display {
                     let overlay_from = out.display.len();
                     out.push_clip(frame, 0.0);
-                    let mut painter =
-                        crate::custom::Painter::new(&mut out.display, frame.origin, env.font, ink, env.cache);
+                    let mut painter = crate::custom::Painter::new(
+                        &mut out.display,
+                        frame.origin,
+                        env.font,
+                        ink,
+                        env.cache,
+                    );
                     let island = overlay_path(path);
                     motor::identity::begin_paint(&island);
                     let covered = element.element().paint_overlay(&ctx, &mut painter);
@@ -7167,7 +7629,10 @@ impl LayoutNode {
                                 },
                                 size: shown.size,
                             },
-                            visible: Rect { origin: Point::ZERO, size: shown.size },
+                            visible: Rect {
+                                origin: Point::ZERO,
+                                size: shown.size,
+                            },
                             region: out.region_stack.last().cloned(),
                             font: env.font,
                             ink,
@@ -7187,10 +7652,16 @@ impl LayoutNode {
                 // shell clips the platform view by it, so a host
                 // inside a scroll region never escapes it
                 let window = out.current_clip().map_or(
-                    Rect { origin: Point::ZERO, size: frame.size },
+                    Rect {
+                        origin: Point::ZERO,
+                        size: frame.size,
+                    },
                     |clip| {
                         clip.intersection(frame).map_or(
-                            Rect { origin: Point::ZERO, size: Size::default() },
+                            Rect {
+                                origin: Point::ZERO,
+                                size: Size::default(),
+                            },
                             |clip| Rect {
                                 origin: Point {
                                     x: clip.origin.x - frame.origin.x,
@@ -7220,8 +7691,16 @@ impl LayoutNode {
                 // platform composites the view above it
             }
 
-            (LayoutNode::Sheet { path, content, child, surface }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, fit, env, out);
+            (
+                LayoutNode::Sheet {
+                    path,
+                    content,
+                    child,
+                    surface,
+                },
+                Fit::Wrapped(_, fit),
+            ) => {
+                child.place(frame, fit, env, out)?;
                 // the line the modal draws: everything recorded from
                 // here on is ABOVE it, and the walk back stops at the
                 // mark instead of reaching under it
@@ -7249,8 +7728,16 @@ impl LayoutNode {
                 });
             }
 
-            (LayoutNode::Anchored { path, side, overlay, child }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, fit, env, out);
+            (
+                LayoutNode::Anchored {
+                    path,
+                    side,
+                    overlay,
+                    child,
+                },
+                Fit::Wrapped(_, fit),
+            ) => {
+                child.place(frame, fit, env, out)?;
                 // the REAL anchor: un-shift the in-flight animation
                 // (the popover never chases a sliding row — the same
                 // contract as the retained boundary frames)
@@ -7277,36 +7764,36 @@ impl LayoutNode {
             }
 
             (LayoutNode::Hinted { child, .. }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, fit, env, out);
+                child.place(frame, fit, env, out)?;
             }
 
             (LayoutNode::BoundaryHint { .. }, Fit::Leaf) => {}
 
             (LayoutNode::ExactLayout { child }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, fit, env, out);
+                child.place(frame, fit, env, out)?;
             }
 
             (LayoutNode::IgnoresSafeArea { child }, Fit::Wrapped(_, fit)) => {
                 let Some(safe) = out.safe else {
                     // no inset anywhere: the node is glass
-                    child.place(frame, fit, env, out);
-                    return;
+                    child.place(frame, fit, env, out)?;
+                    return Ok(());
                 };
                 let grown = safe.reclaim(frame);
                 if grown == frame {
-                    child.place(frame, fit, env, out);
-                    return;
+                    child.place(frame, fit, env, out)?;
+                    return Ok(());
                 }
                 // the child is measured once more, at the size it
                 // reclaimed; nothing below it reclaims again
-                let (_, fit) = child.measure(Proposal::exact(grown.size), env);
+                let (_, fit) = child.measure(Proposal::exact(grown.size), env)?;
                 let kept = out.safe.take();
-                child.place(grown, &fit, env, out);
+                child.place(grown, &fit, env, out)?;
                 out.safe = kept;
             }
 
             (LayoutNode::DragRegion { child }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, fit, env, out);
+                child.place(frame, fit, env, out)?;
                 // clipped like a hit: what is not visible cannot drag
                 let region = match out.current_clip() {
                     Some(clip) => frame.intersection(clip),
@@ -7318,7 +7805,7 @@ impl LayoutNode {
             }
 
             (LayoutNode::ControlRegion { control, child }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, fit, env, out);
+                child.place(frame, fit, env, out)?;
                 // clipped like a hit: what is not visible is no button
                 let region = match out.current_clip() {
                     Some(clip) => frame.intersection(clip),
@@ -7351,10 +7838,17 @@ impl LayoutNode {
                         rect,
                     });
                 }
-                child.place(frame, fit, env, out);
+                child.place(frame, fit, env, out)?;
             }
 
-            (LayoutNode::ContextSource { items, on_click, child }, Fit::Wrapped(_, fit)) => {
+            (
+                LayoutNode::ContextSource {
+                    items,
+                    on_click,
+                    child,
+                },
+                Fit::Wrapped(_, fit),
+            ) => {
                 // outer before inner: the innermost menu wins the press
                 if let Some(rect) = clip_of(out, frame) {
                     out.menus.push(MenuRegion {
@@ -7364,19 +7858,30 @@ impl LayoutNode {
                         direction: env.direction,
                     });
                 }
-                child.place(frame, fit, env, out);
+                child.place(frame, fit, env, out)?;
             }
 
             (LayoutNode::DragSource { payload, child }, Fit::Wrapped(_, fit)) => {
                 // outer before inner: what the hand lifts is the
                 // innermost thing under it, never the card around it
                 if let Some(rect) = clip_of(out, frame) {
-                    out.drag_sources.push(DragSourceRegion { payload: payload.clone(), rect });
+                    out.drag_sources.push(DragSourceRegion {
+                        payload: payload.clone(),
+                        rect,
+                    });
                 }
-                child.place(frame, fit, env, out);
+                child.place(frame, fit, env, out)?;
             }
 
-            (LayoutNode::DropTarget { accepts, action, over, child }, Fit::Wrapped(_, fit)) => {
+            (
+                LayoutNode::DropTarget {
+                    accepts,
+                    action,
+                    over,
+                    child,
+                },
+                Fit::Wrapped(_, fit),
+            ) => {
                 let region = clip_of(out, frame);
                 // the ROUTE is recorded before the descent, so the
                 // vector runs outer to inner and the runtime's reverse
@@ -7393,7 +7898,7 @@ impl LayoutNode {
                         direction: env.direction,
                     });
                 }
-                child.place(frame, fit, env, out);
+                child.place(frame, fit, env, out)?;
                 // the RING is paint, and paint runs the other way: it
                 // has to cover the child in the draw list and be the
                 // later sibling in the element tree. Routing order and
@@ -7470,7 +7975,11 @@ impl LayoutNode {
                             out.push_clip(frame, 0.0);
                             out.draw(DrawCommand::Image {
                                 rect,
-                                source: if env.mirrors() { source.mirrored() } else { source.clone() },
+                                source: if env.mirrors() {
+                                    source.mirrored()
+                                } else {
+                                    source.clone()
+                                },
                             });
                             out.pop_clip();
                         }
@@ -7479,7 +7988,11 @@ impl LayoutNode {
                         // to flip with the scene
                         out.draw(DrawCommand::Image {
                             rect: frame,
-                            source: if env.mirrors() { source.mirrored() } else { source.clone() },
+                            source: if env.mirrors() {
+                                source.mirrored()
+                            } else {
+                                source.clone()
+                            },
                         });
                     }
                 }
@@ -7514,7 +8027,10 @@ impl LayoutNode {
                             x: frame.origin.x + (frame.size.width - side) / 2.0,
                             y: frame.origin.y + (frame.size.height - side) / 2.0,
                         },
-                        size: Size { width: side, height: side },
+                        size: Size {
+                            width: side,
+                            height: side,
+                        },
                     };
                     let glyph = if *forced {
                         ImageSource::symbol_forced(*symbol, color)
@@ -7525,33 +8041,71 @@ impl LayoutNode {
                     // when its view said so; its identity carries the flip
                     out.draw(DrawCommand::Image {
                         rect,
-                        source: if env.mirrors() { glyph.mirrored() } else { glyph },
+                        source: if env.mirrors() {
+                            glyph.mirrored()
+                        } else {
+                            glyph
+                        },
                     });
                 }
             }
 
-            (LayoutNode::Stack { axis, spacing, align, children, .. }, Fit::Children(fits)) => {
-                place_stack(*axis, *spacing, *align, children, frame, fits, env, out);
+            (
+                LayoutNode::Stack {
+                    axis,
+                    spacing,
+                    align,
+                    children,
+                    ..
+                },
+                Fit::Children(fits),
+            ) => {
+                place_stack(*axis, *spacing, *align, children, frame, fits, env, out)?;
             }
 
             (
-                LayoutNode::Flow { spacing, line_spacing, align, children },
+                LayoutNode::Flow {
+                    spacing,
+                    line_spacing,
+                    align,
+                    children,
+                },
                 Fit::Lines(lines, fits),
             ) => {
-                place_flow(*spacing, *line_spacing, *align, children, frame, lines, fits, env, out);
+                place_flow(
+                    *spacing,
+                    *line_spacing,
+                    *align,
+                    children,
+                    frame,
+                    lines,
+                    fits,
+                    env,
+                    out,
+                )?;
             }
 
             (
-                LayoutNode::Split { path, axis, unit, min_a, min_b, trailing, children, .. },
+                LayoutNode::Split {
+                    path,
+                    axis,
+                    unit,
+                    min_a,
+                    min_b,
+                    trailing,
+                    children,
+                    ..
+                },
                 Fit::Children(fits),
             ) => {
                 // the seam's metrics, read before the fits move into
                 // the placing loop
                 let lane_main = |index: usize| {
-                    fits.get(index).map_or(0.0, |(size, _): &(Size, Fit)| match axis {
-                        Axis::Horizontal => size.width,
-                        Axis::Vertical => size.height,
-                    })
+                    fits.get(index)
+                        .map_or(0.0, |(size, _): &(Size, Fit)| match axis {
+                            Axis::Horizontal => size.width,
+                            Axis::Vertical => size.height,
+                        })
                 };
                 let seam_center = lane_main(0) + lane_main(1) / 2.0;
                 // what the lanes share: a fractional drag divides by
@@ -7565,15 +8119,27 @@ impl LayoutNode {
                 for (child, (size, fit)) in children.iter().zip(fits) {
                     let (origin, lane) = match axis {
                         Axis::Horizontal => (
-                            Point { x: leading_x(frame, cursor, size.width, rtl), y: frame.origin.y },
-                            Size { width: size.width, height: frame.size.height },
+                            Point {
+                                x: leading_x(frame, cursor, size.width, rtl),
+                                y: frame.origin.y,
+                            },
+                            Size {
+                                width: size.width,
+                                height: frame.size.height,
+                            },
                         ),
                         Axis::Vertical => (
-                            Point { x: frame.origin.x, y: frame.origin.y + cursor },
-                            Size { width: frame.size.width, height: size.height },
+                            Point {
+                                x: frame.origin.x,
+                                y: frame.origin.y + cursor,
+                            },
+                            Size {
+                                width: frame.size.width,
+                                height: size.height,
+                            },
                         ),
                     };
-                    child.place(Rect { origin, size: lane }, fit, env, out);
+                    child.place(Rect { origin, size: lane }, fit, env, out)?;
                     cursor += match axis {
                         Axis::Horizontal => size.width,
                         Axis::Vertical => size.height,
@@ -7594,14 +8160,20 @@ impl LayoutNode {
                                 },
                                 y: frame.origin.y,
                             },
-                            size: Size { width: SPLIT_GRIP, height: frame.size.height },
+                            size: Size {
+                                width: SPLIT_GRIP,
+                                height: frame.size.height,
+                            },
                         },
                         Axis::Vertical => Rect {
                             origin: Point {
                                 x: frame.origin.x,
                                 y: frame.origin.y + center - SPLIT_GRIP / 2.0,
                             },
-                            size: Size { width: frame.size.width, height: SPLIT_GRIP },
+                            size: Size {
+                                width: frame.size.width,
+                                height: SPLIT_GRIP,
+                            },
                         },
                     }
                 };
@@ -7625,7 +8197,15 @@ impl LayoutNode {
                 });
             }
 
-            (LayoutNode::Overlay { at, behind, layer, child }, Fit::Children(fits)) => {
+            (
+                LayoutNode::Overlay {
+                    at,
+                    behind,
+                    layer,
+                    child,
+                },
+                Fit::Children(fits),
+            ) => {
                 let (base_size, base_fit) = (fits[0].0, &fits[0].1);
                 let (layer_size, layer_fit) = (fits[1].0, &fits[1].1);
                 // a layer that FILLED the measured box follows the real
@@ -7633,7 +8213,11 @@ impl LayoutNode {
                 // more room than it asked for, and a rule that crossed
                 // the box must still cross it
                 let stretch = |axis_layer: Px, axis_base: Px, axis_frame: Px| {
-                    if axis_layer >= axis_base { axis_frame } else { axis_layer }
+                    if axis_layer >= axis_base {
+                        axis_frame
+                    } else {
+                        axis_layer
+                    }
                 };
                 let size = Size {
                     width: stretch(layer_size.width, base_size.width, frame.size.width),
@@ -7657,21 +8241,29 @@ impl LayoutNode {
                     if let Some(dom) = out.dom.as_mut() {
                         dom.enter_layer();
                     }
-                    layer.place(layer_frame, layer_fit, env, out);
+                    layer.place(layer_frame, layer_fit, env, out)?;
                     if let Some(dom) = out.dom.as_mut() {
                         dom.leave_layer();
                     }
+                    Ok::<(), crate::text_error::TextError>(())
                 };
                 if *behind {
-                    paint_layer(out);
-                    child.place(frame, base_fit, env, out);
+                    paint_layer(out)?;
+                    child.place(frame, base_fit, env, out)?;
                 } else {
-                    child.place(frame, base_fit, env, out);
-                    paint_layer(out);
+                    child.place(frame, base_fit, env, out)?;
+                    paint_layer(out)?;
                 }
             }
 
-            (LayoutNode::Layered { align, modal, children }, Fit::Children(fits)) => {
+            (
+                LayoutNode::Layered {
+                    align,
+                    modal,
+                    children,
+                },
+                Fit::Children(fits),
+            ) => {
                 for (index, (child, (size, fit))) in children.iter().zip(fits).enumerate() {
                     // a modal pile draws its line here: everything
                     // recorded from now on is ABOVE, and the walk back
@@ -7697,7 +8289,15 @@ impl LayoutNode {
                         y: frame.origin.y
                             + align_offset(frame.size.height, size.height, CrossAlign::Center),
                     };
-                    child.place(Rect { origin, size: *size }, fit, env, out);
+                    child.place(
+                        Rect {
+                            origin,
+                            size: *size,
+                        },
+                        fit,
+                        env,
+                        out,
+                    )?;
                 }
             }
 
@@ -7707,7 +8307,15 @@ impl LayoutNode {
                     x: leading_x(frame, edges.leading, child_size.width, env.rtl()),
                     y: frame.origin.y + edges.top,
                 };
-                child.place(Rect { origin, size: *child_size }, fit, env, out);
+                child.place(
+                    Rect {
+                        origin,
+                        size: *child_size,
+                    },
+                    fit,
+                    env,
+                    out,
+                )?;
             }
 
             (LayoutNode::Frame { align, child, .. }, Fit::Wrapped(child_size, fit)) => {
@@ -7716,13 +8324,21 @@ impl LayoutNode {
                     y: frame.origin.y
                         + align_offset(frame.size.height, child_size.height, CrossAlign::Center),
                 };
-                child.place(Rect { origin, size: *child_size }, fit, env, out);
+                child.place(
+                    Rect {
+                        origin,
+                        size: *child_size,
+                    },
+                    fit,
+                    env,
+                    out,
+                )?;
             }
 
             (LayoutNode::Hug { child, .. }, Fit::Wrapped(_, fit)) => {
                 // The frame, never the child's measured size: a region placed
                 // smaller than what it measured is exactly what travels.
-                child.place(frame, fit, env, out);
+                child.place(frame, fit, env, out)?;
             }
 
             (LayoutNode::MaxFrame { align, child, .. }, Fit::Wrapped(child_size, fit))
@@ -7730,11 +8346,26 @@ impl LayoutNode {
                 let x = align_x(frame, child_size.width, *align, env.rtl());
                 let y = frame.origin.y
                     + align_offset(frame.size.height, child_size.height, CrossAlign::Center);
-                child.place(Rect { origin: Point { x, y }, size: *child_size }, fit, env, out);
+                child.place(
+                    Rect {
+                        origin: Point { x, y },
+                        size: *child_size,
+                    },
+                    fit,
+                    env,
+                    out,
+                )?;
             }
 
             (
-                LayoutNode::Scroll { path, target, axes, commanded, child, .. },
+                LayoutNode::Scroll {
+                    path,
+                    target,
+                    axes,
+                    commanded,
+                    child,
+                    ..
+                },
                 Fit::ScrollContent(content, fit),
             ) => {
                 // per-axis travel over SNAPPED values: "scrollable by
@@ -7748,8 +8379,10 @@ impl LayoutNode {
                     .unwrap_or_default();
                 // content that shrank re-clamps here — the retained
                 // offset never leaves the region in no man's land
-                let offset =
-                    Point { x: raw.x.clamp(0.0, max_x), y: raw.y.clamp(0.0, max_y) };
+                let offset = Point {
+                    x: raw.x.clamp(0.0, max_x),
+                    y: raw.y.clamp(0.0, max_y),
+                };
                 out.push_clip(frame, 0.0);
                 // the offset counts from the content's LEADING edge: zero
                 // shows its start, which right to left is its right end
@@ -7769,13 +8402,18 @@ impl LayoutNode {
                 // a virtual child reports misses against THIS region,
                 // and its measured geometry is snapshot material
                 let (row_extent, row_offsets) = match fit.unshared() {
-                    Fit::Virtual { row_extent, offsets, .. } => {
-                        (Some(*row_extent), offsets.clone())
-                    }
+                    Fit::Virtual {
+                        row_extent,
+                        offsets,
+                        ..
+                    } => (Some(*row_extent), offsets.clone()),
                     _ => (None, None),
                 };
                 if let Some(path) = path {
-                    let parent = out.scrolls.iter().rposition(|region| Some(&region.path) == out.region_stack.last());
+                    let parent = out
+                        .scrolls
+                        .iter()
+                        .rposition(|region| Some(&region.path) == out.region_stack.last());
                     out.region_stack.push(path.clone());
                     // BEFORE the child, which puts the regions in the
                     // paint order every other list here already keeps:
@@ -7817,16 +8455,22 @@ impl LayoutNode {
                     );
                     dom.open(
                         crate::dom::DomKind::Content,
-                        Rect { origin: frame.origin, size: *content },
+                        Rect {
+                            origin: frame.origin,
+                            size: *content,
+                        },
                         content_origin,
                     );
                 }
                 child.place(
-                    Rect { origin: content_origin, size: *content },
+                    Rect {
+                        origin: content_origin,
+                        size: *content,
+                    },
                     fit,
                     env,
                     out,
-                );
+                )?;
                 if let Some(dom) = out.dom.as_mut() {
                     dom.close();
                     dom.close();
@@ -7871,7 +8515,10 @@ impl LayoutNode {
                     text_align: props.text_align.or(env.text_align),
                     direction: props.direction.unwrap_or(env.direction),
                     flips: props.flips.unwrap_or(env.flips),
-                    anim: env.anim.map(|scope| AnimScope { colors: false, ..scope }),
+                    anim: env.anim.map(|scope| AnimScope {
+                        colors: false,
+                        ..scope
+                    }),
                     ..*env
                 };
                 // the animator paints the value in flight, never the
@@ -7920,7 +8567,11 @@ impl LayoutNode {
                 // a box that follows a GROUP paints by the ancestor's
                 // pointer, not by the target it belongs to — the mark
                 // inside a chip lights when the CHIP is hovered
-                let stack = if props.from_group { &out.groups } else { &out.pointer };
+                let stack = if props.from_group {
+                    &out.groups
+                } else {
+                    &out.pointer
+                };
                 let (hovered, pressed) = stack.last().copied().unwrap_or((false, false));
                 // this box is WHY a hover there is a new picture: the
                 // frame's pointer re-read lays out again for such a
@@ -7956,7 +8607,11 @@ impl LayoutNode {
                 // px here — the shaders only evaluate
                 if let Some(gradient) = props.gradient {
                     // its anchors are named from the leading side
-                    let gradient = if env.rtl() { gradient.flipped() } else { gradient };
+                    let gradient = if env.rtl() {
+                        gradient.flipped()
+                    } else {
+                        gradient
+                    };
                     out.draw(DrawCommand::Gradient {
                         rect: frame,
                         paint: gradient.resolve(frame),
@@ -7982,7 +8637,7 @@ impl LayoutNode {
                 if props.clip {
                     out.push_clip(frame, props.corner_radius.unwrap_or_default());
                 }
-                child.place(frame, fit, &env, out);
+                child.place(frame, fit, &env, out)?;
                 if props.clip {
                     out.pop_clip();
                 }
@@ -8021,8 +8676,8 @@ impl LayoutNode {
             (LayoutNode::Animated { key, spec, child }, Fit::Wrapped(_, fit)) => {
                 // a keyless scope (built outside a pass) stays inert
                 let Some(key) = key else {
-                    child.place(frame, fit, env, out);
-                    return;
+                    child.place(frame, fit, env, out)?;
+                    return Ok(());
                 };
                 // the node flies its OWN origin, anchored to the scroll
                 // content box — scrolling moves content 1:1 and never
@@ -8031,12 +8686,14 @@ impl LayoutNode {
                 let painted = match env.animator {
                     Some(animator) => {
                         let anchor = out.anchors.last().copied().unwrap_or_default();
-                        let rel =
-                            (frame.origin.x - anchor.x, frame.origin.y - anchor.y);
+                        let rel = (frame.origin.x - anchor.x, frame.origin.y - anchor.y);
                         let (x, y) = animator
                             .borrow_mut()
                             .resolve_origin(key.as_ref(), *spec, rel);
-                        Point { x: anchor.x + x, y: anchor.y + y }
+                        Point {
+                            x: anchor.x + x,
+                            y: anchor.y + y,
+                        }
                     }
                     None => frame.origin,
                 };
@@ -8056,11 +8713,14 @@ impl LayoutNode {
                     dom.arm_transition(spec.response, spec.damping);
                 }
                 child.place(
-                    Rect { origin: painted, size: frame.size },
+                    Rect {
+                        origin: painted,
+                        size: frame.size,
+                    },
                     fit,
                     &env,
                     out,
-                );
+                )?;
                 if let Some(dom) = out.dom.as_mut() {
                     dom.disarm();
                 }
@@ -8069,8 +8729,11 @@ impl LayoutNode {
             (LayoutNode::Live { spec, child }, Fit::Wrapped(_, fit)) => {
                 // the clock opens for the subtree: the custom boxes
                 // below resolve their phase against it at paint time
-                let env = LayoutEnv { live: Some(*spec), ..*env };
-                child.place(frame, fit, &env, out);
+                let env = LayoutEnv {
+                    live: Some(*spec),
+                    ..*env
+                };
+                child.place(frame, fit, &env, out)?;
             }
 
             (LayoutNode::Island { child, .. }, Fit::Wrapped(_, fit)) => {
@@ -8084,13 +8747,13 @@ impl LayoutNode {
                     if let Some(dom) = out.dom.as_mut() {
                         dom.open_canvas(frame, start);
                     }
-                    child.place(frame, fit, env, out);
+                    child.place(frame, fit, env, out)?;
                     let end = out.display.len();
                     if let Some(dom) = out.dom.as_mut() {
                         dom.close_canvas(end);
                     }
                 } else {
-                    child.place(frame, fit, env, out);
+                    child.place(frame, fit, env, out)?;
                 }
             }
 
@@ -8101,9 +8764,9 @@ impl LayoutNode {
                 let under = |target: &Option<String>| {
                     target.as_deref().is_some_and(|target| {
                         target == path
-                            || target.strip_prefix(path.as_str()).is_some_and(|rest| {
-                                rest.starts_with('/')
-                            })
+                            || target
+                                .strip_prefix(path.as_str())
+                                .is_some_and(|rest| rest.starts_with('/'))
                     })
                 };
                 let hovered = under(&env.stamp.interaction.hovered);
@@ -8116,7 +8779,7 @@ impl LayoutNode {
                     // an ancestor is the one thing a selector can name
                     dom.open_group(group_key(path), frame);
                 }
-                child.place(frame, fit, env, out);
+                child.place(frame, fit, env, out)?;
                 if let Some(dom) = out.dom.as_mut() {
                     dom.close_group();
                 }
@@ -8127,12 +8790,20 @@ impl LayoutNode {
             }
 
             (LayoutNode::Interactive { path, child }, Fit::Wrapped(_, fit)) => {
-                place_target(path, frame, env, out, |out| child.place(frame, fit, env, out));
+                place_target(path, frame, env, out, |out| {
+                    child.place(frame, fit, env, out)
+                })?;
             }
 
             (
-                LayoutNode::VirtualStack { count, children, .. },
-                Fit::Virtual { row_extent, children: fits, offsets },
+                LayoutNode::VirtualStack {
+                    count, children, ..
+                },
+                Fit::Virtual {
+                    row_extent,
+                    children: fits,
+                    offsets,
+                },
             ) => {
                 let start_of = |index: usize| -> Px {
                     match &offsets {
@@ -8150,7 +8821,15 @@ impl LayoutNode {
                         x: leading_x(frame, 0.0, size.width, env.rtl()),
                         y: frame.origin.y + start_of(*index),
                     };
-                    child.place(Rect { origin, size: *size }, fit, env, out);
+                    child.place(
+                        Rect {
+                            origin,
+                            size: *size,
+                        },
+                        fit,
+                        env,
+                        out,
+                    )?;
                 }
                 // the window miss, both directions: a VISIBLE row that
                 // does not exist (the wheel outran the buffer), or a
@@ -8185,8 +8864,7 @@ impl LayoutNode {
                             ((clip_bottom / row_extent).ceil() as usize).min(*count),
                         ),
                     };
-                    let uncovered =
-                        (top..bottom).any(|index| !materialized.contains(&index));
+                    let uncovered = (top..bottom).any(|index| !materialized.contains(&index));
                     let rows_in_view = bottom.saturating_sub(top).max(1);
                     let fat = materialized.len() > (3 * rows_in_view + 4) * 2;
                     if (uncovered || fat)
@@ -8202,7 +8880,7 @@ impl LayoutNode {
                 // exactly the frame this node was given
                 out.frames.record_named(path, frame);
                 if let Some((_, fit)) = fits.first() {
-                    child.place(frame, fit, env, out);
+                    child.place(frame, fit, env, out)?;
                 }
             }
 
@@ -8229,7 +8907,9 @@ impl LayoutNode {
                     // measure from the same origin, so a flight above
                     // never bends the captured interior
                     dom.open(
-                        crate::dom::DomKind::Group { path: Rc::clone(path) },
+                        crate::dom::DomKind::Group {
+                            path: Rc::clone(path),
+                        },
                         real,
                         real.origin,
                     );
@@ -8245,7 +8925,7 @@ impl LayoutNode {
                     None => env,
                 };
                 if children.len() == 1 {
-                    children[0].place(frame, &fits[0].1, env, out);
+                    children[0].place(frame, &fits[0].1, env, out)?;
                 } else {
                     place_stack(
                         Axis::Vertical,
@@ -8256,7 +8936,7 @@ impl LayoutNode {
                         fits,
                         env,
                         out,
-                    );
+                    )?;
                 }
                 if let Some(dom) = out.dom.as_mut() {
                     dom.close();
@@ -8269,9 +8949,10 @@ impl LayoutNode {
             (LayoutNode::BoundaryRef { slot, .. }, fit) => {
                 slot.with_layout(|layout| {
                     if let Some(node) = layout {
-                        node.place(frame, fit, env, out);
+                        node.place(frame, fit, env, out)?;
                     }
-                });
+                    Ok::<(), crate::text_error::TextError>(())
+                })?;
             }
 
             (_, Fit::Leaf) => {}
@@ -8281,6 +8962,7 @@ impl LayoutNode {
             // own bug
             _ => unreachable!("fit of one node used on another"),
         }
+        Ok(())
     }
 }
 
@@ -8361,10 +9043,16 @@ fn measure_split(
     children: &[LayoutNode],
     proposal: Proposal,
     env: &LayoutEnv<'_>,
-) -> (Size, Fit) {
+) -> Result<(Size, Fit), crate::text_error::TextError> {
     let lane = |main: Option<Px>| match axis {
-        Axis::Horizontal => Proposal { width: main, height: proposal.height },
-        Axis::Vertical => Proposal { width: proposal.width, height: main },
+        Axis::Horizontal => Proposal {
+            width: main,
+            height: proposal.height,
+        },
+        Axis::Vertical => Proposal {
+            width: proposal.width,
+            height: main,
+        },
     };
     let main = |size: &Size| match axis {
         Axis::Horizontal => size.width,
@@ -8379,7 +9067,7 @@ fn measure_split(
         Axis::Vertical => proposal.height,
     };
 
-    let (divider_size, divider_fit) = children[1].measure(lane(None), env);
+    let (divider_size, divider_fit) = children[1].measure(lane(None), env)?;
     let thickness = main(&divider_size);
 
     let (a_main, b_main) = match proposed_main {
@@ -8398,8 +9086,8 @@ fn measure_split(
         }
         None => (None, None),
     };
-    let (a_size, a_fit) = children[0].measure(lane(a_main), env);
-    let (b_size, b_fit) = children[2].measure(lane(b_main), env);
+    let (a_size, a_fit) = children[0].measure(lane(a_main), env)?;
+    let (b_size, b_fit) = children[2].measure(lane(b_main), env)?;
 
     // the Fit carries the LANES, not the children's answers: a rigid
     // child (a text) answers its natural, but its lane is still the
@@ -8412,8 +9100,14 @@ fn measure_split(
     }
     .unwrap_or_else(|| cross(&a_size).max(cross(&divider_size)).max(cross(&b_size)));
     let lane_size = |lane_main: Px| match axis {
-        Axis::Horizontal => Size { width: lane_main, height: cross_extent },
-        Axis::Vertical => Size { width: cross_extent, height: lane_main },
+        Axis::Horizontal => Size {
+            width: lane_main,
+            height: cross_extent,
+        },
+        Axis::Vertical => Size {
+            width: cross_extent,
+            height: lane_main,
+        },
     };
 
     let main_sum = a_lane + thickness + b_lane;
@@ -8427,14 +9121,14 @@ fn measure_split(
             height: proposed_main.unwrap_or(main_sum),
         },
     };
-    (
+    Ok((
         size,
         Fit::Children(vec![
             (lane_size(a_lane), a_fit),
             (lane_size(thickness), divider_fit),
             (lane_size(b_lane), b_fit),
         ]),
-    )
+    ))
 }
 
 /// A difference within half a device pixel is arithmetic, not appetite:
@@ -8468,10 +9162,16 @@ fn measure_stack(
     children: &[LayoutNode],
     proposal: Proposal,
     env: &LayoutEnv<'_>,
-) -> (Size, Fit) {
+) -> Result<(Size, Fit), crate::text_error::TextError> {
     let cross_proposal = |main: Option<Px>| match axis {
-        Axis::Vertical => Proposal { width: proposal.width, height: main },
-        Axis::Horizontal => Proposal { width: main, height: proposal.height },
+        Axis::Vertical => Proposal {
+            width: proposal.width,
+            height: main,
+        },
+        Axis::Horizontal => Proposal {
+            width: main,
+            height: proposal.height,
+        },
     };
     let main = |size: &Size| match axis {
         Axis::Vertical => size.height,
@@ -8490,7 +9190,7 @@ fn measure_stack(
     let mut measured: Vec<(Size, Fit)> = children
         .iter()
         .map(|child| child.measure(cross_proposal(None), env))
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     let spacing_total = spacing * children.len().saturating_sub(1) as Px;
     let flexible: Vec<usize> = children
@@ -8544,13 +9244,19 @@ fn measure_stack(
             while !pool.is_empty() {
                 let share = budget / pool.len() as Px;
                 for &index in &pool {
-                    measured[index] = children[index].measure(cross_proposal(Some(share)), env);
+                    measured[index] = children[index].measure(cross_proposal(Some(share)), env)?;
                 }
                 let took = |index: &usize| main(&measured[*index].0);
-                let under: Vec<usize> =
-                    pool.iter().copied().filter(|index| took(index) < share - SETTLED).collect();
+                let under: Vec<usize> = pool
+                    .iter()
+                    .copied()
+                    .filter(|index| took(index) < share - SETTLED)
+                    .collect();
                 let retired = if under.is_empty() {
-                    pool.iter().copied().filter(|index| took(index) > share + SETTLED).collect()
+                    pool.iter()
+                        .copied()
+                        .filter(|index| took(index) > share + SETTLED)
+                        .collect()
                 } else {
                     under
                 };
@@ -8561,6 +9267,7 @@ fn measure_stack(
                 budget = budget.max(0.0);
                 pool.retain(|index| !retired.contains(index));
             }
+            Ok::<(), crate::text_error::TextError>(())
         };
 
         // Before the quotas: WHO here actually wants a size?
@@ -8596,14 +9303,22 @@ fn measure_stack(
         // nothing here to win — two panes that take whatever they are
         // given are naturals of nothing and never reach the probe.
         let quota = budget / pool.len() as Px;
-        let wants_more = pool.iter().any(|&index| main(&measured[index].0) > quota + SETTLED);
+        let wants_more = pool
+            .iter()
+            .any(|&index| main(&measured[index].0) > quota + SETTLED);
         if pool.len() > 1 && wants_more {
-            let (bounded, fillers): (Vec<usize>, Vec<usize>) =
-                pool.iter().partition(|&&index| {
-                    let offer = main(&measured[index].0) + 1.0;
-                    main(&children[index].measure(cross_proposal(Some(offer)), env).0)
-                        < offer - SETTLED
-                });
+            let mut bounded = Vec::new();
+            let mut fillers = Vec::new();
+            for &index in &pool {
+                let offer = main(&measured[index].0) + 1.0;
+                if main(&children[index].measure(cross_proposal(Some(offer)), env)?.0)
+                    < offer - SETTLED
+                {
+                    bounded.push(index);
+                } else {
+                    fillers.push(index);
+                }
+            }
             // The bounded contend for the whole budget among themselves,
             // and whatever they leave is the fillers'. When their ideals
             // fit, each gets what it asked for; when they do not, the
@@ -8611,14 +9326,14 @@ fn measure_stack(
             // nothing — which is right, because nothing is what they
             // asked for.
             if !bounded.is_empty() && !fillers.is_empty() {
-                waterfall(&mut measured, bounded.clone(), budget);
+                waterfall(&mut measured, bounded.clone(), budget)?;
                 let taken: Px = bounded.iter().map(|&index| main(&measured[index].0)).sum();
                 budget = (budget - taken).max(0.0);
                 pool = fillers;
             }
         }
 
-        waterfall(&mut measured, pool, budget);
+        waterfall(&mut measured, pool, budget)?;
     }
 
     // phase 3: the row's OWN thickness is the truth, not the box it
@@ -8648,21 +9363,33 @@ fn measure_stack(
         let settled = main(&measured[index].0);
         measured[index] = child.measure(
             match axis {
-                Axis::Vertical => Proposal { width: Some(cross_max), height: Some(settled) },
-                Axis::Horizontal => Proposal { width: Some(settled), height: Some(cross_max) },
+                Axis::Vertical => Proposal {
+                    width: Some(cross_max),
+                    height: Some(settled),
+                },
+                Axis::Horizontal => Proposal {
+                    width: Some(settled),
+                    height: Some(cross_max),
+                },
             },
             env,
-        );
+        )?;
         cross_max = cross_max.max(cross(&measured[index].0));
     }
 
     let main_sum: Px = measured.iter().map(|(size, _)| main(size)).sum::<Px>() + spacing_total;
 
     let size = match axis {
-        Axis::Vertical => Size { width: cross_max, height: main_sum },
-        Axis::Horizontal => Size { width: main_sum, height: cross_max },
+        Axis::Vertical => Size {
+            width: cross_max,
+            height: main_sum,
+        },
+        Axis::Horizontal => Size {
+            width: main_sum,
+            height: cross_max,
+        },
     };
-    (size, Fit::Children(measured))
+    Ok((size, Fit::Children(measured)))
 }
 
 /// The flow's measure: every child at its own size, lines broken where
@@ -8678,20 +9405,29 @@ fn measure_flow(
     children: &[LayoutNode],
     proposal: Proposal,
     env: &LayoutEnv<'_>,
-) -> (Size, Fit) {
+) -> Result<(Size, Fit), crate::text_error::TextError> {
     let limit = proposal.width.unwrap_or(Px::INFINITY);
-    let natural = Proposal { width: None, height: None };
+    let natural = Proposal {
+        width: None,
+        height: None,
+    };
     let measured: Vec<(Size, Fit)> = children
         .iter()
         .map(|child| {
-            let (size, fit) = child.measure(natural, env);
+            let (size, fit) = child.measure(natural, env)?;
             if size.width > limit + SETTLED {
-                child.measure(Proposal { width: Some(limit), height: None }, env)
+                child.measure(
+                    Proposal {
+                        width: Some(limit),
+                        height: None,
+                    },
+                    env,
+                )
             } else {
-                (size, fit)
+                Ok((size, fit))
             }
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     let mut lines = vec![0];
     let (mut line_width, mut line_height) = (0.0, 0.0);
     let (mut widest, mut height): (Px, Px) = (0.0, 0.0);
@@ -8718,7 +9454,13 @@ fn measure_flow(
     if measured.is_empty() {
         lines.clear();
     }
-    (Size { width: widest, height }, Fit::Lines(lines, measured))
+    Ok((
+        Size {
+            width: widest,
+            height,
+        },
+        Fit::Lines(lines, measured),
+    ))
 }
 
 /// The flow's place: the measured lines, top to bottom from the frame's
@@ -8734,11 +9476,13 @@ fn place_flow(
     fits: &[(Size, Fit)],
     env: &LayoutEnv<'_>,
     out: &mut Placement,
-) {
+) -> Result<(), crate::text_error::TextError> {
     let mut top = frame.origin.y;
     for (line, &start) in lines.iter().enumerate() {
         let end = lines.get(line + 1).copied().unwrap_or(fits.len());
-        let height = fits[start..end].iter().fold(0.0, |tallest: Px, (size, _)| tallest.max(size.height));
+        let height = fits[start..end]
+            .iter()
+            .fold(0.0, |tallest: Px, (size, _)| tallest.max(size.height));
         // each line reads from the leading edge, like a row
         let mut along = 0.0;
         for index in start..end {
@@ -8750,18 +9494,22 @@ fn place_flow(
                 align => align_offset(height, size.height, align),
             };
             let x = leading_x(frame, along, size.width, env.rtl());
-            let at = Rect { origin: Point { x, y: top + offset }, size: *size };
+            let at = Rect {
+                origin: Point { x, y: top + offset },
+                size: *size,
+            };
             let child = &children[index];
             if out.leaves_unplaced(at) && child.quiet_now() {
                 child.record_unplaced(at, env, out);
                 crate::stats::note_unplaced();
             } else {
-                child.place(at, fit, env, out);
+                child.place(at, fit, env, out)?;
             }
             along += size.width + spacing;
         }
         top += height + line_spacing;
-    }
+    };
+    Ok(())
 }
 
 /// Paints a placed text: single line, word-wrapped, or truncated with an
@@ -8774,9 +9522,9 @@ fn place_text(
     base_color: Color,
     env: &LayoutEnv<'_>,
     out: &mut Placement,
-) {
+) -> Result<(), crate::text_error::TextError> {
     if content.is_empty() {
-        return;
+        return Ok(());
     }
     // the rows of a long list that are off the glass neither measure nor
     // break their lines: the band is the one every line below is drawn in,
@@ -8786,9 +9534,9 @@ fn place_text(
         frame.origin.y - env.font.size,
         frame.origin.y + frame.size.height + env.font.size * 3.0,
     ) {
-        return;
+        return Ok(());
     }
-    let metrics = env.cache.measure_text(content, &env.font, env.text);
+    let metrics = env.cache.measure_text(content, &env.font, env.text)?;
     let line_h = metrics.height();
     // the step between lines, and the half-leading that centres the glyph
     // box inside a taller one — the baseline stays ascent-based, so the
@@ -8818,15 +9566,16 @@ fn place_text(
 
     if metrics.width <= frame.size.width && !content.contains('\n') {
         let origin = Point { x: frame.origin.x + slide(metrics.width), y: top };
-        emit_text_runs(content, (0, content.len()), highlights, origin, base_color, env, out);
-        return;
+        emit_text_runs(content, (0, content.len()), highlights, origin, base_color, env, out)?;
+        return Ok(());
     }
     if let Some(mode) = truncation {
         // highlight does not survive the ellipsis (the original's ranges
         // do not map onto the composed text) — honest v1, noted
-        let composed: Arc<str> = Arc::from(truncate_to_width(content, "", mode, frame.size.width, env));
+        let composed: Arc<str> = Arc::from(truncate_to_width(content, "", mode, frame.size.width, env)?);
         let length = composed.len();
-        let cut = env.cache.measure_text(&composed, &env.font, env.text).width;
+        let cut = env.cache.measure_text(&composed, &env.font, env.text)?
+            .width;
         out.draw(DrawCommand::TextLine {
             origin: Point { x: frame.origin.x + slide(cut), y: top },
             content: env.cache.text_content(&composed),
@@ -8834,29 +9583,30 @@ fn place_text(
             color: base_color,
             font: env.font,
         });
-        return;
+        return Ok(());
     }
-    let lines = env.cache.get_or_break(content, &env.font, frame.size.width, env.text);
+    let lines = env.cache.get_or_break(content, &env.font, frame.size.width, env.text)?;
     // the same rule the measure used, so the two never disagree about
     // which line is the last one
     let shown = rows_that_fit(lines.len(), advance, Some(frame.size.height));
     for (line_index, (start, end)) in lines.iter().enumerate().take(shown) {
-        // the last line of a paragraph that was CUT says so, the way a
-        // single line that does not fit already did
-        if line_index + 1 == shown && shown < lines.len() {
-            // Keep the hidden prefix that resolves embeddings on this row.
-            // Later hard paragraphs are omitted, as the ellipsis communicates.
-            let paragraph_start = content[..*start].rfind('\n').map_or(0, |at| at + 1);
+            // the last line of a paragraph that was CUT says so, the way a
+            // single line that does not fit already did
+            if line_index + 1 == shown && shown < lines.len() {
+                // Keep the hidden prefix that resolves embeddings on this row.
+                // Later hard paragraphs are omitted, as the ellipsis communicates.
+                let paragraph_start = content[..*start].rfind('\n').map_or(0, |at| at + 1);
             let prefix = &content[paragraph_start..*start];
             let rest = content[*start..].split('\n').next().unwrap_or("").trim_end();
-            let visible = truncate_to_width(rest, prefix, Truncation::End, frame.size.width, env);
+            let visible = truncate_to_width(rest, prefix, Truncation::End, frame.size.width, env)?;
             let composed: Arc<str> = Arc::from(format!("{prefix}{visible}"));
             let length = composed.len();
             let source = env.cache.text_content(&composed);
-            // Both prefix and the composed visible row contain no hard LF.
-            let line = source.line(prefix.len()..length)
+                // Both prefix and the composed visible row contain no hard LF.
+                let line = source.line(prefix.len()..length)
                 .expect("ellipsis is confined to its shaping paragraph");
-            let cut = env.cache.get_or_measure_paragraph(&line, &env.font, env.text).width;
+            let cut = env.cache.get_or_measure_paragraph(&line, &env.font, env.text)?
+                    .width;
             out.draw(DrawCommand::TextLine {
                 origin: Point {
                     x: frame.origin.x + slide(cut),
@@ -8869,11 +9619,11 @@ fn place_text(
             });
             break;
         }
-        // a line that does not start at the frame's left edge has to know
-        // its OWN width; one that does never asks, so the common case
-        // measures nothing extra — leading left to right, trailing right
-        // to left
-        let starts_at_left = matches!(
+            // a line that does not start at the frame's left edge has to know
+            // its OWN width; one that does never asks, so the common case
+            // measures nothing extra — leading left to right, trailing right
+            // to left
+            let starts_at_left = matches!(
             (env.text_align, rtl),
             (None | Some(motor::views::TextAlignment::Leading), false)
                 | (Some(motor::views::TextAlignment::Trailing), true)
@@ -8881,14 +9631,15 @@ fn place_text(
         let x = match starts_at_left {
             true => frame.origin.x,
             false => {
-                // the space a break swallowed is INVISIBLE, and counting
-                // it would slide the line half a space off centre — the
-                // browser trims it too, so the two lowerings agree
-                let trimmed = content[*start..*end].trim_end().len();
+                    // the space a break swallowed is INVISIBLE, and counting
+                    // it would slide the line half a space off centre — the
+                    // browser trims it too, so the two lowerings agree
+                    let trimmed = content[*start..*end].trim_end().len();
                 let source = env.cache.text_content(content);
                 let line = source.line(*start..*start + trimmed)
                     .expect("trimming a wrapped line preserves its paragraph and scalar boundaries");
-                let width = env.cache.get_or_measure_paragraph(&line, &env.font, env.text).width;
+                let width = env.cache.get_or_measure_paragraph(&line, &env.font, env.text)?
+                        .width;
                 frame.origin.x + slide(width)
             }
         };
@@ -8900,8 +9651,9 @@ fn place_text(
             base_color,
             env,
             out,
-        );
-    }
+        )?;
+    };
+    Ok(())
 }
 
 /// Color a complete line by clipping its original shape, so highlights cannot
@@ -8914,22 +9666,37 @@ fn emit_text_runs(
     base_color: Color,
     env: &LayoutEnv<'_>,
     out: &mut Placement,
-) {
-    let native = highlights.and_then(|highlight| {
-        let source = env.cache.text_content(content);
-        let shaped = source.line(line.0..line.1).ok()?;
-        let geometry = env.cache.get_or_paragraph_geometry(&shaped, &env.font, env.text)?;
-        let clip = out.current_clip().unwrap_or_else(|| {
-            // The raster's line box plus the same rounding slack as damage bounds.
-            let metrics = env.cache.get_or_measure_paragraph(&shaped, &env.font, env.text);
-            Rect { origin: Point { x: origin.x - 2.0, y: origin.y - 2.0 },
-                size: Size { width: metrics.width + 4.0, height: metrics.height() + 4.0 } }
-        });
-        Some((highlight, geometry, clip))
-    });
-    let Some((highlight, geometry, clip)) = native else {
+) -> Result<(), crate::text_error::TextError> {
+    let Some(highlight) = highlights else {
+        emit_legacy_text_runs(content, line, None, origin, base_color, env, out);
+        return Ok(());
+    };
+    let source = env.cache.text_content(content);
+    let shaped = source.line(line.0..line.1)?;
+    let Some(geometry) = env
+        .cache
+        .get_or_paragraph_geometry(&shaped, &env.font, env.text)?
+    else {
         emit_legacy_text_runs(content, line, highlights, origin, base_color, env, out);
-        return;
+        return Ok(());
+    };
+    let clip = match out.current_clip() {
+        Some(clip) => clip,
+        None => {
+            let metrics = env
+                .cache
+                .get_or_measure_paragraph(&shaped, &env.font, env.text)?;
+            Rect {
+                origin: Point {
+                    x: origin.x - 2.0,
+                    y: origin.y - 2.0,
+                },
+                size: Size {
+                    width: metrics.width + 4.0,
+                    height: metrics.height() + 4.0,
+                },
+            }
+        }
     };
     let left = clip.origin.x - origin.x;
     let right = left + clip.size.width;
@@ -8969,6 +9736,8 @@ fn emit_text_runs(
         cursor = end;
     }
     paint(cursor, right, base_color);
+
+    Ok(())
 }
 
 /// Emits the `TextLine`s of ONE line: whole in the base color, or sliced
@@ -9114,24 +9883,37 @@ fn rows_that_fit(lines: usize, advance: Px, room: Option<Px>) -> usize {
     }
 }
 
-fn truncate_to_width(content: &str, prefix: &str, mode: Truncation, width: Px, env: &LayoutEnv<'_>) -> String {
+fn truncate_to_width(
+    content: &str,
+    prefix: &str,
+    mode: Truncation,
+    width: Px,
+    env: &LayoutEnv<'_>,
+) -> Result<String, crate::text_error::TextError> {
     // Explicit single-line truncation displays hard separators as spaces.
     let displayed = crate::text_input::displayed(content, false, false);
     let content = displayed.as_ref();
-    let fits = |candidate: &str| {
-        let composed = env.cache.owned_text_content(Arc::from(format!("{prefix}{candidate}")));
+    let fits = |candidate: &str| -> Result<bool, crate::text_error::TextError> {
+        let composed = env
+            .cache
+            .owned_text_content(Arc::from(format!("{prefix}{candidate}")));
         // The prefix is a hard-paragraph slice; the candidate is normalized above.
-        let line = composed.line(prefix.len()..composed.len())
+        let line = composed
+            .line(prefix.len()..composed.len())
             .expect("ellipsis candidates contain no hard paragraph separator");
-        env.cache.get_or_measure_paragraph(&line, &env.font, env.text).width <= width
+        Ok(env
+            .cache
+            .get_or_measure_paragraph(&line, &env.font, env.text)?
+            .width
+            <= width)
     };
     let boundaries = crate::grapheme::boundaries(content);
-    match mode {
+    Ok(match mode {
         Truncation::End => {
             let mut best = ELLIPSIS.to_string();
             for &boundary in boundaries.iter().skip(1) {
                 let candidate = format!("{}{ELLIPSIS}", &content[..boundary]);
-                if fits(&candidate) {
+                if fits(&candidate)? {
                     best = candidate;
                 } else {
                     break;
@@ -9146,7 +9928,7 @@ fn truncate_to_width(content: &str, prefix: &str, mode: Truncation, width: Px, e
                     break; // the whole content did not fit back there
                 }
                 let candidate = format!("{ELLIPSIS}{}", &content[start..]);
-                if fits(&candidate) {
+                if fits(&candidate)? {
                     best = candidate;
                 } else {
                     break;
@@ -9163,7 +9945,11 @@ fn truncate_to_width(content: &str, prefix: &str, mode: Truncation, width: Px, e
                 let mut grew = false;
                 let head_next = next(head);
                 if head_next <= tail
-                    && fits(&format!("{}{ELLIPSIS}{}", &content[..head_next], &content[tail..]))
+                    && fits(&format!(
+                        "{}{ELLIPSIS}{}",
+                        &content[..head_next],
+                        &content[tail..]
+                    ))?
                 {
                     head = head_next;
                     grew = true;
@@ -9174,7 +9960,7 @@ fn truncate_to_width(content: &str, prefix: &str, mode: Truncation, width: Px, e
                         "{}{ELLIPSIS}{}",
                         &content[..head],
                         &content[tail_previous..]
-                    ))
+                    ))?
                 {
                     tail = tail_previous;
                     grew = true;
@@ -9185,7 +9971,7 @@ fn truncate_to_width(content: &str, prefix: &str, mode: Truncation, width: Px, e
             }
             format!("{}{ELLIPSIS}{}", &content[..head], &content[tail..])
         }
-    }
+    })
 }
 
 const SCROLLBAR_W: Px = 4.0;
@@ -9314,8 +10100,8 @@ fn place_target(
     frame: Rect,
     env: &LayoutEnv<'_>,
     out: &mut Placement,
-    place: impl FnOnce(&mut Placement),
-) {
+    place: impl FnOnce(&mut Placement) -> Result<(), crate::text_error::TextError>,
+) -> Result<(), crate::text_error::TextError> {
     // outside the viewport the hit does NOT exist; a
     // half-visible row clicks only on its visible part (the
     // recorded rect is the intersection with the current clip)
@@ -9339,12 +10125,14 @@ fn place_target(
         // clicks with it and scopes `:hover` to the element
         dom.arm_interactive(path);
     }
-    place(out);
+    place(out)?;
     if let Some(dom) = out.dom.as_mut() {
         dom.disarm();
     }
     out.pointer.pop();
     out.pointer_hit.pop();
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9357,7 +10145,7 @@ fn place_stack(
     fits: &[(Size, Fit)],
     env: &LayoutEnv<'_>,
     out: &mut Placement,
-) {
+) -> Result<(), crate::text_error::TextError> {
     // a row reads from its leading edge: the left one, or the right one
     // in a right-to-left scene, where the cursor walks back
     let rtl = axis == Axis::Horizontal && env.rtl();
@@ -9370,65 +10158,72 @@ fn place_stack(
     // baseline — text by its ascent, a baselineless box by its bottom
     // edge (its baseline IS its bottom, the SwiftUI rule). Computed
     // only when asked; the other alignments pay nothing.
-    let baselines: Option<Vec<Px>> = (align == CrossAlign::Baseline
-        && axis == Axis::Horizontal)
+    let baselines: Option<Vec<Px>> = (align == CrossAlign::Baseline && axis == Axis::Horizontal)
         .then(|| {
             children
                 .iter()
                 .zip(fits)
                 .map(|(child, (size, _))| {
-                    child.first_baseline(env).unwrap_or(size.height)
+                    child
+                        .first_baseline(env)
+                        .map(|baseline| baseline.unwrap_or(size.height))
                 })
-                .collect()
-        });
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
     let shared = baselines
         .as_ref()
         .map(|baselines| baselines.iter().fold(0.0_f64, |acc, b| acc.max(*b)));
-    for (index, (child, (size, fit))) in children.iter().zip(fits).enumerate() {
-        let cross_offset = |extent: Px, len: Px| match align {
-            CrossAlign::Baseline => match (&baselines, shared) {
-                (Some(baselines), Some(shared)) => shared - baselines[index],
-                // a vertical stack has no shared baseline: start
-                _ => 0.0,
-            },
-            // a squashed window can be narrower than a rigid child, and
-            // the same rule holds there as everywhere: the leftover is
-            // never negative, so the child starts at the leading edge
-            // instead of hanging half of itself off the near side
-            align => align_offset(extent, len, align),
-        };
-        let origin = match axis {
-            // the column's cross axis is the one with a side: the
-            // offset is mirrored inside the frame, so `Start` hugs the
-            // right and a too-wide child spills left in a right-to-left
-            // scene (a vertical stack has no shared baseline: start)
-            Axis::Vertical => {
-                let offset = cross_offset(frame.size.width, size.width);
-                let x = if env.rtl() {
-                    frame.origin.x + frame.size.width - size.width - offset
-                } else {
-                    frame.origin.x + offset
-                };
-                Point { x, y: cursor }
+
+        for (index, (child, (size, fit))) in children.iter().zip(fits).enumerate() {
+            let cross_offset = |extent: Px, len: Px| match align {
+                CrossAlign::Baseline => match (&baselines, shared) {
+                    (Some(baselines), Some(shared)) => shared - baselines[index],
+                    // a vertical stack has no shared baseline: start
+                    _ => 0.0,
+                },
+                // a squashed window can be narrower than a rigid child, and
+                // the same rule holds there as everywhere: the leftover is
+                // never negative, so the child starts at the leading edge
+                // instead of hanging half of itself off the near side
+                align => align_offset(extent, len, align),
+            };
+            let origin = match axis {
+                // the column's cross axis is the one with a side: the
+                // offset is mirrored inside the frame, so `Start` hugs the
+                // right and a too-wide child spills left in a right-to-left
+                // scene (a vertical stack has no shared baseline: start)
+                Axis::Vertical => {
+                    let offset = cross_offset(frame.size.width, size.width);
+                    let x = if env.rtl() {
+                        frame.origin.x + frame.size.width - size.width - offset
+                    } else {
+                        frame.origin.x + offset
+                    };
+                    Point { x, y: cursor }
+                }
+                Axis::Horizontal => Point {
+                    x: if rtl { cursor - size.width } else { cursor },
+                    y: frame.origin.y + cross_offset(frame.size.height, size.height),
+                },
+            };
+            let at = Rect {
+                origin,
+                size: *size,
+            };
+            if out.leaves_unplaced(at) && child.quiet_now() {
+                child.record_unplaced(at, env, out);
+                crate::stats::note_unplaced();
+            } else {
+                child.place(at, fit, env, out)?;
             }
-            Axis::Horizontal => Point {
-                x: if rtl { cursor - size.width } else { cursor },
-                y: frame.origin.y + cross_offset(frame.size.height, size.height),
-            },
+            let step = match axis {
+                Axis::Vertical => size.height,
+                Axis::Horizontal => size.width,
+            } + spacing;
+            if rtl { cursor -= step } else { cursor += step }
         };
-        let at = Rect { origin, size: *size };
-        if out.leaves_unplaced(at) && child.quiet_now() {
-            child.record_unplaced(at, env, out);
-            crate::stats::note_unplaced();
-        } else {
-            child.place(at, fit, env, out);
-        }
-        let step = match axis {
-            Axis::Vertical => size.height,
-            Axis::Horizontal => size.width,
-        } + spacing;
-        if rtl { cursor -= step } else { cursor += step }
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -9504,10 +10299,10 @@ mod tests {
             vec![boundary("a", text(2)), boundary("b", text(3))],
         );
         let proposal = Proposal { width: Some(100.0), height: Some(20.0) };
-        let ltr = layout(&row, proposal);
+        let ltr = layout(&row, proposal).unwrap();
         assert_eq!(frame_of(&ltr, "a").origin.x, 0.0);
         assert_eq!(frame_of(&ltr, "b").origin.x, 16.0);
-        let rtl = layout_in(&row, proposal, LayoutDirection::RightToLeft);
+        let rtl = layout_in(&row, proposal, LayoutDirection::RightToLeft).unwrap();
         assert_eq!(frame_of(&rtl, "a").origin.x, 84.0, "the first child ends at the right edge");
         assert_eq!(frame_of(&rtl, "b").origin.x, 60.0, "and the row walks left");
         assert_eq!(frame_of(&rtl, "a").origin.y, frame_of(&ltr, "a").origin.y, "nothing moves vertically");
@@ -9524,15 +10319,15 @@ mod tests {
             vec![fixed("fits", 40.0, 10.0), fixed("wide", 140.0, 10.0)],
         );
         let proposal = Proposal { width: Some(100.0), height: Some(100.0) };
-        let ltr = layout(&column, proposal);
+        let ltr = layout(&column, proposal).unwrap();
         assert_eq!(frame_of(&ltr, "fits").origin.x, 0.0);
         assert_eq!(frame_of(&ltr, "wide").origin.x, 0.0, "a left-to-right column spills right");
-        let rtl = layout_in(&column, proposal, LayoutDirection::RightToLeft);
+        let rtl = layout_in(&column, proposal, LayoutDirection::RightToLeft).unwrap();
         assert_eq!(frame_of(&rtl, "fits").origin.x, 60.0, "start hugs the right");
         assert_eq!(frame_of(&rtl, "wide").origin.x, -40.0, "and what does not fit spills left");
         let end = stack(Axis::Vertical, CrossAlign::End, vec![fixed("fits", 40.0, 10.0)]);
         assert_eq!(
-            frame_of(&layout_in(&end, proposal, LayoutDirection::RightToLeft), "fits").origin.x,
+            frame_of(&layout_in(&end, proposal, LayoutDirection::RightToLeft).unwrap(), "fits").origin.x,
             60.0,
             "a column as wide as its child has one place for it",
         );
@@ -9545,10 +10340,11 @@ mod tests {
             edges: Edges { top: 0.0, trailing: 2.0, bottom: 0.0, leading: 10.0 },
             child: Box::new(boundary("inner", text(5))),
         };
-        let ltr = layout(&padded, Proposal::unspecified());
+        let ltr = layout(&padded, Proposal::unspecified()).unwrap();
         assert_eq!(ltr.size.width, 52.0);
         assert_eq!(frame_of(&ltr, "inner").origin.x, 10.0);
-        let rtl = layout_in(&padded, Proposal::unspecified(), LayoutDirection::RightToLeft);
+        let rtl = layout_in(&padded, Proposal::unspecified(), LayoutDirection::RightToLeft)
+        .unwrap();
         assert_eq!(rtl.size, ltr.size, "a direction changes no measure");
         assert_eq!(frame_of(&rtl, "inner").origin.x, 2.0, "the trailing inset is the left one");
     }
@@ -9564,7 +10360,7 @@ mod tests {
             child: Box::new(boundary("n", text(4))),
         };
         let read = |align: CrossAlign, direction: LayoutDirection| {
-            frame_of(&layout_in(&lane(align), Proposal::unspecified(), direction), "n").origin.x
+            frame_of(&layout_in(&lane(align), Proposal::unspecified(), direction).unwrap(), "n").origin.x
         };
         use LayoutDirection::{LeftToRight, RightToLeft};
         assert_eq!(read(CrossAlign::Start, LeftToRight), 0.0);
@@ -9584,8 +10380,8 @@ mod tests {
             modal: false,
             children: vec![fixed("wide", 118.0, 10.0), fixed("bar", 2.0, 10.0)],
         };
-        assert_eq!(frame_of(&layout(&pile, Proposal::unspecified()), "bar").origin.x, 0.0);
-        let rtl = layout_in(&pile, Proposal::unspecified(), LayoutDirection::RightToLeft);
+        assert_eq!(frame_of(&layout(&pile, Proposal::unspecified()).unwrap(), "bar").origin.x, 0.0);
+        let rtl = layout_in(&pile, Proposal::unspecified(), LayoutDirection::RightToLeft).unwrap();
         assert_eq!(frame_of(&rtl, "bar").origin.x, 116.0);
         assert_eq!(frame_of(&rtl, "wide").origin.x, 0.0);
     }
@@ -9601,7 +10397,7 @@ mod tests {
             child: Box::new(fixed("box", 100.0, 50.0)),
         };
         let read = |at: UnitPoint, direction: LayoutDirection| {
-            frame_of(&layout_in(&badge(at), Proposal::unspecified(), direction), "badge").origin
+            frame_of(&layout_in(&badge(at), Proposal::unspecified(), direction).unwrap(), "badge").origin
         };
         use LayoutDirection::{LeftToRight, RightToLeft};
         assert_eq!(read(UnitPoint::TOP_LEADING, LeftToRight), Point { x: 0.0, y: 0.0 });
@@ -9620,11 +10416,11 @@ mod tests {
             children: vec![boundary("a", text(5)), boundary("b", text(5)), boundary("c", text(5))],
         };
         let proposal = Proposal { width: Some(100.0), height: Some(100.0) };
-        let ltr = layout(&flow, proposal);
+        let ltr = layout(&flow, proposal).unwrap();
         assert_eq!(frame_of(&ltr, "a").origin, Point { x: 0.0, y: 0.0 });
         assert_eq!(frame_of(&ltr, "b").origin, Point { x: 40.0, y: 0.0 });
         assert_eq!(frame_of(&ltr, "c").origin, Point { x: 0.0, y: 16.0 }, "the third wraps");
-        let rtl = layout_in(&flow, proposal, LayoutDirection::RightToLeft);
+        let rtl = layout_in(&flow, proposal, LayoutDirection::RightToLeft).unwrap();
         assert_eq!(frame_of(&rtl, "a").origin, Point { x: 60.0, y: 0.0 }, "the first ends at the right edge");
         assert_eq!(frame_of(&rtl, "b").origin, Point { x: 20.0, y: 0.0 });
         assert_eq!(frame_of(&rtl, "c").origin, Point { x: 60.0, y: 16.0 }, "and so does the next line");
@@ -9647,7 +10443,7 @@ mod tests {
         );
         let column = stack(Axis::Vertical, CrossAlign::Center, vec![bar, fixed("body", 948.0, 10.0)]);
         let proposal = Proposal { width: Some(500.0), height: Some(800.0) };
-        let result = layout_in(&column, proposal, LayoutDirection::RightToLeft);
+        let result = layout_in(&column, proposal, LayoutDirection::RightToLeft).unwrap();
         assert_eq!(result.size.width, 948.0, "the frame is as wide as the body it cannot shrink");
         let bar = frame_of(&result, "bar");
         assert_eq!(bar.origin.x + bar.size.width, 500.0, "the bar keeps its right end on the window's");
@@ -9745,8 +10541,8 @@ mod tests {
         );
         let width = 300.0;
         let proposal = Proposal { width: Some(width), height: Some(400.0) };
-        let ltr = layout(&scene, proposal);
-        let rtl = layout_in(&scene, proposal, LayoutDirection::RightToLeft);
+        let ltr = layout(&scene, proposal).unwrap();
+        let rtl = layout_in(&scene, proposal, LayoutDirection::RightToLeft).unwrap();
         assert_eq!(ltr.size, rtl.size, "a direction changes no measure");
         let paths = [
             "r1", "r2", "r3", "pad", "padded", "framed", "f1", "f2", "f3", "f4", "under", "over",
@@ -9794,7 +10590,7 @@ mod tests {
             ],
         };
         let proposal = Proposal { width: Some(1200.0), height: Some(700.0) };
-        let result = layout_in(&split, proposal, LayoutDirection::RightToLeft);
+        let result = layout_in(&split, proposal, LayoutDirection::RightToLeft).unwrap();
         let a = frame_of(&result, "a");
         assert_eq!((a.origin.x, a.size.width), (940.0, 260.0), "lane A stands at the right");
         let b = frame_of(&result, "b");
@@ -9824,9 +10620,9 @@ mod tests {
             }),
         };
         let proposal = Proposal { width: Some(100.0), height: Some(50.0) };
-        let ltr = layout(&region, proposal);
+        let ltr = layout(&region, proposal).unwrap();
         assert_eq!(frame_of(&ltr, "content").origin.x, 0.0);
-        let rtl = layout_in(&region, proposal, LayoutDirection::RightToLeft);
+        let rtl = layout_in(&region, proposal, LayoutDirection::RightToLeft).unwrap();
         let content = frame_of(&rtl, "content");
         assert_eq!(content.size.width, 320.0);
         assert_eq!(content.origin.x, -220.0, "the content hangs out past the left edge, its start at the right");
@@ -9873,8 +10669,8 @@ mod tests {
                 })
                 .expect("the bar paints")
         };
-        assert_eq!(bar_x(&layout(&region, proposal)), 100.0 - SCROLLBAR_INSET - SCROLLBAR_W);
-        assert_eq!(bar_x(&layout_in(&region, proposal, LayoutDirection::RightToLeft)), SCROLLBAR_INSET);
+        assert_eq!(bar_x(&layout(&region, proposal).unwrap()), 100.0 - SCROLLBAR_INSET - SCROLLBAR_W);
+        assert_eq!(bar_x(&layout_in(&region, proposal, LayoutDirection::RightToLeft).unwrap()), SCROLLBAR_INSET);
     }
 
     /// A line aligned leading hugs the right in a right-to-left scene,
@@ -9902,6 +10698,7 @@ mod tests {
         };
         let lefts = |node: &LayoutNode, direction: LayoutDirection| -> Vec<Px> {
             layout_in(node, Proposal::unspecified(), direction)
+                .unwrap()
                 .display
                 .iter()
                 .filter_map(|command| match command {
@@ -9942,12 +10739,11 @@ mod tests {
         };
         let line = |direction: LayoutDirection| {
             layout_in(&node, Proposal::unspecified(), direction)
+                .unwrap()
                 .display
                 .iter()
                 .find_map(|command| match command {
-                    DrawCommand::TextLine { origin, content, .. } => {
-                        Some((origin.x, content.chars().count() as Px * 8.0))
-                    }
+                    DrawCommand::TextLine { origin, content, .. } => Some((origin.x, content.chars().count() as Px * 8.0)),
                     _ => None,
                 })
                 .expect("the line paints")
@@ -10010,6 +10806,7 @@ mod tests {
             action: None,
         };
         let segments: Vec<((usize, usize), Px)> = layout(&node, Proposal::unspecified())
+            .unwrap()
             .display
             .iter()
             .filter_map(|command| match command {
@@ -10040,8 +10837,8 @@ mod tests {
             ],
         );
         let proposal = Proposal { width: Some(100.0), height: Some(100.0) };
-        let plain = layout(&scene, proposal);
-        let spelled = layout_in(&scene, proposal, LayoutDirection::LeftToRight);
+        let plain = layout(&scene, proposal).unwrap();
+        let spelled = layout_in(&scene, proposal, LayoutDirection::LeftToRight).unwrap();
         assert_eq!(plain.display.as_slice(), spelled.display.as_slice());
         assert_eq!(plain.hits, spelled.hits);
         for path in ["a", "b", "c"] {
@@ -10121,7 +10918,8 @@ mod tests {
             hints: ElementHints::default(),
             action: None,
         };
-        let result = layout(&root, Proposal { width: Some(200.0), height: Some(100.0) });
+        let result = layout(&root, Proposal { width: Some(200.0), height: Some(100.0) })
+        .unwrap();
 
         assert_eq!(result.size.height, 100.0);
         assert_eq!(result.frames.get("top").unwrap().origin.y, 0.0);
@@ -10157,7 +10955,8 @@ mod tests {
             hints: ElementHints::default(),
             action: None,
         };
-        let result = layout(&row, Proposal { width: Some(1280.0), height: Some(174.0) });
+        let result = layout(&row, Proposal { width: Some(1280.0), height: Some(174.0) })
+        .unwrap();
 
         assert_eq!(result.size.height, 280.0, "the row is as tall as the rail it cannot shrink");
         let body = result.frames.get("body").unwrap();
@@ -10203,7 +11002,8 @@ mod tests {
             hints: ElementHints::default(),
             action: None,
         };
-        let result = layout(&column, Proposal { width: Some(500.0), height: Some(800.0) });
+        let result = layout(&column, Proposal { width: Some(500.0), height: Some(800.0) })
+        .unwrap();
 
         assert_eq!(result.size.width, 948.0, "the frame is as wide as the body it cannot shrink");
         let bar = result.frames.get("bar").unwrap();
@@ -10234,7 +11034,8 @@ mod tests {
                 ),
             ],
         };
-        let result = layout(&pile, Proposal { width: Some(1280.0), height: Some(240.0) });
+        let result = layout(&pile, Proposal { width: Some(1280.0), height: Some(240.0) })
+        .unwrap();
 
         assert_eq!(result.size.height, 372.0, "the pile is as tall as the frame in it");
         let wash = result.frames.get("wash").unwrap();
@@ -10271,7 +11072,8 @@ mod tests {
             hints: ElementHints::default(),
             action: None,
         };
-        let result = layout(&root, Proposal { width: Some(1280.0), height: Some(800.0) });
+        let result = layout(&root, Proposal { width: Some(1280.0), height: Some(800.0) })
+        .unwrap();
 
         assert_eq!(result.size.height, 800.0);
         assert_eq!(result.frames.get("bar").unwrap().size.height, 40.0);
@@ -10313,7 +11115,8 @@ mod tests {
             hints: ElementHints::default(),
             action: None,
         };
-        let result = layout(&root, Proposal { width: Some(1200.0), height: Some(700.0) });
+        let result = layout(&root, Proposal { width: Some(1200.0), height: Some(700.0) })
+        .unwrap();
 
         assert_eq!(result.frames.get("panel").unwrap().size.width, 260.0);
         assert_eq!(result.frames.get("line").unwrap().size.width, 1.0);
@@ -10342,6 +11145,7 @@ mod tests {
             boundary("trail", row(vec![LayoutNode::Spacer, leaf(150.0)])),
         ]);
         layout(&bar, Proposal { width: Some(width), height: Some(40.0) })
+        .unwrap()
     }
 
     #[test]
@@ -10396,7 +11200,8 @@ mod tests {
             hints: ElementHints::default(),
             action: None,
         };
-        let result = layout(&root, Proposal { width: Some(500.0), height: Some(100.0) });
+        let result = layout(&root, Proposal { width: Some(500.0), height: Some(100.0) })
+        .unwrap();
         assert_eq!(result.frames.get("lane").unwrap().size.width, 300.0);
         assert_eq!(result.frames.get("rest").unwrap().size.width, 200.0);
         assert_eq!(result.size.width, 500.0);
@@ -10423,7 +11228,9 @@ mod tests {
 
     #[test]
     fn a_flow_goes_down_a_line_when_the_next_chip_does_not_fit() {
-        let result = layout(&chips(&[100.0, 80.0, 120.0]), Proposal { width: Some(250.0), height: None });
+        let result = layout(&chips(&[100.0, 80.0, 120.0]), Proposal { width: Some(250.0), height: None },
+        )
+        .unwrap();
         let at = |name: &str| result.frames.get(name).unwrap().origin;
         assert_eq!(at("chip0"), Point { x: 0.0, y: 0.0 });
         assert_eq!(at("chip1"), Point { x: 106.0, y: 0.0 }, "the chips of a line stand spacing apart");
@@ -10433,14 +11240,18 @@ mod tests {
 
     #[test]
     fn a_flow_offered_nothing_is_one_line() {
-        let result = layout(&chips(&[100.0, 80.0, 120.0]), Proposal { width: None, height: None });
+        let result = layout(&chips(&[100.0, 80.0, 120.0]), Proposal { width: None, height: None },
+        )
+        .unwrap();
         assert_eq!(result.size, Size { width: 312.0, height: 20.0 });
         assert_eq!(result.frames.get("chip2").unwrap().origin, Point { x: 192.0, y: 0.0 });
     }
 
     #[test]
     fn a_chip_wider_than_the_flow_takes_a_line_of_its_own() {
-        let result = layout(&chips(&[40.0, 300.0, 40.0]), Proposal { width: Some(250.0), height: None });
+        let result = layout(&chips(&[40.0, 300.0, 40.0]), Proposal { width: Some(250.0), height: None },
+        )
+        .unwrap();
         let at = |name: &str| result.frames.get(name).unwrap().origin;
         assert_eq!(at("chip0"), Point { x: 0.0, y: 0.0 });
         assert_eq!(at("chip1"), Point { x: 0.0, y: 24.0 }, "alone on its line");
@@ -10468,7 +11279,8 @@ mod tests {
                 action: None,
             }),
         };
-        let result = layout(&rail, Proposal { width: Some(800.0), height: Some(600.0) });
+        let result = layout(&rail, Proposal { width: Some(800.0), height: Some(600.0) })
+        .unwrap();
         let chips = result.frames.get("chips").unwrap();
         assert_eq!(chips.size.height, 44.0, "two lines inside the rail");
         assert_eq!(result.frames.get("chip2").unwrap().origin.y, chips.origin.y + 24.0);
@@ -10512,14 +11324,16 @@ mod tests {
         let width_of = |result: &LayoutResult, name: &str| result.frames.get(name).unwrap().size.width;
 
         // room for everyone: the fillers split what the cap leaves
-        let roomy = layout(&root, Proposal { width: Some(900.0), height: Some(100.0) });
+        let roomy = layout(&root, Proposal { width: Some(900.0), height: Some(100.0) })
+        .unwrap();
         assert_eq!(width_of(&roomy, "capped"), 100.0);
         assert_eq!(width_of(&roomy, "lane"), 400.0);
         assert_eq!(width_of(&roomy, "spacer"), 400.0);
 
         // tight: the fillers' equal 200 is under the floor, so the lane
         // keeps its 320 and the spacer is what pays
-        let tight = layout(&root, Proposal { width: Some(500.0), height: Some(100.0) });
+        let tight = layout(&root, Proposal { width: Some(500.0), height: Some(100.0) })
+        .unwrap();
         assert_eq!(width_of(&tight, "capped"), 100.0);
         assert_eq!(width_of(&tight, "lane"), 320.0);
         assert_eq!(width_of(&tight, "spacer"), 80.0);
@@ -10622,7 +11436,9 @@ mod tests {
                 boundary("b", LayoutNode::Spacer),
             ],
         };
-        let result = layout(&split(260.0), Proposal { width: Some(1200.0), height: Some(700.0) });
+        let result = layout(&split(260.0), Proposal { width: Some(1200.0), height: Some(700.0) },
+        )
+        .unwrap();
 
         assert_eq!(result.frames.get("a").unwrap().size.width, 260.0);
         assert_eq!(result.frames.get("b").unwrap().size.width, 939.0);
@@ -10638,9 +11454,11 @@ mod tests {
         assert_eq!(result.splits[0].min_b, 100.0);
 
         // the clamps hold at both ends
-        let low = layout(&split(0.0), Proposal { width: Some(1200.0), height: Some(700.0) });
+        let low = layout(&split(0.0), Proposal { width: Some(1200.0), height: Some(700.0) })
+        .unwrap();
         assert_eq!(low.frames.get("a").unwrap().size.width, 100.0);
-        let high = layout(&split(9999.0), Proposal { width: Some(1200.0), height: Some(700.0) });
+        let high = layout(&split(9999.0), Proposal { width: Some(1200.0), height: Some(700.0) })
+        .unwrap();
         assert_eq!(high.frames.get("a").unwrap().size.width, 1099.0);
     }
 
@@ -10677,6 +11495,7 @@ mod tests {
                 },
                 Proposal { width: Some(width), height: Some(700.0) },
             )
+            .unwrap()
         };
 
         // B is the seam's own number, and A takes the rest.
@@ -10734,7 +11553,8 @@ mod tests {
                     ],
                 },
                 Proposal { width: Some(width), height: Some(700.0) },
-            );
+            )
+            .unwrap();
             (
                 result.frames.get("a").unwrap().size.width,
                 result.frames.get("b").unwrap().size.width,
@@ -10783,7 +11603,9 @@ mod tests {
                 boundary("bottom", LayoutNode::Spacer),
             ],
         };
-        let result = layout(&split, Proposal { width: Some(400.0), height: Some(700.0) });
+        let result = layout(&split, Proposal { width: Some(400.0), height: Some(700.0) },
+        )
+        .unwrap();
 
         assert_eq!(result.frames.get("top").unwrap().size.height, 300.0);
         assert_eq!(result.frames.get("bottom").unwrap().size.height, 399.0);
@@ -10807,7 +11629,8 @@ mod tests {
             align: CrossAlign::Center,
             child: Box::new(boundary("row", LayoutNode::Spacer)),
         };
-        let result = layout(&root, Proposal { width: Some(300.0), height: Some(600.0) });
+        let result = layout(&root, Proposal { width: Some(300.0), height: Some(600.0) })
+        .unwrap();
 
         assert_eq!(result.size.height, 22.0);
         assert_eq!(result.size.width, 300.0);
@@ -10827,7 +11650,7 @@ mod tests {
             child: Box::new(boundary(path, text(chars))),
         };
         let read = |node: LayoutNode, path: &str| {
-            layout(&node, Proposal::unspecified()).frames.get(path).unwrap().origin.x
+            layout(&node, Proposal::unspecified()).unwrap().frames.get(path).unwrap().origin.x
         };
 
         assert_eq!(read(lane("short", 4, CrossAlign::Start), "short"), 0.0);
@@ -10838,9 +11661,7 @@ mod tests {
 
         // and the trailing edge is the number column: the last character
         // lands on the lane's right edge whatever the value measures
-        let right = |chars: usize| {
-            read(lane("n", chars, CrossAlign::End), "n") + chars as f64 * 8.0
-        };
+        let right = |chars: usize| read(lane("n", chars, CrossAlign::End), "n") + chars as f64 * 8.0;
         assert_eq!(right(3), 132.0);
         assert_eq!(right(7), 132.0);
     }
@@ -10855,7 +11676,7 @@ mod tests {
             align: CrossAlign::Center,
             child: Box::new(boundary("inner", text(5))),
         };
-        let result = layout(&root, Proposal::unspecified());
+        let result = layout(&root, Proposal::unspecified()).unwrap();
 
         assert_eq!(result.size, Size { width: 100.0, height: 40.0 });
         let inner = result.frames.get("inner").unwrap();
@@ -10881,8 +11702,8 @@ mod tests {
             child: Box::new(text(4)),
         };
 
-        assert_eq!(layout(&exact, Proposal::unspecified()).size.width, 132.0);
-        assert_eq!(layout(&ceiling, Proposal::unspecified()).size.width, 32.0);
+        assert_eq!(layout(&exact, Proposal::unspecified()).unwrap().size.width, 132.0);
+        assert_eq!(layout(&ceiling, Proposal::unspecified()).unwrap().size.width, 32.0);
     }
 
     #[test]
@@ -10912,7 +11733,8 @@ mod tests {
             hints: ElementHints::default(),
             action: None,
         };
-        let result = layout(&root, Proposal { width: Some(400.0), height: Some(300.0) });
+        let result = layout(&root, Proposal { width: Some(400.0), height: Some(300.0) })
+        .unwrap();
 
         let header = result.frames.get("header").unwrap();
         let region = result.frames.get("region").unwrap();
@@ -10934,7 +11756,7 @@ mod tests {
             edges: Edges::uniform(10.0),
             child: Box::new(boundary("inner", text(5))),
         };
-        let result = layout(&root, Proposal::unspecified());
+        let result = layout(&root, Proposal::unspecified()).unwrap();
 
         assert_eq!(result.size, Size { width: 60.0, height: 36.0 });
         let inner = result.frames.get("inner").unwrap();
@@ -10949,7 +11771,7 @@ mod tests {
             align: CrossAlign::Center,
             child: Box::new(text(5)),
         };
-        let result = layout(&root, Proposal::unspecified());
+        let result = layout(&root, Proposal::unspecified()).unwrap();
         assert_eq!(result.size, Size { width: 100.0, height: LINE_H });
     }
 
@@ -11022,7 +11844,7 @@ mod tests {
             touch: false,
             accessibility: false,
         };
-        node.measure(proposal, &env)
+        node.measure(proposal, &env).unwrap()
     }
 
     /// Full layout with a pointer stamped into the env — how tests drive
@@ -11061,6 +11883,7 @@ mod tests {
             accessibility: false,
             },
         )
+        .unwrap()
     }
 
     #[test]
@@ -11121,7 +11944,8 @@ mod tests {
             touch: false,
             accessibility: false,
         };
-        let region = |width: Px| LayoutNode::Scroll {
+        let region = |width: Px| {
+            LayoutNode::Scroll {
             commanded: None,
             axes: crate::layout::ScrollAxes::Horizontal,
             fill: true,
@@ -11134,7 +11958,9 @@ mod tests {
                 child: Box::new(text(5)),
             }),
         }
-        .measure(Proposal { width: Some(width), height: Some(50.0) }, &env());
+        .measure(Proposal { width: Some(width), height: Some(50.0) }, &env())
+            .unwrap()
+        };
         let (_, fit) = region(300.0);
         let Fit::ScrollContent(content, _) = fit else { panic!("a region's fit") };
         assert_eq!(content.width, 300.0, "the content was laid out AT the region, not merely placed under it");
@@ -11156,7 +11982,8 @@ mod tests {
     #[test]
     fn words_wrap_at_spaces_never_mid_word() {
         let node = LayoutNode::Text { content: crate::bind::TextSource::from("aa bb cc"), highlights: None, truncation: None, hints: ElementHints::default(), action: None };
-        let result = layout(&node, Proposal { width: Some(40.0), height: None });
+        let result = layout(&node, Proposal { width: Some(40.0), height: None })
+        .unwrap();
 
         // "aa bb" (40px) fits; "cc" goes down whole — never an orphan "c"
         assert_eq!(result.size.height, 2.0 * LINE_H);
@@ -11164,7 +11991,9 @@ mod tests {
             .display
             .iter()
             .filter_map(|command| match command {
-                DrawCommand::TextLine { content, range, .. } => Some(content[range.0..range.1].to_string()),
+                DrawCommand::TextLine { content, range, .. } => {
+                    Some(content[range.0..range.1].to_string())
+                }
                 _ => None,
             })
             .collect();
@@ -11181,15 +12010,13 @@ mod tests {
             hints: ElementHints::default(),
             action: None,
         };
-        let result = layout(&node, Proposal::unspecified());
+        let result = layout(&node, Proposal::unspecified()).unwrap();
 
         let runs: Vec<(String, Color, Px)> = result
             .display
             .iter()
             .filter_map(|command| match command {
-                DrawCommand::TextLine { content, range, color, origin, .. } => {
-                    Some((content[range.0..range.1].to_string(), *color, origin.x))
-                }
+                DrawCommand::TextLine { content, range, color, origin, .. } => Some((content[range.0..range.1].to_string(), *color, origin.x)),
                 _ => None,
             })
             .collect();
@@ -11219,7 +12046,9 @@ mod tests {
             hints: ElementHints::default(),
             action: None,
         };
-        let result = layout(&node, Proposal::exact(Size { width: 40.0, height: 100.0 }));
+        let result = layout(&node, Proposal::exact(Size { width: 40.0, height: 100.0 }),
+        )
+        .unwrap();
 
         let hot_runs: Vec<(String, Px, Px)> = result
             .display
@@ -11251,13 +12080,16 @@ mod tests {
                 hints: ElementHints::default(),
                 action: None,
             };
-            let result = layout(&node, Proposal { width: Some(40.0), height: None });
+            let result = layout(&node, Proposal { width: Some(40.0), height: None })
+            .unwrap();
             assert_eq!(result.size.height, LINE_H, "truncation never wraps a line");
             result
                 .display
                 .iter()
                 .find_map(|command| match command {
-                    DrawCommand::TextLine { content, range, .. } => Some(content[range.0..range.1].to_string()),
+                    DrawCommand::TextLine { content, range, .. } => {
+                        Some(content[range.0..range.1].to_string())
+                    }
                     _ => None,
                 })
                 .unwrap()
@@ -11271,7 +12103,8 @@ mod tests {
     #[test]
     fn a_word_longer_than_the_line_hard_breaks() {
         let node = LayoutNode::Text { content: crate::bind::TextSource::from("aaaaaaaaaa"), highlights: None, truncation: None, hints: ElementHints::default(), action: None };
-        let result = layout(&node, Proposal { width: Some(40.0), height: None });
+        let result = layout(&node, Proposal { width: Some(40.0), height: None })
+        .unwrap();
 
         // 10 chars of 8px in 40px: 5 per line
         assert_eq!(result.size.height, 2.0 * LINE_H);
@@ -11279,7 +12112,9 @@ mod tests {
             .display
             .iter()
             .filter_map(|command| match command {
-                DrawCommand::TextLine { content, range, .. } => Some(content[range.0..range.1].to_string()),
+                DrawCommand::TextLine { content, range, .. } => {
+                    Some(content[range.0..range.1].to_string())
+                }
                 _ => None,
             })
             .collect();
@@ -11361,7 +12196,8 @@ mod tests {
                 LayoutNode::Leaf { size: Size { width: 50.0, height: 50.0 } },
             ],
         };
-        let result = layout(&pile, Proposal { width: Some(300.0), height: Some(200.0) });
+        let result = layout(&pile, Proposal { width: Some(300.0), height: Some(200.0) })
+        .unwrap();
         assert_eq!(result.hosts.len(), 1);
         let floor = result.modal_floor.expect("a modal pile draws its line");
         assert_eq!(floor.hosts, 1, "the page is below it");
@@ -11374,7 +12210,9 @@ mod tests {
     #[test]
     fn a_host_reports_its_box_and_paints_nothing() {
         let result =
-            layout(&host("pane"), Proposal { width: Some(300.0), height: Some(200.0) });
+            layout(&host("pane"), Proposal { width: Some(300.0), height: Some(200.0) },
+        )
+        .unwrap();
         assert_eq!(result.hosts.len(), 1);
         let placed = &result.hosts[0];
         assert_eq!(placed.path, "pane");
@@ -11406,7 +12244,8 @@ mod tests {
             hints: ElementHints::default(),
             action: None,
         };
-        let result = layout(&root, Proposal { width: Some(300.0), height: Some(200.0) });
+        let result = layout(&root, Proposal { width: Some(300.0), height: Some(200.0) })
+        .unwrap();
         let placed = &result.hosts[0];
         assert_eq!(placed.frame.origin.x, 100.0);
         assert_eq!(placed.frame.size.width, 200.0);
@@ -11418,7 +12257,8 @@ mod tests {
     /// its space.
     #[test]
     fn a_host_without_identity_mounts_nothing() {
-        let result = layout(&host(""), Proposal { width: Some(10.0), height: Some(10.0) });
+        let result = layout(&host(""), Proposal { width: Some(10.0), height: Some(10.0) })
+        .unwrap();
         assert!(result.hosts.is_empty());
     }
 
@@ -11467,11 +12307,11 @@ mod tests {
         };
         let offer = Proposal { width: Some(100.0), height: Some(200.0) };
 
-        let (plain, _) = region().measure(offer, &env());
+        let (plain, _) = region().measure(offer, &env()).unwrap();
         assert_eq!(plain.height, 200.0, "a plain region fills what it was offered");
 
         let hugging = LayoutNode::Hug { axis: Axis::Vertical, child: Box::new(region()) };
-        let (hugged, _) = hugging.measure(offer, &env());
+        let (hugged, _) = hugging.measure(offer, &env()).unwrap();
         assert_eq!(hugged.height, 48.0, "a hugging one stops at its content");
 
         // …and past the offer it is the offer that wins, which is the cap.
@@ -11486,7 +12326,7 @@ mod tests {
                 child: Box::new(rows(40)),
             }),
         };
-        let (capped, fit) = tall.measure(offer, &env());
+        let (capped, fit) = tall.measure(offer, &env()).unwrap();
         assert_eq!(capped.height, 200.0);
 
         // …and the region still travels, because it is PLACED at the cap
@@ -11497,10 +12337,12 @@ mod tests {
             &fit,
             &env(),
             &mut out,
-        );
+        )
+        .unwrap();
         assert_eq!(out.scrolls.len(), 1);
         assert_eq!(out.scrolls[0].frame.size.height, 200.0, "the viewport is the cap");
-        assert_eq!(out.scrolls[0].content.height, 640.0, "…and the content is the document");
+        assert_eq!(out.scrolls[0].content.height, 640.0, "…and the content is the document"
+        );
     }
 
     #[test]
@@ -11545,7 +12387,8 @@ mod tests {
             &root,
             Proposal::exact(Size { width: 100.0, height: 100.0 }),
             env,
-        );
+        )
+        .unwrap();
 
         assert_eq!(result.scrolls.len(), 1);
         assert_eq!(result.scrolls[0].content.height, 160.0, "the real content stays in the region");
@@ -11588,7 +12431,8 @@ mod tests {
                 action: None,
             }),
         };
-        let result = layout(&root, Proposal::exact(Size { width: 100.0, height: 24.0 }));
+        let result = layout(&root, Proposal::exact(Size { width: 100.0, height: 24.0 }))
+        .unwrap();
 
         assert!(result.hits.iter().any(|(path, _)| path == "inside"));
         let half = result
@@ -11624,10 +12468,10 @@ mod tests {
             })
         };
 
-        let fits = layout(&scroll(2), viewport);
+        let fits = layout(&scroll(2), viewport).unwrap();
         assert!(thumb_of(&fits).is_none(), "short content never gets a bar");
 
-        let over = layout(&scroll(10), viewport);
+        let over = layout(&scroll(10), viewport).unwrap();
         let thumb = thumb_of(&over).expect("overflow gets a thumb");
         // track 88 (inset 6 on both sides), proportional 100/160
         assert_eq!(thumb.size.height, (100.0 / 160.0_f64 * 88.0).max(24.0));
@@ -11646,10 +12490,11 @@ mod tests {
             },
             text(3),
         );
-        let result = layout(&root, Proposal::unspecified());
+        let result = layout(&root, Proposal::unspecified()).unwrap();
 
         let commands: Vec<_> = result.display.iter().collect();
-        assert_eq!(commands.len(), 3, "background, text, border — in this order");
+        assert_eq!(commands.len(), 3, "background, text, border — in this order"
+        );
         assert!(matches!(
             commands[0],
             DrawCommand::FillRect { color, corner_radius, .. }
@@ -11668,7 +12513,7 @@ mod tests {
         let proposal = Proposal::exact(Size { width: 320.0, height: 240.0 });
         for child in [text(8), stack(Axis::Vertical, CrossAlign::Start, vec![text(3), text(7)])] {
             let (size, fit) = measure_fit_with_defaults(&child, proposal);
-            let original = layout(&child, proposal);
+            let original = layout(&child, proposal).unwrap();
             let mut wrapped = child;
             for _ in 0..16 {
                 wrapped = styled(VisualProps::default(), wrapped);
@@ -11676,7 +12521,7 @@ mod tests {
                 assert_eq!(styled_size, size);
                 assert!(styled_fit.same_as(&fit),
                     "transparent styles must reuse the child's fit, not allocate another boxed tree");
-                assert_eq!(layout(&wrapped, proposal).display.as_slice(), original.display.as_slice(),
+                assert_eq!(layout(&wrapped, proposal).unwrap().display.as_slice(), original.display.as_slice(),
                     "removing measure wrappers cannot change placement or pixels");
             }
         }
@@ -11685,7 +12530,7 @@ mod tests {
     #[test]
     fn styled_never_changes_measurement() {
         // the LAW at node level: VisualProps is pure paint
-        let plain = layout(&text(7), Proposal::unspecified());
+        let plain = layout(&text(7), Proposal::unspecified()).unwrap();
         let dressed = layout(
             &styled(
                 VisualProps {
@@ -11697,7 +12542,8 @@ mod tests {
                 text(7),
             ),
             Proposal::unspecified(),
-        );
+        )
+        .unwrap();
         assert_eq!(plain.size, dressed.size);
     }
 
@@ -11722,7 +12568,7 @@ mod tests {
                 action: None,
             },
         );
-        let result = layout(&root, Proposal::unspecified());
+        let result = layout(&root, Proposal::unspecified()).unwrap();
 
         let colors: Vec<Color> = result
             .display
@@ -11895,7 +12741,7 @@ mod tests {
         // 13pt body × 1.25, rounded to the whole point: sixteen — the
         // number the house wrote by hand before the symbol existed
         assert_eq!(
-            layout(&icon_node(false), Proposal::unspecified()).size,
+            layout(&icon_node(false), Proposal::unspecified()).unwrap().size,
             Size { width: 16.0, height: 16.0 }
         );
         // a font patch on the way down moves it, like a character
@@ -11907,14 +12753,15 @@ mod tests {
             icon_node(false),
         );
         assert_eq!(
-            layout(&big, Proposal::unspecified()).size,
+            layout(&big, Proposal::unspecified()).unwrap().size,
             Size { width: 25.0, height: 25.0 }
         );
         // rigid: a proposal cannot squeeze a glyph
         let squeezed = layout(
             &icon_node(false),
             Proposal { width: Some(100.0), height: Some(100.0) },
-        );
+        )
+        .unwrap();
         assert_eq!(squeezed.size, Size { width: 16.0, height: 16.0 });
     }
 
@@ -11928,7 +12775,7 @@ mod tests {
             child: Box::new(icon_node(true)),
         };
         assert_eq!(
-            layout(&node, Proposal::unspecified()).size,
+            layout(&node, Proposal::unspecified()).unwrap().size,
             Size { width: 24.0, height: 24.0 }
         );
     }
@@ -11940,7 +12787,7 @@ mod tests {
             VisualProps { foreground: Some(ink), ..VisualProps::default() },
             icon_node(false),
         );
-        let result = layout(&root, Proposal::unspecified());
+        let result = layout(&root, Proposal::unspecified()).unwrap();
         let sources: Vec<ImageSource> = result
             .display
             .iter()
@@ -11965,7 +12812,7 @@ mod tests {
             VisualProps { foreground: Some(ink), ..VisualProps::default() },
             LayoutNode::Icon { symbol: CHECK, resizable: false, forced: true },
         );
-        let result = layout(&root, Proposal::unspecified());
+        let result = layout(&root, Proposal::unspecified()).unwrap();
         let source = result
             .display
             .iter()
@@ -11986,7 +12833,7 @@ mod tests {
             align: CrossAlign::Center,
             child: Box::new(icon_node(true)),
         };
-        let result = layout(&node, Proposal::unspecified());
+        let result = layout(&node, Proposal::unspecified()).unwrap();
         let rect = result
             .display
             .iter()
@@ -12013,7 +12860,7 @@ mod tests {
             VisualProps { clip: true, corner_radius: Some(Corners::all(6.0)), ..VisualProps::default() },
             text(3),
         );
-        let result = layout(&dressed, Proposal::unspecified());
+        let result = layout(&dressed, Proposal::unspecified()).unwrap();
         let cut = result
             .display
             .iter()
@@ -12031,7 +12878,7 @@ mod tests {
         assert_eq!(pops, 1, "balanced by construction");
         // without a radius: the plain rect cut of always
         let plain = styled(VisualProps { clip: true, ..VisualProps::default() }, text(3));
-        let result = layout(&plain, Proposal::unspecified());
+        let result = layout(&plain, Proposal::unspecified()).unwrap();
         assert!(result.display.iter().any(|command| matches!(
             command,
             DrawCommand::PushClip { corner_radius, .. } if corner_radius.is_zero()
@@ -12057,7 +12904,8 @@ mod tests {
                 text(3),
             ),
         );
-        let result = layout(&island, Proposal { width: Some(40.0), height: Some(24.0) });
+        let result = layout(&island, Proposal { width: Some(40.0), height: Some(24.0) })
+        .unwrap();
         // paint order: island fill, PUSH, child fill, POP, border
         let kinds: Vec<&str> = result
             .display
@@ -12074,7 +12922,7 @@ mod tests {
         assert_eq!(kinds, vec!["fill", "push", "fill", "pop", "stroke"]);
         // and the pixels agree: the child corner is CUT, the island
         // border survives on top
-        let bitmap = crate::raster::rasterize(&result.display, 40, 24, Color::WHITE);
+        let bitmap = crate::raster::rasterize(&result.display, 40, 24, Color::WHITE).unwrap();
         let white = 0xFFFF_FFFF_u32;
         assert_eq!(bitmap.pixel(0, 0), Some(white), "the notch stays canvas");
         let child = 0xAA22_11FF_u32;

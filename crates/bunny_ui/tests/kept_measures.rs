@@ -27,7 +27,7 @@ impl Component for Row {
 }
 
 fn tail_x(runtime: &Runtime, view: &impl View) -> f64 {
-    let laid = runtime.settled_layout(view, Proposal::exact(SIZE));
+    let laid = runtime.settled_layout(view, Proposal::exact(SIZE)).unwrap();
     laid.hits
         .iter()
         .find(|(path, _)| path.contains("[tail]"))
@@ -40,10 +40,10 @@ fn a_bound_text_that_grew_moves_what_sits_beside_it() {
     let word = State::new(String::from("ab"));
     let runtime = Runtime::new();
     let view = Row { word };
-    let _ = runtime.display_frame(&view, SIZE);
+    let _ = runtime.display_frame(&view, SIZE).unwrap();
     let before = tail_x(&runtime, &view);
     word.set(String::from("abcdefghijklmnopqrstuvwxyz"));
-    let _ = runtime.display_frame(&view, SIZE);
+    let _ = runtime.display_frame(&view, SIZE).unwrap();
     assert!(runtime.body_runs().is_empty(), "a binding moves no body: {:?}", runtime.body_runs());
     let after = tail_x(&runtime, &view);
     assert!(after > before + 10.0, "the tail moved right with the longer word: {before} -> {after}");

@@ -1386,7 +1386,7 @@ mod tests {
         let engine = DirectWriteEngine::new();
         let cache = MeasureCache::default();
         let text = "hello world hello world";
-        let lines = break_lines(text, &FontSpec::DEFAULT, 60.0, &engine, &cache);
+        let lines = break_lines(text, &FontSpec::DEFAULT, 60.0, &engine, &cache).unwrap();
 
         assert!(lines.len() > 1, "60px does not hold the sentence: {lines:?}");
         assert_eq!(lines.first().unwrap().0, 0);

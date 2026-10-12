@@ -216,7 +216,7 @@ mod macos {
             msg_arg(view, sel("setLayer:"), layer);
             msg_bool(view, sel("setWantsLayer:"), 1);
             msg_arg(window, sel("setContentView:"), view);
-            presenter.prime(SIZE.width, SIZE.height, 1);
+            presenter.prime(SIZE.width, SIZE.height, 1).unwrap();
             msg_void(window, sel("orderFrontRegardless"));
             msg_void(app, sel("finishLaunching"));
             let images = RawImages::default();
@@ -231,7 +231,8 @@ mod macos {
                     &PixelFont,
                     &images,
                     false,
-                );
+                )
+                    .unwrap();
             }
             msg_void(transaction, sel("commit"));
             expect(window, GREEN, Color::WHITE, "coalesced startup");
@@ -248,7 +249,8 @@ mod macos {
                     &PixelFont,
                     &images,
                     false,
-                );
+                )
+                    .unwrap();
                 expect(window, GREEN, patch, label);
             }
             // Several whole frames reuse the drawable pool after coordination.
@@ -261,7 +263,8 @@ mod macos {
                     &PixelFont,
                     &images,
                     true,
-                );
+                )
+                    .unwrap();
                 presenter.set_transactional(false);
                 expect(window, base, Color::WHITE, "whole frame after coordination");
             }
@@ -288,7 +291,8 @@ mod macos {
                     &PixelFont,
                     &images,
                     true,
-                );
+                )
+                    .unwrap();
                 presenter.set_transactional(false);
                 expect(window, GREEN, Color::WHITE, "resize");
             }
@@ -305,7 +309,7 @@ mod macos {
             let native_layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
             let mut native = WindowPresenter::attach(native_layer, 1.0).unwrap();
             msg_arg(view, sel("setLayer:"), native_layer);
-            native.prime(SIZE.width, SIZE.height, 1);
+            native.prime(SIZE.width, SIZE.height, 1).unwrap();
             let band_scene = |offset: f64| {
                 let mut commands = vec![
                     DrawCommand::FillRect {
@@ -371,7 +375,8 @@ mod macos {
                     &PixelFont,
                     &images,
                     false,
-                );
+                )
+                    .unwrap();
                 assert!(
                     !has_metal_child(native_layer),
                     "the image stays native"
@@ -406,7 +411,8 @@ mod macos {
                     &PixelFont,
                     &images,
                     false,
-                );
+                )
+                    .unwrap();
                 expect(window, GREEN, RED, "native decoration over unchanged rows");
                 let pixel = sample(window, 292, 40);
                 if height > 30.0 {
@@ -432,14 +438,15 @@ mod macos {
                 &PixelFont,
                 &images,
                 false,
-            );
+            )
+                .unwrap();
             expect(window, GREEN, Color::WHITE, "promotion after native image");
             drop(native);
             msg_void(native_layer, sel("release"));
             let sparse_layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
             let mut sparse = WindowPresenter::attach(sparse_layer, 1.0).unwrap();
             msg_arg(view, sel("setLayer:"), sparse_layer);
-            sparse.prime(SIZE.width, SIZE.height, 1);
+            sparse.prime(SIZE.width, SIZE.height, 1).unwrap();
             for label in ["sparse native image", "sparse repeated image"] {
                 sparse.present(
                     &scene(GREEN, Color::WHITE),
@@ -449,7 +456,8 @@ mod macos {
                     &PixelFont,
                     &images,
                     false,
-                );
+                )
+                    .unwrap();
                 assert!(
                     !has_metal_child(sparse_layer),
                     "the sparse base stays native"
@@ -466,14 +474,15 @@ mod macos {
                 &PixelFont,
                 &images,
                 false,
-            );
+                )
+                .unwrap();
             expect(window, RED, Color::WHITE, "promotion after sparse image");
             drop(sparse);
             msg_void(sparse_layer, sel("release"));
             let growing_layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
             let mut growing = WindowPresenter::attach(growing_layer, 1.0).unwrap();
             msg_arg(view, sel("setLayer:"), growing_layer);
-            growing.prime(SIZE.width, SIZE.height, 1);
+            growing.prime(SIZE.width, SIZE.height, 1).unwrap();
             for rows in [0, 1, 2, 4, 5, 2, 0] {
                 let mut commands = vec![
                     DrawCommand::FillRect {
@@ -533,7 +542,8 @@ mod macos {
                     &PixelFont,
                     &images,
                     false,
-                );
+                )
+                    .unwrap();
                 assert!(
                     !has_metal_child(growing_layer),
                     "bounded growth remains native"
@@ -567,7 +577,7 @@ mod macos {
             let patch_layer = msg_id(msg_id(class("CALayer"), sel("alloc")), sel("init"));
             let mut patched = WindowPresenter::attach(patch_layer, 1.0).unwrap();
             msg_arg(view, sel("setLayer:"), patch_layer);
-            patched.prime(SIZE.width, SIZE.height, 1);
+            patched.prime(SIZE.width, SIZE.height, 1).unwrap();
             for (x, width, expected, label) in [
                 (32.0, 64.0, RED, "native rounded base"),
                 (32.0, 16.0, GREEN, "native patch shrinks ink"),
@@ -595,7 +605,8 @@ mod macos {
                         corner_radius: Corners::ZERO,
                     },
                 ]);
-                patched.present(&display, SIZE, 1, Color::BLACK, &PixelFont, &images, false);
+                patched.present(&display, SIZE, 1, Color::BLACK, &PixelFont, &images, false)
+                    .unwrap();
                 assert!(
                     !has_metal_child(patch_layer),
                     "small patches keep the native base"
@@ -618,7 +629,8 @@ mod macos {
                 &PixelFont,
                 &images,
                 false,
-            );
+            )
+                .unwrap();
             assert!(
                 has_metal_child(patch_layer),
                 "a broad rewrite promotes"

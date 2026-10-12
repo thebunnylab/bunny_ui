@@ -20,7 +20,9 @@ impl TextEngine for ContextEngine {
         &self,
         line: &ParagraphLine,
         _: &FontSpec,
-    ) -> Option<bunny_ui::text_geometry::LineGeometry> {
+    ) -> Result<Option<bunny_ui::text_geometry::LineGeometry>, bunny_ui::text_error::TextError>
+    {
+        Ok({
         self.geometries.set(self.geometries.get() + 1);
         let cells = line
             .text()
@@ -36,9 +38,12 @@ impl TextEngine for ContextEngine {
             })
             .collect();
         Some(bunny_ui::text_geometry::LineGeometry::new(line.text(), cells).unwrap())
+    })
     }
-    fn measure_paragraph_line(&self, line: &ParagraphLine, font: &FontSpec) -> LineMetrics {
+    fn measure_paragraph_line(&self, line: &ParagraphLine, font: &FontSpec) -> Result<LineMetrics, bunny_ui::text_error::TextError> {
+        Ok({
         PixelFont.measure_line(line.text(), font)
+    })
     }
     fn raster_paragraph_line(
         &self,
@@ -46,7 +51,8 @@ impl TextEngine for ContextEngine {
         font: &FontSpec,
         _: Color,
         scale: usize,
-    ) -> Option<TextRaster> {
+    ) -> Result<Option<TextRaster>, bunny_ui::text_error::TextError> {
+        Ok({
         self.rasters.set(self.rasters.get() + 1);
         let color = if line.paragraph().text().starts_with('\u{202e}') {
             Color::rgb(200, 10, 20)
@@ -54,6 +60,7 @@ impl TextEngine for ContextEngine {
             Color::rgb(10, 20, 200)
         };
         PixelFont.raster_line(line.text(), font, color, scale)
+    })
     }
 }
 pub fn contextual_line(prefix: &str) -> ParagraphLine {

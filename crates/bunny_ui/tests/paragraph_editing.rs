@@ -46,7 +46,8 @@ impl TextEngine for Context {
     fn measure_line(&self, text: &str, _: &FontSpec) -> LineMetrics {
         metrics(text, 10.0)
     }
-    fn measure_paragraph_line(&self, line: &ParagraphLine, _: &FontSpec) -> LineMetrics {
+    fn measure_paragraph_line(&self, line: &ParagraphLine, _: &FontSpec) -> Result<LineMetrics, bunny_ui::text_error::TextError> {
+        Ok({
         metrics(
             line.text(),
             if line.paragraph().text().starts_with('\u{202e}') {
@@ -55,17 +56,20 @@ impl TextEngine for Context {
                 10.0
             },
         )
+    })
     }
     fn line_geometry(&self, text: &str, _: &FontSpec) -> Option<LineGeometry> {
         Some(geometry(text, 10.0, false))
     }
-    fn paragraph_line_geometry(&self, line: &ParagraphLine, _: &FontSpec) -> Option<LineGeometry> {
+    fn paragraph_line_geometry(&self, line: &ParagraphLine, _: &FontSpec) -> Result<Option<LineGeometry>, bunny_ui::text_error::TextError> {
+        Ok({
         let reverse = line.paragraph().text().starts_with('\u{202e}');
         Some(geometry(
             line.text(),
             if reverse { 20.0 } else { 10.0 },
             reverse,
         ))
+    })
     }
     fn raster_line(&self, _: &str, _: &FontSpec, _: Color, _: usize) -> Option<TextRaster> {
         None
@@ -76,16 +80,18 @@ fn paragraph_editing_wrap_measures_candidates_in_the_original_context() {
     let text = "\u{202e}abc def ghi";
     let cache = MeasureCache::default();
     assert_eq!(
-        break_lines(text, &FontSpec::DEFAULT, 80.0, &Context, &cache),
+        break_lines(text, &FontSpec::DEFAULT, 80.0, &Context, &cache).unwrap(),
         vec![(0, 7), (7, 11), (11, 14)]
     );
     assert_eq!(
-        *cache.field_lines("editor", text, None, &FontSpec::DEFAULT, 80.0, &Context),
+        *cache.field_lines("editor", text, None, &FontSpec::DEFAULT, 80.0, &Context)
+            .unwrap(),
         vec![(0, 7), (7, 11), (11, 14)]
     );
     let edited = "\u{202e}abc def xyz";
     assert_eq!(
-        *cache.field_lines("editor", edited, None, &FontSpec::DEFAULT, 80.0, &Context),
+        *cache.field_lines("editor", edited, None, &FontSpec::DEFAULT, 80.0, &Context)
+            .unwrap(),
         break_lines(
             edited,
             &FontSpec::DEFAULT,
@@ -93,6 +99,7 @@ fn paragraph_editing_wrap_measures_candidates_in_the_original_context() {
             &Context,
             &MeasureCache::default()
         )
+        .unwrap()
     );
 }
 #[test]
@@ -113,8 +120,8 @@ fn paragraph_editing_wrapped_ime_and_pointer_share_contextual_geometry() {
             width: 100.0,
             height: 250.0,
         };
-        runtime.display_frame(&view, size);
-        let placed = runtime.layout(&view, Proposal::exact(size));
+        runtime.display_frame(&view, size).unwrap();
+        let placed = runtime.layout(&view, Proposal::exact(size)).unwrap();
         assert!(runtime.focus_named("editor"));
         let mut checked = 0;
         for command in placed.display.iter() {
@@ -141,14 +148,14 @@ fn paragraph_editing_wrapped_ime_and_pointer_share_contextual_geometry() {
             let expected =
                 20.0_f64.mul_add(count(text_line) - count(&text_line[..local]), origin.x);
             let unit = byte_to_utf16(text, range.0 + local);
-            let observed = runtime.ime_rect_for(unit).unwrap();
+            let observed = runtime.ime_rect_for(unit).unwrap().unwrap();
             assert!(
                 (observed.origin.x - expected).abs() < 0.001,
                 "{alignment:?}, row {range:?}: {} != {expected}",
                 observed.origin.x
             );
-            runtime.pointer_pressed(expected, origin.y + 5.0);
-            let selected = runtime.ime_snapshot().unwrap().selected;
+            runtime.pointer_pressed(expected, origin.y + 5.0).unwrap();
+            let selected = runtime.ime_snapshot().unwrap().unwrap().selected;
             assert_eq!(
                 selected,
                 (unit, 0),
@@ -170,7 +177,8 @@ fn paragraph_editing_static_hard_breaks_never_form_a_cross_paragraph_command() {
             width: 300.0,
             height: 100.0,
         }),
-    );
+    )
+        .unwrap();
     let mut lines = Vec::new();
     for command in result.display.iter() {
         if let DrawCommand::TextLine { content, range, .. } = command {
@@ -198,8 +206,8 @@ fn paragraph_editing_single_line_projection_preserves_binding_and_native_indices
         width: 220.0,
         height: 40.0,
     };
-    runtime.display_frame(&view, size);
-    let placed = runtime.layout(&view, Proposal::exact(size));
+    runtime.display_frame(&view, size).unwrap();
+    let placed = runtime.layout(&view, Proposal::exact(size)).unwrap();
     assert!(runtime.focus_named("editor"));
     let lines: Vec<_> = placed
         .display
@@ -217,14 +225,15 @@ fn paragraph_editing_single_line_projection_preserves_binding_and_native_indices
     let x = placed.fields[0].text_origin.x;
     for (unit, column) in [(0, 0.0), (1, 1.0), (2, 2.0), (4, 3.0), (5, 4.0), (6, 5.0)] {
         assert_eq!(
-            runtime.ime_rect_for(unit).unwrap().origin.x,
+            runtime.ime_rect_for(unit).unwrap().unwrap().origin.x,
             10.0_f64.mul_add(column, x)
         );
         assert_eq!(
             runtime.ime_index_at(
                 10.0_f64.mul_add(column, x),
                 placed.fields[0].run.origin.y + 5.0
-            ),
+            )
+                .unwrap(),
             Some(unit)
         );
     }
@@ -244,7 +253,8 @@ fn paragraph_editing_static_highlights_clip_complete_contextual_lines() {
             width: 80.0,
             height: 150.0,
         }),
-    );
+    )
+        .unwrap();
     let mut clip = None;
     let mut highlighted = 0;
     for command in placed.display.iter() {
@@ -287,15 +297,15 @@ fn paragraph_editing_masked_vertical_arrows_follow_displayed_wraps() {
         width: 56.0,
         height: 120.0,
     };
-    runtime.display_frame(&view, size);
-    let placed = runtime.layout(&view, Proposal::exact(size));
+    runtime.display_frame(&view, size).unwrap();
+    let placed = runtime.layout(&view, Proposal::exact(size)).unwrap();
     runtime.sync_field(&placed.fields[0].path, value, 1);
-    let initial = runtime.ime_snapshot().unwrap().caret_rect.origin.x;
-    assert!(runtime.key(EditCommand::Down(true)).applied);
-    assert_eq!(runtime.ime_snapshot().unwrap().selected, (1, 5));
-    assert_eq!(runtime.ime_rect_for(6).unwrap().origin.x, initial);
-    assert!(runtime.key(EditCommand::Up(false)).applied);
-    assert_eq!(runtime.ime_snapshot().unwrap().selected, (1, 0));
+    let initial = runtime.ime_snapshot().unwrap().unwrap().caret_rect.origin.x;
+    assert!(runtime.key(EditCommand::Down(true)).unwrap().applied);
+    assert_eq!(runtime.ime_snapshot().unwrap().unwrap().selected, (1, 5));
+    assert_eq!(runtime.ime_rect_for(6).unwrap().unwrap().origin.x, initial);
+    assert!(runtime.key(EditCommand::Up(false)).unwrap().applied);
+    assert_eq!(runtime.ime_snapshot().unwrap().unwrap().selected, (1, 0));
     assert_eq!(state.get(), value);
 }
 
@@ -312,7 +322,8 @@ fn paragraph_editing_truncated_hard_breaks_remain_valid_lines() {
                 width: 140.0,
                 height: 15.0,
             }),
-        );
+        )
+            .unwrap();
         let mut count = 0;
         for command in placed.display.iter() {
             if let DrawCommand::TextLine { content, range, .. } = command {
@@ -338,20 +349,20 @@ fn paragraph_editing_wrapped_selection_composition_and_vertical_columns_agree() 
         width: 100.0,
         height: 160.0,
     };
-    runtime.display_frame(&view, size);
-    let placed = runtime.layout(&view, Proposal::exact(size));
+    runtime.display_frame(&view, size).unwrap();
+    let placed = runtime.layout(&view, Proposal::exact(size)).unwrap();
     let unit = byte_to_utf16(value, 8);
     runtime.sync_field(&placed.fields[0].path, value, unit);
-    let x = runtime.ime_snapshot().unwrap().caret_rect.origin.x;
-    assert!(runtime.key(EditCommand::Down(false)).applied);
-    assert_eq!(runtime.ime_snapshot().unwrap().selected, (unit + 4, 0));
-    assert_eq!(runtime.ime_snapshot().unwrap().caret_rect.origin.x, x);
-    assert!(runtime.key(EditCommand::Up(false)).applied);
-    assert_eq!(runtime.ime_snapshot().unwrap().selected, (unit, 0));
-    assert!(runtime.key(EditCommand::Right(true)).applied);
-    assert_eq!(runtime.key(EditCommand::Copy).output.as_deref(), Some("e"));
+    let x = runtime.ime_snapshot().unwrap().unwrap().caret_rect.origin.x;
+    assert!(runtime.key(EditCommand::Down(false)).unwrap().applied);
+    assert_eq!(runtime.ime_snapshot().unwrap().unwrap().selected, (unit + 4, 0));
+    assert_eq!(runtime.ime_snapshot().unwrap().unwrap().caret_rect.origin.x, x);
+    assert!(runtime.key(EditCommand::Up(false)).unwrap().applied);
+    assert_eq!(runtime.ime_snapshot().unwrap().unwrap().selected, (unit, 0));
+    assert!(runtime.key(EditCommand::Right(true)).unwrap().applied);
+    assert_eq!(runtime.key(EditCommand::Copy).unwrap().output.as_deref(), Some("e"));
     let check_band = |height: f64| {
-        let placed = runtime.layout(&view, Proposal::exact(size));
+        let placed = runtime.layout(&view, Proposal::exact(size)).unwrap();
         let bands: Vec<_> = placed
             .display
             .iter()
@@ -372,9 +383,10 @@ fn paragraph_editing_wrapped_selection_composition_and_vertical_columns_agree() 
     runtime.key(EditCommand::SetMarked {
         text: "e".into(),
         caret_utf16: (1, 0),
-    });
+    })
+        .unwrap();
     check_band(1.0);
-    let snapshot = runtime.ime_snapshot().unwrap();
+    let snapshot = runtime.ime_snapshot().unwrap().unwrap();
     assert_eq!(snapshot.marked, Some((unit, 1)));
     assert_eq!(snapshot.selected, (unit + 1, 0));
     assert_eq!(snapshot.caret_rect.origin.x, x - 20.0);
@@ -392,7 +404,8 @@ fn paragraph_editing_last_row_ellipsis_retains_hidden_embedding_context() {
             width: 80.0,
             height: 30.0,
         }),
-    );
+    )
+        .unwrap();
     let lines: Vec<_> = placed
         .display
         .iter()
@@ -411,6 +424,7 @@ fn paragraph_editing_last_row_ellipsis_retains_hidden_embedding_context() {
     assert_eq!(
         Context
             .measure_paragraph_line(last, &FontSpec::DEFAULT)
+            .unwrap()
             .width,
         80.0
     );

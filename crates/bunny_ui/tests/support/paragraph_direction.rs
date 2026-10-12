@@ -24,8 +24,8 @@ pub fn directions_match_paragraph(
         width,
         height: 400.0,
     };
-    runtime.display_frame(&view, size);
-    let layout = runtime.layout(&view, Proposal::exact(size));
+    runtime.display_frame(&view, size).unwrap();
+    let layout = runtime.layout(&view, Proposal::exact(size)).unwrap();
     assert!(runtime.focus_named("editor"));
     let mut rows = 0;
     let mut checked = 0;
@@ -52,8 +52,8 @@ pub fn directions_match_paragraph(
             let expected_rtl = native_levels.iter().find(|(at, _)| *at == byte).unwrap().1;
             let index = byte_to_utf16(text, byte);
             let next_index = byte_to_utf16(text, range.0 + next);
-            let before = runtime.ime_rect_for(index).unwrap().origin.x;
-            let after = runtime.ime_rect_for(next_index).unwrap().origin.x;
+            let before = runtime.ime_rect_for(index).unwrap().unwrap().origin.x;
+            let after = runtime.ime_rect_for(next_index).unwrap().unwrap().origin.x;
             checked += 1;
             if (after - before).abs() < 0.01 || (after < before) != expected_rtl {
                 mismatches.push(format!(

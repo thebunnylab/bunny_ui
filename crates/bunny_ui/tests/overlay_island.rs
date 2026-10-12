@@ -55,7 +55,8 @@ fn an_overlay_is_an_island_when_the_shell_layers_it() {
     let runtime = Runtime::new();
     runtime.set_overlay_layers(true);
     let view = custom(Blinker { phase }).frame(SIZE.width, SIZE.height).id("editor");
-    let result = runtime.settled_layout(&view, Proposal::exact(SIZE));
+    let result = runtime.settled_layout(&view, Proposal::exact(SIZE))
+        .unwrap();
 
     let overlay = result.customs.iter().find(|placement| placement.overlay).expect("the overlay is placed");
     assert!(overlay.path.ends_with("/overlay"), "{}", overlay.path);
@@ -70,7 +71,7 @@ fn an_overlay_is_an_island_when_the_shell_layers_it() {
     );
 
     // a frame paints everything and takes the dirty paints with it
-    let _ = runtime.display_frame(&view, SIZE);
+    let _ = runtime.display_frame(&view, SIZE).unwrap();
     assert!(!runtime.frame_need().paints);
 
     // a write that reaches only the overlay's paint: the island, not the scene
@@ -79,7 +80,7 @@ fn an_overlay_is_an_island_when_the_shell_layers_it() {
     assert!(need.paints, "{need:?}");
     assert!(!need.wrote && !need.dirty, "no view read it: {need:?}");
     assert!(need.only_paints(), "{need:?}");
-    let (blits, plain) = runtime.repaint_dirty_paints(1);
+    let (blits, plain) = runtime.repaint_dirty_paints(1).unwrap();
     assert!(!plain, "no plain box read it");
     assert_eq!(blits.len(), 1, "the overlay alone repaints");
     assert_eq!((blits[0].width, blits[0].height), (2, 16), "at the overlay's own size");
@@ -88,7 +89,7 @@ fn an_overlay_is_an_island_when_the_shell_layers_it() {
 
     // the same picture twice is dropped by the ledger: phase 1 → 3 both hide the caret
     phase.set(3);
-    let (blits, _) = runtime.repaint_dirty_paints(1);
+    let (blits, _) = runtime.repaint_dirty_paints(1).unwrap();
     assert!(blits.is_empty(), "the ledger drops a step whose picture did not change");
 }
 
@@ -98,14 +99,15 @@ fn a_plain_box_that_reads_takes_the_frames_road() {
     let runtime = Runtime::new();
     runtime.set_overlay_layers(true);
     let view = custom(Plain { phase }).frame(SIZE.width, SIZE.height).id("meter");
-    let result = runtime.settled_layout(&view, Proposal::exact(SIZE));
+    let result = runtime.settled_layout(&view, Proposal::exact(SIZE))
+        .unwrap();
     assert!(result.customs.iter().all(|placement| !placement.overlay), "no overlay, no island");
-    let _ = runtime.display_frame(&view, SIZE);
+    let _ = runtime.display_frame(&view, SIZE).unwrap();
 
     phase.set(1);
     let need = runtime.frame_need();
     assert!(need.paints && need.only_paints(), "{need:?}");
-    let (blits, plain) = runtime.repaint_dirty_paints(1);
+    let (blits, plain) = runtime.repaint_dirty_paints(1).unwrap();
     assert!(blits.is_empty());
     assert!(plain, "a box that is no island needs the frame");
 }
@@ -115,7 +117,8 @@ fn without_layers_the_overlay_paints_inline() {
     let phase = State::new(0u32);
     let runtime = Runtime::new();
     let view = custom(Blinker { phase }).frame(SIZE.width, SIZE.height).id("editor");
-    let result = runtime.settled_layout(&view, Proposal::exact(SIZE));
+    let result = runtime.settled_layout(&view, Proposal::exact(SIZE))
+        .unwrap();
     assert!(result.customs.iter().all(|placement| !placement.overlay), "no island without a layer");
     assert!(runtime.live_slices().is_empty());
     assert!(
@@ -161,9 +164,10 @@ fn an_overlay_in_a_scroll_region_never_moves_the_region() {
     runtime.drop_unseen();
     let view = scroll(custom(Revealer { phase }).id("doc")).id("region");
     // the first frame reveals the caret: the region scrolls to show it
-    let _ = runtime.display_frame(&view, SIZE);
+    let _ = runtime.display_frame(&view, SIZE).unwrap();
     let region = runtime
         .settled_layout(&view, Proposal::exact(SIZE))
+        .unwrap()
         .scrolls
         .first()
         .map(|region| region.path.clone())
@@ -175,7 +179,7 @@ fn an_overlay_in_a_scroll_region_never_moves_the_region() {
     // and its reveal is the box's — asked once, at the box's frame. A
     // second ask at the island's frame moved the region every frame.
     for _ in 0..5 {
-        let _ = runtime.display_frame(&view, SIZE);
+        let _ = runtime.display_frame(&view, SIZE).unwrap();
         assert_eq!(runtime.scroll_offset(&region), revealed, "the region stands still");
     }
     let stats = bunny_ui::stats::take();

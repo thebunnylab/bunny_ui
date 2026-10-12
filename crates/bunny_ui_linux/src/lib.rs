@@ -35,6 +35,26 @@ use bunny_ui::prelude::{EditCommand, Locale, Runtime};
 use bunny_ui::view::{Either, Single, View};
 
 use ffi::AppEvent;
+
+/// Native callbacks have no Rust error slot. Record a failed operation and
+/// answer unavailable (or consume an already-started edit); never substitute
+/// isolated text geometry or publish a partially prepared frame.
+fn native_event<T, E: Into<bunny_ui::gpu::walk::RenderError>>(
+    result: Result<T, E>,
+    unavailable: T,
+) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            let error = error.into();
+            trace::mark("X", format_args!("what=render-failure error={error}"));
+            eprintln!("bunny_ui: native operation failed: {error}");
+            unavailable
+        }
+    }
+}
+
+
 pub use gl::OffscreenGl;
 pub use image::LinuxImageEngine;
 pub use text::FreeTypeEngine;
@@ -715,7 +735,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             min: spec.min.map(|min| (min.width, min.height)),
         },
     );
-    let accessibility = ffi::accessibility::Accessibility::new(Rc::clone(&runtime), window.raw_window());
+    let accessibility =
+        ffi::accessibility::Accessibility::new(Rc::clone(&runtime), window.raw_window());
     // the bar: the compositor's where it offers one, the house's own
     // where it does not — decided BEFORE the GPU installs, because the
     // crown's corners want an alpha ground
@@ -756,7 +777,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         bunny_ui::stats::set_clock(Some(trace::clock_ms));
     }
     // two owners: the keyboard gate and the event handler
-    let root = framed(house_bar.then(|| (Rc::clone(&spec.title), spec.manners.minimizable)), root);
+    let root = framed(
+        house_bar.then(|| (Rc::clone(&spec.title), spec.manners.minimizable)),
+        root,
+    );
     let root = Rc::new(root);
 
     // one frame: the Runtime settles, lays out, retains the hits for
@@ -776,278 +800,337 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         Rc::new(RefCell::new(std::collections::HashMap::new()));
     // present takes a READY display list to the window — the tick path
     // reuses it without paying settle or effects
-    let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList)> = Rc::new({
+    let present: Rc<
+        dyn Fn(
+            &Runtime,
+            bunny_ui::layout::DisplayList,
+        ) -> Result<(), bunny_ui::gpu::walk::RenderError>,
+    > = Rc::new({
         let lifecycle = Rc::clone(&lifecycle);
         let surface = Rc::clone(&surface);
         let panels = Rc::clone(&panels);
         let dialogs = Rc::clone(&dialogs);
         let accessibility = Rc::clone(&accessibility);
         let title = spec.title.to_string();
-        move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| {
-            if lifecycle.is_hidden() {
-                return;
-            }
-            (|| {
-            let (width, height) = window.content_size();
-            let scale = window.scale();
-            let canvas = bunny_ui::theme::canvas();
-            let physical = (
-                (width * scale as f64).round() as usize,
-                (height * scale as f64).round() as usize,
-            );
-            if physical.0 == 0 || physical.1 == 0 {
-                // degenerate: a zero surface is an abort, not a frame
-                return;
-            }
-            // the window presents everything BEFORE the first overlay;
-            // each overlay re-presents its own slice on an owned panel
-            // — a popup that may hang past the window's edge
-            let overlays = runtime.overlays();
-            let display = match overlays.first() {
-                Some(first) => full_display.translated_slice((0, first.display.0), 0.0, 0.0),
-                None => full_display.clone(),
-            };
-            // the pages: mounted, re-instructed, placed and swept by
-            // this layout's host boxes, then painted INTO the list
-            // where each host stood — no platform view, no sandwich:
-            // paint order is the truth on every tier because the page
-            // is a picture in the list. The page's scale is the
-            // raster's whole number, so its pixels land 1:1
-            let hosts = runtime.hosts();
-            webview::reconcile(window.raw_window(), &hosts, scale as f64);
-            let display = webview::paint_into(window.raw_window(), &display, &hosts);
+        move |runtime: &Runtime,
+              full_display: bunny_ui::layout::DisplayList|
+              -> Result<(), bunny_ui::gpu::walk::RenderError> {
             {
-                let mut store = panels.borrow_mut();
-                let dead: Vec<String> = store
-                    .keys()
-                    .filter(|path| !overlays.iter().any(|overlay| &overlay.path == *path))
-                    .cloned()
-                    .collect();
-                for path in dead {
-                    if let Some(panel) = store.remove(&path) {
-                        panel.close_panel();
-                    }
+                if lifecycle.is_hidden() {
+                    return Ok(());
                 }
-                // the dialogs' own sweep, AFTER the panels': a dropdown
-                // inside a closing dialog goes before the window it
-                // hangs from
-                let mut dialog_store = dialogs.borrow_mut();
-                dialog_store.retain(|path, dialog| {
-                    let open = overlays.iter().any(|overlay| &overlay.path == path);
-                    if !open {
-                        dialog.handle.close_panel();
+                (|| -> Result<(), bunny_ui::gpu::walk::RenderError> {
+                    let (width, height) = window.content_size();
+                    let scale = window.scale();
+                    let canvas = bunny_ui::theme::canvas();
+                    let physical = (
+                        (width * scale as f64).round() as usize,
+                        (height * scale as f64).round() as usize,
+                    );
+                    if physical.0 == 0 || physical.1 == 0 {
+                        // degenerate: a zero surface is an abort, not a frame
+                        return Ok(());
                     }
-                    open
-                });
-                for overlay in &overlays {
-                    // a dialog presents on a REAL window: no bleed, no
-                    // drawn shadow — the frame and its shadow are the
-                    // compositor's. The window is the truth of the size
-                    // (`dialog_size`, pulled before the layout), so the
-                    // frame here is already what the window was granted.
-                    // An alert is the one exception: its size is its
-                    // content's, one size the window is held to (`fixed`)
-                    let frame = overlay.frame;
-                    let asked = match &overlay.surface {
-                        bunny_ui::layout::OverlaySurface::Window(spec) => Some((
-                            &spec.title,
-                            (spec.min.width, spec.min.height),
-                            matches!(spec.chrome, bunny_ui::layout::DialogChrome::Scene { .. }),
-                            false,
-                        )),
-                        bunny_ui::layout::OverlaySurface::Alert(spec) => Some((
-                            &spec.title,
-                            (frame.size.width, frame.size.height),
-                            false,
-                            true,
-                        )),
-                        bunny_ui::layout::OverlaySurface::Layer => None,
+                    // the window presents everything BEFORE the first overlay;
+                    // each overlay re-presents its own slice on an owned panel
+                    // — a popup that may hang past the window's edge
+                    let overlays = runtime.overlays();
+                    let display = match overlays.first() {
+                        Some(first) => {
+                            full_display.translated_slice((0, first.display.0), 0.0, 0.0)
+                        }
+                        None => full_display.clone(),
                     };
-                    if let Some((title, min, scene, fixed)) = asked {
-                        let dialog =
-                            dialog_store.entry(overlay.path.clone()).or_insert_with(|| {
-                                DialogWindow {
-                                    handle: ffi::create_dialog(
-                                        &window,
-                                        title,
-                                        min,
-                                        scene,
-                                        (
-                                            frame.origin.x,
-                                            frame.origin.y,
-                                            frame.size.width,
-                                            frame.size.height,
-                                        ),
-                                        fixed,
+                    // the pages: mounted, re-instructed, placed and swept by
+                    // this layout's host boxes, then painted INTO the list
+                    // where each host stood — no platform view, no sandwich:
+                    // paint order is the truth on every tier because the page
+                    // is a picture in the list. The page's scale is the
+                    // raster's whole number, so its pixels land 1:1
+                    let hosts = runtime.hosts();
+                    webview::reconcile(window.raw_window(), &hosts, scale as f64);
+                    let display = webview::paint_into(window.raw_window(), &display, &hosts);
+                    {
+                        let mut store = panels.borrow_mut();
+                        let dead: Vec<String> = store
+                            .keys()
+                            .filter(|path| !overlays.iter().any(|overlay| &overlay.path == *path))
+                            .cloned()
+                            .collect();
+                        for path in dead {
+                            if let Some(panel) = store.remove(&path) {
+                                panel.close_panel();
+                            }
+                        }
+                        // the dialogs' own sweep, AFTER the panels': a dropdown
+                        // inside a closing dialog goes before the window it
+                        // hangs from
+                        let mut dialog_store = dialogs.borrow_mut();
+                        dialog_store.retain(|path, dialog| {
+                            let open = overlays.iter().any(|overlay| &overlay.path == path);
+                            if !open {
+                                dialog.handle.close_panel();
+                            }
+                            open
+                        });
+                        for overlay in &overlays {
+                            // a dialog presents on a REAL window: no bleed, no
+                            // drawn shadow — the frame and its shadow are the
+                            // compositor's. The window is the truth of the size
+                            // (`dialog_size`, pulled before the layout), so the
+                            // frame here is already what the window was granted.
+                            // An alert is the one exception: its size is its
+                            // content's, one size the window is held to (`fixed`)
+                            let frame = overlay.frame;
+                            let asked = match &overlay.surface {
+                                bunny_ui::layout::OverlaySurface::Window(spec) => Some((
+                                    &spec.title,
+                                    (spec.min.width, spec.min.height),
+                                    matches!(
+                                        spec.chrome,
+                                        bunny_ui::layout::DialogChrome::Scene { .. }
                                     ),
-                                    origin: frame.origin,
-                                }
-                            });
-                        dialog.origin = frame.origin;
-                        let (x, y) = (frame.origin.x, frame.origin.y);
-                        let (w, h) = (frame.size.width, frame.size.height);
-                        dialog.handle.set_scene_origin(x, y);
-                        let slice = full_display.translated_slice(overlay.display, -x, -y);
-                        let physical =
-                            ((w * scale as f64).round() as usize, (h * scale as f64).round() as usize);
-                        // the window's own ground under the content — a
-                        // toplevel has no parent pixels to show through
-                        let bitmap = bunny_ui::raster::rasterize_with(
-                            &slice,
-                            physical.0,
-                            physical.1,
+                                    false,
+                                )),
+                                bunny_ui::layout::OverlaySurface::Alert(spec) => Some((
+                                    &spec.title,
+                                    (frame.size.width, frame.size.height),
+                                    false,
+                                    true,
+                                )),
+                                bunny_ui::layout::OverlaySurface::Layer => None,
+                            };
+                            if let Some((title, min, scene, fixed)) = asked {
+                                let dialog = dialog_store
+                                    .entry(overlay.path.clone())
+                                    .or_insert_with(|| DialogWindow {
+                                        handle: ffi::create_dialog(
+                                            &window,
+                                            title,
+                                            min,
+                                            scene,
+                                            (
+                                                frame.origin.x,
+                                                frame.origin.y,
+                                                frame.size.width,
+                                                frame.size.height,
+                                            ),
+                                            fixed,
+                                        ),
+                                        origin: frame.origin,
+                                    });
+                                dialog.origin = frame.origin;
+                                let (x, y) = (frame.origin.x, frame.origin.y);
+                                let (w, h) = (frame.size.width, frame.size.height);
+                                dialog.handle.set_scene_origin(x, y);
+                                let slice = full_display.translated_slice(overlay.display, -x, -y);
+                                let physical = (
+                                    (w * scale as f64).round() as usize,
+                                    (h * scale as f64).round() as usize,
+                                );
+                                // the window's own ground under the content — a
+                                // toplevel has no parent pixels to show through
+                                let bitmap = bunny_ui::raster::rasterize_with(
+                                    &slice,
+                                    physical.0,
+                                    physical.1,
+                                    scale,
+                                    canvas,
+                                    &*runtime.text(),
+                                    &*runtime.images(),
+                                )?;
+                                dialog.handle.present_layered(
+                                    (x, y, w, h),
+                                    physical.0,
+                                    physical.1,
+                                    &bitmap.to_rgba_bytes(),
+                                );
+                                continue;
+                            }
+                            // the panel is BLED around the frame so the card's
+                            // own shadow has room — the same pixels every
+                            // target paints, no system shadow involved
+                            const BLEED: f64 = 32.0;
+                            let x = overlay.frame.origin.x - BLEED;
+                            let y = overlay.frame.origin.y - BLEED;
+                            let w = overlay.frame.size.width + 2.0 * BLEED;
+                            let h = overlay.frame.size.height + 2.0 * BLEED;
+                            let chip = overlay.path == bunny_ui::layout::DRAG_LABEL_PATH;
+                            // a popover born inside a dialog is the DIALOG's
+                            // child: it stacks over the dialog and rides its
+                            // moves — the identity path says whose it is
+                            let host = dialog_store
+                                .iter()
+                                .find(|(path, _)| overlay.path.starts_with(path.as_str()))
+                                .map(|(_, dialog)| dialog.handle);
+                            let panel =
+                                store
+                                    .entry(overlay.path.clone())
+                                    .or_insert_with(|| match host {
+                                        Some(dialog) if !chip => {
+                                            ffi::create_panel_in(&window, &dialog)
+                                        }
+                                        _ => ffi::create_panel(&window, chip),
+                                    });
+                            panel.set_scene_origin(x, y);
+                            let slice = full_display.translated_slice(overlay.display, -x, -y);
+                            let panel_physical = (
+                                (w * scale as f64).round() as usize,
+                                (h * scale as f64).round() as usize,
+                            );
+                            let bitmap = bunny_ui::raster::rasterize_with(
+                                &slice,
+                                panel_physical.0,
+                                panel_physical.1,
+                                scale,
+                                bunny_ui::layout::Color {
+                                    r: 0,
+                                    g: 0,
+                                    b: 0,
+                                    a: 0,
+                                },
+                                &*runtime.text(),
+                                &*runtime.images(),
+                            )?;
+                            // position, size and pixels land atomically; the
+                            // premultiply for the alpha surface fuses into the
+                            // copy at the boundary
+                            panel.present_layered(
+                                window.layout_rect_to_screen(x, y, w, h),
+                                panel_physical.0,
+                                panel_physical.1,
+                                &bitmap.to_rgba_bytes(),
+                            );
+                        }
+                    }
+                    if vk::active(window.raw_window()) {
+                        // the front of the ladder: the same display list, no
+                        // Surface in the path — the queue present is the frame
+                        vk::present_window(
+                            window.raw_window(),
+                            &display,
+                            Size { width, height },
                             scale,
                             canvas,
                             &*runtime.text(),
                             &*runtime.images(),
-                        );
-                        dialog.handle.present_layered(
-                            (x, y, w, h),
-                            physical.0,
-                            physical.1,
-                            &bitmap.to_rgba_bytes(),
-                        );
-                        continue;
+                        )?;
+                        if frame_stats {
+                            trace::mark(
+                                "P",
+                                format_args!("road=vk presents={}", trace::presents()),
+                            );
+                        }
+                        return Ok(());
                     }
-                    // the panel is BLED around the frame so the card's
-                    // own shadow has room — the same pixels every
-                    // target paints, no system shadow involved
-                    const BLEED: f64 = 32.0;
-                    let x = overlay.frame.origin.x - BLEED;
-                    let y = overlay.frame.origin.y - BLEED;
-                    let w = overlay.frame.size.width + 2.0 * BLEED;
-                    let h = overlay.frame.size.height + 2.0 * BLEED;
-                    let chip = overlay.path == bunny_ui::layout::DRAG_LABEL_PATH;
-                    // a popover born inside a dialog is the DIALOG's
-                    // child: it stacks over the dialog and rides its
-                    // moves — the identity path says whose it is
-                    let host = dialog_store
-                        .iter()
-                        .find(|(path, _)| overlay.path.starts_with(path.as_str()))
-                        .map(|(_, dialog)| dialog.handle);
-                    let panel = store.entry(overlay.path.clone()).or_insert_with(|| match host {
-                        Some(dialog) if !chip => ffi::create_panel_in(&window, &dialog),
-                        _ => ffi::create_panel(&window, chip),
+                    if gl::active(window.raw_window()) {
+                        // GPU present: the same display list, no Surface in
+                        // the path — the swap is the frame
+                        gl::present_window(
+                            window.raw_window(),
+                            &display,
+                            Size { width, height },
+                            scale,
+                            canvas,
+                            &*runtime.text(),
+                            &*runtime.images(),
+                        )?;
+                        if frame_stats {
+                            trace::mark(
+                                "P",
+                                format_args!("road=gl presents={}", trace::presents()),
+                            );
+                        }
+                        return Ok(());
+                    }
+                    let mut slot = surface.borrow_mut();
+                    let stale = match &*slot {
+                        Some((retained, retained_scale, retained_canvas)) => {
+                            retained.bitmap().width() != physical.0
+                                || retained.bitmap().height() != physical.1
+                                || *retained_scale != scale
+                                || *retained_canvas != canvas
+                        }
+                        None => true,
+                    };
+                    if stale {
+                        *slot = Some((
+                            bunny_ui::raster::Surface::new(physical.0, physical.1, scale, canvas),
+                            scale,
+                            canvas,
+                        ));
+                    }
+                    let (retained, _, _) = slot.as_mut().expect("surface for the frame");
+                    let damage = retained.frame(display, &*runtime.text(), &*runtime.images())?;
+                    if !damage.is_empty() {
+                        // present only the wounds: damage-only backing copy +
+                        // damage-only surface marks in the same pass
+                        let (width, height) =
+                            (retained.bitmap().width(), retained.bitmap().height());
+                        window.blit_partial(width, height, retained.rgba(), &damage);
+                        if frame_stats {
+                            trace::mark(
+                                "P",
+                                format_args!(
+                                    "road=cpu presents={} wounds={}",
+                                    trace::presents(),
+                                    damage.len()
+                                ),
+                            );
+                        }
+                    }
+                    Ok(())
+                })()?;
+                // Decorator after every pixel path, including GPU early returns.
+                // Register every surface even before semantic capture is requested.
+                let (width, height) = window.content_size();
+                let mut semantic_surfaces = vec![ffi::accessibility::Surface {
+                    key: None,
+                    handle: window,
+                    origin: bunny_ui::layout::Point { x: 0.0, y: 0.0 },
+                    size: Size { width, height },
+                    title: title.clone(),
+                }];
+                for overlay in runtime.overlays() {
+                    let dialog = dialogs.borrow().get(&overlay.path).copied();
+                    let panel = panels.borrow().get(&overlay.path).copied();
+                    let (handle, origin, size) = if let Some(dialog) = dialog {
+                        (dialog.handle, dialog.origin, overlay.frame.size)
+                    } else if let Some(panel) = panel {
+                        const BLEED: f64 = 32.0;
+                        (
+                            panel,
+                            bunny_ui::layout::Point {
+                                x: overlay.frame.origin.x - BLEED,
+                                y: overlay.frame.origin.y - BLEED,
+                            },
+                            Size {
+                                width: overlay.frame.size.width + 2.0 * BLEED,
+                                height: overlay.frame.size.height + 2.0 * BLEED,
+                            },
+                        )
+                    } else {
+                        continue;
+                    };
+                    let title = match &overlay.surface {
+                        bunny_ui::layout::OverlaySurface::Window(spec) => spec.title.to_string(),
+                        bunny_ui::layout::OverlaySurface::Alert(spec) => spec.title.to_string(),
+                        bunny_ui::layout::OverlaySurface::Layer => String::new(),
+                    };
+                    semantic_surfaces.push(ffi::accessibility::Surface {
+                        key: Some(overlay.path),
+                        handle,
+                        origin,
+                        size,
+                        title,
                     });
-                    panel.set_scene_origin(x, y);
-                    let slice = full_display.translated_slice(overlay.display, -x, -y);
-                    let panel_physical =
-                        ((w * scale as f64).round() as usize, (h * scale as f64).round() as usize);
-                    let bitmap = bunny_ui::raster::rasterize_with(
-                        &slice,
-                        panel_physical.0,
-                        panel_physical.1,
-                        scale,
-                        bunny_ui::layout::Color { r: 0, g: 0, b: 0, a: 0 },
-                        &*runtime.text(),
-                        &*runtime.images(),
-                    );
-                    // position, size and pixels land atomically; the
-                    // premultiply for the alpha surface fuses into the
-                    // copy at the boundary
-                    panel.present_layered(
-                        window.layout_rect_to_screen(x, y, w, h),
-                        panel_physical.0,
-                        panel_physical.1,
-                        &bitmap.to_rgba_bytes(),
-                    );
                 }
-            }
-            if vk::active(window.raw_window()) {
-                // the front of the ladder: the same display list, no
-                // Surface in the path — the queue present is the frame
-                vk::present_window(
-                    window.raw_window(),
-                    &display,
-                    Size { width, height },
-                    scale,
-                    canvas,
-                    &*runtime.text(),
-                    &*runtime.images(),
-                );
-                if frame_stats {
-                    trace::mark("P", format_args!("road=vk presents={}", trace::presents()));
-                }
-                return;
-            }
-            if gl::active(window.raw_window()) {
-                // GPU present: the same display list, no Surface in
-                // the path — the swap is the frame
-                gl::present_window(
-                    window.raw_window(),
-                    &display,
-                    Size { width, height },
-                    scale,
-                    canvas,
-                    &*runtime.text(),
-                    &*runtime.images(),
-                );
-                if frame_stats {
-                    trace::mark("P", format_args!("road=gl presents={}", trace::presents()));
-                }
-                return;
-            }
-            let mut slot = surface.borrow_mut();
-            let stale = match &*slot {
-                Some((retained, retained_scale, retained_canvas)) => {
-                    retained.bitmap().width() != physical.0
-                        || retained.bitmap().height() != physical.1
-                        || *retained_scale != scale
-                        || *retained_canvas != canvas
-                }
-                None => true,
+                accessibility.publish(semantic_surfaces);
+                // the page's next frame comes after this one went up: the
+                // engine is paced by the shell's own present
+                webview::frame_presented(window.raw_window());
             };
-            if stale {
-                *slot = Some((
-                    bunny_ui::raster::Surface::new(physical.0, physical.1, scale, canvas),
-                    scale,
-                    canvas,
-                ));
-            }
-            let (retained, _, _) = slot.as_mut().expect("surface for the frame");
-            let damage = retained.frame(display, &*runtime.text(), &*runtime.images());
-            if !damage.is_empty() {
-                // present only the wounds: damage-only backing copy +
-                // damage-only surface marks in the same pass
-                let (width, height) = (retained.bitmap().width(), retained.bitmap().height());
-                window.blit_partial(width, height, retained.rgba(), &damage);
-                if frame_stats {
-                    trace::mark(
-                        "P",
-                        format_args!("road=cpu presents={} wounds={}", trace::presents(), damage.len()),
-                    );
-                }
-            }
-            })();
-            // Decorator after every pixel path, including GPU early returns.
-            // Register every surface even before semantic capture is requested.
-            let (width, height) = window.content_size();
-            let mut semantic_surfaces = vec![ffi::accessibility::Surface {
-                key: None, handle: window,
-                origin: bunny_ui::layout::Point { x: 0.0, y: 0.0 },
-                size: Size { width, height }, title: title.clone(),
-            }];
-            for overlay in runtime.overlays() {
-                let dialog = dialogs.borrow().get(&overlay.path).copied();
-                let panel = panels.borrow().get(&overlay.path).copied();
-                let (handle, origin, size) = if let Some(dialog) = dialog {
-                    (dialog.handle, dialog.origin, overlay.frame.size)
-                } else if let Some(panel) = panel {
-                    const BLEED: f64 = 32.0;
-                    (panel, bunny_ui::layout::Point { x: overlay.frame.origin.x - BLEED, y: overlay.frame.origin.y - BLEED },
-                        Size { width: overlay.frame.size.width + 2.0 * BLEED, height: overlay.frame.size.height + 2.0 * BLEED })
-                } else { continue };
-                let title = match &overlay.surface {
-                    bunny_ui::layout::OverlaySurface::Window(spec) => spec.title.to_string(),
-                    bunny_ui::layout::OverlaySurface::Alert(spec) => spec.title.to_string(),
-                    bunny_ui::layout::OverlaySurface::Layer => String::new(),
-                };
-                semantic_surfaces.push(ffi::accessibility::Surface { key: Some(overlay.path), handle, origin, size, title });
-            }
-            accessibility.publish(semantic_surfaces);
-            // the page's next frame comes after this one went up: the
-            // engine is paced by the shell's own present
-            webview::frame_presented(window.raw_window());
+            Ok(())
         }
     });
     // the pacer: a burst of asks is one draw a beat, and a wake with
@@ -1058,141 +1141,163 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         let present = Rc::clone(&present);
         let pacer = Rc::clone(&pacer);
         let dialogs = Rc::clone(&dialogs);
-        move |runtime: &Runtime, root: &_, via: u8| {
-            // Hidden windows retain tasks/state, but must not re-show child surfaces.
-            if lifecycle.is_hidden() {
-                return;
-            }
+        move |runtime: &Runtime,
+              root: &_,
+              via: u8|
+              -> Result<(), bunny_ui::gpu::walk::RenderError> {
+            {
+                // Hidden windows retain tasks/state, but must not re-show child surfaces.
+                if lifecycle.is_hidden() {
+                    return Ok(());
+                }
 
-            let _ = via;
-            let (width, height) = window.content_size();
-            // a box that draws parts which TOUCH puts the shared edge
-            // on a whole PIXEL — it needs the screen's scale
-            runtime.set_device_scale(window.scale() as f64);
-            // popovers position against an inflated work area, in
-            // layout coordinates — overflow past the window's edge is
-            // plain geometry here, and welcome
-            runtime.set_overlay_bounds(window.screen_bounds_in_layout().map(
-                |(x, y, w, h)| bunny_ui::layout::Rect {
-                    origin: bunny_ui::layout::Point { x, y },
-                    size: Size { width: w, height: h },
-                },
-            ));
-            // an open dialog's WINDOW is the truth of its size: pull it
-            // into the runtime before the pass, so this very layout
-            // follows the compositor's configure or the user's resize.
-            // Wayland tells a client nothing of where its window stands,
-            // so the origin stays the scene's own
-            for (path, dialog) in dialogs.borrow().iter() {
-                if let Some((w, h)) = dialog.handle.dialog_size() {
-                    runtime.set_dialog_frame(
-                        path,
-                        bunny_ui::layout::Rect {
-                            origin: dialog.origin,
-                            size: Size { width: w, height: h },
+                let _ = via;
+                let (width, height) = window.content_size();
+                // a box that draws parts which TOUCH puts the shared edge
+                // on a whole PIXEL — it needs the screen's scale
+                runtime.set_device_scale(window.scale() as f64);
+                // popovers position against an inflated work area, in
+                // layout coordinates — overflow past the window's edge is
+                // plain geometry here, and welcome
+                runtime.set_overlay_bounds(window.screen_bounds_in_layout().map(|(x, y, w, h)| {
+                    bunny_ui::layout::Rect {
+                        origin: bunny_ui::layout::Point { x, y },
+                        size: Size {
+                            width: w,
+                            height: h,
                         },
+                    }
+                }));
+                // an open dialog's WINDOW is the truth of its size: pull it
+                // into the runtime before the pass, so this very layout
+                // follows the compositor's configure or the user's resize.
+                // Wayland tells a client nothing of where its window stands,
+                // so the origin stays the scene's own
+                for (path, dialog) in dialogs.borrow().iter() {
+                    if let Some((w, h)) = dialog.handle.dialog_size() {
+                        runtime.set_dialog_frame(
+                            path,
+                            bunny_ui::layout::Rect {
+                                origin: dialog.origin,
+                                size: Size {
+                                    width: w,
+                                    height: h,
+                                },
+                            },
+                        );
+                    }
+                }
+                // what the app asked its pages since the last frame — the
+                // hands, the navigations, the evals and the snapshots — goes
+                // to the engine before the scene settles
+                for op in runtime.webview_commands() {
+                    use bunny_ui::host::WebviewOp;
+                    let at = window.raw_window();
+                    match op {
+                        WebviewOp::Navigate { path, url } => webview::navigate(at, &path, &url),
+                        WebviewOp::Back { path } => webview::back(at, &path),
+                        WebviewOp::Forward { path } => webview::forward(at, &path),
+                        WebviewOp::Input { path, event } => webview::input(at, &path, &event),
+                        WebviewOp::Edit { path, action } => webview::edit(at, &path, &action),
+                        WebviewOp::Eval {
+                            path,
+                            token,
+                            js,
+                            raw,
+                        } => {
+                            if let Err(why) = webview::eval(at, &path, token, &js, raw) {
+                                let _ = runtime.webview_eval_done(token, Err(why));
+                            }
+                        }
+                        WebviewOp::Snapshot { path, token } => {
+                            if let Err(why) = webview::snapshot(at, &path, token) {
+                                let _ = runtime.webview_snapshot_done(token, Err(why));
+                            }
+                        }
+                    }
+                }
+                let display = runtime.display_frame(root, Size { width, height })?;
+                if frame_stats {
+                    let stats = bunny_ui::stats::take();
+                    let ms = |stage| stats.ms(stage);
+                    use bunny_ui::stats::Stage;
+                    trace::mark(
+                        "F",
+                        format_args!(
+                            "settle={:.2} layout={:.2} pass={:.2} asm={:.2} measure={:.2} place={:.2} hover={:.2} passes={} layouts={} asm#={} hover#={} paints={} cmds={} scale={} factor={:.2}",
+                            ms(Stage::Settle),
+                            ms(Stage::Layout),
+                            ms(Stage::Pass),
+                            ms(Stage::Assemble),
+                            ms(Stage::Measure),
+                            ms(Stage::Place),
+                            ms(Stage::Hover),
+                            stats.body_passes,
+                            stats.layout_passes,
+                            stats.assemblies,
+                            stats.hover_relayouts,
+                            stats.paints,
+                            display.len(),
+                            window.scale(),
+                            window.scale_factor(),
+                        ),
                     );
                 }
-            }
-            // what the app asked its pages since the last frame — the
-            // hands, the navigations, the evals and the snapshots — goes
-            // to the engine before the scene settles
-            for op in runtime.webview_commands() {
-                use bunny_ui::host::WebviewOp;
-                let at = window.raw_window();
-                match op {
-                    WebviewOp::Navigate { path, url } => webview::navigate(at, &path, &url),
-                    WebviewOp::Back { path } => webview::back(at, &path),
-                    WebviewOp::Forward { path } => webview::forward(at, &path),
-                    WebviewOp::Input { path, event } => webview::input(at, &path, &event),
-                    WebviewOp::Edit { path, action } => webview::edit(at, &path, &action),
-                    WebviewOp::Eval { path, token, js, raw } => {
-                        if let Err(why) = webview::eval(at, &path, token, &js, raw) {
-                            let _ = runtime.webview_eval_done(token, Err(why));
+                pacer.drew();
+                present(runtime, display)?;
+                let interaction = runtime.interaction();
+                // a live divider drag keeps the resizer even while the
+                // pointer runs ahead of the seam; hovering the grip
+                // announces it
+                window.set_cursor(match runtime.seam_axis() {
+                    // lanes side by side: the seam travels left and right
+                    Some(Axis::Horizontal) => ffi::Cursor::ResizeLeftRight,
+                    // lanes stacked: it travels up and down
+                    Some(Axis::Vertical) => ffi::Cursor::ResizeUpDown,
+                    // the BOX under the pointer answers first — text wants
+                    // an I-beam, and the rule below cannot know that. Only
+                    // where nobody answers does the old rule stand: the
+                    // hand over anything hoverable. A box's frame grip
+                    // wears the border band's own resizers
+                    None => match runtime.hovered_cursor() {
+                        Some(bunny_ui::layout::Cursor::Text) => ffi::Cursor::Text,
+                        Some(bunny_ui::layout::Cursor::Pointing) => ffi::Cursor::Pointing,
+                        Some(bunny_ui::layout::Cursor::Cell) => ffi::Cursor::Cell,
+                        Some(bunny_ui::layout::Cursor::Arrow) => ffi::Cursor::Arrow,
+                        Some(bunny_ui::layout::Cursor::ResizeLeftRight) => {
+                            ffi::Cursor::ResizeLeftRight
                         }
-                    }
-                    WebviewOp::Snapshot { path, token } => {
-                        if let Err(why) = webview::snapshot(at, &path, token) {
-                            let _ = runtime.webview_snapshot_done(token, Err(why));
+                        Some(bunny_ui::layout::Cursor::ResizeUpDown) => ffi::Cursor::ResizeUpDown,
+                        Some(bunny_ui::layout::Cursor::ResizeUpLeftDownRight) => {
+                            ffi::Cursor::ResizeNwSe
                         }
-                    }
-                }
-            }
-            let display = runtime.display_frame(root, Size { width, height });
-            if frame_stats {
-                let stats = bunny_ui::stats::take();
-                let ms = |stage| stats.ms(stage);
-                use bunny_ui::stats::Stage;
-                trace::mark(
-                    "F",
-                    format_args!(
-                        "settle={:.2} layout={:.2} pass={:.2} asm={:.2} measure={:.2} place={:.2} hover={:.2} passes={} layouts={} asm#={} hover#={} paints={} cmds={} scale={} factor={:.2}",
-                        ms(Stage::Settle),
-                        ms(Stage::Layout),
-                        ms(Stage::Pass),
-                        ms(Stage::Assemble),
-                        ms(Stage::Measure),
-                        ms(Stage::Place),
-                        ms(Stage::Hover),
-                        stats.body_passes,
-                        stats.layout_passes,
-                        stats.assemblies,
-                        stats.hover_relayouts,
-                        stats.paints,
-                        display.len(),
-                        window.scale(),
-                        window.scale_factor(),
-                    ),
-                );
-            }
-            pacer.drew();
-            present(runtime, display);
-            let interaction = runtime.interaction();
-            // a live divider drag keeps the resizer even while the
-            // pointer runs ahead of the seam; hovering the grip
-            // announces it
-            window.set_cursor(match runtime.seam_axis() {
-                // lanes side by side: the seam travels left and right
-                Some(Axis::Horizontal) => ffi::Cursor::ResizeLeftRight,
-                // lanes stacked: it travels up and down
-                Some(Axis::Vertical) => ffi::Cursor::ResizeUpDown,
-                // the BOX under the pointer answers first — text wants
-                // an I-beam, and the rule below cannot know that. Only
-                // where nobody answers does the old rule stand: the
-                // hand over anything hoverable. A box's frame grip
-                // wears the border band's own resizers
-                None => match runtime.hovered_cursor() {
-                    Some(bunny_ui::layout::Cursor::Text) => ffi::Cursor::Text,
-                    Some(bunny_ui::layout::Cursor::Pointing) => ffi::Cursor::Pointing,
-                    Some(bunny_ui::layout::Cursor::Cell) => ffi::Cursor::Cell,
-                    Some(bunny_ui::layout::Cursor::Arrow) => ffi::Cursor::Arrow,
-                    Some(bunny_ui::layout::Cursor::ResizeLeftRight) => {
-                        ffi::Cursor::ResizeLeftRight
-                    }
-                    Some(bunny_ui::layout::Cursor::ResizeUpDown) => ffi::Cursor::ResizeUpDown,
-                    Some(bunny_ui::layout::Cursor::ResizeUpLeftDownRight) => {
-                        ffi::Cursor::ResizeNwSe
-                    }
-                    Some(bunny_ui::layout::Cursor::ResizeUpRightDownLeft) => {
-                        ffi::Cursor::ResizeNeSw
-                    }
-                    None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
-                    None => ffi::Cursor::Arrow,
-                },
-            });
-            // the input system's mirror: the door opens at the IME
-            // phase; the slot keeps the twins' step order today
-            ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
-                let rect = snapshot.caret_rect;
-                (
-                    snapshot.marked.is_some(),
-                    snapshot.marked.map(|(start, _)| start).unwrap_or(0),
-                    (rect.origin.x, rect.origin.y, rect.size.width, rect.size.height),
-                )
-            }));
-            // wake or park the frame driver — the event may have
-            // started (or finished) an animation
-            sync_frame_driver(runtime, &pacer, window.raw_window());
+                        Some(bunny_ui::layout::Cursor::ResizeUpRightDownLeft) => {
+                            ffi::Cursor::ResizeNeSw
+                        }
+                        None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
+                        None => ffi::Cursor::Arrow,
+                    },
+                });
+                // the input system's mirror: the door opens at the IME
+                // phase; the slot keeps the twins' step order today
+                ffi::sync_ime(runtime.ime_snapshot()?.map(|snapshot| {
+                    let rect = snapshot.caret_rect;
+                    (
+                        snapshot.marked.is_some(),
+                        snapshot.marked.map(|(start, _)| start).unwrap_or(0),
+                        (
+                            rect.origin.x,
+                            rect.origin.y,
+                            rect.size.width,
+                            rect.size.height,
+                        ),
+                    )
+                }));
+                // wake or park the frame driver — the event may have
+                // started (or finished) an animation
+                sync_frame_driver(runtime, &pacer, window.raw_window());
+            };
+            Ok(())
         }
     };
     // the door of the pacer: an ask that may wait for the beat. A
@@ -1203,23 +1308,29 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         let runtime = Rc::clone(&runtime);
         let root = Rc::clone(&root);
         let blit = blit.clone();
-        move || blit(&runtime, &*root, ORIGIN_REDRAW)
+        move || native_event(blit(&runtime, &*root, ORIGIN_REDRAW), ())
     });
     accessibility.set_refresh(&accessibility_refresh);
     let soon = {
         let blit = blit.clone();
         let pacer = Rc::clone(&pacer);
-        move |runtime: &Runtime, root: &_, via: u8| {
-            let live = ffi::in_live_resize(window.raw_window());
-            if unpaced && !live {
-                blit(runtime, root, via);
-                return;
-            }
-            if pacer.ask(via, Urgency::Soon, live) == Verdict::Draw {
-                blit(runtime, root, via);
-            } else {
-                sync_frame_driver(runtime, &pacer, window.raw_window());
-            }
+        move |runtime: &Runtime,
+              root: &_,
+              via: u8|
+              -> Result<(), bunny_ui::gpu::walk::RenderError> {
+            {
+                let live = ffi::in_live_resize(window.raw_window());
+                if unpaced && !live {
+                    blit(runtime, root, via)?;
+                    return Ok(());
+                }
+                if pacer.ask(via, Urgency::Soon, live) == Verdict::Draw {
+                    blit(runtime, root, via)?;
+                } else {
+                    sync_frame_driver(runtime, &pacer, window.raw_window());
+                }
+            };
+            Ok(())
         }
     };
     // everything a page reports lands here and runs the matching
@@ -1233,37 +1344,58 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         webview::add_dispatch(
             window.raw_window(),
             Rc::new(move |event: webview::WebviewEvent| {
-                use webview::WebviewEvent;
-                let woke = match event {
-                    WebviewEvent::Navigated { path, url } => runtime.webview_navigated(&path, &url),
-                    WebviewEvent::Linked { path, url } => runtime.webview_linked(&path, &url),
-                    WebviewEvent::Changed { path, html } => runtime.webview_changed(&path, &html),
-                    WebviewEvent::Pasted { path, html, text } => {
-                        runtime.webview_pasted(&path, &html, &text)
-                    }
-                    WebviewEvent::NavigationFailed { path, url, why } => {
-                        runtime.webview_navigate_failed(&path, &url, &why)
-                    }
-                    WebviewEvent::Posted { path, body } => runtime.webview_posted(&path, &body),
-                    WebviewEvent::Console { path, line } => runtime.webview_console(&path, &line),
-                    WebviewEvent::Requested { path, line } => {
-                        runtime.webview_requested(&path, &line)
-                    }
-                    WebviewEvent::EvalDone { token, result } => {
-                        runtime.webview_eval_done(token, result)
-                    }
-                    WebviewEvent::SnapshotDone { token, result } => runtime.webview_snapshot_done(
-                        token,
-                        result.map(|(width, height, rgba)| bunny_ui::host::WebviewSnapshot {
-                            width,
-                            height,
-                            rgba,
-                        }),
-                    ),
-                };
-                if woke {
-                    blit(&runtime, &*root, ORIGIN_KEY);
-                }
+                native_event(
+                    (|| -> Result<(), bunny_ui::gpu::walk::RenderError> {
+                        {
+                            use webview::WebviewEvent;
+                            let woke = match event {
+                                WebviewEvent::Navigated { path, url } => {
+                                    runtime.webview_navigated(&path, &url)
+                                }
+                                WebviewEvent::Linked { path, url } => {
+                                    runtime.webview_linked(&path, &url)
+                                }
+                                WebviewEvent::Changed { path, html } => {
+                                    runtime.webview_changed(&path, &html)
+                                }
+                                WebviewEvent::Pasted { path, html, text } => {
+                                    runtime.webview_pasted(&path, &html, &text)
+                                }
+                                WebviewEvent::NavigationFailed { path, url, why } => {
+                                    runtime.webview_navigate_failed(&path, &url, &why)
+                                }
+                                WebviewEvent::Posted { path, body } => {
+                                    runtime.webview_posted(&path, &body)
+                                }
+                                WebviewEvent::Console { path, line } => {
+                                    runtime.webview_console(&path, &line)
+                                }
+                                WebviewEvent::Requested { path, line } => {
+                                    runtime.webview_requested(&path, &line)
+                                }
+                                WebviewEvent::EvalDone { token, result } => {
+                                    runtime.webview_eval_done(token, result)
+                                }
+                                WebviewEvent::SnapshotDone { token, result } => runtime
+                                    .webview_snapshot_done(
+                                        token,
+                                        result.map(|(width, height, rgba)| {
+                                            bunny_ui::host::WebviewSnapshot {
+                                                width,
+                                                height,
+                                                rgba,
+                                            }
+                                        }),
+                                    ),
+                            };
+                            if woke {
+                                blit(&runtime, &*root, ORIGIN_KEY)?;
+                            }
+                        };
+                        Ok(())
+                    })(),
+                    (),
+                );
             }),
         );
     }
@@ -1279,11 +1411,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let control_gate: Box<dyn Fn(f64, f64) -> Option<ffi::ControlHit>> = Box::new({
         let runtime = Rc::clone(&runtime);
         move |x, y| {
-            runtime.window_control_at(x, y).map(|control| match control {
-                bunny_ui::layout::WindowControl::Close => ffi::ControlHit::Close,
-                bunny_ui::layout::WindowControl::Minimize => ffi::ControlHit::Minimize,
-                bunny_ui::layout::WindowControl::Maximize => ffi::ControlHit::Maximize,
-            })
+            runtime
+                .window_control_at(x, y)
+                .map(|control| match control {
+                    bunny_ui::layout::WindowControl::Close => ffi::ControlHit::Close,
+                    bunny_ui::layout::WindowControl::Minimize => ffi::ControlHit::Minimize,
+                    bunny_ui::layout::WindowControl::Maximize => ffi::ControlHit::Maximize,
+                })
         }
     });
 
@@ -1305,73 +1439,85 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         let blit = blit.clone();
         let alt_tap = Rc::clone(&alt_tap);
         move |stroke: &ffi::KeyStroke| {
-            let pattern = key_pattern(stroke);
-            if pattern.is_some() || stroke.types_text {
-                alt_tap.borrow_mut().interrupted();
-            }
-            if stroke.types_text {
-                return false;
-            }
-            let Some(pattern) = pattern else {
-                return false;
-            };
-            // MID-CHORD the keyboard belongs to the keymap: the stroke
-            // that finishes `cmd-k s` is not typing, and it is not the
-            // focused box's either
-            let mid_chord = !runtime.pending_chord().is_empty();
-            // Alt and a letter types nothing here (AltGr does, and arrived
-            // as text above): it is a menu's access key once the box and the
-            // keymap have declined it, never a letter for the field
-            let menu_letter = matches!(MenuKey::of_stroke(&pattern), Some(MenuKey::Access(_)));
-            if !mid_chord && !menu_letter && runtime.focus_takes_text() && pattern.is_text_input() {
-                return false;
-            }
-            // a focused escape hatch owns its strokes: an editor's
-            // arrows, Enter and Tab are its own, and a copy hands the
-            // text back for the clipboard
-            let taken = runtime.key_stroke(Stroke::new(pattern, stroke.typed));
-            if taken.handled {
-                if let Some(text) = taken.text {
-                    ffi::clipboard_write(&text);
-                }
-                blit(&runtime, &*root, ORIGIN_KEY);
-                return true;
-            }
-            // a field of MANY lines owns the bare break and the bare
-            // vertical arrows, before any binding — and only it: a
-            // one-line field declines and the stroke walks on, so the
-            // app keeps its Enter and a list keeps its arrows
-            if !mid_chord
-                && pattern.is_plain()
-                && let Some(command) = match pattern.key {
-                    Key::Enter => Some(EditCommand::Newline),
-                    Key::Up => Some(EditCommand::Up(pattern.shift)),
-                    Key::Down => Some(EditCommand::Down(pattern.shift)),
-                    _ => None,
-                }
-                && runtime.key(command).applied
-            {
-                blit(&runtime, &*root, ORIGIN_KEY);
-                return true;
-            }
-            let action = match runtime.chord(Stroke::new(pattern, stroke.typed)) {
-                KeyMatch::Action(action) => Some(action),
-                // the stroke opened (or let go of) a sequence: it is
-                // spent, and a which-key panel may have just changed
-                KeyMatch::Pending => {
-                    blit(&runtime, &*root, ORIGIN_KEY);
-                    return true;
-                }
-                KeyMatch::None => None,
-            };
-            // nothing bound, or a binding nobody answered: the stroke may
-            // still be the menu bar's — F10, an access key
-            let taken = action.is_some_and(|action| runtime.dispatch_action(action))
-                || menu_key(&runtime, &pattern);
-            if taken {
-                blit(&runtime, &*root, ORIGIN_KEY);
-            }
-            taken
+            native_event(
+                (|| -> Result<bool, bunny_ui::gpu::walk::RenderError> {
+                    Ok({
+                        let pattern = key_pattern(stroke);
+                        if pattern.is_some() || stroke.types_text {
+                            alt_tap.borrow_mut().interrupted();
+                        }
+                        if stroke.types_text {
+                            return Ok(false);
+                        }
+                        let Some(pattern) = pattern else {
+                            return Ok(false);
+                        };
+                        // MID-CHORD the keyboard belongs to the keymap: the stroke
+                        // that finishes `cmd-k s` is not typing, and it is not the
+                        // focused box's either
+                        let mid_chord = !runtime.pending_chord().is_empty();
+                        // Alt and a letter types nothing here (AltGr does, and arrived
+                        // as text above): it is a menu's access key once the box and the
+                        // keymap have declined it, never a letter for the field
+                        let menu_letter =
+                            matches!(MenuKey::of_stroke(&pattern), Some(MenuKey::Access(_)));
+                        if !mid_chord
+                            && !menu_letter
+                            && runtime.focus_takes_text()
+                            && pattern.is_text_input()
+                        {
+                            return Ok(false);
+                        }
+                        // a focused escape hatch owns its strokes: an editor's
+                        // arrows, Enter and Tab are its own, and a copy hands the
+                        // text back for the clipboard
+                        let taken = runtime.key_stroke(Stroke::new(pattern, stroke.typed))?;
+                        if taken.handled {
+                            if let Some(text) = taken.text {
+                                ffi::clipboard_write(&text);
+                            }
+                            blit(&runtime, &*root, ORIGIN_KEY)?;
+                            return Ok(true);
+                        }
+                        // a field of MANY lines owns the bare break and the bare
+                        // vertical arrows, before any binding — and only it: a
+                        // one-line field declines and the stroke walks on, so the
+                        // app keeps its Enter and a list keeps its arrows
+                        if !mid_chord
+                            && pattern.is_plain()
+                            && let Some(command) = match pattern.key {
+                                Key::Enter => Some(EditCommand::Newline),
+                                Key::Up => Some(EditCommand::Up(pattern.shift)),
+                                Key::Down => Some(EditCommand::Down(pattern.shift)),
+                                _ => None,
+                            }
+                            && runtime.key(command)?.applied
+                        {
+                            blit(&runtime, &*root, ORIGIN_KEY)?;
+                            return Ok(true);
+                        }
+                        let action = match runtime.chord(Stroke::new(pattern, stroke.typed)) {
+                            KeyMatch::Action(action) => Some(action),
+                            // the stroke opened (or let go of) a sequence: it is
+                            // spent, and a which-key panel may have just changed
+                            KeyMatch::Pending => {
+                                blit(&runtime, &*root, ORIGIN_KEY)?;
+                                return Ok(true);
+                            }
+                            KeyMatch::None => None,
+                        };
+                        // nothing bound, or a binding nobody answered: the stroke may
+                        // still be the menu bar's — F10, an access key
+                        let taken = action.is_some_and(|action| runtime.dispatch_action(action))
+                            || menu_key(&runtime, &pattern);
+                        if taken {
+                            blit(&runtime, &*root, ORIGIN_KEY)?;
+                        }
+                        taken
+                    })
+                })(),
+                true,
+            )
         }
     });
 
@@ -1383,295 +1529,345 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let held = Cell::new(Modifiers::NONE);
     let handler_lifecycle = Rc::clone(&lifecycle);
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
-        let runtime = &handler_runtime;
-        let root = &*handler_root;
-        if matches!(
-            event,
-            AppEvent::MouseDown { .. } | AppEvent::RightMouseDown { .. } | AppEvent::MiddleMouseDown { .. }
-        ) {
-            alt_tap.borrow_mut().interrupted();
-        }
-        match event {
-            AppEvent::Redraw => blit(runtime, root, ORIGIN_REDRAW),
-            AppEvent::WindowClosed => {}
-            AppEvent::DialogClose { panel } => {
-                // its ✕ or the compositor: the window did NOT close — the
-                // overlay's dismissal flips the app's binding, and the
-                // frame this blit draws takes the window down through
-                // the ordinary sweep
-                let path = handler_dialogs.borrow().iter().find_map(|(path, dialog)| {
-                    (dialog.handle.panel_slot() == Some(panel)).then(|| path.clone())
-                });
-                if let Some(path) = path
-                    && runtime.dismiss_overlay(&path)
+        native_event(
+            (|| -> Result<(), bunny_ui::gpu::walk::RenderError> {
                 {
-                    blit(runtime, root, ORIGIN_POINTER);
-                }
-            }
-            // The work always lands: the tasks are polled. The FRAME is for a
-            // turn that changed something. Most wakes change nothing — a poll
-            // that found no news, a sleeper that went back to sleep — and a
-            // window with a few of those mounted drew whole frames of what
-            // was already on screen, dozens of times a second, at rest. A
-            // change the engine cannot see asks by hand
-            // (`bunny_ui::request_frame`).
-            AppEvent::Wake => {
-                runtime.poll_tasks();
-                if runtime.needs_frame() || webview::fresh(window.raw_window()) {
-                    soon(runtime, root, ORIGIN_WAKE);
-                } else {
-                    // no frame — but a task may have gone to sleep with a
-                    // new deadline, and the driver follows it
+                    let runtime = &handler_runtime;
+                    let root = &*handler_root;
+                    if matches!(
+                        event,
+                        AppEvent::MouseDown { .. }
+                            | AppEvent::RightMouseDown { .. }
+                            | AppEvent::MiddleMouseDown { .. }
+                    ) {
+                        alt_tap.borrow_mut().interrupted();
+                    }
+                    match event {
+                        AppEvent::Redraw => blit(runtime, root, ORIGIN_REDRAW)?,
+                        AppEvent::WindowClosed => {}
+                        AppEvent::DialogClose { panel } => {
+                            // its ✕ or the compositor: the window did NOT close — the
+                            // overlay's dismissal flips the app's binding, and the
+                            // frame this blit draws takes the window down through
+                            // the ordinary sweep
+                            let path =
+                                handler_dialogs.borrow().iter().find_map(|(path, dialog)| {
+                                    (dialog.handle.panel_slot() == Some(panel))
+                                        .then(|| path.clone())
+                                });
+                            if let Some(path) = path
+                                && runtime.dismiss_overlay(&path)
+                            {
+                                blit(runtime, root, ORIGIN_POINTER)?;
+                            }
+                        }
+                        // The work always lands: the tasks are polled. The FRAME is for a
+                        // turn that changed something. Most wakes change nothing — a poll
+                        // that found no news, a sleeper that went back to sleep — and a
+                        // window with a few of those mounted drew whole frames of what
+                        // was already on screen, dozens of times a second, at rest. A
+                        // change the engine cannot see asks by hand
+                        // (`bunny_ui::request_frame`).
+                        AppEvent::Wake => {
+                            runtime.poll_tasks();
+                            if runtime.needs_frame() || webview::fresh(window.raw_window()) {
+                                soon(runtime, root, ORIGIN_WAKE)?;
+                            } else {
+                                // no frame — but a task may have gone to sleep with a
+                                // new deadline, and the driver follows it
+                                sync_frame_driver(runtime, &handler_pacer, window.raw_window());
+                            }
+                        }
+                        AppEvent::WindowState { maximized } => {
+                            if runtime
+                                .set_window_state(bunny_ui::prelude::WindowState { maximized })
+                            {
+                                soon(runtime, root, ORIGIN_KEY)?;
+                            }
+                        }
+                        AppEvent::Modifiers(now) => {
+                            // a release confirms, closes, opens — whatever the sink
+                            // did, the frame that shows it is not one to wait for —
+                            // and Alt let go alone is the menu bar's
+                            let tapped = alt_tap.borrow_mut().modifiers(held.replace(now), now);
+                            let changed = runtime.modifiers_changed(now);
+                            if (tapped && runtime.menu_key(MenuKey::Bar)) || changed {
+                                blit(runtime, root, ORIGIN_KEY)?;
+                            }
+                        }
+                        AppEvent::ResignKey => {
+                            // the user switched away: popovers close like the
+                            // platform's own, and a page lets the keyboard go
+                            webview::unfocus();
+                            if !handler_lifecycle.is_hidden() && runtime.dismiss_all_overlays() {
+                                blit(runtime, root, ORIGIN_KEY)?;
+                            }
+                        }
+                        AppEvent::DismissOverlays => {
+                            // the x11 outside-press: no compositor grab exists to
+                            // dismiss for us — the shell watched the geometry and
+                            // says so; the press itself follows as its own event
+                            if runtime.dismiss_all_overlays() {
+                                blit(runtime, root, ORIGIN_KEY)?;
+                            }
+                        }
+                        AppEvent::Text(text) => {
+                            // typing, paste of characters, and the composed
+                            // dead-key result — the same road for all of them
+                            if !text.is_empty() && runtime.key(EditCommand::Insert(text))?.applied {
+                                blit(runtime, root, ORIGIN_KEY)?;
+                            }
+                        }
+                        AppEvent::Key {
+                            sym,
+                            shift,
+                            command,
+                        } => {
+                            let edit = match sym {
+                                0xff08 => Some(EditCommand::Backspace),
+                                0xffff => Some(EditCommand::Delete),
+                                0xff51 => Some(EditCommand::Left(shift)),
+                                0xff53 => Some(EditCommand::Right(shift)),
+                                0xff50 => Some(EditCommand::Home(shift)),
+                                0xff57 => Some(EditCommand::End(shift)),
+                                0xff1b => {
+                                    // esc releases focus
+                                    if runtime.blur() {
+                                        blit(runtime, root, ORIGIN_KEY)?;
+                                    }
+                                    None
+                                }
+                                0x61 if command => Some(EditCommand::SelectAll), // Ctrl+A
+                                0x63 if command => {
+                                    // Ctrl+C — the field's output goes to the system
+                                    if let Some(text) = runtime.key(EditCommand::Copy)?.output {
+                                        ffi::clipboard_write(&text);
+                                    }
+                                    None
+                                }
+                                0x78 if command => {
+                                    // Ctrl+X
+                                    let cut = runtime.key(EditCommand::Cut)?;
+                                    if let Some(text) = &cut.output {
+                                        ffi::clipboard_write(text);
+                                    }
+                                    if cut.output.is_some() {
+                                        blit(runtime, root, ORIGIN_KEY)?;
+                                    }
+                                    None
+                                }
+                                0x76 if command => {
+                                    // Ctrl+V — the runtime's paste: a picture for the
+                                    // input that takes one (where this shell can read
+                                    // one), the text otherwise
+                                    if runtime.paste()? {
+                                        blit(runtime, root, ORIGIN_KEY)?;
+                                    }
+                                    None
+                                }
+                                _ => None,
+                            };
+                            if let Some(edit) = edit
+                                && runtime.key(edit)?.applied
+                            {
+                                blit(runtime, root, ORIGIN_KEY)?;
+                            }
+                        }
+                        AppEvent::MouseMoved { x, y, modifiers } => {
+                            // a page under the pointer (or one holding a press)
+                            // hears the move as its own; the scene still sees it,
+                            // so a hover it held clears cleanly
+                            let at = window.raw_window();
+                            if let Some(path) = webview::grab_or(at, runtime.host_at(x, y)) {
+                                webview::pointer_motion(at, &path, x, y, modifiers);
+                            }
+                            if runtime.pointer_moved(x, y, modifiers)? {
+                                soon(runtime, root, ORIGIN_POINTER)?;
+                            }
+                        }
+                        AppEvent::RightMouseDown { x, y, modifiers } => {
+                            let at = window.raw_window();
+                            if let Some(path) = runtime.host_at(x, y) {
+                                // the page's own menu, where it draws one
+                                webview::press(at, &path, x, y, MouseButton::Right, modifiers);
+                                webview::release(at, &path, x, y, MouseButton::Right, modifiers);
+                            } else if runtime.button_pressed(
+                                x,
+                                y,
+                                bunny_ui::custom::PointerButton::Secondary,
+                                modifiers,
+                            ) {
+                                // the box under the pointer hears it first; what it
+                                // ignores opens (or closes) the context menu, which
+                                // presents with the scene until panels take it outside
+                                blit(runtime, root, ORIGIN_KEY)?;
+                            }
+                        }
+                        AppEvent::MiddleMouseDown { x, y, modifiers } => {
+                            let at = window.raw_window();
+                            if let Some(path) = runtime.host_at(x, y) {
+                                webview::press(at, &path, x, y, MouseButton::Middle, modifiers);
+                                webview::release(at, &path, x, y, MouseButton::Middle, modifiers);
+                            } else if runtime.button_pressed(
+                                x,
+                                y,
+                                bunny_ui::custom::PointerButton::Middle,
+                                modifiers,
+                            ) {
+                                blit(runtime, root, ORIGIN_KEY)?;
+                            }
+                        }
+                        AppEvent::MouseDown {
+                            x,
+                            y,
+                            clicks,
+                            modifiers,
+                        } => {
+                            let at = window.raw_window();
+                            if let Some(path) = runtime.host_at(x, y) {
+                                // the press is the page's: the scene lets the
+                                // keyboard go, a popover closes as it would beside
+                                // any click, and the page holds the pointer until
+                                // the release (the engine counts the clicks itself)
+                                let _ = runtime.blur();
+                                let dismissed = runtime.dismiss_all_overlays();
+                                webview::focus(at, &path);
+                                webview::press(at, &path, x, y, MouseButton::Left, modifiers);
+                                if dismissed {
+                                    blit(runtime, root, ORIGIN_KEY)?;
+                                }
+                            } else {
+                                webview::unfocus();
+                                if runtime.pointer_clicked(x, y, clicks, modifiers)? {
+                                    blit(runtime, root, ORIGIN_KEY)?;
+                                }
+                            }
+                        }
+                        AppEvent::MouseUp { x, y } => {
+                            let at = window.raw_window();
+                            if let Some(path) = webview::take_grab(at) {
+                                webview::release(
+                                    at,
+                                    &path,
+                                    x,
+                                    y,
+                                    MouseButton::Left,
+                                    Modifiers::NONE,
+                                );
+                            } else {
+                                // fires on up-inside; the pressed visual always clears
+                                let _ = runtime.pointer_released(x, y);
+                                blit(runtime, root, ORIGIN_KEY)?;
+                            }
+                        }
+                        AppEvent::MouseExited => {
+                            if runtime.pointer_exited() {
+                                soon(runtime, root, ORIGIN_POINTER)?;
+                            }
+                        }
+                        AppEvent::Wheel {
+                            x,
+                            y,
+                            dx,
+                            dy,
+                            modifiers,
+                            phase,
+                        } => {
+                            let at = window.raw_window();
+                            if let Some(path) = runtime.host_at(x, y) {
+                                webview::wheel(at, &path, x, y, dx, dy);
+                            } else if runtime.wheel_with(x, y, dx, dy, modifiers, phase) {
+                                // offset is engine state: repaint without render
+                                soon(runtime, root, ORIGIN_WHEEL)?;
+                            }
+                        }
+                        AppEvent::Touch { phase, id, x, y } => {
+                            // a touch that changed nothing visible may still have
+                            // put the finger on the clock (a fling in the air)
+                            let changed = match phase {
+                                ffi::TouchPhase::Began => runtime.touch_began(id, x, y, 1)?,
+                                ffi::TouchPhase::Moved => runtime.touch_moved(id, x, y)?,
+                                ffi::TouchPhase::Ended => runtime.touch_ended(id, x, y)?,
+                                ffi::TouchPhase::Cancelled => runtime.touch_cancelled(id)?,
+                            };
+                            if changed || phase == ffi::TouchPhase::Ended {
+                                soon(runtime, root, ORIGIN_TOUCH)?;
+                            } else {
+                                sync_frame_driver(runtime, &handler_pacer, window.raw_window());
+                            }
+                        }
+                        AppEvent::Magnify { x, y, scale } => {
+                            if runtime.magnify(x, y, scale) {
+                                soon(runtime, root, ORIGIN_WHEEL)?;
+                            }
+                        }
+                        AppEvent::ImeMark { text, caret } => {
+                            let command = EditCommand::SetMarked {
+                                text,
+                                caret_utf16: (caret, 0),
+                            };
+                            if runtime.key(command)?.applied {
+                                blit(runtime, root, ORIGIN_KEY)?;
+                            }
+                        }
+                        AppEvent::ImeUnmark => {
+                            if runtime.key(EditCommand::Unmark)?.applied {
+                                blit(runtime, root, ORIGIN_KEY)?;
+                            }
+                        }
+                        AppEvent::Blink => {
+                            // an idle caret blinks; without focus the tick is
+                            // silence — and the same slow clock ages the tooltip's
+                            // wait and then shows it: the delay is this tick twice
+                            let blinked = runtime.blink();
+                            let explained = runtime.tooltip_tick();
+                            // the same slow beat ages a sequence in the air: two
+                            // ticks and `cmd-k` lets the keyboard go
+                            let chorded = runtime.chord_tick();
+                            // and the wheel's latch: two ticks with no wheel end
+                            // the scroll gesture
+                            runtime.wheel_tick();
+                            if blinked || explained || chorded {
+                                soon(runtime, root, ORIGIN_BLINK)?;
+                            }
+                            // the net under the beat: an ask that waited for a beat
+                            // that never came (a window off screen keeps no beat)
+                            // draws on this slow clock instead
+                            if handler_pacer.pending().count > 0
+                                && !ffi::in_live_resize(window.raw_window())
+                            {
+                                blit(runtime, root, ORIGIN_BLINK)?;
+                            }
+                        }
+                        AppEvent::Frame { dt, elapsed } => {
+                            // the tick path: springs advance, then layout only —
+                            // zero bodies on a stable tree; settle and effects
+                            // belong to the real-event path. The pacer says whether
+                            // this beat draws what was asked for, holds, or is quiet.
+                            // A finger's hold reads the wall; the springs, the step
+                            let moved = runtime.tick_clocked(dt, elapsed)?;
+                            match handler_pacer.beat(ffi::in_live_resize(window.raw_window())) {
+                                Beat::Hold => {}
+                                Beat::Draw => blit(runtime, root, ORIGIN_FRAME)?,
+                                Beat::Quiet => {
+                                    if moved.any() {
+                                        let (width, height) = window.content_size();
+                                        let display = runtime
+                                            .animation_frame(root, Size { width, height })?;
+                                        handler_present(runtime, display)?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // after EVERY event: an event can arm a timer without changing
+                    // a pixel, and the driver has to follow it
                     sync_frame_driver(runtime, &handler_pacer, window.raw_window());
-                }
-            }
-            AppEvent::WindowState { maximized } => {
-                if runtime.set_window_state(bunny_ui::prelude::WindowState { maximized }) {
-                    soon(runtime, root, ORIGIN_KEY);
-                }
-            }
-            AppEvent::Modifiers(now) => {
-                // a release confirms, closes, opens — whatever the sink
-                // did, the frame that shows it is not one to wait for —
-                // and Alt let go alone is the menu bar's
-                let tapped = alt_tap.borrow_mut().modifiers(held.replace(now), now);
-                let changed = runtime.modifiers_changed(now);
-                if (tapped && runtime.menu_key(MenuKey::Bar)) || changed {
-                    blit(runtime, root, ORIGIN_KEY);
-                }
-            }
-            AppEvent::ResignKey => {
-                // the user switched away: popovers close like the
-                // platform's own, and a page lets the keyboard go
-                webview::unfocus();
-                if !handler_lifecycle.is_hidden() && runtime.dismiss_all_overlays() {
-                    blit(runtime, root, ORIGIN_KEY);
-                }
-            }
-            AppEvent::DismissOverlays => {
-                // the x11 outside-press: no compositor grab exists to
-                // dismiss for us — the shell watched the geometry and
-                // says so; the press itself follows as its own event
-                if runtime.dismiss_all_overlays() {
-                    blit(runtime, root, ORIGIN_KEY);
-                }
-            }
-            AppEvent::Text(text) => {
-                // typing, paste of characters, and the composed
-                // dead-key result — the same road for all of them
-                if !text.is_empty() && runtime.key(EditCommand::Insert(text)).applied {
-                    blit(runtime, root, ORIGIN_KEY);
-                }
-            }
-            AppEvent::Key { sym, shift, command } => {
-                let edit = match sym {
-                    0xff08 => Some(EditCommand::Backspace),
-                    0xffff => Some(EditCommand::Delete),
-                    0xff51 => Some(EditCommand::Left(shift)),
-                    0xff53 => Some(EditCommand::Right(shift)),
-                    0xff50 => Some(EditCommand::Home(shift)),
-                    0xff57 => Some(EditCommand::End(shift)),
-                    0xff1b => {
-                        // esc releases focus
-                        if runtime.blur() {
-                            blit(runtime, root, ORIGIN_KEY);
-                        }
-                        None
-                    }
-                    0x61 if command => Some(EditCommand::SelectAll), // Ctrl+A
-                    0x63 if command => {
-                        // Ctrl+C — the field's output goes to the system
-                        if let Some(text) = runtime.key(EditCommand::Copy).output {
-                            ffi::clipboard_write(&text);
-                        }
-                        None
-                    }
-                    0x78 if command => {
-                        // Ctrl+X
-                        let cut = runtime.key(EditCommand::Cut);
-                        if let Some(text) = &cut.output {
-                            ffi::clipboard_write(text);
-                        }
-                        if cut.output.is_some() {
-                            blit(runtime, root, ORIGIN_KEY);
-                        }
-                        None
-                    }
-                    0x76 if command => {
-                        // Ctrl+V — the runtime's paste: a picture for the
-                        // input that takes one (where this shell can read
-                        // one), the text otherwise
-                        if runtime.paste() {
-                            blit(runtime, root, ORIGIN_KEY);
-                        }
-                        None
-                    }
-                    _ => None,
                 };
-                if let Some(edit) = edit
-                    && runtime.key(edit).applied
-                {
-                    blit(runtime, root, ORIGIN_KEY);
-                }
-            }
-            AppEvent::MouseMoved { x, y, modifiers } => {
-                // a page under the pointer (or one holding a press)
-                // hears the move as its own; the scene still sees it,
-                // so a hover it held clears cleanly
-                let at = window.raw_window();
-                if let Some(path) = webview::grab_or(at, runtime.host_at(x, y)) {
-                    webview::pointer_motion(at, &path, x, y, modifiers);
-                }
-                if runtime.pointer_moved(x, y, modifiers) {
-                    soon(runtime, root, ORIGIN_POINTER);
-                }
-            }
-            AppEvent::RightMouseDown { x, y, modifiers } => {
-                let at = window.raw_window();
-                if let Some(path) = runtime.host_at(x, y) {
-                    // the page's own menu, where it draws one
-                    webview::press(at, &path, x, y, MouseButton::Right, modifiers);
-                    webview::release(at, &path, x, y, MouseButton::Right, modifiers);
-                } else if runtime.button_pressed(x, y, bunny_ui::custom::PointerButton::Secondary, modifiers) {
-                    // the box under the pointer hears it first; what it
-                    // ignores opens (or closes) the context menu, which
-                    // presents with the scene until panels take it outside
-                    blit(runtime, root, ORIGIN_KEY);
-                }
-            }
-            AppEvent::MiddleMouseDown { x, y, modifiers } => {
-                let at = window.raw_window();
-                if let Some(path) = runtime.host_at(x, y) {
-                    webview::press(at, &path, x, y, MouseButton::Middle, modifiers);
-                    webview::release(at, &path, x, y, MouseButton::Middle, modifiers);
-                } else if runtime.button_pressed(x, y, bunny_ui::custom::PointerButton::Middle, modifiers) {
-                    blit(runtime, root, ORIGIN_KEY);
-                }
-            }
-            AppEvent::MouseDown { x, y, clicks, modifiers } => {
-                let at = window.raw_window();
-                if let Some(path) = runtime.host_at(x, y) {
-                    // the press is the page's: the scene lets the
-                    // keyboard go, a popover closes as it would beside
-                    // any click, and the page holds the pointer until
-                    // the release (the engine counts the clicks itself)
-                    let _ = runtime.blur();
-                    let dismissed = runtime.dismiss_all_overlays();
-                    webview::focus(at, &path);
-                    webview::press(at, &path, x, y, MouseButton::Left, modifiers);
-                    if dismissed {
-                        blit(runtime, root, ORIGIN_KEY);
-                    }
-                } else {
-                    webview::unfocus();
-                    if runtime.pointer_clicked(x, y, clicks, modifiers) {
-                        blit(runtime, root, ORIGIN_KEY);
-                    }
-                }
-            }
-            AppEvent::MouseUp { x, y } => {
-                let at = window.raw_window();
-                if let Some(path) = webview::take_grab(at) {
-                    webview::release(at, &path, x, y, MouseButton::Left, Modifiers::NONE);
-                } else {
-                    // fires on up-inside; the pressed visual always clears
-                    let _ = runtime.pointer_released(x, y);
-                    blit(runtime, root, ORIGIN_KEY);
-                }
-            }
-            AppEvent::MouseExited => {
-                if runtime.pointer_exited() {
-                    soon(runtime, root, ORIGIN_POINTER);
-                }
-            }
-            AppEvent::Wheel { x, y, dx, dy, modifiers, phase } => {
-                let at = window.raw_window();
-                if let Some(path) = runtime.host_at(x, y) {
-                    webview::wheel(at, &path, x, y, dx, dy);
-                } else if runtime.wheel_with(x, y, dx, dy, modifiers, phase) {
-                    // offset is engine state: repaint without render
-                    soon(runtime, root, ORIGIN_WHEEL);
-                }
-            }
-            AppEvent::Touch { phase, id, x, y } => {
-                // a touch that changed nothing visible may still have
-                // put the finger on the clock (a fling in the air)
-                let changed = match phase {
-                    ffi::TouchPhase::Began => runtime.touch_began(id, x, y, 1),
-                    ffi::TouchPhase::Moved => runtime.touch_moved(id, x, y),
-                    ffi::TouchPhase::Ended => runtime.touch_ended(id, x, y),
-                    ffi::TouchPhase::Cancelled => runtime.touch_cancelled(id),
-                };
-                if changed || phase == ffi::TouchPhase::Ended {
-                    soon(runtime, root, ORIGIN_TOUCH);
-                } else {
-                    sync_frame_driver(runtime, &handler_pacer, window.raw_window());
-                }
-            }
-            AppEvent::Magnify { x, y, scale } => {
-                if runtime.magnify(x, y, scale) {
-                    soon(runtime, root, ORIGIN_WHEEL);
-                }
-            }
-            AppEvent::ImeMark { text, caret } => {
-                let command = EditCommand::SetMarked { text, caret_utf16: (caret, 0) };
-                if runtime.key(command).applied {
-                    blit(runtime, root, ORIGIN_KEY);
-                }
-            }
-            AppEvent::ImeUnmark => {
-                if runtime.key(EditCommand::Unmark).applied {
-                    blit(runtime, root, ORIGIN_KEY);
-                }
-            }
-            AppEvent::Blink => {
-                // an idle caret blinks; without focus the tick is
-                // silence — and the same slow clock ages the tooltip's
-                // wait and then shows it: the delay is this tick twice
-                let blinked = runtime.blink();
-                let explained = runtime.tooltip_tick();
-                // the same slow beat ages a sequence in the air: two
-                // ticks and `cmd-k` lets the keyboard go
-                let chorded = runtime.chord_tick();
-                // and the wheel's latch: two ticks with no wheel end
-                // the scroll gesture
-                runtime.wheel_tick();
-                if blinked || explained || chorded {
-                    soon(runtime, root, ORIGIN_BLINK);
-                }
-                // the net under the beat: an ask that waited for a beat
-                // that never came (a window off screen keeps no beat)
-                // draws on this slow clock instead
-                if handler_pacer.pending().count > 0
-                    && !ffi::in_live_resize(window.raw_window())
-                {
-                    blit(runtime, root, ORIGIN_BLINK);
-                }
-            }
-            AppEvent::Frame { dt, elapsed } => {
-                // the tick path: springs advance, then layout only —
-                // zero bodies on a stable tree; settle and effects
-                // belong to the real-event path. The pacer says whether
-                // this beat draws what was asked for, holds, or is quiet.
-                // A finger's hold reads the wall; the springs, the step
-                let moved = runtime.tick_clocked(dt, elapsed);
-                match handler_pacer.beat(ffi::in_live_resize(window.raw_window())) {
-                    Beat::Hold => {}
-                    Beat::Draw => blit(runtime, root, ORIGIN_FRAME),
-                    Beat::Quiet => {
-                        if moved.any() {
-                            let (width, height) = window.content_size();
-                            let display =
-                                runtime.animation_frame(root, Size { width, height });
-                            handler_present(runtime, display);
-                        }
-                    }
-                }
-            }
-        }
-        // after EVERY event: an event can arm a timer without changing
-        // a pixel, and the driver has to follow it
-        sync_frame_driver(runtime, &handler_pacer, window.raw_window());
+                Ok(())
+            })(),
+            (),
+        );
     });
 
     // the first frame and the reveal are the app's: painted through
