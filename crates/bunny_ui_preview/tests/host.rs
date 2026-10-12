@@ -202,3 +202,69 @@ fn the_small_talk_is_answered() {
     host.handle(ToHost::ClearOverrides { id: String::from("src/lib.rs#card") });
     assert_eq!(host.overrides_of("src/lib.rs#card"), 0);
 }
+
+fn text_x(frame: &wire::Frame) -> f64 {
+    frame
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            wire::Draw::TextLine { origin, .. } => Some(origin.x),
+            _ => None,
+        })
+        .expect("a text line")
+}
+
+/// The site of the card's `.padding_length(8.0)`, read off a frame.
+fn padding_site(frame: &wire::Frame) -> wire::SiteKey {
+    let site = frame
+        .sites
+        .iter()
+        .find(|site| site.modifier.is_some_and(|name| frame.strings.get(name as usize).is_some_and(|name| name == "padding")))
+        .expect("the padding has a site");
+    wire::SiteKey { file: frame.strings[site.file.expect("a recorded site") as usize].clone(), line: site.line, column: site.column }
+}
+
+/// A scrub: a second `Replace` on a site stands in for the first, so the
+/// last gesture shows — and each one moves the picture.
+#[test]
+fn a_second_replace_on_a_site_stands_in_for_the_first() {
+    let (mut host, seen) = host();
+    let id = String::from("src/lib.rs#card");
+    host.handle(select("card", Traits::default()));
+    assert!(host.tick());
+    let first = frames(&seen).remove(0);
+    let site = padding_site(&first);
+    let at_rest = text_x(&first);
+    let gesture = |length: f64| ToHost::Override { id: id.clone(), site: site.clone(), op: wire::OverrideOp::Replace, patch: wire::Patch::PaddingLength(length) };
+    host.handle(gesture(32.0));
+    assert!(host.tick(), "the first gesture renders");
+    let wider = text_x(&frames(&seen).remove(0));
+    assert!(wider > at_rest, "{wider} > {at_rest}");
+    host.handle(gesture(48.0));
+    assert!(host.tick(), "the second gesture renders too");
+    let widest = text_x(&frames(&seen).remove(0));
+    assert!(widest > wider, "{widest} > {wider}");
+    assert_eq!(host.overrides_of(&id), 1, "one override stands on the site");
+    host.handle(ToHost::ClearOverrides { id: id.clone() });
+    assert!(host.tick());
+    assert_eq!(text_x(&frames(&seen).remove(0)), at_rest, "the code says the padding again");
+}
+
+/// A `Hide` stands in for a `Replace` on its site; an `Append` stands in
+/// for an `Append` of the same modifier and stacks beside another's.
+#[test]
+fn an_override_stands_in_for_one_of_its_kind_and_stacks_beside_another() {
+    let (mut host, _seen) = host();
+    let id = String::from("src/lib.rs#card");
+    let site = wire::SiteKey { file: String::from("src/lib.rs"), line: 3, column: 1 };
+    let put = |op, patch| ToHost::Override { id: id.clone(), site: site.clone(), op, patch };
+    host.handle(select("card", Traits::default()));
+    host.handle(put(wire::OverrideOp::Replace, wire::Patch::PaddingLength(8.0)));
+    host.handle(put(wire::OverrideOp::Hide, wire::Patch::Hidden));
+    assert_eq!(host.overrides_of(&id), 1, "the hide took the replace's place");
+    host.handle(put(wire::OverrideOp::Append, wire::Patch::PaddingLength(8.0)));
+    host.handle(put(wire::OverrideOp::Append, wire::Patch::PaddingLength(12.0)));
+    assert_eq!(host.overrides_of(&id), 2, "a scrub of the appended padding is one override");
+    host.handle(put(wire::OverrideOp::Append, wire::Patch::Opacity(0.5)));
+    assert_eq!(host.overrides_of(&id), 3, "another modifier appended stacks");
+}

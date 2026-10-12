@@ -133,6 +133,18 @@ struct Scene {
     overrides: Vec<(wire::SiteKey, wire::OverrideOp, wire::Patch)>,
 }
 
+/// Whether an override put on a site stands in for one standing there: a
+/// `Replace` or a `Hide` for either — the last gesture wins — and an
+/// `Append` for an `Append` of the same modifier (a scrub of an appended
+/// padding), while an `Append` of another modifier stacks beside it.
+fn supersedes(op: wire::OverrideOp, patch: wire::Patch, standing_op: wire::OverrideOp, standing_patch: wire::Patch) -> bool {
+    match (op, standing_op) {
+        (wire::OverrideOp::Replace | wire::OverrideOp::Hide, wire::OverrideOp::Replace | wire::OverrideOp::Hide) => true,
+        (wire::OverrideOp::Append, wire::OverrideOp::Append) => convert::modifier(patch).name() == convert::modifier(standing_patch).name(),
+        _ => false,
+    }
+}
+
 /// What a scene last sent — a frame is sent again only when one of these
 /// moved.
 struct Sent {
@@ -306,6 +318,11 @@ impl Host {
             }
             ToHost::Override { id, site, op, patch } => {
                 if let Some(scene) = self.scene(&id) {
+                    // a scrub: the gesture stands in for the one standing on
+                    // the same site and of the same kind, so the last one
+                    // shows — the provenance applies a site's overrides in
+                    // order and takes the first `Replace`
+                    scene.overrides.retain(|(standing, standing_op, standing_patch)| !(standing == &site && supersedes(op, patch, *standing_op, *standing_patch)));
                     scene.overrides.push((site, op, patch));
                     scene.dirty = true;
                     self.push_overrides();
