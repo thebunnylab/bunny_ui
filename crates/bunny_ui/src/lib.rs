@@ -40,6 +40,8 @@
 pub mod accessibility;
 /// Where a node was written — the sites a tool maps frames to (Studio).
 pub mod provenance;
+/// The preview vocabulary — a view with the traits it is shown under (Studio).
+pub mod preview;
 pub mod action;
 pub mod anim;
 pub mod bind;
@@ -182,6 +184,7 @@ pub mod prelude {
         VisualProps,
     };
     pub use crate::theme::{self, Theme};
+    pub use crate::preview::{Device, Preview, Scheme, Sizing, Traits};
     pub use crate::words::{self, Word, Words};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Tracking, Weight};
     pub use crate::text_input::{CaretState, EditCommand, KeyboardType};

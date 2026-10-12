@@ -151,6 +151,10 @@ impl Theme {
 
 thread_local! {
     static THEME: Cell<Theme> = const { Cell::new(Theme::light()) };
+    /// What `install` last set — the theme a runtime without one of its
+    /// own renders under, put back by `restore_installed` after a scene
+    /// that rendered under a quiet theme of its own.
+    static INSTALLED: Cell<Theme> = const { Cell::new(Theme::light()) };
     static VERSION: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -158,7 +162,31 @@ thread_local! {
 /// next pass of any `Runtime` rebuilds the retention once.
 pub fn install(theme: Theme) {
     THEME.with(|current| current.set(theme));
+    INSTALLED.with(|installed| installed.set(theme));
     VERSION.with(|version| version.set(version.get() + 1));
+}
+
+/// Sets the thread's tokens WITHOUT bumping the version — for a runtime
+/// that renders under a theme of its own (`Runtime::theme`): two scenes
+/// alternating light and dark on one thread each enter their theme
+/// before their pass, and neither rebuilds the other's retention, since
+/// the version every runtime compares never moves. The tokens a body
+/// read stay baked into that scene — which is exactly right, because
+/// that scene always renders under the same theme.
+pub fn set_quiet(theme: Theme) {
+    THEME.with(|current| current.set(theme));
+}
+
+/// Puts the installed theme back — what a runtime WITHOUT a theme of
+/// its own enters with, so a scene that set a quiet theme never leaks
+/// into the app's next pass.
+pub fn restore_installed() {
+    THEME.with(|current| current.set(INSTALLED.with(|installed| installed.get())));
+}
+
+/// The theme `install` last set, whatever a scene set quietly since.
+pub fn installed() -> Theme {
+    INSTALLED.with(|installed| installed.get())
 }
 
 /// The current snapshot — for hot loops that read many tokens.
@@ -189,5 +217,18 @@ mod tests {
     #[test]
     fn the_default_theme_is_the_light_one() {
         assert_eq!(Theme::default(), Theme::light());
+    }
+
+    #[test]
+    fn a_quiet_theme_moves_the_tokens_but_not_the_version_and_restores_to_the_installed_one() {
+        install(Theme::light());
+        let version = version();
+        set_quiet(Theme::dark());
+        assert_eq!(accent(), Theme::dark().accent);
+        assert_eq!(super::version(), version, "a quiet theme rebuilds nothing");
+        assert_eq!(installed(), Theme::light());
+        restore_installed();
+        assert_eq!(accent(), Theme::light().accent);
+        assert_eq!(super::version(), version);
     }
 }
