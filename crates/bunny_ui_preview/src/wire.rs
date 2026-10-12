@@ -17,7 +17,9 @@
 //! travel once, as a [`Resource`], before the first frame that draws it.
 //!
 //! [`WIRE_VERSION`] is 1. It is frozen: a change to an existing message
-//! is a new kind, never a new meaning for an old one.
+//! is a new kind, never a new meaning for an old one. The kinds that
+//! joined after it froze — `Touch` and `Magnify`, tool → host — are
+//! skipped by a host that predates them, by their length.
 
 use std::fmt;
 
@@ -56,6 +58,9 @@ pub mod kind {
     pub const FORGET: u8 = 74;
     pub const PING: u8 = 75;
     pub const BYE: u8 = 76;
+    // joined after v1 froze: a host that predates them skips them
+    pub const TOUCH: u8 = 77;
+    pub const MAGNIFY: u8 = 78;
 }
 
 // =============================================================================
@@ -460,6 +465,15 @@ pub enum PointerKind {
     Leave,
 }
 
+/// A finger's step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchPhase {
+    Began,
+    Moved,
+    Ended,
+    Cancelled,
+}
+
 /// A source site a tool names an override by.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SiteKey {
@@ -529,6 +543,12 @@ pub enum ToHost {
     Resize { id: String, size: Size },
     Pointer { id: String, kind: PointerKind, x: f64, y: f64, modifiers: u32 },
     Wheel { id: String, x: f64, y: f64, dx: f64, dy: f64 },
+    /// A finger on a scene: `touch` names it across its steps, `taps`
+    /// is the platform's own count for it.
+    Touch { id: String, phase: TouchPhase, touch: u64, x: f64, y: f64, taps: u8 },
+    /// Two fingers, or a trackpad, changed their distance over a point
+    /// by `scale`.
+    Magnify { id: String, x: f64, y: f64, scale: f64 },
     Key { id: String, key: String, modifiers: u32 },
     Text { id: String, text: String },
     Override { id: String, site: SiteKey, op: OverrideOp, patch: Patch },
@@ -653,7 +673,7 @@ pub fn decode(kind: u8, payload: &[u8]) -> Result<Received, Malformed> {
     let mut cursor = Cursor { bytes: payload, at: 0, kind };
     let message = match kind {
         kind::HELLO..=kind::PONG => Message::ToIde(ToIde::get(&mut cursor)?),
-        kind::SELECT..=kind::BYE => Message::ToHost(ToHost::get(&mut cursor)?),
+        kind::SELECT..=kind::MAGNIFY => Message::ToHost(ToHost::get(&mut cursor)?),
         _ => return Ok(Received::Unknown { kind, len: payload.len() as u32 }),
     };
     if cursor.at != payload.len() {
@@ -838,6 +858,7 @@ tagged_enum!(Device { IPhone16 = 0, IPhone16ProMax = 1, IPadPro11 = 2, Pixel9 = 
 tagged_enum!(Direction { LeftToRight = 0, RightToLeft = 1 });
 tagged_enum!(SizeClass { Compact = 0, Regular = 1 });
 tagged_enum!(PointerKind { Move = 0, Down = 1, Up = 2, Leave = 3 });
+tagged_enum!(TouchPhase { Began = 0, Moved = 1, Ended = 2, Cancelled = 3 });
 tagged_enum!(OverrideOp { Replace = 0, Append = 1, Hide = 2 });
 tagged_enum!(Edge { Top = 0, Bottom = 1, Leading = 2, Trailing = 3 });
 tagged_enum!(Alignment { Leading = 0, Center = 1, Trailing = 2 });
@@ -1695,6 +1716,22 @@ impl ToHost {
                 out.f64(*dy);
                 kind::WHEEL
             }
+            ToHost::Touch { id, phase, touch, x, y, taps } => {
+                out.string(id);
+                phase.put(out);
+                out.u64(*touch);
+                out.f64(*x);
+                out.f64(*y);
+                out.u8(*taps);
+                kind::TOUCH
+            }
+            ToHost::Magnify { id, x, y, scale } => {
+                out.string(id);
+                out.f64(*x);
+                out.f64(*y);
+                out.f64(*scale);
+                kind::MAGNIFY
+            }
             ToHost::Key { id, key, modifiers } => {
                 out.string(id);
                 out.string(key);
@@ -1740,6 +1777,8 @@ impl ToHost {
             kind::RESIZE => ToHost::Resize { id: c.string()?, size: Size::get(c)? },
             kind::POINTER => ToHost::Pointer { id: c.string()?, kind: PointerKind::get(c)?, x: c.f64()?, y: c.f64()?, modifiers: c.u32()? },
             kind::WHEEL => ToHost::Wheel { id: c.string()?, x: c.f64()?, y: c.f64()?, dx: c.f64()?, dy: c.f64()? },
+            kind::TOUCH => ToHost::Touch { id: c.string()?, phase: TouchPhase::get(c)?, touch: c.u64()?, x: c.f64()?, y: c.f64()?, taps: c.u8()? },
+            kind::MAGNIFY => ToHost::Magnify { id: c.string()?, x: c.f64()?, y: c.f64()?, scale: c.f64()? },
             kind::KEY => ToHost::Key { id: c.string()?, key: c.string()?, modifiers: c.u32()? },
             kind::TEXT => ToHost::Text { id: c.string()?, text: c.string()? },
             kind::OVERRIDE => ToHost::Override { id: c.string()?, site: SiteKey::get(c)?, op: OverrideOp::get(c)?, patch: Patch::get(c)? },

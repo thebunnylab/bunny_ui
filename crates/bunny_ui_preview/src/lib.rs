@@ -25,7 +25,9 @@
 //!   wire's and back, a `Patch` to a `Modifier`.
 //! - With the `host` feature, [`host`]: the runner an app becomes under
 //!   `bunny preview` — one scene per selected variant, the panic boundary,
-//!   the serving loop and the headless check.
+//!   the serving loop, the headless check, and a snapshot on request: the
+//!   frame's pixels through the scene's own engines, what `bunny preview
+//!   --png` writes.
 //!
 //! ## Production gotchas
 //!

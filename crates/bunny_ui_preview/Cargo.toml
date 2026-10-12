@@ -24,6 +24,10 @@ host = ["core", "dep:bunny-ui-hot"]
 bunny-ui-core = { workspace = true, optional = true, default-features = false }
 bunny-ui-hot = { workspace = true, optional = true }
 
+[dev-dependencies]
+# the host's tests pinch a custom box
+bunny-ui-core = { workspace = true, default-features = false, features = ["canvas"] }
+
 [[test]]
 name = "convert"
 required-features = ["core"]

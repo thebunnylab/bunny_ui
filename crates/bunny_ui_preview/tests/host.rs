@@ -43,6 +43,56 @@ fn make_boom() -> Output {
     Output::of(Boom)
 }
 
+/// A box that zooms under two fingers, and says how far.
+#[derive(Clone)]
+struct Zoomer {
+    scale: State<f64>,
+}
+
+struct Pinch {
+    scale: State<f64>,
+}
+
+impl CustomElement for Pinch {
+    fn paint(&self, _: &PaintCtx, _: &mut Painter) {}
+
+    fn event(&self, event: &ElementEvent, _: &EventCtx) -> Response {
+        match event {
+            ElementEvent::Magnify { scale, .. } => {
+                self.scale.set(self.scale.get() * scale);
+                Response::handled()
+            }
+            _ => Response::ignored(),
+        }
+    }
+}
+
+impl Component for Zoomer {
+    fn body(self) -> impl View {
+        vstack!(text!("zoom {:.1}", self.scale), custom(Pinch { scale: self.scale }).frame(100.0, 100.0).id("pinch"))
+    }
+}
+
+/// A button that counts, as the template's does.
+#[derive(Clone)]
+struct Tapper {
+    taps: State<i32>,
+}
+
+impl Component for Tapper {
+    fn body(self) -> impl View {
+        vstack!(text!("taps {}", self.taps), button(text("tap"), move || self.taps.add(1)))
+    }
+}
+
+fn make_zoomer() -> Output {
+    Output::of(Zoomer { scale: State::new(1.0) })
+}
+
+fn make_tapper() -> Output {
+    Output::of(Tapper { taps: State::new(0) })
+}
+
 static CARD: PreviewEntry = PreviewEntry::new(
     Meta { ident: "card", name: "Card", scope: "Cards", example: "card", module: "host", file: "src/lib.rs", line: 3 },
     make_card,
@@ -52,10 +102,31 @@ static BOOM: PreviewEntry = PreviewEntry::new(
     make_boom,
 );
 
+static ZOOMER: PreviewEntry = PreviewEntry::new(
+    Meta { ident: "zoomer", name: "Zoomer", scope: "Gestures", example: "zoomer", module: "host", file: "src/lib.rs", line: 11 },
+    make_zoomer,
+);
+static TAPPER: PreviewEntry = PreviewEntry::new(
+    Meta { ident: "tapper", name: "Tapper", scope: "Gestures", example: "tapper", module: "host", file: "src/lib.rs", line: 14 },
+    make_tapper,
+);
+
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
 pub fn bunny_preview__card() -> &'static PreviewEntry {
     &CARD
+}
+
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+pub fn bunny_preview__zoomer() -> &'static PreviewEntry {
+    &ZOOMER
+}
+
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+pub fn bunny_preview__tapper() -> &'static PreviewEntry {
+    &TAPPER
 }
 
 #[unsafe(no_mangle)]
@@ -71,7 +142,7 @@ fn manifest_dir() -> PathBuf {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
         dir.join("src/lib.rs"),
-        "use bunny_ui::prelude::*;\n\n#[preview(name = \"Card\", scope = \"Cards\")]\nfn card() -> impl View { text(\"\") }\n\n#[preview(name = \"Boom\", scope = \"Cards\")]\nfn boom() -> impl View { text(\"\") }\n\n#[preview]\nfn ghost() -> impl View { text(\"\") }\n",
+        "use bunny_ui::prelude::*;\n\n#[preview(name = \"Card\", scope = \"Cards\")]\nfn card() -> impl View { text(\"\") }\n\n#[preview(name = \"Boom\", scope = \"Cards\")]\nfn boom() -> impl View { text(\"\") }\n\n#[preview]\nfn ghost() -> impl View { text(\"\") }\n\n#[preview(name = \"Zoomer\", scope = \"Gestures\")]\nfn zoomer() -> impl View { text(\"\") }\n\n#[preview(name = \"Tapper\", scope = \"Gestures\")]\nfn tapper() -> impl View { text(\"\") }\n",
     )
     .unwrap();
     dir
@@ -122,7 +193,7 @@ fn hello_lists_what_the_binary_exports_and_names_what_it_does_not() {
     match &messages[1] {
         ToIde::Ready { generation: 0, previews, missing } => {
             let idents: Vec<&str> = previews.iter().map(|p| p.ident.as_str()).collect();
-            assert_eq!(idents, ["card", "boom"]);
+            assert_eq!(idents, ["card", "boom", "zoomer", "tapper"]);
             assert_eq!(previews[0].id, "src/lib.rs#card");
             assert_eq!(previews[0].scope, "Cards");
             assert_eq!(previews[0].traits, Traits::default());
@@ -190,7 +261,7 @@ fn the_small_talk_is_answered() {
     host.handle(ToHost::Forget { keys: vec![1] });
     let messages = seen.borrow_mut().drain(..).collect::<Vec<_>>();
     assert!(matches!(messages[0], ToIde::Pong { nonce: 9 }));
-    assert!(matches!(&messages[1], ToIde::Status { text } if text.contains("snapshots")));
+    assert!(matches!(&messages[1], ToIde::Status { text } if text.contains("not selected")));
     host.handle(select("card", Traits::default()));
     host.handle(ToHost::Override {
         id: String::from("src/lib.rs#card"),
@@ -268,3 +339,81 @@ fn an_override_stands_in_for_one_of_its_kind_and_stacks_beside_another() {
     host.handle(put(wire::OverrideOp::Append, wire::Patch::Opacity(0.5)));
     assert_eq!(host.overrides_of(&id), 3, "another modifier appended stacks");
 }
+
+fn fixed(width: f64, height: f64) -> Traits {
+    Traits { size: wire::Sizing::Fixed(wire::Size { width, height }), ..Traits::default() }
+}
+
+fn says(frame: &wire::Frame, text: &str) -> bool {
+    frame.strings.iter().any(|s| s.contains(text))
+}
+
+/// A snapshot is the frame's own pixels: the scene's display list painted
+/// through the engines it was laid out with — what `Runtime::frame`
+/// paints for the same view at the same size.
+#[test]
+fn a_snapshot_is_the_frames_pixels() {
+    let (mut host, seen) = host();
+    let id = String::from("src/lib.rs#card");
+    host.handle(select("card", fixed(120.0, 60.0)));
+    assert!(host.tick());
+    let frame = frames(&seen).remove(0);
+    assert_eq!(frame.size, wire::Size { width: 120.0, height: 60.0 });
+    host.handle(ToHost::RequestSnapshot { id });
+    let messages = seen.borrow_mut().drain(..).collect::<Vec<_>>();
+    let (size, rgba) = match &messages[..] {
+        [ToIde::Snapshot { preview, variant: 0, size, rgba }] if preview == "card" => (*size, rgba.clone()),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(size, (120, 60));
+    let runtime = Runtime::new();
+    let display = runtime.display_frame(&Card, bunny_ui::layout::Size { width: 120.0, height: 60.0 });
+    let expected = bunny_ui::raster::rasterize(&display, 120, 60, Theme::light().canvas).to_rgba_bytes();
+    assert_eq!(rgba.len(), expected.len());
+    assert!(rgba == expected, "the snapshot is the frame painted");
+    let (pixels, _) = rgba.as_chunks::<4>();
+    assert!(pixels.iter().any(|px| px != &pixels[0]), "something was painted");
+    host.handle(ToHost::RequestSnapshot { id: String::from("src/lib.rs#ghost") });
+    assert!(matches!(&seen.borrow()[..], [ToIde::Status { text }] if text.contains("not selected")));
+}
+
+/// A magnify over a box reaches it: the pinch zooms, the label follows.
+#[test]
+fn a_magnify_reaches_the_box_under_the_point() {
+    let (mut host, seen) = host();
+    let id = String::from("src/lib.rs#zoomer");
+    host.handle(select("zoomer", fixed(200.0, 200.0)));
+    assert!(host.tick());
+    let frame = frames(&seen).remove(0);
+    assert!(says(&frame, "zoom 1.0"), "{:?}", frame.strings);
+    // a custom box records no site of its own: the stack sits at the
+    // origin, the label above the 100-point box — the pinch lands in
+    // the box's middle
+    host.handle(ToHost::Magnify { id: id.clone(), x: 50.0, y: 70.0, scale: 1.5 });
+    assert!(host.tick(), "the pinch repaints");
+    let frame = frames(&seen).remove(0);
+    assert!(says(&frame, "zoom 1.5"), "{:?}", frame.strings);
+    // beside the box, nothing zooms
+    host.handle(ToHost::Magnify { id, x: 190.0, y: 190.0, scale: 2.0 });
+    assert!(!host.tick());
+}
+
+/// A finger on the button counts like a click: began and ended at its
+/// centre, the label says one.
+#[test]
+fn a_touch_on_the_button_counts() {
+    let (mut host, seen) = host();
+    let id = String::from("src/lib.rs#tapper");
+    host.handle(select("tapper", fixed(200.0, 120.0)));
+    assert!(host.tick());
+    let frame = frames(&seen).remove(0);
+    assert!(says(&frame, "taps 0"), "{:?}", frame.strings);
+    let button = frame.sites.iter().find(|site| frame.strings.get(site.kind as usize).is_some_and(|kind| kind == "button")).expect("the button has a site");
+    let (x, y) = (button.frame.origin.x + button.frame.size.width / 2.0, button.frame.origin.y + button.frame.size.height / 2.0);
+    host.handle(ToHost::Touch { id: id.clone(), phase: wire::TouchPhase::Began, touch: 1, x, y, taps: 1 });
+    host.handle(ToHost::Touch { id, phase: wire::TouchPhase::Ended, touch: 1, x, y, taps: 1 });
+    assert!(host.tick(), "the tap repaints");
+    let frame = frames(&seen).remove(0);
+    assert!(says(&frame, "taps 1"), "{:?}", frame.strings);
+}
+

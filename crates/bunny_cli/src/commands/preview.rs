@@ -2,21 +2,24 @@
 //! and keep them rendered — a save reloads the code, and each new frame
 //! shows up here as a line.
 
+use std::collections::HashSet;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-use bunny_ui_preview::wire::{Selection, ToHost, ToIde, Traits};
+use bunny_ui_preview::wire::{Scheme, Selection, Size, Sizing, ToHost, ToIde, Traits};
 
 use crate::args::{HELP, Matches, Opt};
 use crate::commands::doctor;
 use crate::devices::Platform;
 use crate::error::{Error, Result};
+use crate::formats::png;
 use crate::keys::{INTERRUPT, Keys};
 use crate::preview::{Event, Options, Preview, Step};
 use crate::term;
 
 pub const SUMMARY: &str = "Render the app's #[preview] functions, and keep them rendered as you save";
 
-pub const USAGE: &str = "bunny preview [NAME...] [--list] [--json] [OPTIONS]";
+pub const USAGE: &str = "bunny preview [NAME...] [--list] [--json] [--png DIR] [OPTIONS]";
 
 pub const ABOUT: &str = "\
 Lists the previews the app's sources mark with #[preview] (--list), or
@@ -25,13 +28,22 @@ no window — and renders the named previews (every preview, when none is
 named). Each frame the host sends shows up as a line; a save reloads the
 app's code hot and the frames follow.
 
-While it runs: r reloads now, R restarts the host, q stops it.";
+While it runs: r reloads now, R restarts the host, q stops it.
+
+With --png DIR each named preview is rendered once, its pixels asked of
+the host — the same picture the frame paints, through the app's own
+text and image engines — and written as DIR/<ident>.png; then the host
+stops. --size WxH renders at that size in points instead of what each
+view wants, --dark under the dark scheme.";
 
 pub const OPTIONS: &[Opt] = &[
     Opt::flag("list", "List the previews the sources mark, without building"),
     Opt::flag("json", "With --list: the list as JSON"),
     Opt::value("features", "LIST", "Cargo features to turn on (repeatable)"),
     Opt::value("package", "NAME", "The app, in a workspace of several").short('p'),
+    Opt::value("png", "DIR", "Render each preview once to DIR/<ident>.png, then stop"),
+    Opt::value("size", "WxH", "With --png: render at this size in points, not what each view wants"),
+    Opt::flag("dark", "With --png: render under the dark scheme"),
     HELP,
 ];
 
@@ -56,6 +68,7 @@ pub fn run(matches: &Matches) -> Result<()> {
     }
     doctor::preflight(Platform::host())?;
     let wanted: Vec<String> = matches.positionals.clone();
+    let traits = traits_of(matches)?;
     let mut events = Vec::new();
     println!("{}", term::bold("Building the app with its previews…"));
     let began = Instant::now();
@@ -68,7 +81,98 @@ pub fn run(matches: &Matches) -> Result<()> {
     };
     render(&events, &wanted);
     println!("{} {}", term::ok("Host up"), term::dim(&format!("(built in {:.1}s)", began.elapsed().as_secs_f32())));
-    watch(live, wanted)
+    match matches.value("png") {
+        Some(dir) => pictures(live, wanted, Path::new(dir), traits),
+        None => watch(live, wanted),
+    }
+}
+
+/// The traits `--size` and `--dark` ask for.
+fn traits_of(matches: &Matches) -> Result<Traits> {
+    let size = match matches.value("size") {
+        Some(spec) => {
+            let (width, height) = spec
+                .split_once(['x', 'X', '×'])
+                .and_then(|(w, h)| Some((w.trim().parse::<f64>().ok()?, h.trim().parse::<f64>().ok()?)))
+                .filter(|(w, h)| *w >= 1.0 && *h >= 1.0)
+                .ok_or_else(|| Error::new(format!("--size wants WxH in points, not `{spec}`")).hint("for example --size 390x844"))?;
+            Sizing::Fixed(Size { width, height })
+        }
+        None => Sizing::Fits,
+    };
+    let scheme = if matches.flag("dark") { Scheme::Dark } else { Scheme::Light };
+    Ok(Traits { scheme, size, ..Traits::default() })
+}
+
+/// `--png`: every wanted preview rendered once under `traits`, its pixels
+/// asked of the host after its first frame and written as
+/// `DIR/<ident>.png` (`<ident>-v<n>.png` past the first variant); then
+/// the host stops.
+fn pictures(mut live: Preview<crate::preview::Live>, wanted: Vec<String>, dir: &Path, traits: Traits) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|error| Error::new(format!("{}: {error}", dir.display())))?;
+    let until = Instant::now() + Duration::from_secs(120);
+    let mut events = Vec::new();
+    let mut selected = false;
+    let mut pending: Vec<String> = Vec::new();
+    let mut asked: HashSet<String> = HashSet::new();
+    let mut written = 0usize;
+    loop {
+        let alive = live.wait(Duration::from_millis(50), &mut events);
+        for event in events.drain(..) {
+            match &event {
+                Event::Host(ToIde::Ready { previews, .. }) if !selected => {
+                    let chosen: Vec<Selection> = previews
+                        .iter()
+                        .filter(|preview| wanted.is_empty() || wanted.iter().any(|name| *name == preview.ident || *name == preview.name))
+                        .map(|preview| Selection { id: preview.id.clone(), ident: preview.ident.clone(), traits: traits.clone() })
+                        .collect();
+                    if chosen.is_empty() {
+                        live.stop();
+                        return Err(Error::new(format!("none of {wanted:?} is a preview of this app")).hint("`bunny preview --list` names them"));
+                    }
+                    pending = chosen.iter().map(|selection| selection.id.clone()).collect();
+                    let _ = live.send(&ToHost::Select(chosen));
+                    selected = true;
+                }
+                Event::Host(ToIde::Frame(frame)) => {
+                    // the scene's first frame: its pixels, once
+                    let suffix = format!("#{}", frame.preview);
+                    if let Some(id) = pending.iter().find(|id| id.ends_with(&suffix)).cloned()
+                        && asked.insert(id.clone())
+                    {
+                        let _ = live.send(&ToHost::RequestSnapshot { id });
+                    }
+                }
+                Event::Host(ToIde::Snapshot { preview, variant, size, rgba }) => {
+                    let name = if *variant == 0 { format!("{preview}.png") } else { format!("{preview}-v{variant}.png") };
+                    let path = dir.join(&name);
+                    std::fs::write(&path, png::encode(size.0, size.1, rgba)?).map_err(|error| Error::new(format!("{}: {error}", path.display())))?;
+                    println!("{} {}", term::ok(&path.display().to_string()), term::dim(&format!("{}×{}", size.0, size.1)));
+                    written += 1;
+                    let suffix = format!("#{preview}");
+                    pending.retain(|id| !id.ends_with(&suffix));
+                }
+                Event::BuildFailed { .. } | Event::Crashed { .. } => {
+                    print_event(&event, &wanted);
+                    live.stop();
+                    return Err(Error::new("no pictures: the host did not render"));
+                }
+                _ => print_event(&event, &wanted),
+            }
+        }
+        if selected && pending.is_empty() {
+            live.stop();
+            println!("{}", term::dim(&format!("{written} picture(s) in {}", dir.display())));
+            return Ok(());
+        }
+        if !alive {
+            return Err(Error::new("the host ended before its pictures were taken"));
+        }
+        if Instant::now() > until {
+            live.stop();
+            return Err(Error::new(format!("the host sent no picture of {pending:?} within 120 s")));
+        }
+    }
 }
 
 /// The list: `scope / name — example (file:line)`.

@@ -2,7 +2,8 @@
 //! writes, built hot with its preview entries and started as a host; the
 //! template's own `home_preview` selected and framed; a click on its
 //! button answered with a new frame; a save reloaded with the count kept.
-//! Every step prints `@@bunny-timing <step> <ms>`, and under
+//! Then `bunny preview --png` takes a picture of the same preview through
+//! the host's snapshot door. Every step prints `@@bunny-timing <step> <ms>`, and under
 //! `BUNNY_TIMING_STRICT=1` the budgets of NFR-STUDIO-1 are asserted:
 //! a warm start to the first frame within 3 s, a save to its frame within
 //! 800 ms, a click and an override to their frames within 20 ms each.
@@ -212,5 +213,22 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
     assert!(frame.generation >= 2);
 
     live.stop();
+
+    // a picture: `bunny preview --png` starts the host again on the warm
+    // target, asks for the preview's pixels and stops
+    let pictures = here.join("pictures");
+    let began = Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_bunny"))
+        .args(["preview", "--png"])
+        .arg(&pictures)
+        .args(["--size", "320x200", "home_preview"])
+        .current_dir(&app)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    timing("png", began.elapsed(), None);
+    let png = fs::read(pictures.join("home_preview.png")).expect("the picture was written");
+    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    assert_eq!(&png[16..24], &[0, 0, 1, 64, 0, 0, 0, 200], "320x200 at scale 1");
     let _ = fs::remove_dir_all(&here);
 }

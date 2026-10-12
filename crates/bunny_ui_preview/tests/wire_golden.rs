@@ -145,6 +145,8 @@ fn every_message() -> Vec<Message> {
         Message::ToHost(ToHost::Resize { id: String::from("src/lib.rs#home"), size: Size { width: 393.0, height: 852.0 } }),
         Message::ToHost(ToHost::Pointer { id: String::from("src/lib.rs#home"), kind: PointerKind::Down, x: 10.0, y: 20.0, modifiers: 4 }),
         Message::ToHost(ToHost::Wheel { id: String::from("src/lib.rs#home"), x: 10.0, y: 20.0, dx: 0.0, dy: -12.0 }),
+        Message::ToHost(ToHost::Touch { id: String::from("src/lib.rs#home"), phase: TouchPhase::Began, touch: 7, x: 10.0, y: 20.0, taps: 2 }),
+        Message::ToHost(ToHost::Magnify { id: String::from("src/lib.rs#home"), x: 10.0, y: 20.0, scale: 1.25 }),
         Message::ToHost(ToHost::Key { id: String::from("src/lib.rs#home"), key: String::from("cmd-s"), modifiers: 8 }),
         Message::ToHost(ToHost::Text { id: String::from("src/lib.rs#home"), text: String::from("ol\u{e1}") }),
         Message::ToHost(ToHost::Override {
