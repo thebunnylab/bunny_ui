@@ -325,7 +325,9 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
             } else {
                 state.marked = Some((start, start + composition.len()));
                 let (location, length) = caret_utf16;
-                state.caret = start + utf16_to_byte(&composition, location + length);
+                let anchor = start + utf16_to_byte(&composition, location);
+                state.caret = start + utf16_to_byte(&composition, location.saturating_add(length));
+                state.anchor = (anchor < state.caret).then_some(anchor);
             }
         }
         EditCommand::Unmark => {
@@ -848,3 +850,7 @@ mod tests {
         assert_eq!(utf16_to_byte(text, 2), 5, "middle of the surrogate lands on the next boundary");
     }
 }
+
+#[cfg(test)]
+#[path = "text_input_composition_tests.rs"]
+mod composition_tests;

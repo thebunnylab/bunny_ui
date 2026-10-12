@@ -71,6 +71,14 @@ jobs:
         run: |
           cargo test -p bunny-ui-motor --locked --all-targets
           BUNNY_PARANOID=all cargo test -p bunny-ui-motor --locked --all-targets
+      - name: Composition selection, normal and paranoid
+        run: |
+          test_status=0
+          cargo test -p bunny-ui-core --locked --lib text_input::composition_tests:: || test_status=$?
+          BUNNY_PARANOID=all cargo test -p bunny-ui-core --locked --lib text_input::composition_tests:: || test_status=$?
+          cargo test -p bunny-ui-core --locked --test field_composition || test_status=$?
+          BUNNY_PARANOID=all cargo test -p bunny-ui-core --locked --test field_composition || test_status=$?
+          exit "$test_status"
       - name: Windows paragraph analysis and glyphs, normal and paranoid
         id: paragraph-boundary
         if: runner.os == 'Windows'
