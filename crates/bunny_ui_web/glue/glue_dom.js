@@ -534,6 +534,9 @@ function lookRules(selector, kind, flags, style, layout, face) {
   if (style.fade !== null) decl.opacity = `${style.fade}`;
   // a layer that asks for nothing: the click belongs to whatever it covers
   if (style.passThrough) decl["pointer-events"] = "none";
+  // `.hidden()`: the box keeps its place in the flow and shows nothing —
+  // visibility, never display, or the sibling would move up
+  if (style.hidden) decl.visibility = "hidden";
   if (style.filter) {
     decl["backdrop-filter"] = style.filter;
     decl["-webkit-backdrop-filter"] = style.filter;
@@ -827,7 +830,7 @@ function applyPatches(view, length) {
   // the three records a look is made of, decoded with no element in
   // hand: a look is defined once (op 21), then worn by class (op 22)
   const readStyle = () => {
-    // the mask carries twenty-four bits, so it crosses as a u32
+    // the mask carries twenty-five bits, so it crosses as a u32
     const mask = u32();
     const style = {
       background: null,
@@ -849,6 +852,7 @@ function applyPatches(view, length) {
       pressedFade: null,
       group: null,
       passThrough: false,
+      hidden: false,
       filter: null,
     };
     if (mask & 1) style.background = rgba(u32());
@@ -924,6 +928,8 @@ function applyPatches(view, length) {
       u32();
     }
     if (mask & 2097152) style.passThrough = true;
+    // bit 24: hidden — the box keeps its place, paints nothing
+    if (mask & 16777216) style.hidden = true;
     if (mask & 4194304) {
       // four corners, clockwise from the top left — the CSS order
       const tl = f32();

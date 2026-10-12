@@ -969,6 +969,10 @@ fn rule_text(
     if style.clip {
         base.insert("overflow", "hidden".into());
     }
+    if style.hidden {
+        // the box keeps its place in the flow and shows nothing
+        base.insert("visibility", "hidden".into());
+    }
     if let Some(opacity) = style.opacity {
         base.insert("opacity", format!("{opacity}"));
     }
@@ -1257,6 +1261,8 @@ mod tests {
     #[test]
     fn the_page_and_the_glue_write_the_same_logical_properties() {
         let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        assert!(glue.contains("if (mask & 16777216) style.hidden = true;"), "the glue reads the hidden bit");
+        assert!(glue.contains("if (style.hidden) decl.visibility = \"hidden\";"), "and keeps the box's place with visibility");
         for name in ["padding-block", "padding-inline"] {
             assert!(glue.contains(&format!("decl[\"{name}\"]")), "the glue writes {name}");
         }
@@ -1286,6 +1292,26 @@ mod tests {
     /// The page paints from the string alone: markup with ids, inline
     /// styles at rest, pseudo rules aside — and twice over, the same
     /// bytes (the serializer is deterministic by construction).
+    #[derive(Clone)]
+    struct Unseen;
+
+    impl Component for Unseen {
+        fn body(self) -> impl View {
+            crate::vstack!(text("seen"), text("unseen").hidden(), text("after"))
+        }
+    }
+
+    /// `.hidden()` on the page: the box is in the markup, keeps its
+    /// place, and is unseen by visibility — never left out, or the text
+    /// after it would move up.
+    #[test]
+    fn a_hidden_box_keeps_its_place_unseen() {
+        let page = render(&Unseen, Size { width: 300.0, height: 200.0 });
+        assert!(page.css.contains("visibility:hidden"), "{}", page.css);
+        assert!(page.html.contains("unseen"), "the box is in the markup: {}", page.html);
+        assert!(!page.css.contains("display:none"), "{}", page.css);
+    }
+
     #[test]
     fn a_page_renders_to_stable_html() {
         let size = Size { width: 300.0, height: 200.0 };
