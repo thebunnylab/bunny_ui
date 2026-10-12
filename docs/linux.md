@@ -231,9 +231,12 @@ the Unicode data and fonts.
 
 This resolves each shaped line independently. Paragraph embedding context is
 not carried through separately wrapped lines; font fallback and script
-itemization retain their earlier limits. Mixed-direction caret, selection and
-IME rectangles still use the core's approximate geometry. Correct native glyph
-ordering is not full multilingual editor qualification.
+itemization retain their earlier limits. Editable geometry now uses the same
+HarfBuzz glyph clusters, advances and directional runs as rasterization. GDEF
+ligature caret metadata is translated by the shaped glyph origin when complete;
+otherwise internal cluster positions divide its advance by scalar. Pointer hits
+remain grapheme-safe. This does not establish visual horizontal navigation,
+physical IME behavior, human AT acceptance or full multilingual qualification.
 
 ## Images
 

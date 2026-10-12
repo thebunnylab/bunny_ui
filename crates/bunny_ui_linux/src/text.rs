@@ -486,8 +486,11 @@ impl FreeTypeEngine {
                         shaped.push(Shaped {
                             face,
                             glyph: info.codepoint,
-                            #[cfg(test)]
                             cluster: info.cluster,
+                            fragment_end: range.end,
+                            rtl: directional.direction == bidi::Direction::RightToLeft,
+                            pen,
+                            advance: i64::from(position.x_advance) + tracking,
                             x: pen + i64::from(position.x_offset),
                             y: i64::from(position.y_offset),
                         });
@@ -573,8 +576,11 @@ fn fixed_26_6(points: f64) -> i64 {
 struct Shaped {
     face: Face,
     glyph: u32,
-    #[cfg(test)]
     cluster: u32,
+    fragment_end: usize,
+    rtl: bool,
+    pen: i64,
+    advance: i64,
     /// 26.6 pen position (x includes the run base and the offset).
     x: i64,
     y: i64,
@@ -583,7 +589,18 @@ struct Shaped {
 /// fontconfig's weight for each `Weight`, in the key's order.
 const FC_WEIGHTS: [c_int; 6] = [80, 100, 180, 200, 205, 210];
 
+#[path = "text_geometry.rs"]
+mod geometry;
+
 impl TextEngine for FreeTypeEngine {
+    fn line_geometry(
+        &self,
+        text: &str,
+        font: &FontSpec,
+    ) -> Option<bunny_ui::text_geometry::LineGeometry> {
+        geometry::line_geometry(self, text, font)
+    }
+
     fn families(&self) -> Vec<std::sync::Arc<str>> {
         if self.config.is_null() {
             return self.registered_names();
@@ -884,3 +901,7 @@ mod tests {
 #[cfg(test)]
 #[path = "text_bidi_tests.rs"]
 mod bidi_tests;
+
+#[cfg(test)]
+#[path = "text_geometry_tests.rs"]
+mod geometry_tests;

@@ -28,7 +28,8 @@ use crate::layout::{
 };
 use crate::reconciler;
 use crate::image_engine::{ImageEngine, RawImages};
-use crate::text_engine::{FontSpec, MeasureCache, PixelFont, TextEngine, caret_from_x};
+use crate::text_engine::{FontSpec, MeasureCache, PixelFont, TextEngine, line_caret_x, line_hit};
+use crate::text_geometry::{CaretAffinity, CaretHit};
 use crate::text_input::{CaretState, EditCommand, word_around};
 use crate::view::{NodeList, View};
 
@@ -585,6 +586,7 @@ impl Runtime {
     /// `Runtime::new().text_engine(Rc::new(CoreTextEngine::new()))`.
     pub fn text_engine(mut self, engine: Rc<dyn TextEngine>) -> Self {
         self.text = engine;
+        self.cache = MeasureCache::default();
         self
     }
 
@@ -3950,8 +3952,15 @@ impl Runtime {
         *self.focus.borrow_mut() = Some(path.to_string());
         self.sync_field_focus();
         if reconciler::has_editor(path) {
-            self.carets.borrow_mut().entry(path.to_string())
-                .or_insert(CaretState { caret: usize::MAX, anchor: None, marked: None });
+            self.carets
+                .borrow_mut()
+                .entry(path.to_string())
+                .or_insert(CaretState {
+                    affinity: CaretAffinity::Downstream,
+                    caret: usize::MAX,
+                    anchor: None,
+                    marked: None,
+                });
         }
         if !moved {
             return;
@@ -3963,8 +3972,8 @@ impl Runtime {
     }
 
     /// The press that opens a selection: focuses, puts the caret under
-    /// the pointer's X (prefix measurement with the field's effective
-    /// FONT, retained from the last layout) and DROPS THE ANCHOR there
+    /// the pointer's X in the shaped line retained by the cache, using
+    /// the field's effective font, and DROPS THE ANCHOR there
     /// — the sweep that follows extends from it.
     ///
     /// The count picks the unit, the way every text field does it: two
@@ -3977,32 +3986,54 @@ impl Runtime {
         let held = self.focus.borrow().as_deref() == Some(path);
         *self.focus.borrow_mut() = Some(path.to_string());
         self.sync_field_focus();
-        let Some((text, caret, line)) = self.caret_under(path, x, y) else {
+        let Some((text, hit, line)) = self.caret_under(path, x, y) else {
             self.carets
                 .borrow_mut()
                 .entry(path.to_string())
-                .or_insert(CaretState { caret: usize::MAX, anchor: None, marked: None });
+                .or_insert(CaretState {
+                    affinity: CaretAffinity::Downstream,
+                    caret: usize::MAX,
+                    anchor: None,
+                    marked: None,
+                });
             return;
         };
+        let caret = hit.byte;
         let previous = self.carets.borrow().get(path).copied().unwrap_or_default();
         let state = match clicks {
             // the third click takes the line under the hand — and a
             // one-line field IS the line
-            3.. => CaretState { caret: line.1, anchor: Some(line.0), marked: None },
+            3.. => CaretState {
+                affinity: CaretAffinity::Upstream,
+                caret: line.1,
+                anchor: Some(line.0),
+                marked: None,
+            },
             2 => {
                 let (start, end) = word_around(&text, caret);
-                CaretState { caret: end, anchor: Some(start), marked: None }
+                CaretState {
+                    affinity: CaretAffinity::Upstream,
+                    caret: end,
+                    anchor: Some(start),
+                    marked: None,
+                }
             }
             // shift extends from where the selection already stood (or
             // from the caret, when there was no selection to extend)
             _ if shift && held => CaretState {
+                affinity: hit.affinity,
                 caret,
                 anchor: Some(previous.anchor.unwrap_or(previous.caret)),
                 marked: None,
             },
             // the plain press collapses and arms: anchor == caret is no
             // selection at all, and the next move gives it width
-            _ => CaretState { caret, anchor: Some(caret), marked: None },
+            _ => CaretState {
+                affinity: hit.affinity,
+                caret,
+                anchor: Some(caret),
+                marked: None,
+            },
         };
         self.field_unit_anchor
             .set((clicks >= 2).then_some((state.anchor.unwrap_or(state.caret), state.caret)));
@@ -4015,10 +4046,11 @@ impl Runtime {
     /// must repaint.
     fn sweep_to(&self, path: &str, x: Px, y: Px) -> bool {
         self.goal_column.set(None);
-        let Some((text, caret, line)) = self.caret_under(path, x, y) else {
+        let Some((text, hit, line)) = self.caret_under(path, x, y) else {
             return false;
         };
         let mut state = self.carets.borrow().get(path).copied().unwrap_or_default();
+        let caret = hit.byte;
         let (anchor, caret) = if let Some((start, end)) = self.field_unit_anchor.get() {
             let target = if self.pressed_clicks.get() == 2 {
                 word_around(&text, caret)
@@ -4033,11 +4065,21 @@ impl Runtime {
         } else {
             (state.anchor.unwrap_or(state.caret), caret)
         };
-        if state.caret == caret && state.anchor == Some(anchor) {
+        let affinity = if self.field_unit_anchor.get().is_some() {
+            if caret < anchor {
+                CaretAffinity::Downstream
+            } else {
+                CaretAffinity::Upstream
+            }
+        } else {
+            hit.affinity
+        };
+        if state.caret == caret && state.anchor == Some(anchor) && state.affinity == affinity {
             return false;
         }
         state.anchor = Some(anchor);
         state.caret = caret;
+        state.affinity = affinity;
         self.carets.borrow_mut().insert(path.to_string(), state);
         self.caret_phase.set(CaretPhase::Held);
         self.reveal_caret(path);
@@ -4053,7 +4095,12 @@ impl Runtime {
     /// The line comes from the pointer, never from the byte: a caret
     /// sitting exactly on a break belongs to the line it was typed on,
     /// and a third click there must still take the line under the hand.
-    fn caret_under(&self, path: &str, x: Px, y: Px) -> Option<(std::sync::Arc<str>, usize, (usize, usize))> {
+    fn caret_under(
+        &self,
+        path: &str,
+        x: Px,
+        y: Px,
+    ) -> Option<(std::sync::Arc<str>, CaretHit, (usize, usize))> {
         let mut probe = CaretState::default();
         let text = reconciler::read_editor(path, &mut probe)?;
         let placement = self.field_at(path);
@@ -4076,17 +4123,41 @@ impl Runtime {
                 let row = (row.max(0.0) as usize).min(lines.len().saturating_sub(1));
                 let (start, end) = lines[row];
                 let along = self.field_line_x(&field, path, &seen[start..end], x);
-                let caret = start
-                    + caret_from_x(&seen[start..end], along, &field.font, &*self.text, &self.cache);
-                (home(caret), (home(start), home(end)))
+                let hit = line_hit(
+                    &seen[start..end],
+                    along,
+                    &field.font,
+                    &*self.text,
+                    &self.cache,
+                );
+                (
+                    CaretHit {
+                        byte: home(start + hit.byte),
+                        ..hit
+                    },
+                    (home(start), home(end)),
+                )
             }
             Some(field) => {
                 let along = self.field_line_x(&field, path, seen, x);
-                (home(caret_from_x(seen, along, &field.font, &*self.text, &self.cache)), whole)
+                let hit = line_hit(seen, along, &field.font, &*self.text, &self.cache);
+                (
+                    CaretHit {
+                        byte: home(hit.byte),
+                        ..hit
+                    },
+                    whole,
+                )
             }
             // before the first layout there is no run to measure
             // against: the caret goes to the end, as it always did
-            None => (text.len(), whole),
+            None => (
+                CaretHit {
+                    byte: text.len(),
+                    affinity: CaretAffinity::Upstream,
+                },
+                whole,
+            ),
         };
         Some((text, caret, line))
     }
@@ -4101,12 +4172,10 @@ impl Runtime {
     ) -> (Px, Px, bool) {
         let anchor_rtl = field.direction.is_rtl();
         let line_rtl = crate::text_input::reads_right_to_left(line);
-        if !anchor_rtl && !line_rtl
-            && matches!(field.text_align, None | Some(motor::views::TextAlignment::Leading))
-        {
-            return (field.text_origin.x, 0.0, false);
-        }
-        let width = self.cache.get_or_measure(line, &field.font, &*self.text).width;
+        let width = self
+            .cache
+            .get_or_measure(line, &field.font, &*self.text)
+            .width;
         // a wrapped field never rolls sideways; a one-line one does
         let offset_x = if field.multiline {
             0.0
@@ -4116,9 +4185,7 @@ impl Runtime {
         (crate::layout::field_run_x(field.run, offset_x, width, field.text_align, anchor_rtl, line_rtl), width, line_rtl)
     }
 
-    /// The pointer's distance along one visual line of a field, from the
-    /// line's logical START — from its right end on a right-to-left
-    /// line — which is what `caret_from_x` measures prefixes against.
+    /// The pointer's distance from the visual left origin of the shaped line.
     fn field_line_x(
         &self,
         field: &crate::layout::FieldPlacement,
@@ -4126,8 +4193,8 @@ impl Runtime {
         line: &str,
         x: Px,
     ) -> Px {
-        let (line_x, width, line_rtl) = self.field_line(field, path, line);
-        if line_rtl { line_x + width - x } else { x - line_x }
+        let (line_x, _, _) = self.field_line(field, path, line);
+        x - line_x
     }
 
     /// The geometry the last layout recorded for a field.
@@ -4154,15 +4221,15 @@ impl Runtime {
     }
 
     /// Where a byte of a field's text stands, as a caret-wide rect in the
-    /// scene: the input method places its window by it. A note answers
-    /// from its own lines — the byte's line, and the stretch of that line
-    /// before it — so nothing is shaped but one line's head; a one-line
-    /// field measures its head as it always did. The height is the line's.
+    /// scene: the input method places its window by it. The complete
+    /// displayed line supplies the scalar position and directional affinity;
+    /// masked fields map that position back to the original text.
     fn field_byte_rect(
         &self,
         field: &crate::layout::FieldPlacement,
         text: &std::sync::Arc<str>,
         byte: usize,
+        affinity: CaretAffinity,
     ) -> Rect {
         let byte = crate::text_input::clamp_index(text, byte);
         // Native ranges name the real string, but their rectangles follow
@@ -4182,13 +4249,19 @@ impl Runtime {
         } else {
             (0, text.len(), 0)
         };
-        let head = self.cache.get_or_measure(&text[start..byte], &field.font, &*self.text).width;
-        // the line's own start, width and direction — the placement's
-        // formulas, read back for the line the byte is on
-        let (line_x, width, line_rtl) = self.field_line(field, &field.path, &text[start..end]);
+        let line = &text[start..end];
+        let head = line_caret_x(
+            line,
+            byte - start,
+            affinity,
+            &field.font,
+            &*self.text,
+            &self.cache,
+        );
+        let (line_x, _, _) = self.field_line(field, &field.path, line);
         Rect {
             origin: Point {
-                x: crate::layout::field_glyph_x(line_x, width, line_rtl, head),
+                x: line_x + head,
                 y: field.text_origin.y + row as Px * field.line_height,
             },
             size: crate::layout::Size { width: 1.5, height: field.line_height },
@@ -4210,8 +4283,8 @@ impl Runtime {
         let Some(lent) = reconciler::read_editor(path, &mut probe) else {
             return;
         };
-        let caret = self.carets.borrow().get(path).map(|state| state.caret).unwrap_or(0);
-        let caret = crate::text_input::clamp_index(&lent, caret);
+        let state = self.carets.borrow().get(path).copied().unwrap_or_default();
+        let caret = crate::text_input::clamp_index(&lent, state.caret);
         // what scrolls is what is drawn: bullets for a secret field
         let shown = if field.secret {
             crate::text_input::masked(&lent)
@@ -4252,9 +4325,23 @@ impl Runtime {
                 lines.len() as Px * field.line_height,
             );
         } else {
-            let caret_x =
-                self.cache.get_or_measure(&text[..caret], &field.font, &*self.text).width;
-            let full = self.cache.get_or_measure(text, &field.font, &*self.text).width;
+            let visual = line_caret_x(
+                text,
+                caret,
+                state.affinity,
+                &field.font,
+                &*self.text,
+                &self.cache,
+            );
+            let full = self
+                .cache
+                .get_or_measure(text, &field.font, &*self.text)
+                .width;
+            let caret_x = if crate::text_input::reads_right_to_left(text) {
+                full - visual
+            } else {
+                visual
+            };
             offset.x = follow(
                 caret_x,
                 offset.x,
@@ -4321,9 +4408,17 @@ impl Runtime {
         // the column the walk keeps: taken from where the caret stands
         // and RETAINED, so crossing a short line does not lose it
         let column = self.goal_column.get().unwrap_or_else(|| {
-            self.cache
-                .get_or_measure(&text[lines[row].0..caret], &field.font, &*self.text)
-                .width
+            let (start, end) = lines[row];
+            let line = &text[start..end];
+            self.field_line(&field, path, line).0
+                + line_caret_x(
+                    line,
+                    caret - start,
+                    state.affinity,
+                    &field.font,
+                    &*self.text,
+                    &self.cache,
+                )
         });
         let target = match (down, row) {
             (true, row) => row + 1,
@@ -4332,18 +4427,19 @@ impl Runtime {
         };
         let landed = match lines.get(target) {
             Some(&(start, end)) => {
-                start
-                    + caret_from_x(
-                        &text[start..end],
-                        column,
-                        &field.font,
-                        &*self.text,
-                        &self.cache,
-                    )
+                let line = &text[start..end];
+                let local = column - self.field_line(&field, path, line).0;
+                let hit = line_hit(line, local, &field.font, &*self.text, &self.cache);
+                CaretHit {
+                    byte: start + hit.byte,
+                    ..hit
+                }
             }
-            // off the top or the bottom: the ends of the text
-            None if down => text.len(),
-            None => 0,
+            None if down => CaretHit {
+                byte: text.len(),
+                affinity: CaretAffinity::Upstream,
+            },
+            None => CaretHit::default(),
         };
         // the same rule the arrows already follow: shift arms the anchor
         // and keeps it, a bare walk drops the selection
@@ -4352,7 +4448,8 @@ impl Runtime {
         } else {
             state.anchor = None;
         }
-        state.caret = landed;
+        state.caret = landed.byte;
+        state.affinity = landed.affinity;
         state.marked = None;
         self.carets.borrow_mut().insert(path.to_string(), state);
         self.caret_phase.set(CaretPhase::Held);
@@ -4506,9 +4603,14 @@ impl Runtime {
             .iter()
             .find(|field| field.path == path)
             .cloned()?;
-        let caret_rect = self.field_byte_rect(&field, &text, caret);
+        let caret_rect = self.field_byte_rect(&field, &text, caret, state.affinity);
 
-        Some(ImeSnapshot { text, selected, marked, caret_rect })
+        Some(ImeSnapshot {
+            text,
+            selected,
+            marked,
+            caret_rect,
+        })
     }
 
     /// A field's caret, for tests that check what the input method is told.
@@ -4576,8 +4678,8 @@ impl Runtime {
         }
         // Use the pointer's visual row and the same aligned (or masked) run
         // as ordinary clicking, including wrapped and vertically scrolled text.
-        let (text, byte, _) = self.caret_under(&path, x, y)?;
-        Some(crate::text_input::byte_to_utf16(&text, byte))
+        let (text, hit, _) = self.caret_under(&path, x, y)?;
+        Some(crate::text_input::byte_to_utf16(&text, hit.byte))
     }
 
     /// The caret-shaped rect at a UTF-16 index of the focused field, in
@@ -4601,7 +4703,13 @@ impl Runtime {
         let mut probe = CaretState::default();
         let text = reconciler::read_editor(&path, &mut probe)?;
         let byte = crate::text_input::utf16_to_byte(&text, utf16);
-        Some(self.field_byte_rect(&field, &text, byte))
+        let affinity = self
+            .carets
+            .borrow()
+            .get(&path)
+            .filter(|state| state.caret == byte)
+            .map_or(CaretAffinity::Downstream, |state| state.affinity);
+        Some(self.field_byte_rect(&field, &text, byte, affinity))
     }
 
     /// Dom mode's sync door: the BROWSER's input owns the editing there,
@@ -4628,6 +4736,7 @@ impl Runtime {
             );
         }
         state.caret = crate::text_input::utf16_to_byte(content, caret_utf16);
+        state.affinity = CaretAffinity::Downstream;
         state.anchor = None;
         state.marked = None;
         self.carets.borrow_mut().insert(path.to_string(), state);
