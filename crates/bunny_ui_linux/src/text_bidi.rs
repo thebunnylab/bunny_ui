@@ -160,6 +160,19 @@ impl ResolvedText {
         })
     }
 
+    /// Heap storage retained after native analysis; scratch arrays are gone.
+    pub(super) const fn retained_bytes(&self) -> usize {
+        match &self.storage {
+            Storage::Ascii(_) => 0,
+            Storage::Native(native) => {
+                native.bytes.capacity() * size_of::<usize>()
+                    + native.types.capacity() * size_of::<c_uint>()
+                    + native.levels.capacity() * size_of::<i8>()
+                    + native.paragraphs.capacity() * size_of::<Paragraph>()
+            }
+        }
+    }
+
     /// Visual runs retain byte offsets in the original source. Invalid or
     /// mid-scalar boundaries fail explicitly rather than clamping silently.
     pub(super) fn line_runs(&self, range: Range<usize>) -> Result<Vec<Run>, Error> {

@@ -15,12 +15,20 @@
 
 #[path = "text_bidi.rs"]
 mod bidi;
+#[path = "text_shaping.rs"]
+mod shaping;
+#[path = "text_paragraph.rs"]
+mod paragraph;
+#[path = "text_raster.rs"]
+mod raster;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uint, c_void};
 
 use bunny_ui::layout::Color;
+use bunny_ui::text_error::TextError;
+use bunny_ui::text_source::ParagraphLine;
 use bunny_ui::text_engine::{FontDesign, FontSpec, LineMetrics, Slant, TextEngine, TextRaster, Weight};
 
 // MARK: - fontconfig ABI (API-only; patterns are opaque)
@@ -161,7 +169,11 @@ unsafe extern "C" {
     );
     fn hb_buffer_guess_segment_properties(buffer: *mut c_void);
     fn hb_buffer_set_direction(buffer: *mut c_void, direction: c_uint);
-    fn hb_shape(font: *mut c_void, buffer: *mut c_void, features: *const c_void, count: c_uint);
+    fn hb_buffer_allocation_successful(buffer: *mut c_void) -> c_int;
+    fn hb_shape_full(
+        font: *mut c_void, buffer: *mut c_void, features: *const c_void,
+        count: c_uint, shapers: *const *const c_char,
+    ) -> c_int;
     fn hb_buffer_get_glyph_infos(buffer: *mut c_void, length: *mut c_uint) -> *mut HbGlyphInfo;
     fn hb_buffer_get_glyph_positions(buffer: *mut c_void, length: *mut c_uint) -> *mut HbGlyphPos;
     fn hb_buffer_destroy(buffer: *mut c_void);
@@ -204,6 +216,7 @@ struct Shipped {
 /// The text engine backed by the platform stack. Face handles live for
 /// the engine's life (the process, in practice) — fonts do not churn.
 pub struct FreeTypeEngine {
+    paragraphs: RefCell<paragraph::Cache>,
     library: *mut c_void,
     config: *mut c_void,
     faces: RefCell<HashMap<FaceKey, Option<Face>>>,
@@ -222,6 +235,7 @@ impl FreeTypeEngine {
             eprintln!("bunny_ui_linux: the text stack failed to open");
         }
         FreeTypeEngine {
+            paragraphs: RefCell::default(),
             library,
             config,
             faces: RefCell::new(HashMap::new()),
@@ -440,67 +454,18 @@ impl FreeTypeEngine {
         opened
     }
 
-    /// Resolve visual directional runs, then partition each by font coverage.
-    /// Each `HarfBuzz` buffer still receives logical UTF-8 with full text context.
-    /// `tracking` adds 26.6 units after every glyph at the key's scale.
+    /// Legacy isolated-line compatibility uses the same checked native shaper.
     fn shape(&self, text: &str, key: &FaceKey, tracking: i64) -> Option<(Vec<Shaped>, i64)> {
-        let directions = match bidi::runs(text) {
-            Ok(runs) => runs,
+        let result = bidi::runs(text).map_err(shaping::bidi_error).and_then(|runs| {
+            self.shape_runs(text, 0..text.len(), key, tracking, &runs)
+        });
+        match result {
+            Ok(shaped) => Some(shaped),
             Err(error) => {
                 eprintln!("bunny_ui_linux: {error}");
-                return None;
-            }
-        };
-        let text_length = c_int::try_from(text.len()).ok()?;
-        let primary = self.face(key)?;
-        let mut shaped = Vec::new();
-        let mut pen: i64 = 0;
-        for directional in directions {
-            let mut runs = self.face_runs(text, directional.bytes, key, primary);
-            // Font fallback may split a single RTL span. Its fragments must
-            // also be visited right-to-left; reversing UTF-8 would corrupt
-            // clusters and joining, so only the list of logical spans moves.
-            if directional.direction == bidi::Direction::RightToLeft {
-                runs.reverse();
-            }
-            let direction = match directional.direction {
-                bidi::Direction::LeftToRight => 4, // HB_DIRECTION_LTR
-                bidi::Direction::RightToLeft => 5, // HB_DIRECTION_RTL
-            };
-            for (face, range) in runs {
-                let start = c_uint::try_from(range.start).ok()?;
-                let length = c_int::try_from(range.len()).ok()?;
-                unsafe {
-                    let buffer = hb_buffer_create();
-                    hb_buffer_add_utf8(buffer, text.as_ptr().cast(), text_length, start, length);
-                    hb_buffer_set_direction(buffer, direction);
-                    hb_buffer_guess_segment_properties(buffer);
-                    hb_shape(face.hb, buffer, std::ptr::null(), 0);
-                    let mut count = 0;
-                    let infos = hb_buffer_get_glyph_infos(buffer, &raw mut count);
-                    let mut pos_count = 0;
-                    let positions = hb_buffer_get_glyph_positions(buffer, &raw mut pos_count);
-                    for i in 0..count.min(pos_count) as usize {
-                        let info = *infos.add(i);
-                        let position = *positions.add(i);
-                        shaped.push(Shaped {
-                            face,
-                            glyph: info.codepoint,
-                            cluster: info.cluster,
-                            fragment_end: range.end,
-                            rtl: directional.direction == bidi::Direction::RightToLeft,
-                            pen,
-                            advance: i64::from(position.x_advance) + tracking,
-                            x: pen + i64::from(position.x_offset),
-                            y: i64::from(position.y_offset),
-                        });
-                        pen += i64::from(position.x_advance) + tracking;
-                    }
-                    hb_buffer_destroy(buffer);
-                }
+                None
             }
         }
-        Some((shaped, pen))
     }
 
     /// The existing primary-versus-fallback policy, within one direction span.
@@ -593,6 +558,24 @@ const FC_WEIGHTS: [c_int; 6] = [80, 100, 180, 200, 205, 210];
 mod geometry;
 
 impl TextEngine for FreeTypeEngine {
+    fn measure_paragraph_line(
+        &self, line: &ParagraphLine, font: &FontSpec,
+    ) -> Result<LineMetrics, TextError> {
+        self.paragraph_metrics(line, font)
+    }
+
+    fn raster_paragraph_line(
+        &self, line: &ParagraphLine, font: &FontSpec, color: Color, scale: usize,
+    ) -> Result<Option<TextRaster>, TextError> {
+        self.paragraph_raster(line, font, color, scale)
+    }
+
+    fn paragraph_line_geometry(
+        &self, line: &ParagraphLine, font: &FontSpec,
+    ) -> Result<Option<bunny_ui::text_geometry::LineGeometry>, TextError> {
+        self.paragraph_geometry(line, font).map(Some)
+    }
+
     fn line_geometry(
         &self,
         text: &str,
@@ -657,94 +640,19 @@ impl TextEngine for FreeTypeEngine {
         color: Color,
         scale: usize,
     ) -> Option<TextRaster> {
-        let scale = scale.max(1);
-        let key = Self::key(font, scale);
+        let key = Self::key(font, scale.max(1));
         let primary = self.face(&key)?;
         let (ascent, descent) = self.line_box(primary);
-        // the face is built at `scale`, so the spacing is too
-        let (shaped, advance) = self.shape(text, &key, fixed_26_6(font.tracking * scale as f64))?;
-        let width = (advance as f64 / 64.0).ceil() as usize;
-        let baseline = ascent.ceil() as usize;
-        let height = baseline + descent.ceil() as usize;
-        if width == 0 || height == 0 {
-            return None;
-        }
-        let mut rgba = vec![0u8; width * height * 4];
-        for entry in &shaped {
-            unsafe {
-                if FT_Load_Glyph(entry.face.ft, entry.glyph, FT_LOAD_RENDER | FT_LOAD_COLOR) != 0 {
-                    continue;
-                }
-                let slot: *mut c_void = read(entry.face.ft, FACE_GLYPH);
-                if slot.is_null() {
-                    continue;
-                }
-                let bitmap = slot.cast::<u8>().add(SLOT_BITMAP).cast::<c_void>();
-                let rows = read::<u32>(bitmap, BITMAP_ROWS) as usize;
-                let cols = read::<u32>(bitmap, BITMAP_WIDTH) as usize;
-                let pitch = read::<i32>(bitmap, BITMAP_PITCH);
-                let buffer: *const u8 = read(bitmap, BITMAP_BUFFER);
-                let mode = read::<u8>(bitmap, BITMAP_PIXEL_MODE);
-                if buffer.is_null() || rows == 0 || cols == 0 {
-                    continue;
-                }
-                let left = read::<i32>(slot, SLOT_BITMAP_LEFT) as i64;
-                let top = read::<i32>(slot, SLOT_BITMAP_TOP) as i64;
-                let pen_x = (entry.x as f64 / 64.0).round() as i64 + left;
-                let pen_y = baseline as i64 - top - (entry.y as f64 / 64.0).round() as i64;
-                for row in 0..rows {
-                    let target_y = pen_y + row as i64;
-                    if target_y < 0 || target_y >= height as i64 {
-                        continue;
-                    }
-                    let source_row = if pitch >= 0 {
-                        buffer.add(row * pitch as usize)
-                    } else {
-                        buffer.add((rows - 1 - row) * (-pitch) as usize)
-                    };
-                    for col in 0..cols {
-                        let target_x = pen_x + col as i64;
-                        if target_x < 0 || target_x >= width as i64 {
-                            continue;
-                        }
-                        let at = (target_y as usize * width + target_x as usize) * 4;
-                        let px = &mut rgba[at..at + 4];
-                        match mode {
-                            PIXEL_MODE_GRAY => {
-                                let coverage = *source_row.add(col) as u32;
-                                let alpha = ((coverage * color.a as u32 + 127) / 255) as u8;
-                                if alpha > px[3] {
-                                    px[0] = color.r;
-                                    px[1] = color.g;
-                                    px[2] = color.b;
-                                    px[3] = alpha;
-                                }
-                            }
-                            PIXEL_MODE_BGRA => {
-                                // color emoji keep their own colors;
-                                // the bytes arrive premultiplied
-                                let b = *source_row.add(col * 4) as u32;
-                                let g = *source_row.add(col * 4 + 1) as u32;
-                                let r = *source_row.add(col * 4 + 2) as u32;
-                                let a = *source_row.add(col * 4 + 3) as u32;
-                                if a as u8 > px[3] {
-                                    let un = |c: u32| {
-                                        ((c * 255 + a / 2) / a.max(1)).min(255) as u8
-                                    };
-                                    px[0] = un(r);
-                                    px[1] = un(g);
-                                    px[2] = un(b);
-                                    px[3] = a as u8;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+        let (glyphs, advance) = self.shape(text, &key, fixed_26_6(font.tracking * key.scale as f64))?;
+        match raster::render(&glyphs, advance, ascent, descent, color) {
+            Ok(raster) => raster,
+            Err(error) => {
+                eprintln!("bunny_ui_linux: {error}");
+                None
             }
         }
-        Some(TextRaster { width, height, baseline, rgba })
     }
+
 }
 
 // MARK: - tests
