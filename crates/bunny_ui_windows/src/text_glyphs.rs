@@ -3,8 +3,10 @@
 //! ## Wiring
 //! Logical runs use the original analysis source for system font fallback.
 //! Native glyph indices, cluster maps, advances and offsets stay together with
-//! their owning face. Visual L1/L2 ordering and raster/geometry integration are
-//! separate, still-required steps; this boundary does not publish runtime lines.
+//! their owning face. The line module applies visual L1/L2 ordering without
+//! changing those shaping buffers, then supplies runtime geometry and raster.
+//! Native u16 cluster indices bound each shaping span; oversized spans currently
+//! return an explicit preparation error rather than an arbitrary split.
 
 use super::{
     Analyzer, Com, Factories, Guid, Hresult, Prepared, Script, Source, TextError, bidi, com_ok,

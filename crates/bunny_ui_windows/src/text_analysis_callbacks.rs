@@ -176,7 +176,7 @@ unsafe extern "system" fn text_before(
     }
     OK
 }
-unsafe extern "system" fn reading_direction(_this: *mut Source) -> u32 {
+const unsafe extern "system" fn reading_direction(_this: *mut Source) -> u32 {
     // Match IDWriteTextFormat's existing default LTR paragraph base; embedded
     // controls and implicit directions are resolved by AnalyzeBidi itself.
     0
@@ -290,7 +290,7 @@ unsafe extern "system" fn bidi(
     }
     OK
 }
-unsafe extern "system" fn breakpoints(
+const unsafe extern "system" fn breakpoints(
     _this: *mut Sink,
     _position: u32,
     _length: u32,
@@ -300,7 +300,7 @@ unsafe extern "system" fn breakpoints(
     // adapter requests script/bidi analysis, not native line-break analysis.
     OK
 }
-unsafe extern "system" fn sink_number_substitution(
+const unsafe extern "system" fn sink_number_substitution(
     _this: *mut Sink,
     _position: u32,
     _length: u32,

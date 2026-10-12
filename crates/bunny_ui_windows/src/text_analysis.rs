@@ -3,8 +3,8 @@
 //! ## Wiring
 //! Native source/sink callbacks retain the original UTF-16 and engine locale.
 //! Script and bidi output must cover every code unit before it is published.
-//! This boundary is evaluated independently of the existing line-only renderer;
-//! it is not yet connected to the contextual `TextEngine` entry points.
+//! Contextual `TextEngine` operations reuse this immutable analysis through a
+//! bounded cache; each requested line shapes its original source range.
 
 use super::{Com, Factories, Guid, Hresult, com_ok};
 use bunny_ui::text_error::TextError;

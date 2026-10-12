@@ -6,22 +6,23 @@ use std::ffi::c_void;
 // IDWriteTextLayout inherited slots and DWRITE_LINE_METRICS (BOOL is INT32).
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
-struct Metrics {
+pub(super) struct Metrics {
     length: u32,
     trailing_whitespace: u32,
     newline: u32,
-    height: f32,
-    baseline: f32,
+    pub(super) height: f32,
+    pub(super) baseline: f32,
     trimmed: i32,
 }
 #[repr(C)]
-struct LayoutVtbl {
+pub(super) struct LayoutVtbl {
     _pad_0_4: [usize; 5],
     wrapping: unsafe extern "system" fn(*mut c_void, u32) -> Hresult,
     _pad_6_27: [usize; 22],
     width: unsafe extern "system" fn(*mut c_void, f32) -> Hresult,
     _pad_29_58: [usize; 30],
-    lines: unsafe extern "system" fn(*mut c_void, *mut Metrics, u32, *mut u32) -> Hresult,
+    pub(super) lines:
+        unsafe extern "system" fn(*mut c_void, *mut Metrics, u32, *mut u32) -> Hresult,
 }
 
 fn wrapped_layout(

@@ -177,3 +177,7 @@ fn append_clusters(
 #[cfg(test)]
 #[path = "text_line_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "text_line_runtime_tests.rs"]
+mod runtime_tests;
