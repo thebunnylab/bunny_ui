@@ -18,7 +18,19 @@ fn boundaries(text: &str) -> Vec<usize> {
     for character in text.chars() {
         assert!(matches!(
             character,
-            'a' | 'b' | 'c' | 'ب' | 'ت' | 'ث' | 'ل' | 'ا' | '\u{64e}' | '\u{650}'
+            'a' | 'b'
+                | 'c'
+                | 'e'
+                | 'f'
+                | 'i'
+                | 'o'
+                | 'ب'
+                | 'ت'
+                | 'ث'
+                | 'ل'
+                | 'ا'
+                | '\u{64e}'
+                | '\u{650}'
         ));
         if units > 0 && !matches!(character, '\u{64e}' | '\u{650}') {
             edges.push(units);
@@ -255,6 +267,7 @@ fn paragraph_original_context_windows_expose_distant_font_dependencies() {
     let text = format!("a{}c", "b".repeat(128));
     let expected = reference(&engine, &text, &font);
     assert_eq!(expected[0].glyphs, [4]);
+    let mut insufficient = None;
     for context in [1, 8, 128] {
         let actual = overlap(&engine, &text, &font, 1, context).unwrap();
         assert!(
@@ -262,6 +275,10 @@ fn paragraph_original_context_windows_expose_distant_font_dependencies() {
             "insufficient overlap must be detected"
         );
         assert_eq!(actual[0].glyphs, [1]);
+        if let Some(previous) = &insufficient {
+            assert_eq!(&actual, previous, "stable overlap can still be wrong");
+        }
+        insufficient = Some(actual);
         eprintln!(
             "original-context counterexample: context={context} loses the 130-character feature"
         );
@@ -276,10 +293,10 @@ fn paragraph_original_context_windows_refuse_split_clusters_and_oversized_graphe
     let engine = DirectWriteEngine::new();
     let font = FontSpec {
         size: 19.0,
-        family: Family::named("Segoe UI"),
+        family: Family::named("Calibri"),
         ..FontSpec::DEFAULT
     };
-    let text = "بلا".repeat(10);
+    let text = "office".repeat(10);
     let expected = reference(&engine, &text, &font);
     assert!(
         expected.iter().any(|cluster| cluster.source.len() > 1),
@@ -288,6 +305,10 @@ fn paragraph_original_context_windows_refuse_split_clusters_and_oversized_graphe
     let error = overlap(&engine, &text, &font, 1, 8).unwrap_err();
     assert!(error.contains("straddles body"), "{error}");
     eprintln!("original-context explicit refusal: {error}");
+    let font = FontSpec {
+        family: Family::named("Segoe UI"),
+        ..font
+    };
     let text = format!("ب{}", "\u{64e}".repeat(20_000));
     assert_eq!(boundaries(&text), [0, 20_001]);
     let error = overlap(&engine, &text, &font, 1, 8).unwrap_err();
