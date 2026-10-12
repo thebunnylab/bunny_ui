@@ -133,6 +133,8 @@ jobs:
           rustup target add aarch64-apple-ios
           cargo check -p bunny-ui-ios --locked --target aarch64-apple-ios
       - name: Strict lint diagnostic comparison
+        # A failed paragraph oracle must not hide independent lint diagnostics.
+        if: ${{ !cancelled() && (success() || steps.paragraph-boundary.outcome == 'failure') }}
         env:
           PLATFORM: ${{ matrix.platform }}
         run: |
