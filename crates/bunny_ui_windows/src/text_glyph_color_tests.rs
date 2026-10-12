@@ -176,27 +176,6 @@ fn assert_pixels(expected: &[u8], actual: &[u8], label: &str) {
     assert_eq!(differences, 0, "{label}: mismatching PBGRA pixels");
 }
 
-// The older path composites native layers separately into an 8-bit surface.
-// Keep alpha exact and bound RGB differences to one code value; the complete
-// color-context comparisons retain their byte-exact requirement.
-fn assert_layer_pixels(expected: &[u8], actual: &[u8], label: &str) {
-    assert_eq!(expected.len(), actual.len(), "{label}: bitmap lengths");
-    assert_eq!(expected.len() % 4, 0, "{label}: complete pixels");
-    let pairs = || {
-        expected
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .zip(actual.as_chunks::<4>().0)
-    };
-    let valid = pairs().all(|(a, b)| a[3] == b[3] && (0..3).all(|i| a[i].abs_diff(b[i]) <= 1));
-    if !valid {
-        assert_pixels(expected, actual, label);
-    }
-    let differences = pairs().filter(|(a, b)| a != b).count();
-    eprintln!("{label}: {differences} pixels differ within one RGB code value; alpha exact");
-}
-
 #[test]
 fn paragraph_raster_glyph_pixels_match_independent_native_text_layout() {
     let engine = DirectWriteEngine::new();
@@ -289,8 +268,17 @@ fn paragraph_raster_modern_color_formats_match_native_pixels_and_keep_color() {
 }
 
 #[test]
+#[ignore = "Required by the windows-2022 CI job with --ignored; modern TextLayout uses a different color raster path"]
 fn paragraph_raster_translated_svg_bitmap_and_colr_paths_match_native_pixels() {
     let engine = color_engine();
+    let surface = Surface::new(engine.factories.as_ref().unwrap(), 64, 64, 1.0).unwrap();
+    let modern: Option<Com<native::Context7>> =
+        ffi::query_optional(&surface.target, &CONTEXT7, "legacy oracle context").unwrap();
+    assert!(
+        modern.is_none(),
+        "legacy parity requires the earlier native renderer"
+    );
+    eprintln!("native legacy color oracle: Context7 absent; all pixel comparisons are byte-exact");
     let font = color_font();
     let ink = Color::rgb(67, 31, 173);
     for scale in [1.0, 2.0] {
@@ -307,7 +295,7 @@ fn paragraph_raster_translated_svg_bitmap_and_colr_paths_match_native_pixels() {
                     modern == expected
                 );
             }
-            assert_layer_pixels(
+            assert_pixels(
                 &expected,
                 &actual,
                 &format!("translated fixture {text}, scale {scale}"),
@@ -316,7 +304,7 @@ fn paragraph_raster_translated_svg_bitmap_and_colr_paths_match_native_pixels() {
         for text in ["a", "b", "ab"] {
             let expected = reference(&engine, text, &font, ink, scale);
             let actual = rendered(&engine, text, &font, ink, scale, 2);
-            assert_layer_pixels(
+            assert_pixels(
                 &expected,
                 &actual,
                 &format!("COLR layers {text}, scale {scale}"),
