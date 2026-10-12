@@ -14,6 +14,9 @@ use std::sync::{Arc, Mutex, atomic::AtomicU32};
 #[path = "text_analysis_callbacks.rs"]
 mod callbacks;
 
+#[path = "text_glyphs.rs"]
+mod glyphs;
+
 const ENGINE: &str = "DirectWrite";
 const OK: Hresult = 0;
 const NO_INTERFACE: Hresult = -2_147_467_262; // E_NOINTERFACE
@@ -134,6 +137,23 @@ impl Prepared {
     }
 }
 
+impl Analyzer {
+    fn new(factories: &Factories) -> Result<Com<Self>, TextError> {
+        // SAFETY: IDWriteFactory slot 21 is CreateTextAnalyzer. All referenced
+        // objects outlive these synchronous native calls; output is initialized.
+        unsafe {
+            let factory = factories.dwrite.as_ptr().cast::<Factory>();
+            let mut pointer = std::ptr::null_mut();
+            let status = ((*(*factory).vtbl).create_text_analyzer)(factory, &raw mut pointer);
+            let owned = Com::from_raw(pointer);
+            if !com_ok(status) {
+                return Err(preparation("CreateTextAnalyzer"));
+            }
+            owned.ok_or_else(|| preparation("CreateTextAnalyzer result"))
+        }
+    }
+}
+
 fn analyze(
     factories: &Factories,
     source: &Com<Source>,
@@ -145,18 +165,7 @@ fn analyze(
         return Ok((Vec::new(), Vec::new()));
     }
     let sink = Sink::new(input.text.len())?;
-    // SAFETY: IDWriteFactory slot 21 is CreateTextAnalyzer. All referenced
-    // objects outlive these synchronous native calls; output is initialized.
-    let analyzer = unsafe {
-        let factory = factories.dwrite.as_ptr().cast::<Factory>();
-        let mut pointer = std::ptr::null_mut();
-        let status = ((*(*factory).vtbl).create_text_analyzer)(factory, &raw mut pointer);
-        let owned = Com::from_raw(pointer);
-        if !com_ok(status) {
-            return Err(preparation("CreateTextAnalyzer"));
-        }
-        owned.ok_or_else(|| preparation("CreateTextAnalyzer result"))?
-    };
+    let analyzer = Analyzer::new(factories)?;
     // SAFETY: the native analyzer has the documented IUnknown/vtable prefix.
     let vtbl = unsafe { &*(*analyzer.as_ptr()).vtbl };
     for (call, operation) in [
