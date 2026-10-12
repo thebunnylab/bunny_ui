@@ -5,8 +5,9 @@
 //! Native glyph indices, cluster maps, advances and offsets stay together with
 //! their owning face. The line module applies visual L1/L2 ordering without
 //! changing those shaping buffers, then supplies runtime geometry and raster.
-//! Native input/count bounds limit each shaping span; oversized spans currently
-//! return an explicit preparation error rather than an arbitrary split.
+//! Complete font-resolved spans classified natively as simple may use bounded
+//! glyph calls. Complex spans retain their shaping context and report native
+//! input/count failures until a verified continuation policy is available.
 
 use super::{
     Analyzer, Com, Factories, Guid, Hresult, Prepared, Script, Source, TextError, bidi, com_ok,
@@ -30,6 +31,9 @@ pub(super) use line::VisualLine;
 // GetGlyphs rejects a capacity of 65536 even for a short input. This is a
 // native count limit, not the number of representable u16 index values.
 const MAX_GLYPHS: usize = u16::MAX as usize;
+// Match the conservative size observed in native whole-layout glyph runs.
+// This is a work bound for proven-simple spans, not a universal native maximum.
+const SIMPLE_CHUNK_UNITS: usize = 16_000;
 const INSUFFICIENT_BUFFER: Hresult = -2_147_024_774; // HRESULT_FROM_WIN32(122)
 
 pub(super) struct BaseFont {
@@ -158,29 +162,77 @@ impl Shaper {
                     em_size,
                     locale,
                 };
-                let capacity = input.text.len().saturating_mul(3) / 2 + 16;
-                let output = self.produce(&input, tracking, capacity.min(MAX_GLYPHS))?;
-                runs.try_reserve(1)
-                    .map_err(|_| preparation("glyph run allocation"))?;
-                runs.push(Run {
-                    source,
-                    face,
-                    em_size,
-                    level,
-                    visibility: if script.shapes & 1 == 0 {
-                        Visibility::Ink
-                    } else {
-                        Visibility::Control
-                    },
-                    clusters: output.clusters,
-                    glyphs: output.glyphs,
-                    advances: output.advances,
-                    offsets: output.offsets,
-                });
+                let chunk_size = self.shaping_chunk_size(&input)?;
+                let mut chunk_start = source.start;
+                for units in input.text.chunks(chunk_size) {
+                    let source = chunk_start..chunk_start + units.len();
+                    validate_range(text, &source)?;
+                    let chunk = Input {
+                        text: units,
+                        ..input
+                    };
+                    let capacity = units.len().saturating_mul(3) / 2 + 16;
+                    let output = self.produce(&chunk, tracking, capacity.min(MAX_GLYPHS))?;
+                    runs.try_reserve(1)
+                        .map_err(|_| preparation("glyph run allocation"))?;
+                    chunk_start = source.end;
+                    runs.push(Run {
+                        source,
+                        face: face.clone(),
+                        em_size,
+                        level,
+                        visibility: if script.shapes & 1 == 0 {
+                            Visibility::Ink
+                        } else {
+                            Visibility::Control
+                        },
+                        clusters: output.clusters,
+                        glyphs: output.glyphs,
+                        advances: output.advances,
+                        offsets: output.offsets,
+                    });
+                }
                 position += mapped;
             }
         }
         Ok(runs)
+    }
+
+    fn shaping_chunk_size(&self, input: &Input<'_>) -> Result<usize, TextError> {
+        if input.text.len() <= SIMPLE_CHUNK_UNITS {
+            return Ok(input.text.len());
+        }
+        let length =
+            u32::try_from(input.text.len()).map_err(|_| preparation("text complexity length"))?;
+        let mut simple = 0;
+        let mut read = 0;
+        // SAFETY: exact Analyzer1 slot 15 sees the entire unchanged font span.
+        // Optional nominal glyph output is unused; no failed output is consumed.
+        let status = unsafe {
+            ((*(*self.analyzer.as_ptr()).vtbl).complexity)(
+                self.analyzer.as_ptr(),
+                input.text.as_ptr(),
+                length,
+                input.face.as_ptr(),
+                &raw mut simple,
+                &raw mut read,
+                std::ptr::null_mut(),
+            )
+        };
+        if !com_ok(status) {
+            return Err(preparation("GetTextComplexity"));
+        }
+        if read == 0 || read > length {
+            return Err(preparation("text complexity coverage"));
+        }
+        // The native contract excludes combining, supplementary, complex-script
+        // and standard OpenType dependencies from a simple span. A simple
+        // prefix is insufficient: every source unit must have been classified.
+        Ok(if simple != 0 && read == length {
+            SIMPLE_CHUNK_UNITS
+        } else {
+            input.text.len()
+        })
     }
 
     fn map(

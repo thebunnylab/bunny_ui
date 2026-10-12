@@ -599,6 +599,18 @@ impl<T> Com<T> {
     }
 }
 
+impl<T> Clone for Com<T> {
+    fn clone(&self) -> Self {
+        // SAFETY: an owned COM interface has a live IUnknown prefix. AddRef
+        // gives the new owner its own reference, balanced by its eventual Drop.
+        unsafe {
+            let unknown = self.0.as_ptr().cast::<Unknown>();
+            ((*(*unknown).vtbl).add_ref)(unknown.cast());
+        }
+        Self(self.0)
+    }
+}
+
 impl<T> Drop for Com<T> {
     fn drop(&mut self) {
         unsafe {

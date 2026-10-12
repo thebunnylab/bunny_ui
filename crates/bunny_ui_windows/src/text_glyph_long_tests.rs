@@ -103,6 +103,8 @@ fn paragraph_long_spans_match_independent_complete_native_glyphs() {
             Ok(runs) => {
                 if let Some(failure) = difference(name, runs, &expected) {
                     failures.push(failure);
+                } else {
+                    eprintln!("long candidate {name}: complete independent glyph parity passed");
                 }
             }
         }
@@ -110,6 +112,8 @@ fn paragraph_long_spans_match_independent_complete_native_glyphs() {
         let source = content.line(0..text.len()).unwrap();
         if let Err(error) = engine.measure_paragraph_line(&source, &font) {
             failures.push(format!("public {name}: {error:?}"));
+        } else {
+            eprintln!("public long {name}: measurement completed");
         }
     }
     assert!(
@@ -466,5 +470,33 @@ fn paragraph_long_native_complexity_classifies_the_complete_font_span() {
                 }
             })
             .unwrap();
+    }
+}
+
+#[test]
+fn paragraph_long_simple_spans_preserve_native_clusters_and_tracking() {
+    let engine = DirectWriteEngine::new();
+    for length in [16001, 21846, 32765, 65535, 65536, 70000] {
+        for tracking in [-0.75, 0.0, 0.75] {
+            let font = FontSpec {
+                tracking,
+                ..FontSpec::DEFAULT
+            };
+            let text = "a".repeat(length);
+            let layout = tests::reference_layout(&engine, &text, &font);
+            let mut expected: Vec<_> = raster::reference_records(&layout)
+                .iter()
+                .flat_map(clusters)
+                .collect();
+            expected.sort_by_key(|cluster| cluster.source.start);
+            assert_eq!(expected.len(), length);
+            let runs = tests::shape(&engine, &text, &font);
+            let mismatch = difference("simple long span", runs, &expected);
+            assert!(
+                mismatch.is_none(),
+                "length={length}, tracking={tracking}: {mismatch:?}"
+            );
+            eprintln!("simple long parity: length={length}, tracking={tracking}");
+        }
     }
 }

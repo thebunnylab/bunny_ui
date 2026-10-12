@@ -184,4 +184,15 @@ pub(super) struct AnalyzerVtbl {
         *mut f32,
         *mut Offset,
     ) -> Hresult,
+    // IDWriteTextAnalyzer1 slots 11..14 precede GetTextComplexity at 15.
+    _pad_11_14: [usize; 4],
+    pub(super) complexity: unsafe extern "system" fn(
+        *mut Analyzer,
+        *const u16,
+        u32,
+        *mut Face,
+        *mut i32,
+        *mut u32,
+        *mut u16,
+    ) -> Hresult,
 }
