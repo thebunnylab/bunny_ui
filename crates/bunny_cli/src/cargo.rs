@@ -72,7 +72,8 @@ pub struct Diagnostic {
     pub message: String,
     /// The lint or error code, when it has one.
     pub code: Option<String>,
-    /// The primary span's file, relative to where cargo ran.
+    /// The primary span's file, relative to where cargo ran — the
+    /// manifest's directory.
     pub file: Option<String>,
     pub line: Option<u32>,
     pub column: Option<u32>,
@@ -106,11 +107,15 @@ pub struct Built {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// Runs the build. Cargo's progress and diagnostics go straight to the
-/// terminal, rendered as cargo renders them; the artifact paths come
-/// from its JSON on stdout.
-pub fn build(spec: &Build) -> Result<Built> {
+/// The cargo invocation for `spec`, run from the manifest's directory —
+/// so the project's own `.cargo/config.toml` (its target directory, its
+/// rustflags, its linker) is read the way `cargo metadata` reads it, and
+/// not whichever configuration the caller's directory happens to carry.
+fn command(spec: &Build) -> Command {
     let mut command = Command::new("cargo");
+    if let Some(dir) = spec.manifest.parent() {
+        command.current_dir(dir);
+    }
     let subcommand = if spec.what == Target::CdylibLib || !spec.rustc_args.is_empty() { "rustc" } else { "build" };
     command.arg(subcommand).arg("--manifest-path").arg(&spec.manifest).arg("-p").arg(&spec.package);
     match &spec.what {
@@ -156,6 +161,14 @@ pub fn build(spec: &Build) -> Result<Built> {
     for (key, value) in &spec.env {
         command.env(key, value);
     }
+    command
+}
+
+/// Runs the build. Cargo's progress and diagnostics go straight to the
+/// terminal, rendered as cargo renders them; the artifact paths come
+/// from its JSON on stdout.
+pub fn build(spec: &Build) -> Result<Built> {
+    let mut command = command(spec);
     // collected diagnostics leave the terminal alone: cargo's own
     // progress goes nowhere, and what the compiler says is data
     let stderr = if spec.diagnostics == Diagnostics::Collect { Stdio::null() } else { Stdio::inherit() };
@@ -234,4 +247,19 @@ fn diagnostic(message: &Value) -> Option<Diagnostic> {
         column: primary.and_then(|span| span.get("column_start")).and_then(Value::as_u64).map(|column| column as u32),
         rendered: inner.str_at(&["rendered"]).unwrap_or_default().to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The build runs from the manifest's directory, whatever the
+    /// caller's — the project's own cargo configuration is the one read.
+    #[test]
+    fn the_build_runs_from_the_manifests_directory() {
+        let spec = Build { manifest: PathBuf::from("/w/app/Cargo.toml"), package: String::from("app"), ..Build::default() };
+        assert_eq!(command(&spec).get_current_dir(), Some(Path::new("/w/app")));
+        let args: Vec<String> = command(&spec).get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert_eq!(&args[..5], ["rustc", "--manifest-path", "/w/app/Cargo.toml", "-p", "app"]);
+    }
 }
