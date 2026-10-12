@@ -16,6 +16,7 @@ struct Renderer {
     trace: bool,
     callbacks: AtomicU32,
     empty_callbacks: AtomicU32,
+    error: RefCell<Option<&'static str>>,
     records: RefCell<Vec<NativeRun>>,
 }
 // DWRITE_GLYPH_RUN_DESCRIPTION from the same pinned dwrite.h. Text positions
@@ -150,18 +151,13 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         remaining
     }
 }
-unsafe extern "system" fn disabled(
-    this: *mut Renderer,
-    _: *mut c_void,
-    output: *mut i32,
-) -> Hresult {
+unsafe extern "system" fn disabled(_: *mut Renderer, _: *mut c_void, output: *mut i32) -> Hresult {
     if output.is_null() {
         return -2_147_467_261;
     }
-    // SAFETY: the native caller supplies its BOOL output and live renderer.
-    // Glyph snapshots need no pixel snapping; pixel traces preserve it.
+    // SAFETY: the native caller supplies its BOOL output.
     unsafe {
-        *output = i32::from(!(*this).trace);
+        *output = 0;
     }
     0
 }
@@ -203,37 +199,77 @@ unsafe extern "system" fn glyphs(
     unsafe {
         (*this).callbacks.fetch_add(1, Ordering::Relaxed);
     }
-    if run.is_null() {
-        return -2_147_467_261;
-    }
-    // SAFETY: IDWriteTextLayout owns these arrays throughout its synchronous
-    // DrawGlyphRun callback. Nothing borrowed survives this callback.
+    // SAFETY: native arrays remain borrowed only throughout this callback.
+    let record = unsafe { snapshot(run, description) };
+    // SAFETY: the caller retains this renderer for synchronous drawing.
     unsafe {
-        let run = &*run;
+        match record {
+            Ok(None) => {
+                (*this).empty_callbacks.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(Some(record)) => {
+                if (*this).trace {
+                    eprintln!("native layout run: origin=({x},{y}), mode={mode}, {record:?}");
+                }
+                (*this).records.borrow_mut().push(record);
+            }
+            Err(error) => {
+                (*this).error.borrow_mut().get_or_insert(error);
+                return -2_147_467_259; // E_FAIL; also retained if Draw ignores it.
+            }
+        }
+    }
+    0
+}
+
+unsafe fn snapshot(
+    run: *const GlyphRun<'_>,
+    description: *const c_void,
+) -> Result<Option<NativeRun>, &'static str> {
+    // SAFETY: the callback's native pointers are checked before dereferencing;
+    // non-null arrays are supplied for their declared lengths by TextLayout.
+    unsafe {
+        let run = run.as_ref().ok_or("missing glyph run")?;
         if run.count == 0 {
-            (*this).empty_callbacks.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
-                "empty native glyph callback: em_size={}, description_present={}",
-                run.em_size,
-                !description.is_null()
-            );
-            return 0;
+            return Ok(None);
         }
-        if run.indices.is_null() || run.advances.is_null() || run.offsets.is_null() {
-            return -2_147_467_261;
+        let description = description
+            .cast::<Description>()
+            .as_ref()
+            .ok_or("missing glyph description")?;
+        eprintln!(
+            "native glyph arrays: count={}, units={}, indices={}, advances={}, offsets={}, clusters={}",
+            run.count,
+            description.length,
+            !run.indices.is_null(),
+            !run.advances.is_null(),
+            !run.offsets.is_null(),
+            !description.clusters.is_null()
+        );
+        if run.indices.is_null() {
+            return Err("missing required glyph indices");
         }
-        if description.is_null() {
-            return -2_147_467_261;
+        if run.advances.is_null() {
+            return Err("native reference omitted advances");
         }
-        let description = &*description.cast::<Description>();
-        if description.length == 0 || description.clusters.is_null() {
-            return -2_147_467_261;
+        if description.length == 0 {
+            return Err("empty native source description");
+        }
+        if description.clusters.is_null() {
+            return Err("native reference omitted cluster map");
         }
         let start = description.position as usize;
-        let Some(end) = start.checked_add(description.length as usize) else {
-            return -2_147_024_809;
+        let end = start
+            .checked_add(description.length as usize)
+            .ok_or("source range overflow")?;
+        // The pinned SDK marks glyphOffsets optional. An absent array means no
+        // displacement, not an invalid native run; preserve explicit arrays.
+        let offsets = if run.offsets.is_null() {
+            vec![super::super::super::ffi::Offset::default(); run.count as usize]
+        } else {
+            std::slice::from_raw_parts(run.offsets, run.count as usize).to_vec()
         };
-        let record = NativeRun {
+        Ok(Some(NativeRun {
             source: start..end,
             em_size: run.em_size,
             level: run.level,
@@ -241,15 +277,11 @@ unsafe extern "system" fn glyphs(
                 .to_vec(),
             glyphs: std::slice::from_raw_parts(run.indices, run.count as usize).to_vec(),
             advances: std::slice::from_raw_parts(run.advances, run.count as usize).to_vec(),
-            offsets: std::slice::from_raw_parts(run.offsets, run.count as usize).to_vec(),
-        };
-        if (*this).trace {
-            eprintln!("native layout run: origin=({x},{y}), mode={mode}, {record:?}");
-        }
-        (*this).records.borrow_mut().push(record);
+            offsets,
+        }))
     }
-    0
 }
+
 unsafe extern "system" fn decoration(
     _: *mut Renderer,
     _: *mut c_void,
@@ -280,12 +312,6 @@ pub(super) fn trace(layout: &Com<IDWriteTextLayout>, scale: f32) {
 pub(in crate::text::analysis::glyphs) fn collect(
     layout: &Com<IDWriteTextLayout>,
 ) -> Vec<NativeRun> {
-    #[repr(C)]
-    struct BoundsTable {
-        prefix: [usize; 28],
-        set_width: unsafe extern "system" fn(*mut c_void, f32) -> Hresult,
-        set_height: unsafe extern "system" fn(*mut c_void, f32) -> Hresult,
-    }
     let mut metrics = DwriteTextMetrics::default();
     // SAFETY: the independently created layout owns its original text and font.
     // Realize native layout before collecting its synchronous draw callbacks.
@@ -293,24 +319,6 @@ pub(in crate::text::analysis::glyphs) fn collect(
         assert!(com_ok(((*(*layout.as_ptr()).vtbl).get_metrics)(
             layout.as_ptr(),
             &raw mut metrics
-        )));
-    }
-    // The shared legacy helper uses a 1e9-DIP layout box. Use measured bounds
-    // for this glyph-only oracle, without changing text, font, wrapping or
-    // paragraph direction. Native no-wrap layout still owns every source unit.
-    assert!(metrics.height.is_finite() && metrics.height >= 0.0);
-    assert!(metrics.width_including_trailing_whitespace.is_finite());
-    assert!(metrics.width_including_trailing_whitespace >= 0.0);
-    // SAFETY: pinned IDWriteTextLayout slots 28/29, with a live layout.
-    unsafe {
-        let pointer = layout.as_ptr().cast::<*const BoundsTable>();
-        assert!(com_ok(((*(*pointer)).set_width)(
-            layout.as_ptr().cast(),
-            metrics.width_including_trailing_whitespace + 16.0
-        )));
-        assert!(com_ok(((*(*pointer)).set_height)(
-            layout.as_ptr().cast(),
-            metrics.height + 16.0
         )));
     }
     let records = draw(layout, 1.0, false);
@@ -342,6 +350,7 @@ fn draw(layout: &Com<IDWriteTextLayout>, scale: f32, trace: bool) -> Vec<NativeR
         trace,
         callbacks: AtomicU32::new(0),
         empty_callbacks: AtomicU32::new(0),
+        error: RefCell::new(None),
         records: RefCell::new(Vec::new()),
     })))
     .unwrap();
@@ -355,6 +364,11 @@ fn draw(layout: &Com<IDWriteTextLayout>, scale: f32, trace: bool) -> Vec<NativeR
             std::thread::current().name(),
             (*renderer.as_ptr()).callbacks.load(Ordering::Relaxed),
             (*renderer.as_ptr()).empty_callbacks.load(Ordering::Relaxed)
+        );
+        let error = (*renderer.as_ptr()).error.take();
+        assert!(
+            error.is_none(),
+            "native renderer callback rejected data: {error:?}"
         );
         assert!(com_ok(status));
         assert_eq!((*renderer.as_ptr()).references.load(Ordering::Acquire), 1);
