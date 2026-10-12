@@ -500,3 +500,6 @@ fn paragraph_long_simple_spans_preserve_native_clusters_and_tracking() {
         }
     }
 }
+
+#[path = "text_glyph_continuation_tests.rs"]
+mod continuation;
