@@ -69,7 +69,16 @@ pub(super) struct Context4 {
 }
 #[repr(C)]
 pub(super) struct Context4Vtbl {
-    _prefix_0_109: [usize; 110],
+    _prefix_0_81: [usize; 82],
+    pub(super) draw_outline: unsafe extern "system" fn(
+        *mut Context4,
+        D2dPoint,
+        *const GlyphRun<'_>,
+        *const c_void,
+        *mut ID2D1Brush,
+        u32,
+    ),
+    _prefix_83_109: [usize; 27],
     pub(super) draw_layout: unsafe extern "system" fn(
         *mut Context4,
         D2dPoint,
@@ -143,7 +152,7 @@ pub(super) struct Factory2Vtbl {
 #[repr(C)]
 pub(super) struct Layer<'a> {
     pub(super) run: GlyphRun<'a>,
-    _description: *const c_void,
+    pub(super) description: *const c_void,
     pub(super) origin: D2dPoint,
     pub(super) color: D2dColor,
     pub(super) palette: u16,

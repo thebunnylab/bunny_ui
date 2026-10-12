@@ -234,7 +234,22 @@ fn draw_layer(
         // example TRUETYPE | COLR = 5). These all use the outline renderer.
         format if format != 0 && format & !0x7 == 0 => {
             let brush = brushes.layer(surface, layer)?;
-            draw_outline(surface, layer.origin, &layer.run, brush, mode);
+            if let Some(context) = context {
+                // SAFETY: the native layer's description and arrays remain
+                // valid for this synchronous extended device-context call.
+                unsafe {
+                    ((*(*context.as_ptr()).vtbl).draw_outline)(
+                        context.as_ptr(),
+                        layer.origin,
+                        &raw const layer.run,
+                        layer.description,
+                        brush,
+                        mode,
+                    );
+                }
+            } else {
+                draw_outline(surface, layer.origin, &layer.run, brush, mode);
+            }
         }
         8 => {
             let context = context.ok_or_else(|| failure("SVG glyph context"))?;
