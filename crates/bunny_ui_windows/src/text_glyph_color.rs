@@ -293,18 +293,6 @@ fn draw_layers1(
                 return Err(failure("color layer access"));
             }
             let layer = &*layer;
-            eprintln!(
-                "translated layer: format={}, origin=({},{}), palette={}, color=({},{},{},{}), glyphs={:?}",
-                layer.image_format,
-                layer.base.origin.x,
-                layer.base.origin.y,
-                layer.base.palette,
-                layer.base.color.r,
-                layer.base.color.g,
-                layer.base.color.b,
-                layer.base.color.a,
-                std::slice::from_raw_parts(layer.base.run.indices, layer.base.run.count as usize)
-            );
             draw_layer(
                 surface,
                 context,
