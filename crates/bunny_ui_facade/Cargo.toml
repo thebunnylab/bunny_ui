@@ -34,9 +34,17 @@ codec = ["bunny-ui-core/codec"]
 # of an app on the desktop, the iOS Simulator or Android; no other build
 # needs it, and the web has no use for it.
 hot = ["shell", "dep:bunny-ui-dylib", "dep:bunny-ui-hot"]
+# Preview entries: each `#[preview]` function exports a symbol that
+# answers its view and traits, for the preview host Studio and `bunny
+# preview` run. `bunny preview` turns it on with `hot`; a plain build
+# keeps the functions and exports nothing.
+preview = ["dep:bunny-ui-hot"]
 
 [dependencies]
 bunny-ui-core.workspace = true
+# The `#[preview]` attribute itself: always there, so a marked function
+# compiles in every build; what it exports follows the feature above.
+bunny-ui-preview-macros.workspace = true
 
 # The target picks the shell; the application never names one.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -69,6 +77,10 @@ required-features = ["shell"]
 [[test]]
 name = "app_macro"
 required-features = ["shell"]
+
+[[test]]
+name = "preview_macro"
+required-features = ["preview"]
 
 # One page per platform, each with the shell that target compiles.
 [package.metadata.docs.rs]

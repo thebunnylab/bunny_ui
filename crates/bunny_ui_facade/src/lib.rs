@@ -63,6 +63,7 @@ mod entry;
 extern crate bunny_ui_dylib as _;
 
 pub use bunny_ui_core::*;
+pub use bunny_ui_preview_macros::preview;
 pub use entry::{__private, AppConfig};
 
 /// The shell of this target, whole.
