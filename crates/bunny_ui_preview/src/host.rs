@@ -390,6 +390,10 @@ impl Host {
     /// One turn: tasks polled, a new generation announced, every scene
     /// that needs it rendered and sent. Answers whether a frame went out.
     pub fn tick(&mut self) -> bool {
+        // the tasks first: the hot road's swap is one of them, and the
+        // generation it loads must be read before any scene renders —
+        // the frame that carries the new code carries its number too
+        let _ = bunny_ui_core::task::poll_ready();
         let generation = bunny_ui_hot::generation();
         if generation != self.generation {
             self.generation = generation;
@@ -401,7 +405,6 @@ impl Host {
         }
         let mut sent = false;
         for index in 0..self.scenes.len() {
-            let _ = self.scenes[index].runtime.poll_tasks();
             if self.scenes[index].poisoned.is_some() {
                 continue;
             }
