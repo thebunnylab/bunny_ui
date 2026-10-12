@@ -56,6 +56,7 @@ pub(super) struct Run {
 pub(super) enum Error {
     IndexOverflow,
     ResolutionFailed,
+    InvalidRange,
 }
 
 impl std::fmt::Display for Error {
@@ -63,99 +64,187 @@ impl std::fmt::Display for Error {
         formatter.write_str(match self {
             Self::IndexOverflow => "text exceeds the native index range",
             Self::ResolutionFailed => "native paragraph resolution failed",
+            Self::InvalidRange => "line range is not on source UTF-8 boundaries",
         })
     }
 }
 
-/// Logical UTF-8 ranges in visual order. Each paragraph chooses its own first
-/// strong direction. A line is normally one paragraph; explicit paragraph
-/// separators reset resolution rather than leaking one paragraph's controls.
-pub(super) fn runs(text: &str) -> Result<Vec<Run>, Error> {
-    // HarfBuzz also consumes signed byte lengths, so reject that boundary before
-    // allocating the scalar maps, even when the scalar count would fit.
-    c_int::try_from(text.len()).map_err(|_| Error::IndexOverflow)?;
-    if text.is_empty() {
-        return Ok(Vec::new());
-    }
-    // ASCII has no RTL or embedding controls. Its single LTR run preserves
-    // the former shaping path without allocating scalar and level maps.
-    if text.is_ascii() {
-        return Ok(vec![Run {
-            bytes: 0..text.len(),
-            direction: Direction::LeftToRight,
-        }]);
-    }
-    let (mut bytes, scalars): (Vec<_>, Vec<_>) = text
-        .char_indices()
-        .map(|(byte, character)| (byte, u32::from(character)))
-        .unzip();
-    bytes.push(text.len());
-    let length = c_int::try_from(scalars.len()).map_err(|_| Error::IndexOverflow)?;
-    let mut types = vec![0; scalars.len()];
-    let mut brackets = vec![0; scalars.len()];
-    // SAFETY: the three arrays have `length` elements of the header's uint32_t
-    // types. Native calls borrow them for their duration and retain nothing.
-    let (neutral, separator) = unsafe {
-        fribidi_get_bidi_types(scalars.as_ptr(), length, types.as_mut_ptr());
-        fribidi_get_bracket_types(
-            scalars.as_ptr(),
-            length,
-            types.as_ptr(),
-            brackets.as_mut_ptr(),
-        );
-        (
-            fribidi_get_bidi_type(u32::from('!')),
-            fribidi_get_bidi_type(u32::from('\n')),
-        )
-    };
-    let mut result = Vec::new();
-    let mut start = 0;
-    for paragraph in types.split_inclusive(|kind| *kind == separator) {
-        let end = start + paragraph.len();
-        result.extend(paragraph_runs(
-            paragraph,
-            &brackets[start..end],
-            &bytes[start..=end],
-            neutral,
-        )?);
-        start = end;
-    }
-    Ok(result)
+/// Immutable paragraph analysis, reusable for overlapping candidate lines.
+/// Native L1 resets affect a temporary line window, never this retained state.
+pub(super) struct ResolvedText {
+    storage: Storage,
 }
 
-fn paragraph_runs(
+enum Storage {
+    Ascii(usize),
+    Native(NativeText),
+}
+
+struct NativeText {
+    bytes: Vec<usize>,
+    types: Vec<c_uint>,
+    levels: Vec<i8>,
+    paragraphs: Vec<Paragraph>,
+}
+
+struct Paragraph {
+    scalars: Range<usize>,
+    base: c_uint,
+}
+
+impl ResolvedText {
+    pub(super) fn new(text: &str) -> Result<Self, Error> {
+        // HarfBuzz also uses signed byte lengths, so reject before allocating.
+        c_int::try_from(text.len()).map_err(|_| Error::IndexOverflow)?;
+        if text.is_ascii() {
+            return Ok(Self {
+                storage: Storage::Ascii(text.len()),
+            });
+        }
+        let (mut bytes, scalars): (Vec<_>, Vec<_>) = text
+            .char_indices()
+            .map(|(byte, character)| (byte, u32::from(character)))
+            .unzip();
+        bytes.push(text.len());
+        let length = c_int::try_from(scalars.len()).map_err(|_| Error::IndexOverflow)?;
+        let mut types = vec![0; scalars.len()];
+        let mut brackets = vec![0; scalars.len()];
+        let mut levels = vec![0; scalars.len()];
+        // SAFETY: equally sized uint32_t arrays; calls retain no pointers.
+        let (neutral, separator) = unsafe {
+            fribidi_get_bidi_types(scalars.as_ptr(), length, types.as_mut_ptr());
+            fribidi_get_bracket_types(
+                scalars.as_ptr(),
+                length,
+                types.as_ptr(),
+                brackets.as_mut_ptr(),
+            );
+            (
+                fribidi_get_bidi_type(u32::from('!')),
+                fribidi_get_bidi_type(u32::from('\n')),
+            )
+        };
+        let mut paragraphs = Vec::new();
+        let mut start = 0;
+        for paragraph in types.split_inclusive(|kind| *kind == separator) {
+            let end = start + paragraph.len();
+            let length = c_int::try_from(paragraph.len()).map_err(|_| Error::IndexOverflow)?;
+            let mut base = neutral;
+            // SAFETY: this complete paragraph's type, bracket and level windows
+            // have the same length; native resolution writes only its window.
+            let resolved = unsafe {
+                fribidi_get_par_embedding_levels_ex(
+                    paragraph.as_ptr(),
+                    brackets[start..end].as_ptr(),
+                    length,
+                    &raw mut base,
+                    levels[start..end].as_mut_ptr(),
+                )
+            };
+            if resolved == 0 {
+                return Err(Error::ResolutionFailed);
+            }
+            paragraphs.push(Paragraph {
+                scalars: start..end,
+                base,
+            });
+            start = end;
+        }
+        Ok(Self {
+            storage: Storage::Native(NativeText {
+                bytes,
+                types,
+                levels,
+                paragraphs,
+            }),
+        })
+    }
+
+    /// Visual runs retain byte offsets in the original source. Invalid or
+    /// mid-scalar boundaries fail explicitly rather than clamping silently.
+    pub(super) fn line_runs(&self, range: Range<usize>) -> Result<Vec<Run>, Error> {
+        if range.start > range.end {
+            return Err(Error::InvalidRange);
+        }
+        let native = match &self.storage {
+            Storage::Ascii(length) => {
+                if range.end > *length {
+                    return Err(Error::InvalidRange);
+                }
+                return Ok(if range.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![Run {
+                        bytes: range,
+                        direction: Direction::LeftToRight,
+                    }]
+                });
+            }
+            Storage::Native(native) => native,
+        };
+        let start = native
+            .bytes
+            .binary_search(&range.start)
+            .map_err(|_| Error::InvalidRange)?;
+        let end = native
+            .bytes
+            .binary_search(&range.end)
+            .map_err(|_| Error::InvalidRange)?;
+        if start == end {
+            return Ok(Vec::new());
+        }
+        let first = native
+            .paragraphs
+            .partition_point(|p| p.scalars.end <= start);
+        let mut result = Vec::new();
+        for paragraph in native.paragraphs[first..]
+            .iter()
+            .take_while(|p| p.scalars.start < end)
+        {
+            let a = start.max(paragraph.scalars.start);
+            let b = end.min(paragraph.scalars.end);
+            result.extend(reordered_runs(
+                &native.types[a..b],
+                &native.levels[a..b],
+                &native.bytes[a..=b],
+                paragraph.base,
+            )?);
+        }
+        Ok(result)
+    }
+}
+
+/// Legacy whole-line entry, using the same immutable paragraph analysis.
+pub(super) fn runs(text: &str) -> Result<Vec<Run>, Error> {
+    ResolvedText::new(text)?.line_runs(0..text.len())
+}
+
+fn reordered_runs(
     types: &[c_uint],
-    brackets: &[c_uint],
+    paragraph_levels: &[i8],
     bytes: &[usize],
-    mut base: c_uint,
+    base: c_uint,
 ) -> Result<Vec<Run>, Error> {
     let length = c_int::try_from(types.len()).map_err(|_| Error::IndexOverflow)?;
-    let mut levels = vec![0; types.len()];
+    let mut levels = paragraph_levels.to_vec();
     let mut visual_to_logical: Vec<c_int> = (0..length).collect();
-    // SAFETY: equal-length typed arrays, an initialized identity map, and no
-    // retained pointers. Null visual text is explicitly supported. Flags zero
-    // leave mirroring and combining-mark shaping to HarfBuzz, which receives
-    // the original logical substring rather than a reordered scalar string.
+    // SAFETY: the pinned native implementation accesses only [off, off+len).
+    // These line windows use off=0 with the original resolved paragraph base.
+    // L1 mutates only the copied levels; null visual is supported and flags=0
+    // leave mirroring/mark shaping to HarfBuzz. The map starts as identity.
     let resolved = unsafe {
-        fribidi_get_par_embedding_levels_ex(
+        fribidi_reorder_line(
+            0,
             types.as_ptr(),
-            brackets.as_ptr(),
             length,
-            &raw mut base,
+            0,
+            base,
             levels.as_mut_ptr(),
-        ) != 0
-            && fribidi_reorder_line(
-                0,
-                types.as_ptr(),
-                length,
-                0,
-                base,
-                levels.as_mut_ptr(),
-                std::ptr::null_mut(),
-                visual_to_logical.as_mut_ptr(),
-            ) != 0
+            std::ptr::null_mut(),
+            visual_to_logical.as_mut_ptr(),
+        )
     };
-    if !resolved {
+    if resolved == 0 {
         return Err(Error::ResolutionFailed);
     }
     let mut logical_to_visual = vec![0; types.len()];

@@ -909,3 +909,7 @@ mod geometry_tests;
 #[cfg(test)]
 #[path = "text_paragraph_tests.rs"]
 mod paragraph_tests;
+
+#[cfg(test)]
+#[path = "text_bidi_context_tests.rs"]
+mod bidi_context_tests;
