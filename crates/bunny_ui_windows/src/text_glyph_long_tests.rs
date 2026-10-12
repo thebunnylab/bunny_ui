@@ -244,7 +244,10 @@ fn paragraph_glyph_buffer_growth_caps_at_the_native_count() {
     engine
         .with_slot(&font, |slot| {
             let base = BaseFont::new(slot, &font).unwrap();
-            let face = create_face(&base.font).unwrap();
+            let (face, scale, mapped) = shaper
+                .map(&prepared, 0..prepared.utf16().len(), &base, &font)
+                .unwrap();
+            assert_eq!(mapped, prepared.utf16().len());
             // SAFETY: the immutable prepared source retains its native locale.
             let locale = unsafe { &(*prepared.source.as_ptr()).locale };
             let input = Input {
@@ -252,7 +255,7 @@ fn paragraph_glyph_buffer_growth_caps_at_the_native_count() {
                 script: prepared.scripts[0],
                 level: prepared.levels[0].resolved,
                 face: &face,
-                em_size: native_float(font.size).unwrap(),
+                em_size: native_float(font.size).unwrap() * scale,
                 locale,
             };
             // Exercise the clamp itself independently of the native text-length
@@ -261,7 +264,7 @@ fn paragraph_glyph_buffer_growth_caps_at_the_native_count() {
             let run = Run {
                 source: 0..prepared.utf16().len(),
                 face,
-                em_size: native_float(font.size).unwrap(),
+                em_size: native_float(font.size).unwrap() * scale,
                 level: prepared.levels[0].resolved,
                 visibility: Visibility::Ink,
                 clusters: output.clusters,
@@ -269,7 +272,8 @@ fn paragraph_glyph_buffer_growth_caps_at_the_native_count() {
                 advances: output.advances,
                 offsets: output.offsets,
             };
-            assert!(difference("capacity clamp", vec![run], &expected).is_none());
+            let mismatch = difference("capacity clamp", vec![run], &expected);
+            assert!(mismatch.is_none(), "{mismatch:?}");
         })
         .unwrap();
 }
@@ -301,6 +305,11 @@ fn paragraph_long_native_capacity_and_safe_boundary_witness() {
                 (4096, 65_535),
                 (4096, 65_536),
                 (16_384, 65_535),
+                (16_385, 65_535),
+                (21_845, 65_535),
+                (21_846, 65_535),
+                (32_765, 65_535),
+                (32_766, 65_535),
                 (32_767, 65_535),
                 (32_768, 65_535),
                 (43_679, 65_535),
