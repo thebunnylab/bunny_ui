@@ -5440,6 +5440,7 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
             },
         };
         let start = out.display.len();
+        let (floor, scope) = (out.focus_floor, out.focus_scope.take());
         out.focus_floor = out.focus_order.len();
         out.focus_scope = Some(Rc::from(queued.path.as_str()));
         let accessibility_surface = out.accessibility_surface.replace(Rc::from(queued.path.as_str()));
@@ -5447,6 +5448,14 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
         queued.node.place(frame, &fit, env, out);
         out.accessibility_viewport = accessibility_viewport;
         out.accessibility_surface = accessibility_surface;
+        // a popover that placed no control is a picture beside the
+        // keyboard's owner — a completion list, a preview card — not a
+        // dialog: it opens no scope, the keyboard stays where it was and
+        // the walk never enters it
+        if out.focus_order.len() == out.focus_floor {
+            out.focus_floor = floor;
+            out.focus_scope = scope;
+        }
         let end = out.display.len();
         out.overlays.push(OverlayPlacement {
             path: queued.path,
