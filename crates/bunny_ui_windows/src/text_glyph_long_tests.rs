@@ -387,3 +387,84 @@ fn paragraph_native_reference_retains_ascii_at_font_and_length_boundaries() {
         "independent ASCII reference failures: {failures:#?}"
     );
 }
+
+#[test]
+fn paragraph_long_native_complexity_classifies_the_complete_font_span() {
+    // IDWriteTextAnalyzer1: base slots 0..9, spacing 10, baseline 11,
+    // vertical orientation 12, transform 13, script properties 14, complexity 15.
+    #[repr(C)]
+    struct Table {
+        prefix: [usize; 15],
+        complexity: unsafe extern "system" fn(
+            *mut c_void,
+            *const u16,
+            u32,
+            *mut ffi::Face,
+            *mut i32,
+            *mut u32,
+            *mut u16,
+        ) -> Hresult,
+    }
+    let engine = DirectWriteEngine::new();
+    let factories = engine.factories.as_ref().unwrap();
+    let shaper = Shaper::new(factories).unwrap();
+    for (name, text) in [
+        ("plain", "a".repeat(70_000)),
+        ("latin-ligatures", "office affine ".repeat(6_000)),
+        ("arabic-words", "العربية ".repeat(10_000)),
+        ("arabic-connected", "ب".repeat(70_000)),
+        ("combining-clusters", "a\u{301}".repeat(40_000)),
+        (
+            "one-combining-cluster",
+            format!("a{}", "\u{301}".repeat(70_000)),
+        ),
+    ] {
+        let font = FontSpec {
+            size: 19.0,
+            family: if name == "latin-ligatures" {
+                bunny_ui::text_engine::Family::named("Calibri")
+            } else {
+                bunny_ui::text_engine::Family::default()
+            },
+            ..FontSpec::DEFAULT
+        };
+        let prepared = Prepared::new(factories, &text).unwrap();
+        engine
+            .with_slot(&font, |slot| {
+                let base = BaseFont::new(slot, &font).unwrap();
+                let (face, _, mapped) = shaper
+                    .map(&prepared, 0..prepared.utf16().len(), &base, &font)
+                    .unwrap();
+                assert_eq!(mapped, prepared.utf16().len(), "{name}");
+                let mut simple = 0;
+                let mut read = 0;
+                // SAFETY: pinned Analyzer1 slot 15, the original complete span and
+                // resolved font. Native nominal glyph output is optional and unused.
+                let status = unsafe {
+                    let table = &**shaper.analyzer.as_ptr().cast::<*const Table>();
+                    (table.complexity)(
+                        shaper.analyzer.as_ptr().cast(),
+                        prepared.utf16().as_ptr(),
+                        u32::try_from(mapped).unwrap(),
+                        face.as_ptr(),
+                        &raw mut simple,
+                        &raw mut read,
+                        std::ptr::null_mut(),
+                    )
+                };
+                assert!(com_ok(status), "{name}: complexity {status:#x}");
+                assert!(read > 0 && read as usize <= mapped);
+                eprintln!("native complexity {name}: units={mapped}, simple={simple}, read={read}");
+                if name == "plain" {
+                    assert_ne!(simple, 0);
+                    assert_eq!(read as usize, mapped);
+                } else if name != "latin-ligatures" {
+                    assert_eq!(
+                        simple, 0,
+                        "combining/joining text cannot be treated as nominal"
+                    );
+                }
+            })
+            .unwrap();
+    }
+}
