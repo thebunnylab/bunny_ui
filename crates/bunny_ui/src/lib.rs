@@ -143,6 +143,23 @@ macro_rules! zstack {
     };
 }
 
+/// What `#[preview]` expands to where the core stands alone — a crate
+/// that consumes `bunny-ui-core` under the `bunny_ui` name, with no
+/// facade to mint a symbol: the entry is nothing, and the function is
+/// kept from reading as dead code, since the attribute still marks it
+/// for the scan (`bunny preview --list`, an IDE's gallery). The facade's
+/// own arm, under its `preview` feature, exports the symbol a host
+/// loads; its definition shadows this one for every app.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bunny_preview_entry {
+    ($ident:ident, $symbol:ident, $name:expr, $scope:expr, $example:expr $(,)?) => {
+        const _: () = {
+            let _ = $ident;
+        };
+    };
+}
+
 /// The engine's task queue: what `.task` runs on, and the channel a
 /// worker thread (or a browser callback) hands its results over.
 pub mod task {
