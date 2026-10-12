@@ -10,6 +10,10 @@ on:
       - 'crates/bunny_ui_macos/**'
       - 'crates/bunny_ui_windows/**'
       - 'crates/bunny_ui_linux/**'
+      # the preview crates: the facade-entry step tests them
+      - 'crates/bunny_ui_preview/**'
+      - 'crates/bunny_ui_preview_macros/**'
+      - 'crates/bunny_ui_hot/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/check-clippy-regressions.py'

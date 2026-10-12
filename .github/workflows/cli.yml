@@ -7,6 +7,9 @@ on:
       - 'crates/bunny_ui_facade/**'
       - 'crates/bunny_ui_hot/**'
       - 'crates/bunny_ui_dylib/**'
+      # the lane's one dependency, and the attribute the template carries
+      - 'crates/bunny_ui_preview/**'
+      - 'crates/bunny_ui_preview_macros/**'
       - 'crates/bunny_ui_web/glue/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
