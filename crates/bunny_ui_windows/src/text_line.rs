@@ -7,6 +7,9 @@ use std::ops::Range;
 #[path = "text_line_geometry.rs"]
 mod geometry;
 
+#[path = "text_line_raster.rs"]
+mod raster;
+
 impl Prepared {
     fn line_levels(&self, range: Range<usize>) -> Result<Vec<u8>, TextError> {
         glyphs::validate_range(self.utf16(), &range)?;
@@ -25,11 +28,11 @@ impl Prepared {
 
 /// Owned logical glyphs plus atomic clusters placed in visual order. Shaping
 /// levels remain on Run; line-reset levels are used solely for L2 placement.
-pub(super) struct VisualLine {
+pub(in crate::text::analysis) struct VisualLine {
     source: Range<usize>,
     pub(super) runs: Vec<glyphs::Run>,
     pub(super) clusters: Vec<Cluster>,
-    pub(super) width: f64,
+    pub(in crate::text::analysis) width: f64,
 }
 #[derive(Clone, Debug)]
 pub(super) struct Cluster {
@@ -74,7 +77,7 @@ impl VisualLine {
         }
         spans
     }
-    pub(super) fn new(
+    pub(in crate::text::analysis) fn new(
         prepared: &Prepared,
         range: Range<usize>,
         runs: Vec<glyphs::Run>,

@@ -63,6 +63,7 @@ impl<'a> Renderer<'a> {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn draw(&mut self, run: &Run, origin: D2dPoint) -> Result<(), TextError> {
         self.draw_range(run, 0..run.glyphs.len(), origin)
     }

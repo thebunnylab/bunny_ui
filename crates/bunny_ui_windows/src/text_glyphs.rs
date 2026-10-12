@@ -11,6 +11,7 @@ use super::{
     preparation,
 };
 use crate::text::{FontSlot, FontSpec, IDWriteFont, IDWriteFontCollection, style_of, weight_of};
+#[cfg(test)]
 use std::ffi::c_void;
 use std::ops::Range;
 
@@ -22,17 +23,18 @@ mod raster;
 
 #[path = "text_line.rs"]
 mod line;
+pub(super) use line::VisualLine;
 
 const MAX_GLYPHS: usize = u16::MAX as usize + 1;
 const INSUFFICIENT_BUFFER: Hresult = -2_147_024_774; // HRESULT_FROM_WIN32(122)
 
-struct BaseFont {
+pub(super) struct BaseFont {
     collection: Com<IDWriteFontCollection>,
     family: Vec<u16>,
     font: Com<IDWriteFont>,
 }
 impl BaseFont {
-    fn new(slot: &FontSlot, spec: &FontSpec) -> Result<Self, TextError> {
+    pub(super) fn new(slot: &FontSlot, spec: &FontSpec) -> Result<Self, TextError> {
         // Read the resolved collection/name, including custom-font precedence
         // and unknown-family policy, from the existing engine's font slot.
         // SAFETY: IDWriteTextFormat has the exact inherited getter slots.
@@ -87,12 +89,12 @@ impl BaseFont {
     }
 }
 
-struct Shaper {
+pub(super) struct Shaper {
     analyzer: Com<ffi::Analyzer>,
     fallback: Com<ffi::Fallback>,
 }
 impl Shaper {
-    fn new(factories: &Factories) -> Result<Self, TextError> {
+    pub(super) fn new(factories: &Factories) -> Result<Self, TextError> {
         let analyzer = Analyzer::new(factories)?;
         let analyzer = ffi::query(&analyzer, &ffi::ANALYZER1, "IDWriteTextAnalyzer1")?;
         let factory: Com<ffi::Factory> =
@@ -106,7 +108,7 @@ impl Shaper {
         Ok(Self { analyzer, fallback })
     }
 
-    fn shape(
+    pub(super) fn shape(
         &self,
         prepared: &Prepared,
         range: Range<usize>,
@@ -382,7 +384,7 @@ enum Visibility {
     Ink,
     Control,
 }
-struct Run {
+pub(super) struct Run {
     source: Range<usize>,
     face: Com<ffi::Face>,
     em_size: f32,
@@ -394,6 +396,7 @@ struct Run {
     offsets: Vec<ffi::Offset>,
 }
 impl Run {
+    #[cfg(test)]
     fn width(&self) -> f64 {
         if self.visibility == Visibility::Control {
             return 0.0;
@@ -492,7 +495,7 @@ pub(super) mod tests;
     clippy::cast_possible_truncation,
     reason = "DirectWrite requires FLOAT; finite range is checked before IEEE-754 precision rounding"
 )]
-fn native_float(value: f64) -> Result<f32, TextError> {
+pub(super) fn native_float(value: f64) -> Result<f32, TextError> {
     if !value.is_finite() || value.abs() > f64::from(f32::MAX) {
         return Err(TextError::InvalidMetrics {
             engine: super::ENGINE,

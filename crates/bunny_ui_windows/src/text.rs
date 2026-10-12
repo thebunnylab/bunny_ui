@@ -36,6 +36,9 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 use bunny_ui::layout::Color;
+use bunny_ui::text_error::TextError;
+use bunny_ui::text_geometry::LineGeometry;
+use bunny_ui::text_source::ParagraphLine;
 use bunny_ui::text_engine::{
     FontDesign, FontKey, FontSpec, LineMetrics, PixelFont, Slant, TextEngine, TextRaster, Weight,
 };
@@ -592,6 +595,7 @@ pub struct DirectWriteEngine {
     fonts: RefCell<HashMap<FontKey, FontSlot>>,
     custom: RefCell<CustomFaces>,
     fallback: PixelFont,
+    paragraphs: RefCell<analysis::Cache>,
 }
 
 fn family_of(design: FontDesign) -> &'static str {
@@ -682,6 +686,7 @@ impl DirectWriteEngine {
                 collection: None,
             }),
             fallback: PixelFont,
+            paragraphs: RefCell::default(),
         }
     }
 
@@ -1037,6 +1042,32 @@ impl Default for DirectWriteEngine {
 mod geometry;
 
 impl TextEngine for DirectWriteEngine {
+    fn measure_paragraph_line(
+        &self,
+        line: &ParagraphLine,
+        font: &FontSpec,
+    ) -> Result<LineMetrics, TextError> {
+        self.contextual_metrics(line, font)
+    }
+
+    fn paragraph_line_geometry(
+        &self,
+        line: &ParagraphLine,
+        font: &FontSpec,
+    ) -> Result<Option<LineGeometry>, TextError> {
+        self.contextual_geometry(line, font).map(Some)
+    }
+
+    fn raster_paragraph_line(
+        &self,
+        line: &ParagraphLine,
+        font: &FontSpec,
+        color: Color,
+        scale: usize,
+    ) -> Result<Option<TextRaster>, TextError> {
+        self.contextual_raster(line, font, color, scale)
+    }
+
     fn line_geometry(
         &self,
         text: &str,
@@ -1405,7 +1436,5 @@ mod geometry_tests;
 #[path = "text_paragraph_tests.rs"]
 mod paragraph_tests;
 
-// Evaluate the native paragraph boundary before changing runtime shaping.
-#[cfg(test)]
 #[path = "text_analysis.rs"]
 mod analysis;

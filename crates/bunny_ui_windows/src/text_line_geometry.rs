@@ -4,10 +4,13 @@ use super::{TextError, VisualLine, preparation};
 use bunny_ui::text_geometry::{LineGeometry, TextCell};
 
 impl VisualLine {
-    pub(super) fn geometry(&self, text: &str) -> Result<LineGeometry, TextError> {
+    pub(in crate::text::analysis) fn geometry(
+        &self,
+        text: &str,
+    ) -> Result<LineGeometry, TextError> {
         let mut logical: Vec<_> = self.clusters.iter().collect();
         logical.sort_by_key(|cluster| cluster.source.start);
-        let mut cells = Vec::new();
+        let mut cells: Vec<TextCell> = Vec::new();
         let mut unit = self.source.start;
         let mut index = 0;
         for (byte, character) in text.char_indices() {
@@ -25,7 +28,12 @@ impl VisualLine {
             if end > cluster.source.end {
                 return Err(preparation("scalar glyph cluster boundary"));
             }
-            let (leading, trailing) = if cluster.level.is_multiple_of(2) {
+            let (leading, trailing) = if self.runs[cluster.run].visibility
+                == super::glyphs::Visibility::Control
+                && let Some(previous) = cells.last()
+            {
+                (previous.trailing(), previous.trailing())
+            } else if cluster.level.is_multiple_of(2) {
                 (cluster.left, cluster.left + cluster.width)
             } else {
                 (cluster.left + cluster.width, cluster.left)

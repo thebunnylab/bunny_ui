@@ -68,17 +68,25 @@ jobs:
           cargo test -p bunny-ui-motor --locked --all-targets
           BUNNY_PARANOID=all cargo test -p bunny-ui-motor --locked --all-targets
       - name: Windows paragraph analysis and glyphs, normal and paranoid
+        id: paragraph-boundary
         if: runner.os == 'Windows'
         run: |
-          cargo test -p bunny-ui-windows --locked --lib text::analysis:: -- --nocapture
-          BUNNY_PARANOID=all cargo test -p bunny-ui-windows --locked --lib text::analysis:: -- --nocapture
+          test_status=0
+          cargo test -p bunny-ui-windows --locked --lib text::analysis:: -- --nocapture || test_status=$?
+          BUNNY_PARANOID=all cargo test -p bunny-ui-windows --locked --lib text::analysis:: -- --nocapture || test_status=$?
+          exit "$test_status"
       - name: Native platform, normal and paranoid
+        # Retain public runtime results even when a paragraph oracle fails.
+        # Both steps still fail the job; no error is ignored or reclassified.
+        if: ${{ !cancelled() && (success() || steps.paragraph-boundary.outcome == 'failure') }}
         env:
           PLATFORM: ${{ matrix.platform }}
         run: |
           # Retain the actual adapter witness on successful parity tests too.
-          cargo test -p "$PLATFORM" --locked --all-targets -- --nocapture
-          BUNNY_PARANOID=all cargo test -p "$PLATFORM" --locked --all-targets -- --nocapture
+          test_status=0
+          cargo test -p "$PLATFORM" --locked --all-targets -- --nocapture || test_status=$?
+          BUNNY_PARANOID=all cargo test -p "$PLATFORM" --locked --all-targets -- --nocapture || test_status=$?
+          exit "$test_status"
 
       - name: Core default, normal and paranoid
         run: |
