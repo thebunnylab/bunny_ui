@@ -62,7 +62,8 @@ use bunny_ui_core::preview::Traits;
 use bunny_ui_core::text_engine::TextEngine;
 use bunny_ui_hot::preview::preview_entry;
 
-use bunny_ui_core::provenance::{self, Override, SiteKey};
+use bunny_ui_core::layout::DisplayList;
+use bunny_ui_core::provenance::{self, Override, SiteKey, SitePlacement};
 
 use crate::convert;
 use crate::scan;
@@ -158,6 +159,14 @@ impl Sent {
     fn same(&self, size: Size, commands: &[wire::Draw], sites: &[wire::SiteBox], strings: &[String]) -> bool {
         self.size == size && self.commands == commands && self.sites == sites && self.strings == strings
     }
+}
+
+/// What one pass of a scene produced.
+struct Pass {
+    size: Size,
+    display: DisplayList,
+    sites: Vec<SitePlacement>,
+    body_passes: u32,
 }
 
 thread_local! {
@@ -301,6 +310,21 @@ impl Host {
                     scene.dirty |= scene.runtime.wheel(x, y, dx, dy);
                 }
             }
+            ToHost::Touch { id, phase, touch, x, y, taps } => {
+                if let Some(scene) = self.scene(&id) {
+                    scene.dirty |= match phase {
+                        wire::TouchPhase::Began => scene.runtime.touch_began(touch, x, y, taps),
+                        wire::TouchPhase::Moved => scene.runtime.touch_moved(touch, x, y),
+                        wire::TouchPhase::Ended => scene.runtime.touch_ended(touch, x, y),
+                        wire::TouchPhase::Cancelled => scene.runtime.touch_cancelled(touch),
+                    };
+                }
+            }
+            ToHost::Magnify { id, x, y, scale } => {
+                if let Some(scene) = self.scene(&id) {
+                    scene.dirty |= scene.runtime.magnify(x, y, scale);
+                }
+            }
             ToHost::Key { id, key, modifiers } => {
                 if let Some(scene) = self.scene(&id)
                     && let Some(stroke) = stroke_named(&key, modifiers)
@@ -336,7 +360,13 @@ impl Host {
                 }
             }
             ToHost::RequestSnapshot { id } => {
-                (self.sink)(ToIde::Status { text: format!("{id}: snapshots arrive with a later version of the host") });
+                let scenes: Vec<usize> = (0..self.scenes.len()).filter(|&index| self.scenes[index].id == id).collect();
+                if scenes.is_empty() {
+                    (self.sink)(ToIde::Status { text: format!("{id}: not selected, nothing to snapshot") });
+                }
+                for index in scenes {
+                    self.snapshot(index);
+                }
             }
             ToHost::Forget { keys } => {
                 for key in keys {
@@ -455,11 +485,12 @@ impl Host {
         sent
     }
 
-    /// Renders scene `index` and sends its frame when it changed.
-    fn render(&mut self, index: usize) -> bool {
-        let began = Instant::now();
+    /// One pass of scene `index` under its size, inside the panic
+    /// boundary: the size it took, its display list, its sites and the
+    /// body passes it cost — or nothing, with the scene poisoned, the
+    /// tool told, and a fresh runtime standing in for the next generation.
+    fn pass(&mut self, index: usize) -> Option<Pass> {
         let scene = &mut self.scenes[index];
-        scene.dirty = false;
         let root = PreviewHost { ident: Rc::clone(&scene.ident) };
         let fixed = scene.resized.or_else(|| scene.traits.frame());
         IN_PASS.with(|flag| flag.set(true));
@@ -476,11 +507,11 @@ impl Host {
             let display = scene.runtime.display_frame(&root, size);
             let sites = scene.runtime.sites();
             let stats = bunny_ui_core::stats::take();
-            (size, display, sites, stats.body_passes)
+            Pass { size, display, sites, body_passes: stats.body_passes }
         }));
         IN_PASS.with(|flag| flag.set(false));
-        let (size, display, sites, body_passes) = match outcome {
-            Ok(rendered) => rendered,
+        match outcome {
+            Ok(pass) => Some(pass),
             Err(_) => {
                 let message = PANIC_MESSAGE.with(|message| message.borrow_mut().take()).unwrap_or_else(|| String::from("a panic with no message"));
                 let ident = scene.ident.to_string();
@@ -494,9 +525,34 @@ impl Host {
                 scene.traits.apply(&fresh);
                 scene.runtime = fresh;
                 (self.sink)(ToIde::Panicked { preview: ident, message });
-                return false;
+                None
             }
-        };
+        }
+    }
+
+    /// Paints scene `index` through the engines its frames are laid out
+    /// with and sends the pixels: `Runtime::frame`'s picture of the same
+    /// display list, at the scene's own scale.
+    fn snapshot(&mut self, index: usize) {
+        if self.scenes[index].poisoned.is_some() {
+            return;
+        }
+        let Some(Pass { size, display, .. }) = self.pass(index) else { return };
+        let scene = &self.scenes[index];
+        let scale = scene.traits.resolved_scale().round().max(1.0) as usize;
+        let width = (size.width * scale as f64).round().max(1.0) as usize;
+        let height = (size.height * scale as f64).round().max(1.0) as usize;
+        let background = scene.runtime.scene_theme().unwrap_or_else(Theme::light).canvas;
+        let bitmap = bunny_ui_core::raster::rasterize_with(&display, width, height, scale, background, &*self.engines.text, &*self.engines.images);
+        (self.sink)(ToIde::Snapshot { preview: scene.ident.to_string(), variant: scene.variant, size: (width as u32, height as u32), rgba: bitmap.to_rgba_bytes() });
+    }
+
+    /// Renders scene `index` and sends its frame when it changed.
+    fn render(&mut self, index: usize) -> bool {
+        let began = Instant::now();
+        self.scenes[index].dirty = false;
+        let Some(Pass { size, display, sites, body_passes }) = self.pass(index) else { return false };
+        let scene = &self.scenes[index];
         let mut strings = wire::Strings::new();
         let (commands, images) = convert::lower(&display, &mut strings);
         let sites: Vec<wire::SiteBox> = sites.iter().map(|placement| convert::site_box(placement, &mut strings)).collect();

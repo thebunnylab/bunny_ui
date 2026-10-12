@@ -7,4 +7,5 @@ pub mod deflate;
 pub mod tar;
 pub mod elf;
 pub mod pe;
+pub mod png;
 pub mod res;
