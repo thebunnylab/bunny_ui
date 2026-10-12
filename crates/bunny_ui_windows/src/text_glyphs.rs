@@ -505,3 +505,7 @@ pub(super) fn native_float(value: f64) -> Result<f32, TextError> {
     }
     Ok(value as f32)
 }
+
+#[cfg(test)]
+#[path = "text_glyph_long_tests.rs"]
+mod long_tests;

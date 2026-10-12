@@ -14,6 +14,8 @@ use crate::text::{
 #[path = "text_glyph_color.rs"]
 mod color;
 pub(super) use color::Renderer;
+#[cfg(test)]
+pub(super) use color::reference::{NativeRun, collect as reference_records};
 
 const CONTEXT4: Guid = Guid {
     d1: 0x8c42_7831,

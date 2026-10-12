@@ -368,4 +368,4 @@ mod tests;
 
 #[cfg(test)]
 #[path = "text_glyph_reference.rs"]
-mod reference;
+pub(super) mod reference;

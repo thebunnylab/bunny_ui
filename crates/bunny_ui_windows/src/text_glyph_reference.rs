@@ -1,9 +1,11 @@
-//! Independent full-layout glyph records used to diagnose native pixel parity.
+//! Independent full-layout glyph records used for native glyph and pixel oracles.
 
 use super::{Com, GlyphRun, Guid, Hresult};
 use crate::ffi::UnknownVtbl;
 use crate::text::{IDWriteTextLayout, com_ok};
+use std::cell::RefCell;
 use std::ffi::c_void;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 #[repr(C)]
@@ -11,7 +13,31 @@ struct Renderer {
     vtbl: *const Vtable,
     references: AtomicU32,
     scale: f32,
+    trace: bool,
+    records: RefCell<Vec<NativeRun>>,
 }
+// DWRITE_GLYPH_RUN_DESCRIPTION from the same pinned dwrite.h. Text positions
+// are original UTF-16 offsets; the cluster map is relative to this glyph run.
+#[repr(C)]
+struct Description {
+    locale: *const u16,
+    text: *const u16,
+    length: u32,
+    clusters: *const u16,
+    position: u32,
+}
+
+#[derive(Debug)]
+pub(in crate::text::analysis::glyphs) struct NativeRun {
+    pub(in crate::text::analysis::glyphs) source: Range<usize>,
+    pub(in crate::text::analysis::glyphs) em_size: f32,
+    pub(in crate::text::analysis::glyphs) level: u32,
+    pub(in crate::text::analysis::glyphs) clusters: Vec<u16>,
+    pub(in crate::text::analysis::glyphs) glyphs: Vec<u16>,
+    pub(in crate::text::analysis::glyphs) advances: Vec<f32>,
+    pub(in crate::text::analysis::glyphs) offsets: Vec<super::super::super::ffi::Offset>,
+}
+
 type Decoration = unsafe extern "system" fn(
     *mut Renderer,
     *mut c_void,
@@ -157,13 +183,13 @@ unsafe extern "system" fn scale(this: *mut Renderer, _: *mut c_void, output: *mu
     0
 }
 unsafe extern "system" fn glyphs(
-    _: *mut Renderer,
+    this: *mut Renderer,
     _: *mut c_void,
     x: f32,
     y: f32,
     mode: u32,
     run: *const GlyphRun<'_>,
-    _: *const c_void,
+    description: *const c_void,
     _: *mut c_void,
 ) -> Hresult {
     if run.is_null() {
@@ -179,14 +205,31 @@ unsafe extern "system" fn glyphs(
         if run.indices.is_null() || run.advances.is_null() || run.offsets.is_null() {
             return -2_147_467_261;
         }
-        eprintln!(
-            "native layout run: origin=({x},{y}), mode={mode}, em={}, level={}, glyphs={:?}, advances={:?}, offsets={:?}",
-            run.em_size,
-            run.level,
-            std::slice::from_raw_parts(run.indices, run.count as usize),
-            std::slice::from_raw_parts(run.advances, run.count as usize),
-            std::slice::from_raw_parts(run.offsets, run.count as usize)
-        );
+        if description.is_null() {
+            return -2_147_467_261;
+        }
+        let description = &*description.cast::<Description>();
+        if description.length == 0 || description.clusters.is_null() {
+            return -2_147_467_261;
+        }
+        let start = description.position as usize;
+        let Some(end) = start.checked_add(description.length as usize) else {
+            return -2_147_024_809;
+        };
+        let record = NativeRun {
+            source: start..end,
+            em_size: run.em_size,
+            level: run.level,
+            clusters: std::slice::from_raw_parts(description.clusters, description.length as usize)
+                .to_vec(),
+            glyphs: std::slice::from_raw_parts(run.indices, run.count as usize).to_vec(),
+            advances: std::slice::from_raw_parts(run.advances, run.count as usize).to_vec(),
+            offsets: std::slice::from_raw_parts(run.offsets, run.count as usize).to_vec(),
+        };
+        if (*this).trace {
+            eprintln!("native layout run: origin=({x},{y}), mode={mode}, {record:?}");
+        }
+        (*this).records.borrow_mut().push(record);
     }
     0
 }
@@ -214,6 +257,16 @@ unsafe extern "system" fn inline(
 }
 
 pub(super) fn trace(layout: &Com<IDWriteTextLayout>, scale: f32) {
+    draw(layout, scale, true);
+}
+
+pub(in crate::text::analysis::glyphs) fn collect(
+    layout: &Com<IDWriteTextLayout>,
+) -> Vec<NativeRun> {
+    draw(layout, 1.0, false)
+}
+
+fn draw(layout: &Com<IDWriteTextLayout>, scale: f32, trace: bool) -> Vec<NativeRun> {
     #[repr(C)]
     struct Layout {
         vtbl: *const LayoutTable,
@@ -228,6 +281,8 @@ pub(super) fn trace(layout: &Com<IDWriteTextLayout>, scale: f32) {
         vtbl: &raw const VTABLE,
         references: AtomicU32::new(1),
         scale,
+        trace,
+        records: RefCell::new(Vec::new()),
     })))
     .unwrap();
     // SAFETY: exact IDWriteTextLayout::Draw slot and an owned text renderer.
@@ -241,5 +296,6 @@ pub(super) fn trace(layout: &Com<IDWriteTextLayout>, scale: f32) {
             8.0
         )));
         assert_eq!((*renderer.as_ptr()).references.load(Ordering::Acquire), 1);
+        (*renderer.as_ptr()).records.take()
     }
 }
