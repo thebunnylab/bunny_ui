@@ -137,6 +137,16 @@ the same way, with the pixels the engine shows right now. Opening the
 engine's own inspector stays the OS's door (on macOS the view is
 inspectable: right-click, Inspect Element).
 
+Under `bunny preview` and Studio the app has no window, and a page is
+the one thing on the frame the host cannot draw: its box rides the
+wire as a placeholder with its kind and rect. On the Mac the shell
+opens an offscreen desk for the preview host — a window nobody sees,
+one `WKWebView` per hosted box — and the page's own snapshot rides
+the frame as its picture, taken when the load finishes and again
+whenever its pixels move, so the dock and `bunny preview --png` show
+the page. `--engine house` keeps the placeholder: a golden must be the
+same on every OS, and a page's pixels are the platform's.
+
 The input door is the hand an app lends the page. Its vocabulary has
 two halves: `click`, `hover`, `scroll`, `type_text` and `key` are what
 a tool does — each one complete in itself — while `Down`, `Drag` and

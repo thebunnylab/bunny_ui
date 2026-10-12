@@ -4,14 +4,17 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use bunny_ui_core as bunny_ui;
 use bunny_ui::prelude::*;
 use bunny_ui_hot::preview::{Meta, Output, PreviewEntry};
-use bunny_ui_preview::host::{Config, Engines, Host};
+use bunny_ui::image_engine::ImageSource;
+use bunny_ui::layout::HostPlacement;
+use bunny_ui_preview::host::{Config, Engines, Host, HostId, Pictures};
 use bunny_ui_preview::wire::{self, Selection, ToHost, ToIde, Traits};
 
 #[derive(Clone)]
@@ -464,9 +467,9 @@ fn a_host_box_rides_the_frame_and_a_door_fills_it() {
     assert_eq!((webview.frame.size.width, webview.frame.size.height), (160.0, 90.0));
     assert!(!frame.commands.iter().any(|command| matches!(command, wire::Draw::Image { .. })), "no door, no picture");
 
-    let mut host = host.with_pictures(Box::new(|placement| {
+    let mut host = host.with_pictures(Box::new(|placement: &HostPlacement| {
         assert!(matches!(placement.spec, bunny_ui::host::HostSpec::Webview { .. }));
-        Some(bunny_ui::image_engine::ImageSource::Rgba { key: 77, size: (2, 2), rgba: Rc::from(vec![9u8; 16]) })
+        Some(ImageSource::Rgba { key: 77, size: (2, 2), rgba: Rc::from(vec![9u8; 16]) })
     }));
     assert!(host.tick(), "the door's picture is a new frame");
     let messages = seen.borrow_mut().drain(..).collect::<Vec<_>>();
@@ -487,4 +490,141 @@ fn a_host_box_rides_the_frame_and_a_door_fills_it() {
         frame.commands
     );
     assert_eq!(frame.hosts.len(), 1, "the box still rides the frame");
+}
+
+/// Boxes by scene and path, as the host names them to a door.
+type Boxes = Vec<(String, String)>;
+
+/// A door for the tests: the picture it answers, the move it reports,
+/// whether it is busy — the test's to set — and what the host asked and
+/// told it.
+#[derive(Clone, Default)]
+struct Door {
+    picture: Rc<RefCell<Option<ImageSource>>>,
+    moved: Rc<Cell<bool>>,
+    busy: Rc<Cell<bool>>,
+    asked: Rc<RefCell<Boxes>>,
+    told: Rc<RefCell<Vec<Boxes>>>,
+}
+
+impl Pictures for Door {
+    fn picture(&mut self, id: HostId<'_>, _placement: &HostPlacement) -> Option<ImageSource> {
+        self.asked.borrow_mut().push((id.scene.to_string(), id.path.to_string()));
+        self.picture.borrow().clone()
+    }
+
+    fn turn(&mut self) -> bool {
+        self.moved.replace(false)
+    }
+
+    fn busy(&self) -> bool {
+        self.busy.get()
+    }
+
+    fn sweep(&mut self, alive: &[HostId<'_>]) {
+        self.told.borrow_mut().push(alive.iter().map(|id| (id.scene.to_string(), id.path.to_string())).collect());
+    }
+}
+
+/// A two-by-two red picture under `key`.
+fn red(key: u64) -> ImageSource {
+    ImageSource::Rgba { key, size: (2, 2), rgba: Rc::from([255u8, 0, 0, 255].repeat(4)) }
+}
+
+fn snapshots(seen: &Rc<RefCell<Vec<ToIde>>>) -> Vec<((u32, u32), Vec<u8>)> {
+    seen.borrow()
+        .iter()
+        .filter_map(|message| match message {
+            ToIde::Snapshot { size, rgba, .. } => Some((*size, rgba.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The door is asked by scene and path on every render; a picture that
+/// moved on its turn renders the scene with the box again, and the
+/// same picture does not.
+#[test]
+fn a_moved_picture_renders_the_scene_with_the_box_again() {
+    let (host, seen) = host();
+    let door = Door::default();
+    let mut host = host.with_pictures(Box::new(door.clone()));
+    host.handle(select("page", fixed(200.0, 140.0)));
+    assert!(host.tick());
+    let frame = frames(&seen).remove(0);
+    assert!(!frame.commands.iter().any(|command| matches!(command, wire::Draw::Image { .. })), "no picture yet: the placeholder");
+    let asked = door.asked.borrow().clone();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0].0, "p0", "the scene names the page");
+    assert!(!asked[0].1.is_empty(), "and so does the path");
+    assert!(!host.tick(), "nothing moved: no frame");
+    *door.picture.borrow_mut() = Some(red(7));
+    door.moved.set(true);
+    assert!(host.tick(), "a moved picture is a new frame");
+    let frame = frames(&seen).remove(0);
+    assert!(frame.commands.iter().any(|command| matches!(command, wire::Draw::Image { image, .. } if image.key == 7)), "{:?}", frame.commands);
+    assert!(!host.tick(), "the same picture: no frame");
+}
+
+/// A snapshot asked while the door is busy waits: the host keeps its
+/// turns short, and answers with the page's pixels where the box stood
+/// once the door settled.
+#[test]
+fn a_snapshot_asked_while_the_door_is_busy_waits_for_the_picture() {
+    let (host, seen) = host();
+    let door = Door::default();
+    door.busy.set(true);
+    let mut host = host.with_pictures(Box::new(door.clone()));
+    host.handle(select("page", fixed(200.0, 140.0)));
+    assert!(host.tick());
+    let frame = frames(&seen).remove(0);
+    let webview = frame.hosts[0].clone();
+    host.handle(ToHost::RequestSnapshot { id: String::from("src/lib.rs#page") });
+    assert!(host.needs_turn(), "a busy door keeps the turns short");
+    host.tick();
+    assert!(snapshots(&seen).is_empty(), "the snapshot waits for the picture");
+    *door.picture.borrow_mut() = Some(red(9));
+    door.moved.set(true);
+    door.busy.set(false);
+    host.tick();
+    let taken = snapshots(&seen);
+    assert_eq!(taken.len(), 1, "the snapshot answers once the door settled");
+    let ((width, _), rgba) = &taken[0];
+    let x = (webview.frame.origin.x + webview.frame.size.width / 2.0) as usize;
+    let y = (webview.frame.origin.y + webview.frame.size.height / 2.0) as usize;
+    let at = (y * *width as usize + x) * 4;
+    assert_eq!(&rgba[at..at + 4], &[255, 0, 0, 255], "the page's red at the box's centre");
+}
+
+/// Patience runs out: the snapshot answers with the frame as it stands.
+#[test]
+fn a_snapshot_held_past_its_patience_answers_without_the_picture() {
+    let (host, seen) = host();
+    let door = Door::default();
+    door.busy.set(true);
+    let mut host = host.with_pictures(Box::new(door.clone())).with_patience(Duration::ZERO);
+    host.handle(select("page", fixed(200.0, 140.0)));
+    assert!(host.tick());
+    let _ = frames(&seen);
+    host.handle(ToHost::RequestSnapshot { id: String::from("src/lib.rs#page") });
+    host.tick();
+    assert_eq!(snapshots(&seen).len(), 1, "patience ran out: the frame as it stands");
+}
+
+/// The door hears which boxes live after the first frame, and hears
+/// nothing lives when the scene leaves.
+#[test]
+fn the_door_is_told_what_lives_when_a_scene_leaves() {
+    let (host, _seen) = host();
+    let door = Door::default();
+    let mut host = host.with_pictures(Box::new(door.clone()));
+    host.handle(select("page", fixed(200.0, 140.0)));
+    host.tick();
+    let told = door.told.borrow().clone();
+    let last = told.last().expect("told after the first frame");
+    assert_eq!(last.len(), 1, "{told:?}");
+    assert_eq!(last[0].0, "p0");
+    host.handle(ToHost::Select(vec![]));
+    host.tick();
+    assert_eq!(door.told.borrow().last().map(Vec::len), Some(0), "nothing lives");
 }

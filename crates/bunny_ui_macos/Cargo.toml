@@ -35,3 +35,8 @@ harness = false
 [[test]]
 name = "window_lifecycle"
 harness = false
+
+# the desk's window and its pages are AppKit's too
+[[test]]
+name = "pictures"
+harness = false

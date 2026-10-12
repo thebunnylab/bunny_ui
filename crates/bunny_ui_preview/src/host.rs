@@ -18,9 +18,14 @@
 //! A platform view's box — a webview, a video — rides every frame as a
 //! `HostBox` with its kind and its rect, so the tool draws an honest
 //! placeholder where the platform would composite its view. A shell
-//! that can picture such a view hands the host a [`Pictures`] door, and
-//! the picture is spliced into the display list where the host stood
-//! (`DisplayList::with_host_pixels`); without a door the box is all
+//! that can picture such a view hands the host a [`Pictures`] door (the
+//! macOS shell's offscreen desk, `bunny_ui_macos::pictures`, under the
+//! facade): the host turns the door each tick, renders the scenes with
+//! boxes again when a picture moved, splices each picture into the
+//! display list where its host stood (`DisplayList::with_host_pixels`),
+//! tells the door which boxes still live, and holds a `RequestSnapshot`
+//! while the door is busy — a page loading, a shot in flight — so
+//! `bunny preview --png` paints the page. Without a door the box is all
 //! there is, and the placeholder is the truth.
 //!
 //! A panic inside one preview's pass is caught at that scene's boundary:
@@ -92,10 +97,55 @@ impl Engines {
     }
 }
 
-/// A shell's door to the pixels of a platform view: the page a webview
-/// shows, the frame a video is on — by the host's placement, `None`
-/// where the shell has no picture to give.
-pub type Pictures = Box<dyn Fn(&HostPlacement) -> Option<ImageSource>>;
+/// A hosted box's identity across the host's scenes: the scene it stands
+/// in and its path there. The same preview under two variants is two
+/// scenes, and its page two pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HostId<'a> {
+    /// The scene's name — `p0`, `p1`, … in the order the host opened them.
+    pub scene: &'a str,
+    /// The box's path in the scene, as the layout names it.
+    pub path: &'a str,
+}
+
+/// A shell's door to the pictures of its platform views: the page a
+/// webview shows, the frame a video is on. The host asks per placement
+/// on every render, turns the door once per tick, and tells it which
+/// boxes still live. A closure of the placement alone is a door too —
+/// one that never moves, is never busy, and keeps nothing.
+pub trait Pictures {
+    /// The picture of the box `id` at `placement`, if the shell has one
+    /// — a shell mounts on the first ask and answers `None` until the
+    /// page pictures.
+    fn picture(&mut self, id: HostId<'_>, placement: &HostPlacement) -> Option<ImageSource>;
+
+    /// One turn of the shell's own loop: its callbacks landed, its shots
+    /// taken. Answers whether a picture moved, so the scenes with boxes
+    /// render again.
+    fn turn(&mut self) -> bool {
+        false
+    }
+
+    /// Whether the shell has work in flight — a page loading, a shot
+    /// asked — so the host keeps its turns short and holds a snapshot
+    /// of the frame for the picture.
+    fn busy(&self) -> bool {
+        false
+    }
+
+    /// The boxes still on a frame; the pages of every other may go.
+    fn sweep(&mut self, _alive: &[HostId<'_>]) {}
+}
+
+impl<F: FnMut(&HostPlacement) -> Option<ImageSource>> Pictures for F {
+    fn picture(&mut self, _id: HostId<'_>, placement: &HostPlacement) -> Option<ImageSource> {
+        self(placement)
+    }
+}
+
+/// How long a snapshot waits for a busy door before it answers with the
+/// frame as it stands.
+const PATIENCE: Duration = Duration::from_secs(5);
 
 /// What the host says about the app it runs.
 #[derive(Clone, Debug)]
@@ -146,6 +196,9 @@ struct Scene {
     poisoned: Option<String>,
     dirty: bool,
     overrides: Vec<(wire::SiteKey, wire::OverrideOp, wire::Patch)>,
+    /// The paths of the boxes on the last frame — what the door keeps
+    /// pages for, and what renders again when a picture moved.
+    hosts: Vec<String>,
 }
 
 /// Whether an override put on a site stands in for one standing there: a
@@ -243,15 +296,35 @@ pub struct Host {
     sent_resources: HashSet<u64>,
     generation: u32,
     sink: Box<dyn FnMut(ToIde)>,
-    /// A shell's pictures of its platform views, when it has them.
-    pictures: Option<Pictures>,
+    /// A shell's door to the pictures of its platform views, when it
+    /// has one.
+    pictures: Option<Box<dyn Pictures>>,
+    /// How long a snapshot waits for a busy door.
+    patience: Duration,
+    /// Snapshots asked while the door was busy: each scene id and the
+    /// instant it stops waiting.
+    held: Vec<(String, Instant)>,
+    /// A scene or a box left since the door was last told what lives.
+    resweep: bool,
 }
 
 impl Host {
     /// A host that sends through `sink`. Installs the pass guard.
     pub fn new(engines: Engines, config: Config, sink: Box<dyn FnMut(ToIde)>) -> Host {
         guard_passes();
-        Host { engines, config, scenes: Vec::new(), next_scene: 0, sent_resources: HashSet::new(), generation: bunny_ui_hot::generation(), sink, pictures: None }
+        Host {
+            engines,
+            config,
+            scenes: Vec::new(),
+            next_scene: 0,
+            sent_resources: HashSet::new(),
+            generation: bunny_ui_hot::generation(),
+            sink,
+            pictures: None,
+            patience: PATIENCE,
+            held: Vec::new(),
+            resweep: false,
+        }
     }
 
     /// `Hello`, then the first `Ready`.
@@ -299,14 +372,23 @@ impl Host {
         (self.sink)(ToIde::Ready { generation: self.generation, previews, missing });
     }
 
-    /// The host with a shell's pictures of its platform views: each
-    /// spliced into the frame where its host stood, and sent as the
-    /// resource it is. Without one the boxes ride the frame alone.
-    pub fn with_pictures(mut self, pictures: Pictures) -> Host {
+    /// The host with a shell's door to its platform views' pictures:
+    /// each spliced into the frame where its host stood, and sent as
+    /// the resource it is. Without one the boxes ride the frame alone.
+    pub fn with_pictures(mut self, pictures: Box<dyn Pictures>) -> Host {
         self.pictures = Some(pictures);
+        self.resweep = true;
         for scene in &mut self.scenes {
             scene.dirty = true;
         }
+        self
+    }
+
+    /// How long a snapshot asked while the door is busy waits for the
+    /// picture before it answers with the frame as it stands — five
+    /// seconds unless told otherwise.
+    pub fn with_patience(mut self, patience: Duration) -> Host {
+        self.patience = patience;
         self
     }
 
@@ -397,12 +479,15 @@ impl Host {
                 }
             }
             ToHost::RequestSnapshot { id } => {
-                let scenes: Vec<usize> = (0..self.scenes.len()).filter(|&index| self.scenes[index].id == id).collect();
-                if scenes.is_empty() {
+                if !self.scenes.iter().any(|scene| scene.id == id) {
                     (self.sink)(ToIde::Status { text: format!("{id}: not selected, nothing to snapshot") });
-                }
-                for index in scenes {
-                    self.snapshot(index);
+                } else if self.pictures.as_ref().is_some_and(|door| door.busy()) {
+                    // a page still loading, a shot in flight: the picture
+                    // is worth the wait, and the frame as it stands is
+                    // the answer when patience runs out
+                    self.held.push((id, Instant::now() + self.patience));
+                } else {
+                    self.snapshot_scenes(&id);
                 }
             }
             ToHost::Forget { keys } => {
@@ -446,6 +531,7 @@ impl Host {
             }
         }
         self.scenes = kept;
+        self.resweep = true;
         self.push_overrides();
     }
 
@@ -485,12 +571,13 @@ impl Host {
             poisoned: None,
             dirty: true,
             overrides: Vec::new(),
+            hosts: Vec::new(),
         }
     }
 
     /// Whether any scene wants a frame without being asked.
     pub fn needs_turn(&self) -> bool {
-        self.scenes.iter().any(|scene| scene.dirty || scene.runtime.needs_frame())
+        self.scenes.iter().any(|scene| scene.dirty || scene.runtime.needs_frame()) || self.pictures.as_ref().is_some_and(|door| door.busy())
     }
 
     /// One turn: tasks polled, a new generation announced, every scene
@@ -509,6 +596,17 @@ impl Host {
                 scene.dirty = true;
             }
         }
+        // the door's turn next: a picture that landed rides this tick's
+        // frames, in every scene with a box
+        if let Some(door) = self.pictures.as_mut()
+            && door.turn()
+        {
+            for scene in &mut self.scenes {
+                if !scene.hosts.is_empty() {
+                    scene.dirty = true;
+                }
+            }
+        }
         let mut sent = false;
         for index in 0..self.scenes.len() {
             if self.scenes[index].poisoned.is_some() {
@@ -519,7 +617,56 @@ impl Host {
             }
             sent |= self.render(index);
         }
+        self.answer_held();
+        self.sweep_door();
         sent
+    }
+
+    /// The snapshots held for the door: answered when it settled, or
+    /// when their patience ran out.
+    fn answer_held(&mut self) {
+        if self.held.is_empty() {
+            return;
+        }
+        let busy = self.pictures.as_ref().is_some_and(|door| door.busy());
+        let now = Instant::now();
+        let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held).into_iter().partition(|(_, until)| !busy || *until <= now);
+        self.held = waiting;
+        for (id, _) in due {
+            self.snapshot_scenes(&id);
+        }
+    }
+
+    /// Tells the door which boxes still live, once a scene or a box left.
+    fn sweep_door(&mut self) {
+        if !self.resweep {
+            return;
+        }
+        self.resweep = false;
+        let Some(door) = self.pictures.as_mut() else { return };
+        let alive: Vec<HostId<'_>> = self.scenes.iter().flat_map(|scene| scene.hosts.iter().map(|path| HostId { scene: &scene.name, path })).collect();
+        door.sweep(&alive);
+    }
+
+    /// Every scene of `id`, snapshot.
+    fn snapshot_scenes(&mut self, id: &str) {
+        let scenes: Vec<usize> = (0..self.scenes.len()).filter(|&index| self.scenes[index].id == id).collect();
+        for index in scenes {
+            self.snapshot(index);
+        }
+    }
+
+    /// The display with the door's pictures spliced where the hosts
+    /// stood, so the tool paints the page and not a placeholder — or
+    /// the display as it is, without a door or before a page pictures.
+    fn pictured(&mut self, index: usize, hosts: &[HostPlacement], display: DisplayList) -> DisplayList {
+        let Some(door) = self.pictures.as_mut() else { return display };
+        let scene = &self.scenes[index].name;
+        let pictures: Vec<(usize, bunny_ui_core::layout::Rect, ImageSource)> = hosts
+            .iter()
+            .filter_map(|host| door.picture(HostId { scene, path: &host.path }, host).map(|picture| (host.mark, host.frame, picture)))
+            .collect();
+        if pictures.is_empty() { display } else { display.with_host_pixels(&pictures) }
     }
 
     /// One pass of scene `index` under its size, inside the panic
@@ -575,7 +722,8 @@ impl Host {
         if self.scenes[index].poisoned.is_some() {
             return;
         }
-        let Some(Pass { size, display, .. }) = self.pass(index) else { return };
+        let Some(Pass { size, display, hosts, .. }) = self.pass(index) else { return };
+        let display = self.pictured(index, &hosts, display);
         let scene = &self.scenes[index];
         let scale = scene.traits.resolved_scale().round().max(1.0) as usize;
         let width = (size.width * scale as f64).round().max(1.0) as usize;
@@ -590,16 +738,8 @@ impl Host {
         let began = Instant::now();
         self.scenes[index].dirty = false;
         let Some(Pass { size, display, sites, hosts, body_passes }) = self.pass(index) else { return false };
-        // a shell with pictures of its platform views: each spliced where
-        // its host stood, so the tool paints the page and not a placeholder
-        let display = match &self.pictures {
-            Some(door) => {
-                let pictures: Vec<(usize, bunny_ui_core::layout::Rect, ImageSource)> =
-                    hosts.iter().filter_map(|host| door(host).map(|picture| (host.mark, host.frame, picture))).collect();
-                if pictures.is_empty() { display } else { display.with_host_pixels(&pictures) }
-            }
-            None => display,
-        };
+        let display = self.pictured(index, &hosts, display);
+        let paths: Vec<String> = hosts.iter().map(|host| host.path.clone()).collect();
         let scene = &self.scenes[index];
         let mut strings = wire::Strings::new();
         let (commands, images) = convert::lower(&display, &mut strings);
@@ -625,6 +765,10 @@ impl Host {
         }
         let scene = &mut self.scenes[index];
         scene.seq += 1;
+        if scene.hosts != paths {
+            scene.hosts = paths;
+            self.resweep = true;
+        }
         let background = scene.runtime.scene_theme().unwrap_or_else(Theme::light).canvas;
         let frame = wire::Frame {
             preview: scene.ident.to_string(),
@@ -707,10 +851,17 @@ enum Order {
 /// Runs the host in `mode` and never returns: `Check` prints and exits,
 /// `Serve` serves until the tool says `Bye` or the line closes.
 pub fn serve(mode: Mode, engines: Engines, config: Config) -> ! {
+    serve_with(mode, engines, config, None)
+}
+
+/// [`serve`], with a shell's door to its platform views' pictures: the
+/// serving host turns it each tick and splices what it gives. The check
+/// renders once and has no use for one.
+pub fn serve_with(mode: Mode, engines: Engines, config: Config, pictures: Option<Box<dyn Pictures>>) -> ! {
     match mode {
         Mode::Check { idents } => check(idents, engines, config),
         Mode::Serve { port } => {
-            let code = serve_port(port, engines, config);
+            let code = serve_port(port, engines, config, pictures);
             std::process::exit(code)
         }
     }
@@ -749,7 +900,7 @@ fn check(idents: Vec<String>, engines: Engines, config: Config) -> ! {
     std::process::exit(if ok { 0 } else { 1 })
 }
 
-fn serve_port(port: u16, engines: Engines, config: Config) -> i32 {
+fn serve_port(port: u16, engines: Engines, config: Config, pictures: Option<Box<dyn Pictures>>) -> i32 {
     let Ok(stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
         eprintln!("bunny preview: nothing listens on 127.0.0.1:{port}");
         return 2;
@@ -804,6 +955,9 @@ fn serve_port(port: u16, engines: Engines, config: Config) -> i32 {
             }
         }),
     );
+    if let Some(pictures) = pictures {
+        host = host.with_pictures(pictures);
+    }
     host.hello();
     loop {
         let wait = if host.needs_turn() { Duration::from_millis(16) } else { Duration::from_secs(1) };
