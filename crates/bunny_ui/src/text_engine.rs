@@ -562,7 +562,8 @@ pub(crate) fn line_spans(
 
 /// GREEDY breaking by word with the engine's real measurements:
 /// contiguous byte ranges, one per line. A word wider than the line
-/// breaks per char (never less than one). Spaces hang at the end of the
+/// breaks at extended grapheme boundaries (never less than one cluster). A
+/// cluster wider than the line overflows intact. Spaces hang at the end of the
 /// line (they do not force a break — the classic behavior).
 pub fn break_lines(
     text: &str,
@@ -611,51 +612,59 @@ fn wrap_paragraph(
         lines.push((start, stop));
         return;
     }
+    // Resolve boundaries once for this paragraph: every token and forced
+    // break must use them, including spaces carrying combining marks. The
+    // segmentation pass is linear even for long regional-indicator runs.
+    let boundaries = crate::grapheme::boundaries(&text[start..stop]);
+    let byte = |index: usize| start + boundaries[index];
+    let last = boundaries.len() - 1;
     let mut line_start = start;
-    let mut cursor = start;
+    let mut cursor = 0;
 
-    while cursor < stop {
-        let rest = &text[cursor..stop];
-        let is_space = rest.starts_with(' ');
-        let token_len = if is_space {
-            rest.find(|c| c != ' ').unwrap_or(rest.len())
-        } else {
-            rest.find(' ').unwrap_or(rest.len())
-        };
-        let token_end = cursor + token_len;
+    while cursor < last {
+        let is_space = text[byte(cursor)..stop].starts_with(' ');
+        let mut token_end = cursor + 1;
+        while token_end < last && text[byte(token_end)..stop].starts_with(' ') == is_space {
+            token_end += 1;
+        }
 
         if !is_space {
-            let width = cache.get_or_measure(&text[line_start..token_end], font, engine).width;
-            if width > max_width && cursor > line_start {
-                // the word did not fit: break BEFORE it (the spaces
-                // already walked hang at the end of the previous line)
-                lines.push((line_start, cursor));
-                line_start = cursor;
+            let width = cache
+                .get_or_measure(&text[line_start..byte(token_end)], font, engine)
+                .width;
+            if width > max_width && byte(cursor) > line_start {
+                // The spaces already walked hang at the previous line's end.
+                lines.push((line_start, byte(cursor)));
+                line_start = byte(cursor);
                 continue;
             }
             if width > max_width {
-                // a lone word wider than the line: break per char at the
-                // largest prefix that fits — at least one
-                let mut end = cursor + rest.chars().next().map(char::len_utf8).unwrap_or(1);
-                for (offset, _) in rest[..token_len].char_indices().skip(1) {
+                // Keep at least one whole cluster, even if it cannot fit. A
+                // narrower scalar prefix would corrupt the visible character.
+                let mut end = cursor + 1;
+                for candidate in cursor + 2..=token_end {
                     if cache
-                        .get_or_measure(&text[line_start..cursor + offset], font, engine)
+                        .get_or_measure(&text[line_start..byte(candidate)], font, engine)
                         .width
                         > max_width
                     {
                         break;
                     }
-                    end = cursor + offset;
+                    end = candidate;
                 }
-                lines.push((line_start, end));
-                line_start = end;
+                lines.push((line_start, byte(end)));
+                line_start = byte(end);
                 cursor = end;
                 continue;
             }
         }
         cursor = token_end;
     }
-    lines.push((line_start, stop));
+    // An oversized final cluster has already emitted the last line. A soft
+    // break must not invent an empty row; hard breaks are handled by the caller.
+    if line_start < stop {
+        lines.push((line_start, stop));
+    }
 }
 
 /// True when the paragraph is one line at `max_width`. Printable ASCII

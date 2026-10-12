@@ -62,6 +62,13 @@ and IME composition ranges retain their UTF-16/scalar contract; content is never
 normalized. Word commands retain their existing character classes, and horizontal
 movement remains logical rather than visual BiDi navigation.
 
+Soft wrapping also keeps extended grapheme clusters intact, including a space
+with combining marks. An overlong word breaks only between clusters. A single
+cluster wider than the available line overflows intact rather than being split;
+it does not add an empty trailing row. Hard newlines retain their existing line
+boundaries. This is grapheme-safe wrapping, not Unicode line-break tailoring or
+paragraph-aware bidirectional layout.
+
 The boundary rules are Unicode 17.0.0 / UAX #29 revision 47. The core has no new
 dependency. All 766 official GraphemeBreakTest cases exercise the public edit API
 forward, backward and from interior scalar positions. Generated property inputs

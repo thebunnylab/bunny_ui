@@ -34,7 +34,8 @@ fn check_ranges(text: &str, allowed: &[usize], lines: &[(usize, usize)]) {
     assert_eq!(next, text.len());
 }
 
-pub(crate) fn clusters_stay_whole(engine: &dyn TextEngine) {
+/// Assert legal line boundaries across native widths and oversized clusters.
+pub fn clusters_stay_whole(engine: &dyn TextEngine) {
     let font = FontSpec::DEFAULT;
     for clusters in [
         &CLUSTERS[..],
@@ -70,7 +71,8 @@ pub(crate) fn clusters_stay_whole(engine: &dyn TextEngine) {
     }
 }
 
-pub(crate) fn retained_editor_keeps_atomic_lines(engine: Rc<dyn TextEngine>) {
+/// Assert retained drawing and vertical motion share atomic wrap boundaries.
+pub fn retained_editor_keeps_atomic_lines(engine: Rc<dyn TextEngine>) {
     let runtime = Runtime::new().text_engine(engine);
     let content = State::new(CLUSTERS.concat());
     let view = text_editor("", content.binding())
@@ -101,7 +103,7 @@ pub(crate) fn retained_editor_keeps_atomic_lines(engine: Rc<dyn TextEngine>) {
         check_ranges(&text, &allowed, &ranges);
         assert!(runtime.focus_named("editor"));
         runtime.key(EditCommand::Home(false));
-        for _ in 0..ranges.len() + 1 {
+        for _ in 0..=ranges.len() {
             let caret = runtime.ime_snapshot().unwrap().selected.0;
             assert!(
                 allowed.contains(&utf16_to_byte(&text, caret)),
