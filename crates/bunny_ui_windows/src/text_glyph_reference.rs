@@ -263,6 +263,11 @@ pub(super) fn trace(layout: &Com<IDWriteTextLayout>, scale: f32) {
 pub(in crate::text::analysis::glyphs) fn collect(
     layout: &Com<IDWriteTextLayout>,
 ) -> Vec<NativeRun> {
+    #[repr(C)]
+    struct HeightTable {
+        prefix: [usize; 29],
+        set_height: unsafe extern "system" fn(*mut c_void, f32) -> Hresult,
+    }
     let mut metrics = DwriteTextMetrics::default();
     // SAFETY: the independently created layout owns its original text and font.
     // Realize native layout before collecting its synchronous draw callbacks.
@@ -276,11 +281,6 @@ pub(in crate::text::analysis::glyphs) fn collect(
     // oracle's height close to its measured content; at small font sizes the
     // oversized box can produce valid metrics but no DrawGlyphRun callbacks.
     // This does not alter width, text, wrapping, font or paragraph direction.
-    #[repr(C)]
-    struct HeightTable {
-        prefix: [usize; 29],
-        set_height: unsafe extern "system" fn(*mut c_void, f32) -> Hresult,
-    }
     assert!(metrics.height.is_finite() && metrics.height >= 0.0);
     // SAFETY: pinned IDWriteTextLayout::SetMaxHeight slot 29, with a live layout.
     unsafe {
