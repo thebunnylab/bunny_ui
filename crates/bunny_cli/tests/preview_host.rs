@@ -1,7 +1,9 @@
 //! The preview road end to end, with its clock: a project `bunny new`
 //! writes, built hot with its preview entries and started as a host; the
 //! template's own `home_preview` selected and framed; a click on its
-//! button answered with a new frame; a save reloaded with the count kept.
+//! button answered with a new frame; a save reloaded with the count kept;
+//! a save in a sibling crate's body reloaded too, and a type moved there
+//! a restart, said.
 //! Then `bunny preview --png` takes a picture of the same preview through
 //! the host's snapshot door. Every step prints `@@bunny-timing <step> <ms>`, and under
 //! `BUNNY_TIMING_STRICT=1` the budgets of NFR-STUDIO-1 are asserted:
@@ -119,6 +121,19 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let app = here.join("preview_app");
+    // a sibling crate beside the app: the greeting comes from it
+    let kit = here.join("ui_kit");
+    fs::create_dir_all(kit.join("src")).unwrap();
+    fs::write(kit.join("Cargo.toml"), "[package]\nname = \"ui_kit\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n").unwrap();
+    fs::write(kit.join("src/lib.rs"), "pub fn greeting() -> &'static str {\n    \"Hello from bunny-ui\"\n}\n").unwrap();
+    let manifest = app.join("Cargo.toml");
+    let text = fs::read_to_string(&manifest).unwrap();
+    assert!(text.contains("[dependencies]\n"), "{text}");
+    fs::write(&manifest, text.replacen("[dependencies]\n", "[dependencies]\nui_kit = { path = \"../ui_kit\" }\n", 1)).unwrap();
+    let lib = app.join("src/lib.rs");
+    let source = fs::read_to_string(&lib).unwrap();
+    assert!(source.contains("text(\"Hello from bunny-ui\")"), "{source}");
+    fs::write(&lib, source.replace("text(\"Hello from bunny-ui\")", "text(ui_kit::greeting())")).unwrap();
     // one target directory for the road, shared across runs of this test
     fs::create_dir_all(app.join(".cargo")).unwrap();
     fs::write(
@@ -211,6 +226,42 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
     timing("save", began.elapsed(), Some(Duration::from_millis(800)));
     assert!(says(&frame, "You tapped 1 times"), "the state survived the swap: {:?}", frame.strings);
     assert!(frame.generation >= 2);
+
+    // a save in the sibling's body: the crate is built again, the
+    // generation that links it loads, the count stays
+    let kit_lib = kit.join("src/lib.rs");
+    let kit_source = fs::read_to_string(&kit_lib).unwrap();
+    fs::write(&kit_lib, kit_source.replace("Hello from bunny-ui", "Hello from ui_kit")).unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while live.saved().is_none() {
+        assert!(Instant::now() < until, "the sibling's save was not noticed");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let began = Instant::now();
+    let mut events = Vec::new();
+    live.reload(&mut events);
+    assert!(events.iter().any(|event| matches!(event, Event::Reloaded { .. })), "a body edit in a sibling reloads: {events:?}");
+    let frame = expect(&mut live, Duration::from_secs(10), |message| match message {
+        ToIde::Frame(frame) if frame.preview == "home_preview" && says(frame, "Hello from ui_kit") => Some(frame.clone()),
+        _ => None,
+    });
+    timing("sibling_save", began.elapsed(), Some(Duration::from_millis(800)));
+    assert!(says(&frame, "You tapped 1 times"), "the state survived the sibling's swap: {:?}", frame.strings);
+
+    // a type moved in the sibling: no salt renames its types, so the
+    // road asks for a restart and says whose
+    fs::write(&kit_lib, format!("{}\npub struct Greeting;\n", fs::read_to_string(&kit_lib).unwrap())).unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while live.saved().is_none() {
+        assert!(Instant::now() < until, "the sibling's second save was not noticed");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut events = Vec::new();
+    live.reload(&mut events);
+    assert!(
+        events.iter().any(|event| matches!(event, Event::RestartNeeded(why) if why.contains("ui_kit"))),
+        "a type in a sibling asks for a restart by name: {events:?}"
+    );
 
     live.stop();
 
