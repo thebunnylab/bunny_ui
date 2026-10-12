@@ -1,5 +1,5 @@
 use super::*;
-use crate::text::{DirectWriteEngine, DwriteTextMetrics, create_layout};
+use crate::text::{DirectWriteEngine, DwriteTextMetrics, IDWriteTextLayout, create_layout};
 use bunny_ui::text_engine::{FontDesign, Slant, Weight};
 
 fn engine() -> DirectWriteEngine {
@@ -11,7 +11,11 @@ fn engine() -> DirectWriteEngine {
 // Independent high-level layout: it performs its own analysis, fallback and
 // glyph production. Apply style/spacing explicitly because legacy layout ignores
 // the FontSpec tracking and uses an upright format even for italic metrics.
-fn reference_width(engine: &DirectWriteEngine, text: &str, font: &FontSpec) -> f64 {
+pub(super) fn reference_layout(
+    engine: &DirectWriteEngine,
+    text: &str,
+    font: &FontSpec,
+) -> Com<IDWriteTextLayout> {
     #[repr(C)]
     struct Range {
         start: u32,
@@ -42,7 +46,6 @@ fn reference_width(engine: &DirectWriteEngine, text: &str, font: &FontSpec) -> f
                 start: 0,
                 length: u32::try_from(text.encode_utf16().count()).unwrap(),
             };
-            let mut metrics = DwriteTextMetrics::default();
             // SAFETY: exact IDWriteTextLayout1 ABI and a live owning COM reference.
             unsafe {
                 let table = &*(*one.as_ptr()).vtbl;
@@ -58,17 +61,26 @@ fn reference_width(engine: &DirectWriteEngine, text: &str, font: &FontSpec) -> f
                     0.0,
                     range()
                 )));
-                assert!(com_ok(((*(*layout.as_ptr()).vtbl).get_metrics)(
-                    layout.as_ptr(),
-                    &raw mut metrics
-                )));
             }
-            f64::from(metrics.width_including_trailing_whitespace)
+            layout
         })
         .unwrap()
 }
 
-fn shape(engine: &DirectWriteEngine, text: &str, font: &FontSpec) -> Vec<Run> {
+fn reference_width(engine: &DirectWriteEngine, text: &str, font: &FontSpec) -> f64 {
+    let layout = reference_layout(engine, text, font);
+    let mut metrics = DwriteTextMetrics::default();
+    // SAFETY: the independent native layout owns its full text and format.
+    unsafe {
+        assert!(com_ok(((*(*layout.as_ptr()).vtbl).get_metrics)(
+            layout.as_ptr(),
+            &raw mut metrics
+        )));
+    }
+    f64::from(metrics.width_including_trailing_whitespace)
+}
+
+pub(super) fn shape(engine: &DirectWriteEngine, text: &str, font: &FontSpec) -> Vec<Run> {
     let factories = engine.factories.as_ref().unwrap();
     let prepared = Prepared::new(factories, text).unwrap();
     let shaper = Shaper::new(factories).unwrap();

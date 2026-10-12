@@ -11,6 +11,9 @@ use crate::text::{
     WIC_CACHE_ON_LOAD, WIC_PIXEL_32BPP_PBGRA,
 };
 
+#[path = "text_glyph_color.rs"]
+mod color;
+
 const CONTEXT4: Guid = Guid {
     d1: 0x8c42_7831,
     d2: 0x3d90,
@@ -46,6 +49,7 @@ struct Surface {
     bitmap: Com<IWICBitmap>,
     stride: u32,
     bytes: u32,
+    scale: f32,
 }
 impl Surface {
     fn new(factories: &Factories, width: u32, height: u32, scale: f32) -> Result<Self, TextError> {
@@ -102,6 +106,7 @@ impl Surface {
                 bitmap,
                 stride,
                 bytes,
+                scale,
             })
         }
     }
