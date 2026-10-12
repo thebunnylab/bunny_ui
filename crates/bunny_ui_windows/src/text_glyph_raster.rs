@@ -13,6 +13,7 @@ use crate::text::{
 
 #[path = "text_glyph_color.rs"]
 mod color;
+pub(super) use color::Renderer;
 
 const CONTEXT4: Guid = Guid {
     d1: 0x8c42_7831,
@@ -44,7 +45,7 @@ fn owned<T>(
     owned.ok_or_else(|| failure(operation))
 }
 
-struct Surface {
+pub(super) struct Surface {
     target: Com<ID2D1RenderTarget>,
     bitmap: Com<IWICBitmap>,
     stride: u32,
@@ -52,7 +53,12 @@ struct Surface {
     scale: f32,
 }
 impl Surface {
-    fn new(factories: &Factories, width: u32, height: u32, scale: f32) -> Result<Self, TextError> {
+    pub(super) fn new(
+        factories: &Factories,
+        width: u32,
+        height: u32,
+        scale: f32,
+    ) -> Result<Self, TextError> {
         let stride = width
             .checked_mul(4)
             .ok_or_else(|| failure("bitmap stride"))?;
@@ -111,7 +117,7 @@ impl Surface {
         }
     }
 
-    fn paint(
+    pub(super) fn paint(
         &self,
         draw: impl FnOnce(&Com<ID2D1RenderTarget>) -> Result<(), TextError>,
     ) -> Result<Vec<u8>, TextError> {

@@ -28,15 +28,30 @@ pub(super) struct GlyphRun<'a> {
     _borrow: PhantomData<&'a Run>,
 }
 impl<'a> GlyphRun<'a> {
-    pub(super) fn from_run(run: &'a Run) -> Result<Self, super::TextError> {
+    pub(super) fn from_run(
+        run: &'a Run,
+        range: std::ops::Range<usize>,
+    ) -> Result<Self, super::TextError> {
+        let indices = run
+            .glyphs
+            .get(range.clone())
+            .ok_or_else(|| super::failure("raster glyph range"))?;
+        let advances = run
+            .advances
+            .get(range.clone())
+            .ok_or_else(|| super::failure("raster advance range"))?;
+        let offsets = run
+            .offsets
+            .get(range)
+            .ok_or_else(|| super::failure("raster offset range"))?;
         Ok(Self {
             face: run.face.as_ptr().cast(),
             em_size: run.em_size,
-            count: u32::try_from(run.glyphs.len())
+            count: u32::try_from(indices.len())
                 .map_err(|_| super::failure("raster glyph count"))?,
-            indices: run.glyphs.as_ptr(),
-            advances: run.advances.as_ptr(),
-            offsets: run.offsets.as_ptr(),
+            indices: indices.as_ptr(),
+            advances: advances.as_ptr(),
+            offsets: offsets.as_ptr(),
             sideways: 0,
             level: u32::from(run.level),
             _borrow: PhantomData,

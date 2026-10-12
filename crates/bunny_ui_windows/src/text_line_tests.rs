@@ -86,7 +86,10 @@ fn hit(layout: &Com<IDWriteTextLayout>, position: usize) -> geometry::HitMetrics
 fn paragraph_line_levels_and_order_match_independent_native_wraps() {
     let engine = DirectWriteEngine::new();
     let factories = engine.factories.as_ref().unwrap();
+    let mut discrepancies = Vec::new();
     for text in [
+        "\u{202e}ab  \u{202c}",
+        "\u{202e}ab  \u{2069}\u{202c}",
         "\u{202e}abc def ghi jkl mno\u{202c}",
         "\u{202d}אבג דהו זחט יכל מנס\u{202c}",
         "abc \u{2067}אבג (123) דהו\u{2069} xyz",
@@ -122,31 +125,29 @@ fn paragraph_line_levels_and_order_match_independent_native_wraps() {
                         continue;
                     }
                     let level = levels[index - range.start];
-                    assert_eq!(
-                        u32::from(level),
-                        metrics.bidi_level,
-                        "{text:?}, width {width}, range {range:?}, scalar {character:?}, index {index}"
-                    );
+                    if u32::from(level) != metrics.bidi_level {
+                        discrepancies.push(format!("{text:?}, width {width}, range {range:?}, scalar {character:?}, index {index}: level {level} vs {}, left {}", metrics.bidi_level, metrics.left));
+                    }
                     logical.push((index, level, metrics.left));
                 }
                 let mut expected = logical.clone();
                 expected.sort_by(|left, right| left.2.total_cmp(&right.2));
                 bidi::reorder(&mut logical, |&(_, level, _)| level);
-                assert_eq!(
-                    logical
-                        .iter()
-                        .map(|&(index, _, _)| index)
-                        .collect::<Vec<_>>(),
-                    expected
-                        .iter()
-                        .map(|&(index, _, _)| index)
-                        .collect::<Vec<_>>(),
-                    "{text:?}, width {width}, range {range:?}"
-                );
+                let actual: Vec<_> = logical.iter().map(|&(index, _, _)| index).collect();
+                let expected: Vec<_> = expected.iter().map(|&(index, _, _)| index).collect();
+                if actual != expected {
+                    discrepancies.push(format!(
+                        "{text:?}, width {width}, range {range:?}: order {actual:?} vs {expected:?}"
+                    ));
+                }
             }
         }
         assert_eq!(prepared.levels, raw);
     }
+    assert!(
+        discrepancies.is_empty(),
+        "native discrepancies: {discrepancies:#?}"
+    );
 }
 
 #[test]
@@ -162,4 +163,161 @@ fn paragraph_line_boundaries_refuse_split_surrogates_and_keep_original_levels() 
     assert_eq!(whole[2], whole[3]);
     assert_eq!(&whole[5..], &[1, 0, 0]);
     assert_eq!(prepared.levels, raw);
+}
+
+#[test]
+fn paragraph_line_visual_clusters_match_native_positions_without_reshaping_joiners() {
+    let engine = DirectWriteEngine::new();
+    let factories = engine.factories.as_ref().unwrap();
+    let font = FontSpec {
+        size: 21.0,
+        ..FontSpec::DEFAULT
+    };
+    let shaper = glyphs::Shaper::new(factories).unwrap();
+    for text in [
+        "\u{202e}abc def ghi jkl mno\u{202c}",
+        "\u{202d}אבג דהו זחט יכל מנס\u{202c}",
+        "abc \u{2067}אבג (123) דהו\u{2069} xyz",
+        "abc العربية 123 אבג def",
+        "\u{202e}ab 😀 cd ef gh\u{202c}  ",
+        "ب\u{200d} ب\u{200c} ب\u{200d}",
+        "אבג\u{2003}\u{2002}דהו\u{2003}\u{2002}",
+    ] {
+        let prepared = Prepared::new(factories, text).unwrap();
+        for width in [65.0, 130.0, 400.0] {
+            let (layout, ranges) = wrapped_layout(&engine, text, width);
+            engine.with_slot(&font, |slot| {
+                let base = glyphs::BaseFont::new(slot, &font).unwrap();
+                for range in ranges {
+                    let runs = shaper.shape(&prepared, range.clone(), &base, &font).unwrap();
+                    let original: Vec<_> = runs.iter().map(|run| (run.glyphs.clone(), run.advances.clone())).collect();
+                    let line = VisualLine::new(&prepared, range.clone(), runs).unwrap();
+                    assert_eq!(line.runs.iter().map(|run| (run.glyphs.clone(), run.advances.clone())).collect::<Vec<_>>(), original);
+                    for cluster in &line.clusters {
+                        let Some(position) = cluster.source.clone().find(|&index| prepared.classes[index] == bidi::Class::Other) else { continue; };
+                        let metrics = hit(&layout, position);
+                        if metrics.width == 0.0 { continue; }
+                        assert!((cluster.left - f64::from(metrics.left)).abs() < 0.03,
+                            "{text:?}, width {width}, line {range:?}, cluster {:?}: left {} vs {} (glyph map {:?})",
+                            cluster.source, cluster.left, metrics.left, line.runs[cluster.run].clusters);
+                        assert!((cluster.width - f64::from(metrics.width)).abs() < 0.03,
+                            "{text:?}, line {range:?}, cluster {:?}: width {} vs {}", cluster.source, cluster.width, metrics.width);
+                    }
+                    assert!((line.width - line.runs.iter().map(glyphs::Run::width).sum::<f64>()).abs() < 0.00001);
+                }
+            }).unwrap();
+        }
+    }
+}
+
+#[test]
+fn paragraph_line_visual_spans_match_independent_wrapped_native_pixels() {
+    use crate::text::{Color, D2D1_DRAW_TEXT_COLOR_FONT, D2dColor, D2dPoint};
+    use glyphs::raster::{Renderer, Surface};
+    let engine = DirectWriteEngine::new();
+    let factories = engine.factories.as_ref().unwrap();
+    let font = FontSpec {
+        size: 21.0,
+        ..FontSpec::DEFAULT
+    };
+    let shaper = glyphs::Shaper::new(factories).unwrap();
+    for text in [
+        "\u{202e}abc def ghi jkl mno\u{202c}",
+        "\u{202d}אבג דהו זחט יכל מנס\u{202c}",
+        "abc \u{2067}אבג (123) דהו\u{2069} xyz",
+        "abc العربية 123 אבג def",
+        "ב\u{200d} ب\u{200c} ب\u{200d}",
+        "\u{202e}ab 😀 cd ef gh\u{202c}  ",
+    ] {
+        let prepared = Prepared::new(factories, text).unwrap();
+        for width in [65.0, 130.0] {
+            let (layout, ranges) = wrapped_layout(&engine, text, width);
+            for scale in [1.0_f32, 2.0] {
+                let surface = Surface::new(factories, 640, 640, scale).unwrap();
+                let ink = D2dColor {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                };
+                let expected = surface
+                    .paint(|target| {
+                        let mut pointer = std::ptr::null_mut();
+                        // SAFETY: live surface and exact brush ABI with initialized output.
+                        unsafe {
+                            assert!(com_ok(((*(*target.as_ptr()).vtbl)
+                                .create_solid_color_brush)(
+                                target.as_ptr(),
+                                &raw const ink,
+                                std::ptr::null(),
+                                &raw mut pointer
+                            )));
+                        }
+                        let brush = Com::from_raw(pointer).unwrap();
+                        // SAFETY: reference TextLayout owns the complete original text
+                        // and independently performs native analysis/wrapping/shaping.
+                        unsafe {
+                            ((*(*target.as_ptr()).vtbl).draw_text_layout)(
+                                target.as_ptr(),
+                                D2dPoint { x: 8.0, y: 8.0 },
+                                layout.as_ptr(),
+                                brush.as_ptr(),
+                                D2D1_DRAW_TEXT_COLOR_FONT,
+                            );
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                let actual = engine
+                    .with_slot(&font, |slot| {
+                        let base = glyphs::BaseFont::new(slot, &font).unwrap();
+                        let mut renderer =
+                            Renderer::new(&surface, factories, Color::BLACK).unwrap();
+                        surface
+                            .paint(|_| {
+                                let mut top = 8.0;
+                                for range in &ranges {
+                                    let runs =
+                                        shaper.shape(&prepared, range.clone(), &base, &font)?;
+                                    let line = VisualLine::new(&prepared, range.clone(), runs)?;
+                                    let baseline = ((top + glyphs::native_float(slot.ascent)?)
+                                        * scale)
+                                        .round()
+                                        / scale;
+                                    for span in line.spans() {
+                                        let run = &line.runs[span.run];
+                                        let left = glyphs::native_float(span.left)?;
+                                        let advance = glyphs::native_float(span.width)?;
+                                        let x = 8.0
+                                            + left
+                                            + if run.level.is_multiple_of(2) {
+                                                0.0
+                                            } else {
+                                                advance
+                                            };
+                                        renderer.draw_range(
+                                            run,
+                                            span.glyphs,
+                                            D2dPoint { x, y: baseline },
+                                        )?;
+                                    }
+                                    top += glyphs::native_float(slot.ascent + slot.descent)?;
+                                }
+                                Ok(())
+                            })
+                            .unwrap()
+                    })
+                    .unwrap();
+                let differences = expected
+                    .chunks_exact(4)
+                    .zip(actual.chunks_exact(4))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                assert_eq!(
+                    differences, 0,
+                    "{text:?}, width {width}, scale {scale}: pixel differences"
+                );
+            }
+        }
+    }
 }

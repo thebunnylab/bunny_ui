@@ -7,7 +7,7 @@
 //! separate, still-required steps; this boundary does not publish runtime lines.
 
 use super::{
-    Analyzer, Com, Factories, Guid, Hresult, Prepared, Script, Source, TextError, com_ok,
+    Analyzer, Com, Factories, Guid, Hresult, Prepared, Script, Source, TextError, bidi, com_ok,
     preparation,
 };
 use crate::text::{FontSlot, FontSpec, IDWriteFont, IDWriteFontCollection, style_of, weight_of};
@@ -19,6 +19,9 @@ mod ffi;
 
 #[path = "text_glyph_raster.rs"]
 mod raster;
+
+#[path = "text_line.rs"]
+mod line;
 
 const MAX_GLYPHS: usize = u16::MAX as usize + 1;
 const INSUFFICIENT_BUFFER: Hresult = -2_147_024_774; // HRESULT_FROM_WIN32(122)

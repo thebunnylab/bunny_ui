@@ -20,9 +20,6 @@ mod glyphs;
 #[path = "text_bidi.rs"]
 mod bidi;
 
-#[path = "text_line.rs"]
-mod line;
-
 const ENGINE: &str = "DirectWrite";
 const OK: Hresult = 0;
 const NO_INTERFACE: Hresult = -2_147_467_262; // E_NOINTERFACE

@@ -27,13 +27,13 @@ struct Brushes {
     foreground: Com<ID2D1Brush>,
     palette: HashMap<[u32; 4], Com<ID2D1Brush>>,
 }
-pub(super) struct Renderer<'a> {
+pub(in crate::text::analysis::glyphs) struct Renderer<'a> {
     surface: &'a Surface,
     mode: Mode,
     brushes: Brushes,
 }
 impl<'a> Renderer<'a> {
-    pub(super) fn new(
+    pub(in crate::text::analysis::glyphs) fn new(
         surface: &'a Surface,
         factories: &Factories,
         color: Color,
@@ -64,10 +64,19 @@ impl<'a> Renderer<'a> {
     }
 
     pub(super) fn draw(&mut self, run: &Run, origin: D2dPoint) -> Result<(), TextError> {
+        self.draw_range(run, 0..run.glyphs.len(), origin)
+    }
+
+    pub(in crate::text::analysis::glyphs) fn draw_range(
+        &mut self,
+        run: &Run,
+        range: std::ops::Range<usize>,
+        origin: D2dPoint,
+    ) -> Result<(), TextError> {
         if !origin.x.is_finite() || !origin.y.is_finite() {
             return Err(failure("glyph origin"));
         }
-        let glyphs = GlyphRun::from_run(run)?;
+        let glyphs = GlyphRun::from_run(run, range)?;
         match &self.mode {
             Mode::Native(context) => {
                 // SAFETY: the context, brush and all glyph buffers have owners
