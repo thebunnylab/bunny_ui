@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn every_house_icon_rasters_and_stays_in_its_box() {
         let ink = Color { r: 0, g: 0, b: 0, a: 255 };
-        for symbol in ALL {
+        for symbol in ALL.iter().copied() {
             for side in [16usize, 24, 32, 48] {
                 let first = super::super::rasterize(symbol.glyph, ink, false, side, side);
                 let inked = first.rgba.chunks_exact(4).filter(|px| px[3] > 0).count();
@@ -351,5 +351,25 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+
+/// The house symbol `name` names (`"chevron.right"`, `"check"`, …), for
+/// a symbol that arrived by name — over a wire, say.
+pub fn named(name: &str) -> Option<Symbol> {
+    ALL.iter().find(|symbol| symbol.name == name).copied()
+}
+
+#[cfg(test)]
+mod named_tests {
+    use super::*;
+
+    #[test]
+    fn every_house_symbol_answers_to_its_name() {
+        for symbol in ALL.iter().copied() {
+            assert_eq!(named(symbol.name).map(|found| found.key), Some(symbol.key), "{}", symbol.name);
+        }
+        assert!(named("no.such.symbol").is_none());
     }
 }

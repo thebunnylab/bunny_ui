@@ -34,6 +34,25 @@ macro_rules! theme_tokens {
                 THEME.with(|theme| theme.get().$name)
             }
         )+
+
+        impl Theme {
+            /// Every token's name, in the struct's order.
+            pub const NAMES: &'static [&'static str] = &[$(stringify!($name)),+];
+
+            /// The tokens by name — what a theme is on a wire.
+            pub fn tokens(&self) -> Vec<(&'static str, Color)> {
+                vec![$((stringify!($name), self.$name)),+]
+            }
+
+            /// Sets the token `name` names; `false` for a name this theme
+            /// does not have.
+            pub fn set_token(&mut self, name: &str, color: Color) -> bool {
+                match name {
+                    $(stringify!($name) => { self.$name = color; true })+
+                    _ => false,
+                }
+            }
+        }
     };
 }
 
@@ -217,6 +236,20 @@ mod tests {
     #[test]
     fn the_default_theme_is_the_light_one() {
         assert_eq!(Theme::default(), Theme::light());
+    }
+
+    #[test]
+    fn tokens_go_out_by_name_and_come_back_by_name() {
+        let light = Theme::light();
+        let tokens = light.tokens();
+        assert_eq!(tokens.len(), Theme::NAMES.len());
+        assert_eq!(tokens[0], ("canvas", light.canvas));
+        let mut rebuilt = Theme::dark();
+        for (name, color) in &tokens {
+            assert!(rebuilt.set_token(name, *color));
+        }
+        assert_eq!(rebuilt, light);
+        assert!(!rebuilt.set_token("no_such_token", Color::BLACK));
     }
 
     #[test]
