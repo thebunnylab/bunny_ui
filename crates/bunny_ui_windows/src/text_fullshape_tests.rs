@@ -326,3 +326,20 @@ fn paragraph_full_source_preserves_distant_font_context() {
     assert_eq!(expected[0].glyphs, [4]);
     assert_parity(&engine, &text, &font, &expected);
 }
+
+#[test]
+fn paragraph_full_source_preserves_long_input_context() {
+    let engine = DirectWriteEngine::new();
+    assert!(engine.register_font(include_bytes!(
+        "../tests/fixtures/paragraph-input-context.ttf"
+    )));
+    let font = FontSpec {
+        family: Family::named("Bunny Paragraph Input Context"),
+        size: 19.0,
+        ..FontSpec::DEFAULT
+    };
+    let text = format!("a{}c", "b".repeat(128));
+    let expected = reference(&engine, &text, &font);
+    assert_eq!(expected[0].glyphs, [4], "native matched-input witness");
+    assert_parity(&engine, &text, &font, &expected);
+}
