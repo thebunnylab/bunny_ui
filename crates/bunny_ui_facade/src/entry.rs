@@ -192,6 +192,72 @@ macro_rules! __bunny_hot_entry {
     ($root:expr) => {};
 }
 
+/// A preview build (`bunny preview`, Studio): what `#[preview]` writes
+/// after each marked function — the symbol `$symbol` that answers the
+/// preview's entry, in the Rust ABI, like a generation's. `$name`,
+/// `$scope` and `$example` are the attribute's string literals; the file,
+/// the line and the module are the compiler's, as of the attribute.
+#[cfg(all(feature = "preview", not(target_arch = "wasm32")))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bunny_preview_entry {
+    ($ident:ident, $symbol:ident, $name:expr, $scope:expr, $example:expr $(,)?) => {
+        const _: () = {
+            fn make() -> $crate::__private::hot::preview::Output {
+                $crate::__private::hot::preview::Output::of($ident())
+            }
+            static ENTRY: $crate::__private::hot::preview::PreviewEntry =
+                $crate::__private::hot::preview::PreviewEntry::new(
+                    $crate::__private::hot::preview::Meta {
+                        ident: ::core::stringify!($ident),
+                        name: $name,
+                        scope: $scope,
+                        example: $example,
+                        module: ::core::module_path!(),
+                        file: ::core::file!(),
+                        line: ::core::line!(),
+                    },
+                    make,
+                );
+            // the symbol's spelling is the ABI's, double underscore and all
+            #[allow(non_snake_case)]
+            #[unsafe(no_mangle)]
+            pub fn $symbol() -> &'static $crate::__private::hot::preview::PreviewEntry {
+                &ENTRY
+            }
+        };
+    };
+}
+
+/// Any other build exports no preview — and keeps the function from
+/// reading as dead code, since only a symbol table ever calls it.
+#[cfg(not(all(feature = "preview", not(target_arch = "wasm32"))))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bunny_preview_entry {
+    ($ident:ident, $symbol:ident, $name:expr, $scope:expr, $example:expr $(,)?) => {
+        const _: () = {
+            let _ = $ident;
+        };
+    };
+}
+
+/// `#[preview]` without the attribute: the same entry, written by hand.
+/// `$ident` is the function, `$symbol` the symbol to export (write
+/// `bunny_preview__` and the function's name), then the component's
+/// name, the scope and this preview's label, as string literals.
+///
+/// ```ignore
+/// fn home() -> impl View { text("Hello") }
+/// bunny_ui::declare_preview!(home, bunny_preview__home, "Home", "Screens", "home");
+/// ```
+#[macro_export]
+macro_rules! declare_preview {
+    ($ident:ident, $symbol:ident, $name:expr, $scope:expr, $example:expr $(,)?) => {
+        $crate::__bunny_preview_entry!($ident, $symbol, $name, $scope, $example);
+    };
+}
+
 /// No shell, or a target without one: an app has nowhere to start.
 #[cfg(not(all(
     feature = "shell",
@@ -223,8 +289,12 @@ pub mod __private {
     use bunny_ui_core::app::{Identity, set_identity};
     use bunny_ui_core::view::View;
 
-    /// The part of hot reload inside the app.
-    #[cfg(all(feature = "hot", any(target_os = "macos", target_os = "ios", target_os = "windows", target_os = "linux", target_os = "android")))]
+    /// The part of hot reload inside the app — and the preview entries a
+    /// `preview` build exports.
+    #[cfg(any(
+        all(feature = "hot", any(target_os = "macos", target_os = "ios", target_os = "windows", target_os = "linux", target_os = "android")),
+        all(feature = "preview", not(target_arch = "wasm32")),
+    ))]
     pub use bunny_ui_hot as hot;
 
     /// Says who the app is, then opens its window with the first view.

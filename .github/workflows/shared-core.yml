@@ -99,6 +99,10 @@ jobs:
           # run` names it; the web has no hot build, and the feature
           # changes nothing there
           cargo test -p bunny-ui --locked --all-targets --features hot --target aarch64-apple-darwin
+          # the preview build Studio and `bunny preview` make: `#[preview]`
+          # exports an entry per marked function, in an app that forbids `unsafe`
+          cargo test -p bunny-ui --locked --all-targets --features preview --target aarch64-apple-darwin
+          cargo test -p bunny-ui-preview-macros --locked --all-targets
           for target in x86_64-unknown-linux-gnu x86_64-pc-windows-msvc aarch64-apple-ios-sim \
             aarch64-linux-android wasm32-unknown-unknown; do
             cargo check -p bunny-ui --locked --all-targets --features hot --target "$target"
@@ -116,7 +120,7 @@ jobs:
         run: |
           # Each strict exit code stays visible, including inherited failures.
           # New diagnostics fail this separate regression gate.
-          packages=(--package bunny-ui-motor --package bunny-ui-core --package "$PLATFORM")
+          packages=(--package bunny-ui-motor --package bunny-ui-core --package bunny-ui-preview-macros --package "$PLATFORM")
           if [ "$RUNNER_OS" = macOS ]; then
             packages+=(--package bunny-ui-macos)
           fi

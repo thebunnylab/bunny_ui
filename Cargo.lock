@@ -79,6 +79,7 @@ dependencies = [
  "bunny-ui-ios",
  "bunny-ui-linux",
  "bunny-ui-macos",
+ "bunny-ui-preview-macros",
  "bunny-ui-web",
  "bunny-ui-windows",
 ]
@@ -165,6 +166,10 @@ dependencies = [
 
 [[package]]
 name = "bunny-ui-motor"
+version = "0.2.1"
+
+[[package]]
+name = "bunny-ui-preview-macros"
 version = "0.2.1"
 
 [[package]]

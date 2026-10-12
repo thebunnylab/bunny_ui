@@ -133,6 +133,34 @@ impl<V: View> Preview<V> {
     }
 }
 
+/// What a `#[preview]` function may answer: a bare view, shown under the
+/// default traits, or a [`Preview`] carrying its own. The attribute's
+/// entry calls this, so a function never names the wrapper unless it
+/// has a trait to set.
+pub trait IntoPreview {
+    /// The view the preview shows.
+    type View: View;
+
+    /// The view with its traits.
+    fn into_preview(self) -> Preview<Self::View>;
+}
+
+impl<V: View> IntoPreview for V {
+    type View = V;
+
+    fn into_preview(self) -> Preview<V> {
+        Preview::new(self)
+    }
+}
+
+impl<V: View> IntoPreview for Preview<V> {
+    type View = V;
+
+    fn into_preview(self) -> Preview<V> {
+        self
+    }
+}
+
 /// The traits a preview is shown under. Every trait but the scheme and
 /// the sizing is optional: `None` leaves the runtime's own answer.
 #[derive(Clone, Debug, PartialEq)]
@@ -401,6 +429,14 @@ mod tests {
         assert_eq!(one.resolved_size_class(), SizeClass::Regular);
         assert_eq!(one.resolved_scale(), 1.0);
         assert_eq!(one.proposal(), Proposal::unspecified());
+    }
+
+    #[test]
+    fn a_bare_view_and_a_preview_both_answer_into_preview() {
+        let bare = text("x").into_preview();
+        assert_eq!(bare.traits, Traits::default());
+        let traced = Preview::new(text("x")).dark().into_preview();
+        assert_eq!(traced.traits.scheme, Scheme::Dark);
     }
 
     #[test]
