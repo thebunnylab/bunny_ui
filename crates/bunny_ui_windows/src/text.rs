@@ -19,9 +19,14 @@
 //! unknown family DEGRADES to the system font — it never fails. Each
 //! text format is created once per `FontKey` and retained in the
 //! engine, together with the font-box metrics resolved once. If the
-//! platform refuses the factories entirely, the engine degrades to
-//! the house pixel font with one line on stderr — it never fails to
-//! open.
+//! platform refuses the factories entirely, the legacy infallible line APIs
+//! use the house pixel font with one line on stderr. Contextual paragraph APIs
+//! return a typed error; they never publish substitute or incomplete output.
+//!
+//! Contextual measurement, geometry and rasterization share immutable analysis
+//! of the complete original paragraph. A bounded cache retains only source,
+//! script and bidi data; each line resolves its fonts afresh and uses the same
+//! native glyph clusters for widths, directed editing cells and visual ink.
 //!
 //! The app can also [`DirectWriteEngine::register_font`] its own
 //! faces from bytes — the twin of CoreText's in-process registration,
