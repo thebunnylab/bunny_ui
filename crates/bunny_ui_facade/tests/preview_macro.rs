@@ -49,7 +49,7 @@ fn every_marked_function_resolves_by_name_with_its_meta_and_traits() {
     assert_eq!(home.meta.example, "home", "so does the example");
     assert_eq!(home.meta.scope, "");
     assert!(home.meta.file.ends_with("preview_macro.rs"), "{}", home.meta.file);
-    assert_eq!(home.meta.line, 13, "the attribute's own line");
+    assert_eq!(home.meta.line, 14, "the attribute's own line");
     assert_eq!(home.meta.module, "preview_macro");
     assert_eq!((home.make)().traits, Traits::default());
 
