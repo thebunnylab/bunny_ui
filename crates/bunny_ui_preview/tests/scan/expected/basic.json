@@ -1,0 +1,11 @@
+{
+  "previews": [
+    {"ident": "card_short", "symbol": "bunny_preview__card_short", "name": "Card", "scope": "Data Display", "example": "Short", "file": "src/basic.rs", "line": 5, "column": 1},
+    {"ident": "card_long", "symbol": "bunny_preview__card_long", "name": "Card", "scope": "Data Display", "example": "Long title", "file": "src/basic.rs", "line": 13, "column": 1},
+    {"ident": "plain_button", "symbol": "bunny_preview__plain_button", "name": "plain_button", "scope": "", "example": "plain_button", "file": "src/basic.rs", "line": 18, "column": 1},
+    {"ident": "nested_field", "symbol": "bunny_preview__nested_field", "name": "nested_field", "scope": "Forms & Input", "example": "nested_field", "file": "src/basic.rs", "line": 24, "column": 5}
+  ],
+  "refused": [],
+  "duplicates": [],
+  "unreadable": []
+}

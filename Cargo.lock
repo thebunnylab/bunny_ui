@@ -169,6 +169,13 @@ name = "bunny-ui-motor"
 version = "0.2.1"
 
 [[package]]
+name = "bunny-ui-preview"
+version = "0.2.1"
+dependencies = [
+ "bunny-ui-core",
+]
+
+[[package]]
 name = "bunny-ui-preview-macros"
 version = "0.2.1"
 

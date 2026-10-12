@@ -522,6 +522,48 @@ impl<'a> Painter<'a> {
         self.fill_rounded(rect, color, 0.0);
     }
 
+    /// Paints a whole display list here, every command shifted to this
+    /// painter's origin — what a tool that shows frames another process
+    /// rendered calls, with the list it decoded off the wire.
+    pub fn draw_list(&mut self, display: &DisplayList) {
+        for command in display.iter() {
+            let shifted = match command.clone() {
+                DrawCommand::FillRect { rect, color, corner_radius } => {
+                    DrawCommand::FillRect { rect: self.shift(rect), color, corner_radius }
+                }
+                DrawCommand::Gradient { rect, paint, corner_radius } => DrawCommand::Gradient {
+                    rect: self.shift(rect),
+                    paint: match paint {
+                        crate::layout::GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
+                            crate::layout::GradientPaint::Radial { center: self.at(center), start, end, aspect, inner, outer }
+                        }
+                        crate::layout::GradientPaint::Linear { start, end, from, to } => {
+                            crate::layout::GradientPaint::Linear { start: self.at(start), end: self.at(end), from, to }
+                        }
+                    },
+                    corner_radius,
+                },
+                DrawCommand::Backdrop { rect, mut glass, corner_radius } => {
+                    glass.spot_center = self.at(glass.spot_center);
+                    DrawCommand::Backdrop { rect: self.shift(rect), glass, corner_radius }
+                }
+                DrawCommand::Shadow { rect, radius, color, corner_radius } => {
+                    DrawCommand::Shadow { rect: self.shift(rect), radius, color, corner_radius }
+                }
+                DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
+                    DrawCommand::StrokeRect { rect: self.shift(rect), color, width, corner_radius }
+                }
+                DrawCommand::TextLine { origin, content, range, color, font } => {
+                    DrawCommand::TextLine { origin: self.at(origin), content, range, color, font }
+                }
+                DrawCommand::Image { rect, source } => DrawCommand::Image { rect: self.shift(rect), source },
+                DrawCommand::PushClip { rect, corner_radius } => DrawCommand::PushClip { rect: self.shift(rect), corner_radius },
+                DrawCommand::PopClip => DrawCommand::PopClip,
+            };
+            self.display.push(shifted);
+        }
+    }
+
     /// A rectangle with rounded corners (anti-aliased, like every
     /// background in the framework).
     ///

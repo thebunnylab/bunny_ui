@@ -2,6 +2,11 @@
 
 Existing failures remain failures in the logs and summary. This differential
 gate does not turn either strict invocation into a passing lint gate.
+
+A package is judged by the diagnostics in its own files. What a dependency
+emits while it compiles under this package's feature set — a workspace crate
+built without its default features, say — belongs to that dependency's own
+invocation, where its baseline is.
 """
 import argparse
 import json
@@ -9,7 +14,7 @@ from pathlib import Path
 import subprocess
 
 
-def diagnostic_keys(log, source):
+def diagnostic_keys(log, source, directory):
     diagnostics = set()
     for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
@@ -37,6 +42,9 @@ def diagnostic_keys(log, source):
                     # Macro definitions may anchor in the compiler's own
                     # library. Both invocations use that same toolchain.
                     pass
+            if not filename.is_absolute() and not filename.as_posix().startswith(directory + "/"):
+                # another workspace crate's file, compiled on this package's way
+                continue
             file = source / filename
             contents = file.read_text(encoding="utf-8").splitlines() if file.is_file() else []
             diagnostic.update(file=filename.as_posix(),
@@ -90,7 +98,7 @@ def main():
             log = output / (name + "-" + package + ".jsonl")
             with log.open("w", encoding="utf-8") as stream:
                 result = subprocess.run(command, cwd=source, stdout=stream, stderr=subprocess.STDOUT)
-            package_keys = diagnostic_keys(log, source)
+            package_keys = diagnostic_keys(log, source, directories[package])
             record["strict_runs"][name][package] = {
                 "exit_code": result.returncode,
                 "diagnostics": [json.loads(key) for key in sorted(package_keys)],
