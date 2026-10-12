@@ -272,6 +272,24 @@ pub(in crate::text::analysis::glyphs) fn collect(
             &raw mut metrics
         )));
     }
+    // The shared legacy helper uses a 1e9-DIP layout box. Keep this glyph
+    // oracle's height close to its measured content; at small font sizes the
+    // oversized box can produce valid metrics but no DrawGlyphRun callbacks.
+    // This does not alter width, text, wrapping, font or paragraph direction.
+    #[repr(C)]
+    struct HeightTable {
+        prefix: [usize; 29],
+        set_height: unsafe extern "system" fn(*mut c_void, f32) -> Hresult,
+    }
+    assert!(metrics.height.is_finite() && metrics.height >= 0.0);
+    // SAFETY: pinned IDWriteTextLayout::SetMaxHeight slot 29, with a live layout.
+    unsafe {
+        let pointer = layout.as_ptr().cast::<*const HeightTable>();
+        assert!(com_ok(((*(*pointer)).set_height)(
+            layout.as_ptr().cast(),
+            metrics.height + 16.0
+        )));
+    }
     let records = draw(layout, 1.0, false);
     eprintln!(
         "native glyph reference: width={}, height={}, lines={}, runs={}",
