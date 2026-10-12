@@ -149,6 +149,13 @@ fn current_handle() -> Option<native::Handle> {
     CURRENT.with(|current| current.borrow().as_ref().map(|generation| generation.handle))
 }
 
+/// The number of the generation that runs — 0 before any loaded, then
+/// 1, 2, … as `bunny run` sends them. A host that renders previews
+/// compares it between turns to know the code moved under it.
+pub fn generation() -> u32 {
+    CURRENT.with(|current| current.borrow().as_ref().map_or(0, |generation| generation.number))
+}
+
 thread_local! {
     /// The generation that runs.
     static CURRENT: RefCell<Option<Generation>> = const { RefCell::new(None) };

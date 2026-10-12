@@ -102,6 +102,11 @@ jobs:
           # the preview build Studio and `bunny preview` make: `#[preview]`
           # exports an entry per marked function, in an app that forbids `unsafe`
           cargo test -p bunny-ui --locked --all-targets --features preview --target aarch64-apple-darwin
+          # the preview host, headless: the example's three previews render and print a line each
+          BUNNY_PREVIEW_CHECK=card_light,card_dark,card_fits \
+            cargo run -p bunny-ui --locked --features preview --example preview --target aarch64-apple-darwin \
+            | tee preview-check.log
+          grep -c '^@@bunny-preview card_' preview-check.log | grep -qx 3
           cargo test -p bunny-ui-preview-macros --locked --all-targets
           # the preview wire, the reference scan and the conversions to the core's types
           cargo test -p bunny-ui-preview --locked --all-targets

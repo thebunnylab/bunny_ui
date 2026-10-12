@@ -15,10 +15,19 @@ default = []
 # to the wire's draws and back, the traits, a patch to a modifier. Off,
 # the crate is std alone — what a tool that only reads the wire adds.
 core = ["dep:bunny-ui-core"]
+# The host: the runner an app becomes under `bunny preview` — the scenes,
+# the panic boundary, the serving loop. Needs the hot crate for the
+# entries and the generation.
+host = ["core", "dep:bunny-ui-hot"]
 
 [dependencies]
 bunny-ui-core = { workspace = true, optional = true, default-features = false }
+bunny-ui-hot = { workspace = true, optional = true }
 
 [[test]]
 name = "convert"
 required-features = ["core"]
+
+[[test]]
+name = "host"
+required-features = ["host"]

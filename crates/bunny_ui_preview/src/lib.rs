@@ -23,6 +23,9 @@
 //! - With the `core` feature, [`convert`]: the framework's `DisplayList`
 //!   to draws and back (resources collected by key), its `Traits` to the
 //!   wire's and back, a `Patch` to a `Modifier`.
+//! - With the `host` feature, [`host`]: the runner an app becomes under
+//!   `bunny preview` — one scene per selected variant, the panic boundary,
+//!   the serving loop and the headless check.
 //!
 //! ## Production gotchas
 //!
@@ -42,3 +45,6 @@ pub mod wire;
 
 #[cfg(feature = "core")]
 pub mod convert;
+
+#[cfg(feature = "host")]
+pub mod host;
