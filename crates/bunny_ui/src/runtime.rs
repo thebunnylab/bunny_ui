@@ -311,6 +311,14 @@ pub struct Runtime {
     /// the retention ONCE (tokens read in a body are baked into the
     /// scene).
     theme_version: Cell<u64>,
+    /// The theme THIS runtime renders under when it has one of its own
+    /// ([`Runtime::theme`]) — a preview scene beside its light twin.
+    /// `None` renders under the installed theme, like every app.
+    theme: RefCell<Option<crate::theme::Theme>>,
+    /// [`Runtime::set_theme`] moved the runtime's own theme: the next
+    /// pass rebuilds the retention once, the way an installed theme does
+    /// for every runtime.
+    theme_moved: Cell<bool>,
     /// The code version the last pass saw ([`code_changed`]): new code
     /// rebuilds the retention once, the way a new theme does.
     code_version: Cell<u64>,
@@ -816,6 +824,7 @@ impl Runtime {
     /// view of it; a single-window app never pays, because the marker
     /// already names its root.
     fn enter_scene(&self) {
+        self.enter_theme();
         let Some(root) = self.last_root.borrow().clone() else {
             return;
         };
@@ -920,6 +929,47 @@ impl Runtime {
     /// The window's horizontal size class, as the shell reads it from
     /// the platform's traits. Compared first: a rotation that keeps the
     /// class rebuilds nothing. The answer says whether it moved.
+    /// Renders this runtime under `theme` instead of the installed one
+    /// (builder): the preview road, where a dark scene stands beside a
+    /// light one on the same thread. The theme is entered before every
+    /// pass and every layout, quietly — the installed theme's version does
+    /// not move, so neither scene rebuilds the other.
+    pub fn theme(self, theme: crate::theme::Theme) -> Self {
+        self.theme.replace(Some(theme));
+        self
+    }
+
+    /// Moves the runtime's own theme between frames (`None` goes back to
+    /// the installed one). Answers whether it moved; when it did, the
+    /// next pass rebuilds the retention once, as an installed theme would.
+    pub fn set_theme(&self, theme: Option<crate::theme::Theme>) -> bool {
+        if *self.theme.borrow() == theme {
+            return false;
+        }
+        self.theme.replace(theme);
+        self.theme_moved.set(true);
+        self.frame_asked.set(true);
+        true
+    }
+
+    /// The theme this runtime renders under when it has one of its own.
+    pub fn scene_theme(&self) -> Option<crate::theme::Theme> {
+        *self.theme.borrow()
+    }
+
+    /// Makes this runtime's theme the thread's: its own, or the installed
+    /// one when it has none. Every pass, layout and input door enters it.
+    fn enter_theme(&self) {
+        match *self.theme.borrow() {
+            Some(theme) => crate::theme::set_quiet(theme),
+            None => crate::theme::restore_installed(),
+        }
+    }
+
+    pub fn size_class(&self) -> SizeClass {
+        self.ctx.borrow().values.horizontalSizeClass
+    }
+
     pub fn set_size_class(&self, class: SizeClass) -> bool {
         if self.ctx.borrow().values.horizontalSizeClass == class {
             return false;
@@ -1637,6 +1687,8 @@ impl Runtime {
             webview_eval_next: Cell::new(0),
             live_ledger: RefCell::new(motor::hash::FxHashMap::default()),
             theme_version: Cell::new(crate::theme::version()),
+            theme: RefCell::new(None),
+            theme_moved: Cell::new(false),
             code_version: Cell::new(code_version()),
             keymap: RefCell::new(HashMap::default()),
             scoped_keymap: RefCell::new(HashMap::default()),
@@ -1737,6 +1789,8 @@ impl Runtime {
     /// views the walk missed, effect-queue reassembly, and the sweep.
     /// Returns both outputs (print and layout) still holding references.
     fn render_pass<R: View>(&self, root: &R) -> NodeList {
+        // the tokens the bodies read are this runtime's, not the last scene's
+        self.enter_theme();
         let _accessibility = crate::accessibility::CaptureScope::enter(self.accessibility.borrow().enabled);
         // virtualized bodies read LAST frame's region geometry (offset
         // taken NOW — a wheel that just moved it must reach the window
@@ -1803,6 +1857,11 @@ impl Runtime {
         // the same for a moved environment: a body that read the size
         // class baked its answer into the scene it retained
         if self.env_moved.replace(false) {
+            self.invalidate_scene();
+        }
+        // …and a theme of the runtime's own that moved: the bodies baked
+        // the old tokens, as they do for an installed theme
+        if self.theme_moved.replace(false) {
             self.invalidate_scene();
         }
         effects::reset();
@@ -7193,6 +7252,9 @@ impl Runtime {
         dom: bool,
         collect_display: bool,
     ) -> (crate::layout::LayoutResult, Option<crate::dom::DomNode>) {
+        // the chrome reads its tokens at placement: this runtime's theme
+        // must be the thread's before the walk
+        self.enter_theme();
         // every call walks measure+place (the stable-root shortcut
         // skips BODIES, not geometry) — so every call counts
         crate::stats::note_layout_pass();
