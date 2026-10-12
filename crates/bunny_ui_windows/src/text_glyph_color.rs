@@ -263,7 +263,13 @@ fn draw_layer(
                 );
             }
         }
-        _ => return Err(failure("color glyph format")),
+        _ => {
+            eprintln!(
+                "unsupported native glyph format={format:#x}, mode={mode}, palette={}, glyphs={}",
+                layer.palette, layer.run.count
+            );
+            return Err(failure("color glyph format"));
+        }
     }
     Ok(())
 }

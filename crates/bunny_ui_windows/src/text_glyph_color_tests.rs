@@ -48,6 +48,10 @@ fn rendered(
     scale: f32,
     legacy: u8,
 ) -> Vec<u8> {
+    eprintln!(
+        "raster reference: text={text:?}, scale={scale}, path={legacy}, slant={:?}",
+        font.slant
+    );
     let factories = engine.factories.as_ref().unwrap();
     let surface = Surface::new(factories, 640, 160, scale).unwrap();
     let mut renderer = match legacy {
@@ -110,6 +114,29 @@ fn assert_pixels(expected: &[u8], actual: &[u8], label: &str) {
         .zip(actual.as_chunks::<4>().0.iter())
         .filter(|(a, b)| a != b)
         .count();
+    if differences != 0 {
+        let bounds = |pixels: &[u8]| {
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p[3] > 0)
+                .fold((640, 160, 0, 0), |(l, t, r, b), (i, _)| {
+                    (
+                        l.min(i % 640),
+                        t.min(i / 640),
+                        r.max(i % 640),
+                        b.max(i / 640),
+                    )
+                })
+        };
+        eprintln!(
+            "{label}: expected bounds {:?}, actual bounds {:?}",
+            bounds(expected),
+            bounds(actual)
+        );
+    }
     assert_eq!(differences, 0, "{label}: mismatching PBGRA pixels");
 }
 
