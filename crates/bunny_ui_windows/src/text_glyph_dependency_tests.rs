@@ -1,7 +1,8 @@
 //! Inspect the resolved native face and falsify source bounds inferred from
 //! short feature contexts. This module changes no production shaping policy.
 
-use super::super::super::super::{Com, com_ok, ffi};
+use super::super::super::super::{Com, TextError, com_ok, ffi};
+use super::super::super::difference;
 use super::{
     BaseFont, DirectWriteEngine, Family, FontSpec, Prepared, Shaper, mismatch, overlap, reference,
 };
@@ -94,7 +95,7 @@ fn family_name(bytes: &[u8]) -> Option<String> {
 
 // Only inspect declared default-language feature headers. This does not decide
 // which features the script engine enables, or certify any dependency bound.
-fn declared_features(bytes: &[u8], script: [u8; 4]) -> Vec<String> {
+fn declared_features(bytes: &[u8], script: [u8; 4], extension_type: usize) -> Vec<String> {
     let scripts = word(bytes, 4);
     let features = word(bytes, 6);
     let lookups = word(bytes, 8);
@@ -133,9 +134,25 @@ fn declared_features(bytes: &[u8], script: [u8; 4]) -> Vec<String> {
                     let lookup = word(bytes, feature + 4 + item * 2);
                     assert!(lookup < word(bytes, lookups));
                     let entry = lookups + word(bytes, lookups + 2 + lookup * 2);
+                    let kind = word(bytes, entry);
+                    let mut resolved: Vec<_> = (0..word(bytes, entry + 4))
+                        .map(|item| {
+                            let subtable = entry + word(bytes, entry + 6 + item * 2);
+                            if kind == extension_type {
+                                assert_eq!(word(bytes, subtable), 1);
+                                let offset = u32::from_be_bytes(
+                                    bytes[subtable + 4..subtable + 8].try_into().unwrap(),
+                                ) as usize;
+                                (word(bytes, subtable + 2), word(bytes, subtable + offset))
+                            } else {
+                                (kind, word(bytes, subtable))
+                            }
+                        })
+                        .collect();
+                    resolved.sort_unstable();
+                    resolved.dedup();
                     format!(
-                        "{lookup}:type{}:flags{:#x}",
-                        word(bytes, entry),
+                        "{lookup}:type{kind}:flags{:#x}:resolved{resolved:?}",
                         word(bytes, entry + 2)
                     )
                 })
@@ -164,7 +181,7 @@ fn metadata(
         eprintln!("native font dependency metadata: resolved={name}, scale={scale}, usMaxContext={max_context:?}");
         for tag in [*b"GSUB", *b"GPOS"] {
             let data = font_table(&face, tag);
-            let features = data.as_ref().map(|data| declared_features(data, script));
+            let features = data.as_ref().map(|data| declared_features(data, script, if tag == *b"GSUB" { 7 } else { 9 }));
             eprintln!("native font declared features: resolved={name}, table={}, script={}, features={features:?}", std::str::from_utf8(&tag).unwrap(), std::str::from_utf8(&script).unwrap());
         }
         (name, max_context)
@@ -230,5 +247,80 @@ fn paragraph_contextual_substitution_can_propagate_beyond_declared_context() {
             "native cascade complete original context matches: tracking={tracking}, units={}",
             text.len()
         );
+    }
+}
+
+#[test]
+fn paragraph_production_never_silently_restarts_a_contextual_cascade() {
+    let engine = DirectWriteEngine::new();
+    assert!(engine.register_font(include_bytes!("../tests/fixtures/paragraph-cascade.ttf")));
+    let text = format!("a{}", "b".repeat(69_999));
+    let prepared = Prepared::new(engine.factories.as_ref().unwrap(), &text).unwrap();
+    for tracking in [-0.75, 0.0, 0.75] {
+        let font = FontSpec {
+            size: 19.0,
+            family: Family::named("Bunny Paragraph Cascade"),
+            tracking,
+            ..FontSpec::DEFAULT
+        };
+        let sample = reference(&engine, &format!("a{}", "b".repeat(8191)), &font);
+        assert_eq!(sample.len(), 8192);
+        assert!(sample.iter().all(|cluster| cluster.glyphs == [1]));
+        let interior: Vec<_> = sample[1..sample.len() - 1]
+            .iter()
+            .cloned()
+            .map(|mut cluster| {
+                cluster.source = 0..1;
+                cluster
+            })
+            .collect();
+        assert!(interior.windows(2).all(|pair| pair[0] == pair[1]));
+        // This source-generated single rule propagates the initial `a` through
+        // every following `b`. The uniform native sample supplies exact metrics.
+        let expected: Vec<_> = (0..text.len())
+            .map(|index| {
+                let mut cluster = sample[if index == 0 {
+                    0
+                } else if index + 1 == text.len() {
+                    sample.len() - 1
+                } else {
+                    1
+                }]
+                .clone();
+                cluster.source = index..index + 1;
+                cluster
+            })
+            .collect();
+        let result = engine
+            .with_slot(&font, |slot| {
+                let base = BaseFont::new(slot, &font).unwrap();
+                Shaper::new(engine.factories.as_ref().unwrap())
+                    .unwrap()
+                    .shape(&prepared, 0..prepared.utf16().len(), &base, &font)
+            })
+            .unwrap();
+        match result {
+            Ok(runs) => {
+                let error = difference("production cascade", runs, &expected);
+                assert!(
+                    error.is_none(),
+                    "production must not return a silently broken cascade: {error:?}"
+                );
+                eprintln!(
+                    "native cascade production exact parity: tracking={tracking}, units={}",
+                    text.len()
+                );
+            }
+            Err(TextError::Preparation {
+                operation: "glyph continuation boundary",
+                ..
+            }) => {
+                eprintln!(
+                    "native cascade production explicit refusal: tracking={tracking}, units={}; not capability acceptance",
+                    text.len()
+                );
+            }
+            Err(error) => panic!("unexpected cascade failure: {error:?}"),
+        }
     }
 }
