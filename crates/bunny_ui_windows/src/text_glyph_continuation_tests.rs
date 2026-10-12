@@ -31,7 +31,9 @@ fn continue_at_native_cuts(
             text: &input.text[position..end],
             ..*input
         };
-        let output = shaper.glyph_indices(&probe, MAX_GLYPHS).unwrap();
+        // GetGlyphPlacements may clear substitution-only safe flags when
+        // positioning (for example pair kerning) crosses that boundary.
+        let output = shaper.produce(&probe, tracking, MAX_GLYPHS).unwrap();
         let length = if end == input.text.len() {
             probe.text.len()
         } else {
@@ -50,6 +52,7 @@ fn continue_at_native_cuts(
                     safe_flags: output
                         .text_properties
                         .iter()
+                        .take(probe.text.len() - 1)
                         .filter(|&&flags| flags & 4 != 0)
                         .count(),
                     cluster_boundaries: output
@@ -286,7 +289,7 @@ fn paragraph_native_safe_cuts_refuse_incomplete_distant_opentype_context() {
                 assert_eq!(error.probed, bound);
                 assert_eq!(error.safe_flags, 0);
                 assert_eq!(error.cluster_boundaries, bound - 1);
-                eprintln!("native distant-context refuses bound={bound}: independent clusters with no safe flag");
+                eprintln!("native distant-context refuses bound={bound}: independent clusters with no interior safe flag");
             }
             let runs = continue_at_native_cuts(&shaper, &input, 0.0, 511).unwrap();
             assert!(difference("complete distant context", runs, &expected).is_none());
