@@ -888,6 +888,8 @@ where
     }
 }
 
+/// A single-line editor. Externally supplied CR/LF display as spaces while the
+/// binding and native UTF-16 indices retain their original text.
 pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> TextField {
     TextField {
         placeholder: Arc::from(placeholder.into()),

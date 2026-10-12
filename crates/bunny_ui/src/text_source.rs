@@ -63,6 +63,15 @@ impl Paragraph {
         &self.0.text
     }
 
+    /// The complete paragraph as a validated line.
+    #[must_use]
+    pub fn full_line(&self) -> ParagraphLine {
+        ParagraphLine {
+            paragraph: self.clone(),
+            bytes: 0..self.text().len(),
+        }
+    }
+
     /// Validate a UTF-8 line range relative to this paragraph.
     ///
     /// # Errors
@@ -287,6 +296,16 @@ pub(crate) struct ContentCache {
     interned: Arc<Mutex<InternPool>>,
 }
 impl ContentCache {
+    pub(crate) fn paragraph(&self, text: &str) -> Result<Paragraph, TextRangeError> {
+        if text.contains('\n') {
+            return Err(TextRangeError::CrossesParagraph);
+        }
+        Ok(self.interned.lock().map_or_else(
+            |_| Paragraph::new(Arc::from(text), fingerprint(text)),
+            |mut pool| pool.intern(text),
+        ))
+    }
+
     pub(crate) fn get(&mut self, source: &Arc<str>) -> TextContent {
         self.take(source.clone())
     }

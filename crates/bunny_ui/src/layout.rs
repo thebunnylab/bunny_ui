@@ -3718,14 +3718,7 @@ pub fn line_of(lines: &[(usize, usize)], byte: usize) -> usize {
 /// and kept — shaping a document as one line would be the cost of the
 /// document, and the widest paragraph is the honest width anyway.
 fn note_natural_width(sample: &str, env: &LayoutEnv<'_>) -> Px {
-    const MEASURED_WHOLE: usize = 4096;
-    if sample.len() <= MEASURED_WHOLE {
-        return env.cache.get_or_measure(sample, &env.font, env.text).width;
-    }
-    sample
-        .split('\n')
-        .map(|paragraph| env.cache.get_or_measure(paragraph, &env.font, env.text).width)
-        .fold(0.0, Px::max)
+    env.cache.measure_text(sample, &env.font, env.text).width
 }
 
 /// Block/underline carets cover the next glyph at a soft wrap. Keep this
@@ -5660,7 +5653,7 @@ impl LayoutNode {
         match self {
             LayoutNode::Text { content, .. } => {
                 let content = content.get();
-                Some(env.cache.get_or_measure(&content, &env.font, env.text).ascent)
+                Some(env.cache.measure_text(&content, &env.font, env.text).ascent)
             }
             LayoutNode::Field { .. } => {
                 let metrics = env.cache.get_or_measure("0", &env.font, env.text);
@@ -5722,8 +5715,9 @@ impl LayoutNode {
         match self {
             LayoutNode::Text { content, truncation, .. } => {
                 let content = content.get();
-                let metrics = env.cache.get_or_measure(&content, &env.font, env.text);
+                let metrics = env.cache.measure_text(&content, &env.font, env.text);
                 let natural = metrics.width;
+                let hard_lines = content.bytes().filter(|byte| *byte == b'\n').count() + 1;
                 // the line box a paragraph steps by: the face's own box,
                 // or the inherited `.line_height(…)` when one is set. With
                 // none, it is exactly the old `ascent + descent`.
@@ -5732,7 +5726,7 @@ impl LayoutNode {
                 // the width goes into the cache key (probe mode);
                 // truncation turns wrapping off: one line, always
                 let size = match proposal.width {
-                    Some(width) if width > 0.0 && width < natural => {
+                    Some(width) if width > 0.0 && (width < natural || hard_lines > 1) => {
                         if truncation.is_some() {
                             Size { width, height: advance }
                         } else {
@@ -5750,14 +5744,14 @@ impl LayoutNode {
                             // scrolling region asks for, and how a column
                             // of text keeps growing.
                             Size {
-                                width,
+                                width: width.min(natural),
                                 height: rows_that_fit(lines.len(), advance, proposal.height)
                                     as Px
                                     * advance,
                             }
                         }
                     }
-                    _ => Size { width: natural, height: advance },
+                    _ => Size { width: natural, height: std::iter::repeat_n(advance, rows_that_fit(hard_lines, advance, proposal.height)).sum() },
                 };
                 (size, Fit::Leaf)
             }
@@ -5771,14 +5765,10 @@ impl LayoutNode {
             }
 
             LayoutNode::Field { path, content: held, placeholder, multiline, secret, .. } => {
-                let shown;
-                let content: &str = if *secret {
-                    shown = crate::text_input::masked(held);
-                    &shown
-                } else {
-                    held
-                };
-                let sample: &str = if content.is_empty() { placeholder } else { content };
+                let shown = crate::text_input::displayed(held, *secret, *multiline);
+                let content = shown.as_ref();
+                let hint = crate::text_input::displayed(placeholder, false, *multiline);
+                let sample: &str = if content.is_empty() { &hint } else { content };
                 // the allocation the sample lives in, when it is one: the
                 // field's kept lines are then found by pointer
                 let shared = if content.is_empty() {
@@ -5806,7 +5796,7 @@ impl LayoutNode {
                     });
                     (Size { width, height }, Fit::Leaf)
                 } else {
-                    let metrics = env.cache.get_or_measure(sample, &env.font, env.text);
+                    let metrics = env.cache.measure_text(sample, &env.font, env.text);
                     let width = proposal.width.unwrap_or(metrics.width + 2.0 * FIELD_PAD_H);
                     let line_h = env.line_height.unwrap_or(metrics.height());
                     (Size { width, height: line_h + 2.0 * FIELD_PAD_V }, Fit::Leaf)
@@ -6449,13 +6439,10 @@ impl LayoutNode {
                 // move, and `masked_index` is what moves them. The real
                 // string never reaches the scene.
                 let held = content;
-                let masked;
-                let content: &Arc<str> = if secret {
-                    masked = Arc::from(crate::text_input::masked(held));
-                    &masked
-                } else {
-                    held
-                };
+                let shown = crate::text_input::displayed_shared(held, secret, multiline);
+                let content = &shown;
+                let hint = crate::text_input::displayed_shared(placeholder, false, multiline);
+                let placeholder = &hint;
                 let highlights = if secret { &None } else { highlights };
                 if out.dom.is_some() {
                     // the browser's input owns focus, caret and
@@ -6540,10 +6527,14 @@ impl LayoutNode {
                 // the placeholder walks the SAME path as the real text:
                 // same origin, same font, same breaks — only the ink drops
                 let sample: &Arc<str> = if content.is_empty() { placeholder } else { content };
+                let source = env.cache.text_content(sample);
+                // The field's own wrap table supplies scalar-aligned LF-local ranges.
+                let shaped_line = |start, end| source.line(start..end)
+                    .expect("field visual ranges come from this source's wrap table");
                 // a many-line field asks a PROBE for the line height
                 // instead of measuring a whole note as one line; a
                 // one-line field measures what it draws, as it always did
-                let metrics = env.cache.get_or_measure(
+                let metrics = env.cache.measure_text(
                     if multiline { "0" } else { sample },
                     &env.font,
                     env.text,
@@ -6592,7 +6583,7 @@ impl LayoutNode {
                 // instead of painting over the neighbour
                 out.push_clip(frame, if *bare { 0.0 } else { FIELD_RADIUS });
                 let width_of = |from: usize, to: usize| {
-                    env.cache.get_or_measure(&sample[from..to], &env.font, env.text).width
+                    env.cache.get_or_measure_paragraph(&shaped_line(from, to), &env.font, env.text).width
                 };
                 // where a line starts and which way it reads: anchored by
                 // the SCENE, read by its first letter. A left-to-right line
@@ -6600,7 +6591,7 @@ impl LayoutNode {
                 // measures nothing new; every other line knows its width
                 let anchor_rtl = env.rtl();
                 let line_placement = |start: usize, end: usize| -> (Px, Px, bool) {
-                    let line_rtl = crate::text_input::reads_right_to_left(&sample[start..end]);
+                    let line_rtl = crate::text_input::reads_right_to_left(shaped_line(start, end).paragraph().text());
                     if !anchor_rtl
                         && !line_rtl
                         && matches!(
@@ -6640,9 +6631,10 @@ impl LayoutNode {
                         continue;
                     }
                     let (line_x, _, line_rtl) = line_placement(start, end);
+                    let line = shaped_line(start, end);
                     let spans = |head: usize, tail: usize| {
                         crate::text_engine::line_spans(
-                            &sample[start..end],
+                            &line,
                             head - start..tail - start,
                             &env.font,
                             env.text,
@@ -6691,7 +6683,7 @@ impl LayoutNode {
                         // the SAME splitter a `text(…)` uses, on the
                         // same record — the placeholder is not the
                         // content, so its ranges would name nothing
-                        emit_editor_line(
+                        emit_text_runs(
                             sample,
                             (start, end),
                             highlights.as_ref().filter(|_| !content.is_empty()),
@@ -6751,13 +6743,13 @@ impl LayoutNode {
                         line_placement(start, end)
                     };
                     let line = if content.is_empty() {
-                        ""
+                        env.cache.paragraph("").expect("empty text contains no LF").full_line()
                     } else {
-                        &sample[start..end]
+                        shaped_line(start, end)
                     };
                     let local = caret.saturating_sub(start);
                     let boundary = crate::text_engine::line_caret_x(
-                        line,
+                        &line,
                         local,
                         state.affinity,
                         &env.font,
@@ -6768,7 +6760,7 @@ impl LayoutNode {
                         vec![boundary..boundary + FIELD_CARET_W]
                     } else if let Some(next) = next {
                         crate::text_engine::line_spans(
-                            line,
+                            &line,
                             local..next - start,
                             &env.font,
                             env.text,
@@ -8796,7 +8788,7 @@ fn place_text(
     ) {
         return;
     }
-    let metrics = env.cache.get_or_measure(content, &env.font, env.text);
+    let metrics = env.cache.measure_text(content, &env.font, env.text);
     let line_h = metrics.height();
     // the step between lines, and the half-leading that centres the glyph
     // box inside a taller one — the baseline stays ascent-based, so the
@@ -8824,7 +8816,7 @@ fn place_text(
         }
     };
 
-    if metrics.width <= frame.size.width {
+    if metrics.width <= frame.size.width && !content.contains('\n') {
         let origin = Point { x: frame.origin.x + slide(metrics.width), y: top };
         emit_text_runs(content, (0, content.len()), highlights, origin, base_color, env, out);
         return;
@@ -8832,9 +8824,9 @@ fn place_text(
     if let Some(mode) = truncation {
         // highlight does not survive the ellipsis (the original's ranges
         // do not map onto the composed text) — honest v1, noted
-        let composed: Arc<str> = Arc::from(truncate_to_width(content, mode, frame.size.width, env));
+        let composed: Arc<str> = Arc::from(truncate_to_width(content, "", mode, frame.size.width, env));
         let length = composed.len();
-        let cut = env.cache.get_or_measure(&composed, &env.font, env.text).width;
+        let cut = env.cache.measure_text(&composed, &env.font, env.text).width;
         out.draw(DrawCommand::TextLine {
             origin: Point { x: frame.origin.x + slide(cut), y: top },
             content: env.cache.text_content(&composed),
@@ -8852,18 +8844,26 @@ fn place_text(
         // the last line of a paragraph that was CUT says so, the way a
         // single line that does not fit already did
         if line_index + 1 == shown && shown < lines.len() {
-            let rest: Arc<str> = Arc::from(content[*start..].trim_end());
-            let composed: Arc<str> =
-                Arc::from(truncate_to_width(&rest, Truncation::End, frame.size.width, env));
+            // Keep the hidden prefix that resolves embeddings on this row.
+            // Later hard paragraphs are omitted, as the ellipsis communicates.
+            let paragraph_start = content[..*start].rfind('\n').map_or(0, |at| at + 1);
+            let prefix = &content[paragraph_start..*start];
+            let rest = content[*start..].split('\n').next().unwrap_or("").trim_end();
+            let visible = truncate_to_width(rest, prefix, Truncation::End, frame.size.width, env);
+            let composed: Arc<str> = Arc::from(format!("{prefix}{visible}"));
             let length = composed.len();
-            let cut = env.cache.get_or_measure(&composed, &env.font, env.text).width;
+            let source = env.cache.text_content(&composed);
+            // Both prefix and the composed visible row contain no hard LF.
+            let line = source.line(prefix.len()..length)
+                .expect("ellipsis is confined to its shaping paragraph");
+            let cut = env.cache.get_or_measure_paragraph(&line, &env.font, env.text).width;
             out.draw(DrawCommand::TextLine {
                 origin: Point {
                     x: frame.origin.x + slide(cut),
                     y: top + line_index as Px * advance,
                 },
-                content: env.cache.text_content(&composed),
-                range: (0, length),
+                content: source,
+                range: (prefix.len(), length),
                 color: base_color,
                 font: env.font,
             });
@@ -8884,8 +8884,11 @@ fn place_text(
                 // the space a break swallowed is INVISIBLE, and counting
                 // it would slide the line half a space off centre — the
                 // browser trims it too, so the two lowerings agree
-                let line = content[*start..*end].trim_end();
-                let width = env.cache.get_or_measure(&Arc::from(line), &env.font, env.text).width;
+                let trimmed = content[*start..*end].trim_end().len();
+                let source = env.cache.text_content(content);
+                let line = source.line(*start..*start + trimmed)
+                    .expect("trimming a wrapped line preserves its paragraph and scalar boundaries");
+                let width = env.cache.get_or_measure_paragraph(&line, &env.font, env.text).width;
                 frame.origin.x + slide(width)
             }
         };
@@ -8901,9 +8904,9 @@ fn place_text(
     }
 }
 
-/// Color an editable line by clipping its original shape, so highlights cannot
+/// Color a complete line by clipping its original shape, so highlights cannot
 /// reshape substrings and invalidate caret, selection or IME coordinates.
-fn emit_editor_line(
+fn emit_text_runs(
     content: &Arc<str>,
     line: (usize, usize),
     highlights: Option<&TextHighlight>,
@@ -8913,13 +8916,19 @@ fn emit_editor_line(
     out: &mut Placement,
 ) {
     let native = highlights.and_then(|highlight| {
-        let geometry = env
-            .cache
-            .get_or_geometry(&content[line.0..line.1], &env.font, env.text)?;
-        Some((highlight, geometry, out.current_clip()?))
+        let source = env.cache.text_content(content);
+        let shaped = source.line(line.0..line.1).ok()?;
+        let geometry = env.cache.get_or_paragraph_geometry(&shaped, &env.font, env.text)?;
+        let clip = out.current_clip().unwrap_or_else(|| {
+            // The raster's line box plus the same rounding slack as damage bounds.
+            let metrics = env.cache.get_or_measure_paragraph(&shaped, &env.font, env.text);
+            Rect { origin: Point { x: origin.x - 2.0, y: origin.y - 2.0 },
+                size: Size { width: metrics.width + 4.0, height: metrics.height() + 4.0 } }
+        });
+        Some((highlight, geometry, clip))
     });
     let Some((highlight, geometry, clip)) = native else {
-        emit_text_runs(content, line, highlights, origin, base_color, env, out);
+        emit_legacy_text_runs(content, line, highlights, origin, base_color, env, out);
         return;
     };
     let left = clip.origin.x - origin.x;
@@ -8948,7 +8957,7 @@ fn emit_editor_line(
             },
             0.0,
         );
-        emit_text_runs(content, line, None, origin, color, env, out);
+        emit_legacy_text_runs(content, line, None, origin, color, env, out);
         out.pop_clip();
     };
     let mut cursor = left;
@@ -8963,10 +8972,10 @@ fn emit_editor_line(
 }
 
 /// Emits the `TextLine`s of ONE line: whole in the base color, or sliced
-/// into segments when there is a highlight — each segment at its measured
+/// into segments for an engine without geometry — each segment at its measured
 /// prefix position (kerning between segments is approximate; real
 /// shaping by runs arrives with the attributed text system).
-fn emit_text_runs(
+fn emit_legacy_text_runs(
     content: &Arc<str>,
     line: (usize, usize),
     highlights: Option<&TextHighlight>,
@@ -9105,14 +9114,22 @@ fn rows_that_fit(lines: usize, advance: Px, room: Option<Px>) -> usize {
     }
 }
 
-fn truncate_to_width(content: &str, mode: Truncation, width: Px, env: &LayoutEnv<'_>) -> String {
+fn truncate_to_width(content: &str, prefix: &str, mode: Truncation, width: Px, env: &LayoutEnv<'_>) -> String {
+    // Explicit single-line truncation displays hard separators as spaces.
+    let displayed = crate::text_input::displayed(content, false, false);
+    let content = displayed.as_ref();
     let fits = |candidate: &str| {
-        env.cache.get_or_measure(candidate, &env.font, env.text).width <= width
+        let composed = env.cache.owned_text_content(Arc::from(format!("{prefix}{candidate}")));
+        // The prefix is a hard-paragraph slice; the candidate is normalized above.
+        let line = composed.line(prefix.len()..composed.len())
+            .expect("ellipsis candidates contain no hard paragraph separator");
+        env.cache.get_or_measure_paragraph(&line, &env.font, env.text).width <= width
     };
+    let boundaries = crate::grapheme::boundaries(content);
     match mode {
         Truncation::End => {
             let mut best = ELLIPSIS.to_string();
-            for (boundary, _) in content.char_indices().skip(1) {
+            for &boundary in boundaries.iter().skip(1) {
                 let candidate = format!("{}{ELLIPSIS}", &content[..boundary]);
                 if fits(&candidate) {
                     best = candidate;
@@ -9124,8 +9141,7 @@ fn truncate_to_width(content: &str, mode: Truncation, width: Px, env: &LayoutEnv
         }
         Truncation::Start => {
             let mut best = ELLIPSIS.to_string();
-            let starts: Vec<usize> = content.char_indices().map(|(index, _)| index).collect();
-            for &start in starts.iter().rev() {
+            for &start in boundaries.iter().rev().skip(1) {
                 if start == 0 {
                     break; // the whole content did not fit back there
                 }

@@ -210,3 +210,13 @@ fn paragraph_source_legacy_engine_defaults_remain_callable() {
     assert_eq!(contextual.rgba, legacy.rgba);
     assert!(PixelFont.paragraph_line_geometry(&line, &font).is_none());
 }
+
+#[test]
+fn paragraph_source_internal_interning_rejects_hard_separators() {
+    let cache = ContentCache::default();
+    assert_eq!(
+        cache.paragraph("one\ntwo").unwrap_err(),
+        TextRangeError::CrossesParagraph
+    );
+    assert_eq!(cache.paragraph("").unwrap().full_line().text(), "");
+}

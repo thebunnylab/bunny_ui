@@ -29,6 +29,7 @@ use crate::layout::{
 use crate::reconciler;
 use crate::image_engine::{ImageEngine, RawImages};
 use crate::text_engine::{FontSpec, MeasureCache, PixelFont, TextEngine, line_caret_x, line_hit};
+use crate::text_source::ParagraphLine;
 use crate::text_geometry::{CaretAffinity, CaretHit};
 use crate::text_input::{CaretState, EditCommand, word_around};
 use crate::view::{NodeList, View};
@@ -4109,12 +4110,14 @@ impl Runtime {
         // against what the eye sees, then carried back to the string
         // the app holds. Same character, both ways.
         let secret = placement.as_ref().is_some_and(|field| field.secret);
-        let shown =
-            if secret { crate::text_input::masked(&text) } else { String::new() };
-        let seen: &str = if secret { &shown } else { &text };
+        let shown = crate::text_input::displayed_shared(
+            &text, secret, placement.as_ref().is_some_and(|field| field.multiline),
+        );
+        let seen: &str = &shown;
         let home = |index: usize| {
             if secret { crate::text_input::unmasked_index(&text, index) } else { index }
         };
+        let source = self.cache.text_content(&shown);
         let whole = (0, text.len());
         let (caret, line) = match placement {
             Some(field) if field.multiline => {
@@ -4122,9 +4125,10 @@ impl Runtime {
                 let row = ((y - field.text_origin.y) / field.line_height).floor();
                 let row = (row.max(0.0) as usize).min(lines.len().saturating_sub(1));
                 let (start, end) = lines[row];
-                let along = self.field_line_x(&field, path, &seen[start..end], x);
+                let line = source.line(start..end).ok()?;
+                let along = self.field_line_x(&field, path, &line, x);
                 let hit = line_hit(
-                    &seen[start..end],
+                    &line,
                     along,
                     &field.font,
                     &*self.text,
@@ -4139,8 +4143,9 @@ impl Runtime {
                 )
             }
             Some(field) => {
-                let along = self.field_line_x(&field, path, seen, x);
-                let hit = line_hit(seen, along, &field.font, &*self.text, &self.cache);
+                let line = source.line(0..source.len()).ok()?;
+                let along = self.field_line_x(&field, path, &line, x);
+                let hit = line_hit(&line, along, &field.font, &*self.text, &self.cache);
                 (
                     CaretHit {
                         byte: home(hit.byte),
@@ -4168,13 +4173,13 @@ impl Runtime {
         &self,
         field: &crate::layout::FieldPlacement,
         path: &str,
-        line: &str,
+        line: &ParagraphLine,
     ) -> (Px, Px, bool) {
         let anchor_rtl = field.direction.is_rtl();
-        let line_rtl = crate::text_input::reads_right_to_left(line);
+        let line_rtl = crate::text_input::reads_right_to_left(line.paragraph().text());
         let width = self
             .cache
-            .get_or_measure(line, &field.font, &*self.text)
+            .get_or_measure_paragraph(line, &field.font, &*self.text)
             .width;
         // a wrapped field never rolls sideways; a one-line one does
         let offset_x = if field.multiline {
@@ -4190,7 +4195,7 @@ impl Runtime {
         &self,
         field: &crate::layout::FieldPlacement,
         path: &str,
-        line: &str,
+        line: &ParagraphLine,
         x: Px,
     ) -> Px {
         let (line_x, _, _) = self.field_line(field, path, line);
@@ -4230,17 +4235,13 @@ impl Runtime {
         text: &std::sync::Arc<str>,
         byte: usize,
         affinity: CaretAffinity,
-    ) -> Rect {
+    ) -> Option<Rect> {
         let byte = crate::text_input::clamp_index(text, byte);
         // Native ranges name the real string, but their rectangles follow
         // the displayed bullets, just like pointer placement and painting.
-        let masked;
-        let (text, byte) = if field.secret {
-            masked = std::sync::Arc::from(crate::text_input::masked(text));
-            (&masked, crate::text_input::masked_index(text, byte))
-        } else {
-            (text, byte)
-        };
+        let shown = crate::text_input::displayed_shared(text, field.secret, field.multiline);
+        let byte = if field.secret { crate::text_input::masked_index(text, byte) } else { byte };
+        let text = &shown;
         let (start, end, row) = if field.multiline {
             let lines = self.wrap(text, (!field.secret).then_some(text), field);
             let row = crate::layout::line_of(&lines, byte);
@@ -4249,23 +4250,23 @@ impl Runtime {
         } else {
             (0, text.len(), 0)
         };
-        let line = &text[start..end];
+        let line = self.cache.text_content(text).line(start..end).ok()?;
         let head = line_caret_x(
-            line,
+            &line,
             byte - start,
             affinity,
             &field.font,
             &*self.text,
             &self.cache,
         );
-        let (line_x, _, _) = self.field_line(field, &field.path, line);
-        Rect {
+        let (line_x, _, _) = self.field_line(field, &field.path, &line);
+        Some(Rect {
             origin: Point {
                 x: line_x + head,
                 y: field.text_origin.y + row as Px * field.line_height,
             },
             size: crate::layout::Size { width: 1.5, height: field.line_height },
-        }
+        })
     }
 
     /// The run follows the caret: the field scrolls its own text so the
@@ -4286,17 +4287,9 @@ impl Runtime {
         let state = self.carets.borrow().get(path).copied().unwrap_or_default();
         let caret = crate::text_input::clamp_index(&lent, state.caret);
         // what scrolls is what is drawn: bullets for a secret field
-        let shown = if field.secret {
-            crate::text_input::masked(&lent)
-        } else {
-            String::new()
-        };
-        let (text, caret) = if field.secret {
-            let caret = crate::text_input::masked_index(&lent, caret);
-            (shown.as_str(), caret)
-        } else {
-            (&*lent, caret)
-        };
+        let shown = crate::text_input::displayed(&lent, field.secret, field.multiline);
+        let text = shown.as_ref();
+        let caret = if field.secret { crate::text_input::masked_index(&lent, caret) } else { caret };
         let mut offset =
             self.scroll_offsets.borrow().get(path).copied().unwrap_or_default();
         // the caret leaving through one edge pulls the run back; through
@@ -4325,8 +4318,11 @@ impl Runtime {
                 lines.len() as Px * field.line_height,
             );
         } else {
+            // Single-line presentation replaces LF with spaces of the same encoded length.
+            let paragraph = self.cache.paragraph(text).expect("single-line presentation has no LF");
+            let line = paragraph.full_line();
             let visual = line_caret_x(
-                text,
+                &line,
                 caret,
                 state.affinity,
                 &field.font,
@@ -4335,7 +4331,7 @@ impl Runtime {
             );
             let full = self
                 .cache
-                .get_or_measure(text, &field.font, &*self.text)
+                .get_or_measure_paragraph(&line, &field.font, &*self.text)
                 .width;
             let caret_x = if crate::text_input::reads_right_to_left(text) {
                 full - visual
@@ -4401,18 +4397,23 @@ impl Runtime {
         let Some(text) = reconciler::read_editor(path, &mut probe) else {
             return declined;
         };
-        let lines = self.wrap(&text, Some(&text), &field);
+        let shown = crate::text_input::displayed_shared(&text, field.secret, field.multiline);
+        let lines = self.wrap(&shown, Some(&shown), &field);
+        let source = self.cache.text_content(&shown);
         let mut state = self.carets.borrow().get(path).copied().unwrap_or_default();
-        let caret = crate::text_input::clamp_index(&text, state.caret);
+        let real_caret = crate::text_input::clamp_index(&text, state.caret);
+        let caret = if field.secret { crate::text_input::masked_index(&text, real_caret) } else { real_caret };
+        let home = |byte| if field.secret { crate::text_input::unmasked_index(&text, byte) } else { byte };
         let row = crate::layout::line_of(&lines, caret);
         // the column the walk keeps: taken from where the caret stands
         // and RETAINED, so crossing a short line does not lose it
         let column = self.goal_column.get().unwrap_or_else(|| {
             let (start, end) = lines[row];
-            let line = &text[start..end];
-            self.field_line(&field, path, line).0
+            // The cache supplies validated ranges from this source's wrap table.
+            let line = source.line(start..end).expect("wrapped field line belongs to its source");
+            self.field_line(&field, path, &line).0
                 + line_caret_x(
-                    line,
+                    &line,
                     caret - start,
                     state.affinity,
                     &field.font,
@@ -4427,11 +4428,11 @@ impl Runtime {
         };
         let landed = match lines.get(target) {
             Some(&(start, end)) => {
-                let line = &text[start..end];
-                let local = column - self.field_line(&field, path, line).0;
-                let hit = line_hit(line, local, &field.font, &*self.text, &self.cache);
+                let Ok(line) = source.line(start..end) else { return declined };
+                let local = column - self.field_line(&field, path, &line).0;
+                let hit = line_hit(&line, local, &field.font, &*self.text, &self.cache);
                 CaretHit {
-                    byte: start + hit.byte,
+                    byte: home(start + hit.byte),
                     ..hit
                 }
             }
@@ -4444,7 +4445,7 @@ impl Runtime {
         // the same rule the arrows already follow: shift arms the anchor
         // and keeps it, a bare walk drops the selection
         if select {
-            state.anchor = Some(state.anchor.unwrap_or(caret));
+            state.anchor = Some(state.anchor.unwrap_or(real_caret));
         } else {
             state.anchor = None;
         }
@@ -4603,7 +4604,7 @@ impl Runtime {
             .iter()
             .find(|field| field.path == path)
             .cloned()?;
-        let caret_rect = self.field_byte_rect(&field, &text, caret, state.affinity);
+        let caret_rect = self.field_byte_rect(&field, &text, caret, state.affinity)?;
 
         Some(ImeSnapshot {
             text,
@@ -4709,7 +4710,7 @@ impl Runtime {
             .get(&path)
             .filter(|state| state.caret == byte)
             .map_or(CaretAffinity::Downstream, |state| state.affinity);
-        Some(self.field_byte_rect(&field, &text, byte, affinity))
+        self.field_byte_rect(&field, &text, byte, affinity)
     }
 
     /// Dom mode's sync door: the BROWSER's input owns the editing there,

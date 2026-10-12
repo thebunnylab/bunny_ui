@@ -19,7 +19,7 @@ use std::sync::Arc;
 use motor::hash::FxHashMap as HashMap;
 
 use crate::layout::{Color, Px};
-use crate::text_source::{ContentCache, ParagraphLine, TextContent};
+use crate::text_source::{ContentCache, Paragraph, ParagraphLine, TextContent, TextRangeError};
 
 #[path = "text_context_cache.rs"]
 mod context_cache;
@@ -524,20 +524,21 @@ pub fn caret_from_x(
 /// Visual coordinate relative to the left edge of a complete shaped line.
 /// Engines without native geometry keep their existing prefix approximation.
 pub(crate) fn line_caret_x(
-    text: &str,
+    line: &ParagraphLine,
     byte: usize,
     affinity: crate::text_geometry::CaretAffinity,
     font: &FontSpec,
     engine: &dyn TextEngine,
     cache: &MeasureCache,
 ) -> Px {
-    if let Some(geometry) = cache.get_or_geometry(text, font, engine) {
+    if let Some(geometry) = cache.get_or_paragraph_geometry(line, font, engine) {
         return geometry.caret_x(byte, affinity);
     }
+    let text = line.text();
     let byte = crate::text_input::clamp_to_boundary(text, byte);
     let head = cache.get_or_measure(&text[..byte], font, engine).width;
     if crate::text_input::reads_right_to_left(text) {
-        cache.get_or_measure(text, font, engine).width - head
+        cache.get_or_measure_paragraph(line, font, engine).width - head
     } else {
         head
     }
@@ -545,17 +546,18 @@ pub(crate) fn line_caret_x(
 
 /// Resolve a visual coordinate and retain its native directional affinity.
 pub(crate) fn line_hit(
-    text: &str,
+    line: &ParagraphLine,
     x: Px,
     font: &FontSpec,
     engine: &dyn TextEngine,
     cache: &MeasureCache,
 ) -> crate::text_geometry::CaretHit {
-    if let Some(geometry) = cache.get_or_geometry(text, font, engine) {
+    if let Some(geometry) = cache.get_or_paragraph_geometry(line, font, engine) {
         return geometry.hit_test(x);
     }
+    let text = line.text();
     let along = if crate::text_input::reads_right_to_left(text) {
-        cache.get_or_measure(text, font, engine).width - x
+        cache.get_or_measure_paragraph(line, font, engine).width - x
     } else {
         x
     };
@@ -567,21 +569,21 @@ pub(crate) fn line_hit(
 
 /// Disjoint visual selection bands of the complete line, in local coordinates.
 pub(crate) fn line_spans(
-    text: &str,
+    line: &ParagraphLine,
     bytes: std::ops::Range<usize>,
     font: &FontSpec,
     engine: &dyn TextEngine,
     cache: &MeasureCache,
 ) -> Vec<std::ops::Range<Px>> {
-    if let Some(geometry) = cache.get_or_geometry(text, font, engine) {
+    if let Some(geometry) = cache.get_or_paragraph_geometry(line, font, engine) {
         return geometry.selection_spans(bytes);
     }
     if bytes.is_empty() {
         return Vec::new();
     }
     let affinity = crate::text_geometry::CaretAffinity::Downstream;
-    let a = line_caret_x(text, bytes.start, affinity, font, engine, cache);
-    let b = line_caret_x(text, bytes.end, affinity, font, engine, cache);
+    let a = line_caret_x(line, bytes.start, affinity, font, engine, cache);
+    let b = line_caret_x(line, bytes.end, affinity, font, engine, cache);
     std::iter::once(a.min(b)..a.max(b)).collect()
 }
 
@@ -631,14 +633,27 @@ fn wrap_paragraph(
     cache: &MeasureCache,
     lines: &mut Vec<(usize, usize)>,
 ) {
-    // a paragraph that fits is one line, whatever its words: a short
-    // printable-ASCII one is decided by a bound (no shaping at all), any
-    // other by ONE measure of the whole — the word walk below measures a
-    // growing prefix per word, which a page of short lines never needs
-    if paragraph_fits(&text[start..stop], font, max_width, engine, cache) {
+    let text_paragraph = &text[start..stop];
+    // The printable-ASCII bound avoids preparing thousands of short note rows.
+    if text_paragraph.is_empty() || (text_paragraph.bytes().all(|byte| (0x20..0x7f).contains(&byte))
+        && u32::try_from(text_paragraph.len()).is_ok_and(|count| cache.ascii_advance(font, engine) * Px::from(count) <= max_width))
+    {
         lines.push((start, stop));
         return;
     }
+    // The caller delimits this range at hard LF boundaries.
+    let paragraph = cache.paragraph(text_paragraph).expect("wrap input is one hard paragraph");
+    if cache.get_or_measure_paragraph(&paragraph.full_line(), font, engine).width <= max_width {
+        lines.push((start, stop));
+        return;
+    }
+    // All candidates below come from the paragraph's grapheme table, so they
+    // are ordered, scalar-aligned and confined to this LF-delimited paragraph.
+    let measure = |from: usize, to: usize| {
+        let line = paragraph.line(from - start..to - start)
+            .expect("wrap candidates are validated grapheme boundaries of this paragraph");
+        cache.get_or_measure_paragraph(&line, font, engine).width
+    };
     // Resolve boundaries once for this paragraph: every token and forced
     // break must use them, including spaces carrying combining marks. The
     // segmentation pass is linear even for long regional-indicator runs.
@@ -656,9 +671,7 @@ fn wrap_paragraph(
         }
 
         if !is_space {
-            let width = cache
-                .get_or_measure(&text[line_start..byte(token_end)], font, engine)
-                .width;
+            let width = measure(line_start, byte(token_end));
             if width > max_width && byte(cursor) > line_start {
                 // The spaces already walked hang at the previous line's end.
                 lines.push((line_start, byte(cursor)));
@@ -670,10 +683,7 @@ fn wrap_paragraph(
                 // narrower scalar prefix would corrupt the visible character.
                 let mut end = cursor + 1;
                 for candidate in cursor + 2..=token_end {
-                    if cache
-                        .get_or_measure(&text[line_start..byte(candidate)], font, engine)
-                        .width
-                        > max_width
+                    if measure(line_start, byte(candidate)) > max_width
                     {
                         break;
                     }
@@ -692,29 +702,6 @@ fn wrap_paragraph(
     if line_start < stop {
         lines.push((line_start, stop));
     }
-}
-
-/// True when the paragraph is one line at `max_width`. Printable ASCII
-/// is bounded by its widest glyph times its length (kerning and tracking
-/// only nudge a run of these; the bound carries the margin); anything
-/// else, or a long ASCII paragraph, is measured once, whole.
-fn paragraph_fits(
-    paragraph: &str,
-    font: &FontSpec,
-    max_width: Px,
-    engine: &dyn TextEngine,
-    cache: &MeasureCache,
-) -> bool {
-    if paragraph.is_empty() {
-        return true;
-    }
-    let bytes = paragraph.as_bytes();
-    if bytes.iter().all(|byte| (0x20..0x7f).contains(byte))
-        && cache.ascii_advance(font, engine) * bytes.len() as Px <= max_width
-    {
-        return true;
-    }
-    cache.get_or_measure(paragraph, font, engine).width <= max_width
 }
 
 /// How many leading bytes two strings share — compared in blocks, which
@@ -932,6 +919,24 @@ impl MeasureCache {
             + lines.values().map(HashMap::len).sum::<usize>()
             + breaks.values().map(HashMap::len).sum::<usize>();
         self.entries.set(kept);
+    }
+
+    pub(crate) fn paragraph(&self, text: &str) -> Result<Paragraph, TextRangeError> {
+        self.contents.borrow().paragraph(text)
+    }
+
+    /// Natural width and font box across the text's hard paragraphs.
+    pub(crate) fn measure_text(&self, text: &str, font: &FontSpec, engine: &dyn TextEngine) -> LineMetrics {
+        let mut result = LineMetrics { width: 0.0, ascent: 0.0, descent: 0.0 };
+        for part in text.split('\n') {
+            // split excludes the LF separators, including on empty final paragraphs.
+            let line = self.paragraph(part).expect("split yields one hard paragraph").full_line();
+            let metrics = self.get_or_measure_paragraph(&line, font, engine);
+            result.width = result.width.max(metrics.width);
+            result.ascent = result.ascent.max(metrics.ascent);
+            result.descent = result.descent.max(metrics.descent);
+        }
+        result
     }
 
     /// Index this shared source once and reuse unchanged paragraph values.

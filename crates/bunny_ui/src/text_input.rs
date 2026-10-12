@@ -423,6 +423,29 @@ pub fn masked(text: &str) -> String {
     mask
 }
 
+/// The displayed field text. A single-line field shows externally supplied
+/// CR/LF as spaces without changing the binding, UTF-8 or UTF-16 offsets.
+/// Secrets keep the existing one-bullet-per-scalar mapping.
+pub(crate) fn displayed(text: &str, secret: bool, multiline: bool) -> std::borrow::Cow<'_, str> {
+    if secret {
+        std::borrow::Cow::Owned(masked(text))
+    } else if !multiline && text.contains(['\r', '\n']) {
+        std::borrow::Cow::Owned(text.replace(['\r', '\n'], " "))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+/// Preserve source identity when presentation does not transform the binding.
+pub(crate) fn displayed_shared(
+    text: &std::sync::Arc<str>, secret: bool, multiline: bool,
+) -> std::sync::Arc<str> {
+    match displayed(text, secret, multiline) {
+        std::borrow::Cow::Borrowed(_) => std::sync::Arc::clone(text),
+        std::borrow::Cow::Owned(shown) => std::sync::Arc::from(shown),
+    }
+}
+
 /// Where `byte` of `text` lands in [`masked`] of it.
 pub fn masked_index(text: &str, byte: usize) -> usize {
     let byte = clamp_to_boundary(text, byte);
