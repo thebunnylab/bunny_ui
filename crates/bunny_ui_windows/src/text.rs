@@ -1404,3 +1404,8 @@ mod geometry_tests;
 #[cfg(test)]
 #[path = "text_paragraph_tests.rs"]
 mod paragraph_tests;
+
+// Evaluate the native paragraph boundary before changing runtime shaping.
+#[cfg(test)]
+#[path = "text_analysis.rs"]
+mod analysis;

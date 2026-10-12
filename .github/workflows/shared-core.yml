@@ -67,6 +67,11 @@ jobs:
         run: |
           cargo test -p bunny-ui-motor --locked --all-targets
           BUNNY_PARANOID=all cargo test -p bunny-ui-motor --locked --all-targets
+      - name: Windows paragraph analysis, normal and paranoid
+        if: runner.os == 'Windows'
+        run: |
+          cargo test -p bunny-ui-windows --locked --lib paragraph_analysis_ -- --nocapture
+          BUNNY_PARANOID=all cargo test -p bunny-ui-windows --locked --lib paragraph_analysis_ -- --nocapture
       - name: Native platform, normal and paranoid
         env:
           PLATFORM: ${{ matrix.platform }}
