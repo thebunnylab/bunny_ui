@@ -153,3 +153,21 @@ fn both_schemes_render_as_two_scenes_with_their_own_tokens() {
     assert!(dark.contains(&Theme::dark().canvas));
     assert_eq!(theme::installed(), Theme::light(), "the quiet themes never touched the installed one");
 }
+
+/// `#[preview]`'s expansion resolves on the core alone: the entry macro
+/// takes the function and exports nothing, and the function is read.
+mod entry_on_the_core {
+    use bunny_ui_core::prelude::*;
+
+    fn sample() -> impl View {
+        text("sample")
+    }
+
+    bunny_ui_core::__bunny_preview_entry!(sample, bunny_preview__sample, "Sample", "Cards", "sample");
+
+    #[test]
+    fn the_entry_macro_expands_to_nothing_on_the_core() {
+        // nothing to call: the symbol is the facade's to mint. The
+        // invocation above compiling is the test.
+    }
+}
