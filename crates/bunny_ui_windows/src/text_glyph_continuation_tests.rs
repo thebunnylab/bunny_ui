@@ -44,7 +44,7 @@ fn continue_at_native_cuts(
                         && output.clusters[cut - 1] != output.clusters[cut]
                         && validate_range(input.text, &(position..position + cut)).is_ok()
                 })
-                .ok_or(NoCut {
+                .ok_or_else(|| NoCut {
                     position,
                     probed: probe.text.len(),
                     safe_flags: output
@@ -100,7 +100,7 @@ fn paragraph_at_native_cuts(
                         prepared.scripts[index] != script
                             || prepared.levels[index].resolved != level
                     })
-                    .unwrap_or(prepared.utf16().len());
+                    .unwrap_or_else(|| prepared.utf16().len());
                 let (face, scale, mapped) =
                     shaper.map(prepared, position..end, &base, font).unwrap();
                 let input = Input {
@@ -293,4 +293,56 @@ fn paragraph_native_safe_cuts_refuse_incomplete_distant_opentype_context() {
             eprintln!("native distant-context complete 130-unit input matches the feature oracle");
         })
         .unwrap();
+}
+
+#[test]
+fn paragraph_native_cut_flags_record_substitution_and_placement_stages() {
+    let engine = DirectWriteEngine::new();
+    assert!(engine.register_font(include_bytes!("../tests/fixtures/paragraph-context.ttf")));
+    let factories = engine.factories.as_ref().unwrap();
+    let shaper = Shaper::new(factories).unwrap();
+    for (name, text, family) in [
+        ("ligatures", "office affine ".repeat(293), "Calibri"),
+        ("arabic", "العربية ".repeat(512), "Segoe UI"),
+        ("marks", "a\u{301}".repeat(2048), "Segoe UI"),
+        (
+            "context-prefix",
+            format!("a{}", "b".repeat(126)),
+            "Bunny Paragraph Context",
+        ),
+        (
+            "context-complete",
+            format!("a{}c", "b".repeat(128)),
+            "Bunny Paragraph Context",
+        ),
+    ] {
+        let font = FontSpec {
+            size: 19.0,
+            family: bunny_ui::text_engine::Family::named(family),
+            ..FontSpec::DEFAULT
+        };
+        let prepared = Prepared::new(factories, &text).unwrap();
+        engine.with_slot(&font, |slot| {
+            let base = BaseFont::new(slot, &font).unwrap();
+            let end = prepared.levels.iter().position(|level| level.resolved != prepared.levels[0].resolved).unwrap_or_else(|| prepared.utf16().len());
+            let (face, scale, mapped) = shaper.map(&prepared, 0..end, &base, &font).unwrap();
+            assert_eq!(mapped, end);
+            let input = Input {
+                text: &prepared.utf16()[..end],
+                script: prepared.scripts[0],
+                level: prepared.levels[0].resolved,
+                face: &face,
+                em_size: native_float(font.size).unwrap() * scale,
+                // SAFETY: Prepared retains the immutable original source and locale.
+                locale: unsafe { &(*prepared.source.as_ptr()).locale },
+            };
+            let before = shaper.glyph_indices(&input, MAX_GLYPHS).unwrap();
+            let after = shaper.produce(&input, 0.0, MAX_GLYPHS).unwrap();
+            assert_eq!(before.clusters, after.clusters);
+            assert_eq!(before.glyphs, after.glyphs);
+            let flags = |output: &Output| output.text_properties.iter().filter(|&&value| value & 4 != 0).count();
+            let changed = before.text_properties.iter().zip(&after.text_properties).filter(|(left,right)| left != right).count();
+            eprintln!("native cut stages: {name}, units={end}, substitution-safe={}, placement-safe={}, changed={changed}", flags(&before), flags(&after));
+        }).unwrap();
+    }
 }
