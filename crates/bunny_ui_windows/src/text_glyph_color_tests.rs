@@ -161,6 +161,20 @@ fn paragraph_raster_glyph_pixels_match_independent_native_text_layout() {
                 let color = Color::rgb(173, 29, 83);
                 let expected = reference(&engine, text, &font, color, scale);
                 let actual = rendered(&engine, text, &font, color, scale, 0);
+                if actual != expected {
+                    super::reference::trace(&reference_layout(&engine, text, &font), scale);
+                    for run in shape(&engine, text, &font) {
+                        eprintln!(
+                            "shaped run: width={}, em={}, level={}, glyphs={:?}, advances={:?}, offsets={:?}",
+                            run.width(),
+                            run.em_size,
+                            run.level,
+                            run.glyphs,
+                            run.advances,
+                            run.offsets
+                        );
+                    }
+                }
                 assert_pixels(
                     &expected,
                     &actual,

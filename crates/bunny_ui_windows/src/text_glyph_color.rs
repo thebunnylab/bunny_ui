@@ -230,7 +230,9 @@ fn draw_layer(
     mode: u32,
 ) -> Result<(), TextError> {
     match format {
-        1 | 2 | 4 => {
+        // Native COLRv0 layers can retain the outline bit as well (for
+        // example TRUETYPE | COLR = 5). These all use the outline renderer.
+        format if format != 0 && format & !0x7 == 0 => {
             let brush = brushes.layer(surface, layer)?;
             draw_outline(surface, layer.origin, &layer.run, brush, mode);
         }
@@ -263,13 +265,7 @@ fn draw_layer(
                 );
             }
         }
-        _ => {
-            eprintln!(
-                "unsupported native glyph format={format:#x}, mode={mode}, palette={}, glyphs={}",
-                layer.palette, layer.run.count
-            );
-            return Err(failure("color glyph format"));
-        }
+        _ => return Err(failure("color glyph format")),
     }
     Ok(())
 }
@@ -339,3 +335,7 @@ fn draw_layers(
 #[cfg(test)]
 #[path = "text_glyph_color_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "text_glyph_reference.rs"]
+mod reference;
