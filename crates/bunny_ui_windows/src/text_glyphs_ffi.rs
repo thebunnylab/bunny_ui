@@ -25,17 +25,28 @@ pub(super) fn query<T, U>(
     id: &Guid,
     operation: &'static str,
 ) -> Result<Com<U>, TextError> {
-    // SAFETY: every caller's T is a real COM interface with an IUnknown prefix.
+    query_optional(owner, id, operation)?.ok_or_else(|| preparation(operation))
+}
+
+pub(super) fn query_optional<T, U>(
+    owner: &Com<T>,
+    id: &Guid,
+    operation: &'static str,
+) -> Result<Option<Com<U>>, TextError> {
+    // SAFETY: all callers supply real COM owners and exact SDK interface IDs.
     unsafe {
         let pointer = owner.as_ptr().cast::<c_void>();
         let table = &**pointer.cast::<*const UnknownVtbl>();
         let mut output = std::ptr::null_mut();
         let status = (table.query_interface)(pointer, id, &raw mut output);
         let result = Com::from_raw(output.cast::<U>());
+        if status == super::super::NO_INTERFACE {
+            return Ok(None);
+        }
         if !com_ok(status) {
             return Err(preparation(operation));
         }
-        result.ok_or_else(|| preparation(operation))
+        result.map(Some).ok_or_else(|| preparation(operation))
     }
 }
 

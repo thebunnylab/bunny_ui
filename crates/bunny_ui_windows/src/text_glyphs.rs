@@ -17,6 +17,9 @@ use std::ops::Range;
 #[path = "text_glyphs_ffi.rs"]
 mod ffi;
 
+#[path = "text_glyph_raster.rs"]
+mod raster;
+
 const MAX_GLYPHS: usize = u16::MAX as usize + 1;
 const INSUFFICIENT_BUFFER: Hresult = -2_147_024_774; // HRESULT_FROM_WIN32(122)
 
