@@ -2,7 +2,7 @@
 
 use super::{Com, GlyphRun, Guid, Hresult};
 use crate::ffi::UnknownVtbl;
-use crate::text::{IDWriteTextLayout, com_ok};
+use crate::text::{DwriteTextMetrics, IDWriteTextLayout, com_ok};
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ops::Range;
@@ -263,7 +263,24 @@ pub(super) fn trace(layout: &Com<IDWriteTextLayout>, scale: f32) {
 pub(in crate::text::analysis::glyphs) fn collect(
     layout: &Com<IDWriteTextLayout>,
 ) -> Vec<NativeRun> {
-    draw(layout, 1.0, false)
+    let mut metrics = DwriteTextMetrics::default();
+    // SAFETY: the independently created layout owns its original text and font.
+    // Realize native layout before collecting its synchronous draw callbacks.
+    unsafe {
+        assert!(com_ok(((*(*layout.as_ptr()).vtbl).get_metrics)(
+            layout.as_ptr(),
+            &raw mut metrics
+        )));
+    }
+    let records = draw(layout, 1.0, false);
+    eprintln!(
+        "native glyph reference: width={}, height={}, lines={}, runs={}",
+        metrics.width_including_trailing_whitespace,
+        metrics.height,
+        metrics.line_count,
+        records.len()
+    );
+    records
 }
 
 fn draw(layout: &Com<IDWriteTextLayout>, scale: f32, trace: bool) -> Vec<NativeRun> {

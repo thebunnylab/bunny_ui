@@ -241,6 +241,11 @@ fn paragraph_glyph_buffer_growth_caps_at_the_native_count() {
         .flat_map(clusters)
         .collect();
     expected.sort_by_key(|cluster| cluster.source.start);
+    assert_eq!(
+        expected.len(),
+        4096,
+        "independent reference must cover every source unit"
+    );
     engine
         .with_slot(&font, |slot| {
             let base = BaseFont::new(slot, &font).unwrap();
