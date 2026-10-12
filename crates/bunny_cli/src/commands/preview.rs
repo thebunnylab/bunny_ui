@@ -3,9 +3,11 @@
 //! shows up here as a line.
 
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use bunny_ui_preview::snapshot::{self, Picture};
 use bunny_ui_preview::wire::{Scheme, Selection, Size, Sizing, ToHost, ToIde, Traits};
 
 use crate::args::{HELP, Matches, Opt};
@@ -19,7 +21,7 @@ use crate::term;
 
 pub const SUMMARY: &str = "Render the app's #[preview] functions, and keep them rendered as you save";
 
-pub const USAGE: &str = "bunny preview [NAME...] [--list] [--json] [--png DIR] [OPTIONS]";
+pub const USAGE: &str = "bunny preview [NAME...] [--list] [--json] [--png DIR | --snapshot DIR] [OPTIONS]";
 
 pub const ABOUT: &str = "\
 Lists the previews the app's sources mark with #[preview] (--list), or
@@ -34,7 +36,15 @@ With --png DIR each named preview is rendered once, its pixels asked of
 the host — the same picture the frame paints, through the app's own
 text and image engines — and written as DIR/<ident>.png; then the host
 stops. --size WxH renders at that size in points instead of what each
-view wants, --dark under the dark scheme.";
+view wants, --dark under the dark scheme.
+
+With --snapshot DIR the same pictures are compared with the goldens in
+DIR instead: a preview with no golden yet writes one and says `new`, a
+match says `same`, a difference says how many pixels and in what box,
+and the command fails. --update makes the pictures the goldens.
+--engine house renders with the framework's own text and image engines,
+the same on every OS — what a golden kept in a repository is made with;
+the platform's engines are the default.";
 
 pub const OPTIONS: &[Opt] = &[
     Opt::flag("list", "List the previews the sources mark, without building"),
@@ -42,19 +52,34 @@ pub const OPTIONS: &[Opt] = &[
     Opt::value("features", "LIST", "Cargo features to turn on (repeatable)"),
     Opt::value("package", "NAME", "The app, in a workspace of several").short('p'),
     Opt::value("png", "DIR", "Render each preview once to DIR/<ident>.png, then stop"),
-    Opt::value("size", "WxH", "With --png: render at this size in points, not what each view wants"),
-    Opt::flag("dark", "With --png: render under the dark scheme"),
+    Opt::value("snapshot", "DIR", "Render each preview once and compare it with DIR/<ident>.png, writing the golden when there is none"),
+    Opt::flag("update", "With --snapshot: make the pictures the goldens"),
+    Opt::value("engine", "NAME", "With --png or --snapshot: house (the same on every OS) or platform (the default)"),
+    Opt::value("size", "WxH", "With --png or --snapshot: render at this size in points, not what each view wants"),
+    Opt::flag("dark", "With --png or --snapshot: render under the dark scheme"),
     HELP,
 ];
+
+/// Where the pictures go: a folder, or the goldens to hold them to.
+enum Pictures<'a> {
+    Write(&'a Path),
+    Compare { dir: &'a Path, update: bool },
+}
 
 /// How often the lane looks for saves.
 const LOOK: Duration = Duration::from_millis(150);
 
 pub fn run(matches: &Matches) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let env = match matches.value("engine") {
+        Some("house") => vec![(String::from("BUNNY_PREVIEW_ENGINE"), OsString::from("house"))],
+        None | Some("platform") => Vec::new(),
+        Some(other) => return Err(Error::new(format!("--engine is house or platform, not `{other}`"))),
+    };
     let options = Options {
         features: matches.values("features").iter().flat_map(|list| list.split(',')).map(str::trim).filter(|f| !f.is_empty()).map(String::from).collect(),
         package: matches.value("package").map(String::from),
+        env,
     };
     let lane = Preview::new(&cwd, options)?;
     if matches.flag("list") {
@@ -81,9 +106,14 @@ pub fn run(matches: &Matches) -> Result<()> {
     };
     render(&events, &wanted);
     println!("{} {}", term::ok("Host up"), term::dim(&format!("(built in {:.1}s)", began.elapsed().as_secs_f32())));
-    match matches.value("png") {
-        Some(dir) => pictures(live, wanted, Path::new(dir), traits),
-        None => watch(live, wanted),
+    match (matches.value("png"), matches.value("snapshot")) {
+        (Some(_), Some(_)) => {
+            live.stop();
+            Err(Error::new("--png and --snapshot are one or the other"))
+        }
+        (Some(dir), None) => pictures(live, wanted, Pictures::Write(Path::new(dir)), traits),
+        (None, Some(dir)) => pictures(live, wanted, Pictures::Compare { dir: Path::new(dir), update: matches.flag("update") }, traits),
+        (None, None) => watch(live, wanted),
     }
 }
 
@@ -104,12 +134,16 @@ fn traits_of(matches: &Matches) -> Result<Traits> {
     Ok(Traits { scheme, size, ..Traits::default() })
 }
 
-/// `--png`: every wanted preview rendered once under `traits`, its pixels
-/// asked of the host after its first frame and written as
-/// `DIR/<ident>.png` (`<ident>-v<n>.png` past the first variant); then
-/// the host stops.
-fn pictures(mut live: Preview<crate::preview::Live>, wanted: Vec<String>, dir: &Path, traits: Traits) -> Result<()> {
+/// `--png` and `--snapshot`: every wanted preview rendered once under
+/// `traits`, its pixels asked of the host after its first frame and
+/// written as `DIR/<ident>.png` (`<ident>-v<n>.png` past the first
+/// variant) — or held to the golden of that name; then the host stops.
+fn pictures(mut live: Preview<crate::preview::Live>, wanted: Vec<String>, into: Pictures<'_>, traits: Traits) -> Result<()> {
+    let dir = match into {
+        Pictures::Write(dir) | Pictures::Compare { dir, .. } => dir,
+    };
     std::fs::create_dir_all(dir).map_err(|error| Error::new(format!("{}: {error}", dir.display())))?;
+    let mut differing: Vec<String> = Vec::new();
     let until = Instant::now() + Duration::from_secs(120);
     let mut events = Vec::new();
     let mut selected = false;
@@ -146,9 +180,36 @@ fn pictures(mut live: Preview<crate::preview::Live>, wanted: Vec<String>, dir: &
                 Event::Host(ToIde::Snapshot { preview, variant, size, rgba }) => {
                     let name = if *variant == 0 { format!("{preview}.png") } else { format!("{preview}-v{variant}.png") };
                     let path = dir.join(&name);
-                    std::fs::write(&path, png::encode(size.0, size.1, rgba)?).map_err(|error| Error::new(format!("{}: {error}", path.display())))?;
-                    println!("{} {}", term::ok(&path.display().to_string()), term::dim(&format!("{}×{}", size.0, size.1)));
-                    written += 1;
+                    let golden = match into {
+                        Pictures::Compare { update: false, .. } if path.is_file() => {
+                            Some(std::fs::read(&path).map_err(|error| Error::new(format!("{}: {error}", path.display())))?)
+                        }
+                        _ => None,
+                    };
+                    match golden {
+                        Some(golden) => {
+                            let (width, height, expected) = png::decode(&golden).map_err(|error| Error::new(format!("{}: {}", path.display(), error.message)))?;
+                            let expected = Picture::new(width, height, &expected).ok_or_else(|| Error::new(format!("{}: the golden's bytes are not its size", path.display())))?;
+                            let actual = Picture::new(size.0, size.1, rgba).ok_or_else(|| Error::new(format!("{preview}: the host's pixels are not its size")))?;
+                            let verdict = snapshot::compare(expected, actual, 0);
+                            if verdict.is_same() {
+                                println!("{} {}", term::ok(&name), term::dim("same"));
+                            } else {
+                                println!("{} {}", term::red(&name), term::bold(&verdict.to_string()));
+                                differing.push(format!("{name}: {verdict}"));
+                            }
+                        }
+                        None => {
+                            std::fs::write(&path, png::encode(size.0, size.1, rgba)?).map_err(|error| Error::new(format!("{}: {error}", path.display())))?;
+                            let said = match into {
+                                Pictures::Write(_) => format!("{}×{}", size.0, size.1),
+                                Pictures::Compare { update: true, .. } => format!("{}×{} · the golden now", size.0, size.1),
+                                Pictures::Compare { update: false, .. } => format!("{}×{} · new, kept as the golden", size.0, size.1),
+                            };
+                            println!("{} {}", term::ok(&path.display().to_string()), term::dim(&said));
+                            written += 1;
+                        }
+                    }
                     let suffix = format!("#{preview}");
                     pending.retain(|id| !id.ends_with(&suffix));
                 }
@@ -162,7 +223,13 @@ fn pictures(mut live: Preview<crate::preview::Live>, wanted: Vec<String>, dir: &
         }
         if selected && pending.is_empty() {
             live.stop();
-            println!("{}", term::dim(&format!("{written} picture(s) in {}", dir.display())));
+            if !differing.is_empty() {
+                return Err(Error::new(format!("{} preview(s) differ from their goldens in {}:\n{}", differing.len(), dir.display(), differing.join("\n")))
+                    .hint("bunny preview --snapshot DIR --update makes these pictures the goldens"));
+            }
+            if written > 0 {
+                println!("{}", term::dim(&format!("{written} picture(s) in {}", dir.display())));
+            }
             return Ok(());
         }
         if !alive {

@@ -20,6 +20,9 @@
 //! - [`scan`]: the reference scanner — which functions of a crate are
 //!   previews, by reading the source for the attribute, with the fixtures
 //!   under `tests/scan/` as the contract every other scanner meets.
+//! - [`snapshot`]: a picture against its golden, pixel by pixel, the
+//!   difference as a count and a box — what `bunny preview --snapshot`
+//!   prints and a test asserts on; std only, like the wire.
 //! - With the `core` feature, [`convert`]: the framework's `DisplayList`
 //!   to draws and back (resources collected by key), its `Traits` to the
 //!   wire's and back, a `Patch` to a `Modifier`.
@@ -43,6 +46,7 @@
 #![forbid(unsafe_code)]
 
 pub mod scan;
+pub mod snapshot;
 pub mod wire;
 
 #[cfg(feature = "core")]

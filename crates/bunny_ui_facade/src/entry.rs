@@ -331,9 +331,14 @@ pub mod __private {
     fn preview_host(_preview: PreviewConfig) {}
 
     /// The engines the preview host renders with: the platform's where
-    /// the shell has them, the house ones elsewhere.
+    /// the shell has them, the house ones elsewhere — and the house ones
+    /// anywhere under `BUNNY_PREVIEW_ENGINE=house`, the deterministic
+    /// pair a snapshot golden is made with on every OS.
     #[cfg(all(feature = "preview", feature = "shell", target_os = "macos"))]
     fn engines() -> bunny_ui_preview::host::Engines {
+        if std::env::var_os("BUNNY_PREVIEW_ENGINE").is_some_and(|engine| engine == "house") {
+            return bunny_ui_preview::host::Engines::house();
+        }
         bunny_ui_preview::host::Engines {
             text: std::rc::Rc::new(crate::platform::CoreTextEngine::new()),
             images: std::rc::Rc::new(crate::platform::CoreGraphicsImageEngine::new()),
