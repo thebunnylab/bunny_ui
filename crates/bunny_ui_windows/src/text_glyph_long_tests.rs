@@ -44,10 +44,6 @@ fn paragraph_long_spans_match_independent_complete_native_glyphs() {
     let engine = DirectWriteEngine::new();
     let factories = engine.factories.as_ref().unwrap();
     let shaper = Shaper::new(factories).unwrap();
-    let font = FontSpec {
-        size: 19.0,
-        ..FontSpec::DEFAULT
-    };
     let mut failures = Vec::new();
     for (name, text) in [
         ("plain", "a".repeat(70_000)),
@@ -56,6 +52,15 @@ fn paragraph_long_spans_match_independent_complete_native_glyphs() {
         ("arabic-connected", "ب".repeat(70_000)),
         ("combining-clusters", "a\u{301}".repeat(40_000)),
     ] {
+        let font = FontSpec {
+            size: 19.0,
+            family: if name == "latin-ligatures" {
+                bunny_ui::text_engine::Family::named("Calibri")
+            } else {
+                bunny_ui::text_engine::Family::default()
+            },
+            ..FontSpec::DEFAULT
+        };
         let prepared = Prepared::new(factories, &text).unwrap();
         let layout = tests::reference_layout(&engine, &text, &font);
         let native = raster::reference_records(&layout);
@@ -67,6 +72,18 @@ fn paragraph_long_spans_match_independent_complete_native_glyphs() {
                 .map(|run| (run.source.clone(), run.glyphs.len()))
                 .collect::<Vec<_>>()
         );
+        if name == "arabic-connected" {
+            for run in &native {
+                eprintln!(
+                    "native joining {:?}: first {:?}, last {:?}",
+                    run.source,
+                    &run.glyphs[..3],
+                    &run.glyphs[run.glyphs.len() - 3..]
+                );
+            }
+            let sample = tests::shape(&engine, &"ب".repeat(32), &font);
+            eprintln!("native joining short complete word: {:?}", sample[0].glyphs);
+        }
         let mut expected: Vec<_> = native.iter().flat_map(clusters).collect();
         expected.sort_by_key(|cluster| cluster.source.start);
         assert_eq!(expected.first().unwrap().source.start, 0, "{name}");
@@ -107,7 +124,7 @@ fn paragraph_long_spans_match_independent_complete_native_glyphs() {
                 actual.sort_by_key(|cluster| cluster.source.start);
                 let difference = actual.iter().zip(&expected).position(|(a, b)| a != b);
                 if actual.len() != expected.len() || difference.is_some() {
-                    let first = difference.unwrap_or(actual.len().min(expected.len()));
+                    let first = difference.unwrap_or_else(|| actual.len().min(expected.len()));
                     failures.push(format!(
                         "{name}: {} vs {} clusters, first difference {first}: {:?} vs {:?}",
                         actual.len(),
@@ -152,9 +169,15 @@ fn paragraph_long_native_capacity_and_safe_boundary_witness() {
             let prepared = Prepared::new(factories, &text).unwrap();
             assert!(prepared.scripts.iter().all(|&script| script == prepared.scripts[0]), "{name}: homogeneous script required");
             let text = prepared.utf16();
-            for length in [4096, text.len()] {
+            for (length, capacity) in [
+                (4096, 8208),
+                (4096, 65_535),
+                (4096, 65_536),
+                (text.len(), 65_535),
+                (text.len(), 65_536),
+                (text.len(), text.len() * 2 + 16),
+            ] {
                 let text = &text[..length];
-                let capacity = text.len() * 2 + 16;
                 let mut output = Output::new(text.len()).unwrap();
                 output.glyphs = vec![0;capacity];
                 output.glyph_properties = vec![0;capacity];
@@ -175,9 +198,9 @@ fn paragraph_long_native_capacity_and_safe_boundary_witness() {
                     assert!(count as usize <= capacity);
                     let safe: Vec<_> = output.text_properties.iter().enumerate().filter_map(|(i,&flags)| (flags & 4 != 0).then_some(i+1)).collect();
                     let reversals = output.clusters.windows(2).filter(|pair| pair[0] > pair[1]).count();
-                    eprintln!("native capacity {name}: units {}, glyphs {count}, max cluster {:?}, map decreases {reversals}, safe count {}, first {:?}, last {:?}",text.len(),output.clusters.iter().max(),safe.len(),&safe[..safe.len().min(8)],&safe[safe.len().saturating_sub(8)..]);
+                    eprintln!("native capacity {name}: units {}, capacity {capacity}, glyphs {count}, max cluster {:?}, map decreases {reversals}, safe count {}, first {:?}, last {:?}",text.len(),output.clusters.iter().max(),safe.len(),&safe[..safe.len().min(8)],&safe[safe.len().saturating_sub(8)..]);
                 } else {
-                    eprintln!("native capacity {name}: units {}, status {status:#x}; no failure output consumed",text.len());
+                    eprintln!("native capacity {name}: units {}, capacity {capacity}, status {status:#x}; no failure output consumed",text.len());
                 }
             }
         }
