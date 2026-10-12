@@ -8,6 +8,7 @@
 
 use bunny_ui::__private::hot::preview::{PreviewError, SYMBOL_PREFIX, preview_entry, symbol};
 use bunny_ui::prelude::*;
+use bunny_ui::preview::Device;
 
 /// The plainest preview: a bare view, under the default traits.
 #[bunny_ui::preview]
