@@ -774,6 +774,9 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
             use webview::WebviewEvent;
             let woke = match event {
                 WebviewEvent::Navigated { path, url } => runtime.webview_navigated(&path, &url),
+                // the finish is the Mac desk's beat (`bunny_ui_macos::pictures`):
+                // the app hears the commit, and the page's own events after it
+                WebviewEvent::Loaded { .. } => false,
                 WebviewEvent::Linked { path, url } => runtime.webview_linked(&path, &url),
                 WebviewEvent::Changed { path, html } => runtime.webview_changed(&path, &html),
                 WebviewEvent::Pasted { path, html, text } => {
