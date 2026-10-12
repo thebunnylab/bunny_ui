@@ -246,7 +246,7 @@ impl Modifier {
     /// a site carries (`crate::provenance`). A tuple variant's arguments
     /// are not the name; `FrameWH` is `.frame(…)` and `PaddingLength` is
     /// `.padding(…)` to the reader.
-    pub(crate) fn name(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
             Modifier::Font { .. } => "font",
             Modifier::Bold => "bold",
