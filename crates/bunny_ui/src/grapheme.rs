@@ -169,7 +169,9 @@ pub(crate) fn ceil(text: &str, index: usize) -> usize {
 /// All extended grapheme boundaries in one forward pass. Geometry needs the
 /// complete line; repeated backward RI/Indic scans would make that quadratic.
 pub fn boundaries(text: &str) -> Vec<usize> {
-    use Gcb::{Control, Cr, Extend, L, Lf, Lv, Lvt, Prepend, RegionalIndicator, SpacingMark, T, V, Zwj};
+    use Gcb::{
+        Control, Cr, Extend, L, Lf, Lv, Lvt, Prepend, RegionalIndicator, SpacingMark, T, V, Zwj,
+    };
     let mut result = vec![0];
     let mut left = None;
     let mut regional_run = 0usize;
