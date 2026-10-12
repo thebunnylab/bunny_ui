@@ -7061,10 +7061,12 @@ impl LayoutNode {
                     if let Some((from, to)) = selection {
                         let head = from.clamp(start, end);
                         let tail = to.clamp(start, end);
-                        // a break INSIDE the selection reads as a sliver
+                        // A source newline INSIDE the selection reads as a sliver
                         // at the end of its line — without it a selected
                         // empty line would show nothing at all
-                        let over = to > end && from <= end;
+                        let over = to > end
+                            && from <= end
+                            && sample.as_bytes().get(end) == Some(&b'\n');
                         if head < tail || over {
                             let mut bands = spans(head, tail)?;
                             if over {

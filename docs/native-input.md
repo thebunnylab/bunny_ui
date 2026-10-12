@@ -99,6 +99,9 @@ The same cached line supplies all caret shapes, selection and composition bands,
 UTF-16 rectangles, pointer hits, vertical columns and horizontal reveal. Block
 carets and colored highlights recolor the full original line through disjoint
 clips, preserving shaping context and avoiding duplicate alpha blending.
+A selected source newline adds a small paragraph-separator marker, including on
+empty rows. Soft wrapping adds no source character or extra selection advance.
+A masked newline is a displayed bullet and follows the same geometry as other bullets.
 A logical selection may produce several disjoint rectangles. Pointer stops use
 extended grapheme boundaries, while explicit native scalar ranges remain valid.
 Masked fields query the displayed bullets and map back to the original UTF-16.

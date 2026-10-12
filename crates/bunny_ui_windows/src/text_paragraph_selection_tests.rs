@@ -292,3 +292,6 @@ fn paragraph_partial_cluster_selection_keeps_the_native_cell_visible() {
 
 #[path = "text_paragraph_composition_tests.rs"]
 mod composition;
+
+#[path = "text_paragraph_field_tests.rs"]
+mod fields;

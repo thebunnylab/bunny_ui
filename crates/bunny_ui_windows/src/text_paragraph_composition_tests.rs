@@ -7,7 +7,7 @@ use bunny_ui::layout::DrawCommand;
 use bunny_ui::prelude::{Color, EditCommand, Proposal, Runtime, Size, State, ViewExt, text_editor};
 use std::rc::Rc;
 
-fn native_x(layout: &Com<IDWriteTextLayout>, unit: usize) -> f64 {
+pub(super) fn native_x(layout: &Com<IDWriteTextLayout>, unit: usize) -> f64 {
     let mut x = 0.0;
     let mut y = 0.0;
     let mut metrics = geometry::HitMetrics::default();
@@ -25,7 +25,7 @@ fn native_x(layout: &Com<IDWriteTextLayout>, unit: usize) -> f64 {
     f64::from(x)
 }
 
-fn close(actual: f64, expected: f64) {
+pub(super) fn close(actual: f64, expected: f64) {
     assert!((actual - expected).abs() < 0.03, "{actual} vs {expected}");
 }
 
