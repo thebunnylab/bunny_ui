@@ -49,6 +49,35 @@ pub struct Build {
     pub rustc_args: Vec<String>,
     /// Without cargo's progress lines: only what the compiler says.
     pub quiet: bool,
+    /// Where the compiler's diagnostics go: the terminal, or the result.
+    pub diagnostics: Diagnostics,
+}
+
+/// What becomes of the compiler's diagnostics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Diagnostics {
+    /// Rendered by cargo on the terminal, as `bunny run` shows them.
+    #[default]
+    Render,
+    /// Collected into [`Built::diagnostics`], and nothing on the terminal
+    /// — the lane an IDE drives reads them as data.
+    Collect,
+}
+
+/// One thing the compiler said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    /// `error`, `warning`, `note`, `help`.
+    pub level: String,
+    pub message: String,
+    /// The lint or error code, when it has one.
+    pub code: Option<String>,
+    /// The primary span's file, relative to where cargo ran.
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
+    /// The text as the compiler would have shown it.
+    pub rendered: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -73,6 +102,8 @@ pub struct Built {
     /// a dependency that changed. The rest were fresh from an earlier
     /// build.
     pub rebuilt: Vec<String>,
+    /// What the compiler said, under [`Diagnostics::Collect`].
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 /// Runs the build. Cargo's progress and diagnostics go straight to the
@@ -105,11 +136,18 @@ pub fn build(spec: &Build) -> Result<Built> {
     if !spec.features.is_empty() {
         command.arg("--features").arg(spec.features.join(","));
     }
-    command.arg("--message-format=json-render-diagnostics");
+    match spec.diagnostics {
+        Diagnostics::Render => {
+            command.arg("--message-format=json-render-diagnostics");
+        }
+        Diagnostics::Collect => {
+            command.arg("--message-format=json");
+        }
+    }
     if spec.quiet {
         command.arg("--quiet");
     }
-    if std::io::stderr().is_terminal() {
+    if std::io::stderr().is_terminal() && spec.diagnostics == Diagnostics::Render {
         command.arg("--color=always");
     }
     if !spec.rustc_args.is_empty() {
@@ -118,14 +156,24 @@ pub fn build(spec: &Build) -> Result<Built> {
     for (key, value) in &spec.env {
         command.env(key, value);
     }
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+    // collected diagnostics leave the terminal alone: cargo's own
+    // progress goes nowhere, and what the compiler says is data
+    let stderr = if spec.diagnostics == Diagnostics::Collect { Stdio::null() } else { Stdio::inherit() };
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(stderr);
     let mut child = command.spawn().map_err(|error| Error::new(format!("cargo: {error}")))?;
     let mut artifact = None;
     let mut packages = Vec::new();
     let mut rebuilt = Vec::new();
+    let mut diagnostics = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         for line in BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
             let Ok(message) = json::parse(&line) else { continue };
+            if message.str_at(&["reason"]) == Some("compiler-message") {
+                if let Some(diagnostic) = diagnostic(&message) {
+                    diagnostics.push(diagnostic);
+                }
+                continue;
+            }
             if message.str_at(&["reason"]) != Some("compiler-artifact") {
                 continue;
             }
@@ -163,9 +211,27 @@ pub fn build(spec: &Build) -> Result<Built> {
     }
     let status = child.wait().map_err(|error| Error::new(format!("cargo: {error}")))?;
     if !status.success() {
-        // cargo has already said why, on the terminal
-        return Err(Error::new("the build failed"));
+        // cargo has already said why, on the terminal — or in the
+        // diagnostics, which the error carries for whoever collects them
+        return Err(Error::build_failed(diagnostics));
     }
     let artifact = artifact.ok_or_else(|| Error::new("cargo built nothing `bunny` can run"))?;
-    Ok(Built { artifact, packages, rebuilt })
+    Ok(Built { artifact, packages, rebuilt, diagnostics })
+}
+
+/// A `compiler-message` as data: the level, the message, the primary
+/// span and the rendered text.
+fn diagnostic(message: &Value) -> Option<Diagnostic> {
+    let inner = message.get("message")?;
+    let level = inner.str_at(&["level"])?.to_string();
+    let primary = inner.get("spans").map(Value::as_array).unwrap_or_default().iter().find(|span| span.get("is_primary").and_then(Value::as_bool) == Some(true));
+    Some(Diagnostic {
+        level,
+        message: inner.str_at(&["message"]).unwrap_or_default().to_string(),
+        code: inner.str_at(&["code", "code"]).map(String::from),
+        file: primary.and_then(|span| span.str_at(&["file_name"])).map(String::from),
+        line: primary.and_then(|span| span.get("line_start")).and_then(Value::as_u64).map(|line| line as u32),
+        column: primary.and_then(|span| span.get("column_start")).and_then(Value::as_u64).map(|column| column as u32),
+        rendered: inner.str_at(&["rendered"]).unwrap_or_default().to_string(),
+    })
 }

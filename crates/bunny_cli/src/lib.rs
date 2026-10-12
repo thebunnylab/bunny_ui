@@ -22,6 +22,7 @@ pub mod json;
 pub mod keys;
 pub mod net;
 pub mod platform;
+pub mod preview;
 pub mod process;
 pub mod project;
 pub mod serve;
