@@ -5,7 +5,7 @@
 //! Native glyph indices, cluster maps, advances and offsets stay together with
 //! their owning face. The line module applies visual L1/L2 ordering without
 //! changing those shaping buffers, then supplies runtime geometry and raster.
-//! Native u16 cluster indices bound each shaping span; oversized spans currently
+//! Native input/count bounds limit each shaping span; oversized spans currently
 //! return an explicit preparation error rather than an arbitrary split.
 
 use super::{
@@ -27,7 +27,9 @@ mod raster;
 mod line;
 pub(super) use line::VisualLine;
 
-const MAX_GLYPHS: usize = u16::MAX as usize + 1;
+// GetGlyphs rejects a capacity of 65536 even for a short input. This is a
+// native count limit, not the number of representable u16 index values.
+const MAX_GLYPHS: usize = u16::MAX as usize;
 const INSUFFICIENT_BUFFER: Hresult = -2_147_024_774; // HRESULT_FROM_WIN32(122)
 
 pub(super) struct BaseFont {
