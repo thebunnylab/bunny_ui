@@ -36,6 +36,14 @@ pub const COMMANDS: &[Command] = &[
         run: commands::run::run,
     },
     Command {
+        name: "preview",
+        summary: commands::preview::SUMMARY,
+        usage: commands::preview::USAGE,
+        about: commands::preview::ABOUT,
+        options: commands::preview::OPTIONS,
+        run: commands::preview::run,
+    },
+    Command {
         name: "build",
         summary: commands::build::SUMMARY,
         usage: commands::build::USAGE,

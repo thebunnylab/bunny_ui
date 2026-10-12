@@ -156,6 +156,9 @@ impl<'a> Runner<'a> {
         let began = Instant::now();
         if let Some(hot) = self.hot.as_mut() {
             let session = hot.start()?;
+            for note in hot.take_notes() {
+                println!("{}", term::warn(&note));
+            }
             announce(began, self.device);
             return Ok(Some(session));
         }
@@ -406,7 +409,7 @@ fn finish(code: Option<i32>) -> Result<()> {
             println!("{}", term::dim("the app exited"));
             Ok(())
         }
-        Some(code) => Err(Error { message: format!("the app exited with code {code}"), hint: None, code: code.clamp(1, 255) as u8 }),
+        Some(code) => Err(Error { diagnostics: Vec::new(), message: format!("the app exited with code {code}"), hint: None, code: code.clamp(1, 255) as u8 }),
         None => Err(Error::new("the app was ended by a signal")),
     }
 }
