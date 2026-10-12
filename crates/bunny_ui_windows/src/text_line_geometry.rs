@@ -55,3 +55,7 @@ impl VisualLine {
 #[cfg(test)]
 #[path = "text_line_geometry_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "text_paragraph_selection_tests.rs"]
+mod selection_tests;

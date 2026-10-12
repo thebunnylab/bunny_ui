@@ -198,6 +198,12 @@ jobs:
         run: |
           cargo test -p bunny-ui-windows --locked --lib text::analysis::glyphs::long_tests::continuation:: -- --nocapture
           BUNNY_PARANOID=all cargo test -p bunny-ui-windows --locked --lib text::analysis::glyphs::long_tests::continuation:: -- --nocapture
+      - name: Native paragraph selection, normal and paranoid
+        run: |
+          test_status=0
+          cargo test -p bunny-ui-windows --locked --lib text::analysis::glyphs::line::geometry::selection_tests:: -- --nocapture || test_status=$?
+          BUNNY_PARANOID=all cargo test -p bunny-ui-windows --locked --lib text::analysis::glyphs::line::geometry::selection_tests:: -- --nocapture || test_status=$?
+          exit "$test_status"
       - name: Preserve native text environment
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
