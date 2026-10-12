@@ -191,3 +191,35 @@ fn empty_continuation_is_empty_instead_of_the_rest_of_the_paragraph() {
             .is_none()
     );
 }
+
+#[test]
+fn native_empty_font_is_not_zero_width_success() {
+    let engine = FreeTypeEngine::new();
+    let font = font();
+    let key = FreeTypeEngine::key(&font, 1);
+    let original = engine.face(&key).unwrap();
+    // SAFETY: the singleton is a valid native font, but cannot shape this face.
+    let empty = unsafe { crate::text::hb_font_get_empty() };
+    engine.faces.borrow_mut().insert(
+        key.clone(),
+        Some(crate::text::Face {
+            hb: empty,
+            ..original
+        }),
+    );
+    let line = content("abc").line(0..3).unwrap();
+    assert!(matches!(
+        engine.measure_paragraph_line(&line, &font),
+        Err(TextError::Preparation { .. })
+    ));
+    assert!(matches!(
+        engine.paragraph_line_geometry(&line, &font),
+        Err(TextError::Preparation { .. })
+    ));
+    assert!(matches!(
+        engine.raster_paragraph_line(&line, &font, Color::BLACK, 1),
+        Err(TextError::Preparation { .. })
+    ));
+    engine.faces.borrow_mut().insert(key, Some(original));
+    assert!(engine.measure_paragraph_line(&line, &font).unwrap().width > 0.0);
+}

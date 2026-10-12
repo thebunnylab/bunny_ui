@@ -9,7 +9,7 @@ use super::{
     Face, FaceKey, FreeTypeEngine, HbGlyphInfo, HbGlyphPos, Shaped, TextError, bidi, c_int, c_uint,
     c_void, hb_buffer_add_utf8, hb_buffer_allocation_successful, hb_buffer_create,
     hb_buffer_destroy, hb_buffer_get_glyph_infos, hb_buffer_get_glyph_positions,
-    hb_buffer_guess_segment_properties, hb_buffer_set_direction, hb_shape_full,
+    hb_buffer_guess_segment_properties, hb_buffer_set_direction, hb_font_get_empty, hb_shape_full,
 };
 use std::ops::Range;
 use std::ptr::NonNull;
@@ -56,6 +56,11 @@ impl Buffer {
     }
 
     fn shape(&self, face: Face) -> Result<(), TextError> {
+        // SAFETY: the API returns the immutable, process-lifetime empty font.
+        // A failed native font allocation must not become zero-width glyphs.
+        if face.hb.is_null() || face.hb == unsafe { hb_font_get_empty() } {
+            return Err(preparation("hb_ft_font_create_referenced"));
+        }
         self.check()?;
         // SAFETY: live sized font and populated buffer; default features and
         // shapers retain no borrowed Rust storage after this synchronous call.

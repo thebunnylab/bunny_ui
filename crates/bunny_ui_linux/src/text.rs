@@ -159,6 +159,7 @@ struct HbGlyphPos {
 #[link(name = "harfbuzz")]
 unsafe extern "C" {
     fn hb_ft_font_create_referenced(face: *mut c_void) -> *mut c_void;
+    fn hb_font_get_empty() -> *mut c_void;
     fn hb_buffer_create() -> *mut c_void;
     fn hb_buffer_add_utf8(
         buffer: *mut c_void,
