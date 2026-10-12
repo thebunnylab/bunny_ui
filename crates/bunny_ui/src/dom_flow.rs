@@ -1126,6 +1126,7 @@ impl Walk<'_> {
             // own — and a number invented here would be worse than no
             // number at all.
             LayoutNode::Accessible { child, .. }
+            | LayoutNode::Sited { child, .. }
             | LayoutNode::Measured { child, .. } => self.lower_into(child, out),
 
             LayoutNode::Boundary { path, children, .. } => {

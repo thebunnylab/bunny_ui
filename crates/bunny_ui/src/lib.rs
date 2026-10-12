@@ -38,6 +38,8 @@
 #![forbid(unsafe_code)]
 
 pub mod accessibility;
+/// Where a node was written — the sites a tool maps frames to (Studio).
+pub mod provenance;
 pub mod action;
 pub mod anim;
 pub mod bind;

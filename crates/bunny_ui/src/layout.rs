@@ -843,6 +843,16 @@ pub enum LayoutNode {
     Measured { path: String, child: Box<LayoutNode> },
     /// Semantic information with no effect on geometry or paint.
     Accessible { semantics: crate::accessibility::Semantics, child: Box<LayoutNode> },
+    /// Where the child was written (`crate::provenance`): transparent to
+    /// measure and place, it records a [`crate::provenance::SitePlacement`]
+    /// with the frame it was placed at. Only made while a runtime records
+    /// sites — a pass nobody watches never holds one.
+    Sited {
+        site: crate::provenance::Site,
+        kind: crate::provenance::NodeKind,
+        modifier: Option<&'static str>,
+        child: Box<LayoutNode>,
+    },
     /// Fills whatever the proposal gives (Rectangle).
     Fill,
     /// `hints` are what an `.element(…)` over the stack says
@@ -2640,6 +2650,7 @@ impl LayoutNode {
                 layer.collect_quiet(held) && child.collect_quiet(held)
             }
             LayoutNode::Accessible { child, .. }
+            | LayoutNode::Sited { child, .. }
             | LayoutNode::Padding { child, .. }
             | LayoutNode::Frame { child, .. }
             | LayoutNode::MaxFrame { child, .. }
@@ -3855,6 +3866,13 @@ pub const SPLIT_GRIP: Px = 6.0;
 
 #[derive(Default, Debug)]
 pub struct Placement {
+    /// The sited nodes placed so far (`crate::provenance`), in placement
+    /// order; empty unless the pass recorded sites.
+    pub(crate) sites: Vec<crate::provenance::SitePlacement>,
+    /// The enclosing sited nodes, by index into `sites`.
+    site_stack: Vec<u32>,
+    /// The enclosing component boundaries, by path — what a site names.
+    boundary_stack: Vec<Rc<str>>,
     pub(crate) focus_order: Vec<FocusStop>,
     pub(crate) focus_floor: usize,
     pub(crate) focus_scope: Option<Rc<str>>,
@@ -4253,6 +4271,9 @@ pub struct Thumb {
 /// the draw list and the interaction targets.
 #[derive(Debug)]
 pub struct LayoutResult {
+    /// Every sited node the pass placed (`crate::provenance`), with its
+    /// frame; empty unless the runtime recorded sites.
+    pub sites: Vec<crate::provenance::SitePlacement>,
     pub(crate) focus_order: Vec<FocusStop>,
     pub(crate) focus_floor: usize,
     pub(crate) focus_scope: Option<Rc<str>>,
@@ -4488,6 +4509,7 @@ pub(crate) fn layout_placing(
     LayoutResult {
         size,
         accessibility: out.accessibility,
+        sites: out.sites,
         focus_order: out.focus_order, focus_floor: out.focus_floor, focus_scope: out.focus_scope,
         frames: out.frames,
         display: out.display,
@@ -4882,6 +4904,7 @@ pub fn layout_dom(
         LayoutResult {
             size,
             accessibility: out.accessibility,
+            sites: out.sites,
         focus_order: out.focus_order, focus_floor: out.focus_floor, focus_scope: out.focus_scope,
             frames: out.frames,
             display: out.display,
@@ -5643,6 +5666,7 @@ impl LayoutNode {
             // a probe is not a box: it answers for its child in every
             // direction, or measuring a view would change it
             LayoutNode::Accessible { child, .. }
+            | LayoutNode::Sited { child, .. }
             | LayoutNode::Measured { child, .. } => child.is_flexible(axis, enclosing_main),
             // the app answers for its own box, per axis (the default is
             // yes on both, the same answer a Rectangle gives)
@@ -5720,6 +5744,7 @@ impl LayoutNode {
                 children.first().and_then(|child| child.first_baseline(env))
             }
             LayoutNode::Accessible { child, .. }
+            | LayoutNode::Sited { child, .. }
             | LayoutNode::Measured { child, .. } => child.first_baseline(env),
             LayoutNode::BoundaryRef { slot, .. } => {
                 slot.with_layout(|layout| layout.and_then(|node| node.first_baseline(env)))
@@ -6291,7 +6316,9 @@ impl LayoutNode {
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
-            LayoutNode::Accessible { child, .. } => child.measure(proposal, env),
+            LayoutNode::Accessible { child, .. } | LayoutNode::Sited { child, .. } => {
+                child.measure(proposal, env)
+            }
 
             LayoutNode::Measured { child, .. } => {
                 let (size, fit) = child.measure(proposal, env);
@@ -6373,6 +6400,23 @@ impl LayoutNode {
                     let bounds = out.accessible_bounds(frame);
                     semantics.collect(start, bounds, &out.accessibility_surface, &mut out.accessibility);
                 }
+            }
+            // the record is the whole job: the child is placed at exactly
+            // the frame this node was given, under this site as its parent
+            (LayoutNode::Sited { site, kind, modifier, child }, _) => {
+                let index = u32::try_from(out.sites.len()).unwrap_or(u32::MAX);
+                out.sites.push(crate::provenance::SitePlacement {
+                    index,
+                    parent: out.site_stack.last().copied(),
+                    site: *site,
+                    kind: *kind,
+                    modifier: *modifier,
+                    frame,
+                    path: out.boundary_stack.last().cloned(),
+                });
+                out.site_stack.push(index);
+                child.place(frame, fit, env, out);
+                out.site_stack.pop();
             }
             // visual leaves: the draw list is born here
             (LayoutNode::Text { content, highlights, truncation, .. }, Fit::Leaf) => {
@@ -8140,7 +8184,15 @@ impl LayoutNode {
                 // exactly the frame this node was given
                 out.frames.record_named(path, frame);
                 if let Some((_, fit)) = fits.first() {
+                    // the sites placed under this boundary name it as their path
+                    let recording = crate::provenance::recording();
+                    if recording {
+                        out.boundary_stack.push(Rc::from(path.as_str()));
+                    }
                     child.place(frame, fit, env, out);
+                    if recording {
+                        out.boundary_stack.pop();
+                    }
                 }
             }
 
@@ -8182,6 +8234,11 @@ impl LayoutNode {
                     }
                     None => env,
                 };
+                // the sites placed under this boundary name it as their path
+                let recording = crate::provenance::recording();
+                if recording {
+                    out.boundary_stack.push(Rc::clone(path));
+                }
                 if children.len() == 1 {
                     children[0].place(frame, &fits[0].1, env, out);
                 } else {
@@ -8196,6 +8253,9 @@ impl LayoutNode {
                         out,
                     );
                 }
+                if recording {
+                    out.boundary_stack.pop();
+                }
                 if let Some(dom) = out.dom.as_mut() {
                     dom.close();
                 }
@@ -8204,12 +8264,20 @@ impl LayoutNode {
             // skipped boundary: places the RETAINED tree in its place
             // (measure's pair — both phases resolve the SAME retention,
             // the Fit mirrors by construction)
-            (LayoutNode::BoundaryRef { slot, .. }, fit) => {
+            (LayoutNode::BoundaryRef { path, slot, .. }, fit) => {
+                // a retained boundary names the sites under it too
+                let recording = crate::provenance::recording();
+                if recording {
+                    out.boundary_stack.push(Rc::clone(path));
+                }
                 slot.with_layout(|layout| {
                     if let Some(node) = layout {
                         node.place(frame, fit, env, out);
                     }
                 });
+                if recording {
+                    out.boundary_stack.pop();
+                }
             }
 
             (_, Fit::Leaf) => {}

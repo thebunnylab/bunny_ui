@@ -67,15 +67,29 @@ pub(crate) fn wrap_layout(children: Vec<LayoutNode>) -> LayoutNode {
 
 /// `Text("…")` — `Rc<str>` for cheap clones (views are values).
 #[derive(Clone)]
-pub struct Text(pub crate::bind::TextSource);
+pub struct Text {
+    /// What the text reads.
+    pub source: crate::bind::TextSource,
+    /// Where `text(…)` was called; an `IntoText` names itself until then.
+    pub(crate) site: crate::provenance::Site,
+}
 
 impl View for Text {
     type Arity = Single;
 
-    fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        self.render_unsited(ctx, out);
+        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Text, None);
+    }
+}
+
+impl Text {
+    /// The node itself, before its site is sealed over it.
+    fn render_unsited(&self, _ctx: &Context, out: &mut NodeList) {
         // a text that reads for itself takes its key here, where the
         // cursor names the node; the print shows what it reads now
-        let content = self.0.place();
+        let content = self.source.place();
         out.push(match (&content, crate::view::print_enabled()) {
             (_, false) => RenderNode::leaf(String::new()),
             // the print of a text that reads for itself reads it too:
@@ -100,13 +114,15 @@ impl View for Text {
     }
 }
 
+
 /// Displays fixed text or a reactive state/binding. Reactive inputs read at
 /// the text node, so changing them does not rerun the component body.
 /// An eager `text(state.get())` instead reads the snapshot in the body.
 #[track_caller]
 pub fn text(value: impl crate::text_value::IntoText) -> Text {
-    let text = value.into_text();
-    crate::diagnostics::text(&text.0);
+    let mut text = value.into_text();
+    crate::diagnostics::text(&text.source);
+    text.site = crate::provenance::here();
     text
 }
 
@@ -118,8 +134,9 @@ pub fn text(value: impl crate::text_value::IntoText) -> Text {
 ///
 /// A closure that reads nothing is a fixed text: it costs the same as
 /// [`text`].
+#[track_caller]
 pub fn text_with<S: Into<Arc<str>>>(read: impl Fn() -> S + 'static) -> Text {
-    Text(crate::bind::TextSource::Lazy(Rc::new(move || read().into())))
+    Text { source: crate::bind::TextSource::Lazy(Rc::new(move || read().into())), site: crate::provenance::here() }
 }
 
 // The button chrome geometry (Role/Size come later; the future
@@ -137,6 +154,7 @@ pub struct Button<L, F> {
     action: F,
     disabled: bool,
     checked: Option<bool>,
+    site: crate::provenance::Site,
 }
 
 impl<L, F> View for Button<L, F>
@@ -147,6 +165,19 @@ where
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        self.render_unsited(ctx, out);
+        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Button, None);
+    }
+}
+
+impl<L, F> Button<L, F>
+where
+    L: View,
+    F: Fn() + Clone + 'static,
+{
+    /// The node itself, before its site is sealed over it.
+    fn render_unsited(&self, ctx: &Context, out: &mut NodeList) {
         let mut label = NodeList::new();
         self.label.render_into(ctx, &mut label);
         let (prints, layouts) = label.into_parts();
@@ -205,6 +236,7 @@ where
     }
 }
 
+
 impl<L, F> Button<L, F>
 where
     F: Fn() + Clone + 'static,
@@ -226,12 +258,13 @@ where
 /// `Button(action:) { label }` — the label first (it is what you read), the
 /// action last (long closures format better at the end, and it is the
 /// convention of the whole API: content before, behavior after).
+#[track_caller]
 pub fn button<L, F>(label: L, action: F) -> Button<L, F>
 where
     L: View,
     F: Fn() + Clone + 'static,
 {
-    Button { label, action, disabled: false, checked: None }
+    Button { label, action, disabled: false, checked: None, site: crate::provenance::here() }
 }
 
 /// A labelled two-state control backed by the application's boolean binding.
@@ -240,6 +273,7 @@ pub struct Checkbox<L> {
     label: L,
     value: Binding<bool>,
     disabled: bool,
+    site: crate::provenance::Site,
 }
 
 impl<L> Checkbox<L> {
@@ -266,13 +300,16 @@ impl<L: View + Clone> View for Checkbox<L> {
             action: move || value.set(!value.wrappedValue()),
             disabled: self.disabled,
             checked: Some(checked),
-        }.render_into(ctx, out);
+            site: self.site,
+        }
+        .render_into(ctx, out);
     }
 }
 
 /// A checkbox toggles with Space and publishes its checked state to native AT.
-pub const fn checkbox<L: View + Clone>(label: L, value: Binding<bool>) -> Checkbox<L> {
-    Checkbox { label, value, disabled: false }
+#[track_caller]
+pub fn checkbox<L: View + Clone>(label: L, value: Binding<bool>) -> Checkbox<L> {
+    Checkbox { label, value, disabled: false, site: crate::provenance::here() }
 }
 
 /// `TextField("Placeholder", text: $binding)` — a field of one line, or
@@ -282,6 +319,7 @@ pub const fn checkbox<L: View + Clone>(label: L, value: Binding<bool>) -> Checkb
 /// skipped view's field stays editable.
 #[derive(Clone)]
 pub struct TextField {
+    site: crate::provenance::Site,
     placeholder: Arc<str>,
     text: Binding<String>,
     multiline: bool,
@@ -442,7 +480,16 @@ impl TextField {
 impl View for TextField {
     type Arity = Single;
 
-    fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        self.render_unsited(ctx, out);
+        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Field, None);
+    }
+}
+
+impl TextField {
+    /// The node itself, before its site is sealed over it.
+    fn render_unsited(&self, _ctx: &Context, out: &mut NodeList) {
         let scope = motor::identity::cursor_scope();
         // the text as one shared allocation, carried from the field's last
         // render: a note of a megabyte is borrowed from the binding and
@@ -632,6 +679,7 @@ impl View for TextField {
         }
     }
 }
+
 
 /// What a seam can be measured in. The unit rides the BINDING's type,
 /// so a seam and its floors can never disagree: `Binding<f64>` is
@@ -888,8 +936,10 @@ where
     }
 }
 
+#[track_caller]
 pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> TextField {
     TextField {
+        site: crate::provenance::here(),
         placeholder: Arc::from(placeholder.into()),
         text,
         multiline: false,
@@ -916,8 +966,10 @@ pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> Text
 /// stroke through to the app's bindings, so a chord like `⌘↵` keeps
 /// meaning what the app says it means. `.on_submit` takes that chord
 /// for the box itself, and only where the app asked for it.
+#[track_caller]
 pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> TextField {
     TextField {
+        site: crate::provenance::here(),
         placeholder: Arc::from(placeholder.into()),
         text,
         multiline: true,
@@ -954,37 +1006,75 @@ pub fn progress_view() -> ProgressView {
 }
 
 /// `Spacer()`
-#[derive(Clone, Copy, Default)]
-pub struct Spacer;
+#[derive(Clone, Copy)]
+pub struct Spacer {
+    site: crate::provenance::Site,
+}
+
+impl Default for Spacer {
+    fn default() -> Self {
+        Self { site: crate::provenance::Site::Named("spacer") }
+    }
+}
 
 impl View for Spacer {
     type Arity = Single;
 
-    fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        self.render_unsited(ctx, out);
+        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Spacer, None);
+    }
+}
+
+impl Spacer {
+    /// The node itself, before its site is sealed over it.
+    fn render_unsited(&self, _ctx: &Context, out: &mut NodeList) {
         out.push(RenderNode::leaf(crate::view::print_label("Spacer")));
         out.push_layout(LayoutNode::Spacer);
     }
 }
 
+
+#[track_caller]
 pub fn spacer() -> Spacer {
-    Spacer
+    Spacer { site: crate::provenance::here() }
 }
 
 /// `Rectangle()`
-#[derive(Clone, Copy, Default)]
-pub struct Rectangle;
+#[derive(Clone, Copy)]
+pub struct Rectangle {
+    site: crate::provenance::Site,
+}
+
+impl Default for Rectangle {
+    fn default() -> Self {
+        Self { site: crate::provenance::Site::Named("rectangle") }
+    }
+}
 
 impl View for Rectangle {
     type Arity = Single;
 
-    fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        self.render_unsited(ctx, out);
+        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Rectangle, None);
+    }
+}
+
+impl Rectangle {
+    /// The node itself, before its site is sealed over it.
+    fn render_unsited(&self, _ctx: &Context, out: &mut NodeList) {
         out.push(RenderNode::leaf(crate::view::print_label("Rectangle")));
         out.push_layout(LayoutNode::Fill);
     }
 }
 
+
+#[track_caller]
 pub fn rectangle() -> Rectangle {
-    Rectangle
+    Rectangle { site: crate::provenance::here() }
 }
 
 /// `EmptyView` — renders nothing.
@@ -1018,6 +1108,7 @@ impl View for ImageUiImage {
     }
 }
 
+
 pub fn image_ui<T: Debug>(image: T) -> ImageUiImage {
     ImageUiImage(format!("{image:?}"))
 }
@@ -1035,23 +1126,37 @@ pub fn image_ui<T: Debug>(image: T) -> ImageUiImage {
 /// image(&camera).resizable().aspect_ratio(ContentMode::Fill)
 /// ```
 #[derive(Clone)]
-pub struct Image(pub crate::image_engine::ImageSource);
+pub struct Image {
+    /// What the image shows.
+    pub source: crate::image_engine::ImageSource,
+    site: crate::provenance::Site,
+}
 
 impl View for Image {
     type Arity = Single;
 
-    fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
-        out.push(RenderNode::leaf(crate::view::print_line(|| format!("Image ({:?})", self.0))));
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        self.render_unsited(ctx, out);
+        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Image, None);
+    }
+}
+
+impl Image {
+    /// The node itself, before its site is sealed over it.
+    fn render_unsited(&self, _ctx: &Context, out: &mut NodeList) {
+        out.push(RenderNode::leaf(crate::view::print_line(|| format!("Image ({:?})", self.source))));
         out.push_layout(LayoutNode::Image {
-            source: Some(self.0.clone()),
+            source: Some(self.source.clone()),
             resizable: false,
             fit: None,
         });
     }
 }
 
+#[track_caller]
 pub fn image(source: impl Into<crate::image_engine::ImageSource>) -> Image {
-    Image(source.into())
+    Image { source: source.into(), site: crate::provenance::here() }
 }
 
 /// A vector glyph. Sizes with the INHERITED font, the way a character
@@ -1068,6 +1173,7 @@ pub fn image(source: impl Into<crate::image_engine::ImageSource>) -> Image {
 pub struct Icon {
     symbol: crate::icon::Symbol,
     forced: bool,
+    site: crate::provenance::Site,
 }
 
 impl Icon {
@@ -1093,7 +1199,16 @@ impl Icon {
 impl View for Icon {
     type Arity = Single;
 
-    fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        self.render_unsited(ctx, out);
+        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Icon, None);
+    }
+}
+
+impl Icon {
+    /// The node itself, before its site is sealed over it.
+    fn render_unsited(&self, _ctx: &Context, out: &mut NodeList) {
         out.push(RenderNode::leaf(crate::view::print_line(|| format!("Icon ({})", self.symbol.name))));
         out.push_layout(LayoutNode::Icon {
             symbol: self.symbol,
@@ -1102,6 +1217,7 @@ impl View for Icon {
         });
     }
 }
+
 
 use crate::ext::ViewExt as _;
 
@@ -1441,6 +1557,7 @@ pub struct ScrollView<C> {
     hug: bool,
     fill: bool,
     offset: Option<Binding<crate::layout::Point>>,
+    site: crate::provenance::Site,
 }
 
 impl<C> ScrollView<C> {
@@ -1529,6 +1646,15 @@ impl<C: View> View for ScrollView<C> {
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        self.render_unsited(ctx, out);
+        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Scroll, None);
+    }
+}
+
+impl<C: View> ScrollView<C> {
+    /// The node itself, before its site is sealed over it.
+    fn render_unsited(&self, ctx: &Context, out: &mut NodeList) {
         let mut inner = NodeList::new();
         self.content.render_into(ctx, &mut inner);
         let (prints, layouts) = inner.into_parts();
@@ -1572,6 +1698,8 @@ impl<C: View> View for ScrollView<C> {
     }
 }
 
+
+#[track_caller]
 pub fn scroll<C: View>(content: C) -> ScrollView<C> {
     ScrollView {
         content,
@@ -1579,6 +1707,7 @@ pub fn scroll<C: View>(content: C) -> ScrollView<C> {
         hug: false,
         fill: false,
         offset: None,
+        site: crate::provenance::here(),
     }
 }
 
@@ -1630,8 +1759,9 @@ pub fn menu_divider() -> MenuItem {
     MenuItem::Divider
 }
 
+#[track_caller]
 pub fn icon(symbol: crate::icon::Symbol) -> Icon {
-    Icon { symbol, forced: false }
+    Icon { symbol, forced: false, site: crate::provenance::here() }
 }
 
 // MARK: - Containers
@@ -1756,12 +1886,22 @@ pub struct VStack<C> {
     alignment: HorizontalAlignment,
     spacing: Option<f64>,
     children: C,
+    site: crate::provenance::Site,
 }
 
 impl<C: View> View for VStack<C> {
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        self.render_unsited(ctx, out);
+        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::VStack, None);
+    }
+}
+
+impl<C: View> VStack<C> {
+    /// The node itself, before its site is sealed over it.
+    fn render_unsited(&self, ctx: &Context, out: &mut NodeList) {
         render_stack(
             &self.children,
             ctx,
@@ -1774,6 +1914,7 @@ impl<C: View> View for VStack<C> {
         );
     }
 }
+
 
 impl<C> VStack<C> {
     /// `VStack(alignment: .leading)`
@@ -1790,11 +1931,13 @@ impl<C> VStack<C> {
 }
 
 /// `VStack { … }`
+#[track_caller]
 pub fn vstack<C: View>(children: C) -> VStack<C> {
     VStack {
         alignment: HorizontalAlignment::Center,
         spacing: None,
         children,
+        site: crate::provenance::here(),
     }
 }
 
@@ -1806,12 +1949,22 @@ pub struct HStack<C> {
     /// `Some(line_spacing)` when the row wraps.
     wrap: Option<Option<f64>>,
     children: C,
+    site: crate::provenance::Site,
 }
 
 impl<C: View> View for HStack<C> {
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        self.render_unsited(ctx, out);
+        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::HStack, None);
+    }
+}
+
+impl<C: View> HStack<C> {
+    /// The node itself, before its site is sealed over it.
+    fn render_unsited(&self, ctx: &Context, out: &mut NodeList) {
         let Some(line_spacing) = self.wrap else {
             return render_stack(
                 &self.children,
@@ -1844,6 +1997,7 @@ impl<C: View> View for HStack<C> {
         });
     }
 }
+
 
 impl<C> HStack<C> {
     /// `HStack(alignment: .top)`
@@ -1882,12 +2036,14 @@ impl<C> HStack<C> {
 }
 
 /// `HStack { … }`
+#[track_caller]
 pub fn hstack<C: View>(children: C) -> HStack<C> {
     HStack {
         alignment: VerticalAlignment::Center,
         spacing: None,
         wrap: None,
         children,
+        site: crate::provenance::here(),
     }
 }
 
@@ -1897,12 +2053,22 @@ pub fn hstack<C: View>(children: C) -> HStack<C> {
 pub struct ZStack<C> {
     alignment: Alignment,
     children: C,
+    site: crate::provenance::Site,
 }
 
 impl<C: View> View for ZStack<C> {
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        self.render_unsited(ctx, out);
+        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::ZStack, None);
+    }
+}
+
+impl<C: View> ZStack<C> {
+    /// The node itself, before its site is sealed over it.
+    fn render_unsited(&self, ctx: &Context, out: &mut NodeList) {
         let alignment = self.alignment.to_string();
         render_stack(
             &self.children,
@@ -1917,6 +2083,7 @@ impl<C: View> View for ZStack<C> {
     }
 }
 
+
 impl<C> ZStack<C> {
     /// `ZStack(alignment: .leading)` — the children hug that horizontal
     /// edge and stay centered vertically.
@@ -1927,10 +2094,12 @@ impl<C> ZStack<C> {
 }
 
 /// `ZStack { … }`
+#[track_caller]
 pub fn zstack<C: View>(children: C) -> ZStack<C> {
     ZStack {
         alignment: Alignment::Center,
         children,
+        site: crate::provenance::here(),
     }
 }
 
@@ -1965,12 +2134,22 @@ impl Stack {
 #[derive(Clone)]
 pub struct TupleView<C> {
     children: C,
+    site: crate::provenance::Site,
 }
 
 impl<C: View> View for TupleView<C> {
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        self.render_unsited(ctx, out);
+        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Tuple, None);
+    }
+}
+
+impl<C: View> TupleView<C> {
+    /// The node itself, before its site is sealed over it.
+    fn render_unsited(&self, ctx: &Context, out: &mut NodeList) {
         let mut children = NodeList::new();
         self.children.render_into(ctx, &mut children);
         let (prints, layouts) = children.into_parts();
@@ -1979,8 +2158,10 @@ impl<C: View> View for TupleView<C> {
     }
 }
 
+
+#[track_caller]
 pub fn tuple<C: View>(children: C) -> TupleView<C> {
-    TupleView { children }
+    TupleView { children, site: crate::provenance::here() }
 }
 
 /// `List(collection, id: \.keyPath) { item in … }`
@@ -1989,6 +2170,7 @@ pub struct List<T, I, F> {
     items: Vec<T>,
     id: I,
     row: F,
+    site: crate::provenance::Site,
 }
 
 impl<T, I, F, R> View for List<T, I, F>
@@ -2001,6 +2183,21 @@ where
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        self.render_unsited(ctx, out);
+        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::List, None);
+    }
+}
+
+impl<T, I, F, R> List<T, I, F>
+where
+    T: Clone + 'static,
+    I: Fn(&T) -> String + Clone + 'static,
+    F: Fn(&T) -> R + Clone + 'static,
+    R: View,
+{
+    /// The node itself, before its site is sealed over it.
+    fn render_unsited(&self, ctx: &Context, out: &mut NodeList) {
         debug_assert_unique_ids("list", self.items.iter().map(&self.id));
         let scope = motor::identity::cursor_scope();
         let mut row_layouts = Vec::new();
@@ -2081,6 +2278,8 @@ where
     }
 }
 
+
+#[track_caller]
 pub fn list<T, I, F, R>(items: Vec<T>, id: I, row: F) -> List<T, I, F>
 where
     T: Clone + 'static,
@@ -2088,7 +2287,7 @@ where
     F: Fn(&T) -> R + Clone + 'static,
     R: View,
 {
-    List { items, id, row }
+    List { items, id, row, site: crate::provenance::here() }
 }
 
 /// Rows materialized on the first frame, before any geometry is known —
@@ -2118,6 +2317,7 @@ pub struct VirtualList<I, F> {
     count: usize,
     id: I,
     row: F,
+    site: crate::provenance::Site,
     reveal: Option<usize>,
     heights: Option<std::rc::Rc<dyn Fn(usize) -> f64>>,
     declared_extent: Option<f64>,
@@ -2227,6 +2427,20 @@ where
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        self.render_unsited(ctx, out);
+        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::VirtualList, None);
+    }
+}
+
+impl<I, F, R> VirtualList<I, F>
+where
+    I: Fn(usize) -> String + Clone + 'static,
+    F: Fn(usize) -> R + Clone + 'static,
+    R: View,
+{
+    /// The node itself, before its site is sealed over it.
+    fn render_unsited(&self, ctx: &Context, out: &mut NodeList) {
         let scope = motor::identity::cursor_scope();
         // the window comes from LAST frame's retained geometry (offset,
         // viewport, measured row height) — one frame of lag masked by
@@ -2465,8 +2679,10 @@ where
     }
 }
 
+
 /// The virtualized sibling of [`list`]: `virtual_list(count, id, row)`
 /// with closures by INDEX. See [`VirtualList`] for the lazy contract.
+#[track_caller]
 pub fn virtual_list<I, F, R>(count: usize, id: I, row: F) -> VirtualList<I, F>
 where
     I: Fn(usize) -> String + Clone + 'static,
@@ -2477,6 +2693,7 @@ where
         count,
         id,
         row,
+        site: crate::provenance::here(),
         reveal: None,
         heights: None,
         declared_extent: None,
@@ -2995,12 +3212,22 @@ pub struct Section<H, C> {
     header: Option<H>,
     children: C,
     kind: &'static str,
+    site: crate::provenance::Site,
 }
 
 impl<H: View, C: View> View for Section<H, C> {
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        self.render_unsited(ctx, out);
+        crate::provenance::seal(out, mark, self.site, crate::provenance::NodeKind::Section, None);
+    }
+}
+
+impl<H: View, C: View> Section<H, C> {
+    /// The node itself, before its site is sealed over it.
+    fn render_unsited(&self, ctx: &Context, out: &mut NodeList) {
         let mut children = NodeList::new();
         if let Some(header) = &self.header {
             let mut header_nodes = NodeList::new();
@@ -3037,30 +3264,37 @@ impl<H: View, C: View> View for Section<H, C> {
     }
 }
 
+
 /// `Section(header: …) { … }`
+#[track_caller]
 pub fn section<H: View, C: View>(header: H, children: C) -> Section<H, C> {
     Section {
         header: Some(header),
         children,
         kind: "Section",
+        site: crate::provenance::here(),
     }
 }
 
 /// `Section { … }` — no header.
+#[track_caller]
 pub fn section_plain<C: View>(children: C) -> Section<EmptyView, C> {
     Section {
         header: None,
         children,
         kind: "Section",
+        site: crate::provenance::here(),
     }
 }
 
 /// `List { Section { … } }` — the List built from sections, no collection.
+#[track_caller]
 pub fn list_content<C: View>(children: C) -> Section<EmptyView, C> {
     Section {
         header: None,
         children,
         kind: "List",
+        site: crate::provenance::here(),
     }
 }
 
