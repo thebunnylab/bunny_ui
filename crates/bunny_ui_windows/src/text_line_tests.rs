@@ -156,7 +156,7 @@ fn paragraph_line_boundaries_refuse_split_surrogates_and_keep_original_levels() 
     let prepared =
         Prepared::new(engine.factories.as_ref().unwrap(), "\u{202e}a😀 b \u{202c}").unwrap();
     let raw = prepared.levels.clone();
-    for range in [0..3, 3..4, 2..3, 0..99, 5..4] {
+    for range in [0..3, 3..4, 2..3, 0..99, Range { start: 5, end: 4 }] {
         assert!(prepared.line_levels(range).is_err());
     }
     let whole = prepared.line_levels(0..prepared.utf16().len()).unwrap();
@@ -197,6 +197,10 @@ fn paragraph_line_visual_clusters_match_native_positions_without_reshaping_joine
                         let Some(position) = cluster.source.clone().find(|&index| prepared.classes[index] == bidi::Class::Other) else { continue; };
                         let metrics = hit(&layout, position);
                         if metrics.width == 0.0 { continue; }
+                        if (cluster.left - f64::from(metrics.left)).abs() >= 0.03 {
+                            eprintln!("line levels {:?}; clusters {:?}", prepared.line_levels(range.clone()), line.clusters);
+                            for run in &line.runs { eprintln!("source {:?} level {} glyphs {:?} advances {:?}", run.source, run.level, run.glyphs, run.advances); }
+                        }
                         assert!((cluster.left - f64::from(metrics.left)).abs() < 0.03,
                             "{text:?}, width {width}, line {range:?}, cluster {:?}: left {} vs {} (glyph map {:?})",
                             cluster.source, cluster.left, metrics.left, line.runs[cluster.run].clusters);
@@ -210,9 +214,47 @@ fn paragraph_line_visual_clusters_match_native_positions_without_reshaping_joine
     }
 }
 
+fn reference_pixels(surface: &glyphs::raster::Surface, layout: &Com<IDWriteTextLayout>) -> Vec<u8> {
+    use crate::text::{D2D1_DRAW_TEXT_COLOR_FONT, D2dColor, D2dPoint};
+    let ink = D2dColor {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 1.0,
+    };
+    surface
+        .paint(|target| {
+            let mut pointer = std::ptr::null_mut();
+            // SAFETY: live surface and exact brush ABI with initialized output.
+            unsafe {
+                assert!(com_ok(((*(*target.as_ptr()).vtbl)
+                    .create_solid_color_brush)(
+                    target.as_ptr(),
+                    &raw const ink,
+                    std::ptr::null(),
+                    &raw mut pointer
+                )));
+            }
+            let brush = Com::from_raw(pointer).unwrap();
+            // SAFETY: reference TextLayout owns the complete original text
+            // and independently performs native analysis/wrapping/shaping.
+            unsafe {
+                ((*(*target.as_ptr()).vtbl).draw_text_layout)(
+                    target.as_ptr(),
+                    D2dPoint { x: 8.0, y: 8.0 },
+                    layout.as_ptr(),
+                    brush.as_ptr(),
+                    D2D1_DRAW_TEXT_COLOR_FONT,
+                );
+            }
+            Ok(())
+        })
+        .unwrap()
+}
+
 #[test]
 fn paragraph_line_visual_spans_match_independent_wrapped_native_pixels() {
-    use crate::text::{Color, D2D1_DRAW_TEXT_COLOR_FONT, D2dColor, D2dPoint};
+    use crate::text::{Color, D2dPoint};
     use glyphs::raster::{Renderer, Surface};
     let engine = DirectWriteEngine::new();
     let factories = engine.factories.as_ref().unwrap();
@@ -234,40 +276,7 @@ fn paragraph_line_visual_spans_match_independent_wrapped_native_pixels() {
             let (layout, ranges) = wrapped_layout(&engine, text, width);
             for scale in [1.0_f32, 2.0] {
                 let surface = Surface::new(factories, 640, 640, scale).unwrap();
-                let ink = D2dColor {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 1.0,
-                };
-                let expected = surface
-                    .paint(|target| {
-                        let mut pointer = std::ptr::null_mut();
-                        // SAFETY: live surface and exact brush ABI with initialized output.
-                        unsafe {
-                            assert!(com_ok(((*(*target.as_ptr()).vtbl)
-                                .create_solid_color_brush)(
-                                target.as_ptr(),
-                                &raw const ink,
-                                std::ptr::null(),
-                                &raw mut pointer
-                            )));
-                        }
-                        let brush = Com::from_raw(pointer).unwrap();
-                        // SAFETY: reference TextLayout owns the complete original text
-                        // and independently performs native analysis/wrapping/shaping.
-                        unsafe {
-                            ((*(*target.as_ptr()).vtbl).draw_text_layout)(
-                                target.as_ptr(),
-                                D2dPoint { x: 8.0, y: 8.0 },
-                                layout.as_ptr(),
-                                brush.as_ptr(),
-                                D2D1_DRAW_TEXT_COLOR_FONT,
-                            );
-                        }
-                        Ok(())
-                    })
-                    .unwrap();
+                let expected = reference_pixels(&surface, &layout);
                 let actual = engine
                     .with_slot(&font, |slot| {
                         let base = glyphs::BaseFont::new(slot, &font).unwrap();
@@ -309,15 +318,42 @@ fn paragraph_line_visual_spans_match_independent_wrapped_native_pixels() {
                     })
                     .unwrap();
                 let differences = expected
-                    .chunks_exact(4)
-                    .zip(actual.chunks_exact(4))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(actual.as_chunks::<4>().0.iter())
                     .filter(|(a, b)| a != b)
                     .count();
+                if differences != 0 {
+                    pixel_diagnostics(&expected, &actual);
+                    for range in &ranges {
+                        let metric = hit(&layout, range.start);
+                        eprintln!(
+                            "native range {range:?}, top {}, height {}",
+                            metric.top, metric.height
+                        );
+                    }
+                }
                 assert_eq!(
                     differences, 0,
                     "{text:?}, width {width}, scale {scale}: pixel differences"
                 );
             }
         }
+    }
+}
+
+fn pixel_diagnostics(expected: &[u8], actual: &[u8]) {
+    for (label, pixels) in [("native", expected), ("candidate", actual)] {
+        let mut rows = std::collections::BTreeMap::<usize, (usize, usize, usize)>::new();
+        for (index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
+            if pixel[3] > 0 {
+                let row = rows.entry(index / 640).or_insert((640, 0, 0));
+                row.0 = row.0.min(index % 640);
+                row.1 = row.1.max(index % 640);
+                row.2 += 1;
+            }
+        }
+        eprintln!("{label} nonempty rows: {rows:?}");
     }
 }

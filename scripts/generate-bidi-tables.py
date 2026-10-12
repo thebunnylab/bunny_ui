@@ -43,7 +43,9 @@ def main():
         "// Copyright Unicode, Inc.; license: crates/bunny_ui/tests/data/unicode-17.0.0/LICENSE.txt.",
         "use super::Class;", "", "pub(super) const CLASSES: &[(u32, u32, Class)] = &[",
     ]
-    lines.extend(f"    (0x{start:X}, 0x{end:X}, Class::{value})," for start, end, value in entries)
+    def literal(value):
+        return f"0x{value >> 16:04X}_{value & 65535:04X}" if value > 65535 else f"0x{value:X}"
+    lines.extend(f"    ({literal(start)}, {literal(end)}, Class::{value})," for start, end, value in entries)
     lines.extend(["];", ""])
     with tempfile.TemporaryDirectory() as temp:
         rendered = Path(temp) / "text_bidi_data.rs"

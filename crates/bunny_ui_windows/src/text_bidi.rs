@@ -29,7 +29,7 @@ impl Class {
 /// The caller supplies equal-length original classes and copied resolved levels.
 /// `preceding` is the nearest preceding non-retained level in the paragraph.
 /// Empty/trailing reset sequences are valid. Paragraph base direction is LTR,
-/// matching the immutable native source and the engine's TextFormat.
+/// matching the immutable native source and the engine's `TextFormat`.
 pub(super) fn reset_line(classes: &[Class], levels: &mut [u8], preceding: u8) {
     let mut previous = preceding;
     for (&class, level) in classes.iter().zip(levels.iter_mut()) {
