@@ -5182,7 +5182,7 @@ mod tests {
         let pattern = KeyPattern::key(Key::Char('d'));
         assert!(pattern.is_text_input(), "`d` is a bare character");
         assert!(
-            !runtime.key_stroke(&pattern).unwrap().handled,
+            !runtime.key_stroke(pattern).unwrap().handled,
             "the box ignores it, so the keymap gets its turn",
         );
         let action = match runtime.chord(&pattern) {
@@ -8324,7 +8324,7 @@ mod tests {
 
         // and the chord stays the app's there: one door per field
         assert!(
-            !runtime.key_stroke(&KeyPattern::command(Key::Enter)).unwrap()
+            !runtime.key_stroke(KeyPattern::command(Key::Enter)).unwrap()
                 .handled,
             "the chord over a one-line field belongs to the app"
         );
@@ -8343,7 +8343,7 @@ mod tests {
         assert_eq!(panel.committed.get(), 0, "and a break is not a submit");
 
         // ...and puts its own key on the chord, before the keymap
-        assert!(runtime.key_stroke(&KeyPattern::command(Key::Enter)).unwrap().handled);
+        assert!(runtime.key_stroke(KeyPattern::command(Key::Enter)).unwrap().handled);
         assert_eq!(panel.committed.get(), 1);
         assert_eq!(panel.note.get(), "ab\n", "the chord left the note alone");
     }
@@ -14874,7 +14874,7 @@ mod tests {
         // reopen, Escape closes through the stroke gate
         runtime.context_click(30.0, 8.0);
         let handled = runtime
-            .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape))
+            .key_stroke(crate::action::KeyPattern::key(crate::action::Key::Escape))
             .unwrap();
         assert!(handled.handled, "Escape closed the menu");
         assert!(runtime.interaction().menu.is_none());
@@ -15495,7 +15495,7 @@ mod tests {
         runtime.pointer_moved(60.0, 40.0, false).unwrap();
         assert!(runtime.interaction().drag.is_some());
         let handled = runtime
-            .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape))
+            .key_stroke(crate::action::KeyPattern::key(crate::action::Key::Escape))
             .unwrap();
         assert!(handled.handled);
         assert!(runtime.interaction().drag.is_none());
@@ -15950,7 +15950,7 @@ mod tests {
         runtime.pointer_moved(inside.0, inside.1, false).unwrap();
         assert_eq!(view.seen.get().last().map(String::as_str), Some("over"));
         let handled =
-            runtime.key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape))
+            runtime.key_stroke(crate::action::KeyPattern::key(crate::action::Key::Escape))
             .unwrap();
         assert!(handled.handled, "escape cancelled the drag");
         assert_eq!(view.seen.get().last().map(String::as_str), Some("left"),

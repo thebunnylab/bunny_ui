@@ -2331,7 +2331,7 @@ mod tests {
         const NEXT: crate::action::ActionId = crate::action::ActionId("test.next");
         let pattern = crate::action::KeyPattern::key(crate::action::Key::Down);
         runtime.bind(pattern, NEXT);
-        assert!(!runtime.key_stroke(&pattern).unwrap().handled, "the editor ignores Down");
+        assert!(!runtime.key_stroke(pattern).unwrap().handled, "the editor ignores Down");
         assert_eq!(runtime.match_key(&pattern), Some(NEXT), "so the keymap answers");
     }
 

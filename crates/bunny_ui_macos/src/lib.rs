@@ -32,6 +32,12 @@ use ffi::AppEvent;
 pub use bunny_ui_apple::{CoreGraphicsImageEngine, CoreTextEngine};
 pub use metal::OffscreenGpu;
 
+type FramePresenter = dyn Fn(
+    &Runtime,
+    bunny_ui::layout::DisplayList,
+    trace::Origin,
+) -> Result<(), bunny_ui::gpu::walk::RenderError>;
+
 /// AppKit callbacks have no Rust error slot. Record a failed operation and
 /// answer unavailable (or consume an already-started edit); never substitute
 /// isolated text geometry or publish a partially prepared frame.
@@ -1065,13 +1071,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         Rc::new(RefCell::new(std::collections::HashMap::new()));
     // present takes a READY display list to the window — the tick path
     // reuses it without paying settle, effects or the IME tail
-    let present: Rc<
-        dyn Fn(
-            &Runtime,
-            bunny_ui::layout::DisplayList,
-            trace::Origin,
-        ) -> Result<(), bunny_ui::gpu::walk::RenderError>,
-    > = Rc::new({
+    let present: Rc<FramePresenter> = Rc::new({
         let surface = Rc::clone(&surface);
         let panels = Rc::clone(&panels);
         let dialogs = Rc::clone(&dialogs);
@@ -1082,7 +1082,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
               full_display: bunny_ui::layout::DisplayList,
               via: trace::Origin|
               -> Result<(), bunny_ui::gpu::walk::RenderError> {
-            Ok({
+            {
                 let (width, height) = window.content_size();
                 let scale = window.scale();
                 let canvas = bunny_ui::theme::canvas();
@@ -1760,7 +1760,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         format_args!("n={} raster={rastered} px={raster_px}", alive.len()),
                     );
                 }
-            })
+            };
+            Ok(())
         }
     });
     // The semantic presenter follows EVERY pixel path, including a retained
@@ -1772,7 +1773,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         let panels = Rc::clone(&panels);
         let dialogs = Rc::clone(&dialogs);
         move |runtime: &Runtime, display, via| -> Result<(), bunny_ui::gpu::walk::RenderError> {
-            Ok({
+            {
                 if lifecycle.is_hidden() {
                     return Ok(());
                 }
@@ -1790,7 +1791,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     })
                     .collect();
                 accessibility.update(runtime, window, &surfaces);
-            })
+            };
+            Ok(())
         }
     });
     // `BUNNY_FRAME_AUDIT=1`: a wake the engine says needs no frame draws
@@ -1844,7 +1846,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
               root: &_,
               via: trace::Origin|
               -> Result<(), bunny_ui::gpu::walk::RenderError> {
-            Ok({
+            {
                 // Hidden windows retain tasks/state, but must not re-show child surfaces.
                 if lifecycle.is_hidden() {
                     return Ok(());
@@ -2061,7 +2063,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // wake or park the frame driver — the event may have started
                 // (or finished) an animation
                 sync_frame_driver(runtime, &pacer, window_id);
-            })
+            };
+            Ok(())
         }
     };
     // The door for an event that CAN wait for the display's next beat. From
@@ -2080,7 +2083,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
               root: &_,
               via: trace::Origin|
               -> Result<(), bunny_ui::gpu::walk::RenderError> {
-            Ok({
+            {
                 if unpaced && !resizing() {
                     blit(runtime, root, via)?;
                     return Ok(());
@@ -2090,7 +2093,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 } else {
                     sync_frame_driver(runtime, &pacer, window_id);
                 }
-            })
+            };
+            Ok(())
         }
     };
 
@@ -2218,7 +2222,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         move |event| {
             native_event(
                 (|| -> Result<(), bunny_ui::gpu::walk::RenderError> {
-                    Ok({
+                    {
                         let root = &*root;
                         match event {
                             webview::WebviewEvent::Navigated { path, url } => {
@@ -2279,7 +2283,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                                 }
                             }
                         }
-                    })
+                    };
+                    Ok(())
                 })(),
                 (),
             )
@@ -2324,7 +2329,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         native_event(
             (|| -> Result<(), bunny_ui::gpu::walk::RenderError> {
-                Ok({
+                {
                     let runtime = &handler_runtime;
                     let root = &*handler_root;
                     // mid-drag of a DIALOG the resize steps are the only presenter,
@@ -2909,7 +2914,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     // is the frame tick, so the sleeper never woke, and the card it was
                     // waiting for arrived on whatever unrelated click came next.
                     sync_frame_driver(runtime, &handler_pacer, window_id);
-                })
+                };
+                Ok(())
             })(),
             (),
         )
