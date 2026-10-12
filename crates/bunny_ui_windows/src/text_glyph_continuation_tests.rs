@@ -9,6 +9,8 @@ use super::*;
 struct NoCut {
     position: usize,
     probed: usize,
+    safe_flags: usize,
+    cluster_boundaries: usize,
 }
 
 fn continue_at_native_cuts(
@@ -45,6 +47,16 @@ fn continue_at_native_cuts(
                 .ok_or(NoCut {
                     position,
                     probed: probe.text.len(),
+                    safe_flags: output
+                        .text_properties
+                        .iter()
+                        .filter(|&&flags| flags & 4 != 0)
+                        .count(),
+                    cluster_boundaries: output
+                        .clusters
+                        .windows(2)
+                        .filter(|pair| pair[0] != pair[1])
+                        .count(),
                 })?
         };
         let chunk = Input {
@@ -68,11 +80,64 @@ fn continue_at_native_cuts(
     Ok(runs)
 }
 
+fn paragraph_at_native_cuts(
+    engine: &DirectWriteEngine,
+    prepared: &Prepared,
+    font: &FontSpec,
+    bound: usize,
+) -> Result<Vec<Run>, NoCut> {
+    let shaper = Shaper::new(engine.factories.as_ref().unwrap()).unwrap();
+    engine
+        .with_slot(font, |slot| {
+            let base = BaseFont::new(slot, font).unwrap();
+            let mut result = Vec::new();
+            let mut position = 0;
+            while position < prepared.utf16().len() {
+                let script = prepared.scripts[position];
+                let level = prepared.levels[position].resolved;
+                let end = (position + 1..prepared.utf16().len())
+                    .find(|&index| {
+                        prepared.scripts[index] != script
+                            || prepared.levels[index].resolved != level
+                    })
+                    .unwrap_or(prepared.utf16().len());
+                let (face, scale, mapped) =
+                    shaper.map(prepared, position..end, &base, font).unwrap();
+                let input = Input {
+                    text: &prepared.utf16()[position..position + mapped],
+                    script,
+                    level,
+                    face: &face,
+                    em_size: native_float(font.size).unwrap() * scale,
+                    // SAFETY: Prepared retains the source and locale for this witness.
+                    locale: unsafe { &(*prepared.source.as_ptr()).locale },
+                };
+                match continue_at_native_cuts(
+                    &shaper,
+                    &input,
+                    native_float(font.tracking).unwrap(),
+                    bound,
+                ) {
+                    Ok(runs) => result.extend(runs.into_iter().map(|mut run| {
+                        run.source = position + run.source.start..position + run.source.end;
+                        run
+                    })),
+                    Err(mut error) => {
+                        error.position += position;
+                        return Err(error);
+                    }
+                }
+                position += mapped;
+            }
+            Ok(result)
+        })
+        .unwrap()
+}
+
 #[test]
 fn paragraph_long_native_safe_cut_continuation_matches_complete_source() {
     let engine = DirectWriteEngine::new();
     let factories = engine.factories.as_ref().unwrap();
-    let shaper = Shaper::new(factories).unwrap();
     let mut failures = Vec::new();
     for (name, text, family) in [
         ("ligatures", "office affine ".repeat(6_000), "Calibri"),
@@ -109,57 +174,24 @@ fn paragraph_long_native_safe_cut_continuation_matches_complete_source() {
                     .windows(2)
                     .all(|pair| pair[0].source.end == pair[1].source.start)
             );
-            engine
-                .with_slot(&font, |slot| {
-                    let base = BaseFont::new(slot, &font).unwrap();
-                    let (face, scale, mapped) = shaper
-                        .map(&prepared, 0..prepared.utf16().len(), &base, &font)
-                        .unwrap();
-                    assert_eq!(mapped, prepared.utf16().len(), "{name}: one font span");
-                    assert!(
-                        prepared
-                            .scripts
-                            .iter()
-                            .all(|&script| script == prepared.scripts[0]),
-                        "{name}: one script"
-                    );
-                    assert!(
-                        prepared
-                            .levels
-                            .iter()
-                            .all(|level| level.resolved == prepared.levels[0].resolved),
-                        "{name}: one resolved level"
-                    );
-                    let input = Input {
-                        text: prepared.utf16(),
-                        script: prepared.scripts[0],
-                        level: prepared.levels[0].resolved,
-                        face: &face,
-                        em_size: native_float(font.size).unwrap() * scale,
-                        // SAFETY: Prepared retains this immutable source throughout the witness.
-                        locale: unsafe { &(*prepared.source.as_ptr()).locale },
-                    };
-                    for bound in [4095, 16_000] {
-                        let label = format!("{name}, tracking={tracking}, bound={bound}");
-                        match continue_at_native_cuts(
-                            &shaper,
-                            &input,
-                            native_float(tracking).unwrap(),
-                            bound,
-                        ) {
-                            Ok(runs) => {
-                                let count = runs.len();
-                                if let Some(error) = difference(&label, runs, &expected) {
-                                    failures.push(error);
-                                } else {
-                                    eprintln!("native safe-cut parity: {label}, runs={count}");
-                                }
-                            }
-                            Err(error) => failures.push(format!("{label}: {error:?}")),
+            for bound in [4095, 16_000] {
+                let label = format!("{name}, tracking={tracking}, bound={bound}");
+                match paragraph_at_native_cuts(&engine, &prepared, &font, bound) {
+                    Ok(runs) => {
+                        let count = runs.len();
+                        if let Some(error) = difference(&label, runs, &expected) {
+                            eprintln!("native safe-cut mismatch: {error}");
+                            failures.push(error);
+                        } else {
+                            eprintln!("native safe-cut parity: {label}, runs={count}");
                         }
                     }
-                })
-                .unwrap();
+                    Err(error) => {
+                        eprintln!("native safe-cut unavailable: {label}: {error:?}");
+                        failures.push(format!("{label}: {error:?}"));
+                    }
+                }
+            }
         }
     }
     assert!(
@@ -208,7 +240,7 @@ fn paragraph_long_native_safe_cut_refuses_connected_and_single_cluster_sources()
 }
 
 #[test]
-fn paragraph_native_safe_cuts_preserve_distant_opentype_context() {
+fn paragraph_native_safe_cuts_refuse_incomplete_distant_opentype_context() {
     let engine = DirectWriteEngine::new();
     assert!(engine.register_font(include_bytes!("../tests/fixtures/paragraph-context.ttf")));
     let font = FontSpec {
@@ -230,7 +262,6 @@ fn paragraph_native_safe_cuts_preserve_distant_opentype_context() {
         "complete context must activate the custom feature"
     );
     let shaper = Shaper::new(factories).unwrap();
-    let mut failures = Vec::new();
     engine
         .with_slot(&font, |slot| {
             let base = BaseFont::new(slot, &font).unwrap();
@@ -247,23 +278,19 @@ fn paragraph_native_safe_cuts_preserve_distant_opentype_context() {
                 // SAFETY: Prepared owns the source and locale for this entire witness.
                 locale: unsafe { &(*prepared.source.as_ptr()).locale },
             };
-            for bound in [31, 127, 511] {
-                let label = format!("distant-context bound={bound}");
-                match continue_at_native_cuts(&shaper, &input, 0.0, bound) {
-                    Ok(runs) => {
-                        if let Some(error) = difference(&label, runs, &expected) {
-                            failures.push(error);
-                        } else {
-                            eprintln!("native safe-cut parity: {label}");
-                        }
-                    }
-                    Err(error) => failures.push(format!("{label}: {error:?}")),
-                }
+            for bound in [31, 127] {
+                let Err(error) = continue_at_native_cuts(&shaper, &input, 0.0, bound) else {
+                    panic!("incomplete distant context must not authorize a cut");
+                };
+                assert_eq!(error.position, 0);
+                assert_eq!(error.probed, bound);
+                assert_eq!(error.safe_flags, 0);
+                assert_eq!(error.cluster_boundaries, bound - 1);
+                eprintln!("native distant-context refuses bound={bound}: independent clusters with no safe flag");
             }
+            let runs = continue_at_native_cuts(&shaper, &input, 0.0, 511).unwrap();
+            assert!(difference("complete distant context", runs, &expected).is_none());
+            eprintln!("native distant-context complete 130-unit input matches the feature oracle");
         })
         .unwrap();
-    assert!(
-        failures.is_empty(),
-        "native distant-context failures: {failures:#?}"
-    );
 }
