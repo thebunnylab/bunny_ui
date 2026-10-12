@@ -326,13 +326,21 @@ impl Shaper {
             return Err(preparation("GetGlyphPlacements"));
         }
         if tracking != 0.0 {
+            // Match TextLayout's placement of spacing in the glyph buffer:
+            // right-to-left runs need the offset on the opposite edge. Widths
+            // alone cannot detect an incorrectly shifted but equally wide run.
+            let (leading, trailing) = if input.level.is_multiple_of(2) {
+                (0.0, tracking)
+            } else {
+                (tracking, 0.0)
+            };
             // SAFETY: the SDK permits in-place advance/offset adjustment. The
             // native operation preserves diacritic and ligature cluster shape.
             let status = unsafe {
                 (table.spacing)(
                     self.analyzer.as_ptr(),
-                    0.0,
-                    tracking,
+                    leading,
+                    trailing,
                     0.0,
                     length,
                     actual,

@@ -136,6 +136,21 @@ fn assert_pixels(expected: &[u8], actual: &[u8], label: &str) {
             bounds(expected),
             bounds(actual)
         );
+        for (index, (a, b)) in expected
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(actual.as_chunks::<4>().0)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .take(16)
+        {
+            eprintln!(
+                "pixel ({},{}): expected {a:?}, actual {b:?}",
+                index % 640,
+                index / 640
+            );
+        }
     }
     assert_eq!(differences, 0, "{label}: mismatching PBGRA pixels");
 }
@@ -151,11 +166,14 @@ fn paragraph_raster_glyph_pixels_match_independent_native_text_layout() {
             "😀",
             "Hello 😀",
         ] {
-            for slant in [Slant::Upright, Slant::Italic] {
+            for (slant, tracking) in [Slant::Upright, Slant::Italic]
+                .into_iter()
+                .flat_map(|slant| [-0.75, 0.0, 0.75].map(|tracking| (slant, tracking)))
+            {
                 let font = FontSpec {
                     size: 21.0,
                     slant,
-                    tracking: 0.75,
+                    tracking,
                     ..FontSpec::DEFAULT
                 };
                 let color = Color::rgb(173, 29, 83);
@@ -178,7 +196,7 @@ fn paragraph_raster_glyph_pixels_match_independent_native_text_layout() {
                 assert_pixels(
                     &expected,
                     &actual,
-                    &format!("{text:?}, {slant:?}, scale {scale}"),
+                    &format!("{text:?}, {slant:?}, tracking {tracking}, scale {scale}"),
                 );
             }
         }

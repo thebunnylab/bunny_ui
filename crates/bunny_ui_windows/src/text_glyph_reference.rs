@@ -225,7 +225,7 @@ pub(super) fn trace(layout: &Com<IDWriteTextLayout>, scale: f32) {
             unsafe extern "system" fn(*mut Layout, *mut c_void, *mut Renderer, f32, f32) -> Hresult,
     }
     let renderer = Com::from_raw(Box::into_raw(Box::new(Renderer {
-        vtbl: &VTABLE,
+        vtbl: &raw const VTABLE,
         references: AtomicU32::new(1),
         scale,
     })))
