@@ -27,6 +27,12 @@ use bunny_ui::prelude::{EditCommand, Locale, Runtime};
 use bunny_ui::view::View;
 
 use ffi::AppEvent;
+
+type FramePresenter = dyn Fn(
+    &Runtime,
+    bunny_ui::layout::DisplayList,
+) -> Result<(), bunny_ui::gpu::walk::RenderError>;
+
 /// Win32 callbacks have no Rust error slot. Record a failed operation and
 /// answer unavailable (or consume an already-started edit); never substitute
 /// isolated text geometry or publish a partially prepared frame.
@@ -707,12 +713,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         Rc::new(RefCell::new(std::collections::HashMap::new()));
     // present takes a READY display list to the window — the tick path
     // reuses it without paying settle or effects
-    let present: Rc<
-        dyn Fn(
-            &Runtime,
-            bunny_ui::layout::DisplayList,
-        ) -> Result<(), bunny_ui::gpu::walk::RenderError>,
-    > = Rc::new({
+    let present: Rc<FramePresenter> = Rc::new({
         let surface = Rc::clone(&surface);
         let panels = Rc::clone(&panels);
         let beneaths = Rc::clone(&beneaths);
