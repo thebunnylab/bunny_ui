@@ -159,9 +159,14 @@ pub fn bunny_preview__boom() -> &'static PreviewEntry {
     &BOOM
 }
 
-/// A manifest directory whose `src/lib.rs` the scan reads: the two
-/// previews above, and one the binary does not export.
+/// A manifest directory whose `src/lib.rs` the scan reads: the previews
+/// above, and one the binary does not export. Written ONCE per process:
+/// every test in this binary reads it, and the tests run in parallel, so a
+/// write per call — a truncate, then the bytes — could land while another
+/// test's `hello` scanned the file and listed nothing.
 fn manifest_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
     let dir = std::env::temp_dir().join(format!("bunny-preview-host-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
@@ -170,6 +175,8 @@ fn manifest_dir() -> PathBuf {
     )
     .unwrap();
     dir
+    })
+    .clone()
 }
 
 fn host() -> (Host, Rc<RefCell<Vec<ToIde>>>) {
