@@ -408,6 +408,7 @@ fn print_event(event: &Event, _wanted: &[String]) {
                 );
             }
         }
+        Event::Sources { .. } => {}
         Event::BuildStarted => println!("{}", term::dim("building…")),
         Event::Diagnostic(diagnostic) => {
             if diagnostic.level == "warning" || diagnostic.level == "error" {
