@@ -455,7 +455,16 @@ impl Tree {
                     element.rule = Some(*rule);
                 }
             }
-            DomPatch::SetBox { id, width, height, max_width, max_height, slot_y } => {
+            DomPatch::SetBox {
+                id,
+                width,
+                height,
+                max_width,
+                max_height,
+                slot_y,
+                at,
+                span,
+            } => {
                 let Some(element) = self.elements.get_mut(id) else {
                     return;
                 };
@@ -486,6 +495,49 @@ impl Tree {
                             element.style.remove(name);
                         }
                     }
+                }
+                for name in [
+                    "margin-left",
+                    "margin-top",
+                    "align-self",
+                    "justify-self",
+                    "z-index",
+                    "grid-column",
+                    "grid-row",
+                    "bottom",
+                ] {
+                    element.style.remove(name);
+                }
+                if let Some(at) = at {
+                    if at.layered {
+                        element.style.insert("margin-left", px(at.x));
+                        element.style.insert("margin-top", px(at.y));
+                        element.style.insert(
+                            "align-self",
+                            if at.fill_y { "stretch" } else { "start" }.into(),
+                        );
+                        element.style.insert(
+                            "justify-self",
+                            if at.fill_x { "stretch" } else { "left" }.into(),
+                        );
+                    } else {
+                        element.style.insert("position", "absolute".into());
+                        element.style.insert("left", px(at.x));
+                        element.style.insert("top", px(at.y));
+                        element.style.insert("z-index", "1".into());
+                        if at.fill_x {
+                            element.style.insert("right", "0".into());
+                        }
+                        if at.fill_y {
+                            element.style.insert("bottom", "0".into());
+                        }
+                    }
+                }
+                if let Some((columns, rows)) = span {
+                    element
+                        .style
+                        .insert("grid-column", format!("span {columns}"));
+                    element.style.insert("grid-row", format!("span {rows}"));
                 }
             }
             DomPatch::SetMarks { id, tooltip, group_owner } => {
@@ -834,6 +886,10 @@ fn rule_text(
     } else if layout.plain {
         base.remove("display");
         base.remove("flex-direction");
+    }
+    if layout.relative {
+        base.insert("position", "relative".into());
+        base.insert("isolation", "isolate".into());
     }
     if let Some(gap) = layout.gap {
         base.insert("gap", px(gap));

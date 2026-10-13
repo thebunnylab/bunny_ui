@@ -47,7 +47,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 20;
+const EXPECTED_ABI = 21;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads (`bunny run` and `bunny build` write it);
@@ -469,6 +469,7 @@ function lookRules(selector, kind, flags, style, layout, face) {
     delete decl.display;
     delete decl["flex-direction"];
   }
+  if (layout.relative) { decl.position = "relative"; decl.isolation = "isolate"; }
   if (layout.gap !== null) decl.gap = `${layout.gap}px`;
   if (layout.align !== null) {
     decl["align-items"] =
@@ -966,6 +967,7 @@ function applyPatches(view, length) {
   const readLayout = () => {
     const mask = u16();
     const layout = {
+      relative: (mask & 32768) !== 0,
       gap: null,
       align: null,
       padding: null,
@@ -1401,6 +1403,8 @@ function applyPatches(view, length) {
       const maxWidth = mask & 4 ? f32() : null;
       const maxHeight = mask & 8 ? f32() : null;
       const slotY = mask & 16 ? f32() : null;
+      const at = mask & 32 ? { flags: u8(), x: f32(), y: f32() } : null;
+      const span = mask & 64 ? [u16(), u16()] : null;
       if (el) {
         const style = el.style;
         const dressed = style.length !== 0;
@@ -1424,6 +1428,27 @@ function applyPatches(view, length) {
           style.left = "";
           style.right = "";
         }
+        for (const key of ["marginLeft", "marginTop", "alignSelf", "justifySelf", "zIndex", "gridColumn", "gridRow", "bottom"]) style[key] = "";
+        if (at) {
+          if (at.flags & 1) {
+            style.marginLeft = `${at.x}px`;
+            style.marginTop = `${at.y}px`;
+            style.alignSelf = at.flags & 4 ? "stretch" : "start";
+            style.justifySelf = at.flags & 2 ? "stretch" : "left";
+          } else {
+            style.position = "absolute";
+            style.left = `${at.x}px`;
+            style.top = `${at.y}px`;
+            style.zIndex = "1";
+            if (at.flags & 2) style.right = "0";
+            if (at.flags & 4) style.bottom = "0";
+          }
+        }
+        if (span) {
+          style.gridColumn = `span ${span[0]}`;
+          style.gridRow = `span ${span[1]}`;
+        }
+
       }
     } else if (op === 24) {
       // the element's marks: the tooltip it shows, the group it owns
