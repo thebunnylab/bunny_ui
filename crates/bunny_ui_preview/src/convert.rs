@@ -685,6 +685,14 @@ fn device_from_wire(device: wire::Device) -> core_preview::Device {
 // Patches
 // =============================================================================
 
+/// The modifier an additive placement patch stands for.
+pub fn place_modifier(patch: wire::PlacePatch) -> Modifier {
+    match patch {
+        wire::PlacePatch::Position(point) => Modifier::Position(point.into()),
+        wire::PlacePatch::Span(columns, rows) => Modifier::Span(usize::from(columns.max(1)), usize::from(rows.max(1))),
+    }
+}
+
 /// The modifier a patch stands for.
 pub fn modifier(patch: wire::Patch) -> Modifier {
     match patch {

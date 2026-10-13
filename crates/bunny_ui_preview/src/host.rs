@@ -195,7 +195,7 @@ struct Scene {
     /// next generation.
     poisoned: Option<String>,
     dirty: bool,
-    overrides: Vec<(wire::SiteKey, wire::OverrideOp, wire::Patch)>,
+    overrides: Vec<(wire::SiteKey, Override)>,
     /// The paths of the boxes on the last frame — what the door keeps
     /// pages for, and what renders again when a picture moved.
     hosts: Vec<String>,
@@ -205,11 +205,19 @@ struct Scene {
 /// `Replace` or a `Hide` for either — the last gesture wins — and an
 /// `Append` for an `Append` of the same modifier (a scrub of an appended
 /// padding), while an `Append` of another modifier stacks beside it.
-fn supersedes(op: wire::OverrideOp, patch: wire::Patch, standing_op: wire::OverrideOp, standing_patch: wire::Patch) -> bool {
-    match (op, standing_op) {
-        (wire::OverrideOp::Replace | wire::OverrideOp::Hide, wire::OverrideOp::Replace | wire::OverrideOp::Hide) => true,
-        (wire::OverrideOp::Append, wire::OverrideOp::Append) => convert::modifier(patch).name() == convert::modifier(standing_patch).name(),
+fn supersedes(incoming: &Override, standing: &Override) -> bool {
+    match (incoming, standing) {
+        (Override::Replace(_) | Override::Hide, Override::Replace(_) | Override::Hide) => true,
+        (Override::Append(incoming), Override::Append(standing)) => incoming.name() == standing.name(),
         _ => false,
+    }
+}
+
+fn as_override(op: wire::OverrideOp, modifier: bunny_ui_core::modifier::Modifier) -> Override {
+    match op {
+        wire::OverrideOp::Replace => Override::Replace(modifier),
+        wire::OverrideOp::Append => Override::Append(modifier),
+        wire::OverrideOp::Hide => Override::Hide,
     }
 }
 
@@ -336,7 +344,7 @@ impl Host {
             generation: self.generation,
             workspace_root: self.config.manifest_dir.to_string_lossy().into_owned(),
             package: self.config.package.clone(),
-            caps: 0,
+            caps: wire::caps::PLACE,
         });
         self.ready();
     }
@@ -460,16 +468,10 @@ impl Host {
                 }
             }
             ToHost::Override { id, site, op, patch } => {
-                if let Some(scene) = self.scene(&id) {
-                    // a scrub: the gesture stands in for the one standing on
-                    // the same site and of the same kind, so the last one
-                    // shows — the provenance applies a site's overrides in
-                    // order and takes the first `Replace`
-                    scene.overrides.retain(|(standing, standing_op, standing_patch)| !(standing == &site && supersedes(op, patch, *standing_op, *standing_patch)));
-                    scene.overrides.push((site, op, patch));
-                    scene.dirty = true;
-                    self.push_overrides();
-                }
+                self.apply_override(&id, site, as_override(op, convert::modifier(patch)));
+            }
+            ToHost::Place { id, site, op, patch } => {
+                self.apply_override(&id, site, as_override(op, convert::place_modifier(patch)));
             }
             ToHost::ClearOverrides { id } => {
                 if let Some(scene) = self.scene(&id) {
@@ -535,17 +537,25 @@ impl Host {
         self.push_overrides();
     }
 
+    fn apply_override(&mut self, id: &str, site: wire::SiteKey, incoming: Override) {
+        if let Some(scene) = self.scene(id) {
+            // A scrub replaces only the same operation at this site. Style
+            // and placement appends keep distinct modifier names.
+            scene
+                .overrides
+                .retain(|(standing, value)| !(standing == &site && supersedes(&incoming, value)));
+            scene.overrides.push((site, incoming));
+            scene.dirty = true;
+            self.push_overrides();
+        }
+    }
+
     /// Every scene's overrides, on the thread's one table.
     fn push_overrides(&self) {
         provenance::set_overrides(self.scenes.iter().flat_map(|scene| {
-            scene.overrides.iter().map(|(site, op, patch)| {
+            scene.overrides.iter().map(|(site, value)| {
                 let key = SiteKey { file: site.file.clone(), line: site.line, column: site.column };
-                let override_ = match op {
-                    wire::OverrideOp::Replace => Override::Replace(convert::modifier(*patch)),
-                    wire::OverrideOp::Append => Override::Append(convert::modifier(*patch)),
-                    wire::OverrideOp::Hide => Override::Hide,
-                };
-                (key, override_)
+                (key, value.clone())
             })
         }));
     }

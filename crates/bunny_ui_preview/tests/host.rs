@@ -162,6 +162,49 @@ pub fn bunny_preview__boom() -> &'static PreviewEntry {
     &BOOM
 }
 
+#[derive(Clone)]
+struct PlacedCard;
+impl Component for PlacedCard {
+    fn body(self) -> impl View {
+        vstack!(
+            rectangle().frame(200.0, 100.0),
+            text!("positioned").position(10.0, 20.0)
+        )
+    }
+}
+
+#[derive(Clone)]
+struct GridCard;
+impl Component for GridCard {
+    fn body(self) -> impl View {
+        grid!(text!("a").span(1, 1), text!("b"), text!("c"), text!("d"))
+            .columns(2)
+            .spacing(4.0)
+            .frame_width(100.0)
+    }
+}
+
+fn make_placed() -> Output {
+    Output::of(PlacedCard)
+}
+fn make_grid() -> Output {
+    Output::of(GridCard)
+}
+static PLACED: PreviewEntry = PreviewEntry::new(
+    Meta { ident: "placed", name: "Placed", scope: "Layout", example: "placed", module: "host", file: "src/lib.rs", line: 20 }, make_placed,
+);
+static GRID: PreviewEntry = PreviewEntry::new(
+    Meta { ident: "grid_card", name: "Grid", scope: "Layout", example: "grid_card", module: "host", file: "src/lib.rs", line: 23 }, make_grid,
+);
+#[unsafe(export_name = "bunny_preview__placed")]
+pub fn placed_entry() -> &'static PreviewEntry {
+    &PLACED
+}
+#[unsafe(export_name = "bunny_preview__grid_card")]
+pub fn grid_entry() -> &'static PreviewEntry {
+    &GRID
+}
+
 /// A manifest directory whose `src/lib.rs` the scan reads: the previews
 /// above, and one the binary does not export. Written ONCE per process:
 /// every test in this binary reads it, and the tests run in parallel, so a
@@ -174,7 +217,7 @@ fn manifest_dir() -> PathBuf {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
         dir.join("src/lib.rs"),
-        "use bunny_ui::prelude::*;\n\n#[preview(name = \"Card\", scope = \"Cards\")]\nfn card() -> impl View { text(\"\") }\n\n#[preview(name = \"Boom\", scope = \"Cards\")]\nfn boom() -> impl View { text(\"\") }\n\n#[preview]\nfn ghost() -> impl View { text(\"\") }\n\n#[preview(name = \"Zoomer\", scope = \"Gestures\")]\nfn zoomer() -> impl View { text(\"\") }\n\n#[preview(name = \"Tapper\", scope = \"Gestures\")]\nfn tapper() -> impl View { text(\"\") }\n\n#[preview(name = \"Page\", scope = \"Hosts\")]\nfn page() -> impl View { text(\"\") }\n",
+        "use bunny_ui::prelude::*;\n\n#[preview(name = \"Card\", scope = \"Cards\")]\nfn card() -> impl View { text(\"\") }\n\n#[preview(name = \"Boom\", scope = \"Cards\")]\nfn boom() -> impl View { text(\"\") }\n\n#[preview]\nfn ghost() -> impl View { text(\"\") }\n\n#[preview(name = \"Zoomer\", scope = \"Gestures\")]\nfn zoomer() -> impl View { text(\"\") }\n\n#[preview(name = \"Tapper\", scope = \"Gestures\")]\nfn tapper() -> impl View { text(\"\") }\n\n#[preview(name = \"Page\", scope = \"Hosts\")]\nfn page() -> impl View { text(\"\") }\n\n#[preview]\nfn placed() -> impl View { text(\"\") }\n\n#[preview]\nfn grid_card() -> impl View { text(\"\") }\n",
     )
     .unwrap();
     dir
@@ -227,7 +270,18 @@ fn hello_lists_what_the_binary_exports_and_names_what_it_does_not() {
     match &messages[1] {
         ToIde::Ready { generation: 0, previews, missing } => {
             let idents: Vec<&str> = previews.iter().map(|p| p.ident.as_str()).collect();
-            assert_eq!(idents, ["card", "boom", "zoomer", "tapper", "page"]);
+            assert_eq!(
+                idents,
+                [
+                    "card",
+                    "boom",
+                    "zoomer",
+                    "tapper",
+                    "page",
+                    "placed",
+                    "grid_card"
+                ]
+            );
             assert_eq!(previews[0].id, "src/lib.rs#card");
             assert_eq!(previews[0].scope, "Cards");
             assert_eq!(previews[0].traits, Traits::default());
@@ -372,6 +426,12 @@ fn an_override_stands_in_for_one_of_its_kind_and_stacks_beside_another() {
     assert_eq!(host.overrides_of(&id), 2, "a scrub of the appended padding is one override");
     host.handle(put(wire::OverrideOp::Append, wire::Patch::Opacity(0.5)));
     assert_eq!(host.overrides_of(&id), 3, "another modifier appended stacks");
+    for x in [10.0, 20.0] {
+        host.handle(ToHost::Place { id: id.clone(), site: site.clone(), op: wire::OverrideOp::Append, patch: wire::PlacePatch::Position(wire::Point { x, y: 0.0 }) });
+        assert_eq!(host.overrides_of(&id), 4, "position scrubs retain the style appends");
+    }
+    host.handle(ToHost::Place { id: id.clone(), site: site.clone(), op: wire::OverrideOp::Append, patch: wire::PlacePatch::Span(2, 1) });
+    assert_eq!(host.overrides_of(&id), 5, "span and position have separate names");
 }
 
 fn fixed(width: f64, height: f64) -> Traits {
@@ -627,4 +687,50 @@ fn the_door_is_told_what_lives_when_a_scene_leaves() {
     host.handle(ToHost::Select(vec![]));
     host.tick();
     assert_eq!(door.told.borrow().last().map(Vec::len), Some(0), "nothing lives");
+}
+
+#[test]
+fn hello_announces_live_placement() {
+    let (mut host, seen) = host();
+    host.hello();
+    assert!(
+        seen.borrow()
+            .iter()
+            .any(|m| matches!(m, ToIde::Hello { caps, .. } if caps & wire::caps::PLACE != 0))
+    );
+}
+
+fn modifier_site(frame: &wire::Frame, name: &str) -> wire::SiteKey {
+    let site = frame.sites.iter().find(|site| site.modifier.is_some_and(|index| frame.strings[index as usize] == name)).expect("recorded modifier");
+    wire::SiteKey { file: frame.strings[site.file.unwrap() as usize].clone(), line: site.line, column: site.column }
+}
+
+#[test]
+fn a_place_on_a_position_site_moves_the_child() {
+    let (mut host, seen) = host();
+    host.handle(select("placed", Traits::default()));
+    assert!(host.tick());
+    let before = frames(&seen).remove(0);
+    let site = modifier_site(&before, "position");
+    host.handle(ToHost::Place { id: String::from("src/lib.rs#placed"), site, op: wire::OverrideOp::Replace, patch: wire::PlacePatch::Position(wire::Point { x: 50.0, y: 60.0 }) });
+    assert!(host.tick());
+    let after = frames(&seen).remove(0);
+    assert_eq!(text_x(&after) - text_x(&before), 40.0);
+    host.handle(ToHost::ClearOverrides { id: String::from("src/lib.rs#placed") });
+    assert!(host.tick());
+    assert_eq!(text_x(&frames(&seen).remove(0)), text_x(&before));
+}
+
+#[test]
+fn a_span_place_regrows_the_grid() {
+    let (mut host, seen) = host();
+    host.handle(select("grid_card", Traits::default()));
+    assert!(host.tick());
+    let before = frames(&seen).remove(0);
+    let site = modifier_site(&before, "span");
+    host.handle(ToHost::Place { id: String::from("src/lib.rs#grid_card"), site, op: wire::OverrideOp::Replace, patch: wire::PlacePatch::Span(2, 1) });
+    assert!(host.tick());
+    let after = frames(&seen).remove(0);
+    assert_eq!(before.size.height, 36.0);
+    assert_eq!(after.size.height, 56.0);
 }

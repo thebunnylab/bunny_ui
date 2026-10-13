@@ -18,7 +18,7 @@
 //!
 //! [`WIRE_VERSION`] is 1. It is frozen: a change to an existing message
 //! is a new kind, never a new meaning for an old one. The kinds that
-//! joined after it froze — `Touch` and `Magnify`, tool → host — are
+//! joined after it froze — `Touch`, `Magnify` and `Place`, tool → host — are
 //! skipped by a host that predates them, by their length.
 
 use std::fmt;
@@ -61,6 +61,13 @@ pub mod kind {
     // joined after v1 froze: a host that predates them skips them
     pub const TOUCH: u8 = 77;
     pub const MAGNIFY: u8 = 78;
+    pub const PLACE: u8 = 79;
+}
+
+/// Features a host explicitly offers in `Hello.caps`.
+pub mod caps {
+    /// Free form, grid and live Position/Span overrides through message 79.
+    pub const PLACE: u32 = 1;
 }
 
 // =============================================================================
@@ -535,6 +542,15 @@ pub enum Patch {
     HugHeight,
 }
 
+/// Placement modifiers travel separately from the frozen 23-tag `Patch` enum.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PlacePatch {
+    /// Physical coordinates in the enclosing stack.
+    Position(Point),
+    /// Grid columns and rows; the core normalizes zero to one.
+    Span(u8, u8),
+}
+
 /// What the tool sends.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToHost {
@@ -552,6 +568,8 @@ pub enum ToHost {
     Key { id: String, key: String, modifiers: u32 },
     Text { id: String, text: String },
     Override { id: String, site: SiteKey, op: OverrideOp, patch: Patch },
+    /// Send only after the host announces `caps::PLACE`.
+    Place { id: String, site: SiteKey, op: OverrideOp, patch: PlacePatch },
     ClearOverrides { id: String },
     RequestSnapshot { id: String },
     Forget { keys: Vec<u64> },
@@ -673,7 +691,7 @@ pub fn decode(kind: u8, payload: &[u8]) -> Result<Received, Malformed> {
     let mut cursor = Cursor { bytes: payload, at: 0, kind };
     let message = match kind {
         kind::HELLO..=kind::PONG => Message::ToIde(ToIde::get(&mut cursor)?),
-        kind::SELECT..=kind::MAGNIFY => Message::ToHost(ToHost::get(&mut cursor)?),
+        kind::SELECT..=kind::PLACE => Message::ToHost(ToHost::get(&mut cursor)?),
         _ => return Ok(Received::Unknown { kind, len: payload.len() as u32 }),
     };
     if cursor.at != payload.len() {
@@ -1481,6 +1499,29 @@ impl Wire for SiteKey {
     }
 }
 
+impl Wire for PlacePatch {
+    fn put(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Position(point) => {
+                out.u8(0);
+                point.put(out);
+            }
+            Self::Span(columns, rows) => {
+                out.u8(1);
+                out.u8(*columns);
+                out.u8(*rows);
+            }
+        }
+    }
+    fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
+        Ok(match c.u8()? {
+            0 => Self::Position(Point::get(c)?),
+            1 => Self::Span(c.u8()?, c.u8()?),
+            tag => return Err(Malformed::BadTag { what: "PlacePatch", tag }),
+        })
+    }
+}
+
 impl Wire for Patch {
     fn put(&self, out: &mut Vec<u8>) {
         match *self {
@@ -1750,6 +1791,13 @@ impl ToHost {
                 patch.put(out);
                 kind::OVERRIDE
             }
+            ToHost::Place { id, site, op, patch } => {
+                out.string(id);
+                site.put(out);
+                op.put(out);
+                patch.put(out);
+                kind::PLACE
+            }
             ToHost::ClearOverrides { id } => {
                 out.string(id);
                 kind::CLEAR_OVERRIDES
@@ -1782,6 +1830,7 @@ impl ToHost {
             kind::KEY => ToHost::Key { id: c.string()?, key: c.string()?, modifiers: c.u32()? },
             kind::TEXT => ToHost::Text { id: c.string()?, text: c.string()? },
             kind::OVERRIDE => ToHost::Override { id: c.string()?, site: SiteKey::get(c)?, op: OverrideOp::get(c)?, patch: Patch::get(c)? },
+            kind::PLACE => ToHost::Place { id: c.string()?, site: SiteKey::get(c)?, op: OverrideOp::get(c)?, patch: PlacePatch::get(c)? },
             kind::CLEAR_OVERRIDES => ToHost::ClearOverrides { id: c.string()? },
             kind::REQUEST_SNAPSHOT => ToHost::RequestSnapshot { id: c.string()? },
             kind::FORGET => ToHost::Forget { keys: c.list(|c| c.u64())? },

@@ -136,3 +136,21 @@ fn a_patch_is_the_modifier_it_names_and_a_site_keeps_its_place() {
     assert!(here.line > 10);
     assert!(!table[here.kind as usize].is_empty());
 }
+
+#[test]
+fn a_place_patch_is_the_modifier_it_names() {
+    use bunny_ui::modifier::Modifier;
+    use bunny_ui_preview::convert::place_modifier;
+    assert!(matches!(
+        place_modifier(wire::PlacePatch::Position(wire::Point { x: 12.0, y: 34.0 })),
+        Modifier::Position(Point { x: 12.0, y: 34.0 })
+    ));
+    assert!(matches!(
+        place_modifier(wire::PlacePatch::Span(2, 3)),
+        Modifier::Span(2, 3)
+    ));
+    assert!(matches!(
+        place_modifier(wire::PlacePatch::Span(0, 0)),
+        Modifier::Span(1, 1)
+    ));
+}
