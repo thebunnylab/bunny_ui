@@ -286,3 +286,95 @@ fn a_held_snapshot_cannot_reattach_to_a_recreated_instance() {
             .any(|event| matches!(event, ToIde::InstanceSnapshot { .. }))
     );
 }
+
+#[test]
+fn dock_and_page_selection_replace_only_their_own_scenes() {
+    let (mut host, seen) = host();
+    host.handle(ToHost::SelectInstances(vec![selection(
+        "board",
+        "tapper",
+        fixed(200.0, 120.0),
+    )]));
+    host.tick();
+    let first = instance_frames(&seen);
+    let button = first[0]
+        .1
+        .sites
+        .iter()
+        .find(|site| first[0].1.strings[site.kind as usize] == "button")
+        .unwrap()
+        .frame;
+    for kind in [wire::PointerKind::Down, wire::PointerKind::Up] {
+        host.handle(command(
+            "board",
+            0,
+            InstanceCommand::Pointer {
+                kind,
+                x: button.origin.x + button.size.width / 2.0,
+                y: button.origin.y + button.size.height / 2.0,
+                modifiers: 0,
+            },
+        ));
+    }
+    host.tick();
+    seen.borrow_mut().clear();
+    host.handle(ToHost::Select(vec![wire::Selection {
+        id: "dock".into(),
+        ident: "tapper".into(),
+        traits: fixed(250.0, 150.0),
+    }]));
+    host.tick();
+    seen.borrow_mut().clear();
+    host.handle(command(
+        "board",
+        0,
+        InstanceCommand::Resize(wire::Size {
+            width: 210.0,
+            height: 120.0,
+        }),
+    ));
+    host.tick();
+    assert!(
+        seen.borrow().iter().any(
+            |message| matches!(message, ToIde::InstanceFrame {frame,..} if says(frame,"taps 1"))
+        ),
+        "opening Code must retain the page's state"
+    );
+    seen.borrow_mut().clear();
+    host.handle(ToHost::SelectInstances(vec![]));
+    host.handle(ToHost::Resize {
+        id: "dock".into(),
+        size: wire::Size {
+            width: 270.0,
+            height: 150.0,
+        },
+    });
+    host.tick();
+    assert!(
+        seen.borrow()
+            .iter()
+            .any(|message| matches!(message, ToIde::Frame(frame) if frame.size.width==270.0)),
+        "closing page scenes must retain the Code dock"
+    );
+    seen.borrow_mut().clear();
+    host.handle(ToHost::SelectInstances(vec![selection(
+        "board",
+        "tapper",
+        fixed(200.0, 120.0),
+    )]));
+    host.tick();
+    seen.borrow_mut().clear();
+    host.handle(ToHost::Select(vec![]));
+    host.handle(command(
+        "board",
+        0,
+        InstanceCommand::Resize(wire::Size {
+            width: 220.0,
+            height: 120.0,
+        }),
+    ));
+    host.tick();
+    assert!(seen.borrow().iter().any(
+        |message| matches!(message, ToIde::InstanceFrame {frame,..} if frame.size.width==220.0)
+    ));
+}

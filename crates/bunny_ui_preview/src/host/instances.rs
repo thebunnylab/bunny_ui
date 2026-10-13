@@ -8,6 +8,19 @@
 use super::*;
 use wire::{InstanceCommand, InstanceSelection, SceneInstanceId};
 
+pub(super) enum SceneLane {
+    Legacy,
+    Instances,
+}
+impl SceneLane {
+    pub(super) fn contains(&self, scene: &Scene) -> bool {
+        match self {
+            Self::Legacy => scene.instance().is_none(),
+            Self::Instances => scene.instance().is_some(),
+        }
+    }
+}
+
 pub(super) enum SceneMode {
     Legacy,
     Instance {
@@ -85,6 +98,7 @@ impl Host {
             }
         }
         self.select_scenes(
+            SceneLane::Instances,
             selections
                 .into_iter()
                 .map(|selection| {

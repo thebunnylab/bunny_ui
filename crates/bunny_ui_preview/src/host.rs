@@ -83,7 +83,7 @@ use crate::scan;
 use crate::wire::{self, Message, Reader, Received, ToHost, ToIde};
 
 mod instances;
-use instances::SceneMode;
+use instances::{SceneLane, SceneMode};
 
 /// The text and image engines the scenes render with — the platform's
 /// in an app, the house ones in a test.
@@ -547,11 +547,12 @@ impl Host {
             .find(|scene| scene.instance().is_none() && scene.id == id)
     }
 
-    /// The tool's selection replaces the scenes: one per variant of each
+    /// The tool's selection replaces its legacy scenes: one per variant of each
     /// selected preview; a scene already standing for the same id and
     /// variant under the same traits keeps its state.
     fn select(&mut self, selections: Vec<wire::Selection>) {
         self.select_scenes(
+            SceneLane::Legacy,
             selections
                 .into_iter()
                 .map(|selection| (selection, None))
@@ -559,7 +560,11 @@ impl Host {
         );
     }
 
-    fn select_scenes(&mut self, selections: Vec<(wire::Selection, Option<wire::SceneInstanceId>)>) {
+    fn select_scenes(
+        &mut self,
+        lane: SceneLane,
+        selections: Vec<(wire::Selection, Option<wire::SceneInstanceId>)>,
+    ) {
         let mut kept = Vec::new();
         for (selection, instance) in selections {
             let traits = convert::core_traits(&selection.traits);
@@ -590,6 +595,7 @@ impl Host {
                 }
             }
         }
+        kept.extend(self.scenes.drain(..).filter(|scene| !lane.contains(scene)));
         self.scenes = kept;
         self.resweep = true;
         self.push_overrides();
