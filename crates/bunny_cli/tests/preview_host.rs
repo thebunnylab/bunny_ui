@@ -250,7 +250,7 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
         _ => None,
     });
     assert!(events.iter().any(|event| matches!(event, Event::Sources { generation, sources: Some(sources) }
-        if *generation == frame.generation && sources.files().get(&fs::canonicalize(&lib).unwrap()).is_some_and(|source| source.contains("Tap again")))), "frame generation {}, path {:?}, receipts {:?}", frame.generation, lib, events.iter().filter_map(|event| match event { Event::Sources { generation, sources } => Some((*generation, sources.as_ref().map(|sources| sources.files().keys().filter(|path| path.ends_with("src/lib.rs")).cloned().collect::<Vec<_>>()))), _ => None }).collect::<Vec<_>>());
+        if *generation == frame.generation && sources.files().iter().any(|(path, source)| fs::canonicalize(path).is_ok_and(|path| path == fs::canonicalize(&lib).unwrap()) && source.contains("Tap again")))), "frame generation {}, path {:?}, receipts {:?}", frame.generation, lib, events.iter().filter_map(|event| match event { Event::Sources { generation, sources } => Some((*generation, sources.as_ref().map(|sources| sources.files().keys().filter(|path| path.ends_with("src/lib.rs")).cloned().collect::<Vec<_>>()))), _ => None }).collect::<Vec<_>>());
     timing("save", began.elapsed(), Some(Duration::from_millis(800)));
     assert!(says(&frame, "You tapped 1 times"), "the state survived the swap: {:?}", frame.strings);
     assert!(frame.generation >= 2);
