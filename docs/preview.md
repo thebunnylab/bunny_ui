@@ -89,3 +89,31 @@ received frame, and compare it to current documents before geometry-driven edits
 Undo restoring the exact source can restore eligibility. A restart may reuse
 generation numbers, so retained pictures must keep their own receipts rather
 than borrowing the new process's proof.
+
+## Independent scene instances (T2-STUDIO-79)
+
+`Hello.caps & caps::INSTANCES != 0` enables `SelectInstances` (80) and
+`Instance` (81). An instance has a validated opaque `SceneInstanceId`, a source
+preview ident and rendering traits. Reordering selections keeps the same runtime;
+removing and recreating an instance creates fresh state. Duplicate identities or
+unexported previews refuse the whole selection before replacing any runtime.
+Legacy `Select` still selects the original single-preview lane. Its commands
+cannot alias an instance whose identity happens to have the same spelling.
+
+`Instance` addresses one instance and variant, carrying traits, dimensions,
+pointer/wheel/key/text/touch/pinch input, style/placement overrides, clear or
+snapshot. A traits command changes that variant; `SelectInstances` changes the
+number of variants. Replies use new kinds: `InstanceFrame` (10),
+`InstancePanicked` (11), `InstanceSnapshot` (12) and `InstanceError` (13). Shared
+image resources remain keyed by content. Existing payloads, version-1 goldens and
+legacy host behavior remain unchanged. Tools must retain the old lane for hosts
+without the capability and explain why instance composition is unavailable.
+
+Each instance variant owns an immutable `provenance::OverrideSet`. Rendering,
+input and dirty checks enter its context and restore the outer context, even on
+panic. A set retains its own version across passes, so another artboard does not
+invalidate its layout cache. The legacy thread-wide override table remains the
+legacy lane. A delayed snapshot holds the runtime identity, preventing a removed
+artboard's request from attaching to a recreated instance. A generation change
+invalidates the last-sent frame even when its pixels are identical, allowing tools
+to associate the new source receipt with every retained instance.

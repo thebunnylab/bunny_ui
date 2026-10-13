@@ -23,6 +23,9 @@
 
 use std::fmt;
 
+mod instances;
+pub use instances::{InstanceCommand, InstanceSelection, InvalidSceneInstanceId, SceneInstanceId};
+
 /// The version of this wire — what `Hello` announces.
 pub const WIRE_VERSION: u32 = 1;
 
@@ -47,6 +50,10 @@ pub mod kind {
     pub const PANIC: u8 = 7;
     pub const SNAPSHOT: u8 = 8;
     pub const PONG: u8 = 9;
+    pub const INSTANCE_FRAME: u8 = 10;
+    pub const INSTANCE_PANICKED: u8 = 11;
+    pub const INSTANCE_SNAPSHOT: u8 = 12;
+    pub const INSTANCE_ERROR: u8 = 13;
 
     pub const SELECT: u8 = 64;
     pub const RETRAIT: u8 = 65;
@@ -65,12 +72,16 @@ pub mod kind {
     pub const TOUCH: u8 = 77;
     pub const MAGNIFY: u8 = 78;
     pub const PLACE: u8 = 79;
+    pub const SELECT_INSTANCES: u8 = 80;
+    pub const INSTANCE: u8 = 81;
 }
 
 /// Features a host explicitly offers in `Hello.caps`.
 pub mod caps {
     /// Free form, grid and live Position/Span overrides through message 79.
     pub const PLACE: u32 = 1;
+    /// Independently addressed preview instances through messages 10–13 and 80–81.
+    pub const INSTANCES: u32 = 2;
 }
 
 // =============================================================================
@@ -448,6 +459,32 @@ pub enum ToIde {
     /// The previews of the generation that runs, after each load.
     Ready { generation: u32, previews: Vec<PreviewInfo>, missing: Vec<String> },
     Frame(Frame),
+    /// A frame from one independent scene instance.
+    InstanceFrame {
+        instance: SceneInstanceId,
+        frame: Box<Frame>,
+    },
+    /// A panic confined to one instance variant.
+    InstancePanicked {
+        instance: SceneInstanceId,
+        preview: String,
+        variant: u32,
+        message: String,
+    },
+    /// Pixels requested from one instance variant.
+    InstanceSnapshot {
+        instance: SceneInstanceId,
+        preview: String,
+        variant: u32,
+        size: (u32, u32),
+        rgba: Vec<u8>,
+    },
+    /// An invalid instance selection or command; the previous state is retained.
+    InstanceError {
+        instance: SceneInstanceId,
+        variant: Option<u32>,
+        message: String,
+    },
     Resource(Resource),
     Status { text: String },
     /// One preview's pass panicked; the host is alive.
@@ -558,10 +595,36 @@ pub enum PlacePatch {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToHost {
     Select(Vec<Selection>),
-    Retrait { id: String, traits: Traits },
-    Resize { id: String, size: Size },
-    Pointer { id: String, kind: PointerKind, x: f64, y: f64, modifiers: u32 },
-    Wheel { id: String, x: f64, y: f64, dx: f64, dy: f64 },
+    /// Replace instance selections after negotiating `caps::INSTANCES`.
+    SelectInstances(Vec<InstanceSelection>),
+    /// Address one variant of an independent scene.
+    Instance {
+        instance: SceneInstanceId,
+        variant: u32,
+        command: InstanceCommand,
+    },
+    Retrait {
+        id: String,
+        traits: Traits,
+    },
+    Resize {
+        id: String,
+        size: Size,
+    },
+    Pointer {
+        id: String,
+        kind: PointerKind,
+        x: f64,
+        y: f64,
+        modifiers: u32,
+    },
+    Wheel {
+        id: String,
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+    },
     /// A finger on a scene: `touch` names it across its steps, `taps`
     /// is the platform's own count for it.
     Touch { id: String, phase: TouchPhase, touch: u64, x: f64, y: f64, taps: u8 },
@@ -604,6 +667,8 @@ pub enum Malformed {
     BadTag { what: &'static str, tag: u8 },
     /// A string that is not UTF-8.
     BadText,
+    /// A scene instance name violates its identity contract.
+    InvalidSceneInstance,
     /// A length past [`MAX_FRAME`].
     Oversized { len: u32 },
     /// Bytes left over after the message — the payload was not this kind's.
@@ -615,6 +680,7 @@ impl fmt::Display for Malformed {
         match self {
             Malformed::Truncated { kind } => write!(f, "a message of kind {kind} ended before its payload did"),
             Malformed::BadTag { what, tag } => write!(f, "no {what} answers to the tag {tag}"),
+            Malformed::InvalidSceneInstance => f.write_str("invalid scene instance identity"),
             Malformed::BadText => f.write_str("a string on the wire is not UTF-8"),
             Malformed::Oversized { len } => write!(f, "a frame of {len} bytes is past the wire's limit"),
             Malformed::Trailing { kind, left } => write!(f, "a message of kind {kind} left {left} bytes unread"),
@@ -693,8 +759,8 @@ impl Reader {
 pub fn decode(kind: u8, payload: &[u8]) -> Result<Received, Malformed> {
     let mut cursor = Cursor { bytes: payload, at: 0, kind };
     let message = match kind {
-        kind::HELLO..=kind::PONG => Message::ToIde(ToIde::get(&mut cursor)?),
-        kind::SELECT..=kind::PLACE => Message::ToHost(ToHost::get(&mut cursor)?),
+        kind::HELLO..=kind::INSTANCE_ERROR => Message::ToIde(ToIde::get(&mut cursor)?),
+        kind::SELECT..=kind::INSTANCE => Message::ToHost(ToHost::get(&mut cursor)?),
         _ => return Ok(Received::Unknown { kind, len: payload.len() as u32 }),
     };
     if cursor.at != payload.len() {
@@ -1664,6 +1730,48 @@ impl ToIde {
                 frame.put(out);
                 kind::FRAME
             }
+            ToIde::InstanceFrame { instance, frame } => {
+                instance.put(out);
+                frame.put(out);
+                kind::INSTANCE_FRAME
+            }
+            ToIde::InstancePanicked {
+                instance,
+                preview,
+                variant,
+                message,
+            } => {
+                instance.put(out);
+                out.string(preview);
+                out.u32(*variant);
+                out.string(message);
+                kind::INSTANCE_PANICKED
+            }
+            ToIde::InstanceSnapshot {
+                instance,
+                preview,
+                variant,
+                size,
+                rgba,
+            } => {
+                instance.put(out);
+                out.string(preview);
+                out.u32(*variant);
+                out.u32(size.0);
+                out.u32(size.1);
+                out.bytes(rgba);
+                kind::INSTANCE_SNAPSHOT
+            }
+            ToIde::InstanceError {
+                instance,
+                variant,
+                message,
+            } => {
+                instance.put(out);
+                out.option(variant.as_ref(), |out, v| out.u32(*v));
+                out.string(message);
+                kind::INSTANCE_ERROR
+            }
             ToIde::Resource(resource) => {
                 resource.put(out);
                 kind::RESOURCE
@@ -1715,6 +1823,28 @@ impl ToIde {
             }
             kind::READY => ToIde::Ready { generation: c.u32()?, previews: c.list(PreviewInfo::get)?, missing: c.list(|c| c.string())? },
             kind::FRAME => ToIde::Frame(Frame::get(c)?),
+            kind::INSTANCE_FRAME => ToIde::InstanceFrame {
+                instance: SceneInstanceId::get(c)?,
+                frame: Box::new(Frame::get(c)?),
+            },
+            kind::INSTANCE_PANICKED => ToIde::InstancePanicked {
+                instance: SceneInstanceId::get(c)?,
+                preview: c.string()?,
+                variant: c.u32()?,
+                message: c.string()?,
+            },
+            kind::INSTANCE_SNAPSHOT => ToIde::InstanceSnapshot {
+                instance: SceneInstanceId::get(c)?,
+                preview: c.string()?,
+                variant: c.u32()?,
+                size: (c.u32()?, c.u32()?),
+                rgba: c.bytes()?,
+            },
+            kind::INSTANCE_ERROR => ToIde::InstanceError {
+                instance: SceneInstanceId::get(c)?,
+                variant: c.option(|c| c.u32())?,
+                message: c.string()?,
+            },
             kind::RESOURCE => ToIde::Resource(Resource::get(c)?),
             kind::STATUS => ToIde::Status { text: c.string()? },
             kind::PANICKED => ToIde::Panicked { preview: c.string()?, message: c.string()? },
@@ -1730,6 +1860,20 @@ impl ToHost {
     /// Writes the payload; answers the kind.
     fn put(&self, out: &mut Vec<u8>) -> u8 {
         match self {
+            ToHost::SelectInstances(selections) => {
+                out.list(selections, |out, s| s.put(out));
+                kind::SELECT_INSTANCES
+            }
+            ToHost::Instance {
+                instance,
+                variant,
+                command,
+            } => {
+                instance.put(out);
+                out.u32(*variant);
+                command.put(out);
+                kind::INSTANCE
+            }
             ToHost::Select(selections) => {
                 out.list(selections, |out, s| s.put(out));
                 kind::SELECT
@@ -1823,6 +1967,12 @@ impl ToHost {
 
     fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
         Ok(match c.kind {
+            kind::SELECT_INSTANCES => ToHost::SelectInstances(c.list(InstanceSelection::get)?),
+            kind::INSTANCE => ToHost::Instance {
+                instance: SceneInstanceId::get(c)?,
+                variant: c.u32()?,
+                command: InstanceCommand::get(c)?,
+            },
             kind::SELECT => ToHost::Select(c.list(Selection::get)?),
             kind::RETRAIT => ToHost::Retrait { id: c.string()?, traits: Traits::get(c)? },
             kind::RESIZE => ToHost::Resize { id: c.string()?, size: Size::get(c)? },

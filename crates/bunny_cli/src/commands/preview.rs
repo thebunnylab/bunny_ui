@@ -453,7 +453,23 @@ fn print_event(event: &Event, _wanted: &[String]) {
             ToIde::Panicked { preview, message } => println!("{}", term::red(&format!("{preview} panicked: {message}"))),
             ToIde::Panic { message } => println!("{}", term::red(&format!("the host panicked: {message}"))),
             ToIde::Status { text } => println!("{}", term::dim(text)),
-            ToIde::Resource(_) | ToIde::Snapshot { .. } | ToIde::Pong { .. } => {}
+            ToIde::InstanceFrame { instance, frame } => println!(
+                "{}",
+                term::dim(&format!(
+                    "{instance} · {} · frame {}",
+                    frame.preview, frame.seq
+                ))
+            ),
+            ToIde::InstancePanicked {
+                instance, message, ..
+            }
+            | ToIde::InstanceError {
+                instance, message, ..
+            } => println!("{}", term::red(&format!("{instance}: {message}"))),
+            ToIde::Resource(_)
+            | ToIde::Snapshot { .. }
+            | ToIde::InstanceSnapshot { .. }
+            | ToIde::Pong { .. } => {}
         },
     }
 }
