@@ -186,6 +186,14 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::PaddingEdge(edge, length))
     }
 
+    /// Places this view's outer box at a physical point in its enclosing stack.
+    /// A row or column excludes it from flow; layers include its extent.
+    /// Outside a stack this annotation is transparent. It never clips.
+    #[track_caller]
+    fn position(self, x: f64, y: f64) -> Modified<Self> {
+        Modified::new(self, Modifier::Position(crate::layout::Point { x, y }))
+    }
+
     /// `.frame(width: 120, height: 80)` — the box is exact and the
     /// content CENTRES in it, as SwiftUI's does.
     #[track_caller]

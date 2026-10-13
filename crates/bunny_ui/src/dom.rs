@@ -1032,6 +1032,10 @@ impl DomCapture {
 pub struct DomLayout {
     /// Gap between a flex container's children, px.
     pub gap: Option<f32>,
+    /// The containing block for children taken out of flow.
+    pub relative: bool,
+    /// Rare child placement parameters, shared when a scene is retained.
+    pub placement: Option<Rc<DomPlacement>>,
     /// Cross-axis alignment: 0 start, 1 center, 2 end, 3 baseline.
     pub align: Option<u8>,
     /// Padding `(top, trailing, bottom, leading)`, px — logical sides, so
@@ -1066,6 +1070,49 @@ pub struct DomLayout {
     /// `unicode-bidi`, so the browser orders its rows, aligns its
     /// `start` and shapes its words the island's way. `None` inherits.
     pub direction: Option<motor::state::LayoutDirection>,
+}
+
+/// A positioned child's physical coordinates and its stack's sizing rule.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DomPosition {
+    /// Physical left offset, in points, independent of reading direction.
+    pub x: f32,
+    /// Top offset, in points.
+    pub y: f32,
+    /// Layers include the offset in their natural extent; flow stacks do not.
+    pub layered: bool,
+    /// Take the remaining horizontal room when the child is flexible.
+    pub fill_x: bool,
+    /// Take the remaining vertical room when the child is flexible.
+    pub fill_y: bool,
+}
+
+/// Rare stack-child geometry. Ordinary flow nodes pay only one pointer.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DomPlacement {
+    /// The stack's physical point and sizing rule.
+    pub at: Option<DomPosition>,
+    /// Column and row spans, reserved for grid lowering in the same ABI.
+    pub span: Option<(u16, u16)>,
+}
+
+/// Per-element geometry, kept outside shared appearance rules.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DomBox {
+    /// Pinned width in points.
+    pub width: Option<f32>,
+    /// Pinned height in points.
+    pub height: Option<f32>,
+    /// Maximum width in points.
+    pub max_width: Option<f32>,
+    /// Maximum height in points.
+    pub max_height: Option<f32>,
+    /// Virtual row offset in points.
+    pub slot_y: Option<f32>,
+    /// Physical position within the enclosing stack.
+    pub at: Option<DomPosition>,
+    /// Column and row spans. Reserved for grid lowering in the same ABI.
+    pub span: Option<(u16, u16)>,
 }
 
 /// Element hints only the Dom consumes — a real tag, a class, an id.
@@ -1215,6 +1262,8 @@ pub enum DomPatch {
         max_width: Option<f32>,
         max_height: Option<f32>,
         slot_y: Option<f32>,
+        at: Option<DomPosition>,
+        span: Option<(u16, u16)>,
     },
     /// The element's own marks: its tooltip and the hover group it owns.
     SetMarks { id: u32, tooltip: Option<Arc<str>>, group_owner: Option<u64> },
@@ -1970,6 +2019,7 @@ fn look_layout(layout: &DomLayout) -> DomLayout {
         max_width: None,
         max_height: None,
         slot_y: None,
+        placement: None,
         ..layout.clone()
     }
 }
@@ -2054,6 +2104,9 @@ fn look_hash(node: &DomNode) -> u64 {
             layout.fill.hash(&mut hasher);
             hash_f32(layout.wrap, &mut hasher);
             layout.plain.hash(&mut hasher);
+            if layout.relative {
+                0x706f736974696f6eu64.hash(&mut hasher);
+            }
             // only an island adds to the hash: every look without a direction
             // of its own hashes as it always did
             if let Some(direction) = layout.direction {
@@ -2176,13 +2229,38 @@ fn face_only(face: FontSpec) -> DomText {
 }
 
 /// The element's own geometry, as the box patch carries it.
-fn geometry_of(layout: &DomLayout) -> [Option<f32>; 5] {
-    [layout.width, layout.height, layout.max_width, layout.max_height, layout.slot_y]
+fn geometry_of(layout: &DomLayout) -> DomBox {
+    DomBox {
+        width: layout.width,
+        height: layout.height,
+        max_width: layout.max_width,
+        max_height: layout.max_height,
+        slot_y: layout.slot_y,
+        at: layout.placement.as_ref().and_then(|p| p.at),
+        span: layout.placement.as_ref().and_then(|p| p.span),
+    }
 }
 
-fn box_patch(id: u32, geometry: [Option<f32>; 5]) -> DomPatch {
-    let [width, height, max_width, max_height, slot_y] = geometry;
-    DomPatch::SetBox { id, width, height, max_width, max_height, slot_y }
+fn box_patch(id: u32, geometry: DomBox) -> DomPatch {
+    let DomBox {
+        width,
+        height,
+        max_width,
+        max_height,
+        slot_y,
+        at,
+        span,
+    } = geometry;
+    DomPatch::SetBox {
+        id,
+        width,
+        height,
+        max_width,
+        max_height,
+        slot_y,
+        at,
+        span,
+    }
 }
 
 /// The element's own marks.
@@ -2592,6 +2670,7 @@ fn same_look_layout(a: &DomLayout, b: &DomLayout) -> bool {
         && a.fill == b.fill
         && a.wrap == b.wrap
         && a.plain == b.plain
+        && a.relative == b.relative
 }
 
 /// The shared part of two styles, equal? (What [`look_hash`] reads of
@@ -2629,7 +2708,29 @@ fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
     // the look says everything a rule shares; the box and the hints
     // say the rest the clone must carry byte for byte
     look_hash(node).hash(hasher);
-    geometry_of(layout).map(|value| value.map(f32::to_bits)).hash(hasher);
+    let geometry = geometry_of(layout);
+    [
+        geometry.width,
+        geometry.height,
+        geometry.max_width,
+        geometry.max_height,
+        geometry.slot_y,
+    ]
+    .map(|value| value.map(f32::to_bits))
+    .hash(hasher);
+    geometry
+        .at
+        .map(|at| {
+            (
+                at.x.to_bits(),
+                at.y.to_bits(),
+                at.layered,
+                at.fill_x,
+                at.fill_y,
+            )
+        })
+        .hash(hasher);
+    geometry.span.hash(hasher);
     node.hints.tag.as_deref().hash(hasher);
     node.hints.class.as_deref().hash(hasher);
     // the action path is the row's own; that there IS one is the shape
@@ -2708,7 +2809,7 @@ fn create_subtree(
         // a flow node speaks semantics; its geometry fields are silent
         Some(layout) => {
             let geometry = geometry_of(layout);
-            if geometry.iter().any(Option::is_some) {
+            if geometry != DomBox::default() {
                 patches.push(box_patch(id, geometry));
             }
         }
@@ -3128,7 +3229,7 @@ fn diff_node(
         None => {
             // an absolute node that WAS flow clears its box first
             if old.layout.is_some() {
-                patches.push(box_patch(id, [None; 5]));
+                patches.push(box_patch(id, DomBox::default()));
             }
             if (old.x, old.y) != (new.x, new.y) {
                 patches.push(DomPatch::SetTransform { id, x: new.x, y: new.y });
@@ -3897,7 +3998,11 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// offset is logical on both sides of the wire — the glue negates
 /// `scrollLeft` under a right-to-left mount, which reports it at or
 /// below zero.
-pub const ABI_VERSION: u32 = 20;
+///
+/// 21 (0.3.0): stack placement and grid. SetBox bits 5/6 carry a position
+/// (u8 flags: layered/fill-x/fill-y, f32 x/y) and spans (u16 columns/rows); flow bit 15 marks
+/// the containing block of out-of-flow children. Grid shares this revision.
+pub const ABI_VERSION: u32 = 21;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -4013,7 +4118,8 @@ pub const ABI_VERSION: u32 = 20;
 ///                   12 plain (flag, no payload),
 ///                   13 direction u8 (0 ltr, 1 rtl) — an island that
 ///                   reads the other way: `direction` and an isolated
-///                   `unicode-bidi` on its box
+///                   `unicode-bidi` on its box;
+///                   15 relative containing block (flag, no payload)
 ///  12 move          u32 parent, u32 before (0 = to the end)
 ///  13 reveal        u32 target — the container scrolls it into view
 ///  14 set anchor    u32 anchor element, u8 side (0 top, 1 bottom,
@@ -4241,7 +4347,16 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_u32(&mut out, (*rule >> 32) as u32);
                 push_u32(&mut out, *rule as u32);
             }
-            DomPatch::SetBox { id, width, height, max_width, max_height, slot_y } => {
+            DomPatch::SetBox {
+                id,
+                width,
+                height,
+                max_width,
+                max_height,
+                slot_y,
+                at,
+                span,
+            } => {
                 out.push(23);
                 push_u32(&mut out, *id);
                 let fields = [width, height, max_width, max_height, slot_y];
@@ -4251,9 +4366,28 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                         mask |= 1 << bit;
                     }
                 }
+                if at.is_some() {
+                    mask |= 1 << 5;
+                }
+                if span.is_some() {
+                    mask |= 1 << 6;
+                }
                 out.push(mask);
                 for field in fields.into_iter().flatten() {
                     push_f32(&mut out, *field as f64);
+                }
+                if let Some(at) = at {
+                    out.push(
+                        u8::from(at.layered)
+                            | (u8::from(at.fill_x) << 1)
+                            | (u8::from(at.fill_y) << 2),
+                    );
+                    push_f32(&mut out, at.x);
+                    push_f32(&mut out, at.y);
+                }
+                if let Some((columns, rows)) = span {
+                    push_u16(&mut out, *columns);
+                    push_u16(&mut out, *rows);
                 }
             }
             DomPatch::SetMarks { id, tooltip, group_owner } => {
@@ -4485,83 +4619,86 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
 }
 
 fn encode_layout(out: &mut Vec<u8>, layout: &DomLayout) {
-                let mut mask = 0u16;
-                if layout.gap.is_some() {
-                    mask |= 1;
-                }
-                if layout.align.is_some() {
-                    mask |= 1 << 1;
-                }
-                if layout.padding.is_some() {
-                    mask |= 1 << 2;
-                }
-                if layout.width.is_some() {
-                    mask |= 1 << 3;
-                }
-                if layout.height.is_some() {
-                    mask |= 1 << 4;
-                }
-                if layout.max_width.is_some() {
-                    mask |= 1 << 5;
-                }
-                if layout.max_height.is_some() {
-                    mask |= 1 << 6;
-                }
-                if layout.grow {
-                    mask |= 1 << 7;
-                }
-                if layout.slot_y.is_some() {
-                    mask |= 1 << 8;
-                }
-                if layout.stretch {
-                    mask |= 1 << 9;
-                }
-                if layout.fill {
-                    mask |= 1 << 10;
-                }
-                if layout.wrap.is_some() {
-                    mask |= 1 << 11;
-                }
-                if layout.plain {
-                    mask |= 1 << 12;
-                }
-                if layout.direction.is_some() {
-                    mask |= 1 << 13;
-                }
-                push_u16(out, mask);
-                if let Some(gap) = layout.gap {
-                    push_f32(out, gap);
-                }
-                if let Some(align) = layout.align {
-                    out.push(align);
-                }
-                if let Some((top, trailing, bottom, leading)) = layout.padding {
-                    push_f32(out, top);
-                    push_f32(out, trailing);
-                    push_f32(out, bottom);
-                    push_f32(out, leading);
-                }
-                if let Some(width) = layout.width {
-                    push_f32(out, width);
-                }
-                if let Some(height) = layout.height {
-                    push_f32(out, height);
-                }
-                if let Some(max_width) = layout.max_width {
-                    push_f32(out, max_width);
-                }
-                if let Some(max_height) = layout.max_height {
-                    push_f32(out, max_height);
-                }
-                if let Some(slot_y) = layout.slot_y {
-                    push_f32(out, slot_y);
-                }
-                if let Some(wrap) = layout.wrap {
-                    push_f32(out, wrap);
-                }
-                if let Some(direction) = layout.direction {
-                    out.push(direction.is_rtl() as u8);
-                }
+    let mut mask = 0u16;
+    if layout.gap.is_some() {
+        mask |= 1;
+    }
+    if layout.align.is_some() {
+        mask |= 1 << 1;
+    }
+    if layout.padding.is_some() {
+        mask |= 1 << 2;
+    }
+    if layout.width.is_some() {
+        mask |= 1 << 3;
+    }
+    if layout.height.is_some() {
+        mask |= 1 << 4;
+    }
+    if layout.max_width.is_some() {
+        mask |= 1 << 5;
+    }
+    if layout.max_height.is_some() {
+        mask |= 1 << 6;
+    }
+    if layout.grow {
+        mask |= 1 << 7;
+    }
+    if layout.slot_y.is_some() {
+        mask |= 1 << 8;
+    }
+    if layout.stretch {
+        mask |= 1 << 9;
+    }
+    if layout.fill {
+        mask |= 1 << 10;
+    }
+    if layout.wrap.is_some() {
+        mask |= 1 << 11;
+    }
+    if layout.plain {
+        mask |= 1 << 12;
+    }
+    if layout.direction.is_some() {
+        mask |= 1 << 13;
+    }
+    if layout.relative {
+        mask |= 1 << 15;
+    }
+    push_u16(out, mask);
+    if let Some(gap) = layout.gap {
+        push_f32(out, gap);
+    }
+    if let Some(align) = layout.align {
+        out.push(align);
+    }
+    if let Some((top, trailing, bottom, leading)) = layout.padding {
+        push_f32(out, top);
+        push_f32(out, trailing);
+        push_f32(out, bottom);
+        push_f32(out, leading);
+    }
+    if let Some(width) = layout.width {
+        push_f32(out, width);
+    }
+    if let Some(height) = layout.height {
+        push_f32(out, height);
+    }
+    if let Some(max_width) = layout.max_width {
+        push_f32(out, max_width);
+    }
+    if let Some(max_height) = layout.max_height {
+        push_f32(out, max_height);
+    }
+    if let Some(slot_y) = layout.slot_y {
+        push_f32(out, slot_y);
+    }
+    if let Some(wrap) = layout.wrap {
+        push_f32(out, wrap);
+    }
+    if let Some(direction) = layout.direction {
+        out.push(direction.is_rtl() as u8);
+    }
 }
 
 /// A text's face and ink, as a look carries them.
@@ -7730,6 +7867,58 @@ mod tests {
         assert!(matches!(&regapped[1], DomPatch::UseRule { id: 0, .. }), "{regapped:#?}");
     }
 
+    #[test]
+    fn position_geometry_is_byte_stable_and_clears_without_changing_the_look() {
+        let patch = DomPatch::SetBox {
+            id: 7,
+            width: None,
+            height: None,
+            max_width: None,
+            max_height: None,
+            slot_y: None,
+            at: Some(DomPosition {
+                x: 10.0,
+                y: 20.0,
+                layered: true,
+                fill_x: false,
+                fill_y: false,
+            }),
+            span: None,
+        };
+        let expected: Vec<u8> = [
+            &1u32.to_le_bytes()[..],
+            &[23],
+            &7u32.to_le_bytes()[..],
+            &[32, 1],
+            &10f32.to_le_bytes()[..],
+            &20f32.to_le_bytes()[..],
+        ]
+        .concat();
+        assert_eq!(encode(&[patch]), expected);
+        let mut layout = DomLayout::default();
+        let before = look_layout(&layout);
+        layout.placement = Some(Rc::new(DomPlacement {
+            at: Some(DomPosition {
+                x: 10.0,
+                y: 20.0,
+                layered: false,
+                fill_x: false,
+                fill_y: false,
+            }),
+            span: None,
+        }));
+        assert_eq!(look_layout(&layout), before);
+        assert_ne!(geometry_of(&layout), DomBox::default());
+        assert!(matches!(
+            box_patch(7, DomBox::default()),
+            DomPatch::SetBox {
+                at: None,
+                span: None,
+                ..
+            }
+        ));
+    }
+
     /// The box an element owns, a move and a reveal, pinned byte for
     /// byte: the box is a mask of five and the floats it names, in order.
     #[test]
@@ -7742,6 +7931,8 @@ mod tests {
                 max_width: None,
                 max_height: None,
                 slot_y: Some(120.0),
+                at: None,
+                span: None,
             },
             DomPatch::Move { id: 5, parent: 1, before: 9 },
             DomPatch::Reveal { id: 3, target: 44 },
@@ -8730,16 +8921,23 @@ mod size_tests {
         // (wasm: DomNode 248, DomStyle 16, DomKind 56, Modifier 56); a
         // placed element's box stays f64, the served page prints it. The
         // node is the retention too: its element id and its rule are the
-        // eight bytes over 320, where a wrapper around every kept node
+        // eight bytes over 320, plus the aligned pointer to rare child placement,
+        // where a wrapper around every kept node
         // was forty and a second vector per parent
-        assert!(size_of::<super::DomNode>() <= 328, "DomNode grew: box the rare record, not the node");
+        assert!(
+            size_of::<super::DomNode>() <= 336,
+            "DomNode grew: box the rare record, not the node"
+        );
         // the action path inline, the look and the marks boxed
         assert!(size_of::<super::DomStyle>() <= 32, "DomStyle grew: a look's field belongs in DomLook");
         // no kind wider than a text, the commonest: a wider one is boxed
         assert!(size_of::<super::DomKind>() <= 72, "DomKind grew: box the new payload");
         assert!(size_of::<super::DomText>() <= 72, "DomText grew");
-        // the flow record holds the wire's f32s
-        assert!(size_of::<Option<super::DomLayout>>() <= 84, "DomLayout grew: a length is an f32");
+        // The flow record holds f32s and one pointer for rare placement parameters.
+        assert!(
+            size_of::<Option<super::DomLayout>>() <= 96,
+            "DomLayout grew: a length is an f32"
+        );
         // a stack, a text and a style carry their hints and their action,
         // the text the widest: a wrapper for each was a box per row
         assert!(size_of::<crate::layout::LayoutNode>() <= 120, "LayoutNode grew: box the rare payload");

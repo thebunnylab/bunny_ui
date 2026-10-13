@@ -916,6 +916,8 @@ pub enum LayoutNode {
         layer: Box<LayoutNode>,
         child: Box<LayoutNode>,
     },
+    /// A child parameter read by its enclosing stack, transparent elsewhere.
+    Placed { at: Point, child: Box<LayoutNode> },
     Padding { edges: Edges, child: Box<LayoutNode> },
     /// `.frame(width:height:)` — `Some` axes override proposal and answer.
     ///
@@ -2656,7 +2658,8 @@ impl LayoutNode {
             LayoutNode::Overlay { layer, child, .. } => {
                 layer.collect_quiet(held) && child.collect_quiet(held)
             }
-            LayoutNode::Accessible { child, .. }
+            LayoutNode::Placed { child, .. }
+            | LayoutNode::Accessible { child, .. }
             | LayoutNode::Sited { child, .. }
             | LayoutNode::Padding { child, .. }
             | LayoutNode::Frame { child, .. }
@@ -5681,9 +5684,13 @@ impl LayoutNode {
             // nesting it must not freeze it at its natural extent). It
             // also RENAMES the main axis: its children answer against its
             // own axis, not the grandparent's.
-            LayoutNode::Stack { children, axis: main, .. } => {
-                children.iter().any(|child| child.is_flexible(axis, Some(*main)))
-            }
+            LayoutNode::Stack {
+                children,
+                axis: main,
+                ..
+            } => children
+                .iter()
+                .any(|child| child.placed_at().is_none() && child.is_flexible(axis, Some(*main))),
             // a flow takes the width it is offered — that is where it
             // wraps — and answers its height with its lines
             LayoutNode::Flow { .. } => axis == Axis::Horizontal,
@@ -5695,7 +5702,8 @@ impl LayoutNode {
             LayoutNode::Boundary { children, .. } => Self::boundary_is_flexible(children, axis, enclosing_main),
             // a probe is not a box: it answers for its child in every
             // direction, or measuring a view would change it
-            LayoutNode::Accessible { child, .. }
+            LayoutNode::Placed { child, .. }
+            | LayoutNode::Accessible { child, .. }
             | LayoutNode::Sited { child, .. }
             | LayoutNode::Measured { child, .. } => child.is_flexible(axis, enclosing_main),
             // the app answers for its own box, per axis (the default is
@@ -5710,6 +5718,53 @@ impl LayoutNode {
                 layout.map(|node| node.is_flexible(axis, enclosing_main)).unwrap_or(false)
             }),
             _ => false,
+        }
+    }
+
+    /// This stack child's physical position, looking through its outer wrappers.
+    /// The first (outermost) position wins. Retained components read the same tree.
+    pub fn placed_at(&self) -> Option<Point> {
+        match self {
+            Self::Placed { at, .. } => Some(*at),
+            Self::BoundaryRef { slot, .. } => {
+                slot.with_layout(|node| node.and_then(Self::placed_at))
+            }
+            _ => self.only_child().and_then(Self::placed_at),
+        }
+    }
+
+    fn only_child(&self) -> Option<&Self> {
+        match self {
+            Self::Measured { child, .. }
+            | Self::Accessible { child, .. }
+            | Self::Sited { child, .. }
+            | Self::Overlay { child, .. }
+            | Self::Padding { child, .. }
+            | Self::Frame { child, .. }
+            | Self::MaxFrame { child, .. }
+            | Self::FlexFrame { child, .. }
+            | Self::Scroll { child, .. }
+            | Self::Hug { child, .. }
+            | Self::Styled { child, .. }
+            | Self::Animated { child, .. }
+            | Self::Interactive { child, .. }
+            | Self::HoverGroup { child, .. }
+            | Self::Island { child, .. }
+            | Self::Live { child, .. }
+            | Self::Sheet { child, .. }
+            | Self::Anchored { child, .. }
+            | Self::DragRegion { child, .. }
+            | Self::IgnoresSafeArea { child, .. }
+            | Self::ControlRegion { child, .. }
+            | Self::Tooltip { child, .. }
+            | Self::ContextSource { child, .. }
+            | Self::DragSource { child, .. }
+            | Self::DropTarget { child, .. }
+            | Self::ExactLayout { child, .. }
+            | Self::Hinted { child, .. }
+            | Self::Placed { child, .. } => Some(child),
+            Self::Boundary { children, .. } if children.len() == 1 => children.first(),
+            _ => None,
         }
     }
 
@@ -5764,16 +5819,21 @@ impl LayoutNode {
             LayoutNode::Split { children, .. } => {
                 children.first().and_then(|child| child.first_baseline(env))
             }
-            LayoutNode::Padding { edges, child } => {
-                child.first_baseline(env).map(|baseline| baseline + edges.top)
-            }
-            LayoutNode::Stack { children, .. } | LayoutNode::Flow { children, .. } => {
+            LayoutNode::Padding { edges, child } => child
+                .first_baseline(env)
+                .map(|baseline| baseline + edges.top),
+            LayoutNode::Stack { children, .. } => children
+                .iter()
+                .find(|child| child.placed_at().is_none())
+                .and_then(|child| child.first_baseline(env)),
+            LayoutNode::Flow { children, .. } => {
                 children.first().and_then(|child| child.first_baseline(env))
             }
             LayoutNode::Boundary { children, .. } => {
                 children.first().and_then(|child| child.first_baseline(env))
             }
-            LayoutNode::Accessible { child, .. }
+            LayoutNode::Placed { child, .. }
+            | LayoutNode::Accessible { child, .. }
             | LayoutNode::Sited { child, .. }
             | LayoutNode::Measured { child, .. } => child.first_baseline(env),
             LayoutNode::BoundaryRef { slot, .. } => {
@@ -6111,33 +6171,46 @@ impl LayoutNode {
             }
 
             LayoutNode::Layered { children, .. } => {
-                let mut measured: Vec<(Size, Fit)> =
-                    children.iter().map(|child| child.measure(proposal, env)).collect();
-                let mut size = measured.iter().fold(Size::default(), |acc, (size, _)| Size {
-                    width: acc.width.max(size.width),
-                    height: acc.height.max(size.height),
-                });
+                let mut measured: Vec<(Size, Fit)> = children
+                    .iter()
+                    .map(|child| child.measure(position_proposal(proposal, child.placed_at()), env))
+                    .collect();
+                let mut size = children.iter().zip(&measured).fold(
+                    Size::default(),
+                    |acc, (child, (size, _))| {
+                        let at = child.placed_at().unwrap_or(Point::ZERO);
+                        Size {
+                            width: acc.width.max(at.x + size.width),
+                            height: acc.height.max(at.y + size.height),
+                        }
+                    },
+                );
                 // The stack's last pass, on both axes at once: a layer too
                 // big to shrink decides the box, and a layer that CAN take
                 // that box was measured against a smaller one. Centring it
                 // there would walk a full-bleed wash off the corner it was
                 // painted for. Asked again, once.
                 for (index, child) in children.iter().enumerate() {
+                    let at = child.placed_at().unwrap_or(Point::ZERO);
+                    let room = Size {
+                        width: (size.width - at.x).max(0.0),
+                        height: (size.height - at.y).max(0.0),
+                    };
                     let (answered, _) = &measured[index];
-                    let wider = size.width - answered.width > SETTLED
+                    let wider = room.width - answered.width > SETTLED
                         && child.is_flexible(Axis::Horizontal, None);
-                    let taller = size.height - answered.height > SETTLED
+                    let taller = room.height - answered.height > SETTLED
                         && child.is_flexible(Axis::Vertical, None);
                     if !wider && !taller {
                         continue;
                     }
                     let asked = Proposal {
-                        width: Some(if wider { size.width } else { answered.width }),
-                        height: Some(if taller { size.height } else { answered.height }),
+                        width: Some(if wider { room.width } else { answered.width }),
+                        height: Some(if taller { room.height } else { answered.height }),
                     };
                     measured[index] = child.measure(asked, env);
-                    size.width = size.width.max(measured[index].0.width);
-                    size.height = size.height.max(measured[index].0.height);
+                    size.width = size.width.max(at.x + measured[index].0.width);
+                    size.height = size.height.max(at.y + measured[index].0.height);
                 }
                 (size, Fit::Children(measured))
             }
@@ -6346,9 +6419,9 @@ impl LayoutNode {
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
-            LayoutNode::Accessible { child, .. } | LayoutNode::Sited { child, .. } => {
-                child.measure(proposal, env)
-            }
+            LayoutNode::Placed { child, .. }
+            | LayoutNode::Accessible { child, .. }
+            | LayoutNode::Sited { child, .. } => child.measure(proposal, env),
 
             LayoutNode::Measured { child, .. } => {
                 let (size, fit) = child.measure(proposal, env);
@@ -6423,6 +6496,7 @@ impl LayoutNode {
     /// The node itself, its own action aside.
     fn place_node(&self, frame: Rect, fit: &Fit, env: &LayoutEnv<'_>, out: &mut Placement) {
         match (self, fit.unshared()) {
+            (LayoutNode::Placed { child, .. }, _) => child.place(frame, fit, env, out),
             (LayoutNode::Accessible { semantics, child }, _) => {
                 let start = out.accessibility.len();
                 child.place(frame, fit, env, out);
@@ -7704,12 +7778,26 @@ impl LayoutNode {
                     }
                     // the alignment edge is horizontal — a 2pt accent bar
                     // hugs the leading side and still centers vertically
-                    let origin = Point {
-                        x: align_x(frame, size.width, *align, env.rtl()),
-                        y: frame.origin.y
-                            + align_offset(frame.size.height, size.height, CrossAlign::Center),
-                    };
-                    child.place(Rect { origin, size: *size }, fit, env, out);
+                    let origin = child.placed_at().map_or_else(
+                        || Point {
+                            x: align_x(frame, size.width, *align, env.rtl()),
+                            y: frame.origin.y
+                                + align_offset(frame.size.height, size.height, CrossAlign::Center),
+                        },
+                        |at| Point {
+                            x: frame.origin.x + at.x,
+                            y: frame.origin.y + at.y,
+                        },
+                    );
+                    child.place(
+                        Rect {
+                            origin,
+                            size: *size,
+                        },
+                        fit,
+                        env,
+                        out,
+                    );
                 }
             }
 
@@ -8492,6 +8580,16 @@ fn measure_split(
 /// child back to be measured a second time.
 const SETTLED: Px = 0.5;
 
+fn position_proposal(proposal: Proposal, at: Option<Point>) -> Proposal {
+    match at {
+        Some(at) => Proposal {
+            width: proposal.width.map(|width| (width - at.x).max(0.0)),
+            height: proposal.height.map(|height| (height - at.y).max(0.0)),
+        },
+        None => proposal,
+    }
+}
+
 /// The stack algorithm: measures everyone ONCE with no restriction on the
 /// main axis (naturals + who is flexible), splits the leftover among the
 /// flexibles and re-measures only those. Shrinking never happens behind
@@ -8539,14 +8637,28 @@ fn measure_stack(
     // phase 1: naturals (unrestricted proposal on the main axis)
     let mut measured: Vec<(Size, Fit)> = children
         .iter()
-        .map(|child| child.measure(cross_proposal(None), env))
+        .map(|child| {
+            child.measure(
+                if child.placed_at().is_some() {
+                    position_proposal(proposal, child.placed_at())
+                } else {
+                    cross_proposal(None)
+                },
+                env,
+            )
+        })
         .collect();
 
-    let spacing_total = spacing * children.len().saturating_sub(1) as Px;
+    let spacing_total = spacing
+        * children
+            .iter()
+            .filter(|child| child.placed_at().is_none())
+            .count()
+            .saturating_sub(1) as Px;
     let flexible: Vec<usize> = children
         .iter()
         .enumerate()
-        .filter(|(_, child)| child.is_flexible(axis, Some(axis)))
+        .filter(|(_, child)| child.placed_at().is_none() && child.is_flexible(axis, Some(axis)))
         .map(|(index, _)| index)
         .collect();
 
@@ -8559,7 +8671,9 @@ fn measure_stack(
         let rigid: Px = measured
             .iter()
             .enumerate()
-            .filter(|(index, _)| !flexible.contains(index))
+            .filter(|(index, _)| {
+                children[*index].placed_at().is_none() && !flexible.contains(index)
+            })
             .map(|(_, (size, _))| main(size))
             .sum();
         let mut budget = (total - rigid - spacing_total).max(0.0);
@@ -8686,10 +8800,13 @@ fn measure_stack(
     };
     let mut cross_max: Px = measured
         .iter()
-        .map(|(size, _)| cross(size))
+        .zip(children)
+        .filter(|(_, child)| child.placed_at().is_none())
+        .map(|((size, _), _)| cross(size))
         .fold(0.0, Px::max);
     for (index, child) in children.iter().enumerate() {
-        if cross(&measured[index].0) >= cross_max - SETTLED
+        if child.placed_at().is_some()
+            || cross(&measured[index].0) >= cross_max - SETTLED
             || !child.is_flexible(cross_axis, Some(axis))
         {
             continue;
@@ -8706,7 +8823,13 @@ fn measure_stack(
         cross_max = cross_max.max(cross(&measured[index].0));
     }
 
-    let main_sum: Px = measured.iter().map(|(size, _)| main(size)).sum::<Px>() + spacing_total;
+    let main_sum: Px = measured
+        .iter()
+        .zip(children)
+        .filter(|(_, child)| child.placed_at().is_none())
+        .map(|((size, _), _)| main(size))
+        .sum::<Px>()
+        + spacing_total;
 
     let size = match axis {
         Axis::Vertical => Size { width: cross_max, height: main_sum },
@@ -9342,7 +9465,11 @@ fn place_stack(
                 .iter()
                 .zip(fits)
                 .map(|(child, (size, _))| {
-                    child.first_baseline(env).unwrap_or(size.height)
+                    if child.placed_at().is_some() {
+                        0.0
+                    } else {
+                        child.first_baseline(env).unwrap_or(size.height)
+                    }
                 })
                 .collect()
         });
@@ -9350,6 +9477,9 @@ fn place_stack(
         .as_ref()
         .map(|baselines| baselines.iter().fold(0.0_f64, |acc, b| acc.max(*b)));
     for (index, (child, (size, fit))) in children.iter().zip(fits).enumerate() {
+        if child.placed_at().is_some() {
+            continue;
+        }
         let cross_offset = |extent: Px, len: Px| match align {
             CrossAlign::Baseline => match (&baselines, shared) {
                 (Some(baselines), Some(shared)) => shared - baselines[index],
@@ -9393,6 +9523,22 @@ fn place_stack(
             Axis::Horizontal => size.width,
         } + spacing;
         if rtl { cursor -= step } else { cursor += step }
+    }
+    for (child, (size, fit)) in children.iter().zip(fits) {
+        if let Some(at) = child.placed_at() {
+            child.place(
+                Rect {
+                    origin: Point {
+                        x: frame.origin.x + at.x,
+                        y: frame.origin.y + at.y,
+                    },
+                    size: *size,
+                },
+                fit,
+                env,
+                out,
+            );
+        }
     }
 }
 

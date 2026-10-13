@@ -1,5 +1,12 @@
 //! The built-in views, written the Rust way — generic end to end.
 //!
+//! Stack child placement parity:
+//!
+//! | Parameter | Native | DOM / served HTML |
+//! | --- | --- | --- |
+//! | `.position(x, y)` | Physical point, out of row/column flow; contributes to layer extent | Absolute in row/column, margins in layers; see `docs/freeform.md` |
+
+//!
 //! | Swift                            | bunny_ui                          |
 //! |----------------------------------|-----------------------------------|
 //! | `Text("x")`                      | [`text("x")`]                     |
