@@ -48,6 +48,8 @@ pub enum Modifier {
     HugHeight,
     /// The outer box sits at this point in its enclosing stack.
     Position(crate::layout::Point),
+    /// Number of grid columns and rows occupied by the outer box.
+    Span(usize, usize),
     NavigationTitle(String),
     NavigationBarTitle(String),
     ListStyle(ListStyle),
@@ -264,6 +266,7 @@ impl Modifier {
             Modifier::FrameFlex { .. } => "frame_flex",
             Modifier::HugHeight => "hug_height",
             Modifier::Position(_) => "position",
+            Modifier::Span(_, _) => "span",
             Modifier::NavigationTitle { .. } => "navigation_title",
             Modifier::NavigationBarTitle { .. } => "navigation_bar_title",
             Modifier::ListStyle { .. } => "list_style",
@@ -377,6 +380,7 @@ impl Modifier {
                 " [.frame(flex, minWidth: {min_width}, minHeight: {min_height}, alignment: {alignment})]"
             ),
             Modifier::HugHeight => " [.hugHeight]".into(),
+            Modifier::Span(columns, rows) => format!(" [.span({columns}, {rows})]"),
             Modifier::Position(at) => format!(" [.position({}, {})]", at.x, at.y),
             Modifier::NavigationTitle(title) => format!(" [.navigationTitle({title:?})]"),
             Modifier::NavigationBarTitle(title) => format!(" [.navigationBarTitle({title:?})]"),
@@ -535,6 +539,15 @@ fn rewrite_scroll_node(
     ) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        LayoutNode::Spanned {
+            columns,
+            rows,
+            child,
+        } => LayoutNode::Spanned {
+            columns,
+            rows,
+            child: Box::new(rewrite_scroll_node(*child, rewrite)),
+        },
         LayoutNode::Placed { at, child } => LayoutNode::Placed {
             at,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
@@ -637,6 +650,15 @@ fn rewrite_field_node(
     rewrite: &impl Fn(FieldParts) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        LayoutNode::Spanned {
+            columns,
+            rows,
+            child,
+        } => LayoutNode::Spanned {
+            columns,
+            rows,
+            child: Box::new(rewrite_field_node(*child, rewrite)),
+        },
         LayoutNode::Placed { at, child } => LayoutNode::Placed {
             at,
             child: Box::new(rewrite_field_node(*child, rewrite)),
@@ -734,6 +756,15 @@ fn rewrite_pixel_node(
     icon: &impl Fn(crate::icon::Symbol, bool, bool) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        LayoutNode::Spanned {
+            columns,
+            rows,
+            child,
+        } => LayoutNode::Spanned {
+            columns,
+            rows,
+            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
+        },
         LayoutNode::Placed { at, child } => LayoutNode::Placed {
             at,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
@@ -808,6 +839,15 @@ fn rewrite_text_node(
     ) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        LayoutNode::Spanned {
+            columns,
+            rows,
+            child,
+        } => LayoutNode::Spanned {
+            columns,
+            rows,
+            child: Box::new(rewrite_text_node(*child, rewrite)),
+        },
         LayoutNode::Placed { at, child } => LayoutNode::Placed {
             at,
             child: Box::new(rewrite_text_node(*child, rewrite)),
@@ -1495,6 +1535,13 @@ pub(crate) fn apply(
                 min_width,
                 min_height,
                 align,
+                child: Box::new(node),
+            });
+        }
+        Modifier::Span(columns, rows) => {
+            out.wrap_layout_from(mark, |node| LayoutNode::Spanned {
+                columns: *columns,
+                rows: *rows,
                 child: Box::new(node),
             });
         }

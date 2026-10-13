@@ -533,11 +533,16 @@ impl Tree {
                         }
                     }
                 }
-                if let Some((columns, rows)) = span {
+                if let Some(span) = span {
+                    if span.fill_x {
+                        element.style.insert("justify-self", "stretch".into());
+                    }
                     element
                         .style
-                        .insert("grid-column", format!("span {columns}"));
-                    element.style.insert("grid-row", format!("span {rows}"));
+                        .insert("grid-column", format!("span {}", span.columns));
+                    element
+                        .style
+                        .insert("grid-row", format!("span {}", span.rows));
                 }
             }
             DomPatch::SetMarks { id, tooltip, group_owner } => {
@@ -794,7 +799,7 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
                 ("min-height", "0"),
             ],
         ),
-        CreateKind::Layers => (
+        CreateKind::Layers | CreateKind::Grid => (
             "div",
             &[
                 ("display", "grid"),
@@ -892,11 +897,30 @@ fn rule_text(
         base.insert("isolation", "isolate".into());
     }
     if let Some(gap) = layout.gap {
-        base.insert("gap", px(gap));
+        base.insert(
+            if matches!(kind, CreateKind::Grid) {
+                "column-gap"
+            } else {
+                "gap"
+            },
+            px(gap),
+        );
+    }
+    if let Some(columns) = layout.columns {
+        base.insert(
+            "grid-template-columns",
+            format!("repeat({columns},minmax(0,1fr))"),
+        );
+        base.insert("align-items", "center".into());
+        base.insert("align-content", "start".into());
     }
     if let Some(align) = layout.align {
         base.insert(
-            "align-items",
+            if matches!(kind, CreateKind::Grid) {
+                "justify-items"
+            } else {
+                "align-items"
+            },
             match align {
                 1 => "center",
                 2 => "flex-end",
@@ -943,7 +967,9 @@ fn rule_text(
         base.insert("min-height", "0".into());
     }
     if let Some(line_gap) = layout.wrap {
-        base.insert("flex-wrap", "wrap".into());
+        if !matches!(kind, CreateKind::Grid) {
+            base.insert("flex-wrap", "wrap".into());
+        }
         base.insert("row-gap", px(line_gap));
     }
     let mut states: Vec<String> = Vec::new();

@@ -186,6 +186,19 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::PaddingEdge(edge, length))
     }
 
+    /// Occupies these grid tracks. Counts are clamped to 1..=65535;
+    /// the enclosing grid also clamps columns to its own width.
+    #[track_caller]
+    fn span(self, columns: usize, rows: usize) -> Modified<Self> {
+        Modified::new(
+            self,
+            Modifier::Span(
+                columns.clamp(1, u16::MAX as usize),
+                rows.clamp(1, u16::MAX as usize),
+            ),
+        )
+    }
+
     /// Places this view's outer box at a physical point in its enclosing stack.
     /// A row or column excludes it from flow; layers include its extent.
     /// Outside a stack this annotation is transparent. It never clips.

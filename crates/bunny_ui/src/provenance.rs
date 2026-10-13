@@ -192,6 +192,8 @@ pub enum NodeKind {
     VirtualList,
     /// A modifier applied by a `ViewExt` method — `modifier` names it.
     Modifier,
+    /// `grid(...)` / `grid!`.
+    Grid,
 }
 
 impl NodeKind {
@@ -205,6 +207,7 @@ impl NodeKind {
             Self::VStack => "vstack",
             Self::HStack => "hstack",
             Self::ZStack => "zstack",
+            Self::Grid => "grid",
             Self::Spacer => "spacer",
             Self::Rectangle => "rectangle",
             Self::Image => "image",

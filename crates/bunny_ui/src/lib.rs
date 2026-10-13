@@ -143,6 +143,12 @@ macro_rules! zstack {
     };
 }
 
+/// `grid!(a, b, c)` — equal columns, optional per-child spans.
+#[macro_export]
+macro_rules! grid {
+    ($($child:expr),* $(,)?) => { $crate::views::grid(($($child,)*)) };
+}
+
 /// What `#[preview]` expands to where the core stands alone — a crate
 /// that consumes `bunny-ui-core` under the `bunny_ui` name, with no
 /// facade to mint a symbol: the entry is nothing, and the function is
@@ -169,6 +175,8 @@ pub mod task {
 }
 
 pub mod prelude {
+    pub use crate::{grid, hstack, text, vstack, zstack};
+    pub use crate::ext::ViewExt;
     pub use crate::action::{ActionId, Key, KeyPattern};
     pub use crate::anim::{FramePace, Loop, Spring, Ticked};
     // the app's strings: `catalog::Table` and `catalog::Key` stay
@@ -186,8 +194,6 @@ pub mod prelude {
         ColorScheme, EditorCommand, HostSpec, MediaHandle, NetworkPolicy, VideoView, WebviewHandle,
         video, webview, webview_html,
     };
-    pub use crate::{hstack, text, vstack, zstack};
-    pub use crate::ext::ViewExt;
     pub use crate::icon::house as symbol;
     pub use crate::icon::{ICON_GRID, Ink, Paint, Rule, Symbol, Verb};
     pub use crate::image_engine::{
