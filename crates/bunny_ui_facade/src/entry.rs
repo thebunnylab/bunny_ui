@@ -83,6 +83,7 @@ macro_rules! app {
         /// activity's content on Android. The web starts from the
         /// page's `start` export instead, and this returns at once.
         pub fn run() {
+            $crate::__bunny_app_preview_entry!($root, $config);
             $crate::__private::run($crate::__bunny_identity!(), $config, $root, $crate::__bunny_preview_config!())
         }
         $crate::__bunny_entry!(run, $root, $config);
@@ -205,6 +206,50 @@ macro_rules! __bunny_hot_entry {
     ($root:expr) => {};
 }
 
+/// The real app root, with its configured window size, exported beside the
+/// marked previews. Feature selection happens in the facade, not the app.
+#[cfg(all(feature = "preview", not(target_arch = "wasm32")))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bunny_app_preview_entry {
+    ($root:expr, $config:expr) => {
+        {
+            fn make() -> $crate::__private::hot::preview::Output {
+                $crate::__private::app_output(($root)(), $config)
+            }
+            static ENTRY: $crate::__private::hot::preview::PreviewEntry =
+                $crate::__private::hot::preview::PreviewEntry::new(
+                    $crate::__private::hot::preview::Meta {
+                        ident: $crate::__private::hot::preview::APP_IDENT,
+                        name: "App",
+                        scope: "App",
+                        example: ::core::env!("CARGO_PKG_NAME"),
+                        module: ::core::module_path!(),
+                        file: ::core::file!(),
+                        line: ::core::line!(),
+                    },
+                    make,
+                );
+            #[allow(non_snake_case, reason = "the reserved symbol is the preview ABI")]
+            #[unsafe(no_mangle)]
+            pub fn bunny_preview__app() -> &'static $crate::__private::hot::preview::PreviewEntry {
+                &ENTRY
+            }
+            // Keep this symbol when the app is an rlib and main calls only run().
+            // An unreferenced export in another codegen unit can be dead-stripped.
+            let _ = ::core::hint::black_box(bunny_preview__app as fn() -> &'static $crate::__private::hot::preview::PreviewEntry);
+        }
+    };
+}
+
+/// Other builds export no whole-app preview.
+#[cfg(not(all(feature = "preview", not(target_arch = "wasm32"))))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bunny_app_preview_entry {
+    ($root:expr, $config:expr) => {};
+}
+
 /// A preview build (`bunny preview`, Studio): what `#[preview]` writes
 /// after each marked function — the symbol `$symbol` that answers the
 /// preview's entry, in the Rust ABI, like a generation's. `$name`,
@@ -266,6 +311,11 @@ macro_rules! __bunny_preview_entry {
 /// ```
 #[macro_export]
 macro_rules! declare_preview {
+    (app, $($rest:tt)*) => {
+        ::core::compile_error!(
+            "`app` is the App scene's ident, exported by `app!`; rename the preview"
+        );
+    };
     ($ident:ident, $symbol:ident, $name:expr, $scope:expr, $example:expr $(,)?) => {
         $crate::__bunny_preview_entry!($ident, $symbol, $name, $scope, $example);
     };
@@ -301,6 +351,12 @@ pub mod __private {
     use super::AppConfig;
     use bunny_ui_core::app::{Identity, set_identity};
     use bunny_ui_core::view::View;
+
+    /// Builds the app as a preview without opening its platform window.
+    #[cfg(all(feature = "preview", not(target_arch = "wasm32")))]
+    pub fn app_output(root: impl View, config: AppConfig) -> hot::preview::Output {
+        hot::preview::Output::of(bunny_ui_core::preview::Preview::new(root).size(config.size.width, config.size.height))
+    }
 
     /// The app's package and manifest directory, for the preview host.
     #[derive(Clone, Copy, Debug)]

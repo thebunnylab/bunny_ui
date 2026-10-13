@@ -70,6 +70,8 @@ impl fmt::Display for Site {
 /// Why an attribute was not a preview.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reason {
+    /// `app` belongs to the whole-app entry exported by `app!`.
+    Reserved,
     /// `#[preview]` on something that is not a free function.
     NotAFunction,
     /// On a function inside `impl` or `trait`.
@@ -90,6 +92,7 @@ impl Reason {
     /// The stable spelling the JSON carries.
     pub fn tag(&self) -> String {
         match self {
+            Reason::Reserved => String::from("reserved"),
             Reason::NotAFunction => String::from("not_a_function"),
             Reason::Associated => String::from("associated"),
             Reason::Parameters => String::from("parameters"),
@@ -104,6 +107,7 @@ impl Reason {
 impl fmt::Display for Reason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Reason::Reserved => f.write_str("is reserved for the App scene exported by `app!`; rename the preview"),
             Reason::NotAFunction => f.write_str("`#[preview]` must sit on a free function"),
             Reason::Associated => f.write_str("an associated function; a preview is a free function"),
             Reason::Parameters => f.write_str("takes parameters; a preview takes none"),
@@ -147,6 +151,8 @@ pub struct Duplicate {
 /// What a scan found and refused.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScanReport {
+    /// The first whole-app invocation, when this crate has one.
+    pub app: Option<Site>,
     /// The previews, in file then position order.
     pub previews: Vec<PreviewRef>,
     /// What was refused, in position order.
@@ -175,9 +181,19 @@ impl ScanReport {
                 }
             }
         }
+        if let Some(site) = other.app {
+            self.record_app(site);
+        }
         self.refused.extend(other.refused);
         self.duplicates.extend(other.duplicates);
         self.unreadable.extend(other.unreadable);
+    }
+
+    fn record_app(&mut self, site: Site) {
+        match &self.app {
+            Some(kept) => self.duplicates.push(Duplicate { ident: String::from(crate::wire::APP_IDENT), kept: kept.clone(), dropped: site }),
+            None => self.app = Some(site),
+        }
     }
 
     /// The report as JSON — the shape the fixtures are committed in, one
@@ -209,7 +225,16 @@ impl ScanReport {
         rows(&mut out, &self.unreadable, |out, (file, error)| {
             out.push_str(&format!("{{\"file\": {}, \"error\": {}}}", quote(file), quote(error)));
         });
-        out.push_str("]\n}\n");
+        out.push(']');
+        if let Some(site) = &self.app {
+            out.push_str(&format!(
+                ",\n  \"app\": {{\"file\": {}, \"line\": {}, \"column\": {}}}",
+                quote(&site.file),
+                site.line,
+                site.column
+            ));
+        }
+        out.push_str("\n}\n");
         out
     }
 }
@@ -515,18 +540,54 @@ pub fn scan_source(source: &str, file: &str) -> ScanReport {
                 let associated = blocks.last() == Some(&Block::Associated);
                 i = attribute(&tokens, i, file, associated, &mut report);
             }
+            Tok::Ident(word)
+                if word == "app"
+                    && blocks.is_empty()
+                    && tokens.get(i + 1).is_some_and(|t| t.tok == Tok::Punct('!')) =>
+            {
+                let start = path_start(&tokens, i);
+                if let Some(end) = macro_end(&tokens, i + 2) {
+                    report.record_app(Site { file: file.to_string(), line: tokens[start].line, column: tokens[start].column });
+                    i = end;
+                } else {
+                    i += 2;
+                }
+            }
             Tok::Ident(word) if word == "declare_preview" && tokens.get(i + 1).is_some_and(|t| t.tok == Tok::Punct('!')) => {
                 // `bunny_ui::declare_preview!` sites at the path's start
-                let mut start = i;
-                while start >= 2 && tokens[start - 1].tok == Tok::Punct(':') && tokens[start - 2].tok == Tok::Punct(':') {
-                    start = if start >= 3 && matches!(tokens[start - 3].tok, Tok::Ident(_)) { start - 3 } else { start - 2 };
-                }
+                let start = path_start(&tokens, i);
                 i = declared(&tokens, i, start, file, &mut report);
+            }
+            Tok::Ident(word) if tokens.get(i + 1).is_some_and(|t| t.tok == Tok::Punct('!')) => {
+                let open = i + if word == "macro_rules" { 3 } else { 2 };
+                i = macro_end(&tokens, open).unwrap_or(i + 2);
             }
             _ => i += 1,
         }
     }
     report
+}
+
+fn path_start(tokens: &[Token], mut at: usize) -> usize {
+    while at >= 2 && tokens[at - 1].tok == Tok::Punct(':') && tokens[at - 2].tok == Tok::Punct(':')
+    {
+        at = if at >= 3 && matches!(tokens[at - 3].tok, Tok::Ident(_)) {
+            at - 3
+        } else {
+            at - 2
+        };
+    }
+    at
+}
+
+fn macro_end(tokens: &[Token], open: usize) -> Option<usize> {
+    let (opener, closer) = match tokens.get(open)?.tok {
+        Tok::Punct('(') => ('(', ')'),
+        Tok::Punct('[') => ('[', ']'),
+        Tok::Punct('{') => ('{', '}'),
+        _ => return None,
+    };
+    Some(matching(tokens, open, opener, closer) + 1)
 }
 
 /// Reads an attribute at `at` (`#`), records what it means, and answers
@@ -606,6 +667,10 @@ fn attribute(tokens: &[Token], at: usize, file: &str, associated: bool, report: 
     let refuse = |reason: Reason, report: &mut ScanReport| {
         report.refused.push(Refusal { site: item_site.clone(), ident: Some(ident.clone()), reason });
     };
+    if ident == crate::wire::APP_IDENT {
+        refuse(Reason::Reserved, report);
+        return i + 2;
+    }
     if associated {
         refuse(Reason::Associated, report);
         return i + 2;
@@ -707,6 +772,9 @@ fn declared(tokens: &[Token], at: usize, start: usize, file: &str, report: &mut 
     let close = matching(tokens, open, '(', ')');
     let inner: Vec<&Tok> = tokens[open + 1..close].iter().map(|t| &t.tok).filter(|t| **t != Tok::Punct(',')).collect();
     match inner.as_slice() {
+        [Tok::Ident(ident), ..] if ident == crate::wire::APP_IDENT => {
+            report.refused.push(Refusal { site, ident: Some(ident.clone()), reason: Reason::Reserved });
+        }
         [Tok::Ident(ident), Tok::Ident(symbol_name), Tok::Str(name), Tok::Str(scope), Tok::Str(example)] => {
             report.previews.push(PreviewRef {
                 ident: ident.clone(),

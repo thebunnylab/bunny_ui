@@ -217,7 +217,7 @@ fn manifest_dir() -> PathBuf {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
         dir.join("src/lib.rs"),
-        "use bunny_ui::prelude::*;\n\n#[preview(name = \"Card\", scope = \"Cards\")]\nfn card() -> impl View { text(\"\") }\n\n#[preview(name = \"Boom\", scope = \"Cards\")]\nfn boom() -> impl View { text(\"\") }\n\n#[preview]\nfn ghost() -> impl View { text(\"\") }\n\n#[preview(name = \"Zoomer\", scope = \"Gestures\")]\nfn zoomer() -> impl View { text(\"\") }\n\n#[preview(name = \"Tapper\", scope = \"Gestures\")]\nfn tapper() -> impl View { text(\"\") }\n\n#[preview(name = \"Page\", scope = \"Hosts\")]\nfn page() -> impl View { text(\"\") }\n\n#[preview]\nfn placed() -> impl View { text(\"\") }\n\n#[preview]\nfn grid_card() -> impl View { text(\"\") }\n",
+        "use bunny_ui::prelude::*;\n\n#[preview(name = \"Card\", scope = \"Cards\")]\nfn card() -> impl View { text(\"\") }\n\n#[preview(name = \"Boom\", scope = \"Cards\")]\nfn boom() -> impl View { text(\"\") }\n\n#[preview]\nfn ghost() -> impl View { text(\"\") }\n\n#[preview(name = \"Zoomer\", scope = \"Gestures\")]\nfn zoomer() -> impl View { text(\"\") }\n\n#[preview(name = \"Tapper\", scope = \"Gestures\")]\nfn tapper() -> impl View { text(\"\") }\n\n#[preview(name = \"Page\", scope = \"Hosts\")]\nfn page() -> impl View { text(\"\") }\n\n#[preview]\nfn placed() -> impl View { text(\"\") }\n\n#[preview]\nfn grid_card() -> impl View { text(\"\") }\n\nbunny_ui::app!(root);\n",
     )
     .unwrap();
     dir
@@ -273,6 +273,7 @@ fn hello_lists_what_the_binary_exports_and_names_what_it_does_not() {
             assert_eq!(
                 idents,
                 [
+                    "app",
                     "card",
                     "boom",
                     "zoomer",
@@ -282,9 +283,9 @@ fn hello_lists_what_the_binary_exports_and_names_what_it_does_not() {
                     "grid_card"
                 ]
             );
-            assert_eq!(previews[0].id, "src/lib.rs#card");
-            assert_eq!(previews[0].scope, "Cards");
-            assert_eq!(previews[0].traits, Traits::default());
+            assert_eq!(previews[1].id, "src/lib.rs#card");
+            assert_eq!(previews[1].scope, "Cards");
+            assert_eq!(previews[1].traits, Traits::default());
             assert_eq!(missing, &["ghost"]);
         }
         other => panic!("{other:?}"),
@@ -733,4 +734,90 @@ fn a_span_place_regrows_the_grid() {
     let after = frames(&seen).remove(0);
     assert_eq!(before.size.height, 36.0);
     assert_eq!(after.size.height, 56.0);
+}
+
+thread_local! {
+    static APP_PANICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn make_app() -> Output {
+    assert!(!APP_PANICS.get(), "app root construction failed");
+    let mut output = make_tapper();
+    output.traits.size = bunny_ui::preview::Sizing::Fixed(bunny_ui::layout::Size { width: 420.0, height: 640.0 });
+    output
+}
+
+static APP: PreviewEntry = PreviewEntry::new(
+    Meta { ident: "app", name: "App", scope: "App", example: "host", module: "host", file: "src/lib.rs", line: 28 }, make_app,
+);
+#[unsafe(export_name = "bunny_preview__app")]
+pub fn app_entry() -> &'static PreviewEntry {
+    &APP
+}
+
+#[test]
+fn hello_lists_the_app_first_with_its_scope() {
+    assert_eq!(wire::APP_IDENT, bunny_ui_hot::preview::APP_IDENT);
+    let (mut host, seen) = host();
+    host.hello();
+    let messages = seen.borrow();
+    let ToIde::Ready { previews, .. } = &messages[1] else {
+        panic!("no Ready")
+    };
+    let app = &previews[0];
+    assert_eq!(
+        (
+            app.id.as_str(),
+            app.ident.as_str(),
+            app.name.as_str(),
+            app.scope.as_str(),
+            app.example.as_str()
+        ),
+        ("src/lib.rs#app", "app", "App", "App", "host")
+    );
+    assert_eq!(
+        app.traits.size,
+        wire::Sizing::Fixed(wire::Size {
+            width: 420.0,
+            height: 640.0
+        })
+    );
+}
+
+#[test]
+fn the_app_scene_renders_with_real_state() {
+    let (mut host, seen) = host();
+    host.handle(select("app", fixed(420.0, 640.0)));
+    assert!(host.tick());
+    let frame = frames(&seen).remove(0);
+    assert!(says(&frame, "taps 0"));
+    assert_eq!(frame.size, wire::Size { width: 420.0, height: 640.0 });
+    let button = frame.sites.iter().find(|site| frame.strings[site.kind as usize] == "button").unwrap();
+    let (x, y) = (button.frame.origin.x + button.frame.size.width / 2.0, button.frame.origin.y + button.frame.size.height / 2.0);
+    for kind in [wire::PointerKind::Down, wire::PointerKind::Up] {
+        host.handle(ToHost::Pointer { id: String::from("src/lib.rs#app"), kind, x, y, modifiers: 0 });
+    }
+    assert!(host.tick());
+    assert!(says(&frames(&seen).remove(0), "taps 1"));
+    host.ready();
+    host.handle(ToHost::Resize { id: String::from("src/lib.rs#app"), size: wire::Size { width: 500.0, height: 700.0 } });
+    assert!(host.tick());
+    assert!(
+        says(&frames(&seen).remove(0), "taps 1"),
+        "discovery and resizing preserve state"
+    );
+}
+
+#[test]
+fn an_app_root_panic_during_discovery_is_reported_without_killing_the_host() {
+    let (mut host, seen) = host();
+    APP_PANICS.set(true);
+    host.hello();
+    APP_PANICS.set(false);
+    assert!(seen.borrow().iter().any(|message| matches!(message, ToIde::Panicked { preview, message } if preview == "app" && message.contains("app root construction failed"))));
+    assert!(seen.borrow().iter().any(
+        |message| matches!(message, ToIde::Ready { previews, .. } if previews[0].ident == "app")
+    ));
+    host.handle(select("app", fixed(420.0, 640.0)));
+    assert!(host.tick(), "repaired app can be selected");
 }

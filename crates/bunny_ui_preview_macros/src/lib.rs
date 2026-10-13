@@ -230,6 +230,9 @@ mod scan {
         let Some(Tok::Ident(ident)) = tokens.get(at + 1) else {
             return Err(String::from("`#[preview]` must sit on a free function"));
         };
+        if ident.trim_start_matches("r#") == "app" {
+            return Err(String::from("`app` is the App scene's ident, exported by `app!`; rename the preview"));
+        }
         at += 2;
         if tokens.get(at) == Some(&Tok::Punct('<')) {
             return Err(format!("`#[preview]`: `{ident}` takes type parameters; a preview takes none"));
@@ -326,6 +329,16 @@ mod scan {
                 invocation(&args, "button_primary"),
                 "::ui::__bunny_preview_entry!(button_primary, bunny_preview__button_primary, \"Button\", \"Input\", \"Primary\");"
             );
+        }
+
+        #[test]
+        fn app_is_reserved_even_as_a_raw_identifier() {
+            for name in ["app", "r#app"] {
+                assert_eq!(
+                    signature(&plain_fn(name)).unwrap_err(),
+                    "`app` is the App scene's ident, exported by `app!`; rename the preview"
+                );
+            }
         }
 
         #[test]

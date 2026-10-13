@@ -111,6 +111,18 @@ jobs:
             cargo run -p bunny-ui --locked --features preview --example preview --target aarch64-apple-darwin \
             | tee preview-check.log
           grep -c '^@@bunny-preview card_' preview-check.log | grep -qx 3
+          # A new app exports its real root, without adding a marked preview.
+          app_dir="$RUNNER_TEMP/studio_app_preview"
+          cargo run -p bunny-cli --locked -- new "$app_dir" --org io.bunny --bunny-ui-path "$PWD/crates/bunny_ui_facade"
+          BUNNY_PREVIEW_CHECK=app CARGO_TARGET_DIR="$PWD/target" \
+            cargo run --manifest-path "$app_dir/Cargo.toml" --features bunny-ui/preview --target aarch64-apple-darwin \
+            | tee app-preview-check.log
+          grep '^@@bunny-preview app commands=' app-preview-check.log
+          if BUNNY_PREVIEW_CHECK=missing "$PWD/target/aarch64-apple-darwin/debug/studio_app_preview" > missing-preview-check.log; then
+            cat missing-preview-check.log
+            exit 1
+          fi
+          grep '^@@bunny-preview missing failed ' missing-preview-check.log
           cargo test -p bunny-ui-preview-macros --locked --all-targets
           # the preview wire, the reference scan and the conversions to the core's types
           cargo test -p bunny-ui-preview --locked --all-targets

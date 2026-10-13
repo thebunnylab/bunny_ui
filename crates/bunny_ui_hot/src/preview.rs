@@ -29,6 +29,9 @@ use super::{Root, anchor};
 /// shape and reads none of it but this number.
 pub const PREVIEW_ABI: u32 = 1;
 
+/// The reserved whole-app entry exported by the facade's `app!`.
+pub const APP_IDENT: &str = "app";
+
 /// What every preview's symbol starts with; the function's name follows.
 pub const SYMBOL_PREFIX: &str = "bunny_preview__";
 

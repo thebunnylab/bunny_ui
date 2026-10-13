@@ -357,24 +357,38 @@ impl Host {
         let report = scan::scan_dir(&self.config.manifest_dir.join("src"));
         let mut previews = Vec::new();
         let mut missing = Vec::new();
-        for found in &report.previews {
-            let file = format!("src/{}", found.file);
-            match preview_entry(&found.ident) {
+        let found = report.app.iter().map(|site| (wire::APP_IDENT, site.file.as_str(), site.line))
+            .chain(report.previews.iter().map(|preview| (preview.ident.as_str(), preview.file.as_str(), preview.line)));
+        for (ident, file, line) in found {
+            let file = format!("src/{file}");
+            match preview_entry(ident) {
                 Ok(entry) => {
-                    let output = (entry.make)();
+                    IN_PASS.with(|flag| flag.set(true));
+                    let traits = std::panic::catch_unwind(AssertUnwindSafe(|| convert::traits(&(entry.make)().traits)));
+                    IN_PASS.with(|flag| flag.set(false));
+                    let traits = match traits {
+                        Ok(traits) => traits,
+                        Err(_) => {
+                            let message = PANIC_MESSAGE
+                                .with(|message| message.borrow_mut().take())
+                                .unwrap_or_else(|| String::from("a panic with no message"));
+                            (self.sink)(ToIde::Panicked { preview: ident.to_string(), message });
+                            wire::Traits::default()
+                        }
+                    };
                     previews.push(wire::PreviewInfo {
-                        id: format!("{file}#{}", found.ident),
-                        ident: found.ident.clone(),
+                        id: format!("{file}#{ident}"),
+                        ident: ident.to_string(),
                         name: entry.meta.name.to_string(),
                         scope: entry.meta.scope.to_string(),
                         example: entry.meta.example.to_string(),
                         module: entry.meta.module.to_string(),
                         file,
-                        line: found.line,
-                        traits: convert::traits(&output.traits),
+                        line,
+                        traits,
                     });
                 }
-                Err(_) => missing.push(found.ident.clone()),
+                Err(_) => missing.push(ident.to_string()),
             }
         }
         (self.sink)(ToIde::Ready { generation: self.generation, previews, missing });
@@ -883,6 +897,11 @@ fn check(idents: Vec<String>, engines: Engines, config: Config) -> ! {
     let mut host = Host::new(engines, config, Box::new(move |message| sink.borrow_mut().push(message)));
     let mut ok = true;
     for ident in idents {
+        if let Err(why) = preview_entry(&ident) {
+            println!("@@bunny-preview {ident} failed {why}");
+            ok = false;
+            continue;
+        }
         host.handle(ToHost::Select(vec![wire::Selection { id: ident.clone(), ident: ident.clone(), traits: wire::Traits::default() }]));
         let began = Instant::now();
         host.tick();
