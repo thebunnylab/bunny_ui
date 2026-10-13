@@ -86,6 +86,14 @@ fn start(lane: Preview<bunny_cli::preview::Idle>) -> Preview<bunny_cli::preview:
     let mut events = Vec::new();
     match lane.start(&mut events) {
         Step::Live(live) => {
+            assert!(
+                events.iter().any(
+                    |event| matches!(event, Event::Sources { generation: 1, sources: Some(sources) }
+                if sources.files().keys().any(|path| path.ends_with("src/main.rs"))
+                    && sources.files().keys().any(|path| path.ends_with("src/lib.rs")))
+                ),
+                "startup provenance: {events:?}"
+            );
             for event in &events {
                 match event {
                     Event::Note(note) => println!("note: {note}"),
@@ -241,6 +249,8 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
         ToIde::Frame(frame) if frame.preview == "app" && says(frame, "Tap again") => Some(frame.clone()),
         _ => None,
     });
+    assert!(events.iter().any(|event| matches!(event, Event::Sources { generation, sources: Some(sources) }
+        if *generation == frame.generation && sources.files().get(&fs::canonicalize(&lib).unwrap()).is_some_and(|source| source.contains("Tap again")))), "frame generation {}, path {:?}, receipts {:?}", frame.generation, lib, events.iter().filter_map(|event| match event { Event::Sources { generation, sources } => Some((*generation, sources.as_ref().map(|sources| sources.files().keys().filter(|path| path.ends_with("src/lib.rs")).cloned().collect::<Vec<_>>()))), _ => None }).collect::<Vec<_>>());
     timing("save", began.elapsed(), Some(Duration::from_millis(800)));
     assert!(says(&frame, "You tapped 1 times"), "the state survived the swap: {:?}", frame.strings);
     assert!(frame.generation >= 2);

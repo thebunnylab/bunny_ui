@@ -32,6 +32,7 @@
 //! dependency) restarts too — the framework is one shared library.
 
 pub mod classify;
+pub mod sources;
 pub mod watch;
 
 use std::cell::Cell;
@@ -53,6 +54,7 @@ use crate::process;
 use crate::project::Project;
 use crate::toolchains;
 use classify::Reach;
+use sources::{BuildInputs, BuildSources};
 use watch::Watch;
 
 /// How long the app may take to swap to a generation.
@@ -113,6 +115,8 @@ pub struct Hot {
     /// them.
     sources: BTreeMap<PathBuf, String>,
     watch: Watch,
+    initial_inputs: Option<BuildInputs>,
+    built_sources: Option<BuildSources>,
     /// What a lane that renders no terminal asks for.
     extra: Extra,
     /// What the road would have said on the terminal — hot reload off,
@@ -217,6 +221,8 @@ impl Hot {
             next: Cell::new(1),
             salt: 1,
             sources: BTreeMap::new(),
+            initial_inputs: None,
+            built_sources: None,
             watch: Watch::new_many(&roots),
             project: project.clone(),
             options: options.clone(),
@@ -321,6 +327,41 @@ impl Hot {
         &self.project
     }
 
+    /// Sources observed stable around the last successful build. None means
+    /// provenance is unavailable; callers must not substitute current disk text.
+    pub fn built_sources(&self) -> Option<&BuildSources> {
+        self.built_sources.as_ref()
+    }
+
+    fn capture_inputs(&mut self) -> Option<BuildInputs> {
+        match BuildInputs::capture(&self.roots()) {
+            Ok(inputs) => Some(inputs),
+            Err(error) => {
+                self.notes
+                    .push(format!("source provenance unavailable: {error}"));
+                None
+            }
+        }
+    }
+
+    fn finish_inputs(&mut self, inputs: Option<BuildInputs>) {
+        self.built_sources = inputs.and_then(|inputs| match inputs.finish() {
+            Ok(sources) => {
+                if sources.is_none() {
+                    self.notes.push(String::from(
+                        "source provenance unavailable: inputs changed during the build",
+                    ));
+                }
+                sources
+            }
+            Err(error) => {
+                self.notes
+                    .push(format!("source provenance unavailable: {error}"));
+                None
+            }
+        });
+    }
+
     /// Builds the app with its first generation, and starts it.
     pub fn start(&mut self) -> Result<Box<dyn Session>> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -330,6 +371,7 @@ impl Hot {
         // build is a change the next look finds
         self.watch = Watch::new_many(&self.roots());
         let sources = self.read_sources();
+        let inputs = self.capture_inputs();
         let mut features = vec![self.feature.clone()];
         features.extend(self.extra.features.iter().cloned());
         let feature = features.as_slice();
@@ -369,6 +411,11 @@ impl Hot {
             }
         };
         self.sources = sources;
+        self.initial_inputs = inputs.clone();
+        self.finish_inputs(inputs);
+        if self.built_sources.is_none() {
+            self.initial_inputs = None;
+        }
         let (session, note) = call_back(listener, app, bytes);
         if let Some(why) = note {
             self.notes.push(format!("hot reload is off: {why} — r restarts the app"));
@@ -390,6 +437,13 @@ impl Hot {
     pub fn reload(&mut self, app: &mut dyn Session) -> std::result::Result<Reloaded, Missed> {
         let began = Instant::now();
         let sources = self.read_sources();
+        let inputs = self.capture_inputs().filter(|now| {
+            self.initial_inputs.as_ref().is_some_and(|initial| {
+                now.unchanged_where(initial, |path| {
+                    matches!(self.change(&[path.to_path_buf()]), Change::Restart(_))
+                })
+            })
+        });
         // a sibling's type that moved has no salt to start over under
         if let Some(name) = self.sibling_types_moved(&sources) {
             return Err(Missed::Restart(format!("a type of {name} changed: a sibling's types keep their state only through a restart")));
@@ -408,6 +462,7 @@ impl Hot {
             Some(Ok(_)) => {
                 self.salt = salt;
                 self.sources = sources;
+                self.finish_inputs(inputs);
                 Ok(Reloaded { took: began.elapsed(), new_types })
             }
         }
@@ -638,6 +693,7 @@ fn call_back(listener: TcpListener, mut app: Box<dyn Session>, bytes: bool) -> (
 
 /// The running app, with a line to it.
 struct HotApp {
+    generation: Option<u32>,
     app: Box<dyn Session>,
     line: TcpStream,
     answers: Receiver<String>,
@@ -661,7 +717,13 @@ impl HotApp {
                 }
             }
         });
-        let mut hot = HotApp { app, line, answers, bytes };
+        let mut hot = HotApp {
+            app,
+            line,
+            answers,
+            bytes,
+            generation: None,
+        };
         match hot.answer(LOAD_TIMEOUT) {
             Ok(_) => Ok(hot),
             Err(why) => Err((hot.app, why)),
@@ -673,7 +735,11 @@ impl HotApp {
         let until = Instant::now() + timeout;
         loop {
             match self.answers.recv_timeout(Duration::from_millis(100)) {
-                Ok(answer) => return parse_answer(&answer),
+                Ok(answer) => {
+                    let loaded = parse_answer(&answer)?;
+                    self.generation = loaded.generation;
+                    return Ok(loaded.took);
+                }
                 Err(RecvTimeoutError::Disconnected) => return Err(String::from("the app stopped")),
                 Err(RecvTimeoutError::Timeout) => {
                     if self.app.wait(Duration::ZERO).is_some() {
@@ -699,20 +765,44 @@ impl HotApp {
     }
 }
 
+/// An acknowledgment carries the runtime's generation, never a guessed counter.
+#[derive(Debug, PartialEq, Eq)]
+struct Loaded {
+    generation: Option<u32>,
+    took: Duration,
+}
+
 /// `loaded <n> <ms>`, `ready`, or `failed <why>`.
-fn parse_answer(answer: &str) -> std::result::Result<Duration, String> {
+fn parse_answer(answer: &str) -> std::result::Result<Loaded, String> {
     match answer.split_once(' ').unwrap_or((answer, "")) {
         ("loaded", rest) => {
-            let millis = rest.split_whitespace().nth(1).and_then(|ms| ms.parse().ok()).unwrap_or(0);
-            Ok(Duration::from_millis(millis))
+            let mut fields = rest.split_whitespace();
+            let generation = fields.next().and_then(|n| n.parse().ok());
+            let millis = fields.next().and_then(|ms| ms.parse().ok());
+            match (generation, millis, fields.next()) {
+                (Some(generation), Some(millis), None) => Ok(Loaded {
+                    generation: Some(generation),
+                    took: Duration::from_millis(millis),
+                }),
+                _ => Err(format!(
+                    "the app sent an invalid load acknowledgment: {answer:?}"
+                )),
+            }
         }
-        ("ready", _) => Ok(Duration::ZERO),
+        ("ready", "") => Ok(Loaded {
+            generation: None,
+            took: Duration::ZERO,
+        }),
         ("failed", why) => Err(why.to_string()),
         _ => Err(format!("the app answered {answer:?}")),
     }
 }
 
 impl Session for HotApp {
+    fn generation(&self) -> Option<u32> {
+        self.generation
+    }
+
     fn wait(&mut self, timeout: Duration) -> Option<Option<i32>> {
         self.app.wait(timeout)
     }
@@ -763,8 +853,23 @@ mod tests {
 
     #[test]
     fn the_answers_of_the_app_are_read() {
-        assert_eq!(parse_answer("loaded 3 164"), Ok(Duration::from_millis(164)));
-        assert_eq!(parse_answer("ready"), Ok(Duration::ZERO));
+        assert_eq!(
+            parse_answer("loaded 3 164"),
+            Ok(Loaded {
+                generation: Some(3),
+                took: Duration::from_millis(164)
+            })
+        );
+        assert_eq!(
+            parse_answer("ready"),
+            Ok(Loaded {
+                generation: None,
+                took: Duration::ZERO
+            })
+        );
+        assert!(parse_answer("loaded x 164").is_err());
+        assert!(parse_answer("loaded 3").is_err());
+        assert!(parse_answer("loaded 3 x").is_err());
         assert_eq!(parse_answer("failed it has no entry"), Err(String::from("it has no entry")));
         assert!(parse_answer("hello").is_err());
     }

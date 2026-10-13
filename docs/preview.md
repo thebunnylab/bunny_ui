@@ -65,3 +65,27 @@ can be constructed again.
 The App export is retained when the app lives in a library and the binary only
 calls `run()`. `BUNNY_PREVIEW_CHECK` fails for an unresolved entry; rendering a
 diagnostic string is not a successful preview check.
+
+## Build-source provenance
+
+The in-process CLI lane emits `Event::Sources` after a successful build/load,
+with the generation number in the hot runtime's `loaded <n> <ms>` acknowledgment.
+This does not change any v1 wire payload. A tool must correlate frames by that
+acknowledged generation, not by the arrival time of `BuildStarted` or `Reloaded`.
+Queued frames may still belong to the previous generation.
+
+`BuildInputs` observes package Rust sources, including executable and nested
+component files, together with manifests/build scripts before and after the
+build. Changed metadata/content, added/removed files, unreadable inputs or source
+symlinks leave the proof unavailable. Reloads also require the startup text of
+inputs that only a restart can replace. `Sources { sources: None, .. }` means
+unknown provenance; the tool keeps the last-good picture but must not infer its
+source from whatever happens to be in the editor now. Build-generated files
+outside the captured roots are not attested. These observations assume ordinary
+filesystem modification tracking; they are not a hermetic compiler input record.
+
+An IDE should fingerprint the observed text once, attach the receipt to each
+received frame, and compare it to current documents before geometry-driven edits.
+Undo restoring the exact source can restore eligibility. A restart may reuse
+generation numbers, so retained pictures must keep their own receipts rather
+than borrowing the new process's proof.

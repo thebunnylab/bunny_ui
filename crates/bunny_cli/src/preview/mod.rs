@@ -60,6 +60,13 @@ pub enum Event {
     /// The previews the sources list, before any build.
     Previews(ScanReport),
     BuildStarted,
+    /// Stable build inputs tied to the generation acknowledged by the runtime.
+    /// None means the build inputs could not be verified; frames remain usable
+    /// for display but must not be joined to current editor source by geometry.
+    Sources {
+        generation: u32,
+        sources: Option<crate::hot::sources::BuildSources>,
+    },
     /// One thing the compiler said during a build that went on.
     Diagnostic(Diagnostic),
     /// The app and its first generation built, and the host started.
@@ -208,6 +215,12 @@ fn start(project: Project, options: Options, events: &mut Vec<Event>) -> Step {
     };
     let (sender, inbox) = mpsc::channel();
     std::thread::spawn(move || read_line(reading, &sender));
+    if let Some(generation) = app.generation() {
+        events.push(Event::Sources {
+            generation,
+            sources: hot.built_sources().cloned(),
+        });
+    }
     events.push(Event::Built { took: began.elapsed() });
     Step::Live(Preview { state: Live { hot: Box::new(hot), app, line, inbox, pid, project, options } })
 }
@@ -319,8 +332,21 @@ impl Preview<Live> {
     pub fn reload(&mut self, events: &mut Vec<Event>) {
         events.push(Event::BuildStarted);
         match self.state.hot.reload(self.state.app.as_mut()) {
-            Ok(done) => events.push(Event::Reloaded { took: done.took, new_types: done.new_types }),
-            Err(Missed::Build) => events.push(Event::BuildFailed { diagnostics: Vec::new() }),
+            Ok(done) => {
+                if let Some(generation) = self.state.app.generation() {
+                    events.push(Event::Sources {
+                        generation,
+                        sources: self.state.hot.built_sources().cloned(),
+                    });
+                }
+                events.push(Event::Reloaded {
+                    took: done.took,
+                    new_types: done.new_types,
+                });
+            }
+            Err(Missed::Build) => events.push(Event::BuildFailed {
+                diagnostics: Vec::new(),
+            }),
             Err(Missed::Restart(why)) => events.push(Event::RestartNeeded(why)),
             Err(Missed::Load(why)) => events.push(Event::Note(format!("the host did not take the new code: {why}"))),
         }
