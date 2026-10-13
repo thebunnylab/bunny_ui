@@ -41,7 +41,7 @@ use crate::text_input::{CaretState, EditCommand};
 /// What a click hands the app: the platform's own count for the press
 /// that armed it — 1, then 2 on the double, 3 on the triple. The
 /// framework holds no clock; it carries what the shell counted.
-pub(crate) type ClickAction = Rc<dyn Fn(u8)>;
+pub(crate) type ClickAction = Rc<dyn Fn(u8, crate::action::Modifiers)>;
 
 pub(crate) type ActionEntry = (Rc<str>, ClickAction);
 
@@ -1660,10 +1660,14 @@ pub fn has_action(path: &str) -> bool {
 /// `false` = target not registered (the identity died between frame and
 /// click — harmless).
 pub(crate) fn run_action(path: &str, clicks: u8) -> bool {
+    run_action_with_modifiers(path, clicks, crate::action::Modifiers::NONE)
+}
+
+pub(crate) fn run_action_with_modifiers(path: &str, clicks: u8, modifiers: crate::action::Modifiers) -> bool {
     let action = LIVE.with(|live| live.borrow().click(path));
     match action {
         Some(action) => {
-            action(clicks);
+            action(clicks, modifiers);
             true
         }
         None => false,

@@ -439,6 +439,7 @@ pub struct Runtime {
     /// time, so the number needs no key: it belongs to whatever
     /// `interaction.pressed` names, and the release takes it.
     pressed_clicks: Cell<u8>,
+    pressed_modifiers: Cell<crate::action::Modifiers>,
     /// Original word/line selected by a field press. Held motion extends
     /// from this entire unit, never from a partially swept caret.
     field_unit_anchor: Cell<Option<(usize, usize)>>,
@@ -1728,6 +1729,7 @@ impl Runtime {
             last_drop_rings: RefCell::new(Vec::new()),
             drag_armed: RefCell::new(None),
             pressed_clicks: Cell::new(1),
+            pressed_modifiers: Cell::new(crate::action::Modifiers::NONE),
             field_unit_anchor: Cell::new(None),
             touch: RefCell::new(crate::touch::Recognizer::new()),
             touch_modality: Cell::new(false),
@@ -2633,6 +2635,7 @@ impl Runtime {
         // risen press of a box, the thumb, the seam and the ordinary
         // tail all take their count from here, and the release takes it
         self.pressed_clicks.set(clicks);
+        self.pressed_modifiers.set(modifiers);
         self.field_unit_anchor.set(None);
         let target = self.hover_target(x, y);
         // a press inside the app's box hands it the pointer: nothing
@@ -2718,6 +2721,9 @@ impl Runtime {
         // including the ones that end a drag, a grab, a seam or a thumb
         // and fire no action at all, so the next gesture starts at one
         let clicks = self.pressed_clicks.replace(1);
+        let modifiers = self
+            .pressed_modifiers
+            .replace(crate::action::Modifiers::NONE);
         self.field_unit_anchor.set(None);
         // a live drag ends here: over a compatible target the value
         // lands (the drag clears FIRST — the action writes state into
@@ -2770,7 +2776,7 @@ impl Runtime {
                     .borrow()
                     .iter()
                     .any(|(path, rect)| *path == above && rect.contains(x, y));
-                if inside && self.activate_clicks(&above, clicks) {
+                if inside && reconciler::run_action_with_modifiers(&above, clicks, modifiers) {
                     return Some(above);
                 }
             }
@@ -2813,7 +2819,9 @@ impl Runtime {
             }
         };
         // outside the borrow: the action can write state and re-enter here
-        let activated = fired.as_deref().is_some_and(|path| self.activate_clicks(path, clicks));
+        let activated = fired
+            .as_deref()
+            .is_some_and(|path| reconciler::run_action_with_modifiers(path, clicks, modifiers));
         // the keyboard follows the click: to the view that answers a copy
         // for what was clicked (the row's table), and away from every
         // field otherwise — first responder follows the click. Chrome is
@@ -3103,6 +3111,7 @@ impl Runtime {
 
     fn pointer_cancelled_road(&self) -> bool {
         self.pressed_clicks.set(1);
+        self.pressed_modifiers.set(crate::action::Modifiers::NONE);
         self.field_unit_anchor.set(None);
         self.drag_armed.borrow_mut().take();
         let dragged = self.drag_value.borrow_mut().take().is_some();
@@ -5514,6 +5523,12 @@ impl Runtime {
     /// straight to the action door — no engine hit test, no geometry.
     pub fn dom_action(&self, path: &str, clicks: u8) -> bool {
         reconciler::run_action(path, clicks)
+    }
+
+    /// Browser-resolved click with the initiating event's modifier keys.
+    /// The existing `dom_action` remains the modifier-free compatibility door.
+    pub fn dom_action_with_modifiers(&self, path: &str, clicks: u8, modifiers: crate::action::Modifiers) -> bool {
+        reconciler::run_action_with_modifiers(path, clicks, modifiers)
     }
 
     /// The canvas islands whose CONTENT changed since the last call —

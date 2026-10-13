@@ -1320,7 +1320,7 @@ pub(crate) fn apply(
                 let is_presented = is_presented.clone();
                 crate::reconciler::attribute_action(
                     Rc::from(format!("{path}/#dismiss")),
-                    Rc::new(move |_| is_presented.set(false)),
+                    Rc::new(move |_, _| is_presented.set(false)),
                 );
             }
             // the sheet's own lowering — same centring, same capture —
@@ -1372,7 +1372,7 @@ pub(crate) fn apply(
                 };
                 crate::reconciler::attribute_action(Rc::from(format!("{path}/#dismiss")), {
                     let cancel = cancel.clone();
-                    Rc::new(move |_| cancel())
+                    Rc::new(move |_, _| cancel())
                 });
                 crate::reconciler::attribute_handler(
                     path.clone(),
@@ -1448,7 +1448,7 @@ pub(crate) fn apply(
                     // a dismiss has no count to hear: the same
                     // closure the keyboard's Escape handler holds
                     let close = close.clone();
-                    Rc::new(move |_| close())
+                    Rc::new(move |_, _| close())
                 });
                 crate::reconciler::attribute_handler(
                     path.clone(),

@@ -70,3 +70,16 @@ uses `scripts/generate-grapheme-tables.py` with those downloaded files and the
 build-time Python package `blake3==1.0.8`. The Unicode data license is retained
 beside the test corpus. Ordinary ASCII edits inspect local boundaries; regional
 indicator parity can require scanning the preceding indicator run.
+
+## Click modifiers without pointer capture
+
+`ViewExt::on_click_with_modifiers` receives `(click_count, Modifiers)` from the
+initiating press. It is the same retained click target as `on_click_count`: a
+cancelled press or lifted drag does not activate it, and `.on_drag` continues to
+use the normal drag lane. Releasing a modifier before the pointer does not change
+that press's meaning. Existing `on_click` and `on_click_count` callers keep their
+signatures. Programmatic activation carries `Modifiers::NONE`.
+
+Browser embeddings may forward their event modifiers through
+`Runtime::dom_action_with_modifiers`; the original `dom_action` remains the
+modifier-free compatibility entry point.
