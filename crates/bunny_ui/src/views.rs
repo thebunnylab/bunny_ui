@@ -4,6 +4,7 @@
 //!
 //! | Parameter | Native | DOM / served HTML |
 //! | --- | --- | --- |
+//! | `LazyVGrid(columns: n × .flexible())` | `grid!((…)).columns(n)` | Sparse equal-width CSS grid |
 //! | `.position(x, y)` | Physical point, out of row/column flow; contributes to layer extent | Absolute in row/column, margins in layers; see `docs/freeform.md` |
 
 //!
@@ -2104,6 +2105,92 @@ impl<C> ZStack<C> {
 #[track_caller]
 pub fn zstack<C: View>(children: C) -> ZStack<C> {
     ZStack {
+        alignment: Alignment::Center,
+        children,
+        site: crate::provenance::here(),
+    }
+}
+
+/// Equal-width columns with sparse row-major placement and optional child spans.
+#[derive(Clone)]
+pub struct Grid<C> {
+    columns: usize,
+    spacing: f64,
+    row_spacing: Option<f64>,
+    alignment: Alignment,
+    children: C,
+    site: crate::provenance::Site,
+}
+
+impl<C> Grid<C> {
+    /// Number of equal columns, clamped to 1..=65535. The default is two.
+    pub fn columns(mut self, columns: usize) -> Self {
+        self.columns = columns.clamp(1, u16::MAX as usize);
+        self
+    }
+    /// Horizontal gap and the default vertical gap, in points.
+    pub fn spacing(mut self, spacing: f64) -> Self {
+        self.spacing = spacing;
+        self
+    }
+    /// Vertical gap, overriding the shared spacing.
+    pub fn row_spacing(mut self, spacing: f64) -> Self {
+        self.row_spacing = Some(spacing);
+        self
+    }
+    /// Horizontal alignment within each cell. Vertically cells are centered.
+    pub fn alignment(mut self, alignment: Alignment) -> Self {
+        self.alignment = alignment;
+        self
+    }
+}
+
+impl<C: View> View for Grid<C> {
+    type Arity = Single;
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        let mut nodes = NodeList::new();
+        self.children.render_into(ctx, &mut nodes);
+        let (prints, children) = nodes.into_parts();
+        out.push(RenderNode::branch(
+            if crate::view::print_enabled() {
+                format!(
+                    "Grid (columns: {}, spacing: {}, rowSpacing: {}, alignment: {})",
+                    self.columns,
+                    self.spacing,
+                    self.row_spacing.unwrap_or(self.spacing),
+                    self.alignment
+                )
+            } else {
+                String::new()
+            },
+            prints,
+        ));
+        out.push_layout(LayoutNode::Grid {
+            columns: self.columns,
+            spacing: self.spacing,
+            row_spacing: self.row_spacing.unwrap_or(self.spacing),
+            align: cross_align(self.alignment),
+            children,
+        });
+        crate::provenance::seal(
+            ctx,
+            out,
+            mark,
+            self.site,
+            crate::provenance::NodeKind::Grid,
+            None,
+        );
+    }
+}
+
+/// An equal-column grid; `grid!` supplies the tuple of children.
+#[track_caller]
+pub fn grid<C: View>(children: C) -> Grid<C> {
+    Grid {
+        columns: 2,
+        spacing: 0.0,
+        row_spacing: None,
         alignment: Alignment::Center,
         children,
         site: crate::provenance::here(),

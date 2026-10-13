@@ -110,6 +110,8 @@ pub enum DomKind {
     FlexRow,
     /// Layered children: `display:grid`, everyone in the same cell.
     Layers,
+    /// Equal-width column tracks with sparse cell placement.
+    Grid,
     /// A CLEAN boundary, by promise: no body under this path ran this
     /// frame, so the retained subtree still holds — the diff keeps it
     /// wholesale and never descends. Internal to the walk and the
@@ -1032,6 +1034,8 @@ impl DomCapture {
 pub struct DomLayout {
     /// Gap between a flex container's children, px.
     pub gap: Option<f32>,
+    /// Equal-width grid track count; absent on other containers.
+    pub columns: Option<u16>,
     /// The containing block for children taken out of flow.
     pub relative: bool,
     /// Rare child placement parameters, shared when a scene is retained.
@@ -1087,13 +1091,24 @@ pub struct DomPosition {
     pub fill_y: bool,
 }
 
+/// Grid occupancy and the child's horizontal appetite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DomSpan {
+    /// Column tracks, clamped to the grid width.
+    pub columns: u16,
+    /// Row tracks.
+    pub rows: u16,
+    /// Fill the allocated width rather than align at natural width.
+    pub fill_x: bool,
+}
+
 /// Rare stack-child geometry. Ordinary flow nodes pay only one pointer.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DomPlacement {
     /// The stack's physical point and sizing rule.
     pub at: Option<DomPosition>,
     /// Column and row spans, reserved for grid lowering in the same ABI.
-    pub span: Option<(u16, u16)>,
+    pub span: Option<DomSpan>,
 }
 
 /// Per-element geometry, kept outside shared appearance rules.
@@ -1112,7 +1127,7 @@ pub struct DomBox {
     /// Physical position within the enclosing stack.
     pub at: Option<DomPosition>,
     /// Column and row spans. Reserved for grid lowering in the same ABI.
-    pub span: Option<(u16, u16)>,
+    pub span: Option<DomSpan>,
 }
 
 /// Element hints only the Dom consumes — a real tag, a class, an id.
@@ -1158,6 +1173,8 @@ pub enum CreateKind {
     FlexColumn,
     FlexRow,
     Layers,
+    /// Equal-width column tracks with sparse cell placement.
+    Grid,
     Popover,
     /// A `<textarea>`: the field of many lines. A separate kind because
     /// the ELEMENT differs — a field that changes shape is recreated,
@@ -1263,7 +1280,7 @@ pub enum DomPatch {
         max_height: Option<f32>,
         slot_y: Option<f32>,
         at: Option<DomPosition>,
-        span: Option<(u16, u16)>,
+        span: Option<DomSpan>,
     },
     /// The element's own marks: its tooltip and the hover group it owns.
     SetMarks { id: u32, tooltip: Option<Arc<str>>, group_owner: Option<u64> },
@@ -2083,6 +2100,7 @@ fn look_hash(node: &DomNode) -> u64 {
         DomKind::FlexColumn => 11,
         DomKind::FlexRow => 12,
         DomKind::Layers => 13,
+        DomKind::Grid => 17,
         DomKind::Reuse { .. } => 14,
         DomKind::Popover { .. } => 15,
         DomKind::Video { .. } => 16,
@@ -2092,6 +2110,9 @@ fn look_hash(node: &DomNode) -> u64 {
         Some(layout) => {
             1u8.hash(&mut hasher);
             hash_f32(layout.gap, &mut hasher);
+            if let Some(columns) = layout.columns {
+                columns.hash(&mut hasher);
+            }
             layout.align.hash(&mut hasher);
             layout
                 .padding
@@ -2301,6 +2322,7 @@ fn create_kind(kind: &DomKind) -> CreateKind {
         DomKind::FlexColumn => CreateKind::FlexColumn,
         DomKind::FlexRow => CreateKind::FlexRow,
         DomKind::Layers => CreateKind::Layers,
+        DomKind::Grid => CreateKind::Grid,
         DomKind::Popover { .. } => CreateKind::Popover,
         // a reuse only exists where a retained group matched; reaching
         // creation means the promise broke — mount an empty anchor and
@@ -2619,7 +2641,8 @@ fn same_shape(node: &DomNode, old: &DomNode) -> bool {
         | DomKind::Box
         | DomKind::FlexColumn
         | DomKind::FlexRow
-        | DomKind::Layers => {}
+        | DomKind::Layers
+        | DomKind::Grid => {}
         DomKind::Text(text) => {
             if text.highlights.is_some() {
                 return false;
@@ -2663,6 +2686,7 @@ fn same_shape(node: &DomNode, old: &DomNode) -> bool {
 /// reads of a layout.)
 fn same_look_layout(a: &DomLayout, b: &DomLayout) -> bool {
     a.gap == b.gap
+        && a.columns == b.columns
         && a.align == b.align
         && a.padding == b.padding
         && a.grow == b.grow
@@ -2690,7 +2714,8 @@ fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
         | DomKind::Text(_)
         | DomKind::FlexColumn
         | DomKind::FlexRow
-        | DomKind::Layers => {}
+        | DomKind::Layers
+        | DomKind::Grid => {}
         _ => return false,
     }
     if let DomKind::Text(text) = &node.kind
@@ -3912,7 +3937,7 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 ///
 /// Bump this constant when ANY of these change:
 /// - the op codes or their payloads (the table on [`encode`])
-/// - the create kinds (0 group .. 15 video)
+/// - the create kinds (0 group .. 16 grid)
 /// - the style mask bits or their field order
 /// - the weight or truncation codes
 /// - the key table or the modifier bits (the shell's `named_key`)
@@ -4000,7 +4025,7 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// below zero.
 ///
 /// 21 (0.3.0): stack placement and grid. SetBox bits 5/6 carry a position
-/// (u8 flags: layered/fill-x/fill-y, f32 x/y) and spans (u16 columns/rows); flow bit 15 marks
+/// (u8 flags: layered/fill-x/fill-y, f32 x/y) and spans (u16 columns/rows, u8 fill-x); flow bit 14 carries the u16 grid column count and bit 15 marks
 /// the containing block of out-of-flow children. Grid shares this revision.
 pub const ABI_VERSION: u32 = 21;
 
@@ -4119,6 +4144,7 @@ pub const ABI_VERSION: u32 = 21;
 ///                   13 direction u8 (0 ltr, 1 rtl) — an island that
 ///                   reads the other way: `direction` and an isolated
 ///                   `unicode-bidi` on its box;
+///                   14 columns u16 (grid track count);
 ///                   15 relative containing block (flag, no payload)
 ///  12 move          u32 parent, u32 before (0 = to the end)
 ///  13 reveal        u32 target — the container scrolls it into view
@@ -4385,9 +4411,10 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                     push_f32(&mut out, at.x);
                     push_f32(&mut out, at.y);
                 }
-                if let Some((columns, rows)) = span {
-                    push_u16(&mut out, *columns);
-                    push_u16(&mut out, *rows);
+                if let Some(span) = span {
+                    push_u16(&mut out, span.columns);
+                    push_u16(&mut out, span.rows);
+                    out.push(u8::from(span.fill_x));
                 }
             }
             DomPatch::SetMarks { id, tooltip, group_owner } => {
@@ -4662,6 +4689,9 @@ fn encode_layout(out: &mut Vec<u8>, layout: &DomLayout) {
     if layout.direction.is_some() {
         mask |= 1 << 13;
     }
+    if layout.columns.is_some() {
+        mask |= 1 << 14;
+    }
     if layout.relative {
         mask |= 1 << 15;
     }
@@ -4698,6 +4728,9 @@ fn encode_layout(out: &mut Vec<u8>, layout: &DomLayout) {
     }
     if let Some(direction) = layout.direction {
         out.push(direction.is_rtl() as u8);
+    }
+    if let Some(columns) = layout.columns {
+        push_u16(out, columns);
     }
 }
 
@@ -4751,6 +4784,7 @@ fn kind_code(kind: CreateKind) -> u8 {
         CreateKind::Editor => 13,
         CreateKind::Iframe => 14,
         CreateKind::Video => 15,
+        CreateKind::Grid => 16,
     }
 }
 
@@ -7865,6 +7899,56 @@ mod tests {
             DomPatch::DefineRule { layout, .. } if layout.gap == Some(12.0)
         ));
         assert!(matches!(&regapped[1], DomPatch::UseRule { id: 0, .. }), "{regapped:#?}");
+    }
+
+    #[test]
+    fn grid_tracks_and_spans_are_byte_stable() {
+        let mut bytes = Vec::new();
+        encode_layout(
+            &mut bytes,
+            &DomLayout {
+                columns: Some(3),
+                gap: Some(4.0),
+                wrap: Some(8.0),
+                align: Some(1),
+                ..DomLayout::default()
+            },
+        );
+        let expected = [
+            &(1u16 | 2 | (1 << 11) | (1 << 14)).to_le_bytes()[..],
+            &4f32.to_le_bytes()[..],
+            &[1],
+            &8f32.to_le_bytes()[..],
+            &3u16.to_le_bytes()[..],
+        ]
+        .concat();
+        assert_eq!(bytes, expected);
+        let patch = DomPatch::SetBox {
+            id: 7,
+            width: None,
+            height: None,
+            max_width: None,
+            max_height: None,
+            slot_y: None,
+            at: None,
+            span: Some(DomSpan {
+                columns: 2,
+                rows: 3,
+                fill_x: true,
+            }),
+        };
+        let expected = [
+            &1u32.to_le_bytes()[..],
+            &[23],
+            &7u32.to_le_bytes()[..],
+            &[64],
+            &2u16.to_le_bytes()[..],
+            &3u16.to_le_bytes()[..],
+            &[1],
+        ]
+        .concat();
+        assert_eq!(encode(&[patch]), expected);
+        assert_eq!(kind_code(CreateKind::Grid), 16);
     }
 
     #[test]

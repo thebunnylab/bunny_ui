@@ -581,6 +581,45 @@ impl Walk<'_> {
     /// The node itself, what it carries aside.
     fn lower_node(&mut self, tree: &LayoutNode, out: &mut Vec<DomNode>) {
         match tree {
+            LayoutNode::Grid {
+                columns,
+                spacing,
+                row_spacing,
+                align,
+                children,
+            } => {
+                let container = placed(out, node(DomKind::Grid));
+                container.style.interactive = self.pending_interactive.take();
+                container.style.set_tooltip(self.pending_tooltip.take());
+                container.style.set_transition(self.pending_transition.take());
+                let layout = container.layout.as_mut().expect("flow node");
+                let columns = (*columns).clamp(1, u16::MAX as usize);
+                layout.columns = Some(columns as u16);
+                layout.gap = Some(*spacing as f32);
+                layout.wrap = Some(*row_spacing as f32);
+                layout.align = Some(align_code(*align));
+                for child in children {
+                    let opened = container.children.len();
+                    self.lower_into(child, &mut container.children);
+                    let (wide, tall) = child.span_of();
+                    let span = crate::dom::DomSpan {
+                        columns: wide.clamp(1, columns) as u16,
+                        rows: tall.clamp(1, u16::MAX as usize) as u16,
+                        fill_x: child.is_flexible(Axis::Horizontal, None),
+                    };
+                    for cell in &mut container.children[opened..] {
+                        if let Some(layout) = cell.layout.as_mut() {
+                            layout.placement = Some(std::rc::Rc::new(crate::dom::DomPlacement {
+                                at: None,
+                                span: Some(span),
+                            }));
+                            layout.grow = false;
+                            layout.fill = false;
+                            layout.stretch = false;
+                        }
+                    }
+                }
+            }
             LayoutNode::Stack { axis, spacing, align, children, .. } => {
                 let kind = match axis {
                     Axis::Vertical => DomKind::FlexColumn,
@@ -1170,6 +1209,7 @@ impl Walk<'_> {
             LayoutNode::Accessible { child, .. }
             | LayoutNode::Sited { child, .. }
             | LayoutNode::Placed { child, .. }
+            | LayoutNode::Spanned { child, .. }
             | LayoutNode::Measured { child, .. } => self.lower_into(child, out),
 
             LayoutNode::Boundary { path, children, .. } => {
@@ -1876,6 +1916,62 @@ mod tests {
             hints: Default::default(),
             action: None,
         }
+    }
+
+    #[test]
+    fn a_grid_lowers_to_a_grid_with_its_columns_and_spans() {
+        let offsets = HashMap::default();
+        let tree = LayoutNode::Grid {
+            columns: 2,
+            spacing: 4.0,
+            row_spacing: 8.0,
+            align: CrossAlign::Center,
+            children: vec![
+                LayoutNode::Spanned {
+                    columns: 9,
+                    rows: 2,
+                    child: Box::new(text_node("wide")),
+                },
+                LayoutNode::Fill,
+            ],
+        };
+        let tree = LayoutNode::Interactive { path: std::rc::Rc::from("grid-action"), child: Box::new(tree) };
+        let output = lower(&tree, &env_fixture(&offsets));
+        let grid = &output.scene.children[0];
+        assert!(matches!(grid.kind, DomKind::Grid));
+        assert_eq!(grid.style.interactive.as_deref(), Some("grid-action"));
+        let layout = grid.layout.as_ref().unwrap();
+        assert_eq!(
+            (layout.columns, layout.gap, layout.wrap),
+            (Some(2), Some(4.0), Some(8.0))
+        );
+        let span = |index: usize| {
+            grid.children[index]
+                .layout
+                .as_ref()
+                .unwrap()
+                .placement
+                .as_ref()
+                .unwrap()
+                .span
+                .unwrap()
+        };
+        assert_eq!(
+            span(0),
+            crate::dom::DomSpan {
+                columns: 2,
+                rows: 2,
+                fill_x: false
+            }
+        );
+        assert_eq!(
+            span(1),
+            crate::dom::DomSpan {
+                columns: 1,
+                rows: 1,
+                fill_x: true
+            }
+        );
     }
 
     #[test]

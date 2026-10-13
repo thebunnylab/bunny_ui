@@ -36,6 +36,9 @@ use std::sync::Arc;
 use crate::image_engine::{ImageEngine, ImageSource, RawImages, intrinsic_of};
 use crate::text_engine::{FontPatch, FontSpec, MeasureCache, PixelFont, TextEngine};
 
+mod grid;
+pub use grid::CellArea;
+
 /// Logical pixels. Snapping to device pixels is the real backend's
 /// decision, at a single point of the pipeline — never spread around.
 pub type Px = f64;
@@ -879,6 +882,14 @@ pub enum LayoutNode {
     /// offered that width, so a long label wraps inside it instead of
     /// overflowing.
     Flow { spacing: Px, line_spacing: Px, align: CrossAlign, children: Vec<LayoutNode> },
+    /// Equal-width tracks with sparse placement and per-child spans.
+    Grid {
+        columns: usize,
+        spacing: Px,
+        row_spacing: Px,
+        align: CrossAlign,
+        children: Vec<LayoutNode>,
+    },
     /// Overlay: all children in the same frame (ZStack, sheet on top).
     /// `align` is the HORIZONTAL edge each child sits on; the vertical
     /// one stays centered, exactly what SwiftUI's `.leading` means.
@@ -918,7 +929,16 @@ pub enum LayoutNode {
     },
     /// A child parameter read by its enclosing stack, transparent elsewhere.
     Placed { at: Point, child: Box<LayoutNode> },
-    Padding { edges: Edges, child: Box<LayoutNode> },
+    /// Track occupancy read by the enclosing grid, transparent elsewhere.
+    Spanned {
+        columns: usize,
+        rows: usize,
+        child: Box<LayoutNode>,
+    },
+    Padding {
+        edges: Edges,
+        child: Box<LayoutNode>,
+    },
     /// `.frame(width:height:)` — `Some` axes override proposal and answer.
     ///
     /// `align` places the child INSIDE that answer on the horizontal axis:
@@ -1485,6 +1505,12 @@ pub enum Fit {
     /// the place draws the lines that were measured and never breaks
     /// them again against a frame of another width.
     Lines(Vec<usize>, Vec<(Size, Fit)>),
+    /// Cell allocation, resolved row heights and measured children.
+    Grid {
+        areas: Vec<CellArea>,
+        rows: Vec<Px>,
+        cells: Vec<(Size, Fit)>,
+    },
     /// The real content size (it can exceed the frame — that is what scrolls).
     ScrollContent(Size, Box<Fit>),
     /// A retained boundary's KEPT fit: measured on an earlier frame for
@@ -1513,6 +1539,18 @@ impl Fit {
         match (self.unshared(), other.unshared()) {
             (Fit::Leaf, Fit::Leaf) => true,
             (Fit::Children(a), Fit::Children(b)) => pairs(a, b),
+            (
+                Fit::Grid {
+                    areas: aa,
+                    rows: ra,
+                    cells: ca,
+                },
+                Fit::Grid {
+                    areas: ab,
+                    rows: rb,
+                    cells: cb,
+                },
+            ) => aa == ab && ra == rb && pairs(ca, cb),
             (Fit::Lines(la, a), Fit::Lines(lb, b)) => la == lb && pairs(a, b),
             (
                 Fit::Virtual { row_extent: ra, children: ca, offsets: oa },
@@ -2648,6 +2686,7 @@ impl LayoutNode {
             | LayoutNode::BoundaryHint { .. } => true,
             LayoutNode::Stack { children, .. }
             | LayoutNode::Flow { children, .. }
+            | LayoutNode::Grid { children, .. }
             | LayoutNode::Boundary { children, .. } => {
                 children.iter().all(|child| child.collect_quiet(held))
             }
@@ -2658,7 +2697,8 @@ impl LayoutNode {
             LayoutNode::Overlay { layer, child, .. } => {
                 layer.collect_quiet(held) && child.collect_quiet(held)
             }
-            LayoutNode::Placed { child, .. }
+            LayoutNode::Spanned { child, .. }
+            | LayoutNode::Placed { child, .. }
             | LayoutNode::Accessible { child, .. }
             | LayoutNode::Sited { child, .. }
             | LayoutNode::Padding { child, .. }
@@ -5693,7 +5733,7 @@ impl LayoutNode {
                 .any(|child| child.placed_at().is_none() && child.is_flexible(axis, Some(*main))),
             // a flow takes the width it is offered — that is where it
             // wraps — and answers its height with its lines
-            LayoutNode::Flow { .. } => axis == Axis::Horizontal,
+            LayoutNode::Flow { .. } | LayoutNode::Grid { .. } => axis == Axis::Horizontal,
             // a layer pile has no main axis of its own — the question
             // passes through it unchanged
             LayoutNode::Layered { children, .. } => {
@@ -5702,7 +5742,8 @@ impl LayoutNode {
             LayoutNode::Boundary { children, .. } => Self::boundary_is_flexible(children, axis, enclosing_main),
             // a probe is not a box: it answers for its child in every
             // direction, or measuring a view would change it
-            LayoutNode::Placed { child, .. }
+            LayoutNode::Spanned { child, .. }
+            | LayoutNode::Placed { child, .. }
             | LayoutNode::Accessible { child, .. }
             | LayoutNode::Sited { child, .. }
             | LayoutNode::Measured { child, .. } => child.is_flexible(axis, enclosing_main),
@@ -5730,6 +5771,17 @@ impl LayoutNode {
                 slot.with_layout(|node| node.and_then(Self::placed_at))
             }
             _ => self.only_child().and_then(Self::placed_at),
+        }
+    }
+
+    /// The outermost grid span through wrappers, or one cell by default.
+    pub fn span_of(&self) -> (usize, usize) {
+        match self {
+            Self::Spanned { columns, rows, .. } => (*columns, *rows),
+            Self::BoundaryRef { slot, .. } => {
+                slot.with_layout(|node| node.map(Self::span_of).unwrap_or((1, 1)))
+            }
+            _ => self.only_child().map(Self::span_of).unwrap_or((1, 1)),
         }
     }
 
@@ -5762,7 +5814,8 @@ impl LayoutNode {
             | Self::DropTarget { child, .. }
             | Self::ExactLayout { child, .. }
             | Self::Hinted { child, .. }
-            | Self::Placed { child, .. } => Some(child),
+            | Self::Placed { child, .. }
+            | Self::Spanned { child, .. } => Some(child),
             Self::Boundary { children, .. } if children.len() == 1 => children.first(),
             _ => None,
         }
@@ -5826,13 +5879,14 @@ impl LayoutNode {
                 .iter()
                 .find(|child| child.placed_at().is_none())
                 .and_then(|child| child.first_baseline(env)),
-            LayoutNode::Flow { children, .. } => {
+            LayoutNode::Flow { children, .. } | LayoutNode::Grid { children, .. } => {
                 children.first().and_then(|child| child.first_baseline(env))
             }
             LayoutNode::Boundary { children, .. } => {
                 children.first().and_then(|child| child.first_baseline(env))
             }
-            LayoutNode::Placed { child, .. }
+            LayoutNode::Spanned { child, .. }
+            | LayoutNode::Placed { child, .. }
             | LayoutNode::Accessible { child, .. }
             | LayoutNode::Sited { child, .. }
             | LayoutNode::Measured { child, .. } => child.first_baseline(env),
@@ -6047,12 +6101,29 @@ impl LayoutNode {
                 measure_stack(*axis, *spacing, children, proposal, env)
             }
 
+            LayoutNode::Grid { columns, spacing, row_spacing, align, children } => {
+                grid::Tracks {
+                    columns: (*columns).max(1),
+                    gap: *spacing,
+                    row_gap: *row_spacing,
+                    align: *align,
+                }.measure(children, proposal, env)
+            }
             LayoutNode::Flow { spacing, line_spacing, children, .. } => {
                 measure_flow(*spacing, *line_spacing, children, proposal, env)
             }
 
-            LayoutNode::VirtualStack { row_extent, count, children, heights, measured: cache } => {
-                let child_proposal = Proposal { width: proposal.width, height: None };
+            LayoutNode::VirtualStack {
+                row_extent,
+                count,
+                children,
+                heights,
+                measured: cache,
+            } => {
+                let child_proposal = Proposal {
+                    width: proposal.width,
+                    height: None,
+                };
                 let measured: Vec<(usize, Size, Fit)> = children
                     .iter()
                     .map(|(index, child)| {
@@ -6419,7 +6490,8 @@ impl LayoutNode {
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
-            LayoutNode::Placed { child, .. }
+            LayoutNode::Spanned { child, .. }
+            | LayoutNode::Placed { child, .. }
             | LayoutNode::Accessible { child, .. }
             | LayoutNode::Sited { child, .. } => child.measure(proposal, env),
 
@@ -6496,7 +6568,9 @@ impl LayoutNode {
     /// The node itself, its own action aside.
     fn place_node(&self, frame: Rect, fit: &Fit, env: &LayoutEnv<'_>, out: &mut Placement) {
         match (self, fit.unshared()) {
-            (LayoutNode::Placed { child, .. }, _) => child.place(frame, fit, env, out),
+            (LayoutNode::Placed { child, .. }, _) | (LayoutNode::Spanned { child, .. }, _) => {
+                child.place(frame, fit, env, out)
+            }
             (LayoutNode::Accessible { semantics, child }, _) => {
                 let start = out.accessibility.len();
                 child.place(frame, fit, env, out);
@@ -7616,6 +7690,24 @@ impl LayoutNode {
                 }
             }
 
+            (
+                LayoutNode::Grid {
+                    columns,
+                    spacing,
+                    row_spacing,
+                    align,
+                    children,
+                },
+                fit @ Fit::Grid { .. },
+            ) => {
+                grid::Tracks {
+                    columns: (*columns).max(1),
+                    gap: *spacing,
+                    row_gap: *row_spacing,
+                    align: *align,
+                }
+                .place(children, frame, fit, env, out);
+            }
             (LayoutNode::Stack { axis, spacing, align, children, .. }, Fit::Children(fits)) => {
                 place_stack(*axis, *spacing, *align, children, frame, fits, env, out);
             }

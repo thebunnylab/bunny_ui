@@ -47,7 +47,7 @@ separate wrapper so it is not counted twice. HTML rendering and the DOM decoder
 apply the same geometry and clear it when the position disappears.
 
 DOM ABI 21 carries position in `SetBox` bit 5 (flags for layered/fill-x/fill-y,
-then f32 x/y), reserves bit 6 for grid spans, and marks relative containers in
+then f32 x/y), uses bit 6 for grid spans (u16 columns/rows and u8 fill-x), and marks relative containers in
 flow bit 15. Coordinates remain per-element geometry, outside shared appearance
 rules. Rare placement data is behind one shared pointer: on 64-bit hosts the
 flow record is at most 96 bytes and a retained node at most 336 bytes. All glue
