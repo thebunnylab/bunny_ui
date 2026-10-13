@@ -530,6 +530,14 @@ impl<C: View> View for Vec<C> {
     }
 }
 
+/// The zero-child tuple is a fragment, just like every non-empty tuple.
+/// Blank stack macros retain their container without inventing a child node.
+impl View for () {
+    type Arity = Many;
+
+    fn render_into(&self, _ctx: &Context, _out: &mut NodeList) {}
+}
+
 /// SwiftUI's `TupleView` — the implicit container of a multi-statement
 /// `@ViewBuilder` block, flattened into the parent's children.
 macro_rules! tuple_view {

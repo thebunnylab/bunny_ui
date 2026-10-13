@@ -122,24 +122,24 @@ macro_rules! text {
 /// `vstack!(a, b, c)` — the children without the tuple's doubled parentheses.
 #[macro_export]
 macro_rules! vstack {
-    ($($child:expr),+ $(,)?) => {
-        $crate::views::vstack(($($child,)+))
+    ($($child:expr),* $(,)?) => {
+        $crate::views::vstack(($($child,)*))
     };
 }
 
 /// `hstack!(a, b, c)` — see [`vstack!`].
 #[macro_export]
 macro_rules! hstack {
-    ($($child:expr),+ $(,)?) => {
-        $crate::views::hstack(($($child,)+))
+    ($($child:expr),* $(,)?) => {
+        $crate::views::hstack(($($child,)*))
     };
 }
 
 /// `zstack!(a, b, c)` — see [`vstack!`].
 #[macro_export]
 macro_rules! zstack {
-    ($($child:expr),+ $(,)?) => {
-        $crate::views::zstack(($($child,)+))
+    ($($child:expr),* $(,)?) => {
+        $crate::views::zstack(($($child,)*))
     };
 }
 
