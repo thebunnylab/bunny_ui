@@ -799,7 +799,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// when it leaves, and never twice for the same answer.
     #[track_caller]
     fn on_hover(self, action: impl Fn(bool) + 'static) -> Modified<Self> {
-        Modified::new(self, Modifier::OnHover(std::rc::Rc::new(move |inside| action(inside != 0))))
+        Modified::new(self, Modifier::OnHover(std::rc::Rc::new(move |inside, _| action(inside != 0))))
     }
 
     /// `.on_copy { … }` — a read-only view that answers the platform's
@@ -845,6 +845,16 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// a chain is the one that fires.
     #[track_caller]
     fn on_click_count(self, action: impl Fn(u8) + 'static) -> Modified<Self> {
+        self.on_click_with_modifiers(move |clicks, _| action(clicks))
+    }
+
+    /// A normal click target with its count and the initiating press's modifier keys.
+    /// Unlike a custom element, this does not capture the pointer: `.on_drag`
+    /// still lifts, and a drag or cancelled press never fires the click callback.
+    /// Programmatic activation supplies no modifiers. Browser embeddings can
+    /// forward them through `Runtime::dom_action_with_modifiers`.
+    #[track_caller]
+    fn on_click_with_modifiers(self, action: impl Fn(u8, crate::action::Modifiers) + 'static) -> Modified<Self> {
         Modified::new(self, Modifier::OnClick(Rc::new(action)))
     }
 

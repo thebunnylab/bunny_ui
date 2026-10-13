@@ -197,7 +197,7 @@ where
         let target = motor::identity::cursor_scope_rc().inspect(|path| {
             if !self.disabled {
                 let action = self.action.clone();
-                crate::reconciler::attribute_action(Rc::clone(path), Rc::new(move |_| action()));
+                crate::reconciler::attribute_action(Rc::clone(path), Rc::new(move |_, _| action()));
             }
         });
 
