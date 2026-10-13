@@ -119,11 +119,26 @@ macro_rules! text {
     };
 }
 
+/// Packs a macro's children in typed chunks while retaining a flat identity index.
+/// Ordinary short stacks keep their existing tuple type; longer lists add no View nodes.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bunny_children {
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr,
+     $g:expr, $h:expr, $i:expr, $j:expr, $k:expr, $l:expr, $($rest:expr),+ $(,)?) => {
+        $crate::view::JoinedChildren::new(
+            ($a, $b, $c, $d, $e, $f, $g, $h, $i, $j, $k, $l),
+            $crate::__bunny_children!($($rest),+),
+        )
+    };
+    ($($child:expr),* $(,)?) => { ($($child,)*) };
+}
+
 /// `vstack!(a, b, c)` — the children without the tuple's doubled parentheses.
 #[macro_export]
 macro_rules! vstack {
     ($($child:expr),* $(,)?) => {
-        $crate::views::vstack(($($child,)*))
+        $crate::views::vstack($crate::__bunny_children!($($child),*))
     };
 }
 
@@ -131,7 +146,7 @@ macro_rules! vstack {
 #[macro_export]
 macro_rules! hstack {
     ($($child:expr),* $(,)?) => {
-        $crate::views::hstack(($($child,)*))
+        $crate::views::hstack($crate::__bunny_children!($($child),*))
     };
 }
 
@@ -139,14 +154,14 @@ macro_rules! hstack {
 #[macro_export]
 macro_rules! zstack {
     ($($child:expr),* $(,)?) => {
-        $crate::views::zstack(($($child,)*))
+        $crate::views::zstack($crate::__bunny_children!($($child),*))
     };
 }
 
 /// `grid!(a, b, c)` — equal columns, optional per-child spans.
 #[macro_export]
 macro_rules! grid {
-    ($($child:expr),* $(,)?) => { $crate::views::grid(($($child,)*)) };
+    ($($child:expr),* $(,)?) => { $crate::views::grid($crate::__bunny_children!($($child),*)) };
 }
 
 /// What `#[preview]` expands to where the core stands alone — a crate
