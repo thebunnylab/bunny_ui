@@ -66,23 +66,9 @@ impl Tracks {
                 )
             })
             .collect();
-        let count = areas
-            .iter()
-            .map(|area| area.row + area.rows)
-            .max()
-            .unwrap_or(0);
-        let mut rows = vec![0.0_f64; count];
-        // Single-row children establish the ordinary tracks first. A spanning
-        // cell gives only its remaining deficit to its final row.
-        for (area, (size, _)) in areas.iter().zip(&cells).filter(|(area, _)| area.rows == 1) {
-            rows[area.row] = rows[area.row].max(size.height);
-        }
-        for (area, (size, _)) in areas.iter().zip(&cells).filter(|(area, _)| area.rows > 1) {
-            let end = area.row + area.rows;
-            let height = rows[area.row..end].iter().sum::<Px>()
-                + self.row_gap * area.rows.saturating_sub(1) as Px;
-            rows[end - 1] += (size.height - height).max(0.0);
-        }
+        let sizes: Vec<_> = cells.iter().map(|(size, _)| *size).collect();
+        let rows = row_heights(&areas, &sizes, self.row_gap);
+        let count = rows.len();
         let size = Size {
             width: if children.is_empty() {
                 proposal.width.unwrap_or(0.0)
@@ -105,21 +91,25 @@ impl Tracks {
         let Fit::Grid { areas, rows, cells } = fit else {
             return;
         };
-        let column = self.width(frame.size.width);
-        let mut starts = Vec::with_capacity(rows.len() + 1);
-        starts.push(0.0);
-        for row in rows {
-            starts.push(starts.last().copied().unwrap_or(0.0) + row + self.row_gap);
-        }
-        for ((child, area), (size, fit)) in children.iter().zip(areas).zip(cells) {
-            let width = self.across(column, area.columns);
-            let top = starts[area.row];
-            let height = starts[area.row + area.rows] - top - self.row_gap;
-            let along = area.column as Px * (column + self.gap)
-                + align_offset(width, size.width, self.align);
+        let rectangles = cell_rectangles(
+            frame,
+            self.columns,
+            self.gap,
+            self.row_gap,
+            env.rtl(),
+            areas,
+            rows,
+        );
+        for ((child, cell), (size, fit)) in children.iter().zip(rectangles).zip(cells) {
+            let offset = align_offset(cell.size.width, size.width, self.align);
             let origin = Point {
-                x: leading_x(frame, along, size.width, env.rtl()),
-                y: frame.origin.y + top + align_offset(height, size.height, CrossAlign::Center),
+                x: cell.origin.x
+                    + if env.rtl() {
+                        cell.size.width - size.width - offset
+                    } else {
+                        offset
+                    },
+                y: cell.origin.y + align_offset(cell.size.height, size.height, CrossAlign::Center),
             };
             child.place(
                 Rect {
@@ -132,6 +122,76 @@ impl Tracks {
             );
         }
     }
+}
+
+fn row_heights(areas: &[CellArea], sizes: &[Size], row_gap: Px) -> Vec<Px> {
+    let count = areas
+        .iter()
+        .map(|area| area.row + area.rows)
+        .max()
+        .unwrap_or(0);
+    let mut rows = vec![0.0_f64; count];
+    for (area, size) in areas.iter().zip(sizes).filter(|(area, _)| area.rows == 1) {
+        rows[area.row] = rows[area.row].max(size.height);
+    }
+    for (area, size) in areas.iter().zip(sizes).filter(|(area, _)| area.rows > 1) {
+        let end = area.row + area.rows;
+        let height =
+            rows[area.row..end].iter().sum::<Px>() + row_gap * area.rows.saturating_sub(1) as Px;
+        rows[end - 1] += (size.height - height).max(0.0);
+    }
+    rows
+}
+
+/// Cell hit areas for already measured children, in source order. Uses the
+/// same sparse allocation and row sizing as native Grid measurement. Child
+/// sizes are their outer measured boxes, before alignment within the cells.
+/// The bounds name the Grid content box, inside any enclosing padding.
+/// Columns and spans have the same 1..=65535 bounds as the view modifiers.
+pub fn grid_cells(
+    bounds: Rect,
+    columns: usize,
+    spacing: Px,
+    row_spacing: Px,
+    rtl: bool,
+    children: &[(Size, (usize, usize))],
+) -> Vec<Rect> {
+    let columns = columns.clamp(1, 65535);
+    let areas = auto_place(columns, children.iter().map(|(_, (cols, rows))| {
+        ((*cols).clamp(1, 65535), (*rows).clamp(1, 65535))
+    }));
+    let sizes: Vec<_> = children.iter().map(|(size, _)| *size).collect();
+    let rows = row_heights(&areas, &sizes, row_spacing);
+    cell_rectangles(bounds, columns, spacing, row_spacing, rtl, &areas, &rows)
+}
+
+fn cell_rectangles(
+    bounds: Rect,
+    columns: usize,
+    gap: Px,
+    row_gap: Px,
+    rtl: bool,
+    areas: &[CellArea],
+    rows: &[Px],
+) -> Vec<Rect> {
+    let column =
+        ((bounds.size.width - gap * columns.saturating_sub(1) as Px) / columns as Px).max(0.0);
+    let mut starts = Vec::with_capacity(rows.len() + 1);
+    starts.push(0.0);
+    for row in rows {
+        starts.push(starts.last().copied().unwrap_or(0.0) + row + row_gap);
+    }
+    areas.iter().map(|area| {
+        let width = column * area.columns as Px + gap * area.columns.saturating_sub(1) as Px;
+        let along = area.column as Px * (column + gap);
+        Rect {
+            origin: Point {
+                x: bounds.origin.x + if rtl { bounds.size.width - along - width } else { along },
+                y: bounds.origin.y + starts[area.row],
+            },
+            size: Size { width, height: starts[area.row + area.rows] - starts[area.row] - row_gap },
+        }
+    }).collect()
 }
 
 /// CSS sparse auto-placement: the cursor never backfills a preceding hole.
