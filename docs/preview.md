@@ -90,7 +90,7 @@ Undo restoring the exact source can restore eligibility. A restart may reuse
 generation numbers, so retained pictures must keep their own receipts rather
 than borrowing the new process's proof.
 
-## Independent scene instances (T2-STUDIO-79)
+## Independent scene instances (T2-STUDIO-79, T2-STUDIO-80)
 
 `Hello.caps & caps::INSTANCES != 0` enables `SelectInstances` (80) and
 `Instance` (81). An instance has a validated opaque `SceneInstanceId`, a source
@@ -99,6 +99,11 @@ removing and recreating an instance creates fresh state. Duplicate identities or
 unexported previews refuse the whole selection before replacing any runtime.
 Legacy `Select` still selects the original single-preview lane. Its commands
 cannot alias an instance whose identity happens to have the same spelling.
+
+`Select` replaces only the legacy scenes; `SelectInstances` replaces only the
+instance scenes. Both selections coexist in one host. Clearing or changing the
+Code dock therefore retains every artboard runtime, and closing page scenes
+retains the dock. Neither lane can address the other by a matching string.
 
 `Instance` addresses one instance and variant, carrying traits, dimensions,
 pointer/wheel/key/text/touch/pinch input, style/placement overrides, clear or
