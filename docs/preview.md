@@ -40,3 +40,28 @@ and Place (79) extend the wire by new message kinds. The golden stream appends
 placement cases after every existing byte. `wire_v1_before_place.bin` pins that
 prefix independently, so regenerating the current golden cannot silently alter
 legacy payloads.
+
+## The whole app
+
+A native build with `preview` makes `app!` export the reserved `app` entry.
+The host lists it first, under **App**, at the window size set by `AppConfig`.
+Its source reference is the `app!` invocation. It runs the real root and state
+under the same scene boundary, panic reporting, input and hot-reload path as
+marked previews; it opens no platform window. `app` cannot name a marked or
+manually declared preview.
+
+`bunny preview` with no names includes the app. `bunny preview --png pictures`
+also writes `pictures/app.png`, preserving the configured window size unless
+`--size` overrides it. `--list` and `--list --json` discover the app without
+building; JSON adds an optional `app` source site, leaving older records intact.
+Macro bodies and strings containing sample invocations are not app entries.
+Duplicate invocations are reported with both source sites.
+
+Window chrome and menus are not part of the preview image. A panic while
+constructing the root during discovery is reported by name without ending the
+host; its row remains available for repair, with default traits until the root
+can be constructed again.
+
+The App export is retained when the app lives in a library and the binary only
+calls `run()`. `BUNNY_PREVIEW_CHECK` fails for an unresolved entry; rendering a
+diagnostic string is not a successful preview check.

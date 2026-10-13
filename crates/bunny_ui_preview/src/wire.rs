@@ -26,6 +26,9 @@ use std::fmt;
 /// The version of this wire — what `Hello` announces.
 pub const WIRE_VERSION: u32 = 1;
 
+/// The whole-app scene, exported by `app!` in a preview build.
+pub const APP_IDENT: &str = "app";
+
 /// The first bytes of a `Hello`: a reader that sees anything else is on
 /// the wrong socket.
 pub const MAGIC: [u8; 4] = *b"BNYP";

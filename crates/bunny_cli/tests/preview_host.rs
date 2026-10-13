@@ -1,6 +1,6 @@
 //! The preview road end to end, with its clock: a project `bunny new`
 //! writes, built hot with its preview entries and started as a host; the
-//! template's own `home_preview` selected and framed; a click on its
+//! template's real `app!` root selected and framed; a click on its
 //! button answered with a new frame; a save reloaded with the count kept;
 //! a save in a sibling crate's body reloaded too, and a type moved there
 //! a restart, said.
@@ -21,7 +21,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use bunny_cli::preview::{Event, Options, Preview, Step};
-use bunny_ui_preview::wire::{Frame, OverrideOp, Patch, PointerKind, Selection, SiteKey, ToHost, ToIde, Traits};
+use bunny_ui_preview::wire::{Frame, OverrideOp, Patch, PointerKind, Selection, SiteKey, ToHost, ToIde};
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().to_path_buf()
@@ -156,10 +156,26 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
         ToIde::Ready { previews, .. } => Some(previews.clone()),
         _ => None,
     });
-    let home = previews.iter().find(|preview| preview.ident == "home_preview").expect("the template's preview is listed");
-    live.send(&ToHost::Select(vec![Selection { id: home.id.clone(), ident: home.ident.clone(), traits: Traits::default() }])).unwrap();
-    let frame = expect(&mut live, Duration::from_secs(30), frame_of("home_preview"));
+    let home = previews.first().expect("the template's app is listed");
+    assert_eq!(home.ident, "app");
+    assert_eq!(home.traits.size, bunny_ui_preview::wire::Sizing::Fixed(bunny_ui_preview::wire::Size { width: 420.0, height: 640.0 }));
+    live.send(&ToHost::Select(vec![Selection { id: home.id.clone(), ident: home.ident.clone(), traits: home.traits.clone() }])).unwrap();
+    let frame = expect(&mut live, Duration::from_secs(30), frame_of("app"));
     timing("warm_start", began.elapsed(), Some(Duration::from_secs(3)));
+    timing("app_frame", began.elapsed(), Some(Duration::from_secs(3)));
+    assert_eq!(
+        frame.size,
+        bunny_ui_preview::wire::Size {
+            width: 420.0,
+            height: 640.0
+        }
+    );
+    assert!(
+        frame.sites.iter().any(|site| site
+            .file
+            .is_some_and(|file| frame.strings[file as usize].starts_with("src/"))),
+        "app source sites are recorded"
+    );
     assert!(says(&frame, "You tapped 0 times"), "{:?}", frame.strings);
 
     // a click on the button, found by its site
@@ -173,7 +189,7 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
     live.send(&ToHost::Pointer { id: home.id.clone(), kind: PointerKind::Down, x, y, modifiers: 0 }).unwrap();
     live.send(&ToHost::Pointer { id: home.id.clone(), kind: PointerKind::Up, x, y, modifiers: 0 }).unwrap();
     let frame = expect(&mut live, Duration::from_secs(10), |message| match message {
-        ToIde::Frame(frame) if frame.preview == "home_preview" && says(frame, "You tapped 1 times") => Some(frame.clone()),
+        ToIde::Frame(frame) if frame.preview == "app" && says(frame, "You tapped 1 times") => Some(frame.clone()),
         _ => None,
     });
     timing("click", began.elapsed(), Some(Duration::from_millis(20)));
@@ -196,14 +212,14 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
     let began = Instant::now();
     live.send(&ToHost::Override { id: home.id.clone(), site: site.clone(), op: OverrideOp::Replace, patch: Patch::PaddingLength(64.0) }).unwrap();
     let frame = expect(&mut live, Duration::from_secs(10), |message| match message {
-        ToIde::Frame(frame) if frame.preview == "home_preview" && text_x(frame).is_some_and(|x| x != before) => Some(frame.clone()),
+        ToIde::Frame(frame) if frame.preview == "app" && text_x(frame).is_some_and(|x| x != before) => Some(frame.clone()),
         _ => None,
     });
     timing("override", began.elapsed(), Some(Duration::from_millis(20)));
     assert!(text_x(&frame).unwrap() > before, "the text moved right under the wider padding");
     live.send(&ToHost::ClearOverrides { id: home.id.clone() }).unwrap();
     let frame = expect(&mut live, Duration::from_secs(10), |message| match message {
-        ToIde::Frame(frame) if frame.preview == "home_preview" && text_x(frame) == Some(before) => Some(frame.clone()),
+        ToIde::Frame(frame) if frame.preview == "app" && text_x(frame) == Some(before) => Some(frame.clone()),
         _ => None,
     });
     assert!(says(&frame, "You tapped 1 times"), "the count survived the override: {:?}", frame.strings);
@@ -222,7 +238,7 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
     live.reload(&mut events);
     assert!(events.iter().any(|event| matches!(event, Event::Reloaded { .. })), "{events:?}");
     let frame = expect(&mut live, Duration::from_secs(10), |message| match message {
-        ToIde::Frame(frame) if frame.preview == "home_preview" && says(frame, "Tap again") => Some(frame.clone()),
+        ToIde::Frame(frame) if frame.preview == "app" && says(frame, "Tap again") => Some(frame.clone()),
         _ => None,
     });
     timing("save", began.elapsed(), Some(Duration::from_millis(800)));
@@ -244,7 +260,7 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
     live.reload(&mut events);
     assert!(events.iter().any(|event| matches!(event, Event::Reloaded { .. })), "a body edit in a sibling reloads: {events:?}");
     let frame = expect(&mut live, Duration::from_secs(10), |message| match message {
-        ToIde::Frame(frame) if frame.preview == "home_preview" && says(frame, "Hello from ui_kit") => Some(frame.clone()),
+        ToIde::Frame(frame) if frame.preview == "app" && says(frame, "Hello from ui_kit") => Some(frame.clone()),
         _ => None,
     });
     timing("sibling_save", began.elapsed(), Some(Duration::from_millis(800)));
@@ -274,7 +290,6 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
     let out = Command::new(env!("CARGO_BIN_EXE_bunny"))
         .args(["preview", "--png"])
         .arg(&pictures)
-        .args(["--size", "320x200", "home_preview"])
         .current_dir(&app)
         .output()
         .unwrap();
@@ -282,7 +297,12 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
     timing("png", began.elapsed(), None);
     let png = fs::read(pictures.join("home_preview.png")).expect("the picture was written");
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
-    assert_eq!(&png[16..24], &[0, 0, 1, 64, 0, 0, 0, 200], "320x200 at scale 1");
+    let app_png = fs::read(pictures.join("app.png")).expect("no idents includes the whole app");
+    assert_eq!(
+        &app_png[16..24],
+        &[0, 0, 1, 164, 0, 0, 2, 128],
+        "420x640 at scale 1"
+    );
 
     // a page: on the Mac the host's shell pictures a webview through an
     // offscreen desk, and the picture paints the page where the

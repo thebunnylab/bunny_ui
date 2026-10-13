@@ -24,7 +24,7 @@ pub const SUMMARY: &str = "Render the app's #[preview] functions, and keep them 
 pub const USAGE: &str = "bunny preview [NAME...] [--list] [--json] [--png DIR | --snapshot DIR] [OPTIONS]";
 
 pub const ABOUT: &str = "\
-Lists the previews the app's sources mark with #[preview] (--list), or
+Lists the app! root and previews marked with #[preview] (--list), or
 builds the app with its preview entries, starts it as a preview host —
 no window — and renders the named previews (every preview, when none is
 named). Each frame the host sends shows up as a line; a save reloads the
@@ -158,7 +158,15 @@ fn pictures(mut live: Preview<crate::preview::Live>, wanted: Vec<String>, into: 
                     let chosen: Vec<Selection> = previews
                         .iter()
                         .filter(|preview| wanted.is_empty() || wanted.iter().any(|name| *name == preview.ident || *name == preview.name))
-                        .map(|preview| Selection { id: preview.id.clone(), ident: preview.ident.clone(), traits: traits.clone() })
+                        .map(|preview| {
+                            let mut traits = traits.clone();
+                            if preview.ident == bunny_ui_preview::wire::APP_IDENT
+                                && matches!(traits.size, Sizing::Fits)
+                            {
+                                traits.size = preview.traits.size;
+                            }
+                            Selection { id: preview.id.clone(), ident: preview.ident.clone(), traits }
+                        })
                         .collect();
                     if chosen.is_empty() {
                         live.stop();
@@ -244,8 +252,18 @@ fn pictures(mut live: Preview<crate::preview::Live>, wanted: Vec<String>, into: 
 
 /// The list: `scope / name — example (file:line)`.
 fn list(report: &bunny_ui_preview::scan::ScanReport) {
-    if report.previews.is_empty() {
-        println!("{}", term::dim("no #[preview] functions under src/"));
+    if report.previews.is_empty() && report.app.is_none() {
+        println!(
+            "{}",
+            term::dim("no app! or #[preview] functions under src/")
+        );
+    }
+    if let Some(site) = &report.app {
+        println!(
+            "App / {} {}",
+            term::bold("App"),
+            term::dim(&format!("({}:{}); ident: app", site.file, site.line))
+        );
     }
     for preview in &report.previews {
         let scope = if preview.scope.is_empty() { "unsorted" } else { preview.scope.as_str() };
@@ -383,8 +401,11 @@ fn render(events: &[Event], wanted: &[String]) {
 fn print_event(event: &Event, _wanted: &[String]) {
     match event {
         Event::Previews(report) => {
-            if report.previews.is_empty() {
-                println!("{}", term::warn("no #[preview] functions under src/ — mark one and save"));
+            if report.previews.is_empty() && report.app.is_none() {
+                println!(
+                    "{}",
+                    term::warn("no app! or #[preview] functions under src/ — mark one and save")
+                );
             }
         }
         Event::BuildStarted => println!("{}", term::dim("building…")),

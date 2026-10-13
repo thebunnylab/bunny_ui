@@ -57,3 +57,30 @@ fn a_crate_scan_folds_its_files_and_names_the_ident_two_of_them_claim() {
     assert!(report.unreadable.is_empty());
     check(&report, "dir.json");
 }
+
+#[test]
+fn the_app_has_one_site_and_reserves_its_preview_ident() {
+    let report = scan_source(include_str!("scan/fixtures/app.rs"), "src/app.rs");
+    let site = report.app.as_ref().expect("app! is discovered");
+    assert_eq!(site.to_string(), "src/app.rs:5:1");
+    assert!(report.previews.is_empty());
+    assert_eq!(
+        report
+            .refused
+            .iter()
+            .map(|r| r.reason.tag())
+            .collect::<Vec<_>>(),
+        ["reserved", "reserved"]
+    );
+    check(&report, "app.json");
+}
+
+#[test]
+fn duplicate_app_entries_are_visible_and_keep_the_first_site() {
+    let mut report = scan_source("app!(first);", "src/a.rs");
+    report.merge(scan_source("bunny_ui::app!(second);", "src/b.rs"));
+    assert_eq!(report.app.as_ref().unwrap().file, "src/a.rs");
+    assert_eq!(report.duplicates.len(), 1);
+    assert_eq!(report.duplicates[0].ident, "app");
+    assert_eq!(report.duplicates[0].dropped.to_string(), "src/b.rs:1:1");
+}

@@ -8,6 +8,8 @@
     {"ident": "fine", "symbol": "bunny_preview__fine", "name": "Fine", "scope": "Status", "example": "fine", "file": "tricky.rs", "line": 23, "column": 1}
   ],
   "refused": [
+    {"file": "app.rs", "line": 8, "column": 1, "ident": "app", "reason": "reserved"},
+    {"file": "app.rs", "line": 10, "column": 1, "ident": "app", "reason": "reserved"},
     {"file": "tricky.rs", "line": 10, "column": 1, "ident": "with_params", "reason": "parameters"},
     {"file": "tricky.rs", "line": 14, "column": 1, "ident": null, "reason": "unknown_argument:label"},
     {"file": "tricky.rs", "line": 19, "column": 1, "ident": null, "reason": "not_a_function"}
@@ -15,5 +17,6 @@
   "duplicates": [
     {"ident": "twin", "kept": "dup_a.rs:2:1", "dropped": "dup_b.rs:2:1"}
   ],
-  "unreadable": []
+  "unreadable": [],
+  "app": {"file": "app.rs", "line": 5, "column": 1}
 }
