@@ -821,3 +821,6 @@ fn an_app_root_panic_during_discovery_is_reported_without_killing_the_host() {
     host.handle(select("app", fixed(420.0, 640.0)));
     assert!(host.tick(), "repaired app can be selected");
 }
+
+#[path = "support/instances.rs"]
+mod instances;

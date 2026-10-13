@@ -116,6 +116,212 @@ fn start(lane: Preview<bunny_cli::preview::Idle>) -> Preview<bunny_cli::preview:
     }
 }
 
+/// Two copies of the real app keep their state, sizes and overrides through a swap.
+fn exercise_instances(
+    live: &mut Preview<bunny_cli::preview::Live>,
+    home: &bunny_ui_preview::wire::PreviewInfo,
+    lib: &std::path::Path,
+) {
+    use bunny_ui_preview::wire::{InstanceCommand as C, InstanceSelection, SceneInstanceId, Size};
+    let a = SceneInstanceId::parse("artboard:1").unwrap();
+    let b = SceneInstanceId::parse("artboard:2").unwrap();
+    live.send(&ToHost::SelectInstances(vec![
+        InstanceSelection {
+            instance: a.clone(),
+            ident: home.ident.clone(),
+            traits: home.traits.clone(),
+        },
+        InstanceSelection {
+            instance: b.clone(),
+            ident: home.ident.clone(),
+            traits: home.traits.clone(),
+        },
+    ]))
+    .unwrap();
+    let mut first = std::collections::BTreeMap::new();
+    expect(live, Duration::from_secs(10), |message| {
+        if let ToIde::InstanceFrame { instance, frame } = message {
+            first.insert(instance.clone(), frame.as_ref().clone());
+        }
+        (first.len() == 2).then_some(())
+    });
+    assert!(
+        first
+            .values()
+            .all(|frame| says(frame, "You tapped 0 times"))
+    );
+    let initial = &first[&a];
+    let button = initial
+        .sites
+        .iter()
+        .find(|site| initial.strings[site.kind as usize] == "button")
+        .unwrap();
+    let (x, y) = (
+        button.frame.origin.x + button.frame.size.width / 2.0,
+        button.frame.origin.y + button.frame.size.height / 2.0,
+    );
+    let began = Instant::now();
+    for kind in [PointerKind::Down, PointerKind::Up] {
+        live.send(&ToHost::Instance {
+            instance: a.clone(),
+            variant: 0,
+            command: C::Pointer {
+                kind,
+                x,
+                y,
+                modifiers: 0,
+            },
+        })
+        .unwrap();
+    }
+    let frame = expect(live, Duration::from_secs(10), |message| match message {
+        ToIde::InstanceFrame { instance, frame }
+            if instance == &a && says(frame, "You tapped 1 times") =>
+        {
+            Some(frame.as_ref().clone())
+        }
+        _ => None,
+    });
+    timing(
+        "instance_click",
+        began.elapsed(),
+        Some(Duration::from_millis(20)),
+    );
+    let padding = frame
+        .sites
+        .iter()
+        .find(|site| {
+            site.modifier
+                .is_some_and(|name| frame.strings[name as usize] == "padding")
+        })
+        .unwrap();
+    let site = SiteKey {
+        file: frame.strings[padding.file.unwrap() as usize].clone(),
+        line: padding.line,
+        column: padding.column,
+    };
+    let text_x = |frame: &Frame| {
+        frame
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                bunny_ui_preview::wire::Draw::TextLine { origin, .. } => Some(origin.x),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let before = text_x(&frame);
+    live.send(&ToHost::Instance {
+        instance: b.clone(),
+        variant: 0,
+        command: C::Resize(Size {
+            width: 600.0,
+            height: 700.0,
+        }),
+    })
+    .unwrap();
+    let before_b = expect(live, Duration::from_secs(10), |message| match message {
+        ToIde::InstanceFrame { instance, frame } if instance == &b && frame.size.width == 600.0 => {
+            Some(text_x(frame))
+        }
+        _ => None,
+    });
+    live.send(&ToHost::Instance {
+        instance: a.clone(),
+        variant: 0,
+        command: C::Override {
+            site,
+            op: OverrideOp::Replace,
+            patch: Patch::PaddingLength(64.0),
+        },
+    })
+    .unwrap();
+    expect(live, Duration::from_secs(10), |message| match message {
+        ToIde::InstanceFrame { instance, frame } if instance == &a && text_x(frame) > before => {
+            Some(())
+        }
+        _ => None,
+    });
+    live.send(&ToHost::Instance {
+        instance: b.clone(),
+        variant: 0,
+        command: C::Resize(Size {
+            width: 600.0,
+            height: 701.0,
+        }),
+    })
+    .unwrap();
+    let other = expect(live, Duration::from_secs(10), |message| match message {
+        ToIde::InstanceFrame { instance, frame }
+            if instance == &b && frame.size.height == 701.0 =>
+        {
+            Some(frame.as_ref().clone())
+        }
+        _ => None,
+    });
+    assert!(says(&other, "You tapped 0 times"));
+    assert_eq!(
+        text_x(&other),
+        before_b,
+        "another instance's padding did not leak"
+    );
+    live.send(&ToHost::Instance {
+        instance: a.clone(),
+        variant: 0,
+        command: C::ClearOverrides,
+    })
+    .unwrap();
+    expect(live, Duration::from_secs(10), |message| match message {
+        ToIde::InstanceFrame { instance, frame } if instance == &a && text_x(frame) == before => {
+            Some(())
+        }
+        _ => None,
+    });
+    let source = fs::read_to_string(lib).unwrap();
+    fs::write(lib, source.replace("Tap again", "Tap together")).unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while live.saved().is_none() {
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let began = Instant::now();
+    let mut events = Vec::new();
+    live.reload(&mut events);
+    let mut updated = std::collections::BTreeMap::new();
+    expect(live, Duration::from_secs(10), |message| {
+        if let ToIde::InstanceFrame { instance, frame } = message
+            && says(frame, "Tap together")
+        {
+            updated.insert(instance.clone(), frame.as_ref().clone());
+        }
+        (updated.len() == 2).then_some(())
+    });
+    timing(
+        "instance_save",
+        began.elapsed(),
+        Some(Duration::from_millis(800)),
+    );
+    assert!(says(&updated[&a], "You tapped 1 times"));
+    assert!(says(&updated[&b], "You tapped 0 times"));
+    assert_eq!(updated[&a].size.width, 420.0);
+    assert_eq!(updated[&b].size.width, 600.0);
+    assert!(updated.values().all(|frame| events.iter().any(|event| matches!(event, Event::Sources { generation, sources: Some(_) } if *generation == frame.generation))));
+    live.send(&ToHost::Instance {
+        instance: b.clone(),
+        variant: 0,
+        command: C::RequestSnapshot,
+    })
+    .unwrap();
+    expect(live, Duration::from_secs(10), |message| match message {
+        ToIde::InstanceSnapshot {
+            instance,
+            size: (600, 701),
+            ..
+        } if instance == &b => Some(()),
+        _ => None,
+    });
+}
+
 #[test]
 #[ignore = "builds the framework as a shared library; run with --ignored"]
 fn the_preview_road_frames_clicks_and_survives_a_swap() {
@@ -275,6 +481,8 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
     });
     timing("sibling_save", began.elapsed(), Some(Duration::from_millis(800)));
     assert!(says(&frame, "You tapped 1 times"), "the state survived the sibling's swap: {:?}", frame.strings);
+
+    exercise_instances(&mut live, home, &lib);
 
     // a type moved in the sibling: no salt renames its types, so the
     // road asks for a restart and says whose

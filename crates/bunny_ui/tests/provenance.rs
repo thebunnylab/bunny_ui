@@ -131,3 +131,31 @@ fn sites_under_a_component_carry_its_path() {
     let inner = sites.iter().find(|p| p.kind == NodeKind::Text).expect("the card's text");
     assert!(inner.path.as_deref().is_some_and(|path| path.contains("Card")), "{:?}", inner.path);
 }
+
+#[test]
+fn retained_override_sets_restore_the_thread_and_keep_their_own_versions() {
+    use bunny_ui::provenance::{OverrideSet, clear_overrides, overrides_version};
+    clear_overrides();
+    let outside = overrides_version();
+    let first = OverrideSet::new(std::iter::empty());
+    let second = OverrideSet::new(std::iter::empty());
+    let first_version = first.with(overrides_version);
+    let second_version = second.with(overrides_version);
+    assert_ne!(first_version, second_version);
+    first.with(|| {
+        assert_eq!(overrides_version(), first_version);
+        second.with(|| assert_eq!(overrides_version(), second_version));
+        assert_eq!(overrides_version(), first_version);
+    });
+    assert_eq!(overrides_version(), outside);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        first.with(|| panic!("scene failed"))
+    }));
+    assert!(result.is_err());
+    assert_eq!(overrides_version(), outside);
+    assert_eq!(
+        first.with(overrides_version),
+        first_version,
+        "entering another scene did not dirty this one"
+    );
+}

@@ -54,10 +54,9 @@
 //!   polls tasks per turn but keeps the engine's manual clock, so an
 //!   animation driven by a sleep stands still. A frame asked for by state
 //!   or a task's result is rendered on the next turn.
-//! - Overrides are kept per scene and put on the thread's one table
-//!   (`provenance::set_overrides`) whenever they move: a site shared by
-//!   two scenes — the two variants of one preview — moves in both, which
-//!   is what a designer dragging a padding wants to see.
+//! - Legacy selections retain the thread-wide override table. Instance
+//!   selections own versioned override contexts; painting, input and dirty
+//!   checks enter only their context and restore the outer table afterward.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -82,6 +81,9 @@ use bunny_ui_core::provenance::{self, Override, SiteKey, SitePlacement};
 use crate::convert;
 use crate::scan;
 use crate::wire::{self, Message, Reader, Received, ToHost, ToIde};
+
+mod instances;
+use instances::SceneMode;
 
 /// The text and image engines the scenes render with — the platform's
 /// in an app, the house ones in a test.
@@ -183,6 +185,7 @@ impl Mode {
 /// of its own.
 struct Scene {
     id: String,
+    mode: SceneMode,
     ident: Rc<str>,
     variant: u32,
     name: Rc<str>,
@@ -312,6 +315,7 @@ pub struct Host {
     /// Snapshots asked while the door was busy: each scene id and the
     /// instant it stops waiting.
     held: Vec<(String, Instant)>,
+    held_instances: Vec<(wire::SceneInstanceId, u32, Rc<str>, Instant)>,
     /// A scene or a box left since the door was last told what lives.
     resweep: bool,
 }
@@ -331,6 +335,7 @@ impl Host {
             pictures: None,
             patience: PATIENCE,
             held: Vec::new(),
+            held_instances: Vec::new(),
             resweep: false,
         }
     }
@@ -344,7 +349,7 @@ impl Host {
             generation: self.generation,
             workspace_root: self.config.manifest_dir.to_string_lossy().into_owned(),
             package: self.config.package.clone(),
-            caps: wire::caps::PLACE,
+            caps: wire::caps::PLACE | wire::caps::INSTANCES,
         });
         self.ready();
     }
@@ -418,10 +423,20 @@ impl Host {
     pub fn handle(&mut self, message: ToHost) {
         match message {
             ToHost::Select(selections) => self.select(selections),
+            ToHost::SelectInstances(selections) => self.select_instances(selections),
+            ToHost::Instance {
+                instance,
+                variant,
+                command,
+            } => self.instance_command(instance, variant, command),
             ToHost::Retrait { id, traits } => {
                 let traits = convert::core_traits(&traits);
                 let variants = traits.variants();
-                for scene in self.scenes.iter_mut().filter(|scene| scene.id == id) {
+                for scene in self
+                    .scenes
+                    .iter_mut()
+                    .filter(|scene| scene.instance().is_none() && scene.id == id)
+                {
                     if let Some(variant) = variants.get(scene.variant as usize) {
                         variant.apply(&scene.runtime);
                         scene.traits = variant.clone();
@@ -430,7 +445,11 @@ impl Host {
                 }
             }
             ToHost::Resize { id, size } => {
-                for scene in self.scenes.iter_mut().filter(|scene| scene.id == id) {
+                for scene in self
+                    .scenes
+                    .iter_mut()
+                    .filter(|scene| scene.instance().is_none() && scene.id == id)
+                {
                     scene.resized = Some(size.into());
                     scene.dirty = true;
                 }
@@ -495,8 +514,14 @@ impl Host {
                 }
             }
             ToHost::RequestSnapshot { id } => {
-                if !self.scenes.iter().any(|scene| scene.id == id) {
-                    (self.sink)(ToIde::Status { text: format!("{id}: not selected, nothing to snapshot") });
+                if !self
+                    .scenes
+                    .iter()
+                    .any(|scene| scene.instance().is_none() && scene.id == id)
+                {
+                    (self.sink)(ToIde::Status {
+                        text: format!("{id}: not selected, nothing to snapshot"),
+                    });
                 } else if self.pictures.as_ref().is_some_and(|door| door.busy()) {
                     // a page still loading, a shot in flight: the picture
                     // is worth the wait, and the frame as it stands is
@@ -517,22 +542,35 @@ impl Host {
     }
 
     fn scene(&mut self, id: &str) -> Option<&mut Scene> {
-        self.scenes.iter_mut().find(|scene| scene.id == id)
+        self.scenes
+            .iter_mut()
+            .find(|scene| scene.instance().is_none() && scene.id == id)
     }
 
     /// The tool's selection replaces the scenes: one per variant of each
     /// selected preview; a scene already standing for the same id and
     /// variant under the same traits keeps its state.
     fn select(&mut self, selections: Vec<wire::Selection>) {
+        self.select_scenes(
+            selections
+                .into_iter()
+                .map(|selection| (selection, None))
+                .collect(),
+        );
+    }
+
+    fn select_scenes(&mut self, selections: Vec<(wire::Selection, Option<wire::SceneInstanceId>)>) {
         let mut kept = Vec::new();
-        for selection in selections {
+        for (selection, instance) in selections {
             let traits = convert::core_traits(&selection.traits);
             for (variant, traits) in traits.variants().into_iter().enumerate() {
                 let variant = variant as u32;
-                let standing = self
-                    .scenes
-                    .iter()
-                    .position(|scene| scene.id == selection.id && scene.variant == variant && scene.ident.as_ref() == selection.ident);
+                let standing = self.scenes.iter().position(|scene| {
+                    scene.instance() == instance.as_ref()
+                        && scene.id == selection.id
+                        && scene.variant == variant
+                        && scene.ident.as_ref() == selection.ident
+                });
                 if let Some(at) = standing {
                     let mut scene = self.scenes.remove(at);
                     if scene.traits != traits {
@@ -542,7 +580,13 @@ impl Host {
                     }
                     kept.push(scene);
                 } else {
-                    kept.push(self.open(&selection.id, &selection.ident, variant, traits));
+                    kept.push(self.open(
+                        &selection.id,
+                        &selection.ident,
+                        variant,
+                        traits,
+                        instance.clone(),
+                    ));
                 }
             }
         }
@@ -566,15 +610,31 @@ impl Host {
 
     /// Every scene's overrides, on the thread's one table.
     fn push_overrides(&self) {
-        provenance::set_overrides(self.scenes.iter().flat_map(|scene| {
-            scene.overrides.iter().map(|(site, value)| {
-                let key = SiteKey { file: site.file.clone(), line: site.line, column: site.column };
-                (key, value.clone())
-            })
-        }));
+        provenance::set_overrides(
+            self.scenes
+                .iter()
+                .filter(|scene| scene.instance().is_none())
+                .flat_map(|scene| {
+                    scene.overrides.iter().map(|(site, value)| {
+                        let key = SiteKey {
+                            file: site.file.clone(),
+                            line: site.line,
+                            column: site.column,
+                        };
+                        (key, value.clone())
+                    })
+                }),
+        );
     }
 
-    fn open(&mut self, id: &str, ident: &str, variant: u32, traits: Traits) -> Scene {
+    fn open(
+        &mut self,
+        id: &str,
+        ident: &str,
+        variant: u32,
+        traits: Traits,
+        instance: Option<wire::SceneInstanceId>,
+    ) -> Scene {
         let name: Rc<str> = Rc::from(format!("p{}", self.next_scene));
         self.next_scene += 1;
         let runtime = Runtime::scene(Rc::clone(&name))
@@ -583,6 +643,10 @@ impl Host {
         runtime.record_sites(true);
         traits.apply(&runtime);
         Scene {
+            mode: instance.map_or(SceneMode::Legacy, |id| SceneMode::Instance {
+                id,
+                overrides: provenance::OverrideSet::new(std::iter::empty()),
+            }),
             id: id.to_string(),
             ident: Rc::from(ident),
             variant,
@@ -601,7 +665,10 @@ impl Host {
 
     /// Whether any scene wants a frame without being asked.
     pub fn needs_turn(&self) -> bool {
-        self.scenes.iter().any(|scene| scene.dirty || scene.runtime.needs_frame()) || self.pictures.as_ref().is_some_and(|door| door.busy())
+        self.scenes
+            .iter()
+            .any(|scene| scene.dirty || scene.needs_frame())
+            || self.pictures.as_ref().is_some_and(|door| door.busy())
     }
 
     /// One turn: tasks polled, a new generation announced, every scene
@@ -617,6 +684,7 @@ impl Host {
             self.ready();
             for scene in &mut self.scenes {
                 scene.poisoned = None;
+                scene.last = None;
                 scene.dirty = true;
             }
         }
@@ -636,12 +704,13 @@ impl Host {
             if self.scenes[index].poisoned.is_some() {
                 continue;
             }
-            if !(self.scenes[index].dirty || self.scenes[index].runtime.needs_frame()) {
+            if !(self.scenes[index].dirty || self.scenes[index].needs_frame()) {
                 continue;
             }
             sent |= self.render(index);
         }
         self.answer_held();
+        self.answer_held_instances();
         self.sweep_door();
         sent
     }
@@ -674,7 +743,9 @@ impl Host {
 
     /// Every scene of `id`, snapshot.
     fn snapshot_scenes(&mut self, id: &str) {
-        let scenes: Vec<usize> = (0..self.scenes.len()).filter(|&index| self.scenes[index].id == id).collect();
+        let scenes: Vec<usize> = (0..self.scenes.len())
+            .filter(|&index| self.scenes[index].instance().is_none() && self.scenes[index].id == id)
+            .collect();
         for index in scenes {
             self.snapshot(index);
         }
@@ -698,6 +769,14 @@ impl Host {
     /// body passes it cost — or nothing, with the scene poisoned, the
     /// tool told, and a fresh runtime standing in for the next generation.
     fn pass(&mut self, index: usize) -> Option<Pass> {
+        let scope = self.scenes[index].override_set().cloned();
+        match scope {
+            Some(scope) => scope.with(|| self.pass_scoped(index)),
+            None => self.pass_scoped(index),
+        }
+    }
+
+    fn pass_scoped(&mut self, index: usize) -> Option<Pass> {
         let scene = &mut self.scenes[index];
         let root = PreviewHost { ident: Rc::clone(&scene.ident) };
         let fixed = scene.resized.or_else(|| scene.traits.frame());
@@ -733,7 +812,19 @@ impl Host {
                 fresh.record_sites(true);
                 scene.traits.apply(&fresh);
                 scene.runtime = fresh;
-                (self.sink)(ToIde::Panicked { preview: ident, message });
+                let event = match scene.instance() {
+                    Some(instance) => ToIde::InstancePanicked {
+                        instance: instance.clone(),
+                        preview: ident,
+                        variant: scene.variant,
+                        message,
+                    },
+                    None => ToIde::Panicked {
+                        preview: ident,
+                        message,
+                    },
+                };
+                (self.sink)(event);
                 None
             }
         }
@@ -754,7 +845,22 @@ impl Host {
         let height = (size.height * scale as f64).round().max(1.0) as usize;
         let background = scene.runtime.scene_theme().unwrap_or_else(Theme::light).canvas;
         let bitmap = bunny_ui_core::raster::rasterize_with(&display, width, height, scale, background, &*self.engines.text, &*self.engines.images);
-        (self.sink)(ToIde::Snapshot { preview: scene.ident.to_string(), variant: scene.variant, size: (width as u32, height as u32), rgba: bitmap.to_rgba_bytes() });
+        let event = match scene.instance() {
+            Some(instance) => ToIde::InstanceSnapshot {
+                instance: instance.clone(),
+                preview: scene.ident.to_string(),
+                variant: scene.variant,
+                size: (width as u32, height as u32),
+                rgba: bitmap.to_rgba_bytes(),
+            },
+            None => ToIde::Snapshot {
+                preview: scene.ident.to_string(),
+                variant: scene.variant,
+                size: (width as u32, height as u32),
+                rgba: bitmap.to_rgba_bytes(),
+            },
+        };
+        (self.sink)(event);
     }
 
     /// Renders scene `index` and sends its frame when it changed.
@@ -814,7 +920,14 @@ impl Host {
             },
         };
         scene.last = Some(Sent { size, commands, sites, hosts, strings: table });
-        (self.sink)(ToIde::Frame(frame));
+        let event = match scene.instance() {
+            Some(instance) => ToIde::InstanceFrame {
+                instance: instance.clone(),
+                frame: Box::new(frame),
+            },
+            None => ToIde::Frame(frame),
+        };
+        (self.sink)(event);
         true
     }
 
@@ -1024,7 +1137,11 @@ impl Host {
 
     /// The overrides a scene holds.
     pub fn overrides_of(&self, id: &str) -> usize {
-        self.scenes.iter().filter(|scene| scene.id == id).map(|scene| scene.overrides.len()).sum()
+        self.scenes
+            .iter()
+            .filter(|scene| scene.instance().is_none() && scene.id == id)
+            .map(|scene| scene.overrides.len())
+            .sum()
     }
 
     /// The configuration.

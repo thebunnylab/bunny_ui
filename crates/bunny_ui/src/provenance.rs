@@ -49,6 +49,8 @@
 //! runtime's retention once (the nodes baked the modifiers they were built
 //! with), and [`clear_overrides`] puts the code back in charge. Cost when
 //! empty: one `Cell` read per seal.
+//! Independent preview instances use [`OverrideSet::with`] to enter their own
+//! retained context without invalidating another runtime.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -109,7 +111,8 @@ impl std::fmt::Debug for Override {
 }
 
 thread_local! {
-    static OVERRIDES: RefCell<HashMap<SiteKey, Vec<Override>>> = RefCell::new(HashMap::new());
+    static OVERRIDES: RefCell<Rc<HashMap<SiteKey, Vec<Override>>>> = RefCell::new(Rc::new(HashMap::new()));
+    static OVERRIDES_CLOCK: Cell<u64> = const { Cell::new(0) };
     static OVERRIDES_VERSION: Cell<u64> = const { Cell::new(0) };
     static HAS_OVERRIDES: Cell<bool> = const { Cell::new(false) };
 }
@@ -119,13 +122,60 @@ thread_local! {
 /// the way an installed theme does, since the nodes baked the modifiers
 /// they were built with. Several overrides on one site apply in order.
 pub fn set_overrides(overrides: impl IntoIterator<Item = (SiteKey, Override)>) {
-    let mut table: HashMap<SiteKey, Vec<Override>> = HashMap::new();
-    for (site, override_) in overrides {
-        table.entry(site).or_default().push(override_);
+    OverrideSet::new(overrides).install();
+}
+
+/// An immutable, versioned set of one scene's provisional source modifiers.
+/// Re-entering a set keeps its version, so other scenes do not invalidate this
+/// runtime's retained layout. The default thread table remains the legacy lane.
+#[derive(Clone)]
+pub struct OverrideSet {
+    table: Rc<HashMap<SiteKey, Vec<Override>>>,
+    version: u64,
+}
+
+impl OverrideSet {
+    /// Capture overrides in application order with a fresh retention identity.
+    pub fn new(overrides: impl IntoIterator<Item = (SiteKey, Override)>) -> Self {
+        let mut table: HashMap<SiteKey, Vec<Override>> = HashMap::new();
+        for (site, value) in overrides {
+            table.entry(site).or_default().push(value);
+        }
+        let version = OVERRIDES_CLOCK.with(|clock| {
+            let next = clock.get() + 1;
+            clock.set(next);
+            next
+        });
+        Self {
+            table: Rc::new(table),
+            version,
+        }
     }
-    HAS_OVERRIDES.with(|has| has.set(!table.is_empty()));
-    OVERRIDES.with(|current| *current.borrow_mut() = table);
-    OVERRIDES_VERSION.with(|version| version.set(version.get() + 1));
+
+    /// Render or deliver input under this scene's overrides. Restore the outer
+    /// set even when the scene panics; nested scopes remain independent.
+    pub fn with<T>(&self, run: impl FnOnce() -> T) -> T {
+        let previous = Self {
+            table: OVERRIDES.with(|table| Rc::clone(&table.borrow())),
+            version: overrides_version(),
+        };
+        let _restore = RestoreOverrides(previous);
+        self.install();
+        run()
+    }
+
+    fn install(&self) {
+        HAS_OVERRIDES.with(|has| has.set(!self.table.is_empty()));
+        OVERRIDES.with(|current| *current.borrow_mut() = Rc::clone(&self.table));
+        OVERRIDES_VERSION.with(|version| version.set(self.version));
+    }
+}
+
+struct RestoreOverrides(OverrideSet);
+impl Drop for RestoreOverrides {
+    fn drop(&mut self) {
+        self.0.install();
+    }
 }
 
 /// Takes every override away; the code says what the picture shows again.
