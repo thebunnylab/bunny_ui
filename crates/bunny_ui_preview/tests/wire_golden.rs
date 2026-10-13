@@ -208,6 +208,11 @@ fn stream() -> (Vec<Message>, Vec<u8>) {
             patch,
         }));
     }
+    for patch in [PlacePatch::Position(Point { x: 12.0, y: 34.0 }), PlacePatch::Span(2, 3)] {
+        for op in [OverrideOp::Replace, OverrideOp::Append, OverrideOp::Hide] {
+            messages.push(Message::ToHost(ToHost::Place { id: String::from("p"), site: SiteKey { file: String::from("f"), line: 1, column: 1 }, op, patch }));
+        }
+    }
     let bytes = messages.iter().flat_map(encode).collect();
     (messages, bytes)
 }
@@ -250,4 +255,12 @@ fn a_truncated_frame_is_malformed_and_a_stranger_kind_is_skipped() {
     reader.feed(&encode(&Message::ToHost(ToHost::Bye)));
     assert_eq!(reader.pull().unwrap(), Some(Received::Unknown { kind: 250, len: 1 }));
     assert_eq!(reader.pull().unwrap(), Some(Received::Message(Message::ToHost(ToHost::Bye))));
+}
+
+#[test]
+fn placement_keeps_the_preexisting_stream_as_an_exact_prefix() {
+    let (_, bytes) = stream();
+    let before = include_bytes!("fixtures/wire_v1_before_place.bin");
+    assert!(bytes.starts_with(before));
+    assert!(bytes.len() > before.len());
 }
