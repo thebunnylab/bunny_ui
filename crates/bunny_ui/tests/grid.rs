@@ -213,3 +213,40 @@ fn a_retained_grid_keeps_the_same_cell_geometry() {
         assert_eq!(origin(&first, word), origin(&next, word));
     }
 }
+
+#[test]
+fn measured_cell_hit_areas_include_empty_space_and_mirror_in_rtl() {
+    use bunny_ui_core::layout::{grid_cells, Point, Rect, Size};
+    let bounds = Rect { origin: Point { x: 12.0, y: 20.0 }, size: Size { width: 210.0, height: 130.0 } };
+    let cells = [
+        (Size { width: 20.0, height: 10.0 }, (1, 1)),
+        (Size { width: 90.0, height: 100.0 }, (1, 1)),
+        (Size { width: 80.0, height: 20.0 }, (2, 1)),
+    ];
+    let hit = grid_cells(bounds, 2, 10.0, 10.0, false, &cells);
+    assert_eq!(
+        hit[0],
+        Rect {
+            origin: bounds.origin,
+            size: Size {
+                width: 100.0,
+                height: 100.0
+            }
+        }
+    );
+    assert_eq!(hit[1].origin, Point { x: 122.0, y: 20.0 });
+    assert_eq!(
+        hit[2],
+        Rect {
+            origin: Point { x: 12.0, y: 130.0 },
+            size: Size {
+                width: 210.0,
+                height: 20.0
+            }
+        }
+    );
+    let rtl = grid_cells(bounds, 2, 10.0, 10.0, true, &cells);
+    assert_eq!(rtl[0], hit[1]);
+    assert_eq!(rtl[1], hit[0]);
+    assert_eq!(rtl[2], hit[2]);
+}

@@ -37,7 +37,7 @@ use crate::image_engine::{ImageEngine, ImageSource, RawImages, intrinsic_of};
 use crate::text_engine::{FontPatch, FontSpec, MeasureCache, PixelFont, TextEngine};
 
 mod grid;
-pub use grid::CellArea;
+pub use grid::{CellArea, grid_cells};
 
 /// Logical pixels. Snapping to device pixels is the real backend's
 /// decision, at a single point of the pipeline — never spread around.

@@ -41,3 +41,10 @@ The position/grid family consumes a single ABI revision.
 
 Explicit rows and track names, auto-fit/minmax configuration, fixed track widths,
 dense packing, per-cell alignment and a one-argument `.span(n)` are deferred.
+
+`layout::grid_cells` returns complete cell rectangles from already measured
+outer child sizes and spans, including empty space around aligned content.
+Native placement uses the same allocation, row sizing and cell rectangles.
+Design tools can hit-test cells without copying the layout algorithm or using
+text bounds as a proxy for the containing cell. Bounds are the Grid content
+box; RTL mirrors the columns, and the returned order remains the child order.
