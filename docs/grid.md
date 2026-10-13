@@ -54,3 +54,10 @@ and `grid!()` retain their layout node and take modifiers such as padding or
 an explicit frame. Their empty tuple is a zero-child `View` fragment; it adds
 no placeholder child. This lets a visual editor create a blank container or
 move its final child elsewhere without producing invalid Rust.
+
+Stack macros also accept more than twelve direct children. Longer macro lists
+use typed chunks that share one positional identity counter; they add no layout
+containers, allocation per child, or source sites. Up to twelve children still
+use the original tuple type. The `vstack((a, b))` tuple API remains compatible,
+including intentionally nested tuples with their own structural identity. Rust's
+normal macro recursion and type limits still apply to very large expressions.
