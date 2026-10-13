@@ -48,3 +48,9 @@ Native placement uses the same allocation, row sizing and cell rectangles.
 Design tools can hit-test cells without copying the layout algorithm or using
 text bounds as a proxy for the containing cell. Bounds are the Grid content
 box; RTL mirrors the columns, and the returned order remains the child order.
+
+All stack macros accept zero children: `vstack!()`, `hstack!()`, `zstack!()`
+and `grid!()` retain their layout node and take modifiers such as padding or
+an explicit frame. Their empty tuple is a zero-child `View` fragment; it adds
+no placeholder child. This lets a visual editor create a blank container or
+move its final child elsewhere without producing invalid Rust.
