@@ -173,7 +173,7 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
     assert!(
         frame.sites.iter().any(|site| site
             .file
-            .is_some_and(|file| frame.strings[file as usize].starts_with("src/"))),
+            .is_some_and(|file| frame.strings[file as usize].replace('\\', "/").starts_with("src/"))),
         "app source sites are recorded"
     );
     assert!(says(&frame, "You tapped 0 times"), "{:?}", frame.strings);
