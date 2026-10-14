@@ -26,6 +26,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr::null_mut;
+use std::rc::{Rc, Weak};
 
 use bunny_ui::host::{
     Document, EDITOR_SCRIPT, EditorAction, EditorReport, HostSpec, WEBKIT_BOOT, WEBKIT_CONSOLE_HOOK,
@@ -152,6 +153,102 @@ struct Letter {
     /// has no window at its creation (the host adds it after), so the
     /// commit is the first beat the keyboard can be taken at.
     focus: bool,
+    navigation: Id,
+}
+
+/// Keeps up to two empty native HTML engines ready for local read-only documents.
+///
+/// Requesting preparation allocates no WebKit objects. The native host services
+/// the request after presenting a frame; WebKit then loads a sealed blank page
+/// asynchronously. Claimed engines transfer ownership to the host, and dropping
+/// this resource releases only engines that have not been claimed.
+pub struct HtmlPreparation {
+    pool: Rc<EnginePool>,
+}
+
+type EnginePool = RefCell<Vec<SpareEngine>>;
+
+struct SpareEngine(Id);
+impl Drop for SpareEngine {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                msg_void(self.0, sel("stopLoading"));
+                msg_void(self.0, sel("release"));
+            }
+        }
+    }
+}
+
+thread_local! {
+    static HTML_PREPARATIONS: RefCell<Vec<Weak<EnginePool>>> = const { RefCell::new(Vec::new()) };
+}
+
+impl HtmlPreparation {
+    /// Request main-thread preparation after the next native presentation.
+    #[must_use]
+    pub fn request() -> Self {
+        let pool = Rc::new(RefCell::new(Vec::new()));
+        HTML_PREPARATIONS.with(|pending| pending.borrow_mut().push(Rc::downgrade(&pool)));
+        Self { pool }
+    }
+
+    /// Number of unclaimed engines; primarily useful for native diagnostics.
+    #[must_use]
+    pub fn available(&self) -> usize {
+        self.pool.borrow().len()
+    }
+}
+
+fn preparation_allowed(document: &Document) -> bool {
+    document.policy == bunny_ui::host::NetworkPolicy::Deny
+        && document.base.is_empty()
+        && !document.editable
+}
+
+/// Services deferred preparation after the host has presented its frame.
+pub fn prepare_pending_html() {
+    HTML_PREPARATIONS.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        pending.retain(|pool| pool.strong_count() != 0);
+        for pool in pending.iter().filter_map(Weak::upgrade) {
+            let mut pool = pool.borrow_mut();
+            while pool.len() < 2 {
+                let view = unsafe { new_engine() };
+                let blank = Document::new(
+                    "<!doctype html><html><body></body></html>",
+                    "",
+                    bunny_ui::host::NetworkPolicy::Deny,
+                );
+                unsafe {
+                    let _ = msg_id_id_id(
+                        view,
+                        sel("loadHTMLString:baseURL:"),
+                        ns(&blank.sealed()),
+                        null_mut(),
+                    );
+                }
+                pool.push(SpareEngine(view));
+            }
+        }
+    });
+}
+
+fn take_prepared(document: &Document) -> Option<Id> {
+    if !preparation_allowed(document) {
+        return None;
+    }
+    HTML_PREPARATIONS.with(|pending| {
+        pending
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find_map(|pool| {
+                pool.borrow_mut()
+                    .pop()
+                    .map(|mut engine| std::mem::replace(&mut engine.0, null_mut()))
+            })
+    })
 }
 
 /// `WKNavigationActionPolicy` — what the delegate answers with.
@@ -248,10 +345,13 @@ extern "C" fn bridge_message(_this: Id, _sel: Sel, _controller: Id, message: Id)
 /// `webView:didCommitNavigation:` — the url is real from here on. A
 /// document's commit also shuts the door its own load came through:
 /// from here on nothing the document asks for moves it.
-extern "C" fn bridge_committed(_this: Id, _sel: Sel, view: Id, _navigation: Id) {
+extern "C" fn bridge_committed(_this: Id, _sel: Sel, view: Id, navigation: Id) {
     let Some(path) = key_of(view) else {
         return;
     };
+    if !current_navigation(&path, navigation) {
+        return;
+    }
     let wants_keyboard = LETTERS.with(|letters| {
         let mut letters = letters.borrow_mut();
         let Some(letter) = letters.get_mut(&path) else {
@@ -277,10 +377,13 @@ extern "C" fn bridge_committed(_this: Id, _sel: Sel, view: Id, _navigation: Id) 
 /// what the engine shows, and a picture of it is the page. A view the
 /// shell no longer files (swept between the ask and the answer)
 /// reports nothing.
-extern "C" fn bridge_finished(_this: Id, _sel: Sel, view: Id, _navigation: Id) {
+extern "C" fn bridge_finished(_this: Id, _sel: Sel, view: Id, navigation: Id) {
     let Some(path) = key_of(view) else {
         return;
     };
+    if !current_navigation(&path, navigation) {
+        return;
+    }
     unsafe {
         let url = msg_id(view, sel("URL"));
         if url.is_null() {
@@ -399,13 +502,14 @@ unsafe fn report_link(view: Id, action: Id) {
 /// the engine says when a newer navigation took the tab, and that one
 /// answers for both. Reporting it would tell an app its live load
 /// died at the moment it actually started.
-extern "C" fn bridge_failed(_this: Id, _sel: Sel, view: Id, _navigation: Id, error: Id) {
+extern "C" fn bridge_failed(_this: Id, _sel: Sel, view: Id, navigation: Id, error: Id) {
     unsafe {
         if cancelled(error) {
             return;
         }
         let url = failing_url(view, error);
         if let Some(path) = key_of(view) {
+            if !current_navigation(&path, navigation) { return; }
             dispatch(WebviewEvent::NavigationFailed { path, url, why: error_name(error) });
         }
     }
@@ -531,23 +635,16 @@ fn bridge() -> Id {
 pub fn create(path: &str, spec: &HostSpec) -> Id {
     // never reached for a video host — the shells refuse one before
     // they mount anything — and a null is the honest nothing if it were
-    let HostSpec::Webview { url, document, .. } = spec else { return std::ptr::null_mut() };
+    let HostSpec::Webview { url, document, .. } = spec else {
+        return std::ptr::null_mut();
+    };
     unsafe {
-        let config =
-            msg_id(msg_id(class("WKWebViewConfiguration"), sel("alloc")), sel("init"));
+        let view = document
+            .as_ref()
+            .and_then(take_prepared)
+            .unwrap_or_else(|| new_engine());
+        let config = msg_id(view, sel("configuration"));
         install_bridge(msg_id(config, sel("userContentController")), spec);
-        let view = msg_id(class("WKWebView"), sel("alloc"));
-        let view = msg_init_config(
-            view,
-            sel("initWithFrame:configuration:"),
-            CGRect {
-                origin: CGPoint { x: 0.0, y: 0.0 },
-                size: CGSize { width: 0.0, height: 0.0 },
-            },
-            config,
-        );
-        // the view copied what it needed from the configuration
-        msg_void(config, sel("release"));
         // navigation reports come through the bridge (the delegate
         // reference is weak; the bridge outlives every view), and so
         // does the ask a new-window link makes
@@ -568,6 +665,38 @@ pub fn create(path: &str, spec: &HostSpec) -> Id {
     }
 }
 
+unsafe fn new_engine() -> Id {
+    unsafe {
+        let config = msg_id(
+            msg_id(class("WKWebViewConfiguration"), sel("alloc")),
+            sel("init"),
+        );
+        let view = msg_init_config(
+            msg_id(class("WKWebView"), sel("alloc")),
+            sel("initWithFrame:configuration:"),
+            CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize {
+                    width: 0.0,
+                    height: 0.0,
+                },
+            },
+            config,
+        );
+        msg_void(config, sel("release"));
+        view
+    }
+}
+
+fn current_navigation(path: &str, navigation: Id) -> bool {
+    LETTERS.with(|letters| {
+        letters
+            .borrow()
+            .get(path)
+            .is_none_or(|letter| std::ptr::eq(letter.navigation, navigation))
+    })
+}
+
 /// Loads a document from MEMORY — `loadHTMLString:baseURL:`, the
 /// sealed html the spec holds, the base the engine resolves relative
 /// references by (nil for none). Filed first, loaded second: the
@@ -577,19 +706,34 @@ fn load_document(path: &str, view: Id, document: &Document) {
     LETTERS.with(|letters| {
         letters.borrow_mut().insert(
             path.to_string(),
-            Letter { digest: document.digest, expected: true, focus: document.focus },
+            Letter {
+                digest: document.digest,
+                expected: true,
+                focus: document.focus,
+                navigation: null_mut(),
+            },
         );
     });
     unsafe {
-        let base = if document.base.is_empty() { null_mut() } else { ns_url(&document.base) };
-        let _ = msg_id_id_id(
+        let base = if document.base.is_empty() {
+            null_mut()
+        } else {
+            ns_url(&document.base)
+        };
+        let navigation = msg_id_id_id(
             view,
             sel("loadHTMLString:baseURL:"),
             ns(&document.sealed()),
             base,
         );
+        LETTERS.with(|letters| {
+            if let Some(letter) = letters.borrow_mut().get_mut(path) {
+                letter.navigation = navigation;
+            }
+        });
     }
 }
+
 
 /// The view becomes the window's first responder — the keyboard is
 /// the page's. A view with no window yet takes nothing.
@@ -1084,3 +1228,7 @@ unsafe fn to_string(ns: Id) -> String {
         CStr::from_ptr(utf8).to_string_lossy().into_owned()
     }
 }
+
+#[cfg(test)]
+#[path = "webview_preparation_tests.rs"]
+mod preparation_tests;
