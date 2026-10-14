@@ -82,6 +82,7 @@ use crate::convert;
 use crate::scan;
 use crate::wire::{self, Message, Reader, Received, ToHost, ToIde};
 
+mod input;
 mod instances;
 use instances::{SceneLane, SceneMode, SelectedScene};
 
@@ -499,18 +500,13 @@ impl Host {
                 }
             }
             ToHost::Key { id, key, modifiers } => {
-                if let Some(scene) = self.scene(&id)
-                    && let Some(stroke) = stroke_named(&key, modifiers)
-                {
-                    scene.dirty |= scene.runtime.key_stroke(stroke).handled;
+                if let Some(scene) = self.scene(&id) {
+                    scene.dirty |= input::key(&scene.runtime, &key, modifiers);
                 }
             }
             ToHost::Text { id, text } => {
                 if let Some(scene) = self.scene(&id) {
-                    for typed in text.chars() {
-                        let stroke = bunny_ui_core::action::Stroke { pattern: KeyPattern::key(Key::Char(typed)), typed: Some(typed) };
-                        scene.dirty |= scene.runtime.key_stroke(stroke).handled;
-                    }
+                    scene.dirty |= input::text(&scene.runtime, &text);
                 }
             }
             ToHost::Override { id, site, op, patch } => {
