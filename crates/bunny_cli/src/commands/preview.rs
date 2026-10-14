@@ -469,6 +469,7 @@ fn print_event(event: &Event, _wanted: &[String]) {
             ToIde::Resource(_)
             | ToIde::Snapshot { .. }
             | ToIde::InstanceSnapshot { .. }
+            | ToIde::ExecutionsSelected { .. }
             | ToIde::Pong { .. } => {}
         },
     }
