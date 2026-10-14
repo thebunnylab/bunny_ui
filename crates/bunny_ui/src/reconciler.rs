@@ -607,11 +607,11 @@ impl Live {
     /// each one only while it is still the left entry's own: a boundary
     /// that mounted at the same path since then registered its own over
     /// it, from a slot of its own.
-    fn take_buried(&mut self, graveyard: &[Box<Entry>]) {
+    fn take_buried(&mut self, graveyard: &[RetiredEntry]) {
         if self.buried_actions == 0 {
             return;
         }
-        for entry in graveyard {
+        for RetiredEntry(entry) in graveyard {
             for (key, action) in &entry.actions {
                 if let std::collections::hash_map::Entry::Occupied(found) = self.actions.entry(Rc::clone(key))
                     && found.get().owner.as_ref().is_some_and(|owner| Rc::ptr_eq(owner, &entry.slot))
@@ -940,6 +940,13 @@ pub(crate) fn begin_pass(dirty: HashSet<String>) {
     });
 }
 
+type RetainedBoundary = (Rc<str>, Rc<Slot>);
+type AssembledEffects = (String, u64, Rc<[EffectFn]>);
+
+/// Preserve the existing allocation until idle collection. Unboxing at retirement
+/// would free this allocation inside the frame that removed the view.
+struct RetiredEntry(Box<Entry>);
+
 pub(crate) enum Decision {
     Skip,
     Render,
@@ -953,14 +960,10 @@ pub(crate) enum Decision {
 /// kept by key — a row renders once per key, and what the row shows
 /// moves through the row's own reads — so under it a retained clean
 /// row is skipped like any clean boundary.
-pub(crate) fn decide(path: &str) -> Decision {
-    decide_at(path).0
-}
-
-/// [`decide`], with the retained boundary's own path handed back when
+/// The retained boundary's own path is handed back when
 /// there is one: the one copy of it the page holds, for the marks and
 /// the reference to share instead of copying the path again.
-pub(crate) fn decide_at(path: &str) -> (Decision, Option<(Rc<str>, Rc<Slot>)>) {
+pub(crate) fn decide_at(path: &str) -> (Decision, Option<RetainedBoundary>) {
     PASS.with(|pass| {
         let pass = pass.borrow();
         LIVE.with(|live| {
@@ -1960,7 +1963,7 @@ thread_local! {
     /// effect generation it was built for. It has its own key: the
     /// derived tables are also rebuilt outside a pass, when a scene
     /// becomes current again, and that rebuild makes no queue.
-    static ASSEMBLED_EFFECTS: RefCell<Option<(String, u64, Rc<[EffectFn]>)>> =
+    static ASSEMBLED_EFFECTS: RefCell<Option<AssembledEffects>> =
         const { RefCell::new(None) };
 }
 
@@ -2237,7 +2240,7 @@ fn drop_entries<P: AsRef<str>>(paths: &[P]) {
                         // the entry's memory — a layout tree, a value, the
                         // bindings' objects — is freed when the page is
                         // idle, not inside the frame that let it go
-                        graveyard.push(entry);
+                        graveyard.push(RetiredEntry(entry));
                     }
                 }
                 if graveyard.len() > buried {
@@ -2252,7 +2255,7 @@ thread_local! {
     /// Entries that left the retention and wait for an idle moment to
     /// be freed: a thousand rows that leave a list are a thousand layout
     /// trees, and the frame that drops them must not pay their frees.
-    static GRAVEYARD: RefCell<Vec<Box<Entry>>> = const { RefCell::new(Vec::new()) };
+    static GRAVEYARD: RefCell<Vec<RetiredEntry>> = const { RefCell::new(Vec::new()) };
     /// The trees re-runs replaced, waiting for the same idle moment.
     static REPLACED: RefCell<Vec<Rc<Held>>> = const { RefCell::new(Vec::new()) };
     /// Bytes in immutable field snapshots replaced since the last release
@@ -2516,7 +2519,7 @@ pub(crate) fn sweep_stale(root: &str) {
                 let mut fall = |path: &Rc<str>, entry: Box<Entry>| {
                     live.unindex_leaving(path, &entry);
                     motor::identity::retire_view(path);
-                    graveyard.push(entry);
+                    graveyard.push(RetiredEntry(entry));
                 };
                 for run in &runs {
                     sweep_under(&mut retained, run, visit, &mut fall);
@@ -3210,7 +3213,11 @@ mod tests {
         assert!(run_action(&key, 1), "the row that came back answers");
         assert_eq!(all[1].presses.get(), 1);
         let _ = collect_garbage();
-        assert_eq!(click_keys("[2]"), [key.clone()], "the idle kept the new registration");
+        assert_eq!(
+            click_keys("[2]"),
+            std::slice::from_ref(&key),
+            "the idle kept the new registration"
+        );
         assert!(run_action(&key, 1));
         assert_eq!(all[1].presses.get(), 2);
 

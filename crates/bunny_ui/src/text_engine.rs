@@ -14,6 +14,8 @@
 //! cache): the key GAINS the probing mode — a line cache poisoned by a
 //! proposal is a classic bug.
 
+type CachedText<V> = HashMap<String, (V, std::cell::Cell<u32>)>;
+
 use std::cell::RefCell;
 use std::sync::Arc;
 use motor::hash::FxHashMap as HashMap;
@@ -715,9 +717,8 @@ pub struct MeasureCache {
     entries: std::cell::Cell<usize>,
     /// The size under which nothing ages out. `None` = [`CACHE_FLOOR`].
     floor: Option<usize>,
-    lines: RefCell<HashMap<FontKey, HashMap<String, (LineMetrics, std::cell::Cell<u32>)>>>,
-    breaks:
-        RefCell<HashMap<(FontKey, u32), HashMap<String, (BreakLines, std::cell::Cell<u32>)>>>,
+    lines: RefCell<HashMap<FontKey, CachedText<LineMetrics>>>,
+    breaks: RefCell<HashMap<(FontKey, u32), CachedText<BreakLines>>>,
     /// Multi-line fields, by path: their lines at the widths they were
     /// laid out at ([`MeasureCache::field_lines`]).
     fields: RefCell<HashMap<String, Vec<FieldLines>>>,
@@ -783,7 +784,7 @@ impl MeasureCache {
     pub fn begin_frame(&self) {
         let frame = self.frame.get().wrapping_add(1);
         self.frame.set(frame);
-        if frame % SWEEP_EVERY == 0 {
+        if frame.is_multiple_of(SWEEP_EVERY) {
             let mut fields = self.fields.borrow_mut();
             for kept in fields.values_mut() {
                 kept.retain(|lines| frame.wrapping_sub(lines.used.get()) <= FIELD_KEEP_FRAMES);
@@ -791,7 +792,7 @@ impl MeasureCache {
             fields.retain(|_, kept| !kept.is_empty());
         }
         let floor = self.floor();
-        if self.entries.get() <= floor || (floor > 0 && frame % SWEEP_EVERY != 0) {
+        if self.entries.get() <= floor || (floor > 0 && !frame.is_multiple_of(SWEEP_EVERY)) {
             return;
         }
         let mut lines = self.lines.borrow_mut();

@@ -1751,11 +1751,9 @@ impl Walk<'_> {
             .children
             .iter()
             .any(|child| child.layout.as_ref().is_some_and(|layout| layout.stretch))
-        {
-            if let Some(layout) = container.layout.as_mut() {
+            && let Some(layout) = container.layout.as_mut() {
                 layout.stretch = true;
             }
-        }
     }
 }
 
@@ -1798,7 +1796,6 @@ impl Walk<'_> {
     }
 
     /// A canvas island: the engine measures and paints ITS OWN pixels,
-
     /// locally — the subtree places at its own origin, so the commands
     /// are island-local by construction and the element gets a fixed
     /// box the browser never argues with.
@@ -2191,7 +2188,8 @@ mod tests {
             promised_fill: None,
         };
         assert!(walk.lowers_in(&walk.flow_key()), "a walk holds its own key");
-        let moves: [(&str, fn(&mut Walk)); 12] = [
+        type WalkChange = (&'static str, fn(&mut Walk));
+        let moves: [WalkChange; 12] = [
             ("the direction", |walk| walk.direction = motor::state::LayoutDirection::RightToLeft),
             ("the ink", |walk| walk.ink.push(Color { r: 1, g: 2, b: 3, a: 255 })),
             ("an ink scope", |walk| walk.ink_scopes.push(0)),
@@ -2639,9 +2637,11 @@ mod tests {
     #[test]
     fn text_under_a_hover_ink_inherits() {
         use crate::layout::VisualProps;
-        let mut props = VisualProps::default();
-        props.foreground = Some(Color::hex(0x888888));
-        props.foreground_hovered = Some(Color::hex(0xFFFFFF));
+        let props = VisualProps {
+            foreground: Some(Color::hex(0x888888)),
+            foreground_hovered: Some(Color::hex(0xFFFFFF)),
+            ..VisualProps::default()
+        };
         let tree = LayoutNode::Styled {
             props: std::rc::Rc::new(props),
             child: Box::new(text_node("flip me")),

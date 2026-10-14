@@ -649,10 +649,14 @@ impl TextField {
                                 // the bytes before the first one touched are as the
                                 // lent text has them — told only while the lent text
                                 // is the one these edits started from
-                                if changed && let Some(lent) = lent_for_edit.borrow_mut().as_mut() {
-                                    if lent.kept_before.is_some() || (before.is_some() && lent.version == before) {
-                                        lent.kept_before = Some(lent.kept_before.map_or(touched, |kept| kept.min(touched)));
-                                    }
+                                if changed
+                                    && let Some(lent) = lent_for_edit.borrow_mut().as_mut()
+                                    && (lent.kept_before.is_some()
+                                        || (before.is_some() && lent.version == before))
+                                {
+                                    lent.kept_before = Some(
+                                        lent.kept_before.map_or(touched, |kept| kept.min(touched)),
+                                    );
                                 }
                                 output
                             }
@@ -1893,16 +1897,27 @@ pub(crate) fn cross_align(alignment: Alignment) -> CrossAlign {
     }
 }
 
+struct StackPresentation<'a> {
+    kind: &'a str,
+    alignment: &'a str,
+    spacing: Option<f64>,
+    axis: Option<Axis>,
+    align: CrossAlign,
+}
+
 fn render_stack<C: View>(
     children: &C,
     ctx: &Context,
     out: &mut NodeList,
-    kind: &str,
-    alignment: &str,
-    spacing: Option<f64>,
-    axis: Option<Axis>,
-    align: CrossAlign,
+    presentation: StackPresentation<'_>,
 ) {
+    let StackPresentation {
+        kind,
+        alignment,
+        spacing,
+        axis,
+        align,
+    } = presentation;
     let mut nodes = NodeList::new();
     children.render_into(ctx, &mut nodes);
     let (prints, layouts) = nodes.into_parts();
@@ -1955,11 +1970,13 @@ impl<C: View> VStack<C> {
             &self.children,
             ctx,
             out,
-            "VStack",
-            self.alignment.print(),
-            self.spacing,
-            Some(Axis::Vertical),
-            self.alignment.cross(),
+            StackPresentation {
+                kind: "VStack",
+                alignment: self.alignment.print(),
+                spacing: self.spacing,
+                axis: Some(Axis::Vertical),
+                align: self.alignment.cross(),
+            },
         );
     }
 }
@@ -2019,11 +2036,13 @@ impl<C: View> HStack<C> {
                 &self.children,
                 ctx,
                 out,
-                "HStack",
-                self.alignment.print(),
-                self.spacing,
-                Some(Axis::Horizontal),
-                self.alignment.cross(),
+                StackPresentation {
+                    kind: "HStack",
+                    alignment: self.alignment.print(),
+                    spacing: self.spacing,
+                    axis: Some(Axis::Horizontal),
+                    align: self.alignment.cross(),
+                },
             );
         };
         let mut nodes = NodeList::new();
@@ -2123,11 +2142,13 @@ impl<C: View> ZStack<C> {
             &self.children,
             ctx,
             out,
-            "ZStack",
-            &alignment,
-            None,
-            None,
-            cross_align(self.alignment),
+            StackPresentation {
+                kind: "ZStack",
+                alignment: &alignment,
+                spacing: None,
+                axis: None,
+                align: cross_align(self.alignment),
+            },
         );
     }
 }

@@ -108,7 +108,7 @@ pub fn inflate_zlib(bytes: &[u8]) -> Option<Vec<u8>> {
     let cmf = bytes[0] as u32;
     let flg = bytes[1] as u32;
     // deflate method, window sane, header checksum, no preset dict
-    if cmf & 0x0F != 8 || (cmf * 256 + flg) % 31 != 0 || flg & 0x20 != 0 {
+    if cmf & 0x0F != 8 || !(cmf * 256 + flg).is_multiple_of(31) || flg & 0x20 != 0 {
         return None;
     }
     let deflate = &bytes[2..];
@@ -214,7 +214,7 @@ pub fn inflate_zlib(bytes: &[u8]) -> Option<Vec<u8>> {
         }
     }
     // the adler tail seals the stream
-    let at = 2 + bits.at + if bits.bit >= 8 { 0 } else { 0 };
+    let at = 2 + bits.at;
     let tail = bytes.get(at..at + 4);
     if let Some(tail) = tail {
         let want = u32::from_be_bytes([tail[0], tail[1], tail[2], tail[3]]);

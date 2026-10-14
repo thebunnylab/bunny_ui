@@ -942,10 +942,10 @@ fn rule_text(
     }
     // layers: the same alignment across the cell, so a centred stack
     // centres both ways
-    if matches!(kind, CreateKind::Layers) {
-        if let Some(align) = base.get("align-items").cloned() {
-            base.insert("justify-items", align);
-        }
+    if matches!(kind, CreateKind::Layers)
+        && let Some(align) = base.get("align-items").cloned()
+    {
+        base.insert("justify-items", align);
     }
     // the record's sides are logical, and so are the properties: a
     // right-to-left mount puts the leading inset on the right by itself
@@ -1105,7 +1105,7 @@ fn rule_text(
             // the shorthand leaves the spacing alone; the face's own
             // advance rides beside it
             if text.font.tracking != 0.0 {
-                base.insert("letter-spacing", format!("{}px", f64::from(text.font.tracking)));
+                base.insert("letter-spacing", format!("{}px", text.font.tracking));
             }
         }
         // after the font shorthand, which resets it — the served page

@@ -3149,7 +3149,7 @@ impl DisplayList {
                     DrawCommand::Image { rect: shift_rect(rect), source }
                 }
                 DrawCommand::PushClip { rect, corner_radius } => {
-                    DrawCommand::PushClip { rect: shift_rect(rect), corner_radius: corner_radius }
+                    DrawCommand::PushClip { rect: shift_rect(rect), corner_radius }
                 }
                 DrawCommand::PopClip => DrawCommand::PopClip,
             })
@@ -3534,7 +3534,10 @@ impl std::fmt::Debug for DragBuilder {
 
 /// The closure a drop lands in — same story.
 #[derive(Clone)]
-pub struct DropAction(pub std::rc::Rc<dyn Fn(&dyn std::any::Any, DropPoint)>);
+pub struct DropAction(pub std::rc::Rc<DropHandler>);
+
+/// A typed-value drop handler after erasure at the layout boundary.
+pub type DropHandler = dyn Fn(&dyn std::any::Any, DropPoint);
 
 impl std::fmt::Debug for DropAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3940,10 +3943,6 @@ pub struct Placement {
     /// A Dom frame with no live island skips the display list — the
     /// clip stack still runs, only the command collection sleeps.
     skip_display: bool,
-    /// A canvas island placed this pass. When collection was OFF, the
-    /// runtime re-runs the pass collected — an island's birth costs
-    /// one extra walk; a steady frame costs none.
-    saw_island: bool,
     /// The window and its safe area, when the pass has insets at all —
     /// `None` on every desktop, so the zero-inset walk is today's walk
     /// byte for byte. [`LayoutNode::IgnoresSafeArea`] reads it.
@@ -4249,7 +4248,7 @@ impl Rect {
         let y0 = self.origin.y.max(other.origin.y);
         let x1 = (self.origin.x + self.size.width).min(other.origin.x + other.size.width);
         let y1 = (self.origin.y + self.size.height).min(other.origin.y + other.size.height);
-        (x1 > x0 && y1 > y0).then(|| Rect {
+        (x1 > x0 && y1 > y0).then_some(Rect {
             origin: Point { x: x0, y: y0 },
             size: Size { width: x1 - x0, height: y1 - y0 },
         })
@@ -4363,9 +4362,6 @@ pub struct LayoutResult {
     /// Virtual windows that failed to cover the visible band this
     /// frame — the runtime re-materializes them in a follow-up pass.
     pub misses: Vec<String>,
-    /// A canvas island placed while display collection was off — the
-    /// runtime re-runs the pass collected.
-    pub(crate) saw_island: bool,
     /// The hits whose hover changes the picture (indices into `hits`),
     /// and the groups whose hover does. A frame re-reads the pointer
     /// after its layout; it lays out again only when the target the
@@ -4590,7 +4586,6 @@ pub(crate) fn layout_placing(
         customs: out.customs,
         hosts: out.hosts,
         misses: out.misses,
-        saw_island: out.saw_island,
         hover_sensitive: out.hover_sensitive,
         sensitive_groups: out.sensitive_groups,
         overlays: out.overlays,
@@ -4985,8 +4980,7 @@ pub fn layout_dom(
             customs: out.customs,
             hosts: out.hosts,
             misses: out.misses,
-            saw_island: out.saw_island,
-            hover_sensitive: out.hover_sensitive,
+                hover_sensitive: out.hover_sensitive,
             sensitive_groups: out.sensitive_groups,
             overlays: out.overlays,
             modal_floor: out.modal_floor,
@@ -5651,7 +5645,7 @@ impl LayoutNode {
             // holds it, never across it — so a bar of them never makes its
             // row take the leftover HEIGHT. With no stack in reach (a
             // spacer measured on its own) it keeps the old bi-axial answer.
-            LayoutNode::Spacer => enclosing_main.map_or(true, |main| axis == main),
+            LayoutNode::Spacer => enclosing_main.is_none_or(|main| axis == main),
             // a fill FILLS the offer on both axes — legitimately bi-axial
             LayoutNode::Fill | LayoutNode::Rectangle | LayoutNode::Ellipse => true,
             // a split FILLS the offer on both axes — its whole job is
@@ -6029,7 +6023,7 @@ impl LayoutNode {
                     // the print-parity stub keeps the old rigid box
                     None => Size { width: 40.0, height: 40.0 },
                     Some(source) => {
-                        let intrinsic = intrinsic_of(&*env.images, source);
+                        let intrinsic = intrinsic_of(env.images, source);
                         // a size that is not known yet arrives later, with
                         // no state write to announce it
                         if intrinsic.is_none() {
@@ -7148,7 +7142,6 @@ impl LayoutNode {
                 // the box becomes a canvas island, and the island slices
                 // exactly the commands between here and the close
                 let start = out.display.len();
-                out.saw_island = true;
                 if let Some(dom) = out.dom.as_mut() {
                     // the island covers what is VISIBLE, never the whole
                     // box: a box that declared four thousand points of
@@ -7653,7 +7646,7 @@ impl LayoutNode {
                     if cover {
                         // Fill spills over the frame on one axis — the
                         // clip is built in, never a separate modifier
-                        if let Some(rect) = cover_rect(frame, intrinsic_of(&*env.images, source)) {
+                        if let Some(rect) = cover_rect(frame, intrinsic_of(env.images, source)) {
                             out.push_clip(frame, 0.0);
                             out.draw(DrawCommand::Image {
                                 rect,
@@ -8312,8 +8305,7 @@ impl LayoutNode {
                 // between open and close). Pixel targets place through:
                 // everything is the pixel pipeline there already.
                 if out.dom.is_some() {
-                    out.saw_island = true;
-                    let start = out.display.len();
+                        let start = out.display.len();
                     if let Some(dom) = out.dom.as_mut() {
                         dom.open_canvas(frame, start);
                     }

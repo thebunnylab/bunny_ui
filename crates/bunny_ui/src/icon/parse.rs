@@ -359,7 +359,7 @@ pub fn parse(svg: &str) -> Result<ParsedGlyph, SvgError> {
                     numbers.push(value);
                 }
                 let mut verbs = Vec::new();
-                for (i, pair) in numbers.chunks_exact(2).enumerate() {
+                for (i, pair) in numbers.as_chunks::<2>().0.iter().enumerate() {
                     let verb = if i == 0 {
                         Verb::Move(pair[0], pair[1])
                     } else {
@@ -432,7 +432,7 @@ fn number_attribute(attributes: &[(&str, &str)], name: &str) -> f32 {
     attribute(attributes, name).and_then(|value| value.trim().parse().ok()).unwrap_or(0.0)
 }
 
-fn parse_attributes<'a>(rest: &'a str, line: usize) -> Result<Vec<(&'a str, &'a str)>, SvgError> {
+fn parse_attributes(rest: &str, line: usize) -> Result<Vec<(&str, &str)>, SvgError> {
     let mut out = Vec::new();
     let mut at = 0;
     let bytes = rest.as_bytes();
@@ -503,10 +503,10 @@ fn absorb_paint(state: &mut Inherited, attributes: &[(&str, &str)], warnings: &m
         state.stroke = Some(value != "none");
         state.stroke_tint = tint_of(value, "stroke", warnings);
     }
-    if let Some(value) = paint_attr(attributes, "stroke-width") {
-        if let Ok(width) = value.trim().parse() {
-            state.stroke_width = width;
-        }
+    if let Some(value) = paint_attr(attributes, "stroke-width")
+        && let Ok(width) = value.trim().parse()
+    {
+        state.stroke_width = width;
     }
     for key in ["fill-rule", "clip-rule"] {
         if let Some(value) = paint_attr(attributes, key) {
@@ -514,11 +514,10 @@ fn absorb_paint(state: &mut Inherited, attributes: &[(&str, &str)], warnings: &m
         }
     }
     for (key, kept) in [("stroke-linecap", "round"), ("stroke-linejoin", "round")] {
-        if let Some(value) = paint_attr(attributes, key) {
-            if value != kept {
+        if let Some(value) = paint_attr(attributes, key)
+            && value != kept {
                 warnings.push(format!("{key}=\"{value}\" becomes round — the one shape the pen has."));
             }
-        }
     }
 }
 
@@ -703,7 +702,7 @@ fn dash_verbs(verbs: &[Verb], pattern: &[f32]) -> Vec<Verb> {
 }
 
 fn ellipse_verbs(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<Verb> {
-    const KAPPA: f32 = 0.552_284_75;
+    const KAPPA: f32 = 0.552_284_8;
     let (kx, ky) = (rx * KAPPA, ry * KAPPA);
     vec![
         Verb::Move(cx + rx, cy),
@@ -726,7 +725,7 @@ fn rect_verbs(x: f32, y: f32, w: f32, h: f32, rx: f32) -> Vec<Verb> {
             Verb::Close,
         ];
     }
-    const KAPPA: f32 = 0.552_284_75;
+    const KAPPA: f32 = 0.552_284_8;
     let k = r * KAPPA;
     vec![
         Verb::Move(x + r, y),
