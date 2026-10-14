@@ -31,6 +31,7 @@ use bunny_ui::view::View;
 
 use ffi::AppEvent;
 pub use bunny_ui_apple::{CoreGraphicsImageEngine, CoreTextEngine};
+pub use bunny_ui_apple::webview::HtmlPreparation;
 pub use metal::OffscreenGpu;
 
 /// Points the shell's frame driver at the pace the runtime asks for:
@@ -1899,6 +1900,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 );
             }
             present(runtime, display, via);
+            // Prepare only after the window has presented its frame.
+            webview::prepare_pending_html();
         point_cursor(runtime, !resizing());
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
             let rect = snapshot.caret_rect;

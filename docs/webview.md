@@ -1,5 +1,23 @@
 # A webview
 
+## Deferred Apple HTML preparation
+
+The macOS host exports `HtmlPreparation::request()`. The returned non-Send
+resource owns up to two unclaimed blank WebKit engines. Requesting it performs
+no native allocation; after a native frame is presented, the host creates the
+engines and starts loading a sealed empty document asynchronously. Eligible
+local, read-only, network-denied documents claim them, and the host replenishes
+the unclaimed reserve after presentation. Editable documents, remote-image
+permission and nonempty bases use their ordinary creation path.
+
+Each claimed view transfers its retain to the mounted host. Used views are not
+returned to the reserve; this preparation does not yet implement retention of a
+reader view across changing host identities. Dropping the resource stops and
+releases unclaimed engines. Navigation identity rejects late events from the
+preparation page after a view was claimed. Native first-session measurements
+must establish its benefit; a populated reserve is not performance approval.
+
+
 *Status: the native host, the macOS webview and its instrumentation
 floor — user scripts, the message bus, navigation reports (both legs:
 the commit and the refusal), eval with the value coming back, console
