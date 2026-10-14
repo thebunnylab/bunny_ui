@@ -259,3 +259,30 @@ impl InstanceCommand {
         })
     }
 }
+
+/// Application execution intent, independent of rendering traits and overrides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionMode {
+    /// Use application fixtures; do not enable live services.
+    Design,
+    /// Execute using the application's configured live services.
+    Play,
+}
+impl ExecutionMode {
+    pub(super) fn put(self, out: &mut Vec<u8>) {
+        out.u8(match self {
+            Self::Design => 0,
+            Self::Play => 1,
+        });
+    }
+    pub(super) fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
+        match c.u8()? {
+            0 => Ok(Self::Design),
+            1 => Ok(Self::Play),
+            tag => Err(Malformed::BadTag {
+                what: "ExecutionMode",
+                tag,
+            }),
+        }
+    }
+}

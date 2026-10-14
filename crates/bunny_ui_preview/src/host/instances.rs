@@ -44,10 +44,10 @@ impl Scene {
         }
     }
     pub(super) fn needs_frame(&self) -> bool {
-        match self.override_set() {
+        self.execution.with(|| match self.override_set() {
             Some(scope) => scope.with(|| self.runtime.needs_frame()),
             None => self.runtime.needs_frame(),
-        }
+        })
     }
 
     fn refresh_overrides(&mut self) {
@@ -69,6 +69,55 @@ impl Scene {
 }
 
 impl Host {
+    pub(super) fn execution_for(
+        &self,
+        message: &ToHost,
+    ) -> Option<bunny_ui_core::preview::ExecutionContext> {
+        let scene = match message {
+            ToHost::Instance {
+                instance, variant, ..
+            }
+            | ToHost::SetExecution {
+                instance, variant, ..
+            } => self
+                .scenes
+                .iter()
+                .find(|scene| scene.instance() == Some(instance) && scene.variant == *variant),
+            ToHost::Pointer { id, .. }
+            | ToHost::Wheel { id, .. }
+            | ToHost::Touch { id, .. }
+            | ToHost::Magnify { id, .. }
+            | ToHost::Key { id, .. }
+            | ToHost::Text { id, .. } => self
+                .scenes
+                .iter()
+                .find(|scene| scene.instance().is_none() && scene.id == *id),
+            _ => None,
+        }?;
+        Some(scene.execution.context())
+    }
+
+    pub(super) fn set_execution(
+        &mut self,
+        instance: SceneInstanceId,
+        variant: u32,
+        mode: wire::ExecutionMode,
+    ) {
+        let Some(scene) = self
+            .scenes
+            .iter_mut()
+            .find(|scene| scene.instance() == Some(&instance) && scene.variant == variant)
+        else {
+            self.instance_error(instance, Some(variant), "instance variant is not selected");
+            return;
+        };
+        let mode = match mode {
+            wire::ExecutionMode::Design => ExecutionMode::Design,
+            wire::ExecutionMode::Play => ExecutionMode::Play,
+        };
+        scene.dirty |= scene.execution.set_mode(mode);
+    }
+
     fn instance_error(&mut self, instance: SceneInstanceId, variant: Option<u32>, message: &str) {
         (self.sink)(ToIde::InstanceError {
             instance,

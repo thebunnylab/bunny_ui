@@ -144,3 +144,40 @@ keep previewing while the designer withholds unsupported mount insertion. No wir
 message or existing capability changes. The designer's Mount action emits
 `on_mount`, while legacy appear callbacks remain
 explicitly identified by their different behavior.
+
+### Design and Play execution contexts
+
+`Hello.caps & caps::EXECUTION != 0` (bit 16) enables `SetExecution` (kind 82),
+addressed by `SceneInstanceId` and variant with `Design` or `Play`. It does not
+change a frozen selection, command, frame or version-1 payload. Tools send it only
+after negotiation; older hosts retain the individual preview lane and cannot
+promise automatic fixture/live switching. An absent instance or variant returns
+`InstanceError`. Repeating the current mode is inert and only a changed scene is
+marked dirty. Rendering traits and provisional overrides remain independent.
+
+Each scene owns a `preview::ExecutionScope`, initially Design. Preview discovery
+uses a temporary Design scope which closes immediately after reading the traits.
+Construction, layout/mount, dirty checks and input run under the addressed
+context. Reordering or changing traits preserves it; removing a scene, replacing
+a failed runtime or dropping the host closes the old context. Recreating the
+same identity opens a fresh Design context. Light/dark variants are independent.
+
+Application adapters capture `preview::ExecutionContext::current()` when their
+ViewModel is constructed, read `mode()` for the initial state and retain an
+`ExecutionSubscription` from `subscribe` to observe subsequent changes.
+`Some(Design)` means fixtures, `Some(Play)` permits the application's configured
+live services, and `None` means the owner has closed: cancel work and reject late
+results. The framework supplies no HTTP client, executor, credentials or service
+model. Standalone applications may own an explicit scope around their own runtime.
+
+Captured handles do not extend the owner's lifetime. A scoped `with` call restores
+the previous thread-local context on return and unwind, and does not revive a
+closed handle. Async tasks must capture their context explicitly; global task
+polling does not infer a scene. Notifications run under their own context with
+no registry borrow, permit detach/reentry, and skip obsolete intermediate states
+when another listener changes the mode. They observe state rather than replaying
+an event log. Adapter callbacks must not oscillate modes indefinitely. A failed
+listener does not prevent the others from observing closure; its panic resumes
+after notification, except during an existing unwind, which preserves the
+original failure. Reading a mode alone is not a reactive dependency: subscriptions
+must project changes into the application's own state when the view depends on it.
