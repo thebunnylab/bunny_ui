@@ -35,6 +35,9 @@ use crate::theme::Theme;
 use crate::view::View;
 use motor::state::{LayoutDirection, Locale, SizeClass};
 
+mod execution;
+pub use execution::{ExecutionContext, ExecutionMode, ExecutionScope, ExecutionSubscription};
+
 /// A view and the traits it is shown under.
 #[derive(Clone, Debug)]
 pub struct Preview<V: View> {

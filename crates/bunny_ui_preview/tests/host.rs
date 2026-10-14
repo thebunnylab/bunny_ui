@@ -824,3 +824,6 @@ fn an_app_root_panic_during_discovery_is_reported_without_killing_the_host() {
 
 #[path = "support/instances.rs"]
 mod instances;
+
+#[path = "support/execution.rs"]
+mod execution;

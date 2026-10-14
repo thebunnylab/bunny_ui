@@ -71,7 +71,7 @@ use bunny_ui_core::host::HostSpec;
 use bunny_ui_core::image_engine::{ImageEngine, ImageSource};
 use bunny_ui_core::layout::{Proposal, Size};
 use bunny_ui_core::prelude::*;
-use bunny_ui_core::preview::Traits;
+use bunny_ui_core::preview::{ExecutionMode, ExecutionScope, Traits};
 use bunny_ui_core::text_engine::TextEngine;
 use bunny_ui_hot::preview::preview_entry;
 
@@ -184,6 +184,7 @@ impl Mode {
 /// One scene: a preview variant the tool selected, rendering on a runtime
 /// of its own.
 struct Scene {
+    execution: ExecutionScope,
     id: String,
     mode: SceneMode,
     ident: Rc<str>,
@@ -349,7 +350,7 @@ impl Host {
             generation: self.generation,
             workspace_root: self.config.manifest_dir.to_string_lossy().into_owned(),
             package: self.config.package.clone(),
-            caps: wire::caps::PLACE | wire::caps::INSTANCES | wire::caps::SHAPES | wire::caps::MOUNT,
+            caps: wire::caps::PLACE | wire::caps::INSTANCES | wire::caps::SHAPES | wire::caps::MOUNT | wire::caps::EXECUTION,
         });
         self.ready();
     }
@@ -369,7 +370,10 @@ impl Host {
             match preview_entry(ident) {
                 Ok(entry) => {
                     IN_PASS.with(|flag| flag.set(true));
-                    let traits = std::panic::catch_unwind(AssertUnwindSafe(|| convert::traits(&(entry.make)().traits)));
+                    let traits = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        let discovery = ExecutionScope::new(ExecutionMode::Design);
+                        discovery.with(|| convert::traits(&(entry.make)().traits))
+                    }));
                     IN_PASS.with(|flag| flag.set(false));
                     let traits = match traits {
                         Ok(traits) => traits,
@@ -421,7 +425,15 @@ impl Host {
 
     /// One message from the tool.
     pub fn handle(&mut self, message: ToHost) {
+        match self.execution_for(&message) {
+            Some(context) => context.with(|| self.handle_scoped(message)),
+            None => self.handle_scoped(message),
+        }
+    }
+
+    fn handle_scoped(&mut self, message: ToHost) {
         match message {
+            ToHost::SetExecution { instance, variant, mode } => self.set_execution(instance, variant, mode),
             ToHost::Select(selections) => self.select(selections),
             ToHost::SelectInstances(selections) => self.select_instances(selections),
             ToHost::Instance {
@@ -649,6 +661,7 @@ impl Host {
         runtime.record_sites(true);
         traits.apply(&runtime);
         Scene {
+            execution: ExecutionScope::new(ExecutionMode::Design),
             mode: instance.map_or(SceneMode::Legacy, |id| SceneMode::Instance {
                 id,
                 overrides: provenance::OverrideSet::new(std::iter::empty()),
@@ -776,10 +789,11 @@ impl Host {
     /// tool told, and a fresh runtime standing in for the next generation.
     fn pass(&mut self, index: usize) -> Option<Pass> {
         let scope = self.scenes[index].override_set().cloned();
-        match scope {
+        let context = self.scenes[index].execution.context();
+        context.with(|| match scope {
             Some(scope) => scope.with(|| self.pass_scoped(index)),
             None => self.pass_scoped(index),
-        }
+        })
     }
 
     fn pass_scoped(&mut self, index: usize) -> Option<Pass> {
@@ -817,6 +831,8 @@ impl Host {
                     .image_engine(Rc::clone(&self.engines.images));
                 fresh.record_sites(true);
                 scene.traits.apply(&fresh);
+                let mode = scene.execution.context().mode().unwrap_or(ExecutionMode::Design);
+                scene.execution = ExecutionScope::new(mode);
                 scene.runtime = fresh;
                 let event = match scene.instance() {
                     Some(instance) => ToIde::InstancePanicked {
