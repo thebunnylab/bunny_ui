@@ -23,14 +23,15 @@
 //!   lane on a thread of its own, since the session is not `Send`.
 
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use bunny_ui_preview::scan::{self, ScanReport};
-use bunny_ui_preview::wire::{self, Message, Reader, Received, ToHost, ToIde};
+use bunny_ui_preview::wire::{self, Message, Received, ToHost, ToIde};
 
 use crate::cargo::{Diagnostic, Diagnostics};
 use crate::devices::{Device, Kind, Platform, State};
@@ -39,8 +40,15 @@ use crate::hot::{Change, Extra, Hot, Missed};
 use crate::platform::{self, Session};
 use crate::project::Project;
 
+mod incoming;
+
 /// How long the host may take to call back after it started.
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A lightweight notification that the incoming queue may have changed.
+/// Called on the socket reader or registering thread; it must not block or panic.
+/// The owner drains messages through `poll` or `wait`, including after spurious wakes.
+pub type WakeHook = Arc<dyn Fn() + Send + Sync>;
 
 /// What the lane builds with.
 #[derive(Clone, Debug, Default)]
@@ -99,6 +107,7 @@ pub struct Live {
     app: Box<dyn Session>,
     line: TcpStream,
     inbox: Receiver<Received>,
+    incoming: incoming::Signal,
     pid: u32,
     project: Project,
     options: Options,
@@ -214,7 +223,9 @@ fn start(project: Project, options: Options, events: &mut Vec<Event>) -> Step {
         return failed(project, options, String::from("the line to the host broke"), events);
     };
     let (sender, inbox) = mpsc::channel();
-    std::thread::spawn(move || read_line(reading, &sender));
+    let incoming = incoming::Signal::default();
+    let signal = incoming.clone();
+    std::thread::spawn(move || incoming::read(reading, &sender, &signal));
     if let Some(generation) = app.generation() {
         events.push(Event::Sources {
             generation,
@@ -222,7 +233,7 @@ fn start(project: Project, options: Options, events: &mut Vec<Event>) -> Step {
         });
     }
     events.push(Event::Built { took: began.elapsed() });
-    Step::Live(Preview { state: Live { hot: Box::new(hot), app, line, inbox, pid, project, options } })
+    Step::Live(Preview { state: Live { hot: Box::new(hot), app, line, inbox, incoming, pid, project, options } })
 }
 
 /// Waits for the host to connect, the app watched meanwhile.
@@ -252,31 +263,16 @@ fn exit(code: Option<i32>) -> String {
     code.map_or_else(|| String::from("a signal ended it"), |code| format!("exit code {code}"))
 }
 
-/// Reads frames off the line until it closes.
-fn read_line(mut reading: TcpStream, sender: &mpsc::Sender<Received>) {
-    let mut reader = Reader::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let read = match reading.read(&mut buf) {
-            Ok(0) | Err(_) => return,
-            Ok(read) => read,
-        };
-        reader.feed(&buf[..read]);
-        loop {
-            match reader.pull() {
-                Ok(Some(received)) => {
-                    if sender.send(received).is_err() {
-                        return;
-                    }
-                }
-                Ok(None) => break,
-                Err(_) => return,
-            }
-        }
-    }
-}
-
 impl Preview<Live> {
+    /// Install, replace or remove the incoming-message notification.
+    /// Registration wakes immediately so earlier queued messages are not lost.
+    /// Later wakes follow enqueue or reader closure, outside the registration lock.
+    /// Replacing/removing a callback does not wait for an invocation already in flight.
+    /// A successful restart retains this hook; existing polling clients need none.
+    pub fn set_waker(&self, hook: Option<WakeHook>) {
+        self.state.incoming.set(hook);
+    }
+
     /// The host's process id — the leader of its process group on Unix.
     pub fn pid(&self) -> u32 {
         self.state.pid
@@ -356,8 +352,13 @@ impl Preview<Live> {
     pub fn restart(mut self, events: &mut Vec<Event>) -> Step {
         let _ = self.send(&ToHost::Bye);
         self.state.app.stop();
+        let hook = self.state.incoming.current();
         let Live { project, options, .. } = self.state;
-        start(project, options, events)
+        let step = start(project, options, events);
+        if let Step::Live(live) = &step {
+            live.set_waker(hook);
+        }
+        step
     }
 
     /// Ends the host.
@@ -372,3 +373,7 @@ impl From<Error> for Event {
         if error.diagnostics.is_empty() { Event::Note(error.message) } else { Event::BuildFailed { diagnostics: error.diagnostics } }
     }
 }
+
+#[cfg(test)]
+#[path = "incoming_tests.rs"]
+mod incoming_tests;
