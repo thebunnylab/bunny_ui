@@ -294,18 +294,10 @@ impl Host {
                 scene.dirty |= scene.runtime.magnify(x, y, scale);
             }
             InstanceCommand::Key { key, modifiers } => {
-                if let Some(stroke) = stroke_named(&key, modifiers) {
-                    scene.dirty |= scene.runtime.key_stroke(stroke).handled;
-                }
+                scene.dirty |= input::key(&scene.runtime, &key, modifiers);
             }
             InstanceCommand::Text { text } => {
-                for typed in text.chars() {
-                    let stroke = bunny_ui_core::action::Stroke {
-                        pattern: KeyPattern::key(Key::Char(typed)),
-                        typed: Some(typed),
-                    };
-                    scene.dirty |= scene.runtime.key_stroke(stroke).handled;
-                }
+                scene.dirty |= input::text(&scene.runtime, &text);
             }
             InstanceCommand::Override { site, op, patch } => {
                 Self::instance_override(scene, site, as_override(op, convert::modifier(patch)))

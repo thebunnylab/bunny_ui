@@ -114,6 +114,13 @@ image resources remain keyed by content. Existing payloads, version-1 goldens an
 legacy host behavior remain unchanged. Tools must retain the old lane for hosts
 without the capability and explain why instance composition is unavailable.
 
+Both input lanes offer strokes to the runtime's custom handlers before applying
+ordinary field edits. `Text` carries committed Unicode text; `Key` carries
+navigation, deletion, selection and submission, without inserting printable key
+names a second time. Command+A and Control+A select the focused field's text.
+Enter and vertical arrows follow the runtime's single/multiline field policy.
+The host never reads or writes the system clipboard on behalf of a key message.
+
 Each instance variant owns an immutable `provenance::OverrideSet`. Rendering,
 input and dirty checks enter its context and restore the outer context, even on
 panic. A set retains its own version across passes, so another artboard does not

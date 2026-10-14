@@ -827,3 +827,6 @@ mod instances;
 
 #[path = "support/execution.rs"]
 mod execution;
+
+#[path = "support/input.rs"]
+mod input;
