@@ -7494,7 +7494,12 @@ impl Runtime {
         // to it is a reason to ask them again, and a write to anything
         // else is not
         motor::identity::begin_effects(self.pump_fresh.replace(false));
-        let changed = effects::take().iter().any(|effect| effect(&ctx));
+        // Every mounted effect must observe this pass. Short-circuiting after
+        // the first change can starve later mounts/tasks once the tree is quiet.
+        let mut changed = false;
+        for effect in &*effects::take() {
+            changed |= effect(&ctx);
+        }
         motor::identity::end_effects();
         changed
     }
