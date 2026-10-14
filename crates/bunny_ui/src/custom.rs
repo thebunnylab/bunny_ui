@@ -583,6 +583,16 @@ impl<'a> Painter<'a> {
         });
     }
 
+    /// A filled ellipse inscribed in `rect`, using the shared vector pipeline.
+    pub fn fill_ellipse(&mut self, rect: Rect, color: Color) {
+        if let Some(source) = crate::shapes::ellipse_source(rect.size, color) {
+            self.display.push(DrawCommand::Image {
+                rect: self.shift(rect),
+                source,
+            });
+        }
+    }
+
     /// A border painted INWARD from the edge.
     pub fn stroke(
         &mut self,

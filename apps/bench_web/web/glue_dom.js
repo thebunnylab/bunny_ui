@@ -446,6 +446,9 @@ const KIND_BASE = [
   "display:block;pointer-events:none;box-sizing:border-box;min-width:0;min-height:0",
   // 16 grid: sparse cells in equal-width tracks
   "display:grid;box-sizing:border-box;min-width:0;min-height:0",
+  // 17 rectangle, 18 ellipse: independent axes, inherited hover/press ink
+  "box-sizing:border-box;min-width:0;min-height:0;background:currentColor",
+  "box-sizing:border-box;min-width:0;min-height:0;background:currentColor;border-radius:50%",
 ];
 
 // The rules of one look: the base, then one per state. The twin of the

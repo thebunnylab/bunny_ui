@@ -850,6 +850,16 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
         // its box to the child, and only a flex line can hand the
         // offer down (width by the stretch default, height by the
         // fill flag)
+        CreateKind::Rectangle => (
+            "div",
+            &[("box-sizing", "border-box"), ("min-width", "0"), ("min-height", "0"),
+              ("background", "currentColor")],
+        ),
+        CreateKind::Ellipse => (
+            "div",
+            &[("box-sizing", "border-box"), ("min-width", "0"), ("min-height", "0"),
+              ("background", "currentColor"), ("border-radius", "50%")],
+        ),
         CreateKind::Group | CreateKind::Box => (
             "div",
             &[

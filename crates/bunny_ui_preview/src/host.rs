@@ -349,7 +349,7 @@ impl Host {
             generation: self.generation,
             workspace_root: self.config.manifest_dir.to_string_lossy().into_owned(),
             package: self.config.package.clone(),
-            caps: wire::caps::PLACE | wire::caps::INSTANCES,
+            caps: wire::caps::PLACE | wire::caps::INSTANCES | wire::caps::SHAPES,
         });
         self.ready();
     }
