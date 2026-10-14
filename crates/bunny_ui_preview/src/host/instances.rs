@@ -135,8 +135,12 @@ impl Host {
         );
     }
 
-    pub(super) fn select_executions(&mut self, selections: Vec<wire::ExecutionSelection>) {
-        self.select_instances_in(
+    pub(super) fn select_executions(
+        &mut self,
+        request: u64,
+        selections: Vec<wire::ExecutionSelection>,
+    ) {
+        if self.select_instances_in(
             selections
                 .into_iter()
                 .map(|pick| {
@@ -147,15 +151,30 @@ impl Host {
                     (pick.selection, Some(mode))
                 })
                 .collect(),
-        );
+        ) {
+            // Publish a current frame after the stream fence even for retained scenes.
+            // Clients may have discarded intermediate frames during a superseded request.
+            for scene in self
+                .scenes
+                .iter_mut()
+                .filter(|scene| scene.instance().is_some())
+            {
+                scene.last = None;
+                scene.dirty = true;
+            }
+            (self.sink)(ToIde::ExecutionsSelected { request });
+        }
     }
 
-    fn select_instances_in(&mut self, selections: Vec<(InstanceSelection, Option<ExecutionMode>)>) {
+    fn select_instances_in(
+        &mut self,
+        selections: Vec<(InstanceSelection, Option<ExecutionMode>)>,
+    ) -> bool {
         let mut identities = HashSet::new();
         for (selection, _) in &selections {
             if !identities.insert(&selection.instance) {
                 self.instance_error(selection.instance.clone(), None, "duplicate scene instance");
-                return;
+                return false;
             }
             if preview_entry(&selection.ident).is_err() {
                 self.instance_error(
@@ -163,7 +182,7 @@ impl Host {
                     None,
                     "preview is not exported by this build",
                 );
-                return;
+                return false;
             }
         }
         self.select_scenes(
@@ -181,6 +200,7 @@ impl Host {
                 })
                 .collect(),
         );
+        true
     }
 
     pub(super) fn instance_command(

@@ -433,7 +433,7 @@ impl Host {
 
     fn handle_scoped(&mut self, message: ToHost) {
         match message {
-            ToHost::SelectExecutions(selections) => self.select_executions(selections),
+            ToHost::SelectExecutions { request, selections } => self.select_executions(request, selections),
             ToHost::SetExecution { instance, variant, mode } => self.set_execution(instance, variant, mode),
             ToHost::Select(selections) => self.select(selections),
             ToHost::SelectInstances(selections) => self.select_instances(selections),
