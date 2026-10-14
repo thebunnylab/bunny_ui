@@ -84,6 +84,8 @@ pub mod caps {
     pub const INSTANCES: u32 = 2;
     /// Ellipse builders and inherited foreground ink for basic shapes.
     pub const SHAPES: u32 = 4;
+    /// The application framework provides once-per-identity on_mount handlers.
+    pub const MOUNT: u32 = 8;
 }
 
 // =============================================================================

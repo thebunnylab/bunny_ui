@@ -130,3 +130,17 @@ Hosts offering `ellipse()` and inherited foreground ink for `rectangle()` announ
 The ellipse uses the existing vector resource and image draw, so no frozen draw,
 resource or message payload changes. Source sites name its builder `ellipse`.
 See [Basic shapes](shapes.md) for layout, ink and responsive DOM behavior.
+
+### Mount actions in application components
+
+`ViewExt::on_mount` runs once per call site and view identity, independently for
+each preview scene instance. Rebuilding or reordering the same identity does not
+repeat it; removing and later mounting that identity runs it again. Helpers that
+emit multiple actions at one source site use `on_mount_keyed` with distinct keys.
+The ordinary application runtime owns these retained effect slots; Studio is not
+required. `on_appear` retains its existing render-time behavior for compatibility.
+The preview host advertises `Hello.caps & MOUNT` (bit 8), so older projects can
+keep previewing while the designer withholds unsupported mount insertion. No wire
+message or existing capability changes. The designer's Mount action emits
+`on_mount`, while legacy appear callbacks remain
+explicitly identified by their different behavior.
