@@ -266,7 +266,7 @@ fn hello_lists_what_the_binary_exports_and_names_what_it_does_not() {
     let (mut host, seen) = host();
     host.hello();
     let messages = seen.borrow_mut().drain(..).collect::<Vec<_>>();
-    assert!(matches!(&messages[0], ToIde::Hello { wire: 1, package, .. } if package == "host"));
+    assert!(matches!(&messages[0], ToIde::Hello { wire: 1, package, caps, .. } if package == "host" && caps & wire::caps::MOUNT != 0));
     match &messages[1] {
         ToIde::Ready { generation: 0, previews, missing } => {
             let idents: Vec<&str> = previews.iter().map(|p| p.ident.as_str()).collect();

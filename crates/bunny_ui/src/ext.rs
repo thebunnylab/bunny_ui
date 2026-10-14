@@ -1168,6 +1168,32 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::OnAppear(Rc::new(action)))
     }
 
+    /// Run once when this view identity mounts. Rebuilding or reordering the
+    /// same identity does not run it again; removing and remounting does.
+    /// Each scene instance owns an independent lifecycle slot.
+    #[track_caller]
+    fn on_mount(self, action: impl Fn() + 'static) -> Modified<Self> {
+        self.on_mount_keyed(Location::caller(), action)
+    }
+
+    /// A mount action with an explicit site, for helpers called more than once
+    /// within the same view identity. Use a distinct key for each action.
+    #[track_caller]
+    fn on_mount_keyed(
+        self,
+        site: impl Into<Site>,
+        action: impl Fn() + 'static,
+    ) -> Modified<Self> {
+        Modified::new(
+            self,
+            Modifier::Effect {
+                name: "onMount",
+                detail: "()",
+                effect: effects::change_effect(site.into(), || (), true, move |_, _| action()),
+            },
+        )
+    }
+
     /// `.onChange(of:initial:) { old, new in … }`
     ///
     /// The change-detection slot's site is the callsite itself

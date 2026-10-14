@@ -18164,3 +18164,6 @@ mod input_focus_policy_tests {
         assert!(runtime.focused().is_none());
     }
 }
+
+#[cfg(test)]
+mod mount_tests;
