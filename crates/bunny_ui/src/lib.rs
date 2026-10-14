@@ -78,6 +78,7 @@ pub mod raster;
 pub mod pacing;
 mod paranoid;
 mod reconciler;
+mod shapes;
 pub mod runtime;
 #[cfg(feature = "canvas")]
 pub mod slider;

@@ -857,6 +857,20 @@ impl Walk<'_> {
                 fill.layout.as_mut().expect("flow node").grow = true;
                 fill.style.look_mut().background = Some(Color::FILL);
             }
+            LayoutNode::Rectangle | LayoutNode::Ellipse => {
+                let kind = if matches!(tree, LayoutNode::Ellipse) {
+                    DomKind::Ellipse
+                } else {
+                    DomKind::Rectangle
+                };
+                let shape = placed(out, node(kind));
+                shape.layout.as_mut().expect("flow node").grow = true;
+                // currentColor follows inherited hover/press ink in CSS too.
+                // An unstyled shape retains the original rectangle's fill.
+                if self.ink.is_empty() {
+                    shape.style.look_mut().color = Some(Color::FILL);
+                }
+            }
             LayoutNode::Leaf { size } => {
                 let leaf = placed(out, node(DomKind::Box));
                 let layout = leaf.layout.as_mut().expect("flow node");

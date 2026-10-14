@@ -154,3 +154,24 @@ fn a_place_patch_is_the_modifier_it_names() {
         Modifier::Span(1, 1)
     ));
 }
+
+#[test]
+fn ellipse_geometry_and_ink_round_trip_through_existing_vector_resources() {
+    let size = Size {
+        width: 200.0,
+        height: 80.0,
+    };
+    let runtime = Runtime::new();
+    let display = runtime.display_frame(&ellipse().foreground_color(theme::accent()), size);
+    let mut strings = Strings::new();
+    let (commands, sources) = lower(&display, &mut strings);
+    assert_eq!(sources.len(), 1);
+    let mut images = HashMap::new();
+    for source in &sources {
+        let sent = resource(source).expect("shape has a vector resource");
+        assert!(matches!(sent.kind, wire::ResourceKind::Vector { .. }));
+        images.insert(sent.key, image_source(&sent).unwrap());
+    }
+    let raised = raise(&commands, &strings.into_table(), &images).unwrap();
+    assert_eq!(raised.as_slice(), display.as_slice());
+}

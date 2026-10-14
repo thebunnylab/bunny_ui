@@ -858,6 +858,10 @@ pub enum LayoutNode {
     },
     /// Fills whatever the proposal gives (Rectangle).
     Fill,
+    /// A rectangle filled with the inherited shape ink.
+    Rectangle,
+    /// A filled ellipse inscribed in the proposed rectangle.
+    Ellipse,
     /// `hints` are what an `.element(…)` over the stack says
     /// ([`ElementHints`]), and `action` the one an `.on_click(…)` over
     /// it arms — the stack is the target an [`LayoutNode::Interactive`]
@@ -2683,6 +2687,8 @@ impl LayoutNode {
             | LayoutNode::Image { .. }
             | LayoutNode::Icon { .. }
             | LayoutNode::Fill
+            | LayoutNode::Ellipse
+            | LayoutNode::Rectangle
             | LayoutNode::BoundaryHint { .. } => true,
             LayoutNode::Stack { children, .. }
             | LayoutNode::Flow { children, .. }
@@ -5647,7 +5653,7 @@ impl LayoutNode {
             // spacer measured on its own) it keeps the old bi-axial answer.
             LayoutNode::Spacer => enclosing_main.map_or(true, |main| axis == main),
             // a fill FILLS the offer on both axes — legitimately bi-axial
-            LayoutNode::Fill => true,
+            LayoutNode::Fill | LayoutNode::Rectangle | LayoutNode::Ellipse => true,
             // a split FILLS the offer on both axes — its whole job is
             // dividing the room it was given
             LayoutNode::Split { .. } => true,
@@ -5941,7 +5947,7 @@ impl LayoutNode {
                 (size, Fit::Leaf)
             }
 
-            LayoutNode::Spacer | LayoutNode::Fill => {
+            LayoutNode::Spacer | LayoutNode::Fill | LayoutNode::Rectangle | LayoutNode::Ellipse => {
                 let size = Size {
                     width: proposal.width.unwrap_or(0.0),
                     height: proposal.height.unwrap_or(0.0),
@@ -6633,17 +6639,38 @@ impl LayoutNode {
                 );
             }
 
-            (LayoutNode::Fill, Fit::Leaf) => {
+            (LayoutNode::Fill | LayoutNode::Rectangle, Fit::Leaf) => {
+                let color = if matches!(self, LayoutNode::Rectangle) {
+                    out.foreground.last().copied().unwrap_or(Color::FILL)
+                } else {
+                    Color::FILL
+                };
                 if let Some(dom) = out.dom.as_mut() {
                     dom.open(crate::dom::DomKind::Box, frame, frame.origin);
-                    dom.set_background(Color::FILL);
+                    dom.set_background(color);
                     dom.close();
                 }
                 out.draw(DrawCommand::FillRect {
                     rect: frame,
-                    color: Color::FILL,
+                    color,
                     corner_radius: Corners::ZERO,
                 });
+            }
+
+            (LayoutNode::Ellipse, Fit::Leaf) => {
+                let color = out.foreground.last().copied().unwrap_or(Color::FILL);
+                if let Some(source) = crate::shapes::ellipse_source(frame.size, color) {
+                    if let Some(dom) = out.dom.as_mut() {
+                        dom.leaf(
+                            crate::dom::DomKind::Image(crate::dom::DomImage {
+                                key: source.key(),
+                                cover: false,
+                            }),
+                            frame,
+                        );
+                    }
+                    out.draw(DrawCommand::Image { rect: frame, source });
+                }
             }
 
             (

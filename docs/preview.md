@@ -122,3 +122,11 @@ legacy lane. A delayed snapshot holds the runtime identity, preventing a removed
 artboard's request from attaching to a recreated instance. A generation change
 invalidates the last-sent frame even when its pixels are identical, allowing tools
 to associate the new source receipt with every retained instance.
+
+### Basic shape authoring capability
+
+Hosts offering `ellipse()` and inherited foreground ink for `rectangle()` announce
+`caps::SHAPES` (`4`) in `Hello.caps`. An editor gates source insertion on this bit.
+The ellipse uses the existing vector resource and image draw, so no frozen draw,
+resource or message payload changes. Source sites name its builder `ellipse`.
+See [Basic shapes](shapes.md) for layout, ink and responsive DOM behavior.

@@ -48,6 +48,10 @@ pub enum DomKind {
     Group { path: std::rc::Rc<str> },
     /// A styled box (background, border, radius, shadow, interaction).
     Box,
+    /// A filled rectangle inheriting CSS currentColor.
+    Rectangle,
+    /// A filled ellipse inheriting CSS currentColor.
+    Ellipse,
     /// One run of text — the browser renders and selects it natively.
     Text(DomText),
     /// A native `<input>` — the browser owns the editing. Boxed: the
@@ -101,7 +105,12 @@ pub enum DomKind {
     /// crosses the border in either direction. The element is wired to
     /// its stream once — a changed handle rewires it, a changed flag
     /// alone never restarts the playback (`docs/video.md`).
-    Video { stream: u32, mirrored: bool, cover: bool, radius: f32 },
+    Video {
+        stream: u32,
+        mirrored: bool,
+        cover: bool,
+        radius: f32,
+    },
     /// A flow container: `display:flex; flex-direction:column`. Two
     /// variants instead of a payload so the keyed match's discriminant
     /// tells the axes apart — an axis change recreates the element.
@@ -1163,6 +1172,10 @@ impl DomHints {
 pub enum CreateKind {
     Group,
     Box,
+    /// A filled rectangle.
+    Rectangle,
+    /// An ellipse inscribed in its box.
+    Ellipse,
     Text,
     Field,
     Scroll,
@@ -2089,6 +2102,8 @@ fn look_hash(node: &DomNode) -> u64 {
         DomKind::Root => 0,
         DomKind::Group { .. } => 1,
         DomKind::Box => 2,
+        DomKind::Rectangle => 18,
+        DomKind::Ellipse => 19,
         DomKind::Text(_) => 3,
         DomKind::Field(_) => 4,
         DomKind::Scroll { .. } => 5,
@@ -2304,6 +2319,8 @@ fn create_kind(kind: &DomKind) -> CreateKind {
         DomKind::Root => unreachable!("the root is never created"),
         DomKind::Group { .. } => CreateKind::Group,
         DomKind::Box => CreateKind::Box,
+        DomKind::Rectangle => CreateKind::Rectangle,
+        DomKind::Ellipse => CreateKind::Ellipse,
         DomKind::Text(_) => CreateKind::Text,
         DomKind::Field(field) => {
             if field.multiline {
@@ -2639,6 +2656,8 @@ fn same_shape(node: &DomNode, old: &DomNode) -> bool {
     match &node.kind {
         DomKind::Group { .. }
         | DomKind::Box
+        | DomKind::Rectangle
+        | DomKind::Ellipse
         | DomKind::FlexColumn
         | DomKind::FlexRow
         | DomKind::Layers
@@ -2711,6 +2730,8 @@ fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
     match &node.kind {
         DomKind::Group { .. }
         | DomKind::Box
+        | DomKind::Rectangle
+        | DomKind::Ellipse
         | DomKind::Text(_)
         | DomKind::FlexColumn
         | DomKind::FlexRow
@@ -4770,6 +4791,8 @@ fn kind_code(kind: CreateKind) -> u8 {
     match kind {
         CreateKind::Group => 0,
         CreateKind::Box => 1,
+        CreateKind::Rectangle => 17,
+        CreateKind::Ellipse => 18,
         CreateKind::Text => 2,
         CreateKind::Field => 3,
         CreateKind::Scroll => 4,

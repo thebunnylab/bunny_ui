@@ -1075,7 +1075,7 @@ impl Rectangle {
     /// The node itself, before its site is sealed over it.
     fn render_unsited(&self, _ctx: &Context, out: &mut NodeList) {
         out.push(RenderNode::leaf(crate::view::print_label("Rectangle")));
-        out.push_layout(LayoutNode::Fill);
+        out.push_layout(LayoutNode::Rectangle);
     }
 }
 
@@ -1083,6 +1083,47 @@ impl Rectangle {
 #[track_caller]
 pub fn rectangle() -> Rectangle {
     Rectangle { site: crate::provenance::here() }
+}
+
+/// An ellipse that fills its proposed width and height independently.
+/// Its ink inherits `.foreground_color(…)`; without one it uses `Color::FILL`.
+#[derive(Clone, Copy)]
+pub struct Ellipse {
+    site: crate::provenance::Site,
+}
+
+impl Default for Ellipse {
+    fn default() -> Self {
+        Self {
+            site: crate::provenance::Site::Named("ellipse"),
+        }
+    }
+}
+
+impl View for Ellipse {
+    type Arity = Single;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mark = out.layout_mark();
+        out.push(RenderNode::leaf(crate::view::print_label("Ellipse")));
+        out.push_layout(LayoutNode::Ellipse);
+        crate::provenance::seal(
+            ctx,
+            out,
+            mark,
+            self.site,
+            crate::provenance::NodeKind::Ellipse,
+            None,
+        );
+    }
+}
+
+/// A filled ellipse; a square frame produces a circle.
+#[track_caller]
+pub fn ellipse() -> Ellipse {
+    Ellipse {
+        site: crate::provenance::here(),
+    }
 }
 
 /// `EmptyView` — renders nothing.

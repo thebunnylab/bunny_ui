@@ -82,6 +82,8 @@ pub mod caps {
     pub const PLACE: u32 = 1;
     /// Independently addressed preview instances through messages 10–13 and 80–81.
     pub const INSTANCES: u32 = 2;
+    /// Ellipse builders and inherited foreground ink for basic shapes.
+    pub const SHAPES: u32 = 4;
 }
 
 // =============================================================================

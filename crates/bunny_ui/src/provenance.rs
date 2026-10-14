@@ -244,6 +244,8 @@ pub enum NodeKind {
     Modifier,
     /// `grid(...)` / `grid!`.
     Grid,
+    /// `ellipse()`.
+    Ellipse,
 }
 
 impl NodeKind {
@@ -260,6 +262,7 @@ impl NodeKind {
             Self::Grid => "grid",
             Self::Spacer => "spacer",
             Self::Rectangle => "rectangle",
+            Self::Ellipse => "ellipse",
             Self::Image => "image",
             Self::Icon => "icon",
             Self::Scroll => "scroll",
