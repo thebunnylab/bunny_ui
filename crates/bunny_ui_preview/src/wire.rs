@@ -24,7 +24,7 @@
 use std::fmt;
 
 mod instances;
-pub use instances::{ExecutionMode, InstanceCommand, InstanceSelection, InvalidSceneInstanceId, SceneInstanceId};
+pub use instances::{ExecutionMode, ExecutionSelection, InstanceCommand, InstanceSelection, InvalidSceneInstanceId, SceneInstanceId};
 
 /// The version of this wire — what `Hello` announces.
 pub const WIRE_VERSION: u32 = 1;
@@ -54,6 +54,7 @@ pub mod kind {
     pub const INSTANCE_PANICKED: u8 = 11;
     pub const INSTANCE_SNAPSHOT: u8 = 12;
     pub const INSTANCE_ERROR: u8 = 13;
+    pub const EXECUTIONS_SELECTED: u8 = 14;
 
     pub const SELECT: u8 = 64;
     pub const RETRAIT: u8 = 65;
@@ -75,6 +76,7 @@ pub mod kind {
     pub const SELECT_INSTANCES: u8 = 80;
     pub const INSTANCE: u8 = 81;
     pub const SET_EXECUTION: u8 = 82;
+    pub const SELECT_EXECUTIONS: u8 = 83;
 }
 
 /// Features a host explicitly offers in `Hello.caps`.
@@ -89,6 +91,8 @@ pub mod caps {
     pub const MOUNT: u32 = 8;
     /// Per-instance Design/Play execution contexts and lifetime notifications.
     pub const EXECUTION: u32 = 16;
+    /// Atomic initial execution selection and remount on an intent change.
+    pub const EXECUTION_SELECTION: u32 = 32;
 }
 
 // =============================================================================
@@ -453,6 +457,8 @@ pub struct PreviewInfo {
 /// What the host sends.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToIde {
+    /// The complete execution selection is applied; following instance frames use it.
+    ExecutionsSelected { request: u64 },
     /// The first message: who is talking.
     Hello {
         wire: u32,
@@ -604,6 +610,13 @@ pub enum ToHost {
     Select(Vec<Selection>),
     /// Replace instance selections after negotiating `caps::INSTANCES`.
     SelectInstances(Vec<InstanceSelection>),
+    /// Select initial intent atomically after negotiating `caps::EXECUTION_SELECTION`.
+    SelectExecutions {
+        /// Opaque caller correlation echoed only after successful application.
+        request: u64,
+        /// Complete replacement selection for the instance lane.
+        selections: Vec<ExecutionSelection>,
+    },
     /// Set one scene's execution intent after negotiating `caps::EXECUTION`.
     SetExecution {
         instance: SceneInstanceId,
@@ -772,8 +785,8 @@ impl Reader {
 pub fn decode(kind: u8, payload: &[u8]) -> Result<Received, Malformed> {
     let mut cursor = Cursor { bytes: payload, at: 0, kind };
     let message = match kind {
-        kind::HELLO..=kind::INSTANCE_ERROR => Message::ToIde(ToIde::get(&mut cursor)?),
-        kind::SELECT..=kind::SET_EXECUTION => Message::ToHost(ToHost::get(&mut cursor)?),
+        kind::HELLO..=kind::EXECUTIONS_SELECTED => Message::ToIde(ToIde::get(&mut cursor)?),
+        kind::SELECT..=kind::SELECT_EXECUTIONS => Message::ToHost(ToHost::get(&mut cursor)?),
         _ => return Ok(Received::Unknown { kind, len: payload.len() as u32 }),
     };
     if cursor.at != payload.len() {
@@ -1722,6 +1735,10 @@ impl ToIde {
     /// Writes the payload; answers the kind.
     fn put(&self, out: &mut Vec<u8>) -> u8 {
         match self {
+            ToIde::ExecutionsSelected { request } => {
+                out.u64(*request);
+                kind::EXECUTIONS_SELECTED
+            }
             ToIde::Hello { wire, framework, pid, generation, workspace_root, package, caps } => {
                 out.extend_from_slice(&MAGIC);
                 out.u32(*wire);
@@ -1819,6 +1836,7 @@ impl ToIde {
 
     fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
         Ok(match c.kind {
+            kind::EXECUTIONS_SELECTED => ToIde::ExecutionsSelected { request: c.u64()? },
             kind::HELLO => {
                 let magic = c.take(4)?;
                 if magic != MAGIC {
@@ -1873,6 +1891,11 @@ impl ToHost {
     /// Writes the payload; answers the kind.
     fn put(&self, out: &mut Vec<u8>) -> u8 {
         match self {
+            ToHost::SelectExecutions { request, selections } => {
+                out.u64(*request);
+                out.list(selections, |out, s| s.put(out));
+                kind::SELECT_EXECUTIONS
+            }
             ToHost::SetExecution { instance, variant, mode } => {
                 instance.put(out);
                 out.u32(*variant);
@@ -1986,6 +2009,7 @@ impl ToHost {
 
     fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
         Ok(match c.kind {
+            kind::SELECT_EXECUTIONS => ToHost::SelectExecutions { request: c.u64()?, selections: c.list(ExecutionSelection::get)? },
             kind::SET_EXECUTION => ToHost::SetExecution {
                 instance: SceneInstanceId::get(c)?,
                 variant: c.u32()?,

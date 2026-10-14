@@ -83,7 +83,7 @@ use crate::scan;
 use crate::wire::{self, Message, Reader, Received, ToHost, ToIde};
 
 mod instances;
-use instances::{SceneLane, SceneMode};
+use instances::{SceneLane, SceneMode, SelectedScene};
 
 /// The text and image engines the scenes render with — the platform's
 /// in an app, the house ones in a test.
@@ -350,7 +350,7 @@ impl Host {
             generation: self.generation,
             workspace_root: self.config.manifest_dir.to_string_lossy().into_owned(),
             package: self.config.package.clone(),
-            caps: wire::caps::PLACE | wire::caps::INSTANCES | wire::caps::SHAPES | wire::caps::MOUNT | wire::caps::EXECUTION,
+            caps: wire::caps::PLACE | wire::caps::INSTANCES | wire::caps::SHAPES | wire::caps::MOUNT | wire::caps::EXECUTION | wire::caps::EXECUTION_SELECTION,
         });
         self.ready();
     }
@@ -433,6 +433,7 @@ impl Host {
 
     fn handle_scoped(&mut self, message: ToHost) {
         match message {
+            ToHost::SelectExecutions { request, selections } => self.select_executions(request, selections),
             ToHost::SetExecution { instance, variant, mode } => self.set_execution(instance, variant, mode),
             ToHost::Select(selections) => self.select(selections),
             ToHost::SelectInstances(selections) => self.select_instances(selections),
@@ -567,7 +568,7 @@ impl Host {
             SceneLane::Legacy,
             selections
                 .into_iter()
-                .map(|selection| (selection, None))
+                .map(|selection| SelectedScene { selection, instance: None, execution: None })
                 .collect(),
         );
     }
@@ -575,10 +576,10 @@ impl Host {
     fn select_scenes(
         &mut self,
         lane: SceneLane,
-        selections: Vec<(wire::Selection, Option<wire::SceneInstanceId>)>,
+        selections: Vec<SelectedScene>,
     ) {
         let mut kept = Vec::new();
-        for (selection, instance) in selections {
+        for SelectedScene { selection, instance, execution } in selections {
             let traits = convert::core_traits(&selection.traits);
             for (variant, traits) in traits.variants().into_iter().enumerate() {
                 let variant = variant as u32;
@@ -590,6 +591,19 @@ impl Host {
                 });
                 if let Some(at) = standing {
                     let mut scene = self.scenes.remove(at);
+                    if let Some(mode) = execution.filter(|mode| scene.execution.context().mode() != Some(*mode)) {
+                        let seq = scene.seq;
+                        let resized = scene.resized;
+                        let overrides = std::mem::take(&mut scene.overrides);
+                        // Close the old lifetime before a fresh runtime can capture its intent.
+                        drop(scene);
+                        scene = self.open(&selection.id, &selection.ident, variant, traits.clone(), instance.clone());
+                        scene.execution.set_mode(mode);
+                        scene.seq = seq;
+                        scene.resized = resized;
+                        scene.overrides = overrides;
+                        scene.refresh_overrides();
+                    }
                     if scene.traits != traits {
                         traits.apply(&scene.runtime);
                         scene.traits = traits;
@@ -597,13 +611,15 @@ impl Host {
                     }
                     kept.push(scene);
                 } else {
-                    kept.push(self.open(
+                    let scene = self.open(
                         &selection.id,
                         &selection.ident,
                         variant,
                         traits,
                         instance.clone(),
-                    ));
+                    );
+                    if let Some(mode) = execution { scene.execution.set_mode(mode); }
+                    kept.push(scene);
                 }
             }
         }

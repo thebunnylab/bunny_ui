@@ -181,3 +181,32 @@ listener does not prevent the others from observing closure; its panic resumes
 after notification, except during an existing unwind, which preserves the
 original failure. Reading a mode alone is not a reactive dependency: subscriptions
 must project changes into the application's own state when the view depends on it.
+
+### Initial execution selection
+
+`caps::EXECUTION_SELECTION` (bit 32) enables `SelectExecutions` (kind 83). Each
+selection batch carries an opaque request id, and each `ExecutionSelection` contains
+an ordinary `InstanceSelection` and its initial
+Design/Play intent. The host validates the whole list before changing a scene.
+A new scene's factory and mount callbacks run under the requested intent from
+their first invocation. Changing intent closes the old scope and remounts that
+instance's variants; unchanged selections and reordering keep their state.
+
+Remount retains logical resize and per-variant overrides, and advances the
+existing frame sequence so an IDE cannot reuse an image from the previous mode.
+Other instances and the legacy lane remain independent. The existing
+`SelectInstances` retains a standing scene's mode and starts new scenes in Design;
+`SetExecution` still changes intent without remounting. Their frozen payloads and
+behavior do not change. Tools needing mount-time live services negotiate this
+new capability instead of racing a selection against a later mode message.
+
+After applying the complete selection, the host emits `ExecutionsSelected`
+(kind 14) with that request id, before rendering any frames for the new selection.
+Failed preflight emits no acknowledgement. This ordered stream boundary lets an
+IDE reject old frames already in transit, ignore superseded acknowledgements,
+and wait for a new addressed frame before enabling input on a remounted scene.
+Every accepted selection republishes the selected frames (or their explicit scene errors),
+including retained runtimes, without replaying mount effects. This also settles a
+rapid mode change/revert when intermediate frames were discarded. Clients cache
+unchanged selections rather than sending them on every UI frame. The last-good
+image may remain visible while that boundary is pending.

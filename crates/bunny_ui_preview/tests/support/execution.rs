@@ -253,3 +253,294 @@ fn failed_scene_closes_its_captured_context_without_poisoning_other_scenes() {
     });
     assert!(ExecutionContext::current().is_none());
 }
+
+fn execution_pick(
+    id: &str,
+    scheme: wire::Scheme,
+    mode: wire::ExecutionMode,
+) -> wire::ExecutionSelection {
+    wire::ExecutionSelection {
+        selection: selection(id, scheme),
+        mode,
+    }
+}
+fn take_instance_frames(
+    seen: &Rc<RefCell<Vec<ToIde>>>,
+) -> Vec<(wire::SceneInstanceId, wire::Frame)> {
+    seen.borrow_mut()
+        .drain(..)
+        .filter_map(|message| match message {
+            ToIde::InstanceFrame { instance, frame } => Some((instance, *frame)),
+            _ => None,
+        })
+        .collect()
+}
+#[test]
+fn execution_selection_mounts_in_play_and_reordering_does_not_remount() {
+    let (mut host, seen) = host();
+    EVENTS.with(|events| events.borrow_mut().clear());
+    let a = execution_pick("initial-a", wire::Scheme::Both, wire::ExecutionMode::Play);
+    let b = execution_pick(
+        "initial-b",
+        wire::Scheme::Light,
+        wire::ExecutionMode::Design,
+    );
+    host.handle(select_executions(vec![a.clone(), b.clone()]));
+    host.tick();
+    let frames = take_instance_frames(&seen);
+    assert_eq!(frames.len(), 3);
+    assert!(frames.iter().all(|(id, frame)| says(
+        frame,
+        if id == &a.selection.instance {
+            "Some(Play)"
+        } else {
+            "Some(Design)"
+        }
+    )));
+    let mounts = EVENTS.with(|events| {
+        events
+            .borrow_mut()
+            .drain(..)
+            .filter(|(kind, _)| *kind == "mount")
+            .map(|(_, context)| context)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(mounts.len(), 3);
+    assert_eq!(
+        mounts
+            .iter()
+            .map(ExecutionContext::mode)
+            .collect::<Vec<_>>(),
+        [
+            Some(ExecutionMode::Play),
+            Some(ExecutionMode::Play),
+            Some(ExecutionMode::Design)
+        ]
+    );
+    host.handle(select_executions(vec![b, a]));
+    host.tick();
+    assert!(EVENTS.with(|events| events.borrow().is_empty()));
+    let published = take_instance_frames(&seen);
+    assert_eq!(
+        published.len(),
+        3,
+        "an acknowledged selection republishes even retained scenes"
+    );
+    assert!(published.iter().all(|(id, frame)| {
+        frames.iter().any(|(old_id, old)| {
+            old_id == id && old.variant == frame.variant && frame.seq > old.seq
+        })
+    }));
+}
+
+#[test]
+fn execution_remount_closes_only_changed_instances_and_advances_cached_frame_identity() {
+    let (mut host, seen) = host();
+    EVENTS.with(|events| events.borrow_mut().clear());
+    let mut a = execution_pick("remount-a", wire::Scheme::Both, wire::ExecutionMode::Design);
+    let b = execution_pick(
+        "remount-b",
+        wire::Scheme::Light,
+        wire::ExecutionMode::Design,
+    );
+    host.handle(select_executions(vec![a.clone(), b.clone()]));
+    host.tick();
+    let old = EVENTS.with(|events| {
+        events
+            .borrow_mut()
+            .drain(..)
+            .filter(|(kind, _)| *kind == "mount")
+            .map(|(_, context)| context)
+            .collect::<Vec<_>>()
+    });
+    take_instance_frames(&seen);
+    host.handle(ToHost::Instance {
+        instance: a.selection.instance.clone(),
+        variant: 1,
+        command: wire::InstanceCommand::Resize(wire::Size {
+            width: 320.0,
+            height: 180.0,
+        }),
+    });
+    host.tick();
+    let resized = take_instance_frames(&seen);
+    let seq = resized.iter().find(|(_, f)| f.variant == 1).unwrap().1.seq;
+    a.mode = wire::ExecutionMode::Play;
+    host.handle(select_executions(vec![a.clone(), b.clone()]));
+    assert_eq!(old[0].mode(), None);
+    assert_eq!(old[1].mode(), None);
+    assert_eq!(old[2].mode(), Some(ExecutionMode::Design));
+    host.tick();
+    let frames = take_instance_frames(&seen);
+    assert_eq!(frames.len(), 3);
+    assert!(frames.iter().all(|(id, f)| says(
+        f,
+        if id == &a.selection.instance {
+            "Some(Play)"
+        } else {
+            "Some(Design)"
+        }
+    )));
+    let (_, second) = frames.iter().find(|(_, f)| f.variant == 1).unwrap();
+    assert!(second.seq > seq);
+    assert_eq!(
+        second.size,
+        wire::Size {
+            width: 320.0,
+            height: 180.0
+        }
+    );
+    host.handle(ToHost::SelectInstances(vec![a.selection, b.selection]));
+    host.tick();
+    assert!(take_instance_frames(&seen).is_empty());
+}
+
+#[test]
+fn invalid_execution_selection_cannot_partially_close_or_remount_scenes() {
+    let (mut host, seen) = host();
+    EVENTS.with(|events| events.borrow_mut().clear());
+    let a = execution_pick("atomic", wire::Scheme::Light, wire::ExecutionMode::Design);
+    host.handle(select_executions(vec![a.clone()]));
+    host.tick();
+    let context = EVENTS.with(|events| {
+        events
+            .borrow()
+            .iter()
+            .find(|(kind, _)| *kind == "mount")
+            .unwrap()
+            .1
+            .clone()
+    });
+    take_instance_frames(&seen);
+    let mut play = a.clone();
+    play.mode = wire::ExecutionMode::Play;
+    let mut missing = execution_pick("missing", wire::Scheme::Light, wire::ExecutionMode::Play);
+    missing.selection.ident = "no_export".into();
+    for picks in [vec![play.clone(), missing], vec![play, a]] {
+        host.handle(select_executions(picks));
+        assert_eq!(context.mode(), Some(ExecutionMode::Design));
+        assert!(matches!(
+            seen.borrow_mut().pop(),
+            Some(ToIde::InstanceError { .. })
+        ));
+        host.tick();
+        assert!(take_instance_frames(&seen).is_empty());
+    }
+}
+
+#[test]
+fn execution_remount_keeps_each_variants_overrides() {
+    let (mut host, seen) = host();
+    let mut a = execution_pick(
+        "overrides-a",
+        wire::Scheme::Both,
+        wire::ExecutionMode::Design,
+    );
+    a.selection.ident = "card".into();
+    host.handle(select_executions(vec![a.clone()]));
+    host.tick();
+    let first = take_instance_frames(&seen);
+    let site = padding_site(&first[0].1);
+    let normal = text_x(&first[0].1);
+    host.handle(ToHost::Instance {
+        instance: a.selection.instance.clone(),
+        variant: 1,
+        command: wire::InstanceCommand::Override {
+            site,
+            op: wire::OverrideOp::Replace,
+            patch: wire::Patch::PaddingLength(48.0),
+        },
+    });
+    host.tick();
+    let changed = take_instance_frames(&seen);
+    let offset = text_x(&changed[0].1);
+    assert!(offset > normal);
+    a.mode = wire::ExecutionMode::Play;
+    host.handle(select_executions(vec![a]));
+    host.tick();
+    let frames = take_instance_frames(&seen);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(
+        text_x(&frames.iter().find(|(_, f)| f.variant == 0).unwrap().1),
+        normal
+    );
+    assert_eq!(
+        text_x(&frames.iter().find(|(_, f)| f.variant == 1).unwrap().1),
+        offset
+    );
+}
+
+fn select_executions(selections: Vec<wire::ExecutionSelection>) -> ToHost {
+    ToHost::SelectExecutions {
+        request: 7,
+        selections,
+    }
+}
+#[test]
+fn execution_acknowledgement_separates_old_frames_from_the_new_mount() {
+    let (mut host, seen) = host();
+    let mut pick = execution_pick("ack", wire::Scheme::Light, wire::ExecutionMode::Design);
+    host.handle(ToHost::SelectExecutions {
+        request: 10,
+        selections: vec![pick.clone()],
+    });
+    assert!(matches!(
+        &seen.borrow()[..],
+        [ToIde::ExecutionsSelected { request: 10 }]
+    ));
+    host.tick();
+    pick.mode = wire::ExecutionMode::Play;
+    host.handle(ToHost::SelectExecutions {
+        request: 11,
+        selections: vec![pick],
+    });
+    assert!(matches!(
+        seen.borrow().last(),
+        Some(ToIde::ExecutionsSelected { request: 11 })
+    ));
+    let boundary = seen.borrow().len() - 1;
+    assert!(
+        seen.borrow()[..boundary].iter().any(
+            |m| matches!(m, ToIde::InstanceFrame { frame, .. } if says(frame, "Some(Design)"))
+        )
+    );
+    host.tick();
+    assert!(
+        seen.borrow()[boundary + 1..]
+            .iter()
+            .any(|m| matches!(m, ToIde::InstanceFrame { frame, .. } if says(frame, "Some(Play)")))
+    );
+}
+
+#[test]
+fn rapid_mode_revert_acknowledges_both_requests_and_mounts_only_the_final_intent() {
+    let (mut host, seen) = host();
+    EVENTS.with(|events| events.borrow_mut().clear());
+    let mut pick = execution_pick("rapid", wire::Scheme::Light, wire::ExecutionMode::Play);
+    host.handle(ToHost::SelectExecutions {
+        request: 20,
+        selections: vec![pick.clone()],
+    });
+    pick.mode = wire::ExecutionMode::Design;
+    host.handle(ToHost::SelectExecutions {
+        request: 21,
+        selections: vec![pick],
+    });
+    assert!(matches!(
+        &seen.borrow()[..],
+        [
+            ToIde::ExecutionsSelected { request: 20 },
+            ToIde::ExecutionsSelected { request: 21 }
+        ]
+    ));
+    host.tick();
+    let frames = take_instance_frames(&seen);
+    assert_eq!(frames.len(), 1);
+    assert!(says(&frames[0].1, "Some(Design)"));
+    assert!(EVENTS.with(|events| {
+        events
+            .borrow()
+            .iter()
+            .all(|(_, context)| context.mode() == Some(ExecutionMode::Design))
+    }));
+}
