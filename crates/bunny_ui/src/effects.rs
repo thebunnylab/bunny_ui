@@ -16,14 +16,16 @@ use motor::identity::scoped_effect_slot;
 use motor::runtime::Site;
 use motor::state::{Context, EffectFn};
 
+type TaskRegistration = (Weak<RefCell<Option<TaskSlot>>>, String);
+
 thread_local! {
     static EFFECTS: RefCell<Option<Rc<[EffectFn]>>> = const { RefCell::new(None) };
     /// Every `.task` slot ever opened on this thread, weakly, WITH the
     /// identity scope it was opened under: the identity owns the cell,
     /// this list only watches it — and the scope is what tells one
     /// scene's tasks from another's when the sweep comes round.
-    static TASK_CELLS: RefCell<Vec<(Weak<RefCell<Option<TaskSlot>>>, String)>> =
-        RefCell::new(Vec::new());
+    static TASK_CELLS: RefCell<Vec<TaskRegistration>> =
+        const { RefCell::new(Vec::new()) };
     /// The pass counter the sweep compares against.
     static GENERATION: Cell<u64> = const { Cell::new(1) };
     /// Did THIS pass assemble its queue? A pass with no root declares

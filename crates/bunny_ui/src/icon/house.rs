@@ -340,7 +340,7 @@ mod tests {
         for symbol in ALL.iter().copied() {
             for side in [16usize, 24, 32, 48] {
                 let first = super::super::rasterize(symbol.glyph, ink, false, side, side);
-                let inked = first.rgba.chunks_exact(4).filter(|px| px[3] > 0).count();
+                let inked = first.rgba.as_chunks::<4>().0.iter().filter(|px| px[3] > 0).count();
                 assert!(inked > side, "{} is bare at {side}", symbol.name);
                 let again = super::super::rasterize(symbol.glyph, ink, false, side, side);
                 assert_eq!(first.rgba, again.rgba, "{} wobbles at {side}", symbol.name);

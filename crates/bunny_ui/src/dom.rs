@@ -26,6 +26,9 @@
 //! The patch stream has a fixed little-endian encoding ([`encode`]) —
 //! one `DataView` walk on the other side of the border, no JSON.
 
+/// Shared text highlight byte ranges and their paint color.
+pub type TextHighlights = (Rc<Vec<(usize, usize)>>, Color);
+
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -555,7 +558,7 @@ pub struct DomText {
     /// browser's own default for our writing direction.
     pub text_align: Option<motor::views::TextAlignment>,
     /// Match highlight spans (byte ranges) + their color.
-    pub highlights: Option<(Rc<Vec<(usize, usize)>>, Color)>,
+    pub highlights: Option<TextHighlights>,
     pub truncation: Option<Truncation>,
     /// The face is the one declared above: the text names no font of
     /// its own, and the look it wears carries none.
@@ -826,7 +829,7 @@ impl DomCapture {
             // the rebuild must not drop what the layer scope decided
             pass_through: self.overlay_depth > 0 && interactive.is_none(),
             transition,
-            group: props.from_group.then(|| group).flatten(),
+            group: props.from_group.then_some(group).flatten(),
             ..DomLook::from_props(props)
         };
         // the tint has no layer of its own in a browser: it folds into
@@ -1428,7 +1431,7 @@ const PATCHES_PER_FRESH_GROUP: usize = 8;
 /// in, so a list that clears moves no row and frees no vector inside
 /// the frame.
 enum Buried {
-    One(DomNode),
+    One(Box<DomNode>),
     Many(Vec<DomNode>),
 }
 
@@ -1436,7 +1439,7 @@ impl Buried {
     /// The subtrees, root by root.
     fn roots(&self) -> &[DomNode] {
         match self {
-            Buried::One(root) => std::slice::from_ref(root),
+            Buried::One(root) => std::slice::from_ref(root.as_ref()),
             Buried::Many(roots) => roots,
         }
     }
@@ -1918,12 +1921,6 @@ impl DomLowering {
         patches
     }
 
-    /// Does the retained scene hold any canvas island? The runtime
-    /// skips display-list collection when none is alive.
-    pub(crate) fn has_islands(&self) -> bool {
-        !self.islands.is_empty()
-    }
-
     /// The islands whose pixels no longer match, cleared of their flag.
     /// Each returns `(id, logical width, logical height, commands)` —
     /// the caller rasterizes and blits.
@@ -2399,7 +2396,7 @@ fn island_commands(node: &DomNode, ctx: &LowerCtx) -> Vec<DrawCommand> {
                 DrawCommand::Image { rect: shift(rect), source }
             }
             DrawCommand::PushClip { rect, corner_radius } => {
-                DrawCommand::PushClip { rect: shift(rect), corner_radius: corner_radius }
+                DrawCommand::PushClip { rect: shift(rect), corner_radius }
             }
             DrawCommand::PopClip => DrawCommand::PopClip,
         })
@@ -3013,7 +3010,7 @@ fn remove_subtree(retained: DomNode, ctx: &mut LowerCtx, patches: &mut Vec<DomPa
     if !ctx.templates.members.is_empty() || !ctx.islands.is_empty() {
         forget_now(&retained, ctx);
     }
-    ctx.graveyard.push(Buried::One(retained));
+    ctx.graveyard.push(Buried::One(Box::new(retained)));
 }
 
 /// Every old child leaves and nothing stays: the parent is emptied in
@@ -5170,7 +5167,7 @@ mod tests {
                 DomPatch::Create { id, kind: CreateKind::Group, .. } => Some(*id),
                 _ => None,
             })
-            .last()
+            .next_back()
             .expect("Inner mounted as a group");
 
         view.gap.set(12.0);
@@ -5568,7 +5565,7 @@ mod tests {
             "the pixels match the island's box"
         );
         assert!(
-            islands[0].rgba.chunks_exact(4).any(|pixel| pixel[3] > 0),
+            islands[0].rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 0),
             "the island has ink"
         );
 
@@ -6927,7 +6924,7 @@ mod tests {
         let mask = u32::from_le_bytes(bytes[MASK_AT..MASK_AT + 4].try_into().unwrap());
         assert_eq!(mask, 1 << 22, "four radii take bit 22, and bit 4 stays clear");
         let radii: Vec<f32> = bytes[MASK_AT + 4..MASK_AT + 4 + 16]
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
             .collect();
         assert_eq!(radii, vec![1.0, 2.0, 3.0, 4.0]);
@@ -7290,7 +7287,7 @@ mod tests {
             for at in (1..length).rev() {
                 seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
                 scramble.swap(at, (seed >> 33) as usize % (at + 1));
-                if seed % 11 == 0 {
+                if seed.is_multiple_of(11) {
                     scramble[at] = FRESH;
                 }
             }

@@ -28,6 +28,13 @@
 //! have been views loses the browser's text selection, its accessibility
 //! and its zero-patch hover.
 
+/// A context menu anchored at its logical position.
+type ContextMenu = (Point, Rc<[crate::views::MenuItem]>);
+#[cfg(test)]
+type PaintObservation = Rc<std::cell::Cell<Option<(Rect, FontSpec, Color)>>>;
+#[cfg(test)]
+type KeyObservation = Rc<std::cell::RefCell<Vec<(crate::action::Key, Option<char>)>>>;
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1026,7 +1033,7 @@ pub struct EventCtx<'a> {
     /// AFTER the box has answered — nothing of the scene is borrowed
     /// while the app is talking, which is the rule every door into a
     /// box already lives by.
-    pub(crate) menu: &'a RefCell<Option<(Point, Rc<[crate::views::MenuItem]>)>>,
+    pub(crate) menu: &'a RefCell<Option<ContextMenu>>,
     /// Which way the scene around the box reads — the same answer its
     /// paint was given ([`PaintCtx::direction`]), so a box that put a
     /// gutter on the leading edge hit-tests it on the same side.
@@ -1222,7 +1229,7 @@ mod tests {
     }
 
     impl Bar {
-        fn new(color: Color) -> (Bar, Rc<Cell<Option<(Rect, FontSpec, Color)>>>) {
+        fn new(color: Color) -> (Bar, PaintObservation) {
             let seen = Rc::new(Cell::new(None));
             (Bar { color, seen: Rc::clone(&seen) }, seen)
         }
@@ -1440,7 +1447,7 @@ mod tests {
         let islands = runtime.dom_islands(1);
         assert_eq!(islands.len(), 1);
         assert!(
-            islands[0].rgba.chunks_exact(4).any(|pixel| pixel[3] > 0),
+            islands[0].rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 0),
             "the island carries the app's ink"
         );
         // a second frame with nothing changed asks for no pixels
@@ -2098,7 +2105,7 @@ mod tests {
     /// walks the ordinary road — and it writes down what each one typed.
     #[derive(Clone, Default)]
     struct Commander {
-        seen: Rc<std::cell::RefCell<Vec<(crate::action::Key, Option<char>)>>>,
+        seen: KeyObservation,
         pressed: Rc<std::cell::RefCell<Vec<crate::action::Modifiers>>>,
     }
 
@@ -2340,7 +2347,7 @@ mod tests {
         // the strokes come through the gate's door
         assert!(
             runtime
-                .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Backspace))
+                .key_stroke(crate::action::KeyPattern::key(crate::action::Key::Backspace))
                 .handled
         );
         assert_eq!(&*editor.text.borrow(), "let ");
@@ -2358,7 +2365,10 @@ mod tests {
         const NEXT: crate::action::ActionId = crate::action::ActionId("test.next");
         let pattern = crate::action::KeyPattern::key(crate::action::Key::Down);
         runtime.bind(pattern, NEXT);
-        assert!(!runtime.key_stroke(&pattern).handled, "the editor ignores Down");
+        assert!(
+            !runtime.key_stroke(pattern).handled,
+            "the editor ignores Down"
+        );
         assert_eq!(runtime.match_key(&pattern), Some(NEXT), "so the keymap answers");
     }
 
@@ -2487,7 +2497,7 @@ mod tests {
         assert_eq!(runtime.focused(), None);
         assert!(
             !runtime
-                .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Enter))
+                .key_stroke(crate::action::KeyPattern::key(crate::action::Key::Enter))
                 .handled,
             "no focus, no keys"
         );

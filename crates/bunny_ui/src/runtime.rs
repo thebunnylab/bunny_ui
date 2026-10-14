@@ -11,6 +11,9 @@
 //! the fine invalidation joins the stability condition and is visible in
 //! [`Runtime::take_dirty`] and [`Runtime::body_runs`].
 
+type IslandHits = HashMap<Rc<str>, Vec<(String, Rect)>>;
+type ChordObserver = Rc<dyn Fn(&[KeyPattern])>;
+
 use std::cell::{Cell, RefCell};
 use motor::hash::FxHashMap as HashMap;
 use std::rc::Rc;
@@ -233,7 +236,7 @@ pub struct Runtime {
     /// identity — target path and frame in the island's own
     /// coordinates, from the last walk that lowered the island. A
     /// canvas click is routed by them.
-    island_hits: RefCell<HashMap<Rc<str>, Vec<(String, Rect)>>>,
+    island_hits: RefCell<IslandHits>,
     /// Dom mode: one retained paint target per island, by element id —
     /// a frame repaints what changed inside the island and ships that
     /// rect, where it once rasterized the whole box into a fresh bitmap.
@@ -355,7 +358,7 @@ pub struct Runtime {
     /// with the strokes in the air after every change: a stroke that
     /// opened or lengthened a sequence, and the end of one, however it
     /// ended (an action, a dead end, Escape, the slow tick).
-    chord_sink: RefCell<Option<Rc<dyn Fn(&[KeyPattern])>>>,
+    chord_sink: RefCell<Option<ChordObserver>>,
     /// Whether the sink has heard the sequence now in the air — so its
     /// end is announced exactly when its start was, and a plain stroke
     /// (pushed and resolved in one breath) says nothing at all.
@@ -5356,13 +5359,13 @@ impl Runtime {
         let no_promises = motor::hash::FxHashMap::default();
         let boxes = self.island_boxes.borrow();
         let flow = crate::dom_flow::FlowEnv {
-            scroll_offsets: &*offsets,
+            scroll_offsets: &offsets,
             direction: self.layout_direction(),
             size: (size.width, size.height),
             layout: Some(env),
             changed: &changed,
             retained_groups: match rings_held {
-                true => &retained_groups,
+                true => retained_groups,
                 // the ring moved: no boundary may promise this frame,
                 // or the walk never reaches the target that wears it
                 false => &no_promises,
@@ -5487,13 +5490,13 @@ impl Runtime {
         let no_promises = motor::hash::FxHashMap::default();
         let boxes = self.island_boxes.borrow();
         let flow = crate::dom_flow::FlowEnv {
-            scroll_offsets: &*offsets,
+            scroll_offsets: &offsets,
             direction: self.layout_direction(),
             size: (size.width, size.height),
             layout: Some(env),
             changed: &changed,
             retained_groups: match rings_held {
-                true => &retained_groups,
+                true => retained_groups,
                 // the ring moved: no boundary may promise this frame,
                 // or the walk never reaches the target that wears it
                 false => &no_promises,
@@ -6339,10 +6342,11 @@ impl Runtime {
         let Some(path) = self.dom.borrow().island_path(id) else {
             return false;
         };
-        if let Some((w, h)) = self.island_boxes.borrow().get(path.as_ref()) {
-            if (w - width).abs() < 0.5 && (h - height).abs() < 0.5 {
-                return false;
-            }
+        if let Some((w, h)) = self.island_boxes.borrow().get(path.as_ref())
+            && (w - width).abs() < 0.5
+            && (h - height).abs() < 0.5
+        {
+            return false;
         }
         self.island_boxes.borrow_mut().insert(Rc::clone(&path), (width, height));
         // the island lives under a body — the fresh box re-runs it
@@ -6519,14 +6523,15 @@ impl Runtime {
             if own as f32 == pin { own } else { pin.into() }
         }
         fn walk(node: &crate::dom::DomNode, boxes: &mut HashMap<Rc<str>, (f64, f64)>) {
-            if let crate::dom::DomKind::Canvas { path: Some(path), .. } = &node.kind {
-                if let Some(layout) = &node.layout {
-                    if let (Some(w), Some(h)) = (layout.width, layout.height) {
+            if let crate::dom::DomKind::Canvas {
+                path: Some(path), ..
+            } = &node.kind
+                && let Some(layout) = &node.layout
+                && let (Some(w), Some(h)) = (layout.width, layout.height)
+            {
                         boxes
                             .entry(Rc::clone(path))
                             .or_insert((seed(w, node.width), seed(h, node.height)));
-                    }
-                }
             }
             for child in &node.children {
                 walk(child, boxes);

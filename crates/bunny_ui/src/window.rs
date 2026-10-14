@@ -77,14 +77,26 @@ impl Default for Lifecycle {
     /// Panics if the process exhausts the identity space, refusing reuse.
     fn default() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(1);
-        let id = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        let id = reserve_identity(&NEXT)
             .expect("window identity space exhausted; identities cannot be reused");
         Self {
             id: WindowId(id),
             handler: RefCell::new(None),
             deciding: Cell::new(false),
             hidden: Cell::new(false),
+        }
+    }
+}
+
+// A checked compare/exchange keeps exhaustion permanent, without depending on
+// the fetch_update/try_update naming transition across supported toolchains.
+fn reserve_identity(next: &AtomicUsize) -> Option<usize> {
+    let mut current = next.load(Ordering::Relaxed);
+    loop {
+        let following = current.checked_add(1)?;
+        match next.compare_exchange_weak(current, following, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some(current),
+            Err(actual) => current = actual,
         }
     }
 }
@@ -137,5 +149,41 @@ impl Lifecycle {
         Ok(handler.map_or(CloseAction::Close, |handler| {
             (handler.borrow_mut())(self.id)
         }))
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn exhausting_the_identity_space_never_wraps_or_reuses() {
+        let next = AtomicUsize::new(usize::MAX - 1);
+        assert_eq!(reserve_identity(&next), Some(usize::MAX - 1));
+        assert_eq!(reserve_identity(&next), None);
+        assert_eq!(reserve_identity(&next), None);
+        assert_eq!(next.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    #[test]
+    fn concurrent_reservations_are_unique() {
+        let next = AtomicUsize::new(1);
+        let mut ids = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..64)
+                            .map(|_| reserve_identity(&next).unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=256).collect::<Vec<_>>());
     }
 }

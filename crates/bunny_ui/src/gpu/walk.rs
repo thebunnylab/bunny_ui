@@ -483,6 +483,12 @@ pub struct LiveEntry {
     pub stale: bool,
 }
 
+impl Default for RunAtlas {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RunAtlas {
     pub fn new() -> RunAtlas {
         RunAtlas {

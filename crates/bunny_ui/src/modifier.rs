@@ -476,8 +476,7 @@ impl Modifier {
                     crate::layout::WindowControl::Minimize => "minimize",
                     crate::layout::WindowControl::Maximize => "maximize",
                 }
-            )
-            .into(),
+            ),
             Modifier::ElementHint(tag, class, dom_id, href) => {
                 format!(" [.element({tag:?}, {class:?}, {dom_id:?}, {href:?})]")
             }
@@ -1104,12 +1103,12 @@ where
             layer: Box::new(layer),
             child: Box::new(node),
         });
-        if let Some(node) = out.last_mut() {
-            if crate::view::print_enabled() {
+        if let Some(node) = out.last_mut()
+            && crate::view::print_enabled()
+        {
                 node.line
                     .push_str(if behind { " [.background()]" } else { " [.overlay()]" });
-                node.children.extend(layer_prints);
-            }
+            node.children.extend(layer_prints);
         }
     }
 }
@@ -1188,20 +1187,25 @@ fn named_segment(name: &std::rc::Rc<str>) -> String {
 
 #[inline(never)]
 fn seal_id(name: &std::rc::Rc<str>, mut nodes: NodeList, out: &mut NodeList) {
-    if crate::view::print_enabled() {
-        if let Some(node) = nodes.last_mut() {
-            node.line.push_str(&format!(" [.id({name:?})]"));
-        }
+    if crate::view::print_enabled()
+        && let Some(node) = nodes.last_mut()
+    {
+        node.line.push_str(&format!(" [.id({name:?})]"));
     }
     out.extend(nodes);
 }
 
 #[inline(never)]
-fn seal_custom(custom: &dyn crate::erased::CustomModifier, mut nodes: NodeList, out: &mut NodeList) {
-    if crate::view::print_enabled() {
-        if let Some(node) = nodes.last_mut() {
-            node.line.push_str(&format!(" [.modifier({})]", custom.name()));
-        }
+fn seal_custom(
+    custom: &dyn crate::erased::CustomModifier,
+    mut nodes: NodeList,
+    out: &mut NodeList,
+) {
+    if crate::view::print_enabled()
+        && let Some(node) = nodes.last_mut()
+    {
+        node.line
+            .push_str(&format!(" [.modifier({})]", custom.name()));
     }
     out.extend(nodes);
 }
