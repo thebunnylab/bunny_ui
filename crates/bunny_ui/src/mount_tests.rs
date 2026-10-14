@@ -100,3 +100,33 @@ fn keyed_mount_helpers_keep_distinct_slots_and_can_write_state() {
     runtime.render_stable(&pair);
     assert_eq!(pair.count.get(), 8);
 }
+
+#[test]
+fn every_mount_effect_runs_in_one_pump_even_without_state_writes() {
+    #[derive(Clone)]
+    struct Many {
+        mounted: Rc<RefCell<Vec<usize>>>,
+    }
+    impl Component for Many {
+        fn body(self) -> impl View {
+            vstack!(for_each(
+                (0usize..20).collect::<Vec<_>>(),
+                |index| index.to_string(),
+                move |index| {
+                    let mounted = self.mounted.clone();
+                    let index = *index;
+                    text(index.to_string()).on_mount(move || mounted.borrow_mut().push(index))
+                }
+            ))
+        }
+    }
+    let view = Many {
+        mounted: Rc::default(),
+    };
+    let runtime = Runtime::scene("mount-all");
+    runtime.render(&view);
+    assert!(runtime.pump());
+    assert_eq!(*view.mounted.borrow(), (0..20).collect::<Vec<_>>());
+    runtime.render_stable(&view);
+    assert_eq!(view.mounted.borrow().len(), 20);
+}
