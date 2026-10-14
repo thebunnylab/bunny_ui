@@ -50,7 +50,7 @@ impl Scene {
         })
     }
 
-    fn refresh_overrides(&mut self) {
+    pub(super) fn refresh_overrides(&mut self) {
         if let SceneMode::Instance { overrides, .. } = &mut self.mode {
             *overrides =
                 provenance::OverrideSet::new(self.overrides.iter().map(|(site, value)| {
@@ -127,14 +127,34 @@ impl Host {
     }
 
     pub(super) fn select_instances(&mut self, selections: Vec<InstanceSelection>) {
+        self.select_instances_in(
+            selections
+                .into_iter()
+                .map(|selection| (selection, None))
+                .collect(),
+        );
+    }
+
+    pub(super) fn select_executions(&mut self, selections: Vec<wire::ExecutionSelection>) {
+        self.select_instances_in(
+            selections
+                .into_iter()
+                .map(|pick| {
+                    let mode = match pick.mode {
+                        wire::ExecutionMode::Design => ExecutionMode::Design,
+                        wire::ExecutionMode::Play => ExecutionMode::Play,
+                    };
+                    (pick.selection, Some(mode))
+                })
+                .collect(),
+        );
+    }
+
+    fn select_instances_in(&mut self, selections: Vec<(InstanceSelection, Option<ExecutionMode>)>) {
         let mut identities = HashSet::new();
-        for selection in &selections {
+        for (selection, _) in &selections {
             if !identities.insert(&selection.instance) {
-                self.instance_error(
-                    selection.instance.clone(),
-                    None,
-                    "duplicate instance identity",
-                );
+                self.instance_error(selection.instance.clone(), None, "duplicate scene instance");
                 return;
             }
             if preview_entry(&selection.ident).is_err() {
@@ -150,13 +170,14 @@ impl Host {
             SceneLane::Instances,
             selections
                 .into_iter()
-                .map(|selection| {
-                    let legacy = wire::Selection {
+                .map(|(selection, execution)| SelectedScene {
+                    selection: wire::Selection {
                         id: selection.instance.to_string(),
                         ident: selection.ident,
                         traits: selection.traits,
-                    };
-                    (legacy, Some(selection.instance))
+                    },
+                    instance: Some(selection.instance),
+                    execution,
                 })
                 .collect(),
         );
@@ -314,4 +335,11 @@ impl Host {
         }
         self.held_instances = pending;
     }
+}
+
+/// Requested scene address with optional explicit execution; legacy selection retains intent.
+pub(super) struct SelectedScene {
+    pub(super) selection: wire::Selection,
+    pub(super) instance: Option<SceneInstanceId>,
+    pub(super) execution: Option<ExecutionMode>,
 }

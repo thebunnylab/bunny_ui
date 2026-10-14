@@ -286,3 +286,25 @@ impl ExecutionMode {
         }
     }
 }
+
+/// One instance selection with its initial execution intent.
+/// Changing intent remounts its variants; an unchanged intent preserves state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutionSelection {
+    /// Stable source identity and rendering traits.
+    pub selection: InstanceSelection,
+    /// Intent established before the first factory or mount callback.
+    pub mode: ExecutionMode,
+}
+impl ExecutionSelection {
+    pub(super) fn put(&self, out: &mut Vec<u8>) {
+        self.selection.put(out);
+        self.mode.put(out);
+    }
+    pub(super) fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
+        Ok(Self {
+            selection: InstanceSelection::get(c)?,
+            mode: ExecutionMode::get(c)?,
+        })
+    }
+}

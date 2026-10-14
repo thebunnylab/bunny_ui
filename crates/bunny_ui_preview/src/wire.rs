@@ -24,7 +24,7 @@
 use std::fmt;
 
 mod instances;
-pub use instances::{ExecutionMode, InstanceCommand, InstanceSelection, InvalidSceneInstanceId, SceneInstanceId};
+pub use instances::{ExecutionMode, ExecutionSelection, InstanceCommand, InstanceSelection, InvalidSceneInstanceId, SceneInstanceId};
 
 /// The version of this wire — what `Hello` announces.
 pub const WIRE_VERSION: u32 = 1;
@@ -75,6 +75,7 @@ pub mod kind {
     pub const SELECT_INSTANCES: u8 = 80;
     pub const INSTANCE: u8 = 81;
     pub const SET_EXECUTION: u8 = 82;
+    pub const SELECT_EXECUTIONS: u8 = 83;
 }
 
 /// Features a host explicitly offers in `Hello.caps`.
@@ -89,6 +90,8 @@ pub mod caps {
     pub const MOUNT: u32 = 8;
     /// Per-instance Design/Play execution contexts and lifetime notifications.
     pub const EXECUTION: u32 = 16;
+    /// Atomic initial execution selection and remount on an intent change.
+    pub const EXECUTION_SELECTION: u32 = 32;
 }
 
 // =============================================================================
@@ -604,6 +607,8 @@ pub enum ToHost {
     Select(Vec<Selection>),
     /// Replace instance selections after negotiating `caps::INSTANCES`.
     SelectInstances(Vec<InstanceSelection>),
+    /// Select initial intent atomically after negotiating `caps::EXECUTION_SELECTION`.
+    SelectExecutions(Vec<ExecutionSelection>),
     /// Set one scene's execution intent after negotiating `caps::EXECUTION`.
     SetExecution {
         instance: SceneInstanceId,
@@ -773,7 +778,7 @@ pub fn decode(kind: u8, payload: &[u8]) -> Result<Received, Malformed> {
     let mut cursor = Cursor { bytes: payload, at: 0, kind };
     let message = match kind {
         kind::HELLO..=kind::INSTANCE_ERROR => Message::ToIde(ToIde::get(&mut cursor)?),
-        kind::SELECT..=kind::SET_EXECUTION => Message::ToHost(ToHost::get(&mut cursor)?),
+        kind::SELECT..=kind::SELECT_EXECUTIONS => Message::ToHost(ToHost::get(&mut cursor)?),
         _ => return Ok(Received::Unknown { kind, len: payload.len() as u32 }),
     };
     if cursor.at != payload.len() {
@@ -1873,6 +1878,10 @@ impl ToHost {
     /// Writes the payload; answers the kind.
     fn put(&self, out: &mut Vec<u8>) -> u8 {
         match self {
+            ToHost::SelectExecutions(selections) => {
+                out.list(selections, |out, s| s.put(out));
+                kind::SELECT_EXECUTIONS
+            }
             ToHost::SetExecution { instance, variant, mode } => {
                 instance.put(out);
                 out.u32(*variant);
@@ -1986,6 +1995,7 @@ impl ToHost {
 
     fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
         Ok(match c.kind {
+            kind::SELECT_EXECUTIONS => ToHost::SelectExecutions(c.list(ExecutionSelection::get)?),
             kind::SET_EXECUTION => ToHost::SetExecution {
                 instance: SceneInstanceId::get(c)?,
                 variant: c.u32()?,
