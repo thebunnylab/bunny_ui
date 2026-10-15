@@ -318,7 +318,8 @@ fn a_both_selection_renders_two_scenes_in_their_own_tokens_and_only_once() {
     let again = frames(&seen);
     assert_eq!(again.len(), 2);
     assert_eq!(again[0].size, wire::Size { width: 200.0, height: 100.0 });
-    assert_eq!(again[0].seq, 2);
+    assert!(again[0].seq > rendered[0].seq);
+    assert!(again[1].seq > rendered[1].seq);
 }
 
 #[test]
@@ -830,3 +831,6 @@ mod execution;
 
 #[path = "support/input.rs"]
 mod input;
+
+#[path = "support/views.rs"]
+mod views;

@@ -24,6 +24,8 @@
 use std::fmt;
 
 mod instances;
+mod views;
+pub use views::{InvalidMountedViewId, MatchedViews, MountedViewId, ViewIdentity, ViewMismatch, ViewSnapshot};
 pub use instances::{ExecutionMode, ExecutionSelection, InstanceCommand, InstanceSelection, InvalidSceneInstanceId, SceneInstanceId};
 
 /// The version of this wire — what `Hello` announces.
@@ -55,6 +57,7 @@ pub mod kind {
     pub const INSTANCE_SNAPSHOT: u8 = 12;
     pub const INSTANCE_ERROR: u8 = 13;
     pub const EXECUTIONS_SELECTED: u8 = 14;
+    pub const VIEW_SNAPSHOT: u8 = 15;
 
     pub const SELECT: u8 = 64;
     pub const RETRAIT: u8 = 65;
@@ -77,10 +80,13 @@ pub mod kind {
     pub const INSTANCE: u8 = 81;
     pub const SET_EXECUTION: u8 = 82;
     pub const SELECT_EXECUTIONS: u8 = 83;
+    pub const OBSERVE_VIEWS: u8 = 84;
 }
 
 /// Features a host explicitly offers in `Hello.caps`.
 pub mod caps {
+    /// Opt-in mounted-view snapshots accompanying exact frame publications.
+    pub const VIEW_IDENTITIES: u32 = 64;
     /// Free form, grid and live Position/Span overrides through message 79.
     pub const PLACE: u32 = 1;
     /// Independently addressed preview instances through messages 10–13 and 80–81.
@@ -295,7 +301,8 @@ pub struct Frame {
     pub preview: String,
     /// Which of its variants (a `Both` scheme is two).
     pub variant: u32,
-    /// Counts up per preview; a tool drops a frame older than one it has.
+    /// Increases per preview; publications may skip numbers. Never reused by
+    /// another mount in one host connection. Drop older publications.
     pub seq: u64,
     /// The generation that rendered it.
     pub generation: u32,
@@ -457,6 +464,8 @@ pub struct PreviewInfo {
 /// What the host sends.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToIde {
+    /// Mounted identities immediately preceding their exact frame.
+    ViewSnapshot(ViewSnapshot),
     /// The complete execution selection is applied; following instance frames use it.
     ExecutionsSelected { request: u64 },
     /// The first message: who is talking.
@@ -607,6 +616,8 @@ pub enum PlacePatch {
 /// What the tool sends.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToHost {
+    /// Opt in after negotiating `caps::VIEW_IDENTITIES`; false stops metadata.
+    ObserveViews { enabled: bool },
     Select(Vec<Selection>),
     /// Replace instance selections after negotiating `caps::INSTANCES`.
     SelectInstances(Vec<InstanceSelection>),
@@ -695,6 +706,8 @@ pub enum Malformed {
     BadText,
     /// A scene instance name violates its identity contract.
     InvalidSceneInstance,
+    /// Zero cannot identify a mounted view.
+    InvalidMountedView,
     /// A length past [`MAX_FRAME`].
     Oversized { len: u32 },
     /// Bytes left over after the message — the payload was not this kind's.
@@ -706,6 +719,7 @@ impl fmt::Display for Malformed {
         match self {
             Malformed::Truncated { kind } => write!(f, "a message of kind {kind} ended before its payload did"),
             Malformed::BadTag { what, tag } => write!(f, "no {what} answers to the tag {tag}"),
+            Malformed::InvalidMountedView => f.write_str("invalid mounted view identity"),
             Malformed::InvalidSceneInstance => f.write_str("invalid scene instance identity"),
             Malformed::BadText => f.write_str("a string on the wire is not UTF-8"),
             Malformed::Oversized { len } => write!(f, "a frame of {len} bytes is past the wire's limit"),
@@ -785,8 +799,8 @@ impl Reader {
 pub fn decode(kind: u8, payload: &[u8]) -> Result<Received, Malformed> {
     let mut cursor = Cursor { bytes: payload, at: 0, kind };
     let message = match kind {
-        kind::HELLO..=kind::EXECUTIONS_SELECTED => Message::ToIde(ToIde::get(&mut cursor)?),
-        kind::SELECT..=kind::SELECT_EXECUTIONS => Message::ToHost(ToHost::get(&mut cursor)?),
+        kind::HELLO..=kind::VIEW_SNAPSHOT => Message::ToIde(ToIde::get(&mut cursor)?),
+        kind::SELECT..=kind::OBSERVE_VIEWS => Message::ToHost(ToHost::get(&mut cursor)?),
         _ => return Ok(Received::Unknown { kind, len: payload.len() as u32 }),
     };
     if cursor.at != payload.len() {
@@ -1735,6 +1749,10 @@ impl ToIde {
     /// Writes the payload; answers the kind.
     fn put(&self, out: &mut Vec<u8>) -> u8 {
         match self {
+            ToIde::ViewSnapshot(snapshot) => {
+                snapshot.put(out);
+                kind::VIEW_SNAPSHOT
+            }
             ToIde::ExecutionsSelected { request } => {
                 out.u64(*request);
                 kind::EXECUTIONS_SELECTED
@@ -1836,6 +1854,7 @@ impl ToIde {
 
     fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
         Ok(match c.kind {
+            kind::VIEW_SNAPSHOT => ToIde::ViewSnapshot(ViewSnapshot::get(c)?),
             kind::EXECUTIONS_SELECTED => ToIde::ExecutionsSelected { request: c.u64()? },
             kind::HELLO => {
                 let magic = c.take(4)?;
@@ -1891,6 +1910,10 @@ impl ToHost {
     /// Writes the payload; answers the kind.
     fn put(&self, out: &mut Vec<u8>) -> u8 {
         match self {
+            ToHost::ObserveViews { enabled } => {
+                out.bool(*enabled);
+                kind::OBSERVE_VIEWS
+            }
             ToHost::SelectExecutions { request, selections } => {
                 out.u64(*request);
                 out.list(selections, |out, s| s.put(out));
@@ -2009,6 +2032,7 @@ impl ToHost {
 
     fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
         Ok(match c.kind {
+            kind::OBSERVE_VIEWS => ToHost::ObserveViews { enabled: c.bool()? },
             kind::SELECT_EXECUTIONS => ToHost::SelectExecutions { request: c.u64()?, selections: c.list(ExecutionSelection::get)? },
             kind::SET_EXECUTION => ToHost::SetExecution {
                 instance: SceneInstanceId::get(c)?,
