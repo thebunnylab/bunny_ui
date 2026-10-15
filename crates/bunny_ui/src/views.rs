@@ -2268,16 +2268,19 @@ pub struct Stack;
 
 impl Stack {
     /// `vstack((…))` by another name.
+    #[track_caller]
     pub fn vertical<C: View>(children: C) -> VStack<C> {
         vstack(children)
     }
 
     /// `hstack((…))` by another name.
+    #[track_caller]
     pub fn horizontal<C: View>(children: C) -> HStack<C> {
         hstack(children)
     }
 
     /// `zstack((…))` by another name.
+    #[track_caller]
     pub fn layered<C: View>(children: C) -> ZStack<C> {
         zstack(children)
     }
