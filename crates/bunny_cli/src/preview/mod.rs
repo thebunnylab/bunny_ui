@@ -225,7 +225,7 @@ fn start(project: Project, options: Options, events: &mut Vec<Event>) -> Step {
     let (sender, inbox) = mpsc::channel();
     let incoming = incoming::Signal::default();
     let signal = incoming.clone();
-    std::thread::spawn(move || incoming::read(reading, &sender, &signal));
+    std::thread::spawn(move || incoming::read(reading, sender, &signal));
     if let Some(generation) = app.generation() {
         events.push(Event::Sources {
             generation,

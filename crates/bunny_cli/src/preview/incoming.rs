@@ -31,8 +31,14 @@ impl Drop for Closed<'_> {
     }
 }
 
-pub(super) fn read(mut reading: impl Read, sender: &Sender<Received>, signal: &Signal) {
+pub(super) fn read(reading: impl Read, sender: Sender<Received>, signal: &Signal) {
     let _closed = Closed(signal);
+    // The inner call owns the last sender: it drops before the guard wakes the
+    // owner, including during unwinding. Polling on that wake must observe EOF.
+    drain(reading, sender, signal);
+}
+
+fn drain(mut reading: impl Read, sender: Sender<Received>, signal: &Signal) {
     let mut reader = Reader::new();
     let mut buf = [0u8; 64 * 1024];
     loop {

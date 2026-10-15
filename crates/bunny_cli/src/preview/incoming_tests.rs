@@ -24,21 +24,21 @@ fn reader_enqueues_before_waking_and_notifies_closure() {
         saved
             .lock()
             .unwrap()
-            .push(read_inbox.lock().unwrap().try_recv().ok());
+            .push(read_inbox.lock().unwrap().try_recv());
     })));
-    read(Cursor::new(wire::encode(&message())), &sender, &signal);
+    read(Cursor::new(wire::encode(&message())), sender, &signal);
     let events = observed.lock().unwrap();
     assert_eq!(events.len(), 3, "registration, message, closure");
-    assert!(events[0].is_none());
-    assert!(matches!(&events[1], Some(Received::Message(value)) if value == &message()));
-    assert!(events[2].is_none());
+    assert!(matches!(events[0], Err(mpsc::TryRecvError::Empty)));
+    assert!(matches!(&events[1], Ok(Received::Message(value)) if value == &message()));
+    assert!(matches!(events[2], Err(mpsc::TryRecvError::Disconnected)));
 }
 
 #[test]
 fn registration_covers_preexisting_messages_and_replacement_can_reenter() {
     let signal = Signal::default();
     let (sender, inbox) = mpsc::channel();
-    read(Cursor::new(wire::encode(&message())), &sender, &signal);
+    read(Cursor::new(wire::encode(&message())), sender, &signal);
     let count = Arc::new(AtomicUsize::new(0));
     let counted = count.clone();
     let setting = signal.clone();
@@ -73,7 +73,7 @@ fn read_failure_still_wakes_the_owner() {
         counted.fetch_add(1, Ordering::SeqCst);
     })));
     let (sender, _) = mpsc::channel();
-    read(Broken, &sender, &signal);
+    read(Broken, sender, &signal);
     assert_eq!(count.load(Ordering::SeqCst), 2);
 }
 
@@ -90,7 +90,7 @@ fn socket_data_and_disconnect_wake_without_owner_polling() {
     awake.recv_timeout(Duration::from_secs(2)).unwrap();
     let (sender, inbox) = mpsc::channel();
     let reading = signal.clone();
-    let thread = std::thread::spawn(move || read(socket, &sender, &reading));
+    let thread = std::thread::spawn(move || read(socket, sender, &reading));
     writer.write_all(&wire::encode(&message())).unwrap();
     awake
         .recv_timeout(Duration::from_secs(2))
