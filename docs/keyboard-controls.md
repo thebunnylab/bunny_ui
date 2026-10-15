@@ -45,3 +45,13 @@ and the checkbox's native value.
 
 These contracts have runtime and native protocol regression tests. They do not
 establish human screen-reader or operating-system keyboard qualification.
+
+## Application-drawn controls
+
+`button(label, action).plain()` keeps the native focus, keyboard, pointer/touch
+and accessibility contract while the label supplies all geometry and visuals.
+It adds no theme chrome or padding; ordinary buttons keep their default style.
+A custom two-state label can use `.checked(value)` to expose its real checked
+state without adding a glyph. The application still owns the value and callback;
+Space and accessibility activation invoke that callback. Disabled controls remain
+unavailable through every activation path.
