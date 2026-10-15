@@ -1108,7 +1108,6 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
             let alive = hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>();
             window.host_sweep(&alive);
-            webview::sweep(&alive);
             traced.stage("H", format_args!("hosts={}", hosts.len()));
             let overlays = runtime.overlays();
             let display = match overlays.first() {

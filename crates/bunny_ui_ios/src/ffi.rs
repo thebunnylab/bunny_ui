@@ -1754,21 +1754,22 @@ pub fn host_place(
 /// platform view goes with it. Releases the two holds [`host_place`]
 /// took: the container's alloc and the tenant's `make`.
 pub fn host_sweep(alive: &[String]) {
-    let dead: Vec<(Id, Id)> = HOST_VIEWS.with(|hosts| {
+    let dead: Vec<(String, Id, Id)> = HOST_VIEWS.with(|hosts| {
         let mut hosts = hosts.borrow_mut();
         let mut dead = Vec::new();
         hosts.retain(|key, slot| {
             if alive.iter().any(|path| path == key) {
                 return true;
             }
-            dead.push((slot.container, slot.child));
+            dead.push((key.clone(), slot.container, slot.child));
             false
         });
         dead
     });
-    for (container, child) in dead {
+    for (key, container, child) in dead {
         unsafe {
             msg_void(container, sel("removeFromSuperview"));
+            crate::webview::retire(&key, child);
             msg_void(child, sel("release"));
             msg_void(container, sel("release"));
         }

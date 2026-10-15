@@ -357,14 +357,13 @@ impl Desk {
             }
             unsafe {
                 msg_void(page.view, sel("removeFromSuperview"));
+                webview::retire(key, page.view);
                 msg_void(page.view, sel("release"));
             }
             refit = true;
             false
         });
         if refit {
-            let kept: Vec<String> = self.pages.keys().cloned().collect();
-            webview::sweep(&kept);
             self.fit();
         }
     }
