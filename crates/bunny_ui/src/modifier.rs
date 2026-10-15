@@ -221,6 +221,7 @@ pub enum Modifier {
     Popover {
         is_presented: Binding<bool>,
         side: crate::layout::Side,
+        focus: crate::layout::PopoverFocus,
         on_dismiss: Option<Rc<dyn Fn()>>,
         content: Rc<dyn Fn(&Context) -> crate::erased::Erased>,
     },
@@ -1415,6 +1416,7 @@ pub(crate) fn apply(
         Modifier::Popover {
             is_presented,
             side,
+            focus,
             on_dismiss,
             content,
         } if is_presented.get() => {
@@ -1469,6 +1471,7 @@ pub(crate) fn apply(
             out.wrap_layout_from(mark, |base| LayoutNode::Anchored {
                 path: path.unwrap_or_default(),
                 side,
+                focus: *focus,
                 overlay: Rc::new(wrap_layout(popover_layouts)),
                 child: Box::new(base),
             });
