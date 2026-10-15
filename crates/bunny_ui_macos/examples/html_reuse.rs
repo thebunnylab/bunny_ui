@@ -15,6 +15,8 @@ mod native {
         phase: State<u8>,
         answer: State<String>,
         other: WebviewHandle,
+        other_window: WebviewHandle,
+        pulse: State<u8>,
         handle: WebviewHandle,
     }
     impl Component for Probe {
@@ -46,14 +48,21 @@ mod native {
                             }
                             2 if probe.reserve.recycled() >= 1 => probe.phase.set(3),
                             3 if probe.answer.get()== "empty:public-B" => {
-                                let app = probe.app.clone();
+                                probe.phase.set(4);
+                                let phase = probe.phase;
+                                let pulse = probe.pulse;
+                                let other_window = probe.other_window.clone();
                                 probe.other.eval("document.body.innerText", move |result| {
                                     assert_eq!(result.unwrap(), "\"independent-C\"");
-                                    println!("native reuse: scrubbed engine, new document and independent live pane passed");
-                                    app.quit();
+                                    other_window.eval("document.body.innerText", move |result| {
+                                        assert_eq!(result.unwrap(), "\"independent-D\"");
+                                        println!("native reuse: scrubbed engine, new document, independent pane and second window passed");
+                                        phase.set(5);
+                                    });
+                                    pulse.update(|value| *value += 1);
                                 });
-                                break;
                             }
+                            5 => { probe.app.quit(); break; }
                             _ => {}
                         }
                         task::sleep(Duration::from_millis(10)).await;
@@ -62,9 +71,35 @@ mod native {
             })
         }
     }
+    #[derive(Clone)]
+    struct Secondary {
+        handle: WebviewHandle,
+        pulse: State<u8>,
+    }
+    impl Component for Secondary {
+        fn body(self) -> impl View {
+            let _ = self.pulse.get();
+            webview_html(
+                "<html><body>independent-D</body></html>",
+                "",
+                NetworkPolicy::Deny,
+            )
+            .handle(&self.handle)
+        }
+    }
     pub fn run() {
         let app = App::new();
         let runtime = Rc::new(app.runtime());
+        let other_window = WebviewHandle::new();
+        let pulse = State::new(0);
+        app.open(
+            WindowSpec::titled("Independent HTML window").size(330.0, 190.0),
+            Rc::new(app.runtime()),
+            Secondary {
+                handle: other_window.clone(),
+                pulse,
+            },
+        );
         app.open(
             WindowSpec::titled("HTML reuse protocol").size(700.0, 260.0),
             runtime,
@@ -74,6 +109,8 @@ mod native {
                 phase: State::new(0),
                 answer: State::new(String::new()),
                 other: WebviewHandle::new(),
+                other_window,
+                pulse,
                 handle: WebviewHandle::new(),
             },
         );

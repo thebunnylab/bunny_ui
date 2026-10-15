@@ -500,7 +500,6 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
             }
             let alive: Vec<String> = hosts.iter().map(|host| host.path.clone()).collect();
             ffi::host_sweep(&alive);
-            webview::sweep(&alive);
             // the sandwich: what painted ABOVE a host leaves the
             // drawable's present and composites on a segment surface
             // over the island (the desktops' law, without the drag they

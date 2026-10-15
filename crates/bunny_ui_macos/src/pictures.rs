@@ -364,8 +364,6 @@ impl Desk {
             false
         });
         if refit {
-            let kept: Vec<String> = self.pages.keys().cloned().collect();
-            webview::sweep(&kept);
             self.fit();
         }
     }

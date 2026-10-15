@@ -2816,7 +2816,7 @@ impl WindowHandle {
                 msg_void_i64(child, sel("setAutoresizingMask:"), SIZABLE);
                 msg_void_id(container, sel("addSubview:"), child);
                 msg_void_id(self.view, sel("addSubview:"), container);
-                HostSlot { container, child, stamp: stamp.to_string(), scroll: bunny_ui::host::DocumentScroll::Document, wheel: crate::host_wheel::ParentWheel::default() }
+                HostSlot { owner: self.view, container, child, stamp: stamp.to_string(), scroll: bunny_ui::host::DocumentScroll::Document, wheel: crate::host_wheel::ParentWheel::default() }
             });
             let (x, y, w, h) = frame;
             let (vx, vy, vw, vh) = window;
@@ -2862,7 +2862,7 @@ impl WindowHandle {
         HOST_VIEWS.with(|hosts| {
             let mut hosts = hosts.borrow_mut();
             hosts.retain(|key, slot| {
-                if alive.iter().any(|path| path == key) {
+                if slot.owner != self.view || alive.iter().any(|path| path == key) {
                     return true;
                 }
                 unsafe {
@@ -3151,6 +3151,7 @@ thread_local! {
 /// tenant's view inside it, and the stamp the tenant last applied — a
 /// changed spec re-instructs the view, it never re-mounts it.
 struct HostSlot {
+    owner: Id,
     container: Id,
     child: Id,
     stamp: String,
