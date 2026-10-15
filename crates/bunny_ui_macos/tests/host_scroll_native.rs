@@ -32,7 +32,8 @@ mod probe {
         fn at(value: Id, command: Sel, index: usize) -> Id;
         #[link_name = "objc_msgSend"]
         fn chars(value: Id, command: Sel) -> *const c_char;
-        #[link_name = "objc_msgSend"]
+        #[cfg_attr(target_arch = "aarch64", link_name = "objc_msgSend")]
+        #[cfg_attr(target_arch = "x86_64", link_name = "objc_msgSend_stret")]
         fn rectangle(value: Id, command: Sel) -> CGRect;
         #[link_name = "objc_msgSend"]
         fn point(value: Id, command: Sel, point: CGPoint) -> Id;
@@ -231,8 +232,15 @@ mod probe {
                 .task(move || {
                     let script = script.clone();
                     async move {
-                        task::sleep(Duration::from_secs(1)).await;
-                        assert!(value(&script.handle, "document.scrollingElement.scrollWidth - document.scrollingElement.clientWidth").await > 0.0);
+                        let mut ready = false;
+                        for _ in 0..200 {
+                            if value(&script.handle, "Number(document.readyState === 'complete' && document.getElementById('end') !== null && document.scrollingElement.scrollWidth > document.scrollingElement.clientWidth)").await > 0.0 {
+                                ready = true;
+                                break;
+                            }
+                            task::sleep(Duration::from_millis(25)).await;
+                        }
+                        assert!(ready, "the actual local document loaded and laid out its wide content");
                         unsafe { pointer_stays_with_document(); wheel(0, -80, true); }
                         task::sleep(Duration::from_millis(250)).await;
                         assert!(script.offset.get().y > 0.0, "vertical body input scrolls the enclosing conversation");
