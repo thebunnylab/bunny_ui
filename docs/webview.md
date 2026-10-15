@@ -410,3 +410,36 @@ all — and an API grown on the richest backend would be wrong on the
 other two. The capability table
 above is the acceptance sheet: each cell either works or refuses by
 name.
+
+
+### Local documents inside a scrolling reader
+
+On macOS, a read-only local document can give vertical wheel gestures to the
+surrounding scene:
+
+```rust,ignore
+webview_html(&message.html, "", NetworkPolicy::Deny)
+    .scroll_with_parent()
+    .frame_height(natural_body_height)
+```
+
+The enclosing reader owns vertical motion, including trackpad momentum. The
+engine keeps horizontal gestures, links and text selection. Native hit testing
+selects a host proxy only for wheel events; the original NSEvent reaches its
+owner unchanged, with its deltas, modifiers and phases. Axis ownership survives
+finger lift and momentum; a new physical gesture or independent wheel step
+chooses again. Zero-delta gesture bookends reach both owners without movement.
+
+Frame the document to its complete measured height so its end remains part of
+the outer reader. A diagnostic image-size limit must not truncate reading
+geometry. Browser URL views and editable documents retain ordinary scrolling;
+modifier order cannot transfer an editor's scrolling to its parent. Other
+platform backends retain their ordinary document handling; this policy currently
+has a macOS native implementation.
+
+`cargo test -p bunny-ui-macos --test host_scroll_native` runs a controlled native
+WebKit witness over a body taller than 6,000 points and two hosted messages.
+CG-backed NSEvents exercise native hit testing and forwarding inside the test
+application. It checks outer/inner offsets, horizontal motion, links, selection
+and default document behavior. These injected events do not certify physical
+trackpad timing, touch behavior or application-level visual acceptance.
