@@ -22,6 +22,14 @@ popover that places no control — a completion list, a preview card — is a
 picture beside the keyboard's owner, not a dialog: it opens no scope, focus
 stays where it was, and the walk never enters it.
 
+An interactive completion list uses `.popover_with_focus(...,
+PopoverFocus::Preserve, ...)`: opening it keeps the editor focused even when
+its choices are real buttons. Those controls remain in the existing Tab order
+and keep their accessibility actions. Use `.leaves_keyboard()` on a suggestion
+button to retain the editor during pointer selection. The ordinary `.popover`
+and `.popover_on_dismiss` continue to create a scope when they contain controls.
+The explicit policy changes native navigation only; flow DOM remains browser-owned.
+
 ```rust,ignore
 vstack!(
     text_field("Description", description.binding()),

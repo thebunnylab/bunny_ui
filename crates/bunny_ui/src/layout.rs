@@ -483,6 +483,17 @@ pub enum Side {
     Trailing,
 }
 
+/// How an anchored popover participates in native keyboard navigation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PopoverFocus {
+    /// Controls form a scope, borrowing focus until the popover closes.
+    #[default]
+    Scope,
+    /// Keep the current owner and include choices in the existing Tab order.
+    /// Useful for completion lists whose editor must keep receiving text.
+    Preserve,
+}
+
 /// One of the window's own buttons, marked on a scene-drawn control
 /// so the platform treats it as the real thing (snap layouts hover
 /// the maximize button; the system closes on close). Shells without
@@ -1196,6 +1207,7 @@ pub enum LayoutNode {
         /// The popover's identity (dismiss registrations key on it).
         path: String,
         side: Side,
+        focus: PopoverFocus,
         overlay: Rc<LayoutNode>,
         child: Box<LayoutNode>,
     },
@@ -3669,6 +3681,7 @@ pub struct MenuOpen {
 #[derive(Debug)]
 struct QueuedOverlay {
     path: String,
+    focus: PopoverFocus,
     /// Where it hangs from — PHYSICAL, decided where the anchor was
     /// placed (a leading popover of a right-to-left island hangs at its
     /// right). `None` is a SHEET: it hangs from nothing and centres in
@@ -5496,7 +5509,7 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
         // keyboard's owner — a completion list, a preview card — not a
         // dialog: it opens no scope, the keyboard stays where it was and
         // the walk never enters it
-        if out.focus_order.len() == out.focus_floor {
+        if queued.focus == PopoverFocus::Preserve || out.focus_order.len() == out.focus_floor {
             out.focus_floor = floor;
             out.focus_scope = scope;
         }
@@ -7422,6 +7435,7 @@ impl LayoutNode {
                 // and out of the scene, on the popover's own road
                 out.overlay_queue.push(QueuedOverlay {
                     path: path.clone(),
+                    focus: PopoverFocus::Scope,
                     side: None,
                     surface: surface.clone(),
                     node: Rc::clone(content),
@@ -7431,7 +7445,7 @@ impl LayoutNode {
                 });
             }
 
-            (LayoutNode::Anchored { path, side, overlay, child }, Fit::Wrapped(_, fit)) => {
+            (LayoutNode::Anchored { path, side, focus, overlay, child }, Fit::Wrapped(_, fit)) => {
                 child.place(frame, fit, env, out);
                 // the REAL anchor: un-shift the in-flight animation
                 // (the popover never chases a sliding row — the same
@@ -7449,6 +7463,7 @@ impl LayoutNode {
                     .is_none_or(|clip| anchor.intersection(clip).is_some());
                 out.overlay_queue.push(QueuedOverlay {
                     path: path.clone(),
+                    focus: *focus,
                     side: Some(side.physical(env.rtl())),
                     surface: OverlaySurface::Layer,
                     node: Rc::clone(overlay),

@@ -1446,7 +1446,7 @@ impl Walk<'_> {
                 layout.grow = true;
                 layout.stretch = true;
             }
-            LayoutNode::Anchored { path, side, overlay, child } => {
+            LayoutNode::Anchored { path, side, overlay, child, .. } => {
                 // the anchor gets an IDENTITY the glue can find: a
                 // group wrapped around the child, keyed off the
                 // popover's own path
@@ -2259,6 +2259,7 @@ mod tests {
         }
         let anchored = LayoutNode::Anchored {
             path: "App/#0/popover".into(),
+            focus: crate::layout::PopoverFocus::Scope,
             side: crate::layout::Side::Leading,
             overlay: std::rc::Rc::new(text_node("card")),
             child: Box::new(text_node("anchor")),
@@ -2740,6 +2741,7 @@ mod tests {
             align: CrossAlign::Start,
             children: vec![LayoutNode::Anchored {
                 path: "app/[row]".into(),
+                focus: crate::layout::PopoverFocus::Scope,
                 side: crate::layout::Side::Bottom,
                 overlay: std::rc::Rc::new(text_node("the card")),
                 child: Box::new(text_node("the row")),

@@ -1444,7 +1444,23 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         side: crate::layout::Side,
         content: impl Fn(&Context) -> Erased + 'static,
     ) -> Modified<Self> {
-        Modified::new(self, Modifier::Popover { is_presented, side, on_dismiss: None, content: Rc::new(content), })
+        Modified::new(self, Modifier::Popover { is_presented, side, focus: crate::layout::PopoverFocus::Scope, on_dismiss: None, content: Rc::new(content), })
+    }
+
+    /// An anchored popover with an explicit native keyboard policy.
+    /// `PopoverFocus::Preserve` keeps the editor focused while completion
+    /// choices remain operable through pointer, Tab and accessibility actions.
+    /// Dismissal and placement are the same as [`Self::popover`]. Flow DOM
+    /// retains browser-owned keyboard navigation.
+    #[track_caller]
+    fn popover_with_focus(
+        self,
+        is_presented: Binding<bool>,
+        side: crate::layout::Side,
+        focus: crate::layout::PopoverFocus,
+        content: impl Fn(&Context) -> Erased + 'static,
+    ) -> Modified<Self> {
+        Modified::new(self, Modifier::Popover { is_presented, side, focus, on_dismiss: None, content: Rc::new(content), })
     }
 
     /// [`Self::popover`] with a dismissal callback: it runs after ANY
@@ -1460,7 +1476,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         on_dismiss: impl Fn() + 'static,
         content: impl Fn(&Context) -> Erased + 'static,
     ) -> Modified<Self> {
-        Modified::new(self, Modifier::Popover { is_presented, side, on_dismiss: Some(Rc::new(on_dismiss)), content: Rc::new(content), })
+        Modified::new(self, Modifier::Popover { is_presented, side, focus: crate::layout::PopoverFocus::Scope, on_dismiss: Some(Rc::new(on_dismiss)), content: Rc::new(content), })
     }
 
     /// `.toolbar { … }` — inert in the fake runtime, as in the motor.
