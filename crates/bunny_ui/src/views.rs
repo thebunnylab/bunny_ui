@@ -154,6 +154,12 @@ const BUTTON_RADIUS: f64 = 6.0;
 const BUTTON_PAD_H: f64 = 14.0;
 const BUTTON_PAD_V: f64 = 6.0;
 
+#[derive(Clone, Copy)]
+enum ButtonChrome {
+    Standard,
+    Plain,
+}
+
 /// `Button(action:) { label }` — the action lives in an `F: Fn()` field,
 /// called statically (there is no `Rc<dyn Fn()>` here).
 #[derive(Clone)]
@@ -162,6 +168,7 @@ pub struct Button<L, F> {
     action: F,
     disabled: bool,
     checked: Option<bool>,
+    chrome: ButtonChrome,
     site: crate::provenance::Site,
 }
 
@@ -212,25 +219,27 @@ where
                 path: Rc::clone(path), enabled: !self.disabled, checked: self.checked,
             }
         ));
-        out.push_layout(LayoutNode::Styled {
-            props: VisualProps {
-                background: Some(theme.control),
-                background_hovered: Some(theme.control_hovered),
-                background_pressed: Some(theme.control_pressed),
-                corner_radius: Some(Corners::all(BUTTON_RADIUS)),
-                opacity: self.disabled.then_some(0.5),
-                ..VisualProps::default()
-            }
-            .shared(),
-            child: Box::new(LayoutNode::Padding {
-                edges: Edges {
-                    top: BUTTON_PAD_V,
-                    bottom: BUTTON_PAD_V,
-                    leading: BUTTON_PAD_H,
-                    trailing: BUTTON_PAD_H,
+        let content = wrap_layout(layouts);
+        let (mut props, child) = match self.chrome {
+            ButtonChrome::Standard => (
+                VisualProps {
+                    background: Some(theme.control),
+                    background_hovered: Some(theme.control_hovered),
+                    background_pressed: Some(theme.control_pressed),
+                    corner_radius: Some(Corners::all(BUTTON_RADIUS)),
+                    ..VisualProps::default()
                 },
-                child: Box::new(wrap_layout(layouts)),
-            }),
+                LayoutNode::Padding {
+                    edges: Edges { top: BUTTON_PAD_V, bottom: BUTTON_PAD_V, leading: BUTTON_PAD_H, trailing: BUTTON_PAD_H },
+                    child: Box::new(content),
+                },
+            ),
+            ButtonChrome::Plain => (VisualProps::default(), content),
+        };
+        props.opacity = self.disabled.then_some(0.5);
+        out.push_layout(LayoutNode::Styled {
+            props: props.shared(),
+            child: Box::new(child),
             hints: crate::layout::ElementHints {
                 semantics,
                 address: Some(crate::layout::Address::shared(crate::layout::Address {
@@ -261,6 +270,24 @@ where
         self.disabled = disabled;
         self
     }
+
+    /// Keep activation, focus and accessibility while the label supplies all
+    /// geometry and visuals. No default padding or button chrome is added.
+    #[must_use]
+    pub const fn plain(mut self) -> Self {
+        self.chrome = ButtonChrome::Plain;
+        self
+    }
+
+    /// Expose a custom two-state control without adding a checkbox glyph.
+    /// The application owns the value and draws it in the label; Space and
+    /// accessibility activation invoke the existing callback.
+    #[must_use]
+    pub const fn checked(mut self, checked: bool) -> Self {
+        self.checked = Some(checked);
+        self
+    }
+
 }
 
 /// `Button(action:) { label }` — the label first (it is what you read), the
@@ -272,7 +299,7 @@ where
     L: View,
     F: Fn() + Clone + 'static,
 {
-    Button { label, action, disabled: false, checked: None, site: crate::provenance::here() }
+    Button { label, action, disabled: false, checked: None, chrome: ButtonChrome::Standard, site: crate::provenance::here() }
 }
 
 /// A labelled two-state control backed by the application's boolean binding.
@@ -308,6 +335,7 @@ impl<L: View + Clone> View for Checkbox<L> {
             action: move || value.set(!value.wrappedValue()),
             disabled: self.disabled,
             checked: Some(checked),
+            chrome: ButtonChrome::Standard,
             site: self.site,
         }
         .render_into(ctx, out);
