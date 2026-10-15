@@ -134,6 +134,8 @@ unsafe extern "C" {
     fn msg_void_id_i64_id(obj: Id, sel: Sel, a: Id, b: i64, c: Id);
     #[link_name = "objc_msgSendSuper"]
     fn msg_super_bool_id(sup: *const ObjcSuper, sel: Sel, a: Id) -> i8;
+    #[link_name = "objc_msgSendSuper"]
+    fn msg_super_id_point(sup: *const ObjcSuper, sel: Sel, point: CGPoint) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_void_rect_bool(obj: Id, sel: Sel, rect: CGRect, flag: i8);
     #[link_name = "objc_msgSend"]
@@ -2779,10 +2781,11 @@ impl WindowHandle {
         make: impl FnOnce() -> Id,
         update: impl FnOnce(Id, &str),
     ) {
+        unsafe { register_host_class() };
         HOST_VIEWS.with(|hosts| {
             let mut hosts = hosts.borrow_mut();
             let slot = hosts.entry(key.to_string()).or_insert_with(|| unsafe {
-                let container = msg_id(class("NSView"), sel("alloc"));
+                let container = msg_id(class("BunnyHostView"), sel("alloc"));
                 let container = msg_init_rect(
                     container,
                     sel("initWithFrame:"),
@@ -2813,7 +2816,7 @@ impl WindowHandle {
                 msg_void_i64(child, sel("setAutoresizingMask:"), SIZABLE);
                 msg_void_id(container, sel("addSubview:"), child);
                 msg_void_id(self.view, sel("addSubview:"), container);
-                HostSlot { container, child, stamp: stamp.to_string() }
+                HostSlot { container, child, stamp: stamp.to_string(), scroll: bunny_ui::host::DocumentScroll::Document, wheel: crate::host_wheel::ParentWheel::default() }
             });
             let (x, y, w, h) = frame;
             let (vx, vy, vw, vh) = window;
@@ -3150,6 +3153,93 @@ struct HostSlot {
     container: Id,
     child: Id,
     stamp: String,
+    scroll: bunny_ui::host::DocumentScroll,
+    wheel: crate::host_wheel::ParentWheel,
+}
+
+/// Set the mounted document's input policy without changing its native identity.
+pub(crate) fn host_scroll_policy(key: &str, scroll: bunny_ui::host::DocumentScroll) {
+    HOST_VIEWS.with(|hosts| {
+        if let Some(slot) = hosts.borrow_mut().get_mut(key)
+            && slot.scroll != scroll
+        {
+            slot.scroll = scroll;
+            slot.wheel = crate::host_wheel::ParentWheel::default();
+        }
+    });
+}
+
+static REGISTER_HOST: Once = Once::new();
+
+/// Only wheel events hit the opted-in host proxy. Every other event follows
+/// NSView's ordinary hit test, retaining the engine's links and text selection.
+extern "C" fn bunny_host_hit(this: Id, _sel: Sel, point: CGPoint) -> Id {
+    unsafe {
+        let sup = ObjcSuper { receiver: this, class: class("NSView") };
+        let hit = msg_super_id_point(&sup, sel("hitTest:"), point);
+        if hit.is_null() {
+            return hit;
+        }
+        let application = msg_id(class("NSApplication"), sel("sharedApplication"));
+        let event = msg_id(application, sel("currentEvent"));
+        const SCROLL_WHEEL: u64 = 22;
+        if event.is_null() || msg_u64(event, sel("type")) != SCROLL_WHEEL {
+            return hit;
+        }
+        let parent = HOST_VIEWS.with(|hosts| {
+            // Placement may reenter hit testing while updating the table.
+            hosts.try_borrow().ok().is_some_and(|hosts| hosts.values().any(|slot| {
+                slot.container == this && slot.scroll == bunny_ui::host::DocumentScroll::ParentVertical
+            }))
+        });
+        if parent { this } else { hit }
+    }
+}
+
+/// Forward the original native event, retaining precise deltas, modifiers,
+/// momentum and phase. No DOM script or synthesized wheel enters this path.
+extern "C" fn bunny_host_wheel(this: Id, cmd: Sel, event: Id) {
+    unsafe {
+        use crate::host_wheel::Target;
+        let phase = msg_u64(event, sel("phase"));
+        let momentum = msg_u64(event, sel("momentumPhase"));
+        let step = match (phase, momentum) {
+            (_, 8 | 16) | (8 | 16, 0) => bunny_ui::custom::WheelPhase::Ended,
+            (1 | 32, 0) => bunny_ui::custom::WheelPhase::Began,
+            _ => bunny_ui::custom::WheelPhase::Changed,
+        };
+        let dx = msg_f64(event, sel("scrollingDeltaX"));
+        let dy = msg_f64(event, sel("scrollingDeltaY"));
+        let destination = HOST_VIEWS.with(|hosts| {
+            let mut hosts = hosts.try_borrow_mut().ok()?;
+            let slot = hosts.values_mut().find(|slot| slot.container == this)?;
+            let target = if slot.scroll == bunny_ui::host::DocumentScroll::ParentVertical {
+                slot.wheel.route(dx, dy, step, phase != 0 || momentum != 0)
+            } else {
+                Target::Document
+            };
+            Some((slot.child, target))
+        });
+        if let Some((child, target)) = destination {
+            if matches!(target, Target::Document | Target::Both) {
+                msg_void_id(child, cmd, event);
+            }
+            if matches!(target, Target::Parent | Target::Both) {
+                bunny_segment_forward(this, cmd, event);
+            }
+        } else {
+            bunny_segment_forward(this, cmd, event);
+        }
+    }
+}
+
+unsafe fn register_host_class() {
+    REGISTER_HOST.call_once(|| unsafe {
+        let host = objc_allocateClassPair(class("NSView"), c"BunnyHostView".as_ptr(), 0);
+        class_addMethod(host, sel("hitTest:"), bunny_host_hit as *const c_void, c"@@:{CGPoint=dd}".as_ptr());
+        class_addMethod(host, sel("scrollWheel:"), bunny_host_wheel as *const c_void, c"v@:@".as_ptr());
+        objc_registerClassPair(host);
+    });
 }
 
 /// The tenant's view mounted under `key`, if any — where a drained

@@ -40,3 +40,7 @@ harness = false
 [[test]]
 name = "pictures"
 harness = false
+
+[[test]]
+name = "host_scroll_native"
+harness = false

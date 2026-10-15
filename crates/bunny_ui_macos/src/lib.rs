@@ -12,6 +12,7 @@ use bunny_ui_apple::trace;
 pub mod dialog;
 pub mod drive;
 mod ffi;
+mod host_wheel;
 mod life;
 mod menu;
 mod metal;
@@ -1073,7 +1074,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             let placed =
                 runtime.last_viewport().map_or(height, |viewport| viewport.height);
             for host in &hosts {
-                let bunny_ui::host::HostSpec::Webview { .. } = &host.spec else {
+                let bunny_ui::host::HostSpec::Webview { document, .. } = &host.spec else {
                     // a video host is the web's: the box stays reserved
                     // and empty here, and the console says so once
                     bunny_ui::host::refuse_video_once();
@@ -1101,6 +1102,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     || webview::create(&host.path, &host.spec),
                     |child, _stamp| webview::update(&host.path, child, &host.spec),
                 );
+                ffi::host_scroll_policy(&host.path, document.as_ref().filter(|document| !document.editable).map_or(
+                    bunny_ui::host::DocumentScroll::Document, |document| document.scroll,
+                ));
             }
             let alive = hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>();
             window.host_sweep(&alive);
