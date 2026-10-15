@@ -852,6 +852,7 @@ pub enum LayoutNode {
     /// sites — a pass nobody watches never holds one.
     Sited {
         site: crate::provenance::Site,
+        mounted: Option<crate::provenance::MountedId>,
         kind: crate::provenance::NodeKind,
         modifier: Option<&'static str>,
         child: Box<LayoutNode>,
@@ -6581,12 +6582,13 @@ impl LayoutNode {
             }
             // the record is the whole job: the child is placed at exactly
             // the frame this node was given, under this site as its parent
-            (LayoutNode::Sited { site, kind, modifier, child }, _) => {
+            (LayoutNode::Sited { site, mounted, kind, modifier, child }, _) => {
                 let index = u32::try_from(out.sites.len()).unwrap_or(u32::MAX);
                 out.sites.push(crate::provenance::SitePlacement {
                     index,
                     parent: out.site_stack.last().copied(),
                     site: *site,
+                    mounted: *mounted,
                     kind: *kind,
                     modifier: *modifier,
                     frame,

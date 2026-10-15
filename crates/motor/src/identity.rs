@@ -41,6 +41,9 @@ use std::rc::Rc;
 
 use crate::runtime::Site;
 
+mod mounted;
+pub use mounted::MountedId;
+
 /// An observable dependency: a `State` (by the slot's global id, never
 /// recycled) or a whole `Store` (object granularity, like an
 /// ObservableObject).
@@ -53,6 +56,7 @@ pub enum DepKey {
 #[derive(Default)]
 struct Registry {
     pass_active: bool,
+    mounted: mounted::MountedSites,
     /// First segment pushed in the pass — defines the swept root.
     pass_root: Option<String>,
     /// The cursor's path, joined with `/`, maintained incrementally by
@@ -385,7 +389,7 @@ pub fn begin_pass() {
         registry.view_keys.clear();
         registry.pass_no += 1;
         registry.skipped.clear();
-        registry.skips_asked = !registry.owners.is_empty();
+        registry.skips_asked = !registry.owners.is_empty() || !registry.mounted.is_empty();
         registry.reran.clear();
         registry.seqs.clear();
         registry.ordinals.clear();
@@ -420,6 +424,10 @@ pub fn end_pass() -> Vec<String> {
             owner == root || owner.strip_prefix(root.as_str()).is_some_and(|rest| rest.starts_with('/'))
         };
         let pass_no = registry.pass_no;
+        {
+            let Registry { mounted, skipped, reran, .. } = &mut *registry;
+            mounted.sweep(&root, pass_no, |scope| protected_by_boundaries(skipped, reran, scope));
+        }
         let dead: Vec<String> = registry
             .owners
             .iter()
@@ -455,13 +463,17 @@ pub fn end_pass() -> Vec<String> {
 /// apply. The owner's own path is asked first, then each cut above it —
 /// a lookup per level, whatever the size of the two sets.
 fn protected_by_skip(registry: &Registry, owner: &str) -> bool {
+    protected_by_boundaries(&registry.skipped, &registry.reran, owner)
+}
+
+fn protected_by_boundaries(skipped: &HashSet<Rc<str>>, reran: &HashSet<Rc<str>>, owner: &str) -> bool {
     let mut end = owner.len();
     loop {
         let candidate = &owner[..end];
-        if registry.skipped.contains(candidate) {
+        if skipped.contains(candidate) {
             return true;
         }
-        if registry.reran.contains(candidate) {
+        if reran.contains(candidate) {
             return false;
         }
         match candidate.rfind('/') {
@@ -1040,6 +1052,7 @@ pub fn reset_world() {
 pub fn reset_scene(root: &str) {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
+        registry.mounted.reset(root);
         let prefix = format!("{root}/");
         let doomed: Vec<String> = registry
             .owners
@@ -1064,6 +1077,20 @@ pub fn reset_scene(root: &str) {
             registry.dirty.remove(&owner);
         }
     });
+}
+
+/// The recorded declaration at this cursor, source site and role. Repeated
+/// declarations at one site follow positional semantics. Outside an active
+/// pass (or after ID exhaustion), identity is unavailable; it is never guessed.
+pub fn mounted_site(site: Site, role: &'static str) -> Option<MountedId> {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        if !registry.pass_active || registry.joined.is_empty() {
+            return None;
+        }
+        let Registry { mounted, joined, pass_no, .. } = &mut *registry;
+        mounted.claim(joined, site, role, *pass_no)
+    })
 }
 
 // MARK: - State anchors
@@ -2530,3 +2557,7 @@ mod moved_code_tests {
         assert!(dropped.upgrade().is_none(), "the slot nobody took is gone after the pass");
     }
 }
+
+#[cfg(test)]
+#[path = "mounted_tests.rs"]
+mod mounted_tests;

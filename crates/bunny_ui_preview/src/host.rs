@@ -194,7 +194,6 @@ struct Scene {
     runtime: Runtime,
     traits: Traits,
     resized: Option<Size>,
-    seq: u64,
     last: Option<Sent>,
     /// A panic inside the pass: the scene shows the message until the
     /// next generation.
@@ -229,6 +228,7 @@ fn as_override(op: wire::OverrideOp, modifier: bunny_ui_core::modifier::Modifier
 /// What a scene last sent — a frame is sent again only when one of these
 /// moved.
 struct Sent {
+    views: Vec<wire::ViewIdentity>,
     size: Size,
     commands: Vec<wire::Draw>,
     sites: Vec<wire::SiteBox>,
@@ -302,6 +302,9 @@ impl Component for PreviewHost {
 
 /// The host: the scenes, what was sent, and the sink it sends through.
 pub struct Host {
+    observe_views: bool,
+    /// Never reused by another mount in this host connection.
+    publication: u64,
     engines: Engines,
     config: Config,
     scenes: Vec<Scene>,
@@ -327,6 +330,8 @@ impl Host {
     pub fn new(engines: Engines, config: Config, sink: Box<dyn FnMut(ToIde)>) -> Host {
         guard_passes();
         Host {
+            observe_views: false,
+            publication: 0,
             engines,
             config,
             scenes: Vec::new(),
@@ -351,7 +356,7 @@ impl Host {
             generation: self.generation,
             workspace_root: self.config.manifest_dir.to_string_lossy().into_owned(),
             package: self.config.package.clone(),
-            caps: wire::caps::PLACE | wire::caps::INSTANCES | wire::caps::SHAPES | wire::caps::MOUNT | wire::caps::EXECUTION | wire::caps::EXECUTION_SELECTION,
+            caps: wire::caps::VIEW_IDENTITIES | wire::caps::PLACE | wire::caps::INSTANCES | wire::caps::SHAPES | wire::caps::MOUNT | wire::caps::EXECUTION | wire::caps::EXECUTION_SELECTION,
         });
         self.ready();
     }
@@ -434,6 +439,15 @@ impl Host {
 
     fn handle_scoped(&mut self, message: ToHost) {
         match message {
+            ToHost::ObserveViews { enabled } => {
+                if self.observe_views != enabled {
+                    self.observe_views = enabled;
+                    for scene in &mut self.scenes {
+                        scene.last = None;
+                        scene.dirty = true;
+                    }
+                }
+            }
             ToHost::SelectExecutions { request, selections } => self.select_executions(request, selections),
             ToHost::SetExecution { instance, variant, mode } => self.set_execution(instance, variant, mode),
             ToHost::Select(selections) => self.select(selections),
@@ -588,14 +602,12 @@ impl Host {
                 if let Some(at) = standing {
                     let mut scene = self.scenes.remove(at);
                     if let Some(mode) = execution.filter(|mode| scene.execution.context().mode() != Some(*mode)) {
-                        let seq = scene.seq;
                         let resized = scene.resized;
                         let overrides = std::mem::take(&mut scene.overrides);
                         // Close the old lifetime before a fresh runtime can capture its intent.
                         drop(scene);
                         scene = self.open(&selection.id, &selection.ident, variant, traits.clone(), instance.clone());
                         scene.execution.set_mode(mode);
-                        scene.seq = seq;
                         scene.resized = resized;
                         scene.overrides = overrides;
                         scene.refresh_overrides();
@@ -685,7 +697,6 @@ impl Host {
             runtime,
             traits,
             resized: None,
-            seq: 0,
             last: None,
             poisoned: None,
             dirty: true,
@@ -907,6 +918,14 @@ impl Host {
         let scene = &self.scenes[index];
         let mut strings = wire::Strings::new();
         let (commands, images) = convert::lower(&display, &mut strings);
+        let views = if self.observe_views {
+            sites.iter().map(|site| wire::ViewIdentity {
+                index: site.index,
+                mounted: site.mounted.and_then(|id| wire::MountedViewId::parse(id.get()).ok()),
+            }).collect()
+        } else {
+            Vec::new()
+        };
         let sites: Vec<wire::SiteBox> = sites.iter().map(|placement| convert::site_box(placement, &mut strings)).collect();
         let hosts: Vec<wire::HostBox> = hosts
             .iter()
@@ -914,7 +933,7 @@ impl Host {
             .map(|(index, host)| wire::HostBox { index: index as u32, kind: strings.intern(host_kind(&host.spec)), frame: host.frame.into() })
             .collect();
         let table = strings.into_table();
-        if scene.last.as_ref().is_some_and(|last| last.same(size, &commands, &sites, &hosts, &table)) {
+        if scene.last.as_ref().is_some_and(|last| last.views == views && last.same(size, &commands, &sites, &hosts, &table)) {
             return false;
         }
         for image in images {
@@ -928,7 +947,11 @@ impl Host {
             }
         }
         let scene = &mut self.scenes[index];
-        scene.seq += 1;
+        let Some(seq) = self.publication.checked_add(1) else {
+            (self.sink)(ToIde::Panic { message: "preview frame sequence exhausted".to_owned() });
+            return false;
+        };
+        self.publication = seq;
         if scene.hosts != paths {
             scene.hosts = paths;
             self.resweep = true;
@@ -937,7 +960,7 @@ impl Host {
         let frame = wire::Frame {
             preview: scene.ident.to_string(),
             variant: scene.variant,
-            seq: scene.seq,
+            seq,
             generation: self.generation,
             size: size.into(),
             scale: scene.traits.resolved_scale(),
@@ -953,7 +976,17 @@ impl Host {
                 commands: commands.len() as u32,
             },
         };
-        scene.last = Some(Sent { size, commands, sites, hosts, strings: table });
+        if self.observe_views {
+            (self.sink)(ToIde::ViewSnapshot(wire::ViewSnapshot {
+                instance: scene.instance().cloned(),
+                preview: frame.preview.clone(),
+                variant: frame.variant,
+                generation: frame.generation,
+                seq: frame.seq,
+                nodes: views.clone(),
+            }));
+        }
+        scene.last = Some(Sent { size, commands, sites, hosts, strings: table, views });
         let event = match scene.instance() {
             Some(instance) => ToIde::InstanceFrame {
                 instance: instance.clone(),

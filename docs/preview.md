@@ -227,3 +227,31 @@ runs outside the registration lock and should only signal the owner's event
 loop; `poll`/`wait` still own ordered message delivery. Spurious notifications
 are allowed. Replacing a hook does not wait for one already in flight. A
 successful restart retains the hook; polling clients and wire bytes are unchanged.
+
+## Mounted view identities (T2-STUDIO-119)
+
+`Hello.caps & caps::VIEW_IDENTITIES != 0` offers separate mounted identities.
+After `ObserveViews { enabled: true }` (84), `ViewSnapshot` (15) immediately
+precedes each published frame. It carries optional SceneInstanceId, preview,
+variant, generation, seq and site-index-to-optional-nonzero-ID records. Enabling
+observation forces a fresh pair. Identity changes publish even if paint is
+unchanged. Disabling observation stops metadata. Old peers retain the same
+Frame/SiteBox bytes and wire-v1 behavior.
+
+IDs belong to a mounted declaration, not a layout ordinal or source expression.
+The existing structural cursor gives keyed/positional semantics; source site,
+role and repeated-site occurrence distinguish declarations within that scope.
+Repaint, resize, reactive updates and cached subtrees retain identity. Absence
+from an evaluated subtree, scene teardown and remount retire it. IDs are never
+recycled in a host lifetime. No active pass means unavailable identity. No
+recording means no identity allocation.
+
+Clients join only exact host-connection/scene/preview/variant/generation/seq
+evidence, reject duplicate/missing/stale metadata and retain separate source
+revision proofs. An ID does not prove Rust ownership or editing capability.
+
+Frame sequences increase across all publications within a host connection,
+including scene removal/recreation. A consumer must compare ordering, not expect
+contiguous numbers per preview. This prevents a new mount's metadata from joining
+a queued frame of an older mount with the same scene name/build. Restarted hosts
+still require a new client connection epoch.

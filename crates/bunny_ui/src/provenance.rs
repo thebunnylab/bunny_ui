@@ -56,6 +56,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+pub use motor::identity::MountedId;
 pub use motor::runtime::Site;
 use motor::state::Context;
 
@@ -280,6 +281,8 @@ impl NodeKind {
 pub struct SitePlacement {
     /// This placement's index in the list — what `parent` refers to.
     pub index: u32,
+    /// Mounted declaration identity, independent of this layout's index.
+    pub mounted: Option<MountedId>,
     /// The enclosing sited node, when there is one.
     pub parent: Option<u32>,
     /// Where the builder or the modifier was called.
@@ -340,5 +343,6 @@ pub(crate) fn seal(ctx: &Context, out: &mut NodeList, mark: usize, site: Site, k
     if !recording() {
         return;
     }
-    out.wrap_layout_from(mark, |child| LayoutNode::Sited { site, kind, modifier, child: Box::new(child) });
+    let mounted = motor::identity::mounted_site(site, modifier.unwrap_or_else(|| kind.name()));
+    out.wrap_layout_from(mark, |child| LayoutNode::Sited { site, mounted, kind, modifier, child: Box::new(child) });
 }
