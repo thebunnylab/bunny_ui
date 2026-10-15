@@ -499,6 +499,28 @@ fn the_preview_road_frames_clicks_and_survives_a_swap() {
         "a type in a sibling asks for a restart by name: {events:?}"
     );
 
+    // Registration wakes queued work; restart keeps the same notification.
+    let (wake, awake) = std::sync::mpsc::channel();
+    live.set_waker(Some(std::sync::Arc::new(move || { let _ = wake.send(()); })));
+    awake.recv_timeout(Duration::from_secs(1)).unwrap();
+    let mut events = Vec::new();
+    let mut live = match live.restart(&mut events) {
+        Step::Live(live) => live,
+        Step::Failed(failed) => panic!("restart: {}", failed.why()),
+    };
+    awake.recv_timeout(Duration::from_secs(1)).expect("the retained hook wakes the restarted owner");
+    expect(&mut live, Duration::from_secs(30), |message| matches!(message, ToIde::Ready { .. }).then_some(()));
+    while awake.try_recv().is_ok() {}
+    live.send(&ToHost::Ping { nonce: 111 }).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        awake.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("a reply after restart wakes the owner without polling");
+        let mut received = Vec::new();
+        assert!(live.poll(&mut received));
+        if received.iter().any(|event| matches!(event, Event::Host(ToIde::Pong { nonce: 111 }))) { break; }
+    }
+    live.set_waker(None);
     live.stop();
 
     // a picture: `bunny preview --png` starts the host again on the warm

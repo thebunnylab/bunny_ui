@@ -217,3 +217,13 @@ including retained runtimes, without replaying mount effects. This also settles 
 rapid mode change/revert when intermediate frames were discarded. Clients cache
 unchanged selections rather than sending them on every UI frame. The last-good
 image may remain visible while that boundary is pending.
+
+## Waking an embedded preview lane
+
+`bunny_cli::preview::Preview<Live>::set_waker` installs an optional thread-safe
+notification after wire messages are queued or the reader closes. Registration
+also rings once, covering messages received before installation. The callback
+runs outside the registration lock and should only signal the owner's event
+loop; `poll`/`wait` still own ordered message delivery. Spurious notifications
+are allowed. Replacing a hook does not wait for one already in flight. A
+successful restart retains the hook; polling clients and wire bytes are unchanged.
