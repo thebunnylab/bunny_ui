@@ -10,9 +10,13 @@ local, read-only, network-denied documents claim them, and the host replenishes
 the unclaimed reserve after presentation. Editable documents, remote-image
 permission and nonempty bases use their ordinary creation path.
 
-Each claimed view transfers its retain to the mounted host. Used views are not
-returned to the reserve; this preparation does not yet implement retention of a
-reader view across changing host identities. Dropping the resource stops and
+Each claimed view transfers its retain to the mounted host. A retired eligible
+view can return to the bounded reserve only after detachment, removal of all
+scripts/handlers, revoked routing and a confirmed sealed blank navigation.
+Ready and cleaning views share the same two-engine budget. A view with back
+history is discarded instead of crossing document identities. Mount-specific
+bridge channels reject reports from an earlier mount; active panes never share
+an engine. Remote-enabled documents and editors cannot enter this reserve. Dropping the resource stops and
 releases unclaimed engines. Navigation identity rejects late events from the
 preparation page after a view was claimed. Native first-session measurements
 must establish its benefit; a populated reserve is not performance approval.

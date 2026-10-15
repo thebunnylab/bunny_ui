@@ -357,6 +357,7 @@ impl Desk {
             }
             unsafe {
                 msg_void(page.view, sel("removeFromSuperview"));
+                webview::retire(key, page.view);
                 msg_void(page.view, sel("release"));
             }
             refit = true;

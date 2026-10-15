@@ -2867,6 +2867,7 @@ impl WindowHandle {
                 }
                 unsafe {
                     msg_void(slot.container, sel("removeFromSuperview"));
+                    crate::webview::retire(key, slot.child);
                     msg_void(slot.child, sel("release"));
                     msg_void(slot.container, sel("release"));
                 }

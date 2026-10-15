@@ -71,7 +71,6 @@ unsafe extern "C" {
     fn msg_init_config(obj: Id, sel: Sel, frame: CGRect, config: Id) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_init_script(obj: Id, sel: Sel, source: Id, time: i64, main_only: i8) -> Id;
-    #[cfg(not(target_os = "macos"))]
     #[link_name = "objc_msgSend"]
     fn msg_bool(obj: Id, sel: Sel) -> i8;
     fn objc_allocateClassPair(superclass: Id, name: *const c_char, extra: usize) -> Id;
@@ -154,6 +153,7 @@ struct Letter {
     /// commit is the first beat the keyboard can be taken at.
     focus: bool,
     navigation: Id,
+    reusable: bool,
 }
 
 /// Keeps up to two empty native HTML engines ready for local read-only documents.
@@ -166,7 +166,41 @@ pub struct HtmlPreparation {
     pool: Rc<EnginePool>,
 }
 
-type EnginePool = RefCell<Vec<SpareEngine>>;
+type EnginePool = RefCell<EngineReserve>;
+#[derive(Default)]
+struct EngineReserve {
+    ready: Vec<SpareEngine>,
+    cleaning: Vec<CleaningEngine>,
+    reused: usize,
+}
+struct CleaningEngine {
+    engine: SpareEngine,
+    navigation: Id,
+    origin: EngineOrigin,
+}
+#[derive(Clone, Copy)]
+enum EngineOrigin { Fresh, Retired }
+impl EngineReserve {
+    fn len(&self) -> usize { self.ready.len() + self.cleaning.len() }
+}
+const CHANNELS: [&str; 5] = ["bunny", "bunnyConsole", "bunnyNet", "bunnyEval", "bunnyEdit"];
+thread_local! {
+    static MOUNTS: RefCell<HashMap<usize, u64>> = RefCell::new(HashMap::new());
+    static NEXT_MOUNT: Cell<u64> = const { Cell::new(0) };
+}
+fn register_mount(view: Id) -> u64 {
+    let generation = NEXT_MOUNT.with(|next| { let value = next.get().wrapping_add(1); next.set(value); value });
+    MOUNTS.with(|mounts| mounts.borrow_mut().insert(view as usize, generation));
+    generation
+}
+fn current_channel(view: Id, name: &str) -> Option<&str> {
+    let (channel, generation) = name.rsplit_once('_')?;
+    let generation = generation.parse::<u64>().ok()?;
+    (CHANNELS.contains(&channel) && MOUNTS.with(|mounts| mounts.borrow().get(&(view as usize)).copied()) == Some(generation)).then_some(channel)
+}
+fn scoped_script(script: &str, generation: u64) -> String {
+    CHANNELS.iter().fold(script.to_owned(), |script, channel| script.replace(&format!("messageHandlers.{channel}.postMessage"), &format!("messageHandlers.{channel}_{generation}.postMessage")))
+}
 
 struct SpareEngine(Id);
 impl Drop for SpareEngine {
@@ -188,7 +222,7 @@ impl HtmlPreparation {
     /// Request main-thread preparation after the next native presentation.
     #[must_use]
     pub fn request() -> Self {
-        let pool = Rc::new(RefCell::new(Vec::new()));
+        let pool = Rc::new(RefCell::new(EngineReserve::default()));
         HTML_PREPARATIONS.with(|pending| pending.borrow_mut().push(Rc::downgrade(&pool)));
         Self { pool }
     }
@@ -196,8 +230,12 @@ impl HtmlPreparation {
     /// Number of unclaimed engines; primarily useful for native diagnostics.
     #[must_use]
     pub fn available(&self) -> usize {
-        self.pool.borrow().len()
+        self.pool.borrow().ready.len()
     }
+    /// Number of retired engines scrubbed and returned; useful for native diagnostics.
+    #[must_use]
+    pub fn recycled(&self) -> usize { self.pool.borrow().reused }
+
 }
 
 fn preparation_allowed(document: &Document) -> bool {
@@ -208,30 +246,17 @@ fn preparation_allowed(document: &Document) -> bool {
 
 /// Services deferred preparation after the host has presented its frame.
 pub fn prepare_pending_html() {
-    HTML_PREPARATIONS.with(|pending| {
+    let pools = HTML_PREPARATIONS.with(|pending| {
         let mut pending = pending.borrow_mut();
         pending.retain(|pool| pool.strong_count() != 0);
-        for pool in pending.iter().filter_map(Weak::upgrade) {
-            let mut pool = pool.borrow_mut();
-            while pool.len() < 2 {
-                let view = unsafe { new_engine() };
-                let blank = Document::new(
-                    "<!doctype html><html><body></body></html>",
-                    "",
-                    bunny_ui::host::NetworkPolicy::Deny,
-                );
-                unsafe {
-                    let _ = msg_id_id_id(
-                        view,
-                        sel("loadHTMLString:baseURL:"),
-                        ns(&blank.sealed()),
-                        null_mut(),
-                    );
-                }
-                pool.push(SpareEngine(view));
-            }
-        }
+        pending.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
     });
+    for pool in pools {
+        while pool.borrow().len() < 2 {
+            let view = unsafe { new_engine() };
+            reuse::begin_cleaning(&pool, SpareEngine(view), EngineOrigin::Fresh);
+        }
+    }
 }
 
 fn take_prepared(document: &Document) -> Option<Id> {
@@ -245,7 +270,7 @@ fn take_prepared(document: &Document) -> Option<Id> {
             .filter_map(Weak::upgrade)
             .find_map(|pool| {
                 pool.borrow_mut()
-                    .pop()
+                    .ready.pop()
                     .map(|mut engine| std::mem::replace(&mut engine.0, null_mut()))
             })
     })
@@ -291,7 +316,9 @@ extern "C" fn bridge_message(_this: Id, _sel: Sel, _controller: Id, message: Id)
         }
         let body = to_string(body);
         let name = to_string(msg_id(message, sel("name")));
-        match name.as_str() {
+        let view = msg_id(message, sel("webView"));
+        let Some(channel) = current_channel(view, &name) else { return; };
+        match channel {
             "bunny" => {
                 if let Some(path) = key_of(msg_id(message, sel("webView"))) {
                     dispatch(WebviewEvent::Posted { path, body });
@@ -379,6 +406,7 @@ extern "C" fn bridge_committed(_this: Id, _sel: Sel, view: Id, navigation: Id) {
 /// reports nothing.
 extern "C" fn bridge_finished(_this: Id, _sel: Sel, view: Id, navigation: Id) {
     let Some(path) = key_of(view) else {
+        finish_cleaning(view, navigation);
         return;
     };
     if !current_navigation(&path, navigation) {
@@ -427,6 +455,11 @@ extern "C" fn bridge_decide(_this: Id, _sel: Sel, view: Id, action: Id, handler:
 
 unsafe fn decide(view: Id, action: Id) -> i64 {
     let Some(path) = key_of(view) else {
+        if is_cleaning(view) {
+            let request = unsafe { msg_id(action, sel("request")) };
+            let url = unsafe { msg_id(request, sel("URL")) };
+            return if !url.is_null() && unsafe { to_string(msg_id(url, sel("absoluteString"))) } == "about:blank" { POLICY_ALLOW } else { POLICY_CANCEL };
+        }
         return POLICY_ALLOW;
     };
     let expected = LETTERS.with(|letters| {
@@ -644,7 +677,7 @@ pub fn create(path: &str, spec: &HostSpec) -> Id {
             .and_then(take_prepared)
             .unwrap_or_else(|| new_engine());
         let config = msg_id(view, sel("configuration"));
-        install_bridge(msg_id(config, sel("userContentController")), spec);
+        install_bridge(msg_id(config, sel("userContentController")), spec, register_mount(view));
         // navigation reports come through the bridge (the delegate
         // reference is weak; the bridge outlives every view), and so
         // does the ask a new-window link makes
@@ -711,6 +744,7 @@ fn load_document(path: &str, view: Id, document: &Document) {
                 expected: true,
                 focus: document.focus,
                 navigation: null_mut(),
+                reusable: preparation_allowed(document),
             },
         );
     });
@@ -787,25 +821,30 @@ unsafe fn run_script(view: Id, js: &str) {
 /// called beside the host sweep, with the paths still standing.
 pub fn sweep(alive: &[String]) {
     LETTERS.with(|letters| letters.borrow_mut().retain(|path, _| alive.contains(path)));
-    PAGES.with(|pages| pages.borrow_mut().retain(|path, _| alive.contains(path)));
+    PAGES.with(|pages| pages.borrow_mut().retain(|path, view| {
+        if alive.contains(path) { true } else {
+            MOUNTS.with(|mounts| mounts.borrow_mut().remove(&(*view as usize)));
+            false
+        }
+    }));
 }
 
 /// Hands the controller the bridge and the document-start scripts.
 /// Every channel registers up front (a registered name that never
 /// speaks costs nothing, and re-adding one throws); the scripts are
 /// [`apply_scripts`]'s.
-unsafe fn install_bridge(controller: Id, spec: &bunny_ui::host::HostSpec) {
+unsafe fn install_bridge(controller: Id, spec: &bunny_ui::host::HostSpec, generation: u64) {
     unsafe {
         let bridge = bridge();
-        for channel in ["bunny", "bunnyConsole", "bunnyNet", "bunnyEval", "bunnyEdit"] {
+        for channel in CHANNELS {
             msg_void_id_id(
                 controller,
                 sel("addScriptMessageHandler:name:"),
                 bridge,
-                ns(channel),
+                ns(&format!("{channel}_{generation}")),
             );
         }
-        apply_scripts(controller, spec);
+        apply_scripts(controller, spec, generation);
     }
 }
 
@@ -814,24 +853,24 @@ unsafe fn install_bridge(controller: Id, spec: &bunny_ui::host::HostSpec) {
 /// nobody watches pays for no capture — then the editor for an
 /// editable document (its transport first, the framework's script
 /// after), then the app's own scripts, in declaration order.
-unsafe fn apply_scripts(controller: Id, spec: &HostSpec) {
+unsafe fn apply_scripts(controller: Id, spec: &HostSpec, generation: u64) {
     let HostSpec::Webview { scripts, console, requests, document, .. } = spec else { return };
     unsafe {
-        add_script(controller, WEBKIT_BOOT);
+        add_script(controller, &scoped_script(WEBKIT_BOOT, generation));
         if *console {
-            add_script(controller, WEBKIT_CONSOLE_HOOK);
+            add_script(controller, &scoped_script(WEBKIT_CONSOLE_HOOK, generation));
         }
         if *requests {
-            add_script(controller, WEBKIT_NET_WRAP);
+            add_script(controller, &scoped_script(WEBKIT_NET_WRAP, generation));
         }
         if let Some(document) = document
             && document.editable
         {
-            add_script(controller, &webkit_editor_prelude(document));
-            add_script(controller, EDITOR_SCRIPT);
+            add_script(controller, &scoped_script(&webkit_editor_prelude(document), generation));
+            add_script(controller, &scoped_script(EDITOR_SCRIPT, generation));
         }
         for script in scripts.iter() {
-            add_script(controller, script);
+            add_script(controller, &scoped_script(script, generation));
         }
     }
 }
@@ -873,7 +912,8 @@ pub fn update(path: &str, view: Id, spec: &HostSpec) {
         let config = msg_id(view, sel("configuration"));
         let controller = msg_id(config, sel("userContentController"));
         msg_void(controller, sel("removeAllUserScripts"));
-        apply_scripts(controller, spec);
+        let Some(generation) = MOUNTS.with(|mounts| mounts.borrow().get(&(view as usize)).copied()) else { return; };
+        apply_scripts(controller, spec, generation);
         match document {
             Some(document) => {
                 let loaded = LETTERS
@@ -1008,7 +1048,8 @@ pub fn forward(view: Id) {
 /// so no block ever crosses this border. `raw` hands the value back as
 /// the string it is (a null answers empty); otherwise it rides as JSON.
 pub fn eval(view: Id, token: u64, js: &str, raw: bool) {
-    let wrapped = webkit_eval_wrap(token, js, raw);
+    let Some(generation) = MOUNTS.with(|mounts| mounts.borrow().get(&(view as usize)).copied()) else { return; };
+    let wrapped = scoped_script(&webkit_eval_wrap(token, js, raw), generation);
     unsafe { run_script(view, &wrapped) }
 }
 
@@ -1232,3 +1273,8 @@ unsafe fn to_string(ns: Id) -> String {
 #[cfg(test)]
 #[path = "webview_preparation_tests.rs"]
 mod preparation_tests;
+
+#[path = "webview_reuse.rs"]
+mod reuse;
+use reuse::{finish_cleaning, is_cleaning};
+pub use reuse::retire;
