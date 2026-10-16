@@ -452,3 +452,21 @@ CG-backed NSEvents exercise native hit testing and forwarding inside the test
 application. It checks outer/inner offsets, horizontal motion, links, selection
 and default document behavior. These injected events do not certify physical
 trackpad timing, touch behavior or application-level visual acceptance.
+
+## Private native document milestones
+
+With `BUNNY_PRESENT_TRACE` enabled, Apple document hosts add `V` records on the
+same trace clock as frame settlement/presentation. Each contains only a numeric
+process-local mount and one fixed stage: `load-request`, `load-return`, `commit`,
+`finish` or `post`. No host path, HTML, URL or posted payload enters these records.
+Navigation callbacks must match the current navigation; posted milestones follow
+existing mount-channel validation. Browser pages do not emit document milestones.
+The load request precedes sealing/submission; return follows the native call.
+The `post` label means an accepted application bridge message, not DOM readiness.
+These milestones never substitute for actual presented body pixels.
+
+Run the native reuse witness with a trace, then validate its private record
+shape and at least one navigation/post using `python3 scripts/check-html-lifecycle.py
+<path>`. Interrupted retired documents need not finish. The checker supports
+independent mounts and repeat loads; `python3 scripts/test_html_lifecycle.py`
+checks rejected payloads, impossible callbacks and interleaving.
