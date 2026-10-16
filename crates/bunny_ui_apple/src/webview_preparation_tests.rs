@@ -98,3 +98,62 @@ fn retire_only_owns_the_matching_native_host() {
     PAGES.with(|pages| pages.borrow_mut().remove(path));
     MOUNTS.with(|mounts| mounts.borrow_mut().remove(&(actual as usize)));
 }
+
+
+#[test]
+fn a_claimed_engine_keeps_its_reserve_slot_until_retirement() {
+    let requested = HtmlPreparation::request();
+    requested.pool.borrow_mut().ready.extend([
+        SpareEngine(null_mut()), SpareEngine(null_mut()),
+    ]);
+    let local = Document::new("<p>Selected message</p>", "", NetworkPolicy::Deny);
+    assert!(take_prepared(&local).is_some());
+    assert_eq!(requested.available(), 1);
+    assert_eq!(requested.pool.borrow().occupied(), 2,
+        "displaying a prepared message must not trigger fresh WebKit construction");
+}
+
+
+#[test]
+fn releasing_a_claim_preserves_the_other_pool_and_is_idempotent() {
+    let first = HtmlPreparation::request();
+    let second = HtmlPreparation::request();
+    first.pool.borrow_mut().borrowed.insert(101);
+    second.pool.borrow_mut().borrowed.insert(102);
+    let home = release_prepared(102usize as Id).unwrap();
+    assert!(Rc::ptr_eq(&home, &second.pool));
+    assert_eq!(first.pool.borrow().occupied(), 1);
+    assert_eq!(second.pool.borrow().occupied(), 0);
+    assert!(release_prepared(102usize as Id).is_none());
+    assert!(release_prepared(103usize as Id).is_none());
+}
+
+#[test]
+fn swept_hosts_release_only_their_own_reservation() {
+    let requested = HtmlPreparation::request();
+    requested.pool.borrow_mut().borrowed.extend([201, 202]);
+    PAGES.with(|pages| {
+        pages.borrow_mut().insert("retired".into(), 201usize as Id);
+        pages.borrow_mut().insert("still-mounted".into(), 202usize as Id);
+    });
+    sweep(&["still-mounted".into()]);
+    assert_eq!(requested.pool.borrow().occupied(), 1);
+    assert!(requested.pool.borrow().borrowed.contains(&202));
+    sweep(&[]);
+    assert_eq!(requested.pool.borrow().occupied(), 0);
+}
+
+#[test]
+fn claims_and_cleaning_share_the_same_preparation_budget() {
+    let requested = HtmlPreparation::request();
+    requested.pool.borrow_mut().borrowed.insert(301);
+    requested.pool.borrow_mut().cleaning.push(CleaningEngine {
+        engine: SpareEngine(null_mut()),
+        navigation: 302usize as Id,
+        origin: EngineOrigin::Retired,
+    });
+    assert_eq!(requested.pool.borrow().occupied(), 2);
+    assert_eq!(requested.available(), 0);
+    release_prepared(301usize as Id);
+    assert_eq!(requested.pool.borrow().occupied(), 1);
+}

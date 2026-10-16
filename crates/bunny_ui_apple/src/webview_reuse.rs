@@ -5,7 +5,7 @@
 use super::{
     CHANNELS, CleaningEngine, EngineOrigin, EnginePool, HTML_PREPARATIONS, Id, LETTERS, MOUNTS,
     PAGES, SpareEngine, bridge, current_url, msg_bool, msg_id, msg_id_id_id, msg_void, msg_void_id,
-    ns, null_mut, sel,
+    ns, null_mut, release_prepared, sel,
 };
 use bunny_ui::host::{Document, NetworkPolicy};
 use std::rc::{Rc, Weak};
@@ -21,6 +21,7 @@ pub unsafe fn retire(path: &str, view: Id) {
     if !owns_host(path, view) {
         return;
     }
+    let claimed = release_prepared(view);
     PAGES.with(|pages| pages.borrow_mut().remove(path));
     let eligible = LETTERS.with(|letters| {
         letters
@@ -32,19 +33,24 @@ pub unsafe fn retire(path: &str, view: Id) {
     if !eligible {
         return;
     }
-    let pool = HTML_PREPARATIONS.with(|pending| {
-        pending
-            .borrow()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .find(|pool| pool.borrow().cleaning.len() < 2)
+    let pool = claimed.or_else(|| {
+        HTML_PREPARATIONS.with(|pending| {
+            pending
+                .borrow()
+                .iter()
+                .filter_map(Weak::upgrade)
+                .find(|pool| {
+                    let reserve = pool.borrow();
+                    reserve.occupied() < 2 || !reserve.ready.is_empty()
+                })
+        })
     });
     let Some(pool) = pool else {
         return;
     };
     let discarded = {
         let mut reserve = pool.borrow_mut();
-        if reserve.len() == 2 {
+        if reserve.occupied() == 2 {
             reserve.ready.pop()
         } else {
             None
