@@ -72,10 +72,11 @@ The app calls `bunny run` back on a socket — on the loopback, or on Android
 through `adb reverse` — and takes each new build there: by its path, or, on
 Android, as bytes it writes to its own folder first.
 
-- An edit inside function bodies keeps all the state. An edit that reaches a
-  type — a field, a signature, a new item — gives the new build new types: the
-  state that holds the app's own types (`State<Vec<Todo>>`) starts over, the
-  state of other types (`State<i32>`, `State<String>`) stays.
+- An edit inside function bodies keeps the mounted state. An edit that reaches
+  a type — a field, a signature, a new item — is compiled first, then restarts
+  the app with fresh state. This includes primitive payloads such as `State<i32>`:
+  inserting a field must not give it another field's live value. A failed build
+  leaves the previous code and state running.
 - A change to `Cargo.toml`, `build.rs` or `src/main.rs` restarts the app; so
   does a reload that finds another crate of the workspace changed.
 - What the old code started keeps the old code: a running `.task`, a closure a

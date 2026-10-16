@@ -17,10 +17,11 @@
 //! which the Simulator shares with the computer, or, on Android, an
 //! abstract socket that `adb reverse` carries here.
 //!
-//! An edit that reaches a type gets a new salt ([`classify`]). A change
-//! the library cannot carry restarts the app: `Cargo.toml`, `build.rs`,
-//! the binary's own `src/main.rs`, or a dependency that had to be built
-//! again.
+//! An edit that reaches a type ([`classify`]) is compiled first, then
+//! restarts the app. A new build salt cannot distinguish newly inserted
+//! primitive State fields from live fields with the same payload type.
+//! `Cargo.toml`, `build.rs`, the binary's own `src/main.rs`, or a rebuilt
+//! external dependency also require a restart.
 //!
 //! The path crates the app builds from — a `ui_kit` beside it — are
 //! watched with it: a save inside one of their function bodies builds
@@ -455,6 +456,12 @@ impl Hot {
         // else built again — the framework, a registry crate — is a restart
         if let Some(dependency) = rebuilt.iter().find(|name| !self.locals.iter().any(|local| !local.framework && local.name == **name)) {
             return Err(Missed::Restart(format!("{dependency} was built again")));
+        }
+        // Salting renames application types, not primitive State payloads. A
+        // new field can otherwise claim a live sibling's ordinal. Compile first
+        // so a failed edit leaves the old app alive, then reset all execution.
+        if new_types {
+            return Err(Missed::Restart(String::from("an application type changed: live state must restart")));
         }
         match app.load(&generation) {
             None => Err(Missed::Load(String::from("this app does not take new code"))),
