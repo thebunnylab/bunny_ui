@@ -113,7 +113,7 @@ jobs:
         # the app as a preview host: built hot with its entries, a frame
         # per selected preview, a click answered, a save swapped with the
         # state kept — each step printed with its milliseconds
-        run: cargo test -p bunny-cli --locked --test preview_host -- --ignored --nocapture
+        run: cargo test -p bunny-cli --locked --test preview_host --test preview_state_shape -- --ignored --nocapture
 
   android-build:
     name: bunny build linux and android
