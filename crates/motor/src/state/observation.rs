@@ -10,7 +10,7 @@
 //! connection, scene and frame lifetime before presenting a value as current.
 
 use crate::hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use crate::identity::DepKey;
+pub use crate::identity::DepKey;
 use std::any::Any;
 use std::cell::RefCell;
 use std::panic::Location;
