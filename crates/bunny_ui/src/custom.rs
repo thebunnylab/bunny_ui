@@ -902,7 +902,8 @@ pub enum ElementEvent {
         modifiers: crate::action::Modifiers,
         phase: WheelPhase,
     },
-    /// The pointer left the box (or the window).
+    /// The pointer left the box: for another target, for bare glass, or
+    /// out of the window. A box that keeps a hover of its own ends it here.
     PointerExited,
     /// A keystroke, while the box has focus — arrows, Enter, Tab and
     /// the shortcuts, exactly as the keymap spells them. Escape also reaches
@@ -1660,6 +1661,51 @@ mod tests {
         );
         runtime.pointer_exited();
         assert_eq!(log.borrow().last(), Some(&ElementEvent::PointerExited));
+    }
+
+    /// A box hears the pointer leave for ANOTHER view, not only for the
+    /// window's edge: a hover it keeps for itself would otherwise stay lit
+    /// after the hand moved on to a neighbour. Once per departure, and the
+    /// way back in is an ordinary move.
+    #[test]
+    fn a_move_onto_a_neighbour_tells_the_box_the_pointer_left() {
+        #[derive(Clone)]
+        struct Screen {
+            log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
+        }
+        impl Component for Screen {
+            fn body(self) -> impl View {
+                use crate::ext::ViewExt;
+                crate::hstack!(
+                    custom(Recorder::new(&self.log)).frame(40.0, 40.0),
+                    crate::views::text("next").frame(40.0, 40.0).on_click(|| {}),
+                    crate::views::spacer().frame(40.0, 40.0),
+                )
+                .spacing(0.0)
+            }
+        }
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let runtime = Runtime::new();
+        let view = Screen { log: Rc::clone(&log) };
+        runtime.layout(&view, Proposal { width: Some(120.0), height: Some(40.0) });
+        let exits = || {
+            log.borrow().iter().filter(|event| **event == ElementEvent::PointerExited).count()
+        };
+        runtime.pointer_moved(12.0, 8.0, false);
+        assert!(matches!(log.borrow().last(), Some(ElementEvent::PointerMoved { .. })));
+        // onto the neighbour target
+        runtime.pointer_moved(52.0, 8.0, false);
+        assert_eq!(log.borrow().last(), Some(&ElementEvent::PointerExited));
+        assert_eq!(exits(), 1);
+        // moving about on the neighbour tells the box nothing more
+        runtime.pointer_moved(60.0, 20.0, false);
+        assert_eq!(exits(), 1, "once per departure");
+        // back in, and out again onto bare glass
+        runtime.pointer_moved(12.0, 8.0, false);
+        assert!(matches!(log.borrow().last(), Some(ElementEvent::PointerMoved { .. })));
+        runtime.pointer_moved(100.0, 8.0, false);
+        assert_eq!(log.borrow().last(), Some(&ElementEvent::PointerExited));
+        assert_eq!(exits(), 2);
     }
 
     /// PAIN-88: a painted scene has no views inside it, and the choice
