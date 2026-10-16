@@ -2105,8 +2105,15 @@ impl Runtime {
         };
         let changed = interaction.hovered != hovered;
         interaction.pointer = Some(Point { x, y });
-        interaction.hovered = hovered.clone();
+        let left = std::mem::replace(&mut interaction.hovered, hovered.clone());
         drop(interaction);
+        // the box the pointer just left hears it go, whatever it went to —
+        // another target, bare glass — exactly as it does when the pointer
+        // leaves the window: a hover a box keeps for itself (a lifted row, a
+        // column of chevrons) otherwise outlives the hand that made it
+        if changed && let Some(placement) = left.as_deref().and_then(|path| self.custom_at(path)) {
+            self.deliver(&placement, crate::custom::ElementEvent::PointerExited);
+        }
         // a free move over a box still reaches it: a cursor over code
         // wants the column under it
         let over = hovered.as_deref().and_then(|path| self.custom_at(path));
