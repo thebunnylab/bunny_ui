@@ -8,6 +8,9 @@ use crate::hash::FxHashMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
+/// Read-only, bounded observations of actual state storage.
+pub mod observation;
+
 /// A side effect collected while rendering (drained by `Runtime::pump`).
 /// Returns whether it observed a state change (i.e. a re-render is due).
 pub type EffectFn = Rc<dyn Fn(&Context) -> bool>;
@@ -648,6 +651,9 @@ struct TypedSlot<T> {
     /// identity it names the value's content — a reader that kept what it
     /// saw at a count knows nothing changed while the count stands.
     writes: u64,
+    /// None after retirement; a reused arena slot gets a fresh dependency.
+    dep: Option<u64>,
+    constructor: &'static std::panic::Location<'static>,
 }
 
 struct TypedArena<T> {
@@ -660,14 +666,16 @@ impl<T> TypedArena<T> {
         TypedArena { slots: Vec::new(), free: Vec::new() }
     }
 
-    fn alloc(&mut self, value: T) -> (usize, u32) {
+    fn alloc(&mut self, value: T, dep: u64, constructor: &'static std::panic::Location<'static>) -> (usize, u32) {
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index];
             slot.value = Some(value);
             slot.writes += 1;
+            slot.dep = Some(dep);
+            slot.constructor = constructor;
             (index, slot.generation)
         } else {
-            self.slots.push(TypedSlot { generation: 0, value: Some(value), writes: 0 });
+            self.slots.push(TypedSlot { generation: 0, value: Some(value), writes: 0, dep: Some(dep), constructor });
             (self.slots.len() - 1, 0)
         }
     }
@@ -678,6 +686,7 @@ impl<T> TypedArena<T> {
         if let Some(slot) = self.slots.get_mut(index) {
             slot.generation += 1;
             slot.value = None;
+            slot.dep = None;
             self.free.push(index);
         }
     }
@@ -700,6 +709,7 @@ thread_local! {
 /// made it.
 struct Arena {
     cell: Rc<dyn Any>,
+    observe: observation::Reader,
     #[cfg(debug_assertions)]
     shape: Shape,
 }
@@ -748,6 +758,7 @@ fn arena_cell<T: 'static>() -> Rc<RefCell<TypedArena<T>>> {
             FREERS.with(|freers| freers.borrow_mut().insert(TypeId::of::<T>(), free_typed::<T>));
             Arena {
                 cell: Rc::new(RefCell::new(TypedArena::<T>::new())) as Rc<dyn Any>,
+                observe: observation::read_arena::<T>,
                 #[cfg(debug_assertions)]
                 shape: Shape::of::<T>(),
             }
@@ -798,7 +809,9 @@ impl<T> Clone for State<T> {
 impl<T> Copy for State<T> {}
 
 impl<T: Clone + 'static> State<T> {
+    #[track_caller]
     pub fn new(value: T) -> Self {
+        let constructor = std::panic::Location::caller();
         match crate::identity::claim_anchor(TypeId::of::<T>()) {
             crate::identity::Claim::Existing { index, generation, dep } => {
                 // identity already mounted: revive the slot, discard the initial
@@ -810,7 +823,7 @@ impl<T: Clone + 'static> State<T> {
                     next.set(dep + 1);
                     dep
                 });
-                let (index, generation) = with_arena::<T, _>(|arena| arena.alloc(value));
+                let (index, generation) = with_arena::<T, _>(|arena| arena.alloc(value, dep, constructor));
                 crate::identity::fulfill_anchor(token, index, generation, dep);
                 State { index, generation, dep, _marker: PhantomData }
             }

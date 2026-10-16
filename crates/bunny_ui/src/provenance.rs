@@ -58,6 +58,41 @@ use std::rc::Rc;
 
 pub use motor::identity::MountedId;
 pub use motor::runtime::Site;
+pub use motor::state::observation;
+
+/// An exact retained text binding, not a path-based reconstruction.
+///
+/// This token owns only the binding key. It cannot keep a view, state value or
+/// callback alive. A replacement binding at the same path does not revive it.
+#[derive(Clone, Debug)]
+pub struct ReadBinding {
+    key: Rc<str>,
+    owner: std::rc::Weak<()>,
+}
+
+impl PartialEq for ReadBinding {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.key, &other.key) && std::rc::Weak::ptr_eq(&self.owner, &other.owner)
+    }
+}
+impl Eq for ReadBinding {}
+
+impl ReadBinding {
+    /// Observe the binding's currently recorded dependencies, without evaluating
+    /// the binding. None means these exact read edges no longer stand (or the
+    /// last evaluation read nothing). Values describe now, not a saved frame;
+    /// transports must capture them with the matching publication and lifetime.
+    pub fn observe(&self) -> Result<Option<Vec<observation::Observation>>, observation::Unavailable> {
+        if self.owner.upgrade().is_none() { return Ok(None); }
+        motor::identity::binding_dependencies(&self.key)
+            .map(|dependencies| observation::snapshot(&dependencies))
+            .transpose()
+    }
+
+    pub(crate) fn attach(&mut self, owner: &Rc<()>) {
+        self.owner = Rc::downgrade(owner);
+    }
+}
 use motor::state::Context;
 
 use crate::layout::{LayoutNode, Rect};
@@ -283,6 +318,9 @@ pub struct SitePlacement {
     pub index: u32,
     /// Mounted declaration identity, independent of this layout's index.
     pub mounted: Option<MountedId>,
+    /// Exact text-node read ownership, when this node has a retained binding.
+    /// A containing stack or modifier does not inherit its children's reads.
+    pub reading: Option<ReadBinding>,
     /// The enclosing sited node, when there is one.
     pub parent: Option<u32>,
     /// Where the builder or the modifier was called.
@@ -344,5 +382,13 @@ pub(crate) fn seal(ctx: &Context, out: &mut NodeList, mark: usize, site: Site, k
         return;
     }
     let mounted = motor::identity::mounted_site(site, modifier.unwrap_or_else(|| kind.name()));
-    out.wrap_layout_from(mark, |child| LayoutNode::Sited { site, mounted, kind, modifier, child: Box::new(child) });
+    out.wrap_layout_from(mark, |child| {
+        let reading = match &child {
+            LayoutNode::Text { content, .. } if kind == NodeKind::Text => {
+                content.bound().map(|bound| ReadBinding { key: Rc::clone(bound.key()), owner: std::rc::Weak::new() })
+            }
+            _ => None,
+        };
+        LayoutNode::Sited { site, mounted, reading, kind, modifier, child: Box::new(child) }
+    });
 }

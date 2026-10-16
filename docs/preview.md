@@ -130,6 +130,33 @@ artboard's request from attaching to a recreated instance. A generation change
 invalidates the last-sent frame even when its pixels are identical, allowing tools
 to associate the new source receipt with every retained instance.
 
+### Read-only state observation foundation
+
+`Runtime::sites()` now attaches an exact `ReadBinding` to a reactive text site.
+`reading.observe()` consults the retained read graph and actual `State` storage;
+it never evaluates the text closure, clones an application value or invokes its
+formatting. A containing stack or modifier does not inherit child dependencies.
+The token expires when recording stops, its runtime drops or that exact binding
+is retired/replaced, including replacement at the same structural path.
+
+State allocation retains its original `#[track_caller]` location, dependency
+identity and write version. Revived state keeps its original creation location;
+a recycled slot receives a new identity. Integers preserve all 128 bits, floats
+preserve their bit patterns, and booleans, characters and standard string types
+have built-in inspection. Other types are explicitly opaque and require no
+`Debug` or `Serialize` bound. Strings above 4096 bytes are reported as oversized,
+never truncated. A request above 512 dependencies or borrowed storage refuses
+the complete snapshot; a value temporarily owned by `update` is marked updating.
+Store dependencies remain explicitly unsupported.
+
+These are current execution facts, not reconstructed source expressions. The
+constructor caller is not necessarily a model field or the whole initialization
+expression. A text can read several states; multiple texts can share one state.
+No runtime setter or source edit is exposed. This foundation has no new preview
+wire capability yet: selected observation requests, frame/connection fencing and
+the Studio inspector remain T2-STUDIO-128 integration work. Frozen messages and
+existing host behavior are unchanged.
+
 ### Basic shape authoring capability
 
 Hosts offering `ellipse()` and inherited foreground ink for `rectangle()` announce
