@@ -4,8 +4,8 @@
 //! revoked before touching WebKit, and a different mount uses different channels.
 use super::{
     CHANNELS, CleaningEngine, EngineOrigin, EnginePool, HTML_PREPARATIONS, Id, LETTERS, MOUNTS,
-    PAGES, SpareEngine, bridge, class, current_url, msg_bool, msg_id, msg_id_id_id,
-    msg_init_script, msg_void, msg_void_id, ns, null_mut, sel,
+    PAGES, SpareEngine, bridge, current_url, msg_bool, msg_id, msg_id_id_id, msg_void, msg_void_id,
+    ns, null_mut, sel,
 };
 use bunny_ui::host::{Document, NetworkPolicy};
 use std::rc::{Rc, Weak};
@@ -82,21 +82,6 @@ pub(super) fn begin_cleaning(pool: &Rc<EnginePool>, engine: SpareEngine, origin:
     });
     unsafe {
         msg_void_id(view, sel("setNavigationDelegate:"), bridge());
-        // Prime the script runtime on the sealed blank, never on user content.
-        // No handlers are registered, and readiness removes this inert script.
-        let controller = msg_id(
-            msg_id(view, sel("configuration")),
-            sel("userContentController"),
-        );
-        let primer = msg_init_script(
-            msg_id(class("WKUserScript"), sel("alloc")),
-            sel("initWithSource:injectionTime:forMainFrameOnly:"),
-            ns("void 0;"),
-            0,
-            1,
-        );
-        msg_void_id(controller, sel("addUserScript:"), primer);
-        msg_void(primer, sel("release"));
         let blank = Document::new(
             "<!doctype html><html><body></body></html>",
             "",
@@ -163,11 +148,6 @@ pub(super) fn finish_cleaning(view: Id, navigation: Id) {
     let cleaned = pool.cleaning.remove(index);
     unsafe {
         msg_void_id(view, sel("setNavigationDelegate:"), null_mut());
-        let controller = msg_id(
-            msg_id(view, sel("configuration")),
-            sel("userContentController"),
-        );
-        msg_void(controller, sel("removeAllUserScripts"));
         if current_url(view).as_deref() != Some("about:blank")
             || msg_bool(view, sel("canGoBack")) != 0
             || msg_bool(view, sel("canGoForward")) != 0
