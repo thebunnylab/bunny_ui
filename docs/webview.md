@@ -3,12 +3,15 @@
 ## Deferred Apple HTML preparation
 
 The macOS host exports `HtmlPreparation::request()`. The returned non-Send
-resource owns up to two unclaimed blank WebKit engines. Requesting it performs
-no native allocation; after a native frame is presented, the host creates the
-engines and starts loading a sealed empty document asynchronously. Eligible
-local, read-only, network-denied documents claim them, and the host replenishes
-the unclaimed reserve after presentation. Editable documents, remote-image
-permission and nonempty bases use their ordinary creation path.
+resource prepares a two-engine WebKit reserve. Requesting it performs no native
+allocation; after a native frame is presented, the host creates the engines and
+starts loading sealed empty documents asynchronously. Eligible local, read-only,
+network-denied documents claim them. Claimed engines keep their capacity slot
+while mounted, so displaying a prepared document never triggers a speculative
+fresh-engine refill. Retirement returns the slot through the existing sealed-blank
+barrier; leaving the eligible document policy or sweeping the exact host releases
+it. Editable documents, remote-image permission and nonempty bases use their
+ordinary creation path.
 
 Fixed native configuration, including supported inspection, is applied once
 when allocating an engine, before its reserve blank navigation. Claiming a
@@ -18,7 +21,7 @@ and injects no runtime warm-up scripts.
 Each claimed view transfers its retain to the mounted host. A retired eligible
 view can return to the bounded reserve only after detachment, removal of all
 scripts/handlers, revoked routing and a confirmed sealed blank navigation.
-Ready and cleaning views share the same two-engine budget. A view with back
+Ready, cleaning and claimed views share the same two-engine budget. A view with back
 history is discarded instead of crossing document identities. Mount-specific
 bridge channels reject reports from an earlier mount; active panes never share
 an engine. Remote-enabled documents and editors cannot enter this reserve. Dropping the resource stops and

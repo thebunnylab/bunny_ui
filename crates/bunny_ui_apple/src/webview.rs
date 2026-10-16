@@ -23,7 +23,7 @@
 //! reports to the app, and nothing else moves.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr::null_mut;
 use std::rc::{Rc, Weak};
@@ -191,11 +191,12 @@ struct Letter {
     reusable: bool,
 }
 
-/// Keeps up to two empty native HTML engines ready for local read-only documents.
+/// Prepares a two-engine reserve for local read-only documents.
 ///
 /// Requesting preparation allocates no WebKit objects. The native host services
 /// the request after presenting a frame; WebKit then loads a sealed blank page
-/// asynchronously. Claimed engines transfer ownership to the host, and dropping
+/// asynchronously. Claimed engines remain in the capacity budget while owned
+/// by the host, avoiding fresh construction during reading. Dropping
 /// this resource releases only engines that have not been claimed.
 pub struct HtmlPreparation {
     pool: Rc<EnginePool>,
@@ -207,6 +208,7 @@ struct EngineReserve {
     ready: Vec<SpareEngine>,
     cleaning: Vec<CleaningEngine>,
     reused: usize,
+    borrowed: HashSet<usize>,
 }
 struct CleaningEngine {
     engine: SpareEngine,
@@ -217,6 +219,7 @@ struct CleaningEngine {
 enum EngineOrigin { Fresh, Retired }
 impl EngineReserve {
     fn len(&self) -> usize { self.ready.len() + self.cleaning.len() }
+    fn occupied(&self) -> usize { self.len() + self.borrowed.len() }
 }
 const CHANNELS: [&str; 5] = ["bunny", "bunnyConsole", "bunnyNet", "bunnyEval", "bunnyEdit"];
 thread_local! {
@@ -287,7 +290,7 @@ pub fn prepare_pending_html() {
         pending.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
     });
     for pool in pools {
-        while pool.borrow().len() < 2 {
+        while pool.borrow().occupied() < 2 {
             let view = unsafe { new_engine() };
             reuse::begin_cleaning(&pool, SpareEngine(view), EngineOrigin::Fresh);
         }
@@ -304,10 +307,23 @@ fn take_prepared(document: &Document) -> Option<Id> {
             .iter()
             .filter_map(Weak::upgrade)
             .find_map(|pool| {
-                pool.borrow_mut()
-                    .ready.pop()
-                    .map(|mut engine| std::mem::replace(&mut engine.0, null_mut()))
+                let mut reserve = pool.borrow_mut();
+                let mut engine = reserve.ready.pop()?;
+                let view = std::mem::replace(&mut engine.0, null_mut());
+                reserve.borrowed.insert(view as usize);
+                Some(view)
             })
+    })
+}
+
+/// Release a reservation only for the exact engine claimed from that pool.
+fn release_prepared(view: Id) -> Option<Rc<EnginePool>> {
+    HTML_PREPARATIONS.with(|pending| {
+        pending
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|pool| pool.borrow_mut().borrowed.remove(&(view as usize)))
     })
 }
 
@@ -774,6 +790,9 @@ fn current_navigation(path: &str, navigation: Id) -> bool {
 /// delegate is asked about this load, and must find the letter
 /// expecting it.
 fn load_document(path: &str, view: Id, document: &Document) {
+    if !preparation_allowed(document) {
+        release_prepared(view);
+    }
     LETTERS.with(|letters| {
         letters.borrow_mut().insert(
             path.to_string(),
@@ -864,6 +883,7 @@ pub fn sweep(alive: &[String]) {
     PAGES.with(|pages| pages.borrow_mut().retain(|path, view| {
         if alive.contains(path) { true } else {
             MOUNTS.with(|mounts| mounts.borrow_mut().remove(&(*view as usize)));
+            release_prepared(*view);
             false
         }
     }));
@@ -963,6 +983,7 @@ pub fn update(path: &str, view: Id, spec: &HostSpec) {
                 }
             }
             None => {
+                release_prepared(view);
                 LETTERS.with(|letters| letters.borrow_mut().remove(path));
                 if current_url(view).as_deref() != Some(&**url) {
                     navigate(view, url);
