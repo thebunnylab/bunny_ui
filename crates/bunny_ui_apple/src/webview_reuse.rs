@@ -4,11 +4,24 @@
 //! revoked before touching WebKit, and a different mount uses different channels.
 use super::{
     CHANNELS, CleaningEngine, EngineOrigin, EnginePool, HTML_PREPARATIONS, Id, LETTERS, MOUNTS,
-    PAGES, SpareEngine, bridge, current_url, msg_bool, msg_id, msg_id_id_id, msg_void, msg_void_id,
-    ns, null_mut, sel,
+    PAGES, SpareEngine, bridge, class, current_url, msg_bool, msg_id, msg_id_id_id,
+    msg_init_script, msg_void, msg_void_id, ns, null_mut, sel,
 };
 use bunny_ui::host::{Document, NetworkPolicy};
 use std::rc::{Rc, Weak};
+
+// Fixed text only: no user content or bridge enters the reserve's blank.
+const FONT_PRIMER: &str = r#"(() => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 640; canvas.height = 40;
+    const context = canvas.getContext('2d');
+    if (!context) return;
+    for (const font of ['14px system-ui', 'bold 21px system-ui']) {
+        context.font = font;
+        context.fillText('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789', 0, 28);
+    }
+    context.getImageData(0, 0, 640, 40);
+})();"#;
 
 /// Retire a detached host before its owner releases its last native retain.
 /// Only local, read-only, network-denied documents can enter a live preparation
@@ -82,6 +95,21 @@ pub(super) fn begin_cleaning(pool: &Rc<EnginePool>, engine: SpareEngine, origin:
     });
     unsafe {
         msg_void_id(view, sel("setNavigationDelegate:"), bridge());
+        if matches!(origin, EngineOrigin::Fresh) {
+            let controller = msg_id(
+                msg_id(view, sel("configuration")),
+                sel("userContentController"),
+            );
+            let primer = msg_init_script(
+                msg_id(class("WKUserScript"), sel("alloc")),
+                sel("initWithSource:injectionTime:forMainFrameOnly:"),
+                ns(FONT_PRIMER),
+                0,
+                1,
+            );
+            msg_void_id(controller, sel("addUserScript:"), primer);
+            msg_void(primer, sel("release"));
+        }
         let blank = Document::new(
             "<!doctype html><html><body></body></html>",
             "",
@@ -148,6 +176,11 @@ pub(super) fn finish_cleaning(view: Id, navigation: Id) {
     let cleaned = pool.cleaning.remove(index);
     unsafe {
         msg_void_id(view, sel("setNavigationDelegate:"), null_mut());
+        let controller = msg_id(
+            msg_id(view, sel("configuration")),
+            sel("userContentController"),
+        );
+        msg_void(controller, sel("removeAllUserScripts"));
         if current_url(view).as_deref() != Some("about:blank")
             || msg_bool(view, sel("canGoBack")) != 0
             || msg_bool(view, sel("canGoForward")) != 0

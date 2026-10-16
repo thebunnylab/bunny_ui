@@ -12,8 +12,10 @@ permission and nonempty bases use their ordinary creation path.
 
 Fixed native configuration, including supported inspection, is applied once
 when allocating an engine, before its reserve blank navigation. Claiming a
-prepared engine does not repeat this setup. Preparation attaches no window
-and injects no runtime warm-up scripts.
+prepared engine does not repeat this setup. Preparation attaches no window.
+A fresh reserve blank may execute fixed, trusted system-font canvas work; no
+user content or message handler participates, and the script is removed before
+readiness. A new host never inherits that script.
 
 Each claimed view transfers its retain to the mounted host. A retired eligible
 view can return to the bounded reserve only after detachment, removal of all
