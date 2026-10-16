@@ -138,6 +138,41 @@ fn key_of(view: Id) -> Option<String> {
     })
 }
 
+/// Fixed native lifecycle labels: no page-derived data enters the tape.
+#[derive(Clone, Copy)]
+enum DocumentMilestone {
+    LoadRequest,
+    LoadReturn,
+    Committed,
+    Finished,
+    Posted,
+}
+impl DocumentMilestone {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::LoadRequest => "load-request",
+            Self::LoadReturn => "load-return",
+            Self::Committed => "commit",
+            Self::Finished => "finish",
+            Self::Posted => "post",
+        }
+    }
+}
+
+fn trace_document(path: &str, view: Id, milestone: DocumentMilestone) {
+    if !crate::trace::enabled() || !LETTERS.with(|letters| letters.borrow().contains_key(path)) {
+        return;
+    }
+    MOUNTS.with(|mounts| {
+        if let Some(mount) = mounts.borrow().get(&(view as usize)) {
+            crate::trace::mark(
+                "V",
+                format_args!("mount={mount} stage={}", milestone.name()),
+            );
+        }
+    });
+}
+
 /// A mounted document's standing.
 struct Letter {
     /// The fingerprint of what is loaded — `update` compares, so the
@@ -321,6 +356,7 @@ extern "C" fn bridge_message(_this: Id, _sel: Sel, _controller: Id, message: Id)
         match channel {
             "bunny" => {
                 if let Some(path) = key_of(msg_id(message, sel("webView"))) {
+                    trace_document(&path, view, DocumentMilestone::Posted);
                     dispatch(WebviewEvent::Posted { path, body });
                 }
             }
@@ -379,6 +415,7 @@ extern "C" fn bridge_committed(_this: Id, _sel: Sel, view: Id, navigation: Id) {
     if !current_navigation(&path, navigation) {
         return;
     }
+    trace_document(&path, view, DocumentMilestone::Committed);
     let wants_keyboard = LETTERS.with(|letters| {
         let mut letters = letters.borrow_mut();
         let Some(letter) = letters.get_mut(&path) else {
@@ -412,6 +449,7 @@ extern "C" fn bridge_finished(_this: Id, _sel: Sel, view: Id, navigation: Id) {
     if !current_navigation(&path, navigation) {
         return;
     }
+    trace_document(&path, view, DocumentMilestone::Finished);
     unsafe {
         let url = msg_id(view, sel("URL"));
         if url.is_null() {
@@ -748,6 +786,7 @@ fn load_document(path: &str, view: Id, document: &Document) {
             },
         );
     });
+    trace_document(path, view, DocumentMilestone::LoadRequest);
     unsafe {
         let base = if document.base.is_empty() {
             null_mut()
@@ -766,6 +805,7 @@ fn load_document(path: &str, view: Id, document: &Document) {
             }
         });
     }
+    trace_document(path, view, DocumentMilestone::LoadReturn);
 }
 
 
