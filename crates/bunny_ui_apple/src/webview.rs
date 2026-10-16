@@ -683,12 +683,6 @@ pub fn create(path: &str, spec: &HostSpec) -> Id {
         // does the ask a new-window link makes
         msg_void_id(view, sel("setNavigationDelegate:"), bridge());
         msg_void_id(view, sel("setUIDelegate:"), bridge());
-        // the engine's own inspector, where the OS offers the switch
-        // (13.3+) — a webview here is a dev's window into a page, and
-        // a devtool that cannot open is a quiet page with no name
-        if msg_bool_sel(view, sel("respondsToSelector:"), sel("setInspectable:")) != 0 {
-            msg_void_bool(view, sel("setInspectable:"), 1);
-        }
         PAGES.with(|pages| pages.borrow_mut().insert(path.to_string(), view));
         match document {
             Some(document) => load_document(path, view, document),
@@ -717,6 +711,12 @@ unsafe fn new_engine() -> Id {
             config,
         );
         msg_void(config, sel("release"));
+        // the engine's own inspector, where the OS offers the switch
+        // (13.3+) — a webview here is a dev's window into a page, and
+        // a devtool that cannot open is a quiet page with no name
+        if msg_bool_sel(view, sel("respondsToSelector:"), sel("setInspectable:")) != 0 {
+            msg_void_bool(view, sel("setInspectable:"), 1);
+        }
         view
     }
 }
