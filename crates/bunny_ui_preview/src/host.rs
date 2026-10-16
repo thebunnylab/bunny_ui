@@ -84,6 +84,7 @@ use crate::wire::{self, Message, Reader, Received, ToHost, ToIde};
 
 mod input;
 mod instances;
+mod state;
 use instances::{SceneLane, SceneMode, SelectedScene};
 
 /// The text and image engines the scenes render with — the platform's
@@ -228,6 +229,7 @@ fn as_override(op: wire::OverrideOp, modifier: bunny_ui_core::modifier::Modifier
 /// What a scene last sent — a frame is sent again only when one of these
 /// moved.
 struct Sent {
+    state: Option<(wire::StateRequestId, wire::StateRead)>,
     views: Vec<wire::ViewIdentity>,
     size: Size,
     commands: Vec<wire::Draw>,
@@ -302,6 +304,8 @@ impl Component for PreviewHost {
 
 /// The host: the scenes, what was sent, and the sink it sends through.
 pub struct Host {
+    state_request: Option<wire::StateRequestId>,
+    state_watch: Option<state::StateWatch>,
     observe_views: bool,
     /// Never reused by another mount in this host connection.
     publication: u64,
@@ -330,6 +334,8 @@ impl Host {
     pub fn new(engines: Engines, config: Config, sink: Box<dyn FnMut(ToIde)>) -> Host {
         guard_passes();
         Host {
+            state_request: None,
+            state_watch: None,
             observe_views: false,
             publication: 0,
             engines,
@@ -356,7 +362,7 @@ impl Host {
             generation: self.generation,
             workspace_root: self.config.manifest_dir.to_string_lossy().into_owned(),
             package: self.config.package.clone(),
-            caps: wire::caps::VIEW_IDENTITIES | wire::caps::PLACE | wire::caps::INSTANCES | wire::caps::SHAPES | wire::caps::MOUNT | wire::caps::EXECUTION | wire::caps::EXECUTION_SELECTION,
+            caps: wire::caps::STATE_OBSERVATIONS | wire::caps::VIEW_IDENTITIES | wire::caps::PLACE | wire::caps::INSTANCES | wire::caps::SHAPES | wire::caps::MOUNT | wire::caps::EXECUTION | wire::caps::EXECUTION_SELECTION,
         });
         self.ready();
     }
@@ -435,10 +441,12 @@ impl Host {
             Some(context) => context.with(|| self.handle_scoped(message)),
             None => self.handle_scoped(message),
         }
+        self.check_state_watch();
     }
 
     fn handle_scoped(&mut self, message: ToHost) {
         match message {
+            ToHost::ObserveState { request, target } => self.observe_state(request, target),
             ToHost::ObserveViews { enabled } => {
                 if self.observe_views != enabled {
                     self.observe_views = enabled;
@@ -707,7 +715,7 @@ impl Host {
 
     /// Whether any scene wants a frame without being asked.
     pub fn needs_turn(&self) -> bool {
-        self.scenes
+        self.state_changed() || self.scenes
             .iter()
             .any(|scene| scene.dirty || scene.needs_frame())
             || self.pictures.as_ref().is_some_and(|door| door.busy())
@@ -741,16 +749,19 @@ impl Host {
                 }
             }
         }
+        self.check_state_watch();
+        let changed_state = self.state_changed().then(|| self.state_scene_index()).flatten();
         let mut sent = false;
         for index in 0..self.scenes.len() {
             if self.scenes[index].poisoned.is_some() {
                 continue;
             }
-            if !(self.scenes[index].dirty || self.scenes[index].needs_frame()) {
+            if !(self.scenes[index].dirty || self.scenes[index].needs_frame() || changed_state == Some(index)) {
                 continue;
             }
             sent |= self.render(index);
         }
+        self.check_state_watch();
         self.answer_held();
         self.answer_held_instances();
         self.sweep_door();
@@ -913,6 +924,7 @@ impl Host {
         let began = Instant::now();
         self.scenes[index].dirty = false;
         let Some(Pass { size, display, sites, hosts, body_passes }) = self.pass(index) else { return false };
+        let state = self.state_for_pass(index, &sites);
         let display = self.pictured(index, &hosts, display);
         let paths: Vec<String> = hosts.iter().map(|host| host.path.clone()).collect();
         let scene = &self.scenes[index];
@@ -933,7 +945,7 @@ impl Host {
             .map(|(index, host)| wire::HostBox { index: index as u32, kind: strings.intern(host_kind(&host.spec)), frame: host.frame.into() })
             .collect();
         let table = strings.into_table();
-        if scene.last.as_ref().is_some_and(|last| last.views == views && last.same(size, &commands, &sites, &hosts, &table)) {
+        if scene.last.as_ref().is_some_and(|last| last.state == state && last.views == views && last.same(size, &commands, &sites, &hosts, &table)) {
             return false;
         }
         for image in images {
@@ -976,6 +988,8 @@ impl Host {
                 commands: commands.len() as u32,
             },
         };
+        self.publish_state(seq, &state);
+        let scene = &mut self.scenes[index];
         if self.observe_views {
             (self.sink)(ToIde::ViewSnapshot(wire::ViewSnapshot {
                 instance: scene.instance().cloned(),
@@ -986,7 +1000,7 @@ impl Host {
                 nodes: views.clone(),
             }));
         }
-        scene.last = Some(Sent { size, commands, sites, hosts, strings: table, views });
+        scene.last = Some(Sent { size, commands, sites, hosts, strings: table, views, state });
         let event = match scene.instance() {
             Some(instance) => ToIde::InstanceFrame {
                 instance: instance.clone(),

@@ -1564,6 +1564,31 @@ pub fn binding_read_count(key: &str) -> usize {
     REGISTRY.with(|registry| registry.borrow().binding_reads.get(key).map_or(0, Few::len))
 }
 
+/// Exact current read edges of this binding allocation, without recording reads.
+/// Reusing the same path does not revive an older binding's evidence. Retired
+/// bindings are unavailable even before the deferred retirement sweep runs.
+pub fn binding_dependencies(key: &Rc<str>) -> Option<Vec<DepKey>> {
+    REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        let (standing, dependencies) = registry.binding_reads.get_key_value(&**key)?;
+        if !Rc::ptr_eq(standing, key)
+            || registry.retired_bindings.contains(&identity(key))
+            || registry.leaving.iter().any(|view| {
+                standing_bindings(&registry.view_bindings, view)
+                    .is_some_and(|bindings| bindings.iter().any(|binding| Rc::ptr_eq(binding, key)))
+            })
+        {
+            return None;
+        }
+        let mut dependencies: Vec<_> = dependencies.iter().copied().collect();
+        dependencies.sort_by_key(|dependency| match dependency {
+            DepKey::State(id) => (0, *id),
+            DepKey::Store(id) => (1, *id),
+        });
+        Some(dependencies)
+    })
+}
+
 /// Did a write reach a binding since the last frame took the dirty ones?
 pub fn has_dirty_bindings() -> bool {
     REGISTRY.with(|registry| !registry.borrow().dirty_bindings.is_empty())

@@ -130,6 +130,65 @@ artboard's request from attaching to a recreated instance. A generation change
 invalidates the last-sent frame even when its pixels are identical, allowing tools
 to associate the new source receipt with every retained instance.
 
+### Read-only state observation foundation
+
+`Runtime::sites()` now attaches an exact `ReadBinding` to a reactive text site.
+`reading.observe()` consults the retained read graph and actual `State` storage;
+it never evaluates the text closure, clones an application value or invokes its
+formatting. A containing stack or modifier does not inherit child dependencies.
+The token expires when recording stops, its runtime drops or that exact binding
+is retired/replaced, including replacement at the same structural path.
+
+State allocation retains its original `#[track_caller]` location, dependency
+identity and write version. Revived state keeps its original creation location;
+a recycled slot receives a new identity. Integers preserve all 128 bits, floats
+preserve their bit patterns, and booleans, characters and standard string types
+have built-in inspection. Other types are explicitly opaque and require no
+`Debug` or `Serialize` bound. Strings above 4096 bytes are reported as oversized,
+never truncated. A request above 512 dependencies or borrowed storage refuses
+the complete snapshot; a value temporarily owned by `update` is marked updating.
+Store dependencies remain explicitly unsupported.
+
+These are current execution facts, not reconstructed source expressions. The
+constructor caller is not necessarily a model field or the whole initialization
+expression. A text can read several states; multiple texts can share one state.
+No runtime setter or source edit is exposed.
+
+### Selected state observation protocol
+
+Hosts advertise `caps::STATE_OBSERVATIONS` (128). After enabling `ObserveViews`,
+a client sends `ObserveState` (kind 85) with a nonzero, monotonically increasing
+request and a target: scene instance (or the legacy lane), preview identifier,
+variant, generation and mounted view identity. `target: None` cancels. Only one
+watch exists per connection. A newer request replaces it even if the new target
+is invalid; an old request cannot clear a newer watch. A legacy target matching
+multiple scene aliases is explicitly ambiguous, never the first match.
+
+`StateObservation` (kind 16) distinguishes a frame-bound snapshot from a stopped
+or refused request. An active watch publishes `StateSnapshot`, `ViewSnapshot`,
+then `Frame`/`InstanceFrame`, preserving the existing view/frame adjacency and
+all frozen version-1 bytes. Values are sampled after layout. The selected
+binding is also polled through its read-only lifetime token: a storage/version
+change publishes a new frame even when formatted text and paint are identical.
+Unselected nodes are not inspected. Remount, removal, panic, generation changes
+and disabling view observation revoke the watch explicitly.
+
+`StateSnapshot::match_views` requires validated view/frame metadata and the
+client's current request and target. It verifies the exact publication and
+mounted occurrence, unique dependencies and bounds. Consumers must additionally
+fence the host connection and compiled-source freshness; a proof from an old
+connection is unusable in a new one. The wire carries no source-edit permission.
+Bounds are checked before decoding allocations: at most 512 dependencies and
+4096 UTF-8 bytes per value/metadata string. Unsupported, missing, retired,
+borrowed, updating and oversized outcomes remain distinct; no truncation or
+application callbacks are used. Integers retain 128 bits and floats travel as
+IEEE-754 bits, including signed zero and NaN payloads.
+
+Older peers receive no state messages without opting in; clients must show an
+unavailable capability when a host does not advertise it. Native Studio session,
+connection/source fencing, inspector and initializer controls remain integration
+work under T2-STUDIO-128.
+
 ### Basic shape authoring capability
 
 Hosts offering `ellipse()` and inherited foreground ink for `rectangle()` announce

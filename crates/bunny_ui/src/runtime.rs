@@ -184,6 +184,8 @@ pub struct Runtime {
     /// The sited nodes of the last layout (`crate::provenance`) — empty
     /// unless [`Runtime::record_sites`] turned recording on.
     last_sites: RefCell<Vec<crate::provenance::SitePlacement>>,
+    /// Exported read observations cannot outlive this runtime or recording session.
+    observation_lifetime: RefCell<Rc<()>>,
     /// Which of those hits paint a pointer state (indices into
     /// `last_hits`), and which hover groups do — the last layout's
     /// answer to "would a hover HERE change the picture?".
@@ -1656,6 +1658,7 @@ impl Runtime {
             last_root_type: Cell::new(None),
             last_hits: RefCell::new(Vec::new()),
             last_sites: RefCell::new(Vec::new()),
+            observation_lifetime: RefCell::new(Rc::new(())),
             last_hover_sensitive: RefCell::new(Vec::new()),
             last_sensitive_groups: RefCell::new(Vec::new()),
             hover_move_had_more: Cell::new(false),
@@ -5559,6 +5562,7 @@ impl Runtime {
         crate::provenance::set_recording(on);
         if !on {
             self.last_sites.borrow_mut().clear();
+            *self.observation_lifetime.borrow_mut() = Rc::new(());
         }
     }
 
@@ -5566,7 +5570,12 @@ impl Runtime {
     /// scene's coordinates — the table a tool maps a click or a caret
     /// through. Empty unless [`Runtime::record_sites`] is on.
     pub fn sites(&self) -> Vec<crate::provenance::SitePlacement> {
-        self.last_sites.borrow().clone()
+        let mut sites = self.last_sites.borrow().clone();
+        let owner = self.observation_lifetime.borrow();
+        for site in &mut sites {
+            if let Some(reading) = &mut site.reading { reading.attach(&owner); }
+        }
+        sites
     }
 
     /// Dom mode: every island's element id, origin and size in the

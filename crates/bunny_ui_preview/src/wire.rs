@@ -25,6 +25,8 @@ use std::fmt;
 
 mod instances;
 mod views;
+mod state;
+pub use state::{DependencyKey, InvalidStateRequestId, MatchedState, StateConstructor, StateDependency, StateEvidence, StateMismatch, StateRead, StateRefusal, StateReply, StateRequestId, StateSnapshot, StateTarget, StateValue, STATE_DEPENDENCY_LIMIT, STATE_TEXT_LIMIT};
 pub use views::{InvalidMountedViewId, MatchedViews, MountedViewId, ViewIdentity, ViewMismatch, ViewSnapshot};
 pub use instances::{ExecutionMode, ExecutionSelection, InstanceCommand, InstanceSelection, InvalidSceneInstanceId, SceneInstanceId};
 
@@ -58,6 +60,7 @@ pub mod kind {
     pub const INSTANCE_ERROR: u8 = 13;
     pub const EXECUTIONS_SELECTED: u8 = 14;
     pub const VIEW_SNAPSHOT: u8 = 15;
+    pub const STATE_OBSERVATION: u8 = 16;
 
     pub const SELECT: u8 = 64;
     pub const RETRAIT: u8 = 65;
@@ -81,10 +84,13 @@ pub mod kind {
     pub const SET_EXECUTION: u8 = 82;
     pub const SELECT_EXECUTIONS: u8 = 83;
     pub const OBSERVE_VIEWS: u8 = 84;
+    pub const OBSERVE_STATE: u8 = 85;
 }
 
 /// Features a host explicitly offers in `Hello.caps`.
 pub mod caps {
+    /// Selected read-only state observations through messages 16 and 85.
+    pub const STATE_OBSERVATIONS: u32 = 128;
     /// Opt-in mounted-view snapshots accompanying exact frame publications.
     pub const VIEW_IDENTITIES: u32 = 64;
     /// Free form, grid and live Position/Span overrides through message 79.
@@ -466,6 +472,8 @@ pub struct PreviewInfo {
 pub enum ToIde {
     /// Mounted identities immediately preceding their exact frame.
     ViewSnapshot(ViewSnapshot),
+    /// Selected state metadata, joined to an exact request and frame.
+    StateObservation(StateReply),
     /// The complete execution selection is applied; following instance frames use it.
     ExecutionsSelected { request: u64 },
     /// The first message: who is talking.
@@ -618,6 +626,8 @@ pub enum PlacePatch {
 pub enum ToHost {
     /// Opt in after negotiating `caps::VIEW_IDENTITIES`; false stops metadata.
     ObserveViews { enabled: bool },
+    /// Replace or cancel the selected state watch; requires view observation.
+    ObserveState { request: StateRequestId, target: Option<StateTarget> },
     Select(Vec<Selection>),
     /// Replace instance selections after negotiating `caps::INSTANCES`.
     SelectInstances(Vec<InstanceSelection>),
@@ -708,6 +718,10 @@ pub enum Malformed {
     InvalidSceneInstance,
     /// Zero cannot identify a mounted view.
     InvalidMountedView,
+    /// An observation contains an invalid request, value or duplicate dependency.
+    InvalidStateObservation,
+    /// Selected observation bounds were exceeded.
+    StateObservationLimit,
     /// A length past [`MAX_FRAME`].
     Oversized { len: u32 },
     /// Bytes left over after the message — the payload was not this kind's.
@@ -719,6 +733,8 @@ impl fmt::Display for Malformed {
         match self {
             Malformed::Truncated { kind } => write!(f, "a message of kind {kind} ended before its payload did"),
             Malformed::BadTag { what, tag } => write!(f, "no {what} answers to the tag {tag}"),
+            Malformed::InvalidStateObservation => f.write_str("invalid state observation"),
+            Malformed::StateObservationLimit => f.write_str("state observation exceeds its bounds"),
             Malformed::InvalidMountedView => f.write_str("invalid mounted view identity"),
             Malformed::InvalidSceneInstance => f.write_str("invalid scene instance identity"),
             Malformed::BadText => f.write_str("a string on the wire is not UTF-8"),
@@ -799,8 +815,8 @@ impl Reader {
 pub fn decode(kind: u8, payload: &[u8]) -> Result<Received, Malformed> {
     let mut cursor = Cursor { bytes: payload, at: 0, kind };
     let message = match kind {
-        kind::HELLO..=kind::VIEW_SNAPSHOT => Message::ToIde(ToIde::get(&mut cursor)?),
-        kind::SELECT..=kind::OBSERVE_VIEWS => Message::ToHost(ToHost::get(&mut cursor)?),
+        kind::HELLO..=kind::STATE_OBSERVATION => Message::ToIde(ToIde::get(&mut cursor)?),
+        kind::SELECT..=kind::OBSERVE_STATE => Message::ToHost(ToHost::get(&mut cursor)?),
         _ => return Ok(Received::Unknown { kind, len: payload.len() as u32 }),
     };
     if cursor.at != payload.len() {
@@ -1749,6 +1765,7 @@ impl ToIde {
     /// Writes the payload; answers the kind.
     fn put(&self, out: &mut Vec<u8>) -> u8 {
         match self {
+            ToIde::StateObservation(reply) => { reply.put(out); kind::STATE_OBSERVATION }
             ToIde::ViewSnapshot(snapshot) => {
                 snapshot.put(out);
                 kind::VIEW_SNAPSHOT
@@ -1854,6 +1871,7 @@ impl ToIde {
 
     fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
         Ok(match c.kind {
+            kind::STATE_OBSERVATION => ToIde::StateObservation(StateReply::get(c)?),
             kind::VIEW_SNAPSHOT => ToIde::ViewSnapshot(ViewSnapshot::get(c)?),
             kind::EXECUTIONS_SELECTED => ToIde::ExecutionsSelected { request: c.u64()? },
             kind::HELLO => {
@@ -1910,6 +1928,9 @@ impl ToHost {
     /// Writes the payload; answers the kind.
     fn put(&self, out: &mut Vec<u8>) -> u8 {
         match self {
+            ToHost::ObserveState { request, target } => {
+                out.u64(request.get()); out.option(target.as_ref(), |out, target| target.put(out)); kind::OBSERVE_STATE
+            }
             ToHost::ObserveViews { enabled } => {
                 out.bool(*enabled);
                 kind::OBSERVE_VIEWS
@@ -2032,6 +2053,7 @@ impl ToHost {
 
     fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
         Ok(match c.kind {
+            kind::OBSERVE_STATE => ToHost::ObserveState { request: StateRequestId::get_wire(c)?, target: c.option(StateTarget::get)? },
             kind::OBSERVE_VIEWS => ToHost::ObserveViews { enabled: c.bool()? },
             kind::SELECT_EXECUTIONS => ToHost::SelectExecutions { request: c.u64()?, selections: c.list(ExecutionSelection::get)? },
             kind::SET_EXECUTION => ToHost::SetExecution {
