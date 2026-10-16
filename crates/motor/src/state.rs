@@ -12,6 +12,9 @@ use std::rc::Rc;
 /// Returns whether it observed a state change (i.e. a re-render is due).
 pub type EffectFn = Rc<dyn Fn(&Context) -> bool>;
 
+/// Application query lookup by declared model name.
+pub type QuerySource = Rc<dyn Fn(&'static str) -> Option<Rc<dyn Any>>>;
+
 /// `\.locale` — the languages the reader asked for, best first, as one
 /// normalized BCP-47 list: `"pt-BR,en-US,en"`.
 ///
@@ -471,7 +474,7 @@ pub struct EnvironmentValues {
     /// `\.injected` — `Rc<DIContainer>` in the app.
     pub injected: Option<Rc<dyn Any>>,
     /// `\.modelContext` stand-in: resolves `Query<T>` sources by type name.
-    pub querySource: Option<Rc<dyn Fn(&'static str) -> Option<Rc<dyn Any>>>>,
+    pub querySource: Option<QuerySource>,
 }
 
 /// Render-time context: environment values + collected effects.
@@ -726,8 +729,7 @@ impl Shape {
 
 fn with_arena<T: 'static, R>(f: impl FnOnce(&mut TypedArena<T>) -> R) -> R {
     let cell = arena_cell::<T>();
-    let result = f(&mut cell.borrow_mut());
-    result
+    f(&mut cell.borrow_mut())
 }
 
 /// The arena of `T`, borrowed to READ: several reads of one type may
@@ -735,8 +737,7 @@ fn with_arena<T: 'static, R>(f: impl FnOnce(&mut TypedArena<T>) -> R) -> R {
 /// one fails loudly, the rule `update` already keeps.
 fn with_arena_ref<T: 'static, R>(f: impl FnOnce(&TypedArena<T>) -> R) -> R {
     let cell = arena_cell::<T>();
-    let result = f(&cell.borrow());
-    result
+    f(&cell.borrow())
 }
 
 /// The arena of `T`, made on first use.
@@ -1279,8 +1280,9 @@ mod tests {
 
     #[test]
     fn state_clones_share_storage() {
+        fn clone_handle<T: Clone>(value: &T) -> T { value.clone() }
         let a = State::new(1);
-        let b = a.clone();
+        let b = clone_handle(&a);
         b.set(2);
         assert_eq!(a.wrappedValue(), 2);
     }
@@ -1301,8 +1303,10 @@ mod tests {
     /// them once, leaving every other holder with the values it had.
     #[test]
     fn a_context_copy_shares_its_values_until_one_is_written() {
-        let mut ctx = Context::default();
-        ctx.values = Rc::new(EnvironmentValues { locale: Locale::new("pt-BR"), ..EnvironmentValues::default() });
+        let mut ctx = Context {
+            values: Rc::new(EnvironmentValues { locale: Locale::new("pt-BR"), ..EnvironmentValues::default() }),
+            ..Context::default()
+        };
         let kept = ctx.clone();
         assert!(Rc::ptr_eq(&kept.values, &ctx.values), "a copy shares the values");
         Rc::make_mut(&mut ctx.values).locale = Locale::new("en");

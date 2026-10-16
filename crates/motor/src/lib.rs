@@ -5,7 +5,7 @@
 //! synchronous, which is honest to the "headless demo" goal:
 //!
 //! - `@State`         → [`State<T>`] (`Rc<RefCell<T>>`; views are `Clone` and cheap,
-//!                       so value-type-view + heap-state, like real SwiftUI)
+//!   so value-type-view + heap-state, like real SwiftUI)
 //! - `CurrentValueSubject` → [`Store<T>`] (synchronous watchers, no async)
 //! - `AnyPublisher`   → pull-based [`AnyPublisher<V>`] polled by [`Runtime::pump`]
 //! - `@Environment`   → [`Environment<T>`] resolved from [`Context`] / [`EnvironmentValues`]
