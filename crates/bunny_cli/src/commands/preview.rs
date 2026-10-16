@@ -470,6 +470,7 @@ fn print_event(event: &Event, _wanted: &[String]) {
             | ToIde::Snapshot { .. }
             | ToIde::InstanceSnapshot { .. }
             | ToIde::ViewSnapshot(_)
+            | ToIde::StateObservation(_)
             | ToIde::ExecutionsSelected { .. }
             | ToIde::Pong { .. } => {}
         },
