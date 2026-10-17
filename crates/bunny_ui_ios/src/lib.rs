@@ -494,7 +494,7 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                         host.visible.size.width,
                         host.visible.size.height,
                     ),
-                    || webview::create(&host.path, &host.spec),
+                    |place| webview::create_placed(&host.path, &host.spec, place),
                     |child, _stamp| webview::update(&host.path, child, &host.spec),
                 );
             }

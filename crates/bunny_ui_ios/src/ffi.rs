@@ -1675,7 +1675,7 @@ thread_local! {
 /// An empty window hides the view instead of unmounting it: a page
 /// keeps its state while it is scrolled off.
 ///
-/// `make` runs once, when the key first appears, and returns the
+/// `make` runs once, calls its placement continuation, and returns the
 /// tenant's view with ONE retain that [`host_sweep`] releases. `update`
 /// runs when `stamp` changed — how a navigation lands without a
 /// re-mount.
@@ -1684,7 +1684,7 @@ pub fn host_place(
     stamp: &str,
     frame: (f64, f64, f64, f64),
     window: (f64, f64, f64, f64),
-    make: impl FnOnce() -> Id,
+    make: impl FnOnce(&dyn Fn(Id)) -> Id,
     update: impl FnOnce(Id, &str),
 ) {
     let scene = VIEW.with(Cell::get);
@@ -1700,20 +1700,32 @@ pub fn host_place(
             let container = msg_init_rect(
                 msg_id(class("UIView"), sel("alloc")),
                 sel("initWithFrame:"),
-                CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 0.0, height: 0.0 } },
+                CGRect {
+                    origin: CGPoint { x: 0.0, y: 0.0 },
+                    size: CGSize {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                },
             );
             // the container is the CLIP: whatever the tenant draws
             // stays inside the window the layout granted
             msg_void_bool(container, sel("setClipsToBounds:"), 1);
-            let child = make();
-            msg_void_id(container, sel("addSubview:"), child);
-            msg_void_id(scene, sel("addSubview:"), container);
+            let child = make(&|child| {
+                msg_void_id(container, sel("addSubview:"), child);
+                msg_void_id(scene, sel("addSubview:"), container);
+                position_host(container, child, frame, window);
+            });
             (container, child)
         };
         HOST_VIEWS.with(|hosts| {
             hosts.borrow_mut().insert(
                 key.to_string(),
-                HostSlot { container, child, stamp: stamp.to_string() },
+                HostSlot {
+                    container,
+                    child,
+                    stamp: stamp.to_string(),
+                },
             );
         });
     }
@@ -1726,6 +1738,21 @@ pub fn host_place(
         }
         (slot.container, slot.child, stale)
     });
+    unsafe {
+        position_host(container, child, frame, window);
+    }
+    if stale {
+        update(child, stamp);
+    }
+}
+
+/// Position a clipped UIKit tenant before initial content or retained resize.
+unsafe fn position_host(
+    container: Id,
+    child: Id,
+    frame: (f64, f64, f64, f64),
+    window: (f64, f64, f64, f64),
+) {
     let (x, y, w, h) = frame;
     let (vx, vy, vw, vh) = window;
     unsafe {
@@ -1736,17 +1763,29 @@ pub fn host_place(
             msg_void_rect(
                 container,
                 sel("setFrame:"),
-                CGRect { origin: CGPoint { x: x + vx, y: y + vy }, size: CGSize { width: vw, height: vh } },
+                CGRect {
+                    origin: CGPoint {
+                        x: x + vx,
+                        y: y + vy,
+                    },
+                    size: CGSize {
+                        width: vw,
+                        height: vh,
+                    },
+                },
             );
             msg_void_rect(
                 child,
                 sel("setFrame:"),
-                CGRect { origin: CGPoint { x: -vx, y: -vy }, size: CGSize { width: w, height: h } },
+                CGRect {
+                    origin: CGPoint { x: -vx, y: -vy },
+                    size: CGSize {
+                        width: w,
+                        height: h,
+                    },
+                },
             );
         }
-    }
-    if stale {
-        update(child, stamp);
     }
 }
 

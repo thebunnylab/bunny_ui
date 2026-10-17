@@ -78,6 +78,13 @@ A box owned by a platform view. The framework positions it, sizes it,
 clips it to the box, shows and hides it with the subtree — and keeps
 **paint order the truth**, island or no island.
 
+On macOS and iOS, a new webview registers its instrumented mount, then the
+host attaches and sizes the tenant before its first document or URL submission.
+The synchronous placement continuation adds no blank navigation or task. A
+retained host still compares its stamp and updates the existing view. The
+shared Apple `webview::create` entry point retains immediate navigation for
+callers that own placement themselves; `create_placed` accepts the continuation.
+
 The platform's law is that a native child view composites above the
 scene, and the framework answers it on two roads rather than letting
 the law leak into the app. Whatever the scene paints AFTER the host —
@@ -467,6 +474,15 @@ existing mount-channel validation. Browser pages do not emit document milestones
 The load request precedes sealing/submission; return follows the native call.
 The `post` label means an accepted application bridge message, not DOM readiness.
 These milestones never substitute for actual presented body pixels.
+
+Each document load also emits a `U` observation immediately before its request:
+the same opaque mount number, native-window attachment and tenant width/height
+in points. `python3 scripts/check-html-placement.py <path>` requires an attached,
+nonzero tenant for each observed load in an initially visible native protocol.
+It refuses missing, detached, stale or mismatched observations. Offscreen hidden
+hosts may legitimately lack initial dimensions; this checker is for the visible
+protocol, not a claim about all hidden mounts. Geometry and attachment do not
+establish on-screen visibility, first paint or a performance improvement.
 
 Run the native reuse witness with a trace, then validate its private record
 shape and at least one navigation/post using `python3 scripts/check-html-lifecycle.py
