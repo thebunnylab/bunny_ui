@@ -63,3 +63,20 @@ A custom two-state label can use `.checked(value)` to expose its real checked
 state without adding a glyph. The application still owns the value and callback;
 Space and accessibility activation invoke that callback. Disabled controls remain
 unavailable through every activation path.
+
+## Edit commands from panels
+
+A containing editor can declare `.on_edit(Edit::Undo, undo)` and
+`.on_edit(Edit::Redo, redo)`. When a non-text control inside it holds focus,
+the nearest ancestor registered for that command answers both its standard
+accelerator and the native Edit menu. Sibling panels and other window scenes
+do not share responders. Registrations survive retained renders and disappear
+with their view. An open alert prevents dispatch into the application behind it.
+
+Fields and custom editors keep their own commands, even when they cannot
+currently undo. A read-only `.on_copy` target keeps its local copy answer.
+Ordinary fields currently have no local history; declaring an ancestor Undo
+handler does not change that or let a field undo application source. The
+handler owns its operation, including clipboard work for Cut, Copy or Paste.
+This runtime contract applies to native/canvas controls; flow DOM keeps the
+browser's native editing behavior.

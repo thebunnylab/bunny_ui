@@ -885,6 +885,23 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::OnAction(id, Rc::new(handler)))
     }
 
+    /// Respond to a standard Edit-menu command from a focused non-text
+    /// control in this subtree. The nearest registered ancestor wins.
+    /// Keyboard and native menus use the same responder. Fields, custom
+    /// editors and read-only copy targets keep their own edit behavior;
+    /// their commands never fall back into this handler.
+    /// Retained bodies keep the registration until they unmount.
+    #[track_caller]
+    fn on_edit(
+        self,
+        edit: crate::menu::Edit,
+        handler: impl Fn() + 'static,
+    ) -> crate::modifier::EditResponder<Self> {
+        crate::modifier::EditResponder {
+            content: Modified::new(self, Modifier::OnEdit(edit, Rc::new(handler))),
+        }
+    }
+
     /// `.on_measure(|size| …)` — the size this view RESOLVED to, handed
     /// back as it changes.
     ///

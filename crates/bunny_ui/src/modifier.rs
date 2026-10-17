@@ -175,6 +175,7 @@ pub enum Modifier {
     /// click (no caret) and answers ⌘C with what it has selected.
     OnCopy(crate::reconciler::CopyFn),
     OnAction(crate::action::ActionId, Rc<dyn Fn()>),
+    OnEdit(crate::menu::Edit, Rc<dyn Fn()>),
 
     // MARK: - Interaction (the action fires at render, as in the headless engine)
     OnAppear(Rc<dyn Fn()>),
@@ -330,6 +331,7 @@ impl Modifier {
             Modifier::OnHover { .. } => "on_hover",
             Modifier::OnCopy { .. } => "on_copy",
             Modifier::OnAction { .. } => "on_action",
+            Modifier::OnEdit { .. } => "on_edit",
             Modifier::OnAppear { .. } => "on_appear",
             Modifier::OnTapGesture { .. } => "on_tap_gesture",
             Modifier::Id { .. } => "id",
@@ -486,6 +488,7 @@ impl Modifier {
             Modifier::OnHover(_) => " [.onHover()]".into(),
             Modifier::OnCopy(_) => " [.onCopy()]".into(),
             Modifier::OnAction(id, _) => format!(" [.onAction({id})]"),
+            Modifier::OnEdit(edit, _) => format!(" [.onEdit({edit:?})]"),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
             Modifier::OnTapGesture(_) => " [.onTapGesture()]".into(),
             Modifier::Effect { name, detail, .. } => format!(" [.{name}{detail}]"),
@@ -983,6 +986,20 @@ impl<C> Modified<C> {
     #[track_caller]
     pub(crate) fn new(base: C, modifier: Modifier) -> Self {
         Self { base, modifier, site: crate::provenance::here() }
+    }
+}
+
+/// A retained standard-edit responder around a single view. The boundary
+/// preserves its handler when the scene is revisited after another window;
+/// the contained modifier keeps the original caller's source site.
+#[derive(Clone)]
+pub struct EditResponder<C> {
+    pub(crate) content: Modified<C>,
+}
+
+impl<C: View<Arity = Single>> crate::view::Component for EditResponder<C> {
+    fn body(self) -> impl View {
+        self.content
     }
 }
 
@@ -2022,6 +2039,11 @@ pub(crate) fn apply(
             // — the action arrives by dispatch (keyboard), not hit-test
             if let Some(path) = motor::identity::cursor_scope() {
                 crate::reconciler::attribute_handler(path, *id, handler.clone());
+            }
+        }
+        Modifier::OnEdit(edit, handler) => {
+            if let Some(path) = motor::identity::cursor_scope() {
+                crate::reconciler::attribute_edit_handler(path, *edit, handler.clone());
             }
         }
         _ => {}
