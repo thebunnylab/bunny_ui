@@ -84,11 +84,12 @@ fn fields_and_custom_editors_never_undo_the_enclosing_application() {
         runtime.display_frame(&view, SIZE);
         assert!(runtime.focus_named("filter"));
         assert!(runtime.key(EditCommand::Insert("probe".into())).applied);
-        // Fields have no local history yet. An absent local Undo is not
-        // permission to alter the application behind the field.
-        assert!(!runtime.menu_answers(Pick::Edit(Edit::Undo)));
-        assert!(!runtime.key_stroke(Edit::Undo.stroke()).handled);
+        // Local field history takes priority, including once it is exhausted.
+        assert!(runtime.menu_answers(Pick::Edit(Edit::Undo)));
+        assert!(runtime.key_stroke(Edit::Undo.stroke()).handled);
+        assert_eq!(value.get(), "");
         assert!(!runtime.menu_pick(Pick::Edit(Edit::Undo)));
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Redo)));
         assert_eq!(value.get(), "probe");
         assert_eq!(app.get(), 0);
         assert!(runtime.focus_named("editor"));

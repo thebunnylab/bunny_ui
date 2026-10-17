@@ -75,8 +75,9 @@ with their view. An open alert prevents dispatch into the application behind it.
 
 Fields and custom editors keep their own commands, even when they cannot
 currently undo. A read-only `.on_copy` target keeps its local copy answer.
-Ordinary fields currently have no local history; declaring an ancestor Undo
-handler does not change that or let a field undo application source. The
-handler owns its operation, including clipboard work for Cut, Copy or Paste.
+Ordinary fields retain bounded local text and selection history across renders
+and focus changes. An empty history never falls through to application source.
+Custom editing strategies keep ownership of their history. An ancestor handler
+owns its operation, including clipboard work for Cut, Copy or Paste.
 This runtime contract applies to native/canvas controls; flow DOM keeps the
 browser's native editing behavior.

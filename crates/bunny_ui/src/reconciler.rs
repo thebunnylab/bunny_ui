@@ -76,6 +76,7 @@ pub(crate) struct EditorFn {
     /// Where a pasted picture goes (`TextField::on_paste_image`).
     pub paste_image: Option<Rc<dyn Fn(crate::clipboard::ClipboardImage)>>,
     pub command: EditFn,
+    pub history: Option<crate::field_history::FieldHistory>,
     pub key: Option<FieldKeyFn>,
     pub policy: Option<Rc<dyn crate::text_input::EditingStrategy>>,
     /// The app's word for the keyboard reaching or leaving the field
@@ -1957,8 +1958,30 @@ fn editor_at(path: &str) -> Option<EditorFn> {
     LIVE.with(|live| live.borrow().editors.get(path).cloned())
 }
 
-/// The text a field's editor last lent: the cell a new render of the same
-/// field carries on, so its unchanged text is not copied again.
+/// Retain history across a render or an unambiguous named-field move.
+pub(crate) fn retained_editor_history(path: &str) -> Option<crate::field_history::FieldHistory> {
+    if let Some(editor) = editor_at(path) { return editor.history; }
+    let chain = motor::identity::named_chain(path);
+    if chain.is_empty() { return None; }
+    // Render is building a new scene while the last assembled scene may be
+    // another window. Use this pass's root, not the input registry's marker.
+    let root = motor::identity::current_pass_root()?;
+    LIVE.with(|live| {
+        let live = live.borrow();
+        let mut candidates = live.editors.iter().filter(|(old, _)|
+            covers(&root, old) && motor::identity::named_chain(old) == chain);
+        let (_, editor) = candidates.next()?;
+        if candidates.next().is_some() { return None; }
+        editor.history.clone()
+    })
+}
+
+/// The currently mounted field's own history; never another named input.
+pub(crate) fn editor_history(path: &str) -> Option<crate::field_history::FieldHistory> {
+    editor_at(path)?.history
+}
+
+/// The shared text cache carried across renders of the same field.
 pub(crate) fn editor_text(path: &str) -> Option<LentText> {
     LIVE.with(|live| live.borrow().editors.get(path).map(|editor| editor.text.clone()))
 }

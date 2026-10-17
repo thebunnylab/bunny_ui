@@ -88,6 +88,7 @@ pub mod stats;
 pub mod text_engine;
 pub mod text_value;
 pub mod text_input;
+mod field_history;
 mod grapheme;
 pub mod theme;
 pub mod touch;
@@ -8608,7 +8609,7 @@ mod tests {
 
     /// The Edit menu acts on the field that holds the keyboard, and the
     /// clipboard is the runtime's business: a copy writes it, a paste reads
-    /// it. A field keeps no history, so its Undo is dark.
+    /// it. Undo restores the field's last local edit and its selection.
     #[test]
     fn an_edit_item_reaches_the_field_that_holds_the_keyboard() {
         use crate::layout::{Proposal, Size};
@@ -8640,7 +8641,7 @@ mod tests {
         for edit in [Edit::Cut, Edit::Copy, Edit::Paste, Edit::SelectAll] {
             assert!(answers(edit), "{edit:?} answers in a field");
         }
-        assert!(!answers(Edit::Undo) && !answers(Edit::Redo), "a field keeps no history");
+        assert!(!answers(Edit::Undo) && !answers(Edit::Redo), "the field has not been edited yet");
 
         assert!(runtime.menu_pick(Pick::Edit(Edit::SelectAll)));
         assert!(runtime.menu_pick(Pick::Edit(Edit::Copy)));
@@ -8651,7 +8652,10 @@ mod tests {
         assert!(runtime.menu_pick(Pick::Edit(Edit::Paste)));
         runtime.render_stable(&form);
         assert_eq!(form.name.get(), "Deco", "the paste read it back");
-        assert!(!runtime.menu_pick(Pick::Edit(Edit::Undo)), "dark, so it runs nothing");
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Undo)));
+        assert_eq!(form.name.get(), "", "Undo reversed this field's paste");
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Redo)));
+        assert_eq!(form.name.get(), "Deco");
     }
 
     /// A read-only view that copies answers Copy from the menu, and nothing

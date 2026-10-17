@@ -549,6 +549,10 @@ impl TextField {
                 let typing_strategy = self.editing.clone();
                 let key_binding = self.text.clone();
                 let lent_for_edit = lent.clone();
+                let history = self.editing.is_none().then(|| crate::field_history::FieldHistory::new(
+                    self.text.clone(), lent.clone(), crate::reconciler::retained_editor_history(&path),
+                ));
+                let edit_history = history.clone();
                 crate::reconciler::attribute_editor(
                     path.clone(),
                     crate::reconciler::EditorFn {
@@ -583,12 +587,14 @@ impl TextField {
                         handled
                     }) as crate::reconciler::FieldKeyFn),
                     policy: typing_strategy,
+                    history,
                     command: Rc::new(move |command, state| {
                         // the field's own key never touches the text.
                         // An EMPTY answer says a handler took the
                         // stroke; no answer at all says the app named
                         // none, and the stroke walks on
                         if matches!(command, crate::text_input::EditCommand::Submit) {
+                            if let Some(history) = &edit_history { history.separate(); }
                             submit.as_ref()?();
                             return Some(String::new());
                         }
@@ -637,6 +643,7 @@ impl TextField {
                             // have rewritten those bytes, so they are all that is
                             // kept to compare — never a copy of the note
                             None => {
+                                let record = edit_history.as_ref().and_then(|history| history.begin(&command, state));
                                 let mut command = Some(command);
                                 let mut output = None;
                                 let before = binding.version();
@@ -686,6 +693,7 @@ impl TextField {
                                         lent.kept_before.map_or(touched, |kept| kept.min(touched)),
                                     );
                                 }
+                                if let Some(history) = &edit_history { history.finish(record, *state); }
                                 output
                             }
                         }
