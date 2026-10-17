@@ -1,0 +1,38 @@
+[
+  {
+    "file": "crates/bunny_ui_apple/src/trace.rs",
+    "baseline_formatting_blocks": 4,
+    "current_formatting_blocks": 4,
+    "new_unformatted_blocks": 0
+  },
+  {
+    "file": "crates/bunny_ui_apple/src/webview.rs",
+    "baseline_formatting_blocks": 39,
+    "current_formatting_blocks": 38,
+    "new_unformatted_blocks": 0
+  },
+  {
+    "file": "crates/bunny_ui_ios/src/ffi.rs",
+    "baseline_formatting_blocks": 64,
+    "current_formatting_blocks": 60,
+    "new_unformatted_blocks": 0
+  },
+  {
+    "file": "crates/bunny_ui_ios/src/lib.rs",
+    "baseline_formatting_blocks": 17,
+    "current_formatting_blocks": 17,
+    "new_unformatted_blocks": 0
+  },
+  {
+    "file": "crates/bunny_ui_macos/src/ffi.rs",
+    "baseline_formatting_blocks": 132,
+    "current_formatting_blocks": 128,
+    "new_unformatted_blocks": 0
+  },
+  {
+    "file": "crates/bunny_ui_macos/src/lib.rs",
+    "baseline_formatting_blocks": 86,
+    "current_formatting_blocks": 86,
+    "new_unformatted_blocks": 0
+  }
+]
