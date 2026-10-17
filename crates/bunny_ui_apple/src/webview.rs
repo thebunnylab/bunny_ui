@@ -47,6 +47,9 @@ unsafe extern "C" {}
 unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_id(obj: Id, sel: Sel) -> Id;
+    #[cfg_attr(target_arch = "aarch64", link_name = "objc_msgSend")]
+    #[cfg_attr(target_arch = "x86_64", link_name = "objc_msgSend_stret")]
+    fn msg_rect(obj: Id, sel: Sel) -> CGRect;
     #[link_name = "objc_msgSend"]
     fn msg_id_id(obj: Id, sel: Sel, a: Id) -> Id;
     #[link_name = "objc_msgSend"]
@@ -720,6 +723,15 @@ fn bridge() -> Id {
 /// the scene. `path` is the host's identity, what a document is filed
 /// under for the delegate to find.
 pub fn create(path: &str, spec: &HostSpec) -> Id {
+    create_placed(path, spec, |_| {})
+}
+
+/// Creates an instrumented engine and gives the host its initial placement
+/// before submitting content. `place` synchronously attaches and sizes the
+/// tenant; it runs once, after mount registration and before navigation. The
+/// returned reference has ONE retain, just like [`create`]. No blank document
+/// or deferred task is inserted into this transition.
+pub fn create_placed(path: &str, spec: &HostSpec, place: impl FnOnce(Id)) -> Id {
     // never reached for a video host — the shells refuse one before
     // they mount anything — and a null is the honest nothing if it were
     let HostSpec::Webview { url, document, .. } = spec else {
@@ -731,13 +743,18 @@ pub fn create(path: &str, spec: &HostSpec) -> Id {
             .and_then(take_prepared)
             .unwrap_or_else(|| new_engine());
         let config = msg_id(view, sel("configuration"));
-        install_bridge(msg_id(config, sel("userContentController")), spec, register_mount(view));
+        install_bridge(
+            msg_id(config, sel("userContentController")),
+            spec,
+            register_mount(view),
+        );
         // navigation reports come through the bridge (the delegate
         // reference is weak; the bridge outlives every view), and so
         // does the ask a new-window link makes
         msg_void_id(view, sel("setNavigationDelegate:"), bridge());
         msg_void_id(view, sel("setUIDelegate:"), bridge());
         PAGES.with(|pages| pages.borrow_mut().insert(path.to_string(), view));
+        place(view);
         match document {
             Some(document) => load_document(path, view, document),
             None => navigate(view, url),
@@ -805,6 +822,24 @@ fn load_document(path: &str, view: Id, document: &Document) {
             },
         );
     });
+    if crate::trace::enabled() {
+        MOUNTS.with(|mounts| {
+            if let Some(mount) = mounts.borrow().get(&(view as usize)) {
+                // Fixed native geometry only: no page identity or content.
+                let frame = unsafe { msg_rect(view, sel("frame")) };
+                let attached = unsafe { !msg_id(view, sel("window")).is_null() };
+                crate::trace::mark(
+                    "U",
+                    format_args!(
+                        "mount={mount} attached={} width={:.3} height={:.3}",
+                        u8::from(attached),
+                        frame.size.width,
+                        frame.size.height,
+                    ),
+                );
+            }
+        });
+    }
     trace_document(path, view, DocumentMilestone::LoadRequest);
     unsafe {
         let base = if document.base.is_empty() {

@@ -1086,20 +1086,22 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 window.host_place(
                     &host.path,
                     &stamp,
-                    (
-                        host.frame.origin.x,
-                        host.frame.origin.y,
-                        host.frame.size.width,
-                        host.frame.size.height,
-                    ),
-                    (
-                        host.visible.origin.x,
-                        host.visible.origin.y,
-                        host.visible.size.width,
-                        host.visible.size.height,
-                    ),
-                    placed,
-                    || webview::create(&host.path, &host.spec),
+                    ffi::HostGeometry {
+                        frame: (
+                            host.frame.origin.x,
+                            host.frame.origin.y,
+                            host.frame.size.width,
+                            host.frame.size.height,
+                        ),
+                        window: (
+                            host.visible.origin.x,
+                            host.visible.origin.y,
+                            host.visible.size.width,
+                            host.visible.size.height,
+                        ),
+                        view_height: placed,
+                    },
+                    |place| webview::create_placed(&host.path, &host.spec, place),
                     |child, _stamp| webview::update(&host.path, child, &host.spec),
                 );
                 ffi::host_scroll_policy(&host.path, document.as_ref().filter(|document| !document.editable).map_or(

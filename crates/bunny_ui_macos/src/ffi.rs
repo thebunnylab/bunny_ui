@@ -2767,7 +2767,7 @@ impl WindowHandle {
     /// empty window hides the view instead of unmounting it — a page
     /// keeps its state while it is scrolled off.
     ///
-    /// `make` runs once, when the key first appears, and returns the
+    /// `make` runs once, calls its placement continuation, and returns the
     /// tenant's view with ONE retain that [`WindowHandle::host_sweep`]
     /// releases. `update` runs when `stamp` changed — how a navigation
     /// lands without a re-mount.
@@ -2775,12 +2775,15 @@ impl WindowHandle {
         &self,
         key: &str,
         stamp: &str,
-        frame: (f64, f64, f64, f64),
-        window: (f64, f64, f64, f64),
-        view_height: f64,
-        make: impl FnOnce() -> Id,
+        geometry: HostGeometry,
+        make: impl FnOnce(&dyn Fn(Id)) -> Id,
         update: impl FnOnce(Id, &str),
     ) {
+        let HostGeometry {
+            frame,
+            window,
+            view_height,
+        } = geometry;
         unsafe { register_host_class() };
         HOST_VIEWS.with(|hosts| {
             let mut hosts = hosts.borrow_mut();
@@ -2791,7 +2794,10 @@ impl WindowHandle {
                     sel("initWithFrame:"),
                     CGRect {
                         origin: CGPoint { x: 0.0, y: 0.0 },
-                        size: CGSize { width: 0.0, height: 0.0 },
+                        size: CGSize {
+                            width: 0.0,
+                            height: 0.0,
+                        },
                     },
                 );
                 // the container is the CLIP: whatever the tenant
@@ -2812,40 +2818,23 @@ impl WindowHandle {
                 // sixty-a-second approximation we correct).
                 const SIZABLE: i64 = 2 | 16;
                 msg_void_i64(container, sel("setAutoresizingMask:"), SIZABLE);
-                let child = make();
-                msg_void_i64(child, sel("setAutoresizingMask:"), SIZABLE);
-                msg_void_id(container, sel("addSubview:"), child);
-                msg_void_id(self.view, sel("addSubview:"), container);
-                HostSlot { owner: self.view, container, child, stamp: stamp.to_string(), scroll: bunny_ui::host::DocumentScroll::Document, wheel: crate::host_wheel::ParentWheel::default() }
-            });
-            let (x, y, w, h) = frame;
-            let (vx, vy, vw, vh) = window;
-            unsafe {
-                if vw <= 0.0 || vh <= 0.0 {
-                    msg_void_bool(slot.container, sel("setHidden:"), 1);
-                } else {
-                    msg_void_bool(slot.container, sel("setHidden:"), 0);
-                    // the container lands on the visible cut, flipped
-                    // into AppKit's bottom-left world
-                    msg_void_rect(
-                        slot.container,
-                        sel("setFrame:"),
-                        CGRect {
-                            origin: CGPoint { x: x + vx, y: view_height - (y + vy) - vh },
-                            size: CGSize { width: vw, height: vh },
-                        },
-                    );
-                    // the tenant keeps the WHOLE box, container-local:
-                    // the cut shows through, the content never rewraps
-                    msg_void_rect(
-                        slot.child,
-                        sel("setFrame:"),
-                        CGRect {
-                            origin: CGPoint { x: -vx, y: vh + vy - h },
-                            size: CGSize { width: w, height: h },
-                        },
-                    );
+                let child = make(&|child| {
+                    msg_void_i64(child, sel("setAutoresizingMask:"), SIZABLE);
+                    msg_void_id(container, sel("addSubview:"), child);
+                    msg_void_id(self.view, sel("addSubview:"), container);
+                    position_host(container, child, frame, window, view_height);
+                });
+                HostSlot {
+                    owner: self.view,
+                    container,
+                    child,
+                    stamp: stamp.to_string(),
+                    scroll: bunny_ui::host::DocumentScroll::Document,
+                    wheel: crate::host_wheel::ParentWheel::default(),
                 }
+            });
+            unsafe {
+                position_host(slot.container, slot.child, frame, window, view_height);
                 if slot.stamp != stamp {
                     slot.stamp = stamp.to_string();
                     update(slot.child, stamp);
@@ -3145,6 +3134,68 @@ thread_local! {
     /// One platform view per HOST box, keyed by identity — the native
     /// content that composites above the scene.
     static HOST_VIEWS: RefCell<HashMap<String, HostSlot>> = RefCell::new(HashMap::new());
+}
+
+/// Initial host placement in layout points and the layout's viewport height.
+#[derive(Clone, Copy)]
+pub struct HostGeometry {
+    /// Complete tenant box: x, y, width, height.
+    pub frame: (f64, f64, f64, f64),
+    /// Visible cut within that box: x, y, width, height.
+    pub window: (f64, f64, f64, f64),
+    /// Height used to convert layout coordinates into AppKit coordinates.
+    pub view_height: f64,
+}
+
+/// Position a clipped host in AppKit coordinates, before initial content or resize.
+unsafe fn position_host(
+    container: Id,
+    child: Id,
+    frame: (f64, f64, f64, f64),
+    window: (f64, f64, f64, f64),
+    view_height: f64,
+) {
+    let (x, y, w, h) = frame;
+    let (vx, vy, vw, vh) = window;
+    unsafe {
+        if vw <= 0.0 || vh <= 0.0 {
+            msg_void_bool(container, sel("setHidden:"), 1);
+        } else {
+            msg_void_bool(container, sel("setHidden:"), 0);
+            // the container lands on the visible cut, flipped
+            // into AppKit's bottom-left world
+            msg_void_rect(
+                container,
+                sel("setFrame:"),
+                CGRect {
+                    origin: CGPoint {
+                        x: x + vx,
+                        y: view_height - (y + vy) - vh,
+                    },
+                    size: CGSize {
+                        width: vw,
+                        height: vh,
+                    },
+                },
+            );
+            // the tenant keeps the WHOLE box, container-local:
+            // the cut shows through, the content never rewraps
+            msg_void_rect(
+                child,
+                sel("setFrame:"),
+                CGRect {
+                    origin: CGPoint {
+                        x: -vx,
+                        y: vh + vy - h,
+                    },
+                    size: CGSize {
+                        width: w,
+                        height: h,
+                    },
+                },
+            );
+        }
+    }
 }
 
 /// One mounted native host: the clipping container (ours), the

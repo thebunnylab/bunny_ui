@@ -1,0 +1,11 @@
+{
+  "revision": "b7ca9592d384754526013c2ce45d67b716f8c60b",
+  "native_command": [
+    "target/debug/examples/html_reuse"
+  ],
+  "native_exit_code": 0,
+  "placement_check_exit_code": 1,
+  "observation": "Four initial loads without native window attachment; three had zero dimensions.",
+  "display_state": "Mac reported locked; native structural assertions only.",
+  "baseline_binary_sha256": null
+}
