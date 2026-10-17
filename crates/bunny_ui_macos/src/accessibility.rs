@@ -475,8 +475,26 @@ extern "C" fn view_focused(this: Id, _: Sel) -> Id {
         return this;
     };
     surface.activate();
-    // A hosted native editor owns its first responder and its own AX focus.
-    // Retained Bunny fields use this view as first responder instead.
+    // A non-key child panel keeps keyboard focus in its parent window. Resolve
+    // the scene's focused proxy across surfaces so that querying that parent
+    // still reaches the active popup choice. Other windows own separate scenes.
+    let focused = surface.scene.upgrade().and_then(|scene| {
+        scene.surfaces.borrow().values().find_map(|surface| {
+            surface
+                .elements
+                .borrow()
+                .iter()
+                .find(|element| element.node.borrow().focused)
+                .map(Rc::clone)
+        })
+    });
+    if let Some(element) = &focused
+        && element.node.borrow().surface.is_some()
+    {
+        return element.object;
+    }
+    // A hosted native editor owns its first responder and its own AX focus
+    // when no Bunny overlay owns focus. Retained fields use this view instead.
     unsafe {
         let mut responder = msg_id(msg_id(this, sel("window")), sel("firstResponder"));
         // AppKit's shared field editor speaks for its owning text control.
@@ -501,12 +519,7 @@ extern "C" fn view_focused(this: Id, _: Sel) -> Id {
         }
     }
 
-    surface
-        .elements
-        .borrow()
-        .iter()
-        .find(|element| element.node.borrow().focused)
-        .map_or(this, |element| element.object)
+    focused.map_or(this, |element| element.object)
 }
 fn contains(frame: CGRect, point: CGPoint) -> bool {
     point.x >= frame.origin.x
