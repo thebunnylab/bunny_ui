@@ -47,6 +47,9 @@ unsafe extern "C" {}
 unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_id(obj: Id, sel: Sel) -> Id;
+    #[cfg_attr(target_arch = "aarch64", link_name = "objc_msgSend")]
+    #[cfg_attr(target_arch = "x86_64", link_name = "objc_msgSend_stret")]
+    fn msg_rect(obj: Id, sel: Sel) -> CGRect;
     #[link_name = "objc_msgSend"]
     fn msg_id_id(obj: Id, sel: Sel, a: Id) -> Id;
     #[link_name = "objc_msgSend"]
@@ -805,6 +808,19 @@ fn load_document(path: &str, view: Id, document: &Document) {
             },
         );
     });
+    if crate::trace::enabled() {
+        MOUNTS.with(|mounts| {
+            if let Some(mount) = mounts.borrow().get(&(view as usize)) {
+                // Fixed native geometry only: no page identity or content.
+                let frame = unsafe { msg_rect(view, sel("frame")) };
+                let attached = unsafe { !msg_id(view, sel("window")).is_null() };
+                crate::trace::mark("U", format_args!(
+                    "mount={mount} attached={} width={:.3} height={:.3}",
+                    u8::from(attached), frame.size.width, frame.size.height,
+                ));
+            }
+        });
+    }
     trace_document(path, view, DocumentMilestone::LoadRequest);
     unsafe {
         let base = if document.base.is_empty() {
