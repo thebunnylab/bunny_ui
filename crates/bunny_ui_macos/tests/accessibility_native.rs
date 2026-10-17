@@ -84,6 +84,7 @@ mod probe {
         presses: State<u32>,
         rows: State<Vec<u32>>,
         modal: State<bool>,
+        reactions: State<bool>,
         checked: State<bool>,
         disabled: State<bool>,
     }
@@ -104,6 +105,21 @@ mod probe {
                     .disabled
                     .set(!self.disabled.get())),
                 button(text("Open modal"), move || self.modal.set(true)),
+                button(text("Open reactions"), move || self.reactions.set(true)).popover(
+                    self.reactions.binding(),
+                    Side::Bottom,
+                    move |_| erased(
+                        hstack!(
+                            button(text("Thumbs up"), move || {
+                                self.presses.add(10);
+                                self.reactions.set(false);
+                            })
+                            .id("native-reaction-like"),
+                            button(text("Heart"), move || self.reactions.set(false)),
+                        )
+                        .padding()
+                    ),
+                ),
                 button(text("Remove row"), move || self.rows.set(vec![1])),
                 for_each(
                     self.rows,
@@ -133,6 +149,7 @@ mod probe {
             disabled: State::new(false),
             rows: State::new(vec![1, 2]),
             modal: State::new(false),
+            reactions: State::new(false),
         };
         let id = app.open(
             WindowSpec::titled("Bunny accessibility protocol witness").size(480.0, 640.0),
@@ -399,6 +416,44 @@ mod probe {
             assert!(!named(view, "Updated name").is_null());
             void(dismiss, sel("release"));
             void(old_save, sel("release"));
+            assert_eq!(
+                boolean(
+                    named(view, "Open reactions"),
+                    sel("accessibilityPerformPress")
+                ),
+                1
+            );
+            let child_windows = object(window, sel("childWindows"));
+            let panel = (0..count(child_windows, sel("count")))
+                .map(|i| at(child_windows, sel("objectAtIndex:"), i))
+                .find(|panel| {
+                    children(object(*panel, sel("contentView")))
+                        .iter()
+                        .any(|node| {
+                            property(*node, "accessibilityLabel").as_deref() == Some("Thumbs up")
+                        })
+                })
+                .expect("the popover exports choices on its native child surface");
+            let panel_view = object(panel, sel("contentView"));
+            let like = named(panel_view, "Thumbs up");
+            assert_eq!(
+                property(like, "accessibilityRole").as_deref(),
+                Some("AXButton")
+            );
+            assert_eq!(object(like, sel("accessibilityWindow")), panel);
+            set_bool(like, sel("setAccessibilityFocused:"), 1);
+            assert_eq!(boolean(like, sel("isAccessibilityFocused")), 1);
+            assert_eq!(
+                object(panel_view, sel("accessibilityFocusedUIElement")),
+                like
+            );
+            assert_eq!(
+                object(view, sel("accessibilityFocusedUIElement")),
+                like,
+                "main-window focus must reach its focused native popover choice"
+            );
+            assert_eq!(boolean(like, sel("accessibilityPerformPress")), 1);
+            assert!(!form.reactions.get());
             let needed = runtime.needs_frame();
             for _ in 0..10 {
                 let _ = children(view);
