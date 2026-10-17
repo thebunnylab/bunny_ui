@@ -23,6 +23,27 @@ including when only modal state changed. Declining preserves normal key routing.
 `edit` defaults to native text editing; a policy can add grouped history or
 replacement semantics. `Read` and `Copy` should remain observational.
 
+## Ordinary field history
+
+A field without an editing strategy owns Undo/Redo through the standard keyboard
+accelerators and native Edit menu. History restores both text and selection,
+survives retained renders and unambiguous named moves, and stays local to its
+mounted field. Unmounting or an external binding revision discards the history;
+closure-backed bindings without revision identity detect changed text instead.
+Custom strategies continue to own their editing commands and history.
+
+Adjacent single-character typing and deletion coalesce. Selection, navigation,
+paste, replacement and focus changes separate groups. One IME composition is one
+group; Undo/Redo is unavailable while text is marked, and cancelling composition
+preserves the previous redo. Read and Copy never create an edit. Secret fields
+retain local history without exposing their contents through Copy or Cut.
+
+History keeps changed bytes and caret states, sharing the current text's lending
+cache. It retains at most 128 groups and a 1 MiB budget for replacements and patch
+overhead. Old groups are evicted whole; an oversized edit leaves no partial Undo.
+This contract covers the native/canvas runtime; browser flow DOM keeps its own
+editing behavior. `tests/field_history.rs` exercises the public runtime boundary.
+
 The runtime's `ExternalPaths` payload uses the same clipped `.on_drop` regions
 as internal drag operations. `external_drag` previews without committing;
 `external_drop` delivers only to the accepting target under the pointer;

@@ -2498,6 +2498,21 @@ impl Runtime {
                 }
             }
         }
+        if let Some(edit) = [Edit::Undo, Edit::Redo].into_iter().find(|edit| edit.stroke() == *pattern)
+            && let Some(path) = self.focused()
+            && self.field_at(&path).is_some()
+            && let Some(history) = reconciler::editor_history(&path)
+        {
+            let mut caret = self.carets.borrow().get(&path).copied().unwrap_or_default();
+            if history.restore(edit, &mut caret) {
+                self.carets.borrow_mut().insert(path.clone(), caret);
+                self.caret_phase.set(CaretPhase::Held);
+                self.frame_asked.set(true);
+                self.goal_column.set(None);
+                self.reveal_caret(&path);
+                return crate::custom::Response::handled();
+            }
+        }
         if let Some(placement) = self.focused_custom() {
             let response = self.deliver(&placement, crate::custom::ElementEvent::Key(stroke));
             if response.handled {
@@ -3828,8 +3843,8 @@ impl Runtime {
     /// An edit answers while the keyboard is held by someone who can take
     /// it. A copy needs anyone who can hand text back: a field that is not
     /// secret, a box, or a read-only view with `.on_copy`. A cut, a paste
-    /// and a select-all need a field or a box. An undo and a redo need a
-    /// box, because a field keeps no history. A focused non-text control
+    /// and a select-all need a field or a box. Undo and Redo use a box's
+    /// own commands or the focused field's available history. A non-text control
     /// can instead use its nearest ancestor's `.on_edit` responder.
     pub fn menu_answers(&self, pick: Pick) -> bool {
         self.enter_scene();
@@ -3850,7 +3865,10 @@ impl Runtime {
                     Edit::Copy => boxed || open_field || reconciler::answers_copy(&path),
                     Edit::Cut => boxed || open_field,
                     Edit::Paste | Edit::SelectAll => boxed || field.is_some(),
-                    Edit::Undo | Edit::Redo => boxed,
+                    Edit::Undo | Edit::Redo => boxed || reconciler::editor_history(&path).is_some_and(|history| {
+                        let caret = self.carets.borrow().get(&path).copied().unwrap_or_default();
+                        history.available(edit, caret)
+                    }),
                 };
                 local || self.edit_responder_focus(edit)
                     .is_some_and(|focus| reconciler::has_edit_handler(&focus, edit))
@@ -4064,6 +4082,7 @@ impl Runtime {
         self.frame_asked.set(true);
         let moved = self.focus.borrow().as_deref() != Some(path);
         if moved {
+            if let Some(history) = reconciler::editor_history(path) { history.separate(); }
             self.blur();
         }
         self.caret_phase.set(if placement.is_some() || self.custom_at(path).is_some() {
@@ -4096,6 +4115,7 @@ impl Runtime {
     /// `shift` keeps the anchor where it already was, which is the
     /// keyboard's own extend done with the mouse.
     fn select_at(&self, path: &str, x: Px, y: Px, clicks: u8, shift: bool) {
+        if let Some(history) = reconciler::editor_history(path) { history.separate(); }
         self.caret_phase.set(CaretPhase::Held);
         self.goal_column.set(None);
         let held = self.focus.borrow().as_deref() == Some(path);
@@ -4430,6 +4450,7 @@ impl Runtime {
     /// does everywhere. A one-line field declines, so a list under a
     /// search box still navigates with the arrows.
     fn walk_line(&self, path: &str, down: bool, select: bool) -> Edited {
+        if let Some(history) = reconciler::editor_history(path) { history.separate(); }
         let declined = Edited { applied: false, output: None };
         let Some(field) = self.field_at(path).filter(|field| field.multiline) else {
             return declined;
@@ -4539,6 +4560,7 @@ impl Runtime {
 
     pub fn blur(&self) -> bool {
         let dropped = self.focus.borrow_mut().take();
+        if let Some(history) = dropped.as_deref().and_then(reconciler::editor_history) { history.separate(); }
         self.sync_field_focus();
         // the box hears the keyboard leave — a selection that only
         // means something while focused goes quiet
@@ -4863,6 +4885,7 @@ impl Runtime {
         let Some(path) = self.focus.borrow().clone() else {
             return false;
         };
+        if let Some(history) = reconciler::editor_history(&path) { history.separate(); }
         if let Some(placement) = self.custom_at(&path) {
             if let Some(image) = crate::clipboard::read_image() {
                 let response = self.deliver(&placement, crate::custom::ElementEvent::PasteImage(image));
@@ -4879,10 +4902,12 @@ impl Runtime {
             self.frame_asked.set(true);
             return true;
         }
-        match crate::clipboard::read() {
+        let applied = match crate::clipboard::read() {
             Some(text) => self.key(EditCommand::Insert(text)).applied,
             None => false,
-        }
+        };
+        if let Some(history) = reconciler::editor_history(&path) { history.separate(); }
+        applied
     }
 
     /// A full frame for the shell: settle, layout at the viewport,
