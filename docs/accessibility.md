@@ -58,6 +58,13 @@ owned by each native view. Its first accessibility query enables semantic captur
 applications do not need to opt in manually. Overlay panels have their own roots,
 including when the first query targets an already-open modal.
 
+Popup choices remain children of their native overlay surface. The parent
+window's focused-element query resolves the focused proxy across its own scene,
+so a non-key popover can report its active choice through the parent that keeps
+keyboard focus. Other windows retain independent focus. A hosted native editor
+keeps its own focus when no Bunny overlay owns it. Inspecting only the parent's
+children still omits overlay choices; clients must include child surfaces.
+
 The adapter keeps each native object while its `NodeId` remains exposed, converts
 layout bounds to screen coordinates, reports keyboard focus and forwards supported
 press, focus and value edits through the shell's existing event queue. Secure
@@ -76,7 +83,9 @@ dependency and stays inside the existing macOS FFI boundary.
 `cargo test -p bunny-ui-macos --test accessibility_native --locked` runs a
 main-thread AppKit probe against real windows and selectors. It checks live edits,
 identity, screen bounds, modals, password redaction, retired objects and
-main-thread exit with an accessible window still open. This
+main-thread exit with an accessible window still open. Popover checks cover
+native button roles, labels, actions, focus through the parent, hit testing,
+repeated opening, retired choices and independent-window focus. This
 in-process probe does not require permission to control other applications. It
 is distinct from an external AX client dump or a human VoiceOver workflow.
 
