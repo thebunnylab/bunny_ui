@@ -2506,6 +2506,13 @@ impl Runtime {
                 return response;
             }
         }
+        if let Some(edit) = Edit::ALL.into_iter().find(|edit| edit.stroke() == *pattern)
+            && let Some(path) = self.edit_responder_focus(edit)
+            && reconciler::run_edit_handler(&path, edit)
+        {
+            self.frame_asked.set(true);
+            return crate::custom::Response::handled();
+        }
         self.control_key(pattern)
     }
 
@@ -3822,7 +3829,8 @@ impl Runtime {
     /// it. A copy needs anyone who can hand text back: a field that is not
     /// secret, a box, or a read-only view with `.on_copy`. A cut, a paste
     /// and a select-all need a field or a box. An undo and a redo need a
-    /// box, because a field keeps no history.
+    /// box, because a field keeps no history. A focused non-text control
+    /// can instead use its nearest ancestor's `.on_edit` responder.
     pub fn menu_answers(&self, pick: Pick) -> bool {
         self.enter_scene();
         match pick {
@@ -3838,12 +3846,14 @@ impl Runtime {
                 let boxed = self.custom_at(&path).is_some();
                 let field = self.field_at(&path);
                 let open_field = field.as_ref().is_some_and(|field| !field.secret);
-                match edit {
+                let local = match edit {
                     Edit::Copy => boxed || open_field || reconciler::answers_copy(&path),
                     Edit::Cut => boxed || open_field,
                     Edit::Paste | Edit::SelectAll => boxed || field.is_some(),
                     Edit::Undo | Edit::Redo => boxed,
-                }
+                };
+                local || self.edit_responder_focus(edit)
+                    .is_some_and(|focus| reconciler::has_edit_handler(&focus, edit))
             }
         }
     }
@@ -3869,6 +3879,22 @@ impl Runtime {
             Pick::Command(action) => self.dispatch_action(action),
             Pick::Edit(edit) => self.menu_edit(edit),
         }
+    }
+
+    /// Ordinary controls may ask their containing editor. Fields and custom
+    /// editors own their command even when they cannot currently answer it.
+    fn edit_responder_focus(&self, edit: Edit) -> Option<String> {
+        if self.alert_asks() {
+            return None;
+        }
+        let path = self.focused()?;
+        if self.field_at(&path).is_some()
+            || self.custom_at(&path).is_some()
+            || (edit == Edit::Copy && reconciler::answers_copy(&path))
+        {
+            return None;
+        }
+        Some(path)
     }
 
     /// [`Runtime::menu_pick`] for an edit the window answers.

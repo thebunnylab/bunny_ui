@@ -116,11 +116,15 @@ pub(crate) type ContextEntry = (String, &'static str, bool);
 /// binding ever names it: the `bunny.` prefix is the house's.
 pub(crate) const KEYBOARD_NEUTRAL: &str = "bunny.keyboard-neutral";
 
-/// A NAMED action handler registered at render: (registration path,
-/// id, what runs). Retained like the actions — a skipped view's
-/// handler lives.
+/// A named action or standard edit registered at render: (registration
+/// path, typed command, what runs). A skipped view retains its handlers.
 pub(crate) type HandlerFn = Rc<dyn Fn()>;
-pub(crate) type HandlerEntry = (String, crate::action::ActionId, HandlerFn);
+#[derive(Clone, Copy)]
+pub(crate) enum HandlerId {
+    Action(crate::action::ActionId),
+    Edit(crate::menu::Edit),
+}
+pub(crate) type HandlerEntry = (String, HandlerId, HandlerFn);
 
 /// A webview's app-side hooks, registered at render: the navigation
 /// and message writers, and the handle's command queue. Retained like
@@ -1471,6 +1475,14 @@ pub(crate) fn active_contexts(focus: Option<&str>) -> Vec<&'static str> {
 }
 
 pub(crate) fn attribute_handler(path: String, id: crate::action::ActionId, handler: HandlerFn) {
+    attribute_handler_entry(path, HandlerId::Action(id), handler);
+}
+
+pub(crate) fn attribute_edit_handler(path: String, edit: crate::menu::Edit, handler: HandlerFn) {
+    attribute_handler_entry(path, HandlerId::Edit(edit), handler);
+}
+
+fn attribute_handler_entry(path: String, id: HandlerId, handler: HandlerFn) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         if let Some(frame) = pass.building.last_mut() {
@@ -1487,25 +1499,32 @@ thread_local! {
     /// stamp of the pass, never retained interaction state.
     static HANDLERS: RefCell<HashMap<crate::action::ActionId, (usize, HandlerFn)>> =
         RefCell::new(HashMap::default());
+    /// Standard edits retain their registration path for focus-scoped dispatch.
+    static EDIT_HANDLERS: RefCell<HashMap<(String, crate::menu::Edit), HandlerFn>> =
+        RefCell::new(HashMap::default());
 }
 
 /// Reassembles the handler map from the entries under the root that
 /// carry one + the root region. Precedence: the DEEPEST path wins
 /// (innermost in the tree); a depth tie → the last one mounted
 /// (deterministic from the path order, documented as NON-contractual —
-/// the semantic tiebreak arrives with key contexts).
+/// the semantic tiebreak arrives with key contexts). Standard edits retain
+/// every registration path; their nearest ancestor is chosen at dispatch.
 pub(crate) fn assemble_handlers(root: &str) {
     let mut map: HashMap<crate::action::ActionId, (usize, HandlerFn)> = HashMap::default();
-    let place = |map: &mut HashMap<crate::action::ActionId, (usize, HandlerFn)>,
-                     path: &str,
-                     id: crate::action::ActionId,
-                     handler: HandlerFn| {
-        let depth = path.split('/').count();
-        match map.get(&id) {
-            Some((existing, _)) if *existing > depth => {}
-            _ => {
-                map.insert(id, (depth, handler));
+    let mut edits = HashMap::default();
+    let mut place = |path: &str, id: HandlerId, handler: HandlerFn| match id {
+        HandlerId::Action(id) => {
+            let depth = path.split('/').count();
+            match map.get(&id) {
+                Some((existing, _)) if *existing > depth => {}
+                _ => {
+                    map.insert(id, (depth, handler));
+                }
             }
+        }
+        HandlerId::Edit(edit) => {
+            edits.insert((path.to_owned(), edit), handler);
         }
     };
     let carriers = carriers_under(root, |live| live.handler_entries.iter().cloned().collect());
@@ -1514,17 +1533,18 @@ pub(crate) fn assemble_handlers(root: &str) {
         for path in &carriers {
             if let Some(entry) = retained.get(path.as_str()) {
                 for (key, id, handler) in entry.handlers() {
-                    place(&mut map, key, *id, handler.clone());
+                    place(key, *id, handler.clone());
                 }
             }
         }
     });
     PASS.with(|pass| {
         for (key, id, handler) in std::mem::take(&mut pass.borrow_mut().root_handlers) {
-            place(&mut map, &key, id, handler);
+            place(&key, id, handler);
         }
     });
     HANDLERS.with(|handlers| *handlers.borrow_mut() = map);
+    EDIT_HANDLERS.with(|handlers| *handlers.borrow_mut() = edits);
 }
 
 /// Is a handler for the id mounted in the tree? The question a menu asks
@@ -1547,6 +1567,29 @@ pub(crate) fn run_handler(id: crate::action::ActionId) -> bool {
         }
         None => false,
     }
+}
+
+fn edit_handler(path: &str, edit: crate::menu::Edit) -> Option<HandlerFn> {
+    EDIT_HANDLERS.with(|handlers| {
+        handlers
+            .borrow()
+            .iter()
+            .filter(|((owner, candidate), _)| *candidate == edit && covers(owner, path))
+            .max_by_key(|((owner, _), _)| owner.len())
+            .map(|(_, handler)| Rc::clone(handler))
+    })
+}
+
+pub(crate) fn has_edit_handler(path: &str, edit: crate::menu::Edit) -> bool {
+    edit_handler(path, edit).is_some()
+}
+
+pub(crate) fn run_edit_handler(path: &str, edit: crate::menu::Edit) -> bool {
+    let Some(handler) = edit_handler(path, edit) else {
+        return false;
+    };
+    handler();
+    true
 }
 
 /// Dirty views the walk did not reach (a skipped parent, or a row a keyed
@@ -2032,6 +2075,17 @@ pub(crate) fn input_fingerprint() -> u64 {
         map.borrow().values().fold(0u64, |sum, (depth, handler)| {
             sum.wrapping_add((*depth as u64).wrapping_mul(0x9E37_79B9) ^ fingerprint_ptr(handler))
         })
+    }));
+    mix(EDIT_HANDLERS.with(|map| {
+        map.borrow()
+            .iter()
+            .fold(0u64, |sum, ((path, edit), handler)| {
+                sum.wrapping_add(
+                    fingerprint_key(path)
+                        ^ fingerprint_key(edit.title())
+                        ^ fingerprint_ptr(handler),
+                )
+            })
     }));
     mix(ACTIVE_CONTEXTS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(fingerprint_key(key)))));
     mix(DECLARED_CONTEXTS.with(|list| {
@@ -2675,6 +2729,7 @@ pub(crate) fn reset_world() {
     ACTIVE_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
     DECLARED_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
     HANDLERS.with(|handlers| handlers.borrow_mut().clear());
+    EDIT_HANDLERS.with(|handlers| handlers.borrow_mut().clear());
 }
 
 pub(crate) fn end_pass() {
