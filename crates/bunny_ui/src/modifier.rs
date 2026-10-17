@@ -120,6 +120,8 @@ pub enum Modifier {
     OnMeasure(Rc<dyn Fn(crate::layout::Size)>),
     /// The field asks for focus on its first appearance.
     AutoFocus,
+    /// Return focus to the invoker when this transient subtree closes.
+    RestoreFocusOnClose,
     /// The field takes the keyboard on each new beat, from whoever holds it.
     AutoFocusBeat(u64),
     /// As [`Modifier::AutoFocusBeat`], selecting the field's whole text on
@@ -311,6 +313,7 @@ impl Modifier {
             Modifier::ScrollTarget { .. } => "scroll_target",
             Modifier::OnMeasure { .. } => "on_measure",
             Modifier::AutoFocus => "auto_focus",
+            Modifier::RestoreFocusOnClose => "restore_focus_on_close",
             Modifier::AutoFocusBeat { .. } => "auto_focus_beat",
             Modifier::SelectOnBeat { .. } => "select_on_beat",
             Modifier::Shadow { .. } => "shadow",
@@ -453,6 +456,7 @@ impl Modifier {
             Modifier::ScrollTarget(id) => format!(" [.scrollTarget({id:?})]"),
             Modifier::OnMeasure(_) => " [.onMeasure]".into(),
             Modifier::AutoFocus => " [.autoFocus()]".into(),
+            Modifier::RestoreFocusOnClose => " [.restoreFocusOnClose()]".into(),
             Modifier::AutoFocusBeat(beat) => format!(" [.autoFocusBeat({beat})]"),
             Modifier::SelectOnBeat(beat) => format!(" [.selectOnBeat({beat})]"),
             Modifier::Shadow(radius, color) => format!(" [.shadow(radius: {radius}, {color})]"),
@@ -1937,6 +1941,10 @@ pub(crate) fn apply(
             // context deactivates when the view unmounts
             let path = motor::identity::cursor_scope().unwrap_or_default();
             crate::reconciler::attribute_context(path, name, false);
+        }
+        Modifier::RestoreFocusOnClose => {
+            let path = motor::identity::cursor_scope().unwrap_or_default();
+            crate::reconciler::attribute_context(path, crate::reconciler::FOCUS_RETURN, false);
         }
         Modifier::KeyContextFocused(name) => {
             // the same declaration, with the view it hangs on: it counts
