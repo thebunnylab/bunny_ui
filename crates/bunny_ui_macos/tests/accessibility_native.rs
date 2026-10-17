@@ -76,6 +76,21 @@ mod probe {
             .unwrap_or_else(|| panic!("native accessible element missing: {name}"))
     }
 
+    unsafe fn popup_choice(window: Id, label: &str) -> (Id, Id) {
+        unsafe {
+            let windows = object(window, sel("childWindows"));
+            let panel = (0..count(windows, sel("count")))
+                .map(|i| at(windows, sel("objectAtIndex:"), i))
+                .find(|panel| {
+                    children(object(*panel, sel("contentView")))
+                        .iter()
+                        .any(|node| property(*node, "accessibilityLabel").as_deref() == Some(label))
+                })
+                .unwrap_or_else(|| panic!("native child surface missing choice: {label}"));
+            (panel, named(object(panel, sel("contentView")), label))
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct Form {
         name: State<String>,
@@ -115,7 +130,10 @@ mod probe {
                                 self.reactions.set(false);
                             })
                             .id("native-reaction-like"),
-                            button(text("Heart"), move || self.reactions.set(false)),
+                            button(text("Heart"), move || {
+                                self.presses.add(20);
+                                self.reactions.set(false);
+                            }),
                         )
                         .padding()
                     ),
@@ -416,44 +434,103 @@ mod probe {
             assert!(!named(view, "Updated name").is_null());
             void(dismiss, sel("release"));
             void(old_save, sel("release"));
-            assert_eq!(
-                boolean(
-                    named(view, "Open reactions"),
-                    sel("accessibilityPerformPress")
-                ),
-                1
+            let launcher = named(view, "Open reactions");
+            let before_reactions = form.presses.get();
+            for (label, delta) in [("Thumbs up", 10), ("Heart", 20), ("Thumbs up", 10)] {
+                set_bool(launcher, sel("setAccessibilityFocused:"), 1);
+                assert_eq!(boolean(launcher, sel("accessibilityPerformPress")), 1);
+                let (panel, choice) = popup_choice(window, label);
+                let choice = object(choice, sel("retain"));
+                let panel_view = object(panel, sel("contentView"));
+                assert_eq!(
+                    property(choice, "accessibilityRole").as_deref(),
+                    Some("AXButton")
+                );
+                assert_eq!(object(choice, sel("accessibilityWindow")), panel);
+                assert!(!children(view).iter().any(|node| property(*node, "accessibilityLabel").as_deref() == Some(label)),
+                    "popup controls belong to the native child surface");
+                set_bool(choice, sel("setAccessibilityFocused:"), 1);
+                assert_eq!(boolean(choice, sel("isAccessibilityFocused")), 1);
+                assert_eq!(
+                    object(panel_view, sel("accessibilityFocusedUIElement")),
+                    choice
+                );
+                assert_eq!(
+                    object(view, sel("accessibilityFocusedUIElement")),
+                    choice,
+                    "main-window focus must reach its focused native popover choice"
+                );
+                let bounds = rectangle(choice, sel("accessibilityFrame"));
+                assert!(bounds.size.width > 0.0 && bounds.size.height > 0.0);
+                assert_eq!(
+                    point_object(
+                        panel_view,
+                        sel("accessibilityHitTest:"),
+                        CGPoint {
+                            x: bounds.origin.x + bounds.size.width / 2.0,
+                            y: bounds.origin.y + bounds.size.height / 2.0,
+                        }
+                    ),
+                    choice
+                );
+                let previous = form.presses.get();
+                assert_eq!(boolean(choice, sel("accessibilityPerformPress")), 1);
+                assert_eq!(form.presses.get(), previous + delta);
+                assert!(!form.reactions.get());
+                assert_eq!(object(view, sel("accessibilityFocusedUIElement")), launcher);
+                assert_eq!(boolean(choice, sel("isAccessibilityElement")), 0);
+                assert_eq!(
+                    boolean(choice, sel("accessibilityPerformPress")),
+                    0,
+                    "retired choices cannot act after dismissal or reuse"
+                );
+                assert_eq!(form.presses.get(), previous + delta);
+                void(choice, sel("release"));
+            }
+            assert_eq!(form.presses.get(), before_reactions + 40);
+            let companion = Form {
+                presses: State::new(0),
+                reactions: State::new(false),
+                modal: State::new(false),
+                ..form
+            };
+            let companion_id = app.open(
+                WindowSpec::titled("Independent popup focus").size(480.0, 640.0),
+                Rc::new(app.runtime()),
+                companion,
             );
-            let child_windows = object(window, sel("childWindows"));
-            let panel = (0..count(child_windows, sel("count")))
-                .map(|i| at(child_windows, sel("objectAtIndex:"), i))
-                .find(|panel| {
-                    children(object(*panel, sel("contentView")))
-                        .iter()
-                        .any(|node| {
-                            property(*node, "accessibilityLabel").as_deref() == Some("Thumbs up")
-                        })
+            let windows = object(
+                object(class("NSApplication"), sel("sharedApplication")),
+                sel("windows"),
+            );
+            let companion_window = (0..count(windows, sel("count")))
+                .map(|i| at(windows, sel("objectAtIndex:"), i))
+                .find(|window| {
+                    property(*window, "title").as_deref() == Some("Independent popup focus")
                 })
-                .expect("the popover exports choices on its native child surface");
-            let panel_view = object(panel, sel("contentView"));
-            let like = named(panel_view, "Thumbs up");
+                .unwrap();
+            let companion_view = object(companion_window, sel("contentView"));
+            let companion_save = named(companion_view, "Save");
+            set_bool(companion_save, sel("setAccessibilityFocused:"), 1);
+            assert_eq!(boolean(launcher, sel("accessibilityPerformPress")), 1);
+            let (_, choice) = popup_choice(window, "Thumbs up");
+            let choice = object(choice, sel("retain"));
+            set_bool(choice, sel("setAccessibilityFocused:"), 1);
+            assert_eq!(object(view, sel("accessibilityFocusedUIElement")), choice);
             assert_eq!(
-                property(like, "accessibilityRole").as_deref(),
-                Some("AXButton")
+                object(companion_view, sel("accessibilityFocusedUIElement")),
+                companion_save,
+                "another window keeps its own native focus"
             );
-            assert_eq!(object(like, sel("accessibilityWindow")), panel);
-            set_bool(like, sel("setAccessibilityFocused:"), 1);
-            assert_eq!(boolean(like, sel("isAccessibilityFocused")), 1);
-            assert_eq!(
-                object(panel_view, sel("accessibilityFocusedUIElement")),
-                like
+            assert_eq!(boolean(choice, sel("accessibilityPerformPress")), 1);
+            assert_eq!(boolean(choice, sel("accessibilityPerformPress")), 0);
+            assert_eq!(companion.presses.get(), 0);
+            assert!(!companion.reactions.get());
+            void(choice, sel("release"));
+            app.close(companion_id);
+            println!(
+                "Native popover roles, actions, focus, hit testing, repeated retirement and independent window passed"
             );
-            assert_eq!(
-                object(view, sel("accessibilityFocusedUIElement")),
-                like,
-                "main-window focus must reach its focused native popover choice"
-            );
-            assert_eq!(boolean(like, sel("accessibilityPerformPress")), 1);
-            assert!(!form.reactions.get());
             let needed = runtime.needs_frame();
             for _ in 0..10 {
                 let _ = children(view);
@@ -502,7 +579,19 @@ mod probe {
                 .unwrap();
             let view = object(object(window, sel("contentView")), sel("retain"));
             let save = object(named(view, "Save"), sel("retain"));
+            assert_eq!(
+                boolean(
+                    named(view, "Open reactions"),
+                    sel("accessibilityPerformPress")
+                ),
+                1
+            );
+            let (_, choice) = popup_choice(window, "Heart");
+            let choice = object(choice, sel("retain"));
             app.close(id);
+            assert_eq!(boolean(choice, sel("isAccessibilityElement")), 0);
+            assert_eq!(boolean(choice, sel("accessibilityPerformPress")), 0);
+            void(choice, sel("release"));
             assert_eq!(boolean(save, sel("accessibilityPerformPress")), 0);
             assert_eq!(boolean(save, sel("isAccessibilityElement")), 0);
             assert_eq!(boolean(view, sel("isAccessibilityElement")), 0);
