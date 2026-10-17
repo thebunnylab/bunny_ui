@@ -2823,6 +2823,11 @@ impl WindowHandle {
                     msg_void_id(container, sel("addSubview:"), child);
                     msg_void_id(self.view, sel("addSubview:"), container);
                     position_host(container, child, frame, window, view_height);
+                    // Complete the native child's pending layout before the
+                    // factory submits its initial document. Frame assignment
+                    // alone can leave its internal views awaiting a layout pass.
+                    msg_void_bool(child, sel("setNeedsLayout:"), 1);
+                    msg_void(child, sel("layoutSubtreeIfNeeded"));
                 });
                 HostSlot {
                     owner: self.view,
