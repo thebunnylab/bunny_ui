@@ -116,6 +116,8 @@ pub(crate) type ContextEntry = (String, &'static str, bool);
 /// — a skipped view keeps its mark, an unmounted one drops it — and no
 /// binding ever names it: the `bunny.` prefix is the house's.
 pub(crate) const KEYBOARD_NEUTRAL: &str = "bunny.keyboard-neutral";
+/// An inline transient subtree that returns focus to its invoking control.
+pub(crate) const FOCUS_RETURN: &str = "bunny.focus-return";
 
 /// A named action or standard edit registered at render: (registration
 /// path, typed command, what runs). A skipped view retains its handlers.
@@ -1481,6 +1483,18 @@ pub(crate) fn declares(path: &str, name: &str) -> bool {
     })
 }
 
+/// Mounted focus-return boundaries, including retained component bodies.
+pub(crate) fn focus_returns() -> Vec<String> {
+    DECLARED_CONTEXTS.with(|contexts| {
+        contexts
+            .borrow()
+            .iter()
+            .filter(|(_, name, _)| *name == FOCUS_RETURN)
+            .map(|(path, _, _)| path.clone())
+            .collect()
+    })
+}
+
 /// The contexts active for a keyboard held at `focus`, outermost first,
 /// each named once — the stack a key-context debugger shows.
 pub(crate) fn active_contexts(focus: Option<&str>) -> Vec<&'static str> {
@@ -1488,7 +1502,7 @@ pub(crate) fn active_contexts(focus: Option<&str>) -> Vec<&'static str> {
         let mut stack: Vec<&'static str> = Vec::new();
         for entry in contexts.borrow().iter() {
             // a mark, not a context a key could be read in
-            if entry.1 == KEYBOARD_NEUTRAL {
+            if matches!(entry.1, KEYBOARD_NEUTRAL | FOCUS_RETURN) {
                 continue;
             }
             if declaration_counts(entry, focus) && !stack.contains(&entry.1) {

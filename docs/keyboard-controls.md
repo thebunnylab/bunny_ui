@@ -81,3 +81,12 @@ Custom editing strategies keep ownership of their history. An ancestor handler
 owns its operation, including clipboard work for Cut, Copy or Paste.
 This runtime contract applies to native/canvas controls; flow DOM keeps the
 browser's native editing behavior.
+
+Inline transient forms can use `.restore_focus_on_close()` on their containing
+view. It remembers the control focused when the form appears, independently of
+which child later owns the keyboard. Closing from Apply, Cancel or a field
+returns focus to that invoker if it still exists. Moving focus outside the form
+before closing preserves the new owner. Nested forms can close together without
+reviving missing controls. The modifier neither takes focus on opening nor traps
+Tab; child fields keep their text history and composition. Like panel responders,
+this contract governs native/canvas input; flow DOM remains browser-owned.

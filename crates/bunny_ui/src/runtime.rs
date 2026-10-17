@@ -409,6 +409,7 @@ pub struct Runtime {
     /// Who lent the keyboard to a field's beat — the road home when the
     /// field leaves still holding it (`crate::loans`).
     loans: RefCell<crate::loans::Loans>,
+    focus_returns: RefCell<crate::loans::Returns>,
     /// The retained animations — springs keyed by identity, resolved
     /// at place through the env, advanced by the shell's tick.
     animator: RefCell<crate::anim::Animator>,
@@ -1730,6 +1731,7 @@ impl Runtime {
             element_reveals: RefCell::new(HashMap::default()),
             auto_focused: RefCell::new(std::collections::HashSet::default()),
             loans: RefCell::new(crate::loans::Loans::default()),
+            focus_returns: RefCell::new(crate::loans::Returns::default()),
             animator: RefCell::new(crate::anim::Animator::default()),
             last_proposal: Cell::new(None),
             last_overlays: RefCell::new(Vec::new()),
@@ -7086,6 +7088,14 @@ impl Runtime {
         // take its caret and its once-per-identity memory with it, and
         // the retains below would have thrown both away
         self.follow_named_inputs();
+        let restore = self.focus_returns.borrow_mut().sync(
+            &reconciler::focus_returns(),
+            self.focus.borrow().as_deref(),
+            input_lives,
+        );
+        if let Some(path) = restore {
+            self.hand_keyboard(&path, None);
+        }
         self.carets.borrow_mut().retain(|path, _| reconciler::has_editor(path));
         self.auto_focused.borrow_mut().retain(|key| {
             // a once-per-beat memory is keyed `path#beat`, a box's or a

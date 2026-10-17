@@ -969,6 +969,19 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::AutoFocus)
     }
 
+    /// Remember who holds the keyboard when this transient subtree appears.
+    /// If it closes while any descendant holds focus, return the keyboard to
+    /// that invoker, provided it is still mounted. Tab and pointer moves
+    /// between children keep the same return address.
+    ///
+    /// This does not focus a child or trap navigation. Moving focus outside
+    /// the subtree before it closes preserves that choice. Nested boundaries
+    /// can close together; missing invokers are never revived.
+    #[track_caller]
+    fn restore_focus_on_close(self) -> Modified<Self> {
+        Modified::new(self, Modifier::RestoreFocusOnClose)
+    }
+
     /// The field takes the keyboard on each NEW `beat` — from whoever
     /// holds it. The rule a custom box's `auto_focus(beat)` has always
     /// kept, applied to a field.
