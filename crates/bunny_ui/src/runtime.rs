@@ -555,6 +555,14 @@ pub struct Runtime {
     pump_fresh: Cell<bool>,
 }
 
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if let Some(scene) = self.scene.as_deref() {
+            reconciler::forget_root_inputs(scene);
+        }
+    }
+}
+
 impl Default for Runtime {
     fn default() -> Self {
         Self::new()
@@ -785,7 +793,8 @@ impl Runtime {
                 }
             };
             effects::set_queue(queue);
-            if !reconciler::assembly_is_current(root) {
+            let replaced_root = reconciler::refresh_root_region(root);
+            if had_root_region || replaced_root || !reconciler::assembly_is_current(root) {
                 crate::stats::note_assembly();
                 self.assemble_input(root, had_root_region);
             } else if crate::paranoid::on(crate::paranoid::ASSEMBLE) {
@@ -794,13 +803,10 @@ impl Runtime {
         });
     }
 
-    /// Brings the tables the input doors read up to date. The path-keyed
-    /// ones follow the retention at every entry and need nothing here
-    /// but the root region's one-pass registrations; the two DERIVED
-    /// ones (handlers, key contexts) rebuild from the entries that carry
-    /// them.
+    /// Rebuilds this scene's derived input tables from retained entries and
+    /// its last rendered root region. Switching scenes never replaces root
+    /// registrations or refills the effect queue.
     fn assemble_input(&self, root: &str, had_root_region: bool) {
-        reconciler::refresh_root_region();
         reconciler::assemble_handlers(root);
         reconciler::assemble_contexts(root);
         reconciler::set_assembled_root(root, had_root_region);

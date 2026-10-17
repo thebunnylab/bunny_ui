@@ -23,6 +23,20 @@ including when only modal state changed. Declining preserves normal key routing.
 `edit` defaults to native text editing; a policy can add grouped history or
 replacement semantics. `Read` and `Copy` should remain observational.
 
+## Independent native scenes
+
+Each named `Runtime::scene` retains the root controls published by its last
+render, including fields rendered directly without a `Component` wrapper.
+Another scene may render or receive input without removing those controls.
+Handlers and key contexts rebuild from the selected scene's retained entries
+and root registrations; input-only activation never queues render effects.
+
+A new render replaces only its own root registrations, including an empty
+replacement when a control unmounts. Closing or resetting a named scene releases
+its root input callbacks without removing a neighboring scene's controls.
+`tests/scene_input.rs` covers typing, selection, independent history, rerender,
+unmount and recreation through the public runtime API.
+
 ## Ordinary field history
 
 A field without an editing strategy owns Undo/Redo through the standard keyboard

@@ -457,10 +457,9 @@ struct Live {
     context_gen: u64,
     /// The same, for effects.
     effect_gen: u64,
-    /// The keys the ROOT REGION of the last assembly put into the maps.
-    /// Those registrations live for one pass: the next assembly takes
-    /// them out before it puts the new region's in.
-    root_keys: RootKeys,
+    /// Registrations outside retained boundaries, owned by the scene whose
+    /// last frame published them. Input activation never replaces a region.
+    root_regions: HashMap<String, RootRegion>,
     /// Entries with no retained boundary above them — the ones only the
     /// root region mounts, and so the only ones the root region can
     /// unmount. The sweep reads this instead of searching for them.
@@ -476,7 +475,7 @@ struct Live {
 }
 
 #[derive(Default)]
-struct RootKeys {
+struct RootRegion {
     actions: Vec<String>,
     copies: Vec<String>,
     editors: Vec<String>,
@@ -485,6 +484,23 @@ struct RootKeys {
     measures: Vec<String>,
     webviews: Vec<String>,
     customs: Vec<String>,
+    handlers: Vec<HandlerEntry>,
+    contexts: Vec<ContextEntry>,
+}
+
+impl RootRegion {
+    fn is_empty(&self) -> bool {
+        self.actions.is_empty()
+            && self.copies.is_empty()
+            && self.editors.is_empty()
+            && self.splits.is_empty()
+            && self.scrolls.is_empty()
+            && self.measures.is_empty()
+            && self.webviews.is_empty()
+            && self.customs.is_empty()
+            && self.handlers.is_empty()
+            && self.contexts.is_empty()
+    }
 }
 
 /// A click key's registration: what it fires, and whose it is.
@@ -494,8 +510,8 @@ struct Registered {
     /// boundary's stay in the retention: a body that re-runs keeps it and
     /// replaces its registrations, one that leaves marks it left, and the
     /// boundary that mounts at the same path afterwards gets a slot of its
-    /// own. `None` for the root region, whose keys leave at the next
-    /// assembly.
+    /// own. `None` for a root region, whose keys leave when its own scene
+    /// renders again or closes.
     owner: Option<Rc<Slot>>,
 }
 
@@ -669,9 +685,11 @@ impl Live {
         }
     }
 
-    /// Takes the last root region's registrations back out.
-    fn drop_root_region(&mut self) {
-        let keys = std::mem::take(&mut self.root_keys);
+    /// Takes one scene's root registrations back out, leaving its neighbors.
+    fn drop_root_region(&mut self, root: &str) -> bool {
+        let Some(keys) = self.root_regions.remove(root) else {
+            return false;
+        };
         for key in &keys.actions {
             self.remove_action(key);
         }
@@ -697,6 +715,7 @@ impl Live {
             self.customs.remove(key);
             self.keyed_customs.remove(key);
         }
+        true
     }
 }
 
@@ -1405,8 +1424,10 @@ pub(crate) fn assemble_contexts(root: &str) {
             }
         }
     });
-    PASS.with(|pass| {
-        declared.extend(std::mem::take(&mut pass.borrow_mut().root_contexts));
+    LIVE.with(|live| {
+        if let Some(region) = live.borrow().root_regions.get(root) {
+            declared.extend(region.contexts.iter().cloned());
+        }
     });
     // outermost first: a view nearer the root holds the ones below it,
     // and among equals the tree's own order stands
@@ -1414,8 +1435,11 @@ pub(crate) fn assemble_contexts(root: &str) {
         let depth = |path: &str| path.split('/').count();
         depth(a).cmp(&depth(b)).then_with(|| a.cmp(b))
     });
-    let mounted: HashSet<&'static str> =
-        declared.iter().filter(|(_, _, focused)| !focused).map(|(_, name, _)| *name).collect();
+    let mounted: HashSet<&'static str> = declared
+        .iter()
+        .filter(|(_, _, focused)| !focused)
+        .map(|(_, name, _)| *name)
+        .collect();
     ACTIVE_CONTEXTS.with(|contexts| *contexts.borrow_mut() = mounted);
     DECLARED_CONTEXTS.with(|contexts| *contexts.borrow_mut() = declared);
 }
@@ -1539,9 +1563,11 @@ pub(crate) fn assemble_handlers(root: &str) {
             }
         }
     });
-    PASS.with(|pass| {
-        for (key, id, handler) in std::mem::take(&mut pass.borrow_mut().root_handlers) {
-            place(&key, id, handler);
+    LIVE.with(|live| {
+        if let Some(region) = live.borrow().root_regions.get(root) {
+            for (key, id, handler) in &region.handlers {
+                place(key, *id, handler.clone());
+            }
         }
     });
     HANDLERS.with(|handlers| *handlers.borrow_mut() = map);
@@ -2050,40 +2076,78 @@ fn fingerprint_ptr<T: ?Sized>(shared: &Rc<T>) -> u64 {
 /// keys out — the retention never holds those, so a fingerprint built
 /// from it must not see them either.
 fn tables_fingerprint(live: &Live, without_root: bool) -> u64 {
-    let skip = |keys: &[String], key: &str| without_root && keys.iter().any(|root| root == key);
+    let skip = |keys: fn(&RootRegion) -> &[String], key: &str| {
+        without_root
+            && live
+                .root_regions
+                .values()
+                .any(|region| keys(region).iter().any(|root| root == key))
+    };
     let mut total = 0u64;
     let mut mix = |part: u64| total = total.wrapping_mul(31).wrapping_add(part);
     // a click key whose owner left waits for the idle: it is not live
     mix(live.actions.iter().fold(0u64, |sum, (key, registered)| {
-        if skip(&live.root_keys.actions, key) || !registered.is_live() {
+        if skip(|region| &region.actions, key) || !registered.is_live() {
             sum
         } else {
             sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(&registered.action))
         }
     }));
     mix(live.copies.iter().fold(0u64, |sum, (key, copy)| {
-        if skip(&live.root_keys.copies, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(copy)) }
+        if skip(|region| &region.copies, key) {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(copy))
+        }
     }));
     mix(live.editors.iter().fold(0u64, |sum, (key, editor)| {
-        if skip(&live.root_keys.editors, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(&editor.command)) }
+        if skip(|region| &region.editors, key) {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(&editor.command))
+        }
     }));
     mix(live.splits.iter().fold(0u64, |sum, (key, split)| {
-        if skip(&live.root_keys.splits, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(split)) }
+        if skip(|region| &region.splits, key) {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(split))
+        }
     }));
     mix(live.scrolls.iter().fold(0u64, |sum, (key, scroll)| {
-        if skip(&live.root_keys.scrolls, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(scroll)) }
+        if skip(|region| &region.scrolls, key) {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(scroll))
+        }
     }));
     mix(live.measures.iter().fold(0u64, |sum, (key, measure)| {
-        if skip(&live.root_keys.measures, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(measure)) }
+        if skip(|region| &region.measures, key) {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(measure))
+        }
     }));
     mix(live.webviews.keys().fold(0u64, |sum, key| {
-        if skip(&live.root_keys.webviews, key) { sum } else { sum.wrapping_add(fingerprint_key(key)) }
+        if skip(|region| &region.webviews, key) {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key))
+        }
     }));
     mix(live.customs.iter().fold(0u64, |sum, key| {
-        if skip(&live.root_keys.customs, key) { sum } else { sum.wrapping_add(fingerprint_key(key)) }
+        if skip(|region| &region.customs, key) {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key))
+        }
     }));
     mix(live.keyed_customs.iter().fold(0u64, |sum, key| {
-        if skip(&live.root_keys.customs, key) { sum } else { sum.wrapping_add(fingerprint_key(key)) }
+        if skip(|region| &region.customs, key) {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key))
+        }
     }));
     total
 }
@@ -2149,7 +2213,7 @@ fn slots_match(live: &Live, rebuilt: &Live) -> bool {
 }
 
 /// Is the root region of THIS pass empty? Registrations made outside
-/// every boundary live there, and only for one pass.
+/// every boundary wait here until the completed pass publishes them.
 fn root_region_is_empty() -> bool {
     PASS.with(|pass| {
         let pass = pass.borrow();
@@ -2231,29 +2295,44 @@ pub(crate) fn set_assembled_root(root: &str, had_root_region: bool) {
     ASSEMBLED_AT.with(|at| at.set(Some((handlers, contexts, had_root_region))));
 }
 
-/// The root region's registrations — made outside every boundary —
-/// enter the tables for ONE pass: the last region's leave first, this
-/// pass's go in, and their keys are kept so the next assembly can take
-/// them out again.
-pub(crate) fn refresh_root_region() {
-    let (actions, copies, editors, splits, scrolls, measures, webviews, customs) =
-        PASS.with(|pass| {
-            let mut pass = pass.borrow_mut();
-            (
-                std::mem::take(&mut pass.root_actions),
-                std::mem::take(&mut pass.root_copies),
-                std::mem::take(&mut pass.root_editors),
-                std::mem::take(&mut pass.root_splits),
-                std::mem::take(&mut pass.root_scrolls),
-                std::mem::take(&mut pass.root_measures),
-                std::mem::take(&mut pass.root_webviews),
-                std::mem::take(&mut pass.root_customs),
-            )
-        });
+/// Publishes the finished pass's root input registrations. Only a render
+/// replaces them; input-only activation reads the stored region. Effects
+/// remain pass-owned and are deliberately absent from this storage.
+pub(crate) fn refresh_root_region(root: &str) -> bool {
+    let (
+        actions,
+        copies,
+        editors,
+        splits,
+        scrolls,
+        measures,
+        webviews,
+        customs,
+        handlers,
+        contexts,
+    ) = PASS.with(|pass| {
+        let mut pass = pass.borrow_mut();
+        (
+            std::mem::take(&mut pass.root_actions),
+            std::mem::take(&mut pass.root_copies),
+            std::mem::take(&mut pass.root_editors),
+            std::mem::take(&mut pass.root_splits),
+            std::mem::take(&mut pass.root_scrolls),
+            std::mem::take(&mut pass.root_measures),
+            std::mem::take(&mut pass.root_webviews),
+            std::mem::take(&mut pass.root_customs),
+            std::mem::take(&mut pass.root_handlers),
+            std::mem::take(&mut pass.root_contexts),
+        )
+    });
     LIVE.with(|live| {
         let mut live = live.borrow_mut();
-        live.drop_root_region();
-        let mut keys = RootKeys::default();
+        let replaced = live.drop_root_region(root);
+        let mut keys = RootRegion {
+            handlers,
+            contexts,
+            ..RootRegion::default()
+        };
         for (key, action) in actions {
             keys.actions.push(key.to_string());
             live.insert_action(key, action, None);
@@ -2289,8 +2368,56 @@ pub(crate) fn refresh_root_region() {
             }
             live.customs.insert(key);
         }
-        live.root_keys = keys;
-    });
+        if !keys.is_empty() {
+            live.root_regions.insert(root.to_string(), keys);
+        }
+        replaced
+    })
+}
+
+/// Retires one scene's root input registrations and derived-table cache.
+fn clear_root_region(root: &str) {
+    if LIVE.with(|live| live.borrow_mut().drop_root_region(root)) {
+        clear_assembled_under(root);
+    }
+}
+
+/// Releases a closed or reset scene's root inputs even when another scene
+/// currently owns the derived tables. State and effects keep their own lifecycle.
+pub(crate) fn forget_root_inputs(root: &str) {
+    // A shell may keep its Runtime in TLS. During thread teardown the live
+    // tables or a derived table may already have released their callbacks.
+    let Ok(regions) = LIVE.try_with(|live| {
+        live.borrow()
+            .root_regions
+            .keys()
+            .filter(|path| covers(root, path))
+            .cloned()
+            .collect::<Vec<_>>()
+    }) else {
+        return;
+    };
+    for region in regions {
+        clear_root_region(&region);
+    }
+}
+
+fn clear_assembled_under(root: &str) {
+    let was_current = ASSEMBLED_ROOT
+        .try_with(|slot| {
+            slot.borrow()
+                .as_deref()
+                .is_some_and(|active| covers(root, active))
+        })
+        .unwrap_or(false);
+    if was_current {
+        let _ = ASSEMBLED_ROOT.try_with(|slot| *slot.borrow_mut() = None);
+        let _ = ASSEMBLED_AT.try_with(|slot| slot.set(None));
+        let _ = HANDLERS.try_with(|handlers| handlers.borrow_mut().clear());
+        let _ = EDIT_HANDLERS.try_with(|handlers| handlers.borrow_mut().clear());
+        let _ = ACTIVE_CONTEXTS.try_with(|contexts| contexts.borrow_mut().clear());
+        let _ = DECLARED_CONTEXTS.try_with(|contexts| contexts.borrow_mut().clear());
+    }
 }
 
 /// Removes the entries at `paths` from the retention, and their
@@ -2499,12 +2626,8 @@ pub(crate) fn forget_under(root: &str) {
             .collect()
     });
     drop_entries(&doomed);
-    ASSEMBLED_ROOT.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.as_deref() == Some(root) {
-            *slot = None;
-        }
-    });
+    forget_root_inputs(root);
+    clear_assembled_under(root);
 }
 
 /// Identities swept by `end_pass`: their entries fall with them.
@@ -2698,9 +2821,6 @@ fn sweep_under(
 /// callbacks. Unlike an unmount, invalidation preserves the identity/read graph
 /// until the new pass replaces it; the owning runtime immediately renders next.
 pub(crate) fn clear_under(root: &str) {
-    let was_current = ASSEMBLED_ROOT.with(|slot| {
-        slot.borrow().as_deref().is_some_and(|active| covers(root, active))
-    });
     RETAINED.with(|retained| {
         let mut retained = retained.borrow_mut();
         LIVE.with(|live| {
@@ -2708,15 +2828,10 @@ pub(crate) fn clear_under(root: &str) {
             for (path, entry) in retained.extract_if(.., |path, _| covers(root, path)) {
                 live.unindex(&path, &entry);
             }
-            if was_current {
-                live.drop_root_region();
-            }
         });
     });
-    if was_current {
-        ASSEMBLED_ROOT.with(|slot| *slot.borrow_mut() = None);
-        ASSEMBLED_AT.with(|slot| slot.set(None));
-    }
+    forget_root_inputs(root);
+    clear_assembled_under(root);
 }
 
 /// Drops the whole retention — the next pass runs every body (the
@@ -3841,3 +3956,7 @@ mod tests {
         check("a row added");
     }
 }
+
+#[cfg(test)]
+#[path = "root_region_tests.rs"]
+mod root_region_tests;
