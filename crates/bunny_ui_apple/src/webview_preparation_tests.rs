@@ -157,3 +157,57 @@ fn claims_and_cleaning_share_the_same_preparation_budget() {
     release_prepared(301usize as Id);
     assert_eq!(requested.pool.borrow().occupied(), 1);
 }
+
+#[test]
+fn fresh_preparation_places_an_empty_engine_before_starting_its_blank_barrier() {
+    let requested = HtmlPreparation::request();
+    let steps = RefCell::new(Vec::new());
+    refill_preparation(
+        &requested.pool,
+        || {
+            steps.borrow_mut().push("allocate");
+            SpareEngine(null_mut())
+        },
+        |view| {
+            assert!(view.is_null());
+            steps.borrow_mut().push("place");
+        },
+        |pool, engine| {
+            steps.borrow_mut().push("blank");
+            pool.borrow_mut().cleaning.push(CleaningEngine {
+                engine,
+                navigation: null_mut(),
+                origin: EngineOrigin::Fresh,
+            });
+        },
+    );
+    assert_eq!(
+        *steps.borrow(),
+        ["allocate", "place", "blank", "allocate", "place", "blank"]
+    );
+    assert_eq!(
+        requested.available(),
+        0,
+        "association cannot bypass the blank barrier"
+    );
+    assert_eq!(requested.pool.borrow().occupied(), 2);
+}
+
+#[test]
+fn fresh_preparation_never_repositions_a_retired_or_borrowed_engine() {
+    let requested = HtmlPreparation::request();
+    requested.pool.borrow_mut().borrowed.insert(401);
+    requested.pool.borrow_mut().cleaning.push(CleaningEngine {
+        engine: SpareEngine(null_mut()),
+        navigation: 402usize as Id,
+        origin: EngineOrigin::Retired,
+    });
+    refill_preparation(
+        &requested.pool,
+        || panic!("the two existing engines already occupy the reserve"),
+        |_| panic!("a private or borrowed view cannot enter fresh placement"),
+        |_, _| panic!("an existing blank barrier cannot restart"),
+    );
+    assert_eq!(requested.pool.borrow().occupied(), 2);
+    assert_eq!(requested.available(), 0);
+}

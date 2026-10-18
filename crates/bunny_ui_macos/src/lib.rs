@@ -1906,7 +1906,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
             present(runtime, display, via);
             // Prepare only after the window has presented its frame.
-            webview::prepare_pending_html();
+            webview::prepare_pending_html_placed(|view| window.prepare_html_engine(view));
         point_cursor(runtime, !resizing());
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
             let rect = snapshot.caret_rect;

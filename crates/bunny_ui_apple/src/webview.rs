@@ -249,6 +249,7 @@ impl Drop for SpareEngine {
         if !self.0.is_null() {
             unsafe {
                 msg_void(self.0, sel("stopLoading"));
+                msg_void(self.0, sel("removeFromSuperview"));
                 msg_void(self.0, sel("release"));
             }
         }
@@ -287,16 +288,40 @@ fn preparation_allowed(document: &Document) -> bool {
 
 /// Services deferred preparation after the host has presented its frame.
 pub fn prepare_pending_html() {
+    prepare_pending_html_placed(|_| {});
+}
+
+/// Associates newly allocated empty engines before their sealed blank navigation.
+///
+/// The platform callback must keep each view hidden and input-inert. Retired
+/// document engines never pass through this callback; their scrub barrier stays
+/// detached. The ordinary two-engine budget and confirmed-blank admission apply.
+pub fn prepare_pending_html_placed(place: impl Fn(Id)) {
     let pools = HTML_PREPARATIONS.with(|pending| {
         let mut pending = pending.borrow_mut();
         pending.retain(|pool| pool.strong_count() != 0);
         pending.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
     });
     for pool in pools {
-        while pool.borrow().occupied() < 2 {
-            let view = unsafe { new_engine() };
-            reuse::begin_cleaning(&pool, SpareEngine(view), EngineOrigin::Fresh);
-        }
+        refill_preparation(
+            &pool,
+            || SpareEngine(unsafe { new_engine() }),
+            &place,
+            |pool, engine| reuse::begin_cleaning(pool, engine, EngineOrigin::Fresh),
+        );
+    }
+}
+
+fn refill_preparation(
+    pool: &Rc<EnginePool>,
+    mut allocate: impl FnMut() -> SpareEngine,
+    mut place: impl FnMut(Id),
+    mut begin_blank: impl FnMut(&Rc<EnginePool>, SpareEngine),
+) {
+    while pool.borrow().occupied() < 2 {
+        let engine = allocate();
+        place(engine.0);
+        begin_blank(pool, engine);
     }
 }
 
@@ -313,6 +338,9 @@ fn take_prepared(document: &Document) -> Option<Id> {
                 let mut reserve = pool.borrow_mut();
                 let mut engine = reserve.ready.pop()?;
                 let view = std::mem::replace(&mut engine.0, null_mut());
+                // Native preparation can associate a hidden, empty view. The
+                // host reparents it synchronously before authored content loads.
+                unsafe { msg_void_bool(view, sel("setHidden:"), 0) };
                 reserve.borrowed.insert(view as usize);
                 Some(view)
             })

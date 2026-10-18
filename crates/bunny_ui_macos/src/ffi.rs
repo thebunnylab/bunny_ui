@@ -2426,6 +2426,43 @@ pub struct WindowHandle {
 }
 
 impl WindowHandle {
+    /// Associate only a newly allocated empty HTML engine after presentation.
+    /// The hidden view cannot receive hits or enter the key-view loop. The pool
+    /// owns its retain and detaches it on drop; a real host reparents on claim.
+    pub(crate) fn prepare_html_engine(&self, child: Id) {
+        unsafe {
+            let responder = msg_id(self.window, sel("firstResponder"));
+            msg_void_bool(child, sel("setHidden:"), 1);
+            msg_void_rect(
+                child,
+                sel("setFrame:"),
+                CGRect {
+                    origin: CGPoint { x: 0.0, y: 0.0 },
+                    size: CGSize {
+                        width: 1.0,
+                        height: 1.0,
+                    },
+                },
+            );
+            msg_void_id(self.view, sel("addSubview:"), child);
+            if crate::trace::active() {
+                let frame = msg_rect(child, sel("frame"));
+                crate::trace::mark(
+                    "N",
+                    format_args!(
+                        "stage=prepare attached={} hidden={} key={} focus_kept={} width={:.3} height={:.3}",
+                        u8::from(!msg_id(child, sel("window")).is_null()),
+                        msg_bool(child, sel("isHidden")),
+                        msg_bool(child, sel("canBecomeKeyView")),
+                        u8::from(responder == msg_id(self.window, sel("firstResponder"))),
+                        frame.size.width,
+                        frame.size.height,
+                    ),
+                );
+            }
+        }
+    }
+
     /// The content view — the key a grafted presenter is filed under.
     pub(crate) fn view(&self) -> Id {
         self.view
