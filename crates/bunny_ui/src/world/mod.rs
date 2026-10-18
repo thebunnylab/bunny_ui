@@ -14,15 +14,19 @@
 //! The module is behind the `3d` feature. An app that draws no world
 //! carries none of it.
 
+pub mod camera;
 pub mod material;
 pub mod math;
 pub mod mesh;
+pub mod orbit;
 pub mod polygon;
 pub mod store;
 
 pub use math::{Aabb, Frustum, Mat4, Plane, Quat, Ray, Transform, Vec2, Vec3, Vec4, vec2, vec3, vec4};
+pub use camera::{Camera, Flight, Lens};
 pub use material::{AlphaMode, Light, LineDepth, LineStyle, Material, Model, PointLight, Sun, SunFrame};
 pub use mesh::{Lines, Mesh, MeshData};
+pub use orbit::{Orbit, OrbitLimits};
 pub use store::{Entity, EntityId, EntitySpec, Shape, World, WorldEdit};
 
 /// A fresh identity for a mesh, a set of lines or a world. One counter
