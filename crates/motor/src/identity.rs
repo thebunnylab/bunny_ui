@@ -165,6 +165,8 @@ struct Registry {
     /// The painting box's path, held in a warm buffer (no string per
     /// paint) and spelled as an `Rc<str>` only when a read is filed.
     painting_path: String,
+    /// Counts the paints begun: two paints of one box are two numbers.
+    paint_serial: u64,
     painting_rc: Option<Rc<str>>,
     /// Who paints what: the boxes that read each dependency.
     paint_readers: HashMap<DepKey, Few<Rc<str>>>,
@@ -1627,6 +1629,7 @@ pub fn begin_paint(path: &str) {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         registry.painting = true;
+        registry.paint_serial = registry.paint_serial.wrapping_add(1);
         registry.painting_path.clear();
         registry.painting_path.push_str(path);
         registry.painting_rc = None;
@@ -1639,6 +1642,37 @@ pub fn end_paint() {
         registry.painting = false;
         registry.painting_rc = None;
     });
+}
+
+/// The frame clock's dependency. A state's dependency counts up from
+/// zero; this one stands at the far end and never meets one.
+const FRAME_CLOCK: u64 = u64::MAX;
+
+/// A box that animates on its own reads the frame clock while it paints:
+/// every [`tick_frame_clock`] then repaints it, and a box that stopped
+/// reading it is left alone.
+pub fn read_frame_clock() {
+    record_read(DepKey::State(FRAME_CLOCK));
+}
+
+/// One beat of the frame clock: every box that read it repaints.
+pub fn tick_frame_clock() {
+    record_write(DepKey::State(FRAME_CLOCK));
+}
+
+/// The box painting now: a number that names it, the same on every frame
+/// for the same box, and the serial of this paint, new each time a paint
+/// begins. `(0, 0)` outside a paint.
+pub fn painting_key() -> (u64, u64) {
+    REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        if !registry.painting {
+            return (0, 0);
+        }
+        let mut hasher = crate::hash::FxHasher::default();
+        std::hash::Hasher::write(&mut hasher, registry.painting_path.as_bytes());
+        (std::hash::Hasher::finish(&hasher).max(1), registry.paint_serial)
+    })
 }
 
 /// Did a write reach a box's paint since the last frame took them?

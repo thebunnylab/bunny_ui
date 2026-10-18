@@ -775,6 +775,15 @@ impl RunAtlas {
         if let ImageSource::Feed { key, generation, size, format, bytes } = source {
             return Ok(self.resolve_live(ground, *key, *generation, *size, *format, bytes));
         }
+        // a world's key is its SLOT: the shelf and the dedicated caches
+        // would show an old picture. Where no tier draws worlds, the
+        // oracle's picture rides the live road, once per generation.
+        if let Some((slot, frame)) = source.world_feed() {
+            let Some(raster) = raster_source(engine, source, width as usize, height as usize) else {
+                return Ok(None);
+            };
+            return Ok(self.resolve_live(ground, slot, frame, (width, height), PixelFormat::Rgba8, &raster.rgba));
+        }
         let cache_key = (source.key(), width, height);
         let walk = self.walk;
         if let Some(entry) = self.dedicated.get_mut(&cache_key) {

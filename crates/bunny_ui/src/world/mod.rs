@@ -25,6 +25,7 @@ pub mod polygon;
 pub mod shade;
 pub mod soft;
 pub mod store;
+pub mod view;
 pub mod wire;
 
 pub use math::{Aabb, Frustum, Mat4, Plane, Quat, Ray, Transform, Vec2, Vec3, Vec4, vec2, vec3, vec4};
@@ -36,6 +37,7 @@ pub use orbit::{Orbit, OrbitLimits};
 pub use pick::Hit;
 pub use soft::Picture;
 pub use store::{Entity, EntityId, EntitySpec, Shape, World, WorldEdit};
+pub use view::{CameraSource, Shot};
 
 /// A fresh identity for a mesh, a set of lines or a world. One counter
 /// for all of them: an identity names one thing, whatever its kind.
