@@ -278,6 +278,53 @@ fn exercise_instances(
         _ => None,
     });
     let source = fs::read_to_string(lib).unwrap();
+    let broken = source.replace("text(\"Tap again\")", "text(missing_reload_value)");
+    assert_ne!(source, broken);
+    fs::write(lib, &broken).unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while live.saved().is_none() {
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut failed = Vec::new();
+    live.reload(&mut failed);
+    let diagnostics = match failed.as_slice() {
+        [Event::BuildStarted, Event::BuildFailed { diagnostics }] => diagnostics,
+        _ => panic!("a failed body build must keep the live host: {failed:?}"),
+    };
+    let problem = diagnostics
+        .iter()
+        .find(|problem| problem.level == "error" && problem.message.contains("missing_reload_value"))
+        .expect("the failed reload must preserve the compiler diagnostic");
+    assert_eq!(problem.code.as_deref(), Some("E0425"));
+    assert_eq!(problem.file.as_deref().map(Path::new), Some(Path::new("src/lib.rs")));
+    let line = broken.lines().nth(problem.line.unwrap() as usize - 1).unwrap();
+    assert!(line[problem.column.unwrap() as usize - 1..].starts_with("missing_reload_value"));
+    for instance in [&a, &b] {
+        live.send(&ToHost::Instance {
+            instance: instance.clone(),
+            variant: 0,
+            command: C::Resize(Size {
+                width: if instance == &a { 420.0 } else { 600.0 },
+                height: 702.0,
+            }),
+        })
+        .unwrap();
+        let retained = expect(live, Duration::from_secs(10), |message| match message {
+            ToIde::InstanceFrame { instance: current, frame }
+                if current == instance && frame.size.height == 702.0 =>
+            {
+                Some(frame.as_ref().clone())
+            }
+            _ => None,
+        });
+        assert_eq!(retained.generation, other.generation);
+        assert!(says(&retained, "Tap again"));
+        assert!(says(
+            &retained,
+            if instance == &a { "You tapped 1 times" } else { "You tapped 0 times" }
+        ));
+    }
     fs::write(lib, source.replace("Tap again", "Tap together")).unwrap();
     let until = Instant::now() + Duration::from_secs(5);
     while live.saved().is_none() {
@@ -315,7 +362,7 @@ fn exercise_instances(
     expect(live, Duration::from_secs(10), |message| match message {
         ToIde::InstanceSnapshot {
             instance,
-            size: (600, 701),
+            size: (600, 702),
             ..
         } if instance == &b => Some(()),
         _ => None,

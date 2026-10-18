@@ -340,9 +340,7 @@ impl Preview<Live> {
                     new_types: done.new_types,
                 });
             }
-            Err(Missed::Build) => events.push(Event::BuildFailed {
-                diagnostics: Vec::new(),
-            }),
+            Err(Missed::Build(error)) => build_failed(error, events),
             Err(Missed::Restart(why)) => events.push(Event::RestartNeeded(why)),
             Err(Missed::Load(why)) => events.push(Event::Note(format!("the host did not take the new code: {why}"))),
         }
@@ -368,6 +366,20 @@ impl Preview<Live> {
     }
 }
 
+/// A failed build always ends the Building state, including I/O failures
+/// for which the compiler has no diagnostic. Keep those failures actionable.
+fn build_failed(error: Error, events: &mut Vec<Event>) {
+    if error.diagnostics.is_empty() {
+        let mut message = error.message;
+        if let Some(hint) = error.hint {
+            message.push('\n');
+            message.push_str(&hint);
+        }
+        events.push(Event::Note(message));
+    }
+    events.push(Event::BuildFailed { diagnostics: error.diagnostics });
+}
+
 impl From<Error> for Event {
     fn from(error: Error) -> Event {
         if error.diagnostics.is_empty() { Event::Note(error.message) } else { Event::BuildFailed { diagnostics: error.diagnostics } }
@@ -377,3 +389,7 @@ impl From<Error> for Event {
 #[cfg(test)]
 #[path = "incoming_tests.rs"]
 mod incoming_tests;
+
+#[cfg(test)]
+#[path = "build_tests.rs"]
+mod build_tests;
