@@ -16,6 +16,10 @@
 
 pub mod camera;
 pub mod frame;
+#[cfg(feature = "gltf")]
+pub mod gltf;
+#[cfg(feature = "gltf")]
+pub mod json;
 pub mod material;
 pub mod math;
 pub mod mesh;
@@ -32,6 +36,8 @@ pub mod wire;
 
 pub use math::{Aabb, Frustum, Mat4, Plane, Quat, Ray, Transform, Vec2, Vec3, Vec4, vec2, vec3, vec4};
 pub use camera::{Camera, Flight, Lens};
+#[cfg(feature = "gltf")]
+pub use gltf::{Asset, AssetNode, GltfError};
 pub use frame::{Background, Blend, Draw, DrawKind, Pass, Quality, WorldFrame, WorldStyle};
 pub use material::{AlphaMode, Light, LineDepth, LineStyle, Material, Model, PointLight, Sun, SunFrame};
 pub use mesh::{Lines, Mesh, MeshData};

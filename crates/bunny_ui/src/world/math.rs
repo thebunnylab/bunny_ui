@@ -297,6 +297,27 @@ impl Quat {
         Quat { x: axis.x, y: axis.y, z: axis.z, w: 1.0 + cos }.normalized()
     }
 
+    /// The rotation of a matrix whose upper 3×3 turns without scaling:
+    /// columns of unit length, right-handed.
+    pub fn from_rotation_matrix(matrix: &Mat4) -> Quat {
+        let m = |row: usize, col: usize| matrix.at(row, col);
+        let trace = m(0, 0) + m(1, 1) + m(2, 2);
+        let q = if trace > 0.0 {
+            let s = (trace + 1.0).sqrt() * 2.0;
+            Quat { w: 0.25 * s, x: (m(2, 1) - m(1, 2)) / s, y: (m(0, 2) - m(2, 0)) / s, z: (m(1, 0) - m(0, 1)) / s }
+        } else if m(0, 0) > m(1, 1) && m(0, 0) > m(2, 2) {
+            let s = (1.0 + m(0, 0) - m(1, 1) - m(2, 2)).sqrt() * 2.0;
+            Quat { w: (m(2, 1) - m(1, 2)) / s, x: 0.25 * s, y: (m(0, 1) + m(1, 0)) / s, z: (m(0, 2) + m(2, 0)) / s }
+        } else if m(1, 1) > m(2, 2) {
+            let s = (1.0 + m(1, 1) - m(0, 0) - m(2, 2)).sqrt() * 2.0;
+            Quat { w: (m(0, 2) - m(2, 0)) / s, x: (m(0, 1) + m(1, 0)) / s, y: 0.25 * s, z: (m(1, 2) + m(2, 1)) / s }
+        } else {
+            let s = (1.0 + m(2, 2) - m(0, 0) - m(1, 1)).sqrt() * 2.0;
+            Quat { w: (m(1, 0) - m(0, 1)) / s, x: (m(0, 2) + m(2, 0)) / s, y: (m(1, 2) + m(2, 1)) / s, z: 0.25 * s }
+        };
+        q.normalized()
+    }
+
     pub fn dot(self, other: Quat) -> f64 {
         self.x * other.x + self.y * other.y + self.z * other.z + self.w * other.w
     }
@@ -751,6 +772,26 @@ impl Transform {
     pub const IDENTITY: Transform =
         Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE };
 
+    /// The scale, rotation and translation of an affine matrix. A mirror
+    /// lands in the scale of x; a shear is not kept.
+    pub fn from_matrix(matrix: &Mat4) -> Transform {
+        let column = |c: usize| vec3(matrix.at(0, c), matrix.at(1, c), matrix.at(2, c));
+        let (x, y, z) = (column(0), column(1), column(2));
+        let mut scale = vec3(x.length(), y.length(), z.length());
+        if matrix.determinant() < 0.0 {
+            scale.x = -scale.x;
+        }
+        let safe = |s: f64| if s.abs() > 1e-300 { s } else { 1.0 };
+        let mut turn = Mat4::IDENTITY;
+        for (c, (axis, s)) in [(x, scale.x), (y, scale.y), (z, scale.z)].into_iter().enumerate() {
+            let unit = axis / safe(s);
+            turn.m[c * 4] = unit.x;
+            turn.m[c * 4 + 1] = unit.y;
+            turn.m[c * 4 + 2] = unit.z;
+        }
+        Transform { translation: matrix.translation_part(), rotation: Quat::from_rotation_matrix(&turn), scale }
+    }
+
     pub fn from_translation(translation: Vec3) -> Transform {
         Transform { translation, ..Transform::IDENTITY }
     }
@@ -1169,6 +1210,21 @@ mod tests {
             .with_scale(vec3(2.0, 0.5, 3.0));
         let point = vec3(0.3, -1.2, 4.0);
         assert!(close3(transform.matrix().transform_point(point), transform.transform_point(point)));
+    }
+
+    #[test]
+    fn a_matrix_comes_apart_into_its_transform() {
+        let mut seed = Seed(7);
+        for _ in 0..200 {
+            let rotation = Quat::from_axis_angle(vec3(seed.next(), seed.next(), seed.next()), seed.next() * 3.1);
+            let mut scale = vec3(0.3 + seed.next().abs(), 0.3 + seed.next().abs(), 0.3 + seed.next().abs());
+            if seed.next() < 0.0 {
+                scale.x = -scale.x;
+            }
+            let transform = Transform { translation: vec3(seed.next(), seed.next(), seed.next()) * 9.0, rotation, scale };
+            let back = Transform::from_matrix(&transform.matrix());
+            assert!(close_mat(&back.matrix(), &transform.matrix()), "{transform:?} came back as {back:?}");
+        }
     }
 
     #[test]
