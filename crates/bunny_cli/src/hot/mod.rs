@@ -164,8 +164,9 @@ pub struct Reloaded {
 
 /// Why a hot reload did not land.
 pub enum Missed {
-    /// The build failed, and cargo said why. The app keeps its code.
-    Build,
+    /// The build failed. Keep its diagnostics or failure message; the app
+    /// keeps its code.
+    Build(Error),
     /// Only a restart carries this change — and what it is.
     Restart(String),
     /// The app refused the new code, or did not answer.
@@ -451,7 +452,7 @@ impl Hot {
         }
         let new_types = reaches_types_under(&self.project.dir, &self.sources, &sources);
         let salt = if new_types { self.salt + 1 } else { self.salt };
-        let (generation, rebuilt) = self.build_generation(salt).map_err(|_| Missed::Build)?;
+        let (generation, rebuilt) = self.build_generation(salt).map_err(Missed::Build)?;
         // a sibling built again is the save that was just made; anything
         // else built again — the framework, a registry crate — is a restart
         if let Some(dependency) = rebuilt.iter().find(|name| !self.locals.iter().any(|local| !local.framework && local.name == **name)) {

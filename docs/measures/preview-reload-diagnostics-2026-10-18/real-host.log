@@ -1,0 +1,23 @@
+   Compiling bunny-cli v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-history-responder/bunny_ui/crates/bunny_cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.52s
+     Running tests/preview_host.rs (target/debug/deps/preview_host-273e06e0edcf4718)
+
+running 1 test
+@@bunny-timing cold_build 2214.4
+@@bunny-timing warm_start 434.8
+@@bunny-timing app_frame 434.8
+@@bunny-timing click 1.5
+@@bunny-timing override 1.5
+@@bunny-timing save 462.6
+@@bunny-timing sibling_save 482.3
+@@bunny-timing instance_click 2.8
+@@bunny-timing instance_save 571.0
+@@bunny-timing png 587.2
+@@bunny-timing page_png 2284.0
+@@bunny-timing snapshot_new 491.4
+@@bunny-timing snapshot_same 470.4
+@@bunny-timing snapshot_differs 1338.6
+test the_preview_road_frames_clicks_and_survives_a_swap ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.07s
+
