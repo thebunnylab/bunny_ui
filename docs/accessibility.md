@@ -51,6 +51,13 @@ semantic nodes with `enabled = false` and reject actions. Checkboxes expose
 unavailable requests return distinct errors. Successful actions request a
 frame. Snapshots report current keyboard focus without requesting a frame.
 
+Successful `Activate` follows the pointer's keyboard-ownership rule after the
+callback: a focusable control receives focus, including its containing editor's
+standard edit commands. Explicit `.leaves_keyboard()` chrome preserves the
+current owner. This also gives forms an invoking control to restore when they
+close; it does not install a global edit-command fallback or change a focused
+text field's own history. Rejected actions leave focus unchanged.
+
 ## macOS adapter
 
 The AppKit shell exposes these controls through `NSAccessibilityElement` proxies

@@ -337,6 +337,16 @@ mod probe {
             );
             assert_eq!(form.presses.get(), 1);
             assert_eq!(
+                boolean(named(view, "Save"), sel("isAccessibilityFocused")),
+                1
+            );
+            assert_eq!(boolean(field, sel("isAccessibilityFocused")), 0);
+            assert_eq!(
+                object(view, sel("accessibilityFocusedUIElement")),
+                named(view, "Save"),
+                "native press transfers keyboard ownership to the invoked button"
+            );
+            assert_eq!(
                 named(view, "Updated name"),
                 field,
                 "a changing name keeps the native object"
@@ -351,9 +361,8 @@ mod probe {
                 boolean(object(check, sel("accessibilityValue")), sel("boolValue")),
                 0
             );
-            set_bool(check, sel("setAccessibilityFocused:"), 1);
-            assert_eq!(boolean(check, sel("isAccessibilityFocused")), 1);
             assert_eq!(boolean(check, sel("accessibilityPerformPress")), 1);
+            assert_eq!(boolean(check, sel("isAccessibilityFocused")), 1);
             assert!(form.checked.get());
             assert_eq!(
                 boolean(object(check, sel("accessibilityValue")), sel("boolValue")),

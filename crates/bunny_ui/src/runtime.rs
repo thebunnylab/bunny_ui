@@ -2865,18 +2865,24 @@ impl Runtime {
         let activated = fired
             .as_deref()
             .is_some_and(|path| reconciler::run_action_with_modifiers(path, clicks, modifiers));
+        self.focus_after_activation(fired.as_deref());
+        fired.filter(|_| activated)
+    }
+
+    /// Pointer and accessibility invocation leave the same keyboard owner.
+    fn focus_after_activation(&self, fired: Option<&str>) {
         // the keyboard follows the click: to the view that answers a copy
         // for what was clicked (the row's table), and away from every
         // field otherwise — first responder follows the click. Chrome is
         // the exception (`.leaves_keyboard()`): a menu's row, a toolbar
         // button, and the keyboard stays where it was
-        if !fired.as_deref().is_some_and(reconciler::leaves_keyboard) {
-            let control = fired.as_deref().and_then(|path| {
+        if !fired.is_some_and(reconciler::leaves_keyboard) {
+            let control = fired.and_then(|path| {
                 self.last_focus_order.borrow().iter().find(|stop| stop.path.as_ref() == path && stop.control.is_some()).cloned()
             });
             match control {
                 Some(stop) => self.focus_stop(&stop),
-                None => match fired.as_deref().and_then(reconciler::copy_owner) {
+                None => match fired.and_then(reconciler::copy_owner) {
                 Some(owner) => self.focus_element(&owner),
                 None => {
                     self.blur();
@@ -2884,7 +2890,6 @@ impl Runtime {
                 },
             }
         }
-        fired.filter(|_| activated)
     }
 
     /// What the pointer should look like where it is — the box under it
@@ -8156,7 +8161,11 @@ impl Runtime {
         if !node.supports(&action) { return Err(ActionError::Unsupported); }
         self.enter_scene();
         let applied = match action {
-            Action::Activate => reconciler::run_action(&node.path, 1),
+            Action::Activate => {
+                let applied = reconciler::run_action(&node.path, 1);
+                if applied { self.focus_after_activation(Some(&node.path)); }
+                applied
+            }
             Action::Focus => {
                 let stop = self.last_focus_order.borrow().iter().skip(self.last_focus_floor.get())
                     .find(|stop| stop.path == node.path).cloned().ok_or(ActionError::Unavailable)?;

@@ -90,6 +90,39 @@ fn a_pointer_close_returns_to_the_invoker_and_its_edit_responder() {
 }
 
 #[test]
+fn accessibility_open_and_close_preserve_the_invoking_edit_scope() {
+    use bunny_ui_core::accessibility::Action;
+    let runtime = Runtime::new();
+    runtime.set_accessibility_enabled(true);
+    let form = Form::new();
+    runtime.display_frame(&form, SIZE);
+    let invoke = |label: &str| {
+        let tree = runtime.accessibility_tree();
+        let id = tree
+            .nodes()
+            .iter()
+            .find(|node| node.label.as_ref() == label)
+            .unwrap()
+            .id;
+        runtime.accessibility_action(id, Action::Activate).unwrap();
+        runtime.display_frame(&form, SIZE);
+    };
+    invoke("Open");
+    assert!(form.open.get());
+    let owner = runtime
+        .focused()
+        .expect("accessible invocation has a return address");
+    assert!(owner.contains("[open]"));
+    assert!(runtime.focus_named("value"));
+    assert!(runtime.key(EditCommand::Insert("draft".into())).applied);
+    invoke("Apply");
+    assert!(!form.open.get());
+    assert_eq!(runtime.focused(), Some(owner));
+    assert!(runtime.menu_pick(Pick::Edit(Edit::Undo)));
+    assert_eq!(form.undos.get(), 1);
+}
+
+#[test]
 fn tab_to_cancel_keeps_the_return_address_across_reopenings() {
     let runtime = Runtime::new();
     let form = Form::new();
