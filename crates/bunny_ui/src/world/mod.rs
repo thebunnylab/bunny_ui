@@ -23,6 +23,7 @@ pub mod orbit;
 pub mod pick;
 pub mod polygon;
 pub mod shade;
+pub mod soft;
 pub mod store;
 pub mod wire;
 
@@ -33,6 +34,7 @@ pub use material::{AlphaMode, Light, LineDepth, LineStyle, Material, Model, Poin
 pub use mesh::{Lines, Mesh, MeshData};
 pub use orbit::{Orbit, OrbitLimits};
 pub use pick::Hit;
+pub use soft::Picture;
 pub use store::{Entity, EntityId, EntitySpec, Shape, World, WorldEdit};
 
 /// A fresh identity for a mesh, a set of lines or a world. One counter

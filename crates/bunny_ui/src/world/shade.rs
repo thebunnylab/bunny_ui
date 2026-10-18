@@ -82,6 +82,175 @@ pub fn quantize(code: f32, dither: f32) -> u8 {
     (code + 0.5 + dither).floor().clamp(0.0, 255.0) as u8
 }
 
+// MARK: - Bunny Lit v1
+//
+// The shading every tier evaluates, written once here for the CPU and
+// mirrored by the shaders operation for operation. Inputs are in the
+// eye's space; colours are linear light.
+
+pub type V3 = [f32; 3];
+
+pub fn dot(a: V3, b: V3) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+pub fn scale(a: V3, k: f32) -> V3 {
+    [a[0] * k, a[1] * k, a[2] * k]
+}
+
+pub fn add(a: V3, b: V3) -> V3 {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+pub fn mul(a: V3, b: V3) -> V3 {
+    [a[0] * b[0], a[1] * b[1], a[2] * b[2]]
+}
+
+pub fn mix(a: V3, b: V3, t: f32) -> V3 {
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+}
+
+pub fn normalize(a: V3) -> V3 {
+    let length = dot(a, a).sqrt();
+    if length > 0.0 { scale(a, 1.0 / length) } else { [0.0, 0.0, 1.0] }
+}
+
+pub fn saturate(x: f32) -> f32 {
+    x.clamp(0.0, 1.0)
+}
+
+/// `2^x` for `x ≤ 0`, by the exponent bits and a fixed polynomial on
+/// the fraction — the same number on every machine, within 3·10⁻⁷ of the
+/// truth.
+pub fn exp2(x: f32) -> f32 {
+    let x = x.max(-126.0);
+    let whole = x.floor();
+    let f = x - whole;
+    let fraction = 0.99999976 + f * (0.6931568 + f * (0.24013178 + f * (0.05587644 + f * (0.00894063 + f * 0.0018943873))));
+    let power = f32::from_bits(((whole as i32 + 127) as u32) << 23);
+    power * fraction
+}
+
+/// The sky over a surface that faces `direction`: the ground's light
+/// below, the sky's above, blended by how much it faces up.
+pub fn hemisphere(direction: V3, up: V3, sky: V3, ground: V3) -> V3 {
+    mix(ground, sky, 0.5 + 0.5 * dot(direction, up))
+}
+
+/// How much light a surface reflects from its surroundings at an angle,
+/// with no picture of the surroundings: a fitted curve.
+pub fn environment_brdf(f0: V3, roughness: f32, n_dot_v: f32) -> V3 {
+    let r = [
+        1.0 - roughness,
+        roughness * -0.0275 + 0.0425,
+        roughness * -0.572 + 1.04,
+        roughness * 0.022 - 0.04,
+    ];
+    let a004 = (r[0] * r[0]).min(exp2(-9.28 * n_dot_v)) * r[0] + r[1];
+    let (a, b) = (-1.04 * a004 + r[2], 1.04 * a004 + r[3]);
+    [f0[0] * a + b, f0[1] * a + b, f0[2] * a + b]
+}
+
+/// The tone curve: the identity below the knee, a soft shoulder above it
+/// that keeps the hue, and the hottest light bleaching toward white.
+pub fn tone(color: V3, exposure: f32, knee: f32) -> V3 {
+    let mut c = scale(color, exposure);
+    let m = c[0].max(c[1]).max(c[2]);
+    if m > knee {
+        let f = knee + (1.0 - knee) * (m - knee) / ((1.0 - knee) + (m - knee));
+        c = scale(c, f / m);
+        let t = saturate((m - 1.0) / 3.0);
+        let bleach = 0.6 * t * t * (3.0 - 2.0 * t);
+        c = mix(c, [f, f, f], bleach);
+    }
+    [saturate(c[0]), saturate(c[1]), saturate(c[2])]
+}
+
+/// The 4×4 ordered dither at a pixel, in `(−½, ½)`.
+pub fn bayer(x: u32, y: u32) -> f32 {
+    const B: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+    (B[(y & 3) as usize][(x & 3) as usize] as f32 + 0.5) / 16.0 - 0.5
+}
+
+/// A surface point as a shader sees it.
+#[derive(Clone, Copy, Debug)]
+pub struct Surface {
+    /// Eye-space position.
+    pub position: V3,
+    /// Eye-space unit normal, on the side the eye sees.
+    pub normal: V3,
+    /// Linear base colour (alpha apart).
+    pub base: V3,
+    pub roughness: f32,
+    pub metallic: f32,
+    pub emissive: V3,
+    /// Baked light from the surroundings, 1 = nothing in the way.
+    pub occlusion: f32,
+    /// The light groups the surface belongs to.
+    pub groups: u32,
+}
+
+/// The light a surface sends toward the eye, before the tone curve.
+pub fn lit(u: &super::wire::FrameUniforms, surface: &Surface) -> V3 {
+    let n = surface.normal;
+    let parallel = u.params[3] > 0.5;
+    let v = if parallel { [0.0, 0.0, 1.0] } else { normalize(scale(surface.position, -1.0)) };
+    let n_dot_v = dot(n, v).clamp(1e-4, 1.0);
+    let metal = saturate(surface.metallic);
+    let diffuse = scale(surface.base, 1.0 - metal);
+    let f0 = mix([0.04, 0.04, 0.04], surface.base, metal);
+    let r = surface.roughness.clamp(0.045, 1.0);
+    let (a, a2) = (r * r, r * r * r * r);
+    let up = [u.sky_up[0], u.sky_up[1], u.sky_up[2]];
+    let (sky, ground) = ([u.sky_color[0], u.sky_color[1], u.sky_color[2]], [u.ground_color[0], u.ground_color[1], u.ground_color[2]]);
+    let ao = 1.0 + (surface.occlusion - 1.0) * 0.8;
+
+    let mut light = scale(mul(diffuse, hemisphere(n, up, sky, ground)), ao);
+    let reflected = add(scale(n, 2.0 * dot(n, v)), scale(v, -1.0));
+    light = add(light, scale(mul(environment_brdf(f0, r, n_dot_v), hemisphere(reflected, up, sky, ground)), ao));
+
+    if u.sun_direction[3] > 0.5 {
+        let l = [u.sun_direction[0], u.sun_direction[1], u.sun_direction[2]];
+        let n_dot_l = saturate(dot(n, l));
+        if n_dot_l > 0.0 {
+            let h = normalize(add(l, v));
+            let (n_dot_h, v_dot_h) = (saturate(dot(n, h)), saturate(dot(v, h)));
+            let q = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+            // π·D cancels the 1/π of the distribution
+            let pi_d = a2 / (q * q);
+            let visibility = 0.5 / (2.0 * n_dot_l * n_dot_v + (n_dot_l + n_dot_v - 2.0 * n_dot_l * n_dot_v) * a).max(1e-5);
+            let x = 1.0 - v_dot_h;
+            let x5 = x * x * x * x * x;
+            let fresnel = add(f0, scale(add([1.0, 1.0, 1.0], scale(f0, -1.0)), x5));
+            let specular = scale(fresnel, pi_d * visibility);
+            let sun = [u.sun_color[0], u.sun_color[1], u.sun_color[2]];
+            light = add(light, scale(mul(add(diffuse, specular), sun), n_dot_l));
+        }
+    }
+
+    let points = u.counts[0] as usize;
+    for i in 0..points.min(super::wire::MAX_POINTS) {
+        if u.point_groups[i / 4][i % 4] & surface.groups == 0 {
+            continue;
+        }
+        let p = u.point_position[i];
+        let to = [p[0] - surface.position[0], p[1] - surface.position[1], p[2] - surface.position[2]];
+        let d2 = dot(to, to);
+        let range2 = p[3] * p[3];
+        if d2 >= range2 || range2 <= 0.0 {
+            continue;
+        }
+        let l = scale(to, 1.0 / d2.max(1e-8).sqrt());
+        let w = saturate(1.0 - d2 / range2);
+        let r0 = u.point_color[i][3];
+        let attenuation = w * w * (r0 * r0) / (d2 + r0 * r0).max(1e-8);
+        let color = [u.point_color[i][0], u.point_color[i][1], u.point_color[i][2]];
+        light = add(light, scale(mul(diffuse, color), attenuation * saturate(dot(n, l))));
+    }
+
+    add(light, surface.emissive)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +265,27 @@ mod tests {
         assert_eq!(encode(-1.0), 0);
         assert_eq!(encode(f32::NAN), 0);
         assert_eq!(encode(2.0), 255);
+    }
+
+    #[test]
+    fn the_fixed_exp2_follows_the_true_one() {
+        for i in 0..=1000 {
+            let x = -10.0 * i as f32 / 1000.0;
+            let truth = (x as f64).exp2();
+            let ours = exp2(x) as f64;
+            assert!((ours - truth).abs() <= 3e-7 * truth.max(1e-3), "2^{x}: {ours} vs {truth}");
+        }
+        assert_eq!(exp2(0.0), 0.99999976);
+    }
+
+    #[test]
+    fn the_tone_curve_keeps_the_house_colours() {
+        // below the knee nothing moves
+        assert_eq!(tone([0.57, 0.3, 0.1], 1.0, 0.8), [0.57, 0.3, 0.1]);
+        // above it the hue holds and the value stays inside one
+        let toned = tone([3.0, 1.5, 0.75], 1.0, 0.8);
+        assert!(toned.iter().all(|c| *c <= 1.0));
+        assert!(toned[0] > toned[1] && toned[1] > toned[2]);
     }
 
     #[test]
