@@ -168,10 +168,12 @@ impl Orbit {
     }
 }
 
-/// The world point under the pointer: the plane through the target,
-/// facing the eye. (A pick of the world's surfaces takes the first word
-/// once picking exists.)
-fn pivot_at(camera: &Camera, at: Point, size: Size, _world: World) -> Vec3 {
+/// The world point under the pointer: the surface there, or else the
+/// plane through the target, facing the eye.
+fn pivot_at(camera: &Camera, at: Point, size: Size, world: World) -> Vec3 {
+    if let Some(hit) = world.pick(camera, at, size) {
+        return hit.point;
+    }
     let ray = camera.ray(at, size);
     let plane = Plane::new(camera.target, -camera.forward());
     match camera.lens {

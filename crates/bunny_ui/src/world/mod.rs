@@ -19,6 +19,7 @@ pub mod material;
 pub mod math;
 pub mod mesh;
 pub mod orbit;
+pub mod pick;
 pub mod polygon;
 pub mod store;
 
@@ -27,6 +28,7 @@ pub use camera::{Camera, Flight, Lens};
 pub use material::{AlphaMode, Light, LineDepth, LineStyle, Material, Model, PointLight, Sun, SunFrame};
 pub use mesh::{Lines, Mesh, MeshData};
 pub use orbit::{Orbit, OrbitLimits};
+pub use pick::Hit;
 pub use store::{Entity, EntityId, EntitySpec, Shape, World, WorldEdit};
 
 /// A fresh identity for a mesh, a set of lines or a world. One counter

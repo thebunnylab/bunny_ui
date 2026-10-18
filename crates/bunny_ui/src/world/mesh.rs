@@ -164,6 +164,8 @@ struct MeshInner {
     generation: u64,
     data: MeshData,
     bounds: Aabb,
+    /// Built the first time a ray asks, kept for the revision.
+    bvh: std::cell::OnceCell<super::pick::Bvh>,
 }
 
 impl std::fmt::Debug for Mesh {
@@ -196,7 +198,7 @@ impl Mesh {
     fn with_identity(id: u64, generation: u64, data: MeshData) -> Mesh {
         let data = sanitize(data);
         let bounds = Aabb::from_points(data.positions.iter().map(|&p| to_vec(p)));
-        Mesh(Rc::new(MeshInner { id, generation, data, bounds }))
+        Mesh(Rc::new(MeshInner { id, generation, data, bounds, bvh: std::cell::OnceCell::new() }))
     }
 
     /// The same mesh with a new shape: the identity stays, the
@@ -221,6 +223,11 @@ impl Mesh {
     /// The box around every vertex, in model space.
     pub fn bounds(&self) -> Aabb {
         self.0.bounds
+    }
+
+    /// The mesh's bounding volume hierarchy, built on first use.
+    pub(crate) fn bvh(&self) -> &super::pick::Bvh {
+        self.0.bvh.get_or_init(|| super::pick::Bvh::build(&self.0.data))
     }
 
     pub fn vertex_count(&self) -> usize {

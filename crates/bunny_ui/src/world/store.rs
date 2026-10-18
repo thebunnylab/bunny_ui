@@ -546,6 +546,10 @@ impl std::fmt::Debug for Entity {
 }
 
 impl Entity {
+    pub(crate) fn from_parts(world: World, id: EntityId) -> Entity {
+        Entity { world, id }
+    }
+
     pub fn id(&self) -> EntityId {
         self.id
     }
