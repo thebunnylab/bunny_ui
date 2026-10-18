@@ -193,7 +193,15 @@ thread_local! {
 
 /// The world drawn on the CPU at exactly `width × height`, straight alpha,
 /// the veil multiplied in — once per picture and size.
-pub(crate) fn world_raster(key: u64, generation: u64, veil: u8, shot: &Shot, width: usize, height: usize) -> Option<Rc<ImageRaster>> {
+pub(crate) fn world_raster(
+    images: &dyn crate::image_engine::ImageEngine,
+    key: u64,
+    generation: u64,
+    veil: u8,
+    shot: &Shot,
+    width: usize,
+    height: usize,
+) -> Option<Rc<ImageRaster>> {
     if width == 0 || height == 0 {
         return None;
     }
@@ -201,7 +209,8 @@ pub(crate) fn world_raster(key: u64, generation: u64, veil: u8, shot: &Shot, wid
     if let Some(hit) = WORLD_RASTERS.with(|cache| cache.borrow().iter().find(|(held, _)| *held == id).map(|(_, raster)| Rc::clone(raster))) {
         return Some(hit);
     }
-    let picture = super::soft::draw(&shot.frame((width as u32, height as u32)));
+    let frame = shot.frame((width as u32, height as u32));
+    let picture = super::soft::draw_with(&frame, &|index| super::texture::texture_of(images, &frame.textures[index]));
     let mut rgba = picture.unpremultiplied();
     if veil < 255 {
         for pixel in rgba.chunks_exact_mut(4) {

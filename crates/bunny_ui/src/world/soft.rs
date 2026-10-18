@@ -13,9 +13,12 @@
 //! RGBA8, the top row first. The same frame gives the same bytes on every
 //! machine.
 
+use std::rc::Rc;
+
 use super::frame::{Background, Blend, DrawKind, WorldFrame};
 use super::mesh::{fold_normal, unfold_normal};
 use super::shade::{self, Surface, V3, decode, encode_code, quantize};
+use super::texture::{Texture, log2};
 use super::wire::{FrameUniforms, InstanceData, material_flag};
 
 /// A picture of a world: premultiplied, sRGB-encoded RGBA8, top row
@@ -52,8 +55,14 @@ impl Picture {
     }
 }
 
-/// Draws the frame.
+/// Draws the frame, with no texture: a textured surface shows its colour.
 pub fn draw(frame: &WorldFrame) -> Picture {
+    draw_with(frame, &|_| None)
+}
+
+/// Draws the frame; `textures` gives the texture of each of the frame's
+/// textures by index, `None` while it is not decoded.
+pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Texture>>) -> Picture {
     let (width, height) = (frame.size.0.max(1), frame.size.1.max(1));
     let mut target = Target {
         width,
@@ -65,12 +74,13 @@ pub fn draw(frame: &WorldFrame) -> Picture {
     let projection = frame.uniforms.clip_from_eye;
     for draw in &frame.draws {
         match draw.kind {
-            DrawKind::Mesh { mesh, first_index, index_count, cull_back, mirrored, blend, mask, .. } => {
+            DrawKind::Mesh { mesh, first_index, index_count, texture, cull_back, mirrored, blend, mask } => {
+                let texture = texture.and_then(|index| textures(index as usize));
                 let mesh = &frame.meshes[mesh as usize];
                 let corners = Corners::of(mesh);
                 let indices = &mesh.data().indices[first_index as usize..(first_index + index_count) as usize];
                 for instance in &frame.instances[draw.first_instance as usize..(draw.first_instance + draw.instance_count) as usize] {
-                    let job = Job { frame, instance, cull_back, mirrored, blend, mask };
+                    let job = Job { frame, instance, cull_back, mirrored, blend, mask, texture: texture.as_deref() };
                     for triangle in indices.chunks_exact(3) {
                         let vertices = [0, 1, 2].map(|k| corners.vertex(triangle[k] as usize, instance, &projection));
                         job.triangle(&mut target, vertices);
@@ -99,6 +109,20 @@ impl super::store::World {
             style.quality = super::frame::Quality::Low;
         }
         draw(&self.frame(camera, &style, size, px_per_point))
+    }
+
+    /// [`World::render`] with textures, decoded by `images`.
+    pub fn render_with(
+        &self,
+        images: &dyn crate::image_engine::ImageEngine,
+        camera: &super::camera::Camera,
+        style: &super::frame::WorldStyle,
+        size: (u32, u32),
+        px_per_point: f32,
+    ) -> Picture {
+        let style = super::frame::WorldStyle { quality: super::frame::Quality::Low, ..style.clone() };
+        let frame = self.frame(camera, &style, size, px_per_point);
+        draw_with(&frame, &|index| super::texture::texture_of(images, &frame.textures[index]))
     }
 }
 
@@ -183,6 +207,7 @@ impl<'a> Corners<'a> {
             clip: clip_of(projection, eye),
             eye,
             normal,
+            uv: if data.uvs.len() == count { data.uvs[index] } else { [0.0, 0.0] },
             color: [decode(color[0]), decode(color[1]), decode(color[2]), color[3] as f32 / 255.0],
             material: if data.materials.len() == count { data.materials[index] as u32 } else { 0 },
             occlusion: if data.occlusion.len() == count { data.occlusion[index] as f32 / 255.0 } else { 1.0 },
@@ -204,6 +229,7 @@ struct Vertex {
     clip: [f32; 4],
     eye: [f32; 3],
     normal: [f32; 3],
+    uv: [f32; 2],
     /// Linear, straight alpha.
     color: [f32; 4],
     /// The slot in the instance's materials (flat across a triangle).
@@ -217,6 +243,7 @@ fn lerp_vertex(a: &Vertex, b: &Vertex, t: f32) -> Vertex {
         clip: [0, 1, 2, 3].map(|k| l(a.clip[k], b.clip[k])),
         eye: [0, 1, 2].map(|k| l(a.eye[k], b.eye[k])),
         normal: [0, 1, 2].map(|k| l(a.normal[k], b.normal[k])),
+        uv: [0, 1].map(|k| l(a.uv[k], b.uv[k])),
         color: [0, 1, 2, 3].map(|k| l(a.color[k], b.color[k])),
         material: a.material,
         occlusion: l(a.occlusion, b.occlusion),
@@ -270,6 +297,7 @@ struct Job<'a> {
     mirrored: bool,
     blend: Blend,
     mask: bool,
+    texture: Option<&'a Texture>,
 }
 
 /// A corner on the screen: fixed-point position, depth, `1/w`.
@@ -361,10 +389,27 @@ impl Job<'_> {
                 if !(0.0..=1.0).contains(&z) || z >= target.depth[index] {
                     continue;
                 }
-                let weights = [lambda[0] * s0.inv_w, lambda[1] * s1.inv_w, lambda[2] * s2.inv_w];
-                let sum = weights[0] + weights[1] + weights[2];
-                let b = weights.map(|weight| weight / sum);
-                let Some(color) = self.shade(vertices, b, front, px as u32, py as u32) else { continue };
+                let correct = |e: [i64; 3]| {
+                    let l = e.map(|value| (value as f64 * inv_area) as f32);
+                    let w = [l[0] * s0.inv_w, l[1] * s1.inv_w, l[2] * s2.inv_w];
+                    let sum = w[0] + w[1] + w[2];
+                    w.map(|weight| weight / sum)
+                };
+                let b = correct(e);
+                let texel = self.texture.map(|texture| {
+                    let uv_at = |b: [f32; 3]| [0, 1].map(|k| vertices[0].uv[k] * b[0] + vertices[1].uv[k] * b[1] + vertices[2].uv[k] * b[2]);
+                    let uv = uv_at(b);
+                    // the screen derivatives of uv, by the neighbours' centres
+                    let right = uv_at(correct(edges.map(|(a, c)| edge(a, c, (at.0 + 256, at.1)))));
+                    let below = uv_at(correct(edges.map(|(a, c)| edge(a, c, (at.0, at.1 + 256)))));
+                    let level = &texture.levels[0];
+                    let (w, h) = (level.width as f32, level.height as f32);
+                    let dx = ((right[0] - uv[0]) * w, (right[1] - uv[1]) * h);
+                    let dy = ((below[0] - uv[0]) * w, (below[1] - uv[1]) * h);
+                    let rho2 = (dx.0 * dx.0 + dx.1 * dx.1).max(dy.0 * dy.0 + dy.1 * dy.1);
+                    texture.sample(uv[0], uv[1], 0.5 * log2(rho2.max(1e-12)))
+                });
+                let Some(color) = self.shade(vertices, b, front, texel, px as u32, py as u32) else { continue };
                 if opaque {
                     target.depth[index] = z;
                 }
@@ -375,7 +420,7 @@ impl Job<'_> {
 
     /// The colour of a fragment, premultiplied in codes; `None` when it is
     /// discarded.
-    fn shade(&self, v: [&Vertex; 3], b: [f32; 3], front: bool, x: u32, y: u32) -> Option<[f32; 4]> {
+    fn shade(&self, v: [&Vertex; 3], b: [f32; 3], front: bool, texel: Option<[f32; 4]>, x: u32, y: u32) -> Option<[f32; 4]> {
         let u: &FrameUniforms = &self.frame.uniforms;
         let mix3 = |f: fn(&Vertex) -> [f32; 3]| -> V3 {
             let (a, c, d) = (f(v[0]), f(v[1]), f(v[2]));
@@ -389,7 +434,10 @@ impl Job<'_> {
         let material = &self.frame.materials[(self.instance.material_base + v[0].material) as usize];
         let flags = material.params[3] as u32;
         let tint = self.instance.tint;
-        let color = [0, 1, 2, 3].map(|k| v[0].color[k] * b[0] + v[1].color[k] * b[1] + v[2].color[k] * b[2]);
+        let mut color = [0, 1, 2, 3].map(|k| v[0].color[k] * b[0] + v[1].color[k] * b[1] + v[2].color[k] * b[2]);
+        if let Some(texel) = texel {
+            color = [0, 1, 2, 3].map(|k| color[k] * texel[k]);
+        }
         let two_sided = material.back[3] > 0.5;
         let surface = if front || !two_sided { material.base } else { [material.back[0], material.back[1], material.back[2], material.base[3]] };
         let base = [0, 1, 2].map(|k| surface[k] * decode(tint[k]) * color[k]);
@@ -565,6 +613,7 @@ mod tests {
         Mesh::new(MeshData {
             positions: vec![[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [1.0, 1.0, 0.0], [-1.0, 1.0, 0.0]],
             normals: vec![[0.0, 0.0, 1.0]; 4],
+            uvs: vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
             indices: vec![0, 1, 2, 0, 2, 3],
             ..MeshData::default()
         })
@@ -747,6 +796,32 @@ mod tests {
         assert_eq!(picture.at(40, 24), [0, 0, 0, 0], "the cut half is gone");
         assert!(picture.at(24, 40)[0] > 150, "the edge on the kept side stays");
         assert_eq!(picture.at(40, 40), [0, 0, 0, 0], "the edge on the cut side is cut too");
+    }
+
+    #[test]
+    fn a_textured_sheet_is_crisp_near_and_its_average_far() {
+        use crate::image_engine::{ImageSource, RawImages};
+        let side = 64u32;
+        let checker: Vec<u8> = (0..side * side)
+            .flat_map(|i| if ((i % side) / 8 + (i / side) / 8).is_multiple_of(2) { [255, 255, 255, 255] } else { [0, 0, 0, 255] })
+            .collect();
+        let picture = ImageSource::from_bytes(RawImages::encode(side, side, &checker));
+        let images = RawImages::default();
+        let world = World::new();
+        world.add(square(), Material::unlit(Color::WHITE).texture(picture));
+        // near: the sheet fills the view, eight texels a square: crisp
+        let near = Camera::looking_at(vec3(0.0, 0.0, 1.0), Vec3::ZERO).parallel_height(2.0);
+        let close = world.render_with(&images, &near, &style(Background::Transparent), (64, 64), 1.0);
+        let values: std::collections::BTreeSet<u8> = (0..64).map(|x| close.at(x, 4)[0]).collect();
+        assert!(values.contains(&255) && values.contains(&0), "black and white squares: {values:?}");
+        // far: the sheet is four pixels wide, every square under a texel
+        let far = Camera::looking_at(vec3(0.0, 0.0, 1.0), Vec3::ZERO).parallel_height(32.0);
+        let small = world.render_with(&images, &far, &style(Background::Transparent), (64, 64), 1.0);
+        let middle = small.at(32, 32);
+        assert!((middle[0] as i32 - 188).abs() <= 3, "half the light: {middle:?}");
+        // and without the engine, the colour alone
+        let plain = world.render(&near, &style(Background::Transparent), (64, 64), 1.0);
+        assert_eq!(plain.at(10, 10), [255, 255, 255, 255]);
     }
 
     #[test]

@@ -648,7 +648,7 @@ pub fn raster_source(
         // the oracle draws the world where no tier does
         #[cfg(feature = "3d")]
         ImageSource::World { key, generation, veil, shot } => {
-            crate::world::view::world_raster(*key, *generation, *veil, shot, width, height)
+            crate::world::view::world_raster(engine, *key, *generation, *veil, shot, width, height)
         }
         #[cfg(not(feature = "3d"))]
         ImageSource::World { .. } => None,

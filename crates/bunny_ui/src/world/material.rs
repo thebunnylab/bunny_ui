@@ -3,8 +3,8 @@
 
 use std::rc::Rc;
 
-use super::math::Vec3;
-use super::mesh::Mesh;
+use super::math::{Mat4, Vec3};
+use super::mesh::{Mesh, MeshData};
 use crate::image_engine::ImageSource;
 use crate::layout::Color;
 
@@ -132,6 +132,60 @@ impl Model {
     /// One material for every vertex.
     pub fn single(mesh: Mesh, material: Material) -> Model {
         Model { mesh, materials: Rc::from(vec![material]) }
+    }
+
+    /// Many pieces as ONE model: one mesh, so one draw for all of them,
+    /// whatever their materials. Each piece is a model, placed by a
+    /// matrix, and its vertices take `part` as their part, so a piece can
+    /// still take a tint of its own or hide. Equal materials are kept
+    /// once. A model holds at most 256 materials: past that, a piece
+    /// takes the last one.
+    pub fn merge(pieces: impl IntoIterator<Item = (Model, Mat4, u16)>) -> Model {
+        let mut data = MeshData::default();
+        let mut materials: Vec<Material> = Vec::new();
+        for (model, matrix, part) in pieces {
+            let source = model.mesh.data();
+            let count = source.positions.len();
+            let base = data.positions.len() as u32;
+            let remap: Vec<u8> = model
+                .materials
+                .iter()
+                .map(|material| match materials.iter().position(|known| known == material) {
+                    Some(at) => at.min(255) as u8,
+                    None => {
+                        materials.push(material.clone());
+                        (materials.len() - 1).min(255) as u8
+                    }
+                })
+                .collect();
+            let normal = matrix.normal_matrix();
+            let turn = |n: [f32; 3]| {
+                let n = [n[0] as f64, n[1] as f64, n[2] as f64];
+                let row = |r: [f64; 3]| r[0] * n[0] + r[1] * n[1] + r[2] * n[2];
+                Vec3 { x: row(normal[0]), y: row(normal[1]), z: row(normal[2]) }.normalized().to_f32()
+            };
+            for i in 0..count {
+                let p = source.positions[i];
+                data.positions.push(matrix.transform_point(Vec3 { x: p[0] as f64, y: p[1] as f64, z: p[2] as f64 }).to_f32());
+                data.normals.push(turn(source.normals[i]));
+                data.uvs.push(if source.uvs.len() == count { source.uvs[i] } else { [0.0, 0.0] });
+                data.colors.push(if source.colors.len() == count { source.colors[i] } else { [255; 4] });
+                data.occlusion.push(if source.occlusion.len() == count { source.occlusion[i] } else { 255 });
+                let slot = if source.materials.len() == count { source.materials[i] as usize } else { 0 };
+                data.materials.push(remap.get(slot).or(remap.last()).copied().unwrap_or(0));
+                data.parts.push(part);
+            }
+            // a mirroring matrix turns the faces around: the corners turn back
+            let mirrored = matrix.determinant() < 0.0;
+            for triangle in source.indices.chunks_exact(3) {
+                let [a, b, c] = [triangle[0], triangle[1], triangle[2]].map(|i| base + i);
+                data.indices.extend_from_slice(&if mirrored { [a, c, b] } else { [a, b, c] });
+            }
+        }
+        if materials.is_empty() {
+            materials.push(Material::default());
+        }
+        Model::new(Mesh::new(data), materials)
     }
 }
 
@@ -297,5 +351,51 @@ impl From<Sun> for Light {
 impl From<PointLight> for Light {
     fn from(point: PointLight) -> Light {
         Light::Point(point)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::math::{Quat, Transform, vec3};
+
+    #[test]
+    fn merged_pieces_are_one_mesh_with_their_materials_and_parts() {
+        let red = Material::color(Color::rgb(200, 0, 0));
+        let blue = Material::color(Color::rgb(0, 0, 200));
+        let cube = Mesh::cuboid(1.0, 1.0, 1.0);
+        let pieces = vec![
+            (Model::single(cube.clone(), red.clone()), Mat4::translation(vec3(-2.0, 0.0, 0.0)), 1),
+            (Model::single(cube.clone(), blue.clone()), Mat4::IDENTITY, 2),
+            (Model::single(cube.clone(), red.clone()), Mat4::translation(vec3(2.0, 0.0, 0.0)), 3),
+        ];
+        let merged = Model::merge(pieces);
+        assert_eq!(merged.materials.len(), 2, "equal materials kept once");
+        assert_eq!(merged.mesh.triangle_count(), 36);
+        assert_eq!(merged.mesh.material_runs().len(), 2, "one run per material");
+        let bounds = merged.mesh.bounds();
+        assert_eq!((bounds.min.x, bounds.max.x), (-2.5, 2.5));
+        let parts: std::collections::BTreeSet<u16> = merged.mesh.data().parts.iter().copied().collect();
+        assert_eq!(parts.into_iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_mirrored_piece_still_faces_out() {
+        let cube = Model::single(Mesh::cuboid(1.0, 1.0, 1.0), Material::default());
+        let mirror = Transform::IDENTITY.with_scale(vec3(-1.0, 1.0, 1.0)).with_rotation(Quat::IDENTITY).matrix();
+        let merged = Model::merge(vec![(cube, mirror, 0)]);
+        let data = merged.mesh.data();
+        let volume: f64 = data
+            .indices
+            .chunks_exact(3)
+            .map(|t| {
+                let [a, b, c] = [t[0], t[1], t[2]].map(|i| {
+                    let p = data.positions[i as usize];
+                    vec3(p[0] as f64, p[1] as f64, p[2] as f64)
+                });
+                a.dot(b.cross(c)) / 6.0
+            })
+            .sum();
+        assert!((volume - 1.0).abs() < 1e-6, "faces out after the mirror: {volume}");
     }
 }

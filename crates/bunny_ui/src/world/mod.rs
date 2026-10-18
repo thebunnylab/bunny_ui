@@ -26,6 +26,7 @@ pub mod scene;
 pub mod shade;
 pub mod soft;
 pub mod store;
+pub mod texture;
 pub mod view;
 pub mod wire;
 
