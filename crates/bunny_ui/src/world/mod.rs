@@ -22,6 +22,7 @@ pub mod mesh;
 pub mod orbit;
 pub mod pick;
 pub mod polygon;
+pub mod scene;
 pub mod shade;
 pub mod soft;
 pub mod store;
@@ -35,6 +36,7 @@ pub use material::{AlphaMode, Light, LineDepth, LineStyle, Material, Model, Poin
 pub use mesh::{Lines, Mesh, MeshData};
 pub use orbit::{Orbit, OrbitLimits};
 pub use pick::Hit;
+pub use scene::{Anchor, SceneView, scene_view};
 pub use soft::Picture;
 pub use store::{Entity, EntityId, EntitySpec, Shape, World, WorldEdit};
 pub use view::{CameraSource, Shot};

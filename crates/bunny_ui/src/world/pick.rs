@@ -9,7 +9,7 @@
 //! Picking runs on the CPU, the same on every tier: no tier reads a
 //! pixel back to answer a click.
 
-use super::camera::{Camera, Lens};
+use super::camera::Lens;
 use super::material::AlphaMode;
 use super::math::{Aabb, Plane, Ray, Vec3, vec3};
 use super::mesh::{Mesh, MeshData};
@@ -316,8 +316,10 @@ impl World {
     }
 
     /// The surface under the point `at` of a box of `size` that shows
-    /// the world through `camera`.
-    pub fn pick(&self, camera: &Camera, at: Point, size: Size) -> Option<Hit> {
+    /// the world through `camera` — a `Camera`, or the `State<Camera>`
+    /// the box paints with.
+    pub fn pick(&self, camera: impl super::view::CameraSource, at: Point, size: Size) -> Option<Hit> {
+        let camera = camera.camera();
         let mut ray = camera.ray(at, size);
         if let Lens::Parallel { .. } = camera.lens {
             // parallel rays start on the eye's plane: step back far enough
@@ -337,6 +339,7 @@ impl World {
 mod tests {
     use super::*;
     use crate::layout::Color;
+    use crate::world::camera::Camera;
     use crate::world::material::Material;
     use crate::world::mesh::MeshData;
 
@@ -388,7 +391,7 @@ mod tests {
         let cube = world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::WHITE)).set_position(far);
         let camera = Camera::looking_at(far + vec3(0.0, 0.0, 5.0), far);
         let size = Size { width: 400.0, height: 300.0 };
-        let hit = world.pick(&camera, Point { x: 200.0, y: 150.0 }, size).expect("dead ahead");
+        let hit = world.pick(camera, Point { x: 200.0, y: 150.0 }, size).expect("dead ahead");
         assert_eq!(hit.entity, cube);
         assert!((hit.point - (far + vec3(0.0, 0.0, 0.5))).length() < 1e-9, "{:?}", hit.point);
         assert!((hit.distance - 4.5).abs() < 1e-9);
@@ -433,8 +436,8 @@ mod tests {
         let camera = Camera::looking_at(vec3(0.0, 0.0, -0.2), vec3(0.0, 0.0, -10.0)).parallel_height(10.0);
         let size = Size { width: 1000.0, height: 1000.0 };
         let at = |x: f64| camera.project(vec3(x, 0.0, 0.0), size).expect("a parallel lens sees everything");
-        assert_eq!(world.pick(&camera, at(3.0), size).map(|h| h.entity), Some(right));
-        assert_eq!(world.pick(&camera, at(-3.0), size).map(|h| h.entity), Some(left));
-        assert_eq!(world.pick(&camera, at(0.0), size), None);
+        assert_eq!(world.pick(camera, at(3.0), size).map(|h| h.entity), Some(right));
+        assert_eq!(world.pick(camera, at(-3.0), size).map(|h| h.entity), Some(left));
+        assert_eq!(world.pick(camera, at(0.0), size), None);
     }
 }

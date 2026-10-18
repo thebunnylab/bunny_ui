@@ -171,7 +171,7 @@ impl Orbit {
 /// The world point under the pointer: the surface there, or else the
 /// plane through the target, facing the eye.
 fn pivot_at(camera: &Camera, at: Point, size: Size, world: World) -> Vec3 {
-    if let Some(hit) = world.pick(camera, at, size) {
+    if let Some(hit) = world.pick(*camera, at, size) {
         return hit.point;
     }
     let ray = camera.ray(at, size);
