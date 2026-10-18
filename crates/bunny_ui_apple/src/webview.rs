@@ -329,7 +329,7 @@ fn take_prepared(document: &Document) -> Option<Id> {
     if !preparation_allowed(document) {
         return None;
     }
-    HTML_PREPARATIONS.with(|pending| {
+    let prepared = HTML_PREPARATIONS.with(|pending| {
         pending
             .borrow()
             .iter()
@@ -338,13 +338,16 @@ fn take_prepared(document: &Document) -> Option<Id> {
                 let mut reserve = pool.borrow_mut();
                 let mut engine = reserve.ready.pop()?;
                 let view = std::mem::replace(&mut engine.0, null_mut());
-                // Native preparation can associate a hidden, empty view. The
-                // host reparents it synchronously before authored content loads.
-                unsafe { msg_void_bool(view, sel("setHidden:"), 0) };
                 reserve.borrowed.insert(view as usize);
                 Some(view)
             })
-    })
+    });
+    if let Some(view) = prepared {
+        // Release the reserve borrow before AppKit can deliver callbacks. The
+        // host reparents the view synchronously before authored content loads.
+        unsafe { msg_void_bool(view, sel("setHidden:"), 0) };
+    }
+    prepared
 }
 
 /// Release a reservation only for the exact engine claimed from that pool.
