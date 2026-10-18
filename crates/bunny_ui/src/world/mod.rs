@@ -13,3 +13,7 @@
 //!
 //! The module is behind the `3d` feature. An app that draws no world
 //! carries none of it.
+
+pub mod math;
+
+pub use math::{Aabb, Frustum, Mat4, Plane, Quat, Ray, Transform, Vec2, Vec3, Vec4, vec2, vec3, vec4};
