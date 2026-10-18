@@ -164,6 +164,7 @@ struct MeshInner {
     generation: u64,
     data: MeshData,
     bounds: Aabb,
+    runs: Vec<(u8, u32, u32)>,
     /// Built the first time a ray asks, kept for the revision.
     bvh: std::cell::OnceCell<super::pick::Bvh>,
 }
@@ -198,7 +199,8 @@ impl Mesh {
     fn with_identity(id: u64, generation: u64, data: MeshData) -> Mesh {
         let data = sanitize(data);
         let bounds = Aabb::from_points(data.positions.iter().map(|&p| to_vec(p)));
-        Mesh(Rc::new(MeshInner { id, generation, data, bounds, bvh: std::cell::OnceCell::new() }))
+        let runs = material_runs(&data);
+        Mesh(Rc::new(MeshInner { id, generation, data, bounds, runs, bvh: std::cell::OnceCell::new() }))
     }
 
     /// The same mesh with a new shape: the identity stays, the
@@ -223,6 +225,12 @@ impl Mesh {
     /// The box around every vertex, in model space.
     pub fn bounds(&self) -> Aabb {
         self.0.bounds
+    }
+
+    /// The runs of triangles that share a material slot: `(slot, first
+    /// index, index count)`. The triangles of a slot stand together.
+    pub fn material_runs(&self) -> &[(u8, u32, u32)] {
+        &self.0.runs
     }
 
     /// The mesh's bounding volume hierarchy, built on first use.
@@ -340,7 +348,32 @@ fn sanitize(mut data: MeshData) -> MeshData {
     if data.normals.len() != count {
         data = data.with_flat_normals();
     }
+    // the triangles of one material side by side, in their own order:
+    // a draw binds one texture, and a material is a run of indices
+    let count = data.positions.len();
+    if data.materials.len() == count && data.materials.windows(2).any(|pair| pair[0] != pair[1]) {
+        let material_of = |triangle: &[u32]| data.materials[triangle[0] as usize];
+        let mut triangles: Vec<[u32; 3]> = data.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
+        triangles.sort_by_key(|t| material_of(t));
+        data.indices = triangles.into_iter().flatten().collect();
+    }
     data
+}
+
+/// The runs of triangles that share a material: `(slot, first index,
+/// index count)`, in index order. A mesh without material slots is one
+/// run of slot 0.
+fn material_runs(data: &MeshData) -> Vec<(u8, u32, u32)> {
+    let count = data.positions.len();
+    let mut runs: Vec<(u8, u32, u32)> = Vec::new();
+    for (at, triangle) in data.indices.chunks_exact(3).enumerate() {
+        let slot = if data.materials.len() == count { data.materials[triangle[0] as usize] } else { 0 };
+        match runs.last_mut() {
+            Some(run) if run.0 == slot => run.2 += 3,
+            _ => runs.push((slot, at as u32 * 3, 3)),
+        }
+    }
+    runs
 }
 
 // MARK: - Shapes
@@ -755,6 +788,22 @@ mod tests {
         assert_eq!(bytes[offset::MATERIAL], 7);
         assert_eq!(bytes[offset::OCCLUSION], 200);
         assert_eq!(u16::from_le_bytes([bytes[offset::PART], bytes[offset::PART + 1]]), 513);
+    }
+
+    #[test]
+    fn the_triangles_of_a_material_stand_together() {
+        let mut data = Mesh::cuboid(1.0, 1.0, 1.0).data().clone();
+        // faces alternate between slots 0 and 1
+        data.materials = (0..data.positions.len()).map(|i| ((i / 4) % 2) as u8).collect();
+        let mesh = Mesh::new(data);
+        assert_eq!(mesh.material_runs(), &[(0, 0, 18), (1, 18, 18)]);
+        let data = mesh.data();
+        for &(slot, first, count) in mesh.material_runs() {
+            for &index in &data.indices[first as usize..(first + count) as usize] {
+                assert_eq!(data.materials[index as usize], slot);
+            }
+        }
+        assert_eq!(Mesh::sphere(1.0).material_runs().len(), 1, "no slots: one run");
     }
 
     #[test]

@@ -15,16 +15,20 @@
 //! carries none of it.
 
 pub mod camera;
+pub mod frame;
 pub mod material;
 pub mod math;
 pub mod mesh;
 pub mod orbit;
 pub mod pick;
 pub mod polygon;
+pub mod shade;
 pub mod store;
+pub mod wire;
 
 pub use math::{Aabb, Frustum, Mat4, Plane, Quat, Ray, Transform, Vec2, Vec3, Vec4, vec2, vec3, vec4};
 pub use camera::{Camera, Flight, Lens};
+pub use frame::{Background, Blend, Draw, DrawKind, Pass, Quality, WorldFrame, WorldStyle};
 pub use material::{AlphaMode, Light, LineDepth, LineStyle, Material, Model, PointLight, Sun, SunFrame};
 pub use mesh::{Lines, Mesh, MeshData};
 pub use orbit::{Orbit, OrbitLimits};
