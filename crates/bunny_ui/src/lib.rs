@@ -80,6 +80,8 @@ pub mod view;
 pub(crate) mod viewport;
 pub mod views;
 pub mod words;
+#[cfg(feature = "3d")]
+pub mod world;
 
 pub use runtime::request_frame;
 
@@ -133,7 +135,7 @@ macro_rules! zstack {
 /// worker thread (or a browser callback) hands its results over.
 pub mod task {
     pub use motor::task::{
-        Receiver, Recv, SendError, Sender, Sleep, Spawned, channel, sleep, spawn,
+        Receiver, Recv, SendError, Sender, Sleep, Spawned, channel, now, sleep, spawn,
     };
 }
 

@@ -308,6 +308,14 @@ pub fn advance(dt: f64) -> bool {
     woke
 }
 
+/// The engine's clock, in seconds: where [`advance`] brought it. It
+/// moves only with the frames — between two beats every reader sees the
+/// same instant, so a motion sampled twice in one frame agrees with
+/// itself, and a test that never advances it sees time stand still.
+pub fn now() -> f64 {
+    EXECUTOR.with(|executor| executor.borrow().clock)
+}
+
 /// Is anyone sleeping? The shell keeps its frame driver awake while
 /// this is true — that is how the clock keeps moving.
 pub fn has_timers() -> bool {
@@ -480,6 +488,16 @@ mod tests {
             executor.clock = 0.0;
             executor.shared = Arc::default();
         });
+    }
+
+    #[test]
+    fn the_engine_clock_moves_with_the_frames() {
+        fresh();
+        assert_eq!(now(), 0.0, "a fresh queue starts at zero");
+        advance(0.016);
+        advance(0.016);
+        assert!((now() - 0.032).abs() < 1e-12, "two beats, two steps: {}", now());
+        assert_eq!(now(), now(), "a reading never moves the clock");
     }
 
     #[test]
