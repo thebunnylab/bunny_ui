@@ -15,5 +15,16 @@
 //! carries none of it.
 
 pub mod math;
+pub mod mesh;
+pub mod polygon;
 
 pub use math::{Aabb, Frustum, Mat4, Plane, Quat, Ray, Transform, Vec2, Vec3, Vec4, vec2, vec3, vec4};
+pub use mesh::{Lines, Mesh, MeshData};
+
+/// A fresh identity for a mesh, a set of lines or a world. One counter
+/// for all of them: an identity names one thing, whatever its kind.
+pub(crate) fn next_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
