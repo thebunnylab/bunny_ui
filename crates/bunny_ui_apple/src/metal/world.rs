@@ -429,12 +429,50 @@ vertex WorldVary world_vertex(uint vid [[vertex_id]],
     return out;
 }
 
+// the grade: 16 × 16 × 16 points of codes in the part table, from
+// tone.w less one. A surface's codes fall in a cube of eight points;
+// the walk from its low corner to its high one, the largest share
+// first, crosses four of them, and the codes blend along that walk —
+// the CPU's order
+static float3 grade_point(device const uchar4* parts, uint index) {
+    return float3(parts[index].rgb);
+}
+
+static float3 graded(constant WorldUniforms& u, device const uchar4* parts, float3 code) {
+    if (u.tone.w < 0.5) {
+        return code;
+    }
+    float3 g = clamp(code / 255.0 * 15.0, 0.0, 15.0);
+    float3 i = min(floor(g), float3(14.0));
+    float3 w = g - i;
+    uint3 s = uint3(1u, 16u, 256u);
+    if (w.x < w.y) {
+        w.xy = w.yx;
+        s.xy = s.yx;
+    }
+    if (w.y < w.z) {
+        w.yz = w.zy;
+        s.yz = s.zy;
+    }
+    if (w.x < w.y) {
+        w.xy = w.yx;
+        s.xy = s.yx;
+    }
+    uint low = uint(u.tone.w) - 1u + uint(i.x) + 16u * uint(i.y) + 256u * uint(i.z);
+    float3 p0 = grade_point(parts, low);
+    float3 p1 = grade_point(parts, low + s.x);
+    float3 p2 = grade_point(parts, low + s.x + s.y);
+    float3 p3 = grade_point(parts, low + s.x + s.y + s.z);
+    return p0 + (p1 - p0) * w.x + (p2 - p1) * w.y + (p3 - p2) * w.z;
+}
+
 // premultiplied codes over 255: the target's unorm write rounds them to
 // the byte the CPU computes
 static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* materials,
                           device const WorldInstance* instances, constant WorldUniforms& u,
                           constant WorldDraw& draw, texture2d<float> picture, sampler wrap,
-                          depth2d<float> shadow_map, sampler compare, texture2d<float> floor_map) {
+                          depth2d<float> shadow_map, sampler compare, texture2d<float> floor_map,
+                          device const uchar4* parts) {
     float4 section = u.section;
     if (any(section != 0.0) && section.x * in.eye.x + section.y * in.eye.y + section.z * in.eye.z + section.w < 0.0) {
         discard_fragment();
@@ -485,7 +523,7 @@ static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* 
         }
         linear = tone(light, u.tone.x, u.tone.y);
     }
-    float3 code = float3(encode_code(linear.r), encode_code(linear.g), encode_code(linear.b));
+    float3 code = graded(u, parts, float3(encode_code(linear.r), encode_code(linear.g), encode_code(linear.b)));
     float3 codes = clamp(floor(code * alpha + 0.5 + dither), 0.0, 255.0);
     return float4(codes / 255.0, coverage >= 0.0 ? coverage : floor(alpha * 255.0 + 0.5) / 255.0);
 }
@@ -500,8 +538,9 @@ fragment float4 world_fragment(WorldVary in [[stage_in]],
                                sampler wrap [[sampler(0)]],
                                depth2d<float> shadow_map [[texture(1)]],
                                sampler compare [[sampler(1)]],
-                               texture2d<float> floor_map [[texture(2)]]) {
-    return world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, floor_map);
+                               texture2d<float> floor_map [[texture(2)]],
+                               device const uchar4* parts [[buffer(5)]]) {
+    return world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, floor_map, parts);
 }
 
 struct SteppedBack {
@@ -521,9 +560,10 @@ fragment SteppedBack world_fragment_stepped(WorldVary in [[stage_in]],
                                             sampler wrap [[sampler(0)]],
                                             depth2d<float> shadow_map [[texture(1)]],
                                             sampler compare [[sampler(1)]],
-                                            texture2d<float> floor_map [[texture(2)]]) {
+                                            texture2d<float> floor_map [[texture(2)]],
+                                            device const uchar4* parts [[buffer(5)]]) {
     SteppedBack out;
-    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, floor_map);
+    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, floor_map, parts);
     float z = in.position.z;
     float slope = max(abs(dfdx(in.depth)), abs(dfdy(in.depth)));
     out.depth = min(z + draw.bias.x * slope + DEPTH_TIE, DEPTH_CEILING);
@@ -1678,6 +1718,7 @@ impl FramePass {
                     msg_void_id_u64_u64(encoder, sels.set_fragment_buffer, staging, job.instances, 1);
                     msg_void_id_u64_u64(encoder, sels.set_fragment_buffer, staging, job.materials, 0);
                     msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, job.parts, 5);
+                    msg_void_id_u64_u64(encoder, sels.set_fragment_buffer, staging, job.parts, 5);
                 }
                 msg_void_id_u64(encoder, world.set_fragment_sampler, job.sampler, 0);
                 msg_void_id_u64(encoder, sels.set_fragment_texture, job.shadow_map, 1);

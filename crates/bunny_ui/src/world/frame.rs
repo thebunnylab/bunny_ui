@@ -118,13 +118,78 @@ pub struct WorldStyle {
     /// Every surface drawn see-through, so what stands behind it shows,
     /// and every edge with it: the look of an editor over a busy model.
     pub xray: bool,
+    /// The colour grade of every surface, after the tone curve: a day's
+    /// warmth, a night's blue. `None` leaves the colours alone.
+    pub grade: Option<Grade>,
     /// The most pictures a second an animation may ask for.
     pub max_fps: Option<f64>,
 }
 
 impl Default for WorldStyle {
     fn default() -> WorldStyle {
-        WorldStyle { background: Background::Transparent, quality: Quality::Medium, section: None, exposure: 1.0, xray: false, max_fps: None }
+        WorldStyle {
+            background: Background::Transparent,
+            quality: Quality::Medium,
+            section: None,
+            exposure: 1.0,
+            xray: false,
+            grade: None,
+            max_fps: None,
+        }
+    }
+}
+
+/// A colour grade: a table of 16 × 16 × 16 points from the sRGB codes a
+/// surface would show to the codes it shows. A colour between the points
+/// blends four of them (the corners of the tetrahedron that holds it), so
+/// a grade costs four reads a pixel. One table serves every frame that
+/// names it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Grade {
+    /// Red runs fastest, then green, then blue.
+    points: Rc<[[u8; 3]]>,
+    /// A hash of the points, for the picture's identity.
+    hash: u64,
+}
+
+impl Grade {
+    /// The points along each channel.
+    pub const SIDE: usize = 16;
+
+    /// The grade that `f` draws: from a colour in `[0, 1]` sRGB to the
+    /// colour it becomes, sampled at the table's points.
+    pub fn from_fn(f: impl Fn([f32; 3]) -> [f32; 3]) -> Grade {
+        let side = Grade::SIDE;
+        let at = |index: usize| index as f32 / (side - 1) as f32;
+        let mut points = Vec::with_capacity(side * side * side);
+        for b in 0..side {
+            for g in 0..side {
+                for r in 0..side {
+                    let out = f([at(r), at(g), at(b)]);
+                    points.push(out.map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5).floor() as u8));
+                }
+            }
+        }
+        Grade::from_points(points)
+    }
+
+    /// A grade of its `16³` points, red running fastest; `None` for
+    /// another count.
+    pub fn new(points: Vec<[u8; 3]>) -> Option<Grade> {
+        (points.len() == Grade::SIDE.pow(3)).then(|| Grade::from_points(points))
+    }
+
+    fn from_points(points: Vec<[u8; 3]>) -> Grade {
+        let mut hasher = motor::hash::FxHasher::default();
+        for point in &points {
+            hasher.write(point);
+        }
+        Grade { points: points.into(), hash: hasher.finish() }
+    }
+
+    /// A hash of the grade's points.
+    pub fn hash(&self) -> u64 {
+        self.hash
     }
 }
 
@@ -707,6 +772,12 @@ pub(crate) fn build_frame(
     });
 
     frame.uniforms = uniforms(&Eye { camera, view, projection }, style, size, px_per_point, time, &lights);
+    // the grade rides the part table, after the parts: `tone.w` names
+    // where it starts, plus one
+    if let Some(grade) = &style.grade {
+        frame.uniforms.tone[3] = frame.parts.len() as f32 + 1.0;
+        frame.parts.extend(grade.points.iter().map(|&[r, g, b]| [r, g, b, 255]));
+    }
     if let Some(map) = floor_map.filter(|map| map.size.x > 0.0 && map.size.y > 0.0) {
         // u runs with the world's x from the map's corner, v with its z;
         // the eye's own place is taken out in f64

@@ -467,6 +467,44 @@ WorldVary world_vertex(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     return o;
 }
 
+// the grade: 16 × 16 × 16 points of codes in the part table, from
+// tone.w less one. A surface's codes fall in a cube of eight points;
+// the walk from its low corner to its high one, the largest share
+// first, crosses four of them, and the codes blend along that walk —
+// the CPU's order
+float3 grade_point(uint index) {
+    uint packed = parts[index];
+    return float3((float)(packed & 0xFFu), (float)((packed >> 8) & 0xFFu), (float)((packed >> 16) & 0xFFu));
+}
+
+float3 graded(float3 code) {
+    if (u.tone.w < 0.5) {
+        return code;
+    }
+    float3 g = clamp(code / 255.0 * 15.0, 0.0, 15.0);
+    float3 i = min(floor(g), float3(14.0, 14.0, 14.0));
+    float3 w = g - i;
+    uint3 s = uint3(1u, 16u, 256u);
+    if (w.x < w.y) {
+        w.xy = w.yx;
+        s.xy = s.yx;
+    }
+    if (w.y < w.z) {
+        w.yz = w.zy;
+        s.yz = s.zy;
+    }
+    if (w.x < w.y) {
+        w.xy = w.yx;
+        s.xy = s.yx;
+    }
+    uint low = (uint)u.tone.w - 1u + (uint)i.x + 16u * (uint)i.y + 256u * (uint)i.z;
+    float3 p0 = grade_point(low);
+    float3 p1 = grade_point(low + s.x);
+    float3 p2 = grade_point(low + s.x + s.y);
+    float3 p3 = grade_point(low + s.x + s.y + s.z);
+    return p0 + (p1 - p0) * w.x + (p2 - p1) * w.y + (p3 - p2) * w.z;
+}
+
 // premultiplied codes over 255: the target's unorm write rounds them to
 // the byte the CPU computes
 float4 world_shade(WorldVary v, bool front) {
@@ -524,7 +562,7 @@ float4 world_shade(WorldVary v, bool front) {
         }
         shaded = tone_curve(light, u.tone.x, u.tone.y);
     }
-    float3 code = float3(encode_code(shaded.r), encode_code(shaded.g), encode_code(shaded.b));
+    float3 code = graded(float3(encode_code(shaded.r), encode_code(shaded.g), encode_code(shaded.b)));
     float3 codes = clamp(floor(code * alpha + 0.5 + dither), 0.0, 255.0);
     return float4(codes / 255.0, coverage >= 0.0 ? coverage : floor(alpha * 255.0 + 0.5) / 255.0);
 }
@@ -1007,6 +1045,7 @@ impl D3dWorld {
             write_constants(context, stack.uniforms.as_ptr(), &frame.uniforms.to_bytes());
             let part_view = parts.srv_ptr();
             (vtbl.vs_set_shader_resources)(context, 8, 1, &part_view);
+            (vtbl.ps_set_shader_resources)(context, 8, 1, &part_view);
 
             // the sun's map first, when it does not hold this frame's casters
             if let (Some((shadow, map)), Some(frame_shadow)) = (map, frame.shadow.as_ref())

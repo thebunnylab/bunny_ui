@@ -210,6 +210,20 @@ of them, the look of an editor over a busy model. An X-ray writes no
 depth: its surfaces blend from the farthest to the nearest, and its
 edges, hidden or not, show.
 
+A grade (`WorldStyle::grade`) gives the colours a mood — a day's
+warmth, a night's blue — after the tone curve. It is a table of
+16 × 16 × 16 points from the codes a surface would show to the codes it
+shows; `Grade::from_fn` samples a function into one. A colour between
+the points blends the four corners of the tetrahedron that holds it, so
+a grade costs four reads a pixel at every quality, and the CPU's
+picture is graded the same way. Lines and the backdrop keep their own
+colours.
+
+```rust
+let night = Grade::from_fn(|[r, g, b]| [0.8 * r, 0.85 * g, 0.1 + 0.9 * b]);
+let style = WorldStyle { grade: Some(night), ..WorldStyle::default() };
+```
+
 A section cuts the picture in the shaders. `world.section_lines(plane)`
 finds the cut itself on the CPU — the outline the plane leaves through
 every shown solid, in the world's space — for a drawing to ink over the
@@ -335,6 +349,6 @@ BUNNY_PARANOID=all cargo test -p bunny-ui-core --all-features
 cargo test -p bunny-ui-apple --features 3d
 cargo run -p bunny-ui-macos --features 3d --example world_window
 # in a page built with the web shell's `3d` feature, from the console:
-#   for (let n = 0; n < 15; n++) __bunny.bunny_gpu_world_parity(n)
+#   for (let n = 0; n < 16; n++) __bunny.bunny_gpu_world_parity(n)
 BUNNY_WORLD_GLB=chair.glb BUNNY_WORLD_DUMP=/tmp cargo test -p bunny-ui-core --features gltf --lib a_glb_from_the_environment -- --ignored
 ```

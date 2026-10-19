@@ -344,6 +344,43 @@ vec3 lit(vec3 position, vec3 n, vec3 base, float roughness, float metallic, vec3
     return light + emissive;
 }
 
+// the grade: 16 × 16 × 16 points of codes in the part table, from
+// tone.w less one. A surface's codes fall in a cube of eight points;
+// the walk from its low corner to its high one, the largest share
+// first, crosses four of them, and the codes blend along that walk —
+// the CPU's order
+vec3 grade_point(uint index) {
+    return vec3(part_row(index).rgb);
+}
+
+vec3 graded(vec3 code) {
+    if (tone.w < 0.5) {
+        return code;
+    }
+    vec3 g = clamp(code / 255.0 * 15.0, 0.0, 15.0);
+    vec3 i = min(floor(g), vec3(14.0));
+    vec3 w = g - i;
+    uvec3 s = uvec3(1u, 16u, 256u);
+    if (w.x < w.y) {
+        w.xy = w.yx;
+        s.xy = s.yx;
+    }
+    if (w.y < w.z) {
+        w.yz = w.zy;
+        s.yz = s.zy;
+    }
+    if (w.x < w.y) {
+        w.xy = w.yx;
+        s.xy = s.yx;
+    }
+    uint low = uint(tone.w) - 1u + uint(i.x) + 16u * uint(i.y) + 256u * uint(i.z);
+    vec3 p0 = grade_point(low);
+    vec3 p1 = grade_point(low + s.x);
+    vec3 p2 = grade_point(low + s.x + s.y);
+    vec3 p3 = grade_point(low + s.x + s.y + s.z);
+    return p0 + (p1 - p0) * w.x + (p2 - p1) * w.y + (p3 - p2) * w.z;
+}
+
 vec4 material_row(int row) {
     int index = int(v_material);
     return texelFetch(u_materials, ivec2((index % 1024) * 4 + row, index / 1024), 0);
@@ -401,7 +438,7 @@ vec4 shade() {
         }
         linear = tone_curve(light, tone.x, tone.y);
     }
-    vec3 code = vec3(encode_code(linear.r), encode_code(linear.g), encode_code(linear.b));
+    vec3 code = graded(vec3(encode_code(linear.r), encode_code(linear.g), encode_code(linear.b)));
     vec3 codes = clamp(floor(code * alpha + 0.5 + dither), 0.0, 255.0);
     return vec4(codes / 255.0, coverage >= 0.0 ? coverage : floor(alpha * 255.0 + 0.5) / 255.0);
 }

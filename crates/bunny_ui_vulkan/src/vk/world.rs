@@ -100,8 +100,8 @@ mod generator {
         let table = gl::srgb_table();
         vec![
             ("world_mesh.vert", stage(&[gl::WORLD_COMMON, &table, gl::PARTS, gl::MESH_VERT])),
-            ("world_mesh.frag", stage(&[gl::WORLD_COMMON, gl::MESH_FRAG_COMMON, gl::MESH_FRAG])),
-            ("world_stepped.frag", stage(&[gl::WORLD_COMMON, gl::MESH_FRAG_COMMON, gl::MESH_FRAG_STEPPED])),
+            ("world_mesh.frag", stage(&[gl::WORLD_COMMON, gl::PARTS, gl::MESH_FRAG_COMMON, gl::MESH_FRAG])),
+            ("world_stepped.frag", stage(&[gl::WORLD_COMMON, gl::PARTS, gl::MESH_FRAG_COMMON, gl::MESH_FRAG_STEPPED])),
             ("world_line.vert", stage(&[gl::WORLD_COMMON, gl::LINE_VERT])),
             ("world_line.frag", stage(&[gl::WORLD_COMMON, gl::LINE_FRAG])),
             ("world_backdrop.vert", stage(&[gl::BACKDROP_VERT])),
@@ -794,7 +794,7 @@ impl WorldStack {
                     binding: 2,
                     descriptor_type: DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     count: 1,
-                    stages: SHADER_STAGE_VERTEX,
+                    stages: SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT,
                     immutable_samplers: std::ptr::null(),
                 },
             ])?;

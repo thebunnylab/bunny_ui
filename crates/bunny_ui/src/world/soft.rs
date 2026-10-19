@@ -578,7 +578,7 @@ impl Job<'_> {
             let dither = if u.tone[2] > 0.5 { shade::bayer(x, y) } else { 0.0 };
             (shade::tone(lit, u.tone[0], u.tone[1]), dither)
         };
-        let codes = linear.map(|c| quantize(encode_code(c) * alpha, dither) as f32);
+        let codes = graded(self.frame, linear.map(encode_code)).map(|code| quantize(code * alpha, dither) as f32);
         Some([codes[0], codes[1], codes[2], (alpha * 255.0 + 0.5).floor()])
     }
 }
@@ -598,6 +598,35 @@ fn floor_light(u: &FrameUniforms, map: &Texture, position: V3) -> [f32; 4] {
     let base = &map.levels[0];
     let (half_s, half_t) = (0.5 / base.width as f32, 0.5 / base.height as f32);
     map.sample(s.clamp(half_s, 1.0 - half_s), t.clamp(half_t, 1.0 - half_t), 0.0)
+}
+
+/// A surface's continuous codes through the frame's grade: the table's
+/// eight points around them, blended along red, then green, then blue —
+/// the shaders' order.
+fn graded(frame: &WorldFrame, code: [f32; 3]) -> [f32; 3] {
+    let start = frame.uniforms.tone[3];
+    if start < 0.5 {
+        return code;
+    }
+    let g = code.map(|c| (c / 255.0 * 15.0).clamp(0.0, 15.0));
+    let i = g.map(|v| v.floor().min(14.0));
+    let mut w = [g[0] - i[0], g[1] - i[1], g[2] - i[2]];
+    let mut s = [1usize, 16, 256];
+    // the walk from the cube's low corner to its high one, the largest
+    // share first: the same three swaps as the shaders'
+    for (a, b) in [(0, 1), (1, 2), (0, 1)] {
+        if w[a] < w[b] {
+            w.swap(a, b);
+            s.swap(a, b);
+        }
+    }
+    let low = start as usize - 1 + i[0] as usize + 16 * i[1] as usize + 256 * i[2] as usize;
+    let at = |index: usize| {
+        let row = frame.parts.get(index).copied().unwrap_or([0; 4]);
+        [row[0] as f32, row[1] as f32, row[2] as f32]
+    };
+    let (p0, p1, p2, p3) = (at(low), at(low + s[0]), at(low + s[0] + s[1]), at(low + s[0] + s[1] + s[2]));
+    [0, 1, 2].map(|k| p0[k] + (p1[k] - p0[k]) * w[0] + (p2[k] - p1[k]) * w[1] + (p3[k] - p2[k]) * w[2])
 }
 
 /// The deepest a surface that steps back may go: the largest number
@@ -946,6 +975,27 @@ mod tests {
         let top = camera.project(at + vec3(0.3, 0.4, 0.3), size).expect("in view");
         let pixel = picture.at(top.x as u32, top.y as u32);
         assert!(pixel[3] > 100 && pixel[3] < 255, "a see-through top: {pixel:?}");
+    }
+
+    #[test]
+    fn a_grade_turns_the_colours() {
+        use crate::world::frame::Grade;
+        let world = World::new();
+        world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::unlit(Color::rgb(200, 120, 60)));
+        let camera = Camera::looking_at(vec3(0.0, 0.0, 4.0), Vec3::ZERO).parallel_height(2.0);
+        let medium = WorldStyle { quality: Quality::Medium, ..style(Background::Transparent) };
+        let plain = world.render(&camera, &medium, (32, 32), 1.0);
+        // the identity: the table's points blend back to the codes
+        let same = WorldStyle { grade: Some(Grade::from_fn(|c| c)), ..medium.clone() };
+        let picture = world.render(&camera, &same, (32, 32), 1.0);
+        let worst = plain.rgba.iter().zip(&picture.rgba).map(|(a, b)| a.abs_diff(*b)).max();
+        assert!(worst <= Some(1), "an identity grade moves a code by {worst:?}");
+        // red and blue trade places
+        let swap = WorldStyle { grade: Some(Grade::from_fn(|[r, g, b]| [b, g, r])), ..medium.clone() };
+        let swapped = world.render(&camera, &swap, (32, 32), 1.0).at(16, 16);
+        let [r, g, b, _] = plain.at(16, 16);
+        assert!(swapped[0].abs_diff(b) <= 1 && swapped[1].abs_diff(g) <= 1 && swapped[2].abs_diff(r) <= 1, "{swapped:?}");
+        assert!(Grade::new(vec![[0; 3]; 15]).is_none(), "a table of another count");
     }
 
     #[test]

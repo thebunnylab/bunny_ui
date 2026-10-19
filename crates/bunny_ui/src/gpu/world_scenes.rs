@@ -10,7 +10,7 @@ use std::rc::Rc;
 use crate::image_engine::ImageSource;
 use crate::layout::Color;
 use crate::world::camera::Camera;
-use crate::world::frame::{Background, Quality, WorldFrame, WorldStyle};
+use crate::world::frame::{Background, Grade, Quality, WorldFrame, WorldStyle};
 use crate::world::material::{FloorMap, Light, LineDepth, LineStyle, Material, Model, PartState};
 use crate::world::math::Mat4;
 use crate::world::math::{Vec3, vec2, vec3};
@@ -18,7 +18,7 @@ use crate::world::mesh::{Mesh, MeshData};
 use crate::world::store::World;
 
 /// How many worlds the catalog holds.
-pub const COUNT: u32 = 15;
+pub const COUNT: u32 = 16;
 
 /// What a tier's picture may differ from the CPU's by: the share of
 /// pixels whose worst channel is more than three codes apart, and more
@@ -202,6 +202,18 @@ pub fn world_scene(index: u32) -> WorldScene {
             tolerance: PENUMBRA,
             pictures: Vec::new(),
         },
+        15 => {
+            // the still life through a grade of the night: the warm
+            // channels pressed toward the blue, the darks lifted
+            let night = Grade::from_fn(|[r, g, b]| {
+                let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                [0.05 + 0.75 * (0.6 * r + 0.4 * luma), 0.06 + 0.82 * (0.8 * g + 0.2 * luma), 0.11 + 0.89 * b]
+            });
+            let graded = WorldStyle { grade: Some(night), ..style(Quality::Medium) };
+            let mut frame = still_life().frame(&Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0), &graded, (160, 120), 1.0);
+            frame.samples = 1;
+            WorldScene { frame: Rc::new(frame), name: "a graded picture", tolerance: EXACT, pictures: Vec::new() }
+        }
         14 => {
             // the cut-out floor at four samples: its edges become coverage,
             // which the CPU's one sample cannot show

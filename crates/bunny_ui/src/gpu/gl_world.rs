@@ -345,7 +345,7 @@ impl<G: GlFamily> GlWorld<G> {
         let table = source::srgb_table();
         let world = [("World", WORLD_BINDING)];
         let mesh_vertex = format!("{prelude}{}{table}{}{}", source::WORLD_COMMON, source::PARTS, source::MESH_VERT);
-        let mesh_fragment = |body: &str| format!("{prelude}{}{}{body}", source::WORLD_COMMON, source::MESH_FRAG_COMMON);
+        let mesh_fragment = |body: &str| format!("{prelude}{}{}{}{body}", source::WORLD_COMMON, source::PARTS, source::MESH_FRAG_COMMON);
         let mesh = gl.program(&mesh_vertex, &mesh_fragment(source::MESH_FRAG), &MESH_ATTRIBUTES, &world)?;
         let stepped = gl.program(&mesh_vertex, &mesh_fragment(source::MESH_FRAG_STEPPED), &MESH_ATTRIBUTES, &world)?;
         let lines = gl.program(

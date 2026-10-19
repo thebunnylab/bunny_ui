@@ -41,7 +41,8 @@ pub struct FrameUniforms {
     /// The world's up in the eye's space; `w` = the eye's height above
     /// the ground plane.
     pub sky_up: Row,
-    /// `(exposure, knee, dither on, 0)`.
+    /// `(exposure, knee, dither on, grade)`; the grade is where its
+    /// points start in the part table plus one, 0 for none.
     pub tone: Row,
     /// The sun's shadow map from the eye's space, column-major:
     /// `(u, v, depth, 1)`, with `u` and `v` across the map (`v = 0` at
