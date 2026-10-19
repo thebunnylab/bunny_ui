@@ -1,0 +1,74 @@
+//! In-process native protocol qualification of the unchanged authored app.
+use bunny_ui::platform::{App, WindowSpec};
+use bunny_ui::prelude::*;
+use std::{ffi::{CStr, CString, c_char, c_void}, rc::Rc};
+use studio_new_screen_state::native_records_app::{NativeRecordsApp, NativeRecordsAppRoute};
+type Id = *mut c_void;
+type Sel = *const c_void;
+#[allow(clashing_extern_declarations, reason = "Objective-C selectors have distinct concrete ABIs")]
+#[link(name = "objc")]
+unsafe extern "C" {
+    fn objc_getClass(name: *const c_char) -> Id;
+    fn sel_registerName(name: *const c_char) -> Sel;
+    #[link_name = "objc_msgSend"] fn object(o: Id, s: Sel) -> Id;
+    #[link_name = "objc_msgSend"] fn count(o: Id, s: Sel) -> usize;
+    #[link_name = "objc_msgSend"] fn at(o: Id, s: Sel, i: usize) -> Id;
+    #[link_name = "objc_msgSend"] fn chars(o: Id, s: Sel) -> *const c_char;
+    #[link_name = "objc_msgSend"] fn boolean(o: Id, s: Sel) -> i8;
+    #[link_name = "objc_msgSend"] fn set_bool(o: Id, s: Sel, v: i8);
+    #[link_name = "objc_msgSend"] fn void(o: Id, s: Sel);
+}
+fn sel(name: &str) -> Sel { unsafe { sel_registerName(CString::new(name).unwrap().as_ptr()) } }
+unsafe fn property(o: Id, name: &str) -> Option<String> {
+    let value = unsafe { object(o, sel(name)) };
+    if value.is_null() { return None; }
+    let bytes = unsafe { chars(value, sel("UTF8String")) };
+    (!bytes.is_null()).then(|| unsafe { CStr::from_ptr(bytes) }.to_string_lossy().into_owned())
+}
+unsafe fn children(o: Id) -> Vec<Id> {
+    let list = unsafe { object(o, sel("accessibilityChildren")) };
+    (0..unsafe { count(list, sel("count")) }).map(|i| unsafe { at(list, sel("objectAtIndex:"), i) }).collect()
+}
+unsafe fn named(o: Id, name: &str) -> Id {
+    unsafe { children(o) }.into_iter().find(|n| unsafe { property(*n, "accessibilityLabel") }.as_deref()==Some(name)).unwrap_or_else(|| panic!("Missing native control {name}"))
+}
+fn main() {
+    let app = App::new();
+    let model = NativeRecordsApp::default();
+    let navigation = model.navigation.clone();
+    let id = app.open(WindowSpec::titled("Records modal protocol qualification").size(1024.0, 640.0), Rc::new(app.runtime()), model);
+    unsafe {
+        let ns = object(objc_getClass(c"NSApplication".as_ptr()), sel("sharedApplication"));
+        let windows = object(ns, sel("windows"));
+        let window = (0..count(windows, sel("count"))).map(|i| at(windows, sel("objectAtIndex:"), i)).find(|w| property(*w,"title").as_deref()==Some("Records modal protocol qualification")).unwrap();
+        let view = object(window, sel("contentView"));
+        for edit in [false, true] {
+            let opener = object(named(view,"Button"),sel("retain"));
+            assert_eq!(boolean(opener,sel("accessibilityPerformPress")),1);
+            assert_eq!(navigation.state.get().modal,Some(NativeRecordsAppRoute::Detail{id:7}));
+            assert!(children(view).is_empty());
+            assert_eq!(boolean(opener,sel("accessibilityPerformPress")),0);
+            let panels = object(window,sel("childWindows"));
+            let panel = (0..count(panels,sel("count"))).map(|i|at(panels,sel("objectAtIndex:"),i)).find(|p|children(object(*p,sel("contentView"))).iter().any(|n|property(*n,"accessibilityLabel").as_deref()==Some("Close modal"))).expect("actual app modal has a native accessible panel");
+            let pv = object(panel,sel("contentView"));
+            let labels: Vec<_> = children(pv).iter().map(|n|property(*n,"accessibilityLabel")).collect();
+            println!("Active modal native panel controls: {labels:?}");
+            for label in ["Edit","Close modal","Back"] {
+                let control = named(pv,label);
+                assert_eq!(property(control,"accessibilityRole").as_deref(),Some("AXButton"));
+                assert_eq!(object(control,sel("accessibilityWindow")),panel);
+            }
+            let action = object(named(pv,if edit {"Edit"} else {"Close modal"}),sel("retain"));
+            set_bool(action,sel("setAccessibilityFocused:"),1);
+            assert_eq!(object(view,sel("accessibilityFocusedUIElement")),action);
+            assert_eq!(boolean(action,sel("accessibilityPerformPress")),1);
+            assert!(navigation.state.get().modal.is_none());
+            if edit { assert!(matches!(navigation.state.get().current,NativeRecordsAppRoute::Edit{id:7,..})); assert!(!named(view,"Save").is_null()); }
+            else { assert_eq!(navigation.state.get().current,NativeRecordsAppRoute::List); assert!(!named(view,"Button").is_null()); }
+            assert_eq!(boolean(action,sel("accessibilityPerformPress")),0);
+            void(action,sel("release"));void(opener,sel("release"));
+        }
+    }
+    println!("Unchanged Records application: native modal roles, focus, Close/Edit navigation and blocked background all pass. Main-window-only AX excludes child-panel controls by design. No external client or VoiceOver claim.");
+    app.close(id);
+}

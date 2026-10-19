@@ -1,0 +1,243 @@
+{
+  "base_revision": "ad68287a32f0cc9e50036bcdf290fbacc387e996",
+  "method": "Same isolated checkout, sequential exact baseline/candidate Rust snapshots; own artifact directory. Production Rust unchanged. CI diagnostic comparator with all-target/all-feature keep-going strict invocations.",
+  "strict_runs": {
+    "baseline": {
+      "exit_code": 101,
+      "diagnostics": [
+        {
+          "code": "clippy::chunks_exact_to_as_chunks",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "using `chunks_exact_mut` with a constant chunk size",
+          "source": "for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {"
+        },
+        {
+          "code": "clippy::chunks_exact_to_as_chunks",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "using `chunks_exact_mut` with a constant chunk size",
+          "source": "for pixel in backing.chunks_exact_mut(4) {"
+        },
+        {
+          "code": "clippy::chunks_exact_to_as_chunks",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "using `chunks_exact` with a constant chunk size",
+          "source": "for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {"
+        },
+        {
+          "code": "clippy::needless_range_loop",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "the loop variable `channel` is only used to index `pixel`",
+          "source": "for channel in 0..3 {"
+        },
+        {
+          "code": "clippy::too_many_arguments",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "this function has too many arguments (11/7)",
+          "source": "pub fn live_layer_blit("
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "static DRAG_GATE: RefCell<Option<Box<dyn Fn(f64, f64) -> bool>>> ="
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "static HANDLER: RefCell<Option<Box<dyn FnMut(AppEvent)>>> = const { RefCell::new(None) };"
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "static IME_INDEX: RefCell<Option<Box<dyn Fn(f64, f64) -> Option<u64>>>> ="
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "static IME_RECT: RefCell<Option<Box<dyn Fn(u64) -> Option<CGRect>>>> ="
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "static KEY_GATE: RefCell<Option<Box<dyn FnMut(&KeyStroke) -> bool>>> ="
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "static MENU_ANSWERS: RefCell<Option<Box<dyn Fn(usize, Pick) -> bool>>> ="
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "static PLACED_LIGHTS: RefCell<Vec<(Id, (f64, f64, Option<f64>))>> ="
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "static SCREEN_BOUNDS: Cell<Option<(std::time::Instant, ScreenBoundsKey, (f64, f64, f64, f64))>> ="
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/lib.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "key_gate: RefCell<Box<dyn FnMut(&ffi::KeyStroke) -> bool>>,"
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/lib.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList, trace::Origin)> = Rc::new({"
+        },
+        {
+          "code": "clippy::unnecessary_lazy_evaluations",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "unnecessary closure used with `bool::then`",
+          "source": "inside.then(|| (point.x + dx, bounds.size.height - point.y + dy))"
+        }
+      ]
+    },
+    "candidate": {
+      "exit_code": 101,
+      "diagnostics": [
+        {
+          "code": "clippy::chunks_exact_to_as_chunks",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "using `chunks_exact_mut` with a constant chunk size",
+          "source": "for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {"
+        },
+        {
+          "code": "clippy::chunks_exact_to_as_chunks",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "using `chunks_exact_mut` with a constant chunk size",
+          "source": "for pixel in backing.chunks_exact_mut(4) {"
+        },
+        {
+          "code": "clippy::chunks_exact_to_as_chunks",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "using `chunks_exact` with a constant chunk size",
+          "source": "for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {"
+        },
+        {
+          "code": "clippy::needless_range_loop",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "the loop variable `channel` is only used to index `pixel`",
+          "source": "for channel in 0..3 {"
+        },
+        {
+          "code": "clippy::too_many_arguments",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "this function has too many arguments (11/7)",
+          "source": "pub fn live_layer_blit("
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "static DRAG_GATE: RefCell<Option<Box<dyn Fn(f64, f64) -> bool>>> ="
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "static HANDLER: RefCell<Option<Box<dyn FnMut(AppEvent)>>> = const { RefCell::new(None) };"
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "static IME_INDEX: RefCell<Option<Box<dyn Fn(f64, f64) -> Option<u64>>>> ="
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "static IME_RECT: RefCell<Option<Box<dyn Fn(u64) -> Option<CGRect>>>> ="
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "static KEY_GATE: RefCell<Option<Box<dyn FnMut(&KeyStroke) -> bool>>> ="
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "static MENU_ANSWERS: RefCell<Option<Box<dyn Fn(usize, Pick) -> bool>>> ="
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "static PLACED_LIGHTS: RefCell<Vec<(Id, (f64, f64, Option<f64>))>> ="
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "static SCREEN_BOUNDS: Cell<Option<(std::time::Instant, ScreenBoundsKey, (f64, f64, f64, f64))>> ="
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/lib.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "key_gate: RefCell<Box<dyn FnMut(&ffi::KeyStroke) -> bool>>,"
+        },
+        {
+          "code": "clippy::type_complexity",
+          "file": "crates/bunny_ui_macos/src/lib.rs",
+          "level": "error",
+          "message": "very complex type used. Consider factoring parts into `type` definitions",
+          "source": "let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList, trace::Origin)> = Rc::new({"
+        },
+        {
+          "code": "clippy::unnecessary_lazy_evaluations",
+          "file": "crates/bunny_ui_macos/src/ffi.rs",
+          "level": "error",
+          "message": "unnecessary closure used with `bool::then`",
+          "source": "inside.then(|| (point.x + dx, bounds.size.height - point.y + dy))"
+        }
+      ]
+    }
+  },
+  "shared": 16,
+  "new": [],
+  "removed": []
+}

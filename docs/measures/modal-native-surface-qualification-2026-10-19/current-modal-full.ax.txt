@@ -1,0 +1,8 @@
+Window: "studio-new-screen-state", App: Studio Clipboard Validation.
+0 standard window studio-new-screen-state, Secondary Actions: Raise
+	1 close button
+	2 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	3 minimize button
+	4 text studio-new-screen-state
+5 menu bar
+	6 Studio Clipboard Validation

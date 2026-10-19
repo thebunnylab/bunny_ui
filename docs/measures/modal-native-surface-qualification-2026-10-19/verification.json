@@ -1,0 +1,20 @@
+{
+  "task": "T2-STUDIO-177",
+  "test_revision": "28f9c4ec65cae24d60c18d6d8760539dcacae2d4",
+  "runtime_revision": "ad68287a32f0cc9e50036bcdf290fbacc387e996",
+  "production_changed": false,
+  "qualification": "The reported empty main-window AX capture does not reproduce missing framework controls. Native child-panel selectors expose real modal roles, focus and actions on the unchanged production revision, including the actual source-generated Records app.",
+  "passed": [
+    "Routed erased/binding-derived sheet in normal and paranoid native AppKit witness",
+    "Actual unchanged24-file Records app: modal Edit/Close/Back native roles, parent focus, Close and Edit actions, record7 identity, background refusal and retired actions",
+    "Scoped formatting, whitespace, differential strict lint:16 shared diagnostics, zero new"
+  ],
+  "strict_lint": "Both baseline and candidate strict all-target/all-feature invocations exit101 with inherited macOS diagnostics. This is a passing regression comparison, not a passing strict lint invocation. No diagnostic was suppressed.",
+  "external_controller": "Its main-window snapshot omits native child-panel controls. The app inventory did not expose a child-window selection. Original captures remain retained; they do not justify a projection change.",
+  "open": [
+    "Authentic disposition of the original T177 criterion, whose failing-before assumption is not established",
+    "External full-surface assistive-client acceptance",
+    "Explicitly deferred VoiceOver",
+    "Remaining T73 checkpoints and final revision bindings"
+  ]
+}

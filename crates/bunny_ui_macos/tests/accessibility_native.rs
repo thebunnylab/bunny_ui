@@ -170,6 +170,101 @@ mod probe {
         }
     }
 
+    /// Matches a source-generated router: erased keyed destinations and a
+    /// sheet binding derived from the navigation snapshot, not a bool State.
+    #[derive(Clone, Copy)]
+    struct RoutedModal {
+        modal: State<Option<u32>>,
+        edited: State<Option<u32>>,
+    }
+    impl Component for RoutedModal {
+        fn body(self) -> impl View {
+            let shown = Binding::new(
+                move || self.modal.get().is_some(),
+                move |shown| {
+                    if !shown {
+                        self.modal.set(None);
+                    }
+                },
+            );
+            erased(button(text("Open record modal"), move || self.modal.set(Some(7))).id("List"))
+                .sheet(shown, move |_| match self.modal.get() {
+                    Some(id) => erased(
+                        vstack!(
+                            text(format!("Record {id}")),
+                            button(text("Edit record"), move || {
+                                self.edited.set(Some(id));
+                                self.modal.set(None);
+                            }),
+                            button(text("Close record modal"), move || self.modal.set(None)),
+                        )
+                        .id(format!("Detail {{ id: {id} }}")),
+                    ),
+                    None => erased(spacer()),
+                })
+        }
+    }
+
+    fn routed_modal_uses_its_native_child_surface(app: &App) {
+        let model = RoutedModal {
+            modal: State::new(None),
+            edited: State::new(None),
+        };
+        let id = app.open(
+            WindowSpec::titled("Routed modal witness").size(480.0, 640.0),
+            Rc::new(app.runtime()),
+            model,
+        );
+        unsafe {
+            let ns_app = object(class("NSApplication"), sel("sharedApplication"));
+            let windows = object(ns_app, sel("windows"));
+            let window = (0..count(windows, sel("count")))
+                .map(|i| at(windows, sel("objectAtIndex:"), i))
+                .find(|window| {
+                    property(*window, "title").as_deref() == Some("Routed modal witness")
+                })
+                .unwrap();
+            let view = object(window, sel("contentView"));
+            for edit in [false, true] {
+                let opener = object(named(view, "Open record modal"), sel("retain"));
+                assert_eq!(boolean(opener, sel("accessibilityPerformPress")), 1);
+                assert_eq!(model.modal.get(), Some(7));
+                assert!(
+                    children(view).is_empty(),
+                    "the modal covers the main surface"
+                );
+                assert_eq!(boolean(opener, sel("accessibilityPerformPress")), 0);
+                let label = if edit {
+                    "Edit record"
+                } else {
+                    "Close record modal"
+                };
+                let (panel, action) = popup_choice(window, label);
+                let action = object(action, sel("retain"));
+                assert_eq!(
+                    property(action, "accessibilityRole").as_deref(),
+                    Some("AXButton")
+                );
+                assert_eq!(object(action, sel("accessibilityWindow")), panel);
+                let frame = rectangle(action, sel("accessibilityFrame"));
+                assert!(frame.size.width > 0.0 && frame.size.height > 0.0);
+                set_bool(action, sel("setAccessibilityFocused:"), 1);
+                assert_eq!(object(view, sel("accessibilityFocusedUIElement")), action);
+                assert_eq!(boolean(action, sel("accessibilityPerformPress")), 1);
+                assert_eq!(model.modal.get(), None);
+                assert_eq!(model.edited.get(), edit.then_some(7));
+                assert_eq!(boolean(action, sel("accessibilityPerformPress")), 0);
+                assert!(!named(view, "Open record modal").is_null());
+                void(action, sel("release"));
+                void(opener, sel("release"));
+            }
+        }
+        app.close(id);
+        println!(
+            "Routed erased modal exposes native panel controls, focus and real actions; covered main controls stay unavailable"
+        );
+    }
+
     pub fn run(teardown: bool) {
         let app = App::new();
         let runtime = Rc::new(app.runtime());
@@ -726,6 +821,7 @@ mod probe {
                 "the first accessibility query may target a modal without querying its parent"
             );
         }
+        routed_modal_uses_its_native_child_surface(&app);
         println!("Native AppKit protocol witness passed; no human assistive-technology claim.");
         app.close(keeper);
     }

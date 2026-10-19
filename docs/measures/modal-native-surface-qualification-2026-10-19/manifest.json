@@ -1,0 +1,26 @@
+{
+  "algorithm": "BLAKE3",
+  "files": {
+    "README.md": "5af9d6cdb45037780fc7bc667b6aa42e73a091fc033dc791fe01c03fb72bb72d",
+    "baseline-bunny-ui-macos.jsonl": "980b96efc3d88eb4d581c538fe5feb622245973b0b3dcb2dc38d0449d6ed15b4",
+    "candidate-bunny-ui-macos.jsonl": "1f9ea9c5dececc9977e79164101518705166df5b72126693eafa5c118909ac39",
+    "compare_lint.py": "5b29c896bf0710fe3693f406c6cecaab5014a96808968d77f9f5d9092de2df33",
+    "comparison.json": "22a956bb7dd4ed2036b62b613c068222f7fb175fa26b3b1f8026ef0f10f36d3d",
+    "current-modal-closed.ax.txt": "0788633733d69d45d80b6952d10ed13a389cc308c25d01c87a9af070649d03c6",
+    "current-modal-closed.png": "d61734648cfdc1a3f07ad718c5d6c6009b047ec50d2cc51e845be266faac7917",
+    "current-modal-full.ax.txt": "3dfaf750cced9030b020c2436db53da1dde9d98f118db8326de08b650ab779d0",
+    "current-modal.png": "2d07d40f9cbb11a6d36c7b19f2ae79322166af0fdd4ce60f3794be8e42839938",
+    "fixture-installed.json": "e01752fd749c9061b5cbc79d3183a0c191e12f9296487799ec711ce0b82fb232",
+    "fixture-source-snapshot.json": "8bb2833953715b9db8a65c8fd25e99d4eee7a9195d8fa21948bcf9fab86af633",
+    "modal-requalification.ax.txt": "3dfaf750cced9030b020c2436db53da1dde9d98f118db8326de08b650ab779d0",
+    "modal-requalification.png": "fd2f78a4efbadc135e78674855fe2399f1a32146606bd5d51fd780b468fa33aa",
+    "native-clippy.log": "96b05702c3f02902f132341ef8e7d17bacb566049531e6f8608a35169274c842",
+    "probe-clippy.log": "e9b64bd2bb09cfb138214abc29cad9f0b1efb0183dbe3e872a5e5ad4957f1904",
+    "records-native-baseline.log": "c0312c509890f0ad943884b3bbdddb2abcc376df16cbb0394cc1552ee68b216e",
+    "records-native-binding.json": "d0b42bc2f3bf3e3f0f4c4cac4784329995197d0042f16c67b3ff00a1790a7de3",
+    "records-native-probe.rs.txt": "b093ac579247ab5cf58654ffb67cd4672d645e8e71ac4e54560e9b9c27072420",
+    "route-native-baseline.log": "464aa20e712f7552e99c149245eafe88597a0451e1e093bf9b7ffb6338e499ba",
+    "route-native-paranoid.log": "6e32daf4fbeb2b7ec58e3f7392a8c3748a634d94f49eac5b06a8a5e75274edc6",
+    "verification.json": "f0311edf385cbf7ea8ae132ad64844640d39cf9c82e14c1b96353da894d438fd"
+  }
+}
