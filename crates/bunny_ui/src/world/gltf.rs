@@ -418,7 +418,8 @@ fn read(json: &Json, bin: Option<&[u8]>) -> Result<Asset, GltfError> {
                     slots.len() - 1
                 }
             };
-            data.positions.extend(positions.as_chunks::<3>().0.iter().copied());
+            data.positions
+                .extend(positions.as_chunks::<3>().0.iter().copied());
             let normals = match attribute("NORMAL") {
                 Some(index) => document.floats(index)?.0.as_chunks::<3>().0.to_vec(),
                 None => Vec::new(),
@@ -683,7 +684,15 @@ mod tests {
             let name = std::path::Path::new(&path).file_stem().and_then(|s| s.to_str()).unwrap_or("asset");
             let _ = std::fs::write(std::path::Path::new(&folder).join(format!("{name}-256x256.rgba")), &picture.rgba);
         }
-        assert!(picture.rgba.chunks_exact(4).any(|p| p != [236, 238, 242, 255]), "something drew");
+        assert!(
+            picture
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| *p != [236, 238, 242, 255]),
+            "something drew"
+        );
     }
 
     #[test]
