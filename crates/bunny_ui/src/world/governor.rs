@@ -14,6 +14,10 @@
 //! the world, so every tier is governed the same way, with no timer of
 //! its own. A world that does not move is drawn once and governs nothing.
 
+// the GPU seam keeps a governor for each box; without it, only the
+// device's start is read
+#![cfg_attr(not(feature = "gpu"), allow(dead_code))]
+
 use std::collections::VecDeque;
 
 use super::frame::Quality;

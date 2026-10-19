@@ -18,7 +18,7 @@ use crate::world::mesh::{Mesh, MeshData};
 use crate::world::store::World;
 
 /// How many worlds the catalog holds.
-pub const COUNT: u32 = 18;
+pub const COUNT: u32 = 19;
 
 /// What a tier's picture may differ from the CPU's by: the share of
 /// pixels whose worst channel is more than three codes apart, and more
@@ -129,6 +129,41 @@ fn night_lamps() -> WorldFrame {
     world.frame(&Camera::orbiting(Vec3::ZERO, 25.0, 20.0, 5.0), &night, (200, 150), 1.0)
 }
 
+/// A post on a floor whose top half hangs from a joint that a clip
+/// turns and carries, held at its end; the sun casts its pose.
+fn swaying_post() -> WorldFrame {
+    use crate::world::math::{Quat, Transform};
+    use crate::world::skin::{Channel, Clip, Path, Play, Skeleton, SkeletonNode, Skin};
+    let skeleton = Skeleton::new(vec![
+        SkeletonNode { name: None, parent: None, rest: Transform::IDENTITY },
+        SkeletonNode { name: None, parent: Some(0), rest: Transform::IDENTITY },
+    ]);
+    let skin = Skin::new(skeleton, vec![0, 1], Vec::new()).expect("two joints");
+    let mut data = Mesh::cuboid(0.5, 2.0, 0.5).data().clone();
+    data.joints = vec![[0, 1, 0, 0]; data.positions.len()];
+    data.weights = data.positions.iter().map(|p| if p[1] > 0.0 { [0, 255, 0, 0] } else { [255, 0, 0, 0] }).collect();
+    let world = World::new();
+    world.add(Mesh::plane(6.0, 6.0), Material::color(Color::rgb(200, 196, 188))).set_position(vec3(0.0, -1.0, 0.0));
+    let post = world.add_model(Model::single(Mesh::new(data), Material::color(Color::rgb(222, 120, 60))).skinned(skin));
+    let lean = Quat::from_axis_angle(Vec3::Z, 0.5);
+    let channels = vec![
+        Channel { node: 1, path: Path::Translation, step: false, times: Rc::from([0.0, 1.0]), values: Rc::from([0.0, 0.0, 0.0, 0.4, 0.0, 0.0]) },
+        Channel {
+            node: 1,
+            path: Path::Rotation,
+            step: false,
+            times: Rc::from([0.0, 1.0]),
+            values: Rc::from([0.0, 0.0, 0.0, 1.0, lean.x as f32, lean.y as f32, lean.z as f32, lean.w as f32]),
+        },
+    ];
+    post.set_play(Some(Play { clip: Clip::new(None, channels), start: motor::task::now() - 10.0, speed: 1.0, looped: false }));
+    // a low sun: the pose casts a long shadow
+    world.add_light(Light::sun().toward(vec3(1.0, -0.8, 0.6)).with_shadows());
+    let mut frame = world.frame(&Camera::orbiting(Vec3::ZERO, 30.0, 22.0, 6.0), &style(Quality::Low), (200, 150), 1.0);
+    frame.samples = 1;
+    frame
+}
+
 /// World `index` of the catalog.
 pub fn world_scene(index: u32) -> WorldScene {
     let frame = |world: &World, camera: &Camera, quality: Quality, size: (u32, u32)| Rc::new(world.frame(camera, &style(quality), size, 1.0));
@@ -219,6 +254,7 @@ pub fn world_scene(index: u32) -> WorldScene {
             tolerance: PENUMBRA,
             pictures: Vec::new(),
         },
+        18 => WorldScene { frame: Rc::new(swaying_post()), name: "a post on its joints", tolerance: PENUMBRA, pictures: Vec::new() },
         16 => {
             // drawn at one sample, so the glow's edge is the CPU's
             let mut frame = night_lamps();

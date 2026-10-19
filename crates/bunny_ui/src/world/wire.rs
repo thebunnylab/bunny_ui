@@ -112,12 +112,18 @@ pub struct InstanceData {
     /// Where the states of the instance's parts start in the frame's part
     /// table, one a part its mesh names; [`NO_PARTS`] for none.
     pub part_base: u32,
-    /// Two words kept for what an instance will carry next: zero.
-    pub reserved: [u32; 2],
+    /// Where the instance's palette starts in the frame's joint rows,
+    /// three rows a joint; [`NO_JOINTS`] for a mesh at rest.
+    pub joint_base: u32,
+    /// A word kept for what an instance will carry next: zero.
+    pub reserved: u32,
 }
 
 /// The `part_base` of an instance whose parts all keep their own look.
 pub const NO_PARTS: u32 = u32::MAX;
+
+/// The `joint_base` of an instance that hangs from no joints.
+pub const NO_JOINTS: u32 = u32::MAX;
 
 /// One part's state in the frame's part table: its tint (sRGB) and, in
 /// the fourth byte, 255 when it shows and 0 when it hides.
@@ -133,7 +139,8 @@ pub mod instance_offset {
     pub const FLAGS: usize = 108;
     pub const AMBIENT: usize = 112;
     pub const PART_BASE: usize = 116;
-    pub const RESERVED: usize = 120;
+    pub const JOINT_BASE: usize = 120;
+    pub const RESERVED: usize = 124;
     pub const SIZE: usize = 128;
 }
 
@@ -178,12 +185,14 @@ pub mod material_flag {
 /// map-from-model matrix, `x' = rows[0] · (x, y, z, 1)` — `x` and `y`
 /// across the map in `[-1, 1]` (`y` up), `z` the depth from the sun in
 /// `[0, 1]` — and where the states of its parts start in the frame's part
-/// table (a part that hides casts nothing). 64 bytes: the rows, the part
-/// base, three zero words.
+/// table (a part that hides casts nothing), and where its palette starts
+/// for a skinned caster. 64 bytes: the rows, the part base, the joint
+/// base, two zero words.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShadowCaster {
     pub rows: [Row; 3],
     pub part_base: u32,
+    pub joint_base: u32,
 }
 
 /// Bytes of one [`ShadowCaster`].
@@ -254,9 +263,8 @@ impl InstanceData {
         out.extend_from_slice(&self.flags.to_le_bytes());
         out.extend_from_slice(&self.ambient);
         out.extend_from_slice(&self.part_base.to_le_bytes());
-        for word in self.reserved {
-            out.extend_from_slice(&word.to_le_bytes());
-        }
+        out.extend_from_slice(&self.joint_base.to_le_bytes());
+        out.extend_from_slice(&self.reserved.to_le_bytes());
     }
 }
 
@@ -291,7 +299,7 @@ pub fn shadow_instance_bytes(instances: &[ShadowCaster]) -> Vec<u8> {
         for row in &caster.rows {
             put_row(&mut out, row);
         }
-        for word in [caster.part_base, 0, 0, 0] {
+        for word in [caster.part_base, caster.joint_base, 0, 0] {
             out.extend_from_slice(&word.to_le_bytes());
         }
     }
@@ -399,7 +407,8 @@ mod tests {
             flags: instance_flag::CASTS_SHADOW,
             ambient: [50, 60, 70, 255],
             part_base: 99,
-            reserved: [0; 2],
+            joint_base: NO_JOINTS,
+            reserved: 0,
         };
         let bytes = instance_bytes(&[instance, instance]);
         assert_eq!(bytes.len(), 2 * instance_offset::SIZE);
@@ -413,7 +422,8 @@ mod tests {
         assert_eq!(u32_at(&bytes, at::FLAGS), 1);
         assert_eq!(&bytes[at::AMBIENT..at::AMBIENT + 4], &[50, 60, 70, 255]);
         assert_eq!(u32_at(&bytes, at::PART_BASE), 99);
-        assert_eq!(u32_at(&bytes, at::RESERVED + 4), 0);
+        assert_eq!(u32_at(&bytes, at::JOINT_BASE), NO_JOINTS);
+        assert_eq!(u32_at(&bytes, at::RESERVED), 0);
         assert_eq!(u32_at(&bytes, at::SIZE + at::MATERIAL_BASE), 77, "the second instance starts at 128");
     }
 
@@ -430,10 +440,11 @@ mod tests {
         let bytes = segment_bytes(&[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]);
         assert_eq!(bytes.len(), SEGMENT_STRIDE);
         assert_eq!(f32_at(&bytes, 20), 6.0);
-        let caster = ShadowCaster { rows: [[1.0, 0.0, 0.0, 0.5], [0.0, 1.0, 0.0, 0.25], [0.0, 0.0, 1.0, 0.125]], part_base: 7 };
+        let caster = ShadowCaster { rows: [[1.0, 0.0, 0.0, 0.5], [0.0, 1.0, 0.0, 0.25], [0.0, 0.0, 1.0, 0.125]], part_base: 7, joint_base: 9 };
         let bytes = shadow_instance_bytes(&[caster, caster]);
         assert_eq!(bytes.len(), 2 * SHADOW_INSTANCE_STRIDE);
         assert_eq!(f32_at(&bytes, SHADOW_INSTANCE_STRIDE + 44), 0.125);
         assert_eq!(u32_at(&bytes, SHADOW_INSTANCE_STRIDE + 48), 7);
+        assert_eq!(u32_at(&bytes, SHADOW_INSTANCE_STRIDE + 52), 9, "the joint base beside the part base");
     }
 }

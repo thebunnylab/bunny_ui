@@ -68,6 +68,15 @@ function glFloats(pointer, length) {
   return new Float32Array(glBytes(pointer, length).slice().buffer);
 }
 
+// Words for an UNSIGNED_INT texture, the same way: WebGL takes no bytes
+// for words
+function glWords(pointer, length) {
+  pointer >>>= 0;
+  length >>>= 0;
+  if (pointer % 4 === 0) return new Uint32Array(glWasm.memory.buffer, pointer, length >>> 2);
+  return new Uint32Array(glBytes(pointer, length).slice().buffer);
+}
+
 const glDecoder = new TextDecoder();
 const glEncoder = new TextEncoder();
 
@@ -304,9 +313,11 @@ const bunnyGlImports = {
   gl_tex_image_2d(target, level, internal, width, height, format, kind, pointer, length) {
     // a null pointer allocates without filling — the atlas and the
     // pyramid both open their storage that way. FLOAT data wants a view
-    // of floats; every other kind takes the bytes
+    // of floats, UNSIGNED_INT one of words; every other kind takes the
+    // bytes
+    const words = (kind >>> 0) === 0x1405;
     const source = pointer
-      ? (kind >>> 0) === 0x1406 ? glFloats(pointer, length) : glBytes(pointer, length)
+      ? (kind >>> 0) === 0x1406 ? glFloats(pointer, length) : words ? glWords(pointer, length) : glBytes(pointer, length)
       : null;
     gl.texImage2D(
       target >>> 0, level | 0, internal | 0, width | 0, height | 0, 0,

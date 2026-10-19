@@ -17,9 +17,10 @@ use super::math::{Aabb, Frustum, Mat4, Plane, Vec3, vec3, vec4};
 use super::mesh::{Lines, Mesh};
 use super::shade::decode;
 use super::shadow;
-use super::store::{Shape, WorldData};
+use super::store::{EntityId, Shape, WorldData};
 use super::wire::{
-    FrameUniforms, InstanceData, LineStyleData, MAX_POINTS, MaterialData, NO_PARTS, PartRow, Row, ShadowCaster, instance_flag, material_flag,
+    FrameUniforms, InstanceData, LineStyleData, MAX_POINTS, MaterialData, NO_JOINTS, NO_PARTS, PartRow, Row, ShadowCaster, instance_flag,
+    material_flag,
 };
 use crate::image_engine::ImageSource;
 use crate::layout::Color;
@@ -334,6 +335,10 @@ pub struct WorldFrame {
     /// ([`super::bloom`]). The pass then draws each pixel's glow beside
     /// its colour.
     pub bloom: u16,
+    /// The palettes of the skinned instances, three rows a joint
+    /// ([`InstanceData::joint_base`]): each pose worked out once, the
+    /// clothes of a figure sharing it.
+    pub joints: Vec<Row>,
 }
 
 impl WorldFrame {
@@ -397,6 +402,9 @@ impl WorldFrame {
         }
         hasher.write(&super::wire::part_bytes(&self.parts));
         hasher.write_u16(self.bloom);
+        for value in self.joints.iter().flatten() {
+            hasher.write_u32(value.to_bits());
+        }
         hasher.finish()
     }
 }
@@ -475,6 +483,7 @@ struct Seen {
     ambient: Color,
     parts: Option<Rc<[PartState]>>,
     flags: u32,
+    joint_base: u32,
 }
 
 /// Decides the picture of `world` through `camera` for a target of
@@ -498,12 +507,37 @@ pub(crate) fn build_frame(
     let mut casters: Vec<Caster> = Vec::new();
     let mut line_sets: Vec<(Seen, Lines, super::material::LineStyle)> = Vec::new();
     let mut lights: Vec<(Light, Mat4)> = Vec::new();
+    // each pose once per skeleton and the entity that plays it, each
+    // palette once per skin and pose: a figure's clothes share both
+    let mut poses = HashMap::<(Option<EntityId>, u64), Rc<Vec<Mat4>>>::new();
+    let mut palettes = HashMap::<(Option<EntityId>, u64), u32>::new();
+    let mut joints: Vec<Row> = Vec::new();
     for (id, data) in world.iter() {
         if !world.shown(id) {
             continue;
         }
         let Some(matrix) = world.world_matrix(id) else { continue };
         let eye_from_model = view * matrix;
+        let (joint_base, joint_rows) = match &data.spec.shape {
+            Shape::Model(model) => match &model.skin {
+                Some(skin) if model.mesh.is_skinned() => {
+                    let played = world.play_of(id);
+                    let owner = played.map(|(owner, _)| owner);
+                    let skeleton = skin.skeleton();
+                    let pose = Rc::clone(
+                        poses.entry((owner, skeleton.id())).or_insert_with(|| Rc::new(skeleton.pose(played.map(|(_, play)| play), time))),
+                    );
+                    let base = *palettes.entry((owner, skin.id())).or_insert_with(|| {
+                        let base = joints.len() as u32;
+                        joints.extend(skin.palette(&pose));
+                        base
+                    });
+                    (base, skin.joints().len() as u32 * 3)
+                }
+                _ => (NO_JOINTS, 0),
+            },
+            _ => (NO_JOINTS, 0),
+        };
         let seen = |bounds: Aabb| Seen {
             entity: id.index,
             eye_from_model,
@@ -514,17 +548,24 @@ pub(crate) fn build_frame(
             flags: if data.spec.casts_shadow { instance_flag::CASTS_SHADOW } else { 0 }
                 | if data.spec.reads_floor_map { instance_flag::FLOOR_MAP } else { 0 }
                 | (data.spec.light_group as u32 & instance_flag::GROUP_MASK) << instance_flag::GROUP_SHIFT,
+            joint_base,
         };
         match &data.spec.shape {
             Shape::Model(model) => {
+                // a skinned mesh leaves its rest pose: its box grows by
+                // half its longest side each way
+                let local = if joint_base == NO_JOINTS { model.mesh.bounds() } else { skinned_bounds(model.mesh.bounds()) };
                 if data.spec.casts_shadow {
                     casters.push(Caster {
                         world_from_model: matrix,
                         model: Model { mesh: model.mesh.clone(), materials: Rc::clone(&model.materials) },
                         parts: data.spec.parts.clone(),
+                        joint_base,
+                        joint_rows,
+                        bounds: local,
                     });
                 }
-                let bounds = model.mesh.bounds().transformed(&eye_from_model);
+                let bounds = local.transformed(&eye_from_model);
                 if sides.may_see(&bounds) && (parallel || bounds.min.z < 0.0) {
                     models.push((seen(bounds), Model { mesh: model.mesh.clone(), materials: Rc::clone(&model.materials) }));
                 }
@@ -594,6 +635,7 @@ pub(crate) fn build_frame(
         floor: None,
         parts: Vec::new(),
         bloom: if style.quality == Quality::High && style.bloom > 0.0 { (style.bloom.min(1.0) * 256.0).round() as u16 } else { 0 },
+        joints,
     };
     // each set of part states once, as many rows as its mesh names parts
     let mut part_bases = HashMap::<(usize, u32), u32>::new();
@@ -820,6 +862,21 @@ struct Caster {
     world_from_model: Mat4,
     model: Model,
     parts: Option<Rc<[PartState]>>,
+    joint_base: u32,
+    /// How many rows its palette takes.
+    joint_rows: u32,
+    /// The box it casts from, in its own space (grown for a skin).
+    bounds: Aabb,
+}
+
+/// The box a skinned mesh may reach from its rest pose's: half its
+/// longest side more each way.
+fn skinned_bounds(bounds: Aabb) -> Aabb {
+    if bounds.is_empty() {
+        return bounds;
+    }
+    let reach = Vec3::splat(bounds.size().max_element() * 0.5);
+    Aabb::new(bounds.min - reach, bounds.max + reach)
 }
 
 /// Where a set of part states starts in the frame's part table, its rows
@@ -885,7 +942,7 @@ fn shadow_frame(
         if runs.is_empty() {
             continue;
         }
-        bounds = bounds.union(caster.model.mesh.bounds().transformed(&(light * caster.world_from_model)));
+        bounds = bounds.union(caster.bounds.transformed(&(light * caster.world_from_model)));
         let mesh = &caster.model.mesh;
         let group = *group_of.entry((mesh.id(), mesh.generation(), runs.clone())).or_insert_with(|| {
             groups.push(CasterGroup { runs, members: Vec::new() });
@@ -911,7 +968,7 @@ fn shadow_frame(
         for &member in members {
             let caster = &casters[member];
             let part_base = part_base_of(&mut frame.parts, part_bases, &caster.parts, &caster.model.mesh);
-            out.instances.push(ShadowCaster { rows: rows(&(fit.map_from_world * caster.world_from_model)), part_base });
+            out.instances.push(ShadowCaster { rows: rows(&(fit.map_from_world * caster.world_from_model)), part_base, joint_base: caster.joint_base });
         }
         for &(first_index, index_count) in runs {
             out.draws.push(ShadowDraw { mesh: slot, first_index, index_count, first_instance, instance_count: members.len() as u32 });
@@ -925,6 +982,13 @@ fn shadow_frame(
     for caster in &out.instances {
         for value in caster.rows.iter().flatten() {
             hasher.write_u32(value.to_bits());
+        }
+        // a skinned caster casts its pose: the pose moves the map
+        if caster.joint_base != NO_JOINTS {
+            let rows = casters.iter().find(|known| known.joint_base == caster.joint_base).map_or(0, |known| known.joint_rows);
+            for value in frame.joints.iter().skip(caster.joint_base as usize).take(rows as usize).flatten() {
+                hasher.write_u32(value.to_bits());
+            }
         }
         // a part that hides casts nothing: which parts show moves the map
         if caster.part_base != NO_PARTS {
@@ -984,7 +1048,8 @@ fn instance_of(seen: &Seen, material_base: u32, part_base: u32) -> InstanceData 
         flags: seen.flags,
         ambient: [seen.ambient.r, seen.ambient.g, seen.ambient.b, 255],
         part_base,
-        reserved: [0; 2],
+        joint_base: seen.joint_base,
+        reserved: 0,
     }
 }
 

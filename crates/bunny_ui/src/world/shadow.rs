@@ -129,11 +129,18 @@ impl ShadowMap {
             let Some(indices) = data.indices.get(draw.first_index as usize..(draw.first_index + draw.index_count) as usize) else { continue };
             for caster in shadow.instances.iter().skip(draw.first_instance as usize).take(draw.instance_count as usize) {
                 let rows = &caster.rows;
-                let place = |p: &[f32; 3]| {
+                let skinned = caster.joint_base != super::wire::NO_JOINTS && data.joints.len() == data.positions.len() && data.weights.len() == data.positions.len();
+                let place = |(index, p): (usize, &[f32; 3])| {
+                    // a skinned caster casts its pose
+                    let p = if skinned {
+                        super::skin::skin_vertex(&frame.joints, caster.joint_base, data.joints[index], data.weights[index], *p, [0.0; 3]).0
+                    } else {
+                        *p
+                    };
                     let row = |r: [f32; 4]| r[0] * p[0] + r[1] * p[1] + r[2] * p[2] + r[3];
                     [row(rows[0]), row(rows[1]), row(rows[2])]
                 };
-                let corners: Vec<[f32; 3]> = data.positions.iter().map(place).collect();
+                let corners: Vec<[f32; 3]> = data.positions.iter().enumerate().map(place).collect();
                 for triangle in indices.as_chunks::<3>().0 {
                     if super::soft::part_hidden(frame, caster.part_base, data, triangle[0] as usize) {
                         continue;

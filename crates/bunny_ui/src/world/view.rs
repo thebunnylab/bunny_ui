@@ -118,7 +118,8 @@ impl Painter<'_> {
     pub fn world_styled(&mut self, rect: Rect, world: World, camera: impl CameraSource, style: &WorldStyle) {
         let time = motor::task::now();
         let held = camera.camera();
-        let moving = held.is_flying(time);
+        // a flying camera or a clip that plays: frames until it rests
+        let moving = held.is_flying(time) || world.with(|data| data.moving(time));
         let fps = style.max_fps.unwrap_or(MOTION_FPS).max(1.0);
         if moving {
             crate::anim::pulse(fps);

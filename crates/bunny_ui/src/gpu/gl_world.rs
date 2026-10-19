@@ -56,6 +56,8 @@ pub mod gl {
     pub const TEXTURE2: u32 = 0x84C2;
     pub const TEXTURE3: u32 = 0x84C3;
     pub const TEXTURE4: u32 = 0x84C4;
+    pub const TEXTURE5: u32 = 0x84C5;
+    pub const TEXTURE6: u32 = 0x84C6;
     pub const TEXTURE_MIN_FILTER: u32 = 0x2801;
     pub const TEXTURE_MAG_FILTER: u32 = 0x2800;
     pub const TEXTURE_WRAP_S: u32 = 0x2802;
@@ -75,6 +77,8 @@ pub mod gl {
     pub const RGBA32F: u32 = 0x8814;
     pub const RGBA8UI: u32 = 0x8D7C;
     pub const RGBA_INTEGER: u32 = 0x8D99;
+    pub const R32UI: u32 = 0x8236;
+    pub const RED_INTEGER: u32 = 0x8D94;
     pub const DEPTH_COMPONENT32F: u32 = 0x8CAC;
     pub const DEPTH_COMPONENT16: u32 = 0x81A5;
     pub const DEPTH_COMPONENT: u32 = 0x1902;
@@ -244,6 +248,10 @@ struct Programs {
     materials: u32,
     /// The frame's part table: four unsigned bytes a part.
     parts: u32,
+    /// The frame's palettes: three RGBA32F texels a joint.
+    joints: u32,
+    /// One word: what a mesh without a skin binds for its deform stream.
+    no_deform: u32,
     blank: u32,
     /// A map of one texel whose comparison always passes: a frame without
     /// a map reads full sun.
@@ -277,6 +285,8 @@ struct MeshObjects {
     array: u32,
     vertices: u32,
     indices: u32,
+    /// The deform stream as an R32UI texture (1024 words a row), or 0.
+    deform: u32,
 }
 
 struct SegmentObjects {
@@ -389,7 +399,7 @@ impl<G: GlFamily> GlWorld<G> {
         let prelude = gl.prelude();
         let table = source::srgb_table();
         let world = [("World", WORLD_BINDING)];
-        let mesh_vertex = format!("{prelude}{}{table}{}{}", source::WORLD_COMMON, source::PARTS, source::MESH_VERT);
+        let mesh_vertex = format!("{prelude}{}{table}{}{}{}", source::WORLD_COMMON, source::PARTS, source::SKIN, source::MESH_VERT);
         let mesh_fragment = |body: &str| format!("{prelude}{}{}{}{body}", source::WORLD_COMMON, source::PARTS, source::MESH_FRAG_COMMON);
         let mesh = gl.program(&mesh_vertex, &mesh_fragment(source::MESH_FRAG), &MESH_ATTRIBUTES, &world)?;
         let stepped = gl.program(&mesh_vertex, &mesh_fragment(source::MESH_FRAG_STEPPED), &MESH_ATTRIBUTES, &world)?;
@@ -407,7 +417,7 @@ impl<G: GlFamily> GlWorld<G> {
         let bloom_up = step(gl, source::BLOOM_UP_FRAG)?;
         let bloom_spill = step(gl, source::BLOOM_SPILL_FRAG)?;
         let shadow = gl.program(
-            &format!("{prelude}{}{}{}", source::WORLD_COMMON, source::PARTS, source::SHADOW_VERT),
+            &format!("{prelude}{}{}{}{}", source::WORLD_COMMON, source::PARTS, source::SKIN, source::SHADOW_VERT),
             &format!("{prelude}{}", source::SHADOW_FRAG),
             &MESH_ATTRIBUTES,
             &world,
@@ -426,7 +436,18 @@ impl<G: GlFamily> GlWorld<G> {
             located.style = gl.uniform_location(handle, "u_style");
             located.ramp = gl.uniform_location(handle, "u_ramp");
             located.bloom = gl.uniform_location(handle, "u_bloom");
-            let units = [("u_materials", 0), ("u_surface", 1), ("u_shadow", 2), ("u_floor", 3), ("u_parts", 4), ("atlas", 0), ("u_above", 0), ("u_second", 1)];
+            let units = [
+                ("u_materials", 0),
+                ("u_surface", 1),
+                ("u_shadow", 2),
+                ("u_floor", 3),
+                ("u_parts", 4),
+                ("u_joints", 5),
+                ("u_deform", 6),
+                ("atlas", 0),
+                ("u_above", 0),
+                ("u_second", 1),
+            ];
             for (name, unit) in units {
                 let at = gl.uniform_location(handle, name);
                 if at != 0 {
@@ -459,6 +480,15 @@ impl<G: GlFamily> GlWorld<G> {
         gl.bind_texture(parts);
         gl.tex_parameteri(gl::TEXTURE_MIN_FILTER, gl::NEAREST);
         gl.tex_parameteri(gl::TEXTURE_MAG_FILTER, gl::NEAREST);
+        let joints = gl.create_texture();
+        gl.bind_texture(joints);
+        gl.tex_parameteri(gl::TEXTURE_MIN_FILTER, gl::NEAREST);
+        gl.tex_parameteri(gl::TEXTURE_MAG_FILTER, gl::NEAREST);
+        let no_deform = gl.create_texture();
+        gl.bind_texture(no_deform);
+        gl.tex_image_2d(0, gl::R32UI, 1, 1, gl::RED_INTEGER, gl::UNSIGNED_INT, &[0; 4]);
+        gl.tex_parameteri(gl::TEXTURE_MIN_FILTER, gl::NEAREST);
+        gl.tex_parameteri(gl::TEXTURE_MAG_FILTER, gl::NEAREST);
         let dark = gl.create_texture();
         gl.bind_texture(dark);
         gl.tex_image_2d(0, gl::SRGB8_ALPHA8, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, &[0, 0, 0, 255]);
@@ -485,6 +515,8 @@ impl<G: GlFamily> GlWorld<G> {
             casters: gl.create_buffer(),
             materials,
             parts,
+            joints,
+            no_deform,
             blank,
             lit,
             dark,
@@ -523,7 +555,7 @@ impl<G: GlFamily> GlWorld<G> {
         gl.enable(gl::BLEND);
         let [a, b, c, d] = self.blend_2d;
         gl.blend_func_separate(a, b, c, d);
-        for unit in [gl::TEXTURE4, gl::TEXTURE3, gl::TEXTURE2, gl::TEXTURE1, gl::TEXTURE0] {
+        for unit in [gl::TEXTURE6, gl::TEXTURE5, gl::TEXTURE4, gl::TEXTURE3, gl::TEXTURE2, gl::TEXTURE1, gl::TEXTURE0] {
             gl.active_texture(unit);
             gl.bind_texture(0);
         }
@@ -551,6 +583,8 @@ impl<G: GlFamily> GlWorld<G> {
         for draw in &shadow.draws {
             let Some(objects) = job.meshes.get(draw.mesh as usize).and_then(|id| self.meshes.get(id)) else { continue };
             let gl = &mut self.gl;
+            gl.active_texture(gl::TEXTURE6);
+            gl.bind_texture(if objects.deform != 0 { objects.deform } else { programs.no_deform });
             gl.bind_vertex_array(objects.array);
             gl.bind_buffer(gl::ARRAY_BUFFER, programs.casters);
             point_casters(gl, draw.first_instance as usize * SHADOW_INSTANCE_STRIDE);
@@ -576,6 +610,14 @@ impl<G: GlFamily> GlWorld<G> {
         gl.active_texture(gl::TEXTURE4);
         gl.bind_texture(programs.parts);
         gl.tex_image_2d(0, gl::RGBA8UI, columns as i32, rows as i32, gl::RGBA_INTEGER, gl::UNSIGNED_BYTE, &table);
+        // the palettes, which the casters read too: 1024 rows a line
+        let count = frame.joints.len().max(1);
+        let (columns, rows) = (count.min(1024), count.div_ceil(1024));
+        let mut palette: Vec<u8> = frame.joints.iter().flatten().flat_map(|value| value.to_le_bytes()).collect();
+        palette.resize(columns * rows * 16, 0);
+        gl.active_texture(gl::TEXTURE5);
+        gl.bind_texture(programs.joints);
+        gl.tex_image_2d(0, gl::RGBA32F, columns as i32, rows as i32, gl::RGBA, gl::FLOAT, &palette);
         // the sun's map first, when it does not hold this frame's casters
         let map = job.shadow.and_then(|shadow| self.shadow_maps.get(&shadow.map).copied().map(|map| (shadow, map)));
         if let (Some((shadow, map)), Some(casters)) = (map, frame.shadow.as_ref())
@@ -682,6 +724,8 @@ impl<G: GlFamily> GlWorld<G> {
                     gl.front_face(if mirrored { gl::CCW } else { gl::CW });
                     gl.active_texture(gl::TEXTURE1);
                     gl.bind_texture(surface.unwrap_or(programs.blank));
+                    gl.active_texture(gl::TEXTURE6);
+                    gl.bind_texture(if objects.deform != 0 { objects.deform } else { programs.no_deform });
                     gl.bind_vertex_array(objects.array);
                     gl.bind_buffer(gl::ARRAY_BUFFER, programs.instances);
                     point_instances(gl, draw.first_instance as usize * crate::world::wire::instance_offset::SIZE);
@@ -982,7 +1026,7 @@ impl<G: GlFamily> WorldGround for GlWorld<G> {
         }
     }
 
-    fn make_mesh(&mut self, vertices: &[u8], indices: &[u8]) -> Option<u64> {
+    fn make_mesh(&mut self, vertices: &[u8], indices: &[u8], deform: &[u8]) -> Option<u64> {
         use crate::world::mesh::{VERTEX_STRIDE, offset};
         if vertices.is_empty() || indices.is_empty() {
             return None;
@@ -1010,8 +1054,23 @@ impl<G: GlFamily> WorldGround for GlWorld<G> {
         gl.bind_buffer(gl::ELEMENT_ARRAY_BUFFER, index_buffer);
         gl.buffer_data(gl::ELEMENT_ARRAY_BUFFER, indices, gl::STATIC_DRAW);
         gl.bind_vertex_array(0);
+        // the deform stream: one word a texel, 1024 a row
+        let mut deform_texture = 0;
+        if !deform.is_empty() {
+            let words = deform.len().div_ceil(4);
+            let (columns, rows) = (words.min(1024), words.div_ceil(1024));
+            let mut bytes = deform.to_vec();
+            bytes.resize(columns * rows * 4, 0);
+            deform_texture = gl.create_texture();
+            gl.active_texture(gl::TEXTURE0);
+            gl.bind_texture(deform_texture);
+            gl.tex_image_2d(0, gl::R32UI, columns as i32, rows as i32, gl::RED_INTEGER, gl::UNSIGNED_INT, &bytes);
+            gl.tex_parameteri(gl::TEXTURE_MIN_FILTER, gl::NEAREST);
+            gl.tex_parameteri(gl::TEXTURE_MAG_FILTER, gl::NEAREST);
+            gl.bind_texture(0);
+        }
         let id = self.mint();
-        self.meshes.insert(id, MeshObjects { array, vertices: vertex_buffer, indices: index_buffer });
+        self.meshes.insert(id, MeshObjects { array, vertices: vertex_buffer, indices: index_buffer, deform: deform_texture });
         Some(id)
     }
 
@@ -1020,6 +1079,9 @@ impl<G: GlFamily> WorldGround for GlWorld<G> {
             self.gl.delete_vertex_array(mesh.array);
             self.gl.delete_buffer(mesh.vertices);
             self.gl.delete_buffer(mesh.indices);
+            if mesh.deform != 0 {
+                self.gl.delete_texture(mesh.deform);
+            }
         }
     }
 

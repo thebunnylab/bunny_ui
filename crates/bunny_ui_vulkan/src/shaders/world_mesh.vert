@@ -73,6 +73,46 @@ uvec4 part_row(uint index) {
     return uvec4(packed & 255u, (packed >> 8) & 255u, (packed >> 16) & 255u, packed >> 24);
 }
 
+layout(std430, set = 0, binding = 3) readonly buffer Joints {
+    vec4 rows[];
+} palette;
+layout(std430, set = 4, binding = 0) readonly buffer Deform {
+    uint words[];
+} deform;
+
+vec4 joint_row(uint index) {
+    return palette.rows[index];
+}
+
+uint deform_word(uint index) {
+    return deform.words[index];
+}
+
+// each of the vertex's four joints applied to the point, and without the
+// move to the normal, weighed by its share in order: the CPU's order
+void skin(uint base, inout vec3 p, inout vec3 n) {
+    uint vertex = uint(gl_VertexIndex);
+    uint joints = deform_word(2u * vertex);
+    uint weights = deform_word(2u * vertex + 1u);
+    vec3 point = vec3(0.0);
+    vec3 normal = vec3(0.0);
+    for (uint k = 0u; k < 4u; k++) {
+        float w = float((weights >> (8u * k)) & 255u) / 255.0;
+        uint row = base + 3u * ((joints >> (8u * k)) & 255u);
+        vec4 r0 = joint_row(row);
+        vec4 r1 = joint_row(row + 1u);
+        vec4 r2 = joint_row(row + 2u);
+        point = point + w * vec3(r0.x * p.x + r0.y * p.y + r0.z * p.z + r0.w,
+                                 r1.x * p.x + r1.y * p.y + r1.z * p.z + r1.w,
+                                 r2.x * p.x + r2.y * p.y + r2.z * p.z + r2.w);
+        normal = normal + w * vec3(r0.x * n.x + r0.y * n.y + r0.z * n.z,
+                                   r1.x * n.x + r1.y * n.y + r1.z * n.z,
+                                   r2.x * n.x + r2.y * n.y + r2.z * n.z);
+    }
+    p = point;
+    n = normal;
+}
+
 layout(location = 0) in vec3 a_position;
 layout(location = 1) in ivec2 a_normal;
 layout(location = 2) in vec2 a_uv;
@@ -115,10 +155,14 @@ vec3 unfold_normal(ivec2 folded) {
 
 void main() {
     vec3 p = a_position;
+    vec3 n = unfold_normal(a_normal);
+    // a skinned vertex moves to its pose before it is placed
+    if (i_more.z != 0xFFFFFFFFu) {
+        skin(i_more.z, p, n);
+    }
     vec3 eye = vec3(i_row0.x * p.x + i_row0.y * p.y + i_row0.z * p.z + i_row0.w,
                     i_row1.x * p.x + i_row1.y * p.y + i_row1.z * p.z + i_row1.w,
                     i_row2.x * p.x + i_row2.y * p.y + i_row2.z * p.z + i_row2.w);
-    vec3 n = unfold_normal(a_normal);
     vec4 clip = clip_from_eye * vec4(eye, 1.0);
     gl_Position = to_gl(clip);
     v_zw = vec2(clip.z, clip.w);

@@ -22,7 +22,7 @@ use super::mesh::{fold_normal, unfold_normal};
 use super::shade::{self, Surface, V3, decode, encode_code, quantize};
 use super::shadow::{self as sun_shadow, ShadowMap};
 use super::texture::{Texture, log2};
-use super::wire::{FrameUniforms, InstanceData, NO_PARTS, PartRow, instance_flag, material_flag};
+use super::wire::{FrameUniforms, InstanceData, NO_JOINTS, NO_PARTS, PartRow, Row, instance_flag, material_flag};
 
 /// A picture of a world: premultiplied, sRGB-encoded RGBA8, top row
 /// first.
@@ -105,7 +105,7 @@ pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Textu
                         if part_hidden(frame, instance.part_base, mesh.data(), triangle[0] as usize) {
                             continue;
                         }
-                        let vertices = [0, 1, 2].map(|k| corners.vertex(triangle[k] as usize, instance, &projection));
+                        let vertices = [0, 1, 2].map(|k| corners.vertex(triangle[k] as usize, instance, &projection, &frame.joints));
                         job.triangle(&mut target, vertices);
                     }
                 }
@@ -253,13 +253,17 @@ impl<'a> Corners<'a> {
         Corners { data, normals: data.normals.iter().map(|&n| unfold_normal(fold_normal(n))).collect() }
     }
 
-    fn vertex(&self, index: usize, instance: &InstanceData, projection: &[f32; 16]) -> Vertex {
+    fn vertex(&self, index: usize, instance: &InstanceData, projection: &[f32; 16], palette: &[Row]) -> Vertex {
         let data = self.data;
         let count = data.positions.len();
-        let p = data.positions[index];
+        let mut p = data.positions[index];
+        let mut n = self.normals[index];
+        // a skinned vertex moves to its pose before it is placed
+        if instance.joint_base != NO_JOINTS && data.joints.len() == count && data.weights.len() == count {
+            (p, n) = super::skin::skin_vertex(palette, instance.joint_base, data.joints[index], data.weights[index], p, n);
+        }
         let row = |r: [f32; 4]| r[0] * p[0] + r[1] * p[1] + r[2] * p[2] + r[3];
         let eye = [row(instance.eye_from_model[0]), row(instance.eye_from_model[1]), row(instance.eye_from_model[2])];
-        let n = self.normals[index];
         let turn = |r: [f32; 4]| r[0] * n[0] + r[1] * n[1] + r[2] * n[2];
         let normal = [turn(instance.normal[0]), turn(instance.normal[1]), turn(instance.normal[2])];
         let color = if data.colors.len() == count { data.colors[index] } else { [255; 4] };
@@ -766,7 +770,7 @@ mod tests {
     use crate::world::material::{LineDepth, LineStyle, Material};
     use crate::world::math::{Plane, Vec3, vec2, vec3};
     use crate::world::mesh::{Mesh, MeshData};
-    use crate::world::store::World;
+    use crate::world::store::{Entity, World};
 
     fn style(background: Background) -> WorldStyle {
         WorldStyle { background, quality: Quality::Low, ..WorldStyle::default() }
@@ -1039,6 +1043,67 @@ mod tests {
         // below High, no bloom
         let medium = world.frame(&camera, &WorldStyle { quality: Quality::Medium, ..high }, (96, 96), 1.0);
         assert_eq!(medium.bloom, 0);
+    }
+
+    /// A tall box whose top hangs from an arm that a clip carries one
+    /// meter along x; the bottom stays on the root.
+    fn swaying_box() -> (World, crate::world::skin::Clip, Entity) {
+        use crate::world::material::Model;
+        use crate::world::math::Transform;
+        use crate::world::skin::{Channel, Clip, Path, Skeleton, SkeletonNode, Skin};
+        let skeleton = Skeleton::new(vec![
+            SkeletonNode { name: Some("root".into()), parent: None, rest: Transform::IDENTITY },
+            SkeletonNode { name: Some("arm".into()), parent: Some(0), rest: Transform::IDENTITY },
+        ]);
+        let skin = Skin::new(skeleton, vec![0, 1], Vec::new()).expect("a skin");
+        let mut data = Mesh::cuboid(0.4, 2.0, 0.4).data().clone();
+        data.joints = vec![[0, 1, 0, 0]; data.positions.len()];
+        data.weights = data.positions.iter().map(|p| if p[1] > 0.0 { [0, 255, 0, 0] } else { [255, 0, 0, 0] }).collect();
+        let world = World::new();
+        let entity = world.add_model(Model::single(Mesh::new(data), Material::unlit(Color::rgb(220, 90, 40))).skinned(skin));
+        let sway = Channel { node: 1, path: Path::Translation, step: false, times: Rc::from([0.0, 1.0]), values: Rc::from([0.0, 0.0, 0.0, 1.0, 0.0, 0.0]) };
+        (world, Clip::new(Some("sway".into()), vec![sway]), entity)
+    }
+
+    #[test]
+    fn a_skinned_box_follows_its_clip() {
+        use crate::world::skin::Play;
+        let (world, clip, entity) = swaying_box();
+        let camera = Camera::looking_at(vec3(0.0, 0.0, 5.0), Vec3::ZERO).parallel_height(4.0);
+        let rest = world.render(&camera, &style(Background::Transparent), (64, 64), 1.0);
+        // at rest the box stands straight: its top half on the middle column
+        assert!(rest.at(32, 18)[3] > 0 && rest.at(48, 18)[3] == 0, "{:?} {:?}", rest.at(32, 18), rest.at(48, 18));
+        entity.set_play(Some(Play { clip, start: motor::task::now() - 5.0, speed: 1.0, looped: false }));
+        let moved = world.render(&camera, &style(Background::Transparent), (64, 64), 1.0);
+        dump("skinned-box", &moved);
+        // the clip held at its end: the top a meter to the right, the
+        // bottom where it stood
+        assert!(moved.at(48, 18)[3] > 0 && moved.at(32, 18)[3] == 0, "{:?} {:?}", moved.at(48, 18), moved.at(32, 18));
+        assert_eq!(moved.at(32, 46), rest.at(32, 46), "the root's half stays");
+    }
+
+    #[test]
+    fn garments_share_their_wearers_palette() {
+        use crate::world::material::Model;
+        let (world, clip, body) = swaying_box();
+        let model = body.spec().and_then(|spec| match spec.shape {
+            crate::world::store::Shape::Model(model) => Some(model),
+            _ => None,
+        });
+        let model: Model = model.expect("the body's model");
+        // a coat: the same mesh and skin, hung under the body
+        let coat = world.add_model(Model { materials: Rc::from(vec![Material::unlit(Color::rgb(40, 60, 200))]), ..model }).set_parent(Some(body));
+        body.play(&clip);
+        let camera = Camera::looking_at(vec3(0.0, 0.0, 5.0), Vec3::ZERO).parallel_height(4.0);
+        let frame = world.frame(&camera, &style(Background::Transparent), (64, 64), 1.0);
+        assert_eq!(frame.joints.len(), 6, "one palette for the body and its coat");
+        assert!(frame.instances.iter().all(|instance| instance.joint_base == 0));
+        assert!(coat.is_alive());
+        // a clip that plays asks for frames; one held at its end does not
+        let moving = |world: &World| world.with(|data| data.moving(motor::task::now()));
+        assert!(moving(&world));
+        body.set_play(Some(crate::world::skin::Play { clip, start: motor::task::now() - 5.0, speed: 1.0, looped: false }));
+        assert!(!moving(&world));
     }
 
     #[test]

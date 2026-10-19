@@ -85,10 +85,52 @@ uvec4 part_row(uint index) {
 }
 "#;
 
+/// A skinned vertex's pose: the frame's palette (three RGBA32F texels a
+/// joint, 1024 a row) and the mesh's deform stream (one R32UI texel a
+/// word, two words a vertex: its joints, then its weights), both read by
+/// number. It follows `WORLD_COMMON`.
+pub const SKIN: &str = r#"
+uniform highp sampler2D u_joints;
+uniform highp usampler2D u_deform;
+
+vec4 joint_row(uint index) {
+    return texelFetch(u_joints, ivec2(int(index % 1024u), int(index / 1024u)), 0);
+}
+
+uint deform_word(uint index) {
+    return texelFetch(u_deform, ivec2(int(index % 1024u), int(index / 1024u)), 0).r;
+}
+
+// each of the vertex's four joints applied to the point, and without the
+// move to the normal, weighed by its share in order: the CPU's order
+void skin(uint base, inout vec3 p, inout vec3 n) {
+    uint vertex = uint(gl_VertexID);
+    uint joints = deform_word(2u * vertex);
+    uint weights = deform_word(2u * vertex + 1u);
+    vec3 point = vec3(0.0);
+    vec3 normal = vec3(0.0);
+    for (uint k = 0u; k < 4u; k++) {
+        float w = float((weights >> (8u * k)) & 255u) / 255.0;
+        uint row = base + 3u * ((joints >> (8u * k)) & 255u);
+        vec4 r0 = joint_row(row);
+        vec4 r1 = joint_row(row + 1u);
+        vec4 r2 = joint_row(row + 2u);
+        point = point + w * vec3(r0.x * p.x + r0.y * p.y + r0.z * p.z + r0.w,
+                                 r1.x * p.x + r1.y * p.y + r1.z * p.z + r1.w,
+                                 r2.x * p.x + r2.y * p.y + r2.z * p.z + r2.w);
+        normal = normal + w * vec3(r0.x * n.x + r0.y * n.y + r0.z * n.z,
+                                   r1.x * n.x + r1.y * n.y + r1.z * n.z,
+                                   r2.x * n.x + r2.y * n.y + r2.z * n.z);
+    }
+    p = point;
+    n = normal;
+}
+"#;
+
 /// A surface's vertex stage: the vertex and its instance arrive as
 /// attributes at fixed locations; the instance attributes are re-pointed
 /// per draw, so the first instance rides the byte offset. It follows
-/// `WORLD_COMMON`, the sRGB table and `PARTS`.
+/// `WORLD_COMMON`, the sRGB table, `PARTS` and `SKIN`.
 pub const MESH_VERT: &str = r#"
 layout(location = 0) in vec3 a_position;
 layout(location = 1) in ivec2 a_normal;
@@ -132,10 +174,14 @@ vec3 unfold_normal(ivec2 folded) {
 
 void main() {
     vec3 p = a_position;
+    vec3 n = unfold_normal(a_normal);
+    // a skinned vertex moves to its pose before it is placed
+    if (i_more.z != 0xFFFFFFFFu) {
+        skin(i_more.z, p, n);
+    }
     vec3 eye = vec3(i_row0.x * p.x + i_row0.y * p.y + i_row0.z * p.z + i_row0.w,
                     i_row1.x * p.x + i_row1.y * p.y + i_row1.z * p.z + i_row1.w,
                     i_row2.x * p.x + i_row2.y * p.y + i_row2.z * p.z + i_row2.w);
-    vec3 n = unfold_normal(a_normal);
     vec4 clip = clip_from_eye * vec4(eye, 1.0);
     gl_Position = to_gl(clip);
     v_zw = vec2(clip.z, clip.w);
@@ -480,8 +526,9 @@ void main() {
 
 /// A caster into the sun's shadow map: the vertex placed by the caster's
 /// rows, the map upside down in clip space like every target, so its
-/// first row is its top; a part that hides casts nothing. It follows
-/// `WORLD_COMMON` and `PARTS`.
+/// first row is its top; a part that hides casts nothing, and a skinned
+/// caster casts its pose (`i_ids.y`, its joint base). It follows
+/// `WORLD_COMMON`, `PARTS` and `SKIN`.
 pub const SHADOW_VERT: &str = r#"
 layout(location = 0) in vec3 a_position;
 layout(location = 4) in uvec4 a_ids;
@@ -496,6 +543,10 @@ void main() {
         return;
     }
     vec3 p = a_position;
+    if (i_ids.y != 0xFFFFFFFFu) {
+        vec3 unused = vec3(0.0);
+        skin(i_ids.y, p, unused);
+    }
     vec3 m = vec3(i_row0.x * p.x + i_row0.y * p.y + i_row0.z * p.z + i_row0.w,
                   i_row1.x * p.x + i_row1.y * p.y + i_row1.z * p.z + i_row1.w,
                   i_row2.x * p.x + i_row2.y * p.y + i_row2.z * p.z + i_row2.w);
@@ -779,9 +830,10 @@ mod tests {
     use super::*;
     use crate::gpu::shaders::{PRELUDE_300ES, PRELUDE_330};
 
-    const BODIES: [(&str, &str); 16] = [
+    const BODIES: [(&str, &str); 17] = [
         ("WORLD_COMMON", WORLD_COMMON),
         ("PARTS", PARTS),
+        ("SKIN", SKIN),
         ("MESH_VERT", MESH_VERT),
         ("MESH_FRAG_COMMON", MESH_FRAG_COMMON),
         ("MESH_FRAG", MESH_FRAG),

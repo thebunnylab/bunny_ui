@@ -15,11 +15,8 @@ use super::polygon::triangulate;
 
 // MARK: - The vertex on the wire
 
-/// Bytes per vertex of a mesh without a skin.
+/// Bytes per vertex.
 pub const VERTEX_STRIDE: usize = 32;
-/// Bytes per vertex of a skinned mesh: the plain vertex, then four
-/// joint indices and four weights.
-pub const SKINNED_VERTEX_STRIDE: usize = 40;
 
 /// Where each attribute starts inside a vertex. Every tier reads these
 /// offsets; a test pins them.
@@ -38,11 +35,13 @@ pub mod offset {
     pub const OCCLUSION: usize = 29;
     /// `u16`, little-endian: the part of the mesh the vertex belongs to.
     pub const PART: usize = 30;
-    /// `u8 × 4`: the joints that move a skinned vertex.
-    pub const JOINTS: usize = 32;
-    /// `u8 × 4`, unit-normalized: how much each joint moves it.
-    pub const WEIGHTS: usize = 36;
 }
+
+/// Bytes per vertex of a skinned mesh's second stream
+/// ([`Mesh::deform_bytes`]): its four joints, then its four weights. The
+/// shaders read it by the vertex's number, so the vertex itself keeps
+/// its 32 bytes and a mesh without a skin carries nothing more.
+pub const DEFORM_STRIDE: usize = 8;
 
 /// A unit normal folded onto the octahedron and quantized to two
 /// signed 16-bit numbers. The shader and the CPU rasterizer unfold it
@@ -105,6 +104,12 @@ pub struct MeshData {
     /// region of a figure. A part can take its own tint or hide, with no
     /// new upload. Default 0.
     pub parts: Vec<u16>,
+    /// The four joints each vertex hangs from, by their number in the
+    /// skin ([`super::skin::Skin`]). Empty for a mesh without a skin.
+    pub joints: Vec<[u8; 4]>,
+    /// How much each of the four joints moves the vertex; they sum to
+    /// 255 (a mesh is made so).
+    pub weights: Vec<[u8; 4]>,
     pub indices: Vec<u32>,
 }
 
@@ -137,6 +142,10 @@ impl MeshData {
                 out.materials.push(Self::channel(&self.materials, count, i, 0));
                 out.occlusion.push(Self::channel(&self.occlusion, count, i, 255));
                 out.parts.push(Self::channel(&self.parts, count, i, 0));
+                if self.joints.len() == count && self.weights.len() == count {
+                    out.joints.push(self.joints[i]);
+                    out.weights.push(self.weights[i]);
+                }
             }
         }
         out
@@ -232,6 +241,27 @@ impl Mesh {
     /// index, index count)`. The triangles of a slot stand together.
     pub fn material_runs(&self) -> &[(u8, u32, u32)] {
         &self.0.runs
+    }
+
+    /// Whether the mesh's vertices hang from joints.
+    pub fn is_skinned(&self) -> bool {
+        let data = &self.0.data;
+        !data.positions.is_empty() && data.joints.len() == data.positions.len() && data.weights.len() == data.positions.len()
+    }
+
+    /// The second stream of a skinned mesh, [`DEFORM_STRIDE`] bytes a
+    /// vertex: its joints, then its weights. Empty without a skin.
+    pub fn deform_bytes(&self) -> Vec<u8> {
+        if !self.is_skinned() {
+            return Vec::new();
+        }
+        let data = &self.0.data;
+        let mut bytes = Vec::with_capacity(data.positions.len() * DEFORM_STRIDE);
+        for (joints, weights) in data.joints.iter().zip(&data.weights) {
+            bytes.extend_from_slice(joints);
+            bytes.extend_from_slice(weights);
+        }
+        bytes
     }
 
     /// How many parts the mesh's vertices name: one past the highest.
@@ -359,6 +389,16 @@ fn sanitize(mut data: MeshData) -> MeshData {
     if data.normals.len() != count {
         data = data.with_flat_normals();
     }
+    // weights that sum to 255, the largest taking what rounding leaves
+    let count = data.positions.len();
+    if data.joints.len() == count && data.weights.len() == count {
+        for weights in &mut data.weights {
+            *weights = whole_weights(*weights);
+        }
+    } else {
+        data.joints.clear();
+        data.weights.clear();
+    }
     // the triangles of one material side by side, in their own order:
     // a draw binds one texture, and a material is a run of indices
     let count = data.positions.len();
@@ -369,6 +409,23 @@ fn sanitize(mut data: MeshData) -> MeshData {
         data.indices = triangles.into_iter().flatten().collect();
     }
     data
+}
+
+/// Four weights scaled to sum to 255; four zeros put the vertex on its
+/// first joint.
+fn whole_weights(weights: [u8; 4]) -> [u8; 4] {
+    let sum: u32 = weights.iter().map(|&w| w as u32).sum();
+    if sum == 0 {
+        return [255, 0, 0, 0];
+    }
+    if sum == 255 {
+        return weights;
+    }
+    let mut out = weights.map(|w| (w as u32 * 255 / sum) as u8);
+    let left = 255 - out.iter().map(|&w| w as u32).sum::<u32>();
+    let largest = (0..4).max_by_key(|&k| (weights[k], 3 - k)).unwrap_or(0);
+    out[largest] += left as u8;
+    out
 }
 
 /// The runs of triangles that share a material: `(slot, first index,
@@ -787,9 +844,14 @@ mod tests {
             materials: vec![7],
             occlusion: vec![200],
             parts: vec![513],
+            joints: vec![[3, 1, 0, 0]],
+            weights: vec![[100, 100, 0, 0]],
             indices: vec![],
         };
-        let bytes = Mesh::new(data).vertex_bytes();
+        let mesh = Mesh::new(data);
+        // the skin rides a stream of its own, its weights made whole
+        assert_eq!(mesh.deform_bytes(), vec![3, 1, 0, 0, 128, 127, 0, 0]);
+        let bytes = mesh.vertex_bytes();
         assert_eq!(bytes.len(), VERTEX_STRIDE);
         let f32_at = |at: usize| f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
         let i16_at = |at: usize| i16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());

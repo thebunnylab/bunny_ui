@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use super::math::{Mat4, Vec2, Vec3};
 use super::mesh::{Mesh, MeshData};
+use super::skin::Skin;
 use crate::image_engine::ImageSource;
 use crate::layout::Color;
 
@@ -122,16 +123,24 @@ impl Material {
 pub struct Model {
     pub mesh: Mesh,
     pub materials: Rc<[Material]>,
+    /// How the mesh hangs from a skeleton, for a mesh whose vertices name
+    /// joints: the entity, or one above it, plays the clip that moves it.
+    pub skin: Option<Skin>,
 }
 
 impl Model {
     pub fn new(mesh: Mesh, materials: impl Into<Rc<[Material]>>) -> Model {
-        Model { mesh, materials: materials.into() }
+        Model { mesh, materials: materials.into(), skin: None }
     }
 
     /// One material for every vertex.
     pub fn single(mesh: Mesh, material: Material) -> Model {
-        Model { mesh, materials: Rc::from(vec![material]) }
+        Model { mesh, materials: Rc::from(vec![material]), skin: None }
+    }
+
+    /// The same model, hanging from `skin`.
+    pub fn skinned(self, skin: Skin) -> Model {
+        Model { skin: Some(skin), ..self }
     }
 
     /// A soft dark disc `radius` meters across its half, for under

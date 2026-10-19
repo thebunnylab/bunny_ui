@@ -343,6 +343,33 @@ light, alpha modes, two sides, unlit surfaces, and the node tree. The
 under a group; an asset spawned twice draws as one instanced mesh.
 Every malformed input is an error, never a panic.
 
+## Skins and clips
+
+A figure's vertices hang from joints. A `Skeleton` is a tree of nodes
+in their rest pose; a `Skin` names the nodes a mesh hangs from and the
+inverse bind of each; a `Clip` moves the nodes with keys of
+translation, rotation and scale, held or blended. glTF brings all three
+(`asset.skeleton`, `asset.skins`, `asset.clips`): cubic spline keys are
+refused, so sample them at a steady rate. An entity plays a clip, and
+every skinned entity below it moves with it — a figure and the clothes
+it wears read one pose:
+
+```rust
+let figure = world.spawn(&asset);
+figure.play(asset.clip("walk").unwrap());   // over and over, from now
+```
+
+The pose is worked out on the CPU, once a frame for each entity that
+plays, with the four operations and square roots alone: the same bytes
+on every machine. Between two keys a rotation turns along the straight
+blend of the two, made unit again. Each skinned instance takes its
+palette — three rows a joint — and the vertex stage moves each vertex
+by its four joints; the shadow pass casts the pose. Instances of one
+skinned mesh still draw as one, each with its own palette. A playing
+clip asks for frames until it rests; a clip played once holds its last
+pose. A skinned mesh is culled by its rest box, grown by half its
+longest side each way.
+
 ## Limits
 
 - A world inside a `.looping` box or an overlay island is drawn on the
@@ -365,6 +392,6 @@ BUNNY_PARANOID=all cargo test -p bunny-ui-core --all-features
 cargo test -p bunny-ui-apple --features 3d
 cargo run -p bunny-ui-macos --features 3d --example world_window
 # in a page built with the web shell's `3d` feature, from the console:
-#   for (let n = 0; n < 18; n++) __bunny.bunny_gpu_world_parity(n)
+#   for (let n = 0; n < 19; n++) __bunny.bunny_gpu_world_parity(n)
 BUNNY_WORLD_GLB=chair.glb BUNNY_WORLD_DUMP=/tmp cargo test -p bunny-ui-core --features gltf --lib a_glb_from_the_environment -- --ignored
 ```

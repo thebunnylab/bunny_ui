@@ -135,7 +135,8 @@ struct WorldInstance {
     uint flags;
     uchar4 ambient;
     uint part_base;
-    uint reserved[2];
+    uint joint_base;
+    uint reserved;
 };
 
 struct WorldMaterial {
@@ -378,6 +379,32 @@ static float3 unfold_normal(short2 folded) {
     return float3(x / len, y / len, z / len);
 }
 
+// a skinned vertex's pose: each of its four joints applied to the point,
+// and without the move to the normal, weighed by its share in order —
+// the CPU's order. The deform stream holds two words a vertex (its
+// joints, then its weights); the palette three rows a joint
+static void skin(device const float4* joints, device const uint* deform, uint base, uint corner, thread float3& p, thread float3& n) {
+    uint which = deform[2 * corner];
+    uint shares = deform[2 * corner + 1];
+    float3 point = float3(0.0);
+    float3 normal = float3(0.0);
+    for (uint k = 0; k < 4; k++) {
+        float w = float((shares >> (8 * k)) & 255u) / 255.0;
+        uint row = base + 3 * ((which >> (8 * k)) & 255u);
+        float4 r0 = joints[row];
+        float4 r1 = joints[row + 1];
+        float4 r2 = joints[row + 2];
+        point = point + w * float3(r0.x * p.x + r0.y * p.y + r0.z * p.z + r0.w,
+                                   r1.x * p.x + r1.y * p.y + r1.z * p.z + r1.w,
+                                   r2.x * p.x + r2.y * p.y + r2.z * p.z + r2.w);
+        normal = normal + w * float3(r0.x * n.x + r0.y * n.y + r0.z * n.z,
+                                     r1.x * n.x + r1.y * n.y + r1.z * n.z,
+                                     r2.x * n.x + r2.y * n.y + r2.z * n.z);
+    }
+    p = point;
+    n = normal;
+}
+
 static float3 to_eye(WorldInstance instance, float3 p) {
     float4 r0 = instance.eye_from_model[0];
     float4 r1 = instance.eye_from_model[1];
@@ -409,7 +436,9 @@ vertex WorldVary world_vertex(uint vid [[vertex_id]],
                               device const WorldInstance* instances [[buffer(1)]],
                               constant WorldUniforms& u [[buffer(2)]],
                               constant WorldDraw& draw [[buffer(3)]],
-                              device const uchar4* parts [[buffer(5)]]) {
+                              device const uchar4* parts [[buffer(5)]],
+                              device const uint* deform [[buffer(6)]],
+                              device const float4* joints [[buffer(7)]]) {
     WorldVertex v = vertices[vid];
     uint index = draw.first_instance + iid;
     WorldInstance instance = instances[index];
@@ -424,8 +453,13 @@ vertex WorldVary world_vertex(uint vid [[vertex_id]],
         }
         part_tint = float3(SRGB_DECODE[part.r], SRGB_DECODE[part.g], SRGB_DECODE[part.b]);
     }
-    float3 eye = to_eye(instance, float3(v.position));
+    float3 p = float3(v.position);
     float3 n = unfold_normal(v.normal);
+    // a skinned vertex moves to its pose before it is placed
+    if (instance.joint_base != 0xFFFFFFFFu) {
+        skin(joints, deform, instance.joint_base, vid, p, n);
+    }
+    float3 eye = to_eye(instance, p);
     WorldVary out;
     out.position = u.clip_from_eye * float4(eye, 1.0);
     out.depth = out.position.z / out.position.w;
@@ -653,7 +687,8 @@ fragment SteppedGlowBack world_fragment_stepped_glow(WorldVary in [[stage_in]],
 struct ShadowCaster {
     float4 rows[3];
     uint part_base;
-    uint pad[3];
+    uint joint_base;
+    uint pad[2];
 };
 
 struct ShadowVary {
@@ -667,12 +702,19 @@ vertex ShadowVary shadow_vertex(uint vid [[vertex_id]],
                                 device const WorldVertex* vertices [[buffer(0)]],
                                 device const ShadowCaster* casters [[buffer(1)]],
                                 constant WorldDraw& draw [[buffer(3)]],
-                                device const uchar4* parts [[buffer(5)]]) {
+                                device const uchar4* parts [[buffer(5)]],
+                                device const uint* deform [[buffer(6)]],
+                                device const float4* joints [[buffer(7)]]) {
     float3 p = float3(vertices[vid].position);
     ShadowCaster caster = casters[draw.first_instance + iid];
     // a part that hides casts nothing
     if (caster.part_base != 0xFFFFFFFFu && parts[caster.part_base + vertices[vid].part].a == 0) {
         return ShadowVary{float4(0.0, 0.0, 2.0, 1.0)};
+    }
+    // a skinned caster casts its pose
+    if (caster.joint_base != 0xFFFFFFFFu) {
+        float3 unused = float3(0.0);
+        skin(joints, deform, caster.joint_base, vid, p, unused);
     }
     float4 r0 = caster.rows[0];
     float4 r1 = caster.rows[1];
@@ -1046,6 +1088,8 @@ struct WorldStack {
     /// One black, opaque texel: a floor map that adds and takes nothing,
     /// bound while a frame's floor map is not decoded.
     dark: Id,
+    /// One word: the deform stream a mesh without a skin binds.
+    no_deform: Id,
     /// Whether the GPU keeps attachments in tile memory.
     memoryless: bool,
     sels: Selectors,
@@ -1078,6 +1122,8 @@ struct Target {
 struct MeshBuffers {
     vertices: Id,
     indices: Id,
+    /// The deform stream, or null for a mesh without a skin.
+    deform: Id,
 }
 
 /// A target's bloom: its glow and the chain's steps, made on its first
@@ -1169,11 +1215,11 @@ impl MetalWorld {
     /// need, built: what the encode reads, with nothing left to borrow.
     /// `staged` holds where each job's instances and materials lie in the
     /// slot's staging buffer.
-    pub(super) fn prepare(&mut self, batches: &FrameBatches, staged: &[(u64, u64, u64, u64)]) -> FramePass {
+    pub(super) fn prepare(&mut self, batches: &FrameBatches, staged: &[StagedAt]) -> FramePass {
         let Built::Ready(stack) = &mut self.built else { return FramePass::default() };
         let composite = stack.composite;
         let mut jobs = Vec::with_capacity(batches.worlds.len());
-        for (job, &(instances, materials, casters, parts)) in batches.worlds.iter().zip(staged) {
+        for (job, &StagedAt { instances, materials, casters, parts, joints }) in batches.worlds.iter().zip(staged) {
             let Some(target) = self.targets.get(&job.target) else { continue };
             let samples = target.samples;
             // a frame with a bloom draws its glow beside its colour
@@ -1209,6 +1255,7 @@ impl MetalWorld {
                             Some(CasterDraw {
                                 vertices: buffers.vertices,
                                 indices: buffers.indices,
+                                deform: if buffers.deform.is_null() { stack.no_deform } else { buffers.deform },
                                 first_index: draw.first_index,
                                 index_count: draw.index_count,
                                 instance_count: draw.instance_count,
@@ -1262,6 +1309,7 @@ impl MetalWorld {
                             winding: if mirrored { WINDING_CLOCKWISE } else { WINDING_COUNTER_CLOCKWISE },
                             vertices: buffers.vertices,
                             indices: buffers.indices,
+                            deform: if buffers.deform.is_null() { stack.no_deform } else { buffers.deform },
                             first_index,
                             index_count,
                             instance_count: draw.instance_count,
@@ -1334,6 +1382,7 @@ impl MetalWorld {
                 instances,
                 materials,
                 parts,
+                joints,
                 draws,
                 sampler: stack.sampler,
                 shadow,
@@ -1433,6 +1482,10 @@ impl WorldStack {
                 return Err("no dark texel".to_string());
             }
             super::upload_texture(dark, 0, 0, 1, 1, &[0, 0, 0, 255], 1);
+            let no_deform = filled_buffer(device, &[0; 4]);
+            if no_deform.is_null() {
+                return Err("no empty deform buffer".to_string());
+            }
             // tile memory on an Apple GPU — but not under the simulator,
             // whose Metal has no memoryless storage
             let memoryless = cfg!(not(target_abi = "sim")) && msg_bool_u64(device, sel("supportsFamily:"), GPU_FAMILY_APPLE1) != 0;
@@ -1449,6 +1502,7 @@ impl WorldStack {
                 sampler,
                 blank,
                 dark,
+                no_deform,
                 memoryless,
                 sels: Selectors {
                     depth_attachment: sel("depthAttachment"),
@@ -1496,7 +1550,7 @@ impl WorldStack {
 impl Drop for WorldStack {
     fn drop(&mut self) {
         unsafe {
-            for id in [self.library, self.composite, self.shadow, self.compare, self.lit, self.always, self.sampler, self.blank, self.dark]
+            for id in [self.library, self.composite, self.shadow, self.compare, self.lit, self.always, self.sampler, self.blank, self.dark, self.no_deform]
                 .into_iter()
                 .chain(self.depth_states)
                 .chain(self.bloom)
@@ -1733,14 +1787,16 @@ impl WorldGround for MetalWorld {
         }
     }
 
-    fn make_mesh(&mut self, vertices: &[u8], indices: &[u8]) -> Option<u64> {
+    fn make_mesh(&mut self, vertices: &[u8], indices: &[u8], deform: &[u8]) -> Option<u64> {
         if vertices.is_empty() || indices.is_empty() {
             return None;
         }
+        let wants_deform = !deform.is_empty();
         let (vertices, indices) = unsafe { (filled_buffer(self.device, vertices), filled_buffer(self.device, indices)) };
-        if vertices.is_null() || indices.is_null() {
+        let deform = if wants_deform { unsafe { filled_buffer(self.device, deform) } } else { null_mut() };
+        if vertices.is_null() || indices.is_null() || (wants_deform && deform.is_null()) {
             unsafe {
-                for buffer in [vertices, indices] {
+                for buffer in [vertices, indices, deform] {
                     if !buffer.is_null() {
                         msg_void(buffer, sel("release"));
                     }
@@ -1749,7 +1805,7 @@ impl WorldGround for MetalWorld {
             return None;
         }
         let id = self.mint();
-        self.meshes.insert(id, MeshBuffers { vertices, indices });
+        self.meshes.insert(id, MeshBuffers { vertices, indices, deform });
         Some(id)
     }
 
@@ -1760,6 +1816,9 @@ impl WorldGround for MetalWorld {
             unsafe {
                 msg_void(mesh.vertices, sel("release"));
                 msg_void(mesh.indices, sel("release"));
+                if !mesh.deform.is_null() {
+                    msg_void(mesh.deform, sel("release"));
+                }
             }
         }
     }
@@ -1929,6 +1988,7 @@ struct PreparedJob {
     instances: u64,
     materials: u64,
     parts: u64,
+    joints: u64,
     draws: Vec<PreparedDraw>,
     sampler: Id,
     /// The casters to draw into the box's map first, when it does not
@@ -1966,6 +2026,7 @@ struct PreparedShadow {
 struct CasterDraw {
     vertices: Id,
     indices: Id,
+    deform: Id,
     first_index: u32,
     index_count: u32,
     instance_count: u32,
@@ -1980,6 +2041,7 @@ enum PreparedDraw {
         winding: u64,
         vertices: Id,
         indices: Id,
+        deform: Id,
         first_index: u32,
         index_count: u32,
         instance_count: u32,
@@ -2071,6 +2133,7 @@ impl FramePass {
                     msg_void_id_u64_u64(encoder, sels.set_fragment_buffer, staging, job.materials, 0);
                     msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, job.parts, 5);
                     msg_void_id_u64_u64(encoder, sels.set_fragment_buffer, staging, job.parts, 5);
+                    msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, job.joints, 7);
                 }
                 msg_void_id_u64(encoder, world.set_fragment_sampler, job.sampler, 0);
                 msg_void_id_u64(encoder, sels.set_fragment_texture, job.shadow_map, 1);
@@ -2078,12 +2141,13 @@ impl FramePass {
                 msg_void_id_u64(encoder, sels.set_fragment_texture, job.floor_map, 2);
                 for draw in &job.draws {
                     match draw {
-                        PreparedDraw::Mesh { pipeline, depth, cull, winding, vertices, indices, first_index, index_count, instance_count, texture, block } => {
+                        PreparedDraw::Mesh { pipeline, depth, cull, winding, vertices, indices, deform, first_index, index_count, instance_count, texture, block } => {
                             msg_void_id(encoder, sels.set_pipeline, *pipeline);
                             msg_void_id(encoder, world.set_depth_state, *depth);
                             msg_void_u64(encoder, world.set_cull_mode, *cull);
                             msg_void_u64(encoder, world.set_winding, *winding);
                             msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, *vertices, 0, 0);
+                            msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, *deform, 0, 6);
                             let block = (block as *const DrawBlock).cast();
                             msg_void_ptr_u64_u64(encoder, sels.set_vertex_bytes, block, DRAW_BLOCK, 3);
                             msg_void_ptr_u64_u64(encoder, sels.set_fragment_bytes, block, DRAW_BLOCK, 3);
@@ -2179,9 +2243,11 @@ unsafe fn encode_casters(command: Id, sels: &Sels, world: &Selectors, pass_class
         if !staging.is_null() {
             msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, shadow.casters, 1);
             msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, job.parts, 5);
+            msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, job.joints, 7);
         }
         for draw in &shadow.draws {
             msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, draw.vertices, 0, 0);
+            msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, draw.deform, 0, 6);
             msg_void_ptr_u64_u64(encoder, sels.set_vertex_bytes, (&draw.block as *const DrawBlock).cast(), DRAW_BLOCK, 3);
             msg_void_draw_indexed(
                 encoder,
@@ -2198,10 +2264,31 @@ unsafe fn encode_casters(command: Id, sels: &Sels, world: &Selectors, pass_class
     }
 }
 
+/// The bytes a job stages in the slot's buffer.
+pub(super) struct Staged {
+    pub(super) instances: Vec<u8>,
+    pub(super) materials: Vec<u8>,
+    /// The rows of its shadow's casters, when the box's map must be drawn.
+    pub(super) casters: Vec<u8>,
+    pub(super) parts: Vec<u8>,
+    pub(super) joints: Vec<u8>,
+}
+
+/// Where a job's staged bytes lie in the slot's buffer.
+#[derive(Clone, Copy)]
+pub(super) struct StagedAt {
+    pub(super) instances: u64,
+    pub(super) materials: u64,
+    pub(super) casters: u64,
+    pub(super) parts: u64,
+    pub(super) joints: u64,
+}
+
 /// The bytes each job stages: its instances, its materials, the rows of
-/// its shadow's casters when the box's map must be drawn, and its part
-/// table (one part at least: the stage's buffer is never left unbound).
-pub(super) fn staged_bytes(job: &WorldJob) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+/// its shadow's casters when the box's map must be drawn, its part table
+/// and its palettes (one part and one row at least: the stage's buffers
+/// are never left unbound).
+pub(super) fn staged_bytes(job: &WorldJob) -> Staged {
     let casters = match (job.shadow, &job.frame.shadow) {
         (Some(held), Some(shadow)) if held.draw => shadow_instance_bytes(&shadow.instances),
         _ => Vec::new(),
@@ -2210,7 +2297,11 @@ pub(super) fn staged_bytes(job: &WorldJob) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8
     if parts.is_empty() {
         parts = vec![255; 4];
     }
-    (instance_bytes(&job.frame.instances), material_bytes(&job.frame.materials), casters, parts)
+    let mut joints: Vec<u8> = job.frame.joints.iter().flatten().flat_map(|value| value.to_le_bytes()).collect();
+    if joints.is_empty() {
+        joints = vec![0; 16];
+    }
+    Staged { instances: instance_bytes(&job.frame.instances), materials: material_bytes(&job.frame.materials), casters, parts, joints }
 }
 
 /// A frame of its own, for the harness: what the parity tests compare

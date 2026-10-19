@@ -19,6 +19,7 @@ use motor::state::State;
 use super::material::{FloorMap, Light, LineStyle, Material, Model, PartState};
 use super::math::{Aabb, Mat4, Quat, Transform, Vec3};
 use super::mesh::{Lines, Mesh};
+use super::skin::{Clip, Play};
 use crate::layout::Color;
 
 /// Slots per chunk: the unit an edit copies when a snapshot shares it.
@@ -63,6 +64,9 @@ pub struct EntitySpec {
     /// part takes a tint of its own, or hides, with no new mesh. A part
     /// past the end keeps its own look.
     pub parts: Option<Rc<[PartState]>>,
+    /// The clip the entity plays: its own skinned mesh, and every skinned
+    /// entity below it that plays none of its own, take the pose.
+    pub play: Option<Play>,
     /// A number the app chooses, given back with a pick.
     pub tag: u64,
     /// Raw JSON an asset brought with it, untouched.
@@ -88,6 +92,7 @@ impl EntitySpec {
             tint: Color::WHITE,
             ambient: Color::WHITE,
             parts: None,
+            play: None,
             tag: 0,
             extras: None,
         }
@@ -298,6 +303,30 @@ impl WorldData {
             }
         }
         Some(matrix)
+    }
+
+    /// The clip the entity's pose comes from: its own, or that of the
+    /// nearest entity above it that plays one, and which entity that is.
+    pub(crate) fn play_of(&self, id: EntityId) -> Option<(EntityId, &Play)> {
+        let mut current = Some(id);
+        let mut steps = 0u32;
+        while let Some(at) = current {
+            let data = self.get(at)?;
+            if let Some(play) = &data.spec.play {
+                return Some((at, play));
+            }
+            current = data.parent;
+            steps += 1;
+            if steps > self.live + 1 {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Whether a clip of the world still moves at `time`.
+    pub(crate) fn moving(&self, time: f64) -> bool {
+        self.iter().any(|(_, data)| data.spec.play.as_ref().is_some_and(|play| play.moving(time)))
     }
 
     /// Is the entity shown — itself and every parent above it?
@@ -729,6 +758,27 @@ impl Entity {
 
     pub fn set_tag(self, tag: u64) -> Entity {
         self.change(|spec| spec.tag = tag)
+    }
+
+    /// Plays `clip` from now, over and over: the entity's skinned mesh,
+    /// and every skinned entity below it, move with it — a figure and
+    /// what it wears. A box that shows the world asks for frames while it
+    /// moves.
+    pub fn play(self, clip: &Clip) -> Entity {
+        let start = motor::task::now();
+        self.change(|spec| spec.play = Some(Play { clip: clip.clone(), start, speed: 1.0, looped: true }))
+    }
+
+    /// Plays `clip` from now, once, and holds its last pose.
+    pub fn play_once(self, clip: &Clip) -> Entity {
+        let start = motor::task::now();
+        self.change(|spec| spec.play = Some(Play { clip: clip.clone(), start, speed: 1.0, looped: false }))
+    }
+
+    /// The clip and its timing, whole; `None` puts the skinned meshes
+    /// below back in their rest pose.
+    pub fn set_play(self, play: Option<Play>) -> Entity {
+        self.change(|spec| spec.play = play)
     }
 
     /// Hangs the entity under `parent`: it moves, turns and hides with

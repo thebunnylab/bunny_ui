@@ -52,7 +52,9 @@ pub trait WorldGround {
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64>;
     fn drop_target(&mut self, id: u64);
     /// A mesh: vertices in the wire layout, `u32` indices, little-endian.
-    fn make_mesh(&mut self, vertices: &[u8], indices: &[u8]) -> Option<u64>;
+    /// `deform` is the mesh's second stream (`Mesh::deform_bytes`), read
+    /// by the vertex's number: empty for a mesh without a skin.
+    fn make_mesh(&mut self, vertices: &[u8], indices: &[u8], deform: &[u8]) -> Option<u64>;
     fn drop_mesh(&mut self, id: u64);
     /// A texture and its whole chain: straight sRGB RGBA8, one slice per
     /// level, the base first, each level half the one above (at least 1).
@@ -118,7 +120,7 @@ impl WorldJob {
         let target = ground.make_target(frame.size.0, frame.size.1, samples)?;
         let mut meshes = Vec::with_capacity(frame.meshes.len());
         for mesh in &frame.meshes {
-            meshes.push(ground.make_mesh(&mesh.vertex_bytes(), &mesh.index_bytes())?);
+            meshes.push(ground.make_mesh(&mesh.vertex_bytes(), &mesh.index_bytes(), &mesh.deform_bytes())?);
         }
         let mut segments = Vec::with_capacity(frame.lines.len());
         for lines in &frame.lines {
@@ -359,7 +361,7 @@ impl WorldResidency {
             ground.drop_mesh(asset.id);
             self.meshes.remove(&mesh.id());
         }
-        let id = ground.make_mesh(&mesh.vertex_bytes(), &mesh.index_bytes())?;
+        let id = ground.make_mesh(&mesh.vertex_bytes(), &mesh.index_bytes(), &mesh.deform_bytes())?;
         self.meshes.insert(mesh.id(), Asset { id, generation: mesh.generation(), walk });
         Some(id)
     }
@@ -492,7 +494,7 @@ mod tests {
         fn drop_target(&mut self, id: u64) {
             self.give_back("target", id);
         }
-        fn make_mesh(&mut self, vertices: &[u8], indices: &[u8]) -> Option<u64> {
+        fn make_mesh(&mut self, vertices: &[u8], indices: &[u8], _: &[u8]) -> Option<u64> {
             assert!(!vertices.is_empty() && !indices.is_empty());
             self.mint("mesh")
         }
@@ -694,8 +696,8 @@ mod tests {
             fn drop_target(&mut self, id: u64) {
                 self.0.drop_target(id)
             }
-            fn make_mesh(&mut self, v: &[u8], i: &[u8]) -> Option<u64> {
-                self.0.make_mesh(v, i)
+            fn make_mesh(&mut self, v: &[u8], i: &[u8], d: &[u8]) -> Option<u64> {
+                self.0.make_mesh(v, i, d)
             }
             fn drop_mesh(&mut self, id: u64) {
                 self.0.drop_mesh(id)

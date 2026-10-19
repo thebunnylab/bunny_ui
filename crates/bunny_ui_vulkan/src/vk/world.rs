@@ -99,6 +99,18 @@ mod generator {
     const GL_MATERIAL_ROW: &str = "return texelFetch(u_materials, ivec2((index % 1024) * 4 + row, index / 1024), 0);";
     const VK_MATERIAL_ROW: &str = "return materials.rows[index * 4 + row];";
 
+    /// The palettes: a storage buffer in the frame's set, three rows a
+    /// joint.
+    const JOINTS: &str = "layout(std430, set = 0, binding = 3) readonly buffer Joints {\n    vec4 rows[];\n} palette;";
+    const GL_JOINT_ROW: &str = "return texelFetch(u_joints, ivec2(int(index % 1024u), int(index / 1024u)), 0);";
+    const VK_JOINT_ROW: &str = "return palette.rows[index];";
+
+    /// A skinned mesh's deform stream: a storage buffer in a set of its
+    /// own (4), one word an element.
+    const DEFORM: &str = "layout(std430, set = 4, binding = 0) readonly buffer Deform {\n    uint words[];\n} deform;";
+    const GL_DEFORM_WORD: &str = "return texelFetch(u_deform, ivec2(int(index % 1024u), int(index / 1024u)), 0).r;";
+    const VK_DEFORM_WORD: &str = "return deform.words[index];";
+
     /// The part table: a storage buffer, one packed word a part.
     const PARTS: &str = "layout(std430, set = 0, binding = 2) readonly buffer Parts {\n    uint rows[];\n} parts;";
     const GL_PART_ROW: &str = "return texelFetch(u_parts, ivec2(int(index % 1024u), int(index / 1024u)), 0);";
@@ -112,14 +124,14 @@ mod generator {
         use bunny_ui::gpu::world_shaders as gl;
         let table = gl::srgb_table();
         vec![
-            ("world_mesh.vert", stage(&[gl::WORLD_COMMON, &table, gl::PARTS, gl::MESH_VERT])),
+            ("world_mesh.vert", stage(&[gl::WORLD_COMMON, &table, gl::PARTS, gl::SKIN, gl::MESH_VERT])),
             ("world_mesh.frag", stage(&[gl::WORLD_COMMON, gl::PARTS, gl::MESH_FRAG_COMMON, gl::MESH_FRAG])),
             ("world_stepped.frag", stage(&[gl::WORLD_COMMON, gl::PARTS, gl::MESH_FRAG_COMMON, gl::MESH_FRAG_STEPPED])),
             ("world_line.vert", stage(&[gl::WORLD_COMMON, gl::LINE_VERT])),
             ("world_line.frag", stage(&[gl::WORLD_COMMON, gl::LINE_FRAG])),
             ("world_backdrop.vert", stage(&[gl::BACKDROP_VERT])),
             ("world_backdrop.frag", stage(&[gl::BACKDROP_FRAG])),
-            ("world_shadow.vert", stage(&[gl::WORLD_COMMON, gl::PARTS, gl::SHADOW_VERT])),
+            ("world_shadow.vert", stage(&[gl::WORLD_COMMON, gl::PARTS, gl::SKIN, gl::SHADOW_VERT])),
             ("world_bloom_down.frag", stage(&[gl::BLOOM_COMMON, gl::BLOOM_DOWN_FRAG])),
             ("world_bloom_up.frag", stage(&[gl::BLOOM_COMMON, gl::BLOOM_UP_FRAG])),
             ("world_bloom_spill.frag", stage(&[gl::BLOOM_COMMON, gl::BLOOM_SPILL_FRAG])),
@@ -143,6 +155,10 @@ mod generator {
             assert!(text.contains(GL_PART_ROW), "the GL family's part table moved");
             text = text.replace(GL_PART_ROW, VK_PART_ROW);
         }
+        if text.contains("vec4 joint_row(") {
+            assert!(text.contains(GL_JOINT_ROW) && text.contains(GL_DEFORM_WORD), "the GL family's skin moved");
+            text = text.replace(GL_JOINT_ROW, VK_JOINT_ROW).replace(GL_DEFORM_WORD, VK_DEFORM_WORD);
+        }
         let text = text.replace("gl_VertexID", "gl_VertexIndex");
         let mut out = String::from(GENERATED);
         let (mut inputs, mut outputs) = (0, 0);
@@ -159,6 +175,8 @@ mod generator {
                 "uniform highp sampler2DShadow u_shadow;" => "layout(set = 2, binding = 0) uniform sampler2DShadow u_shadow;",
                 "uniform sampler2D u_floor;" => "layout(set = 3, binding = 0) uniform sampler2D u_floor;",
                 "uniform highp usampler2D u_parts;" => PARTS,
+                "uniform highp sampler2D u_joints;" => JOINTS,
+                "uniform highp usampler2D u_deform;" => DEFORM,
                 "uniform sampler2D u_above;" => "layout(set = 0, binding = 0) uniform sampler2D u_above;",
                 "uniform sampler2D u_second;" => "layout(set = 0, binding = 1) uniform sampler2D u_second;",
                 "uniform vec4 u_bloom;" => PUSH_BLOOM,
@@ -379,6 +397,12 @@ struct WorldStack {
     /// bound while a frame's floor map is not decoded (set 3, the
     /// pictures' own layout).
     dark: Surface,
+    /// Set 4: a skinned mesh's deform stream; the sets come from their
+    /// own pool and go back with their mesh.
+    deform_layout: DescriptorSetLayout,
+    deform_pool: DescriptorPool,
+    /// One word and its set: what a mesh without a skin binds.
+    no_deform: Option<(Buffer, DescriptorSet)>,
 }
 
 enum Built {
@@ -417,6 +441,8 @@ struct Buffer {
 struct MeshBuffers {
     vertices: Buffer,
     indices: Buffer,
+    /// The deform stream and its set, for a skinned mesh.
+    deform: Option<(Buffer, DescriptorSet)>,
 }
 
 struct Segments {
@@ -572,6 +598,10 @@ impl VkWorld {
                 Garbage::Mesh(mesh) => {
                     destroy_buffer(stack, mesh.vertices);
                     destroy_buffer(stack, mesh.indices);
+                    if let Some((buffer, set)) = mesh.deform {
+                        (stack.fns.free_descriptor_sets)(stack.device, world.deform_pool, 1, &set);
+                        destroy_buffer(stack, buffer);
+                    }
                 }
                 Garbage::Surface(surface) => {
                     (stack.fns.free_descriptor_sets)(stack.device, world.surface_pool, 1, &surface.set);
@@ -667,8 +697,9 @@ impl VkWorld {
             let casters = (instances + (frame.instances.len() * instance_offset::SIZE).max(instance_offset::SIZE)).next_multiple_of(BLOCK_ALIGN);
             let rows = casters_of(job, held.map(|(shadow, _)| shadow)).map_or(0, |shadow| shadow.instances.len() * SHADOW_INSTANCE_STRIDE);
             let parts = (casters + rows.max(SHADOW_INSTANCE_STRIDE)).next_multiple_of(BLOCK_ALIGN);
-            cursor = (parts + (frame.parts.len() * 4).max(4)).next_multiple_of(BLOCK_ALIGN);
-            places.push((uniforms, materials, instances, casters, parts));
+            let joints = (parts + (frame.parts.len() * 4).max(4)).next_multiple_of(BLOCK_ALIGN);
+            cursor = (joints + (frame.joints.len() * 16).max(16)).next_multiple_of(BLOCK_ALIGN);
+            places.push((uniforms, materials, instances, casters, parts, joints));
         }
         if !unsafe { world.ensure_slot(stack, slot, cursor, jobs.len() as u32) } {
             return false;
@@ -676,7 +707,7 @@ impl VkWorld {
         let fns = &stack.fns;
         unsafe {
             (fns.reset_descriptor_pool)(stack.device, slot.pool, 0);
-            for ((job, &(uniforms, materials, instances, casters, parts)), held) in jobs.iter().zip(&places).zip(&held) {
+            for ((job, &(uniforms, materials, instances, casters, parts, joints)), held) in jobs.iter().zip(&places).zip(&held) {
                 let Some(target) = targets.get(&job.target) else { continue };
                 let frame = &job.frame;
                 let draw = casters_of(job, held.map(|(shadow, _)| shadow));
@@ -687,12 +718,19 @@ impl VkWorld {
                     (casters, draw.map_or(Vec::new(), |shadow| shadow_instance_bytes(&shadow.instances))),
                     // one part at least: the stage's buffer is never left empty
                     (parts, if frame.parts.is_empty() { vec![255; 4] } else { part_bytes(&frame.parts) }),
+                    // and one palette row
+                    (joints, if frame.joints.is_empty() { vec![0; 16] } else { frame.joints.iter().flatten().flat_map(|value| value.to_le_bytes()).collect() }),
                 ];
                 for (offset, bytes) in &blocks {
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot.map.add(*offset), bytes.len());
                 }
-                let Some(set) = world.frame_set(stack, slot, uniforms, materials, (frame.materials.len() * 64).max(64), parts, (frame.parts.len() * 4).max(4))
-                else {
+                let blocks_of = FrameBlocks {
+                    uniforms,
+                    materials: (materials, (frame.materials.len() * 64).max(64)),
+                    parts: (parts, (frame.parts.len() * 4).max(4)),
+                    joints: (joints, (frame.joints.len() * 16).max(16)),
+                };
+                let Some(set) = world.frame_set(stack, slot, &blocks_of) else {
                     continue;
                 };
                 let shadow = JobShadow {
@@ -879,7 +917,22 @@ impl WorldStack {
                     stages: SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT,
                     immutable_samplers: std::ptr::null(),
                 },
+                DescriptorSetLayoutBinding {
+                    binding: 3,
+                    descriptor_type: DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    count: 1,
+                    stages: SHADER_STAGE_VERTEX,
+                    immutable_samplers: std::ptr::null(),
+                },
             ])?;
+            // set 4: a skinned mesh's deform stream
+            let deform_layout = layout_of(&[DescriptorSetLayoutBinding {
+                binding: 0,
+                descriptor_type: DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                count: 1,
+                stages: SHADER_STAGE_VERTEX,
+                immutable_samplers: std::ptr::null(),
+            }])?;
             let picture_binding = [DescriptorSetLayoutBinding {
                 binding: 0,
                 descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -890,13 +943,13 @@ impl WorldStack {
             let surface_layout = layout_of(&picture_binding)?;
             let shadow_layout = layout_of(&picture_binding)?;
             // set 3, the floor map, is a picture like set 1
-            let set_layouts = [frame_layout, surface_layout, shadow_layout, surface_layout];
+            let set_layouts = [frame_layout, surface_layout, shadow_layout, surface_layout, deform_layout];
             let push_range = PushConstantRange { stages: SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT, offset: 0, size: DRAW_PUSH };
             let layout_info = PipelineLayoutCreateInfo {
                 s_type: ST_PIPELINE_LAYOUT_CREATE,
                 p_next: std::ptr::null(),
                 flags: 0,
-                set_layout_count: 4,
+                set_layout_count: 5,
                 set_layouts: set_layouts.as_ptr(),
                 push_range_count: 1,
                 push_ranges: &push_range,
@@ -1009,6 +1062,13 @@ impl WorldStack {
             if !ok((fns.create_descriptor_pool)(stack.device, &pool_info, std::ptr::null(), &mut surface_pool)) {
                 return Err("the world's picture pool refused".into());
             }
+            // the meshes' deform sets: given back with their mesh
+            let deform_size = DescriptorPoolSize { descriptor_type: DESCRIPTOR_TYPE_STORAGE_BUFFER, count: 1024 };
+            let deform_info = DescriptorPoolCreateInfo { pool_sizes: &deform_size, ..pool_info };
+            let mut deform_pool: DescriptorPool = 0;
+            if !ok((fns.create_descriptor_pool)(stack.device, &deform_info, std::ptr::null(), &mut deform_pool)) {
+                return Err("the world's deform pool refused".into());
+            }
             let mut world = WorldStack {
                 frame_layout,
                 surface_layout,
@@ -1028,7 +1088,23 @@ impl WorldStack {
                 surface_pool,
                 blank: Surface { image: Image { image: 0, memory: 0, view: 0 }, set: 0 },
                 dark: Surface { image: Image { image: 0, memory: 0, view: 0 }, set: 0 },
+                deform_layout,
+                deform_pool,
+                no_deform: None,
             };
+            // one word: the deform stream a mesh without a skin binds
+            let no_deform = filled(stack, &[0; 4], BUFFER_USAGE_STORAGE);
+            let set = no_deform.as_ref().and_then(|buffer| world.deform_set(stack, buffer.buffer, 4));
+            match (no_deform, set) {
+                (Some(buffer), Some(set)) => world.no_deform = Some((buffer, set)),
+                (buffer, _) => {
+                    if let Some(buffer) = buffer {
+                        destroy_buffer(stack, buffer);
+                    }
+                    world.release(stack);
+                    return Err("no empty deform stream".into());
+                }
+            }
             match (world.surface(stack, 1, 1, &[&[255, 255, 255, 255]]), world.surface(stack, 1, 1, &[&[0, 0, 0, 255]])) {
                 (Some(blank), Some(dark)) => (world.blank, world.dark) = (blank, dark),
                 (blank, dark) => {
@@ -1099,6 +1175,11 @@ impl WorldStack {
             (fns.destroy_sampler)(stack.device, self.always_sampler, std::ptr::null());
             (fns.destroy_render_pass)(stack.device, self.shadow_pass, std::ptr::null());
             (fns.destroy_descriptor_pool)(stack.device, self.surface_pool, std::ptr::null());
+            if let Some((buffer, _)) = self.no_deform {
+                destroy_buffer(stack, buffer);
+            }
+            (fns.destroy_descriptor_pool)(stack.device, self.deform_pool, std::ptr::null());
+            (fns.destroy_descriptor_set_layout)(stack.device, self.deform_layout, std::ptr::null());
             (fns.destroy_sampler)(stack.device, self.surface_sampler, std::ptr::null());
             for pass in self.passes {
                 (fns.destroy_render_pass)(stack.device, pass, std::ptr::null());
@@ -1141,7 +1222,7 @@ impl WorldStack {
                 let sets = jobs.next_power_of_two().max(8);
                 let sizes = [
                     DescriptorPoolSize { descriptor_type: DESCRIPTOR_TYPE_UNIFORM_BUFFER, count: sets },
-                    DescriptorPoolSize { descriptor_type: DESCRIPTOR_TYPE_STORAGE_BUFFER, count: sets * 2 },
+                    DescriptorPoolSize { descriptor_type: DESCRIPTOR_TYPE_STORAGE_BUFFER, count: sets * 3 },
                 ];
                 let info = DescriptorPoolCreateInfo {
                     s_type: ST_DESCRIPTOR_POOL_CREATE,
@@ -1160,18 +1241,9 @@ impl WorldStack {
         }
     }
 
-    /// A set over one job's frame block and material table.
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn frame_set(
-        &self,
-        stack: &VkStack,
-        slot: &WorldSlot,
-        uniforms: usize,
-        materials: usize,
-        material_bytes: usize,
-        parts: usize,
-        part_bytes: usize,
-    ) -> Option<DescriptorSet> {
+    /// A set over one job's blocks in the slot's buffer.
+    unsafe fn frame_set(&self, stack: &VkStack, slot: &WorldSlot, blocks: &FrameBlocks) -> Option<DescriptorSet> {
+        let FrameBlocks { uniforms, materials: (materials, material_bytes), parts: (parts, part_bytes), joints: (joints, joint_bytes) } = *blocks;
         let fns = &stack.fns;
         unsafe {
             let allocate = DescriptorSetAllocateInfo {
@@ -1188,6 +1260,7 @@ impl WorldStack {
             let block = DescriptorBufferInfo { buffer: slot.buffer, offset: uniforms as u64, range: frame_offset::SIZE as u64 };
             let table = DescriptorBufferInfo { buffer: slot.buffer, offset: materials as u64, range: material_bytes as u64 };
             let part_table = DescriptorBufferInfo { buffer: slot.buffer, offset: parts as u64, range: part_bytes as u64 };
+            let palettes = DescriptorBufferInfo { buffer: slot.buffer, offset: joints as u64, range: joint_bytes as u64 };
             let writes = [
                 WriteDescriptorSet {
                     s_type: ST_WRITE_DESCRIPTOR_SET,
@@ -1225,8 +1298,20 @@ impl WorldStack {
                     buffer_info: (&part_table as *const DescriptorBufferInfo).cast(),
                     texel_view: std::ptr::null(),
                 },
+                WriteDescriptorSet {
+                    s_type: ST_WRITE_DESCRIPTOR_SET,
+                    p_next: std::ptr::null(),
+                    set,
+                    binding: 3,
+                    array_element: 0,
+                    count: 1,
+                    descriptor_type: DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    image_info: std::ptr::null(),
+                    buffer_info: (&palettes as *const DescriptorBufferInfo).cast(),
+                    texel_view: std::ptr::null(),
+                },
             ];
-            (fns.update_descriptor_sets)(stack.device, 3, writes.as_ptr(), 0, std::ptr::null());
+            (fns.update_descriptor_sets)(stack.device, 4, writes.as_ptr(), 0, std::ptr::null());
             Some(set)
         }
     }
@@ -1706,6 +1791,8 @@ impl WorldStack {
                         (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, pipeline);
                         let picture = surface.map_or(self.blank.set, |surface| surface.set);
                         (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 1, 1, &picture, 0, std::ptr::null());
+                        let deform = self.deform_of(buffers);
+                        (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 4, 1, &deform, 0, std::ptr::null());
                         push(command, &DrawPush { draw: [flags as f32, near, far, bias], ..DrawPush::default() });
                         // the first instance rides the instance buffer's
                         // offset, as on the GL family
@@ -1975,6 +2062,8 @@ impl WorldStack {
             (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 0, 1, &set, 0, std::ptr::null());
             for draw in &shadow.draws {
                 let Some(buffers) = job.meshes.get(draw.mesh as usize).and_then(|id| meshes.get(id)) else { continue };
+                let deform = self.deform_of(buffers);
+                (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 4, 1, &deform, 0, std::ptr::null());
                 // the first caster rides the buffer's offset, as the
                 // instances of a surface do
                 let bound = [buffers.vertices.buffer, blocks];
@@ -2018,6 +2107,39 @@ impl WorldStack {
         }
     }
 
+    /// A set of the deform layout over `length` bytes of `buffer`.
+    unsafe fn deform_set(&self, stack: &VkStack, buffer: BufferHandle, length: u64) -> Option<DescriptorSet> {
+        let fns = &stack.fns;
+        unsafe {
+            let allocate = DescriptorSetAllocateInfo {
+                s_type: ST_DESCRIPTOR_SET_ALLOCATE,
+                p_next: std::ptr::null(),
+                pool: self.deform_pool,
+                count: 1,
+                layouts: &self.deform_layout,
+            };
+            let mut set: DescriptorSet = 0;
+            if !ok((fns.allocate_descriptor_sets)(stack.device, &allocate, &mut set)) {
+                return None;
+            }
+            let words = DescriptorBufferInfo { buffer, offset: 0, range: length };
+            let write = WriteDescriptorSet {
+                s_type: ST_WRITE_DESCRIPTOR_SET,
+                p_next: std::ptr::null(),
+                set,
+                binding: 0,
+                array_element: 0,
+                count: 1,
+                descriptor_type: DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                image_info: std::ptr::null(),
+                buffer_info: (&words as *const DescriptorBufferInfo).cast(),
+                texel_view: std::ptr::null(),
+            };
+            (fns.update_descriptor_sets)(stack.device, 1, &write, 0, std::ptr::null());
+            Some(set)
+        }
+    }
+
     /// A set of the shadow's layout over `view`, read through `sampler`.
     unsafe fn shadow_set(&self, stack: &VkStack, view: ImageView, sampler: Sampler) -> Option<DescriptorSet> {
         let fns = &stack.fns;
@@ -2049,6 +2171,23 @@ impl WorldStack {
             (fns.update_descriptor_sets)(stack.device, 1, &write, 0, std::ptr::null());
             Some(set)
         }
+    }
+}
+
+/// Where one job's blocks lie in the slot's buffer: offsets, and with the
+/// tables their lengths in bytes.
+#[derive(Clone, Copy)]
+struct FrameBlocks {
+    uniforms: usize,
+    materials: (usize, usize),
+    parts: (usize, usize),
+    joints: (usize, usize),
+}
+
+impl WorldStack {
+    /// The deform set a mesh binds: its own, or the empty one.
+    fn deform_of(&self, buffers: &MeshBuffers) -> DescriptorSet {
+        buffers.deform.as_ref().map(|(_, set)| *set).or(self.no_deform.as_ref().map(|(_, set)| *set)).unwrap_or(0)
     }
 }
 
@@ -2903,7 +3042,8 @@ impl WorldGround for VkWorldDoor<'_> {
         }
     }
 
-    fn make_mesh(&mut self, vertices: &[u8], indices: &[u8]) -> Option<u64> {
+    fn make_mesh(&mut self, vertices: &[u8], indices: &[u8], deform: &[u8]) -> Option<u64> {
+        let Built::Ready(world) = &self.world.built else { return None };
         if vertices.is_empty() || indices.is_empty() {
             return None;
         }
@@ -2912,8 +3052,23 @@ impl WorldGround for VkWorldDoor<'_> {
             unsafe { destroy_buffer(self.stack, vertices) };
             return None;
         };
+        // a skinned mesh's deform stream, in a set of its own
+        let mut deform_set = None;
+        if !deform.is_empty() {
+            let buffer = filled(self.stack, deform, BUFFER_USAGE_STORAGE);
+            let set = buffer.as_ref().and_then(|buffer| unsafe { world.deform_set(self.stack, buffer.buffer, deform.len() as u64) });
+            match (buffer, set) {
+                (Some(buffer), Some(set)) => deform_set = Some((buffer, set)),
+                (buffer, _) => unsafe {
+                    for made in [Some(vertices), Some(indices), buffer].into_iter().flatten() {
+                        destroy_buffer(self.stack, made);
+                    }
+                    return None;
+                },
+            }
+        }
         let id = self.world.mint();
-        self.world.meshes.insert(id, MeshBuffers { vertices, indices });
+        self.world.meshes.insert(id, MeshBuffers { vertices, indices, deform: deform_set });
         Some(id)
     }
 

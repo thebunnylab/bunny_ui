@@ -134,8 +134,8 @@ struct WorldInstance {
     uint flags;
     uint ambient;
     uint part_base;
-    uint reserved0;
-    uint reserved1;
+    uint joint_base;
+    uint reserved;
 };
 
 struct WorldMaterial {
@@ -203,6 +203,10 @@ Texture2D<float> shadow_map : register(t5);
 Texture2D<float4> floor_picture : register(t7);
 // the frame's part table: a part's tint and, in the top byte, 0 when it hides
 StructuredBuffer<uint> parts : register(t8);
+// a skinned mesh's deform stream (two words a vertex: its joints, then
+// its weights) and the frame's palettes (three rows a joint)
+StructuredBuffer<uint> deform : register(t11);
+StructuredBuffer<float4> joints : register(t12);
 SamplerState surface_sampler : register(s1);
 SamplerComparisonState shadow_sampler : register(s2);
 
@@ -444,6 +448,31 @@ struct WorldVary {
     nointerpolation float3 part_tint : W_PART;
 };
 
+// a skinned vertex's pose: each of its four joints applied to the point,
+// and without the move to the normal, weighed by its share in order —
+// the CPU's order
+void skin(uint base, uint corner, inout float3 p, inout float3 n) {
+    uint which = deform[2u * corner];
+    uint shares = deform[2u * corner + 1u];
+    float3 moved = float3(0.0, 0.0, 0.0);
+    float3 turned = float3(0.0, 0.0, 0.0);
+    for (uint k = 0u; k < 4u; k++) {
+        float w = (float)((shares >> (8u * k)) & 255u) / 255.0;
+        uint row = base + 3u * ((which >> (8u * k)) & 255u);
+        float4 r0 = joints[row];
+        float4 r1 = joints[row + 1u];
+        float4 r2 = joints[row + 2u];
+        moved = moved + w * float3(r0.x * p.x + r0.y * p.y + r0.z * p.z + r0.w,
+                                   r1.x * p.x + r1.y * p.y + r1.z * p.z + r1.w,
+                                   r2.x * p.x + r2.y * p.y + r2.z * p.z + r2.w);
+        turned = turned + w * float3(r0.x * n.x + r0.y * n.y + r0.z * n.z,
+                                     r1.x * n.x + r1.y * n.y + r1.z * n.z,
+                                     r2.x * n.x + r2.y * n.y + r2.z * n.z);
+    }
+    p = moved;
+    n = turned;
+}
+
 WorldVary world_vertex(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     WorldVertex vx = vertices[vid];
     uint index = draw.first_instance + iid;
@@ -460,9 +489,14 @@ WorldVary world_vertex(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
         }
         o.part_tint = float3(SRGB_DECODE[part & 0xFFu], SRGB_DECODE[(part >> 8) & 0xFFu], SRGB_DECODE[(part >> 16) & 0xFFu]);
     }
-    float3 eye = to_eye(instance, vx.position);
+    float3 p = vx.position;
     int2 folded = int2(asint(vx.folded << 16) >> 16, asint(vx.folded) >> 16);
     float3 n = unfold_normal(folded);
+    // a skinned vertex moves to its pose before it is placed
+    if (instance.joint_base != 0xFFFFFFFFu) {
+        skin(instance.joint_base, vid, p, n);
+    }
+    float3 eye = to_eye(instance, p);
     o.position = mul(u.clip_from_eye, float4(eye, 1.0));
     o.depth = o.position.z / o.position.w;
     o.eye = eye;
@@ -625,7 +659,7 @@ SteppedBack world_fragment_stepped(WorldVary v, bool front : SV_IsFrontFace) {
 struct ShadowCaster {
     float4 rows[3];
     uint part_base;
-    uint pad0;
+    uint joint_base;
     uint pad1;
     uint pad2;
 };
@@ -640,6 +674,11 @@ float4 shadow_vertex(uint vid : SV_VertexID, uint iid : SV_InstanceID) : SV_Posi
     // a part that hides casts nothing
     if (caster.part_base != 0xFFFFFFFFu && (parts[caster.part_base + (vertices[vid].ids >> 16)] >> 24) == 0u) {
         return float4(0.0, 0.0, 2.0, 1.0);
+    }
+    // a skinned caster casts its pose
+    if (caster.joint_base != 0xFFFFFFFFu) {
+        float3 unused = float3(0.0, 0.0, 0.0);
+        skin(caster.joint_base, vid, p, unused);
     }
     float4 r0 = caster.rows[0];
     float4 r1 = caster.rows[1];
@@ -977,6 +1016,8 @@ struct WorldStack {
     /// One black, opaque texel: a floor map that adds and takes nothing,
     /// bound while a frame's floor map is not decoded.
     dark: (Com<Texture2d>, Com<Srv>),
+    /// One word: the deform stream a mesh without a skin binds.
+    no_deform: (Com<Buffer>, Com<Srv>),
     uniforms: Com<Buffer>,
     draw: Com<Buffer>,
     backdrop: Com<Buffer>,
@@ -1030,6 +1071,8 @@ struct MeshBuffers {
     _vertices: Com<Buffer>,
     vertex_srv: Com<Srv>,
     indices: Com<Buffer>,
+    /// The deform stream, one word an element, for a skinned mesh.
+    deform: Option<(Com<Buffer>, Com<Srv>)>,
 }
 
 struct Segments {
@@ -1069,6 +1112,8 @@ pub(super) struct D3dWorld {
     casters: SlotBuffer,
     /// The frame's part table, the same way.
     parts: SlotBuffer,
+    /// The frame's palettes, the same way.
+    joints: SlotBuffer,
 }
 
 impl D3dWorld {
@@ -1088,6 +1133,7 @@ impl D3dWorld {
             materials: SlotBuffer::empty(),
             casters: SlotBuffer::empty(),
             parts: SlotBuffer::empty(),
+            joints: SlotBuffer::empty(),
         }
     }
 
@@ -1159,7 +1205,7 @@ impl D3dWorld {
     }
 
     fn encode_job(&mut self, job: &WorldJob) {
-        let D3dWorld { device, context, built, targets, meshes, textures, segments, shadow_maps, blooms, instances, materials, casters, parts, .. } =
+        let D3dWorld { device, context, built, targets, meshes, textures, segments, shadow_maps, blooms, instances, materials, casters, parts, joints, .. } =
             self;
         let (device, context) = (*device, *context);
         let Built::Ready(stack) = built else { return };
@@ -1184,12 +1230,19 @@ impl D3dWorld {
         if part_data.is_empty() {
             part_data = vec![255; 4];
         }
+        // one row at least: the palette's view is never left empty
+        let mut joint_data: Vec<u8> = frame.joints.iter().flatten().flat_map(|value| value.to_le_bytes()).collect();
+        if joint_data.is_empty() {
+            joint_data = vec![0; 16];
+        }
         let staged = instances.ensure(device, frame.instances.len(), instance_offset::SIZE)
             && materials.ensure(device, frame.materials.len(), 64)
             && parts.ensure(device, part_data.len() / 4, 4)
+            && joints.ensure(device, joint_data.len() / 16, 16)
             && instances.upload(context, &instance_data)
             && materials.upload(context, &material_data)
-            && parts.upload(context, &part_data);
+            && parts.upload(context, &part_data)
+            && joints.upload(context, &joint_data);
         if !staged {
             return;
         }
@@ -1200,6 +1253,8 @@ impl D3dWorld {
             let part_view = parts.srv_ptr();
             (vtbl.vs_set_shader_resources)(context, 8, 1, &part_view);
             (vtbl.ps_set_shader_resources)(context, 8, 1, &part_view);
+            let joint_view = joints.srv_ptr();
+            (vtbl.vs_set_shader_resources)(context, 12, 1, &joint_view);
 
             // the sun's map first, when it does not hold this frame's casters
             if let (Some((shadow, map)), Some(frame_shadow)) = (map, frame.shadow.as_ref())
@@ -1229,6 +1284,8 @@ impl D3dWorld {
                         write_constants(context, stack.draw.as_ptr(), bytes_of(&block));
                         let vertex_view = buffers.vertex_srv.as_ptr();
                         (vtbl.vs_set_shader_resources)(context, 0, 1, &vertex_view);
+                        let deform_view = buffers.deform.as_ref().map_or(stack.no_deform.1.as_ptr(), |(_, view)| view.as_ptr());
+                        (vtbl.vs_set_shader_resources)(context, 11, 1, &deform_view);
                         (vtbl.ia_set_index_buffer)(context, buffers.indices.as_ptr(), FORMAT_R32_UINT, 0);
                         (vtbl.draw_indexed_instanced)(context, draw.index_count, draw.instance_count, draw.first_index, 0, 0);
                     }
@@ -1336,6 +1393,8 @@ impl D3dWorld {
                         (vtbl.om_set_blend_state)(context, blend_state, null(), 0xFFFF_FFFF);
                         let vertex_view = buffers.vertex_srv.as_ptr();
                         (vtbl.vs_set_shader_resources)(context, 0, 1, &vertex_view);
+                        let deform_view = buffers.deform.as_ref().map_or(stack.no_deform.1.as_ptr(), |(_, view)| view.as_ptr());
+                        (vtbl.vs_set_shader_resources)(context, 11, 1, &deform_view);
                         let picture = surface.unwrap_or(stack.blank.1.as_ptr());
                         (vtbl.ps_set_shader_resources)(context, 3, 1, &picture);
                         (vtbl.ia_set_index_buffer)(context, buffers.indices.as_ptr(), FORMAT_R32_UINT, 0);
@@ -1809,6 +1868,8 @@ impl WorldStack {
             let level = [SubresourceData { memory: black.as_ptr().cast(), pitch: 4, slice_pitch: 0 }];
             let dark = texture_2d(device, &blank_desc, Some(&level)).ok_or("no dark texel")?;
             let dark_srv = make_srv(device, &dark).ok_or("no dark texel view")?;
+            let no_deform = filled_buffer(device, &[0; 4], BIND_SHADER_RESOURCE, 4).ok_or("no empty deform stream")?;
+            let no_deform_view = buffer_view(device, &no_deform, 1).ok_or("no empty deform view")?;
 
             Ok(WorldStack {
                 mesh_vs,
@@ -1833,6 +1894,7 @@ impl WorldStack {
                 lit: (lit, lit_srv),
                 blank: (blank, blank_srv),
                 dark: (dark, dark_srv),
+                no_deform: (no_deform, no_deform_view),
                 uniforms: make_constant_buffer(device, bunny_ui::world::wire::frame_offset::SIZE as u32).ok_or("world constants refused")?,
                 draw: make_constant_buffer(device, std::mem::size_of::<DrawBlock>() as u32).ok_or("draw constants refused")?,
                 backdrop: make_constant_buffer(device, std::mem::size_of::<BackdropBlock>() as u32).ok_or("backdrop constants refused")?,
@@ -1897,7 +1959,7 @@ impl WorldGround for D3dWorld {
         self.targets.remove(&id);
     }
 
-    fn make_mesh(&mut self, vertices: &[u8], indices: &[u8]) -> Option<u64> {
+    fn make_mesh(&mut self, vertices: &[u8], indices: &[u8], deform: &[u8]) -> Option<u64> {
         use bunny_ui::world::mesh::VERTEX_STRIDE;
         if vertices.len() < VERTEX_STRIDE || indices.len() < 4 {
             return None;
@@ -1907,7 +1969,14 @@ impl WorldGround for D3dWorld {
             let vertex_buffer = filled_buffer(device, vertices, BIND_SHADER_RESOURCE, VERTEX_STRIDE as u32)?;
             let vertex_srv = buffer_view(device, &vertex_buffer, (vertices.len() / VERTEX_STRIDE) as u32)?;
             let indices = filled_buffer(device, indices, BIND_INDEX_BUFFER, 0)?;
-            MeshBuffers { _vertices: vertex_buffer, vertex_srv, indices }
+            let deform = if deform.len() >= 4 {
+                let buffer = filled_buffer(device, deform, BIND_SHADER_RESOURCE, 4)?;
+                let view = buffer_view(device, &buffer, (deform.len() / 4) as u32)?;
+                Some((buffer, view))
+            } else {
+                None
+            };
+            MeshBuffers { _vertices: vertex_buffer, vertex_srv, indices, deform }
         };
         let id = self.mint();
         self.meshes.insert(id, buffers);
