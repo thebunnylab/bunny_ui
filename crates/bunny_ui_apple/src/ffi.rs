@@ -266,8 +266,11 @@ pub unsafe fn ns_string(text: &str) -> Id {
     unsafe { msg_id_cstr(class("NSString"), sel("stringWithUTF8String:"), text.as_ptr()) }
 }
 
-/// An `NSError`'s own words, or a placeholder when it has none.
 /// The text of an `NSString`, or `None` for a null one.
+///
+/// # Safety
+///
+/// `string` is null or a live `NSString`.
 pub unsafe fn text_of(string: Id) -> Option<String> {
     unsafe {
         if string.is_null() {
@@ -278,6 +281,7 @@ pub unsafe fn text_of(string: Id) -> Option<String> {
     }
 }
 
+/// An `NSError`'s own words, or a placeholder when it has none.
 pub unsafe fn error_message(error: Id) -> String {
     unsafe {
         if error.is_null() {
