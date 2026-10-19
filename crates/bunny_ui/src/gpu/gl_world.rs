@@ -240,7 +240,7 @@ struct Programs {
     /// The 2D pass's sprite for a world's target.
     composite: u32,
     /// The casters into a shadow map.
-    shadow: u32,
+    shadow: Program,
     frame: u32,
     instances: u32,
     /// The casters' rows.
@@ -464,7 +464,7 @@ impl<G: GlFamily> GlWorld<G> {
         let bloom_up = program(gl, bloom_up);
         let bloom_spill = program(gl, bloom_spill);
         let composite = program(gl, composite).handle;
-        let shadow = program(gl, shadow).handle;
+        let shadow = program(gl, shadow);
         gl.use_program(0);
         let blank = gl.create_texture();
         gl.active_texture(gl::TEXTURE0);
@@ -577,12 +577,15 @@ impl<G: GlFamily> GlWorld<G> {
         gl.disable(gl::BLEND);
         gl.disable(gl::CULL_FACE);
         gl.clear([0.0; 4], 1.0);
-        gl.use_program(programs.shadow);
+        gl.use_program(programs.shadow.handle);
         gl.bind_buffer(gl::ARRAY_BUFFER, programs.casters);
         gl.buffer_data(gl::ARRAY_BUFFER, &shadow_instance_bytes(&shadow.instances), gl::STREAM_DRAW);
         for draw in &shadow.draws {
             let Some(objects) = job.meshes.get(draw.mesh as usize).and_then(|id| self.meshes.get(id)) else { continue };
+            // how the caster's mesh lays out its morphs and its skin
+            let deform = job.frame.meshes.get(draw.mesh as usize).map_or(0, |mesh| mesh.deform_flags());
             let gl = &mut self.gl;
+            gl.uniform4fv(programs.shadow.draw, &[[deform as f32, 0.0, 0.0, 0.0]]);
             gl.active_texture(gl::TEXTURE6);
             gl.bind_texture(if objects.deform != 0 { objects.deform } else { programs.no_deform });
             gl.bind_vertex_array(objects.array);
@@ -702,6 +705,8 @@ impl<G: GlFamily> GlWorld<G> {
                     if replace {
                         flags |= 4;
                     }
+                    // how the mesh lays out its morphs and its skin
+                    flags |= frame.meshes.get(mesh as usize).map_or(0, |mesh| mesh.deform_flags());
                     let gl = &mut self.gl;
                     gl.use_program(program.handle);
                     gl.uniform4fv(program.draw, &[[flags as f32, near, far, bias]]);

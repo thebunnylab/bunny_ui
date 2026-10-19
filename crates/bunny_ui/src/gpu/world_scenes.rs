@@ -18,7 +18,7 @@ use crate::world::mesh::{Mesh, MeshData};
 use crate::world::store::World;
 
 /// How many worlds the catalog holds.
-pub const COUNT: u32 = 19;
+pub const COUNT: u32 = 20;
 
 /// What a tier's picture may differ from the CPU's by: the share of
 /// pixels whose worst channel is more than three codes apart, and more
@@ -130,8 +130,9 @@ fn night_lamps() -> WorldFrame {
 }
 
 /// A post on a floor whose top half hangs from a joint that a clip
-/// turns and carries, held at its end; the sun casts its pose.
-fn swaying_post() -> WorldFrame {
+/// turns and carries, held at its end; the sun casts its pose. With
+/// `morphs`, it also swells and stretches by two morph targets.
+fn swaying_post(morphs: bool) -> WorldFrame {
     use crate::world::math::{Quat, Transform};
     use crate::world::skin::{Channel, Clip, Path, Play, Skeleton, SkeletonNode, Skin};
     let skeleton = Skeleton::new(vec![
@@ -142,9 +143,19 @@ fn swaying_post() -> WorldFrame {
     let mut data = Mesh::cuboid(0.5, 2.0, 0.5).data().clone();
     data.joints = vec![[0, 1, 0, 0]; data.positions.len()];
     data.weights = data.positions.iter().map(|p| if p[1] > 0.0 { [0, 255, 0, 0] } else { [255, 0, 0, 0] }).collect();
+    if morphs {
+        use crate::world::mesh::Morph;
+        // the top swells across, the whole post stretches up
+        let swell = data.positions.iter().map(|p| if p[1] > 0.0 { [p[0] * 0.8, 0.0, p[2] * 0.8] } else { [0.0; 3] }).collect();
+        let stretch = data.positions.iter().map(|p| [0.0, (p[1] + 1.0) * 0.25, 0.0]).collect();
+        data.morphs = vec![Morph { positions: swell, normals: Vec::new() }, Morph { positions: stretch, normals: Vec::new() }];
+    }
     let world = World::new();
     world.add(Mesh::plane(6.0, 6.0), Material::color(Color::rgb(200, 196, 188))).set_position(vec3(0.0, -1.0, 0.0));
     let post = world.add_model(Model::single(Mesh::new(data), Material::color(Color::rgb(222, 120, 60))).skinned(skin));
+    if morphs {
+        post.set_morph([0.6, 0.3]);
+    }
     let lean = Quat::from_axis_angle(Vec3::Z, 0.5);
     let channels = vec![
         Channel { node: 1, path: Path::Translation, step: false, times: Rc::from([0.0, 1.0]), values: Rc::from([0.0, 0.0, 0.0, 0.4, 0.0, 0.0]) },
@@ -254,7 +265,8 @@ pub fn world_scene(index: u32) -> WorldScene {
             tolerance: PENUMBRA,
             pictures: Vec::new(),
         },
-        18 => WorldScene { frame: Rc::new(swaying_post()), name: "a post on its joints", tolerance: PENUMBRA, pictures: Vec::new() },
+        18 => WorldScene { frame: Rc::new(swaying_post(false)), name: "a post on its joints", tolerance: PENUMBRA, pictures: Vec::new() },
+        19 => WorldScene { frame: Rc::new(swaying_post(true)), name: "a post that swells", tolerance: PENUMBRA, pictures: Vec::new() },
         16 => {
             // drawn at one sample, so the glow's edge is the CPU's
             let mut frame = night_lamps();

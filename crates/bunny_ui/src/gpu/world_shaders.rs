@@ -85,13 +85,16 @@ uvec4 part_row(uint index) {
 }
 "#;
 
-/// A skinned vertex's pose: the frame's palette (three RGBA32F texels a
-/// joint, 1024 a row) and the mesh's deform stream (one R32UI texel a
-/// word, two words a vertex: its joints, then its weights), both read by
-/// number. It follows `WORLD_COMMON`.
+/// A vertex's morphs and pose: the mesh's deform stream (one R32UI texel
+/// a word: each vertex's skin, two words, then each morph target's
+/// change, six) and the frame's palette (three RGBA32F texels a joint),
+/// both read by number, 1024 a row. The draw's flags say how the stream
+/// is laid out. It follows `WORLD_COMMON`.
 pub const SKIN: &str = r#"
 uniform highp sampler2D u_joints;
 uniform highp usampler2D u_deform;
+
+const uint DEFORM_SKIN = 16u;
 
 vec4 joint_row(uint index) {
     return texelFetch(u_joints, ivec2(int(index % 1024u), int(index / 1024u)), 0);
@@ -101,17 +104,32 @@ uint deform_word(uint index) {
     return texelFetch(u_deform, ivec2(int(index % 1024u), int(index / 1024u)), 0).r;
 }
 
-// each of the vertex's four joints applied to the point, and without the
-// move to the normal, weighed by its share in order: the CPU's order
-void skin(uint base, inout vec3 p, inout vec3 n) {
-    uint vertex = uint(gl_VertexID);
-    uint joints = deform_word(2u * vertex);
-    uint weights = deform_word(2u * vertex + 1u);
+// the vertex's morphs, weighed by the instance's two 16-bit shares, then
+// its pose: each of its four joints applied to the point, and without
+// the move to the normal, weighed by its share — the CPU's order
+void deform_vertex(uint flags, uint joint_base, uint shares, inout vec3 p, inout vec3 n) {
+    uint morphs = (flags >> 5u) & 3u;
+    bool skinned = (flags & DEFORM_SKIN) != 0u;
+    uint first = uint(gl_VertexID) * ((skinned ? 2u : 0u) + 6u * morphs);
+    uint at = first + (skinned ? 2u : 0u);
+    for (uint k = 0u; k < morphs; k++) {
+        float w = float((shares >> (16u * k)) & 65535u) / 65535.0;
+        vec3 moved = vec3(uintBitsToFloat(deform_word(at)), uintBitsToFloat(deform_word(at + 1u)), uintBitsToFloat(deform_word(at + 2u)));
+        vec3 turned = vec3(uintBitsToFloat(deform_word(at + 3u)), uintBitsToFloat(deform_word(at + 4u)), uintBitsToFloat(deform_word(at + 5u)));
+        p = p + w * moved;
+        n = n + w * turned;
+        at += 6u;
+    }
+    if (!skinned || joint_base == 0xFFFFFFFFu) {
+        return;
+    }
+    uint joints = deform_word(first);
+    uint weights = deform_word(first + 1u);
     vec3 point = vec3(0.0);
     vec3 normal = vec3(0.0);
     for (uint k = 0u; k < 4u; k++) {
         float w = float((weights >> (8u * k)) & 255u) / 255.0;
-        uint row = base + 3u * ((joints >> (8u * k)) & 255u);
+        uint row = joint_base + 3u * ((joints >> (8u * k)) & 255u);
         vec4 r0 = joint_row(row);
         vec4 r1 = joint_row(row + 1u);
         vec4 r2 = joint_row(row + 2u);
@@ -175,9 +193,10 @@ vec3 unfold_normal(ivec2 folded) {
 void main() {
     vec3 p = a_position;
     vec3 n = unfold_normal(a_normal);
-    // a skinned vertex moves to its pose before it is placed
-    if (i_more.z != 0xFFFFFFFFu) {
-        skin(i_more.z, p, n);
+    // a vertex takes its morphs, then its pose, before it is placed
+    uint layout_flags = uint(u_draw.x);
+    if ((layout_flags & (DEFORM_SKIN | (3u << 5u))) != 0u) {
+        deform_vertex(layout_flags, i_more.z, i_more.w, p, n);
     }
     vec3 eye = vec3(i_row0.x * p.x + i_row0.y * p.y + i_row0.z * p.z + i_row0.w,
                     i_row1.x * p.x + i_row1.y * p.y + i_row1.z * p.z + i_row1.w,
@@ -526,9 +545,9 @@ void main() {
 
 /// A caster into the sun's shadow map: the vertex placed by the caster's
 /// rows, the map upside down in clip space like every target, so its
-/// first row is its top; a part that hides casts nothing, and a skinned
-/// caster casts its pose (`i_ids.y`, its joint base). It follows
-/// `WORLD_COMMON`, `PARTS` and `SKIN`.
+/// first row is its top; a part that hides casts nothing, and a caster
+/// casts its morphs (`i_ids.z`, its weights) and its pose (`i_ids.y`, its
+/// joint base). It follows `WORLD_COMMON`, `PARTS` and `SKIN`.
 pub const SHADOW_VERT: &str = r#"
 layout(location = 0) in vec3 a_position;
 layout(location = 4) in uvec4 a_ids;
@@ -543,9 +562,10 @@ void main() {
         return;
     }
     vec3 p = a_position;
-    if (i_ids.y != 0xFFFFFFFFu) {
+    uint layout_flags = uint(u_draw.x);
+    if ((layout_flags & (DEFORM_SKIN | (3u << 5u))) != 0u) {
         vec3 unused = vec3(0.0);
-        skin(i_ids.y, p, unused);
+        deform_vertex(layout_flags, i_ids.y, i_ids.z, p, unused);
     }
     vec3 m = vec3(i_row0.x * p.x + i_row0.y * p.y + i_row0.z * p.z + i_row0.w,
                   i_row1.x * p.x + i_row1.y * p.y + i_row1.z * p.z + i_row1.w,

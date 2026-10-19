@@ -9,8 +9,9 @@
 //! unlit surfaces (`KHR_materials_unlit`); nodes with a matrix or a
 //! translation, rotation and scale; skins (`JOINTS_0`, `WEIGHTS_0`, the
 //! inverse binds) and the animations that move their nodes, keys held
-//! (`STEP`) or blended (`LINEAR`); and the `extras` of nodes and meshes,
-//! handed on as raw JSON.
+//! (`STEP`) or blended (`LINEAR`); up to two morph targets a mesh (their
+//! places and normals, weighed by the app); and the `extras` of nodes and
+//! meshes, handed on as raw JSON.
 //!
 //! What it refuses, by name: buffers in files outside the asset, sparse
 //! accessors, cubic spline keys (sample them at a steady rate), a skin
@@ -22,7 +23,7 @@ use std::rc::Rc;
 use super::json::{Json, JsonError};
 use super::material::{AlphaMode, Material, Model};
 use super::math::{Mat4, Quat, Transform, Vec3, vec3};
-use super::mesh::{Mesh, MeshData};
+use super::mesh::{MAX_MORPHS, Mesh, MeshData, Morph};
 use super::skin::{Channel, Clip, Path, Skeleton, SkeletonNode, Skin};
 use super::shade::encode;
 use super::store::{Entity, EntitySpec, Shape, World};
@@ -412,6 +413,7 @@ fn read(json: &Json, bin: Option<&[u8]>) -> Result<Asset, GltfError> {
         let mut data = MeshData::default();
         let mut slots: Vec<Option<usize>> = Vec::new();
         let mut materials: Vec<Material> = Vec::new();
+        let mut morphs: Vec<Morph> = Vec::new();
         for primitive in mesh.get("primitives").map_or(&[][..], Json::as_array) {
             if primitive.get("mode").and_then(Json::as_index).unwrap_or(4) != 4 {
                 continue; // lines and points have no surface to draw
@@ -501,6 +503,32 @@ fn read(json: &Json, bin: Option<&[u8]>) -> Result<Asset, GltfError> {
                 data.weights.clear();
             }
             data.materials.extend(std::iter::repeat_n(slot.min(255) as u8, count));
+            // morph targets: each primitive's vertices in each target, a
+            // primitive without one adding no change
+            let targets = primitive.get("targets").map_or(&[][..], Json::as_array);
+            if targets.len() > MAX_MORPHS {
+                return Err(GltfError::Unsupported("more than two morph targets"));
+            }
+            while morphs.len() < targets.len() {
+                morphs.push(Morph { positions: vec![[0.0; 3]; base as usize], normals: vec![[0.0; 3]; base as usize] });
+            }
+            for (k, morph) in morphs.iter_mut().enumerate() {
+                let target = targets.get(k);
+                let read = |name: &str| -> Result<Vec<[f32; 3]>, GltfError> {
+                    match target.and_then(|t| t.get(name)).and_then(Json::as_index) {
+                        Some(index) => {
+                            let (values, components) = document.floats(index)?;
+                            if components != 3 || values.len() != count * 3 {
+                                return Err(GltfError::Unsupported("a morph target that does not match its primitive"));
+                            }
+                            Ok(values.as_chunks::<3>().0.to_vec())
+                        }
+                        None => Ok(vec![[0.0; 3]; count]),
+                    }
+                };
+                morph.positions.extend(read("POSITION")?);
+                morph.normals.extend(read("NORMAL")?);
+            }
             match primitive.get("indices").and_then(Json::as_index) {
                 Some(index) => {
                     for i in document.indices(index)? {
@@ -520,6 +548,7 @@ fn read(json: &Json, bin: Option<&[u8]>) -> Result<Asset, GltfError> {
         if materials.is_empty() {
             materials.push(default_material());
         }
+        data.morphs = morphs;
         models.push(Model::new(Mesh::new(data), materials));
         model_extras.push(mesh.get("extras").map(|e| Rc::from(e.to_text())));
     }
@@ -808,6 +837,30 @@ mod tests {
         // cubic spline keys are refused by name
         let cubic = json.replace(r#""interpolation":"LINEAR""#, r#""interpolation":"CUBICSPLINE""#);
         assert_eq!(Asset::from_bytes(&glb(&cubic, &bin)).err(), Some(GltfError::Unsupported("a cubic spline animation")));
+    }
+
+    #[test]
+    fn a_mesh_with_targets_imports_its_morphs() {
+        let mut bin = triangle_bin();
+        bin.extend_from_slice(&[0, 0]); // the indices padded to four bytes
+        for value in [0.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0] {
+            bin.extend_from_slice(&value.to_le_bytes()); // 44: the second corner moves toward +z
+        }
+        let json = r#"{"asset":{"version":"2.0"},"buffers":[{"byteLength":80}],
+            "bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36},{"buffer":0,"byteOffset":36,"byteLength":6},{"buffer":0,"byteOffset":44,"byteLength":36}],
+            "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"},
+              {"bufferView":2,"componentType":5126,"count":3,"type":"VEC3"}],
+            "meshes":[{"primitives":[{"attributes":{"POSITION":0},"indices":1,"targets":[{"POSITION":2}]}]}],
+            "nodes":[{"mesh":0}]}"#;
+        let asset = Asset::from_bytes(&glb(json, &bin)).expect("a valid asset");
+        let mesh = &asset.models[0].mesh;
+        assert_eq!(mesh.morph_count(), 1);
+        // the flat faces split the corners; the morph travels with them
+        let data = mesh.data();
+        let moved = data.positions.iter().zip(&data.morphs[0].positions).find(|(p, _)| **p == [1.0, 0.0, 0.0]).map(|(_, m)| *m);
+        assert_eq!(moved, Some([0.0, 0.0, 1.0]));
+        let three = json.replace(r#""targets":[{"POSITION":2}]"#, r#""targets":[{"POSITION":2},{"POSITION":2},{"POSITION":2}]"#);
+        assert_eq!(Asset::from_bytes(&glb(&three, &bin)).err(), Some(GltfError::Unsupported("more than two morph targets")));
     }
 
     #[test]

@@ -115,8 +115,9 @@ pub struct InstanceData {
     /// Where the instance's palette starts in the frame's joint rows,
     /// three rows a joint; [`NO_JOINTS`] for a mesh at rest.
     pub joint_base: u32,
-    /// A word kept for what an instance will carry next: zero.
-    pub reserved: u32,
+    /// The weights of its mesh's morph targets, two 16-bit shares
+    /// ([`super::mesh::pack_morph`]).
+    pub morph: u32,
 }
 
 /// The `part_base` of an instance whose parts all keep their own look.
@@ -140,7 +141,7 @@ pub mod instance_offset {
     pub const AMBIENT: usize = 112;
     pub const PART_BASE: usize = 116;
     pub const JOINT_BASE: usize = 120;
-    pub const RESERVED: usize = 124;
+    pub const MORPH: usize = 124;
     pub const SIZE: usize = 128;
 }
 
@@ -185,14 +186,15 @@ pub mod material_flag {
 /// map-from-model matrix, `x' = rows[0] · (x, y, z, 1)` — `x` and `y`
 /// across the map in `[-1, 1]` (`y` up), `z` the depth from the sun in
 /// `[0, 1]` — and where the states of its parts start in the frame's part
-/// table (a part that hides casts nothing), and where its palette starts
-/// for a skinned caster. 64 bytes: the rows, the part base, the joint
-/// base, two zero words.
+/// table (a part that hides casts nothing), where its palette starts for
+/// a skinned caster, and its morph weights. 64 bytes: the rows, the part
+/// base, the joint base, the morph weights, a zero word.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShadowCaster {
     pub rows: [Row; 3],
     pub part_base: u32,
     pub joint_base: u32,
+    pub morph: u32,
 }
 
 /// Bytes of one [`ShadowCaster`].
@@ -264,7 +266,7 @@ impl InstanceData {
         out.extend_from_slice(&self.ambient);
         out.extend_from_slice(&self.part_base.to_le_bytes());
         out.extend_from_slice(&self.joint_base.to_le_bytes());
-        out.extend_from_slice(&self.reserved.to_le_bytes());
+        out.extend_from_slice(&self.morph.to_le_bytes());
     }
 }
 
@@ -299,7 +301,7 @@ pub fn shadow_instance_bytes(instances: &[ShadowCaster]) -> Vec<u8> {
         for row in &caster.rows {
             put_row(&mut out, row);
         }
-        for word in [caster.part_base, caster.joint_base, 0, 0] {
+        for word in [caster.part_base, caster.joint_base, caster.morph, 0] {
             out.extend_from_slice(&word.to_le_bytes());
         }
     }
@@ -408,7 +410,7 @@ mod tests {
             ambient: [50, 60, 70, 255],
             part_base: 99,
             joint_base: NO_JOINTS,
-            reserved: 0,
+            morph: 0,
         };
         let bytes = instance_bytes(&[instance, instance]);
         assert_eq!(bytes.len(), 2 * instance_offset::SIZE);
@@ -423,7 +425,7 @@ mod tests {
         assert_eq!(&bytes[at::AMBIENT..at::AMBIENT + 4], &[50, 60, 70, 255]);
         assert_eq!(u32_at(&bytes, at::PART_BASE), 99);
         assert_eq!(u32_at(&bytes, at::JOINT_BASE), NO_JOINTS);
-        assert_eq!(u32_at(&bytes, at::RESERVED), 0);
+        assert_eq!(u32_at(&bytes, at::MORPH), 0);
         assert_eq!(u32_at(&bytes, at::SIZE + at::MATERIAL_BASE), 77, "the second instance starts at 128");
     }
 
@@ -440,11 +442,12 @@ mod tests {
         let bytes = segment_bytes(&[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]);
         assert_eq!(bytes.len(), SEGMENT_STRIDE);
         assert_eq!(f32_at(&bytes, 20), 6.0);
-        let caster = ShadowCaster { rows: [[1.0, 0.0, 0.0, 0.5], [0.0, 1.0, 0.0, 0.25], [0.0, 0.0, 1.0, 0.125]], part_base: 7, joint_base: 9 };
+        let caster = ShadowCaster { rows: [[1.0, 0.0, 0.0, 0.5], [0.0, 1.0, 0.0, 0.25], [0.0, 0.0, 1.0, 0.125]], part_base: 7, joint_base: 9, morph: 11 };
         let bytes = shadow_instance_bytes(&[caster, caster]);
         assert_eq!(bytes.len(), 2 * SHADOW_INSTANCE_STRIDE);
         assert_eq!(f32_at(&bytes, SHADOW_INSTANCE_STRIDE + 44), 0.125);
         assert_eq!(u32_at(&bytes, SHADOW_INSTANCE_STRIDE + 48), 7);
         assert_eq!(u32_at(&bytes, SHADOW_INSTANCE_STRIDE + 52), 9, "the joint base beside the part base");
+        assert_eq!(u32_at(&bytes, SHADOW_INSTANCE_STRIDE + 56), 11, "and the morph weights");
     }
 }

@@ -382,6 +382,14 @@ box asks for frames until it arrives. Placing the entity stops it.
 figure.cross_fade(asset.clip("walk").unwrap(), 0.25).move_to(vec3(4.0, 0.0, 2.0), 1.3);
 ```
 
+A mesh carries up to two morph targets (`MeshData::morphs`, glTF's
+`targets`): how far each vertex moves, and how its normal turns, at full
+weight. The entity weighs them, each in `[0, 1]`
+(`entity.set_morph([0.6, 0.0])`) — a coat that settles on a seat, a
+cheek that puffs. A vertex takes its morphs first, then its pose; the
+shadow casts both. The weights ride the instance, so instances of one
+mesh with their own weights still draw as one.
+
 ## Limits
 
 - A world inside a `.looping` box or an overlay island is drawn on the
@@ -404,6 +412,6 @@ BUNNY_PARANOID=all cargo test -p bunny-ui-core --all-features
 cargo test -p bunny-ui-apple --features 3d
 cargo run -p bunny-ui-macos --features 3d --example world_window
 # in a page built with the web shell's `3d` feature, from the console:
-#   for (let n = 0; n < 19; n++) __bunny.bunny_gpu_world_parity(n)
+#   for (let n = 0; n < 20; n++) __bunny.bunny_gpu_world_parity(n)
 BUNNY_WORLD_GLB=chair.glb BUNNY_WORLD_DUMP=/tmp cargo test -p bunny-ui-core --features gltf --lib a_glb_from_the_environment -- --ignored
 ```

@@ -71,6 +71,8 @@ pub struct EntitySpec {
     /// A walk the entity is on: while it lasts, it places the entity (and
     /// may turn it), whatever the transform says.
     pub motion: Option<Motion>,
+    /// The weights of its mesh's morph targets, each in `[0, 1]`.
+    pub morph: [f32; 2],
     /// A number the app chooses, given back with a pick.
     pub tag: u64,
     /// Raw JSON an asset brought with it, untouched.
@@ -98,6 +100,7 @@ impl EntitySpec {
             parts: None,
             play: None,
             motion: None,
+            morph: [0.0; 2],
             tag: 0,
             extras: None,
         }
@@ -825,6 +828,12 @@ impl Entity {
                 None => next,
             });
         })
+    }
+
+    /// The weights of the entity's mesh's morph targets, each in `[0, 1]`:
+    /// a cheek that puffs, a coat that settles on a seat.
+    pub fn set_morph(self, weights: [f32; 2]) -> Entity {
+        self.change(|spec| spec.morph = weights)
     }
 
     /// Walks the entity from where it stands now to `to`, `speed` meters a

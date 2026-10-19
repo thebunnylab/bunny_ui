@@ -136,7 +136,7 @@ struct WorldInstance {
     uchar4 ambient;
     uint part_base;
     uint joint_base;
-    uint reserved;
+    uint morph;
 };
 
 struct WorldMaterial {
@@ -181,6 +181,9 @@ constant uint DRAW_MASK = 1;
 constant uint DRAW_TEXTURED = 2;
 constant uint DRAW_REPLACE = 4;
 constant uint DRAW_COVERAGE = 8;
+// the mesh's deform stream opens each vertex's words with its skin; its
+// morph targets' count lies from bit 5
+constant uint DEFORM_SKIN = 16;
 constant uint MATERIAL_UNLIT = 1;
 constant uint MATERIAL_MASK = 4;
 constant float LINE_PULL = 2.0e-3;
@@ -379,18 +382,35 @@ static float3 unfold_normal(short2 folded) {
     return float3(x / len, y / len, z / len);
 }
 
-// a skinned vertex's pose: each of its four joints applied to the point,
-// and without the move to the normal, weighed by its share in order —
-// the CPU's order. The deform stream holds two words a vertex (its
-// joints, then its weights); the palette three rows a joint
-static void skin(device const float4* joints, device const uint* deform, uint base, uint corner, thread float3& p, thread float3& n) {
-    uint which = deform[2 * corner];
-    uint shares = deform[2 * corner + 1];
+// a vertex's morphs, weighed by the instance's two 16-bit shares, then
+// its pose: each of its four joints applied to the point, and without
+// the move to the normal, weighed by its share — the CPU's order. The
+// deform stream holds each vertex's skin (two words) then each morph
+// target's change (six); the draw's flags say which
+static void deform(device const float4* joints, device const uint* stream, uint flags, uint joint_base, uint shares, uint corner,
+                   thread float3& p, thread float3& n) {
+    uint morphs = (flags >> 5) & 3u;
+    bool skinned = (flags & DEFORM_SKIN) != 0;
+    uint first = corner * ((skinned ? 2u : 0u) + 6u * morphs);
+    uint at = first + (skinned ? 2u : 0u);
+    for (uint k = 0; k < morphs; k++) {
+        float w = float((shares >> (16 * k)) & 65535u) / 65535.0;
+        float3 moved = float3(as_type<float>(stream[at]), as_type<float>(stream[at + 1]), as_type<float>(stream[at + 2]));
+        float3 turned = float3(as_type<float>(stream[at + 3]), as_type<float>(stream[at + 4]), as_type<float>(stream[at + 5]));
+        p = p + w * moved;
+        n = n + w * turned;
+        at += 6;
+    }
+    if (!skinned || joint_base == 0xFFFFFFFFu) {
+        return;
+    }
+    uint which = stream[first];
+    uint weights = stream[first + 1];
     float3 point = float3(0.0);
     float3 normal = float3(0.0);
     for (uint k = 0; k < 4; k++) {
-        float w = float((shares >> (8 * k)) & 255u) / 255.0;
-        uint row = base + 3 * ((which >> (8 * k)) & 255u);
+        float w = float((weights >> (8 * k)) & 255u) / 255.0;
+        uint row = joint_base + 3 * ((which >> (8 * k)) & 255u);
         float4 r0 = joints[row];
         float4 r1 = joints[row + 1];
         float4 r2 = joints[row + 2];
@@ -437,7 +457,7 @@ vertex WorldVary world_vertex(uint vid [[vertex_id]],
                               constant WorldUniforms& u [[buffer(2)]],
                               constant WorldDraw& draw [[buffer(3)]],
                               device const uchar4* parts [[buffer(5)]],
-                              device const uint* deform [[buffer(6)]],
+                              device const uint* stream [[buffer(6)]],
                               device const float4* joints [[buffer(7)]]) {
     WorldVertex v = vertices[vid];
     uint index = draw.first_instance + iid;
@@ -455,9 +475,9 @@ vertex WorldVary world_vertex(uint vid [[vertex_id]],
     }
     float3 p = float3(v.position);
     float3 n = unfold_normal(v.normal);
-    // a skinned vertex moves to its pose before it is placed
-    if (instance.joint_base != 0xFFFFFFFFu) {
-        skin(joints, deform, instance.joint_base, vid, p, n);
+    // a vertex takes its morphs, then its pose, before it is placed
+    if ((draw.flags & (DEFORM_SKIN | (3u << 5))) != 0) {
+        deform(joints, stream, draw.flags, instance.joint_base, instance.morph, vid, p, n);
     }
     float3 eye = to_eye(instance, p);
     WorldVary out;
@@ -688,7 +708,8 @@ struct ShadowCaster {
     float4 rows[3];
     uint part_base;
     uint joint_base;
-    uint pad[2];
+    uint morph;
+    uint pad;
 };
 
 struct ShadowVary {
@@ -703,7 +724,7 @@ vertex ShadowVary shadow_vertex(uint vid [[vertex_id]],
                                 device const ShadowCaster* casters [[buffer(1)]],
                                 constant WorldDraw& draw [[buffer(3)]],
                                 device const uchar4* parts [[buffer(5)]],
-                                device const uint* deform [[buffer(6)]],
+                                device const uint* stream [[buffer(6)]],
                                 device const float4* joints [[buffer(7)]]) {
     float3 p = float3(vertices[vid].position);
     ShadowCaster caster = casters[draw.first_instance + iid];
@@ -711,10 +732,10 @@ vertex ShadowVary shadow_vertex(uint vid [[vertex_id]],
     if (caster.part_base != 0xFFFFFFFFu && parts[caster.part_base + vertices[vid].part].a == 0) {
         return ShadowVary{float4(0.0, 0.0, 2.0, 1.0)};
     }
-    // a skinned caster casts its pose
-    if (caster.joint_base != 0xFFFFFFFFu) {
+    // a caster casts its morphs and its pose
+    if ((draw.flags & (DEFORM_SKIN | (3u << 5))) != 0) {
         float3 unused = float3(0.0);
-        skin(joints, deform, caster.joint_base, vid, p, unused);
+        deform(joints, stream, draw.flags, caster.joint_base, caster.morph, vid, p, unused);
     }
     float4 r0 = caster.rows[0];
     float4 r1 = caster.rows[1];
@@ -1259,7 +1280,13 @@ impl MetalWorld {
                                 first_index: draw.first_index,
                                 index_count: draw.index_count,
                                 instance_count: draw.instance_count,
-                                block: DrawBlock { first_instance: draw.first_instance, flags: 0, near: 0.0, far: 0.0, bias: [0.0; 4] },
+                                block: DrawBlock {
+                                    first_instance: draw.first_instance,
+                                    flags: job.frame.meshes.get(draw.mesh as usize).map_or(0, |mesh| mesh.deform_flags()),
+                                    near: 0.0,
+                                    far: 0.0,
+                                    bias: [0.0; 4],
+                                },
                             })
                         })
                         .collect(),
@@ -1301,6 +1328,8 @@ impl MetalWorld {
                         if coverage {
                             flags |= DRAW_COVERAGE;
                         }
+                        // how the mesh lays out its morphs and its skin
+                        flags |= job.frame.meshes.get(mesh as usize).map_or(0, |mesh| mesh.deform_flags());
                         draws.push(PreparedDraw::Mesh {
                             pipeline,
                             depth: stack.depth_states[if blend == Blend::Replace { DEPTH_OPAQUE } else { DEPTH_SEE_THROUGH }],

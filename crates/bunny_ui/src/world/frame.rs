@@ -484,6 +484,7 @@ struct Seen {
     parts: Option<Rc<[PartState]>>,
     flags: u32,
     joint_base: u32,
+    morph: u32,
 }
 
 /// Decides the picture of `world` through `camera` for a target of
@@ -549,6 +550,7 @@ pub(crate) fn build_frame(
                 | if data.spec.reads_floor_map { instance_flag::FLOOR_MAP } else { 0 }
                 | (data.spec.light_group as u32 & instance_flag::GROUP_MASK) << instance_flag::GROUP_SHIFT,
             joint_base,
+            morph: super::mesh::pack_morph(data.spec.morph),
         };
         match &data.spec.shape {
             Shape::Model(model) => {
@@ -562,6 +564,7 @@ pub(crate) fn build_frame(
                         parts: data.spec.parts.clone(),
                         joint_base,
                         joint_rows,
+                        morph: super::mesh::pack_morph(data.spec.morph),
                         bounds: local,
                     });
                 }
@@ -865,6 +868,7 @@ struct Caster {
     joint_base: u32,
     /// How many rows its palette takes.
     joint_rows: u32,
+    morph: u32,
     /// The box it casts from, in its own space (grown for a skin).
     bounds: Aabb,
 }
@@ -968,7 +972,12 @@ fn shadow_frame(
         for &member in members {
             let caster = &casters[member];
             let part_base = part_base_of(&mut frame.parts, part_bases, &caster.parts, &caster.model.mesh);
-            out.instances.push(ShadowCaster { rows: rows(&(fit.map_from_world * caster.world_from_model)), part_base, joint_base: caster.joint_base });
+            out.instances.push(ShadowCaster {
+                rows: rows(&(fit.map_from_world * caster.world_from_model)),
+                part_base,
+                joint_base: caster.joint_base,
+                morph: caster.morph,
+            });
         }
         for &(first_index, index_count) in runs {
             out.draws.push(ShadowDraw { mesh: slot, first_index, index_count, first_instance, instance_count: members.len() as u32 });
@@ -983,7 +992,8 @@ fn shadow_frame(
         for value in caster.rows.iter().flatten() {
             hasher.write_u32(value.to_bits());
         }
-        // a skinned caster casts its pose: the pose moves the map
+        // a caster's morph weights and its pose move the map
+        hasher.write_u32(caster.morph);
         if caster.joint_base != NO_JOINTS {
             let rows = casters.iter().find(|known| known.joint_base == caster.joint_base).map_or(0, |known| known.joint_rows);
             for value in frame.joints.iter().skip(caster.joint_base as usize).take(rows as usize).flatten() {
@@ -1049,7 +1059,7 @@ fn instance_of(seen: &Seen, material_base: u32, part_base: u32) -> InstanceData 
         ambient: [seen.ambient.r, seen.ambient.g, seen.ambient.b, 255],
         part_base,
         joint_base: seen.joint_base,
-        reserved: 0,
+        morph: seen.morph,
     }
 }
 

@@ -1788,6 +1788,8 @@ impl WorldStack {
                         if coverage {
                             flags |= DRAW_COVERAGE;
                         }
+                        // how the mesh lays out its morphs and its skin
+                        flags |= frame.meshes.get(mesh as usize).map_or(0, |mesh| mesh.deform_flags());
                         (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, pipeline);
                         let picture = surface.map_or(self.blank.set, |surface| surface.set);
                         (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 1, 1, &picture, 0, std::ptr::null());
@@ -2064,6 +2066,17 @@ impl WorldStack {
                 let Some(buffers) = job.meshes.get(draw.mesh as usize).and_then(|id| meshes.get(id)) else { continue };
                 let deform = self.deform_of(buffers);
                 (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 4, 1, &deform, 0, std::ptr::null());
+                // how the caster's mesh lays out its morphs and its skin
+                let layout_flags = job.frame.meshes.get(draw.mesh as usize).map_or(0, |mesh| mesh.deform_flags());
+                let push = DrawPush { draw: [layout_flags as f32, 0.0, 0.0, 0.0], ..DrawPush::default() };
+                (fns.cmd_push_constants)(
+                    command,
+                    self.layout,
+                    SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT,
+                    0,
+                    DRAW_PUSH,
+                    (&push as *const DrawPush).cast(),
+                );
                 // the first caster rides the buffer's offset, as the
                 // instances of a surface do
                 let bound = [buffers.vertices.buffer, blocks];

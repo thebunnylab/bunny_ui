@@ -258,7 +258,10 @@ impl<'a> Corners<'a> {
         let count = data.positions.len();
         let mut p = data.positions[index];
         let mut n = self.normals[index];
-        // a skinned vertex moves to its pose before it is placed
+        // a vertex takes its morphs, then its pose, before it is placed
+        if !data.morphs.is_empty() {
+            (p, n) = super::mesh::morph_vertex(data, index, instance.morph, p, n);
+        }
         if instance.joint_base != NO_JOINTS && data.joints.len() == count && data.weights.len() == count {
             (p, n) = super::skin::skin_vertex(palette, instance.joint_base, data.joints[index], data.weights[index], p, n);
         }

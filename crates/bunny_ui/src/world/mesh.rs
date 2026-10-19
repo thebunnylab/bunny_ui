@@ -37,11 +37,54 @@ pub mod offset {
     pub const PART: usize = 30;
 }
 
-/// Bytes per vertex of a skinned mesh's second stream
+/// Words a vertex's skin takes in a mesh's second stream
 /// ([`Mesh::deform_bytes`]): its four joints, then its four weights. The
-/// shaders read it by the vertex's number, so the vertex itself keeps
-/// its 32 bytes and a mesh without a skin carries nothing more.
-pub const DEFORM_STRIDE: usize = 8;
+/// shaders read the stream by the vertex's number, so the vertex itself
+/// keeps its 32 bytes and a mesh with neither skin nor morphs carries
+/// nothing more.
+pub const SKIN_WORDS: usize = 2;
+
+/// Words each morph target takes a vertex in the second stream: the
+/// change of its place, then of its normal, three `f32` each.
+pub const MORPH_WORDS: usize = 6;
+
+/// The most morph targets a mesh carries.
+pub const MAX_MORPHS: usize = 2;
+
+/// How a mesh's second stream is laid out, as a draw's flags carry it to
+/// the vertex stage: [`DEFORM_SKIN`] when each vertex's words open with
+/// its skin, and its morph targets' count from [`DEFORM_MORPH_SHIFT`].
+pub const DEFORM_SKIN: u32 = 16;
+pub const DEFORM_MORPH_SHIFT: u32 = 5;
+
+/// Two morph weights as an instance carries them: each in `[0, 1]`, a
+/// 16-bit share, the first in the low half.
+pub fn pack_morph(weights: [f32; 2]) -> u32 {
+    let share = |weight: f32| if weight.is_finite() { (weight.clamp(0.0, 1.0) * 65535.0).round() as u32 } else { 0 };
+    share(weights[0]) | share(weights[1]) << 16
+}
+
+/// A vertex of a mesh with morph targets at the weights an instance packs:
+/// each target's change weighed in order — the shaders' arithmetic.
+pub(crate) fn morph_vertex(data: &MeshData, vertex: usize, weights: u32, mut p: [f32; 3], mut n: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    for (k, morph) in data.morphs.iter().enumerate() {
+        let w = ((weights >> (16 * k)) & 0xFFFF) as f32 / 65535.0;
+        let moved = morph.positions[vertex];
+        let turned = morph.normals.get(vertex).copied().unwrap_or([0.0; 3]);
+        p = [0, 1, 2].map(|c| p[c] + w * moved[c]);
+        n = [0, 1, 2].map(|c| n[c] + w * turned[c]);
+    }
+    (p, n)
+}
+
+/// One morph target of a mesh: how far each vertex moves, and how its
+/// normal turns, at full weight.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Morph {
+    pub positions: Vec<[f32; 3]>,
+    /// Empty when the target turns no normal.
+    pub normals: Vec<[f32; 3]>,
+}
 
 /// A unit normal folded onto the octahedron and quantized to two
 /// signed 16-bit numbers. The shader and the CPU rasterizer unfold it
@@ -110,6 +153,9 @@ pub struct MeshData {
     /// How much each of the four joints moves the vertex; they sum to
     /// 255 (a mesh is made so).
     pub weights: Vec<[u8; 4]>,
+    /// Shapes the mesh can take on: at most [`MAX_MORPHS`], each weighed
+    /// by the entity that shows the mesh ([`super::store::Entity::set_morph`]).
+    pub morphs: Vec<Morph>,
     pub indices: Vec<u32>,
 }
 
@@ -126,6 +172,8 @@ impl MeshData {
         let corners = self.indices.len() / 3 * 3;
         out.positions.reserve(corners);
         out.normals.reserve(corners);
+        // the vertex each corner comes from
+        let mut sources = Vec::with_capacity(corners);
         for triangle in self.indices.as_chunks::<3>().0 {
             if triangle.iter().any(|&i| i as usize >= count) {
                 continue;
@@ -134,6 +182,7 @@ impl MeshData {
             let normal = face_normal(a, b, c);
             for &index in triangle {
                 let i = index as usize;
+                sources.push(i);
                 out.indices.push(out.positions.len() as u32);
                 out.positions.push(self.positions[i]);
                 out.normals.push(normal);
@@ -147,6 +196,14 @@ impl MeshData {
                     out.weights.push(self.weights[i]);
                 }
             }
+        }
+        // a morph's corners travel with them; a flat face's normal turns not
+        for morph in &self.morphs {
+            if morph.positions.len() != count {
+                continue;
+            }
+            let positions = sources.iter().map(|&i| morph.positions[i]).collect();
+            out.morphs.push(Morph { positions, normals: Vec::new() });
         }
         out
     }
@@ -249,17 +306,38 @@ impl Mesh {
         !data.positions.is_empty() && data.joints.len() == data.positions.len() && data.weights.len() == data.positions.len()
     }
 
-    /// The second stream of a skinned mesh, [`DEFORM_STRIDE`] bytes a
-    /// vertex: its joints, then its weights. Empty without a skin.
+    /// How many morph targets the mesh carries.
+    pub fn morph_count(&self) -> usize {
+        self.0.data.morphs.len()
+    }
+
+    /// The layout of the second stream, as a draw's flags carry it.
+    pub fn deform_flags(&self) -> u32 {
+        (if self.is_skinned() { DEFORM_SKIN } else { 0 }) | (self.morph_count() as u32) << DEFORM_MORPH_SHIFT
+    }
+
+    /// The mesh's second stream, the same words for each vertex: its skin
+    /// ([`SKIN_WORDS`]: its joints, then its weights) when it has one, then
+    /// each morph target's change ([`MORPH_WORDS`]). Empty with neither.
     pub fn deform_bytes(&self) -> Vec<u8> {
-        if !self.is_skinned() {
+        let data = &self.0.data;
+        let skinned = self.is_skinned();
+        let words = if skinned { SKIN_WORDS } else { 0 } + MORPH_WORDS * data.morphs.len();
+        if words == 0 {
             return Vec::new();
         }
-        let data = &self.0.data;
-        let mut bytes = Vec::with_capacity(data.positions.len() * DEFORM_STRIDE);
-        for (joints, weights) in data.joints.iter().zip(&data.weights) {
-            bytes.extend_from_slice(joints);
-            bytes.extend_from_slice(weights);
+        let mut bytes = Vec::with_capacity(data.positions.len() * words * 4);
+        for vertex in 0..data.positions.len() {
+            if skinned {
+                bytes.extend_from_slice(&data.joints[vertex]);
+                bytes.extend_from_slice(&data.weights[vertex]);
+            }
+            for morph in &data.morphs {
+                let normal = morph.normals.get(vertex).copied().unwrap_or([0.0; 3]);
+                for value in morph.positions[vertex].iter().chain(normal.iter()) {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+            }
         }
         bytes
     }
@@ -398,6 +476,15 @@ fn sanitize(mut data: MeshData) -> MeshData {
     } else {
         data.joints.clear();
         data.weights.clear();
+    }
+    // morph targets of the mesh's own length, at most two; a normal list
+    // of another length turns nothing
+    data.morphs.retain(|morph| morph.positions.len() == count);
+    data.morphs.truncate(MAX_MORPHS);
+    for morph in &mut data.morphs {
+        if morph.normals.len() != count {
+            morph.normals.clear();
+        }
     }
     // the triangles of one material side by side, in their own order:
     // a draw binds one texture, and a material is a run of indices
@@ -846,11 +933,19 @@ mod tests {
             parts: vec![513],
             joints: vec![[3, 1, 0, 0]],
             weights: vec![[100, 100, 0, 0]],
+            morphs: vec![Morph { positions: vec![[0.5, 0.0, -1.0]], normals: vec![] }],
             indices: vec![],
         };
         let mesh = Mesh::new(data);
-        // the skin rides a stream of its own, its weights made whole
-        assert_eq!(mesh.deform_bytes(), vec![3, 1, 0, 0, 128, 127, 0, 0]);
+        // the skin and the morph ride a stream of their own, the weights
+        // made whole, a morph's missing normal turning nothing
+        let deform = mesh.deform_bytes();
+        assert_eq!(deform.len(), (SKIN_WORDS + MORPH_WORDS) * 4);
+        assert_eq!(&deform[..8], &[3, 1, 0, 0, 128, 127, 0, 0]);
+        let word = |at: usize| f32::from_le_bytes(deform[at * 4..at * 4 + 4].try_into().unwrap());
+        assert_eq!([word(2), word(3), word(4), word(5)], [0.5, 0.0, -1.0, 0.0]);
+        assert_eq!(mesh.deform_flags(), DEFORM_SKIN | 1 << DEFORM_MORPH_SHIFT);
+        assert_eq!(pack_morph([1.0, 0.5]), 0xFFFF | 32768 << 16);
         let bytes = mesh.vertex_bytes();
         assert_eq!(bytes.len(), VERTEX_STRIDE);
         let f32_at = |at: usize| f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());

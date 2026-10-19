@@ -131,7 +131,9 @@ impl ShadowMap {
                 let rows = &caster.rows;
                 let skinned = caster.joint_base != super::wire::NO_JOINTS && data.joints.len() == data.positions.len() && data.weights.len() == data.positions.len();
                 let place = |(index, p): (usize, &[f32; 3])| {
-                    // a skinned caster casts its pose
+                    // a caster casts its morphs and its pose
+                    let p = if data.morphs.is_empty() { *p } else { super::mesh::morph_vertex(data, index, caster.morph, *p, [0.0; 3]).0 };
+                    let p = &p;
                     let p = if skinned {
                         super::skin::skin_vertex(&frame.joints, caster.joint_base, data.joints[index], data.weights[index], *p, [0.0; 3]).0
                     } else {

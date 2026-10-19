@@ -80,6 +80,8 @@ layout(std430, set = 4, binding = 0) readonly buffer Deform {
     uint words[];
 } deform;
 
+const uint DEFORM_SKIN = 16u;
+
 vec4 joint_row(uint index) {
     return palette.rows[index];
 }
@@ -88,17 +90,32 @@ uint deform_word(uint index) {
     return deform.words[index];
 }
 
-// each of the vertex's four joints applied to the point, and without the
-// move to the normal, weighed by its share in order: the CPU's order
-void skin(uint base, inout vec3 p, inout vec3 n) {
-    uint vertex = uint(gl_VertexIndex);
-    uint joints = deform_word(2u * vertex);
-    uint weights = deform_word(2u * vertex + 1u);
+// the vertex's morphs, weighed by the instance's two 16-bit shares, then
+// its pose: each of its four joints applied to the point, and without
+// the move to the normal, weighed by its share — the CPU's order
+void deform_vertex(uint flags, uint joint_base, uint shares, inout vec3 p, inout vec3 n) {
+    uint morphs = (flags >> 5u) & 3u;
+    bool skinned = (flags & DEFORM_SKIN) != 0u;
+    uint first = uint(gl_VertexIndex) * ((skinned ? 2u : 0u) + 6u * morphs);
+    uint at = first + (skinned ? 2u : 0u);
+    for (uint k = 0u; k < morphs; k++) {
+        float w = float((shares >> (16u * k)) & 65535u) / 65535.0;
+        vec3 moved = vec3(uintBitsToFloat(deform_word(at)), uintBitsToFloat(deform_word(at + 1u)), uintBitsToFloat(deform_word(at + 2u)));
+        vec3 turned = vec3(uintBitsToFloat(deform_word(at + 3u)), uintBitsToFloat(deform_word(at + 4u)), uintBitsToFloat(deform_word(at + 5u)));
+        p = p + w * moved;
+        n = n + w * turned;
+        at += 6u;
+    }
+    if (!skinned || joint_base == 0xFFFFFFFFu) {
+        return;
+    }
+    uint joints = deform_word(first);
+    uint weights = deform_word(first + 1u);
     vec3 point = vec3(0.0);
     vec3 normal = vec3(0.0);
     for (uint k = 0u; k < 4u; k++) {
         float w = float((weights >> (8u * k)) & 255u) / 255.0;
-        uint row = base + 3u * ((joints >> (8u * k)) & 255u);
+        uint row = joint_base + 3u * ((joints >> (8u * k)) & 255u);
         vec4 r0 = joint_row(row);
         vec4 r1 = joint_row(row + 1u);
         vec4 r2 = joint_row(row + 2u);
@@ -156,9 +173,10 @@ vec3 unfold_normal(ivec2 folded) {
 void main() {
     vec3 p = a_position;
     vec3 n = unfold_normal(a_normal);
-    // a skinned vertex moves to its pose before it is placed
-    if (i_more.z != 0xFFFFFFFFu) {
-        skin(i_more.z, p, n);
+    // a vertex takes its morphs, then its pose, before it is placed
+    uint layout_flags = uint(u_draw.x);
+    if ((layout_flags & (DEFORM_SKIN | (3u << 5u))) != 0u) {
+        deform_vertex(layout_flags, i_more.z, i_more.w, p, n);
     }
     vec3 eye = vec3(i_row0.x * p.x + i_row0.y * p.y + i_row0.z * p.z + i_row0.w,
                     i_row1.x * p.x + i_row1.y * p.y + i_row1.z * p.z + i_row1.w,
