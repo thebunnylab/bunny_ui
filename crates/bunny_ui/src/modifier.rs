@@ -764,6 +764,23 @@ fn rewrite_pixel_node(
     icon: &impl Fn(crate::icon::Symbol, bool, bool) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        // Source sites describe this same view; recording must not turn
+        // a pixel modifier into a no-op or discard its edit provenance.
+        LayoutNode::Sited {
+            site,
+            mounted,
+            reading,
+            kind,
+            modifier,
+            child,
+        } => LayoutNode::Sited {
+            site,
+            mounted,
+            reading,
+            kind,
+            modifier,
+            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
+        },
         LayoutNode::Spanned {
             columns,
             rows,

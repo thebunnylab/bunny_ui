@@ -1,0 +1,81 @@
+[
+  {
+    "gate": "core-tests",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "bunny-ui-core"
+    ],
+    "exit_code": 0
+  },
+  {
+    "gate": "native-clippy",
+    "command": [
+      "cargo",
+      "clippy",
+      "--locked",
+      "-p",
+      "bunny-ui-core",
+      "--all-targets",
+      "--no-deps",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 101
+  },
+  {
+    "gate": "production-tests",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "bunny-ui-core",
+      "--all-features"
+    ],
+    "exit_code": 0
+  },
+  {
+    "gate": "production-clippy",
+    "command": [
+      "cargo",
+      "clippy",
+      "--locked",
+      "-p",
+      "bunny-ui-core",
+      "-p",
+      "bunny-ui-preview",
+      "--all-features",
+      "--all-targets",
+      "--no-deps",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0
+  },
+  {
+    "gate": "wasm-clippy",
+    "command": [
+      "cargo",
+      "+nightly-2026-07-15",
+      "clippy",
+      "--locked",
+      "-p",
+      "bunny-ui-core",
+      "-p",
+      "bunny-ui-preview",
+      "--all-features",
+      "--target",
+      "wasm32-unknown-unknown",
+      "--no-deps",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0
+  }
+]

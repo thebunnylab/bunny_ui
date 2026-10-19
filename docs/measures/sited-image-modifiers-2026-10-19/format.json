@@ -1,0 +1,5 @@
+{
+  "new_test_rustfmt": "passed",
+  "production_change": "New Sited arm uses rustfmt-compatible multiline fields; surrounding preexisting modifier file retains its existing formatting.",
+  "diff_check": "passed"
+}

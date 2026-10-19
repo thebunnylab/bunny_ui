@@ -1,0 +1,11 @@
+   Compiling bunny-ui-core v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.61s
+     Running tests/image_provenance.rs (target/studio-execution/debug/deps/image_provenance-6817a1aa3ef1def4)
+
+running 3 tests
+test recorded_resizable_icons_keep_their_frame_and_source ... ok
+test recording_preserves_pixel_rewrite_action_hint_and_overlay_boundaries ... ok
+test recorded_image_modifiers_keep_resize_fit_fill_and_source_sites ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

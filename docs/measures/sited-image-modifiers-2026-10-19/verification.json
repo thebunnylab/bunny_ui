@@ -1,0 +1,27 @@
+{
+  "task": "T2-STUDIO-182",
+  "base_revision": "1ada4d16520906887846d1d51b8c4020086dbb47",
+  "result": "framework_regressions_passed_native_integration_pending",
+  "tests": {
+    "core-tests": {
+      "passed": 1236,
+      "failed": 0,
+      "ignored": 57
+    },
+    "production-tests": {
+      "passed": 1427,
+      "failed": 0,
+      "ignored": 59
+    }
+  },
+  "implementation_files": {
+    "crates/bunny_ui/src/modifier.rs": "1c5b04d236f5500d3043384a53cecc79f08211505973fe234dfc6785405484a7",
+    "crates/bunny_ui/tests/image_provenance.rs": "e626e5b4b91bc74a84e20f18d17d4957e727d1698cd4697ca8b16f628a3ce564",
+    "docs/preview.md": "3d4c2a066621e843816e7424ef98dcd0f7ab22f493c4f70b45979cdbaff03f5d"
+  },
+  "qualifications": [
+    "Default-feature strict all-targets lint fails on the preexisting unused super import in glass.rs:658, whose only test is GPU-gated. No warning was suppressed or unrelated source changed. CI production all-features strict native and pinned-nightly wasm lanes pass.",
+    "Native failure came from signed Trinityad14ce338 with projectBunny57aa3de; the corrected native pin/helper integration is still pending.",
+    "Image draw geometry is compared separately because preexisting Styled folding moves the background across an equivalent clip when recording is disabled."
+  ]
+}

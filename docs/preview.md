@@ -12,6 +12,14 @@ version 1. Messages have a length prefix and kind byte: unknown message kinds ca
 be skipped in full, but unknown tags inside a known payload are malformed.
 This wire is independent of the browser DOM ABI.
 
+## Image modifiers with source recording
+
+Recorded source sites remain transparent to image and icon modifiers. A
+resizable image and its Fit/Fill mode use the same geometry as the standalone
+application, including when visual wrappers precede the modifier. Rewriting the
+pixel leaf retains its source-site metadata and does not traverse an overlay
+layer or bypass existing action/element-hint boundaries.
+
 ## Live placement
 
 `Hello.caps & caps::PLACE != 0` announces free form, grid and message kind 79,
