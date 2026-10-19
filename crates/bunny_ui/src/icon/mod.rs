@@ -240,6 +240,8 @@ pub(crate) fn to_svg_path(path: &[Verb]) -> String {
 /// (a 32×32 tile is four kilobytes); the ceiling is generous.
 const ICON_KEEP: usize = 256;
 
+type TraceCache = (HashMap<(u64, usize, usize), Trace>, u64);
+
 thread_local! {
     /// Rasters by `(tinted key, physical width, physical height)`. The
     /// tint lives INSIDE the key (see `ImageSource::symbol`), so a
@@ -302,7 +304,7 @@ thread_local! {
     /// arcs behind them hold one key each — a full clear used to throw
     /// the still layers out with the churn and re-tessellate them a
     /// moment later.
-    static TRACES: RefCell<(HashMap<(u64, usize, usize), Trace>, u64)> =
+    static TRACES: RefCell<TraceCache> =
         RefCell::new((HashMap::default(), 0));
 }
 
@@ -770,7 +772,7 @@ mod tests {
     /// crowns, and almost every pixel far tighter than either.
     #[test]
     fn a_circle_glyph_agrees_with_the_house_pill() {
-        const KAPPA: f32 = 0.552_284_75;
+        const KAPPA: f32 = 0.552_284_8;
         const K: f32 = 12.0 * KAPPA;
         const CIRCLE_PATH: &[Verb] = &[
             Verb::Move(24.0, 12.0),

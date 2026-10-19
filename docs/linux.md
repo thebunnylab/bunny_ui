@@ -6,7 +6,7 @@ The shell opens one of two doors — Wayland (`xdg-shell`, through
 and not a single dependency, and it shares its Vulkan tier with the
 Android shell through `bunny-ui-vulkan`. What is Linux's alone lives
 here: the two doors, the EGL/GL presenter, the text engine
-(fontconfig, FreeType, HarfBuzz), the image engine (the codecs of the
+(fontconfig, FreeType, FriBidi, HarfBuzz), the image engine (the codecs of the
 house), the session bus (notifications, sleep, the portal's theme and
 file pickers), the secret store (`libsecret`), and the webview (WPE
 WebKit, loaded at run time).
@@ -194,9 +194,17 @@ raised from a running app, the counts kept apart, the FIRST window
 closed with the app still standing, then the survivors closed and the
 road ending by itself.
 
+`hide`/`show` preserve the scene and keep the wake pipe alive with all windows
+hidden. X11 unmaps/maps the retained window. Wayland commits a null buffer,
+retires native child surfaces while retaining their logical slots, and forbids
+CPU/GPU attachment until a fresh show/configure/ack. Show restores the xdg
+metadata and size limits discarded by unmapping; child surfaces are rebuilt
+on the next presentation. See [retained visibility](life.md#retained-visibility-and-close-requests)
+for close policy, lifetime IDs and qualification boundaries.
+
 ## Fonts
 
-The text engine is fontconfig, FreeType and HarfBuzz. A family the
+The text engine uses fontconfig, FreeType, FriBidi and HarfBuzz. A family the
 app names is matched by fontconfig, weights on its own scale
 (regular 80 … black 210), with a charset fallback for the glyphs the
 matched face lacks. A face the app SHIPS registers with
@@ -207,6 +215,28 @@ registered face — the slant matched first, then the nearest weight —
 before fontconfig is asked. The container proves it with the
 machine's DejaVu Sans: registered, its bold file outranks the regular
 the machine would have answered.
+
+FriBidi resolves paragraph levels and orders directional runs before HarfBuzz
+shapes their original logical UTF-8. Each run carries an explicit direction;
+font fallback fragments inside an RTL run are also visited in visual order.
+Measurement and raster use that same shaping result. HarfBuzz performs glyph
+mirroring and mark shaping; FriBidi does not rewrite the input characters.
+
+Builds now require FriBidi 1.0 or later: `libfribidi-dev` on Debian/Ubuntu,
+`fribidi-devel` on Fedora, or `fribidi` on Arch. The runtime needs
+`libfribidi.so.0` (`libfribidi0` on Debian/Ubuntu). `bunny doctor`, the native
+container/CI and generated package dependencies include it. No Rust dependency
+or bundled Unicode/font data was added; the installed native libraries supply
+the Unicode data and fonts.
+
+This resolves each shaped line independently. Paragraph embedding context is
+not carried through separately wrapped lines; font fallback and script
+itemization retain their earlier limits. Editable geometry now uses the same
+HarfBuzz glyph clusters, advances and directional runs as rasterization. GDEF
+ligature caret metadata is translated by the shaped glyph origin when complete;
+otherwise internal cluster positions divide its advance by scalar. Pointer hits
+remain grapheme-safe. This does not establish visual horizontal navigation,
+physical IME behavior, human AT acceptance or full multilingual qualification.
 
 ## Images
 

@@ -26,9 +26,11 @@ it does not roll the binding back. Releasing after cancellation adds no write.
 
 A pointer release inside the control takes keyboard focus. An application can
 also call `runtime.focus_named("rate")` after layout, including in element mode,
-and use that name in its own Tab order. An exact text-field name retains
-priority; a name wrapping several focusable custom controls is ambiguous and
-returns `false`. Naming does not register an automatic Tab order.
+and use that name in its own navigation policy. Native Tab/Shift+Tab traversal
+includes enabled sliders in layout reading order; their unhandled Tab stroke
+moves to the next control. An exact text-field name retains priority; a name
+wrapping several focusable controls is ambiguous and returns `false`. See
+[keyboard controls](keyboard-controls.md) for traversal and scroll reveal.
 
 | Key | Effect |
 | --- | --- |
@@ -50,7 +52,12 @@ not divide the span. Painting reads the binding live and never repairs it:
 NaN displays at the minimum, other out-of-range values at the nearest endpoint,
 and the next adjustment writes a valid bounded value.
 
-Native AX/UIA/AT-SPI range semantics are not implemented for this control yet.
-Visible labeling and keyboard operation do not establish screen-reader support.
-Applications requiring that support need the native range accessibility work
-before treating this primitive as qualified.
+Add `.accessibility_label("Refresh rate")` to name the slider. Native shells
+expose AXSlider, UIA RangeValue and AT-SPI Value with finite minimum, maximum,
+current value and enabled state. Increment/decrement use the same keyboard
+steps; numeric sets must be finite and inside the inclusive domain, then snap
+like pointer input. Numeric adjustments preserve keyboard focus and their
+meaning in RTL. Disabled, removed and modal-excluded controls reject actions.
+Reading an invalid application value reports the bounded visual position and
+never repairs the binding. See [accessibility](accessibility.md) for the native
+protocol witnesses and the separate human screen-reader acceptance boundary.

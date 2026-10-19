@@ -12,9 +12,12 @@ use bunny_ui_apple::trace;
 pub mod dialog;
 pub mod drive;
 mod ffi;
+mod host_wheel;
 mod life;
 mod menu;
+mod objc_bool;
 mod metal;
+pub mod pictures;
 pub mod webview;
 
 use std::cell::{Cell, RefCell};
@@ -30,6 +33,7 @@ use bunny_ui::view::View;
 
 use ffi::AppEvent;
 pub use bunny_ui_apple::{CoreGraphicsImageEngine, CoreTextEngine};
+pub use bunny_ui_apple::webview::HtmlPreparation;
 pub use metal::OffscreenGpu;
 
 /// Points the shell's frame driver at the pace the runtime asks for:
@@ -446,9 +450,13 @@ impl WindowSpec {
     }
 }
 
-/// A window's handle in an [`App`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub struct WindowId(usize);
+use bunny_ui::window::{Lifecycle, Relationships};
+mod window_api;
+mod window_geometry;
+pub use bunny_ui::window::{
+    CloseAction, DesktopPosition, DesktopSpace, WindowError, WindowGeometry, WindowId,
+    WindowParent, WindowParentKind, WindowPlacement, WindowSize, WindowVisibility,
+};
 
 /// This shell holds MORE THAN ONE window — the detachable composer,
 /// the second workbench. The three shells answer this differently and
@@ -462,6 +470,8 @@ type FileDragFn = Box<dyn Fn(f64, f64, Vec<std::path::PathBuf>, ffi::FileDrag) -
 struct Slot {
     presentation_view: usize,
     presentation: RefCell<Option<bunny_ui::presentation::backend::PresentationSource>>,
+    lifecycle: Rc<Lifecycle>,
+    confirmation: bunny_ui::window::ConfirmationSlot,
     /// The `NSWindow` as an address — what an event's source is
     /// compared against.
     window: usize,
@@ -516,6 +526,7 @@ pub struct App {
 /// The half the platform gates hold: they outlive any borrow of the
 /// app, so what they capture is a handle and never a reference.
 struct AppInner {
+    relationships: Relationships,
     slots: RefCell<Vec<Rc<Slot>>>,
     routed: std::cell::Cell<bool>,
     scenes: std::cell::Cell<usize>,
@@ -546,6 +557,7 @@ impl App {
         bunny_ui::clipboard::install_image_reader(ffi::clipboard_read_image);
         App {
             inner: Rc::new(AppInner {
+                relationships: Relationships::default(),
                 slots: RefCell::new(Vec::new()),
                 routed: std::cell::Cell::new(false),
                 scenes: std::cell::Cell::new(0),
@@ -606,7 +618,9 @@ impl App {
     /// Raises a window on `runtime`, showing `root`.
     pub fn open(&self, spec: WindowSpec, runtime: Rc<Runtime>, root: impl View) -> WindowId {
         let slot = mount(&spec, runtime, root);
-        let id = WindowId(slot.window);
+        self.inner.relationships.register(slot.lifecycle.id());
+        ffi::register_geometry(slot.window, Rc::clone(slot.lifecycle.geometry_events()));
+        let id = slot.lifecycle.id();
         self.inner.slots.borrow_mut().push(slot.clone());
         self.inner.clone().route();
         // Its own first frame, through its OWN handler and not the global
@@ -631,8 +645,7 @@ impl App {
         feed: bunny_ui::image_engine::FeedKey,
         capacity: usize,
     ) -> Option<bunny_ui::presentation::FeedPresentation> {
-        let slots = self.inner.slots.borrow();
-        let slot = slots.iter().find(|slot| slot.window == id.0)?;
+        let slot = self.slot(id)?;
         let (observer, source) = bunny_ui::presentation::backend::channel(feed, capacity);
         metal::observe_feed(slot.presentation_view as ffi::Id, source.sender());
         *slot.presentation.borrow_mut() = Some(source);
@@ -641,17 +654,150 @@ impl App {
 
     /// Closes a window. The app stays up unless it was the last.
     pub fn close(&self, id: WindowId) {
+        self.close_children(id);
         // the delegate still runs (the window leaves the registry and
         // the frame beat moves house if it lived here), but its
         // notification does NOT re-enter the scene: this is usually
         // called from inside the handler of the very window that asked
-        ffi::lend_hand(|| ffi::close_top_level(id.0));
-        self.inner.buried(id.0);
+        if let Some(slot) = self.slot(id) {
+            slot.presentation.borrow_mut().take();
+            slot.confirmation.owner_closed();
+            slot.runtime.retire_dialog_geometry();
+            slot.lifecycle.geometry_events().retire();
+            ffi::forget_geometry(slot.window, id);
+            ffi::lend_hand(|| ffi::close_top_level(slot.window));
+            self.inner.relationships.retire(id);
+            self.inner
+                .slots
+                .borrow_mut()
+                .retain(|live| live.lifecycle.id() != id);
+        }
     }
 
     /// The windows the app has open, oldest first.
     pub fn windows(&self) -> Vec<WindowId> {
-        self.inner.slots.borrow().iter().map(|slot| WindowId(slot.window)).collect()
+        self.inner
+            .slots
+            .borrow()
+            .iter()
+            .map(|slot| slot.lifecycle.id())
+            .collect()
+    }
+
+    fn slot(&self, id: WindowId) -> Option<Rc<Slot>> {
+        self.inner
+            .slots
+            .borrow()
+            .iter()
+            .find(|slot| slot.lifecycle.id() == id)
+            .cloned()
+    }
+
+    /// Hides a live window and its descendants without destroying their scenes.
+    /// Explicit child hide requests survive a later parent show. A descendant
+    /// failure can leave earlier windows changed; retrying is safe.
+    ///
+    /// # Errors
+    /// Returns `StaleWindow` for a closed or foreign ID, or a native failure.
+    pub fn hide(&self, id: WindowId) -> Result<(), WindowError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        let previous = slot.lifecycle.set_hidden(true);
+        if let Err(error) = self.refresh_window_visibility(id) {
+            slot.lifecycle.set_hidden(previous);
+            return Err(error);
+        }
+        self.refresh_child_visibility(id)
+    }
+
+    /// Shows a retained window unless an owning ancestor is hidden.
+    /// Descendants preserve their own explicit hide requests. Native activation
+    /// remains subject to OS policy. A descendant failure can leave earlier
+    /// windows changed; retrying is safe.
+    ///
+    /// # Errors
+    /// Returns `StaleWindow` for a closed or foreign ID, or a native failure.
+    pub fn show(&self, id: WindowId) -> Result<(), WindowError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        let previous = slot.lifecycle.set_hidden(false);
+        if let Err(error) = self.refresh_window_visibility(id) {
+            slot.lifecycle.set_hidden(previous);
+            return Err(error);
+        }
+        self.refresh_child_visibility(id)
+    }
+
+    /// Reports native visibility; this does not mean unobscured or focused.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn visibility(&self, id: WindowId) -> Result<WindowVisibility, WindowError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        ffi::window_visibility(slot.window)
+    }
+
+    /// Replaces a window's user-close policy. Explicit [`App::close`] bypasses it.
+    /// Return Cancel while an asynchronous save decision is pending. A callback
+    /// may replace/remove itself or close/open windows; recursive requests for
+    /// the same window fail with [`WindowError::CloseInProgress`].
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn on_close_requested(
+        &self,
+        id: WindowId,
+        handler: impl FnMut(WindowId) -> CloseAction + 'static,
+    ) -> Result<(), WindowError> {
+        self.slot(id)
+            .ok_or(WindowError::StaleWindow)?
+            .lifecycle
+            .on_close(handler);
+        Ok(())
+    }
+
+    /// Restores default Close handling for subsequent user-close requests.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn clear_close_handler(&self, id: WindowId) -> Result<(), WindowError> {
+        self.slot(id)
+            .ok_or(WindowError::StaleWindow)?
+            .lifecycle
+            .clear();
+        Ok(())
+    }
+
+    fn close_decision(&self, id: WindowId) -> Result<CloseAction, WindowError> {
+        let action = self
+            .slot(id)
+            .ok_or(WindowError::StaleWindow)?
+            .lifecycle
+            .decide()?;
+        if action == CloseAction::Hide && self.slot(id).is_some() {
+            self.hide(id)?;
+        } else if action == CloseAction::Close {
+            self.close_children(id);
+        }
+        Ok(action)
+    }
+
+    /// Requests closure through the same policy as the native close button.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    /// Same-window callback recursion returns [`WindowError::CloseInProgress`].
+    pub fn request_close(&self, id: WindowId) -> Result<CloseAction, WindowError> {
+        let action = self.close_decision(id)?;
+        if action == CloseAction::Close {
+            self.close(id);
+        }
+        Ok(action)
+    }
+
+    /// Explicitly tears down every window, bypassing user-close policies.
+    pub fn quit(&self) {
+        for id in self.windows() {
+            self.close(id);
+        }
     }
 
     /// Puts the app's menus on the mac's menu bar, replacing the bar that
@@ -692,14 +838,44 @@ impl AppInner {
         if self.routed.replace(true) {
             return;
         }
+        let closing = App {
+            inner: Rc::clone(&self),
+        };
+        ffi::set_close_gate(Rc::new(move |window| {
+            let id = closing
+                .inner
+                .live()
+                .iter()
+                .find(|slot| slot.window == window)
+                .map(|slot| slot.lifecycle.id());
+            id.is_some_and(|id| {
+                closing.close_decision(id) == Ok(CloseAction::Close) && closing.slot(id).is_some()
+            })
+        }));
         let app = Rc::clone(&self);
         ffi::set_handler(Box::new(move |event| {
+            if let AppEvent::DialogGeometryChanged(observation) = event {
+                observation.deliver();
+                return;
+            }
+            if let AppEvent::GeometryChanged(observation) = event {
+                if let Some(slot) = app.live().into_iter().find(|slot| slot.lifecycle.id() == observation.id()) {
+                    slot.lifecycle.geometry_events().observe_captured(&observation);
+                }
+                return;
+            }
+            if let AppEvent::AppearanceChanged(appearance) = event {
+                bunny_ui::theme::observe_system_appearance(appearance);
+            }
             let source = ffi::event_source();
             let gone = matches!(event, AppEvent::WindowClosed);
             let spoke = matches!(event, AppEvent::Locale);
             for slot in app.live() {
                 // source 0 is a beat every window shares
                 if source == 0 || slot.window == source {
+                    if gone {
+                        slot.confirmation.owner_closed();
+                    }
                     let mut handler = slot.handler.borrow_mut();
                     handler(event.clone());
                 }
@@ -770,14 +946,19 @@ impl AppInner {
 
     /// Drops the slot of a window that has gone.
     fn buried(&self, window: usize) {
-        self.slots.borrow_mut().retain(|slot| {
-            if slot.window == window {
-                slot.presentation.borrow_mut().take();
-                false
-            } else {
-                true
-            }
-        });
+        if let Some(slot) = self
+            .slots
+            .borrow()
+            .iter()
+            .find(|slot| slot.window == window)
+        {
+            slot.presentation.borrow_mut().take();
+            slot.runtime.retire_dialog_geometry();
+            slot.lifecycle.geometry_events().retire();
+            ffi::forget_geometry(slot.window, slot.lifecycle.id());
+            self.relationships.retire(slot.lifecycle.id());
+        }
+        self.slots.borrow_mut().retain(|slot| slot.window != window);
     }
 
     /// The locale the windows read: the app's pin, else the system's
@@ -841,17 +1022,34 @@ fn why(need: bunny_ui::runtime::FrameNeed) -> String {
         (need.insets, "insets"),
         (need.webview, "webview"),
     ];
-    let named: Vec<&str> = reasons.iter().filter(|(on, _)| *on).map(|(_, name)| *name).collect();
-    if named.is_empty() { "-".to_string() } else { named.join("+") }
+    let named: Vec<&str> = reasons
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, name)| *name)
+        .collect();
+    if named.is_empty() {
+        "-".to_string()
+    } else {
+        named.join("+")
+    }
 }
 
 /// A layout size in AppKit's own struct — the one crossing `create_window`
 /// takes. Both types are foreign here, so it is a function, not a `From`.
 const fn cg_size(size: Size) -> ffi::CGSize {
-    ffi::CGSize { width: size.width, height: size.height }
+    ffi::CGSize {
+        width: size.width,
+        height: size.height,
+    }
 }
 
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
+    runtime.set_dialog_geometry_dispatch(ffi::queue_dialog_geometry);
+    let lifecycle = Rc::new(Lifecycle::default());
+    let confirmation = bunny_ui::window::ConfirmationSlot::new(
+        lifecycle.id(),
+        bunny_ui::window::ConfirmationKind::AppKitSheet,
+    );
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
     runtime.drop_unseen();
@@ -867,6 +1065,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let window = ffi::lend_hand(|| {
         ffi::create_window(title, cg_size(size), spec.min.map(cg_size), chrome.scene(), spec.manners)
     });
+    bunny_ui::theme::observe_system_appearance(ffi::os_appearance());
     let accessibility = Rc::new(ffi::Accessibility::new(window));
     // a task that lands on a worker thread asks the main run loop for
     // one more turn; the frame it takes drains the queue on its way
@@ -967,66 +1166,42 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             let placed =
                 runtime.last_viewport().map_or(height, |viewport| viewport.height);
             for host in &hosts {
-                let bunny_ui::host::HostSpec::Webview {
-                    url,
-                    document,
-                    scripts,
-                    console,
-                    requests,
-                    full_motion,
-                } = &host.spec
-                else {
+                let bunny_ui::host::HostSpec::Webview { document, .. } = &host.spec else {
                     // a video host is the web's: the box stays reserved
                     // and empty here, and the console says so once
                     bunny_ui::host::refuse_video_once();
                     continue;
                 };
                 // the stamp fingerprints the whole spec: a changed
-                // url, script set or declared hook re-instructs; the
-                // separators are control characters no url or script
-                // spells. `full_motion` rides for symmetry — this
-                // backend does not serve MediaEmulation (WKWebView
-                // offers no public override), but the stamp must not
-                // lie about what the spec says
-                let mut stamp = String::from(&**url);
-                // a document stamps by its fingerprint, never by its
-                // pages — the letter is the app's to hold, not the
-                // stamp's to copy every frame
-                if let Some(document) = document {
-                    stamp.push('\u{3}');
-                    stamp.push_str(&format!("{:016x}", document.digest));
-                }
-                stamp.push('\u{2}');
-                stamp.push(if *console { 'c' } else { '-' });
-                stamp.push(if *requests { 'r' } else { '-' });
-                stamp.push(if *full_motion { 'm' } else { '-' });
-                for script in scripts.iter() {
-                    stamp.push('\u{1}');
-                    stamp.push_str(script);
-                }
+                // url, script set or declared hook re-instructs
+                let stamp = webview::stamp(&host.spec);
                 window.host_place(
                     &host.path,
                     &stamp,
-                    (
-                        host.frame.origin.x,
-                        host.frame.origin.y,
-                        host.frame.size.width,
-                        host.frame.size.height,
-                    ),
-                    (
-                        host.visible.origin.x,
-                        host.visible.origin.y,
-                        host.visible.size.width,
-                        host.visible.size.height,
-                    ),
-                    placed,
-                    || webview::create(&host.path, &host.spec),
+                    ffi::HostGeometry {
+                        frame: (
+                            host.frame.origin.x,
+                            host.frame.origin.y,
+                            host.frame.size.width,
+                            host.frame.size.height,
+                        ),
+                        window: (
+                            host.visible.origin.x,
+                            host.visible.origin.y,
+                            host.visible.size.width,
+                            host.visible.size.height,
+                        ),
+                        view_height: placed,
+                    },
+                    |place| webview::create_placed(&host.path, &host.spec, place),
                     |child, _stamp| webview::update(&host.path, child, &host.spec),
                 );
+                ffi::host_scroll_policy(&host.path, document.as_ref().filter(|document| !document.editable).map_or(
+                    bunny_ui::host::DocumentScroll::Document, |document| document.scroll,
+                ));
             }
             let alive = hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>();
             window.host_sweep(&alive);
-            webview::sweep(&alive);
             traced.stage("H", format_args!("hosts={}", hosts.len()));
             let overlays = runtime.overlays();
             let display = match overlays.first() {
@@ -1119,32 +1294,14 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     })
                     .map(|(path, _)| path.clone())
                     .collect();
+                let mut focus_dialog = dead_dialogs.iter().any(|path| {
+                    dialog_store.get(path).is_some_and(ffi::WindowHandle::is_key)
+                });
                 for path in &dead_dialogs {
                     if let Some(dialog) = dialog_store.get(path) {
                         ffi::lend_hand(|| dialog.close_panel(&window));
                     }
                     dialog_surfaces.borrow_mut().remove(path);
-                }
-                if !dead_dialogs.is_empty() {
-                    // the keyboard goes to the window still standing on
-                    // top — an ask answered over Settings hands the keys
-                    // back to Settings, not to the workbench under both —
-                    // and only when none stands does the modal hold end.
-                    // The flag drops FIRST: the make-key asks the parent
-                    // `canBecomeKeyWindow`, and the answer has to already
-                    // be yes. Safe over a fullscreen parent too — its
-                    // space is the one on screen, so re-keying it
-                    // switches nothing.
-                    let standing = overlays.iter().rev().find_map(|overlay| {
-                        dialog_store.get(&overlay.path).filter(|dialog| dialog.is_visible())
-                    });
-                    ffi::lend_hand(|| match standing {
-                        Some(dialog) => dialog.make_key_with_view(),
-                        None => {
-                            ffi::end_window_modal(&window);
-                            window.make_key_with_view();
-                        }
-                    });
                 }
                 for overlay in &overlays {
                     // a dialog or an alert presents on a REAL window, not
@@ -1198,14 +1355,25 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                                 window.layout_rect_to_screen(x, y, w, h),
                             );
                             if opening {
-                                // the modal ceremony: the parent's
-                                // lights go dark, its key is refused,
-                                // and the keyboard moves into the
-                                // dialog
-                                ffi::begin_window_modal(&window);
-                                dialog.make_key_with_view();
+                                // Order in now; focus only after the complete
+                                // stack reflects layout's modal floor.
+                                dialog.order_front();
+                                focus_dialog = true;
                             }
                         });
+                        if dialog.bind_dialog_geometry(
+                            &window,
+                            runtime.dialog_geometry_session(&overlay.path),
+                        ) {
+                            let (x, y, width, height) = dialog.content_rect_in_layout(&window);
+                            runtime.set_dialog_frame(
+                                &overlay.path,
+                                bunny_ui::layout::Rect {
+                                    origin: bunny_ui::layout::Point { x, y },
+                                    size: Size { width, height },
+                                },
+                            );
+                        }
                         dialog.set_scene_origin(x, y);
                         if opening {
                             // the hover painted at open time froze over
@@ -1377,6 +1545,20 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         &[(0, 0, panel_physical.0 as i64, panel_physical.1 as i64)],
                     );
                 }
+                let ordered: Vec<_> = overlays
+                    .iter()
+                    .filter_map(|overlay| {
+                        dialog_store.get(&overlay.path).filter(|dialog| dialog.is_visible()).copied()
+                    })
+                    .collect();
+                ffi::lend_hand(|| {
+                    ffi::set_window_modals(&window, &ordered);
+                    // A background dismissal must not steal another scene's
+                    // keyboard. Opening a dialog is an explicit focus request.
+                    if focus_dialog {
+                        ordered.last().unwrap_or(&window).make_key_with_view();
+                    }
+                });
             }
             traced.stage("O", format_args!("panels={}", overlays.len()));
             if metal::active(window.view()) {
@@ -1587,11 +1769,15 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // The semantic presenter follows EVERY pixel path, including a retained
     // GPU frame whose early return correctly painted nothing new.
     let present = Rc::new({
+        let lifecycle = Rc::clone(&lifecycle);
         let paint = present;
         let accessibility = Rc::clone(&accessibility);
         let panels = Rc::clone(&panels);
         let dialogs = Rc::clone(&dialogs);
         move |runtime: &Runtime, display, via| {
+            if lifecycle.is_hidden() {
+                return;
+            }
             paint(runtime, display, via);
             let panels = panels.borrow();
             let dialogs = dialogs.borrow();
@@ -1637,6 +1823,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // idle hour names a leak. (frames drawn, the clock of the last line)
     let kept_line: Rc<Cell<(u32, f64)>> = Rc::new(Cell::new((0, f64::NEG_INFINITY)));
     let blit = {
+        let lifecycle = Rc::clone(&lifecycle);
         let present = Rc::clone(&present);
         let dialogs = Rc::clone(&dialogs);
         let panels = Rc::clone(&panels);
@@ -1646,6 +1833,11 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         let pacer = Rc::clone(&pacer);
         let resizing = Rc::clone(&resizing);
         move |runtime: &Runtime, root: &_, via: trace::Origin| {
+            // Hidden windows retain tasks/state, but must not re-show child surfaces.
+            if lifecycle.is_hidden() {
+                return;
+            }
+
             // a sleeper due by now wakes before the settle polls
             runtime.advance_tasks_to_now();
             // the handles' commands are spent BEFORE the frame
@@ -1812,6 +2004,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 );
             }
             present(runtime, display, via);
+            // Prepare only after the window has presented its frame.
+            webview::prepare_pending_html();
         point_cursor(runtime, !resizing());
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
             let rect = snapshot.caret_rect;
@@ -1985,6 +2179,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         blit(&runtime, root, trace::Origin::Web);
                     }
                 }
+                // the finish is the desk's beat (`pictures`): the app
+                // hears the commit, and the page's own events after it
+                webview::WebviewEvent::Loaded { .. } => {}
                 webview::WebviewEvent::Linked { path, url } => {
                     if runtime.webview_linked(&path, &url) {
                         blit(&runtime, root, trace::Origin::Web);
@@ -2064,6 +2261,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     });
     let frame_clock = Instant::now();
     let mut last_display_beat = None;
+    let handler_lifecycle = Rc::clone(&lifecycle);
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
@@ -2106,6 +2304,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 blit(runtime, root, trace::Origin::Input);
             }
         }
+        AppEvent::GeometryChanged(_) | AppEvent::DialogGeometryChanged(_) => return,
         AppEvent::Redraw => blit(runtime, root, trace::Origin::Redraw),
         // the Redraw that follows presents it
         AppEvent::WindowState { maximized } => {
@@ -2119,6 +2318,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
         }
         AppEvent::WindowClosed => {
+            runtime.retire_dialog_geometry();
             // Nothing to take down by hand: the popover panels and the
             // dialogs are CHILDREN of this window and AppKit closes
             // them with it, and the slot the app drops right after this
@@ -2211,6 +2411,11 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 }
             }
         }
+        AppEvent::AppearanceChanged(_) => {
+            if runtime.needs_frame() {
+                blit(runtime, root, trace::Origin::Redraw);
+            }
+        }
         AppEvent::Locale => {
             // the system's languages moved: the scene reads them again —
             // unless the app pinned its own, or the list came back the
@@ -2234,7 +2439,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // only ever fires on the parent) — and the decorations
             // freeze: they animate for eyes that are on them
             runtime.set_loops_paused(true);
-            if runtime.dismiss_all_overlays() {
+            if !handler_lifecycle.is_hidden() && runtime.dismiss_all_overlays() {
                 blit(runtime, root, trace::Origin::Input);
             } else {
                 sync_frame_driver(runtime, &handler_pacer, window_id);
@@ -2578,6 +2783,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     Rc::new(Slot {
         presentation: RefCell::new(None),
         presentation_view: window.view() as usize,
+        lifecycle,
+        confirmation,
         window: window.raw_window(),
         runtime,
         handler: RefCell::new(handler),

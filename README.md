@@ -87,6 +87,9 @@ and the web start from the library, not from a `main`: `app!` writes their
 entries too, the Android activity and the page's `start` export. `bunny run`
 reloads that library hot.
 
+Desktop scenes can ask owner-bound Yes/No questions with
+[asynchronous confirmations](docs/confirmations.md).
+
 ## Signals and subscriptions
 
 The API calls its signal `State<T>`. The subscription belongs to the place that
@@ -166,6 +169,8 @@ cargo run -p bunny-ui-core --example profile_mvvm
 
 The canvas-backed [slider](docs/slider.md) binds a scalar value to a validated
 range, with pointer capture, keyboard adjustment, disabled state and RTL input.
+[Line charts](docs/line-charts.md) plot validated live snapshots, with compact
+sparklines and optional pointer/keyboard sample inspection.
 
 ## Work that waits
 
@@ -228,6 +233,31 @@ Use it for content that has no views. A rounded corner, a hover state
 or a gradient belongs in the framework. Content that arrives with its
 own renderer — a web page, a camera's video — takes the native host
 instead (`docs/webview.md`, `docs/video.md`).
+
+## A world in a box
+
+Some content has three dimensions: a model, a room, a site. A world
+holds it — meshes, materials, lights and lines, placed in meters — and
+a box shows it through a camera.
+
+```rust
+let world = World::new();
+world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(orange));
+world.add_light(Light::sun().toward(vec3(-1.0, -2.0, -1.5)));
+
+scene_view(self.world, self.camera)
+    .orbit()                                   // the hand turns the camera
+    .on_tap(move |hit| self.picked.set(hit.map(|hit| hit.entity)))
+```
+
+The picture enters the scene as one image, so it clips, fades and
+composites like any other, and a box paints its own marks over it in
+the same frame. A change to the world or the camera repaints that box
+and runs no body; a world at rest asks for no frame. Picking runs on the
+CPU, the same on every platform. Metal draws worlds on the Mac and the
+phone, WebGL2 in a browser; every other platform shows the picture the
+CPU draws, until its own GPU pass comes. The `3d` feature carries the
+core; the `gltf` feature reads assets (`docs/world.md`).
 
 ## Gradients
 

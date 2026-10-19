@@ -399,15 +399,10 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
     runtime.drop_unseen();
     // the present backend, chosen ONCE: the GPU, or nothing
     ffi::install_gpu();
-    // the season's mirrors: reduce-motion always follows the system
-    // (accessibility is never the app's to refuse); the theme follows
-    // ONLY while the app has not chosen one — an installed theme means
-    // the scene owns its colors and the shell stays out
-    let mirror_theme = bunny_ui::theme::version() == 0;
     let (dark, compact) = ffi::traits();
-    if mirror_theme && dark == Some(true) {
-        bunny_ui::theme::install(bunny_ui::theme::Theme::dark());
-    }
+    bunny_ui::theme::observe_system_appearance(
+        dark.map(bunny_ui::theme::Appearance::from_dark),
+    );
     runtime.set_reduce_motion(ffi::reduce_motion());
     // the system's languages reach the scene before its first frame; a
     // locale the app pinned (`App::set_locale`) stands over them. There
@@ -494,13 +489,12 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                         host.visible.size.width,
                         host.visible.size.height,
                     ),
-                    || webview::create(&host.path, &host.spec),
+                    |place| webview::create_placed(&host.path, &host.spec, place),
                     |child, _stamp| webview::update(&host.path, child, &host.spec),
                 );
             }
             let alive: Vec<String> = hosts.iter().map(|host| host.path.clone()).collect();
             ffi::host_sweep(&alive);
-            webview::sweep(&alive);
             // the sandwich: what painted ABOVE a host leaves the
             // drawable's present and composites on a segment surface
             // over the island (the desktops' law, without the drag they
@@ -774,6 +768,9 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
             use webview::WebviewEvent;
             let woke = match event {
                 WebviewEvent::Navigated { path, url } => runtime.webview_navigated(&path, &url),
+                // the finish is the Mac desk's beat (`bunny_ui_macos::pictures`):
+                // the app hears the commit, and the page's own events after it
+                WebviewEvent::Loaded { .. } => false,
                 WebviewEvent::Linked { path, url } => runtime.webview_linked(&path, &url),
                 WebviewEvent::Changed { path, html } => runtime.webview_changed(&path, &html),
                 WebviewEvent::Pasted { path, html, text } => {
@@ -853,17 +850,9 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                 }
             }
             AppEvent::Traits { dark, compact } => {
-                if mirror_theme && let Some(wants_dark) = dark {
-                    let is_dark =
-                        bunny_ui::theme::current().canvas == bunny_ui::theme::Theme::dark().canvas;
-                    if wants_dark != is_dark {
-                        bunny_ui::theme::install(if wants_dark {
-                            bunny_ui::theme::Theme::dark()
-                        } else {
-                            bunny_ui::theme::Theme::light()
-                        });
-                    }
-                }
+                bunny_ui::theme::observe_system_appearance(
+                    dark.map(bunny_ui::theme::Appearance::from_dark),
+                );
                 runtime.set_size_class(size_class(compact));
                 blit(runtime, root);
             }

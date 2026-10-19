@@ -6,11 +6,19 @@
 //! pace itself by the thing it measures. So the worker keeps the time and
 //! hands each step to a task on the main thread, which raises it through the
 //! shell's own door (`bunny_ui_macos::drive`) — no CGEvent, no Accessibility.
+//!
+//! Windows takes the other road on purpose: its wheel and keyboard arrive
+//! from an external producer through the operating system's queue, and the
+//! app only answers observation boundaries on stdin (`native`). Nothing on
+//! the Windows side ever stands in for native input.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod diagnostic;
+#[cfg(target_os = "windows")]
+mod native;
+pub mod platform;
 mod schedule;
 pub use diagnostic::Checkpoint;
 pub mod scene;
@@ -25,7 +33,12 @@ pub const WINDOW: (f64, f64) = (1280.0, 800.0);
 /// The face shared by the text-bearing macOS scenes. Naming the face is
 /// part of the fixture: a platform's default would change glyph widths,
 /// wrapping and raster work between measurements. It must be installed.
+#[cfg(target_os = "macos")]
 pub const FONT_FAMILY: &str = "Menlo";
+/// The face shared by the text-bearing Windows scenes: installed with every
+/// Windows, so each framework measured beside it reads the same font file.
+#[cfg(target_os = "windows")]
+pub const FONT_FAMILY: &str = "Consolas";
 
 /// What the script asked for, from the command line.
 #[derive(Clone, Debug)]
@@ -71,20 +84,36 @@ pub fn fixtures() -> PathBuf {
 }
 
 /// The rows of `rows-10k.tsv`, the first `count` of them, six cells each.
+///
+/// A missing or malformed fixture ends the process: an empty table would be
+/// a fast scene that measured nothing, which is worse than no measurement.
 #[must_use]
 pub fn rows(count: usize) -> Vec<[String; 6]> {
-    let text = std::fs::read_to_string(fixtures().join("rows-10k.tsv")).unwrap_or_default();
-    text.lines()
-        .skip(1)
-        .take(count)
-        .map(|line| {
-            let mut cells = line.split('\t').map(str::to_owned);
-            std::array::from_fn(|_| cells.next().unwrap_or_default())
-        })
-        .collect()
+    let text = read_fixture("rows-10k.tsv");
+    parse_rows(&text, count).unwrap_or_else(|error| fixture_error("rows-10k.tsv", &error))
 }
 
-/// The editor's text: `lines-400.txt` or `lines-30k.txt`.
+fn parse_rows(text: &str, count: usize) -> Result<Vec<[String; 6]>, String> {
+    let rows = text
+        .lines()
+        .skip(1)
+        .take(count)
+        .enumerate()
+        .map(|(index, line)| {
+            let cells: Vec<String> = line.split('\t').map(str::to_owned).collect();
+            <[String; 6]>::try_from(cells)
+                .map_err(|cells| format!("row {index} has {} cells, not six", cells.len()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.len() == count {
+        Ok(rows)
+    } else {
+        Err(format!("{} rows where {count} were asked for", rows.len()))
+    }
+}
+
+/// The editor's text: `lines-400.txt` or `lines-30k.txt`. An unreadable or
+/// empty document is refused rather than edited.
 #[must_use]
 pub fn lines(count: usize) -> String {
     let file = if count > 400 {
@@ -92,7 +121,21 @@ pub fn lines(count: usize) -> String {
     } else {
         "lines-400.txt"
     };
-    std::fs::read_to_string(fixtures().join(file)).unwrap_or_default()
+    let text = read_fixture(file);
+    if text.is_empty() {
+        fixture_error(file, "the document is empty");
+    }
+    text
+}
+
+fn read_fixture(file: &str) -> String {
+    let path = fixtures().join(file);
+    std::fs::read_to_string(&path).unwrap_or_else(|error| fixture_error(file, &error.to_string()))
+}
+
+fn fixture_error(file: &str, reason: &str) -> ! {
+    eprintln!("FIXTURE_ERROR {file}: {reason}");
+    std::process::exit(2)
 }
 
 /// The wall clock in milliseconds since the epoch — the one clock the
@@ -188,6 +231,7 @@ pub fn play(args: &Args, over: (f64, f64), send: impl Fn(Step) -> bool) {
 }
 
 /// Raises a step through the shell's door, on the main thread.
+#[cfg(target_os = "macos")]
 pub fn raise(step: Step) {
     match step {
         Step::Wheel { x, y, dy } => bunny_ui_macos::drive::wheel(x, y, 0.0, dy),
@@ -197,9 +241,25 @@ pub fn raise(step: Step) {
     }
 }
 
+/// The script, mounted on a view. On Windows the external producer plays
+/// it: the first frame is announced, stdin's boundaries are answered with
+/// observations, and `DONE` ends the process (`native`). `over` belongs to
+/// the producer there, which aims its own wheel.
+#[cfg(target_os = "windows")]
+pub fn scripted<V: View<Arity = Single>>(
+    view: V,
+    args: Args,
+    over: (f64, f64),
+    on_step: impl Fn(Step) + 'static,
+) -> impl View {
+    let _ = over;
+    native::scripted(view, args, on_step)
+}
+
 /// The script, mounted on a view: the worker starts when the view first
 /// appears, the first frame is announced, and `Done` ends the process.
 /// `on_step` sees every step before it is raised — a stream appends there.
+#[cfg(target_os = "macos")]
 pub fn scripted<V: View<Arity = Single>>(
     view: V,
     args: Args,
@@ -228,4 +288,28 @@ pub fn scripted<V: View<Arity = Single>>(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_rows;
+
+    const HEADER: &str = "id\tname\tstatus\tregion\tamount\tdate\n";
+
+    #[test]
+    fn a_short_or_malformed_table_is_refused_rather_than_measured_empty() {
+        assert!(parse_rows("", 1).is_err());
+        assert!(parse_rows(HEADER, 1).is_err());
+        assert!(parse_rows(&format!("{HEADER}a\tb\tc\n"), 1).is_err());
+        assert!(parse_rows(&format!("{HEADER}a\tb\tc\td\te\tf\tg\n"), 1).is_err());
+    }
+
+    #[test]
+    fn a_whole_table_keeps_its_six_cells_in_order() {
+        let text = format!("{HEADER}a\tb\tc\td\te\tf\nu\tv\tw\tx\ty\tz\n");
+        let rows = parse_rows(&text, 2).expect("two whole rows");
+        assert_eq!(rows[0], ["a", "b", "c", "d", "e", "f"]);
+        assert_eq!(rows[1], ["u", "v", "w", "x", "y", "z"]);
+        assert_eq!(parse_rows(&text, 1).expect("the first row").len(), 1);
+    }
 }

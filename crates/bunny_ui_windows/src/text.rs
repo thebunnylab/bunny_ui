@@ -392,13 +392,34 @@ struct DwriteTextMetrics {
 // IDWriteTextLayout inherits IDWriteTextFormat's slots 3..=27; its own
 // setters/getters run 28..=57 (the typography getter mirrors its
 // setter — 39 own methods), 58 Draw, 59 GetLineMetrics, 60 GetMetrics;
-// the rest unused.
+// 61 GetOverhangMetrics, 62 GetClusterMetrics, 63 DetermineMinWidth,
+// 64 HitTestPoint, 65 HitTestTextPosition. Later methods are unused.
 #[repr(C)]
 struct IDWriteTextLayoutVtbl {
     unknown: crate::ffi::UnknownVtbl,
     _pad_3_59: [usize; 57],
     get_metrics:
         unsafe extern "system" fn(*mut IDWriteTextLayout, *mut DwriteTextMetrics) -> Hresult,
+    _pad_61_64: [usize; 4],
+    hit_test_text_position: unsafe extern "system" fn(
+        *mut IDWriteTextLayout,
+        u32,
+        i32,
+        *mut f32,
+        *mut f32,
+        *mut geometry::HitMetrics,
+    ) -> Hresult,
+    #[cfg(test)]
+    hit_test_text_range: unsafe extern "system" fn(
+        *mut IDWriteTextLayout,
+        u32,
+        u32,
+        f32,
+        f32,
+        *mut geometry::HitMetrics,
+        u32,
+        *mut u32,
+    ) -> Hresult,
 }
 #[repr(C)]
 struct IDWriteTextLayout {
@@ -1012,7 +1033,18 @@ impl Default for DirectWriteEngine {
     }
 }
 
+#[path = "text_geometry.rs"]
+mod geometry;
+
 impl TextEngine for DirectWriteEngine {
+    fn line_geometry(
+        &self,
+        text: &str,
+        font: &FontSpec,
+    ) -> Option<bunny_ui::text_geometry::LineGeometry> {
+        geometry::line_geometry(self, text, font)
+    }
+
     fn families(&self) -> Vec<std::sync::Arc<str>> {
         let Some(factories) = self.factories.as_ref() else {
             return Vec::new();
@@ -1365,3 +1397,6 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+#[path = "text_geometry_tests.rs"]
+mod geometry_tests;

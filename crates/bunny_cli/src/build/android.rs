@@ -174,6 +174,7 @@ pub fn build(project: &Project, options: &Options, out: &Path, log: &mut Log, in
             env: android::cargo_env(project, &toolchain, triple),
             rustc_args: android::page_args(),
             quiet: false,
+            diagnostics: cargo::Diagnostics::Render,
         })?;
         log.note(&format!("cargo built {} for {triple}", built.artifact.display()));
         android::check_entry(&toolchain, &built.artifact)?;

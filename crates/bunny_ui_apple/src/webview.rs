@@ -23,9 +23,10 @@
 //! reports to the app, and nothing else moves.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr::null_mut;
+use std::rc::{Rc, Weak};
 
 use bunny_ui::host::{
     Document, EDITOR_SCRIPT, EditorAction, EditorReport, HostSpec, WEBKIT_BOOT, WEBKIT_CONSOLE_HOOK,
@@ -46,6 +47,9 @@ unsafe extern "C" {}
 unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_id(obj: Id, sel: Sel) -> Id;
+    #[cfg_attr(target_arch = "aarch64", link_name = "objc_msgSend")]
+    #[cfg_attr(target_arch = "x86_64", link_name = "objc_msgSend_stret")]
+    fn msg_rect(obj: Id, sel: Sel) -> CGRect;
     #[link_name = "objc_msgSend"]
     fn msg_id_id(obj: Id, sel: Sel, a: Id) -> Id;
     #[link_name = "objc_msgSend"]
@@ -70,7 +74,6 @@ unsafe extern "C" {
     fn msg_init_config(obj: Id, sel: Sel, frame: CGRect, config: Id) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_init_script(obj: Id, sel: Sel, source: Id, time: i64, main_only: i8) -> Id;
-    #[cfg(not(target_os = "macos"))]
     #[link_name = "objc_msgSend"]
     fn msg_bool(obj: Id, sel: Sel) -> i8;
     fn objc_allocateClassPair(superclass: Id, name: *const c_char, extra: usize) -> Id;
@@ -86,6 +89,10 @@ unsafe extern "C" {
 pub enum WebviewEvent {
     /// The engine committed a navigation — link clicks included.
     Navigated { path: String, url: String },
+    /// The engine finished loading what it committed — the page's load
+    /// event fired, and the page stands as the engine shows it. A
+    /// picture taken now is the page, not its first paint.
+    Loaded { path: String, url: String },
     /// A link in a DOCUMENT was activated. The engine did not follow
     /// it: the document stays, and the app hears the url.
     Linked { path: String, url: String },
@@ -134,6 +141,41 @@ fn key_of(view: Id) -> Option<String> {
     })
 }
 
+/// Fixed native lifecycle labels: no page-derived data enters the tape.
+#[derive(Clone, Copy)]
+enum DocumentMilestone {
+    LoadRequest,
+    LoadReturn,
+    Committed,
+    Finished,
+    Posted,
+}
+impl DocumentMilestone {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::LoadRequest => "load-request",
+            Self::LoadReturn => "load-return",
+            Self::Committed => "commit",
+            Self::Finished => "finish",
+            Self::Posted => "post",
+        }
+    }
+}
+
+fn trace_document(path: &str, view: Id, milestone: DocumentMilestone) {
+    if !crate::trace::enabled() || !LETTERS.with(|letters| letters.borrow().contains_key(path)) {
+        return;
+    }
+    MOUNTS.with(|mounts| {
+        if let Some(mount) = mounts.borrow().get(&(view as usize)) {
+            crate::trace::mark(
+                "V",
+                format_args!("mount={mount} stage={}", milestone.name()),
+            );
+        }
+    });
+}
+
 /// A mounted document's standing.
 struct Letter {
     /// The fingerprint of what is loaded — `update` compares, so the
@@ -148,6 +190,144 @@ struct Letter {
     /// has no window at its creation (the host adds it after), so the
     /// commit is the first beat the keyboard can be taken at.
     focus: bool,
+    navigation: Id,
+    reusable: bool,
+}
+
+/// Prepares a two-engine reserve for local read-only documents.
+///
+/// Requesting preparation allocates no WebKit objects. The native host services
+/// the request after presenting a frame; WebKit then loads a sealed blank page
+/// asynchronously. Claimed engines remain in the capacity budget while owned
+/// by the host, avoiding fresh construction during reading. Dropping
+/// this resource releases only engines that have not been claimed.
+pub struct HtmlPreparation {
+    pool: Rc<EnginePool>,
+}
+
+type EnginePool = RefCell<EngineReserve>;
+#[derive(Default)]
+struct EngineReserve {
+    ready: Vec<SpareEngine>,
+    cleaning: Vec<CleaningEngine>,
+    reused: usize,
+    borrowed: HashSet<usize>,
+}
+struct CleaningEngine {
+    engine: SpareEngine,
+    navigation: Id,
+    origin: EngineOrigin,
+}
+#[derive(Clone, Copy)]
+enum EngineOrigin { Fresh, Retired }
+impl EngineReserve {
+    fn len(&self) -> usize { self.ready.len() + self.cleaning.len() }
+    fn occupied(&self) -> usize { self.len() + self.borrowed.len() }
+}
+const CHANNELS: [&str; 5] = ["bunny", "bunnyConsole", "bunnyNet", "bunnyEval", "bunnyEdit"];
+thread_local! {
+    static MOUNTS: RefCell<HashMap<usize, u64>> = RefCell::new(HashMap::new());
+    static NEXT_MOUNT: Cell<u64> = const { Cell::new(0) };
+}
+fn register_mount(view: Id) -> u64 {
+    let generation = NEXT_MOUNT.with(|next| { let value = next.get().wrapping_add(1); next.set(value); value });
+    MOUNTS.with(|mounts| mounts.borrow_mut().insert(view as usize, generation));
+    generation
+}
+fn current_channel(view: Id, name: &str) -> Option<&str> {
+    let (channel, generation) = name.rsplit_once('_')?;
+    let generation = generation.parse::<u64>().ok()?;
+    (CHANNELS.contains(&channel) && MOUNTS.with(|mounts| mounts.borrow().get(&(view as usize)).copied()) == Some(generation)).then_some(channel)
+}
+fn scoped_script(script: &str, generation: u64) -> String {
+    CHANNELS.iter().fold(script.to_owned(), |script, channel| script.replace(&format!("messageHandlers.{channel}.postMessage"), &format!("messageHandlers.{channel}_{generation}.postMessage")))
+}
+
+struct SpareEngine(Id);
+impl Drop for SpareEngine {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                msg_void(self.0, sel("stopLoading"));
+                msg_void(self.0, sel("release"));
+            }
+        }
+    }
+}
+
+thread_local! {
+    static HTML_PREPARATIONS: RefCell<Vec<Weak<EnginePool>>> = const { RefCell::new(Vec::new()) };
+}
+
+impl HtmlPreparation {
+    /// Request main-thread preparation after the next native presentation.
+    #[must_use]
+    pub fn request() -> Self {
+        let pool = Rc::new(RefCell::new(EngineReserve::default()));
+        HTML_PREPARATIONS.with(|pending| pending.borrow_mut().push(Rc::downgrade(&pool)));
+        Self { pool }
+    }
+
+    /// Number of unclaimed engines; primarily useful for native diagnostics.
+    #[must_use]
+    pub fn available(&self) -> usize {
+        self.pool.borrow().ready.len()
+    }
+    /// Number of retired engines scrubbed and returned; useful for native diagnostics.
+    #[must_use]
+    pub fn recycled(&self) -> usize { self.pool.borrow().reused }
+
+}
+
+fn preparation_allowed(document: &Document) -> bool {
+    document.policy == bunny_ui::host::NetworkPolicy::Deny
+        && document.base.is_empty()
+        && !document.editable
+}
+
+/// Services deferred preparation after the host has presented its frame.
+pub fn prepare_pending_html() {
+    let pools = HTML_PREPARATIONS.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        pending.retain(|pool| pool.strong_count() != 0);
+        pending.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
+    });
+    for pool in pools {
+        while pool.borrow().occupied() < 2 {
+            let view = unsafe { new_engine() };
+            reuse::begin_cleaning(&pool, SpareEngine(view), EngineOrigin::Fresh);
+        }
+    }
+}
+
+fn take_prepared(document: &Document) -> Option<Id> {
+    if !preparation_allowed(document) {
+        return None;
+    }
+    HTML_PREPARATIONS.with(|pending| {
+        pending
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find_map(|pool| {
+                let mut reserve = pool.borrow_mut();
+                let mut engine = reserve.ready.pop()?;
+                let view = std::mem::replace(&mut engine.0, null_mut());
+                reserve.borrowed.insert(view as usize);
+                Some(view)
+            })
+    })
+}
+
+/// Release a reservation only for the exact engine claimed from that pool.
+fn release_prepared(view: Id) -> Option<Rc<EnginePool>> {
+    HTML_PREPARATIONS.with(|pending| {
+        pending
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|pool| pool.borrow_mut().borrowed.remove(&(view as usize)))
+    })
 }
 
 /// `WKNavigationActionPolicy` — what the delegate answers with.
@@ -190,9 +370,12 @@ extern "C" fn bridge_message(_this: Id, _sel: Sel, _controller: Id, message: Id)
         }
         let body = to_string(body);
         let name = to_string(msg_id(message, sel("name")));
-        match name.as_str() {
+        let view = msg_id(message, sel("webView"));
+        let Some(channel) = current_channel(view, &name) else { return; };
+        match channel {
             "bunny" => {
                 if let Some(path) = key_of(msg_id(message, sel("webView"))) {
+                    trace_document(&path, view, DocumentMilestone::Posted);
                     dispatch(WebviewEvent::Posted { path, body });
                 }
             }
@@ -244,10 +427,14 @@ extern "C" fn bridge_message(_this: Id, _sel: Sel, _controller: Id, message: Id)
 /// `webView:didCommitNavigation:` — the url is real from here on. A
 /// document's commit also shuts the door its own load came through:
 /// from here on nothing the document asks for moves it.
-extern "C" fn bridge_committed(_this: Id, _sel: Sel, view: Id, _navigation: Id) {
+extern "C" fn bridge_committed(_this: Id, _sel: Sel, view: Id, navigation: Id) {
     let Some(path) = key_of(view) else {
         return;
     };
+    if !current_navigation(&path, navigation) {
+        return;
+    }
+    trace_document(&path, view, DocumentMilestone::Committed);
     let wants_keyboard = LETTERS.with(|letters| {
         let mut letters = letters.borrow_mut();
         let Some(letter) = letters.get_mut(&path) else {
@@ -266,6 +453,29 @@ extern "C" fn bridge_committed(_this: Id, _sel: Sel, view: Id, _navigation: Id) 
         }
         let url = to_string(msg_id(url, sel("absoluteString")));
         dispatch(WebviewEvent::Navigated { path, url });
+    }
+}
+
+/// `webView:didFinishNavigation:` — the load event fired: the page is
+/// what the engine shows, and a picture of it is the page. A view the
+/// shell no longer files (swept between the ask and the answer)
+/// reports nothing.
+extern "C" fn bridge_finished(_this: Id, _sel: Sel, view: Id, navigation: Id) {
+    let Some(path) = key_of(view) else {
+        finish_cleaning(view, navigation);
+        return;
+    };
+    if !current_navigation(&path, navigation) {
+        return;
+    }
+    trace_document(&path, view, DocumentMilestone::Finished);
+    unsafe {
+        let url = msg_id(view, sel("URL"));
+        if url.is_null() {
+            return;
+        }
+        let url = to_string(msg_id(url, sel("absoluteString")));
+        dispatch(WebviewEvent::Loaded { path, url });
     }
 }
 
@@ -302,6 +512,11 @@ extern "C" fn bridge_decide(_this: Id, _sel: Sel, view: Id, action: Id, handler:
 
 unsafe fn decide(view: Id, action: Id) -> i64 {
     let Some(path) = key_of(view) else {
+        if is_cleaning(view) {
+            let request = unsafe { msg_id(action, sel("request")) };
+            let url = unsafe { msg_id(request, sel("URL")) };
+            return if !url.is_null() && unsafe { to_string(msg_id(url, sel("absoluteString"))) } == "about:blank" { POLICY_ALLOW } else { POLICY_CANCEL };
+        }
         return POLICY_ALLOW;
     };
     let expected = LETTERS.with(|letters| {
@@ -377,13 +592,14 @@ unsafe fn report_link(view: Id, action: Id) {
 /// the engine says when a newer navigation took the tab, and that one
 /// answers for both. Reporting it would tell an app its live load
 /// died at the moment it actually started.
-extern "C" fn bridge_failed(_this: Id, _sel: Sel, view: Id, _navigation: Id, error: Id) {
+extern "C" fn bridge_failed(_this: Id, _sel: Sel, view: Id, navigation: Id, error: Id) {
     unsafe {
         if cancelled(error) {
             return;
         }
         let url = failing_url(view, error);
         if let Some(path) = key_of(view) {
+            if !current_navigation(&path, navigation) { return; }
             dispatch(WebviewEvent::NavigationFailed { path, url, why: error_name(error) });
         }
     }
@@ -452,6 +668,12 @@ fn bridge() -> Id {
                 bridge_committed as *const c_void,
                 message_types.as_ptr(),
             );
+            class_addMethod(
+                bridge,
+                sel("webView:didFinishNavigation:"),
+                bridge_finished as *const c_void,
+                message_types.as_ptr(),
+            );
             let failure_types = CString::new("v@:@@@").expect("type encoding");
             for leg in [
                 "webView:didFailProvisionalNavigation:withError:",
@@ -501,37 +723,38 @@ fn bridge() -> Id {
 /// the scene. `path` is the host's identity, what a document is filed
 /// under for the delegate to find.
 pub fn create(path: &str, spec: &HostSpec) -> Id {
+    create_placed(path, spec, |_| {})
+}
+
+/// Creates an instrumented engine and gives the host its initial placement
+/// before submitting content. `place` synchronously attaches and sizes the
+/// tenant; it runs once, after mount registration and before navigation. The
+/// returned reference has ONE retain, just like [`create`]. No blank document
+/// or deferred task is inserted into this transition.
+pub fn create_placed(path: &str, spec: &HostSpec, place: impl FnOnce(Id)) -> Id {
     // never reached for a video host — the shells refuse one before
     // they mount anything — and a null is the honest nothing if it were
-    let HostSpec::Webview { url, document, .. } = spec else { return std::ptr::null_mut() };
+    let HostSpec::Webview { url, document, .. } = spec else {
+        return std::ptr::null_mut();
+    };
     unsafe {
-        let config =
-            msg_id(msg_id(class("WKWebViewConfiguration"), sel("alloc")), sel("init"));
-        install_bridge(msg_id(config, sel("userContentController")), spec);
-        let view = msg_id(class("WKWebView"), sel("alloc"));
-        let view = msg_init_config(
-            view,
-            sel("initWithFrame:configuration:"),
-            CGRect {
-                origin: CGPoint { x: 0.0, y: 0.0 },
-                size: CGSize { width: 0.0, height: 0.0 },
-            },
-            config,
+        let view = document
+            .as_ref()
+            .and_then(take_prepared)
+            .unwrap_or_else(|| new_engine());
+        let config = msg_id(view, sel("configuration"));
+        install_bridge(
+            msg_id(config, sel("userContentController")),
+            spec,
+            register_mount(view),
         );
-        // the view copied what it needed from the configuration
-        msg_void(config, sel("release"));
         // navigation reports come through the bridge (the delegate
         // reference is weak; the bridge outlives every view), and so
         // does the ask a new-window link makes
         msg_void_id(view, sel("setNavigationDelegate:"), bridge());
         msg_void_id(view, sel("setUIDelegate:"), bridge());
-        // the engine's own inspector, where the OS offers the switch
-        // (13.3+) — a webview here is a dev's window into a page, and
-        // a devtool that cannot open is a quiet page with no name
-        if msg_bool_sel(view, sel("respondsToSelector:"), sel("setInspectable:")) != 0 {
-            msg_void_bool(view, sel("setInspectable:"), 1);
-        }
         PAGES.with(|pages| pages.borrow_mut().insert(path.to_string(), view));
+        place(view);
         match document {
             Some(document) => load_document(path, view, document),
             None => navigate(view, url),
@@ -540,28 +763,105 @@ pub fn create(path: &str, spec: &HostSpec) -> Id {
     }
 }
 
+unsafe fn new_engine() -> Id {
+    unsafe {
+        let config = msg_id(
+            msg_id(class("WKWebViewConfiguration"), sel("alloc")),
+            sel("init"),
+        );
+        let view = msg_init_config(
+            msg_id(class("WKWebView"), sel("alloc")),
+            sel("initWithFrame:configuration:"),
+            CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize {
+                    width: 0.0,
+                    height: 0.0,
+                },
+            },
+            config,
+        );
+        msg_void(config, sel("release"));
+        // the engine's own inspector, where the OS offers the switch
+        // (13.3+) — a webview here is a dev's window into a page, and
+        // a devtool that cannot open is a quiet page with no name
+        if msg_bool_sel(view, sel("respondsToSelector:"), sel("setInspectable:")) != 0 {
+            msg_void_bool(view, sel("setInspectable:"), 1);
+        }
+        view
+    }
+}
+
+fn current_navigation(path: &str, navigation: Id) -> bool {
+    LETTERS.with(|letters| {
+        letters
+            .borrow()
+            .get(path)
+            .is_none_or(|letter| std::ptr::eq(letter.navigation, navigation))
+    })
+}
+
 /// Loads a document from MEMORY — `loadHTMLString:baseURL:`, the
 /// sealed html the spec holds, the base the engine resolves relative
 /// references by (nil for none). Filed first, loaded second: the
 /// delegate is asked about this load, and must find the letter
 /// expecting it.
 fn load_document(path: &str, view: Id, document: &Document) {
+    if !preparation_allowed(document) {
+        release_prepared(view);
+    }
     LETTERS.with(|letters| {
         letters.borrow_mut().insert(
             path.to_string(),
-            Letter { digest: document.digest, expected: true, focus: document.focus },
+            Letter {
+                digest: document.digest,
+                expected: true,
+                focus: document.focus,
+                navigation: null_mut(),
+                reusable: preparation_allowed(document),
+            },
         );
     });
+    if crate::trace::enabled() {
+        MOUNTS.with(|mounts| {
+            if let Some(mount) = mounts.borrow().get(&(view as usize)) {
+                // Fixed native geometry only: no page identity or content.
+                let frame = unsafe { msg_rect(view, sel("frame")) };
+                let attached = unsafe { !msg_id(view, sel("window")).is_null() };
+                crate::trace::mark(
+                    "U",
+                    format_args!(
+                        "mount={mount} attached={} width={:.3} height={:.3}",
+                        u8::from(attached),
+                        frame.size.width,
+                        frame.size.height,
+                    ),
+                );
+            }
+        });
+    }
+    trace_document(path, view, DocumentMilestone::LoadRequest);
     unsafe {
-        let base = if document.base.is_empty() { null_mut() } else { ns_url(&document.base) };
-        let _ = msg_id_id_id(
+        let base = if document.base.is_empty() {
+            null_mut()
+        } else {
+            ns_url(&document.base)
+        };
+        let navigation = msg_id_id_id(
             view,
             sel("loadHTMLString:baseURL:"),
             ns(&document.sealed()),
             base,
         );
+        LETTERS.with(|letters| {
+            if let Some(letter) = letters.borrow_mut().get_mut(path) {
+                letter.navigation = navigation;
+            }
+        });
     }
+    trace_document(path, view, DocumentMilestone::LoadReturn);
 }
+
 
 /// The view becomes the window's first responder — the keyboard is
 /// the page's. A view with no window yet takes nothing.
@@ -615,25 +915,31 @@ unsafe fn run_script(view: Id, js: &str) {
 /// called beside the host sweep, with the paths still standing.
 pub fn sweep(alive: &[String]) {
     LETTERS.with(|letters| letters.borrow_mut().retain(|path, _| alive.contains(path)));
-    PAGES.with(|pages| pages.borrow_mut().retain(|path, _| alive.contains(path)));
+    PAGES.with(|pages| pages.borrow_mut().retain(|path, view| {
+        if alive.contains(path) { true } else {
+            MOUNTS.with(|mounts| mounts.borrow_mut().remove(&(*view as usize)));
+            release_prepared(*view);
+            false
+        }
+    }));
 }
 
 /// Hands the controller the bridge and the document-start scripts.
 /// Every channel registers up front (a registered name that never
 /// speaks costs nothing, and re-adding one throws); the scripts are
 /// [`apply_scripts`]'s.
-unsafe fn install_bridge(controller: Id, spec: &bunny_ui::host::HostSpec) {
+unsafe fn install_bridge(controller: Id, spec: &bunny_ui::host::HostSpec, generation: u64) {
     unsafe {
         let bridge = bridge();
-        for channel in ["bunny", "bunnyConsole", "bunnyNet", "bunnyEval", "bunnyEdit"] {
+        for channel in CHANNELS {
             msg_void_id_id(
                 controller,
                 sel("addScriptMessageHandler:name:"),
                 bridge,
-                ns(channel),
+                ns(&format!("{channel}_{generation}")),
             );
         }
-        apply_scripts(controller, spec);
+        apply_scripts(controller, spec, generation);
     }
 }
 
@@ -642,24 +948,24 @@ unsafe fn install_bridge(controller: Id, spec: &bunny_ui::host::HostSpec) {
 /// nobody watches pays for no capture — then the editor for an
 /// editable document (its transport first, the framework's script
 /// after), then the app's own scripts, in declaration order.
-unsafe fn apply_scripts(controller: Id, spec: &HostSpec) {
+unsafe fn apply_scripts(controller: Id, spec: &HostSpec, generation: u64) {
     let HostSpec::Webview { scripts, console, requests, document, .. } = spec else { return };
     unsafe {
-        add_script(controller, WEBKIT_BOOT);
+        add_script(controller, &scoped_script(WEBKIT_BOOT, generation));
         if *console {
-            add_script(controller, WEBKIT_CONSOLE_HOOK);
+            add_script(controller, &scoped_script(WEBKIT_CONSOLE_HOOK, generation));
         }
         if *requests {
-            add_script(controller, WEBKIT_NET_WRAP);
+            add_script(controller, &scoped_script(WEBKIT_NET_WRAP, generation));
         }
         if let Some(document) = document
             && document.editable
         {
-            add_script(controller, &webkit_editor_prelude(document));
-            add_script(controller, EDITOR_SCRIPT);
+            add_script(controller, &scoped_script(&webkit_editor_prelude(document), generation));
+            add_script(controller, &scoped_script(EDITOR_SCRIPT, generation));
         }
         for script in scripts.iter() {
-            add_script(controller, script);
+            add_script(controller, &scoped_script(script, generation));
         }
     }
 }
@@ -701,7 +1007,8 @@ pub fn update(path: &str, view: Id, spec: &HostSpec) {
         let config = msg_id(view, sel("configuration"));
         let controller = msg_id(config, sel("userContentController"));
         msg_void(controller, sel("removeAllUserScripts"));
-        apply_scripts(controller, spec);
+        let Some(generation) = MOUNTS.with(|mounts| mounts.borrow().get(&(view as usize)).copied()) else { return; };
+        apply_scripts(controller, spec, generation);
         match document {
             Some(document) => {
                 let loaded = LETTERS
@@ -711,6 +1018,7 @@ pub fn update(path: &str, view: Id, spec: &HostSpec) {
                 }
             }
             None => {
+                release_prepared(view);
                 LETTERS.with(|letters| letters.borrow_mut().remove(path));
                 if current_url(view).as_deref() != Some(&**url) {
                     navigate(view, url);
@@ -718,6 +1026,35 @@ pub fn update(path: &str, view: Id, spec: &HostSpec) {
             }
         }
     }
+}
+
+/// The spec's fingerprint — what a shell compares to know whether a
+/// mounted page must be re-instructed: a changed url, script set or
+/// declared hook re-instructs, the same spec never does. A document
+/// stamps by its digest, never by its pages (the letter is the app's
+/// to hold, not the stamp's to copy every frame); the separators are
+/// control characters no url or script spells. `full_motion` rides for
+/// symmetry — this backend does not serve MediaEmulation (WKWebView
+/// offers no public override), but the stamp must not lie about what
+/// the spec says. A video spec stamps empty: nothing mounts for it.
+pub fn stamp(spec: &HostSpec) -> String {
+    let HostSpec::Webview { url, document, scripts, console, requests, full_motion } = spec else {
+        return String::new();
+    };
+    let mut stamp = String::from(&**url);
+    if let Some(document) = document {
+        stamp.push('\u{3}');
+        stamp.push_str(&format!("{:016x}", document.digest));
+    }
+    stamp.push('\u{2}');
+    stamp.push(if *console { 'c' } else { '-' });
+    stamp.push(if *requests { 'r' } else { '-' });
+    stamp.push(if *full_motion { 'm' } else { '-' });
+    for script in scripts.iter() {
+        stamp.push('\u{1}');
+        stamp.push_str(script);
+    }
+    stamp
 }
 
 /// Where the engine is right now — the committed url, the same string
@@ -807,7 +1144,8 @@ pub fn forward(view: Id) {
 /// so no block ever crosses this border. `raw` hands the value back as
 /// the string it is (a null answers empty); otherwise it rides as JSON.
 pub fn eval(view: Id, token: u64, js: &str, raw: bool) {
-    let wrapped = webkit_eval_wrap(token, js, raw);
+    let Some(generation) = MOUNTS.with(|mounts| mounts.borrow().get(&(view as usize)).copied()) else { return; };
+    let wrapped = scoped_script(&webkit_eval_wrap(token, js, raw), generation);
     unsafe { run_script(view, &wrapped) }
 }
 
@@ -1027,3 +1365,12 @@ unsafe fn to_string(ns: Id) -> String {
         CStr::from_ptr(utf8).to_string_lossy().into_owned()
     }
 }
+
+#[cfg(test)]
+#[path = "webview_preparation_tests.rs"]
+mod preparation_tests;
+
+#[path = "webview_reuse.rs"]
+mod reuse;
+use reuse::{finish_cleaning, is_cleaning};
+pub use reuse::retire;

@@ -28,6 +28,8 @@ pub(super) const FRAGMENT: Guid = guid(0xf7063da8_8359_439c_9297_bbc5299a7d87);
 pub(super) const ROOT: Guid = guid(0x620ce2a5_ab8f_40a9_86cb_de3c75599b58);
 pub(super) const INVOKE: Guid = guid(0x54fcb24b_e18e_47a2_b4d3_eccbe77599a2);
 pub(super) const VALUE: Guid = guid(0xc7935180_6fb3_4201_b174_7df73adbf64a);
+pub(super) const RANGE: Guid = guid(0x36dc7aef_33e6_4691_afe1_2be7274b3d33);
+pub(super) const TOGGLE: Guid = guid(0x56d00bd0_c4f4_433c_a836_1a52a57e0892);
 
 pub(super) const BOUNDS: i32 = 30001;
 pub(super) const CONTROL_TYPE: i32 = 30003;
@@ -44,7 +46,17 @@ pub(super) const FRAMEWORK: i32 = 30024;
 pub(super) const VALUE_VALUE: i32 = 30045;
 pub(super) const VALUE_READ_ONLY: i32 = 30046;
 pub(super) const INVOKE_PATTERN: i32 = 10000;
+pub(super) const RANGE_VALUE: i32 = 30047;
+pub(super) const RANGE_READ_ONLY: i32 = 30048;
+pub(super) const RANGE_MINIMUM: i32 = 30049;
+pub(super) const RANGE_MAXIMUM: i32 = 30050;
+pub(super) const RANGE_LARGE_CHANGE: i32 = 30051;
+pub(super) const RANGE_SMALL_CHANGE: i32 = 30052;
+pub(super) const RANGE_PATTERN: i32 = 10003;
 pub(super) const VALUE_PATTERN: i32 = 10002;
+pub(super) const TOGGLE_PATTERN: i32 = 10015;
+pub(super) const TOGGLE_STATE: i32 = 30086;
+pub(super) const NOT_ENABLED: Hresult = 0x80040200u32 as i32;
 pub(super) const FOCUS_EVENT: i32 = 20005;
 
 #[repr(C)]
@@ -86,6 +98,13 @@ impl Variant {
         Self {
             kind: 3,
             data: ValueData { integer: value },
+            ..Self::empty()
+        }
+    }
+    pub fn real(value: f64) -> Self {
+        Self {
+            kind: 5,
+            data: ValueData { real: value },
             ..Self::empty()
         }
     }
@@ -170,11 +189,29 @@ pub(super) struct InvokeVtbl {
     pub invoke: unsafe extern "system" fn(Object) -> Hresult,
 }
 #[repr(C)]
+pub(super) struct ToggleVtbl {
+    pub unknown: UnknownVtbl,
+    pub toggle: unsafe extern "system" fn(Object) -> Hresult,
+    pub state: unsafe extern "system" fn(Object, *mut i32) -> Hresult,
+}
+#[repr(C)]
 pub(super) struct ValueVtbl {
     pub unknown: UnknownVtbl,
     pub set: unsafe extern "system" fn(Object, *const u16) -> Hresult,
     pub get: unsafe extern "system" fn(Object, *mut *mut u16) -> Hresult,
     pub read_only: unsafe extern "system" fn(Object, *mut i32) -> Hresult,
+}
+
+#[repr(C)]
+pub(super) struct RangeVtbl {
+    pub unknown: UnknownVtbl,
+    pub set: unsafe extern "system" fn(Object, f64) -> Hresult,
+    pub get: unsafe extern "system" fn(Object, *mut f64) -> Hresult,
+    pub read_only: unsafe extern "system" fn(Object, *mut i32) -> Hresult,
+    pub maximum: unsafe extern "system" fn(Object, *mut f64) -> Hresult,
+    pub minimum: unsafe extern "system" fn(Object, *mut f64) -> Hresult,
+    pub large_change: unsafe extern "system" fn(Object, *mut f64) -> Hresult,
+    pub small_change: unsafe extern "system" fn(Object, *mut f64) -> Hresult,
 }
 
 #[link(name = "uiautomationcore", kind = "raw-dylib")]

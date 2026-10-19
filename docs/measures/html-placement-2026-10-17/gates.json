@@ -1,0 +1,327 @@
+[
+  {
+    "name": "baseline-clippy-bunny-ui-apple",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "b7ca9592d384754526013c2ce45d67b716f8c60b",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement-baseline",
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "bunny-ui-apple",
+      "--all-targets",
+      "--locked",
+      "--no-deps",
+      "--keep-going",
+      "--jobs",
+      "1",
+      "--message-format=json",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "started": "2026-10-17T21:17:51.749135+00:00",
+    "ended": "2026-10-17T21:17:55.440214+00:00",
+    "exit_code": 101
+  },
+  {
+    "name": "baseline-clippy-bunny-ui-macos",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "b7ca9592d384754526013c2ce45d67b716f8c60b",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement-baseline",
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "bunny-ui-macos",
+      "--all-targets",
+      "--locked",
+      "--no-deps",
+      "--keep-going",
+      "--jobs",
+      "1",
+      "--message-format=json",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "started": "2026-10-17T21:17:55.440541+00:00",
+    "ended": "2026-10-17T21:18:05.128381+00:00",
+    "exit_code": 101
+  },
+  {
+    "name": "build-final",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement",
+    "command": [
+      "cargo",
+      "build",
+      "-p",
+      "bunny-ui-macos",
+      "--example",
+      "html_reuse",
+      "--locked",
+      "--jobs",
+      "1"
+    ],
+    "started": "2026-10-17T21:18:05.130019+00:00",
+    "ended": "2026-10-17T21:18:08.047106+00:00",
+    "exit_code": 0
+  },
+  {
+    "name": "reuse-final",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement",
+    "command": [
+      "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement/target/debug/examples/html_reuse"
+    ],
+    "started": "2026-10-17T21:18:08.056951+00:00",
+    "ended": "2026-10-17T21:18:08.734239+00:00",
+    "exit_code": 0
+  },
+  {
+    "name": "placement-final",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement",
+    "command": [
+      "python3",
+      "scripts/check-html-placement.py",
+      "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement/target/verification/html-placement-20261017/final.trace"
+    ],
+    "started": "2026-10-17T21:18:08.734556+00:00",
+    "ended": "2026-10-17T21:18:08.774678+00:00",
+    "exit_code": 0
+  },
+  {
+    "name": "lifecycle-final",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement",
+    "command": [
+      "python3",
+      "scripts/check-html-lifecycle.py",
+      "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement/target/verification/html-placement-20261017/final.trace"
+    ],
+    "started": "2026-10-17T21:18:08.775110+00:00",
+    "ended": "2026-10-17T21:18:08.805835+00:00",
+    "exit_code": 0
+  },
+  {
+    "name": "placement-checker-tests",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement",
+    "command": [
+      "python3",
+      "scripts/test_html_placement.py"
+    ],
+    "started": "2026-10-17T21:18:08.806112+00:00",
+    "ended": "2026-10-17T21:18:08.854470+00:00",
+    "exit_code": 0
+  },
+  {
+    "name": "lifecycle-checker-tests",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement",
+    "command": [
+      "python3",
+      "scripts/test_html_lifecycle.py"
+    ],
+    "started": "2026-10-17T21:18:08.854794+00:00",
+    "ended": "2026-10-17T21:18:08.897167+00:00",
+    "exit_code": 0
+  },
+  {
+    "name": "tests-bunny-ui-apple",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "bunny-ui-apple",
+      "--lib",
+      "--locked",
+      "--jobs",
+      "1",
+      "--",
+      "--test-threads=2"
+    ],
+    "started": "2026-10-17T21:18:08.897480+00:00",
+    "ended": "2026-10-17T21:18:21.133327+00:00",
+    "exit_code": 0
+  },
+  {
+    "name": "tests-bunny-ui-macos",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "bunny-ui-macos",
+      "--lib",
+      "--locked",
+      "--jobs",
+      "1",
+      "--",
+      "--test-threads=2"
+    ],
+    "started": "2026-10-17T21:18:21.133810+00:00",
+    "ended": "2026-10-17T21:18:22.293203+00:00",
+    "exit_code": 0
+  },
+  {
+    "name": "tests-trace",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "bunny-ui-macos",
+      "--example",
+      "trace_report",
+      "--locked",
+      "--jobs",
+      "1",
+      "--",
+      "--test-threads=2"
+    ],
+    "started": "2026-10-17T21:18:22.293541+00:00",
+    "ended": "2026-10-17T21:18:22.980214+00:00",
+    "exit_code": 0
+  },
+  {
+    "name": "native-host-scroll",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "bunny-ui-macos",
+      "--test",
+      "host_scroll_native",
+      "--locked",
+      "--jobs",
+      "1"
+    ],
+    "started": "2026-10-17T21:18:22.980522+00:00",
+    "ended": "2026-10-17T21:18:27.491891+00:00",
+    "exit_code": 0
+  },
+  {
+    "name": "native-window-lifecycle",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "bunny-ui-macos",
+      "--test",
+      "window_lifecycle",
+      "--locked",
+      "--jobs",
+      "1"
+    ],
+    "started": "2026-10-17T21:18:27.492398+00:00",
+    "ended": "2026-10-17T21:18:30.511183+00:00",
+    "exit_code": 0
+  },
+  {
+    "name": "check-ios",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement",
+    "command": [
+      "cargo",
+      "check",
+      "-p",
+      "bunny-ui-ios",
+      "--target",
+      "aarch64-apple-ios-sim",
+      "--locked",
+      "--jobs",
+      "1"
+    ],
+    "started": "2026-10-17T21:18:30.511687+00:00",
+    "ended": "2026-10-17T21:18:32.433737+00:00",
+    "exit_code": 0
+  },
+  {
+    "name": "candidate-clippy-bunny-ui-apple",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement",
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "bunny-ui-apple",
+      "--all-targets",
+      "--locked",
+      "--no-deps",
+      "--keep-going",
+      "--jobs",
+      "1",
+      "--message-format=json",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "started": "2026-10-17T21:18:32.434082+00:00",
+    "ended": "2026-10-17T21:18:34.719971+00:00",
+    "exit_code": 101
+  },
+  {
+    "name": "candidate-clippy-bunny-ui-macos",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement",
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "bunny-ui-macos",
+      "--all-targets",
+      "--locked",
+      "--no-deps",
+      "--keep-going",
+      "--jobs",
+      "1",
+      "--message-format=json",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "started": "2026-10-17T21:18:34.720307+00:00",
+    "ended": "2026-10-17T21:18:38.083695+00:00",
+    "exit_code": 101
+  },
+  {
+    "name": "whitespace",
+    "source": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "revision": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "cwd": "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement",
+    "command": [
+      "git",
+      "diff",
+      "b7ca959..HEAD",
+      "--check"
+    ],
+    "started": "2026-10-17T21:18:38.084031+00:00",
+    "ended": "2026-10-17T21:18:38.109214+00:00",
+    "exit_code": 0
+  }
+]

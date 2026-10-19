@@ -26,8 +26,46 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::time::Instant;
 
+#[path = "accessibility_bus.rs"]
+mod bus;
+#[path = "appearance.rs"]
+pub mod appearance;
+
 #[path = "accessibility.rs"]
 pub(crate) mod accessibility;
+
+#[path = "window_ops.rs"]
+mod window_ops;
+pub use window_ops::{focus_window, set_window_parent};
+#[path = "window_mapping.rs"]
+mod window_mapping;
+#[cfg(test)]
+#[path = "window_scale_tests.rs"]
+mod window_scale_tests;
+#[path = "geometry_ops.rs"]
+mod geometry_ops;
+#[path = "dialog_geometry_ops.rs"]
+mod dialog_geometry_ops;
+pub use geometry_ops::{
+    forget_geometry, queue_dialog_geometry, register_geometry, restore_window_placement,
+    window_geometry,
+};
+
+/// X11 has its own event registry; its panel index names the same host slot.
+pub fn notify_dialog_geometry(index: usize) {
+    dialog_geometry_ops::notify(index);
+}
+
+/// Captures an X11 notification outside its client registry borrow.
+pub fn notify_geometry(window: usize) {
+    geometry_ops::notify(window);
+}
+
+/// Records actual Wayland EGL buffer size after a successful swap, outside GL's
+/// registry borrow at delivery time. X11 geometry comes from native configure.
+pub fn observe_gl_geometry(window: usize, physical: (usize, usize), scale: usize) {
+    if !is_x11() { geometry_ops::observe_buffer(window, physical, scale); }
+}
 
 // MARK: - libc floor (the only raw syscalls the shell needs)
 
@@ -275,6 +313,7 @@ enum Iface {
     Decoration,
     Pinch,
     FractionalScale,
+    ActivationToken,
     CoreSurface,
     CoreSeat,
     CoreOutput,
@@ -297,6 +336,8 @@ pub(crate) struct Protocols {
     pinch: &'static WlInterface,
     fractional_manager: &'static WlInterface,
     fractional: &'static WlInterface,
+    activation: &'static WlInterface,
+    activation_token: &'static WlInterface,
 }
 
 /// The xdg-shell message rows, transcribed from the installed
@@ -518,9 +559,10 @@ fn build_protocols() -> Protocols {
             .chain(decoration_spec())
             .chain(pointer_gestures_spec())
             .chain(fractional_scale_spec())
+            .chain(window_ops::activation_spec())
             .collect();
     // pass 1: stable homes, filled with placeholders
-    let slots: &'static mut [WlInterface; 13] = Box::leak(Box::new(std::array::from_fn(|_| {
+    let slots: &'static mut [WlInterface; 15] = Box::leak(Box::new(std::array::from_fn(|_| {
         WlInterface {
             name: c"".as_ptr(),
             version: 0,
@@ -541,6 +583,7 @@ fn build_protocols() -> Protocols {
             Iface::Decoration => unsafe { base.add(8) },
             Iface::Pinch => unsafe { base.add(10) },
             Iface::FractionalScale => unsafe { base.add(12) },
+            Iface::ActivationToken => unsafe { base.add(14) },
             Iface::CoreSurface => &raw const wl_surface_interface,
             Iface::CoreSeat => &raw const wl_seat_interface,
             Iface::CoreOutput => &raw const wl_output_interface,
@@ -592,6 +635,8 @@ fn build_protocols() -> Protocols {
         pinch: &slots[10],
         fractional_manager: &slots[11],
         fractional: &slots[12],
+        activation: &slots[13],
+        activation_token: &slots[14],
     }
 }
 
@@ -747,6 +792,7 @@ const PANEL_KIND_TOPLEVEL: usize = 3;
 /// NOTHING but this queue — state and marshalling stay outside, so a
 /// roundtrip can never re-enter a borrow.
 enum Ev {
+    ActivationDone { id: usize, token: CString },
     Global { name: u32, interface: String, version: u32 },
     GlobalRemove { name: u32 },
     Ping { serial: u32 },
@@ -757,7 +803,7 @@ enum Ev {
     /// 2 = the server.
     DecorationMode { decoration_ptr: usize, mode: u32 },
     /// The keyboard came to, or left, one of our surfaces.
-    KeyboardEnter { surface_ptr: usize },
+    KeyboardEnter { serial: u32, surface_ptr: usize },
     KeyboardLeave { surface_ptr: usize },
     /// The input method came to, or left, one of our surfaces.
     ImeEnter { surface_ptr: usize },
@@ -787,7 +833,7 @@ enum Ev {
     PreferredBufferScale { surface_ptr: usize, scale: i32 },
     /// The seat said what it has — the touch device is asked for here.
     SeatCapabilities { caps: u32 },
-    TouchDown { surface_ptr: usize, id: i32, x: f64, y: f64 },
+    TouchDown { serial: u32, surface_ptr: usize, id: i32, x: f64, y: f64 },
     TouchUp { id: i32 },
     TouchMotion { id: i32, x: f64, y: f64 },
     TouchFrame,
@@ -908,6 +954,7 @@ unsafe extern "C" fn dispatcher(
         }
         TAG_TOUCH => match opcode {
             0 => push_ev(Ev::TouchDown {
+                serial: unsafe { arg(0).u },
                 surface_ptr: unsafe { arg(2).o } as usize,
                 id: unsafe { arg(3).i },
                 x: fixed_to_f64(unsafe { arg(4).f }),
@@ -971,7 +1018,7 @@ unsafe extern "C" fn dispatcher(
                 fd: unsafe { arg(1).h },
                 size: unsafe { arg(2).u },
             }),
-            1 => push_ev(Ev::KeyboardEnter { surface_ptr: unsafe { arg(1).o } as usize }),
+            1 => push_ev(Ev::KeyboardEnter { serial: unsafe { arg(0).u }, surface_ptr: unsafe { arg(1).o } as usize }),
             2 => push_ev(Ev::KeyboardLeave { surface_ptr: unsafe { arg(1).o } as usize }),
             3 => push_ev(Ev::KeyboardKey {
                 serial: unsafe { arg(0).u },
@@ -1051,6 +1098,11 @@ unsafe extern "C" fn dispatcher(
             1 => push_ev(Ev::ImeLeave { surface_ptr: unsafe { arg(0).o } as usize }),
             _ => {} // delete_surrounding(4): documented gap
         },
+        tag if tag >= window_ops::ACTIVATION_TAG_BASE => {
+            if opcode == 0 {
+                push_ev(Ev::ActivationDone { id: tag - window_ops::ACTIVATION_TAG_BASE, token: unsafe { CStr::from_ptr(arg(0).s) }.to_owned() });
+            }
+        }
         tag if tag >= PANEL_TAG_BASE => {
             let index = (tag - PANEL_TAG_BASE) >> 2;
             match tag & 0x3 {
@@ -1101,24 +1153,39 @@ unsafe extern "C" fn dispatcher(
 /// commits. Violations are FATAL protocol errors, so the machine is
 /// the single authority.
 #[derive(Default)]
-struct MapState {
-    configured: bool,
-    mapped: bool,
+enum MapState {
+    Hidden,
+    #[default]
+    AwaitingConfigure,
+    Configured {
+        mapped: bool,
+    },
 }
 
 impl MapState {
-    /// A configure arrived; ack is always owed.
     fn on_configure(&mut self) {
-        self.configured = true;
+        if matches!(self, Self::AwaitingConfigure) {
+            *self = Self::Configured { mapped: false };
+        }
     }
 
     fn can_attach(&self) -> bool {
-        self.configured
+        matches!(self, Self::Configured { .. })
+    }
+    const fn mapped(&self) -> bool {
+        matches!(self, Self::Configured { mapped: true })
+    }
+    const fn hidden(&self) -> bool {
+        matches!(self, Self::Hidden)
+    }
+
+    const fn awaits_buffer(&self) -> bool {
+        matches!(self, Self::Configured { mapped: false })
     }
 
     fn on_present(&mut self) {
-        if self.configured {
-            self.mapped = true;
+        if self.can_attach() {
+            *self = Self::Configured { mapped: true };
         }
     }
 }
@@ -1344,10 +1411,16 @@ struct Backing {
 }
 
 struct Window {
+    title: std::ffi::CString,
+    min_size: Option<(i32, i32)>,
+    max_size: Option<(i32, i32)>,
     surface: *mut Proxy,
     xdg_surface: *mut Proxy,
     toplevel: *mut Proxy,
     logical: (f64, f64),
+    /// Last configured or committed size; requests change only `logical`.
+    observed_size: Option<(f64, f64)>,
+    size_authority: geometry_ops::SizeAuthority,
     map: MapState,
     /// The size the role staged for the next `xdg_surface.configure`.
     pending_size: Option<(i32, i32)>,
@@ -1558,6 +1631,12 @@ struct Dialog {
     /// configure that commits it.
     pending: Option<(f64, f64)>,
     pending_maximized: bool,
+    pending_authority: geometry_ops::SizeAuthority,
+    size_authority: geometry_ops::SizeAuthority,
+    /// Restoration is a layout target, not an observed configure or commit.
+    requested: Option<(f64, f64)>,
+    /// Actual content size and scale of the last committed native buffer.
+    observed: Option<bunny_ui::window::WindowGeometry>,
     /// The size the compositor granted — the frame layout follows.
     /// `None` until it names one: the dialog then keeps its own.
     granted: Option<(f64, f64)>,
@@ -1581,12 +1660,18 @@ impl Dialog {
                 Some((f64::from(width).max(self.min.0), f64::from(height).max(self.min.1)));
         }
         self.pending_maximized = states.contains(&MAXIMIZED);
+        self.pending_authority = geometry_ops::SizeAuthority::from_states(states);
     }
 
     /// The xdg configure commits what the toplevel said. `true` when the
     /// granted size changed — the owner must lay the dialog out again.
     fn commit(&mut self) -> bool {
         self.maximized = self.pending_maximized;
+        self.size_authority = self.pending_authority;
+        if self.pending.is_some() || self.size_authority == geometry_ops::SizeAuthority::Compositor
+        {
+            self.requested = None;
+        }
         match self.pending.take() {
             Some(granted) if self.granted != Some(granted) => {
                 self.granted = Some(granted);
@@ -1639,6 +1724,7 @@ impl Panel {
 }
 
 struct Client {
+    window_ops: window_ops::WindowOps,
     display: *mut Display,
     registry: *mut Proxy,
     compositor: *mut Proxy,
@@ -1790,6 +1876,12 @@ pub enum TouchPhase {
 
 #[derive(Clone)]
 pub enum AppEvent {
+    /// A live application-wide portal observation.
+    AppearanceChanged(Option<bunny_ui::theme::Appearance>),
+    /// Captured native geometry addressed to its non-recycled scene lifetime.
+    GeometryChanged(bunny_ui::window::GeometryObservation),
+    /// Native dialog facts scoped to their presentation lease.
+    DialogGeometryChanged(bunny_ui::window::DialogGeometryObservation),
     Redraw,
     /// This window closed — by its button, the compositor, or the app;
     /// its slot retires. Delivered at the window, before it is gone.
@@ -1884,6 +1976,8 @@ pub fn dispatch(event: AppEvent) {
             handler(event);
         }
     });
+    geometry_ops::drain();
+    crate::confirmation::drain();
 }
 
 // MARK: - connect and the registry census
@@ -1948,6 +2042,7 @@ fn connect() {
         1,
         TAG_SYNC,
     );
+    let activation = bind(c"xdg_activation_v1", protocols.activation, 1, TAG_SYNC);
     assert!(!compositor.is_null(), "wl_compositor is mandatory");
     assert!(!shm.is_null(), "wl_shm is mandatory");
     assert!(!wm_base.is_null(), "xdg_wm_base is mandatory");
@@ -2073,6 +2168,7 @@ fn connect() {
 
     CLIENT.with(|slot| {
         *slot.borrow_mut() = Some(Client {
+            window_ops: window_ops::WindowOps::new(activation),
             display,
             registry,
             compositor,
@@ -2178,6 +2274,8 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
                 TAG_TOPLEVEL,
             )
         };
+        let mut min_size = None;
+        let mut max_size = None;
         unsafe {
             request(toplevel, 2, &mut [WlArgument { s: title_c.as_ptr() }]);
             request(toplevel, 3, &mut [arg_s(&crate::life::app_id())]); // set_app_id
@@ -2186,12 +2284,15 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
                 // asked for, and the compositor refuses the grab and the
                 // maximize verb of its own accord
                 let (w, h) = (width.round() as i32, height.round() as i32);
+                min_size = Some((w, h));
+                max_size = Some((w, h));
                 request(toplevel, 8, &mut [arg_i(w), arg_i(h)]); // set_min_size
                 request(toplevel, 7, &mut [arg_i(w), arg_i(h)]); // set_max_size
             } else if let Some((min_width, min_height)) = options.min {
                 // a floor alone: the grab stops there, and no maximum is
                 // said, so the maximize verb stays the compositor's
                 let (w, h) = (min_width.round() as i32, min_height.round() as i32);
+                min_size = Some((w, h));
                 request(toplevel, 8, &mut [arg_i(w), arg_i(h)]); // set_min_size
             }
         }
@@ -2239,10 +2340,15 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
             wl_display_flush(client.display);
         }
         client.windows.push(Window {
+            title: title_c.clone(),
+            min_size,
+            max_size,
             surface,
             xdg_surface,
             toplevel,
             logical: (width, height),
+            observed_size: None,
+            size_authority: geometry_ops::SizeAuthority::Client,
             map: MapState::default(),
             pending_size: None,
             scale: 1,
@@ -2343,7 +2449,7 @@ fn absorb_setup(addr: usize) -> bool {
         q.extend(kept);
         q.extend(tail);
     });
-    with_client(|client| window_ref(client, addr).is_some_and(|win| win.map.configured))
+    with_client(|client| window_ref(client, addr).is_some_and(|win| win.map.can_attach()))
 }
 
 /// The toplevel's word: a size (zero = our choice) and the states.
@@ -2358,7 +2464,8 @@ fn apply_toplevel_configure(
 ) -> Option<(usize, bool)> {
     let win = window_where(client, |w| w.toplevel as usize == toplevel_ptr)?;
     // zero means "your choice": keep what we have
-    win.pending_size = (width > 0 && height > 0).then_some((width, height));
+    win.pending_size = (width > 0 || height > 0).then_some((width, height));
+    win.size_authority = geometry_ops::SizeAuthority::from_states(states);
     const STATE_MAXIMIZED: u32 = 1;
     const STATE_RESIZING: u32 = 3;
     win.maximized = states.contains(&STATE_MAXIMIZED);
@@ -2376,19 +2483,21 @@ fn apply_surface_configure(
     serial: u32,
 ) -> Option<(usize, bool, bool, bool, u64)> {
     let win = window_where(client, |w| w.xdg_surface as usize == xdg_ptr)?;
-    let first = !win.map.configured;
+    let first = !win.map.can_attach();
     let staged = win.pending_size.take();
     win.map.on_configure();
     unsafe { request(win.xdg_surface, 4, &mut [arg_u(serial)]) };
-    let mapped = win.map.mapped;
+    let mapped = win.map.mapped();
     let mut resized = false;
     if let Some((w, h)) = staged {
-        let logical = (w as f64, h as f64);
+        let logical = (if w > 0 { f64::from(w) } else { win.logical.0 },
+            if h > 0 { f64::from(h) } else { win.logical.1 });
         if logical != win.logical {
             win.logical = logical;
             resized = true;
         }
     }
+    win.observed_size = geometry_ops::configured_size(staged, win.observed_size);
     Some((win.surface as usize, resized, first, mapped, win.presents))
 }
 
@@ -2472,6 +2581,14 @@ pub struct WindowHandle {
 }
 
 impl WindowHandle {
+    /// A newly configured Wayland mapping needs a buffer even when the retained
+    /// display list has no pixel damage. An unmap detached its previous buffer.
+    pub fn needs_mapping_buffer(&self) -> bool {
+        !is_x11() && with_client(|client| {
+            window_ref(client, self.window).is_some_and(|win| win.map.awaits_buffer())
+        })
+    }
+
     fn toplevel(window: usize) -> WindowHandle {
         WindowHandle { window, panel: 0 }
     }
@@ -2484,9 +2601,24 @@ impl WindowHandle {
     }
 }
 
-/// Asks the road to end — what the app's `close` spends on the one
-/// window this shell holds. The pump leaves on its next turn, and the
-/// process returns from `run`.
+type CloseGate = std::rc::Rc<dyn Fn(usize) -> bool>;
+
+thread_local! {
+    static CLOSE_GATE: RefCell<Option<CloseGate>> = const { RefCell::new(None) };
+}
+
+/// Installs the owning application's user-close decision gate.
+pub fn set_close_gate(gate: CloseGate) {
+    CLOSE_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+}
+
+/// Queries application policy outside any platform registry borrow.
+pub fn allow_close(window: usize) -> bool {
+    let gate = CLOSE_GATE.with(|slot| slot.borrow().clone());
+    gate.is_none_or(|gate| gate(window))
+}
+
+/// Explicit teardown; the last native window ends the event loop.
 pub fn close_top_level(window: usize) {
     accessibility::retire_window(window);
     if is_x11() {
@@ -2498,6 +2630,7 @@ pub fn close_top_level(window: usize) {
     crate::vk::teardown(window);
     crate::gl::teardown(window);
     with_client(|client| {
+        window_ops::retire(client, window);
         // children before the parent — the protocol's teardown law: the
         // popups first (one may hang from a dialog), then the dialogs
         for dialogs in [false, true] {
@@ -2506,7 +2639,7 @@ pub fn close_top_level(window: usize) {
                     panel.owner == window && panel.role.dialog().is_some() == dialogs
                 }) && let Some(panel) = slot.take()
                 {
-                    unsafe { teardown_panel(panel) };
+                    unsafe { teardown_panel(panel, &mut client.window_ops) };
                 }
             }
         }
@@ -2542,8 +2675,10 @@ pub(crate) fn settle_closes() {
     loop {
         let next = with_client(|client| client.close_requested.pop());
         let Some(window) = next else { break };
-        dispatch_at(window, AppEvent::WindowClosed);
-        close_top_level(window);
+        if allow_close(window) {
+            dispatch_at(window, AppEvent::WindowClosed);
+            close_top_level(window);
+        }
     }
 }
 
@@ -2560,8 +2695,12 @@ unsafe fn destroy_window_proxies(win: Window) {
         if !win.fractional.is_null() {
             destroy(win.fractional, 0); // before the surface it watches
         }
-        destroy(win.toplevel, 0);
-        destroy(win.xdg_surface, 0);
+        if !win.toplevel.is_null() {
+            destroy(win.toplevel, 0);
+        }
+        if !win.xdg_surface.is_null() {
+            destroy(win.xdg_surface, 0);
+        }
         if let Some(backing) = win.backing {
             destroy(backing.buffer, 0);
             destroy(backing.pool, 1);
@@ -2703,6 +2842,7 @@ impl WindowHandle {
         if self.panel == 0 {
             return;
         }
+        dialog_geometry_ops::forget(self.panel - 1);
         if is_x11() {
             return crate::x11::close_panel(self.panel - 1);
         }
@@ -2723,7 +2863,7 @@ impl WindowHandle {
                         (at != index).then(|| panel.role.reborn().map(|role| (panel.owner, role)))
                     });
                     if let Some(panel) = slot.take() {
-                        unsafe { teardown_panel(panel) };
+                        unsafe { teardown_panel(panel, &mut client.window_ops) };
                     }
                     // a hosted popup keeps its slot — the pool still
                     // holds its handle and re-presents it, parentless
@@ -2736,6 +2876,16 @@ impl WindowHandle {
                 }
             }
         });
+    }
+
+    /// Binds this native panel slot to one runtime-owned dialog presentation.
+    pub fn bind_dialog_geometry(
+        &self,
+        session: Option<std::rc::Rc<bunny_ui::window::DialogGeometrySession>>,
+    ) -> bool {
+        self.panel
+            .checked_sub(1)
+            .is_some_and(|index| dialog_geometry_ops::bind(index, self.window, session))
     }
 
     /// The size the compositor granted this dialog's window, in points —
@@ -2755,7 +2905,7 @@ impl WindowHandle {
                 .get(self.panel - 1)
                 .and_then(Option::as_ref)
                 .and_then(|panel| panel.role.dialog())
-                .and_then(|dialog| dialog.granted)
+                .and_then(|dialog| dialog.requested.or(dialog.granted))
         })
     }
 }
@@ -2821,14 +2971,46 @@ pub fn create_dialog(
         decoration: std::ptr::null_mut(),
         pending: None,
         pending_maximized: false,
+        pending_authority: geometry_ops::SizeAuthority::Client,
+        size_authority: geometry_ops::SizeAuthority::Client,
+        requested: None,
+        observed: None,
         granted: None,
         maximized: false,
         logical: (0.0, 0.0),
         fixed,
     };
     with_client(|client| {
-        client.panels.push(Some(Panel::new(owner, Role::Dialog(dialog))));
-        WindowHandle { window: owner, panel: client.panels.len() }
+        window_ops::cancel(&mut client.window_ops, owner);
+        client
+            .panels
+            .push(Some(Panel::new(owner, Role::Dialog(dialog))));
+        WindowHandle {
+            window: owner,
+            panel: client.panels.len(),
+        }
+    })
+}
+
+/// The fixture waits for observed native geometry, not only a retained overlay.
+#[cfg(test)]
+pub fn confirmation_geometry(
+    handle: WindowHandle,
+) -> Result<bunny_ui::window::WindowGeometry, bunny_ui::window::WindowError> {
+    use bunny_ui::window::WindowError;
+    let index = handle.panel_slot().ok_or(WindowError::StaleWindow)?;
+    if is_x11() {
+        return crate::x11::dialog_geometry(index);
+    }
+    with_client(|client| {
+        client
+            .panels
+            .get(index)
+            .and_then(Option::as_ref)
+            .and_then(|panel| panel.role.dialog())
+            .ok_or(WindowError::StaleWindow)?
+            .observed
+            .ok_or(WindowError::GeometryUnavailable)
     })
 }
 
@@ -2839,7 +3021,8 @@ pub fn create_dialog(
 const XDG_ANCHOR_TOP_LEFT: u32 = 5;
 const XDG_GRAVITY_BOTTOM_RIGHT: u32 = 8;
 
-unsafe fn teardown_panel(panel: Panel) {
+unsafe fn teardown_panel(panel: Panel, state: &mut window_ops::WindowOps) {
+    window_ops::forget_surface(state, panel.owner, panel.surface as usize);
     unsafe {
         if !panel.popup.is_null() {
             destroy(panel.popup, 0);
@@ -2874,6 +3057,7 @@ unsafe fn teardown_panel(panel: Panel) {
 
 fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height: usize, rgba: &[u8]) {
     let (x, y, w, h) = rect;
+    let mut geometry_changed = false;
     with_client(|client| {
         let owner = client.panels.get(index).and_then(|p| p.as_ref()).map_or(0, |p| p.owner);
         let (mut parent_surface, mut parent_xdg, mut parent_logical, parent_toplevel, scale) =
@@ -2919,7 +3103,7 @@ fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height:
         if moved && let Some(role) = panel.role.reborn() {
             let owner = panel.owner;
             let dead = std::mem::replace(panel, Panel::new(owner, role));
-            unsafe { teardown_panel(dead) };
+            unsafe { teardown_panel(dead, &mut client.window_ops) };
         }
         if let Some(dialog) = panel.role.dialog_mut() {
             dialog.logical = (w, h);
@@ -3118,10 +3302,13 @@ fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height:
             return;
         }
         unsafe {
-            flush_panel_pixels(client.shm, panel, width, height, &bytes, scale);
+            geometry_changed = flush_panel_pixels(client.shm, panel, width, height, &bytes, scale);
             wl_display_flush(client.display);
         }
     });
+    if geometry_changed {
+        dialog_geometry_ops::notify(index);
+    }
 }
 
 /// Writes the premultiplied pixels into the panel's shm and commits.
@@ -3132,7 +3319,7 @@ unsafe fn flush_panel_pixels(
     height: usize,
     bytes: &[u8],
     scale: usize,
-) {
+) -> bool {
     unsafe {
         let stale = panel
             .backing
@@ -3148,10 +3335,12 @@ unsafe fn flush_panel_pixels(
             const ARGB8888: u32 = 0;
             panel.backing = make_backing(shm, width, height, ARGB8888, TAG_SYNC);
         }
-        let Some(backing) = panel.backing.as_mut() else { return };
+        let Some(backing) = panel.backing.as_mut() else {
+            return false;
+        };
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), backing.map, bytes.len().min(backing.len));
         let surface_version = wl_proxy_get_version(panel.surface);
-        if scale > 1 && surface_version >= 3 {
+        if surface_version >= 3 {
             request(panel.surface, 8, &mut [arg_i(scale as i32)]);
         }
         request(panel.surface, 1, &mut [arg_o(backing.buffer), arg_i(0), arg_i(0)]);
@@ -3165,6 +3354,32 @@ unsafe fn flush_panel_pixels(
             request(panel.surface, 2, &mut [arg_i(0), arg_i(0), arg_i(i32::MAX), arg_i(i32::MAX)]);
         }
         request(panel.surface, 6, &mut no_args());
+        let actual_scale = if surface_version >= 3 { scale } else { 1 };
+        let observed =
+            geometry_ops::committed_size(width, height, actual_scale).and_then(|(w, h)| {
+                bunny_ui::window::WindowSize::new(w, h)
+                    .ok()
+                    .and_then(|size| {
+                        bunny_ui::window::WindowGeometry::new(
+                            size,
+                            None,
+                            u32::try_from(actual_scale).map(f64::from).ok()?,
+                        )
+                        .ok()
+                    })
+            });
+        if let Some(dialog) = panel.role.dialog_mut() {
+            let previous = std::mem::replace(&mut dialog.observed, observed);
+            if let Some(observed) = observed {
+                let size = (observed.size().width(), observed.size().height());
+                if dialog.requested == Some(size) {
+                    dialog.requested = None;
+                    dialog.granted = Some(size);
+                }
+            }
+            return previous != observed;
+        }
+        false
     }
 }
 
@@ -3334,6 +3549,7 @@ fn wait_release(client: &mut Client, addr: usize) {
 }
 
 fn present_rows(addr: usize, width: usize, height: usize, rgba: &[u8], damage: &[(i64, i64, i64, i64)]) {
+    let before = with_client(|client| window_ref(client, addr).and_then(|win| win.observed_size));
     with_client(|client| {
         if !window_ref(client, addr).is_some_and(|w| w.map.can_attach()) {
             return;
@@ -3373,7 +3589,7 @@ fn present_rows(addr: usize, width: usize, height: usize, rgba: &[u8], damage: &
         let buffer = backing.buffer;
         unsafe {
             let surface_version = wl_proxy_get_version(win.surface);
-            if win.scale > 1 && surface_version >= 3 {
+            if surface_version >= 3 {
                 request(win.surface, 8, &mut [arg_i(win.scale as i32)]);
             }
             request(win.surface, 1, &mut [arg_o(buffer), arg_i(0), arg_i(0)]);
@@ -3414,9 +3630,13 @@ fn present_rows(addr: usize, width: usize, height: usize, rgba: &[u8], damage: &
             wl_display_flush(display);
         }
         win.map.on_present();
+        win.observed_size = geometry_ops::committed_size(width, height, win.scale);
         win.presents += 1;
         client.presents += 1;
+        window_ops::restore_parents(client);
     });
+    let after = with_client(|client| window_ref(client, addr).and_then(|win| win.observed_size));
+    if before != after { geometry_ops::notify(addr); }
 }
 
 // MARK: - cursor (theme tier; the shape protocol joins on compositors that have it)
@@ -3772,7 +3992,6 @@ struct DbusIter {
 
 const DBUS_TYPE_STRING: c_int = 115; // 's'
 const DBUS_TYPE_VARIANT: c_int = 118; // 'v'
-const DBUS_TYPE_UINT32: c_int = 117; // 'u'
 const DBUS_TYPE_BOOLEAN: c_int = 98; // 'b'
 const DBUS_BUS_SESSION: c_int = 0;
 
@@ -3832,20 +4051,6 @@ fn portal_read(namespace: &CStr, key: &CStr) -> Option<(c_int, u64)> {
         dbus_connection_close(connection);
         dbus_connection_unref(connection);
         value.flatten()
-    }
-}
-
-/// The standardized appearance key: 1 = dark, 2 = light, 0 = no say.
-pub fn os_prefers_dark() -> Option<bool> {
-    let (kind, value) = portal_read(c"org.freedesktop.appearance", c"color-scheme")?;
-    (kind == DBUS_TYPE_UINT32).then(|| color_scheme_wants_dark(value as u32)).flatten()
-}
-
-fn color_scheme_wants_dark(scheme: u32) -> Option<bool> {
-    match scheme {
-        1 => Some(true),
-        2 => Some(false),
-        _ => None,
     }
 }
 
@@ -3935,6 +4140,9 @@ fn crown_execute(window: usize, take: CrownTake, x: f64, y: f64) -> bool {
         let seat = client.seat;
         let serial = client.serials.press;
         let Some(win) = window_ref(client, window) else { return false };
+        if win.map.hidden() {
+            return false;
+        }
         // a grab (move, resize, the menu) needs the seat that pressed;
         // the window's own buttons and the maximize toggle need none —
         // a compositor with no seat (a headless one) still closes
@@ -4590,7 +4798,7 @@ pub(crate) fn gpu_pre_present(window: usize, scale: usize) -> bool {
             return false;
         }
         unsafe {
-            if scale > 1 && wl_proxy_get_version(win.surface) >= 3 {
+            if wl_proxy_get_version(win.surface) >= 3 {
                 request(win.surface, 8, &mut [arg_i(scale as i32)]);
             }
             // every presenting commit carries a frame callback; `done`
@@ -4622,6 +4830,7 @@ pub(crate) fn gpu_note_present(window: usize) {
             win.presents += 1;
         }
         client.presents += 1;
+        window_ops::restore_parents(client);
     });
 }
 
@@ -4637,8 +4846,12 @@ pub(crate) fn gpu_limit_size(window: usize, max_px: usize) {
         return;
     }
     with_client(|client| {
-        let Some(win) = window_ref(client, window) else { return };
+        let Some(win) = window_at(client, window) else { return };
         let logical = (max_px / win.scale.max(1)) as i32;
+        win.max_size = Some((logical, logical));
+        if win.toplevel.is_null() {
+            return;
+        }
         unsafe {
             request(win.toplevel, 7, &mut [arg_i(logical), arg_i(logical)]);
             wl_display_flush(client.display);
@@ -4656,6 +4869,7 @@ fn drain_protocol_events() {
             return;
         };
         match ev {
+            Ev::ActivationDone { id, token } => with_client(|client| window_ops::activate(client, id, &token)),
             Ev::Ping { serial } => with_client(|client| unsafe {
                 request(client.wm_base, 3, &mut [arg_u(serial)]);
             }),
@@ -4676,6 +4890,7 @@ fn drain_protocol_events() {
                 else {
                     continue;
                 };
+                geometry_ops::notify(addr);
                 if resized || first {
                     // a new size, or the window's very first configure:
                     // the reveal
@@ -4755,6 +4970,7 @@ fn drain_protocol_events() {
             Ev::PointerEnter { serial, surface_ptr, x, y } => {
                 let (x, y) = with_client(|client| {
                     client.serials.enter = serial;
+                    client.window_ops.input = Some((serial, surface_ptr));
                     // which of our surfaces the pointer entered decides
                     // the translation of everything that follows
                     client.pointer_focus = target_of(client, surface_ptr);
@@ -4809,6 +5025,7 @@ fn drain_protocol_events() {
             Ev::PointerButton { serial, time_ms, button, pressed } => {
                 let (x, y, focus, on) = with_client(|client| {
                     client.serials.record_button(serial, pressed);
+                    if pressed { window_ops::pointer_input(client, serial); }
                     let local = client.pointer_pos;
                     let (x, y) = translate_pointer(client, local.0, local.1);
                     let on = match client.pointer_focus {
@@ -4869,7 +5086,8 @@ fn drain_protocol_events() {
                     };
                 }
             }),
-            Ev::TouchDown { surface_ptr, id, x, y } => with_client(|client| {
+            Ev::TouchDown { serial, surface_ptr, id, x, y } => with_client(|client| {
+                client.window_ops.input = Some((serial, surface_ptr));
                 // fingers on the main window only — a panel takes none
                 if let Target::Window(owner) = target_of(client, surface_ptr) {
                     client.touch_live.push((id, x, y, owner));
@@ -4933,6 +5151,7 @@ fn drain_protocol_events() {
                 }
             }
             Ev::PanelConfigure { index, serial } => {
+                let mut geometry_changed = false;
                 let resized = with_client(|client| {
                     let shm = client.shm;
                     let owner =
@@ -4950,12 +5169,16 @@ fn drain_protocol_events() {
                         .then_some(owner);
                     if let Some((width, height, bytes)) = panel.staged.take() {
                         unsafe {
-                            flush_panel_pixels(shm, panel, width, height, &bytes, scale);
+                            geometry_changed =
+                                flush_panel_pixels(shm, panel, width, height, &bytes, scale);
                             wl_display_flush(client.display);
                         }
                     }
                     resized
                 });
+                if geometry_changed {
+                    dialog_geometry_ops::notify(index);
+                }
                 // the frame follows the window: the owner lays the
                 // dialog out again at the size it was given
                 if let Some(owner) = resized {
@@ -5040,7 +5263,7 @@ fn drain_protocol_events() {
                     let reborn =
                         slot.as_ref().and_then(|panel| Some((panel.owner, panel.role.reborn()?)));
                     if let Some(panel) = slot.take() {
-                        unsafe { teardown_panel(panel) };
+                        unsafe { teardown_panel(panel, &mut client.window_ops) };
                     }
                     if let Some((owner, role)) = reborn {
                         *slot = Some(Panel::new(owner, role));
@@ -5174,7 +5397,9 @@ fn drain_protocol_events() {
             }
             // a dialog holding the keyboard types into its OWNER's
             // runtime — the scene the dialog is a slice of
-            Ev::KeyboardEnter { surface_ptr } => with_client(|client| {
+            Ev::KeyboardEnter { serial, surface_ptr } => with_client(|client| {
+                client.window_ops.keyboard_surface = surface_ptr;
+                client.window_ops.input = Some((serial, surface_ptr));
                 client.keyboard_focus = window_of_surface(client, surface_ptr);
             }),
             Ev::KeyboardLeave { surface_ptr } => {
@@ -5236,6 +5461,7 @@ fn drain_protocol_events() {
                 // the native event it is; the scene's road stays shut
                 let raw = with_client(|client| {
                     client.serials.record_key(serial, pressed);
+                    if pressed { client.window_ops.input = Some((serial, client.window_ops.keyboard_surface)); }
                     let keycode = key + 8;
                     crate::webview::RawKey {
                         window: client.keyboard_focus,
@@ -5385,24 +5611,20 @@ fn update_scale_all() {
 }
 
 /// Applies an edit to the window's scale inputs and re-resolves the
-/// ladder. True when the lattice actually moved — the caller asks for
+/// ladder. True when the exact factor or the raster lattice moved — the caller asks for
 /// the fresh frame, or not (a window being set up draws soon anyway).
 fn update_scale(addr: usize, edit: impl FnOnce(&mut Window)) -> bool {
-    with_client(|client| {
+    let changed = with_client(|client| {
         let outputs: Vec<(u32, i32)> =
             client.outputs.iter().map(|output| (output.name, output.scale)).collect();
         let Some(win) = window_at(client, addr) else { return false };
         edit(win);
         let (scale, factor) =
             scale_ladder(win.preferred_120, win.preferred_buffer, &win.entered, &outputs);
-        win.factor = factor;
-        if scale != win.scale {
-            win.scale = scale;
-            true
-        } else {
-            false
-        }
-    })
+        geometry_ops::set_scale(&mut win.scale, &mut win.factor, scale, factor)
+    });
+    if changed { geometry_ops::notify(addr); }
+    changed
 }
 
 /// The pump: prepare-read integration of the wayland fd plus the
@@ -5439,6 +5661,7 @@ pub fn run() {
                 PollFd { fd: wake_fd, events: POLLIN, revents: 0 },
             ];
             accessibility::prepare(&mut fds);
+            appearance::prepare(&mut fds);
             // the engine's own descriptors ride this poll: a page's
             // frame, a signal, a message — all land on this thread
             let timeout = match crate::webview::pump_prepare(&mut fds) {
@@ -5456,6 +5679,8 @@ pub fn run() {
                 let mut drain = [0u8; 64];
                 while read(wake_fd, drain.as_mut_ptr().cast(), drain.len()) > 0 {}
             }
+            accessibility::after(&fds);
+            appearance::after(&fds);
             crate::webview::pump_after(&mut fds);
             wl_display_dispatch_pending(display);
             if wl_display_get_error(display) != 0 {
@@ -5464,6 +5689,7 @@ pub fn run() {
             }
         }
         drain_protocol_events();
+        appearance::pump();
         if wake_woke {
             dispatch(AppEvent::Wake);
         }
@@ -5567,14 +5793,15 @@ fn teardown() {
     crate::vk::teardown_all();
     crate::gl::teardown_all();
     CLIENT.with(|slot| {
-        let Some(client) = slot.borrow_mut().take() else { return };
+        let Some(mut client) = slot.borrow_mut().take() else { return };
         unsafe {
             // children before the parent — the protocol's teardown law
             for slot in client.panels {
                 if let Some(panel) = slot {
-                    teardown_panel(panel);
+                    teardown_panel(panel, &mut client.window_ops);
                 }
             }
+            window_ops::teardown(client.window_ops);
             for win in client.windows {
                 destroy_window_proxies(win);
             }
@@ -5651,6 +5878,129 @@ fn teardown() {
 }
 
 // MARK: - tests
+
+/// Reads native visibility for a registered top-level window.
+pub fn window_visibility(
+    window: usize,
+) -> Result<bunny_ui::window::WindowVisibility, bunny_ui::window::WindowError> {
+    use bunny_ui::window::{WindowError, WindowVisibility};
+    if is_x11() {
+        return crate::x11::window_visibility(u32::try_from(window).map_err(|_| WindowError::StaleWindow)?);
+    }
+    with_client(|client| {
+        window_ref(client, window)
+            .map(|win| {
+                if win.map.hidden() {
+                    WindowVisibility::Hidden
+                } else {
+                    WindowVisibility::Shown
+                }
+            })
+            .ok_or(WindowError::StaleWindow)
+    })
+}
+
+/// Rebuild native child surfaces on remap, retaining their logical overlay slots.
+fn suspend_window_panels(client: &mut Client, window: usize) {
+    // Popups first and in reverse creation order; dialogs follow their children.
+    for dialogs in [false, true] {
+        for slot in client.panels.iter_mut().rev() {
+            let Some(panel) = slot
+                .as_ref()
+                .filter(|p| p.owner == window && p.role.dialog().is_some() == dialogs)
+            else {
+                continue;
+            };
+            let role = match &panel.role {
+                Role::Popup { host } => Role::Popup { host: *host },
+                Role::Chip => Role::Chip,
+                Role::Dialog(d) => Role::Dialog(Dialog {
+                    title: d.title.clone(),
+                    min: d.min,
+                    scene: d.scene,
+                    toplevel: std::ptr::null_mut(),
+                    decoration: std::ptr::null_mut(),
+                    pending: None,
+                    pending_maximized: false,
+                    pending_authority: geometry_ops::SizeAuthority::Client,
+                    size_authority: geometry_ops::SizeAuthority::Client,
+                    requested: None,
+                    observed: None,
+                    granted: None,
+                    maximized: false,
+                    logical: d.logical,
+                    fixed: d.fixed,
+                }),
+            };
+            let mut replacement = Panel::new(window, role);
+            replacement.scene_origin = panel.scene_origin;
+            if let Some(old) = slot.replace(replacement) {
+                unsafe {
+                    teardown_panel(old, &mut client.window_ops);
+                }
+            }
+        }
+    }
+}
+
+/// Changes native visibility without retiring the window lifetime.
+pub fn set_window_visibility(
+    window: usize,
+    visibility: bunny_ui::window::WindowVisibility,
+) -> Result<(), bunny_ui::window::WindowError> {
+    use bunny_ui::window::{WindowError, WindowVisibility};
+    if is_x11() {
+        return crate::x11::set_window_visibility(u32::try_from(window).map_err(|_| WindowError::StaleWindow)?, visibility);
+    }
+    if window_visibility(window)? == visibility {
+        return Ok(());
+    }
+    with_client(|client| {
+        if visibility == WindowVisibility::Hidden {
+            window_ops::unmap(&mut client.window_ops, window);
+            suspend_window_panels(client, window);
+        }
+        match visibility {
+            WindowVisibility::Hidden => {
+                let win = window_at(client, window).ok_or(WindowError::StaleWindow)?;
+                unsafe {
+                    win.map = MapState::Hidden;
+                    if !win.frame_callback.is_null() {
+                        wl_proxy_destroy(win.frame_callback);
+                        win.frame_callback = std::ptr::null_mut();
+                    }
+                    request(
+                        win.surface,
+                        1,
+                        &mut [arg_o(std::ptr::null_mut()), arg_i(0), arg_i(0)],
+                    );
+                    request(win.surface, 6, &mut no_args());
+                }
+            }
+            WindowVisibility::Shown => window_mapping::remap(client, window)?,
+        }
+        unsafe {
+            wl_display_flush(client.display);
+        }
+        // Unmapping discards native parenting. Record the absent relation now
+        // so the parent's first remapped presentation reapplies it.
+        window_ops::restore_parents(client);
+        Ok(())
+    })?;
+    if visibility == WindowVisibility::Hidden {
+        // Settle pre-unmap configures without dispatching scene callbacks. They
+        // must not satisfy the next mapping's fresh configure requirement.
+        let display = with_client(|client| client.display);
+        unsafe {
+            wl_display_roundtrip(display);
+        }
+        absorb_setup(window);
+    } else {
+        crate::vk::invalidate(window);
+        crate::gl::invalidate(window);
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -5976,16 +6326,47 @@ mod tests {
     }
 
     #[test]
+    fn unmapping_blocks_buffers_and_old_configures_until_explicit_remap() {
+        let mut map = MapState::default();
+        assert!(!map.awaits_buffer());
+        map.on_configure();
+        assert!(map.awaits_buffer());
+        map.on_present();
+        assert!(!map.awaits_buffer());
+        assert!(map.mapped());
+        map = MapState::Hidden;
+        map.on_configure();
+        map.on_present();
+        assert!(map.hidden());
+        assert!(!map.awaits_buffer());
+        assert!(!map.can_attach());
+        map = MapState::AwaitingConfigure;
+        map.on_present();
+        assert!(!map.mapped());
+        assert!(!map.can_attach());
+        map.on_configure();
+        assert!(map.can_attach());
+        assert!(map.awaits_buffer());
+        assert!(!map.mapped());
+        map.on_present();
+        assert!(map.mapped());
+        assert!(!map.awaits_buffer());
+    }
+
+    #[test]
     fn the_map_dance_holds_its_order() {
         let mut map = MapState::default();
         assert!(!map.can_attach(), "a buffer before the first configure is a protocol error");
         map.on_present();
-        assert!(!map.mapped, "a present that could not attach maps nothing");
+        assert!(
+            !map.mapped(),
+            "a present that could not attach maps nothing"
+        );
         map.on_configure();
         assert!(map.can_attach());
-        assert!(!map.mapped, "configured is not yet mapped");
+        assert!(!map.mapped(), "configured is not yet mapped");
         map.on_present();
-        assert!(map.mapped, "the first real present maps the window");
+        assert!(map.mapped(), "the first real present maps the window");
     }
 
     fn dialog(min: (f64, f64)) -> Dialog {
@@ -5997,11 +6378,37 @@ mod tests {
             decoration: std::ptr::null_mut(),
             pending: None,
             pending_maximized: false,
+            pending_authority: geometry_ops::SizeAuthority::Client,
+            size_authority: geometry_ops::SizeAuthority::Client,
+            requested: None,
+            observed: None,
             granted: None,
             maximized: false,
             logical: (0.0, 0.0),
             fixed: false,
         }
+    }
+
+    #[test]
+    fn dialog_requests_and_configures_do_not_fabricate_buffer_observations() {
+        let mut account = dialog((280.0, 180.0));
+        account.requested = Some((470.0, 310.0));
+        account.hear(0, 0, &[]);
+        account.commit();
+        assert_eq!(account.requested, Some((470.0, 310.0)));
+        assert_eq!(account.observed, None);
+        account.hear(900, 700, &[1]);
+        assert_eq!(account.size_authority, geometry_ops::SizeAuthority::Client);
+        account.commit();
+        assert_eq!(
+            account.size_authority,
+            geometry_ops::SizeAuthority::Compositor
+        );
+        assert_eq!(account.requested, None);
+        assert_eq!(
+            account.observed, None,
+            "only an actual buffer commit can set the observation"
+        );
     }
 
     /// The compositor's first word is usually 0 × 0 — the dialog opens
@@ -6099,13 +6506,7 @@ mod tests {
         assert_eq!(resolve_scale(&[3], &[(3, 0)]), 1, "a zero scale clamps to one");
     }
 
-    #[test]
-    fn the_color_scheme_reads_its_three_answers() {
-        assert_eq!(color_scheme_wants_dark(1), Some(true), "one is dark");
-        assert_eq!(color_scheme_wants_dark(2), Some(false), "two is light");
-        assert_eq!(color_scheme_wants_dark(0), None, "zero has no say");
-        assert_eq!(color_scheme_wants_dark(9), None, "the future has no say either");
-    }
+
 
     #[test]
     fn the_text_input_tables_match_their_xml() {

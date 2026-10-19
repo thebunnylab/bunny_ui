@@ -13,15 +13,14 @@
 //! Wayland exposes window-relative geometry, never invented screen positions.
 //! WPE pixels do not yet expose an embedded accessibility plug.
 
-#[path = "accessibility_bus.rs"]
-mod bus;
+use super::bus;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::rc::{Rc, Weak};
 
-use bunny_ui::accessibility::{Action, Node, NodeId, Role};
+use bunny_ui::accessibility::{Action, Node, NodeId, RangeValue, Role};
 use bunny_ui::layout::{Point, Rect, Size};
 use bunny_ui::prelude::Runtime;
 use bus::{Connection, Message, Value};
@@ -33,6 +32,7 @@ const APPLICATION: &str = "org.a11y.atspi.Application";
 const COMPONENT: &str = "org.a11y.atspi.Component";
 const ACTION: &str = "org.a11y.atspi.Action";
 const TEXT: &str = "org.a11y.atspi.Text";
+const VALUE: &str = "org.a11y.atspi.Value";
 const EDITABLE: &str = "org.a11y.atspi.EditableText";
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 
@@ -89,6 +89,8 @@ impl Entry {
             Kind::Control(node) => match node.role {
                 Role::Text => (29, "label"),
                 Role::Button => (43, "push button"),
+                Role::Checkbox => (7, "check box"),
+                Role::Slider => (51, "slider"),
                 Role::TextField => (79, "entry"),
                 Role::PasswordField => (40, "password text"),
             },
@@ -98,8 +100,9 @@ impl Entry {
         let mut result = vec![ACCESSIBLE, COMPONENT];
         if let Kind::Control(node) = &self.kind {
             match node.role {
-                Role::Button => result.push(ACTION),
+                Role::Button | Role::Checkbox => result.push(ACTION),
                 Role::Text => result.push(TEXT),
+                Role::Slider => result.extend([VALUE, ACTION]),
                 Role::TextField | Role::PasswordField => result.extend([TEXT, EDITABLE]),
             }
         }
@@ -112,17 +115,54 @@ impl Entry {
             _ => "",
         }
     }
-    fn state(&self) -> u32 {
+    fn state(&self) -> u64 {
+        // AT-SPI StateType: enabled, sensitive, showing and visible. The
+        // second word carries CHECKABLE (41); checkboxes are not editable text.
         let mut bits = (1 << 8) | (1 << 24) | (1 << 25) | (1 << 30);
         if let Kind::Control(node) = &self.kind {
+            if !node.enabled {
+                bits &= !((1 << 8) | (1 << 24));
+            }
             if node.supports(&Action::Focus) {
-                bits |= (1 << 7) | (1 << 11) | (1 << if node.multiline { 17 } else { 26 });
+                bits |= 1 << 11;
+            }
+            if matches!(node.role, Role::TextField | Role::PasswordField) {
+                bits |= (1 << 7) | (1 << if node.multiline { 17 } else { 26 });
+            }
+            if node.role == Role::Slider && node.enabled {
+                bits |= 1 << 7;
+            }
+            if node.checked.is_some() {
+                bits |= 1 << 41;
+            }
+            if node.checked == Some(true) {
+                bits |= 1 << 4;
             }
             if node.focused {
                 bits |= 1 << 12;
             }
         }
         bits
+    }
+    fn range(&self) -> Option<RangeValue> {
+        match &self.kind {
+            Kind::Control(node) => node.range,
+            _ => None,
+        }
+    }
+    fn actions(&self) -> &'static [(&'static str, Action)] {
+        match &self.kind {
+            Kind::Control(node) => match node.role {
+                Role::Slider => &[
+                    ("increment", Action::Increment),
+                    ("decrement", Action::Decrement),
+                ],
+                Role::Checkbox => &[("toggle", Action::Activate)],
+                Role::Button => &[("click", Action::Activate)],
+                _ => &[],
+            },
+            _ => &[],
+        }
     }
     fn extents(&self, coordinates: u32) -> Result<[i32; 4], Failure> {
         let scale = self.handle.scale_factor();
@@ -203,6 +243,25 @@ impl Accessibility {
         {
             callback();
         }
+    }
+    fn perform(&self, entry: &Entry, action: Action) -> Result<Vec<Value>, Failure> {
+        let Kind::Control(node) = &entry.kind else {
+            return Err(Failure::Unsupported);
+        };
+        self.runtime
+            .accessibility_action(node.id, action)
+            .map_err(|error| {
+                if std::env::var_os("BUNNY_ATSPI_TRACE").is_some() {
+                    eprintln!("AT-SPI runtime refused {}: {error}", node.id.get());
+                }
+                match error {
+                    bunny_ui::accessibility::ActionError::Unavailable => Failure::Unavailable,
+                    bunny_ui::accessibility::ActionError::Unsupported => Failure::Unsupported,
+                    bunny_ui::accessibility::ActionError::InvalidValue => Failure::Arguments,
+                }
+            })?;
+        self.redraw();
+        Ok(vec![Value::Bool(true)])
     }
     fn activate(&self) {
         if !self.capture.replace(true) {
@@ -390,16 +449,35 @@ impl Service {
                             Value::text(&current.name),
                         );
                     }
-                    if previous.state() != current.state()
-                        && (previous.state() ^ current.state()) & (1 << 12) != 0
+                    for (bit, detail) in [
+                        (4, "checked"),
+                        (7, "editable"),
+                        (8, "enabled"),
+                        (11, "focusable"),
+                        (12, "focused"),
+                        (24, "sensitive"),
+                    ] {
+                        if (previous.state() ^ current.state()) & (1 << bit) != 0 {
+                            self.event(
+                                &current.path,
+                                c"StateChanged",
+                                detail,
+                                i32::from(current.state() & (1 << bit) != 0),
+                                0,
+                                Value::I32(0),
+                            );
+                        }
+                    }
+                    if previous.range() != current.range()
+                        && let Some(range) = current.range()
                     {
                         self.event(
                             &current.path,
-                            c"StateChanged",
-                            "focused",
-                            i32::from(current.state() & (1 << 12) != 0),
+                            c"PropertyChange",
+                            "accessible-value",
                             0,
-                            Value::I32(0),
+                            0,
+                            Value::F64(range.value()),
                         );
                     }
                     if previous.text() != current.text() {
@@ -548,6 +626,24 @@ impl Service {
             return Err(Failure::Unavailable);
         }
         if interface == PROPERTIES {
+            if let (
+                "Set",
+                [
+                    Value::String(interface),
+                    Value::String(name),
+                    Value::Variant(value),
+                ],
+            ) = (member.as_str(), args.as_slice())
+                && interface == VALUE
+                && name == "CurrentValue"
+            {
+                let Value::F64(number) = **value else {
+                    return Err(Failure::Arguments);
+                };
+                let (owner, entry) = owner_entry.as_ref().ok_or(Failure::Unavailable)?;
+                owner.perform(entry, Action::SetValue(number))?;
+                return Ok(Vec::new());
+            }
             return self.property_call(&path, entry, &member, &args);
         }
         let supported = entry.map_or_else(|| vec![ACCESSIBLE, APPLICATION], Entry::interfaces);
@@ -578,7 +674,10 @@ impl Service {
                 )]),
                 ("GetState", []) => Ok(vec![Value::Array(
                     c"u",
-                    vec![Value::U32(entry.map_or(0, Entry::state)), Value::U32(0)],
+                    vec![
+                        Value::U32(entry.map_or(0, Entry::state) as u32),
+                        Value::U32((entry.map_or(0, Entry::state) >> 32) as u32),
+                    ],
                 )]),
                 ("GetRelationSet", []) => Ok(vec![Value::Array(c"(ua(so))", Vec::new())]),
                 ("GetAttributes", []) => Ok(vec![Value::Array(c"{ss}", Vec::new())]),
@@ -598,40 +697,41 @@ impl Service {
             };
         }
         let (owner, entry) = owner_entry.ok_or(Failure::Unavailable)?;
-        let perform = |action| {
-            let Kind::Control(node) = &entry.kind else {
-                return Err(Failure::Unsupported);
-            };
-            owner
-                .runtime
-                .accessibility_action(node.id, action)
-                .map_err(|error| {
-                    if std::env::var_os("BUNNY_ATSPI_TRACE").is_some() {
-                        eprintln!("AT-SPI runtime refused {}: {error}", node.id.get());
-                    }
-                    match error {
-                        bunny_ui::accessibility::ActionError::Unavailable => Failure::Unavailable,
-                        bunny_ui::accessibility::ActionError::Unsupported => Failure::Unsupported,
-                    }
-                })?;
-            owner.redraw();
-            Ok(vec![Value::Bool(true)])
-        };
+        let perform = |action| owner.perform(&entry, action);
         match (interface.as_str(), member.as_str(), args.as_slice()) {
-            (ACTION, "DoAction", [Value::I32(0)]) => perform(Action::Activate),
-            (ACTION, "GetName" | "GetLocalizedName", [Value::I32(0)]) => {
-                Ok(vec![Value::text("click")])
+            (ACTION, "DoAction", [Value::I32(index)]) => {
+                let (_, action) = entry
+                    .actions()
+                    .get(usize::try_from(*index).map_err(|_| Failure::Arguments)?)
+                    .ok_or(Failure::Arguments)?;
+                perform(action.clone())
             }
-            (ACTION, "GetDescription" | "GetKeyBinding", [Value::I32(0)]) => {
-                Ok(vec![Value::text("")])
+            (
+                ACTION,
+                "GetName" | "GetLocalizedName" | "GetDescription" | "GetKeyBinding",
+                [Value::I32(index)],
+            ) => {
+                let (name, _) = entry
+                    .actions()
+                    .get(usize::try_from(*index).map_err(|_| Failure::Arguments)?)
+                    .ok_or(Failure::Arguments)?;
+                Ok(vec![Value::text(
+                    if matches!(member.as_str(), "GetName" | "GetLocalizedName") {
+                        name
+                    } else {
+                        ""
+                    },
+                )])
             }
             (ACTION, "GetActions", []) => Ok(vec![Value::Array(
                 c"(sss)",
-                vec![Value::Struct(vec![
-                    Value::text("click"),
-                    Value::text(""),
-                    Value::text(""),
-                ])],
+                entry
+                    .actions()
+                    .iter()
+                    .map(|(name, _)| {
+                        Value::Struct(vec![Value::text(*name), Value::text(""), Value::text("")])
+                    })
+                    .collect(),
             )]),
             (EDITABLE, "SetTextContents", [Value::String(text)]) => {
                 perform(Action::SetText(text.clone()))
@@ -735,6 +835,14 @@ impl Service {
                         "Id",
                     ],
                     ACTION => &["NActions", "version"],
+                    VALUE => &[
+                        "MinimumValue",
+                        "MaximumValue",
+                        "MinimumIncrement",
+                        "CurrentValue",
+                        "Text",
+                        "version",
+                    ],
                     TEXT => &["CharacterCount", "version"],
                     COMPONENT | EDITABLE => &["version"],
                     _ => return Err(Failure::Unsupported),
@@ -808,7 +916,20 @@ impl Service {
             (APPLICATION, "AtspiVersion") => Ok(Value::text("2.1")),
             (APPLICATION, "Id") => Ok(Value::I32(self.id.get())),
             (APPLICATION, "InterfaceVersion") | (_, "version") => Ok(Value::U32(1)),
-            (ACTION, "NActions") => Ok(Value::I32(1)),
+            (ACTION, "NActions") => Ok(Value::I32(
+                entry.ok_or(Failure::Unavailable)?.actions().len() as i32,
+            )),
+            (VALUE, name) => {
+                let range = entry.and_then(Entry::range).ok_or(Failure::Unsupported)?;
+                match name {
+                    "MinimumValue" => Ok(Value::F64(range.minimum())),
+                    "MaximumValue" => Ok(Value::F64(range.maximum())),
+                    "MinimumIncrement" => Ok(Value::F64(range.small_change())),
+                    "CurrentValue" => Ok(Value::F64(range.value())),
+                    "Text" => Ok(Value::text(range.value().to_string())),
+                    _ => Err(Failure::Unsupported),
+                }
+            }
             (TEXT, "CharacterCount") => Ok(Value::I32(text_len(
                 entry.ok_or(Failure::Unavailable)?.text(),
             ))),
@@ -934,22 +1055,20 @@ fn service() -> Option<Rc<Service>> {
         .flatten()
 }
 
-/// Adds the bus descriptor, including write readiness for queued replies.
+/// Adds libdbus-owned watches for queued reads and replies.
 pub(crate) fn prepare(fds: &mut Vec<super::PollFd>) {
     if let Some(service) = service()
         && service.connected.get()
-        && let Some(fd) = service.connection.fd()
     {
-        fds.push(super::PollFd {
-            fd,
-            events: super::POLLIN
-                | if service.connection.wants_write() {
-                    4
-                } else {
-                    0
-                },
-            revents: 0,
-        });
+        service.connection.prepare(fds);
+    }
+}
+/// Reports descriptor readiness without dispatching accessibility actions.
+pub fn after(fds: &[super::PollFd]) {
+    if let Some(service) = service()
+        && service.connected.get()
+    {
+        service.connection.after(fds);
     }
 }
 /// Runs outside display dispatch, with no borrowed runtime or platform client.

@@ -723,3 +723,56 @@ scratch consumer suite passes 2,889 tests with 44 ignored. Strict Apple lint
 retains the same 34 baseline diagnostics, with no new signatures; this is not
 a green strict-clippy gate. Frozen sources, executables, collectors, all raw
 samples and rejected candidates are preserved separately from these docs.
+
+## Windows (2026-10-14)
+
+The same four apps open a Windows window through `bunny_ui_windows`: DirectWrite and WIC for text and
+images, the Direct3D 11 presenter, and the shell's own event loop (`platform::open`). The scenes, their
+geometry and their fixtures are the ones above; the face is **Consolas**, which every Windows installs,
+at the same logical sizes (the editor's face size puts the glyph advance on whole units, with a 16-unit
+line box).
+
+Windows takes the other road for input. The app never synthesises a step: an external producer raises
+every wheel notch and keystroke through the system's input queue (`SendInput`), on absolute deadlines,
+as a hand would, after placing the window and bringing it to the front. The app's stdin carries only
+observation boundaries — `BEGIN`, `DOWN`, `UP`, `DONE` — and each is answered with the scene's actual
+state (`SCENE_READY` / `SCENE_DONE`, `EDITOR_READY` / `EDITOR_DONE`), so a run that did less than its
+script cannot pass for one that did it. `BEGIN` starts the streaming scene's producer; the canvas keeps
+its last paint for every boundary. A sample is admitted only when its witnesses hold (rows, offset back at
+the top after the wheel's way out and back, stream count and content, 60 ± 10 painted frames a second
+on the canvas, the editor's text, collapsed end caret and caret in view) and when the window's own
+pixels, captured from the composed screen at the first and the last boundary, show what the scene drew
+(stripes and text ink, an empty stream at its start, the canvas marker, a white editor page with ink).
+
+Measurement session for the figures below: one machine (Ryzen AI MAX+ 395, Radeon 8060S, Windows 11
+25H2), on AC, display at 150 % (2560×1600 physical, 1280×800 logical client) and set to 60 Hz for the
+session; release builds; no build for 60 s before a sample, a CPU canary within 1.3× the session's,
+the console session unlocked and in front, and no real or foreign input during a sample.
+
+- **CPU** is the cycle time of every process the app started (a Job object holds them), from
+  `QueryProcessCycleTime`, over the scene's steady window, divided by the invariant TSC rate:
+  percent of one logical core. The window is seconds 10–18 of rest, 1–7 of the canvas and 3–11
+  of the active scripts, counted from the script's start (the stream's from `BEGIN`).
+- **Memory** is `PROCESS_MEMORY_COUNTERS_EX2` summed over the job at the window's end: private commit
+  (`PrivateUsage`) and private working set (`PrivateWorkingSetSize`). On this integrated GPU the
+  device's local allocations (swapchain buffers, atlases) are charged to private commit.
+- **GPU** is the 3D engine's running time for the app's processes from the `GPU Engine` performance
+  counters, as a share of the window; the compositor is read separately and not attributed to the app.
+- **Launch**: `FIRST_FRAME` against process creation, and the first time the table's first cell shows
+  a stripe with text ink on the composed screen; 15 launches.
+
+bunny_ui's own figures, `3c0916a` with the arena's Windows port, medians (min–max) of three rounds:
+
+| scene | CPU | private commit | private WS | app GPU 3D | compositor GPU 3D |
+|---|---:|---:|---:|---:|---:|
+| table at rest | 0.023 % (0.022–0.024) | 91.6 MiB | 32.2 MiB | 0 % | 0.12 % |
+| table under the wheel | 13.76 % (13.57–13.90) | 147.2 MiB | 44.4 MiB | 3.56 % | 0.89 % |
+| chat, one line every 33 ms | 3.70 % (3.58–4.22) | 89.0 MiB | 32.3 MiB | 1.75 % | 0.50 % |
+| looping canvas, 60 fps | 3.36 % (3.12–3.92) | 83.6 MiB | 24.2 MiB | 1.59 % | 0.14 % |
+| editor, 400 lines, typing | 1.17 % (1.11–1.28) | 95.6 MiB | 33.3 MiB | 0.53 % | 0.29 % |
+| editor, 30 000 lines, typing | 1.70 % (1.70–1.71) | 110.2 MiB | 38.2 MiB | 0.68 % | 0.28 % |
+| editor, 30 000 lines, append | 3.08 % (3.07–3.18) | 159.8 MiB | 56.0 MiB | 0.77 % | 0.26 % |
+
+Launch: `FIRST_FRAME` at 216 ms (200–230) and the first visible cell at 412 ms (382–430), over 15
+launches. These figures describe this machine and this session; the steps that follow on Windows are
+each measured against the build before them, interleaved, the same way.

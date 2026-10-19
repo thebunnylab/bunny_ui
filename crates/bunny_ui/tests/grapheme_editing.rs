@@ -160,6 +160,7 @@ fn native_composition_and_explicit_ranges_keep_their_utf16_contract() {
 
     text = "ae\u{301}z".into();
     caret = CaretState {
+        affinity: Default::default(),
         caret: 4,
         anchor: Some(2),
         marked: None,

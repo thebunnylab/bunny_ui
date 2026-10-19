@@ -195,14 +195,20 @@ impl WindowSpec {
     }
 }
 
-/// A window's handle in an [`App`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub struct WindowId(usize);
+use bunny_ui::window::{Lifecycle, Relationships};
+mod window_api;
+mod window_geometry;
+pub use bunny_ui::window::{
+    CloseAction, DesktopPosition, DesktopSpace, WindowError, WindowGeometry, WindowId,
+    WindowParent, WindowParentKind, WindowPlacement, WindowSize, WindowVisibility,
+};
 
 /// Everything one window owns for as long as it is open. The app holds
 /// these and routes every event to the one it belongs to.
 struct Slot {
     presentation: RefCell<Option<bunny_ui::presentation::backend::PresentationSource>>,
+    lifecycle: Rc<Lifecycle>,
+    confirmation: bunny_ui::window::ConfirmationSlot,
     /// The `HWND` as an address — what an event's source is compared
     /// against.
     window: usize,
@@ -210,6 +216,7 @@ struct Slot {
     /// The window's own scene — what a locale the app pins reaches.
     runtime: Rc<Runtime>,
     handler: RefCell<Box<dyn FnMut(AppEvent)>>,
+    pending: RefCell<std::collections::VecDeque<AppEvent>>,
     key_gate: RefCell<Box<dyn FnMut(&ffi::KeyStroke) -> bool>>,
     /// The bar's answer to a menu key — Alt alone, F10, an Alt chord.
     menu_gate: RefCell<Box<dyn FnMut(bunny_ui::menu::MenuKey) -> bool>>,
@@ -219,6 +226,24 @@ struct Slot {
     on_web: Box<dyn Fn(webview::WebviewEvent)>,
     /// Files dragged in from the system: previewed, dropped, or gone.
     file_drag: Box<dyn Fn(f64, f64, Vec<std::path::PathBuf>, filedrop::FileDrag) -> bool>,
+}
+
+impl Slot {
+    /// The first frame runs directly, outside the global dispatcher. Native
+    /// child creation can synchronously report activation during that frame;
+    /// replay those events after its scene borrow ends instead of reentering it.
+    fn dispatch(&self, event: AppEvent) {
+        let _confirmation = ffi::defer_confirmations();
+        self.pending.borrow_mut().push_back(event);
+        let Ok(mut handler) = self.handler.try_borrow_mut() else {
+            return;
+        };
+        loop {
+            let event = self.pending.borrow_mut().pop_front();
+            let Some(event) = event else { break };
+            handler(event);
+        }
+    }
 }
 
 /// This shell holds MORE THAN ONE window — the detachable composer,
@@ -253,6 +278,7 @@ pub struct App {
 /// The half the platform gates hold: they outlive any borrow of the
 /// app, so what they capture is a handle and never a reference.
 struct AppInner {
+    relationships: Relationships,
     slots: RefCell<Vec<Rc<Slot>>>,
     routed: std::cell::Cell<bool>,
     scenes: std::cell::Cell<usize>,
@@ -278,6 +304,7 @@ impl App {
         bunny_ui::clipboard::install_image_reader(ffi::clipboard_read_image);
         App {
             inner: Rc::new(AppInner {
+                relationships: Relationships::default(),
                 slots: RefCell::new(Vec::new()),
                 routed: std::cell::Cell::new(false),
                 scenes: std::cell::Cell::new(0),
@@ -306,13 +333,15 @@ impl App {
     /// Raises a window on `runtime`, showing `root`.
     pub fn open(&self, spec: WindowSpec, runtime: Rc<Runtime>, root: impl View) -> WindowId {
         let slot = mount(&spec, runtime, root);
-        let id = WindowId(slot.window);
+        self.inner.relationships.register(slot.lifecycle.id());
+        ffi::register_geometry(slot.window, Rc::clone(slot.lifecycle.geometry_events()));
+        let id = slot.lifecycle.id();
         self.inner.slots.borrow_mut().push(Rc::clone(&slot));
         Rc::clone(&self.inner).route();
         // its own first frame, through its OWN handler and not the
         // global road: a window is very often opened from inside an
         // event, and the road is busy carrying that event
-        (slot.handler.borrow_mut())(AppEvent::Redraw);
+        slot.dispatch(AppEvent::Redraw);
         // painted, then shown — a window never flashes unpainted
         ffi::show_window(slot.handle);
         id
@@ -331,8 +360,7 @@ impl App {
         feed: bunny_ui::image_engine::FeedKey,
         capacity: usize,
     ) -> Option<bunny_ui::presentation::FeedPresentation> {
-        let slots = self.inner.slots.borrow();
-        let slot = slots.iter().find(|slot| slot.window == id.0)?;
+        let slot = self.slot(id)?;
         let (observer, source) = bunny_ui::presentation::backend::channel(feed, capacity);
         source
             .sender()
@@ -343,12 +371,146 @@ impl App {
 
     /// Closes a window. The app stays up unless it was the last.
     pub fn close(&self, id: WindowId) {
-        ffi::close_top_level(id.0);
+        self.close_children(id);
+        if let Some(slot) = self.slot(id) {
+            slot.presentation.borrow_mut().take();
+            slot.confirmation.owner_closed();
+            slot.runtime.retire_dialog_geometry();
+            slot.lifecycle.geometry_events().retire();
+            ffi::forget_geometry(slot.window, id);
+            ffi::close_top_level(slot.window);
+            self.inner.relationships.retire(id);
+            self.inner
+                .slots
+                .borrow_mut()
+                .retain(|live| live.lifecycle.id() != id);
+        }
     }
 
     /// The windows the app has open, oldest first.
     pub fn windows(&self) -> Vec<WindowId> {
-        self.inner.slots.borrow().iter().map(|slot| WindowId(slot.window)).collect()
+        self.inner
+            .slots
+            .borrow()
+            .iter()
+            .map(|slot| slot.lifecycle.id())
+            .collect()
+    }
+
+    fn slot(&self, id: WindowId) -> Option<Rc<Slot>> {
+        self.inner
+            .slots
+            .borrow()
+            .iter()
+            .find(|slot| slot.lifecycle.id() == id)
+            .cloned()
+    }
+
+    /// Hides a live window and its descendants without destroying their scenes.
+    /// Explicit child hide requests survive a later parent show. A descendant
+    /// failure can leave earlier windows changed; retrying is safe.
+    ///
+    /// # Errors
+    /// Returns `StaleWindow` for a closed or foreign ID, or a native failure.
+    pub fn hide(&self, id: WindowId) -> Result<(), WindowError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        let previous = slot.lifecycle.set_hidden(true);
+        if let Err(error) = self.refresh_window_visibility(id) {
+            slot.lifecycle.set_hidden(previous);
+            return Err(error);
+        }
+        self.refresh_child_visibility(id)
+    }
+
+    /// Shows a retained window unless an owning ancestor is hidden.
+    /// Descendants preserve their own explicit hide requests. Native activation
+    /// remains subject to OS policy. A descendant failure can leave earlier
+    /// windows changed; retrying is safe.
+    ///
+    /// # Errors
+    /// Returns `StaleWindow` for a closed or foreign ID, or a native failure.
+    pub fn show(&self, id: WindowId) -> Result<(), WindowError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        let previous = slot.lifecycle.set_hidden(false);
+        if let Err(error) = self.refresh_window_visibility(id) {
+            slot.lifecycle.set_hidden(previous);
+            return Err(error);
+        }
+        self.refresh_child_visibility(id)
+    }
+
+    /// Reports native visibility; this does not mean unobscured or focused.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn visibility(&self, id: WindowId) -> Result<WindowVisibility, WindowError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        ffi::window_visibility(slot.window)
+    }
+
+    /// Replaces a window's user-close policy. Explicit [`App::close`] bypasses it.
+    /// Return Cancel while an asynchronous save decision is pending. A callback
+    /// may replace/remove itself or close/open windows; recursive requests for
+    /// the same window fail with [`WindowError::CloseInProgress`].
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn on_close_requested(
+        &self,
+        id: WindowId,
+        handler: impl FnMut(WindowId) -> CloseAction + 'static,
+    ) -> Result<(), WindowError> {
+        self.slot(id)
+            .ok_or(WindowError::StaleWindow)?
+            .lifecycle
+            .on_close(handler);
+        Ok(())
+    }
+
+    /// Restores default Close handling for subsequent user-close requests.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn clear_close_handler(&self, id: WindowId) -> Result<(), WindowError> {
+        self.slot(id)
+            .ok_or(WindowError::StaleWindow)?
+            .lifecycle
+            .clear();
+        Ok(())
+    }
+
+    fn close_decision(&self, id: WindowId) -> Result<CloseAction, WindowError> {
+        let action = self
+            .slot(id)
+            .ok_or(WindowError::StaleWindow)?
+            .lifecycle
+            .decide()?;
+        if action == CloseAction::Hide && self.slot(id).is_some() {
+            self.hide(id)?;
+        } else if action == CloseAction::Close {
+            self.close_children(id);
+        }
+        Ok(action)
+    }
+
+    /// Requests closure through the same policy as the native close button.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    /// Same-window callback recursion returns [`WindowError::CloseInProgress`].
+    pub fn request_close(&self, id: WindowId) -> Result<CloseAction, WindowError> {
+        let action = self.close_decision(id)?;
+        if action == CloseAction::Close {
+            self.close(id);
+        }
+        Ok(action)
+    }
+
+    /// Explicitly tears down every window, bypassing user-close policies.
+    pub fn quit(&self) {
+        for id in self.windows() {
+            self.close(id);
+        }
     }
 
     /// Pins the language every window reads — over the system's display
@@ -392,15 +554,47 @@ impl AppInner {
         if self.routed.replace(true) {
             return;
         }
+        let closing = App {
+            inner: Rc::clone(&self),
+        };
+        ffi::set_close_gate(Rc::new(move |window| {
+            let id = closing
+                .inner
+                .live()
+                .iter()
+                .find(|slot| slot.window == window)
+                .map(|slot| slot.lifecycle.id());
+            id.is_some_and(|id| {
+                closing.close_decision(id) == Ok(CloseAction::Close) && closing.slot(id).is_some()
+            })
+        }));
         let app = Rc::clone(&self);
         ffi::set_handler(Box::new(move |event| {
+            if let AppEvent::DialogGeometryChanged(observation) = event {
+                observation.deliver();
+                return;
+            }
+            if let AppEvent::GeometryChanged(observation) = event {
+                if let Some(slot) = app
+                    .live()
+                    .into_iter()
+                    .find(|slot| slot.lifecycle.id() == observation.id())
+                {
+                    slot.lifecycle
+                        .geometry_events()
+                        .observe_captured(&observation);
+                }
+                return;
+            }
             let source = ffi::event_source();
             let gone = matches!(event, AppEvent::WindowClosed);
             for slot in app.live() {
                 // source 0 is a beat every window shares
                 if source == 0 || slot.window == source {
-                    let mut handler = slot.handler.borrow_mut();
-                    handler(event.clone());
+                    if gone {
+                        slot.confirmation.owner_closed();
+                    }
+                    slot.dispatch(event.clone());
                 }
             }
             if gone {
@@ -458,14 +652,19 @@ impl AppInner {
 
     /// Drops the slot of a window that has gone.
     fn buried(&self, window: usize) {
-        self.slots.borrow_mut().retain(|slot| {
-            if slot.window == window {
-                slot.presentation.borrow_mut().take();
-                false
-            } else {
-                true
-            }
-        });
+        if let Some(slot) = self
+            .slots
+            .borrow()
+            .iter()
+            .find(|slot| slot.window == window)
+        {
+            slot.presentation.borrow_mut().take();
+            slot.runtime.retire_dialog_geometry();
+            slot.lifecycle.geometry_events().retire();
+            ffi::forget_geometry(slot.window, slot.lifecycle.id());
+            self.relationships.retire(slot.lifecycle.id());
+        }
+        self.slots.borrow_mut().retain(|slot| slot.window != window);
     }
 }
 
@@ -493,6 +692,12 @@ pub fn run_window_chrome(
 /// long as it does — the frame path, the pools, the gates and the event
 /// handler — into a slot the [`App`] holds and routes to.
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
+    runtime.set_dialog_geometry_dispatch(ffi::queue_dialog_geometry);
+    let lifecycle = Rc::new(Lifecycle::default());
+    let confirmation = bunny_ui::window::ConfirmationSlot::new(
+        lifecycle.id(),
+        bunny_ui::window::ConfirmationKind::Win32MessageBox,
+    );
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
     runtime.drop_unseen();
@@ -510,14 +715,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // raster on refusal — and the window has not shown yet, so the
     // first frame (whichever road) lands before anyone looks
     ffi::install_gpu(&window);
-    // the season's mirrors: reduce-motion always follows the system
-    // (accessibility is never the app's to refuse); the theme follows
-    // ONLY while the app has not chosen one — an installed theme means
-    // the scene owns its colors and the shell stays out
-    let mirror_theme = bunny_ui::theme::version() == 0;
-    if mirror_theme && ffi::os_uses_light_theme() == Some(false) {
-        bunny_ui::theme::install(bunny_ui::theme::Theme::dark());
-    }
+    // Native preference is independent of an application-owned palette.
+    bunny_ui::theme::observe_system_appearance(
+        ffi::os_uses_light_theme().map(|light| bunny_ui::theme::Appearance::from_dark(!light)),
+    );
     runtime.set_reduce_motion(!ffi::animations_enabled());
     // the system's display languages reach the scene before its first
     // frame; a locale the app pinned (`App::set_locale`) stands over them
@@ -858,6 +1059,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                             );
                         }
                     }
+                    dialog.bind_dialog_geometry(
+                        window,
+                        runtime.dialog_geometry_session(&overlay.path),
+                    );
                     // layout follows the real window: the frame the reader
                     // left it at is what the next pass lays out against
                     let (rx, ry, rw, rh) = dialog.screen_rect_to_layout(dialog.client_rect_screen());
@@ -1044,11 +1249,15 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     });
     // Semantics follow every pixel path, including retained GPU early returns.
     let present = Rc::new({
+        let lifecycle = Rc::clone(&lifecycle);
         let paint = present;
         let accessibility = Rc::clone(&accessibility);
         let panels = Rc::clone(&panels);
         let dialogs = Rc::clone(&dialogs);
         move |runtime: &Runtime, display| {
+            if lifecycle.is_hidden() {
+                return;
+            }
             paint(runtime, display);
             let surfaces: Vec<_> = {
                 let panels = panels.borrow();
@@ -1062,9 +1271,15 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         }
     });
     let blit = {
+        let lifecycle = Rc::clone(&lifecycle);
         let accessibility = Rc::clone(&accessibility);
         let present = Rc::clone(&present);
         move |runtime: &Runtime, root: &_| {
+            // Hidden windows retain tasks/state, but must not re-show child surfaces.
+            if lifecycle.is_hidden() {
+                return;
+            }
+
             // A dialog's close button is the reader asking the SCENE to close,
             // not the window to die: spend those asks before the frame lays
             // out, so this pass renders without the dialog.
@@ -1347,6 +1562,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         }
     });
 
+    let handler_lifecycle = Rc::clone(&lifecycle);
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
@@ -1362,6 +1578,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // holding it back leaves the compositor stretching a stale
             // frame. A worker's wake mid-drag polls on the next turn
             // instead of racing the one presenter (the mac's law).
+            AppEvent::GeometryChanged(_) | AppEvent::DialogGeometryChanged(_) => return,
             AppEvent::Redraw => blit(runtime, root),
             // the Redraw that follows presents it
             AppEvent::WindowState { maximized } => {
@@ -1391,18 +1608,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // the display languages are a setting like the rest: read
                 // again, and a list that did not move rebuilds nothing
                 runtime.set_system_locale(ffi::preferred_locale());
-                if mirror_theme {
-                    let wants_dark = ffi::os_uses_light_theme() == Some(false);
-                    let is_dark =
-                        bunny_ui::theme::current().canvas == bunny_ui::theme::Theme::dark().canvas;
-                    if wants_dark != is_dark {
-                        bunny_ui::theme::install(if wants_dark {
-                            bunny_ui::theme::Theme::dark()
-                        } else {
-                            bunny_ui::theme::Theme::light()
-                        });
-                    }
-                }
+                bunny_ui::theme::observe_system_appearance(
+                    ffi::os_uses_light_theme().map(|light| bunny_ui::theme::Appearance::from_dark(!light)),
+                );
                 blit(runtime, root);
             }
             AppEvent::ResignKey => {
@@ -1410,7 +1618,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // platform's own — and the decorations freeze: they
                 // animate for eyes that are on them (the mac's rule)
                 runtime.set_loops_paused(true);
-                if runtime.dismiss_all_overlays() {
+                if !handler_lifecycle.is_hidden() && runtime.dismiss_all_overlays() {
                     blit(runtime, root);
                 }
                 // a frozen loop asks for no frames: the beat parks
@@ -1570,16 +1778,22 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
             // the app buries the slot by the source; the window itself
             // has nothing left to draw
-            AppEvent::WindowClosed => {}
+            AppEvent::WindowClosed => runtime.retire_dialog_geometry(),
         }
+        // A hidden scene can dirty state and then await another timer. Keep the
+        // task clock armed even when that turn deliberately skips presentation.
+        ffi::want_pace(window.raw_window(), pace_of(runtime));
     });
 
     Rc::new(Slot {
         presentation: RefCell::new(None),
+        lifecycle,
+        confirmation,
         window: window.raw_window(),
         handle: window,
         runtime,
         handler: RefCell::new(handler),
+        pending: RefCell::default(),
         key_gate: RefCell::new(key_gate),
         menu_gate: RefCell::new(menu_gate),
         drag_gate,

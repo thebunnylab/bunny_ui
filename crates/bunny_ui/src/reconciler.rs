@@ -41,7 +41,7 @@ use crate::text_input::{CaretState, EditCommand};
 /// What a click hands the app: the platform's own count for the press
 /// that armed it — 1, then 2 on the double, 3 on the triple. The
 /// framework holds no clock; it carries what the shell counted.
-pub(crate) type ClickAction = Rc<dyn Fn(u8)>;
+pub(crate) type ClickAction = Rc<dyn Fn(u8, crate::action::Modifiers)>;
 
 pub(crate) type ActionEntry = (Rc<str>, ClickAction);
 
@@ -76,6 +76,7 @@ pub(crate) struct EditorFn {
     /// Where a pasted picture goes (`TextField::on_paste_image`).
     pub paste_image: Option<Rc<dyn Fn(crate::clipboard::ClipboardImage)>>,
     pub command: EditFn,
+    pub history: Option<crate::field_history::FieldHistory>,
     pub key: Option<FieldKeyFn>,
     pub policy: Option<Rc<dyn crate::text_input::EditingStrategy>>,
     /// The app's word for the keyboard reaching or leaving the field
@@ -115,12 +116,18 @@ pub(crate) type ContextEntry = (String, &'static str, bool);
 /// — a skipped view keeps its mark, an unmounted one drops it — and no
 /// binding ever names it: the `bunny.` prefix is the house's.
 pub(crate) const KEYBOARD_NEUTRAL: &str = "bunny.keyboard-neutral";
+/// An inline transient subtree that returns focus to its invoking control.
+pub(crate) const FOCUS_RETURN: &str = "bunny.focus-return";
 
-/// A NAMED action handler registered at render: (registration path,
-/// id, what runs). Retained like the actions — a skipped view's
-/// handler lives.
+/// A named action or standard edit registered at render: (registration
+/// path, typed command, what runs). A skipped view retains its handlers.
 pub(crate) type HandlerFn = Rc<dyn Fn()>;
-pub(crate) type HandlerEntry = (String, crate::action::ActionId, HandlerFn);
+#[derive(Clone, Copy)]
+pub(crate) enum HandlerId {
+    Action(crate::action::ActionId),
+    Edit(crate::menu::Edit),
+}
+pub(crate) type HandlerEntry = (String, HandlerId, HandlerFn);
 
 /// A webview's app-side hooks, registered at render: the navigation
 /// and message writers, and the handle's command queue. Retained like
@@ -452,10 +459,9 @@ struct Live {
     context_gen: u64,
     /// The same, for effects.
     effect_gen: u64,
-    /// The keys the ROOT REGION of the last assembly put into the maps.
-    /// Those registrations live for one pass: the next assembly takes
-    /// them out before it puts the new region's in.
-    root_keys: RootKeys,
+    /// Registrations outside retained boundaries, owned by the scene whose
+    /// last frame published them. Input activation never replaces a region.
+    root_regions: HashMap<String, RootRegion>,
     /// Entries with no retained boundary above them — the ones only the
     /// root region mounts, and so the only ones the root region can
     /// unmount. The sweep reads this instead of searching for them.
@@ -471,7 +477,7 @@ struct Live {
 }
 
 #[derive(Default)]
-struct RootKeys {
+struct RootRegion {
     actions: Vec<String>,
     copies: Vec<String>,
     editors: Vec<String>,
@@ -480,6 +486,23 @@ struct RootKeys {
     measures: Vec<String>,
     webviews: Vec<String>,
     customs: Vec<String>,
+    handlers: Vec<HandlerEntry>,
+    contexts: Vec<ContextEntry>,
+}
+
+impl RootRegion {
+    fn is_empty(&self) -> bool {
+        self.actions.is_empty()
+            && self.copies.is_empty()
+            && self.editors.is_empty()
+            && self.splits.is_empty()
+            && self.scrolls.is_empty()
+            && self.measures.is_empty()
+            && self.webviews.is_empty()
+            && self.customs.is_empty()
+            && self.handlers.is_empty()
+            && self.contexts.is_empty()
+    }
 }
 
 /// A click key's registration: what it fires, and whose it is.
@@ -489,8 +512,8 @@ struct Registered {
     /// boundary's stay in the retention: a body that re-runs keeps it and
     /// replaces its registrations, one that leaves marks it left, and the
     /// boundary that mounts at the same path afterwards gets a slot of its
-    /// own. `None` for the root region, whose keys leave at the next
-    /// assembly.
+    /// own. `None` for a root region, whose keys leave when its own scene
+    /// renders again or closes.
     owner: Option<Rc<Slot>>,
 }
 
@@ -607,11 +630,11 @@ impl Live {
     /// each one only while it is still the left entry's own: a boundary
     /// that mounted at the same path since then registered its own over
     /// it, from a slot of its own.
-    fn take_buried(&mut self, graveyard: &[Box<Entry>]) {
+    fn take_buried(&mut self, graveyard: &[RetiredEntry]) {
         if self.buried_actions == 0 {
             return;
         }
-        for entry in graveyard {
+        for RetiredEntry(entry) in graveyard {
             for (key, action) in &entry.actions {
                 if let std::collections::hash_map::Entry::Occupied(found) = self.actions.entry(Rc::clone(key))
                     && found.get().owner.as_ref().is_some_and(|owner| Rc::ptr_eq(owner, &entry.slot))
@@ -664,9 +687,11 @@ impl Live {
         }
     }
 
-    /// Takes the last root region's registrations back out.
-    fn drop_root_region(&mut self) {
-        let keys = std::mem::take(&mut self.root_keys);
+    /// Takes one scene's root registrations back out, leaving its neighbors.
+    fn drop_root_region(&mut self, root: &str) -> bool {
+        let Some(keys) = self.root_regions.remove(root) else {
+            return false;
+        };
         for key in &keys.actions {
             self.remove_action(key);
         }
@@ -692,6 +717,7 @@ impl Live {
             self.customs.remove(key);
             self.keyed_customs.remove(key);
         }
+        true
     }
 }
 
@@ -940,6 +966,13 @@ pub(crate) fn begin_pass(dirty: HashSet<String>) {
     });
 }
 
+type RetainedBoundary = (Rc<str>, Rc<Slot>);
+type AssembledEffects = (String, u64, Rc<[EffectFn]>);
+
+/// Preserve the existing allocation until idle collection. Unboxing at retirement
+/// would free this allocation inside the frame that removed the view.
+struct RetiredEntry(Box<Entry>);
+
 pub(crate) enum Decision {
     Skip,
     Render,
@@ -953,14 +986,10 @@ pub(crate) enum Decision {
 /// kept by key — a row renders once per key, and what the row shows
 /// moves through the row's own reads — so under it a retained clean
 /// row is skipped like any clean boundary.
-pub(crate) fn decide(path: &str) -> Decision {
-    decide_at(path).0
-}
-
-/// [`decide`], with the retained boundary's own path handed back when
+/// The retained boundary's own path is handed back when
 /// there is one: the one copy of it the page holds, for the marks and
 /// the reference to share instead of copying the path again.
-pub(crate) fn decide_at(path: &str) -> (Decision, Option<(Rc<str>, Rc<Slot>)>) {
+pub(crate) fn decide_at(path: &str) -> (Decision, Option<RetainedBoundary>) {
     PASS.with(|pass| {
         let pass = pass.borrow();
         LIVE.with(|live| {
@@ -1397,8 +1426,10 @@ pub(crate) fn assemble_contexts(root: &str) {
             }
         }
     });
-    PASS.with(|pass| {
-        declared.extend(std::mem::take(&mut pass.borrow_mut().root_contexts));
+    LIVE.with(|live| {
+        if let Some(region) = live.borrow().root_regions.get(root) {
+            declared.extend(region.contexts.iter().cloned());
+        }
     });
     // outermost first: a view nearer the root holds the ones below it,
     // and among equals the tree's own order stands
@@ -1406,8 +1437,11 @@ pub(crate) fn assemble_contexts(root: &str) {
         let depth = |path: &str| path.split('/').count();
         depth(a).cmp(&depth(b)).then_with(|| a.cmp(b))
     });
-    let mounted: HashSet<&'static str> =
-        declared.iter().filter(|(_, _, focused)| !focused).map(|(_, name, _)| *name).collect();
+    let mounted: HashSet<&'static str> = declared
+        .iter()
+        .filter(|(_, _, focused)| !focused)
+        .map(|(_, name, _)| *name)
+        .collect();
     ACTIVE_CONTEXTS.with(|contexts| *contexts.borrow_mut() = mounted);
     DECLARED_CONTEXTS.with(|contexts| *contexts.borrow_mut() = declared);
 }
@@ -1449,6 +1483,18 @@ pub(crate) fn declares(path: &str, name: &str) -> bool {
     })
 }
 
+/// Mounted focus-return boundaries, including retained component bodies.
+pub(crate) fn focus_returns() -> Vec<String> {
+    DECLARED_CONTEXTS.with(|contexts| {
+        contexts
+            .borrow()
+            .iter()
+            .filter(|(_, name, _)| *name == FOCUS_RETURN)
+            .map(|(path, _, _)| path.clone())
+            .collect()
+    })
+}
+
 /// The contexts active for a keyboard held at `focus`, outermost first,
 /// each named once — the stack a key-context debugger shows.
 pub(crate) fn active_contexts(focus: Option<&str>) -> Vec<&'static str> {
@@ -1456,7 +1502,7 @@ pub(crate) fn active_contexts(focus: Option<&str>) -> Vec<&'static str> {
         let mut stack: Vec<&'static str> = Vec::new();
         for entry in contexts.borrow().iter() {
             // a mark, not a context a key could be read in
-            if entry.1 == KEYBOARD_NEUTRAL {
+            if matches!(entry.1, KEYBOARD_NEUTRAL | FOCUS_RETURN) {
                 continue;
             }
             if declaration_counts(entry, focus) && !stack.contains(&entry.1) {
@@ -1468,6 +1514,14 @@ pub(crate) fn active_contexts(focus: Option<&str>) -> Vec<&'static str> {
 }
 
 pub(crate) fn attribute_handler(path: String, id: crate::action::ActionId, handler: HandlerFn) {
+    attribute_handler_entry(path, HandlerId::Action(id), handler);
+}
+
+pub(crate) fn attribute_edit_handler(path: String, edit: crate::menu::Edit, handler: HandlerFn) {
+    attribute_handler_entry(path, HandlerId::Edit(edit), handler);
+}
+
+fn attribute_handler_entry(path: String, id: HandlerId, handler: HandlerFn) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         if let Some(frame) = pass.building.last_mut() {
@@ -1484,25 +1538,32 @@ thread_local! {
     /// stamp of the pass, never retained interaction state.
     static HANDLERS: RefCell<HashMap<crate::action::ActionId, (usize, HandlerFn)>> =
         RefCell::new(HashMap::default());
+    /// Standard edits retain their registration path for focus-scoped dispatch.
+    static EDIT_HANDLERS: RefCell<HashMap<(String, crate::menu::Edit), HandlerFn>> =
+        RefCell::new(HashMap::default());
 }
 
 /// Reassembles the handler map from the entries under the root that
 /// carry one + the root region. Precedence: the DEEPEST path wins
 /// (innermost in the tree); a depth tie → the last one mounted
 /// (deterministic from the path order, documented as NON-contractual —
-/// the semantic tiebreak arrives with key contexts).
+/// the semantic tiebreak arrives with key contexts). Standard edits retain
+/// every registration path; their nearest ancestor is chosen at dispatch.
 pub(crate) fn assemble_handlers(root: &str) {
     let mut map: HashMap<crate::action::ActionId, (usize, HandlerFn)> = HashMap::default();
-    let place = |map: &mut HashMap<crate::action::ActionId, (usize, HandlerFn)>,
-                     path: &str,
-                     id: crate::action::ActionId,
-                     handler: HandlerFn| {
-        let depth = path.split('/').count();
-        match map.get(&id) {
-            Some((existing, _)) if *existing > depth => {}
-            _ => {
-                map.insert(id, (depth, handler));
+    let mut edits = HashMap::default();
+    let mut place = |path: &str, id: HandlerId, handler: HandlerFn| match id {
+        HandlerId::Action(id) => {
+            let depth = path.split('/').count();
+            match map.get(&id) {
+                Some((existing, _)) if *existing > depth => {}
+                _ => {
+                    map.insert(id, (depth, handler));
+                }
             }
+        }
+        HandlerId::Edit(edit) => {
+            edits.insert((path.to_owned(), edit), handler);
         }
     };
     let carriers = carriers_under(root, |live| live.handler_entries.iter().cloned().collect());
@@ -1511,17 +1572,20 @@ pub(crate) fn assemble_handlers(root: &str) {
         for path in &carriers {
             if let Some(entry) = retained.get(path.as_str()) {
                 for (key, id, handler) in entry.handlers() {
-                    place(&mut map, key, *id, handler.clone());
+                    place(key, *id, handler.clone());
                 }
             }
         }
     });
-    PASS.with(|pass| {
-        for (key, id, handler) in std::mem::take(&mut pass.borrow_mut().root_handlers) {
-            place(&mut map, &key, id, handler);
+    LIVE.with(|live| {
+        if let Some(region) = live.borrow().root_regions.get(root) {
+            for (key, id, handler) in &region.handlers {
+                place(key, *id, handler.clone());
+            }
         }
     });
     HANDLERS.with(|handlers| *handlers.borrow_mut() = map);
+    EDIT_HANDLERS.with(|handlers| *handlers.borrow_mut() = edits);
 }
 
 /// Is a handler for the id mounted in the tree? The question a menu asks
@@ -1544,6 +1608,29 @@ pub(crate) fn run_handler(id: crate::action::ActionId) -> bool {
         }
         None => false,
     }
+}
+
+fn edit_handler(path: &str, edit: crate::menu::Edit) -> Option<HandlerFn> {
+    EDIT_HANDLERS.with(|handlers| {
+        handlers
+            .borrow()
+            .iter()
+            .filter(|((owner, candidate), _)| *candidate == edit && covers(owner, path))
+            .max_by_key(|((owner, _), _)| owner.len())
+            .map(|(_, handler)| Rc::clone(handler))
+    })
+}
+
+pub(crate) fn has_edit_handler(path: &str, edit: crate::menu::Edit) -> bool {
+    edit_handler(path, edit).is_some()
+}
+
+pub(crate) fn run_edit_handler(path: &str, edit: crate::menu::Edit) -> bool {
+    let Some(handler) = edit_handler(path, edit) else {
+        return false;
+    };
+    handler();
+    true
 }
 
 /// Dirty views the walk did not reach (a skipped parent, or a row a keyed
@@ -1651,14 +1738,23 @@ pub(crate) fn hover_watched() -> bool {
     LIVE.with(|live| live.borrow().hover_keys > 0)
 }
 
+/// Whether the retained target still has an activation callback.
+pub fn has_action(path: &str) -> bool {
+    LIVE.with(|live| live.borrow().click(path).is_some())
+}
+
 /// Fires the target's action (the key comes from the hit-test).
 /// `false` = target not registered (the identity died between frame and
 /// click — harmless).
 pub(crate) fn run_action(path: &str, clicks: u8) -> bool {
+    run_action_with_modifiers(path, clicks, crate::action::Modifiers::NONE)
+}
+
+pub(crate) fn run_action_with_modifiers(path: &str, clicks: u8, modifiers: crate::action::Modifiers) -> bool {
     let action = LIVE.with(|live| live.borrow().click(path));
     match action {
         Some(action) => {
-            action(clicks);
+            action(clicks, modifiers);
             true
         }
         None => false,
@@ -1902,8 +1998,30 @@ fn editor_at(path: &str) -> Option<EditorFn> {
     LIVE.with(|live| live.borrow().editors.get(path).cloned())
 }
 
-/// The text a field's editor last lent: the cell a new render of the same
-/// field carries on, so its unchanged text is not copied again.
+/// Retain history across a render or an unambiguous named-field move.
+pub(crate) fn retained_editor_history(path: &str) -> Option<crate::field_history::FieldHistory> {
+    if let Some(editor) = editor_at(path) { return editor.history; }
+    let chain = motor::identity::named_chain(path);
+    if chain.is_empty() { return None; }
+    // Render is building a new scene while the last assembled scene may be
+    // another window. Use this pass's root, not the input registry's marker.
+    let root = motor::identity::current_pass_root()?;
+    LIVE.with(|live| {
+        let live = live.borrow();
+        let mut candidates = live.editors.iter().filter(|(old, _)|
+            covers(&root, old) && motor::identity::named_chain(old) == chain);
+        let (_, editor) = candidates.next()?;
+        if candidates.next().is_some() { return None; }
+        editor.history.clone()
+    })
+}
+
+/// The currently mounted field's own history; never another named input.
+pub(crate) fn editor_history(path: &str) -> Option<crate::field_history::FieldHistory> {
+    editor_at(path)?.history
+}
+
+/// The shared text cache carried across renders of the same field.
 pub(crate) fn editor_text(path: &str) -> Option<LentText> {
     LIVE.with(|live| live.borrow().editors.get(path).map(|editor| editor.text.clone()))
 }
@@ -1951,7 +2069,7 @@ thread_local! {
     /// effect generation it was built for. It has its own key: the
     /// derived tables are also rebuilt outside a pass, when a scene
     /// becomes current again, and that rebuild makes no queue.
-    static ASSEMBLED_EFFECTS: RefCell<Option<(String, u64, Rc<[EffectFn]>)>> =
+    static ASSEMBLED_EFFECTS: RefCell<Option<AssembledEffects>> =
         const { RefCell::new(None) };
 }
 
@@ -1972,40 +2090,78 @@ fn fingerprint_ptr<T: ?Sized>(shared: &Rc<T>) -> u64 {
 /// keys out — the retention never holds those, so a fingerprint built
 /// from it must not see them either.
 fn tables_fingerprint(live: &Live, without_root: bool) -> u64 {
-    let skip = |keys: &[String], key: &str| without_root && keys.iter().any(|root| root == key);
+    let skip = |keys: fn(&RootRegion) -> &[String], key: &str| {
+        without_root
+            && live
+                .root_regions
+                .values()
+                .any(|region| keys(region).iter().any(|root| root == key))
+    };
     let mut total = 0u64;
     let mut mix = |part: u64| total = total.wrapping_mul(31).wrapping_add(part);
     // a click key whose owner left waits for the idle: it is not live
     mix(live.actions.iter().fold(0u64, |sum, (key, registered)| {
-        if skip(&live.root_keys.actions, key) || !registered.is_live() {
+        if skip(|region| &region.actions, key) || !registered.is_live() {
             sum
         } else {
             sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(&registered.action))
         }
     }));
     mix(live.copies.iter().fold(0u64, |sum, (key, copy)| {
-        if skip(&live.root_keys.copies, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(copy)) }
+        if skip(|region| &region.copies, key) {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(copy))
+        }
     }));
     mix(live.editors.iter().fold(0u64, |sum, (key, editor)| {
-        if skip(&live.root_keys.editors, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(&editor.command)) }
+        if skip(|region| &region.editors, key) {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(&editor.command))
+        }
     }));
     mix(live.splits.iter().fold(0u64, |sum, (key, split)| {
-        if skip(&live.root_keys.splits, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(split)) }
+        if skip(|region| &region.splits, key) {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(split))
+        }
     }));
     mix(live.scrolls.iter().fold(0u64, |sum, (key, scroll)| {
-        if skip(&live.root_keys.scrolls, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(scroll)) }
+        if skip(|region| &region.scrolls, key) {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(scroll))
+        }
     }));
     mix(live.measures.iter().fold(0u64, |sum, (key, measure)| {
-        if skip(&live.root_keys.measures, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(measure)) }
+        if skip(|region| &region.measures, key) {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(measure))
+        }
     }));
     mix(live.webviews.keys().fold(0u64, |sum, key| {
-        if skip(&live.root_keys.webviews, key) { sum } else { sum.wrapping_add(fingerprint_key(key)) }
+        if skip(|region| &region.webviews, key) {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key))
+        }
     }));
     mix(live.customs.iter().fold(0u64, |sum, key| {
-        if skip(&live.root_keys.customs, key) { sum } else { sum.wrapping_add(fingerprint_key(key)) }
+        if skip(|region| &region.customs, key) {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key))
+        }
     }));
     mix(live.keyed_customs.iter().fold(0u64, |sum, key| {
-        if skip(&live.root_keys.customs, key) { sum } else { sum.wrapping_add(fingerprint_key(key)) }
+        if skip(|region| &region.customs, key) {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key))
+        }
     }));
     total
 }
@@ -2020,6 +2176,17 @@ pub(crate) fn input_fingerprint() -> u64 {
         map.borrow().values().fold(0u64, |sum, (depth, handler)| {
             sum.wrapping_add((*depth as u64).wrapping_mul(0x9E37_79B9) ^ fingerprint_ptr(handler))
         })
+    }));
+    mix(EDIT_HANDLERS.with(|map| {
+        map.borrow()
+            .iter()
+            .fold(0u64, |sum, ((path, edit), handler)| {
+                sum.wrapping_add(
+                    fingerprint_key(path)
+                        ^ fingerprint_key(edit.title())
+                        ^ fingerprint_ptr(handler),
+                )
+            })
     }));
     mix(ACTIVE_CONTEXTS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(fingerprint_key(key)))));
     mix(DECLARED_CONTEXTS.with(|list| {
@@ -2060,7 +2227,7 @@ fn slots_match(live: &Live, rebuilt: &Live) -> bool {
 }
 
 /// Is the root region of THIS pass empty? Registrations made outside
-/// every boundary live there, and only for one pass.
+/// every boundary wait here until the completed pass publishes them.
 fn root_region_is_empty() -> bool {
     PASS.with(|pass| {
         let pass = pass.borrow();
@@ -2142,29 +2309,44 @@ pub(crate) fn set_assembled_root(root: &str, had_root_region: bool) {
     ASSEMBLED_AT.with(|at| at.set(Some((handlers, contexts, had_root_region))));
 }
 
-/// The root region's registrations — made outside every boundary —
-/// enter the tables for ONE pass: the last region's leave first, this
-/// pass's go in, and their keys are kept so the next assembly can take
-/// them out again.
-pub(crate) fn refresh_root_region() {
-    let (actions, copies, editors, splits, scrolls, measures, webviews, customs) =
-        PASS.with(|pass| {
-            let mut pass = pass.borrow_mut();
-            (
-                std::mem::take(&mut pass.root_actions),
-                std::mem::take(&mut pass.root_copies),
-                std::mem::take(&mut pass.root_editors),
-                std::mem::take(&mut pass.root_splits),
-                std::mem::take(&mut pass.root_scrolls),
-                std::mem::take(&mut pass.root_measures),
-                std::mem::take(&mut pass.root_webviews),
-                std::mem::take(&mut pass.root_customs),
-            )
-        });
+/// Publishes the finished pass's root input registrations. Only a render
+/// replaces them; input-only activation reads the stored region. Effects
+/// remain pass-owned and are deliberately absent from this storage.
+pub(crate) fn refresh_root_region(root: &str) -> bool {
+    let (
+        actions,
+        copies,
+        editors,
+        splits,
+        scrolls,
+        measures,
+        webviews,
+        customs,
+        handlers,
+        contexts,
+    ) = PASS.with(|pass| {
+        let mut pass = pass.borrow_mut();
+        (
+            std::mem::take(&mut pass.root_actions),
+            std::mem::take(&mut pass.root_copies),
+            std::mem::take(&mut pass.root_editors),
+            std::mem::take(&mut pass.root_splits),
+            std::mem::take(&mut pass.root_scrolls),
+            std::mem::take(&mut pass.root_measures),
+            std::mem::take(&mut pass.root_webviews),
+            std::mem::take(&mut pass.root_customs),
+            std::mem::take(&mut pass.root_handlers),
+            std::mem::take(&mut pass.root_contexts),
+        )
+    });
     LIVE.with(|live| {
         let mut live = live.borrow_mut();
-        live.drop_root_region();
-        let mut keys = RootKeys::default();
+        let replaced = live.drop_root_region(root);
+        let mut keys = RootRegion {
+            handlers,
+            contexts,
+            ..RootRegion::default()
+        };
         for (key, action) in actions {
             keys.actions.push(key.to_string());
             live.insert_action(key, action, None);
@@ -2200,8 +2382,56 @@ pub(crate) fn refresh_root_region() {
             }
             live.customs.insert(key);
         }
-        live.root_keys = keys;
-    });
+        if !keys.is_empty() {
+            live.root_regions.insert(root.to_string(), keys);
+        }
+        replaced
+    })
+}
+
+/// Retires one scene's root input registrations and derived-table cache.
+fn clear_root_region(root: &str) {
+    if LIVE.with(|live| live.borrow_mut().drop_root_region(root)) {
+        clear_assembled_under(root);
+    }
+}
+
+/// Releases a closed or reset scene's root inputs even when another scene
+/// currently owns the derived tables. State and effects keep their own lifecycle.
+pub(crate) fn forget_root_inputs(root: &str) {
+    // A shell may keep its Runtime in TLS. During thread teardown the live
+    // tables or a derived table may already have released their callbacks.
+    let Ok(regions) = LIVE.try_with(|live| {
+        live.borrow()
+            .root_regions
+            .keys()
+            .filter(|path| covers(root, path))
+            .cloned()
+            .collect::<Vec<_>>()
+    }) else {
+        return;
+    };
+    for region in regions {
+        clear_root_region(&region);
+    }
+}
+
+fn clear_assembled_under(root: &str) {
+    let was_current = ASSEMBLED_ROOT
+        .try_with(|slot| {
+            slot.borrow()
+                .as_deref()
+                .is_some_and(|active| covers(root, active))
+        })
+        .unwrap_or(false);
+    if was_current {
+        let _ = ASSEMBLED_ROOT.try_with(|slot| *slot.borrow_mut() = None);
+        let _ = ASSEMBLED_AT.try_with(|slot| slot.set(None));
+        let _ = HANDLERS.try_with(|handlers| handlers.borrow_mut().clear());
+        let _ = EDIT_HANDLERS.try_with(|handlers| handlers.borrow_mut().clear());
+        let _ = ACTIVE_CONTEXTS.try_with(|contexts| contexts.borrow_mut().clear());
+        let _ = DECLARED_CONTEXTS.try_with(|contexts| contexts.borrow_mut().clear());
+    }
 }
 
 /// Removes the entries at `paths` from the retention, and their
@@ -2228,7 +2458,7 @@ fn drop_entries<P: AsRef<str>>(paths: &[P]) {
                         // the entry's memory — a layout tree, a value, the
                         // bindings' objects — is freed when the page is
                         // idle, not inside the frame that let it go
-                        graveyard.push(entry);
+                        graveyard.push(RetiredEntry(entry));
                     }
                 }
                 if graveyard.len() > buried {
@@ -2243,7 +2473,7 @@ thread_local! {
     /// Entries that left the retention and wait for an idle moment to
     /// be freed: a thousand rows that leave a list are a thousand layout
     /// trees, and the frame that drops them must not pay their frees.
-    static GRAVEYARD: RefCell<Vec<Box<Entry>>> = const { RefCell::new(Vec::new()) };
+    static GRAVEYARD: RefCell<Vec<RetiredEntry>> = const { RefCell::new(Vec::new()) };
     /// The trees re-runs replaced, waiting for the same idle moment.
     static REPLACED: RefCell<Vec<Rc<Held>>> = const { RefCell::new(Vec::new()) };
     /// Bytes in immutable field snapshots replaced since the last release
@@ -2410,12 +2640,8 @@ pub(crate) fn forget_under(root: &str) {
             .collect()
     });
     drop_entries(&doomed);
-    ASSEMBLED_ROOT.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.as_deref() == Some(root) {
-            *slot = None;
-        }
-    });
+    forget_root_inputs(root);
+    clear_assembled_under(root);
 }
 
 /// Identities swept by `end_pass`: their entries fall with them.
@@ -2507,7 +2733,7 @@ pub(crate) fn sweep_stale(root: &str) {
                 let mut fall = |path: &Rc<str>, entry: Box<Entry>| {
                     live.unindex_leaving(path, &entry);
                     motor::identity::retire_view(path);
-                    graveyard.push(entry);
+                    graveyard.push(RetiredEntry(entry));
                 };
                 for run in &runs {
                     sweep_under(&mut retained, run, visit, &mut fall);
@@ -2609,9 +2835,6 @@ fn sweep_under(
 /// callbacks. Unlike an unmount, invalidation preserves the identity/read graph
 /// until the new pass replaces it; the owning runtime immediately renders next.
 pub(crate) fn clear_under(root: &str) {
-    let was_current = ASSEMBLED_ROOT.with(|slot| {
-        slot.borrow().as_deref().is_some_and(|active| covers(root, active))
-    });
     RETAINED.with(|retained| {
         let mut retained = retained.borrow_mut();
         LIVE.with(|live| {
@@ -2619,15 +2842,10 @@ pub(crate) fn clear_under(root: &str) {
             for (path, entry) in retained.extract_if(.., |path, _| covers(root, path)) {
                 live.unindex(&path, &entry);
             }
-            if was_current {
-                live.drop_root_region();
-            }
         });
     });
-    if was_current {
-        ASSEMBLED_ROOT.with(|slot| *slot.borrow_mut() = None);
-        ASSEMBLED_AT.with(|slot| slot.set(None));
-    }
+    forget_root_inputs(root);
+    clear_assembled_under(root);
 }
 
 /// Drops the whole retention — the next pass runs every body (the
@@ -2663,6 +2881,7 @@ pub(crate) fn reset_world() {
     ACTIVE_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
     DECLARED_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
     HANDLERS.with(|handlers| handlers.borrow_mut().clear());
+    EDIT_HANDLERS.with(|handlers| handlers.borrow_mut().clear());
 }
 
 pub(crate) fn end_pass() {
@@ -3201,7 +3420,11 @@ mod tests {
         assert!(run_action(&key, 1), "the row that came back answers");
         assert_eq!(all[1].presses.get(), 1);
         let _ = collect_garbage();
-        assert_eq!(click_keys("[2]"), [key.clone()], "the idle kept the new registration");
+        assert_eq!(
+            click_keys("[2]"),
+            std::slice::from_ref(&key),
+            "the idle kept the new registration"
+        );
         assert!(run_action(&key, 1));
         assert_eq!(all[1].presses.get(), 2);
 
@@ -3747,3 +3970,7 @@ mod tests {
         check("a row added");
     }
 }
+
+#[cfg(test)]
+#[path = "root_region_tests.rs"]
+mod root_region_tests;

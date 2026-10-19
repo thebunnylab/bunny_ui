@@ -83,6 +83,24 @@ Registering the url scheme is the platform's own configuration (the
 bundle's `Info.plist`, the registry, a `.desktop` file), and stays
 the app's to write.
 
+On macOS, an associated HTTP(S) link arrives through
+`application:continueUserActivity:restorationHandler:` with
+`NSUserActivityTypeBrowsingWeb`. The shell forwards its `webpageURL` as one
+`Reopened` argument, preserving the URL fragment. Subscribe before creating the
+native app so a cold launch is heard too. Other activity types and missing URLs
+are not handled. The shell creates no restorable responder and does not retain
+the optional restoration block.
+
+The application still validates its own trusted origin and parameters, and owns
+its signed associated-domain entitlement and website association file. Receiving
+an event grants no access and must not implicitly accept an invitation. Sensitive
+links must stay out of logs and disk-backed instance spools: a bundled macOS app
+receives this event directly in memory. The delegate regression uses real
+Foundation activity/URL objects and the registered Objective-C method; it does
+not prove a deployed website association or system launch of a signed bundle.
+See Apple's [universal-link integration](https://developer.apple.com/documentation/xcode/supporting-universal-links-in-your-app)
+and [AppKit delegate contract](https://developer.apple.com/documentation/appkit/nsapplicationdelegate/application(_:continue:restorationhandler:)).
+
 ## More than one window
 
 A mail client detaches its composer; a workbench opens a second
@@ -139,6 +157,53 @@ iOS `run` hands the process
 to UIKit, which never returns, and on Android it hands the window to
 the activity, which was running already, and returns.
 
+## Retained visibility and close requests
+
+The desktop shells expose `App::hide`, `show` and `visibility` for a live
+`WindowId`. Hiding preserves the runtime, editor draft and logical focus;
+background tasks still wake through the app's existing channel. Native
+presentation, including child dialogs and popups, stays suspended until show.
+An ID denotes one lifetime, not a reusable native address: a stale or foreign
+ID returns `WindowError::StaleWindow`. Explicit `close` on such an ID is a no-op.
+
+```rust
+use bunny_ui::window::{CloseAction, WindowVisibility};
+
+// The app retains this window and its editor when its close button is used.
+app.on_close_requested(main, |_| CloseAction::Hide)?;
+match app.visibility(main)? {
+    WindowVisibility::Shown => app.hide(main)?,
+    WindowVisibility::Hidden => app.show(main)?,
+}
+// Quit and explicit close bypass the user-close policy.
+app.quit();
+```
+
+`CloseAction::Close` is the default. `Cancel` keeps the window open while, for
+example, a save prompt is answered; the application later calls `close` after
+Save/Discard, or leaves it open after Cancel. `request_close` runs the same
+policy as the native close button. A policy can replace or remove itself,
+open another window, or explicitly close its own window. Recursive requests
+for the same window return `WindowError::CloseInProgress`; native recursion
+cancels. `clear_close_handler` restores default handling. Closing the last
+window retains the shell's usual exit behavior; hiding the last does not exit.
+
+`Shown` means submitted to the window system. It does not promise unobscured
+pixels, focus, successful foreground activation or human interaction. Wayland
+show starts a fresh configure/ack/map cycle; buffers cannot attach while
+hidden or before that configure. The shell restores title, app ID and size
+constraints and rebuilds retained child surfaces after unmapping. On macOS,
+Windows and X11 the native window remains allocated while ordered out/hidden
+or unmapped. Mobile shells do not expose this desktop lifecycle contract.
+
+The native `window_lifecycle` test uses subprocesses to witness policy,
+retained drafts, stale IDs, callback reentrancy, all-hidden worker wake and
+final exit. AppKit `performClose` and Win32 `WM_CLOSE` exercise native request
+routing. The Linux probe uses a real compositor/server for mapping and the
+public close request for policy; it does not prove a compositor-generated
+close action. These checks do not replace physical input, tray/global-hotkey
+interaction or human assistive-technology testing.
+
 ## What each platform answers
 
 | | macOS | Windows | Linux | iOS | Android |
@@ -147,7 +212,7 @@ the activity, which was running already, and returns.
 | notification | UserNotifications, a category per button set | a WinRT toast under the process's AppUserModelID | `org.freedesktop.Notifications` `Notify` | UserNotifications, the same module as the Mac's; the system asks once | `NotificationManager` over JNI, one channel, a button per action; the person asked once at the first post |
 | activation | the center's delegate, while running or launched by the click | the toast's `Activated` event, while running | `ActionInvoked` on the session bus | the center's delegate, while running or launched by the tap | the activity RE-CREATED with the tap's intent, read at create — while running or as the launch |
 | second launch | the spool; a BUNDLED app reopens through the delegate instead | the spool | the spool | the system's own: one process by construction | the system's own: one activity by construction |
-| a url handed over | `application:openURLs:` → `Reopened` | an argument → the spool | an argument → the spool | the scene's `scene:openURLContexts:`, or the launch's `URLContexts` → `Reopened` | not yet — a `NativeActivity` hears no new intent |
+| a url handed over | `application:openURLs:` or a web browsing activity → `Reopened` | an argument → the spool | an argument → the spool | the scene's `scene:openURLContexts:`, or the launch's `URLContexts` → `Reopened` | not yet — a `NativeActivity` hears no new intent |
 | languages | `NSLocale.preferredLanguages`, and `NSCurrentLocaleDidChangeNotification` while running | `GetUserPreferredUILanguages`, read again on `WM_SETTINGCHANGE` | `LANGUAGE`, else `LC_ALL`, `LC_MESSAGES`, `LANG` — once; the environment does not move | `NSLocale.preferredLanguages`; a change relaunches the app | the configuration's `LocaleList`, read again on every configuration change |
 
 Five honest edges. macOS shows notifications for a BUNDLE, never a
@@ -170,6 +235,72 @@ app that already EXITED needs a COM server the registry knows — both
 the app's own setup. Linux announces sleep only where logind runs,
 which is where a laptop runs.
 
+## Persistent dialog placement
+
+A `.dialog` can opt into native placement with
+`DialogSpec::titled("Inspector").geometry(controller.clone())`, where
+`controller` is `bunny_ui::window::DialogGeometry`. Keep one controller per
+independently open dialog. `DialogGeometry::new()` retains the usual initial
+placement; `DialogGeometry::restoring(saved_placement)` requests a saved content
+frame. Minimum sizes and available desktop work areas still apply. Alerts
+retain their ordinary centered, content-sized policy.
+
+`controller.on_change(|result| { ... })` receives actual native geometry or a
+restoration error on the UI thread, outside native and renderer borrows. Save
+successful `WindowGeometry::placement()` values in the application's own
+storage, including the `DesktopSpace` tag; pass one back when constructing the
+controller in a fresh process. The framework adds no serialization or storage
+dependency. `geometry()` retains the last actual observation after dismissal;
+reopening prefers it to the original restoration request. A request alone never
+populates this getter. `last_error()` retains the last failure of the current
+presentation even if later native observations succeed.
+
+Each opening owns a separate presentation lease. Dismissal, controller
+replacement and parent destruction invalidate its queued events, including
+when the app retains the runtime or AppKit pools the native window. Replacing
+or clearing the callback invalidates events captured for the old subscription.
+Callbacks may close or reopen windows; reentrant observations retain their
+order and only consecutive identical results are suppressed. Simultaneously
+attaching one controller to multiple presentations reports `GeometryInUse` and
+leaves the original presentation's lease intact.
+
+AppKit positions use points relative to the primary display's top-left; Win32
+and X11 positions use their tagged desktop/root pixels. A position from a
+different desktop space is rejected before changing size. Wayland rejects
+requests containing global position. Its dialog size and scale observations
+come from actual native buffer commits, independently of the pending layout
+request. A compositor-controlled size cannot be replaced by a client request.
+Scene-only hosts, including DOM flow and canvas islands, explicitly report
+`Unsupported` and produce no native geometry.
+
+The `dialog_geometry` native test covers restore, close/reopen, live controller
+replacement, invalid coordinate spaces, minimum sizes, missing displays,
+closing the parent from a callback and persistence into a second process.
+Linux runs with `BUNNY_DIALOG_GEOMETRY_PROBE=1` under the X11/Wayland display
+harness. These are native API observations, not physical input, pixel,
+screen-reader or mixed-display qualification.
+
+## macOS dialog modality
+
+`.dialog` creates a child `NSWindow` with framework-managed modality. It is
+not an AppKit sheet or an OS-modal session. Each scene owns its ordered
+dialog stack: its parent and lower dialogs refuse key/main status, while
+independent scenes remain eligible. The stack follows layout order, including
+when a pooled dialog reopens. Ending modality restores each standard button's
+previous enabled state; it cannot enable a prohibited minimize button.
+
+Opening requests focus for the top dialog. Closing the key dialog requests
+focus for the remaining top dialog or its parent; a background dismissal
+does not request focus away from another scene. The OS decides whether to
+grant those requests. Closing a parent retires only its own modal scope.
+
+`cargo test -p bunny-ui-macos --test window_modality` runs the public dialog
+API on the process main thread and inspects real AppKit eligibility and button
+state. It covers independent modal scopes, nesting, repeated reopen, retained
+hide/show and parent teardown. These observations do not verify synthetic
+pointer blocking, granted focus, visible pixels or mixed-display DPI; those
+require the separate native interaction qualification.
+
 ## Native window presentation regression
 
 On macOS, each top-level window and pooled dialog has its own presenter,
@@ -186,3 +317,55 @@ capture denial fails qualification; the script does not turn it into a skip.
 `BUNNY_PRESENT=cpu` exercises the explicit CPU fallback with the same probe.
 The output directory must be fresh, so a stage acknowledgement cannot come
 from an earlier run.
+
+## System appearance and palette ownership
+
+`theme::system_appearance()` returns the latest `Option<Appearance>` reported
+by the native shell. Read it inside a component body to derive custom colors;
+changed observations invalidate retained bodies in every runtime. `None` means
+unavailable or no preference, not an observed light appearance.
+
+The built-in tokens initially follow the system. `theme::install(palette)`
+selects application-owned tokens; later native changes remain observable but
+cannot overwrite that palette. `theme::follow_system()` opts back into automatic
+light/dark tokens using the latest observation, with light as the documented
+fallback for `None`. Repeated identical native reports are inert. Ownership is
+process/UI-thread policy, independent of the version counter and which window
+opened first.
+
+macOS captures application-effective appearance at window creation and observes
+[`NSApplication.effectiveAppearance` with KVO](https://developer.apple.com/documentation/uikit/supporting-dark-mode-in-your-interface).
+It uses AppKit's best-match operation for light/dark, including high-contrast
+variants, and defers scene delivery onto the existing main-loop wake. A
+window-specific native override is not a new system preference and cannot
+prevent the application observer from delivering changes. Windows reports
+its initial registry preference and refreshes it on
+[`WM_SETTINGCHANGE`](https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-settingchange).
+iOS trait and Android configuration events use the same ownership policy.
+Linux subscribes before reading the initial portal preference and receives
+[`Settings.SettingChanged`](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Settings.html)
+through the X11 and Wayland event loops. The UI thread owns one private session
+connection and polls libdbus-provided watches, including outgoing readiness.
+Messages must match the current portal owner, object, interface, key and type.
+No preference and unknown numeric schemes become `None`; malformed or unrelated
+signals do not replace a valid observation. Portal owner loss clears the value;
+reacquisition reads the new owner's current value with a bounded request.
+An installed portal can activate on the initial Read. A missing or disconnected
+session bus remains unavailable until process restart. Native scenes receive
+changes outside bus and display borrows. No settings timer, background thread
+or new runtime dependency is involved. Shells without an appearance adapter
+leave the observation unavailable.
+
+`cargo test -p bunny-ui-core --test system_appearance --all-features` covers
+palette ownership and retained scenes. `cargo test -p bunny-ui-macos --test
+system_appearance` changes only the test process's application appearance and
+checks native callback delivery, later windows and teardown of the first window.
+It does not change the user's system preferences or claim physical input,
+visible pixels, or observation of a system-settings interaction.
+
+The Linux `system_appearance` fixture uses an isolated fake portal on a real
+session bus, native X11/Wayland windows and normal/paranoid runs in
+`scripts/check-linux-accessibility.sh`. It checks initial/live values, explicit
+palette ownership, malformed/unrelated signals, service loss/reacquisition, session-bus disconnect and
+surviving windows. This verifies protocol integration and scene evaluation,
+not an actual desktop settings panel, physical input or presented pixels.

@@ -1,5 +1,35 @@
 # A webview
 
+## Deferred Apple HTML preparation
+
+The macOS host exports `HtmlPreparation::request()`. The returned non-Send
+resource prepares a two-engine WebKit reserve. Requesting it performs no native
+allocation; after a native frame is presented, the host creates the engines and
+starts loading sealed empty documents asynchronously. Eligible local, read-only,
+network-denied documents claim them. Claimed engines keep their capacity slot
+while mounted, so displaying a prepared document never triggers a speculative
+fresh-engine refill. Retirement returns the slot through the existing sealed-blank
+barrier; leaving the eligible document policy or sweeping the exact host releases
+it. Editable documents, remote-image permission and nonempty bases use their
+ordinary creation path.
+
+Fixed native configuration, including supported inspection, is applied once
+when allocating an engine, before its reserve blank navigation. Claiming a
+prepared engine does not repeat this setup. Preparation attaches no window
+and injects no runtime warm-up scripts.
+
+Each claimed view transfers its retain to the mounted host. A retired eligible
+view can return to the bounded reserve only after detachment, removal of all
+scripts/handlers, revoked routing and a confirmed sealed blank navigation.
+Ready, cleaning and claimed views share the same two-engine budget. A view with back
+history is discarded instead of crossing document identities. Mount-specific
+bridge channels reject reports from an earlier mount; active panes never share
+an engine. Remote-enabled documents and editors cannot enter this reserve. Dropping the resource stops and
+releases unclaimed engines. Navigation identity rejects late events from the
+preparation page after a view was claimed. Native first-session measurements
+must establish its benefit; a populated reserve is not performance approval.
+
+
 *Status: the native host, the macOS webview and its instrumentation
 floor — user scripts, the message bus, navigation reports (both legs:
 the commit and the refusal), eval with the value coming back, console
@@ -47,6 +77,13 @@ Two pieces, and the first is more general than the second.
 A box owned by a platform view. The framework positions it, sizes it,
 clips it to the box, shows and hides it with the subtree — and keeps
 **paint order the truth**, island or no island.
+
+On macOS and iOS, a new webview registers its instrumented mount, then the
+host attaches and sizes the tenant before its first document or URL submission.
+The synchronous placement continuation adds no blank navigation or task. A
+retained host still compares its stamp and updates the existing view. The
+shared Apple `webview::create` entry point retains immediate navigation for
+callers that own placement themselves; `create_placed` accepts the continuation.
 
 The platform's law is that a native child view composites above the
 scene, and the framework answers it on two roads rather than letting
@@ -136,6 +173,16 @@ name — never silence that looks like a slow page. `snapshot` answers
 the same way, with the pixels the engine shows right now. Opening the
 engine's own inspector stays the OS's door (on macOS the view is
 inspectable: right-click, Inspect Element).
+
+Under `bunny preview` and Studio the app has no window, and a page is
+the one thing on the frame the host cannot draw: its box rides the
+wire as a placeholder with its kind and rect. On the Mac the shell
+opens an offscreen desk for the preview host — a window nobody sees,
+one `WKWebView` per hosted box — and the page's own snapshot rides
+the frame as its picture, taken when the load finishes and again
+whenever its pixels move, so the dock and `bunny preview --png` show
+the page. `--engine house` keeps the placeholder: a golden must be the
+same on every OS, and a page's pixels are the platform's.
 
 The input door is the hand an app lends the page. Its vocabulary has
 two halves: `click`, `hover`, `scroll`, `type_text` and `key` are what
@@ -382,3 +429,63 @@ all — and an API grown on the richest backend would be wrong on the
 other two. The capability table
 above is the acceptance sheet: each cell either works or refuses by
 name.
+
+
+### Local documents inside a scrolling reader
+
+On macOS, a read-only local document can give vertical wheel gestures to the
+surrounding scene:
+
+```rust,ignore
+webview_html(&message.html, "", NetworkPolicy::Deny)
+    .scroll_with_parent()
+    .frame_height(natural_body_height)
+```
+
+The enclosing reader owns vertical motion, including trackpad momentum. The
+engine keeps horizontal gestures, links and text selection. Native hit testing
+selects a host proxy only for wheel events; the original NSEvent reaches its
+owner unchanged, with its deltas, modifiers and phases. Axis ownership survives
+finger lift and momentum; a new physical gesture or independent wheel step
+chooses again. Zero-delta gesture bookends reach both owners without movement.
+
+Frame the document to its complete measured height so its end remains part of
+the outer reader. A diagnostic image-size limit must not truncate reading
+geometry. Browser URL views and editable documents retain ordinary scrolling;
+modifier order cannot transfer an editor's scrolling to its parent. Other
+platform backends retain their ordinary document handling; this policy currently
+has a macOS native implementation.
+
+`cargo test -p bunny-ui-macos --test host_scroll_native` runs a controlled native
+WebKit witness over a body taller than 6,000 points and two hosted messages.
+CG-backed NSEvents exercise native hit testing and forwarding inside the test
+application. It checks outer/inner offsets, horizontal motion, links, selection
+and default document behavior. These injected events do not certify physical
+trackpad timing, touch behavior or application-level visual acceptance.
+
+## Private native document milestones
+
+With `BUNNY_PRESENT_TRACE` enabled, Apple document hosts add `V` records on the
+same trace clock as frame settlement/presentation. Each contains only a numeric
+process-local mount and one fixed stage: `load-request`, `load-return`, `commit`,
+`finish` or `post`. No host path, HTML, URL or posted payload enters these records.
+Navigation callbacks must match the current navigation; posted milestones follow
+existing mount-channel validation. Browser pages do not emit document milestones.
+The load request precedes sealing/submission; return follows the native call.
+The `post` label means an accepted application bridge message, not DOM readiness.
+These milestones never substitute for actual presented body pixels.
+
+Each document load also emits a `U` observation immediately before its request:
+the same opaque mount number, native-window attachment and tenant width/height
+in points. `python3 scripts/check-html-placement.py <path>` requires an attached,
+nonzero tenant for each observed load in an initially visible native protocol.
+It refuses missing, detached, stale or mismatched observations. Offscreen hidden
+hosts may legitimately lack initial dimensions; this checker is for the visible
+protocol, not a claim about all hidden mounts. Geometry and attachment do not
+establish on-screen visibility, first paint or a performance improvement.
+
+Run the native reuse witness with a trace, then validate its private record
+shape and at least one navigation/post using `python3 scripts/check-html-lifecycle.py
+<path>`. Interrupted retired documents need not finish. The checker supports
+independent mounts and repeat loads; `python3 scripts/test_html_lifecycle.py`
+checks rejected payloads, impossible callbacks and interleaving.

@@ -35,6 +35,9 @@
 //! An application does not use this crate itself: `bunny_ui::app!` does,
 //! in a build with the `hot` feature of `bunny-ui`, which `bunny run`
 //! turns on.
+//!
+//! [`preview`] is the other thing a build may export: the entries of its
+//! `#[preview]` functions, looked up by name in the code that runs.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -48,6 +51,8 @@ use std::time::Instant;
 
 use bunny_ui::view::{Component, Many, NodeList, View};
 use motor::state::Context;
+
+pub mod preview;
 
 /// The shape of [`Entry`]. The app refuses a generation built for
 /// another shape, and reads none of it but this number.
@@ -134,6 +139,21 @@ impl Component for HotRoot {
 struct Generation {
     number: u32,
     entry: &'static Entry,
+    /// The library, open for as long as the app runs — where the
+    /// generation's other symbols (its previews) are looked up.
+    handle: native::Handle,
+}
+
+/// The library of the generation that runs, if one is loaded.
+fn current_handle() -> Option<native::Handle> {
+    CURRENT.with(|current| current.borrow().as_ref().map(|generation| generation.handle))
+}
+
+/// The number of the generation that runs — 0 before any loaded, then
+/// 1, 2, … as `bunny run` sends them. A host that renders previews
+/// compares it between turns to know the code moved under it.
+pub fn generation() -> u32 {
+    CURRENT.with(|current| current.borrow().as_ref().map_or(0, |generation| generation.number))
 }
 
 thread_local! {
@@ -277,11 +297,11 @@ impl Answer {
 fn swap(path: &Path) -> Answer {
     let began = Instant::now();
     match load(path) {
-        Ok(entry) => {
+        Ok((handle, entry)) => {
             let number = CURRENT.with(|current| {
                 let mut current = current.borrow_mut();
                 let number = current.as_ref().map_or(1, |generation| generation.number + 1);
-                *current = Some(Generation { number, entry });
+                *current = Some(Generation { number, entry, handle });
                 number
             });
             bunny_ui::code_changed();
@@ -291,9 +311,10 @@ fn swap(path: &Path) -> Answer {
     }
 }
 
-/// The entry of the generation at `path`, checked against this app.
-fn load(path: &Path) -> Result<&'static Entry, String> {
-    let entry = native::open(path)?;
+/// The entry of the generation at `path`, checked against this app, and
+/// the library it came from.
+fn load(path: &Path) -> Result<(native::Handle, &'static Entry), String> {
+    let (handle, entry) = native::open(path)?;
     if entry.abi != ABI {
         return Err(format!(
             "{} was built for another version of bunny-ui (its entry is {}, the app's {ABI})",
@@ -307,7 +328,7 @@ fn load(path: &Path) -> Result<&'static Entry, String> {
             path.display()
         ));
     }
-    Ok(entry)
+    Ok((handle, entry))
 }
 
 /// `BUNNY_HOT_CHECK`: the whole road without a window, for a machine
@@ -413,6 +434,29 @@ mod native {
         fn dlerror() -> *const c_char;
     }
 
+    /// A library open for as long as the app runs.
+    #[derive(Clone, Copy)]
+    pub struct Handle(*mut c_void);
+
+    impl Handle {
+        /// The program itself, with every library it loaded globally.
+        pub fn program() -> Handle {
+            // SAFETY: a NULL path opens the main program; the handle is
+            // never closed.
+            Handle(unsafe { dlopen(std::ptr::null(), RTLD_NOW) })
+        }
+
+        /// The address of `name` in this library, if it exports one.
+        pub fn symbol(self, name: &CStr) -> Option<*mut c_void> {
+            if self.0.is_null() {
+                return None;
+            }
+            // SAFETY: the handle is open and the name is NUL-terminated.
+            let pointer = unsafe { dlsym(self.0, name.as_ptr()) };
+            (!pointer.is_null()).then_some(pointer)
+        }
+    }
+
     const RTLD_NOW: c_int = 0x2;
     // a generation's own symbols stay out of the global namespace, so
     // the next generation cannot bind to them by accident
@@ -423,7 +467,7 @@ mod native {
 
     /// Loads the library at `path` for as long as the app runs, and
     /// calls its entry.
-    pub fn open(path: &Path) -> Result<&'static Entry, String> {
+    pub fn open(path: &Path) -> Result<(Handle, &'static Entry), String> {
         let name = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| format!("{} has a NUL byte in its path", path.display()))?;
         // SAFETY: `name` is a NUL-terminated path. Loading runs the
@@ -448,7 +492,7 @@ mod native {
         // the compiler that built it can link: the ABI is the same. The
         // library is never closed, so the entry lives as long as the app.
         let entry = unsafe { std::mem::transmute::<*mut c_void, fn() -> &'static Entry>(symbol) };
-        Ok(entry())
+        Ok((Handle(handle), entry()))
     }
 
     fn last_error() -> String {
@@ -474,13 +518,37 @@ mod native {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
         fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
         fn GetLastError() -> u32;
     }
 
+    /// A module loaded for as long as the app runs.
+    #[derive(Clone, Copy)]
+    pub struct Handle(*mut c_void);
+
+    impl Handle {
+        /// The program itself.
+        pub fn program() -> Handle {
+            // SAFETY: a NULL name answers the module of the program; it
+            // is never freed.
+            Handle(unsafe { GetModuleHandleW(std::ptr::null()) })
+        }
+
+        /// The address of `name` in this module, if it exports one.
+        pub fn symbol(self, name: &std::ffi::CStr) -> Option<*mut c_void> {
+            if self.0.is_null() {
+                return None;
+            }
+            // SAFETY: the module is loaded and the name is NUL-terminated.
+            let pointer = unsafe { GetProcAddress(self.0, name.as_ptr()) };
+            (!pointer.is_null()).then_some(pointer)
+        }
+    }
+
     /// Loads the library at `path` for as long as the app runs, and
     /// calls its entry.
-    pub fn open(path: &Path) -> Result<&'static Entry, String> {
+    pub fn open(path: &Path) -> Result<(Handle, &'static Entry), String> {
         let name: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
         // SAFETY: `name` is a NUL-terminated wide path. Loading runs the
         // library's initializers, and a generation is the app's own
@@ -504,7 +572,7 @@ mod native {
         // writes, in the Rust ABI of the compiler that linked the
         // framework's library; the module is never freed.
         let entry = unsafe { std::mem::transmute::<*mut c_void, fn() -> &'static Entry>(symbol) };
-        Ok(entry())
+        Ok((Handle(module), entry()))
     }
 }
 
@@ -514,7 +582,21 @@ mod native {
 
     use super::Entry;
 
-    pub fn open(path: &Path) -> Result<&'static Entry, String> {
+    /// No library opens here.
+    #[derive(Clone, Copy)]
+    pub struct Handle;
+
+    impl Handle {
+        pub fn program() -> Handle {
+            Handle
+        }
+
+        pub fn symbol(self, _name: &std::ffi::CStr) -> Option<*mut std::ffi::c_void> {
+            None
+        }
+    }
+
+    pub fn open(path: &Path) -> Result<(Handle, &'static Entry), String> {
         Err(format!("{}: this platform does not load new code", path.display()))
     }
 }

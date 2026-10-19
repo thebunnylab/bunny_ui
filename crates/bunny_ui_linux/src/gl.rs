@@ -958,11 +958,15 @@ impl GlStack {
                         }
                         // handled above, in a pass of its own
                         RunKind::Glass => continue,
+                        // this tier has no world pass yet: its ground
+                        // opens no world door, and the walk shows the
+                        // oracle's picture
+                        RunKind::World(_) => continue,
                     }
                 }
                 match run.kind {
                     // handled above, in a pass of its own
-                    RunKind::Glass => continue,
+                    RunKind::Glass | RunKind::World(_) => continue,
                     RunKind::Rects => {
                         // the run's base = the byte offset every attrib
                         // pointer carries — the SV_InstanceID trap of
@@ -1869,6 +1873,7 @@ impl GlPresenter {
             return Presented::Ok;
         }
         crate::ffi::gpu_note_present(self.window);
+        crate::ffi::observe_gl_geometry(self.window, physical, scale);
         self.retained = Some((display.clone(), physical, scale, canvas));
         Presented::Ok
     }

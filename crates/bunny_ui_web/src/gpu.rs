@@ -33,6 +33,9 @@ use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::layout::{Color, DisplayList, Size};
 use bunny_ui::text_engine::TextEngine;
 
+#[cfg(feature = "3d")]
+mod world;
+
 #[link(wasm_import_module = "./bunny_gpu.js")]
 unsafe extern "C" {
     /// `kind` 0 is the page's own surface, 1 the islands' backing
@@ -131,6 +134,45 @@ unsafe extern "C" {
 
     fn gl_draw_arrays(mode: u32, first: i32, count: i32);
     fn gl_draw_arrays_instanced(mode: u32, first: i32, count: i32, instances: i32);
+
+    // the world pass's verbs (feature `3d`): what a pass with depth,
+    // samples and indexed meshes asks of GL beyond the 2D pass
+    #[cfg(feature = "3d")]
+    fn gl_uniform4fv(location: u32, pointer: *const f32, count: usize);
+    #[cfg(feature = "3d")]
+    fn gl_buffer_data(target: u32, pointer: *const u8, len: usize, usage: u32);
+    #[cfg(feature = "3d")]
+    fn gl_delete_vertex_array(array: u32);
+    #[cfg(feature = "3d")]
+    fn gl_vertex_attrib_i_pointer(index: u32, size: i32, kind: u32, stride: i32, offset: i32);
+    #[cfg(feature = "3d")]
+    fn gl_framebuffer_renderbuffer(target: u32, attachment: u32, renderbuffer: u32);
+    #[cfg(feature = "3d")]
+    fn gl_create_renderbuffer() -> u32;
+    #[cfg(feature = "3d")]
+    fn gl_delete_renderbuffer(renderbuffer: u32);
+    /// Binds the renderbuffer and gives it storage; 0 samples is one.
+    #[cfg(feature = "3d")]
+    fn gl_renderbuffer_storage_multisample(renderbuffer: u32, samples: i32, internal: u32, width: i32, height: i32);
+    /// The read framebuffer's colour onto the draw framebuffer, the same
+    /// rectangle on both, nearest.
+    #[cfg(feature = "3d")]
+    fn gl_blit_framebuffer(width: i32, height: i32);
+    /// Up to two attachments; 0 is none.
+    #[cfg(feature = "3d")]
+    fn gl_invalidate_framebuffer(target: u32, first: u32, second: u32);
+    #[cfg(feature = "3d")]
+    fn gl_depth_func(function: u32);
+    #[cfg(feature = "3d")]
+    fn gl_depth_mask(write: u32);
+    #[cfg(feature = "3d")]
+    fn gl_cull_face(face: u32);
+    #[cfg(feature = "3d")]
+    fn gl_front_face(mode: u32);
+    #[cfg(feature = "3d")]
+    fn gl_clear_depth(depth: f32);
+    #[cfg(feature = "3d")]
+    fn gl_draw_elements_instanced(mode: u32, count: i32, kind: u32, offset: i32, instances: i32);
     #[allow(clippy::too_many_arguments)]
     fn gl_read_pixels(
         x: i32,
@@ -155,6 +197,8 @@ pub(crate) const GL_DEPTH_TEST: u32 = 0x0B71;
 pub(crate) const GL_CULL_FACE: u32 = 0x0B44;
 pub(crate) const GL_SCISSOR_TEST: u32 = 0x0C11;
 pub(crate) const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
+#[cfg(feature = "3d")]
+pub(crate) const GL_DEPTH_BUFFER_BIT: u32 = 0x0100;
 pub(crate) const GL_RGBA: u32 = 0x1908;
 pub(crate) const GL_UNSIGNED_BYTE: u32 = 0x1401;
 pub(crate) const GL_VERTEX_SHADER: u32 = 0x8B31;
@@ -726,13 +770,34 @@ fn glass_attribs(base: usize) {
 
 // MARK: - The ground (the one seam the walk asks a tier to fill)
 
-#[derive(Default)]
 struct WebGround {
     shared: Option<u32>,
     dedicated: std::collections::HashMap<u64, u32>,
     /// The feeds' textures: sized to the picture, LINEAR, written whole.
     live: std::collections::HashMap<u64, u32>,
     next: u64,
+    /// The world pass: the GL family's, over this border. Its programs
+    /// are built the first time a box paints a world.
+    #[cfg(feature = "3d")]
+    world: bunny_ui::gpu::gl_world::GlWorld<world::WebGl>,
+}
+
+impl Default for WebGround {
+    fn default() -> WebGround {
+        WebGround {
+            shared: None,
+            dedicated: std::collections::HashMap::new(),
+            live: std::collections::HashMap::new(),
+            next: 0,
+            // the 2D pass's blend, put back after each world pass
+            #[cfg(feature = "3d")]
+            world: bunny_ui::gpu::gl_world::GlWorld::new(
+                world::WebGl,
+                [GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA],
+                4,
+            ),
+        }
+    }
 }
 
 impl AtlasGround for WebGround {
@@ -845,6 +910,19 @@ impl AtlasGround for WebGround {
         if let Some(texture) = self.live.remove(&id) {
             unsafe { gl_delete_texture(texture) };
         }
+    }
+
+    #[cfg(feature = "3d")]
+    fn world(&mut self) -> Option<&mut dyn bunny_ui::gpu::world::WorldGround> {
+        let refused = self.world.failed();
+        if self.world.door().is_none() {
+            if !refused && self.world.failed() {
+                // said once: a refused door is never asked again
+                say(&format!("bunny gl: the world shaders did not build - worlds draw on the cpu: {}", last_log().trim()));
+            }
+            return None;
+        }
+        self.world.door()
     }
 }
 
@@ -1013,6 +1091,16 @@ pub(crate) fn present_window(
             say("bunny gl: the atlas overflowed twice - the frame is short");
             return;
         }
+        // the worlds that moved, each into its own target, before the 2D
+        // pass samples them
+        #[cfg(feature = "3d")]
+        {
+            let Tier { ground, atlas, batches, .. } = tier;
+            if !batches.worlds.is_empty() {
+                ground.world.encode(&batches.worlds);
+                atlas.worlds.drawn();
+            }
+        }
 
         // a pane READS what is under it, so a frame that holds one
         // cannot draw at the drawable: the drawable is write-only. It
@@ -1143,6 +1231,34 @@ pub(crate) fn present_window(
                     }
                     sprite_attribs(run.base as usize * std::mem::size_of::<SpriteInstance>());
                 }
+                // a world's target, composited with the box's veil
+                #[cfg(feature = "3d")]
+                RunKind::World(index) => {
+                    let Some((wanted, texture)) = tier
+                        .batches
+                        .world_targets
+                        .get(index as usize)
+                        .and_then(|handle| tier.ground.world.composite(*handle))
+                    else {
+                        continue;
+                    };
+                    if program != wanted {
+                        program = wanted;
+                        unsafe {
+                            gl_use_program(program);
+                            gl_bind_vertex_array(tier.pipelines.vao_sprite);
+                            gl_bind_buffer(GL_ARRAY_BUFFER, tier.pipelines.sprites);
+                        }
+                    }
+                    unsafe {
+                        gl_active_texture(GL_TEXTURE0);
+                        gl_bind_texture(GL_TEXTURE_2D, texture);
+                    }
+                    sprite_attribs(run.base as usize * std::mem::size_of::<SpriteInstance>());
+                }
+                // without the world pass the walk makes no world run
+                #[cfg(not(feature = "3d"))]
+                RunKind::World(_) => continue,
                 RunKind::Glass => {
                     let Some(targets) = tier.glass.as_ref() else { continue };
                     // the pyramid is blurred out of the scene AS DRAWN
@@ -1183,6 +1299,20 @@ pub(crate) fn present_window(
 }
 
 pub(crate) const GL_FRAMEBUFFER: u32 = 0x8D40;
+
+/// One world frame drawn by the world pass alone and read back, top row
+/// first — for the parity harness. `None` without a tier, or when the
+/// world pass cannot stand on this device.
+#[cfg(feature = "3d")]
+pub(crate) fn world_rgba(frame: &std::rc::Rc<bunny_ui::world::WorldFrame>, images: &dyn ImageEngine) -> Option<Vec<u8>> {
+    TIER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let tier = slot.as_mut()?;
+        let rgba = tier.ground.world.draw_single(frame, images);
+        unsafe { gl_finish() };
+        rgba
+    })
+}
 
 /// Reads the drawable back, top row first — GL counts from the bottom
 /// and the rasterizer counts from the top, so the rows mirror once.

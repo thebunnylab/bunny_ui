@@ -1,0 +1,22 @@
+{
+  "previews": [
+    {"ident": "card_short", "symbol": "bunny_preview__card_short", "name": "Card", "scope": "Data Display", "example": "Short", "file": "basic.rs", "line": 5, "column": 1},
+    {"ident": "card_long", "symbol": "bunny_preview__card_long", "name": "Card", "scope": "Data Display", "example": "Long title", "file": "basic.rs", "line": 13, "column": 1},
+    {"ident": "plain_button", "symbol": "bunny_preview__plain_button", "name": "plain_button", "scope": "", "example": "plain_button", "file": "basic.rs", "line": 18, "column": 1},
+    {"ident": "nested_field", "symbol": "bunny_preview__nested_field", "name": "nested_field", "scope": "Forms & Input", "example": "nested_field", "file": "basic.rs", "line": 24, "column": 5},
+    {"ident": "twin", "symbol": "bunny_preview__twin", "name": "twin", "scope": "", "example": "twin", "file": "dup_a.rs", "line": 2, "column": 1},
+    {"ident": "fine", "symbol": "bunny_preview__fine", "name": "Fine", "scope": "Status", "example": "fine", "file": "tricky.rs", "line": 23, "column": 1}
+  ],
+  "refused": [
+    {"file": "app.rs", "line": 8, "column": 1, "ident": "app", "reason": "reserved"},
+    {"file": "app.rs", "line": 10, "column": 1, "ident": "app", "reason": "reserved"},
+    {"file": "tricky.rs", "line": 10, "column": 1, "ident": "with_params", "reason": "parameters"},
+    {"file": "tricky.rs", "line": 14, "column": 1, "ident": null, "reason": "unknown_argument:label"},
+    {"file": "tricky.rs", "line": 19, "column": 1, "ident": null, "reason": "not_a_function"}
+  ],
+  "duplicates": [
+    {"ident": "twin", "kept": "dup_a.rs:2:1", "dropped": "dup_b.rs:2:1"}
+  ],
+  "unreadable": [],
+  "app": {"file": "app.rs", "line": 5, "column": 1}
+}

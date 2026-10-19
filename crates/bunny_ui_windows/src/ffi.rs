@@ -18,6 +18,21 @@ use std::sync::{Condvar, Mutex, OnceLock};
 mod accessibility;
 pub(crate) use accessibility::{Accessibility, Request as AccessibilityRequest};
 
+#[path = "confirmation.rs"]
+mod confirmation;
+#[path = "window_ops.rs"]
+mod window_ops;
+pub use confirmation::{
+    available as confirmation_available, defer as defer_confirmations, queue as queue_confirmation,
+};
+pub use window_ops::{focus_window, set_window_parent};
+#[path = "geometry_ops.rs"]
+mod geometry_ops;
+pub use geometry_ops::{
+    forget_geometry, queue_dialog_geometry, register_geometry, restore_window_placement,
+    window_geometry,
+};
+
 // MARK: - Win32 ABI surface (the platform headers, transcribed)
 
 pub type Hwnd = isize;
@@ -216,6 +231,7 @@ unsafe extern "system" {
     fn GetWindow(hwnd: Hwnd, relation: u32) -> Hwnd;
     fn GetParent(hwnd: Hwnd) -> Hwnd;
     fn ShowWindow(hwnd: Hwnd, cmd: i32) -> i32;
+    fn ShowOwnedPopups(hwnd: Hwnd, show: i32) -> i32;
     fn UpdateWindow(hwnd: Hwnd) -> i32;
     fn InvalidateRect(hwnd: Hwnd, rect: *const Rect, erase: i32) -> i32;
     fn GetClientRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
@@ -350,6 +366,33 @@ unsafe extern "system" {
     fn GlobalFree(handle: Handle) -> Handle;
     fn GlobalSize(handle: Handle) -> usize;
     fn Sleep(milliseconds: u32);
+    fn CreateWaitableTimerExW(
+        attributes: *const c_void,
+        name: *const u16,
+        flags: u32,
+        access: u32,
+    ) -> Handle;
+    fn SetWaitableTimer(
+        timer: Handle,
+        due: *const i64,
+        period: i32,
+        routine: *const c_void,
+        argument: *const c_void,
+        resume: i32,
+    ) -> i32;
+    fn CreateEventW(
+        attributes: *const c_void,
+        manual_reset: i32,
+        initial_state: i32,
+        name: *const u16,
+    ) -> Handle;
+    fn SetEvent(event: Handle) -> i32;
+    fn WaitForMultipleObjects(
+        count: u32,
+        handles: *const Handle,
+        wait_all: i32,
+        milliseconds: u32,
+    ) -> u32;
     fn GetUserPreferredUILanguages(
         flags: u32,
         count: *mut u32,
@@ -483,6 +526,11 @@ const WM_APP_WAKE: u32 = 0x8000 + 2;
 /// re-mint it — posted instead of dispatched because the ask can come
 /// from INSIDE a dispatch (the demotion) or a paint.
 const WM_APP_REPRESENT: u32 = 0x8000 + 3;
+/// One slow beat landed (posted by the driver thread's high-resolution
+/// timer): only loop clocks (or a sleeping task) live, so the app wakes
+/// once per step instead of on every composition frame. (`0x8000 + 4` is
+/// the accessibility drain's.)
+const WM_APP_SLOW: u32 = 0x8000 + 5;
 /// The compositor restarted (a driver reset restarts it) — every
 /// window's redirection content was discarded.
 const WM_DWMCOMPOSITIONCHANGED: u32 = 0x031E;
@@ -508,9 +556,11 @@ const HTCLIENT: isize = 1;
 // timers
 const TIMER_BLINK: usize = 1;
 const TIMER_RESIZE: usize = 2;
-/// The slow beat: only loop clocks (or a sleeping task) live, so a plain
-/// timer beats once per step instead of the composition clock every frame.
-const TIMER_SLOW: usize = 3;
+// the slow beat's high-resolution waitable timer
+const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x0000_0002;
+const TIMER_ALL_ACCESS: u32 = 0x001F_0003;
+const WAIT_OBJECT_0: u32 = 0;
+const INFINITE: u32 = u32::MAX;
 // TrackMouseEvent
 const TME_LEAVE: u32 = 0x0002;
 // raster op
@@ -648,6 +698,10 @@ pub(crate) fn com_init() {
 /// beats to each of them.
 #[derive(Clone)]
 pub enum AppEvent {
+    /// Captured native geometry addressed to its non-recycled scene lifetime.
+    GeometryChanged(bunny_ui::window::GeometryObservation),
+    /// Captured dialog geometry, bound to its current presentation.
+    DialogGeometryChanged(bunny_ui::window::DialogGeometryObservation),
     /// First UIA query enables semantic collection.
     AccessibilityEnable,
     /// A validated COM request returns to the scene thread.
@@ -1506,22 +1560,36 @@ fn unregister_top_level(hwnd: Hwnd) -> usize {
             }
         }
     }
-    if driver().hwnd.load(Ordering::Acquire) == hwnd {
-        driver().hwnd.store(heir, Ordering::Release);
-        // the slow beat is the driver's too, and moves house with it
-        if let Some(step) = SLOW_STEP.with(Cell::get)
-            && heir != 0
-        {
-            unsafe {
-                SetTimer(heir, TIMER_SLOW, slow_interval_ms(step), std::ptr::null());
-            }
-        }
+    let clock = driver();
+    // Posting and handing off the window share the beat lock. Neither kind
+    // of tick queued to a dying window can acknowledge its in-flight latch.
+    let _beat = clock.beat.lock().expect("driver lock");
+    if clock.hwnd.load(Ordering::Acquire) == hwnd {
+        clock.hwnd.store(heir, Ordering::Release);
+        clock.in_flight.store(false, Ordering::Release);
+        clock.slow_in_flight.store(false, Ordering::Release);
     }
     TOP_LEVEL.with(|windows| windows.borrow().len())
 }
 
-/// Asks the platform to close a top-level window — the app's own
-/// `close`. The destroy road does the burying.
+type CloseGate = std::rc::Rc<dyn Fn(usize) -> bool>;
+
+thread_local! {
+    static CLOSE_GATE: RefCell<Option<CloseGate>> = const { RefCell::new(None) };
+}
+
+/// Installs the owning application's user-close decision gate.
+pub fn set_close_gate(gate: CloseGate) {
+    CLOSE_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+}
+
+/// Queries application policy outside any platform registry borrow.
+pub fn allow_close(window: usize) -> bool {
+    let gate = CLOSE_GATE.with(|slot| slot.borrow().clone());
+    gate.is_none_or(|gate| gate(window))
+}
+
+/// Explicit teardown, bypassing the native user-close policy.
 pub fn close_top_level(window: usize) {
     let hwnd = window as Hwnd;
     if hwnd != 0 && is_top_level(hwnd) {
@@ -1604,6 +1672,8 @@ pub fn dispatch(event: AppEvent) {
             handler(event);
         }
     });
+    geometry_ops::drain();
+    confirmation::drain();
 }
 
 // MARK: - DPI metrics (one funnel)
@@ -1852,55 +1922,200 @@ fn apply_cursor(cursor: Cursor) {
     }
 }
 
-// MARK: - Frame driver (born paused)
+// MARK: - Frame driver (born parked)
 
-/// The driver thread parks on this shared state; the composition clock
-/// (`DwmFlush`) paces the resumed loop and a posted message delivers
-/// the tick, folded by `in_flight` so a busy queue never floods.
+/// What the driver thread beats for the app.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Beat {
+    /// Nothing moves: the thread parks on its condition.
+    Parked,
+    /// The composition clock (`DwmFlush`): one beat per displayed frame.
+    Composition,
+    /// A high-resolution waitable timer: one beat per step (seconds), on
+    /// absolute deadlines. A USER32 timer would round a 60 Hz step up to
+    /// two grains of the 15.6 ms clock interrupt and beat at 32 Hz.
+    Slow(f64),
+}
+
+/// The driver thread parks on this shared state. The composition clock
+/// (`DwmFlush`) or the slow beat's timer paces the resumed loop, and a
+/// posted message delivers each beat, folded by its `in_flight` flag so a
+/// busy queue never floods.
 struct Driver {
-    running: Mutex<bool>,
+    beat: Mutex<Beat>,
     resume: Condvar,
+    /// Auto-reset event raised on every beat change, so a slow wait ends
+    /// the moment the app asks for another pace.
+    changed: Handle,
     hwnd: AtomicIsize,
     in_flight: AtomicBool,
+    slow_in_flight: AtomicBool,
 }
 
 static DRIVER: OnceLock<&'static Driver> = OnceLock::new();
 
 fn driver() -> &'static Driver {
     DRIVER.get_or_init(|| {
+        // SAFETY: an anonymous auto-reset event, owned for the app's life.
+        let changed = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
         let shared: &'static Driver = Box::leak(Box::new(Driver {
-            running: Mutex::new(false),
+            beat: Mutex::new(Beat::Parked),
             resume: Condvar::new(),
+            changed,
             hwnd: AtomicIsize::new(0),
             in_flight: AtomicBool::new(false),
+            slow_in_flight: AtomicBool::new(false),
         }));
-        std::thread::spawn(move || {
-            loop {
-                {
-                    let mut running = shared.running.lock().expect("driver lock");
-                    while !*running {
-                        running = shared.resume.wait(running).expect("driver wait");
-                    }
-                }
+        std::thread::spawn(move || drive(shared));
+        shared
+    })
+}
+
+/// The driver thread's loop.
+fn drive(shared: &'static Driver) {
+    // A high-resolution timer when the system has one (Windows 10 1803+);
+    // otherwise the plain waitable timer, which still keeps absolute
+    // deadlines, only on the coarser grain.
+    let timer = unsafe {
+        let precise = CreateWaitableTimerExW(
+            std::ptr::null(),
+            std::ptr::null(),
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+            TIMER_ALL_ACCESS,
+        );
+        if precise == 0 {
+            CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), 0, TIMER_ALL_ACCESS)
+        } else {
+            precise
+        }
+    };
+    let mut slow = SlowSchedule::default();
+    loop {
+        let beat = {
+            let mut beat = shared.beat.lock().expect("driver lock");
+            while *beat == Beat::Parked {
+                beat = shared.resume.wait(beat).expect("driver wait");
+            }
+            *beat
+        };
+        match beat {
+            Beat::Parked => {}
+            Beat::Composition => {
+                slow = SlowSchedule::default();
                 // the composition clock; some sessions (remote desktop)
                 // refuse it — degrade to a plain metronome
                 if unsafe { DwmFlush() } < 0 {
                     std::thread::sleep(std::time::Duration::from_millis(16));
                 }
-                let hwnd = shared.hwnd.load(Ordering::Acquire);
-                if hwnd != 0 && !shared.in_flight.swap(true, Ordering::AcqRel) {
-                    unsafe {
-                        PostMessageW(hwnd, WM_APP_FRAME, 0, 0);
-                    }
+                post_beat(shared, beat, WM_APP_FRAME, &shared.in_flight);
+            }
+            Beat::Slow(step) => {
+                let now = performance_counter();
+                let (next, due) = slow.next(step, now, ticks_per_second());
+                if wait_until(timer, shared.changed, due, now) {
+                    slow = next;
+                    post_beat(shared, beat, WM_APP_SLOW, &shared.slow_in_flight);
                 }
             }
-        });
-        shared
-    })
+        }
+    }
 }
 
-/// Parks or resumes the frame driver. Born paused; the shell resumes it
-/// only while an animation (or a sleeping task) needs the clock.
+/// Posts one beat to the driver's window unless the previous one of its
+/// kind is still in the queue.
+fn post_beat(shared: &Driver, expected: Beat, message: u32, in_flight: &AtomicBool) {
+    let beat = shared.beat.lock().expect("driver lock");
+    if *beat != expected || *beat == Beat::Parked {
+        return;
+    }
+    let hwnd = shared.hwnd.load(Ordering::Acquire);
+    if hwnd != 0
+        && !in_flight.swap(true, Ordering::AcqRel)
+        && unsafe { PostMessageW(hwnd, message, 0, 0) } == 0
+    {
+        in_flight.store(false, Ordering::Release);
+    }
+}
+
+/// Waits for the counter tick `due` on `timer`, or for a pace change.
+/// Answers whether the deadline (not the change) ended the wait.
+fn wait_until(timer: Handle, changed: Handle, due: i64, now: i64) -> bool {
+    if due <= now {
+        return true;
+    }
+    let ticks = due - now;
+    // relative due time: negative, in 100 ns units
+    let relative = -((ticks as f64 / ticks_per_second() * 1e7).ceil() as i64).max(1);
+    if timer == 0 {
+        std::thread::sleep(std::time::Duration::from_nanos((relative.unsigned_abs()) * 100));
+        return true;
+    }
+    unsafe {
+        SetWaitableTimer(
+            timer,
+            &relative,
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        let handles = [timer, changed];
+        WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) == WAIT_OBJECT_0
+    }
+}
+
+fn performance_counter() -> i64 {
+    let mut now = 0i64;
+    unsafe {
+        QueryPerformanceCounter(&mut now);
+    }
+    now
+}
+
+/// The slow beat's schedule: absolute deadlines from an anchor, so a
+/// steady loop never drifts — every beat is due `step` after the anchor
+/// times its index, whenever the previous one was delivered.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SlowSchedule {
+    step: f64,
+    anchor: i64,
+    beats: u64,
+}
+
+impl SlowSchedule {
+    /// The schedule after the next beat, and that beat's due tick. A new
+    /// step re-anchors at `now`; so does falling more than a whole step
+    /// behind, rather than firing a burst of beats to catch up.
+    fn next(self, step: f64, now: i64, tps: f64) -> (SlowSchedule, i64) {
+        let step_ticks = (step * tps).round().max(1.0) as i64;
+        let held = self.beats > 0 && self.step == step;
+        let (anchor, beats) = if held { (self.anchor, self.beats) } else { (now, 0) };
+        let due = anchor + ((beats + 1) as f64 * step * tps).round() as i64;
+        if due + step_ticks < now {
+            let next = SlowSchedule { step, anchor: now, beats: 1 };
+            return (next, now + step_ticks);
+        }
+        (SlowSchedule { step, anchor, beats: beats + 1 }, due)
+    }
+}
+
+/// Moves the driver to `beat`, waking it from a park or a slow wait.
+fn set_beat(beat: Beat) {
+    let driver = driver();
+    let mut held = driver.beat.lock().expect("driver lock");
+    if *held == beat {
+        return;
+    }
+    *held = beat;
+    driver.resume.notify_one();
+    unsafe {
+        SetEvent(driver.changed);
+    }
+}
+
+/// Moves the frame driver to the pace a window wants. Born parked; the
+/// shell resumes it only while an animation (or a sleeping task) needs the
+/// clock.
 pub fn want_pace(window: usize, pace: DriverPace) {
     let effective = PACES.with(|paces| {
         let mut paces = paces.borrow_mut();
@@ -1914,10 +2129,18 @@ pub fn want_pace(window: usize, pace: DriverPace) {
         }
         paces.values().fold(DriverPace::Off, |pace, wanted| pace.faster(*wanted))
     });
-    set_frame_driver_paused(effective != DriverPace::Full);
-    set_slow_beat(match effective {
+    let step = match effective {
         DriverPace::Slow(step) => Some(step),
         DriverPace::Full | DriverPace::Off => None,
+    };
+    if SLOW_STEP.with(|slot| slot.replace(step)) != step {
+        // a newly armed beat counts its first step from now
+        LAST_SLOW.with(|cell| cell.set(0));
+    }
+    set_beat(match effective {
+        DriverPace::Full => Beat::Composition,
+        DriverPace::Slow(step) => Beat::Slow(step),
+        DriverPace::Off => Beat::Parked,
     });
 }
 
@@ -1956,47 +2179,32 @@ thread_local! {
     static PACES: RefCell<HashMap<Hwnd, DriverPace>> = RefCell::new(HashMap::new());
     /// The slow beat's step while it is armed.
     static SLOW_STEP: Cell<Option<f64>> = const { Cell::new(None) };
+    /// The counter tick of the previous slow beat (0: none since armed).
+    static LAST_SLOW: Cell<i64> = const { Cell::new(0) };
 }
 
-/// A slow step as a `SetTimer` interval: whole milliseconds, never under
-/// the platform's floor (`USER_TIMER_MINIMUM`, 10 ms).
-fn slow_interval_ms(step: f64) -> u32 {
-    const USER_TIMER_MINIMUM: f64 = 10.0;
-    (step * 1000.0).round().clamp(USER_TIMER_MINIMUM, f64::from(u32::MAX)) as u32
+/// The longest stretch one slow beat may cover, in seconds.
+const SLOW_CATCH_UP: f64 = 1.0;
+
+/// dt for one slow beat, in whole steps: the steps that actually elapsed
+/// since the previous beat, and at least one. The clocks still advance by
+/// exactly the steps they were promised (the mac's `bunnySlow:`, no
+/// fractional wall time in the path), but a beat the main thread received
+/// late can no longer leave a loop's clock behind the wall's. The frame
+/// clock's own dt is clamped for springs and would run a quarter-second
+/// loop at an eighth of its speed, so it is not used here.
+fn slow_steps(elapsed: f64, step: f64) -> f64 {
+    let most = (SLOW_CATCH_UP / step).floor().max(1.0);
+    (elapsed / step).round().clamp(1.0, most) * step
 }
 
-/// Arms (or re-arms, or disarms) the slow beat on the driver's window.
-/// Silent when the step did not change: a steady loop re-states its pace
-/// after every frame.
-fn set_slow_beat(step: Option<f64>) {
-    let held = SLOW_STEP.with(Cell::get);
-    if held == step {
-        return;
+fn slow_dt(step: f64) -> f64 {
+    let now = performance_counter();
+    let last = LAST_SLOW.with(|cell| cell.replace(now));
+    if last == 0 {
+        return step;
     }
-    SLOW_STEP.with(|slot| slot.set(step));
-    let hwnd = driver().hwnd.load(Ordering::Acquire);
-    if hwnd == 0 {
-        return;
-    }
-    unsafe {
-        match step {
-            Some(step) => {
-                SetTimer(hwnd, TIMER_SLOW, slow_interval_ms(step), std::ptr::null());
-            }
-            None => {
-                KillTimer(hwnd, TIMER_SLOW);
-            }
-        }
-    }
-}
-
-pub fn set_frame_driver_paused(paused: bool) {
-    let driver = driver();
-    let mut running = driver.running.lock().expect("driver lock");
-    *running = !paused;
-    if !paused {
-        driver.resume.notify_one();
-    }
+    slow_steps((now - last) as f64 / ticks_per_second(), step)
 }
 
 thread_local! {
@@ -2152,6 +2360,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             // it, and a dispatch would re-enter the handler running it.
             if is_dialog(hwnd) {
                 refresh_metrics(hwnd);
+                geometry_ops::notify_dialog(hwnd);
                 ask_represent(owner_of(hwnd));
                 return 0;
             }
@@ -2159,6 +2368,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 return 0;
             }
             refresh_metrics(hwnd);
+            geometry_ops::notify(hwnd);
             // the platform's word on the window itself, BEFORE the frame
             // that shows it: a scene-drawn caption swaps the square for
             // the restore glyph in the same composition as the new size
@@ -2170,7 +2380,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_DPICHANGED => {
-            if !is_top_level(hwnd) {
+            if !is_top_level(hwnd) && !is_dialog(hwnd) {
                 // layered panels are raw screen pixels — the owner's
                 // funnel rescales them on its next present
                 return 0;
@@ -2193,7 +2403,12 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 }
             }
             refresh_metrics(hwnd);
-            dispatch_at(hwnd, AppEvent::Redraw);
+            geometry_ops::notify(hwnd);
+            if is_dialog(hwnd) {
+                ask_represent(owner_of(hwnd));
+            } else {
+                dispatch_at(hwnd, AppEvent::Redraw);
+            }
             0
         }
         WM_PAINT => {
@@ -2421,6 +2636,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_MOVE => {
+            geometry_ops::notify(hwnd);
             if is_top_level(hwnd) {
                 // the engine repositions its own popups — a select
                 // dropdown, autofill — after the parent's move lands
@@ -2657,17 +2873,6 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 dispatch(AppEvent::Frame { dt });
                 return 0;
             }
-            if wparam == TIMER_SLOW {
-                // the slow beat covers exactly one step — the clocks
-                // advance by the step they were promised, with no wall
-                // clock in the path (the mac's `bunnySlow:`); the frame
-                // clock's own dt is clamped for springs and would run a
-                // quarter-second loop at an eighth of its speed
-                if let Some(step) = SLOW_STEP.with(Cell::get) {
-                    dispatch(AppEvent::Frame { dt: step });
-                }
-                return 0;
-            }
             0
         }
         WM_APP_FRAME => {
@@ -2676,8 +2881,16 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             dispatch(AppEvent::Frame { dt });
             0
         }
+        WM_APP_SLOW => {
+            driver().slow_in_flight.store(false, Ordering::Release);
+            if let Some(step) = SLOW_STEP.with(Cell::get) {
+                dispatch(AppEvent::Frame { dt: slow_dt(step) });
+            }
+            0
+        }
         WM_APP_WAKE => {
             dispatch(AppEvent::Wake);
+            geometry_ops::drain_dialogs();
             0
         }
         WM_APP_REPRESENT => {
@@ -2739,6 +2952,12 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_ACTIVATE => {
+            // Moving focus between a scene and its own dialog is not leaving
+            // that scene. WM_ACTIVATE's lParam identifies the receiving window.
+            let owner = scene_owner(hwnd);
+            if (wparam & 0xFFFF) == WA_INACTIVE && owner != 0 && scene_owner(lparam) == owner {
+                return 0;
+            }
             dispatch_at(hwnd, activation(wparam));
             0
         }
@@ -2777,12 +2996,15 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 ask_represent(owner_of(hwnd));
                 return 0;
             }
-            unsafe {
-                DestroyWindow(hwnd);
+            if !is_top_level(hwnd) || allow_close(usize::from_ne_bytes(hwnd.to_ne_bytes())) {
+                unsafe {
+                    DestroyWindow(hwnd);
+                }
             }
             0
         }
         WM_DESTROY => {
+            geometry_ops::forget_dialog(hwnd);
             accessibility::destroy(hwnd);
             BACKING.with(|stores| {
                 if let Some(mut backing) = stores.borrow_mut().remove(&hwnd) {
@@ -3099,6 +3321,15 @@ pub struct WindowHandle {
 }
 
 impl WindowHandle {
+    /// Binds a native dialog to its runtime-owned presentation lease.
+    pub fn bind_dialog_geometry(
+        &self,
+        parent: Self,
+        session: Option<std::rc::Rc<bunny_ui::window::DialogGeometrySession>>,
+    ) {
+        geometry_ops::bind_dialog(self.hwnd, parent.hwnd, session);
+    }
+
     /// The window as an address — what an event's source is compared
     /// against, and the app's own handle for it.
     pub fn raw_window(&self) -> usize {
@@ -4085,6 +4316,50 @@ impl WindowHandle {
     }
 }
 
+/// Reads native visibility for a registered top-level window.
+pub fn window_visibility(
+    window: usize,
+) -> Result<bunny_ui::window::WindowVisibility, bunny_ui::window::WindowError> {
+    use bunny_ui::window::{WindowError, WindowVisibility};
+    let hwnd = Hwnd::from_ne_bytes(window.to_ne_bytes());
+    if !is_top_level(hwnd) {
+        return Err(WindowError::StaleWindow);
+    }
+    Ok(if unsafe { IsWindowVisible(hwnd) } != 0 {
+        WindowVisibility::Shown
+    } else {
+        WindowVisibility::Hidden
+    })
+}
+
+/// Changes native visibility without retiring the window lifetime.
+pub fn set_window_visibility(
+    window: usize,
+    visibility: bunny_ui::window::WindowVisibility,
+) -> Result<(), bunny_ui::window::WindowError> {
+    if window_visibility(window)? == visibility {
+        return Ok(());
+    }
+    let command = match visibility {
+        bunny_ui::window::WindowVisibility::Shown => SW_SHOW,
+        bunny_ui::window::WindowVisibility::Hidden => SW_HIDE,
+    };
+    let hwnd = Hwnd::from_ne_bytes(window.to_ne_bytes());
+    let shown = i32::from(visibility == bunny_ui::window::WindowVisibility::Shown);
+    // Owned dialogs and layered popups are top-level windows, not child HWNDs.
+    // This API remembers which were visible, so showing does not resurrect
+    // panels that were already hidden before the owner was hidden.
+    if unsafe { ShowOwnedPopups(hwnd, shown) } == 0 {
+        return Err(bunny_ui::window::WindowError::Unsupported(
+            "Win32 could not change owned popup visibility",
+        ));
+    }
+    unsafe {
+        ShowWindow(hwnd, command);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4204,6 +4479,39 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_or_obsolete_beat_does_not_latch_the_driver() {
+        for (expected, message) in [
+            (Beat::Composition, WM_APP_FRAME),
+            (Beat::Slow(0.25), WM_APP_SLOW),
+        ] {
+            let shared = Driver {
+                beat: Mutex::new(expected),
+                resume: Condvar::new(),
+                changed: 0,
+                hwnd: AtomicIsize::new(isize::MAX),
+                in_flight: AtomicBool::new(false),
+                slow_in_flight: AtomicBool::new(false),
+            };
+            let latch = if message == WM_APP_FRAME {
+                &shared.in_flight
+            } else {
+                &shared.slow_in_flight
+            };
+            post_beat(&shared, expected, message, latch);
+            assert!(
+                !latch.load(Ordering::Acquire),
+                "an invalid HWND cannot acknowledge a failed post"
+            );
+            *shared.beat.lock().unwrap() = Beat::Parked;
+            post_beat(&shared, expected, message, latch);
+            assert!(
+                !latch.load(Ordering::Acquire),
+                "a retired pace must not post"
+            );
+        }
+    }
+
+    #[test]
     fn the_beat_runs_at_the_fastest_pace_any_window_wants() {
         use DriverPace::{Full, Off, Slow};
         assert_eq!(Off.faster(Off), Off);
@@ -4217,12 +4525,42 @@ mod tests {
     }
 
     #[test]
-    fn a_slow_step_becomes_a_timer_the_platform_keeps() {
-        assert_eq!(slow_interval_ms(0.25), 250);
-        assert_eq!(slow_interval_ms(0.0333), 33);
-        // under the platform's floor: the floor
-        assert_eq!(slow_interval_ms(0.001), 10);
-        assert_eq!(slow_interval_ms(0.0), 10);
+    fn a_slow_beat_keeps_absolute_deadlines_and_reanchors_after_a_stall() {
+        // a 10 MHz counter and a 60 Hz loop: every beat due a sixtieth of a
+        // second after the anchor times its index, never accumulating the
+        // rounding of one period
+        let tps = 10_000_000.0;
+        let step = 1.0 / 60.0;
+        let (first, due) = SlowSchedule::default().next(step, 1_000, tps);
+        assert_eq!(due, 1_000 + 166_667);
+        // delivered late: the next deadline still counts from the anchor
+        let (second, due) = first.next(step, 1_000 + 170_000, tps);
+        assert_eq!(due, 1_000 + 333_333);
+        let (_, due) = second.next(step, 1_000 + 340_000, tps);
+        assert_eq!(due, 1_000 + 500_000);
+        // more than a whole step behind: re-anchored now, no burst of beats
+        let (late, due) = second.next(step, 10_000_000, tps);
+        assert_eq!((late.anchor, late.beats), (10_000_000, 1));
+        assert_eq!(due, 10_000_000 + 166_667);
+        // a new step re-anchors too
+        let (other, due) = first.next(0.25, 2_000, tps);
+        assert_eq!((other.anchor, other.beats, due), (2_000, 1, 2_000 + 2_500_000));
+    }
+
+    #[test]
+    fn a_late_slow_beat_advances_the_clocks_by_the_whole_steps_that_elapsed() {
+        let step = 1.0 / 60.0;
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        // punctual: exactly the promised step
+        assert!(near(slow_steps(step, step), step));
+        assert!(near(slow_steps(step * 1.4, step), step));
+        // two grains of the clock interrupt (31.25 ms): two steps, not one
+        assert!(near(slow_steps(0.03125, step), 2.0 * step));
+        // early or immediate beats still advance one step
+        assert!(near(slow_steps(0.0, step), step));
+        // a long stall is bounded to a second of steps
+        assert!(near(slow_steps(10.0, step), 60.0 * step));
+        assert!(near(slow_steps(10.0, 2.0), 2.0));
     }
 
     #[test]

@@ -211,11 +211,14 @@ mod tests {
             source: feed.source(),
         }]
         .into();
-        gpu.present_wait(&display, 1, Color::WHITE, &PixelFont, &RawImages::default());
+        gpu.ground.begin_slot(0, &mut gpu.atlas);
+        gpu.walk(&display, 1, &PixelFont, &RawImages::default());
         assert!(uploaded_in_frame(feed.key(), &gpu.atlas, &gpu.ground));
+        gpu.present_wait(&display, 1, Color::WHITE, &PixelFont, &RawImages::default());
+        assert!(!uploaded_in_frame(feed.key(), &gpu.atlas, &gpu.ground));
         // A new staging slot has no bytes for this generation, even though
         // the cache still names it. A prior upload may have been abandoned.
-        gpu.ground.begin_slot(1);
+        gpu.ground.begin_slot(1, &mut gpu.atlas);
         assert!(!uploaded_in_frame(feed.key(), &gpu.atlas, &gpu.ground));
         assert_eq!(gpu.atlas.live[&feed.key().raw()].generation, 1);
         feed.push((1, 1), vec![0, 255, 0, 255]);

@@ -7,6 +7,9 @@ on:
       - 'crates/bunny_ui_facade/**'
       - 'crates/bunny_ui_hot/**'
       - 'crates/bunny_ui_dylib/**'
+      # the lane's one dependency, and the attribute the template carries
+      - 'crates/bunny_ui_preview/**'
+      - 'crates/bunny_ui_preview_macros/**'
       - 'crates/bunny_ui_web/glue/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -100,12 +103,17 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libxcb1-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-shm0-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libdbus-1-dev libsecret-1-dev libfontconfig-dev libfreetype-dev libharfbuzz-dev
+            libdbus-1-dev libsecret-1-dev libfontconfig-dev libfreetype-dev libharfbuzz-dev libfribidi-dev
       - name: Two generations into a running app, without a window
         # the binary on the framework's shared library loads each build of
         # the app's library and draws it as text (BUNNY_HOT_CHECK): the
         # load, the entry and the swap on every desktop, no screen needed
         run: cargo test -p bunny-cli --locked --test hot_reload -- --ignored
+      - name: The preview road, timed
+        # the app as a preview host: built hot with its entries, a frame
+        # per selected preview, a click answered, a save swapped with the
+        # state kept — each step printed with its milliseconds
+        run: cargo test -p bunny-cli --locked --test preview_host --test preview_state_shape -- --ignored --nocapture
 
   android-build:
     name: bunny build linux and android
@@ -126,7 +134,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libxcb1-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-shm0-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libdbus-1-dev libsecret-1-dev libfontconfig-dev libfreetype-dev libharfbuzz-dev
+            libdbus-1-dev libsecret-1-dev libfontconfig-dev libfreetype-dev libharfbuzz-dev libfribidi-dev
       - name: The Android platform the template compiles against
         # the runner's SDK has its terms accepted; this is a no-op when
         # the image already carries the platform

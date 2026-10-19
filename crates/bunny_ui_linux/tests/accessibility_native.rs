@@ -19,6 +19,9 @@ fn main() {
         presses: State<u32>,
         rows: State<Vec<u32>>,
         modal: State<bool>,
+        rate: State<f64>,
+        checked: State<bool>,
+        disabled: State<bool>,
         close: Rc<dyn Fn()>,
     }
     impl Component for Form {
@@ -32,7 +35,20 @@ fn main() {
                     self.presses.add(1);
                     assert_eq!(self.presses.get(), 1);
                     self.name.set("Updated name".into());
-                }),
+                })
+                .disabled(self.disabled.get()),
+                slider(
+                    self.rate.binding(),
+                    SliderRange::new(0.0..=1.0).unwrap().with_step(0.3).unwrap()
+                )
+                .disabled(self.disabled.get())
+                .frame(220.0, 32.0)
+                .accessibility_label("Refresh rate"),
+                checkbox(text("Reimbursable"), self.checked.binding())
+                    .disabled(self.disabled.get()),
+                button(text("Toggle controls"), move || self
+                    .disabled
+                    .set(!self.disabled.get())),
                 button(text("Open modal"), move || self.modal.set(true)),
                 button(text("Remove row"), move || self.rows.set(vec![1])),
                 button(text("Reverse rows"), move || self.rows.set(vec![2, 1])),
@@ -73,6 +89,9 @@ fn main() {
             value: State::new("Lunch".into()),
             password: State::new("never-export-this".into()),
             presses: State::new(0),
+            rate: State::new(0.0),
+            checked: State::new(false),
+            disabled: State::new(false),
             rows: State::new(vec![1, 2]),
             modal: State::new(
                 std::env::var("BUNNY_PROBE_MODAL_FIRST").is_ok_and(|value| value == "1"),

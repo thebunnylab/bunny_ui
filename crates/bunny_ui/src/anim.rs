@@ -14,6 +14,9 @@
 //! time (the cursor is gone by place time). An entry the place stopped
 //! touching belongs to an unmounted node and dies on the next tick.
 
+/// Animated origins keyed by their retained view path.
+type AnimatedOrigins = Vec<(Rc<str>, (f64, f64))>;
+
 use std::rc::Rc;
 
 use crate::layout::Color;
@@ -492,7 +495,7 @@ impl Animator {
     /// Advances every live track by `dt` seconds. Returns what moved
     /// plus the scroll offsets to write back — a settled flight
     /// delivers its final (snapped) value once and leaves.
-    pub(crate) fn tick(&mut self, dt: f64) -> (Ticked, Vec<(Rc<str>, (f64, f64))>) {
+    pub(crate) fn tick(&mut self, dt: f64) -> (Ticked, AnimatedOrigins) {
         let places = self.places;
         let mut moved = Ticked::default();
         self.entries.retain(|_, entry| {
@@ -517,6 +520,13 @@ impl Animator {
             offsets.push((Rc::clone(path), (flight.tracks[0].value, flight.tracks[1].value)));
             flight.tracks.iter().any(Track::active)
         });
+        // a box that animates on its own asked for this beat while it
+        // painted: the frame clock moves, and exactly the boxes that read
+        // it repaint — and ask again if they still move
+        if PULSE.with(|pulse| pulse.take()).is_some() && !self.springs_reduced {
+            motor::identity::tick_frame_clock();
+            moved.scene = true;
+        }
         let paused = self.loops_paused;
         self.loops.retain(|_, clock| {
             if clock.touched < places {
@@ -543,6 +553,7 @@ impl Animator {
         self.entries.values().any(NodeAnim::active)
             || !self.scrolls.is_empty()
             || self.loops_alive()
+            || PULSE.with(|pulse| pulse.get()).is_some()
     }
 
     /// Are the loop clocks running — present, unfrozen, and not
@@ -557,6 +568,19 @@ impl Animator {
     pub(crate) fn pace(&self) -> FramePace {
         if self.entries.values().any(NodeAnim::active) || !self.scrolls.is_empty() {
             return FramePace::Display;
+        }
+        if let Some(fps) = PULSE.with(|pulse| pulse.get()) {
+            // a pulse that wants the display rate takes it; a capped one
+            // is served at its cap, unless a loop asks faster
+            if fps >= 60.0 {
+                return FramePace::Display;
+            }
+            let loops = if self.loops_alive() {
+                self.loops.values().map(|clock| clock.spec.fps).fold(1.0_f64, f64::max)
+            } else {
+                1.0
+            };
+            return FramePace::Slow(1.0 / fps.max(loops));
         }
         if self.loops_alive() {
             let fastest = self
@@ -881,4 +905,21 @@ mod tests {
         assert!(guard < 1000, "the spring settles");
         assert_eq!(animator.pace(), FramePace::Slow(1.0 / 8.0));
     }
+}
+
+thread_local! {
+    /// The fastest rate a box that animates on its own asked for while it
+    /// painted this frame. The next beat takes it; a box that still moves
+    /// asks again when it repaints, and a still one does not.
+    static PULSE: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
+/// A box that animates on its own — a flight, a playing motion — says so
+/// while it paints: the driver keeps beating at up to `fps` frames a
+/// second, and the box reads the frame clock so the next beat repaints
+/// it. A box that stops asking costs nothing on the next beat.
+pub fn pulse(fps: f64) {
+    motor::identity::read_frame_clock();
+    let fps = if fps.is_finite() && fps > 0.0 { fps } else { 120.0 };
+    PULSE.with(|pulse| pulse.set(Some(pulse.get().map_or(fps, |held| held.max(fps)))));
 }

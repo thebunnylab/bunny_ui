@@ -10,16 +10,31 @@ repository.workspace = true
 bunny-ui = { workspace = true, features = ["canvas", "gpu"] }
 bunny-ui-apple.workspace = true
 
+[features]
+# Worlds drawn by Metal itself (the world pass of `bunny-ui-apple`).
+# Without it a world still shows: the CPU draws it.
+3d = ["bunny-ui/3d", "bunny-ui-apple/3d"]
+
 [dev-dependencies]
 # examples only (the real countries app in a native window)
 countries-core.workspace = true
 countries-pure.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Checked Objective-C consumers catch callback ABI/encoding disagreements.
+objc2 = "=0.6.5"
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSArray", "NSEnumerator", "NSString", "NSGeometry"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSAppearance", "NSWindow", "NSView", "NSResponder", "objc2-core-foundation"] }
 
 # the present tape reader carries its own golden-tape tests; the other
 # examples stay on autodiscovery
 [[example]]
 name = "trace_report"
 test = true
+
+[[example]]
+name = "world_window"
+required-features = ["3d"]
 
 # Its API exists only on its own platform; docs.rs builds on Linux
 # by default and would publish an empty page.
@@ -30,4 +45,49 @@ targets = ["aarch64-apple-darwin"]
 # AppKit must run on the process main thread, not a Rust test worker.
 [[test]]
 name = "accessibility_native"
+harness = false
+
+[[test]]
+name = "window_lifecycle"
+harness = false
+
+[[test]]
+name = "window_modality"
+harness = false
+
+[[test]]
+name = "window_relationships"
+harness = false
+
+[[test]]
+name = "window_geometry"
+harness = false
+
+[[test]]
+name = "objc_bool_native"
+harness = false
+
+[[test]]
+name = "window_startup"
+harness = false
+
+[[test]]
+name = "dialog_geometry"
+harness = false
+
+[[test]]
+name = "system_appearance"
+harness = false
+
+[[test]]
+name = "confirmation_native"
+harness = false
+
+# the desk's window and its pages are AppKit's too
+[[test]]
+name = "pictures"
+harness = false
+
+[[test]]
+name = "host_scroll_native"
 harness = false

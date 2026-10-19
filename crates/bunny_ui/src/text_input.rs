@@ -7,6 +7,8 @@
 //! field. Default horizontal movement and unselected deletion use extended
 //! grapheme clusters; explicit native ranges and composition stay scalar-aligned.
 
+pub use crate::text_geometry::CaretAffinity;
+
 /// A field's caret + selection anchor, per identity. `caret` is the
 /// active point; `anchor` marks the other side of the selection (None =
 /// no selection); `marked` is the live IME composition (underlined, not
@@ -15,6 +17,8 @@
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct CaretState {
     pub caret: usize,
+    /// The logical side whose native position draws the insertion point.
+    pub affinity: CaretAffinity,
     pub anchor: Option<usize>,
     pub marked: Option<(usize, usize)>,
 }
@@ -231,6 +235,23 @@ pub(crate) fn clamp_state(text: &str, state: &mut CaretState) {
 /// clamps here. The output is the text `Read`/`Copy`/`Cut` extract.
 pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) -> Option<String> {
     clamp_state(text, state);
+    match &command {
+        EditCommand::Read
+        | EditCommand::Copy
+        | EditCommand::Unmark
+        | EditCommand::Submit
+        | EditCommand::Newline
+        | EditCommand::Up(_)
+        | EditCommand::Down(_) => (),
+        EditCommand::Insert(_)
+        | EditCommand::Right(_)
+        | EditCommand::WordRight(_)
+        | EditCommand::LineEnd(_)
+        | EditCommand::End(_)
+        | EditCommand::SelectAll
+        | EditCommand::SetMarked { .. } => state.affinity = CaretAffinity::Upstream,
+        _ => state.affinity = CaretAffinity::Downstream,
+    }
 
     // any command that is not composition or reading ends the live
     // composition (commits it as it stands) before acting — except
@@ -643,7 +664,12 @@ mod tests {
     use super::*;
 
     fn state(caret: usize) -> CaretState {
-        CaretState { caret, anchor: None, marked: None }
+        CaretState {
+            affinity: CaretAffinity::Downstream,
+            caret,
+            anchor: None,
+            marked: None,
+        }
     }
 
     #[test]

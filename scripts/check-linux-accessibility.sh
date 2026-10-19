@@ -33,6 +33,47 @@ test -n "$fixture"
 failures=0
 for backend in x11 wayland; do
   for paranoid in '' all; do
+    echo "Portal appearance backend=$backend paranoid=${paranoid:-off}"
+    if ! BUNNY_BACKEND="$backend" BUNNY_PARANOID="$paranoid" BUNNY_PORTAL_APPEARANCE_PROBE=1 timeout 45s \
+      cargo test -p bunny-ui-linux --locked --test system_appearance; then
+      failures=$((failures + 1))
+    fi
+    echo "Native confirmation backend=$backend paranoid=${paranoid:-off}"
+    if ! BUNNY_BACKEND="$backend" BUNNY_PARANOID="$paranoid" timeout 45s \
+      cargo test -p bunny-ui-linux --locked --lib confirmation_native_protocol -- --ignored --nocapture; then
+      failures=$((failures + 1))
+    fi
+    echo "Window lifecycle backend=$backend paranoid=${paranoid:-off}"
+    if ! BUNNY_BACKEND="$backend" BUNNY_PARANOID="$paranoid" BUNNY_WINDOW_LIFECYCLE_PROBE=1 timeout 100s \
+      cargo test -p bunny-ui-linux --locked --test window_lifecycle; then
+      failures=$((failures + 1))
+    fi
+    echo "Window relationships backend=$backend paranoid=${paranoid:-off}"
+    if ! BUNNY_BACKEND="$backend" BUNNY_PARANOID="$paranoid" BUNNY_WINDOW_RELATIONSHIPS_PROBE=1 timeout 100s \
+      cargo test -p bunny-ui-linux --locked --test window_relationships; then
+      failures=$((failures + 1))
+    fi
+    echo "Window geometry backend=$backend paranoid=${paranoid:-off}"
+    if ! BUNNY_BACKEND="$backend" BUNNY_PARANOID="$paranoid" BUNNY_WINDOW_GEOMETRY_PROBE=1 timeout 100s \
+      cargo test -p bunny-ui-linux --locked --test window_geometry; then
+      failures=$((failures + 1))
+    fi
+    echo "Dialog geometry backend=$backend paranoid=${paranoid:-off}"
+    if ! BUNNY_BACKEND="$backend" BUNNY_PARANOID="$paranoid" BUNNY_DIALOG_GEOMETRY_PROBE=1 timeout 100s \
+      cargo test -p bunny-ui-linux --locked --test dialog_geometry; then
+      failures=$((failures + 1))
+    fi
+    if [[ $backend == x11 ]]; then
+      if ! BUNNY_BACKEND=x11 BUNNY_PARANOID="$paranoid" timeout 45s \
+        cargo test -p bunny-ui-linux --locked --lib relationship_property_round_trip -- --ignored --nocapture; then
+        failures=$((failures + 1))
+      fi
+    else
+      if ! BUNNY_BACKEND=wayland BUNNY_PARANOID="$paranoid" timeout 45s \
+        cargo test -p bunny-ui-linux --locked --lib buffer_scale_reset_reaches_the_wayland_wire -- --ignored --nocapture; then
+        failures=$((failures + 1))
+      fi
+    fi
     for modal_first in 0 1; do
       echo "AT-SPI backend=$backend paranoid=${paranoid:-off} modal-first=$modal_first"
       if ! BUNNY_BACKEND="$backend" BUNNY_PARANOID="$paranoid" BUNNY_PROBE_MODAL_FIRST="$modal_first" timeout 45s \

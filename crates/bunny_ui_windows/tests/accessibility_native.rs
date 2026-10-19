@@ -22,6 +22,18 @@ mod probe {
         d3: 0x4cd6,
         d4: [0x9d, 0x2d, 0x64, 0x05, 0x37, 0xab, 0x39, 0xe9],
     };
+    const RANGE_IID: Guid = Guid {
+        d1: 0x59213f4f,
+        d2: 0x7346,
+        d3: 0x49e5,
+        d4: [0xb1, 0x20, 0x80, 0x55, 0x59, 0x87, 0xa1, 0x48],
+    };
+    const TOGGLE_IID: Guid = Guid {
+        d1: 0x94cf8058,
+        d2: 0x9b8d,
+        d3: 0x4ab9,
+        d4: [0x8b, 0xfd, 0x4c, 0xd0, 0xa3, 0x3c, 0x8c, 0x70],
+    };
     const INVOKE_IID: Guid = Guid {
         d1: 0xfb377fbe,
         d2: 0x8ea6,
@@ -90,6 +102,23 @@ mod probe {
         unknown: Unknown,
         set: unsafe extern "system" fn(Object, *const u16) -> Hresult,
         get: unsafe extern "system" fn(Object, *mut *mut u16) -> Hresult,
+    }
+    #[repr(C)]
+    struct RangePattern {
+        unknown: Unknown,
+        set: unsafe extern "system" fn(Object, f64) -> Hresult,
+        get: unsafe extern "system" fn(Object, *mut f64) -> Hresult,
+        read_only: unsafe extern "system" fn(Object, *mut i32) -> Hresult,
+        maximum: unsafe extern "system" fn(Object, *mut f64) -> Hresult,
+        minimum: unsafe extern "system" fn(Object, *mut f64) -> Hresult,
+        large_change: unsafe extern "system" fn(Object, *mut f64) -> Hresult,
+        small_change: unsafe extern "system" fn(Object, *mut f64) -> Hresult,
+    }
+    #[repr(C)]
+    struct TogglePattern {
+        unknown: Unknown,
+        toggle: unsafe extern "system" fn(Object) -> Hresult,
+        state: unsafe extern "system" fn(Object, *mut i32) -> Hresult,
     }
     #[repr(C)]
     struct InvokePattern {
@@ -262,6 +291,12 @@ mod probe {
                     SysStringLen(value.data[0] as *const u16) as usize,
                 ))
             }
+        } else if value.kind == 5 {
+            unsafe { ptr::read_unaligned(value.data.as_ptr().cast::<f64>()) }.to_string()
+        } else if value.kind == 3 {
+            (value.data[0] as i32).to_string()
+        } else if value.kind == 11 {
+            (value.data[0] as i16 != 0).to_string()
         } else {
             String::new()
         };
@@ -299,7 +334,7 @@ mod probe {
                 }))
                 .cast(),
             );
-            let properties = [30005, 30045, 30008];
+            let properties = [30005, 30045, 30008, 30010, 30086, 30047, 30048];
             unsafe {
                 succeeded((client.table::<Client>().add_properties)(
                     client.0,
@@ -500,6 +535,62 @@ mod probe {
             succeeded((pattern.table::<InvokePattern>().invoke)(pattern.0));
         }
     }
+    unsafe fn range_value(pattern: &Owned) -> f64 {
+        let mut value = f64::NAN;
+        unsafe {
+            succeeded((pattern.table::<RangePattern>().get)(pattern.0, &mut value));
+        }
+        value
+    }
+    unsafe fn exercise_range(client: &Owned, slider: &Owned, range: &Owned) {
+        unsafe {
+            assert_eq!(read_integer(slider, 30003, 3), 50015);
+            let stable = identity(slider);
+            let events = Events::subscribe(client, slider);
+            let table = range.table::<RangePattern>();
+            let mut value = f64::NAN;
+            for (get, expected) in [
+                (table.minimum, 0.0),
+                (table.maximum, 1.0),
+                (table.small_change, 0.3),
+                (table.large_change, 1.0),
+            ] {
+                succeeded(get(range.0, &mut value));
+                assert!((value - expected).abs() < 1e-12);
+            }
+            let mut read_only = -1;
+            succeeded((table.read_only)(range.0, &mut read_only));
+            assert_eq!(read_only, 0);
+            for (requested, expected) in [
+                (0.3, 0.3),
+                (0.6, 0.6),
+                (0.9, 0.9),
+                (1.0, 1.0),
+                (0.2, 0.3),
+                (0.0, 0.0),
+            ] {
+                succeeded((table.set)(range.0, requested));
+                until("range value follows SetValue", || {
+                    (range_value(range) - expected).abs() < 1e-12
+                });
+            }
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+                assert!(
+                    (table.set)(range.0, invalid) < 0,
+                    "invalid numeric SetValue accepted"
+                );
+                assert_eq!(range_value(range), 0.0);
+            }
+            succeeded((slider.table::<Element>().focus)(slider.0));
+            until("range focus", || read_integer(slider, 30008, 11) != 0);
+            until("numeric range notification", || events.saw(30047, "1"));
+            assert_eq!(identity(slider), stable);
+            println!(
+                "UIA RangeValue value, bounds, steps, numeric validation, focus and notifications passed"
+            );
+        }
+    }
+
     fn until(label: &str, mut check: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -683,6 +774,50 @@ mod probe {
             println!("UIA phase: unsubscribe start");
             drop(events);
             println!("UIA phase: unsubscribed");
+            let slider = named(&client, &root, "Refresh rate");
+            let range = pattern(&slider, 10003, &RANGE_IID);
+            exercise_range(&client, &slider, &range);
+            let check = named(&client, &root, "Reimbursable");
+            assert_eq!(read_integer(&check, 30003, 3), 50002);
+            assert_eq!(read_integer(&check, 30086, 3), 0);
+            let check_identity = identity(&check);
+            let check_events = Events::subscribe(&client, &check);
+            let toggle = pattern(&check, 10015, &TOGGLE_IID);
+            let mut checked = -1;
+            succeeded((toggle.table::<TogglePattern>().state)(
+                toggle.0,
+                &mut checked,
+            ));
+            assert_eq!(checked, 0);
+            succeeded((check.table::<Element>().focus)(check.0));
+            until("checkbox focus", || read_integer(&check, 30008, 11) != 0);
+            succeeded((toggle.table::<TogglePattern>().toggle)(toggle.0));
+            until("checkbox toggle", || read_integer(&check, 30086, 3) == 1);
+            until("checkbox value notification", || {
+                check_events.saw(30086, "1")
+            });
+            invoke(&named(&client, &root, "Toggle controls"));
+            until("disabled checkbox", || read_integer(&check, 30010, 11) == 0);
+            until("disabled slider", || read_integer(&slider, 30010, 11) == 0);
+            assert!((range.table::<RangePattern>().set)(range.0, 1.0) < 0);
+            assert!((slider.table::<Element>().focus)(slider.0) < 0);
+            assert_eq!(range_value(&range), 0.0);
+            until("disabled notification", || check_events.saw(30010, "false"));
+            assert!((toggle.table::<TogglePattern>().toggle)(toggle.0) < 0);
+            assert!((check.table::<Element>().focus)(check.0) < 0);
+            let save = named(&client, &root, "Save");
+            assert_eq!(read_integer(&save, 30010, 11), 0);
+            let save_action = pattern(&save, 10000, &INVOKE_IID);
+            assert!((save_action.table::<InvokePattern>().invoke)(save_action.0) < 0);
+            assert_eq!(read_integer(&check, 30086, 3), 1);
+            invoke(&named(&client, &root, "Toggle controls"));
+            until("enabled checkbox", || read_integer(&check, 30010, 11) != 0);
+            assert_eq!(identity(&check), check_identity);
+            succeeded((save.table::<Element>().focus)(save.0));
+            until("button focus", || read_integer(&save, 30008, 11) != 0);
+            println!(
+                "UIA checkbox Toggle, state, focus, enabled rejection and notifications passed"
+            );
             println!("UIA phase: locate retiring row");
             let row = named(&client, &root, "Row 2");
             println!("UIA phase: retiring row located");
@@ -709,6 +844,16 @@ mod probe {
                 find(&client, &root, "Updated name").is_none(),
                 "modal excludes background fields"
             );
+            assert!(
+                (toggle.table::<TogglePattern>().toggle)(toggle.0) < 0,
+                "retired checkbox refuses Toggle"
+            );
+            assert!(
+                (range.table::<RangePattern>().set)(range.0, 0.6) < 0,
+                "retired range refuses SetValue"
+            );
+            let mut retired_value = 0.0;
+            assert!((range.table::<RangePattern>().get)(range.0, &mut retired_value) < 0);
             println!("UIA phase: dismiss-modal invoke start");
             invoke(&dismiss.unwrap());
             println!("UIA phase: dismiss-modal invoke accepted");
@@ -758,6 +903,9 @@ mod probe {
         presses: State<u32>,
         rows: State<Vec<u32>>,
         modal: State<bool>,
+        rate: State<f64>,
+        checked: State<bool>,
+        disabled: State<bool>,
     }
     impl Component for Form {
         fn body(self) -> impl View {
@@ -768,7 +916,20 @@ mod probe {
                 button(text("Save"), move || {
                     self.presses.add(1);
                     self.name.set("Updated name".into());
-                }),
+                })
+                .disabled(self.disabled.get()),
+                slider(
+                    self.rate.binding(),
+                    SliderRange::new(0.0..=1.0).unwrap().with_step(0.3).unwrap()
+                )
+                .disabled(self.disabled.get())
+                .frame(220.0, 32.0)
+                .accessibility_label("Refresh rate"),
+                checkbox(text("Reimbursable"), self.checked.binding())
+                    .disabled(self.disabled.get()),
+                button(text("Toggle controls"), move || self
+                    .disabled
+                    .set(!self.disabled.get())),
                 button(text("Open modal"), move || self.modal.set(true)),
                 button(text("Remove row"), move || self.rows.set(vec![1])),
                 for_each(
@@ -809,6 +970,9 @@ mod probe {
             value: State::new("Lunch".into()),
             password: State::new("never-export-this".into()),
             presses: State::new(0),
+            rate: State::new(0.0),
+            checked: State::new(false),
+            disabled: State::new(false),
             rows: State::new(vec![1, 2]),
             modal: State::new(first_modal),
         };

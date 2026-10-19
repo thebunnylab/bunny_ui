@@ -8,10 +8,9 @@ use std::rc::Rc;
 
 use bunny_ui::layout::{DisplayList, DrawCommand, LayoutResult, Proposal};
 use bunny_ui::prelude::*;
-use bunny_ui_macos::{App, CoreGraphicsImageEngine, CoreTextEngine, WindowSpec};
 use serde_json::{Value, json};
 
-use crate::{Args, Step, WINDOW, scripted, unix_ms};
+use crate::{Args, Checkpoint, Step, WINDOW, platform, scripted, unix_ms};
 
 type Observer = Box<dyn Fn(&str)>;
 
@@ -25,16 +24,17 @@ pub fn run<V: View<Arity = Single>>(
     on_step: impl Fn(Step) + 'static,
     content: impl Fn() -> Value + 'static,
 ) {
-    let runtime = Rc::new(
-        Runtime::new()
-            .text_engine(Rc::new(CoreTextEngine::new()))
-            .image_engine(Rc::new(CoreGraphicsImageEngine::new())),
-    );
+    let runtime = platform::runtime();
     let observer: Rc<OnceCell<Observer>> = Rc::new(OnceCell::new());
     let weak = Rc::downgrade(&observer);
     let ready = Cell::new(false);
     let root = scripted(view, args, (WINDOW.0 / 2.0, WINDOW.1 / 2.0), move |step| {
         if let Step::Checkpoint(point) = step {
+            // An explicit go-ahead (the Windows producer's BEGIN) is the
+            // readiness report; the first step must not repeat it.
+            if matches!(point, Checkpoint::Ready) {
+                ready.set(true);
+            }
             emit(&weak, point.marker());
             return;
         }
@@ -59,13 +59,7 @@ pub fn run<V: View<Arity = Single>>(
         value["content"] = content();
         println!("{marker} {} {value}", unix_ms());
     }));
-    let app = App::new();
-    app.open(
-        WindowSpec::titled(title).size(WINDOW.0, WINDOW.1),
-        runtime,
-        root,
-    );
-    app.run();
+    platform::open(title, runtime, root);
 }
 
 fn emit(weak: &std::rc::Weak<OnceCell<Observer>>, marker: &str) {

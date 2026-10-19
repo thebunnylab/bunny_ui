@@ -20,6 +20,10 @@ mod probe {
         #[link_name = "objc_msgSend"]
         fn count(object: Id, selector: Sel) -> usize;
         #[link_name = "objc_msgSend"]
+        fn double(object: Id, selector: Sel) -> f64;
+        #[link_name = "objc_msgSend"]
+        fn number(object: Id, selector: Sel, value: f64) -> Id;
+        #[link_name = "objc_msgSend"]
         fn at(object: Id, selector: Sel, index: usize) -> Id;
         #[link_name = "objc_msgSend"]
         fn chars(object: Id, selector: Sel) -> *const c_char;
@@ -50,6 +54,9 @@ mod probe {
         if value.is_null() {
             return None;
         }
+        if unsafe { bool_object(value, sel("isKindOfClass:"), class("NSString")) } == 0 {
+            return None;
+        }
         let bytes = unsafe { chars(value, sel("UTF8String")) };
         if bytes.is_null() {
             return None;
@@ -76,6 +83,21 @@ mod probe {
             .unwrap_or_else(|| panic!("native accessible element missing: {name}"))
     }
 
+    unsafe fn popup_choice(window: Id, label: &str) -> (Id, Id) {
+        unsafe {
+            let windows = object(window, sel("childWindows"));
+            let panel = (0..count(windows, sel("count")))
+                .map(|i| at(windows, sel("objectAtIndex:"), i))
+                .find(|panel| {
+                    children(object(*panel, sel("contentView")))
+                        .iter()
+                        .any(|node| property(*node, "accessibilityLabel").as_deref() == Some(label))
+                })
+                .unwrap_or_else(|| panic!("native child surface missing choice: {label}"));
+            (panel, named(object(panel, sel("contentView")), label))
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct Form {
         name: State<String>,
@@ -84,6 +106,10 @@ mod probe {
         presses: State<u32>,
         rows: State<Vec<u32>>,
         modal: State<bool>,
+        rate: State<f64>,
+        reactions: State<bool>,
+        checked: State<bool>,
+        disabled: State<bool>,
     }
     impl Component for Form {
         fn body(self) -> impl View {
@@ -94,8 +120,39 @@ mod probe {
                 button(text("Save"), move || {
                     self.presses.add(1);
                     self.name.set("Updated name".into());
-                }),
+                })
+                .disabled(self.disabled.get()),
+                slider(
+                    self.rate.binding(),
+                    SliderRange::new(0.0..=1.0).unwrap().with_step(0.3).unwrap()
+                )
+                .disabled(self.disabled.get())
+                .frame(220.0, 32.0)
+                .accessibility_label("Refresh rate"),
+                checkbox(text("Reimbursable"), self.checked.binding())
+                    .disabled(self.disabled.get()),
+                button(text("Toggle controls"), move || self
+                    .disabled
+                    .set(!self.disabled.get())),
                 button(text("Open modal"), move || self.modal.set(true)),
+                button(text("Open reactions"), move || self.reactions.set(true)).popover(
+                    self.reactions.binding(),
+                    Side::Bottom,
+                    move |_| erased(
+                        hstack!(
+                            button(text("Thumbs up"), move || {
+                                self.presses.add(10);
+                                self.reactions.set(false);
+                            })
+                            .id("native-reaction-like"),
+                            button(text("Heart"), move || {
+                                self.presses.add(20);
+                                self.reactions.set(false);
+                            }),
+                        )
+                        .padding()
+                    ),
+                ),
                 button(text("Remove row"), move || self.rows.set(vec![1])),
                 for_each(
                     self.rows,
@@ -121,14 +178,22 @@ mod probe {
             value: State::new("Lunch".into()),
             password: State::new("never-export-this".into()),
             presses: State::new(0),
+            rate: State::new(0.0),
+            checked: State::new(false),
+            disabled: State::new(false),
             rows: State::new(vec![1, 2]),
             modal: State::new(false),
+            reactions: State::new(false),
         };
         let id = app.open(
             WindowSpec::titled("Bunny accessibility protocol witness").size(480.0, 640.0),
             Rc::clone(&runtime),
             form,
         );
+        if std::env::args().any(|argument| argument == "--external-ax-fixture") {
+            app.run();
+            return;
+        }
         unsafe {
             let ns_app = object(class("NSApplication"), sel("sharedApplication"));
             let windows = object(ns_app, sel("windows"));
@@ -152,6 +217,65 @@ mod probe {
             assert_eq!(
                 property(field, "accessibilityValue").as_deref(),
                 Some("Lunch")
+            );
+            let range = named(view, "Refresh rate");
+            assert_eq!(
+                property(range, "accessibilityRole").as_deref(),
+                Some("AXSlider")
+            );
+            assert_eq!(
+                double(
+                    object(range, sel("accessibilityMinValue")),
+                    sel("doubleValue")
+                ),
+                0.0
+            );
+            assert_eq!(
+                double(
+                    object(range, sel("accessibilityMaxValue")),
+                    sel("doubleValue")
+                ),
+                1.0
+            );
+            assert_eq!(
+                allowed(
+                    range,
+                    sel("isAccessibilitySelectorAllowed:"),
+                    sel("accessibilityPerformIncrement")
+                ),
+                1
+            );
+            for expected in [0.3, 0.6, 0.9, 1.0, 1.0] {
+                assert_eq!(boolean(range, sel("accessibilityPerformIncrement")), 1);
+                assert!((form.rate.get() - expected).abs() < 1e-12);
+                assert!(
+                    (double(object(range, sel("accessibilityValue")), sel("doubleValue"))
+                        - expected)
+                        .abs()
+                        < 1e-12
+                );
+            }
+            assert_eq!(boolean(range, sel("accessibilityPerformDecrement")), 1);
+            assert!((form.rate.get() - 0.9).abs() < 1e-12);
+            set_object(
+                range,
+                sel("setAccessibilityValue:"),
+                number(class("NSNumber"), sel("numberWithDouble:"), 0.2),
+            );
+            assert!((form.rate.get() - 0.3).abs() < 1e-12);
+            for invalid in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+                set_object(
+                    range,
+                    sel("setAccessibilityValue:"),
+                    number(class("NSNumber"), sel("numberWithDouble:"), invalid),
+                );
+                assert!((form.rate.get() - 0.3).abs() < 1e-12);
+            }
+            set_bool(range, sel("setAccessibilityFocused:"), 1);
+            assert_eq!(boolean(range, sel("isAccessibilityFocused")), 1);
+            assert_eq!(named(view, "Refresh rate"), range);
+            println!(
+                "NSAccessibility slider value, bounds, nondividing steps, numeric validation and focus passed"
             );
             let password = named(view, "Password");
             assert_eq!(
@@ -292,9 +416,88 @@ mod probe {
             );
             assert_eq!(form.presses.get(), 1);
             assert_eq!(
+                boolean(named(view, "Save"), sel("isAccessibilityFocused")),
+                1
+            );
+            assert_eq!(boolean(field, sel("isAccessibilityFocused")), 0);
+            assert_eq!(
+                object(view, sel("accessibilityFocusedUIElement")),
+                named(view, "Save"),
+                "native press transfers keyboard ownership to the invoked button"
+            );
+            assert_eq!(
                 named(view, "Updated name"),
                 field,
                 "a changing name keeps the native object"
+            );
+            let check = named(view, "Reimbursable");
+            let save = named(view, "Save");
+            assert_eq!(
+                property(check, "accessibilityRole").as_deref(),
+                Some("AXCheckBox")
+            );
+            assert_eq!(
+                boolean(object(check, sel("accessibilityValue")), sel("boolValue")),
+                0
+            );
+            assert_eq!(boolean(check, sel("accessibilityPerformPress")), 1);
+            assert_eq!(boolean(check, sel("isAccessibilityFocused")), 1);
+            assert!(form.checked.get());
+            assert_eq!(
+                boolean(object(check, sel("accessibilityValue")), sel("boolValue")),
+                1
+            );
+            assert_eq!(
+                boolean(
+                    named(view, "Toggle controls"),
+                    sel("accessibilityPerformPress")
+                ),
+                1
+            );
+            assert_eq!(boolean(range, sel("isAccessibilityEnabled")), 0);
+            assert_eq!(boolean(range, sel("accessibilityPerformIncrement")), 0);
+            assert_eq!(
+                allowed(
+                    range,
+                    sel("isAccessibilitySelectorAllowed:"),
+                    sel("setAccessibilityValue:")
+                ),
+                0
+            );
+            set_object(
+                range,
+                sel("setAccessibilityValue:"),
+                number(class("NSNumber"), sel("numberWithDouble:"), 1.0),
+            );
+            assert!((form.rate.get() - 0.3).abs() < 1e-12);
+            assert_eq!(boolean(check, sel("isAccessibilityEnabled")), 0);
+            assert_eq!(boolean(save, sel("isAccessibilityEnabled")), 0);
+            assert_eq!(boolean(check, sel("isAccessibilityFocused")), 0);
+            assert_eq!(boolean(check, sel("accessibilityPerformPress")), 0);
+            assert_eq!(boolean(save, sel("accessibilityPerformPress")), 0);
+            assert_eq!(
+                allowed(
+                    check,
+                    sel("isAccessibilitySelectorAllowed:"),
+                    sel("setAccessibilityFocused:")
+                ),
+                0
+            );
+            assert_eq!(form.presses.get(), 1);
+            assert!(form.checked.get());
+            assert_eq!(
+                boolean(
+                    named(view, "Toggle controls"),
+                    sel("accessibilityPerformPress")
+                ),
+                1
+            );
+            assert_eq!(named(view, "Reimbursable"), check);
+            assert_eq!(boolean(check, sel("isAccessibilityEnabled")), 1);
+            set_bool(save, sel("setAccessibilityFocused:"), 1);
+            assert_eq!(boolean(save, sel("isAccessibilityFocused")), 1);
+            println!(
+                "NSAccessibility checkbox value, focus, disabled rejection and stable identity passed"
             );
             let removed = object(named(view, "Row 2"), sel("retain"));
             assert_eq!(
@@ -304,6 +507,7 @@ mod probe {
             assert_eq!(boolean(removed, sel("accessibilityPerformPress")), 0);
             assert_eq!(form.presses.get(), 1);
             void(removed, sel("release"));
+            let old_range = object(range, sel("retain"));
             let old_save = object(named(view, "Save"), sel("retain"));
             assert_eq!(
                 boolean(named(view, "Open modal"), sel("accessibilityPerformPress")),
@@ -313,6 +517,9 @@ mod probe {
                 children(view).is_empty(),
                 "the covered main surface exposes no controls"
             );
+            assert_eq!(boolean(old_range, sel("accessibilityPerformIncrement")), 0);
+            assert!(object(old_range, sel("accessibilityValue")).is_null());
+            void(old_range, sel("release"));
             assert_eq!(boolean(old_save, sel("accessibilityPerformPress")), 0);
             let child_windows = object(window, sel("childWindows"));
             let panel = (0..count(child_windows, sel("count")))
@@ -335,6 +542,103 @@ mod probe {
             assert!(!named(view, "Updated name").is_null());
             void(dismiss, sel("release"));
             void(old_save, sel("release"));
+            let launcher = named(view, "Open reactions");
+            let before_reactions = form.presses.get();
+            for (label, delta) in [("Thumbs up", 10), ("Heart", 20), ("Thumbs up", 10)] {
+                set_bool(launcher, sel("setAccessibilityFocused:"), 1);
+                assert_eq!(boolean(launcher, sel("accessibilityPerformPress")), 1);
+                let (panel, choice) = popup_choice(window, label);
+                let choice = object(choice, sel("retain"));
+                let panel_view = object(panel, sel("contentView"));
+                assert_eq!(
+                    property(choice, "accessibilityRole").as_deref(),
+                    Some("AXButton")
+                );
+                assert_eq!(object(choice, sel("accessibilityWindow")), panel);
+                assert!(!children(view).iter().any(|node| property(*node, "accessibilityLabel").as_deref() == Some(label)),
+                    "popup controls belong to the native child surface");
+                set_bool(choice, sel("setAccessibilityFocused:"), 1);
+                assert_eq!(boolean(choice, sel("isAccessibilityFocused")), 1);
+                assert_eq!(
+                    object(panel_view, sel("accessibilityFocusedUIElement")),
+                    choice
+                );
+                assert_eq!(
+                    object(view, sel("accessibilityFocusedUIElement")),
+                    choice,
+                    "main-window focus must reach its focused native popover choice"
+                );
+                let bounds = rectangle(choice, sel("accessibilityFrame"));
+                assert!(bounds.size.width > 0.0 && bounds.size.height > 0.0);
+                assert_eq!(
+                    point_object(
+                        panel_view,
+                        sel("accessibilityHitTest:"),
+                        CGPoint {
+                            x: bounds.origin.x + bounds.size.width / 2.0,
+                            y: bounds.origin.y + bounds.size.height / 2.0,
+                        }
+                    ),
+                    choice
+                );
+                let previous = form.presses.get();
+                assert_eq!(boolean(choice, sel("accessibilityPerformPress")), 1);
+                assert_eq!(form.presses.get(), previous + delta);
+                assert!(!form.reactions.get());
+                assert_eq!(object(view, sel("accessibilityFocusedUIElement")), launcher);
+                assert_eq!(boolean(choice, sel("isAccessibilityElement")), 0);
+                assert_eq!(
+                    boolean(choice, sel("accessibilityPerformPress")),
+                    0,
+                    "retired choices cannot act after dismissal or reuse"
+                );
+                assert_eq!(form.presses.get(), previous + delta);
+                void(choice, sel("release"));
+            }
+            assert_eq!(form.presses.get(), before_reactions + 40);
+            let companion = Form {
+                presses: State::new(0),
+                reactions: State::new(false),
+                modal: State::new(false),
+                ..form
+            };
+            let companion_id = app.open(
+                WindowSpec::titled("Independent popup focus").size(480.0, 640.0),
+                Rc::new(app.runtime()),
+                companion,
+            );
+            let windows = object(
+                object(class("NSApplication"), sel("sharedApplication")),
+                sel("windows"),
+            );
+            let companion_window = (0..count(windows, sel("count")))
+                .map(|i| at(windows, sel("objectAtIndex:"), i))
+                .find(|window| {
+                    property(*window, "title").as_deref() == Some("Independent popup focus")
+                })
+                .unwrap();
+            let companion_view = object(companion_window, sel("contentView"));
+            let companion_save = named(companion_view, "Save");
+            set_bool(companion_save, sel("setAccessibilityFocused:"), 1);
+            assert_eq!(boolean(launcher, sel("accessibilityPerformPress")), 1);
+            let (_, choice) = popup_choice(window, "Thumbs up");
+            let choice = object(choice, sel("retain"));
+            set_bool(choice, sel("setAccessibilityFocused:"), 1);
+            assert_eq!(object(view, sel("accessibilityFocusedUIElement")), choice);
+            assert_eq!(
+                object(companion_view, sel("accessibilityFocusedUIElement")),
+                companion_save,
+                "another window keeps its own native focus"
+            );
+            assert_eq!(boolean(choice, sel("accessibilityPerformPress")), 1);
+            assert_eq!(boolean(choice, sel("accessibilityPerformPress")), 0);
+            assert_eq!(companion.presses.get(), 0);
+            assert!(!companion.reactions.get());
+            void(choice, sel("release"));
+            app.close(companion_id);
+            println!(
+                "Native popover roles, actions, focus, hit testing, repeated retirement and independent window passed"
+            );
             let needed = runtime.needs_frame();
             for _ in 0..10 {
                 let _ = children(view);
@@ -349,7 +653,14 @@ mod probe {
                     "NSAccessibility role={:?} label={:?} value={:?} focused={}",
                     property(node, "accessibilityRole"),
                     property(node, "accessibilityLabel"),
-                    property(node, "accessibilityValue"),
+                    if property(node, "accessibilityRole").as_deref() == Some("AXCheckBox") {
+                        Some(
+                            boolean(object(node, sel("accessibilityValue")), sel("boolValue"))
+                                .to_string(),
+                        )
+                    } else {
+                        property(node, "accessibilityValue")
+                    },
                     boolean(node, sel("isAccessibilityFocused"))
                 );
             }
@@ -376,7 +687,19 @@ mod probe {
                 .unwrap();
             let view = object(object(window, sel("contentView")), sel("retain"));
             let save = object(named(view, "Save"), sel("retain"));
+            assert_eq!(
+                boolean(
+                    named(view, "Open reactions"),
+                    sel("accessibilityPerformPress")
+                ),
+                1
+            );
+            let (_, choice) = popup_choice(window, "Heart");
+            let choice = object(choice, sel("retain"));
             app.close(id);
+            assert_eq!(boolean(choice, sel("isAccessibilityElement")), 0);
+            assert_eq!(boolean(choice, sel("accessibilityPerformPress")), 0);
+            void(choice, sel("release"));
             assert_eq!(boolean(save, sel("accessibilityPerformPress")), 0);
             assert_eq!(boolean(save, sel("isAccessibilityElement")), 0);
             assert_eq!(boolean(view, sel("isAccessibilityElement")), 0);
@@ -410,6 +733,10 @@ mod probe {
 
 #[cfg(target_os = "macos")]
 fn main() {
+    if std::env::args().any(|argument| argument == "--external-ax-fixture") {
+        probe::run(false);
+        return;
+    }
     if std::env::args().any(|argument| argument == "--teardown-witness") {
         probe::run(true);
         return;
