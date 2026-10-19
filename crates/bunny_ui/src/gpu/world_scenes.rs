@@ -18,7 +18,7 @@ use crate::world::mesh::{Mesh, MeshData};
 use crate::world::store::World;
 
 /// How many worlds the catalog holds.
-pub const COUNT: u32 = 13;
+pub const COUNT: u32 = 14;
 
 /// What a tier's picture may differ from the CPU's by: the share of
 /// pixels whose worst channel is more than three codes apart, and more
@@ -202,6 +202,22 @@ pub fn world_scene(index: u32) -> WorldScene {
             tolerance: PENUMBRA,
             pictures: Vec::new(),
         },
+        13 => {
+            // a sky over a ground, the horizon across the middle: the
+            // backdrop follows the view's tilt, not the picture's rows
+            let world = World::new();
+            world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(222, 120, 60))).set_position(vec3(0.0, 0.0, -2.0));
+            let sky = WorldStyle {
+                background: Background::Sky { zenith: Color::rgb(92, 140, 210), horizon: Color::rgb(222, 230, 238), ground: Color::rgb(150, 144, 132) },
+                ..style(Quality::Low)
+            };
+            WorldScene {
+                frame: Rc::new(world.frame(&Camera::looking_at(vec3(0.0, 1.0, 4.0), vec3(0.0, 1.6, -4.0)), &sky, (200, 140), 1.0)),
+                name: "a sky over a ground",
+                tolerance: EXACT,
+                pictures: Vec::new(),
+            }
+        }
         12 => {
             // three boxes merged into one mesh: the middle one hides (and
             // casts nothing), the last takes a tint; a ball beside them

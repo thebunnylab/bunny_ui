@@ -198,7 +198,8 @@ while is given back.
 
 `scene_view(world, camera).style(style)` and
 `painter.world_styled(rect, world, camera, &style)` take a
-`WorldStyle`: the backdrop (none, a colour or a vertical ramp), the
+`WorldStyle`: the backdrop (none, a colour, a vertical ramp, or a sky
+over a ground whose horizon moves as the camera tilts), the
 quality, a section plane that cuts the world away beyond it, an
 exposure, and `xray` — every surface see-through and every edge on top
 of them, the look of an editor over a busy model. An X-ray writes no
@@ -317,6 +318,6 @@ BUNNY_PARANOID=all cargo test -p bunny-ui-core --all-features
 cargo test -p bunny-ui-apple --features 3d
 cargo run -p bunny-ui-macos --features 3d --example world_window
 # in a page built with the web shell's `3d` feature, from the console:
-#   for (let n = 0; n < 13; n++) __bunny.bunny_gpu_world_parity(n)
+#   for (let n = 0; n < 14; n++) __bunny.bunny_gpu_world_parity(n)
 BUNNY_WORLD_GLB=chair.glb BUNNY_WORLD_DUMP=/tmp cargo test -p bunny-ui-core --features gltf --lib a_glb_from_the_environment -- --ignored
 ```

@@ -73,7 +73,7 @@ pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Textu
         color: vec![[0; 4]; (width * height) as usize],
         depth: vec![1.0; (width * height) as usize],
     };
-    target.clear(frame.background);
+    target.clear(frame);
     let shadow = sun_shadow::map_of(frame);
     let floor = frame.floor.and_then(|index| textures(index as usize));
     let projection = frame.uniforms.clip_from_eye;
@@ -159,8 +159,8 @@ struct Target {
 }
 
 impl Target {
-    fn clear(&mut self, background: Background) {
-        match background {
+    fn clear(&mut self, frame: &WorldFrame) {
+        match frame.background {
             Background::Transparent => {}
             Background::Color(c) => {
                 let pixel = premultiply([c.r, c.g, c.b], c.a);
@@ -174,6 +174,15 @@ impl Target {
                     let pixel = premultiply([lerp(top.r, bottom.r), lerp(top.g, bottom.g), lerp(top.b, bottom.b)], alpha);
                     let row = (y * self.width) as usize;
                     self.color[row..row + self.width as usize].fill(pixel);
+                }
+            }
+            Background::Sky { .. } => {
+                let Some(ramp) = frame.backdrop() else { return };
+                for y in 0..self.height {
+                    for x in 0..self.width {
+                        let at = (y * self.width + x) as usize;
+                        self.color[at] = sky(&ramp, x as f32 + 0.5, y as f32 + 0.5);
+                    }
                 }
             }
         }
@@ -193,6 +202,20 @@ impl Target {
         };
         self.color[index] = out.map(|value| (value + 0.5).floor().clamp(0.0, 255.0) as u8);
     }
+}
+
+/// The sky's colour at a pixel centre `(x, y)` (y down): the view's ray
+/// through it, against the world's up — the shaders' backdrop step for
+/// step.
+fn sky(ramp: &[[f32; 4]; 6], x: f32, y: f32) -> [u8; 4] {
+    let nx = x / ramp[2][0] * 2.0 - 1.0;
+    let ny = 1.0 - y / ramp[2][1] * 2.0;
+    let ray = if ramp[5][2] > 0.5 { [0.0, 0.0, -1.0] } else { shade::normalize([nx * ramp[5][0], ny * ramp[5][1], -1.0]) };
+    let e = shade::dot(ray, [ramp[4][0], ramp[4][1], ramp[4][2]]);
+    let (from, to, t) = if e >= 0.0 { (ramp[1], ramp[0], e * (2.0 - e)) } else { (ramp[1], ramp[3], (-e * 8.0).min(1.0)) };
+    let c = [0, 1, 2, 3].map(|k| (from[k] + (to[k] - from[k]) * t + 0.5).floor().clamp(0.0, 255.0));
+    let rgb = [0, 1, 2].map(|k| ((c[k] * c[3] + 127.0) / 255.0).floor() as u8);
+    [rgb[0], rgb[1], rgb[2], c[3] as u8]
 }
 
 fn premultiply(rgb: [u8; 3], alpha: u8) -> [u8; 4] {

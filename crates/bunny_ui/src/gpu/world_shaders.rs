@@ -586,13 +586,26 @@ void main() {
 "#;
 
 pub const BACKDROP_FRAG: &str = r#"
-// the ramp's two ends in codes, and the target's height
-uniform vec4 u_ramp[3];
+// the ramp's ends in codes, the target's size and the backdrop's kind;
+// for a sky, the ground's codes, the world's up and the lens
+uniform vec4 u_ramp[6];
 out vec4 out_color;
 
 void main() {
-    float t = gl_FragCoord.y / u_ramp[2].y;
-    vec4 c = clamp(floor(u_ramp[0] + (u_ramp[1] - u_ramp[0]) * t + 0.5), 0.0, 255.0);
+    vec4 c;
+    if (u_ramp[2].z > 0.5) {
+        // the view's ray through the pixel, against the world's up
+        float x = gl_FragCoord.x / u_ramp[2].x * 2.0 - 1.0;
+        float y = 1.0 - gl_FragCoord.y / u_ramp[2].y * 2.0;
+        vec3 ray = u_ramp[5].z > 0.5 ? vec3(0.0, 0.0, -1.0) : normalize(vec3(x * u_ramp[5].x, y * u_ramp[5].y, -1.0));
+        float e = dot(ray, u_ramp[4].xyz);
+        vec4 to = e >= 0.0 ? u_ramp[0] : u_ramp[3];
+        float t = e >= 0.0 ? e * (2.0 - e) : min(-e * 8.0, 1.0);
+        c = clamp(floor(u_ramp[1] + (to - u_ramp[1]) * t + 0.5), 0.0, 255.0);
+    } else {
+        float t = gl_FragCoord.y / u_ramp[2].y;
+        c = clamp(floor(u_ramp[0] + (u_ramp[1] - u_ramp[0]) * t + 0.5), 0.0, 255.0);
+    }
     vec3 rgb = floor((c.rgb * c.a + 127.0) / 255.0);
     out_color = vec4(rgb, c.a) / 255.0;
 }

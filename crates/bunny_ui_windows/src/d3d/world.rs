@@ -164,10 +164,11 @@ struct WorldDraw {
     float4 line_shape;
 };
 
+// the ramp's ends in codes, the target's size and the backdrop's kind;
+// for a sky, the ground's codes, the world's up and the lens
+// (`WorldFrame::backdrop`)
 struct Backdrop {
-    float4 top;
-    float4 bottom;
-    float4 size;
+    float4 rows[6];
 };
 
 // every cbuffer owns its register: a stricter compiler refuses two on one
@@ -688,8 +689,20 @@ float4 backdrop_vertex(uint vid : SV_VertexID) : SV_Position {
 }
 
 float4 backdrop_fragment(float4 position : SV_Position) : SV_Target {
-    float t = position.y / ramp.size.y;
-    float4 c = clamp(floor(ramp.top + (ramp.bottom - ramp.top) * t + 0.5), 0.0, 255.0);
+    float4 c;
+    if (ramp.rows[2].z > 0.5) {
+        // the view's ray through the pixel, against the world's up
+        float x = position.x / ramp.rows[2].x * 2.0 - 1.0;
+        float y = 1.0 - position.y / ramp.rows[2].y * 2.0;
+        float3 ray = ramp.rows[5].z > 0.5 ? float3(0.0, 0.0, -1.0) : normalize(float3(x * ramp.rows[5].x, y * ramp.rows[5].y, -1.0));
+        float e = dot(ray, ramp.rows[4].xyz);
+        float4 to = e >= 0.0 ? ramp.rows[0] : ramp.rows[3];
+        float t = e >= 0.0 ? e * (2.0 - e) : min(-e * 8.0, 1.0);
+        c = clamp(floor(ramp.rows[1] + (to - ramp.rows[1]) * t + 0.5), 0.0, 255.0);
+    } else {
+        float t = position.y / ramp.rows[2].y;
+        c = clamp(floor(ramp.rows[0] + (ramp.rows[1] - ramp.rows[0]) * t + 0.5), 0.0, 255.0);
+    }
     float3 rgb = floor((c.rgb * c.a + 127.0) / 255.0);
     return float4(rgb, c.a) / 255.0;
 }
@@ -735,13 +748,11 @@ struct DrawBlock {
 
 const _: () = assert!(std::mem::size_of::<DrawBlock>() == 64);
 
-/// The twin of `Backdrop` in the shaders: codes, then the target's size.
+/// The twin of `Backdrop` in the shaders: `WorldFrame::backdrop`'s rows.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct BackdropBlock {
-    top: [f32; 4],
-    bottom: [f32; 4],
-    size: [f32; 4],
+    rows: [[f32; 4]; 6],
 }
 
 /// `D3D11_DEPTH_STENCIL_VIEW_DESC` of one level of a 2D texture.
@@ -1055,13 +1066,12 @@ impl D3dWorld {
                     let premultiply = |channel: u8| ((channel as u32 * c.a as u32 + 127) / 255) as f32 / 255.0;
                     [premultiply(c.r), premultiply(c.g), premultiply(c.b), c.a as f32 / 255.0]
                 }
-                Background::Transparent | Background::Gradient { .. } => [0.0; 4],
+                Background::Transparent | Background::Gradient { .. } | Background::Sky { .. } => [0.0; 4],
             };
             (vtbl.clear_render_target_view)(context, rtv, clear.as_ptr());
             (vtbl.clear_depth_stencil_view)(context, target.dsv.as_ptr(), CLEAR_DEPTH, 1.0, 0);
-            if let Background::Gradient { top, bottom } = frame.background {
-                let codes = |c: bunny_ui::layout::Color| [c.r as f32, c.g as f32, c.b as f32, c.a as f32];
-                let ramp = BackdropBlock { top: codes(top), bottom: codes(bottom), size: [width as f32, height as f32, 0.0, 0.0] };
+            if let Some(rows) = frame.backdrop() {
+                let ramp = BackdropBlock { rows };
                 write_constants(context, stack.backdrop.as_ptr(), bytes_of(&ramp));
                 (vtbl.vs_set_shader)(context, stack.backdrop_vs.as_ptr(), null(), 0);
                 (vtbl.ps_set_shader)(context, stack.backdrop_ps.as_ptr(), null(), 0);

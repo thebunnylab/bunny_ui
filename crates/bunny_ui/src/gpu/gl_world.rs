@@ -550,13 +550,12 @@ impl<G: GlFamily> GlWorld<G> {
                 let premultiply = |channel: u8| ((channel as u32 * c.a as u32 + 127) / 255) as f32 / 255.0;
                 [premultiply(c.r), premultiply(c.g), premultiply(c.b), c.a as f32 / 255.0]
             }
-            Background::Transparent | Background::Gradient { .. } => [0.0; 4],
+            Background::Transparent | Background::Gradient { .. } | Background::Sky { .. } => [0.0; 4],
         };
         gl.clear(clear, 1.0);
-        if let Background::Gradient { top, bottom } = frame.background {
-            let codes = |c: crate::layout::Color| [c.r as f32, c.g as f32, c.b as f32, c.a as f32];
+        if let Some(ramp) = frame.backdrop() {
             gl.use_program(programs.backdrop.handle);
-            gl.uniform4fv(programs.backdrop.ramp, &[codes(top), codes(bottom), [width as f32, height as f32, 0.0, 0.0]]);
+            gl.uniform4fv(programs.backdrop.ramp, &ramp);
             gl.depth_func(gl::ALWAYS);
             gl.depth_mask(false);
             gl.bind_vertex_array(programs.empty);

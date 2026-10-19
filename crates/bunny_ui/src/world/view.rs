@@ -170,6 +170,11 @@ pub(crate) fn style_hash(style: &WorldStyle) -> u64 {
             put(2 << 32 | u32::from_le_bytes([top.r, top.g, top.b, top.a]) as u64);
             put(u32::from_le_bytes([bottom.r, bottom.g, bottom.b, bottom.a]) as u64);
         }
+        Background::Sky { zenith, horizon, ground } => {
+            put(3 << 32 | u32::from_le_bytes([zenith.r, zenith.g, zenith.b, zenith.a]) as u64);
+            put(u32::from_le_bytes([horizon.r, horizon.g, horizon.b, horizon.a]) as u64);
+            put(u32::from_le_bytes([ground.r, ground.g, ground.b, ground.a]) as u64);
+        }
     }
     put(style.quality as u64);
     if let Some(plane) = style.section {

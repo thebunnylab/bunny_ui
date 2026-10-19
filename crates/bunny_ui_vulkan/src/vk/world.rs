@@ -70,7 +70,7 @@ mod generator {
     const PUSH_DRAW: &str = "layout(push_constant) uniform Draw {\n    vec4 draw;\n    vec4 rows[3];\n    vec4 style[2];\n} pc;\n\
                              #define u_draw pc.draw\n#define u_rows pc.rows\n#define u_style pc.style";
 
-    const PUSH_RAMP: &str = "layout(push_constant) uniform Ramp {\n    vec4 ramp[3];\n} pc;\n#define u_ramp pc.ramp";
+    const PUSH_RAMP: &str = "layout(push_constant) uniform Ramp {\n    vec4 ramp[6];\n} pc;\n#define u_ramp pc.ramp";
 
     /// The material table: a storage buffer, four rows a material.
     const MATERIALS: &str = "layout(std430, set = 0, binding = 1) readonly buffer Materials {\n    vec4 rows[];\n} materials;";
@@ -135,7 +135,7 @@ mod generator {
             let rewritten = match trimmed {
                 "layout(std140) uniform World {" => "layout(std140, set = 0, binding = 0) uniform World {",
                 "uniform vec4 u_draw;" => PUSH_DRAW,
-                "uniform vec4 u_ramp[3];" => PUSH_RAMP,
+                "uniform vec4 u_ramp[6];" => PUSH_RAMP,
                 // the draw's block already holds them
                 "uniform vec4 u_rows[3];" | "uniform vec4 u_style[2];" => continue,
                 "uniform sampler2D u_materials;" => MATERIALS,
@@ -1522,7 +1522,7 @@ impl WorldStack {
                     let premultiply = |channel: u8| ((channel as u32 * c.a as u32 + 127) / 255) as f32 / 255.0;
                     [premultiply(c.r), premultiply(c.g), premultiply(c.b), c.a as f32 / 255.0]
                 }
-                Background::Transparent | Background::Gradient { .. } => [0.0; 4],
+                Background::Transparent | Background::Gradient { .. } | Background::Sky { .. } => [0.0; 4],
             };
             // colour, depth, and the resolve (never cleared)
             let clears = [color, [1.0, 0.0, 0.0, 0.0], [0.0; 4]];
@@ -1560,16 +1560,11 @@ impl WorldStack {
                     (bytes as *const DrawPush).cast(),
                 );
             };
-            if let Background::Gradient { top, bottom } = frame.background {
+            if let Some(rows) = frame.backdrop() {
                 let pipeline = self.pipeline(stack, Pipe::Backdrop, samples);
                 if pipeline != 0 {
-                    let codes = |c: bunny_ui::layout::Color| [c.r as f32, c.g as f32, c.b as f32, c.a as f32];
-                    // the ramp rides the draw's first three rows
-                    let ramp = DrawPush {
-                        draw: codes(top),
-                        rows: [codes(bottom), [width as f32, height as f32, 0.0, 0.0], [0.0; 4]],
-                        style: [[0.0; 4]; 2],
-                    };
+                    // the ramp's six rows ride the draw's six
+                    let ramp = DrawPush { draw: rows[0], rows: [rows[1], rows[2], rows[3]], style: [rows[4], rows[5]] };
                     (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, pipeline);
                     push(command, &ramp);
                     (fns.cmd_draw)(command, 3, 1, 0, 0);

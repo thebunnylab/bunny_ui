@@ -19,7 +19,7 @@ use super::shade::decode;
 use super::shadow;
 use super::store::{Shape, WorldData};
 use super::wire::{
-    FrameUniforms, InstanceData, LineStyleData, MAX_POINTS, MaterialData, NO_PARTS, PartRow, ShadowCaster, instance_flag, material_flag,
+    FrameUniforms, InstanceData, LineStyleData, MAX_POINTS, MaterialData, NO_PARTS, PartRow, Row, ShadowCaster, instance_flag, material_flag,
 };
 use crate::image_engine::ImageSource;
 use crate::layout::Color;
@@ -35,6 +35,10 @@ pub enum Background {
     Color(Color),
     /// A vertical ramp, top to bottom.
     Gradient { top: Color, bottom: Color },
+    /// A sky over a ground, by where the view looks: `horizon` at eye
+    /// level, `zenith` straight up, `ground` below the horizon. The
+    /// horizon moves as the camera tilts; a parallel lens sees one colour.
+    Sky { zenith: Color, horizon: Color, ground: Color },
 }
 
 /// What a picture of the world may cost.
@@ -259,6 +263,32 @@ pub struct WorldFrame {
 }
 
 impl WorldFrame {
+    /// The backdrop's block, for a backdrop a pass draws: six rows —
+    /// `[0]` the top's or the zenith's codes, `[1]` the bottom's or the
+    /// horizon's, `[2]` `(width, height, 1 for a sky, 0)`, `[3]` the
+    /// ground's codes, `[4]` the world's up in the eye's space, `[5]`
+    /// `(1/focal x, 1/focal y, 1 for a parallel lens, 0)`. `None` for a
+    /// backdrop the clear alone draws.
+    pub fn backdrop(&self) -> Option<[Row; 6]> {
+        let codes = |c: Color| [c.r as f32, c.g as f32, c.b as f32, c.a as f32];
+        let size = [self.size.0 as f32, self.size.1 as f32];
+        let u = &self.uniforms;
+        match self.background {
+            Background::Transparent | Background::Color(_) => None,
+            Background::Gradient { top, bottom } => {
+                Some([codes(top), codes(bottom), [size[0], size[1], 0.0, 0.0], [0.0; 4], [0.0; 4], [0.0; 4]])
+            }
+            Background::Sky { zenith, horizon, ground } => Some([
+                codes(zenith),
+                codes(horizon),
+                [size[0], size[1], 1.0, 0.0],
+                codes(ground),
+                [u.sky_up[0], u.sky_up[1], u.sky_up[2], 0.0],
+                [1.0 / u.clip_from_eye[0], 1.0 / u.clip_from_eye[5], u.params[3], 0.0],
+            ]),
+        }
+    }
+
     /// One number for everything a tier reads: two frames with the same
     /// checksum draw the same picture.
     pub fn checksum(&self) -> u64 {
