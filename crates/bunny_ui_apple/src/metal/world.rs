@@ -430,7 +430,7 @@ static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* 
             normal = -normal;
         }
         float3 light = lit(u, in.eye, normal, base, material.params.x, material.params.y,
-                           material.emissive.xyz, in.occlusion, 0xFFFFFFFFu,
+                           material.emissive.xyz, in.occlusion, 1u << ((instance.flags >> 8) & 31u),
                            sun_visibility(u, shadow_map, compare, in.eye, normal));
         if (u.tone.z > 0.5) {
             dither = bayer(uint(in.position.x), uint(in.position.y));

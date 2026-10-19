@@ -392,7 +392,8 @@ pub(crate) fn build_frame(
             eye_from_model,
             bounds,
             tint: data.spec.tint,
-            flags: if data.spec.casts_shadow { instance_flag::CASTS_SHADOW } else { 0 },
+            flags: if data.spec.casts_shadow { instance_flag::CASTS_SHADOW } else { 0 }
+                | (data.spec.light_group as u32 & instance_flag::GROUP_MASK) << instance_flag::GROUP_SHIFT,
         };
         match &data.spec.shape {
             Shape::Model(model) => {

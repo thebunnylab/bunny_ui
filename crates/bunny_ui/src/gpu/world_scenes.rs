@@ -17,7 +17,7 @@ use crate::world::mesh::{Mesh, MeshData};
 use crate::world::store::World;
 
 /// How many worlds the catalog holds.
-pub const COUNT: u32 = 10;
+pub const COUNT: u32 = 11;
 
 /// What a tier's picture may differ from the CPU's by: the share of
 /// pixels whose worst channel is more than three codes apart, and more
@@ -178,6 +178,26 @@ pub fn world_scene(index: u32) -> WorldScene {
             tolerance: PENUMBRA,
             pictures: Vec::new(),
         },
+        10 => {
+            // two rooms at night, a lamp in each: each lamp reaches its own
+            // room's group alone, though the light would reach both
+            let world = World::new();
+            world.add_light(Light::sky(Color::rgb(30, 34, 46), Color::rgb(20, 18, 16)));
+            let floor = Mesh::plane(3.0, 3.0);
+            let block = Mesh::cuboid(0.8, 0.8, 0.8);
+            for (room, x) in [(1u8, -1.6), (2u8, 1.6)] {
+                world.add(floor.clone(), Material::color(Color::rgb(210, 204, 196))).set_position(vec3(x, 0.0, 0.0)).set_light_group(room);
+                world.add(block.clone(), Material::color(Color::rgb(222, 120, 60))).set_position(vec3(x, 0.4, -0.4)).set_light_group(room);
+                let lamp = if room == 1 { Color::rgb(255, 196, 140) } else { Color::rgb(150, 190, 255) };
+                world.add_light(Light::point(lamp).intensity(2.5).range(4.5).radius(0.4).groups(1 << room)).set_position(vec3(x * 0.4, 1.2, 0.6));
+            }
+            WorldScene {
+                frame: frame(&world, &Camera::orbiting(vec3(0.0, 0.3, 0.0), 0.0, 38.0, 6.0), Quality::Low, (200, 120)),
+                name: "lamps by group",
+                tolerance: EXACT,
+                pictures: Vec::new(),
+            }
+        }
         9 => {
             let world = World::new();
             world.add(Mesh::plane(8.0, 8.0), Material::color(Color::rgb(228, 224, 216)));

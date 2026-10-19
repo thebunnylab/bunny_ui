@@ -115,6 +115,10 @@ pub mod instance_offset {
 /// Bits of [`InstanceData::flags`].
 pub mod instance_flag {
     pub const CASTS_SHADOW: u32 = 1;
+    /// Where the entity's light group (0 to 31) lies: its surfaces answer
+    /// to the point lights whose mask holds bit `group`.
+    pub const GROUP_SHIFT: u32 = 8;
+    pub const GROUP_MASK: u32 = 31;
 }
 
 /// One material of the frame's table. 64 bytes; a tier stores the table

@@ -68,6 +68,7 @@ layout(location = 4) in float v_occlusion;
 layout(location = 5) in vec2 v_zw;
 layout(location = 6) flat in uint v_material;
 layout(location = 7) flat in vec4 v_tint;
+layout(location = 8) flat in uint v_groups;
 
 layout(std430, set = 0, binding = 1) readonly buffer Materials {
     vec4 rows[];
@@ -266,7 +267,7 @@ vec4 shade() {
         if (!front) {
             normal = -normal;
         }
-        vec3 light = lit(v_eye, normal, base, params_row.x, params_row.y, emissive_row.xyz, v_occlusion, 0xFFFFFFFFu, sun_visibility(v_eye, normal));
+        vec3 light = lit(v_eye, normal, base, params_row.x, params_row.y, emissive_row.xyz, v_occlusion, v_groups, sun_visibility(v_eye, normal));
         if (tone.z > 0.5) {
             dither = bayer(uint(gl_FragCoord.x), uint(gl_FragCoord.y));
         }

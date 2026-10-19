@@ -22,7 +22,7 @@ use super::mesh::{fold_normal, unfold_normal};
 use super::shade::{self, Surface, V3, decode, encode_code, quantize};
 use super::shadow::{self as sun_shadow, ShadowMap};
 use super::texture::{Texture, log2};
-use super::wire::{FrameUniforms, InstanceData, material_flag};
+use super::wire::{FrameUniforms, InstanceData, instance_flag, material_flag};
 
 /// A picture of a world: premultiplied, sRGB-encoded RGBA8, top row
 /// first.
@@ -497,7 +497,7 @@ impl Job<'_> {
                     metallic: material.params[1],
                     emissive: [material.emissive[0], material.emissive[1], material.emissive[2]],
                     occlusion,
-                    groups: u32::MAX,
+                    groups: 1 << ((self.instance.flags >> instance_flag::GROUP_SHIFT) & instance_flag::GROUP_MASK),
                     shadow,
                 },
             );
@@ -982,6 +982,24 @@ mod tests {
             let share = darker as f64 / (160.0 * 120.0);
             assert!(share > 0.01 && share < 0.12, "{quality:?}: {share} of the picture in shadow");
         }
+    }
+
+    #[test]
+    fn a_lamp_lights_only_the_groups_it_names() {
+        let paint = |groups: u32| {
+            let world = World::new();
+            world.add_light(crate::world::material::Light::sky(Color::rgb(20, 20, 24), Color::rgb(10, 10, 10)));
+            world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::WHITE)).set_position(vec3(-0.8, 0.0, 0.0)).set_light_group(1);
+            world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::WHITE)).set_position(vec3(0.8, 0.0, 0.0)).set_light_group(2);
+            world.add_light(crate::world::material::Light::point(Color::WHITE).range(4.0).groups(groups)).set_position(vec3(0.0, 0.0, 1.5));
+            world.render(&front_camera(), &style(Background::Transparent), (64, 32), 1.0)
+        };
+        let (both, first, neither) = (paint(0b110), paint(0b010), paint(0));
+        let (left, right) = ((16, 16), (48, 16));
+        assert!(first.at(left.0, left.1)[0] > neither.at(left.0, left.1)[0] + 20, "the lamp lights its group");
+        assert_eq!(first.at(right.0, right.1), neither.at(right.0, right.1), "and nothing of the other");
+        assert_eq!(both.at(left.0, left.1), first.at(left.0, left.1), "a group is lit the same with another beside it");
+        assert!(both.at(right.0, right.1)[0] > neither.at(right.0, right.1)[0] + 20);
     }
 
     #[test]

@@ -46,6 +46,11 @@ pub struct EntitySpec {
     pub visible: bool,
     pub pickable: bool,
     pub casts_shadow: bool,
+    /// The group of lights the entity's surfaces answer to, 0 to 31: a
+    /// point light reaches the groups its mask names
+    /// ([`super::material::PointLight::groups`]). A lamp in one room
+    /// does not light the next.
+    pub light_group: u8,
     /// Multiplies the colour of every material of the entity.
     pub tint: Color,
     /// A number the app chooses, given back with a pick.
@@ -68,6 +73,7 @@ impl EntitySpec {
             visible: true,
             pickable: true,
             casts_shadow: true,
+            light_group: 0,
             tint: Color::WHITE,
             tag: 0,
             extras: None,
@@ -117,6 +123,11 @@ impl EntitySpec {
 
     pub fn without_shadow(self) -> EntitySpec {
         EntitySpec { casts_shadow: false, ..self }
+    }
+
+    /// The entity's surfaces answer to the lights of `group` (0 to 31).
+    pub fn in_light_group(self, group: u8) -> EntitySpec {
+        EntitySpec { light_group: group.min(31), ..self }
     }
 
     /// The box around what the entity shows, in its own space. Empty for
@@ -633,6 +644,11 @@ impl Entity {
 
     pub fn set_casts_shadow(self, casts: bool) -> Entity {
         self.change(|spec| spec.casts_shadow = casts)
+    }
+
+    /// The entity's surfaces answer to the lights of `group` (0 to 31).
+    pub fn set_light_group(self, group: u8) -> Entity {
+        self.change(|spec| spec.light_group = group.min(31))
     }
 
     pub fn set_tint(self, tint: Color) -> Entity {

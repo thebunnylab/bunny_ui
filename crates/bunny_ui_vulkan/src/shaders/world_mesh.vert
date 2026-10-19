@@ -83,6 +83,7 @@ layout(location = 4) out float v_occlusion;
 layout(location = 5) out vec2 v_zw;
 layout(location = 6) flat out uint v_material;
 layout(location = 7) flat out vec4 v_tint;
+layout(location = 8) flat out uint v_groups;
 
 vec3 unfold_normal(ivec2 folded) {
     float u = max(float(folded.x) / 32767.0, -1.0);
@@ -114,4 +115,6 @@ void main() {
     v_occlusion = float(a_ids.y) / 255.0;
     v_material = i_ids.x + a_ids.x;
     v_tint = vec4(SRGB_DECODE[i_tint.r], SRGB_DECODE[i_tint.g], SRGB_DECODE[i_tint.b], float(i_tint.a) / 255.0);
+    // the light group the instance's flags name, as the bit a lamp's mask holds
+    v_groups = 1u << ((i_ids.z >> 8) & 31u);
 }
