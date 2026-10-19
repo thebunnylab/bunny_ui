@@ -1,0 +1,8 @@
+{
+  "real-host-fixture-mismatch.log": "610dee7377fd3c98200ed86c6e08364f717b8e9e5ded06ec1f68505e302aa796",
+  "trinity-before-fix.log": "479416298d11344d5718dec987b4914b710d15b3e7fd69710f1b391a040ac59c",
+  "clippy.log": "d79312e0dc00ad0e64b1babe1b686669eccfba87a5d6aef21c371d7a1232f674",
+  "real-host-snapshot-mismatch.log": "59f353467f2747b869dc1bf9961658f6c67ad246702ef5cb7bbc614373a13383",
+  "real-host.log": "9f08f86197b6515645390f85ce497afd03992b463baa6cb640f1408fde1fa1bb",
+  "tests.log": "ce0fd9382a065accb31bd300567c799398660c8e8ff2677853b0cb4332c46aa6"
+}

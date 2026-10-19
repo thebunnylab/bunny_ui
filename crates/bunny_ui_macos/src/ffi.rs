@@ -2,9 +2,10 @@
 //!
 //! This module is the project's sanctioned `unsafe` border: the
 //! Objective-C runtime is called through `objc_msgSend` re-declared with
-//! the concrete signature of each message (on arm64 there is ONE single
-//! entry point for all messages — small structs go and come back in
-//! registers, no `_stret` variant), and two classes are born at runtime
+//! the concrete signature of each message. `CGRect` returns use
+//! `objc_msgSend_stret` on `x86_64`; arm64 uses `objc_msgSend` for every
+//! return type. `CGPoint` and `CGSize` stay in registers on both targets.
+//! Two classes are born at runtime
 //! via `objc_allocateClassPair`/`class_addMethod`:
 //!
 //! - `BunnyView` (NSView) — receives the full pointer cycle
@@ -32,14 +33,33 @@ pub(crate) use bunny_ui_apple::ffi::{
     CFRelease, CGColorSpaceCreateDeviceRGB, CGColorSpaceRelease, CGContextDrawImage,
     CGContextSetInterpolationQuality, CGImageRelease, CGPoint, CGRect, CGSize, Id, NS_NOT_FOUND,
     NSRange, NSRunLoopCommonModes, ObjcSuper, Sel, class, class_addMethod, class_addProtocol,
-    kill_layer_actions, modifiers_of, objc_allocateClassPair, objc_autoreleasePoolPop,
-    objc_autoreleasePoolPush, objc_getProtocol, objc_registerClassPair, ns_string, owned_provider,
-    sel, sel_getName, text_argument_to_string, wake_from_any_thread,
+    kill_layer_actions, modifiers_of, ns_string, objc_allocateClassPair, objc_autoreleasePoolPop,
+    objc_autoreleasePoolPush, objc_getProtocol, objc_registerClassPair, owned_provider, sel,
+    sel_getName, text_argument_to_string, wake_from_any_thread,
 };
+
+use crate::objc_bool::{self, ObjcBool};
+
+#[path = "appearance.rs"]
+mod appearance;
+#[path = "confirmation.rs"]
+mod confirmation;
+pub use appearance::os_appearance;
+pub use confirmation::{available as confirmation_available, queue as queue_confirmation};
 
 #[path = "accessibility.rs"]
 mod accessibility;
 pub(crate) use accessibility::Accessibility;
+
+#[path = "modal.rs"]
+mod modal;
+
+#[path = "window_ops.rs"]
+mod window_ops;
+pub use window_ops::{focus_window, set_window_parent};
+#[path = "geometry_ops.rs"]
+mod geometry_ops;
+pub use geometry_ops::{register_geometry, forget_geometry, window_geometry, restore_window_placement};
 
 use bunny_ui::action::ActionId;
 use bunny_ui::menu::Pick;
@@ -57,7 +77,7 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_void_id(obj: Id, sel: Sel, a: Id);
     #[link_name = "objc_msgSend"]
-    fn msg_void_bool(obj: Id, sel: Sel, a: i8);
+    fn msg_void_bool(obj: Id, sel: Sel, a: ObjcBool);
     #[link_name = "objc_msgSend"]
     fn msg_void_f64(obj: Id, sel: Sel, a: f64);
     #[link_name = "objc_msgSend"]
@@ -67,25 +87,26 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_f64(obj: Id, sel: Sel) -> f64;
     #[link_name = "objc_msgSend"]
-    fn msg_bool_i64(obj: Id, sel: Sel, a: i64) -> i8;
+    fn msg_bool_i64(obj: Id, sel: Sel, a: i64) -> ObjcBool;
     #[link_name = "objc_msgSend"]
     fn msg_id_cstr(obj: Id, sel: Sel, a: *const c_char) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_point(obj: Id, sel: Sel) -> CGPoint;
-    #[link_name = "objc_msgSend"]
+    #[cfg_attr(target_arch = "aarch64", link_name = "objc_msgSend")]
+    #[cfg_attr(target_arch = "x86_64", link_name = "objc_msgSend_stret")]
     fn msg_rect(obj: Id, sel: Sel) -> CGRect;
     #[link_name = "objc_msgSend"]
     fn msg_init_rect(obj: Id, sel: Sel, rect: CGRect) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_void_rect(obj: Id, sel: Sel, rect: CGRect);
     #[link_name = "objc_msgSend"]
-    fn msg_init_window(obj: Id, sel: Sel, rect: CGRect, style: u64, backing: u64, defer: i8)
+    fn msg_init_window(obj: Id, sel: Sel, rect: CGRect, style: u64, backing: u64, defer: ObjcBool)
     -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_init_tracking(obj: Id, sel: Sel, rect: CGRect, options: u64, owner: Id, info: Id)
     -> Id;
     #[link_name = "objc_msgSend"]
-    fn msg_bool(obj: Id, sel: Sel) -> i8;
+    fn msg_bool(obj: Id, sel: Sel) -> ObjcBool;
     #[link_name = "objc_msgSend"]
     fn msg_u16(obj: Id, sel: Sel) -> u16;
     #[link_name = "objc_msgSend"]
@@ -99,9 +120,9 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_id_u64_u64(obj: Id, sel: Sel, a: u64, b: u64) -> Id;
     #[link_name = "objc_msgSend"]
-    fn msg_bool_id_id(obj: Id, sel: Sel, a: Id, b: Id) -> i8;
+    fn msg_bool_id_id(obj: Id, sel: Sel, a: Id, b: Id) -> ObjcBool;
     #[link_name = "objc_msgSend"]
-    fn msg_bool_id(obj: Id, sel: Sel, a: Id) -> i8;
+    fn msg_bool_id(obj: Id, sel: Sel, a: Id) -> ObjcBool;
     #[link_name = "objc_msgSend"]
     fn msg_id_u64_id(obj: Id, sel: Sel, a: u64, b: Id) -> Id;
     #[link_name = "objc_msgSend"]
@@ -112,11 +133,12 @@ unsafe extern "C" {
         target: Id,
         selector: Sel,
         info: Id,
-        repeats: i8,
+        repeats: ObjcBool,
     ) -> Id;
     #[link_name = "objc_msgSend"]
-    fn msg_bool_sel(obj: Id, sel: Sel, a: Sel) -> i8;
-    #[link_name = "objc_msgSend"]
+    fn msg_bool_sel(obj: Id, sel: Sel, a: Sel) -> ObjcBool;
+    #[cfg_attr(target_arch = "aarch64", link_name = "objc_msgSend")]
+    #[cfg_attr(target_arch = "x86_64", link_name = "objc_msgSend_stret")]
     fn msg_rect_rect(obj: Id, sel: Sel, rect: CGRect) -> CGRect;
     #[link_name = "objc_msgSend"]
     fn msg_id_id_sel(obj: Id, sel: Sel, target: Id, selector: Sel) -> Id;
@@ -133,9 +155,13 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_void_id_i64_id(obj: Id, sel: Sel, a: Id, b: i64, c: Id);
     #[link_name = "objc_msgSendSuper"]
-    fn msg_super_bool_id(sup: *const ObjcSuper, sel: Sel, a: Id) -> i8;
+    fn msg_super_bool_id(sup: *const ObjcSuper, sel: Sel, a: Id) -> ObjcBool;
+    #[link_name = "objc_msgSendSuper"]
+    fn msg_super_id_point(sup: *const ObjcSuper, sel: Sel, point: CGPoint) -> Id;
     #[link_name = "objc_msgSend"]
-    fn msg_void_rect_bool(obj: Id, sel: Sel, rect: CGRect, flag: i8);
+    fn msg_observe(obj: Id, sel: Sel, observer: Id, key: Id, options: usize, context: *mut c_void);
+    #[link_name = "objc_msgSend"]
+    fn msg_void_rect_bool(obj: Id, sel: Sel, rect: CGRect, flag: ObjcBool);
     #[link_name = "objc_msgSend"]
     fn msg_void_i64(obj: Id, sel: Sel, a: i64);
     #[link_name = "objc_msgSend"]
@@ -208,6 +234,12 @@ unsafe extern "C" {
 /// display-link tick reaches every window that wants it.
 #[derive(Clone)]
 pub enum AppEvent {
+    /// Deferred application-effective appearance observed by `AppKit`.
+    AppearanceChanged(Option<bunny_ui::theme::Appearance>),
+    /// Captured native geometry addressed to its non-recycled scene lifetime.
+    GeometryChanged(bunny_ui::window::GeometryObservation),
+    /// A native dialog fact scoped to its current presentation and subscription.
+    DialogGeometryChanged(bunny_ui::window::DialogGeometryObservation),
     /// A native assistive-technology client first queried this window.
     AccessibilityEnable,
     /// A validated native element requests an action on its retained control.
@@ -381,6 +413,7 @@ impl Default for Manners {
 /// which is to say on the very next frame. That crash is what this
 /// function exists to have already prevented.
 fn forget_window(window: usize) {
+    update_modal_scopes(|scopes| scopes.forget(window));
     // a window that closed wants no beat
     BEAT_WANTS.with(|wants| wants.borrow_mut().retain(|(open, _)| *open != window));
     let blinking = BLINK_WANTS.with(|wants| wants.borrow_mut().remove(window));
@@ -421,9 +454,9 @@ pub fn set_close_gate(gate: CloseGate) {
     CLOSE_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
 }
 
-extern "C" fn bunny_window_should_close(_this: Id, _sel: Sel, sender: Id) -> i8 {
+extern "C" fn bunny_window_should_close(_this: Id, _sel: Sel, sender: Id) -> ObjcBool {
     let gate = CLOSE_GATE.with(|slot| slot.borrow().clone());
-    i8::from(gate.is_none_or(|gate| gate(sender as usize)))
+    ObjcBool::new(gate.is_none_or(|gate| gate(sender as usize)))
 }
 
 /// Reads native visibility for a registered top-level window.
@@ -435,7 +468,7 @@ pub fn window_visibility(
         return Err(WindowError::StaleWindow);
     }
     Ok(
-        if unsafe { msg_bool(window as Id, sel("isVisible")) } != 0 {
+        if unsafe { msg_bool(window as Id, sel("isVisible")) }.get() {
             WindowVisibility::Shown
         } else {
             WindowVisibility::Hidden
@@ -478,8 +511,7 @@ unsafe fn start_beat(window: Id, view: Id, delegate: Id) {
         // extra thread. Born PAUSED: events repaint by themselves; the
         // link runs only while something animates. An older system
         // skips it and animations snap to their target.
-        if msg_bool_sel(view, sel("respondsToSelector:"), sel("displayLinkWithTarget:selector:"))
-            != 0
+        if msg_bool_sel(view, sel("respondsToSelector:"), sel("displayLinkWithTarget:selector:")).get()
         {
             let link = msg_id_id_sel(
                 view,
@@ -488,7 +520,7 @@ unsafe fn start_beat(window: Id, view: Id, delegate: Id) {
                 sel("bunnyFrame:"),
             );
             if !link.is_null() {
-                msg_void_bool(link, sel("setPaused:"), 1);
+                msg_void_bool(link, sel("setPaused:"), ObjcBool::YES);
                 // the link arrives unscheduled — common modes keep the
                 // ticks coming during event tracking (live resize)
                 msg_void_id_id(
@@ -520,6 +552,9 @@ fn owning_window(window: Id) -> usize {
         if window.is_null() {
             return 0;
         }
+        if WINDOWS.with(|windows| windows.borrow().iter().any(|(live, _, _)| *live == window as usize)) {
+            return window as usize;
+        }
         let parent = unsafe { msg_id(window, sel("parentWindow")) };
         if parent.is_null() {
             return window as usize;
@@ -539,6 +574,16 @@ pub fn dispatch_to(window: Id, event: AppEvent) {
 /// worker's wake. The app fans it out.
 pub fn dispatch_all(event: AppEvent) {
     dispatch_from(0, event);
+}
+
+/// Preserve dialog facts even during `lend_hand`; callbacks run on a later dispatch.
+pub fn queue_dialog_geometry(event: bunny_ui::window::DialogGeometryObservation) {
+    PENDING.with(|queue| {
+        queue
+            .borrow_mut()
+            .push_back((0, AppEvent::DialogGeometryChanged(event)));
+    });
+    wake_from_any_thread();
 }
 
 fn dispatch_from(source: usize, event: AppEvent) {
@@ -577,6 +622,28 @@ fn dispatch_from(source: usize, event: AppEvent) {
         let Some((source, event)) = next else { break };
         dispatch_from(source, event);
     }
+    confirmation::drain();
+}
+
+/// Native placement can synchronously notify while `AppKit` still uses its frame.
+/// Preserve those facts and let user callbacks run after the operation returns.
+pub fn defer_events<T>(work: impl FnOnce() -> T) -> T {
+    struct Deferred(bool);
+    impl Drop for Deferred {
+        fn drop(&mut self) { DISPATCHING.with(|flag| flag.set(self.0)); }
+    }
+    let held = DISPATCHING.with(|flag| flag.replace(true));
+    let deferred = Deferred(held);
+    let result = work();
+    drop(deferred);
+    if !held {
+        loop {
+            let next = PENDING.with(|queue| queue.borrow_mut().pop_front());
+            let Some((source, event)) = next else { break };
+            dispatch_from(source, event);
+        }
+    }
+    result
 }
 
 /// An event that waits behind a running handler joins the line — and a
@@ -625,13 +692,16 @@ pub fn dispatch(event: AppEvent) {
 /// A knock from another thread lands here, on the main thread, as one
 /// more beat for every window.
 extern "C" fn perform_wake(_info: *mut c_void) {
+    appearance::deliver();
     dispatch_all(AppEvent::Wake);
+    confirmation::drain();
 }
 
 /// Opens the run-loop door a background thread knocks on. Called once,
 /// on the main thread, while the window is being built.
 pub fn install_wake_source() {
     bunny_ui_apple::ffi::install_wake_source(perform_wake);
+    appearance::install();
 }
 
 /// The system says memory is short: every window hears it on the main
@@ -742,8 +812,8 @@ fn file_drag(this: Id, info: Id, phase: FileDrag) -> bool {
 extern "C" fn bunny_drag_preview(this: Id, _: Sel, info: Id) -> u64 {
     u64::from(file_drag(this, info, FileDrag::Preview))
 }
-extern "C" fn bunny_file_drop(this: Id, _: Sel, info: Id) -> i8 {
-    i8::from(file_drag(this, info, FileDrag::Drop))
+extern "C" fn bunny_file_drop(this: Id, _: Sel, info: Id) -> ObjcBool {
+    ObjcBool::new(file_drag(this, info, FileDrag::Drop))
 }
 extern "C" fn bunny_drag_exit(this: Id, _: Sel, info: Id) {
     file_drag(this, info, FileDrag::Exit);
@@ -884,8 +954,8 @@ unsafe fn scene_point_under_mouse(left: Id) -> Option<(f64, f64)> {
 }
 
 /// BunnyView accepts first responder — without this, keyDown never arrives.
-extern "C" fn bunny_accepts_first_responder(_this: Id, _sel: Sel) -> i8 {
-    1
+const extern "C" fn bunny_accepts_first_responder(_this: Id, _sel: Sel) -> ObjcBool {
+    ObjcBool::YES
 }
 
 /// The raw AppKit key already extracted — the keymap gate's vocabulary.
@@ -1009,8 +1079,8 @@ extern "C" fn bunny_unmark_text(_this: Id, _sel: Sel) {
     dispatch(AppEvent::ImeUnmark);
 }
 
-extern "C" fn bunny_has_marked_text(_this: Id, _sel: Sel) -> i8 {
-    i8::from(ime_mirror().is_some_and(|ime| ime.marked.location != NS_NOT_FOUND))
+extern "C" fn bunny_has_marked_text(_this: Id, _sel: Sel) -> ObjcBool {
+    ObjcBool::new(ime_mirror().is_some_and(|ime| ime.marked.location != NS_NOT_FOUND))
 }
 
 extern "C" fn bunny_marked_range(_this: Id, _sel: Sel) -> NSRange {
@@ -1138,7 +1208,7 @@ unsafe fn bare_characters(event: Id) -> String {
     unsafe {
         let selector = sel("charactersByApplyingModifiers:");
         let fallback = || text_argument_to_string(msg_id(event, sel("charactersIgnoringModifiers")));
-        if msg_bool_sel(class("NSEvent"), sel("instancesRespondToSelector:"), selector) == 0 {
+        if !msg_bool_sel(class("NSEvent"), sel("instancesRespondToSelector:"), selector).get() {
             return fallback();
         }
         let bare = text_argument_to_string(msg_id_u64(event, selector, 0));
@@ -1161,7 +1231,7 @@ unsafe fn bare_characters(event: Id) -> String {
 unsafe fn typed_character(event: Id, flags: u64) -> Option<char> {
     unsafe {
         let selector = sel("charactersByApplyingModifiers:");
-        if msg_bool_sel(class("NSEvent"), sel("instancesRespondToSelector:"), selector) == 0 {
+        if !msg_bool_sel(class("NSEvent"), sel("instancesRespondToSelector:"), selector).get() {
             return None;
         }
         let typed = text_argument_to_string(msg_id_u64(event, selector, flags));
@@ -1178,8 +1248,8 @@ unsafe fn typed_character(event: Id, flags: u64) -> Option<char> {
 /// NSView's own `performKeyEquivalent:` — the walk into the subviews
 /// this override would otherwise swallow (the page's ⌘C in a form
 /// lives down there).
-unsafe fn key_equivalent_super(this: Id, event: Id) -> i8 {
-    let sup = ObjcSuper { receiver: this, class: class("NSView") };
+unsafe fn key_equivalent_super(this: Id, event: Id) -> ObjcBool {
+    let sup = ObjcSuper { receiver: this, class: unsafe { class("NSView") } };
     unsafe { msg_super_bool_id(&sup, sel("performKeyEquivalent:"), event) }
 }
 
@@ -1217,7 +1287,7 @@ unsafe fn first_offer(event: Id) -> bool {
 ///   here, and everything but a chord is the page's to type.
 /// - not consumed → super, so the page keeps its own chords, and the menu
 ///   bar has its turn after.
-extern "C" fn bunny_perform_key_equivalent(this: Id, _sel: Sel, event: Id) -> i8 {
+extern "C" fn bunny_perform_key_equivalent(this: Id, _sel: Sel, event: Id) -> ObjcBool {
     unsafe {
         let window = msg_id(this, sel("window"));
         if window.is_null() {
@@ -1244,7 +1314,7 @@ extern "C" fn bunny_perform_key_equivalent(this: Id, _sel: Sel, event: Id) -> i8
             chars_bare: bare_characters(event),
         };
         if gate_consumed(&stroke) {
-            return 1; // the keymap dispatched — the event dies here
+            return ObjcBool::YES; // the keymap dispatched — the event dies here
         }
         key_equivalent_super(this, event)
     }
@@ -1298,7 +1368,7 @@ extern "C" fn bunny_scroll_wheel(this: Id, _sel: Sel, event: Id) {
         let mut dy = msg_f64(event, sel("scrollingDeltaY"));
         // trackpad delivers precise points; the legacy wheel delivers line
         // TICKS — converted to points here, once
-        if msg_bool(event, sel("hasPreciseScrollingDeltas")) == 0 {
+        if !msg_bool(event, sel("hasPreciseScrollingDeltas")).get() {
             dx *= 16.0;
             dy *= 16.0;
         }
@@ -1385,13 +1455,18 @@ extern "C" fn bunny_window_did_change_backing(_this: Id, _sel: Sel, note: Id) {
 // them apart: a drag on the left or top edge moves the origin AND
 // the size, so `move` and `resize` both arrive on every step.
 fn window_frame_changed(note: Id, kind: &str) {
+    defer_events(|| window_frame_changed_inner(note, kind));
+}
+
+fn window_frame_changed_inner(note: Id, kind: &str) {
     let window = unsafe { msg_id(note, sel("object")) };
+    geometry_ops::notify(window as usize);
     if crate::trace::active() {
         unsafe {
             let view = msg_id(window, sel("contentView"));
             if !view.is_null() {
                 let bounds = msg_rect(view, sel("bounds"));
-                let live = msg_bool(view, sel("inLiveResize")) != 0;
+                let live = msg_bool(view, sel("inLiveResize")).get();
                 crate::trace::mark(
                     "R",
                     format_args!(
@@ -1408,7 +1483,7 @@ fn window_frame_changed(note: Id, kind: &str) {
     // the platform's word on the window itself, before the frame that
     // shows it: zoomed is the mac's maximized
     if kind == "resize" {
-        let maximized = unsafe { msg_bool(window, sel("isZoomed")) } != 0;
+        let maximized = unsafe { msg_bool(window, sel("isZoomed")) }.get();
         dispatch_to(window, AppEvent::WindowState { maximized });
     }
     dispatch_to(window, AppEvent::Redraw);
@@ -1578,46 +1653,74 @@ pub fn place_traffic_lights(window: Id) {
     }
 }
 
+#[derive(Default)]
+struct ModalWindows {
+    scopes: modal::ModalScopes,
+    disabled: HashMap<usize, [bool; 3]>,
+}
+
 thread_local! {
-    /// True while a dialog holds the app window-modal: the MAIN window
-    /// answers `canBecomeKeyWindow` with NO, so a click on it cannot
-    /// pull the keyboard out of the dialog — the JetBrains manner.
-    static MODAL_BLOCKED: Cell<bool> = const { Cell::new(false) };
+    // Only the parent and lower dialogs in this scene refuse key/main.
+    // Native addresses stay inside the main-thread AppKit boundary.
+    static MODAL_WINDOWS: RefCell<ModalWindows> = RefCell::default();
 }
 
-/// `BunnyWindow`'s answer to "may I become key" — YES, a titled
-/// window's own answer, until a dialog holds the app modal. The
-/// subclass exists for this one question.
-extern "C" fn bunny_window_can_become_key(_this: Id, _sel: Sel) -> i8 {
-    i8::from(!MODAL_BLOCKED.with(Cell::get))
+extern "C" fn bunny_window_can_become_key(this: Id, _sel: Sel) -> ObjcBool {
+    ObjcBool::new(!MODAL_WINDOWS.with(|state| state.borrow().scopes.is_blocked(this as usize)))
 }
 
-/// Holds the app window-modal under a dialog: the parent's three
-/// traffic lights go dark (disabled, not hidden — the JetBrains bar)
-/// and the parent refuses key. No nested run loop is involved; the
-/// scene's own modal floor already swallows the parent's input.
-pub fn begin_window_modal(parent: &WindowHandle) {
-    MODAL_BLOCKED.with(|blocked| blocked.set(true));
-    set_standard_buttons_enabled(parent, false);
+/// Mirrors layout's modal order before making its top window key. These
+/// are child windows with framework-managed modality, not `AppKit` sheets.
+pub fn set_window_modals(parent: &WindowHandle, dialogs: &[WindowHandle]) {
+    update_modal_scopes(|scopes| {
+        scopes.set(
+            parent.raw_window(),
+            dialogs.iter().map(WindowHandle::raw_window).collect(),
+        );
+    });
 }
 
-/// The reverse, on the dialog's way out. It runs BEFORE the parent is
-/// made key again — the make-key asks `canBecomeKeyWindow`, and the
-/// answer has to already be yes.
-pub fn end_window_modal(parent: &WindowHandle) {
-    MODAL_BLOCKED.with(|blocked| blocked.set(false));
-    set_standard_buttons_enabled(parent, true);
+fn update_modal_scopes(change: impl FnOnce(&mut modal::ModalScopes)) {
+    let (restore, block) = MODAL_WINDOWS.with(|state| {
+        let mut state = state.borrow_mut();
+        change(&mut state.scopes);
+        let blocked: Vec<_> = state.scopes.blocked().collect();
+        let restore: Vec<_> = state
+            .disabled
+            .iter()
+            .filter(|(window, _)| !blocked.contains(window))
+            .map(|(&window, &buttons)| (window, buttons))
+            .collect();
+        for (window, _) in &restore {
+            state.disabled.remove(window);
+        }
+        let block: Vec<_> = blocked
+            .into_iter()
+            .filter(|window| !state.disabled.contains_key(window))
+            .collect();
+        (restore, block)
+    });
+    // AppKit may synchronously ask for key eligibility during a transition.
+    // No registry borrow survives an Objective-C call.
+    for (window, buttons) in restore {
+        set_standard_buttons(window, buttons);
+    }
+    for window in block {
+        let buttons = WINDOW_BUTTONS.map(|kind| unsafe {
+            let button = msg_id_u64(window as Id, sel("standardWindowButton:"), kind);
+            !button.is_null() && msg_bool(button, sel("isEnabled")).get()
+        });
+        MODAL_WINDOWS.with(|state| state.borrow_mut().disabled.insert(window, buttons));
+        set_standard_buttons(window, [false; 3]);
+    }
 }
 
-/// Enables or disables the window's three standard buttons. The
-/// placement loop above only ever moves frames, so a disabled button
-/// stays disabled through every re-place.
-fn set_standard_buttons_enabled(window: &WindowHandle, enabled: bool) {
-    unsafe {
-        for kind in WINDOW_BUTTONS {
-            let button = msg_id_u64(window.window, sel("standardWindowButton:"), kind);
+fn set_standard_buttons(window: usize, enabled: [bool; 3]) {
+    for (kind, enabled) in WINDOW_BUTTONS.into_iter().zip(enabled) {
+        unsafe {
+            let button = msg_id_u64(window as Id, sel("standardWindowButton:"), kind);
             if !button.is_null() {
-                msg_void_bool(button, sel("setEnabled:"), i8::from(enabled));
+                msg_void_bool(button, sel("setEnabled:"), ObjcBool::new(enabled));
             }
         }
     }
@@ -1629,9 +1732,9 @@ fn set_standard_buttons_enabled(window: &WindowHandle, enabled: bool) {
 /// always NO: the window never closes itself; the shell hears the
 /// event, runs the overlay's dismissal, and the flipped binding is
 /// what takes the window down (the same road the app's Escape takes).
-extern "C" fn bunny_dialog_should_close(_this: Id, _sel: Sel, sender: Id) -> i8 {
+extern "C" fn bunny_dialog_should_close(_this: Id, _sel: Sel, sender: Id) -> ObjcBool {
     dispatch_to(sender, AppEvent::DialogClose { window: sender as usize });
-    0
+    ObjcBool::NO
 }
 
 /// A dialog's frame moved — a user drag, a resize step, the zoom
@@ -1643,6 +1746,7 @@ extern "C" fn bunny_dialog_should_close(_this: Id, _sel: Sel, sender: Id) -> i8 
 /// dialog's content inside it.
 extern "C" fn bunny_dialog_frame_changed(_this: Id, _sel: Sel, note: Id) {
     let window = unsafe { msg_id(note, sel("object")) };
+    geometry_ops::notify_dialog(window as usize);
     place_traffic_lights(window);
     dispatch_to(window, AppEvent::Redraw);
 }
@@ -1827,7 +1931,7 @@ unsafe fn install_blink(delegate: Id) {
             delegate,
             sel("bunnyBlink:"),
             std::ptr::null_mut(),
-            1,
+            ObjcBool::YES,
         );
         msg_void_id(timer, sel("setFireDate:"), msg_id(class("NSDate"), sel("distantFuture")));
         BLINK.with(|slot| slot.set(timer));
@@ -1919,7 +2023,7 @@ pub fn aim_tasks(left: Option<f64>) {
                 delegate,
                 sel("bunnyTasks:"),
                 std::ptr::null_mut(),
-                1,
+                ObjcBool::YES,
             )
         };
         // a millisecond of tolerance lets the system fold the alarm into
@@ -1964,7 +2068,7 @@ pub fn set_frame_driver(pace: DriverPace) {
         // on its own when it judges the window covered (some displays never
         // report it visible), and only this keeps the beat coming
         if !link.is_null() {
-            unsafe { msg_void_bool(link, sel("setPaused:"), (!full) as i8) };
+            unsafe { msg_void_bool(link, sel("setPaused:"), ObjcBool::new(!full)) };
         }
     });
     SLOW.with(|slot| {
@@ -1989,7 +2093,7 @@ pub fn set_frame_driver(pace: DriverPace) {
                         delegate,
                         sel("bunnySlow:"),
                         std::ptr::null_mut(),
-                        1,
+                        ObjcBool::YES,
                     )
                 };
                 slot.set((fresh, wanted));
@@ -2026,7 +2130,7 @@ unsafe fn register_classes() {
         class_addMethod(view, sel("mouseUp:"), bunny_mouse_up as *const c_void, types.as_ptr());
         class_addMethod(view, sel("draggingEntered:"), bunny_drag_preview as *const c_void, c"Q@:@".as_ptr());
         class_addMethod(view, sel("draggingUpdated:"), bunny_drag_preview as *const c_void, c"Q@:@".as_ptr());
-        class_addMethod(view, sel("performDragOperation:"), bunny_file_drop as *const c_void, c"c@:@".as_ptr());
+        class_addMethod(view, sel("performDragOperation:"), bunny_file_drop as *const c_void, objc_bool::OBJECT.as_ptr());
         class_addMethod(view, sel("draggingExited:"), bunny_drag_exit as *const c_void, types.as_ptr());
         class_addMethod(view, sel("concludeDragOperation:"), bunny_drag_exit as *const c_void, types.as_ptr());
 
@@ -2098,7 +2202,7 @@ unsafe fn register_classes() {
         );
         // the chord road that survives a hosted page holding the
         // first responder — see bunny_perform_key_equivalent
-        let key_equivalent_types = CString::new("c@:@").expect("type encoding");
+        let key_equivalent_types = objc_bool::OBJECT;
         class_addMethod(
             view,
             sel("performKeyEquivalent:"),
@@ -2112,7 +2216,7 @@ unsafe fn register_classes() {
             bunny_draw_rect as *const c_void,
             draw_types.as_ptr(),
         );
-        let bool_getter = CString::new("c@:").expect("type encoding");
+        let bool_getter = objc_bool::GETTER;
         class_addMethod(
             view,
             sel("acceptsFirstResponder"),
@@ -2214,7 +2318,7 @@ unsafe fn register_classes() {
                 types.as_ptr(),
             );
         }
-        let validate_types = CString::new("c@:@").expect("type encoding");
+        let validate_types = objc_bool::OBJECT;
         class_addMethod(
             view,
             sel("validateMenuItem:"),
@@ -2325,7 +2429,7 @@ unsafe fn register_classes() {
             bunny_window_will_close as *const c_void,
             types.as_ptr(),
         );
-        let close_bool = CString::new("c@:@").expect("type encoding");
+        let close_bool = objc_bool::OBJECT;
         class_addMethod(
             delegate,
             sel("windowShouldClose:"),
@@ -2334,9 +2438,9 @@ unsafe fn register_classes() {
         );
         objc_registerClassPair(delegate);
 
-        // the MAIN window's subclass — one question answered, nothing
-        // else touched: under a dialog it refuses to become key
-        let bare_bool = CString::new("c@:").expect("type encoding");
+        // Top levels and dialogs share eligibility: only the top modal
+        // of a scene can become key while unrelated scenes stay usable.
+        let bare_bool = objc_bool::GETTER;
         let window = objc_allocateClassPair(
             class("NSWindow"),
             CString::new("BunnyWindow").expect("name").as_ptr(),
@@ -2359,7 +2463,7 @@ unsafe fn register_classes() {
         // the DIALOG's own delegate — the shared one would terminate
         // the app on close and re-place the parent's traffic lights on
         // every dialog resize
-        let sender_bool = CString::new("c@:@").expect("type encoding");
+        let sender_bool = objc_bool::OBJECT;
         let dialog = objc_allocateClassPair(
             class("NSObject"),
             CString::new("BunnyDialogDelegate").expect("name").as_ptr(),
@@ -2380,6 +2484,12 @@ unsafe fn register_classes() {
         class_addMethod(
             dialog,
             sel("windowDidMove:"),
+            bunny_dialog_frame_changed as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            dialog,
+            sel("windowDidChangeBackingProperties:"),
             bunny_dialog_frame_changed as *const c_void,
             types.as_ptr(),
         );
@@ -2424,6 +2534,20 @@ pub struct WindowHandle {
 }
 
 impl WindowHandle {
+    /// Binds this native dialog to one runtime-owned presentation.
+    pub fn bind_dialog_geometry(
+        &self,
+        parent: &Self,
+        session: Option<std::rc::Rc<bunny_ui::window::DialogGeometrySession>>,
+    ) -> bool {
+        geometry_ops::bind_dialog(
+            self.window as usize,
+            self.view,
+            parent.window as usize,
+            session,
+        )
+    }
+
     /// The content view — the key a grafted presenter is filed under.
     pub(crate) fn view(&self) -> Id {
         self.view
@@ -2486,7 +2610,7 @@ impl WindowHandle {
                     // a raw sublayer keeps CA's default quarter-second
                     // actions — the trail and the order-in fade both
                     // die here, for every transaction that touches it
-                    unsafe { kill_layer_actions(layer) };
+                    kill_layer_actions(layer);
                     // the sublayer composites over the drawable — where
                     // the scene left the box's hole
                     msg_void_id(root, sel("addSublayer:"), layer);
@@ -2626,7 +2750,7 @@ impl WindowHandle {
     /// lands in a different beat than the window frame, and a drag is
     /// exactly what makes that beat visible.
     pub fn in_live_resize(&self) -> bool {
-        unsafe { msg_bool(self.view, sel("inLiveResize")) != 0 }
+        unsafe { msg_bool(self.view, sel("inLiveResize")).get() }
     }
 
     /// Shows the thumbs the scene left to layers of their own
@@ -2676,7 +2800,7 @@ impl WindowHandle {
                             // scene lifted the thumb only where nothing
                             // after it paints over its pixels
                             msg_void_f64(layer, sel("setZPosition:"), 1.0);
-                            msg_void_bool(layer, sel("setHidden:"), 1);
+                            msg_void_bool(layer, sel("setHidden:"), ObjcBool::YES);
                             msg_void_id(root, sel("addSublayer:"), layer);
                             layers.push(ThumbLayer { layer, shown: None, color: None, radius: -1.0 });
                         }
@@ -2721,12 +2845,12 @@ impl WindowHandle {
                             CGColorSpaceRelease(space);
                         }
                         if was.is_none() {
-                            msg_void_bool(entry.layer, sel("setHidden:"), 0);
+                            msg_void_bool(entry.layer, sel("setHidden:"), ObjcBool::NO);
                         }
                     }
                     for entry in layers.iter_mut().skip(thumbs.len()) {
                         if entry.shown.take().is_some() {
-                            msg_void_bool(entry.layer, sel("setHidden:"), 1);
+                            msg_void_bool(entry.layer, sel("setHidden:"), ObjcBool::YES);
                         }
                     }
                 });
@@ -2765,7 +2889,7 @@ impl WindowHandle {
     /// empty window hides the view instead of unmounting it — a page
     /// keeps its state while it is scrolled off.
     ///
-    /// `make` runs once, when the key first appears, and returns the
+    /// `make` runs once, calls its placement continuation, and returns the
     /// tenant's view with ONE retain that [`WindowHandle::host_sweep`]
     /// releases. `update` runs when `stamp` changed — how a navigation
     /// lands without a re-mount.
@@ -2773,30 +2897,37 @@ impl WindowHandle {
         &self,
         key: &str,
         stamp: &str,
-        frame: (f64, f64, f64, f64),
-        window: (f64, f64, f64, f64),
-        view_height: f64,
-        make: impl FnOnce() -> Id,
+        geometry: HostGeometry,
+        make: impl FnOnce(&dyn Fn(Id)) -> Id,
         update: impl FnOnce(Id, &str),
     ) {
+        let HostGeometry {
+            frame,
+            window,
+            view_height,
+        } = geometry;
+        unsafe { register_host_class() };
         HOST_VIEWS.with(|hosts| {
             let mut hosts = hosts.borrow_mut();
             let slot = hosts.entry(key.to_string()).or_insert_with(|| unsafe {
-                let container = msg_id(class("NSView"), sel("alloc"));
+                let container = msg_id(class("BunnyHostView"), sel("alloc"));
                 let container = msg_init_rect(
                     container,
                     sel("initWithFrame:"),
                     CGRect {
                         origin: CGPoint { x: 0.0, y: 0.0 },
-                        size: CGSize { width: 0.0, height: 0.0 },
+                        size: CGSize {
+                            width: 0.0,
+                            height: 0.0,
+                        },
                     },
                 );
                 // the container is the CLIP: whatever the tenant
                 // draws stays inside the window the layout granted
-                msg_void_bool(container, sel("setWantsLayer:"), 1);
+                msg_void_bool(container, sel("setWantsLayer:"), ObjcBool::YES);
                 let layer = msg_id(container, sel("layer"));
                 if !layer.is_null() {
-                    msg_void_bool(layer, sel("setMasksToBounds:"), 1);
+                    msg_void_bool(layer, sel("setMasksToBounds:"), ObjcBool::YES);
                 }
                 // width and height SIZABLE, margins fixed: during a
                 // live resize APPKIT ITSELF drives both views at the
@@ -2809,40 +2940,23 @@ impl WindowHandle {
                 // sixty-a-second approximation we correct).
                 const SIZABLE: i64 = 2 | 16;
                 msg_void_i64(container, sel("setAutoresizingMask:"), SIZABLE);
-                let child = make();
-                msg_void_i64(child, sel("setAutoresizingMask:"), SIZABLE);
-                msg_void_id(container, sel("addSubview:"), child);
-                msg_void_id(self.view, sel("addSubview:"), container);
-                HostSlot { container, child, stamp: stamp.to_string() }
-            });
-            let (x, y, w, h) = frame;
-            let (vx, vy, vw, vh) = window;
-            unsafe {
-                if vw <= 0.0 || vh <= 0.0 {
-                    msg_void_bool(slot.container, sel("setHidden:"), 1);
-                } else {
-                    msg_void_bool(slot.container, sel("setHidden:"), 0);
-                    // the container lands on the visible cut, flipped
-                    // into AppKit's bottom-left world
-                    msg_void_rect(
-                        slot.container,
-                        sel("setFrame:"),
-                        CGRect {
-                            origin: CGPoint { x: x + vx, y: view_height - (y + vy) - vh },
-                            size: CGSize { width: vw, height: vh },
-                        },
-                    );
-                    // the tenant keeps the WHOLE box, container-local:
-                    // the cut shows through, the content never rewraps
-                    msg_void_rect(
-                        slot.child,
-                        sel("setFrame:"),
-                        CGRect {
-                            origin: CGPoint { x: -vx, y: vh + vy - h },
-                            size: CGSize { width: w, height: h },
-                        },
-                    );
+                let child = make(&|child| {
+                    msg_void_i64(child, sel("setAutoresizingMask:"), SIZABLE);
+                    msg_void_id(container, sel("addSubview:"), child);
+                    msg_void_id(self.view, sel("addSubview:"), container);
+                    position_host(container, child, frame, window, view_height);
+                });
+                HostSlot {
+                    owner: self.view,
+                    container,
+                    child,
+                    stamp: stamp.to_string(),
+                    scroll: bunny_ui::host::DocumentScroll::Document,
+                    wheel: crate::host_wheel::ParentWheel::default(),
                 }
+            });
+            unsafe {
+                position_host(slot.container, slot.child, frame, window, view_height);
                 if slot.stamp != stamp {
                     slot.stamp = stamp.to_string();
                     update(slot.child, stamp);
@@ -2859,11 +2973,12 @@ impl WindowHandle {
         HOST_VIEWS.with(|hosts| {
             let mut hosts = hosts.borrow_mut();
             hosts.retain(|key, slot| {
-                if alive.iter().any(|path| path == key) {
+                if slot.owner != self.view || alive.iter().any(|path| path == key) {
                     return true;
                 }
                 unsafe {
                     msg_void(slot.container, sel("removeFromSuperview"));
+                    crate::webview::retire(key, slot.child);
                     msg_void(slot.child, sel("release"));
                     msg_void(slot.container, sel("release"));
                 }
@@ -2979,7 +3094,7 @@ impl WindowHandle {
                 && (frame.size.width - current.size.width).abs() < 0.5
                 && (frame.size.height - current.size.height).abs() < 0.5;
             if !same {
-                msg_void_rect_bool(self.window, sel("setFrame:display:"), frame, 1);
+                msg_void_rect_bool(self.window, sel("setFrame:display:"), frame, ObjcBool::YES);
             }
         }
     }
@@ -2998,7 +3113,12 @@ impl WindowHandle {
 
     /// Is the window on screen (ordered in)?
     pub fn is_visible(&self) -> bool {
-        unsafe { msg_bool(self.window, sel("isVisible")) != 0 }
+        unsafe { msg_bool(self.window, sel("isVisible")).get() }
+    }
+
+    /// Whether `AppKit` currently gives this window keyboard focus.
+    pub fn is_key(&self) -> bool {
+        unsafe { msg_bool(self.window, sel("isKeyWindow")).get() }
     }
 
     /// Re-adopts a pooled dialog on reopen — the child tie was cut
@@ -3017,6 +3137,11 @@ impl WindowHandle {
         }
     }
 
+    /// Shows a dialog while the shell assembles its scene's modal stack.
+    pub fn order_front(&self) {
+        unsafe { msg_void_id(self.window, sel("orderFront:"), std::ptr::null_mut()) };
+    }
+
     /// The `NSWindow` as an address — what a delegate callback names
     /// so the shell can find this handle in a pool.
     pub fn raw_window(&self) -> usize {
@@ -3031,7 +3156,7 @@ unsafe fn shape_of(cursor: Cursor) -> Id {
     unsafe {
         let cursors = class("NSCursor");
         let framed = frame_position(cursor).filter(|_| {
-            msg_bool_sel(cursors, sel("respondsToSelector:"), sel(FRAME_RESIZE)) != 0
+            msg_bool_sel(cursors, sel("respondsToSelector:"), sel(FRAME_RESIZE)).get()
         });
         match framed {
             Some(position) => {
@@ -3143,13 +3268,163 @@ thread_local! {
     static HOST_VIEWS: RefCell<HashMap<String, HostSlot>> = RefCell::new(HashMap::new());
 }
 
+/// Initial host placement in layout points and the layout's viewport height.
+#[derive(Clone, Copy)]
+pub struct HostGeometry {
+    /// Complete tenant box: x, y, width, height.
+    pub frame: (f64, f64, f64, f64),
+    /// Visible cut within that box: x, y, width, height.
+    pub window: (f64, f64, f64, f64),
+    /// Height used to convert layout coordinates into AppKit coordinates.
+    pub view_height: f64,
+}
+
+/// Position a clipped host in AppKit coordinates, before initial content or resize.
+unsafe fn position_host(
+    container: Id,
+    child: Id,
+    frame: (f64, f64, f64, f64),
+    window: (f64, f64, f64, f64),
+    view_height: f64,
+) {
+    let (x, y, w, h) = frame;
+    let (vx, vy, vw, vh) = window;
+    unsafe {
+        if vw <= 0.0 || vh <= 0.0 {
+            msg_void_bool(container, sel("setHidden:"), ObjcBool::YES);
+        } else {
+            msg_void_bool(container, sel("setHidden:"), ObjcBool::NO);
+            // the container lands on the visible cut, flipped
+            // into AppKit's bottom-left world
+            msg_void_rect(
+                container,
+                sel("setFrame:"),
+                CGRect {
+                    origin: CGPoint {
+                        x: x + vx,
+                        y: view_height - (y + vy) - vh,
+                    },
+                    size: CGSize {
+                        width: vw,
+                        height: vh,
+                    },
+                },
+            );
+            // the tenant keeps the WHOLE box, container-local:
+            // the cut shows through, the content never rewraps
+            msg_void_rect(
+                child,
+                sel("setFrame:"),
+                CGRect {
+                    origin: CGPoint {
+                        x: -vx,
+                        y: vh + vy - h,
+                    },
+                    size: CGSize {
+                        width: w,
+                        height: h,
+                    },
+                },
+            );
+        }
+    }
+}
+
 /// One mounted native host: the clipping container (ours), the
 /// tenant's view inside it, and the stamp the tenant last applied — a
 /// changed spec re-instructs the view, it never re-mounts it.
 struct HostSlot {
+    owner: Id,
     container: Id,
     child: Id,
     stamp: String,
+    scroll: bunny_ui::host::DocumentScroll,
+    wheel: crate::host_wheel::ParentWheel,
+}
+
+/// Set the mounted document's input policy without changing its native identity.
+pub(crate) fn host_scroll_policy(key: &str, scroll: bunny_ui::host::DocumentScroll) {
+    HOST_VIEWS.with(|hosts| {
+        if let Some(slot) = hosts.borrow_mut().get_mut(key)
+            && slot.scroll != scroll
+        {
+            slot.scroll = scroll;
+            slot.wheel = crate::host_wheel::ParentWheel::default();
+        }
+    });
+}
+
+static REGISTER_HOST: Once = Once::new();
+
+/// Only wheel events hit the opted-in host proxy. Every other event follows
+/// NSView's ordinary hit test, retaining the engine's links and text selection.
+extern "C" fn bunny_host_hit(this: Id, _sel: Sel, point: CGPoint) -> Id {
+    unsafe {
+        let sup = ObjcSuper { receiver: this, class: unsafe { class("NSView") } };
+        let hit = msg_super_id_point(&sup, sel("hitTest:"), point);
+        if hit.is_null() {
+            return hit;
+        }
+        let application = msg_id(class("NSApplication"), sel("sharedApplication"));
+        let event = msg_id(application, sel("currentEvent"));
+        const SCROLL_WHEEL: u64 = 22;
+        if event.is_null() || msg_u64(event, sel("type")) != SCROLL_WHEEL {
+            return hit;
+        }
+        let parent = HOST_VIEWS.with(|hosts| {
+            // Placement may reenter hit testing while updating the table.
+            hosts.try_borrow().ok().is_some_and(|hosts| hosts.values().any(|slot| {
+                slot.container == this && slot.scroll == bunny_ui::host::DocumentScroll::ParentVertical
+            }))
+        });
+        if parent { this } else { hit }
+    }
+}
+
+/// Forward the original native event, retaining precise deltas, modifiers,
+/// momentum and phase. No DOM script or synthesized wheel enters this path.
+extern "C" fn bunny_host_wheel(this: Id, cmd: Sel, event: Id) {
+    unsafe {
+        use crate::host_wheel::Target;
+        let phase = msg_u64(event, sel("phase"));
+        let momentum = msg_u64(event, sel("momentumPhase"));
+        let step = match (phase, momentum) {
+            (_, 8 | 16) | (8 | 16, 0) => bunny_ui::custom::WheelPhase::Ended,
+            (1 | 32, 0) => bunny_ui::custom::WheelPhase::Began,
+            _ => bunny_ui::custom::WheelPhase::Changed,
+        };
+        let dx = msg_f64(event, sel("scrollingDeltaX"));
+        let dy = msg_f64(event, sel("scrollingDeltaY"));
+        let destination = HOST_VIEWS.with(|hosts| {
+            let mut hosts = hosts.try_borrow_mut().ok()?;
+            let slot = hosts.values_mut().find(|slot| slot.container == this)?;
+            let target = if slot.scroll == bunny_ui::host::DocumentScroll::ParentVertical {
+                slot.wheel.route(dx, dy, step, phase != 0 || momentum != 0)
+            } else {
+                Target::Document
+            };
+            Some((slot.child, target))
+        });
+        if let Some((child, target)) = destination {
+            if matches!(target, Target::Document | Target::Both) {
+                msg_void_id(child, cmd, event);
+            }
+            if matches!(target, Target::Parent | Target::Both) {
+                bunny_segment_forward(this, cmd, event);
+            }
+        } else {
+            bunny_segment_forward(this, cmd, event);
+        }
+    }
+}
+
+unsafe fn register_host_class() {
+    REGISTER_HOST.call_once(|| unsafe {
+        let host = objc_allocateClassPair(class("NSView"), c"BunnyHostView".as_ptr(), 0);
+        class_addMethod(host, sel("hitTest:"), bunny_host_hit as *const c_void, c"@@:{CGPoint=dd}".as_ptr());
+        class_addMethod(host, sel("scrollWheel:"), bunny_host_wheel as *const c_void, c"v@:@".as_ptr());
+        objc_registerClassPair(host);
+    });
 }
 
 /// The tenant's view mounted under `key`, if any — where a drained
@@ -3301,7 +3576,7 @@ impl WindowHandle {
                         size: CGSize { width: 0.0, height: 0.0 },
                     },
                 );
-                msg_void_bool(view, sel("setWantsLayer:"), 1);
+                msg_void_bool(view, sel("setWantsLayer:"), ObjcBool::YES);
                 msg_void_i64(
                     view,
                     sel("setAutoresizingMask:"),
@@ -3473,7 +3748,7 @@ fn host_child_container(key: &str) -> Option<Id> {
 /// badge.
 pub(crate) fn wear_cursor(cursor: Cursor, insist: bool) {
     let active = unsafe {
-        msg_bool(msg_id(class("NSApplication"), sel("sharedApplication")), sel("isActive")) != 0
+        msg_bool(msg_id(class("NSApplication"), sel("sharedApplication")), sel("isActive")).get()
     };
     INSIST.with(|kept| kept.set(insist));
     wear(cursor, insist && active);
@@ -3537,7 +3812,7 @@ pub fn install_cursor_keeper() {
 
 extern "C" fn keep_cursor(_observer: Id, _activity: u64, _info: *mut c_void) {
     keep(|| unsafe {
-        msg_bool(msg_id(class("NSApplication"), sel("sharedApplication")), sel("isActive")) != 0
+        msg_bool(msg_id(class("NSApplication"), sel("sharedApplication")), sel("isActive")).get()
     });
 }
 
@@ -3691,7 +3966,7 @@ unsafe fn without_actions(body: impl FnOnce()) {
     unsafe {
         let transaction = class("CATransaction");
         msg_void(transaction, sel("begin"));
-        msg_void_bool(transaction, sel("setDisableActions:"), 1);
+        msg_void_bool(transaction, sel("setDisableActions:"), ObjcBool::YES);
         body();
         msg_void(transaction, sel("commit"));
     }
@@ -3802,10 +4077,10 @@ pub fn create_window(
             rect,
             style,
             2, // buffered
-            0,
+            ObjcBool::NO,
         );
         if scene_chrome {
-            msg_void_bool(window, sel("setTitlebarAppearsTransparent:"), 1);
+            msg_void_bool(window, sel("setTitlebarAppearsTransparent:"), ObjcBool::YES);
             // NSWindowTitleHidden = 1 — the title still names the
             // window in Mission Control and the Dock
             msg_void_i64(window, sel("setTitleVisibility:"), 1);
@@ -3837,7 +4112,7 @@ pub fn create_window(
             size.width,
             size.height,
         );
-        msg_void_bool(view, sel("setWantsLayer:"), 1);
+        msg_void_bool(view, sel("setWantsLayer:"), ObjcBool::YES);
         msg_void_id(window, sel("setContentView:"), view);
 
         // moved/entered/exited arrive via the tracking area — no first
@@ -3887,7 +4162,7 @@ pub fn create_window(
         msg_void_id(window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
         // the keyboard is born pointing at the event view
         msg_void_id(window, sel("makeFirstResponder:"), view);
-        msg_void_bool(app, sel("activateIgnoringOtherApps:"), 1);
+        msg_void_bool(app, sel("activateIgnoringOtherApps:"), ObjcBool::YES);
         // LAST: the traffic lights are placed after everything that
         // touches the chrome. `setTitle:` alone puts them back where
         // the system wants them, and it runs above.
@@ -3926,22 +4201,22 @@ pub fn create_panel(parent: &WindowHandle, width: f64, height: f64) -> WindowHan
             rect,
             PANEL_STYLE,
             2, // buffered
-            0,
+            ObjcBool::NO,
         );
         // the panel is a transparent sheet of glass: our scene paints
         // the popover's card, shadow included — the system shadow
         // would double it (and borderless panels default it ON)
-        msg_void_bool(panel, sel("setOpaque:"), 0);
+        msg_void_bool(panel, sel("setOpaque:"), ObjcBool::NO);
         msg_void_id(panel, sel("setBackgroundColor:"), msg_id(class("NSColor"), sel("clearColor")));
-        msg_void_bool(panel, sel("setHasShadow:"), 0);
+        msg_void_bool(panel, sel("setHasShadow:"), ObjcBool::NO);
         // the store manages the lifetime — never AppKit's release
-        msg_void_bool(panel, sel("setReleasedWhenClosed:"), 0);
+        msg_void_bool(panel, sel("setReleasedWhenClosed:"), ObjcBool::NO);
 
         let view = msg_id(class("BunnyView"), sel("alloc"));
         let view = msg_init_rect(view, sel("initWithFrame:"), rect);
         register_file_drag(view);
         // CPU present only: no metal graft on panels (v1)
-        msg_void_bool(view, sel("setWantsLayer:"), 1);
+        msg_void_bool(view, sel("setWantsLayer:"), ObjcBool::YES);
         msg_void_id(panel, sel("setContentView:"), view);
 
         // hover and exit work inside the panel like anywhere else — but
@@ -4055,17 +4330,17 @@ pub fn create_dialog(
             // its content's (the shell sets the frame layout fitted)
             DialogManners::Ask => (1 | (1 << 15), None, true),
         };
-        let window = msg_id(class("NSWindow"), sel("alloc"));
+        let window = msg_id(class("BunnyWindow"), sel("alloc"));
         let window = msg_init_window(
             window,
             sel("initWithContentRect:styleMask:backing:defer:"),
             rect,
             style,
             2, // buffered
-            0,
+            ObjcBool::NO,
         );
         if bare {
-            msg_void_bool(window, sel("setTitlebarAppearsTransparent:"), 1);
+            msg_void_bool(window, sel("setTitlebarAppearsTransparent:"), ObjcBool::YES);
             // NSWindowTitleHidden = 1 — the title still names the
             // window in Mission Control
             msg_void_i64(window, sel("setTitleVisibility:"), 1);
@@ -4077,7 +4352,7 @@ pub fn create_dialog(
             for kind in WINDOW_BUTTONS {
                 let button = msg_id_u64(window, sel("standardWindowButton:"), kind);
                 if !button.is_null() {
-                    msg_void_bool(button, sel("setHidden:"), 1);
+                    msg_void_bool(button, sel("setHidden:"), ObjcBool::YES);
                 }
             }
         }
@@ -4098,7 +4373,7 @@ pub fn create_dialog(
         );
         msg_void_id(window, sel("setTitle:"), ns_title);
         // the store manages the lifetime — never AppKit's release
-        msg_void_bool(window, sel("setReleasedWhenClosed:"), 0);
+        msg_void_bool(window, sel("setReleasedWhenClosed:"), ObjcBool::NO);
 
         let view = msg_id(class("BunnyView"), sel("alloc"));
         let view = msg_init_rect(view, sel("initWithFrame:"), rect);
@@ -4114,7 +4389,7 @@ pub fn create_dialog(
             width,
             height,
         );
-        msg_void_bool(view, sel("setWantsLayer:"), 1);
+        msg_void_bool(view, sel("setWantsLayer:"), ObjcBool::YES);
         msg_void_id(window, sel("setContentView:"), view);
 
         // hover must work while EITHER of our windows is key — the
@@ -4160,7 +4435,7 @@ impl WindowHandle {
     /// Places the panel at a SCREEN rect (AppKit coordinates, y-up) —
     /// the parent's `layout_rect_to_screen` produces it.
     pub fn set_frame_screen(&self, rect: CGRect) {
-        unsafe { msg_void_rect_bool(self.window, sel("setFrame:display:"), rect, 1) };
+        unsafe { msg_void_rect_bool(self.window, sel("setFrame:display:"), rect, ObjcBool::YES) };
     }
 
     /// The panel lets the pointer through to the window under it: no
@@ -4168,7 +4443,7 @@ impl WindowHandle {
     /// surface that takes no input — and whose bleed lies over the very
     /// box it stands beside.
     pub fn pass_pointer_through(&self) {
-        unsafe { msg_void_bool(self.window, sel("setIgnoresMouseEvents:"), 1) };
+        unsafe { msg_void_bool(self.window, sel("setIgnoresMouseEvents:"), ObjcBool::YES) };
     }
 
     /// Registers where this panel's view sits in SCENE coordinates —
@@ -4183,6 +4458,7 @@ impl WindowHandle {
     /// panel object stays reusable-dead (released when the process
     /// goes) — panels are few and pooled by path.
     pub fn close_panel(&self, parent: &WindowHandle) {
+        update_modal_scopes(|scopes| scopes.end(self.raw_window()));
         unsafe {
             // the ACTUAL holder, not the caller's guess: a dropdown
             // born inside a dialog is the DIALOG's child, and the
@@ -4353,8 +4629,8 @@ extern "C" fn bunny_menu_pick(_this: Id, _sel: Sel, item: Id) {
 
 /// `validateMenuItem:` on the target: a command is enabled while its
 /// window answers it, and Quit always is.
-extern "C" fn bunny_menu_validate(_this: Id, _sel: Sel, item: Id) -> i8 {
-    i8::from(match menu_entry(item) {
+extern "C" fn bunny_menu_validate(_this: Id, _sel: Sel, item: Id) -> ObjcBool {
+    ObjcBool::new(match menu_entry(item) {
         Some(MenuEntry::Command(action)) => menu_answers(menu_window(), Pick::Command(action)),
         Some(MenuEntry::Quit(_)) => true,
         None => false,
@@ -4385,16 +4661,16 @@ extern "C" fn bunny_view_edit(this: Id, selector: Sel, _sender: Id) {
 
 /// `validateMenuItem:` on the view: an edit is enabled while this window's
 /// keyboard is held by someone who can take it.
-extern "C" fn bunny_view_validate(this: Id, _sel: Sel, item: Id) -> i8 {
+extern "C" fn bunny_view_validate(this: Id, _sel: Sel, item: Id) -> ObjcBool {
     let edit = unsafe { selector_name(msg_sel(item, sel("action"))) }
         .as_deref()
         .and_then(crate::menu::edit_of_selector);
     match edit {
         Some(edit) => {
             let window = owning_window(unsafe { msg_id(this, sel("window")) });
-            i8::from(menu_answers(window, Pick::Edit(edit)))
+            ObjcBool::new(menu_answers(window, Pick::Edit(edit)))
         }
-        None => 1,
+        None => ObjcBool::YES,
     }
 }
 
@@ -4611,7 +4887,7 @@ pub fn clipboard_read_image() -> Option<bunny_ui::clipboard::ClipboardImage> {
         );
         let types = msg_id(pasteboard, sel("types"));
         let has =
-            |kind: Id| !types.is_null() && msg_bool_id(types, sel("containsObject:"), kind) != 0;
+            |kind: Id| !types.is_null() && msg_bool_id(types, sel("containsObject:"), kind).get();
         let picture = picture_to_read(has(NSPasteboardTypeString), has(png), has(tiff))?;
         let bytes = match picture {
             Picture::Png => data_bytes(msg_id_arg(pasteboard, sel("dataForType:"), png))?,
@@ -4700,8 +4976,8 @@ mod tests {
             install_blink(delegate);
             let second = BLINK.with(Cell::get);
             assert_ne!(first, second);
-            assert_eq!(msg_bool(first, sel("isValid")), 0, "the former owner leaves no timer behind");
-            assert_ne!(msg_bool(second, sel("isValid")), 0);
+            assert!(!msg_bool(first, sel("isValid")).get(), "the former owner leaves no timer behind");
+            assert!(msg_bool(second, sel("isValid")).get());
             assert!(fire_at(second) < parked, "the surviving window's request follows the owner");
             want_blink(1, false);
             assert_eq!(fire_at(second).to_bits(), parked.to_bits(), "the last request parks the timer");
@@ -4773,7 +5049,7 @@ mod tests {
             class("NSCursor")
         };
         let framed = unsafe {
-            msg_bool_sel(cursors, sel("respondsToSelector:"), sel(FRAME_RESIZE)) != 0
+            msg_bool_sel(cursors, sel("respondsToSelector:"), sel(FRAME_RESIZE)).get()
         };
         if framed {
             // where the frame cursor exists the shell asks for it, and a
@@ -4981,7 +5257,7 @@ mod tests {
                 sel("instancesRespondToSelector:"),
                 sel("standardWindowButton:"),
             );
-            assert_ne!(responds, 0, "NSWindow has no standardWindowButton:");
+            assert!(responds.get(), "NSWindow has no standardWindowButton:");
         }
     }
 
@@ -4993,9 +5269,9 @@ mod tests {
             let responds = |class_name: &str, name: &str| {
                 msg_bool_sel(class(class_name), sel("instancesRespondToSelector:"), sel(name))
             };
-            assert_ne!(responds("NSPasteboard", "dataForType:"), 0, "NSPasteboard has no dataForType:");
-            assert_ne!(responds("NSData", "length"), 0, "NSData has no length");
-            assert_ne!(responds("NSData", "bytes"), 0, "NSData has no bytes");
+            assert!(responds("NSPasteboard", "dataForType:").get(), "NSPasteboard has no dataForType:");
+            assert!(responds("NSData", "length").get(), "NSData has no length");
+            assert!(responds("NSData", "bytes").get(), "NSData has no bytes");
         }
     }
 
@@ -5018,7 +5294,7 @@ mod tests {
                     sel("instancesRespondToSelector:"),
                     sel(name),
                 );
-                assert_ne!(responds, 0, "NSWindow has no {name}");
+                assert!(responds.get(), "NSWindow has no {name}");
             }
             // the parent's lights go dark through the button itself
             let responds = msg_bool_sel(
@@ -5026,7 +5302,7 @@ mod tests {
                 sel("instancesRespondToSelector:"),
                 sel("setEnabled:"),
             );
-            assert_ne!(responds, 0, "NSButton has no setEnabled:");
+            assert!(responds.get(), "NSButton has no setEnabled:");
         }
     }
 
@@ -5038,7 +5314,7 @@ mod tests {
                 sel("instancesRespondToSelector:"),
                 sel("charactersByApplyingModifiers:"),
             );
-            assert_ne!(responds, 0, "NSEvent has no charactersByApplyingModifiers:");
+            assert!(responds.get(), "NSEvent has no charactersByApplyingModifiers:");
         }
     }
 }

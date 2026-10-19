@@ -57,12 +57,26 @@ semantic nodes with `enabled = false` and reject actions. Checkboxes expose
 unavailable requests return distinct errors. Successful actions request a
 frame. Snapshots report current keyboard focus without requesting a frame.
 
+Successful `Activate` follows the pointer's keyboard-ownership rule after the
+callback: a focusable control receives focus, including its containing editor's
+standard edit commands. Explicit `.leaves_keyboard()` chrome preserves the
+current owner. This also gives forms an invoking control to restore when they
+close; it does not install a global edit-command fallback or change a focused
+text field's own history. Rejected actions leave focus unchanged.
+
 ## macOS adapter
 
 The AppKit shell exposes these controls through `NSAccessibilityElement` proxies
 owned by each native view. Its first accessibility query enables semantic capture;
 applications do not need to opt in manually. Overlay panels have their own roots,
 including when the first query targets an already-open modal.
+
+Popup choices remain children of their native overlay surface. The parent
+window's focused-element query resolves the focused proxy across its own scene,
+so a non-key popover can report its active choice through the parent that keeps
+keyboard focus. Other windows retain independent focus. A hosted native editor
+keeps its own focus when no Bunny overlay owns it. Inspecting only the parent's
+children still omits overlay choices; clients must include child surfaces.
 
 The adapter keeps each native object while its `NodeId` remains exposed, converts
 layout bounds to screen coordinates, reports keyboard focus and forwards supported
@@ -84,7 +98,9 @@ dependency and stays inside the existing macOS FFI boundary.
 `cargo test -p bunny-ui-macos --test accessibility_native --locked` runs a
 main-thread AppKit probe against real windows and selectors. It checks live edits,
 identity, screen bounds, modals, password redaction, retired objects and
-main-thread exit with an accessible window still open. This
+main-thread exit with an accessible window still open. Popover checks cover
+native button roles, labels, actions, focus through the parent, hit testing,
+repeated opening, retired choices and independent-window focus. This
 in-process probe does not require permission to control other applications. It
 is distinct from an external AX client dump or a human VoiceOver workflow.
 `scripts/check-macos-accessibility.swift <accessibility_native-executable>` runs

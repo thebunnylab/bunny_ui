@@ -23,6 +23,41 @@ including when only modal state changed. Declining preserves normal key routing.
 `edit` defaults to native text editing; a policy can add grouped history or
 replacement semantics. `Read` and `Copy` should remain observational.
 
+## Independent native scenes
+
+Each named `Runtime::scene` retains the root controls published by its last
+render, including fields rendered directly without a `Component` wrapper.
+Another scene may render or receive input without removing those controls.
+Handlers and key contexts rebuild from the selected scene's retained entries
+and root registrations; input-only activation never queues render effects.
+
+A new render replaces only its own root registrations, including an empty
+replacement when a control unmounts. Closing or resetting a named scene releases
+its root input callbacks without removing a neighboring scene's controls.
+`tests/scene_input.rs` covers typing, selection, independent history, rerender,
+unmount and recreation through the public runtime API.
+
+## Ordinary field history
+
+A field without an editing strategy owns Undo/Redo through the standard keyboard
+accelerators and native Edit menu. History restores both text and selection,
+survives retained renders and unambiguous named moves, and stays local to its
+mounted field. Unmounting or an external binding revision discards the history;
+closure-backed bindings without revision identity detect changed text instead.
+Custom strategies continue to own their editing commands and history.
+
+Adjacent single-character typing and deletion coalesce. Selection, navigation,
+paste, replacement and focus changes separate groups. One IME composition is one
+group; Undo/Redo is unavailable while text is marked, and cancelling composition
+preserves the previous redo. Read and Copy never create an edit. Secret fields
+retain local history without exposing their contents through Copy or Cut.
+
+History keeps changed bytes and caret states, sharing the current text's lending
+cache. It retains at most 128 groups and a 1 MiB budget for replacements and patch
+overhead. Old groups are evicted whole; an oversized edit leaves no partial Undo.
+This contract covers the native/canvas runtime; browser flow DOM keeps its own
+editing behavior. `tests/field_history.rs` exercises the public runtime boundary.
+
 The runtime's `ExternalPaths` payload uses the same clipped `.on_drop` regions
 as internal drag operations. `external_drag` previews without committing;
 `external_drop` delivers only to the accepting target under the pointer;
@@ -62,6 +97,13 @@ and IME composition ranges retain their UTF-16/scalar contract; content is never
 normalized. Word commands retain their existing character classes, and horizontal
 movement remains logical rather than visual BiDi navigation.
 
+Soft wrapping also keeps extended grapheme clusters intact, including a space
+with combining marks. An overlong word breaks only between clusters. A single
+cluster wider than the available line overflows intact rather than being split;
+it does not add an empty trailing row. Hard newlines retain their existing line
+boundaries. This is grapheme-safe wrapping, not Unicode line-break tailoring or
+paragraph-aware bidirectional layout.
+
 The boundary rules are Unicode 17.0.0 / UAX #29 revision 47. The core has no new
 dependency. All 766 official GraphemeBreakTest cases exercise the public edit API
 forward, backward and from interior scalar positions. Generated property inputs
@@ -70,3 +112,56 @@ uses `scripts/generate-grapheme-tables.py` with those downloaded files and the
 build-time Python package `blake3==1.0.8`. The Unicode data license is retained
 beside the test corpus. Ordinary ASCII edits inspect local boundaries; regional
 indicator parity can require scanning the preceding indicator run.
+
+## Native shaped-line geometry
+
+`TextEngine::line_geometry` optionally returns validated `LineGeometry` cells
+in logical UTF-8 order, with directed visual edges for every scalar. CoreText
+uses complete-line caret enumeration, DirectWrite uses full-layout hit testing,
+and Linux reads the same HarfBuzz/FriBidi clusters used by the raster path. The
+core never receives a native handle. Engines that leave this method at `None`
+keep the existing prefix approximation; that fallback is not native BiDi parity.
+
+`CaretState` now includes `affinity: CaretAffinity`. Use `..CaretState::default()`
+when constructing a state without a specific visual side. `Downstream` is before
+the following logical scalar; `Upstream` is after the preceding scalar. At a
+BiDi boundary those positions can differ. A custom editing strategy that moves
+the caret must choose the side it intends. Pointer and drag selection retain the
+hit's side, insertion/rightward logical motion choose upstream, and leftward
+motion chooses downstream. These are logical commands, not visual arrow navigation.
+
+The same cached line supplies all caret shapes, selection and composition bands,
+UTF-16 rectangles, pointer hits, vertical columns and horizontal reveal. Block
+carets and colored highlights recolor the full original line through disjoint
+clips, preserving shaping context and avoiding duplicate alpha blending.
+A logical selection may produce several disjoint rectangles. Pointer stops use
+extended grapheme boundaries, while explicit native scalar ranges remain valid.
+Masked fields query the displayed bullets and map back to the original UTF-16.
+Geometry shares the font/text cache's aging rules; replacing the runtime's engine
+invalidates its cache. External users of `MeasureCache` must likewise keep one
+cache per engine and invalidate it when changing the engine's registered fonts.
+
+Native cluster interiors depend on the platform's font data and hit API. Linux
+uses a complete valid GDEF caret list for a single-glyph ligature when available,
+translated by its shaped origin; otherwise it divides the cluster advance by
+scalar. This is an explicit approximation inside a cluster, not recovered font
+metadata. Paragraph-aware wrapping, visual horizontal motion, actual OS IME
+input and human assistive-technology validation remain separate work.
+
+Native CI retains compiler, OS/runner image and BLAKE3 hashes of machine font
+files beside its test logs. This inventories available font inputs; it does not
+assert that every file was selected by the shaper, and it copies no font binary.
+The recorder reuses the Unicode tooling's build-time `blake3==1.0.8` package.
+
+## Click modifiers without pointer capture
+
+`ViewExt::on_click_with_modifiers` receives `(click_count, Modifiers)` from the
+initiating press. It is the same retained click target as `on_click_count`: a
+cancelled press or lifted drag does not activate it, and `.on_drag` continues to
+use the normal drag lane. Releasing a modifier before the pointer does not change
+that press's meaning. Existing `on_click` and `on_click_count` callers keep their
+signatures. Programmatic activation carries `Modifiers::NONE`.
+
+Browser embeddings may forward their event modifiers through
+`Runtime::dom_action_with_modifiers`; the original `dom_action` remains the
+modifier-free compatibility entry point.

@@ -278,7 +278,8 @@ impl CoreGraphicsImageEngine {
             | ImageSource::Rgba { .. }
             | ImageSource::Feed { .. }
             | ImageSource::Faded { .. }
-            | ImageSource::Mirrored { .. } => std::ptr::null_mut(),
+            | ImageSource::Mirrored { .. }
+            | ImageSource::World { .. } => std::ptr::null_mut(),
         };
         let entry = (!image.is_null()).then(|| OwnedImage(image));
         self.decoded.borrow_mut().insert(key, entry);
@@ -339,7 +340,8 @@ impl ImageEngine for CoreGraphicsImageEngine {
             | ImageSource::Rgba { .. }
             | ImageSource::Feed { .. }
             | ImageSource::Faded { .. }
-            | ImageSource::Mirrored { .. } => {
+            | ImageSource::Mirrored { .. }
+            | ImageSource::World { .. } => {
                 debug_assert!(false, "a house drawing never reaches an engine");
                 return None;
             }

@@ -22,6 +22,7 @@ pub const LINKED: &[(&str, &str, &str, &str)] = &[
     ("fontconfig", "libfontconfig-dev", "fontconfig-devel", "fontconfig"),
     ("freetype", "libfreetype-dev", "freetype-devel", "freetype2"),
     ("harfbuzz", "libharfbuzz-dev", "harfbuzz-devel", "harfbuzz"),
+    ("fribidi", "libfribidi-dev", "fribidi-devel", "fribidi"),
 ];
 
 /// What the shell opens at run time: the GPU paths. Without them the

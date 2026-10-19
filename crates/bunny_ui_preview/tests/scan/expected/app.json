@@ -1,0 +1,10 @@
+{
+  "previews": [],
+  "refused": [
+    {"file": "src/app.rs", "line": 8, "column": 1, "ident": "app", "reason": "reserved"},
+    {"file": "src/app.rs", "line": 10, "column": 1, "ident": "app", "reason": "reserved"}
+  ],
+  "duplicates": [],
+  "unreadable": [],
+  "app": {"file": "src/app.rs", "line": 5, "column": 1}
+}

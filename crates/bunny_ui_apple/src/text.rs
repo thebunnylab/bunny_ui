@@ -21,6 +21,9 @@
 //! `--` ligature drew `--submit` as `-submit`, one cell and one character
 //! short, in every inline code span that carried a flag.
 
+#[path = "text_geometry.rs"]
+mod geometry;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -464,6 +467,14 @@ unsafe fn cf_string_out(string: CFStringRef) -> Option<String> {
 }
 
 impl TextEngine for CoreTextEngine {
+    fn line_geometry(
+        &self,
+        text: &str,
+        font: &FontSpec,
+    ) -> Option<bunny_ui::text_geometry::LineGeometry> {
+        geometry::line_geometry(self, text, font)
+    }
+
     fn families(&self) -> Vec<std::sync::Arc<str>> {
         unsafe {
             let array = CTFontManagerCopyAvailableFontFamilyNames();
@@ -759,3 +770,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "text_geometry_tests.rs"]
+mod geometry_tests;

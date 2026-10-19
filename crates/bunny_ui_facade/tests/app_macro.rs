@@ -29,3 +29,20 @@ fn the_house_window_is_the_default() {
     assert!(config.contains("title: None"), "{config}");
     assert!(config.contains("1024"), "{config}");
 }
+
+/// The reserved entry uses the configured window and remains callable under forbid(unsafe_code).
+#[cfg(all(feature = "preview", not(target_arch = "wasm32")))]
+#[test]
+fn the_app_entry_carries_the_window_size() {
+    let entry = bunny_ui::__private::hot::preview::preview_entry("app").unwrap();
+    assert_eq!(entry.meta.scope, "App");
+    assert_eq!(entry.meta.name, "App");
+    assert_eq!(entry.meta.example, env!("CARGO_PKG_NAME"));
+    assert_eq!(
+        (entry.make)().traits.size,
+        bunny_ui::preview::Sizing::Fixed(bunny_ui::layout::Size {
+            width: 320.0,
+            height: 240.0
+        })
+    );
+}

@@ -1,0 +1,17 @@
+[package]
+name = "bunny-ui-preview-macros"
+version.workspace = true
+edition.workspace = true
+description = "The #[preview] attribute of bunny-ui — marks a function whose view Studio and `bunny preview` show"
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["bunny-ui", "preview", "gui"]
+categories = ["gui", "development-tools"]
+
+[lib]
+proc-macro = true
+
+# Nothing: the attribute scans the tokens it is given by hand, so an app
+# pays no syntax crate for a function it marked.
+[dependencies]

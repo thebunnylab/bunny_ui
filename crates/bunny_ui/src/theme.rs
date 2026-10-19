@@ -34,6 +34,25 @@ macro_rules! theme_tokens {
                 THEME.with(|theme| theme.get().$name)
             }
         )+
+
+        impl Theme {
+            /// Every token's name, in the struct's order.
+            pub const NAMES: &'static [&'static str] = &[$(stringify!($name)),+];
+
+            /// The tokens by name — what a theme is on a wire.
+            pub fn tokens(&self) -> Vec<(&'static str, Color)> {
+                vec![$((stringify!($name), self.$name)),+]
+            }
+
+            /// Sets the token `name` names; `false` for a name this theme
+            /// does not have.
+            pub fn set_token(&mut self, name: &str, color: Color) -> bool {
+                match name {
+                    $(stringify!($name) => { self.$name = color; true })+
+                    _ => false,
+                }
+            }
+        }
     };
 }
 
@@ -151,14 +170,120 @@ impl Theme {
 
 thread_local! {
     static THEME: Cell<Theme> = const { Cell::new(Theme::light()) };
+    /// The app palette, installed explicitly or supplied by the system —
+    /// put back by `restore_installed` after a scene
+    /// that rendered under a quiet theme of its own.
+    static INSTALLED: Cell<Theme> = const { Cell::new(Theme::light()) };
     static VERSION: Cell<u64> = const { Cell::new(0) };
+    static APPEARANCE: Cell<Option<Appearance>> = const { Cell::new(None) };
+    static SOURCE: Cell<Source> = const { Cell::new(Source::System) };
 }
 
-/// Swaps the WHOLE theme between frames. The global version bumps — the
-/// next pass of any `Runtime` rebuilds the retention once.
-pub fn install(theme: Theme) {
-    THEME.with(|current| current.set(theme));
+/// The native application's preferred color scheme.
+///
+/// This observation is independent of the palette installed by the application.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Appearance {
+    /// Light native appearance.
+    Light,
+    /// Dark native appearance.
+    Dark,
+}
+
+impl Appearance {
+    /// Converts a platform's explicitly reported dark-mode preference.
+    #[must_use]
+    pub const fn from_dark(dark: bool) -> Self {
+        if dark { Self::Dark } else { Self::Light }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    System,
+    Custom,
+}
+
+fn system_theme() -> Theme {
+    match system_appearance() {
+        Some(Appearance::Dark) => Theme::dark(),
+        Some(Appearance::Light) | None => Theme::light(),
+    }
+}
+
+/// The latest native appearance, or `None` when unavailable or unspecified.
+///
+/// Read in a component body to derive application colors. A changed native
+/// observation invalidates every runtime's retained body, including when a
+/// custom palette is installed. This is thread-local, like the theme itself.
+/// macOS and Windows report live changes; Linux currently reports at startup.
+/// Shells without an appearance adapter leave the value unavailable.
+pub fn system_appearance() -> Option<Appearance> {
+    APPEARANCE.with(Cell::get)
+}
+
+/// Follows native appearance again after a custom [`install`].
+///
+/// This is the initial policy. Unknown/no preference uses the light built-in
+/// palette. A later native observation updates the tokens automatically.
+pub fn follow_system() {
+    SOURCE.with(|source| source.set(Source::System));
+    replace(system_theme());
+}
+
+/// Supplies a native observation from a platform adapter on the UI thread.
+/// Duplicate reports are inert; a changed report invalidates every runtime
+/// without replacing application-owned tokens.
+#[doc(hidden)]
+pub fn observe_system_appearance(appearance: Option<Appearance>) {
+    if APPEARANCE.with(|current| current.replace(appearance)) == appearance {
+        return;
+    }
+    if SOURCE.with(Cell::get) == Source::System {
+        let theme = system_theme();
+        THEME.with(|current| current.set(theme));
+        INSTALLED.with(|installed| installed.set(theme));
+    }
     VERSION.with(|version| version.set(version.get() + 1));
+}
+
+/// Swaps the whole theme and selects application-owned tokens.
+///
+/// Native observations remain available but never overwrite this palette. Call
+/// [`follow_system`] to resume automatic tokens. The version bumps so every
+/// runtime rebuilds its retained output on the next pass.
+pub fn install(theme: Theme) {
+    SOURCE.with(|source| source.set(Source::Custom));
+    replace(theme);
+}
+
+fn replace(theme: Theme) {
+    THEME.with(|current| current.set(theme));
+    INSTALLED.with(|installed| installed.set(theme));
+    VERSION.with(|version| version.set(version.get() + 1));
+}
+
+/// Sets the thread's tokens WITHOUT bumping the version — for a runtime
+/// that renders under a theme of its own (`Runtime::theme`): two scenes
+/// alternating light and dark on one thread each enter their theme
+/// before their pass, and neither rebuilds the other's retention, since
+/// the version every runtime compares never moves. The tokens a body
+/// read stay baked into that scene — which is exactly right, because
+/// that scene always renders under the same theme.
+pub fn set_quiet(theme: Theme) {
+    THEME.with(|current| current.set(theme));
+}
+
+/// Puts the installed theme back — what a runtime WITHOUT a theme of
+/// its own enters with, so a scene that set a quiet theme never leaks
+/// into the app's next pass.
+pub fn restore_installed() {
+    THEME.with(|current| current.set(INSTALLED.with(|installed| installed.get())));
+}
+
+/// The app palette, whatever a scene set quietly since.
+pub fn installed() -> Theme {
+    INSTALLED.with(|installed| installed.get())
 }
 
 /// The current snapshot — for hot loops that read many tokens.
@@ -166,7 +291,7 @@ pub fn current() -> Theme {
     THEME.with(|theme| theme.get())
 }
 
-/// The installed theme's version — whoever retains derived output compares it.
+/// The palette and native-appearance version; retained output compares it.
 pub fn version() -> u64 {
     VERSION.with(|version| version.get())
 }
@@ -189,5 +314,32 @@ mod tests {
     #[test]
     fn the_default_theme_is_the_light_one() {
         assert_eq!(Theme::default(), Theme::light());
+    }
+
+    #[test]
+    fn tokens_go_out_by_name_and_come_back_by_name() {
+        let light = Theme::light();
+        let tokens = light.tokens();
+        assert_eq!(tokens.len(), Theme::NAMES.len());
+        assert_eq!(tokens[0], ("canvas", light.canvas));
+        let mut rebuilt = Theme::dark();
+        for (name, color) in &tokens {
+            assert!(rebuilt.set_token(name, *color));
+        }
+        assert_eq!(rebuilt, light);
+        assert!(!rebuilt.set_token("no_such_token", Color::BLACK));
+    }
+
+    #[test]
+    fn a_quiet_theme_moves_the_tokens_but_not_the_version_and_restores_to_the_installed_one() {
+        install(Theme::light());
+        let version = version();
+        set_quiet(Theme::dark());
+        assert_eq!(accent(), Theme::dark().accent);
+        assert_eq!(super::version(), version, "a quiet theme rebuilds nothing");
+        assert_eq!(installed(), Theme::light());
+        restore_installed();
+        assert_eq!(accent(), Theme::light().accent);
+        assert_eq!(super::version(), version);
     }
 }

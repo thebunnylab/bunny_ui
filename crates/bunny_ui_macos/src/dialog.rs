@@ -24,6 +24,7 @@
 use std::ffi::{CString, c_char, c_void};
 use std::path::PathBuf;
 
+use crate::objc_bool::ObjcBool;
 use crate::ffi::{Id, Sel, class, sel};
 
 // The panel bridge — msgSend casts in the house pattern, local to the
@@ -40,7 +41,7 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_void_id(obj: Id, sel: Sel, a: Id);
     #[link_name = "objc_msgSend"]
-    fn msg_void_bool(obj: Id, sel: Sel, a: i8);
+    fn msg_void_bool(obj: Id, sel: Sel, a: ObjcBool);
     #[link_name = "objc_msgSend"]
     fn msg_i64(obj: Id, sel: Sel) -> i64;
     #[link_name = "objc_msgSend"]
@@ -91,12 +92,12 @@ unsafe fn run_panel(prompt: &str, directories: bool, many: bool) -> Vec<PathBuf>
             return Vec::new();
         }
         // exactly one of the two: a folder picker or a file picker
-        msg_void_bool(panel, sel("setCanChooseDirectories:"), directories as i8);
-        msg_void_bool(panel, sel("setCanChooseFiles:"), (!directories) as i8);
-        msg_void_bool(panel, sel("setAllowsMultipleSelection:"), many as i8);
+        msg_void_bool(panel, sel("setCanChooseDirectories:"), ObjcBool::new(directories));
+        msg_void_bool(panel, sel("setCanChooseFiles:"), ObjcBool::new(!directories));
+        msg_void_bool(panel, sel("setAllowsMultipleSelection:"), ObjcBool::new(many));
         // the reader can always REACH a folder that is not there yet,
         // which is what makes this the picker a project opener wants
-        msg_void_bool(panel, sel("setCanCreateDirectories:"), directories as i8);
+        msg_void_bool(panel, sel("setCanCreateDirectories:"), ObjcBool::new(directories));
         if !prompt.is_empty()
             && let Ok(text) = CString::new(prompt)
         {
@@ -147,7 +148,7 @@ mod tests {
     #[allow(clashing_extern_declarations)]
     unsafe extern "C" {
         #[link_name = "objc_msgSend"]
-        fn msg_bool_sel(obj: Id, sel: Sel, a: Sel) -> i8;
+        fn msg_bool_sel(obj: Id, sel: Sel, a: Sel) -> ObjcBool;
     }
 
     /// Every message this module sends, asked of the REAL AppKit on
@@ -161,7 +162,7 @@ mod tests {
             assert!(!panel.is_null(), "AppKit is linked and NSOpenPanel is there");
             assert_eq!(
                 msg_bool_sel(panel, sel("respondsToSelector:"), sel("openPanel")),
-                1,
+                ObjcBool::YES,
                 "the class makes one",
             );
             for name in [
@@ -175,14 +176,14 @@ mod tests {
             ] {
                 assert_eq!(
                     msg_bool_sel(panel, sel("instancesRespondToSelector:"), sel(name)),
-                    1,
+                    ObjcBool::YES,
                     "a panel answers `{name}`",
                 );
             }
             let url = class("NSURL");
             assert_eq!(
                 msg_bool_sel(url, sel("instancesRespondToSelector:"), sel("path")),
-                1,
+                ObjcBool::YES,
                 "a URL answers `path`",
             );
         }

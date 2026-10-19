@@ -1,0 +1,28 @@
+   Compiling bunny-cli v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-history-responder/bunny_ui/crates/bunny_cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.51s
+     Running tests/preview_host.rs (target/debug/deps/preview_host-273e06e0edcf4718)
+
+running 1 test
+@@bunny-timing cold_build 2171.2
+@@bunny-timing warm_start 469.2
+@@bunny-timing app_frame 469.2
+@@bunny-timing click 1.4
+@@bunny-timing override 1.4
+@@bunny-timing save 449.0
+@@bunny-timing sibling_save 485.9
+@@bunny-timing instance_click 1.4
+@@bunny-timing instance_save 449.9
+
+thread 'the_preview_road_frames_clicks_and_survives_a_swap' (33801907) panicked at crates/bunny_cli/tests/preview_host.rs:70:9:
+nothing matched within 10 s
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test the_preview_road_frames_clicks_and_survives_a_swap ... FAILED
+
+failures:
+
+failures:
+    the_preview_road_frames_clicks_and_survives_a_swap
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.47s
+
+error: test failed, to rerun pass `-p bunny-cli --test preview_host`

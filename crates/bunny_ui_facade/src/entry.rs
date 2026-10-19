@@ -83,7 +83,8 @@ macro_rules! app {
         /// activity's content on Android. The web starts from the
         /// page's `start` export instead, and this returns at once.
         pub fn run() {
-            $crate::__private::run($crate::__bunny_identity!(), $config, $root)
+            $crate::__bunny_app_preview_entry!($root, $config);
+            $crate::__private::run($crate::__bunny_identity!(), $config, $root, $crate::__bunny_preview_config!())
         }
         $crate::__bunny_entry!(run, $root, $config);
     };
@@ -103,6 +104,19 @@ macro_rules! __bunny_identity {
             },
             id: ::core::option_env!("BUNNY_APP_ID"),
             version: ::core::env!("CARGO_PKG_VERSION"),
+        }
+    };
+}
+
+/// Where the app's previews are: its package and manifest directory, as
+/// its OWN crate was built — what the preview host scans.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bunny_preview_config {
+    () => {
+        $crate::__private::PreviewConfig {
+            package: ::core::env!("CARGO_PKG_NAME"),
+            manifest_dir: ::core::env!("CARGO_MANIFEST_DIR"),
         }
     };
 }
@@ -192,6 +206,121 @@ macro_rules! __bunny_hot_entry {
     ($root:expr) => {};
 }
 
+/// The real app root, with its configured window size, exported beside the
+/// marked previews. Feature selection happens in the facade, not the app.
+#[cfg(all(feature = "preview", not(target_arch = "wasm32")))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bunny_app_preview_entry {
+    ($root:expr, $config:expr) => {
+        {
+            fn make() -> $crate::__private::hot::preview::Output {
+                $crate::__private::app_output(($root)(), $config)
+            }
+            static ENTRY: $crate::__private::hot::preview::PreviewEntry =
+                $crate::__private::hot::preview::PreviewEntry::new(
+                    $crate::__private::hot::preview::Meta {
+                        ident: $crate::__private::hot::preview::APP_IDENT,
+                        name: "App",
+                        scope: "App",
+                        example: ::core::env!("CARGO_PKG_NAME"),
+                        module: ::core::module_path!(),
+                        file: ::core::file!(),
+                        line: ::core::line!(),
+                    },
+                    make,
+                );
+            #[allow(non_snake_case, reason = "the reserved symbol is the preview ABI")]
+            #[unsafe(no_mangle)]
+            pub fn bunny_preview__app() -> &'static $crate::__private::hot::preview::PreviewEntry {
+                &ENTRY
+            }
+            // Keep this symbol when the app is an rlib and main calls only run().
+            // An unreferenced export in another codegen unit can be dead-stripped.
+            let _ = ::core::hint::black_box(bunny_preview__app as fn() -> &'static $crate::__private::hot::preview::PreviewEntry);
+        }
+    };
+}
+
+/// Other builds export no whole-app preview.
+#[cfg(not(all(feature = "preview", not(target_arch = "wasm32"))))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bunny_app_preview_entry {
+    ($root:expr, $config:expr) => {};
+}
+
+/// A preview build (`bunny preview`, Studio): what `#[preview]` writes
+/// after each marked function — the symbol `$symbol` that answers the
+/// preview's entry, in the Rust ABI, like a generation's. `$name`,
+/// `$scope` and `$example` are the attribute's string literals; the file,
+/// the line and the module are the compiler's, as of the attribute.
+#[cfg(all(feature = "preview", not(target_arch = "wasm32")))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bunny_preview_entry {
+    ($ident:ident, $symbol:ident, $name:expr, $scope:expr, $example:expr $(,)?) => {
+        const _: () = {
+            fn make() -> $crate::__private::hot::preview::Output {
+                $crate::__private::hot::preview::Output::of($ident())
+            }
+            static ENTRY: $crate::__private::hot::preview::PreviewEntry =
+                $crate::__private::hot::preview::PreviewEntry::new(
+                    $crate::__private::hot::preview::Meta {
+                        ident: ::core::stringify!($ident),
+                        name: $name,
+                        scope: $scope,
+                        example: $example,
+                        module: ::core::module_path!(),
+                        file: ::core::file!(),
+                        line: ::core::line!(),
+                    },
+                    make,
+                );
+            // the symbol's spelling is the ABI's, double underscore and all
+            #[allow(non_snake_case)]
+            #[unsafe(no_mangle)]
+            pub fn $symbol() -> &'static $crate::__private::hot::preview::PreviewEntry {
+                &ENTRY
+            }
+        };
+    };
+}
+
+/// Any other build exports no preview — and keeps the function from
+/// reading as dead code, since only a symbol table ever calls it.
+#[cfg(not(all(feature = "preview", not(target_arch = "wasm32"))))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bunny_preview_entry {
+    ($ident:ident, $symbol:ident, $name:expr, $scope:expr, $example:expr $(,)?) => {
+        const _: () = {
+            let _ = $ident;
+        };
+    };
+}
+
+/// `#[preview]` without the attribute: the same entry, written by hand.
+/// `$ident` is the function, `$symbol` the symbol to export (write
+/// `bunny_preview__` and the function's name), then the component's
+/// name, the scope and this preview's label, as string literals.
+///
+/// ```ignore
+/// fn home() -> impl View { text("Hello") }
+/// bunny_ui::declare_preview!(home, bunny_preview__home, "Home", "Screens", "home");
+/// ```
+#[macro_export]
+macro_rules! declare_preview {
+    (app, $($rest:tt)*) => {
+        ::core::compile_error!(
+            "`app` is the App scene's ident, exported by `app!`; rename the preview"
+        );
+    };
+    ($ident:ident, $symbol:ident, $name:expr, $scope:expr, $example:expr $(,)?) => {
+        $crate::__bunny_preview_entry!($ident, $symbol, $name, $scope, $example);
+    };
+}
+
 /// No shell, or a target without one: an app has nowhere to start.
 #[cfg(not(all(
     feature = "shell",
@@ -223,8 +352,119 @@ pub mod __private {
     use bunny_ui_core::app::{Identity, set_identity};
     use bunny_ui_core::view::View;
 
-    /// The part of hot reload inside the app.
-    #[cfg(all(feature = "hot", any(target_os = "macos", target_os = "ios", target_os = "windows", target_os = "linux", target_os = "android")))]
+    /// Builds the app as a preview without opening its platform window.
+    #[cfg(all(feature = "preview", not(target_arch = "wasm32")))]
+    pub fn app_output(root: impl View, config: AppConfig) -> hot::preview::Output {
+        hot::preview::Output::of(bunny_ui_core::preview::Preview::new(root).size(config.size.width, config.size.height))
+    }
+
+    /// The app's package and manifest directory, for the preview host.
+    #[derive(Clone, Copy, Debug)]
+    pub struct PreviewConfig {
+        pub package: &'static str,
+        pub manifest_dir: &'static str,
+    }
+
+    /// The preview host, when the environment asks for it: never returns
+    /// when it runs. Only a `preview` build has one.
+    #[cfg(all(feature = "preview", not(target_arch = "wasm32")))]
+    fn preview_host(preview: PreviewConfig) {
+        use bunny_ui_preview::host::{Config, Mode, serve_with};
+        if let Some(mode) = Mode::from_env() {
+            serve_with(
+                mode,
+                engines(),
+                Config {
+                    package: preview.package.to_string(),
+                    manifest_dir: std::path::PathBuf::from(preview.manifest_dir),
+                    framework: env!("CARGO_PKG_VERSION"),
+                },
+                pictures(),
+            );
+        }
+    }
+
+    #[cfg(not(all(feature = "preview", not(target_arch = "wasm32"))))]
+    fn preview_host(_preview: PreviewConfig) {}
+
+    /// The engines the preview host renders with: the platform's where
+    /// the shell has them, the house ones elsewhere — and the house ones
+    /// anywhere under `BUNNY_PREVIEW_ENGINE=house`, the deterministic
+    /// pair a snapshot golden is made with on every OS.
+    #[cfg(all(feature = "preview", feature = "shell", target_os = "macos"))]
+    fn engines() -> bunny_ui_preview::host::Engines {
+        if house() {
+            return bunny_ui_preview::host::Engines::house();
+        }
+        bunny_ui_preview::host::Engines {
+            text: std::rc::Rc::new(crate::platform::CoreTextEngine::new()),
+            images: std::rc::Rc::new(crate::platform::CoreGraphicsImageEngine::new()),
+        }
+    }
+
+    #[cfg(all(feature = "preview", not(all(feature = "shell", target_os = "macos")), not(target_arch = "wasm32")))]
+    fn engines() -> bunny_ui_preview::host::Engines {
+        bunny_ui_preview::host::Engines::house()
+    }
+
+    /// `BUNNY_PREVIEW_ENGINE=house`: the deterministic engines, and no
+    /// door to the platform's views — a golden must be the same on
+    /// every OS, and a page's pixels are the platform's.
+    #[cfg(all(feature = "preview", feature = "shell", target_os = "macos"))]
+    fn house() -> bool {
+        std::env::var_os("BUNNY_PREVIEW_ENGINE").is_some_and(|engine| engine == "house")
+    }
+
+    /// The door to the pictures of the platform's views: the macOS
+    /// shell's offscreen desk, where the shell is the Mac's — and none
+    /// under the house engines, where a page stays the placeholder it
+    /// is everywhere else.
+    #[cfg(all(feature = "preview", feature = "shell", target_os = "macos"))]
+    fn pictures() -> Option<Box<dyn bunny_ui_preview::host::Pictures>> {
+        if house() {
+            return None;
+        }
+        Some(Box::new(Desk(crate::platform::pictures::Desk::open())))
+    }
+
+    #[cfg(all(feature = "preview", not(all(feature = "shell", target_os = "macos")), not(target_arch = "wasm32")))]
+    fn pictures() -> Option<Box<dyn bunny_ui_preview::host::Pictures>> {
+        None
+    }
+
+    /// The macOS desk behind the host's door.
+    #[cfg(all(feature = "preview", feature = "shell", target_os = "macos"))]
+    struct Desk(crate::platform::pictures::Desk);
+
+    #[cfg(all(feature = "preview", feature = "shell", target_os = "macos"))]
+    impl bunny_ui_preview::host::Pictures for Desk {
+        fn picture(
+            &mut self,
+            id: bunny_ui_preview::host::HostId<'_>,
+            placement: &bunny_ui_core::layout::HostPlacement,
+        ) -> Option<bunny_ui_core::image_engine::ImageSource> {
+            self.0.picture(id.scene, placement)
+        }
+
+        fn turn(&mut self) -> bool {
+            self.0.turn()
+        }
+
+        fn busy(&self) -> bool {
+            self.0.busy()
+        }
+
+        fn sweep(&mut self, alive: &[bunny_ui_preview::host::HostId<'_>]) {
+            self.0.sweep(|scene, path| alive.iter().any(|id| id.scene == scene && id.path == path));
+        }
+    }
+
+    /// The part of hot reload inside the app — and the preview entries a
+    /// `preview` build exports.
+    #[cfg(any(
+        all(feature = "hot", any(target_os = "macos", target_os = "ios", target_os = "windows", target_os = "linux", target_os = "android")),
+        all(feature = "preview", not(target_arch = "wasm32")),
+    ))]
     pub use bunny_ui_hot as hot;
 
     /// Says who the app is, then opens its window with the first view.
@@ -239,8 +479,11 @@ pub mod __private {
         ),
         not(feature = "hot"),
     ))]
-    pub fn run<V: View>(identity: Identity, config: AppConfig, root: impl FnOnce() -> V) {
+    pub fn run<V: View>(identity: Identity, config: AppConfig, root: impl FnOnce() -> V, preview: PreviewConfig) {
         set_identity(identity);
+        // a preview build asked to host: the previews resolve in this
+        // very binary, and no window opens
+        preview_host(preview);
         let title = config.title.unwrap_or_else(|| identity.name.to_string());
         crate::run_window(&title, config.size, root())
     }
@@ -250,7 +493,7 @@ pub mod __private {
     /// view is built again with each generation's code, inside the pass,
     /// so the state it makes is found again — `root` runs more than once.
     #[cfg(all(feature = "shell", all(feature = "hot", any(target_os = "macos", target_os = "ios", target_os = "windows", target_os = "linux", target_os = "android"))))]
-    pub fn run<V: View>(identity: Identity, config: AppConfig, root: impl Fn() -> V + 'static) {
+    pub fn run<V: View>(identity: Identity, config: AppConfig, root: impl Fn() -> V + 'static, preview: PreviewConfig) {
         set_identity(identity);
         let title = config.title.unwrap_or_else(|| identity.name.to_string());
         // Android names no folder an app may write but the activity's own
@@ -259,6 +502,10 @@ pub mod __private {
         #[cfg(not(target_os = "android"))]
         let scratch = None;
         let root = hot::start(move || hot::Root::new(root()), scratch);
+        // hot is up — the generations `bunny preview` sends load into this
+        // process — and a preview build asked to host renders them instead
+        // of opening the window
+        preview_host(preview);
         crate::run_window(&title, config.size, root)
     }
 
@@ -273,7 +520,7 @@ pub mod __private {
             target_os = "android",
         )
     )))]
-    pub fn run<V: View>(identity: Identity, _config: AppConfig, _root: impl FnOnce() -> V) {
+    pub fn run<V: View>(identity: Identity, _config: AppConfig, _root: impl FnOnce() -> V, _preview: PreviewConfig) {
         set_identity(identity);
     }
 

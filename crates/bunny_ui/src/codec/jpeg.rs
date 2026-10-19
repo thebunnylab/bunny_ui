@@ -420,7 +420,7 @@ impl<'a> Decoder<'a> {
 
     fn frame(&mut self, marker: u8, segment: &[u8]) -> Result<(), Unsupported> {
         match marker {
-            0xC0 | 0xC1 | 0xC2 => {}
+            0xC0..=0xC2 => {}
             0xC3 | 0xC7 | 0xCB | 0xCF => return Err(Unsupported::Lossless),
             0xC5 | 0xC6 | 0xCD | 0xCE => return Err(Unsupported::Hierarchical),
             0xC9 | 0xCA => return Err(Unsupported::Arithmetic),
@@ -673,7 +673,7 @@ impl<'a> Decoder<'a> {
         } else if let Some(transform) = self.adobe_transform {
             transform != 0
         } else {
-            ids != [b'R', b'G', b'B']
+            ids != *b"RGB"
         };
         for y in 0..height {
             for x in 0..width {
@@ -1017,7 +1017,7 @@ fn upsample(plane: &Plane, hmax: usize, vmax: usize, width: usize, height: usize
         }
         return out;
     }
-    if fx == 2 && fy == 1 && hmax % plane.h == 0 {
+    if fx == 2 && fy == 1 && hmax.is_multiple_of(plane.h) {
         // h2v1: out[2i] = (3·in[i] + in[i−1] + 1) >> 2, out[2i+1] = (3·in[i] + in[i+1] + 2) >> 2
         for y in 0..height {
             for i in 0..plane.width {
@@ -1041,7 +1041,7 @@ fn upsample(plane: &Plane, hmax: usize, vmax: usize, width: usize, height: usize
         }
         return out;
     }
-    if fx == 1 && fy == 2 && vmax % plane.v == 0 {
+    if fx == 1 && fy == 2 && vmax.is_multiple_of(plane.v) {
         // h1v2: the same filter down the columns
         for j in 0..plane.height {
             for x in 0..width {
@@ -1060,7 +1060,7 @@ fn upsample(plane: &Plane, hmax: usize, vmax: usize, width: usize, height: usize
         }
         return out;
     }
-    if fx == 2 && fy == 2 && hmax % plane.h == 0 && vmax % plane.v == 0 {
+    if fx == 2 && fy == 2 && hmax.is_multiple_of(plane.h) && vmax.is_multiple_of(plane.v) {
         // h2v2: vertical 3:1 sums first, then the horizontal filter on
         // the sums with the +8/+7 rounding — jdsample's h2v2_fancy_upsample
         for j in 0..plane.height {
