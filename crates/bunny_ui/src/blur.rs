@@ -129,6 +129,9 @@ pub(crate) fn paint(
             ]
         })
         .collect();
+    // These pixels are already decoded. RawImages supplies the existing
+    // content-and-size identity, but its envelope is not a platform codec.
+    let key = ImageSource::from_bytes(RawImages::encode(width as u32, height as u32, &rgba)).key();
     Some(DrawCommand::Image {
         rect: Rect {
             origin: Point { x, y },
@@ -137,7 +140,7 @@ pub(crate) fn paint(
                 height: height as f64 / factor,
             },
         },
-        source: ImageSource::from_bytes(RawImages::encode(width as u32, height as u32, &rgba)),
+        source: ImageSource::rgba(key, (width as u32, height as u32), rgba),
     })
 }
 
