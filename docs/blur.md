@@ -9,7 +9,9 @@ Radius is Gaussian standard deviation in logical pixels. Nonpositive and
 nonfinite values are inert; positive values are capped at 128. Pixel targets
 approximate the Gaussian using three separable box filters. Filtering includes
 premultiplied RGB and alpha, followed by one conversion to straight alpha for
-the existing immutable image transport. This avoids dark fringes around
+the existing immutable RGBA image transport. Computed pixels bypass encoded-image
+decoders; a headless raw envelope is not a format accepted by native ImageIO.
+This avoids dark fringes around
 translucent content. The layer retains the kernel support outside the viewport;
 its allocation follows the visible surface and device scale, not an unbounded
 scroll document. Backdrop materials can still sample paint beneath the layer.
@@ -31,4 +33,6 @@ and project format are unchanged.
 
 `crates/bunny_ui/tests/blur_paint.rs` checks actual painting, transparency, clip
 order, overlapping children, nested effects, source recording, click geometry,
-radius normalization, device scale, animation, scrollbar layers and SSR.
+radius normalization, device scale, animation, scrollbar layers and SSR. The
+decoder-independent regression and `bunny_ui_apple/tests/blur_pixels.rs` cover
+the composite reaching native painting without requiring an image codec.

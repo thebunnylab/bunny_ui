@@ -320,3 +320,40 @@ fn native_hosts_keep_their_paint_order_and_geometry_inside_blur() {
     );
     assert_eq!(runtime.host_segments(display.len())[0].1, (1, 2));
 }
+
+// Decoded effect pixels must not depend on a platform decoder understanding
+// the headless RawImages envelope. Native ImageIO only accepts real codecs.
+#[test]
+fn computed_blur_pixels_need_no_encoded_image_decoder() {
+    use bunny_ui_core::image_engine::{ImageEngine, ImageRaster, ImageSource};
+    use bunny_ui_core::raster::rasterize_with;
+    use bunny_ui_core::text_engine::PixelFont;
+    use std::rc::Rc;
+
+    struct NoEncodedImages;
+    impl ImageEngine for NoEncodedImages {
+        fn intrinsic(&self, _: &ImageSource) -> Option<(u32, u32)> {
+            None
+        }
+        fn raster(&self, _: &ImageSource, _: usize, _: usize) -> Option<Rc<ImageRaster>> {
+            None
+        }
+    }
+    let runtime = Runtime::new().image_engine(Rc::new(NoEncodedImages));
+    let display = runtime.display_frame(
+        &scene(3.0),
+        Size {
+            width: 60.0,
+            height: 60.0,
+        },
+    );
+    let clear = Color::rgba(0, 0, 0, 0);
+    let expected = rasterize(&display, 60, 60, clear).to_rgba_bytes();
+    assert!(expected.as_chunks::<4>().0.iter().any(|p| p[3] > 240));
+    let actual =
+        rasterize_with(&display, 60, 60, 1, clear, &PixelFont, &NoEncodedImages).to_rgba_bytes();
+    assert!(
+        actual == expected,
+        "computed pixels are independent of platform codecs"
+    );
+}

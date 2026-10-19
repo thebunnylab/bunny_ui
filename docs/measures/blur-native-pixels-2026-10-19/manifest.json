@@ -1,0 +1,70 @@
+{
+  "algorithm": "blake3",
+  "files": [
+    {
+      "path": "README.md",
+      "bytes": 1080,
+      "blake3": "53524ea7c505fbb6d606c08de03459b8cd9d893d508b60b54ad2f10ae237cdea"
+    },
+    {
+      "path": "native-pixels-failing-apple.exit",
+      "bytes": 4,
+      "blake3": "779c2379a41b40ee4b939961fbce0ade8840c854490c67163ca5c3df7424c440"
+    },
+    {
+      "path": "native-pixels-failing-apple.log",
+      "bytes": 3227,
+      "blake3": "fb08a1558b564296f6306f48d26e068756d4fc99025e1035dcf813977275bd16"
+    },
+    {
+      "path": "native-pixels-failing-core.exit",
+      "bytes": 4,
+      "blake3": "779c2379a41b40ee4b939961fbce0ade8840c854490c67163ca5c3df7424c440"
+    },
+    {
+      "path": "native-pixels-failing-core.log",
+      "bytes": 89940,
+      "blake3": "1442474b93489e83646ffd0e1a52c1649562fc719da7227fd291abfdcb7e7fb5"
+    },
+    {
+      "path": "pixels-apple-clippy.log",
+      "bytes": 16522,
+      "blake3": "ca85d4ee13c6765dcfb22ffc2717c96ce354b6320a3ca1246180274c0af5252f"
+    },
+    {
+      "path": "pixels-apple.log",
+      "bytes": 14801,
+      "blake3": "f9b7bdadfb0447d5eb4b231aa0e4e7d0dc212b444591762cf501c13bbf145669"
+    },
+    {
+      "path": "pixels-core.log",
+      "bytes": 119756,
+      "blake3": "64bb212c4c30f64613ce91bcd4cff49b07f13cc9600fcfebdc96b0d77e7c7b7e"
+    },
+    {
+      "path": "pixels-gates.json",
+      "bytes": 1172,
+      "blake3": "cc65ad75715e1fd472e2da6efffa21ae0fe89d790466e4c8c4bc783abf950561"
+    },
+    {
+      "path": "pixels-native-clippy.log",
+      "bytes": 600,
+      "blake3": "5b6d0509482ad590513234aeda42ce30dc34070c11a318ca22781866272b4479"
+    },
+    {
+      "path": "pixels-preview.log",
+      "bytes": 9213,
+      "blake3": "37bccb56fc7cfc65553bb05ef9df58af92f391164c6e92cbd62dda357c57dbbd"
+    },
+    {
+      "path": "pixels-wasm-clippy.log",
+      "bytes": 548,
+      "blake3": "f58cb421a7c643e4036680e77ae93f5696ac73597dee81264ed759ae0b0f2a6f"
+    },
+    {
+      "path": "verification.json",
+      "bytes": 2861,
+      "blake3": "c33109509e78ed20dc058ff8a4070a7fd15211bf3875ae001a301bae1ac151c7"
+    }
+  ]
+}
