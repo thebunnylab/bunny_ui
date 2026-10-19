@@ -43,9 +43,12 @@ pub struct FrameUniforms {
     pub sky_up: Row,
     /// `(exposure, knee, dither on, 0)`.
     pub tone: Row,
-    /// The sun's shadow map projection from the eye's space.
+    /// The sun's shadow map from the eye's space, column-major:
+    /// `(u, v, depth, 1)`, with `u` and `v` across the map (`v = 0` at
+    /// its first row) and the depth from the sun in `[0, 1]`.
     pub shadow_from_eye: [f32; 16],
-    /// `(1/size, normal offset, depth bias, taps)`; taps 0 = no shadow.
+    /// `(1/size, normal offset in meters, depth bias, taps)`; taps 0 =
+    /// no shadow, else 1, 4 or 9 lookups.
     pub shadow: Row,
     /// `(point lights, 0, 0, 0)`.
     pub counts: Row,
@@ -140,6 +143,12 @@ pub mod material_flag {
     pub const MASK: u32 = 4;
 }
 
+/// Bytes of one caster of the sun's shadow map: the three rows of its
+/// map-from-model matrix, `x' = rows[0] · (x, y, z, 1)` — `x` and `y`
+/// across the map in `[-1, 1]` (`y` up), `z` the depth from the sun in
+/// `[0, 1]`.
+pub const SHADOW_INSTANCE_STRIDE: usize = 48;
+
 /// How a set of lines is drawn. 32 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct LineStyleData {
@@ -224,6 +233,17 @@ pub fn instance_bytes(instances: &[InstanceData]) -> Vec<u8> {
     let mut out = Vec::with_capacity(instances.len() * instance_offset::SIZE);
     for instance in instances {
         instance.write(&mut out);
+    }
+    out
+}
+
+/// Every caster of the shadow map, back to back.
+pub fn shadow_instance_bytes(instances: &[[Row; 3]]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(instances.len() * SHADOW_INSTANCE_STRIDE);
+    for rows in instances {
+        for row in rows {
+            put_row(&mut out, row);
+        }
     }
     out
 }
@@ -345,5 +365,9 @@ mod tests {
         let bytes = segment_bytes(&[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]);
         assert_eq!(bytes.len(), SEGMENT_STRIDE);
         assert_eq!(f32_at(&bytes, 20), 6.0);
+        let caster = [[1.0, 0.0, 0.0, 0.5], [0.0, 1.0, 0.0, 0.25], [0.0, 0.0, 1.0, 0.125]];
+        let bytes = shadow_instance_bytes(&[caster, caster]);
+        assert_eq!(bytes.len(), 2 * SHADOW_INSTANCE_STRIDE);
+        assert_eq!(f32_at(&bytes, SHADOW_INSTANCE_STRIDE + 44), 0.125);
     }
 }

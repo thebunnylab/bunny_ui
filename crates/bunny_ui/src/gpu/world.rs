@@ -6,9 +6,10 @@
 //! it keeps for the box, the frame the core decided, and the tier's own
 //! handles for every mesh, texture and set of segments the frame names —
 //! uploaded once per identity and generation by the [`WorldResidency`]
-//! here. The tier draws the jobs into their targets before its 2D pass,
-//! and the 2D pass composites each target like a feed, with the box's
-//! veil ([`super::walk::RunKind::World`]).
+//! here — and the box's shadow map, with whether the casters must be
+//! drawn into it again. The tier draws the jobs into their targets before
+//! its 2D pass, and the 2D pass composites each target like a feed, with
+//! the box's veil ([`super::walk::RunKind::World`]).
 //!
 //! The LAW is the walk's: every decision about what to keep and when to
 //! let it go is made here, on the CPU. A tier only moves bytes and mints
@@ -55,6 +56,28 @@ pub trait WorldGround {
     /// A set of segments, [`crate::world::wire::SEGMENT_STRIDE`] bytes each.
     fn make_segments(&mut self, segments: &[u8]) -> Option<u64>;
     fn drop_segments(&mut self, id: u64);
+    /// A shadow map of `size × size` depths: the shadow pass draws the
+    /// casters into it, and the surfaces read it through a comparing
+    /// sampler. `None` when the tier has none: its worlds draw in full sun.
+    fn make_shadow_map(&mut self, size: u32) -> Option<u64> {
+        let _ = size;
+        None
+    }
+    fn drop_shadow_map(&mut self, id: u64) {
+        let _ = id;
+    }
+}
+
+/// The sun's shadow map of a job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShadowJob {
+    /// The map's handle.
+    pub map: u64,
+    /// The map's side in texels: the frame's.
+    pub size: u32,
+    /// The map does not hold the frame's shadow yet: the casters are
+    /// drawn into it before the frame. False when only the camera moved.
+    pub draw: bool,
 }
 
 /// One world picture a tier draws this frame, into one target.
@@ -75,6 +98,58 @@ pub struct WorldJob {
     pub textures: Vec<Option<u64>>,
     /// The tier's handle for each of `frame.lines`.
     pub segments: Vec<u64>,
+    /// The sun's shadow map, when the frame has one and the tier made it;
+    /// without it the surfaces draw in full sun.
+    pub shadow: Option<ShadowJob>,
+}
+
+impl WorldJob {
+    /// One frame by itself, and everything it names made on `ground`: a
+    /// target of its own, each mesh, texture and set of segments, and the
+    /// shadow map to draw. For a parity harness, which reads the target
+    /// back and then gives it all back ([`WorldJob::give_back`]).
+    pub fn single(ground: &mut dyn WorldGround, frame: &Rc<WorldFrame>, images: &dyn ImageEngine) -> Option<WorldJob> {
+        let samples = frame.samples.clamp(1, ground.world_caps().samples.max(1));
+        let target = ground.make_target(frame.size.0, frame.size.1, samples)?;
+        let mut meshes = Vec::with_capacity(frame.meshes.len());
+        for mesh in &frame.meshes {
+            meshes.push(ground.make_mesh(&mesh.vertex_bytes(), &mesh.index_bytes())?);
+        }
+        let mut segments = Vec::with_capacity(frame.lines.len());
+        for lines in &frame.lines {
+            segments.push(ground.make_segments(&segment_bytes(lines.segments()))?);
+        }
+        let textures = frame
+            .textures
+            .iter()
+            .map(|source| {
+                let texture = crate::world::texture::texture_of(images, source)?;
+                let levels: Vec<&[u8]> = texture.levels.iter().map(|level| level.rgba.as_slice()).collect();
+                ground.make_texture(texture.levels[0].width, texture.levels[0].height, &levels)
+            })
+            .collect();
+        let shadow = frame.shadow.as_ref().and_then(|shadow| {
+            Some(ShadowJob { map: ground.make_shadow_map(shadow.size)?, size: shadow.size, draw: true })
+        });
+        Some(WorldJob { target, size: frame.size, samples, frame: Rc::clone(frame), meshes, textures, segments, shadow })
+    }
+
+    /// Gives back everything [`WorldJob::single`] made.
+    pub fn give_back(self, ground: &mut dyn WorldGround) {
+        ground.drop_target(self.target);
+        for id in self.meshes {
+            ground.drop_mesh(id);
+        }
+        for id in self.segments {
+            ground.drop_segments(id);
+        }
+        for id in self.textures.into_iter().flatten() {
+            ground.drop_texture(id);
+        }
+        if let Some(shadow) = self.shadow {
+            ground.drop_shadow_map(shadow.map);
+        }
+    }
 }
 
 /// A world picture on a tier that draws worlds: the target the 2D pass
@@ -106,6 +181,14 @@ struct Asset {
     walk: u64,
 }
 
+/// A box's shadow map: its side, and the shadow it holds.
+struct HeldMap {
+    id: u64,
+    size: u32,
+    holds: Option<u64>,
+    walk: u64,
+}
+
 /// What a ground holds for worlds, and when to let it go.
 #[derive(Default)]
 pub struct WorldResidency {
@@ -113,12 +196,16 @@ pub struct WorldResidency {
     meshes: HashMap<u64, Asset>,
     textures: HashMap<u64, Asset>,
     segments: HashMap<u64, Asset>,
+    /// Each box's shadow map, by slot.
+    shadow_maps: HashMap<u64, HeldMap>,
     /// The walk in progress.
     walk: u64,
     /// What this walk's jobs leave in their targets — kept apart until
     /// the tier says it drew them, so a walk the atlas cuts short, or a
     /// frame that never reached the GPU, draws its worlds again.
     pending: Vec<(u64, u64)>,
+    /// What this walk's jobs leave in their shadow maps, the same way.
+    pending_shadows: Vec<(u64, u64)>,
 }
 
 impl WorldResidency {
@@ -126,6 +213,7 @@ impl WorldResidency {
     pub(crate) fn begin_walk(&mut self, walk: u64) {
         self.walk = walk;
         self.pending.clear();
+        self.pending_shadows.clear();
     }
 
     /// The tier encoded the walk's jobs: their targets hold what they
@@ -137,6 +225,11 @@ impl WorldResidency {
                 target.holds = Some(generation);
             }
         }
+        for (slot, generation) in self.pending_shadows.drain(..) {
+            if let Some(map) = self.shadow_maps.get_mut(&slot) {
+                map.holds = Some(generation);
+            }
+        }
     }
 
     /// The device is gone, and every handle with it: nothing is dropped,
@@ -146,7 +239,14 @@ impl WorldResidency {
         self.meshes.clear();
         self.textures.clear();
         self.segments.clear();
+        self.shadow_maps.clear();
         self.pending.clear();
+        self.pending_shadows.clear();
+    }
+
+    /// How many shadow maps are held.
+    pub fn shadow_maps(&self) -> usize {
+        self.shadow_maps.len()
     }
 
     /// How many targets, meshes, textures and segment sets are held.
@@ -204,7 +304,35 @@ impl WorldResidency {
         if textures.iter().all(Option::is_some) {
             self.pending.push((slot, generation));
         }
-        Some(ResolvedWorld { target: id, size, job: Some(WorldJob { target: id, size, samples, frame, meshes, textures, segments }) })
+        // the shadow is drawn again only when what it holds moved: a
+        // camera that moves under a still sun reads the map it has
+        let shadow = frame.shadow.as_ref().and_then(|shadow| {
+            let (map, holds) = self.shadow_map(ground, slot, shadow.size)?;
+            let draw = holds != Some(shadow.generation);
+            if draw {
+                self.pending_shadows.push((slot, shadow.generation));
+            }
+            Some(ShadowJob { map, size: shadow.size, draw })
+        });
+        Some(ResolvedWorld { target: id, size, job: Some(WorldJob { target: id, size, samples, frame, meshes, textures, segments, shadow }) })
+    }
+
+    /// The box's shadow map of `size`, made when it has none of that
+    /// side, with the generation it holds.
+    fn shadow_map(&mut self, ground: &mut dyn WorldGround, slot: u64, size: u32) -> Option<(u64, Option<u64>)> {
+        let walk = self.walk;
+        if let Some(held) = self.shadow_maps.get_mut(&slot) {
+            if held.size == size {
+                held.walk = walk;
+                return Some((held.id, held.holds));
+            }
+            let old = held.id;
+            self.shadow_maps.remove(&slot);
+            ground.drop_shadow_map(old);
+        }
+        let id = ground.make_shadow_map(size)?;
+        self.shadow_maps.insert(slot, HeldMap { id, size, holds: None, walk });
+        Some((id, None))
     }
 
     fn mesh(&mut self, ground: &mut dyn WorldGround, mesh: &Mesh) -> Option<u64> {
@@ -260,6 +388,13 @@ impl WorldResidency {
             let keep = !idle(target.walk, TARGET_IDLE_WALKS);
             if !keep {
                 ground.drop_target(target.id);
+            }
+            keep
+        });
+        self.shadow_maps.retain(|_, map| {
+            let keep = !idle(map.walk, TARGET_IDLE_WALKS);
+            if !keep {
+                ground.drop_shadow_map(map.id);
             }
             keep
         });
@@ -358,6 +493,12 @@ mod tests {
         }
         fn drop_segments(&mut self, id: u64) {
             self.give_back("segments", id);
+        }
+        fn make_shadow_map(&mut self, _: u32) -> Option<u64> {
+            self.mint("shadow map")
+        }
+        fn drop_shadow_map(&mut self, id: u64) {
+            self.give_back("shadow map", id);
         }
     }
 
@@ -479,6 +620,88 @@ mod tests {
         let images = RawImages::default();
         residency.begin_walk(1);
         assert!(residency.resolve(&mut ground, &images, &shot(&world, Quality::Low), 7, 1, (64, 64)).is_none());
+    }
+
+    #[test]
+    fn a_shadow_is_drawn_once_and_read_while_the_camera_moves() {
+        use crate::world::material::Light;
+        let (world, cube) = cube_world();
+        world.add(crate::world::mesh::Mesh::plane(8.0, 8.0), Material::color(Color::rgb(200, 196, 188))).set_position(Vec3 { x: 0.0, y: -0.5, z: 0.0 });
+        world.add_light(Light::sun().toward(Vec3 { x: 0.5, y: -1.0, z: 0.7 }).with_shadows());
+        let at = |yaw: f64, quality: Quality| {
+            let style = WorldStyle { quality, ..WorldStyle::default() };
+            Shot::new(world.with(WorldData::clone), Camera::orbiting(Vec3::ZERO, yaw, 25.0, 5.0), style, 0.0, (100.0, 80.0))
+        };
+        let (mut ground, mut residency) = (Ledger::new(), WorldResidency::default());
+        let images = RawImages::default();
+        let mut walk = 0;
+        let mut shadow_of = |residency: &mut WorldResidency, ground: &mut Ledger, shot: &Shot, generation: u64| {
+            walk += 1;
+            residency.begin_walk(walk);
+            let job = residency.resolve(ground, &images, shot, 7, generation, (200, 160)).expect("a target").job.expect("a job");
+            residency.drawn();
+            job.shadow.expect("a shadow map")
+        };
+        let first = shadow_of(&mut residency, &mut ground, &at(30.0, Quality::Medium), 1);
+        assert!(first.draw, "a new map draws its casters");
+        assert_eq!(first.size, 2048);
+        let turned = shadow_of(&mut residency, &mut ground, &at(70.0, Quality::Medium), 2);
+        assert_eq!((turned.map, turned.draw), (first.map, false), "the camera turned: the map holds");
+        cube.set_position(Vec3 { x: 0.0, y: 0.2, z: 0.0 });
+        let moved = shadow_of(&mut residency, &mut ground, &at(70.0, Quality::Medium), 3);
+        assert_eq!((moved.map, moved.draw), (first.map, true), "a caster moved: the same map, drawn again");
+        let low = shadow_of(&mut residency, &mut ground, &at(70.0, Quality::Low), 4);
+        assert_ne!(low.map, first.map, "a smaller map for a lower quality");
+        assert!(low.draw);
+        assert_eq!(Ledger::count(&ground.made, "shadow map"), 2);
+        assert_eq!(Ledger::count(&ground.dropped, "shadow map"), 1, "the larger map came down");
+        residency.begin_walk(walk + TARGET_IDLE_WALKS + 1);
+        residency.retire(&mut ground);
+        assert_eq!(residency.shadow_maps(), 0, "an idle map is given back");
+        assert!(!ground.live.iter().any(|id| *id == low.map));
+    }
+
+    #[test]
+    fn a_tier_without_shadow_maps_draws_in_full_sun() {
+        use crate::world::material::Light;
+        let (world, _) = cube_world();
+        world.add_light(Light::sun().with_shadows());
+        struct Plain(Ledger);
+        impl WorldGround for Plain {
+            fn world_caps(&self) -> WorldCaps {
+                self.0.world_caps()
+            }
+            fn make_target(&mut self, w: u32, h: u32, s: u8) -> Option<u64> {
+                self.0.make_target(w, h, s)
+            }
+            fn drop_target(&mut self, id: u64) {
+                self.0.drop_target(id)
+            }
+            fn make_mesh(&mut self, v: &[u8], i: &[u8]) -> Option<u64> {
+                self.0.make_mesh(v, i)
+            }
+            fn drop_mesh(&mut self, id: u64) {
+                self.0.drop_mesh(id)
+            }
+            fn make_texture(&mut self, w: u32, h: u32, l: &[&[u8]]) -> Option<u64> {
+                self.0.make_texture(w, h, l)
+            }
+            fn drop_texture(&mut self, id: u64) {
+                self.0.drop_texture(id)
+            }
+            fn make_segments(&mut self, s: &[u8]) -> Option<u64> {
+                self.0.make_segments(s)
+            }
+            fn drop_segments(&mut self, id: u64) {
+                self.0.drop_segments(id)
+            }
+        }
+        let mut ground = Plain(Ledger::new());
+        let mut residency = WorldResidency::default();
+        residency.begin_walk(1);
+        let job = residency.resolve(&mut ground, &RawImages::default(), &shot(&world, Quality::Low), 7, 1, (64, 64)).unwrap().job.unwrap();
+        assert!(job.frame.shadow.is_some(), "the frame asks for a shadow");
+        assert!(job.shadow.is_none(), "the tier has no map: the picture still draws");
     }
 
     #[test]

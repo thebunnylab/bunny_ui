@@ -188,6 +188,9 @@ pub struct Surface {
     pub occlusion: f32,
     /// The light groups the surface belongs to.
     pub groups: u32,
+    /// How much of the sun reaches the point: 1 in full light, 0 in the
+    /// sun's shadow.
+    pub shadow: f32,
 }
 
 /// The light a surface sends toward the eye, before the tone curve.
@@ -224,7 +227,7 @@ pub fn lit(u: &super::wire::FrameUniforms, surface: &Surface) -> V3 {
             let fresnel = add(f0, scale(add([1.0, 1.0, 1.0], scale(f0, -1.0)), x5));
             let specular = scale(fresnel, pi_d * visibility);
             let sun = [u.sun_color[0], u.sun_color[1], u.sun_color[2]];
-            light = add(light, scale(mul(add(diffuse, specular), sun), n_dot_l));
+            light = add(light, scale(mul(add(diffuse, specular), sun), n_dot_l * surface.shadow));
         }
     }
 

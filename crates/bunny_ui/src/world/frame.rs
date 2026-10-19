@@ -7,16 +7,19 @@
 //! rasterizer runs the same list. Two tiers can only disagree on how a
 //! pixel is shaded, never on what is drawn.
 
+use std::collections::HashMap;
+use std::hash::Hasher;
 use std::rc::Rc;
 
 use super::camera::{Camera, Lens};
 use super::material::{AlphaMode, Light, LineDepth, Material, SunFrame};
-use super::math::{Aabb, Frustum, Mat4, Plane, Vec3, vec3};
+use super::math::{Aabb, Frustum, Mat4, Plane, Vec3, vec3, vec4};
 use super::mesh::{Lines, Mesh};
 use super::shade::decode;
+use super::shadow;
 use super::store::{Shape, WorldData};
 use super::wire::{
-    FrameUniforms, InstanceData, LineStyleData, MAX_POINTS, MaterialData, instance_flag, material_flag,
+    FrameUniforms, InstanceData, LineStyleData, MAX_POINTS, MaterialData, Row, instance_flag, material_flag,
 };
 use crate::image_engine::ImageSource;
 use crate::layout::Color;
@@ -64,6 +67,24 @@ impl Quality {
             Quality::Low => 1_200_000,
             Quality::Medium => 2_200_000,
             Quality::High => 4_000_000,
+        }
+    }
+
+    /// The side of the sun's shadow map, in texels.
+    pub fn shadow_size(self) -> u32 {
+        match self {
+            Quality::Low => 1024,
+            Quality::Medium | Quality::High => 2048,
+        }
+    }
+
+    /// The lookups a pixel makes into the sun's shadow map — each one
+    /// four texels compared and filtered: one, four or nine.
+    pub fn shadow_taps(self) -> u32 {
+        match self {
+            Quality::Low => 1,
+            Quality::Medium => 4,
+            Quality::High => 9,
         }
     }
 
@@ -165,6 +186,37 @@ pub struct Draw {
     pub instance_count: u32,
 }
 
+/// The sun's shadow map of a frame: what a tier draws into it, from the
+/// sun, before the frame's own draws. The casters are the solid surfaces
+/// of every entity that casts a shadow, in view or not — a shadow falls
+/// into the view from outside it. A cut-out casts its whole shape.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShadowFrame {
+    /// A hash of what the map holds — the casters, their meshes and the
+    /// sun — and of nothing else: a tier that holds a map of this
+    /// generation draws nothing into it, whatever the camera did.
+    pub generation: u64,
+    /// The map's side, in texels.
+    pub size: u32,
+    /// Each caster's rows ([`super::wire::shadow_instance_bytes`]).
+    pub instances: Vec<[Row; 3]>,
+    /// In order. Each one draws both faces and keeps the nearest depth.
+    pub draws: Vec<ShadowDraw>,
+}
+
+/// One draw into the shadow map: a run of a mesh's indices, once per
+/// caster.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ShadowDraw {
+    /// Into [`WorldFrame::meshes`].
+    pub mesh: u16,
+    pub first_index: u32,
+    pub index_count: u32,
+    /// Into [`ShadowFrame::instances`].
+    pub first_instance: u32,
+    pub instance_count: u32,
+}
+
 /// One picture of a world, decided: everything a tier needs to draw it.
 #[derive(Clone, Debug)]
 pub struct WorldFrame {
@@ -192,6 +244,9 @@ pub struct WorldFrame {
     /// even where the surface turns away from the eye. Zero when no
     /// line of the frame meets the depth.
     pub face_bias: f32,
+    /// The sun's shadow map, when the frame's sun casts shadows and
+    /// something casts one.
+    pub shadow: Option<ShadowFrame>,
 }
 
 impl WorldFrame {
@@ -199,7 +254,6 @@ impl WorldFrame {
     /// checksum draw the same picture.
     pub fn checksum(&self) -> u64 {
         let mut hasher = motor::hash::FxHasher::default();
-        use std::hash::Hasher;
         hasher.write_u32(self.size.0);
         hasher.write_u32(self.size.1);
         hasher.write_u8(self.samples);
@@ -221,6 +275,9 @@ impl WorldFrame {
         }
         for draw in &self.draws {
             std::hash::Hash::hash(draw, &mut hasher);
+        }
+        if let Some(shadow) = &self.shadow {
+            hasher.write_u64(shadow.generation);
         }
         hasher.finish()
     }
@@ -315,6 +372,7 @@ pub(crate) fn build_frame(
     let sides = Frustum::from_matrix(&open);
 
     let mut models: Vec<(Seen, Model)> = Vec::new();
+    let mut casters: Vec<Caster> = Vec::new();
     let mut line_sets: Vec<(Seen, Lines, super::material::LineStyle)> = Vec::new();
     let mut lights: Vec<(Light, Mat4)> = Vec::new();
     for (id, data) in world.iter() {
@@ -332,6 +390,12 @@ pub(crate) fn build_frame(
         };
         match &data.spec.shape {
             Shape::Model(model) => {
+                if data.spec.casts_shadow {
+                    casters.push(Caster {
+                        world_from_model: matrix,
+                        model: Model { mesh: model.mesh.clone(), materials: Rc::clone(&model.materials) },
+                    });
+                }
                 let bounds = model.mesh.bounds().transformed(&eye_from_model);
                 if sides.may_see(&bounds) && (parallel || bounds.min.z < 0.0) {
                     models.push((seen(bounds), Model { mesh: model.mesh.clone(), materials: Rc::clone(&model.materials) }));
@@ -398,6 +462,7 @@ pub(crate) fn build_frame(
         near,
         far,
         face_bias: 0.0,
+        shadow: None,
     };
 
     // models: one group per (mesh, materials, handedness), drawn instanced
@@ -409,9 +474,9 @@ pub(crate) fn build_frame(
         depth: f64,
     }
     let mut groups: Vec<Group> = Vec::new();
-    let mut group_of = std::collections::HashMap::<(u64, u64, usize, bool), usize>::new();
-    let mut mesh_slot = std::collections::HashMap::<(u64, u64), u16>::new();
-    let mut material_slot = std::collections::HashMap::<usize, u32>::new();
+    let mut group_of = HashMap::<(u64, u64, usize, bool), usize>::new();
+    let mut mesh_slot = HashMap::<(u64, u64), u16>::new();
+    let mut material_slot = HashMap::<usize, u32>::new();
     for (index, (seen, model)) in models.iter().enumerate() {
         let mirrored = seen.eye_from_model.determinant() < 0.0;
         let materials_key = Rc::as_ptr(&model.materials) as *const Material as usize;
@@ -551,8 +616,128 @@ pub(crate) fn build_frame(
     // stable: within a pass, the order above stands
     frame.draws.sort_by_key(|draw| draw.pass);
 
+    // the frame's sun is its first, and it casts when it says so
+    let world_from_eye = view.inverse().unwrap_or(Mat4::IDENTITY);
+    let sun = lights.iter().find_map(|(light, _)| match light {
+        Light::Sun(sun) => Some(*sun),
+        _ => None,
+    });
+    let fit = sun.filter(|sun| sun.shadows).and_then(|sun| {
+        let travel = match sun.frame {
+            SunFrame::World => sun.direction,
+            SunFrame::View => world_from_eye.transform_vector(sun.direction),
+        };
+        shadow_frame(&mut frame, &mut mesh_slot, &casters, travel.try_normalized()?, style.quality)
+    });
+
     frame.uniforms = uniforms(&Eye { camera, view, projection }, style, size, px_per_point, time, &lights);
+    if let Some(fit) = fit {
+        // the map's u runs with its x, its v down from its top
+        let uv = Mat4::from_cols(vec4(0.5, 0.0, 0.0, 0.0), vec4(0.0, -0.5, 0.0, 0.0), vec4(0.0, 0.0, 1.0, 0.0), vec4(0.5, 0.5, 0.0, 1.0));
+        frame.uniforms.shadow_from_eye = (uv * fit.map_from_world * world_from_eye).to_f32();
+        let taps = style.quality.shadow_taps();
+        frame.uniforms.shadow = [
+            1.0 / style.quality.shadow_size() as f32,
+            (fit.texel * shadow::reach(taps)) as f32,
+            shadow::depth_bias(&fit) as f32,
+            taps as f32,
+        ];
+    }
     frame
+}
+
+/// An entity that casts the sun's shadow: where it stands, what it is.
+struct Caster {
+    world_from_model: Mat4,
+    model: Model,
+}
+
+/// Casters that share a mesh and its solid runs: one instanced draw a
+/// run.
+struct CasterGroup {
+    runs: Vec<(u32, u32)>,
+    members: Vec<usize>,
+}
+
+/// The runs of a model's triangles that light does not pass through —
+/// opaque and cut-out surfaces — as `(first index, count)`, neighbours
+/// joined.
+fn solid_runs(model: &Model) -> Vec<(u32, u32)> {
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for &(slot, first, count) in model.mesh.material_runs() {
+        let alpha = model.materials.get(slot as usize).or(model.materials.last()).map_or(AlphaMode::Opaque, |material| material.alpha);
+        if !matches!(alpha, AlphaMode::Opaque | AlphaMode::Mask(_)) {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((start, length)) if *start + *length == first => *length += count,
+            _ => runs.push((first, count)),
+        }
+    }
+    runs
+}
+
+/// The shadow map of a sun whose light travels along `travel`: every
+/// caster's solid surfaces as the sun sees them, the map fitted around
+/// them. Casters that share a mesh and its runs draw instanced. `None`
+/// when nothing casts.
+fn shadow_frame(
+    frame: &mut WorldFrame,
+    mesh_slot: &mut HashMap<(u64, u64), u16>,
+    casters: &[Caster],
+    travel: Vec3,
+    quality: Quality,
+) -> Option<shadow::Fit> {
+    let light = shadow::light_view(travel);
+    let mut bounds = Aabb::EMPTY;
+    let mut groups: Vec<CasterGroup> = Vec::new();
+    let mut group_of = HashMap::<(u64, u64, Vec<(u32, u32)>), usize>::new();
+    for (index, caster) in casters.iter().enumerate() {
+        let runs = solid_runs(&caster.model);
+        if runs.is_empty() {
+            continue;
+        }
+        bounds = bounds.union(caster.model.mesh.bounds().transformed(&(light * caster.world_from_model)));
+        let mesh = &caster.model.mesh;
+        let group = *group_of.entry((mesh.id(), mesh.generation(), runs.clone())).or_insert_with(|| {
+            groups.push(CasterGroup { runs, members: Vec::new() });
+            groups.len() - 1
+        });
+        groups[group].members.push(index);
+    }
+    if groups.is_empty() || bounds.is_empty() {
+        return None;
+    }
+    let size = quality.shadow_size();
+    let fit = shadow::Fit::around(&light, &bounds, size);
+    let mut out = ShadowFrame { generation: 0, size, instances: Vec::new(), draws: Vec::new() };
+    let mut hasher = motor::hash::FxHasher::default();
+    hasher.write_u32(size);
+    for CasterGroup { runs, members } in &groups {
+        let mesh = &casters[members[0]].model.mesh;
+        let slot = *mesh_slot.entry((mesh.id(), mesh.generation())).or_insert_with(|| {
+            frame.meshes.push(mesh.clone());
+            (frame.meshes.len() - 1) as u16
+        });
+        let first_instance = out.instances.len() as u32;
+        for &member in members {
+            out.instances.push(rows(&(fit.map_from_world * casters[member].world_from_model)));
+        }
+        for &(first_index, index_count) in runs {
+            out.draws.push(ShadowDraw { mesh: slot, first_index, index_count, first_instance, instance_count: members.len() as u32 });
+            hasher.write_u64(mesh.id());
+            hasher.write_u64(mesh.generation());
+            for value in [first_index, index_count, first_instance, members.len() as u32] {
+                hasher.write_u32(value);
+            }
+        }
+    }
+    for value in out.instances.iter().flatten().flatten() {
+        hasher.write_u32(value.to_bits());
+    }
+    out.generation = hasher.finish();
+    frame.shadow = Some(out);
+    Some(fit)
 }
 
 impl super::store::World {
@@ -860,6 +1045,110 @@ mod tests {
         // `build` draws at two pixels a point: a 1.5 pt line is 3 px wide
         let bias = build(&world, &camera).face_bias;
         assert!((bias - (1.5 + 0.25) * std::f32::consts::SQRT_2).abs() < 1e-4, "{bias}");
+    }
+
+    fn sunny(shadows: bool) -> (World, crate::world::store::Entity) {
+        let world = World::new();
+        let cube = world.add(Mesh::cuboid(1.0, 1.0, 1.0), gray());
+        world.add(Mesh::plane(8.0, 8.0), gray()).set_position(vec3(0.0, -0.5, 0.0));
+        let sun = Light::sun().toward(vec3(0.5, -1.0, 0.7));
+        world.add_light(if shadows { sun.with_shadows() } else { sun });
+        (world, cube)
+    }
+
+    #[test]
+    fn a_sun_without_shadows_casts_none() {
+        let (world, _) = sunny(false);
+        let frame = build(&world, &Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0));
+        assert!(frame.shadow.is_none());
+        assert_eq!(frame.uniforms.shadow, [0.0; 4], "no lookups");
+    }
+
+    #[test]
+    fn the_shadow_holds_still_while_the_camera_moves() {
+        let (world, _) = sunny(true);
+        let generation = |camera: &Camera| {
+            let frame = build(&world, camera);
+            let shadow = frame.shadow.as_ref().expect("a sun with shadows over casters");
+            assert_eq!(shadow.size, Quality::Medium.shadow_size());
+            assert_eq!(frame.uniforms.shadow[3], 4.0, "four lookups at the default quality");
+            (shadow.generation, frame.uniforms.shadow_from_eye)
+        };
+        let (first, from_eye) = generation(&Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0));
+        for (camera, eye_moved) in [
+            (Camera::orbiting(Vec3::ZERO, 80.0, 40.0, 5.0), true),
+            (Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 2.5), true),
+            (Camera::orbiting(vec3(1.5, 0.0, -2.0), 35.0, 28.0, 5.0), true),
+            (Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0).parallel(), false),
+        ] {
+            let (again, seen_from) = generation(&camera);
+            assert_eq!(again, first, "the camera moved, the map did not");
+            // the eye reads the same map from where it stands now
+            assert_eq!(seen_from != from_eye, eye_moved);
+        }
+    }
+
+    #[test]
+    fn a_caster_that_moves_draws_the_shadow_again() {
+        let (world, cube) = sunny(true);
+        let camera = Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0);
+        let before = build(&world, &camera).shadow.expect("a shadow").generation;
+        cube.set_position(vec3(0.0, 0.25, 0.0));
+        let after = build(&world, &camera).shadow.expect("a shadow").generation;
+        assert_ne!(before, after);
+        // a second sun changes nothing: the first is the frame's
+        let second = world.add_light(Light::sun().toward(vec3(-0.5, -1.0, 0.7)).with_shadows());
+        assert_eq!(build(&world, &camera).shadow.unwrap().generation, after);
+        // and a sun that turns draws it again
+        second.remove();
+        world.with(|data| {
+            let sun = data.iter().find(|(_, entity)| matches!(entity.spec.shape, Shape::Light(Light::Sun(_)))).map(|(id, _)| id);
+            assert!(sun.is_some());
+        });
+        let turned = World::new();
+        turned.add(Mesh::cuboid(1.0, 1.0, 1.0), gray()).set_position(vec3(0.0, 0.25, 0.0));
+        turned.add(Mesh::plane(8.0, 8.0), gray()).set_position(vec3(0.0, -0.5, 0.0));
+        turned.add_light(Light::sun().toward(vec3(0.6, -1.0, 0.7)).with_shadows());
+        assert_ne!(build(&turned, &camera).shadow.unwrap().generation, after);
+    }
+
+    #[test]
+    fn a_caster_out_of_view_still_casts() {
+        let (world, _) = sunny(true);
+        let far = world.add(Mesh::sphere(0.5), gray()).set_position(vec3(-60.0, 0.0, 0.0));
+        let camera = Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0);
+        let frame = build(&world, &camera);
+        let shadow = frame.shadow.as_ref().expect("a shadow");
+        assert_eq!(shadow.draws.len(), 3, "the cube, the floor, and the ball out of view");
+        assert_eq!(frame.draws.len(), 2, "only what the camera sees is drawn");
+        assert!(shadow.draws.iter().all(|draw| (draw.mesh as usize) < frame.meshes.len()));
+        far.remove();
+        assert_eq!(build(&world, &camera).shadow.unwrap().draws.len(), 2);
+    }
+
+    #[test]
+    fn what_lets_light_through_casts_nothing() {
+        let world = World::new();
+        world.add(Mesh::plane(8.0, 8.0), gray()).set_position(vec3(0.0, -0.5, 0.0)).set_casts_shadow(false);
+        world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgba(200, 220, 255, 100)).blend());
+        world.add_light(Light::sun().toward(vec3(0.5, -1.0, 0.7)).with_shadows());
+        let frame = build(&world, &Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0));
+        assert!(frame.shadow.is_none(), "glass and a floor that casts no shadow: no map");
+        assert_eq!(frame.uniforms.shadow[3], 0.0);
+        world.add(Mesh::cuboid(0.5, 0.5, 0.5), gray()).set_position(vec3(2.0, 0.0, 0.0));
+        let frame = build(&world, &Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0));
+        assert_eq!(frame.shadow.expect("the solid box casts").draws.len(), 1);
+    }
+
+    #[test]
+    fn a_sun_fixed_to_the_view_draws_its_shadow_again_when_the_camera_turns() {
+        let world = World::new();
+        world.add(Mesh::cuboid(1.0, 1.0, 1.0), gray());
+        world.add(Mesh::plane(8.0, 8.0), gray()).set_position(vec3(0.0, -0.5, 0.0));
+        world.add_light(Light::sun().from_view(vec3(0.3, -1.0, -0.4)).with_shadows());
+        let at = |yaw: f64| build(&world, &Camera::orbiting(Vec3::ZERO, yaw, 28.0, 5.0)).shadow.unwrap().generation;
+        assert_ne!(at(35.0), at(60.0), "the sun turned with the camera");
+        assert_eq!(at(35.0), at(35.0));
     }
 
     #[test]

@@ -7,7 +7,9 @@
 //! functions with the top-left rule, depth linear on the screen,
 //! attributes corrected for perspective, colour blended as an 8-bit
 //! target blends it. Lines are quads of analytic coverage, as their
-//! shader draws them.
+//! shader draws them. The sun's shadow map is drawn first, by the same
+//! rules, and read the way a comparing sampler reads it
+//! (`super::shadow`).
 //!
 //! The picture is what a tier's target holds: premultiplied, sRGB-encoded
 //! RGBA8, the top row first. The same frame gives the same bytes on every
@@ -18,6 +20,7 @@ use std::rc::Rc;
 use super::frame::{Background, Blend, DrawKind, WorldFrame};
 use super::mesh::{fold_normal, unfold_normal};
 use super::shade::{self, Surface, V3, decode, encode_code, quantize};
+use super::shadow::{self as sun_shadow, ShadowMap};
 use super::texture::{Texture, log2};
 use super::wire::{FrameUniforms, InstanceData, material_flag};
 
@@ -71,6 +74,7 @@ pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Textu
         depth: vec![1.0; (width * height) as usize],
     };
     target.clear(frame.background);
+    let shadow = sun_shadow::map_of(frame);
     let projection = frame.uniforms.clip_from_eye;
     for draw in &frame.draws {
         match draw.kind {
@@ -82,7 +86,7 @@ pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Textu
                 // an opaque surface steps back under the frame's edges
                 let bias = if blend == Blend::Replace { frame.face_bias } else { 0.0 };
                 for instance in &frame.instances[draw.first_instance as usize..(draw.first_instance + draw.instance_count) as usize] {
-                    let job = Job { frame, instance, cull_back, mirrored, blend, mask, bias, texture: texture.as_deref() };
+                    let job = Job { frame, instance, cull_back, mirrored, blend, mask, bias, texture: texture.as_deref(), shadow: shadow.as_deref() };
                     for triangle in indices.as_chunks::<3>().0 {
                         let vertices = [0, 1, 2].map(|k| corners.vertex(triangle[k] as usize, instance, &projection));
                         job.triangle(&mut target, vertices);
@@ -302,6 +306,8 @@ struct Job<'a> {
     /// How many pixels of its own depth slope the triangle steps back.
     bias: f32,
     texture: Option<&'a Texture>,
+    /// The sun's shadow map of the frame.
+    shadow: Option<&'a ShadowMap>,
 }
 
 /// A corner on the screen: fixed-point position, depth, `1/w`.
@@ -315,13 +321,13 @@ struct Screen {
 
 /// The edge function: positive when `p` lies to the right of `a → b`
 /// on a y-down screen.
-fn edge(a: (i64, i64), b: (i64, i64), p: (i64, i64)) -> i64 {
+pub(super) fn edge(a: (i64, i64), b: (i64, i64), p: (i64, i64)) -> i64 {
     (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0)
 }
 
 /// A top edge (flat, going right) or a left edge (going up) of a
 /// clockwise triangle: a pixel centre exactly on it belongs to it.
-fn top_left(a: (i64, i64), b: (i64, i64)) -> bool {
+pub(super) fn top_left(a: (i64, i64), b: (i64, i64)) -> bool {
     (a.1 == b.1 && b.0 > a.0) || b.1 < a.1
 }
 
@@ -480,6 +486,7 @@ impl Job<'_> {
             let normal = shade::normalize(mix3(|v| v.normal));
             let normal = if front { normal } else { shade::scale(normal, -1.0) };
             let occlusion = v[0].occlusion * b[0] + v[1].occlusion * b[1] + v[2].occlusion * b[2];
+            let shadow = self.shadow.map_or(1.0, |map| sun_shadow::visibility(u, map, position, normal));
             let lit = shade::lit(
                 u,
                 &Surface {
@@ -491,6 +498,7 @@ impl Job<'_> {
                     emissive: [material.emissive[0], material.emissive[1], material.emissive[2]],
                     occlusion,
                     groups: u32::MAX,
+                    shadow,
                 },
             );
             let dither = if u.tone[2] > 0.5 { shade::bayer(x, y) } else { 0.0 };
@@ -512,7 +520,7 @@ pub const DEPTH_CEILING: f32 = f32::from_bits(0x3F7F_FFFF);
 pub const DEPTH_TIE: f32 = 2.384_185_8e-7;
 
 /// Snaps a pixel coordinate to 1/256, rounding half to even.
-fn snap(value: f32) -> i64 {
+pub(super) fn snap(value: f32) -> i64 {
     (value as f64 * 256.0).round_ties_even() as i64
 }
 
@@ -911,6 +919,50 @@ mod tests {
         // and without the engine, the colour alone
         let plain = world.render(&near, &style(Background::Transparent), (64, 64), 1.0);
         assert_eq!(plain.at(10, 10), [255, 255, 255, 255]);
+    }
+
+    /// A box on a floor under a sun that travels toward the camera: its
+    /// shadow falls in front of it, in view.
+    fn sunlit_box(shadows: bool, quality: Quality) -> Picture {
+        let world = World::new();
+        world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(222, 120, 60)));
+        world.add(Mesh::plane(8.0, 8.0), Material::color(Color::rgb(200, 196, 188))).set_position(vec3(0.0, -0.5, 0.0));
+        let sun = crate::world::material::Light::sun().toward(vec3(0.5, -1.0, 0.7));
+        world.add_light(if shadows { sun.with_shadows() } else { sun });
+        let style = WorldStyle { background: Background::Color(Color::rgb(236, 233, 226)), quality, ..WorldStyle::default() };
+        let camera = Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0);
+        draw(&world.frame(&camera, &style, (160, 120), 1.0))
+    }
+
+    #[test]
+    fn a_box_casts_its_shadow_on_the_floor_and_none_on_itself() {
+        let size = crate::layout::Size { width: 160.0, height: 120.0 };
+        let camera = Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0);
+        let pixel = |picture: &Picture, point: Vec3| {
+            let at = camera.project(point, size).expect("in view");
+            picture.at(at.x as u32, at.y as u32)
+        };
+        let plain = sunlit_box(false, Quality::Low);
+        for quality in [Quality::Low, Quality::Medium, Quality::High] {
+            let shaded = sunlit_box(true, quality);
+            dump(&format!("shadow-{quality:?}"), &shaded);
+            // the floor under the box's middle, seen past its front corner
+            let under = vec3(0.625, -0.5, 0.775);
+            let (dark, light) = (pixel(&shaded, under), pixel(&plain, under));
+            assert!((dark[0] as i32) < light[0] as i32 - 30, "{quality:?}: the shadow is darker: {dark:?} vs {light:?}");
+            // the open floor and the sunlit top keep every bit
+            for open in [vec3(-2.0, -0.5, 2.0), vec3(2.5, -0.5, -1.0), vec3(0.0, 0.5, 0.0), vec3(-0.3, 0.5, 0.2)] {
+                assert_eq!(pixel(&shaded, open), pixel(&plain, open), "{quality:?}: a lit point at {open:?} moved");
+            }
+            // a shadow only takes light away, and only around the box
+            let mut darker = 0;
+            for (a, b) in shaded.rgba.as_chunks::<4>().0.iter().zip(plain.rgba.as_chunks::<4>().0) {
+                assert!((0..3).all(|k| a[k] <= b[k]), "{quality:?}: a pixel grew lighter: {a:?} vs {b:?}");
+                darker += (a != b) as usize;
+            }
+            let share = darker as f64 / (160.0 * 120.0);
+            assert!(share > 0.01 && share < 0.12, "{quality:?}: {share} of the picture in shadow");
+        }
     }
 
     #[test]

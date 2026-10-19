@@ -30,7 +30,7 @@ use std::rc::Rc;
 use bunny_ui::gpu::world::{WorldCaps, WorldGround, WorldJob};
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, WorldFrame};
-use bunny_ui::world::wire::{SEGMENT_STRIDE, frame_offset, instance_bytes, instance_offset, material_bytes, segment_bytes};
+use bunny_ui::world::wire::{SEGMENT_STRIDE, frame_offset, instance_bytes, instance_offset, material_bytes};
 
 use super::*;
 
@@ -550,26 +550,9 @@ impl VkWorld {
         frame: &Rc<WorldFrame>,
         images: &dyn ImageEngine,
     ) -> Option<Vec<u8>> {
-        let samples = frame.samples.clamp(1, 4);
         let mut door = VkWorldDoor { stack, world: self };
-        let ground = door.open()?;
-        let target = ground.make_target(frame.size.0, frame.size.1, samples)?;
-        let mut meshes = Vec::new();
-        for mesh in &frame.meshes {
-            meshes.push(ground.make_mesh(&mesh.vertex_bytes(), &mesh.index_bytes())?);
-        }
-        let mut lines = Vec::new();
-        for set in &frame.lines {
-            lines.push(ground.make_segments(&segment_bytes(set.segments()))?);
-        }
-        let mut textures = Vec::new();
-        for picture in &frame.textures {
-            textures.push(bunny_ui::world::texture::texture_of(images, picture).and_then(|texture| {
-                let levels: Vec<&[u8]> = texture.levels.iter().map(|level| level.rgba.as_slice()).collect();
-                ground.make_texture(texture.levels[0].width, texture.levels[0].height, &levels)
-            }));
-        }
-        let job = WorldJob { target, size: frame.size, samples, frame: Rc::clone(frame), meshes, textures, segments: lines };
+        let job = WorldJob::single(door.open()?, frame, images)?;
+        let target = job.target;
         let (width, height) = frame.size;
         let length = width as usize * height as usize * 4;
         let (readback, readback_memory, readback_map) =
@@ -668,15 +651,8 @@ impl VkWorld {
             (fns.destroy_buffer)(stack.device, readback, std::ptr::null());
             (fns.free_memory)(stack.device, readback_memory, std::ptr::null());
             let mut door = VkWorldDoor { stack, world: self };
-            door.drop_target(job.target);
-            for id in job.meshes {
-                door.drop_mesh(id);
-            }
-            for id in job.segments {
-                door.drop_segments(id);
-            }
-            for id in job.textures.into_iter().flatten() {
-                door.drop_texture(id);
+            if let Some(ground) = door.open() {
+                job.give_back(ground);
             }
             // the device is idle: what the job made goes now
             let graveyard = std::mem::take(&mut self.graveyard);

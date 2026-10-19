@@ -3667,7 +3667,6 @@ impl OffscreenGpu {
 
     /// [`OffscreenGpu::world_rgba`] with textures, decoded by `images`.
     pub fn world_rgba_with(&mut self, frame: &Rc<bunny_ui::world::WorldFrame>, images: &dyn ImageEngine) -> Option<Vec<u8>> {
-        use bunny_ui::gpu::world::WorldGround;
         unsafe {
             let pool = objc_autoreleasePoolPush();
             poll_uploads(&mut self.slots, &mut self.atlas, &self.stack.sels);
@@ -3691,17 +3690,7 @@ impl OffscreenGpu {
             msg_void(command, self.stack.sels.commit);
             msg_void(command, self.stack.sels.wait_completed);
             let bytes = world::read_target(&self.ground.world, job.target, &self.stack.sels);
-            let door = &mut self.ground.world;
-            door.drop_target(job.target);
-            for id in job.meshes {
-                door.drop_mesh(id);
-            }
-            for id in job.segments {
-                door.drop_segments(id);
-            }
-            for id in job.textures.into_iter().flatten() {
-                door.drop_texture(id);
-            }
+            job.give_back(&mut self.ground.world);
             objc_autoreleasePoolPop(pool);
             bytes
         }

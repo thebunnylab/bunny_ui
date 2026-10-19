@@ -22,7 +22,7 @@ use super::world::{WorldCaps, WorldGround, WorldJob};
 use super::world_shaders as source;
 use crate::image_engine::ImageEngine;
 use crate::world::frame::{Background, Blend, DrawKind, WorldFrame};
-use crate::world::wire::{SEGMENT_STRIDE, instance_bytes, material_bytes, segment_bytes};
+use crate::world::wire::{SEGMENT_STRIDE, instance_bytes, material_bytes};
 
 /// The numbers GL answers to, the ones this pass uses.
 pub mod gl {
@@ -528,41 +528,14 @@ impl<G: GlFamily> GlWorld<G> {
     /// the CPU's `soft::draw` gives for the same frame. For the parity
     /// harness; `None` when the pass cannot stand.
     pub fn draw_single(&mut self, frame: &Rc<WorldFrame>, images: &dyn ImageEngine) -> Option<Vec<u8>> {
-        let samples = frame.samples.clamp(1, self.samples);
-        let door = self.door()?;
-        let target = door.make_target(frame.size.0, frame.size.1, samples)?;
-        let mut meshes = Vec::new();
-        for mesh in &frame.meshes {
-            meshes.push(door.make_mesh(&mesh.vertex_bytes(), &mesh.index_bytes())?);
-        }
-        let mut segments = Vec::new();
-        for lines in &frame.lines {
-            segments.push(door.make_segments(&segment_bytes(lines.segments()))?);
-        }
-        let mut textures = Vec::new();
-        for picture in &frame.textures {
-            textures.push(crate::world::texture::texture_of(images, picture).and_then(|texture| {
-                let levels: Vec<&[u8]> = texture.levels.iter().map(|level| level.rgba.as_slice()).collect();
-                door.make_texture(texture.levels[0].width, texture.levels[0].height, &levels)
-            }));
-        }
-        let job = WorldJob { target, size: frame.size, samples, frame: Rc::clone(frame), meshes, textures, segments };
+        let job = WorldJob::single(self.door()?, frame, images)?;
         self.encode(std::slice::from_ref(&job));
-        let resolve = self.targets.get(&target)?.resolve;
+        let resolve = self.targets.get(&job.target)?.resolve;
         let mut out = vec![0u8; frame.size.0 as usize * frame.size.1 as usize * 4];
         self.gl.bind_framebuffer(gl::FRAMEBUFFER, resolve);
         self.gl.read_pixels(frame.size.0 as i32, frame.size.1 as i32, &mut out);
         self.gl.bind_framebuffer(gl::FRAMEBUFFER, 0);
-        self.drop_target(job.target);
-        for id in job.meshes {
-            self.drop_mesh(id);
-        }
-        for id in job.segments {
-            self.drop_segments(id);
-        }
-        for id in job.textures.into_iter().flatten() {
-            self.drop_texture(id);
-        }
+        job.give_back(self);
         Some(out)
     }
 }

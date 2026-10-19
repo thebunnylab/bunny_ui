@@ -1415,24 +1415,7 @@ pub(super) fn staged_bytes(job: &WorldJob) -> (Vec<u8>, Vec<u8>) {
 /// against the CPU's picture of the same frame. Textures decode through
 /// `images`, as the walk's do.
 pub(super) fn single_job(world: &mut MetalWorld, frame: &Rc<WorldFrame>, images: &dyn bunny_ui::image_engine::ImageEngine) -> Option<WorldJob> {
-    let door = world.door()?;
-    let target = door.make_target(frame.size.0, frame.size.1, frame.samples.clamp(1, 4))?;
-    let mut meshes = Vec::new();
-    for mesh in &frame.meshes {
-        meshes.push(door.make_mesh(&mesh.vertex_bytes(), &mesh.index_bytes())?);
-    }
-    let mut segments = Vec::new();
-    for lines in &frame.lines {
-        segments.push(door.make_segments(&bunny_ui::world::wire::segment_bytes(lines.segments()))?);
-    }
-    let mut textures = Vec::new();
-    for source in &frame.textures {
-        textures.push(bunny_ui::world::texture::texture_of(images, source).and_then(|texture| {
-            let levels: Vec<&[u8]> = texture.levels.iter().map(|level| level.rgba.as_slice()).collect();
-            door.make_texture(texture.levels[0].width, texture.levels[0].height, &levels)
-        }));
-    }
-    Some(WorldJob { target, size: frame.size, samples: frame.samples.clamp(1, 4), frame: Rc::clone(frame), meshes, textures, segments })
+    WorldJob::single(world.door()?, frame, images)
 }
 
 /// The resolved picture of a harness target, row by row.

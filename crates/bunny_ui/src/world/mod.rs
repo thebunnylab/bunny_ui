@@ -28,6 +28,7 @@ pub mod pick;
 pub mod polygon;
 pub mod scene;
 pub mod shade;
+pub mod shadow;
 pub mod soft;
 pub mod store;
 pub mod texture;
@@ -38,12 +39,13 @@ pub use math::{Aabb, Frustum, Mat4, Plane, Quat, Ray, Transform, Vec2, Vec3, Vec
 pub use camera::{Camera, Flight, Lens};
 #[cfg(feature = "gltf")]
 pub use gltf::{Asset, AssetNode, GltfError};
-pub use frame::{Background, Blend, Draw, DrawKind, Pass, Quality, WorldFrame, WorldStyle};
+pub use frame::{Background, Blend, Draw, DrawKind, Pass, Quality, ShadowDraw, ShadowFrame, WorldFrame, WorldStyle};
 pub use material::{AlphaMode, Light, LineDepth, LineStyle, Material, Model, PointLight, Sun, SunFrame};
 pub use mesh::{Lines, Mesh, MeshData};
 pub use orbit::{Orbit, OrbitLimits};
 pub use pick::Hit;
 pub use scene::{Anchor, SceneView, scene_view};
+pub use shadow::ShadowMap;
 pub use soft::Picture;
 pub use store::{Entity, EntityId, EntitySpec, Shape, World, WorldEdit};
 pub use view::{CameraSource, Shot};

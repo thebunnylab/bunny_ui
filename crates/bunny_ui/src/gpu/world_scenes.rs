@@ -17,7 +17,7 @@ use crate::world::mesh::{Mesh, MeshData};
 use crate::world::store::World;
 
 /// How many worlds the catalog holds.
-pub const COUNT: u32 = 6;
+pub const COUNT: u32 = 9;
 
 /// What a tier's picture may differ from the CPU's by: the share of
 /// pixels whose worst channel is more than three codes apart, and more
@@ -31,6 +31,11 @@ pub struct Tolerance {
 /// Interiors agree to the dither's step; the pixels a triangle's edge
 /// crosses may fall to either side.
 const EXACT: Tolerance = Tolerance { beyond_three: 0.02, beyond_sixteen: 0.01 };
+
+/// A shadow's edge is a filtered blend of comparisons, and a texture
+/// unit keeps fewer bits of the blend than the CPU: the penumbra may sit
+/// a few codes apart.
+const PENUMBRA: Tolerance = Tolerance { beyond_three: 0.03, beyond_sixteen: 0.01 };
 
 /// One world of the catalog: the frame, its name, its tolerance.
 pub struct WorldScene {
@@ -55,6 +60,17 @@ fn still_life() -> World {
     world
 }
 
+/// The still life under a sun that casts: the box's shadow falls on the
+/// floor and on the ball.
+fn shadowed_still_life() -> World {
+    let world = World::new();
+    world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(222, 120, 60)));
+    world.add(Mesh::plane(6.0, 6.0), Material::color(Color::rgb(200, 196, 188))).set_position(vec3(0.0, -0.5, 0.0));
+    world.add(Mesh::sphere(0.45), Material::color(Color::rgb(70, 110, 200)).roughness(0.3).metallic(0.2)).set_position(vec3(1.25, -0.05, 0.5));
+    world.add_light(Light::sun().toward(vec3(0.6, -1.0, 0.45)).with_shadows());
+    world
+}
+
 /// A checker of `cells` squares a side over a clear band.
 pub fn checker(cells: u32, side: u32) -> ImageSource {
     let mut rgba = Vec::with_capacity((side * side * 4) as usize);
@@ -75,6 +91,12 @@ pub fn checker(cells: u32, side: u32) -> ImageSource {
 /// World `index` of the catalog.
 pub fn world_scene(index: u32) -> WorldScene {
     let frame = |world: &World, camera: &Camera, quality: Quality, size: (u32, u32)| Rc::new(world.frame(camera, &style(quality), size, 1.0));
+    // a quality's shadow, drawn at one sample like the CPU's picture
+    let one_sample = |world: &World, camera: &Camera, quality: Quality, size: (u32, u32)| {
+        let mut frame = world.frame(camera, &style(quality), size, 1.0);
+        frame.samples = 1;
+        Rc::new(frame)
+    };
     match index % COUNT {
         0 => WorldScene {
             frame: frame(&still_life(), &Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0), Quality::Low, (160, 120)),
@@ -144,6 +166,24 @@ pub fn world_scene(index: u32) -> WorldScene {
                 pictures: vec![picture],
             }
         }
+        6 => WorldScene {
+            frame: frame(&shadowed_still_life(), &Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0), Quality::Low, (160, 120)),
+            name: "a cast shadow",
+            tolerance: PENUMBRA,
+            pictures: Vec::new(),
+        },
+        7 => WorldScene {
+            frame: one_sample(&shadowed_still_life(), &Camera::orbiting(Vec3::ZERO, 20.0, 35.0, 4.0), Quality::Medium, (200, 150)),
+            name: "a shadow of four lookups",
+            tolerance: PENUMBRA,
+            pictures: Vec::new(),
+        },
+        8 => WorldScene {
+            frame: one_sample(&shadowed_still_life(), &Camera::orbiting(vec3(0.5, 0.0, 0.3), 50.0, 30.0, 3.5).parallel(), Quality::High, (200, 150)),
+            name: "a shadow of nine lookups",
+            tolerance: PENUMBRA,
+            pictures: Vec::new(),
+        },
         _ => WorldScene {
             frame: frame(&still_life(), &Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0), Quality::Medium, (160, 120)),
             name: "four samples",
@@ -199,6 +239,28 @@ mod tests {
             assert!(painted > 0, "{} painted nothing", scene.name);
             // the CPU against itself is the zero of the scale
             assert!(Spread::of(&picture.rgba, &picture.rgba).within(scene.tolerance));
+            if let Some(dump) = std::env::var_os("BUNNY_WORLD_DUMP") {
+                let (w, h) = scene.frame.size;
+                let _ = std::fs::write(std::path::Path::new(&dump).join(format!("catalog-{index}-{w}x{h}.rgba")), &picture.rgba);
+            }
+        }
+    }
+
+    #[test]
+    fn every_shadow_of_the_catalog_shows() {
+        for index in 0..COUNT {
+            let scene = world_scene(index);
+            if scene.frame.shadow.is_none() {
+                continue;
+            }
+            let shaded = crate::world::soft::draw(&scene.frame);
+            let mut sunlit = (*scene.frame).clone();
+            sunlit.shadow = None;
+            sunlit.uniforms.shadow = [0.0; 4];
+            let plain = crate::world::soft::draw(&sunlit);
+            let darker = shaded.rgba.as_chunks::<4>().0.iter().zip(plain.rgba.as_chunks::<4>().0).filter(|(a, b)| a[0] as i32 + 20 < b[0] as i32).count();
+            let share = darker as f64 / scene.frame.size.0 as f64 / scene.frame.size.1 as f64;
+            assert!(share > 0.02, "{}: {share} of the picture in clear shadow", scene.name);
         }
     }
 }
