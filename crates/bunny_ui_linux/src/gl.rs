@@ -431,6 +431,8 @@ struct GlWorldFns {
     front_face: unsafe extern "C" fn(GlEnum),
     clear_depth: unsafe extern "C" fn(f64),
     draw_elements_instanced: unsafe extern "C" fn(GlEnum, i32, GlEnum, *const c_void, i32),
+    draw_buffer: unsafe extern "C" fn(GlEnum),
+    read_buffer: unsafe extern "C" fn(GlEnum),
     /// GL 4.3, or `ARB_invalidate_subdata`: a hint the pass can lose.
     invalidate_framebuffer: Option<unsafe extern "C" fn(GlEnum, i32, *const GlEnum)>,
 }
@@ -472,6 +474,8 @@ fn resolve_world(egl: &EglFns) -> Option<GlWorldFns> {
         front_face: gl!("glFrontFace"),
         clear_depth: gl!("glClearDepth"),
         draw_elements_instanced: gl!("glDrawElementsInstanced"),
+        draw_buffer: gl!("glDrawBuffer"),
+        read_buffer: gl!("glReadBuffer"),
         invalidate_framebuffer: sym("glInvalidateFramebuffer").map(|address| unsafe { entry(address) }),
     })
 }
@@ -1705,6 +1709,13 @@ impl GlFamily for Gl33 {
         let Some(invalidate) = self.world.invalidate_framebuffer else { return };
         let attachments: Vec<GlEnum> = [first, second].into_iter().filter(|attachment| *attachment != 0).collect();
         unsafe { invalidate(target, attachments.len() as i32, attachments.as_ptr()) }
+    }
+
+    fn draw_no_color(&mut self) {
+        unsafe {
+            (self.world.draw_buffer)(0);
+            (self.world.read_buffer)(0);
+        }
     }
 
     fn viewport(&mut self, width: i32, height: i32) {

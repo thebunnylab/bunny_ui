@@ -12,6 +12,11 @@
 //! multisample renderbuffers that a blit resolves into it. The shaders
 //! are `super::world_shaders`.
 //!
+//! A frame whose sun casts draws its casters first, when the box's map
+//! does not hold them yet, into a 16-bit depth texture the surfaces read
+//! through a comparing sampler (unit 2); a frame without one binds a map
+//! of one texel that always answers "lit".
+//!
 //! The 2D pass's state is put back when the pass ends: depth off, culling
 //! off, blending on with the 2D pass's own factors, texture unit 0.
 
@@ -21,8 +26,8 @@ use std::rc::Rc;
 use super::world::{WorldCaps, WorldGround, WorldJob};
 use super::world_shaders as source;
 use crate::image_engine::ImageEngine;
-use crate::world::frame::{Background, Blend, DrawKind, WorldFrame};
-use crate::world::wire::{SEGMENT_STRIDE, instance_bytes, material_bytes};
+use crate::world::frame::{Background, Blend, DrawKind, ShadowFrame, WorldFrame};
+use crate::world::wire::{SEGMENT_STRIDE, SHADOW_INSTANCE_STRIDE, instance_bytes, material_bytes, shadow_instance_bytes};
 
 /// The numbers GL answers to, the ones this pass uses.
 pub mod gl {
@@ -35,16 +40,21 @@ pub mod gl {
     pub const BYTE: u32 = 0x1400;
     pub const UNSIGNED_BYTE: u32 = 0x1401;
     pub const SHORT: u32 = 0x1402;
+    pub const UNSIGNED_SHORT: u32 = 0x1403;
     pub const UNSIGNED_INT: u32 = 0x1405;
     pub const FLOAT: u32 = 0x1406;
     pub const TEXTURE_2D: u32 = 0x0DE1;
     pub const TEXTURE0: u32 = 0x84C0;
     pub const TEXTURE1: u32 = 0x84C1;
+    pub const TEXTURE2: u32 = 0x84C2;
     pub const TEXTURE_MIN_FILTER: u32 = 0x2801;
     pub const TEXTURE_MAG_FILTER: u32 = 0x2800;
     pub const TEXTURE_WRAP_S: u32 = 0x2802;
     pub const TEXTURE_WRAP_T: u32 = 0x2803;
     pub const TEXTURE_MAX_LEVEL: u32 = 0x813D;
+    pub const TEXTURE_COMPARE_MODE: u32 = 0x884C;
+    pub const TEXTURE_COMPARE_FUNC: u32 = 0x884D;
+    pub const COMPARE_REF_TO_TEXTURE: i32 = 0x884E;
     pub const NEAREST: i32 = 0x2600;
     pub const LINEAR: i32 = 0x2601;
     pub const LINEAR_MIPMAP_LINEAR: i32 = 0x2703;
@@ -55,6 +65,8 @@ pub mod gl {
     pub const SRGB8_ALPHA8: u32 = 0x8C43;
     pub const RGBA32F: u32 = 0x8814;
     pub const DEPTH_COMPONENT32F: u32 = 0x8CAC;
+    pub const DEPTH_COMPONENT16: u32 = 0x81A5;
+    pub const DEPTH_COMPONENT: u32 = 0x1902;
     pub const FRAMEBUFFER: u32 = 0x8D40;
     pub const READ_FRAMEBUFFER: u32 = 0x8CA8;
     pub const DRAW_FRAMEBUFFER: u32 = 0x8CA9;
@@ -136,6 +148,10 @@ pub trait GlFamily {
     /// The attachments' contents are no longer needed: a tiled GPU need
     /// not write them back. Up to two; 0 is none.
     fn invalidate_framebuffer(&mut self, target: u32, first: u32, second: u32);
+    /// The bound framebuffer draws and reads no colour. Desktop GL 3.3
+    /// counts a framebuffer of depth alone complete only once it is said;
+    /// ES and WebGL2 need nothing.
+    fn draw_no_color(&mut self) {}
 
     fn viewport(&mut self, width: i32, height: i32);
     fn enable(&mut self, capability: u32);
@@ -183,10 +199,17 @@ struct Programs {
     backdrop: Program,
     /// The 2D pass's sprite for a world's target.
     composite: u32,
+    /// The casters into a shadow map.
+    shadow: u32,
     frame: u32,
     instances: u32,
+    /// The casters' rows.
+    casters: u32,
     materials: u32,
     blank: u32,
+    /// A map of one texel whose comparison always passes: a frame without
+    /// a map reads full sun.
+    lit: u32,
     empty: u32,
 }
 
@@ -221,6 +244,13 @@ struct SegmentObjects {
     count: u32,
 }
 
+#[derive(Clone, Copy)]
+struct ShadowObjects {
+    texture: u32,
+    framebuffer: u32,
+    size: u32,
+}
+
 /// The world's GL objects, and the door the walk opens.
 pub struct GlWorld<G: GlFamily> {
     pub gl: G,
@@ -229,6 +259,7 @@ pub struct GlWorld<G: GlFamily> {
     meshes: HashMap<u64, MeshObjects>,
     textures: HashMap<u64, u32>,
     segments: HashMap<u64, SegmentObjects>,
+    shadow_maps: HashMap<u64, ShadowObjects>,
     next: u64,
     /// The 2D pass's blend factors, put back when the world pass ends.
     blend_2d: [u32; 4],
@@ -246,6 +277,7 @@ impl<G: GlFamily> GlWorld<G> {
             meshes: HashMap::new(),
             textures: HashMap::new(),
             segments: HashMap::new(),
+            shadow_maps: HashMap::new(),
             next: 1,
             blend_2d,
             samples: samples.clamp(1, 4),
@@ -280,6 +312,7 @@ impl<G: GlFamily> GlWorld<G> {
         self.meshes.clear();
         self.textures.clear();
         self.segments.clear();
+        self.shadow_maps.clear();
     }
 
     fn mint(&mut self) -> u64 {
@@ -304,6 +337,12 @@ impl<G: GlFamily> GlWorld<G> {
             &world,
         )?;
         let backdrop = gl.program(&format!("{prelude}{}", source::BACKDROP_VERT), &format!("{prelude}{}", source::BACKDROP_FRAG), &[], &[])?;
+        let shadow = gl.program(
+            &format!("{prelude}{}{}", source::WORLD_COMMON, source::SHADOW_VERT),
+            &format!("{prelude}{}", source::SHADOW_FRAG),
+            &MESH_ATTRIBUTES,
+            &world,
+        )?;
         let composite = gl.program(
             &format!("{prelude}{}", super::shaders::SPRITE_VERT),
             &format!("{prelude}{}{}", super::shaders::SHARED_FRAG, source::COMPOSITE_FRAG_BODY),
@@ -317,7 +356,7 @@ impl<G: GlFamily> GlWorld<G> {
             located.rows = gl.uniform_location(handle, "u_rows");
             located.style = gl.uniform_location(handle, "u_style");
             located.ramp = gl.uniform_location(handle, "u_ramp");
-            for (name, unit) in [("u_materials", 0), ("u_surface", 1), ("atlas", 0)] {
+            for (name, unit) in [("u_materials", 0), ("u_surface", 1), ("u_shadow", 2), ("atlas", 0)] {
                 let at = gl.uniform_location(handle, name);
                 if at != 0 {
                     gl.uniform1i(at, unit);
@@ -341,6 +380,11 @@ impl<G: GlFamily> GlWorld<G> {
         gl.bind_texture(materials);
         gl.tex_parameteri(gl::TEXTURE_MIN_FILTER, gl::NEAREST);
         gl.tex_parameteri(gl::TEXTURE_MAG_FILTER, gl::NEAREST);
+        // its texel is never written: a comparison that always passes
+        let lit = gl.create_texture();
+        gl.bind_texture(lit);
+        gl.tex_image_2d(0, gl::DEPTH_COMPONENT16, 1, 1, gl::DEPTH_COMPONENT, gl::UNSIGNED_SHORT, &[]);
+        compare_with(gl, gl::ALWAYS, gl::NEAREST);
         gl.bind_texture(0);
         Ok(Programs {
             mesh,
@@ -348,10 +392,13 @@ impl<G: GlFamily> GlWorld<G> {
             lines,
             backdrop,
             composite,
+            shadow,
             frame: gl.create_buffer(),
             instances: gl.create_buffer(),
+            casters: gl.create_buffer(),
             materials,
             blank,
+            lit,
             empty: gl.create_vertex_array(),
         })
     }
@@ -385,6 +432,8 @@ impl<G: GlFamily> GlWorld<G> {
         gl.enable(gl::BLEND);
         let [a, b, c, d] = self.blend_2d;
         gl.blend_func_separate(a, b, c, d);
+        gl.active_texture(gl::TEXTURE2);
+        gl.bind_texture(0);
         gl.active_texture(gl::TEXTURE1);
         gl.bind_texture(0);
         gl.active_texture(gl::TEXTURE0);
@@ -392,16 +441,53 @@ impl<G: GlFamily> GlWorld<G> {
         gl.bind_framebuffer(gl::FRAMEBUFFER, 0);
     }
 
+    /// The casters of the frame's shadow into the box's map, from the sun:
+    /// both faces, the nearest depth kept.
+    fn draw_shadow(&mut self, programs: &Programs, job: &WorldJob, map: ShadowObjects, shadow: &ShadowFrame) {
+        let gl = &mut self.gl;
+        // nothing samples the map while it is drawn
+        gl.active_texture(gl::TEXTURE2);
+        gl.bind_texture(0);
+        gl.bind_framebuffer(gl::FRAMEBUFFER, map.framebuffer);
+        gl.viewport(map.size as i32, map.size as i32);
+        gl.enable(gl::DEPTH_TEST);
+        gl.depth_mask(true);
+        gl.depth_func(gl::LESS);
+        gl.disable(gl::BLEND);
+        gl.disable(gl::CULL_FACE);
+        gl.clear([0.0; 4], 1.0);
+        gl.use_program(programs.shadow);
+        gl.bind_buffer(gl::ARRAY_BUFFER, programs.casters);
+        gl.buffer_data(gl::ARRAY_BUFFER, &shadow_instance_bytes(&shadow.instances), gl::STREAM_DRAW);
+        for draw in &shadow.draws {
+            let Some(objects) = job.meshes.get(draw.mesh as usize).and_then(|id| self.meshes.get(id)) else { continue };
+            let gl = &mut self.gl;
+            gl.bind_vertex_array(objects.array);
+            gl.bind_buffer(gl::ARRAY_BUFFER, programs.casters);
+            point_casters(gl, draw.first_instance as usize * SHADOW_INSTANCE_STRIDE);
+            gl.draw_elements_instanced(gl::TRIANGLES, draw.index_count as i32, gl::UNSIGNED_INT, draw.first_index as usize * 4, draw.instance_count as i32);
+        }
+    }
+
     fn encode_job(&mut self, programs: &Programs, job: &WorldJob) {
         let Some(target) = self.targets.get(&job.target).copied() else { return };
         let frame = &job.frame;
+        // the frame's block, which every program of the pass declares
+        let gl = &mut self.gl;
+        gl.bind_buffer(gl::UNIFORM_BUFFER, programs.frame);
+        gl.buffer_data(gl::UNIFORM_BUFFER, &frame.uniforms.to_bytes(), gl::STREAM_DRAW);
+        gl.bind_buffer_base(gl::UNIFORM_BUFFER, WORLD_BINDING, programs.frame);
+        // the sun's map first, when it does not hold this frame's casters
+        let map = job.shadow.and_then(|shadow| self.shadow_maps.get(&shadow.map).copied().map(|map| (shadow, map)));
+        if let (Some((shadow, map)), Some(casters)) = (map, frame.shadow.as_ref())
+            && shadow.draw
+        {
+            self.draw_shadow(programs, job, map, casters);
+        }
         let gl = &mut self.gl;
         let (width, height) = (target.size.0 as i32, target.size.1 as i32);
 
         // what every draw of the frame reads
-        gl.bind_buffer(gl::UNIFORM_BUFFER, programs.frame);
-        gl.buffer_data(gl::UNIFORM_BUFFER, &frame.uniforms.to_bytes(), gl::STREAM_DRAW);
-        gl.bind_buffer_base(gl::UNIFORM_BUFFER, WORLD_BINDING, programs.frame);
         gl.bind_buffer(gl::ARRAY_BUFFER, programs.instances);
         gl.buffer_data(gl::ARRAY_BUFFER, &instance_bytes(&frame.instances), gl::STREAM_DRAW);
         // the material table: four RGBA32F texels a material, 1024 a row
@@ -412,6 +498,8 @@ impl<G: GlFamily> GlWorld<G> {
         gl.active_texture(gl::TEXTURE0);
         gl.bind_texture(programs.materials);
         gl.tex_image_2d(0, gl::RGBA32F, (columns * 4) as i32, rows as i32, gl::RGBA, gl::FLOAT, &table);
+        gl.active_texture(gl::TEXTURE2);
+        gl.bind_texture(map.map_or(programs.lit, |(_, map)| map.texture));
         gl.active_texture(gl::TEXTURE1);
         gl.bind_texture(programs.blank);
 
@@ -554,6 +642,31 @@ fn set_blend<G: GlFamily>(gl: &mut G, blend: Blend) {
             gl.blend_func_separate(gl::ONE, gl::ONE, gl::ONE_MINUS_DST_ALPHA, gl::ONE);
         }
     }
+}
+
+/// The comparison a depth texture answers a sampler with, and its filter.
+fn compare_with<G: GlFamily>(gl: &mut G, function: u32, filter: i32) {
+    gl.tex_parameteri(gl::TEXTURE_MIN_FILTER, filter);
+    gl.tex_parameteri(gl::TEXTURE_MAG_FILTER, filter);
+    gl.tex_parameteri(gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE);
+    gl.tex_parameteri(gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE);
+    gl.tex_parameteri(gl::TEXTURE_COMPARE_MODE, gl::COMPARE_REF_TO_TEXTURE);
+    gl.tex_parameteri(gl::TEXTURE_COMPARE_FUNC, function as i32);
+}
+
+/// The casters' rows at a draw's first caster. The surface attributes
+/// the casters' stage does not read point into the same buffer, so no
+/// attribute the array enables reads past an end.
+fn point_casters<G: GlFamily>(gl: &mut G, base: usize) {
+    let stride = SHADOW_INSTANCE_STRIDE as i32;
+    for row in 0..3 {
+        gl.vertex_attrib_pointer(INSTANCE_ATTRIBUTE + row as u32, 4, gl::FLOAT, false, stride, base + row * 16);
+    }
+    for row in 3..6 {
+        gl.vertex_attrib_pointer(INSTANCE_ATTRIBUTE + row, 4, gl::FLOAT, false, stride, base);
+    }
+    gl.vertex_attrib_i_pointer(INSTANCE_ATTRIBUTE + 6, 4, gl::UNSIGNED_BYTE, stride, base);
+    gl.vertex_attrib_i_pointer(INSTANCE_ATTRIBUTE + 7, 3, gl::UNSIGNED_INT, stride, base);
 }
 
 /// The instance attributes, at the draw's first instance: GL has no base
@@ -724,6 +837,37 @@ impl<G: GlFamily> WorldGround for GlWorld<G> {
         if let Some(segments) = self.segments.remove(&id) {
             self.gl.delete_vertex_array(segments.array);
             self.gl.delete_buffer(segments.buffer);
+        }
+    }
+
+    fn make_shadow_map(&mut self, size: u32) -> Option<u64> {
+        let gl = &mut self.gl;
+        let texture = gl.create_texture();
+        gl.active_texture(gl::TEXTURE0);
+        gl.bind_texture(texture);
+        gl.tex_image_2d(0, gl::DEPTH_COMPONENT16, size as i32, size as i32, gl::DEPTH_COMPONENT, gl::UNSIGNED_SHORT, &[]);
+        compare_with(gl, gl::LEQUAL, gl::LINEAR);
+        gl.bind_texture(0);
+        let framebuffer = gl.create_framebuffer();
+        gl.bind_framebuffer(gl::FRAMEBUFFER, framebuffer);
+        gl.framebuffer_texture_2d(gl::DEPTH_ATTACHMENT, texture);
+        gl.draw_no_color();
+        let complete = gl.check_framebuffer_status() == gl::FRAMEBUFFER_COMPLETE;
+        gl.bind_framebuffer(gl::FRAMEBUFFER, 0);
+        if !complete {
+            gl.delete_framebuffer(framebuffer);
+            gl.delete_texture(texture);
+            return None;
+        }
+        let id = self.mint();
+        self.shadow_maps.insert(id, ShadowObjects { texture, framebuffer, size });
+        Some(id)
+    }
+
+    fn drop_shadow_map(&mut self, id: u64) {
+        if let Some(map) = self.shadow_maps.remove(&id) {
+            self.gl.delete_framebuffer(map.framebuffer);
+            self.gl.delete_texture(map.texture);
         }
     }
 }
@@ -914,7 +1058,7 @@ mod tests {
         let out = world.draw_single(&frame, &crate::image_engine::RawImages::default()).expect("the pass stands");
         assert_eq!(out.len(), 64 * 48 * 4);
         let tape = &world.gl;
-        assert_eq!(tape.count("program"), 5, "mesh, stepped, lines, backdrop, composite");
+        assert_eq!(tape.count("program"), 6, "mesh, stepped, lines, backdrop, shadow, composite");
         assert_eq!(tape.count("storage 4"), 2, "four samples of colour and of depth");
         assert_eq!(tape.count("draw mesh 36 at 0 x2"), 1, "two cubes in one draw");
         assert_eq!(tape.count("draw lines 6 x12"), 1, "twelve edges, one quad each");
@@ -945,6 +1089,38 @@ mod tests {
         assert!(tail.iter().any(|call| *call == "disable 0xb71"), "depth off");
         assert!(tail.iter().any(|call| *call == "enable 0xbe2"), "blending on");
         assert!(tail.iter().any(|call| *call == "blend 0x1 0x303 0x1 0x303"), "the 2D factors");
+    }
+
+    #[test]
+    fn the_casters_go_into_the_map_before_the_frame_and_only_when_they_moved() {
+        use crate::world::material::Light;
+        let world = World::new();
+        world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(200, 90, 50)));
+        world.add(Mesh::plane(6.0, 6.0), Material::color(Color::rgb(200, 196, 188))).set_position(vec3(0.0, -0.5, 0.0));
+        world.add_light(Light::sun().toward(vec3(0.5, -1.0, 0.7)).with_shadows());
+        let style = WorldStyle { quality: Quality::Low, ..WorldStyle::default() };
+        let frame = Rc::new(world.frame(&Camera::orbiting(Vec3::ZERO, 30.0, 25.0, 6.0), &style, (64, 48), 1.0));
+        assert!(frame.shadow.is_some());
+        let mut gl_world = GlWorld::new(Tape::default(), [gl::ONE; 4], 4);
+        gl_world.draw_single(&frame, &crate::image_engine::RawImages::default()).expect("the pass stands");
+        let tape = &gl_world.gl;
+        assert_eq!(tape.count("image 0 0x81a5 1024x1024"), 1, "a map of the quality's side");
+        let draws: Vec<&String> = tape.calls.iter().filter(|call| call.starts_with("draw mesh")).collect();
+        // the cube and the floor into the map, then the same two into the target
+        assert_eq!(draws.len(), 4, "{draws:?}");
+        let data = tape.calls.iter().position(|call| *call == format!("data {:#x} 96", gl::ARRAY_BUFFER)).expect("two casters' rows");
+        let first_draw = tape.calls.iter().position(|call| call.starts_with("draw mesh")).unwrap();
+        assert!(data < first_draw, "the rows go up before the casters draw");
+        assert!(gl_world.shadow_maps.is_empty(), "the single frame gave its map back");
+
+        // a job whose map holds the casters draws only the frame
+        let mut gl_world = GlWorld::new(Tape::default(), [gl::ONE; 4], 4);
+        let door = gl_world.door().unwrap();
+        let mut job = WorldJob::single(door, &frame, &crate::image_engine::RawImages::default()).unwrap();
+        job.shadow.as_mut().unwrap().draw = false;
+        gl_world.gl.calls.clear();
+        gl_world.encode(std::slice::from_ref(&job));
+        assert_eq!(gl_world.gl.count("draw mesh"), 2, "the map is read, not drawn");
     }
 
     #[test]
