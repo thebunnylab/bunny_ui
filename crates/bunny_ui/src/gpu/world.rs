@@ -70,6 +70,17 @@ pub struct WorldTiming {
     pub seconds: f64,
 }
 
+/// The longest a job may take on the GPU, in seconds. A clock that reads
+/// more — or nothing — is wrong, and its time is dropped.
+pub const TIMING_MOST: f64 = 1.0;
+
+impl WorldTiming {
+    /// Whether a clock could have read `seconds` over one job.
+    pub fn plausible(seconds: f64) -> bool {
+        seconds > 0.0 && seconds < TIMING_MOST
+    }
+}
+
 /// What of its target a job draws.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Redraw {
@@ -712,7 +723,7 @@ impl WorldResidency {
     pub(crate) fn retire(&mut self, ground: &mut dyn WorldGround) {
         // what the GPU took over the jobs that finished: each box's
         // governor weighs its own
-        for timing in ground.take_timings() {
+        for timing in ground.take_timings().into_iter().filter(|timing| WorldTiming::plausible(timing.seconds)) {
             if let Probe::Running { target, times, .. } = &mut self.probe
                 && *target == timing.target
             {
@@ -1141,6 +1152,26 @@ mod tests {
         }
         let quality = residency.governors.get(&7).expect("the box's governor").quality(Quality::High);
         assert_eq!(quality, Quality::Medium, "a window of whole frames over 10 ms steps down once");
+    }
+
+    #[test]
+    fn a_clock_that_lies_moves_no_governor() {
+        let (world, cube) = cube_world();
+        let (mut ground, mut residency) = (Ledger::new(), WorldResidency::default());
+        let images = RawImages::default();
+        for walk in 1..=30u64 {
+            residency.begin_walk(walk);
+            cube.set_tint(Color::rgb(walk as u8, 90, 50));
+            let style = WorldStyle { quality: Quality::High, ..WorldStyle::default() };
+            let shot = Shot::new(world.with(WorldData::clone), Camera::orbiting(Vec3::ZERO, walk as f64, 25.0, 5.0), style, 0.0, (100.0, 80.0));
+            let job = residency.resolve(&mut ground, &images, &shot, 7, walk, (200, 160)).expect("a target").job.expect("a job");
+            residency.drawn();
+            // the time since boot, or nothing: a driver lost the start
+            let seconds = if walk % 2 == 0 { 150.0 } else { 0.0 };
+            ground.timings.push(WorldTiming { target: job.target, seconds });
+            residency.retire(&mut ground);
+        }
+        assert_eq!(residency.governors[&7].quality(Quality::High), Quality::High);
     }
 
     #[test]

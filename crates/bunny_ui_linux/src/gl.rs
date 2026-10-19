@@ -3702,12 +3702,18 @@ mod world_tests {
 
     #[test]
     fn each_world_job_is_timed_on_the_gpu() {
-        use bunny_ui::gpu::world::WorldGround;
+        use bunny_ui::gpu::world::{WorldGround, WorldTiming};
         use bunny_ui::gpu::world_scenes::world_scene;
         let Some(mut gpu) = harness() else { return };
         let frame = world_scene(6).frame;
         gpu.world_rgba(&frame).expect("the world pass");
         let timings = gpu.world.as_mut().expect("the world pass").take_timings();
+        if gpu.renderer().contains("llvmpipe") {
+            // its elapsed time can lose the query's start and read the
+            // time since boot: the family keeps only a time it can trust
+            assert!(timings.len() <= 1 && timings.iter().all(|t| WorldTiming::plausible(t.seconds)), "{timings:?}");
+            return;
+        }
         assert_eq!(timings.len(), 1, "one job, one time: {timings:?}");
         assert!(timings[0].seconds > 0.0 && timings[0].seconds < 1.0, "{timings:?}");
         eprintln!("{} took {:.3} ms on the GPU", world_scene(6).name, timings[0].seconds * 1000.0);

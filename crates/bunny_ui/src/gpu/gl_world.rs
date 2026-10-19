@@ -626,7 +626,12 @@ impl<G: GlFamily> GlWorld<G> {
             TimerRead::Pending => true,
             TimerRead::Lost => false,
             TimerRead::Nanos(nanos) => {
-                timings.push(WorldTiming { target, seconds: nanos as f64 * 1e-9 });
+                // a driver that loses a query's start answers the time
+                // since boot (llvmpipe): no time at all is better
+                let seconds = nanos as f64 * 1e-9;
+                if WorldTiming::plausible(seconds) {
+                    timings.push(WorldTiming { target, seconds });
+                }
                 false
             }
         });
