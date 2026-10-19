@@ -1,0 +1,25 @@
+   Compiling bunny-ui-motor v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/motor)
+   Compiling bunny-ui-preview v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui_preview)
+   Compiling bunny-ui-core v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui)
+   Compiling bunny-ui-hot v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui_hot)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.80s
+     Running tests/host.rs (target/debug/deps/host-7a9303c751404576)
+
+running 1 test
+test input::clipboard_payload_replaces_the_focused_field_as_one_commit ... FAILED
+
+failures:
+
+---- input::clipboard_payload_replaces_the_focused_field_as_one_commit stdout ----
+
+thread 'input::clipboard_payload_replaces_the_focused_field_as_one_commit' (40206484) panicked at crates/bunny_ui_preview/tests/support/input.rs:210:9:
+editing should publish a frame
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    input::clipboard_payload_replaces_the_focused_field_as_one_commit
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 48 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p bunny-ui-preview --test host`

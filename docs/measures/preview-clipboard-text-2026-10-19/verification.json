@@ -1,0 +1,15 @@
+{
+  "task": "T2-STUDIO-176",
+  "base_revision": "7619a062b1a649a40c6ea2740690f5a0accb0302",
+  "artifact_revision": "754f1e360f28e55fe53409e91d63770318fe0356",
+  "red_failures": 1,
+  "core_passed": 1232,
+  "core_ignored": 1,
+  "preview_passed": 93,
+  "cli_passed": 131,
+  "cli_ignored": 5,
+  "native_clippy": "passed",
+  "wasm_clippy": "passed; nightly-2026-07-15, all-features, no-deps, -D warnings",
+  "format": "Changed hunks match rustfmt; unrelated baseline formatting preserved.",
+  "scope": "Public host/wire and Runtime tests. Native Trinity integration and authentic review remain pending."
+}
