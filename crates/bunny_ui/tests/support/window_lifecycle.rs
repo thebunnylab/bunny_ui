@@ -63,10 +63,16 @@ fn policies(native_close: NativeClose) {
         Rc::clone(&runtime),
         text_field("Draft", value.binding()).id("draft"),
     );
+    let feed = bunny_ui::image_engine::ImageFeed::new();
+    let observer = app
+        .observe_feed(id, feed.key(), 8)
+        .expect("owned live window");
+    assert!(!observer.snapshot().closed);
     assert!(runtime.focus_named("draft"));
     assert_eq!(app.visibility(id), Ok(WindowVisibility::Shown));
     let foreign = App::new();
     assert_eq!(foreign.hide(id), Err(WindowError::StaleWindow));
+    assert!(foreign.observe_feed(id, feed.key(), 8).is_none());
     let focus = runtime.focused();
     for _ in 0..3 {
         app.hide(id).unwrap();
@@ -78,6 +84,7 @@ fn policies(native_close: NativeClose) {
         assert_eq!(app.visibility(id), Ok(WindowVisibility::Shown));
         assert_eq!(value.get(), "retained draft");
         assert_eq!(runtime.focused(), focus);
+        assert!(!observer.snapshot().closed);
     }
     let calls = Rc::new(Cell::new(0));
     app.on_close_requested(id, {
@@ -90,6 +97,7 @@ fn policies(native_close: NativeClose) {
     .unwrap();
     native_close(&app, id, "Lifecycle subject");
     assert_eq!(calls.get(), 1, "close request consults policy once");
+    assert!(!observer.snapshot().closed);
     assert_eq!(app.visibility(id), Ok(WindowVisibility::Shown));
     app.on_close_requested(id, |_| CloseAction::Hide).unwrap();
     native_close(&app, id, "Lifecycle subject");
@@ -109,6 +117,8 @@ fn policies(native_close: NativeClose) {
     app.show(id).unwrap();
     app.clear_close_handler(id).unwrap();
     assert_eq!(app.request_close(id), Ok(CloseAction::Close));
+    assert!(observer.snapshot().closed);
+    assert!(app.observe_feed(id, feed.key(), 8).is_none());
     assert_eq!(app.visibility(id), Err(WindowError::StaleWindow));
     assert_eq!(app.show(id), Err(WindowError::StaleWindow));
     assert_eq!(app.hide(id), Err(WindowError::StaleWindow));
@@ -140,7 +150,9 @@ fn policies(native_close: NativeClose) {
         panic!("explicit teardown must bypass close policy")
     })
     .unwrap();
+    let bypass_observer = app.observe_feed(bypass, feed.key(), 8).unwrap();
     app.close(bypass);
+    assert!(bypass_observer.snapshot().closed);
     assert_eq!(app.windows(), vec![guard]);
     println!(
         "native lifecycle policies, retained draft, repeated hide/show and stale handles passed"
@@ -195,8 +207,11 @@ fn final_close(native_close: NativeClose) {
         Rc::new(app.runtime()),
         text("last"),
     );
+    let feed = bunny_ui::image_engine::ImageFeed::new();
+    let observer = app.observe_feed(id, feed.key(), 8).unwrap();
     println!("Requesting default close on the final owned window");
     native_close(&app, id, "Lifecycle default close");
+    assert!(observer.snapshot().closed);
     app.run();
     assert!(app.windows().is_empty());
 }

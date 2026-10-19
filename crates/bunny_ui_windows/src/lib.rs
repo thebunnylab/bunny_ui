@@ -206,6 +206,7 @@ pub use bunny_ui::window::{
 /// Everything one window owns for as long as it is open. The app holds
 /// these and routes every event to the one it belongs to.
 struct Slot {
+    presentation: RefCell<Option<bunny_ui::presentation::backend::PresentationSource>>,
     lifecycle: Rc<Lifecycle>,
     confirmation: bunny_ui::window::ConfirmationSlot,
     /// The `HWND` as an address — what an event's source is compared
@@ -346,10 +347,33 @@ impl App {
         id
     }
 
+    /// Observe future presentation receipts for one feed in this window.
+    /// Only one observer is attached per window; replacement closes the old one.
+    /// The event capacity is clamped to 1–256. Dropping the consumer disables
+    /// tracking. CPU/native-compositing and unimplemented platforms explicitly
+    /// report unavailable; see `bunny_ui::presentation` for timestamp limits.
+    /// Returns `None` when the window is no longer open.
+    #[must_use]
+    pub fn observe_feed(
+        &self,
+        id: WindowId,
+        feed: bunny_ui::image_engine::FeedKey,
+        capacity: usize,
+    ) -> Option<bunny_ui::presentation::FeedPresentation> {
+        let slot = self.slot(id)?;
+        let (observer, source) = bunny_ui::presentation::backend::channel(feed, capacity);
+        source
+            .sender()
+            .unavailable(bunny_ui::presentation::Unavailable::UnsupportedPlatform);
+        *slot.presentation.borrow_mut() = Some(source);
+        Some(observer)
+    }
+
     /// Closes a window. The app stays up unless it was the last.
     pub fn close(&self, id: WindowId) {
         self.close_children(id);
         if let Some(slot) = self.slot(id) {
+            slot.presentation.borrow_mut().take();
             slot.confirmation.owner_closed();
             slot.runtime.retire_dialog_geometry();
             slot.lifecycle.geometry_events().retire();
@@ -634,6 +658,7 @@ impl AppInner {
             .iter()
             .find(|slot| slot.window == window)
         {
+            slot.presentation.borrow_mut().take();
             slot.runtime.retire_dialog_geometry();
             slot.lifecycle.geometry_events().retire();
             ffi::forget_geometry(slot.window, slot.lifecycle.id());
@@ -1761,6 +1786,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     });
 
     Rc::new(Slot {
+        presentation: RefCell::new(None),
         lifecycle,
         confirmation,
         window: window.raw_window(),

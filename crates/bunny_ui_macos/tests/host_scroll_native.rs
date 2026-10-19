@@ -191,6 +191,22 @@ mod probe {
             .expect("numeric expression")
     }
 
+    async fn wait_for_horizontal_scroll(handle: &WebviewHandle) {
+        // WebKit handles the single forwarded event in another process. A
+        // quarter-second delay is not an acknowledgement of that event.
+        for poll in 0..40 {
+            let left = value(handle, "document.scrollingElement.scrollLeft").await;
+            if poll == 0 || left > 0.0 {
+                println!("native horizontal observation: poll={poll}, offset={left}");
+            }
+            if left > 0.0 {
+                return;
+            }
+            task::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the single native horizontal wheel event did not scroll the document");
+    }
+
     #[derive(Clone)]
     struct Fixture {
         app: App,
@@ -251,7 +267,8 @@ mod probe {
                         unsafe { wheel(-100, 0, true); }
                         task::sleep(Duration::from_millis(250)).await;
                         assert_eq!(script.offset.get().y, 0.0);
-                        assert!(value(&script.handle, "document.scrollingElement.scrollLeft").await > 0.0);
+                        wait_for_horizontal_scroll(&script.handle).await;
+                        assert_eq!(script.offset.get().y, 0.0);
                         println!("native horizontal wheel: document moves, parent stays");
                         script.handle.eval("window.scrollTo(0, 0)", |_| {});
                         task::sleep(Duration::from_millis(100)).await;

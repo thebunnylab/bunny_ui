@@ -713,11 +713,38 @@ impl Metal {
 /// A macOS window's native Strategy, with one-way promotion to Metal.
 /// The scene contract decides; no application identity enters admission.
 pub struct WindowPresenter {
+    observation: Option<bunny_ui::presentation::backend::PresentationSender>,
+    observation_visible: bool,
     layer: Id,
     strategy: Strategy,
 }
 
 impl WindowPresenter {
+    /// Attach a weak per-window receipt producer without changing render strategy.
+    pub fn observe_feed(&mut self, sender: bunny_ui::presentation::backend::PresentationSender) {
+        self.observation = Some(sender);
+    }
+
+    /// No native visibility queries are needed without a live listener.
+    #[must_use]
+    pub fn observing_feed(&self) -> bool {
+        self.observation
+            .as_ref()
+            .is_some_and(|sender| sender.feed().is_some())
+    }
+
+    /// `AppKit` visibility is consulted on the main thread, never in a Metal callback.
+    pub fn observation_visibility(&mut self, visible: bool) {
+        self.observation_visible = visible;
+        if let Some(sender) = &self.observation {
+            if visible {
+                sender.resume();
+            } else {
+                sender.suspend();
+            }
+        }
+    }
+
     /// Installs a native base. An explicit CPU override keeps the shell's
     /// existing CPU backend; no Metal device or queue is created here.
     ///
@@ -735,6 +762,8 @@ impl WindowPresenter {
             msg_void_f64(layer, sel("setContentsScale:"), scale.round().max(1.0));
         }
         Some(Self {
+            observation: None,
+            observation_visible: true,
             layer,
             strategy: Strategy::Native(Box::new(Native {
                 base,
@@ -776,6 +805,14 @@ impl WindowPresenter {
     ) {
         let pool = unsafe { objc_autoreleasePoolPush() };
         self.present_inner(display, size, scale, canvas, text, images, live);
+        if self.observation_visible
+            && matches!(self.strategy, Strategy::Native(_))
+            && let Some(sender) = &self.observation
+        {
+            drop(bunny_ui::presentation::backend::FrameObservation::begin(
+                sender, display,
+            ));
+        }
         unsafe { objc_autoreleasePoolPop(pool) };
     }
 
@@ -794,6 +831,10 @@ impl WindowPresenter {
         live: bool,
     ) {
         if let Strategy::Metal(metal) = &mut self.strategy {
+            metal.presenter.observation = self
+                .observation_visible
+                .then(|| self.observation.clone())
+                .flatten();
             metal.present(display, size, scale, canvas, text, images, live);
             return;
         }
@@ -965,6 +1006,10 @@ impl WindowPresenter {
             Strategy::Metal(Box::new(metal)),
         );
         if let Strategy::Metal(metal) = &mut self.strategy {
+            metal.presenter.observation = self
+                .observation_visible
+                .then(|| self.observation.clone())
+                .flatten();
             if let Strategy::Native(native) = prior {
                 metal.cover = Some(native);
             }

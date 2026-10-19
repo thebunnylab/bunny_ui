@@ -258,6 +258,7 @@ pub struct App {
 /// gate, the crown's gates. The app installs ONE of each with the
 /// door and routes by the window the event arrived at.
 struct Slot {
+    presentation: RefCell<Option<bunny_ui::presentation::backend::PresentationSource>>,
     lifecycle: Rc<Lifecycle>,
     confirmation: bunny_ui::window::FrameworkConfirmation,
     confirmation_dialogs: Rc<RefCell<std::collections::HashMap<String, DialogWindow>>>,
@@ -366,6 +367,7 @@ impl AppInner {
             .iter()
             .find(|slot| slot.window == window)
         {
+            slot.presentation.borrow_mut().take();
             slot.runtime.retire_dialog_geometry();
             slot.lifecycle.geometry_events().retire();
             ffi::forget_geometry(slot.window, slot.lifecycle.id());
@@ -428,10 +430,33 @@ impl App {
         slot.lifecycle.id()
     }
 
+    /// Observe future presentation receipts for one feed in this window.
+    /// Only one observer is attached per window; replacement closes the old one.
+    /// The event capacity is clamped to 1–256. Dropping the consumer disables
+    /// tracking. CPU/native-compositing and unimplemented platforms explicitly
+    /// report unavailable; see `bunny_ui::presentation` for timestamp limits.
+    /// Returns `None` when the window is no longer open.
+    #[must_use]
+    pub fn observe_feed(
+        &self,
+        id: WindowId,
+        feed: bunny_ui::image_engine::FeedKey,
+        capacity: usize,
+    ) -> Option<bunny_ui::presentation::FeedPresentation> {
+        let slot = self.slot(id)?;
+        let (observer, source) = bunny_ui::presentation::backend::channel(feed, capacity);
+        source
+            .sender()
+            .unavailable(bunny_ui::presentation::Unavailable::UnsupportedPlatform);
+        *slot.presentation.borrow_mut() = Some(source);
+        Some(observer)
+    }
+
     /// Closes the window. The last one out quits the app.
     pub fn close(&self, id: WindowId) {
         self.close_children(id);
         if let Some(slot) = self.slot(id) {
+            slot.presentation.borrow_mut().take();
             slot.confirmation.owner_closed();
             confirmation::dismiss(&slot.confirmation, &slot.confirmation_dialogs);
             slot.runtime.retire_dialog_geometry();
@@ -1821,6 +1846,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // this slot's own handler, then shown — on wayland the first
     // presenting commit IS the reveal, so the window never flashes
     Rc::new(Slot {
+        presentation: RefCell::new(None),
         lifecycle,
         confirmation,
         confirmation_dialogs: dialogs,
