@@ -265,7 +265,19 @@ impl Mesh {
 
     fn with_identity(id: u64, generation: u64, data: MeshData) -> Mesh {
         let data = sanitize(data);
-        let bounds = Aabb::from_points(data.positions.iter().map(|&p| to_vec(p)));
+        // every shape the morphs give: a vertex moves by each target's
+        // share, so its farthest places are the corners of the weights
+        let corners = 1usize << data.morphs.len();
+        let bounds = Aabb::from_points(data.positions.iter().enumerate().flat_map(|(vertex, &p)| {
+            let morphs = &data.morphs;
+            (0..corners).map(move |corner| {
+                let moved = morphs.iter().enumerate().filter(|(k, _)| corner >> k & 1 == 1).fold(p, |at, (_, morph)| {
+                    let delta = morph.positions[vertex];
+                    [at[0] + delta[0], at[1] + delta[1], at[2] + delta[2]]
+                });
+                to_vec(moved)
+            })
+        }));
         let runs = material_runs(&data);
         Mesh(Rc::new(MeshInner { id, generation, data, bounds, runs, bvh: std::cell::OnceCell::new(), parts: std::cell::OnceCell::new() }))
     }
@@ -289,7 +301,8 @@ impl Mesh {
         &self.0.data
     }
 
-    /// The box around every vertex, in model space.
+    /// The box around every vertex, in model space, in every shape its
+    /// morph targets give.
     pub fn bounds(&self) -> Aabb {
         self.0.bounds
     }
@@ -919,6 +932,24 @@ mod tests {
         assert_eq!(mesh.vertex_count(), 6, "each flat triangle owns its corners");
         assert!(mesh.data().normals.iter().all(|n| *n == [0.0, 0.0, 1.0]));
         assert!(mesh.data().colors.iter().all(|c| *c == [10, 20, 30, 255]), "colors travel with corners");
+    }
+
+    #[test]
+    fn the_box_holds_every_shape_the_morphs_give() {
+        let data = MeshData {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            indices: vec![0, 1, 2],
+            morphs: vec![
+                Morph { positions: vec![[0.0, 0.0, 2.0], [0.0; 3], [0.0; 3]], normals: vec![] },
+                Morph { positions: vec![[0.0, 0.0, 1.0], [-3.0, 0.0, 0.0], [0.0; 3]], normals: vec![] },
+            ],
+            ..MeshData::default()
+        };
+        let bounds = Mesh::new(data).bounds();
+        assert_eq!(bounds.max.z, 3.0, "both targets at full weight");
+        assert_eq!(bounds.min.x, -2.0, "the second alone");
+        assert_eq!((bounds.min.z, bounds.max.x, bounds.max.y), (0.0, 1.0, 1.0), "and the rest shape");
     }
 
     #[test]

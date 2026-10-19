@@ -314,6 +314,18 @@ pub struct ShadowDraw {
     pub instance_count: u32,
 }
 
+/// What one instance of a frame shows, so two frames of one target can be
+/// told apart ([`super::damage`]): a key that changes with anything of
+/// its picture — its shape, its place, its look, its parts, its pose —
+/// and the pixels its picture may reach.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cover {
+    pub key: u64,
+    /// `[left, top, right, bottom]` in pixels of the target, y down: the
+    /// whole target when the lens cannot tell.
+    pub rect: [f32; 4],
+}
+
 /// One picture of a world, decided: everything a tier needs to draw it.
 #[derive(Clone, Debug)]
 pub struct WorldFrame {
@@ -363,6 +375,15 @@ pub struct WorldFrame {
     /// ([`InstanceData::joint_base`]): each pose worked out once, the
     /// clothes of a figure sharing it.
     pub joints: Vec<Row>,
+    /// What each instance shows, by the index of its instance.
+    pub covers: Vec<Cover>,
+    /// Where the shadow of each thing in the map of what moves may fall,
+    /// `[left, top, right, bottom]` in pixels.
+    pub moving_covers: Vec<[f32; 4]>,
+    /// A hash of all the frame's instances share — the eye, the style,
+    /// the lights, the still map, the floor map — so two frames with the
+    /// same one differ only where their covers do.
+    pub scene: u64,
 }
 
 impl WorldFrame {
@@ -389,6 +410,32 @@ impl WorldFrame {
                 [u.sky_up[0], u.sky_up[1], u.sky_up[2], 0.0],
                 [1.0 / u.clip_from_eye[0], 1.0 / u.clip_from_eye[5], u.params[3], 0.0],
             ]),
+        }
+    }
+
+    /// The backdrop's block that paints the frame's background over a
+    /// part of a target, where a clear cannot: [`WorldFrame::backdrop`],
+    /// or for a flat background a ramp from its colour to itself — the
+    /// same codes the clear gives.
+    pub fn fill(&self) -> [Row; 6] {
+        self.backdrop().unwrap_or_else(|| {
+            let color = match self.background {
+                Background::Color(color) => color,
+                _ => Color::rgba(0, 0, 0, 0),
+            };
+            let codes = [color.r as f32, color.g as f32, color.b as f32, color.a as f32];
+            [codes, codes, [self.size.0 as f32, self.size.1 as f32, 0.0, 0.0], [0.0; 4], [0.0; 4], [0.0; 4]]
+        })
+    }
+
+    /// Whether `draw` may reach `rect` (`[x, y, width, height]` in pixels):
+    /// a draw none of whose instances reach it changes nothing there.
+    pub fn draw_reaches(&self, draw: &Draw, rect: [u32; 4]) -> bool {
+        let (left, top, right, bottom) = (rect[0] as f32, rect[1] as f32, (rect[0] + rect[2]) as f32, (rect[1] + rect[3]) as f32);
+        let first = draw.first_instance as usize;
+        match self.covers.get(first..first + draw.instance_count as usize) {
+            Some(covers) => covers.iter().any(|cover| cover.rect[0] < right && cover.rect[2] > left && cover.rect[1] < bottom && cover.rect[3] > top),
+            None => true,
         }
     }
 
@@ -504,6 +551,7 @@ const STUDIO_TOWARD_SUN: [f64; 3] = [-0.575, 0.814, 0.082];
 
 struct Seen {
     entity: u32,
+    world_from_model: Mat4,
     eye_from_model: Mat4,
     bounds: Aabb,
     tint: Color,
@@ -511,6 +559,8 @@ struct Seen {
     parts: Option<Rc<[PartState]>>,
     flags: u32,
     joint_base: u32,
+    /// How many rows its palette takes.
+    joint_rows: u32,
     morph: u32,
 }
 
@@ -540,6 +590,8 @@ pub(crate) fn build_frame(
     let mut poses = HashMap::<(Option<EntityId>, u64), Rc<Vec<Mat4>>>::new();
     let mut palettes = HashMap::<(Option<EntityId>, u64), u32>::new();
     let mut joints: Vec<Row> = Vec::new();
+    // the world's box around what is in view: no shadow falls past it
+    let mut receivers = Aabb::EMPTY;
     let mut levels = world.levels.borrow_mut();
     for (id, data) in world.iter() {
         if !world.shown(id) {
@@ -579,6 +631,7 @@ pub(crate) fn build_frame(
         };
         let seen = |bounds: Aabb| Seen {
             entity: id.index,
+            world_from_model: matrix,
             eye_from_model,
             bounds,
             tint: data.spec.tint,
@@ -588,6 +641,7 @@ pub(crate) fn build_frame(
                 | if data.spec.reads_floor_map { instance_flag::FLOOR_MAP } else { 0 }
                 | (data.spec.light_group as u32 & instance_flag::GROUP_MASK) << instance_flag::GROUP_SHIFT,
             joint_base,
+            joint_rows,
             morph: super::mesh::pack_morph(data.spec.morph),
         };
         match &data.spec.shape {
@@ -612,12 +666,14 @@ pub(crate) fn build_frame(
                     });
                 }
                 if in_view {
+                    receivers = receivers.union(local.transformed(&matrix));
                     models.push((seen(bounds), Model { mesh, materials: Rc::clone(&model.materials) }));
                 }
             }
             Shape::Lines(lines, line_style) => {
                 let bounds = lines.bounds().transformed(&eye_from_model);
                 if sides.may_see(&bounds) && (parallel || bounds.min.z < 0.0) {
+                    receivers = receivers.union(lines.bounds().transformed(&matrix));
                     line_sets.push((seen(bounds), lines.clone(), *line_style));
                 }
             }
@@ -683,7 +739,15 @@ pub(crate) fn build_frame(
         parts: Vec::new(),
         bloom: if style.quality == Quality::High && style.bloom > 0.0 { (style.bloom.min(1.0) * 256.0).round() as u16 } else { 0 },
         joints,
+        covers: Vec::new(),
+        moving_covers: Vec::new(),
+        scene: 0,
     };
+    // the pixels an eye-space box may reach on the target
+    let reach = |bounds: &Aabb, margin: f64| reach_of(bounds, &projection, size, margin);
+    // what each set of materials and each palette looks like, hashed once
+    let mut looks = HashMap::<usize, u64>::new();
+    let mut poses_seen = HashMap::<u32, u64>::new();
     // each set of part states once, as many rows as its mesh names parts
     let mut part_bases = HashMap::<(usize, u32), u32>::new();
 
@@ -742,12 +806,16 @@ pub(crate) fn build_frame(
         let mut members: Vec<usize> = group.members.clone();
         members.sort_by(|&a, &b| (-models[a].0.bounds.max.z).total_cmp(&(-models[b].0.bounds.max.z)));
         for &member in &members {
-            let seen = &models[member].0;
-            let mut instance = instance_of(seen, group.material_base, part_base_of(&mut frame.parts, &mut part_bases, &seen.parts, &models[member].1.mesh));
+            let (seen, model) = &models[member];
+            let mut instance = instance_of(seen, group.material_base, part_base_of(&mut frame.parts, &mut part_bases, &seen.parts, &model.mesh));
             if style.xray {
                 instance.tint[3] = ((instance.tint[3] as u32 * XRAY_ALPHA + 127) / 255) as u8;
             }
             frame.instances.push(instance);
+            let look = *looks.entry(Rc::as_ptr(&model.materials) as *const Material as usize).or_insert_with(|| look_of(&model.materials));
+            let pose = pose_of(&frame.joints, &mut poses_seen, seen);
+            let key = cover_key(seen, (model.mesh.id(), model.mesh.generation()), look, pose);
+            frame.covers.push(Cover { key, rect: reach(&seen.bounds, 1.0) });
         }
         let (_, model) = &models[group.members[0]];
         // runs of the same draw key become one draw
@@ -817,6 +885,13 @@ pub(crate) fn build_frame(
             LineDepth::Always => Pass::Overlay,
         };
         frame.instances.push(instance_of(seen, 0, NO_PARTS));
+        // a line reaches half its width past its segments, and its soft
+        // rim a pixel more
+        let mut look = motor::hash::FxHasher::default();
+        look.write(&super::wire::line_style_bytes(&[data]));
+        let look = look.finish();
+        let key = cover_key(seen, (lines.id(), lines.generation()), look, 0);
+        frame.covers.push(Cover { key, rect: reach(&seen.bounds, data.shape[0] as f64 * 0.5 + 2.0) });
         line_draws.push(Draw {
             pass,
             kind: DrawKind::Lines { lines: set, style: style_index },
@@ -881,9 +956,21 @@ pub(crate) fn build_frame(
         Some(fit)
     });
     let moving: Vec<&Caster> = moving.into_iter().filter(|caster| caster.in_view).collect();
-    let moving_fit = travel.zip(style.quality.moving_shadow_size()).and_then(|(travel, size)| {
-        let (shadow, fit) = shadow_frame(&mut frame, &mut mesh_slot, &mut part_bases, &moving, travel, size)?;
+    let moving_fit = travel.zip(style.quality.moving_shadow_size()).and_then(|(travel, side)| {
+        let (shadow, fit) = shadow_frame(&mut frame, &mut mesh_slot, &mut part_bases, &moving, travel, side)?;
         frame.moving_shadow = Some(shadow);
+        // where each one's shadow may fall: its box, grown by the
+        // lookups' reach, swept along the sun's way out of what is seen
+        let grow = fit.texel * (shadow::reach(style.quality.moving_shadow_taps()) + 2.0);
+        frame.moving_covers = moving
+            .iter()
+            .filter_map(|caster| {
+                let bounds = caster.bounds.transformed(&caster.world_from_model);
+                let grown = Aabb::new(bounds.min - vec3(grow, grow, grow), bounds.max + vec3(grow, grow, grow));
+                let swept = shadow_sweep(grown, travel, &receivers)?;
+                Some(reach(&swept.transformed(&view), 1.0))
+            })
+            .collect();
         Some(fit)
     });
 
@@ -916,7 +1003,138 @@ pub(crate) fn build_frame(
     if let (Some(fit), Some(size)) = (moving_fit, style.quality.moving_shadow_size()) {
         (frame.uniforms.moving_from_eye, frame.uniforms.moving) = lookup(&fit, size, style.quality.moving_shadow_taps());
     }
+    frame.scene = scene_of(&frame, &view, &projection, style, px_per_point);
     frame
+}
+
+/// The pixels an eye-space box may reach on a target of `size` through
+/// `projection`, `[left, top, right, bottom]` with y down, grown by
+/// `margin` pixels: the hull of its corners, which holds all of it that
+/// lies before the eye — the whole target when a corner lies behind it.
+fn reach_of(bounds: &Aabb, projection: &Mat4, size: (u32, u32), margin: f64) -> [f32; 4] {
+    let (width, height) = (size.0 as f64, size.1 as f64);
+    let whole = [0.0, 0.0, width as f32, height as f32];
+    if bounds.is_empty() {
+        return [0.0; 4];
+    }
+    let mut out = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    for corner in bounds.corners() {
+        let clip = projection.transform(corner.extend(1.0));
+        if clip.w.is_nan() || clip.w <= 0.0 {
+            return whole;
+        }
+        let (x, y) = ((clip.x / clip.w + 1.0) * 0.5 * width, (1.0 - clip.y / clip.w) * 0.5 * height);
+        out = [out[0].min(x), out[1].min(y), out[2].max(x), out[3].max(y)];
+    }
+    let clamp = |value: f64, end: f64| value.clamp(0.0, end) as f32;
+    [clamp(out[0] - margin, width), clamp(out[1] - margin, height), clamp(out[2] + margin, width), clamp(out[3] + margin, height)]
+}
+
+/// The box a shadow from `caster` (a world box) may fall in: swept along
+/// `travel` while some of it can still meet what is in `receivers`, and
+/// cut to it. `None` when it meets nothing.
+fn shadow_sweep(caster: Aabb, travel: Vec3, receivers: &Aabb) -> Option<Aabb> {
+    if caster.is_empty() || receivers.is_empty() {
+        return None;
+    }
+    // past the first side whose far wall even its last corner has
+    // crossed, nothing of it lies in the box any more
+    let exits = [(travel.x, caster.min.x, caster.max.x, receivers.min.x, receivers.max.x), (travel.y, caster.min.y, caster.max.y, receivers.min.y, receivers.max.y), (travel.z, caster.min.z, caster.max.z, receivers.min.z, receivers.max.z)];
+    let reach = exits
+        .iter()
+        .filter(|(way, ..)| way.abs() > 1e-12)
+        .map(|&(way, low, high, wall_low, wall_high)| if way > 0.0 { (wall_high - low) / way } else { (wall_low - high) / way })
+        .fold(f64::INFINITY, f64::min);
+    let reach = if reach.is_finite() { reach.max(0.0) } else { 0.0 };
+    let moved = Aabb::new(caster.min + travel * reach, caster.max + travel * reach);
+    let swept = caster.union(moved);
+    let cut = Aabb::new(swept.min.max(receivers.min), swept.max.min(receivers.max));
+    (cut.min.x <= cut.max.x && cut.min.y <= cut.max.y && cut.min.z <= cut.max.z).then_some(cut)
+}
+
+/// A hash of what a set of materials looks like: each one's colours,
+/// alpha mode and texture.
+fn look_of(materials: &[Material]) -> u64 {
+    let mut hasher = motor::hash::FxHasher::default();
+    for material in materials {
+        hasher.write(&super::wire::material_bytes(&[material_data(material)]));
+        hasher.write_u8(match material.alpha {
+            AlphaMode::Opaque => 0,
+            AlphaMode::Mask(_) => 1,
+            AlphaMode::Blend => 2,
+            AlphaMode::Add => 3,
+        });
+        hasher.write_u64(material.texture.as_ref().map_or(0, ImageSource::key));
+    }
+    hasher.finish()
+}
+
+/// A hash of an instance's palette, once a palette.
+fn pose_of(joints: &[Row], seen: &mut HashMap<u32, u64>, instance: &Seen) -> u64 {
+    if instance.joint_base == NO_JOINTS {
+        return 0;
+    }
+    *seen.entry(instance.joint_base).or_insert_with(|| {
+        let mut hasher = motor::hash::FxHasher::default();
+        let (start, end) = (instance.joint_base as usize, (instance.joint_base + instance.joint_rows) as usize);
+        for value in joints.get(start..end).unwrap_or(&[]).iter().flatten() {
+            hasher.write_u32(value.to_bits());
+        }
+        hasher.finish()
+    })
+}
+
+/// The key of what an instance shows: `shape` is its mesh's or its
+/// lines' identity and revision, `look` its materials' or its line
+/// style's hash, `pose` its palette's.
+fn cover_key(seen: &Seen, shape: (u64, u64), look: u64, pose: u64) -> u64 {
+    let mut hasher = motor::hash::FxHasher::default();
+    hasher.write_u32(seen.entity);
+    hasher.write_u64(shape.0);
+    hasher.write_u64(shape.1);
+    for value in seen.world_from_model.m {
+        hasher.write_u64(value.to_bits());
+    }
+    hasher.write(&[seen.tint.r, seen.tint.g, seen.tint.b, seen.tint.a, seen.ambient.r, seen.ambient.g, seen.ambient.b]);
+    hasher.write_u32(seen.flags);
+    hasher.write_u32(seen.morph);
+    for part in seen.parts.iter().flat_map(|parts| parts.iter()) {
+        hasher.write(&[part.tint.r, part.tint.g, part.tint.b, part.tint.a, part.shown as u8]);
+    }
+    hasher.write_u64(look);
+    hasher.write_u64(pose);
+    hasher.finish()
+}
+
+/// The hash of all a frame's instances share: the eye and the lens, the
+/// style, the uniforms but for the clock, the grade's place and the map
+/// of what moves, the still map, the floor map and the grade's points.
+fn scene_of(frame: &WorldFrame, view: &Mat4, projection: &Mat4, style: &WorldStyle, px_per_point: f32) -> u64 {
+    let mut hasher = motor::hash::FxHasher::default();
+    hasher.write_u32(frame.size.0);
+    hasher.write_u32(frame.size.1);
+    hasher.write_u8(frame.samples);
+    hasher.write_u32(px_per_point.to_bits());
+    for value in view.m.iter().chain(&projection.m) {
+        hasher.write_u64(value.to_bits());
+    }
+    hasher.write_u64(super::view::style_hash(style));
+    let mut uniforms = frame.uniforms;
+    uniforms.params[1] = 0.0;
+    uniforms.tone[3] = 0.0;
+    uniforms.moving_from_eye = [0.0; 16];
+    uniforms.moving = [0.0; 4];
+    hasher.write(&uniforms.to_bytes());
+    hasher.write_u32(frame.face_bias.to_bits());
+    hasher.write_u16(frame.bloom);
+    hasher.write_u64(frame.shadow.as_ref().map_or(0, |shadow| shadow.generation));
+    hasher.write_u64(frame.floor.and_then(|index| frame.textures.get(index as usize)).map_or(0, ImageSource::key));
+    if frame.uniforms.tone[3] > 0.0 {
+        for row in frame.parts.get(frame.uniforms.tone[3] as usize - 1..).unwrap_or(&[]) {
+            hasher.write(row);
+        }
+    }
+    hasher.finish()
 }
 
 /// An entity that casts the sun's shadow: where it stands, what it is.
@@ -1072,11 +1290,14 @@ fn shadow_frame(
                 hasher.write_u32(value.to_bits());
             }
         }
-        // a part that hides casts nothing: which parts show moves the map
+        // a part that hides casts nothing: which parts hide moves the map,
+        // and a tint does not
         if caster.part_base != NO_PARTS {
             let count = frame.parts.len().saturating_sub(caster.part_base as usize);
-            for row in frame.parts.iter().skip(caster.part_base as usize).take(count) {
-                hasher.write_u8(row[3]);
+            for (index, row) in frame.parts.iter().skip(caster.part_base as usize).take(count).enumerate() {
+                if row[3] == 0 {
+                    hasher.write_u32(index as u32);
+                }
             }
         }
     }

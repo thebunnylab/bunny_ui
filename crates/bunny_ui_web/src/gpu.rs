@@ -154,10 +154,13 @@ unsafe extern "C" {
     /// Binds the renderbuffer and gives it storage; 0 samples is one.
     #[cfg(feature = "3d")]
     fn gl_renderbuffer_storage_multisample(renderbuffer: u32, samples: i32, internal: u32, width: i32, height: i32);
-    /// The read framebuffer's colour onto the draw framebuffer, the same
-    /// rectangle on both, nearest.
+    /// A rectangle of the read framebuffer's colour onto the same
+    /// rectangle of the draw framebuffer, nearest.
     #[cfg(feature = "3d")]
-    fn gl_blit_framebuffer(width: i32, height: i32);
+    fn gl_blit_framebuffer(x: i32, y: i32, width: i32, height: i32);
+    /// The box the scissor test keeps, in the framebuffer's pixels.
+    #[cfg(feature = "3d")]
+    fn gl_scissor(x: i32, y: i32, width: i32, height: i32);
     /// Up to two attachments; 0 is none.
     #[cfg(feature = "3d")]
     fn gl_invalidate_framebuffer(target: u32, first: u32, second: u32);
@@ -1317,6 +1320,24 @@ pub(crate) fn world_rgba(frame: &std::rc::Rc<bunny_ui::world::WorldFrame>, image
         let mut slot = slot.borrow_mut();
         let tier = slot.as_mut()?;
         let rgba = tier.ground.world.draw_single(frame, images);
+        unsafe { gl_finish() };
+        rgba
+    })
+}
+
+/// `before` drawn whole by the world pass alone, then `after` over it in
+/// `rects` alone, read back top row first — for the parity harness.
+#[cfg(feature = "3d")]
+pub(crate) fn world_over_rgba(
+    before: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+    after: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+    rects: &[[u32; 4]],
+    images: &dyn ImageEngine,
+) -> Option<Vec<u8>> {
+    TIER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let tier = slot.as_mut()?;
+        let rgba = tier.ground.world.draw_over(before, after, rects, images);
         unsafe { gl_finish() };
         rgba
     })

@@ -137,6 +137,27 @@ motion ends nothing asks: a quarter-second flight is fifteen beats at
 Motion is a pure function of the engine clock (`task::now()`). A camera
 flight is a start time and a length: no state is written while it flies.
 
+## Only what changed
+
+A target keeps the frame it holds. Each instance of a frame carries a
+key of all it shows — its shape, its place, its look, its parts, its
+pose — and the rect of pixels it may reach. When the next frame of the
+box keeps the eye, the style, the lights and the still shadow, the
+tier draws only the rects of what changed: a figure that walks, a clip
+that plays, a part that turns red, an entity that comes or goes. The
+shadows of what moves add the rects where they may fall. Each rect is
+cleared and drawn again with every draw that reaches it, and the rest
+of the target keeps its picture. A frame that changes nothing seen
+draws nothing. A frame with a bloom, a new eye, or a change past half
+of the target is drawn whole.
+
+The CPU proves the rule (`world::damage`): the next frame drawn over
+the last in its rects gives the same bytes as the next frame drawn
+whole, and each tier proves the same against its own whole picture.
+Metal draws rects at one sample: four memoryless samples resolve into
+the whole target. The GL family, D3D11 and Vulkan draw them at four
+samples too.
+
 ## Cameras and the hand
 
 A camera is a plain value: an eye, a target, an up and a lens. A
@@ -436,5 +457,6 @@ cargo test -p bunny-ui-apple --features 3d
 cargo run -p bunny-ui-macos --features 3d --example world_window
 # in a page built with the web shell's `3d` feature, from the console:
 #   for (let n = 0; n < 21; n++) __bunny.bunny_gpu_world_parity(n)
+#   for (let n = 0; n < 4; n++) __bunny.bunny_gpu_world_redraw(n)
 BUNNY_WORLD_GLB=chair.glb BUNNY_WORLD_DUMP=/tmp cargo test -p bunny-ui-core --features gltf --lib a_glb_from_the_environment -- --ignored
 ```

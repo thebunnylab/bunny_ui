@@ -4861,6 +4861,20 @@ impl OffscreenVk {
         self.world.draw_single(&self.stack, command, fence, frame, images)
     }
 
+    /// `before` drawn whole, then `after` over it in `rects` alone, read
+    /// back: what `after` drawn whole gives, when the redraw is right.
+    #[cfg(feature = "3d")]
+    pub fn world_over_rgba(
+        &mut self,
+        before: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+        after: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+        rects: &[[u32; 4]],
+    ) -> Option<Vec<u8>> {
+        drain_all(&self.stack, &mut self.slots);
+        let (command, fence) = (self.slots[0].command, self.slots[0].fence);
+        self.world.draw_over(&self.stack, command, fence, before, after, rects, &bunny_ui::image_engine::RawImages::default())
+    }
+
     /// How many worlds the last frame drew: a held picture draws none.
     #[cfg(feature = "3d")]
     pub fn world_jobs(&self) -> usize {

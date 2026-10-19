@@ -16,6 +16,7 @@
 
 pub mod bloom;
 pub mod camera;
+pub mod damage;
 pub mod frame;
 pub mod governor;
 #[cfg(feature = "gltf")]

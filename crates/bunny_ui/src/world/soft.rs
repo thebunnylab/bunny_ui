@@ -66,15 +66,34 @@ pub fn draw(frame: &WorldFrame) -> Picture {
 /// Draws the frame; `textures` gives the texture of each of the frame's
 /// textures by index, `None` while it is not decoded.
 pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Texture>>) -> Picture {
-    let (width, height) = (frame.size.0.max(1), frame.size.1.max(1));
-    let mut target = Target {
-        width,
-        height,
-        color: vec![[0; 4]; (width * height) as usize],
-        depth: vec![1.0; (width * height) as usize],
-        glow: if frame.bloom > 0 { vec![0; (width * height) as usize] } else { Vec::new() },
-    };
+    let mut target = Target::of(frame);
     target.clear(frame);
+    draw_into(&mut target, frame, textures)
+}
+
+/// Draws the frame over `held` — the picture of an earlier frame of the
+/// same target — inside `rects` alone (`[x, y, width, height]`): each is
+/// cleared to the backdrop and drawn again, and the rest of `held` stays.
+/// What a tier does with [`crate::gpu::world::Redraw::Rects`]; with the
+/// rects of [`super::damage::redraw_rects`] it gives what
+/// [`draw_with`] gives.
+pub fn draw_over_with(held: &Picture, frame: &WorldFrame, rects: &[[u32; 4]], textures: &dyn Fn(usize) -> Option<Rc<Texture>>) -> Picture {
+    let mut target = Target::of(frame);
+    target.clear(frame);
+    target.only = Some(rects.to_vec());
+    for (index, pixel) in target.color.iter_mut().enumerate() {
+        let (x, y) = (index as u32 % target.width, index as u32 / target.width);
+        let inside = rects.iter().any(|r| x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]);
+        if !inside && let Some(kept) = held.rgba.get(index * 4..index * 4 + 4) {
+            *pixel = [kept[0], kept[1], kept[2], kept[3]];
+        }
+    }
+    draw_into(&mut target, frame, textures)
+}
+
+/// Runs the frame's draws into a cleared target.
+fn draw_into(target: &mut Target, frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Texture>>) -> Picture {
+    let (width, height) = (target.width, target.height);
     let shadow = sun_shadow::map_of(frame);
     let moving = sun_shadow::moving_map_of(frame);
     let floor = frame.floor.and_then(|index| textures(index as usize));
@@ -108,7 +127,7 @@ pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Textu
                             continue;
                         }
                         let vertices = [0, 1, 2].map(|k| corners.vertex(triangle[k] as usize, instance, &projection, &frame.joints));
-                        job.triangle(&mut target, vertices);
+                        job.triangle(target, vertices);
                     }
                 }
             }
@@ -116,7 +135,7 @@ pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Textu
                 let instance = &frame.instances[draw.first_instance as usize];
                 let style = &frame.line_styles[style as usize];
                 for segment in frame.lines[lines as usize].segments() {
-                    line(&mut target, frame, instance, &projection, style, segment);
+                    line(target, frame, instance, &projection, style, segment);
                 }
             }
         }
@@ -124,7 +143,7 @@ pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Textu
     if frame.bloom > 0 {
         super::bloom::apply(&mut target.color, &target.glow, (width, height), frame.bloom as u32);
     }
-    Picture { width, height, rgba: target.color.into_iter().flatten().collect() }
+    Picture { width, height, rgba: target.color.iter().flatten().copied().collect() }
 }
 
 impl super::store::World {
@@ -164,9 +183,31 @@ struct Target {
     depth: Vec<f32>,
     /// How much each pixel glows, for a frame with a bloom; empty without.
     glow: Vec<u8>,
+    /// The rects drawn into, `[x, y, width, height]`; `None` for all of
+    /// the target.
+    only: Option<Vec<[u32; 4]>>,
 }
 
 impl Target {
+    /// A target of the frame's size: no colour yet, the far depth.
+    fn of(frame: &WorldFrame) -> Target {
+        let (width, height) = (frame.size.0.max(1), frame.size.1.max(1));
+        Target {
+            width,
+            height,
+            color: vec![[0; 4]; (width * height) as usize],
+            depth: vec![1.0; (width * height) as usize],
+            glow: if frame.bloom > 0 { vec![0; (width * height) as usize] } else { Vec::new() },
+            only: None,
+        }
+    }
+
+    /// Whether a draw may write the pixel: every one, or those inside the
+    /// rects drawn into.
+    fn open(&self, x: u32, y: u32) -> bool {
+        self.only.as_ref().is_none_or(|rects| rects.iter().any(|r| x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]))
+    }
+
     fn clear(&mut self, frame: &WorldFrame) {
         match frame.background {
             Background::Transparent => {}
@@ -491,6 +532,9 @@ impl Job<'_> {
         };
         for py in y0..=y1 {
             for px in x0..=x1 {
+                if !target.open(px as u32, py as u32) {
+                    continue;
+                }
                 let at = (px * 256 + 128, py * 256 + 128);
                 let e = edges.map(|(a, b)| edge(a, b, at));
                 if (0..3).any(|k| e[k] < 0 || (e[k] == 0 && !owns[k])) {
@@ -729,6 +773,9 @@ fn line(target: &mut Target, frame: &WorldFrame, instance: &InstanceData, projec
     let section = u.section;
     for py in y0..=y1 {
         for px in x0..=x1 {
+            if !target.open(px as u32, py as u32) {
+                continue;
+            }
             let (cx, cy) = (px as f32 + 0.5, py as f32 + 0.5);
             let t = if length2 > 0.0 { (((cx - ax) * dx + (cy - ay) * dy) / length2).clamp(0.0, 1.0) } else { 0.0 };
             let (nx, ny) = (ax + dx * t - cx, ay + dy * t - cy);

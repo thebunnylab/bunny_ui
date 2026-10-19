@@ -425,6 +425,7 @@ struct GlWorldFns {
     renderbuffer_storage_multisample: unsafe extern "C" fn(GlEnum, i32, GlEnum, i32, i32),
     framebuffer_renderbuffer: unsafe extern "C" fn(GlEnum, GlEnum, GlEnum, u32),
     blit_framebuffer: unsafe extern "C" fn(i32, i32, i32, i32, i32, i32, i32, i32, u32, GlEnum),
+    scissor: unsafe extern "C" fn(i32, i32, i32, i32),
     depth_func: unsafe extern "C" fn(GlEnum),
     depth_mask: unsafe extern "C" fn(u8),
     cull_face: unsafe extern "C" fn(GlEnum),
@@ -470,6 +471,7 @@ fn resolve_world(egl: &EglFns) -> Option<GlWorldFns> {
         renderbuffer_storage_multisample: gl!("glRenderbufferStorageMultisample"),
         framebuffer_renderbuffer: gl!("glFramebufferRenderbuffer"),
         blit_framebuffer: gl!("glBlitFramebuffer"),
+        scissor: gl!("glScissor"),
         depth_func: gl!("glDepthFunc"),
         depth_mask: gl!("glDepthMask"),
         cull_face: gl!("glCullFace"),
@@ -1705,8 +1707,13 @@ impl GlFamily for Gl33 {
         }
     }
 
-    fn blit_color(&mut self, width: i32, height: i32) {
-        unsafe { (self.world.blit_framebuffer)(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST as GlEnum) }
+    fn blit_color(&mut self, rect: [i32; 4]) {
+        let [x0, y0, x1, y1] = [rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]];
+        unsafe { (self.world.blit_framebuffer)(x0, y0, x1, y1, x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST as GlEnum) }
+    }
+
+    fn scissor(&mut self, rect: [i32; 4]) {
+        unsafe { (self.world.scissor)(rect[0], rect[1], rect[2], rect[3]) }
     }
 
     fn invalidate_framebuffer(&mut self, target: u32, first: u32, second: u32) {
@@ -2752,6 +2759,18 @@ impl OffscreenGl {
         self.world.as_mut()?.draw_single(frame, images)
     }
 
+    /// `before` drawn whole, then `after` over it in `rects` alone, read
+    /// back: what `after` drawn whole gives, when the redraw is right.
+    #[cfg(feature = "3d")]
+    pub fn world_over_rgba(
+        &mut self,
+        before: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+        after: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+        rects: &[[u32; 4]],
+    ) -> Option<Vec<u8>> {
+        self.world.as_mut()?.draw_over(before, after, rects, &bunny_ui::image_engine::RawImages::default())
+    }
+
     /// How many worlds the last frame drew: a held picture draws none.
     #[cfg(feature = "3d")]
     pub fn world_jobs(&self) -> usize {
@@ -3624,6 +3643,20 @@ mod world_tests {
             let s = Spread::of(&ours, &oracle);
             eprintln!("{}: worst {} · >1 {} · >3 {} · >16 {} of {}", scene.name, s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
             assert!(s.within(scene.tolerance), "{} is beyond its tolerance", scene.name);
+        }
+    }
+
+    #[test]
+    fn every_redraw_of_the_catalog_matches_its_whole_picture() {
+        use bunny_ui::gpu::world_scenes::{REDRAWS, world_redraw};
+        let Some(mut gpu) = harness() else { return };
+        for index in 0..REDRAWS {
+            let redraw = world_redraw(index);
+            let over = gpu.world_over_rgba(&redraw.before, &redraw.after, &redraw.rects).expect("the world pass");
+            let whole = gpu.world_rgba(&redraw.after).expect("the world pass");
+            let s = Spread::of(&over, &whole);
+            eprintln!("{} in {:?}: worst {} · >1 {} of {}", redraw.name, redraw.rects, s.worst, s.beyond[0], s.pixels);
+            assert_eq!(s.worst, 0, "{}: the redraw is not the whole picture", redraw.name);
         }
     }
 

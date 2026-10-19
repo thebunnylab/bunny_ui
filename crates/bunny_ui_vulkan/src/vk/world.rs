@@ -45,7 +45,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::rc::Rc;
 
-use bunny_ui::gpu::world::{WorldCaps, WorldGround, WorldJob};
+use bunny_ui::gpu::world::{Redraw, WorldCaps, WorldGround, WorldJob};
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::world::bloom::LEVELS;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, ShadowFrame, WorldFrame};
@@ -388,6 +388,9 @@ struct WorldStack {
     /// The pass at one sample, at four, and both again with the glow
     /// beside the colour: `[(samples > 1) as usize + 2 · glow]`.
     passes: [RenderPass; 4],
+    /// The pass at one sample and at four that keeps the picture outside
+    /// its render area: a frame drawn in rects, a pass a rect.
+    keep_passes: [RenderPass; 2],
     modules: Modules,
     /// By the way they meet the target, the samples, and whether the pass
     /// draws the glow.
@@ -779,8 +782,58 @@ impl VkWorld {
     ) -> Option<Vec<u8>> {
         let mut door = VkWorldDoor { stack, world: self };
         let job = WorldJob::single(door.open()?, frame, images)?;
-        let target = job.target;
-        let (width, height) = frame.size;
+        let out = self.draw_and_read(stack, command, fence, std::slice::from_ref(&job));
+        let mut door = VkWorldDoor { stack, world: self };
+        if let Some(ground) = door.open() {
+            job.give_back(ground);
+        }
+        self.bury_now(stack);
+        out
+    }
+
+    /// `before` drawn whole into a target of its own, then `after` over it
+    /// in `rects` alone ([`Redraw::Rects`]), read back as
+    /// [`VkWorld::draw_single`] reads: what `after` drawn whole gives, when
+    /// the redraw is right. For the parity harness.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn draw_over(
+        &mut self,
+        stack: &VkStack,
+        command: CommandBuffer,
+        fence: Fence,
+        before: &Rc<WorldFrame>,
+        after: &Rc<WorldFrame>,
+        rects: &[[u32; 4]],
+        images: &dyn ImageEngine,
+    ) -> Option<Vec<u8>> {
+        let mut door = VkWorldDoor { stack, world: self };
+        let under = WorldJob::single(door.open()?, before, images)?;
+        let over = WorldJob::over(door.open()?, &under, after, images, rects.to_vec());
+        let out = over.as_ref().and_then(|over| self.draw_and_read(stack, command, fence, &[under.clone(), over.clone()]));
+        let mut door = VkWorldDoor { stack, world: self };
+        if let Some(ground) = door.open() {
+            if let Some(over) = over {
+                over.give_back_over(ground);
+            }
+            under.give_back(ground);
+        }
+        self.bury_now(stack);
+        out
+    }
+
+    /// The device is idle: what the harness's jobs made goes now.
+    fn bury_now(&mut self, stack: &VkStack) {
+        let graveyard = std::mem::take(&mut self.graveyard);
+        for (_, garbage) in graveyard {
+            unsafe { self.destroy(stack, garbage) };
+        }
+    }
+
+    /// Records `jobs` in order, each in a frame slot of its own, into
+    /// `command`, submits it, waits, and reads back the last job's target.
+    fn draw_and_read(&mut self, stack: &VkStack, command: CommandBuffer, fence: Fence, jobs: &[WorldJob]) -> Option<Vec<u8>> {
+        let target = jobs.last()?.target;
+        let (width, height) = jobs.last()?.size;
         let length = width as usize * height as usize * 4;
         let (readback, readback_memory, readback_map) =
             stack.buffer(length as u64, BUFFER_USAGE_TRANSFER_DST, MEMORY_PROPERTY_HOST_VISIBLE | MEMORY_PROPERTY_HOST_COHERENT)?;
@@ -795,7 +848,9 @@ impl VkWorld {
                 inheritance: std::ptr::null(),
             };
             (fns.begin_command_buffer)(command, &begin);
-            self.encode(stack, command, 0, std::slice::from_ref(&job));
+            for (slot, job) in jobs.iter().enumerate() {
+                self.encode(stack, command, slot, std::slice::from_ref(job));
+            }
             // the picture, out to the host
             let to_transfer = ImageMemoryBarrier {
                 s_type: ST_IMAGE_MEMORY_BARRIER,
@@ -877,15 +932,6 @@ impl VkWorld {
             std::ptr::copy_nonoverlapping(readback_map, out.as_mut_ptr(), length);
             (fns.destroy_buffer)(stack.device, readback, std::ptr::null());
             (fns.free_memory)(stack.device, readback_memory, std::ptr::null());
-            let mut door = VkWorldDoor { stack, world: self };
-            if let Some(ground) = door.open() {
-                job.give_back(ground);
-            }
-            // the device is idle: what the job made goes now
-            let graveyard = std::mem::take(&mut self.graveyard);
-            for (_, garbage) in graveyard {
-                self.destroy(stack, garbage);
-            }
             submitted.then_some(out)
         }
     }
@@ -998,7 +1044,8 @@ impl WorldStack {
             if !ok((fns.create_pipeline_layout)(stack.device, &layout_info, std::ptr::null(), &mut layout)) {
                 return Err("the world pipeline layout refused".into());
             }
-            let passes = [world_pass(stack, 1, false)?, world_pass(stack, 4, false)?, world_pass(stack, 1, true)?, world_pass(stack, 4, true)?];
+            let passes = [world_pass(stack, 1, false, false)?, world_pass(stack, 4, false, false)?, world_pass(stack, 1, true, false)?, world_pass(stack, 4, true, false)?];
+            let keep_passes = [world_pass(stack, 1, false, true)?, world_pass(stack, 4, false, true)?];
             let shadow_pass = shadow_pass(stack)?;
             let modules = Modules {
                 mesh_vert: stack.shader(MESH_VERT_SPV)?,
@@ -1119,6 +1166,7 @@ impl WorldStack {
                 lit: Image { image: 0, memory: 0, view: 0 },
                 layout,
                 passes,
+                keep_passes,
                 modules,
                 pipelines: HashMap::new(),
                 bloom,
@@ -1217,7 +1265,7 @@ impl WorldStack {
             (fns.destroy_descriptor_pool)(stack.device, self.deform_pool, std::ptr::null());
             (fns.destroy_descriptor_set_layout)(stack.device, self.deform_layout, std::ptr::null());
             (fns.destroy_sampler)(stack.device, self.surface_sampler, std::ptr::null());
-            for pass in self.passes {
+            for pass in self.passes.into_iter().chain(self.keep_passes) {
                 (fns.destroy_render_pass)(stack.device, pass, std::ptr::null());
             }
             (fns.destroy_pipeline_layout)(stack.device, self.layout, std::ptr::null());
@@ -1776,115 +1824,127 @@ impl WorldStack {
             // the glow (cleared to none) and its resolve; at one sample the
             // glow takes the resolve's place
             let clears = [color, [1.0, 0.0, 0.0, 0.0], [0.0; 4], [0.0; 4], [0.0; 4]];
-            let begin = RenderPassBeginInfo {
-                s_type: ST_RENDER_PASS_BEGIN,
-                p_next: std::ptr::null(),
-                render_pass: self.passes[(samples > 1) as usize + 2 * glow as usize],
-                framebuffer: bloom.map_or(target.framebuffer, |bloom| bloom.framebuffer),
-                render_area_offset: [0, 0],
-                render_area_extent: [width, height],
-                clear_count: match (samples > 1, glow) {
-                    (false, false) => 2,
-                    (true, false) | (false, true) => 3,
-                    (true, true) => 5,
-                },
-                clears: clears.as_ptr(),
+            // all of the target, or a pass a rect the job asks for: the
+            // render area holds its clears and its resolve, the scissor its
+            // draws, and the rest of the picture stays
+            let (rects, partial) = match &job.redraw {
+                Redraw::Whole => (vec![[0, 0, width, height]], false),
+                Redraw::Rects(rects) => (rects.clone(), true),
             };
-            (fns.cmd_begin_render_pass)(command, &begin, SUBPASS_CONTENTS_INLINE);
-            let viewport = Viewport { x: 0.0, y: 0.0, width: width as f32, height: height as f32, min_depth: 0.0, max_depth: 1.0 };
-            (fns.cmd_set_viewport)(command, 0, 1, &viewport);
-            let scissor = Rect2D { offset: [0, 0], extent: [width, height] };
-            (fns.cmd_set_scissor)(command, 0, 1, &scissor);
-            (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 0, 1, &set, 0, std::ptr::null());
-            let layout = self.layout;
-            let push = |command: CommandBuffer, bytes: &DrawPush| {
-                (fns.cmd_push_constants)(
-                    command,
-                    layout,
-                    SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT,
-                    0,
-                    DRAW_PUSH,
-                    (bytes as *const DrawPush).cast(),
-                );
-            };
-            if let Some(rows) = frame.backdrop() {
-                let pipeline = self.pipeline(stack, Pipe::Backdrop, samples, glow);
-                if pipeline != 0 {
-                    // the ramp's six rows ride the draw's six
-                    let ramp = DrawPush { draw: rows[0], rows: [rows[1], rows[2], rows[3]], style: [rows[4], rows[5]] };
-                    (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-                    push(command, &ramp);
-                    (fns.cmd_draw)(command, 3, 1, 0, 0);
-                }
-            }
-            let (near, far) = (frame.near as f32, frame.far as f32);
-            for draw in &frame.draws {
-                match draw.kind {
-                    DrawKind::Mesh { mesh, first_index, index_count, texture, cull_back, mirrored, blend, mask } => {
-                        let Some(buffers) = job.meshes.get(mesh as usize).and_then(|id| meshes.get(id)) else { continue };
-                        let surface = texture
-                            .and_then(|index| job.textures.get(index as usize).copied().flatten())
-                            .and_then(|id| surfaces.get(&id));
-                        let replace = blend == Blend::Replace;
-                        let bias = if replace { frame.face_bias } else { 0.0 };
-                        // with four samples a cut-out's edge becomes coverage
-                        let coverage = mask && samples > 1;
-                        let pipeline = self.pipeline(stack, Pipe::Mesh { blend, stepped: bias > 0.0, cull_back, mirrored, coverage }, samples, glow);
-                        if pipeline == 0 {
-                            continue;
-                        }
-                        let mut flags = 0;
-                        if mask {
-                            flags |= DRAW_MASK;
-                        }
-                        if surface.is_some() {
-                            flags |= DRAW_TEXTURED;
-                        }
-                        if replace {
-                            flags |= DRAW_REPLACE;
-                        }
-                        if coverage {
-                            flags |= DRAW_COVERAGE;
-                        }
-                        // how the mesh lays out its morphs and its skin
-                        flags |= frame.meshes.get(mesh as usize).map_or(0, |mesh| mesh.deform_flags());
+            for &rect in &rects {
+                let begin = RenderPassBeginInfo {
+                    s_type: ST_RENDER_PASS_BEGIN,
+                    p_next: std::ptr::null(),
+                    render_pass: if partial { self.keep_passes[(samples > 1) as usize] } else { self.passes[(samples > 1) as usize + 2 * glow as usize] },
+                    framebuffer: bloom.map_or(target.framebuffer, |bloom| bloom.framebuffer),
+                    render_area_offset: [rect[0] as i32, rect[1] as i32],
+                    render_area_extent: [rect[2], rect[3]],
+                    clear_count: match (samples > 1, glow) {
+                        (false, false) => 2,
+                        (true, false) | (false, true) => 3,
+                        (true, true) => 5,
+                    },
+                    clears: clears.as_ptr(),
+                };
+                (fns.cmd_begin_render_pass)(command, &begin, SUBPASS_CONTENTS_INLINE);
+                let viewport = Viewport { x: 0.0, y: 0.0, width: width as f32, height: height as f32, min_depth: 0.0, max_depth: 1.0 };
+                (fns.cmd_set_viewport)(command, 0, 1, &viewport);
+                let scissor = Rect2D { offset: [rect[0] as i32, rect[1] as i32], extent: [rect[2], rect[3]] };
+                (fns.cmd_set_scissor)(command, 0, 1, &scissor);
+                (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 0, 1, &set, 0, std::ptr::null());
+                let layout = self.layout;
+                let push = |command: CommandBuffer, bytes: &DrawPush| {
+                    (fns.cmd_push_constants)(
+                        command,
+                        layout,
+                        SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT,
+                        0,
+                        DRAW_PUSH,
+                        (bytes as *const DrawPush).cast(),
+                    );
+                };
+                if let Some(rows) = frame.backdrop() {
+                    let pipeline = self.pipeline(stack, Pipe::Backdrop, samples, glow);
+                    if pipeline != 0 {
+                        // the ramp's six rows ride the draw's six
+                        let ramp = DrawPush { draw: rows[0], rows: [rows[1], rows[2], rows[3]], style: [rows[4], rows[5]] };
                         (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-                        let picture = surface.map_or(self.blank.set, |surface| surface.set);
-                        (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 1, 1, &picture, 0, std::ptr::null());
-                        let deform = self.deform_of(buffers);
-                        (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 2, 1, &deform, 0, std::ptr::null());
-                        push(command, &DrawPush { draw: [flags as f32, near, far, bias], ..DrawPush::default() });
-                        // the first instance rides the instance buffer's
-                        // offset, as on the GL family
-                        let buffers_bound = [buffers.vertices.buffer, blocks];
-                        let offsets = [0u64, instances + draw.first_instance as u64 * instance_offset::SIZE as u64];
-                        (fns.cmd_bind_vertex_buffers)(command, 0, 2, buffers_bound.as_ptr(), offsets.as_ptr());
-                        (fns.cmd_bind_index_buffer)(command, buffers.indices.buffer, 0, INDEX_TYPE_UINT32);
-                        (fns.cmd_draw_indexed)(command, index_count, draw.instance_count, first_index, 0, 0);
-                    }
-                    DrawKind::Lines { lines, style } => {
-                        let Some(set) = job.segments.get(lines as usize).and_then(|id| segments.get(id)) else { continue };
-                        let (Some(style), Some(instance), Some(buffer)) =
-                            (frame.line_styles.get(style as usize), frame.instances.get(draw.first_instance as usize), set.buffer.as_ref())
-                        else {
-                            continue;
-                        };
-                        if set.count == 0 {
-                            continue;
-                        }
-                        let pipeline = self.pipeline(stack, Pipe::Lines((style.shape[3] as u8).min(2)), samples, glow);
-                        if pipeline == 0 {
-                            continue;
-                        }
-                        (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-                        push(command, &DrawPush { draw: [0.0, near, far, 0.0], rows: instance.eye_from_model, style: [style.color, style.shape] });
-                        let offset = 0u64;
-                        (fns.cmd_bind_vertex_buffers)(command, 0, 1, &buffer.buffer, &offset);
-                        (fns.cmd_draw)(command, 6, set.count, 0, 0);
+                        push(command, &ramp);
+                        (fns.cmd_draw)(command, 3, 1, 0, 0);
                     }
                 }
+                let (near, far) = (frame.near as f32, frame.far as f32);
+                for draw in &frame.draws {
+                    if partial && !frame.draw_reaches(draw, rect) {
+                        continue;
+                    }
+                    match draw.kind {
+                        DrawKind::Mesh { mesh, first_index, index_count, texture, cull_back, mirrored, blend, mask } => {
+                            let Some(buffers) = job.meshes.get(mesh as usize).and_then(|id| meshes.get(id)) else { continue };
+                            let surface = texture
+                                .and_then(|index| job.textures.get(index as usize).copied().flatten())
+                                .and_then(|id| surfaces.get(&id));
+                            let replace = blend == Blend::Replace;
+                            let bias = if replace { frame.face_bias } else { 0.0 };
+                            // with four samples a cut-out's edge becomes coverage
+                            let coverage = mask && samples > 1;
+                            let pipeline = self.pipeline(stack, Pipe::Mesh { blend, stepped: bias > 0.0, cull_back, mirrored, coverage }, samples, glow);
+                            if pipeline == 0 {
+                                continue;
+                            }
+                            let mut flags = 0;
+                            if mask {
+                                flags |= DRAW_MASK;
+                            }
+                            if surface.is_some() {
+                                flags |= DRAW_TEXTURED;
+                            }
+                            if replace {
+                                flags |= DRAW_REPLACE;
+                            }
+                            if coverage {
+                                flags |= DRAW_COVERAGE;
+                            }
+                            // how the mesh lays out its morphs and its skin
+                            flags |= frame.meshes.get(mesh as usize).map_or(0, |mesh| mesh.deform_flags());
+                            (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+                            let picture = surface.map_or(self.blank.set, |surface| surface.set);
+                            (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 1, 1, &picture, 0, std::ptr::null());
+                            let deform = self.deform_of(buffers);
+                            (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 2, 1, &deform, 0, std::ptr::null());
+                            push(command, &DrawPush { draw: [flags as f32, near, far, bias], ..DrawPush::default() });
+                            // the first instance rides the instance buffer's
+                            // offset, as on the GL family
+                            let buffers_bound = [buffers.vertices.buffer, blocks];
+                            let offsets = [0u64, instances + draw.first_instance as u64 * instance_offset::SIZE as u64];
+                            (fns.cmd_bind_vertex_buffers)(command, 0, 2, buffers_bound.as_ptr(), offsets.as_ptr());
+                            (fns.cmd_bind_index_buffer)(command, buffers.indices.buffer, 0, INDEX_TYPE_UINT32);
+                            (fns.cmd_draw_indexed)(command, index_count, draw.instance_count, first_index, 0, 0);
+                        }
+                        DrawKind::Lines { lines, style } => {
+                            let Some(set) = job.segments.get(lines as usize).and_then(|id| segments.get(id)) else { continue };
+                            let (Some(style), Some(instance), Some(buffer)) =
+                                (frame.line_styles.get(style as usize), frame.instances.get(draw.first_instance as usize), set.buffer.as_ref())
+                            else {
+                                continue;
+                            };
+                            if set.count == 0 {
+                                continue;
+                            }
+                            let pipeline = self.pipeline(stack, Pipe::Lines((style.shape[3] as u8).min(2)), samples, glow);
+                            if pipeline == 0 {
+                                continue;
+                            }
+                            (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+                            push(command, &DrawPush { draw: [0.0, near, far, 0.0], rows: instance.eye_from_model, style: [style.color, style.shape] });
+                            let offset = 0u64;
+                            (fns.cmd_bind_vertex_buffers)(command, 0, 1, &buffer.buffer, &offset);
+                            (fns.cmd_draw)(command, 6, set.count, 0, 0);
+                        }
+                    }
+                }
+                (fns.cmd_end_render_pass)(command);
             }
-            (fns.cmd_end_render_pass)(command);
             if let Some(bloom) = bloom {
                 self.record_bloom(stack, command, target, bloom, frame.bloom);
             }
@@ -2484,9 +2544,12 @@ unsafe fn shadow_pass(stack: &VkStack) -> Result<RenderPass, String> {
 /// cleared to none and left ready the same way. Its dependencies order it
 /// after the frames that sampled or drew the same target, and before the
 /// 2D pass that samples it now (or a copy out, or the bloom's chain).
-unsafe fn world_pass(stack: &VkStack, samples: u8, glow: bool) -> Result<RenderPass, String> {
+unsafe fn world_pass(stack: &VkStack, samples: u8, glow: bool, keep: bool) -> Result<RenderPass, String> {
     let multisampled = samples > 1;
     let count = if multisampled { SAMPLE_COUNT_4 } else { SAMPLE_COUNT_1 };
+    // a pass that keeps the picture outside its render area finds it as
+    // the 2D pass left it: an undefined layout would let it go
+    let picture_layout = if keep { IMAGE_LAYOUT_SHADER_READ_ONLY } else { IMAGE_LAYOUT_UNDEFINED };
     // what is drawn: kept at one sample, dropped at four once resolved
     let drawn = |format: u32| AttachmentDescription {
         flags: 0,
@@ -2496,7 +2559,7 @@ unsafe fn world_pass(stack: &VkStack, samples: u8, glow: bool) -> Result<RenderP
         store_op: if multisampled { ATTACHMENT_STORE_DONT_CARE } else { ATTACHMENT_STORE_STORE },
         stencil_load: ATTACHMENT_LOAD_DONT_CARE,
         stencil_store: ATTACHMENT_STORE_DONT_CARE,
-        initial_layout: IMAGE_LAYOUT_UNDEFINED,
+        initial_layout: if multisampled { IMAGE_LAYOUT_UNDEFINED } else { picture_layout },
         final_layout: if multisampled { IMAGE_LAYOUT_COLOR_ATTACHMENT } else { IMAGE_LAYOUT_SHADER_READ_ONLY },
     };
     let resolved = |format: u32| AttachmentDescription {
@@ -2507,7 +2570,7 @@ unsafe fn world_pass(stack: &VkStack, samples: u8, glow: bool) -> Result<RenderP
         store_op: ATTACHMENT_STORE_STORE,
         stencil_load: ATTACHMENT_LOAD_DONT_CARE,
         stencil_store: ATTACHMENT_STORE_DONT_CARE,
-        initial_layout: IMAGE_LAYOUT_UNDEFINED,
+        initial_layout: picture_layout,
         final_layout: IMAGE_LAYOUT_SHADER_READ_ONLY,
     };
     let depth = AttachmentDescription {
@@ -2595,7 +2658,7 @@ unsafe fn world_pass(stack: &VkStack, samples: u8, glow: bool) -> Result<RenderP
     let mut pass: RenderPass = 0;
     unsafe {
         if !ok((stack.fns.create_render_pass)(stack.device, &info, std::ptr::null(), &mut pass)) {
-            return Err(format!("the world render pass at {samples} samples (glow: {glow}) refused"));
+            return Err(format!("the world render pass at {samples} samples (glow: {glow}, keep: {keep}) refused"));
         }
     }
     Ok(pass)
@@ -3002,7 +3065,8 @@ impl WorldGround for VkWorldDoor<'_> {
         unsafe { (self.stack.fns.get_physical_device_properties)(self.stack.physical, &mut properties) };
         let end = properties.device_name.iter().position(|&byte| byte == 0).unwrap_or(properties.device_name.len());
         let name = String::from_utf8_lossy(&properties.device_name[..end]);
-        WorldCaps { samples: 4, start: bunny_ui::world::governor::device_quality(&name) }
+        // a pass a rect, whose render area holds its clears and resolve
+        WorldCaps { samples: 4, start: bunny_ui::world::governor::device_quality(&name), redraw_samples: 4 }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {
@@ -3248,6 +3312,20 @@ mod tests {
             let s = Spread::of(&ours, &oracle);
             eprintln!("{}: worst {} · >1 {} · >3 {} · >16 {} of {}", scene.name, s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
             assert!(s.within(scene.tolerance), "{} is beyond its tolerance", scene.name);
+        }
+    }
+
+    #[test]
+    fn every_redraw_of_the_catalog_matches_its_whole_picture() {
+        use bunny_ui::gpu::world_scenes::{REDRAWS, world_redraw};
+        let Some(mut gpu) = harness() else { return };
+        for index in 0..REDRAWS {
+            let redraw = world_redraw(index);
+            let over = gpu.world_over_rgba(&redraw.before, &redraw.after, &redraw.rects).expect("the world pass");
+            let whole = gpu.world_rgba(&redraw.after).expect("the world pass");
+            let s = Spread::of(&over, &whole);
+            eprintln!("{} in {:?}: worst {} · >1 {} of {}", redraw.name, redraw.rects, s.worst, s.beyond[0], s.pixels);
+            assert_eq!(s.worst, 0, "{}: the redraw is not the whole picture", redraw.name);
         }
     }
 

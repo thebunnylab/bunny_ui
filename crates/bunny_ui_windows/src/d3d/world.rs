@@ -40,7 +40,7 @@ use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::rc::Rc;
 
-use bunny_ui::gpu::world::{WorldCaps, WorldGround, WorldJob};
+use bunny_ui::gpu::world::{Redraw, WorldCaps, WorldGround, WorldJob};
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::world::bloom::LEVELS;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, WorldFrame};
@@ -51,7 +51,7 @@ use bunny_ui::world::wire::{
 
 use super::{
     ADDRESS_CLAMP, BIND_RENDER_TARGET, BIND_SHADER_RESOURCE, BLEND_INV_SRC_ALPHA, BLEND_ONE, BLEND_OP_ADD, BlendDesc, BlendState, Blob,
-    Buffer, BufferDesc, COMPARISON_NEVER, CPU_ACCESS_READ, CULL_NONE, Context, DepthStencilDesc,
+    Buffer, BufferDesc, COMPARISON_NEVER, CPU_ACCESS_READ, CULL_NONE, Context, D3dRect, DepthStencilDesc,
     DepthStencilOpDesc, DepthStencilState, Device, Dsv, FILL_SOLID, FILTER_MIN_MAG_MIP_LINEAR, FORMAT_RGBA8,
     FORMAT_RGBA8_SRGB, FORMAT_UNKNOWN, MAP_READ, MAP_WRITE_DISCARD, MISC_BUFFER_STRUCTURED, MappedSubresource,
     PixelShader, RasterizerDesc, RasterizerState, RenderTargetBlendDesc, Rtv, SHADER_SOURCE, SRV_DIMENSION_BUFFER,
@@ -1032,8 +1032,9 @@ struct WorldStack {
     /// Opaque, see-through, lines tested, lines hidden, always.
     depth_states: [Com<DepthStencilState>; 5],
     /// By culling (none, back), then by the front's winding
-    /// (counter-clockwise, clockwise).
-    rasterizers: [Com<RasterizerState>; 4],
+    /// (counter-clockwise, clockwise); then the four again with the
+    /// scissor on, for a frame drawn in rects.
+    rasterizers: [Com<RasterizerState>; 8],
     /// Over and add; a replacing draw binds no blend at all.
     over: Com<BlendState>,
     add: Com<BlendState>,
@@ -1381,101 +1382,122 @@ impl D3dWorld {
                 }
                 Background::Transparent | Background::Gradient { .. } | Background::Sky { .. } => [0.0; 4],
             };
-            (vtbl.clear_render_target_view)(context, rtv, clear.as_ptr());
-            (vtbl.clear_depth_stencil_view)(context, target.dsv.as_ptr(), CLEAR_DEPTH, 1.0, 0);
-            if let Some(rows) = frame.backdrop() {
-                let ramp = BackdropBlock { rows };
-                write_constants(context, stack.backdrop.as_ptr(), bytes_of(&ramp));
-                (vtbl.vs_set_shader)(context, stack.backdrop_vs.as_ptr(), null(), 0);
-                (vtbl.ps_set_shader)(context, stack.backdrop_ps.as_ptr(), null(), 0);
-                (vtbl.om_set_depth_stencil_state)(context, stack.depth_states[DEPTH_ALWAYS].as_ptr(), 0);
-                (vtbl.rs_set_state)(context, stack.rasterizers[0].as_ptr());
-                (vtbl.om_set_blend_state)(context, null_mut(), null(), 0xFFFF_FFFF);
-                (vtbl.draw_instanced)(context, 3, 1, 0, 0);
+            // all of the target, or each rect the job asks for: the
+            // scissor holds the backdrop — which fills a rect a clear
+            // cannot — and the draws inside it, and the rest keeps what the
+            // target holds
+            let (rects, scissored) = match &job.redraw {
+                Redraw::Whole => (vec![[0, 0, width, height]], 0),
+                Redraw::Rects(rects) => (rects.clone(), 4),
+            };
+            if scissored == 0 {
+                (vtbl.clear_render_target_view)(context, rtv, clear.as_ptr());
             }
-
+            (vtbl.clear_depth_stencil_view)(context, target.dsv.as_ptr(), CLEAR_DEPTH, 1.0, 0);
             let (near, far) = (frame.near as f32, frame.far as f32);
-            for draw in &frame.draws {
-                match draw.kind {
-                    DrawKind::Mesh { mesh, first_index, index_count, texture, cull_back, mirrored, blend, mask } => {
-                        let Some(buffers) = job.meshes.get(mesh as usize).and_then(|id| meshes.get(id)) else { continue };
-                        let surface = texture
-                            .and_then(|index| job.textures.get(index as usize).copied().flatten())
-                            .and_then(|id| textures.get(&id))
-                            .map(|(_, srv)| srv.as_ptr());
-                        let replace = blend == Blend::Replace;
-                        let bias = if replace { frame.face_bias } else { 0.0 };
-                        let mut flags = 0;
-                        if mask {
-                            flags |= DRAW_MASK;
-                        }
-                        if surface.is_some() {
-                            flags |= DRAW_TEXTURED;
-                        }
-                        if replace {
-                            flags |= DRAW_REPLACE;
-                        }
-                        // with four samples a cut-out's edge becomes coverage
-                        let coverage = mask && target.color.is_some();
-                        if coverage {
-                            flags |= DRAW_COVERAGE;
-                        }
-                        // how the mesh lays out its morphs and its skin
-                        flags |= frame.meshes.get(mesh as usize).map_or(0, |mesh| mesh.deform_flags());
-                        let block = DrawBlock { first_instance: draw.first_instance, flags, near, far, bias: [bias, 0.0, 0.0, 0.0], ..DrawBlock::default() };
-                        write_constants(context, stack.draw.as_ptr(), bytes_of(&block));
-                        (vtbl.vs_set_shader)(context, stack.mesh_vs.as_ptr(), null(), 0);
-                        let pixel = if bias > 0.0 { &stack.stepped_ps } else { &stack.mesh_ps };
-                        (vtbl.ps_set_shader)(context, pixel.as_ptr(), null(), 0);
-                        let depth = if replace { DEPTH_OPAQUE } else { DEPTH_SEE_THROUGH };
-                        (vtbl.om_set_depth_stencil_state)(context, stack.depth_states[depth].as_ptr(), 0);
-                        // the instances mirror the mesh: its front turns the other way
-                        (vtbl.rs_set_state)(context, stack.rasterizers[cull_back as usize * 2 + mirrored as usize].as_ptr());
-                        let blend_state = match blend {
-                            Blend::Replace if coverage => stack.coverage.as_ptr(),
-                            Blend::Replace => null_mut(),
-                            Blend::Alpha => stack.over.as_ptr(),
-                            Blend::Add => stack.add.as_ptr(),
-                        };
-                        (vtbl.om_set_blend_state)(context, blend_state, null(), 0xFFFF_FFFF);
-                        let vertex_view = buffers.vertex_srv.as_ptr();
-                        (vtbl.vs_set_shader_resources)(context, 0, 1, &vertex_view);
-                        let deform_view = buffers.deform.as_ref().map_or(stack.no_deform.1.as_ptr(), |(_, view)| view.as_ptr());
-                        (vtbl.vs_set_shader_resources)(context, 11, 1, &deform_view);
-                        let picture = surface.unwrap_or(stack.blank.1.as_ptr());
-                        (vtbl.ps_set_shader_resources)(context, 3, 1, &picture);
-                        (vtbl.ia_set_index_buffer)(context, buffers.indices.as_ptr(), FORMAT_R32_UINT, 0);
-                        (vtbl.draw_indexed_instanced)(context, index_count, draw.instance_count, first_index, 0, 0);
+            for &rect in &rects {
+                let partial = scissored != 0;
+                if partial {
+                    let scissor = D3dRect { left: rect[0] as i32, top: rect[1] as i32, right: (rect[0] + rect[2]) as i32, bottom: (rect[1] + rect[3]) as i32 };
+                    (vtbl.rs_set_scissor_rects)(context, 1, &scissor);
+                }
+                let backdrop = if partial { Some(frame.fill()) } else { frame.backdrop() };
+                if let Some(rows) = backdrop {
+                    let ramp = BackdropBlock { rows };
+                    write_constants(context, stack.backdrop.as_ptr(), bytes_of(&ramp));
+                    (vtbl.vs_set_shader)(context, stack.backdrop_vs.as_ptr(), null(), 0);
+                    (vtbl.ps_set_shader)(context, stack.backdrop_ps.as_ptr(), null(), 0);
+                    (vtbl.om_set_depth_stencil_state)(context, stack.depth_states[DEPTH_ALWAYS].as_ptr(), 0);
+                    (vtbl.rs_set_state)(context, stack.rasterizers[scissored].as_ptr());
+                    (vtbl.om_set_blend_state)(context, null_mut(), null(), 0xFFFF_FFFF);
+                    (vtbl.draw_instanced)(context, 3, 1, 0, 0);
+                }
+
+                for draw in &frame.draws {
+                    if partial && !frame.draw_reaches(draw, rect) {
+                        continue;
                     }
-                    DrawKind::Lines { lines, style } => {
-                        let Some(set) = job.segments.get(lines as usize).and_then(|id| segments.get(id)) else { continue };
-                        let (Some(style), Some((_, view))) = (frame.line_styles.get(style as usize), set.view.as_ref()) else { continue };
-                        if set.count == 0 {
-                            continue;
+                    match draw.kind {
+                        DrawKind::Mesh { mesh, first_index, index_count, texture, cull_back, mirrored, blend, mask } => {
+                            let Some(buffers) = job.meshes.get(mesh as usize).and_then(|id| meshes.get(id)) else { continue };
+                            let surface = texture
+                                .and_then(|index| job.textures.get(index as usize).copied().flatten())
+                                .and_then(|id| textures.get(&id))
+                                .map(|(_, srv)| srv.as_ptr());
+                            let replace = blend == Blend::Replace;
+                            let bias = if replace { frame.face_bias } else { 0.0 };
+                            let mut flags = 0;
+                            if mask {
+                                flags |= DRAW_MASK;
+                            }
+                            if surface.is_some() {
+                                flags |= DRAW_TEXTURED;
+                            }
+                            if replace {
+                                flags |= DRAW_REPLACE;
+                            }
+                            // with four samples a cut-out's edge becomes coverage
+                            let coverage = mask && target.color.is_some();
+                            if coverage {
+                                flags |= DRAW_COVERAGE;
+                            }
+                            // how the mesh lays out its morphs and its skin
+                            flags |= frame.meshes.get(mesh as usize).map_or(0, |mesh| mesh.deform_flags());
+                            let block = DrawBlock { first_instance: draw.first_instance, flags, near, far, bias: [bias, 0.0, 0.0, 0.0], ..DrawBlock::default() };
+                            write_constants(context, stack.draw.as_ptr(), bytes_of(&block));
+                            (vtbl.vs_set_shader)(context, stack.mesh_vs.as_ptr(), null(), 0);
+                            let pixel = if bias > 0.0 { &stack.stepped_ps } else { &stack.mesh_ps };
+                            (vtbl.ps_set_shader)(context, pixel.as_ptr(), null(), 0);
+                            let depth = if replace { DEPTH_OPAQUE } else { DEPTH_SEE_THROUGH };
+                            (vtbl.om_set_depth_stencil_state)(context, stack.depth_states[depth].as_ptr(), 0);
+                            // the instances mirror the mesh: its front turns the other way
+                            (vtbl.rs_set_state)(context, stack.rasterizers[scissored + cull_back as usize * 2 + mirrored as usize].as_ptr());
+                            let blend_state = match blend {
+                                Blend::Replace if coverage => stack.coverage.as_ptr(),
+                                Blend::Replace => null_mut(),
+                                Blend::Alpha => stack.over.as_ptr(),
+                                Blend::Add => stack.add.as_ptr(),
+                            };
+                            (vtbl.om_set_blend_state)(context, blend_state, null(), 0xFFFF_FFFF);
+                            let vertex_view = buffers.vertex_srv.as_ptr();
+                            (vtbl.vs_set_shader_resources)(context, 0, 1, &vertex_view);
+                            let deform_view = buffers.deform.as_ref().map_or(stack.no_deform.1.as_ptr(), |(_, view)| view.as_ptr());
+                            (vtbl.vs_set_shader_resources)(context, 11, 1, &deform_view);
+                            let picture = surface.unwrap_or(stack.blank.1.as_ptr());
+                            (vtbl.ps_set_shader_resources)(context, 3, 1, &picture);
+                            (vtbl.ia_set_index_buffer)(context, buffers.indices.as_ptr(), FORMAT_R32_UINT, 0);
+                            (vtbl.draw_indexed_instanced)(context, index_count, draw.instance_count, first_index, 0, 0);
                         }
-                        let depth = match style.shape[3] as u32 {
-                            0 => DEPTH_LINES_TESTED,
-                            1 => DEPTH_LINES_HIDDEN,
-                            _ => DEPTH_ALWAYS,
-                        };
-                        let block = DrawBlock {
-                            first_instance: draw.first_instance,
-                            flags: 0,
-                            near,
-                            far,
-                            bias: [0.0; 4],
-                            line_color: style.color,
-                            line_shape: style.shape,
-                        };
-                        write_constants(context, stack.draw.as_ptr(), bytes_of(&block));
-                        (vtbl.vs_set_shader)(context, stack.line_vs.as_ptr(), null(), 0);
-                        (vtbl.ps_set_shader)(context, stack.line_ps.as_ptr(), null(), 0);
-                        (vtbl.om_set_depth_stencil_state)(context, stack.depth_states[depth].as_ptr(), 0);
-                        (vtbl.rs_set_state)(context, stack.rasterizers[0].as_ptr());
-                        (vtbl.om_set_blend_state)(context, stack.over.as_ptr(), null(), 0xFFFF_FFFF);
-                        let segment_view = view.as_ptr();
-                        (vtbl.vs_set_shader_resources)(context, 4, 1, &segment_view);
-                        (vtbl.draw_instanced)(context, 6, set.count, 0, 0);
+                        DrawKind::Lines { lines, style } => {
+                            let Some(set) = job.segments.get(lines as usize).and_then(|id| segments.get(id)) else { continue };
+                            let (Some(style), Some((_, view))) = (frame.line_styles.get(style as usize), set.view.as_ref()) else { continue };
+                            if set.count == 0 {
+                                continue;
+                            }
+                            let depth = match style.shape[3] as u32 {
+                                0 => DEPTH_LINES_TESTED,
+                                1 => DEPTH_LINES_HIDDEN,
+                                _ => DEPTH_ALWAYS,
+                            };
+                            let block = DrawBlock {
+                                first_instance: draw.first_instance,
+                                flags: 0,
+                                near,
+                                far,
+                                bias: [0.0; 4],
+                                line_color: style.color,
+                                line_shape: style.shape,
+                            };
+                            write_constants(context, stack.draw.as_ptr(), bytes_of(&block));
+                            (vtbl.vs_set_shader)(context, stack.line_vs.as_ptr(), null(), 0);
+                            (vtbl.ps_set_shader)(context, stack.line_ps.as_ptr(), null(), 0);
+                            (vtbl.om_set_depth_stencil_state)(context, stack.depth_states[depth].as_ptr(), 0);
+                            (vtbl.rs_set_state)(context, stack.rasterizers[scissored].as_ptr());
+                            (vtbl.om_set_blend_state)(context, stack.over.as_ptr(), null(), 0xFFFF_FFFF);
+                            let segment_view = view.as_ptr();
+                            (vtbl.vs_set_shader_resources)(context, 4, 1, &segment_view);
+                            (vtbl.draw_instanced)(context, 6, set.count, 0, 0);
+                        }
                     }
                 }
             }
@@ -1515,6 +1537,21 @@ impl D3dWorld {
         self.encode(std::slice::from_ref(&job));
         let out = self.read_target(job.target);
         job.give_back(self);
+        out
+    }
+
+    /// `before` drawn whole into a target of its own, then `after` over it
+    /// in `rects` alone ([`Redraw::Rects`]), read back as
+    /// [`D3dWorld::draw_single`] reads: what `after` drawn whole gives,
+    /// when the redraw is right. For the parity harness.
+    pub(super) fn draw_over(&mut self, before: &Rc<WorldFrame>, after: &Rc<WorldFrame>, rects: &[[u32; 4]], images: &dyn ImageEngine) -> Option<Vec<u8>> {
+        let under = WorldJob::single(self.door()?, before, images)?;
+        self.encode(std::slice::from_ref(&under));
+        let over = WorldJob::over(self.door()?, &under, after, images, rects.to_vec())?;
+        self.encode(std::slice::from_ref(&over));
+        let out = self.read_target(under.target);
+        over.give_back_over(self);
+        under.give_back(self);
         out
     }
 
@@ -1769,7 +1806,7 @@ impl WorldStack {
                 depth_state(COMPARISON_ALWAYS, false)?,
             ];
 
-            let rasterizer = |cull: u32, counter_clockwise: bool| -> Result<Com<RasterizerState>, String> {
+            let rasterizer = |cull: u32, counter_clockwise: bool, scissor: bool| -> Result<Com<RasterizerState>, String> {
                 let desc = RasterizerDesc {
                     fill_mode: FILL_SOLID,
                     cull_mode: cull,
@@ -1778,7 +1815,7 @@ impl WorldStack {
                     depth_bias_clamp: 0.0,
                     slope_scaled_depth_bias: 0.0,
                     depth_clip_enable: 1,
-                    scissor_enable: 0,
+                    scissor_enable: scissor as i32,
                     multisample_enable: 1,
                     antialiased_line_enable: 0,
                 };
@@ -1791,10 +1828,14 @@ impl WorldStack {
             // the clip space is the frame's, upside up: a front that turns
             // counter-clockwise there is a front here
             let rasterizers = [
-                rasterizer(CULL_NONE, true)?,
-                rasterizer(CULL_NONE, false)?,
-                rasterizer(CULL_BACK, true)?,
-                rasterizer(CULL_BACK, false)?,
+                rasterizer(CULL_NONE, true, false)?,
+                rasterizer(CULL_NONE, false, false)?,
+                rasterizer(CULL_BACK, true, false)?,
+                rasterizer(CULL_BACK, false, false)?,
+                rasterizer(CULL_NONE, true, true)?,
+                rasterizer(CULL_NONE, false, true)?,
+                rasterizer(CULL_BACK, true, true)?,
+                rasterizer(CULL_BACK, false, true)?,
             ];
 
             // over: rgb = s + d·(1−sa), a = sa + da·(1−sa); add: rgb = s + d,
@@ -1955,7 +1996,9 @@ impl WorldStack {
 impl WorldGround for D3dWorld {
     fn world_caps(&self) -> WorldCaps {
         // the adapter's name is not read here: the ask stands
-        WorldCaps { samples: 4, start: bunny_ui::world::Quality::High }
+        // the samples stay in their texture between frames: a part
+        // redraws over them, and the resolve gives back the rest unchanged
+        WorldCaps { samples: 4, start: bunny_ui::world::Quality::High, redraw_samples: 4 }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {
@@ -2188,6 +2231,20 @@ mod tests {
             let s = Spread::of(&ours, &oracle);
             eprintln!("{}: worst {} · >1 {} · >3 {} · >16 {} of {}", scene.name, s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
             assert!(s.within(scene.tolerance), "{} is beyond its tolerance", scene.name);
+        }
+    }
+
+    #[test]
+    fn every_redraw_of_the_catalog_matches_its_whole_picture() {
+        use bunny_ui::gpu::world_scenes::{REDRAWS, world_redraw};
+        let Some(mut gpu) = harness() else { return };
+        for index in 0..REDRAWS {
+            let redraw = world_redraw(index);
+            let over = gpu.world_over_rgba(&redraw.before, &redraw.after, &redraw.rects).expect("the world pass");
+            let whole = gpu.world_rgba(&redraw.after).expect("the world pass");
+            let s = Spread::of(&over, &whole);
+            eprintln!("{} in {:?}: worst {} · >1 {} of {}", redraw.name, redraw.rects, s.worst, s.beyond[0], s.pixels);
+            assert_eq!(s.worst, 0, "{}: the redraw is not the whole picture", redraw.name);
         }
     }
 

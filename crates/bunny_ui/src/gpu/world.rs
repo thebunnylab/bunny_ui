@@ -19,6 +19,12 @@
 //!
 //! A target holds premultiplied, sRGB-encoded RGBA8, its first row at
 //! the top: what the CPU rasterizer writes.
+//!
+//! A target remembers the frame it holds. When the next frame of its box
+//! differs only in what some entities show — a figure that walks, a part
+//! that turns red — the job asks for those rects alone
+//! ([`Redraw::Rects`], from [`crate::world::damage`]), and the tier
+//! clears and draws them over the picture the target keeps.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -39,6 +45,23 @@ pub struct WorldCaps {
     /// ([`crate::world::governor::device_quality`] of its name); `High`
     /// when the tier cannot name it, which leaves the ask alone.
     pub start: Quality,
+    /// The most samples a pixel at which the tier draws only some rects
+    /// of a frame over what its target holds ([`Redraw::Rects`]): 0 when
+    /// it draws every frame whole.
+    pub redraw_samples: u8,
+}
+
+/// What of its target a job draws.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Redraw {
+    /// All of it, from a cleared target.
+    #[default]
+    Whole,
+    /// Only these rects, in pixels `[x, y, width, height]` from the top
+    /// left, each cleared to the backdrop and drawn again with every draw
+    /// that reaches it ([`crate::world::frame::WorldFrame::draw_reaches`]);
+    /// the rest of the target keeps the picture it holds. Never empty.
+    Rects(Vec<[u32; 4]>),
 }
 
 /// The door a tier opens for worlds. Each call moves bytes or mints a
@@ -111,6 +134,8 @@ pub struct WorldJob {
     /// The second map, of what moves, the same way; drawn every frame it
     /// holds something new.
     pub moving_shadow: Option<ShadowJob>,
+    /// What of the target to draw.
+    pub redraw: Redraw,
 }
 
 impl WorldJob {
@@ -121,6 +146,32 @@ impl WorldJob {
     pub fn single(ground: &mut dyn WorldGround, frame: &Rc<WorldFrame>, images: &dyn ImageEngine) -> Option<WorldJob> {
         let samples = frame.samples.clamp(1, ground.world_caps().samples.max(1));
         let target = ground.make_target(frame.size.0, frame.size.1, samples)?;
+        let job = WorldJob::into_target(ground, target, samples, frame, images);
+        if job.is_none() {
+            ground.drop_target(target);
+        }
+        job
+    }
+
+    /// `frame` over the picture `under` drew: into its target, in `rects`
+    /// alone ([`Redraw::Rects`]), with everything else the frame names made
+    /// on `ground`. For a parity harness, which reads the target back and
+    /// gives this job back with [`WorldJob::give_back_over`] before `under`.
+    pub fn over(ground: &mut dyn WorldGround, under: &WorldJob, frame: &Rc<WorldFrame>, images: &dyn ImageEngine, rects: Vec<[u32; 4]>) -> Option<WorldJob> {
+        let mut job = WorldJob::into_target(ground, under.target, under.samples, frame, images)?;
+        job.redraw = Redraw::Rects(rects);
+        Some(job)
+    }
+
+    /// Gives back what [`WorldJob::over`] made: all but the target, which
+    /// is the job's under it.
+    pub fn give_back_over(self, ground: &mut dyn WorldGround) {
+        self.give_back_assets(ground, false);
+    }
+
+    /// Everything a frame names, made on `ground`, drawn whole into
+    /// `target`.
+    fn into_target(ground: &mut dyn WorldGround, target: u64, samples: u8, frame: &Rc<WorldFrame>, images: &dyn ImageEngine) -> Option<WorldJob> {
         let mut meshes = Vec::with_capacity(frame.meshes.len());
         for mesh in &frame.meshes {
             meshes.push(ground.make_mesh(&mesh.vertex_bytes(), &mesh.index_bytes(), &mesh.deform_bytes())?);
@@ -144,12 +195,18 @@ impl WorldJob {
         let moving_shadow = frame.moving_shadow.as_ref().and_then(|shadow| {
             Some(ShadowJob { map: ground.make_shadow_map(shadow.size)?, size: shadow.size, draw: true })
         });
-        Some(WorldJob { target, size: frame.size, samples, frame: Rc::clone(frame), meshes, textures, segments, shadow, moving_shadow })
+        Some(WorldJob { target, size: frame.size, samples, frame: Rc::clone(frame), meshes, textures, segments, shadow, moving_shadow, redraw: Redraw::Whole })
     }
 
     /// Gives back everything [`WorldJob::single`] made.
     pub fn give_back(self, ground: &mut dyn WorldGround) {
-        ground.drop_target(self.target);
+        self.give_back_assets(ground, true);
+    }
+
+    fn give_back_assets(self, ground: &mut dyn WorldGround, target: bool) {
+        if target {
+            ground.drop_target(self.target);
+        }
         for id in self.meshes {
             ground.drop_mesh(id);
         }
@@ -185,6 +242,9 @@ struct Target {
     /// The generation the target holds; `None` on a new target, which
     /// holds nothing yet.
     holds: Option<u64>,
+    /// The frame the target holds, when the tier said it drew it: what
+    /// the next frame is told apart from. `None` while a job is out.
+    held: Option<Rc<WorldFrame>>,
     walk: u64,
 }
 
@@ -218,8 +278,8 @@ pub struct WorldResidency {
     walk: u64,
     /// What this walk's jobs leave in their targets — kept apart until
     /// the tier says it drew them, so a walk the atlas cuts short, or a
-    /// frame that never reached the GPU, draws its worlds again.
-    pending: Vec<(u64, u64)>,
+    /// frame that never reached the GPU, draws its worlds again, whole.
+    pending: Vec<(u64, u64, Rc<WorldFrame>)>,
     /// What this walk's jobs leave in their shadow maps, the same way.
     pending_shadows: Vec<((u64, bool), u64)>,
 }
@@ -236,9 +296,10 @@ impl WorldResidency {
     /// draw. A tier that never says so draws every world on every frame
     /// — slower, never wrong.
     pub fn drawn(&mut self) {
-        for (slot, generation) in self.pending.drain(..) {
+        for (slot, generation, frame) in self.pending.drain(..) {
             if let Some(target) = self.targets.get_mut(&slot) {
                 target.holds = Some(generation);
+                target.held = Some(frame);
             }
         }
         for (slot, generation) in self.pending_shadows.drain(..) {
@@ -300,7 +361,7 @@ impl WorldResidency {
                     ground.drop_target(old.id);
                 }
                 let id = ground.make_target(size.0, size.1, samples)?;
-                self.targets.insert(slot, Target { id, size, samples, holds: None, walk });
+                self.targets.insert(slot, Target { id, size, samples, holds: None, held: None, walk });
                 self.targets.get_mut(&slot).expect("the target just made")
             }
         };
@@ -308,7 +369,27 @@ impl WorldResidency {
         if target.holds == Some(generation) {
             return Some(ResolvedWorld { target: id, size, job: None });
         }
+        // until the tier says it drew the job, nobody knows what the
+        // target holds: the next frame then draws whole
+        let held = target.held.take();
         let frame = shot.frame_at(size, quality);
+        // what of the target to draw: the rects that changed, where the
+        // tier can draw them alone
+        let redraw = match held.as_deref() {
+            Some(held) if samples <= caps.redraw_samples => match crate::world::damage::redraw_rects(held, &frame) {
+                Some(rects) if rects.is_empty() => {
+                    // nothing it shows changed: the target holds it
+                    if let Some(target) = self.targets.get_mut(&slot) {
+                        target.holds = Some(generation);
+                        target.held = Some(frame);
+                    }
+                    return Some(ResolvedWorld { target: id, size, job: None });
+                }
+                Some(rects) => Redraw::Rects(rects),
+                None => Redraw::Whole,
+            },
+            _ => Redraw::Whole,
+        };
         // the world draws: its beat is the governor's measure
         if let Some(governor) = self.governors.get_mut(&slot) {
             governor.drew(shot.time());
@@ -325,7 +406,7 @@ impl WorldResidency {
         // a texture still decoding shows its colour this frame; the
         // target is not marked, so the next walk draws it again
         if textures.iter().all(Option::is_some) {
-            self.pending.push((slot, generation));
+            self.pending.push((slot, generation, Rc::clone(&frame)));
         }
         // a map is drawn again only when what it holds moved: a camera
         // that moves under a still sun reads the map it has
@@ -340,7 +421,7 @@ impl WorldResidency {
         };
         let shadow = held(frame.shadow.as_ref(), false);
         let moving_shadow = held(frame.moving_shadow.as_ref(), true);
-        let job = WorldJob { target: id, size, samples, frame, meshes, textures, segments, shadow, moving_shadow };
+        let job = WorldJob { target: id, size, samples, frame, meshes, textures, segments, shadow, moving_shadow, redraw };
         Some(ResolvedWorld { target: id, size, job: Some(job) })
     }
 
@@ -468,11 +549,12 @@ mod tests {
         refuse: bool,
         samples: u8,
         start: Quality,
+        redraw_samples: u8,
     }
 
     impl Ledger {
         fn new() -> Ledger {
-            Ledger { samples: 4, start: Quality::High, ..Ledger::default() }
+            Ledger { samples: 4, start: Quality::High, redraw_samples: 4, ..Ledger::default() }
         }
 
         fn mint(&mut self, what: &'static str) -> Option<u64> {
@@ -497,7 +579,7 @@ mod tests {
 
     impl WorldGround for Ledger {
         fn world_caps(&self) -> WorldCaps {
-            WorldCaps { samples: self.samples, start: self.start }
+            WorldCaps { samples: self.samples, start: self.start, redraw_samples: self.redraw_samples }
         }
         fn make_target(&mut self, _: u32, _: u32, _: u8) -> Option<u64> {
             self.mint("target")
@@ -545,7 +627,7 @@ mod tests {
 
     #[test]
     fn a_held_picture_makes_no_job() {
-        let (world, _) = cube_world();
+        let (world, cube) = cube_world();
         let (mut ground, mut residency) = (Ledger::new(), WorldResidency::default());
         let images = RawImages::default();
         residency.begin_walk(1);
@@ -558,8 +640,12 @@ mod tests {
         assert!(again.job.is_none(), "the target holds the picture");
         assert_eq!(again.target, first.target);
         residency.begin_walk(3);
-        let moved = residency.resolve(&mut ground, &images, &shot(&world, Quality::Medium), 7, 101, (200, 160)).expect("the target");
-        assert!(moved.job.is_some(), "a new generation draws");
+        let quiet = residency.resolve(&mut ground, &images, &shot(&world, Quality::Medium), 7, 101, (200, 160)).expect("the target");
+        assert!(quiet.job.is_none(), "a new generation that shows the same picture draws nothing");
+        residency.begin_walk(4);
+        cube.set_tint(Color::rgb(30, 60, 200));
+        let moved = residency.resolve(&mut ground, &images, &shot(&world, Quality::Medium), 7, 102, (200, 160)).expect("the target");
+        assert!(moved.job.is_some(), "a new picture draws");
         assert_eq!(moved.target, first.target, "into the same target");
         assert_eq!(Ledger::count(&ground.made, "mesh"), 1, "the mesh went up once");
     }
@@ -689,6 +775,46 @@ mod tests {
         residency.retire(&mut ground);
         assert_eq!(residency.shadow_maps(), 0, "an idle map is given back");
         assert!(!ground.live.iter().any(|id| *id == low.map));
+    }
+
+    #[test]
+    fn a_figure_that_walks_redraws_its_rects_and_a_lost_frame_draws_whole() {
+        let (world, cube) = cube_world();
+        world.add(crate::world::mesh::Mesh::plane(8.0, 8.0), Material::color(Color::rgb(200, 196, 188))).set_position(Vec3 { x: 0.0, y: -0.5, z: 0.0 });
+        let figure = world.add(crate::world::mesh::Mesh::cuboid(0.2, 0.6, 0.2), Material::color(Color::rgb(40, 140, 90)));
+        figure.set_position(Vec3 { x: -1.5, y: -0.2, z: 1.0 }).move_to(Vec3 { x: -0.5, y: -0.2, z: 1.5 }, 1.0);
+        let at = |time: f64| {
+            let style = WorldStyle { quality: Quality::Medium, ..WorldStyle::default() };
+            Shot::new(world.with(WorldData::clone), Camera::orbiting(Vec3::ZERO, 30.0, 25.0, 8.0), style, time, (100.0, 80.0))
+        };
+        let (mut ground, mut residency) = (Ledger::new(), WorldResidency::default());
+        let images = RawImages::default();
+        let mut walk = 0;
+        let mut job_of = |residency: &mut WorldResidency, ground: &mut Ledger, time: f64, generation: u64, drawn: bool| {
+            walk += 1;
+            residency.begin_walk(walk);
+            let job = residency.resolve(ground, &images, &at(time), 7, generation, (200, 160)).expect("a target").job;
+            if drawn {
+                residency.drawn();
+            }
+            job
+        };
+        let first = job_of(&mut residency, &mut ground, 0.1, 1, true).expect("a new target");
+        assert_eq!(first.redraw, Redraw::Whole);
+        let Some(Redraw::Rects(rects)) = job_of(&mut residency, &mut ground, 0.2, 2, true).map(|job| job.redraw) else {
+            panic!("the walk redraws a part");
+        };
+        assert!(!rects.is_empty() && rects.iter().all(|r| r[2] * r[3] < 200 * 160 / 2), "{rects:?}");
+        // a job the tier never said it drew: the next one is whole
+        assert!(matches!(job_of(&mut residency, &mut ground, 0.3, 3, false).map(|job| job.redraw), Some(Redraw::Rects(_))));
+        assert_eq!(job_of(&mut residency, &mut ground, 0.4, 4, true).map(|job| job.redraw), Some(Redraw::Whole));
+        // the walk is over and only the clock moves: no job at all
+        assert!(job_of(&mut residency, &mut ground, 5.0, 5, true).is_some(), "it arrives");
+        assert!(job_of(&mut residency, &mut ground, 6.0, 6, true).is_none(), "nothing seen changed");
+        // a tier that draws every frame whole is never asked for rects
+        cube.set_tint(Color::rgb(10, 10, 200));
+        ground.redraw_samples = 0;
+        assert_eq!(job_of(&mut residency, &mut ground, 6.0, 7, true).map(|job| job.redraw), Some(Redraw::Whole));
     }
 
     #[test]

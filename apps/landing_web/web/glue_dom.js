@@ -1658,7 +1658,7 @@ function bunnyGlStubsOrNothing() {
 
 const GPU_VERBS = [
   "gl_init", "gl_log", "gl_island_blit", "gl_now", "gl_teardown", "gl_resize",
-  "gl_viewport", "gl_clear_color", "gl_clear", "gl_enable", "gl_disable",
+  "gl_viewport", "gl_scissor", "gl_clear_color", "gl_clear", "gl_enable", "gl_disable",
   "gl_blend_func_separate", "gl_pixel_storei", "gl_finish", "gl_flush",
   "gl_compile_shader", "gl_link_program", "gl_bind_attrib_location", "gl_use_program",
   "gl_uniform_location", "gl_uniform_block", "gl_uniform1i", "gl_uniform4f", "gl_last_log",

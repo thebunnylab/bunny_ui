@@ -215,6 +215,7 @@ export function gl_resize(width, height) {
 // MARK: - Fixed state
 
 export function gl_viewport(x, y, width, height) { gl.viewport(x | 0, y | 0, width | 0, height | 0); }
+export function gl_scissor(x, y, width, height) { gl.scissor(x | 0, y | 0, width | 0, height | 0); }
 export function gl_clear_color(r, g, b, a) { gl.clearColor(r, g, b, a); }
 export function gl_clear(mask) { gl.clear(mask >>> 0); }
 export function gl_enable(cap) { gl.enable(cap >>> 0); }
@@ -398,12 +399,12 @@ export function gl_renderbuffer_storage_multisample(renderbuffer, samples, inter
     gl.renderbufferStorage(gl.RENDERBUFFER, internal >>> 0, width | 0, height | 0);
   }
 }
-// the samples resolve: the read framebuffer's colour onto the draw one
-export function gl_blit_framebuffer(width, height) {
+// the samples resolve: a rect of the read framebuffer's colour onto the
+// same rect of the draw one
+export function gl_blit_framebuffer(x, y, width, height) {
   if (!gl) return;
-  gl.blitFramebuffer(
-    0, 0, width | 0, height | 0, 0, 0, width | 0, height | 0, gl.COLOR_BUFFER_BIT, gl.NEAREST,
-  );
+  const [x0, y0, x1, y1] = [x | 0, y | 0, (x + width) | 0, (y + height) | 0];
+  gl.blitFramebuffer(x0, y0, x1, y1, x0, y0, x1, y1, gl.COLOR_BUFFER_BIT, gl.NEAREST);
 }
 // a tiled GPU need not write back what nobody reads
 export function gl_invalidate_framebuffer(target, first, second) {

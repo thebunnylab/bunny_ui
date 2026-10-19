@@ -433,6 +433,62 @@ pub fn world_scene(index: u32) -> WorldScene {
     }
 }
 
+/// How many redraws the catalog holds.
+pub const REDRAWS: u32 = 4;
+
+/// One redraw of the catalog: a frame, the next frame of the same
+/// target, and the rects the second asks for over the first. A tier draws
+/// the first whole and the second in the rects alone, and must give what
+/// it gives for the second drawn whole.
+pub struct WorldRedraw {
+    pub before: Rc<WorldFrame>,
+    pub after: Rc<WorldFrame>,
+    pub rects: Vec<[u32; 4]>,
+    pub name: &'static str,
+}
+
+/// Redraw `index` of the catalog.
+pub fn world_redraw(index: u32) -> WorldRedraw {
+    use crate::world::frame::build_frame;
+    let world = World::new();
+    world.add(Mesh::plane(8.0, 8.0), Material::color(Color::rgb(200, 196, 188))).set_position(vec3(0.0, -0.5, 0.0));
+    let block = world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(222, 120, 60))).set_position(vec3(-1.2, 0.0, -0.6));
+    world.add_light(Light::sun().toward(vec3(1.0, -0.9, 0.6)).with_shadows());
+    let camera = Camera::orbiting(Vec3::ZERO, 20.0, 30.0, 8.0);
+    let at = |style: &WorldStyle, time: f64| Rc::new(world.with(|data| build_frame(data, &camera, style, (200, 150), 1.0, time)));
+    let (name, before, after) = match index {
+        // a figure walks: where it was, where it is, and its shadow in the
+        // map of what moves, at four samples and at one
+        0 | 1 => {
+            world.add(Mesh::cuboid(0.3, 0.9, 0.3), Material::color(Color::rgb(70, 110, 200))).set_position(vec3(-1.0, -0.05, 1.5)).move_to(vec3(2.0, -0.05, 1.5), 1.0);
+            let style = style(if index == 0 { Quality::Medium } else { Quality::Low });
+            let name = if index == 0 { "a figure walks, at four samples" } else { "a figure walks, at one sample" };
+            (name, at(&style, 0.3), at(&style, 0.6))
+        }
+        // a part turns another colour over a sky: the backdrop fills the
+        // rect the clear cannot
+        2 => {
+            let sky = Background::Sky { zenith: Color::rgb(90, 140, 220), horizon: Color::rgb(220, 228, 240), ground: Color::rgb(120, 110, 96) };
+            let style = WorldStyle { background: sky, ..style(Quality::Medium) };
+            let before = at(&style, 0.0);
+            block.set_tint(Color::rgb(60, 160, 220));
+            ("a block turns blue under a sky", before, at(&style, 0.0))
+        }
+        // edges move across the floor at one sample
+        _ => {
+            let square = [vec3(0.0, 0.0, 0.0), vec3(1.0, 0.0, 0.0), vec3(1.0, 0.0, 1.0), vec3(0.0, 0.0, 1.0)];
+            let edges = world.add_lines(crate::world::mesh::Lines::path(&square, true), LineStyle::solid(Color::rgb(30, 30, 30), 2.0));
+            edges.set_position(vec3(0.6, -0.45, 0.4));
+            let style = style(Quality::Low);
+            let before = at(&style, 0.0);
+            edges.set_position(vec3(0.9, -0.45, 0.6));
+            ("a square of edges moves", before, at(&style, 0.0))
+        }
+    };
+    let rects = crate::world::damage::redraw_rects(&before, &after).expect("a part of the picture");
+    WorldRedraw { before, after, rects, name }
+}
+
 /// How two pictures differ: the worst channel, and how many pixels sit
 /// more than one, three and sixteen codes apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -467,6 +523,18 @@ impl Spread {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_redraw_of_the_catalog_is_a_part_and_exact_on_the_oracle() {
+        for index in 0..REDRAWS {
+            let redraw = world_redraw(index);
+            let area: u32 = redraw.rects.iter().map(|r| r[2] * r[3]).sum();
+            assert!(area > 0 && area * 2 < 200 * 150, "{}: {:?}", redraw.name, redraw.rects);
+            let over = crate::world::soft::draw_over_with(&crate::world::soft::draw(&redraw.before), &redraw.after, &redraw.rects, &|_| None);
+            assert!(over.rgba == crate::world::soft::draw(&redraw.after).rgba, "{} is not the whole", redraw.name);
+        }
+        assert!(world_redraw(0).after.samples == 4 && world_redraw(1).after.samples == 1);
+    }
 
     #[test]
     fn every_world_of_the_catalog_draws_on_the_cpu() {

@@ -32,7 +32,7 @@ use std::ptr::null_mut;
 use std::rc::Rc;
 
 use bunny_ui::gpu::walk::FrameBatches;
-use bunny_ui::gpu::world::{WorldCaps, WorldGround, WorldJob};
+use bunny_ui::gpu::world::{Redraw, WorldCaps, WorldGround, WorldJob};
 use bunny_ui::world::bloom::LEVELS;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, WorldFrame};
 use bunny_ui::world::shade::SRGB_DECODE;
@@ -57,6 +57,18 @@ unsafe extern "C" {
     fn msg_void_draw_indexed(obj: Id, sel: Sel, primitive: u64, count: u64, kind: u64, buffer: Id, offset: u64, instances: u64);
     #[link_name = "objc_msgSend"]
     fn msg_bool_u64(obj: Id, sel: Sel, a: u64) -> i8;
+    // `setScissorRect:` — four `NSUInteger`s, wider than two registers:
+    // the struct travels by reference, as the C ABI says
+    #[link_name = "objc_msgSend"]
+    fn msg_void_scissor(obj: Id, sel: Sel, rect: MTLScissorRect);
+}
+
+#[repr(C)]
+struct MTLScissorRect {
+    x: u64,
+    y: u64,
+    width: u64,
+    height: u64,
 }
 
 // MARK: - Metal vocabulary of the world pass
@@ -1100,6 +1112,7 @@ struct Selectors {
     set_winding: Sel,
     set_fragment_sampler: Sel,
     draw_indexed: Sel,
+    set_scissor: Sel,
 }
 
 struct WorldStack {
@@ -1323,8 +1336,19 @@ impl MetalWorld {
                 .and_then(|index| job.textures.get(index as usize).copied().flatten())
                 .and_then(|id| self.textures.get(&id).copied())
                 .unwrap_or(stack.dark);
+            // a part of the target, at one sample: four memoryless samples
+            // would resolve the rest away
+            let rects = match &job.redraw {
+                Redraw::Rects(rects) if samples == 1 => Some(rects.clone()),
+                _ => None,
+            };
             let mut draws = Vec::with_capacity(job.frame.draws.len());
+            let mut reaches = Vec::with_capacity(job.frame.draws.len());
             for draw in &job.frame.draws {
+                let reach = rects.as_ref().map_or(1, |rects| {
+                    rects.iter().enumerate().filter(|(_, rect)| job.frame.draw_reaches(draw, **rect)).fold(0u8, |bits, (k, _)| bits | 1 << k)
+                });
+                let before = draws.len();
                 match draw.kind {
                     DrawKind::Mesh { mesh, first_index, index_count, texture, cull_back, mirrored, blend, mask } => {
                         let Some(buffers) = job.meshes.get(mesh as usize).and_then(|id| self.meshes.get(id)) else { continue };
@@ -1409,6 +1433,9 @@ impl MetalWorld {
                         });
                     }
                 }
+                if draws.len() > before {
+                    reaches.push(reach);
+                }
             }
             let (clear, backdrop) = match job.frame.background {
                 Background::Transparent => (MTLClearColor { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 }, None),
@@ -1423,6 +1450,15 @@ impl MetalWorld {
                     (MTLClearColor { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 }, backdrop)
                 }
             };
+            // a rect is filled by the backdrop, where a clear would take
+            // the whole target
+            let backdrop = match (backdrop, &rects) {
+                (None, Some(_)) => {
+                    let pipeline = unsafe { stack.pipeline(self.device, Pipe::Backdrop, samples, glow) };
+                    (!pipeline.is_null()).then(|| (pipeline, BackdropBlock { rows: job.frame.fill() }))
+                }
+                (backdrop, _) => backdrop,
+            };
             jobs.push(PreparedJob {
                 resolve: target.resolve,
                 color: target.color,
@@ -1436,6 +1472,8 @@ impl MetalWorld {
                 parts,
                 joints,
                 draws,
+                rects,
+                reaches,
                 sampler: stack.sampler,
                 shadow,
                 shadow_pipeline: stack.shadow,
@@ -1565,6 +1603,7 @@ impl WorldStack {
                     set_clear_depth: sel("setClearDepth:"),
                     set_depth_state: sel("setDepthStencilState:"),
                     set_cull_mode: sel("setCullMode:"),
+                    set_scissor: sel("setScissorRect:"),
                     set_winding: sel("setFrontFacingWinding:"),
                     set_fragment_sampler: sel("setFragmentSamplerState:atIndex:"),
                     draw_indexed: sel("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:"),
@@ -1798,7 +1837,9 @@ unsafe fn attachment(device: Id, format: u64, size: (u32, u32), samples: u8, sto
 
 impl WorldGround for MetalWorld {
     fn world_caps(&self) -> WorldCaps {
-        WorldCaps { samples: 4, start: self.start }
+        // four memoryless samples resolve into the whole target: a part
+        // is redrawn at one sample alone
+        WorldCaps { samples: 4, start: self.start, redraw_samples: 1 }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {
@@ -2045,6 +2086,11 @@ struct PreparedJob {
     parts: u64,
     joints: u64,
     draws: Vec<PreparedDraw>,
+    /// The rects to draw, the rest of the target kept: `None` draws all
+    /// of it.
+    rects: Option<Vec<[u32; 4]>>,
+    /// For each draw, the rects it reaches, a bit each.
+    reaches: Vec<u8>,
     sampler: Id,
     /// The casters to draw into the box's map first, when it does not
     /// hold them.
@@ -2151,7 +2197,8 @@ impl FramePass {
                     msg_void_id(attachment, world.set_resolve_texture, job.resolve);
                     msg_void_u64(attachment, sels.set_store_action, STORE_ACTION_MULTISAMPLE_RESOLVE);
                 }
-                msg_void_u64(attachment, sels.set_load_action, LOAD_ACTION_CLEAR);
+                // a part keeps the rest of what the target holds
+                msg_void_u64(attachment, sels.set_load_action, if job.rects.is_some() { LOAD_ACTION_LOAD } else { LOAD_ACTION_CLEAR });
                 msg_void_clear_color(
                     attachment,
                     sels.set_clear_color,
@@ -2181,62 +2228,76 @@ impl FramePass {
                 let length = job.uniforms.len() as u64;
                 msg_void_ptr_u64_u64(encoder, sels.set_vertex_bytes, uniforms, length, 2);
                 msg_void_ptr_u64_u64(encoder, sels.set_fragment_bytes, uniforms, length, 2);
-                if let Some((pipeline, ramp)) = &job.backdrop {
-                    msg_void_id(encoder, sels.set_pipeline, *pipeline);
-                    msg_void_id(encoder, world.set_depth_state, job.backdrop_depth);
-                    msg_void_ptr_u64_u64(encoder, sels.set_fragment_bytes, (ramp as *const BackdropBlock).cast(), std::mem::size_of::<BackdropBlock>() as u64, 0);
-                    msg_void_u64x3(encoder, sels.draw_plain, PRIMITIVE_TRIANGLE, 0, 3);
-                }
-                if !staging.is_null() {
-                    msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, job.instances, 1);
-                    msg_void_id_u64_u64(encoder, sels.set_fragment_buffer, staging, job.instances, 1);
-                    msg_void_id_u64_u64(encoder, sels.set_fragment_buffer, staging, job.materials, 0);
-                    msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, job.parts, 5);
-                    msg_void_id_u64_u64(encoder, sels.set_fragment_buffer, staging, job.parts, 5);
-                    msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, job.joints, 7);
-                }
                 msg_void_id_u64(encoder, world.set_fragment_sampler, job.sampler, 0);
                 msg_void_id_u64(encoder, sels.set_fragment_texture, job.shadow_map, 1);
                 msg_void_id_u64(encoder, world.set_fragment_sampler, job.shadow_sampler, 1);
                 msg_void_id_u64(encoder, sels.set_fragment_texture, job.moving_map, 3);
                 msg_void_id_u64(encoder, world.set_fragment_sampler, job.moving_sampler, 2);
                 msg_void_id_u64(encoder, sels.set_fragment_texture, job.floor_map, 2);
-                for draw in &job.draws {
-                    match draw {
-                        PreparedDraw::Mesh { pipeline, depth, cull, winding, vertices, indices, deform, first_index, index_count, instance_count, texture, block } => {
-                            msg_void_id(encoder, sels.set_pipeline, *pipeline);
-                            msg_void_id(encoder, world.set_depth_state, *depth);
-                            msg_void_u64(encoder, world.set_cull_mode, *cull);
-                            msg_void_u64(encoder, world.set_winding, *winding);
-                            msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, *vertices, 0, 0);
-                            msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, *deform, 0, 6);
-                            let block = (block as *const DrawBlock).cast();
-                            msg_void_ptr_u64_u64(encoder, sels.set_vertex_bytes, block, DRAW_BLOCK, 3);
-                            msg_void_ptr_u64_u64(encoder, sels.set_fragment_bytes, block, DRAW_BLOCK, 3);
-                            msg_void_id_u64(encoder, sels.set_fragment_texture, *texture, 0);
-                            msg_void_draw_indexed(
-                                encoder,
-                                world.draw_indexed,
-                                PRIMITIVE_TRIANGLE,
-                                *index_count as u64,
-                                INDEX_UINT32,
-                                *indices,
-                                *first_index as u64 * 4,
-                                *instance_count as u64,
-                            );
+                // all of the target, or each rect the job asks for, the
+                // scissor holding the backdrop and the draws inside it
+                let whole = [[0, 0, 0, 0]];
+                let rects = job.rects.as_deref().unwrap_or(&whole);
+                for (k, rect) in rects.iter().enumerate() {
+                    if job.rects.is_some() {
+                        let scissor = MTLScissorRect { x: rect[0] as u64, y: rect[1] as u64, width: rect[2] as u64, height: rect[3] as u64 };
+                        msg_void_scissor(encoder, world.set_scissor, scissor);
+                    }
+                    if let Some((pipeline, ramp)) = &job.backdrop {
+                        msg_void_id(encoder, sels.set_pipeline, *pipeline);
+                        msg_void_id(encoder, world.set_depth_state, job.backdrop_depth);
+                        msg_void_ptr_u64_u64(encoder, sels.set_fragment_bytes, (ramp as *const BackdropBlock).cast(), std::mem::size_of::<BackdropBlock>() as u64, 0);
+                        msg_void_u64x3(encoder, sels.draw_plain, PRIMITIVE_TRIANGLE, 0, 3);
+                    }
+                    // after the backdrop, whose ramp takes the materials' slot
+                    if !staging.is_null() {
+                        msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, job.instances, 1);
+                        msg_void_id_u64_u64(encoder, sels.set_fragment_buffer, staging, job.instances, 1);
+                        msg_void_id_u64_u64(encoder, sels.set_fragment_buffer, staging, job.materials, 0);
+                        msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, job.parts, 5);
+                        msg_void_id_u64_u64(encoder, sels.set_fragment_buffer, staging, job.parts, 5);
+                        msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, job.joints, 7);
+                    }
+                    for (draw, reach) in job.draws.iter().zip(&job.reaches) {
+                        if reach >> k & 1 == 0 {
+                            continue;
                         }
-                        PreparedDraw::Lines { pipeline, depth, segments, count, style, block } => {
-                            msg_void_id(encoder, sels.set_pipeline, *pipeline);
-                            msg_void_id(encoder, world.set_depth_state, *depth);
-                            msg_void_u64(encoder, world.set_cull_mode, CULL_NONE);
-                            msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, *segments, 0, 0);
-                            let block = (block as *const DrawBlock).cast();
-                            msg_void_ptr_u64_u64(encoder, sels.set_vertex_bytes, block, DRAW_BLOCK, 3);
-                            msg_void_ptr_u64_u64(encoder, sels.set_fragment_bytes, block, DRAW_BLOCK, 3);
-                            let style = style.as_ptr() as *const c_void;
-                            msg_void_ptr_u64_u64(encoder, sels.set_vertex_bytes, style, 32, 4);
-                            msg_void_ptr_u64_u64(encoder, sels.set_fragment_bytes, style, 32, 4);
-                            msg_void_u64x5(encoder, sels.draw, PRIMITIVE_TRIANGLE, 0, 6, *count as u64, 0);
+                        match draw {
+                            PreparedDraw::Mesh { pipeline, depth, cull, winding, vertices, indices, deform, first_index, index_count, instance_count, texture, block } => {
+                                msg_void_id(encoder, sels.set_pipeline, *pipeline);
+                                msg_void_id(encoder, world.set_depth_state, *depth);
+                                msg_void_u64(encoder, world.set_cull_mode, *cull);
+                                msg_void_u64(encoder, world.set_winding, *winding);
+                                msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, *vertices, 0, 0);
+                                msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, *deform, 0, 6);
+                                let block = (block as *const DrawBlock).cast();
+                                msg_void_ptr_u64_u64(encoder, sels.set_vertex_bytes, block, DRAW_BLOCK, 3);
+                                msg_void_ptr_u64_u64(encoder, sels.set_fragment_bytes, block, DRAW_BLOCK, 3);
+                                msg_void_id_u64(encoder, sels.set_fragment_texture, *texture, 0);
+                                msg_void_draw_indexed(
+                                    encoder,
+                                    world.draw_indexed,
+                                    PRIMITIVE_TRIANGLE,
+                                    *index_count as u64,
+                                    INDEX_UINT32,
+                                    *indices,
+                                    *first_index as u64 * 4,
+                                    *instance_count as u64,
+                                );
+                            }
+                            PreparedDraw::Lines { pipeline, depth, segments, count, style, block } => {
+                                msg_void_id(encoder, sels.set_pipeline, *pipeline);
+                                msg_void_id(encoder, world.set_depth_state, *depth);
+                                msg_void_u64(encoder, world.set_cull_mode, CULL_NONE);
+                                msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, *segments, 0, 0);
+                                let block = (block as *const DrawBlock).cast();
+                                msg_void_ptr_u64_u64(encoder, sels.set_vertex_bytes, block, DRAW_BLOCK, 3);
+                                msg_void_ptr_u64_u64(encoder, sels.set_fragment_bytes, block, DRAW_BLOCK, 3);
+                                let style = style.as_ptr() as *const c_void;
+                                msg_void_ptr_u64_u64(encoder, sels.set_vertex_bytes, style, 32, 4);
+                                msg_void_ptr_u64_u64(encoder, sels.set_fragment_bytes, style, 32, 4);
+                                msg_void_u64x5(encoder, sels.draw, PRIMITIVE_TRIANGLE, 0, 6, *count as u64, 0);
+                            }
                         }
                     }
                 }
@@ -2378,6 +2439,17 @@ pub(super) fn single_job(world: &mut MetalWorld, frame: &Rc<WorldFrame>, images:
     WorldJob::single(world.door()?, frame, images)
 }
 
+/// `frame` over what `under` drew, in `rects` alone, for the harness.
+pub(super) fn over_job(
+    world: &mut MetalWorld,
+    under: &WorldJob,
+    frame: &Rc<WorldFrame>,
+    images: &dyn bunny_ui::image_engine::ImageEngine,
+    rects: Vec<[u32; 4]>,
+) -> Option<WorldJob> {
+    WorldJob::over(world.door()?, under, frame, images, rects)
+}
+
 /// The resolved picture of a harness target, row by row.
 pub(super) fn read_target(world: &MetalWorld, id: u64, sels: &Sels) -> Option<Vec<u8>> {
     let target = world.targets.get(&id)?;
@@ -2481,6 +2553,23 @@ mod tests {
             let s = Spread::of(&ours, &oracle);
             eprintln!("{}: worst {} · >1 {} · >3 {} · >16 {} of {}", scene.name, s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
             assert!(s.within(scene.tolerance), "{} is beyond its tolerance", scene.name);
+        }
+    }
+
+    /// Every redraw of the shared catalog: the second frame over the first
+    /// in its rects alone is the second drawn whole — at one sample; at
+    /// four the pass draws whole.
+    #[test]
+    fn every_redraw_of_the_catalog_matches_its_whole_picture() {
+        use bunny_ui::gpu::world_scenes::{REDRAWS, Spread, world_redraw};
+        let Some(mut gpu) = harness() else { return };
+        for index in 0..REDRAWS {
+            let redraw = world_redraw(index);
+            let over = gpu.world_over_rgba(&redraw.before, &redraw.after, &redraw.rects).expect("the world pass");
+            let whole = gpu.world_rgba(&redraw.after).expect("the world pass");
+            let s = Spread::of(&over, &whole);
+            eprintln!("{} in {:?}: worst {} · >1 {} of {}", redraw.name, redraw.rects, s.worst, s.beyond[0], s.pixels);
+            assert_eq!(s.worst, 0, "{}: the redraw is not the whole picture", redraw.name);
         }
     }
 

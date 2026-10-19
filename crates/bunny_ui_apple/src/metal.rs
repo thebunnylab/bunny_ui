@@ -3676,6 +3676,46 @@ impl OffscreenGpu {
     pub fn world_rgba_with(&mut self, frame: &Rc<bunny_ui::world::WorldFrame>, images: &dyn ImageEngine) -> Option<Vec<u8>> {
         unsafe {
             let pool = objc_autoreleasePoolPush();
+            let job = self.run_world_job(|world| world::single_job(world, frame, images));
+            let bytes = job.as_ref().and_then(|job| world::read_target(&self.ground.world, job.target, &self.stack.sels));
+            if let Some(job) = job {
+                job.give_back(&mut self.ground.world);
+            }
+            objc_autoreleasePoolPop(pool);
+            bytes
+        }
+    }
+
+    /// `before` drawn whole, then `after` over it in `rects` alone
+    /// ([`bunny_ui::gpu::world::Redraw::Rects`]), read back: what `after`
+    /// drawn whole gives, when the redraw is right.
+    pub fn world_over_rgba(
+        &mut self,
+        before: &Rc<bunny_ui::world::WorldFrame>,
+        after: &Rc<bunny_ui::world::WorldFrame>,
+        rects: &[[u32; 4]],
+    ) -> Option<Vec<u8>> {
+        let images = bunny_ui::image_engine::RawImages::default();
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let under = self.run_world_job(|world| world::single_job(world, before, &images));
+            let over = under.as_ref().and_then(|under| self.run_world_job(|world| world::over_job(world, under, after, &images, rects.to_vec())));
+            let bytes = over.as_ref().and_then(|over| world::read_target(&self.ground.world, over.target, &self.stack.sels));
+            if let Some(over) = over {
+                over.give_back_over(&mut self.ground.world);
+            }
+            if let Some(under) = under {
+                under.give_back(&mut self.ground.world);
+            }
+            objc_autoreleasePoolPop(pool);
+            bytes
+        }
+    }
+
+    /// One world job, made by `make` in a slot of its own, drawn and waited
+    /// for.
+    unsafe fn run_world_job(&mut self, make: impl FnOnce(&mut world::MetalWorld) -> Option<bunny_ui::gpu::world::WorldJob>) -> Option<bunny_ui::gpu::world::WorldJob> {
+        unsafe {
             poll_uploads(&mut self.slots, &mut self.atlas, &self.stack.sels);
             let index = acquire_slot(
                 &mut self.slots,
@@ -3685,10 +3725,7 @@ impl OffscreenGpu {
             )
             .index;
             self.ground.begin_slot(index, &mut self.atlas);
-            let Some(job) = world::single_job(&mut self.ground.world, frame, images) else {
-                objc_autoreleasePoolPop(pool);
-                return None;
-            };
+            let job = make(&mut self.ground.world)?;
             let mut batches = FrameBatches::default();
             batches.worlds.push(job.clone());
             let pass = self.ground.prepare_worlds(&batches);
@@ -3696,10 +3733,7 @@ impl OffscreenGpu {
             pass.encode(command, &self.stack.sels, self.stack.pass_class, self.ground.staging_buffer());
             msg_void(command, self.stack.sels.commit);
             msg_void(command, self.stack.sels.wait_completed);
-            let bytes = world::read_target(&self.ground.world, job.target, &self.stack.sels);
-            job.give_back(&mut self.ground.world);
-            objc_autoreleasePoolPop(pool);
-            bytes
+            Some(job)
         }
     }
 

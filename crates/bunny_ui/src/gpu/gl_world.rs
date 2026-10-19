@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::world::{WorldCaps, WorldGround, WorldJob};
+use super::world::{Redraw, WorldCaps, WorldGround, WorldJob};
 use super::world_shaders as source;
 use crate::image_engine::ImageEngine;
 use crate::world::frame::{Background, Blend, DrawKind, ShadowFrame, WorldFrame};
@@ -93,6 +93,7 @@ pub mod gl {
     pub const DEPTH_ATTACHMENT: u32 = 0x8D00;
     pub const FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
     pub const DEPTH_TEST: u32 = 0x0B71;
+    pub const SCISSOR_TEST: u32 = 0x0C11;
     pub const BLEND: u32 = 0x0BE2;
     pub const CULL_FACE: u32 = 0x0B44;
     pub const SAMPLE_ALPHA_TO_COVERAGE: u32 = 0x809E;
@@ -165,7 +166,10 @@ pub trait GlFamily {
     fn renderbuffer_storage(&mut self, renderbuffer: u32, samples: i32, internal: u32, width: i32, height: i32);
     /// The colour of the read framebuffer onto the draw framebuffer, the
     /// same rectangle on both: how multisamples resolve.
-    fn blit_color(&mut self, width: i32, height: i32);
+    fn blit_color(&mut self, rect: [i32; 4]);
+    /// The box the scissor test keeps, `[x, y, width, height]` in the
+    /// framebuffer's pixels.
+    fn scissor(&mut self, rect: [i32; 4]);
     /// The attachments' contents are no longer needed: a tiled GPU need
     /// not write them back. Up to two; 0 is none.
     fn invalidate_framebuffer(&mut self, target: u32, first: u32, second: u32);
@@ -663,12 +667,13 @@ impl<G: GlFamily> GlWorld<G> {
         gl.active_texture(gl::TEXTURE1);
         gl.bind_texture(programs.blank);
 
-        // the target, cleared to the backdrop, and its glow to none
+        // the target, cleared to the backdrop, and its glow to none: all of
+        // it, or each rect the frame asks for, the rest kept — the scissor
+        // holds the clear and the draws inside the rect
         gl.bind_framebuffer(gl::FRAMEBUFFER, if target.multisample != 0 { target.multisample } else { target.resolve });
         gl.draw_buffers(if bloom.is_some() { 2 } else { 1 });
         gl.viewport(width, height);
         gl.enable(gl::DEPTH_TEST);
-        gl.depth_mask(true);
         gl.disable(gl::BLEND);
         gl.disable(gl::CULL_FACE);
         let clear = match frame.background {
@@ -678,114 +683,137 @@ impl<G: GlFamily> GlWorld<G> {
             }
             Background::Transparent | Background::Gradient { .. } | Background::Sky { .. } => [0.0; 4],
         };
-        gl.clear(clear, 1.0);
-        if bloom.is_some() {
-            gl.clear_color_buffer(1, [0.0; 4]);
+        let (rects, partial) = match &job.redraw {
+            Redraw::Whole => (vec![[0, 0, width as u32, height as u32]], false),
+            Redraw::Rects(rects) => (rects.clone(), true),
+        };
+        if partial {
+            gl.enable(gl::SCISSOR_TEST);
         }
-        if let Some(ramp) = frame.backdrop() {
-            gl.use_program(programs.backdrop.handle);
-            gl.uniform4fv(programs.backdrop.ramp, &ramp);
-            gl.depth_func(gl::ALWAYS);
-            gl.depth_mask(false);
-            gl.bind_vertex_array(programs.empty);
-            gl.draw_arrays(gl::TRIANGLES, 0, 3);
-        }
-
         let (near, far) = (frame.near as f32, frame.far as f32);
-        for draw in &frame.draws {
-            match draw.kind {
-                DrawKind::Mesh { mesh, first_index, index_count, texture, cull_back, mirrored, blend, mask } => {
-                    let Some(objects) = job.meshes.get(mesh as usize).and_then(|id| self.meshes.get(id)) else { continue };
-                    let surface = texture
-                        .and_then(|index| job.textures.get(index as usize).copied().flatten())
-                        .and_then(|id| self.textures.get(&id).copied());
-                    let replace = blend == Blend::Replace;
-                    let bias = if replace { frame.face_bias } else { 0.0 };
-                    let program = if bias > 0.0 { programs.stepped } else { programs.mesh };
-                    let mut flags = 0u32;
-                    if mask {
-                        flags |= 1;
-                    }
-                    // with four samples a cut-out's edge becomes coverage
-                    let coverage = mask && target.multisample != 0;
-                    if coverage {
-                        flags |= 8;
-                    }
-                    if surface.is_some() {
-                        flags |= 2;
-                    }
-                    if replace {
-                        flags |= 4;
-                    }
-                    // how the mesh lays out its morphs and its skin
-                    flags |= frame.meshes.get(mesh as usize).map_or(0, |mesh| mesh.deform_flags());
-                    let gl = &mut self.gl;
-                    gl.use_program(program.handle);
-                    gl.uniform4fv(program.draw, &[[flags as f32, near, far, bias]]);
-                    set_blend(gl, blend);
-                    if coverage {
-                        gl.enable(gl::SAMPLE_ALPHA_TO_COVERAGE);
-                    } else {
-                        gl.disable(gl::SAMPLE_ALPHA_TO_COVERAGE);
-                    }
-                    gl.depth_func(gl::LESS);
-                    gl.depth_mask(replace);
-                    if cull_back {
-                        gl.enable(gl::CULL_FACE);
-                        gl.cull_face(gl::BACK);
-                    } else {
-                        gl.disable(gl::CULL_FACE);
-                    }
-                    // the picture is upside down in clip space: a front that
-                    // turns counter-clockwise turns clockwise on the target
-                    gl.front_face(if mirrored { gl::CCW } else { gl::CW });
-                    gl.active_texture(gl::TEXTURE1);
-                    gl.bind_texture(surface.unwrap_or(programs.blank));
-                    gl.active_texture(gl::TEXTURE6);
-                    gl.bind_texture(if objects.deform != 0 { objects.deform } else { programs.no_deform });
-                    gl.bind_vertex_array(objects.array);
-                    gl.bind_buffer(gl::ARRAY_BUFFER, programs.instances);
-                    point_instances(gl, draw.first_instance as usize * crate::world::wire::instance_offset::SIZE);
-                    gl.draw_elements_instanced(gl::TRIANGLES, index_count as i32, gl::UNSIGNED_INT, first_index as usize * 4, draw.instance_count as i32);
+        for &rect in &rects {
+            let gl = &mut self.gl;
+            if partial {
+                gl.scissor(rect.map(|value| value as i32));
+            }
+            gl.depth_mask(true);
+            gl.clear(clear, 1.0);
+            if bloom.is_some() {
+                gl.clear_color_buffer(1, [0.0; 4]);
+            }
+            if let Some(ramp) = frame.backdrop() {
+                gl.use_program(programs.backdrop.handle);
+                gl.uniform4fv(programs.backdrop.ramp, &ramp);
+                gl.depth_func(gl::ALWAYS);
+                gl.depth_mask(false);
+                gl.bind_vertex_array(programs.empty);
+                gl.draw_arrays(gl::TRIANGLES, 0, 3);
+            }
+
+            for draw in &frame.draws {
+                if partial && !frame.draw_reaches(draw, rect) {
+                    continue;
                 }
-                DrawKind::Lines { lines, style } => {
-                    let Some(objects) = job.segments.get(lines as usize).and_then(|id| self.segments.get(id)) else { continue };
-                    let (Some(style), Some(instance)) = (frame.line_styles.get(style as usize), frame.instances.get(draw.first_instance as usize)) else {
-                        continue;
-                    };
-                    if objects.count == 0 {
-                        continue;
+                match draw.kind {
+                    DrawKind::Mesh { mesh, first_index, index_count, texture, cull_back, mirrored, blend, mask } => {
+                        let Some(objects) = job.meshes.get(mesh as usize).and_then(|id| self.meshes.get(id)) else { continue };
+                        let surface = texture
+                            .and_then(|index| job.textures.get(index as usize).copied().flatten())
+                            .and_then(|id| self.textures.get(&id).copied());
+                        let replace = blend == Blend::Replace;
+                        let bias = if replace { frame.face_bias } else { 0.0 };
+                        let program = if bias > 0.0 { programs.stepped } else { programs.mesh };
+                        let mut flags = 0u32;
+                        if mask {
+                            flags |= 1;
+                        }
+                        // with four samples a cut-out's edge becomes coverage
+                        let coverage = mask && target.multisample != 0;
+                        if coverage {
+                            flags |= 8;
+                        }
+                        if surface.is_some() {
+                            flags |= 2;
+                        }
+                        if replace {
+                            flags |= 4;
+                        }
+                        // how the mesh lays out its morphs and its skin
+                        flags |= frame.meshes.get(mesh as usize).map_or(0, |mesh| mesh.deform_flags());
+                        let gl = &mut self.gl;
+                        gl.use_program(program.handle);
+                        gl.uniform4fv(program.draw, &[[flags as f32, near, far, bias]]);
+                        set_blend(gl, blend);
+                        if coverage {
+                            gl.enable(gl::SAMPLE_ALPHA_TO_COVERAGE);
+                        } else {
+                            gl.disable(gl::SAMPLE_ALPHA_TO_COVERAGE);
+                        }
+                        gl.depth_func(gl::LESS);
+                        gl.depth_mask(replace);
+                        if cull_back {
+                            gl.enable(gl::CULL_FACE);
+                            gl.cull_face(gl::BACK);
+                        } else {
+                            gl.disable(gl::CULL_FACE);
+                        }
+                        // the picture is upside down in clip space: a front that
+                        // turns counter-clockwise turns clockwise on the target
+                        gl.front_face(if mirrored { gl::CCW } else { gl::CW });
+                        gl.active_texture(gl::TEXTURE1);
+                        gl.bind_texture(surface.unwrap_or(programs.blank));
+                        gl.active_texture(gl::TEXTURE6);
+                        gl.bind_texture(if objects.deform != 0 { objects.deform } else { programs.no_deform });
+                        gl.bind_vertex_array(objects.array);
+                        gl.bind_buffer(gl::ARRAY_BUFFER, programs.instances);
+                        point_instances(gl, draw.first_instance as usize * crate::world::wire::instance_offset::SIZE);
+                        gl.draw_elements_instanced(gl::TRIANGLES, index_count as i32, gl::UNSIGNED_INT, first_index as usize * 4, draw.instance_count as i32);
                     }
-                    let gl = &mut self.gl;
-                    gl.use_program(programs.lines.handle);
-                    gl.uniform4fv(programs.lines.draw, &[[0.0, near, far, 0.0]]);
-                    gl.uniform4fv(programs.lines.rows, &instance.eye_from_model);
-                    gl.uniform4fv(programs.lines.style, &[style.color, style.shape]);
-                    set_blend(gl, Blend::Alpha);
-                    gl.depth_func(match style.shape[3] as u32 {
-                        0 => gl::LEQUAL,
-                        1 => gl::GREATER,
-                        _ => gl::ALWAYS,
-                    });
-                    gl.depth_mask(false);
-                    gl.disable(gl::CULL_FACE);
-                    gl.bind_vertex_array(objects.array);
-                    gl.draw_arrays_instanced(gl::TRIANGLES, 0, 6, objects.count as i32);
+                    DrawKind::Lines { lines, style } => {
+                        let Some(objects) = job.segments.get(lines as usize).and_then(|id| self.segments.get(id)) else { continue };
+                        let (Some(style), Some(instance)) = (frame.line_styles.get(style as usize), frame.instances.get(draw.first_instance as usize)) else {
+                            continue;
+                        };
+                        if objects.count == 0 {
+                            continue;
+                        }
+                        let gl = &mut self.gl;
+                        gl.use_program(programs.lines.handle);
+                        gl.uniform4fv(programs.lines.draw, &[[0.0, near, far, 0.0]]);
+                        gl.uniform4fv(programs.lines.rows, &instance.eye_from_model);
+                        gl.uniform4fv(programs.lines.style, &[style.color, style.shape]);
+                        set_blend(gl, Blend::Alpha);
+                        gl.depth_func(match style.shape[3] as u32 {
+                            0 => gl::LEQUAL,
+                            1 => gl::GREATER,
+                            _ => gl::ALWAYS,
+                        });
+                        gl.depth_mask(false);
+                        gl.disable(gl::CULL_FACE);
+                        gl.bind_vertex_array(objects.array);
+                        gl.draw_arrays_instanced(gl::TRIANGLES, 0, 6, objects.count as i32);
+                    }
                 }
             }
         }
 
-        // the samples into the texture, and nothing written back that
-        // nobody reads
+        // the samples into the texture — the rects alone, with the
+        // scissor off, which a blit would heed — and nothing written back
+        // that nobody reads
         let gl = &mut self.gl;
+        if partial {
+            gl.disable(gl::SCISSOR_TEST);
+        }
         if target.multisample != 0 {
             gl.bind_framebuffer(gl::READ_FRAMEBUFFER, target.multisample);
             gl.bind_framebuffer(gl::DRAW_FRAMEBUFFER, target.resolve);
-            gl.blit_color(width, height);
+            for &rect in &rects {
+                gl.blit_color(rect.map(|value| value as i32));
+            }
             if let Some(bloom) = bloom {
                 gl.read_buffer(gl::COLOR_ATTACHMENT1);
                 gl.bind_framebuffer(gl::DRAW_FRAMEBUFFER, bloom.glow_framebuffer);
-                gl.blit_color(width, height);
+                gl.blit_color([0, 0, width, height]);
                 gl.read_buffer(gl::COLOR_ATTACHMENT0);
                 gl.invalidate_framebuffer(gl::READ_FRAMEBUFFER, gl::COLOR_ATTACHMENT1, 0);
             }
@@ -926,6 +954,25 @@ impl<G: GlFamily> GlWorld<G> {
         job.give_back(self);
         Some(out)
     }
+
+    /// `before` drawn whole into a target of its own, then `after` over it
+    /// in `rects` alone ([`super::world::Redraw::Rects`]), read back as
+    /// [`GlWorld::draw_single`] reads: what `after` drawn whole gives,
+    /// when the redraw is right. For the parity harness.
+    pub fn draw_over(&mut self, before: &Rc<WorldFrame>, after: &Rc<WorldFrame>, rects: &[[u32; 4]], images: &dyn ImageEngine) -> Option<Vec<u8>> {
+        let under = WorldJob::single(self.door()?, before, images)?;
+        self.encode(std::slice::from_ref(&under));
+        let over = WorldJob::over(self.door()?, &under, after, images, rects.to_vec())?;
+        self.encode(std::slice::from_ref(&over));
+        let resolve = self.targets.get(&under.target)?.resolve;
+        let mut out = vec![0u8; after.size.0 as usize * after.size.1 as usize * 4];
+        self.gl.bind_framebuffer(gl::FRAMEBUFFER, resolve);
+        self.gl.read_pixels(after.size.0 as i32, after.size.1 as i32, &mut out);
+        self.gl.bind_framebuffer(gl::FRAMEBUFFER, 0);
+        over.give_back_over(self);
+        under.give_back(self);
+        Some(out)
+    }
 }
 
 /// How a draw's colour meets the target — `soft`'s `Target::blend`, in
@@ -987,7 +1034,8 @@ fn point_instances<G: GlFamily>(gl: &mut G, base: usize) {
 impl<G: GlFamily> WorldGround for GlWorld<G> {
     fn world_caps(&self) -> WorldCaps {
         let start = self.gl.renderer().map_or(crate::world::frame::Quality::High, |name| crate::world::governor::device_quality(&name));
-        WorldCaps { samples: self.samples, start }
+        // a rect alone resolves by a blit of that rect
+        WorldCaps { samples: self.samples, start, redraw_samples: 4 }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {
@@ -1337,8 +1385,11 @@ mod tests {
         fn renderbuffer_storage(&mut self, _: u32, samples: i32, internal: u32, _: i32, _: i32) {
             self.note(format!("storage {samples} {internal:#x}"));
         }
-        fn blit_color(&mut self, width: i32, height: i32) {
-            self.note(format!("blit {width}x{height}"));
+        fn blit_color(&mut self, rect: [i32; 4]) {
+            self.note(format!("blit {}x{}", rect[2], rect[3]));
+        }
+        fn scissor(&mut self, rect: [i32; 4]) {
+            self.note(format!("scissor {rect:?}"));
         }
         fn invalidate_framebuffer(&mut self, _: u32, _: u32, _: u32) {
             self.note("invalidate".into());

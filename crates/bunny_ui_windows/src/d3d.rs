@@ -511,7 +511,9 @@ struct ContextVtbl {
     rs_set_state: unsafe extern "system" fn(*mut Context, *mut RasterizerState),
     // 44 RSSetViewports
     rs_set_viewports: unsafe extern "system" fn(*mut Context, u32, *const Viewport),
-    _pad_45_46: [usize; 2], // 45 RSSetScissorRects, 46 CopySubresourceRegion
+    // 45 RSSetScissorRects
+    rs_set_scissor_rects: unsafe extern "system" fn(*mut Context, u32, *const D3dRect),
+    _pad_46: [usize; 1], // 46 CopySubresourceRegion
     // 47 CopyResource
     copy_resource: unsafe extern "system" fn(*mut Context, *mut c_void, *mut c_void),
     // 48 UpdateSubresource
@@ -600,6 +602,18 @@ struct Adapter1Vtbl {
 
 const _: () =
     assert!(std::mem::offset_of!(AdapterDesc1, flags) == 280 + 3 * std::mem::size_of::<usize>());
+const _: () =
+    assert!(std::mem::offset_of!(ContextVtbl, rs_set_scissor_rects) == 45 * std::mem::size_of::<usize>());
+
+/// `D3D11_RECT`: a scissor's box, its right and bottom past its last
+/// pixel.
+#[repr(C)]
+struct D3dRect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
 const _: () =
     assert!(std::mem::offset_of!(Adapter1Vtbl, get_desc1) == 10 * std::mem::size_of::<usize>());
 
@@ -3231,6 +3245,18 @@ impl OffscreenD3d {
     #[cfg(feature = "3d")]
     pub fn world_rgba_with(&mut self, frame: &std::rc::Rc<bunny_ui::world::WorldFrame>, images: &dyn ImageEngine) -> Option<Vec<u8>> {
         self.ground.world.draw_single(frame, images)
+    }
+
+    /// `before` drawn whole, then `after` over it in `rects` alone, read
+    /// back: what `after` drawn whole gives, when the redraw is right.
+    #[cfg(feature = "3d")]
+    pub fn world_over_rgba(
+        &mut self,
+        before: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+        after: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+        rects: &[[u32; 4]],
+    ) -> Option<Vec<u8>> {
+        self.ground.world.draw_over(before, after, rects, &bunny_ui::image_engine::RawImages::default())
     }
 
     /// How many worlds the last frame drew: a held picture draws none.

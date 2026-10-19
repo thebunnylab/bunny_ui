@@ -1975,6 +1975,33 @@ pub extern "C" fn bunny_gpu_world_parity(index: u32) -> u32 {
     u32::from(!pass)
 }
 
+/// One redraw from the catalog: the first frame drawn whole and the next
+/// over it in its rects alone, against the next drawn whole — both by
+/// this tier's world pass. Returns 0 when the two are the same picture,
+/// 1 when they are not, 2 when the world pass cannot stand.
+#[cfg(all(feature = "gpu", feature = "3d"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_gpu_world_redraw(index: u32) -> u32 {
+    use bunny_ui::gpu::world_scenes::{Spread, world_redraw};
+    let redraw = world_redraw(index);
+    let images = bunny_ui::image_engine::RawImages::default();
+    let (Some(over), Some(whole)) = (gpu::world_over_rgba(&redraw.before, &redraw.after, &redraw.rects, &images), gpu::world_rgba(&redraw.after, &images)) else {
+        gpu::say(&format!("world redraw {}: the world pass did not stand", redraw.name));
+        return 2;
+    };
+    let spread = Spread::of(&over, &whole);
+    gpu::say(&format!(
+        "world redraw {} in {:?}: {} · worst {} · >1 {} of {}",
+        redraw.name,
+        redraw.rects,
+        if spread.worst == 0 { "pass" } else { "FAIL" },
+        spread.worst,
+        spread.beyond[0],
+        spread.pixels,
+    ));
+    u32::from(spread.worst != 0)
+}
+
 /// One timed present of a full-window scene, in milliseconds.
 ///
 /// `road` 0 is this tier, 1 is a FRESH `Surface` each sample (the shape
