@@ -14,6 +14,7 @@
 //! The module is behind the `3d` feature. An app that draws no world
 //! carries none of it.
 
+pub mod bloom;
 pub mod camera;
 pub mod frame;
 pub mod governor;

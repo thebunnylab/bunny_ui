@@ -17,6 +17,12 @@
 //! surfaces read through a comparing sampler. A frame without a map binds
 //! a texel and a sampler whose comparison always passes.
 //!
+//! A frame with a bloom draws each pixel's glow beside its colour, into a
+//! second attachment of one byte (its samples memoryless too), and after
+//! the pass runs the chain of `bunny_ui::world::bloom`: passes into small
+//! textures of the target's own, and the spill blended over the target as
+//! a screen.
+//!
 //! The world library is compiled the first time a box paints a world: an
 //! app that shows none never pays for it.
 
@@ -27,6 +33,7 @@ use std::rc::Rc;
 
 use bunny_ui::gpu::walk::FrameBatches;
 use bunny_ui::gpu::world::{WorldCaps, WorldGround, WorldJob};
+use bunny_ui::world::bloom::LEVELS;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, WorldFrame};
 use bunny_ui::world::shade::SRGB_DECODE;
 use bunny_ui::world::wire::{instance_bytes, material_bytes, part_bytes, shadow_instance_bytes};
@@ -55,6 +62,10 @@ unsafe extern "C" {
 // MARK: - Metal vocabulary of the world pass
 
 const PIXEL_FORMAT_DEPTH32_FLOAT: u64 = 252;
+const PIXEL_FORMAT_R8: u64 = 10;
+const LOAD_ACTION_DONT_CARE: u64 = 0;
+const LOAD_ACTION_LOAD: u64 = 1;
+const BLEND_ONE_MINUS_DESTINATION_COLOR: u64 = 7;
 const PIXEL_FORMAT_DEPTH16_UNORM: u64 = 250;
 const ADDRESS_CLAMP_TO_EDGE: u64 = 0;
 const STORAGE_MODE_MEMORYLESS: u64 = 3;
@@ -466,13 +477,20 @@ static float3 graded(constant WorldUniforms& u, device const uchar4* parts, floa
     return p0 + (p1 - p0) * w.x + (p2 - p1) * w.y + (p3 - p2) * w.z;
 }
 
+// how much a surface glows, from the light it gives off: its brightest
+// channel, a quarter a unit (bunny_ui::world::bloom::glow)
+static float glow_of(float3 emissive) {
+    return saturate(max(emissive.r, max(emissive.g, emissive.b)) * 0.25);
+}
+
 // premultiplied codes over 255: the target's unorm write rounds them to
-// the byte the CPU computes
+// the byte the CPU computes; `glow` takes the surface's glow, a code
+// premultiplied by its alpha
 static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* materials,
                           device const WorldInstance* instances, constant WorldUniforms& u,
                           constant WorldDraw& draw, texture2d<float> picture, sampler wrap,
                           depth2d<float> shadow_map, sampler compare, texture2d<float> floor_map,
-                          device const uchar4* parts) {
+                          device const uchar4* parts, thread float& glow) {
     float4 section = u.section;
     if (any(section != 0.0) && section.x * in.eye.x + section.y * in.eye.y + section.z * in.eye.z + section.w < 0.0) {
         discard_fragment();
@@ -525,8 +543,15 @@ static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* 
     }
     float3 code = graded(u, parts, float3(encode_code(linear.r), encode_code(linear.g), encode_code(linear.b)));
     float3 codes = clamp(floor(code * alpha + 0.5 + dither), 0.0, 255.0);
+    glow = floor(glow_of(material.emissive.xyz) * alpha * 255.0 + 0.5);
     return float4(codes / 255.0, coverage >= 0.0 ? coverage : floor(alpha * 255.0 + 0.5) / 255.0);
 }
+
+// a frame with a bloom draws each pixel's glow beside its colour
+struct GlowBack {
+    float4 color [[color(0)]];
+    float4 glow [[color(1)]];
+};
 
 fragment float4 world_fragment(WorldVary in [[stage_in]],
                                bool front [[front_facing]],
@@ -540,13 +565,47 @@ fragment float4 world_fragment(WorldVary in [[stage_in]],
                                sampler compare [[sampler(1)]],
                                texture2d<float> floor_map [[texture(2)]],
                                device const uchar4* parts [[buffer(5)]]) {
-    return world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, floor_map, parts);
+    float glow;
+    return world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, floor_map, parts, glow);
+}
+
+fragment GlowBack world_fragment_glow(WorldVary in [[stage_in]],
+                               bool front [[front_facing]],
+                               device const WorldMaterial* materials [[buffer(0)]],
+                               device const WorldInstance* instances [[buffer(1)]],
+                               constant WorldUniforms& u [[buffer(2)]],
+                               constant WorldDraw& draw [[buffer(3)]],
+                               texture2d<float> picture [[texture(0)]],
+                               sampler wrap [[sampler(0)]],
+                               depth2d<float> shadow_map [[texture(1)]],
+                               sampler compare [[sampler(1)]],
+                               texture2d<float> floor_map [[texture(2)]],
+                               device const uchar4* parts [[buffer(5)]]) {
+    GlowBack out;
+    float glow;
+    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, floor_map, parts, glow);
+    out.glow = float4(glow / 255.0, 0.0, 0.0, out.color.a);
+    return out;
 }
 
 struct SteppedBack {
     float4 color [[color(0)]];
     float depth [[depth(greater)]];
 };
+
+struct SteppedGlowBack {
+    float4 color [[color(0)]];
+    float4 glow [[color(1)]];
+    float depth [[depth(greater)]];
+};
+
+// how far an opaque surface under edges steps back: its own slope, short
+// of the far plane
+static float stepped_depth(WorldVary in, constant WorldDraw& draw) {
+    float z = in.position.z;
+    float slope = max(abs(dfdx(in.depth)), abs(dfdy(in.depth)));
+    return min(z + draw.bias.x * slope + DEPTH_TIE, DEPTH_CEILING);
+}
 
 // an opaque surface under edges steps back by its own slope, short of
 // the far plane: an edge drawn on it wins across its whole width
@@ -563,10 +622,29 @@ fragment SteppedBack world_fragment_stepped(WorldVary in [[stage_in]],
                                             texture2d<float> floor_map [[texture(2)]],
                                             device const uchar4* parts [[buffer(5)]]) {
     SteppedBack out;
-    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, floor_map, parts);
-    float z = in.position.z;
-    float slope = max(abs(dfdx(in.depth)), abs(dfdy(in.depth)));
-    out.depth = min(z + draw.bias.x * slope + DEPTH_TIE, DEPTH_CEILING);
+    float glow;
+    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, floor_map, parts, glow);
+    out.depth = stepped_depth(in, draw);
+    return out;
+}
+
+fragment SteppedGlowBack world_fragment_stepped_glow(WorldVary in [[stage_in]],
+                               bool front [[front_facing]],
+                               device const WorldMaterial* materials [[buffer(0)]],
+                               device const WorldInstance* instances [[buffer(1)]],
+                               constant WorldUniforms& u [[buffer(2)]],
+                               constant WorldDraw& draw [[buffer(3)]],
+                               texture2d<float> picture [[texture(0)]],
+                               sampler wrap [[sampler(0)]],
+                               depth2d<float> shadow_map [[texture(1)]],
+                               sampler compare [[sampler(1)]],
+                               texture2d<float> floor_map [[texture(2)]],
+                               device const uchar4* parts [[buffer(5)]]) {
+    SteppedGlowBack out;
+    float glow;
+    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, floor_map, parts, glow);
+    out.glow = float4(glow / 255.0, 0.0, 0.0, out.color.a);
+    out.depth = stepped_depth(in, draw);
     return out;
 }
 
@@ -681,9 +759,13 @@ struct LineOut {
     float depth [[depth(any)]];
 };
 
-fragment LineOut line_fragment(LineVary in [[stage_in]],
-                               constant WorldUniforms& u [[buffer(2)]],
-                               constant LineStyle& style [[buffer(4)]]) {
+struct LineGlowOut {
+    float4 color [[color(0)]];
+    float4 glow [[color(1)]];
+    float depth [[depth(any)]];
+};
+
+static LineOut line_shade(LineVary in, constant WorldUniforms& u, constant LineStyle& style) {
     float2 c = in.position.xy;
     float2 d = in.b - in.a;
     float length2 = dot(d, d);
@@ -723,6 +805,24 @@ fragment LineOut line_fragment(LineVary in [[stage_in]],
     return out;
 }
 
+fragment LineOut line_fragment(LineVary in [[stage_in]],
+                               constant WorldUniforms& u [[buffer(2)]],
+                               constant LineStyle& style [[buffer(4)]]) {
+    return line_shade(in, u, style);
+}
+
+// an edge glows not, and covers the glow behind it as its colour does
+fragment LineGlowOut line_fragment_glow(LineVary in [[stage_in]],
+                                        constant WorldUniforms& u [[buffer(2)]],
+                                        constant LineStyle& style [[buffer(4)]]) {
+    LineOut plain = line_shade(in, u, style);
+    LineGlowOut out;
+    out.color = plain.color;
+    out.glow = float4(0.0, 0.0, 0.0, plain.color.a);
+    out.depth = plain.depth;
+    return out;
+}
+
 // MARK: - The backdrop (a vertical ramp)
 
 struct WorldFullVary {
@@ -741,8 +841,7 @@ struct Backdrop {
     float4 rows[6];
 };
 
-fragment float4 backdrop_fragment(WorldFullVary in [[stage_in]],
-                                  constant Backdrop& ramp [[buffer(0)]]) {
+static float4 backdrop_shade(WorldFullVary in, constant Backdrop& ramp) {
     float4 c;
     if (ramp.rows[2].z > 0.5) {
         // the view's ray through the pixel, against the world's up
@@ -759,6 +858,93 @@ fragment float4 backdrop_fragment(WorldFullVary in [[stage_in]],
     }
     float3 rgb = floor((c.rgb * c.a + 127.0) / 255.0);
     return float4(rgb, c.a) / 255.0;
+}
+
+fragment float4 backdrop_fragment(WorldFullVary in [[stage_in]],
+                                  constant Backdrop& ramp [[buffer(0)]]) {
+    return backdrop_shade(in, ramp);
+}
+
+fragment GlowBack backdrop_fragment_glow(WorldFullVary in [[stage_in]],
+                                         constant Backdrop& ramp [[buffer(0)]]) {
+    GlowBack out;
+    out.color = backdrop_shade(in, ramp);
+    out.glow = float4(0.0);
+    return out;
+}
+
+// MARK: - The bloom (bunny_ui::world::bloom)
+
+// every step reads whole texels, the edge repeated past it, and sums
+// whole codes: the CPU's chain, to the code
+constant uint BLOOM_BAYER[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+
+static uint3 codes_at(texture2d<float> picture, int2 at) {
+    int2 size = int2(picture.get_width(), picture.get_height());
+    return uint3(picture.read(uint2(clamp(at, int2(0), size - 1))).rgb * 255.0 + 0.5);
+}
+
+// the step below read at a texel of the step above: the four nearest,
+// weighted 9, 3, 3 and 1
+static uint3 up16(texture2d<float> below, int2 at) {
+    int2 m = at / 2;
+    int2 o = int2((at.x & 1) == 0 ? -1 : 1, (at.y & 1) == 0 ? -1 : 1);
+    return 9u * codes_at(below, m) + 3u * codes_at(below, m + int2(o.x, 0)) + 3u * codes_at(below, m + int2(0, o.y)) +
+           codes_at(below, m + o);
+}
+
+// a step down: the 4 × 4 block around the texel's own 2 × 2 above, five
+// for the middle four and one for the ring; the first step reads the
+// colours times their glow
+fragment float4 bloom_down_fragment(WorldFullVary in [[stage_in]],
+                                    texture2d<float> above [[texture(0)]],
+                                    texture2d<float> second [[texture(1)]],
+                                    constant float4& bloom [[buffer(0)]]) {
+    int2 at = int2(in.position.xy);
+    bool glowing = bloom.x > 0.5;
+    int2 size = int2(second.get_width(), second.get_height());
+    uint3 sum = uint3(0);
+    for (int dy = -1; dy <= 2; dy++) {
+        for (int dx = -1; dx <= 2; dx++) {
+            int2 p = 2 * at + int2(dx, dy);
+            uint3 texel = codes_at(above, p);
+            if (glowing) {
+                texel *= uint(second.read(uint2(clamp(p, int2(0), size - 1))).r * 255.0 + 0.5);
+            }
+            uint weight = (dx == 0 || dx == 1) && (dy == 0 || dy == 1) ? 5u : 1u;
+            sum += weight * texel;
+        }
+    }
+    uint whole = glowing ? 8160u : 32u;
+    return float4(float3((sum + whole / 2u) / whole) / 255.0, 1.0);
+}
+
+// a step up: its own step down and the step below read up, each of the
+// steps below weighing as much as its own
+fragment float4 bloom_up_fragment(WorldFullVary in [[stage_in]],
+                                  texture2d<float> above [[texture(0)]],
+                                  texture2d<float> second [[texture(1)]],
+                                  constant float4& bloom [[buffer(0)]]) {
+    int2 at = int2(in.position.xy);
+    uint below = uint(bloom.z);
+    uint whole = 16u * (below + 1u);
+    uint3 sum = 16u * codes_at(above, at) + below * up16(second, at) + whole / 2u;
+    return float4(float3(sum / whole) / 255.0, 1.0);
+}
+
+// the spill: the chain's top read up, times the strength and a gain of
+// four, as far as the pixel does not glow itself, dithered to whole
+// codes; the target blends it as a screen
+fragment float4 bloom_spill_fragment(WorldFullVary in [[stage_in]],
+                                     texture2d<float> above [[texture(0)]],
+                                     texture2d<float> second [[texture(1)]],
+                                     constant float4& bloom [[buffer(0)]]) {
+    int2 at = int2(in.position.xy);
+    int2 size = int2(above.get_width(), above.get_height());
+    uint glow = uint(above.read(uint2(clamp(at, int2(0), size - 1))).r * 255.0 + 0.5);
+    uint dither = 65280u * BLOOM_BAYER[(at.y & 3) * 4 + (at.x & 3)] + 32640u;
+    uint3 s = min((uint(bloom.y) * 4u * up16(second, at) * (255u - glow) + dither) / 1044480u, uint3(255u));
+    return float4(float3(s) / 255.0, float(max(s.r, max(s.g, s.b))) / 255.0);
 }
 
 // MARK: - The composite (the 2D pass)
@@ -847,8 +1033,11 @@ struct WorldStack {
     /// frame without a map binds.
     lit: Id,
     always: Id,
-    /// By the way they meet the target and the samples a pixel.
-    pipelines: HashMap<(Pipe, u8), Id>,
+    /// By the way they meet the target, the samples a pixel, and whether
+    /// the pass draws its glow beside its colour.
+    pipelines: HashMap<(Pipe, u8, bool), Id>,
+    /// The bloom's steps: down, back up, and the spill (a screen).
+    bloom: [Id; 3],
     /// Opaque, see-through, lines tested, lines hidden, always.
     depth_states: [Id; 5],
     sampler: Id,
@@ -891,6 +1080,18 @@ struct MeshBuffers {
     indices: Id,
 }
 
+/// A target's bloom: its glow and the chain's steps, made on its first
+/// frame with a bloom.
+struct BloomTextures {
+    /// The glow at one sample: where its samples resolve, and what the
+    /// chain reads.
+    glow: Id,
+    /// The glow's samples, or null at one sample.
+    glow_samples: Id,
+    down: [Id; LEVELS],
+    up: [Id; LEVELS - 1],
+}
+
 /// The Metal side of the world seam: it mints targets, buffers and
 /// textures, and draws the walk's jobs.
 pub(super) struct MetalWorld {
@@ -907,6 +1108,8 @@ pub(super) struct MetalWorld {
     segments: HashMap<u64, (Id, u32)>,
     /// Each shadow map and its side.
     shadow_maps: HashMap<u64, (Id, u32)>,
+    /// By target.
+    blooms: HashMap<u64, BloomTextures>,
     next: u64,
     /// Targets the CPU can read: the harness's, for the parity tests.
     pub(super) readable: bool,
@@ -925,6 +1128,7 @@ impl MetalWorld {
             textures: HashMap::new(),
             segments: HashMap::new(),
             shadow_maps: HashMap::new(),
+            blooms: HashMap::new(),
             next: 1,
             readable: false,
         }
@@ -972,6 +1176,25 @@ impl MetalWorld {
         for (job, &(instances, materials, casters, parts)) in batches.worlds.iter().zip(staged) {
             let Some(target) = self.targets.get(&job.target) else { continue };
             let samples = target.samples;
+            // a frame with a bloom draws its glow beside its colour
+            let bloom = if job.frame.bloom > 0 {
+                if !self.blooms.contains_key(&job.target)
+                    && let Some(textures) = unsafe { bloom_textures(self.device, target.size, samples, stack.memoryless) }
+                {
+                    self.blooms.insert(job.target, textures);
+                }
+                self.blooms.get(&job.target).map(|textures| PreparedBloom {
+                    glow: textures.glow,
+                    glow_samples: textures.glow_samples,
+                    down: textures.down,
+                    up: textures.up,
+                    strength: job.frame.bloom,
+                    pipelines: stack.bloom,
+                })
+            } else {
+                None
+            };
+            let glow = bloom.is_some();
             // the box's map, and its casters when it does not hold them
             let map = job.shadow.and_then(|shadow| self.shadow_maps.get(&shadow.map).map(|&(map, _)| (shadow, map)));
             let shadow = match (map, job.frame.shadow.as_ref()) {
@@ -1014,7 +1237,7 @@ impl MetalWorld {
                         let bias = if blend == Blend::Replace { job.frame.face_bias } else { 0.0 };
                         // with four samples a cut-out's edge becomes coverage
                         let coverage = mask && samples > 1;
-                        let pipeline = unsafe { stack.pipeline(self.device, Pipe::Mesh(blend, bias > 0.0, coverage), samples) };
+                        let pipeline = unsafe { stack.pipeline(self.device, Pipe::Mesh(blend, bias > 0.0, coverage), samples, glow) };
                         if pipeline.is_null() {
                             continue;
                         }
@@ -1058,7 +1281,7 @@ impl MetalWorld {
                         if count == 0 {
                             continue;
                         }
-                        let pipeline = unsafe { stack.pipeline(self.device, Pipe::Lines, samples) };
+                        let pipeline = unsafe { stack.pipeline(self.device, Pipe::Lines, samples, glow) };
                         if pipeline.is_null() {
                             continue;
                         }
@@ -1094,7 +1317,7 @@ impl MetalWorld {
                     (MTLClearColor { red: premultiply(c.r), green: premultiply(c.g), blue: premultiply(c.b), alpha: c.a as f64 / 255.0 }, None)
                 }
                 Background::Gradient { .. } | Background::Sky { .. } => {
-                    let pipeline = unsafe { stack.pipeline(self.device, Pipe::Backdrop, samples) };
+                    let pipeline = unsafe { stack.pipeline(self.device, Pipe::Backdrop, samples, glow) };
                     let ramp = job.frame.backdrop().map(|rows| BackdropBlock { rows });
                     let backdrop = ramp.filter(|_| !pipeline.is_null()).map(|ramp| (pipeline, ramp));
                     (MTLClearColor { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 }, backdrop)
@@ -1119,6 +1342,7 @@ impl MetalWorld {
                 shadow_map,
                 shadow_sampler,
                 floor_map,
+                bloom,
             });
         }
         let targets = batches
@@ -1155,6 +1379,11 @@ impl WorldStack {
             }
             let composite = super::build_pipeline(device, library, "sprite_vertex", "world_composite_fragment", format, true)?;
             let shadow = shadow_pipeline(device, library)?;
+            let bloom = [
+                bloom_pipeline(device, library, "bloom_down_fragment", false)?,
+                bloom_pipeline(device, library, "bloom_up_fragment", false)?,
+                bloom_pipeline(device, library, "bloom_spill_fragment", true)?,
+            ];
             let depth_state = |compare: u64, write: bool| {
                 let descriptor = msg_id(msg_id(class("MTLDepthStencilDescriptor"), sel("alloc")), sel("init"));
                 msg_void_u64(descriptor, sel("setDepthCompareFunction:"), compare);
@@ -1215,6 +1444,7 @@ impl WorldStack {
                 lit,
                 always,
                 pipelines: HashMap::new(),
+                bloom,
                 depth_states,
                 sampler,
                 blank,
@@ -1234,10 +1464,11 @@ impl WorldStack {
         }
     }
 
-    /// The pipeline for `pipe` at `samples`, built on its first ask; null
-    /// when it cannot be built (the draw is skipped, and says so once).
-    unsafe fn pipeline(&mut self, device: Id, pipe: Pipe, samples: u8) -> Id {
-        if let Some(&pipeline) = self.pipelines.get(&(pipe, samples)) {
+    /// The pipeline for `pipe` at `samples`, drawing its glow beside its
+    /// colour when `glow` says so, built on its first ask; null when it
+    /// cannot be built (the draw is skipped, and says so once).
+    unsafe fn pipeline(&mut self, device: Id, pipe: Pipe, samples: u8, glow: bool) -> Id {
+        if let Some(&pipeline) = self.pipelines.get(&(pipe, samples, glow)) {
             return pipeline;
         }
         let (vertex, fragment) = match pipe {
@@ -1251,12 +1482,13 @@ impl WorldStack {
             Pipe::Lines => (Blend::Alpha, false),
             Pipe::Backdrop => (Blend::Replace, false),
         };
-        let pipeline = unsafe { world_pipeline(device, self.library, vertex, fragment, blend, coverage, samples) };
+        let fragment = if glow { format!("{fragment}_glow") } else { fragment.to_string() };
+        let pipeline = unsafe { world_pipeline(device, self.library, vertex, &fragment, blend, coverage, samples, glow) };
         let pipeline = pipeline.unwrap_or_else(|reason| {
             eprintln!("bunny_ui metal: {reason}");
             null_mut()
         });
-        self.pipelines.insert((pipe, samples), pipeline);
+        self.pipelines.insert((pipe, samples, glow), pipeline);
         pipeline
     }
 }
@@ -1267,6 +1499,7 @@ impl Drop for WorldStack {
             for id in [self.library, self.composite, self.shadow, self.compare, self.lit, self.always, self.sampler, self.blank, self.dark]
                 .into_iter()
                 .chain(self.depth_states)
+                .chain(self.bloom)
             {
                 msg_void(id, sel("release"));
             }
@@ -1280,9 +1513,20 @@ impl Drop for WorldStack {
 }
 
 /// A pipeline of the world pass: RGBA8 colour and 32-bit depth at
-/// `samples`, blended the way the CPU blends that kind of draw. Colour
+/// `samples`, blended the way the CPU blends that kind of draw, and with
+/// `glow` a one-byte glow beside the colour, blended the same way. Colour
 /// is premultiplied throughout.
-unsafe fn world_pipeline(device: Id, library: Id, vertex: &str, fragment: &str, blend: Blend, coverage: bool, samples: u8) -> Result<Id, String> {
+#[allow(clippy::too_many_arguments)]
+unsafe fn world_pipeline(
+    device: Id,
+    library: Id,
+    vertex: &str,
+    fragment: &str,
+    blend: Blend,
+    coverage: bool,
+    samples: u8,
+    glow: bool,
+) -> Result<Id, String> {
     unsafe {
         let vertex_fn = msg_id_arg(library, sel("newFunctionWithName:"), ns_string(vertex));
         let fragment_fn = msg_id_arg(library, sel("newFunctionWithName:"), ns_string(fragment));
@@ -1295,8 +1539,6 @@ unsafe fn world_pipeline(device: Id, library: Id, vertex: &str, fragment: &str, 
         msg_void_u64(descriptor, sel("setDepthAttachmentPixelFormat:"), PIXEL_FORMAT_DEPTH32_FLOAT);
         msg_void_u64(descriptor, sel("setRasterSampleCount:"), samples as u64);
         msg_void_bool(descriptor, sel("setAlphaToCoverageEnabled:"), coverage as i8);
-        let attachment = msg_id_u64(msg_id(descriptor, sel("colorAttachments")), sel("objectAtIndexedSubscript:"), 0);
-        msg_void_u64(attachment, sel("setPixelFormat:"), PIXEL_FORMAT_RGBA8);
         // over: rgb = s + d·(1−sa), a = sa + da·(1−sa); add: rgb = s + d,
         // a = da + sa·(1−da) — `Target::blend` of the CPU, word for word
         let factors = match blend {
@@ -1304,12 +1546,17 @@ unsafe fn world_pipeline(device: Id, library: Id, vertex: &str, fragment: &str, 
             Blend::Alpha => Some((BLEND_ONE, BLEND_ONE_MINUS_SOURCE_ALPHA, BLEND_ONE, BLEND_ONE_MINUS_SOURCE_ALPHA)),
             Blend::Add => Some((BLEND_ONE, BLEND_ONE, BLEND_ONE_MINUS_DESTINATION_ALPHA, BLEND_ONE)),
         };
-        msg_void_bool(attachment, sel("setBlendingEnabled:"), factors.is_some() as i8);
-        let (rgb_source, rgb_destination, alpha_source, alpha_destination) = factors.unwrap_or((BLEND_ONE, BLEND_ZERO, BLEND_ONE, BLEND_ZERO));
-        msg_void_u64(attachment, sel("setSourceRGBBlendFactor:"), rgb_source);
-        msg_void_u64(attachment, sel("setDestinationRGBBlendFactor:"), rgb_destination);
-        msg_void_u64(attachment, sel("setSourceAlphaBlendFactor:"), alpha_source);
-        msg_void_u64(attachment, sel("setDestinationAlphaBlendFactor:"), alpha_destination);
+        let formats: &[u64] = if glow { &[PIXEL_FORMAT_RGBA8, PIXEL_FORMAT_R8] } else { &[PIXEL_FORMAT_RGBA8] };
+        for (index, &format) in formats.iter().enumerate() {
+            let attachment = msg_id_u64(msg_id(descriptor, sel("colorAttachments")), sel("objectAtIndexedSubscript:"), index as u64);
+            msg_void_u64(attachment, sel("setPixelFormat:"), format);
+            msg_void_bool(attachment, sel("setBlendingEnabled:"), factors.is_some() as i8);
+            let (rgb_source, rgb_destination, alpha_source, alpha_destination) = factors.unwrap_or((BLEND_ONE, BLEND_ZERO, BLEND_ONE, BLEND_ZERO));
+            msg_void_u64(attachment, sel("setSourceRGBBlendFactor:"), rgb_source);
+            msg_void_u64(attachment, sel("setDestinationRGBBlendFactor:"), rgb_destination);
+            msg_void_u64(attachment, sel("setSourceAlphaBlendFactor:"), alpha_source);
+            msg_void_u64(attachment, sel("setDestinationAlphaBlendFactor:"), alpha_destination);
+        }
         let mut error: Id = null_mut();
         let pipeline = msg_id_id_ptr(device, sel("newRenderPipelineStateWithDescriptor:error:"), descriptor, &mut error);
         msg_void(descriptor, sel("release"));
@@ -1319,6 +1566,81 @@ unsafe fn world_pipeline(device: Id, library: Id, vertex: &str, fragment: &str, 
             return Err(format!("world pipeline {vertex}/{fragment} failed: {}", error_message(error)));
         }
         Ok(pipeline)
+    }
+}
+
+/// A step of the bloom: one triangle over an RGBA8 texture of one sample;
+/// with `screen`, blended over what the texture holds, `c + s·(1 − c)`.
+unsafe fn bloom_pipeline(device: Id, library: Id, fragment: &str, screen: bool) -> Result<Id, String> {
+    unsafe {
+        let vertex_fn = msg_id_arg(library, sel("newFunctionWithName:"), ns_string("backdrop_vertex"));
+        let fragment_fn = msg_id_arg(library, sel("newFunctionWithName:"), ns_string(fragment));
+        if vertex_fn.is_null() || fragment_fn.is_null() {
+            return Err(format!("missing bloom shader {fragment}"));
+        }
+        let descriptor = msg_id(msg_id(class("MTLRenderPipelineDescriptor"), sel("alloc")), sel("init"));
+        msg_void_id(descriptor, sel("setVertexFunction:"), vertex_fn);
+        msg_void_id(descriptor, sel("setFragmentFunction:"), fragment_fn);
+        let attachment = msg_id_u64(msg_id(descriptor, sel("colorAttachments")), sel("objectAtIndexedSubscript:"), 0);
+        msg_void_u64(attachment, sel("setPixelFormat:"), PIXEL_FORMAT_RGBA8);
+        msg_void_bool(attachment, sel("setBlendingEnabled:"), screen as i8);
+        if screen {
+            msg_void_u64(attachment, sel("setSourceRGBBlendFactor:"), BLEND_ONE_MINUS_DESTINATION_COLOR);
+            msg_void_u64(attachment, sel("setDestinationRGBBlendFactor:"), BLEND_ONE);
+            msg_void_u64(attachment, sel("setSourceAlphaBlendFactor:"), BLEND_ONE_MINUS_DESTINATION_ALPHA);
+            msg_void_u64(attachment, sel("setDestinationAlphaBlendFactor:"), BLEND_ONE);
+        }
+        let mut error: Id = null_mut();
+        let pipeline = msg_id_id_ptr(device, sel("newRenderPipelineStateWithDescriptor:error:"), descriptor, &mut error);
+        msg_void(descriptor, sel("release"));
+        msg_void(vertex_fn, sel("release"));
+        msg_void(fragment_fn, sel("release"));
+        if pipeline.is_null() {
+            return Err(format!("the bloom pipeline {fragment} failed: {}", error_message(error)));
+        }
+        Ok(pipeline)
+    }
+}
+
+/// A target's bloom textures: the glow (its samples memoryless where the
+/// GPU allows) and the chain's steps. `None` when one cannot be made.
+unsafe fn bloom_textures(device: Id, size: (u32, u32), samples: u8, memoryless: bool) -> Option<BloomTextures> {
+    unsafe {
+        let pool = super::objc_autoreleasePoolPush();
+        let read = TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ;
+        let glow = attachment(device, PIXEL_FORMAT_R8, size, 1, STORAGE_MODE_PRIVATE, read);
+        let glow_samples = if samples > 1 {
+            let storage = if memoryless { STORAGE_MODE_MEMORYLESS } else { STORAGE_MODE_PRIVATE };
+            let texture = attachment(device, PIXEL_FORMAT_R8, size, samples, storage, TEXTURE_USAGE_RENDER_TARGET);
+            if texture.is_null() && storage != STORAGE_MODE_PRIVATE {
+                attachment(device, PIXEL_FORMAT_R8, size, samples, STORAGE_MODE_PRIVATE, TEXTURE_USAGE_RENDER_TARGET)
+            } else {
+                texture
+            }
+        } else {
+            null_mut()
+        };
+        let sizes = bunny_ui::world::bloom::sizes(size);
+        let down = sizes.map(|size| attachment(device, PIXEL_FORMAT_RGBA8, size, 1, STORAGE_MODE_PRIVATE, read));
+        let up = [0, 1, 2].map(|level| attachment(device, PIXEL_FORMAT_RGBA8, sizes[level], 1, STORAGE_MODE_PRIVATE, read));
+        super::objc_autoreleasePoolPop(pool);
+        let textures = BloomTextures { glow, glow_samples, down, up };
+        let missing = glow.is_null() || (samples > 1 && glow_samples.is_null()) || down.iter().chain(up.iter()).any(|texture| texture.is_null());
+        if missing {
+            release_bloom(&textures);
+            return None;
+        }
+        Some(textures)
+    }
+}
+
+fn release_bloom(textures: &BloomTextures) {
+    unsafe {
+        for texture in [textures.glow, textures.glow_samples].into_iter().chain(textures.down).chain(textures.up) {
+            if !texture.is_null() {
+                msg_void(texture, sel("release"));
+            }
+        }
     }
 }
 
@@ -1403,6 +1725,9 @@ impl WorldGround for MetalWorld {
     }
 
     fn drop_target(&mut self, id: u64) {
+        if let Some(textures) = self.blooms.remove(&id) {
+            release_bloom(&textures);
+        }
         if let Some(target) = self.targets.remove(&id) {
             release_target(&target);
         }
@@ -1616,6 +1941,19 @@ struct PreparedJob {
     shadow_sampler: Id,
     /// The frame's floor map, or the dark texel.
     floor_map: Id,
+    bloom: Option<PreparedBloom>,
+}
+
+/// A job's bloom: its glow beside the colour, and the chain after.
+struct PreparedBloom {
+    glow: Id,
+    glow_samples: Id,
+    down: [Id; LEVELS],
+    up: [Id; LEVELS - 1],
+    /// In 256ths.
+    strength: u16,
+    /// Down, back up, the spill.
+    pipelines: [Id; 3],
 }
 
 struct PreparedShadow {
@@ -1697,6 +2035,20 @@ impl FramePass {
                     sels.set_clear_color,
                     MTLClearColor { red: job.clear.red, green: job.clear.green, blue: job.clear.blue, alpha: job.clear.alpha },
                 );
+                if let Some(bloom) = &job.bloom {
+                    // the glow beside the colour, from none
+                    let glow = msg_id_u64(msg_id(pass, sels.color_attachments), sels.object_at, 1);
+                    if bloom.glow_samples.is_null() {
+                        msg_void_id(glow, sels.set_texture, bloom.glow);
+                        msg_void_u64(glow, sels.set_store_action, STORE_ACTION_STORE);
+                    } else {
+                        msg_void_id(glow, sels.set_texture, bloom.glow_samples);
+                        msg_void_id(glow, world.set_resolve_texture, bloom.glow);
+                        msg_void_u64(glow, sels.set_store_action, STORE_ACTION_MULTISAMPLE_RESOLVE);
+                    }
+                    msg_void_u64(glow, sels.set_load_action, LOAD_ACTION_CLEAR);
+                    msg_void_clear_color(glow, sels.set_clear_color, MTLClearColor { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 });
+                }
                 let depth = msg_id(pass, world.depth_attachment);
                 msg_void_id(depth, sels.set_texture, job.depth);
                 msg_void_u64(depth, sels.set_load_action, LOAD_ACTION_CLEAR);
@@ -1763,8 +2115,50 @@ impl FramePass {
                     }
                 }
                 msg_void(encoder, sels.end_encoding);
+                if let Some(bloom) = &job.bloom {
+                    encode_bloom(command, sels, pass_class, job.resolve, bloom);
+                }
             }
         }
+    }
+}
+
+/// The chain over a resolved target: four steps down from its colours and
+/// glow, three back up, and the spill blended over the target.
+unsafe fn encode_bloom(command: Id, sels: &Sels, pass_class: Id, resolve: Id, bloom: &PreparedBloom) {
+    unsafe {
+        let [down, up, spill] = bloom.pipelines;
+        bloom_step(command, sels, pass_class, (bloom.down[0], LOAD_ACTION_DONT_CARE), down, (resolve, bloom.glow), [1.0, 0.0, 0.0, 0.0]);
+        for level in 1..LEVELS {
+            let above = bloom.down[level - 1];
+            bloom_step(command, sels, pass_class, (bloom.down[level], LOAD_ACTION_DONT_CARE), down, (above, above), [0.0; 4]);
+        }
+        let mut lower = bloom.down[LEVELS - 1];
+        for (below, level) in (0..LEVELS - 1).rev().enumerate() {
+            let values = [0.0, 0.0, (below + 1) as f32, 0.0];
+            bloom_step(command, sels, pass_class, (bloom.up[level], LOAD_ACTION_DONT_CARE), up, (bloom.down[level], lower), values);
+            lower = bloom.up[level];
+        }
+        bloom_step(command, sels, pass_class, (resolve, LOAD_ACTION_LOAD), spill, (bloom.glow, lower), [0.0, bloom.strength as f32, 0.0, 0.0]);
+    }
+}
+
+/// One step of the chain: a pass of one triangle into `target`, reading
+/// two textures and four values.
+unsafe fn bloom_step(command: Id, sels: &Sels, pass_class: Id, (target, load): (Id, u64), pipeline: Id, (above, second): (Id, Id), values: [f32; 4]) {
+    unsafe {
+        let pass = msg_id(pass_class, sels.render_pass_descriptor);
+        let attachment = msg_id_u64(msg_id(pass, sels.color_attachments), sels.object_at, 0);
+        msg_void_id(attachment, sels.set_texture, target);
+        msg_void_u64(attachment, sels.set_load_action, load);
+        msg_void_u64(attachment, sels.set_store_action, STORE_ACTION_STORE);
+        let encoder = msg_id_arg(command, sels.encoder, pass);
+        msg_void_id(encoder, sels.set_pipeline, pipeline);
+        msg_void_id_u64(encoder, sels.set_fragment_texture, above, 0);
+        msg_void_id_u64(encoder, sels.set_fragment_texture, second, 1);
+        msg_void_ptr_u64_u64(encoder, sels.set_fragment_bytes, values.as_ptr().cast(), 16, 0);
+        msg_void_u64x3(encoder, sels.draw_plain, PRIMITIVE_TRIANGLE, 0, 3);
+        msg_void(encoder, sels.end_encoding);
     }
 }
 

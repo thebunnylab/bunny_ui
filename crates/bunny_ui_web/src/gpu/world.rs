@@ -153,6 +153,15 @@ impl GlFamily for WebGl {
     fn invalidate_framebuffer(&mut self, target: u32, first: u32, second: u32) {
         unsafe { gl_invalidate_framebuffer(target, first, second) }
     }
+    fn draw_buffers(&mut self, count: u32) {
+        unsafe { gl_draw_buffers(count) }
+    }
+    fn read_buffer(&mut self, attachment: u32) {
+        unsafe { gl_read_buffer(attachment) }
+    }
+    fn clear_color_buffer(&mut self, index: i32, color: [f32; 4]) {
+        unsafe { gl_clear_bufferfv(index, color[0], color[1], color[2], color[3]) }
+    }
 
     fn viewport(&mut self, width: i32, height: i32) {
         unsafe { gl_viewport(0, 0, width, height) }

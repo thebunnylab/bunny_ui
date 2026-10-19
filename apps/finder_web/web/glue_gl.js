@@ -382,6 +382,12 @@ const bunnyGlImports = {
     if (second >>> 0) attachments.push(second >>> 0);
     if (attachments.length) gl.invalidateFramebuffer(target >>> 0, attachments);
   },
+  // a frame that draws its glow draws into two attachments
+  gl_draw_buffers(count) {
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1].slice(0, Math.min(count >>> 0, 2)));
+  },
+  gl_read_buffer(attachment) { gl.readBuffer(attachment >>> 0); },
+  gl_clear_bufferfv(index, r, g, b, a) { gl.clearBufferfv(gl.COLOR, index | 0, [r, g, b, a]); },
   gl_depth_func(func) { gl.depthFunc(func >>> 0); },
   gl_depth_mask(write) { gl.depthMask(write !== 0); },
   gl_cull_face(face) { gl.cullFace(face >>> 0); },

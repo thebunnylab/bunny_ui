@@ -168,8 +168,7 @@ pub fn tone(color: V3, exposure: f32, knee: f32) -> V3 {
 
 /// The 4×4 ordered dither at a pixel, in `(−½, ½)`.
 pub fn bayer(x: u32, y: u32) -> f32 {
-    const B: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
-    (B[(y & 3) as usize][(x & 3) as usize] as f32 + 0.5) / 16.0 - 0.5
+    (super::bloom::bayer_index(x, y) as f32 + 0.5) / 16.0 - 0.5
 }
 
 /// A surface point as a shader sees it.

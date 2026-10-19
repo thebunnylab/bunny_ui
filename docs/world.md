@@ -224,6 +224,22 @@ let night = Grade::from_fn(|[r, g, b]| [0.8 * r, 0.85 * g, 0.1 + 0.9 * b]);
 let style = WorldStyle { grade: Some(night), ..WorldStyle::default() };
 ```
 
+A bloom (`WorldStyle::bloom`, from 0 to 1) spills the light of what
+glows around it: a lamp's halo, a sign's haze. Only `Quality::High`
+draws it. A surface glows as far as its emissive light is strong
+(`Material::emissive`: a strength of four glows fully), and the pass
+draws that glow beside the colour, one byte a pixel. A chain of small
+pictures — four steps down, each half the size, and three back up —
+spreads the glowing colours, and the result is laid over the picture as
+a screen, `c + s·(1 − c)`: it brightens and never clips, and a pixel
+that glows keeps its own look. Every step sums whole codes, so every
+tier and the CPU draw the same bloom.
+
+```rust
+world.add(Mesh::sphere(0.2), Material::unlit(warm).emissive(warm, 3.0));
+let style = WorldStyle { quality: Quality::High, bloom: 0.6, ..WorldStyle::default() };
+```
+
 A section cuts the picture in the shaders. `world.section_lines(plane)`
 finds the cut itself on the CPU — the outline the plane leaves through
 every shown solid, in the world's space — for a drawing to ink over the
@@ -275,11 +291,11 @@ nothing at all.
 
 ## Quality
 
-| | Samples | Pixel budget | Shadow map | Shadow lookups |
-|---|---|---|---|---|
-| `Quality::Low` | 1 | 1.2 million | 1024² | 1 |
-| `Quality::Medium` (default) | 4 | 2.2 million | 2048² | 4 |
-| `Quality::High` | 4 | 4 million | 2048² | 9 |
+| | Samples | Pixel budget | Shadow map | Shadow lookups | Bloom |
+|---|---|---|---|---|---|
+| `Quality::Low` | 1 | 1.2 million | 1024² | 1 | — |
+| `Quality::Medium` (default) | 4 | 2.2 million | 2048² | 4 | — |
+| `Quality::High` | 4 | 4 million | 2048² | 9 | as the style asks |
 
 The style's quality is an ask, and a governor answers it for each box,
 never above it. It starts from the name the device's graphics answer to
@@ -349,6 +365,6 @@ BUNNY_PARANOID=all cargo test -p bunny-ui-core --all-features
 cargo test -p bunny-ui-apple --features 3d
 cargo run -p bunny-ui-macos --features 3d --example world_window
 # in a page built with the web shell's `3d` feature, from the console:
-#   for (let n = 0; n < 16; n++) __bunny.bunny_gpu_world_parity(n)
+#   for (let n = 0; n < 18; n++) __bunny.bunny_gpu_world_parity(n)
 BUNNY_WORLD_GLB=chair.glb BUNNY_WORLD_DUMP=/tmp cargo test -p bunny-ui-core --features gltf --lib a_glb_from_the_environment -- --ignored
 ```

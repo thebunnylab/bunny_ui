@@ -179,7 +179,10 @@ uniform sampler2D u_materials;
 uniform sampler2D u_surface;
 uniform highp sampler2DShadow u_shadow;
 uniform sampler2D u_floor;
-out vec4 out_color;
+layout(location = 0) out vec4 out_color;
+// how much the pixel glows, premultiplied as its colour: a frame with a
+// bloom draws it beside the colour, and any other frame drops it
+layout(location = 1) out vec4 out_glow;
 
 const int BAYER[16] = int[16](0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5);
 
@@ -386,6 +389,15 @@ vec4 material_row(int row) {
     return texelFetch(u_materials, ivec2((index % 1024) * 4 + row, index / 1024), 0);
 }
 
+// the glow `shade` leaves, in a code premultiplied by its alpha
+float shade_glow = 0.0;
+
+// how much a surface glows, from the light it gives off: its brightest
+// channel, a quarter a unit
+float glow_of(vec3 emissive) {
+    return clamp(max(emissive.r, max(emissive.g, emissive.b)) * 0.25, 0.0, 1.0);
+}
+
 // premultiplied codes over 255: the target's unorm write rounds them to
 // the byte the CPU computes
 vec4 shade() {
@@ -440,6 +452,7 @@ vec4 shade() {
     }
     vec3 code = graded(vec3(encode_code(linear.r), encode_code(linear.g), encode_code(linear.b)));
     vec3 codes = clamp(floor(code * alpha + 0.5 + dither), 0.0, 255.0);
+    shade_glow = floor(glow_of(emissive_row.xyz) * alpha * 255.0 + 0.5);
     return vec4(codes / 255.0, coverage >= 0.0 ? coverage : floor(alpha * 255.0 + 0.5) / 255.0);
 }
 "#;
@@ -448,6 +461,7 @@ vec4 shade() {
 pub const MESH_FRAG: &str = r#"
 void main() {
     out_color = shade();
+    out_glow = vec4(shade_glow / 255.0, 0.0, 0.0, out_color.a);
 }
 "#;
 
@@ -457,6 +471,7 @@ void main() {
 pub const MESH_FRAG_STEPPED: &str = r#"
 void main() {
     out_color = shade();
+    out_glow = vec4(shade_glow / 255.0, 0.0, 0.0, out_color.a);
     float depth = v_zw.x / v_zw.y;
     float slope = max(abs(dFdx(depth)), abs(dFdy(depth)));
     gl_FragDepth = min(gl_FragCoord.z + u_draw.w * slope + DEPTH_TIE, DEPTH_CEILING);
@@ -581,7 +596,8 @@ flat in vec2 v_b;
 flat in vec4 v_depth;
 flat in vec3 v_ea;
 flat in vec3 v_eb;
-out vec4 out_color;
+layout(location = 0) out vec4 out_color;
+layout(location = 1) out vec4 out_glow;
 
 void main() {
     vec2 c = gl_FragCoord.xy;
@@ -617,6 +633,8 @@ void main() {
     vec3 codes = vec3(encode_code(u_style[0].r), encode_code(u_style[0].g), encode_code(u_style[0].b));
     float alpha = coverage * u_style[0].a;
     out_color = vec4(codes * alpha, alpha * 255.0) / 255.0;
+    // an edge glows not, and covers the glow behind it as its colour does
+    out_glow = vec4(0.0, 0.0, 0.0, out_color.a);
     gl_FragDepth = z;
 }
 "#;
@@ -633,7 +651,8 @@ pub const BACKDROP_FRAG: &str = r#"
 // the ramp's ends in codes, the target's size and the backdrop's kind;
 // for a sky, the ground's codes, the world's up and the lens
 uniform vec4 u_ramp[6];
-out vec4 out_color;
+layout(location = 0) out vec4 out_color;
+layout(location = 1) out vec4 out_glow;
 
 void main() {
     vec4 c;
@@ -652,6 +671,87 @@ void main() {
     }
     vec3 rgb = floor((c.rgb * c.a + 127.0) / 255.0);
     out_color = vec4(rgb, c.a) / 255.0;
+    out_glow = vec4(0.0);
+}
+"#;
+
+/// The bloom's steps share these (`super::super::world::bloom`): the
+/// picture above and a second one — the glow, or the step below — read a
+/// whole texel at a time, the edge repeated past it, as whole codes. Each
+/// step is one triangle over its target (`BACKDROP_VERT`).
+pub const BLOOM_COMMON: &str = r#"
+uniform sampler2D u_above;
+uniform sampler2D u_second;
+// (1 when the step down reads the glow, the strength in 256ths, the steps
+// the step below carries, 0)
+uniform vec4 u_bloom;
+layout(location = 0) out vec4 out_color;
+
+const uint BLOOM_BAYER[16] = uint[16](0u, 8u, 2u, 10u, 12u, 4u, 14u, 6u, 3u, 11u, 1u, 9u, 15u, 7u, 13u, 5u);
+
+uvec3 codes_at(sampler2D picture, ivec2 at) {
+    ivec2 size = textureSize(picture, 0);
+    return uvec3(texelFetch(picture, clamp(at, ivec2(0), size - ivec2(1)), 0).rgb * 255.0 + 0.5);
+}
+
+// the step below read at a texel of the step above: the four nearest,
+// weighted 9, 3, 3 and 1
+uvec3 up16(sampler2D below, ivec2 at) {
+    ivec2 m = at / 2;
+    ivec2 o = ivec2((at.x & 1) == 0 ? -1 : 1, (at.y & 1) == 0 ? -1 : 1);
+    return 9u * codes_at(below, m) + 3u * codes_at(below, m + ivec2(o.x, 0)) + 3u * codes_at(below, m + ivec2(0, o.y)) +
+           codes_at(below, m + o);
+}
+"#;
+
+/// A step down: the 4 × 4 block around the texel's own 2 × 2 above, five
+/// for the middle four and one for the ring; the first step reads the
+/// colours times their glow.
+pub const BLOOM_DOWN_FRAG: &str = r#"
+void main() {
+    ivec2 at = ivec2(gl_FragCoord.xy);
+    bool glowing = u_bloom.x > 0.5;
+    ivec2 size = textureSize(u_second, 0);
+    uvec3 sum = uvec3(0u);
+    for (int dy = -1; dy <= 2; dy++) {
+        for (int dx = -1; dx <= 2; dx++) {
+            ivec2 p = 2 * at + ivec2(dx, dy);
+            uvec3 texel = codes_at(u_above, p);
+            if (glowing) {
+                texel *= uint(texelFetch(u_second, clamp(p, ivec2(0), size - ivec2(1)), 0).r * 255.0 + 0.5);
+            }
+            uint weight = (dx == 0 || dx == 1) && (dy == 0 || dy == 1) ? 5u : 1u;
+            sum += weight * texel;
+        }
+    }
+    uint whole = glowing ? 8160u : 32u;
+    out_color = vec4(vec3((sum + whole / 2u) / whole) / 255.0, 1.0);
+}
+"#;
+
+/// A step up: the texel's own step down and the step below read up, each
+/// of the steps below weighing as much as its own.
+pub const BLOOM_UP_FRAG: &str = r#"
+void main() {
+    ivec2 at = ivec2(gl_FragCoord.xy);
+    uint below = uint(u_bloom.z);
+    uint whole = 16u * (below + 1u);
+    uvec3 sum = 16u * codes_at(u_above, at) + below * up16(u_second, at) + whole / 2u;
+    out_color = vec4(vec3(sum / whole) / 255.0, 1.0);
+}
+"#;
+
+/// The spill over the picture: the chain's top read up, times the
+/// strength and a gain of four, as far as the pixel does not glow itself,
+/// dithered to whole codes. The target blends it as a screen.
+pub const BLOOM_SPILL_FRAG: &str = r#"
+void main() {
+    ivec2 at = ivec2(gl_FragCoord.xy);
+    ivec2 size = textureSize(u_above, 0);
+    uint glow = uint(texelFetch(u_above, clamp(at, ivec2(0), size - ivec2(1)), 0).r * 255.0 + 0.5);
+    uint dither = 65280u * BLOOM_BAYER[(at.y & 3) * 4 + (at.x & 3)] + 32640u;
+    uvec3 s = min((uint(u_bloom.y) * 4u * up16(u_second, at) * (255u - glow) + dither) / 1044480u, uvec3(255u));
+    out_color = vec4(vec3(s) / 255.0, float(max(s.r, max(s.g, s.b))) / 255.0);
 }
 "#;
 
@@ -679,7 +779,7 @@ mod tests {
     use super::*;
     use crate::gpu::shaders::{PRELUDE_300ES, PRELUDE_330};
 
-    const BODIES: [(&str, &str); 12] = [
+    const BODIES: [(&str, &str); 16] = [
         ("WORLD_COMMON", WORLD_COMMON),
         ("PARTS", PARTS),
         ("MESH_VERT", MESH_VERT),
@@ -692,6 +792,10 @@ mod tests {
         ("LINE_FRAG", LINE_FRAG),
         ("BACKDROP_FRAG", BACKDROP_FRAG),
         ("COMPOSITE_FRAG_BODY", COMPOSITE_FRAG_BODY),
+        ("BLOOM_COMMON", BLOOM_COMMON),
+        ("BLOOM_DOWN_FRAG", BLOOM_DOWN_FRAG),
+        ("BLOOM_UP_FRAG", BLOOM_UP_FRAG),
+        ("BLOOM_SPILL_FRAG", BLOOM_SPILL_FRAG),
     ];
 
     #[test]
@@ -724,6 +828,25 @@ mod tests {
         }
         // GLSL takes every value as a float literal: a whole number needs its point
         assert!(table.contains("0.0") && table.contains("1.0"));
+    }
+
+    #[test]
+    fn the_bloom_steps_keep_the_oracles_numbers() {
+        use crate::world::bloom;
+        assert_eq!(bloom::GAIN, 4);
+        assert!(BLOOM_SPILL_FRAG.contains("* 4u *") && BLOOM_SPILL_FRAG.contains("1044480u") && BLOOM_SPILL_FRAG.contains("65280u"));
+        assert!(BLOOM_DOWN_FRAG.contains("8160u") && BLOOM_DOWN_FRAG.contains("? 5u : 1u"));
+        assert_eq!(bloom::LEVELS, 4);
+        assert_eq!(bloom::GLOW_PER_LIGHT, 0.25);
+        assert!(MESH_FRAG_COMMON.contains("* 0.25, 0.0, 1.0)"));
+        let table = "uint[16](0u, 8u, 2u, 10u, 12u, 4u, 14u, 6u, 3u, 11u, 1u, 9u, 15u, 7u, 13u, 5u)";
+        assert!(BLOOM_COMMON.contains(table));
+        for y in 0..4 {
+            for x in 0..4 {
+                let index = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5][y * 4 + x];
+                assert_eq!(bloom::bayer_index(x as u32, y as u32), index);
+            }
+        }
     }
 
     #[test]

@@ -21,6 +21,12 @@
 //! (set 2) the surfaces read through a comparing sampler. A frame without
 //! a map binds a texel and a sampler whose comparison always passes.
 //!
+//! A frame with a bloom draws each pixel's glow beside its colour, into a
+//! second attachment of one byte (a render pass of its own, and pipelines
+//! made against it), and after the pass records the chain of
+//! `bunny_ui::world::bloom`: passes into small images of the target's
+//! own, and the spill blended over the target as a screen.
+//!
 //! Vulkan keeps no reference to what a recorded frame reads: whatever
 //! the walk gives back is destroyed only once every frame in flight has
 //! come back ([`VkWorld::sweep`]).
@@ -34,6 +40,7 @@ use std::rc::Rc;
 
 use bunny_ui::gpu::world::{WorldCaps, WorldGround, WorldJob};
 use bunny_ui::image_engine::ImageEngine;
+use bunny_ui::world::bloom::LEVELS;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, ShadowFrame, WorldFrame};
 use bunny_ui::world::wire::{
     SEGMENT_STRIDE, SHADOW_INSTANCE_STRIDE, frame_offset, instance_bytes, instance_offset, material_bytes, part_bytes, shadow_instance_bytes,
@@ -51,6 +58,9 @@ const LINE_FRAG_SPV: &[u8] = include_bytes!("../shaders/world_line.frag.spv");
 const BACKDROP_VERT_SPV: &[u8] = include_bytes!("../shaders/world_backdrop.vert.spv");
 const BACKDROP_FRAG_SPV: &[u8] = include_bytes!("../shaders/world_backdrop.frag.spv");
 const SHADOW_VERT_SPV: &[u8] = include_bytes!("../shaders/world_shadow.vert.spv");
+const BLOOM_DOWN_FRAG_SPV: &[u8] = include_bytes!("../shaders/world_bloom_down.frag.spv");
+const BLOOM_UP_FRAG_SPV: &[u8] = include_bytes!("../shaders/world_bloom_up.frag.spv");
+const BLOOM_SPILL_FRAG_SPV: &[u8] = include_bytes!("../shaders/world_bloom_spill.frag.spv");
 /// The 2D pass's side: a world's target into its box (written by hand,
 /// in the 2D shaders' dialect).
 const COMPOSITE_FRAG_SPV: &[u8] = include_bytes!("../shaders/world_composite.frag.spv");
@@ -71,6 +81,9 @@ mod generator {
                              #define u_draw pc.draw\n#define u_rows pc.rows\n#define u_style pc.style";
 
     const PUSH_RAMP: &str = "layout(push_constant) uniform Ramp {\n    vec4 ramp[6];\n} pc;\n#define u_ramp pc.ramp";
+
+    /// A bloom step's four values, as push constants.
+    const PUSH_BLOOM: &str = "layout(push_constant) uniform Bloom {\n    vec4 bloom;\n} pc;\n#define u_bloom pc.bloom";
 
     /// The material table: a storage buffer, four rows a material.
     const MATERIALS: &str = "layout(std430, set = 0, binding = 1) readonly buffer Materials {\n    vec4 rows[];\n} materials;";
@@ -107,6 +120,9 @@ mod generator {
             ("world_backdrop.vert", stage(&[gl::BACKDROP_VERT])),
             ("world_backdrop.frag", stage(&[gl::BACKDROP_FRAG])),
             ("world_shadow.vert", stage(&[gl::WORLD_COMMON, gl::PARTS, gl::SHADOW_VERT])),
+            ("world_bloom_down.frag", stage(&[gl::BLOOM_COMMON, gl::BLOOM_DOWN_FRAG])),
+            ("world_bloom_up.frag", stage(&[gl::BLOOM_COMMON, gl::BLOOM_UP_FRAG])),
+            ("world_bloom_spill.frag", stage(&[gl::BLOOM_COMMON, gl::BLOOM_SPILL_FRAG])),
         ]
     }
 
@@ -143,6 +159,9 @@ mod generator {
                 "uniform highp sampler2DShadow u_shadow;" => "layout(set = 2, binding = 0) uniform sampler2DShadow u_shadow;",
                 "uniform sampler2D u_floor;" => "layout(set = 3, binding = 0) uniform sampler2D u_floor;",
                 "uniform highp usampler2D u_parts;" => PARTS,
+                "uniform sampler2D u_above;" => "layout(set = 0, binding = 0) uniform sampler2D u_above;",
+                "uniform sampler2D u_second;" => "layout(set = 0, binding = 1) uniform sampler2D u_second;",
+                "uniform vec4 u_bloom;" => PUSH_BLOOM,
                 _ => "",
             };
             if !rewritten.is_empty() {
@@ -170,6 +189,8 @@ mod generator {
 
 const ST_PIPELINE_DEPTH_STENCIL: u32 = 25;
 const FORMAT_D32_SFLOAT: u32 = 126;
+const FORMAT_R8_UNORM: u32 = 9;
+const BLEND_FACTOR_ONE_MINUS_DST_COLOR: u32 = 5;
 const FORMAT_D16_UNORM: u32 = 124;
 const FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR: u32 = 0x1000;
 const FORMAT_R32G32B32_SFLOAT: u32 = 106;
@@ -282,6 +303,44 @@ struct Modules {
     backdrop_frag: ShaderModule,
 }
 
+/// The bloom's steps: their set layout (the picture above and a second
+/// one), their pipeline layout (four values pushed), the passes they draw
+/// in, and their pipelines.
+struct BloomStack {
+    set_layout: DescriptorSetLayout,
+    layout: PipelineLayout,
+    /// A step: what the image held is dropped.
+    step_pass: RenderPass,
+    /// The spill: blended over the target's picture.
+    spill_pass: RenderPass,
+    /// Down, back up, the spill.
+    pipelines: [Pipeline; 3],
+}
+
+/// A texture of the chain: its image, the framebuffer a step draws it
+/// through, and the set of what that step reads.
+struct Step {
+    image: Image,
+    framebuffer: Framebuffer,
+    set: DescriptorSet,
+    size: (u32, u32),
+}
+
+/// A target's bloom, made on its first frame with a bloom.
+struct BloomTargets {
+    /// The glow at one sample: drawn into, or resolved into from its
+    /// samples; what the chain reads.
+    glow: Image,
+    glow_samples: Option<Image>,
+    /// The target's pass with the glow beside the colour.
+    framebuffer: Framebuffer,
+    /// The target's picture alone, for the spill.
+    spill_framebuffer: Framebuffer,
+    spill_set: DescriptorSet,
+    down: Vec<Step>,
+    up: Vec<Step>,
+}
+
 struct WorldStack {
     /// Set 0: the frame's block and its material table.
     frame_layout: DescriptorSetLayout,
@@ -300,10 +359,14 @@ struct WorldStack {
     always_sampler: Sampler,
     lit: ShadowMap,
     layout: PipelineLayout,
-    /// The pass at one sample, and at four.
-    passes: [RenderPass; 2],
+    /// The pass at one sample, at four, and both again with the glow
+    /// beside the colour: `[(samples > 1) as usize + 2 · glow]`.
+    passes: [RenderPass; 4],
     modules: Modules,
-    pipelines: HashMap<(Pipe, u8), Pipeline>,
+    /// By the way they meet the target, the samples, and whether the pass
+    /// draws the glow.
+    pipelines: HashMap<(Pipe, u8, bool), Pipeline>,
+    bloom: BloomStack,
     /// The 2D pass's pipeline for a world's target.
     composite: Pipeline,
     /// Trilinear and repeating: a surface's picture.
@@ -393,6 +456,7 @@ enum Garbage {
     Surface(Surface),
     Segments(Buffer),
     Shadow(ShadowMap),
+    Bloom(BloomTargets),
 }
 
 /// One frame slot's share: the frame's blocks, and the pool their sets
@@ -422,6 +486,8 @@ pub(super) struct VkWorld {
     surfaces: HashMap<u64, Surface>,
     segments: HashMap<u64, Segments>,
     shadow_maps: HashMap<u64, ShadowMap>,
+    /// By target.
+    blooms: HashMap<u64, BloomTargets>,
     next: u64,
     slots: [WorldSlot; 3],
     /// What was given back, with the frame it was given back on.
@@ -465,6 +531,7 @@ impl VkWorld {
             surfaces: HashMap::new(),
             segments: HashMap::new(),
             shadow_maps: HashMap::new(),
+            blooms: HashMap::new(),
             next: 1,
             slots: [WorldSlot::empty(), WorldSlot::empty(), WorldSlot::empty()],
             graveyard: Vec::new(),
@@ -516,6 +583,7 @@ impl VkWorld {
                     (stack.fns.free_descriptor_sets)(stack.device, world.surface_pool, 1, &map.set);
                     destroy_image(stack, map.image);
                 }
+                Garbage::Bloom(bloom) => world.release_bloom(stack, bloom),
             }
         }
     }
@@ -528,7 +596,9 @@ impl VkWorld {
         let surfaces: Vec<Surface> = self.surfaces.drain().map(|(_, surface)| surface).collect();
         let segments: Vec<Buffer> = self.segments.drain().filter_map(|(_, set)| set.buffer).collect();
         let shadow_maps: Vec<ShadowMap> = self.shadow_maps.drain().map(|(_, map)| map).collect();
+        let blooms: Vec<BloomTargets> = self.blooms.drain().map(|(_, bloom)| bloom).collect();
         let mut garbage: Vec<Garbage> = std::mem::take(&mut self.graveyard).into_iter().map(|(_, garbage)| garbage).collect();
+        garbage.extend(blooms.into_iter().map(Garbage::Bloom));
         garbage.extend(shadow_maps.into_iter().map(Garbage::Shadow));
         garbage.extend(targets.into_iter().map(Garbage::Target));
         garbage.extend(meshes.into_iter().map(Garbage::Mesh));
@@ -569,9 +639,20 @@ impl VkWorld {
         if jobs.is_empty() {
             return false;
         }
-        let VkWorld { built, targets, meshes, surfaces, segments, shadow_maps, slots, .. } = self;
+        let VkWorld { built, targets, meshes, surfaces, segments, shadow_maps, blooms, slots, .. } = self;
         let Built::Ready(world) = built else { return false };
         let slot = &mut slots[slot];
+        // a frame with a bloom draws its glow beside its colour: the
+        // target's bloom, made on its first
+        for job in jobs {
+            if job.frame.bloom > 0
+                && !blooms.contains_key(&job.target)
+                && let Some(target) = targets.get(&job.target)
+                && let Some(bloom) = unsafe { world.bloom_targets(stack, target) }
+            {
+                blooms.insert(job.target, bloom);
+            }
+        }
         // the casters each job draws into its map first, if any
         let held: Vec<Option<(bunny_ui::gpu::world::ShadowJob, &ShadowMap)>> =
             jobs.iter().map(|job| job.shadow.and_then(|shadow| shadow_maps.get(&shadow.map).map(|map| (shadow, map)))).collect();
@@ -618,7 +699,8 @@ impl VkWorld {
                     set: held.map_or(world.lit.set, |(_, map)| map.set),
                     draw: held.and_then(|(_, map)| draw.map(|shadow| (map, shadow, casters as u64))),
                 };
-                world.record(stack, command, job, target, set, slot.buffer, instances as u64, &shadow, meshes, surfaces, segments);
+                let bloom = if frame.bloom > 0 { blooms.get(&job.target) } else { None };
+                world.record(stack, command, job, target, bloom, set, slot.buffer, instances as u64, &shadow, meshes, surfaces, segments);
             }
         }
         true
@@ -823,7 +905,7 @@ impl WorldStack {
             if !ok((fns.create_pipeline_layout)(stack.device, &layout_info, std::ptr::null(), &mut layout)) {
                 return Err("the world pipeline layout refused".into());
             }
-            let passes = [world_pass(stack, 1)?, world_pass(stack, 4)?];
+            let passes = [world_pass(stack, 1, false)?, world_pass(stack, 4, false)?, world_pass(stack, 1, true)?, world_pass(stack, 4, true)?];
             let shadow_pass = shadow_pass(stack)?;
             let modules = Modules {
                 mesh_vert: stack.shader(MESH_VERT_SPV)?,
@@ -913,6 +995,7 @@ impl WorldStack {
             let compare_sampler = comparing(COMPARE_LESS_OR_EQUAL)?;
             let always_sampler = comparing(COMPARE_ALWAYS)?;
             let shadow_pipeline = caster_pipeline(stack, layout, shadow_pass, modules.shadow_vert)?;
+            let bloom = bloom_stack(stack, modules.backdrop_vert)?;
             let pool_size = DescriptorPoolSize { descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, count: 1024 };
             let pool_info = DescriptorPoolCreateInfo {
                 s_type: ST_DESCRIPTOR_POOL_CREATE,
@@ -939,6 +1022,7 @@ impl WorldStack {
                 passes,
                 modules,
                 pipelines: HashMap::new(),
+                bloom,
                 composite,
                 surface_sampler,
                 surface_pool,
@@ -982,6 +1066,13 @@ impl WorldStack {
             }
             (fns.destroy_pipeline)(stack.device, self.composite, std::ptr::null());
             (fns.destroy_pipeline)(stack.device, self.shadow_pipeline, std::ptr::null());
+            for pipeline in self.bloom.pipelines {
+                (fns.destroy_pipeline)(stack.device, pipeline, std::ptr::null());
+            }
+            (fns.destroy_render_pass)(stack.device, self.bloom.step_pass, std::ptr::null());
+            (fns.destroy_render_pass)(stack.device, self.bloom.spill_pass, std::ptr::null());
+            (fns.destroy_pipeline_layout)(stack.device, self.bloom.layout, std::ptr::null());
+            (fns.destroy_descriptor_set_layout)(stack.device, self.bloom.set_layout, std::ptr::null());
             let modules = &self.modules;
             for module in [
                 modules.mesh_vert,
@@ -1140,21 +1231,22 @@ impl WorldStack {
         }
     }
 
-    /// The pipeline for `pipe` at `samples`, made on its first ask; 0
-    /// when the device refuses it (the draw is skipped, and says so once).
-    fn pipeline(&mut self, stack: &VkStack, pipe: Pipe, samples: u8) -> Pipeline {
-        if let Some(&pipeline) = self.pipelines.get(&(pipe, samples)) {
+    /// The pipeline for `pipe` at `samples`, in the pass that draws the
+    /// glow when `glow` says so, made on its first ask; 0 when the device
+    /// refuses it (the draw is skipped, and says so once).
+    fn pipeline(&mut self, stack: &VkStack, pipe: Pipe, samples: u8, glow: bool) -> Pipeline {
+        if let Some(&pipeline) = self.pipelines.get(&(pipe, samples, glow)) {
             return pipeline;
         }
-        let pipeline = unsafe { self.make_pipeline(stack, pipe, samples) }.unwrap_or_else(|reason| {
+        let pipeline = unsafe { self.make_pipeline(stack, pipe, samples, glow) }.unwrap_or_else(|reason| {
             eprintln!("bunny_ui vk: {reason}");
             0
         });
-        self.pipelines.insert((pipe, samples), pipeline);
+        self.pipelines.insert((pipe, samples, glow), pipeline);
         pipeline
     }
 
-    unsafe fn make_pipeline(&self, stack: &VkStack, pipe: Pipe, samples: u8) -> Result<Pipeline, String> {
+    unsafe fn make_pipeline(&self, stack: &VkStack, pipe: Pipe, samples: u8, glow: bool) -> Result<Pipeline, String> {
         let modules = &self.modules;
         let (vert, frag) = match pipe {
             Pipe::Mesh { stepped: false, .. } => (modules.mesh_vert, modules.mesh_frag),
@@ -1342,14 +1434,16 @@ impl WorldStack {
                 write_mask: 0xF,
             },
         };
+        // the glow blends as the colour does
+        let attachments = [attachment; 2];
         let color_blend = PipelineColorBlend {
             s_type: ST_PIPELINE_COLOR_BLEND,
             p_next: std::ptr::null(),
             flags: 0,
             logic_op_enable: 0,
             logic_op: 0,
-            attachment_count: 1,
-            attachments: &attachment,
+            attachment_count: 1 + glow as u32,
+            attachments: attachments.as_ptr(),
             blend_constants: [0.0; 4],
         };
         let dynamic_states = [DYNAMIC_STATE_VIEWPORT, DYNAMIC_STATE_SCISSOR];
@@ -1376,7 +1470,7 @@ impl WorldStack {
             color_blend: &color_blend,
             dynamic: &dynamic,
             layout: self.layout,
-            render_pass: self.passes[(samples > 1) as usize],
+            render_pass: self.passes[(samples > 1) as usize + 2 * glow as usize],
             subpass: 0,
             base_pipeline: 0,
             base_index: -1,
@@ -1384,7 +1478,7 @@ impl WorldStack {
         let mut pipeline: Pipeline = 0;
         unsafe {
             if !ok((stack.fns.create_graphics_pipelines)(stack.device, 0, 1, &info, std::ptr::null(), &mut pipeline)) {
-                return Err(format!("the world pipeline {pipe:?} at {samples} samples refused"));
+                return Err(format!("the world pipeline {pipe:?} at {samples} samples (glow: {glow}) refused"));
             }
         }
         Ok(pipeline)
@@ -1502,6 +1596,7 @@ impl WorldStack {
         command: CommandBuffer,
         job: &WorldJob,
         target: &Target,
+        bloom: Option<&BloomTargets>,
         set: DescriptorSet,
         blocks: BufferHandle,
         instances: u64,
@@ -1514,6 +1609,7 @@ impl WorldStack {
         let frame = &job.frame;
         let (width, height) = target.size;
         let samples = target.samples;
+        let glow = bloom.is_some();
         unsafe {
             // the sun's map first, when it does not hold this frame's casters
             if let Some((map, casters, rows)) = shadow.draw {
@@ -1526,16 +1622,22 @@ impl WorldStack {
                 }
                 Background::Transparent | Background::Gradient { .. } | Background::Sky { .. } => [0.0; 4],
             };
-            // colour, depth, and the resolve (never cleared)
-            let clears = [color, [1.0, 0.0, 0.0, 0.0], [0.0; 4]];
+            // colour, depth, the resolve (never cleared), and with a bloom
+            // the glow (cleared to none) and its resolve; at one sample the
+            // glow takes the resolve's place
+            let clears = [color, [1.0, 0.0, 0.0, 0.0], [0.0; 4], [0.0; 4], [0.0; 4]];
             let begin = RenderPassBeginInfo {
                 s_type: ST_RENDER_PASS_BEGIN,
                 p_next: std::ptr::null(),
-                render_pass: self.passes[(samples > 1) as usize],
-                framebuffer: target.framebuffer,
+                render_pass: self.passes[(samples > 1) as usize + 2 * glow as usize],
+                framebuffer: bloom.map_or(target.framebuffer, |bloom| bloom.framebuffer),
                 render_area_offset: [0, 0],
                 render_area_extent: [width, height],
-                clear_count: if samples > 1 { 3 } else { 2 },
+                clear_count: match (samples > 1, glow) {
+                    (false, false) => 2,
+                    (true, false) | (false, true) => 3,
+                    (true, true) => 5,
+                },
                 clears: clears.as_ptr(),
             };
             (fns.cmd_begin_render_pass)(command, &begin, SUBPASS_CONTENTS_INLINE);
@@ -1563,7 +1665,7 @@ impl WorldStack {
                 );
             };
             if let Some(rows) = frame.backdrop() {
-                let pipeline = self.pipeline(stack, Pipe::Backdrop, samples);
+                let pipeline = self.pipeline(stack, Pipe::Backdrop, samples, glow);
                 if pipeline != 0 {
                     // the ramp's six rows ride the draw's six
                     let ramp = DrawPush { draw: rows[0], rows: [rows[1], rows[2], rows[3]], style: [rows[4], rows[5]] };
@@ -1584,7 +1686,7 @@ impl WorldStack {
                         let bias = if replace { frame.face_bias } else { 0.0 };
                         // with four samples a cut-out's edge becomes coverage
                         let coverage = mask && samples > 1;
-                        let pipeline = self.pipeline(stack, Pipe::Mesh { blend, stepped: bias > 0.0, cull_back, mirrored, coverage }, samples);
+                        let pipeline = self.pipeline(stack, Pipe::Mesh { blend, stepped: bias > 0.0, cull_back, mirrored, coverage }, samples, glow);
                         if pipeline == 0 {
                             continue;
                         }
@@ -1623,7 +1725,7 @@ impl WorldStack {
                         if set.count == 0 {
                             continue;
                         }
-                        let pipeline = self.pipeline(stack, Pipe::Lines((style.shape[3] as u8).min(2)), samples);
+                        let pipeline = self.pipeline(stack, Pipe::Lines((style.shape[3] as u8).min(2)), samples, glow);
                         if pipeline == 0 {
                             continue;
                         }
@@ -1636,6 +1738,198 @@ impl WorldStack {
                 }
             }
             (fns.cmd_end_render_pass)(command);
+            if let Some(bloom) = bloom {
+                self.record_bloom(stack, command, target, bloom, frame.bloom);
+            }
+        }
+    }
+
+    /// The chain over the target's resolved picture: four steps down from
+    /// its colours and glow, three back up, and the spill blended over the
+    /// picture. Each step is a pass of its own; their dependencies make
+    /// each step's image ready for the step after.
+    unsafe fn record_bloom(&self, stack: &VkStack, command: CommandBuffer, target: &Target, bloom: &BloomTargets, strength: u16) {
+        let fns = &stack.fns;
+        let layout = self.bloom.layout;
+        unsafe {
+            let step = |pass: RenderPass, framebuffer: Framebuffer, (width, height): (u32, u32), pipeline: Pipeline, set: DescriptorSet, values: [f32; 4]| {
+                let begin = RenderPassBeginInfo {
+                    s_type: ST_RENDER_PASS_BEGIN,
+                    p_next: std::ptr::null(),
+                    render_pass: pass,
+                    framebuffer,
+                    render_area_offset: [0, 0],
+                    render_area_extent: [width, height],
+                    clear_count: 0,
+                    clears: std::ptr::null(),
+                };
+                (fns.cmd_begin_render_pass)(command, &begin, SUBPASS_CONTENTS_INLINE);
+                let viewport = Viewport { x: 0.0, y: 0.0, width: width as f32, height: height as f32, min_depth: 0.0, max_depth: 1.0 };
+                (fns.cmd_set_viewport)(command, 0, 1, &viewport);
+                let scissor = Rect2D { offset: [0, 0], extent: [width, height] };
+                (fns.cmd_set_scissor)(command, 0, 1, &scissor);
+                (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+                (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, std::ptr::null());
+                (fns.cmd_push_constants)(command, layout, SHADER_STAGE_FRAGMENT, 0, 16, values.as_ptr().cast());
+                (fns.cmd_draw)(command, 3, 1, 0, 0);
+                (fns.cmd_end_render_pass)(command);
+            };
+            let [down, up, spill] = self.bloom.pipelines;
+            for (level, at) in bloom.down.iter().enumerate() {
+                let values = if level == 0 { [1.0, 0.0, 0.0, 0.0] } else { [0.0; 4] };
+                step(self.bloom.step_pass, at.framebuffer, at.size, down, at.set, values);
+            }
+            for (below, level) in (0..LEVELS - 1).rev().enumerate() {
+                let at = &bloom.up[level];
+                step(self.bloom.step_pass, at.framebuffer, at.size, up, at.set, [0.0, 0.0, (below + 1) as f32, 0.0]);
+            }
+            step(self.bloom.spill_pass, bloom.spill_framebuffer, target.size, spill, bloom.spill_set, [0.0, strength as f32, 0.0, 0.0]);
+        }
+    }
+
+    /// A target's bloom: its glow, the target's pass with the glow beside
+    /// the colour, the chain's images, and the set each step reads.
+    /// `None` when the device refuses a part (what was made goes back).
+    unsafe fn bloom_targets(&self, stack: &VkStack, target: &Target) -> Option<BloomTargets> {
+        let fns = &stack.fns;
+        let (width, height) = target.size;
+        let read = IMAGE_USAGE_COLOR_ATTACHMENT | IMAGE_USAGE_SAMPLED;
+        let sizes = bunny_ui::world::bloom::sizes(target.size);
+        let chain_sizes: Vec<(u32, u32)> = sizes.iter().chain(sizes[..LEVELS - 1].iter()).copied().collect();
+        unsafe {
+            let glow = image(stack, width, height, FORMAT_R8_UNORM, 1, 1, read, IMAGE_ASPECT_COLOR, false);
+            let glow_samples = if target.samples > 1 {
+                let transient = IMAGE_USAGE_COLOR_ATTACHMENT | IMAGE_USAGE_TRANSIENT_ATTACHMENT;
+                image(stack, width, height, FORMAT_R8_UNORM, 1, target.samples, transient, IMAGE_ASPECT_COLOR, true)
+            } else {
+                None
+            };
+            let chain: Vec<Option<Image>> =
+                chain_sizes.iter().map(|&(w, h)| image(stack, w, h, FORMAT_R8G8B8A8_UNORM, 1, 1, read, IMAGE_ASPECT_COLOR, false)).collect();
+            let complete = glow.is_some() && (target.samples == 1 || glow_samples.is_some()) && chain.iter().all(Option::is_some);
+            if !complete {
+                for image in [glow, glow_samples].into_iter().chain(chain).flatten() {
+                    destroy_image(stack, image);
+                }
+                return None;
+            }
+            let glow = glow?;
+            let chain: Vec<Image> = chain.into_iter().flatten().collect();
+            // the target's pass with the glow: colour, depth, the resolve,
+            // the glow's samples and its resolve — or at one sample the
+            // picture, depth, and the glow
+            let views: Vec<ImageView> = match (&target.color, &glow_samples) {
+                (Some(color), Some(samples)) => vec![color.view, target.depth.view, target.picture.view, samples.view, glow.view],
+                _ => vec![target.picture.view, target.depth.view, glow.view],
+            };
+            let info = FramebufferCreateInfo {
+                s_type: ST_FRAMEBUFFER_CREATE,
+                p_next: std::ptr::null(),
+                flags: 0,
+                render_pass: self.passes[(target.samples > 1) as usize + 2],
+                attachment_count: views.len() as u32,
+                attachments: views.as_ptr(),
+                width,
+                height,
+                layers: 1,
+            };
+            let mut framebuffer: Framebuffer = 0;
+            if !ok((fns.create_framebuffer)(stack.device, &info, std::ptr::null(), &mut framebuffer)) {
+                framebuffer = 0;
+            }
+            let spill_framebuffer = stack.framebuffer_of(self.bloom.spill_pass, target.picture.view, width, height).unwrap_or(0);
+            // what each step reads: the picture and its glow, then each
+            // step down the one above; each step up its own step down and
+            // the step below; the spill the glow and the chain's top
+            let view = |index: usize| chain[index].view;
+            let mut reads: Vec<(ImageView, ImageView)> = vec![(target.picture.view, glow.view)];
+            reads.extend((1..LEVELS).map(|level| (view(level - 1), view(level - 1))));
+            let mut up_reads = vec![(0, 0); LEVELS - 1];
+            for level in (0..LEVELS - 1).rev() {
+                let lower = if level == LEVELS - 2 { view(LEVELS - 1) } else { view(LEVELS + level + 1) };
+                up_reads[level] = (view(level), lower);
+            }
+            reads.extend(up_reads);
+            let spill_set = self.bloom_set(stack, glow.view, view(LEVELS)).unwrap_or(0);
+            let mut steps: Vec<Step> = chain
+                .into_iter()
+                .zip(chain_sizes)
+                .zip(reads)
+                .map(|((image, size), (above, second))| {
+                    let framebuffer = stack.framebuffer_of(self.bloom.step_pass, image.view, size.0, size.1).unwrap_or(0);
+                    let set = self.bloom_set(stack, above, second).unwrap_or(0);
+                    Step { image, framebuffer, set, size }
+                })
+                .collect();
+            let up = steps.split_off(LEVELS);
+            let bloom = BloomTargets { glow, glow_samples, framebuffer, spill_framebuffer, spill_set, down: steps, up };
+            let whole = bloom.framebuffer != 0
+                && bloom.spill_framebuffer != 0
+                && bloom.spill_set != 0
+                && bloom.down.iter().chain(&bloom.up).all(|step| step.framebuffer != 0 && step.set != 0);
+            if !whole {
+                self.release_bloom(stack, bloom);
+                return None;
+            }
+            Some(bloom)
+        }
+    }
+
+    /// A set of the bloom's layout over two pictures.
+    unsafe fn bloom_set(&self, stack: &VkStack, above: ImageView, second: ImageView) -> Option<DescriptorSet> {
+        let fns = &stack.fns;
+        unsafe {
+            let allocate = DescriptorSetAllocateInfo {
+                s_type: ST_DESCRIPTOR_SET_ALLOCATE,
+                p_next: std::ptr::null(),
+                pool: self.surface_pool,
+                count: 1,
+                layouts: &self.bloom.set_layout,
+            };
+            let mut set: DescriptorSet = 0;
+            if !ok((fns.allocate_descriptor_sets)(stack.device, &allocate, &mut set)) {
+                return None;
+            }
+            let infos = [
+                DescriptorImageInfo { sampler: self.surface_sampler, image_view: above, layout: IMAGE_LAYOUT_SHADER_READ_ONLY },
+                DescriptorImageInfo { sampler: self.surface_sampler, image_view: second, layout: IMAGE_LAYOUT_SHADER_READ_ONLY },
+            ];
+            let write = |binding: u32| WriteDescriptorSet {
+                s_type: ST_WRITE_DESCRIPTOR_SET,
+                p_next: std::ptr::null(),
+                set,
+                binding,
+                array_element: 0,
+                count: 1,
+                descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                image_info: &infos[binding as usize],
+                buffer_info: std::ptr::null(),
+                texel_view: std::ptr::null(),
+            };
+            let writes = [write(0), write(1)];
+            (fns.update_descriptor_sets)(stack.device, 2, writes.as_ptr(), 0, std::ptr::null());
+            Some(set)
+        }
+    }
+
+    /// What a target's bloom made; no frame in flight reads it.
+    unsafe fn release_bloom(&self, stack: &VkStack, bloom: BloomTargets) {
+        let fns = &stack.fns;
+        unsafe {
+            let steps = bloom.down.iter().chain(&bloom.up);
+            for framebuffer in [bloom.framebuffer, bloom.spill_framebuffer].into_iter().chain(steps.clone().map(|step| step.framebuffer)) {
+                if framebuffer != 0 {
+                    (fns.destroy_framebuffer)(stack.device, framebuffer, std::ptr::null());
+                }
+            }
+            let sets: Vec<DescriptorSet> = steps.map(|step| step.set).chain([bloom.spill_set]).filter(|set| *set != 0).collect();
+            if !sets.is_empty() {
+                (fns.free_descriptor_sets)(stack.device, self.surface_pool, sets.len() as u32, sets.as_ptr());
+            }
+            let images = [Some(bloom.glow), bloom.glow_samples].into_iter().flatten();
+            for image in images.chain(bloom.down.into_iter().chain(bloom.up).map(|step| step.image)) {
+                destroy_image(stack, image);
+            }
         }
     }
 }
@@ -2002,21 +2296,35 @@ unsafe fn shadow_pass(stack: &VkStack) -> Result<RenderPass, String> {
 
 /// The render pass of a world at `samples`: colour and depth cleared,
 /// the picture left ready to be sampled — resolved from four samples, or
-/// drawn straight at one. Its dependencies order it after the frames
-/// that sampled or drew the same target, and before the 2D pass that
-/// samples it now (or a copy out).
-unsafe fn world_pass(stack: &VkStack, samples: u8) -> Result<RenderPass, String> {
-    let count = if samples > 1 { SAMPLE_COUNT_4 } else { SAMPLE_COUNT_1 };
-    let color = AttachmentDescription {
+/// drawn straight at one. With `glow`, a one-byte glow beside the colour,
+/// cleared to none and left ready the same way. Its dependencies order it
+/// after the frames that sampled or drew the same target, and before the
+/// 2D pass that samples it now (or a copy out, or the bloom's chain).
+unsafe fn world_pass(stack: &VkStack, samples: u8, glow: bool) -> Result<RenderPass, String> {
+    let multisampled = samples > 1;
+    let count = if multisampled { SAMPLE_COUNT_4 } else { SAMPLE_COUNT_1 };
+    // what is drawn: kept at one sample, dropped at four once resolved
+    let drawn = |format: u32| AttachmentDescription {
         flags: 0,
-        format: FORMAT_R8G8B8A8_UNORM,
+        format,
         samples: count,
         load_op: ATTACHMENT_LOAD_CLEAR,
-        store_op: if samples > 1 { ATTACHMENT_STORE_DONT_CARE } else { ATTACHMENT_STORE_STORE },
+        store_op: if multisampled { ATTACHMENT_STORE_DONT_CARE } else { ATTACHMENT_STORE_STORE },
         stencil_load: ATTACHMENT_LOAD_DONT_CARE,
         stencil_store: ATTACHMENT_STORE_DONT_CARE,
         initial_layout: IMAGE_LAYOUT_UNDEFINED,
-        final_layout: if samples > 1 { IMAGE_LAYOUT_COLOR_ATTACHMENT } else { IMAGE_LAYOUT_SHADER_READ_ONLY },
+        final_layout: if multisampled { IMAGE_LAYOUT_COLOR_ATTACHMENT } else { IMAGE_LAYOUT_SHADER_READ_ONLY },
+    };
+    let resolved = |format: u32| AttachmentDescription {
+        flags: 0,
+        format,
+        samples: SAMPLE_COUNT_1,
+        load_op: ATTACHMENT_LOAD_DONT_CARE,
+        store_op: ATTACHMENT_STORE_STORE,
+        stencil_load: ATTACHMENT_LOAD_DONT_CARE,
+        stencil_store: ATTACHMENT_STORE_DONT_CARE,
+        initial_layout: IMAGE_LAYOUT_UNDEFINED,
+        final_layout: IMAGE_LAYOUT_SHADER_READ_ONLY,
     };
     let depth = AttachmentDescription {
         flags: 0,
@@ -2029,29 +2337,38 @@ unsafe fn world_pass(stack: &VkStack, samples: u8) -> Result<RenderPass, String>
         initial_layout: IMAGE_LAYOUT_UNDEFINED,
         final_layout: IMAGE_LAYOUT_DEPTH_ATTACHMENT,
     };
-    let resolve = AttachmentDescription {
-        flags: 0,
-        format: FORMAT_R8G8B8A8_UNORM,
-        samples: SAMPLE_COUNT_1,
-        load_op: ATTACHMENT_LOAD_DONT_CARE,
-        store_op: ATTACHMENT_STORE_STORE,
-        stencil_load: ATTACHMENT_LOAD_DONT_CARE,
-        stencil_store: ATTACHMENT_STORE_DONT_CARE,
-        initial_layout: IMAGE_LAYOUT_UNDEFINED,
-        final_layout: IMAGE_LAYOUT_SHADER_READ_ONLY,
-    };
-    let attachments = [color, depth, resolve];
-    let color_reference = AttachmentReference { attachment: 0, layout: IMAGE_LAYOUT_COLOR_ATTACHMENT };
+    // colour, depth, then the resolve; the glow and its resolve after
+    let mut attachments = vec![drawn(FORMAT_R8G8B8A8_UNORM), depth];
+    if multisampled {
+        attachments.push(resolved(FORMAT_R8G8B8A8_UNORM));
+    }
+    if glow {
+        attachments.push(drawn(FORMAT_R8_UNORM));
+        if multisampled {
+            attachments.push(resolved(FORMAT_R8_UNORM));
+        }
+    }
+    let reference = |attachment: u32| AttachmentReference { attachment, layout: IMAGE_LAYOUT_COLOR_ATTACHMENT };
+    let mut colors = vec![reference(0)];
+    let mut resolves = Vec::new();
+    if multisampled {
+        resolves.push(reference(2));
+    }
+    if glow {
+        colors.push(reference(if multisampled { 3 } else { 2 }));
+        if multisampled {
+            resolves.push(reference(4));
+        }
+    }
     let depth_reference = AttachmentReference { attachment: 1, layout: IMAGE_LAYOUT_DEPTH_ATTACHMENT };
-    let resolve_reference = AttachmentReference { attachment: 2, layout: IMAGE_LAYOUT_COLOR_ATTACHMENT };
     let subpass = SubpassDescription {
         flags: 0,
         bind_point: PIPELINE_BIND_POINT_GRAPHICS,
         input_count: 0,
         inputs: std::ptr::null(),
-        color_count: 1,
-        colors: &color_reference,
-        resolves: if samples > 1 { &resolve_reference } else { std::ptr::null() },
+        color_count: colors.len() as u32,
+        colors: colors.as_ptr(),
+        resolves: if resolves.is_empty() { std::ptr::null() } else { resolves.as_ptr() },
         depth: &depth_reference,
         preserve_count: 0,
         preserves: std::ptr::null(),
@@ -2084,7 +2401,7 @@ unsafe fn world_pass(stack: &VkStack, samples: u8) -> Result<RenderPass, String>
         s_type: ST_RENDER_PASS_CREATE,
         p_next: std::ptr::null(),
         flags: 0,
-        attachment_count: if samples > 1 { 3 } else { 2 },
+        attachment_count: attachments.len() as u32,
         attachments: attachments.as_ptr(),
         subpass_count: 1,
         subpasses: &subpass,
@@ -2094,10 +2411,260 @@ unsafe fn world_pass(stack: &VkStack, samples: u8) -> Result<RenderPass, String>
     let mut pass: RenderPass = 0;
     unsafe {
         if !ok((stack.fns.create_render_pass)(stack.device, &info, std::ptr::null(), &mut pass)) {
-            return Err(format!("the world render pass at {samples} samples refused"));
+            return Err(format!("the world render pass at {samples} samples (glow: {glow}) refused"));
         }
     }
     Ok(pass)
+}
+
+/// The bloom's steps: a set of two pictures, four values pushed, a pass
+/// that drops what its image held and one that blends over the picture,
+/// and the three pipelines, over the backdrop's triangle.
+unsafe fn bloom_stack(stack: &VkStack, vertex: ShaderModule) -> Result<BloomStack, String> {
+    let fns = &stack.fns;
+    unsafe {
+        let binding = |binding: u32| DescriptorSetLayoutBinding {
+            binding,
+            descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            count: 1,
+            stages: SHADER_STAGE_FRAGMENT,
+            immutable_samplers: std::ptr::null(),
+        };
+        let bindings = [binding(0), binding(1)];
+        let info = DescriptorSetLayoutCreateInfo {
+            s_type: ST_DESCRIPTOR_SET_LAYOUT_CREATE,
+            p_next: std::ptr::null(),
+            flags: 0,
+            binding_count: 2,
+            bindings: bindings.as_ptr(),
+        };
+        let mut set_layout: DescriptorSetLayout = 0;
+        if !ok((fns.create_descriptor_set_layout)(stack.device, &info, std::ptr::null(), &mut set_layout)) {
+            return Err("the bloom's set layout refused".into());
+        }
+        let push_range = PushConstantRange { stages: SHADER_STAGE_FRAGMENT, offset: 0, size: 16 };
+        let layout_info = PipelineLayoutCreateInfo {
+            s_type: ST_PIPELINE_LAYOUT_CREATE,
+            p_next: std::ptr::null(),
+            flags: 0,
+            set_layout_count: 1,
+            set_layouts: &set_layout,
+            push_range_count: 1,
+            push_ranges: &push_range,
+        };
+        let mut layout: PipelineLayout = 0;
+        if !ok((fns.create_pipeline_layout)(stack.device, &layout_info, std::ptr::null(), &mut layout)) {
+            return Err("the bloom's pipeline layout refused".into());
+        }
+        let step_pass = bloom_pass(stack, false)?;
+        let spill_pass = bloom_pass(stack, true)?;
+        let mut pipelines = [0; 3];
+        for (index, (spv, pass)) in [(BLOOM_DOWN_FRAG_SPV, step_pass), (BLOOM_UP_FRAG_SPV, step_pass), (BLOOM_SPILL_FRAG_SPV, spill_pass)].into_iter().enumerate() {
+            let fragment = stack.shader(spv)?;
+            let pipeline = bloom_pipeline(stack, layout, pass, vertex, fragment, index == 2);
+            (fns.destroy_shader_module)(stack.device, fragment, std::ptr::null());
+            pipelines[index] = pipeline?;
+        }
+        Ok(BloomStack { set_layout, layout, step_pass, spill_pass, pipelines })
+    }
+}
+
+/// A pass of the bloom over one RGBA8 image: a step drops what the image
+/// held; the spill keeps the picture and blends over it. Either leaves
+/// the image ready to be sampled, after the frames and steps that read
+/// or drew it, and before the steps, the 2D pass or a copy that read it.
+unsafe fn bloom_pass(stack: &VkStack, spill: bool) -> Result<RenderPass, String> {
+    let color = AttachmentDescription {
+        flags: 0,
+        format: FORMAT_R8G8B8A8_UNORM,
+        samples: SAMPLE_COUNT_1,
+        load_op: if spill { ATTACHMENT_LOAD_LOAD } else { ATTACHMENT_LOAD_DONT_CARE },
+        store_op: ATTACHMENT_STORE_STORE,
+        stencil_load: ATTACHMENT_LOAD_DONT_CARE,
+        stencil_store: ATTACHMENT_STORE_DONT_CARE,
+        initial_layout: if spill { IMAGE_LAYOUT_SHADER_READ_ONLY } else { IMAGE_LAYOUT_UNDEFINED },
+        final_layout: IMAGE_LAYOUT_SHADER_READ_ONLY,
+    };
+    let reference = AttachmentReference { attachment: 0, layout: IMAGE_LAYOUT_COLOR_ATTACHMENT };
+    let subpass = SubpassDescription {
+        flags: 0,
+        bind_point: PIPELINE_BIND_POINT_GRAPHICS,
+        input_count: 0,
+        inputs: std::ptr::null(),
+        color_count: 1,
+        colors: &reference,
+        resolves: std::ptr::null(),
+        depth: std::ptr::null(),
+        preserve_count: 0,
+        preserves: std::ptr::null(),
+    };
+    let dependencies = [
+        SubpassDependency {
+            src_subpass: SUBPASS_EXTERNAL,
+            dst_subpass: 0,
+            src_stage: PIPELINE_STAGE_FRAGMENT_SHADER | PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT | PIPELINE_STAGE_TRANSFER,
+            dst_stage: PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT,
+            src_access: ACCESS_COLOR_ATTACHMENT_WRITE,
+            dst_access: ACCESS_COLOR_ATTACHMENT_READ | ACCESS_COLOR_ATTACHMENT_WRITE,
+            flags: 0,
+        },
+        SubpassDependency {
+            src_subpass: 0,
+            dst_subpass: SUBPASS_EXTERNAL,
+            src_stage: PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT,
+            dst_stage: PIPELINE_STAGE_FRAGMENT_SHADER | PIPELINE_STAGE_TRANSFER,
+            src_access: ACCESS_COLOR_ATTACHMENT_WRITE,
+            dst_access: ACCESS_SHADER_READ | ACCESS_TRANSFER_READ,
+            flags: 0,
+        },
+    ];
+    let info = RenderPassCreateInfo {
+        s_type: ST_RENDER_PASS_CREATE,
+        p_next: std::ptr::null(),
+        flags: 0,
+        attachment_count: 1,
+        attachments: &color,
+        subpass_count: 1,
+        subpasses: &subpass,
+        dependency_count: 2,
+        dependencies: dependencies.as_ptr().cast(),
+    };
+    let mut pass: RenderPass = 0;
+    unsafe {
+        if !ok((stack.fns.create_render_pass)(stack.device, &info, std::ptr::null(), &mut pass)) {
+            return Err("a bloom render pass refused".into());
+        }
+    }
+    Ok(pass)
+}
+
+/// A step's pipeline: one triangle over the image, no depth; with
+/// `screen`, blended over what the image holds, `c + s·(1 − c)`.
+unsafe fn bloom_pipeline(
+    stack: &VkStack,
+    layout: PipelineLayout,
+    pass: RenderPass,
+    vertex: ShaderModule,
+    fragment: ShaderModule,
+    screen: bool,
+) -> Result<Pipeline, String> {
+    let stage = |stage: u32, module: ShaderModule| PipelineShaderStage {
+        s_type: ST_PIPELINE_SHADER_STAGE,
+        p_next: std::ptr::null(),
+        flags: 0,
+        stage,
+        module,
+        name: c"main".as_ptr(),
+        specialization: std::ptr::null(),
+    };
+    let stages = [stage(SHADER_STAGE_VERTEX, vertex), stage(SHADER_STAGE_FRAGMENT, fragment)];
+    let vertex_input = PipelineVertexInput {
+        s_type: ST_PIPELINE_VERTEX_INPUT,
+        p_next: std::ptr::null(),
+        flags: 0,
+        binding_count: 0,
+        bindings: std::ptr::null(),
+        attribute_count: 0,
+        attributes: std::ptr::null(),
+    };
+    let assembly = PipelineInputAssembly {
+        s_type: ST_PIPELINE_INPUT_ASSEMBLY,
+        p_next: std::ptr::null(),
+        flags: 0,
+        topology: PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        primitive_restart: 0,
+    };
+    let viewport = PipelineViewportState {
+        s_type: ST_PIPELINE_VIEWPORT,
+        p_next: std::ptr::null(),
+        flags: 0,
+        viewport_count: 1,
+        viewports: std::ptr::null(),
+        scissor_count: 1,
+        scissors: std::ptr::null(),
+    };
+    let rasterization = PipelineRasterization {
+        s_type: ST_PIPELINE_RASTERIZATION,
+        p_next: std::ptr::null(),
+        flags: 0,
+        depth_clamp: 0,
+        discard: 0,
+        polygon_mode: POLYGON_MODE_FILL,
+        cull_mode: CULL_MODE_NONE,
+        front_face: FRONT_FACE_COUNTER_CLOCKWISE,
+        depth_bias: 0,
+        bias_constant: 0.0,
+        bias_clamp: 0.0,
+        bias_slope: 0.0,
+        line_width: 1.0,
+    };
+    let multisample = PipelineMultisample {
+        s_type: ST_PIPELINE_MULTISAMPLE,
+        p_next: std::ptr::null(),
+        flags: 0,
+        samples: SAMPLE_COUNT_1,
+        sample_shading: 0,
+        min_sample_shading: 0.0,
+        sample_mask: std::ptr::null(),
+        alpha_to_coverage: 0,
+        alpha_to_one: 0,
+    };
+    let attachment = ColorBlendAttachment {
+        blend_enable: screen as u32,
+        src_color: BLEND_FACTOR_ONE_MINUS_DST_COLOR,
+        dst_color: BLEND_FACTOR_ONE,
+        color_op: BLEND_OP_ADD,
+        src_alpha: BLEND_FACTOR_ONE_MINUS_DST_ALPHA,
+        dst_alpha: BLEND_FACTOR_ONE,
+        alpha_op: BLEND_OP_ADD,
+        write_mask: 0xF,
+    };
+    let color_blend = PipelineColorBlend {
+        s_type: ST_PIPELINE_COLOR_BLEND,
+        p_next: std::ptr::null(),
+        flags: 0,
+        logic_op_enable: 0,
+        logic_op: 0,
+        attachment_count: 1,
+        attachments: &attachment,
+        blend_constants: [0.0; 4],
+    };
+    let dynamic_states = [DYNAMIC_STATE_VIEWPORT, DYNAMIC_STATE_SCISSOR];
+    let dynamic = PipelineDynamicState {
+        s_type: ST_PIPELINE_DYNAMIC,
+        p_next: std::ptr::null(),
+        flags: 0,
+        state_count: 2,
+        states: dynamic_states.as_ptr(),
+    };
+    let info = GraphicsPipelineCreateInfo {
+        s_type: ST_GRAPHICS_PIPELINE_CREATE,
+        p_next: std::ptr::null(),
+        flags: 0,
+        stage_count: 2,
+        stages: stages.as_ptr(),
+        vertex_input: &vertex_input,
+        input_assembly: &assembly,
+        tessellation: std::ptr::null(),
+        viewport: &viewport,
+        rasterization: &rasterization,
+        multisample: &multisample,
+        depth_stencil: std::ptr::null(),
+        color_blend: &color_blend,
+        dynamic: &dynamic,
+        layout,
+        render_pass: pass,
+        subpass: 0,
+        base_pipeline: 0,
+        base_index: -1,
+    };
+    let mut pipeline: Pipeline = 0;
+    unsafe {
+        if !ok((stack.fns.create_graphics_pipelines)(stack.device, 0, 1, &info, std::ptr::null(), &mut pipeline)) {
+            return Err("a bloom pipeline refused".into());
+        }
+    }
+    Ok(pipeline)
 }
 
 /// An image with its memory and a view over all its levels.
@@ -2327,8 +2894,11 @@ impl WorldGround for VkWorldDoor<'_> {
     }
 
     fn drop_target(&mut self, id: u64) {
+        let frame = self.world.frame;
+        if let Some(bloom) = self.world.blooms.remove(&id) {
+            self.world.graveyard.push((frame, Garbage::Bloom(bloom)));
+        }
         if let Some(target) = self.world.targets.remove(&id) {
-            let frame = self.world.frame;
             self.world.graveyard.push((frame, Garbage::Target(target)));
         }
     }

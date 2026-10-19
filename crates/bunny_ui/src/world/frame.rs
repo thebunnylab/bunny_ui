@@ -121,6 +121,10 @@ pub struct WorldStyle {
     /// The colour grade of every surface, after the tone curve: a day's
     /// warmth, a night's blue. `None` leaves the colours alone.
     pub grade: Option<Grade>,
+    /// How strongly what glows spills its light around itself, in
+    /// `[0, 1]`: 0 is none, 0.6 a soft glow. Only [`Quality::High`] draws
+    /// it; a lamp's emissive light decides how much it glows.
+    pub bloom: f32,
     /// The most pictures a second an animation may ask for.
     pub max_fps: Option<f64>,
 }
@@ -134,6 +138,7 @@ impl Default for WorldStyle {
             exposure: 1.0,
             xray: false,
             grade: None,
+            bloom: 0.0,
             max_fps: None,
         }
     }
@@ -325,6 +330,10 @@ pub struct WorldFrame {
     /// The states of the parts of every instance that sets them, one row a
     /// part its mesh names ([`InstanceData::part_base`]).
     pub parts: Vec<PartRow>,
+    /// How strongly what glows spills, in 256ths: 0 draws no bloom
+    /// ([`super::bloom`]). The pass then draws each pixel's glow beside
+    /// its colour.
+    pub bloom: u16,
 }
 
 impl WorldFrame {
@@ -387,6 +396,7 @@ impl WorldFrame {
             hasher.write_u16(floor);
         }
         hasher.write(&super::wire::part_bytes(&self.parts));
+        hasher.write_u16(self.bloom);
         hasher.finish()
     }
 }
@@ -583,6 +593,7 @@ pub(crate) fn build_frame(
         shadow: None,
         floor: None,
         parts: Vec::new(),
+        bloom: if style.quality == Quality::High && style.bloom > 0.0 { (style.bloom.min(1.0) * 256.0).round() as u16 } else { 0 },
     };
     // each set of part states once, as many rows as its mesh names parts
     let mut part_bases = HashMap::<(usize, u32), u32>::new();

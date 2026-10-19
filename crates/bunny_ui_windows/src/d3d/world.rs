@@ -24,6 +24,12 @@
 //! The world shaders are compiled the first time a box paints a world:
 //! an app that shows none never pays for them.
 //!
+//! A frame with a bloom draws each pixel's glow beside its colour, into a
+//! second view of one byte (`SV_Target1`), and after the resolve runs the
+//! chain of `bunny_ui::world::bloom`: draws into small textures of the
+//! target's own (`t9`, `t10`, `b3`), and the spill blended over the
+//! target as a screen.
+//!
 //! The pass leaves the 2D pass's ground as it found it: the 2D pass
 //! binds its own targets, shaders, buffers and states, and its sampler
 //! slot is not touched — the world's sampler lives at `s1`.
@@ -35,6 +41,7 @@ use std::rc::Rc;
 
 use bunny_ui::gpu::world::{WorldCaps, WorldGround, WorldJob};
 use bunny_ui::image_engine::ImageEngine;
+use bunny_ui::world::bloom::LEVELS;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, WorldFrame};
 use bunny_ui::world::shade::SRGB_DECODE;
 use bunny_ui::world::wire::{
@@ -56,6 +63,8 @@ use crate::ffi::{Com, com_ok};
 // MARK: - D3D vocabulary of the world pass (values from the SDK headers)
 
 const FORMAT_D32_FLOAT: u32 = 40;
+const FORMAT_R8_UNORM: u32 = 61;
+const BLEND_INV_DEST_COLOR: u32 = 10;
 const FORMAT_R32_UINT: u32 = 42;
 const FORMAT_R16_TYPELESS: u32 = 53;
 const FORMAT_D16_UNORM: u32 = 55;
@@ -507,7 +516,14 @@ float3 graded(float3 code) {
 
 // premultiplied codes over 255: the target's unorm write rounds them to
 // the byte the CPU computes
-float4 world_shade(WorldVary v, bool front) {
+// how much a surface glows, from the light it gives off: its brightest
+// channel, a quarter a unit (bunny_ui::world::bloom::glow)
+float glow_of(float3 emissive) {
+    return saturate(max(emissive.r, max(emissive.g, emissive.b)) * 0.25);
+}
+
+// `glow` takes the surface's glow, a code premultiplied by its alpha
+float4 world_shade(WorldVary v, bool front, out float glow) {
     float4 cut = u.section;
     if (any(cut != 0.0) && cut.x * v.eye.x + cut.y * v.eye.y + cut.z * v.eye.z + cut.w < 0.0) {
         discard;
@@ -564,18 +580,31 @@ float4 world_shade(WorldVary v, bool front) {
     }
     float3 code = graded(float3(encode_code(shaded.r), encode_code(shaded.g), encode_code(shaded.b)));
     float3 codes = clamp(floor(code * alpha + 0.5 + dither), 0.0, 255.0);
+    glow = floor(glow_of(material.emissive.xyz) * alpha * 255.0 + 0.5);
     return float4(codes / 255.0, coverage >= 0.0 ? coverage : floor(alpha * 255.0 + 0.5) / 255.0);
 }
 
-float4 world_fragment(WorldVary v, bool front : SV_IsFrontFace) : SV_Target {
-    return world_shade(v, front);
+// the glow rides SV_Target1: a frame with a bloom binds a view there, and
+// any other frame drops it
+struct WorldBack {
+    float4 color : SV_Target0;
+    float4 glow : SV_Target1;
+};
+
+WorldBack world_fragment(WorldVary v, bool front : SV_IsFrontFace) {
+    WorldBack o;
+    float glow;
+    o.color = world_shade(v, front, glow);
+    o.glow = float4(glow / 255.0, 0.0, 0.0, o.color.a);
+    return o;
 }
 
 // a plain depth, as the GL family writes it: D3D takes a conservative
 // one (SV_DepthGreaterEqual) only from a pixel whose position is
 // interpolated at its centroid, and the step is measured at the centre
 struct SteppedBack {
-    float4 color : SV_Target;
+    float4 color : SV_Target0;
+    float4 glow : SV_Target1;
     float depth : SV_Depth;
 };
 
@@ -584,7 +613,9 @@ struct SteppedBack {
 SteppedBack world_fragment_stepped(WorldVary v, bool front : SV_IsFrontFace) {
     float slope = max(abs(ddx(v.depth)), abs(ddy(v.depth)));
     SteppedBack o;
-    o.color = world_shade(v, front);
+    float glow;
+    o.color = world_shade(v, front, glow);
+    o.glow = float4(glow / 255.0, 0.0, 0.0, o.color.a);
     o.depth = min(v.position.z + draw.bias.x * slope + DEPTH_TIE, DEPTH_CEILING);
     return o;
 }
@@ -683,7 +714,8 @@ LineVary line_vertex(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
 }
 
 struct LineOut {
-    float4 color : SV_Target;
+    float4 color : SV_Target0;
+    float4 glow : SV_Target1;
     float depth : SV_Depth;
 };
 
@@ -723,6 +755,8 @@ LineOut line_fragment(LineVary v) {
     float alpha = coverage * draw.line_color.a;
     LineOut o;
     o.color = float4(codes * alpha, alpha * 255.0) / 255.0;
+    // an edge glows not, and covers the glow behind it as its colour does
+    o.glow = float4(0.0, 0.0, 0.0, o.color.a);
     o.depth = z;
     return o;
 }
@@ -734,7 +768,7 @@ float4 backdrop_vertex(uint vid : SV_VertexID) : SV_Position {
     return float4(corner * 2.0 - 1.0, 0.5, 1.0);
 }
 
-float4 backdrop_fragment(float4 position : SV_Position) : SV_Target {
+WorldBack backdrop_fragment(float4 position : SV_Position) {
     float4 c;
     if (ramp.rows[2].z > 0.5) {
         // the view's ray through the pixel, against the world's up
@@ -750,7 +784,88 @@ float4 backdrop_fragment(float4 position : SV_Position) : SV_Target {
         c = clamp(floor(ramp.rows[0] + (ramp.rows[1] - ramp.rows[0]) * t + 0.5), 0.0, 255.0);
     }
     float3 rgb = floor((c.rgb * c.a + 127.0) / 255.0);
-    return float4(rgb, c.a) / 255.0;
+    WorldBack o;
+    o.color = float4(rgb, c.a) / 255.0;
+    o.glow = float4(0.0, 0.0, 0.0, 0.0);
+    return o;
+}
+
+// MARK: - The bloom (bunny_ui::world::bloom)
+
+// every step reads whole texels, the edge repeated past it, and sums
+// whole codes: the CPU's chain, to the code
+Texture2D<float4> bloom_above : register(t9);
+Texture2D<float4> bloom_second : register(t10);
+
+// (1 when the step down reads the glow, the strength in 256ths, the steps
+// the step below carries, 0)
+cbuffer BloomBlock : register(b3) {
+    float4 bloom;
+};
+
+uint3 codes_at(Texture2D<float4> image, int2 at) {
+    uint width, height;
+    image.GetDimensions(width, height);
+    int2 last = int2(width, height) - int2(1, 1);
+    return (uint3)(image.Load(int3(clamp(at, int2(0, 0), last), 0)).rgb * 255.0 + 0.5);
+}
+
+// the step below read at a texel of the step above: the four nearest,
+// weighted 9, 3, 3 and 1
+uint3 up16(Texture2D<float4> below, int2 at) {
+    int2 m = at / 2;
+    int2 o = int2((at.x & 1) == 0 ? -1 : 1, (at.y & 1) == 0 ? -1 : 1);
+    return 9u * codes_at(below, m) + 3u * codes_at(below, m + int2(o.x, 0)) + 3u * codes_at(below, m + int2(0, o.y)) +
+           codes_at(below, m + o);
+}
+
+// a step down: the 4 × 4 block around the texel's own 2 × 2 above, five
+// for the middle four and one for the ring; the first step reads the
+// colours times their glow
+float4 bloom_down_fragment(float4 position : SV_Position) : SV_Target {
+    int2 at = int2(position.xy);
+    bool glowing = bloom.x > 0.5;
+    uint width, height;
+    bloom_second.GetDimensions(width, height);
+    int2 last = int2(width, height) - int2(1, 1);
+    uint3 sum = uint3(0, 0, 0);
+    for (int dy = -1; dy <= 2; dy++) {
+        for (int dx = -1; dx <= 2; dx++) {
+            int2 p = 2 * at + int2(dx, dy);
+            uint3 texel = codes_at(bloom_above, p);
+            if (glowing) {
+                texel *= (uint)(bloom_second.Load(int3(clamp(p, int2(0, 0), last), 0)).r * 255.0 + 0.5);
+            }
+            uint weight = (dx == 0 || dx == 1) && (dy == 0 || dy == 1) ? 5u : 1u;
+            sum += weight * texel;
+        }
+    }
+    uint whole = glowing ? 8160u : 32u;
+    return float4((float3)((sum + whole / 2u) / whole) / 255.0, 1.0);
+}
+
+// a step up: its own step down and the step below read up, each of the
+// steps below weighing as much as its own
+float4 bloom_up_fragment(float4 position : SV_Position) : SV_Target {
+    int2 at = int2(position.xy);
+    uint below = (uint)bloom.z;
+    uint whole = 16u * (below + 1u);
+    uint3 sum = 16u * codes_at(bloom_above, at) + below * up16(bloom_second, at) + whole / 2u;
+    return float4((float3)(sum / whole) / 255.0, 1.0);
+}
+
+// the spill: the chain's top read up, times the strength and a gain of
+// four, as far as the pixel does not glow itself, dithered to whole
+// codes; the target blends it as a screen
+float4 bloom_spill_fragment(float4 position : SV_Position) : SV_Target {
+    int2 at = int2(position.xy);
+    uint width, height;
+    bloom_above.GetDimensions(width, height);
+    int2 last = int2(width, height) - int2(1, 1);
+    uint glow = (uint)(bloom_above.Load(int3(clamp(at, int2(0, 0), last), 0)).r * 255.0 + 0.5);
+    uint dither = 65280u * BAYER[(at.y & 3) * 4 + (at.x & 3)] + 32640u;
+    uint3 s = min(((uint)bloom.y * 4u * up16(bloom_second, at) * (255u - glow) + dither) / 1044480u, uint3(255u, 255u, 255u));
+    return float4((float3)s / 255.0, (float)max(s.r, max(s.g, s.b)) / 255.0);
 }
 "#;
 
@@ -834,6 +949,10 @@ struct WorldStack {
     stepped_ps: Com<PixelShader>,
     line_ps: Com<PixelShader>,
     backdrop_ps: Com<PixelShader>,
+    /// The bloom's steps: down, back up, the spill.
+    bloom_ps: [Com<PixelShader>; 3],
+    /// The spill's blend: a screen, `c + s·(1 − c)`.
+    screen: Com<BlendState>,
     /// The 2D pass's pixel shader for a world's target.
     composite_ps: Com<PixelShader>,
     /// Opaque, see-through, lines tested, lines hidden, always.
@@ -861,6 +980,8 @@ struct WorldStack {
     uniforms: Com<Buffer>,
     draw: Com<Buffer>,
     backdrop: Com<Buffer>,
+    /// A bloom step's four values.
+    bloom: Com<Buffer>,
 }
 
 enum Built {
@@ -882,6 +1003,27 @@ struct Target {
     _depth: Com<Texture2d>,
     dsv: Com<Dsv>,
     size: (u32, u32),
+    samples: u8,
+}
+
+/// A texture the chain draws into and reads from.
+struct Step {
+    texture: Com<Texture2d>,
+    rtv: Com<Rtv>,
+    srv: Com<Srv>,
+    size: (u32, u32),
+}
+
+/// A target's bloom: its glow and the chain's steps, made on its first
+/// frame with a bloom.
+struct BloomTargets {
+    /// The glow at one sample: where its samples resolve, and what the
+    /// chain reads.
+    glow: Step,
+    /// The glow's samples, or none at one sample.
+    glow_samples: Option<(Com<Texture2d>, Com<Rtv>)>,
+    down: Vec<Step>,
+    up: Vec<Step>,
 }
 
 struct MeshBuffers {
@@ -916,6 +1058,8 @@ pub(super) struct D3dWorld {
     textures: HashMap<u64, (Com<Texture2d>, Com<Srv>)>,
     segments: HashMap<u64, Segments>,
     shadow_maps: HashMap<u64, ShadowMap>,
+    /// By target.
+    blooms: HashMap<u64, BloomTargets>,
     next: u64,
     /// The frame's instances and materials, written again for each job:
     /// a discard map gives every job a buffer of its own.
@@ -938,6 +1082,7 @@ impl D3dWorld {
             textures: HashMap::new(),
             segments: HashMap::new(),
             shadow_maps: HashMap::new(),
+            blooms: HashMap::new(),
             next: 1,
             instances: SlotBuffer::empty(),
             materials: SlotBuffer::empty(),
@@ -1014,11 +1159,20 @@ impl D3dWorld {
     }
 
     fn encode_job(&mut self, job: &WorldJob) {
-        let D3dWorld { device, context, built, targets, meshes, textures, segments, shadow_maps, instances, materials, casters, parts, .. } = self;
+        let D3dWorld { device, context, built, targets, meshes, textures, segments, shadow_maps, blooms, instances, materials, casters, parts, .. } =
+            self;
         let (device, context) = (*device, *context);
         let Built::Ready(stack) = built else { return };
         let Some(target) = targets.get(&job.target) else { return };
         let frame = &job.frame;
+        // a frame with a bloom draws its glow beside its colour
+        if frame.bloom > 0
+            && !blooms.contains_key(&job.target)
+            && let Some(made) = unsafe { bloom_targets(device, target.size, target.samples) }
+        {
+            blooms.insert(job.target, made);
+        }
+        let bloom = if frame.bloom > 0 { blooms.get(&job.target) } else { None };
         let map = job.shadow.and_then(|shadow| shadow_maps.get(&shadow.map).map(|map| (shadow, map)));
         // what every draw of the frame reads: the instances and the
         // material table, a discard map each, so a job never waits on the
@@ -1087,9 +1241,17 @@ impl D3dWorld {
             (vtbl.ps_set_shader_resources)(context, 1, 1, &instance_view);
             (vtbl.ps_set_shader_resources)(context, 2, 1, &material_view);
 
-            // the target, cleared to the backdrop
+            // the target, cleared to the backdrop, and its glow to none
             let rtv = target.color.as_ref().map_or(target.resolve_rtv.as_ptr(), |(_, rtv)| rtv.as_ptr());
-            (vtbl.om_set_render_targets)(context, 1, &rtv, target.dsv.as_ptr().cast());
+            let glow_rtv = bloom.map(|bloom| bloom.glow_samples.as_ref().map_or(bloom.glow.rtv.as_ptr(), |(_, rtv)| rtv.as_ptr()));
+            match glow_rtv {
+                Some(glow_rtv) => {
+                    let views = [rtv, glow_rtv];
+                    (vtbl.om_set_render_targets)(context, 2, views.as_ptr(), target.dsv.as_ptr().cast());
+                    (vtbl.clear_render_target_view)(context, glow_rtv, [0.0f32; 4].as_ptr());
+                }
+                None => (vtbl.om_set_render_targets)(context, 1, &rtv, target.dsv.as_ptr().cast()),
+            }
             // the map is read once it is no longer drawn into
             let (shadow_view, shadow_sampler) =
                 map.map_or((stack.lit.1.as_ptr(), stack.always.as_ptr()), |(_, map)| (map.srv.as_ptr(), stack.compare.as_ptr()));
@@ -1223,10 +1385,17 @@ impl D3dWorld {
                     FORMAT_RGBA8,
                 );
             }
+            if let Some((glow_samples, _)) = bloom.and_then(|bloom| bloom.glow_samples.as_ref()) {
+                let glow = &bloom.expect("a bloom").glow;
+                (vtbl.resolve_subresource)(context, glow.texture.as_ptr().cast(), 0, glow_samples.as_ptr().cast(), 0, FORMAT_R8_UNORM);
+            }
             // the map leaves the slot it was read from: the next shadow
             // pass draws into it
             let none: *mut Srv = null_mut();
             (vtbl.ps_set_shader_resources)(context, 5, 1, &none);
+            if let Some(bloom) = bloom {
+                encode_bloom(context, stack, target, bloom, frame.bloom);
+            }
         }
     }
 
@@ -1277,6 +1446,90 @@ impl D3dWorld {
             (vtbl.unmap)(context, staging.as_ptr().cast(), 0);
         }
         Some(bytes)
+    }
+}
+
+/// The chain over a resolved target: four steps down from its colours and
+/// glow, three back up, and the spill blended over the target. A texture
+/// becomes a view to draw into before the step after reads it.
+unsafe fn encode_bloom(context: *mut Context, stack: &WorldStack, target: &Target, bloom: &BloomTargets, strength: u16) {
+    unsafe {
+        let vtbl = &*(*context).vtbl;
+        (vtbl.vs_set_shader)(context, stack.backdrop_vs.as_ptr(), null(), 0);
+        (vtbl.om_set_depth_stencil_state)(context, null_mut(), 0);
+        (vtbl.rs_set_state)(context, stack.rasterizers[0].as_ptr());
+        let block = stack.bloom.as_ptr();
+        (vtbl.ps_set_constant_buffers)(context, 3, 1, &block);
+        let step = |rtv: *mut Rtv, size: (u32, u32), shader: &Com<PixelShader>, above: *mut Srv, second: *mut Srv, values: [f32; 4]| {
+            let none: [*mut Srv; 2] = [null_mut(); 2];
+            (vtbl.ps_set_shader_resources)(context, 9, 2, none.as_ptr());
+            (vtbl.om_set_render_targets)(context, 1, &rtv, null_mut());
+            let port = Viewport { top_left_x: 0.0, top_left_y: 0.0, width: size.0 as f32, height: size.1 as f32, min_depth: 0.0, max_depth: 1.0 };
+            (vtbl.rs_set_viewports)(context, 1, &port);
+            write_constants(context, block, bytes_of(&values));
+            (vtbl.ps_set_shader)(context, shader.as_ptr(), null(), 0);
+            let views = [above, second];
+            (vtbl.ps_set_shader_resources)(context, 9, 2, views.as_ptr());
+            (vtbl.draw_instanced)(context, 3, 1, 0, 0);
+        };
+        let [down, up, spill] = &stack.bloom_ps;
+        (vtbl.om_set_blend_state)(context, null_mut(), null(), 0xFFFF_FFFF);
+        step(bloom.down[0].rtv.as_ptr(), bloom.down[0].size, down, target.resolve_srv.as_ptr(), bloom.glow.srv.as_ptr(), [1.0, 0.0, 0.0, 0.0]);
+        for level in 1..LEVELS {
+            let above = bloom.down[level - 1].srv.as_ptr();
+            step(bloom.down[level].rtv.as_ptr(), bloom.down[level].size, down, above, above, [0.0; 4]);
+        }
+        let mut lower = bloom.down[LEVELS - 1].srv.as_ptr();
+        for (below, level) in (0..LEVELS - 1).rev().enumerate() {
+            let values = [0.0, 0.0, (below + 1) as f32, 0.0];
+            step(bloom.up[level].rtv.as_ptr(), bloom.up[level].size, up, bloom.down[level].srv.as_ptr(), lower, values);
+            lower = bloom.up[level].srv.as_ptr();
+        }
+        (vtbl.om_set_blend_state)(context, stack.screen.as_ptr(), null(), 0xFFFF_FFFF);
+        step(target.resolve_rtv.as_ptr(), target.size, spill, bloom.glow.srv.as_ptr(), lower, [0.0, strength as f32, 0.0, 0.0]);
+        // nothing of the chain stays bound: the next frame draws into it
+        let none: [*mut Srv; 2] = [null_mut(); 2];
+        (vtbl.ps_set_shader_resources)(context, 9, 2, none.as_ptr());
+        (vtbl.om_set_blend_state)(context, null_mut(), null(), 0xFFFF_FFFF);
+    }
+}
+
+/// A target's bloom: the glow (with samples of its own when the target
+/// takes more than one) and the chain's steps. `None` when one is
+/// refused.
+unsafe fn bloom_targets(device: *mut Device, size: (u32, u32), samples: u8) -> Option<BloomTargets> {
+    unsafe {
+        let step = |format: u32, size: (u32, u32)| -> Option<Step> {
+            let texture = super::make_target_texture(device, size.0, size.1, format, 1)?;
+            let rtv = make_rtv(device, &texture, None)?;
+            let srv = make_srv(device, &texture)?;
+            Some(Step { texture, rtv, srv, size })
+        };
+        let glow = step(FORMAT_R8_UNORM, size)?;
+        let glow_samples = if samples > 1 {
+            let desc = Texture2dDesc {
+                width: size.0,
+                height: size.1,
+                mip_levels: 1,
+                array_size: 1,
+                format: FORMAT_R8_UNORM,
+                sample_count: samples as u32,
+                sample_quality: 0,
+                usage: USAGE_DEFAULT,
+                bind_flags: BIND_RENDER_TARGET,
+                cpu_access_flags: 0,
+                misc_flags: 0,
+            };
+            let texture = texture_2d(device, &desc, None)?;
+            let rtv = make_rtv(device, &texture, None)?;
+            Some((texture, rtv))
+        } else {
+            None
+        };
+        let sizes = bunny_ui::world::bloom::sizes(size);
+        let down = sizes.iter().map(|&size| step(FORMAT_RGBA8, size)).collect::<Option<Vec<Step>>>()?;
+        let up = sizes[..LEVELS - 1].iter().map(|&size| step(FORMAT_RGBA8, size)).collect::<Option<Vec<Step>>>()?;
+        Some(BloomTargets { glow, glow_samples, down, up })
     }
 }
 
@@ -1371,6 +1624,11 @@ impl WorldStack {
             let stepped_ps = pixel(&source, "world_fragment_stepped", COMPILE_IEEE_STRICTNESS)?;
             let line_ps = pixel(&source, "line_fragment", COMPILE_IEEE_STRICTNESS)?;
             let backdrop_ps = pixel(&source, "backdrop_fragment", COMPILE_IEEE_STRICTNESS)?;
+            let bloom_ps = [
+                pixel(&source, "bloom_down_fragment", COMPILE_IEEE_STRICTNESS)?,
+                pixel(&source, "bloom_up_fragment", COMPILE_IEEE_STRICTNESS)?,
+                pixel(&source, "bloom_spill_fragment", COMPILE_IEEE_STRICTNESS)?,
+            ];
             let composite_ps = pixel(&composite_source, "world_composite_fragment", 0)?;
 
             let depth_state = |compare: u32, write: bool| -> Result<Com<DepthStencilState>, String> {
@@ -1454,6 +1712,7 @@ impl WorldStack {
             };
             let over = blend_state(BLEND_ONE, BLEND_INV_SRC_ALPHA, BLEND_ONE, BLEND_INV_SRC_ALPHA)?;
             let add = blend_state(BLEND_ONE, BLEND_ONE, BLEND_INV_DEST_ALPHA, BLEND_ONE)?;
+            let screen = blend_state(BLEND_INV_DEST_COLOR, BLEND_ONE, BLEND_INV_DEST_ALPHA, BLEND_ONE)?;
             let coverage = {
                 let target = RenderTargetBlendDesc {
                     blend_enable: 0,
@@ -1560,6 +1819,8 @@ impl WorldStack {
                 stepped_ps,
                 line_ps,
                 backdrop_ps,
+                bloom_ps,
+                screen,
                 composite_ps,
                 depth_states,
                 rasterizers,
@@ -1575,6 +1836,7 @@ impl WorldStack {
                 uniforms: make_constant_buffer(device, bunny_ui::world::wire::frame_offset::SIZE as u32).ok_or("world constants refused")?,
                 draw: make_constant_buffer(device, std::mem::size_of::<DrawBlock>() as u32).ok_or("draw constants refused")?,
                 backdrop: make_constant_buffer(device, std::mem::size_of::<BackdropBlock>() as u32).ok_or("backdrop constants refused")?,
+                bloom: make_constant_buffer(device, 16).ok_or("bloom constants refused")?,
             })
         }
     }
@@ -1621,7 +1883,7 @@ impl WorldGround for D3dWorld {
                 return None;
             }
             let dsv = Com::from_raw(dsv)?;
-            Target { resolve, resolve_srv, resolve_rtv, color, _depth: depth, dsv, size: (width, height) }
+            Target { resolve, resolve_srv, resolve_rtv, color, _depth: depth, dsv, size: (width, height), samples: samples.max(1) }
         };
         let id = self.mint();
         self.targets.insert(id, target);
@@ -1631,6 +1893,7 @@ impl WorldGround for D3dWorld {
     fn drop_target(&mut self, id: u64) {
         // a frame in flight keeps what it reads: the context holds its
         // own references to what is bound
+        self.blooms.remove(&id);
         self.targets.remove(&id);
     }
 

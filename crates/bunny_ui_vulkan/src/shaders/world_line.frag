@@ -70,6 +70,7 @@ layout(location = 2) flat in vec4 v_depth;
 layout(location = 3) flat in vec3 v_ea;
 layout(location = 4) flat in vec3 v_eb;
 layout(location = 0) out vec4 out_color;
+layout(location = 1) out vec4 out_glow;
 
 void main() {
     vec2 c = gl_FragCoord.xy;
@@ -105,5 +106,7 @@ void main() {
     vec3 codes = vec3(encode_code(u_style[0].r), encode_code(u_style[0].g), encode_code(u_style[0].b));
     float alpha = coverage * u_style[0].a;
     out_color = vec4(codes * alpha, alpha * 255.0) / 255.0;
+    // an edge glows not, and covers the glow behind it as its colour does
+    out_glow = vec4(0.0, 0.0, 0.0, out_color.a);
     gl_FragDepth = z;
 }

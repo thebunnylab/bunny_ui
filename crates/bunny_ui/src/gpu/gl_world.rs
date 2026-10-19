@@ -17,6 +17,12 @@
 //! through a comparing sampler (unit 2); a frame without one binds a map
 //! of one texel that always answers "lit".
 //!
+//! A frame with a bloom draws its glow beside its colours, into a second
+//! attachment (one byte a pixel), and runs the chain of
+//! `crate::world::bloom` after the resolve: steps down and back up into
+//! small textures of the target's own, and the spill blended over the
+//! target as a screen.
+//!
 //! The 2D pass's state is put back when the pass ends: depth off, culling
 //! off, blending on with the 2D pass's own factors, texture unit 0.
 
@@ -27,6 +33,7 @@ use super::world::{WorldCaps, WorldGround, WorldJob};
 use super::world_shaders as source;
 use crate::image_engine::ImageEngine;
 use crate::world::frame::{Background, Blend, DrawKind, ShadowFrame, WorldFrame};
+use crate::world::bloom::LEVELS;
 use crate::world::wire::{SEGMENT_STRIDE, SHADOW_INSTANCE_STRIDE, instance_bytes, material_bytes, shadow_instance_bytes};
 
 /// The numbers GL answers to, the ones this pass uses.
@@ -75,6 +82,9 @@ pub mod gl {
     pub const READ_FRAMEBUFFER: u32 = 0x8CA8;
     pub const DRAW_FRAMEBUFFER: u32 = 0x8CA9;
     pub const COLOR_ATTACHMENT0: u32 = 0x8CE0;
+    pub const COLOR_ATTACHMENT1: u32 = 0x8CE1;
+    pub const R8: u32 = 0x8229;
+    pub const RED: u32 = 0x1903;
     pub const DEPTH_ATTACHMENT: u32 = 0x8D00;
     pub const FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
     pub const DEPTH_TEST: u32 = 0x0B71;
@@ -92,6 +102,7 @@ pub mod gl {
     pub const ONE: u32 = 1;
     pub const ONE_MINUS_SRC_ALPHA: u32 = 0x0303;
     pub const ONE_MINUS_DST_ALPHA: u32 = 0x0305;
+    pub const ONE_MINUS_DST_COLOR: u32 = 0x0307;
 }
 
 /// The verbs the pass needs, each one GL call (or two, where a verb says
@@ -157,6 +168,13 @@ pub trait GlFamily {
     /// counts a framebuffer of depth alone complete only once it is said;
     /// ES and WebGL2 need nothing.
     fn draw_no_color(&mut self) {}
+    /// The bound draw framebuffer draws into its first `count` colour
+    /// attachments: one, or two when a frame draws its glow.
+    fn draw_buffers(&mut self, count: u32);
+    /// The colour attachment the bound read framebuffer reads from.
+    fn read_buffer(&mut self, attachment: u32);
+    /// One colour attachment of the bound draw framebuffer, cleared.
+    fn clear_color_buffer(&mut self, index: i32, color: [f32; 4]);
     /// The name the device's graphics answer to, when the tier can read
     /// it: the governor's start.
     fn renderer(&self) -> Option<String> {
@@ -202,6 +220,7 @@ struct Program {
     rows: u32,
     style: u32,
     ramp: u32,
+    bloom: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -210,6 +229,10 @@ struct Programs {
     stepped: Program,
     lines: Program,
     backdrop: Program,
+    /// The bloom's steps: down, back up, and the spill over the target.
+    bloom_down: Program,
+    bloom_up: Program,
+    bloom_spill: Program,
     /// The 2D pass's sprite for a world's target.
     composite: u32,
     /// The casters into a shadow map.
@@ -233,7 +256,7 @@ struct Programs {
 
 enum Built {
     Not,
-    Ready(Programs),
+    Ready(Box<Programs>),
     /// A program the device refused: worlds stay on the CPU.
     Failed,
 }
@@ -262,6 +285,24 @@ struct SegmentObjects {
     count: u32,
 }
 
+/// A target's bloom: its glow, and the chain's textures.
+#[derive(Clone, Copy)]
+struct BloomObjects {
+    /// The glow at one sample, and a framebuffer of it alone: where the
+    /// samples resolve.
+    glow: u32,
+    glow_framebuffer: u32,
+    /// The glow's samples, or 0 when the target takes one.
+    glow_samples: u32,
+    /// The target's texture alone: what the spill draws into.
+    spill_framebuffer: u32,
+    /// The steps down and back up, each a texture and its framebuffer;
+    /// `up[k]` is the size of `down[k]`.
+    down: [(u32, u32); LEVELS],
+    up: [(u32, u32); LEVELS - 1],
+    sizes: [(u32, u32); LEVELS],
+}
+
 #[derive(Clone, Copy)]
 struct ShadowObjects {
     texture: u32,
@@ -278,6 +319,8 @@ pub struct GlWorld<G: GlFamily> {
     textures: HashMap<u64, u32>,
     segments: HashMap<u64, SegmentObjects>,
     shadow_maps: HashMap<u64, ShadowObjects>,
+    /// By target: made on the first frame with a bloom.
+    blooms: HashMap<u64, BloomObjects>,
     next: u64,
     /// The 2D pass's blend factors, put back when the world pass ends.
     blend_2d: [u32; 4],
@@ -296,6 +339,7 @@ impl<G: GlFamily> GlWorld<G> {
             textures: HashMap::new(),
             segments: HashMap::new(),
             shadow_maps: HashMap::new(),
+            blooms: HashMap::new(),
             next: 1,
             blend_2d,
             samples: samples.clamp(1, 4),
@@ -307,7 +351,7 @@ impl<G: GlFamily> GlWorld<G> {
     pub fn door(&mut self) -> Option<&mut dyn WorldGround> {
         if let Built::Not = self.built {
             self.built = match self.build() {
-                Ok(programs) => Built::Ready(programs),
+                Ok(programs) => Built::Ready(Box::new(programs)),
                 Err(_) => Built::Failed,
             };
         }
@@ -331,6 +375,7 @@ impl<G: GlFamily> GlWorld<G> {
         self.textures.clear();
         self.segments.clear();
         self.shadow_maps.clear();
+        self.blooms.clear();
     }
 
     fn mint(&mut self) -> u64 {
@@ -355,6 +400,12 @@ impl<G: GlFamily> GlWorld<G> {
             &world,
         )?;
         let backdrop = gl.program(&format!("{prelude}{}", source::BACKDROP_VERT), &format!("{prelude}{}", source::BACKDROP_FRAG), &[], &[])?;
+        let step = |gl: &mut G, body: &str| {
+            gl.program(&format!("{prelude}{}", source::BACKDROP_VERT), &format!("{prelude}{}{body}", source::BLOOM_COMMON), &[], &[])
+        };
+        let bloom_down = step(gl, source::BLOOM_DOWN_FRAG)?;
+        let bloom_up = step(gl, source::BLOOM_UP_FRAG)?;
+        let bloom_spill = step(gl, source::BLOOM_SPILL_FRAG)?;
         let shadow = gl.program(
             &format!("{prelude}{}{}{}", source::WORLD_COMMON, source::PARTS, source::SHADOW_VERT),
             &format!("{prelude}{}", source::SHADOW_FRAG),
@@ -369,12 +420,14 @@ impl<G: GlFamily> GlWorld<G> {
         )?;
         let program = |gl: &mut G, handle: u32| {
             gl.use_program(handle);
-            let mut located = Program { handle, draw: 0, rows: 0, style: 0, ramp: 0 };
+            let mut located = Program { handle, draw: 0, rows: 0, style: 0, ramp: 0, bloom: 0 };
             located.draw = gl.uniform_location(handle, "u_draw");
             located.rows = gl.uniform_location(handle, "u_rows");
             located.style = gl.uniform_location(handle, "u_style");
             located.ramp = gl.uniform_location(handle, "u_ramp");
-            for (name, unit) in [("u_materials", 0), ("u_surface", 1), ("u_shadow", 2), ("u_floor", 3), ("u_parts", 4), ("atlas", 0)] {
+            located.bloom = gl.uniform_location(handle, "u_bloom");
+            let units = [("u_materials", 0), ("u_surface", 1), ("u_shadow", 2), ("u_floor", 3), ("u_parts", 4), ("atlas", 0), ("u_above", 0), ("u_second", 1)];
+            for (name, unit) in units {
                 let at = gl.uniform_location(handle, name);
                 if at != 0 {
                     gl.uniform1i(at, unit);
@@ -386,6 +439,9 @@ impl<G: GlFamily> GlWorld<G> {
         let stepped = program(gl, stepped);
         let lines = program(gl, lines);
         let backdrop = program(gl, backdrop);
+        let bloom_down = program(gl, bloom_down);
+        let bloom_up = program(gl, bloom_up);
+        let bloom_spill = program(gl, bloom_spill);
         let composite = program(gl, composite).handle;
         let shadow = program(gl, shadow).handle;
         gl.use_program(0);
@@ -419,6 +475,9 @@ impl<G: GlFamily> GlWorld<G> {
             stepped,
             lines,
             backdrop,
+            bloom_down,
+            bloom_up,
+            bloom_spill,
             composite,
             shadow,
             frame: gl.create_buffer(),
@@ -445,7 +504,8 @@ impl<G: GlFamily> GlWorld<G> {
     /// Draws every job into its target. Call it after the walk and before
     /// the 2D pass; the 2D pass's state is put back at the end.
     pub fn encode(&mut self, jobs: &[WorldJob]) {
-        let Built::Ready(programs) = self.built else { return };
+        let Built::Ready(programs) = &self.built else { return };
+        let programs = **programs;
         if jobs.is_empty() {
             return;
         }
@@ -501,6 +561,7 @@ impl<G: GlFamily> GlWorld<G> {
     fn encode_job(&mut self, programs: &Programs, job: &WorldJob) {
         let Some(target) = self.targets.get(&job.target).copied() else { return };
         let frame = &job.frame;
+        let bloom = if frame.bloom > 0 { self.bloom_of(job.target, &target) } else { None };
         // the frame's block, which every program of the pass declares
         let gl = &mut self.gl;
         gl.bind_buffer(gl::UNIFORM_BUFFER, programs.frame);
@@ -545,8 +606,9 @@ impl<G: GlFamily> GlWorld<G> {
         gl.active_texture(gl::TEXTURE1);
         gl.bind_texture(programs.blank);
 
-        // the target, cleared to the backdrop
+        // the target, cleared to the backdrop, and its glow to none
         gl.bind_framebuffer(gl::FRAMEBUFFER, if target.multisample != 0 { target.multisample } else { target.resolve });
+        gl.draw_buffers(if bloom.is_some() { 2 } else { 1 });
         gl.viewport(width, height);
         gl.enable(gl::DEPTH_TEST);
         gl.depth_mask(true);
@@ -560,6 +622,9 @@ impl<G: GlFamily> GlWorld<G> {
             Background::Transparent | Background::Gradient { .. } | Background::Sky { .. } => [0.0; 4],
         };
         gl.clear(clear, 1.0);
+        if bloom.is_some() {
+            gl.clear_color_buffer(1, [0.0; 4]);
+        }
         if let Some(ramp) = frame.backdrop() {
             gl.use_program(programs.backdrop.handle);
             gl.uniform4fv(programs.backdrop.ramp, &ramp);
@@ -656,10 +721,133 @@ impl<G: GlFamily> GlWorld<G> {
             gl.bind_framebuffer(gl::READ_FRAMEBUFFER, target.multisample);
             gl.bind_framebuffer(gl::DRAW_FRAMEBUFFER, target.resolve);
             gl.blit_color(width, height);
+            if let Some(bloom) = bloom {
+                gl.read_buffer(gl::COLOR_ATTACHMENT1);
+                gl.bind_framebuffer(gl::DRAW_FRAMEBUFFER, bloom.glow_framebuffer);
+                gl.blit_color(width, height);
+                gl.read_buffer(gl::COLOR_ATTACHMENT0);
+                gl.invalidate_framebuffer(gl::READ_FRAMEBUFFER, gl::COLOR_ATTACHMENT1, 0);
+            }
             gl.invalidate_framebuffer(gl::READ_FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::DEPTH_ATTACHMENT);
         } else {
             gl.invalidate_framebuffer(gl::FRAMEBUFFER, gl::DEPTH_ATTACHMENT, 0);
         }
+        if let Some(bloom) = bloom {
+            self.draw_bloom(programs, &target, &bloom, frame.bloom);
+        }
+    }
+
+    /// The target's bloom objects, made on its first frame with a bloom:
+    /// the glow beside the colour (its samples on the target's samples),
+    /// and the chain's textures. `None` when a framebuffer will not stand.
+    fn bloom_of(&mut self, id: u64, target: &Target) -> Option<BloomObjects> {
+        if let Some(bloom) = self.blooms.get(&id) {
+            return Some(*bloom);
+        }
+        let gl = &mut self.gl;
+        let (w, h) = (target.size.0 as i32, target.size.1 as i32);
+        let texture = |gl: &mut G, internal: u32, format: u32, (w, h): (i32, i32)| {
+            let texture = gl.create_texture();
+            gl.active_texture(gl::TEXTURE0);
+            gl.bind_texture(texture);
+            gl.tex_image_2d(0, internal, w, h, format, gl::UNSIGNED_BYTE, &[]);
+            gl.tex_parameteri(gl::TEXTURE_MIN_FILTER, gl::NEAREST);
+            gl.tex_parameteri(gl::TEXTURE_MAG_FILTER, gl::NEAREST);
+            gl.tex_parameteri(gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE);
+            gl.tex_parameteri(gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE);
+            gl.bind_texture(0);
+            texture
+        };
+        let alone = |gl: &mut G, texture: u32| {
+            let framebuffer = gl.create_framebuffer();
+            gl.bind_framebuffer(gl::FRAMEBUFFER, framebuffer);
+            gl.framebuffer_texture_2d(gl::COLOR_ATTACHMENT0, texture);
+            let complete = gl.check_framebuffer_status() == gl::FRAMEBUFFER_COMPLETE;
+            (framebuffer, complete)
+        };
+        let glow = texture(gl, gl::R8, gl::RED, (w, h));
+        let (glow_framebuffer, mut complete) = alone(gl, glow);
+        let (spill_framebuffer, spill) = alone(gl, target.texture);
+        complete &= spill;
+        let sizes = crate::world::bloom::sizes(target.size);
+        let mut down = [(0, 0); LEVELS];
+        let mut up = [(0, 0); LEVELS - 1];
+        for (level, size) in sizes.iter().enumerate() {
+            let size = (size.0 as i32, size.1 as i32);
+            let step = texture(gl, gl::RGBA8, gl::RGBA, size);
+            let (framebuffer, ok) = alone(gl, step);
+            down[level] = (step, framebuffer);
+            complete &= ok;
+            if level < LEVELS - 1 {
+                let step = texture(gl, gl::RGBA8, gl::RGBA, size);
+                let (framebuffer, ok) = alone(gl, step);
+                up[level] = (step, framebuffer);
+                complete &= ok;
+            }
+        }
+        // the glow beside the colour: samples of its own, or the texture
+        let mut glow_samples = 0;
+        if target.multisample != 0 {
+            glow_samples = gl.create_renderbuffer();
+            gl.renderbuffer_storage(glow_samples, self.samples as i32, gl::R8, w, h);
+            gl.bind_framebuffer(gl::FRAMEBUFFER, target.multisample);
+            gl.framebuffer_renderbuffer(gl::COLOR_ATTACHMENT1, glow_samples);
+        } else {
+            gl.bind_framebuffer(gl::FRAMEBUFFER, target.resolve);
+            gl.framebuffer_texture_2d(gl::COLOR_ATTACHMENT1, glow);
+        }
+        gl.draw_buffers(2);
+        complete &= gl.check_framebuffer_status() == gl::FRAMEBUFFER_COMPLETE;
+        gl.draw_buffers(1);
+        gl.bind_framebuffer(gl::FRAMEBUFFER, 0);
+        let bloom = BloomObjects { glow, glow_framebuffer, glow_samples, spill_framebuffer, down, up, sizes };
+        if !complete {
+            release_bloom(gl, &bloom);
+            return None;
+        }
+        self.blooms.insert(id, bloom);
+        Some(bloom)
+    }
+
+    /// The chain over a resolved target: four steps down from its colours
+    /// and glow, three back up, and the spill blended over the target as a
+    /// screen — `c + s·(1 − c)`, alpha by the brightest channel.
+    fn draw_bloom(&mut self, programs: &Programs, target: &Target, bloom: &BloomObjects, strength: u16) {
+        let gl = &mut self.gl;
+        gl.disable(gl::DEPTH_TEST);
+        gl.disable(gl::BLEND);
+        gl.disable(gl::CULL_FACE);
+        gl.disable(gl::SAMPLE_ALPHA_TO_COVERAGE);
+        gl.bind_vertex_array(programs.empty);
+        let step = |gl: &mut G, program: &Program, framebuffer: u32, size: (u32, u32), above: u32, second: u32, values: [f32; 4]| {
+            gl.bind_framebuffer(gl::FRAMEBUFFER, framebuffer);
+            gl.viewport(size.0 as i32, size.1 as i32);
+            gl.use_program(program.handle);
+            gl.uniform4fv(program.bloom, &[values]);
+            gl.active_texture(gl::TEXTURE0);
+            gl.bind_texture(above);
+            gl.active_texture(gl::TEXTURE1);
+            gl.bind_texture(second);
+            gl.draw_arrays(gl::TRIANGLES, 0, 3);
+        };
+        // down: the glowing colours first, then each step from the one above
+        step(gl, &programs.bloom_down, bloom.down[0].1, bloom.sizes[0], target.texture, bloom.glow, [1.0, 0.0, 0.0, 0.0]);
+        for level in 1..LEVELS {
+            let above = bloom.down[level - 1].0;
+            step(gl, &programs.bloom_down, bloom.down[level].1, bloom.sizes[level], above, above, [0.0; 4]);
+        }
+        // up: each step its own step down and the step below read up
+        let mut lower = bloom.down[LEVELS - 1].0;
+        for (below, level) in (0..LEVELS - 1).rev().enumerate() {
+            let carried = (below + 1) as f32;
+            step(gl, &programs.bloom_up, bloom.up[level].1, bloom.sizes[level], bloom.down[level].0, lower, [0.0, 0.0, carried, 0.0]);
+            lower = bloom.up[level].0;
+        }
+        // the spill, a screen over the target
+        gl.enable(gl::BLEND);
+        gl.blend_func_separate(gl::ONE_MINUS_DST_COLOR, gl::ONE, gl::ONE_MINUS_DST_ALPHA, gl::ONE);
+        step(gl, &programs.bloom_spill, bloom.spill_framebuffer, target.size, bloom.glow, lower, [0.0, strength as f32, 0.0, 0.0]);
+        gl.disable(gl::BLEND);
     }
 
     /// Draws one frame by itself into a target of its own and reads it
@@ -786,6 +974,9 @@ impl<G: GlFamily> WorldGround for GlWorld<G> {
     }
 
     fn drop_target(&mut self, id: u64) {
+        if let Some(bloom) = self.blooms.remove(&id) {
+            release_bloom(&mut self.gl, &bloom);
+        }
         if let Some(target) = self.targets.remove(&id) {
             release_target(&mut self.gl, &target);
         }
@@ -928,6 +1119,21 @@ impl<G: GlFamily> WorldGround for GlWorld<G> {
     }
 }
 
+fn release_bloom<G: GlFamily>(gl: &mut G, bloom: &BloomObjects) {
+    let steps = bloom.down.iter().chain(bloom.up.iter());
+    for &(texture, framebuffer) in steps.chain([(bloom.glow, bloom.glow_framebuffer), (0, bloom.spill_framebuffer)].iter()) {
+        if framebuffer != 0 {
+            gl.delete_framebuffer(framebuffer);
+        }
+        if texture != 0 {
+            gl.delete_texture(texture);
+        }
+    }
+    if bloom.glow_samples != 0 {
+        gl.delete_renderbuffer(bloom.glow_samples);
+    }
+}
+
 fn release_target<G: GlFamily>(gl: &mut G, target: &Target) {
     for framebuffer in [target.resolve, target.multisample] {
         if framebuffer != 0 {
@@ -1058,6 +1264,15 @@ mod tests {
         fn invalidate_framebuffer(&mut self, _: u32, _: u32, _: u32) {
             self.note("invalidate".into());
         }
+        fn draw_buffers(&mut self, count: u32) {
+            self.note(format!("draw_buffers {count}"));
+        }
+        fn read_buffer(&mut self, attachment: u32) {
+            self.note(format!("read_buffer {attachment:#x}"));
+        }
+        fn clear_color_buffer(&mut self, index: i32, _: [f32; 4]) {
+            self.note(format!("clear_color_buffer {index}"));
+        }
         fn viewport(&mut self, _: i32, _: i32) {}
         fn enable(&mut self, capability: u32) {
             self.note(format!("enable {capability:#x}"));
@@ -1114,7 +1329,7 @@ mod tests {
         let out = world.draw_single(&frame, &crate::image_engine::RawImages::default()).expect("the pass stands");
         assert_eq!(out.len(), 64 * 48 * 4);
         let tape = &world.gl;
-        assert_eq!(tape.count("program"), 6, "mesh, stepped, lines, backdrop, shadow, composite");
+        assert_eq!(tape.count("program"), 9, "mesh, stepped, lines, backdrop, three bloom steps, shadow, composite");
         assert_eq!(tape.count("storage 4"), 2, "four samples of colour and of depth");
         assert_eq!(tape.count("draw mesh 36 at 0 x2"), 1, "two cubes in one draw");
         assert_eq!(tape.count("draw lines 6 x12"), 1, "twelve edges, one quad each");
@@ -1127,6 +1342,35 @@ mod tests {
         assert!(frame.face_bias > 0.0);
         // and everything made for the single frame went away
         assert!(world.targets.is_empty() && world.meshes.is_empty() && world.segments.is_empty());
+    }
+
+    #[test]
+    fn a_frame_with_a_bloom_draws_its_glow_and_runs_the_chain() {
+        let world_of = || {
+            let world = World::new();
+            world.add(Mesh::sphere(0.4), Material::unlit(Color::rgb(255, 200, 120)).emissive(Color::rgb(255, 200, 120), 3.0));
+            world
+        };
+        let style = WorldStyle { quality: Quality::High, bloom: 0.6, ..WorldStyle::default() };
+        let frame = Rc::new(world_of().frame(&Camera::orbiting(Vec3::ZERO, 30.0, 25.0, 6.0), &style, (64, 48), 1.0));
+        let mut world = GlWorld::new(Tape::default(), [gl::ONE; 4], 4);
+        world.draw_single(&frame, &crate::image_engine::RawImages::default()).expect("the pass stands");
+        let tape = &world.gl;
+        assert_eq!(tape.count("storage 4"), 3, "four samples of colour, depth and glow");
+        assert_eq!(tape.count("clear_color_buffer 1"), 1, "the glow starts at none");
+        assert_eq!(tape.count("blit 64x48"), 2, "the colour and the glow resolve");
+        assert_eq!(tape.count("draw 3"), 8, "four steps down, three up, one spill");
+        assert_eq!(tape.count("blend 0x307 0x1 0x305 0x1"), 1, "the spill is a screen");
+        let spill = tape.calls.iter().position(|call| call == "blend 0x307 0x1 0x305 0x1").unwrap();
+        let resolve = tape.calls.iter().rposition(|call| call.starts_with("blit")).unwrap();
+        assert!(resolve < spill, "the chain reads the resolved target");
+        assert!(world.blooms.is_empty(), "the target's bloom went with it");
+        // without a bloom, one attachment and no chain
+        let plain = Rc::new(world_of().frame(&Camera::orbiting(Vec3::ZERO, 30.0, 25.0, 6.0), &WorldStyle { bloom: 0.0, ..style }, (64, 48), 1.0));
+        let mut world = GlWorld::new(Tape::default(), [gl::ONE; 4], 4);
+        world.draw_single(&plain, &crate::image_engine::RawImages::default()).expect("the pass stands");
+        assert_eq!(world.gl.count("draw 3"), 0);
+        assert_eq!(world.gl.count("draw_buffers 2"), 0);
     }
 
     #[test]

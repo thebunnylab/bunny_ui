@@ -197,6 +197,7 @@ pub(crate) fn style_hash(style: &WorldStyle) -> u64 {
     put(style.exposure.to_bits() as u64);
     put(style.xray as u64);
     put(style.grade.as_ref().map_or(0, super::frame::Grade::hash));
+    put(style.bloom.to_bits() as u64);
     put(style.max_fps.map_or(0, f64::to_bits));
     std::hash::Hasher::finish(&hasher)
 }

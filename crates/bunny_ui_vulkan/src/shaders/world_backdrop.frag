@@ -10,6 +10,7 @@ layout(push_constant) uniform Ramp {
 } pc;
 #define u_ramp pc.ramp
 layout(location = 0) out vec4 out_color;
+layout(location = 1) out vec4 out_glow;
 
 void main() {
     vec4 c;
@@ -28,4 +29,5 @@ void main() {
     }
     vec3 rgb = floor((c.rgb * c.a + 127.0) / 255.0);
     out_color = vec4(rgb, c.a) / 255.0;
+    out_glow = vec4(0.0);
 }

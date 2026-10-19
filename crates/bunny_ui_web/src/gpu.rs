@@ -161,6 +161,14 @@ unsafe extern "C" {
     /// Up to two attachments; 0 is none.
     #[cfg(feature = "3d")]
     fn gl_invalidate_framebuffer(target: u32, first: u32, second: u32);
+    /// The bound draw framebuffer's first `count` colour attachments.
+    #[cfg(feature = "3d")]
+    fn gl_draw_buffers(count: u32);
+    #[cfg(feature = "3d")]
+    fn gl_read_buffer(attachment: u32);
+    /// One colour attachment of the bound draw framebuffer, cleared.
+    #[cfg(feature = "3d")]
+    fn gl_clear_bufferfv(index: i32, r: f32, g: f32, b: f32, a: f32);
     #[cfg(feature = "3d")]
     fn gl_depth_func(function: u32);
     #[cfg(feature = "3d")]

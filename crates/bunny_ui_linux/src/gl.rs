@@ -432,7 +432,9 @@ struct GlWorldFns {
     clear_depth: unsafe extern "C" fn(f64),
     draw_elements_instanced: unsafe extern "C" fn(GlEnum, i32, GlEnum, *const c_void, i32),
     draw_buffer: unsafe extern "C" fn(GlEnum),
+    draw_buffers: unsafe extern "C" fn(i32, *const GlEnum),
     read_buffer: unsafe extern "C" fn(GlEnum),
+    clear_bufferfv: unsafe extern "C" fn(GlEnum, i32, *const f32),
     /// GL 4.3, or `ARB_invalidate_subdata`: a hint the pass can lose.
     invalidate_framebuffer: Option<unsafe extern "C" fn(GlEnum, i32, *const GlEnum)>,
 }
@@ -475,7 +477,9 @@ fn resolve_world(egl: &EglFns) -> Option<GlWorldFns> {
         clear_depth: gl!("glClearDepth"),
         draw_elements_instanced: gl!("glDrawElementsInstanced"),
         draw_buffer: gl!("glDrawBuffer"),
+        draw_buffers: gl!("glDrawBuffers"),
         read_buffer: gl!("glReadBuffer"),
+        clear_bufferfv: gl!("glClearBufferfv"),
         invalidate_framebuffer: sym("glInvalidateFramebuffer").map(|address| unsafe { entry(address) }),
     })
 }
@@ -1716,6 +1720,20 @@ impl GlFamily for Gl33 {
             (self.world.draw_buffer)(0);
             (self.world.read_buffer)(0);
         }
+    }
+
+    fn draw_buffers(&mut self, count: u32) {
+        const ATTACHMENTS: [GlEnum; 2] = [0x8CE0, 0x8CE1];
+        unsafe { (self.world.draw_buffers)(count.min(2) as i32, ATTACHMENTS.as_ptr()) }
+    }
+
+    fn read_buffer(&mut self, attachment: u32) {
+        unsafe { (self.world.read_buffer)(attachment) }
+    }
+
+    fn clear_color_buffer(&mut self, index: i32, color: [f32; 4]) {
+        const GL_COLOR: GlEnum = 0x1800;
+        unsafe { (self.world.clear_bufferfv)(GL_COLOR, index, color.as_ptr()) }
     }
 
     fn renderer(&self) -> Option<String> {

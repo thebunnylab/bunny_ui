@@ -18,7 +18,7 @@ use crate::world::mesh::{Mesh, MeshData};
 use crate::world::store::World;
 
 /// How many worlds the catalog holds.
-pub const COUNT: u32 = 16;
+pub const COUNT: u32 = 18;
 
 /// What a tier's picture may differ from the CPU's by: the share of
 /// pixels whose worst channel is more than three codes apart, and more
@@ -112,6 +112,23 @@ pub fn checker(cells: u32, side: u32) -> ImageSource {
     ImageSource::rgba(0xC4EC_0000_0000_0001, (side, side), rgba)
 }
 
+/// Lamps at night, at High with a bloom: what glows spills its light
+/// around itself.
+fn night_lamps() -> WorldFrame {
+    let world = World::new();
+    world.add(Mesh::plane(6.0, 6.0), Material::color(Color::rgb(70, 74, 86))).set_position(vec3(0.0, -0.5, 0.0));
+    world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(222, 120, 60)));
+    world
+        .add(Mesh::sphere(0.25), Material::unlit(Color::rgb(255, 214, 160)).emissive(Color::rgb(255, 214, 160), 3.0))
+        .set_position(vec3(-1.1, 0.4, 0.6));
+    world
+        .add(Mesh::cuboid(0.9, 0.08, 0.08), Material::unlit(Color::rgb(90, 200, 255)).emissive(Color::rgb(90, 200, 255), 4.0))
+        .set_position(vec3(1.0, 0.7, -0.2));
+    world.add_light(Light::sun().toward(vec3(-1.0, -2.0, -1.5)).intensity(0.25));
+    let night = WorldStyle { background: Background::Color(Color::rgb(14, 16, 24)), bloom: 0.7, ..style(Quality::High) };
+    world.frame(&Camera::orbiting(Vec3::ZERO, 25.0, 20.0, 5.0), &night, (200, 150), 1.0)
+}
+
 /// World `index` of the catalog.
 pub fn world_scene(index: u32) -> WorldScene {
     let frame = |world: &World, camera: &Camera, quality: Quality, size: (u32, u32)| Rc::new(world.frame(camera, &style(quality), size, 1.0));
@@ -200,6 +217,19 @@ pub fn world_scene(index: u32) -> WorldScene {
             frame: one_sample(&shadowed_still_life(), &Camera::orbiting(Vec3::ZERO, 20.0, 35.0, 4.0), Quality::Medium, (200, 150)),
             name: "a shadow of four lookups",
             tolerance: PENUMBRA,
+            pictures: Vec::new(),
+        },
+        16 => {
+            // drawn at one sample, so the glow's edge is the CPU's
+            let mut frame = night_lamps();
+            frame.samples = 1;
+            WorldScene { frame: Rc::new(frame), name: "lamps that bloom", tolerance: EXACT, pictures: Vec::new() }
+        }
+        17 => WorldScene {
+            frame: Rc::new(night_lamps()),
+            name: "lamps that bloom, four samples",
+            // the CPU takes one sample: the edges, and the glow they spill
+            tolerance: Tolerance { beyond_three: 0.08, beyond_sixteen: 0.06 },
             pictures: Vec::new(),
         },
         15 => {

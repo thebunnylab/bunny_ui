@@ -90,6 +90,9 @@ layout(set = 1, binding = 0) uniform sampler2D u_surface;
 layout(set = 2, binding = 0) uniform sampler2DShadow u_shadow;
 layout(set = 3, binding = 0) uniform sampler2D u_floor;
 layout(location = 0) out vec4 out_color;
+// how much the pixel glows, premultiplied as its colour: a frame with a
+// bloom draws it beside the colour, and any other frame drops it
+layout(location = 1) out vec4 out_glow;
 
 const int BAYER[16] = int[16](0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5);
 
@@ -296,6 +299,15 @@ vec4 material_row(int row) {
     return materials.rows[index * 4 + row];
 }
 
+// the glow `shade` leaves, in a code premultiplied by its alpha
+float shade_glow = 0.0;
+
+// how much a surface glows, from the light it gives off: its brightest
+// channel, a quarter a unit
+float glow_of(vec3 emissive) {
+    return clamp(max(emissive.r, max(emissive.g, emissive.b)) * 0.25, 0.0, 1.0);
+}
+
 // premultiplied codes over 255: the target's unorm write rounds them to
 // the byte the CPU computes
 vec4 shade() {
@@ -350,11 +362,13 @@ vec4 shade() {
     }
     vec3 code = graded(vec3(encode_code(linear.r), encode_code(linear.g), encode_code(linear.b)));
     vec3 codes = clamp(floor(code * alpha + 0.5 + dither), 0.0, 255.0);
+    shade_glow = floor(glow_of(emissive_row.xyz) * alpha * 255.0 + 0.5);
     return vec4(codes / 255.0, coverage >= 0.0 ? coverage : floor(alpha * 255.0 + 0.5) / 255.0);
 }
 
 void main() {
     out_color = shade();
+    out_glow = vec4(shade_glow / 255.0, 0.0, 0.0, out_color.a);
     float depth = v_zw.x / v_zw.y;
     float slope = max(abs(dFdx(depth)), abs(dFdy(depth)));
     gl_FragDepth = min(gl_FragCoord.z + u_draw.w * slope + DEPTH_TIE, DEPTH_CEILING);

@@ -72,6 +72,7 @@ pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Textu
         height,
         color: vec![[0; 4]; (width * height) as usize],
         depth: vec![1.0; (width * height) as usize],
+        glow: if frame.bloom > 0 { vec![0; (width * height) as usize] } else { Vec::new() },
     };
     target.clear(frame);
     let shadow = sun_shadow::map_of(frame);
@@ -118,6 +119,9 @@ pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Textu
             }
         }
     }
+    if frame.bloom > 0 {
+        super::bloom::apply(&mut target.color, &target.glow, (width, height), frame.bloom as u32);
+    }
     Picture { width, height, rgba: target.color.into_iter().flatten().collect() }
 }
 
@@ -156,6 +160,8 @@ struct Target {
     /// Premultiplied, sRGB-encoded.
     color: Vec<[u8; 4]>,
     depth: Vec<f32>,
+    /// How much each pixel glows, for a frame with a bloom; empty without.
+    glow: Vec<u8>,
 }
 
 impl Target {
@@ -189,8 +195,17 @@ impl Target {
     }
 
     /// Blends a premultiplied colour into the pixel, the way an 8-bit
-    /// target does: in floating point, rounded to the nearest code.
-    fn blend(&mut self, index: usize, source: [f32; 4], blend: Blend) {
+    /// target does: in floating point, rounded to the nearest code. The
+    /// glow, premultiplied in codes too, blends as the colour does.
+    fn blend(&mut self, index: usize, source: [f32; 4], glow: f32, blend: Blend) {
+        if let Some(below) = self.glow.get(index).map(|&g| g as f32) {
+            let out = match blend {
+                Blend::Replace => glow,
+                Blend::Alpha => glow + below * (1.0 - source[3] / 255.0),
+                Blend::Add => glow + below,
+            };
+            self.glow[index] = (out + 0.5).floor().clamp(0.0, 255.0) as u8;
+        }
         let destination = self.color[index];
         let out = match blend {
             Blend::Replace => source,
@@ -503,18 +518,18 @@ impl Job<'_> {
                     let rho2 = (dx.0 * dx.0 + dx.1 * dx.1).max(dy.0 * dy.0 + dy.1 * dy.1);
                     texture.sample(uv[0], uv[1], 0.5 * log2(rho2.max(1e-12)))
                 });
-                let Some(color) = self.shade(vertices, b, front, texel, px as u32, py as u32) else { continue };
+                let Some((color, glow)) = self.shade(vertices, b, front, texel, px as u32, py as u32) else { continue };
                 if opaque {
                     target.depth[index] = z;
                 }
-                target.blend(index, color, self.blend);
+                target.blend(index, color, glow, self.blend);
             }
         }
     }
 
-    /// The colour of a fragment, premultiplied in codes; `None` when it is
-    /// discarded.
-    fn shade(&self, v: [&Vertex; 3], b: [f32; 3], front: bool, texel: Option<[f32; 4]>, x: u32, y: u32) -> Option<[f32; 4]> {
+    /// The colour of a fragment, premultiplied in codes, and its glow in a
+    /// code premultiplied too; `None` when it is discarded.
+    fn shade(&self, v: [&Vertex; 3], b: [f32; 3], front: bool, texel: Option<[f32; 4]>, x: u32, y: u32) -> Option<([f32; 4], f32)> {
         let u: &FrameUniforms = &self.frame.uniforms;
         let mix3 = |f: fn(&Vertex) -> [f32; 3]| -> V3 {
             let (a, c, d) = (f(v[0]), f(v[1]), f(v[2]));
@@ -579,7 +594,8 @@ impl Job<'_> {
             (shade::tone(lit, u.tone[0], u.tone[1]), dither)
         };
         let codes = graded(self.frame, linear.map(encode_code)).map(|code| quantize(code * alpha, dither) as f32);
-        Some([codes[0], codes[1], codes[2], (alpha * 255.0 + 0.5).floor()])
+        let glow = super::bloom::glow([material.emissive[0], material.emissive[1], material.emissive[2]]);
+        Some(([codes[0], codes[1], codes[2], (alpha * 255.0 + 0.5).floor()], (glow * alpha * 255.0 + 0.5).floor()))
     }
 }
 
@@ -736,7 +752,7 @@ fn line(target: &mut Target, frame: &WorldFrame, instance: &InstanceData, projec
             }
             let alpha = coverage * style.color[3];
             let source = [codes[0] * alpha, codes[1] * alpha, codes[2] * alpha, alpha * 255.0];
-            target.blend(index, source, Blend::Alpha);
+            target.blend(index, source, 0.0, Blend::Alpha);
         }
     }
 }
@@ -996,6 +1012,33 @@ mod tests {
         let [r, g, b, _] = plain.at(16, 16);
         assert!(swapped[0].abs_diff(b) <= 1 && swapped[1].abs_diff(g) <= 1 && swapped[2].abs_diff(r) <= 1, "{swapped:?}");
         assert!(Grade::new(vec![[0; 3]; 15]).is_none(), "a table of another count");
+    }
+
+    #[test]
+    fn a_glowing_ball_spills_its_light_at_high() {
+        let world = World::new();
+        world.add(Mesh::sphere(0.3), Material::unlit(Color::rgb(255, 190, 110)).emissive(Color::rgb(255, 190, 110), 3.0));
+        world.add(Mesh::cuboid(0.4, 0.4, 0.4), Material::color(Color::rgb(90, 140, 200))).set_position(vec3(1.2, 0.0, 0.0));
+        let camera = Camera::looking_at(vec3(0.0, 0.0, 4.0), Vec3::ZERO).parallel_height(3.0);
+        let dark = Background::Color(Color::rgb(16, 18, 24));
+        let high = WorldStyle { quality: Quality::High, bloom: 0.6, ..style(dark) };
+        let frame = world.frame(&camera, &high, (96, 96), 1.0);
+        assert_eq!(frame.bloom, 154, "0.6 in 256ths");
+        let glowing = draw(&frame);
+        let plain = draw(&world.frame(&camera, &WorldStyle { bloom: 0.0, ..high.clone() }, (96, 96), 1.0));
+        dump("bloom", &glowing);
+        // just past the ball's edge (its radius is ten pixels), the light
+        // spills; a far corner keeps its colour
+        let (near, far) = ((48 + 12, 48), (2, 2));
+        assert!(glowing.at(near.0, near.1)[0] > plain.at(near.0, near.1)[0] + 20, "{:?} over {:?}", glowing.at(near.0, near.1), plain.at(near.0, near.1));
+        assert_eq!(glowing.at(far.0, far.1), plain.at(far.0, far.1));
+        assert!(glowing.rgba.chunks(4).all(|pixel| pixel[3] == 255), "an opaque picture stays opaque");
+        // the box does not glow: its middle gains only what spills from the ball
+        let middle = glowing.at(48 + 38, 48);
+        assert!(middle[2] >= plain.at(48 + 38, 48)[2], "a screen never darkens");
+        // below High, no bloom
+        let medium = world.frame(&camera, &WorldStyle { quality: Quality::Medium, ..high }, (96, 96), 1.0);
+        assert_eq!(medium.bloom, 0);
     }
 
     #[test]

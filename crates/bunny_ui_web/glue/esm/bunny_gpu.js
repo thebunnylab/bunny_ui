@@ -402,6 +402,19 @@ export function gl_invalidate_framebuffer(target, first, second) {
   if (second >>> 0) attachments.push(second >>> 0);
   if (attachments.length) gl.invalidateFramebuffer(target >>> 0, attachments);
 }
+// a frame that draws its glow draws into two attachments
+export function gl_draw_buffers(count) {
+  if (!gl) return;
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1].slice(0, Math.min(count >>> 0, 2)));
+}
+export function gl_read_buffer(attachment) {
+  if (!gl) return;
+  gl.readBuffer(attachment >>> 0);
+}
+export function gl_clear_bufferfv(index, r, g, b, a) {
+  if (!gl) return;
+  gl.clearBufferfv(gl.COLOR, index | 0, [r, g, b, a]);
+}
 export function gl_depth_func(func) {
   if (!gl) return;
   gl.depthFunc(func >>> 0);

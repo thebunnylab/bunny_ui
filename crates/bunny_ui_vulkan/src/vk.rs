@@ -5517,6 +5517,9 @@ mod tests {
             "world_backdrop.frag",
             "world_shadow.vert",
             "world_composite.frag",
+            "world_bloom_down.frag",
+            "world_bloom_up.frag",
+            "world_bloom_spill.frag",
         ] {
             let out = std::env::temp_dir().join(format!("bunny-drift-{stage}.spv"));
             let status = std::process::Command::new("glslangValidator")
