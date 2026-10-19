@@ -1,15 +1,15 @@
 {
   "task": "T2-STUDIO-183",
-  "source_revision": "b8c0e6ced1b564127722fc43f541d607263a3f1b",
+  "source_revision": "9ee003d3083613c28812b69a4668c7cf7e2b470c",
   "baseline_revision": "ab60478d11e6fc08f5118670917e884788654e19",
   "result": "framework_regressions_passed_native_integration_pending",
   "tests": {
     "core_and_web_all_features": {
-      "passed": 1441,
+      "passed": 1443,
       "failed": 0,
       "ignored": 59
     },
-    "focused_public_runtime": 8
+    "focused_public_runtime_paranoid": 10
   },
   "gates": {
     "native_production_clippy": "passed -D warnings; core and web all targets/all features",
@@ -22,5 +22,13 @@
     "The extra no-default-feature strict core lint reports six dead-code diagnostics in existing methods/types; it is not a passed gate. Production strict native and core wasm gates pass.",
     "Signed native corrected inspector and standalone painting are pending the combined T182/T183 Trinity integration. Native before captures remain attributed to Trinity05e87, hostBunnyad682 and projectBunny57aa3de.",
     "DOM ABI advances to22 and every shipped mirror changes together. The preview protocol and project format do not change. Native platform hosts remain outside framework paint."
-  ]
+  ],
+  "earlier_source_revision": "b8c0e6ced1b564127722fc43f541d607263a3f1b",
+  "final_logs": {
+    "final-core-web-tests.log": "final-core-web-tests.log",
+    "final-paranoid-blur.log": "final-paranoid-blur.log",
+    "final-cull-clippy.log": "final-cull-clippy.log",
+    "final-wasm-core.log": "final-wasm-core.log"
+  },
+  "additional_regression": "The first implementation retained invisible placeholders. Clipped multi-child blur failed the paranoid full-versus-culled invariant. The final implementation replaces paint ranges, rebinds dependent records and preserves native-host paint barriers; ten focused paranoid scenarios pass."
 }
