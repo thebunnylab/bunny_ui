@@ -1868,7 +1868,9 @@ pub extern "C" fn bunny_gpu_parity(scene: u32) -> u32 {
     let scale = 2usize;
     let canvas = Color::rgba(242, 243, 247, 255);
     let (display, name) = bunny_ui::gpu::scenes::scene(scene);
-    let runtime = Runtime::new();
+    // a scene of its own: a runtime on the page's root would take the
+    // page's views down with it when it went
+    let runtime = Runtime::scene("bunny-gpu-parity");
     let physical = (
         (size.width as usize * scale) as u32,
         (size.height as usize * scale) as u32,
