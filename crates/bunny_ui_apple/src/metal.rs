@@ -80,7 +80,7 @@ mod world {
             None
         }
 
-        pub(super) unsafe fn encode(&self, _command: Id, _sels: &super::Sels, _pass_class: Id, _staging: Id) {}
+        pub(super) unsafe fn encode(&self, _command: Id, _queue: Id, _sels: &super::Sels, _pass_class: Id, _staging: Id) {}
     }
 }
 
