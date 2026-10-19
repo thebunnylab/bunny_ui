@@ -54,3 +54,14 @@ pub(super) fn text(runtime: &Runtime, text: &str) -> bool {
     }
     changed
 }
+
+/// A paste is one commit after the application's original shortcut has its say.
+pub(super) fn paste(runtime: &Runtime, paste: crate::wire::ClipboardPaste) -> bool {
+    if !crate::wire::ClipboardPaste::is_shortcut(&paste.key, paste.modifiers) {
+        return false;
+    }
+    let Some(stroke) = stroke_named(&paste.key, paste.modifiers) else {
+        return false;
+    };
+    runtime.key_stroke(stroke).handled || runtime.paste_text(paste.text)
+}

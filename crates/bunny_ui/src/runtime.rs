@@ -5028,11 +5028,27 @@ impl Runtime {
             self.frame_asked.set(true);
             return true;
         }
-        let applied = match crate::clipboard::read() {
-            Some(text) => self.key(EditCommand::Insert(text)).applied,
-            None => false,
+        crate::clipboard::read().is_some_and(|text| self.paste_text(text))
+    }
+
+    /// Commit text captured by a shell as one paste, without reading a clipboard.
+    ///
+    /// The shell offers the originating shortcut to `key_stroke` first. Paste
+    /// boundaries keep this complete commit separate from surrounding typing
+    /// and other pastes in the focused field's existing history.
+    pub fn paste_text(&self, text: String) -> bool {
+        self.enter_scene();
+        let Some(path) = self.focus.borrow().clone() else {
+            return false;
         };
-        if let Some(history) = reconciler::editor_history(&path) { history.separate(); }
+        let history = reconciler::editor_history(&path);
+        if let Some(history) = &history {
+            history.separate();
+        }
+        let applied = self.key(EditCommand::Insert(text)).applied;
+        if let Some(history) = history {
+            history.separate();
+        }
         applied
     }
 

@@ -362,7 +362,15 @@ impl Host {
             generation: self.generation,
             workspace_root: self.config.manifest_dir.to_string_lossy().into_owned(),
             package: self.config.package.clone(),
-            caps: wire::caps::STATE_OBSERVATIONS | wire::caps::VIEW_IDENTITIES | wire::caps::PLACE | wire::caps::INSTANCES | wire::caps::SHAPES | wire::caps::MOUNT | wire::caps::EXECUTION | wire::caps::EXECUTION_SELECTION,
+            caps: wire::caps::CLIPBOARD_TEXT
+                | wire::caps::STATE_OBSERVATIONS
+                | wire::caps::VIEW_IDENTITIES
+                | wire::caps::PLACE
+                | wire::caps::INSTANCES
+                | wire::caps::SHAPES
+                | wire::caps::MOUNT
+                | wire::caps::EXECUTION
+                | wire::caps::EXECUTION_SELECTION,
         });
         self.ready();
     }
@@ -524,6 +532,11 @@ impl Host {
             ToHost::Key { id, key, modifiers } => {
                 if let Some(scene) = self.scene(&id) {
                     scene.dirty |= input::key(&scene.runtime, &key, modifiers);
+                }
+            }
+            ToHost::Paste { id, paste } => {
+                if let Some(scene) = self.scene(&id) {
+                    scene.dirty |= input::paste(&scene.runtime, paste);
                 }
             }
             ToHost::Text { id, text } => {

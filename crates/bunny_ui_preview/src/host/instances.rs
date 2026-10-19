@@ -88,7 +88,8 @@ impl Host {
             | ToHost::Touch { id, .. }
             | ToHost::Magnify { id, .. }
             | ToHost::Key { id, .. }
-            | ToHost::Text { id, .. } => self
+            | ToHost::Text { id, .. }
+            | ToHost::Paste { id, .. } => self
                 .scenes
                 .iter()
                 .find(|scene| scene.instance().is_none() && scene.id == *id),
@@ -295,6 +296,9 @@ impl Host {
             }
             InstanceCommand::Key { key, modifiers } => {
                 scene.dirty |= input::key(&scene.runtime, &key, modifiers);
+            }
+            InstanceCommand::Paste(paste) => {
+                scene.dirty |= input::paste(&scene.runtime, paste);
             }
             InstanceCommand::Text { text } => {
                 scene.dirty |= input::text(&scene.runtime, &text);

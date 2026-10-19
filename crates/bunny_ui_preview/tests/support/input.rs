@@ -55,6 +55,10 @@ impl EditingStrategy for Guard {
                 self.0.add(1);
                 true
             }
+            Key::Char('v') if stroke.pattern.command || stroke.pattern.control => {
+                self.0.add(1);
+                true
+            }
             Key::Char('a') if stroke.pattern.command => {
                 self.0.add(1);
                 true
@@ -151,6 +155,7 @@ impl Target {
                     },
                     InstanceCommand::Key { key, modifiers } => ToHost::Key { id, key, modifiers },
                     InstanceCommand::Text { text } => ToHost::Text { id, text },
+                    InstanceCommand::Paste(paste) => ToHost::Paste { id, paste },
                     _ => panic!("unsupported test input"),
                 }
             }
@@ -203,6 +208,16 @@ impl Target {
             },
         );
     }
+    fn paste(&self, host: &mut Host, text: &str, modifiers: u32) {
+        self.send(
+            host,
+            InstanceCommand::Paste(wire::ClipboardPaste {
+                key: "v".into(),
+                modifiers,
+                text: text.into(),
+            }),
+        );
+    }
     fn text(&self, host: &mut Host, text: &str) {
         self.send(host, InstanceCommand::Text { text: text.into() });
     }
@@ -243,6 +258,17 @@ fn edit(target: &Target, host: &mut Host, seen: &Rc<RefCell<Vec<ToIde>>>, first:
     let frame = target.take(seen).unwrap();
     assert!(says(&frame, "value=done"));
     assert!(says(&frame, "submitted=done"));
+    target.key(host, "a", 2);
+    target.paste(host, "café 🐇 Ω", 2);
+    target.value(host, seen, "café 🐇 Ω");
+    target.paste(host, " + β", 8);
+    target.value(host, seen, "café 🐇 Ω + β");
+    target.key(host, "z", 2);
+    target.value(host, seen, "café 🐇 Ω");
+    target.key(host, "z", 2);
+    target.value(host, seen, "done");
+    target.key(host, "z", 3);
+    target.value(host, seen, "café 🐇 Ω");
 }
 
 #[test]
@@ -323,6 +349,12 @@ fn field_strategy_consumes_strokes_once_before_default_editing() {
     let frame = target.take(&seen).unwrap();
     assert!(says(&frame, "value=!ok"), "{:?}", frame.strings);
     assert!(says(&frame, "intercepted=3"));
+    target.paste(&mut host, "must not insert", 2);
+    target.paste(&mut host, "must not insert either", 8);
+    assert!(host.tick());
+    let frame = target.take(&seen).unwrap();
+    assert!(says(&frame, "value=!ok"));
+    assert!(says(&frame, "intercepted=5"));
 }
 
 fn instance_frames(seen: &Rc<RefCell<Vec<ToIde>>>) -> Vec<(SceneInstanceId, wire::Frame)> {
@@ -363,4 +395,36 @@ fn multiline_enter_arrows_and_committed_text_follow_native_field_semantics() {
     target.key(&mut host, "Escape", 0);
     target.text(&mut host, "ignored");
     target.value(&mut host, &seen, "a!d");
+}
+
+#[test]
+fn clipboard_payload_replaces_the_focused_field_as_one_commit() {
+    let (mut host, seen) = host();
+    host.handle(select("input_form", fixed(300.0, 160.0)));
+    host.tick();
+    let target = Target::Legacy("input_form");
+    let first = target.take(&seen).unwrap();
+    target.focus(&mut host, &first);
+    target.text(&mut host, "before");
+    target.key(&mut host, "a", 2);
+    host.tick();
+    target.take(&seen).unwrap();
+
+    // A literal new-kind payload also runs against the original decoder:
+    // it skips the message, reproducing the missing clipboard input door.
+    let mut payload = Vec::new();
+    for value in ["src/lib.rs#input_form", "v"] {
+        payload.extend_from_slice(&u32::try_from(value.len()).unwrap().to_le_bytes());
+        payload.extend_from_slice(value.as_bytes());
+    }
+    payload.extend_from_slice(&2_u32.to_le_bytes());
+    let text = "café 🐇 Ω";
+    payload.extend_from_slice(&u32::try_from(text.len()).unwrap().to_le_bytes());
+    payload.extend_from_slice(text.as_bytes());
+    if let wire::Received::Message(wire::Message::ToHost(message)) =
+        wire::decode(86, &payload).unwrap()
+    {
+        host.handle(message);
+    }
+    target.value(&mut host, &seen, text);
 }
