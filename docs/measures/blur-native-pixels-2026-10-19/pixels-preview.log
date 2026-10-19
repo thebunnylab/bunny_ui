@@ -1,0 +1,157 @@
+   Compiling bunny-ui-core v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui)
+   Compiling bunny-ui-preview v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui_preview)
+   Compiling bunny-ui-hot v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui_hot)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.14s
+     Running unittests src/lib.rs (target/debug/deps/bunny_ui_preview-ce0631fea04f8fa3)
+
+running 12 tests
+test scan::tests::a_free_function_under_the_attribute_is_a_preview_at_its_own_site ... ok
+test snapshot::tests::tolerance_and_size ... ok
+test scan::tests::raw_strings_chars_and_lifetimes_do_not_confuse_the_lexer ... ok
+test snapshot::tests::a_difference_is_counted_and_boxed ... ok
+test scan::tests::the_lexer_keeps_strings_whole_and_drops_comments ... ok
+test scan::tests::the_declarative_form_is_a_preview_at_the_macros_site ... ok
+test scan::tests::qualifiers_generics_and_bad_arguments_are_refused_by_name ... ok
+test wire::tests::a_frame_fed_in_pieces_comes_out_whole ... ok
+test wire::tests::an_unknown_kind_is_skipped_and_a_cut_payload_is_malformed ... ok
+test wire::tests::strings_intern_once ... ok
+test scan::tests::an_impl_block_and_a_trait_make_their_functions_associated ... ok
+test scan::tests::merging_names_the_second_claim_of_an_ident_a_duplicate ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/convert.rs (target/debug/deps/convert-ff311a9584d18926)
+
+running 6 tests
+test a_place_patch_is_the_modifier_it_names ... ok
+test images_travel_by_key_with_their_wraps_folded_in ... ok
+test traits_round_trip_with_a_theme_by_token_name ... ok
+test ellipse_geometry_and_ink_round_trip_through_existing_vector_resources ... ok
+test a_patch_is_the_modifier_it_names_and_a_site_keeps_its_place ... ok
+test a_frame_goes_to_the_wire_and_back_unchanged ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/host.rs (target/debug/deps/host-4e56cd1e89e011c4)
+
+running 49 tests
+test execution::discovery_uses_a_temporary_design_context_and_closes_it ... ok
+test an_override_stands_in_for_one_of_its_kind_and_stacks_beside_another ... ok
+test an_app_root_panic_during_discovery_is_reported_without_killing_the_host ... ok
+test a_host_box_rides_the_frame_and_a_door_fills_it ... ok
+test a_moved_picture_renders_the_scene_with_the_box_again ... ok
+test a_magnify_reaches_the_box_under_the_point ... ok
+test execution::failed_scene_closes_its_captured_context_without_poisoning_other_scenes ... ok
+test execution::execution_acknowledgement_separates_old_frames_from_the_new_mount ... ok
+test a_panic_in_one_scene_is_reported_and_the_other_keeps_rendering ... ok
+test a_both_selection_renders_two_scenes_in_their_own_tokens_and_only_once ... ok
+test a_span_place_regrows_the_grid ... ok
+test a_touch_on_the_button_counts ... ok
+test a_place_on_a_position_site_moves_the_child ... ok
+test a_snapshot_is_the_frames_pixels ... ok
+test a_snapshot_held_past_its_patience_answers_without_the_picture ... ok
+test a_second_replace_on_a_site_stands_in_for_the_first ... ok
+test execution::execution_remount_keeps_each_variants_overrides ... ok
+test execution::legacy_callbacks_use_design_and_missing_instance_mode_reports_an_error ... ok
+test execution::invalid_execution_selection_cannot_partially_close_or_remount_scenes ... ok
+test execution::execution_selection_mounts_in_play_and_reordering_does_not_remount ... ok
+test execution::rapid_mode_revert_acknowledges_both_requests_and_mounts_only_the_final_intent ... ok
+test hello_announces_live_placement ... ok
+test hello_lists_the_app_first_with_its_scope ... ok
+test hello_lists_what_the_binary_exports_and_names_what_it_does_not ... ok
+test execution::execution_remount_closes_only_changed_instances_and_advances_cached_frame_identity ... ok
+test instances::a_held_snapshot_cannot_reattach_to_a_recreated_instance ... ok
+test execution::modes_input_and_mount_are_scoped_per_instance_and_variant ... ok
+test instances::an_instance_panic_names_only_its_instance_and_other_scenes_survive ... ok
+test input::field_strategy_consumes_strokes_once_before_default_editing ... ok
+test a_snapshot_asked_while_the_door_is_busy_waits_for_the_picture ... ok
+test input::clipboard_payload_replaces_the_focused_field_as_one_commit ... ok
+test state::ambiguous_legacy_scenes_never_pick_the_first_matching_preview ... ok
+test instances::invalid_instance_selection_is_atomic_and_legacy_commands_cannot_alias_it ... ok
+test input::multiline_enter_arrows_and_committed_text_follow_native_field_semantics ... ok
+test the_small_talk_is_answered ... ok
+test state::same_formatted_pixels_still_publish_changed_storage_and_write_version ... ok
+test instances::a_variant_has_its_own_input_and_recreated_instances_start_fresh ... ok
+test the_door_is_told_what_lives_when_a_scene_leaves ... ok
+test state::invalid_replacement_clears_previous_watch_and_removal_reports_revocation ... ok
+test state::cancellation_stale_requests_disable_and_remount_revoke_without_retargeting ... ok
+test instances::dock_and_page_selection_replace_only_their_own_scenes ... ok
+test instances::duplicate_components_keep_input_size_and_state_by_instance_when_reordered ... ok
+test instances::overrides_and_variant_input_do_not_leak_to_another_instance ... ok
+test views::instance_remount_retires_ids_even_when_the_picture_is_identical ... ok
+test the_app_scene_renders_with_real_state ... ok
+test views::view_observation_is_opt_in_and_forces_a_current_frame_pair ... ok
+test state::selected_observation_is_opt_in_and_independent_between_instances ... ok
+test input::legacy_field_accepts_unicode_selection_deletion_and_submission ... ok
+test input::instance_field_editing_is_scoped_to_its_instance_and_variant ... ok
+
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/scan.rs (target/debug/deps/scan-fe47fe5ae3ee196e)
+
+running 5 tests
+test duplicate_app_entries_are_visible_and_keep_the_first_site ... ok
+test the_app_has_one_site_and_reserves_its_preview_ident ... ok
+test the_tricky_fixture_keeps_only_the_fine_one_and_names_the_rest ... ok
+test the_basic_fixture_lists_four_previews_on_three_cards ... ok
+test a_crate_scan_folds_its_files_and_names_the_ident_two_of_them_claim ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/wire_execution.rs (target/debug/deps/wire_execution-5cef3a74d9d7b8ae)
+
+running 4 tests
+test execution_acknowledgement_roundtrips_its_opaque_request_and_refuses_truncation ... ok
+test execution_refuses_unknown_modes_truncated_payloads_and_invalid_identities ... ok
+test initial_execution_selection_has_its_own_capability_and_roundtrips ... ok
+test execution_is_an_additive_message_with_an_explicit_capability ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/wire_golden.rs (target/debug/deps/wire_golden-db838f5861321015)
+
+running 3 tests
+test placement_keeps_the_preexisting_stream_as_an_exact_prefix ... ok
+test a_truncated_frame_is_malformed_and_a_stranger_kind_is_skipped ... ok
+test the_bytes_are_the_golden_ones_and_decode_to_what_was_sent ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/wire_instances.rs (target/debug/deps/wire_instances-2f04786d60e811f9)
+
+running 3 tests
+test malformed_instance_ids_are_refused_without_changing_old_message_kinds ... ok
+test clipboard_text_roundtrips_without_changing_ordinary_key_or_text_messages ... ok
+test instance_messages_preserve_identity_and_every_command_payload ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/wire_state.rs (target/debug/deps/wire_state-33ca725ce0522f15)
+
+running 7 tests
+test additive_control_messages_have_fixed_kinds_and_bytes ... ok
+test zero_request_and_oversized_metadata_are_rejected_at_decode ... ok
+test invalid_scalar_duplicate_dependency_and_large_count_are_malformed ... ok
+test duplicate_dependencies_and_limits_refuse_a_proof ... ok
+test all_values_and_request_outcomes_roundtrip_without_loss ... ok
+test observations_require_current_request_target_and_exact_validated_frame ... ok
+test explicit_unavailable_outcomes_roundtrip_and_every_truncation_fails ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/wire_views.rs (target/debug/deps/wire_views-e6fb649fabf290b4)
+
+running 4 tests
+test zero_id_is_malformed_on_the_wire ... ok
+test view_snapshot_and_opt_in_round_trip_without_changing_old_payloads ... ok
+test missing_unknown_duplicate_and_unavailable_identities_refuse_the_join ... ok
+test metadata_requires_the_exact_scene_build_and_publication ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests bunny_ui_preview
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,80 @@
+{
+  "task": "T2-STUDIO-183",
+  "source_revision": "c8dc378e5d37d82b6b7b3d1e8f428390a7d2b0e4",
+  "baseline_revision": "d633ebe7eddc188d8f18df43d879c5b0e8b6eb29",
+  "result": "decoder_regressions_passed_native_window_retake_pending",
+  "tests": {
+    "core": {
+      "passed": 1444,
+      "failed": 0,
+      "ignored": 59
+    },
+    "apple": {
+      "passed": 157,
+      "failed": 0,
+      "ignored": 1
+    },
+    "preview": {
+      "passed": 93,
+      "failed": 0,
+      "ignored": 0
+    }
+  },
+  "before": {
+    "reject_encoded_engine": 101,
+    "apple_imageio_engine": 101
+  },
+  "after": "Computed blur uses the existing ImageSource::Rgba. Both failing regressions pass; existing preview RGBA conversion/wire/resource tests pass.",
+  "gates": [
+    {
+      "name": "pixels-core",
+      "command": "cargo test --locked -p bunny-ui-core --all-features",
+      "exit": 0,
+      "seconds": 60.93724989891052
+    },
+    {
+      "name": "pixels-apple",
+      "command": "cargo test --locked -p bunny-ui-apple --all-features",
+      "exit": 0,
+      "seconds": 16.047881841659546
+    },
+    {
+      "name": "pixels-preview",
+      "command": "cargo test --locked -p bunny-ui-preview --all-features",
+      "exit": 0,
+      "seconds": 9.490383863449097
+    },
+    {
+      "name": "pixels-native-clippy",
+      "command": "cargo clippy --locked -p bunny-ui-core -p bunny-ui-preview --all-features --all-targets --no-deps -- -D warnings",
+      "exit": 0,
+      "seconds": 8.2448410987854
+    },
+    {
+      "name": "pixels-apple-clippy",
+      "command": "cargo clippy --locked -p bunny-ui-apple --all-features --lib --test blur_pixels --no-deps -- -D warnings",
+      "exit": 101,
+      "seconds": 9.71825623512268
+    },
+    {
+      "name": "pixels-wasm-clippy",
+      "command": "cargo +nightly-2026-07-15 clippy --locked -p bunny-ui-core -p bunny-ui-preview --all-features --target wasm32-unknown-unknown --no-deps -- -D warnings",
+      "exit": 0,
+      "seconds": 2.920593023300171
+    }
+  ],
+  "additional_apple_strict_lint": {
+    "exit": 101,
+    "diagnostics": 34,
+    "all_reported_source_files_unchanged_from_baseline": {
+      "crates/bunny_ui_apple/src/ffi.rs": true,
+      "crates/bunny_ui_apple/src/image.rs": true,
+      "crates/bunny_ui_apple/src/metal.rs": true,
+      "crates/bunny_ui_apple/src/text.rs": true,
+      "crates/bunny_ui_apple/src/webview.rs": true
+    },
+    "qualification": "This additional strict invocation is failed, not green. The repository CI separately compares inherited diagnostics."
+  },
+  "native_failure_receipt": "Trinity docs/bunny/measures/studio-image-sizing-2026-10-19: signed25f456a with Bunnyd633ebe loses panel on Blur1/5; exact source and captured images retained.",
+  "scope": "No preview wire or project format change. Corrected signed native inspector and same-source standalone painting remain required."
+}

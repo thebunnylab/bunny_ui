@@ -1,0 +1,86 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling cfg_aliases v0.2.2
+   Compiling libc v0.2.189
+   Compiling libm v0.2.16
+   Compiling autocfg v1.5.1
+   Compiling bitflags v2.13.2
+   Compiling cfg-if v1.0.5
+   Compiling zerocopy v0.8.59
+   Compiling thiserror v2.0.21
+   Compiling log v0.4.34
+   Compiling core-foundation-sys v0.8.7
+   Compiling paste v1.0.15
+   Compiling parking_lot_core v0.9.12
+   Compiling unicode-width v0.2.2
+   Compiling hashbrown v0.17.1
+   Compiling scopeguard v1.2.0
+   Compiling bit-vec v0.8.0
+   Compiling equivalent v1.0.2
+   Compiling naga v27.0.3
+   Compiling foldhash v0.2.0
+   Compiling smallvec v1.16.2
+   Compiling foreign-types-shared v0.3.1
+   Compiling codespan-reporting v0.12.0
+   Compiling wgpu-hal v27.0.4
+   Compiling lock_api v0.4.14
+   Compiling hashbrown v0.16.1
+   Compiling bit-set v0.8.0
+   Compiling num-traits v0.2.19
+   Compiling hexf-parse v0.2.1
+   Compiling indexmap v2.14.2
+   Compiling arrayvec v0.7.8
+   Compiling block v0.1.6
+   Compiling once_cell v1.21.4
+   Compiling rustc-hash v1.1.0
+   Compiling profiling v1.0.18
+   Compiling raw-window-handle v0.6.2
+   Compiling wgpu-core v27.0.3
+   Compiling litrs v1.0.0
+   Compiling wgpu v27.0.1
+   Compiling static_assertions v1.1.0
+   Compiling bunny-ui-core v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui)
+   Compiling pollster v0.4.0
+   Compiling document-features v0.2.12
+   Compiling malloc_buf v0.0.6
+   Compiling core-foundation v0.10.1
+   Compiling objc v0.2.7
+   Compiling syn v3.0.3
+   Compiling syn v2.0.119
+   Compiling parking_lot v0.12.5
+   Compiling core-graphics-types v0.2.0
+   Compiling zerocopy-derive v0.8.59
+   Compiling thiserror-impl v2.0.21
+   Compiling bytemuck_derive v1.12.1
+   Compiling foreign-types-macros v0.2.4
+   Compiling foreign-types v0.5.0
+   Compiling bytemuck v1.25.2
+   Compiling metal v0.32.0
+   Compiling wgpu-types v27.0.1
+   Compiling half v2.7.1
+   Compiling wgpu-core-deps-apple v27.0.0
+   Compiling bunny-ui-apple v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui_apple)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.22s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/blur_pixels.rs (target/debug/deps/blur_pixels-e63a61f999b31754)
+
+running 1 test
+test native_decoder_displays_the_complete_blurred_subtree ... FAILED
+
+failures:
+
+---- native_decoder_displays_the_complete_blurred_subtree stdout ----
+
+thread 'native_decoder_displays_the_complete_blurred_subtree' (42901640) panicked at crates/bunny_ui_apple/tests/blur_pixels.rs:34:10:
+native painting can read the effect pixels
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    native_decoder_displays_the_complete_blurred_subtree
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+error: test failed, to rerun pass `-p bunny-ui-apple --test blur_pixels`

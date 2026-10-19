@@ -1,0 +1,38 @@
+[
+  {
+    "name": "pixels-core",
+    "command": "cargo test --locked -p bunny-ui-core --all-features",
+    "exit": 0,
+    "seconds": 60.93724989891052
+  },
+  {
+    "name": "pixels-apple",
+    "command": "cargo test --locked -p bunny-ui-apple --all-features",
+    "exit": 0,
+    "seconds": 16.047881841659546
+  },
+  {
+    "name": "pixels-preview",
+    "command": "cargo test --locked -p bunny-ui-preview --all-features",
+    "exit": 0,
+    "seconds": 9.490383863449097
+  },
+  {
+    "name": "pixels-native-clippy",
+    "command": "cargo clippy --locked -p bunny-ui-core -p bunny-ui-preview --all-features --all-targets --no-deps -- -D warnings",
+    "exit": 0,
+    "seconds": 8.2448410987854
+  },
+  {
+    "name": "pixels-apple-clippy",
+    "command": "cargo clippy --locked -p bunny-ui-apple --all-features --lib --test blur_pixels --no-deps -- -D warnings",
+    "exit": 101,
+    "seconds": 9.71825623512268
+  },
+  {
+    "name": "pixels-wasm-clippy",
+    "command": "cargo +nightly-2026-07-15 clippy --locked -p bunny-ui-core -p bunny-ui-preview --all-features --target wasm32-unknown-unknown --no-deps -- -D warnings",
+    "exit": 0,
+    "seconds": 2.920593023300171
+  }
+]
