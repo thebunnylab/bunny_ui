@@ -941,7 +941,8 @@ fn wrap_styled(out: &mut NodeList, mark: usize, delta: VisualProps) {
         // a style that wears hints or an action stood behind their
         // wrapper, where no style reached it to merge: the new one
         // nests, as it did. One that merges merges where it stands
-        LayoutNode::Styled { props, hints, action: None, .. } if hints.is_empty() => {
+        LayoutNode::Styled { props, hints, action: None, .. }
+            if hints.is_empty() && props.blur.is_none() && delta.blur.is_none() => {
             VisualProps::restyle(props, delta);
         }
         node => wrap_in_place(node, |other| LayoutNode::Styled {
@@ -1618,6 +1619,11 @@ pub(crate) fn apply(
             mark,
             VisualProps { gradient: Some(*gradient), ..VisualProps::default() },
         ),
+        Modifier::Blur(radius) => {
+            if let Some(radius) = crate::blur::radius(*radius) {
+                wrap_styled(out, mark, VisualProps { blur: Some(radius), ..VisualProps::default() });
+            }
+        }
         Modifier::Shadow(radius, color) => wrap_styled(
             out,
             mark,

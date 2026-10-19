@@ -5321,6 +5321,15 @@ impl Runtime {
         let hand = if self.touch_fresh.replace(false) { elapsed.min(dt) } else { elapsed };
         let gestures = self.touch.borrow_mut().tick_timed(dt, hand.max(0.0), self);
         let mut moved = moved;
+        if moved.islands
+            && self
+                .last_customs
+                .borrow()
+                .iter()
+                .any(|custom| custom.composited && custom.live.is_some())
+        {
+            moved.scene = true;
+        }
         if !gestures.is_empty() {
             let (repaint, input) = self.perform_touch(gestures);
             moved.scene |= repaint;

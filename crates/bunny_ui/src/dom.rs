@@ -354,6 +354,8 @@ pub struct DomLook {
     /// strictly better than the per-command multiply the pixel
     /// pipelines do, and costs the scene nothing.
     pub opacity: Option<f64>,
+    /// Foreground CSS filter, independent of the backdrop material.
+    pub blur: Option<Px>,
     pub hover_opacity: Option<f64>,
     pub pressed_opacity: Option<f64>,
     /// `.group_hovered()` — the ancestor whose `:hover` drives this
@@ -408,6 +410,7 @@ impl DomLook {
         clip: false,
         hidden: false,
         opacity: None,
+        blur: None,
         hover_opacity: None,
         pressed_opacity: None,
         group: None,
@@ -433,6 +436,7 @@ impl DomLook {
             clip: props.clip,
             hidden: props.hidden,
             opacity: props.opacity,
+            blur: props.blur,
             hover_opacity: props.opacity_hovered,
             pressed_opacity: props.opacity_pressed,
             group: None,
@@ -458,6 +462,7 @@ impl DomLook {
             || props.clip
             || props.hidden
             || props.opacity.is_some()
+            || props.blur.is_some()
             || props.opacity_hovered.is_some()
             || props.opacity_pressed.is_some()
             || props.glass.is_some();
@@ -801,6 +806,12 @@ impl DomCapture {
         // the node inherits the ink until a `Styled` says otherwise
         self.ink.push(self.current_ink());
         self.stack.push((child_origin, node));
+    }
+
+    /// A pixel island owns effects that the DOM cannot apply inside its canvas.
+    #[cfg(feature = "canvas")]
+    pub(crate) fn in_canvas(&self) -> bool {
+        self.island > 0
     }
 
     /// Opens a styled box straight from a `Styled` node's props.
@@ -2167,6 +2178,10 @@ fn look_hash(node: &DomNode) -> u64 {
     style.clip.hash(&mut hasher);
     style.hidden.hash(&mut hasher);
     hash_f64(style.opacity, &mut hasher);
+    if let Some(blur) = style.blur {
+        0x626c7572u64.hash(&mut hasher);
+        blur.to_bits().hash(&mut hasher);
+    }
     hash_f64(style.hover_opacity, &mut hasher);
     hash_f64(style.pressed_opacity, &mut hasher);
     style.group.hash(&mut hasher);
@@ -4045,7 +4060,10 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// 21 (0.3.0): stack placement and grid. SetBox bits 5/6 carry a position
 /// (u8 flags: layered/fill-x/fill-y, f32 x/y) and spans (u16 columns/rows, u8 fill-x); flow bit 14 carries the u16 grid column count and bit 15 marks
 /// the containing block of out-of-flow children. Grid shares this revision.
-pub const ABI_VERSION: u32 = 21;
+///
+/// 22 (2026-10-19): foreground blur in style bit 25, followed by one f32
+/// logical radius. Every browser decoder must consume the field together.
+pub const ABI_VERSION: u32 = 22;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -4116,6 +4134,7 @@ pub const ABI_VERSION: u32 = 21;
 ///                      visibility:hidden, the box keeps its place in
 ///                      the flow and paints nothing, as `.hidden()`
 ///                      does in the pixel pipelines
+///                   25 foreground blur f32, in logical px
 ///   6 set text      u32 rgba, u8 inherits ink (1 = no color of its
 ///                   own — the box above owns both states),
 ///                   f32 size, u8 weight, u8 mono, u8 italic,
@@ -4570,6 +4589,9 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
     if style.glass.is_some() {
         mask |= 1 << 23;
     }
+    if style.blur.is_some() {
+        mask |= 1 << 25;
+    }
     push_u32(out, mask);
     if let Some(color) = style.background {
         push_u32(out, pack_color(color));
@@ -4660,6 +4682,9 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
         push_f32(out, glass.brightness);
         push_u32(out, pack_color(glass.rim));
         push_f32(out, glass.rim_band);
+    }
+    if let Some(blur) = style.blur {
+        push_f32(out, blur);
     }
 }
 
@@ -6817,6 +6842,7 @@ mod tests {
             clip: true,
             hidden: false,
             opacity: Some(0.5),
+            blur: None,
             hover_opacity: Some(0.75),
             pressed_opacity: Some(0.25),
             group: Some(7),
@@ -6852,6 +6878,14 @@ mod tests {
         boxed.style.set_group_owner(Some(9));
         boxed.layout.as_mut().expect("flow").slot_y = Some(40.0);
         assert_eq!(look_hash(&boxed), 0xc6a2_35e5_858f_ec6f);
+    }
+
+    #[test]
+    fn foreground_blur_has_its_own_payload_after_the_existing_style() {
+        let soft = DomLook { background: Some(Color::WHITE), blur: Some(3.5), ..DomLook::default() };
+        let mut encoded = Vec::new();
+        encode_style(&mut encoded, &soft);
+        assert_eq!(encoded, [1, 0, 0, 2, 255, 255, 255, 255, 0, 0, 96, 64]);
     }
 
     #[test]

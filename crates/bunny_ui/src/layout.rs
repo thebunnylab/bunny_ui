@@ -2370,6 +2370,8 @@ pub struct VisualProps {
     /// pass, and it is invisible in the case the modifier exists for —
     /// a crossfade between two glyphs that share a slot.
     pub opacity: Option<f64>,
+    /// Foreground blur in logical pixels. A compositing boundary: styles never fold across it.
+    pub blur: Option<Px>,
     /// The same fade under hover and pressed, so a mark can appear
     /// under the pointer without the scene changing what it CONTAINS
     /// (the LAW: hover swaps paint, never content).
@@ -2425,6 +2427,7 @@ impl VisualProps {
             flips: self.flips.or(outer.flips),
             shadow: self.shadow.or(outer.shadow),
             opacity: self.opacity.or(outer.opacity),
+            blur: self.blur.or(outer.blur),
             opacity_hovered: self.opacity_hovered.or(outer.opacity_hovered),
             opacity_pressed: self.opacity_pressed.or(outer.opacity_pressed),
             hidden: self.hidden || outer.hidden,
@@ -3127,6 +3130,33 @@ impl DisplayList {
                 DrawCommand::Image { source, .. } => *source = source.faded(opacity),
                 DrawCommand::PushClip { .. } | DrawCommand::PopClip => {}
             }
+        }
+    }
+
+    /// Composite without renumbering the placement's custom/host/overlay ranges.
+    #[cfg(feature = "canvas")]
+    fn blur_from(&mut self, from: usize, radius: Px, viewport: Rect, env: &LayoutEnv<'_>) {
+        let layer = self.translated_slice((from, self.len()), 0.0, 0.0);
+        let beneath = if layer
+            .iter()
+            .any(|command| matches!(command, DrawCommand::Backdrop { .. }))
+        {
+            self.translated_slice((0, from), 0.0, 0.0)
+        } else {
+            DisplayList::default()
+        };
+        let blurred = crate::blur::paint(&layer, &beneath, radius, viewport, env);
+        for command in &mut self.commands[from..] {
+            *command = DrawCommand::FillRect {
+                rect: Rect::default(),
+                color: Color::rgba(0, 0, 0, 0),
+                corner_radius: Corners::default(),
+            };
+        }
+        if let Some(blurred) = blurred
+            && let Some(last) = self.commands.last_mut().filter(|_| !layer.is_empty())
+        {
+            *last = blurred;
         }
     }
 
@@ -3915,6 +3945,8 @@ pub struct CustomPlacement {
     /// box's with `/overlay`, the frame is what the overlay covers, and the
     /// runtime repaints it alone when a write reaches what it read.
     pub overlay: bool,
+    /// This box paints inside a foreground effect; its animation repaints the scene.
+    pub composited: bool,
     /// The box's own commands in the frame's display list
     /// (`start..end`) — what a live repaint replaces, and what the GPU
     /// presenter routes to the box's own layer.
@@ -3928,7 +3960,7 @@ impl CustomPlacement {
     /// Does the box present on a surface of its own — a loop's box, or
     /// an overlay?
     pub fn is_island(&self) -> bool {
-        self.live.is_some() || self.overlay
+        !self.composited && (self.live.is_some() || self.overlay)
     }
 }
 
@@ -3963,6 +3995,8 @@ pub const SPLIT_GRIP: Px = 6.0;
 
 #[derive(Default, Debug)]
 pub struct Placement {
+    /// Nested pixel effects keep custom and scrollbar paint on the scene.
+    compositing: usize,
     /// The sited nodes placed so far (`crate::provenance`), in placement
     /// order; empty unless the pass recorded sites.
     pub(crate) sites: Vec<crate::provenance::SitePlacement>,
@@ -7301,6 +7335,7 @@ impl LayoutNode {
                             element: element.clone(),
                             live: env.live,
                             overlay: false,
+                            composited: out.compositing > 0,
                             slice: (0, 0),
                             direction: env.direction,
                         });
@@ -7334,7 +7369,8 @@ impl LayoutNode {
                 // the overlay's island road: open when the shell can layer
                 // it, for a box with a name, outside a loop, on the pixel
                 // world (the element world has islands of its own)
-                let layered = overlay_layers()
+                let layered = out.compositing == 0
+                    && overlay_layers()
                     && env.live.is_none()
                     && placed.is_some()
                     && out.dom.is_none();
@@ -7523,6 +7559,7 @@ impl LayoutNode {
                             element: element.clone(),
                             live: None,
                             overlay: true,
+                            composited: false,
                             slice: (overlay_from, overlay_end),
                             direction: env.direction,
                         });
@@ -8290,6 +8327,18 @@ impl LayoutNode {
                 // background and border fade with the subtree, the way
                 // a layer would take them all at once
                 let fade_from = out.display.len();
+                #[cfg(feature = "canvas")]
+                let blur = props.blur.filter(|_| out.dom.as_ref().is_none_or(|dom| dom.in_canvas()));
+                #[cfg(not(feature = "canvas"))]
+                let blur: Option<Px> = None;
+                let old_thumbs = out.thumb_layers;
+                let old_keep = out.keep_unseen;
+                if blur.is_some() {
+                    out.compositing += 1;
+                    out.thumb_layers = false;
+                    // Paint outside an ancestor clip can blur back into it.
+                    out.keep_unseen = true;
+                }
                 // the halo goes first — everything else paints over it
                 if let Some((radius, color)) = props.shadow {
                     out.draw(DrawCommand::Shadow {
@@ -8409,6 +8458,18 @@ impl LayoutNode {
                     if let Some(opacity) = opacity.filter(|value| *value < 1.0) {
                         out.display.fade_from(fade_from, opacity.max(0.0));
                     }
+                }
+                if let Some(radius) = blur {
+                    out.compositing -= 1;
+                    out.thumb_layers = old_thumbs;
+                    out.keep_unseen = old_keep;
+                    #[cfg(feature = "canvas")]
+                    {
+                        let viewport = env.overlay_bounds.or(out.accessibility_viewport).unwrap_or(frame);
+                        out.display.blur_from(fade_from, radius, viewport, &env);
+                    }
+                    #[cfg(not(feature = "canvas"))]
+                    let _ = radius;
                 }
                 if let Some(dom) = out.dom.as_mut() {
                     dom.close();

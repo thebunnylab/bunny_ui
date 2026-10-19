@@ -1080,6 +1080,9 @@ fn rule_text(
     // liquid glass, the half a browser owns: one native filter over
     // what is behind the element, and the rim as two inset shadows
     // along the lit diagonals
+    if let Some(blur) = style.blur {
+        base.insert("filter", format!("blur({blur}px)"));
+    }
     if let Some(glass) = style.glass {
         let filter = format!(
             "blur({}px) saturate({}) brightness({})",

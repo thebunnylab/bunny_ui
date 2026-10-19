@@ -45,6 +45,7 @@ pub mod preview;
 pub mod action;
 pub mod anim;
 pub mod bind;
+mod blur;
 pub mod catalog;
 pub mod clipboard;
 pub mod custom;

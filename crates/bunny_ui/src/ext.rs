@@ -328,7 +328,11 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::Resizable)
     }
 
-    /// `.blur(radius: 10)`
+    /// Blurs this subtree's paint, preserving layout and interaction geometry.
+    /// Radius is a Gaussian standard deviation in logical pixels, capped at 128.
+    /// Nonpositive and nonfinite values are inert. Pixel targets approximate the
+    /// Gaussian with three box passes; DOM targets use the browser's CSS filter.
+    /// Platform-owned native host surfaces are outside the framework's paint.
     #[track_caller]
     fn blur(self, radius: f64) -> Modified<Self> {
         Modified::new(self, Modifier::Blur(radius))
