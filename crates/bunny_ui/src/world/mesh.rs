@@ -660,7 +660,9 @@ mod tests {
     fn signed_volume(mesh: &Mesh) -> f64 {
         let data = mesh.data();
         data.indices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|t| {
                 let [a, b, c] = [t[0], t[1], t[2]].map(|i| to_vec(data.positions[i as usize]));
                 a.dot(b.cross(c)) / 6.0
@@ -674,7 +676,7 @@ mod tests {
         let data = mesh.data();
         let key = |i: u32| data.positions[i as usize].map(f32::to_bits);
         let mut directed = std::collections::HashMap::<([u32; 3], [u32; 3]), i32>::new();
-        for t in data.indices.chunks_exact(3) {
+        for t in data.indices.as_chunks::<3>().0 {
             for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
                 *directed.entry((key(a), key(b))).or_default() += 1;
             }
@@ -693,7 +695,7 @@ mod tests {
         assert_eq!((bounds.min, bounds.max), (vec3(-1.0, -1.5, -2.0), vec3(1.0, 1.5, 2.0)));
         // each stored normal points the way its face turns
         let data = mesh.data();
-        for t in data.indices.chunks_exact(3) {
+        for t in data.indices.as_chunks::<3>().0 {
             let [a, b, c] = [t[0], t[1], t[2]].map(|i| data.positions[i as usize]);
             let geometric = to_vec(face_normal(a, b, c));
             assert!((geometric - to_vec(data.normals[t[0] as usize])).length() < 1e-6);
@@ -709,7 +711,7 @@ mod tests {
         assert!(volume > 0.97 * exact && volume < exact, "faces out, close to the ball: {volume} vs {exact}");
         // and the triangles turn the way the normals point
         let data = mesh.data();
-        for t in data.indices.chunks_exact(3) {
+        for t in data.indices.as_chunks::<3>().0 {
             let [a, b, c] = [t[0], t[1], t[2]].map(|i| data.positions[i as usize]);
             let center = (to_vec(a) + to_vec(b) + to_vec(c)) / 3.0;
             assert!(to_vec(face_normal(a, b, c)).dot(center) > 0.0);
