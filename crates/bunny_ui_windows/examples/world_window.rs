@@ -4,12 +4,13 @@
 //! cargo run -p bunny-ui-windows --features 3d --example world_window
 //! ```
 //!
-//! A few shapes on a floor, under a sun and a soft sky. Drag to turn the
-//! view around what lies under the pointer; shift and a drag pan it; the
-//! wheel or a pinch zooms toward the pointer. A click selects a shape —
-//! it takes a tint, and a label that follows the camera — and a click on
-//! nothing clears it. The buttons fly the camera: a flight keeps the
-//! frames coming until it lands, and a still world asks for none.
+//! A few shapes on a floor, under a sun that casts shadows and a soft
+//! sky. Drag to turn the view around what lies under the pointer; shift
+//! and a drag pan it; the wheel or a pinch zooms toward the pointer. A
+//! click selects a shape — it takes a tint, and a label that follows
+//! the camera — and a click on nothing clears it. The buttons fly the
+//! camera: a flight keeps the frames coming until it lands, and a still
+//! world asks for none.
 //!
 //! `BUNNY_PRESENT=cpu` shows the same world drawn by the CPU.
 
@@ -129,7 +130,7 @@ fn still_life() -> World {
     let at = vec3(1.2, 0.0, -2.8);
     world.add(ring.clone(), Material::color(Color::rgb(246, 244, 238))).set_position(at);
     world.add_lines(ring.edges(30.0), LineStyle::solid(INK, 1.2)).set_position(at);
-    world.add_light(Light::sun().toward(vec3(-1.0, -2.2, -1.4)));
+    world.add_light(Light::sun().toward(vec3(-1.0, -2.2, -1.4)).with_shadows());
     world
 }
 

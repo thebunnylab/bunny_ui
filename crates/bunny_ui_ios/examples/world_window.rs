@@ -4,12 +4,12 @@
 //! crates/bunny_ui_ios/simulator/run-sim.sh world_window_ios
 //! ```
 //!
-//! A few shapes on a floor, under a sun and a soft sky. A drag turns the
-//! view around what lies under the finger, a pinch zooms toward it. A
-//! tap selects a shape — it takes a tint, and a label that follows the
-//! camera — and a tap on nothing clears it. The buttons fly the camera:
-//! a flight keeps the frames coming until it lands, and a still world
-//! asks for none.
+//! A few shapes on a floor, under a sun that casts shadows and a soft
+//! sky. A drag turns the view around what lies under the finger, a
+//! pinch zooms toward it. A tap selects a shape — it takes a tint, and
+//! a label that follows the camera — and a tap on nothing clears it.
+//! The buttons fly the camera: a flight keeps the frames coming until
+//! it lands, and a still world asks for none.
 
 #![cfg_attr(not(target_os = "ios"), allow(dead_code, unused_imports))]
 
@@ -127,7 +127,7 @@ fn still_life() -> World {
     let at = vec3(1.2, 0.0, -2.8);
     world.add(ring.clone(), Material::color(Color::rgb(246, 244, 238))).set_position(at);
     world.add_lines(ring.edges(30.0), LineStyle::solid(INK, 1.2)).set_position(at);
-    world.add_light(Light::sun().toward(vec3(-1.0, -2.2, -1.4)));
+    world.add_light(Light::sun().toward(vec3(-1.0, -2.2, -1.4)).with_shadows());
     world
 }
 

@@ -12,6 +12,11 @@
 //! they live in tile memory for the length of one pass and never touch
 //! memory, which is why a world draws in ONE encoder.
 //!
+//! A frame whose sun casts draws its casters first, when the box's map
+//! does not hold them yet: a pass of depth alone into a 16-bit map the
+//! surfaces read through a comparing sampler. A frame without a map binds
+//! a texel and a sampler whose comparison always passes.
+//!
 //! The world library is compiled the first time a box paints a world: an
 //! app that shows none never pays for it.
 
@@ -24,7 +29,7 @@ use bunny_ui::gpu::walk::FrameBatches;
 use bunny_ui::gpu::world::{WorldCaps, WorldGround, WorldJob};
 use bunny_ui::world::frame::{Background, Blend, DrawKind, WorldFrame};
 use bunny_ui::world::shade::SRGB_DECODE;
-use bunny_ui::world::wire::{instance_bytes, material_bytes};
+use bunny_ui::world::wire::{instance_bytes, material_bytes, shadow_instance_bytes};
 
 use super::{
     LOAD_ACTION_CLEAR, MTLClearColor, MTLOrigin, MTLRegion, MTLSize, PIXEL_FORMAT_RGBA8, PIXEL_FORMAT_RGBA8_SRGB,
@@ -50,6 +55,8 @@ unsafe extern "C" {
 // MARK: - Metal vocabulary of the world pass
 
 const PIXEL_FORMAT_DEPTH32_FLOAT: u64 = 252;
+const PIXEL_FORMAT_DEPTH16_UNORM: u64 = 250;
+const ADDRESS_CLAMP_TO_EDGE: u64 = 0;
 const STORAGE_MODE_MEMORYLESS: u64 = 3;
 const TEXTURE_TYPE_2D_MULTISAMPLE: u64 = 4;
 const STORE_ACTION_DONT_CARE: u64 = 0;
@@ -220,8 +227,47 @@ static float encode_code(float linear) {
     return s * 255.0;
 }
 
+// how much of the sun reaches a point: its depth from the sun against the
+// map's, each lookup four texels compared and filtered by the sampler
+static float sun_visibility(constant WorldUniforms& u, depth2d<float> map, sampler compare, float3 position, float3 n) {
+    float taps = u.shadow.w;
+    if (taps < 0.5 || u.sun_direction.w <= 0.5) {
+        return 1.0;
+    }
+    float n_dot_l = saturate(dot(n, u.sun_direction.xyz));
+    if (!(n_dot_l > 0.0)) {
+        return 1.0;
+    }
+    float sine = sqrt(max(1.0 - n_dot_l * n_dot_l, 0.0));
+    float3 p = position + n * (u.shadow.y * sine);
+    float4 s = u.shadow_from_eye * float4(p, 1.0);
+    if (!(s.x > 0.0 && s.x < 1.0 && s.y > 0.0 && s.y < 1.0)) {
+        return 1.0;
+    }
+    float reference = clamp(s.z - u.shadow.z, 0.0, 1.0);
+    float texel = u.shadow.x;
+    if (taps < 1.5) {
+        return map.sample_compare(compare, s.xy, reference, level(0));
+    }
+    if (taps < 4.5) {
+        float sum = 0.0;
+        sum += map.sample_compare(compare, float2(s.x - 0.5 * texel, s.y - 0.5 * texel), reference, level(0));
+        sum += map.sample_compare(compare, float2(s.x + 0.5 * texel, s.y - 0.5 * texel), reference, level(0));
+        sum += map.sample_compare(compare, float2(s.x - 0.5 * texel, s.y + 0.5 * texel), reference, level(0));
+        sum += map.sample_compare(compare, float2(s.x + 0.5 * texel, s.y + 0.5 * texel), reference, level(0));
+        return sum * 0.25;
+    }
+    float sum = 0.0;
+    for (int j = -1; j <= 1; j++) {
+        for (int i = -1; i <= 1; i++) {
+            sum += map.sample_compare(compare, float2(s.x + float(i) * texel, s.y + float(j) * texel), reference, level(0));
+        }
+    }
+    return sum / 9.0;
+}
+
 static float3 lit(constant WorldUniforms& u, float3 position, float3 n, float3 base,
-                  float roughness, float metallic, float3 emissive, float occlusion, uint groups) {
+                  float roughness, float metallic, float3 emissive, float occlusion, uint groups, float shadow) {
     bool parallel = u.params.w > 0.5;
     float3 v = parallel ? float3(0.0, 0.0, 1.0) : safe_normalize(-position);
     float n_dot_v = clamp(dot(n, v), 1e-4, 1.0);
@@ -254,7 +300,7 @@ static float3 lit(constant WorldUniforms& u, float3 position, float3 n, float3 b
             float x5 = x * x * x * x * x;
             float3 fresnel = f0 + (float3(1.0) - f0) * x5;
             float3 specular = fresnel * (pi_d * visibility);
-            light = light + (diffuse + specular) * u.sun_color.xyz * n_dot_l;
+            light = light + (diffuse + specular) * u.sun_color.xyz * (n_dot_l * shadow);
         }
     }
 
@@ -347,7 +393,8 @@ vertex WorldVary world_vertex(uint vid [[vertex_id]],
 // the byte the CPU computes
 static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* materials,
                           device const WorldInstance* instances, constant WorldUniforms& u,
-                          constant WorldDraw& draw, texture2d<float> picture, sampler wrap) {
+                          constant WorldDraw& draw, texture2d<float> picture, sampler wrap,
+                          depth2d<float> shadow_map, sampler compare) {
     float4 section = u.section;
     if (any(section != 0.0) && section.x * in.eye.x + section.y * in.eye.y + section.z * in.eye.z + section.w < 0.0) {
         discard_fragment();
@@ -383,7 +430,8 @@ static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* 
             normal = -normal;
         }
         float3 light = lit(u, in.eye, normal, base, material.params.x, material.params.y,
-                           material.emissive.xyz, in.occlusion, 0xFFFFFFFFu);
+                           material.emissive.xyz, in.occlusion, 0xFFFFFFFFu,
+                           sun_visibility(u, shadow_map, compare, in.eye, normal));
         if (u.tone.z > 0.5) {
             dither = bayer(uint(in.position.x), uint(in.position.y));
         }
@@ -401,8 +449,10 @@ fragment float4 world_fragment(WorldVary in [[stage_in]],
                                constant WorldUniforms& u [[buffer(2)]],
                                constant WorldDraw& draw [[buffer(3)]],
                                texture2d<float> picture [[texture(0)]],
-                               sampler wrap [[sampler(0)]]) {
-    return world_shade(in, front, materials, instances, u, draw, picture, wrap);
+                               sampler wrap [[sampler(0)]],
+                               depth2d<float> shadow_map [[texture(1)]],
+                               sampler compare [[sampler(1)]]) {
+    return world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare);
 }
 
 struct SteppedBack {
@@ -419,12 +469,43 @@ fragment SteppedBack world_fragment_stepped(WorldVary in [[stage_in]],
                                             constant WorldUniforms& u [[buffer(2)]],
                                             constant WorldDraw& draw [[buffer(3)]],
                                             texture2d<float> picture [[texture(0)]],
-                                            sampler wrap [[sampler(0)]]) {
+                                            sampler wrap [[sampler(0)]],
+                                            depth2d<float> shadow_map [[texture(1)]],
+                                            sampler compare [[sampler(1)]]) {
     SteppedBack out;
-    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap);
+    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare);
     float z = in.position.z;
     float slope = max(abs(dfdx(in.depth)), abs(dfdy(in.depth)));
     out.depth = min(z + draw.bias.x * slope + DEPTH_TIE, DEPTH_CEILING);
+    return out;
+}
+
+// MARK: - The sun's shadow map (bunny_ui::world::shadow)
+
+struct ShadowCaster {
+    float4 rows[3];
+};
+
+struct ShadowVary {
+    float4 position [[position]];
+};
+
+// a caster into the map, placed by its rows: Metal's clip space already
+// puts the map's top at its first row, and its depth in [0, 1]
+vertex ShadowVary shadow_vertex(uint vid [[vertex_id]],
+                                uint iid [[instance_id]],
+                                device const WorldVertex* vertices [[buffer(0)]],
+                                device const ShadowCaster* casters [[buffer(1)]],
+                                constant WorldDraw& draw [[buffer(3)]]) {
+    float3 p = float3(vertices[vid].position);
+    ShadowCaster caster = casters[draw.first_instance + iid];
+    float4 r0 = caster.rows[0];
+    float4 r1 = caster.rows[1];
+    float4 r2 = caster.rows[2];
+    ShadowVary out;
+    out.position = float4(r0.x * p.x + r0.y * p.y + r0.z * p.z + r0.w,
+                          r1.x * p.x + r1.y * p.y + r1.z * p.z + r1.w,
+                          r2.x * p.x + r2.y * p.y + r2.z * p.z + r2.w, 1.0);
     return out;
 }
 
@@ -649,6 +730,14 @@ struct WorldStack {
     /// The 2D pass's pipeline for a world's target, bound to the 2D
     /// target's format.
     composite: Id,
+    /// The casters into a shadow map: depth alone.
+    shadow: Id,
+    /// The shadow map's sampler: four texels compared and filtered.
+    compare: Id,
+    /// A map of one texel and a sampler that always answers "lit": what a
+    /// frame without a map binds.
+    lit: Id,
+    always: Id,
     /// By the way they meet the target and the samples a pixel.
     pipelines: HashMap<(Pipe, u8), Id>,
     /// Opaque, see-through, lines tested, lines hidden, always.
@@ -702,6 +791,8 @@ pub(super) struct MetalWorld {
     textures: HashMap<u64, Id>,
     /// Each set's buffer and its segment count.
     segments: HashMap<u64, (Id, u32)>,
+    /// Each shadow map and its side.
+    shadow_maps: HashMap<u64, (Id, u32)>,
     next: u64,
     /// Targets the CPU can read: the harness's, for the parity tests.
     pub(super) readable: bool,
@@ -717,6 +808,7 @@ impl MetalWorld {
             meshes: HashMap::new(),
             textures: HashMap::new(),
             segments: HashMap::new(),
+            shadow_maps: HashMap::new(),
             next: 1,
             readable: false,
         }
@@ -757,13 +849,38 @@ impl MetalWorld {
     /// need, built: what the encode reads, with nothing left to borrow.
     /// `staged` holds where each job's instances and materials lie in the
     /// slot's staging buffer.
-    pub(super) fn prepare(&mut self, batches: &FrameBatches, staged: &[(u64, u64)]) -> FramePass {
+    pub(super) fn prepare(&mut self, batches: &FrameBatches, staged: &[(u64, u64, u64)]) -> FramePass {
         let Built::Ready(stack) = &mut self.built else { return FramePass::default() };
         let composite = stack.composite;
         let mut jobs = Vec::with_capacity(batches.worlds.len());
-        for (job, &(instances, materials)) in batches.worlds.iter().zip(staged) {
+        for (job, &(instances, materials, casters)) in batches.worlds.iter().zip(staged) {
             let Some(target) = self.targets.get(&job.target) else { continue };
             let samples = target.samples;
+            // the box's map, and its casters when it does not hold them
+            let map = job.shadow.and_then(|shadow| self.shadow_maps.get(&shadow.map).map(|&(map, _)| (shadow, map)));
+            let shadow = match (map, job.frame.shadow.as_ref()) {
+                (Some((held, map)), Some(frame_shadow)) if held.draw => Some(PreparedShadow {
+                    map,
+                    casters,
+                    draws: frame_shadow
+                        .draws
+                        .iter()
+                        .filter_map(|draw| {
+                            let buffers = job.meshes.get(draw.mesh as usize).and_then(|id| self.meshes.get(id))?;
+                            Some(CasterDraw {
+                                vertices: buffers.vertices,
+                                indices: buffers.indices,
+                                first_index: draw.first_index,
+                                index_count: draw.index_count,
+                                instance_count: draw.instance_count,
+                                block: DrawBlock { first_instance: draw.first_instance, flags: 0, near: 0.0, far: 0.0, bias: [0.0; 4] },
+                            })
+                        })
+                        .collect(),
+                }),
+                _ => None,
+            };
+            let (shadow_map, shadow_sampler) = map.map_or((stack.lit, stack.always), |(_, map)| (map, stack.compare));
             let mut draws = Vec::with_capacity(job.frame.draws.len());
             for draw in &job.frame.draws {
                 match draw.kind {
@@ -868,6 +985,11 @@ impl MetalWorld {
                 materials,
                 draws,
                 sampler: stack.sampler,
+                shadow,
+                shadow_pipeline: stack.shadow,
+                caster_depth: stack.depth_states[DEPTH_OPAQUE],
+                shadow_map,
+                shadow_sampler,
             });
         }
         let targets = batches
@@ -903,6 +1025,7 @@ impl WorldStack {
                 return Err(format!("world shader compile failed: {}", error_message(error)));
             }
             let composite = super::build_pipeline(device, library, "sprite_vertex", "world_composite_fragment", format, true)?;
+            let shadow = shadow_pipeline(device, library)?;
             let depth_state = |compare: u64, write: bool| {
                 let descriptor = msg_id(msg_id(class("MTLDepthStencilDescriptor"), sel("alloc")), sel("init"));
                 msg_void_u64(descriptor, sel("setDepthCompareFunction:"), compare);
@@ -929,8 +1052,21 @@ impl WorldStack {
             msg_void_u64(sampler_descriptor, sel("setTAddressMode:"), ADDRESS_REPEAT);
             let sampler = msg_id_arg(device, sel("newSamplerStateWithDescriptor:"), sampler_descriptor);
             msg_void(sampler_descriptor, sel("release"));
+            let comparing = |function: u64| {
+                let descriptor = msg_id(msg_id(class("MTLSamplerDescriptor"), sel("alloc")), sel("init"));
+                msg_void_u64(descriptor, sel("setMinFilter:"), FILTER_LINEAR);
+                msg_void_u64(descriptor, sel("setMagFilter:"), FILTER_LINEAR);
+                msg_void_u64(descriptor, sel("setSAddressMode:"), ADDRESS_CLAMP_TO_EDGE);
+                msg_void_u64(descriptor, sel("setTAddressMode:"), ADDRESS_CLAMP_TO_EDGE);
+                msg_void_u64(descriptor, sel("setCompareFunction:"), function);
+                let state = msg_id_arg(device, sel("newSamplerStateWithDescriptor:"), descriptor);
+                msg_void(descriptor, sel("release"));
+                state
+            };
+            let (compare, always) = (comparing(COMPARE_LESS_EQUAL), comparing(COMPARE_ALWAYS));
+            let lit = attachment(device, PIXEL_FORMAT_DEPTH16_UNORM, (1, 1), 1, STORAGE_MODE_PRIVATE, TEXTURE_USAGE_SHADER_READ);
             let blank = super::shared_texture(device, PIXEL_FORMAT_RGBA8_SRGB, 1, 1);
-            if sampler.is_null() || blank.is_null() {
+            if sampler.is_null() || blank.is_null() || compare.is_null() || always.is_null() || lit.is_null() {
                 return Err("no sampler or blank texture".to_string());
             }
             super::upload_texture(blank, 0, 0, 1, 1, &[255, 255, 255, 255], 1);
@@ -940,6 +1076,10 @@ impl WorldStack {
             Ok(WorldStack {
                 library,
                 composite,
+                shadow,
+                compare,
+                lit,
+                always,
                 pipelines: HashMap::new(),
                 depth_states,
                 sampler,
@@ -989,7 +1129,7 @@ impl WorldStack {
 impl Drop for WorldStack {
     fn drop(&mut self) {
         unsafe {
-            for id in [self.library, self.composite, self.sampler, self.blank].into_iter().chain(self.depth_states) {
+            for id in [self.library, self.composite, self.shadow, self.compare, self.lit, self.always, self.sampler, self.blank].into_iter().chain(self.depth_states) {
                 msg_void(id, sel("release"));
             }
             for pipeline in self.pipelines.values() {
@@ -1038,6 +1178,28 @@ unsafe fn world_pipeline(device: Id, library: Id, vertex: &str, fragment: &str, 
         msg_void(fragment_fn, sel("release"));
         if pipeline.is_null() {
             return Err(format!("world pipeline {vertex}/{fragment} failed: {}", error_message(error)));
+        }
+        Ok(pipeline)
+    }
+}
+
+/// The pipeline of the casters: a vertex stage and a 16-bit depth, no
+/// colour and no fragment stage.
+unsafe fn shadow_pipeline(device: Id, library: Id) -> Result<Id, String> {
+    unsafe {
+        let vertex_fn = msg_id_arg(library, sel("newFunctionWithName:"), ns_string("shadow_vertex"));
+        if vertex_fn.is_null() {
+            return Err("missing world shader shadow_vertex".to_string());
+        }
+        let descriptor = msg_id(msg_id(class("MTLRenderPipelineDescriptor"), sel("alloc")), sel("init"));
+        msg_void_id(descriptor, sel("setVertexFunction:"), vertex_fn);
+        msg_void_u64(descriptor, sel("setDepthAttachmentPixelFormat:"), PIXEL_FORMAT_DEPTH16_UNORM);
+        let mut error: Id = null_mut();
+        let pipeline = msg_id_id_ptr(device, sel("newRenderPipelineStateWithDescriptor:error:"), descriptor, &mut error);
+        msg_void(descriptor, sel("release"));
+        msg_void(vertex_fn, sel("release"));
+        if pipeline.is_null() {
+            return Err(format!("the shadow pipeline failed: {}", error_message(error)));
         }
         Ok(pipeline)
     }
@@ -1207,6 +1369,28 @@ impl WorldGround for MetalWorld {
             unsafe { msg_void(buffer, sel("release")) };
         }
     }
+
+    fn make_shadow_map(&mut self, size: u32) -> Option<u64> {
+        self.stack()?;
+        let map = unsafe {
+            let pool = super::objc_autoreleasePoolPush();
+            let map = attachment(self.device, PIXEL_FORMAT_DEPTH16_UNORM, (size, size), 1, STORAGE_MODE_PRIVATE, TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ);
+            super::objc_autoreleasePoolPop(pool);
+            map
+        };
+        if map.is_null() {
+            return None;
+        }
+        let id = self.mint();
+        self.shadow_maps.insert(id, (map, size));
+        Some(id)
+    }
+
+    fn drop_shadow_map(&mut self, id: u64) {
+        if let Some((map, _)) = self.shadow_maps.remove(&id) {
+            unsafe { msg_void(map, sel("release")) };
+        }
+    }
 }
 
 fn release_target(target: &Target) {
@@ -1249,6 +1433,10 @@ impl Drop for MetalWorld {
         for id in ids {
             self.drop_segments(id);
         }
+        let ids: Vec<u64> = self.shadow_maps.keys().copied().collect();
+        for id in ids {
+            self.drop_shadow_map(id);
+        }
     }
 }
 
@@ -1278,6 +1466,30 @@ struct PreparedJob {
     materials: u64,
     draws: Vec<PreparedDraw>,
     sampler: Id,
+    /// The casters to draw into the box's map first, when it does not
+    /// hold them.
+    shadow: Option<PreparedShadow>,
+    shadow_pipeline: Id,
+    caster_depth: Id,
+    /// What the surfaces read the sun's shadow through.
+    shadow_map: Id,
+    shadow_sampler: Id,
+}
+
+struct PreparedShadow {
+    map: Id,
+    /// Where the casters' rows lie in the slot's staging buffer.
+    casters: u64,
+    draws: Vec<CasterDraw>,
+}
+
+struct CasterDraw {
+    vertices: Id,
+    indices: Id,
+    first_index: u32,
+    index_count: u32,
+    instance_count: u32,
+    block: DrawBlock,
 }
 
 enum PreparedDraw {
@@ -1324,6 +1536,9 @@ impl FramePass {
         let Some(world) = self.sels else { return };
         for job in &self.jobs {
             unsafe {
+                if let Some(shadow) = &job.shadow {
+                    encode_casters(command, sels, &world, pass_class, staging, job, shadow);
+                }
                 let pass = msg_id(pass_class, sels.render_pass_descriptor);
                 let attachment = msg_id_u64(msg_id(pass, sels.color_attachments), sels.object_at, 0);
                 if job.color.is_null() {
@@ -1362,6 +1577,8 @@ impl FramePass {
                     msg_void_id_u64_u64(encoder, sels.set_fragment_buffer, staging, job.materials, 0);
                 }
                 msg_void_id_u64(encoder, world.set_fragment_sampler, job.sampler, 0);
+                msg_void_id_u64(encoder, sels.set_fragment_texture, job.shadow_map, 1);
+                msg_void_id_u64(encoder, world.set_fragment_sampler, job.shadow_sampler, 1);
                 for draw in &job.draws {
                     match draw {
                         PreparedDraw::Mesh { pipeline, depth, cull, winding, vertices, indices, first_index, index_count, instance_count, texture, block } => {
@@ -1406,9 +1623,49 @@ impl FramePass {
     }
 }
 
-/// The bytes each job stages: its instances and its materials.
-pub(super) fn staged_bytes(job: &WorldJob) -> (Vec<u8>, Vec<u8>) {
-    (instance_bytes(&job.frame.instances), material_bytes(&job.frame.materials))
+/// The casters of a job into the box's map, from the sun, in a pass of
+/// depth alone: both faces, the nearest depth kept.
+unsafe fn encode_casters(command: Id, sels: &Sels, world: &Selectors, pass_class: Id, staging: Id, job: &PreparedJob, shadow: &PreparedShadow) {
+    unsafe {
+        let pass = msg_id(pass_class, sels.render_pass_descriptor);
+        let depth = msg_id(pass, world.depth_attachment);
+        msg_void_id(depth, sels.set_texture, shadow.map);
+        msg_void_u64(depth, sels.set_load_action, LOAD_ACTION_CLEAR);
+        msg_void_f64(depth, world.set_clear_depth, 1.0);
+        msg_void_u64(depth, sels.set_store_action, STORE_ACTION_STORE);
+        let encoder = msg_id_arg(command, sels.encoder, pass);
+        msg_void_id(encoder, sels.set_pipeline, job.shadow_pipeline);
+        msg_void_id(encoder, world.set_depth_state, job.caster_depth);
+        msg_void_u64(encoder, world.set_cull_mode, CULL_NONE);
+        if !staging.is_null() {
+            msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, shadow.casters, 1);
+        }
+        for draw in &shadow.draws {
+            msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, draw.vertices, 0, 0);
+            msg_void_ptr_u64_u64(encoder, sels.set_vertex_bytes, (&draw.block as *const DrawBlock).cast(), DRAW_BLOCK, 3);
+            msg_void_draw_indexed(
+                encoder,
+                world.draw_indexed,
+                PRIMITIVE_TRIANGLE,
+                draw.index_count as u64,
+                INDEX_UINT32,
+                draw.indices,
+                draw.first_index as u64 * 4,
+                draw.instance_count as u64,
+            );
+        }
+        msg_void(encoder, sels.end_encoding);
+    }
+}
+
+/// The bytes each job stages: its instances, its materials, and the rows
+/// of its shadow's casters when the box's map must be drawn.
+pub(super) fn staged_bytes(job: &WorldJob) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let casters = match (job.shadow, &job.frame.shadow) {
+        (Some(held), Some(shadow)) if held.draw => shadow_instance_bytes(&shadow.instances),
+        _ => Vec::new(),
+    };
+    (instance_bytes(&job.frame.instances), material_bytes(&job.frame.materials), casters)
 }
 
 /// A frame of its own, for the harness: what the parity tests compare
@@ -1499,6 +1756,28 @@ mod tests {
             let folder = std::path::Path::new(&folder);
             let _ = std::fs::write(folder.join(format!("{name}-metal-{}x{}.rgba", size.0, size.1)), ours);
             let _ = std::fs::write(folder.join(format!("{name}-oracle-{}x{}.rgba", size.0, size.1)), oracle);
+        }
+    }
+
+    /// Every world of the shared catalog — the shadows among them —
+    /// against the CPU's picture of the same frame.
+    #[test]
+    fn every_world_of_the_catalog_matches_the_oracle() {
+        use bunny_ui::gpu::world_scenes::{COUNT, Spread, world_scene};
+        use bunny_ui::image_engine::RawImages;
+        use bunny_ui::world::soft::draw_with;
+        use bunny_ui::world::texture::texture_of;
+        let Some(mut gpu) = harness() else { return };
+        let images = RawImages::default();
+        for index in 0..COUNT {
+            let scene = world_scene(index);
+            let frame = &scene.frame;
+            let ours = gpu.world_rgba_with(frame, &images).expect("the world pass");
+            let oracle = draw_with(frame, &|at| texture_of(&images, &frame.textures[at])).rgba;
+            dump(&format!("catalog-{index}"), frame.size, &ours, &oracle);
+            let s = Spread::of(&ours, &oracle);
+            eprintln!("{}: worst {} · >1 {} · >3 {} · >16 {} of {}", scene.name, s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
+            assert!(s.within(scene.tolerance), "{} is beyond its tolerance", scene.name);
         }
     }
 
