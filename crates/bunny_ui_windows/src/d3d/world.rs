@@ -1886,9 +1886,9 @@ mod tests {
     #[test]
     fn the_wire_blocks_hold_their_layout() {
         assert_eq!(std::mem::size_of::<super::DrawBlock>(), 64);
-        assert_eq!(std::mem::size_of::<super::BackdropBlock>(), 48);
+        assert_eq!(std::mem::size_of::<super::BackdropBlock>(), 96);
         assert_eq!(bunny_ui::world::mesh::VERTEX_STRIDE, 32, "WorldVertex reads 32 bytes");
-        assert_eq!(bunny_ui::world::wire::instance_offset::SIZE, 112, "WorldInstance reads 112 bytes");
+        assert_eq!(bunny_ui::world::wire::instance_offset::SIZE, 128, "WorldInstance reads 128 bytes");
         assert_eq!(bunny_ui::world::wire::SEGMENT_STRIDE, 24, "WorldSegment reads 24 bytes");
     }
 }
