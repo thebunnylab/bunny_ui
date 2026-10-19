@@ -513,15 +513,26 @@ pub(crate) fn build_frame(
     let mut poses = HashMap::<(Option<EntityId>, u64), Rc<Vec<Mat4>>>::new();
     let mut palettes = HashMap::<(Option<EntityId>, u64), u32>::new();
     let mut joints: Vec<Row> = Vec::new();
+    let mut levels = world.levels.borrow_mut();
     for (id, data) in world.iter() {
         if !world.shown(id) {
             continue;
         }
         let Some(matrix) = world.world_matrix_at(id, time) else { continue };
         let eye_from_model = view * matrix;
-        let (joint_base, joint_rows) = match &data.spec.shape {
-            Shape::Model(model) => match &model.skin {
-                Some(skin) if model.mesh.is_skinned() => {
+        // the mesh a model draws with: a coarser one as it stands small
+        let mesh = match &data.spec.shape {
+            Shape::Model(model) if !model.lods.is_empty() => {
+                let level = model.level(height_on_target(&model.mesh.bounds().transformed(&eye_from_model), &open, parallel, size), levels.get(&id).copied());
+                levels.insert(id, level);
+                Some(model.mesh_at(level).clone())
+            }
+            Shape::Model(model) => Some(model.mesh.clone()),
+            _ => None,
+        };
+        let (joint_base, joint_rows) = match (&data.spec.shape, &mesh) {
+            (Shape::Model(model), Some(mesh)) => match &model.skin {
+                Some(skin) if mesh.is_skinned() => {
                     let played = world.play_of(id);
                     let owner = played.map(|(owner, _)| owner);
                     let skeleton = skin.skeleton();
@@ -554,13 +565,14 @@ pub(crate) fn build_frame(
         };
         match &data.spec.shape {
             Shape::Model(model) => {
+                let Some(mesh) = mesh else { continue };
                 // a skinned mesh leaves its rest pose: its box grows by
                 // half its longest side each way
-                let local = if joint_base == NO_JOINTS { model.mesh.bounds() } else { skinned_bounds(model.mesh.bounds()) };
+                let local = if joint_base == NO_JOINTS { mesh.bounds() } else { skinned_bounds(mesh.bounds()) };
                 if data.spec.casts_shadow {
                     casters.push(Caster {
                         world_from_model: matrix,
-                        model: Model { mesh: model.mesh.clone(), materials: Rc::clone(&model.materials) },
+                        model: Model { mesh: mesh.clone(), materials: Rc::clone(&model.materials) },
                         parts: data.spec.parts.clone(),
                         joint_base,
                         joint_rows,
@@ -570,7 +582,7 @@ pub(crate) fn build_frame(
                 }
                 let bounds = local.transformed(&eye_from_model);
                 if sides.may_see(&bounds) && (parallel || bounds.min.z < 0.0) {
-                    models.push((seen(bounds), Model { mesh: model.mesh.clone(), materials: Rc::clone(&model.materials) }));
+                    models.push((seen(bounds), Model { mesh, materials: Rc::clone(&model.materials) }));
                 }
             }
             Shape::Lines(lines, line_style) => {
@@ -584,6 +596,7 @@ pub(crate) fn build_frame(
         }
     }
 
+    drop(levels);
     // near and far hug what is in view
     let reach = models
         .iter()
@@ -873,6 +886,17 @@ struct Caster {
     bounds: Aabb,
 }
 
+/// How many pixels tall a box in the eye's space stands on a target of
+/// `size` through `projection` (the lens without its planes).
+fn height_on_target(bounds: &Aabb, projection: &Mat4, parallel: bool, size: (u32, u32)) -> f64 {
+    let tall = (bounds.max.y - bounds.min.y) * projection.m[5] * size.1 as f64 * 0.5;
+    if parallel {
+        return tall;
+    }
+    let depth = -bounds.center().z;
+    if depth > 0.0 { tall / depth } else { f64::INFINITY }
+}
+
 /// The box a skinned mesh may reach from its rest pose's: half its
 /// longest side more each way.
 fn skinned_bounds(bounds: Aabb) -> Aabb {
@@ -1158,6 +1182,34 @@ mod tests {
 
     fn gray() -> Material {
         Material::color(Color::rgb(128, 128, 128))
+    }
+
+    #[test]
+    fn a_small_figure_takes_its_coarse_mesh_and_holds_it_near_the_step() {
+        use crate::world::material::Model;
+        let (fine, middle, coarse) = (Mesh::cuboid(1.0, 1.0, 1.0), Mesh::cuboid(1.0, 1.0, 1.0), Mesh::cuboid(1.0, 1.0, 1.0));
+        let model = Model::single(fine.clone(), gray()).with_lods([(coarse.clone(), 120.0), (middle.clone(), 300.0)]);
+        // the levels run from the fine mesh down, whatever order they came in
+        assert_eq!(model.mesh_at(1), &middle);
+        assert_eq!(model.mesh_at(2), &coarse);
+        assert_eq!(model.level(310.0, None), 0);
+        assert_eq!(model.level(290.0, Some(0)), 0, "within a tenth of the step: held");
+        assert_eq!(model.level(260.0, Some(0)), 1, "past it: the next level");
+        assert_eq!(model.level(115.0, Some(1)), 1);
+        assert_eq!(model.level(100.0, Some(1)), 2);
+        let world = World::new();
+        world.add_model(model);
+        // a parallel lens: a meter-tall box spans `200 / height` pixels of 200
+        let drawn = |height: f64| {
+            let camera = Camera::looking_at(vec3(0.0, 0.0, 5.0), Vec3::ZERO).parallel_height(height);
+            let frame = world.frame(&camera, &WorldStyle::default(), (200, 200), 1.0);
+            frame.meshes[0].clone()
+        };
+        assert_eq!(drawn(0.5), fine, "four hundred pixels: the fine mesh");
+        assert_eq!(drawn(1.0), middle, "two hundred: the middle one");
+        assert_eq!(drawn(2.5), coarse, "eighty: the coarse one");
+        assert_eq!(drawn(1.6), coarse, "125 pixels: held at the coarse one");
+        assert_eq!(drawn(1.4), middle, "143: past a tenth, back to the middle");
     }
 
     #[test]

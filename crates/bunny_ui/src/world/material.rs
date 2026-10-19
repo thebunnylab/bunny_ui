@@ -126,21 +126,57 @@ pub struct Model {
     /// How the mesh hangs from a skeleton, for a mesh whose vertices name
     /// joints: the entity, or one above it, plays the clip that moves it.
     pub skin: Option<Skin>,
+    /// Coarser meshes for when the model stands small on the target, each
+    /// taking over below its height in pixels, the coarsest last
+    /// ([`Model::with_lods`]).
+    pub lods: Rc<[(Mesh, f32)]>,
 }
 
 impl Model {
     pub fn new(mesh: Mesh, materials: impl Into<Rc<[Material]>>) -> Model {
-        Model { mesh, materials: materials.into(), skin: None }
+        Model { mesh, materials: materials.into(), skin: None, lods: Rc::from([]) }
     }
 
     /// One material for every vertex.
     pub fn single(mesh: Mesh, material: Material) -> Model {
-        Model { mesh, materials: Rc::from(vec![material]), skin: None }
+        Model { mesh, materials: Rc::from(vec![material]), skin: None, lods: Rc::from([]) }
     }
 
     /// The same model, hanging from `skin`.
     pub fn skinned(self, skin: Skin) -> Model {
         Model { skin: Some(skin), ..self }
+    }
+
+    /// The same model with coarser meshes: each `(mesh, pixels)` takes
+    /// over below `pixels` of the model's height on the target, the
+    /// coarsest last. A level holds until the height leaves it by a tenth,
+    /// so a figure that bobs across a step does not flicker. The meshes
+    /// share the model's materials (and skin).
+    pub fn with_lods(self, lods: impl IntoIterator<Item = (Mesh, f32)>) -> Model {
+        let mut lods: Vec<(Mesh, f32)> = lods.into_iter().filter(|(_, pixels)| pixels.is_finite() && *pixels > 0.0).collect();
+        lods.sort_by(|a, b| b.1.total_cmp(&a.1));
+        Model { lods: lods.into(), ..self }
+    }
+
+    /// The level to draw at `pixels` of height on the target: 0 for the
+    /// model's own mesh, `k` for the `k`th of its lods. `held` is the
+    /// level the frame before drew: it stands while the height stays
+    /// within a tenth of the step that would change it.
+    pub fn level(&self, pixels: f64, held: Option<u8>) -> u8 {
+        let level_at = |height: f64| self.lods.iter().filter(|(_, below)| height < *below as f64).count() as u8;
+        let wanted = level_at(pixels);
+        match held {
+            Some(held) if (level_at(pixels * 1.1)..=level_at(pixels / 1.1)).contains(&held) => held,
+            _ => wanted,
+        }
+    }
+
+    /// The mesh of `level`.
+    pub fn mesh_at(&self, level: u8) -> &Mesh {
+        match level.checked_sub(1) {
+            Some(index) => self.lods.get(index as usize).map_or(&self.mesh, |(mesh, _)| mesh),
+            None => &self.mesh,
+        }
     }
 
     /// A soft dark disc `radius` meters across its half, for under

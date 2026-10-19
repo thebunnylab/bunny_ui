@@ -94,6 +94,14 @@ states ride a table the vertex stage reads. `entity.set_ambient(color)`
 tints the light an entity takes from the sky and the ground — the
 ambient of the room it stands in.
 
+A model can carry coarser meshes for when it stands small:
+`Model::with_lods([(middle, 300.0), (coarse, 120.0)])` draws `middle`
+once the model is under 300 pixels tall on the target and `coarse`
+under 120. A level holds until the height leaves its step by a tenth,
+so a figure that bobs across a step does not flicker. The levels share
+the model's materials and skin, and instances at one level still draw
+as one.
+
 Shapes: `cuboid`, `plane`, `sphere`, `cylinder`, and `extrude` for a
 polygon with holes. `mesh.edges(degrees)` gives the lines a drawing
 shows: rims, and creases sharper than the limit.

@@ -219,11 +219,15 @@ pub(crate) struct WorldData {
     live: u32,
     /// The light and shade baked on the ground.
     pub(crate) floor_map: Option<Rc<FloorMap>>,
+    /// The level each model was last drawn at: a level holds while the
+    /// model's height stays near it. Shared by every snapshot; frames
+    /// write it, and no write of it repaints anything.
+    pub(crate) levels: Rc<std::cell::RefCell<HashMap<EntityId, u8>>>,
 }
 
 impl WorldData {
     fn new() -> WorldData {
-        WorldData { chunks: Vec::new(), free: Rc::default(), keyed: Rc::default(), live: 0, floor_map: None }
+        WorldData { chunks: Vec::new(), free: Rc::default(), keyed: Rc::default(), live: 0, floor_map: None, levels: Rc::default() }
     }
 
     fn slot(&self, id: EntityId) -> Option<&Slot> {
