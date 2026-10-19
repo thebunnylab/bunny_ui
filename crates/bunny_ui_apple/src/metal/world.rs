@@ -26,13 +26,14 @@
 //! The world library is compiled the first time a box paints a world: an
 //! app that shows none never pays for it.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::rc::Rc;
 
 use bunny_ui::gpu::walk::FrameBatches;
-use bunny_ui::gpu::world::{Redraw, WorldCaps, WorldGround, WorldJob, slide_copy};
+use bunny_ui::gpu::world::{Redraw, WorldCaps, WorldGround, WorldJob, WorldTiming, slide_copy};
 use bunny_ui::world::bloom::LEVELS;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, WorldFrame};
 use bunny_ui::world::shade::SRGB_DECODE;
@@ -89,6 +90,13 @@ struct MTLScissorRect {
 }
 
 // MARK: - Metal vocabulary of the world pass
+
+/// Command buffers the pass keeps waiting to be timed before it lets the
+/// oldest go.
+const TIMERS_HELD: usize = 32;
+
+/// The command buffers of jobs not timed yet, each with its target.
+type Timers = Rc<RefCell<Vec<(u64, Id)>>>;
 
 const PIXEL_FORMAT_DEPTH32_FLOAT: u64 = 252;
 const PIXEL_FORMAT_R8: u64 = 10;
@@ -1232,6 +1240,9 @@ pub(super) struct MetalWorld {
     next: u64,
     /// Targets the CPU can read: the harness's, for the parity tests.
     pub(super) readable: bool,
+    /// Each job's own command buffer, retained, by target, until the GPU
+    /// has run it: its start and end on the GPU are the job's time.
+    timers: Timers,
 }
 
 impl MetalWorld {
@@ -1250,6 +1261,7 @@ impl MetalWorld {
             blooms: HashMap::new(),
             next: 1,
             readable: false,
+            timers: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -1489,6 +1501,7 @@ impl MetalWorld {
                 (backdrop, _) => backdrop,
             };
             jobs.push(PreparedJob {
+                target: job.target,
                 resolve: target.resolve,
                 color: target.color,
                 depth: target.depth,
@@ -1522,7 +1535,7 @@ impl MetalWorld {
             .iter()
             .map(|id| self.targets.get(id).map_or(null_mut(), |target| target.resolve))
             .collect();
-        FramePass { composite, targets, jobs, sels: Some(stack.sels) }
+        FramePass { composite, targets, jobs, sels: Some(stack.sels), timers: Some(Rc::clone(&self.timers)) }
     }
 }
 
@@ -1869,8 +1882,9 @@ unsafe fn attachment(device: Id, format: u64, size: (u32, u32), samples: u8, sto
 impl WorldGround for MetalWorld {
     fn world_caps(&self) -> WorldCaps {
         // four memoryless samples resolve into the whole target: a part
-        // is redrawn at one sample alone; a blit slides a picture
-        WorldCaps { samples: 4, start: self.start, redraw_samples: 1, slides: true }
+        // is redrawn at one sample alone; a blit slides a picture; each
+        // job's command buffer times it
+        WorldCaps { samples: 4, start: self.start, redraw_samples: 1, slides: true, timers: true }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {
@@ -2041,6 +2055,33 @@ impl WorldGround for MetalWorld {
             unsafe { msg_void(map, sel("release")) };
         }
     }
+
+    fn take_timings(&mut self) -> Vec<WorldTiming> {
+        let (status, start, end, release) = unsafe { (sel("status"), sel("GPUStartTime"), sel("GPUEndTime"), sel("release")) };
+        let mut timings = Vec::new();
+        let mut timers = self.timers.borrow_mut();
+        timers.retain(|&(target, command)| unsafe {
+            let state = super::msg_u64(command, status);
+            if state < super::STATUS_COMPLETED {
+                return true;
+            }
+            // an error is no measure
+            if state == super::STATUS_COMPLETED {
+                let (from, to) = (super::msg_f64(command, start), super::msg_f64(command, end));
+                if from > 0.0 && to >= from {
+                    timings.push(WorldTiming { target, seconds: to - from });
+                }
+            }
+            msg_void(command, release);
+            false
+        });
+        // a queue that never finishes keeps no more of them
+        while timers.len() > TIMERS_HELD {
+            let (_, command) = timers.remove(0);
+            unsafe { msg_void(command, release) };
+        }
+        timings
+    }
 }
 
 fn release_target(target: &Target) {
@@ -2101,9 +2142,13 @@ pub(super) struct FramePass {
     targets: Vec<Id>,
     jobs: Vec<PreparedJob>,
     sels: Option<Selectors>,
+    /// Where each job's command buffer waits to be timed.
+    timers: Option<Timers>,
 }
 
 struct PreparedJob {
+    /// The target's handle, for the job's time.
+    target: u64,
     resolve: Id,
     color: Id,
     depth: Id,
@@ -2200,7 +2245,7 @@ enum PreparedDraw {
 
 impl Default for FramePass {
     fn default() -> FramePass {
-        FramePass { composite: null_mut(), targets: Vec::new(), jobs: Vec::new(), sels: None }
+        FramePass { composite: null_mut(), targets: Vec::new(), jobs: Vec::new(), sels: None, timers: None }
     }
 }
 
@@ -2214,10 +2259,18 @@ impl FramePass {
 
     /// Draws every job into its target, one pass each, before the 2D pass
     /// reads them. `staging` holds the instances and the materials.
-    pub(super) unsafe fn encode(&self, command: Id, sels: &Sels, pass_class: Id, staging: Id) {
+    /// `queue` gives each job a command buffer of its own, committed before
+    /// the frame's `command`: the GPU's start and end of it are the job's
+    /// time. A null queue draws every job into `command`, untimed.
+    pub(super) unsafe fn encode(&self, command: Id, queue: Id, sels: &Sels, pass_class: Id, staging: Id) {
         let Some(world) = self.sels else { return };
         for job in &self.jobs {
             unsafe {
+                let own = match &self.timers {
+                    Some(_) if !queue.is_null() => msg_id(queue, sels.command_buffer),
+                    _ => null_mut(),
+                };
+                let command = if own.is_null() { command } else { own };
                 for shadow in [&job.shadow, &job.moving_shadow].into_iter().flatten() {
                     encode_casters(command, sels, &world, pass_class, staging, job, shadow);
                 }
@@ -2358,6 +2411,11 @@ impl FramePass {
                 msg_void(encoder, sels.end_encoding);
                 if let Some(bloom) = &job.bloom {
                     encode_bloom(command, sels, pass_class, job.resolve, bloom);
+                }
+                if let Some(timers) = self.timers.as_ref().filter(|_| !own.is_null()) {
+                    msg_void(own, sels.retain);
+                    msg_void(own, sels.commit);
+                    timers.borrow_mut().push((job.target, own));
                 }
             }
         }
@@ -2615,6 +2673,19 @@ mod tests {
     /// Every redraw of the shared catalog: the second frame over the first
     /// in its rects alone is the second drawn whole — at one sample; at
     /// four the pass draws whole.
+    #[test]
+    fn each_world_job_is_timed_on_the_gpu() {
+        use bunny_ui::gpu::world::WorldGround;
+        use bunny_ui::gpu::world_scenes::world_scene;
+        let Some(mut gpu) = harness() else { return };
+        let frame = world_scene(6).frame;
+        gpu.world_rgba(&frame).expect("the world pass");
+        let timings = gpu.ground.world.take_timings();
+        assert_eq!(timings.len(), 1, "one job, one time: {timings:?}");
+        assert!(timings[0].seconds > 0.0 && timings[0].seconds < 1.0, "{timings:?}");
+        eprintln!("{} took {:.3} ms on the GPU", world_scene(6).name, timings[0].seconds * 1000.0);
+    }
+
     #[test]
     fn every_redraw_of_the_catalog_matches_its_whole_picture() {
         use bunny_ui::gpu::world_scenes::{REDRAWS, Spread, world_redraw};

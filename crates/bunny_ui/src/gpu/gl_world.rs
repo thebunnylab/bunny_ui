@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::world::{Redraw, WorldCaps, WorldGround, WorldJob, slide_copy};
+use super::world::{Redraw, WorldCaps, WorldGround, WorldJob, WorldTiming, slide_copy};
 use super::world_shaders as source;
 use crate::image_engine::ImageEngine;
 use crate::world::frame::{Background, Blend, DrawKind, ShadowFrame, WorldFrame};
@@ -189,6 +189,23 @@ pub trait GlFamily {
     fn renderer(&self) -> Option<String> {
         None
     }
+    /// Whether the context times its GPU ([`GlFamily::begin_timer`]).
+    fn has_timers(&self) -> bool {
+        false
+    }
+    /// A timer of the GPU's time begins over the commands that follow:
+    /// its handle, or 0 when the context keeps no timers.
+    fn begin_timer(&mut self) -> u32 {
+        0
+    }
+    /// The timer begun last ends after the commands before it.
+    fn end_timer(&mut self) {}
+    /// What a timer measured, read without waiting; a timer read done or
+    /// lost is given back.
+    fn read_timer(&mut self, timer: u32) -> TimerRead {
+        let _ = timer;
+        TimerRead::Lost
+    }
 
     fn viewport(&mut self, width: i32, height: i32);
     fn enable(&mut self, capability: u32);
@@ -326,9 +343,26 @@ struct ShadowObjects {
 }
 
 /// The world's GL objects, and the door the walk opens.
+/// What a GPU timer gave ([`GlFamily::read_timer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerRead {
+    /// The GPU has not finished the commands it times.
+    Pending,
+    /// The measure was lost: the clock jumped, or the timer is unknown.
+    Lost,
+    Nanos(u64),
+}
+
+/// Timers a world pass keeps waiting before it gives the oldest up.
+const TIMERS_HELD: usize = 32;
+
 pub struct GlWorld<G: GlFamily> {
     pub gl: G,
     built: Built,
+    /// Each job's timer, by target, until the GPU has run it.
+    timers: Vec<(u64, u32)>,
+    /// What the timers measured, for the residency's next ask.
+    timings: Vec<WorldTiming>,
     targets: HashMap<u64, Target>,
     meshes: HashMap<u64, MeshObjects>,
     textures: HashMap<u64, u32>,
@@ -349,6 +383,8 @@ impl<G: GlFamily> GlWorld<G> {
         GlWorld {
             gl,
             built: Built::Not,
+            timers: Vec::new(),
+            timings: Vec::new(),
             targets: HashMap::new(),
             meshes: HashMap::new(),
             textures: HashMap::new(),
@@ -391,6 +427,8 @@ impl<G: GlFamily> GlWorld<G> {
         self.segments.clear();
         self.shadow_maps.clear();
         self.blooms.clear();
+        self.timers.clear();
+        self.timings.clear();
     }
 
     fn mint(&mut self) -> u64 {
@@ -547,8 +585,20 @@ impl<G: GlFamily> GlWorld<G> {
         if jobs.is_empty() {
             return;
         }
+        self.read_timers();
         for job in jobs {
+            // the GPU's time over the job: its shadows, its pass, its bloom
+            let timer = self.gl.begin_timer();
             self.encode_job(&programs, job);
+            if timer != 0 {
+                self.gl.end_timer();
+                self.timers.push((job.target, timer));
+            }
+        }
+        // a context that never finishes its timers keeps no more of them
+        while self.timers.len() > TIMERS_HELD {
+            let (_, timer) = self.timers.remove(0);
+            let _ = self.gl.read_timer(timer);
         }
         let gl = &mut self.gl;
         gl.bind_vertex_array(0);
@@ -566,6 +616,20 @@ impl<G: GlFamily> GlWorld<G> {
             gl.bind_texture(0);
         }
         gl.bind_framebuffer(gl::FRAMEBUFFER, 0);
+    }
+
+    /// The timers the GPU has run, read without waiting, into the timings
+    /// the residency asks for.
+    fn read_timers(&mut self) {
+        let GlWorld { gl, timers, timings, .. } = self;
+        timers.retain(|&(target, timer)| match gl.read_timer(timer) {
+            TimerRead::Pending => true,
+            TimerRead::Lost => false,
+            TimerRead::Nanos(nanos) => {
+                timings.push(WorldTiming { target, seconds: nanos as f64 * 1e-9 });
+                false
+            }
+        });
     }
 
     /// The casters of one of the frame's shadows into the box's map, from
@@ -1057,7 +1121,7 @@ impl<G: GlFamily> WorldGround for GlWorld<G> {
         let start = self.gl.renderer().map_or(crate::world::frame::Quality::High, |name| crate::world::governor::device_quality(&name));
         // a rect alone resolves by a blit of that rect, and a picture
         // slides by a blit from one target into another
-        WorldCaps { samples: self.samples, start, redraw_samples: 4, slides: true }
+        WorldCaps { samples: self.samples, start, redraw_samples: 4, slides: true, timers: self.gl.has_timers() }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {
@@ -1265,6 +1329,11 @@ impl<G: GlFamily> WorldGround for GlWorld<G> {
             self.gl.delete_framebuffer(map.framebuffer);
             self.gl.delete_texture(map.texture);
         }
+    }
+
+    fn take_timings(&mut self) -> Vec<WorldTiming> {
+        self.read_timers();
+        std::mem::take(&mut self.timings)
     }
 }
 

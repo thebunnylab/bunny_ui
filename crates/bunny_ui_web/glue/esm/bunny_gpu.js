@@ -39,6 +39,18 @@ function glObj(handle) {
   return glObjects[handle >>> 0] ?? null;
 }
 
+// the GPU's timers, where the browser keeps them: asked once a context
+let glTimer = null;
+let glTimerFor = null;
+
+function glTimerExt() {
+  if (glTimerFor !== gl) {
+    glTimerFor = gl;
+    glTimer = gl ? gl.getExtension("EXT_disjoint_timer_query_webgl2") : null;
+  }
+  return glTimer;
+}
+
 function glRelease(handle) {
   const slot = handle >>> 0;
   if (slot === 0 || slot >= glObjects.length) return null;
@@ -414,6 +426,32 @@ export function gl_invalidate_framebuffer(target, first, second) {
   if (first >>> 0) attachments.push(first >>> 0);
   if (second >>> 0) attachments.push(second >>> 0);
   if (attachments.length) gl.invalidateFramebuffer(target >>> 0, attachments);
+}
+// the GPU's time over a run of commands, where the browser keeps it
+export function gl_has_timers() {
+  return glTimerExt() ? 1 : 0;
+}
+export function gl_timer_begin() {
+  const ext = glTimerExt();
+  if (!ext) return 0;
+  const query = gl.createQuery();
+  gl.beginQuery(ext.TIME_ELAPSED_EXT, query);
+  return glPut(query);
+}
+export function gl_timer_end() {
+  const ext = glTimerExt();
+  if (ext) gl.endQuery(ext.TIME_ELAPSED_EXT);
+}
+// nanoseconds; -1 while the GPU runs it, -2 when the measure was lost
+export function gl_timer_read(handle) {
+  const query = glObj(handle);
+  const ext = glTimerExt();
+  if (!query || !ext) return -2;
+  if (!gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE)) return -1;
+  const lost = gl.getParameter(ext.GPU_DISJOINT_EXT);
+  const nanos = gl.getQueryParameter(query, gl.QUERY_RESULT);
+  gl.deleteQuery(glRelease(handle));
+  return lost ? -2 : nanos;
 }
 // a frame that draws its glow draws into two attachments
 export function gl_draw_buffers(count) {

@@ -1078,7 +1078,7 @@ impl MetalStack {
             }
             // the worlds next, each into its own target: the 2D pass
             // below samples them
-            frame.worlds.encode(command, &self.sels, self.pass_class, frame.staging);
+            frame.worlds.encode(command, self.queue, &self.sels, self.pass_class, frame.staging);
             let mut cleared = false;
             let mut index = 0;
             while index < frame.runs.len() {
@@ -3790,7 +3790,7 @@ impl OffscreenGpu {
             batches.worlds.push(job.clone());
             let pass = self.ground.prepare_worlds(&batches);
             let command = msg_id(self.stack.queue, self.stack.sels.command_buffer);
-            pass.encode(command, &self.stack.sels, self.stack.pass_class, self.ground.staging_buffer());
+            pass.encode(command, self.stack.queue, &self.stack.sels, self.stack.pass_class, self.ground.staging_buffer());
             msg_void(command, self.stack.sels.commit);
             msg_void(command, self.stack.sels.wait_completed);
             Some(job)

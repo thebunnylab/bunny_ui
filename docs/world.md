@@ -355,6 +355,14 @@ of long frames steps a quality down; a long stretch with room to spare
 steps up, once a session and one step past the start at most. A world
 at rest is not weighed: it costs nothing.
 
+Every tier also times its GPU over each world job — a command buffer of
+its own on Metal, timestamp queries on D3D11 and Vulkan, `TIME_ELAPSED`
+on GL 3.3, and `EXT_disjoint_timer_query_webgl2` where the browser has
+it — and reads the time back frames later, never waiting on the GPU.
+The governor weighs it too: nine whole frames in ten must cost under
+10 ms, and nine redraws of a part under 3 ms, or the quality steps
+down; a long stretch at a third of that steps up.
+
 A box inside the budget is drawn at its own size. A larger box is drawn
 smaller, and the compositor stretches it to the box. At four samples a
 cut-out surface (`Material::mask`) turns its edge into coverage — the

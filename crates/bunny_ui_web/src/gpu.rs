@@ -161,6 +161,18 @@ unsafe extern "C" {
     /// The box the scissor test keeps, in the framebuffer's pixels.
     #[cfg(feature = "3d")]
     fn gl_scissor(x: i32, y: i32, width: i32, height: i32);
+    /// 1 when the browser keeps GPU timers (`EXT_disjoint_timer_query_webgl2`).
+    #[cfg(feature = "3d")]
+    fn gl_has_timers() -> u32;
+    /// A timer over the commands that follow; 0 without timers.
+    #[cfg(feature = "3d")]
+    fn gl_timer_begin() -> u32;
+    #[cfg(feature = "3d")]
+    fn gl_timer_end();
+    /// Nanoseconds; −1 while the GPU runs the timer, −2 when its measure
+    /// was lost.
+    #[cfg(feature = "3d")]
+    fn gl_timer_read(timer: u32) -> f64;
     /// Up to two attachments; 0 is none.
     #[cfg(feature = "3d")]
     fn gl_invalidate_framebuffer(target: u32, first: u32, second: u32);
@@ -1323,6 +1335,15 @@ pub(crate) fn world_rgba(frame: &std::rc::Rc<bunny_ui::world::WorldFrame>, image
         unsafe { gl_finish() };
         rgba
     })
+}
+
+/// What the GPU took over the world jobs whose timers came back since the
+/// last ask — for the parity harness. A browser hands a timer's measure
+/// over a task or more after the frame that set it.
+#[cfg(feature = "3d")]
+pub(crate) fn world_timings() -> Vec<bunny_ui::gpu::world::WorldTiming> {
+    use bunny_ui::gpu::world::WorldGround;
+    TIER.with(|slot| slot.borrow_mut().as_mut().map(|tier| tier.ground.world.take_timings()).unwrap_or_default())
 }
 
 /// `before` drawn whole by the world pass alone, then `after` over it —

@@ -55,6 +55,19 @@ pub struct WorldCaps {
     /// Whether the tier slides a picture from one of its targets into
     /// another of the same size ([`Redraw::Slide`]).
     pub slides: bool,
+    /// Whether the tier times its GPU over each job
+    /// ([`WorldGround::take_timings`]).
+    pub timers: bool,
+}
+
+/// How long the GPU took over one job, measured by the tier and read some
+/// frames after the job ran.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorldTiming {
+    /// The job's target.
+    pub target: u64,
+    /// From the job's first command to its last, on the GPU.
+    pub seconds: f64,
 }
 
 /// What of its target a job draws.
@@ -130,6 +143,12 @@ pub trait WorldGround {
     }
     fn drop_shadow_map(&mut self, id: u64) {
         let _ = id;
+    }
+    /// The GPU times of the jobs that finished since the last ask, for a
+    /// tier that keeps timers ([`WorldCaps::timers`]). Never waits on the
+    /// GPU: a job still running is read on a later ask.
+    fn take_timings(&mut self) -> Vec<WorldTiming> {
+        Vec::new()
     }
 }
 
@@ -339,6 +358,9 @@ pub struct WorldResidency {
     pending: Vec<(u64, u64, Rc<WorldFrame>)>,
     /// What this walk's jobs leave in their shadow maps, the same way.
     pending_shadows: Vec<((u64, bool), u64)>,
+    /// Whether the last job into each target drew it whole: the governor
+    /// weighs the GPU's time over it by that.
+    kinds: HashMap<u64, bool>,
 }
 
 impl WorldResidency {
@@ -377,6 +399,7 @@ impl WorldResidency {
         self.governors.clear();
         self.pending.clear();
         self.pending_shadows.clear();
+        self.kinds.clear();
     }
 
     /// How many shadow maps are held.
@@ -490,6 +513,7 @@ impl WorldResidency {
         };
         let shadow = held(frame.shadow.as_ref(), false);
         let moving_shadow = held(frame.moving_shadow.as_ref(), true);
+        self.kinds.insert(id, redraw == Redraw::Whole);
         let job = WorldJob { target: id, size, samples, frame, meshes, textures, segments, shadow, moving_shadow, redraw };
         Some(ResolvedWorld { target: id, size, job: Some(job) })
     }
@@ -559,6 +583,15 @@ impl WorldResidency {
 
     /// Gives back what no walk read for a while. The walk asks at its end.
     pub(crate) fn retire(&mut self, ground: &mut dyn WorldGround) {
+        // what the GPU took over the jobs that finished: each box's
+        // governor weighs its own
+        for timing in ground.take_timings() {
+            let whole = self.kinds.get(&timing.target).copied().unwrap_or(true);
+            let slot = self.targets.iter().find(|(_, target)| target.id == timing.target || target.spare == Some(timing.target)).map(|(slot, _)| *slot);
+            if let Some(governor) = slot.and_then(|slot| self.governors.get_mut(&slot)) {
+                governor.timed(timing.seconds, whole);
+            }
+        }
         let walk = self.walk;
         let idle = |since: u64, limit: u64| walk.wrapping_sub(since) > limit;
         self.targets.retain(|_, target| {
@@ -573,6 +606,7 @@ impl WorldResidency {
         });
         let targets = &self.targets;
         self.governors.retain(|slot, _| targets.contains_key(slot));
+        self.kinds.retain(|id, _| targets.values().any(|target| target.id == *id || target.spare == Some(*id)));
         self.shadow_maps.retain(|_, map| {
             let keep = !idle(map.walk, TARGET_IDLE_WALKS);
             if !keep {
@@ -623,6 +657,8 @@ mod tests {
         start: Quality,
         redraw_samples: u8,
         slides: bool,
+        /// What the GPU took over the jobs, handed over on the next ask.
+        timings: Vec<WorldTiming>,
     }
 
     impl Ledger {
@@ -652,7 +688,7 @@ mod tests {
 
     impl WorldGround for Ledger {
         fn world_caps(&self) -> WorldCaps {
-            WorldCaps { samples: self.samples, start: self.start, redraw_samples: self.redraw_samples, slides: self.slides }
+            WorldCaps { samples: self.samples, start: self.start, redraw_samples: self.redraw_samples, slides: self.slides, timers: true }
         }
         fn make_target(&mut self, _: u32, _: u32, _: u8) -> Option<u64> {
             self.mint("target")
@@ -684,6 +720,9 @@ mod tests {
         }
         fn drop_shadow_map(&mut self, id: u64) {
             self.give_back("shadow map", id);
+        }
+        fn take_timings(&mut self) -> Vec<WorldTiming> {
+            std::mem::take(&mut self.timings)
         }
     }
 
@@ -933,6 +972,28 @@ mod tests {
         residency.begin_walk(walk + TARGET_IDLE_WALKS + 1);
         residency.retire(&mut ground);
         assert_eq!(Ledger::count(&ground.dropped, "target"), 2);
+    }
+
+    #[test]
+    fn a_world_the_gpu_takes_long_over_steps_down() {
+        let (world, cube) = cube_world();
+        let (mut ground, mut residency) = (Ledger::new(), WorldResidency::default());
+        let images = RawImages::default();
+        for walk in 1..=30u64 {
+            residency.begin_walk(walk);
+            // a new picture each walk, drawn whole
+            cube.set_tint(Color::rgb(walk as u8, 90, 50));
+            let style = WorldStyle { quality: Quality::High, ..WorldStyle::default() };
+            let shot = Shot::new(world.with(WorldData::clone), Camera::orbiting(Vec3::ZERO, walk as f64, 25.0, 5.0), style, 0.0, (100.0, 80.0));
+            let resolved = residency.resolve(&mut ground, &images, &shot, 7, walk, (200, 160)).expect("a target");
+            let job = resolved.job.expect("a job");
+            residency.drawn();
+            // the tier read 14 ms on its clock
+            ground.timings.push(WorldTiming { target: job.target, seconds: 0.014 });
+            residency.retire(&mut ground);
+        }
+        let quality = residency.governors.get(&7).expect("the box's governor").quality(Quality::High);
+        assert_eq!(quality, Quality::Medium, "a window of whole frames over 10 ms steps down once");
     }
 
     #[test]

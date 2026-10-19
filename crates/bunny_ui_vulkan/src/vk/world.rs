@@ -45,7 +45,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::rc::Rc;
 
-use bunny_ui::gpu::world::{Redraw, WorldCaps, WorldGround, WorldJob, slide_copy};
+use bunny_ui::gpu::world::{Redraw, WorldCaps, WorldGround, WorldJob, WorldTiming, slide_copy};
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::world::bloom::LEVELS;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, ShadowFrame, WorldFrame};
@@ -252,6 +252,9 @@ const PIPELINE_STAGE_EARLY_FRAGMENT_TESTS: u32 = 0x100;
 const PIPELINE_STAGE_LATE_FRAGMENT_TESTS: u32 = 0x200;
 const ACCESS_DEPTH_ATTACHMENT_READ: u32 = 0x200;
 const ACCESS_DEPTH_ATTACHMENT_WRITE: u32 = 0x400;
+const PIPELINE_STAGE_BOTTOM: u32 = 0x2000;
+const QUERY_TYPE_TIMESTAMP: u32 = 2;
+const QUERY_RESULT_64: u32 = 0x1;
 /// Every offset a block takes in the frame's buffer: the most any device
 /// asks of a uniform or a storage buffer's offset.
 const BLOCK_ALIGN: usize = 256;
@@ -413,6 +416,9 @@ struct WorldStack {
     deform_pool: DescriptorPool,
     /// One word and its set: what a mesh without a skin binds.
     no_deform: Option<(Buffer, DescriptorSet)>,
+    /// Nanoseconds a tick of the GPU's clock, and the ticks' valid bits,
+    /// when the queue keeps a clock.
+    clock: Option<(f64, u32)>,
 }
 
 enum Built {
@@ -503,11 +509,17 @@ struct WorldSlot {
     pool: DescriptorPool,
     /// How many sets the pool holds.
     sets: u32,
+    /// Two ticks of the GPU's clock a job — its first and its last — and
+    /// how many the pool holds.
+    queries: QueryPool,
+    query_count: u32,
+    /// The target of each job the slot timed, in the order of its ticks.
+    timed: Vec<u64>,
 }
 
 impl WorldSlot {
     const fn empty() -> WorldSlot {
-        WorldSlot { buffer: 0, memory: 0, map: std::ptr::null_mut(), capacity: 0, pool: 0, sets: 0 }
+        WorldSlot { buffer: 0, memory: 0, map: std::ptr::null_mut(), capacity: 0, pool: 0, sets: 0, queries: 0, query_count: 0, timed: Vec::new() }
     }
 }
 
@@ -528,6 +540,8 @@ pub(super) struct VkWorld {
     graveyard: Vec<(u64, Garbage)>,
     /// Frames begun: the graveyard's clock.
     frame: u64,
+    /// What the slots' clocks measured, for the residency's next ask.
+    timings: Vec<WorldTiming>,
 }
 
 /// The world door a walk opens: the world, and the stack it builds with.
@@ -570,6 +584,7 @@ impl VkWorld {
             slots: [WorldSlot::empty(), WorldSlot::empty(), WorldSlot::empty()],
             graveyard: Vec::new(),
             frame: 0,
+            timings: Vec::new(),
         }
     }
 
@@ -653,6 +668,9 @@ impl VkWorld {
                 if slot.pool != 0 {
                     (stack.fns.destroy_descriptor_pool)(stack.device, slot.pool, std::ptr::null());
                 }
+                if slot.queries != 0 {
+                    (stack.fns.destroy_query_pool)(stack.device, slot.queries, std::ptr::null());
+                }
                 *slot = WorldSlot::empty();
             }
             if let Built::Ready(world) = std::mem::replace(&mut self.built, Built::Not) {
@@ -676,9 +694,15 @@ impl VkWorld {
         if jobs.is_empty() {
             return false;
         }
-        let VkWorld { built, targets, meshes, surfaces, segments, shadow_maps, blooms, slots, .. } = self;
+        let VkWorld { built, targets, meshes, surfaces, segments, shadow_maps, blooms, slots, timings, .. } = self;
         let Built::Ready(world) = built else { return false };
         let slot = &mut slots[slot];
+        // what the GPU took over this slot's jobs the last time round: its
+        // fence came back, so the ticks are written
+        unsafe { world.read_clock(stack, slot, timings) };
+        if !unsafe { world.ensure_clock(stack, slot, jobs.len() as u32) } {
+            return false;
+        }
         // a frame with a bloom draws its glow beside its colour: the
         // target's bloom, made on its first
         for job in jobs {
@@ -765,7 +789,17 @@ impl VkWorld {
                     Redraw::Slide { from, .. } => targets.get(from).map(|from| from.picture.image),
                     _ => None,
                 };
+                // the GPU's clock before the job's first command and after its last
+                let tick = 2 * slot.timed.len() as u32;
+                if slot.queries != 0 {
+                    (fns.cmd_reset_query_pool)(command, slot.queries, tick, 2);
+                    (fns.cmd_write_timestamp)(command, PIPELINE_STAGE_TOP, slot.queries, tick);
+                }
                 world.record(stack, command, job, target, bloom, set, slot.buffer, instances as u64, &shadows, slid_from, meshes, surfaces, segments);
+                if slot.queries != 0 {
+                    (fns.cmd_write_timestamp)(command, PIPELINE_STAGE_BOTTOM, slot.queries, tick + 1);
+                    slot.timed.push(job.target);
+                }
             }
         }
         true
@@ -933,6 +967,13 @@ impl VkWorld {
             let submitted = ok((fns.queue_submit)(stack.queue, 1, &submit, fence));
             if submitted {
                 (fns.wait_for_fences)(stack.device, 1, &fence, 1, u64::MAX);
+                // the device is idle: every job's ticks are written
+                let VkWorld { built, slots, timings, .. } = &mut *self;
+                if let Built::Ready(world) = built {
+                    for slot in slots.iter_mut().take(jobs.len()) {
+                        world.read_clock(stack, slot, timings);
+                    }
+                }
             }
             let mut out = vec![0u8; length];
             std::ptr::copy_nonoverlapping(readback_map, out.as_mut_ptr(), length);
@@ -1184,7 +1225,21 @@ impl WorldStack {
                 deform_layout,
                 deform_pool,
                 no_deform: None,
+                clock: None,
             };
+            // the GPU's clock: nanoseconds a tick (`timestampPeriod`, at 424
+            // in the limits block), and the bits the queue keeps of it
+            let mut properties = std::mem::zeroed::<PhysicalDeviceProperties>();
+            (fns.get_physical_device_properties)(stack.physical, &mut properties);
+            let period = f32::from_le_bytes([properties.limits.0[424], properties.limits.0[425], properties.limits.0[426], properties.limits.0[427]]);
+            let mut count = 0u32;
+            (fns.get_queue_family_properties)(stack.physical, &mut count, std::ptr::null_mut());
+            let mut families = vec![std::mem::zeroed::<QueueFamilyProperties>(); count as usize];
+            (fns.get_queue_family_properties)(stack.physical, &mut count, families.as_mut_ptr());
+            let bits = families.get(stack.family as usize).map_or(0, |family| family.timestamp_bits);
+            if bits > 0 && period.is_finite() && period > 0.0 {
+                world.clock = Some((period as f64, bits));
+            }
             // one word: the deform stream a mesh without a skin binds
             let no_deform = filled(stack, &[0; 4], BUFFER_USAGE_STORAGE);
             let set = no_deform.as_ref().and_then(|buffer| world.deform_set(stack, buffer.buffer, 4));
@@ -1278,6 +1333,59 @@ impl WorldStack {
             (fns.destroy_descriptor_set_layout)(stack.device, self.frame_layout, std::ptr::null());
             (fns.destroy_descriptor_set_layout)(stack.device, self.surface_layout, std::ptr::null());
         }
+    }
+
+    /// What the slot's clock measured over the jobs it timed, into
+    /// `timings`: the slot's fence came back, so every tick is written.
+    unsafe fn read_clock(&self, stack: &VkStack, slot: &mut WorldSlot, timings: &mut Vec<WorldTiming>) {
+        let timed = std::mem::take(&mut slot.timed);
+        let Some((period, bits)) = self.clock else { return };
+        if timed.is_empty() || slot.queries == 0 {
+            return;
+        }
+        let mut ticks = vec![0u64; timed.len() * 2];
+        let read = unsafe {
+            (stack.fns.get_query_pool_results)(stack.device, slot.queries, 0, ticks.len() as u32, ticks.len() * 8, ticks.as_mut_ptr().cast(), 8, QUERY_RESULT_64)
+        };
+        if read != 0 {
+            return;
+        }
+        let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        for (k, target) in timed.into_iter().enumerate() {
+            let span = ticks[2 * k + 1].wrapping_sub(ticks[2 * k]) & mask;
+            timings.push(WorldTiming { target, seconds: span as f64 * period * 1e-9 });
+        }
+    }
+
+    /// The slot's clock holds two ticks for each of `jobs`; false when the
+    /// device refuses a pool. A device without a clock holds none.
+    unsafe fn ensure_clock(&self, stack: &VkStack, slot: &mut WorldSlot, jobs: u32) -> bool {
+        if self.clock.is_none() || slot.query_count >= jobs * 2 {
+            return true;
+        }
+        let fns = &stack.fns;
+        unsafe {
+            if slot.queries != 0 {
+                (fns.destroy_query_pool)(stack.device, slot.queries, std::ptr::null());
+                slot.queries = 0;
+                slot.query_count = 0;
+            }
+            let count = (jobs * 2).next_power_of_two().max(8);
+            let info = QueryPoolCreateInfo {
+                s_type: ST_QUERY_POOL_CREATE,
+                p_next: std::ptr::null(),
+                flags: 0,
+                query_type: QUERY_TYPE_TIMESTAMP,
+                query_count: count,
+                pipeline_statistics: 0,
+            };
+            if !ok((fns.create_query_pool)(stack.device, &info, std::ptr::null(), &mut slot.queries)) {
+                slot.queries = 0;
+                return false;
+            }
+            slot.query_count = count;
+        }
+        true
     }
 
     /// The slot's buffer holds `bytes` and its pool `jobs` sets — the
@@ -3155,8 +3263,9 @@ impl WorldGround for VkWorldDoor<'_> {
         let end = properties.device_name.iter().position(|&byte| byte == 0).unwrap_or(properties.device_name.len());
         let name = String::from_utf8_lossy(&properties.device_name[..end]);
         // a pass a rect, whose render area holds its clears and resolve;
-        // an image copy slides a picture
-        WorldCaps { samples: 4, start: bunny_ui::world::governor::device_quality(&name), redraw_samples: 4, slides: true }
+        // an image copy slides a picture; the queue's clock times each job
+        let timers = matches!(&self.world.built, Built::Ready(stack) if stack.clock.is_some());
+        WorldCaps { samples: 4, start: bunny_ui::world::governor::device_quality(&name), redraw_samples: 4, slides: true, timers }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {
@@ -3325,6 +3434,10 @@ impl WorldGround for VkWorldDoor<'_> {
             self.world.graveyard.push((frame, Garbage::Shadow(map)));
         }
     }
+
+    fn take_timings(&mut self) -> Vec<WorldTiming> {
+        std::mem::take(&mut self.world.timings)
+    }
 }
 
 // MARK: - Tests
@@ -3403,6 +3516,18 @@ mod tests {
             eprintln!("{}: worst {} · >1 {} · >3 {} · >16 {} of {}", scene.name, s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
             assert!(s.within(scene.tolerance), "{} is beyond its tolerance", scene.name);
         }
+    }
+
+    #[test]
+    fn each_world_job_is_timed_on_the_gpu() {
+        use bunny_ui::gpu::world_scenes::world_scene;
+        let Some(mut gpu) = harness() else { return };
+        let frame = world_scene(6).frame;
+        gpu.world_rgba(&frame).expect("the world pass");
+        let timings = std::mem::take(&mut gpu.world.timings);
+        assert_eq!(timings.len(), 1, "one job, one time: {timings:?}");
+        assert!(timings[0].seconds > 0.0 && timings[0].seconds < 1.0, "{timings:?}");
+        eprintln!("{} took {:.3} ms on the GPU", world_scene(6).name, timings[0].seconds * 1000.0);
     }
 
     #[test]

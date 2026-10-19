@@ -40,7 +40,7 @@ use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::rc::Rc;
 
-use bunny_ui::gpu::world::{Redraw, WorldCaps, WorldGround, WorldJob, slide_copy};
+use bunny_ui::gpu::world::{Redraw, WorldCaps, WorldGround, WorldJob, WorldTiming, slide_copy};
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::world::bloom::LEVELS;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, WorldFrame};
@@ -54,7 +54,7 @@ use super::{
     Buffer, BufferDesc, COMPARISON_NEVER, CPU_ACCESS_READ, CULL_NONE, Context, D3dBox, D3dRect, DepthStencilDesc,
     DepthStencilOpDesc, DepthStencilState, Device, Dsv, FILL_SOLID, FILTER_MIN_MAG_MIP_LINEAR, FORMAT_RGBA8,
     FORMAT_RGBA8_SRGB, FORMAT_UNKNOWN, MAP_READ, MAP_WRITE_DISCARD, MISC_BUFFER_STRUCTURED, MappedSubresource,
-    PixelShader, RasterizerDesc, RasterizerState, RenderTargetBlendDesc, Rtv, SHADER_SOURCE, SRV_DIMENSION_BUFFER,
+    PixelShader, Query, QueryDesc, RasterizerDesc, RasterizerState, RenderTargetBlendDesc, Rtv, S_OK, SHADER_SOURCE, SRV_DIMENSION_BUFFER,
     SamplerDesc, SamplerState, SlotBuffer, Srv, SrvDesc, SubresourceData, TOPOLOGY_TRIANGLELIST, Texture2d,
     Texture2dDesc, USAGE_DEFAULT, USAGE_STAGING, VertexShader, Viewport, WorldRuns, blob_bytes, compile_source,
     compiler, make_constant_buffer, make_rtv, make_srv,
@@ -64,6 +64,11 @@ use crate::ffi::{Com, com_ok};
 // MARK: - D3D vocabulary of the world pass (values from the SDK headers)
 
 const FORMAT_D32_FLOAT: u32 = 40;
+const QUERY_TIMESTAMP: u32 = 2;
+const QUERY_TIMESTAMP_DISJOINT: u32 = 3;
+const ASYNC_GETDATA_DONOTFLUSH: u32 = 1;
+/// Jobs the pass keeps waiting to be timed before it lets the oldest go.
+const TIMERS_HELD: usize = 32;
 const FORMAT_R8_UNORM: u32 = 61;
 const BLEND_INV_DEST_COLOR: u32 = 10;
 const FORMAT_R32_UINT: u32 = 42;
@@ -1152,6 +1157,18 @@ pub(super) struct D3dWorld {
     parts: SlotBuffer,
     /// The frame's palettes, the same way.
     joints: SlotBuffer,
+    /// Each job's queries — the clock's span, its first and its last tick —
+    /// by target, until the GPU has run it.
+    timers: Vec<(u64, [Com<Query>; 3])>,
+}
+
+/// `D3D11_QUERY_DATA_TIMESTAMP_DISJOINT`: the ticks a second, and whether
+/// the clock jumped while the queries ran.
+#[repr(C)]
+#[derive(Default)]
+struct TimestampDisjoint {
+    frequency: u64,
+    disjoint: i32,
 }
 
 impl D3dWorld {
@@ -1172,6 +1189,7 @@ impl D3dWorld {
             casters: SlotBuffer::empty(),
             parts: SlotBuffer::empty(),
             joints: SlotBuffer::empty(),
+            timers: Vec::new(),
         }
     }
 
@@ -1211,6 +1229,21 @@ impl D3dWorld {
 
     /// Draws every job into its target. Call it after the walk and before
     /// the 2D pass.
+    /// Three new queries for one job's time: the clock's span, its first
+    /// tick and its last; `None` when the device refuses one.
+    unsafe fn timer_queries(&self) -> Option<[Com<Query>; 3]> {
+        let device = self.device;
+        let make = |query: u32| -> Option<Com<Query>> {
+            let desc = QueryDesc { query, misc_flags: 0 };
+            let mut out: *mut Query = null_mut();
+            if !com_ok(unsafe { ((*(*device).vtbl).create_query)(device, &desc, &mut out) }) {
+                return None;
+            }
+            Com::from_raw(out)
+        };
+        Some([make(QUERY_TIMESTAMP_DISJOINT)?, make(QUERY_TIMESTAMP)?, make(QUERY_TIMESTAMP)?])
+    }
+
     pub(super) fn encode(&mut self, jobs: &[WorldJob]) {
         let Built::Ready(stack) = &self.built else { return };
         if jobs.is_empty() {
@@ -1231,7 +1264,27 @@ impl D3dWorld {
             (vtbl.ps_set_samplers)(context, 1, 1, &sampler);
         }
         for job in jobs {
+            // the GPU's clock over the job: its shadows, its pass, its bloom
+            let queries = unsafe { self.timer_queries() };
+            if let Some([span, first, _]) = &queries {
+                unsafe {
+                    let vtbl = &*(*context).vtbl;
+                    (vtbl.begin)(context, span.as_ptr().cast());
+                    (vtbl.end)(context, first.as_ptr().cast());
+                }
+            }
             self.encode_job(job);
+            if let Some(queries) = queries {
+                unsafe {
+                    let vtbl = &*(*context).vtbl;
+                    (vtbl.end)(context, queries[2].as_ptr().cast());
+                    (vtbl.end)(context, queries[0].as_ptr().cast());
+                }
+                self.timers.push((job.target, queries));
+                if self.timers.len() > TIMERS_HELD {
+                    self.timers.remove(0);
+                }
+            }
         }
         unsafe {
             let vtbl = &*(*context).vtbl;
@@ -2018,8 +2071,8 @@ impl WorldGround for D3dWorld {
         // the adapter's name is not read here: the ask stands
         // the samples stay in their texture between frames: a part
         // redraws over them, and the resolve gives back the rest unchanged;
-        // a copy slides a picture
-        WorldCaps { samples: 4, start: bunny_ui::world::Quality::High, redraw_samples: 4, slides: true }
+        // a copy slides a picture; timestamp queries time each job
+        WorldCaps { samples: 4, start: bunny_ui::world::Quality::High, redraw_samples: 4, slides: true, timers: true }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {
@@ -2202,6 +2255,32 @@ impl WorldGround for D3dWorld {
     fn drop_shadow_map(&mut self, id: u64) {
         self.shadow_maps.remove(&id);
     }
+
+    fn take_timings(&mut self) -> Vec<WorldTiming> {
+        let context = self.context;
+        let mut timings = Vec::new();
+        self.timers.retain(|(target, [span, first, last])| unsafe {
+            let vtbl = &*(*context).vtbl;
+            let mut clock = TimestampDisjoint::default();
+            let size = std::mem::size_of::<TimestampDisjoint>() as u32;
+            if (vtbl.get_data)(context, span.as_ptr().cast(), (&mut clock as *mut TimestampDisjoint).cast(), size, ASYNC_GETDATA_DONOTFLUSH) != S_OK {
+                return true;
+            }
+            let read = |query: &Com<Query>, out: &mut u64| {
+                (vtbl.get_data)(context, query.as_ptr().cast(), (out as *mut u64).cast(), 8, ASYNC_GETDATA_DONOTFLUSH) == S_OK
+            };
+            let (mut from, mut to) = (0u64, 0u64);
+            if !(read(first, &mut from) && read(last, &mut to)) {
+                return true;
+            }
+            // a clock that jumped while they ran gives no measure
+            if clock.disjoint == 0 && clock.frequency > 0 && to >= from {
+                timings.push(WorldTiming { target: *target, seconds: (to - from) as f64 / clock.frequency as f64 });
+            }
+            false
+        });
+        timings
+    }
 }
 
 // MARK: - Tests
@@ -2253,6 +2332,19 @@ mod tests {
             eprintln!("{}: worst {} · >1 {} · >3 {} · >16 {} of {}", scene.name, s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
             assert!(s.within(scene.tolerance), "{} is beyond its tolerance", scene.name);
         }
+    }
+
+    #[test]
+    fn each_world_job_is_timed_on_the_gpu() {
+        use bunny_ui::gpu::world::WorldGround;
+        use bunny_ui::gpu::world_scenes::world_scene;
+        let Some(mut gpu) = harness() else { return };
+        let frame = world_scene(6).frame;
+        gpu.world_rgba(&frame).expect("the world pass");
+        let timings = gpu.ground.world.take_timings();
+        assert_eq!(timings.len(), 1, "one job, one time: {timings:?}");
+        assert!(timings[0].seconds > 0.0 && timings[0].seconds < 1.0, "{timings:?}");
+        eprintln!("{} took {:.3} ms on the GPU", world_scene(6).name, timings[0].seconds * 1000.0);
     }
 
     #[test]

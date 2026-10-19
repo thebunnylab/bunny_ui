@@ -11,8 +11,12 @@
 //! is never measured: it costs nothing.
 //!
 //! The beat is measured on the engine clock between the frames that drew
-//! the world, so every tier is governed the same way, with no timer of
-//! its own. A world that does not move is drawn once and governs nothing.
+//! the world, so every tier is governed the same way. A tier that times
+//! its own GPU tells the governor how long each world took there too
+//! ([`Governor::timed`]): nine whole frames in ten must cost under 10 ms
+//! and nine redraws of a part under 3 ms, or the quality steps down; a long
+//! stretch at a third of that steps up. A world that does not move is
+//! drawn once and governs nothing.
 
 // the GPU seam keeps a governor for each box; without it, only the
 // device's start is read
@@ -41,6 +45,16 @@ const ROOM_BEAT: f64 = 1.05;
 const PAUSE: f64 = 0.25;
 /// The shortest beat a display keeps: no measure goes under it.
 const FASTEST_BEAT: f64 = 1.0 / 240.0;
+/// The GPU times the governor weighs, of each kind of frame.
+const TIMED_WINDOW: usize = 30;
+/// What nine frames in ten may cost the GPU, in seconds: a frame drawn
+/// whole, and a frame that redraws a part.
+const WHOLE_BUDGET: f64 = 0.010;
+const PART_BUDGET: f64 = 0.003;
+/// A share of the budget under which a frame has room to spare...
+const TIMED_ROOM: f64 = 0.35;
+/// ...and how many such whole frames before a step up.
+const TIMED_ROOM_FRAMES: u32 = 120;
 
 /// What a box's world draws at, and why.
 #[derive(Clone, Debug)]
@@ -60,6 +74,12 @@ pub(crate) struct Governor {
     room: u32,
     /// Whether this session stepped up already.
     stepped_up: bool,
+    /// What the GPU took over the last frames drawn whole, and over the
+    /// last redraws of a part, in seconds.
+    whole_times: VecDeque<f64>,
+    part_times: VecDeque<f64>,
+    /// Whole frames in a row whose GPU time had room to spare.
+    timed_room: u32,
 }
 
 impl Governor {
@@ -74,6 +94,9 @@ impl Governor {
             last: None,
             room: 0,
             stepped_up: false,
+            whole_times: VecDeque::with_capacity(TIMED_WINDOW),
+            part_times: VecDeque::with_capacity(TIMED_WINDOW),
+            timed_room: 0,
         }
     }
 
@@ -124,11 +147,37 @@ impl Governor {
         }
     }
 
+    /// The GPU took `seconds` over one of the world's frames: one drawn
+    /// whole, or one that redrew a part.
+    pub(crate) fn timed(&mut self, seconds: f64, whole: bool) {
+        if !(seconds.is_finite() && seconds >= 0.0) {
+            return;
+        }
+        let window = if whole { &mut self.whole_times } else { &mut self.part_times };
+        if window.len() == TIMED_WINDOW {
+            window.pop_front();
+        }
+        window.push_back(seconds);
+        if window.len() < TIMED_WINDOW {
+            return;
+        }
+        let slow = percentile(window);
+        let budget = if whole { WHOLE_BUDGET } else { PART_BUDGET };
+        if slow > budget {
+            self.step_down();
+        } else if whole && slow < budget * TIMED_ROOM {
+            self.timed_room += 1;
+            if self.timed_room >= TIMED_ROOM_FRAMES {
+                self.step_up();
+            }
+        } else if whole {
+            self.timed_room = 0;
+        }
+    }
+
     /// The beat nine frames in ten keep under.
     fn slow_end(&self) -> f64 {
-        let mut sorted: Vec<f64> = self.beats.iter().copied().collect();
-        sorted.sort_by(f64::total_cmp);
-        sorted[((sorted.len() as f64 * PERCENTILE) as usize).min(sorted.len() - 1)]
+        percentile(&self.beats)
     }
 
     fn step_down(&mut self) {
@@ -140,10 +189,14 @@ impl Governor {
         self.beats.clear();
         self.long.clear();
         self.room = 0;
+        self.whole_times.clear();
+        self.part_times.clear();
+        self.timed_room = 0;
     }
 
     fn step_up(&mut self) {
         self.room = 0;
+        self.timed_room = 0;
         let next = match self.current {
             Quality::Low => Quality::Medium,
             Quality::Medium | Quality::High => Quality::High,
@@ -154,7 +207,16 @@ impl Governor {
         self.stepped_up = true;
         self.current = next;
         self.beats.clear();
+        self.whole_times.clear();
+        self.part_times.clear();
     }
+}
+
+/// The value nine in ten of `values` keep under.
+fn percentile(values: &VecDeque<f64>) -> f64 {
+    let mut sorted: Vec<f64> = values.iter().copied().collect();
+    sorted.sort_by(f64::total_cmp);
+    sorted[((sorted.len() as f64 * PERCENTILE) as usize).min(sorted.len() - 1)]
 }
 
 /// One quality above `quality`.
@@ -254,6 +316,35 @@ mod tests {
         assert_eq!(governor.quality(Quality::High), Quality::Medium, "one step up");
         run(&mut governor, 100.0, 1.0 / 60.0, 2 * (WINDOW + ROOM_FRAMES as usize));
         assert_eq!(governor.quality(Quality::High), Quality::Medium, "once a session");
+    }
+
+    #[test]
+    fn the_gpu_time_steps_down_a_slow_world_and_up_a_light_one() {
+        // nine whole frames in ten over 10 ms on the GPU: a step down
+        let mut governor = Governor::new(Quality::High);
+        for _ in 0..TIMED_WINDOW {
+            governor.timed(0.014, true);
+        }
+        assert_eq!(governor.quality(Quality::High), Quality::Medium);
+        // redraws of a part answer to 3 ms
+        for _ in 0..TIMED_WINDOW {
+            governor.timed(0.002, false);
+        }
+        assert_eq!(governor.quality(Quality::High), Quality::Medium, "under the part's budget");
+        for _ in 0..TIMED_WINDOW {
+            governor.timed(0.005, false);
+        }
+        assert_eq!(governor.quality(Quality::High), Quality::Low, "over it");
+        // a long stretch of light whole frames steps up once
+        for _ in 0..(TIMED_WINDOW + TIMED_ROOM_FRAMES as usize) {
+            governor.timed(0.001, true);
+        }
+        assert_eq!(governor.quality(Quality::High), Quality::Medium);
+        // a lost measure is no measure
+        let held = governor.whole_times.len();
+        governor.timed(f64::NAN, true);
+        governor.timed(-1.0, true);
+        assert_eq!(governor.whole_times.len(), held);
     }
 
     #[test]

@@ -1676,6 +1676,7 @@ const GPU_VERBS = [
   "gl_renderbuffer_storage_multisample", "gl_blit_framebuffer", "gl_invalidate_framebuffer",
   "gl_depth_func", "gl_depth_mask", "gl_cull_face", "gl_front_face", "gl_clear_depth",
   "gl_draw_elements_instanced",
+  "gl_has_timers", "gl_timer_begin", "gl_timer_end", "gl_timer_read",
 ];
 
 // Keyed by the modules' RELATIVE names — see glue.js on why.

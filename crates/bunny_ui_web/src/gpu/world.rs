@@ -153,6 +153,23 @@ impl GlFamily for WebGl {
     fn scissor(&mut self, rect: [i32; 4]) {
         unsafe { gl_scissor(rect[0], rect[1], rect[2], rect[3]) }
     }
+    fn has_timers(&self) -> bool {
+        unsafe { gl_has_timers() != 0 }
+    }
+    fn begin_timer(&mut self) -> u32 {
+        unsafe { gl_timer_begin() }
+    }
+    fn end_timer(&mut self) {
+        unsafe { gl_timer_end() }
+    }
+    fn read_timer(&mut self, timer: u32) -> bunny_ui::gpu::gl_world::TimerRead {
+        use bunny_ui::gpu::gl_world::TimerRead;
+        match unsafe { gl_timer_read(timer) } {
+            nanos if nanos >= 0.0 => TimerRead::Nanos(nanos as u64),
+            -1.0 => TimerRead::Pending,
+            _ => TimerRead::Lost,
+        }
+    }
     fn invalidate_framebuffer(&mut self, target: u32, first: u32, second: u32) {
         unsafe { gl_invalidate_framebuffer(target, first, second) }
     }

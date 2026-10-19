@@ -489,7 +489,10 @@ struct ContextVtbl {
     ia_set_primitive_topology: unsafe extern "system" fn(*mut Context, u32),
     // 25 VSSetShaderResources
     vs_set_shader_resources: unsafe extern "system" fn(*mut Context, u32, u32, *const *mut Srv),
-    _pad_26_27: [usize; 2], // 26 VSSetSamplers, 27 Begin
+    _pad_26: [usize; 1], // 26 VSSetSamplers
+    // 27 Begin (async is any ID3D11Asynchronous)
+    #[cfg_attr(not(feature = "3d"), allow(dead_code))]
+    begin: unsafe extern "system" fn(*mut Context, *mut c_void),
     // 28 End (async is any ID3D11Asynchronous)
     end: unsafe extern "system" fn(*mut Context, *mut c_void),
     // 29 GetData
@@ -605,6 +608,7 @@ const _: () =
     assert!(std::mem::offset_of!(AdapterDesc1, flags) == 280 + 3 * std::mem::size_of::<usize>());
 const _: () =
     assert!(std::mem::offset_of!(ContextVtbl, rs_set_scissor_rects) == 45 * std::mem::size_of::<usize>());
+const _: () = assert!(std::mem::offset_of!(ContextVtbl, begin) == 27 * std::mem::size_of::<usize>());
 const _: () =
     assert!(std::mem::offset_of!(ContextVtbl, copy_subresource_region) == 46 * std::mem::size_of::<usize>());
 

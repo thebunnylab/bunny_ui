@@ -185,6 +185,7 @@ const GPU_VERBS = [
   "gl_framebuffer_renderbuffer", "gl_create_renderbuffer", "gl_delete_renderbuffer",
   "gl_renderbuffer_storage_multisample", "gl_blit_framebuffer", "gl_invalidate_framebuffer",
   "gl_draw_buffers", "gl_read_buffer", "gl_clear_bufferfv",
+  "gl_has_timers", "gl_timer_begin", "gl_timer_end", "gl_timer_read",
   "gl_depth_func", "gl_depth_mask", "gl_cull_face", "gl_front_face", "gl_clear_depth",
   "gl_draw_elements_instanced",
 ];

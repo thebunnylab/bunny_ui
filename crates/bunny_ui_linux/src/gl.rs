@@ -200,6 +200,12 @@ const GL_RENDERER: GlEnum = 0x1F01;
 const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
 const GL_BLEND: GlEnum = 0x0BE2;
 const GL_SCISSOR_TEST: GlEnum = 0x0C11;
+#[cfg(feature = "3d")]
+const GL_TIME_ELAPSED: GlEnum = 0x88BF;
+#[cfg(feature = "3d")]
+const GL_QUERY_RESULT: GlEnum = 0x8866;
+#[cfg(feature = "3d")]
+const GL_QUERY_RESULT_AVAILABLE: GlEnum = 0x8867;
 const GL_DEPTH_TEST: GlEnum = 0x0B71;
 const GL_CULL_FACE: GlEnum = 0x0B44;
 const GL_SRC_ALPHA: GlEnum = 0x0302;
@@ -426,6 +432,12 @@ struct GlWorldFns {
     framebuffer_renderbuffer: unsafe extern "C" fn(GlEnum, GlEnum, GlEnum, u32),
     blit_framebuffer: unsafe extern "C" fn(i32, i32, i32, i32, i32, i32, i32, i32, u32, GlEnum),
     scissor: unsafe extern "C" fn(i32, i32, i32, i32),
+    gen_queries: unsafe extern "C" fn(i32, *mut u32),
+    delete_queries: unsafe extern "C" fn(i32, *const u32),
+    begin_query: unsafe extern "C" fn(GlEnum, u32),
+    end_query: unsafe extern "C" fn(GlEnum),
+    get_query_objectiv: unsafe extern "C" fn(u32, GlEnum, *mut i32),
+    get_query_objectui64v: unsafe extern "C" fn(u32, GlEnum, *mut u64),
     depth_func: unsafe extern "C" fn(GlEnum),
     depth_mask: unsafe extern "C" fn(u8),
     cull_face: unsafe extern "C" fn(GlEnum),
@@ -472,6 +484,12 @@ fn resolve_world(egl: &EglFns) -> Option<GlWorldFns> {
         framebuffer_renderbuffer: gl!("glFramebufferRenderbuffer"),
         blit_framebuffer: gl!("glBlitFramebuffer"),
         scissor: gl!("glScissor"),
+        gen_queries: gl!("glGenQueries"),
+        delete_queries: gl!("glDeleteQueries"),
+        begin_query: gl!("glBeginQuery"),
+        end_query: gl!("glEndQuery"),
+        get_query_objectiv: gl!("glGetQueryObjectiv"),
+        get_query_objectui64v: gl!("glGetQueryObjectui64v"),
         depth_func: gl!("glDepthFunc"),
         depth_mask: gl!("glDepthMask"),
         cull_face: gl!("glCullFace"),
@@ -1715,6 +1733,39 @@ impl GlFamily for Gl33 {
 
     fn scissor(&mut self, rect: [i32; 4]) {
         unsafe { (self.world.scissor)(rect[0], rect[1], rect[2], rect[3]) }
+    }
+
+    // GL 3.3 keeps timers in its core (`GL_TIME_ELAPSED`)
+    fn has_timers(&self) -> bool {
+        true
+    }
+
+    fn begin_timer(&mut self) -> u32 {
+        let mut query = 0;
+        unsafe {
+            (self.world.gen_queries)(1, &mut query);
+            (self.world.begin_query)(GL_TIME_ELAPSED, query);
+        }
+        query
+    }
+
+    fn end_timer(&mut self) {
+        unsafe { (self.world.end_query)(GL_TIME_ELAPSED) }
+    }
+
+    fn read_timer(&mut self, timer: u32) -> bunny_ui::gpu::gl_world::TimerRead {
+        use bunny_ui::gpu::gl_world::TimerRead;
+        let mut ready = 0;
+        unsafe { (self.world.get_query_objectiv)(timer, GL_QUERY_RESULT_AVAILABLE, &mut ready) };
+        if ready == 0 {
+            return TimerRead::Pending;
+        }
+        let mut nanos = 0u64;
+        unsafe {
+            (self.world.get_query_objectui64v)(timer, GL_QUERY_RESULT, &mut nanos);
+            (self.world.delete_queries)(1, &timer);
+        }
+        TimerRead::Nanos(nanos)
     }
 
     fn invalidate_framebuffer(&mut self, target: u32, first: u32, second: u32) {
@@ -3647,6 +3698,19 @@ mod world_tests {
             eprintln!("{}: worst {} · >1 {} · >3 {} · >16 {} of {}", scene.name, s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
             assert!(s.within(scene.tolerance), "{} is beyond its tolerance", scene.name);
         }
+    }
+
+    #[test]
+    fn each_world_job_is_timed_on_the_gpu() {
+        use bunny_ui::gpu::world::WorldGround;
+        use bunny_ui::gpu::world_scenes::world_scene;
+        let Some(mut gpu) = harness() else { return };
+        let frame = world_scene(6).frame;
+        gpu.world_rgba(&frame).expect("the world pass");
+        let timings = gpu.world.as_mut().expect("the world pass").take_timings();
+        assert_eq!(timings.len(), 1, "one job, one time: {timings:?}");
+        assert!(timings[0].seconds > 0.0 && timings[0].seconds < 1.0, "{timings:?}");
+        eprintln!("{} took {:.3} ms on the GPU", world_scene(6).name, timings[0].seconds * 1000.0);
     }
 
     #[test]

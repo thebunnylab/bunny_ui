@@ -1975,6 +1975,19 @@ pub extern "C" fn bunny_gpu_world_parity(index: u32) -> u32 {
     u32::from(!pass)
 }
 
+/// How many world jobs the GPU's timers measured since the last ask; each
+/// one goes to the console. A browser without
+/// `EXT_disjoint_timer_query_webgl2` measures none.
+#[cfg(all(feature = "gpu", feature = "3d"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_gpu_world_timings() -> u32 {
+    let timings = gpu::world_timings();
+    for timing in &timings {
+        gpu::say(&format!("world timing: {:.3} ms on the GPU", timing.seconds * 1000.0));
+    }
+    timings.len() as u32
+}
+
 /// One redraw from the catalog: the first frame drawn whole and the next
 /// over it — slid, then drawn in its rects — against the next drawn whole,
 /// both by this tier's world pass. Returns 0 when the two agree within the
