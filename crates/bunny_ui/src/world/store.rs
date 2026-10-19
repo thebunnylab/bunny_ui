@@ -396,6 +396,29 @@ impl World {
         self.add_spec(EntitySpec::new(Shape::Empty))
     }
 
+    /// The world's three axes from the origin, `length` meters each way —
+    /// x red, y green, z blue, solid where they run positive and dashed
+    /// where they run negative: the guide of a modelling tool. ONE group,
+    /// in one write: move it, hide it or remove it whole.
+    pub fn add_axes(&self, length: f64) -> Entity {
+        let reach = length.max(0.0) as f32;
+        let axes = [(0usize, Color::rgb(204, 52, 52)), (1, Color::rgb(46, 150, 64)), (2, Color::rgb(52, 92, 210))];
+        self.edit(|edit| {
+            let group = edit.add(EntitySpec::new(Shape::Empty));
+            for (axis, color) in axes {
+                for sign in [1.0f32, -1.0] {
+                    let mut end = [0.0f32; 3];
+                    end[axis] = reach * sign;
+                    let style = LineStyle::solid(color, 1.0);
+                    let style = if sign < 0.0 { style.dashed(6.0, 4.0) } else { style };
+                    let line = edit.add(EntitySpec { pickable: false, ..EntitySpec::lines(Lines::new(vec![[[0.0; 3], end]]), style) });
+                    edit.set_parent(line, Some(group));
+                }
+            }
+            group
+        })
+    }
+
     pub fn add_spec(&self, spec: EntitySpec) -> Entity {
         let id = self.data.update(|data| data.insert(EntityData { spec, parent: None, key: None }));
         Entity { world: *self, id }

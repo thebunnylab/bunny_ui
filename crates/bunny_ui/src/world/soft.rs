@@ -1163,6 +1163,26 @@ mod tests {
     }
 
     #[test]
+    fn the_axes_run_red_green_and_blue_from_the_origin() {
+        let world = World::new();
+        let axes = world.add_axes(2.0);
+        assert_eq!(world.len(), 7, "a group and six lines");
+        let camera = Camera::orbiting(Vec3::ZERO, 35.0, 25.0, 6.0);
+        let picture = world.render(&camera, &style(Background::Color(Color::WHITE)), (160, 120), 1.0);
+        let size = crate::layout::Size { width: 160.0, height: 120.0 };
+        let ink = |point: Vec3| {
+            let p = camera.project(point, size).expect("in view");
+            picture.at(p.x as u32, p.y as u32)
+        };
+        let (x, y, z) = (ink(vec3(1.2, 0.0, 0.0)), ink(vec3(0.0, 1.2, 0.0)), ink(vec3(0.0, 0.0, 1.2)));
+        assert!(x[0] > x[1] + 60 && x[0] > x[2] + 60, "x is red: {x:?}");
+        assert!(y[1] > y[0] + 40 && y[1] > y[2] + 40, "y is green: {y:?}");
+        assert!(z[2] > z[0] + 60 && z[2] > z[1] + 60, "z is blue: {z:?}");
+        axes.remove();
+        assert_eq!(world.len(), 0, "the group takes its lines with it");
+    }
+
+    #[test]
     fn a_transparent_background_leaves_alpha_zero() {
         let world = World::new();
         world.add(Mesh::cuboid(0.5, 0.5, 0.5), Material::color(Color::WHITE));

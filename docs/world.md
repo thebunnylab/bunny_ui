@@ -66,6 +66,7 @@ fixed `Camera` has no `.orbit()`: the call does not compile.
 | A shape in a material | `world.add(mesh, material)` |
 | A shape of many materials | `world.add_model(Model::new(mesh, materials))`; each vertex names its material by slot |
 | Lines: edges, a grid, a guide | `world.add_lines(lines, LineStyle::solid(ink, 1.5))` |
+| The axes of a modelling tool | `world.add_axes(100.0)`: x red, y green, z blue, dashed where negative |
 | A light | `world.add_light(Light::sun().toward(d))`, `Light::sky(sky, ground)`, `Light::point(warm)` |
 | A lamp that lights one room | `entity.set_light_group(1)` on the room's entities, `Light::point(warm).groups(1 << 1)` |
 | Light and shade baked on the floor | `world.set_floor_map(Some(FloorMap { picture, origin, size }))`, `floor.set_reads_floor_map(true)` |
