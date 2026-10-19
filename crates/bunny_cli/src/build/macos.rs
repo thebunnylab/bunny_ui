@@ -114,6 +114,7 @@ pub fn build(project: &Project, options: &Options, out: &Path, log: &mut Log, in
             env: env.clone(),
             rustc_args: Vec::new(),
             quiet: false,
+            diagnostics: cargo::Diagnostics::Render,
         })?;
         log.note(&format!("cargo built {} for {target}", built.artifact.display()));
         binaries.push(built.artifact);

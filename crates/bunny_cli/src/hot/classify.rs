@@ -5,19 +5,18 @@
 //! it — safe while each type keeps its shape. The compiler names a type
 //! by its path and the build's salt, not by its fields: a field that
 //! changes type keeps the name, and the new code would read the old
-//! value as the new shape. So an edit that reaches a type gets a new
-//! salt, and the types of the new build are new types, whose state
-//! starts over; an edit inside function bodies keeps the salt, and all
-//! the state stays.
+//! value as the new shape. Salting alone does not reset primitive State
+//! payloads: inserting a field can reassign an old ordinal to a new field.
+//! An edit that reaches a type therefore compiles, then asks for a restart;
+//! an edit inside function bodies keeps the salt and the mounted state.
 //!
 //! The decision is lexical. The file becomes its tokens, without
 //! comments, and the inside of each function body comes out — unless
 //! the body declares an item of its own (a `struct`, an `impl`…), which
 //! is then part of what must not move. Two versions whose remains are
 //! equal changed only inside bodies. A wrong answer is safe one way
-//! only, so every doubt answers "types": a new salt costs the state of
-//! the edited types, a kept salt on a moved type costs memory read
-//! wrong.
+//! only, so every doubt answers "types": a restart costs execution state,
+//! retaining a changed structure can assign state to the wrong field.
 
 /// What an edit to a source file reaches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,7 +24,7 @@ pub enum Reach {
     /// Only the inside of function bodies: every type is as it was.
     Bodies,
     /// Something else — a type, a field, a signature, an item added or
-    /// removed. The new build needs a new salt.
+    /// removed. A successful build must restart before it executes.
     Types,
 }
 

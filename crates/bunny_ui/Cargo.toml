@@ -28,6 +28,16 @@ gpu = ["canvas"]
 # platform with no codec of its own (Linux). Off by default — the other
 # shells ask their platform, and their binaries carry no decoder.
 codec = []
+# Worlds in three dimensions: the retained world, the cameras, the
+# picking, the frame wire and the software rasterizer. It implies
+# `canvas`: a world paints into a box, and the CPU rasterizer is its
+# oracle and its floor. With `gpu` too, the walk hands each world to
+# the tier. Off by default — an app that draws no world carries none
+# of it.
+3d = ["canvas"]
+# The glTF reader: JSON and GLB in safe Rust, standard library only.
+# It implies `3d`, because what it reads becomes a world.
+gltf = ["3d"]
 
 [dependencies]
 motor.workspace = true

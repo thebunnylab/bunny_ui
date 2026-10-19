@@ -12,6 +12,9 @@ canvas = ["bunny-ui/canvas"]
 # The WebGL2 tier. Off, the page presents through the CPU Surface
 # and the island canvases take putImageData — today's roads.
 gpu = ["bunny-ui/gpu", "canvas"]
+# Worlds drawn by WebGL2 itself: the GL family's world pass. Without
+# it a world still shows: the CPU draws it.
+3d = ["bunny-ui/3d", "gpu"]
 # The hit rectangles of the last layout, readable from the page
 # (`bunny_hits_*`): what a runner clicks by on a page without elements.
 # Off in every shipped build.

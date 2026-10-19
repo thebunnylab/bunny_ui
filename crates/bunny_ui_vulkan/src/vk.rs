@@ -3080,6 +3080,11 @@ fn draw_runs(
         let mut bound_round = u32::MAX;
         let mut bound_set: DescriptorSet = 0;
         for run in runs {
+            // this tier has no world pass yet: its ground opens no world
+            // door, and the walk shows the oracle's picture
+            if let RunKind::World(_) = run.kind {
+                continue;
+            }
             if bound_round != run.round {
                 let round: &RoundClip = &batches.rounds[run.round as usize];
                 push.round_box = round.box4;
@@ -3103,7 +3108,7 @@ fn draw_runs(
             }
             match run.kind {
                 // a pane reads the scene: it takes a pass of its own
-                RunKind::Glass => continue,
+                RunKind::Glass | RunKind::World(_) => continue,
                 RunKind::Rects => {
                     let offset =
                         run.base as u64 * std::mem::size_of::<RectInstance>() as u64;

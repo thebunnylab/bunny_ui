@@ -530,32 +530,74 @@ impl<C: View> View for Vec<C> {
     }
 }
 
+/// The zero-child tuple is a fragment, just like every non-empty tuple.
+/// Blank stack macros retain their container without inventing a child node.
+impl View for () {
+    type Arity = Many;
+
+    fn render_into(&self, _ctx: &Context, _out: &mut NodeList) {}
+}
+
+/// A tuple chunk's children, with an index shared across generated chunks.
+/// This is public only because exported stack macros instantiate it downstream.
+#[doc(hidden)]
+pub trait TupleChildren: Clone + 'static {
+    fn render_children(&self, ctx: &Context, out: &mut NodeList, position: &mut usize);
+}
+
+/// Two compile-time child chunks, flattened without an extra layout or identity node.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct JoinedChildren<A, B>(A, B);
+
+impl<A, B> JoinedChildren<A, B> {
+    pub const fn new(first: A, rest: B) -> Self {
+        Self(first, rest)
+    }
+}
+
+impl<A: TupleChildren, B: TupleChildren> TupleChildren for JoinedChildren<A, B> {
+    fn render_children(&self, ctx: &Context, out: &mut NodeList, position: &mut usize) {
+        self.0.render_children(ctx, out, position);
+        self.1.render_children(ctx, out, position);
+    }
+}
+
+impl<A: TupleChildren, B: TupleChildren> View for JoinedChildren<A, B> {
+    type Arity = Many;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        self.render_children(ctx, out, &mut 0);
+    }
+}
+
 /// SwiftUI's `TupleView` — the implicit container of a multi-statement
 /// `@ViewBuilder` block, flattened into the parent's children.
 macro_rules! tuple_view {
     ($($name:ident),+) => {
         #[allow(non_snake_case)]
-        impl<$($name: View),+> View for ($($name,)+) {
-            type Arity = Many;
-
-            fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        impl<$($name: View),+> TupleChildren for ($($name,)+) {
+            fn render_children(&self, ctx: &Context, out: &mut NodeList, position: &mut usize) {
                 let ($(ref $name,)+) = *self;
-                // The tuple position is structural identity: two siblings of
-                // the same type do not get confused, and an empty `Option` does
-                // not shift the indices (the structure is static, not the emitted nodes).
-                let mut position = 0usize;
-                // one node a child, as a rule: room for the arity, made
-                // when the first one arrives
+                // The index belongs to the flat child list, even across macro
+                // chunks. An empty Option still owns its structural slot.
                 const ARITY: usize = [$(stringify!($name)),+].len();
                 out.expect_layout(ARITY);
                 $(
                     {
-                        let _frame = motor::identity::enter(position_segment(position));
+                        let _frame = motor::identity::enter(position_segment(*position));
                         $name.render_into(ctx, out);
-                        position += 1;
+                        *position += 1;
                     }
                 )+
-                let _ = position;
+            }
+        }
+
+        impl<$($name: View),+> View for ($($name,)+) {
+            type Arity = Many;
+
+            fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+                self.render_children(ctx, out, &mut 0);
             }
         }
     };

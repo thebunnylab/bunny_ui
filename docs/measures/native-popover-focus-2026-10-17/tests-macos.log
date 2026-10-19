@@ -1,0 +1,71 @@
+   Compiling bunny-ui-macos v0.3.0 (/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement/crates/bunny_ui_macos)
+warning[E0133]: call to unsafe function `bunny_ui_apple::ffi::class` is unsafe and requires unsafe block
+    --> crates/bunny_ui_macos/src/ffi.rs:1184:50
+     |
+1184 |     let sup = ObjcSuper { receiver: this, class: class("NSView") };
+     |                                                  ^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+    --> crates/bunny_ui_macos/src/ffi.rs:1183:1
+     |
+1183 | unsafe fn key_equivalent_super(this: Id, event: Id) -> i8 {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+     = note: `#[warn(unsafe_op_in_unsafe_fn)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+warning: unnecessary `unsafe` block
+    --> crates/bunny_ui_macos/src/ffi.rs:2491:21
+     |
+2477 |         unsafe {
+     |         ------ because it's nested under this `unsafe` block
+...
+2491 |                     unsafe { kill_layer_actions(layer) };
+     |                     ^^^^^^ unnecessary `unsafe` block
+     |
+     = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+For more information about this error, try `rustc --explain E0133`.
+warning: `bunny-ui-macos` (lib test) generated 2 warnings (run `cargo fix --lib -p bunny-ui-macos --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.60s
+     Running unittests src/lib.rs (target/debug/deps/bunny_ui_macos-edac926852334998)
+
+running 35 tests
+test dialog::tests::the_panel_answers_every_message_the_module_sends ... ok
+test ffi::accessibility::tests::notifications_follow_real_value_name_and_focus_changes_without_idle_chatter ... ok
+test ffi::tests::a_smaller_light_takes_its_gap_with_it ... ok
+test ffi::tests::a_still_window_cannot_park_another_windows_slow_clock ... ok
+test ffi::tests::an_empty_task_queue_never_arms_an_unused_alarm ... ok
+test ffi::tests::an_event_raised_inside_a_handler_waits_its_turn ... ok
+test ffi::tests::appkit_can_report_a_key_without_its_modifiers ... ok
+test ffi::tests::appkit_still_hands_out_the_window_buttons ... ok
+test ffi::tests::appkit_still_speaks_the_dialogs_selectors ... ok
+test ffi::tests::the_blink_timer_parks_and_leaves_with_its_owner ... ok
+test ffi::tests::the_group_keeps_the_systems_own_spacing ... ok
+test ffi::tests::the_lights_flip_from_the_top_into_the_container ... ok
+test ffi::tests::the_pasteboard_answers_the_pictures_reader ... ok
+test ffi::tests::a_frame_edge_wears_the_resizer_a_window_edge_wears ... ok
+test ffi::the_line_behind_a_handler::a_clock_that_waits_folds_into_its_twin ... ok
+test host_wheel::tests::a_notched_wheel_does_not_retain_a_previous_trackpad_owner ... ok
+test host_wheel::tests::a_trackpad_gesture_retains_its_axis_despite_later_diagonal_motion ... ok
+test host_wheel::tests::momentum_keeps_the_owner_chosen_before_the_finger_lift ... ok
+test host_wheel::tests::vertical_turns_reach_the_parent_and_horizontal_turns_keep_the_document ... ok
+test menu::tests::a_filed_item_leaves_no_gap_where_it_stood ... ok
+test menu::tests::a_key_equivalent_is_drawn_only_where_the_mac_can_keep_it ... ok
+test menu::tests::a_submenu_is_lowered_and_tidied_like_a_menu ... ok
+test menu::tests::a_word_order_that_puts_the_app_last_is_kept ... ok
+test menu::tests::the_app_menu_leads_and_holds_what_the_mac_files_there ... ok
+test menu::tests::the_app_menu_speaks_the_words_it_is_given ... ok
+test menu::tests::the_edit_items_carry_their_accelerators_and_selectors ... ok
+test menu::tests::the_window_menu_stands_before_help_or_last ... ok
+test menu::tests::with_no_quit_declared_the_system_quits ... ok
+test tests::a_floor_is_kept_and_the_window_opens_over_it ... ok
+test ffi::tests::the_pointer_puts_back_a_cursor_appkit_replaced ... ok
+test tests::a_window_has_no_floor_until_its_spec_names_one ... ok
+test tests::recovery_rescues_a_missing_link_and_yields_when_it_resumes ... ok
+test tests::recovery_does_not_split_regular_display_beats ... ok
+test tests::the_floor_crosses_into_appkit_unchanged ... ok
+test tests::the_function_row_is_named_by_number ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+

@@ -60,6 +60,15 @@ function glBytes(pointer, length) {
   return new Uint8Array(glMemory.buffer, pointer >>> 0, length >>> 0);
 }
 
+// Floats for a FLOAT texture or a vec4 array: a view where the pointer
+// sits on four bytes, a copy where it does not (a view would throw)
+function glFloats(pointer, length) {
+  pointer >>>= 0;
+  length >>>= 0;
+  if (pointer % 4 === 0) return new Float32Array(glMemory.buffer, pointer, length >>> 2);
+  return new Float32Array(glBytes(pointer, length).slice().buffer);
+}
+
 const glDecoder = new TextDecoder();
 const glEncoder = new TextEncoder();
 
@@ -302,8 +311,11 @@ export function gl_tex_parameteri(target, name, param) {
 }
 export function gl_tex_image_2d(target, level, internal, width, height, format, kind, pointer, length) {
   // a null pointer allocates without filling — the atlas and the
-  // pyramid both open their storage that way
-  const source = pointer ? glBytes(pointer, length) : null;
+  // pyramid both open their storage that way. FLOAT data wants a view
+  // of floats; every other kind takes the bytes
+  const source = pointer
+    ? (kind >>> 0) === 0x1406 ? glFloats(pointer, length) : glBytes(pointer, length)
+    : null;
   gl.texImage2D(
     target >>> 0, level | 0, internal | 0, width | 0, height | 0, 0,
     format >>> 0, kind >>> 0, source,
@@ -334,6 +346,86 @@ export function gl_check_framebuffer_status(target) {
 export function gl_delete_framebuffer(framebuffer) { gl.deleteFramebuffer(glRelease(framebuffer)); }
 
 // MARK: - Draw and read
+
+// MARK: - The world pass (feature `3d`): depth, samples, indexed meshes
+
+export function gl_uniform4fv(location, pointer, count) {
+  if (!gl) return;
+  gl.uniform4fv(glObj(location), glFloats(pointer, (count >>> 0) * 16));
+}
+export function gl_buffer_data(target, pointer, length, usage) {
+  if (!gl) return;
+  gl.bufferData(target >>> 0, glHeap(), usage >>> 0, pointer >>> 0, length >>> 0);
+}
+export function gl_delete_vertex_array(array) {
+  if (!gl) return;
+  gl.deleteVertexArray(glRelease(array));
+}
+export function gl_vertex_attrib_i_pointer(index, size, kind, stride, offset) {
+  if (!gl) return;
+  gl.vertexAttribIPointer(index >>> 0, size | 0, kind >>> 0, stride | 0, offset | 0);
+}
+export function gl_framebuffer_renderbuffer(target, attachment, renderbuffer) {
+  if (!gl) return;
+  gl.framebufferRenderbuffer(target >>> 0, attachment >>> 0, gl.RENDERBUFFER, glObj(renderbuffer));
+}
+export function gl_create_renderbuffer() {
+  if (!gl) return 0;
+  return glPut(gl.createRenderbuffer());
+}
+export function gl_delete_renderbuffer(renderbuffer) {
+  if (!gl) return;
+  gl.deleteRenderbuffer(glRelease(renderbuffer));
+}
+// binds, then gives storage; zero samples is one
+export function gl_renderbuffer_storage_multisample(renderbuffer, samples, internal, width, height) {
+  if (!gl) return;
+  gl.bindRenderbuffer(gl.RENDERBUFFER, glObj(renderbuffer));
+  if ((samples | 0) > 0) {
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples | 0, internal >>> 0, width | 0, height | 0);
+  } else {
+    gl.renderbufferStorage(gl.RENDERBUFFER, internal >>> 0, width | 0, height | 0);
+  }
+}
+// the samples resolve: the read framebuffer's colour onto the draw one
+export function gl_blit_framebuffer(width, height) {
+  if (!gl) return;
+  gl.blitFramebuffer(
+    0, 0, width | 0, height | 0, 0, 0, width | 0, height | 0, gl.COLOR_BUFFER_BIT, gl.NEAREST,
+  );
+}
+// a tiled GPU need not write back what nobody reads
+export function gl_invalidate_framebuffer(target, first, second) {
+  if (!gl) return;
+  const attachments = [];
+  if (first >>> 0) attachments.push(first >>> 0);
+  if (second >>> 0) attachments.push(second >>> 0);
+  if (attachments.length) gl.invalidateFramebuffer(target >>> 0, attachments);
+}
+export function gl_depth_func(func) {
+  if (!gl) return;
+  gl.depthFunc(func >>> 0);
+}
+export function gl_depth_mask(write) {
+  if (!gl) return;
+  gl.depthMask(write !== 0);
+}
+export function gl_cull_face(face) {
+  if (!gl) return;
+  gl.cullFace(face >>> 0);
+}
+export function gl_front_face(mode) {
+  if (!gl) return;
+  gl.frontFace(mode >>> 0);
+}
+export function gl_clear_depth(depth) {
+  if (!gl) return;
+  gl.clearDepth(depth);
+}
+export function gl_draw_elements_instanced(mode, count, kind, offset, instances) {
+  if (!gl) return;
+  gl.drawElementsInstanced(mode >>> 0, count | 0, kind >>> 0, offset | 0, instances | 0);
+}
 
 export function gl_draw_arrays(mode, first, count) { gl.drawArrays(mode >>> 0, first | 0, count | 0); }
 export function gl_draw_arrays_instanced(mode, first, count, instances) {

@@ -47,6 +47,82 @@ const SIZE: Size = Size {
 };
 
 #[test]
+fn activation_gives_the_control_its_edit_scope_without_touching_other_windows() {
+    use bunny_ui::menu::{Edit, Pick};
+    let first = Runtime::scene("activation-owner");
+    let second = Runtime::scene("activation-other");
+    first.set_accessibility_enabled(true);
+    second.set_accessibility_enabled(true);
+    let app = Form::new();
+    let other = Form::new();
+    let root = app.on_edit(Edit::Undo, move || app.count.set(0));
+    first.display_frame(&root, SIZE);
+    let save = first
+        .accessibility_tree()
+        .nodes()
+        .iter()
+        .find(|node| node.label.as_ref() == "Save")
+        .unwrap()
+        .id;
+    second.display_frame(&other, SIZE);
+    assert!(second.focus_named("description"));
+    let other_focus = second.focused();
+
+    first.accessibility_action(save, Action::Activate).unwrap();
+    assert_eq!(app.count.get(), 1);
+    assert!(
+        first.accessibility_tree().node(save).unwrap().focused,
+        "the invoked control owns subsequent keyboard and edit commands"
+    );
+    assert!(first.menu_answers(Pick::Edit(Edit::Undo)));
+    assert!(first.key_stroke(Edit::Undo.stroke()).handled);
+    assert_eq!(app.count.get(), 0);
+    assert_eq!(second.focused(), other_focus);
+    assert_eq!(other.count.get(), 0);
+    // Moving back to a field restores its own history; the parent does not
+    // answer an edit the field declines.
+    assert!(first.focus_named("description"));
+    assert!(!first.menu_answers(Pick::Edit(Edit::Undo)));
+    assert!(!first.key_stroke(Edit::Undo.stroke()).handled);
+}
+
+#[test]
+fn accessible_chrome_preserves_the_fields_focus_and_history() {
+    use bunny_ui::{
+        menu::{Edit, Pick},
+        text_input::EditCommand,
+    };
+    let runtime = Runtime::new();
+    runtime.set_accessibility_enabled(true);
+    let value = State::new(String::new());
+    let count = State::new(0);
+    let undos = State::new(0);
+    let root = vstack!(
+        text_field("Draft", value.binding()).id("draft"),
+        button(text("Inspect"), move || count.add(1)).leaves_keyboard(),
+    )
+    .on_edit(Edit::Undo, move || undos.add(1));
+    runtime.display_frame(&root, SIZE);
+    assert!(runtime.focus_named("draft"));
+    assert!(runtime.key(EditCommand::Insert("text".into())).applied);
+    runtime.display_frame(&root, SIZE);
+    let held = runtime.focused();
+    let id = runtime
+        .accessibility_tree()
+        .nodes()
+        .iter()
+        .find(|node| node.label.as_ref() == "Inspect")
+        .unwrap()
+        .id;
+    runtime.accessibility_action(id, Action::Activate).unwrap();
+    assert_eq!(runtime.focused(), held);
+    assert_eq!(count.get(), 1);
+    assert!(runtime.menu_pick(Pick::Edit(Edit::Undo)));
+    assert_eq!(value.get(), "");
+    assert_eq!(undos.get(), 0);
+}
+
+#[test]
 fn an_initial_modal_action_survives_another_window_frame() {
     let app = ProtectedForm {
         password: State::new("secret".into()),

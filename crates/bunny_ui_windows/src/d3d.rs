@@ -2406,6 +2406,13 @@ impl RunAtlas {
         if let ImageSource::Feed { key, generation, size, bytes, .. } = source {
             return Ok(self.resolve_live(*key, *generation, *size, bytes));
         }
+        // a world's key is its slot: the oracle's picture rides the live road
+        if let Some((slot, frame)) = source.world_feed() {
+            let Some(raster) = raster_source(engine, source, width as usize, height as usize) else {
+                return Ok(None);
+            };
+            return Ok(self.resolve_live(slot, frame, (width, height), &raster.rgba));
+        }
         let cache_key = (source.key(), width, height);
         let walk = self.walk;
         if let Some(entry) = self.dedicated.get_mut(&cache_key) {

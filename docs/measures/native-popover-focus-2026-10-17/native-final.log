@@ -1,0 +1,44 @@
+warning[E0133]: call to unsafe function `bunny_ui_apple::ffi::class` is unsafe and requires unsafe block
+    --> crates/bunny_ui_macos/src/ffi.rs:1184:50
+     |
+1184 |     let sup = ObjcSuper { receiver: this, class: class("NSView") };
+     |                                                  ^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+    --> crates/bunny_ui_macos/src/ffi.rs:1183:1
+     |
+1183 | unsafe fn key_equivalent_super(this: Id, event: Id) -> i8 {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+     = note: `#[warn(unsafe_op_in_unsafe_fn)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+warning: unnecessary `unsafe` block
+    --> crates/bunny_ui_macos/src/ffi.rs:2491:21
+     |
+2477 |         unsafe {
+     |         ------ because it's nested under this `unsafe` block
+...
+2491 |                     unsafe { kill_layer_actions(layer) };
+     |                     ^^^^^^ unnecessary `unsafe` block
+     |
+     = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+For more information about this error, try `rustc --explain E0133`.
+warning: `bunny-ui-macos` (lib) generated 2 warnings (run `cargo fix --lib -p bunny-ui-macos` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running tests/accessibility_native.rs (target/debug/deps/accessibility_native-2c53cc861877986f)
+Leaving an accessible window open for main-thread teardown.
+NSAccessibility checkbox value, focus, disabled rejection and stable identity passed
+Native popover roles, actions, focus, hit testing, repeated retirement and independent window passed
+NSAccessibility role=Some("AXStaticText") label=Some("Native protocol witness") value=Some("Native protocol witness") focused=0
+NSAccessibility role=Some("AXTextField") label=Some("Updated name") value=Some("Dinner") focused=0
+NSAccessibility role=Some("AXTextField") label=Some("Password") value=None focused=0
+NSAccessibility role=Some("AXButton") label=Some("Save") value=None focused=0
+NSAccessibility role=Some("AXCheckBox") label=Some("Reimbursable") value=Some("1") focused=0
+NSAccessibility role=Some("AXButton") label=Some("Toggle controls") value=None focused=0
+NSAccessibility role=Some("AXButton") label=Some("Open modal") value=None focused=0
+NSAccessibility role=Some("AXButton") label=Some("Open reactions") value=None focused=1
+NSAccessibility role=Some("AXButton") label=Some("Remove row") value=None focused=0
+NSAccessibility role=Some("AXButton") label=Some("Row 1") value=None focused=0
+Native AppKit protocol witness passed; no human assistive-technology claim.

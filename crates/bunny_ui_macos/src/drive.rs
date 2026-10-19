@@ -19,20 +19,48 @@ use crate::ffi::{self, AppEvent};
 /// wake polls — the event waits for the handler to return, like any event
 /// raised from inside one.
 pub fn wheel(x: f64, y: f64, dx: f64, dy: f64) {
+    wheel_with(
+        x,
+        y,
+        dx,
+        dy,
+        bunny_ui::action::Modifiers::NONE,
+        bunny_ui::custom::WheelPhase::Changed,
+    );
+}
+
+/// A wheel step with held modifiers and the native gesture phase.
+///
+/// Like [`wheel`], this enters the shell handler on the main thread. A
+/// diagnostic Command-wheel zoom therefore exercises input pacing and
+/// presentation instead of mutating the runtime from a task wake.
+pub fn wheel_with(
+    x: f64,
+    y: f64,
+    dx: f64,
+    dy: f64,
+    modifiers: bunny_ui::action::Modifiers,
+    phase: bunny_ui::custom::WheelPhase,
+) {
     ffi::dispatch(AppEvent::Wheel {
         x,
         y,
         dx,
         dy,
-        modifiers: bunny_ui::action::Modifiers::NONE,
-        phase: bunny_ui::custom::WheelPhase::Changed,
+        modifiers,
+        phase,
     });
 }
 
 /// The primary button pressed at a point of the key window, with nothing
 /// held — a click's first half, a drag's start.
 pub fn press(x: f64, y: f64) {
-    ffi::dispatch(AppEvent::MouseDown { x, y, clicks: 1, modifiers: bunny_ui::action::Modifiers::NONE });
+    ffi::dispatch(AppEvent::MouseDown {
+        x,
+        y,
+        clicks: 1,
+        modifiers: bunny_ui::action::Modifiers::NONE,
+    });
 }
 
 /// The primary button released at a point of the key window.
@@ -52,7 +80,9 @@ pub fn pointer(x: f64, y: f64) {
 /// Text typed into the key window's focused input — the input system's
 /// commit, the road plain typing takes.
 pub fn text(text: &str) {
-    ffi::dispatch(AppEvent::ImeInsert { text: text.to_owned() });
+    ffi::dispatch(AppEvent::ImeInsert {
+        text: text.to_owned(),
+    });
 }
 
 /// The Backspace key, bare.
