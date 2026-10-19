@@ -254,10 +254,12 @@ The picture enters the scene as one image, so it clips, fades and
 composites like any other, and a box paints its own marks over it in
 the same frame. A change to the world or the camera repaints that box
 and runs no body; a world at rest asks for no frame. Picking runs on the
-CPU, the same on every platform. Metal draws worlds on the Mac and the
-phone, WebGL2 in a browser; every other platform shows the picture the
-CPU draws, until its own GPU pass comes. The `3d` feature carries the
-core; the `gltf` feature reads assets (`docs/world.md`).
+CPU, the same on every platform. Every platform draws worlds on its
+GPU: Metal on the Mac and the phone, WebGL2 in a browser, D3D11 on
+Windows, Vulkan on Linux and Android, GL 3.3 on a Linux box with no
+Vulkan. A GPU that cannot shows the picture the CPU draws. The `3d`
+feature carries the core; the `gltf` feature reads assets
+(`docs/world.md`).
 
 ## Gradients
 
