@@ -447,6 +447,10 @@ pub struct WorldRedraw {
     pub shift: [i32; 2],
     pub rects: Vec<[u32; 4]>,
     pub name: &'static str,
+    /// The most a tier's channel may differ from its own whole picture:
+    /// none in place; one code for a slide, whose eye moved — the same
+    /// point shades from numbers of the eye's space a last bit apart.
+    pub worst: u8,
 }
 
 /// Redraw `index` of the catalog.
@@ -505,7 +509,8 @@ pub fn world_redraw(index: u32) -> WorldRedraw {
         }
     };
     let reuse = crate::world::damage::reuse(&before, &after).expect("a part of the picture");
-    WorldRedraw { before, after, shift: reuse.shift, rects: reuse.rects, name }
+    let worst = u8::from(reuse.shift != [0, 0]);
+    WorldRedraw { before, after, shift: reuse.shift, rects: reuse.rects, name, worst }
 }
 
 /// How two pictures differ: the worst channel, and how many pixels sit

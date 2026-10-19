@@ -1976,9 +1976,9 @@ pub extern "C" fn bunny_gpu_world_parity(index: u32) -> u32 {
 }
 
 /// One redraw from the catalog: the first frame drawn whole and the next
-/// over it in its rects alone, against the next drawn whole — both by
-/// this tier's world pass. Returns 0 when the two are the same picture,
-/// 1 when they are not, 2 when the world pass cannot stand.
+/// over it — slid, then drawn in its rects — against the next drawn whole,
+/// both by this tier's world pass. Returns 0 when the two agree within the
+/// redraw's worst, 1 when they do not, 2 when the world pass cannot stand.
 #[cfg(all(feature = "gpu", feature = "3d"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_gpu_world_redraw(index: u32) -> u32 {
@@ -1996,12 +1996,12 @@ pub extern "C" fn bunny_gpu_world_redraw(index: u32) -> u32 {
         redraw.name,
         redraw.shift,
         redraw.rects,
-        if spread.worst == 0 { "pass" } else { "FAIL" },
+        if spread.worst <= redraw.worst { "pass" } else { "FAIL" },
         spread.worst,
         spread.beyond[0],
         spread.pixels,
     ));
-    u32::from(spread.worst != 0)
+    u32::from(spread.worst > redraw.worst)
 }
 
 /// One timed present of a full-window scene, in milliseconds.

@@ -3659,7 +3659,7 @@ mod world_tests {
             let whole = gpu.world_rgba(&redraw.after).expect("the world pass");
             let s = Spread::of(&over, &whole);
             eprintln!("{} in {:?}: worst {} · >1 {} of {}", redraw.name, redraw.rects, s.worst, s.beyond[0], s.pixels);
-            assert_eq!(s.worst, 0, "{}: the redraw is not the whole picture", redraw.name);
+            assert!(s.worst <= redraw.worst, "{}: the redraw is not the whole picture", redraw.name);
         }
     }
 

@@ -163,7 +163,9 @@ zoom, a gradient backdrop or a new range of depths draws whole.
 The CPU proves the rule (`world::damage`): the next frame drawn over
 the last — slid, then drawn in its rects — gives the same bytes as the
 next frame drawn whole, and each tier proves the same against its own
-whole picture. Metal draws rects at one sample: four memoryless
+whole picture: the same bytes in place, and within one code after a
+slide, where the eye moved and a GPU shades the same point from numbers
+a last bit apart. Metal draws rects at one sample: four memoryless
 samples resolve into the whole target. The GL family, D3D11 and Vulkan
 draw them at four samples too.
 

@@ -401,14 +401,21 @@ mod tests {
             world.with(|data| build_frame(data, &camera, &style(Quality::Low), SIZE, 1.0, 0.0))
         };
         let before = looking(Vec3::ZERO);
-        // steps whose turn differs from the first in its last bit
+        // steps whose turn differs from the first in its last bit: which
+        // ones do depends on the machine's rounding, so they are found
         let turn = |shift: Vec3| {
             let start = Camera::orbiting(vec3(0.1, 0.0, 0.7), 45.0, 35.0, 20.0);
             let view = Camera::looking_at(start.eye + shift, start.target + shift).view();
             [0, 1, 2, 4, 5, 6, 8, 9, 10].map(|k| view.m[k].to_bits())
         };
-        for step in [vec3(2.116_573_886_622_883, 0.0, 0.775_746_603_011_303_3), vec3(2.575_375_156_993_571_2, 0.0, -2.105_203_682_180_405_4)] {
-            assert_ne!(turn(step), turn(Vec3::ZERO), "the turn moved by a last bit");
+        let steps = (0..400).map(|k| {
+            let k = k as f64;
+            vec3((k * 0.7311).sin() * 1.4, 0.0, (k * 1.3).cos() * 1.2)
+        });
+        let awkward: Vec<Vec3> = steps.clone().filter(|step| turn(*step) != turn(Vec3::ZERO)).take(3).collect();
+        // a machine that rounds no step that way still slides plain ones
+        let chosen = if awkward.is_empty() { steps.take(3).collect() } else { awkward };
+        for step in chosen {
             slid_exactly(&before, &looking(step));
         }
     }
