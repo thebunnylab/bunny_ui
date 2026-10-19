@@ -17,6 +17,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/check-clippy-regressions.py'
+      - 'scripts/record-native-text-environment.py'
       - '.github/workflows/shared-core.yml'
   workflow_dispatch:
 
@@ -62,6 +63,10 @@ jobs:
           rustup override set 1.98.1
           rustc --version --verbose
           cargo --version
+      - name: Record native font and toolchain inputs
+        run: |
+          python -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/native-text-tools" blake3==1.0.8
+          PYTHONPATH="$RUNNER_TEMP/native-text-tools" python scripts/record-native-text-environment.py --output native-text-environment.json
       - name: Task executor, normal and paranoid
         run: |
           cargo test -p bunny-ui-motor --locked --all-targets
@@ -170,3 +175,10 @@ jobs:
             lint-evidence/*.jsonl
             lint-evidence/comparison.json
           if-no-files-found: warn
+      - name: Preserve native text environment
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-text-${{ matrix.runner }}
+          path: native-text-environment.json
+          if-no-files-found: error
