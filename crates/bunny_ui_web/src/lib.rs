@@ -1908,6 +1908,42 @@ pub extern "C" fn bunny_gpu_parity(scene: u32) -> u32 {
     worst as u32
 }
 
+/// One world from the catalog, drawn twice: by this tier's world pass and
+/// by the CPU rasterizer it must match. Returns 0 when the two agree
+/// within the world's tolerance, 1 when they do not, 2 when the world
+/// pass cannot stand; the spread goes to the console.
+#[cfg(all(feature = "gpu", feature = "3d"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_gpu_world_parity(index: u32) -> u32 {
+    use bunny_ui::gpu::world_scenes::{Spread, world_scene};
+    let scene = world_scene(index);
+    // the catalog's pictures are raw pixels: no runtime is needed to read
+    // them, and a runtime made here would share the page's root and take
+    // the page's views down with it when it went
+    let images = bunny_ui::image_engine::RawImages::default();
+    let Some(mine) = gpu::world_rgba(&scene.frame, &images) else {
+        gpu::say(&format!("world parity {}: the world pass did not stand", scene.name));
+        return 2;
+    };
+    let theirs = bunny_ui::world::soft::draw_with(&scene.frame, &|at| {
+        bunny_ui::world::texture::texture_of(&images, &scene.frame.textures[at])
+    })
+    .rgba;
+    let spread = Spread::of(&mine, &theirs);
+    let pass = spread.within(scene.tolerance);
+    gpu::say(&format!(
+        "world parity {}: {} · worst {} · >1 {} · >3 {} · >16 {} of {}",
+        scene.name,
+        if pass { "pass" } else { "FAIL" },
+        spread.worst,
+        spread.beyond[0],
+        spread.beyond[1],
+        spread.beyond[2],
+        spread.pixels,
+    ));
+    u32::from(!pass)
+}
+
 /// One timed present of a full-window scene, in milliseconds.
 ///
 /// `road` 0 is this tier, 1 is a FRESH `Surface` each sample (the shape
