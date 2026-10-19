@@ -3,11 +3,11 @@
 *Status: the core is complete behind the `3d` feature — the retained
 world, cameras, the orbit, picking, the frame, the software rasterizer
 and the view — and the `gltf` feature reads assets. Metal draws worlds
-itself on the Mac and the phone. Every other tier shows a world too:
-the CPU rasterizer draws it, and the picture rides the live road the
-feeds use, until the tier's own pass comes — WebGL2, then D3D11, GL and
-Vulkan. `cargo test -p bunny-ui-core --features gltf` proves the core
-on any machine.*
+itself on the Mac and the phone, and WebGL2 in a browser. Every other
+tier shows a world too: the CPU rasterizer draws it, and the picture
+rides the live road the feeds use, until the tier's own pass comes —
+D3D11, GL and Vulkan. `cargo test -p bunny-ui-core --features gltf`
+proves the core on any machine.*
 
 An app turns worlds on in its manifest:
 
@@ -165,7 +165,8 @@ pin every offset.
 |---|---|
 | CPU oracle | draws every world; byte-stable on every machine |
 | Metal (Mac, phone) | draws worlds itself: one pass per world, four samples resolved in tile memory, held to the oracle by parity tests |
-| WebGL2, D3D11, GL, Vulkan | show the oracle's picture through the live road; their own passes come next |
+| WebGL2 (browser) | draws worlds itself through the GL family's pass (`gpu::gl_world`): four samples resolved by a blit; `bunny_gpu_world_parity(n)` holds it to the oracle in a page |
+| D3D11, GL, Vulkan | show the oracle's picture through the live road; their own passes come next (GL 3.3 shares the WebGL2 pass) |
 
 A tier that draws worlds keeps a target per box and hands the 2D pass
 the target like a feed. A world whose picture did not move is not
@@ -231,5 +232,7 @@ cargo test -p bunny-ui-core --features gltf
 BUNNY_PARANOID=all cargo test -p bunny-ui-core --all-features
 cargo test -p bunny-ui-apple --features 3d
 cargo run -p bunny-ui-macos --features 3d --example world_window
+# in a page built with the web shell's `3d` feature, from the console:
+#   for (let n = 0; n < 6; n++) __bunny.bunny_gpu_world_parity(n)
 BUNNY_WORLD_GLB=chair.glb BUNNY_WORLD_DUMP=/tmp cargo test -p bunny-ui-core --features gltf --lib a_glb_from_the_environment -- --ignored
 ```
