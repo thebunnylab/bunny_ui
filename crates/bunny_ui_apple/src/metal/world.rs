@@ -2068,7 +2068,7 @@ impl WorldGround for MetalWorld {
             // an error is no measure
             if state == super::STATUS_COMPLETED {
                 let (from, to) = (super::msg_f64(command, start), super::msg_f64(command, end));
-                if from > 0.0 && to >= from {
+                if from > 0.0 && WorldTiming::plausible(to - from) {
                     timings.push(WorldTiming { target, seconds: to - from });
                 }
             }
