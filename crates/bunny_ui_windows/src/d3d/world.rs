@@ -422,9 +422,12 @@ float4 world_fragment(WorldVary v, bool front : SV_IsFrontFace) : SV_Target {
     return world_shade(v, front);
 }
 
+// a plain depth, as the GL family writes it: D3D takes a conservative
+// one (SV_DepthGreaterEqual) only from a pixel whose position is
+// interpolated at its centroid, and the step is measured at the centre
 struct SteppedBack {
     float4 color : SV_Target;
-    float depth : SV_DepthGreaterEqual;
+    float depth : SV_Depth;
 };
 
 // an opaque surface under edges steps back by its own slope, short of
