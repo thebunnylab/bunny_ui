@@ -16,6 +16,11 @@
 //! The render pass leaves the picture ready to be sampled, and its
 //! dependencies order it against the 2D pass that reads it.
 //!
+//! A frame whose sun casts draws its casters first, when the box's map
+//! does not hold them yet: a render pass of depth alone into a 16-bit map
+//! (set 2) the surfaces read through a comparing sampler. A frame without
+//! a map binds a texel and a sampler whose comparison always passes.
+//!
 //! Vulkan keeps no reference to what a recorded frame reads: whatever
 //! the walk gives back is destroyed only once every frame in flight has
 //! come back ([`VkWorld::sweep`]).
@@ -29,8 +34,10 @@ use std::rc::Rc;
 
 use bunny_ui::gpu::world::{WorldCaps, WorldGround, WorldJob};
 use bunny_ui::image_engine::ImageEngine;
-use bunny_ui::world::frame::{Background, Blend, DrawKind, WorldFrame};
-use bunny_ui::world::wire::{SEGMENT_STRIDE, frame_offset, instance_bytes, instance_offset, material_bytes};
+use bunny_ui::world::frame::{Background, Blend, DrawKind, ShadowFrame, WorldFrame};
+use bunny_ui::world::wire::{
+    SEGMENT_STRIDE, SHADOW_INSTANCE_STRIDE, frame_offset, instance_bytes, instance_offset, material_bytes, shadow_instance_bytes,
+};
 
 use super::*;
 
@@ -43,6 +50,7 @@ const LINE_VERT_SPV: &[u8] = include_bytes!("../shaders/world_line.vert.spv");
 const LINE_FRAG_SPV: &[u8] = include_bytes!("../shaders/world_line.frag.spv");
 const BACKDROP_VERT_SPV: &[u8] = include_bytes!("../shaders/world_backdrop.vert.spv");
 const BACKDROP_FRAG_SPV: &[u8] = include_bytes!("../shaders/world_backdrop.frag.spv");
+const SHADOW_VERT_SPV: &[u8] = include_bytes!("../shaders/world_shadow.vert.spv");
 /// The 2D pass's side: a world's target into its box (written by hand,
 /// in the 2D shaders' dialect).
 const COMPOSITE_FRAG_SPV: &[u8] = include_bytes!("../shaders/world_composite.frag.spv");
@@ -93,6 +101,7 @@ mod generator {
             ("world_line.frag", stage(&[gl::WORLD_COMMON, gl::LINE_FRAG])),
             ("world_backdrop.vert", stage(&[gl::BACKDROP_VERT])),
             ("world_backdrop.frag", stage(&[gl::BACKDROP_FRAG])),
+            ("world_shadow.vert", stage(&[gl::WORLD_COMMON, gl::SHADOW_VERT])),
         ]
     }
 
@@ -122,6 +131,7 @@ mod generator {
                 "uniform vec4 u_rows[3];" | "uniform vec4 u_style[2];" => continue,
                 "uniform sampler2D u_materials;" => MATERIALS,
                 "uniform sampler2D u_surface;" => "layout(set = 1, binding = 0) uniform sampler2D u_surface;",
+                "uniform highp sampler2DShadow u_shadow;" => "layout(set = 2, binding = 0) uniform sampler2DShadow u_shadow;",
                 _ => "",
             };
             if !rewritten.is_empty() {
@@ -149,6 +159,8 @@ mod generator {
 
 const ST_PIPELINE_DEPTH_STENCIL: u32 = 25;
 const FORMAT_D32_SFLOAT: u32 = 126;
+const FORMAT_D16_UNORM: u32 = 124;
+const FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR: u32 = 0x1000;
 const FORMAT_R32G32B32_SFLOAT: u32 = 106;
 const FORMAT_R16G16_SINT: u32 = 82;
 const FORMAT_R8G8B8A8_UINT: u32 = 41;
@@ -248,6 +260,7 @@ enum Pipe {
 
 struct Modules {
     mesh_vert: ShaderModule,
+    shadow_vert: ShaderModule,
     mesh_frag: ShaderModule,
     stepped_frag: ShaderModule,
     line_vert: ShaderModule,
@@ -261,6 +274,18 @@ struct WorldStack {
     frame_layout: DescriptorSetLayout,
     /// Set 1: the surface's picture.
     surface_layout: DescriptorSetLayout,
+    /// Set 2: the sun's shadow map.
+    shadow_layout: DescriptorSetLayout,
+    /// Depth alone, 16 bits, left ready to be sampled.
+    shadow_pass: RenderPass,
+    /// The casters: a vertex stage and no fragment.
+    shadow_pipeline: Pipeline,
+    /// Four texels compared and filtered.
+    compare_sampler: Sampler,
+    /// A comparison that always passes, over `lit`: what a frame without
+    /// a map binds.
+    always_sampler: Sampler,
+    lit: ShadowMap,
     layout: PipelineLayout,
     /// The pass at one sample, and at four.
     passes: [RenderPass; 2],
@@ -326,12 +351,31 @@ struct Surface {
     set: DescriptorSet,
 }
 
+/// A box's shadow map: its 16-bit image, the framebuffer the casters draw
+/// into and the set the surfaces read it by.
+struct ShadowMap {
+    image: Image,
+    /// None for the texel that answers "lit".
+    framebuffer: Framebuffer,
+    set: DescriptorSet,
+    size: u32,
+}
+
+/// What a job's surfaces read the sun's shadow through, and the casters
+/// to draw into its map first, with where their rows lie in the slot's
+/// buffer.
+struct JobShadow<'a> {
+    set: DescriptorSet,
+    draw: Option<(&'a ShadowMap, &'a ShadowFrame, u64)>,
+}
+
 /// What the walk gave back, waiting for every frame that may read it.
 enum Garbage {
     Target(Target),
     Mesh(MeshBuffers),
     Surface(Surface),
     Segments(Buffer),
+    Shadow(ShadowMap),
 }
 
 /// One frame slot's share: the frame's blocks, and the pool their sets
@@ -360,6 +404,7 @@ pub(super) struct VkWorld {
     meshes: HashMap<u64, MeshBuffers>,
     surfaces: HashMap<u64, Surface>,
     segments: HashMap<u64, Segments>,
+    shadow_maps: HashMap<u64, ShadowMap>,
     next: u64,
     slots: [WorldSlot; 3],
     /// What was given back, with the frame it was given back on.
@@ -402,6 +447,7 @@ impl VkWorld {
             meshes: HashMap::new(),
             surfaces: HashMap::new(),
             segments: HashMap::new(),
+            shadow_maps: HashMap::new(),
             next: 1,
             slots: [WorldSlot::empty(), WorldSlot::empty(), WorldSlot::empty()],
             graveyard: Vec::new(),
@@ -448,6 +494,11 @@ impl VkWorld {
                     destroy_image(stack, surface.image);
                 }
                 Garbage::Segments(buffer) => destroy_buffer(stack, buffer),
+                Garbage::Shadow(map) => {
+                    (stack.fns.destroy_framebuffer)(stack.device, map.framebuffer, std::ptr::null());
+                    (stack.fns.free_descriptor_sets)(stack.device, world.surface_pool, 1, &map.set);
+                    destroy_image(stack, map.image);
+                }
             }
         }
     }
@@ -459,7 +510,9 @@ impl VkWorld {
         let meshes: Vec<MeshBuffers> = self.meshes.drain().map(|(_, mesh)| mesh).collect();
         let surfaces: Vec<Surface> = self.surfaces.drain().map(|(_, surface)| surface).collect();
         let segments: Vec<Buffer> = self.segments.drain().filter_map(|(_, set)| set.buffer).collect();
+        let shadow_maps: Vec<ShadowMap> = self.shadow_maps.drain().map(|(_, map)| map).collect();
         let mut garbage: Vec<Garbage> = std::mem::take(&mut self.graveyard).into_iter().map(|(_, garbage)| garbage).collect();
+        garbage.extend(shadow_maps.into_iter().map(Garbage::Shadow));
         garbage.extend(targets.into_iter().map(Garbage::Target));
         garbage.extend(meshes.into_iter().map(Garbage::Mesh));
         garbage.extend(surfaces.into_iter().map(Garbage::Surface));
@@ -499,19 +552,24 @@ impl VkWorld {
         if jobs.is_empty() {
             return false;
         }
-        let VkWorld { built, targets, meshes, surfaces, segments, slots, .. } = self;
+        let VkWorld { built, targets, meshes, surfaces, segments, shadow_maps, slots, .. } = self;
         let Built::Ready(world) = built else { return false };
         let slot = &mut slots[slot];
+        // the casters each job draws into its map first, if any
+        let held: Vec<Option<(bunny_ui::gpu::world::ShadowJob, &ShadowMap)>> =
+            jobs.iter().map(|job| job.shadow.and_then(|shadow| shadow_maps.get(&shadow.map).map(|map| (shadow, map)))).collect();
         // where each job's blocks lie in the slot's buffer
         let mut places = Vec::with_capacity(jobs.len());
         let mut cursor = 0usize;
-        for job in jobs {
+        for (job, held) in jobs.iter().zip(&held) {
             let frame = &job.frame;
             let uniforms = cursor;
             let materials = (uniforms + frame_offset::SIZE).next_multiple_of(BLOCK_ALIGN);
             let instances = (materials + (frame.materials.len() * 64).max(64)).next_multiple_of(BLOCK_ALIGN);
-            cursor = (instances + (frame.instances.len() * instance_offset::SIZE).max(instance_offset::SIZE)).next_multiple_of(BLOCK_ALIGN);
-            places.push((uniforms, materials, instances));
+            let casters = (instances + (frame.instances.len() * instance_offset::SIZE).max(instance_offset::SIZE)).next_multiple_of(BLOCK_ALIGN);
+            let rows = casters_of(job, held.map(|(shadow, _)| shadow)).map_or(0, |shadow| shadow.instances.len() * SHADOW_INSTANCE_STRIDE);
+            cursor = (casters + rows.max(SHADOW_INSTANCE_STRIDE)).next_multiple_of(BLOCK_ALIGN);
+            places.push((uniforms, materials, instances, casters));
         }
         if !unsafe { world.ensure_slot(stack, slot, cursor, jobs.len() as u32) } {
             return false;
@@ -519,19 +577,25 @@ impl VkWorld {
         let fns = &stack.fns;
         unsafe {
             (fns.reset_descriptor_pool)(stack.device, slot.pool, 0);
-            for (job, &(uniforms, materials, instances)) in jobs.iter().zip(&places) {
+            for ((job, &(uniforms, materials, instances, casters)), held) in jobs.iter().zip(&places).zip(&held) {
                 let Some(target) = targets.get(&job.target) else { continue };
                 let frame = &job.frame;
+                let draw = casters_of(job, held.map(|(shadow, _)| shadow));
                 let blocks = [
                     (uniforms, frame.uniforms.to_bytes()),
                     (materials, material_bytes(&frame.materials)),
                     (instances, instance_bytes(&frame.instances)),
+                    (casters, draw.map_or(Vec::new(), |shadow| shadow_instance_bytes(&shadow.instances))),
                 ];
                 for (offset, bytes) in &blocks {
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot.map.add(*offset), bytes.len());
                 }
                 let Some(set) = world.frame_set(stack, slot, uniforms, materials, (frame.materials.len() * 64).max(64)) else { continue };
-                world.record(stack, command, job, target, set, slot.buffer, instances as u64, meshes, surfaces, segments);
+                let shadow = JobShadow {
+                    set: held.map_or(world.lit.set, |(_, map)| map.set),
+                    draw: held.and_then(|(_, map)| draw.map(|shadow| (map, shadow, casters as u64))),
+                };
+                world.record(stack, command, job, target, set, slot.buffer, instances as u64, &shadow, meshes, surfaces, segments);
             }
         }
         true
@@ -704,20 +768,22 @@ impl WorldStack {
                     immutable_samplers: std::ptr::null(),
                 },
             ])?;
-            let surface_layout = layout_of(&[DescriptorSetLayoutBinding {
+            let picture_binding = [DescriptorSetLayoutBinding {
                 binding: 0,
                 descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                 count: 1,
                 stages: SHADER_STAGE_FRAGMENT,
                 immutable_samplers: std::ptr::null(),
-            }])?;
-            let set_layouts = [frame_layout, surface_layout];
+            }];
+            let surface_layout = layout_of(&picture_binding)?;
+            let shadow_layout = layout_of(&picture_binding)?;
+            let set_layouts = [frame_layout, surface_layout, shadow_layout];
             let push_range = PushConstantRange { stages: SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT, offset: 0, size: DRAW_PUSH };
             let layout_info = PipelineLayoutCreateInfo {
                 s_type: ST_PIPELINE_LAYOUT_CREATE,
                 p_next: std::ptr::null(),
                 flags: 0,
-                set_layout_count: 2,
+                set_layout_count: 3,
                 set_layouts: set_layouts.as_ptr(),
                 push_range_count: 1,
                 push_ranges: &push_range,
@@ -727,8 +793,10 @@ impl WorldStack {
                 return Err("the world pipeline layout refused".into());
             }
             let passes = [world_pass(stack, 1)?, world_pass(stack, 4)?];
+            let shadow_pass = shadow_pass(stack)?;
             let modules = Modules {
                 mesh_vert: stack.shader(MESH_VERT_SPV)?,
+                shadow_vert: stack.shader(SHADOW_VERT_SPV)?,
                 mesh_frag: stack.shader(MESH_FRAG_SPV)?,
                 stepped_frag: stack.shader(STEPPED_FRAG_SPV)?,
                 line_vert: stack.shader(LINE_VERT_SPV)?,
@@ -788,6 +856,32 @@ impl WorldStack {
             if !ok((fns.create_sampler)(stack.device, &sampler_info, std::ptr::null(), &mut surface_sampler)) {
                 return Err("the world sampler refused".into());
             }
+            // a device that cannot filter a 16-bit depth compares one texel
+            let mut properties = std::mem::zeroed::<FormatProperties>();
+            (fns.get_format_properties)(stack.physical, FORMAT_D16_UNORM, &mut properties);
+            let filter = if properties.optimal_tiling & FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR != 0 { FILTER_LINEAR } else { FILTER_NEAREST };
+            let comparing = |function: u32| -> Result<Sampler, String> {
+                let info = SamplerCreateInfo {
+                    mag_filter: filter,
+                    min_filter: filter,
+                    mipmap_mode: 0,
+                    address_u: SAMPLER_ADDRESS_CLAMP_TO_EDGE,
+                    address_v: SAMPLER_ADDRESS_CLAMP_TO_EDGE,
+                    address_w: SAMPLER_ADDRESS_CLAMP_TO_EDGE,
+                    compare_enable: 1,
+                    compare_op: function,
+                    max_lod: 0.0,
+                    ..sampler_info
+                };
+                let mut sampler: Sampler = 0;
+                if !ok((fns.create_sampler)(stack.device, &info, std::ptr::null(), &mut sampler)) {
+                    return Err("the shadow sampler refused".into());
+                }
+                Ok(sampler)
+            };
+            let compare_sampler = comparing(COMPARE_LESS_OR_EQUAL)?;
+            let always_sampler = comparing(COMPARE_ALWAYS)?;
+            let shadow_pipeline = caster_pipeline(stack, layout, shadow_pass, modules.shadow_vert)?;
             let pool_size = DescriptorPoolSize { descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, count: 1024 };
             let pool_info = DescriptorPoolCreateInfo {
                 s_type: ST_DESCRIPTOR_POOL_CREATE,
@@ -804,6 +898,12 @@ impl WorldStack {
             let mut world = WorldStack {
                 frame_layout,
                 surface_layout,
+                shadow_layout,
+                shadow_pass,
+                shadow_pipeline,
+                compare_sampler,
+                always_sampler,
+                lit: ShadowMap { image: Image { image: 0, memory: 0, view: 0 }, framebuffer: 0, set: 0, size: 1 },
                 layout,
                 passes,
                 modules,
@@ -820,6 +920,20 @@ impl WorldStack {
                     return Err("no blank picture".into());
                 }
             }
+            // the texel that answers "lit": never drawn, so never framed
+            let lit = image(stack, 1, 1, FORMAT_D16_UNORM, 1, 1, IMAGE_USAGE_SAMPLED, IMAGE_ASPECT_DEPTH, false)
+                .filter(|lit| ready_to_read(stack, lit.image));
+            let set = lit.as_ref().and_then(|lit| world.shadow_set(stack, lit.view, world.always_sampler));
+            match (lit, set) {
+                (Some(image), Some(set)) => world.lit = ShadowMap { image, framebuffer: 0, set, size: 1 },
+                (lit, _) => {
+                    if let Some(image) = lit {
+                        destroy_image(stack, image);
+                    }
+                    world.release(stack);
+                    return Err("no lit texel".into());
+                }
+            }
             Ok(world)
         }
     }
@@ -832,9 +946,11 @@ impl WorldStack {
                 (fns.destroy_pipeline)(stack.device, *pipeline, std::ptr::null());
             }
             (fns.destroy_pipeline)(stack.device, self.composite, std::ptr::null());
+            (fns.destroy_pipeline)(stack.device, self.shadow_pipeline, std::ptr::null());
             let modules = &self.modules;
             for module in [
                 modules.mesh_vert,
+                modules.shadow_vert,
                 modules.mesh_frag,
                 modules.stepped_frag,
                 modules.line_vert,
@@ -847,6 +963,12 @@ impl WorldStack {
             if self.blank.image.image != 0 {
                 destroy_image(stack, self.blank.image);
             }
+            if self.lit.image.image != 0 {
+                destroy_image(stack, self.lit.image);
+            }
+            (fns.destroy_sampler)(stack.device, self.compare_sampler, std::ptr::null());
+            (fns.destroy_sampler)(stack.device, self.always_sampler, std::ptr::null());
+            (fns.destroy_render_pass)(stack.device, self.shadow_pass, std::ptr::null());
             (fns.destroy_descriptor_pool)(stack.device, self.surface_pool, std::ptr::null());
             (fns.destroy_sampler)(stack.device, self.surface_sampler, std::ptr::null());
             for pass in self.passes {
@@ -855,6 +977,7 @@ impl WorldStack {
             (fns.destroy_pipeline_layout)(stack.device, self.layout, std::ptr::null());
             (fns.destroy_descriptor_set_layout)(stack.device, self.frame_layout, std::ptr::null());
             (fns.destroy_descriptor_set_layout)(stack.device, self.surface_layout, std::ptr::null());
+            (fns.destroy_descriptor_set_layout)(stack.device, self.shadow_layout, std::ptr::null());
         }
     }
 
@@ -1319,6 +1442,7 @@ impl WorldStack {
         set: DescriptorSet,
         blocks: BufferHandle,
         instances: u64,
+        shadow: &JobShadow<'_>,
         meshes: &HashMap<u64, MeshBuffers>,
         surfaces: &HashMap<u64, Surface>,
         segments: &HashMap<u64, Segments>,
@@ -1328,6 +1452,10 @@ impl WorldStack {
         let (width, height) = target.size;
         let samples = target.samples;
         unsafe {
+            // the sun's map first, when it does not hold this frame's casters
+            if let Some((map, casters, rows)) = shadow.draw {
+                self.record_casters(stack, command, job, set, blocks, rows, map, casters, meshes);
+            }
             let color = match frame.background {
                 Background::Color(c) => {
                     let premultiply = |channel: u8| ((channel as u32 * c.a as u32 + 127) / 255) as f32 / 255.0;
@@ -1353,6 +1481,7 @@ impl WorldStack {
             let scissor = Rect2D { offset: [0, 0], extent: [width, height] };
             (fns.cmd_set_scissor)(command, 0, 1, &scissor);
             (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 0, 1, &set, 0, std::ptr::null());
+            (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 2, 1, &shadow.set, 0, std::ptr::null());
             let layout = self.layout;
             let push = |command: CommandBuffer, bytes: &DrawPush| {
                 (fns.cmd_push_constants)(
@@ -1440,6 +1569,363 @@ impl WorldStack {
             (fns.cmd_end_render_pass)(command);
         }
     }
+}
+
+impl WorldStack {
+    /// The casters of a job into its map, from the sun: a render pass of
+    /// depth alone, both faces, the nearest depth kept. The rows lie at
+    /// `rows` in the slot's buffer.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn record_casters(
+        &self,
+        stack: &VkStack,
+        command: CommandBuffer,
+        job: &WorldJob,
+        set: DescriptorSet,
+        blocks: BufferHandle,
+        rows: u64,
+        map: &ShadowMap,
+        shadow: &ShadowFrame,
+        meshes: &HashMap<u64, MeshBuffers>,
+    ) {
+        let fns = &stack.fns;
+        unsafe {
+            let clears = [[1.0f32, 0.0, 0.0, 0.0]];
+            let begin = RenderPassBeginInfo {
+                s_type: ST_RENDER_PASS_BEGIN,
+                p_next: std::ptr::null(),
+                render_pass: self.shadow_pass,
+                framebuffer: map.framebuffer,
+                render_area_offset: [0, 0],
+                render_area_extent: [map.size, map.size],
+                clear_count: 1,
+                clears: clears.as_ptr(),
+            };
+            (fns.cmd_begin_render_pass)(command, &begin, SUBPASS_CONTENTS_INLINE);
+            let side = map.size as f32;
+            let viewport = Viewport { x: 0.0, y: 0.0, width: side, height: side, min_depth: 0.0, max_depth: 1.0 };
+            (fns.cmd_set_viewport)(command, 0, 1, &viewport);
+            let scissor = Rect2D { offset: [0, 0], extent: [map.size, map.size] };
+            (fns.cmd_set_scissor)(command, 0, 1, &scissor);
+            (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, self.shadow_pipeline);
+            // the frame's block, which the stage declares
+            (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 0, 1, &set, 0, std::ptr::null());
+            for draw in &shadow.draws {
+                let Some(buffers) = job.meshes.get(draw.mesh as usize).and_then(|id| meshes.get(id)) else { continue };
+                // the first caster rides the buffer's offset, as the
+                // instances of a surface do
+                let bound = [buffers.vertices.buffer, blocks];
+                let offsets = [0u64, rows + draw.first_instance as u64 * SHADOW_INSTANCE_STRIDE as u64];
+                (fns.cmd_bind_vertex_buffers)(command, 0, 2, bound.as_ptr(), offsets.as_ptr());
+                (fns.cmd_bind_index_buffer)(command, buffers.indices.buffer, 0, INDEX_TYPE_UINT32);
+                (fns.cmd_draw_indexed)(command, draw.index_count, draw.instance_count, draw.first_index, 0, 0);
+            }
+            (fns.cmd_end_render_pass)(command);
+        }
+    }
+
+    /// A shadow map of `size`: the image, cleared to nothing and ready to
+    /// be read until the casters first draw into it, its framebuffer, and
+    /// its set.
+    unsafe fn shadow_map(&self, stack: &VkStack, size: u32) -> Option<ShadowMap> {
+        unsafe {
+            let image = image(stack, size, size, FORMAT_D16_UNORM, 1, 1, IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT | IMAGE_USAGE_SAMPLED, IMAGE_ASPECT_DEPTH, false)?;
+            let info = FramebufferCreateInfo {
+                s_type: ST_FRAMEBUFFER_CREATE,
+                p_next: std::ptr::null(),
+                flags: 0,
+                render_pass: self.shadow_pass,
+                attachment_count: 1,
+                attachments: &image.view,
+                width: size,
+                height: size,
+                layers: 1,
+            };
+            let mut framebuffer: Framebuffer = 0;
+            if !ok((stack.fns.create_framebuffer)(stack.device, &info, std::ptr::null(), &mut framebuffer)) {
+                destroy_image(stack, image);
+                return None;
+            }
+            let Some(set) = self.shadow_set(stack, image.view, self.compare_sampler).filter(|_| ready_to_read(stack, image.image)) else {
+                (stack.fns.destroy_framebuffer)(stack.device, framebuffer, std::ptr::null());
+                destroy_image(stack, image);
+                return None;
+            };
+            Some(ShadowMap { image, framebuffer, set, size })
+        }
+    }
+
+    /// A set of the shadow's layout over `view`, read through `sampler`.
+    unsafe fn shadow_set(&self, stack: &VkStack, view: ImageView, sampler: Sampler) -> Option<DescriptorSet> {
+        let fns = &stack.fns;
+        unsafe {
+            let allocate = DescriptorSetAllocateInfo {
+                s_type: ST_DESCRIPTOR_SET_ALLOCATE,
+                p_next: std::ptr::null(),
+                pool: self.surface_pool,
+                count: 1,
+                layouts: &self.shadow_layout,
+            };
+            let mut set: DescriptorSet = 0;
+            if !ok((fns.allocate_descriptor_sets)(stack.device, &allocate, &mut set)) {
+                return None;
+            }
+            let image_info = DescriptorImageInfo { sampler, image_view: view, layout: IMAGE_LAYOUT_SHADER_READ_ONLY };
+            let write = WriteDescriptorSet {
+                s_type: ST_WRITE_DESCRIPTOR_SET,
+                p_next: std::ptr::null(),
+                set,
+                binding: 0,
+                array_element: 0,
+                count: 1,
+                descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                image_info: &image_info,
+                buffer_info: std::ptr::null(),
+                texel_view: std::ptr::null(),
+            };
+            (fns.update_descriptor_sets)(stack.device, 1, &write, 0, std::ptr::null());
+            Some(set)
+        }
+    }
+}
+
+/// The casters a job draws into its map first: the frame's shadow, when
+/// the box's map does not hold it.
+fn casters_of(job: &WorldJob, held: Option<bunny_ui::gpu::world::ShadowJob>) -> Option<&ShadowFrame> {
+    match (held, job.frame.shadow.as_ref()) {
+        (Some(shadow), Some(frame_shadow)) if shadow.draw => Some(frame_shadow),
+        _ => None,
+    }
+}
+
+/// A new depth image in the layout the surfaces read it in, so a set may
+/// name it before any pass has drawn into it.
+unsafe fn ready_to_read(stack: &VkStack, image: ImageHandle) -> bool {
+    unsafe {
+        one_time(stack, |command| {
+            let barrier = ImageMemoryBarrier {
+                s_type: ST_IMAGE_MEMORY_BARRIER,
+                p_next: std::ptr::null(),
+                src_access: 0,
+                dst_access: ACCESS_SHADER_READ,
+                old_layout: IMAGE_LAYOUT_UNDEFINED,
+                new_layout: IMAGE_LAYOUT_SHADER_READ_ONLY,
+                src_family: u32::MAX,
+                dst_family: u32::MAX,
+                image,
+                aspect: IMAGE_ASPECT_DEPTH,
+                base_mip: 0,
+                mip_count: 1,
+                base_layer: 0,
+                layer_count: 1,
+            };
+            (stack.fns.cmd_pipeline_barrier)(command, PIPELINE_STAGE_TOP, PIPELINE_STAGE_FRAGMENT_SHADER, 0, 0, std::ptr::null(), 0, std::ptr::null(), 1, &barrier);
+        })
+    }
+}
+
+/// The casters' pipeline: the vertex and its caster's rows, no fragment
+/// stage, both faces, the nearest depth kept.
+unsafe fn caster_pipeline(stack: &VkStack, layout: PipelineLayout, pass: RenderPass, module: ShaderModule) -> Result<Pipeline, String> {
+    let stage = PipelineShaderStage {
+        s_type: ST_PIPELINE_SHADER_STAGE,
+        p_next: std::ptr::null(),
+        flags: 0,
+        stage: SHADER_STAGE_VERTEX,
+        module,
+        name: c"main".as_ptr(),
+        specialization: std::ptr::null(),
+    };
+    let bindings = [
+        VertexInputBinding { binding: 0, stride: bunny_ui::world::mesh::VERTEX_STRIDE as u32, input_rate: VERTEX_INPUT_RATE_VERTEX },
+        VertexInputBinding { binding: 1, stride: SHADOW_INSTANCE_STRIDE as u32, input_rate: VERTEX_INPUT_RATE_INSTANCE },
+    ];
+    let attributes = [
+        VertexInputAttribute { location: 0, binding: 0, format: FORMAT_R32G32B32_SFLOAT, offset: bunny_ui::world::mesh::offset::POSITION as u32 },
+        VertexInputAttribute { location: 5, binding: 1, format: FORMAT_R32G32B32A32_SFLOAT, offset: 0 },
+        VertexInputAttribute { location: 6, binding: 1, format: FORMAT_R32G32B32A32_SFLOAT, offset: 16 },
+        VertexInputAttribute { location: 7, binding: 1, format: FORMAT_R32G32B32A32_SFLOAT, offset: 32 },
+    ];
+    let vertex_input = PipelineVertexInput {
+        s_type: ST_PIPELINE_VERTEX_INPUT,
+        p_next: std::ptr::null(),
+        flags: 0,
+        binding_count: bindings.len() as u32,
+        bindings: bindings.as_ptr(),
+        attribute_count: attributes.len() as u32,
+        attributes: attributes.as_ptr(),
+    };
+    let assembly = PipelineInputAssembly {
+        s_type: ST_PIPELINE_INPUT_ASSEMBLY,
+        p_next: std::ptr::null(),
+        flags: 0,
+        topology: PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        primitive_restart: 0,
+    };
+    let viewport = PipelineViewportState {
+        s_type: ST_PIPELINE_VIEWPORT,
+        p_next: std::ptr::null(),
+        flags: 0,
+        viewport_count: 1,
+        viewports: std::ptr::null(),
+        scissor_count: 1,
+        scissors: std::ptr::null(),
+    };
+    let rasterization = PipelineRasterization {
+        s_type: ST_PIPELINE_RASTERIZATION,
+        p_next: std::ptr::null(),
+        flags: 0,
+        depth_clamp: 0,
+        discard: 0,
+        polygon_mode: POLYGON_MODE_FILL,
+        cull_mode: CULL_MODE_NONE,
+        front_face: FRONT_FACE_COUNTER_CLOCKWISE,
+        depth_bias: 0,
+        bias_constant: 0.0,
+        bias_clamp: 0.0,
+        bias_slope: 0.0,
+        line_width: 1.0,
+    };
+    let multisample = PipelineMultisample {
+        s_type: ST_PIPELINE_MULTISAMPLE,
+        p_next: std::ptr::null(),
+        flags: 0,
+        samples: SAMPLE_COUNT_1,
+        sample_shading: 0,
+        min_sample_shading: 0.0,
+        sample_mask: std::ptr::null(),
+        alpha_to_coverage: 0,
+        alpha_to_one: 0,
+    };
+    let depth_stencil = PipelineDepthStencil {
+        s_type: ST_PIPELINE_DEPTH_STENCIL,
+        p_next: std::ptr::null(),
+        flags: 0,
+        depth_test: 1,
+        depth_write: 1,
+        compare: COMPARE_LESS,
+        bounds_test: 0,
+        stencil_test: 0,
+        front: StencilOpState([0; 7]),
+        back: StencilOpState([0; 7]),
+        min_bounds: 0.0,
+        max_bounds: 1.0,
+    };
+    let color_blend = PipelineColorBlend {
+        s_type: ST_PIPELINE_COLOR_BLEND,
+        p_next: std::ptr::null(),
+        flags: 0,
+        logic_op_enable: 0,
+        logic_op: 0,
+        attachment_count: 0,
+        attachments: std::ptr::null(),
+        blend_constants: [0.0; 4],
+    };
+    let dynamic_states = [DYNAMIC_STATE_VIEWPORT, DYNAMIC_STATE_SCISSOR];
+    let dynamic = PipelineDynamicState {
+        s_type: ST_PIPELINE_DYNAMIC,
+        p_next: std::ptr::null(),
+        flags: 0,
+        state_count: 2,
+        states: dynamic_states.as_ptr(),
+    };
+    let info = GraphicsPipelineCreateInfo {
+        s_type: ST_GRAPHICS_PIPELINE_CREATE,
+        p_next: std::ptr::null(),
+        flags: 0,
+        stage_count: 1,
+        stages: &stage,
+        vertex_input: &vertex_input,
+        input_assembly: &assembly,
+        tessellation: std::ptr::null(),
+        viewport: &viewport,
+        rasterization: &rasterization,
+        multisample: &multisample,
+        depth_stencil: (&depth_stencil as *const PipelineDepthStencil).cast(),
+        color_blend: &color_blend,
+        dynamic: &dynamic,
+        layout,
+        render_pass: pass,
+        subpass: 0,
+        base_pipeline: 0,
+        base_index: -1,
+    };
+    let mut pipeline: Pipeline = 0;
+    unsafe {
+        if !ok((stack.fns.create_graphics_pipelines)(stack.device, 0, 1, &info, std::ptr::null(), &mut pipeline)) {
+            return Err("the casters' pipeline refused".into());
+        }
+    }
+    Ok(pipeline)
+}
+
+/// The casters' pass: a 16-bit depth cleared to the far plane, kept, and
+/// left ready to be sampled. Its dependencies order it after the frames
+/// that read the same map and before the world pass that reads it now.
+unsafe fn shadow_pass(stack: &VkStack) -> Result<RenderPass, String> {
+    let depth = AttachmentDescription {
+        flags: 0,
+        format: FORMAT_D16_UNORM,
+        samples: SAMPLE_COUNT_1,
+        load_op: ATTACHMENT_LOAD_CLEAR,
+        store_op: ATTACHMENT_STORE_STORE,
+        stencil_load: ATTACHMENT_LOAD_DONT_CARE,
+        stencil_store: ATTACHMENT_STORE_DONT_CARE,
+        initial_layout: IMAGE_LAYOUT_UNDEFINED,
+        final_layout: IMAGE_LAYOUT_SHADER_READ_ONLY,
+    };
+    let depth_reference = AttachmentReference { attachment: 0, layout: IMAGE_LAYOUT_DEPTH_ATTACHMENT };
+    let subpass = SubpassDescription {
+        flags: 0,
+        bind_point: PIPELINE_BIND_POINT_GRAPHICS,
+        input_count: 0,
+        inputs: std::ptr::null(),
+        color_count: 0,
+        colors: std::ptr::null(),
+        resolves: std::ptr::null(),
+        depth: &depth_reference,
+        preserve_count: 0,
+        preserves: std::ptr::null(),
+    };
+    let tests = PIPELINE_STAGE_EARLY_FRAGMENT_TESTS | PIPELINE_STAGE_LATE_FRAGMENT_TESTS;
+    let dependencies = [
+        SubpassDependency {
+            src_subpass: SUBPASS_EXTERNAL,
+            dst_subpass: 0,
+            src_stage: PIPELINE_STAGE_FRAGMENT_SHADER | tests,
+            dst_stage: tests,
+            src_access: ACCESS_DEPTH_ATTACHMENT_WRITE,
+            dst_access: ACCESS_DEPTH_ATTACHMENT_READ | ACCESS_DEPTH_ATTACHMENT_WRITE,
+            flags: 0,
+        },
+        SubpassDependency {
+            src_subpass: 0,
+            dst_subpass: SUBPASS_EXTERNAL,
+            src_stage: tests,
+            dst_stage: PIPELINE_STAGE_FRAGMENT_SHADER,
+            src_access: ACCESS_DEPTH_ATTACHMENT_WRITE,
+            dst_access: ACCESS_SHADER_READ,
+            flags: 0,
+        },
+    ];
+    let info = RenderPassCreateInfo {
+        s_type: ST_RENDER_PASS_CREATE,
+        p_next: std::ptr::null(),
+        flags: 0,
+        attachment_count: 1,
+        attachments: &depth,
+        subpass_count: 1,
+        subpasses: &subpass,
+        dependency_count: 2,
+        dependencies: dependencies.as_ptr().cast(),
+    };
+    let mut pass: RenderPass = 0;
+    unsafe {
+        if !ok((stack.fns.create_render_pass)(stack.device, &info, std::ptr::null(), &mut pass)) {
+            return Err("the shadow render pass refused".into());
+        }
+    }
+    Ok(pass)
 }
 
 /// The render pass of a world at `samples`: colour and depth cleared,
@@ -1822,6 +2308,21 @@ impl WorldGround for VkWorldDoor<'_> {
         if let Some(Segments { buffer: Some(buffer), .. }) = self.world.segments.remove(&id) {
             let frame = self.world.frame;
             self.world.graveyard.push((frame, Garbage::Segments(buffer)));
+        }
+    }
+
+    fn make_shadow_map(&mut self, size: u32) -> Option<u64> {
+        let Built::Ready(world) = &self.world.built else { return None };
+        let map = unsafe { world.shadow_map(self.stack, size)? };
+        let id = self.world.mint();
+        self.world.shadow_maps.insert(id, map);
+        Some(id)
+    }
+
+    fn drop_shadow_map(&mut self, id: u64) {
+        if let Some(map) = self.world.shadow_maps.remove(&id) {
+            let frame = self.world.frame;
+            self.world.graveyard.push((frame, Garbage::Shadow(map)));
         }
     }
 }

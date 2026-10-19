@@ -5515,6 +5515,7 @@ mod tests {
             "world_line.frag",
             "world_backdrop.vert",
             "world_backdrop.frag",
+            "world_shadow.vert",
             "world_composite.frag",
         ] {
             let out = std::env::temp_dir().join(format!("bunny-drift-{stage}.spv"));

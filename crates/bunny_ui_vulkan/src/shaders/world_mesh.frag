@@ -73,6 +73,7 @@ layout(std430, set = 0, binding = 1) readonly buffer Materials {
     vec4 rows[];
 } materials;
 layout(set = 1, binding = 0) uniform sampler2D u_surface;
+layout(set = 2, binding = 0) uniform sampler2DShadow u_shadow;
 layout(location = 0) out vec4 out_color;
 
 const int BAYER[16] = int[16](0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5);
@@ -120,7 +121,46 @@ float bayer(uint x, uint y) {
     return (float(BAYER[int((y & 3u) * 4u + (x & 3u))]) + 0.5) / 16.0 - 0.5;
 }
 
-vec3 lit(vec3 position, vec3 n, vec3 base, float roughness, float metallic, vec3 emissive, float occlusion, uint groups) {
+// how much of the sun reaches a point: its depth from the sun against the
+// map's, each lookup four texels compared and filtered by the sampler
+float sun_visibility(vec3 position, vec3 n) {
+    float taps = shadow.w;
+    if (taps < 0.5 || sun_direction.w <= 0.5) {
+        return 1.0;
+    }
+    float n_dot_l = clamp(dot(n, sun_direction.xyz), 0.0, 1.0);
+    if (!(n_dot_l > 0.0)) {
+        return 1.0;
+    }
+    float sine = sqrt(max(1.0 - n_dot_l * n_dot_l, 0.0));
+    vec3 p = position + n * (shadow.y * sine);
+    vec4 s = shadow_from_eye * vec4(p, 1.0);
+    if (!(s.x > 0.0 && s.x < 1.0 && s.y > 0.0 && s.y < 1.0)) {
+        return 1.0;
+    }
+    float reference = clamp(s.z - shadow.z, 0.0, 1.0);
+    float texel = shadow.x;
+    if (taps < 1.5) {
+        return textureLod(u_shadow, vec3(s.x, s.y, reference), 0.0);
+    }
+    if (taps < 4.5) {
+        float sum = 0.0;
+        sum += textureLod(u_shadow, vec3(s.x - 0.5 * texel, s.y - 0.5 * texel, reference), 0.0);
+        sum += textureLod(u_shadow, vec3(s.x + 0.5 * texel, s.y - 0.5 * texel, reference), 0.0);
+        sum += textureLod(u_shadow, vec3(s.x - 0.5 * texel, s.y + 0.5 * texel, reference), 0.0);
+        sum += textureLod(u_shadow, vec3(s.x + 0.5 * texel, s.y + 0.5 * texel, reference), 0.0);
+        return sum * 0.25;
+    }
+    float sum = 0.0;
+    for (int j = -1; j <= 1; j++) {
+        for (int i = -1; i <= 1; i++) {
+            sum += textureLod(u_shadow, vec3(s.x + float(i) * texel, s.y + float(j) * texel, reference), 0.0);
+        }
+    }
+    return sum / 9.0;
+}
+
+vec3 lit(vec3 position, vec3 n, vec3 base, float roughness, float metallic, vec3 emissive, float occlusion, uint groups, float shadow) {
     bool parallel = params.w > 0.5;
     vec3 v = parallel ? vec3(0.0, 0.0, 1.0) : safe_normalize(-position);
     float n_dot_v = clamp(dot(n, v), 1e-4, 1.0);
@@ -153,7 +193,7 @@ vec3 lit(vec3 position, vec3 n, vec3 base, float roughness, float metallic, vec3
             float x5 = x * x * x * x * x;
             vec3 fresnel = f0 + (vec3(1.0) - f0) * x5;
             vec3 specular = fresnel * (pi_d * visibility);
-            light = light + (diffuse + specular) * sun_color.xyz * n_dot_l;
+            light = light + (diffuse + specular) * sun_color.xyz * (n_dot_l * shadow);
         }
     }
 
@@ -226,7 +266,7 @@ vec4 shade() {
         if (!front) {
             normal = -normal;
         }
-        vec3 light = lit(v_eye, normal, base, params_row.x, params_row.y, emissive_row.xyz, v_occlusion, 0xFFFFFFFFu);
+        vec3 light = lit(v_eye, normal, base, params_row.x, params_row.y, emissive_row.xyz, v_occlusion, 0xFFFFFFFFu, sun_visibility(v_eye, normal));
         if (tone.z > 0.5) {
             dither = bayer(uint(gl_FragCoord.x), uint(gl_FragCoord.y));
         }
