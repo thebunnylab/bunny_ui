@@ -249,6 +249,7 @@ const GL_CONDITION_SATISFIED: GlEnum = 0x911C;
 /// The GL 3.3 core surface this module speaks, resolved through
 /// `eglGetProcAddress` after the display initializes. One struct, one
 /// resolve, every pointer checked — a missing symbol refuses the road.
+#[derive(Clone, Copy)]
 struct GlFns {
     get_error: unsafe extern "C" fn() -> GlEnum,
     get_integerv: unsafe extern "C" fn(GlEnum, *mut i32),
@@ -408,6 +409,73 @@ fn resolve_gl(egl: &EglFns) -> Option<GlFns> {
     })
 }
 
+/// The verbs the world pass adds to the 2D pass's table: GL 3.3 core
+/// as well, resolved the same way. One missing leaves the worlds to the
+/// CPU and the 2D road as it was.
+#[cfg(feature = "3d")]
+#[derive(Clone, Copy)]
+struct GlWorldFns {
+    uniform4fv: unsafe extern "C" fn(i32, i32, *const f32),
+    delete_buffers: unsafe extern "C" fn(i32, *const u32),
+    delete_vertex_arrays: unsafe extern "C" fn(i32, *const u32),
+    vertex_attrib_i_pointer: unsafe extern "C" fn(u32, i32, GlEnum, i32, *const c_void),
+    gen_renderbuffers: unsafe extern "C" fn(i32, *mut u32),
+    delete_renderbuffers: unsafe extern "C" fn(i32, *const u32),
+    bind_renderbuffer: unsafe extern "C" fn(GlEnum, u32),
+    renderbuffer_storage_multisample: unsafe extern "C" fn(GlEnum, i32, GlEnum, i32, i32),
+    framebuffer_renderbuffer: unsafe extern "C" fn(GlEnum, GlEnum, GlEnum, u32),
+    blit_framebuffer: unsafe extern "C" fn(i32, i32, i32, i32, i32, i32, i32, i32, u32, GlEnum),
+    depth_func: unsafe extern "C" fn(GlEnum),
+    depth_mask: unsafe extern "C" fn(u8),
+    cull_face: unsafe extern "C" fn(GlEnum),
+    front_face: unsafe extern "C" fn(GlEnum),
+    clear_depth: unsafe extern "C" fn(f64),
+    draw_elements_instanced: unsafe extern "C" fn(GlEnum, i32, GlEnum, *const c_void, i32),
+    /// GL 4.3, or `ARB_invalidate_subdata`: a hint the pass can lose.
+    invalidate_framebuffer: Option<unsafe extern "C" fn(GlEnum, i32, *const GlEnum)>,
+}
+
+/// A resolved address as the function pointer type `F` its field
+/// declares.
+#[cfg(feature = "3d")]
+unsafe fn entry<F: Copy>(address: *mut c_void) -> F {
+    assert_eq!(std::mem::size_of::<F>(), std::mem::size_of::<*mut c_void>());
+    unsafe { std::mem::transmute_copy::<*mut c_void, F>(&address) }
+}
+
+#[cfg(feature = "3d")]
+fn resolve_world(egl: &EglFns) -> Option<GlWorldFns> {
+    let sym = |name: &str| -> Option<*mut c_void> {
+        let name = CString::new(name).expect("gl name");
+        let address = unsafe { (egl.get_proc_address)(name.as_ptr()) };
+        (!address.is_null()).then_some(address)
+    };
+    macro_rules! gl {
+        ($name:literal) => {
+            unsafe { entry(sym($name)?) }
+        };
+    }
+    Some(GlWorldFns {
+        uniform4fv: gl!("glUniform4fv"),
+        delete_buffers: gl!("glDeleteBuffers"),
+        delete_vertex_arrays: gl!("glDeleteVertexArrays"),
+        vertex_attrib_i_pointer: gl!("glVertexAttribIPointer"),
+        gen_renderbuffers: gl!("glGenRenderbuffers"),
+        delete_renderbuffers: gl!("glDeleteRenderbuffers"),
+        bind_renderbuffer: gl!("glBindRenderbuffer"),
+        renderbuffer_storage_multisample: gl!("glRenderbufferStorageMultisample"),
+        framebuffer_renderbuffer: gl!("glFramebufferRenderbuffer"),
+        blit_framebuffer: gl!("glBlitFramebuffer"),
+        depth_func: gl!("glDepthFunc"),
+        depth_mask: gl!("glDepthMask"),
+        cull_face: gl!("glCullFace"),
+        front_face: gl!("glFrontFace"),
+        clear_depth: gl!("glClearDepth"),
+        draw_elements_instanced: gl!("glDrawElementsInstanced"),
+        invalidate_framebuffer: sym("glInvalidateFramebuffer").map(|address| unsafe { entry(address) }),
+    })
+}
+
 // MARK: - Shaders (the shared sources, in this tier's dialect)
 
 use bunny_ui::gpu::shaders::PRELUDE_330 as SHADER_PRELUDE;
@@ -455,6 +523,9 @@ struct GlStack {
     round_ubo: u32,
     /// The Frame block's cached viewport — written on change only.
     frame_viewport: (f32, f32),
+    /// The world pass's verbs, when the driver answers every one.
+    #[cfg(feature = "3d")]
+    world_fns: Option<GlWorldFns>,
 }
 
 const UBO_FRAME_BINDING: u32 = 0;
@@ -702,6 +773,8 @@ impl GlStack {
                 frame_ubo: 0,
                 round_ubo: 0,
                 frame_viewport: (0.0, 0.0),
+                #[cfg(feature = "3d")]
+                world_fns: resolve_world(egl),
             };
             if kind == TargetKind::Offscreen {
                 stack.finish_pipelines()?;
@@ -867,6 +940,7 @@ impl GlStack {
         corner_mask: Option<f64>,
         glass: Option<&GlassTargets>,
         target_fbo: u32,
+        worlds: &[Option<(u32, u32)>],
     ) {
         unsafe {
             // a pane READS the scene, and no pass samples the target it
@@ -958,15 +1032,18 @@ impl GlStack {
                         }
                         // handled above, in a pass of its own
                         RunKind::Glass => continue,
-                        // this tier has no world pass yet: its ground
-                        // opens no world door, and the walk shows the
-                        // oracle's picture
-                        RunKind::World(_) => continue,
+                        // a world's target, composited with the box's
+                        // veil and its clip: the sprite's road
+                        RunKind::World(index) => {
+                            let Some(Some((program, _))) = worlds.get(index as usize) else { continue };
+                            (gl.use_program)(*program);
+                            (gl.bind_vertex_array)(self.vao_sprite);
+                        }
                     }
                 }
                 match run.kind {
                     // handled above, in a pass of its own
-                    RunKind::Glass | RunKind::World(_) => continue,
+                    RunKind::Glass => continue,
                     RunKind::Rects => {
                         // the run's base = the byte offset every attrib
                         // pointer carries — the SV_InstanceID trap of
@@ -975,19 +1052,23 @@ impl GlStack {
                         let base = run.base as usize * std::mem::size_of::<RectInstance>();
                         rect_attribs(gl, base);
                     }
-                    RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) => {
-                        (gl.bind_buffer)(GL_ARRAY_BUFFER, slot.sprites.buffer);
-                        let base = run.base as usize * std::mem::size_of::<SpriteInstance>();
-                        sprite_attribs(gl, base);
-                        // the shared atlas, or the run's own dedicated or
+                    RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) | RunKind::World(_) => {
+                        // the shared atlas, the run's own dedicated or
                         // live texture (the walk's handles ARE gl texture
-                        // names on this tier)
+                        // names on this tier), or a world's target
                         let texture = match run.kind {
                             RunKind::Texture(index) | RunKind::Live(index) => {
                                 textures[index as usize] as u32
                             }
+                            RunKind::World(index) => {
+                                let Some(Some((_, texture))) = worlds.get(index as usize) else { continue };
+                                *texture
+                            }
                             _ => atlas_texture,
                         };
+                        (gl.bind_buffer)(GL_ARRAY_BUFFER, slot.sprites.buffer);
+                        let base = run.base as usize * std::mem::size_of::<SpriteInstance>();
+                        sprite_attribs(gl, base);
                         if bound_texture != Some(texture) {
                             (gl.active_texture)(GL_TEXTURE0);
                             (gl.bind_texture)(GL_TEXTURE_2D, texture);
@@ -1316,6 +1397,9 @@ unsafe fn make_texture(
 struct GlGround<'a> {
     gl: &'a GlFns,
     shared: &'a mut Option<u32>,
+    /// The world pass, when the driver answers its verbs.
+    #[cfg(feature = "3d")]
+    world: Option<&'a mut GlWorld<Gl33>>,
 }
 
 impl AtlasGround for GlGround<'_> {
@@ -1402,6 +1486,290 @@ impl AtlasGround for GlGround<'_> {
         let texture = id as u32;
         unsafe { (self.gl.delete_textures)(1, &texture) };
     }
+
+    #[cfg(feature = "3d")]
+    fn world(&mut self) -> Option<&mut dyn bunny_ui::gpu::world::WorldGround> {
+        let world = self.world.as_deref_mut()?;
+        let refused = world.failed();
+        if world.door().is_none() {
+            if !refused && world.failed() {
+                eprintln!("bunny_ui gl: the world shaders did not build — worlds draw on the cpu: {}", world.gl.log.trim());
+            }
+            return None;
+        }
+        world.door()
+    }
+}
+
+// MARK: - The world pass (the GL family's, over this tier's pointers)
+
+#[cfg(feature = "3d")]
+use bunny_ui::gpu::gl_world::{GlFamily, GlWorld};
+
+#[cfg(feature = "3d")]
+const GL_RENDERBUFFER: GlEnum = 0x8D41;
+#[cfg(feature = "3d")]
+const GL_DEPTH_BUFFER_BIT: u32 = 0x0100;
+
+/// The 2D pass's blend, put back after each world pass.
+#[cfg(feature = "3d")]
+const BLEND_2D: [u32; 4] = [GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA];
+
+/// GL 3.3 as the world pass speaks it: each verb of [`GlFamily`] is one
+/// call through the tables above.
+#[cfg(feature = "3d")]
+struct Gl33 {
+    gl: GlFns,
+    world: GlWorldFns,
+    /// The driver's last complaint about a program.
+    log: String,
+}
+
+#[cfg(feature = "3d")]
+impl Gl33 {
+    /// The world pass over this context, or none when a verb is missing.
+    fn pass(gl: &GlFns, world: Option<GlWorldFns>) -> Option<GlWorld<Gl33>> {
+        world.map(|world| GlWorld::new(Gl33 { gl: *gl, world, log: String::new() }, BLEND_2D, 4))
+    }
+}
+
+#[cfg(feature = "3d")]
+impl GlFamily for Gl33 {
+    fn prelude(&self) -> &'static str {
+        SHADER_PRELUDE
+    }
+
+    fn program(&mut self, vertex: &str, fragment: &str, attributes: &[&str], blocks: &[(&str, u32)]) -> Result<u32, String> {
+        let names: Vec<CString> = attributes.iter().map(|name| CString::new(*name).expect("attribute name")).collect();
+        let names: Vec<&std::ffi::CStr> = names.iter().map(CString::as_c_str).collect();
+        let program = unsafe { build_program(&self.gl, &[vertex], &[fragment], &names) }.inspect_err(|log| self.log = log.clone())?;
+        for (name, binding) in blocks {
+            let name = CString::new(*name).expect("block name");
+            unsafe {
+                let index = (self.gl.get_uniform_block_index)(program, name.as_ptr());
+                if index != u32::MAX {
+                    (self.gl.uniform_block_binding)(program, index, *binding);
+                }
+            }
+        }
+        Ok(program)
+    }
+
+    // GL's −1 is "none" and 0 a real place; the family's 0 is none
+    fn uniform_location(&mut self, program: u32, name: &str) -> u32 {
+        let name = CString::new(name).expect("uniform name");
+        let at = unsafe { (self.gl.get_uniform_location)(program, name.as_ptr()) };
+        (at + 1) as u32
+    }
+
+    fn use_program(&mut self, program: u32) {
+        unsafe { (self.gl.use_program)(program) }
+    }
+
+    fn uniform1i(&mut self, location: u32, value: i32) {
+        unsafe { (self.gl.uniform1i)(location as i32 - 1, value) }
+    }
+
+    fn uniform4fv(&mut self, location: u32, values: &[[f32; 4]]) {
+        unsafe { (self.world.uniform4fv)(location as i32 - 1, values.len() as i32, values.as_ptr().cast()) }
+    }
+
+    fn create_buffer(&mut self) -> u32 {
+        let mut buffer = 0;
+        unsafe { (self.gl.gen_buffers)(1, &mut buffer) };
+        buffer
+    }
+
+    fn delete_buffer(&mut self, buffer: u32) {
+        unsafe { (self.world.delete_buffers)(1, &buffer) }
+    }
+
+    fn bind_buffer(&mut self, target: u32, buffer: u32) {
+        unsafe { (self.gl.bind_buffer)(target, buffer) }
+    }
+
+    fn buffer_data(&mut self, target: u32, bytes: &[u8], usage: u32) {
+        let data = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr().cast() };
+        unsafe { (self.gl.buffer_data)(target, bytes.len() as isize, data, usage) }
+    }
+
+    fn bind_buffer_base(&mut self, target: u32, index: u32, buffer: u32) {
+        unsafe { (self.gl.bind_buffer_base)(target, index, buffer) }
+    }
+
+    fn create_vertex_array(&mut self) -> u32 {
+        let mut array = 0;
+        unsafe { (self.gl.gen_vertex_arrays)(1, &mut array) };
+        array
+    }
+
+    fn delete_vertex_array(&mut self, array: u32) {
+        unsafe { (self.world.delete_vertex_arrays)(1, &array) }
+    }
+
+    fn bind_vertex_array(&mut self, array: u32) {
+        unsafe { (self.gl.bind_vertex_array)(array) }
+    }
+
+    fn enable_vertex_attrib_array(&mut self, index: u32) {
+        unsafe { (self.gl.enable_vertex_attrib_array)(index) }
+    }
+
+    fn vertex_attrib_pointer(&mut self, index: u32, size: i32, kind: u32, normalized: bool, stride: i32, offset: usize) {
+        unsafe { (self.gl.vertex_attrib_pointer)(index, size, kind, normalized as u8, stride, offset as *const c_void) }
+    }
+
+    fn vertex_attrib_i_pointer(&mut self, index: u32, size: i32, kind: u32, stride: i32, offset: usize) {
+        unsafe { (self.world.vertex_attrib_i_pointer)(index, size, kind, stride, offset as *const c_void) }
+    }
+
+    fn vertex_attrib_divisor(&mut self, index: u32, divisor: u32) {
+        unsafe { (self.gl.vertex_attrib_divisor)(index, divisor) }
+    }
+
+    fn create_texture(&mut self) -> u32 {
+        let mut texture = 0;
+        unsafe { (self.gl.gen_textures)(1, &mut texture) };
+        texture
+    }
+
+    fn delete_texture(&mut self, texture: u32) {
+        unsafe { (self.gl.delete_textures)(1, &texture) }
+    }
+
+    fn active_texture(&mut self, unit: u32) {
+        unsafe { (self.gl.active_texture)(unit) }
+    }
+
+    fn bind_texture(&mut self, texture: u32) {
+        unsafe { (self.gl.bind_texture)(GL_TEXTURE_2D, texture) }
+    }
+
+    fn tex_parameteri(&mut self, name: u32, value: i32) {
+        unsafe { (self.gl.tex_parameteri)(GL_TEXTURE_2D, name, value) }
+    }
+
+    fn tex_image_2d(&mut self, level: i32, internal: u32, width: i32, height: i32, format: u32, kind: u32, bytes: &[u8]) {
+        let data = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr().cast() };
+        unsafe { (self.gl.tex_image_2d)(GL_TEXTURE_2D, level, internal as i32, width, height, 0, format, kind, data) }
+    }
+
+    fn create_framebuffer(&mut self) -> u32 {
+        let mut framebuffer = 0;
+        unsafe { (self.gl.gen_framebuffers)(1, &mut framebuffer) };
+        framebuffer
+    }
+
+    fn delete_framebuffer(&mut self, framebuffer: u32) {
+        unsafe { (self.gl.delete_framebuffers)(1, &framebuffer) }
+    }
+
+    fn bind_framebuffer(&mut self, target: u32, framebuffer: u32) {
+        unsafe { (self.gl.bind_framebuffer)(target, framebuffer) }
+    }
+
+    fn framebuffer_texture_2d(&mut self, attachment: u32, texture: u32) {
+        unsafe { (self.gl.framebuffer_texture_2d)(GL_FRAMEBUFFER, attachment, GL_TEXTURE_2D, texture, 0) }
+    }
+
+    fn framebuffer_renderbuffer(&mut self, attachment: u32, renderbuffer: u32) {
+        unsafe { (self.world.framebuffer_renderbuffer)(GL_FRAMEBUFFER, attachment, GL_RENDERBUFFER, renderbuffer) }
+    }
+
+    fn check_framebuffer_status(&mut self) -> u32 {
+        unsafe { (self.gl.check_framebuffer_status)(GL_FRAMEBUFFER) }
+    }
+
+    fn create_renderbuffer(&mut self) -> u32 {
+        let mut renderbuffer = 0;
+        unsafe { (self.world.gen_renderbuffers)(1, &mut renderbuffer) };
+        renderbuffer
+    }
+
+    fn delete_renderbuffer(&mut self, renderbuffer: u32) {
+        unsafe { (self.world.delete_renderbuffers)(1, &renderbuffer) }
+    }
+
+    fn renderbuffer_storage(&mut self, renderbuffer: u32, samples: i32, internal: u32, width: i32, height: i32) {
+        unsafe {
+            (self.world.bind_renderbuffer)(GL_RENDERBUFFER, renderbuffer);
+            (self.world.renderbuffer_storage_multisample)(GL_RENDERBUFFER, samples, internal, width, height);
+        }
+    }
+
+    fn blit_color(&mut self, width: i32, height: i32) {
+        unsafe { (self.world.blit_framebuffer)(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST as GlEnum) }
+    }
+
+    fn invalidate_framebuffer(&mut self, target: u32, first: u32, second: u32) {
+        let Some(invalidate) = self.world.invalidate_framebuffer else { return };
+        let attachments: Vec<GlEnum> = [first, second].into_iter().filter(|attachment| *attachment != 0).collect();
+        unsafe { invalidate(target, attachments.len() as i32, attachments.as_ptr()) }
+    }
+
+    fn viewport(&mut self, width: i32, height: i32) {
+        unsafe { (self.gl.viewport)(0, 0, width, height) }
+    }
+
+    fn enable(&mut self, capability: u32) {
+        unsafe { (self.gl.enable)(capability) }
+    }
+
+    fn disable(&mut self, capability: u32) {
+        unsafe { (self.gl.disable)(capability) }
+    }
+
+    fn depth_func(&mut self, function: u32) {
+        unsafe { (self.world.depth_func)(function) }
+    }
+
+    fn depth_mask(&mut self, write: bool) {
+        unsafe { (self.world.depth_mask)(write as u8) }
+    }
+
+    fn blend_func_separate(&mut self, source_rgb: u32, destination_rgb: u32, source_alpha: u32, destination_alpha: u32) {
+        unsafe { (self.gl.blend_func_separate)(source_rgb, destination_rgb, source_alpha, destination_alpha) }
+    }
+
+    fn cull_face(&mut self, face: u32) {
+        unsafe { (self.world.cull_face)(face) }
+    }
+
+    fn front_face(&mut self, winding: u32) {
+        unsafe { (self.world.front_face)(winding) }
+    }
+
+    fn clear(&mut self, color: [f32; 4], depth: f32) {
+        unsafe {
+            (self.gl.clear_color)(color[0], color[1], color[2], color[3]);
+            (self.world.clear_depth)(depth as f64);
+            (self.gl.clear)(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        }
+    }
+
+    fn draw_arrays(&mut self, mode: u32, first: i32, count: i32) {
+        unsafe { (self.gl.draw_arrays)(mode, first, count) }
+    }
+
+    fn draw_arrays_instanced(&mut self, mode: u32, first: i32, count: i32, instances: i32) {
+        unsafe { (self.gl.draw_arrays_instanced)(mode, first, count, instances) }
+    }
+
+    fn draw_elements_instanced(&mut self, mode: u32, count: i32, kind: u32, offset: usize, instances: i32) {
+        unsafe { (self.world.draw_elements_instanced)(mode, count, kind, offset as *const c_void, instances) }
+    }
+
+    fn read_pixels(&mut self, width: i32, height: i32, out: &mut [u8]) {
+        unsafe { (self.gl.read_pixels)(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, out.as_mut_ptr().cast()) }
+    }
+}
+
+/// What the 2D pass composites each world run with: the program and the
+/// target's texture, by the index the run carries.
+#[cfg(feature = "3d")]
+fn composites(world: Option<&GlWorld<Gl33>>, handles: &[u64]) -> Vec<Option<(u32, u32)>> {
+    let Some(world) = world else { return Vec::new() };
+    handles.iter().map(|handle| world.composite(*handle)).collect()
 }
 
 // MARK: - The glass targets (the scene, and the pyramid it blurs into)
@@ -1673,6 +2041,10 @@ struct GlPresenter {
     /// that carries glass and remade whenever the buffer resizes. A
     /// window that never shows glass never allocates them.
     glass: Option<GlassTargets>,
+    /// The world pass: its programs are built the first time a box
+    /// paints a world.
+    #[cfg(feature = "3d")]
+    world: Option<GlWorld<Gl33>>,
 }
 
 impl GlPresenter {
@@ -1748,7 +2120,12 @@ impl GlPresenter {
         images: &dyn ImageEngine,
     ) {
         for attempt in 0..3 {
-            let mut ground = GlGround { gl: &self.stack.gl, shared: &mut self.shared };
+            let mut ground = GlGround {
+                gl: &self.stack.gl,
+                shared: &mut self.shared,
+                #[cfg(feature = "3d")]
+                world: self.world.as_mut(),
+            };
             match build_frame(
                 &mut ground,
                 display,
@@ -1768,8 +2145,12 @@ impl GlPresenter {
                         return;
                     }
                     drain_slots(&self.stack.gl, &mut self.slots);
-                    let mut ground =
-                        GlGround { gl: &self.stack.gl, shared: &mut self.shared };
+                    let mut ground = GlGround {
+                        gl: &self.stack.gl,
+                        shared: &mut self.shared,
+                        #[cfg(feature = "3d")]
+                        world: None,
+                    };
                     self.atlas.reset(&mut ground, true);
                 }
             }
@@ -1837,6 +2218,20 @@ impl GlPresenter {
         // a frame with glass needs a scene of its own to read; a frame
         // without one never asks for the textures
         self.ensure_glass(physical);
+        // the worlds that moved, each into its own target, before the 2D
+        // pass samples them
+        #[cfg(feature = "3d")]
+        let worlds = {
+            if let Some(world) = &mut self.world
+                && !self.batches.worlds.is_empty()
+            {
+                world.encode(&self.batches.worlds);
+                self.atlas.worlds.drawn();
+            }
+            composites(self.world.as_ref(), &self.batches.world_targets)
+        };
+        #[cfg(not(feature = "3d"))]
+        let worlds = Vec::new();
         unsafe {
             (self.stack.gl.bind_framebuffer)(GL_FRAMEBUFFER, 0);
             let glass = (!self.batches.glass.is_empty()).then_some(()).and(self.glass.as_ref());
@@ -1851,6 +2246,7 @@ impl GlPresenter {
                 corner_mask,
                 glass,
                 0,
+                &worlds,
             );
         }
         // the map dance holds: buffer scale and the frame callback go
@@ -1962,6 +2358,8 @@ fn install(window: usize) -> Option<GlPresenter> {
         }
         Some(GlPresenter {
             window,
+            #[cfg(feature = "3d")]
+            world: Gl33::pass(&stack.gl, stack.world_fns),
             stack,
             egl_surface,
             native_window,
@@ -2111,6 +2509,8 @@ pub struct OffscreenGl {
     /// The scene texture and the blur pyramid, made on the first frame
     /// that carries glass.
     glass: Option<GlassTargets>,
+    #[cfg(feature = "3d")]
+    world: Option<GlWorld<Gl33>>,
 }
 
 impl OffscreenGl {
@@ -2145,6 +2545,8 @@ impl OffscreenGl {
             (framebuffer, target)
         };
         Some(OffscreenGl {
+            #[cfg(feature = "3d")]
+            world: Gl33::pass(&stack.gl, stack.world_fns),
             stack,
             framebuffer,
             target,
@@ -2179,7 +2581,12 @@ impl OffscreenGl {
         wait: bool,
     ) {
         for attempt in 0..3 {
-            let mut ground = GlGround { gl: &self.stack.gl, shared: &mut self.shared };
+            let mut ground = GlGround {
+                gl: &self.stack.gl,
+                shared: &mut self.shared,
+                #[cfg(feature = "3d")]
+                world: self.world.as_mut(),
+            };
             match build_frame(
                 &mut ground,
                 display,
@@ -2197,8 +2604,12 @@ impl OffscreenGl {
                         break;
                     }
                     drain_slots(&self.stack.gl, &mut self.slots);
-                    let mut ground =
-                        GlGround { gl: &self.stack.gl, shared: &mut self.shared };
+                    let mut ground = GlGround {
+                        gl: &self.stack.gl,
+                        shared: &mut self.shared,
+                        #[cfg(feature = "3d")]
+                        world: None,
+                    };
                     self.atlas.reset(&mut ground, true);
                 }
             }
@@ -2212,6 +2623,18 @@ impl OffscreenGl {
                 GlassTargets::new(&self.stack.gl, (self.width as u32, self.height as u32))
             };
         }
+        #[cfg(feature = "3d")]
+        let worlds = {
+            if let Some(world) = &mut self.world
+                && !self.batches.worlds.is_empty()
+            {
+                world.encode(&self.batches.worlds);
+                self.atlas.worlds.drawn();
+            }
+            composites(self.world.as_ref(), &self.batches.world_targets)
+        };
+        #[cfg(not(feature = "3d"))]
+        let worlds = Vec::new();
         unsafe {
             (self.stack.gl.bind_framebuffer)(GL_FRAMEBUFFER, self.framebuffer);
             let glass = (!self.batches.glass.is_empty()).then_some(()).and(self.glass.as_ref());
@@ -2226,6 +2649,7 @@ impl OffscreenGl {
                 None,
                 glass,
                 self.framebuffer,
+                &worlds,
             );
         }
         mark_in_flight(&self.stack.gl, &mut self.slots[index]);
@@ -2276,6 +2700,27 @@ impl OffscreenGl {
     #[cfg(test)]
     fn atlas_footprint(&self) -> (usize, u32) {
         self.atlas.footprint()
+    }
+
+    /// One world frame drawn by the world pass alone and read back:
+    /// premultiplied, sRGB-encoded RGBA8, the top row first — what the
+    /// CPU's `soft::draw` gives for the same frame. `None` when the world
+    /// pass cannot stand on this context.
+    #[cfg(feature = "3d")]
+    pub fn world_rgba(&mut self, frame: &std::rc::Rc<bunny_ui::world::WorldFrame>) -> Option<Vec<u8>> {
+        self.world_rgba_with(frame, &bunny_ui::image_engine::RawImages::default())
+    }
+
+    /// [`OffscreenGl::world_rgba`] with textures, decoded by `images`.
+    #[cfg(feature = "3d")]
+    pub fn world_rgba_with(&mut self, frame: &std::rc::Rc<bunny_ui::world::WorldFrame>, images: &dyn ImageEngine) -> Option<Vec<u8>> {
+        self.world.as_mut()?.draw_single(frame, images)
+    }
+
+    /// How many worlds the last frame drew: a held picture draws none.
+    #[cfg(feature = "3d")]
+    pub fn world_jobs(&self) -> usize {
+        self.batches.worlds.len()
     }
 
     /// The rendered bytes, R,G,B,A per pixel — the same order as the
@@ -3092,5 +3537,169 @@ mod tests {
         // that already carries the lower one's own difference
         let (worst, share) = glass_gate((6, 0.015), (16, 0.15));
         assert_glass_close(&gpu, &cpu, worst, share, "stacked panes");
+    }
+}
+
+// MARK: - World tests (the GL family's pass against the oracle)
+
+#[cfg(all(test, feature = "3d"))]
+mod world_tests {
+    use std::rc::Rc;
+
+    use bunny_ui::gpu::world_scenes::{COUNT, Spread, world_scene};
+    use bunny_ui::image_engine::RawImages;
+    use bunny_ui::layout::Color;
+    use bunny_ui::world::soft::{draw, draw_with};
+    use bunny_ui::world::texture::texture_of;
+    use bunny_ui::world::{Background, Camera, Material, Mesh, Quality, Vec3, World, WorldFrame, WorldStyle, vec3};
+
+    use super::OffscreenGl;
+
+    /// The harness, or `None` on a machine with no GL at all (llvmpipe
+    /// makes one almost everywhere).
+    fn harness() -> Option<OffscreenGl> {
+        let gpu = OffscreenGl::new(8, 8);
+        match &gpu {
+            Some(gpu) => eprintln!("gl world renderer: {}", gpu.renderer()),
+            None => eprintln!("no gl context — skipping"),
+        }
+        gpu
+    }
+
+    /// Writes both pictures as raw RGBA when `BUNNY_WORLD_DUMP` names a
+    /// folder — for a person to look at, never for the test to read.
+    fn dump(name: &str, size: (u32, u32), ours: &[u8], oracle: &[u8]) {
+        if let Ok(folder) = std::env::var("BUNNY_WORLD_DUMP") {
+            let folder = std::path::Path::new(&folder);
+            let _ = std::fs::write(folder.join(format!("{name}-gl-{}x{}.rgba", size.0, size.1)), ours);
+            let _ = std::fs::write(folder.join(format!("{name}-oracle-{}x{}.rgba", size.0, size.1)), oracle);
+        }
+    }
+
+    #[test]
+    fn every_world_of_the_catalog_matches_the_oracle() {
+        let Some(mut gpu) = harness() else { return };
+        let images = RawImages::default();
+        for index in 0..COUNT {
+            let scene = world_scene(index);
+            let frame = &scene.frame;
+            let ours = gpu.world_rgba_with(frame, &images).expect("the world pass");
+            let oracle = draw_with(frame, &|at| texture_of(&images, &frame.textures[at])).rgba;
+            dump(&format!("catalog-{index}"), frame.size, &ours, &oracle);
+            let s = Spread::of(&ours, &oracle);
+            eprintln!("{}: worst {} · >1 {} · >3 {} · >16 {} of {}", scene.name, s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
+            assert!(s.within(scene.tolerance), "{} is beyond its tolerance", scene.name);
+        }
+    }
+
+    #[test]
+    fn four_samples_soften_the_edges_and_keep_the_faces() {
+        let Some(mut gpu) = harness() else { return };
+        let world = World::new();
+        world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(222, 120, 60)));
+        let style = WorldStyle { background: Background::Color(Color::rgb(236, 233, 226)), quality: Quality::Medium, ..WorldStyle::default() };
+        let frame = Rc::new(world.frame(&Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0), &style, (160, 120), 1.0));
+        assert_eq!(frame.samples, 4);
+        let ours = gpu.world_rgba(&frame).expect("the world pass");
+        let oracle = draw(&frame).rgba;
+        let s = Spread::of(&ours, &oracle);
+        eprintln!("4×: worst {} · >1 {} · >3 {} · >16 {} of {}", s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
+        // the oracle takes one sample: only the edges may move, and they do
+        assert!(s.beyond[2] > 0, "multisampling changed no edge");
+        assert!(s.beyond[2] as f64 / s.pixels as f64 <= 0.06);
+    }
+
+    #[test]
+    fn edges_on_turning_surfaces_stay_whole_and_hidden_ones_stay_hidden() {
+        use bunny_ui::layout::Size;
+        use bunny_ui::world::{LineStyle, vec2};
+        let Some(mut gpu) = harness() else { return };
+        let world = World::new();
+        world.add(Mesh::plane(16.0, 16.0), Material::color(Color::rgb(228, 224, 216)));
+        let outline = [vec2(0.0, 0.0), vec2(2.4, 0.0), vec2(2.4, 2.4), vec2(0.0, 2.4)];
+        let hole = [vec2(0.6, 0.6), vec2(1.8, 0.6), vec2(1.8, 1.8), vec2(0.6, 1.8)];
+        let ring = Mesh::extrude(&outline, &[&hole], 0.4);
+        let at = vec3(1.2, 0.0, -2.8);
+        world.add(ring.clone(), Material::color(Color::rgb(246, 244, 238))).set_position(at);
+        world.add_lines(ring.edges(30.0), LineStyle::solid(Color::rgb(20, 20, 24), 1.2)).set_position(at);
+        let camera = Camera::orbiting(vec3(0.0, 0.6, 0.0), 32.0, 24.0, 9.0);
+        let style = WorldStyle { background: Background::Color(Color::rgb(236, 233, 226)), quality: Quality::Low, ..WorldStyle::default() };
+        let frame: Rc<WorldFrame> = Rc::new(world.frame(&camera, &style, (480, 280), 1.0));
+        let ours = gpu.world_rgba(&frame).expect("the world pass");
+        let oracle = draw(&frame).rgba;
+        dump("ring", frame.size, &ours, &oracle);
+        let s = Spread::of(&ours, &oracle);
+        eprintln!("ring: worst {} · >1 {} · >3 {} · >16 {} of {}", s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
+        assert!(s.beyond[2] as f64 / s.pixels as f64 <= 0.001, "the edges agree with the oracle's");
+        let size = Size { width: 480.0, height: 280.0 };
+        let ink = |x: f64, y: f64| {
+            let i = ((y.floor() as usize) * 480 + x.floor() as usize) * 4;
+            ours[i] < 120
+        };
+        // the near edge of the hole, against a wall that faces away
+        let (from, to) = (camera.project(at + vec3(0.6, 0.4, 1.8), size).unwrap(), camera.project(at + vec3(1.8, 0.4, 1.8), size).unwrap());
+        for step in 2..39 {
+            let t = step as f64 / 40.0;
+            assert!(ink(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t), "a gap in the edge at {t}");
+        }
+        // the edge at the hole's far right corner, behind the ring
+        for y in [0.05, 0.15, 0.25] {
+            let p = camera.project(at + vec3(1.8, y, 0.6), size).unwrap();
+            assert!(!ink(p.x, p.y), "a hidden edge shows at height {y}");
+        }
+    }
+
+    /// A world in a box on a page: the 2D around it, the clip and the
+    /// veil, through the walk.
+    fn page(world: World, camera: bunny_ui::prelude::State<Camera>, veil: f64) -> impl bunny_ui::prelude::View {
+        use bunny_ui::prelude::*;
+        use bunny_ui::world::scene_view;
+        let style = WorldStyle { background: Background::Color(Color::rgb(236, 233, 226)), quality: Quality::Low, ..WorldStyle::default() };
+        vstack((text("above"), scene_view(world, camera).style(style).frame(80.0, 60.0).corner_radius(8.0).clipped().opacity(veil)))
+            .padding_length(6.0)
+    }
+
+    /// The same page drawn by the window's road on the GPU and by the
+    /// CPU, the GPU's own world pass held to the CPU's picture.
+    fn both(runtime: &bunny_ui::runtime::Runtime, root: &impl bunny_ui::prelude::View, gpu: &mut OffscreenGl) -> (Vec<u8>, Vec<u8>) {
+        use bunny_ui::layout::Size;
+        use bunny_ui::prelude::PixelFont;
+        let logical = Size { width: 100.0, height: 100.0 };
+        let display = runtime.display_frame(root, logical);
+        let canvas = Color::rgb(250, 250, 250);
+        let cpu = bunny_ui::raster::rasterize_with(&display, 200, 200, 2, canvas, &PixelFont, &RawImages::default()).to_rgba_bytes();
+        gpu.present_wait(&display, 2, canvas, &PixelFont, &RawImages::default());
+        (gpu.read_rgba(), cpu)
+    }
+
+    #[test]
+    fn a_world_in_a_page_matches_the_cpu_and_a_held_one_draws_nothing() {
+        use bunny_ui::prelude::State;
+        if harness().is_none() {
+            return;
+        }
+        let mut gpu = OffscreenGl::new(200, 200).expect("offscreen gpu");
+        let camera = State::new(Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0));
+        let world = World::new();
+        world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(222, 120, 60)));
+        world.add(Mesh::plane(6.0, 6.0), Material::color(Color::rgb(200, 196, 188))).set_position(vec3(0.0, -0.5, 0.0));
+        let runtime = bunny_ui::runtime::Runtime::new();
+        let (ours, cpu) = both(&runtime, &page(world, camera, 1.0), &mut gpu);
+        assert_eq!(gpu.world_jobs(), 1, "the first frame draws the world");
+        dump("page", (200, 200), &ours, &cpu);
+        let s = Spread::of(&ours, &cpu);
+        eprintln!("page: worst {} · >1 {} · >3 {} · >16 {} of {}", s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
+        assert!(s.worst <= 2, "the composite holds the CPU's picture");
+        // the same page again: the target holds the picture
+        let (again, _) = both(&runtime, &page(world, camera, 1.0), &mut gpu);
+        assert_eq!(gpu.world_jobs(), 0, "a held picture is not drawn again");
+        assert_eq!(again, ours);
+        // a veil rides the identity: composited thinner, never drawn again
+        let (veiled, cpu) = both(&runtime, &page(world, camera, 0.5), &mut gpu);
+        assert_eq!(gpu.world_jobs(), 0, "a fade draws no world");
+        let s = Spread::of(&veiled, &cpu);
+        eprintln!("veiled page: worst {} · >1 {} · >3 {} · >16 {} of {}", s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
+        assert!(s.worst <= 2, "the veil matches the CPU's");
+        assert_ne!(veiled, ours);
     }
 }

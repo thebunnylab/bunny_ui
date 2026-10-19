@@ -10,6 +10,10 @@ repository.workspace = true
 # back
 autoexamples = false
 
+[features]
+# Worlds in three dimensions, drawn by the GL 3.3 world pass.
+3d = ["bunny-ui/3d"]
+
 [dependencies]
 bunny-ui = { workspace = true, features = ["canvas", "gpu", "codec"] }
 bunny-ui-vulkan.workspace = true
@@ -89,6 +93,11 @@ path = "examples/table_window.rs"
 [[example]]
 name = "compose_window_linux"
 path = "examples/compose_window.rs"
+
+[[example]]
+name = "world_window_linux"
+path = "examples/world_window.rs"
+required-features = ["3d"]
 
 [[test]]
 name = "window_lifecycle"
