@@ -1,0 +1,191 @@
+[
+  {
+    "file": "crates/bunny_ui/src/dom.rs",
+    "range": [
+      357,
+      358
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/dom.rs",
+    "range": [
+      413,
+      413
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/dom.rs",
+    "range": [
+      439,
+      439
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/dom.rs",
+    "range": [
+      465,
+      465
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/dom.rs",
+    "range": [
+      811,
+      814
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/dom.rs",
+    "range": [
+      2179,
+      2182
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/dom.rs",
+    "range": [
+      4132,
+      4132
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/dom.rs",
+    "range": [
+      4587,
+      4589
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/dom.rs",
+    "range": [
+      4681,
+      4683
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/dom.rs",
+    "range": [
+      6840,
+      6840
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/ext.rs",
+    "range": [
+      331,
+      335
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/layout.rs",
+    "range": [
+      2373,
+      2374
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/layout.rs",
+    "range": [
+      2430,
+      2430
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/layout.rs",
+    "range": [
+      3136,
+      3155
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/layout.rs",
+    "range": [
+      3941,
+      3942
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/layout.rs",
+    "range": [
+      3956,
+      3956
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/layout.rs",
+    "range": [
+      3991,
+      3992
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/layout.rs",
+    "range": [
+      7331,
+      7331
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/layout.rs",
+    "range": [
+      7365,
+      7366
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/layout.rs",
+    "range": [
+      7555,
+      7555
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/layout.rs",
+    "range": [
+      8323,
+      8334
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/layout.rs",
+    "range": [
+      8455,
+      8466
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/lib.rs",
+    "range": [
+      48,
+      48
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/modifier.rs",
+    "range": [
+      944,
+      945
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/modifier.rs",
+    "range": [
+      1622,
+      1626
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/runtime.rs",
+    "range": [
+      5324,
+      5326
+    ]
+  },
+  {
+    "file": "crates/bunny_ui/src/ssr.rs",
+    "range": [
+      1083,
+      1085
+    ]
+  }
+]

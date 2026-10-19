@@ -1,0 +1,73 @@
+    Checking bunny-ui-core v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui)
+error: method `take_dirty_loops` is never used
+   --> crates/bunny_ui/src/anim.rs:448:19
+    |
+323 | impl Animator {
+    | ------------- method in this implementation
+...
+448 |     pub(crate) fn take_dirty_loops(&mut self) -> Vec<Rc<str>> {
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = note: `-D dead-code` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[expect(dead_code)]` or `#[allow(dead_code)]`
+
+error: struct `Painting` is never constructed
+    --> crates/bunny_ui/src/custom.rs:1237:8
+     |
+1237 | struct Painting<F>(F);
+     |        ^^^^^^^^
+
+error: method `has_island` is never used
+    --> crates/bunny_ui/src/dom.rs:1966:19
+     |
+1558 | impl DomLowering {
+     | ---------------- method in this implementation
+...
+1966 |     pub(crate) fn has_island(&self, id: u32) -> bool {
+     |                   ^^^^^^^^^^
+
+error: method `extend` is never used
+    --> crates/bunny_ui/src/layout.rs:3078:19
+     |
+2982 | impl DisplayList {
+     | ---------------- method in this implementation
+...
+3078 |     pub(crate) fn extend(&mut self, other: DisplayList) {
+     |                   ^^^^^^
+
+error: associated items `dialog_geometry`, `with_ink`, `with_capture`, and `take_capture` are never used
+    --> crates/bunny_ui/src/layout.rs:4123:19
+     |
+4121 | impl Placement {
+     | -------------- associated items in this implementation
+4122 |     /// Controllers declared inside an exact DOM subtree or canvas island.
+4123 |     pub(crate) fn dialog_geometry(
+     |                   ^^^^^^^^^^^^^^^
+...
+4160 |     pub(crate) fn with_ink(ink: Color) -> Placement {
+     |                   ^^^^^^^^
+...
+4167 |     pub(crate) fn with_capture(size: Size, ink: Color) -> Placement {
+     |                   ^^^^^^^^^^^^
+...
+4178 |     pub(crate) fn take_capture(&mut self) -> crate::dom::DomCapture {
+     |                   ^^^^^^^^^^^^
+
+error: fields `display`, `physical`, `scale`, `aligned`, and `paint` are never read
+  --> crates/bunny_ui/src/runtime.rs:85:5
+   |
+84 | struct LiveCell {
+   |        -------- fields in this struct
+85 |     display: Vec<crate::layout::DrawCommand>,
+   |     ^^^^^^^
+86 |     physical: (usize, usize),
+   |     ^^^^^^^^
+87 |     scale: usize,
+   |     ^^^^^
+88 |     aligned: bool,
+   |     ^^^^^^^
+89 |     /// Painted region relative to the visible box; retained for layout-only moves.
+90 |     paint: Rect,
+   |     ^^^^^
+
+error: could not compile `bunny-ui-core` (lib) due to 6 previous errors

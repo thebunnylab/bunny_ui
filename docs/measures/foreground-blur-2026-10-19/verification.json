@@ -1,0 +1,26 @@
+{
+  "task": "T2-STUDIO-183",
+  "source_revision": "b8c0e6ced1b564127722fc43f541d607263a3f1b",
+  "baseline_revision": "ab60478d11e6fc08f5118670917e884788654e19",
+  "result": "framework_regressions_passed_native_integration_pending",
+  "tests": {
+    "core_and_web_all_features": {
+      "passed": 1441,
+      "failed": 0,
+      "ignored": 59
+    },
+    "focused_public_runtime": 8
+  },
+  "gates": {
+    "native_production_clippy": "passed -D warnings; core and web all targets/all features",
+    "wasm_core_clippy": "passed -D warnings; nightly-2026-07-15, wasm32-unknown-unknown, all features, no deps",
+    "format": "new Rust files rustfmt; modified ranges formatted with pinned nightly; diff whitespace clean",
+    "javascript": "node --check canonical element glue passed; byte-identical shipped copies tested"
+  },
+  "qualifications": [
+    "The broader wasm web-adapter lint reports ten diagnostics in unchanged crates/bunny_ui_web/src/lib.rs. That Rust file is byte-identical to the baseline; this change only edits its JavaScript glue. The core wasm lane passes.",
+    "The extra no-default-feature strict core lint reports six dead-code diagnostics in existing methods/types; it is not a passed gate. Production strict native and core wasm gates pass.",
+    "Signed native corrected inspector and standalone painting are pending the combined T182/T183 Trinity integration. Native before captures remain attributed to Trinity05e87, hostBunnyad682 and projectBunny57aa3de.",
+    "DOM ABI advances to22 and every shipped mirror changes together. The preview protocol and project format do not change. Native platform hosts remain outside framework paint."
+  ]
+}
