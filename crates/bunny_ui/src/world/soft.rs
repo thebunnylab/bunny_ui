@@ -41,7 +41,7 @@ impl Picture {
     /// blends. A clear pixel becomes black and clear.
     pub fn unpremultiplied(&self) -> Vec<u8> {
         let mut out = self.rgba.clone();
-        for pixel in out.chunks_exact_mut(4) {
+        for pixel in out.as_chunks_mut::<4>().0 {
             let alpha = pixel[3] as u32;
             if alpha == 0 {
                 pixel[..3].fill(0);
@@ -79,9 +79,11 @@ pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Textu
                 let mesh = &frame.meshes[mesh as usize];
                 let corners = Corners::of(mesh);
                 let indices = &mesh.data().indices[first_index as usize..(first_index + index_count) as usize];
+                // an opaque surface steps back under the frame's edges
+                let bias = if blend == Blend::Replace { frame.face_bias } else { 0.0 };
                 for instance in &frame.instances[draw.first_instance as usize..(draw.first_instance + draw.instance_count) as usize] {
-                    let job = Job { frame, instance, cull_back, mirrored, blend, mask, texture: texture.as_deref() };
-                    for triangle in indices.chunks_exact(3) {
+                    let job = Job { frame, instance, cull_back, mirrored, blend, mask, bias, texture: texture.as_deref() };
+                    for triangle in indices.as_chunks::<3>().0 {
                         let vertices = [0, 1, 2].map(|k| corners.vertex(triangle[k] as usize, instance, &projection));
                         job.triangle(&mut target, vertices);
                     }
@@ -297,6 +299,8 @@ struct Job<'a> {
     mirrored: bool,
     blend: Blend,
     mask: bool,
+    /// How many pixels of its own depth slope the triangle steps back.
+    bias: f32,
     texture: Option<&'a Texture>,
 }
 
@@ -375,6 +379,19 @@ impl Job<'_> {
         let edges = [(p(&s1), p(&s2)), (p(&s2), p(&s0)), (p(&s0), p(&s1))];
         let owns = edges.map(|(a, b)| top_left(a, b));
         let inv_area = 1.0 / area as f64;
+        // the slope-scaled step back of a GPU: the steeper of the depth's
+        // two slopes on the screen, per pixel, times the bias
+        let step_back = if self.bias > 0.0 {
+            let (x1, y1) = ((s1.x - s0.x) as f64 / 256.0, (s1.y - s0.y) as f64 / 256.0);
+            let (x2, y2) = ((s2.x - s0.x) as f64 / 256.0, (s2.y - s0.y) as f64 / 256.0);
+            let (z1, z2) = ((s1.z - s0.z) as f64, (s2.z - s0.z) as f64);
+            let det = x1 * y2 - x2 * y1;
+            let dzdx = (z1 * y2 - z2 * y1) / det;
+            let dzdy = (z2 * x1 - z1 * x2) / det;
+            (self.bias as f64 * dzdx.abs().max(dzdy.abs())) as f32
+        } else {
+            0.0
+        };
         for py in y0..=y1 {
             for px in x0..=x1 {
                 let at = (px * 256 + 128, py * 256 + 128);
@@ -386,7 +403,13 @@ impl Job<'_> {
                 let z = lambda[0] * s0.z + lambda[1] * s1.z + lambda[2] * s2.z;
                 let index = (py as u32 * target.width + px as u32) as usize;
                 let opaque = self.blend == Blend::Replace;
-                if !(0.0..=1.0).contains(&z) || z >= target.depth[index] {
+                if !(0.0..=1.0).contains(&z) {
+                    continue;
+                }
+                // a surface that steps back stops short of the far plane: it
+                // stays in the picture, behind everything drawn nearer
+                let z = if self.bias > 0.0 { (z + step_back + DEPTH_TIE).min(DEPTH_CEILING) } else { z };
+                if z >= target.depth[index] {
                     continue;
                 }
                 let correct = |e: [i64; 3]| {
@@ -477,6 +500,16 @@ impl Job<'_> {
         Some([codes[0], codes[1], codes[2], (alpha * 255.0 + 0.5).floor()])
     }
 }
+
+/// The deepest a surface that steps back may go: the largest number
+/// below the far plane's 1.
+pub const DEPTH_CEILING: f32 = f32::from_bits(0x3F7F_FFFF);
+
+/// The constant part of a surface's step back, `2⁻²²` — four steps of a
+/// float depth near the far plane: it breaks the ties an edge and its
+/// surface are left in where the slope gives nothing, as the constant
+/// term of a GPU's depth bias does.
+pub const DEPTH_TIE: f32 = 2.384_185_8e-7;
 
 /// Snaps a pixel coordinate to 1/256, rounding half to even.
 fn snap(value: f32) -> i64 {
@@ -587,7 +620,7 @@ mod tests {
     use crate::world::camera::Camera;
     use crate::world::frame::{Background, Quality, WorldStyle};
     use crate::world::material::{LineDepth, LineStyle, Material};
-    use crate::world::math::{Plane, Vec3, vec3};
+    use crate::world::math::{Plane, Vec3, vec2, vec3};
     use crate::world::mesh::{Mesh, MeshData};
     use crate::world::store::World;
 
@@ -738,7 +771,63 @@ mod tests {
         // the same bytes on every machine: this number is the picture's
         // fingerprint, and a platform that rounds one pixel differently
         // fails here
-        assert_eq!(fnv(&first.rgba), 12_363_781_133_140_793_577, "the picture's fingerprint moved");
+        assert_eq!(fnv(&first.rgba), 15_732_496_699_468_962_662, "the picture's fingerprint moved");
+    }
+
+    /// A low square ring with a hole, its edges drawn, seen from above
+    /// and in front: the corners of the hole are where an edge meets a
+    /// surface that turns away, and where a hidden edge leaves a corner.
+    fn ring_with_edges() -> (World, Camera, Vec3) {
+        let world = World::new();
+        world.add(Mesh::plane(16.0, 16.0), Material::color(Color::rgb(228, 224, 216)));
+        let outline = [vec2(0.0, 0.0), vec2(2.4, 0.0), vec2(2.4, 2.4), vec2(0.0, 2.4)];
+        let hole = [vec2(0.6, 0.6), vec2(1.8, 0.6), vec2(1.8, 1.8), vec2(0.6, 1.8)];
+        let ring = Mesh::extrude(&outline, &[&hole], 0.4);
+        let at = vec3(1.2, 0.0, -2.8);
+        world.add(ring.clone(), Material::color(Color::rgb(246, 244, 238))).set_position(at);
+        world.add_lines(ring.edges(30.0), LineStyle::solid(Color::rgb(20, 20, 24), 1.2)).set_position(at);
+        (world, Camera::orbiting(vec3(0.0, 0.6, 0.0), 32.0, 24.0, 9.0), at)
+    }
+
+    fn ink(picture: &Picture, x: f64, y: f64, reach: i64) -> bool {
+        let (cx, cy) = (x.floor() as i64, y.floor() as i64);
+        (-reach..=reach).any(|dy| {
+            (-reach..=reach).any(|dx| {
+                let (px, py) = (cx + dx, cy + dy);
+                px >= 0 && py >= 0 && (px as u32) < picture.width && (py as u32) < picture.height && picture.at(px as u32, py as u32)[0] < 120
+            })
+        })
+    }
+
+    #[test]
+    fn an_edge_on_a_surface_that_turns_away_stays_whole() {
+        let (world, camera, at) = ring_with_edges();
+        let size = crate::layout::Size { width: 480.0, height: 280.0 };
+        let picture = world.render(&camera, &style(Background::Transparent), (480, 280), 1.0);
+        dump("ring", &picture);
+        // the near edge of the hole: the top on one side, a wall that faces
+        // away on the other
+        let from = camera.project(at + vec3(0.6, 0.4, 1.8), size).expect("in view");
+        let to = camera.project(at + vec3(1.8, 0.4, 1.8), size).expect("in view");
+        let steps = 40;
+        for step in 2..steps - 1 {
+            let t = step as f64 / steps as f64;
+            let (x, y) = (from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
+            assert!(ink(&picture, x, y, 0), "the edge has a gap at ({x:.1}, {y:.1})");
+        }
+    }
+
+    #[test]
+    fn an_edge_behind_a_surface_stays_hidden_up_to_its_corner() {
+        let (world, camera, at) = ring_with_edges();
+        let size = crate::layout::Size { width: 480.0, height: 280.0 };
+        let picture = world.render(&camera, &style(Background::Transparent), (480, 280), 1.0);
+        // the vertical edge at the hole's far right corner is behind the
+        // ring's right side all the way down
+        for y in [0.05, 0.15, 0.25] {
+            let p = camera.project(at + vec3(1.8, y, 0.6), size).expect("in view");
+            assert!(!ink(&picture, p.x, p.y, 0), "a hidden edge shows at height {y}");
+        }
     }
 
     #[test]

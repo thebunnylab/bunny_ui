@@ -217,7 +217,7 @@ pub(crate) fn world_raster(
     let picture = super::soft::draw_with(&frame, &|index| super::texture::texture_of(images, &frame.textures[index]));
     let mut rgba = picture.unpremultiplied();
     if veil < 255 {
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             pixel[3] = ((pixel[3] as u32 * veil as u32 + 127) / 255) as u8;
         }
     }

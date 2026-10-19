@@ -177,8 +177,8 @@ impl Model {
             }
             // a mirroring matrix turns the faces around: the corners turn back
             let mirrored = matrix.determinant() < 0.0;
-            for triangle in source.indices.chunks_exact(3) {
-                let [a, b, c] = [triangle[0], triangle[1], triangle[2]].map(|i| base + i);
+            for triangle in source.indices.as_chunks::<3>().0 {
+                let [a, b, c] = triangle.map(|i| base + i);
                 data.indices.extend_from_slice(&if mirrored { [a, c, b] } else { [a, b, c] });
             }
         }

@@ -142,12 +142,14 @@ struct LineStyle {
 };
 
 // what one draw adds: its first instance (the pass has no base
-// instance on every tier), its bits, and the planes the lines need
+// instance on every tier), its bits, the planes the lines need, and how
+// many pixels of its slope an opaque surface steps back under edges
 struct WorldDraw {
     uint first_instance;
     uint flags;
     float near;
     float far;
+    float4 bias;
 };
 
 constant uint DRAW_MASK = 1;
@@ -156,6 +158,8 @@ constant uint DRAW_REPLACE = 4;
 constant uint MATERIAL_UNLIT = 1;
 constant uint MATERIAL_MASK = 4;
 constant float LINE_PULL = 2.0e-3;
+constant float DEPTH_CEILING = as_type<float>(0x3F7FFFFFu);
+constant float DEPTH_TIE = 2.384185791015625e-7;
 constant uchar BAYER[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
 
 // MARK: - Bunny Lit v1 (bunny_ui::world::shade)
@@ -308,6 +312,9 @@ struct WorldVary {
     float2 uv;
     float4 color;
     float occlusion;
+    // the depth again, linear on the screen like the depth itself: what
+    // a stepped-back surface takes its slope from
+    float depth [[center_no_perspective]];
     uint material [[flat]];
     uint instance [[flat]];
 };
@@ -325,6 +332,7 @@ vertex WorldVary world_vertex(uint vid [[vertex_id]],
     float3 n = unfold_normal(v.normal);
     WorldVary out;
     out.position = u.clip_from_eye * float4(eye, 1.0);
+    out.depth = out.position.z / out.position.w;
     out.eye = eye;
     out.normal = float3(dot(instance.normal[0].xyz, n), dot(instance.normal[1].xyz, n), dot(instance.normal[2].xyz, n));
     out.uv = v.uv;
@@ -337,14 +345,9 @@ vertex WorldVary world_vertex(uint vid [[vertex_id]],
 
 // premultiplied codes over 255: the target's unorm write rounds them to
 // the byte the CPU computes
-fragment float4 world_fragment(WorldVary in [[stage_in]],
-                               bool front [[front_facing]],
-                               device const WorldMaterial* materials [[buffer(0)]],
-                               device const WorldInstance* instances [[buffer(1)]],
-                               constant WorldUniforms& u [[buffer(2)]],
-                               constant WorldDraw& draw [[buffer(3)]],
-                               texture2d<float> picture [[texture(0)]],
-                               sampler wrap [[sampler(0)]]) {
+static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* materials,
+                          device const WorldInstance* instances, constant WorldUniforms& u,
+                          constant WorldDraw& draw, texture2d<float> picture, sampler wrap) {
     float4 section = u.section;
     if (any(section != 0.0) && section.x * in.eye.x + section.y * in.eye.y + section.z * in.eye.z + section.w < 0.0) {
         discard_fragment();
@@ -389,6 +392,40 @@ fragment float4 world_fragment(WorldVary in [[stage_in]],
     float3 code = float3(encode_code(linear.r), encode_code(linear.g), encode_code(linear.b));
     float3 codes = clamp(floor(code * alpha + 0.5 + dither), 0.0, 255.0);
     return float4(codes, floor(alpha * 255.0 + 0.5)) / 255.0;
+}
+
+fragment float4 world_fragment(WorldVary in [[stage_in]],
+                               bool front [[front_facing]],
+                               device const WorldMaterial* materials [[buffer(0)]],
+                               device const WorldInstance* instances [[buffer(1)]],
+                               constant WorldUniforms& u [[buffer(2)]],
+                               constant WorldDraw& draw [[buffer(3)]],
+                               texture2d<float> picture [[texture(0)]],
+                               sampler wrap [[sampler(0)]]) {
+    return world_shade(in, front, materials, instances, u, draw, picture, wrap);
+}
+
+struct SteppedBack {
+    float4 color [[color(0)]];
+    float depth [[depth(greater)]];
+};
+
+// an opaque surface under edges steps back by its own slope, short of
+// the far plane: an edge drawn on it wins across its whole width
+fragment SteppedBack world_fragment_stepped(WorldVary in [[stage_in]],
+                                            bool front [[front_facing]],
+                                            device const WorldMaterial* materials [[buffer(0)]],
+                                            device const WorldInstance* instances [[buffer(1)]],
+                                            constant WorldUniforms& u [[buffer(2)]],
+                                            constant WorldDraw& draw [[buffer(3)]],
+                                            texture2d<float> picture [[texture(0)]],
+                                            sampler wrap [[sampler(0)]]) {
+    SteppedBack out;
+    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap);
+    float z = in.position.z;
+    float slope = max(abs(dfdx(in.depth)), abs(dfdy(in.depth)));
+    out.depth = min(z + draw.bias.x * slope + DEPTH_TIE, DEPTH_CEILING);
+    return out;
 }
 
 // MARK: - Lines (bunny_ui::world::soft::line)
@@ -568,9 +605,12 @@ struct DrawBlock {
     flags: u32,
     near: f32,
     far: f32,
+    /// `x`: how many pixels of its slope the surface steps back.
+    bias: [f32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<DrawBlock>() == 16);
+const DRAW_BLOCK: u64 = std::mem::size_of::<DrawBlock>() as u64;
+const _: () = assert!(DRAW_BLOCK == 32);
 
 /// The twin of `Backdrop` in the shader: codes, then the target's size.
 #[repr(C)]
@@ -586,7 +626,8 @@ struct BackdropBlock {
 /// How a pipeline meets the target.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Pipe {
-    Mesh(Blend),
+    /// A surface; `true` when it steps back under the frame's edges.
+    Mesh(Blend, bool),
     Lines,
     Backdrop,
 }
@@ -731,7 +772,8 @@ impl MetalWorld {
                         let texture = texture
                             .and_then(|index| job.textures.get(index as usize).copied().flatten())
                             .and_then(|id| self.textures.get(&id).copied());
-                        let pipeline = unsafe { stack.pipeline(self.device, Pipe::Mesh(blend), samples) };
+                        let bias = if blend == Blend::Replace { job.frame.face_bias } else { 0.0 };
+                        let pipeline = unsafe { stack.pipeline(self.device, Pipe::Mesh(blend, bias > 0.0), samples) };
                         if pipeline.is_null() {
                             continue;
                         }
@@ -757,7 +799,13 @@ impl MetalWorld {
                             index_count,
                             instance_count: draw.instance_count,
                             texture: texture.unwrap_or(stack.blank),
-                            block: DrawBlock { first_instance: draw.first_instance, flags, near: job.frame.near as f32, far: job.frame.far as f32 },
+                            block: DrawBlock {
+                                first_instance: draw.first_instance,
+                                flags,
+                                near: job.frame.near as f32,
+                                far: job.frame.far as f32,
+                                bias: [bias, 0.0, 0.0, 0.0],
+                            },
                         });
                     }
                     DrawKind::Lines { lines, style } => {
@@ -784,7 +832,13 @@ impl MetalWorld {
                             segments: buffer,
                             count,
                             style: bytes,
-                            block: DrawBlock { first_instance: draw.first_instance, flags: 0, near: job.frame.near as f32, far: job.frame.far as f32 },
+                            block: DrawBlock {
+                                first_instance: draw.first_instance,
+                                flags: 0,
+                                near: job.frame.near as f32,
+                                far: job.frame.far as f32,
+                                bias: [0.0; 4],
+                            },
                         });
                     }
                 }
@@ -910,12 +964,13 @@ impl WorldStack {
             return pipeline;
         }
         let (vertex, fragment) = match pipe {
-            Pipe::Mesh(_) => ("world_vertex", "world_fragment"),
+            Pipe::Mesh(_, false) => ("world_vertex", "world_fragment"),
+            Pipe::Mesh(_, true) => ("world_vertex", "world_fragment_stepped"),
             Pipe::Lines => ("line_vertex", "line_fragment"),
             Pipe::Backdrop => ("backdrop_vertex", "backdrop_fragment"),
         };
         let blend = match pipe {
-            Pipe::Mesh(blend) => blend,
+            Pipe::Mesh(blend, _) => blend,
             Pipe::Lines => Blend::Alpha,
             Pipe::Backdrop => Blend::Replace,
         };
@@ -1314,8 +1369,8 @@ impl FramePass {
                             msg_void_u64(encoder, world.set_winding, *winding);
                             msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, *vertices, 0, 0);
                             let block = (block as *const DrawBlock).cast();
-                            msg_void_ptr_u64_u64(encoder, sels.set_vertex_bytes, block, 16, 3);
-                            msg_void_ptr_u64_u64(encoder, sels.set_fragment_bytes, block, 16, 3);
+                            msg_void_ptr_u64_u64(encoder, sels.set_vertex_bytes, block, DRAW_BLOCK, 3);
+                            msg_void_ptr_u64_u64(encoder, sels.set_fragment_bytes, block, DRAW_BLOCK, 3);
                             msg_void_id_u64(encoder, sels.set_fragment_texture, *texture, 0);
                             msg_void_draw_indexed(
                                 encoder,
@@ -1334,8 +1389,8 @@ impl FramePass {
                             msg_void_u64(encoder, world.set_cull_mode, CULL_NONE);
                             msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, *segments, 0, 0);
                             let block = (block as *const DrawBlock).cast();
-                            msg_void_ptr_u64_u64(encoder, sels.set_vertex_bytes, block, 16, 3);
-                            msg_void_ptr_u64_u64(encoder, sels.set_fragment_bytes, block, 16, 3);
+                            msg_void_ptr_u64_u64(encoder, sels.set_vertex_bytes, block, DRAW_BLOCK, 3);
+                            msg_void_ptr_u64_u64(encoder, sels.set_fragment_bytes, block, DRAW_BLOCK, 3);
                             let style = style.as_ptr() as *const c_void;
                             msg_void_ptr_u64_u64(encoder, sels.set_vertex_bytes, style, 32, 4);
                             msg_void_ptr_u64_u64(encoder, sels.set_fragment_bytes, style, 32, 4);
@@ -1512,6 +1567,45 @@ mod tests {
         eprintln!("lines: worst {} · >1 {} · >3 {} · >16 {} of {}", s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
         assert!(share(s.beyond[1], s.pixels) <= 0.03);
         assert!(share(s.beyond[2], s.pixels) <= 0.015);
+    }
+
+    #[test]
+    fn edges_on_turning_surfaces_stay_whole_and_hidden_ones_stay_hidden() {
+        use bunny_ui::layout::Size;
+        use bunny_ui::world::vec2;
+        let Some(mut gpu) = harness() else { return };
+        let world = World::new();
+        world.add(Mesh::plane(16.0, 16.0), Material::color(Color::rgb(228, 224, 216)));
+        let outline = [vec2(0.0, 0.0), vec2(2.4, 0.0), vec2(2.4, 2.4), vec2(0.0, 2.4)];
+        let hole = [vec2(0.6, 0.6), vec2(1.8, 0.6), vec2(1.8, 1.8), vec2(0.6, 1.8)];
+        let ring = Mesh::extrude(&outline, &[&hole], 0.4);
+        let at = vec3(1.2, 0.0, -2.8);
+        world.add(ring.clone(), Material::color(Color::rgb(246, 244, 238))).set_position(at);
+        world.add_lines(ring.edges(30.0), LineStyle::solid(Color::rgb(20, 20, 24), 1.2)).set_position(at);
+        let camera = Camera::orbiting(vec3(0.0, 0.6, 0.0), 32.0, 24.0, 9.0);
+        let frame = frame_of(&world, &camera, Quality::Low, (480, 280));
+        let ours = gpu.world_rgba(&frame).expect("the world pass");
+        let oracle = draw(&frame).rgba;
+        dump("ring", frame.size, &ours, &oracle);
+        let s = spread(&ours, &oracle);
+        eprintln!("ring: worst {} · >1 {} · >3 {} · >16 {} of {}", s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
+        assert!(share(s.beyond[2], s.pixels) <= 0.001, "the edges agree with the oracle's");
+        let size = Size { width: 480.0, height: 280.0 };
+        let ink = |x: f64, y: f64| {
+            let i = ((y.floor() as usize) * 480 + x.floor() as usize) * 4;
+            ours[i] < 120
+        };
+        // the near edge of the hole, against a wall that faces away
+        let (from, to) = (camera.project(at + vec3(0.6, 0.4, 1.8), size).unwrap(), camera.project(at + vec3(1.8, 0.4, 1.8), size).unwrap());
+        for step in 2..39 {
+            let t = step as f64 / 40.0;
+            assert!(ink(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t), "a gap in the edge at {t}");
+        }
+        // the edge at the hole's far right corner, behind the ring
+        for y in [0.05, 0.15, 0.25] {
+            let p = camera.project(at + vec3(1.8, y, 0.6), size).unwrap();
+            assert!(!ink(p.x, p.y), "a hidden edge shows at height {y}");
+        }
     }
 
     #[test]

@@ -118,11 +118,10 @@ impl MeshData {
     pub fn with_flat_normals(&self) -> MeshData {
         let count = self.positions.len();
         let mut out = MeshData::default();
-        let triangles = self.indices.chunks_exact(3);
-        let corners = triangles.len() * 3;
+        let corners = self.indices.len() / 3 * 3;
         out.positions.reserve(corners);
         out.normals.reserve(corners);
-        for triangle in self.indices.chunks_exact(3) {
+        for triangle in self.indices.as_chunks::<3>().0 {
             if triangle.iter().any(|&i| i as usize >= count) {
                 continue;
             }
@@ -300,8 +299,8 @@ impl Mesh {
             places[place as usize] = data.positions[index];
         }
         let mut faces_at = std::collections::HashMap::<(u32, u32), Vec<Vec3>>::new();
-        for triangle in data.indices.chunks_exact(3) {
-            let corners = [triangle[0], triangle[1], triangle[2]].map(|i| welded[i as usize]);
+        for triangle in data.indices.as_chunks::<3>().0 {
+            let corners = triangle.map(|i| welded[i as usize]);
             if corners[0] == corners[1] || corners[1] == corners[2] || corners[0] == corners[2] {
                 continue;
             }
@@ -338,7 +337,9 @@ fn sanitize(mut data: MeshData) -> MeshData {
     if data.indices.iter().any(|&i| i as usize >= count) {
         let kept: Vec<u32> = data
             .indices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .filter(|t| t.iter().all(|&i| (i as usize) < count))
             .flatten()
             .copied()
@@ -353,7 +354,7 @@ fn sanitize(mut data: MeshData) -> MeshData {
     let count = data.positions.len();
     if data.materials.len() == count && data.materials.windows(2).any(|pair| pair[0] != pair[1]) {
         let material_of = |triangle: &[u32]| data.materials[triangle[0] as usize];
-        let mut triangles: Vec<[u32; 3]> = data.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
+        let mut triangles: Vec<[u32; 3]> = data.indices.as_chunks::<3>().0.to_vec();
         triangles.sort_by_key(|t| material_of(t));
         data.indices = triangles.into_iter().flatten().collect();
     }
@@ -366,7 +367,7 @@ fn sanitize(mut data: MeshData) -> MeshData {
 fn material_runs(data: &MeshData) -> Vec<(u8, u32, u32)> {
     let count = data.positions.len();
     let mut runs: Vec<(u8, u32, u32)> = Vec::new();
-    for (at, triangle) in data.indices.chunks_exact(3).enumerate() {
+    for (at, triangle) in data.indices.as_chunks::<3>().0.iter().enumerate() {
         let slot = if data.materials.len() == count { data.materials[triangle[0] as usize] } else { 0 };
         match runs.last_mut() {
             Some(run) if run.0 == slot => run.2 += 3,

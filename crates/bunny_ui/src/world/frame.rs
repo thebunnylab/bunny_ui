@@ -187,6 +187,11 @@ pub struct WorldFrame {
     /// The planes the projection uses, in meters from the eye.
     pub near: f64,
     pub far: f64,
+    /// How far each opaque surface is pushed back, in pixels of its own
+    /// depth slope, so an edge drawn on it wins across its whole width
+    /// even where the surface turns away from the eye. Zero when no
+    /// line of the frame meets the depth.
+    pub face_bias: f32,
 }
 
 impl WorldFrame {
@@ -202,6 +207,7 @@ impl WorldFrame {
         hasher.write(&super::wire::instance_bytes(&self.instances));
         hasher.write(&super::wire::material_bytes(&self.materials));
         hasher.write(&super::wire::line_style_bytes(&self.line_styles));
+        hasher.write_u32(self.face_bias.to_bits());
         for mesh in &self.meshes {
             hasher.write_u64(mesh.id());
             hasher.write_u64(mesh.generation());
@@ -265,6 +271,15 @@ fn material_data(material: &Material) -> MaterialData {
         params: [material.roughness, material.metallic, cutoff, flags as f32],
     }
 }
+
+/// The nearest a fitted near plane may come, as a share of the far
+/// plane: with a 24-bit or a float depth, two surfaces a few millimetres
+/// apart at the far end still draw in their order.
+const NEAR_PER_FAR: f64 = 1.0 / 2000.0;
+
+/// The steepest a depth slope reads across a pixel, against the slope
+/// along the axes: a diagonal is √2 longer.
+const FACE_BIAS_PER_PIXEL: f32 = std::f32::consts::SQRT_2;
 
 /// The studio light: a soft sky every world gets until it holds a sky of
 /// its own, and a key light from the upper left of the view for a world
@@ -351,7 +366,10 @@ pub(crate) fn build_frame(
         }
         (Some((near, far)), false) => {
             let far = (far * 1.01).max(1e-6);
-            (near.max(far * 1e-5) * 0.99, far)
+            // a floor that runs under the eye would pull the near plane to
+            // nothing, and the depth would lose every step it can tell
+            // apart: the near plane stays within a ratio of the far one
+            (near.max(far * NEAR_PER_FAR) * 0.99, far)
         }
     };
     if let Some(fixed) = camera.near {
@@ -379,6 +397,7 @@ pub(crate) fn build_frame(
         draws: Vec::new(),
         near,
         far,
+        face_bias: 0.0,
     };
 
     // models: one group per (mesh, materials, handedness), drawn instanced
@@ -508,6 +527,22 @@ pub(crate) fn build_frame(
             first_instance: frame.instances.len() as u32 - 1,
             instance_count: 1,
         });
+    }
+    // a line's solid core reaches half its width from its edge, and its
+    // soft rim half a pixel more: the surfaces under it step back as far
+    // as the core and a quarter of the rim, in their own slope, with room
+    // for a slope across the diagonal. A larger step would let hidden
+    // edges show near the corners they leave from
+    let widest = line_draws
+        .iter()
+        .filter(|draw| matches!(draw.pass, Pass::Lines | Pass::HiddenLines))
+        .filter_map(|draw| match draw.kind {
+            DrawKind::Lines { style, .. } => Some(frame.line_styles[style as usize].shape[0]),
+            DrawKind::Mesh { .. } => None,
+        })
+        .fold(None, |widest: Option<f32>, width| Some(widest.map_or(width, |w| w.max(width))));
+    if let Some(width) = widest {
+        frame.face_bias = (width * 0.5 + 0.25) * FACE_BIAS_PER_PIXEL;
     }
     // the farthest see-through surface first
     transparent.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -793,6 +828,38 @@ mod tests {
         let frame = build(&world, &Camera::orbiting(Vec3::ZERO, 0.0, 0.0, 6.0));
         assert_eq!(frame.uniforms.sky_color, [0.0; 4]);
         assert_eq!(frame.uniforms.ground_color, [0.0; 4]);
+    }
+
+    #[test]
+    fn a_floor_under_the_eye_keeps_the_near_plane_within_reach() {
+        let world = World::new();
+        world.add(Mesh::plane(400.0, 400.0), gray());
+        world.add(Mesh::cuboid(1.0, 1.0, 1.0), gray()).set_position(vec3(0.0, 0.5, 0.0));
+        let frame = build(&world, &Camera::orbiting(Vec3::ZERO, 30.0, 25.0, 6.0));
+        // the far corner of the floor is near 290 m away: the near plane
+        // stays a seventh of a metre out, where the depth still parts two
+        // surfaces a centimetre apart at that distance
+        assert!(frame.far > 250.0 && frame.near > 0.12, "near {} far {}", frame.near, frame.far);
+        // a box alone in view keeps the near plane it hugs
+        let world = World::new();
+        world.add(Mesh::cuboid(1.0, 1.0, 1.0), gray());
+        let frame = build(&world, &Camera::orbiting(Vec3::ZERO, 30.0, 25.0, 6.0));
+        assert!(frame.near > 5.0 && frame.near < 6.0, "near {}", frame.near);
+    }
+
+    #[test]
+    fn surfaces_step_back_only_under_edges_that_meet_the_depth() {
+        let world = World::new();
+        let cube = Mesh::cuboid(1.0, 1.0, 1.0);
+        world.add(cube.clone(), gray());
+        let camera = Camera::orbiting(Vec3::ZERO, 30.0, 25.0, 6.0);
+        assert_eq!(build(&world, &camera).face_bias, 0.0, "no edges, no step");
+        world.add_lines(cube.edges(30.0), LineStyle::solid(Color::rgb(0, 0, 0), 3.0).depth(LineDepth::Always));
+        assert_eq!(build(&world, &camera).face_bias, 0.0, "an overlay meets no depth");
+        world.add_lines(cube.edges(30.0), LineStyle::solid(Color::rgb(0, 0, 0), 1.5));
+        // `build` draws at two pixels a point: a 1.5 pt line is 3 px wide
+        let bias = build(&world, &camera).face_bias;
+        assert!((bias - (1.5 + 0.25) * std::f32::consts::SQRT_2).abs() < 1e-4, "{bias}");
     }
 
     #[test]

@@ -418,13 +418,13 @@ fn read(json: &Json, bin: Option<&[u8]>) -> Result<Asset, GltfError> {
                     slots.len() - 1
                 }
             };
-            data.positions.extend(positions.chunks_exact(3).map(|p| [p[0], p[1], p[2]]));
+            data.positions.extend(positions.as_chunks::<3>().0.iter().copied());
             let normals = match attribute("NORMAL") {
-                Some(index) => document.floats(index)?.0.chunks_exact(3).map(|n| [n[0], n[1], n[2]]).collect::<Vec<_>>(),
+                Some(index) => document.floats(index)?.0.as_chunks::<3>().0.to_vec(),
                 None => Vec::new(),
             };
             let uvs = match attribute("TEXCOORD_0") {
-                Some(index) => document.floats(index)?.0.chunks_exact(2).map(|t| [t[0], t[1]]).collect::<Vec<_>>(),
+                Some(index) => document.floats(index)?.0.as_chunks::<2>().0.to_vec(),
                 None => Vec::new(),
             };
             let colors = match attribute("COLOR_0") {
