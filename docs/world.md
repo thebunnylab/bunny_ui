@@ -30,7 +30,7 @@ The short door is a view:
 let world = World::new();
 world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(orange));
 world.add(Mesh::plane(8.0, 8.0), Material::color(paper)).set_position(vec3(0.0, -0.5, 0.0));
-world.add_light(Light::sun().toward(vec3(-1.0, -2.0, -1.5)));
+world.add_light(Light::sun().toward(vec3(-1.0, -2.0, -1.5)).with_shadows());
 
 scene_view(self.world, self.camera)      // camera: State<Camera>
     .orbit()                             // drag turns, shift pans, the wheel zooms
@@ -188,13 +188,41 @@ drawn again: a repeated frame, a fade, or a frame that changed only the
 go up once per identity and generation, and what no frame reads for a
 while is given back.
 
+## Shadows
+
+A sun casts shadows when it says so:
+
+```rust
+world.add_light(Light::sun().toward(vec3(-1.0, -2.0, -1.5)).with_shadows());
+```
+
+The first sun of a world is its sun; one sun casts. Every entity whose
+`casts_shadow` is true casts with its solid surfaces — opaque and
+cut-out ones; see-through and glowing ones let the light through. An
+entity out of view casts too: its shadow may fall into the view.
+
+The shadow is one map, fitted to what casts as the sun sees it, and it
+is CACHED: its generation hashes the casters, their meshes and the sun,
+and nothing else. A camera that pans, turns or zooms under a sun fixed
+to the world reads the map it has; the GPU draws the casters again
+only when one of them moves or the sun turns. A sun fixed to the view
+(`Sun::from_view`) turns with the camera, so a turn draws it again. The
+fit's side climbs a ladder of quarter octaves and its centre sits on
+its own texel grid: a caster that moves inside the fit moves no other
+shadow by a fraction of a texel.
+
+A surface reads the map at its own point, pushed off along its normal
+(further as it turns from the sun) and a step toward the sun, so it
+never shades itself. Each lookup compares four texels and blends the
+answers, as a comparing sampler does.
+
 ## Quality
 
-| | Samples | Pixel budget |
-|---|---|---|
-| `Quality::Low` | 1 | 1.2 million |
-| `Quality::Medium` (default) | 4 | 2.2 million |
-| `Quality::High` | 4 | 4 million |
+| | Samples | Pixel budget | Shadow map | Shadow lookups |
+|---|---|---|---|---|
+| `Quality::Low` | 1 | 1.2 million | 1024² | 1 |
+| `Quality::Medium` (default) | 4 | 2.2 million | 2048² | 4 |
+| `Quality::High` | 4 | 4 million | 2048² | 9 |
 
 A box inside the budget is drawn at its own size. A larger box is drawn
 smaller, and the compositor stretches it to the box.
@@ -208,9 +236,12 @@ colour blended as an 8-bit target blends it. Lines are quads of analytic
 coverage, pulled a hair toward the eye so an edge wins against its
 faces. Where a frame draws edges, each opaque surface also steps back
 by its own depth slope, so an edge on a surface that turns away from
-the eye stays whole across its width — and never past the far plane. Its shading uses `+ − × ÷`, `sqrt`, `floor` and fixed tables
-only: the same frame gives the same bytes on every machine, and a test
-pins the fingerprint of one picture.
+the eye stays whole across its width — and never past the far plane.
+It draws the sun's map by the same rules, into 16-bit depths, and reads
+it as a comparing sampler reads it, with the eight bits of blend a
+texture unit keeps. Its shading uses `+ − × ÷`, `sqrt`, `floor` and
+fixed tables only: the same frame gives the same bytes on every
+machine, and a test pins the fingerprint of one picture.
 
 `world.render(camera, style, size, scale)` draws a picture on the CPU —
 a thumbnail, an export, a test. `world.render_with(images, …)` decodes
@@ -232,7 +263,9 @@ Every malformed input is an error, never a panic.
   CPU: those roads rasterize their boxes. Paint a world on the frame's
   road.
 - Labels are painted text. A label that is a view comes later.
-- No shadows, no skins and no animation clips yet.
+- No skins and no animation clips yet.
+- A cut-out surface casts its whole shape: the shadow pass reads no
+  texture.
 - A model holds at most 256 materials.
 - The preview wire carries no picture of a world: a preview shows the
   box empty.
@@ -246,6 +279,6 @@ BUNNY_PARANOID=all cargo test -p bunny-ui-core --all-features
 cargo test -p bunny-ui-apple --features 3d
 cargo run -p bunny-ui-macos --features 3d --example world_window
 # in a page built with the web shell's `3d` feature, from the console:
-#   for (let n = 0; n < 6; n++) __bunny.bunny_gpu_world_parity(n)
+#   for (let n = 0; n < 9; n++) __bunny.bunny_gpu_world_parity(n)
 BUNNY_WORLD_GLB=chair.glb BUNNY_WORLD_DUMP=/tmp cargo test -p bunny-ui-core --features gltf --lib a_glb_from_the_environment -- --ignored
 ```
