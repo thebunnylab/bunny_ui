@@ -37,6 +37,14 @@ use crate::ffi::{
     Keyboard, PollFd, O_CLOEXEC, O_NONBLOCK, POLLIN,
 };
 
+#[path = "x11_window_ops.rs"]
+mod window_ops;
+pub use window_ops::{focus_window, set_window_parent};
+#[path = "x11_geometry_ops.rs"]
+mod geometry_ops;
+pub use geometry_ops::{dialog_geometry, restore_dialog_placement};
+pub use geometry_ops::{restore_window_placement, window_geometry};
+
 // MARK: - libc floor additions (SysV shared memory + free — the
 // wayland door never needed either; the rest borrows ffi's floor)
 
@@ -775,6 +783,7 @@ fn size_hints_min(width: u32, height: u32) -> [u32; 18] {
 
 /// Every atom this door speaks, interned in one batch at connect.
 pub(crate) struct Atoms {
+    pub(crate) net_active_window: u32,
     pub(crate) wm_protocols: u32,
     pub(crate) wm_delete_window: u32,
     pub(crate) net_wm_name: u32,
@@ -796,7 +805,7 @@ pub(crate) struct Atoms {
     pub(crate) net_wm_window_type_normal: u32,
 }
 
-const ATOM_NAMES: [&CStr; 16] = [
+const ATOM_NAMES: [&CStr; 17] = [
     c"WM_PROTOCOLS",
     c"WM_DELETE_WINDOW",
     c"_NET_WM_NAME",
@@ -813,6 +822,7 @@ const ATOM_NAMES: [&CStr; 16] = [
     c"WM_CHANGE_STATE",
     c"_NET_WM_WINDOW_TYPE",
     c"_NET_WM_WINDOW_TYPE_NORMAL",
+    c"_NET_ACTIVE_WINDOW",
 ];
 
 use std::ffi::CStr;
@@ -835,6 +845,7 @@ fn intern_atoms(connection: *mut Connection) -> Atoms {
         }
     }
     Atoms {
+        net_active_window: atoms[16],
         wm_protocols: atoms[0],
         wm_delete_window: atoms[1],
         net_wm_name: atoms[2],
@@ -3138,10 +3149,15 @@ fn interpret(event: *mut GenericEvent) -> Step {
                     dialog.granted = Some(granted);
                     dialog.asked = (width as usize, height as usize);
                 }
-                Some((owner, changed))
+                Some((index, owner, changed))
             });
-            if let Some((owner, changed)) = dialog {
-                return if changed { Step::Deliver(owner, AppEvent::Redraw) } else { Step::Silence };
+            if let Some((index, owner, changed)) = dialog {
+                crate::ffi::notify_dialog_geometry(index);
+                return if changed {
+                    Step::Deliver(owner, AppEvent::Redraw)
+                } else {
+                    Step::Silence
+                };
             }
             let resized = with_x(|client| {
                 let Some(win) = window_at(client, window) else { return false };
@@ -3156,6 +3172,7 @@ fn interpret(event: *mut GenericEvent) -> Step {
                     false
                 }
             });
+            crate::ffi::notify_geometry(window as usize);
             if resized {
                 Step::Deliver(window, AppEvent::Redraw)
             } else {
@@ -3590,6 +3607,7 @@ pub(crate) fn run() {
             PollFd { fd: wake_fd, events: POLLIN, revents: 0 },
         ];
         crate::ffi::accessibility::prepare(&mut fds);
+        crate::ffi::appearance::prepare(&mut fds);
         // the engine's own descriptors ride this poll (see the wayland
         // door)
         let timeout = match crate::webview::pump_prepare(&mut fds) {
@@ -3602,12 +3620,15 @@ pub(crate) fn run() {
             let mut drain = [0u8; 64];
             unsafe { while read(wake_fd, drain.as_mut_ptr().cast(), drain.len()) > 0 {} }
         }
+        crate::ffi::accessibility::after(&fds);
+        crate::ffi::appearance::after(&fds);
         crate::webview::pump_after(&mut fds);
         if unsafe { xcb_connection_has_error(connection) } != 0 {
             eprintln!("bunny_ui x11: the connection died");
             break;
         }
         drain_events();
+        crate::ffi::appearance::pump();
         if wake_woke {
             dispatch(AppEvent::Wake);
         }

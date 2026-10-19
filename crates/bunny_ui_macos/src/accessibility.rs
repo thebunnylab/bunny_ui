@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 use std::rc::{Rc, Weak};
 
+use super::objc_bool::{self, ObjcBool};
 use super::{
     AppEvent, CGPoint, CGRect, CGSize, Id, Sel, WindowHandle, class, class_addMethod, dispatch_to,
     msg_id, msg_rect, msg_void, ns_string, objc_allocateClassPair, objc_registerClassPair, sel,
@@ -38,11 +39,15 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn append(object: Id, selector: Sel, value: Id);
     #[link_name = "objc_msgSend"]
-    fn predicate(object: Id, selector: Sel, value: Id) -> i8;
+    fn predicate(object: Id, selector: Sel, value: Id) -> ObjcBool;
     #[link_name = "objc_msgSend"]
-    fn boolean(object: Id, selector: Sel) -> i8;
+    fn boolean(object: Id, selector: Sel) -> ObjcBool;
     #[link_name = "objc_msgSend"]
-    fn number_bool(object: Id, selector: Sel, value: i8) -> Id;
+    fn number_bool(object: Id, selector: Sel, value: ObjcBool) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn number_double(object: Id, selector: Sel, value: f64) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn double_value(object: Id, selector: Sel) -> f64;
     #[link_name = "objc_msgSendSuper"]
     fn super_object(object: *const Super, selector: Sel) -> Id;
     #[link_name = "objc_msgSend"]
@@ -398,7 +403,11 @@ fn changes(previous: Option<&Node>, current: &Node) -> impl Iterator<Item = Noti
             .is_some_and(|old| old.label != current.label)
             .then_some(Notification::Title),
         previous
-            .is_some_and(|old| value_of(old) != value_of(current) || old.checked != current.checked)
+            .is_some_and(|old| {
+                value_of(old) != value_of(current)
+                    || old.checked != current.checked
+                    || old.range != current.range
+            })
             .then_some(Notification::Value),
         previous
             .is_some_and(|old| old.enabled != current.enabled)
@@ -464,8 +473,8 @@ extern "C" fn view_children(this: Id, _: Sel) -> Id {
     surface.activate();
     surface.children()
 }
-extern "C" fn view_element(this: Id, _: Sel) -> i8 {
-    i8::from(surface(this).is_some())
+extern "C" fn view_element(this: Id, _: Sel) -> ObjcBool {
+    ObjcBool::new(surface(this).is_some())
 }
 extern "C" fn view_role(_: Id, _: Sel) -> Id {
     unsafe { ns_string("AXGroup") }
@@ -498,19 +507,19 @@ extern "C" fn view_focused(this: Id, _: Sel) -> Id {
     unsafe {
         let mut responder = msg_id(msg_id(this, sel("window")), sel("firstResponder"));
         // AppKit's shared field editor speaks for its owning text control.
-        if predicate(responder, sel("isKindOfClass:"), class("NSText")) != 0
-            && boolean(responder, sel("isFieldEditor")) != 0
+        if predicate(responder, sel("isKindOfClass:"), class("NSText")).get()
+            && boolean(responder, sel("isFieldEditor")).get()
         {
             let owner = msg_id(responder, sel("delegate"));
-            if predicate(owner, sel("isKindOfClass:"), class("NSView")) != 0
-                && predicate(owner, sel("isDescendantOf:"), this) != 0
+            if predicate(owner, sel("isKindOfClass:"), class("NSView")).get()
+                && predicate(owner, sel("isDescendantOf:"), this).get()
             {
                 responder = owner;
             }
         }
         if responder != this
-            && predicate(responder, sel("isKindOfClass:"), class("NSView")) != 0
-            && predicate(responder, sel("isDescendantOf:"), this) != 0
+            && predicate(responder, sel("isKindOfClass:"), class("NSView")).get()
+            && predicate(responder, sel("isDescendantOf:"), this).get()
         {
             let focused = msg_id(responder, sel("accessibilityFocusedUIElement"));
             if !focused.is_null() {
@@ -557,11 +566,11 @@ extern "C" fn view_hit(this: Id, _: Sel, point: CGPoint) -> Id {
         .find(|element| contains(element.frame(), point))
         .map_or(this, |element| element.object)
 }
-extern "C" fn element_alive(this: Id, _: Sel) -> i8 {
-    i8::from(element(this).is_some())
+extern "C" fn element_alive(this: Id, _: Sel) -> ObjcBool {
+    ObjcBool::new(element(this).is_some())
 }
-extern "C" fn element_enabled(this: Id, _: Sel) -> i8 {
-    i8::from(element(this).is_some_and(|element| element.node.borrow().enabled))
+extern "C" fn element_enabled(this: Id, _: Sel) -> ObjcBool {
+    ObjcBool::new(element(this).is_some_and(|element| element.node.borrow().enabled))
 }
 extern "C" fn element_role(this: Id, _: Sel) -> Id {
     let Some(element) = element(this) else {
@@ -572,6 +581,7 @@ extern "C" fn element_role(this: Id, _: Sel) -> Id {
             Role::Text => "AXStaticText",
             Role::Button => "AXButton",
             Role::Checkbox => "AXCheckBox",
+            Role::Slider => "AXSlider",
             Role::TextField | Role::PasswordField => "AXTextField",
         })
     }
@@ -604,10 +614,34 @@ extern "C" fn element_value(this: Id, _: Sel) -> Id {
     let node = element.node.borrow();
     if let Some(checked) = node.checked {
         return unsafe {
-            number_bool(class("NSNumber"), sel("numberWithBool:"), i8::from(checked))
+            number_bool(class("NSNumber"), sel("numberWithBool:"), ObjcBool::new(checked))
+        };
+    }
+    if let Some(range) = node.range {
+        return unsafe {
+            number_double(class("NSNumber"), sel("numberWithDouble:"), range.value())
         };
     }
     value_of(&node).map_or(empty(), |value| unsafe { ns_string(value) })
+}
+extern "C" fn element_minimum(this: Id, _: Sel) -> Id {
+    range_number(this, bunny_ui::accessibility::RangeValue::minimum)
+}
+extern "C" fn element_maximum(this: Id, _: Sel) -> Id {
+    range_number(this, bunny_ui::accessibility::RangeValue::maximum)
+}
+fn range_number(this: Id, read: fn(bunny_ui::accessibility::RangeValue) -> f64) -> Id {
+    element(this)
+        .and_then(|element| element.node.borrow().range)
+        .map_or_else(empty, |range| unsafe {
+            number_double(class("NSNumber"), sel("numberWithDouble:"), read(range))
+        })
+}
+extern "C" fn element_increment(this: Id, _: Sel) -> ObjcBool {
+    ObjcBool::new(element(this).is_some_and(|element| element.action(Action::Increment)))
+}
+extern "C" fn element_decrement(this: Id, _: Sel) -> ObjcBool {
+    ObjcBool::new(element(this).is_some_and(|element| element.action(Action::Decrement)))
 }
 extern "C" fn element_identifier(this: Id, _: Sel) -> Id {
     element(this).map_or(empty(), |element| unsafe {
@@ -625,46 +659,68 @@ extern "C" fn element_window(this: Id, command: Sel) -> Id {
 extern "C" fn element_frame(this: Id, _: Sel) -> CGRect {
     element(this).map_or_else(empty_frame, |element| element.frame())
 }
-extern "C" fn element_focused(this: Id, _: Sel) -> i8 {
-    i8::from(element(this).is_some_and(|element| element.node.borrow().focused))
+extern "C" fn element_focused(this: Id, _: Sel) -> ObjcBool {
+    ObjcBool::new(element(this).is_some_and(|element| element.node.borrow().focused))
 }
-extern "C" fn element_press(this: Id, _: Sel) -> i8 {
-    i8::from(element(this).is_some_and(|element| element.action(Action::Activate)))
+extern "C" fn element_press(this: Id, _: Sel) -> ObjcBool {
+    ObjcBool::new(element(this).is_some_and(|element| element.action(Action::Activate)))
 }
-extern "C" fn element_set_focus(this: Id, _: Sel, focused: i8) {
-    if focused != 0
+extern "C" fn element_set_focus(this: Id, _: Sel, focused: ObjcBool) {
+    if focused.get()
         && let Some(element) = element(this)
     {
         element.action(Action::Focus);
     }
 }
 extern "C" fn element_set_value(this: Id, _: Sel, value: Id) {
-    if let Some(element) = element(this)
-        && !value.is_null()
-        && unsafe { predicate(value, sel("isKindOfClass:"), class("NSString")) } != 0
-    {
+    let Some(element) = element(this) else {
+        return;
+    };
+    if value.is_null() {
+        return;
+    }
+    if unsafe { predicate(value, sel("isKindOfClass:"), class("NSNumber")) }.get() {
+        element.action(Action::SetValue(unsafe {
+            double_value(value, sel("doubleValue"))
+        }));
+    } else if unsafe { predicate(value, sel("isKindOfClass:"), class("NSString")) }.get() {
         let text = unsafe { super::text_argument_to_string(value) };
         element.action(Action::SetText(text));
     }
 }
-extern "C" fn element_allowed(this: Id, _: Sel, selector: Sel) -> i8 {
+extern "C" fn element_allowed(this: Id, _: Sel, selector: Sel) -> ObjcBool {
     let Some(element) = element(this) else {
-        return 0;
+        return ObjcBool::NO;
     };
     let node = element.node.borrow();
     if selector == unsafe { sel("accessibilityPerformPress") } {
-        return i8::from(node.supports(&Action::Activate));
+        return ObjcBool::new(node.supports(&Action::Activate));
     }
     if selector == unsafe { sel("setAccessibilityValue:") } {
-        return i8::from(
-            node.enabled && matches!(node.role, Role::TextField | Role::PasswordField),
+        return ObjcBool::new(
+            node.enabled
+                && matches!(
+                    node.role,
+                    Role::TextField | Role::PasswordField | Role::Slider
+                ),
         );
     }
+    if selector == unsafe { sel("accessibilityPerformIncrement") } {
+        return ObjcBool::new(node.supports(&Action::Increment));
+    }
+    if selector == unsafe { sel("accessibilityPerformDecrement") } {
+        return ObjcBool::new(node.supports(&Action::Decrement));
+    }
+    if selector == unsafe { sel("accessibilityMinValue") }
+        || selector == unsafe { sel("accessibilityMaxValue") }
+    {
+        return ObjcBool::new(node.range.is_some());
+    }
     if selector == unsafe { sel("setAccessibilityFocused:") } {
-        return i8::from(node.supports(&Action::Focus));
+        return ObjcBool::new(node.supports(&Action::Focus));
     }
     let name = unsafe { CStr::from_ptr(sel_getName(selector)) }.to_bytes();
-    i8::from(!name.starts_with(b"setAccessibility") && !name.starts_with(b"accessibilityPerform"))
+    ObjcBool::new(!name.starts_with(b"setAccessibility") && !name.starts_with(b"accessibilityPerform"))
 }
 
 // =============================================================================
@@ -688,7 +744,7 @@ pub(super) unsafe fn register_view(view: Id) {
             (
                 "isAccessibilityElement",
                 view_element as *const c_void,
-                c"c@:",
+                objc_bool::GETTER,
             ),
             ("accessibilityRole", view_role as *const c_void, c"@@:"),
             (
@@ -713,12 +769,12 @@ pub(super) unsafe fn register_view(view: Id) {
             (
                 "isAccessibilityElement",
                 element_alive as *const c_void,
-                c"c@:",
+                objc_bool::GETTER,
             ),
             (
                 "isAccessibilityEnabled",
                 element_enabled as *const c_void,
-                c"c@:",
+                objc_bool::GETTER,
             ),
             ("accessibilityRole", element_role as *const c_void, c"@@:"),
             (
@@ -733,6 +789,26 @@ pub(super) unsafe fn register_view(view: Id) {
             ),
             ("accessibilityLabel", element_label as *const c_void, c"@@:"),
             ("accessibilityValue", element_value as *const c_void, c"@@:"),
+            (
+                "accessibilityMinValue",
+                element_minimum as *const c_void,
+                c"@@:",
+            ),
+            (
+                "accessibilityMaxValue",
+                element_maximum as *const c_void,
+                c"@@:",
+            ),
+            (
+                "accessibilityPerformIncrement",
+                element_increment as *const c_void,
+                objc_bool::GETTER,
+            ),
+            (
+                "accessibilityPerformDecrement",
+                element_decrement as *const c_void,
+                objc_bool::GETTER,
+            ),
             (
                 "accessibilityIdentifier",
                 element_identifier as *const c_void,
@@ -761,17 +837,17 @@ pub(super) unsafe fn register_view(view: Id) {
             (
                 "isAccessibilityFocused",
                 element_focused as *const c_void,
-                c"c@:",
+                objc_bool::GETTER,
             ),
             (
                 "accessibilityPerformPress",
                 element_press as *const c_void,
-                c"c@:",
+                objc_bool::GETTER,
             ),
             (
                 "setAccessibilityFocused:",
                 element_set_focus as *const c_void,
-                c"v@:c",
+                objc_bool::SETTER,
             ),
             (
                 "setAccessibilityValue:",
@@ -781,7 +857,7 @@ pub(super) unsafe fn register_view(view: Id) {
             (
                 "isAccessibilitySelectorAllowed:",
                 element_allowed as *const c_void,
-                c"c@::",
+                objc_bool::SELECTOR,
             ),
         ] {
             class_addMethod(class, sel(name), method, types.as_ptr());
@@ -850,6 +926,36 @@ mod tests {
         assert_eq!(
             changes(None, after.node(field).unwrap()).collect::<Vec<_>>(),
             [Notification::Focus]
+        );
+    }
+    #[test]
+    fn numeric_value_changes_notify_once_and_unchanged_ranges_stay_quiet() {
+        let runtime = Runtime::new();
+        runtime.set_accessibility_enabled(true);
+        let value = State::new(0.3);
+        let control = slider(
+            value.binding(),
+            SliderRange::new(0.0..=1.0).unwrap().with_step(0.3).unwrap(),
+        )
+        .accessibility_label("Refresh rate");
+        let size = Size {
+            width: 220.0,
+            height: 32.0,
+        };
+        runtime.display_frame(&control, size);
+        let before = runtime.accessibility_tree();
+        runtime
+            .accessibility_action(before.nodes()[0].id, Action::Increment)
+            .unwrap();
+        runtime.display_frame(&control, size);
+        let after = runtime.accessibility_tree();
+        assert_eq!(
+            changes(Some(&before.nodes()[0]), &after.nodes()[0]).collect::<Vec<_>>(),
+            [Notification::Value]
+        );
+        assert_eq!(
+            changes(Some(&after.nodes()[0]), &after.nodes()[0]).count(),
+            0
         );
     }
 }

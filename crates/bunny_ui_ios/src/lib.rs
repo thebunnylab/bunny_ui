@@ -399,15 +399,10 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
     runtime.drop_unseen();
     // the present backend, chosen ONCE: the GPU, or nothing
     ffi::install_gpu();
-    // the season's mirrors: reduce-motion always follows the system
-    // (accessibility is never the app's to refuse); the theme follows
-    // ONLY while the app has not chosen one — an installed theme means
-    // the scene owns its colors and the shell stays out
-    let mirror_theme = bunny_ui::theme::version() == 0;
     let (dark, compact) = ffi::traits();
-    if mirror_theme && dark == Some(true) {
-        bunny_ui::theme::install(bunny_ui::theme::Theme::dark());
-    }
+    bunny_ui::theme::observe_system_appearance(
+        dark.map(bunny_ui::theme::Appearance::from_dark),
+    );
     runtime.set_reduce_motion(ffi::reduce_motion());
     // the system's languages reach the scene before its first frame; a
     // locale the app pinned (`App::set_locale`) stands over them. There
@@ -855,17 +850,9 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                 }
             }
             AppEvent::Traits { dark, compact } => {
-                if mirror_theme && let Some(wants_dark) = dark {
-                    let is_dark =
-                        bunny_ui::theme::current().canvas == bunny_ui::theme::Theme::dark().canvas;
-                    if wants_dark != is_dark {
-                        bunny_ui::theme::install(if wants_dark {
-                            bunny_ui::theme::Theme::dark()
-                        } else {
-                            bunny_ui::theme::Theme::light()
-                        });
-                    }
-                }
+                bunny_ui::theme::observe_system_appearance(
+                    dark.map(bunny_ui::theme::Appearance::from_dark),
+                );
                 runtime.set_size_class(size_class(compact));
                 blit(runtime, root);
             }

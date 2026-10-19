@@ -20,6 +20,10 @@ mod probe {
         #[link_name = "objc_msgSend"]
         fn count(object: Id, selector: Sel) -> usize;
         #[link_name = "objc_msgSend"]
+        fn double(object: Id, selector: Sel) -> f64;
+        #[link_name = "objc_msgSend"]
+        fn number(object: Id, selector: Sel, value: f64) -> Id;
+        #[link_name = "objc_msgSend"]
         fn at(object: Id, selector: Sel, index: usize) -> Id;
         #[link_name = "objc_msgSend"]
         fn chars(object: Id, selector: Sel) -> *const c_char;
@@ -48,6 +52,9 @@ mod probe {
 
     unsafe fn string(value: Id) -> Option<String> {
         if value.is_null() {
+            return None;
+        }
+        if unsafe { bool_object(value, sel("isKindOfClass:"), class("NSString")) } == 0 {
             return None;
         }
         let bytes = unsafe { chars(value, sel("UTF8String")) };
@@ -99,6 +106,7 @@ mod probe {
         presses: State<u32>,
         rows: State<Vec<u32>>,
         modal: State<bool>,
+        rate: State<f64>,
         reactions: State<bool>,
         checked: State<bool>,
         disabled: State<bool>,
@@ -114,6 +122,13 @@ mod probe {
                     self.name.set("Updated name".into());
                 })
                 .disabled(self.disabled.get()),
+                slider(
+                    self.rate.binding(),
+                    SliderRange::new(0.0..=1.0).unwrap().with_step(0.3).unwrap()
+                )
+                .disabled(self.disabled.get())
+                .frame(220.0, 32.0)
+                .accessibility_label("Refresh rate"),
                 checkbox(text("Reimbursable"), self.checked.binding())
                     .disabled(self.disabled.get()),
                 button(text("Toggle controls"), move || self
@@ -163,6 +178,7 @@ mod probe {
             value: State::new("Lunch".into()),
             password: State::new("never-export-this".into()),
             presses: State::new(0),
+            rate: State::new(0.0),
             checked: State::new(false),
             disabled: State::new(false),
             rows: State::new(vec![1, 2]),
@@ -174,6 +190,10 @@ mod probe {
             Rc::clone(&runtime),
             form,
         );
+        if std::env::args().any(|argument| argument == "--external-ax-fixture") {
+            app.run();
+            return;
+        }
         unsafe {
             let ns_app = object(class("NSApplication"), sel("sharedApplication"));
             let windows = object(ns_app, sel("windows"));
@@ -197,6 +217,65 @@ mod probe {
             assert_eq!(
                 property(field, "accessibilityValue").as_deref(),
                 Some("Lunch")
+            );
+            let range = named(view, "Refresh rate");
+            assert_eq!(
+                property(range, "accessibilityRole").as_deref(),
+                Some("AXSlider")
+            );
+            assert_eq!(
+                double(
+                    object(range, sel("accessibilityMinValue")),
+                    sel("doubleValue")
+                ),
+                0.0
+            );
+            assert_eq!(
+                double(
+                    object(range, sel("accessibilityMaxValue")),
+                    sel("doubleValue")
+                ),
+                1.0
+            );
+            assert_eq!(
+                allowed(
+                    range,
+                    sel("isAccessibilitySelectorAllowed:"),
+                    sel("accessibilityPerformIncrement")
+                ),
+                1
+            );
+            for expected in [0.3, 0.6, 0.9, 1.0, 1.0] {
+                assert_eq!(boolean(range, sel("accessibilityPerformIncrement")), 1);
+                assert!((form.rate.get() - expected).abs() < 1e-12);
+                assert!(
+                    (double(object(range, sel("accessibilityValue")), sel("doubleValue"))
+                        - expected)
+                        .abs()
+                        < 1e-12
+                );
+            }
+            assert_eq!(boolean(range, sel("accessibilityPerformDecrement")), 1);
+            assert!((form.rate.get() - 0.9).abs() < 1e-12);
+            set_object(
+                range,
+                sel("setAccessibilityValue:"),
+                number(class("NSNumber"), sel("numberWithDouble:"), 0.2),
+            );
+            assert!((form.rate.get() - 0.3).abs() < 1e-12);
+            for invalid in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+                set_object(
+                    range,
+                    sel("setAccessibilityValue:"),
+                    number(class("NSNumber"), sel("numberWithDouble:"), invalid),
+                );
+                assert!((form.rate.get() - 0.3).abs() < 1e-12);
+            }
+            set_bool(range, sel("setAccessibilityFocused:"), 1);
+            assert_eq!(boolean(range, sel("isAccessibilityFocused")), 1);
+            assert_eq!(named(view, "Refresh rate"), range);
+            println!(
+                "NSAccessibility slider value, bounds, nondividing steps, numeric validation and focus passed"
             );
             let password = named(view, "Password");
             assert_eq!(
@@ -375,6 +454,22 @@ mod probe {
                 ),
                 1
             );
+            assert_eq!(boolean(range, sel("isAccessibilityEnabled")), 0);
+            assert_eq!(boolean(range, sel("accessibilityPerformIncrement")), 0);
+            assert_eq!(
+                allowed(
+                    range,
+                    sel("isAccessibilitySelectorAllowed:"),
+                    sel("setAccessibilityValue:")
+                ),
+                0
+            );
+            set_object(
+                range,
+                sel("setAccessibilityValue:"),
+                number(class("NSNumber"), sel("numberWithDouble:"), 1.0),
+            );
+            assert!((form.rate.get() - 0.3).abs() < 1e-12);
             assert_eq!(boolean(check, sel("isAccessibilityEnabled")), 0);
             assert_eq!(boolean(save, sel("isAccessibilityEnabled")), 0);
             assert_eq!(boolean(check, sel("isAccessibilityFocused")), 0);
@@ -412,6 +507,7 @@ mod probe {
             assert_eq!(boolean(removed, sel("accessibilityPerformPress")), 0);
             assert_eq!(form.presses.get(), 1);
             void(removed, sel("release"));
+            let old_range = object(range, sel("retain"));
             let old_save = object(named(view, "Save"), sel("retain"));
             assert_eq!(
                 boolean(named(view, "Open modal"), sel("accessibilityPerformPress")),
@@ -421,6 +517,9 @@ mod probe {
                 children(view).is_empty(),
                 "the covered main surface exposes no controls"
             );
+            assert_eq!(boolean(old_range, sel("accessibilityPerformIncrement")), 0);
+            assert!(object(old_range, sel("accessibilityValue")).is_null());
+            void(old_range, sel("release"));
             assert_eq!(boolean(old_save, sel("accessibilityPerformPress")), 0);
             let child_windows = object(window, sel("childWindows"));
             let panel = (0..count(child_windows, sel("count")))
@@ -634,6 +733,10 @@ mod probe {
 
 #[cfg(target_os = "macos")]
 fn main() {
+    if std::env::args().any(|argument| argument == "--external-ax-fixture") {
+        probe::run(false);
+        return;
+    }
     if std::env::args().any(|argument| argument == "--teardown-witness") {
         probe::run(true);
         return;

@@ -103,7 +103,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libxcb1-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-shm0-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libdbus-1-dev libsecret-1-dev libfontconfig-dev libfreetype-dev libharfbuzz-dev
+            libdbus-1-dev libsecret-1-dev libfontconfig-dev libfreetype-dev libharfbuzz-dev libfribidi-dev
       - name: Two generations into a running app, without a window
         # the binary on the framework's shared library loads each build of
         # the app's library and draws it as text (BUNNY_HOT_CHECK): the
@@ -134,7 +134,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libxcb1-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-shm0-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libdbus-1-dev libsecret-1-dev libfontconfig-dev libfreetype-dev libharfbuzz-dev
+            libdbus-1-dev libsecret-1-dev libfontconfig-dev libfreetype-dev libharfbuzz-dev libfribidi-dev
       - name: The Android platform the template compiles against
         # the runner's SDK has its terms accepted; this is a no-op when
         # the image already carries the platform

@@ -219,8 +219,14 @@ impl WindowSpec {
     }
 }
 
-use bunny_ui::window::Lifecycle;
-pub use bunny_ui::window::{CloseAction, WindowError, WindowId, WindowVisibility};
+use bunny_ui::window::{Lifecycle, Relationships};
+mod confirmation;
+mod window_api;
+mod window_geometry;
+pub use bunny_ui::window::{
+    CloseAction, DesktopPosition, DesktopSpace, WindowError, WindowGeometry, WindowId,
+    WindowParent, WindowParentKind, WindowPlacement, WindowSize, WindowVisibility,
+};
 
 /// Whether this shell opens more than one window at a time — it does:
 /// one poll loop, a `wl_surface` (or an xcb window) each, a presenter
@@ -253,6 +259,8 @@ pub struct App {
 /// door and routes by the window the event arrived at.
 struct Slot {
     lifecycle: Rc<Lifecycle>,
+    confirmation: bunny_ui::window::FrameworkConfirmation,
+    confirmation_dialogs: Rc<RefCell<std::collections::HashMap<String, DialogWindow>>>,
     window: usize,
     handle: ffi::WindowHandle,
     /// The window's own scene — what a locale the app pins reaches.
@@ -265,6 +273,7 @@ struct Slot {
 }
 
 struct AppInner {
+    relationships: Relationships,
     slots: RefCell<Vec<Rc<Slot>>>,
     routed: std::cell::Cell<bool>,
     scenes: std::cell::Cell<usize>,
@@ -297,10 +306,27 @@ impl AppInner {
         }));
         let app = Rc::clone(self);
         ffi::set_handler(Box::new(move |event| {
+            if let AppEvent::DialogGeometryChanged(observation) = event {
+                observation.deliver();
+                return;
+            }
+            if let AppEvent::GeometryChanged(observation) = event {
+                if let Some(slot) = app.live().into_iter().find(|slot| slot.lifecycle.id() == observation.id()) {
+                    slot.lifecycle.geometry_events().observe_captured(&observation);
+                }
+                return;
+            }
+            if let AppEvent::AppearanceChanged(value) = event {
+                bunny_ui::theme::observe_system_appearance(value);
+            }
             let source = ffi::event_source();
             let closing = matches!(event, AppEvent::WindowClosed);
             for slot in app.live() {
                 if source == 0 || slot.window == source {
+                    if closing {
+                        slot.confirmation.owner_closed();
+                        confirmation::dismiss(&slot.confirmation, &slot.confirmation_dialogs);
+                    }
                     (slot.handler.borrow_mut())(event.clone());
                 }
             }
@@ -334,6 +360,17 @@ impl AppInner {
     }
 
     fn buried(&self, window: usize) {
+        if let Some(slot) = self
+            .slots
+            .borrow()
+            .iter()
+            .find(|slot| slot.window == window)
+        {
+            slot.runtime.retire_dialog_geometry();
+            slot.lifecycle.geometry_events().retire();
+            ffi::forget_geometry(slot.window, slot.lifecycle.id());
+            self.relationships.retire(slot.lifecycle.id());
+        }
         self.slots.borrow_mut().retain(|slot| slot.window != window);
     }
 }
@@ -355,6 +392,7 @@ impl App {
         bunny_ui::clipboard::install(ffi::clipboard_write, ffi::clipboard_read);
         App {
             inner: Rc::new(AppInner {
+                relationships: Relationships::default(),
                 slots: RefCell::new(Vec::new()),
                 routed: std::cell::Cell::new(false),
                 scenes: std::cell::Cell::new(0),
@@ -381,6 +419,8 @@ impl App {
     /// the new slot's own handler, not the door's road.
     pub fn open(&self, spec: WindowSpec, runtime: Rc<Runtime>, root: impl View) -> WindowId {
         let slot = mount(&spec, runtime, root);
+        self.inner.relationships.register(slot.lifecycle.id());
+        ffi::register_geometry(slot.window, Rc::clone(slot.lifecycle.geometry_events()));
         self.inner.slots.borrow_mut().push(Rc::clone(&slot));
         self.inner.route();
         (slot.handler.borrow_mut())(AppEvent::Redraw);
@@ -390,8 +430,15 @@ impl App {
 
     /// Closes the window. The last one out quits the app.
     pub fn close(&self, id: WindowId) {
+        self.close_children(id);
         if let Some(slot) = self.slot(id) {
+            slot.confirmation.owner_closed();
+            confirmation::dismiss(&slot.confirmation, &slot.confirmation_dialogs);
+            slot.runtime.retire_dialog_geometry();
+            slot.lifecycle.geometry_events().retire();
+            ffi::forget_geometry(slot.window, id);
             ffi::close_top_level(slot.window);
+            self.inner.relationships.retire(id);
             self.inner
                 .slots
                 .borrow_mut()
@@ -418,31 +465,37 @@ impl App {
             .cloned()
     }
 
-    /// Hides a live window without destroying its scene. Repeating it is harmless.
+    /// Hides a live window and its descendants without destroying their scenes.
+    /// Explicit child hide requests survive a later parent show. A descendant
+    /// failure can leave earlier windows changed; retrying is safe.
     ///
     /// # Errors
-    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    /// Returns `StaleWindow` for a closed or foreign ID, or a native failure.
     pub fn hide(&self, id: WindowId) -> Result<(), WindowError> {
         let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
         let previous = slot.lifecycle.set_hidden(true);
-        let result = ffi::set_window_visibility(slot.window, WindowVisibility::Hidden);
-        if result.is_err() {
+        if let Err(error) = self.refresh_window_visibility(id) {
             slot.lifecycle.set_hidden(previous);
+            return Err(error);
         }
-        result
+        self.refresh_child_visibility(id)
     }
 
-    /// Shows a retained window and requests activation, subject to OS policy.
+    /// Shows a retained window unless an owning ancestor is hidden.
+    /// Descendants preserve their own explicit hide requests. Native activation
+    /// remains subject to OS policy. A descendant failure can leave earlier
+    /// windows changed; retrying is safe.
     ///
     /// # Errors
-    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    /// Returns `StaleWindow` for a closed or foreign ID, or a native failure.
     pub fn show(&self, id: WindowId) -> Result<(), WindowError> {
         let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
-        ffi::set_window_visibility(slot.window, WindowVisibility::Shown)?;
-        slot.lifecycle.set_hidden(false);
-        slot.runtime.request_frame();
-        ffi::wake_from_any_thread();
-        Ok(())
+        let previous = slot.lifecycle.set_hidden(false);
+        if let Err(error) = self.refresh_window_visibility(id) {
+            slot.lifecycle.set_hidden(previous);
+            return Err(error);
+        }
+        self.refresh_child_visibility(id)
     }
 
     /// Reports native visibility; this does not mean unobscured or focused.
@@ -493,6 +546,8 @@ impl App {
             .decide()?;
         if action == CloseAction::Hide && self.slot(id).is_some() {
             self.hide(id)?;
+        } else if action == CloseAction::Close {
+            self.close_children(id);
         }
         Ok(action)
     }
@@ -689,6 +744,7 @@ fn house_bar(title: Rc<str>, minimizable: bool) -> impl View<Arity = Single> {
 #[derive(Clone, Copy)]
 struct DialogWindow {
     handle: ffi::WindowHandle,
+    confirmation: Option<usize>,
     /// Where the scene last placed the dialog. Wayland never says where
     /// a window stands, so this stays the scene's own origin — the base
     /// its pointer events translate from.
@@ -699,7 +755,9 @@ struct DialogWindow {
 /// as long as it does — the frame path, the pools, the gates and the
 /// event handler — into a slot the app routes to.
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
+    runtime.set_dialog_geometry_dispatch(ffi::queue_dialog_geometry);
     let lifecycle = Rc::new(Lifecycle::default());
+    let confirmation = bunny_ui::window::FrameworkConfirmation::new(lifecycle.id());
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
     runtime.drop_unseen();
@@ -728,16 +786,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // raster on refusal — and the window is still unmapped, so the
     // first frame (whichever road) IS the reveal
     ffi::install_gpu(&window);
-    // the season's mirrors: reduce-motion always follows the system
-    // (accessibility is never the app's to refuse); the theme follows
-    // ONLY while the app has not chosen one — an installed theme means
-    // the scene owns its colors and the shell stays out. Where no
-    // portal runs (this compositor), both keep their defaults; the
-    // live change signal joins at the real-desktop pass.
-    let mirror_theme = bunny_ui::theme::version() == 0;
-    if mirror_theme && ffi::os_prefers_dark() == Some(true) {
-        bunny_ui::theme::install(bunny_ui::theme::Theme::dark());
-    }
+    ffi::appearance::install();
     runtime.set_reduce_motion(!ffi::animations_enabled());
     // the environment's languages reach the scene before its first
     // frame; a locale the app pinned (`App::set_locale`) stands over
@@ -756,8 +805,11 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         bunny_ui::stats::set_clock(Some(trace::clock_ms));
     }
     // two owners: the keyboard gate and the event handler
-    let root = framed(house_bar.then(|| (Rc::clone(&spec.title), spec.manners.minimizable)), root);
-    let root = Rc::new(root);
+    let root = framed(
+        house_bar.then(|| (Rc::clone(&spec.title), spec.manners.minimizable)),
+        root,
+    );
+    let root = Rc::new(confirmation.host(root));
 
     // one frame: the Runtime settles, lays out, retains the hits for
     // pointer events; the RETAINED surface repaints only the damage
@@ -781,6 +833,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         let surface = Rc::clone(&surface);
         let panels = Rc::clone(&panels);
         let dialogs = Rc::clone(&dialogs);
+        let confirmation = confirmation.clone();
         let accessibility = Rc::clone(&accessibility);
         let title = spec.title.to_string();
         move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| {
@@ -788,244 +841,313 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 return;
             }
             (|| {
-            let (width, height) = window.content_size();
-            let scale = window.scale();
-            let canvas = bunny_ui::theme::canvas();
-            let physical = (
-                (width * scale as f64).round() as usize,
-                (height * scale as f64).round() as usize,
-            );
-            if physical.0 == 0 || physical.1 == 0 {
-                // degenerate: a zero surface is an abort, not a frame
-                return;
-            }
-            // the window presents everything BEFORE the first overlay;
-            // each overlay re-presents its own slice on an owned panel
-            // — a popup that may hang past the window's edge
-            let overlays = runtime.overlays();
-            let display = match overlays.first() {
-                Some(first) => full_display.translated_slice((0, first.display.0), 0.0, 0.0),
-                None => full_display.clone(),
-            };
-            // the pages: mounted, re-instructed, placed and swept by
-            // this layout's host boxes, then painted INTO the list
-            // where each host stood — no platform view, no sandwich:
-            // paint order is the truth on every tier because the page
-            // is a picture in the list. The page's scale is the
-            // raster's whole number, so its pixels land 1:1
-            let hosts = runtime.hosts();
-            webview::reconcile(window.raw_window(), &hosts, scale as f64);
-            let display = webview::paint_into(window.raw_window(), &display, &hosts);
-            {
-                let mut store = panels.borrow_mut();
-                let dead: Vec<String> = store
-                    .keys()
-                    .filter(|path| !overlays.iter().any(|overlay| &overlay.path == *path))
-                    .cloned()
-                    .collect();
-                for path in dead {
-                    if let Some(panel) = store.remove(&path) {
-                        panel.close_panel();
-                    }
+                let (width, height) = window.content_size();
+                let scale = window.scale();
+                let canvas = bunny_ui::theme::canvas();
+                let physical = (
+                    (width * scale as f64).round() as usize,
+                    (height * scale as f64).round() as usize,
+                );
+                if physical.0 == 0 || physical.1 == 0 {
+                    // degenerate: a zero surface is an abort, not a frame
+                    return;
                 }
-                // the dialogs' own sweep, AFTER the panels': a dropdown
-                // inside a closing dialog goes before the window it
-                // hangs from
-                let mut dialog_store = dialogs.borrow_mut();
-                dialog_store.retain(|path, dialog| {
-                    let open = overlays.iter().any(|overlay| &overlay.path == path);
-                    if !open {
-                        dialog.handle.close_panel();
+                // the window presents everything BEFORE the first overlay;
+                // each overlay re-presents its own slice on an owned panel
+                // — a popup that may hang past the window's edge
+                let overlays = runtime.overlays();
+                let display = match overlays.first() {
+                    Some(first) => full_display.translated_slice((0, first.display.0), 0.0, 0.0),
+                    None => full_display.clone(),
+                };
+                // the pages: mounted, re-instructed, placed and swept by
+                // this layout's host boxes, then painted INTO the list
+                // where each host stood — no platform view, no sandwich:
+                // paint order is the truth on every tier because the page
+                // is a picture in the list. The page's scale is the
+                // raster's whole number, so its pixels land 1:1
+                let hosts = runtime.hosts();
+                webview::reconcile(window.raw_window(), &hosts, scale as f64);
+                let display = webview::paint_into(window.raw_window(), &display, &hosts);
+                {
+                    let mut store = panels.borrow_mut();
+                    let dead: Vec<String> = store
+                        .keys()
+                        .filter(|path| !overlays.iter().any(|overlay| &overlay.path == *path))
+                        .cloned()
+                        .collect();
+                    for path in dead {
+                        if let Some(panel) = store.remove(&path) {
+                            panel.close_panel();
+                        }
                     }
-                    open
-                });
-                for overlay in &overlays {
-                    // a dialog presents on a REAL window: no bleed, no
-                    // drawn shadow — the frame and its shadow are the
-                    // compositor's. The window is the truth of the size
-                    // (`dialog_size`, pulled before the layout), so the
-                    // frame here is already what the window was granted.
-                    // An alert is the one exception: its size is its
-                    // content's, one size the window is held to (`fixed`)
-                    let frame = overlay.frame;
-                    let asked = match &overlay.surface {
-                        bunny_ui::layout::OverlaySurface::Window(spec) => Some((
-                            &spec.title,
-                            (spec.min.width, spec.min.height),
-                            matches!(spec.chrome, bunny_ui::layout::DialogChrome::Scene { .. }),
-                            false,
-                        )),
-                        bunny_ui::layout::OverlaySurface::Alert(spec) => Some((
-                            &spec.title,
-                            (frame.size.width, frame.size.height),
-                            false,
-                            true,
-                        )),
-                        bunny_ui::layout::OverlaySurface::Layer => None,
-                    };
-                    if let Some((title, min, scene, fixed)) = asked {
-                        let dialog =
-                            dialog_store.entry(overlay.path.clone()).or_insert_with(|| {
-                                DialogWindow {
-                                    handle: ffi::create_dialog(
-                                        &window,
-                                        title,
-                                        min,
-                                        scene,
-                                        (
-                                            frame.origin.x,
-                                            frame.origin.y,
-                                            frame.size.width,
-                                            frame.size.height,
-                                        ),
-                                        fixed,
-                                    ),
-                                    origin: frame.origin,
+                    // the dialogs' own sweep, AFTER the panels': a dropdown
+                    // inside a closing dialog goes before the window it
+                    // hangs from
+                    let mut dialog_store = dialogs.borrow_mut();
+                    dialog_store.retain(|path, dialog| {
+                        let open = overlays.iter().any(|overlay| &overlay.path == path);
+                        if !open {
+                            dialog.handle.close_panel();
+                            if let Some(token) = dialog.confirmation {
+                                confirmation::closed(&confirmation, token);
+                            }
+                        }
+                        open
+                    });
+                    for overlay in &overlays {
+                        // a dialog presents on a REAL window: no bleed, no
+                        // drawn shadow — the frame and its shadow are the
+                        // compositor's. The window is the truth of the size
+                        // (`dialog_size`, pulled before the layout), so the
+                        // frame here is already what the window was granted.
+                        // An alert is the one exception: its size is its
+                        // content's, one size the window is held to (`fixed`)
+                        let frame = overlay.frame;
+                        let asked = match &overlay.surface {
+                            bunny_ui::layout::OverlaySurface::Window(spec) => Some((
+                                &spec.title,
+                                (spec.min.width, spec.min.height),
+                                matches!(spec.chrome, bunny_ui::layout::DialogChrome::Scene { .. }),
+                                false,
+                            )),
+                            bunny_ui::layout::OverlaySurface::Alert(spec) => Some((
+                                &spec.title,
+                                (frame.size.width, frame.size.height),
+                                false,
+                                true,
+                            )),
+                            bunny_ui::layout::OverlaySurface::Layer => None,
+                        };
+                        if let Some((title, min, scene, fixed)) = asked {
+                            let token = match &overlay.surface {
+                                bunny_ui::layout::OverlaySurface::Alert(spec) => {
+                                    spec.confirmation_token.map(std::num::NonZeroUsize::get)
                                 }
-                            });
-                        dialog.origin = frame.origin;
-                        let (x, y) = (frame.origin.x, frame.origin.y);
-                        let (w, h) = (frame.size.width, frame.size.height);
-                        dialog.handle.set_scene_origin(x, y);
+                                _ => None,
+                            };
+                            if let Some(token) = token
+                                && !dialog_store.contains_key(&overlay.path)
+                                && overlays.iter().any(|other| {
+                                    other.path != overlay.path
+                                        && !matches!(
+                                            other.surface,
+                                            bunny_ui::layout::OverlaySurface::Layer
+                                        )
+                                })
+                            {
+                                confirmation::failed(
+                                    &confirmation,
+                                    token,
+                                    bunny_ui::window::ConfirmationError::AlreadyOpen,
+                                );
+                                continue;
+                            }
+                            if !dialog_store.contains_key(&overlay.path)
+                                && let Some(token) = token
+                                && !confirmation.native_presented(token)
+                            {
+                                continue;
+                            }
+                            let dialog =
+                                dialog_store.entry(overlay.path.clone()).or_insert_with(|| {
+                                    DialogWindow {
+                                        handle: ffi::create_dialog(
+                                            &window,
+                                            title,
+                                            min,
+                                            scene,
+                                            (
+                                                frame.origin.x,
+                                                frame.origin.y,
+                                                frame.size.width,
+                                                frame.size.height,
+                                            ),
+                                            fixed,
+                                        ),
+                                        confirmation: token,
+                                        origin: frame.origin,
+                                    }
+                                });
+                            dialog.origin = frame.origin;
+                            let (x, y) = (frame.origin.x, frame.origin.y);
+                            let changed = dialog.handle.bind_dialog_geometry(
+                                runtime.dialog_geometry_session(&overlay.path),
+                            );
+                            let (w, h) = dialog
+                                .handle
+                                .dialog_size()
+                                .unwrap_or((frame.size.width, frame.size.height));
+                            if changed {
+                                runtime.set_dialog_frame(
+                                    &overlay.path,
+                                    bunny_ui::layout::Rect {
+                                        origin: frame.origin,
+                                        size: Size {
+                                            width: w,
+                                            height: h,
+                                        },
+                                    },
+                                );
+                            }
+                            dialog.handle.set_scene_origin(x, y);
+                            let slice = full_display.translated_slice(overlay.display, -x, -y);
+                            let physical = (
+                                (w * scale as f64).round() as usize,
+                                (h * scale as f64).round() as usize,
+                            );
+                            // A native dialog has no parent pixels to show through.
+                            let bitmap = bunny_ui::raster::rasterize_with(
+                                &slice,
+                                physical.0,
+                                physical.1,
+                                scale,
+                                canvas,
+                                &*runtime.text(),
+                                &*runtime.images(),
+                            );
+                            dialog.handle.present_layered(
+                                (x, y, w, h),
+                                physical.0,
+                                physical.1,
+                                &bitmap.to_rgba_bytes(),
+                            );
+                            continue;
+                        }
+                        // the panel is BLED around the frame so the card's
+                        // own shadow has room — the same pixels every
+                        // target paints, no system shadow involved
+                        const BLEED: f64 = 32.0;
+                        let x = overlay.frame.origin.x - BLEED;
+                        let y = overlay.frame.origin.y - BLEED;
+                        let w = overlay.frame.size.width + 2.0 * BLEED;
+                        let h = overlay.frame.size.height + 2.0 * BLEED;
+                        let chip = overlay.path == bunny_ui::layout::DRAG_LABEL_PATH;
+                        // a popover born inside a dialog is the DIALOG's
+                        // child: it stacks over the dialog and rides its
+                        // moves — the identity path says whose it is
+                        let host = dialog_store
+                            .iter()
+                            .find(|(path, _)| overlay.path.starts_with(path.as_str()))
+                            .map(|(_, dialog)| dialog.handle);
+                        let panel =
+                            store
+                                .entry(overlay.path.clone())
+                                .or_insert_with(|| match host {
+                                    Some(dialog) if !chip => ffi::create_panel_in(&window, &dialog),
+                                    _ => ffi::create_panel(&window, chip),
+                                });
+                        panel.set_scene_origin(x, y);
                         let slice = full_display.translated_slice(overlay.display, -x, -y);
-                        let physical =
-                            ((w * scale as f64).round() as usize, (h * scale as f64).round() as usize);
-                        // the window's own ground under the content — a
-                        // toplevel has no parent pixels to show through
+                        let panel_physical = (
+                            (w * scale as f64).round() as usize,
+                            (h * scale as f64).round() as usize,
+                        );
                         let bitmap = bunny_ui::raster::rasterize_with(
                             &slice,
-                            physical.0,
-                            physical.1,
+                            panel_physical.0,
+                            panel_physical.1,
                             scale,
-                            canvas,
+                            bunny_ui::layout::Color {
+                                r: 0,
+                                g: 0,
+                                b: 0,
+                                a: 0,
+                            },
                             &*runtime.text(),
                             &*runtime.images(),
                         );
-                        dialog.handle.present_layered(
-                            (x, y, w, h),
-                            physical.0,
-                            physical.1,
+                        // position, size and pixels land atomically; the
+                        // premultiply for the alpha surface fuses into the
+                        // copy at the boundary
+                        panel.present_layered(
+                            window.layout_rect_to_screen(x, y, w, h),
+                            panel_physical.0,
+                            panel_physical.1,
                             &bitmap.to_rgba_bytes(),
                         );
-                        continue;
                     }
-                    // the panel is BLED around the frame so the card's
-                    // own shadow has room — the same pixels every
-                    // target paints, no system shadow involved
-                    const BLEED: f64 = 32.0;
-                    let x = overlay.frame.origin.x - BLEED;
-                    let y = overlay.frame.origin.y - BLEED;
-                    let w = overlay.frame.size.width + 2.0 * BLEED;
-                    let h = overlay.frame.size.height + 2.0 * BLEED;
-                    let chip = overlay.path == bunny_ui::layout::DRAG_LABEL_PATH;
-                    // a popover born inside a dialog is the DIALOG's
-                    // child: it stacks over the dialog and rides its
-                    // moves — the identity path says whose it is
-                    let host = dialog_store
-                        .iter()
-                        .find(|(path, _)| overlay.path.starts_with(path.as_str()))
-                        .map(|(_, dialog)| dialog.handle);
-                    let panel = store.entry(overlay.path.clone()).or_insert_with(|| match host {
-                        Some(dialog) if !chip => ffi::create_panel_in(&window, &dialog),
-                        _ => ffi::create_panel(&window, chip),
-                    });
-                    panel.set_scene_origin(x, y);
-                    let slice = full_display.translated_slice(overlay.display, -x, -y);
-                    let panel_physical =
-                        ((w * scale as f64).round() as usize, (h * scale as f64).round() as usize);
-                    let bitmap = bunny_ui::raster::rasterize_with(
-                        &slice,
-                        panel_physical.0,
-                        panel_physical.1,
+                }
+                if vk::active(window.raw_window()) {
+                    // the front of the ladder: the same display list, no
+                    // Surface in the path — the queue present is the frame
+                    vk::present_window(
+                        window.raw_window(),
+                        &display,
+                        Size { width, height },
                         scale,
-                        bunny_ui::layout::Color { r: 0, g: 0, b: 0, a: 0 },
+                        canvas,
                         &*runtime.text(),
                         &*runtime.images(),
                     );
-                    // position, size and pixels land atomically; the
-                    // premultiply for the alpha surface fuses into the
-                    // copy at the boundary
-                    panel.present_layered(
-                        window.layout_rect_to_screen(x, y, w, h),
-                        panel_physical.0,
-                        panel_physical.1,
-                        &bitmap.to_rgba_bytes(),
+                    if frame_stats {
+                        trace::mark("P", format_args!("road=vk presents={}", trace::presents()));
+                    }
+                    return;
+                }
+                if gl::active(window.raw_window()) {
+                    // GPU present: the same display list, no Surface in
+                    // the path — the swap is the frame
+                    gl::present_window(
+                        window.raw_window(),
+                        &display,
+                        Size { width, height },
+                        scale,
+                        canvas,
+                        &*runtime.text(),
+                        &*runtime.images(),
                     );
+                    if frame_stats {
+                        trace::mark("P", format_args!("road=gl presents={}", trace::presents()));
+                    }
+                    return;
                 }
-            }
-            if vk::active(window.raw_window()) {
-                // the front of the ladder: the same display list, no
-                // Surface in the path — the queue present is the frame
-                vk::present_window(
-                    window.raw_window(),
-                    &display,
-                    Size { width, height },
-                    scale,
-                    canvas,
-                    &*runtime.text(),
-                    &*runtime.images(),
-                );
-                if frame_stats {
-                    trace::mark("P", format_args!("road=vk presents={}", trace::presents()));
+                let mut slot = surface.borrow_mut();
+                let stale = window.needs_mapping_buffer()
+                    || match &*slot {
+                        Some((retained, retained_scale, retained_canvas)) => {
+                            retained.bitmap().width() != physical.0
+                                || retained.bitmap().height() != physical.1
+                                || *retained_scale != scale
+                                || *retained_canvas != canvas
+                        }
+                        None => true,
+                    };
+                if stale {
+                    *slot = Some((
+                        bunny_ui::raster::Surface::new(physical.0, physical.1, scale, canvas),
+                        scale,
+                        canvas,
+                    ));
                 }
-                return;
-            }
-            if gl::active(window.raw_window()) {
-                // GPU present: the same display list, no Surface in
-                // the path — the swap is the frame
-                gl::present_window(
-                    window.raw_window(),
-                    &display,
-                    Size { width, height },
-                    scale,
-                    canvas,
-                    &*runtime.text(),
-                    &*runtime.images(),
-                );
-                if frame_stats {
-                    trace::mark("P", format_args!("road=gl presents={}", trace::presents()));
+                let (retained, _, _) = slot.as_mut().expect("surface for the frame");
+                let damage = retained.frame(display, &*runtime.text(), &*runtime.images());
+                if !damage.is_empty() {
+                    // present only the wounds: damage-only backing copy +
+                    // damage-only surface marks in the same pass
+                    let (width, height) = (retained.bitmap().width(), retained.bitmap().height());
+                    window.blit_partial(width, height, retained.rgba(), &damage);
+                    if frame_stats {
+                        trace::mark(
+                            "P",
+                            format_args!(
+                                "road=cpu presents={} wounds={}",
+                                trace::presents(),
+                                damage.len()
+                            ),
+                        );
+                    }
                 }
-                return;
-            }
-            let mut slot = surface.borrow_mut();
-            let stale = match &*slot {
-                Some((retained, retained_scale, retained_canvas)) => {
-                    retained.bitmap().width() != physical.0
-                        || retained.bitmap().height() != physical.1
-                        || *retained_scale != scale
-                        || *retained_canvas != canvas
-                }
-                None => true,
-            };
-            if stale {
-                *slot = Some((
-                    bunny_ui::raster::Surface::new(physical.0, physical.1, scale, canvas),
-                    scale,
-                    canvas,
-                ));
-            }
-            let (retained, _, _) = slot.as_mut().expect("surface for the frame");
-            let damage = retained.frame(display, &*runtime.text(), &*runtime.images());
-            if !damage.is_empty() {
-                // present only the wounds: damage-only backing copy +
-                // damage-only surface marks in the same pass
-                let (width, height) = (retained.bitmap().width(), retained.bitmap().height());
-                window.blit_partial(width, height, retained.rgba(), &damage);
-                if frame_stats {
-                    trace::mark(
-                        "P",
-                        format_args!("road=cpu presents={} wounds={}", trace::presents(), damage.len()),
-                    );
-                }
-            }
             })();
             // Decorator after every pixel path, including GPU early returns.
             // Register every surface even before semantic capture is requested.
             let (width, height) = window.content_size();
             let mut semantic_surfaces = vec![ffi::accessibility::Surface {
-                key: None, handle: window,
+                key: None,
+                handle: window,
                 origin: bunny_ui::layout::Point { x: 0.0, y: 0.0 },
-                size: Size { width, height }, title: title.clone(),
+                size: Size { width, height },
+                title: title.clone(),
             }];
             for overlay in runtime.overlays() {
                 let dialog = dialogs.borrow().get(&overlay.path).copied();
@@ -1034,15 +1156,32 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     (dialog.handle, dialog.origin, overlay.frame.size)
                 } else if let Some(panel) = panel {
                     const BLEED: f64 = 32.0;
-                    (panel, bunny_ui::layout::Point { x: overlay.frame.origin.x - BLEED, y: overlay.frame.origin.y - BLEED },
-                        Size { width: overlay.frame.size.width + 2.0 * BLEED, height: overlay.frame.size.height + 2.0 * BLEED })
-                } else { continue };
+                    (
+                        panel,
+                        bunny_ui::layout::Point {
+                            x: overlay.frame.origin.x - BLEED,
+                            y: overlay.frame.origin.y - BLEED,
+                        },
+                        Size {
+                            width: overlay.frame.size.width + 2.0 * BLEED,
+                            height: overlay.frame.size.height + 2.0 * BLEED,
+                        },
+                    )
+                } else {
+                    continue;
+                };
                 let title = match &overlay.surface {
                     bunny_ui::layout::OverlaySurface::Window(spec) => spec.title.to_string(),
                     bunny_ui::layout::OverlaySurface::Alert(spec) => spec.title.to_string(),
                     bunny_ui::layout::OverlaySurface::Layer => String::new(),
                 };
-                semantic_surfaces.push(ffi::accessibility::Surface { key: Some(overlay.path), handle, origin, size, title });
+                semantic_surfaces.push(ffi::accessibility::Surface {
+                    key: Some(overlay.path),
+                    handle,
+                    origin,
+                    size,
+                    title,
+                });
             }
             accessibility.publish(semantic_surfaces);
             // the page's next frame comes after this one went up: the
@@ -1392,8 +1531,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             alt_tap.borrow_mut().interrupted();
         }
         match event {
+            AppEvent::GeometryChanged(_) | AppEvent::DialogGeometryChanged(_) => return,
             AppEvent::Redraw => blit(runtime, root, ORIGIN_REDRAW),
-            AppEvent::WindowClosed => {}
+            AppEvent::WindowClosed => runtime.retire_dialog_geometry(),
             AppEvent::DialogClose { panel } => {
                 // its ✕ or the compositor: the window did NOT close — the
                 // overlay's dismissal flips the app's binding, and the
@@ -1415,6 +1555,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // was already on screen, dozens of times a second, at rest. A
             // change the engine cannot see asks by hand
             // (`bunny_ui::request_frame`).
+            AppEvent::AppearanceChanged(_) => {
+                if runtime.needs_frame() { soon(runtime, root, ORIGIN_WAKE); }
+            }
             AppEvent::Wake => {
                 runtime.poll_tasks();
                 if runtime.needs_frame() || webview::fresh(window.raw_window()) {
@@ -1679,6 +1822,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // presenting commit IS the reveal, so the window never flashes
     Rc::new(Slot {
         lifecycle,
+        confirmation,
+        confirmation_dialogs: dialogs,
         window: window.raw_window(),
         handle: window,
         runtime,

@@ -170,16 +170,94 @@ impl Theme {
 
 thread_local! {
     static THEME: Cell<Theme> = const { Cell::new(Theme::light()) };
-    /// What `install` last set — the theme a runtime without one of its
-    /// own renders under, put back by `restore_installed` after a scene
+    /// The app palette, installed explicitly or supplied by the system —
+    /// put back by `restore_installed` after a scene
     /// that rendered under a quiet theme of its own.
     static INSTALLED: Cell<Theme> = const { Cell::new(Theme::light()) };
     static VERSION: Cell<u64> = const { Cell::new(0) };
+    static APPEARANCE: Cell<Option<Appearance>> = const { Cell::new(None) };
+    static SOURCE: Cell<Source> = const { Cell::new(Source::System) };
 }
 
-/// Swaps the WHOLE theme between frames. The global version bumps — the
-/// next pass of any `Runtime` rebuilds the retention once.
+/// The native application's preferred color scheme.
+///
+/// This observation is independent of the palette installed by the application.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Appearance {
+    /// Light native appearance.
+    Light,
+    /// Dark native appearance.
+    Dark,
+}
+
+impl Appearance {
+    /// Converts a platform's explicitly reported dark-mode preference.
+    #[must_use]
+    pub const fn from_dark(dark: bool) -> Self {
+        if dark { Self::Dark } else { Self::Light }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    System,
+    Custom,
+}
+
+fn system_theme() -> Theme {
+    match system_appearance() {
+        Some(Appearance::Dark) => Theme::dark(),
+        Some(Appearance::Light) | None => Theme::light(),
+    }
+}
+
+/// The latest native appearance, or `None` when unavailable or unspecified.
+///
+/// Read in a component body to derive application colors. A changed native
+/// observation invalidates every runtime's retained body, including when a
+/// custom palette is installed. This is thread-local, like the theme itself.
+/// macOS and Windows report live changes; Linux currently reports at startup.
+/// Shells without an appearance adapter leave the value unavailable.
+pub fn system_appearance() -> Option<Appearance> {
+    APPEARANCE.with(Cell::get)
+}
+
+/// Follows native appearance again after a custom [`install`].
+///
+/// This is the initial policy. Unknown/no preference uses the light built-in
+/// palette. A later native observation updates the tokens automatically.
+pub fn follow_system() {
+    SOURCE.with(|source| source.set(Source::System));
+    replace(system_theme());
+}
+
+/// Supplies a native observation from a platform adapter on the UI thread.
+/// Duplicate reports are inert; a changed report invalidates every runtime
+/// without replacing application-owned tokens.
+#[doc(hidden)]
+pub fn observe_system_appearance(appearance: Option<Appearance>) {
+    if APPEARANCE.with(|current| current.replace(appearance)) == appearance {
+        return;
+    }
+    if SOURCE.with(Cell::get) == Source::System {
+        let theme = system_theme();
+        THEME.with(|current| current.set(theme));
+        INSTALLED.with(|installed| installed.set(theme));
+    }
+    VERSION.with(|version| version.set(version.get() + 1));
+}
+
+/// Swaps the whole theme and selects application-owned tokens.
+///
+/// Native observations remain available but never overwrite this palette. Call
+/// [`follow_system`] to resume automatic tokens. The version bumps so every
+/// runtime rebuilds its retained output on the next pass.
 pub fn install(theme: Theme) {
+    SOURCE.with(|source| source.set(Source::Custom));
+    replace(theme);
+}
+
+fn replace(theme: Theme) {
     THEME.with(|current| current.set(theme));
     INSTALLED.with(|installed| installed.set(theme));
     VERSION.with(|version| version.set(version.get() + 1));
@@ -203,7 +281,7 @@ pub fn restore_installed() {
     THEME.with(|current| current.set(INSTALLED.with(|installed| installed.get())));
 }
 
-/// The theme `install` last set, whatever a scene set quietly since.
+/// The app palette, whatever a scene set quietly since.
 pub fn installed() -> Theme {
     INSTALLED.with(|installed| installed.get())
 }
@@ -213,7 +291,7 @@ pub fn current() -> Theme {
     THEME.with(|theme| theme.get())
 }
 
-/// The installed theme's version — whoever retains derived output compares it.
+/// The palette and native-appearance version; retained output compares it.
 pub fn version() -> u64 {
     VERSION.with(|version| version.get())
 }

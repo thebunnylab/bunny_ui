@@ -211,10 +211,11 @@ pub enum Modifier {
     /// `.alert(…)`: a dialog's window with an ask's manners — one size
     /// fitted to the content, Escape, ⌘. and the close button all the
     /// cancel answer, Return the default button, and the keyboard held
-    /// by the alert while it is up.
+    /// by the alert while it is up. The spec is boxed to keep every
+    /// retained modifier within the scene-node memory budget.
     Alert {
         is_presented: Binding<bool>,
-        spec: crate::layout::AlertSpec,
+        spec: Box<crate::layout::AlertSpec>,
         content: Rc<dyn Fn(&Context) -> crate::erased::Erased>,
     },
     /// An anchored popover: the modified view is the ANCHOR, `side`
@@ -1358,7 +1359,7 @@ pub(crate) fn apply(
                     path: path.clone(),
                     content: Rc::new(wrap_layout(dialog_layouts.clone())),
                     child: Box::new(base),
-                    surface: crate::layout::OverlaySurface::Window((**spec).clone()),
+                    surface: crate::layout::OverlaySurface::Window(Rc::new((**spec).clone())),
                 }),
                 None => out.wrap_layout_from(mark, |base| LayoutNode::Layered {
                     align: CrossAlign::Center,
@@ -1425,7 +1426,7 @@ pub(crate) fn apply(
                         child: Box::new(wrap_layout(alert_layouts.clone())),
                     }),
                     child: Box::new(base),
-                    surface: crate::layout::OverlaySurface::Alert(spec.clone()),
+                    surface: crate::layout::OverlaySurface::Alert((**spec).clone()),
                 }),
                 None => out.wrap_layout_from(mark, |base| LayoutNode::Layered {
                     align: CrossAlign::Center,

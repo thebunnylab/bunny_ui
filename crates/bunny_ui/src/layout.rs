@@ -3349,8 +3349,8 @@ pub struct ScrollRegion {
 pub enum OverlaySurface {
     /// The in-scene layer — the road every popover and sheet rides.
     Layer,
-    /// A real titled window, wearing the spec.
-    Window(DialogSpec),
+    /// A real titled window. Its rare spec is shared to keep every retained node small.
+    Window(Rc<DialogSpec>),
     /// A real window with an alert's manners, wearing the spec.
     Alert(AlertSpec),
 }
@@ -3396,6 +3396,8 @@ pub struct DialogSpec {
     /// the floor.
     pub open: Option<Size>,
     pub chrome: DialogChrome,
+    /// Optional native placement restoration and observation, owned by the app.
+    pub geometry: Option<crate::window::DialogGeometry>,
 }
 
 impl DialogSpec {
@@ -3407,6 +3409,7 @@ impl DialogSpec {
             min: Size { width: 320.0, height: 240.0 },
             open: None,
             chrome: DialogChrome::Native,
+            geometry: None,
         }
     }
 
@@ -3422,6 +3425,14 @@ impl DialogSpec {
     /// under the floor opens at the floor.
     pub fn opens_at(mut self, width: Px, height: Px) -> Self {
         self.open = Some(Size { width, height });
+        self
+    }
+
+    /// Restores and observes native content placement through a persistent controller.
+    /// Layout-local frames are not global desktop coordinates.
+    #[must_use]
+    pub fn geometry(mut self, geometry: crate::window::DialogGeometry) -> Self {
+        self.geometry = Some(geometry);
         self
     }
 
@@ -3466,12 +3477,19 @@ pub struct AlertSpec {
     /// The content's width. Its height is the content's own answer at
     /// this width.
     pub width: Px,
+    /// Native acknowledgement token used by the framework confirmation adapter.
+    #[doc(hidden)]
+    pub confirmation_token: Option<std::num::NonZeroUsize>,
 }
 
 impl AlertSpec {
     /// An ask named `title`, laid out `width` points wide.
     pub fn new(title: impl Into<Arc<str>>, width: Px) -> Self {
-        Self { title: title.into(), width }
+        Self {
+            title: title.into(),
+            width,
+            confirmation_token: None,
+        }
     }
 }
 
@@ -3788,16 +3806,6 @@ pub(crate) fn field_run_x(
     }
 }
 
-/// Where the glyph boundary after a logical prefix of `prefix_width`
-/// stands on a line that starts at `line_x` and is `line_width` wide:
-/// so far from the left on a left-to-right line, so far from the right
-/// on a right-to-left one — the engines draw a right-to-left run in
-/// visual order, so its logical start is its right end. Exact for a
-/// line of one direction; a mixed line is placed by its first word.
-pub(crate) fn field_glyph_x(line_x: Px, line_width: Px, line_rtl: bool, prefix_width: Px) -> Px {
-    if line_rtl { line_x + line_width - prefix_width } else { line_x + prefix_width }
-}
-
 /// Which visual line owns a byte: the FIRST whose end reaches it, so a
 /// caret at a break belongs to the line it was typed on and not to the
 /// one after. Never empty — a field always has at least one line.
@@ -4062,6 +4070,26 @@ pub struct Placement {
 }
 
 impl Placement {
+    /// Controllers declared inside an exact DOM subtree or canvas island.
+    pub(crate) fn dialog_geometry(
+        &self,
+    ) -> impl Iterator<Item = (&str, &crate::window::DialogGeometry)> {
+        self.overlay_queue
+            .iter()
+            .map(|overlay| (overlay.path.as_str(), &overlay.surface))
+            .chain(
+                self.overlays
+                    .iter()
+                    .map(|overlay| (overlay.path.as_str(), &overlay.surface)),
+            )
+            .filter_map(|(path, surface)| match surface {
+                OverlaySurface::Window(spec) => {
+                    spec.geometry.as_ref().map(|controller| (path, controller))
+                }
+                _ => None,
+            })
+    }
+
     fn can_reveal_focus(&self, frame: Rect) -> bool {
         !frame.is_empty() && (!self.region_stack.is_empty() || self.accessible_bounds(frame).is_some())
     }
@@ -6710,7 +6738,9 @@ impl LayoutNode {
                     let bounds = out.accessible_bounds(frame);
                     if let Some(bounds) = bounds.filter(|bounds| !bounds.is_empty()) {
                         out.accessibility.push(crate::accessibility::Placed {
-                            enabled: true, checked: None,
+                            enabled: true,
+                            checked: None,
+                            range: None,
                             path: Rc::from(path.as_str()),
                             role: if *secret { crate::accessibility::Role::PasswordField } else { crate::accessibility::Role::TextField },
                             label: Arc::clone(placeholder),
@@ -6878,10 +6908,14 @@ impl LayoutNode {
                 // in a left-to-right scene is where it always was and
                 // measures nothing new; every other line knows its width
                 let anchor_rtl = env.rtl();
-                let line_geometry = |start: usize, end: usize| -> (Px, Px, bool) {
+                let line_placement = |start: usize, end: usize| -> (Px, Px, bool) {
                     let line_rtl = crate::text_input::reads_right_to_left(&sample[start..end]);
-                    if !anchor_rtl && !line_rtl
-                        && matches!(env.text_align, None | Some(motor::views::TextAlignment::Leading))
+                    if !anchor_rtl
+                        && !line_rtl
+                        && matches!(
+                            env.text_align,
+                            None | Some(motor::views::TextAlignment::Leading)
+                        )
                     {
                         return (text_origin.x, 0.0, false);
                     }
@@ -6914,11 +6948,16 @@ impl LayoutNode {
                     if y + paint_bottom <= frame.origin.y {
                         continue;
                     }
-                    let (line_x, line_w, line_rtl) = line_geometry(start, end);
-                    let glyph = |prefix: Px| field_glyph_x(line_x, line_w, line_rtl, prefix);
-                    // a band between two glyph boundaries, whichever way
-                    // the line puts them
-                    let band = |a: Px, b: Px| if a <= b { (a, b) } else { (b, a) };
+                    let (line_x, _, line_rtl) = line_placement(start, end);
+                    let spans = |head: usize, tail: usize| {
+                        crate::text_engine::line_spans(
+                            &sample[start..end],
+                            head - start..tail - start,
+                            &env.font,
+                            env.text,
+                            env.cache,
+                        )
+                    };
                     // selection behind the text
                     if let Some((from, to)) = selection {
                         let head = from.clamp(start, end);
@@ -6928,27 +6967,40 @@ impl LayoutNode {
                         // empty line would show nothing at all
                         let over = to > end && from <= end;
                         if head < tail || over {
-                            let (mut x0, mut x1) =
-                                band(glyph(width_of(start, head)), glyph(width_of(start, tail)));
+                            let mut bands = spans(head, tail);
                             if over {
-                                // the line's end: its left on a right-to-left line
-                                if line_rtl { x0 -= line_h / 2.0 } else { x1 += line_h / 2.0 }
+                                // A selected paragraph separator occupies the visual
+                                // end of the line, beyond its text advance.
+                                let edge = if line_rtl { 0.0 } else { width_of(start, end) };
+                                bands.push(if line_rtl {
+                                    edge - line_h / 2.0..edge
+                                } else {
+                                    edge..edge + line_h / 2.0
+                                });
                             }
-                            out.draw(DrawCommand::FillRect {
-                                rect: Rect {
-                                    origin: Point { x: x0, y },
-                                    size: Size { width: x1 - x0, height: line_h },
-                                },
-                                color: theme.selection,
-                                corner_radius: Corners::ZERO,
-                            });
+                            for band in bands {
+                                out.draw(DrawCommand::FillRect {
+                                    rect: Rect {
+                                        origin: Point {
+                                            x: line_x + band.start,
+                                            y,
+                                        },
+                                        size: Size {
+                                            width: band.end - band.start,
+                                            height: line_h,
+                                        },
+                                    },
+                                    color: theme.selection,
+                                    corner_radius: Corners::ZERO,
+                                });
+                            }
                         }
                     }
                     if start < end {
                         // the SAME splitter a `text(…)` uses, on the
                         // same record — the placeholder is not the
                         // content, so its ranges would name nothing
-                        emit_text_runs(
+                        emit_editor_line(
                             sample,
                             (start, end),
                             highlights.as_ref().filter(|_| !content.is_empty()),
@@ -6964,16 +7016,22 @@ impl LayoutNode {
                         let head = from.clamp(start, end);
                         let tail = to.clamp(start, end);
                         if head < tail {
-                            let (x0, x1) =
-                                band(glyph(width_of(start, head)), glyph(width_of(start, tail)));
-                            out.draw(DrawCommand::FillRect {
-                                rect: Rect {
-                                    origin: Point { x: x0, y: y + line_h - 1.0 },
-                                    size: Size { width: x1 - x0, height: 1.0 },
-                                },
-                                color: theme.caret,
-                                corner_radius: Corners::ZERO,
-                            });
+                            for band in spans(head, tail) {
+                                out.draw(DrawCommand::FillRect {
+                                    rect: Rect {
+                                        origin: Point {
+                                            x: line_x + band.start,
+                                            y: y + line_h - 1.0,
+                                        },
+                                        size: Size {
+                                            width: band.end - band.start,
+                                            height: 1.0,
+                                        },
+                                    },
+                                    color: theme.caret,
+                                    corner_radius: Corners::ZERO,
+                                });
+                            }
                         }
                     }
                 }
@@ -6985,53 +7043,104 @@ impl LayoutNode {
                     let shape = crate::reconciler::field_caret_shape(path);
                     let index = caret_line(lines, caret, shape);
                     let (start, end) = lines[index];
-                    let next = content.get(caret..).and_then(|tail| tail.chars().next())
+                    let next = content
+                        .get(caret..)
+                        .and_then(|tail| tail.chars().next())
                         .filter(|ch| *ch != '\n' && *ch != '\r')
-                        .map(|ch| caret + ch.len_utf8())
+                        .map(|_| crate::grapheme::next(content, caret))
                         .filter(|next| *next <= end);
-                    let width = if shape == CaretShape::Bar {
+                    // The empty insertion point is independent of its placeholder.
+                    let (line_x, _, line_rtl) = if content.is_empty() {
+                        (
+                            field_run_x(run, 0.0, 0.0, env.text_align, anchor_rtl, false),
+                            0.0,
+                            false,
+                        )
+                    } else {
+                        line_placement(start, end)
+                    };
+                    let line = if content.is_empty() {
+                        ""
+                    } else {
+                        &sample[start..end]
+                    };
+                    let local = caret.saturating_sub(start);
+                    let boundary = crate::text_engine::line_caret_x(
+                        line,
+                        local,
+                        state.affinity,
+                        &env.font,
+                        env.text,
+                        env.cache,
+                    );
+                    let mut bands = if shape == CaretShape::Bar {
+                        vec![boundary..boundary + FIELD_CARET_W]
+                    } else if let Some(next) = next {
+                        crate::text_engine::line_spans(
+                            line,
+                            local..next - start,
+                            &env.font,
+                            env.text,
+                            env.cache,
+                        )
+                    } else {
+                        let width = env
+                            .cache
+                            .get_or_measure(" ", &env.font, env.text)
+                            .width
+                            .max(FIELD_CARET_W);
+                        vec![if line_rtl {
+                            boundary - width..boundary
+                        } else {
+                            boundary..boundary + width
+                        }]
+                    };
+                    let height = if shape == CaretShape::Underline {
                         FIELD_CARET_W
                     } else {
-                        next.map_or_else(
-                            || env.cache.get_or_measure(" ", &env.font, env.text).width,
-                            |next| width_of(caret, next),
-                        ).max(FIELD_CARET_W)
+                        line_h
                     };
-                    let height = if shape == CaretShape::Underline { FIELD_CARET_W } else { line_h };
-                    // the boundary the caret stands at — and a caret that
-                    // covers the NEXT character covers it on the side the
-                    // line continues to, the left on a right-to-left line
-                    // An empty editor's insertion point aligns an empty run,
-                    // independently of the placeholder's visible width.
-                    let (line_x, line_w, line_rtl) = if content.is_empty() {
-                        (field_run_x(run, 0.0, 0.0, env.text_align, anchor_rtl, false), 0.0, false)
-                    } else {
-                        line_geometry(start, end)
-                    };
-                    let boundary =
-                        field_glyph_x(line_x, line_w, line_rtl, width_of(start, caret.max(start)));
-                    let origin = Point {
-                        x: if line_rtl && shape != CaretShape::Bar { boundary - width } else { boundary },
-                        y: text_origin.y + index as Px * line_h,
-                    };
-                    out.draw(DrawCommand::FillRect {
-                        rect: Rect {
-                            origin: Point { x: origin.x, y: origin.y + line_h - height },
-                            size: Size { width, height },
-                        },
-                        color: theme.caret,
-                        corner_radius: if shape == CaretShape::Bar {
-                            Corners::all(FIELD_CARET_W / 2.0)
-                        } else { Corners::ZERO },
-                    });
-                    // Keep the covered character readable on a solid block.
-                    // Empty content must not borrow a glyph from the placeholder.
-                    if shape == CaretShape::Block && let Some(next) = next {
-                        emit_text_runs(
-                            content, (caret, next), None,
-                            Point { x: origin.x, y: origin.y + leading },
-                            theme.field, env, out,
-                        );
+                    let y = text_origin.y + index as Px * line_h;
+                    for band in &mut bands {
+                        band.end = band.end.max(band.start + FIELD_CARET_W);
+                        let rect = Rect {
+                            origin: Point {
+                                x: line_x + band.start,
+                                y: y + line_h - height,
+                            },
+                            size: Size {
+                                width: band.end - band.start,
+                                height,
+                            },
+                        };
+                        out.draw(DrawCommand::FillRect {
+                            rect,
+                            color: theme.caret,
+                            corner_radius: if shape == CaretShape::Bar {
+                                Corners::all(FIELD_CARET_W / 2.0)
+                            } else {
+                                Corners::ZERO
+                            },
+                        });
+                        if shape == CaretShape::Block && next.is_some() {
+                            // Repaint the SAME shaped line through the block's clip.
+                            // Shaping a selected substring would lose ligatures,
+                            // kerning and its original directional context.
+                            out.push_clip(rect, 0.0);
+                            emit_text_runs(
+                                content,
+                                (start, end),
+                                None,
+                                Point {
+                                    x: line_x,
+                                    y: y + leading,
+                                },
+                                theme.field,
+                                env,
+                                out,
+                            );
+                            out.pop_clip();
+                        }
                     }
                 }
                 out.pop_clip();
@@ -7057,7 +7166,7 @@ impl LayoutNode {
                     frame,
                     run,
                     text_origin: Point {
-                        x: line_geometry(lines[0].0, lines[0].1).0,
+                        x: line_placement(lines[0].0, lines[0].1).0,
                         y: text_origin.y,
                     },
                     font: env.font,
@@ -7092,8 +7201,27 @@ impl LayoutNode {
             }
 
             (LayoutNode::Custom { path, element }, Fit::Leaf) => {
-                let focusable = !path.is_empty() && out.can_reveal_focus(frame)
-                    && element.element().accepts_keys() && !element.element().leaves_keyboard();
+                if env.accessibility
+                    && !path.is_empty()
+                    && let Some(range) = element.element().accessibility_range()
+                {
+                    out.accessibility.push(crate::accessibility::Placed {
+                        enabled: element.element().accepts_keys(),
+                        checked: None,
+                        range: Some(range),
+                        path: Rc::from(path.as_str()),
+                        role: crate::accessibility::Role::Slider,
+                        label: Arc::from(""),
+                        value: None,
+                        bounds: out.accessible_bounds(frame),
+                        surface: out.accessibility_surface.clone(),
+                        multiline: false,
+                    });
+                }
+                let focusable = !path.is_empty()
+                    && out.can_reveal_focus(frame)
+                    && element.element().accepts_keys()
+                    && !element.element().leaves_keyboard();
                 if focusable {
                     out.focus_order.push(FocusStop {
                         path: Rc::from(path.as_str()), frame,
@@ -9203,6 +9331,67 @@ fn place_text(
             out,
         );
     }
+}
+
+/// Color an editable line by clipping its original shape, so highlights cannot
+/// reshape substrings and invalidate caret, selection or IME coordinates.
+fn emit_editor_line(
+    content: &Arc<str>,
+    line: (usize, usize),
+    highlights: Option<&TextHighlight>,
+    origin: Point,
+    base_color: Color,
+    env: &LayoutEnv<'_>,
+    out: &mut Placement,
+) {
+    let native = highlights.and_then(|highlight| {
+        let geometry = env
+            .cache
+            .get_or_geometry(&content[line.0..line.1], &env.font, env.text)?;
+        Some((highlight, geometry, out.current_clip()?))
+    });
+    let Some((highlight, geometry, clip)) = native else {
+        emit_text_runs(content, line, highlights, origin, base_color, env, out);
+        return;
+    };
+    let left = clip.origin.x - origin.x;
+    let right = left + clip.size.width;
+    let mut spans = Vec::new();
+    for &(start, end) in highlight.ranges.iter() {
+        let start = crate::text_input::clamp_index(content, start).clamp(line.0, line.1);
+        let end = crate::text_input::clamp_index(content, end).clamp(start, line.1);
+        spans.extend(geometry.selection_spans(start - line.0..end - line.0));
+    }
+    spans.sort_by(|a, b| a.start.total_cmp(&b.start));
+    let mut paint = |start: Px, end: Px, color| {
+        if end <= start {
+            return;
+        }
+        out.push_clip(
+            Rect {
+                origin: Point {
+                    x: origin.x + start,
+                    y: clip.origin.y,
+                },
+                size: Size {
+                    width: end - start,
+                    height: clip.size.height,
+                },
+            },
+            0.0,
+        );
+        emit_text_runs(content, line, None, origin, color, env, out);
+        out.pop_clip();
+    };
+    let mut cursor = left;
+    for span in spans {
+        let start = span.start.clamp(cursor, right);
+        let end = span.end.clamp(start, right);
+        paint(cursor, start, base_color);
+        paint(start, end, highlight.color);
+        cursor = end;
+    }
+    paint(cursor, right, base_color);
 }
 
 /// Emits the `TextLine`s of ONE line: whole in the base color, or sliced

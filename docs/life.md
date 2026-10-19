@@ -235,6 +235,72 @@ app that already EXITED needs a COM server the registry knows — both
 the app's own setup. Linux announces sleep only where logind runs,
 which is where a laptop runs.
 
+## Persistent dialog placement
+
+A `.dialog` can opt into native placement with
+`DialogSpec::titled("Inspector").geometry(controller.clone())`, where
+`controller` is `bunny_ui::window::DialogGeometry`. Keep one controller per
+independently open dialog. `DialogGeometry::new()` retains the usual initial
+placement; `DialogGeometry::restoring(saved_placement)` requests a saved content
+frame. Minimum sizes and available desktop work areas still apply. Alerts
+retain their ordinary centered, content-sized policy.
+
+`controller.on_change(|result| { ... })` receives actual native geometry or a
+restoration error on the UI thread, outside native and renderer borrows. Save
+successful `WindowGeometry::placement()` values in the application's own
+storage, including the `DesktopSpace` tag; pass one back when constructing the
+controller in a fresh process. The framework adds no serialization or storage
+dependency. `geometry()` retains the last actual observation after dismissal;
+reopening prefers it to the original restoration request. A request alone never
+populates this getter. `last_error()` retains the last failure of the current
+presentation even if later native observations succeed.
+
+Each opening owns a separate presentation lease. Dismissal, controller
+replacement and parent destruction invalidate its queued events, including
+when the app retains the runtime or AppKit pools the native window. Replacing
+or clearing the callback invalidates events captured for the old subscription.
+Callbacks may close or reopen windows; reentrant observations retain their
+order and only consecutive identical results are suppressed. Simultaneously
+attaching one controller to multiple presentations reports `GeometryInUse` and
+leaves the original presentation's lease intact.
+
+AppKit positions use points relative to the primary display's top-left; Win32
+and X11 positions use their tagged desktop/root pixels. A position from a
+different desktop space is rejected before changing size. Wayland rejects
+requests containing global position. Its dialog size and scale observations
+come from actual native buffer commits, independently of the pending layout
+request. A compositor-controlled size cannot be replaced by a client request.
+Scene-only hosts, including DOM flow and canvas islands, explicitly report
+`Unsupported` and produce no native geometry.
+
+The `dialog_geometry` native test covers restore, close/reopen, live controller
+replacement, invalid coordinate spaces, minimum sizes, missing displays,
+closing the parent from a callback and persistence into a second process.
+Linux runs with `BUNNY_DIALOG_GEOMETRY_PROBE=1` under the X11/Wayland display
+harness. These are native API observations, not physical input, pixel,
+screen-reader or mixed-display qualification.
+
+## macOS dialog modality
+
+`.dialog` creates a child `NSWindow` with framework-managed modality. It is
+not an AppKit sheet or an OS-modal session. Each scene owns its ordered
+dialog stack: its parent and lower dialogs refuse key/main status, while
+independent scenes remain eligible. The stack follows layout order, including
+when a pooled dialog reopens. Ending modality restores each standard button's
+previous enabled state; it cannot enable a prohibited minimize button.
+
+Opening requests focus for the top dialog. Closing the key dialog requests
+focus for the remaining top dialog or its parent; a background dismissal
+does not request focus away from another scene. The OS decides whether to
+grant those requests. Closing a parent retires only its own modal scope.
+
+`cargo test -p bunny-ui-macos --test window_modality` runs the public dialog
+API on the process main thread and inspects real AppKit eligibility and button
+state. It covers independent modal scopes, nesting, repeated reopen, retained
+hide/show and parent teardown. These observations do not verify synthetic
+pointer blocking, granted focus, visible pixels or mixed-display DPI; those
+require the separate native interaction qualification.
+
 ## Native window presentation regression
 
 On macOS, each top-level window and pooled dialog has its own presenter,
@@ -251,3 +317,55 @@ capture denial fails qualification; the script does not turn it into a skip.
 `BUNNY_PRESENT=cpu` exercises the explicit CPU fallback with the same probe.
 The output directory must be fresh, so a stage acknowledgement cannot come
 from an earlier run.
+
+## System appearance and palette ownership
+
+`theme::system_appearance()` returns the latest `Option<Appearance>` reported
+by the native shell. Read it inside a component body to derive custom colors;
+changed observations invalidate retained bodies in every runtime. `None` means
+unavailable or no preference, not an observed light appearance.
+
+The built-in tokens initially follow the system. `theme::install(palette)`
+selects application-owned tokens; later native changes remain observable but
+cannot overwrite that palette. `theme::follow_system()` opts back into automatic
+light/dark tokens using the latest observation, with light as the documented
+fallback for `None`. Repeated identical native reports are inert. Ownership is
+process/UI-thread policy, independent of the version counter and which window
+opened first.
+
+macOS captures application-effective appearance at window creation and observes
+[`NSApplication.effectiveAppearance` with KVO](https://developer.apple.com/documentation/uikit/supporting-dark-mode-in-your-interface).
+It uses AppKit's best-match operation for light/dark, including high-contrast
+variants, and defers scene delivery onto the existing main-loop wake. A
+window-specific native override is not a new system preference and cannot
+prevent the application observer from delivering changes. Windows reports
+its initial registry preference and refreshes it on
+[`WM_SETTINGCHANGE`](https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-settingchange).
+iOS trait and Android configuration events use the same ownership policy.
+Linux subscribes before reading the initial portal preference and receives
+[`Settings.SettingChanged`](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Settings.html)
+through the X11 and Wayland event loops. The UI thread owns one private session
+connection and polls libdbus-provided watches, including outgoing readiness.
+Messages must match the current portal owner, object, interface, key and type.
+No preference and unknown numeric schemes become `None`; malformed or unrelated
+signals do not replace a valid observation. Portal owner loss clears the value;
+reacquisition reads the new owner's current value with a bounded request.
+An installed portal can activate on the initial Read. A missing or disconnected
+session bus remains unavailable until process restart. Native scenes receive
+changes outside bus and display borrows. No settings timer, background thread
+or new runtime dependency is involved. Shells without an appearance adapter
+leave the observation unavailable.
+
+`cargo test -p bunny-ui-core --test system_appearance --all-features` covers
+palette ownership and retained scenes. `cargo test -p bunny-ui-macos --test
+system_appearance` changes only the test process's application appearance and
+checks native callback delivery, later windows and teardown of the first window.
+It does not change the user's system preferences or claim physical input,
+visible pixels, or observation of a system-settings interaction.
+
+The Linux `system_appearance` fixture uses an isolated fake portal on a real
+session bus, native X11/Wayland windows and normal/paranoid runs in
+`scripts/check-linux-accessibility.sh`. It checks initial/live values, explicit
+palette ownership, malformed/unrelated signals, service loss/reacquisition, session-bus disconnect and
+surviving windows. This verifies protocol integration and scene evaluation,
+not an actual desktop settings panel, physical input or presented pixels.

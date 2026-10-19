@@ -86,6 +86,7 @@ pub mod ssr;
 pub mod state_ext;
 pub mod stats;
 pub mod text_engine;
+pub mod text_geometry;
 pub mod text_value;
 pub mod text_input;
 mod field_history;

@@ -3,7 +3,7 @@
 //!
 //! The mac's app menu and Window menu, the Edit items every platform
 //! lists, the iPad's Settings row, a notification's default action on
-//! a Linux desktop, the Android channel's name: nineteen words no app
+//! a Linux desktop, the Android channel's name: twenty-one words no app
 //! can reach, because the shell writes them. They come from a
 //! [`Catalog`] of sixteen languages, picked by the locale in effect —
 //! and the app has the last word through [`install`], a hook that may
@@ -28,7 +28,7 @@ use motor::state::Locale;
 use crate::catalog::{Catalog, Key, Strings, Table, fill};
 
 /// How many words the framework owns — the length of every table.
-pub const WORDS: usize = 19;
+pub const WORDS: usize = 21;
 
 /// One of the framework's own words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -68,6 +68,10 @@ pub enum Word {
     /// The name of the one channel the app's notifications ride, where
     /// the platform lists channels.
     Notifications,
+    /// An affirmative answer to a confirmation question.
+    Yes,
+    /// A negative answer to a confirmation question.
+    No,
 }
 
 impl Word {
@@ -92,6 +96,8 @@ impl Word {
         Word::SelectAll,
         Word::Open,
         Word::Notifications,
+        Self::Yes,
+        Self::No,
     ];
 
     /// Does the word name the app — is its entry a template with `{app}`?
@@ -111,17 +117,19 @@ impl Key for Word {
 /// One language's words.
 pub type WordTable = Table<WORDS>;
 
-// Every table lists the words in this order, on these four lines:
+// Every table lists the words in this order, on these five lines:
 //   About, Settings, Services, Hide, HideOthers, ShowAll, Quit
 //   Window, Minimize, Zoom, BringAllToFront
 //   Undo, Redo, Cut, Copy, Paste, SelectAll
 //   Open, Notifications
+//   Yes, No
 #[rustfmt::skip]
 const EN: WordTable = Table { tag: "en", entries: [
     "About {app}", "Settings…", "Services", "Hide {app}", "Hide Others", "Show All", "Quit {app}",
     "Window", "Minimize", "Zoom", "Bring All to Front",
     "Undo", "Redo", "Cut", "Copy", "Paste", "Select All",
     "Open", "Notifications",
+    "Yes", "No",
 ]};
 
 /// Brazilian Portuguese, tagged `pt`: `pt-BR` and bare `pt` both land
@@ -132,6 +140,7 @@ const PT: WordTable = Table { tag: "pt", entries: [
     "Janela", "Minimizar", "Zoom", "Trazer Tudo para a Frente",
     "Desfazer", "Refazer", "Recortar", "Copiar", "Colar", "Selecionar Tudo",
     "Abrir", "Notificações",
+    "Sim", "Não",
 ]};
 
 #[rustfmt::skip]
@@ -140,6 +149,7 @@ const PT_PT: WordTable = Table { tag: "pt-PT", entries: [
     "Janela", "Minimizar", "Zoom", "Trazer Tudo para a Frente",
     "Anular", "Refazer", "Cortar", "Copiar", "Colar", "Selecionar Tudo",
     "Abrir", "Notificações",
+    "Sim", "Não",
 ]};
 
 #[rustfmt::skip]
@@ -148,6 +158,7 @@ const ES: WordTable = Table { tag: "es", entries: [
     "Ventana", "Minimizar", "Zoom", "Traer todo al frente",
     "Deshacer", "Rehacer", "Cortar", "Copiar", "Pegar", "Seleccionar todo",
     "Abrir", "Notificaciones",
+    "Sí", "No",
 ]};
 
 #[rustfmt::skip]
@@ -156,6 +167,7 @@ const FR: WordTable = Table { tag: "fr", entries: [
     "Fenêtre", "Placer dans le Dock", "Zoom", "Tout ramener au premier plan",
     "Annuler", "Rétablir", "Couper", "Copier", "Coller", "Tout sélectionner",
     "Ouvrir", "Notifications",
+    "Oui", "Non",
 ]};
 
 #[rustfmt::skip]
@@ -164,6 +176,7 @@ const DE: WordTable = Table { tag: "de", entries: [
     "Fenster", "Im Dock ablegen", "Zoomen", "Alle nach vorne bringen",
     "Widerrufen", "Wiederholen", "Ausschneiden", "Kopieren", "Einsetzen", "Alles auswählen",
     "Öffnen", "Mitteilungen",
+    "Ja", "Nein",
 ]};
 
 #[rustfmt::skip]
@@ -172,6 +185,7 @@ const IT: WordTable = Table { tag: "it", entries: [
     "Finestra", "Contrai", "Zoom", "Porta tutto in primo piano",
     "Annulla", "Ripeti", "Taglia", "Copia", "Incolla", "Seleziona tutto",
     "Apri", "Notifiche",
+    "Sì", "No",
 ]};
 
 #[rustfmt::skip]
@@ -180,6 +194,7 @@ const JA: WordTable = Table { tag: "ja", entries: [
     "ウインドウ", "しまう", "拡大/縮小", "すべてを手前に移動",
     "取り消す", "やり直す", "カット", "コピー", "ペースト", "すべてを選択",
     "開く", "通知",
+    "はい", "いいえ",
 ]};
 
 #[rustfmt::skip]
@@ -188,6 +203,7 @@ const ZH_HANS: WordTable = Table { tag: "zh-Hans", entries: [
     "窗口", "最小化", "缩放", "前置全部窗口",
     "撤销", "重做", "剪切", "拷贝", "粘贴", "全选",
     "打开", "通知",
+    "是", "否",
 ]};
 
 #[rustfmt::skip]
@@ -196,6 +212,7 @@ const ZH_HANT: WordTable = Table { tag: "zh-Hant", entries: [
     "視窗", "縮到最小", "縮放", "全部移至最前",
     "還原", "重做", "剪下", "拷貝", "貼上", "全選",
     "打開", "通知",
+    "是", "否",
 ]};
 
 #[rustfmt::skip]
@@ -204,6 +221,7 @@ const KO: WordTable = Table { tag: "ko", entries: [
     "윈도우", "최소화", "확대/축소", "모두 앞으로 가져오기",
     "실행 취소", "실행 복귀", "오려두기", "복사하기", "붙여넣기", "전체 선택",
     "열기", "알림",
+    "예", "아니요",
 ]};
 
 #[rustfmt::skip]
@@ -212,6 +230,7 @@ const NL: WordTable = Table { tag: "nl", entries: [
     "Venster", "Minimaliseer", "Zoom", "Haal alles naar voren",
     "Herstel", "Opnieuw", "Knip", "Kopieer", "Plak", "Selecteer alles",
     "Open", "Meldingen",
+    "Ja", "Nee",
 ]};
 
 #[rustfmt::skip]
@@ -220,6 +239,7 @@ const RU: WordTable = Table { tag: "ru", entries: [
     "Окно", "Свернуть", "Масштаб", "Все окна на передний план",
     "Отменить", "Повторить", "Вырезать", "Скопировать", "Вставить", "Выбрать все",
     "Открыть", "Уведомления",
+    "Да", "Нет",
 ]};
 
 /// Turkish inflects what it attaches to, and a suffix cannot attach to
@@ -231,6 +251,7 @@ const TR: WordTable = Table { tag: "tr", entries: [
     "Pencere", "Küçült", "Yakınlaştır", "Tümünü Öne Getir",
     "Geri Al", "Yinele", "Kes", "Kopyala", "Yapıştır", "Tümünü Seç",
     "Aç", "Bildirimler",
+    "Evet", "Hayır",
 ]};
 
 #[rustfmt::skip]
@@ -239,6 +260,7 @@ const PL: WordTable = Table { tag: "pl", entries: [
     "Okno", "Minimalizuj", "Powiększ", "Wszystkie na wierzch",
     "Cofnij", "Przywróć", "Wytnij", "Kopiuj", "Wklej", "Zaznacz wszystko",
     "Otwórz", "Powiadomienia",
+    "Tak", "Nie",
 ]};
 
 #[rustfmt::skip]
@@ -247,11 +269,13 @@ const SV: WordTable = Table { tag: "sv", entries: [
     "Fönster", "Minimera", "Zooma", "Lägg alla överst",
     "Ångra", "Gör om", "Klipp ut", "Kopiera", "Klistra in", "Markera allt",
     "Öppna", "Notiser",
+    "Ja", "Nej",
 ]};
 
 /// The sixteen tables, English first — the source every other falls to.
-pub static TABLES: [WordTable; 16] =
-    [EN, PT, PT_PT, ES, FR, DE, IT, JA, ZH_HANS, ZH_HANT, KO, NL, RU, TR, PL, SV];
+pub static TABLES: [WordTable; 16] = [
+    EN, PT, PT_PT, ES, FR, DE, IT, JA, ZH_HANS, ZH_HANT, KO, NL, RU, TR, PL, SV,
+];
 
 /// The framework's words as a catalog — [`Words::for_locale`] picks
 /// from it; a tool lists it.

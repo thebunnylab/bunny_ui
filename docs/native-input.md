@@ -97,6 +97,13 @@ and IME composition ranges retain their UTF-16/scalar contract; content is never
 normalized. Word commands retain their existing character classes, and horizontal
 movement remains logical rather than visual BiDi navigation.
 
+Soft wrapping also keeps extended grapheme clusters intact, including a space
+with combining marks. An overlong word breaks only between clusters. A single
+cluster wider than the available line overflows intact rather than being split;
+it does not add an empty trailing row. Hard newlines retain their existing line
+boundaries. This is grapheme-safe wrapping, not Unicode line-break tailoring or
+paragraph-aware bidirectional layout.
+
 The boundary rules are Unicode 17.0.0 / UAX #29 revision 47. The core has no new
 dependency. All 766 official GraphemeBreakTest cases exercise the public edit API
 forward, backward and from interior scalar positions. Generated property inputs
@@ -105,6 +112,46 @@ uses `scripts/generate-grapheme-tables.py` with those downloaded files and the
 build-time Python package `blake3==1.0.8`. The Unicode data license is retained
 beside the test corpus. Ordinary ASCII edits inspect local boundaries; regional
 indicator parity can require scanning the preceding indicator run.
+
+## Native shaped-line geometry
+
+`TextEngine::line_geometry` optionally returns validated `LineGeometry` cells
+in logical UTF-8 order, with directed visual edges for every scalar. CoreText
+uses complete-line caret enumeration, DirectWrite uses full-layout hit testing,
+and Linux reads the same HarfBuzz/FriBidi clusters used by the raster path. The
+core never receives a native handle. Engines that leave this method at `None`
+keep the existing prefix approximation; that fallback is not native BiDi parity.
+
+`CaretState` now includes `affinity: CaretAffinity`. Use `..CaretState::default()`
+when constructing a state without a specific visual side. `Downstream` is before
+the following logical scalar; `Upstream` is after the preceding scalar. At a
+BiDi boundary those positions can differ. A custom editing strategy that moves
+the caret must choose the side it intends. Pointer and drag selection retain the
+hit's side, insertion/rightward logical motion choose upstream, and leftward
+motion chooses downstream. These are logical commands, not visual arrow navigation.
+
+The same cached line supplies all caret shapes, selection and composition bands,
+UTF-16 rectangles, pointer hits, vertical columns and horizontal reveal. Block
+carets and colored highlights recolor the full original line through disjoint
+clips, preserving shaping context and avoiding duplicate alpha blending.
+A logical selection may produce several disjoint rectangles. Pointer stops use
+extended grapheme boundaries, while explicit native scalar ranges remain valid.
+Masked fields query the displayed bullets and map back to the original UTF-16.
+Geometry shares the font/text cache's aging rules; replacing the runtime's engine
+invalidates its cache. External users of `MeasureCache` must likewise keep one
+cache per engine and invalidate it when changing the engine's registered fonts.
+
+Native cluster interiors depend on the platform's font data and hit API. Linux
+uses a complete valid GDEF caret list for a single-glyph ligature when available,
+translated by its shaped origin; otherwise it divides the cluster advance by
+scalar. This is an explicit approximation inside a cluster, not recovered font
+metadata. Paragraph-aware wrapping, visual horizontal motion, actual OS IME
+input and human assistive-technology validation remain separate work.
+
+Native CI retains compiler, OS/runner image and BLAKE3 hashes of machine font
+files beside its test logs. This inventories available font inputs; it does not
+assert that every file was selected by the shaper, and it copies no font binary.
+The recorder reuses the Unicode tooling's build-time `blake3==1.0.8` package.
 
 ## Click modifiers without pointer capture
 
