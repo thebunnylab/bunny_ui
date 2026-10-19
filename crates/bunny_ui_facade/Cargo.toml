@@ -28,6 +28,12 @@ canvas = ["bunny-ui-core/canvas"]
 svg = ["bunny-ui-core/svg"]
 gpu = ["bunny-ui-core/gpu"]
 codec = ["bunny-ui-core/codec"]
+# Worlds in three dimensions. Metal draws them on the Mac and the phone,
+# WebGL2 in a browser; every other shell shows the picture the CPU
+# draws, until its own GPU pass comes.
+3d = ["bunny-ui-core/3d", "bunny-ui-macos?/3d", "bunny-ui-ios?/3d", "bunny-ui-web?/3d"]
+# The glTF reader, for worlds made in a modelling tool.
+gltf = ["3d", "bunny-ui-core/gltf"]
 # Hot reload, for `bunny run`: the framework comes in as one shared
 # library the app links, and `app!` writes the entry that each new build
 # of the app's code is loaded by. `bunny run` turns it on for a debug run

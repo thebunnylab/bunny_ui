@@ -59,6 +59,25 @@ mod scroll_bands;
 mod window;
 #[cfg(target_os = "macos")]
 pub use window::WindowPresenter;
+#[cfg(feature = "3d")]
+mod world;
+/// Without the `3d` feature no walk makes a world run, and a frame's
+/// world pass is empty.
+#[cfg(not(feature = "3d"))]
+mod world {
+    use crate::ffi::Id;
+
+    #[derive(Default)]
+    pub(super) struct FramePass;
+
+    impl FramePass {
+        pub(super) fn composite(&self, _index: u16) -> Option<(Id, Id)> {
+            None
+        }
+
+        pub(super) unsafe fn encode(&self, _command: Id, _sels: &super::Sels, _pass_class: Id, _staging: Id) {}
+    }
+}
 
 // MARK: - FFI border
 
@@ -278,13 +297,17 @@ const _: () = {
 
 // MARK: - Shaders (compiled at runtime; the structs above, textually)
 
+// The prelude — the instance structs, the clip curve, the sprite vertex
+// and its sampler — opens the world library too (feature `3d`), so a
+// world's picture is clipped and placed like any other sprite.
+
 // The coverage math is the CPU raster's, rewritten once:
 // `clamp(0.5 - sdf, 0, 1)` IS `clamp(radius - distance + 0.5, 0, 1)` for
 // the rounded corner, and the full signed distance (outside + inside
 // terms) reproduces the straight spans exactly — every interior pixel
 // center sits at least 0.5 inside an integer edge, so coverage saturates
 // to 1.0 with no `radius < 0.5` branch.
-const SHADER_SOURCE: &str = r#"
+const SHADER_PRELUDE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
@@ -378,6 +401,32 @@ static float clip_cov(float2 p, constant ClipRound& round) {
     return any(round.radii > 0.0) ? rect_cov(p, round.box, round.radii) : 1.0;
 }
 
+struct SpriteVary {
+    float4 position [[position]];
+    uint id [[flat]];
+};
+
+vertex SpriteVary sprite_vertex(uint vid [[vertex_id]],
+                                uint iid [[instance_id]],
+                                device const SpriteInstance* sprites [[buffer(0)]],
+                                constant Uniforms& uniforms [[buffer(1)]]) {
+    SpriteInstance sprite = sprites[iid];
+    float2 low = max(sprite.dest.xy, sprite.clip.xy);
+    float2 high = max(min(sprite.dest.zw, sprite.clip.zw), low);
+    float2 corner = unit_corners[vid];
+    SpriteVary out;
+    out.position = to_ndc(mix(low, high, corner) - uniforms.origin, uniforms.viewport);
+    out.id = iid;
+    return out;
+}
+
+// pixel coordinates, no normalisation: the sprite maps the box onto the
+// picture, and the sampler scales it — linear
+constexpr sampler live_sampler(coord::pixel, filter::linear, address::clamp_to_edge);
+"#;
+
+// The rest of the 2D library: the fragments, the panes, the blur.
+const SHADER_BODY: &str = r#"
 fragment float4 rect_fragment(RectVary in [[stage_in]],
                               device const RectInstance* rects [[buffer(0)]],
                               constant ClipRound& round [[buffer(1)]],
@@ -445,25 +494,6 @@ fragment float4 rect_fragment(RectVary in [[stage_in]],
     return float4(color.rgb, color.a * coverage * clip_cov(p, round));
 }
 
-struct SpriteVary {
-    float4 position [[position]];
-    uint id [[flat]];
-};
-
-vertex SpriteVary sprite_vertex(uint vid [[vertex_id]],
-                                uint iid [[instance_id]],
-                                device const SpriteInstance* sprites [[buffer(0)]],
-                                constant Uniforms& uniforms [[buffer(1)]]) {
-    SpriteInstance sprite = sprites[iid];
-    float2 low = max(sprite.dest.xy, sprite.clip.xy);
-    float2 high = max(min(sprite.dest.zw, sprite.clip.zw), low);
-    float2 corner = unit_corners[vid];
-    SpriteVary out;
-    out.position = to_ndc(mix(low, high, corner) - uniforms.origin, uniforms.viewport);
-    out.id = iid;
-    return out;
-}
-
 fragment float4 sprite_fragment(SpriteVary in [[stage_in]],
                                 device const SpriteInstance* sprites [[buffer(0)]],
                                 constant ClipRound& round [[buffer(1)]],
@@ -483,9 +513,7 @@ fragment float4 sprite_fragment(SpriteVary in [[stage_in]],
 
 // a feed's sprite: the picture is its own size and the box is another,
 // so the sampler scales — linear — from the pixel's centre in the box
-// to its place in the picture. Pixel coordinates, no normalisation.
-constexpr sampler live_sampler(coord::pixel, filter::linear, address::clamp_to_edge);
-
+// to its place in the picture.
 fragment float4 live_fragment(SpriteVary in [[stage_in]],
                               device const SpriteInstance* sprites [[buffer(0)]],
                               constant ClipRound& round [[buffer(1)]],
@@ -941,7 +969,7 @@ impl MetalStack {
             let library = msg_id_id_id_ptr(
                 device,
                 sel("newLibraryWithSource:options:error:"),
-                ns_string(SHADER_SOURCE),
+                ns_string(&format!("{SHADER_PRELUDE}{SHADER_BODY}")),
                 null_mut(), // nil options: no fast-math surprises to audit
                 &mut error,
             );
@@ -1028,6 +1056,9 @@ impl MetalStack {
                 }
                 msg_void(blit, self.sels.end_encoding);
             }
+            // the worlds next, each into its own target: the 2D pass
+            // below samples them
+            frame.worlds.encode(command, &self.sels, self.pass_class, frame.staging);
             let mut cleared = false;
             let mut index = 0;
             while index < frame.runs.len() {
@@ -1177,6 +1208,26 @@ impl MetalStack {
                                     texture,
                                     0,
                                 );
+                            }
+                            // a world's target, composited with the box's veil
+                            RunKind::World(index) => {
+                                let Some((pipeline, texture)) = frame.worlds.composite(index) else { continue };
+                                msg_void_id(encoder, self.sels.set_pipeline, pipeline);
+                                msg_void_id_u64_u64(
+                                    encoder,
+                                    self.sels.set_vertex_buffer,
+                                    frame.instances,
+                                    frame.sprite_offset as u64,
+                                    0,
+                                );
+                                msg_void_id_u64_u64(
+                                    encoder,
+                                    self.sels.set_fragment_buffer,
+                                    frame.instances,
+                                    frame.sprite_offset as u64,
+                                    0,
+                                );
+                                msg_void_id_u64(encoder, self.sels.set_fragment_texture, texture, 0);
                             }
                             // glass never reaches this pass
                             RunKind::Glass => continue,
@@ -1383,6 +1434,9 @@ struct EncodeFrame<'a> {
     /// The slot's staging buffer, and the feeds' copies out of it.
     staging: Id,
     live_copies: &'a [LiveCopy],
+    /// The worlds this frame draws before its 2D pass, and the targets
+    /// its world runs composite.
+    worlds: world::FramePass,
 }
 
 /// The textures liquid glass needs: the ping and pong of the blur
@@ -1556,6 +1610,9 @@ struct MetalGround {
     pending: Vec<LiveCopy>,
     /// The atlas was offered back to the system while the window rested.
     volatile: bool,
+    /// The world door: targets, meshes and textures of the world pass.
+    #[cfg(feature = "3d")]
+    world: world::MetalWorld,
 }
 
 /// The staging buffer of one ring slot. Grows when a frame's feeds
@@ -1609,8 +1666,11 @@ impl MetalGround {
         before != PURGEABLE_EMPTY
     }
 
-    fn new(device: Id) -> MetalGround {
+    /// `format` is the 2D target's: the world pass composites into it.
+    fn new(device: Id, #[allow(unused_variables)] format: u64) -> MetalGround {
         MetalGround {
+            #[cfg(feature = "3d")]
+            world: world::MetalWorld::new(device, format),
             device,
             shared: null_mut(),
             volatile: false,
@@ -1678,6 +1738,26 @@ impl MetalGround {
     /// The staging buffer the frame's copies read from.
     fn staging_buffer(&self) -> Id {
         self.staging[self.slot].buffer
+    }
+
+    /// The frame's world pass: each job's instances and materials staged
+    /// into the slot's buffer, every handle resolved. Called after the
+    /// walk, before the encode — the buffer [`MetalGround::staging_buffer`]
+    /// gives after it holds them.
+    #[cfg(feature = "3d")]
+    unsafe fn prepare_worlds(&mut self, batches: &FrameBatches) -> world::FramePass {
+        let mut staged = Vec::with_capacity(batches.worlds.len());
+        for job in &batches.worlds {
+            let (instances, materials) = world::staged_bytes(job);
+            let mut place = |bytes: &[u8]| if bytes.is_empty() { 0 } else { unsafe { self.stage(bytes) } };
+            staged.push((place(&instances), place(&materials)));
+        }
+        self.world.prepare(batches, &staged)
+    }
+
+    #[cfg(not(feature = "3d"))]
+    unsafe fn prepare_worlds(&mut self, _batches: &FrameBatches) -> world::FramePass {
+        world::FramePass
     }
 
     /// Release this walk's native imports. In-flight slots retain their leases.
@@ -1817,6 +1897,11 @@ impl AtlasGround for MetalGround {
             self.pending.retain(|copy| copy.texture != texture);
             unsafe { msg_void(texture, sel("release")) };
         }
+    }
+
+    #[cfg(feature = "3d")]
+    fn world(&mut self) -> Option<&mut dyn bunny_ui::gpu::world::WorldGround> {
+        self.world.door()
     }
 }
 
@@ -2771,6 +2856,7 @@ impl MetalPresenter {
                 None => (drawable_texture, null_mut()),
             };
             self.slots[index].native = self.ground.native.values().cloned().collect();
+            let worlds = self.ground.prepare_worlds(&self.batches);
             let textures = self.ground.bound(&self.batches.textures);
             let command = self.stack.encode_frame(EncodeFrame {
                 target,
@@ -2788,7 +2874,11 @@ impl MetalPresenter {
                 pyramid,
                 staging: self.ground.staging_buffer(),
                 live_copies: &self.ground.pending,
+                worlds,
             });
+            // the jobs are on the GPU: their targets hold what they draw
+            #[cfg(feature = "3d")]
+            self.atlas.worlds.drawn();
             // Once the layer has presented inside a transaction, every
             // later drawable follows that contract, including ordinary
             // frames after a native handoff or live resize. Using the
@@ -2993,6 +3083,7 @@ impl MetalPresenter {
             self.resting = false;
             patch.drawables.take(texture);
             self.slots[index].native = self.ground.native.values().cloned().collect();
+            let worlds = self.ground.prepare_worlds(&self.batches);
             let textures = self.ground.bound(&self.batches.textures);
             let command = self.stack.encode_frame(EncodeFrame {
                 target: texture,
@@ -3010,7 +3101,11 @@ impl MetalPresenter {
                 pyramid: None,
                 staging: self.ground.staging_buffer(),
                 live_copies: &self.ground.pending,
+                worlds,
             });
+            // the jobs are on the GPU: their targets hold what they draw
+            #[cfg(feature = "3d")]
+            self.atlas.worlds.drawn();
             msg_void(command, self.stack.sels.commit);
             msg_void(command, self.stack.sels.wait_scheduled);
             let transaction = class("CATransaction");
@@ -3086,7 +3181,7 @@ impl MetalPresenter {
             // does this)
             kill_layer_actions(layer);
         }
-        let device = stack.device;
+        let (device, format) = (stack.device, stack.format);
         Some(MetalPresenter {
             stack,
             layer,
@@ -3094,7 +3189,7 @@ impl MetalPresenter {
             scale: 0,
             slots: std::array::from_fn(|_| FrameSlot::empty()),
             cursor: 0,
-            ground: MetalGround::new(device),
+            ground: MetalGround::new(device, format),
             atlas: RunAtlas::new(),
             batches: FrameBatches::default(),
             retained: None,
@@ -3186,7 +3281,14 @@ impl OffscreenGpu {
         let stack = MetalStack::create(PIXEL_FORMAT_RGBA8)?;
         unsafe {
             let target = readable_target(stack.device, width, height)?;
-            let device = stack.device;
+            let (device, format) = (stack.device, stack.format);
+            #[allow(unused_mut)]
+            let mut ground = MetalGround::new(device, format);
+            // the harness reads its worlds back
+            #[cfg(feature = "3d")]
+            {
+                ground.world.readable = true;
+            }
             Some(OffscreenGpu {
                 stack,
                 target,
@@ -3195,7 +3297,7 @@ impl OffscreenGpu {
                 height,
                 slots: std::array::from_fn(|_| FrameSlot::empty()),
                 cursor: 0,
-                ground: MetalGround::new(device),
+                ground,
                 atlas: RunAtlas::new(),
                 batches: FrameBatches::default(),
             })
@@ -3276,6 +3378,7 @@ impl OffscreenGpu {
             }
             let pyramid = (!self.batches.glass.is_empty()).then_some(()).and(self.glass.as_ref());
             self.slots[index].native = self.ground.native.values().cloned().collect();
+            let worlds = self.ground.prepare_worlds(&self.batches);
             let textures = self.ground.bound(&self.batches.textures);
             let command = self.stack.encode_frame(EncodeFrame {
                 target: self.target,
@@ -3293,7 +3396,11 @@ impl OffscreenGpu {
                 pyramid,
                 staging: self.ground.staging_buffer(),
                 live_copies: &self.ground.pending,
+                worlds,
             });
+            // the jobs are on the GPU: their targets hold what they draw
+            #[cfg(feature = "3d")]
+            self.atlas.worlds.drawn();
             msg_void(command, self.stack.sels.commit);
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
             if wait {
@@ -3372,6 +3479,7 @@ impl OffscreenGpu {
             );
             let target = readable_target(self.stack.device, width, height).expect("a patch target");
             self.slots[index].native = self.ground.native.values().cloned().collect();
+            let worlds = self.ground.prepare_worlds(&self.batches);
             let textures = self.ground.bound(&self.batches.textures);
             let command = self.stack.encode_frame(EncodeFrame {
                 target,
@@ -3389,7 +3497,11 @@ impl OffscreenGpu {
                 pyramid: None,
                 staging: self.ground.staging_buffer(),
                 live_copies: &self.ground.pending,
+                worlds,
             });
+            // the jobs are on the GPU: their targets hold what they draw
+            #[cfg(feature = "3d")]
+            self.atlas.worlds.drawn();
             msg_void(command, self.stack.sels.commit);
             msg_void(command, self.stack.sels.wait_completed);
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
@@ -3398,6 +3510,60 @@ impl OffscreenGpu {
             objc_autoreleasePoolPop(pool);
             bytes
         }
+    }
+}
+
+#[cfg(feature = "3d")]
+impl OffscreenGpu {
+    /// Draws one world frame by the world pass alone, into a target of
+    /// the frame's own size and samples, and returns what it holds:
+    /// premultiplied, sRGB-encoded RGBA8, the top row first — what
+    /// `bunny_ui::world::soft::draw` returns for the same frame. The
+    /// parity tests hold the two together. `None` when the world pass
+    /// cannot stand on this device.
+    pub fn world_rgba(&mut self, frame: &Rc<bunny_ui::world::WorldFrame>) -> Option<Vec<u8>> {
+        self.world_rgba_with(frame, &bunny_ui::image_engine::RawImages::default())
+    }
+
+    /// [`OffscreenGpu::world_rgba`] with textures, decoded by `images`.
+    pub fn world_rgba_with(&mut self, frame: &Rc<bunny_ui::world::WorldFrame>, images: &dyn ImageEngine) -> Option<Vec<u8>> {
+        use bunny_ui::gpu::world::WorldGround;
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
+            self.ground.begin_slot(index);
+            let Some(job) = world::single_job(&mut self.ground.world, frame, images) else {
+                objc_autoreleasePoolPop(pool);
+                return None;
+            };
+            let mut batches = FrameBatches::default();
+            batches.worlds.push(job.clone());
+            let pass = self.ground.prepare_worlds(&batches);
+            let command = msg_id(self.stack.queue, self.stack.sels.command_buffer);
+            pass.encode(command, &self.stack.sels, self.stack.pass_class, self.ground.staging_buffer());
+            msg_void(command, self.stack.sels.commit);
+            msg_void(command, self.stack.sels.wait_completed);
+            let bytes = world::read_target(&self.ground.world, job.target, &self.stack.sels);
+            let door = &mut self.ground.world;
+            door.drop_target(job.target);
+            for id in job.meshes {
+                door.drop_mesh(id);
+            }
+            for id in job.segments {
+                door.drop_segments(id);
+            }
+            for id in job.textures.into_iter().flatten() {
+                door.drop_texture(id);
+            }
+            objc_autoreleasePoolPop(pool);
+            bytes
+        }
+    }
+
+    /// The world jobs the last walk made: none when every world on screen
+    /// held its picture.
+    pub fn world_jobs(&self) -> usize {
+        self.batches.worlds.len()
     }
 }
 
@@ -4748,7 +4914,7 @@ mod tests {
         }
         unsafe {
             let device = MTLCreateSystemDefaultDevice();
-            let mut ground = MetalGround::new(device);
+            let mut ground = MetalGround::new(device, PIXEL_FORMAT_RGBA8);
             // no atlas yet: resting offers nothing, waking finds nothing lost
             ground.rest();
             assert!(!ground.volatile, "no texture, nothing to offer");

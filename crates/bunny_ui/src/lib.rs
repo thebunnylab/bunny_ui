@@ -96,6 +96,8 @@ pub mod view;
 pub(crate) mod viewport;
 pub mod views;
 pub mod words;
+#[cfg(feature = "3d")]
+pub mod world;
 
 pub use runtime::{code_changed, request_frame};
 
@@ -187,7 +189,8 @@ macro_rules! __bunny_preview_entry {
 /// worker thread (or a browser callback) hands its results over.
 pub mod task {
     pub use motor::task::{
-        Receiver, Recv, SendError, Sender, Sleep, Spawned, advance, channel, poll_ready, set_wake_hook, sleep, spawn,
+        Receiver, Recv, SendError, Sender, Sleep, Spawned, advance, channel, now, poll_ready, set_wake_hook, sleep,
+        spawn,
     };
 }
 

@@ -10,6 +10,11 @@ repository.workspace = true
 bunny-ui = { workspace = true, features = ["canvas", "gpu"] }
 bunny-ui-apple.workspace = true
 
+[features]
+# Worlds drawn by Metal itself (the world pass of `bunny-ui-apple`).
+# Without it a world still shows: the CPU draws it.
+3d = ["bunny-ui/3d", "bunny-ui-apple/3d"]
+
 [dev-dependencies]
 # examples only (the real countries app in a native window)
 countries-core.workspace = true
@@ -20,6 +25,10 @@ countries-pure.workspace = true
 [[example]]
 name = "trace_report"
 test = true
+
+[[example]]
+name = "world_window"
+required-features = ["3d"]
 
 # Its API exists only on its own platform; docs.rs builds on Linux
 # by default and would publish an empty page.
