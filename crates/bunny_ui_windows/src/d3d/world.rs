@@ -15,6 +15,12 @@
 //! the shaders read by index — the same road the 2D pass takes, with no
 //! input layout.
 //!
+//! A frame whose sun casts draws its casters first, when the box's map
+//! does not hold them yet: a pass of depth alone, no pixel stage, into a
+//! 16-bit map the surfaces read through a comparing sampler (`t5`, `s2`).
+//! A frame without a map binds a texel and a sampler whose comparison
+//! always passes.
+//!
 //! The world shaders are compiled the first time a box paints a world:
 //! an app that shows none never pays for them.
 //!
@@ -31,10 +37,10 @@ use bunny_ui::gpu::world::{WorldCaps, WorldGround, WorldJob};
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, WorldFrame};
 use bunny_ui::world::shade::SRGB_DECODE;
-use bunny_ui::world::wire::{SEGMENT_STRIDE, instance_bytes, instance_offset, material_bytes};
+use bunny_ui::world::wire::{SEGMENT_STRIDE, SHADOW_INSTANCE_STRIDE, instance_bytes, instance_offset, material_bytes, shadow_instance_bytes};
 
 use super::{
-    BIND_RENDER_TARGET, BIND_SHADER_RESOURCE, BLEND_INV_SRC_ALPHA, BLEND_ONE, BLEND_OP_ADD, BlendDesc, BlendState, Blob,
+    ADDRESS_CLAMP, BIND_RENDER_TARGET, BIND_SHADER_RESOURCE, BLEND_INV_SRC_ALPHA, BLEND_ONE, BLEND_OP_ADD, BlendDesc, BlendState, Blob,
     Buffer, BufferDesc, COMPARISON_NEVER, CPU_ACCESS_READ, CULL_NONE, Context, DepthStencilDesc,
     DepthStencilOpDesc, DepthStencilState, Device, Dsv, FILL_SOLID, FILTER_MIN_MAG_MIP_LINEAR, FORMAT_RGBA8,
     FORMAT_RGBA8_SRGB, FORMAT_UNKNOWN, MAP_READ, MAP_WRITE_DISCARD, MISC_BUFFER_STRUCTURED, MappedSubresource,
@@ -49,6 +55,12 @@ use crate::ffi::{Com, com_ok};
 
 const FORMAT_D32_FLOAT: u32 = 40;
 const FORMAT_R32_UINT: u32 = 42;
+const FORMAT_R16_TYPELESS: u32 = 53;
+const FORMAT_D16_UNORM: u32 = 55;
+const FORMAT_R16_UNORM: u32 = 56;
+const SRV_DIMENSION_TEXTURE2D: u32 = 4;
+const DSV_DIMENSION_TEXTURE2D: u32 = 3;
+const FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT: u32 = 0x94;
 const USAGE_IMMUTABLE: u32 = 1;
 const BIND_INDEX_BUFFER: u32 = 0x2;
 const BIND_DEPTH_STENCIL: u32 = 0x40;
@@ -168,7 +180,9 @@ StructuredBuffer<WorldInstance> instances : register(t1);
 StructuredBuffer<WorldMaterial> materials : register(t2);
 Texture2D<float4> picture : register(t3);
 StructuredBuffer<WorldSegment> segments : register(t4);
+Texture2D<float> shadow_map : register(t5);
 SamplerState surface_sampler : register(s1);
+SamplerComparisonState shadow_sampler : register(s2);
 
 static const uint DRAW_MASK = 1;
 static const uint DRAW_TEXTURED = 2;
@@ -244,8 +258,49 @@ float encode_code(float shade) {
     return s * 255.0;
 }
 
+// how much of the sun reaches a point: its depth from the sun against the
+// map's, each lookup four texels compared and filtered by the sampler
+float sun_visibility(float3 position, float3 n) {
+    float taps = u.shadow.w;
+    if (taps < 0.5 || u.sun_direction.w <= 0.5) {
+        return 1.0;
+    }
+    float n_dot_l = saturate(dot(n, u.sun_direction.xyz));
+    if (!(n_dot_l > 0.0)) {
+        return 1.0;
+    }
+    float sine = sqrt(max(1.0 - n_dot_l * n_dot_l, 0.0));
+    float3 p = position + n * (u.shadow.y * sine);
+    float4 s = mul(u.shadow_from_eye, float4(p, 1.0));
+    if (!(s.x > 0.0 && s.x < 1.0 && s.y > 0.0 && s.y < 1.0)) {
+        return 1.0;
+    }
+    float reference = clamp(s.z - u.shadow.z, 0.0, 1.0);
+    float texel = u.shadow.x;
+    if (taps < 1.5) {
+        return shadow_map.SampleCmpLevelZero(shadow_sampler, s.xy, reference);
+    }
+    if (taps < 4.5) {
+        float four = 0.0;
+        four += shadow_map.SampleCmpLevelZero(shadow_sampler, float2(s.x - 0.5 * texel, s.y - 0.5 * texel), reference);
+        four += shadow_map.SampleCmpLevelZero(shadow_sampler, float2(s.x + 0.5 * texel, s.y - 0.5 * texel), reference);
+        four += shadow_map.SampleCmpLevelZero(shadow_sampler, float2(s.x - 0.5 * texel, s.y + 0.5 * texel), reference);
+        four += shadow_map.SampleCmpLevelZero(shadow_sampler, float2(s.x + 0.5 * texel, s.y + 0.5 * texel), reference);
+        return four * 0.25;
+    }
+    float sum = 0.0;
+    [unroll]
+    for (int j = -1; j <= 1; j++) {
+        [unroll]
+        for (int i = -1; i <= 1; i++) {
+            sum += shadow_map.SampleCmpLevelZero(shadow_sampler, float2(s.x + (float)i * texel, s.y + (float)j * texel), reference);
+        }
+    }
+    return sum / 9.0;
+}
+
 float3 lit(float3 position, float3 n, float3 base, float roughness, float metallic, float3 emissive,
-           float occlusion, uint groups) {
+           float occlusion, uint groups, float shadow) {
     bool parallel = u.params.w > 0.5;
     float3 v = parallel ? float3(0.0, 0.0, 1.0) : safe_normalize(-position);
     float n_dot_v = clamp(dot(n, v), 1e-4, 1.0);
@@ -278,7 +333,7 @@ float3 lit(float3 position, float3 n, float3 base, float roughness, float metall
             float x5 = x * x * x * x * x;
             float3 fresnel = f0 + (float3(1.0, 1.0, 1.0) - f0) * x5;
             float3 specular = fresnel * (pi_d * visibility);
-            light = light + (diffuse + specular) * u.sun_color.xyz * n_dot_l;
+            light = light + (diffuse + specular) * u.sun_color.xyz * (n_dot_l * shadow);
         }
     }
 
@@ -407,7 +462,7 @@ float4 world_shade(WorldVary v, bool front) {
             normal = -normal;
         }
         float3 light = lit(v.eye, normal, base, material.params.x, material.params.y,
-                           material.emissive.xyz, v.occlusion, 0xFFFFFFFFu);
+                           material.emissive.xyz, v.occlusion, 0xFFFFFFFFu, sun_visibility(v.eye, normal));
         if (u.tone.z > 0.5) {
             dither = bayer((uint)v.position.x, (uint)v.position.y);
         }
@@ -438,6 +493,27 @@ SteppedBack world_fragment_stepped(WorldVary v, bool front : SV_IsFrontFace) {
     o.color = world_shade(v, front);
     o.depth = min(v.position.z + draw.bias.x * slope + DEPTH_TIE, DEPTH_CEILING);
     return o;
+}
+
+// MARK: - The sun's shadow map (bunny_ui::world::shadow)
+
+struct ShadowCaster {
+    float4 rows[3];
+};
+
+StructuredBuffer<ShadowCaster> casters : register(t6);
+
+// a caster into the map, placed by its rows: D3D's clip space already
+// puts the map's top at its first row, and its depth in [0, 1]
+float4 shadow_vertex(uint vid : SV_VertexID, uint iid : SV_InstanceID) : SV_Position {
+    float3 p = vertices[vid].position;
+    ShadowCaster caster = casters[draw.first_instance + iid];
+    float4 r0 = caster.rows[0];
+    float4 r1 = caster.rows[1];
+    float4 r2 = caster.rows[2];
+    return float4(r0.x * p.x + r0.y * p.y + r0.z * p.z + r0.w,
+                  r1.x * p.x + r1.y * p.y + r1.z * p.z + r1.w,
+                  r2.x * p.x + r2.y * p.y + r2.z * p.z + r2.w, 1.0);
 }
 
 // MARK: - Lines (bunny_ui::world::soft::line)
@@ -613,6 +689,16 @@ struct BackdropBlock {
     size: [f32; 4],
 }
 
+/// `D3D11_DEPTH_STENCIL_VIEW_DESC` of one level of a 2D texture.
+#[repr(C)]
+struct DsvDesc {
+    format: u32,
+    view_dimension: u32,
+    flags: u32,
+    mip_slice: u32,
+    _union_pad: [u32; 2],
+}
+
 /// The bytes of a plain block.
 fn bytes_of<T: Copy>(block: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((block as *const T).cast::<u8>(), std::mem::size_of::<T>()) }
@@ -628,6 +714,8 @@ const DEPTH_ALWAYS: usize = 4;
 
 struct WorldStack {
     mesh_vs: Com<VertexShader>,
+    /// The casters into a shadow map; they draw with no pixel stage.
+    shadow_vs: Com<VertexShader>,
     line_vs: Com<VertexShader>,
     backdrop_vs: Com<VertexShader>,
     mesh_ps: Com<PixelShader>,
@@ -645,6 +733,12 @@ struct WorldStack {
     over: Com<BlendState>,
     add: Com<BlendState>,
     sampler: Com<SamplerState>,
+    /// The shadow map's sampler: four texels compared and filtered.
+    compare: Com<SamplerState>,
+    /// A texel and a sampler that always answer "lit": what a frame
+    /// without a map binds.
+    always: Com<SamplerState>,
+    lit: (Com<Texture2d>, Com<Srv>),
     /// One white texel: what a draw with no texture binds.
     blank: (Com<Texture2d>, Com<Srv>),
     uniforms: Com<Buffer>,
@@ -685,6 +779,15 @@ struct Segments {
     count: u32,
 }
 
+/// A box's shadow map: one 16-bit texture, a depth view to draw the
+/// casters through and a view the surfaces read.
+struct ShadowMap {
+    _texture: Com<Texture2d>,
+    dsv: Com<Dsv>,
+    srv: Com<Srv>,
+    size: u32,
+}
+
 /// The D3D11 side of the world seam: it mints targets, buffers and
 /// textures, and draws the walk's jobs.
 pub(super) struct D3dWorld {
@@ -695,11 +798,14 @@ pub(super) struct D3dWorld {
     meshes: HashMap<u64, MeshBuffers>,
     textures: HashMap<u64, (Com<Texture2d>, Com<Srv>)>,
     segments: HashMap<u64, Segments>,
+    shadow_maps: HashMap<u64, ShadowMap>,
     next: u64,
     /// The frame's instances and materials, written again for each job:
     /// a discard map gives every job a buffer of its own.
     instances: SlotBuffer,
     materials: SlotBuffer,
+    /// The rows of a shadow's casters, the same way.
+    casters: SlotBuffer,
 }
 
 impl D3dWorld {
@@ -712,9 +818,11 @@ impl D3dWorld {
             meshes: HashMap::new(),
             textures: HashMap::new(),
             segments: HashMap::new(),
+            shadow_maps: HashMap::new(),
             next: 1,
             instances: SlotBuffer::empty(),
             materials: SlotBuffer::empty(),
+            casters: SlotBuffer::empty(),
         }
     }
 
@@ -786,11 +894,12 @@ impl D3dWorld {
     }
 
     fn encode_job(&mut self, job: &WorldJob) {
-        let D3dWorld { device, context, built, targets, meshes, textures, segments, instances, materials, .. } = self;
+        let D3dWorld { device, context, built, targets, meshes, textures, segments, shadow_maps, instances, materials, casters, .. } = self;
         let (device, context) = (*device, *context);
         let Built::Ready(stack) = built else { return };
         let Some(target) = targets.get(&job.target) else { return };
         let frame = &job.frame;
+        let map = job.shadow.and_then(|shadow| shadow_maps.get(&shadow.map).map(|map| (shadow, map)));
         // what every draw of the frame reads: the instances and the
         // material table, a discard map each, so a job never waits on the
         // one before it
@@ -807,6 +916,41 @@ impl D3dWorld {
         unsafe {
             let vtbl = &*(*context).vtbl;
             write_constants(context, stack.uniforms.as_ptr(), &frame.uniforms.to_bytes());
+
+            // the sun's map first, when it does not hold this frame's casters
+            if let (Some((shadow, map)), Some(frame_shadow)) = (map, frame.shadow.as_ref())
+                && shadow.draw
+            {
+                let rows = shadow_instance_bytes(&frame_shadow.instances);
+                if casters.ensure(device, frame_shadow.instances.len(), SHADOW_INSTANCE_STRIDE) && casters.upload(context, &rows) {
+                    // nothing reads the map while it is drawn
+                    let none: *mut Srv = null_mut();
+                    (vtbl.ps_set_shader_resources)(context, 5, 1, &none);
+                    let no_color: *mut Rtv = null_mut();
+                    (vtbl.om_set_render_targets)(context, 1, &no_color, map.dsv.as_ptr().cast());
+                    let side = map.size as f32;
+                    let port = Viewport { top_left_x: 0.0, top_left_y: 0.0, width: side, height: side, min_depth: 0.0, max_depth: 1.0 };
+                    (vtbl.rs_set_viewports)(context, 1, &port);
+                    (vtbl.clear_depth_stencil_view)(context, map.dsv.as_ptr(), CLEAR_DEPTH, 1.0, 0);
+                    (vtbl.vs_set_shader)(context, stack.shadow_vs.as_ptr(), null(), 0);
+                    (vtbl.ps_set_shader)(context, null_mut(), null(), 0);
+                    (vtbl.om_set_depth_stencil_state)(context, stack.depth_states[DEPTH_OPAQUE].as_ptr(), 0);
+                    (vtbl.rs_set_state)(context, stack.rasterizers[0].as_ptr());
+                    (vtbl.om_set_blend_state)(context, null_mut(), null(), 0xFFFF_FFFF);
+                    let caster_view = casters.srv_ptr();
+                    (vtbl.vs_set_shader_resources)(context, 6, 1, &caster_view);
+                    for draw in &frame_shadow.draws {
+                        let Some(buffers) = job.meshes.get(draw.mesh as usize).and_then(|id| meshes.get(id)) else { continue };
+                        let block = DrawBlock { first_instance: draw.first_instance, ..DrawBlock::default() };
+                        write_constants(context, stack.draw.as_ptr(), bytes_of(&block));
+                        let vertex_view = buffers.vertex_srv.as_ptr();
+                        (vtbl.vs_set_shader_resources)(context, 0, 1, &vertex_view);
+                        (vtbl.ia_set_index_buffer)(context, buffers.indices.as_ptr(), FORMAT_R32_UINT, 0);
+                        (vtbl.draw_indexed_instanced)(context, draw.index_count, draw.instance_count, draw.first_index, 0, 0);
+                    }
+                }
+            }
+
             let instance_view = instances.srv_ptr();
             let material_view = materials.srv_ptr();
             (vtbl.vs_set_shader_resources)(context, 1, 1, &instance_view);
@@ -816,6 +960,11 @@ impl D3dWorld {
             // the target, cleared to the backdrop
             let rtv = target.color.as_ref().map_or(target.resolve_rtv.as_ptr(), |(_, rtv)| rtv.as_ptr());
             (vtbl.om_set_render_targets)(context, 1, &rtv, target.dsv.as_ptr().cast());
+            // the map is read once it is no longer drawn into
+            let (shadow_view, shadow_sampler) =
+                map.map_or((stack.lit.1.as_ptr(), stack.always.as_ptr()), |(_, map)| (map.srv.as_ptr(), stack.compare.as_ptr()));
+            (vtbl.ps_set_shader_resources)(context, 5, 1, &shadow_view);
+            (vtbl.ps_set_samplers)(context, 2, 1, &shadow_sampler);
             let port = Viewport {
                 top_left_x: 0.0,
                 top_left_y: 0.0,
@@ -933,6 +1082,10 @@ impl D3dWorld {
                     FORMAT_RGBA8,
                 );
             }
+            // the map leaves the slot it was read from: the next shadow
+            // pass draws into it
+            let none: *mut Srv = null_mut();
+            (vtbl.ps_set_shader_resources)(context, 5, 1, &none);
         }
     }
 
@@ -1070,6 +1223,7 @@ impl WorldStack {
                 Com::from_raw(out).ok_or_else(|| format!("null world pixel shader {entry}"))
             };
             let mesh_vs = vertex("world_vertex")?;
+            let shadow_vs = vertex("shadow_vertex")?;
             let line_vs = vertex("line_vertex")?;
             let backdrop_vs = vertex("backdrop_vertex")?;
             let mesh_ps = pixel(&source, "world_fragment", COMPILE_IEEE_STRICTNESS)?;
@@ -1177,6 +1331,44 @@ impl WorldStack {
                 return Err("world sampler refused".to_string());
             }
             let sampler = Com::from_raw(sampler).ok_or("null world sampler")?;
+            let comparing = |function: u32| -> Result<Com<SamplerState>, String> {
+                let desc = SamplerDesc {
+                    filter: FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT,
+                    address_u: ADDRESS_CLAMP,
+                    address_v: ADDRESS_CLAMP,
+                    address_w: ADDRESS_CLAMP,
+                    mip_lod_bias: 0.0,
+                    max_anisotropy: 1,
+                    comparison_func: function,
+                    border_color: [0.0; 4],
+                    min_lod: 0.0,
+                    max_lod: 0.0,
+                };
+                let mut state: *mut SamplerState = null_mut();
+                if !com_ok(((*(*device).vtbl).create_sampler_state)(device, &desc, &mut state)) {
+                    return Err("the shadow sampler refused".to_string());
+                }
+                Com::from_raw(state).ok_or_else(|| "null shadow sampler".to_string())
+            };
+            let compare = comparing(COMPARISON_LESS_EQUAL)?;
+            let always = comparing(COMPARISON_ALWAYS)?;
+            let lit_desc = Texture2dDesc {
+                width: 1,
+                height: 1,
+                mip_levels: 1,
+                array_size: 1,
+                format: FORMAT_R16_UNORM,
+                sample_count: 1,
+                sample_quality: 0,
+                usage: USAGE_IMMUTABLE,
+                bind_flags: BIND_SHADER_RESOURCE,
+                cpu_access_flags: 0,
+                misc_flags: 0,
+            };
+            let far = [0xFFu8; 2];
+            let level = [SubresourceData { memory: far.as_ptr().cast(), pitch: 2, slice_pitch: 0 }];
+            let lit = texture_2d(device, &lit_desc, Some(&level)).ok_or("no lit texel")?;
+            let lit_srv = make_srv(device, &lit).ok_or("no lit texel view")?;
 
             let blank_desc = Texture2dDesc {
                 width: 1,
@@ -1198,6 +1390,7 @@ impl WorldStack {
 
             Ok(WorldStack {
                 mesh_vs,
+                shadow_vs,
                 line_vs,
                 backdrop_vs,
                 mesh_ps,
@@ -1210,6 +1403,9 @@ impl WorldStack {
                 over,
                 add,
                 sampler,
+                compare,
+                always,
+                lit: (lit, lit_srv),
                 blank: (blank, blank_srv),
                 uniforms: make_constant_buffer(device, bunny_ui::world::wire::frame_offset::SIZE as u32).ok_or("world constants refused")?,
                 draw: make_constant_buffer(device, std::mem::size_of::<DrawBlock>() as u32).ok_or("draw constants refused")?,
@@ -1352,6 +1548,49 @@ impl WorldGround for D3dWorld {
 
     fn drop_segments(&mut self, id: u64) {
         self.segments.remove(&id);
+    }
+
+    fn make_shadow_map(&mut self, size: u32) -> Option<u64> {
+        let device = self.device;
+        let map = unsafe {
+            // one texture behind two views: a 16-bit depth to draw into,
+            // the same bits as a value to compare against
+            let desc = Texture2dDesc {
+                width: size,
+                height: size,
+                mip_levels: 1,
+                array_size: 1,
+                format: FORMAT_R16_TYPELESS,
+                sample_count: 1,
+                sample_quality: 0,
+                usage: USAGE_DEFAULT,
+                bind_flags: BIND_DEPTH_STENCIL | BIND_SHADER_RESOURCE,
+                cpu_access_flags: 0,
+                misc_flags: 0,
+            };
+            let texture = texture_2d(device, &desc, None)?;
+            let dsv_desc = DsvDesc { format: FORMAT_D16_UNORM, view_dimension: DSV_DIMENSION_TEXTURE2D, flags: 0, mip_slice: 0, _union_pad: [0; 2] };
+            let mut dsv: *mut Dsv = null_mut();
+            if !com_ok(((*(*device).vtbl).create_depth_stencil_view)(device, texture.as_ptr().cast(), (&dsv_desc as *const DsvDesc).cast(), &mut dsv)) {
+                return None;
+            }
+            let dsv = Com::from_raw(dsv)?;
+            // the view of a 2D texture: its first level, one level
+            let srv_desc = SrvDesc { format: FORMAT_R16_UNORM, view_dimension: SRV_DIMENSION_TEXTURE2D, first_element: 0, num_elements: 1, _union_pad: [0; 2] };
+            let mut srv: *mut Srv = null_mut();
+            if !com_ok(((*(*device).vtbl).create_shader_resource_view)(device, texture.as_ptr().cast(), &srv_desc, &mut srv)) {
+                return None;
+            }
+            let srv = Com::from_raw(srv)?;
+            ShadowMap { _texture: texture, dsv, srv, size }
+        };
+        let id = self.mint();
+        self.shadow_maps.insert(id, map);
+        Some(id)
+    }
+
+    fn drop_shadow_map(&mut self, id: u64) {
+        self.shadow_maps.remove(&id);
     }
 }
 
