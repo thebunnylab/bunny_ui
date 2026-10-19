@@ -2828,7 +2828,7 @@ impl OffscreenGl {
     /// How many worlds the last frame drew: a held picture draws none.
     #[cfg(feature = "3d")]
     pub fn world_jobs(&self) -> usize {
-        self.batches.worlds.len()
+        self.batches.box_worlds()
     }
 
     /// The rendered bytes, R,G,B,A per pixel — the same order as the

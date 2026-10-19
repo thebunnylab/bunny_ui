@@ -17,6 +17,11 @@
 //! and nine redraws of a part under 3 ms, or the quality steps down; a long
 //! stretch at a third of that steps up. A world that does not move is
 //! drawn once and governs nothing.
+//!
+//! Before any box is weighed, a tier that keeps timers draws a fixed
+//! world off screen a few times ([`probed_quality`]): its time on the GPU
+//! starts every box at the quality the device can carry, whatever its
+//! name said.
 
 // the GPU seam keeps a governor for each box; without it, only the
 // device's start is read
@@ -103,6 +108,19 @@ impl Governor {
     /// The quality to draw at when the world asks for `asked`.
     pub(crate) fn quality(&self, asked: Quality) -> Quality {
         asked.min(self.current)
+    }
+
+    /// The device's probe measured it at `quality`: a governor that has not
+    /// stepped yet starts there.
+    pub(crate) fn probed(&mut self, quality: Quality) {
+        if self.stepped_up || self.current != self.start {
+            return;
+        }
+        self.start = quality;
+        self.current = quality;
+        self.beats.clear();
+        self.whole_times.clear();
+        self.part_times.clear();
     }
 
     /// The world drew at `now` (seconds of the engine clock).
@@ -217,6 +235,26 @@ fn percentile(values: &VecDeque<f64>) -> f64 {
     let mut sorted: Vec<f64> = values.iter().copied().collect();
     sorted.sort_by(f64::total_cmp);
     sorted[((sorted.len() as f64 * PERCENTILE) as usize).min(sorted.len() - 1)]
+}
+
+/// What the probe may cost the GPU for a device to start High, and to
+/// start at Medium. A recent Apple part draws it in about a millisecond;
+/// most of that is the fixed cost of a pass, which a larger frame does
+/// not grow, so the time is weighed as it is, not scaled to a box.
+const PROBE_HIGH: f64 = 0.0015;
+const PROBE_MEDIUM: f64 = 0.004;
+
+/// The quality a device starts at from its probe: `seconds` on the GPU
+/// over the probe's frame — 640 × 360 at four samples, a floor and 36
+/// lit balls under a sun whose map it holds.
+pub(crate) fn probed_quality(seconds: f64) -> Quality {
+    if seconds <= PROBE_HIGH {
+        Quality::High
+    } else if seconds <= PROBE_MEDIUM {
+        Quality::Medium
+    } else {
+        Quality::Low
+    }
 }
 
 /// One quality above `quality`.
@@ -345,6 +383,24 @@ mod tests {
         governor.timed(f64::NAN, true);
         governor.timed(-1.0, true);
         assert_eq!(governor.whole_times.len(), held);
+    }
+
+    #[test]
+    fn the_probe_starts_a_device_at_what_it_can_carry() {
+        assert_eq!(probed_quality(0.0010), Quality::High);
+        assert_eq!(probed_quality(0.0025), Quality::Medium);
+        assert_eq!(probed_quality(0.0060), Quality::Low);
+        // a governor that has not stepped takes the measure; one that has
+        // keeps what its frames told it
+        let mut fresh = Governor::new(Quality::Low);
+        fresh.probed(Quality::High);
+        assert_eq!(fresh.quality(Quality::High), Quality::High);
+        let mut weighed = Governor::new(Quality::High);
+        for _ in 0..TIMED_WINDOW {
+            weighed.timed(0.020, true);
+        }
+        weighed.probed(Quality::High);
+        assert_eq!(weighed.quality(Quality::High), Quality::Medium);
     }
 
     #[test]

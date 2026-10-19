@@ -363,6 +363,13 @@ The governor weighs it too: nine whole frames in ten must cost under
 10 ms, and nine redraws of a part under 3 ms, or the quality steps
 down; a long stretch at a third of that steps up.
 
+Before it weighs any box, such a tier probes the device: the first
+walks that paint a world also draw a fixed one off screen three times —
+a floor and 36 lit balls, 640 × 360 at four samples, its sun's map drawn
+once — and the middle of the three times starts every box that has not
+stepped yet: under 1.5 ms High, under 4 ms Medium, slower Low, whatever
+the device's name said.
+
 A box inside the budget is drawn at its own size. A larger box is drawn
 smaller, and the compositor stretches it to the box. At four samples a
 cut-out surface (`Material::mask`) turns its edge into coverage — the

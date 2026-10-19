@@ -2863,6 +2863,26 @@ mod tests {
         assert_ne!(veiled, ours);
     }
 
+    /// The first walks that paint a world probe the device: three frames of
+    /// a fixed world off screen, whose time on this GPU starts the boxes.
+    #[test]
+    fn the_first_worlds_probe_the_device() {
+        use bunny_ui::prelude::State;
+        if harness().is_none() {
+            return;
+        }
+        let mut gpu = OffscreenGpu::new(200, 200).expect("offscreen gpu");
+        let camera = State::new(Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0));
+        let world = still_life();
+        let runtime = bunny_ui::runtime::Runtime::new();
+        for _ in 0..6 {
+            both(&runtime, &page(world, camera, 1.0), &mut gpu);
+        }
+        let probed = gpu.atlas.worlds.probed();
+        eprintln!("the probe measured this device at {probed:?}");
+        assert!(probed.is_some(), "three frames and their times");
+    }
+
     /// A checkerboard of `cells` squares a side, in two colours, over a
     /// clear band: every level of its chain differs from the one above.
     fn checker(cells: u32, side: u32) -> bunny_ui::image_engine::ImageSource {

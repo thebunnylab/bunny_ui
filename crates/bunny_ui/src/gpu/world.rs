@@ -295,6 +295,29 @@ impl WorldJob {
     }
 }
 
+/// The probe's world: a floor, a block of 36 balls and a sun that casts,
+/// at Medium — the work of a lit room with its shadows.
+fn probe_frame() -> WorldFrame {
+    use crate::layout::Color;
+    use crate::world::camera::Camera;
+    use crate::world::frame::{Background, WorldStyle};
+    use crate::world::material::{Light, Material};
+    use crate::world::math::{Vec3, vec3};
+    use crate::world::store::World;
+    let world = World::new();
+    world.add(Mesh::plane(12.0, 12.0), Material::color(Color::rgb(200, 196, 188))).set_position(vec3(0.0, -0.5, 0.0));
+    let ball = Mesh::sphere(0.35);
+    for row in 0..6 {
+        for column in 0..6 {
+            let colour = Color::rgb(60 + 30 * row as u8, 110, 220 - 25 * column as u8);
+            world.add(ball.clone(), Material::color(colour).roughness(0.4)).set_position(vec3(column as f64 - 2.5, -0.15, row as f64 - 2.5));
+        }
+    }
+    world.add_light(Light::sun().toward(vec3(-1.0, -2.0, -1.5)).with_shadows());
+    let style = WorldStyle { background: Background::Color(Color::rgb(236, 233, 226)), quality: Quality::Medium, ..WorldStyle::default() };
+    world.frame(&Camera::orbiting(Vec3::ZERO, 30.0, 30.0, 10.0), &style, PROBE_SIZE, 1.0)
+}
+
 /// A world picture on a tier that draws worlds: the target the 2D pass
 /// composites, and the job that draws into it when the picture moved.
 pub(crate) struct ResolvedWorld {
@@ -305,6 +328,27 @@ pub(crate) struct ResolvedWorld {
 
 /// Walks a target may sit unread before it is given back.
 pub const TARGET_IDLE_WALKS: u64 = 120;
+/// The probe's picture, and how many times it is drawn.
+const PROBE_SIZE: (u32, u32) = (640, 360);
+const PROBE_FRAMES: usize = 3;
+/// Walks the probe waits for its times before it gives up.
+const PROBE_WALKS: u32 = 240;
+/// The slot the probe's shadow map is kept under: no box's.
+const PROBE_SLOT: u64 = u64::MAX;
+
+/// The first measure of a device: a fixed world drawn a few times off
+/// screen, whose time on the GPU starts every box at the quality the
+/// device can carry ([`crate::world::governor::probed_quality`]).
+#[derive(Default)]
+enum Probe {
+    /// No world was painted yet.
+    #[default]
+    Unasked,
+    /// Drawn `sent` times into `target`, at `samples`; `times` came back.
+    Running { target: u64, samples: u8, frame: Rc<WorldFrame>, sent: usize, times: Vec<f64>, walks: u32 },
+    /// The device's measure; `None` when its times never came back.
+    Done(Option<Quality>),
+}
 /// Walks a mesh, a texture or a segment set may sit unread.
 pub const ASSET_IDLE_WALKS: u64 = 600;
 
@@ -361,12 +405,17 @@ pub struct WorldResidency {
     /// Whether the last job into each target drew it whole: the governor
     /// weighs the GPU's time over it by that.
     kinds: HashMap<u64, bool>,
+    /// The device's probe.
+    probe: Probe,
+    /// Whether this walk painted a world: the probe waits for one.
+    saw_world: bool,
 }
 
 impl WorldResidency {
     /// A walk begins: whatever the last attempt promised is forgotten.
     pub(crate) fn begin_walk(&mut self, walk: u64) {
         self.walk = walk;
+        self.saw_world = false;
         self.pending.clear();
         self.pending_shadows.clear();
     }
@@ -402,6 +451,15 @@ impl WorldResidency {
         self.kinds.clear();
     }
 
+    /// The quality the device's probe measured it at, once the probe is
+    /// done; `None` before, and on a tier that keeps no timers.
+    pub fn probed(&self) -> Option<Quality> {
+        match self.probe {
+            Probe::Done(quality) => quality,
+            _ => None,
+        }
+    }
+
     /// How many shadow maps are held.
     pub fn shadow_maps(&self) -> usize {
         self.shadow_maps.len()
@@ -426,7 +484,14 @@ impl WorldResidency {
         box_px: (u32, u32),
     ) -> Option<ResolvedWorld> {
         let caps = ground.world_caps();
-        let governor = self.governors.entry(slot).or_insert_with(|| Governor::new(caps.start));
+        self.saw_world = true;
+        // a box starts where the device's probe measured it, or where its
+        // name says
+        let start = match self.probe {
+            Probe::Done(Some(quality)) => quality,
+            _ => caps.start,
+        };
+        let governor = self.governors.entry(slot).or_insert_with(|| Governor::new(start));
         let quality = governor.quality(shot.style().quality);
         let size = quality.target_size(box_px);
         let samples = quality.samples().min(caps.samples).max(1);
@@ -518,6 +583,56 @@ impl WorldResidency {
         Some(ResolvedWorld { target: id, size, job: Some(job) })
     }
 
+    /// The probe's next job, when a world was painted this walk and the
+    /// tier keeps timers: the fixed world drawn into a target of its own,
+    /// which no box composites. Its times come back through the tier's
+    /// timings and end the probe ([`WorldResidency::retire`]).
+    pub(crate) fn probe(&mut self, ground: &mut dyn WorldGround, images: &dyn ImageEngine) -> Option<WorldJob> {
+        if !self.saw_world {
+            return None;
+        }
+        let caps = ground.world_caps();
+        if let Probe::Unasked = self.probe {
+            if !caps.timers {
+                self.probe = Probe::Done(None);
+                return None;
+            }
+            let samples = Quality::Medium.samples().min(caps.samples).max(1);
+            let Some(target) = ground.make_target(PROBE_SIZE.0, PROBE_SIZE.1, samples) else {
+                self.probe = Probe::Done(None);
+                return None;
+            };
+            self.probe = Probe::Running { target, samples, frame: Rc::new(probe_frame()), sent: 0, times: Vec::new(), walks: 0 };
+        }
+        let Probe::Running { target, samples, frame, sent, walks, .. } = &mut self.probe else { return None };
+        *walks += 1;
+        if *walks > PROBE_WALKS {
+            // its times never came back: the boxes start from the name
+            let target = *target;
+            ground.drop_target(target);
+            self.probe = Probe::Done(None);
+            return None;
+        }
+        if *sent >= PROBE_FRAMES {
+            return None;
+        }
+        *sent += 1;
+        let first = *sent == 1;
+        let (target, samples, frame) = (*target, *samples, Rc::clone(frame));
+        let mut meshes = Vec::with_capacity(frame.meshes.len());
+        for mesh in &frame.meshes {
+            meshes.push(self.mesh(ground, mesh)?);
+        }
+        let textures: Vec<Option<u64>> = frame.textures.iter().map(|source| self.texture(ground, source, images)).collect();
+        // the casters once, as a box draws them while its camera moves: the
+        // middle of the three times leaves the first out
+        let shadow = frame.shadow.as_ref().and_then(|shadow| {
+            let (map, _) = self.shadow_map(ground, (PROBE_SLOT, false), shadow.size)?;
+            Some(ShadowJob { map, size: shadow.size, draw: first })
+        });
+        Some(WorldJob { target, size: PROBE_SIZE, samples, frame, meshes, textures, segments: Vec::new(), shadow, moving_shadow: None, redraw: Redraw::Whole })
+    }
+
     /// The box's shadow map of `size`, made when it has none of that
     /// side, with the generation it holds.
     fn shadow_map(&mut self, ground: &mut dyn WorldGround, slot: (u64, bool), size: u32) -> Option<(u64, Option<u64>)> {
@@ -586,6 +701,25 @@ impl WorldResidency {
         // what the GPU took over the jobs that finished: each box's
         // governor weighs its own
         for timing in ground.take_timings() {
+            if let Probe::Running { target, times, .. } = &mut self.probe
+                && *target == timing.target
+            {
+                times.push(timing.seconds);
+                if times.len() >= PROBE_FRAMES {
+                    // the middle time of the three: the device's measure
+                    times.sort_by(f64::total_cmp);
+                    let quality = crate::world::governor::probed_quality(times[times.len() / 2]);
+                    ground.drop_target(timing.target);
+                    if let Some(map) = self.shadow_maps.remove(&(PROBE_SLOT, false)) {
+                        ground.drop_shadow_map(map.id);
+                    }
+                    for governor in self.governors.values_mut() {
+                        governor.probed(quality);
+                    }
+                    self.probe = Probe::Done(Some(quality));
+                }
+                continue;
+            }
             let whole = self.kinds.get(&timing.target).copied().unwrap_or(true);
             let slot = self.targets.iter().find(|(_, target)| target.id == timing.target || target.spare == Some(timing.target)).map(|(slot, _)| *slot);
             if let Some(governor) = slot.and_then(|slot| self.governors.get_mut(&slot)) {
@@ -657,13 +791,14 @@ mod tests {
         start: Quality,
         redraw_samples: u8,
         slides: bool,
+        timers: bool,
         /// What the GPU took over the jobs, handed over on the next ask.
         timings: Vec<WorldTiming>,
     }
 
     impl Ledger {
         fn new() -> Ledger {
-            Ledger { samples: 4, start: Quality::High, redraw_samples: 4, slides: true, ..Ledger::default() }
+            Ledger { samples: 4, start: Quality::High, redraw_samples: 4, slides: true, timers: true, ..Ledger::default() }
         }
 
         fn mint(&mut self, what: &'static str) -> Option<u64> {
@@ -688,7 +823,7 @@ mod tests {
 
     impl WorldGround for Ledger {
         fn world_caps(&self) -> WorldCaps {
-            WorldCaps { samples: self.samples, start: self.start, redraw_samples: self.redraw_samples, slides: self.slides, timers: true }
+            WorldCaps { samples: self.samples, start: self.start, redraw_samples: self.redraw_samples, slides: self.slides, timers: self.timers }
         }
         fn make_target(&mut self, _: u32, _: u32, _: u8) -> Option<u64> {
             self.mint("target")
@@ -994,6 +1129,47 @@ mod tests {
         }
         let quality = residency.governors.get(&7).expect("the box's governor").quality(Quality::High);
         assert_eq!(quality, Quality::Medium, "a window of whole frames over 10 ms steps down once");
+    }
+
+    #[test]
+    fn the_device_is_probed_before_its_boxes_are_weighed() {
+        let (world, _) = cube_world();
+        let (mut ground, mut residency) = (Ledger::new(), WorldResidency::default());
+        ground.start = Quality::Low;
+        let images = RawImages::default();
+        let style = WorldStyle { quality: Quality::High, ..WorldStyle::default() };
+        let shot = |yaw: f64| Shot::new(world.with(WorldData::clone), Camera::orbiting(Vec3::ZERO, yaw, 25.0, 5.0), style.clone(), 0.0, (100.0, 80.0));
+        // no world painted yet: no probe
+        residency.begin_walk(1);
+        assert!(residency.probe(&mut ground, &images).is_none());
+        let mut probes = Vec::new();
+        for walk in 2..6u64 {
+            residency.begin_walk(walk);
+            residency.resolve(&mut ground, &images, &shot(walk as f64), 7, walk, (200, 160)).expect("a target");
+            if let Some(job) = residency.probe(&mut ground, &images) {
+                assert_eq!((job.size, job.samples, job.redraw.clone()), (PROBE_SIZE, 4, Redraw::Whole));
+                assert_eq!(job.shadow.map(|shadow| shadow.draw), Some(probes.is_empty()), "the casters once");
+                // a fast device: under half a millisecond at 640 × 360
+                ground.timings.push(WorldTiming { target: job.target, seconds: 0.0004 });
+                probes.push(job.target);
+            }
+            residency.drawn();
+            residency.retire(&mut ground);
+        }
+        assert_eq!(probes.len(), PROBE_FRAMES, "three frames, then done");
+        assert!(probes.iter().all(|target| *target == probes[0]), "into one target");
+        assert!(!ground.live.contains(&probes[0]), "which is given back");
+        // the box drawn before the measure, and a new one, start High
+        assert_eq!(residency.governors[&7].quality(Quality::High), Quality::High);
+        residency.begin_walk(10);
+        residency.resolve(&mut ground, &images, &shot(10.0), 8, 10, (200, 160)).expect("a target");
+        assert_eq!(residency.governors[&8].quality(Quality::High), Quality::High);
+        // a tier without timers is never probed
+        let (mut plain, mut quiet) = (Ledger::new(), WorldResidency::default());
+        plain.timers = false;
+        quiet.begin_walk(1);
+        quiet.resolve(&mut plain, &images, &shot(1.0), 7, 1, (200, 160)).expect("a target");
+        assert!(quiet.probe(&mut plain, &images).is_none());
     }
 
     #[test]

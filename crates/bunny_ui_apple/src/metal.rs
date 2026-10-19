@@ -3800,7 +3800,7 @@ impl OffscreenGpu {
     /// The world jobs the last walk made: none when every world on screen
     /// held its picture.
     pub fn world_jobs(&self) -> usize {
-        self.batches.worlds.len()
+        self.batches.box_worlds()
     }
 }
 
