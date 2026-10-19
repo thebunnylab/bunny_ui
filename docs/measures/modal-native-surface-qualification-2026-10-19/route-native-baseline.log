@@ -1,0 +1,42 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling serde_core v1.0.229
+   Compiling zmij v1.0.23
+   Compiling objc2 v0.6.5
+   Compiling bunny-ui-motor v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/motor)
+   Compiling objc2-encode v4.1.0
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+   Compiling itoa v1.0.18
+   Compiling memchr v2.8.3
+   Compiling bitflags v2.13.2
+   Compiling bunny-ui-core v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui)
+   Compiling syn v3.0.3
+   Compiling objc2-core-foundation v0.3.2
+   Compiling objc2-foundation v0.3.2
+   Compiling serde_derive v1.0.229
+   Compiling objc2-app-kit v0.3.2
+   Compiling countries-core v0.1.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/countries_core)
+   Compiling bunny-ui-apple v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui_apple)
+   Compiling countries-pure v0.1.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/apps/countries_pure)
+   Compiling bunny-ui-macos v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui_macos)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.38s
+     Running tests/accessibility_native.rs (target/studio-execution/debug/deps/accessibility_native-8efae2fec53f9f0a)
+Leaving an accessible window open for main-thread teardown.
+NSAccessibility slider value, bounds, nondividing steps, numeric validation and focus passed
+NSAccessibility checkbox value, focus, disabled rejection and stable identity passed
+Native popover roles, actions, focus, hit testing, repeated retirement and independent window passed
+NSAccessibility role=Some("AXStaticText") label=Some("Native protocol witness") value=Some("Native protocol witness") focused=0
+NSAccessibility role=Some("AXTextField") label=Some("Updated name") value=Some("Dinner") focused=0
+NSAccessibility role=Some("AXTextField") label=Some("Password") value=None focused=0
+NSAccessibility role=Some("AXButton") label=Some("Save") value=None focused=0
+NSAccessibility role=Some("AXSlider") label=Some("Refresh rate") value=None focused=0
+NSAccessibility role=Some("AXCheckBox") label=Some("Reimbursable") value=Some("1") focused=0
+NSAccessibility role=Some("AXButton") label=Some("Toggle controls") value=None focused=0
+NSAccessibility role=Some("AXButton") label=Some("Open modal") value=None focused=0
+NSAccessibility role=Some("AXButton") label=Some("Open reactions") value=None focused=1
+NSAccessibility role=Some("AXButton") label=Some("Remove row") value=None focused=0
+NSAccessibility role=Some("AXButton") label=Some("Row 1") value=None focused=0
+Routed erased modal exposes native panel controls, focus and real actions; covered main controls stay unavailable
+Native AppKit protocol witness passed; no human assistive-technology claim.
