@@ -1,0 +1,16 @@
+   Compiling bunny-ui-core v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.07s
+     Running tests/blur_paint.rs (target/debug/deps/blur_paint-21b485413e99de78)
+
+running 8 tests
+test zero_negative_and_nonfinite_blurs_are_inert ... ok
+test dom_and_ssr_keep_native_elements_and_filter_changes ... ok
+test looping_custom_paint_inside_blur_requests_a_scene_frame ... ok
+test blur_spreads_paint_without_changing_layout_or_source_sites ... ok
+test blur_composites_overlapping_children_and_nested_effects ... ok
+test blur_preserves_transparent_color_and_modifier_order ... ok
+test blur_respects_device_scale_and_keeps_scrollbars_in_the_composite ... ok
+test blur_keeps_click_geometry_and_caps_positive_radius ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.73s
+

@@ -47,7 +47,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 21;
+const EXPECTED_ABI = 22;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads (`bunny run` and `bunny build` write it);
@@ -548,6 +548,7 @@ function lookRules(selector, kind, flags, style, layout, face) {
   // `.hidden()`: the box keeps its place in the flow and shows nothing —
   // visibility, never display, or the sibling would move up
   if (style.hidden) decl.visibility = "hidden";
+  if (style.blur !== null) decl.filter = `blur(${style.blur}px)`;
   if (style.filter) {
     decl["backdrop-filter"] = style.filter;
     decl["-webkit-backdrop-filter"] = style.filter;
@@ -865,6 +866,7 @@ function applyPatches(view, length) {
       passThrough: false,
       hidden: false,
       filter: null,
+      blur: null,
     };
     if (mask & 1) style.background = rgba(u32());
     if (mask & 2) style.hover = rgba(u32());
@@ -972,6 +974,7 @@ function applyPatches(view, length) {
         );
       }
     }
+    if (mask & 33554432) style.blur = f32();
     return style;
   };
   const readLayout = () => {

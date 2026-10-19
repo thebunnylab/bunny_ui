@@ -1,0 +1,91 @@
+    Checking bunny-ui-core v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui)
+    Checking bunny-ui-web v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui_web)
+error: the borrowed expression implements the required traits
+   --> crates/bunny_ui_web/src/lib.rs:309:36
+    |
+309 |     let taken = runtime.key_stroke(&pattern);
+    |                                    ^^^^^^^^ help: change this to: `pattern`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_borrows_for_generic_args
+    = note: `-D clippy::needless-borrows-for-generic-args` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::needless_borrows_for_generic_args)]`
+
+error: the borrowed expression implements the required traits
+   --> crates/bunny_ui_web/src/lib.rs:341:29
+    |
+341 |         match runtime.chord(&pattern) {
+    |                             ^^^^^^^^ help: change this to: `pattern`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_borrows_for_generic_args
+
+error: this public function might dereference a raw pointer but is not marked `unsafe`
+    --> crates/bunny_ui_web/src/lib.rs:1352:48
+     |
+1352 |     let text = unsafe { String::from_raw_parts(pointer, len, len.max(1)) };
+     |                                                ^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#not_unsafe_ptr_arg_deref
+     = note: `#[deny(clippy::not_unsafe_ptr_arg_deref)]` on by default
+
+error: this public function might dereference a raw pointer but is not marked `unsafe`
+    --> crates/bunny_ui_web/src/lib.rs:1366:48
+     |
+1366 |     let text = unsafe { String::from_raw_parts(pointer, len, len.max(1)) };
+     |                                                ^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#not_unsafe_ptr_arg_deref
+
+error: this public function might dereference a raw pointer but is not marked `unsafe`
+    --> crates/bunny_ui_web/src/lib.rs:1729:48
+     |
+1729 |     let path = unsafe { String::from_raw_parts(pointer, len, len.max(1)) };
+     |                                                ^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#not_unsafe_ptr_arg_deref
+
+error: clamp-like pattern without using clamp function
+    --> crates/bunny_ui_web/src/lib.rs:1732:44
+     |
+1732 |     dispatch(Event::Action { path, clicks: clicks.max(1).min(255) as u8 });
+     |                                            ^^^^^^^^^^^^^^^^^^^^^^ help: replace with clamp: `clicks.clamp(1, 255)`
+     |
+     = note: clamp will panic if max < min
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#manual_clamp
+     = note: `-D clippy::manual-clamp` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::manual_clamp)]`
+
+error: this public function might dereference a raw pointer but is not marked `unsafe`
+    --> crates/bunny_ui_web/src/lib.rs:1793:48
+     |
+1793 |     let list = unsafe { String::from_raw_parts(pointer, len, len.max(1)) };
+     |                                                ^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#not_unsafe_ptr_arg_deref
+
+error: this public function might dereference a raw pointer but is not marked `unsafe`
+    --> crates/bunny_ui_web/src/lib.rs:1814:48
+     |
+1814 |     let path = unsafe { String::from_raw_parts(path_pointer, path_len, path_len.max(1)) };
+     |                                                ^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#not_unsafe_ptr_arg_deref
+
+error: this public function might dereference a raw pointer but is not marked `unsafe`
+    --> crates/bunny_ui_web/src/lib.rs:1815:49
+     |
+1815 |     let value = unsafe { String::from_raw_parts(value_pointer, value_len, value_len.max(1)) };
+     |                                                 ^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#not_unsafe_ptr_arg_deref
+
+error: this operation has no effect
+    --> crates/bunny_ui_web/src/lib.rs:1876:15
+     |
+1876 |     let at = (1 * 4 + 1) * 4;
+     |               ^^^^^ help: consider reducing it to: `4`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#identity_op
+     = note: `-D clippy::identity-op` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::identity_op)]`
+
+error: could not compile `bunny-ui-web` (lib) due to 10 previous errors
