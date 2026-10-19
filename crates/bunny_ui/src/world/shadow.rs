@@ -120,7 +120,12 @@ impl ShadowMap {
     /// both faces, corners snapped to 1/256 of a texel, the top-left rule,
     /// the nearest depth kept. `None` for a frame without a shadow.
     pub fn draw(frame: &WorldFrame) -> Option<ShadowMap> {
-        let shadow = frame.shadow.as_ref()?;
+        ShadowMap::draw_of(frame, frame.shadow.as_ref()?)
+    }
+
+    /// [`ShadowMap::draw`] for one of the frame's maps: the still one, or
+    /// the one of what moves.
+    pub fn draw_of(frame: &WorldFrame, shadow: &super::frame::ShadowFrame) -> Option<ShadowMap> {
         let size = shadow.size.max(1);
         let mut map = ShadowMap { size, depth: vec![u16::MAX; size as usize * size as usize] };
         for draw in &shadow.draws {
@@ -220,11 +225,22 @@ impl ShadowMap {
 }
 
 /// How much of the sun reaches a point at `position` with the normal
-/// `n`, both in the eye's space, the normal on the side the eye sees: 1
-/// in full light, 0 in shadow, a share in the penumbra. Step for step
-/// what the shaders compute.
+/// `n`, both in the eye's space, the normal on the side the eye sees, as
+/// the still map tells: 1 in full light, 0 in shadow, a share in the
+/// penumbra. Step for step what the shaders compute.
 pub fn visibility(u: &FrameUniforms, map: &ShadowMap, position: V3, n: V3) -> f32 {
-    let taps = u.shadow[3];
+    visibility_in(u, &u.shadow_from_eye, u.shadow, map, position, n)
+}
+
+/// [`visibility`] as the map of what moves tells.
+pub fn moving_visibility(u: &FrameUniforms, map: &ShadowMap, position: V3, n: V3) -> f32 {
+    visibility_in(u, &u.moving_from_eye, u.moving, map, position, n)
+}
+
+/// A map's word on a point: `from_eye` takes the eye's space to the map,
+/// `params` is `(1/size, normal offset, depth bias, taps)`.
+fn visibility_in(u: &FrameUniforms, from_eye: &[f32; 16], params: super::wire::Row, map: &ShadowMap, position: V3, n: V3) -> f32 {
+    let taps = params[3];
     if taps < 0.5 || u.sun_direction[3] <= 0.5 {
         return 1.0;
     }
@@ -233,8 +249,8 @@ pub fn visibility(u: &FrameUniforms, map: &ShadowMap, position: V3, n: V3) -> f3
         return 1.0;
     }
     let sine = (1.0 - n_dot_l * n_dot_l).max(0.0).sqrt();
-    let p = add(position, scale(n, u.shadow[1] * sine));
-    let m = &u.shadow_from_eye;
+    let p = add(position, scale(n, params[1] * sine));
+    let m = from_eye;
     let s = [
         m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12],
         m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13],
@@ -243,8 +259,8 @@ pub fn visibility(u: &FrameUniforms, map: &ShadowMap, position: V3, n: V3) -> f3
     if !(s[0] > 0.0 && s[0] < 1.0 && s[1] > 0.0 && s[1] < 1.0) {
         return 1.0;
     }
-    let reference = (s[2] - u.shadow[2]).clamp(0.0, 1.0);
-    let texel = u.shadow[0];
+    let reference = (s[2] - params[2]).clamp(0.0, 1.0);
+    let texel = params[0];
     if taps < 1.5 {
         return map.lookup(s[0], s[1], reference);
     }
@@ -268,8 +284,8 @@ pub fn visibility(u: &FrameUniforms, map: &ShadowMap, position: V3, n: V3) -> f3
 /// How many maps the CPU keeps drawn.
 const MAPS_KEPT: usize = 4;
 
-/// A map the CPU drew, by its generation and side.
-type Kept = ((u64, u32), Rc<ShadowMap>);
+/// A map the CPU drew, by its generation, its side and which map it is.
+type Kept = ((u64, u32, bool), Rc<ShadowMap>);
 
 thread_local! {
     /// The maps the CPU drew last: a camera that moves under a still sun
@@ -277,14 +293,22 @@ thread_local! {
     static MAPS: RefCell<Vec<Kept>> = const { RefCell::new(Vec::new()) };
 }
 
-/// The frame's map, drawn once per generation.
+/// The frame's still map, drawn once per generation.
 pub(crate) fn map_of(frame: &WorldFrame) -> Option<Rc<ShadowMap>> {
-    let shadow = frame.shadow.as_ref()?;
-    let key = (shadow.generation, shadow.size);
+    kept(frame, frame.shadow.as_ref()?, false)
+}
+
+/// The frame's map of what moves, drawn once per generation.
+pub(crate) fn moving_map_of(frame: &WorldFrame) -> Option<Rc<ShadowMap>> {
+    kept(frame, frame.moving_shadow.as_ref()?, true)
+}
+
+fn kept(frame: &WorldFrame, shadow: &super::frame::ShadowFrame, moving: bool) -> Option<Rc<ShadowMap>> {
+    let key = (shadow.generation, shadow.size, moving);
     if let Some(hit) = MAPS.with(|maps| maps.borrow().iter().find(|(held, _)| *held == key).map(|(_, map)| Rc::clone(map))) {
         return Some(hit);
     }
-    let map = Rc::new(ShadowMap::draw(frame)?);
+    let map = Rc::new(ShadowMap::draw_of(frame, shadow)?);
     MAPS.with(|maps| {
         let mut maps = maps.borrow_mut();
         if maps.len() >= MAPS_KEPT {

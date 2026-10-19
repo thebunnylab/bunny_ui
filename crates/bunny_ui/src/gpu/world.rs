@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::image_engine::{ImageEngine, ImageSource};
-use crate::world::frame::{Quality, WorldFrame};
+use crate::world::frame::{Quality, ShadowFrame, WorldFrame};
 use crate::world::governor::Governor;
 use crate::world::mesh::{Lines, Mesh};
 use crate::world::view::Shot;
@@ -108,6 +108,9 @@ pub struct WorldJob {
     /// The sun's shadow map, when the frame has one and the tier made it;
     /// without it the surfaces draw in full sun.
     pub shadow: Option<ShadowJob>,
+    /// The second map, of what moves, the same way; drawn every frame it
+    /// holds something new.
+    pub moving_shadow: Option<ShadowJob>,
 }
 
 impl WorldJob {
@@ -138,7 +141,10 @@ impl WorldJob {
         let shadow = frame.shadow.as_ref().and_then(|shadow| {
             Some(ShadowJob { map: ground.make_shadow_map(shadow.size)?, size: shadow.size, draw: true })
         });
-        Some(WorldJob { target, size: frame.size, samples, frame: Rc::clone(frame), meshes, textures, segments, shadow })
+        let moving_shadow = frame.moving_shadow.as_ref().and_then(|shadow| {
+            Some(ShadowJob { map: ground.make_shadow_map(shadow.size)?, size: shadow.size, draw: true })
+        });
+        Some(WorldJob { target, size: frame.size, samples, frame: Rc::clone(frame), meshes, textures, segments, shadow, moving_shadow })
     }
 
     /// Gives back everything [`WorldJob::single`] made.
@@ -153,7 +159,7 @@ impl WorldJob {
         for id in self.textures.into_iter().flatten() {
             ground.drop_texture(id);
         }
-        if let Some(shadow) = self.shadow {
+        for shadow in [self.shadow, self.moving_shadow].into_iter().flatten() {
             ground.drop_shadow_map(shadow.map);
         }
     }
@@ -203,8 +209,9 @@ pub struct WorldResidency {
     meshes: HashMap<u64, Asset>,
     textures: HashMap<u64, Asset>,
     segments: HashMap<u64, Asset>,
-    /// Each box's shadow map, by slot.
-    shadow_maps: HashMap<u64, HeldMap>,
+    /// Each box's shadow maps, by slot and whether it is the map of what
+    /// moves.
+    shadow_maps: HashMap<(u64, bool), HeldMap>,
     /// Each box's governor, by slot: the quality it draws at.
     governors: HashMap<u64, Governor>,
     /// The walk in progress.
@@ -214,7 +221,7 @@ pub struct WorldResidency {
     /// frame that never reached the GPU, draws its worlds again.
     pending: Vec<(u64, u64)>,
     /// What this walk's jobs leave in their shadow maps, the same way.
-    pending_shadows: Vec<(u64, u64)>,
+    pending_shadows: Vec<((u64, bool), u64)>,
 }
 
 impl WorldResidency {
@@ -320,22 +327,26 @@ impl WorldResidency {
         if textures.iter().all(Option::is_some) {
             self.pending.push((slot, generation));
         }
-        // the shadow is drawn again only when what it holds moved: a
-        // camera that moves under a still sun reads the map it has
-        let shadow = frame.shadow.as_ref().and_then(|shadow| {
-            let (map, holds) = self.shadow_map(ground, slot, shadow.size)?;
+        // a map is drawn again only when what it holds moved: a camera
+        // that moves under a still sun reads the map it has
+        let mut held = |shadow: Option<&ShadowFrame>, moving: bool| {
+            let shadow = shadow?;
+            let (map, holds) = self.shadow_map(ground, (slot, moving), shadow.size)?;
             let draw = holds != Some(shadow.generation);
             if draw {
-                self.pending_shadows.push((slot, shadow.generation));
+                self.pending_shadows.push(((slot, moving), shadow.generation));
             }
             Some(ShadowJob { map, size: shadow.size, draw })
-        });
-        Some(ResolvedWorld { target: id, size, job: Some(WorldJob { target: id, size, samples, frame, meshes, textures, segments, shadow }) })
+        };
+        let shadow = held(frame.shadow.as_ref(), false);
+        let moving_shadow = held(frame.moving_shadow.as_ref(), true);
+        let job = WorldJob { target: id, size, samples, frame, meshes, textures, segments, shadow, moving_shadow };
+        Some(ResolvedWorld { target: id, size, job: Some(job) })
     }
 
     /// The box's shadow map of `size`, made when it has none of that
     /// side, with the generation it holds.
-    fn shadow_map(&mut self, ground: &mut dyn WorldGround, slot: u64, size: u32) -> Option<(u64, Option<u64>)> {
+    fn shadow_map(&mut self, ground: &mut dyn WorldGround, slot: (u64, bool), size: u32) -> Option<(u64, Option<u64>)> {
         let walk = self.walk;
         if let Some(held) = self.shadow_maps.get_mut(&slot) {
             if held.size == size {

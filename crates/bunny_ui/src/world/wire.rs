@@ -16,7 +16,7 @@
 /// Rows of four.
 pub type Row = [f32; 4];
 
-/// The per-frame block: lens, viewport, lights, tone. 624 bytes.
+/// The per-frame block: lens, viewport, lights, tone. 704 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct FrameUniforms {
     /// The projection, column-major: clip = this × eye-space position.
@@ -63,6 +63,11 @@ pub struct FrameUniforms {
     /// `u = floor_u · (p, 1)`.
     pub floor_u: Row,
     pub floor_v: Row,
+    /// The second shadow map, of what moves (a figure that walks), from
+    /// the eye's space: as [`FrameUniforms::shadow_from_eye`].
+    pub moving_from_eye: [f32; 16],
+    /// As [`FrameUniforms::shadow`], for the second map; taps 0 = none.
+    pub moving: Row,
 }
 
 /// Point lights a frame carries.
@@ -88,7 +93,9 @@ pub mod frame_offset {
     pub const POINT_GROUPS: usize = 560;
     pub const FLOOR_U: usize = 592;
     pub const FLOOR_V: usize = 608;
-    pub const SIZE: usize = 624;
+    pub const MOVING_FROM_EYE: usize = 624;
+    pub const MOVING: usize = 688;
+    pub const SIZE: usize = 704;
 }
 
 /// One instance of a mesh or a set of lines. 128 bytes.
@@ -245,6 +252,8 @@ impl FrameUniforms {
         }
         put_row(out, &self.floor_u);
         put_row(out, &self.floor_v);
+        put_matrix(out, &self.moving_from_eye);
+        put_row(out, &self.moving);
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -375,6 +384,8 @@ mod tests {
         uniforms.point_groups[1][3] = 0xDEAD_BEEF;
         uniforms.floor_u[3] = 18.0;
         uniforms.floor_v[0] = 19.0;
+        uniforms.moving_from_eye[15] = 20.0;
+        uniforms.moving[3] = 21.0;
         let bytes = uniforms.to_bytes();
         assert_eq!(bytes.len(), frame_offset::SIZE);
         use frame_offset as at;
@@ -396,6 +407,8 @@ mod tests {
         assert_eq!(u32_at(&bytes, at::POINT_GROUPS + 16 + 12), 0xDEAD_BEEF);
         assert_eq!(f32_at(&bytes, at::FLOOR_U + 12), 18.0);
         assert_eq!(f32_at(&bytes, at::FLOOR_V), 19.0);
+        assert_eq!(f32_at(&bytes, at::MOVING_FROM_EYE + 60), 20.0);
+        assert_eq!(f32_at(&bytes, at::MOVING + 12), 21.0);
     }
 
     #[test]

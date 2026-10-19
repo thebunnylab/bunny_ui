@@ -124,6 +124,8 @@ struct WorldUniforms {
     uint4 point_groups[2];
     float4 floor_u;
     float4 floor_v;
+    float4x4 moving_from_eye;
+    float4 moving;
 };
 
 struct WorldInstance {
@@ -251,8 +253,10 @@ static float encode_code(float linear) {
 
 // how much of the sun reaches a point: its depth from the sun against the
 // map's, each lookup four texels compared and filtered by the sampler
-static float sun_visibility(constant WorldUniforms& u, depth2d<float> map, sampler compare, float3 position, float3 n) {
-    float taps = u.shadow.w;
+// how much of the sun a map lets reach a point; `params` is (1/size,
+// normal offset, depth bias, taps)
+static float map_visibility(constant WorldUniforms& u, depth2d<float> map, sampler compare, float4x4 from_eye, float4 params, float3 position, float3 n) {
+    float taps = params.w;
     if (taps < 0.5 || u.sun_direction.w <= 0.5) {
         return 1.0;
     }
@@ -261,13 +265,13 @@ static float sun_visibility(constant WorldUniforms& u, depth2d<float> map, sampl
         return 1.0;
     }
     float sine = sqrt(max(1.0 - n_dot_l * n_dot_l, 0.0));
-    float3 p = position + n * (u.shadow.y * sine);
-    float4 s = u.shadow_from_eye * float4(p, 1.0);
+    float3 p = position + n * (params.y * sine);
+    float4 s = from_eye * float4(p, 1.0);
     if (!(s.x > 0.0 && s.x < 1.0 && s.y > 0.0 && s.y < 1.0)) {
         return 1.0;
     }
-    float reference = clamp(s.z - u.shadow.z, 0.0, 1.0);
-    float texel = u.shadow.x;
+    float reference = clamp(s.z - params.z, 0.0, 1.0);
+    float texel = params.x;
     if (taps < 1.5) {
         return map.sample_compare(compare, s.xy, reference, level(0));
     }
@@ -286,6 +290,13 @@ static float sun_visibility(constant WorldUniforms& u, depth2d<float> map, sampl
         }
     }
     return sum / 9.0;
+}
+
+// the still map's word times the word of the map of what moves
+static float sun_visibility(constant WorldUniforms& u, depth2d<float> map, sampler compare, depth2d<float> moving_map,
+                            sampler moving_compare, float3 position, float3 n) {
+    return map_visibility(u, map, compare, u.shadow_from_eye, u.shadow, position, n) *
+           map_visibility(u, moving_map, moving_compare, u.moving_from_eye, u.moving, position, n);
 }
 
 // what the floor map gives a point: its texel from the base level, never
@@ -543,8 +554,8 @@ static float glow_of(float3 emissive) {
 static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* materials,
                           device const WorldInstance* instances, constant WorldUniforms& u,
                           constant WorldDraw& draw, texture2d<float> picture, sampler wrap,
-                          depth2d<float> shadow_map, sampler compare, texture2d<float> floor_map,
-                          device const uchar4* parts, thread float& glow) {
+                          depth2d<float> shadow_map, sampler compare, depth2d<float> moving_map, sampler moving_compare,
+                          texture2d<float> floor_map, device const uchar4* parts, thread float& glow) {
     float4 section = u.section;
     if (any(section != 0.0) && section.x * in.eye.x + section.y * in.eye.y + section.z * in.eye.z + section.w < 0.0) {
         discard_fragment();
@@ -587,7 +598,7 @@ static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* 
         }
         float3 light = lit(u, in.eye, normal, base, material.params.x, material.params.y,
                            material.emissive.xyz, in.occlusion, 1u << ((instance.flags >> 8) & 31u),
-                           sun_visibility(u, shadow_map, compare, in.eye, normal),
+                           sun_visibility(u, shadow_map, compare, moving_map, moving_compare, in.eye, normal),
                            floor_light(u, instance.flags, floor_map, wrap, in.eye),
                            float3(SRGB_DECODE[instance.ambient.r], SRGB_DECODE[instance.ambient.g], SRGB_DECODE[instance.ambient.b]));
         if (u.tone.z > 0.5) {
@@ -617,10 +628,12 @@ fragment float4 world_fragment(WorldVary in [[stage_in]],
                                sampler wrap [[sampler(0)]],
                                depth2d<float> shadow_map [[texture(1)]],
                                sampler compare [[sampler(1)]],
+                               depth2d<float> moving_map [[texture(3)]],
+                               sampler moving_compare [[sampler(2)]],
                                texture2d<float> floor_map [[texture(2)]],
                                device const uchar4* parts [[buffer(5)]]) {
     float glow;
-    return world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, floor_map, parts, glow);
+    return world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, moving_map, moving_compare, floor_map, parts, glow);
 }
 
 fragment GlowBack world_fragment_glow(WorldVary in [[stage_in]],
@@ -633,11 +646,13 @@ fragment GlowBack world_fragment_glow(WorldVary in [[stage_in]],
                                sampler wrap [[sampler(0)]],
                                depth2d<float> shadow_map [[texture(1)]],
                                sampler compare [[sampler(1)]],
+                               depth2d<float> moving_map [[texture(3)]],
+                               sampler moving_compare [[sampler(2)]],
                                texture2d<float> floor_map [[texture(2)]],
                                device const uchar4* parts [[buffer(5)]]) {
     GlowBack out;
     float glow;
-    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, floor_map, parts, glow);
+    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, moving_map, moving_compare, floor_map, parts, glow);
     out.glow = float4(glow / 255.0, 0.0, 0.0, out.color.a);
     return out;
 }
@@ -673,11 +688,13 @@ fragment SteppedBack world_fragment_stepped(WorldVary in [[stage_in]],
                                             sampler wrap [[sampler(0)]],
                                             depth2d<float> shadow_map [[texture(1)]],
                                             sampler compare [[sampler(1)]],
+                                            depth2d<float> moving_map [[texture(3)]],
+                                            sampler moving_compare [[sampler(2)]],
                                             texture2d<float> floor_map [[texture(2)]],
                                             device const uchar4* parts [[buffer(5)]]) {
     SteppedBack out;
     float glow;
-    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, floor_map, parts, glow);
+    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, moving_map, moving_compare, floor_map, parts, glow);
     out.depth = stepped_depth(in, draw);
     return out;
 }
@@ -692,11 +709,13 @@ fragment SteppedGlowBack world_fragment_stepped_glow(WorldVary in [[stage_in]],
                                sampler wrap [[sampler(0)]],
                                depth2d<float> shadow_map [[texture(1)]],
                                sampler compare [[sampler(1)]],
+                               depth2d<float> moving_map [[texture(3)]],
+                               sampler moving_compare [[sampler(2)]],
                                texture2d<float> floor_map [[texture(2)]],
                                device const uchar4* parts [[buffer(5)]]) {
     SteppedGlowBack out;
     float glow;
-    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, floor_map, parts, glow);
+    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, moving_map, moving_compare, floor_map, parts, glow);
     out.glow = float4(glow / 255.0, 0.0, 0.0, out.color.a);
     out.depth = stepped_depth(in, draw);
     return out;
@@ -1240,7 +1259,7 @@ impl MetalWorld {
         let Built::Ready(stack) = &mut self.built else { return FramePass::default() };
         let composite = stack.composite;
         let mut jobs = Vec::with_capacity(batches.worlds.len());
-        for (job, &StagedAt { instances, materials, casters, parts, joints }) in batches.worlds.iter().zip(staged) {
+        for (job, &StagedAt { instances, materials, casters, moving_casters, parts, joints }) in batches.worlds.iter().zip(staged) {
             let Some(target) = self.targets.get(&job.target) else { continue };
             let samples = target.samples;
             // a frame with a bloom draws its glow beside its colour
@@ -1262,10 +1281,11 @@ impl MetalWorld {
                 None
             };
             let glow = bloom.is_some();
-            // the box's map, and its casters when it does not hold them
-            let map = job.shadow.and_then(|shadow| self.shadow_maps.get(&shadow.map).map(|&(map, _)| (shadow, map)));
-            let shadow = match (map, job.frame.shadow.as_ref()) {
-                (Some((held, map)), Some(frame_shadow)) if held.draw => Some(PreparedShadow {
+            // the box's maps, and their casters when they do not hold them
+            let prepare_shadow = |held: Option<bunny_ui::gpu::world::ShadowJob>, frame_shadow: Option<&bunny_ui::world::ShadowFrame>, casters: u64| {
+                let map = held.and_then(|shadow| self.shadow_maps.get(&shadow.map).map(|&(map, _)| (shadow, map)));
+                let prepared = match (map, frame_shadow) {
+                    (Some((held, map)), Some(frame_shadow)) if held.draw => Some(PreparedShadow {
                     map,
                     casters,
                     draws: frame_shadow
@@ -1290,10 +1310,13 @@ impl MetalWorld {
                             })
                         })
                         .collect(),
-                }),
-                _ => None,
+                    }),
+                    _ => None,
+                };
+                (prepared, map.map_or((stack.lit, stack.always), |(_, map)| (map, stack.compare)))
             };
-            let (shadow_map, shadow_sampler) = map.map_or((stack.lit, stack.always), |(_, map)| (map, stack.compare));
+            let (shadow, (shadow_map, shadow_sampler)) = prepare_shadow(job.shadow, job.frame.shadow.as_ref(), casters);
+            let (moving_shadow, (moving_map, moving_sampler)) = prepare_shadow(job.moving_shadow, job.frame.moving_shadow.as_ref(), moving_casters);
             let floor_map = job
                 .frame
                 .floor
@@ -1419,6 +1442,9 @@ impl MetalWorld {
                 caster_depth: stack.depth_states[DEPTH_OPAQUE],
                 shadow_map,
                 shadow_sampler,
+                moving_shadow,
+                moving_map,
+                moving_sampler,
                 floor_map,
                 bloom,
             });
@@ -2028,6 +2054,11 @@ struct PreparedJob {
     /// What the surfaces read the sun's shadow through.
     shadow_map: Id,
     shadow_sampler: Id,
+    /// The map of what moves: its casters, and what the surfaces read it
+    /// through.
+    moving_shadow: Option<PreparedShadow>,
+    moving_map: Id,
+    moving_sampler: Id,
     /// The frame's floor map, or the dark texel.
     floor_map: Id,
     bloom: Option<PreparedBloom>,
@@ -2107,7 +2138,7 @@ impl FramePass {
         let Some(world) = self.sels else { return };
         for job in &self.jobs {
             unsafe {
-                if let Some(shadow) = &job.shadow {
+                for shadow in [&job.shadow, &job.moving_shadow].into_iter().flatten() {
                     encode_casters(command, sels, &world, pass_class, staging, job, shadow);
                 }
                 let pass = msg_id(pass_class, sels.render_pass_descriptor);
@@ -2167,6 +2198,8 @@ impl FramePass {
                 msg_void_id_u64(encoder, world.set_fragment_sampler, job.sampler, 0);
                 msg_void_id_u64(encoder, sels.set_fragment_texture, job.shadow_map, 1);
                 msg_void_id_u64(encoder, world.set_fragment_sampler, job.shadow_sampler, 1);
+                msg_void_id_u64(encoder, sels.set_fragment_texture, job.moving_map, 3);
+                msg_void_id_u64(encoder, world.set_fragment_sampler, job.moving_sampler, 2);
                 msg_void_id_u64(encoder, sels.set_fragment_texture, job.floor_map, 2);
                 for draw in &job.draws {
                     match draw {
@@ -2299,6 +2332,8 @@ pub(super) struct Staged {
     pub(super) materials: Vec<u8>,
     /// The rows of its shadow's casters, when the box's map must be drawn.
     pub(super) casters: Vec<u8>,
+    /// The same for the map of what moves.
+    pub(super) moving_casters: Vec<u8>,
     pub(super) parts: Vec<u8>,
     pub(super) joints: Vec<u8>,
 }
@@ -2309,6 +2344,7 @@ pub(super) struct StagedAt {
     pub(super) instances: u64,
     pub(super) materials: u64,
     pub(super) casters: u64,
+    pub(super) moving_casters: u64,
     pub(super) parts: u64,
     pub(super) joints: u64,
 }
@@ -2318,10 +2354,12 @@ pub(super) struct StagedAt {
 /// and its palettes (one part and one row at least: the stage's buffers
 /// are never left unbound).
 pub(super) fn staged_bytes(job: &WorldJob) -> Staged {
-    let casters = match (job.shadow, &job.frame.shadow) {
+    let rows_of = |held: Option<bunny_ui::gpu::world::ShadowJob>, shadow: &Option<bunny_ui::world::ShadowFrame>| match (held, shadow) {
         (Some(held), Some(shadow)) if held.draw => shadow_instance_bytes(&shadow.instances),
         _ => Vec::new(),
     };
+    let casters = rows_of(job.shadow, &job.frame.shadow);
+    let moving_casters = rows_of(job.moving_shadow, &job.frame.moving_shadow);
     let mut parts = part_bytes(&job.frame.parts);
     if parts.is_empty() {
         parts = vec![255; 4];
@@ -2330,7 +2368,7 @@ pub(super) fn staged_bytes(job: &WorldJob) -> Staged {
     if joints.is_empty() {
         joints = vec![0; 16];
     }
-    Staged { instances: instance_bytes(&job.frame.instances), materials: material_bytes(&job.frame.materials), casters, parts, joints }
+    Staged { instances: instance_bytes(&job.frame.instances), materials: material_bytes(&job.frame.materials), casters, moving_casters, parts, joints }
 }
 
 /// A frame of its own, for the harness: what the parity tests compare

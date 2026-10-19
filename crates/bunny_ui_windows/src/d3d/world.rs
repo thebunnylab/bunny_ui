@@ -18,8 +18,9 @@
 //! A frame whose sun casts draws its casters first, when the box's map
 //! does not hold them yet: a pass of depth alone, no pixel stage, into a
 //! 16-bit map the surfaces read through a comparing sampler (`t5`, `s2`).
-//! A frame without a map binds a texel and a sampler whose comparison
-//! always passes.
+//! What moves casts into a second map of its own the same way (`t13`,
+//! `s3`), so a walk never draws the still casters again. A frame without
+//! a map binds a texel and a sampler whose comparison always passes.
 //!
 //! The world shaders are compiled the first time a box paints a world:
 //! an app that shows none never pays for them.
@@ -123,6 +124,8 @@ struct WorldUniforms {
     uint4 point_groups[2];
     float4 floor_u;
     float4 floor_v;
+    column_major float4x4 moving_from_eye;
+    float4 moving;
 };
 
 struct WorldInstance {
@@ -200,6 +203,8 @@ StructuredBuffer<WorldMaterial> materials : register(t2);
 Texture2D<float4> picture : register(t3);
 StructuredBuffer<WorldSegment> segments : register(t4);
 Texture2D<float> shadow_map : register(t5);
+// the map of what moves, read the same way
+Texture2D<float> moving_map : register(t13);
 Texture2D<float4> floor_picture : register(t7);
 // the frame's part table: a part's tint and, in the top byte, 0 when it hides
 StructuredBuffer<uint> parts : register(t8);
@@ -209,6 +214,7 @@ StructuredBuffer<uint> deform : register(t11);
 StructuredBuffer<float4> joints : register(t12);
 SamplerState surface_sampler : register(s1);
 SamplerComparisonState shadow_sampler : register(s2);
+SamplerComparisonState moving_sampler : register(s3);
 
 static const uint DRAW_MASK = 1;
 static const uint DRAW_TEXTURED = 2;
@@ -288,10 +294,12 @@ float encode_code(float shade) {
     return s * 255.0;
 }
 
-// how much of the sun reaches a point: its depth from the sun against the
-// map's, each lookup four texels compared and filtered by the sampler
-float sun_visibility(float3 position, float3 n) {
-    float taps = u.shadow.w;
+// how much of the sun a map lets reach a point: its depth from the sun
+// against the map's, each lookup four texels compared and filtered by the
+// sampler; `params` is (1/size, normal offset, depth bias, taps)
+float map_visibility(Texture2D<float> map, SamplerComparisonState compare, float4x4 from_eye, float4 params,
+                     float3 position, float3 n) {
+    float taps = params.w;
     if (taps < 0.5 || u.sun_direction.w <= 0.5) {
         return 1.0;
     }
@@ -300,22 +308,22 @@ float sun_visibility(float3 position, float3 n) {
         return 1.0;
     }
     float sine = sqrt(max(1.0 - n_dot_l * n_dot_l, 0.0));
-    float3 p = position + n * (u.shadow.y * sine);
-    float4 s = mul(u.shadow_from_eye, float4(p, 1.0));
+    float3 p = position + n * (params.y * sine);
+    float4 s = mul(from_eye, float4(p, 1.0));
     if (!(s.x > 0.0 && s.x < 1.0 && s.y > 0.0 && s.y < 1.0)) {
         return 1.0;
     }
-    float reference = clamp(s.z - u.shadow.z, 0.0, 1.0);
-    float texel = u.shadow.x;
+    float reference = clamp(s.z - params.z, 0.0, 1.0);
+    float texel = params.x;
     if (taps < 1.5) {
-        return shadow_map.SampleCmpLevelZero(shadow_sampler, s.xy, reference);
+        return map.SampleCmpLevelZero(compare, s.xy, reference);
     }
     if (taps < 4.5) {
         float four = 0.0;
-        four += shadow_map.SampleCmpLevelZero(shadow_sampler, float2(s.x - 0.5 * texel, s.y - 0.5 * texel), reference);
-        four += shadow_map.SampleCmpLevelZero(shadow_sampler, float2(s.x + 0.5 * texel, s.y - 0.5 * texel), reference);
-        four += shadow_map.SampleCmpLevelZero(shadow_sampler, float2(s.x - 0.5 * texel, s.y + 0.5 * texel), reference);
-        four += shadow_map.SampleCmpLevelZero(shadow_sampler, float2(s.x + 0.5 * texel, s.y + 0.5 * texel), reference);
+        four += map.SampleCmpLevelZero(compare, float2(s.x - 0.5 * texel, s.y - 0.5 * texel), reference);
+        four += map.SampleCmpLevelZero(compare, float2(s.x + 0.5 * texel, s.y - 0.5 * texel), reference);
+        four += map.SampleCmpLevelZero(compare, float2(s.x - 0.5 * texel, s.y + 0.5 * texel), reference);
+        four += map.SampleCmpLevelZero(compare, float2(s.x + 0.5 * texel, s.y + 0.5 * texel), reference);
         return four * 0.25;
     }
     float sum = 0.0;
@@ -323,10 +331,17 @@ float sun_visibility(float3 position, float3 n) {
     for (int j = -1; j <= 1; j++) {
         [unroll]
         for (int i = -1; i <= 1; i++) {
-            sum += shadow_map.SampleCmpLevelZero(shadow_sampler, float2(s.x + (float)i * texel, s.y + (float)j * texel), reference);
+            sum += map.SampleCmpLevelZero(compare, float2(s.x + (float)i * texel, s.y + (float)j * texel), reference);
         }
     }
     return sum / 9.0;
+}
+
+// how much of the sun reaches a point: the still map's word times the
+// word of the map of what moves
+float sun_visibility(float3 position, float3 n) {
+    return map_visibility(shadow_map, shadow_sampler, u.shadow_from_eye, u.shadow, position, n)
+         * map_visibility(moving_map, moving_sampler, u.moving_from_eye, u.moving, position, n);
 }
 
 // what the floor map gives a point: its texel from the base level, never
@@ -1240,6 +1255,7 @@ impl D3dWorld {
         }
         let bloom = if frame.bloom > 0 { blooms.get(&job.target) } else { None };
         let map = job.shadow.and_then(|shadow| shadow_maps.get(&shadow.map).map(|map| (shadow, map)));
+        let moving_map = job.moving_shadow.and_then(|shadow| shadow_maps.get(&shadow.map).map(|map| (shadow, map)));
         // what every draw of the frame reads: the instances and the
         // material table, a discard map each, so a job never waits on the
         // one before it
@@ -1276,15 +1292,20 @@ impl D3dWorld {
             let joint_view = joints.srv_ptr();
             (vtbl.vs_set_shader_resources)(context, 12, 1, &joint_view);
 
-            // the sun's map first, when it does not hold this frame's casters
-            if let (Some((shadow, map)), Some(frame_shadow)) = (map, frame.shadow.as_ref())
-                && shadow.draw
-            {
+            // the sun's maps first, each when it does not hold this frame's
+            // casters; the second upload of the casters' rows discards the
+            // first, which the draws before it keep
+            for (held, frame_shadow) in [(map, frame.shadow.as_ref()), (moving_map, frame.moving_shadow.as_ref())] {
+                let (Some((shadow, map)), Some(frame_shadow)) = (held, frame_shadow) else { continue };
+                if !shadow.draw {
+                    continue;
+                }
                 let rows = shadow_instance_bytes(&frame_shadow.instances);
                 if casters.ensure(device, frame_shadow.instances.len(), SHADOW_INSTANCE_STRIDE) && casters.upload(context, &rows) {
-                    // nothing reads the map while it is drawn
+                    // nothing reads a map while one is drawn
                     let none: *mut Srv = null_mut();
                     (vtbl.ps_set_shader_resources)(context, 5, 1, &none);
+                    (vtbl.ps_set_shader_resources)(context, 13, 1, &none);
                     let no_color: *mut Rtv = null_mut();
                     (vtbl.om_set_render_targets)(context, 1, &no_color, map.dsv.as_ptr().cast());
                     let side = map.size as f32;
@@ -1330,11 +1351,14 @@ impl D3dWorld {
                 }
                 None => (vtbl.om_set_render_targets)(context, 1, &rtv, target.dsv.as_ptr().cast()),
             }
-            // the map is read once it is no longer drawn into
-            let (shadow_view, shadow_sampler) =
-                map.map_or((stack.lit.1.as_ptr(), stack.always.as_ptr()), |(_, map)| (map.srv.as_ptr(), stack.compare.as_ptr()));
+            // the maps are read once they are no longer drawn into
+            let [(shadow_view, shadow_sampler), (moving_view, moving_sampler)] = [map, moving_map].map(|held| {
+                held.map_or((stack.lit.1.as_ptr(), stack.always.as_ptr()), |(_, map)| (map.srv.as_ptr(), stack.compare.as_ptr()))
+            });
             (vtbl.ps_set_shader_resources)(context, 5, 1, &shadow_view);
             (vtbl.ps_set_samplers)(context, 2, 1, &shadow_sampler);
+            (vtbl.ps_set_shader_resources)(context, 13, 1, &moving_view);
+            (vtbl.ps_set_samplers)(context, 3, 1, &moving_sampler);
             let floor_view = frame
                 .floor
                 .and_then(|index| job.textures.get(index as usize).copied().flatten())
@@ -1471,10 +1495,11 @@ impl D3dWorld {
                 let glow = &bloom.expect("a bloom").glow;
                 (vtbl.resolve_subresource)(context, glow.texture.as_ptr().cast(), 0, glow_samples.as_ptr().cast(), 0, FORMAT_R8_UNORM);
             }
-            // the map leaves the slot it was read from: the next shadow
-            // pass draws into it
+            // the maps leave the slots they were read from: the next shadow
+            // pass draws into them
             let none: *mut Srv = null_mut();
             (vtbl.ps_set_shader_resources)(context, 5, 1, &none);
+            (vtbl.ps_set_shader_resources)(context, 13, 1, &none);
             if let Some(bloom) = bloom {
                 encode_bloom(context, stack, target, bloom, frame.bloom);
             }

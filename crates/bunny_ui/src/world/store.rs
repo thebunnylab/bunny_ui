@@ -350,6 +350,26 @@ impl WorldData {
         None
     }
 
+    /// Whether the entity moves by itself at `time`: it walks, or rides on
+    /// one that walks, or its skinned mesh plays a clip that moves.
+    pub(crate) fn moves(&self, id: EntityId, time: f64) -> bool {
+        let mut current = Some(id);
+        let mut steps = 0u32;
+        while let Some(at) = current {
+            let Some(data) = self.get(at) else { return false };
+            if data.spec.motion.as_ref().is_some_and(|motion| motion.moving(time)) {
+                return true;
+            }
+            current = data.parent;
+            steps += 1;
+            if steps > self.live + 1 {
+                break;
+            }
+        }
+        let skinned = self.get(id).is_some_and(|data| matches!(&data.spec.shape, Shape::Model(model) if model.skin.is_some()));
+        skinned && self.play_of(id).is_some_and(|(_, play)| play.moving(time))
+    }
+
     /// Whether a clip of the world still plays, or an entity still walks,
     /// at `time`.
     pub(crate) fn moving(&self, time: f64) -> bool {

@@ -18,7 +18,7 @@ use crate::world::mesh::{Mesh, MeshData};
 use crate::world::store::World;
 
 /// How many worlds the catalog holds.
-pub const COUNT: u32 = 20;
+pub const COUNT: u32 = 21;
 
 /// What a tier's picture may differ from the CPU's by: the share of
 /// pixels whose worst channel is more than three codes apart, and more
@@ -175,6 +175,20 @@ fn swaying_post(morphs: bool) -> WorldFrame {
     frame
 }
 
+/// A box that walks past a still one at Medium: the still one casts into
+/// the cached map, the walker into the second map, drawn at one sample.
+fn walker() -> WorldFrame {
+    let world = World::new();
+    world.add(Mesh::plane(8.0, 8.0), Material::color(Color::rgb(200, 196, 188))).set_position(vec3(0.0, -0.5, 0.0));
+    world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(222, 120, 60))).set_position(vec3(-1.2, 0.0, -0.6));
+    // setting out: it stands where it starts, facing its way
+    world.add(Mesh::cuboid(0.6, 1.6, 0.6), Material::color(Color::rgb(70, 110, 200))).set_position(vec3(-1.0, 0.3, 1.5)).move_to(vec3(2.0, 0.3, 1.5), 1.0);
+    world.add_light(Light::sun().toward(vec3(1.0, -0.9, 0.6)).with_shadows());
+    let mut frame = world.frame(&Camera::orbiting(Vec3::ZERO, 20.0, 30.0, 8.0), &style(Quality::Medium), (200, 150), 1.0);
+    frame.samples = 1;
+    frame
+}
+
 /// World `index` of the catalog.
 pub fn world_scene(index: u32) -> WorldScene {
     let frame = |world: &World, camera: &Camera, quality: Quality, size: (u32, u32)| Rc::new(world.frame(camera, &style(quality), size, 1.0));
@@ -267,6 +281,7 @@ pub fn world_scene(index: u32) -> WorldScene {
         },
         18 => WorldScene { frame: Rc::new(swaying_post(false)), name: "a post on its joints", tolerance: PENUMBRA, pictures: Vec::new() },
         19 => WorldScene { frame: Rc::new(swaying_post(true)), name: "a post that swells", tolerance: PENUMBRA, pictures: Vec::new() },
+        20 => WorldScene { frame: Rc::new(walker()), name: "a walker's shadow of its own", tolerance: PENUMBRA, pictures: Vec::new() },
         16 => {
             // drawn at one sample, so the glow's edge is the CPU's
             let mut frame = night_lamps();
@@ -481,6 +496,8 @@ mod tests {
             let mut sunlit = (*scene.frame).clone();
             sunlit.shadow = None;
             sunlit.uniforms.shadow = [0.0; 4];
+            sunlit.moving_shadow = None;
+            sunlit.uniforms.moving = [0.0; 4];
             let plain = crate::world::soft::draw(&sunlit);
             let darker = shaded.rgba.as_chunks::<4>().0.iter().zip(plain.rgba.as_chunks::<4>().0).filter(|(a, b)| a[0] as i32 + 20 < b[0] as i32).count();
             let share = darker as f64 / scene.frame.size.0 as f64 / scene.frame.size.1 as f64;

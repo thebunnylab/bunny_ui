@@ -58,6 +58,7 @@ pub mod gl {
     pub const TEXTURE4: u32 = 0x84C4;
     pub const TEXTURE5: u32 = 0x84C5;
     pub const TEXTURE6: u32 = 0x84C6;
+    pub const TEXTURE7: u32 = 0x84C7;
     pub const TEXTURE_MIN_FILTER: u32 = 0x2801;
     pub const TEXTURE_MAG_FILTER: u32 = 0x2800;
     pub const TEXTURE_WRAP_S: u32 = 0x2802;
@@ -444,6 +445,7 @@ impl<G: GlFamily> GlWorld<G> {
                 ("u_parts", 4),
                 ("u_joints", 5),
                 ("u_deform", 6),
+                ("u_moving", 7),
                 ("atlas", 0),
                 ("u_above", 0),
                 ("u_second", 1),
@@ -555,19 +557,21 @@ impl<G: GlFamily> GlWorld<G> {
         gl.enable(gl::BLEND);
         let [a, b, c, d] = self.blend_2d;
         gl.blend_func_separate(a, b, c, d);
-        for unit in [gl::TEXTURE6, gl::TEXTURE5, gl::TEXTURE4, gl::TEXTURE3, gl::TEXTURE2, gl::TEXTURE1, gl::TEXTURE0] {
+        for unit in [gl::TEXTURE7, gl::TEXTURE6, gl::TEXTURE5, gl::TEXTURE4, gl::TEXTURE3, gl::TEXTURE2, gl::TEXTURE1, gl::TEXTURE0] {
             gl.active_texture(unit);
             gl.bind_texture(0);
         }
         gl.bind_framebuffer(gl::FRAMEBUFFER, 0);
     }
 
-    /// The casters of the frame's shadow into the box's map, from the sun:
-    /// both faces, the nearest depth kept.
+    /// The casters of one of the frame's shadows into the box's map, from
+    /// the sun: both faces, the nearest depth kept.
     fn draw_shadow(&mut self, programs: &Programs, job: &WorldJob, map: ShadowObjects, shadow: &ShadowFrame) {
         let gl = &mut self.gl;
-        // nothing samples the map while it is drawn
+        // nothing samples a map while it is drawn
         gl.active_texture(gl::TEXTURE2);
+        gl.bind_texture(0);
+        gl.active_texture(gl::TEXTURE7);
         gl.bind_texture(0);
         gl.bind_framebuffer(gl::FRAMEBUFFER, map.framebuffer);
         gl.viewport(map.size as i32, map.size as i32);
@@ -621,9 +625,15 @@ impl<G: GlFamily> GlWorld<G> {
         gl.active_texture(gl::TEXTURE5);
         gl.bind_texture(programs.joints);
         gl.tex_image_2d(0, gl::RGBA32F, columns as i32, rows as i32, gl::RGBA, gl::FLOAT, &palette);
-        // the sun's map first, when it does not hold this frame's casters
+        // the sun's maps first, when they do not hold this frame's casters
         let map = job.shadow.and_then(|shadow| self.shadow_maps.get(&shadow.map).copied().map(|map| (shadow, map)));
         if let (Some((shadow, map)), Some(casters)) = (map, frame.shadow.as_ref())
+            && shadow.draw
+        {
+            self.draw_shadow(programs, job, map, casters);
+        }
+        let moving = job.moving_shadow.and_then(|shadow| self.shadow_maps.get(&shadow.map).copied().map(|map| (shadow, map)));
+        if let (Some((shadow, map)), Some(casters)) = (moving, frame.moving_shadow.as_ref())
             && shadow.draw
         {
             self.draw_shadow(programs, job, map, casters);
@@ -644,6 +654,8 @@ impl<G: GlFamily> GlWorld<G> {
         gl.tex_image_2d(0, gl::RGBA32F, (columns * 4) as i32, rows as i32, gl::RGBA, gl::FLOAT, &table);
         gl.active_texture(gl::TEXTURE2);
         gl.bind_texture(map.map_or(programs.lit, |(_, map)| map.texture));
+        gl.active_texture(gl::TEXTURE7);
+        gl.bind_texture(moving.map_or(programs.lit, |(_, map)| map.texture));
         let floor = frame.floor.and_then(|index| job.textures.get(index as usize).copied().flatten()).and_then(|id| self.textures.get(&id).copied());
         let gl = &mut self.gl;
         gl.active_texture(gl::TEXTURE3);

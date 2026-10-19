@@ -83,6 +83,25 @@ impl Quality {
         }
     }
 
+    /// The side of the second shadow map, of what moves (a figure that
+    /// walks), drawn again each frame it moves: none at Low, where what
+    /// moves casts no shadow (a blob under it stands in).
+    pub fn moving_shadow_size(self) -> Option<u32> {
+        match self {
+            Quality::Low => None,
+            Quality::Medium => Some(1024),
+            Quality::High => Some(2048),
+        }
+    }
+
+    /// The lookups a pixel makes into the second map: one, or four.
+    pub fn moving_shadow_taps(self) -> u32 {
+        match self {
+            Quality::Low | Quality::Medium => 1,
+            Quality::High => 4,
+        }
+    }
+
     /// The lookups a pixel makes into the sun's shadow map — each one
     /// four texels compared and filtered: one, four or nine.
     pub fn shadow_taps(self) -> u32 {
@@ -323,8 +342,13 @@ pub struct WorldFrame {
     /// line of the frame meets the depth, or no surface writes one.
     pub face_bias: f32,
     /// The sun's shadow map, when the frame's sun casts shadows and
-    /// something casts one.
+    /// something casts one: of what stands still, so a camera that moves
+    /// and a figure that walks leave it as it is.
     pub shadow: Option<ShadowFrame>,
+    /// The second map, of what moves in view (a figure that walks, a
+    /// clip that plays): drawn again each frame, small and fitted to it.
+    /// Medium and High only.
+    pub moving_shadow: Option<ShadowFrame>,
     /// Into [`WorldFrame::textures`]: the world's floor map, when one is
     /// laid ([`FrameUniforms::floor_u`] places it).
     pub floor: Option<u16>,
@@ -395,6 +419,9 @@ impl WorldFrame {
             std::hash::Hash::hash(draw, &mut hasher);
         }
         if let Some(shadow) = &self.shadow {
+            hasher.write_u64(shadow.generation);
+        }
+        if let Some(shadow) = &self.moving_shadow {
             hasher.write_u64(shadow.generation);
         }
         if let Some(floor) = self.floor {
@@ -569,6 +596,8 @@ pub(crate) fn build_frame(
                 // a skinned mesh leaves its rest pose: its box grows by
                 // half its longest side each way
                 let local = if joint_base == NO_JOINTS { mesh.bounds() } else { skinned_bounds(mesh.bounds()) };
+                let bounds = local.transformed(&eye_from_model);
+                let in_view = sides.may_see(&bounds) && (parallel || bounds.min.z < 0.0);
                 if data.spec.casts_shadow {
                     casters.push(Caster {
                         world_from_model: matrix,
@@ -578,10 +607,11 @@ pub(crate) fn build_frame(
                         joint_rows,
                         morph: super::mesh::pack_morph(data.spec.morph),
                         bounds: local,
+                        moving: world.moves(id, time),
+                        in_view,
                     });
                 }
-                let bounds = local.transformed(&eye_from_model);
-                if sides.may_see(&bounds) && (parallel || bounds.min.z < 0.0) {
+                if in_view {
                     models.push((seen(bounds), Model { mesh, materials: Rc::clone(&model.materials) }));
                 }
             }
@@ -648,6 +678,7 @@ pub(crate) fn build_frame(
         far,
         face_bias: 0.0,
         shadow: None,
+        moving_shadow: None,
         floor: None,
         parts: Vec::new(),
         bloom: if style.quality == Quality::High && style.bloom > 0.0 { (style.bloom.min(1.0) * 256.0).round() as u16 } else { 0 },
@@ -832,12 +863,28 @@ pub(crate) fn build_frame(
         Light::Sun(sun) => Some(*sun),
         _ => None,
     });
-    let fit = sun.filter(|sun| sun.shadows).and_then(|sun| {
-        let travel = match sun.frame {
-            SunFrame::World => sun.direction,
-            SunFrame::View => world_from_eye.transform_vector(sun.direction),
-        };
-        shadow_frame(&mut frame, &mut mesh_slot, &mut part_bases, &casters, travel.try_normalized()?, style.quality)
+    let travel = sun
+        .filter(|sun| sun.shadows)
+        .and_then(|sun| {
+            match sun.frame {
+                SunFrame::World => sun.direction,
+                SunFrame::View => world_from_eye.transform_vector(sun.direction),
+            }
+            .try_normalized()
+        });
+    // what stands still casts into the cached map; what moves, into the
+    // second one, at Medium and High, when it is in view
+    let (still, moving): (Vec<&Caster>, Vec<&Caster>) = casters.iter().partition(|caster| !caster.moving);
+    let fit = travel.and_then(|travel| {
+        let (shadow, fit) = shadow_frame(&mut frame, &mut mesh_slot, &mut part_bases, &still, travel, style.quality.shadow_size())?;
+        frame.shadow = Some(shadow);
+        Some(fit)
+    });
+    let moving: Vec<&Caster> = moving.into_iter().filter(|caster| caster.in_view).collect();
+    let moving_fit = travel.zip(style.quality.moving_shadow_size()).and_then(|(travel, size)| {
+        let (shadow, fit) = shadow_frame(&mut frame, &mut mesh_slot, &mut part_bases, &moving, travel, size)?;
+        frame.moving_shadow = Some(shadow);
+        Some(fit)
     });
 
     frame.uniforms = uniforms(&Eye { camera, view, projection }, style, size, px_per_point, time, &lights);
@@ -858,17 +905,16 @@ pub(crate) fn build_frame(
         frame.uniforms.floor_v = along(2, map.origin.y, map.size.y);
         frame.uniforms.counts[1] = 1.0;
     }
+    // each map's u runs with its x, its v down from its top
+    let uv = Mat4::from_cols(vec4(0.5, 0.0, 0.0, 0.0), vec4(0.0, -0.5, 0.0, 0.0), vec4(0.0, 0.0, 1.0, 0.0), vec4(0.5, 0.5, 0.0, 1.0));
+    let lookup = |fit: &shadow::Fit, size: u32, taps: u32| {
+        ((uv * fit.map_from_world * world_from_eye).to_f32(), [1.0 / size as f32, (fit.texel * shadow::reach(taps)) as f32, shadow::depth_bias(fit) as f32, taps as f32])
+    };
     if let Some(fit) = fit {
-        // the map's u runs with its x, its v down from its top
-        let uv = Mat4::from_cols(vec4(0.5, 0.0, 0.0, 0.0), vec4(0.0, -0.5, 0.0, 0.0), vec4(0.0, 0.0, 1.0, 0.0), vec4(0.5, 0.5, 0.0, 1.0));
-        frame.uniforms.shadow_from_eye = (uv * fit.map_from_world * world_from_eye).to_f32();
-        let taps = style.quality.shadow_taps();
-        frame.uniforms.shadow = [
-            1.0 / style.quality.shadow_size() as f32,
-            (fit.texel * shadow::reach(taps)) as f32,
-            shadow::depth_bias(&fit) as f32,
-            taps as f32,
-        ];
+        (frame.uniforms.shadow_from_eye, frame.uniforms.shadow) = lookup(&fit, style.quality.shadow_size(), style.quality.shadow_taps());
+    }
+    if let (Some(fit), Some(size)) = (moving_fit, style.quality.moving_shadow_size()) {
+        (frame.uniforms.moving_from_eye, frame.uniforms.moving) = lookup(&fit, size, style.quality.moving_shadow_taps());
     }
     frame
 }
@@ -884,6 +930,9 @@ struct Caster {
     morph: u32,
     /// The box it casts from, in its own space (grown for a skin).
     bounds: Aabb,
+    /// It moves by itself: it walks, or its skin plays a clip.
+    moving: bool,
+    in_view: bool,
 }
 
 /// How many pixels tall a box in the eye's space stands on a target of
@@ -957,10 +1006,10 @@ fn shadow_frame(
     frame: &mut WorldFrame,
     mesh_slot: &mut HashMap<(u64, u64), u16>,
     part_bases: &mut HashMap<(usize, u32), u32>,
-    casters: &[Caster],
+    casters: &[&Caster],
     travel: Vec3,
-    quality: Quality,
-) -> Option<shadow::Fit> {
+    size: u32,
+) -> Option<(ShadowFrame, shadow::Fit)> {
     let light = shadow::light_view(travel);
     let mut bounds = Aabb::EMPTY;
     let mut groups: Vec<CasterGroup> = Vec::new();
@@ -981,7 +1030,6 @@ fn shadow_frame(
     if groups.is_empty() || bounds.is_empty() {
         return None;
     }
-    let size = quality.shadow_size();
     let fit = shadow::Fit::around(&light, &bounds, size);
     let mut out = ShadowFrame { generation: 0, size, instances: Vec::new(), draws: Vec::new() };
     let mut hasher = motor::hash::FxHasher::default();
@@ -994,7 +1042,7 @@ fn shadow_frame(
         });
         let first_instance = out.instances.len() as u32;
         for &member in members {
-            let caster = &casters[member];
+            let caster = casters[member];
             let part_base = part_base_of(&mut frame.parts, part_bases, &caster.parts, &caster.model.mesh);
             out.instances.push(ShadowCaster {
                 rows: rows(&(fit.map_from_world * caster.world_from_model)),
@@ -1033,8 +1081,7 @@ fn shadow_frame(
         }
     }
     out.generation = hasher.finish();
-    frame.shadow = Some(out);
-    Some(fit)
+    Some((out, fit))
 }
 
 impl super::store::World {
@@ -1182,6 +1229,34 @@ mod tests {
 
     fn gray() -> Material {
         Material::color(Color::rgb(128, 128, 128))
+    }
+
+    #[test]
+    fn what_walks_casts_into_a_map_of_its_own() {
+        let world = World::new();
+        world.add(Mesh::plane(8.0, 8.0), gray()).set_position(vec3(0.0, -0.5, 0.0));
+        world.add(Mesh::cuboid(1.0, 1.0, 1.0), gray());
+        let walker = world.add(Mesh::cuboid(0.5, 1.5, 0.5), gray()).set_position(vec3(-1.0, 0.25, 1.5));
+        world.add_light(crate::world::material::Light::sun().toward(vec3(1.0, -0.9, 0.6)).with_shadows());
+        let camera = Camera::orbiting(Vec3::ZERO, 20.0, 30.0, 8.0);
+        let at = |quality: Quality| world.frame(&camera, &WorldStyle { quality, ..WorldStyle::default() }, (200, 150), 1.0);
+        let still = at(Quality::Medium);
+        assert!(still.moving_shadow.is_none(), "nothing walks yet");
+        let generation = still.shadow.as_ref().expect("a still map").generation;
+        walker.move_to(vec3(2.0, 0.25, 1.5), 1.0);
+        let walking = at(Quality::Medium);
+        let held = walking.shadow.as_ref().expect("the still map");
+        assert_eq!(held.instances.len(), 2, "the floor and the box, the walker apart");
+        assert_ne!(held.generation, generation, "the walker left the still map once");
+        let moving = walking.moving_shadow.as_ref().expect("a map of what moves");
+        assert_eq!((moving.instances.len(), moving.size), (1, 1024));
+        assert_eq!(walking.uniforms.moving[3], 1.0, "one lookup at Medium");
+        // the walk goes on, the still map stays
+        assert_eq!(at(Quality::Medium).shadow.as_ref().expect("still").generation, held.generation);
+        // at Low what walks casts nothing: a blob stands in
+        let low = at(Quality::Low);
+        assert!(low.moving_shadow.is_none() && low.uniforms.moving[3] == 0.0);
+        assert_eq!(low.shadow.as_ref().expect("still").instances.len(), 2);
     }
 
     #[test]

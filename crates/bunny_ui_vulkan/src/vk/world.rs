@@ -18,8 +18,15 @@
 //!
 //! A frame whose sun casts draws its casters first, when the box's map
 //! does not hold them yet: a render pass of depth alone into a 16-bit map
-//! (set 2) the surfaces read through a comparing sampler. A frame without
-//! a map binds a texel and a sampler whose comparison always passes.
+//! the surfaces read through a comparing sampler. What moves casts into a
+//! second map of its own the same way, so a walk never draws the still
+//! casters again. A frame without a map binds a texel and a sampler whose
+//! comparison always passes.
+//!
+//! The draws read three sets, never more (a device may bind as few as
+//! four): the frame's — its block, its tables, the floor map and both of
+//! the sun's maps —, the surface's picture, and a skinned mesh's deform
+//! stream.
 //!
 //! A frame with a bloom draws each pixel's glow beside its colour, into a
 //! second attachment of one byte (a render pass of its own, and pipelines
@@ -106,8 +113,8 @@ mod generator {
     const VK_JOINT_ROW: &str = "return palette.rows[index];";
 
     /// A skinned mesh's deform stream: a storage buffer in a set of its
-    /// own (4), one word an element.
-    const DEFORM: &str = "layout(std430, set = 4, binding = 0) readonly buffer Deform {\n    uint words[];\n} deform;";
+    /// own (2), one word an element.
+    const DEFORM: &str = "layout(std430, set = 2, binding = 0) readonly buffer Deform {\n    uint words[];\n} deform;";
     const GL_DEFORM_WORD: &str = "return texelFetch(u_deform, ivec2(int(index % 1024u), int(index / 1024u)), 0).r;";
     const VK_DEFORM_WORD: &str = "return deform.words[index];";
 
@@ -172,8 +179,10 @@ mod generator {
                 "uniform vec4 u_rows[3];" | "uniform vec4 u_style[2];" => continue,
                 "uniform sampler2D u_materials;" => MATERIALS,
                 "uniform sampler2D u_surface;" => "layout(set = 1, binding = 0) uniform sampler2D u_surface;",
-                "uniform highp sampler2DShadow u_shadow;" => "layout(set = 2, binding = 0) uniform sampler2DShadow u_shadow;",
-                "uniform sampler2D u_floor;" => "layout(set = 3, binding = 0) uniform sampler2D u_floor;",
+                // the floor map and the sun's two maps ride the frame's set
+                "uniform sampler2D u_floor;" => "layout(set = 0, binding = 4) uniform sampler2D u_floor;",
+                "uniform highp sampler2DShadow u_shadow;" => "layout(set = 0, binding = 5) uniform sampler2DShadow u_shadow;",
+                "uniform highp sampler2DShadow u_moving;" => "layout(set = 0, binding = 6) uniform sampler2DShadow u_moving;",
                 "uniform highp usampler2D u_parts;" => PARTS,
                 "uniform highp sampler2D u_joints;" => JOINTS,
                 "uniform highp usampler2D u_deform;" => DEFORM,
@@ -360,12 +369,11 @@ struct BloomTargets {
 }
 
 struct WorldStack {
-    /// Set 0: the frame's block and its material table.
+    /// Set 0: the frame's block, its tables, the floor map and the sun's
+    /// two maps.
     frame_layout: DescriptorSetLayout,
     /// Set 1: the surface's picture.
     surface_layout: DescriptorSetLayout,
-    /// Set 2: the sun's shadow map.
-    shadow_layout: DescriptorSetLayout,
     /// Depth alone, 16 bits, left ready to be sampled.
     shadow_pass: RenderPass,
     /// The casters: a vertex stage and no fragment.
@@ -375,7 +383,7 @@ struct WorldStack {
     /// A comparison that always passes, over `lit`: what a frame without
     /// a map binds.
     always_sampler: Sampler,
-    lit: ShadowMap,
+    lit: Image,
     layout: PipelineLayout,
     /// The pass at one sample, at four, and both again with the glow
     /// beside the colour: `[(samples > 1) as usize + 2 · glow]`.
@@ -394,10 +402,9 @@ struct WorldStack {
     /// One white texel: what a draw with no picture binds.
     blank: Surface,
     /// One black, opaque texel: a floor map that adds and takes nothing,
-    /// bound while a frame's floor map is not decoded (set 3, the
-    /// pictures' own layout).
+    /// read while a frame's floor map is not decoded.
     dark: Surface,
-    /// Set 4: a skinned mesh's deform stream; the sets come from their
+    /// Set 2: a skinned mesh's deform stream; the sets come from their
     /// own pool and go back with their mesh.
     deform_layout: DescriptorSetLayout,
     deform_pool: DescriptorPool,
@@ -457,21 +464,19 @@ struct Surface {
     set: DescriptorSet,
 }
 
-/// A box's shadow map: its 16-bit image, the framebuffer the casters draw
-/// into and the set the surfaces read it by.
+/// A box's shadow map: its 16-bit image and the framebuffer the casters
+/// draw into.
 struct ShadowMap {
     image: Image,
-    /// None for the texel that answers "lit".
     framebuffer: Framebuffer,
-    set: DescriptorSet,
     size: u32,
 }
 
-/// What a job's surfaces read the sun's shadow through, and the casters
-/// to draw into its map first, with where their rows lie in the slot's
-/// buffer.
+/// One of the sun's maps for a job: what its surfaces read it through,
+/// and the casters to draw into it first, with where their rows lie in
+/// the slot's buffer.
 struct JobShadow<'a> {
-    set: DescriptorSet,
+    read: (ImageView, Sampler),
     draw: Option<(&'a ShadowMap, &'a ShadowFrame, u64)>,
 }
 
@@ -610,7 +615,6 @@ impl VkWorld {
                 Garbage::Segments(buffer) => destroy_buffer(stack, buffer),
                 Garbage::Shadow(map) => {
                     (stack.fns.destroy_framebuffer)(stack.device, map.framebuffer, std::ptr::null());
-                    (stack.fns.free_descriptor_sets)(stack.device, world.surface_pool, 1, &map.set);
                     destroy_image(stack, map.image);
                 }
                 Garbage::Bloom(bloom) => world.release_bloom(stack, bloom),
@@ -683,23 +687,28 @@ impl VkWorld {
                 blooms.insert(job.target, bloom);
             }
         }
-        // the casters each job draws into its map first, if any
-        let held: Vec<Option<(bunny_ui::gpu::world::ShadowJob, &ShadowMap)>> =
-            jobs.iter().map(|job| job.shadow.and_then(|shadow| shadow_maps.get(&shadow.map).map(|map| (shadow, map)))).collect();
+        // each job's two maps, the still one and the one of what moves,
+        // with the casters it draws into them first, if any
+        let held: Vec<[Held; 2]> = jobs
+            .iter()
+            .map(|job| [job.shadow, job.moving_shadow].map(|shadow| shadow.and_then(|shadow| shadow_maps.get(&shadow.map).map(|map| (shadow, map)))))
+            .collect();
+        let rows_of = |shadow: Option<&ShadowFrame>| shadow.map_or(0, |shadow| shadow.instances.len() * SHADOW_INSTANCE_STRIDE).max(SHADOW_INSTANCE_STRIDE);
         // where each job's blocks lie in the slot's buffer
         let mut places = Vec::with_capacity(jobs.len());
         let mut cursor = 0usize;
         for (job, held) in jobs.iter().zip(&held) {
             let frame = &job.frame;
+            let [still, moving] = casters_of(job, held);
             let uniforms = cursor;
             let materials = (uniforms + frame_offset::SIZE).next_multiple_of(BLOCK_ALIGN);
             let instances = (materials + (frame.materials.len() * 64).max(64)).next_multiple_of(BLOCK_ALIGN);
             let casters = (instances + (frame.instances.len() * instance_offset::SIZE).max(instance_offset::SIZE)).next_multiple_of(BLOCK_ALIGN);
-            let rows = casters_of(job, held.map(|(shadow, _)| shadow)).map_or(0, |shadow| shadow.instances.len() * SHADOW_INSTANCE_STRIDE);
-            let parts = (casters + rows.max(SHADOW_INSTANCE_STRIDE)).next_multiple_of(BLOCK_ALIGN);
+            let moving_casters = (casters + rows_of(still)).next_multiple_of(BLOCK_ALIGN);
+            let parts = (moving_casters + rows_of(moving)).next_multiple_of(BLOCK_ALIGN);
             let joints = (parts + (frame.parts.len() * 4).max(4)).next_multiple_of(BLOCK_ALIGN);
             cursor = (joints + (frame.joints.len() * 16).max(16)).next_multiple_of(BLOCK_ALIGN);
-            places.push((uniforms, materials, instances, casters, parts, joints));
+            places.push((uniforms, materials, instances, [casters, moving_casters], parts, joints));
         }
         if !unsafe { world.ensure_slot(stack, slot, cursor, jobs.len() as u32) } {
             return false;
@@ -710,12 +719,14 @@ impl VkWorld {
             for ((job, &(uniforms, materials, instances, casters, parts, joints)), held) in jobs.iter().zip(&places).zip(&held) {
                 let Some(target) = targets.get(&job.target) else { continue };
                 let frame = &job.frame;
-                let draw = casters_of(job, held.map(|(shadow, _)| shadow));
+                let draws = casters_of(job, held);
+                let rows = |shadow: Option<&ShadowFrame>| shadow.map_or(Vec::new(), |shadow| shadow_instance_bytes(&shadow.instances));
                 let blocks = [
                     (uniforms, frame.uniforms.to_bytes()),
                     (materials, material_bytes(&frame.materials)),
                     (instances, instance_bytes(&frame.instances)),
-                    (casters, draw.map_or(Vec::new(), |shadow| shadow_instance_bytes(&shadow.instances))),
+                    (casters[0], rows(draws[0])),
+                    (casters[1], rows(draws[1])),
                     // one part at least: the stage's buffer is never left empty
                     (parts, if frame.parts.is_empty() { vec![255; 4] } else { part_bytes(&frame.parts) }),
                     // and one palette row
@@ -724,21 +735,30 @@ impl VkWorld {
                 for (offset, bytes) in &blocks {
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot.map.add(*offset), bytes.len());
                 }
+                // the floor map, and each of the sun's maps: read through the
+                // comparing sampler, or the texel that answers "lit"
+                let floor = frame
+                    .floor
+                    .and_then(|index| job.textures.get(index as usize).copied().flatten())
+                    .and_then(|id| surfaces.get(&id))
+                    .map_or(world.dark.image.view, |surface| surface.image.view);
+                let shadows: [JobShadow; 2] = std::array::from_fn(|index| JobShadow {
+                    read: held[index].map_or((world.lit.view, world.always_sampler), |(_, map)| (map.image.view, world.compare_sampler)),
+                    draw: held[index].and_then(|(_, map)| draws[index].map(|shadow| (map, shadow, casters[index] as u64))),
+                });
                 let blocks_of = FrameBlocks {
                     uniforms,
                     materials: (materials, (frame.materials.len() * 64).max(64)),
                     parts: (parts, (frame.parts.len() * 4).max(4)),
                     joints: (joints, (frame.joints.len() * 16).max(16)),
+                    floor,
+                    shadows: [shadows[0].read, shadows[1].read],
                 };
                 let Some(set) = world.frame_set(stack, slot, &blocks_of) else {
                     continue;
                 };
-                let shadow = JobShadow {
-                    set: held.map_or(world.lit.set, |(_, map)| map.set),
-                    draw: held.and_then(|(_, map)| draw.map(|shadow| (map, shadow, casters as u64))),
-                };
                 let bloom = if frame.bloom > 0 { blooms.get(&job.target) } else { None };
-                world.record(stack, command, job, target, bloom, set, slot.buffer, instances as u64, &shadow, meshes, surfaces, segments);
+                world.record(stack, command, job, target, bloom, set, slot.buffer, instances as u64, &shadows, meshes, surfaces, segments);
             }
         }
         true
@@ -924,8 +944,30 @@ impl WorldStack {
                     stages: SHADER_STAGE_VERTEX,
                     immutable_samplers: std::ptr::null(),
                 },
+                // the floor map, the sun's map and the map of what moves
+                DescriptorSetLayoutBinding {
+                    binding: 4,
+                    descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    count: 1,
+                    stages: SHADER_STAGE_FRAGMENT,
+                    immutable_samplers: std::ptr::null(),
+                },
+                DescriptorSetLayoutBinding {
+                    binding: 5,
+                    descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    count: 1,
+                    stages: SHADER_STAGE_FRAGMENT,
+                    immutable_samplers: std::ptr::null(),
+                },
+                DescriptorSetLayoutBinding {
+                    binding: 6,
+                    descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    count: 1,
+                    stages: SHADER_STAGE_FRAGMENT,
+                    immutable_samplers: std::ptr::null(),
+                },
             ])?;
-            // set 4: a skinned mesh's deform stream
+            // set 2: a skinned mesh's deform stream
             let deform_layout = layout_of(&[DescriptorSetLayoutBinding {
                 binding: 0,
                 descriptor_type: DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -941,15 +983,13 @@ impl WorldStack {
                 immutable_samplers: std::ptr::null(),
             }];
             let surface_layout = layout_of(&picture_binding)?;
-            let shadow_layout = layout_of(&picture_binding)?;
-            // set 3, the floor map, is a picture like set 1
-            let set_layouts = [frame_layout, surface_layout, shadow_layout, surface_layout, deform_layout];
+            let set_layouts = [frame_layout, surface_layout, deform_layout];
             let push_range = PushConstantRange { stages: SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT, offset: 0, size: DRAW_PUSH };
             let layout_info = PipelineLayoutCreateInfo {
                 s_type: ST_PIPELINE_LAYOUT_CREATE,
                 p_next: std::ptr::null(),
                 flags: 0,
-                set_layout_count: 5,
+                set_layout_count: set_layouts.len() as u32,
                 set_layouts: set_layouts.as_ptr(),
                 push_range_count: 1,
                 push_ranges: &push_range,
@@ -1072,12 +1112,11 @@ impl WorldStack {
             let mut world = WorldStack {
                 frame_layout,
                 surface_layout,
-                shadow_layout,
                 shadow_pass,
                 shadow_pipeline,
                 compare_sampler,
                 always_sampler,
-                lit: ShadowMap { image: Image { image: 0, memory: 0, view: 0 }, framebuffer: 0, set: 0, size: 1 },
+                lit: Image { image: 0, memory: 0, view: 0 },
                 layout,
                 passes,
                 modules,
@@ -1116,12 +1155,9 @@ impl WorldStack {
                 }
             }
             // the texel that answers "lit": never drawn, so never framed
-            let lit = image(stack, 1, 1, FORMAT_D16_UNORM, 1, 1, IMAGE_USAGE_SAMPLED, IMAGE_ASPECT_DEPTH, false)
-                .filter(|lit| ready_to_read(stack, lit.image));
-            let set = lit.as_ref().and_then(|lit| world.shadow_set(stack, lit.view, world.always_sampler));
-            match (lit, set) {
-                (Some(image), Some(set)) => world.lit = ShadowMap { image, framebuffer: 0, set, size: 1 },
-                (lit, _) => {
+            match image(stack, 1, 1, FORMAT_D16_UNORM, 1, 1, IMAGE_USAGE_SAMPLED, IMAGE_ASPECT_DEPTH, false) {
+                Some(lit) if ready_to_read(stack, lit.image) => world.lit = lit,
+                lit => {
                     if let Some(image) = lit {
                         destroy_image(stack, image);
                     }
@@ -1168,8 +1204,8 @@ impl WorldStack {
             if self.dark.image.image != 0 {
                 destroy_image(stack, self.dark.image);
             }
-            if self.lit.image.image != 0 {
-                destroy_image(stack, self.lit.image);
+            if self.lit.image != 0 {
+                destroy_image(stack, self.lit);
             }
             (fns.destroy_sampler)(stack.device, self.compare_sampler, std::ptr::null());
             (fns.destroy_sampler)(stack.device, self.always_sampler, std::ptr::null());
@@ -1187,7 +1223,6 @@ impl WorldStack {
             (fns.destroy_pipeline_layout)(stack.device, self.layout, std::ptr::null());
             (fns.destroy_descriptor_set_layout)(stack.device, self.frame_layout, std::ptr::null());
             (fns.destroy_descriptor_set_layout)(stack.device, self.surface_layout, std::ptr::null());
-            (fns.destroy_descriptor_set_layout)(stack.device, self.shadow_layout, std::ptr::null());
         }
     }
 
@@ -1223,13 +1258,14 @@ impl WorldStack {
                 let sizes = [
                     DescriptorPoolSize { descriptor_type: DESCRIPTOR_TYPE_UNIFORM_BUFFER, count: sets },
                     DescriptorPoolSize { descriptor_type: DESCRIPTOR_TYPE_STORAGE_BUFFER, count: sets * 3 },
+                    DescriptorPoolSize { descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, count: sets * 3 },
                 ];
                 let info = DescriptorPoolCreateInfo {
                     s_type: ST_DESCRIPTOR_POOL_CREATE,
                     p_next: std::ptr::null(),
                     flags: 0,
                     max_sets: sets,
-                    pool_size_count: 2,
+                    pool_size_count: sizes.len() as u32,
                     pool_sizes: sizes.as_ptr(),
                 };
                 if !ok((fns.create_descriptor_pool)(stack.device, &info, std::ptr::null(), &mut slot.pool)) {
@@ -1241,9 +1277,17 @@ impl WorldStack {
         }
     }
 
-    /// A set over one job's blocks in the slot's buffer.
+    /// A set over one job's blocks in the slot's buffer and the maps its
+    /// surfaces read.
     unsafe fn frame_set(&self, stack: &VkStack, slot: &WorldSlot, blocks: &FrameBlocks) -> Option<DescriptorSet> {
-        let FrameBlocks { uniforms, materials: (materials, material_bytes), parts: (parts, part_bytes), joints: (joints, joint_bytes) } = *blocks;
+        let FrameBlocks {
+            uniforms,
+            materials: (materials, material_bytes),
+            parts: (parts, part_bytes),
+            joints: (joints, joint_bytes),
+            floor,
+            shadows: [(still, still_sampler), (moving, moving_sampler)],
+        } = *blocks;
         let fns = &stack.fns;
         unsafe {
             let allocate = DescriptorSetAllocateInfo {
@@ -1261,6 +1305,23 @@ impl WorldStack {
             let table = DescriptorBufferInfo { buffer: slot.buffer, offset: materials as u64, range: material_bytes as u64 };
             let part_table = DescriptorBufferInfo { buffer: slot.buffer, offset: parts as u64, range: part_bytes as u64 };
             let palettes = DescriptorBufferInfo { buffer: slot.buffer, offset: joints as u64, range: joint_bytes as u64 };
+            let maps = [
+                DescriptorImageInfo { sampler: self.surface_sampler, image_view: floor, layout: IMAGE_LAYOUT_SHADER_READ_ONLY },
+                DescriptorImageInfo { sampler: still_sampler, image_view: still, layout: IMAGE_LAYOUT_SHADER_READ_ONLY },
+                DescriptorImageInfo { sampler: moving_sampler, image_view: moving, layout: IMAGE_LAYOUT_SHADER_READ_ONLY },
+            ];
+            let map_write = |binding: u32, info: &DescriptorImageInfo| WriteDescriptorSet {
+                s_type: ST_WRITE_DESCRIPTOR_SET,
+                p_next: std::ptr::null(),
+                set,
+                binding,
+                array_element: 0,
+                count: 1,
+                descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                image_info: info,
+                buffer_info: std::ptr::null(),
+                texel_view: std::ptr::null(),
+            };
             let writes = [
                 WriteDescriptorSet {
                     s_type: ST_WRITE_DESCRIPTOR_SET,
@@ -1310,8 +1371,11 @@ impl WorldStack {
                     buffer_info: (&palettes as *const DescriptorBufferInfo).cast(),
                     texel_view: std::ptr::null(),
                 },
+                map_write(4, &maps[0]),
+                map_write(5, &maps[1]),
+                map_write(6, &maps[2]),
             ];
-            (fns.update_descriptor_sets)(stack.device, 4, writes.as_ptr(), 0, std::ptr::null());
+            (fns.update_descriptor_sets)(stack.device, writes.len() as u32, writes.as_ptr(), 0, std::ptr::null());
             Some(set)
         }
     }
@@ -1685,7 +1749,7 @@ impl WorldStack {
         set: DescriptorSet,
         blocks: BufferHandle,
         instances: u64,
-        shadow: &JobShadow<'_>,
+        shadows: &[JobShadow<'_>; 2],
         meshes: &HashMap<u64, MeshBuffers>,
         surfaces: &HashMap<u64, Surface>,
         segments: &HashMap<u64, Segments>,
@@ -1696,8 +1760,9 @@ impl WorldStack {
         let samples = target.samples;
         let glow = bloom.is_some();
         unsafe {
-            // the sun's map first, when it does not hold this frame's casters
-            if let Some((map, casters, rows)) = shadow.draw {
+            // the sun's maps first, each when it does not hold this frame's
+            // casters
+            for (map, casters, rows) in shadows.iter().filter_map(|shadow| shadow.draw) {
                 self.record_casters(stack, command, job, set, blocks, rows, map, casters, meshes);
             }
             let color = match frame.background {
@@ -1731,13 +1796,6 @@ impl WorldStack {
             let scissor = Rect2D { offset: [0, 0], extent: [width, height] };
             (fns.cmd_set_scissor)(command, 0, 1, &scissor);
             (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 0, 1, &set, 0, std::ptr::null());
-            (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 2, 1, &shadow.set, 0, std::ptr::null());
-            let floor = frame
-                .floor
-                .and_then(|index| job.textures.get(index as usize).copied().flatten())
-                .and_then(|id| surfaces.get(&id))
-                .map_or(self.dark.set, |surface| surface.set);
-            (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 3, 1, &floor, 0, std::ptr::null());
             let layout = self.layout;
             let push = |command: CommandBuffer, bytes: &DrawPush| {
                 (fns.cmd_push_constants)(
@@ -1794,7 +1852,7 @@ impl WorldStack {
                         let picture = surface.map_or(self.blank.set, |surface| surface.set);
                         (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 1, 1, &picture, 0, std::ptr::null());
                         let deform = self.deform_of(buffers);
-                        (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 4, 1, &deform, 0, std::ptr::null());
+                        (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 2, 1, &deform, 0, std::ptr::null());
                         push(command, &DrawPush { draw: [flags as f32, near, far, bias], ..DrawPush::default() });
                         // the first instance rides the instance buffer's
                         // offset, as on the GL family
@@ -2065,7 +2123,7 @@ impl WorldStack {
             for draw in &shadow.draws {
                 let Some(buffers) = job.meshes.get(draw.mesh as usize).and_then(|id| meshes.get(id)) else { continue };
                 let deform = self.deform_of(buffers);
-                (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 4, 1, &deform, 0, std::ptr::null());
+                (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 2, 1, &deform, 0, std::ptr::null());
                 // how the caster's mesh lays out its morphs and its skin
                 let layout_flags = job.frame.meshes.get(draw.mesh as usize).map_or(0, |mesh| mesh.deform_flags());
                 let push = DrawPush { draw: [layout_flags as f32, 0.0, 0.0, 0.0], ..DrawPush::default() };
@@ -2090,8 +2148,7 @@ impl WorldStack {
     }
 
     /// A shadow map of `size`: the image, cleared to nothing and ready to
-    /// be read until the casters first draw into it, its framebuffer, and
-    /// its set.
+    /// be read until the casters first draw into it, and its framebuffer.
     unsafe fn shadow_map(&self, stack: &VkStack, size: u32) -> Option<ShadowMap> {
         unsafe {
             let image = image(stack, size, size, FORMAT_D16_UNORM, 1, 1, IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT | IMAGE_USAGE_SAMPLED, IMAGE_ASPECT_DEPTH, false)?;
@@ -2111,12 +2168,12 @@ impl WorldStack {
                 destroy_image(stack, image);
                 return None;
             }
-            let Some(set) = self.shadow_set(stack, image.view, self.compare_sampler).filter(|_| ready_to_read(stack, image.image)) else {
+            if !ready_to_read(stack, image.image) {
                 (stack.fns.destroy_framebuffer)(stack.device, framebuffer, std::ptr::null());
                 destroy_image(stack, image);
                 return None;
-            };
-            Some(ShadowMap { image, framebuffer, set, size })
+            }
+            Some(ShadowMap { image, framebuffer, size })
         }
     }
 
@@ -2152,49 +2209,19 @@ impl WorldStack {
             Some(set)
         }
     }
-
-    /// A set of the shadow's layout over `view`, read through `sampler`.
-    unsafe fn shadow_set(&self, stack: &VkStack, view: ImageView, sampler: Sampler) -> Option<DescriptorSet> {
-        let fns = &stack.fns;
-        unsafe {
-            let allocate = DescriptorSetAllocateInfo {
-                s_type: ST_DESCRIPTOR_SET_ALLOCATE,
-                p_next: std::ptr::null(),
-                pool: self.surface_pool,
-                count: 1,
-                layouts: &self.shadow_layout,
-            };
-            let mut set: DescriptorSet = 0;
-            if !ok((fns.allocate_descriptor_sets)(stack.device, &allocate, &mut set)) {
-                return None;
-            }
-            let image_info = DescriptorImageInfo { sampler, image_view: view, layout: IMAGE_LAYOUT_SHADER_READ_ONLY };
-            let write = WriteDescriptorSet {
-                s_type: ST_WRITE_DESCRIPTOR_SET,
-                p_next: std::ptr::null(),
-                set,
-                binding: 0,
-                array_element: 0,
-                count: 1,
-                descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                image_info: &image_info,
-                buffer_info: std::ptr::null(),
-                texel_view: std::ptr::null(),
-            };
-            (fns.update_descriptor_sets)(stack.device, 1, &write, 0, std::ptr::null());
-            Some(set)
-        }
-    }
 }
 
-/// Where one job's blocks lie in the slot's buffer: offsets, and with the
-/// tables their lengths in bytes.
+/// Where one job's blocks lie in the slot's buffer — offsets, and with the
+/// tables their lengths in bytes —, and the maps its surfaces read: the
+/// floor's, and the sun's two, each with its sampler.
 #[derive(Clone, Copy)]
 struct FrameBlocks {
     uniforms: usize,
     materials: (usize, usize),
     parts: (usize, usize),
     joints: (usize, usize),
+    floor: ImageView,
+    shadows: [(ImageView, Sampler); 2],
 }
 
 impl WorldStack {
@@ -2204,14 +2231,19 @@ impl WorldStack {
     }
 }
 
-/// The casters a job draws into its map first: the frame's shadow, when
-/// the box's map does not hold it.
-fn casters_of(job: &WorldJob, held: Option<bunny_ui::gpu::world::ShadowJob>) -> Option<&ShadowFrame> {
-    match (held, job.frame.shadow.as_ref()) {
-        (Some(shadow), Some(frame_shadow)) if shadow.draw => Some(frame_shadow),
+/// The casters a job draws into each of its maps first — the still
+/// map's, then those of the map of what moves —, each when the box's map
+/// does not hold them.
+fn casters_of<'a>(job: &'a WorldJob, held: &[Held<'_>; 2]) -> [Option<&'a ShadowFrame>; 2] {
+    let frames = [job.frame.shadow.as_ref(), job.frame.moving_shadow.as_ref()];
+    std::array::from_fn(|index| match (held[index], frames[index]) {
+        (Some((shadow, _)), Some(frame_shadow)) if shadow.draw => Some(frame_shadow),
         _ => None,
-    }
+    })
 }
+
+/// One of a job's maps, as the box holds it: its job, and the map.
+type Held<'a> = Option<(bunny_ui::gpu::world::ShadowJob, &'a ShadowMap)>;
 
 /// A new depth image in the layout the surfaces read it in, so a set may
 /// name it before any pass has drawn into it.

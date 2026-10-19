@@ -276,10 +276,18 @@ fit's side climbs a ladder of quarter octaves and its centre sits on
 its own texel grid: a caster that moves inside the fit moves no other
 shadow by a fraction of a texel.
 
-Something that moves every frame — a person, a cart — would draw the
-map again every frame. `Model::blob_shadow(radius, darkness)` is the
-cheap road: a soft dark disc, one see-through quad that casts nothing,
-parented to what it follows at the floor's height.
+Something that moves by itself casts into a second map of its own: an
+entity that walks (`move_to`, its own or a parent's) and a skin that
+plays a clip. The still map stays as it is while they move. The second
+map holds only what moves in view, fitted to it, and the GPU draws it
+again each frame they move: 1024² with one lookup at `Quality::Medium`,
+2048² with four at `Quality::High`. A surface reads both maps, and the
+sun reaches a point only where both let it.
+
+At `Quality::Low` what moves casts nothing. `Model::blob_shadow(radius,
+darkness)` is the cheap road there: a soft dark disc, one see-through
+quad that casts nothing, parented to what it follows at the floor's
+height.
 
 A surface reads the map at its own point, pushed off along its normal
 (further as it turns from the sun) and a step toward the sun, so it
@@ -299,11 +307,11 @@ nothing at all.
 
 ## Quality
 
-| | Samples | Pixel budget | Shadow map | Shadow lookups | Bloom |
-|---|---|---|---|---|---|
-| `Quality::Low` | 1 | 1.2 million | 1024² | 1 | — |
-| `Quality::Medium` (default) | 4 | 2.2 million | 2048² | 4 | — |
-| `Quality::High` | 4 | 4 million | 2048² | 9 | as the style asks |
+| | Samples | Pixel budget | Shadow map | Shadow lookups | Map of what moves | Bloom |
+|---|---|---|---|---|---|---|
+| `Quality::Low` | 1 | 1.2 million | 1024² | 1 | — | — |
+| `Quality::Medium` (default) | 4 | 2.2 million | 2048² | 4 | 1024², 1 lookup | — |
+| `Quality::High` | 4 | 4 million | 2048² | 9 | 2048², 4 lookups | as the style asks |
 
 The style's quality is an ask, and a governor answers it for each box,
 never above it. It starts from the name the device's graphics answer to
@@ -411,7 +419,7 @@ mesh with their own weights still draw as one.
   CPU: those roads rasterize their boxes. Paint a world on the frame's
   road.
 - Labels are painted text. A label that is a view comes later.
-- No skins and no animation clips yet.
+- What moves casts no shadow while it is out of view.
 - A cut-out surface casts its whole shape: the shadow pass reads no
   texture.
 - A model holds at most 256 materials.
@@ -427,6 +435,6 @@ BUNNY_PARANOID=all cargo test -p bunny-ui-core --all-features
 cargo test -p bunny-ui-apple --features 3d
 cargo run -p bunny-ui-macos --features 3d --example world_window
 # in a page built with the web shell's `3d` feature, from the console:
-#   for (let n = 0; n < 20; n++) __bunny.bunny_gpu_world_parity(n)
+#   for (let n = 0; n < 21; n++) __bunny.bunny_gpu_world_parity(n)
 BUNNY_WORLD_GLB=chair.glb BUNNY_WORLD_DUMP=/tmp cargo test -p bunny-ui-core --features gltf --lib a_glb_from_the_environment -- --ignored
 ```

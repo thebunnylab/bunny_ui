@@ -1773,6 +1773,7 @@ impl MetalGround {
                 instances: place(&bytes.instances),
                 materials: place(&bytes.materials),
                 casters: place(&bytes.casters),
+                moving_casters: place(&bytes.moving_casters),
                 parts: place(&bytes.parts),
                 joints: place(&bytes.joints),
             });

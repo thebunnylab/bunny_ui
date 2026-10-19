@@ -76,6 +76,7 @@ pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Textu
     };
     target.clear(frame);
     let shadow = sun_shadow::map_of(frame);
+    let moving = sun_shadow::moving_map_of(frame);
     let floor = frame.floor.and_then(|index| textures(index as usize));
     let projection = frame.uniforms.clip_from_eye;
     for draw in &frame.draws {
@@ -98,6 +99,7 @@ pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Textu
                         bias,
                         texture: texture.as_deref(),
                         shadow: shadow.as_deref(),
+                        moving: moving.as_deref(),
                         floor: floor.as_deref(),
                     };
                     for triangle in indices.as_chunks::<3>().0 {
@@ -393,6 +395,8 @@ struct Job<'a> {
     texture: Option<&'a Texture>,
     /// The sun's shadow map of the frame.
     shadow: Option<&'a ShadowMap>,
+    /// The map of what moves.
+    moving: Option<&'a ShadowMap>,
     /// The floor map of the frame, decoded.
     floor: Option<&'a Texture>,
 }
@@ -576,7 +580,9 @@ impl Job<'_> {
             let normal = shade::normalize(mix3(|v| v.normal));
             let normal = if front { normal } else { shade::scale(normal, -1.0) };
             let occlusion = v[0].occlusion * b[0] + v[1].occlusion * b[1] + v[2].occlusion * b[2];
-            let shadow = self.shadow.map_or(1.0, |map| sun_shadow::visibility(u, map, position, normal));
+            // the still map's word times the moving one's
+            let shadow = self.shadow.map_or(1.0, |map| sun_shadow::visibility(u, map, position, normal))
+                * self.moving.map_or(1.0, |map| sun_shadow::moving_visibility(u, map, position, normal));
             let floor = match self.floor {
                 Some(map) if self.instance.flags & instance_flag::FLOOR_MAP != 0 => floor_light(u, map, position),
                 _ => shade::NO_FLOOR,

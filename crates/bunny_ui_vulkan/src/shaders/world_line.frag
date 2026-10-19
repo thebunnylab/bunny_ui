@@ -22,6 +22,8 @@ layout(std140, set = 0, binding = 0) uniform World {
     uvec4 point_groups[2];
     vec4 floor_u;
     vec4 floor_v;
+    mat4 moving_from_eye;
+    vec4 moving;
 };
 
 // (flags, near, far, step back): what one draw adds to the frame
