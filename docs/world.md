@@ -384,6 +384,12 @@ cut-out surface (`Material::mask`) turns its edge into coverage — the
 cut sharpened to a pixel's width — so leaves and grilles keep a smooth
 edge; at one sample it cuts as the CPU does.
 
+`cargo run --release -p bunny-ui-core --features 3d --example bench_world`
+times what the CPU does for each frame of four worlds — a shadowed still
+life, 4 096 instances, a mesh of 262 144 triangles, 64 skinned figures —
+with a pick, a redraw's rects and a slide, and then draws each world on
+the CPU. The tiers' timers measure the GPU's own time.
+
 ## The oracle
 
 The software rasterizer follows the rules a GPU follows: clipping in
