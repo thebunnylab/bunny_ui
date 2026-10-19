@@ -2,11 +2,18 @@
 
 *Status: the core is complete behind the `3d` feature — the retained
 world, cameras, the orbit, picking, the frame, the software rasterizer
-and the view — and the `gltf` feature reads assets. Every tier shows a
-world today: the CPU rasterizer draws it, and the picture rides the
-live road the feeds use. The GPU passes come tier by tier: Metal, then
-WebGL2, D3D11, GL and Vulkan. `cargo test -p bunny-ui --features gltf`
-proves the core on any machine.*
+and the view — and the `gltf` feature reads assets. Metal draws worlds
+itself on the Mac and the phone. Every other tier shows a world too:
+the CPU rasterizer draws it, and the picture rides the live road the
+feeds use, until the tier's own pass comes — WebGL2, then D3D11, GL and
+Vulkan. `cargo test -p bunny-ui-core --features gltf` proves the core
+on any machine.*
+
+An app turns worlds on in its manifest:
+
+```toml
+bunny-ui = { version = "0.3", features = ["3d", "gltf"] }
+```
 
 A world is a retained set of entities — meshes, materials, lights and
 lines — placed in meters. A box paints a picture of it through a
@@ -157,7 +164,26 @@ pin every offset.
 | Tier | Today |
 |---|---|
 | CPU oracle | draws every world; byte-stable on every machine |
-| Metal, WebGL2, D3D11, GL, Vulkan | show the oracle's picture through the live road; their own passes come next |
+| Metal (Mac, phone) | draws worlds itself: one pass per world, four samples resolved in tile memory, held to the oracle by parity tests |
+| WebGL2, D3D11, GL, Vulkan | show the oracle's picture through the live road; their own passes come next |
+
+A tier that draws worlds keeps a target per box and hands the 2D pass
+the target like a feed. A world whose picture did not move is not
+drawn again: a repeated frame, a fade, or a frame that changed only the
+2D around it costs the GPU nothing for the world. Meshes and textures
+go up once per identity and generation, and what no frame reads for a
+while is given back.
+
+## Quality
+
+| | Samples | Pixel budget |
+|---|---|---|
+| `Quality::Low` | 1 | 1.2 million |
+| `Quality::Medium` (default) | 4 | 2.2 million |
+| `Quality::High` | 4 | 4 million |
+
+A box inside the budget is drawn at its own size. A larger box is drawn
+smaller, and the compositor stretches it to the box.
 
 ## The oracle
 
@@ -166,7 +192,9 @@ homogeneous space, corners snapped to 1/256 of a pixel, the top-left
 rule, depth linear on the screen, attributes corrected for perspective,
 colour blended as an 8-bit target blends it. Lines are quads of analytic
 coverage, pulled a hair toward the eye so an edge wins against its
-faces. Its shading uses `+ − × ÷`, `sqrt`, `floor` and fixed tables
+faces. Where a frame draws edges, each opaque surface also steps back
+by its own depth slope, so an edge on a surface that turns away from
+the eye stays whole across its width — and never past the far plane. Its shading uses `+ − × ÷`, `sqrt`, `floor` and fixed tables
 only: the same frame gives the same bytes on every machine, and a test
 pins the fingerprint of one picture.
 
@@ -192,12 +220,16 @@ Every malformed input is an error, never a panic.
 - Labels are painted text. A label that is a view comes later.
 - No shadows, no skins and no animation clips yet.
 - A model holds at most 256 materials.
+- The preview wire carries no picture of a world: a preview shows the
+  box empty.
 
 ## Proof
 
 ```bash
-cargo test -p bunny-ui --features 3d
-cargo test -p bunny-ui --features gltf
-BUNNY_PARANOID=all cargo test -p bunny-ui --all-features
-BUNNY_WORLD_GLB=chair.glb BUNNY_WORLD_DUMP=/tmp cargo test -p bunny-ui --features gltf --lib a_glb_from_the_environment -- --ignored
+cargo test -p bunny-ui-core --features 3d
+cargo test -p bunny-ui-core --features gltf
+BUNNY_PARANOID=all cargo test -p bunny-ui-core --all-features
+cargo test -p bunny-ui-apple --features 3d
+cargo run -p bunny-ui-macos --features 3d --example world_window
+BUNNY_WORLD_GLB=chair.glb BUNNY_WORLD_DUMP=/tmp cargo test -p bunny-ui-core --features gltf --lib a_glb_from_the_environment -- --ignored
 ```
