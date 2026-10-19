@@ -1,0 +1,11 @@
+    Checking bunny-ui-core v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui)
+error: unused import: `super::*`
+   --> crates/bunny_ui/src/glass.rs:658:9
+    |
+658 |     use super::*;
+    |         ^^^^^^^^
+    |
+    = note: `-D unused-imports` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(unused_imports)]`
+
+error: could not compile `bunny-ui-core` (lib test) due to 1 previous error

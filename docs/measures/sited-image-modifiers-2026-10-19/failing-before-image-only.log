@@ -1,0 +1,24 @@
+   Compiling bunny-ui-core v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.51s
+     Running tests/image_provenance.rs (target/studio-execution/debug/deps/image_provenance-6817a1aa3ef1def4)
+
+running 1 test
+test recorded_image_modifiers_keep_resize_fit_fill_and_source_sites ... FAILED
+
+failures:
+
+---- recorded_image_modifiers_keep_resize_fit_fill_and_source_sites stdout ----
+
+thread 'recorded_image_modifiers_keep_resize_fit_fill_and_source_sites' (42390566) panicked at crates/bunny_ui/tests/image_provenance.rs:35:9:
+assertion `left == right` failed: Fit
+  left: [Image { rect: Rect { origin: Point { x: 0.0, y: 30.0 }, size: Size { width: 180.0, height: 60.0 } }, source: rgba(0x626e795f7354927a, 3×1) }]
+ right: [Image { rect: Rect { origin: Point { x: 88.5, y: 59.5 }, size: Size { width: 3.0, height: 1.0 } }, source: rgba(0x626e795f7354927a, 3×1) }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    recorded_image_modifiers_keep_resize_fit_fill_and_source_sites
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p bunny-ui-core --test image_provenance`

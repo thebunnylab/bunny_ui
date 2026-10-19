@@ -1,0 +1,65 @@
+{
+  "algorithm": "blake3",
+  "files": [
+    {
+      "path": "README.md",
+      "blake3": "067c0e951c37f888f170c8a8a5e4ab86be46dedcf847c6491c0d681d471ed78d",
+      "bytes": 1254
+    },
+    {
+      "path": "core-tests.log",
+      "blake3": "2a5d3849d834b93cbb29feaedafa8d33c82cb671d565161cae531ad09094c9e1",
+      "bytes": 105892
+    },
+    {
+      "path": "failing-before-image-only-exit.txt",
+      "blake3": "779c2379a41b40ee4b939961fbce0ade8840c854490c67163ca5c3df7424c440",
+      "bytes": 4
+    },
+    {
+      "path": "failing-before-image-only.log",
+      "blake3": "f8fa9709328af0f90e8e7ccadcb0ead2a913db0420f96f874b55e2670bbd08c7",
+      "bytes": 1304
+    },
+    {
+      "path": "format.json",
+      "blake3": "dce596f1237b9f6027d28e1e56afc30e403af088f9c9612a149302855676bd1a",
+      "bytes": 214
+    },
+    {
+      "path": "gates.json",
+      "blake3": "ddd32773e54d54dda9d005ada9216061c2c8e2121f88fcb93741e6fb0783523c",
+      "bytes": 1279
+    },
+    {
+      "path": "image-after-4.log",
+      "blake3": "f6b2fd43d1e0389207936045748412868c44a10f9e56e903ad9b7425443c1fe4",
+      "bytes": 633
+    },
+    {
+      "path": "native-clippy.log",
+      "blake3": "c672d4f898e25889c08ab1814312ed782db0a3e098f93b1c0119c374eabb0b3e",
+      "bytes": 453
+    },
+    {
+      "path": "production-clippy.log",
+      "blake3": "6eeeaa50716bb9b39511fb05e6391bb9219c5d340218cbbfbe25bcf2290ae709",
+      "bytes": 434
+    },
+    {
+      "path": "production-tests.log",
+      "blake3": "58badb73f55045368ebd47dc2e7b54ddf1d3fc209828a3d729d8884d8a523cb9",
+      "bytes": 119181
+    },
+    {
+      "path": "verification.json",
+      "blake3": "eea3b1804d85f75b41ec960790c9e5dc2df6bd0b0854ae09b27a3f2ba7d92510",
+      "bytes": 1311
+    },
+    {
+      "path": "wasm-clippy.log",
+      "blake3": "a61389bc3839b554898eceacc221b8816d7e6e0412f9632c739384e976971f81",
+      "bytes": 548
+    }
+  ]
+}

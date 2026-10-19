@@ -1,0 +1,4 @@
+    Checking bunny-ui-core v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui)
+   Compiling bunny-ui-preview v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui_preview)
+    Checking bunny-ui-hot v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui_hot)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.54s
