@@ -10,7 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::task::{Context, Poll, Waker};
 
 use crate::prelude::{State, StateExt};
@@ -251,10 +251,7 @@ impl ConfirmationSlot {
         if self.0.current.borrow().is_some() {
             return Err(ConfirmationError::AlreadyOpen);
         }
-        let token = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
+        let token = super::reserve_identity(&NEXT)
             .expect("confirmation identity space exhausted; tokens cannot be reused");
         let shared = Rc::new(Shared {
             token,
