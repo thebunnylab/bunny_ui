@@ -3360,7 +3360,7 @@ static REGISTER_HOST: Once = Once::new();
 /// NSView's ordinary hit test, retaining the engine's links and text selection.
 extern "C" fn bunny_host_hit(this: Id, _sel: Sel, point: CGPoint) -> Id {
     unsafe {
-        let sup = ObjcSuper { receiver: this, class: unsafe { class("NSView") } };
+        let sup = ObjcSuper { receiver: this, class: class("NSView") };
         let hit = msg_super_id_point(&sup, sel("hitTest:"), point);
         if hit.is_null() {
             return hit;
