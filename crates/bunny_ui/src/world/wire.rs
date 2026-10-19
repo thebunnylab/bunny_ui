@@ -90,7 +90,7 @@ pub mod frame_offset {
     pub const SIZE: usize = 624;
 }
 
-/// One instance of a mesh or a set of lines. 112 bytes.
+/// One instance of a mesh or a set of lines. 128 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct InstanceData {
     /// The rows of the eye-from-model matrix: `x' = rows[0] · (x, y, z, 1)`.
@@ -105,7 +105,22 @@ pub struct InstanceData {
     pub entity: u32,
     /// [`instance_flag`] bits.
     pub flags: u32,
+    /// Multiplies the light the instance takes from the sky and the
+    /// ground (sRGB): the ambient of the room it stands in.
+    pub ambient: [u8; 4],
+    /// Where the states of the instance's parts start in the frame's part
+    /// table, one a part its mesh names; [`NO_PARTS`] for none.
+    pub part_base: u32,
+    /// Two words kept for what an instance will carry next: zero.
+    pub reserved: [u32; 2],
 }
+
+/// The `part_base` of an instance whose parts all keep their own look.
+pub const NO_PARTS: u32 = u32::MAX;
+
+/// One part's state in the frame's part table: its tint (sRGB) and, in
+/// the fourth byte, 255 when it shows and 0 when it hides.
+pub type PartRow = [u8; 4];
 
 /// Byte offsets of [`InstanceData`].
 pub mod instance_offset {
@@ -115,7 +130,10 @@ pub mod instance_offset {
     pub const MATERIAL_BASE: usize = 100;
     pub const ENTITY: usize = 104;
     pub const FLAGS: usize = 108;
-    pub const SIZE: usize = 112;
+    pub const AMBIENT: usize = 112;
+    pub const PART_BASE: usize = 116;
+    pub const RESERVED: usize = 120;
+    pub const SIZE: usize = 128;
 }
 
 /// Bits of [`InstanceData::flags`].
@@ -155,11 +173,20 @@ pub mod material_flag {
     pub const MASK: u32 = 4;
 }
 
-/// Bytes of one caster of the sun's shadow map: the three rows of its
+/// One caster of the sun's shadow map: the three rows of its
 /// map-from-model matrix, `x' = rows[0] · (x, y, z, 1)` — `x` and `y`
 /// across the map in `[-1, 1]` (`y` up), `z` the depth from the sun in
-/// `[0, 1]`.
-pub const SHADOW_INSTANCE_STRIDE: usize = 48;
+/// `[0, 1]` — and where the states of its parts start in the frame's part
+/// table (a part that hides casts nothing). 64 bytes: the rows, the part
+/// base, three zero words.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShadowCaster {
+    pub rows: [Row; 3],
+    pub part_base: u32,
+}
+
+/// Bytes of one [`ShadowCaster`].
+pub const SHADOW_INSTANCE_STRIDE: usize = 64;
 
 /// How a set of lines is drawn. 32 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
@@ -224,6 +251,11 @@ impl InstanceData {
         out.extend_from_slice(&self.material_base.to_le_bytes());
         out.extend_from_slice(&self.entity.to_le_bytes());
         out.extend_from_slice(&self.flags.to_le_bytes());
+        out.extend_from_slice(&self.ambient);
+        out.extend_from_slice(&self.part_base.to_le_bytes());
+        for word in self.reserved {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
     }
 }
 
@@ -252,14 +284,22 @@ pub fn instance_bytes(instances: &[InstanceData]) -> Vec<u8> {
 }
 
 /// Every caster of the shadow map, back to back.
-pub fn shadow_instance_bytes(instances: &[[Row; 3]]) -> Vec<u8> {
+pub fn shadow_instance_bytes(instances: &[ShadowCaster]) -> Vec<u8> {
     let mut out = Vec::with_capacity(instances.len() * SHADOW_INSTANCE_STRIDE);
-    for rows in instances {
-        for row in rows {
+    for caster in instances {
+        for row in &caster.rows {
             put_row(&mut out, row);
+        }
+        for word in [caster.part_base, 0, 0, 0] {
+            out.extend_from_slice(&word.to_le_bytes());
         }
     }
     out
+}
+
+/// The part table, back to back: four bytes a part.
+pub fn part_bytes(rows: &[PartRow]) -> Vec<u8> {
+    rows.iter().flatten().copied().collect()
 }
 
 /// Every material, back to back: four texels of a data texture each.
@@ -356,6 +396,9 @@ mod tests {
             material_base: 77,
             entity: 88,
             flags: instance_flag::CASTS_SHADOW,
+            ambient: [50, 60, 70, 255],
+            part_base: 99,
+            reserved: [0; 2],
         };
         let bytes = instance_bytes(&[instance, instance]);
         assert_eq!(bytes.len(), 2 * instance_offset::SIZE);
@@ -367,7 +410,10 @@ mod tests {
         assert_eq!(u32_at(&bytes, at::MATERIAL_BASE), 77);
         assert_eq!(u32_at(&bytes, at::ENTITY), 88);
         assert_eq!(u32_at(&bytes, at::FLAGS), 1);
-        assert_eq!(u32_at(&bytes, at::SIZE + at::MATERIAL_BASE), 77, "the second instance starts at 112");
+        assert_eq!(&bytes[at::AMBIENT..at::AMBIENT + 4], &[50, 60, 70, 255]);
+        assert_eq!(u32_at(&bytes, at::PART_BASE), 99);
+        assert_eq!(u32_at(&bytes, at::RESERVED + 4), 0);
+        assert_eq!(u32_at(&bytes, at::SIZE + at::MATERIAL_BASE), 77, "the second instance starts at 128");
     }
 
     #[test]
@@ -383,9 +429,10 @@ mod tests {
         let bytes = segment_bytes(&[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]);
         assert_eq!(bytes.len(), SEGMENT_STRIDE);
         assert_eq!(f32_at(&bytes, 20), 6.0);
-        let caster = [[1.0, 0.0, 0.0, 0.5], [0.0, 1.0, 0.0, 0.25], [0.0, 0.0, 1.0, 0.125]];
+        let caster = ShadowCaster { rows: [[1.0, 0.0, 0.0, 0.5], [0.0, 1.0, 0.0, 0.25], [0.0, 0.0, 1.0, 0.125]], part_base: 7 };
         let bytes = shadow_instance_bytes(&[caster, caster]);
         assert_eq!(bytes.len(), 2 * SHADOW_INSTANCE_STRIDE);
         assert_eq!(f32_at(&bytes, SHADOW_INSTANCE_STRIDE + 44), 0.125);
+        assert_eq!(u32_at(&bytes, SHADOW_INSTANCE_STRIDE + 48), 7);
     }
 }

@@ -37,7 +37,9 @@ use bunny_ui::gpu::world::{WorldCaps, WorldGround, WorldJob};
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, WorldFrame};
 use bunny_ui::world::shade::SRGB_DECODE;
-use bunny_ui::world::wire::{SEGMENT_STRIDE, SHADOW_INSTANCE_STRIDE, instance_bytes, instance_offset, material_bytes, shadow_instance_bytes};
+use bunny_ui::world::wire::{
+    SEGMENT_STRIDE, SHADOW_INSTANCE_STRIDE, instance_bytes, instance_offset, material_bytes, part_bytes, shadow_instance_bytes,
+};
 
 use super::{
     ADDRESS_CLAMP, BIND_RENDER_TARGET, BIND_SHADER_RESOURCE, BLEND_INV_SRC_ALPHA, BLEND_ONE, BLEND_OP_ADD, BlendDesc, BlendState, Blob,
@@ -120,6 +122,10 @@ struct WorldInstance {
     uint material_base;
     uint entity;
     uint flags;
+    uint ambient;
+    uint part_base;
+    uint reserved0;
+    uint reserved1;
 };
 
 struct WorldMaterial {
@@ -184,6 +190,8 @@ Texture2D<float4> picture : register(t3);
 StructuredBuffer<WorldSegment> segments : register(t4);
 Texture2D<float> shadow_map : register(t5);
 Texture2D<float4> floor_picture : register(t7);
+// the frame's part table: a part's tint and, in the top byte, 0 when it hides
+StructuredBuffer<uint> parts : register(t8);
 SamplerState surface_sampler : register(s1);
 SamplerComparisonState shadow_sampler : register(s2);
 
@@ -322,7 +330,7 @@ float4 floor_light(uint flags, float3 position) {
 }
 
 float3 lit(float3 position, float3 n, float3 base, float roughness, float metallic, float3 emissive,
-           float occlusion, uint groups, float shadow, float4 floor_texel) {
+           float occlusion, uint groups, float shadow, float4 floor_texel, float3 ambient) {
     bool parallel = u.params.w > 0.5;
     float3 v = parallel ? float3(0.0, 0.0, 1.0) : safe_normalize(-position);
     float n_dot_v = clamp(dot(n, v), 1e-4, 1.0);
@@ -333,8 +341,8 @@ float3 lit(float3 position, float3 n, float3 base, float roughness, float metall
     float a = r * r;
     float a2 = r * r * r * r;
     float3 up = u.sky_up.xyz;
-    float3 sky = u.sky_color.xyz;
-    float3 ground = u.ground_color.xyz;
+    float3 sky = u.sky_color.xyz * ambient;
+    float3 ground = u.ground_color.xyz * ambient;
     float ao = (1.0 + (occlusion - 1.0) * 0.8) * floor_texel.a;
 
     float3 light = diffuse * hemisphere(n, up, sky, ground) * ao;
@@ -420,16 +428,29 @@ struct WorldVary {
     noperspective float depth : W_DEPTH;
     nointerpolation uint material : W_MATERIAL;
     nointerpolation uint instance : W_INSTANCE;
+    // the tint of the vertex's part over the instance's (linear)
+    nointerpolation float3 part_tint : W_PART;
 };
 
 WorldVary world_vertex(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     WorldVertex vx = vertices[vid];
     uint index = draw.first_instance + iid;
     WorldInstance instance = instances[index];
+    WorldVary o;
+    o.part_tint = float3(1.0, 1.0, 1.0);
+    // a part that hides leaves the clip volume with every corner
+    if (instance.part_base != 0xFFFFFFFFu) {
+        uint part = parts[instance.part_base + (vx.ids >> 16)];
+        if ((part >> 24) == 0u) {
+            o = (WorldVary)0;
+            o.position = float4(0.0, 0.0, 2.0, 1.0);
+            return o;
+        }
+        o.part_tint = float3(SRGB_DECODE[part & 0xFFu], SRGB_DECODE[(part >> 8) & 0xFFu], SRGB_DECODE[(part >> 16) & 0xFFu]);
+    }
     float3 eye = to_eye(instance, vx.position);
     int2 folded = int2(asint(vx.folded << 16) >> 16, asint(vx.folded) >> 16);
     float3 n = unfold_normal(folded);
-    WorldVary o;
     o.position = mul(u.clip_from_eye, float4(eye, 1.0));
     o.depth = o.position.z / o.position.w;
     o.eye = eye;
@@ -463,7 +484,7 @@ float4 world_shade(WorldVary v, bool front) {
     bool two_sided = material.back.w > 0.5;
     float4 surface = (front || !two_sided) ? material.base : float4(material.back.xyz, material.base.w);
     uint tint = instance.tint;
-    float3 tinted = float3(SRGB_DECODE[tint & 0xFFu], SRGB_DECODE[(tint >> 8) & 0xFFu], SRGB_DECODE[(tint >> 16) & 0xFFu]);
+    float3 tinted = float3(SRGB_DECODE[tint & 0xFFu], SRGB_DECODE[(tint >> 8) & 0xFFu], SRGB_DECODE[(tint >> 16) & 0xFFu]) * v.part_tint;
     float3 base = surface.rgb * tinted * color.rgb;
     float alpha = surface.a * ((float)(tint >> 24) / 255.0) * color.a;
     if ((draw.flags & DRAW_MASK) != 0u || (flags & MATERIAL_MASK) != 0u) {
@@ -486,7 +507,9 @@ float4 world_shade(WorldVary v, bool front) {
         }
         float3 light = lit(v.eye, normal, base, material.params.x, material.params.y,
                            material.emissive.xyz, v.occlusion, 1u << ((instance.flags >> 8) & 31u), sun_visibility(v.eye, normal),
-                           floor_light(instance.flags, v.eye));
+                           floor_light(instance.flags, v.eye),
+                           float3(SRGB_DECODE[instance.ambient & 0xFFu], SRGB_DECODE[(instance.ambient >> 8) & 0xFFu],
+                                  SRGB_DECODE[(instance.ambient >> 16) & 0xFFu]));
         if (u.tone.z > 0.5) {
             dither = bayer((uint)v.position.x, (uint)v.position.y);
         }
@@ -523,6 +546,10 @@ SteppedBack world_fragment_stepped(WorldVary v, bool front : SV_IsFrontFace) {
 
 struct ShadowCaster {
     float4 rows[3];
+    uint part_base;
+    uint pad0;
+    uint pad1;
+    uint pad2;
 };
 
 StructuredBuffer<ShadowCaster> casters : register(t6);
@@ -532,6 +559,10 @@ StructuredBuffer<ShadowCaster> casters : register(t6);
 float4 shadow_vertex(uint vid : SV_VertexID, uint iid : SV_InstanceID) : SV_Position {
     float3 p = vertices[vid].position;
     ShadowCaster caster = casters[draw.first_instance + iid];
+    // a part that hides casts nothing
+    if (caster.part_base != 0xFFFFFFFFu && (parts[caster.part_base + (vertices[vid].ids >> 16)] >> 24) == 0u) {
+        return float4(0.0, 0.0, 2.0, 1.0);
+    }
     float4 r0 = caster.rows[0];
     float4 r1 = caster.rows[1];
     float4 r2 = caster.rows[2];
@@ -833,6 +864,8 @@ pub(super) struct D3dWorld {
     materials: SlotBuffer,
     /// The rows of a shadow's casters, the same way.
     casters: SlotBuffer,
+    /// The frame's part table, the same way.
+    parts: SlotBuffer,
 }
 
 impl D3dWorld {
@@ -850,6 +883,7 @@ impl D3dWorld {
             instances: SlotBuffer::empty(),
             materials: SlotBuffer::empty(),
             casters: SlotBuffer::empty(),
+            parts: SlotBuffer::empty(),
         }
     }
 
@@ -921,7 +955,7 @@ impl D3dWorld {
     }
 
     fn encode_job(&mut self, job: &WorldJob) {
-        let D3dWorld { device, context, built, targets, meshes, textures, segments, shadow_maps, instances, materials, casters, .. } = self;
+        let D3dWorld { device, context, built, targets, meshes, textures, segments, shadow_maps, instances, materials, casters, parts, .. } = self;
         let (device, context) = (*device, *context);
         let Built::Ready(stack) = built else { return };
         let Some(target) = targets.get(&job.target) else { return };
@@ -932,10 +966,17 @@ impl D3dWorld {
         // one before it
         let instance_data = instance_bytes(&frame.instances);
         let material_data = material_bytes(&frame.materials);
+        // one part at least: the stage's view is never left empty
+        let mut part_data = part_bytes(&frame.parts);
+        if part_data.is_empty() {
+            part_data = vec![255; 4];
+        }
         let staged = instances.ensure(device, frame.instances.len(), instance_offset::SIZE)
             && materials.ensure(device, frame.materials.len(), 64)
+            && parts.ensure(device, part_data.len() / 4, 4)
             && instances.upload(context, &instance_data)
-            && materials.upload(context, &material_data);
+            && materials.upload(context, &material_data)
+            && parts.upload(context, &part_data);
         if !staged {
             return;
         }
@@ -943,6 +984,8 @@ impl D3dWorld {
         unsafe {
             let vtbl = &*(*context).vtbl;
             write_constants(context, stack.uniforms.as_ptr(), &frame.uniforms.to_bytes());
+            let part_view = parts.srv_ptr();
+            (vtbl.vs_set_shader_resources)(context, 8, 1, &part_view);
 
             // the sun's map first, when it does not hold this frame's casters
             if let (Some((shadow, map)), Some(frame_shadow)) = (map, frame.shadow.as_ref())

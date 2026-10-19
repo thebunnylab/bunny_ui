@@ -74,15 +74,26 @@ pub fn srgb_table() -> String {
     format!("const float SRGB_DECODE[256] = float[256]({});\n", values.join(", "))
 }
 
+/// The frame's part table, for the vertex stages: one texel a part, its
+/// tint and, in `w`, 0 when it hides.
+pub const PARTS: &str = r#"
+uniform highp usampler2D u_parts;
+
+uvec4 part_row(uint index) {
+    return texelFetch(u_parts, ivec2(int(index % 1024u), int(index / 1024u)), 0);
+}
+"#;
+
 /// A surface's vertex stage: the vertex and its instance arrive as
 /// attributes at fixed locations; the instance attributes are re-pointed
-/// per draw, so the first instance rides the byte offset.
+/// per draw, so the first instance rides the byte offset. It follows
+/// `WORLD_COMMON`, the sRGB table and `PARTS`.
 pub const MESH_VERT: &str = r#"
 layout(location = 0) in vec3 a_position;
 layout(location = 1) in ivec2 a_normal;
 layout(location = 2) in vec2 a_uv;
 layout(location = 3) in uvec4 a_color;
-layout(location = 4) in uvec2 a_ids;
+layout(location = 4) in uvec4 a_ids;
 layout(location = 5) in vec4 i_row0;
 layout(location = 6) in vec4 i_row1;
 layout(location = 7) in vec4 i_row2;
@@ -91,6 +102,7 @@ layout(location = 9) in vec4 i_normal1;
 layout(location = 10) in vec4 i_normal2;
 layout(location = 11) in uvec4 i_tint;
 layout(location = 12) in uvec3 i_ids;
+layout(location = 13) in uvec4 i_more;
 
 out vec3 v_eye;
 out vec3 v_normal;
@@ -101,6 +113,7 @@ out vec2 v_zw;
 flat out uint v_material;
 flat out vec4 v_tint;
 flat out uint v_flags;
+flat out vec3 v_ambient;
 
 vec3 unfold_normal(ivec2 folded) {
     float u = max(float(folded.x) / 32767.0, -1.0);
@@ -131,8 +144,20 @@ void main() {
     v_color = vec4(SRGB_DECODE[a_color.r], SRGB_DECODE[a_color.g], SRGB_DECODE[a_color.b], float(a_color.a) / 255.0);
     v_occlusion = float(a_ids.y) / 255.0;
     v_material = i_ids.x + a_ids.x;
-    v_tint = vec4(SRGB_DECODE[i_tint.r], SRGB_DECODE[i_tint.g], SRGB_DECODE[i_tint.b], float(i_tint.a) / 255.0);
+    vec4 tint = vec4(SRGB_DECODE[i_tint.r], SRGB_DECODE[i_tint.g], SRGB_DECODE[i_tint.b], float(i_tint.a) / 255.0);
+    // the instance's part states: a part that hides leaves the clip
+    // volume with every corner, a part's tint goes over the instance's
+    if (i_more.y != 0xFFFFFFFFu) {
+        uvec4 part = part_row(i_more.y + (a_ids.z | (a_ids.w << 8)));
+        if (part.w == 0u) {
+            gl_Position = to_gl(vec4(0.0, 0.0, 2.0, 1.0));
+            return;
+        }
+        tint = vec4(tint.r * SRGB_DECODE[part.r], tint.g * SRGB_DECODE[part.g], tint.b * SRGB_DECODE[part.b], tint.a);
+    }
+    v_tint = tint;
     v_flags = i_ids.z;
+    v_ambient = vec3(SRGB_DECODE[i_more.x & 255u], SRGB_DECODE[(i_more.x >> 8) & 255u], SRGB_DECODE[(i_more.x >> 16) & 255u]);
 }
 "#;
 
@@ -147,6 +172,7 @@ in vec2 v_zw;
 flat in uint v_material;
 flat in vec4 v_tint;
 flat in uint v_flags;
+flat in vec3 v_ambient;
 
 uniform sampler2D u_materials;
 uniform sampler2D u_surface;
@@ -254,7 +280,7 @@ vec4 floor_light(vec3 position) {
     return textureLod(u_floor, clamp(vec2(s, t), half_texel, vec2(1.0) - half_texel), 0.0);
 }
 
-vec3 lit(vec3 position, vec3 n, vec3 base, float roughness, float metallic, vec3 emissive, float occlusion, uint groups, float shadow, vec4 floor_map) {
+vec3 lit(vec3 position, vec3 n, vec3 base, float roughness, float metallic, vec3 emissive, float occlusion, uint groups, float shadow, vec4 floor_map, vec3 ambient) {
     bool parallel = params.w > 0.5;
     vec3 v = parallel ? vec3(0.0, 0.0, 1.0) : safe_normalize(-position);
     float n_dot_v = clamp(dot(n, v), 1e-4, 1.0);
@@ -265,8 +291,8 @@ vec3 lit(vec3 position, vec3 n, vec3 base, float roughness, float metallic, vec3
     float a = r * r;
     float a2 = r * r * r * r;
     vec3 up = sky_up.xyz;
-    vec3 sky = sky_color.xyz;
-    vec3 ground = ground_color.xyz;
+    vec3 sky = sky_color.xyz * ambient;
+    vec3 ground = ground_color.xyz * ambient;
     float ao = (1.0 + (occlusion - 1.0) * 0.8) * floor_map.a;
 
     vec3 light = diffuse * hemisphere(n, up, sky, ground) * ao;
@@ -362,7 +388,7 @@ vec4 shade() {
             normal = -normal;
         }
         vec3 light = lit(v_eye, normal, base, params_row.x, params_row.y, emissive_row.xyz, v_occlusion,
-                         1u << ((v_flags >> 8) & 31u), sun_visibility(v_eye, normal), floor_light(v_eye));
+                         1u << ((v_flags >> 8) & 31u), sun_visibility(v_eye, normal), floor_light(v_eye), v_ambient);
         if (tone.z > 0.5) {
             dither = bayer(uint(gl_FragCoord.x), uint(gl_FragCoord.y));
         }
@@ -395,14 +421,21 @@ void main() {
 
 /// A caster into the sun's shadow map: the vertex placed by the caster's
 /// rows, the map upside down in clip space like every target, so its
-/// first row is its top. It follows `WORLD_COMMON`.
+/// first row is its top; a part that hides casts nothing. It follows
+/// `WORLD_COMMON` and `PARTS`.
 pub const SHADOW_VERT: &str = r#"
 layout(location = 0) in vec3 a_position;
+layout(location = 4) in uvec4 a_ids;
 layout(location = 5) in vec4 i_row0;
 layout(location = 6) in vec4 i_row1;
 layout(location = 7) in vec4 i_row2;
+layout(location = 12) in uvec3 i_ids;
 
 void main() {
+    if (i_ids.x != 0xFFFFFFFFu && part_row(i_ids.x + (a_ids.z | (a_ids.w << 8))).w == 0u) {
+        gl_Position = to_gl(vec4(0.0, 0.0, 2.0, 1.0));
+        return;
+    }
     vec3 p = a_position;
     vec3 m = vec3(i_row0.x * p.x + i_row0.y * p.y + i_row0.z * p.z + i_row0.w,
                   i_row1.x * p.x + i_row1.y * p.y + i_row1.z * p.z + i_row1.w,
@@ -589,8 +622,9 @@ mod tests {
     use super::*;
     use crate::gpu::shaders::{PRELUDE_300ES, PRELUDE_330};
 
-    const BODIES: [(&str, &str); 11] = [
+    const BODIES: [(&str, &str); 12] = [
         ("WORLD_COMMON", WORLD_COMMON),
+        ("PARTS", PARTS),
         ("MESH_VERT", MESH_VERT),
         ("MESH_FRAG_COMMON", MESH_FRAG_COMMON),
         ("MESH_FRAG", MESH_FRAG),

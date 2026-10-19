@@ -166,6 +166,8 @@ struct MeshInner {
     runs: Vec<(u8, u32, u32)>,
     /// Built the first time a ray asks, kept for the revision.
     bvh: std::cell::OnceCell<super::pick::Bvh>,
+    /// One past the highest part a vertex names, counted on first ask.
+    parts: std::cell::OnceCell<u32>,
 }
 
 impl std::fmt::Debug for Mesh {
@@ -199,7 +201,7 @@ impl Mesh {
         let data = sanitize(data);
         let bounds = Aabb::from_points(data.positions.iter().map(|&p| to_vec(p)));
         let runs = material_runs(&data);
-        Mesh(Rc::new(MeshInner { id, generation, data, bounds, runs, bvh: std::cell::OnceCell::new() }))
+        Mesh(Rc::new(MeshInner { id, generation, data, bounds, runs, bvh: std::cell::OnceCell::new(), parts: std::cell::OnceCell::new() }))
     }
 
     /// The same mesh with a new shape: the identity stays, the
@@ -230,6 +232,14 @@ impl Mesh {
     /// index, index count)`. The triangles of a slot stand together.
     pub fn material_runs(&self) -> &[(u8, u32, u32)] {
         &self.0.runs
+    }
+
+    /// How many parts the mesh's vertices name: one past the highest.
+    pub fn part_count(&self) -> u32 {
+        *self.0.parts.get_or_init(|| {
+            let data = &self.0.data;
+            if data.parts.len() == data.positions.len() { data.parts.iter().map(|&part| part as u32 + 1).max().unwrap_or(1) } else { 1 }
+        })
     }
 
     /// The mesh's bounding volume hierarchy, built on first use.

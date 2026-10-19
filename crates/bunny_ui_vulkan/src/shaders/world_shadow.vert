@@ -62,12 +62,27 @@ float encode_code(float linear) {
     return s * 255.0;
 }
 
+layout(std430, set = 0, binding = 2) readonly buffer Parts {
+    uint rows[];
+} parts;
+
+uvec4 part_row(uint index) {
+    uint packed = parts.rows[index];
+    return uvec4(packed & 255u, (packed >> 8) & 255u, (packed >> 16) & 255u, packed >> 24);
+}
+
 layout(location = 0) in vec3 a_position;
+layout(location = 4) in uvec4 a_ids;
 layout(location = 5) in vec4 i_row0;
 layout(location = 6) in vec4 i_row1;
 layout(location = 7) in vec4 i_row2;
+layout(location = 12) in uvec3 i_ids;
 
 void main() {
+    if (i_ids.x != 0xFFFFFFFFu && part_row(i_ids.x + (a_ids.z | (a_ids.w << 8))).w == 0u) {
+        gl_Position = to_gl(vec4(0.0, 0.0, 2.0, 1.0));
+        return;
+    }
     vec3 p = a_position;
     vec3 m = vec3(i_row0.x * p.x + i_row0.y * p.y + i_row0.z * p.z + i_row0.w,
                   i_row1.x * p.x + i_row1.y * p.y + i_row1.z * p.z + i_row1.w,

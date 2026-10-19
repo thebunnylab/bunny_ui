@@ -12,14 +12,14 @@ use std::hash::Hasher;
 use std::rc::Rc;
 
 use super::camera::{Camera, Lens};
-use super::material::{AlphaMode, Light, LineDepth, Material, SunFrame};
+use super::material::{AlphaMode, Light, LineDepth, Material, PartState, SunFrame};
 use super::math::{Aabb, Frustum, Mat4, Plane, Vec3, vec3, vec4};
 use super::mesh::{Lines, Mesh};
 use super::shade::decode;
 use super::shadow;
 use super::store::{Shape, WorldData};
 use super::wire::{
-    FrameUniforms, InstanceData, LineStyleData, MAX_POINTS, MaterialData, Row, instance_flag, material_flag,
+    FrameUniforms, InstanceData, LineStyleData, MAX_POINTS, MaterialData, NO_PARTS, PartRow, ShadowCaster, instance_flag, material_flag,
 };
 use crate::image_engine::ImageSource;
 use crate::layout::Color;
@@ -201,8 +201,8 @@ pub struct ShadowFrame {
     pub generation: u64,
     /// The map's side, in texels.
     pub size: u32,
-    /// Each caster's rows ([`super::wire::shadow_instance_bytes`]).
-    pub instances: Vec<[Row; 3]>,
+    /// Each caster ([`super::wire::shadow_instance_bytes`]).
+    pub instances: Vec<ShadowCaster>,
     /// In order. Each one draws both faces and keeps the nearest depth.
     pub draws: Vec<ShadowDraw>,
 }
@@ -253,6 +253,9 @@ pub struct WorldFrame {
     /// Into [`WorldFrame::textures`]: the world's floor map, when one is
     /// laid ([`FrameUniforms::floor_u`] places it).
     pub floor: Option<u16>,
+    /// The states of the parts of every instance that sets them, one row a
+    /// part its mesh names ([`InstanceData::part_base`]).
+    pub parts: Vec<PartRow>,
 }
 
 impl WorldFrame {
@@ -288,6 +291,7 @@ impl WorldFrame {
         if let Some(floor) = self.floor {
             hasher.write_u16(floor);
         }
+        hasher.write(&super::wire::part_bytes(&self.parts));
         hasher.finish()
     }
 }
@@ -363,6 +367,8 @@ struct Seen {
     eye_from_model: Mat4,
     bounds: Aabb,
     tint: Color,
+    ambient: Color,
+    parts: Option<Rc<[PartState]>>,
     flags: u32,
 }
 
@@ -398,6 +404,8 @@ pub(crate) fn build_frame(
             eye_from_model,
             bounds,
             tint: data.spec.tint,
+            ambient: data.spec.ambient,
+            parts: data.spec.parts.clone(),
             flags: if data.spec.casts_shadow { instance_flag::CASTS_SHADOW } else { 0 }
                 | if data.spec.reads_floor_map { instance_flag::FLOOR_MAP } else { 0 }
                 | (data.spec.light_group as u32 & instance_flag::GROUP_MASK) << instance_flag::GROUP_SHIFT,
@@ -408,6 +416,7 @@ pub(crate) fn build_frame(
                     casters.push(Caster {
                         world_from_model: matrix,
                         model: Model { mesh: model.mesh.clone(), materials: Rc::clone(&model.materials) },
+                        parts: data.spec.parts.clone(),
                     });
                 }
                 let bounds = model.mesh.bounds().transformed(&eye_from_model);
@@ -478,7 +487,10 @@ pub(crate) fn build_frame(
         face_bias: 0.0,
         shadow: None,
         floor: None,
+        parts: Vec::new(),
     };
+    // each set of part states once, as many rows as its mesh names parts
+    let mut part_bases = HashMap::<(usize, u32), u32>::new();
 
     // models: one group per (mesh, materials, handedness), drawn instanced
     struct Group {
@@ -536,7 +548,7 @@ pub(crate) fn build_frame(
         members.sort_by(|&a, &b| (-models[a].0.bounds.max.z).total_cmp(&(-models[b].0.bounds.max.z)));
         for &member in &members {
             let seen = &models[member].0;
-            let mut instance = instance_of(seen, group.material_base);
+            let mut instance = instance_of(seen, group.material_base, part_base_of(&mut frame.parts, &mut part_bases, &seen.parts, &models[member].1.mesh));
             if style.xray {
                 instance.tint[3] = ((instance.tint[3] as u32 * XRAY_ALPHA + 127) / 255) as u8;
             }
@@ -609,7 +621,7 @@ pub(crate) fn build_frame(
             LineDepth::Hidden => Pass::HiddenLines,
             LineDepth::Always => Pass::Overlay,
         };
-        frame.instances.push(instance_of(seen, 0));
+        frame.instances.push(instance_of(seen, 0, NO_PARTS));
         line_draws.push(Draw {
             pass,
             kind: DrawKind::Lines { lines: set, style: style_index },
@@ -661,7 +673,7 @@ pub(crate) fn build_frame(
             SunFrame::World => sun.direction,
             SunFrame::View => world_from_eye.transform_vector(sun.direction),
         };
-        shadow_frame(&mut frame, &mut mesh_slot, &casters, travel.try_normalized()?, style.quality)
+        shadow_frame(&mut frame, &mut mesh_slot, &mut part_bases, &casters, travel.try_normalized()?, style.quality)
     });
 
     frame.uniforms = uniforms(&Eye { camera, view, projection }, style, size, px_per_point, time, &lights);
@@ -695,6 +707,24 @@ pub(crate) fn build_frame(
 struct Caster {
     world_from_model: Mat4,
     model: Model,
+    parts: Option<Rc<[PartState]>>,
+}
+
+/// Where a set of part states starts in the frame's part table, its rows
+/// laid there the first time: one a part `mesh` names, a part past the
+/// set's end in its own look. [`NO_PARTS`] for no set.
+fn part_base_of(table: &mut Vec<PartRow>, bases: &mut HashMap<(usize, u32), u32>, parts: &Option<Rc<[PartState]>>, mesh: &Mesh) -> u32 {
+    let Some(parts) = parts else { return NO_PARTS };
+    let count = mesh.part_count();
+    let key = (Rc::as_ptr(parts) as *const PartState as usize, count);
+    *bases.entry(key).or_insert_with(|| {
+        let base = table.len() as u32;
+        table.extend((0..count as usize).map(|part| {
+            let state = parts.get(part).copied().unwrap_or_default();
+            [state.tint.r, state.tint.g, state.tint.b, if state.shown { 255 } else { 0 }]
+        }));
+        base
+    })
 }
 
 /// Casters that share a mesh and its solid runs: one instanced draw a
@@ -729,6 +759,7 @@ fn solid_runs(model: &Model) -> Vec<(u32, u32)> {
 fn shadow_frame(
     frame: &mut WorldFrame,
     mesh_slot: &mut HashMap<(u64, u64), u16>,
+    part_bases: &mut HashMap<(usize, u32), u32>,
     casters: &[Caster],
     travel: Vec3,
     quality: Quality,
@@ -766,7 +797,9 @@ fn shadow_frame(
         });
         let first_instance = out.instances.len() as u32;
         for &member in members {
-            out.instances.push(rows(&(fit.map_from_world * casters[member].world_from_model)));
+            let caster = &casters[member];
+            let part_base = part_base_of(&mut frame.parts, part_bases, &caster.parts, &caster.model.mesh);
+            out.instances.push(ShadowCaster { rows: rows(&(fit.map_from_world * caster.world_from_model)), part_base });
         }
         for &(first_index, index_count) in runs {
             out.draws.push(ShadowDraw { mesh: slot, first_index, index_count, first_instance, instance_count: members.len() as u32 });
@@ -777,8 +810,17 @@ fn shadow_frame(
             }
         }
     }
-    for value in out.instances.iter().flatten().flatten() {
-        hasher.write_u32(value.to_bits());
+    for caster in &out.instances {
+        for value in caster.rows.iter().flatten() {
+            hasher.write_u32(value.to_bits());
+        }
+        // a part that hides casts nothing: which parts show moves the map
+        if caster.part_base != NO_PARTS {
+            let count = frame.parts.len().saturating_sub(caster.part_base as usize);
+            for row in frame.parts.iter().skip(caster.part_base as usize).take(count) {
+                hasher.write_u8(row[3]);
+            }
+        }
     }
     out.generation = hasher.finish();
     frame.shadow = Some(out);
@@ -819,7 +861,7 @@ fn same_draw(a: &Material, b: &Material) -> bool {
     key(a) == key(b)
 }
 
-fn instance_of(seen: &Seen, material_base: u32) -> InstanceData {
+fn instance_of(seen: &Seen, material_base: u32, part_base: u32) -> InstanceData {
     let normal = seen.eye_from_model.normal_matrix();
     InstanceData {
         eye_from_model: rows(&seen.eye_from_model),
@@ -828,6 +870,9 @@ fn instance_of(seen: &Seen, material_base: u32) -> InstanceData {
         material_base,
         entity: seen.entity,
         flags: seen.flags,
+        ambient: [seen.ambient.r, seen.ambient.g, seen.ambient.b, 255],
+        part_base,
+        reserved: [0; 2],
     }
 }
 

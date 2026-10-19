@@ -195,6 +195,8 @@ pub struct Surface {
     /// `[3]` the share of the sky's light that reaches it. `[0, 0, 0, 1]`
     /// for a surface that reads none.
     pub floor: [f32; 4],
+    /// Multiplies the light from the sky and the ground (linear).
+    pub ambient: V3,
 }
 
 /// What a surface that reads no floor map reads.
@@ -212,7 +214,8 @@ pub fn lit(u: &super::wire::FrameUniforms, surface: &Surface) -> V3 {
     let r = surface.roughness.clamp(0.045, 1.0);
     let (a, a2) = (r * r, r * r * r * r);
     let up = [u.sky_up[0], u.sky_up[1], u.sky_up[2]];
-    let (sky, ground) = ([u.sky_color[0], u.sky_color[1], u.sky_color[2]], [u.ground_color[0], u.ground_color[1], u.ground_color[2]]);
+    let sky = mul([u.sky_color[0], u.sky_color[1], u.sky_color[2]], surface.ambient);
+    let ground = mul([u.ground_color[0], u.ground_color[1], u.ground_color[2]], surface.ambient);
     let ao = (1.0 + (surface.occlusion - 1.0) * 0.8) * surface.floor[3];
 
     let mut light = scale(mul(diffuse, hemisphere(n, up, sky, ground)), ao);

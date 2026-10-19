@@ -36,7 +36,7 @@ use bunny_ui::gpu::world::{WorldCaps, WorldGround, WorldJob};
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, ShadowFrame, WorldFrame};
 use bunny_ui::world::wire::{
-    SEGMENT_STRIDE, SHADOW_INSTANCE_STRIDE, frame_offset, instance_bytes, instance_offset, material_bytes, shadow_instance_bytes,
+    SEGMENT_STRIDE, SHADOW_INSTANCE_STRIDE, frame_offset, instance_bytes, instance_offset, material_bytes, part_bytes, shadow_instance_bytes,
 };
 
 use super::*;
@@ -86,6 +86,11 @@ mod generator {
     const GL_MATERIAL_ROW: &str = "return texelFetch(u_materials, ivec2((index % 1024) * 4 + row, index / 1024), 0);";
     const VK_MATERIAL_ROW: &str = "return materials.rows[index * 4 + row];";
 
+    /// The part table: a storage buffer, one packed word a part.
+    const PARTS: &str = "layout(std430, set = 0, binding = 2) readonly buffer Parts {\n    uint rows[];\n} parts;";
+    const GL_PART_ROW: &str = "return texelFetch(u_parts, ivec2(int(index % 1024u), int(index / 1024u)), 0);";
+    const VK_PART_ROW: &str = "uint packed = parts.rows[index];\n    return uvec4(packed & 255u, (packed >> 8) & 255u, (packed >> 16) & 255u, packed >> 24);";
+
     /// Every world stage in the Vulkan dialect, by the file it is kept
     /// in: each block and sampler with its set and binding, the draw's
     /// values as push constants, the materials in a storage buffer, every
@@ -94,14 +99,14 @@ mod generator {
         use bunny_ui::gpu::world_shaders as gl;
         let table = gl::srgb_table();
         vec![
-            ("world_mesh.vert", stage(&[gl::WORLD_COMMON, &table, gl::MESH_VERT])),
+            ("world_mesh.vert", stage(&[gl::WORLD_COMMON, &table, gl::PARTS, gl::MESH_VERT])),
             ("world_mesh.frag", stage(&[gl::WORLD_COMMON, gl::MESH_FRAG_COMMON, gl::MESH_FRAG])),
             ("world_stepped.frag", stage(&[gl::WORLD_COMMON, gl::MESH_FRAG_COMMON, gl::MESH_FRAG_STEPPED])),
             ("world_line.vert", stage(&[gl::WORLD_COMMON, gl::LINE_VERT])),
             ("world_line.frag", stage(&[gl::WORLD_COMMON, gl::LINE_FRAG])),
             ("world_backdrop.vert", stage(&[gl::BACKDROP_VERT])),
             ("world_backdrop.frag", stage(&[gl::BACKDROP_FRAG])),
-            ("world_shadow.vert", stage(&[gl::WORLD_COMMON, gl::SHADOW_VERT])),
+            ("world_shadow.vert", stage(&[gl::WORLD_COMMON, gl::PARTS, gl::SHADOW_VERT])),
         ]
     }
 
@@ -118,6 +123,10 @@ mod generator {
             assert!(text.contains(GL_MATERIAL_ROW), "the GL family's material table moved");
             text = text.replace(GL_MATERIAL_ROW, VK_MATERIAL_ROW);
         }
+        if text.contains("uvec4 part_row(") {
+            assert!(text.contains(GL_PART_ROW), "the GL family's part table moved");
+            text = text.replace(GL_PART_ROW, VK_PART_ROW);
+        }
         let text = text.replace("gl_VertexID", "gl_VertexIndex");
         let mut out = String::from(GENERATED);
         let (mut inputs, mut outputs) = (0, 0);
@@ -133,6 +142,7 @@ mod generator {
                 "uniform sampler2D u_surface;" => "layout(set = 1, binding = 0) uniform sampler2D u_surface;",
                 "uniform highp sampler2DShadow u_shadow;" => "layout(set = 2, binding = 0) uniform sampler2DShadow u_shadow;",
                 "uniform sampler2D u_floor;" => "layout(set = 3, binding = 0) uniform sampler2D u_floor;",
+                "uniform highp usampler2D u_parts;" => PARTS,
                 _ => "",
             };
             if !rewritten.is_empty() {
@@ -165,7 +175,7 @@ const FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR: u32 = 0x1000;
 const FORMAT_R32G32B32_SFLOAT: u32 = 106;
 const FORMAT_R16G16_SINT: u32 = 82;
 const FORMAT_R8G8B8A8_UINT: u32 = 41;
-const FORMAT_R8G8_UINT: u32 = 20;
+const FORMAT_R32G32B32A32_UINT: u32 = 107;
 const FORMAT_R32G32B32_UINT: u32 = 104;
 const FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT: u32 = 0x200;
 const IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT: u32 = 0x20;
@@ -573,8 +583,9 @@ impl VkWorld {
             let instances = (materials + (frame.materials.len() * 64).max(64)).next_multiple_of(BLOCK_ALIGN);
             let casters = (instances + (frame.instances.len() * instance_offset::SIZE).max(instance_offset::SIZE)).next_multiple_of(BLOCK_ALIGN);
             let rows = casters_of(job, held.map(|(shadow, _)| shadow)).map_or(0, |shadow| shadow.instances.len() * SHADOW_INSTANCE_STRIDE);
-            cursor = (casters + rows.max(SHADOW_INSTANCE_STRIDE)).next_multiple_of(BLOCK_ALIGN);
-            places.push((uniforms, materials, instances, casters));
+            let parts = (casters + rows.max(SHADOW_INSTANCE_STRIDE)).next_multiple_of(BLOCK_ALIGN);
+            cursor = (parts + (frame.parts.len() * 4).max(4)).next_multiple_of(BLOCK_ALIGN);
+            places.push((uniforms, materials, instances, casters, parts));
         }
         if !unsafe { world.ensure_slot(stack, slot, cursor, jobs.len() as u32) } {
             return false;
@@ -582,7 +593,7 @@ impl VkWorld {
         let fns = &stack.fns;
         unsafe {
             (fns.reset_descriptor_pool)(stack.device, slot.pool, 0);
-            for ((job, &(uniforms, materials, instances, casters)), held) in jobs.iter().zip(&places).zip(&held) {
+            for ((job, &(uniforms, materials, instances, casters, parts)), held) in jobs.iter().zip(&places).zip(&held) {
                 let Some(target) = targets.get(&job.target) else { continue };
                 let frame = &job.frame;
                 let draw = casters_of(job, held.map(|(shadow, _)| shadow));
@@ -591,11 +602,16 @@ impl VkWorld {
                     (materials, material_bytes(&frame.materials)),
                     (instances, instance_bytes(&frame.instances)),
                     (casters, draw.map_or(Vec::new(), |shadow| shadow_instance_bytes(&shadow.instances))),
+                    // one part at least: the stage's buffer is never left empty
+                    (parts, if frame.parts.is_empty() { vec![255; 4] } else { part_bytes(&frame.parts) }),
                 ];
                 for (offset, bytes) in &blocks {
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot.map.add(*offset), bytes.len());
                 }
-                let Some(set) = world.frame_set(stack, slot, uniforms, materials, (frame.materials.len() * 64).max(64)) else { continue };
+                let Some(set) = world.frame_set(stack, slot, uniforms, materials, (frame.materials.len() * 64).max(64), parts, (frame.parts.len() * 4).max(4))
+                else {
+                    continue;
+                };
                 let shadow = JobShadow {
                     set: held.map_or(world.lit.set, |(_, map)| map.set),
                     draw: held.and_then(|(_, map)| draw.map(|shadow| (map, shadow, casters as u64))),
@@ -770,6 +786,13 @@ impl WorldStack {
                     descriptor_type: DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     count: 1,
                     stages: SHADER_STAGE_FRAGMENT,
+                    immutable_samplers: std::ptr::null(),
+                },
+                DescriptorSetLayoutBinding {
+                    binding: 2,
+                    descriptor_type: DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    count: 1,
+                    stages: SHADER_STAGE_VERTEX,
                     immutable_samplers: std::ptr::null(),
                 },
             ])?;
@@ -1025,7 +1048,7 @@ impl WorldStack {
                 let sets = jobs.next_power_of_two().max(8);
                 let sizes = [
                     DescriptorPoolSize { descriptor_type: DESCRIPTOR_TYPE_UNIFORM_BUFFER, count: sets },
-                    DescriptorPoolSize { descriptor_type: DESCRIPTOR_TYPE_STORAGE_BUFFER, count: sets },
+                    DescriptorPoolSize { descriptor_type: DESCRIPTOR_TYPE_STORAGE_BUFFER, count: sets * 2 },
                 ];
                 let info = DescriptorPoolCreateInfo {
                     s_type: ST_DESCRIPTOR_POOL_CREATE,
@@ -1045,7 +1068,17 @@ impl WorldStack {
     }
 
     /// A set over one job's frame block and material table.
-    unsafe fn frame_set(&self, stack: &VkStack, slot: &WorldSlot, uniforms: usize, materials: usize, material_bytes: usize) -> Option<DescriptorSet> {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn frame_set(
+        &self,
+        stack: &VkStack,
+        slot: &WorldSlot,
+        uniforms: usize,
+        materials: usize,
+        material_bytes: usize,
+        parts: usize,
+        part_bytes: usize,
+    ) -> Option<DescriptorSet> {
         let fns = &stack.fns;
         unsafe {
             let allocate = DescriptorSetAllocateInfo {
@@ -1061,6 +1094,7 @@ impl WorldStack {
             }
             let block = DescriptorBufferInfo { buffer: slot.buffer, offset: uniforms as u64, range: frame_offset::SIZE as u64 };
             let table = DescriptorBufferInfo { buffer: slot.buffer, offset: materials as u64, range: material_bytes as u64 };
+            let part_table = DescriptorBufferInfo { buffer: slot.buffer, offset: parts as u64, range: part_bytes as u64 };
             let writes = [
                 WriteDescriptorSet {
                     s_type: ST_WRITE_DESCRIPTOR_SET,
@@ -1086,8 +1120,20 @@ impl WorldStack {
                     buffer_info: (&table as *const DescriptorBufferInfo).cast(),
                     texel_view: std::ptr::null(),
                 },
+                WriteDescriptorSet {
+                    s_type: ST_WRITE_DESCRIPTOR_SET,
+                    p_next: std::ptr::null(),
+                    set,
+                    binding: 2,
+                    array_element: 0,
+                    count: 1,
+                    descriptor_type: DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    image_info: std::ptr::null(),
+                    buffer_info: (&part_table as *const DescriptorBufferInfo).cast(),
+                    texel_view: std::ptr::null(),
+                },
             ];
-            (fns.update_descriptor_sets)(stack.device, 2, writes.as_ptr(), 0, std::ptr::null());
+            (fns.update_descriptor_sets)(stack.device, 3, writes.as_ptr(), 0, std::ptr::null());
             Some(set)
         }
     }
@@ -1151,7 +1197,8 @@ impl WorldStack {
                 attribute(1, 0, FORMAT_R16G16_SINT, offset::NORMAL),
                 attribute(2, 0, FORMAT_R32G32_SFLOAT, offset::UV),
                 attribute(3, 0, FORMAT_R8G8B8A8_UINT, offset::COLOR),
-                attribute(4, 0, FORMAT_R8G8_UINT, offset::MATERIAL),
+                // material, occlusion, and the part's two bytes
+                attribute(4, 0, FORMAT_R8G8B8A8_UINT, offset::MATERIAL),
                 attribute(5, 1, FORMAT_R32G32B32A32_SFLOAT, 0),
                 attribute(6, 1, FORMAT_R32G32B32A32_SFLOAT, 16),
                 attribute(7, 1, FORMAT_R32G32B32A32_SFLOAT, 32),
@@ -1160,6 +1207,7 @@ impl WorldStack {
                 attribute(10, 1, FORMAT_R32G32B32A32_SFLOAT, 80),
                 attribute(11, 1, FORMAT_R8G8B8A8_UINT, instance_offset::TINT),
                 attribute(12, 1, FORMAT_R32G32B32_UINT, instance_offset::MATERIAL_BASE),
+                attribute(13, 1, FORMAT_R32G32B32A32_UINT, instance_offset::AMBIENT),
             ]
         };
         let line_bindings = [VertexInputBinding { binding: 0, stride: SEGMENT_STRIDE as u32, input_rate: VERTEX_INPUT_RATE_INSTANCE }];
@@ -1764,6 +1812,9 @@ unsafe fn caster_pipeline(stack: &VkStack, layout: PipelineLayout, pass: RenderP
         VertexInputAttribute { location: 5, binding: 1, format: FORMAT_R32G32B32A32_SFLOAT, offset: 0 },
         VertexInputAttribute { location: 6, binding: 1, format: FORMAT_R32G32B32A32_SFLOAT, offset: 16 },
         VertexInputAttribute { location: 7, binding: 1, format: FORMAT_R32G32B32A32_SFLOAT, offset: 32 },
+        VertexInputAttribute { location: 4, binding: 0, format: FORMAT_R8G8B8A8_UINT, offset: bunny_ui::world::mesh::offset::MATERIAL as u32 },
+        // the part base, read as the first of the ids
+        VertexInputAttribute { location: 12, binding: 1, format: FORMAT_R32G32B32_UINT, offset: 48 },
     ];
     let vertex_input = PipelineVertexInput {
         s_type: ST_PIPELINE_VERTEX_INPUT,

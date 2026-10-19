@@ -87,7 +87,11 @@ Meshes are immutable and shared. `Mesh::revise(data)` keeps the
 identity and moves the generation: every entity that shows the mesh
 shows the new shape, and a tier uploads it once. `Model::merge` makes
 many pieces one model — one mesh, one draw — and each piece keeps its
-material and its part.
+material and its part. `entity.set_parts(states)` gives each part a
+tint of its own or hides it (and its shadow) with no new mesh: the
+states ride a table the vertex stage reads. `entity.set_ambient(color)`
+tints the light an entity takes from the sky and the ground — the
+ambient of the room it stands in.
 
 Shapes: `cuboid`, `plane`, `sphere`, `cylinder`, and `extrude` for a
 polygon with holes. `mesh.edges(degrees)` gives the lines a drawing
@@ -313,6 +317,6 @@ BUNNY_PARANOID=all cargo test -p bunny-ui-core --all-features
 cargo test -p bunny-ui-apple --features 3d
 cargo run -p bunny-ui-macos --features 3d --example world_window
 # in a page built with the web shell's `3d` feature, from the console:
-#   for (let n = 0; n < 12; n++) __bunny.bunny_gpu_world_parity(n)
+#   for (let n = 0; n < 13; n++) __bunny.bunny_gpu_world_parity(n)
 BUNNY_WORLD_GLB=chair.glb BUNNY_WORLD_DUMP=/tmp cargo test -p bunny-ui-core --features gltf --lib a_glb_from_the_environment -- --ignored
 ```

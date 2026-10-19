@@ -22,7 +22,7 @@ use super::mesh::{fold_normal, unfold_normal};
 use super::shade::{self, Surface, V3, decode, encode_code, quantize};
 use super::shadow::{self as sun_shadow, ShadowMap};
 use super::texture::{Texture, log2};
-use super::wire::{FrameUniforms, InstanceData, instance_flag, material_flag};
+use super::wire::{FrameUniforms, InstanceData, NO_PARTS, PartRow, instance_flag, material_flag};
 
 /// A picture of a world: premultiplied, sRGB-encoded RGBA8, top row
 /// first.
@@ -100,6 +100,10 @@ pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Textu
                         floor: floor.as_deref(),
                     };
                     for triangle in indices.as_chunks::<3>().0 {
+                        // a part that hides: its corners leave the picture
+                        if part_hidden(frame, instance.part_base, mesh.data(), triangle[0] as usize) {
+                            continue;
+                        }
                         let vertices = [0, 1, 2].map(|k| corners.vertex(triangle[k] as usize, instance, &projection));
                         job.triangle(&mut target, vertices);
                     }
@@ -229,8 +233,29 @@ impl<'a> Corners<'a> {
             color: [decode(color[0]), decode(color[1]), decode(color[2]), color[3] as f32 / 255.0],
             material: if data.materials.len() == count { data.materials[index] as u32 } else { 0 },
             occlusion: if data.occlusion.len() == count { data.occlusion[index] as f32 / 255.0 } else { 1.0 },
+            part: part_of(data, index) as u32,
         }
     }
+}
+
+/// The part a mesh's vertex belongs to.
+fn part_of(data: &super::mesh::MeshData, vertex: usize) -> usize {
+    if data.parts.len() == data.positions.len() { data.parts[vertex] as usize } else { 0 }
+}
+
+/// The state of `part` for an instance whose states start at
+/// `part_base`; `None` when it keeps its own look.
+fn part_row(frame: &WorldFrame, part_base: u32, part: usize) -> Option<PartRow> {
+    if part_base == NO_PARTS {
+        return None;
+    }
+    frame.parts.get(part_base as usize + part).copied()
+}
+
+/// Whether the part of a mesh's vertex hides, for an instance whose part
+/// states start at `part_base`.
+pub(super) fn part_hidden(frame: &WorldFrame, part_base: u32, data: &super::mesh::MeshData, vertex: usize) -> bool {
+    part_row(frame, part_base, part_of(data, vertex)).is_some_and(|row| row[3] == 0)
 }
 
 fn clip_of(m: &[f32; 16], p: [f32; 3]) -> [f32; 4] {
@@ -253,6 +278,8 @@ struct Vertex {
     /// The slot in the instance's materials (flat across a triangle).
     material: u32,
     occlusion: f32,
+    /// The part of the mesh (flat across a triangle).
+    part: u32,
 }
 
 fn lerp_vertex(a: &Vertex, b: &Vertex, t: f32) -> Vertex {
@@ -265,6 +292,7 @@ fn lerp_vertex(a: &Vertex, b: &Vertex, t: f32) -> Vertex {
         color: [0, 1, 2, 3].map(|k| l(a.color[k], b.color[k])),
         material: a.material,
         occlusion: l(a.occlusion, b.occlusion),
+        part: a.part,
     }
 }
 
@@ -477,13 +505,16 @@ impl Job<'_> {
         let material = &self.frame.materials[(self.instance.material_base + v[0].material) as usize];
         let flags = material.params[3] as u32;
         let tint = self.instance.tint;
+        // the instance's tint, and its part's over it
+        let part = part_row(self.frame, self.instance.part_base, v[0].part as usize).unwrap_or([255; 4]);
+        let tinted = [0, 1, 2].map(|k| decode(tint[k]) * decode(part[k]));
         let mut color = [0, 1, 2, 3].map(|k| v[0].color[k] * b[0] + v[1].color[k] * b[1] + v[2].color[k] * b[2]);
         if let Some(texel) = texel {
             color = [0, 1, 2, 3].map(|k| color[k] * texel[k]);
         }
         let two_sided = material.back[3] > 0.5;
         let surface = if front || !two_sided { material.base } else { [material.back[0], material.back[1], material.back[2], material.base[3]] };
-        let base = [0, 1, 2].map(|k| surface[k] * decode(tint[k]) * color[k]);
+        let base = [0, 1, 2].map(|k| surface[k] * tinted[k] * color[k]);
         let mut alpha = surface[3] * (tint[3] as f32 / 255.0) * color[3];
         if self.mask || flags & material_flag::MASK != 0 {
             if alpha < material.params[2] {
@@ -518,6 +549,7 @@ impl Job<'_> {
                     groups: 1 << ((self.instance.flags >> instance_flag::GROUP_SHIFT) & instance_flag::GROUP_MASK),
                     shadow,
                     floor,
+                    ambient: [decode(self.instance.ambient[0]), decode(self.instance.ambient[1]), decode(self.instance.ambient[2])],
                 },
             );
             let dither = if u.tone[2] > 0.5 { shade::bayer(x, y) } else { 0.0 };

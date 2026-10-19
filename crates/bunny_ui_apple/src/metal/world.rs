@@ -29,7 +29,7 @@ use bunny_ui::gpu::walk::FrameBatches;
 use bunny_ui::gpu::world::{WorldCaps, WorldGround, WorldJob};
 use bunny_ui::world::frame::{Background, Blend, DrawKind, WorldFrame};
 use bunny_ui::world::shade::SRGB_DECODE;
-use bunny_ui::world::wire::{instance_bytes, material_bytes, shadow_instance_bytes};
+use bunny_ui::world::wire::{instance_bytes, material_bytes, part_bytes, shadow_instance_bytes};
 
 use super::{
     LOAD_ACTION_CLEAR, MTLClearColor, MTLOrigin, MTLRegion, MTLSize, PIXEL_FORMAT_RGBA8, PIXEL_FORMAT_RGBA8_SRGB,
@@ -121,6 +121,9 @@ struct WorldInstance {
     uint material_base;
     uint entity;
     uint flags;
+    uchar4 ambient;
+    uint part_base;
+    uint reserved[2];
 };
 
 struct WorldMaterial {
@@ -286,7 +289,7 @@ static float4 floor_light(constant WorldUniforms& u, uint flags, texture2d<float
 
 static float3 lit(constant WorldUniforms& u, float3 position, float3 n, float3 base,
                   float roughness, float metallic, float3 emissive, float occlusion, uint groups, float shadow,
-                  float4 floor_map) {
+                  float4 floor_map, float3 ambient) {
     bool parallel = u.params.w > 0.5;
     float3 v = parallel ? float3(0.0, 0.0, 1.0) : safe_normalize(-position);
     float n_dot_v = clamp(dot(n, v), 1e-4, 1.0);
@@ -297,8 +300,8 @@ static float3 lit(constant WorldUniforms& u, float3 position, float3 n, float3 b
     float a = r * r;
     float a2 = r * r * r * r;
     float3 up = u.sky_up.xyz;
-    float3 sky = u.sky_color.xyz;
-    float3 ground = u.ground_color.xyz;
+    float3 sky = u.sky_color.xyz * ambient;
+    float3 ground = u.ground_color.xyz * ambient;
     float ao = (1.0 + (occlusion - 1.0) * 0.8) * floor_map.a;
 
     float3 light = diffuse * hemisphere(n, up, sky, ground) * ao;
@@ -383,6 +386,8 @@ struct WorldVary {
     float depth [[center_no_perspective]];
     uint material [[flat]];
     uint instance [[flat]];
+    // the tint of the vertex's part over the instance's (linear)
+    float3 part_tint [[flat]];
 };
 
 vertex WorldVary world_vertex(uint vid [[vertex_id]],
@@ -390,10 +395,22 @@ vertex WorldVary world_vertex(uint vid [[vertex_id]],
                               device const WorldVertex* vertices [[buffer(0)]],
                               device const WorldInstance* instances [[buffer(1)]],
                               constant WorldUniforms& u [[buffer(2)]],
-                              constant WorldDraw& draw [[buffer(3)]]) {
+                              constant WorldDraw& draw [[buffer(3)]],
+                              device const uchar4* parts [[buffer(5)]]) {
     WorldVertex v = vertices[vid];
     uint index = draw.first_instance + iid;
     WorldInstance instance = instances[index];
+    float3 part_tint = float3(1.0);
+    // a part that hides leaves the clip volume with every corner
+    if (instance.part_base != 0xFFFFFFFFu) {
+        uchar4 part = parts[instance.part_base + v.part];
+        if (part.a == 0) {
+            WorldVary gone;
+            gone.position = float4(0.0, 0.0, 2.0, 1.0);
+            return gone;
+        }
+        part_tint = float3(SRGB_DECODE[part.r], SRGB_DECODE[part.g], SRGB_DECODE[part.b]);
+    }
     float3 eye = to_eye(instance, float3(v.position));
     float3 n = unfold_normal(v.normal);
     WorldVary out;
@@ -406,6 +423,7 @@ vertex WorldVary world_vertex(uint vid [[vertex_id]],
     out.occlusion = float(v.occlusion) / 255.0;
     out.material = v.material;
     out.instance = index;
+    out.part_tint = part_tint;
     return out;
 }
 
@@ -428,7 +446,7 @@ static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* 
     }
     bool two_sided = material.back.w > 0.5;
     float4 surface = (front || !two_sided) ? material.base : float4(material.back.xyz, material.base.w);
-    float3 tint = float3(SRGB_DECODE[instance.tint.r], SRGB_DECODE[instance.tint.g], SRGB_DECODE[instance.tint.b]);
+    float3 tint = float3(SRGB_DECODE[instance.tint.r], SRGB_DECODE[instance.tint.g], SRGB_DECODE[instance.tint.b]) * in.part_tint;
     float3 base = surface.rgb * tint * color.rgb;
     float alpha = surface.a * (float(instance.tint.a) / 255.0) * color.a;
     if ((draw.flags & DRAW_MASK) != 0 || (flags & MATERIAL_MASK) != 0) {
@@ -452,7 +470,8 @@ static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* 
         float3 light = lit(u, in.eye, normal, base, material.params.x, material.params.y,
                            material.emissive.xyz, in.occlusion, 1u << ((instance.flags >> 8) & 31u),
                            sun_visibility(u, shadow_map, compare, in.eye, normal),
-                           floor_light(u, instance.flags, floor_map, wrap, in.eye));
+                           floor_light(u, instance.flags, floor_map, wrap, in.eye),
+                           float3(SRGB_DECODE[instance.ambient.r], SRGB_DECODE[instance.ambient.g], SRGB_DECODE[instance.ambient.b]));
         if (u.tone.z > 0.5) {
             dither = bayer(uint(in.position.x), uint(in.position.y));
         }
@@ -507,6 +526,8 @@ fragment SteppedBack world_fragment_stepped(WorldVary in [[stage_in]],
 
 struct ShadowCaster {
     float4 rows[3];
+    uint part_base;
+    uint pad[3];
 };
 
 struct ShadowVary {
@@ -519,9 +540,14 @@ vertex ShadowVary shadow_vertex(uint vid [[vertex_id]],
                                 uint iid [[instance_id]],
                                 device const WorldVertex* vertices [[buffer(0)]],
                                 device const ShadowCaster* casters [[buffer(1)]],
-                                constant WorldDraw& draw [[buffer(3)]]) {
+                                constant WorldDraw& draw [[buffer(3)]],
+                                device const uchar4* parts [[buffer(5)]]) {
     float3 p = float3(vertices[vid].position);
     ShadowCaster caster = casters[draw.first_instance + iid];
+    // a part that hides casts nothing
+    if (caster.part_base != 0xFFFFFFFFu && parts[caster.part_base + vertices[vid].part].a == 0) {
+        return ShadowVary{float4(0.0, 0.0, 2.0, 1.0)};
+    }
     float4 r0 = caster.rows[0];
     float4 r1 = caster.rows[1];
     float4 r2 = caster.rows[2];
@@ -875,11 +901,11 @@ impl MetalWorld {
     /// need, built: what the encode reads, with nothing left to borrow.
     /// `staged` holds where each job's instances and materials lie in the
     /// slot's staging buffer.
-    pub(super) fn prepare(&mut self, batches: &FrameBatches, staged: &[(u64, u64, u64)]) -> FramePass {
+    pub(super) fn prepare(&mut self, batches: &FrameBatches, staged: &[(u64, u64, u64, u64)]) -> FramePass {
         let Built::Ready(stack) = &mut self.built else { return FramePass::default() };
         let composite = stack.composite;
         let mut jobs = Vec::with_capacity(batches.worlds.len());
-        for (job, &(instances, materials, casters)) in batches.worlds.iter().zip(staged) {
+        for (job, &(instances, materials, casters, parts)) in batches.worlds.iter().zip(staged) {
             let Some(target) = self.targets.get(&job.target) else { continue };
             let samples = target.samples;
             // the box's map, and its casters when it does not hold them
@@ -1015,6 +1041,7 @@ impl MetalWorld {
                 uniforms: job.frame.uniforms.to_bytes(),
                 instances,
                 materials,
+                parts,
                 draws,
                 sampler: stack.sampler,
                 shadow,
@@ -1506,6 +1533,7 @@ struct PreparedJob {
     /// Offsets in the slot's staging buffer.
     instances: u64,
     materials: u64,
+    parts: u64,
     draws: Vec<PreparedDraw>,
     sampler: Id,
     /// The casters to draw into the box's map first, when it does not
@@ -1619,6 +1647,7 @@ impl FramePass {
                     msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, job.instances, 1);
                     msg_void_id_u64_u64(encoder, sels.set_fragment_buffer, staging, job.instances, 1);
                     msg_void_id_u64_u64(encoder, sels.set_fragment_buffer, staging, job.materials, 0);
+                    msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, job.parts, 5);
                 }
                 msg_void_id_u64(encoder, world.set_fragment_sampler, job.sampler, 0);
                 msg_void_id_u64(encoder, sels.set_fragment_texture, job.shadow_map, 1);
@@ -1684,6 +1713,7 @@ unsafe fn encode_casters(command: Id, sels: &Sels, world: &Selectors, pass_class
         msg_void_u64(encoder, world.set_cull_mode, CULL_NONE);
         if !staging.is_null() {
             msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, shadow.casters, 1);
+            msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, staging, job.parts, 5);
         }
         for draw in &shadow.draws {
             msg_void_id_u64_u64(encoder, sels.set_vertex_buffer, draw.vertices, 0, 0);
@@ -1703,14 +1733,19 @@ unsafe fn encode_casters(command: Id, sels: &Sels, world: &Selectors, pass_class
     }
 }
 
-/// The bytes each job stages: its instances, its materials, and the rows
-/// of its shadow's casters when the box's map must be drawn.
-pub(super) fn staged_bytes(job: &WorldJob) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+/// The bytes each job stages: its instances, its materials, the rows of
+/// its shadow's casters when the box's map must be drawn, and its part
+/// table (one part at least: the stage's buffer is never left unbound).
+pub(super) fn staged_bytes(job: &WorldJob) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
     let casters = match (job.shadow, &job.frame.shadow) {
         (Some(held), Some(shadow)) if held.draw => shadow_instance_bytes(&shadow.instances),
         _ => Vec::new(),
     };
-    (instance_bytes(&job.frame.instances), material_bytes(&job.frame.materials), casters)
+    let mut parts = part_bytes(&job.frame.parts);
+    if parts.is_empty() {
+        parts = vec![255; 4];
+    }
+    (instance_bytes(&job.frame.instances), material_bytes(&job.frame.materials), casters, parts)
 }
 
 /// A frame of its own, for the harness: what the parity tests compare

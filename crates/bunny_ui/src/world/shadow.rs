@@ -127,13 +127,17 @@ impl ShadowMap {
             let Some(mesh) = frame.meshes.get(draw.mesh as usize) else { continue };
             let data = mesh.data();
             let Some(indices) = data.indices.get(draw.first_index as usize..(draw.first_index + draw.index_count) as usize) else { continue };
-            for rows in shadow.instances.iter().skip(draw.first_instance as usize).take(draw.instance_count as usize) {
+            for caster in shadow.instances.iter().skip(draw.first_instance as usize).take(draw.instance_count as usize) {
+                let rows = &caster.rows;
                 let place = |p: &[f32; 3]| {
                     let row = |r: [f32; 4]| r[0] * p[0] + r[1] * p[1] + r[2] * p[2] + r[3];
                     [row(rows[0]), row(rows[1]), row(rows[2])]
                 };
                 let corners: Vec<[f32; 3]> = data.positions.iter().map(place).collect();
                 for triangle in indices.as_chunks::<3>().0 {
+                    if super::soft::part_hidden(frame, caster.part_base, data, triangle[0] as usize) {
+                        continue;
+                    }
                     map.fill(triangle.map(|index| corners[index as usize]));
                 }
             }

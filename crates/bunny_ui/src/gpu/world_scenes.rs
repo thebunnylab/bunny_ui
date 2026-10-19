@@ -11,13 +11,14 @@ use crate::image_engine::ImageSource;
 use crate::layout::Color;
 use crate::world::camera::Camera;
 use crate::world::frame::{Background, Quality, WorldFrame, WorldStyle};
-use crate::world::material::{FloorMap, Light, LineDepth, LineStyle, Material};
+use crate::world::material::{FloorMap, Light, LineDepth, LineStyle, Material, Model, PartState};
+use crate::world::math::Mat4;
 use crate::world::math::{Vec3, vec2, vec3};
 use crate::world::mesh::{Mesh, MeshData};
 use crate::world::store::World;
 
 /// How many worlds the catalog holds.
-pub const COUNT: u32 = 12;
+pub const COUNT: u32 = 13;
 
 /// What a tier's picture may differ from the CPU's by: the share of
 /// pixels whose worst channel is more than three codes apart, and more
@@ -201,6 +202,28 @@ pub fn world_scene(index: u32) -> WorldScene {
             tolerance: PENUMBRA,
             pictures: Vec::new(),
         },
+        12 => {
+            // three boxes merged into one mesh: the middle one hides (and
+            // casts nothing), the last takes a tint; a ball beside them
+            // stands in a blue room's ambient
+            let world = World::new();
+            world.add(Mesh::plane(6.0, 6.0), Material::color(Color::rgb(214, 210, 202))).set_position(vec3(0.0, -0.5, 0.0));
+            let piece = Model::single(Mesh::cuboid(0.7, 1.0, 0.7), Material::color(Color::rgb(222, 120, 60)));
+            let merged = Model::merge((0..3u16).map(|part| (piece.clone(), Mat4::translation(vec3(part as f64 * 1.0 - 1.0, 0.0, 0.0)), part)));
+            let row = world.add_model(merged);
+            row.set_parts(Some(std::rc::Rc::from(vec![PartState::default(), PartState::hidden(), PartState::tinted(Color::rgb(120, 200, 255))])));
+            world
+                .add(Mesh::sphere(0.4), Material::color(Color::rgb(236, 232, 224)))
+                .set_position(vec3(0.0, -0.1, 1.1))
+                .set_ambient(Color::rgb(90, 140, 255));
+            world.add_light(Light::sun().toward(vec3(0.6, -1.0, -0.5)).with_shadows());
+            WorldScene {
+                frame: frame(&world, &Camera::orbiting(Vec3::ZERO, 15.0, 30.0, 5.0), Quality::Low, (200, 140)),
+                name: "parts that hide and tint",
+                tolerance: PENUMBRA,
+                pictures: Vec::new(),
+            }
+        }
         11 => {
             let world = World::new();
             let map = floor_map(32, 6.0);

@@ -48,6 +48,7 @@ pub mod gl {
     pub const TEXTURE1: u32 = 0x84C1;
     pub const TEXTURE2: u32 = 0x84C2;
     pub const TEXTURE3: u32 = 0x84C3;
+    pub const TEXTURE4: u32 = 0x84C4;
     pub const TEXTURE_MIN_FILTER: u32 = 0x2801;
     pub const TEXTURE_MAG_FILTER: u32 = 0x2800;
     pub const TEXTURE_WRAP_S: u32 = 0x2802;
@@ -65,6 +66,8 @@ pub mod gl {
     pub const RGBA8: u32 = 0x8058;
     pub const SRGB8_ALPHA8: u32 = 0x8C43;
     pub const RGBA32F: u32 = 0x8814;
+    pub const RGBA8UI: u32 = 0x8D7C;
+    pub const RGBA_INTEGER: u32 = 0x8D99;
     pub const DEPTH_COMPONENT32F: u32 = 0x8CAC;
     pub const DEPTH_COMPONENT16: u32 = 0x81A5;
     pub const DEPTH_COMPONENT: u32 = 0x1902;
@@ -175,10 +178,13 @@ pub trait GlFamily {
 pub const WORLD_BINDING: u32 = 2;
 
 /// The mesh program's attributes, in index order.
-const MESH_ATTRIBUTES: [&str; 13] = [
+const MESH_ATTRIBUTES: [&str; 14] = [
     "a_position", "a_normal", "a_uv", "a_color", "a_ids", "i_row0", "i_row1", "i_row2", "i_normal0", "i_normal1", "i_normal2", "i_tint",
-    "i_ids",
+    "i_ids", "i_more",
 ];
+
+/// How many attributes an instance carries.
+const INSTANCE_ATTRIBUTES: u32 = 9;
 
 /// The first index of the instance attributes.
 const INSTANCE_ATTRIBUTE: u32 = 5;
@@ -207,6 +213,8 @@ struct Programs {
     /// The casters' rows.
     casters: u32,
     materials: u32,
+    /// The frame's part table: four unsigned bytes a part.
+    parts: u32,
     blank: u32,
     /// A map of one texel whose comparison always passes: a frame without
     /// a map reads full sun.
@@ -330,7 +338,7 @@ impl<G: GlFamily> GlWorld<G> {
         let prelude = gl.prelude();
         let table = source::srgb_table();
         let world = [("World", WORLD_BINDING)];
-        let mesh_vertex = format!("{prelude}{}{table}{}", source::WORLD_COMMON, source::MESH_VERT);
+        let mesh_vertex = format!("{prelude}{}{table}{}{}", source::WORLD_COMMON, source::PARTS, source::MESH_VERT);
         let mesh_fragment = |body: &str| format!("{prelude}{}{}{body}", source::WORLD_COMMON, source::MESH_FRAG_COMMON);
         let mesh = gl.program(&mesh_vertex, &mesh_fragment(source::MESH_FRAG), &MESH_ATTRIBUTES, &world)?;
         let stepped = gl.program(&mesh_vertex, &mesh_fragment(source::MESH_FRAG_STEPPED), &MESH_ATTRIBUTES, &world)?;
@@ -342,7 +350,7 @@ impl<G: GlFamily> GlWorld<G> {
         )?;
         let backdrop = gl.program(&format!("{prelude}{}", source::BACKDROP_VERT), &format!("{prelude}{}", source::BACKDROP_FRAG), &[], &[])?;
         let shadow = gl.program(
-            &format!("{prelude}{}{}", source::WORLD_COMMON, source::SHADOW_VERT),
+            &format!("{prelude}{}{}{}", source::WORLD_COMMON, source::PARTS, source::SHADOW_VERT),
             &format!("{prelude}{}", source::SHADOW_FRAG),
             &MESH_ATTRIBUTES,
             &world,
@@ -360,7 +368,7 @@ impl<G: GlFamily> GlWorld<G> {
             located.rows = gl.uniform_location(handle, "u_rows");
             located.style = gl.uniform_location(handle, "u_style");
             located.ramp = gl.uniform_location(handle, "u_ramp");
-            for (name, unit) in [("u_materials", 0), ("u_surface", 1), ("u_shadow", 2), ("u_floor", 3), ("atlas", 0)] {
+            for (name, unit) in [("u_materials", 0), ("u_surface", 1), ("u_shadow", 2), ("u_floor", 3), ("u_parts", 4), ("atlas", 0)] {
                 let at = gl.uniform_location(handle, name);
                 if at != 0 {
                     gl.uniform1i(at, unit);
@@ -373,6 +381,7 @@ impl<G: GlFamily> GlWorld<G> {
         let lines = program(gl, lines);
         let backdrop = program(gl, backdrop);
         let composite = program(gl, composite).handle;
+        let shadow = program(gl, shadow).handle;
         gl.use_program(0);
         let blank = gl.create_texture();
         gl.active_texture(gl::TEXTURE0);
@@ -382,6 +391,10 @@ impl<G: GlFamily> GlWorld<G> {
         gl.tex_parameteri(gl::TEXTURE_MAG_FILTER, gl::NEAREST);
         let materials = gl.create_texture();
         gl.bind_texture(materials);
+        gl.tex_parameteri(gl::TEXTURE_MIN_FILTER, gl::NEAREST);
+        gl.tex_parameteri(gl::TEXTURE_MAG_FILTER, gl::NEAREST);
+        let parts = gl.create_texture();
+        gl.bind_texture(parts);
         gl.tex_parameteri(gl::TEXTURE_MIN_FILTER, gl::NEAREST);
         gl.tex_parameteri(gl::TEXTURE_MAG_FILTER, gl::NEAREST);
         let dark = gl.create_texture();
@@ -406,6 +419,7 @@ impl<G: GlFamily> GlWorld<G> {
             instances: gl.create_buffer(),
             casters: gl.create_buffer(),
             materials,
+            parts,
             blank,
             lit,
             dark,
@@ -442,7 +456,7 @@ impl<G: GlFamily> GlWorld<G> {
         gl.enable(gl::BLEND);
         let [a, b, c, d] = self.blend_2d;
         gl.blend_func_separate(a, b, c, d);
-        for unit in [gl::TEXTURE3, gl::TEXTURE2, gl::TEXTURE1, gl::TEXTURE0] {
+        for unit in [gl::TEXTURE4, gl::TEXTURE3, gl::TEXTURE2, gl::TEXTURE1, gl::TEXTURE0] {
             gl.active_texture(unit);
             gl.bind_texture(0);
         }
@@ -485,6 +499,15 @@ impl<G: GlFamily> GlWorld<G> {
         gl.bind_buffer(gl::UNIFORM_BUFFER, programs.frame);
         gl.buffer_data(gl::UNIFORM_BUFFER, &frame.uniforms.to_bytes(), gl::STREAM_DRAW);
         gl.bind_buffer_base(gl::UNIFORM_BUFFER, WORLD_BINDING, programs.frame);
+        // the part table, which the casters read too: 1024 parts a row,
+        // and one row at least, so the unit always holds a texture
+        let count = frame.parts.len().max(1);
+        let (columns, rows) = (count.min(1024), count.div_ceil(1024));
+        let mut table = crate::world::wire::part_bytes(&frame.parts);
+        table.resize(columns * rows * 4, 255);
+        gl.active_texture(gl::TEXTURE4);
+        gl.bind_texture(programs.parts);
+        gl.tex_image_2d(0, gl::RGBA8UI, columns as i32, rows as i32, gl::RGBA_INTEGER, gl::UNSIGNED_BYTE, &table);
         // the sun's map first, when it does not hold this frame's casters
         let map = job.shadow.and_then(|shadow| self.shadow_maps.get(&shadow.map).copied().map(|map| (shadow, map)));
         if let (Some((shadow, map)), Some(casters)) = (map, frame.shadow.as_ref())
@@ -678,7 +701,9 @@ fn point_casters<G: GlFamily>(gl: &mut G, base: usize) {
         gl.vertex_attrib_pointer(INSTANCE_ATTRIBUTE + row, 4, gl::FLOAT, false, stride, base);
     }
     gl.vertex_attrib_i_pointer(INSTANCE_ATTRIBUTE + 6, 4, gl::UNSIGNED_BYTE, stride, base);
-    gl.vertex_attrib_i_pointer(INSTANCE_ATTRIBUTE + 7, 3, gl::UNSIGNED_INT, stride, base);
+    // the part base, read as the first of the casters' ids
+    gl.vertex_attrib_i_pointer(INSTANCE_ATTRIBUTE + 7, 3, gl::UNSIGNED_INT, stride, base + 48);
+    gl.vertex_attrib_i_pointer(INSTANCE_ATTRIBUTE + 8, 4, gl::UNSIGNED_INT, stride, base);
 }
 
 /// The instance attributes, at the draw's first instance: GL has no base
@@ -691,6 +716,7 @@ fn point_instances<G: GlFamily>(gl: &mut G, base: usize) {
     }
     gl.vertex_attrib_i_pointer(INSTANCE_ATTRIBUTE + 6, 4, gl::UNSIGNED_BYTE, stride, base + at::TINT);
     gl.vertex_attrib_i_pointer(INSTANCE_ATTRIBUTE + 7, 3, gl::UNSIGNED_INT, stride, base + at::MATERIAL_BASE);
+    gl.vertex_attrib_i_pointer(INSTANCE_ATTRIBUTE + 8, 4, gl::UNSIGNED_INT, stride, base + at::AMBIENT);
 }
 
 impl<G: GlFamily> WorldGround for GlWorld<G> {
@@ -760,15 +786,16 @@ impl<G: GlFamily> WorldGround for GlWorld<G> {
         gl.bind_buffer(gl::ARRAY_BUFFER, vertex_buffer);
         gl.buffer_data(gl::ARRAY_BUFFER, vertices, gl::STATIC_DRAW);
         let stride = VERTEX_STRIDE as i32;
-        for index in 0..INSTANCE_ATTRIBUTE + 8 {
+        for index in 0..INSTANCE_ATTRIBUTE + INSTANCE_ATTRIBUTES {
             gl.enable_vertex_attrib_array(index);
         }
         gl.vertex_attrib_pointer(0, 3, gl::FLOAT, false, stride, offset::POSITION);
         gl.vertex_attrib_i_pointer(1, 2, gl::SHORT, stride, offset::NORMAL);
         gl.vertex_attrib_pointer(2, 2, gl::FLOAT, false, stride, offset::UV);
         gl.vertex_attrib_i_pointer(3, 4, gl::UNSIGNED_BYTE, stride, offset::COLOR);
-        gl.vertex_attrib_i_pointer(4, 2, gl::UNSIGNED_BYTE, stride, offset::MATERIAL);
-        for index in INSTANCE_ATTRIBUTE..INSTANCE_ATTRIBUTE + 8 {
+        // material, occlusion, and the part's two bytes
+        gl.vertex_attrib_i_pointer(4, 4, gl::UNSIGNED_BYTE, stride, offset::MATERIAL);
+        for index in INSTANCE_ATTRIBUTE..INSTANCE_ATTRIBUTE + INSTANCE_ATTRIBUTES {
             gl.vertex_attrib_divisor(index, 1);
         }
         let index_buffer = gl.create_buffer();
@@ -1120,7 +1147,7 @@ mod tests {
         let draws: Vec<&String> = tape.calls.iter().filter(|call| call.starts_with("draw mesh")).collect();
         // the cube and the floor into the map, then the same two into the target
         assert_eq!(draws.len(), 4, "{draws:?}");
-        let data = tape.calls.iter().position(|call| *call == format!("data {:#x} 96", gl::ARRAY_BUFFER)).expect("two casters' rows");
+        let data = tape.calls.iter().position(|call| *call == format!("data {:#x} 128", gl::ARRAY_BUFFER)).expect("two casters' rows");
         let first_draw = tape.calls.iter().position(|call| call.starts_with("draw mesh")).unwrap();
         assert!(data < first_draw, "the rows go up before the casters draw");
         assert!(gl_world.shadow_maps.is_empty(), "the single frame gave its map back");

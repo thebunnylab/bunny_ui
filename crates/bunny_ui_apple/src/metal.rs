@@ -1767,9 +1767,9 @@ impl MetalGround {
     unsafe fn prepare_worlds(&mut self, batches: &FrameBatches) -> world::FramePass {
         let mut staged = Vec::with_capacity(batches.worlds.len());
         for job in &batches.worlds {
-            let (instances, materials, casters) = world::staged_bytes(job);
+            let (instances, materials, casters, parts) = world::staged_bytes(job);
             let mut place = |bytes: &[u8]| if bytes.is_empty() { 0 } else { unsafe { self.stage(bytes) } };
-            staged.push((place(&instances), place(&materials), place(&casters)));
+            staged.push((place(&instances), place(&materials), place(&casters), place(&parts)));
         }
         self.world.prepare(batches, &staged)
     }

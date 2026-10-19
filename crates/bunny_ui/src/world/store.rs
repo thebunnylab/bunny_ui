@@ -16,7 +16,7 @@ use std::rc::Rc;
 use motor::hash::FxHashMap as HashMap;
 use motor::state::State;
 
-use super::material::{FloorMap, Light, LineStyle, Material, Model};
+use super::material::{FloorMap, Light, LineStyle, Material, Model, PartState};
 use super::math::{Aabb, Mat4, Quat, Transform, Vec3};
 use super::mesh::{Lines, Mesh};
 use crate::layout::Color;
@@ -56,6 +56,13 @@ pub struct EntitySpec {
     pub light_group: u8,
     /// Multiplies the colour of every material of the entity.
     pub tint: Color,
+    /// Multiplies the light the entity takes from the sky and the ground:
+    /// the ambient of the room it stands in. White by default.
+    pub ambient: Color,
+    /// The state of each part of the entity's mesh, by part number: a
+    /// part takes a tint of its own, or hides, with no new mesh. A part
+    /// past the end keeps its own look.
+    pub parts: Option<Rc<[PartState]>>,
     /// A number the app chooses, given back with a pick.
     pub tag: u64,
     /// Raw JSON an asset brought with it, untouched.
@@ -79,6 +86,8 @@ impl EntitySpec {
             reads_floor_map: false,
             light_group: 0,
             tint: Color::WHITE,
+            ambient: Color::WHITE,
+            parts: None,
             tag: 0,
             extras: None,
         }
@@ -682,6 +691,17 @@ impl Entity {
 
     pub fn set_tint(self, tint: Color) -> Entity {
         self.change(|spec| spec.tint = tint)
+    }
+
+    /// Multiplies the light the entity takes from the sky and the ground.
+    pub fn set_ambient(self, ambient: Color) -> Entity {
+        self.change(|spec| spec.ambient = ambient)
+    }
+
+    /// The state of each part of the entity's mesh, by part number;
+    /// `None` gives every part its own look back.
+    pub fn set_parts(self, parts: Option<Rc<[PartState]>>) -> Entity {
+        self.change(|spec| spec.parts = parts)
     }
 
     pub fn set_tag(self, tag: u64) -> Entity {

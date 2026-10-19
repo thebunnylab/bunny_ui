@@ -324,6 +324,33 @@ impl PointLight {
     }
 }
 
+/// How one part of a mesh looks ([`super::mesh::MeshData::parts`]): a
+/// tint over its own colours, or not shown at all. A merged mesh keeps
+/// one upload and one draw while its pieces change.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PartState {
+    pub tint: Color,
+    pub shown: bool,
+}
+
+impl Default for PartState {
+    fn default() -> PartState {
+        PartState { tint: Color::WHITE, shown: true }
+    }
+}
+
+impl PartState {
+    /// The part, tinted.
+    pub fn tinted(tint: Color) -> PartState {
+        PartState { tint, shown: true }
+    }
+
+    /// The part, not shown.
+    pub fn hidden() -> PartState {
+        PartState { tint: Color::WHITE, shown: false }
+    }
+}
+
 /// The falloff of a blob shadow: white, its alpha `(1 − r²)²` from the
 /// centre to the rim. One picture for every blob, so they share a
 /// texture and a draw.
