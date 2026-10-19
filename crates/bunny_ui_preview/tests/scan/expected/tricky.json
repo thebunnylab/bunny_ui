@@ -1,0 +1,12 @@
+{
+  "previews": [
+    {"ident": "fine", "symbol": "bunny_preview__fine", "name": "Fine", "scope": "Status", "example": "fine", "file": "src/tricky.rs", "line": 23, "column": 1}
+  ],
+  "refused": [
+    {"file": "src/tricky.rs", "line": 10, "column": 1, "ident": "with_params", "reason": "parameters"},
+    {"file": "src/tricky.rs", "line": 14, "column": 1, "ident": null, "reason": "unknown_argument:label"},
+    {"file": "src/tricky.rs", "line": 19, "column": 1, "ident": null, "reason": "not_a_function"}
+  ],
+  "duplicates": [],
+  "unreadable": []
+}

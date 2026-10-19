@@ -1,0 +1,14 @@
+[
+  {
+    "file": "crates/bunny_ui_macos/src/accessibility.rs",
+    "baseline_formatting_blocks": 0,
+    "current_formatting_blocks": 0,
+    "new_unformatted_blocks": 0
+  },
+  {
+    "file": "crates/bunny_ui_macos/tests/accessibility_native.rs",
+    "baseline_formatting_blocks": 0,
+    "current_formatting_blocks": 0,
+    "new_unformatted_blocks": 0
+  }
+]

@@ -23,6 +23,41 @@ including when only modal state changed. Declining preserves normal key routing.
 `edit` defaults to native text editing; a policy can add grouped history or
 replacement semantics. `Read` and `Copy` should remain observational.
 
+## Independent native scenes
+
+Each named `Runtime::scene` retains the root controls published by its last
+render, including fields rendered directly without a `Component` wrapper.
+Another scene may render or receive input without removing those controls.
+Handlers and key contexts rebuild from the selected scene's retained entries
+and root registrations; input-only activation never queues render effects.
+
+A new render replaces only its own root registrations, including an empty
+replacement when a control unmounts. Closing or resetting a named scene releases
+its root input callbacks without removing a neighboring scene's controls.
+`tests/scene_input.rs` covers typing, selection, independent history, rerender,
+unmount and recreation through the public runtime API.
+
+## Ordinary field history
+
+A field without an editing strategy owns Undo/Redo through the standard keyboard
+accelerators and native Edit menu. History restores both text and selection,
+survives retained renders and unambiguous named moves, and stays local to its
+mounted field. Unmounting or an external binding revision discards the history;
+closure-backed bindings without revision identity detect changed text instead.
+Custom strategies continue to own their editing commands and history.
+
+Adjacent single-character typing and deletion coalesce. Selection, navigation,
+paste, replacement and focus changes separate groups. One IME composition is one
+group; Undo/Redo is unavailable while text is marked, and cancelling composition
+preserves the previous redo. Read and Copy never create an edit. Secret fields
+retain local history without exposing their contents through Copy or Cut.
+
+History keeps changed bytes and caret states, sharing the current text's lending
+cache. It retains at most 128 groups and a 1 MiB budget for replacements and patch
+overhead. Old groups are evicted whole; an oversized edit leaves no partial Undo.
+This contract covers the native/canvas runtime; browser flow DOM keeps its own
+editing behavior. `tests/field_history.rs` exercises the public runtime boundary.
+
 The runtime's `ExternalPaths` payload uses the same clipped `.on_drop` regions
 as internal drag operations. `external_drag` previews without committing;
 `external_drop` delivers only to the accepting target under the pointer;
@@ -117,3 +152,16 @@ Native CI retains compiler, OS/runner image and BLAKE3 hashes of machine font
 files beside its test logs. This inventories available font inputs; it does not
 assert that every file was selected by the shaper, and it copies no font binary.
 The recorder reuses the Unicode tooling's build-time `blake3==1.0.8` package.
+
+## Click modifiers without pointer capture
+
+`ViewExt::on_click_with_modifiers` receives `(click_count, Modifiers)` from the
+initiating press. It is the same retained click target as `on_click_count`: a
+cancelled press or lifted drag does not activate it, and `.on_drag` continues to
+use the normal drag lane. Releasing a modifier before the pointer does not change
+that press's meaning. Existing `on_click` and `on_click_count` callers keep their
+signatures. Programmatic activation carries `Modifiers::NONE`.
+
+Browser embeddings may forward their event modifiers through
+`Runtime::dom_action_with_modifiers`; the original `dom_action` remains the
+modifier-free compatibility entry point.

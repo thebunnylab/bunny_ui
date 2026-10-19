@@ -19,3 +19,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "bunny"
 path = "src/main.rs"
+
+# The one dependency: the wire a preview host speaks and the scan that
+# lists a crate's previews — in-house, std only, the same workspace and
+# the same version. `bunny preview` reads frames and lists previews
+# through it rather than carrying a second copy of a frozen codec.
+[dependencies]
+bunny-ui-preview = { workspace = true }

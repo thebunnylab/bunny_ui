@@ -14,6 +14,11 @@ autoexamples = false
 bunny-ui = { workspace = true, features = ["canvas", "gpu"] }
 bunny-ui-apple.workspace = true
 
+[features]
+# Worlds drawn by Metal itself (the world pass of `bunny-ui-apple`).
+# Without it a world still shows: the CPU draws it.
+3d = ["bunny-ui/3d", "bunny-ui-apple/3d"]
+
 [dev-dependencies]
 countries-core.workspace = true
 countries-pure.workspace = true
@@ -39,6 +44,11 @@ path = "examples/letter_window.rs"
 [[example]]
 name = "life_window_ios"
 path = "examples/life_window.rs"
+
+[[example]]
+name = "world_window_ios"
+path = "examples/world_window.rs"
+required-features = ["3d"]
 
 # Its API exists only on its own platform; docs.rs builds on Linux
 # by default and would publish an empty page.

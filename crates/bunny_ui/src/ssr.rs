@@ -455,7 +455,16 @@ impl Tree {
                     element.rule = Some(*rule);
                 }
             }
-            DomPatch::SetBox { id, width, height, max_width, max_height, slot_y } => {
+            DomPatch::SetBox {
+                id,
+                width,
+                height,
+                max_width,
+                max_height,
+                slot_y,
+                at,
+                span,
+            } => {
                 let Some(element) = self.elements.get_mut(id) else {
                     return;
                 };
@@ -486,6 +495,54 @@ impl Tree {
                             element.style.remove(name);
                         }
                     }
+                }
+                for name in [
+                    "margin-left",
+                    "margin-top",
+                    "align-self",
+                    "justify-self",
+                    "z-index",
+                    "grid-column",
+                    "grid-row",
+                    "bottom",
+                ] {
+                    element.style.remove(name);
+                }
+                if let Some(at) = at {
+                    if at.layered {
+                        element.style.insert("margin-left", px(at.x));
+                        element.style.insert("margin-top", px(at.y));
+                        element.style.insert(
+                            "align-self",
+                            if at.fill_y { "stretch" } else { "start" }.into(),
+                        );
+                        element.style.insert(
+                            "justify-self",
+                            if at.fill_x { "stretch" } else { "left" }.into(),
+                        );
+                    } else {
+                        element.style.insert("position", "absolute".into());
+                        element.style.insert("left", px(at.x));
+                        element.style.insert("top", px(at.y));
+                        element.style.insert("z-index", "1".into());
+                        if at.fill_x {
+                            element.style.insert("right", "0".into());
+                        }
+                        if at.fill_y {
+                            element.style.insert("bottom", "0".into());
+                        }
+                    }
+                }
+                if let Some(span) = span {
+                    if span.fill_x {
+                        element.style.insert("justify-self", "stretch".into());
+                    }
+                    element
+                        .style
+                        .insert("grid-column", format!("span {}", span.columns));
+                    element
+                        .style
+                        .insert("grid-row", format!("span {}", span.rows));
                 }
             }
             DomPatch::SetMarks { id, tooltip, group_owner } => {
@@ -742,7 +799,7 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
                 ("min-height", "0"),
             ],
         ),
-        CreateKind::Layers => (
+        CreateKind::Layers | CreateKind::Grid => (
             "div",
             &[
                 ("display", "grid"),
@@ -793,6 +850,16 @@ fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'sta
         // its box to the child, and only a flex line can hand the
         // offer down (width by the stretch default, height by the
         // fill flag)
+        CreateKind::Rectangle => (
+            "div",
+            &[("box-sizing", "border-box"), ("min-width", "0"), ("min-height", "0"),
+              ("background", "currentColor")],
+        ),
+        CreateKind::Ellipse => (
+            "div",
+            &[("box-sizing", "border-box"), ("min-width", "0"), ("min-height", "0"),
+              ("background", "currentColor"), ("border-radius", "50%")],
+        ),
         CreateKind::Group | CreateKind::Box => (
             "div",
             &[
@@ -835,12 +902,35 @@ fn rule_text(
         base.remove("display");
         base.remove("flex-direction");
     }
+    if layout.relative {
+        base.insert("position", "relative".into());
+        base.insert("isolation", "isolate".into());
+    }
     if let Some(gap) = layout.gap {
-        base.insert("gap", px(gap));
+        base.insert(
+            if matches!(kind, CreateKind::Grid) {
+                "column-gap"
+            } else {
+                "gap"
+            },
+            px(gap),
+        );
+    }
+    if let Some(columns) = layout.columns {
+        base.insert(
+            "grid-template-columns",
+            format!("repeat({columns},minmax(0,1fr))"),
+        );
+        base.insert("align-items", "center".into());
+        base.insert("align-content", "start".into());
     }
     if let Some(align) = layout.align {
         base.insert(
-            "align-items",
+            if matches!(kind, CreateKind::Grid) {
+                "justify-items"
+            } else {
+                "align-items"
+            },
             match align {
                 1 => "center",
                 2 => "flex-end",
@@ -852,10 +942,10 @@ fn rule_text(
     }
     // layers: the same alignment across the cell, so a centred stack
     // centres both ways
-    if matches!(kind, CreateKind::Layers) {
-        if let Some(align) = base.get("align-items").cloned() {
-            base.insert("justify-items", align);
-        }
+    if matches!(kind, CreateKind::Layers)
+        && let Some(align) = base.get("align-items").cloned()
+    {
+        base.insert("justify-items", align);
     }
     // the record's sides are logical, and so are the properties: a
     // right-to-left mount puts the leading inset on the right by itself
@@ -887,7 +977,9 @@ fn rule_text(
         base.insert("min-height", "0".into());
     }
     if let Some(line_gap) = layout.wrap {
-        base.insert("flex-wrap", "wrap".into());
+        if !matches!(kind, CreateKind::Grid) {
+            base.insert("flex-wrap", "wrap".into());
+        }
         base.insert("row-gap", px(line_gap));
     }
     let mut states: Vec<String> = Vec::new();
@@ -969,6 +1061,10 @@ fn rule_text(
     if style.clip {
         base.insert("overflow", "hidden".into());
     }
+    if style.hidden {
+        // the box keeps its place in the flow and shows nothing
+        base.insert("visibility", "hidden".into());
+    }
     if let Some(opacity) = style.opacity {
         base.insert("opacity", format!("{opacity}"));
     }
@@ -1009,7 +1105,7 @@ fn rule_text(
             // the shorthand leaves the spacing alone; the face's own
             // advance rides beside it
             if text.font.tracking != 0.0 {
-                base.insert("letter-spacing", format!("{}px", f64::from(text.font.tracking)));
+                base.insert("letter-spacing", format!("{}px", text.font.tracking));
             }
         }
         // after the font shorthand, which resets it — the served page
@@ -1257,6 +1353,8 @@ mod tests {
     #[test]
     fn the_page_and_the_glue_write_the_same_logical_properties() {
         let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        assert!(glue.contains("if (mask & 16777216) style.hidden = true;"), "the glue reads the hidden bit");
+        assert!(glue.contains("if (style.hidden) decl.visibility = \"hidden\";"), "and keeps the box's place with visibility");
         for name in ["padding-block", "padding-inline"] {
             assert!(glue.contains(&format!("decl[\"{name}\"]")), "the glue writes {name}");
         }
@@ -1286,6 +1384,26 @@ mod tests {
     /// The page paints from the string alone: markup with ids, inline
     /// styles at rest, pseudo rules aside — and twice over, the same
     /// bytes (the serializer is deterministic by construction).
+    #[derive(Clone)]
+    struct Unseen;
+
+    impl Component for Unseen {
+        fn body(self) -> impl View {
+            crate::vstack!(text("seen"), text("unseen").hidden(), text("after"))
+        }
+    }
+
+    /// `.hidden()` on the page: the box is in the markup, keeps its
+    /// place, and is unseen by visibility — never left out, or the text
+    /// after it would move up.
+    #[test]
+    fn a_hidden_box_keeps_its_place_unseen() {
+        let page = render(&Unseen, Size { width: 300.0, height: 200.0 });
+        assert!(page.css.contains("visibility:hidden"), "{}", page.css);
+        assert!(page.html.contains("unseen"), "the box is in the markup: {}", page.html);
+        assert!(!page.css.contains("display:none"), "{}", page.css);
+    }
+
     #[test]
     fn a_page_renders_to_stable_html() {
         let size = Size { width: 300.0, height: 200.0 };

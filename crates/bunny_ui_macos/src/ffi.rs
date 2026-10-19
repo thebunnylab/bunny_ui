@@ -134,6 +134,8 @@ unsafe extern "C" {
     fn msg_void_id_i64_id(obj: Id, sel: Sel, a: Id, b: i64, c: Id);
     #[link_name = "objc_msgSendSuper"]
     fn msg_super_bool_id(sup: *const ObjcSuper, sel: Sel, a: Id) -> i8;
+    #[link_name = "objc_msgSendSuper"]
+    fn msg_super_id_point(sup: *const ObjcSuper, sel: Sel, point: CGPoint) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_void_rect_bool(obj: Id, sel: Sel, rect: CGRect, flag: i8);
     #[link_name = "objc_msgSend"]
@@ -2765,7 +2767,7 @@ impl WindowHandle {
     /// empty window hides the view instead of unmounting it — a page
     /// keeps its state while it is scrolled off.
     ///
-    /// `make` runs once, when the key first appears, and returns the
+    /// `make` runs once, calls its placement continuation, and returns the
     /// tenant's view with ONE retain that [`WindowHandle::host_sweep`]
     /// releases. `update` runs when `stamp` changed — how a navigation
     /// lands without a re-mount.
@@ -2773,22 +2775,29 @@ impl WindowHandle {
         &self,
         key: &str,
         stamp: &str,
-        frame: (f64, f64, f64, f64),
-        window: (f64, f64, f64, f64),
-        view_height: f64,
-        make: impl FnOnce() -> Id,
+        geometry: HostGeometry,
+        make: impl FnOnce(&dyn Fn(Id)) -> Id,
         update: impl FnOnce(Id, &str),
     ) {
+        let HostGeometry {
+            frame,
+            window,
+            view_height,
+        } = geometry;
+        unsafe { register_host_class() };
         HOST_VIEWS.with(|hosts| {
             let mut hosts = hosts.borrow_mut();
             let slot = hosts.entry(key.to_string()).or_insert_with(|| unsafe {
-                let container = msg_id(class("NSView"), sel("alloc"));
+                let container = msg_id(class("BunnyHostView"), sel("alloc"));
                 let container = msg_init_rect(
                     container,
                     sel("initWithFrame:"),
                     CGRect {
                         origin: CGPoint { x: 0.0, y: 0.0 },
-                        size: CGSize { width: 0.0, height: 0.0 },
+                        size: CGSize {
+                            width: 0.0,
+                            height: 0.0,
+                        },
                     },
                 );
                 // the container is the CLIP: whatever the tenant
@@ -2809,40 +2818,23 @@ impl WindowHandle {
                 // sixty-a-second approximation we correct).
                 const SIZABLE: i64 = 2 | 16;
                 msg_void_i64(container, sel("setAutoresizingMask:"), SIZABLE);
-                let child = make();
-                msg_void_i64(child, sel("setAutoresizingMask:"), SIZABLE);
-                msg_void_id(container, sel("addSubview:"), child);
-                msg_void_id(self.view, sel("addSubview:"), container);
-                HostSlot { container, child, stamp: stamp.to_string() }
-            });
-            let (x, y, w, h) = frame;
-            let (vx, vy, vw, vh) = window;
-            unsafe {
-                if vw <= 0.0 || vh <= 0.0 {
-                    msg_void_bool(slot.container, sel("setHidden:"), 1);
-                } else {
-                    msg_void_bool(slot.container, sel("setHidden:"), 0);
-                    // the container lands on the visible cut, flipped
-                    // into AppKit's bottom-left world
-                    msg_void_rect(
-                        slot.container,
-                        sel("setFrame:"),
-                        CGRect {
-                            origin: CGPoint { x: x + vx, y: view_height - (y + vy) - vh },
-                            size: CGSize { width: vw, height: vh },
-                        },
-                    );
-                    // the tenant keeps the WHOLE box, container-local:
-                    // the cut shows through, the content never rewraps
-                    msg_void_rect(
-                        slot.child,
-                        sel("setFrame:"),
-                        CGRect {
-                            origin: CGPoint { x: -vx, y: vh + vy - h },
-                            size: CGSize { width: w, height: h },
-                        },
-                    );
+                let child = make(&|child| {
+                    msg_void_i64(child, sel("setAutoresizingMask:"), SIZABLE);
+                    msg_void_id(container, sel("addSubview:"), child);
+                    msg_void_id(self.view, sel("addSubview:"), container);
+                    position_host(container, child, frame, window, view_height);
+                });
+                HostSlot {
+                    owner: self.view,
+                    container,
+                    child,
+                    stamp: stamp.to_string(),
+                    scroll: bunny_ui::host::DocumentScroll::Document,
+                    wheel: crate::host_wheel::ParentWheel::default(),
                 }
+            });
+            unsafe {
+                position_host(slot.container, slot.child, frame, window, view_height);
                 if slot.stamp != stamp {
                     slot.stamp = stamp.to_string();
                     update(slot.child, stamp);
@@ -2859,11 +2851,12 @@ impl WindowHandle {
         HOST_VIEWS.with(|hosts| {
             let mut hosts = hosts.borrow_mut();
             hosts.retain(|key, slot| {
-                if alive.iter().any(|path| path == key) {
+                if slot.owner != self.view || alive.iter().any(|path| path == key) {
                     return true;
                 }
                 unsafe {
                     msg_void(slot.container, sel("removeFromSuperview"));
+                    crate::webview::retire(key, slot.child);
                     msg_void(slot.child, sel("release"));
                     msg_void(slot.container, sel("release"));
                 }
@@ -3143,13 +3136,163 @@ thread_local! {
     static HOST_VIEWS: RefCell<HashMap<String, HostSlot>> = RefCell::new(HashMap::new());
 }
 
+/// Initial host placement in layout points and the layout's viewport height.
+#[derive(Clone, Copy)]
+pub struct HostGeometry {
+    /// Complete tenant box: x, y, width, height.
+    pub frame: (f64, f64, f64, f64),
+    /// Visible cut within that box: x, y, width, height.
+    pub window: (f64, f64, f64, f64),
+    /// Height used to convert layout coordinates into AppKit coordinates.
+    pub view_height: f64,
+}
+
+/// Position a clipped host in AppKit coordinates, before initial content or resize.
+unsafe fn position_host(
+    container: Id,
+    child: Id,
+    frame: (f64, f64, f64, f64),
+    window: (f64, f64, f64, f64),
+    view_height: f64,
+) {
+    let (x, y, w, h) = frame;
+    let (vx, vy, vw, vh) = window;
+    unsafe {
+        if vw <= 0.0 || vh <= 0.0 {
+            msg_void_bool(container, sel("setHidden:"), 1);
+        } else {
+            msg_void_bool(container, sel("setHidden:"), 0);
+            // the container lands on the visible cut, flipped
+            // into AppKit's bottom-left world
+            msg_void_rect(
+                container,
+                sel("setFrame:"),
+                CGRect {
+                    origin: CGPoint {
+                        x: x + vx,
+                        y: view_height - (y + vy) - vh,
+                    },
+                    size: CGSize {
+                        width: vw,
+                        height: vh,
+                    },
+                },
+            );
+            // the tenant keeps the WHOLE box, container-local:
+            // the cut shows through, the content never rewraps
+            msg_void_rect(
+                child,
+                sel("setFrame:"),
+                CGRect {
+                    origin: CGPoint {
+                        x: -vx,
+                        y: vh + vy - h,
+                    },
+                    size: CGSize {
+                        width: w,
+                        height: h,
+                    },
+                },
+            );
+        }
+    }
+}
+
 /// One mounted native host: the clipping container (ours), the
 /// tenant's view inside it, and the stamp the tenant last applied — a
 /// changed spec re-instructs the view, it never re-mounts it.
 struct HostSlot {
+    owner: Id,
     container: Id,
     child: Id,
     stamp: String,
+    scroll: bunny_ui::host::DocumentScroll,
+    wheel: crate::host_wheel::ParentWheel,
+}
+
+/// Set the mounted document's input policy without changing its native identity.
+pub(crate) fn host_scroll_policy(key: &str, scroll: bunny_ui::host::DocumentScroll) {
+    HOST_VIEWS.with(|hosts| {
+        if let Some(slot) = hosts.borrow_mut().get_mut(key)
+            && slot.scroll != scroll
+        {
+            slot.scroll = scroll;
+            slot.wheel = crate::host_wheel::ParentWheel::default();
+        }
+    });
+}
+
+static REGISTER_HOST: Once = Once::new();
+
+/// Only wheel events hit the opted-in host proxy. Every other event follows
+/// NSView's ordinary hit test, retaining the engine's links and text selection.
+extern "C" fn bunny_host_hit(this: Id, _sel: Sel, point: CGPoint) -> Id {
+    unsafe {
+        let sup = ObjcSuper { receiver: this, class: class("NSView") };
+        let hit = msg_super_id_point(&sup, sel("hitTest:"), point);
+        if hit.is_null() {
+            return hit;
+        }
+        let application = msg_id(class("NSApplication"), sel("sharedApplication"));
+        let event = msg_id(application, sel("currentEvent"));
+        const SCROLL_WHEEL: u64 = 22;
+        if event.is_null() || msg_u64(event, sel("type")) != SCROLL_WHEEL {
+            return hit;
+        }
+        let parent = HOST_VIEWS.with(|hosts| {
+            // Placement may reenter hit testing while updating the table.
+            hosts.try_borrow().ok().is_some_and(|hosts| hosts.values().any(|slot| {
+                slot.container == this && slot.scroll == bunny_ui::host::DocumentScroll::ParentVertical
+            }))
+        });
+        if parent { this } else { hit }
+    }
+}
+
+/// Forward the original native event, retaining precise deltas, modifiers,
+/// momentum and phase. No DOM script or synthesized wheel enters this path.
+extern "C" fn bunny_host_wheel(this: Id, cmd: Sel, event: Id) {
+    unsafe {
+        use crate::host_wheel::Target;
+        let phase = msg_u64(event, sel("phase"));
+        let momentum = msg_u64(event, sel("momentumPhase"));
+        let step = match (phase, momentum) {
+            (_, 8 | 16) | (8 | 16, 0) => bunny_ui::custom::WheelPhase::Ended,
+            (1 | 32, 0) => bunny_ui::custom::WheelPhase::Began,
+            _ => bunny_ui::custom::WheelPhase::Changed,
+        };
+        let dx = msg_f64(event, sel("scrollingDeltaX"));
+        let dy = msg_f64(event, sel("scrollingDeltaY"));
+        let destination = HOST_VIEWS.with(|hosts| {
+            let mut hosts = hosts.try_borrow_mut().ok()?;
+            let slot = hosts.values_mut().find(|slot| slot.container == this)?;
+            let target = if slot.scroll == bunny_ui::host::DocumentScroll::ParentVertical {
+                slot.wheel.route(dx, dy, step, phase != 0 || momentum != 0)
+            } else {
+                Target::Document
+            };
+            Some((slot.child, target))
+        });
+        if let Some((child, target)) = destination {
+            if matches!(target, Target::Document | Target::Both) {
+                msg_void_id(child, cmd, event);
+            }
+            if matches!(target, Target::Parent | Target::Both) {
+                bunny_segment_forward(this, cmd, event);
+            }
+        } else {
+            bunny_segment_forward(this, cmd, event);
+        }
+    }
+}
+
+unsafe fn register_host_class() {
+    REGISTER_HOST.call_once(|| unsafe {
+        let host = objc_allocateClassPair(class("NSView"), c"BunnyHostView".as_ptr(), 0);
+        class_addMethod(host, sel("hitTest:"), bunny_host_hit as *const c_void, c"@@:{CGPoint=dd}".as_ptr());
+        class_addMethod(host, sel("scrollWheel:"), bunny_host_wheel as *const c_void, c"v@:@".as_ptr());
+        objc_registerClassPair(host);
+    });
 }
 
 /// The tenant's view mounted under `key`, if any — where a drained

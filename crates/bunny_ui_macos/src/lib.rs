@@ -12,9 +12,11 @@ use bunny_ui_apple::trace;
 pub mod dialog;
 pub mod drive;
 mod ffi;
+mod host_wheel;
 mod life;
 mod menu;
 mod metal;
+pub mod pictures;
 pub mod webview;
 
 use std::cell::{Cell, RefCell};
@@ -30,6 +32,7 @@ use bunny_ui::view::View;
 
 use ffi::AppEvent;
 pub use bunny_ui_apple::{CoreGraphicsImageEngine, CoreTextEngine};
+pub use bunny_ui_apple::webview::HtmlPreparation;
 pub use metal::OffscreenGpu;
 
 /// Points the shell's frame driver at the pace the runtime asks for:
@@ -1071,66 +1074,42 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             let placed =
                 runtime.last_viewport().map_or(height, |viewport| viewport.height);
             for host in &hosts {
-                let bunny_ui::host::HostSpec::Webview {
-                    url,
-                    document,
-                    scripts,
-                    console,
-                    requests,
-                    full_motion,
-                } = &host.spec
-                else {
+                let bunny_ui::host::HostSpec::Webview { document, .. } = &host.spec else {
                     // a video host is the web's: the box stays reserved
                     // and empty here, and the console says so once
                     bunny_ui::host::refuse_video_once();
                     continue;
                 };
                 // the stamp fingerprints the whole spec: a changed
-                // url, script set or declared hook re-instructs; the
-                // separators are control characters no url or script
-                // spells. `full_motion` rides for symmetry — this
-                // backend does not serve MediaEmulation (WKWebView
-                // offers no public override), but the stamp must not
-                // lie about what the spec says
-                let mut stamp = String::from(&**url);
-                // a document stamps by its fingerprint, never by its
-                // pages — the letter is the app's to hold, not the
-                // stamp's to copy every frame
-                if let Some(document) = document {
-                    stamp.push('\u{3}');
-                    stamp.push_str(&format!("{:016x}", document.digest));
-                }
-                stamp.push('\u{2}');
-                stamp.push(if *console { 'c' } else { '-' });
-                stamp.push(if *requests { 'r' } else { '-' });
-                stamp.push(if *full_motion { 'm' } else { '-' });
-                for script in scripts.iter() {
-                    stamp.push('\u{1}');
-                    stamp.push_str(script);
-                }
+                // url, script set or declared hook re-instructs
+                let stamp = webview::stamp(&host.spec);
                 window.host_place(
                     &host.path,
                     &stamp,
-                    (
-                        host.frame.origin.x,
-                        host.frame.origin.y,
-                        host.frame.size.width,
-                        host.frame.size.height,
-                    ),
-                    (
-                        host.visible.origin.x,
-                        host.visible.origin.y,
-                        host.visible.size.width,
-                        host.visible.size.height,
-                    ),
-                    placed,
-                    || webview::create(&host.path, &host.spec),
+                    ffi::HostGeometry {
+                        frame: (
+                            host.frame.origin.x,
+                            host.frame.origin.y,
+                            host.frame.size.width,
+                            host.frame.size.height,
+                        ),
+                        window: (
+                            host.visible.origin.x,
+                            host.visible.origin.y,
+                            host.visible.size.width,
+                            host.visible.size.height,
+                        ),
+                        view_height: placed,
+                    },
+                    |place| webview::create_placed(&host.path, &host.spec, place),
                     |child, _stamp| webview::update(&host.path, child, &host.spec),
                 );
+                ffi::host_scroll_policy(&host.path, document.as_ref().filter(|document| !document.editable).map_or(
+                    bunny_ui::host::DocumentScroll::Document, |document| document.scroll,
+                ));
             }
             let alive = hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>();
             window.host_sweep(&alive);
-            webview::sweep(&alive);
             traced.stage("H", format_args!("hosts={}", hosts.len()));
             let overlays = runtime.overlays();
             let display = match overlays.first() {
@@ -1926,6 +1905,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 );
             }
             present(runtime, display, via);
+            // Prepare only after the window has presented its frame.
+            webview::prepare_pending_html();
         point_cursor(runtime, !resizing());
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
             let rect = snapshot.caret_rect;
@@ -2099,6 +2080,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         blit(&runtime, root, trace::Origin::Web);
                     }
                 }
+                // the finish is the desk's beat (`pictures`): the app
+                // hears the commit, and the page's own events after it
+                webview::WebviewEvent::Loaded { .. } => {}
                 webview::WebviewEvent::Linked { path, url } => {
                     if runtime.webview_linked(&path, &url) {
                         blit(&runtime, root, trace::Origin::Web);

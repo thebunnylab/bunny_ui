@@ -41,6 +41,9 @@ use std::rc::Rc;
 
 use crate::runtime::Site;
 
+mod mounted;
+pub use mounted::MountedId;
+
 /// An observable dependency: a `State` (by the slot's global id, never
 /// recycled) or a whole `Store` (object granularity, like an
 /// ObservableObject).
@@ -53,6 +56,7 @@ pub enum DepKey {
 #[derive(Default)]
 struct Registry {
     pass_active: bool,
+    mounted: mounted::MountedSites,
     /// First segment pushed in the pass — defines the swept root.
     pass_root: Option<String>,
     /// The cursor's path, joined with `/`, maintained incrementally by
@@ -167,6 +171,8 @@ struct Registry {
     /// The painting box's path, held in a warm buffer (no string per
     /// paint) and spelled as an `Rc<str>` only when a read is filed.
     painting_path: String,
+    /// Counts the paints begun: two paints of one box are two numbers.
+    paint_serial: u64,
     painting_rc: Option<Rc<str>>,
     /// Who paints what: the boxes that read each dependency.
     paint_readers: HashMap<DepKey, Few<Rc<str>>>,
@@ -385,7 +391,7 @@ pub fn begin_pass() {
         registry.view_keys.clear();
         registry.pass_no += 1;
         registry.skipped.clear();
-        registry.skips_asked = !registry.owners.is_empty();
+        registry.skips_asked = !registry.owners.is_empty() || !registry.mounted.is_empty();
         registry.reran.clear();
         registry.seqs.clear();
         registry.ordinals.clear();
@@ -420,6 +426,10 @@ pub fn end_pass() -> Vec<String> {
             owner == root || owner.strip_prefix(root.as_str()).is_some_and(|rest| rest.starts_with('/'))
         };
         let pass_no = registry.pass_no;
+        {
+            let Registry { mounted, skipped, reran, .. } = &mut *registry;
+            mounted.sweep(&root, pass_no, |scope| protected_by_boundaries(skipped, reran, scope));
+        }
         let dead: Vec<String> = registry
             .owners
             .iter()
@@ -455,13 +465,17 @@ pub fn end_pass() -> Vec<String> {
 /// apply. The owner's own path is asked first, then each cut above it —
 /// a lookup per level, whatever the size of the two sets.
 fn protected_by_skip(registry: &Registry, owner: &str) -> bool {
+    protected_by_boundaries(&registry.skipped, &registry.reran, owner)
+}
+
+fn protected_by_boundaries(skipped: &HashSet<Rc<str>>, reran: &HashSet<Rc<str>>, owner: &str) -> bool {
     let mut end = owner.len();
     loop {
         let candidate = &owner[..end];
-        if registry.skipped.contains(candidate) {
+        if skipped.contains(candidate) {
             return true;
         }
-        if registry.reran.contains(candidate) {
+        if reran.contains(candidate) {
             return false;
         }
         match candidate.rfind('/') {
@@ -1040,6 +1054,7 @@ pub fn reset_world() {
 pub fn reset_scene(root: &str) {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
+        registry.mounted.reset(root);
         let prefix = format!("{root}/");
         let doomed: Vec<String> = registry
             .owners
@@ -1064,6 +1079,20 @@ pub fn reset_scene(root: &str) {
             registry.dirty.remove(&owner);
         }
     });
+}
+
+/// The recorded declaration at this cursor, source site and role. Repeated
+/// declarations at one site follow positional semantics. Outside an active
+/// pass (or after ID exhaustion), identity is unavailable; it is never guessed.
+pub fn mounted_site(site: Site, role: &'static str) -> Option<MountedId> {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        if !registry.pass_active || registry.joined.is_empty() {
+            return None;
+        }
+        let Registry { mounted, joined, pass_no, .. } = &mut *registry;
+        mounted.claim(joined, site, role, *pass_no)
+    })
 }
 
 // MARK: - State anchors
@@ -1537,6 +1566,31 @@ pub fn binding_read_count(key: &str) -> usize {
     REGISTRY.with(|registry| registry.borrow().binding_reads.get(key).map_or(0, Few::len))
 }
 
+/// Exact current read edges of this binding allocation, without recording reads.
+/// Reusing the same path does not revive an older binding's evidence. Retired
+/// bindings are unavailable even before the deferred retirement sweep runs.
+pub fn binding_dependencies(key: &Rc<str>) -> Option<Vec<DepKey>> {
+    REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        let (standing, dependencies) = registry.binding_reads.get_key_value(&**key)?;
+        if !Rc::ptr_eq(standing, key)
+            || registry.retired_bindings.contains(&identity(key))
+            || registry.leaving.iter().any(|view| {
+                standing_bindings(&registry.view_bindings, view)
+                    .is_some_and(|bindings| bindings.iter().any(|binding| Rc::ptr_eq(binding, key)))
+            })
+        {
+            return None;
+        }
+        let mut dependencies: Vec<_> = dependencies.iter().copied().collect();
+        dependencies.sort_by_key(|dependency| match dependency {
+            DepKey::State(id) => (0, *id),
+            DepKey::Store(id) => (1, *id),
+        });
+        Some(dependencies)
+    })
+}
+
 /// Did a write reach a binding since the last frame took the dirty ones?
 pub fn has_dirty_bindings() -> bool {
     REGISTRY.with(|registry| !registry.borrow().dirty_bindings.is_empty())
@@ -1667,6 +1721,7 @@ pub fn begin_paint(path: &str) {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         registry.painting = true;
+        registry.paint_serial = registry.paint_serial.wrapping_add(1);
         registry.painting_path.clear();
         registry.painting_path.push_str(path);
         registry.painting_rc = None;
@@ -1679,6 +1734,37 @@ pub fn end_paint() {
         registry.painting = false;
         registry.painting_rc = None;
     });
+}
+
+/// The frame clock's dependency. A state's dependency counts up from
+/// zero; this one stands at the far end and never meets one.
+const FRAME_CLOCK: u64 = u64::MAX;
+
+/// A box that animates on its own reads the frame clock while it paints:
+/// every [`tick_frame_clock`] then repaints it, and a box that stopped
+/// reading it is left alone.
+pub fn read_frame_clock() {
+    record_read(DepKey::State(FRAME_CLOCK));
+}
+
+/// One beat of the frame clock: every box that read it repaints.
+pub fn tick_frame_clock() {
+    record_write(DepKey::State(FRAME_CLOCK));
+}
+
+/// The box painting now: a number that names it, the same on every frame
+/// for the same box, and the serial of this paint, new each time a paint
+/// begins. `(0, 0)` outside a paint.
+pub fn painting_key() -> (u64, u64) {
+    REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        if !registry.painting {
+            return (0, 0);
+        }
+        let mut hasher = crate::hash::FxHasher::default();
+        std::hash::Hasher::write(&mut hasher, registry.painting_path.as_bytes());
+        (std::hash::Hasher::finish(&hasher).max(1), registry.paint_serial)
+    })
 }
 
 /// Did a write reach a box's paint since the last frame took them?
@@ -2530,3 +2616,7 @@ mod moved_code_tests {
         assert!(dropped.upgrade().is_none(), "the slot nobody took is gone after the pass");
     }
 }
+
+#[cfg(test)]
+#[path = "mounted_tests.rs"]
+mod mounted_tests;

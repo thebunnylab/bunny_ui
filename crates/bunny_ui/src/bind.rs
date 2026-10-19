@@ -624,7 +624,11 @@ mod frame_tests {
             fn body(self) -> impl View {
                 let id = self.item.id;
                 // every third row carries a second cell
-                crate::hstack!(text(id.to_string()), (id % 3 == 0).then(|| text("marked"))).element("tr")
+                crate::hstack!(
+                    text(id.to_string()),
+                    id.is_multiple_of(3).then(|| text("marked"))
+                )
+                .element("tr")
             }
         }
 

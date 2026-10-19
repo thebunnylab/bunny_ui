@@ -116,6 +116,7 @@ pub fn build_with(project: &Project, options: &Options, toolchain: &Toolchain, s
         env: cargo_env(project, toolchain, triple),
         rustc_args,
         quiet: false,
+        diagnostics: cargo::Diagnostics::Render,
     })?;
     let shared = built.artifact;
     check_entry(toolchain, &shared)?;
