@@ -229,6 +229,11 @@ fit's side climbs a ladder of quarter octaves and its centre sits on
 its own texel grid: a caster that moves inside the fit moves no other
 shadow by a fraction of a texel.
 
+Something that moves every frame — a person, a cart — would draw the
+map again every frame. `Model::blob_shadow(radius, darkness)` is the
+cheap road: a soft dark disc, one see-through quad that casts nothing,
+parented to what it follows at the floor's height.
+
 A surface reads the map at its own point, pushed off along its normal
 (further as it turns from the sun) and a step toward the sun, so it
 never shades itself. Each lookup compares four texels and blends the

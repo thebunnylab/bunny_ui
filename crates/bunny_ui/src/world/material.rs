@@ -134,6 +134,22 @@ impl Model {
         Model { mesh, materials: Rc::from(vec![material]) }
     }
 
+    /// A soft dark disc `radius` meters across its half, for under
+    /// something that moves — a person, a cart — where a shadow map would
+    /// be drawn again every frame: one see-through quad a hair above its
+    /// origin, `darkness` (0 to 1) at its heart and nothing at its rim. It
+    /// casts nothing. Parent it to what it follows, at the floor's height.
+    pub fn blob_shadow(radius: f64, darkness: f32) -> Model {
+        // a hair above the floor it lies on, so the two never fight
+        const LIFT: f64 = 0.005;
+        let mut data = Mesh::plane(radius * 2.0, radius * 2.0).data().clone();
+        for position in &mut data.positions {
+            position[1] += LIFT as f32;
+        }
+        let ink = Color::rgba(0, 0, 0, (darkness.clamp(0.0, 1.0) * 255.0).round() as u8);
+        Model::single(Mesh::new(data), Material::unlit(ink).texture(blob_falloff()).blend())
+    }
+
     /// Many pieces as ONE model: one mesh, so one draw for all of them,
     /// whatever their materials. Each piece is a model, placed by a
     /// matrix, and its vertices take `part` as their part, so a piece can
@@ -306,6 +322,23 @@ impl PointLight {
     pub fn groups(self, groups: u32) -> PointLight {
         PointLight { groups, ..self }
     }
+}
+
+/// The falloff of a blob shadow: white, its alpha `(1 − r²)²` from the
+/// centre to the rim. One picture for every blob, so they share a
+/// texture and a draw.
+fn blob_falloff() -> ImageSource {
+    const SIDE: u32 = 64;
+    let mut rgba = Vec::with_capacity((SIDE * SIDE * 4) as usize);
+    for row in 0..SIDE {
+        for column in 0..SIDE {
+            let at = |index: u32| (index as f64 + 0.5) / SIDE as f64 * 2.0 - 1.0;
+            let r2 = (at(column) * at(column) + at(row) * at(row)).min(1.0);
+            let alpha = (1.0 - r2) * (1.0 - r2);
+            rgba.extend_from_slice(&[255, 255, 255, (alpha * 255.0).round() as u8]);
+        }
+    }
+    ImageSource::rgba(0xB10B_0000_0000_0001, (SIDE, SIDE), rgba)
 }
 
 /// Light and shade baked flat onto the ground: a picture laid on the

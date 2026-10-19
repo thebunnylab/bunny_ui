@@ -1084,6 +1084,30 @@ mod tests {
     }
 
     #[test]
+    fn a_blob_shadow_darkens_its_heart_and_leaves_its_rim() {
+        use crate::image_engine::RawImages;
+        use crate::world::material::Model;
+        let images = RawImages::default();
+        let world = World::new();
+        world.add(Mesh::plane(6.0, 6.0), Material::color(Color::rgb(214, 210, 202)));
+        let camera = Camera::orbiting(Vec3::ZERO, 20.0, 50.0, 5.0);
+        let paint = || world.render_with(&images, &camera, &style(Background::Color(Color::rgb(236, 233, 226))), (160, 120), 1.0);
+        let size = crate::layout::Size { width: 160.0, height: 120.0 };
+        let at = |picture: &Picture, point: Vec3| {
+            let p = camera.project(point, size).expect("in view");
+            picture.at(p.x as u32, p.y as u32)
+        };
+        let plain = paint();
+        world.add_model(Model::blob_shadow(0.6, 0.5)).set_position(vec3(0.5, 0.0, 0.0));
+        let blob = paint();
+        dump("blob", &blob);
+        let (heart, rim, far) = (vec3(0.5, 0.0, 0.0), vec3(1.15, 0.0, 0.0), vec3(-2.0, 0.0, 1.5));
+        assert!((at(&blob, heart)[0] as f32) < at(&plain, heart)[0] as f32 * 0.65, "the heart is dark");
+        assert_eq!(at(&blob, rim), at(&plain, rim), "past the rim nothing");
+        assert_eq!(at(&blob, far), at(&plain, far));
+    }
+
+    #[test]
     fn a_transparent_background_leaves_alpha_zero() {
         let world = World::new();
         world.add(Mesh::cuboid(0.5, 0.5, 0.5), Material::color(Color::WHITE));
