@@ -438,6 +438,10 @@ fn point_cursor(runtime: &Runtime) {
             Some(Cursor::ResizeUpDown) => 7,
             Some(Cursor::ResizeUpLeftDownRight) => 8,
             Some(Cursor::ResizeUpRightDownLeft) => 9,
+            Some(Cursor::Grab) => 10,
+            Some(Cursor::Grabbing) => 11,
+            Some(Cursor::Move) => 12,
+            Some(Cursor::Crosshair) => 13,
             None if runtime.interaction().hovered.is_some() => 2,
             None => 0,
         },
@@ -481,6 +485,8 @@ enum Event {
     /// A press of a button past the primary one (the middle one; the
     /// secondary press is the browser's `contextmenu`).
     ButtonDown { x: f64, y: f64, button: bunny_ui::custom::PointerButton, modifiers: bunny_ui::action::Modifiers },
+    /// That button lifted: the end of a drag a box may hold with it.
+    ButtonUp { x: f64, y: f64, button: bunny_ui::custom::PointerButton },
     Text(String),
     /// A named key from the glue's table, with the modifier bits.
     Key(u32, u32),
@@ -815,6 +821,11 @@ pub fn start_with(
                 present(&runtime, &full, size, scale, &mut surface);
                 pacer.rest();
             }
+            Event::ButtonUp { x, y, button } => {
+                if runtime.button_released(x, y, button) {
+                    present(&runtime, &full, size, scale, &mut surface);
+                }
+            }
             // A landing that changed nothing visible may still have put the
             // finger on the clock — a hold that may become a menu, a press
             // that waits to see whether the finger meant to scroll. The
@@ -1146,6 +1157,11 @@ fn start_dom_with(
                 DRAG_ARMED.with(|armed| armed.set(false));
                 present(&runtime, runtime.dom_frame(&root, size), scale);
             }
+            Event::ButtonUp { x, y, button } => {
+                if runtime.button_released(x, y, button) {
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
+            }
             Event::DomScroll { id, x, y } => {
                 // the browser moved: the offset folds into the engine
                 // AND the retained scene (the diff meets its own echo),
@@ -1454,6 +1470,19 @@ pub extern "C" fn bunny_pointer_down(x: f64, y: f64, time_ms: f64, button: u32, 
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_pointer_up(x: f64, y: f64) {
     dispatch(Event::PointerUp { x, y });
+}
+
+/// A button past the primary one lifted — `button` is the event's own
+/// number (1 the middle, 2 the secondary). A glue that predates this
+/// door sends every lift to [`bunny_pointer_up`], as it always did.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_button_up(x: f64, y: f64, button: u32) {
+    let button = match button {
+        1 => bunny_ui::custom::PointerButton::Middle,
+        2 => bunny_ui::custom::PointerButton::Secondary,
+        _ => return,
+    };
+    dispatch(Event::ButtonUp { x, y, button });
 }
 
 /// One wheel event in the browser's own deltas, with the modifier bits

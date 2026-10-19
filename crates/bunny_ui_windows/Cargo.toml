@@ -6,6 +6,10 @@ description = "bunny-ui Windows shell — native window and bitmap blit, depende
 license-file.workspace = true
 repository.workspace = true
 
+[features]
+# Worlds in three dimensions, drawn by the D3D11 world pass.
+3d = ["bunny-ui/3d"]
+
 [dependencies]
 bunny-ui = { workspace = true, features = ["canvas", "gpu"] }
 
@@ -22,6 +26,10 @@ countries-pure.workspace = true
 [package.metadata.docs.rs]
 default-target = "x86_64-pc-windows-msvc"
 targets = ["x86_64-pc-windows-msvc"]
+
+[[example]]
+name = "world_window"
+required-features = ["3d"]
 
 [[test]]
 name = "accessibility_native"

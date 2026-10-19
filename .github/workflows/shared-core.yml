@@ -140,6 +140,11 @@ jobs:
         run: |
           cargo test -p bunny-ui-apple --locked --all-targets --features 3d -- --nocapture
           BUNNY_PARANOID=all cargo test -p bunny-ui-apple --locked --all-targets --features 3d
+      - name: D3D11 world pass, normal and paranoid
+        if: runner.os == 'Windows'
+        run: |
+          cargo test -p bunny-ui-windows --locked --lib --features 3d world -- --nocapture
+          BUNNY_PARANOID=all cargo test -p bunny-ui-windows --locked --lib --features 3d world
       - name: macOS shell, normal and paranoid; iOS build
         if: runner.os == 'macOS'
         run: |

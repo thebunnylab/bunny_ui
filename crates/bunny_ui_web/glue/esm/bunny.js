@@ -207,6 +207,7 @@ export function js_clipboard_write(pointer, length) {
 const CURSORS = [
   "default", "text", "pointer", "cell", "col-resize", "row-resize",
   "ew-resize", "ns-resize", "nwse-resize", "nesw-resize",
+  "grab", "grabbing", "move", "crosshair",
 ];
 export function js_set_cursor(kind) {
   if (!host) return;
@@ -764,6 +765,11 @@ export async function attach(memoryHandle, exports, hostElement, start) {
   host.addEventListener("pointerup", (event) => {
     if (touch(event, 2)) return;
     const [x, y] = point(event);
+    // the middle and the secondary lift end a drag a box may hold
+    if ((event.button === 1 || event.button === 2) && wasm.bunny_button_up) {
+      wasm.bunny_button_up(x, y, event.button);
+      return;
+    }
     wasm.bunny_pointer_up(x, y);
     followText();
   });

@@ -86,6 +86,9 @@ unsafe extern "C" {
     fn msg_void_u32(obj: Id, sel: Sel, a: u32);
     #[link_name = "objc_msgSend"]
     fn msg_f64(obj: Id, sel: Sel) -> f64;
+    /// A `float` answer — `-[NSEvent rotation]` is one.
+    #[link_name = "objc_msgSend"]
+    fn msg_f32(obj: Id, sel: Sel) -> f32;
     #[link_name = "objc_msgSend"]
     fn msg_bool_i64(obj: Id, sel: Sel, a: i64) -> ObjcBool;
     #[link_name = "objc_msgSend"]
@@ -249,6 +252,9 @@ pub enum AppEvent {
     RightMouseDown { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     /// The middle button's press — the wheel pressed down.
     MiddleMouseDown { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
+    /// The right or the middle button lifted — the end of a drag a box
+    /// may hold with it.
+    ButtonUp { x: f64, y: f64, button: bunny_ui::custom::PointerButton },
     MouseUp { x: f64, y: f64 },
     MouseMoved { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     /// The pointer left the window — without this event the hover would
@@ -269,6 +275,9 @@ pub enum AppEvent {
     /// The trackpad's pinch over the view: `scale` is the ratio of this
     /// step (1.0 = nothing), at the pointer.
     Magnify { x: f64, y: f64, scale: f64 },
+    /// The trackpad's twist over the view: the radians of this step,
+    /// counter-clockwise positive, at the pointer.
+    Rotate { x: f64, y: f64, radians: f64 },
     /// The modifier keys moved (`flagsChanged:`) — what the hand holds
     /// now. A modifier going down or coming UP types nothing and makes
     /// no stroke; this is the only report of a release.
@@ -856,6 +865,21 @@ extern "C" fn bunny_other_mouse_down(this: Id, _sel: Sel, event: Id) {
     dispatch(AppEvent::MiddleMouseDown { x, y, modifiers });
 }
 
+/// `rightMouseUp:` — the context button lifted.
+extern "C" fn bunny_right_mouse_up(this: Id, _sel: Sel, event: Id) {
+    let (x, y) = unsafe { event_layout_point(this, event) };
+    dispatch(AppEvent::ButtonUp { x, y, button: bunny_ui::custom::PointerButton::Secondary });
+}
+
+/// `otherMouseUp:` — the middle button lifted; the rest say nothing yet.
+extern "C" fn bunny_other_mouse_up(this: Id, _sel: Sel, event: Id) {
+    if unsafe { msg_i64(event, sel("buttonNumber")) } != 2 {
+        return;
+    }
+    let (x, y) = unsafe { event_layout_point(this, event) };
+    dispatch(AppEvent::ButtonUp { x, y, button: bunny_ui::custom::PointerButton::Middle });
+}
+
 extern "C" fn bunny_mouse_down(this: Id, _sel: Sel, event: Id) {
     let (x, y) = unsafe { event_layout_point(this, event) };
     // the scene's own title bar: a press on a drag region (with no
@@ -1393,6 +1417,16 @@ extern "C" fn bunny_magnify(this: Id, _sel: Sel, event: Id) {
         let (x, y) = event_layout_point(this, event);
         let scale = 1.0 + msg_f64(event, sel("magnification"));
         dispatch(AppEvent::Magnify { x, y, scale });
+    }
+}
+
+/// `rotateWithEvent:` — two fingers twisting on the trackpad. AppKit says
+/// degrees, counter-clockwise positive.
+extern "C" fn bunny_rotate(this: Id, _sel: Sel, event: Id) {
+    unsafe {
+        let (x, y) = event_layout_point(this, event);
+        let radians = f64::from(msg_f32(event, sel("rotation"))).to_radians();
+        dispatch(AppEvent::Rotate { x, y, radians });
     }
 }
 
@@ -2166,6 +2200,14 @@ unsafe fn register_classes() {
             bunny_mouse_moved as *const c_void,
             types.as_ptr(),
         );
+        // with the right or the middle button held AppKit sends these,
+        // never moved: a box holding the press hears every one
+        for name in ["rightMouseDragged:", "otherMouseDragged:"] {
+            class_addMethod(view, sel(name), bunny_mouse_moved as *const c_void, types.as_ptr());
+        }
+        class_addMethod(view, sel("rightMouseUp:"), bunny_right_mouse_up as *const c_void, types.as_ptr());
+        class_addMethod(view, sel("otherMouseUp:"), bunny_other_mouse_up as *const c_void, types.as_ptr());
+        class_addMethod(view, sel("rotateWithEvent:"), bunny_rotate as *const c_void, types.as_ptr());
         class_addMethod(
             view,
             sel("mouseEntered:"),
@@ -3205,6 +3247,15 @@ pub enum Cursor {
     FrameUpLeftDownRight,
     /// A frame's top-right or bottom-left corner (↗↙).
     FrameUpRightDownLeft,
+    /// The open hand: what is under it moves with a drag.
+    Grab,
+    /// The closed hand: it is moving now.
+    Grabbing,
+    /// A drag moves the thing under the pointer: AppKit's own word for
+    /// that is the open hand.
+    Move,
+    /// The thin cross, for an exact point.
+    Crosshair,
 }
 
 /// macOS 15's frame cursor: `+[NSCursor
@@ -3232,7 +3283,11 @@ const fn frame_position(cursor: Cursor) -> Option<u64> {
         | Cursor::Pointing
         | Cursor::Cell
         | Cursor::ResizeLeftRight
-        | Cursor::ResizeUpDown => None,
+        | Cursor::ResizeUpDown
+        | Cursor::Grab
+        | Cursor::Grabbing
+        | Cursor::Move
+        | Cursor::Crosshair => None,
     }
 }
 
@@ -3246,7 +3301,9 @@ const fn classic_name(cursor: Cursor) -> &'static str {
         }
         Cursor::Text => "IBeamCursor",
         Cursor::Pointing => "pointingHandCursor",
-        Cursor::Cell => "crosshairCursor",
+        Cursor::Cell | Cursor::Crosshair => "crosshairCursor",
+        Cursor::Grab | Cursor::Move => "openHandCursor",
+        Cursor::Grabbing => "closedHandCursor",
         Cursor::ResizeLeftRight | Cursor::FrameLeftRight => "resizeLeftRightCursor",
         Cursor::ResizeUpDown | Cursor::FrameUpDown => "resizeUpDownCursor",
     }
@@ -5082,6 +5139,10 @@ mod tests {
             Cursor::FrameUpDown,
             Cursor::FrameUpLeftDownRight,
             Cursor::FrameUpRightDownLeft,
+            Cursor::Grab,
+            Cursor::Grabbing,
+            Cursor::Move,
+            Cursor::Crosshair,
         ] {
             assert!(!unsafe { shape_of(outfit) }.is_null(), "{outfit:?} names no cursor");
         }

@@ -86,6 +86,12 @@ pub enum Gesture {
     /// Two fingers changed their distance: the RATIO of this step, 1.0
     /// for none, at the point between them.
     Magnify { at: Point, scale: f64 },
+    /// The point between two fingers travelled: this step's delta, and
+    /// where the point is now.
+    Pan { at: Point, dx: Px, dy: Px },
+    /// The first two fingers turned around the point between them: this
+    /// step's radians, counter-clockwise on the screen positive.
+    Rotate { at: Point, radians: f64 },
 }
 
 /// One finger the recognizer follows.
@@ -113,8 +119,9 @@ enum Phase {
     Swallowed,
     /// The finger lifted at speed; content keeps sliding on the clock.
     Flinging { anchor: Point, velocity: (Px, Px) },
-    /// Two or more fingers: the span between them is the zoom.
-    Pinching { span: Px },
+    /// Two or more fingers: the span between them is the zoom, the point
+    /// between them the pan, the turn of the first two the rotation.
+    Pinching { span: Px, center: Point, angle: f64 },
 }
 
 /// One frame of finger movement, for the velocity behind a lift.
@@ -162,7 +169,7 @@ impl Recognizer {
             }
             self.samples.clear();
             self.pending = (0.0, 0.0);
-            self.phase = Phase::Pinching { span: self.spread() };
+            self.phase = self.pinching();
             return out;
         }
         // a hand on flying content catches it
@@ -190,12 +197,27 @@ impl Recognizer {
         };
         let was = self.fingers[index].at;
         self.fingers[index].at = at;
-        if let Phase::Pinching { span } = self.phase {
-            let now = self.spread();
+        if let Phase::Pinching { span, center, angle } = self.phase {
+            let Phase::Pinching { span: now, center: middle, angle: turned } = self.pinching() else { return out };
+            self.phase = Phase::Pinching { span: now, center: middle, angle: turned };
             let scale = now / span;
-            self.phase = Phase::Pinching { span: now };
             if scale != 1.0 {
-                out.push(Gesture::Magnify { at: self.centroid(), scale });
+                out.push(Gesture::Magnify { at: middle, scale });
+            }
+            let (dx, dy) = (middle.x - center.x, middle.y - center.y);
+            if dx != 0.0 || dy != 0.0 {
+                out.push(Gesture::Pan { at: middle, dx, dy });
+            }
+            // the screen's y runs down: a turn that grows the angle there
+            // is a clockwise one
+            let mut radians = angle - turned;
+            if radians > std::f64::consts::PI {
+                radians -= std::f64::consts::TAU;
+            } else if radians <= -std::f64::consts::PI {
+                radians += std::f64::consts::TAU;
+            }
+            if radians != 0.0 {
+                out.push(Gesture::Rotate { at: middle, radians });
             }
             return out;
         }
@@ -433,9 +455,19 @@ impl Recognizer {
                 self.samples.clear();
                 self.phase = Phase::Swallowed;
             }
-            _ => self.phase = Phase::Pinching { span: self.spread() },
+            _ => self.phase = self.pinching(),
         }
         Vec::new()
+    }
+
+    /// The fingers as a pinch: their span, the point between them, and
+    /// the angle of the first two.
+    fn pinching(&self) -> Phase {
+        let angle = match self.fingers.as_slice() {
+            [first, second, ..] => (second.at.y - first.at.y).atan2(second.at.x - first.at.x),
+            _ => 0.0,
+        };
+        Phase::Pinching { span: self.spread(), center: self.centroid(), angle }
     }
 
     /// The point between the fingers — symmetric in the set, because
@@ -674,12 +706,56 @@ mod tests {
         assert_eq!(touch.began(1, p(100.0, 100.0), 1, &FLAT), vec![Gesture::Press { at: p(100.0, 100.0), taps: 1, held: 0.0 }]);
         assert_eq!(touch.began(2, p(200.0, 100.0), 1, &FLAT), vec![Gesture::Cancel]);
         // the fingers spread: 100 apart → 200 apart is a scale of 2 at
-        // the point between them
+        // the point between them, which moved half the finger's way
         let out = touch.moved(2, p(300.0, 100.0));
-        assert_eq!(out, vec![Gesture::Magnify { at: p(200.0, 100.0), scale: 2.0 }]);
+        assert_eq!(
+            out,
+            vec![Gesture::Magnify { at: p(200.0, 100.0), scale: 2.0 }, Gesture::Pan { at: p(200.0, 100.0), dx: 50.0, dy: 0.0 }]
+        );
         // the next step is read from the NEW span
         let out = touch.moved(1, p(200.0, 100.0));
-        assert_eq!(out, vec![Gesture::Magnify { at: p(250.0, 100.0), scale: 0.5 }]);
+        assert_eq!(
+            out,
+            vec![Gesture::Magnify { at: p(250.0, 100.0), scale: 0.5 }, Gesture::Pan { at: p(250.0, 100.0), dx: 50.0, dy: 0.0 }]
+        );
+    }
+
+    #[test]
+    fn two_fingers_moving_together_pan_and_do_not_zoom() {
+        let mut touch = Recognizer::new();
+        touch.began(1, p(100.0, 100.0), 1, &FLAT);
+        touch.began(2, p(200.0, 100.0), 1, &FLAT);
+        let mut gestures = touch.moved(1, p(110.0, 130.0));
+        gestures.extend(touch.moved(2, p(210.0, 130.0)));
+        let (mut scale, mut pan, mut turn) = (1.0, (0.0, 0.0), 0.0);
+        for gesture in gestures {
+            match gesture {
+                Gesture::Magnify { scale: step, .. } => scale *= step,
+                Gesture::Pan { dx, dy, .. } => pan = (pan.0 + dx, pan.1 + dy),
+                Gesture::Rotate { radians, .. } => turn += radians,
+                other => panic!("a pinch made {other:?}"),
+            }
+        }
+        assert!((scale - 1.0).abs() < 1e-9, "the span came back: {scale}");
+        assert!((pan.0 - 10.0).abs() < 1e-9 && (pan.1 - 30.0).abs() < 1e-9, "the point between them slid: {pan:?}");
+        assert!(turn.abs() < 1e-9, "nothing turned: {turn}");
+    }
+
+    #[test]
+    fn two_fingers_turning_counter_clockwise_rotate_positive() {
+        let mut touch = Recognizer::new();
+        touch.began(1, p(100.0, 100.0), 1, &FLAT);
+        touch.began(2, p(200.0, 100.0), 1, &FLAT);
+        // the second finger rises on the screen: a counter-clockwise turn
+        let out = touch.moved(2, p(200.0, 50.0));
+        let radians = out
+            .iter()
+            .find_map(|gesture| match gesture {
+                Gesture::Rotate { radians, .. } => Some(*radians),
+                _ => None,
+            })
+            .expect("a turn");
+        assert!((radians - 0.5f64.atan()).abs() < 1e-9, "{radians}");
     }
 
     #[test]
@@ -687,7 +763,10 @@ mod tests {
         let mut touch = Recognizer::new();
         touch.began(1, p(100.0, 100.0), 1, &LIST);
         touch.began(2, p(200.0, 100.0), 1, &LIST);
-        assert_eq!(touch.moved(2, p(300.0, 100.0)), vec![Gesture::Magnify { at: p(200.0, 100.0), scale: 2.0 }]);
+        assert_eq!(
+            touch.moved(2, p(300.0, 100.0)),
+            vec![Gesture::Magnify { at: p(200.0, 100.0), scale: 2.0 }, Gesture::Pan { at: p(200.0, 100.0), dx: 50.0, dy: 0.0 }]
+        );
         assert!(touch.ended(2, p(300.0, 100.0)).is_empty());
         // the finger left was half of the zoom: it does not pan, the
         // hold ages into nothing, and a still lift is no tap

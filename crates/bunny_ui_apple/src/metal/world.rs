@@ -1493,7 +1493,7 @@ mod tests {
     fn spread(a: &[u8], b: &[u8]) -> Spread {
         assert_eq!(a.len(), b.len());
         let mut out = Spread { worst: 0, beyond: [0; 3], pixels: a.len() / 4 };
-        for (p, q) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        for (p, q) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0) {
             let delta = (0..4).map(|k| p[k].abs_diff(q[k])).max().unwrap_or(0);
             out.worst = out.worst.max(delta);
             for (slot, limit) in [1u8, 3, 16].iter().enumerate() {

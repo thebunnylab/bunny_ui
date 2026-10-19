@@ -14545,6 +14545,77 @@ mod tests {
         }
     }
 
+    /// A box that takes the press of a button past the primary one holds
+    /// the pointer until that button lifts: every move reaches it as that
+    /// button's, wherever the hand runs, then the lift — and the hover of
+    /// the rest of the scene waits. A taken-back press ends the drag too.
+    #[test]
+    fn a_box_that_takes_a_middle_press_holds_the_pointer_until_it_lifts() {
+        use crate::action::Modifiers;
+        use crate::custom::PointerButton;
+        use std::cell::RefCell;
+
+        struct Canvas {
+            heard: Rc<RefCell<Vec<String>>>,
+        }
+
+        impl CustomElement for Canvas {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> crate::custom::Response {
+                let line = match event {
+                    ElementEvent::ButtonDown { at, button, .. } => format!("down {button:?} {} {}", at.x, at.y),
+                    ElementEvent::ButtonMoved { at, button, .. } => format!("moved {button:?} {} {}", at.x, at.y),
+                    ElementEvent::ButtonUp { at, button } => format!("up {button:?} {} {}", at.x, at.y),
+                    ElementEvent::PointerMoved { pressed: false, .. } => "hover".to_string(),
+                    _ => return crate::custom::Response::ignored(),
+                };
+                self.heard.borrow_mut().push(line);
+                crate::custom::Response::handled()
+            }
+        }
+
+        #[derive(Clone)]
+        struct Page {
+            heard: Rc<RefCell<Vec<String>>>,
+        }
+
+        impl Component for Page {
+            fn body(self) -> impl View {
+                custom(Canvas { heard: Rc::clone(&self.heard) }).frame(200.0, 100.0)
+            }
+        }
+
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let page = Page { heard: Rc::clone(&heard) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&page);
+        let size = Size { width: 400.0, height: 300.0 };
+        let result = runtime.layout(&page, crate::layout::Proposal::exact(size));
+        let frame = result.customs.first().expect("the box is placed").frame;
+        let (x, y) = (frame.origin.x + 20.0, frame.origin.y + 20.0);
+
+        assert!(runtime.button_pressed(x, y, PointerButton::Middle, Modifiers::NONE));
+        // far outside the frame, the move is still the box's, as the button's
+        runtime.pointer_moved(x + 300.0, y + 150.0, Modifiers::NONE);
+        assert!(runtime.button_released(x + 300.0, y + 150.0, PointerButton::Middle));
+        assert_eq!(
+            *heard.borrow(),
+            ["down Middle 20 20", "moved Middle 320 170", "up Middle 320 170"],
+        );
+        // the drag is over: a move over the box is a hover again, and a
+        // lift with nothing held answers nothing
+        heard.borrow_mut().clear();
+        runtime.pointer_moved(x + 5.0, y, Modifiers::NONE);
+        assert_eq!(*heard.borrow(), ["hover"]);
+        assert!(!runtime.button_released(x, y, PointerButton::Middle));
+        // a press taken back hears its lift all the same
+        heard.borrow_mut().clear();
+        runtime.button_pressed(x, y, PointerButton::Middle, Modifiers::NONE);
+        runtime.pointer_cancelled();
+        assert_eq!(heard.borrow().last().map(String::as_str), Some("up Middle 20 20"));
+        assert!(runtime.interaction().button_grab.is_none());
+    }
+
     /// Shift turns a vertical wheel sideways and a trackpad gesture locks
     /// its axis: the box hears what the hand holds and where the turn sits.
     #[test]

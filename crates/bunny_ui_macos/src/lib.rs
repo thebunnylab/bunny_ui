@@ -168,6 +168,10 @@ fn point_cursor(runtime: &Runtime, insist: bool) {
             Some(bunny_ui::layout::Cursor::ResizeUpRightDownLeft) => {
                 ffi::Cursor::FrameUpRightDownLeft
             }
+            Some(bunny_ui::layout::Cursor::Grab) => ffi::Cursor::Grab,
+            Some(bunny_ui::layout::Cursor::Grabbing) => ffi::Cursor::Grabbing,
+            Some(bunny_ui::layout::Cursor::Move) => ffi::Cursor::Move,
+            Some(bunny_ui::layout::Cursor::Crosshair) => ffi::Cursor::Crosshair,
             None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
             None => ffi::Cursor::Arrow,
         },
@@ -2285,9 +2289,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 AppEvent::MouseDown { .. }
                 | AppEvent::RightMouseDown { .. }
                 | AppEvent::MiddleMouseDown { .. } => Some("press"),
-                AppEvent::MouseUp { .. } => Some("release"),
+                AppEvent::MouseUp { .. } | AppEvent::ButtonUp { .. } => Some("release"),
                 AppEvent::MouseMoved { .. } => Some("move"),
-                AppEvent::Magnify { .. } => Some("magnify"),
+                AppEvent::Magnify { .. } | AppEvent::Rotate { .. } => Some("magnify"),
                 _ => None,
             };
             if let Some(kind) = kind {
@@ -2480,6 +2484,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 blit(runtime, root, trace::Origin::Input);
             }
         }
+        AppEvent::ButtonUp { x, y, button } => {
+            // the end of a drag a box held with that button
+            if runtime.button_released(x, y, button) {
+                blit(runtime, root, trace::Origin::Input);
+            }
+            point_cursor(runtime, true);
+        }
         AppEvent::MouseDown { x, y, clicks, modifiers } => {
             if runtime.pointer_clicked(x, y, clicks, modifiers) {
                 blit(runtime, root, trace::Origin::Input);
@@ -2510,6 +2521,12 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         AppEvent::Magnify { x, y, scale } => {
             // the box under the pointer zooms; nothing else does
             if runtime.magnify(x, y, scale) {
+                soon(runtime, root, trace::Origin::Input);
+            }
+        }
+        AppEvent::Rotate { x, y, radians } => {
+            // the box under the pointer turns; nothing else does
+            if runtime.rotate(x, y, radians) {
                 soon(runtime, root, trace::Origin::Input);
             }
         }

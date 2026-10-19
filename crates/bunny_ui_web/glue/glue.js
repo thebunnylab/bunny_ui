@@ -439,6 +439,7 @@ Object.assign(imports, window.BUNNY_IMPORTS || {});
 const CURSORS = [
   "default", "text", "pointer", "cell", "col-resize", "row-resize",
   "ew-resize", "ns-resize", "nwse-resize", "nesw-resize",
+  "grab", "grabbing", "move", "crosshair",
 ];
 
 function sendText(text) {
@@ -688,6 +689,11 @@ booting.then(
     host.addEventListener("pointerup", (event) => {
       if (touch(event, 2)) return;
       const [x, y] = point(event);
+      // the middle and the secondary lift end a drag a box may hold
+      if ((event.button === 1 || event.button === 2) && wasm.bunny_button_up) {
+        wasm.bunny_button_up(x, y, event.button);
+        return;
+      }
       wasm.bunny_pointer_up(x, y);
       followText();
     });

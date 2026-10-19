@@ -574,6 +574,17 @@ pub enum Cursor {
     /// A frame's top-trailing or bottom-leading corner: along the rising
     /// diagonal (↗↙).
     ResizeUpRightDownLeft,
+    /// The open hand: what is under it moves with a drag — a canvas, a
+    /// map, a world.
+    Grab,
+    /// The closed hand: what is under it is moving with the drag now.
+    Grabbing,
+    /// The four arrows: a drag moves the thing under the pointer, in any
+    /// direction.
+    Move,
+    /// The thin cross: a press lands on an exact point — a drawing's
+    /// snap, a measure. Where a platform has no thin cross, its cross.
+    Crosshair,
 }
 
 /// Padding insets, per edge.
@@ -2518,6 +2529,10 @@ pub struct Interaction {
     /// every move until the release, even outside the frame (dragging
     /// a selection out of the box and back is one gesture).
     pub element_grab: Option<String>,
+    /// The app's box that took the press of a button past the primary
+    /// one, and which button: it hears every move until that button
+    /// lifts.
+    pub button_grab: Option<(String, crate::custom::PointerButton)>,
     /// The field whose selection is being swept: the press dropped the
     /// anchor, every move until the release carries the caret away
     /// from it, and the release changes nothing.
