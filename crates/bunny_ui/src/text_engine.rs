@@ -14,6 +14,8 @@
 //! cache): the key GAINS the probing mode — a line cache poisoned by a
 //! proposal is a classic bug.
 
+type CachedText<V> = HashMap<String, (V, std::cell::Cell<u32>)>;
+
 use std::cell::RefCell;
 use std::sync::Arc;
 use motor::hash::FxHashMap as HashMap;
@@ -291,6 +293,17 @@ pub struct TextRaster {
 /// The boundary: who measures and draws text. Object-safe on purpose —
 /// `Rc<dyn TextEngine>` is the shape that crosses the `Runtime`.
 pub trait TextEngine {
+    /// Editable geometry from the same complete line used by measurement and
+    /// raster. Native adapters return scalar cells in logical UTF-8 order;
+    /// unsupported engines keep the legacy prefix-based editing fallback.
+    fn line_geometry(
+        &self,
+        _text: &str,
+        _font: &FontSpec,
+    ) -> Option<crate::text_geometry::LineGeometry> {
+        None
+    }
+
     fn measure_line(&self, text: &str, font: &FontSpec) -> LineMetrics;
 
     /// The families this engine can shape, for an app that offers the
@@ -483,11 +496,76 @@ pub fn caret_from_x(
     best
 }
 
+/// Visual coordinate relative to the left edge of a complete shaped line.
+/// Engines without native geometry keep their existing prefix approximation.
+pub(crate) fn line_caret_x(
+    text: &str,
+    byte: usize,
+    affinity: crate::text_geometry::CaretAffinity,
+    font: &FontSpec,
+    engine: &dyn TextEngine,
+    cache: &MeasureCache,
+) -> Px {
+    if let Some(geometry) = cache.get_or_geometry(text, font, engine) {
+        return geometry.caret_x(byte, affinity);
+    }
+    let byte = crate::text_input::clamp_to_boundary(text, byte);
+    let head = cache.get_or_measure(&text[..byte], font, engine).width;
+    if crate::text_input::reads_right_to_left(text) {
+        cache.get_or_measure(text, font, engine).width - head
+    } else {
+        head
+    }
+}
+
+/// Resolve a visual coordinate and retain its native directional affinity.
+pub(crate) fn line_hit(
+    text: &str,
+    x: Px,
+    font: &FontSpec,
+    engine: &dyn TextEngine,
+    cache: &MeasureCache,
+) -> crate::text_geometry::CaretHit {
+    if let Some(geometry) = cache.get_or_geometry(text, font, engine) {
+        return geometry.hit_test(x);
+    }
+    let along = if crate::text_input::reads_right_to_left(text) {
+        cache.get_or_measure(text, font, engine).width - x
+    } else {
+        x
+    };
+    crate::text_geometry::CaretHit {
+        byte: caret_from_x(text, along, font, engine, cache),
+        affinity: crate::text_geometry::CaretAffinity::Downstream,
+    }
+}
+
+/// Disjoint visual selection bands of the complete line, in local coordinates.
+pub(crate) fn line_spans(
+    text: &str,
+    bytes: std::ops::Range<usize>,
+    font: &FontSpec,
+    engine: &dyn TextEngine,
+    cache: &MeasureCache,
+) -> Vec<std::ops::Range<Px>> {
+    if let Some(geometry) = cache.get_or_geometry(text, font, engine) {
+        return geometry.selection_spans(bytes);
+    }
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let affinity = crate::text_geometry::CaretAffinity::Downstream;
+    let a = line_caret_x(text, bytes.start, affinity, font, engine, cache);
+    let b = line_caret_x(text, bytes.end, affinity, font, engine, cache);
+    std::iter::once(a.min(b)..a.max(b)).collect()
+}
+
 // MARK: - Line breaking (shape borrowed from the engine, breaking ours)
 
 /// GREEDY breaking by word with the engine's real measurements:
 /// contiguous byte ranges, one per line. A word wider than the line
-/// breaks per char (never less than one). Spaces hang at the end of the
+/// breaks at extended grapheme boundaries (never less than one cluster). A
+/// cluster wider than the line overflows intact. Spaces hang at the end of the
 /// line (they do not force a break — the classic behavior).
 pub fn break_lines(
     text: &str,
@@ -536,51 +614,59 @@ fn wrap_paragraph(
         lines.push((start, stop));
         return;
     }
+    // Resolve boundaries once for this paragraph: every token and forced
+    // break must use them, including spaces carrying combining marks. The
+    // segmentation pass is linear even for long regional-indicator runs.
+    let boundaries = crate::grapheme::boundaries(&text[start..stop]);
+    let byte = |index: usize| start + boundaries[index];
+    let last = boundaries.len() - 1;
     let mut line_start = start;
-    let mut cursor = start;
+    let mut cursor = 0;
 
-    while cursor < stop {
-        let rest = &text[cursor..stop];
-        let is_space = rest.starts_with(' ');
-        let token_len = if is_space {
-            rest.find(|c| c != ' ').unwrap_or(rest.len())
-        } else {
-            rest.find(' ').unwrap_or(rest.len())
-        };
-        let token_end = cursor + token_len;
+    while cursor < last {
+        let is_space = text[byte(cursor)..stop].starts_with(' ');
+        let mut token_end = cursor + 1;
+        while token_end < last && text[byte(token_end)..stop].starts_with(' ') == is_space {
+            token_end += 1;
+        }
 
         if !is_space {
-            let width = cache.get_or_measure(&text[line_start..token_end], font, engine).width;
-            if width > max_width && cursor > line_start {
-                // the word did not fit: break BEFORE it (the spaces
-                // already walked hang at the end of the previous line)
-                lines.push((line_start, cursor));
-                line_start = cursor;
+            let width = cache
+                .get_or_measure(&text[line_start..byte(token_end)], font, engine)
+                .width;
+            if width > max_width && byte(cursor) > line_start {
+                // The spaces already walked hang at the previous line's end.
+                lines.push((line_start, byte(cursor)));
+                line_start = byte(cursor);
                 continue;
             }
             if width > max_width {
-                // a lone word wider than the line: break per char at the
-                // largest prefix that fits — at least one
-                let mut end = cursor + rest.chars().next().map(char::len_utf8).unwrap_or(1);
-                for (offset, _) in rest[..token_len].char_indices().skip(1) {
+                // Keep at least one whole cluster, even if it cannot fit. A
+                // narrower scalar prefix would corrupt the visible character.
+                let mut end = cursor + 1;
+                for candidate in cursor + 2..=token_end {
                     if cache
-                        .get_or_measure(&text[line_start..cursor + offset], font, engine)
+                        .get_or_measure(&text[line_start..byte(candidate)], font, engine)
                         .width
                         > max_width
                     {
                         break;
                     }
-                    end = cursor + offset;
+                    end = candidate;
                 }
-                lines.push((line_start, end));
-                line_start = end;
+                lines.push((line_start, byte(end)));
+                line_start = byte(end);
                 cursor = end;
                 continue;
             }
         }
         cursor = token_end;
     }
-    lines.push((line_start, stop));
+    // An oversized final cluster has already emitted the last line. A soft
+    // break must not invent an empty row; hard breaks are handled by the caller.
+    if line_start < stop {
+        lines.push((line_start, stop));
+    }
 }
 
 /// True when the paragraph is one line at `max_width`. Printable ASCII
@@ -715,15 +801,20 @@ pub struct MeasureCache {
     entries: std::cell::Cell<usize>,
     /// The size under which nothing ages out. `None` = [`CACHE_FLOOR`].
     floor: Option<usize>,
-    lines: RefCell<HashMap<FontKey, HashMap<String, (LineMetrics, std::cell::Cell<u32>)>>>,
-    breaks:
-        RefCell<HashMap<(FontKey, u32), HashMap<String, (BreakLines, std::cell::Cell<u32>)>>>,
+    lines: RefCell<HashMap<FontKey, CachedText<LineMetrics>>>,
+    breaks: RefCell<HashMap<(FontKey, u32), CachedText<BreakLines>>>,
+    geometry: RefCell<HashMap<FontKey, HashMap<String, CachedGeometry>>>,
     /// Multi-line fields, by path: their lines at the widths they were
     /// laid out at ([`MeasureCache::field_lines`]).
     fields: RefCell<HashMap<String, Vec<FieldLines>>>,
     /// The widest printable ASCII glyph of each font, with a margin — the
     /// bound that lets a short ASCII paragraph skip shaping.
     ascii_advance: RefCell<HashMap<FontKey, Px>>,
+}
+
+struct CachedGeometry {
+    value: Option<std::rc::Rc<crate::text_geometry::LineGeometry>>,
+    used: std::cell::Cell<u32>,
 }
 
 /// One multi-line field's visual lines at one width, kept from frame to
@@ -783,7 +874,7 @@ impl MeasureCache {
     pub fn begin_frame(&self) {
         let frame = self.frame.get().wrapping_add(1);
         self.frame.set(frame);
-        if frame % SWEEP_EVERY == 0 {
+        if frame.is_multiple_of(SWEEP_EVERY) {
             let mut fields = self.fields.borrow_mut();
             for kept in fields.values_mut() {
                 kept.retain(|lines| frame.wrapping_sub(lines.used.get()) <= FIELD_KEEP_FRAMES);
@@ -791,7 +882,7 @@ impl MeasureCache {
             fields.retain(|_, kept| !kept.is_empty());
         }
         let floor = self.floor();
-        if self.entries.get() <= floor || (floor > 0 && frame % SWEEP_EVERY != 0) {
+        if self.entries.get() <= floor || (floor > 0 && !frame.is_multiple_of(SWEEP_EVERY)) {
             return;
         }
         let mut lines = self.lines.borrow_mut();
@@ -804,9 +895,45 @@ impl MeasureCache {
             by_text.retain(|_, (_, used)| frame.wrapping_sub(used.get()) <= CACHE_KEEP_FRAMES);
         }
         breaks.retain(|_, by_text| !by_text.is_empty());
-        let kept = lines.values().map(HashMap::len).sum::<usize>()
+        let mut geometry = self.geometry.borrow_mut();
+        for by_text in geometry.values_mut() {
+            by_text.retain(|_, entry| frame.wrapping_sub(entry.used.get()) <= CACHE_KEEP_FRAMES);
+        }
+        geometry.retain(|_, by_text| !by_text.is_empty());
+        let kept = geometry.values().map(HashMap::len).sum::<usize>()
+            + lines.values().map(HashMap::len).sum::<usize>()
             + breaks.values().map(HashMap::len).sum::<usize>();
         self.entries.set(kept);
+    }
+
+    /// Cache the complete line's native geometry, including unsupported answers.
+    /// Repeated pointer, selection and caret queries do not reshape prefixes.
+    pub fn get_or_geometry(
+        &self,
+        text: &str,
+        font: &FontSpec,
+        engine: &dyn TextEngine,
+    ) -> Option<std::rc::Rc<crate::text_geometry::LineGeometry>> {
+        let key = font.key();
+        if let Some(entry) = self
+            .geometry
+            .borrow()
+            .get(&key)
+            .and_then(|by_text| by_text.get(text))
+        {
+            entry.used.set(self.frame.get());
+            return entry.value.clone();
+        }
+        let geometry = engine.line_geometry(text, font).map(std::rc::Rc::new);
+        self.geometry.borrow_mut().entry(key).or_default().insert(
+            text.to_owned(),
+            CachedGeometry {
+                value: geometry.clone(),
+                used: std::cell::Cell::new(self.frame.get()),
+            },
+        );
+        self.entries.set(self.entries.get() + 1);
+        geometry
     }
 
     pub fn get_or_measure(

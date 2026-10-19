@@ -280,6 +280,47 @@ impl Component for Popup {
     }
 }
 
+/// A popover with nothing to focus: a hint beside a field, the shape of a
+/// completion list or a preview card.
+#[derive(Clone, Copy)]
+struct Hint {
+    open: State<bool>,
+    value: State<String>,
+}
+impl Component for Hint {
+    fn body(self) -> impl View {
+        vstack!(
+            text_field("Name", self.value.binding())
+                .id("field")
+                .popover(self.open.binding(), Side::Bottom, |_| erased(text("a hint, no control"))),
+            button(text("Next"), || {}).id("next"),
+        )
+    }
+}
+
+#[test]
+fn a_popover_without_a_control_leaves_the_keyboard_where_it_was() {
+    let runtime = Runtime::new();
+    let view = Hint {
+        open: State::new(false),
+        value: State::new(String::new()),
+    };
+    runtime.display_frame(&view, SIZE);
+    assert!(runtime.focus_named("field"));
+    view.open.set(true);
+    runtime.display_frame(&view, SIZE);
+    // the hint is a picture: the field keeps the keyboard …
+    focused(&runtime, "field");
+    // … and the walk is the page's own, never the hint's
+    tab(&runtime, false);
+    focused(&runtime, "next");
+    tab(&runtime, false);
+    focused(&runtime, "field");
+    view.open.set(false);
+    runtime.display_frame(&view, SIZE);
+    focused(&runtime, "field");
+}
+
 #[test]
 fn popup_traps_the_tab_walk_and_returns_focus_to_its_opener() {
     let runtime = Runtime::new();

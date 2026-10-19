@@ -83,6 +83,24 @@ Registering the url scheme is the platform's own configuration (the
 bundle's `Info.plist`, the registry, a `.desktop` file), and stays
 the app's to write.
 
+On macOS, an associated HTTP(S) link arrives through
+`application:continueUserActivity:restorationHandler:` with
+`NSUserActivityTypeBrowsingWeb`. The shell forwards its `webpageURL` as one
+`Reopened` argument, preserving the URL fragment. Subscribe before creating the
+native app so a cold launch is heard too. Other activity types and missing URLs
+are not handled. The shell creates no restorable responder and does not retain
+the optional restoration block.
+
+The application still validates its own trusted origin and parameters, and owns
+its signed associated-domain entitlement and website association file. Receiving
+an event grants no access and must not implicitly accept an invitation. Sensitive
+links must stay out of logs and disk-backed instance spools: a bundled macOS app
+receives this event directly in memory. The delegate regression uses real
+Foundation activity/URL objects and the registered Objective-C method; it does
+not prove a deployed website association or system launch of a signed bundle.
+See Apple's [universal-link integration](https://developer.apple.com/documentation/xcode/supporting-universal-links-in-your-app)
+and [AppKit delegate contract](https://developer.apple.com/documentation/appkit/nsapplicationdelegate/application(_:continue:restorationhandler:)).
+
 ## More than one window
 
 A mail client detaches its composer; a workbench opens a second
@@ -194,7 +212,7 @@ interaction or human assistive-technology testing.
 | notification | UserNotifications, a category per button set | a WinRT toast under the process's AppUserModelID | `org.freedesktop.Notifications` `Notify` | UserNotifications, the same module as the Mac's; the system asks once | `NotificationManager` over JNI, one channel, a button per action; the person asked once at the first post |
 | activation | the center's delegate, while running or launched by the click | the toast's `Activated` event, while running | `ActionInvoked` on the session bus | the center's delegate, while running or launched by the tap | the activity RE-CREATED with the tap's intent, read at create — while running or as the launch |
 | second launch | the spool; a BUNDLED app reopens through the delegate instead | the spool | the spool | the system's own: one process by construction | the system's own: one activity by construction |
-| a url handed over | `application:openURLs:` → `Reopened` | an argument → the spool | an argument → the spool | the scene's `scene:openURLContexts:`, or the launch's `URLContexts` → `Reopened` | not yet — a `NativeActivity` hears no new intent |
+| a url handed over | `application:openURLs:` or a web browsing activity → `Reopened` | an argument → the spool | an argument → the spool | the scene's `scene:openURLContexts:`, or the launch's `URLContexts` → `Reopened` | not yet — a `NativeActivity` hears no new intent |
 | languages | `NSLocale.preferredLanguages`, and `NSCurrentLocaleDidChangeNotification` while running | `GetUserPreferredUILanguages`, read again on `WM_SETTINGCHANGE` | `LANGUAGE`, else `LC_ALL`, `LC_MESSAGES`, `LANG` — once; the environment does not move | `NSLocale.preferredLanguages`; a change relaunches the app | the configuration's `LocaleList`, read again on every configuration change |
 
 Five honest edges. macOS shows notifications for a BUNDLE, never a

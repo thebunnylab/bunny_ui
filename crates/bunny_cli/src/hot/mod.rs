@@ -17,12 +17,23 @@
 //! which the Simulator shares with the computer, or, on Android, an
 //! abstract socket that `adb reverse` carries here.
 //!
-//! An edit that reaches a type gets a new salt ([`classify`]). A change
-//! the library cannot carry restarts the app: `Cargo.toml`, `build.rs`,
-//! the binary's own `src/main.rs`, or a dependency that had to be built
-//! again.
+//! An edit that reaches a type ([`classify`]) is compiled first, then
+//! restarts the app. A new build salt cannot distinguish newly inserted
+//! primitive State fields from live fields with the same payload type.
+//! `Cargo.toml`, `build.rs`, the binary's own `src/main.rs`, or a rebuilt
+//! external dependency also require a restart.
+//!
+//! The path crates the app builds from — a `ui_kit` beside it — are
+//! watched with it: a save inside one of their function bodies builds
+//! the crate again and loads the generation that links it, the state
+//! kept. An edit that reaches one of their types restarts the app
+//! instead, and says so: a salt renames the app's own types, not a
+//! sibling's, so there is no new arena for the moved type to start over
+//! in. A change under a framework crate (`bunny-ui*`, when it is a path
+//! dependency) restarts too — the framework is one shared library.
 
 pub mod classify;
+pub mod sources;
 pub mod watch;
 
 use std::cell::Cell;
@@ -42,9 +53,9 @@ use crate::json::{self, Value};
 use crate::platform::{self, ChildSession, Options, Session, android, ios};
 use crate::process;
 use crate::project::Project;
-use crate::term;
 use crate::toolchains;
 use classify::Reach;
+use sources::{BuildInputs, BuildSources};
 use watch::Watch;
 
 /// How long the app may take to swap to a generation.
@@ -68,9 +79,20 @@ enum Place {
 
 /// One `bunny run` with hot reload: how it builds the app, and the code
 /// the running app has.
+/// A path crate the app builds from, beside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Local {
+    name: String,
+    dir: PathBuf,
+    /// `bunny-ui*`: one shared library, loaded once — a change restarts.
+    framework: bool,
+}
+
 pub struct Hot {
     project: Project,
     options: Options,
+    /// The path crates the app depends on, the framework's among them.
+    locals: Vec<Local>,
     place: Place,
     /// The triple, named outright even for this computer: without it,
     /// cargo links the binary against the framework twice — statically
@@ -94,6 +116,32 @@ pub struct Hot {
     /// them.
     sources: BTreeMap<PathBuf, String>,
     watch: Watch,
+    initial_inputs: Option<BuildInputs>,
+    built_sources: Option<BuildSources>,
+    /// What a lane that renders no terminal asks for.
+    extra: Extra,
+    /// What the road would have said on the terminal — hot reload off,
+    /// and why. `bunny run` prints them; an IDE reads them.
+    notes: Vec<String>,
+    /// The app's process id, once started.
+    pid: Option<u32>,
+}
+
+/// What a preview lane asks of the hot road beyond `bunny run`'s: more
+/// features of the framework, more environment for the app, the app in a
+/// process group of its own so a tool can end it with everything it
+/// spawned, and the compiler's diagnostics as data instead of a terminal.
+#[derive(Clone, Debug, Default)]
+pub struct Extra {
+    /// Framework features beyond `hot` (`bunny-ui/preview`).
+    pub features: Vec<String>,
+    /// Environment for the app (`BUNNY_PREVIEW_PORT`).
+    pub env: Vec<(String, OsString)>,
+    /// Start the app as the leader of a new process group (Unix), its
+    /// output nowhere.
+    pub process_group: bool,
+    /// Where the builds' diagnostics go.
+    pub diagnostics: cargo::Diagnostics,
 }
 
 /// What the saves since the last look ask of the running app.
@@ -116,8 +164,9 @@ pub struct Reloaded {
 
 /// Why a hot reload did not land.
 pub enum Missed {
-    /// The build failed, and cargo said why. The app keeps its code.
-    Build,
+    /// The build failed. Keep its diagnostics or failure message; the app
+    /// keeps its code.
+    Build(Error),
     /// Only a restart carries this change — and what it is.
     Restart(String),
     /// The app refused the new code, or did not answer.
@@ -128,6 +177,11 @@ impl Hot {
     /// Hot reload for the app on `device` — or why it has none, to follow
     /// "no hot reload: ".
     pub fn prepare(project: &Project, options: &Options, device: &Device) -> std::result::Result<Hot, String> {
+        Hot::prepare_with(project, options, device, Extra::default())
+    }
+
+    /// [`Hot::prepare`] with what a lane asks beyond `bunny run`'s.
+    pub fn prepare_with(project: &Project, options: &Options, device: &Device, extra: Extra) -> std::result::Result<Hot, String> {
         if !project.has_lib {
             return Err(String::from("it builds the app's code from src/lib.rs, and this app has none"));
         }
@@ -146,9 +200,18 @@ impl Hot {
             }
             _ => return Err(format!("{} does not load new code yet", device.name)),
         };
-        let feature = hot_feature(project, &target)?;
+        let metadata = metadata(project, &target)?;
+        let feature = hot_feature(&metadata, project)?;
+        for wanted in &extra.features {
+            if !framework_has_feature(&metadata, wanted.trim_start_matches("bunny-ui/")) {
+                return Err(format!("the app's bunny-ui does not have `{wanted}` yet (update it: cargo update -p bunny-ui)"));
+            }
+        }
+        let locals = locals(&metadata, project);
         let generations = project.out_dir("hot", &target, false).join("generations");
         platform::fresh_dir(&generations).map_err(|error| error.message)?;
+        let mut roots = vec![project.dir.clone()];
+        roots.extend(locals.iter().map(|local| local.dir.clone()));
         Ok(Hot {
             std_libs: rust.sysroot.join("lib/rustlib").join(&target).join("lib"),
             place,
@@ -160,10 +223,145 @@ impl Hot {
             next: Cell::new(1),
             salt: 1,
             sources: BTreeMap::new(),
-            watch: Watch::new(&project.dir),
+            initial_inputs: None,
+            built_sources: None,
+            watch: Watch::new_many(&roots),
             project: project.clone(),
             options: options.clone(),
+            locals,
+            extra,
+            notes: Vec::new(),
+            pid: None,
         })
+    }
+
+    /// The app's directory and its path crates' — what is watched and
+    /// read.
+    fn roots(&self) -> Vec<PathBuf> {
+        let mut roots = vec![self.project.dir.clone()];
+        roots.extend(self.locals.iter().map(|local| local.dir.clone()));
+        roots
+    }
+
+    /// Which package a file belongs to: the app's, or one of its path
+    /// crates — the deepest directory that holds it.
+    fn local_of(&self, path: &Path) -> Option<&Local> {
+        self.locals.iter().filter(|local| path.starts_with(&local.dir)).max_by_key(|local| local.dir.as_os_str().len())
+    }
+
+    /// Whether a saved file is one the library builds from at all: a
+    /// sibling's own binaries are not.
+    fn relevant(&self, path: &Path) -> bool {
+        match self.local_of(path) {
+            Some(local) if !local.framework => {
+                let relative = path.strip_prefix(&local.dir).unwrap_or(path);
+                !(relative == Path::new("src/main.rs") || relative.starts_with("src/bin"))
+            }
+            _ => true,
+        }
+    }
+
+    /// What a save of `changed` asks for: a file the library does not
+    /// build from restarts the app, and so does anything under a
+    /// framework crate; the app's own files answer as [`change`] says.
+    fn change(&self, changed: &[PathBuf]) -> Change {
+        let mut own = Vec::new();
+        for path in changed {
+            let Some(local) = self.local_of(path) else {
+                own.push(path.clone());
+                continue;
+            };
+            let relative = path.strip_prefix(&local.dir).unwrap_or(path);
+            if local.framework {
+                return Change::Restart(format!("{} changed: the framework is one shared library", local.name));
+            }
+            if relative == Path::new("Cargo.toml") || relative == Path::new("build.rs") {
+                return Change::Restart(format!("{}/{} changed", local.name, relative.display()));
+            }
+        }
+        change(&self.project.dir, &own)
+    }
+
+    /// The library's sources, the path crates' with them: every `.rs`
+    /// under each `src/`, the binaries' own files and the framework's
+    /// left out.
+    fn read_sources(&self) -> BTreeMap<PathBuf, String> {
+        fn walk(dir: &Path, sources: &mut BTreeMap<PathBuf, String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, sources);
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && let Ok(text) = std::fs::read_to_string(&path)
+                {
+                    sources.insert(path, text);
+                }
+            }
+        }
+        let mut sources = BTreeMap::new();
+        for root in self.roots() {
+            walk(&root.join("src"), &mut sources);
+        }
+        sources.retain(|path, _| self.relevant(path) && !matches!(self.change(std::slice::from_ref(path)), Change::Restart(_)));
+        sources
+    }
+
+    /// Whether a sibling crate's edit reached one of its types, by name.
+    fn sibling_types_moved(&self, now: &BTreeMap<PathBuf, String>) -> Option<&str> {
+        self.locals.iter().filter(|local| !local.framework).find(|local| reaches_types_under(&local.dir, &self.sources, now)).map(|local| local.name.as_str())
+    }
+
+    /// What the road would have said on the terminal since the last
+    /// take — `bunny run` prints it, an IDE shows it.
+    pub fn take_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
+    }
+
+    /// The app's process id, once started — and the leader of its
+    /// process group when [`Extra::process_group`] asked for one.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// The project the road builds.
+    pub fn project(&self) -> &Project {
+        &self.project
+    }
+
+    /// Sources observed stable around the last successful build. None means
+    /// provenance is unavailable; callers must not substitute current disk text.
+    pub fn built_sources(&self) -> Option<&BuildSources> {
+        self.built_sources.as_ref()
+    }
+
+    fn capture_inputs(&mut self) -> Option<BuildInputs> {
+        match BuildInputs::capture(&self.roots()) {
+            Ok(inputs) => Some(inputs),
+            Err(error) => {
+                self.notes
+                    .push(format!("source provenance unavailable: {error}"));
+                None
+            }
+        }
+    }
+
+    fn finish_inputs(&mut self, inputs: Option<BuildInputs>) {
+        self.built_sources = inputs.and_then(|inputs| match inputs.finish() {
+            Ok(sources) => {
+                if sources.is_none() {
+                    self.notes.push(String::from(
+                        "source provenance unavailable: inputs changed during the build",
+                    ));
+                }
+                sources
+            }
+            Err(error) => {
+                self.notes
+                    .push(format!("source provenance unavailable: {error}"));
+                None
+            }
+        });
     }
 
     /// Builds the app with its first generation, and starts it.
@@ -173,15 +371,22 @@ impl Hot {
         let port = listener.local_addr().map(|address| address.port()).unwrap_or_default().to_string();
         // what the build reads, looked at before it: a save during the
         // build is a change the next look finds
-        self.watch = Watch::new(&self.project.dir);
-        let sources = read_sources(&self.project.dir);
-        let feature = std::slice::from_ref(&self.feature);
+        self.watch = Watch::new_many(&self.roots());
+        let sources = self.read_sources();
+        let inputs = self.capture_inputs();
+        let mut features = vec![self.feature.clone()];
+        features.extend(self.extra.features.iter().cloned());
+        let feature = features.as_slice();
         let (app, bytes) = match &self.place {
             Place::Desktop => {
-                let (executable, built) = platform::desktop::build_with(&self.project, &self.options, Some(&self.target), feature)?;
+                let (executable, built) =
+                    platform::desktop::build_with_diagnostics(&self.project, &self.options, Some(&self.target), feature, self.extra.diagnostics)?;
                 let (generation, _) = self.build_generation(self.salt)?;
-                let env = [("BUNNY_HOT_PORT", OsString::from(&port)), ("BUNNY_HOT_GENERATION", generation.into_os_string())];
-                (launch(&executable, &env, &[self.std_libs.clone(), deps(&built)], &self.options)?, false)
+                let mut env = vec![(String::from("BUNNY_HOT_PORT"), OsString::from(&port)), (String::from("BUNNY_HOT_GENERATION"), generation.into_os_string())];
+                env.extend(self.extra.env.iter().cloned());
+                let (session, pid) = launch(&executable, &env, &[self.std_libs.clone(), deps(&built)], &self.options, self.extra.process_group)?;
+                self.pid = Some(pid);
+                (session, false)
             }
             Place::Simulator(device) => {
                 let app = ios::build_simulator_with(&self.project, &self.options, feature)?;
@@ -201,35 +406,63 @@ impl Hot {
                 let socket = format!("localabstract:{ANDROID_SOCKET}");
                 let reversed = toolchain.adb(serial, &["reverse", &socket, &format!("tcp:{port}")])?;
                 if !reversed.ok() {
-                    println!("{}", term::warn(&format!("adb reverse failed: {}", reversed.stderr.trim())));
+                    self.notes.push(format!("adb reverse failed: {}", reversed.stderr.trim()));
                 }
                 let session = android::launch(toolchain, serial, &apk, &self.options)?;
                 (session.ok_or_else(|| Error::new("the app started detached"))?, true)
             }
         };
         self.sources = sources;
-        Ok(call_back(listener, app, bytes))
+        self.initial_inputs = inputs.clone();
+        self.finish_inputs(inputs);
+        if self.built_sources.is_none() {
+            self.initial_inputs = None;
+        }
+        let (session, note) = call_back(listener, app, bytes);
+        if let Some(why) = note {
+            self.notes.push(format!("hot reload is off: {why} — r restarts the app"));
+        }
+        Ok(session)
     }
 
     /// What the saves since the last look ask for — `None` when nothing
     /// was saved.
     pub fn poll(&mut self) -> Option<Change> {
-        let changed = self.watch.changed();
+        let changed: Vec<PathBuf> = self.watch.changed().into_iter().filter(|path| self.relevant(path)).collect();
         if changed.is_empty() {
             return None;
         }
-        Some(change(&self.project.dir, &changed))
+        Some(self.change(&changed))
     }
 
     /// Builds the library as it is now and loads it into the running app.
     pub fn reload(&mut self, app: &mut dyn Session) -> std::result::Result<Reloaded, Missed> {
         let began = Instant::now();
-        let sources = read_sources(&self.project.dir);
-        let new_types = reaches_types(&self.sources, &sources);
+        let sources = self.read_sources();
+        let inputs = self.capture_inputs().filter(|now| {
+            self.initial_inputs.as_ref().is_some_and(|initial| {
+                now.unchanged_where(initial, |path| {
+                    matches!(self.change(&[path.to_path_buf()]), Change::Restart(_))
+                })
+            })
+        });
+        // a sibling's type that moved has no salt to start over under
+        if let Some(name) = self.sibling_types_moved(&sources) {
+            return Err(Missed::Restart(format!("a type of {name} changed: a sibling's types keep their state only through a restart")));
+        }
+        let new_types = reaches_types_under(&self.project.dir, &self.sources, &sources);
         let salt = if new_types { self.salt + 1 } else { self.salt };
-        let (generation, rebuilt) = self.build_generation(salt).map_err(|_| Missed::Build)?;
-        if let Some(dependency) = rebuilt.first() {
+        let (generation, rebuilt) = self.build_generation(salt).map_err(Missed::Build)?;
+        // a sibling built again is the save that was just made; anything
+        // else built again — the framework, a registry crate — is a restart
+        if let Some(dependency) = rebuilt.iter().find(|name| !self.locals.iter().any(|local| !local.framework && local.name == **name)) {
             return Err(Missed::Restart(format!("{dependency} was built again")));
+        }
+        // Salting renames application types, not primitive State payloads. A
+        // new field can otherwise claim a live sibling's ordinal. Compile first
+        // so a failed edit leaves the old app alive, then reset all execution.
+        if new_types {
+            return Err(Missed::Restart(String::from("an application type changed: live state must restart")));
         }
         match app.load(&generation) {
             None => Err(Missed::Load(String::from("this app does not take new code"))),
@@ -237,6 +470,7 @@ impl Hot {
             Some(Ok(_)) => {
                 self.salt = salt;
                 self.sources = sources;
+                self.finish_inputs(inputs);
                 Ok(Reloaded { took: began.elapsed(), new_types })
             }
         }
@@ -247,6 +481,7 @@ impl Hot {
     fn build_generation(&self, salt: u32) -> Result<(PathBuf, Vec<String>)> {
         let mut features = self.options.features.clone();
         features.push(self.feature.clone());
+        features.extend(self.extra.features.iter().cloned());
         let mut rustc_args = self.rustc_args.clone();
         rustc_args.extend([String::from("-C"), format!("metadata=bunny-salt-{salt}")]);
         let built = cargo::build(&cargo::Build {
@@ -260,6 +495,7 @@ impl Hot {
             env: self.env.clone(),
             rustc_args,
             quiet: true,
+            diagnostics: self.extra.diagnostics,
         })?;
         let extension = built.artifact.extension().map(|ext| ext.to_string_lossy().into_owned()).unwrap_or_default();
         let number = self.next.replace(self.next.get() + 1);
@@ -276,9 +512,8 @@ fn deps(artifact: &Path) -> PathBuf {
     artifact.parent().map(|dir| dir.join("deps")).unwrap_or_default()
 }
 
-/// `bunny-ui/hot`, by the name the app gives bunny-ui — when the
-/// bunny-ui it resolves to has hot reload.
-fn hot_feature(project: &Project, target: &str) -> std::result::Result<String, String> {
+/// The app's dependency graph for `target`, as cargo answers it.
+fn metadata(project: &Project, target: &str) -> std::result::Result<Value, String> {
     let manifest = project.manifest.to_string_lossy().into_owned();
     let args = ["metadata", "--format-version", "1", "--filter-platform", target, "--manifest-path", manifest.as_str()];
     let out = process::run_in("cargo", &args, Some(&project.dir), &[], Duration::from_secs(120))
@@ -286,7 +521,55 @@ fn hot_feature(project: &Project, target: &str) -> std::result::Result<String, S
     if !out.ok() {
         return Err(format!("cargo could not read the app's dependencies: {}", out.stderr.trim()));
     }
-    let metadata = json::parse(&out.stdout).map_err(|error| format!("cargo metadata: {error}"))?;
+    json::parse(&out.stdout).map_err(|error| format!("cargo metadata: {error}"))
+}
+
+/// The path crates the app depends on, directly or through another: a
+/// package with no source is a path, and the framework's own are told
+/// apart by their name.
+fn locals(metadata: &Value, project: &Project) -> Vec<Local> {
+    let packages = metadata.get("packages").map(Value::as_array).unwrap_or_default();
+    let by_id: BTreeMap<&str, &Value> = packages.iter().filter_map(|package| Some((package.str_at(&["id"])?, package))).collect();
+    let nodes = metadata.path(&["resolve", "nodes"]).map(Value::as_array).unwrap_or_default();
+    let deps_of: BTreeMap<&str, Vec<&str>> = nodes
+        .iter()
+        .filter_map(|node| {
+            let deps = node.get("deps").map(Value::as_array).unwrap_or_default().iter().filter_map(|dep| dep.str_at(&["pkg"])).collect();
+            Some((node.str_at(&["id"])?, deps))
+        })
+        .collect();
+    let Some(app) = packages.iter().find(|package| package.str_at(&["manifest_path"]).map(Path::new) == Some(project.manifest.as_path())).and_then(|package| package.str_at(&["id"]))
+    else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut queue = vec![app];
+    let mut found = Vec::new();
+    while let Some(id) = queue.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        for dep in deps_of.get(id).into_iter().flatten() {
+            queue.push(dep);
+        }
+        if id == app {
+            continue;
+        }
+        let Some(package) = by_id.get(id) else { continue };
+        if package.str_at(&["source"]).is_some() {
+            continue;
+        }
+        let (Some(name), Some(manifest)) = (package.str_at(&["name"]), package.str_at(&["manifest_path"])) else { continue };
+        let Some(dir) = Path::new(manifest).parent() else { continue };
+        found.push(Local { name: name.to_string(), dir: dir.to_path_buf(), framework: name.starts_with("bunny-ui") });
+    }
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    found
+}
+
+/// `bunny-ui/hot`, by the name the app gives bunny-ui — when the
+/// bunny-ui it resolves to has hot reload.
+fn hot_feature(metadata: &Value, project: &Project) -> std::result::Result<String, String> {
     let packages = metadata.get("packages").map(Value::as_array).unwrap_or_default();
     let app = packages
         .iter()
@@ -308,8 +591,16 @@ fn hot_feature(project: &Project, target: &str) -> std::result::Result<String, S
     Ok(format!("{}/hot", dependency.str_at(&["rename"]).unwrap_or("bunny-ui")))
 }
 
-/// What a save of `changed` asks for: a file the library does not build
-/// from restarts the app.
+/// Whether the app's `bunny-ui` has the feature `name`.
+fn framework_has_feature(metadata: &Value, name: &str) -> bool {
+    let packages = metadata.get("packages").map(Value::as_array).unwrap_or_default();
+    packages.iter().filter(|package| package.str_at(&["name"]) == Some("bunny-ui")).any(|package| {
+        package.get("features").is_some_and(|features| features.members().iter().any(|(feature, _)| feature == name))
+    })
+}
+
+/// What a save of the app's own `changed` files asks for: a file the
+/// library does not build from restarts the app.
 fn change(dir: &Path, changed: &[PathBuf]) -> Change {
     for path in changed {
         let relative = path.strip_prefix(dir).unwrap_or(path);
@@ -321,39 +612,36 @@ fn change(dir: &Path, changed: &[PathBuf]) -> Change {
     Change::Code
 }
 
-/// Whether the edit from `old` to `new` reaches a type: a file that came
-/// or went (a module, an item set), or an edit outside function bodies.
-fn reaches_types(old: &BTreeMap<PathBuf, String>, new: &BTreeMap<PathBuf, String>) -> bool {
-    old.keys().ne(new.keys())
-        || old.iter().any(|(path, text)| new.get(path).is_some_and(|now| classify::classify(text, now) == Reach::Types))
-}
-
-/// The library's sources: every `.rs` under `src/`, the binary's own
-/// files left out.
-fn read_sources(dir: &Path) -> BTreeMap<PathBuf, String> {
-    fn walk(dir: &Path, sources: &mut BTreeMap<PathBuf, String>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, sources);
-            } else if path.extension().is_some_and(|ext| ext == "rs")
-                && let Ok(text) = std::fs::read_to_string(&path)
-            {
-                sources.insert(path, text);
-            }
-        }
-    }
-    let mut sources = BTreeMap::new();
-    walk(&dir.join("src"), &mut sources);
-    sources.retain(|path, _| !matches!(change(dir, std::slice::from_ref(path)), Change::Restart(_)));
-    sources
+/// Whether the edit from `old` to `new`, among the files under `root`,
+/// reaches a type: a file that came or went (a module, an item set), or
+/// an edit outside function bodies.
+fn reaches_types_under(root: &Path, old: &BTreeMap<PathBuf, String>, new: &BTreeMap<PathBuf, String>) -> bool {
+    let before: Vec<&PathBuf> = old.keys().filter(|path| path.starts_with(root)).collect();
+    let after: Vec<&PathBuf> = new.keys().filter(|path| path.starts_with(root)).collect();
+    before != after
+        || before.iter().any(|path| {
+            let (Some(text), Some(now)) = (old.get(*path), new.get(*path)) else { return false };
+            classify::classify(text, now) == Reach::Types
+        })
 }
 
 /// Starts the binary on this computer, its output in this terminal.
-fn launch(executable: &Path, env: &[(&str, OsString)], libs: &[PathBuf], options: &Options) -> Result<Box<dyn Session>> {
+fn launch(
+    executable: &Path,
+    env: &[(String, OsString)],
+    libs: &[PathBuf],
+    options: &Options,
+    process_group: bool,
+) -> Result<(Box<dyn Session>, u32)> {
     let mut command = Command::new(executable);
-    command.args(&options.args).stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    // a lane's app writes to no terminal: its output goes nowhere
+    let (out, err) = if process_group { (Stdio::null(), Stdio::null()) } else { (Stdio::inherit(), Stdio::inherit()) };
+    command.args(&options.args).stdin(Stdio::null()).stdout(out).stderr(err);
+    #[cfg(unix)]
+    if process_group {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     for (key, value) in env {
         command.env(key, value);
     }
@@ -378,16 +666,15 @@ fn launch(executable: &Path, env: &[(&str, OsString)], libs: &[PathBuf], options
     }
     let child =
         command.spawn().map_err(|error| Error::new(format!("{} did not start: {error}", executable.display())))?;
-    Ok(Box::new(ChildSession { child, on_stop: None }))
+    let pid = child.id();
+    Ok((Box::new(ChildSession { child, on_stop: None }), pid))
 }
 
 /// Waits for the started app to call back, and answers the session that
 /// talks to it. An app that never calls runs on, without hot reload.
-fn call_back(listener: TcpListener, mut app: Box<dyn Session>, bytes: bool) -> Box<dyn Session> {
-    let off = |why: &str| println!("{}", term::warn(&format!("hot reload is off: {why} — r restarts the app")));
+fn call_back(listener: TcpListener, mut app: Box<dyn Session>, bytes: bool) -> (Box<dyn Session>, Option<String>) {
     if listener.set_nonblocking(true).is_err() {
-        off("the port did not open");
-        return app;
+        return (app, Some(String::from("the port did not open")));
     }
     let until = Instant::now() + CALL_TIMEOUT;
     let stream = loop {
@@ -395,30 +682,26 @@ fn call_back(listener: TcpListener, mut app: Box<dyn Session>, bytes: bool) -> B
             Ok((stream, _)) => break stream,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if app.wait(Duration::from_millis(50)).is_some() {
-                    return app;
+                    return (app, None);
                 }
                 if Instant::now() >= until {
-                    off("the app did not call back");
-                    return app;
+                    return (app, Some(String::from("the app did not call back")));
                 }
             }
             Err(error) => {
-                off(&format!("the app's call did not land: {error}"));
-                return app;
+                return (app, Some(format!("the app's call did not land: {error}")));
             }
         }
     };
     match HotApp::new(app, stream, bytes) {
-        Ok(hot) => Box::new(hot),
-        Err((app, why)) => {
-            off(&why);
-            app
-        }
+        Ok(hot) => (Box::new(hot), None),
+        Err((app, why)) => (app, Some(why)),
     }
 }
 
 /// The running app, with a line to it.
 struct HotApp {
+    generation: Option<u32>,
     app: Box<dyn Session>,
     line: TcpStream,
     answers: Receiver<String>,
@@ -442,7 +725,13 @@ impl HotApp {
                 }
             }
         });
-        let mut hot = HotApp { app, line, answers, bytes };
+        let mut hot = HotApp {
+            app,
+            line,
+            answers,
+            bytes,
+            generation: None,
+        };
         match hot.answer(LOAD_TIMEOUT) {
             Ok(_) => Ok(hot),
             Err(why) => Err((hot.app, why)),
@@ -454,7 +743,11 @@ impl HotApp {
         let until = Instant::now() + timeout;
         loop {
             match self.answers.recv_timeout(Duration::from_millis(100)) {
-                Ok(answer) => return parse_answer(&answer),
+                Ok(answer) => {
+                    let loaded = parse_answer(&answer)?;
+                    self.generation = loaded.generation;
+                    return Ok(loaded.took);
+                }
                 Err(RecvTimeoutError::Disconnected) => return Err(String::from("the app stopped")),
                 Err(RecvTimeoutError::Timeout) => {
                     if self.app.wait(Duration::ZERO).is_some() {
@@ -480,20 +773,44 @@ impl HotApp {
     }
 }
 
+/// An acknowledgment carries the runtime's generation, never a guessed counter.
+#[derive(Debug, PartialEq, Eq)]
+struct Loaded {
+    generation: Option<u32>,
+    took: Duration,
+}
+
 /// `loaded <n> <ms>`, `ready`, or `failed <why>`.
-fn parse_answer(answer: &str) -> std::result::Result<Duration, String> {
+fn parse_answer(answer: &str) -> std::result::Result<Loaded, String> {
     match answer.split_once(' ').unwrap_or((answer, "")) {
         ("loaded", rest) => {
-            let millis = rest.split_whitespace().nth(1).and_then(|ms| ms.parse().ok()).unwrap_or(0);
-            Ok(Duration::from_millis(millis))
+            let mut fields = rest.split_whitespace();
+            let generation = fields.next().and_then(|n| n.parse().ok());
+            let millis = fields.next().and_then(|ms| ms.parse().ok());
+            match (generation, millis, fields.next()) {
+                (Some(generation), Some(millis), None) => Ok(Loaded {
+                    generation: Some(generation),
+                    took: Duration::from_millis(millis),
+                }),
+                _ => Err(format!(
+                    "the app sent an invalid load acknowledgment: {answer:?}"
+                )),
+            }
         }
-        ("ready", _) => Ok(Duration::ZERO),
+        ("ready", "") => Ok(Loaded {
+            generation: None,
+            took: Duration::ZERO,
+        }),
         ("failed", why) => Err(why.to_string()),
         _ => Err(format!("the app answered {answer:?}")),
     }
 }
 
 impl Session for HotApp {
+    fn generation(&self) -> Option<u32> {
+        self.generation
+    }
+
     fn wait(&mut self, timeout: Duration) -> Option<Option<i32>> {
         self.app.wait(timeout)
     }
@@ -534,15 +851,33 @@ mod tests {
         let body = [(PathBuf::from("src/lib.rs"), String::from("fn a() { 2 }"))].into();
         let mut two = one.clone();
         two.insert(PathBuf::from("src/row.rs"), String::new());
-        assert!(!reaches_types(&one, &body));
-        assert!(reaches_types(&one, &two));
-        assert!(reaches_types(&two, &one));
+        let root = Path::new("");
+        assert!(!reaches_types_under(root, &one, &body));
+        assert!(reaches_types_under(root, &one, &two));
+        assert!(reaches_types_under(root, &two, &one));
+        // another root's files are not this one's business
+        assert!(!reaches_types_under(Path::new("elsewhere"), &one, &two));
     }
 
     #[test]
     fn the_answers_of_the_app_are_read() {
-        assert_eq!(parse_answer("loaded 3 164"), Ok(Duration::from_millis(164)));
-        assert_eq!(parse_answer("ready"), Ok(Duration::ZERO));
+        assert_eq!(
+            parse_answer("loaded 3 164"),
+            Ok(Loaded {
+                generation: Some(3),
+                took: Duration::from_millis(164)
+            })
+        );
+        assert_eq!(
+            parse_answer("ready"),
+            Ok(Loaded {
+                generation: None,
+                took: Duration::ZERO
+            })
+        );
+        assert!(parse_answer("loaded x 164").is_err());
+        assert!(parse_answer("loaded 3").is_err());
+        assert!(parse_answer("loaded 3 x").is_err());
         assert_eq!(parse_answer("failed it has no entry"), Err(String::from("it has no entry")));
         assert!(parse_answer("hello").is_err());
     }

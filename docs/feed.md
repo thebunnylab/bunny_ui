@@ -95,6 +95,19 @@ buffer copies them into the texture before it draws. GL, WebGL and
 D3D11 order the write themselves; Vulkan records the barriers it always
 did.
 
+Metal keeps staged copies pending until their command is committed. If a
+drawable or upload encoder cannot be obtained, the next walk invalidates
+those feed stamps and retries the same generation. Committed copies carry
+only texture/generation metadata in the existing ring slot. A terminal
+command error invalidates the matching generation and the presenter's
+retained-frame shortcuts; a later generation and unrelated feeds stay valid.
+The next requested frame performs the retry. This does not schedule a new
+frame on its own or change the successful upload/render strategy.
+
+The recovery tests use actual Metal pixels, including a real nil drawable,
+plus injected command-error outcomes. An injected outcome is not a physical
+GPU failure, and successful upload recovery is not proof of display timing.
+
 ## Lifetime
 
 - A feed's texture is minted on first sight and kept while frames read

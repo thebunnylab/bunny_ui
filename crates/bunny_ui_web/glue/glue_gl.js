@@ -59,6 +59,15 @@ function glBytes(pointer, length) {
   return new Uint8Array(glWasm.memory.buffer, pointer >>> 0, length >>> 0);
 }
 
+// Floats for a FLOAT texture or a vec4 array: a view where the pointer
+// sits on four bytes, a copy where it does not (a view would throw)
+function glFloats(pointer, length) {
+  pointer >>>= 0;
+  length >>>= 0;
+  if (pointer % 4 === 0) return new Float32Array(glWasm.memory.buffer, pointer, length >>> 2);
+  return new Float32Array(glBytes(pointer, length).slice().buffer);
+}
+
 const glDecoder = new TextDecoder();
 const glEncoder = new TextEncoder();
 
@@ -294,8 +303,11 @@ const bunnyGlImports = {
   },
   gl_tex_image_2d(target, level, internal, width, height, format, kind, pointer, length) {
     // a null pointer allocates without filling — the atlas and the
-    // pyramid both open their storage that way
-    const source = pointer ? glBytes(pointer, length) : null;
+    // pyramid both open their storage that way. FLOAT data wants a view
+    // of floats; every other kind takes the bytes
+    const source = pointer
+      ? (kind >>> 0) === 0x1406 ? glFloats(pointer, length) : glBytes(pointer, length)
+      : null;
     gl.texImage2D(
       target >>> 0, level | 0, internal | 0, width | 0, height | 0, 0,
       format >>> 0, kind >>> 0, source,
@@ -331,6 +343,54 @@ const bunnyGlImports = {
   gl_draw_arrays_instanced(mode, first, count, instances) {
     gl.drawArraysInstanced(mode >>> 0, first | 0, count | 0, instances | 0);
   },
+  // MARK: - The world pass (feature `3d`): depth, samples, indexed meshes
+
+  gl_uniform4fv(location, pointer, count) {
+    gl.uniform4fv(glObj(location), glFloats(pointer, (count >>> 0) * 16));
+  },
+  gl_buffer_data(target, pointer, length, usage) {
+    gl.bufferData(target >>> 0, glHeap(), usage >>> 0, pointer >>> 0, length >>> 0);
+  },
+  gl_delete_vertex_array(array) { gl.deleteVertexArray(glRelease(array)); },
+  gl_vertex_attrib_i_pointer(index, size, kind, stride, offset) {
+    gl.vertexAttribIPointer(index >>> 0, size | 0, kind >>> 0, stride | 0, offset | 0);
+  },
+  gl_framebuffer_renderbuffer(target, attachment, renderbuffer) {
+    gl.framebufferRenderbuffer(target >>> 0, attachment >>> 0, gl.RENDERBUFFER, glObj(renderbuffer));
+  },
+  gl_create_renderbuffer() { return glPut(gl.createRenderbuffer()); },
+  gl_delete_renderbuffer(renderbuffer) { gl.deleteRenderbuffer(glRelease(renderbuffer)); },
+  // binds, then gives storage; zero samples is one
+  gl_renderbuffer_storage_multisample(renderbuffer, samples, internal, width, height) {
+    gl.bindRenderbuffer(gl.RENDERBUFFER, glObj(renderbuffer));
+    if ((samples | 0) > 0) {
+      gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples | 0, internal >>> 0, width | 0, height | 0);
+    } else {
+      gl.renderbufferStorage(gl.RENDERBUFFER, internal >>> 0, width | 0, height | 0);
+    }
+  },
+  // the samples resolve: the read framebuffer's colour onto the draw one
+  gl_blit_framebuffer(width, height) {
+    gl.blitFramebuffer(
+      0, 0, width | 0, height | 0, 0, 0, width | 0, height | 0, gl.COLOR_BUFFER_BIT, gl.NEAREST,
+    );
+  },
+  // a tiled GPU need not write back what nobody reads
+  gl_invalidate_framebuffer(target, first, second) {
+    const attachments = [];
+    if (first >>> 0) attachments.push(first >>> 0);
+    if (second >>> 0) attachments.push(second >>> 0);
+    if (attachments.length) gl.invalidateFramebuffer(target >>> 0, attachments);
+  },
+  gl_depth_func(func) { gl.depthFunc(func >>> 0); },
+  gl_depth_mask(write) { gl.depthMask(write !== 0); },
+  gl_cull_face(face) { gl.cullFace(face >>> 0); },
+  gl_front_face(mode) { gl.frontFace(mode >>> 0); },
+  gl_clear_depth(depth) { gl.clearDepth(depth); },
+  gl_draw_elements_instanced(mode, count, kind, offset, instances) {
+    gl.drawElementsInstanced(mode >>> 0, count | 0, kind >>> 0, offset | 0, instances | 0);
+  },
+
   // this STALLS the thread: it flushes and waits. No frame may call it;
   // it is the parity harness's own sync point.
   // A read the browser refuses leaves the bytes as they were: the tier's

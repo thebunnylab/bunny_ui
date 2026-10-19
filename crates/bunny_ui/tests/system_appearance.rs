@@ -101,3 +101,42 @@ fn custom_palette_observers_rebuild_every_retained_scene_and_survive_first_scene
     theme::observe_system_appearance(Some(Appearance::Light));
     assert_eq!(theme::version(), before);
 }
+
+#[derive(Clone)]
+struct PaletteReader(Rc<Cell<Theme>>);
+impl Component for PaletteReader {
+    fn body(self) -> impl View {
+        self.0.set(theme::current());
+        text("palette").foreground_color(theme::fg())
+    }
+}
+
+#[test]
+fn system_palette_survives_scene_theme_restoration() {
+    theme::observe_system_appearance(Some(Appearance::Light));
+    theme::follow_system();
+    let ordinary = Runtime::scene("system-palette");
+    let quiet = Runtime::scene("quiet-palette").theme(Theme::light());
+    let seen = Rc::new(Cell::new(Theme::light()));
+    let root = PaletteReader(Rc::clone(&seen));
+    let size = Size {
+        width: 100.0,
+        height: 80.0,
+    };
+    for appearance in [Appearance::Dark, Appearance::Light, Appearance::Dark] {
+        theme::observe_system_appearance(Some(appearance));
+        quiet.display_frame(&root, size);
+        ordinary.display_frame(&root, size);
+        let expected = if appearance == Appearance::Dark {
+            Theme::dark()
+        } else {
+            Theme::light()
+        };
+        assert_eq!(
+            seen.get(),
+            expected,
+            "an ordinary scene follows the observed palette"
+        );
+        assert_eq!(theme::installed(), expected);
+    }
+}

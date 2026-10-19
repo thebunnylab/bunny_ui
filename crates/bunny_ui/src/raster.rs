@@ -266,7 +266,7 @@ fn blend_px(src: u32, dst: u32) -> u32 {
 /// why only islands ever need it.
 pub fn unpremultiplied(rgba: &[u8]) -> Vec<u8> {
     let mut out = rgba.to_vec();
-    for pixel in out.chunks_exact_mut(4) {
+    for pixel in out.as_chunks_mut::<4>().0 {
         let alpha = pixel[3] as u32;
         if alpha == 0 || alpha == 255 {
             continue;
@@ -315,7 +315,7 @@ impl Bitmap {
         // byte checked its capacity four times a pixel, and a looping
         // canvas pays this on every tick
         let mut bytes = vec![0u8; self.pixels.len() * 4];
-        for (dst, pixel) in bytes.chunks_exact_mut(4).zip(&self.pixels) {
+        for (dst, pixel) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(&self.pixels) {
             dst.copy_from_slice(&pixel.to_be_bytes());
         }
         bytes
@@ -1753,7 +1753,7 @@ impl Surface {
                 let row = y * width;
                 for x in x0..x1 {
                     let pixel = self.bitmap.pixels[row + x];
-                    let alpha = (pixel & 0xff) as u32;
+                    let alpha = pixel & 0xff;
                     let straight = |channel: u32| -> u8 {
                         if alpha == 0 || alpha == 255 {
                             channel as u8

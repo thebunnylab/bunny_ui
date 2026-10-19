@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "bunny-ui-core",
  "bunny-ui-macos",
+ "bunny-ui-windows",
  "serde_json",
 ]
 
@@ -66,11 +67,14 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bunny-cli"
-version = "0.2.1"
+version = "0.3.0"
+dependencies = [
+ "bunny-ui-preview",
+]
 
 [[package]]
 name = "bunny-ui"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bunny-ui-android",
  "bunny-ui-core",
@@ -79,13 +83,15 @@ dependencies = [
  "bunny-ui-ios",
  "bunny-ui-linux",
  "bunny-ui-macos",
+ "bunny-ui-preview",
+ "bunny-ui-preview-macros",
  "bunny-ui-web",
  "bunny-ui-windows",
 ]
 
 [[package]]
 name = "bunny-ui-android"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bunny-ui-core",
  "bunny-ui-vulkan",
@@ -95,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "bunny-ui-apple"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bunny-ui-core",
  "foreign-types",
@@ -106,14 +112,14 @@ dependencies = [
 
 [[package]]
 name = "bunny-ui-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bunny-ui-motor",
 ]
 
 [[package]]
 name = "bunny-ui-dylib"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bunny-ui-android",
  "bunny-ui-core",
@@ -127,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "bunny-ui-hot"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bunny-ui-core",
  "bunny-ui-motor",
@@ -135,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "bunny-ui-ios"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bunny-ui-apple",
  "bunny-ui-core",
@@ -145,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "bunny-ui-linux"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bunny-ui-core",
  "bunny-ui-vulkan",
@@ -155,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "bunny-ui-macos"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bunny-ui-apple",
  "bunny-ui-core",
@@ -168,25 +174,37 @@ dependencies = [
 
 [[package]]
 name = "bunny-ui-motor"
-version = "0.2.1"
+version = "0.3.0"
+
+[[package]]
+name = "bunny-ui-preview"
+version = "0.3.0"
+dependencies = [
+ "bunny-ui-core",
+ "bunny-ui-hot",
+]
+
+[[package]]
+name = "bunny-ui-preview-macros"
+version = "0.3.0"
 
 [[package]]
 name = "bunny-ui-vulkan"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bunny-ui-core",
 ]
 
 [[package]]
 name = "bunny-ui-web"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bunny-ui-core",
 ]
 
 [[package]]
 name = "bunny-ui-windows"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bunny-ui-core",
  "countries-core",

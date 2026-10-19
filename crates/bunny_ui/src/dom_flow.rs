@@ -374,6 +374,32 @@ fn node(kind: DomKind) -> DomNode {
     }
 }
 
+fn stamp_position(
+    nodes: &mut [DomNode],
+    at: Point,
+    layered: bool,
+    child: &LayoutNode,
+    axis: Option<Axis>,
+) {
+    for node in nodes {
+        if let Some(layout) = node.layout.as_mut() {
+            layout.placement = Some(std::rc::Rc::new(crate::dom::DomPlacement {
+                at: Some(crate::dom::DomPosition {
+                    x: at.x as f32,
+                    y: at.y as f32,
+                    layered,
+                    fill_x: child.is_flexible(Axis::Horizontal, axis),
+                    fill_y: child.is_flexible(Axis::Vertical, axis),
+                }),
+                span: None,
+            }));
+            layout.grow = false;
+            layout.stretch = false;
+            layout.fill = false;
+        }
+    }
+}
+
 /// Puts a flow node in its parent's list and hands it back there, to be
 /// filled where it stays: built aside and pushed when done, each node of
 /// a row (three hundred bytes, which the retention keeps) was written
@@ -574,6 +600,45 @@ impl Walk<'_> {
     /// The node itself, what it carries aside.
     fn lower_node(&mut self, tree: &LayoutNode, out: &mut Vec<DomNode>) {
         match tree {
+            LayoutNode::Grid {
+                columns,
+                spacing,
+                row_spacing,
+                align,
+                children,
+            } => {
+                let container = placed(out, node(DomKind::Grid));
+                container.style.interactive = self.pending_interactive.take();
+                container.style.set_tooltip(self.pending_tooltip.take());
+                container.style.set_transition(self.pending_transition.take());
+                let layout = container.layout.as_mut().expect("flow node");
+                let columns = (*columns).clamp(1, u16::MAX as usize);
+                layout.columns = Some(columns as u16);
+                layout.gap = Some(*spacing as f32);
+                layout.wrap = Some(*row_spacing as f32);
+                layout.align = Some(align_code(*align));
+                for child in children {
+                    let opened = container.children.len();
+                    self.lower_into(child, &mut container.children);
+                    let (wide, tall) = child.span_of();
+                    let span = crate::dom::DomSpan {
+                        columns: wide.clamp(1, columns) as u16,
+                        rows: tall.clamp(1, u16::MAX as usize) as u16,
+                        fill_x: child.is_flexible(Axis::Horizontal, None),
+                    };
+                    for cell in &mut container.children[opened..] {
+                        if let Some(layout) = cell.layout.as_mut() {
+                            layout.placement = Some(std::rc::Rc::new(crate::dom::DomPlacement {
+                                at: None,
+                                span: Some(span),
+                            }));
+                            layout.grow = false;
+                            layout.fill = false;
+                            layout.stretch = false;
+                        }
+                    }
+                }
+            }
             LayoutNode::Stack { axis, spacing, align, children, .. } => {
                 let kind = match axis {
                     Axis::Vertical => DomKind::FlexColumn,
@@ -592,6 +657,7 @@ impl Walk<'_> {
                     layout.gap = Some(*spacing as f32);
                 }
                 layout.align = Some(align_code(*align));
+                layout.relative = children.iter().any(|child| child.placed_at().is_some());
                 // a column with no length to share grows nobody; a row's
                 // items take the row's height, a length again
                 let open_column = *axis == Axis::Vertical && self.unbounded;
@@ -602,6 +668,16 @@ impl Walk<'_> {
                 for child in children {
                     let opened = container.children.len();
                     self.lower_into(child, &mut container.children);
+                    if let Some(at) = child.placed_at() {
+                        stamp_position(
+                            &mut container.children[opened..],
+                            at,
+                            false,
+                            child,
+                            Some(*axis),
+                        );
+                        continue;
+                    }
                     if open_column {
                         // a spacer or an open frame grows itself; here
                         // it keeps its content's height instead
@@ -683,7 +759,11 @@ impl Walk<'_> {
                 container.layout.as_mut().expect("flow node").align =
                     Some(align_code(*align));
                 for child in children {
+                    let opened = container.children.len();
                     self.lower_into(child, &mut container.children);
+                    if let Some(at) = child.placed_at() {
+                        stamp_position(&mut container.children[opened..], at, true, child, None);
+                    }
                 }
             }
             LayoutNode::Padding { edges, child } => {
@@ -696,6 +776,7 @@ impl Walk<'_> {
                 // to the child, and CSS padding would slide under it.
                 if let [only] = lowered.as_mut_slice()
                     && only.style.is_default()
+                    && !only.layout.as_ref().is_some_and(|layout| layout.relative)
                     && matches!(
                         only.kind,
                         DomKind::FlexColumn | DomKind::FlexRow | DomKind::Layers | DomKind::Box
@@ -804,6 +885,20 @@ impl Walk<'_> {
                 let fill = placed(out, node(DomKind::Box));
                 fill.layout.as_mut().expect("flow node").grow = true;
                 fill.style.look_mut().background = Some(Color::FILL);
+            }
+            LayoutNode::Rectangle | LayoutNode::Ellipse => {
+                let kind = if matches!(tree, LayoutNode::Ellipse) {
+                    DomKind::Ellipse
+                } else {
+                    DomKind::Rectangle
+                };
+                let shape = placed(out, node(kind));
+                shape.layout.as_mut().expect("flow node").grow = true;
+                // currentColor follows inherited hover/press ink in CSS too.
+                // An unstyled shape retains the original rectangle's fill.
+                if self.ink.is_empty() {
+                    shape.style.look_mut().color = Some(Color::FILL);
+                }
             }
             LayoutNode::Leaf { size } => {
                 let leaf = placed(out, node(DomKind::Box));
@@ -1155,6 +1250,9 @@ impl Walk<'_> {
             // own — and a number invented here would be worse than no
             // number at all.
             LayoutNode::Accessible { child, .. }
+            | LayoutNode::Sited { child, .. }
+            | LayoutNode::Placed { child, .. }
+            | LayoutNode::Spanned { child, .. }
             | LayoutNode::Measured { child, .. } => self.lower_into(child, out),
 
             LayoutNode::Boundary { path, children, .. } => {
@@ -1377,7 +1475,7 @@ impl Walk<'_> {
                 layout.grow = true;
                 layout.stretch = true;
             }
-            LayoutNode::Anchored { path, side, overlay, child } => {
+            LayoutNode::Anchored { path, side, overlay, child, .. } => {
                 // the anchor gets an IDENTITY the glue can find: a
                 // group wrapped around the child, keyed off the
                 // popover's own path
@@ -1692,11 +1790,9 @@ impl Walk<'_> {
             .children
             .iter()
             .any(|child| child.layout.as_ref().is_some_and(|layout| layout.stretch))
-        {
-            if let Some(layout) = container.layout.as_mut() {
+            && let Some(layout) = container.layout.as_mut() {
                 layout.stretch = true;
             }
-        }
     }
 }
 
@@ -1744,7 +1840,6 @@ impl Walk<'_> {
     }
 
     /// A canvas island: the engine measures and paints ITS OWN pixels,
-
     /// locally — the subtree places at its own origin, so the commands
     /// are island-local by construction and the element gets a fixed
     /// box the browser never argues with.
@@ -1880,6 +1975,117 @@ mod tests {
             truncation: None,
             hints: Default::default(),
             action: None,
+        }
+    }
+
+    #[test]
+    fn a_grid_lowers_to_a_grid_with_its_columns_and_spans() {
+        let offsets = HashMap::default();
+        let tree = LayoutNode::Grid {
+            columns: 2,
+            spacing: 4.0,
+            row_spacing: 8.0,
+            align: CrossAlign::Center,
+            children: vec![
+                LayoutNode::Spanned {
+                    columns: 9,
+                    rows: 2,
+                    child: Box::new(text_node("wide")),
+                },
+                LayoutNode::Fill,
+            ],
+        };
+        let tree = LayoutNode::Interactive { path: std::rc::Rc::from("grid-action"), child: Box::new(tree) };
+        let output = lower(&tree, &env_fixture(&offsets));
+        let grid = &output.scene.children[0];
+        assert!(matches!(grid.kind, DomKind::Grid));
+        assert_eq!(grid.style.interactive.as_deref(), Some("grid-action"));
+        let layout = grid.layout.as_ref().unwrap();
+        assert_eq!(
+            (layout.columns, layout.gap, layout.wrap),
+            (Some(2), Some(4.0), Some(8.0))
+        );
+        let span = |index: usize| {
+            grid.children[index]
+                .layout
+                .as_ref()
+                .unwrap()
+                .placement
+                .as_ref()
+                .unwrap()
+                .span
+                .unwrap()
+        };
+        assert_eq!(
+            span(0),
+            crate::dom::DomSpan {
+                columns: 2,
+                rows: 2,
+                fill_x: false
+            }
+        );
+        assert_eq!(
+            span(1),
+            crate::dom::DomSpan {
+                columns: 1,
+                rows: 1,
+                fill_x: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_placed_child_lowers_absolute_under_a_column_and_by_margins_under_layers() {
+        let offsets = HashMap::default();
+        let child = || LayoutNode::Frame {
+            width: Some(40.0),
+            height: Some(30.0),
+            align: CrossAlign::Center,
+            child: Box::new(LayoutNode::Placed {
+                at: Point { x: 10.0, y: 20.0 },
+                child: Box::new(text_node("a")),
+            }),
+        };
+        let column = LayoutNode::Stack {
+            axis: Axis::Vertical,
+            spacing: 8.0,
+            align: CrossAlign::Start,
+            children: vec![child()],
+            hints: Default::default(),
+            action: None,
+        };
+        let layers = LayoutNode::Layered {
+            align: CrossAlign::Center,
+            modal: false,
+            children: vec![child()],
+        };
+        for (tree, layered) in [(column, false), (layers, true)] {
+            let output = lower(&tree, &env_fixture(&offsets));
+            let container = &output.scene.children[0];
+            let layout = container.layout.as_ref().unwrap();
+            assert_eq!(layout.relative, !layered);
+            let outer = &container.children[0];
+            let layout = outer.layout.as_ref().unwrap();
+            assert_eq!(layout.width, Some(40.0));
+            assert_eq!(
+                layout.placement.as_ref().unwrap().at,
+                Some(crate::dom::DomPosition {
+                    x: 10.0,
+                    y: 20.0,
+                    layered,
+                    fill_x: false,
+                    fill_y: false
+                })
+            );
+            assert!(
+                outer.children[0]
+                    .layout
+                    .as_ref()
+                    .unwrap()
+                    .placement
+                    .is_none(),
+                "position belongs to the outer box"
+            );
         }
     }
 
@@ -2032,7 +2238,8 @@ mod tests {
             promised_fill: None,
         };
         assert!(walk.lowers_in(&walk.flow_key()), "a walk holds its own key");
-        let moves: [(&str, fn(&mut Walk)); 12] = [
+        type WalkChange = (&'static str, fn(&mut Walk));
+        let moves: [WalkChange; 12] = [
             ("the direction", |walk| walk.direction = motor::state::LayoutDirection::RightToLeft),
             ("the ink", |walk| walk.ink.push(Color { r: 1, g: 2, b: 3, a: 255 })),
             ("an ink scope", |walk| walk.ink_scopes.push(0)),
@@ -2102,6 +2309,7 @@ mod tests {
         }
         let anchored = LayoutNode::Anchored {
             path: "App/#0/popover".into(),
+            focus: crate::layout::PopoverFocus::Scope,
             side: crate::layout::Side::Leading,
             overlay: std::rc::Rc::new(text_node("card")),
             child: Box::new(text_node("anchor")),
@@ -2480,9 +2688,11 @@ mod tests {
     #[test]
     fn text_under_a_hover_ink_inherits() {
         use crate::layout::VisualProps;
-        let mut props = VisualProps::default();
-        props.foreground = Some(Color::hex(0x888888));
-        props.foreground_hovered = Some(Color::hex(0xFFFFFF));
+        let props = VisualProps {
+            foreground: Some(Color::hex(0x888888)),
+            foreground_hovered: Some(Color::hex(0xFFFFFF)),
+            ..VisualProps::default()
+        };
         let tree = LayoutNode::Styled {
             props: std::rc::Rc::new(props),
             child: Box::new(text_node("flip me")),
@@ -2581,6 +2791,7 @@ mod tests {
             align: CrossAlign::Start,
             children: vec![LayoutNode::Anchored {
                 path: "app/[row]".into(),
+                focus: crate::layout::PopoverFocus::Scope,
                 side: crate::layout::Side::Bottom,
                 overlay: std::rc::Rc::new(text_node("the card")),
                 child: Box::new(text_node("the row")),

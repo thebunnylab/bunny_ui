@@ -1,0 +1,28 @@
+{
+  "bunny-ui-apple": {
+    "baseline": 39,
+    "candidate": 39,
+    "new": [],
+    "removed": []
+  },
+  "bunny-ui-macos": {
+    "baseline": 19,
+    "candidate": 18,
+    "new": [],
+    "removed": [
+      {
+        "code": "clippy::too_many_arguments",
+        "file": "crates/bunny_ui_macos/src/ffi.rs",
+        "level": "error",
+        "message": "this function has too many arguments (8/7)",
+        "source": "pub fn host_place("
+      }
+    ]
+  },
+  "bunny-ui-ios": {
+    "baseline": 3,
+    "candidate": 3,
+    "new": [],
+    "removed": []
+  }
+}

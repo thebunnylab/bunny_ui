@@ -17,7 +17,18 @@ Custom elements participate when `accepts_keys()` is true and
 the same eligibility and scroll reveal. An exact field name retains priority;
 a name enclosing multiple eligible controls is otherwise ambiguous. Controls
 behind the active popup or modal cannot be focused by this method. Closing a
-popup returns focus to its previous owner when that control still exists.
+popup returns focus to its previous owner when that control still exists. A
+popover that places no control — a completion list, a preview card — is a
+picture beside the keyboard's owner, not a dialog: it opens no scope, focus
+stays where it was, and the walk never enters it.
+
+An interactive completion list uses `.popover_with_focus(...,
+PopoverFocus::Preserve, ...)`: opening it keeps the editor focused even when
+its choices are real buttons. Those controls remain in the existing Tab order
+and keep their accessibility actions. Use `.leaves_keyboard()` on a suggestion
+button to retain the editor during pointer selection. The ordinary `.popover`
+and `.popover_on_dismiss` continue to create a scope when they contain controls.
+The explicit policy changes native navigation only; flow DOM remains browser-owned.
 
 ```rust,ignore
 vstack!(
@@ -42,3 +53,40 @@ and the checkbox's native value.
 
 These contracts have runtime and native protocol regression tests. They do not
 establish human screen-reader or operating-system keyboard qualification.
+
+## Application-drawn controls
+
+`button(label, action).plain()` keeps the native focus, keyboard, pointer/touch
+and accessibility contract while the label supplies all geometry and visuals.
+It adds no theme chrome or padding; ordinary buttons keep their default style.
+A custom two-state label can use `.checked(value)` to expose its real checked
+state without adding a glyph. The application still owns the value and callback;
+Space and accessibility activation invoke that callback. Disabled controls remain
+unavailable through every activation path.
+
+## Edit commands from panels
+
+A containing editor can declare `.on_edit(Edit::Undo, undo)` and
+`.on_edit(Edit::Redo, redo)`. When a non-text control inside it holds focus,
+the nearest ancestor registered for that command answers both its standard
+accelerator and the native Edit menu. Sibling panels and other window scenes
+do not share responders. Registrations survive retained renders and disappear
+with their view. An open alert prevents dispatch into the application behind it.
+
+Fields and custom editors keep their own commands, even when they cannot
+currently undo. A read-only `.on_copy` target keeps its local copy answer.
+Ordinary fields retain bounded local text and selection history across renders
+and focus changes. An empty history never falls through to application source.
+Custom editing strategies keep ownership of their history. An ancestor handler
+owns its operation, including clipboard work for Cut, Copy or Paste.
+This runtime contract applies to native/canvas controls; flow DOM keeps the
+browser's native editing behavior.
+
+Inline transient forms can use `.restore_focus_on_close()` on their containing
+view. It remembers the control focused when the form appears, independently of
+which child later owns the keyboard. Closing from Apply, Cancel or a field
+returns focus to that invoker if it still exists. Moving focus outside the form
+before closing preserves the new owner. Nested forms can close together without
+reviving missing controls. The modifier neither takes focus on opening nor traps
+Tab; child fields keep their text history and composition. Like panel responders,
+this contract governs native/canvas input; flow DOM remains browser-owned.

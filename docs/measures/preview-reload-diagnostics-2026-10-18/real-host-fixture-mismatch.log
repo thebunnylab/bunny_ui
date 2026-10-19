@@ -1,0 +1,28 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/preview_host.rs (target/debug/deps/preview_host-273e06e0edcf4718)
+
+running 1 test
+@@bunny-timing cold_build 18778.1
+@@bunny-timing warm_start 453.1
+@@bunny-timing app_frame 453.2
+@@bunny-timing click 1.5
+@@bunny-timing override 1.4
+@@bunny-timing save 457.1
+@@bunny-timing sibling_save 459.9
+@@bunny-timing instance_click 1.4
+
+thread 'the_preview_road_frames_clicks_and_survives_a_swap' (33791792) panicked at crates/bunny_cli/tests/preview_host.rs:282:5:
+assertion `left != right` failed
+  left: "//! The whole app lives in this library. `bunny_ui::app!` at the bottom\n//! starts it on every platform: the window on the desktop and iOS, the\n//! activity on Android, the page on the web. `src/main.rs` only calls\n//! `run()`.\n\n#![forbid(unsafe_code)]\n\nuse bunny_ui::prelude::*;\n\n/// A counter: one piece of state, a label that reads it, a button that\n/// changes it. A tap updates the label alone — the body does not run\n/// again.\n#[derive(Clone, Copy)]\nstruct Counter {\n    count: State<i32>,\n}\n\nimpl Component for Counter {\n    fn body(self) -> impl View {\n        vstack!(\n            text(ui_kit::greeting()).font(Font::Title),\n            text!(\"You tapped {} times\", self.count),\n            spacer(),\n            button(text(\"Tap again\"), move || self.count.add(1)),\n        )\n        .alignment(HorizontalAlignment::Leading)\n        .padding()\n    }\n}\n\n/// The first view the app shows.\nfn home() -> impl View {\n    Counter { count: State::new(0) }\n}\n\n/// What Studio and `bunny preview` show while you work: the first view,\n/// as a preview. Mark any function that builds a view the same way.\n#[bunny_ui::preview]\nfn home_preview() -> impl View {\n    home()\n}\n\nbunny_ui::app!(home, bunny_ui::AppConfig::new().size(420.0, 640.0));\n"
+ right: "//! The whole app lives in this library. `bunny_ui::app!` at the bottom\n//! starts it on every platform: the window on the desktop and iOS, the\n//! activity on Android, the page on the web. `src/main.rs` only calls\n//! `run()`.\n\n#![forbid(unsafe_code)]\n\nuse bunny_ui::prelude::*;\n\n/// A counter: one piece of state, a label that reads it, a button that\n/// changes it. A tap updates the label alone — the body does not run\n/// again.\n#[derive(Clone, Copy)]\nstruct Counter {\n    count: State<i32>,\n}\n\nimpl Component for Counter {\n    fn body(self) -> impl View {\n        vstack!(\n            text(ui_kit::greeting()).font(Font::Title),\n            text!(\"You tapped {} times\", self.count),\n            spacer(),\n            button(text(\"Tap again\"), move || self.count.add(1)),\n        )\n        .alignment(HorizontalAlignment::Leading)\n        .padding()\n    }\n}\n\n/// The first view the app shows.\nfn home() -> impl View {\n    Counter { count: State::new(0) }\n}\n\n/// What Studio and `bunny preview` show while you work: the first view,\n/// as a preview. Mark any function that builds a view the same way.\n#[bunny_ui::preview]\nfn home_preview() -> impl View {\n    home()\n}\n\nbunny_ui::app!(home, bunny_ui::AppConfig::new().size(420.0, 640.0));\n"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test the_preview_road_frames_clicks_and_survives_a_swap ... FAILED
+
+failures:
+
+failures:
+    the_preview_road_frames_clicks_and_survives_a_swap
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.34s
+
+error: test failed, to rerun pass `-p bunny-cli --test preview_host`

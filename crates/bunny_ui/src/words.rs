@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn an_installed_hook_outranks_the_table_and_a_none_leaves_it() {
         install(|word, locale| {
-            (word == Word::Quit && locale.language() == "pt").then(|| Cow::Borrowed("Sair do {app}"))
+            (word == Word::Quit && locale.language() == "pt").then_some(Cow::Borrowed("Sair do {app}"))
         });
         let words = Words::for_locale(&Locale::new("pt-BR"));
         assert_eq!(words.titled(Word::Quit, "Bunny"), "Sair do Bunny", "the app's wording");

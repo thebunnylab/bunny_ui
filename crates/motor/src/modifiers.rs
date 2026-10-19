@@ -10,6 +10,9 @@ use crate::views::{
 };
 use std::rc::Rc;
 
+/// An action receiving the previous and current observed values.
+pub type ChangeAction<T> = Rc<dyn Fn(&T, &T)>;
+
 /// What a modifier does beyond describing itself.
 pub enum ModifierBehavior {
     /// Fires when the node is rendered (`onAppear`).
@@ -73,13 +76,11 @@ impl View for ModifiedView {
                 let subtree_ctx = base_ctx.clone();
                 ctx.effects.borrow_mut().push(Rc::new(move |_: &Context| effect(&subtree_ctx)));
             }
-            Some(ModifierBehavior::Sheet { isPresented, content }) => {
-                if isPresented.wrappedValue() {
-                    node.children.push(RenderNode::branch(
-                        "Sheet",
-                        vec![content(ctx).render(ctx)],
-                    ));
-                }
+            Some(ModifierBehavior::Sheet { isPresented, content }) if isPresented.wrappedValue() => {
+                node.children.push(RenderNode::branch(
+                    "Sheet",
+                    vec![content(ctx).render(ctx)],
+                ));
             }
             _ => {}
         }
@@ -224,7 +225,7 @@ pub trait ViewExt: View + Sized {
         site: &'static str,
         of: Rc<dyn Fn() -> V>,
         initial: bool,
-        action: Rc<dyn Fn(&V, &V)>,
+        action: ChangeAction<V>,
     ) -> AnyView {
         let effect: EffectFn = Rc::new(move |_ctx| {
             let value = (of)();

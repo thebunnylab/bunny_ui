@@ -10,9 +10,14 @@ on:
       - 'crates/bunny_ui_macos/**'
       - 'crates/bunny_ui_windows/**'
       - 'crates/bunny_ui_linux/**'
+      # the preview crates: the facade-entry step tests them
+      - 'crates/bunny_ui_preview/**'
+      - 'crates/bunny_ui_preview_macros/**'
+      - 'crates/bunny_ui_hot/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/check-clippy-regressions.py'
+      - 'scripts/record-native-text-environment.py'
       - '.github/workflows/shared-core.yml'
   workflow_dispatch:
 
@@ -58,6 +63,10 @@ jobs:
           rustup override set 1.98.1
           rustc --version --verbose
           cargo --version
+      - name: Record native font and toolchain inputs
+        run: |
+          python -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/native-text-tools" blake3==1.0.8
+          PYTHONPATH="$RUNNER_TEMP/native-text-tools" python scripts/record-native-text-environment.py --output native-text-environment.json
       - name: Task executor, normal and paranoid
         run: |
           cargo test -p bunny-ui-motor --locked --all-targets
@@ -69,7 +78,6 @@ jobs:
           # Retain the actual adapter witness on successful parity tests too.
           cargo test -p "$PLATFORM" --locked --all-targets -- --nocapture
           BUNNY_PARANOID=all cargo test -p "$PLATFORM" --locked --all-targets -- --nocapture
-
       - name: Core default, normal and paranoid
         run: |
           cargo test -p bunny-ui-core --locked --all-targets
@@ -99,10 +107,39 @@ jobs:
           # run` names it; the web has no hot build, and the feature
           # changes nothing there
           cargo test -p bunny-ui --locked --all-targets --features hot --target aarch64-apple-darwin
+          # the preview build Studio and `bunny preview` make: `#[preview]`
+          # exports an entry per marked function, in an app that forbids `unsafe`
+          cargo test -p bunny-ui --locked --all-targets --features preview --target aarch64-apple-darwin
+          # the preview host, headless: the example's three previews render and print a line each
+          BUNNY_PREVIEW_CHECK=card_light,card_dark,card_fits \
+            cargo run -p bunny-ui --locked --features preview --example preview --target aarch64-apple-darwin \
+            | tee preview-check.log
+          grep -c '^@@bunny-preview card_' preview-check.log | grep -qx 3
+          # A new app exports its real root, without adding a marked preview.
+          app_dir="$RUNNER_TEMP/studio_app_preview"
+          cargo run -p bunny-cli --locked -- new "$app_dir" --org io.bunny --bunny-ui-path "$PWD/crates/bunny_ui_facade"
+          BUNNY_PREVIEW_CHECK=app CARGO_TARGET_DIR="$PWD/target" \
+            cargo run --manifest-path "$app_dir/Cargo.toml" --features bunny-ui/preview --target aarch64-apple-darwin \
+            | tee app-preview-check.log
+          grep '^@@bunny-preview app commands=' app-preview-check.log
+          if BUNNY_PREVIEW_CHECK=missing "$PWD/target/aarch64-apple-darwin/debug/studio_app_preview" > missing-preview-check.log; then
+            cat missing-preview-check.log
+            exit 1
+          fi
+          grep '^@@bunny-preview missing failed ' missing-preview-check.log
+          cargo test -p bunny-ui-preview-macros --locked --all-targets
+          # the preview wire, the reference scan and the conversions to the core's types
+          cargo test -p bunny-ui-preview --locked --all-targets
+          cargo test -p bunny-ui-preview --locked --all-targets --all-features
           for target in x86_64-unknown-linux-gnu x86_64-pc-windows-msvc aarch64-apple-ios-sim \
             aarch64-linux-android wasm32-unknown-unknown; do
             cargo check -p bunny-ui --locked --all-targets --features hot --target "$target"
           done
+      - name: Metal world pass, normal and paranoid
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p bunny-ui-apple --locked --all-targets --features 3d -- --nocapture
+          BUNNY_PARANOID=all cargo test -p bunny-ui-apple --locked --all-targets --features 3d
       - name: macOS shell, normal and paranoid; iOS build
         if: runner.os == 'macOS'
         run: |
@@ -119,13 +156,19 @@ jobs:
         run: |
           # Each strict exit code stays visible, including inherited failures.
           # New diagnostics fail this separate regression gate.
-          packages=(--package bunny-ui-motor --package bunny-ui-core --package "$PLATFORM")
+          packages=(--package bunny-ui-motor --package bunny-ui-core --package bunny-ui-preview-macros --package bunny-ui-preview --package "$PLATFORM")
           if [ "$RUNNER_OS" = macOS ]; then
             packages+=(--package bunny-ui-macos)
           fi
           rustup override set 1.98.1 --path .ci-base
           python scripts/check-clippy-regressions.py --baseline .ci-base \
             --output lint-evidence "${packages[@]}"
+      - name: Strict preview framework lint
+        if: runner.os == 'macOS'
+        run: |
+          cargo clippy -p bunny-ui-core -p bunny-ui-preview --locked --all-features --all-targets --no-deps -- -D warnings
+          rustup toolchain install nightly-2026-07-15 --profile minimal --component clippy --target wasm32-unknown-unknown
+          cargo +nightly-2026-07-15 clippy -p bunny-ui-core -p bunny-ui-preview --locked --all-features --target wasm32-unknown-unknown --no-deps -- -D warnings
       - name: Preserve strict lint results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -135,6 +178,13 @@ jobs:
             lint-evidence/*.jsonl
             lint-evidence/comparison.json
           if-no-files-found: warn
+      - name: Preserve native text environment
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-text-${{ matrix.runner }}
+          path: native-text-environment.json
+          if-no-files-found: error
 
   intel-macos:
     name: Native Intel macOS shell

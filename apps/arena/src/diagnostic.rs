@@ -2,9 +2,13 @@
 use crate::{Step, schedule::wait_until};
 use std::time::{Duration, Instant};
 
-/// A settled observation point in the isolated wheel diagnostic.
+/// A settled observation point: the wheel diagnostic's two legs, and the
+/// external producer's go-ahead on Windows.
 #[derive(Clone, Copy, Debug)]
 pub enum Checkpoint {
+    /// The scene has settled and its first timed step is next. Only the
+    /// Windows producer asks for it; macOS reports readiness on its first step.
+    Ready,
     /// The 120 downward inputs have settled.
     Down,
     /// The 120 upward inputs have settled.
@@ -14,6 +18,7 @@ impl Checkpoint {
     /// The structured state marker recorded by the UI thread.
     pub fn marker(self) -> &'static str {
         match self {
+            Self::Ready => "SCENE_READY",
             Self::Down => "SCENE_DOWN",
             Self::Up => "SCENE_UP",
         }

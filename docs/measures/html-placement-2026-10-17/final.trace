@@ -1,0 +1,188 @@
+# bunny-trace v2 pid=46163 t0=1792271888389 tag=
+F 0.5 settle=0.35 layout=0.10 pass=0.31 asm=0.05 measure=0.01 place=0.04 hover=0.00 passes=1 layouts=1 asm#=1 hover#=0 paints=0 cmds=0 mk=0 mm=1
+K 0.7 boundaries 1 (+0 to free, +0 trees replaced, +0 click keys) · bindings live 0 (0 retired) · dom nodes 0 · dom bindings 0 (+0 to unpick) · groups 0 (+0 to unpick) · template members 0 · graveyard 0 · identity owners 0 reads 1 readers 1 view-bindings 0 binding-reads 0 dirty 0 dirty-bindings 0 anchors 0 effect-cells 0 leaving 0 retired 0 seqs 0 effect-readers 0 paint-readers 0 dirty-paints 0 unreached-writes 1 · frame runs 0 · pictures 0 · measures 0 · live actions 0 copies 0 editors 0 scrolls 0 customs 0 slots 1 · tasks 0 pending 0 timers 0 · anim 0 scrolls 0 loops 0 · ledger 0 · scroll offsets 0 targets 0 · carets 0 · icons 0 traces 0 · atlas runs 0 images 0 dedicated 0 live 0 size 0 · presenters 1 · dialogs 0 · panels 0
+P 0.9 330x190 live=0 cmds=0 via=redraw
+U 36.3 mount=1 attached=1 width=330.000 height=190.000
+V 36.4 mount=1 stage=load-request
+V 55.6 mount=1 stage=load-return
+H 55.7 dur=54.8 hosts=1
+O 55.7 dur=0.0 panels=0
+X 58.4 what=sync-on
+M 62.9 dur=7.2 sync=0
+S 63.0 dur=0.1 n=0 raster=0 px=0
+E 63.0 dur=62.1
+G 63.2 gpu=0.02
+D 63.3 pace=off
+F 75.0 settle=0.24 layout=0.03 pass=0.21 asm=0.02 measure=0.02 place=0.01 hover=0.00 passes=2 layouts=1 asm#=1 hover#=0 paints=0 cmds=0 mk=0 mm=1
+K 75.1 boundaries 2 (+0 to free, +0 trees replaced, +0 click keys) · bindings live 0 (0 retired) · dom nodes 0 · dom bindings 0 (+0 to unpick) · groups 0 (+0 to unpick) · template members 0 · graveyard 0 · identity owners 1 reads 2 readers 2 view-bindings 0 binding-reads 0 dirty 0 dirty-bindings 0 anchors 0 effect-cells 1 leaving 0 retired 0 seqs 0 effect-readers 0 paint-readers 0 dirty-paints 0 unreached-writes 2 · frame runs 0 · pictures 0 · measures 0 · live actions 0 copies 0 editors 0 scrolls 0 customs 0 slots 2 · tasks 1 pending 1 timers 1 · anim 0 scrolls 0 loops 0 · ledger 0 · scroll offsets 0 targets 0 · carets 0 · icons 0 traces 0 · atlas runs 0 images 0 dedicated 0 live 0 size 0 · presenters 2 · dialogs 0 · panels 0
+P 75.3 700x260 live=0 cmds=0 via=redraw
+U 78.5 mount=2 attached=1 width=320.000 height=180.000
+V 78.5 mount=2 stage=load-request
+V 92.7 mount=2 stage=load-return
+H 92.8 dur=17.4 hosts=1
+O 92.8 dur=0.0 panels=0
+X 93.6 what=sync-on
+M 94.3 dur=1.5 sync=0
+S 94.3 dur=0.0 n=0 raster=0 px=0
+E 94.3 dur=19.0
+W 154.7 ran=1 need=0 why=-
+W 154.8 ran=0 need=0 why=-
+W 155.3 ran=0 need=0 why=-
+W 155.3 ran=0 need=0 why=-
+W 193.0 ran=1 need=0 why=-
+W 193.1 ran=0 need=0 why=-
+W 193.1 ran=0 need=0 why=-
+W 193.1 ran=0 need=0 why=-
+W 204.1 ran=1 need=0 why=-
+W 204.2 ran=0 need=0 why=-
+W 204.3 ran=0 need=0 why=-
+W 204.3 ran=0 need=0 why=-
+V 212.6 mount=2 stage=commit
+V 212.7 mount=1 stage=commit
+V 213.3 mount=2 stage=finish
+V 213.4 mount=1 stage=finish
+W 214.6 ran=1 need=1 why=wrote
+F 214.8 settle=0.07 layout=0.01 pass=0.06 asm=0.02 measure=0.00 place=0.00 hover=0.00 passes=1 layouts=1 asm#=1 hover#=0 paints=0 cmds=0 mk=1 mm=0
+P 214.9 330x190 live=0 cmds=0 via=wake
+H 215.0 dur=0.0 hosts=1
+O 215.0 dur=0.0 panels=0
+M 215.0 dur=0.0 sync=0
+S 215.1 dur=0.0 n=0 raster=0 px=0
+E 215.1 dur=0.1
+D 215.1 pace=full
+W 215.2 ran=0 need=1 why=dirty+wrote
+F 215.3 settle=0.09 layout=0.01 pass=0.09 asm=0.01 measure=0.01 place=0.00 hover=0.00 passes=1 layouts=1 asm#=1 hover#=0 paints=0 cmds=0 mk=0 mm=1
+P 215.4 700x260 live=0 cmds=0 via=wake
+U 216.1 mount=3 attached=1 width=320.000 height=180.000
+V 216.1 mount=3 stage=load-request
+V 216.2 mount=3 stage=load-return
+H 216.3 dur=0.8 hosts=2
+O 216.3 dur=0.0 panels=0
+M 216.3 dur=0.0 sync=0
+S 216.3 dur=0.0 n=0 raster=0 px=0
+E 216.4 dur=1.0
+W 216.4 ran=0 need=0 why=-
+W 216.5 ran=0 need=0 why=-
+W 225.4 ran=1 need=0 why=-
+W 225.4 ran=0 need=0 why=-
+W 225.5 ran=0 need=0 why=-
+W 225.5 ran=0 need=0 why=-
+W 236.5 ran=1 need=0 why=-
+W 236.6 ran=0 need=0 why=-
+W 236.6 ran=0 need=0 why=-
+W 236.7 ran=0 need=0 why=-
+W 247.7 ran=1 need=0 why=-
+W 247.7 ran=0 need=0 why=-
+W 247.7 ran=0 need=0 why=-
+W 247.8 ran=0 need=0 why=-
+V 254.2 mount=3 stage=commit
+V 255.1 mount=3 stage=post
+V 255.2 mount=3 stage=finish
+F 256.2 settle=0.01 layout=0.02 pass=0.00 asm=0.00 measure=0.00 place=0.01 hover=0.00 passes=0 layouts=1 asm#=0 hover#=0 paints=0 cmds=0 mk=1 mm=0
+P 256.3 330x190 live=0 cmds=0 via=frame
+H 256.3 dur=0.0 hosts=1
+O 256.4 dur=0.0 panels=0
+M 256.4 dur=0.0 sync=0
+S 256.4 dur=0.0 n=0 raster=0 px=0
+E 256.4 dur=0.1
+F 256.5 settle=0.00 layout=0.01 pass=0.00 asm=0.00 measure=0.00 place=0.01 hover=0.00 passes=0 layouts=1 asm#=0 hover#=0 paints=0 cmds=0 mk=1 mm=0
+P 256.6 700x260 live=0 cmds=0 via=frame
+H 256.6 dur=0.0 hosts=2
+O 256.6 dur=0.0 panels=0
+M 256.7 dur=0.0 sync=0
+S 256.7 dur=0.0 n=0 raster=0 px=0
+E 256.7 dur=0.1
+W 258.1 ran=1 need=1 why=wrote
+W 258.2 ran=0 need=1 why=dirty+wrote
+W 258.2 ran=0 need=1 why=wrote
+W 258.2 ran=0 need=1 why=dirty+wrote
+W 269.2 ran=1 need=1 why=wrote
+W 269.3 ran=0 need=1 why=dirty+wrote
+W 269.3 ran=0 need=1 why=wrote
+W 269.3 ran=0 need=1 why=dirty+wrote
+F 273.0 settle=0.07 layout=0.01 pass=0.06 asm=0.02 measure=0.00 place=0.00 hover=0.00 passes=1 layouts=1 asm#=1 hover#=0 paints=0 cmds=0 mk=1 mm=0
+A 273.0 asks=4 also=wake
+P 273.1 330x190 live=0 cmds=0 via=frame
+H 273.1 dur=0.0 hosts=1
+O 273.1 dur=0.0 panels=0
+M 273.1 dur=0.0 sync=0
+S 273.2 dur=0.0 n=0 raster=0 px=0
+E 273.2 dur=0.1
+F 273.3 settle=0.07 layout=0.01 pass=0.07 asm=0.01 measure=0.01 place=0.00 hover=0.00 passes=1 layouts=1 asm#=1 hover#=0 paints=0 cmds=0 mk=0 mm=1
+A 273.4 asks=4 also=wake
+P 273.4 700x260 live=0 cmds=0 via=frame
+H 273.8 dur=0.4 hosts=1
+O 273.8 dur=0.0 panels=0
+M 273.9 dur=0.0 sync=0
+S 273.9 dur=0.0 n=0 raster=0 px=0
+E 273.9 dur=0.5
+W 281.1 ran=1 need=1 why=wrote
+W 281.2 ran=0 need=1 why=dirty+wrote
+W 281.2 ran=0 need=1 why=wrote
+W 281.2 ran=0 need=1 why=dirty+wrote
+F 289.7 settle=0.07 layout=0.01 pass=0.06 asm=0.02 measure=0.00 place=0.00 hover=0.00 passes=1 layouts=1 asm#=1 hover#=0 paints=0 cmds=0 mk=1 mm=0
+A 289.8 asks=2 also=wake
+P 289.8 330x190 live=0 cmds=0 via=frame
+H 289.8 dur=0.0 hosts=1
+O 289.9 dur=0.0 panels=0
+M 289.9 dur=0.0 sync=0
+S 289.9 dur=0.0 n=0 raster=0 px=0
+E 289.9 dur=0.1
+F 290.1 settle=0.08 layout=0.01 pass=0.07 asm=0.01 measure=0.01 place=0.00 hover=0.00 passes=1 layouts=1 asm#=1 hover#=0 paints=0 cmds=0 mk=0 mm=1
+A 290.1 asks=2 also=wake
+P 290.1 700x260 live=0 cmds=0 via=frame
+U 290.6 mount=4 attached=1 width=320.000 height=180.000
+V 290.6 mount=4 stage=load-request
+V 290.7 mount=4 stage=load-return
+H 290.7 dur=0.5 hosts=2
+O 290.7 dur=0.0 panels=0
+M 290.8 dur=0.0 sync=0
+S 290.8 dur=0.0 n=0 raster=0 px=0
+E 290.8 dur=0.6
+V 291.7 mount=4 stage=commit
+V 292.0 mount=4 stage=post
+V 292.1 mount=4 stage=finish
+W 294.3 ran=1 need=1 why=wrote+webview
+W 294.3 ran=0 need=1 why=dirty+wrote+webview
+W 294.3 ran=0 need=1 why=wrote+webview
+W 294.4 ran=0 need=1 why=dirty+wrote+webview
+W 305.4 ran=1 need=1 why=wrote+webview
+W 305.5 ran=0 need=1 why=dirty+wrote+webview
+W 305.5 ran=0 need=1 why=wrote+webview
+W 305.5 ran=0 need=1 why=dirty+wrote+webview
+F 306.5 settle=0.06 layout=0.01 pass=0.05 asm=0.02 measure=0.00 place=0.00 hover=0.00 passes=1 layouts=1 asm#=1 hover#=0 paints=0 cmds=0 mk=1 mm=0
+A 306.5 asks=5 also=wake+web
+P 306.6 330x190 live=0 cmds=0 via=frame
+H 306.6 dur=0.0 hosts=1
+O 306.6 dur=0.0 panels=0
+M 306.7 dur=0.0 sync=0
+S 306.7 dur=0.0 n=0 raster=0 px=0
+E 306.7 dur=0.1
+F 306.8 settle=0.06 layout=0.01 pass=0.06 asm=0.01 measure=0.01 place=0.00 hover=0.00 passes=1 layouts=1 asm#=1 hover#=0 paints=0 cmds=0 mk=0 mm=1
+A 306.9 asks=5 also=wake+web
+P 306.9 700x260 live=0 cmds=0 via=frame
+H 307.2 dur=0.2 hosts=1
+O 307.2 dur=0.0 panels=0
+M 307.2 dur=0.0 sync=0
+S 307.2 dur=0.0 n=0 raster=0 px=0
+E 307.2 dur=0.3
+W 317.3 ran=1 need=1 why=dirty+wrote
+W 317.3 ran=0 need=1 why=wrote
+W 317.3 ran=0 need=1 why=dirty+wrote
+W 317.4 ran=0 need=1 why=wrote
+F 323.1 settle=0.10 layout=0.01 pass=0.09 asm=0.01 measure=0.00 place=0.00 hover=0.00 passes=1 layouts=1 asm#=1 hover#=0 paints=0 cmds=0 mk=0 mm=1
+A 323.2 asks=3 also=wake+web
+P 323.2 330x190 live=0 cmds=0 via=frame
+H 323.3 dur=0.0 hosts=1
+O 323.3 dur=0.0 panels=0
+M 323.3 dur=0.0 sync=0
+S 323.3 dur=0.0 n=0 raster=0 px=0
+E 323.4 dur=0.1
+F 323.5 settle=0.02 layout=0.01 pass=0.02 asm=0.01 measure=0.00 place=0.00 hover=0.00 passes=1 layouts=1 asm#=1 hover#=0 paints=0 cmds=0 mk=1 mm=0
+A 323.6 asks=2 also=wake
+P 323.6 700x260 live=0 cmds=0 via=frame
+H 323.6 dur=0.0 hosts=1
+O 323.6 dur=0.0 panels=0
+M 323.7 dur=0.0 sync=0
+S 323.7 dur=0.0 n=0 raster=0 px=0
+E 323.7 dur=0.1

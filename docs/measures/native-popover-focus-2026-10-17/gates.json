@@ -1,0 +1,129 @@
+[
+  {
+    "name": "native-final",
+    "revision": "6a8c3b1797e7fb75b3cf64d1676916eaf1d61bc1",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "bunny-ui-macos",
+      "--test",
+      "accessibility_native",
+      "--locked",
+      "--jobs",
+      "1"
+    ],
+    "started": "2026-10-17T21:38:13.662530+00:00",
+    "ended": "2026-10-17T21:38:14.235198+00:00",
+    "exit_code": 0
+  },
+  {
+    "name": "tests-macos",
+    "revision": "6a8c3b1797e7fb75b3cf64d1676916eaf1d61bc1",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "bunny-ui-macos",
+      "--lib",
+      "--locked",
+      "--jobs",
+      "1",
+      "--",
+      "--test-threads=2"
+    ],
+    "started": "2026-10-17T21:38:14.235455+00:00",
+    "ended": "2026-10-17T21:38:16.183009+00:00",
+    "exit_code": 0
+  },
+  {
+    "name": "tests-trace",
+    "revision": "6a8c3b1797e7fb75b3cf64d1676916eaf1d61bc1",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "bunny-ui-macos",
+      "--example",
+      "trace_report",
+      "--locked",
+      "--jobs",
+      "1",
+      "--",
+      "--test-threads=2"
+    ],
+    "started": "2026-10-17T21:38:16.183323+00:00",
+    "ended": "2026-10-17T21:38:17.124304+00:00",
+    "exit_code": 0
+  },
+  {
+    "name": "baseline-clippy",
+    "revision": "6a6b1d209c143b3c5a5be68882279b3eb264b6c1",
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "bunny-ui-macos",
+      "--all-targets",
+      "--locked",
+      "--no-deps",
+      "--keep-going",
+      "--jobs",
+      "1",
+      "--message-format=json",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "started": "2026-10-17T21:38:17.124554+00:00",
+    "ended": "2026-10-17T21:38:18.725107+00:00",
+    "exit_code": 101
+  },
+  {
+    "name": "candidate-clippy",
+    "revision": "6a8c3b1797e7fb75b3cf64d1676916eaf1d61bc1",
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "bunny-ui-macos",
+      "--all-targets",
+      "--locked",
+      "--no-deps",
+      "--keep-going",
+      "--jobs",
+      "1",
+      "--message-format=json",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "started": "2026-10-17T21:38:18.725425+00:00",
+    "ended": "2026-10-17T21:38:19.769727+00:00",
+    "exit_code": 101
+  },
+  {
+    "name": "format",
+    "revision": "6a8c3b1797e7fb75b3cf64d1676916eaf1d61bc1",
+    "command": [
+      "python3",
+      "/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement/target/verification/popover-focus-20261017/check_format.py"
+    ],
+    "started": "2026-10-17T21:38:19.770002+00:00",
+    "ended": "2026-10-17T21:38:20.017139+00:00",
+    "exit_code": 0
+  },
+  {
+    "name": "whitespace",
+    "revision": "6a8c3b1797e7fb75b3cf64d1676916eaf1d61bc1",
+    "command": [
+      "git",
+      "diff",
+      "6a6b1d2..HEAD",
+      "--check"
+    ],
+    "started": "2026-10-17T21:38:20.017411+00:00",
+    "ended": "2026-10-17T21:38:20.045043+00:00",
+    "exit_code": 0
+  }
+]

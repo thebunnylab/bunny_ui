@@ -9,6 +9,9 @@ use std::path::Path;
 /// a command to run, a line to add — printed under the message.
 #[derive(Debug)]
 pub struct Error {
+    /// The compiler's diagnostics, when a build failed with them collected
+    /// ([`crate::cargo::Diagnostics::Collect`]).
+    pub diagnostics: Vec<crate::cargo::Diagnostic>,
     pub message: String,
     pub hint: Option<String>,
     /// 1 for a failure, 2 for a command line `bunny` could not read.
@@ -17,13 +20,19 @@ pub struct Error {
 
 impl Error {
     pub fn new(message: impl Into<String>) -> Error {
-        Error { message: message.into(), hint: None, code: 1 }
+        Error { diagnostics: Vec::new(), message: message.into(), hint: None, code: 1 }
     }
 
     /// A command line that could not be read: exit code 2, like every
     /// tool that tells a typo from a failure.
     pub fn usage(message: impl Into<String>) -> Error {
-        Error { message: message.into(), hint: None, code: 2 }
+        Error { diagnostics: Vec::new(), message: message.into(), hint: None, code: 2 }
+    }
+
+    /// A build that failed, with what the compiler said when it was
+    /// collected — empty when cargo rendered it on the terminal.
+    pub fn build_failed(diagnostics: Vec<crate::cargo::Diagnostic>) -> Error {
+        Error { diagnostics, message: String::from("the build failed"), hint: None, code: 1 }
     }
 
     pub fn hint(mut self, hint: impl Into<String>) -> Error {

@@ -6,3 +6,5 @@ apps/*/web/*.wasm
 apps/bench_web/web/index.html
 apps/landing_web/web/index.html
 apps/landing_web/.firebase/
+# the strict-lint gate's working directory (scripts/check-clippy-regressions.py --output)
+lint-evidence/

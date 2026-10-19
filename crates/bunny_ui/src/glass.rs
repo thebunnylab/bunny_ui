@@ -52,7 +52,9 @@ const RIM_FALLOFF: f64 = 1.7;
 /// product, so the opposite bottom-right edge lights up too: the dual
 /// lobe is the material's signature, and one lobe alone reads as a
 /// shine painted on a corner.
-const LIGHT_DIR: (f64, f64) = (-0.707_106_78, -0.707_106_78);
+// Preserve the established eight-decimal light vector for pixel parity.
+const LIGHT_COMPONENT: f64 = -70_710_678.0 / 100_000_000.0;
+const LIGHT_DIR: (f64, f64) = (LIGHT_COMPONENT, LIGHT_COMPONENT);
 
 /// Rec.709 luma — the grey a saturation mixes against.
 const LUMA: (f64, f64, f64) = (0.2126, 0.7152, 0.0722);
@@ -626,8 +628,8 @@ impl Lens {
         };
         let touch = (self.glass.sheen + spot).clamp(0.0, 1.0);
         if touch > 0.0 {
-            for channel in 0..3 {
-                color[channel] = (color[channel] + touch).clamp(0.0, 1.0);
+            for channel in &mut color[..3] {
+                *channel = (*channel + touch).clamp(0.0, 1.0);
             }
         }
 

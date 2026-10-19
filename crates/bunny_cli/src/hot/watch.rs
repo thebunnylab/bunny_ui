@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 
 /// The files of the app that a save can change, and how each one was.
 pub struct Watch {
-    dir: PathBuf,
+    dirs: Vec<PathBuf>,
     seen: BTreeMap<PathBuf, (SystemTime, u64)>,
 }
 
@@ -19,7 +19,13 @@ impl Watch {
     /// Watches the package in `dir`: `Cargo.toml`, `build.rs`, and every
     /// `.rs` file under `src/`.
     pub fn new(dir: &Path) -> Watch {
-        let mut watch = Watch { dir: dir.to_path_buf(), seen: BTreeMap::new() };
+        Watch::new_many(&[dir.to_path_buf()])
+    }
+
+    /// Watches several packages at once — the app's and the path crates
+    /// beside it that it builds from — each as [`Watch::new`] would.
+    pub fn new_many(dirs: &[PathBuf]) -> Watch {
+        let mut watch = Watch { dirs: dirs.to_vec(), seen: BTreeMap::new() };
         watch.seen = watch.scan();
         watch
     }
@@ -52,10 +58,12 @@ impl Watch {
 
     fn scan(&self) -> BTreeMap<PathBuf, (SystemTime, u64)> {
         let mut files = BTreeMap::new();
-        for name in ["Cargo.toml", "build.rs"] {
-            stamp(&self.dir.join(name), &mut files);
+        for dir in &self.dirs {
+            for name in ["Cargo.toml", "build.rs"] {
+                stamp(&dir.join(name), &mut files);
+            }
+            walk(&dir.join("src"), &mut files);
         }
-        walk(&self.dir.join("src"), &mut files);
         files
     }
 }
@@ -108,6 +116,26 @@ mod tests {
         fs::remove_file(dir.join("src/ui/row.rs")).unwrap();
         assert_eq!(watch.changed(), [dir.join("src/ui/row.rs")]);
         assert!(watch.changed().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two packages watched at once: a save in either is a change.
+    #[test]
+    fn a_sibling_package_is_watched_beside_the_app() {
+        let dir = std::env::temp_dir().join(format!("bunny-watch-many-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (app, kit) = (dir.join("app"), dir.join("ui_kit"));
+        for package in [&app, &kit] {
+            fs::create_dir_all(package.join("src")).unwrap();
+            fs::write(package.join("Cargo.toml"), "[package]").unwrap();
+            fs::write(package.join("src/lib.rs"), "pub fn a() {}").unwrap();
+        }
+        let mut watch = Watch::new_many(&[app.clone(), kit.clone()]);
+        assert!(watch.changed().is_empty());
+        fs::write(kit.join("src/lib.rs"), "pub fn a() { /* edited */ }").unwrap();
+        assert_eq!(watch.changed(), [kit.join("src/lib.rs")]);
+        fs::write(app.join("Cargo.toml"), "[package]\n# edited").unwrap();
+        assert_eq!(watch.changed(), [app.join("Cargo.toml")]);
         let _ = fs::remove_dir_all(&dir);
     }
 }
