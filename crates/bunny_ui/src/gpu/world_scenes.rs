@@ -17,7 +17,7 @@ use crate::world::mesh::{Mesh, MeshData};
 use crate::world::store::World;
 
 /// How many worlds the catalog holds.
-pub const COUNT: u32 = 9;
+pub const COUNT: u32 = 10;
 
 /// What a tier's picture may differ from the CPU's by: the share of
 /// pixels whose worst channel is more than three codes apart, and more
@@ -178,6 +178,23 @@ pub fn world_scene(index: u32) -> WorldScene {
             tolerance: PENUMBRA,
             pictures: Vec::new(),
         },
+        9 => {
+            let world = World::new();
+            world.add(Mesh::plane(8.0, 8.0), Material::color(Color::rgb(228, 224, 216)));
+            let outline = [vec2(0.0, 0.0), vec2(2.4, 0.0), vec2(2.4, 2.4), vec2(0.0, 2.4)];
+            let hole = [vec2(0.6, 0.6), vec2(1.8, 0.6), vec2(1.8, 1.8), vec2(0.6, 1.8)];
+            let ring = Mesh::extrude(&outline, &[&hole], 0.4);
+            let at = vec3(-1.2, 0.0, 1.2);
+            world.add(ring.clone(), Material::color(Color::rgb(226, 114, 60))).set_position(at);
+            world.add_lines(ring.edges(30.0), LineStyle::solid(Color::rgb(30, 32, 40), 1.2)).set_position(at);
+            let xray = WorldStyle { xray: true, ..style(Quality::Low) };
+            WorldScene {
+                frame: Rc::new(world.frame(&Camera::orbiting(vec3(0.0, 0.2, 0.0), 28.0, 32.0, 5.5), &xray, (200, 140), 1.0)),
+                name: "an X-ray",
+                tolerance: Tolerance { beyond_three: 0.03, beyond_sixteen: 0.015 },
+                pictures: Vec::new(),
+            }
+        }
         8 => WorldScene {
             frame: one_sample(&shadowed_still_life(), &Camera::orbiting(vec3(0.5, 0.0, 0.3), 50.0, 30.0, 3.5).parallel(), Quality::High, (200, 150)),
             name: "a shadow of nine lookups",

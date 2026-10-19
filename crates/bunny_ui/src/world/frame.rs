@@ -111,13 +111,16 @@ pub struct WorldStyle {
     pub section: Option<Plane>,
     /// Multiplies all light before the tone curve.
     pub exposure: f32,
+    /// Every surface drawn see-through, so what stands behind it shows,
+    /// and every edge with it: the look of an editor over a busy model.
+    pub xray: bool,
     /// The most pictures a second an animation may ask for.
     pub max_fps: Option<f64>,
 }
 
 impl Default for WorldStyle {
     fn default() -> WorldStyle {
-        WorldStyle { background: Background::Transparent, quality: Quality::Medium, section: None, exposure: 1.0, max_fps: None }
+        WorldStyle { background: Background::Transparent, quality: Quality::Medium, section: None, exposure: 1.0, xray: false, max_fps: None }
     }
 }
 
@@ -242,7 +245,7 @@ pub struct WorldFrame {
     /// How far each opaque surface is pushed back, in pixels of its own
     /// depth slope, so an edge drawn on it wins across its whole width
     /// even where the surface turns away from the eye. Zero when no
-    /// line of the frame meets the depth.
+    /// line of the frame meets the depth, or no surface writes one.
     pub face_bias: f32,
     /// The sun's shadow map, when the frame's sun casts shadows and
     /// something casts one.
@@ -337,6 +340,9 @@ const NEAR_PER_FAR: f64 = 1.0 / 2000.0;
 /// The steepest a depth slope reads across a pixel, against the slope
 /// along the axes: a diagonal is √2 longer.
 const FACE_BIAS_PER_PIXEL: f32 = std::f32::consts::SQRT_2;
+
+/// The share of light an X-rayed surface stops, in alpha codes.
+const XRAY_ALPHA: u32 = 128;
 
 /// The studio light: a soft sky every world gets until it holds a sky of
 /// its own, and a key light from the upper left of the view for a world
@@ -521,7 +527,11 @@ pub(crate) fn build_frame(
         members.sort_by(|&a, &b| (-models[a].0.bounds.max.z).total_cmp(&(-models[b].0.bounds.max.z)));
         for &member in &members {
             let seen = &models[member].0;
-            frame.instances.push(instance_of(seen, group.material_base));
+            let mut instance = instance_of(seen, group.material_base);
+            if style.xray {
+                instance.tint[3] = ((instance.tint[3] as u32 * XRAY_ALPHA + 127) / 255) as u8;
+            }
+            frame.instances.push(instance);
         }
         let (_, model) = &models[group.members[0]];
         // runs of the same draw key become one draw
@@ -536,6 +546,8 @@ pub(crate) fn build_frame(
         for (material, first_index, index_count) in runs {
             let texture = texture_of(&mut frame, &material.texture);
             let (pass, blend) = match material.alpha {
+                // X-ray: every solid surface see-through, writing no depth
+                AlphaMode::Opaque | AlphaMode::Mask(_) if style.xray => (Pass::Transparent, Blend::Alpha),
                 AlphaMode::Opaque | AlphaMode::Mask(_) => (Pass::Opaque, Blend::Replace),
                 AlphaMode::Blend => (Pass::Transparent, Blend::Alpha),
                 AlphaMode::Add => (Pass::Transparent, Blend::Add),
@@ -581,6 +593,9 @@ pub(crate) fn build_frame(
             }
         };
         let pass = match line_style.depth {
+            // an X-ray's surfaces write no depth: its edges go on top of
+            // them, still tested against each other's nothing
+            LineDepth::Tested if style.xray => Pass::Overlay,
             LineDepth::Tested => Pass::Lines,
             LineDepth::Hidden => Pass::HiddenLines,
             LineDepth::Always => Pass::Overlay,
@@ -606,7 +621,11 @@ pub(crate) fn build_frame(
             DrawKind::Mesh { .. } => None,
         })
         .fold(None, |widest: Option<f32>, width| Some(widest.map_or(width, |w| w.max(width))));
-    if let Some(width) = widest {
+    // and only where a surface writes a depth for them to meet
+    let solid = frame.draws.iter().any(|draw| draw.pass == Pass::Opaque);
+    if let Some(width) = widest
+        && solid
+    {
         frame.face_bias = (width * 0.5 + 0.25) * FACE_BIAS_PER_PIXEL;
     }
     // the farthest see-through surface first
@@ -1149,6 +1168,31 @@ mod tests {
         let at = |yaw: f64| build(&world, &Camera::orbiting(Vec3::ZERO, yaw, 28.0, 5.0)).shadow.unwrap().generation;
         assert_ne!(at(35.0), at(60.0), "the sun turned with the camera");
         assert_eq!(at(35.0), at(35.0));
+    }
+
+    #[test]
+    fn an_xray_draws_every_surface_see_through() {
+        let world = World::new();
+        world.add(Mesh::cuboid(1.0, 1.0, 1.0), gray());
+        world.add(Mesh::plane(8.0, 8.0), gray()).set_position(vec3(0.0, -0.5, 0.0));
+        world.add_lines(Mesh::cuboid(1.0, 1.0, 1.0).edges(30.0), LineStyle::solid(Color::BLACK, 1.0));
+        let camera = Camera::orbiting(Vec3::ZERO, 30.0, 25.0, 6.0);
+        let plain = build(&world, &camera);
+        assert!(plain.draws.iter().any(|draw| draw.pass == Pass::Opaque));
+        let style = WorldStyle { xray: true, ..WorldStyle::default() };
+        let xray = world.frame(&camera, &style, (640, 480), 2.0);
+        let surfaces: Vec<&Draw> = xray.draws.iter().filter(|draw| matches!(draw.kind, DrawKind::Mesh { .. })).collect();
+        assert_eq!(surfaces.len(), 2);
+        assert!(surfaces.iter().all(|draw| draw.pass == Pass::Transparent && matches!(draw.kind, DrawKind::Mesh { blend: Blend::Alpha, .. })));
+        let tints: Vec<u8> = xray.instances.iter().take(2).map(|instance| instance.tint[3]).collect();
+        assert_eq!(tints, [128, 128], "half the light stopped");
+        assert_eq!(xray.face_bias, 0.0, "no surface writes a depth an edge must beat");
+        assert_eq!(xray.draws.last().map(|draw| draw.pass), Some(Pass::Overlay), "the edges go on top");
+        assert_ne!(view_style_hash(&style), view_style_hash(&WorldStyle::default()), "an X-ray is a new picture");
+    }
+
+    fn view_style_hash(style: &WorldStyle) -> u64 {
+        crate::world::view::style_hash(style)
     }
 
     #[test]

@@ -188,6 +188,17 @@ drawn again: a repeated frame, a fade, or a frame that changed only the
 go up once per identity and generation, and what no frame reads for a
 while is given back.
 
+## The style
+
+`scene_view(world, camera).style(style)` and
+`painter.world_styled(rect, world, camera, &style)` take a
+`WorldStyle`: the backdrop (none, a colour or a vertical ramp), the
+quality, a section plane that cuts the world away beyond it, an
+exposure, and `xray` — every surface see-through and every edge on top
+of them, the look of an editor over a busy model. An X-ray writes no
+depth: its surfaces blend from the farthest to the nearest, and its
+edges, hidden or not, show.
+
 ## Shadows
 
 A sun casts shadows when it says so:
@@ -279,6 +290,6 @@ BUNNY_PARANOID=all cargo test -p bunny-ui-core --all-features
 cargo test -p bunny-ui-apple --features 3d
 cargo run -p bunny-ui-macos --features 3d --example world_window
 # in a page built with the web shell's `3d` feature, from the console:
-#   for (let n = 0; n < 9; n++) __bunny.bunny_gpu_world_parity(n)
+#   for (let n = 0; n < 10; n++) __bunny.bunny_gpu_world_parity(n)
 BUNNY_WORLD_GLB=chair.glb BUNNY_WORLD_DUMP=/tmp cargo test -p bunny-ui-core --features gltf --lib a_glb_from_the_environment -- --ignored
 ```

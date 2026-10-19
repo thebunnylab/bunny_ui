@@ -839,6 +839,25 @@ mod tests {
     }
 
     #[test]
+    fn an_xray_shows_the_edges_behind_its_surfaces() {
+        let (world, camera, at) = ring_with_edges();
+        let size = crate::layout::Size { width: 480.0, height: 280.0 };
+        let xray = WorldStyle { xray: true, ..style(Background::Transparent) };
+        let picture = world.render(&camera, &xray, (480, 280), 1.0);
+        dump("ring-xray", &picture);
+        // the edge at the hole's far right corner, hidden behind the ring
+        // in the plain picture, shows through it
+        for y in [0.05, 0.15, 0.25] {
+            let p = camera.project(at + vec3(1.8, y, 0.6), size).expect("in view");
+            assert!(ink(&picture, p.x, p.y, 1), "the hidden edge stays hidden at height {y}");
+        }
+        // and a surface lets the backdrop through
+        let top = camera.project(at + vec3(0.3, 0.4, 0.3), size).expect("in view");
+        let pixel = picture.at(top.x as u32, top.y as u32);
+        assert!(pixel[3] > 100 && pixel[3] < 255, "a see-through top: {pixel:?}");
+    }
+
+    #[test]
     fn edges_cover_their_faces_without_gaps_or_fighting() {
         let world = World::new();
         world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::unlit(Color::WHITE));

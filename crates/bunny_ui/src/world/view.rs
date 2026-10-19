@@ -160,7 +160,7 @@ impl Painter<'_> {
     }
 }
 
-fn style_hash(style: &WorldStyle) -> u64 {
+pub(crate) fn style_hash(style: &WorldStyle) -> u64 {
     let mut hasher = motor::hash::FxHasher::default();
     let mut put = |value: u64| std::hash::Hasher::write_u64(&mut hasher, value);
     match style.background {
@@ -178,6 +178,7 @@ fn style_hash(style: &WorldStyle) -> u64 {
         }
     }
     put(style.exposure.to_bits() as u64);
+    put(style.xray as u64);
     put(style.max_fps.map_or(0, f64::to_bits));
     std::hash::Hasher::finish(&hasher)
 }
