@@ -27,6 +27,7 @@ pub mod orbit;
 pub mod pick;
 pub mod polygon;
 pub mod scene;
+pub mod section;
 pub mod shade;
 pub mod shadow;
 pub mod soft;

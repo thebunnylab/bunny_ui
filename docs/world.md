@@ -201,6 +201,11 @@ of them, the look of an editor over a busy model. An X-ray writes no
 depth: its surfaces blend from the farthest to the nearest, and its
 edges, hidden or not, show.
 
+A section cuts the picture in the shaders. `world.section_lines(plane)`
+finds the cut itself on the CPU — the outline the plane leaves through
+every shown solid, in the world's space — for a drawing to ink over the
+open faces with a `LineDepth::Always` style.
+
 ## Shadows
 
 A sun casts shadows when it says so:
