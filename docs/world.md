@@ -382,6 +382,13 @@ box asks for frames until it arrives. Placing the entity stops it.
 figure.cross_fade(asset.clip("walk").unwrap(), 0.25).move_to(vec3(4.0, 0.0, 2.0), 1.3);
 ```
 
+A figure's regions are its mesh's parts — glTF's `_REGION`, one 16-bit
+number a vertex: the skin under a coat, a sleeve, the hair. Each entity
+gives each part its own state (`entity.set_parts(states)`): a tint (a
+shirt in this figure's colour) or hidden (the skin a coat covers while
+it sits, so the two never fight). Hidden parts cast no shadow, and the
+states cost no new mesh and no new draw.
+
 A mesh carries up to two morph targets (`MeshData::morphs`, glTF's
 `targets`): how far each vertex moves, and how its normal turns, at full
 weight. The entity weighs them, each in `[0, 1]`

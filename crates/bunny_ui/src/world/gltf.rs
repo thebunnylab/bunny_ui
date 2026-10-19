@@ -7,7 +7,9 @@
 //! materials with a base colour texture, emissive light
 //! (`KHR_materials_emissive_strength`), alpha modes, two sides and
 //! unlit surfaces (`KHR_materials_unlit`); nodes with a matrix or a
-//! translation, rotation and scale; skins (`JOINTS_0`, `WEIGHTS_0`, the
+//! translation, rotation and scale; a region a vertex (`_REGION`, its
+//! part: a sleeve, the skin under a coat) for a part to hide or take a
+//! tint of its own; skins (`JOINTS_0`, `WEIGHTS_0`, the
 //! inverse binds) and the animations that move their nodes, keys held
 //! (`STEP`) or blended (`LINEAR`); up to two morph targets a mesh (their
 //! places and normals, weighed by the app); and the `extras` of nodes and
@@ -463,6 +465,17 @@ fn read(json: &Json, bin: Option<&[u8]>) -> Result<Asset, GltfError> {
                 Some(index) => document.floats(index)?.0.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect::<Vec<_>>(),
                 None => Vec::new(),
             };
+            // the region of each vertex: its part, to hide or tint
+            let regions = match attribute("_REGION") {
+                Some(index) => {
+                    let (values, components) = document.floats(index)?;
+                    if components != 1 || values.iter().any(|&region| !(0.0..65536.0).contains(&region)) {
+                        return Err(GltfError::Unsupported("a _REGION that is not one 16-bit number a vertex"));
+                    }
+                    values.iter().map(|&region| region as u16).collect::<Vec<_>>()
+                }
+                None => Vec::new(),
+            };
             // the joints a vertex hangs from, a byte each, and their shares
             let joints = match attribute("JOINTS_0") {
                 Some(index) => {
@@ -494,6 +507,7 @@ fn read(json: &Json, bin: Option<&[u8]>) -> Result<Asset, GltfError> {
             data.uvs.extend(if uvs.len() == count { uvs } else { vec![[0.0, 0.0]; count] });
             data.colors.extend(if colors.len() == count { colors } else { vec![[255; 4]; count] });
             data.occlusion.extend(if occlusion.len() == count { occlusion } else { vec![255; count] });
+            data.parts.extend(if regions.len() == count { regions } else { vec![0; count] });
             // a skin's lists stay whole across the primitives, or go
             if joints.len() == count && weights.len() == count && data.joints.len() == base as usize {
                 data.joints.extend(joints);
@@ -837,6 +851,26 @@ mod tests {
         // cubic spline keys are refused by name
         let cubic = json.replace(r#""interpolation":"LINEAR""#, r#""interpolation":"CUBICSPLINE""#);
         assert_eq!(Asset::from_bytes(&glb(&cubic, &bin)).err(), Some(GltfError::Unsupported("a cubic spline animation")));
+    }
+
+    #[test]
+    fn regions_arrive_as_parts() {
+        let mut bin = triangle_bin();
+        bin.extend_from_slice(&[0, 0]); // the indices padded to four bytes
+        for region in [0u16, 3, 3] {
+            bin.extend_from_slice(&region.to_le_bytes()); // 44: a region a vertex
+        }
+        let json = r#"{"asset":{"version":"2.0"},"buffers":[{"byteLength":50}],
+            "bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36},{"buffer":0,"byteOffset":36,"byteLength":6},{"buffer":0,"byteOffset":44,"byteLength":6}],
+            "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"},
+              {"bufferView":2,"componentType":5123,"count":3,"type":"SCALAR"}],
+            "meshes":[{"primitives":[{"attributes":{"POSITION":0,"_REGION":2},"indices":1}]}],
+            "nodes":[{"mesh":0}]}"#;
+        let asset = Asset::from_bytes(&glb(json, &bin)).expect("a valid asset");
+        let mesh = &asset.models[0].mesh;
+        assert_eq!(mesh.part_count(), 4, "regions 0 to 3");
+        let parts: Vec<u16> = mesh.data().parts.clone();
+        assert_eq!(parts.iter().filter(|&&part| part == 3).count(), 2, "two corners in region 3");
     }
 
     #[test]
