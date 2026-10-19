@@ -98,6 +98,8 @@ pub enum InstanceCommand {
     Key { key: String, modifiers: u32 },
     /// Deliver committed text.
     Text { text: String },
+    /// Explicit whole-text paste; requires `caps::CLIPBOARD_TEXT`.
+    Paste(super::ClipboardPaste),
     /// Deliver a touch event.
     Touch {
         phase: TouchPhase,
@@ -160,6 +162,10 @@ impl InstanceCommand {
                 out.u8(4);
                 out.string(key);
                 out.u32(*modifiers);
+            }
+            Self::Paste(paste) => {
+                out.u8(12);
+                paste.put(out);
             }
             Self::Text { text } => {
                 out.u8(5);
@@ -250,6 +256,7 @@ impl InstanceCommand {
             },
             10 => Self::ClearOverrides,
             11 => Self::RequestSnapshot,
+            12 => Self::Paste(super::ClipboardPaste::get(c)?),
             tag => {
                 return Err(Malformed::BadTag {
                     what: "InstanceCommand",

@@ -179,3 +179,88 @@ cargo test -p bunny-ui-vulkan --lib the_committed_spirv_matches_its_source
 cargo check -p bunny-ui-windows --target x86_64-pc-windows-msvc --tests
 cargo check -p bunny-ui-web --target wasm32-unknown-unknown
 ```
+
+## Observing native presentation
+
+`ImageFeed::generation()` counts pushes. It does not count frames displayed by
+an operating system. On desktop shells, opt in after opening a window:
+
+```rust,ignore
+let observer = app.observe_feed(window, camera.key(), 64).expect("open window");
+// Poll from an existing task; observation itself starts no animation or timer.
+for event in observer.drain() {
+    println!("session={} feed={:?} {event:?}", observer.session(), observer.feed());
+}
+let state = observer.snapshot();
+```
+
+One observer selects one feed in one top-level window. Attaching another closes
+the previous subscription. The session ID is process-local, never a native
+pointer, and is unique even when a window address is reused. The same feed in
+two windows needs two observers. Attachment is not retroactive: an unchanged
+frame already on the window does not acquire a receipt just because an observer
+was added. Dropping the observer disables tracking; replacing it or closing the
+window invalidates pending callbacks. Observers and callback blocks retain only
+scalar metadata and weak queue references, not image bytes or native windows.
+
+Events deliberately distinguish stages:
+
+- `Submitted` means the renderer encountered a new feed snapshot. It does not
+  report capture/decode or every `push` that happened before a scene was drawn.
+- `Superseded` means a newer submitted generation replaced a snapshot before it
+  acquired a native commit ticket. Generations overwritten between pushes can
+  be absent from the event stream entirely; they never receive presentation credit.
+- `Committed` means a native drawable encoded a matching live texture. It is
+  neither a GPU-completion timestamp nor proof of presentation.
+- `Presented` requires both successful command completion and the drawable's
+  presented callback with a finite positive native timestamp. One generation
+  earns at most one receipt per subscription, even through repeated redraws.
+- `RenderFailed` and `Unconfirmed` do not count. A zero/invalid native timestamp
+  does not explain whether the frame was skipped, dropped, or never visible.
+- `Unavailable` names an unsupported path or current limitation. `Closed` ends
+  the subscription. Neither a timeout nor an unavailable state invents a drop.
+
+The event queue holds 1–256 events (the requested capacity is clamped). If a
+consumer falls behind, the oldest event is evicted and `lost_events` increases.
+Three native generation attempts may be pending; saturation reports
+`Backpressure` and refuses additional observation tickets, without changing
+rendering or pretending to know which frame was dropped. Completed receipts
+can arrive out of timestamp order. `snapshot().presented` is a cumulative count
+of confirmed unique generations, including evicted receipts; it is **not FPS**.
+Queue loss, unavailable intervals, or an incomplete observation window preclude
+a complete cadence measurement. Manual non-monotonic feed generations and
+multiple conflicting snapshots of one feed in a frame are unsupported.
+
+### Current platform boundary
+
+The implemented timestamp source is macOS Metal's
+[`MTLDrawable.addPresentedHandler`](https://developer.apple.com/documentation/metal/mtldrawable/addpresentedhandler(_:))
+and [`presentedTime`](https://developer.apple.com/documentation/metal/mtldrawable/presentedtime),
+with runtime selector checks (available on macOS 10.15.4 and later). Time is in
+Metal's host-time seconds, not Unix time or a Rust `Instant`; `drawableID` belongs
+to its layer and must be associated with the observer session. A successful
+`MTLCommandBuffer` completion is an additional validity gate, never the receipt
+source. No elapsed-time resource-release heuristic issues receipts.
+
+Only whole-frame Metal drawables with a clipped-in live RGBA feed draw qualify
+for that path. The final atlas generation must match after upload retries;
+stale or failed uploads cannot borrow the requested generation's identity.
+The receipt's own command must also encode a complete upload of that texture
+through valid blit and paint encoders. Merely reusing a cached generation is
+`NoCurrentUpload`: its earlier command may have failed or been abandoned before
+submission. Observation does not force a reupload to manufacture a receipt.
+Native bands, CPU drawing, glass passes, partial or reused patches, faded/mirrored feeds,
+native-surface imports, and Windows/Wayland/X11 presentation currently report
+unavailable. Enabling observation preserves the selected rendering strategy.
+Hidden or AppKit-occluded windows suspend tickets, including callbacks racing
+with encoding. A later visible render can start a fresh attempt.
+
+A Metal receipt describes a drawable presentation reported by the platform. It
+does not prove every feed pixel was unobscured by later drawing, other windows,
+or compositor layers; it does not measure photons or input-to-photon latency.
+The native fixture in `crates/bunny_ui_macos/tests/feed_receipts.py` compares
+synthetic frame IDs against independently captured window pixels and refuses
+visible qualification in a locked or unknown session. Window captures alone,
+headless tests, and a wired callback do not establish a qualified presented-FPS
+measurement. Camera/native-surface paths and each other desktop backend require
+independent validation before an application labels a counter “Presented FPS.”

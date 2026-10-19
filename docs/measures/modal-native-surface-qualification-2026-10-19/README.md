@@ -1,0 +1,11 @@
+# Native modal surface qualification
+
+T177 began from an empty main-window accessibility capture while the Records modal was visible. The macOS presenter creates a separate native panel for that sheet. The adapter intentionally removes covered background controls from the parent and exposes active modal controls under the child panel. Inspecting the parent alone therefore does not demonstrate missing controls.
+
+The new native protocol case matches the source router's erased keyed screens and a sheet binding derived from an optional destination. Normal and paranoid runs pass on unchanged production `ad68287`: child-panel roles, native window ownership, focus through the parent, real Close/Edit callbacks, blocked background controls and retired actions. A separate in-process AppKit probe mounts the **actual unchanged Records application**, finds Edit/Close modal/Back on its child panel, executes Close then Edit for record7, and verifies the navigation state. Its24 source/organization files remain unchanged; only a new disposable example was added. Source snapshot, example, executable hashes and logs are retained.
+
+No production projection, modal behavior or application source correction is warranted by this observation. The initial inline-sheet hypothesis is disproved. The documentation now explicitly explains parent-only snapshots for sheets as well as popovers. Original external captures remain evidence of the controller's observed scope, not proof that the child panel lacks semantics.
+
+Strict native lint still fails with the same inherited diagnostics in the baseline and candidate:16 unique diagnostics, no new or removed diagnostics. The repository's diagnostic-comparison policy passes; neither strict exit is presented as green. No lint was suppressed and no unrelated framework refactor was bundled. Only macOS tests/docs changed, so wasm production behavior was unaffected. Exact-head CI remains the landing gate.
+
+This is bounded technical qualification, not an external full-surface AX acceptance or VoiceOver run. The original criterion's demand for a failing-before framework regression has not been met because its assumed defect is not reproduced. Preserve that criterion for authentic disposition; do not replace it with a fabricated failure or approval. The complete Studio acceptance remains open.

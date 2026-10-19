@@ -1,0 +1,6 @@
+The following is a diff from the previous accessibility tree for Window: "studio-new-screen-state" with ~ and + representing changed and added elements, respectively. Removed elements are summarized by ID range.
++	7 container
++		8 button Description: Button, ID: bunny-8
++		9 text (settable) Description: x, ID: bunny-9
++		10 text (settable) Description: Updated second native, ID: bunny-10
+The focused UI element is 8 button Description: Button, ID: bunny-8

@@ -1,0 +1,10 @@
+   Compiling bunny-ui-core v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui)
+   Compiling bunny-ui-hot v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui_hot)
+   Compiling bunny-ui-preview v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui_preview)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.99s
+     Running tests/host.rs (target/debug/deps/host-7a9303c751404576)
+
+running 1 test
+test input::clipboard_payload_replaces_the_focused_field_as_one_commit ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 0.01s

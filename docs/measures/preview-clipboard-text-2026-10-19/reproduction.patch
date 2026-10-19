@@ -1,0 +1,40 @@
+diff --git a/crates/bunny_ui_preview/tests/support/input.rs b/crates/bunny_ui_preview/tests/support/input.rs
+index c6dd8f5f..4390e0fa 100644
+--- a/crates/bunny_ui_preview/tests/support/input.rs
++++ b/crates/bunny_ui_preview/tests/support/input.rs
+@@ -364,3 +364,35 @@ fn multiline_enter_arrows_and_committed_text_follow_native_field_semantics() {
+     target.text(&mut host, "ignored");
+     target.value(&mut host, &seen, "a!d");
+ }
++
++#[test]
++fn clipboard_payload_replaces_the_focused_field_as_one_commit() {
++    let (mut host, seen) = host();
++    host.handle(select("input_form", fixed(300.0, 160.0)));
++    host.tick();
++    let target = Target::Legacy("input_form");
++    let first = target.take(&seen).unwrap();
++    target.focus(&mut host, &first);
++    target.text(&mut host, "before");
++    target.key(&mut host, "a", 2);
++    host.tick();
++    target.take(&seen).unwrap();
++
++    // A literal new-kind payload also runs against the original decoder:
++    // it skips the message, reproducing the missing clipboard input door.
++    let mut payload = Vec::new();
++    for value in ["src/lib.rs#input_form", "v"] {
++        payload.extend_from_slice(&u32::try_from(value.len()).unwrap().to_le_bytes());
++        payload.extend_from_slice(value.as_bytes());
++    }
++    payload.extend_from_slice(&2_u32.to_le_bytes());
++    let text = "café 🐇 Ω";
++    payload.extend_from_slice(&u32::try_from(text.len()).unwrap().to_le_bytes());
++    payload.extend_from_slice(text.as_bytes());
++    if let wire::Received::Message(wire::Message::ToHost(message)) =
++        wire::decode(86, &payload).unwrap()
++    {
++        host.handle(message);
++    }
++    target.value(&mut host, &seen, text);
++}

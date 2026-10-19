@@ -1,0 +1,17 @@
+{
+  "algorithm": "BLAKE3",
+  "files": {
+    "README.md": "330a80afd9579619e68d74614b2be2679d712ec0fc55db86b76e1aef384f951b",
+    "cli-tests.log": "4cc67442b864a7b5abc410b3d032b6bbe6efd4509e93819299621f3a600275a3",
+    "core-history.log": "6d6a31857aa0214486cdf2d9d00cc7168b046f5f41629a309d343fe9b1fa23cf",
+    "core-tests.log": "c45321e7cffd7a5580ef18d94c98ae8b81c448b143db844063e5b2ec323015f6",
+    "first-green.log": "404400221acc17cfca77a2bc99d9544e8628bf395b300eed0a7876e2992529d9",
+    "format.json": "99d4835124d81eb8146c3144474c8fabdd386552e30c1b3124677814469d903e",
+    "native-clippy.log": "6849ca24b2017d93e348e711fb15db6a4d9dd6c104db4c14c69343b355e9b3d5",
+    "preview-final.log": "3e0ce6d3cdd36c3a05bee2ed8e7b5ceca584b30def187d20743173aeefdf7657",
+    "red.log": "e5d41f7a372a3ea4b61faac08870dba6e66a97be4f3a9516a4f3ab7fb0b6d09e",
+    "reproduction.patch": "fc3cdede3c4227815615fb7fe8195adae051d5c35f22cde821fc88745e630c98",
+    "verification.json": "22fe3054a770ebcf0f9a22c22b8e9f00d865ce558fe280112d5fac5e828284b8",
+    "wasm-clippy.log": "2e553fbf2a520895189b991d92d0d8cc9759b13ecf4ba26720a1742d2d7f4645"
+  }
+}

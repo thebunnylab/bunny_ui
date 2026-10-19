@@ -1,0 +1,47 @@
+[
+  {
+    "file": "crates/bunny_ui/src/runtime.rs",
+    "changed_format_hunks": 0,
+    "unchanged_baseline_hunks_preserved": 215
+  },
+  {
+    "file": "crates/bunny_ui/tests/field_history.rs",
+    "changed_format_hunks": 0,
+    "unchanged_baseline_hunks_preserved": 0
+  },
+  {
+    "file": "crates/bunny_ui_preview/src/host.rs",
+    "changed_format_hunks": 0,
+    "unchanged_baseline_hunks_preserved": 59
+  },
+  {
+    "file": "crates/bunny_ui_preview/src/host/input.rs",
+    "changed_format_hunks": 0,
+    "unchanged_baseline_hunks_preserved": 0
+  },
+  {
+    "file": "crates/bunny_ui_preview/src/host/instances.rs",
+    "changed_format_hunks": 0,
+    "unchanged_baseline_hunks_preserved": 0
+  },
+  {
+    "file": "crates/bunny_ui_preview/src/wire.rs",
+    "changed_format_hunks": 0,
+    "unchanged_baseline_hunks_preserved": 86
+  },
+  {
+    "file": "crates/bunny_ui_preview/src/wire/instances.rs",
+    "changed_format_hunks": 0,
+    "unchanged_baseline_hunks_preserved": 0
+  },
+  {
+    "file": "crates/bunny_ui_preview/tests/support/input.rs",
+    "changed_format_hunks": 0,
+    "unchanged_baseline_hunks_preserved": 0
+  },
+  {
+    "file": "crates/bunny_ui_preview/tests/wire_instances.rs",
+    "changed_format_hunks": 0,
+    "unchanged_baseline_hunks_preserved": 0
+  }
+]

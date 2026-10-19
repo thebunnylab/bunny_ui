@@ -1,0 +1,71 @@
+warning: multiple fields are never read
+  --> src/native_state_probe_vm.rs:7:9
+   |
+ 6 | pub(crate) struct NativeStateProbeViewModel {
+   |                   ------------------------- fields in this struct
+ 7 |     pub items: ::bunny_ui::prelude::State<::std::vec::Vec<::std::string::String>>,
+   |         ^^^^^
+ 8 |     pub items_loading: ::bunny_ui::prelude::State<bool>,
+   |         ^^^^^^^^^^^^^
+ 9 |     pub items_success: ::bunny_ui::prelude::State<bool>,
+   |         ^^^^^^^^^^^^^
+10 |     pub items_empty: ::bunny_ui::prelude::State<bool>,
+   |         ^^^^^^^^^^^
+11 |     pub items_cancelled: ::bunny_ui::prelude::State<bool>,
+   |         ^^^^^^^^^^^^^^^
+12 |     pub items_failed: ::bunny_ui::prelude::State<bool>,
+   |         ^^^^^^^^^^^^
+13 |     pub items_error: ::bunny_ui::prelude::State<::std::string::String>,
+   |         ^^^^^^^^^^^
+   |
+   = note: `NativeStateProbeViewModel` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `items_load` is never used
+  --> src/native_state_probe_vm.rs:64:12
+   |
+62 | impl NativeStateProbeViewModel {
+   | ------------------------------ method in this implementation
+63 |     /// Load this operation in the explicitly configured execution context.
+64 |     pub fn items_load(&self, input: ()) {
+   |            ^^^^^^^^^^
+
+warning: multiple fields are never read
+  --> src/native_record_edit_vm.rs:9:9
+   |
+ 6 | pub(crate) struct NativeRecordEditViewModel {
+   |                   ------------------------- fields in this struct
+...
+ 9 |     pub saved: ::bunny_ui::prelude::State<::serde_json::Value>,
+   |         ^^^^^
+10 |     pub saved_loading: ::bunny_ui::prelude::State<bool>,
+   |         ^^^^^^^^^^^^^
+11 |     pub saved_success: ::bunny_ui::prelude::State<bool>,
+   |         ^^^^^^^^^^^^^
+12 |     pub saved_empty: ::bunny_ui::prelude::State<bool>,
+   |         ^^^^^^^^^^^
+13 |     pub saved_cancelled: ::bunny_ui::prelude::State<bool>,
+   |         ^^^^^^^^^^^^^^^
+14 |     pub saved_failed: ::bunny_ui::prelude::State<bool>,
+   |         ^^^^^^^^^^^^
+15 |     pub saved_error: ::bunny_ui::prelude::State<::std::string::String>,
+   |         ^^^^^^^^^^^
+   |
+   = note: `NativeRecordEditViewModel` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: method `saved_load` is never used
+  --> src/native_record_edit_vm.rs:72:12
+   |
+70 | impl NativeRecordEditViewModel {
+   | ------------------------------ method in this implementation
+71 |     /// Load this operation in the explicitly configured execution context.
+72 |     pub fn saved_load(&self, input: ::std::string::String) {
+   |            ^^^^^^^^^^
+
+warning: `studio-new-screen-state` (lib) generated 4 warnings
+   Compiling studio-new-screen-state v0.1.0 (/Volumes/Storage/Codex/worktrees/studio-layers-edits/trinity/target/fixtures/studio-preview-clipboard-20261019)
+    Finished `dev` profile [unoptimized] target(s) in 1.02s
+     Running `target/debug/examples/modal_accessibility`
+Active modal native panel controls: [Some("Edit"), Some("Close modal"), Some("Back")]
+Active modal native panel controls: [Some("Edit"), Some("Close modal"), Some("Back"), Some("x")]
+Unchanged Records application: native modal roles, focus, Close/Edit navigation and blocked background all pass. Main-window-only AX excludes child-panel controls by design. No external client or VoiceOver claim.

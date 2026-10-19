@@ -53,6 +53,7 @@ use crate::ffi::{CFRelease, CFRetain, CGPoint, CGRect, CGSize, Id, Sel, class, e
 
 #[cfg(target_os = "macos")]
 mod software_patch;
+mod presentation;
 #[cfg(target_os = "macos")]
 mod scroll_bands;
 #[cfg(target_os = "macos")]
@@ -1032,22 +1033,31 @@ impl MetalStack {
     /// `framebufferOnly` and cannot be read, so the frame rendered into
     /// an offscreen texture instead.
     ///
-    /// Returns the command buffer (autoreleased — the caller holds the
-    /// pool and decides how to present it).
+    /// Returns the autoreleased command plus receipt eligibility. The caller
+    /// owns the pool and decides how to present; eligibility alone is not a receipt.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn encode_frame(&self, frame: EncodeFrame) -> Id {
+    unsafe fn encode_frame(&self, frame: EncodeFrame) -> EncodedFrame {
         unsafe {
             let command = msg_id(self.queue, self.sels.command_buffer);
             if command.is_null() {
-                return null_mut();
+                return EncodedFrame {
+                    command: null_mut(),
+                    feed_uploads_encoded: false,
+                };
             }
+            let mut feed_uploads_encoded = frame.present_to.is_null()
+                && frame.pyramid.is_none()
+                && !frame.live_copies.is_empty();
             // the feeds' new bytes land first, from the slot's staging
             // buffer, on the queue — after every earlier frame that still
             // samples the textures, before this one does
             if !frame.live_copies.is_empty() {
                 let blit = msg_id(command, self.sels.blit_encoder);
                 if blit.is_null() {
-                    return null_mut();
+                    return EncodedFrame {
+                        command: null_mut(),
+                        feed_uploads_encoded: false,
+                    };
                 }
                 for copy in frame.live_copies {
                     msg_void_blit(
@@ -1077,11 +1087,13 @@ impl MetalStack {
                     index += 1;
                 }
                 if index > start || !cleared {
-                    self.encode_paint(command, &frame, &frame.runs[start..index], !cleared);
+                    feed_uploads_encoded &=
+                        self.encode_paint(command, &frame, &frame.runs[start..index], !cleared);
                     cleared = true;
                 }
                 if index < frame.runs.len() {
                     let run = frame.runs[index];
+                    feed_uploads_encoded = false;
                     if let Some(pyramid) = frame.pyramid {
                         self.build_pyramid(command, pyramid, frame.target, frame.viewport, run.levels);
                         self.encode_glass(command, &frame, run, pyramid);
@@ -1090,12 +1102,15 @@ impl MetalStack {
                 }
             }
             if !cleared {
-                self.encode_paint(command, &frame, &[], true);
+                feed_uploads_encoded &= self.encode_paint(command, &frame, &[], true);
             }
             if !frame.present_to.is_null() {
                 self.encode_blit(command, frame.target, frame.present_to);
             }
-            command
+            EncodedFrame {
+                command,
+                feed_uploads_encoded,
+            }
         }
     }
 
@@ -1127,10 +1142,19 @@ impl MetalStack {
 
     /// One pass of rects and text — the pass this backend has always
     /// encoded.
-    unsafe fn encode_paint(&self, command: Id, frame: &EncodeFrame, runs: &[DrawRun], clear: bool) {
+    unsafe fn encode_paint(
+        &self,
+        command: Id,
+        frame: &EncodeFrame,
+        runs: &[DrawRun],
+        clear: bool,
+    ) -> bool {
         unsafe {
             let load = if clear { LOAD_ACTION_CLEAR } else { LOAD_ACTION_LOAD };
             let encoder = self.begin_pass(command, frame.target, 0, load, frame.canvas);
+            if encoder.is_null() {
+                return false;
+            }
             if !runs.is_empty() {
                 let uniforms = [frame.viewport.0, frame.viewport.1, frame.origin.0, frame.origin.1];
                 // argument bindings persist across pipeline swaps — the
@@ -1256,6 +1280,7 @@ impl MetalStack {
                 }
             }
             msg_void(encoder, self.sels.end_encoding);
+            true
         }
     }
 
@@ -1417,6 +1442,14 @@ impl MetalStack {
             msg_void(encoder, self.sels.end_encoding);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct EncodedFrame {
+    command: Id,
+    // A receipt also needs a matching copy in this command. A cached generation
+    // may name bytes from an earlier aborted upload; it is not sufficient proof.
+    feed_uploads_encoded: bool,
 }
 
 /// Everything one frame's encode needs — a struct because the call is
@@ -2496,6 +2529,7 @@ impl Drop for Patch {
 }
 
 pub struct MetalPresenter {
+    observation: Option<bunny_ui::presentation::backend::PresentationSender>,
     stack: MetalStack,
     layer: Id,
     physical: (usize, usize),
@@ -2772,6 +2806,9 @@ impl MetalPresenter {
         images: &dyn ImageEngine,
         live: bool,
     ) {
+        let observation = self.observation.as_ref().and_then(|sender| {
+            bunny_ui::presentation::backend::FrameObservation::begin(sender, display)
+        });
         unsafe {
             let pool = objc_autoreleasePoolPush();
             let physical = (
@@ -2784,6 +2821,9 @@ impl MetalPresenter {
             }
             if physical.0 == 0 || physical.1 == 0 {
                 // a zero drawable is an abort, not a frame
+                if let Some(attempt) = observation {
+                    attempt.unavailable(bunny_ui::presentation::Unavailable::NoDrawable);
+                }
                 objc_autoreleasePoolPop(pool);
                 return;
             }
@@ -2945,6 +2985,9 @@ impl MetalPresenter {
             let drawable = msg_id(self.layer, self.stack.sels.next_drawable);
             self.drawable_wait_ms = crate::trace::clock_ms() - asked;
             if drawable.is_null() {
+                if let Some(attempt) = observation {
+                    attempt.unavailable(bunny_ui::presentation::Unavailable::NoDrawable);
+                }
                 objc_autoreleasePoolPop(pool);
                 return;
             }
@@ -2964,7 +3007,7 @@ impl MetalPresenter {
             self.slots[index].native = self.ground.native.values().cloned().collect();
             let worlds = self.ground.prepare_worlds(&self.batches);
             let textures = self.ground.bound(&self.batches.textures);
-            let command = self.stack.encode_frame(EncodeFrame {
+            let encoded = self.stack.encode_frame(EncodeFrame {
                 target,
                 present_to,
                 canvas,
@@ -2982,6 +3025,17 @@ impl MetalPresenter {
                 live_copies: &self.ground.pending,
                 worlds,
             });
+            let command = encoded.command;
+            if let Some(attempt) = observation {
+                presentation::observe(
+                    drawable,
+                    encoded,
+                    attempt,
+                    &self.atlas,
+                    &self.batches,
+                    &self.ground,
+                );
+            }
             if command.is_null() {
                 objc_autoreleasePoolPop(pool);
                 return;
@@ -3196,7 +3250,7 @@ impl MetalPresenter {
             self.slots[index].native = self.ground.native.values().cloned().collect();
             let worlds = self.ground.prepare_worlds(&self.batches);
             let textures = self.ground.bound(&self.batches.textures);
-            let command = self.stack.encode_frame(EncodeFrame {
+            let encoded = self.stack.encode_frame(EncodeFrame {
                 target: texture,
                 present_to: null_mut(),
                 canvas,
@@ -3214,6 +3268,7 @@ impl MetalPresenter {
                 live_copies: &self.ground.pending,
                 worlds,
             });
+            let command = encoded.command;
             if command.is_null() {
                 return false;
             }
@@ -3298,6 +3353,7 @@ impl MetalPresenter {
         }
         let (device, format) = (stack.device, stack.format);
         Some(MetalPresenter {
+            observation: None,
             stack,
             layer,
             physical: (0, 0),
@@ -3506,7 +3562,7 @@ impl OffscreenGpu {
             self.slots[index].native = self.ground.native.values().cloned().collect();
             let worlds = self.ground.prepare_worlds(&self.batches);
             let textures = self.ground.bound(&self.batches.textures);
-            let command = self.stack.encode_frame(EncodeFrame {
+            let encoded = self.stack.encode_frame(EncodeFrame {
                 target: self.target,
                 present_to: null_mut(),
                 canvas,
@@ -3524,6 +3580,7 @@ impl OffscreenGpu {
                 live_copies: &self.ground.pending,
                 worlds,
             });
+            let command = encoded.command;
             if command.is_null() {
                 objc_autoreleasePoolPop(pool);
                 return;
@@ -3622,7 +3679,7 @@ impl OffscreenGpu {
             self.slots[index].native = self.ground.native.values().cloned().collect();
             let worlds = self.ground.prepare_worlds(&self.batches);
             let textures = self.ground.bound(&self.batches.textures);
-            let command = self.stack.encode_frame(EncodeFrame {
+            let encoded = self.stack.encode_frame(EncodeFrame {
                 target,
                 present_to: null_mut(),
                 canvas,
@@ -3640,6 +3697,7 @@ impl OffscreenGpu {
                 live_copies: &self.ground.pending,
                 worlds,
             });
+            let command = encoded.command;
             if command.is_null() {
                 msg_void(target, self.stack.sels.release);
                 objc_autoreleasePoolPop(pool);

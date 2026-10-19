@@ -121,6 +121,18 @@ names a second time. Command+A and Control+A select the focused field's text.
 Enter and vertical arrows follow the runtime's single/multiline field policy.
 The host never reads or writes the system clipboard on behalf of a key message.
 
+Text paste is an explicit, negotiated shell operation. `caps::CLIPBOARD_TEXT`
+(256) enables `Paste` (kind86) for legacy scenes and the additive `InstanceCommand`
+tag12 for an exact instance/variant. Both carry the original key/modifiers and
+one complete UTF-8 clipboard snapshot. The tool captures it only on an explicit
+Command/Control+V gesture; the host offers that shortcut to application handlers
+first. If unclaimed, `Runtime::paste_text` replaces the focused selection as one
+history step, separate from surrounding typing and consecutive pastes. The host
+never consults its own clipboard. Modified/non-paste shortcuts are refused by
+this door. Existing `Key`/`Text` bytes and behavior stay frozen; incapable hosts
+must not receive the new command, and tools must explain the update requirement.
+
+
 Each instance variant owns an immutable `provenance::OverrideSet`. Rendering,
 input and dirty checks enter its context and restore the outer context, even on
 panic. A set retains its own version across passes, so another artboard does not

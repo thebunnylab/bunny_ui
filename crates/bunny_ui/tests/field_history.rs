@@ -448,3 +448,30 @@ fn an_alert_does_not_undo_the_field_behind_it() {
     assert!(runtime.menu_pick(Pick::Edit(Edit::Undo)));
     assert_eq!(value.get(), "");
 }
+
+#[test]
+fn supplied_paste_text_is_one_history_step_between_typing_and_other_pastes() {
+    let runtime = Runtime::new();
+    let value = State::new(String::new());
+    let view = text_editor("Text", value.binding()).id("text");
+    runtime.display_frame(&view, SIZE);
+    assert!(runtime.focus_named("text"));
+    runtime.key(EditCommand::Insert("before".into()));
+    runtime.key(EditCommand::SelectAll);
+    assert!(runtime.paste_text("café 🐇\nΩ".into()));
+    assert_eq!(value.get(), "café 🐇\nΩ");
+    assert!(runtime.paste_text(" β".into()));
+    assert_eq!(value.get(), "café 🐇\nΩ β");
+    assert!(runtime.menu_pick(Pick::Edit(Edit::Undo)));
+    assert_eq!(value.get(), "café 🐇\nΩ");
+    assert!(runtime.menu_pick(Pick::Edit(Edit::Undo)));
+    assert_eq!(value.get(), "before");
+    assert!(runtime.menu_pick(Pick::Edit(Edit::Redo)));
+    assert_eq!(value.get(), "café 🐇\nΩ");
+    runtime.key(EditCommand::Insert("typed".into()));
+    assert!(runtime.menu_pick(Pick::Edit(Edit::Undo)));
+    assert_eq!(value.get(), "café 🐇\nΩ");
+    assert!(runtime.blur());
+    assert!(!runtime.paste_text("unfocused".into()));
+    assert_eq!(value.get(), "café 🐇\nΩ");
+}
