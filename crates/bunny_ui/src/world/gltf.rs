@@ -799,7 +799,7 @@ mod tests {
         // played to its end and held: the arm one meter along x from its bind
         let world = World::new();
         let figure = world.spawn(&asset);
-        figure.set_play(Some(super::super::skin::Play { clip, start: motor::task::now() - 2.0, speed: 1.0, looped: false }));
+        figure.set_play(Some(super::super::skin::Play { clip, start: motor::task::now() - 2.0, speed: 1.0, looped: false, from: None }));
         let camera = super::super::camera::Camera::looking_at(vec3(0.5, 0.5, 6.0), vec3(0.5, 0.5, 0.0));
         let frame = world.frame(&camera, &super::super::frame::WorldStyle::default(), (64, 64), 1.0);
         assert_eq!(frame.joints.len(), 6, "two joints, three rows each");

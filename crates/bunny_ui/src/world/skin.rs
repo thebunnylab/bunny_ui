@@ -108,21 +108,11 @@ impl Skeleton {
     }
 
     /// Where every node stands at `time`, in the skeleton's space: the
-    /// rest pose, moved by `play`'s clip where it has keys.
+    /// rest pose, moved by `play`'s clip where it has keys — and while it
+    /// fades in, blended from the pose it fades in from.
     pub fn pose(&self, play: Option<&Play>, time: f64) -> Vec<Mat4> {
         let nodes = &self.0.nodes;
-        let mut local: Vec<Transform> = nodes.iter().map(|node| node.rest).collect();
-        if let Some(play) = play {
-            let at = play.clip_time(time);
-            for channel in &play.clip.0.channels {
-                let Some(node) = local.get_mut(channel.node as usize) else { continue };
-                match channel.path {
-                    Path::Translation => node.translation = channel.vector(at),
-                    Path::Scale => node.scale = channel.vector(at),
-                    Path::Rotation => node.rotation = channel.rotation(at),
-                }
-            }
-        }
+        let local = self.locals(play, time);
         let mut global = vec![Mat4::IDENTITY; nodes.len()];
         for &node in &self.0.order {
             let matrix = local[node as usize].matrix();
@@ -132,6 +122,53 @@ impl Skeleton {
             };
         }
         global
+    }
+
+    /// Each node's place relative to its parent at `time`.
+    fn locals(&self, play: Option<&Play>, time: f64) -> Vec<Transform> {
+        let mut local: Vec<Transform> = self.0.nodes.iter().map(|node| node.rest).collect();
+        let Some(play) = play else { return local };
+        let at = play.clip_time(time);
+        for channel in &play.clip.0.channels {
+            let Some(node) = local.get_mut(channel.node as usize) else { continue };
+            match channel.path {
+                Path::Translation => node.translation = channel.vector(at),
+                Path::Scale => node.scale = channel.vector(at),
+                Path::Rotation => node.rotation = channel.rotation(at),
+            }
+        }
+        // a fade: the pose it leaves weighs less as the new one takes over
+        if let Some((from, seconds)) = &play.from {
+            let share = if *seconds > 0.0 { ((time - play.start) / seconds).clamp(0.0, 1.0) } else { 1.0 };
+            if share < 1.0 {
+                let before = self.locals(Some(from), time);
+                for (node, old) in local.iter_mut().zip(before) {
+                    *node = blend(old, *node, share);
+                }
+            }
+        }
+        local
+    }
+}
+
+/// `a` turned toward `b` by `share`: places and scales along the line,
+/// the rotation along the straight blend made unit again, the short way.
+fn blend(a: Transform, b: Transform, share: f64) -> Transform {
+    let mut to = b.rotation;
+    if a.rotation.dot(to) < 0.0 {
+        to = Quat { x: -to.x, y: -to.y, z: -to.z, w: -to.w };
+    }
+    let from = a.rotation;
+    Transform {
+        translation: a.translation + (b.translation - a.translation) * share,
+        rotation: Quat {
+            x: from.x + (to.x - from.x) * share,
+            y: from.y + (to.y - from.y) * share,
+            z: from.z + (to.z - from.z) * share,
+            w: from.w + (to.w - from.w) * share,
+        }
+        .normalized(),
+        scale: a.scale + (b.scale - a.scale) * share,
     }
 }
 
@@ -366,8 +403,8 @@ impl Clip {
     }
 }
 
-/// A clip as an entity plays it: since when, how fast, and whether it
-/// starts over at its end.
+/// A clip as an entity plays it: since when, how fast, whether it starts
+/// over at its end, and what it fades in from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Play {
     pub clip: Clip,
@@ -376,6 +413,10 @@ pub struct Play {
     /// Clip seconds a second.
     pub speed: f64,
     pub looped: bool,
+    /// The play it takes over from and over how many seconds: until then
+    /// the pose blends from that play's own (which keeps moving) to this
+    /// one's.
+    pub from: Option<(Rc<Play>, f64)>,
 }
 
 impl Play {
@@ -391,8 +432,12 @@ impl Play {
     }
 
     /// Whether the pose still moves at `time`: a loop always does, a clip
-    /// played once until its end.
+    /// played once until its end, and any play while it fades in.
     pub fn moving(&self, time: f64) -> bool {
+        let fading = self.from.as_ref().is_some_and(|(_, seconds)| (0.0..*seconds).contains(&(time - self.start)));
+        if fading {
+            return true;
+        }
         if self.clip.duration() <= 0.0 || self.speed == 0.0 {
             return false;
         }
@@ -400,6 +445,16 @@ impl Play {
             let at = (time - self.start) * self.speed;
             (0.0..self.clip.duration()).contains(&at)
         }
+    }
+
+    /// `next` as it takes over from this play at `time` over `seconds`: a
+    /// play this one was still fading from goes once its fade is over.
+    pub fn handed_to(&self, next: Play, time: f64, seconds: f64) -> Play {
+        let mut leaving = self.clone();
+        if leaving.from.as_ref().is_some_and(|(_, fade)| time - leaving.start >= *fade) {
+            leaving.from = None;
+        }
+        Play { from: Some((Rc::new(leaving), seconds.max(0.0))), ..next }
     }
 }
 
@@ -440,17 +495,38 @@ mod tests {
         };
         let clip = Clip::new(Some("reach".into()), vec![channel(false)]);
         assert_eq!(clip.duration(), 1.0);
-        let play = Play { clip, start: 10.0, speed: 1.0, looped: false };
+        let play = Play { clip, start: 10.0, speed: 1.0, looped: false, from: None };
         let pose = two_bones().pose(Some(&play), 10.5);
         assert_eq!(pose[1].translation_part(), vec3(1.0, 1.0, 0.0), "halfway along x");
-        let held = Play { clip: Clip::new(None, vec![channel(true)]), start: 10.0, speed: 1.0, looped: false };
+        let held = Play { clip: Clip::new(None, vec![channel(true)]), start: 10.0, speed: 1.0, looped: false, from: None };
         assert_eq!(two_bones().pose(Some(&held), 10.9)[1].translation_part(), vec3(0.0, 1.0, 0.0), "a step key holds");
         // once, then still; a loop wraps
         assert!(play.moving(10.5) && !play.moving(11.5));
         assert_eq!(play.clip_time(12.0), 1.0);
-        let looped = Play { looped: true, ..play };
+        let looped = Play { looped: true, ..play.clone() };
         assert!(looped.moving(12.0));
         assert!((looped.clip_time(12.25) - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_crossfade_weighs_both_clips() {
+        // two clips that each hold the arm somewhere of their own
+        let holding = |at: [f32; 3]| {
+            Clip::new(None, vec![Channel { node: 1, path: Path::Translation, step: false, times: Rc::from([0.0]), values: Rc::from(at) }])
+        };
+        let first = Play { clip: holding([1.0, 0.0, 0.0]), start: 0.0, speed: 1.0, looped: false, from: None };
+        let second = Play { clip: holding([0.0, 1.0, 0.0]), start: 10.0, speed: 1.0, looped: false, from: None };
+        let fading = first.handed_to(second, 10.0, 2.0);
+        let arm = |time: f64| two_bones().pose(Some(&fading), time)[1].translation_part();
+        assert_eq!(arm(10.0), vec3(1.0, 0.0, 0.0), "the old pose at the start of the fade");
+        assert_eq!(arm(11.0), vec3(0.5, 0.5, 0.0), "both, halfway through");
+        assert_eq!(arm(12.5), vec3(0.0, 1.0, 0.0), "the new pose once it is over");
+        assert!(fading.moving(11.0), "a fade asks for frames");
+        assert!(!fading.moving(12.5), "a still pose after it asks for none");
+        // handing over again once the fade is over drops the first play
+        let third = fading.handed_to(Play { clip: holding([0.0, 0.0, 1.0]), start: 20.0, speed: 1.0, looped: false, from: None }, 20.0, 1.0);
+        let (leaving, _) = third.from.as_ref().expect("it fades from the second");
+        assert!(leaving.from.is_none(), "the chain of fades stays short");
     }
 
     #[test]
@@ -465,7 +541,7 @@ mod tests {
             times: Rc::from([0.0, 1.0]),
             values: Rc::from([0.0, 0.0, 0.0, 1.0, far.x as f32, far.y as f32, far.z as f32, far.w as f32]),
         };
-        let play = Play { clip: Clip::new(None, vec![channel]), start: 0.0, speed: 1.0, looped: false };
+        let play = Play { clip: Clip::new(None, vec![channel]), start: 0.0, speed: 1.0, looped: false, from: None };
         let pose = two_bones().pose(Some(&play), 0.5);
         // an eighth of a turn, not three: the arm leans toward −x
         let arm = pose[1].transform_point(Vec3::ZERO);

@@ -516,7 +516,7 @@ pub(crate) fn build_frame(
         if !world.shown(id) {
             continue;
         }
-        let Some(matrix) = world.world_matrix(id) else { continue };
+        let Some(matrix) = world.world_matrix_at(id, time) else { continue };
         let eye_from_model = view * matrix;
         let (joint_base, joint_rows) = match &data.spec.shape {
             Shape::Model(model) => match &model.skin {

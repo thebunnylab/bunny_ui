@@ -19,6 +19,7 @@ use motor::state::State;
 use super::material::{FloorMap, Light, LineStyle, Material, Model, PartState};
 use super::math::{Aabb, Mat4, Quat, Transform, Vec3};
 use super::mesh::{Lines, Mesh};
+use super::motion::Motion;
 use super::skin::{Clip, Play};
 use crate::layout::Color;
 
@@ -67,6 +68,9 @@ pub struct EntitySpec {
     /// The clip the entity plays: its own skinned mesh, and every skinned
     /// entity below it that plays none of its own, take the pose.
     pub play: Option<Play>,
+    /// A walk the entity is on: while it lasts, it places the entity (and
+    /// may turn it), whatever the transform says.
+    pub motion: Option<Motion>,
     /// A number the app chooses, given back with a pick.
     pub tag: u64,
     /// Raw JSON an asset brought with it, untouched.
@@ -93,6 +97,7 @@ impl EntitySpec {
             ambient: Color::WHITE,
             parts: None,
             play: None,
+            motion: None,
             tag: 0,
             extras: None,
         }
@@ -155,6 +160,14 @@ impl EntitySpec {
 
     /// The box around what the entity shows, in its own space. Empty for
     /// a group and a light.
+    /// The entity's own transform at `time`, moved by the walk it is on.
+    pub fn transform_at(&self, time: f64) -> Transform {
+        match &self.motion {
+            Some(motion) => motion.applied(self.transform, time),
+            None => self.transform,
+        }
+    }
+
     pub fn local_bounds(&self) -> Aabb {
         match &self.shape {
             Shape::Model(model) => model.mesh.bounds(),
@@ -286,16 +299,22 @@ impl WorldData {
         })
     }
 
-    /// The entity's place in the world: its own transform after each of
-    /// its parents'. A parent chain longer than the world is a cycle and
-    /// stops there.
+    /// The entity's place in the world now (the engine clock's time): see
+    /// [`WorldData::world_matrix_at`].
     pub(crate) fn world_matrix(&self, id: EntityId) -> Option<Mat4> {
+        self.world_matrix_at(id, motor::task::now())
+    }
+
+    /// The entity's place in the world at `time`: its own transform after
+    /// each of its parents', each moved by the walk it is on. A parent
+    /// chain longer than the world is a cycle and stops there.
+    pub(crate) fn world_matrix_at(&self, id: EntityId, time: f64) -> Option<Mat4> {
         let mut data = self.get(id)?;
-        let mut matrix = data.spec.transform.matrix();
+        let mut matrix = data.spec.transform_at(time).matrix();
         let mut steps = 0u32;
         while let Some(parent) = data.parent {
             let Some(parent_data) = self.get(parent) else { break };
-            matrix = parent_data.spec.transform.matrix() * matrix;
+            matrix = parent_data.spec.transform_at(time).matrix() * matrix;
             data = parent_data;
             steps += 1;
             if steps > self.live {
@@ -324,9 +343,12 @@ impl WorldData {
         None
     }
 
-    /// Whether a clip of the world still moves at `time`.
+    /// Whether a clip of the world still plays, or an entity still walks,
+    /// at `time`.
     pub(crate) fn moving(&self, time: f64) -> bool {
-        self.iter().any(|(_, data)| data.spec.play.as_ref().is_some_and(|play| play.moving(time)))
+        self.iter().any(|(_, data)| {
+            data.spec.play.as_ref().is_some_and(|play| play.moving(time)) || data.spec.motion.as_ref().is_some_and(|motion| motion.moving(time))
+        })
     }
 
     /// Is the entity shown — itself and every parent above it?
@@ -588,12 +610,20 @@ impl WorldEdit<'_> {
         }
     }
 
+    /// Places the entity; a walk it was on stops.
     pub fn set_position(&mut self, entity: Entity, position: Vec3) {
-        self.update(entity, |spec| spec.transform.translation = position);
+        self.update(entity, |spec| {
+            spec.transform.translation = position;
+            spec.motion = None;
+        });
     }
 
+    /// Places and turns the entity; a walk it was on stops.
     pub fn set_transform(&mut self, entity: Entity, transform: Transform) {
-        self.update(entity, |spec| spec.transform = transform);
+        self.update(entity, |spec| {
+            spec.transform = transform;
+            spec.motion = None;
+        });
     }
 
     pub fn show(&mut self, entity: Entity, shown: bool) {
@@ -699,8 +729,12 @@ impl Entity {
             .map(|id| Entity { world: self.world, id })
     }
 
+    /// Places the entity; a walk it was on stops.
     pub fn set_position(self, position: Vec3) -> Entity {
-        self.change(|spec| spec.transform.translation = position)
+        self.change(|spec| {
+            spec.transform.translation = position;
+            spec.motion = None;
+        })
     }
 
     pub fn set_rotation(self, rotation: Quat) -> Entity {
@@ -711,8 +745,12 @@ impl Entity {
         self.change(|spec| spec.transform.scale = scale)
     }
 
+    /// Places, turns and scales the entity; a walk it was on stops.
     pub fn set_transform(self, transform: Transform) -> Entity {
-        self.change(|spec| spec.transform = transform)
+        self.change(|spec| {
+            spec.transform = transform;
+            spec.motion = None;
+        })
     }
 
     pub fn set_shape(self, shape: Shape) -> Entity {
@@ -766,13 +804,38 @@ impl Entity {
     /// moves.
     pub fn play(self, clip: &Clip) -> Entity {
         let start = motor::task::now();
-        self.change(|spec| spec.play = Some(Play { clip: clip.clone(), start, speed: 1.0, looped: true }))
+        self.change(|spec| spec.play = Some(Play { clip: clip.clone(), start, speed: 1.0, looped: true, from: None }))
     }
 
     /// Plays `clip` from now, once, and holds its last pose.
     pub fn play_once(self, clip: &Clip) -> Entity {
         let start = motor::task::now();
-        self.change(|spec| spec.play = Some(Play { clip: clip.clone(), start, speed: 1.0, looped: false }))
+        self.change(|spec| spec.play = Some(Play { clip: clip.clone(), start, speed: 1.0, looped: false, from: None }))
+    }
+
+    /// Plays `clip` from now, over and over, taking over from the clip it
+    /// played across `seconds`: the old pose blends into the new one, a
+    /// walk easing into a stand.
+    pub fn cross_fade(self, clip: &Clip, seconds: f64) -> Entity {
+        let start = motor::task::now();
+        self.change(|spec| {
+            let next = Play { clip: clip.clone(), start, speed: 1.0, looped: true, from: None };
+            spec.play = Some(match &spec.play {
+                Some(playing) => playing.handed_to(next, start, seconds),
+                None => next,
+            });
+        })
+    }
+
+    /// Walks the entity from where it stands now to `to`, `speed` meters a
+    /// second, facing its way. A box that shows the world asks for frames
+    /// until it arrives; placing the entity stops the walk.
+    pub fn move_to(self, to: Vec3, speed: f64) -> Entity {
+        let start = motor::task::now();
+        self.change(|spec| {
+            let from = spec.transform_at(start).translation;
+            spec.motion = Some(Motion { from, to, start, speed, face: true });
+        })
     }
 
     /// The clip and its timing, whole; `None` puts the skinned meshes
@@ -830,6 +893,26 @@ mod tests {
         assert!(Rc::ptr_eq(&before.chunks[0], &after.chunks[0]), "an untouched chunk is shared");
         assert!(!Rc::ptr_eq(&before.chunks[1], &after.chunks[1]), "the touched chunk was copied");
         assert!(Rc::ptr_eq(&before.chunks[2], &after.chunks[2]));
+    }
+
+    #[test]
+    fn a_walk_moves_the_entity_and_asks_for_frames_until_it_arrives() {
+        let world = World::new();
+        let walker = world.add(cube(), red());
+        walker.move_to(vec3(4.0, 0.0, 0.0), 2.0);
+        let start = motor::task::now();
+        let at = |time: f64| world.with(|data| data.world_matrix_at(walker.id(), time)).expect("alive").translation_part();
+        assert_eq!(at(start + 1.0), vec3(2.0, 0.0, 0.0), "halfway after a second");
+        assert_eq!(at(start + 5.0), vec3(4.0, 0.0, 0.0), "held where it arrived");
+        assert!(world.with(|data| data.moving(start + 1.0)));
+        assert!(!world.with(|data| data.moving(start + 5.0)), "an arrival asks for no frame");
+        // a child walks with its parent
+        let rider = world.add(cube(), red()).set_parent(Some(walker));
+        assert_eq!(world.with(|data| data.world_matrix_at(rider.id(), start + 1.0)).expect("alive").translation_part(), vec3(2.0, 0.0, 0.0));
+        // placing the entity stops the walk
+        walker.set_position(vec3(-1.0, 0.0, 0.0));
+        assert_eq!(at(start + 1.0), vec3(-1.0, 0.0, 0.0));
+        assert!(!world.with(|data| data.moving(start + 1.0)));
     }
 
     #[test]

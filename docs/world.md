@@ -370,6 +370,18 @@ clip asks for frames until it rests; a clip played once holds its last
 pose. A skinned mesh is culled by its rest box, grown by half its
 longest side each way.
 
+`entity.cross_fade(&clip, seconds)` takes over from the clip that
+plays: across the fade the old pose — still moving — blends into the
+new one, a walk easing into a stand. `entity.move_to(to, speed)` walks
+the entity from where it stands to `to`, `speed` meters a second,
+facing its way (its +Z front, as a glTF figure's): its place is a pure
+function of the engine clock, so the walk writes the world once and a
+box asks for frames until it arrives. Placing the entity stops it.
+
+```rust
+figure.cross_fade(asset.clip("walk").unwrap(), 0.25).move_to(vec3(4.0, 0.0, 2.0), 1.3);
+```
+
 ## Limits
 
 - A world inside a `.looping` box or an overlay island is drawn on the

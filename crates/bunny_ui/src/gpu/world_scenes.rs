@@ -156,7 +156,7 @@ fn swaying_post() -> WorldFrame {
             values: Rc::from([0.0, 0.0, 0.0, 1.0, lean.x as f32, lean.y as f32, lean.z as f32, lean.w as f32]),
         },
     ];
-    post.set_play(Some(Play { clip: Clip::new(None, channels), start: motor::task::now() - 10.0, speed: 1.0, looped: false }));
+    post.set_play(Some(Play { clip: Clip::new(None, channels), start: motor::task::now() - 10.0, speed: 1.0, looped: false, from: None }));
     // a low sun: the pose casts a long shadow
     world.add_light(Light::sun().toward(vec3(1.0, -0.8, 0.6)).with_shadows());
     let mut frame = world.frame(&Camera::orbiting(Vec3::ZERO, 30.0, 22.0, 6.0), &style(Quality::Low), (200, 150), 1.0);

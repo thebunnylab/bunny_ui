@@ -1073,7 +1073,7 @@ mod tests {
         let rest = world.render(&camera, &style(Background::Transparent), (64, 64), 1.0);
         // at rest the box stands straight: its top half on the middle column
         assert!(rest.at(32, 18)[3] > 0 && rest.at(48, 18)[3] == 0, "{:?} {:?}", rest.at(32, 18), rest.at(48, 18));
-        entity.set_play(Some(Play { clip, start: motor::task::now() - 5.0, speed: 1.0, looped: false }));
+        entity.set_play(Some(Play { clip, start: motor::task::now() - 5.0, speed: 1.0, looped: false, from: None }));
         let moved = world.render(&camera, &style(Background::Transparent), (64, 64), 1.0);
         dump("skinned-box", &moved);
         // the clip held at its end: the top a meter to the right, the
@@ -1102,7 +1102,7 @@ mod tests {
         // a clip that plays asks for frames; one held at its end does not
         let moving = |world: &World| world.with(|data| data.moving(motor::task::now()));
         assert!(moving(&world));
-        body.set_play(Some(crate::world::skin::Play { clip, start: motor::task::now() - 5.0, speed: 1.0, looped: false }));
+        body.set_play(Some(crate::world::skin::Play { clip, start: motor::task::now() - 5.0, speed: 1.0, looped: false, from: None }));
         assert!(!moving(&world));
     }
 
