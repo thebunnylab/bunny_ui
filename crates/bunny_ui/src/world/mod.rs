@@ -40,7 +40,7 @@ pub use camera::{Camera, Flight, Lens};
 #[cfg(feature = "gltf")]
 pub use gltf::{Asset, AssetNode, GltfError};
 pub use frame::{Background, Blend, Draw, DrawKind, Pass, Quality, ShadowDraw, ShadowFrame, WorldFrame, WorldStyle};
-pub use material::{AlphaMode, Light, LineDepth, LineStyle, Material, Model, PointLight, Sun, SunFrame};
+pub use material::{AlphaMode, FloorMap, Light, LineDepth, LineStyle, Material, Model, PointLight, Sun, SunFrame};
 pub use mesh::{Lines, Mesh, MeshData};
 pub use orbit::{Orbit, OrbitLimits};
 pub use pick::Hit;

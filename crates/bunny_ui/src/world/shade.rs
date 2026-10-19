@@ -191,7 +191,14 @@ pub struct Surface {
     /// How much of the sun reaches the point: 1 in full light, 0 in the
     /// sun's shadow.
     pub shadow: f32,
+    /// What the floor map gives the point: linear light added, and in
+    /// `[3]` the share of the sky's light that reaches it. `[0, 0, 0, 1]`
+    /// for a surface that reads none.
+    pub floor: [f32; 4],
 }
+
+/// What a surface that reads no floor map reads.
+pub const NO_FLOOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
 /// The light a surface sends toward the eye, before the tone curve.
 pub fn lit(u: &super::wire::FrameUniforms, surface: &Surface) -> V3 {
@@ -206,7 +213,7 @@ pub fn lit(u: &super::wire::FrameUniforms, surface: &Surface) -> V3 {
     let (a, a2) = (r * r, r * r * r * r);
     let up = [u.sky_up[0], u.sky_up[1], u.sky_up[2]];
     let (sky, ground) = ([u.sky_color[0], u.sky_color[1], u.sky_color[2]], [u.ground_color[0], u.ground_color[1], u.ground_color[2]]);
-    let ao = 1.0 + (surface.occlusion - 1.0) * 0.8;
+    let ao = (1.0 + (surface.occlusion - 1.0) * 0.8) * surface.floor[3];
 
     let mut light = scale(mul(diffuse, hemisphere(n, up, sky, ground)), ao);
     let reflected = add(scale(n, 2.0 * dot(n, v)), scale(v, -1.0));
@@ -251,6 +258,7 @@ pub fn lit(u: &super::wire::FrameUniforms, surface: &Surface) -> V3 {
         light = add(light, scale(mul(diffuse, color), attenuation * saturate(dot(n, l))));
     }
 
+    light = add(light, mul(diffuse, [surface.floor[0], surface.floor[1], surface.floor[2]]));
     add(light, surface.emissive)
 }
 

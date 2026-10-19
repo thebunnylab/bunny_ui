@@ -16,7 +16,7 @@
 /// Rows of four.
 pub type Row = [f32; 4];
 
-/// The per-frame block: lens, viewport, lights, tone. 592 bytes.
+/// The per-frame block: lens, viewport, lights, tone. 624 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct FrameUniforms {
     /// The projection, column-major: clip = this × eye-space position.
@@ -50,7 +50,7 @@ pub struct FrameUniforms {
     /// `(1/size, normal offset in meters, depth bias, taps)`; taps 0 =
     /// no shadow, else 1, 4 or 9 lookups.
     pub shadow: Row,
-    /// `(point lights, 0, 0, 0)`.
+    /// `(point lights, 1 when a floor map is laid, 0, 0)`.
     pub counts: Row,
     /// Eye-space position; `w` = range in meters.
     pub point_position: [Row; MAX_POINTS],
@@ -58,6 +58,10 @@ pub struct FrameUniforms {
     pub point_color: [Row; MAX_POINTS],
     /// The light groups each point light reaches, one `u32` each.
     pub point_groups: [[u32; 4]; MAX_POINTS / 4],
+    /// The floor map's `u` and `v` of an eye-space point:
+    /// `u = floor_u · (p, 1)`.
+    pub floor_u: Row,
+    pub floor_v: Row,
 }
 
 /// Point lights a frame carries.
@@ -81,7 +85,9 @@ pub mod frame_offset {
     pub const POINT_POSITION: usize = 304;
     pub const POINT_COLOR: usize = 432;
     pub const POINT_GROUPS: usize = 560;
-    pub const SIZE: usize = 592;
+    pub const FLOOR_U: usize = 592;
+    pub const FLOOR_V: usize = 608;
+    pub const SIZE: usize = 624;
 }
 
 /// One instance of a mesh or a set of lines. 112 bytes.
@@ -115,6 +121,8 @@ pub mod instance_offset {
 /// Bits of [`InstanceData::flags`].
 pub mod instance_flag {
     pub const CASTS_SHADOW: u32 = 1;
+    /// The instance's surfaces read the floor map.
+    pub const FLOOR_MAP: u32 = 2;
     /// Where the entity's light group (0 to 31) lies: its surfaces answer
     /// to the point lights whose mask holds bit `group`.
     pub const GROUP_SHIFT: u32 = 8;
@@ -196,6 +204,8 @@ impl FrameUniforms {
                 out.extend_from_slice(&value.to_le_bytes());
             }
         }
+        put_row(out, &self.floor_u);
+        put_row(out, &self.floor_v);
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -312,6 +322,8 @@ mod tests {
         uniforms.point_position[7][3] = 16.0;
         uniforms.point_color[0][0] = 17.0;
         uniforms.point_groups[1][3] = 0xDEAD_BEEF;
+        uniforms.floor_u[3] = 18.0;
+        uniforms.floor_v[0] = 19.0;
         let bytes = uniforms.to_bytes();
         assert_eq!(bytes.len(), frame_offset::SIZE);
         use frame_offset as at;
@@ -331,6 +343,8 @@ mod tests {
         assert_eq!(f32_at(&bytes, at::POINT_POSITION + 7 * 16 + 12), 16.0);
         assert_eq!(f32_at(&bytes, at::POINT_COLOR), 17.0);
         assert_eq!(u32_at(&bytes, at::POINT_GROUPS + 16 + 12), 0xDEAD_BEEF);
+        assert_eq!(f32_at(&bytes, at::FLOOR_U + 12), 18.0);
+        assert_eq!(f32_at(&bytes, at::FLOOR_V), 19.0);
     }
 
     #[test]

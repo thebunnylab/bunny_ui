@@ -20,6 +20,8 @@ layout(std140, set = 0, binding = 0) uniform World {
     vec4 point_position[8];
     vec4 point_color[8];
     uvec4 point_groups[2];
+    vec4 floor_u;
+    vec4 floor_v;
 };
 
 // (flags, near, far, step back): what one draw adds to the frame

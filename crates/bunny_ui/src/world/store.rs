@@ -16,7 +16,7 @@ use std::rc::Rc;
 use motor::hash::FxHashMap as HashMap;
 use motor::state::State;
 
-use super::material::{Light, LineStyle, Material, Model};
+use super::material::{FloorMap, Light, LineStyle, Material, Model};
 use super::math::{Aabb, Mat4, Quat, Transform, Vec3};
 use super::mesh::{Lines, Mesh};
 use crate::layout::Color;
@@ -46,6 +46,9 @@ pub struct EntitySpec {
     pub visible: bool,
     pub pickable: bool,
     pub casts_shadow: bool,
+    /// The entity's surfaces read the world's floor map
+    /// ([`World::set_floor_map`]): a floor, a rug, a terrace.
+    pub reads_floor_map: bool,
     /// The group of lights the entity's surfaces answer to, 0 to 31: a
     /// point light reaches the groups its mask names
     /// ([`super::material::PointLight::groups`]). A lamp in one room
@@ -73,6 +76,7 @@ impl EntitySpec {
             visible: true,
             pickable: true,
             casts_shadow: true,
+            reads_floor_map: false,
             light_group: 0,
             tint: Color::WHITE,
             tag: 0,
@@ -123,6 +127,11 @@ impl EntitySpec {
 
     pub fn without_shadow(self) -> EntitySpec {
         EntitySpec { casts_shadow: false, ..self }
+    }
+
+    /// The entity's surfaces read the world's floor map.
+    pub fn reading_floor_map(self) -> EntitySpec {
+        EntitySpec { reads_floor_map: true, ..self }
     }
 
     /// The entity's surfaces answer to the lights of `group` (0 to 31).
@@ -178,11 +187,13 @@ pub(crate) struct WorldData {
     free: Rc<Vec<u32>>,
     keyed: Rc<HashMap<u64, EntityId>>,
     live: u32,
+    /// The light and shade baked on the ground.
+    pub(crate) floor_map: Option<Rc<FloorMap>>,
 }
 
 impl WorldData {
     fn new() -> WorldData {
-        WorldData { chunks: Vec::new(), free: Rc::default(), keyed: Rc::default(), live: 0 }
+        WorldData { chunks: Vec::new(), free: Rc::default(), keyed: Rc::default(), live: 0, floor_map: None }
     }
 
     fn slot(&self, id: EntityId) -> Option<&Slot> {
@@ -379,6 +390,19 @@ impl World {
     pub fn add_spec(&self, spec: EntitySpec) -> Entity {
         let id = self.data.update(|data| data.insert(EntityData { spec, parent: None, key: None }));
         Entity { world: *self, id }
+    }
+
+    /// Lays a picture of baked light and shade on the ground, read by the
+    /// entities that ask for it; `None` takes it away. One write, and
+    /// none when the map is the one already laid.
+    pub fn set_floor_map(&self, map: Option<FloorMap>) {
+        self.data.update_if(|data| {
+            let same = data.floor_map.as_deref() == map.as_ref();
+            if !same {
+                data.floor_map = map.map(Rc::new);
+            }
+            (!same, ())
+        });
     }
 
     /// Many changes as ONE write: the box that shows the world repaints
@@ -644,6 +668,11 @@ impl Entity {
 
     pub fn set_casts_shadow(self, casts: bool) -> Entity {
         self.change(|spec| spec.casts_shadow = casts)
+    }
+
+    /// Whether the entity's surfaces read the world's floor map.
+    pub fn set_reads_floor_map(self, reads: bool) -> Entity {
+        self.change(|spec| spec.reads_floor_map = reads)
     }
 
     /// The entity's surfaces answer to the lights of `group` (0 to 31).

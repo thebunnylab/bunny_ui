@@ -109,6 +109,8 @@ struct WorldUniforms {
     float4 point_position[8];
     float4 point_color[8];
     uint4 point_groups[2];
+    float4 floor_u;
+    float4 floor_v;
 };
 
 struct WorldInstance {
@@ -181,6 +183,7 @@ StructuredBuffer<WorldMaterial> materials : register(t2);
 Texture2D<float4> picture : register(t3);
 StructuredBuffer<WorldSegment> segments : register(t4);
 Texture2D<float> shadow_map : register(t5);
+Texture2D<float4> floor_picture : register(t7);
 SamplerState surface_sampler : register(s1);
 SamplerComparisonState shadow_sampler : register(s2);
 
@@ -299,8 +302,27 @@ float sun_visibility(float3 position, float3 n) {
     return sum / 9.0;
 }
 
+// what the floor map gives a point: its texel from the base level, never
+// past the picture's edge; nothing off the map or for a surface that
+// reads none
+float4 floor_light(uint flags, float3 position) {
+    if (u.counts.y < 0.5 || (flags & 2u) == 0u) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    float s = u.floor_u.x * position.x + u.floor_u.y * position.y + u.floor_u.z * position.z + u.floor_u.w;
+    float t = u.floor_v.x * position.x + u.floor_v.y * position.y + u.floor_v.z * position.z + u.floor_v.w;
+    if (!(s >= 0.0 && s <= 1.0 && t >= 0.0 && t <= 1.0)) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    uint width;
+    uint height;
+    floor_picture.GetDimensions(width, height);
+    float2 half_texel = 0.5 / float2((float)width, (float)height);
+    return floor_picture.SampleLevel(surface_sampler, clamp(float2(s, t), half_texel, float2(1.0, 1.0) - half_texel), 0.0);
+}
+
 float3 lit(float3 position, float3 n, float3 base, float roughness, float metallic, float3 emissive,
-           float occlusion, uint groups, float shadow) {
+           float occlusion, uint groups, float shadow, float4 floor_texel) {
     bool parallel = u.params.w > 0.5;
     float3 v = parallel ? float3(0.0, 0.0, 1.0) : safe_normalize(-position);
     float n_dot_v = clamp(dot(n, v), 1e-4, 1.0);
@@ -313,7 +335,7 @@ float3 lit(float3 position, float3 n, float3 base, float roughness, float metall
     float3 up = u.sky_up.xyz;
     float3 sky = u.sky_color.xyz;
     float3 ground = u.ground_color.xyz;
-    float ao = 1.0 + (occlusion - 1.0) * 0.8;
+    float ao = (1.0 + (occlusion - 1.0) * 0.8) * floor_texel.a;
 
     float3 light = diffuse * hemisphere(n, up, sky, ground) * ao;
     float3 reflected = n * (2.0 * dot(n, v)) - v;
@@ -357,6 +379,7 @@ float3 lit(float3 position, float3 n, float3 base, float roughness, float metall
         light = light + diffuse * u.point_color[i].xyz * (attenuation * saturate(dot(n, l)));
     }
 
+    light = light + diffuse * floor_texel.rgb;
     return light + emissive;
 }
 
@@ -462,7 +485,8 @@ float4 world_shade(WorldVary v, bool front) {
             normal = -normal;
         }
         float3 light = lit(v.eye, normal, base, material.params.x, material.params.y,
-                           material.emissive.xyz, v.occlusion, 1u << ((instance.flags >> 8) & 31u), sun_visibility(v.eye, normal));
+                           material.emissive.xyz, v.occlusion, 1u << ((instance.flags >> 8) & 31u), sun_visibility(v.eye, normal),
+                           floor_light(instance.flags, v.eye));
         if (u.tone.z > 0.5) {
             dither = bayer((uint)v.position.x, (uint)v.position.y);
         }
@@ -741,6 +765,9 @@ struct WorldStack {
     lit: (Com<Texture2d>, Com<Srv>),
     /// One white texel: what a draw with no texture binds.
     blank: (Com<Texture2d>, Com<Srv>),
+    /// One black, opaque texel: a floor map that adds and takes nothing,
+    /// bound while a frame's floor map is not decoded.
+    dark: (Com<Texture2d>, Com<Srv>),
     uniforms: Com<Buffer>,
     draw: Com<Buffer>,
     backdrop: Com<Buffer>,
@@ -965,6 +992,12 @@ impl D3dWorld {
                 map.map_or((stack.lit.1.as_ptr(), stack.always.as_ptr()), |(_, map)| (map.srv.as_ptr(), stack.compare.as_ptr()));
             (vtbl.ps_set_shader_resources)(context, 5, 1, &shadow_view);
             (vtbl.ps_set_samplers)(context, 2, 1, &shadow_sampler);
+            let floor_view = frame
+                .floor
+                .and_then(|index| job.textures.get(index as usize).copied().flatten())
+                .and_then(|id| textures.get(&id))
+                .map_or(stack.dark.1.as_ptr(), |(_, srv)| srv.as_ptr());
+            (vtbl.ps_set_shader_resources)(context, 7, 1, &floor_view);
             let port = Viewport {
                 top_left_x: 0.0,
                 top_left_y: 0.0,
@@ -1387,6 +1420,10 @@ impl WorldStack {
             let level = [SubresourceData { memory: white.as_ptr().cast(), pitch: 4, slice_pitch: 0 }];
             let blank = texture_2d(device, &blank_desc, Some(&level)).ok_or("no blank texture")?;
             let blank_srv = make_srv(device, &blank).ok_or("no blank texture view")?;
+            let black = [0u8, 0, 0, 255];
+            let level = [SubresourceData { memory: black.as_ptr().cast(), pitch: 4, slice_pitch: 0 }];
+            let dark = texture_2d(device, &blank_desc, Some(&level)).ok_or("no dark texel")?;
+            let dark_srv = make_srv(device, &dark).ok_or("no dark texel view")?;
 
             Ok(WorldStack {
                 mesh_vs,
@@ -1407,6 +1444,7 @@ impl WorldStack {
                 always,
                 lit: (lit, lit_srv),
                 blank: (blank, blank_srv),
+                dark: (dark, dark_srv),
                 uniforms: make_constant_buffer(device, bunny_ui::world::wire::frame_offset::SIZE as u32).ok_or("world constants refused")?,
                 draw: make_constant_buffer(device, std::mem::size_of::<DrawBlock>() as u32).ok_or("draw constants refused")?,
                 backdrop: make_constant_buffer(device, std::mem::size_of::<BackdropBlock>() as u32).ok_or("backdrop constants refused")?,

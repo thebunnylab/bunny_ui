@@ -11,13 +11,13 @@ use crate::image_engine::ImageSource;
 use crate::layout::Color;
 use crate::world::camera::Camera;
 use crate::world::frame::{Background, Quality, WorldFrame, WorldStyle};
-use crate::world::material::{Light, LineDepth, LineStyle, Material};
+use crate::world::material::{FloorMap, Light, LineDepth, LineStyle, Material};
 use crate::world::math::{Vec3, vec2, vec3};
 use crate::world::mesh::{Mesh, MeshData};
 use crate::world::store::World;
 
 /// How many worlds the catalog holds.
-pub const COUNT: u32 = 11;
+pub const COUNT: u32 = 12;
 
 /// What a tier's picture may differ from the CPU's by: the share of
 /// pixels whose worst channel is more than three codes apart, and more
@@ -69,6 +69,29 @@ fn shadowed_still_life() -> World {
     world.add(Mesh::sphere(0.45), Material::color(Color::rgb(70, 110, 200)).roughness(0.3).metallic(0.2)).set_position(vec3(1.25, -0.05, 0.5));
     world.add_light(Light::sun().toward(vec3(0.6, -1.0, 0.45)).with_shadows());
     world
+}
+
+/// A floor map of `side` texels over a `span`-meter square centred on the
+/// origin: the shade a box at the origin leaves under itself, and a warm
+/// pool of baked lamp light off to one side.
+pub fn floor_map(side: u32, span: f64) -> FloorMap {
+    let mut rgba = Vec::with_capacity((side * side * 4) as usize);
+    for row in 0..side {
+        for column in 0..side {
+            let at = |index: u32| -span * 0.5 + (index as f64 + 0.5) / side as f64 * span;
+            let (x, z) = (at(column), at(row));
+            let near = (x * x + z * z).sqrt();
+            let shade = (0.2 + 0.8 * (near - 0.5) / 0.8).clamp(0.2, 1.0);
+            let (dx, dz) = (x - 1.4, z + 0.9);
+            let pool = (1.0 - (dx * dx + dz * dz).sqrt() / 1.4).clamp(0.0, 1.0);
+            rgba.extend_from_slice(&[(150.0 * pool) as u8, (96.0 * pool) as u8, (40.0 * pool) as u8, (255.0 * shade) as u8]);
+        }
+    }
+    FloorMap {
+        picture: ImageSource::rgba(0xF100_0000_0000_0001, (side, side), rgba),
+        origin: vec2(-span * 0.5, -span * 0.5),
+        size: vec2(span, span),
+    }
 }
 
 /// A checker of `cells` squares a side over a clear band.
@@ -178,6 +201,21 @@ pub fn world_scene(index: u32) -> WorldScene {
             tolerance: PENUMBRA,
             pictures: Vec::new(),
         },
+        11 => {
+            let world = World::new();
+            let map = floor_map(32, 6.0);
+            let picture = map.picture.clone();
+            world.set_floor_map(Some(map));
+            world.add(Mesh::plane(6.0, 6.0), Material::color(Color::rgb(214, 210, 202))).set_position(vec3(0.0, -0.5, 0.0)).set_reads_floor_map(true);
+            world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(90, 140, 210)));
+            world.add_light(Light::sun().toward(vec3(-1.0, -2.0, -1.5)));
+            WorldScene {
+                frame: frame(&world, &Camera::orbiting(Vec3::ZERO, 25.0, 40.0, 6.0), Quality::Low, (200, 140)),
+                name: "a floor map",
+                tolerance: EXACT,
+                pictures: vec![picture],
+            }
+        }
         10 => {
             // two rooms at night, a lamp in each: each lamp reaches its own
             // room's group alone, though the light would reach both

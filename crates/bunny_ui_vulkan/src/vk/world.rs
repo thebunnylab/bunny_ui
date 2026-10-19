@@ -132,6 +132,7 @@ mod generator {
                 "uniform sampler2D u_materials;" => MATERIALS,
                 "uniform sampler2D u_surface;" => "layout(set = 1, binding = 0) uniform sampler2D u_surface;",
                 "uniform highp sampler2DShadow u_shadow;" => "layout(set = 2, binding = 0) uniform sampler2DShadow u_shadow;",
+                "uniform sampler2D u_floor;" => "layout(set = 3, binding = 0) uniform sampler2D u_floor;",
                 _ => "",
             };
             if !rewritten.is_empty() {
@@ -299,6 +300,10 @@ struct WorldStack {
     surface_pool: DescriptorPool,
     /// One white texel: what a draw with no picture binds.
     blank: Surface,
+    /// One black, opaque texel: a floor map that adds and takes nothing,
+    /// bound while a frame's floor map is not decoded (set 3, the
+    /// pictures' own layout).
+    dark: Surface,
 }
 
 enum Built {
@@ -777,13 +782,14 @@ impl WorldStack {
             }];
             let surface_layout = layout_of(&picture_binding)?;
             let shadow_layout = layout_of(&picture_binding)?;
-            let set_layouts = [frame_layout, surface_layout, shadow_layout];
+            // set 3, the floor map, is a picture like set 1
+            let set_layouts = [frame_layout, surface_layout, shadow_layout, surface_layout];
             let push_range = PushConstantRange { stages: SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT, offset: 0, size: DRAW_PUSH };
             let layout_info = PipelineLayoutCreateInfo {
                 s_type: ST_PIPELINE_LAYOUT_CREATE,
                 p_next: std::ptr::null(),
                 flags: 0,
-                set_layout_count: 3,
+                set_layout_count: 4,
                 set_layouts: set_layouts.as_ptr(),
                 push_range_count: 1,
                 push_ranges: &push_range,
@@ -912,10 +918,14 @@ impl WorldStack {
                 surface_sampler,
                 surface_pool,
                 blank: Surface { image: Image { image: 0, memory: 0, view: 0 }, set: 0 },
+                dark: Surface { image: Image { image: 0, memory: 0, view: 0 }, set: 0 },
             };
-            match world.surface(stack, 1, 1, &[&[255, 255, 255, 255]]) {
-                Some(blank) => world.blank = blank,
-                None => {
+            match (world.surface(stack, 1, 1, &[&[255, 255, 255, 255]]), world.surface(stack, 1, 1, &[&[0, 0, 0, 255]])) {
+                (Some(blank), Some(dark)) => (world.blank, world.dark) = (blank, dark),
+                (blank, dark) => {
+                    for surface in [blank, dark].into_iter().flatten() {
+                        destroy_image(stack, surface.image);
+                    }
                     world.release(stack);
                     return Err("no blank picture".into());
                 }
@@ -962,6 +972,9 @@ impl WorldStack {
             }
             if self.blank.image.image != 0 {
                 destroy_image(stack, self.blank.image);
+            }
+            if self.dark.image.image != 0 {
+                destroy_image(stack, self.dark.image);
             }
             if self.lit.image.image != 0 {
                 destroy_image(stack, self.lit.image);
@@ -1482,6 +1495,12 @@ impl WorldStack {
             (fns.cmd_set_scissor)(command, 0, 1, &scissor);
             (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 0, 1, &set, 0, std::ptr::null());
             (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 2, 1, &shadow.set, 0, std::ptr::null());
+            let floor = frame
+                .floor
+                .and_then(|index| job.textures.get(index as usize).copied().flatten())
+                .and_then(|id| surfaces.get(&id))
+                .map_or(self.dark.set, |surface| surface.set);
+            (fns.cmd_bind_descriptor_sets)(command, PIPELINE_BIND_POINT_GRAPHICS, self.layout, 3, 1, &floor, 0, std::ptr::null());
             let layout = self.layout;
             let push = |command: CommandBuffer, bytes: &DrawPush| {
                 (fns.cmd_push_constants)(

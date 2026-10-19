@@ -31,6 +31,8 @@ layout(std140) uniform World {
     vec4 point_position[8];
     vec4 point_color[8];
     uvec4 point_groups[2];
+    vec4 floor_u;
+    vec4 floor_v;
 };
 
 // (flags, near, far, step back): what one draw adds to the frame
@@ -98,7 +100,7 @@ out float v_occlusion;
 out vec2 v_zw;
 flat out uint v_material;
 flat out vec4 v_tint;
-flat out uint v_groups;
+flat out uint v_flags;
 
 vec3 unfold_normal(ivec2 folded) {
     float u = max(float(folded.x) / 32767.0, -1.0);
@@ -130,8 +132,7 @@ void main() {
     v_occlusion = float(a_ids.y) / 255.0;
     v_material = i_ids.x + a_ids.x;
     v_tint = vec4(SRGB_DECODE[i_tint.r], SRGB_DECODE[i_tint.g], SRGB_DECODE[i_tint.b], float(i_tint.a) / 255.0);
-    // the light group the instance's flags name, as the bit a lamp's mask holds
-    v_groups = 1u << ((i_ids.z >> 8) & 31u);
+    v_flags = i_ids.z;
 }
 "#;
 
@@ -145,11 +146,12 @@ in float v_occlusion;
 in vec2 v_zw;
 flat in uint v_material;
 flat in vec4 v_tint;
-flat in uint v_groups;
+flat in uint v_flags;
 
 uniform sampler2D u_materials;
 uniform sampler2D u_surface;
 uniform highp sampler2DShadow u_shadow;
+uniform sampler2D u_floor;
 out vec4 out_color;
 
 const int BAYER[16] = int[16](0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5);
@@ -236,7 +238,23 @@ float sun_visibility(vec3 position, vec3 n) {
     return sum / 9.0;
 }
 
-vec3 lit(vec3 position, vec3 n, vec3 base, float roughness, float metallic, vec3 emissive, float occlusion, uint groups, float shadow) {
+// what the floor map gives a point: its texel from the base level, never
+// past the picture's edge; nothing off the map or for a surface that
+// reads none
+vec4 floor_light(vec3 position) {
+    if (counts.y < 0.5 || (v_flags & 2u) == 0u) {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
+    float s = floor_u.x * position.x + floor_u.y * position.y + floor_u.z * position.z + floor_u.w;
+    float t = floor_v.x * position.x + floor_v.y * position.y + floor_v.z * position.z + floor_v.w;
+    if (!(s >= 0.0 && s <= 1.0 && t >= 0.0 && t <= 1.0)) {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
+    vec2 half_texel = 0.5 / vec2(textureSize(u_floor, 0));
+    return textureLod(u_floor, clamp(vec2(s, t), half_texel, vec2(1.0) - half_texel), 0.0);
+}
+
+vec3 lit(vec3 position, vec3 n, vec3 base, float roughness, float metallic, vec3 emissive, float occlusion, uint groups, float shadow, vec4 floor_map) {
     bool parallel = params.w > 0.5;
     vec3 v = parallel ? vec3(0.0, 0.0, 1.0) : safe_normalize(-position);
     float n_dot_v = clamp(dot(n, v), 1e-4, 1.0);
@@ -249,7 +267,7 @@ vec3 lit(vec3 position, vec3 n, vec3 base, float roughness, float metallic, vec3
     vec3 up = sky_up.xyz;
     vec3 sky = sky_color.xyz;
     vec3 ground = ground_color.xyz;
-    float ao = 1.0 + (occlusion - 1.0) * 0.8;
+    float ao = (1.0 + (occlusion - 1.0) * 0.8) * floor_map.a;
 
     vec3 light = diffuse * hemisphere(n, up, sky, ground) * ao;
     vec3 reflected = n * (2.0 * dot(n, v)) - v;
@@ -295,6 +313,7 @@ vec3 lit(vec3 position, vec3 n, vec3 base, float roughness, float metallic, vec3
         light = light + diffuse * point_color[i].xyz * (attenuation * clamp(dot(n, l), 0.0, 1.0));
     }
 
+    light = light + diffuse * floor_map.rgb;
     return light + emissive;
 }
 
@@ -342,7 +361,8 @@ vec4 shade() {
         if (!front) {
             normal = -normal;
         }
-        vec3 light = lit(v_eye, normal, base, params_row.x, params_row.y, emissive_row.xyz, v_occlusion, v_groups, sun_visibility(v_eye, normal));
+        vec3 light = lit(v_eye, normal, base, params_row.x, params_row.y, emissive_row.xyz, v_occlusion,
+                         1u << ((v_flags >> 8) & 31u), sun_visibility(v_eye, normal), floor_light(v_eye));
         if (tone.z > 0.5) {
             dither = bayer(uint(gl_FragCoord.x), uint(gl_FragCoord.y));
         }

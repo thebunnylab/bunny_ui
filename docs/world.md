@@ -68,6 +68,7 @@ fixed `Camera` has no `.orbit()`: the call does not compile.
 | Lines: edges, a grid, a guide | `world.add_lines(lines, LineStyle::solid(ink, 1.5))` |
 | A light | `world.add_light(Light::sun().toward(d))`, `Light::sky(sky, ground)`, `Light::point(warm)` |
 | A lamp that lights one room | `entity.set_light_group(1)` on the room's entities, `Light::point(warm).groups(1 << 1)` |
+| Light and shade baked on the floor | `world.set_floor_map(Some(FloorMap { picture, origin, size }))`, `floor.set_reads_floor_map(true)` |
 | A group that moves its children | `world.add_group()`, then `child.set_parent(Some(group))` |
 | Many changes as one | `world.edit(|edit| …)` |
 | The world as a function of the app's data | `world.sync(items.map(|item| (item.id, spec(item))))` |
@@ -228,6 +229,17 @@ A surface reads the map at its own point, pushed off along its normal
 never shades itself. Each lookup compares four texels and blends the
 answers, as a comparing sampler does.
 
+## Baked light
+
+Some light never moves, and needs no work a frame. A mesh carries a
+baked occlusion a vertex (glTF's `_AO`): how much of the sky reaches
+it. A floor map is a picture laid on the ground: its colour is light
+added to the surfaces that read it — a room's lamps, baked once — and
+its alpha the share of the sky's light that reaches them, the shade a
+chair leaves under itself. A surface reads one texel of it a pixel;
+off the map it reads nothing, and a surface that does not ask reads
+nothing at all.
+
 ## Quality
 
 | | Samples | Pixel budget | Shadow map | Shadow lookups |
@@ -291,6 +303,6 @@ BUNNY_PARANOID=all cargo test -p bunny-ui-core --all-features
 cargo test -p bunny-ui-apple --features 3d
 cargo run -p bunny-ui-macos --features 3d --example world_window
 # in a page built with the web shell's `3d` feature, from the console:
-#   for (let n = 0; n < 11; n++) __bunny.bunny_gpu_world_parity(n)
+#   for (let n = 0; n < 12; n++) __bunny.bunny_gpu_world_parity(n)
 BUNNY_WORLD_GLB=chair.glb BUNNY_WORLD_DUMP=/tmp cargo test -p bunny-ui-core --features gltf --lib a_glb_from_the_environment -- --ignored
 ```

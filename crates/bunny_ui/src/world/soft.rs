@@ -75,6 +75,7 @@ pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Textu
     };
     target.clear(frame.background);
     let shadow = sun_shadow::map_of(frame);
+    let floor = frame.floor.and_then(|index| textures(index as usize));
     let projection = frame.uniforms.clip_from_eye;
     for draw in &frame.draws {
         match draw.kind {
@@ -86,7 +87,18 @@ pub fn draw_with(frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Textu
                 // an opaque surface steps back under the frame's edges
                 let bias = if blend == Blend::Replace { frame.face_bias } else { 0.0 };
                 for instance in &frame.instances[draw.first_instance as usize..(draw.first_instance + draw.instance_count) as usize] {
-                    let job = Job { frame, instance, cull_back, mirrored, blend, mask, bias, texture: texture.as_deref(), shadow: shadow.as_deref() };
+                    let job = Job {
+                        frame,
+                        instance,
+                        cull_back,
+                        mirrored,
+                        blend,
+                        mask,
+                        bias,
+                        texture: texture.as_deref(),
+                        shadow: shadow.as_deref(),
+                        floor: floor.as_deref(),
+                    };
                     for triangle in indices.as_chunks::<3>().0 {
                         let vertices = [0, 1, 2].map(|k| corners.vertex(triangle[k] as usize, instance, &projection));
                         job.triangle(&mut target, vertices);
@@ -308,6 +320,8 @@ struct Job<'a> {
     texture: Option<&'a Texture>,
     /// The sun's shadow map of the frame.
     shadow: Option<&'a ShadowMap>,
+    /// The floor map of the frame, decoded.
+    floor: Option<&'a Texture>,
 }
 
 /// A corner on the screen: fixed-point position, depth, `1/w`.
@@ -487,6 +501,10 @@ impl Job<'_> {
             let normal = if front { normal } else { shade::scale(normal, -1.0) };
             let occlusion = v[0].occlusion * b[0] + v[1].occlusion * b[1] + v[2].occlusion * b[2];
             let shadow = self.shadow.map_or(1.0, |map| sun_shadow::visibility(u, map, position, normal));
+            let floor = match self.floor {
+                Some(map) if self.instance.flags & instance_flag::FLOOR_MAP != 0 => floor_light(u, map, position),
+                _ => shade::NO_FLOOR,
+            };
             let lit = shade::lit(
                 u,
                 &Surface {
@@ -499,6 +517,7 @@ impl Job<'_> {
                     occlusion,
                     groups: 1 << ((self.instance.flags >> instance_flag::GROUP_SHIFT) & instance_flag::GROUP_MASK),
                     shadow,
+                    floor,
                 },
             );
             let dither = if u.tone[2] > 0.5 { shade::bayer(x, y) } else { 0.0 };
@@ -507,6 +526,23 @@ impl Job<'_> {
         let codes = linear.map(|c| quantize(encode_code(c) * alpha, dither) as f32);
         Some([codes[0], codes[1], codes[2], (alpha * 255.0 + 0.5).floor()])
     }
+}
+
+/// What the floor map gives a point at `position` (the eye's space): its
+/// texel, read as a shader reads it — bilinear in linear light from the
+/// base level, never past the picture's edge — or nothing off the map.
+fn floor_light(u: &FrameUniforms, map: &Texture, position: V3) -> [f32; 4] {
+    if u.counts[1] < 0.5 {
+        return shade::NO_FLOOR;
+    }
+    let row = |r: [f32; 4]| r[0] * position[0] + r[1] * position[1] + r[2] * position[2] + r[3];
+    let (s, t) = (row(u.floor_u), row(u.floor_v));
+    if !((0.0..=1.0).contains(&s) && (0.0..=1.0).contains(&t)) {
+        return shade::NO_FLOOR;
+    }
+    let base = &map.levels[0];
+    let (half_s, half_t) = (0.5 / base.width as f32, 0.5 / base.height as f32);
+    map.sample(s.clamp(half_s, 1.0 - half_s), t.clamp(half_t, 1.0 - half_t), 0.0)
 }
 
 /// The deepest a surface that steps back may go: the largest number
@@ -1000,6 +1036,51 @@ mod tests {
         assert_eq!(first.at(right.0, right.1), neither.at(right.0, right.1), "and nothing of the other");
         assert_eq!(both.at(left.0, left.1), first.at(left.0, left.1), "a group is lit the same with another beside it");
         assert!(both.at(right.0, right.1)[0] > neither.at(right.0, right.1)[0] + 20);
+    }
+
+    #[test]
+    fn a_floor_map_lays_its_light_and_shade_on_what_reads_it() {
+        use crate::image_engine::RawImages;
+        let images = RawImages::default();
+        let world = World::new();
+        let floor = world.add(Mesh::plane(6.0, 6.0), Material::color(Color::rgb(214, 210, 202))).set_position(vec3(0.0, -0.5, 0.0));
+        world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(90, 140, 210)));
+        world.add_light(crate::world::material::Light::sun().toward(vec3(-1.0, -2.0, -1.5)));
+        let camera = Camera::orbiting(Vec3::ZERO, 25.0, 40.0, 6.0);
+        let paint = || world.render_with(&images, &camera, &style(Background::Color(Color::rgb(236, 233, 226))), (200, 140), 1.0);
+        let size = crate::layout::Size { width: 200.0, height: 140.0 };
+        let at = |picture: &Picture, point: Vec3| {
+            let p = camera.project(point, size).expect("in view");
+            picture.at(p.x as u32, p.y as u32)
+        };
+        let plain = paint();
+        // a shade under the box, and a warm pool of light off to one side
+        let (side, span) = (32u32, 6.0);
+        let mut rgba = Vec::new();
+        for row in 0..side {
+            for column in 0..side {
+                let at = |index: u32| -span * 0.5 + (index as f64 + 0.5) / side as f64 * span;
+                let (x, z) = (at(column), at(row));
+                let shade = (0.2 + 0.8 * ((x * x + z * z).sqrt() - 0.5) / 0.8).clamp(0.2, 1.0);
+                let pool = (1.0 - ((x - 1.4) * (x - 1.4) + (z + 0.9) * (z + 0.9)).sqrt() / 1.4).clamp(0.0, 1.0);
+                rgba.extend_from_slice(&[(150.0 * pool) as u8, (96.0 * pool) as u8, (40.0 * pool) as u8, (255.0 * shade) as u8]);
+            }
+        }
+        world.set_floor_map(Some(crate::world::material::FloorMap {
+            picture: crate::image_engine::ImageSource::rgba(0xF100_0000_0000_0002, (side, side), rgba),
+            origin: vec2(-span * 0.5, -span * 0.5),
+            size: vec2(span, span),
+        }));
+        assert_eq!(paint(), plain, "a floor that reads no map keeps every bit");
+        floor.set_reads_floor_map(true);
+        let laid = paint();
+        dump("floor-map", &laid);
+        let (beside, pool, far) = (vec3(0.6, -0.5, 0.25), vec3(1.4, -0.5, -0.9), vec3(-2.6, -0.5, 2.6));
+        assert!(at(&laid, beside)[0] + 12 < at(&plain, beside)[0], "the shade beside the box");
+        let (warm, cool) = (at(&laid, pool), at(&plain, pool));
+        assert!(warm[0] >= cool[0] + 8 && warm[2] <= cool[2], "the warm pool: {warm:?} over {cool:?}");
+        assert_eq!(at(&laid, far), at(&plain, far), "an open corner of the map adds and takes nothing");
+        assert_eq!(at(&laid, vec3(0.0, 0.5, 0.0)), at(&plain, vec3(0.0, 0.5, 0.0)), "the box reads no map");
     }
 
     #[test]

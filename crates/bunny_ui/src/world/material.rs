@@ -3,7 +3,7 @@
 
 use std::rc::Rc;
 
-use super::math::{Mat4, Vec3};
+use super::math::{Mat4, Vec2, Vec3};
 use super::mesh::{Mesh, MeshData};
 use crate::image_engine::ImageSource;
 use crate::layout::Color;
@@ -306,6 +306,23 @@ impl PointLight {
     pub fn groups(self, groups: u32) -> PointLight {
         PointLight { groups, ..self }
     }
+}
+
+/// Light and shade baked flat onto the ground: a picture laid on the
+/// world's x–z plane and read by the surfaces that ask for it
+/// ([`super::store::EntitySpec::reads_floor_map`]). Its colour is light
+/// added to theirs — a room's lamps, baked once — and its alpha the share
+/// of the sky's light that reaches them: the shade a chair leaves under
+/// itself. A surface reads it for the price of one texel a pixel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FloorMap {
+    /// sRGB colour, straight alpha; an alpha of 255 is nothing in the way.
+    pub picture: ImageSource,
+    /// The world `(x, z)` of the picture's first texel corner: its first
+    /// row lies along `z = origin.y`, its first column along `x = origin.x`.
+    pub origin: Vec2,
+    /// The meters the picture spans: along x, then along z.
+    pub size: Vec2,
 }
 
 /// The light a world holds. A light is an entity: a point light stands

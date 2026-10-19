@@ -110,6 +110,8 @@ struct WorldUniforms {
     float4 point_position[8];
     float4 point_color[8];
     uint4 point_groups[2];
+    float4 floor_u;
+    float4 floor_v;
 };
 
 struct WorldInstance {
@@ -266,8 +268,25 @@ static float sun_visibility(constant WorldUniforms& u, depth2d<float> map, sampl
     return sum / 9.0;
 }
 
+// what the floor map gives a point: its texel from the base level, never
+// past the picture's edge; nothing off the map or for a surface that
+// reads none
+static float4 floor_light(constant WorldUniforms& u, uint flags, texture2d<float> map, sampler wrap, float3 position) {
+    if (u.counts.y < 0.5 || (flags & 2u) == 0u) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    float s = u.floor_u.x * position.x + u.floor_u.y * position.y + u.floor_u.z * position.z + u.floor_u.w;
+    float t = u.floor_v.x * position.x + u.floor_v.y * position.y + u.floor_v.z * position.z + u.floor_v.w;
+    if (!(s >= 0.0 && s <= 1.0 && t >= 0.0 && t <= 1.0)) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    float2 half_texel = 0.5 / float2(map.get_width(), map.get_height());
+    return map.sample(wrap, clamp(float2(s, t), half_texel, float2(1.0) - half_texel), level(0));
+}
+
 static float3 lit(constant WorldUniforms& u, float3 position, float3 n, float3 base,
-                  float roughness, float metallic, float3 emissive, float occlusion, uint groups, float shadow) {
+                  float roughness, float metallic, float3 emissive, float occlusion, uint groups, float shadow,
+                  float4 floor_map) {
     bool parallel = u.params.w > 0.5;
     float3 v = parallel ? float3(0.0, 0.0, 1.0) : safe_normalize(-position);
     float n_dot_v = clamp(dot(n, v), 1e-4, 1.0);
@@ -280,7 +299,7 @@ static float3 lit(constant WorldUniforms& u, float3 position, float3 n, float3 b
     float3 up = u.sky_up.xyz;
     float3 sky = u.sky_color.xyz;
     float3 ground = u.ground_color.xyz;
-    float ao = 1.0 + (occlusion - 1.0) * 0.8;
+    float ao = (1.0 + (occlusion - 1.0) * 0.8) * floor_map.a;
 
     float3 light = diffuse * hemisphere(n, up, sky, ground) * ao;
     float3 reflected = n * (2.0 * dot(n, v)) - v;
@@ -323,6 +342,7 @@ static float3 lit(constant WorldUniforms& u, float3 position, float3 n, float3 b
         light = light + diffuse * u.point_color[i].xyz * (attenuation * saturate(dot(n, l)));
     }
 
+    light = light + diffuse * floor_map.rgb;
     return light + emissive;
 }
 
@@ -394,7 +414,7 @@ vertex WorldVary world_vertex(uint vid [[vertex_id]],
 static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* materials,
                           device const WorldInstance* instances, constant WorldUniforms& u,
                           constant WorldDraw& draw, texture2d<float> picture, sampler wrap,
-                          depth2d<float> shadow_map, sampler compare) {
+                          depth2d<float> shadow_map, sampler compare, texture2d<float> floor_map) {
     float4 section = u.section;
     if (any(section != 0.0) && section.x * in.eye.x + section.y * in.eye.y + section.z * in.eye.z + section.w < 0.0) {
         discard_fragment();
@@ -431,7 +451,8 @@ static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* 
         }
         float3 light = lit(u, in.eye, normal, base, material.params.x, material.params.y,
                            material.emissive.xyz, in.occlusion, 1u << ((instance.flags >> 8) & 31u),
-                           sun_visibility(u, shadow_map, compare, in.eye, normal));
+                           sun_visibility(u, shadow_map, compare, in.eye, normal),
+                           floor_light(u, instance.flags, floor_map, wrap, in.eye));
         if (u.tone.z > 0.5) {
             dither = bayer(uint(in.position.x), uint(in.position.y));
         }
@@ -451,8 +472,9 @@ fragment float4 world_fragment(WorldVary in [[stage_in]],
                                texture2d<float> picture [[texture(0)]],
                                sampler wrap [[sampler(0)]],
                                depth2d<float> shadow_map [[texture(1)]],
-                               sampler compare [[sampler(1)]]) {
-    return world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare);
+                               sampler compare [[sampler(1)]],
+                               texture2d<float> floor_map [[texture(2)]]) {
+    return world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, floor_map);
 }
 
 struct SteppedBack {
@@ -471,9 +493,10 @@ fragment SteppedBack world_fragment_stepped(WorldVary in [[stage_in]],
                                             texture2d<float> picture [[texture(0)]],
                                             sampler wrap [[sampler(0)]],
                                             depth2d<float> shadow_map [[texture(1)]],
-                                            sampler compare [[sampler(1)]]) {
+                                            sampler compare [[sampler(1)]],
+                                            texture2d<float> floor_map [[texture(2)]]) {
     SteppedBack out;
-    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare);
+    out.color = world_shade(in, front, materials, instances, u, draw, picture, wrap, shadow_map, compare, floor_map);
     float z = in.position.z;
     float slope = max(abs(dfdx(in.depth)), abs(dfdy(in.depth)));
     out.depth = min(z + draw.bias.x * slope + DEPTH_TIE, DEPTH_CEILING);
@@ -745,6 +768,9 @@ struct WorldStack {
     sampler: Id,
     /// One white texel: what a draw with no texture binds.
     blank: Id,
+    /// One black, opaque texel: a floor map that adds and takes nothing,
+    /// bound while a frame's floor map is not decoded.
+    dark: Id,
     /// Whether the GPU keeps attachments in tile memory.
     memoryless: bool,
     sels: Selectors,
@@ -881,6 +907,12 @@ impl MetalWorld {
                 _ => None,
             };
             let (shadow_map, shadow_sampler) = map.map_or((stack.lit, stack.always), |(_, map)| (map, stack.compare));
+            let floor_map = job
+                .frame
+                .floor
+                .and_then(|index| job.textures.get(index as usize).copied().flatten())
+                .and_then(|id| self.textures.get(&id).copied())
+                .unwrap_or(stack.dark);
             let mut draws = Vec::with_capacity(job.frame.draws.len());
             for draw in &job.frame.draws {
                 match draw.kind {
@@ -990,6 +1022,7 @@ impl MetalWorld {
                 caster_depth: stack.depth_states[DEPTH_OPAQUE],
                 shadow_map,
                 shadow_sampler,
+                floor_map,
             });
         }
         let targets = batches
@@ -1070,6 +1103,11 @@ impl WorldStack {
                 return Err("no sampler or blank texture".to_string());
             }
             super::upload_texture(blank, 0, 0, 1, 1, &[255, 255, 255, 255], 1);
+            let dark = super::shared_texture(device, PIXEL_FORMAT_RGBA8_SRGB, 1, 1);
+            if dark.is_null() {
+                return Err("no dark texel".to_string());
+            }
+            super::upload_texture(dark, 0, 0, 1, 1, &[0, 0, 0, 255], 1);
             // tile memory on an Apple GPU — but not under the simulator,
             // whose Metal has no memoryless storage
             let memoryless = cfg!(not(target_abi = "sim")) && msg_bool_u64(device, sel("supportsFamily:"), GPU_FAMILY_APPLE1) != 0;
@@ -1084,6 +1122,7 @@ impl WorldStack {
                 depth_states,
                 sampler,
                 blank,
+                dark,
                 memoryless,
                 sels: Selectors {
                     depth_attachment: sel("depthAttachment"),
@@ -1129,7 +1168,10 @@ impl WorldStack {
 impl Drop for WorldStack {
     fn drop(&mut self) {
         unsafe {
-            for id in [self.library, self.composite, self.shadow, self.compare, self.lit, self.always, self.sampler, self.blank].into_iter().chain(self.depth_states) {
+            for id in [self.library, self.composite, self.shadow, self.compare, self.lit, self.always, self.sampler, self.blank, self.dark]
+                .into_iter()
+                .chain(self.depth_states)
+            {
                 msg_void(id, sel("release"));
             }
             for pipeline in self.pipelines.values() {
@@ -1474,6 +1516,8 @@ struct PreparedJob {
     /// What the surfaces read the sun's shadow through.
     shadow_map: Id,
     shadow_sampler: Id,
+    /// The frame's floor map, or the dark texel.
+    floor_map: Id,
 }
 
 struct PreparedShadow {
@@ -1579,6 +1623,7 @@ impl FramePass {
                 msg_void_id_u64(encoder, world.set_fragment_sampler, job.sampler, 0);
                 msg_void_id_u64(encoder, sels.set_fragment_texture, job.shadow_map, 1);
                 msg_void_id_u64(encoder, world.set_fragment_sampler, job.shadow_sampler, 1);
+                msg_void_id_u64(encoder, sels.set_fragment_texture, job.floor_map, 2);
                 for draw in &job.draws {
                     match draw {
                         PreparedDraw::Mesh { pipeline, depth, cull, winding, vertices, indices, first_index, index_count, instance_count, texture, block } => {

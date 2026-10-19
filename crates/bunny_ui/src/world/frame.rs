@@ -250,6 +250,9 @@ pub struct WorldFrame {
     /// The sun's shadow map, when the frame's sun casts shadows and
     /// something casts one.
     pub shadow: Option<ShadowFrame>,
+    /// Into [`WorldFrame::textures`]: the world's floor map, when one is
+    /// laid ([`FrameUniforms::floor_u`] places it).
+    pub floor: Option<u16>,
 }
 
 impl WorldFrame {
@@ -281,6 +284,9 @@ impl WorldFrame {
         }
         if let Some(shadow) = &self.shadow {
             hasher.write_u64(shadow.generation);
+        }
+        if let Some(floor) = self.floor {
+            hasher.write_u16(floor);
         }
         hasher.finish()
     }
@@ -393,6 +399,7 @@ pub(crate) fn build_frame(
             bounds,
             tint: data.spec.tint,
             flags: if data.spec.casts_shadow { instance_flag::CASTS_SHADOW } else { 0 }
+                | if data.spec.reads_floor_map { instance_flag::FLOOR_MAP } else { 0 }
                 | (data.spec.light_group as u32 & instance_flag::GROUP_MASK) << instance_flag::GROUP_SHIFT,
         };
         match &data.spec.shape {
@@ -470,6 +477,7 @@ pub(crate) fn build_frame(
         far,
         face_bias: 0.0,
         shadow: None,
+        floor: None,
     };
 
     // models: one group per (mesh, materials, handedness), drawn instanced
@@ -636,6 +644,12 @@ pub(crate) fn build_frame(
     // stable: within a pass, the order above stands
     frame.draws.sort_by_key(|draw| draw.pass);
 
+    // the light and shade baked on the ground
+    let floor_map = world.floor_map.clone();
+    if let Some(map) = &floor_map {
+        frame.floor = texture_of(&mut frame, &Some(map.picture.clone()));
+    }
+
     // the frame's sun is its first, and it casts when it says so
     let world_from_eye = view.inverse().unwrap_or(Mat4::IDENTITY);
     let sun = lights.iter().find_map(|(light, _)| match light {
@@ -651,6 +665,17 @@ pub(crate) fn build_frame(
     });
 
     frame.uniforms = uniforms(&Eye { camera, view, projection }, style, size, px_per_point, time, &lights);
+    if let Some(map) = floor_map.filter(|map| map.size.x > 0.0 && map.size.y > 0.0) {
+        // u runs with the world's x from the map's corner, v with its z;
+        // the eye's own place is taken out in f64
+        let along = |row: usize, origin: f64, span: f64| {
+            let r = world_from_eye.row(row);
+            [(r.x / span) as f32, (r.y / span) as f32, (r.z / span) as f32, ((r.w - origin) / span) as f32]
+        };
+        frame.uniforms.floor_u = along(0, map.origin.x, map.size.x);
+        frame.uniforms.floor_v = along(2, map.origin.y, map.size.y);
+        frame.uniforms.counts[1] = 1.0;
+    }
     if let Some(fit) = fit {
         // the map's u runs with its x, its v down from its top
         let uv = Mat4::from_cols(vec4(0.5, 0.0, 0.0, 0.0), vec4(0.0, -0.5, 0.0, 0.0), vec4(0.0, 0.0, 1.0, 0.0), vec4(0.5, 0.5, 0.0, 1.0));

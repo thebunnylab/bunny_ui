@@ -47,6 +47,7 @@ pub mod gl {
     pub const TEXTURE0: u32 = 0x84C0;
     pub const TEXTURE1: u32 = 0x84C1;
     pub const TEXTURE2: u32 = 0x84C2;
+    pub const TEXTURE3: u32 = 0x84C3;
     pub const TEXTURE_MIN_FILTER: u32 = 0x2801;
     pub const TEXTURE_MAG_FILTER: u32 = 0x2800;
     pub const TEXTURE_WRAP_S: u32 = 0x2802;
@@ -210,6 +211,9 @@ struct Programs {
     /// A map of one texel whose comparison always passes: a frame without
     /// a map reads full sun.
     lit: u32,
+    /// One black, opaque texel: a floor map that adds no light and takes
+    /// none away, bound while a frame's floor map is not decoded.
+    dark: u32,
     empty: u32,
 }
 
@@ -356,7 +360,7 @@ impl<G: GlFamily> GlWorld<G> {
             located.rows = gl.uniform_location(handle, "u_rows");
             located.style = gl.uniform_location(handle, "u_style");
             located.ramp = gl.uniform_location(handle, "u_ramp");
-            for (name, unit) in [("u_materials", 0), ("u_surface", 1), ("u_shadow", 2), ("atlas", 0)] {
+            for (name, unit) in [("u_materials", 0), ("u_surface", 1), ("u_shadow", 2), ("u_floor", 3), ("atlas", 0)] {
                 let at = gl.uniform_location(handle, name);
                 if at != 0 {
                     gl.uniform1i(at, unit);
@@ -380,6 +384,11 @@ impl<G: GlFamily> GlWorld<G> {
         gl.bind_texture(materials);
         gl.tex_parameteri(gl::TEXTURE_MIN_FILTER, gl::NEAREST);
         gl.tex_parameteri(gl::TEXTURE_MAG_FILTER, gl::NEAREST);
+        let dark = gl.create_texture();
+        gl.bind_texture(dark);
+        gl.tex_image_2d(0, gl::SRGB8_ALPHA8, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, &[0, 0, 0, 255]);
+        gl.tex_parameteri(gl::TEXTURE_MIN_FILTER, gl::NEAREST);
+        gl.tex_parameteri(gl::TEXTURE_MAG_FILTER, gl::NEAREST);
         // its texel is never written: a comparison that always passes
         let lit = gl.create_texture();
         gl.bind_texture(lit);
@@ -399,6 +408,7 @@ impl<G: GlFamily> GlWorld<G> {
             materials,
             blank,
             lit,
+            dark,
             empty: gl.create_vertex_array(),
         })
     }
@@ -432,12 +442,10 @@ impl<G: GlFamily> GlWorld<G> {
         gl.enable(gl::BLEND);
         let [a, b, c, d] = self.blend_2d;
         gl.blend_func_separate(a, b, c, d);
-        gl.active_texture(gl::TEXTURE2);
-        gl.bind_texture(0);
-        gl.active_texture(gl::TEXTURE1);
-        gl.bind_texture(0);
-        gl.active_texture(gl::TEXTURE0);
-        gl.bind_texture(0);
+        for unit in [gl::TEXTURE3, gl::TEXTURE2, gl::TEXTURE1, gl::TEXTURE0] {
+            gl.active_texture(unit);
+            gl.bind_texture(0);
+        }
         gl.bind_framebuffer(gl::FRAMEBUFFER, 0);
     }
 
@@ -500,6 +508,10 @@ impl<G: GlFamily> GlWorld<G> {
         gl.tex_image_2d(0, gl::RGBA32F, (columns * 4) as i32, rows as i32, gl::RGBA, gl::FLOAT, &table);
         gl.active_texture(gl::TEXTURE2);
         gl.bind_texture(map.map_or(programs.lit, |(_, map)| map.texture));
+        let floor = frame.floor.and_then(|index| job.textures.get(index as usize).copied().flatten()).and_then(|id| self.textures.get(&id).copied());
+        let gl = &mut self.gl;
+        gl.active_texture(gl::TEXTURE3);
+        gl.bind_texture(floor.unwrap_or(programs.dark));
         gl.active_texture(gl::TEXTURE1);
         gl.bind_texture(programs.blank);
 
