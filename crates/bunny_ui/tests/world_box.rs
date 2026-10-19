@@ -150,5 +150,8 @@ fn a_world_rasters_once_per_generation() {
     let second = bunny_ui::image_engine::raster_source(&engine, &source, 64, 40).expect("again");
     assert!(std::rc::Rc::ptr_eq(&first, &second), "once per picture and size");
     assert_eq!(first.rgba.len(), 64 * 40 * 4);
-    assert!(first.rgba.chunks_exact(4).any(|p| p[3] == 255), "the cube is there");
+    assert!(
+        first.rgba.as_chunks::<4>().0.iter().any(|p| p[3] == 255),
+        "the cube is there"
+    );
 }
