@@ -934,7 +934,9 @@ impl WorldStack {
                 return Err("no sampler or blank texture".to_string());
             }
             super::upload_texture(blank, 0, 0, 1, 1, &[255, 255, 255, 255], 1);
-            let memoryless = msg_bool_u64(device, sel("supportsFamily:"), GPU_FAMILY_APPLE1) != 0;
+            // tile memory on an Apple GPU — but not under the simulator,
+            // whose Metal has no memoryless storage
+            let memoryless = cfg!(not(target_abi = "sim")) && msg_bool_u64(device, sel("supportsFamily:"), GPU_FAMILY_APPLE1) != 0;
             Ok(WorldStack {
                 library,
                 composite,
