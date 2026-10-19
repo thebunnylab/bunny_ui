@@ -248,3 +248,75 @@ fn blur_respects_device_scale_and_keeps_scrollbars_in_the_composite() {
         "a separate sharp thumb would bypass the effect"
     );
 }
+
+#[test]
+fn a_clipped_multichild_blur_matches_full_and_culled_placement() {
+    let view = zstack!(
+        rectangle().foreground_color(Color::rgb(255, 0, 0)),
+        text("Inside"),
+    )
+    .frame(30.0, 30.0)
+    .blur(3.0)
+    .clipped()
+    .padding_length(15.0);
+    let size = Size {
+        width: 60.0,
+        height: 60.0,
+    };
+    let full = Runtime::new();
+    let cut = Runtime::new();
+    cut.drop_unseen();
+    let full = full.display_frame(&view, size);
+    let cut = cut.display_frame(&view, size);
+    assert_eq!(
+        rasterize(&full, 60, 60, Color::WHITE).to_rgba_bytes(),
+        rasterize(&cut, 60, 60, Color::WHITE).to_rgba_bytes()
+    );
+}
+
+#[test]
+fn native_hosts_keep_their_paint_order_and_geometry_inside_blur() {
+    #[derive(Clone, Copy)]
+    struct Hosted;
+    impl Component for Hosted {
+        fn body(self) -> impl View {
+            zstack!(
+                rectangle().foreground_color(Color::rgb(255, 0, 0)),
+                bunny_ui_core::host::webview("https://example.test/"),
+                text("Above the native surface"),
+            )
+            .frame(40.0, 40.0)
+            .clipped()
+            .blur(2.0)
+            .padding_length(10.0)
+        }
+    }
+    let runtime = Runtime::new();
+    runtime.drop_unseen();
+    let display = runtime.display_frame(
+        &Hosted,
+        Size {
+            width: 60.0,
+            height: 60.0,
+        },
+    );
+    let hosts = runtime.hosts();
+    assert_eq!(hosts.len(), 1);
+    assert_eq!(
+        hosts[0].frame.size,
+        Size {
+            width: 40.0,
+            height: 40.0
+        }
+    );
+    assert_eq!(
+        hosts[0].mark, 1,
+        "the background stays beneath the native host"
+    );
+    assert_eq!(
+        display.len(),
+        2,
+        "the two framework paint layers stay separate"
+    );
+    assert_eq!(runtime.host_segments(display.len())[0].1, (1, 2));
+}

@@ -3133,33 +3133,6 @@ impl DisplayList {
         }
     }
 
-    /// Composite without renumbering the placement's custom/host/overlay ranges.
-    #[cfg(feature = "canvas")]
-    fn blur_from(&mut self, from: usize, radius: Px, viewport: Rect, env: &LayoutEnv<'_>) {
-        let layer = self.translated_slice((from, self.len()), 0.0, 0.0);
-        let beneath = if layer
-            .iter()
-            .any(|command| matches!(command, DrawCommand::Backdrop { .. }))
-        {
-            self.translated_slice((0, from), 0.0, 0.0)
-        } else {
-            DisplayList::default()
-        };
-        let blurred = crate::blur::paint(&layer, &beneath, radius, viewport, env);
-        for command in &mut self.commands[from..] {
-            *command = DrawCommand::FillRect {
-                rect: Rect::default(),
-                color: Color::rgba(0, 0, 0, 0),
-                corner_radius: Corners::default(),
-            };
-        }
-        if let Some(blurred) = blurred
-            && let Some(last) = self.commands.last_mut().filter(|_| !layer.is_empty())
-        {
-            *last = blurred;
-        }
-    }
-
     /// A translated copy of `commands[range]` — what a second surface
     /// (a popover's child panel, a canvas island) re-presents in its
     /// own coordinates. Clip pairs inside an overlay slice are
@@ -3993,6 +3966,15 @@ pub struct HostPlacement {
 /// The grip band's thickness over a split divider, in points.
 pub const SPLIT_GRIP: Px = 6.0;
 
+#[cfg(feature = "canvas")]
+#[derive(Clone, Copy)]
+struct BlurScope {
+    radius: Px,
+    display: usize,
+    customs: usize,
+    hosts: usize,
+}
+
 #[derive(Default, Debug)]
 pub struct Placement {
     /// Nested pixel effects keep custom and scrollbar paint on the scene.
@@ -4204,6 +4186,71 @@ impl Placement {
             return;
         }
         self.display.push(command);
+    }
+
+    /// Replace framework paint with its composite and rebind dependent ranges.
+    /// Native hosts are paint barriers: each side stays on its original layer.
+    #[cfg(feature = "canvas")]
+    fn blur_from(&mut self, scope: BlurScope, viewport: Rect, env: &LayoutEnv<'_>) {
+        let original = DisplayList {
+            commands: self.display.commands.split_off(scope.display),
+        };
+        let boundaries: Vec<usize> = self.hosts[scope.hosts..]
+            .iter()
+            .map(|host| host.mark - scope.display)
+            .chain(std::iter::once(original.len()))
+            .collect();
+        let mut start = 0;
+        for (index, end) in boundaries.into_iter().enumerate() {
+            // A native host can split an inner clip. Carry the open stack
+            // into each segment and close it locally, without painting it.
+            let mut clips = Vec::new();
+            for command in &original.commands[..start] {
+                match command {
+                    DrawCommand::PushClip { .. } => clips.push(command.clone()),
+                    DrawCommand::PopClip => {
+                        clips.pop();
+                    }
+                    _ => {}
+                }
+            }
+            let mut layer = DisplayList {
+                commands: clips.clone(),
+            };
+            for command in &original.commands[start..end] {
+                match command {
+                    DrawCommand::PushClip { .. } => clips.push(command.clone()),
+                    DrawCommand::PopClip => {
+                        clips.pop();
+                    }
+                    _ => {}
+                }
+                layer.push(command.clone());
+            }
+            for _ in clips {
+                layer.push(DrawCommand::PopClip);
+            }
+            let beneath = if layer
+                .iter()
+                .any(|command| matches!(command, DrawCommand::Backdrop { .. }))
+            {
+                self.display.clone()
+            } else {
+                DisplayList::default()
+            };
+            if let Some(image) = crate::blur::paint(&layer, &beneath, scope.radius, viewport, env) {
+                self.draw(image);
+            }
+            if let Some(host) = self.hosts.get_mut(scope.hosts + index) {
+                host.mark = self.display.len();
+            }
+            start = end;
+        }
+        for custom in &mut self.customs[scope.customs..] {
+            // There is no independent slice inside a composited group. Its
+            // pixels move together; interaction still uses the original box.
+            custom.slice = (scope.display, self.display.len());
+        }
     }
 
     /// Is this box FAR off the glass — a whole window away from the clip
@@ -8328,9 +8375,10 @@ impl LayoutNode {
                 // a layer would take them all at once
                 let fade_from = out.display.len();
                 #[cfg(feature = "canvas")]
-                let blur = props.blur.filter(|_| out.dom.as_ref().is_none_or(|dom| dom.in_canvas()));
+                let blur = props.blur.filter(|_| out.dom.as_ref().is_none_or(|dom| dom.in_canvas()))
+                    .map(|radius| BlurScope { radius, display: fade_from, customs: out.customs.len(), hosts: out.hosts.len() });
                 #[cfg(not(feature = "canvas"))]
-                let blur: Option<Px> = None;
+                let blur: Option<()> = None;
                 let old_thumbs = out.thumb_layers;
                 let old_keep = out.keep_unseen;
                 if blur.is_some() {
@@ -8459,17 +8507,17 @@ impl LayoutNode {
                         out.display.fade_from(fade_from, opacity.max(0.0));
                     }
                 }
-                if let Some(radius) = blur {
+                if let Some(scope) = blur {
                     out.compositing -= 1;
                     out.thumb_layers = old_thumbs;
                     out.keep_unseen = old_keep;
                     #[cfg(feature = "canvas")]
                     {
                         let viewport = env.overlay_bounds.or(out.accessibility_viewport).unwrap_or(frame);
-                        out.display.blur_from(fade_from, radius, viewport, &env);
+                        out.blur_from(scope, viewport, &env);
                     }
                     #[cfg(not(feature = "canvas"))]
-                    let _ = radius;
+                    let _ = scope;
                 }
                 if let Some(dom) = out.dom.as_mut() {
                     dom.close();

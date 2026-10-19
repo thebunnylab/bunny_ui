@@ -18,7 +18,10 @@ Custom paint and scrollbar thumbs inside a blur remain in the scene. A looping
 custom view requests a scene repaint so its independent surface cannot bypass
 the effect. Native platform hosts such as a webview or video surface remain
 platform-owned content outside framework paint; this modifier does not capture
-or filter those native surfaces.
+or filter those native surfaces. They remain paint barriers: framework paint
+on each side is composited separately, preserving the host's stacking order.
+Composite replacement rebinds custom paint ranges and native-host marks;
+invisible placeholder commands are not retained.
 
 The element renderer keeps native text and controls and emits CSS `filter`.
 DOM ABI 22 adds style bit 25 and a trailing f32 radius. The encoder, SSR rules,
