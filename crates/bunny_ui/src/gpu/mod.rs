@@ -15,3 +15,5 @@
 pub mod scenes;
 pub mod shaders;
 pub mod walk;
+#[cfg(feature = "3d")]
+pub mod world;

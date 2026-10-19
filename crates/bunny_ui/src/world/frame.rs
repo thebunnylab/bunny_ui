@@ -37,10 +37,13 @@ pub enum Background {
 /// What a picture of the world may cost.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Quality {
-    /// Fewer pixels, no multisampling: a weak GPU, a phone, a busy page.
+    /// One sample a pixel and a small pixel budget: a weak GPU, a phone,
+    /// a busy page.
     Low,
+    /// Four samples a pixel.
     #[default]
     Medium,
+    /// Four samples a pixel and the largest budget.
     High,
 }
 
@@ -53,13 +56,27 @@ impl Quality {
         }
     }
 
-    /// The share of the box's pixels the picture is drawn at; the
-    /// compositor stretches it to the box.
-    pub fn render_scale(self) -> f64 {
+    /// The most pixels a GPU tier draws a picture with. A box inside the
+    /// budget is drawn at its own size; a larger one is drawn smaller,
+    /// and the compositor stretches it to the box.
+    pub fn pixel_budget(self) -> u32 {
         match self {
-            Quality::Low => 0.75,
-            Quality::Medium | Quality::High => 1.0,
+            Quality::Low => 1_200_000,
+            Quality::Medium => 2_200_000,
+            Quality::High => 4_000_000,
         }
+    }
+
+    /// The size a GPU tier draws a box of `box_px` pixels at: the box's
+    /// own, or the largest of the same shape inside the budget.
+    pub fn target_size(self, box_px: (u32, u32)) -> (u32, u32) {
+        let pixels = box_px.0 as f64 * box_px.1 as f64;
+        let budget = self.pixel_budget() as f64;
+        if pixels <= budget {
+            return (box_px.0.max(1), box_px.1.max(1));
+        }
+        let scale = (budget / pixels).sqrt();
+        (((box_px.0 as f64 * scale).floor() as u32).max(1), ((box_px.1 as f64 * scale).floor() as u32).max(1))
     }
 }
 

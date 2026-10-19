@@ -53,9 +53,20 @@ pub struct Shot {
 type Decided = ((u32, u32), Rc<WorldFrame>);
 
 impl Shot {
+    /// A picture of `world` through `camera` (sampled at `time`), for a
+    /// box of `points`.
+    pub(crate) fn new(world: WorldData, camera: Camera, style: WorldStyle, time: f64, points: (f64, f64)) -> Shot {
+        Shot { world, camera, style, time, points, frame: RefCell::new(None) }
+    }
+
     /// The box's size in points, rounded.
     pub fn points(&self) -> (u32, u32) {
         (self.points.0.round().max(0.0) as u32, self.points.1.round().max(0.0) as u32)
+    }
+
+    /// The style the box shows its world with.
+    pub fn style(&self) -> &WorldStyle {
+        &self.style
     }
 
     /// The frame for a target of `size` pixels, decided once per size.
@@ -136,14 +147,7 @@ impl Painter<'_> {
             put((time * fps).floor() as u64);
         }
 
-        let shot = Shot {
-            world: snapshot,
-            camera: seen,
-            style: style.clone(),
-            time,
-            points: (rect.size.width, rect.size.height),
-            frame: RefCell::new(None),
-        };
+        let shot = Shot::new(snapshot, seen, style.clone(), time, (rect.size.width, rect.size.height));
         self.image(
             rect,
             ImageSource::World {

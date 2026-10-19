@@ -9,6 +9,10 @@ bunny-ui = { workspace = true, features = ["canvas", "gpu"] }
 
 [features]
 wgpu-surface = ["dep:wgpu", "dep:metal", "dep:foreign-types"]
+# Worlds drawn by Metal itself: the world pass, its targets and its
+# shaders, compiled the first time a box paints a world. Without it a
+# world still shows: the CPU draws it.
+3d = ["bunny-ui/3d"]
 
 [dependencies.wgpu]
 version = "27.0.1"

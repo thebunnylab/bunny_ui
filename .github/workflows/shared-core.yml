@@ -70,6 +70,11 @@ jobs:
           # Retain the actual adapter witness on successful parity tests too.
           cargo test -p "$PLATFORM" --locked --all-targets -- --nocapture
           BUNNY_PARANOID=all cargo test -p "$PLATFORM" --locked --all-targets -- --nocapture
+      - name: Metal world pass, normal and paranoid
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p bunny-ui-apple --locked --all-targets --features 3d -- --nocapture
+          BUNNY_PARANOID=all cargo test -p bunny-ui-apple --locked --all-targets --features 3d
       - name: macOS shell, normal and paranoid; iOS build
         if: runner.os == 'macOS'
         run: |

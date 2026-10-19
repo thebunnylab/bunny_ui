@@ -1143,6 +1143,9 @@ pub(crate) fn present_window(
                     }
                     sprite_attribs(run.base as usize * std::mem::size_of::<SpriteInstance>());
                 }
+                // this tier has no world pass yet: its ground opens no
+                // world door, and the walk shows the oracle's picture
+                RunKind::World(_) => continue,
                 RunKind::Glass => {
                     let Some(targets) = tier.glass.as_ref() else { continue };
                     // the pyramid is blurred out of the scene AS DRAWN
