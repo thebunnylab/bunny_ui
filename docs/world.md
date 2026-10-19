@@ -132,10 +132,20 @@ another camera along a path that curves around the target.
 
 `Orbit` reads the box's events and moves a `State<Camera>`. A drag
 turns the view around the surface the press landed on, and that point
-stays under the pointer; shift pans; the wheel and a pinch zoom toward
-the pointer. The pitch and the distance stay inside `OrbitLimits`. A
+stays under the pointer — with the primary button, or with the middle
+one, as drawing programs turn; shift pans; the wheel and a pinch zoom
+toward the pointer. On a touch screen two fingers pan the point between
+them and turn the view as they twist, and a trackpad's twist turns it
+too. The pitch and the distance stay inside `OrbitLimits`. A primary
 press that never travels comes back IGNORED on its release: that is a
-tap, and the caller answers it.
+tap, and the caller answers it. While a drag moves the camera, the
+pointer is the closed hand (`Cursor::Grabbing`).
+
+A box that answers the press of a button past the primary one holds the
+pointer until that button lifts: it hears `ElementEvent::ButtonMoved`
+wherever the hand runs, then `ElementEvent::ButtonUp`. Two fingers on a
+touch screen arrive as `ElementEvent::Pan` and `ElementEvent::Rotate`,
+beside the pinch's `Magnify`.
 
 ## Picking
 

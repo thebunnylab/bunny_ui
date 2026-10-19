@@ -841,7 +841,9 @@ enum Ev {
     PinchBegin,
     /// The pinch's scale since its begin — cumulative, the ratio is
     /// taken here.
-    PinchUpdate { scale: f64 },
+    /// The pinch's scale since it began, and its turn since the last
+    /// step in degrees, clockwise.
+    PinchUpdate { scale: f64, rotation: f64 },
     PinchEnd,
     PointerFrame,
     BufferRelease { buffer_ptr: usize },
@@ -972,7 +974,10 @@ unsafe extern "C" fn dispatcher(
         },
         TAG_PINCH => match opcode {
             0 => push_ev(Ev::PinchBegin),
-            1 => push_ev(Ev::PinchUpdate { scale: fixed_to_f64(unsafe { arg(3).f }) }),
+            1 => push_ev(Ev::PinchUpdate {
+                scale: fixed_to_f64(unsafe { arg(3).f }),
+                rotation: fixed_to_f64(unsafe { arg(4).f }),
+            }),
             2 => push_ev(Ev::PinchEnd),
             _ => {}
         },
@@ -1896,6 +1901,9 @@ pub enum AppEvent {
     RightMouseDown { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     /// The middle button's press — the wheel pressed down.
     MiddleMouseDown { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
+    /// The right or the middle button lifted — the end of a drag a box
+    /// may hold with it.
+    ButtonUp { x: f64, y: f64, button: bunny_ui::custom::PointerButton },
     MouseExited,
     /// Typing, paste of characters, and the composed dead-key result —
     /// the same road for all of them.
@@ -1929,6 +1937,8 @@ pub enum AppEvent {
     Touch { phase: TouchPhase, id: u64, x: f64, y: f64 },
     /// One step of a pinch: the RATIO of this step (1 = no change).
     Magnify { x: f64, y: f64, scale: f64 },
+    /// One step of a pinch's twist: radians, counter-clockwise positive.
+    Rotate { x: f64, y: f64, radians: f64 },
     ImeMark { text: String, caret: usize },
     ImeUnmark,
     Blink,
@@ -3653,6 +3663,14 @@ pub enum Cursor {
     ResizeUpDown,
     ResizeNwSe,
     ResizeNeSw,
+    /// The open hand: what is under it moves with a drag.
+    Grab,
+    /// The closed hand: it is moving now.
+    Grabbing,
+    /// The four arrows.
+    Move,
+    /// The thin cross, for an exact point.
+    Crosshair,
 }
 
 /// The border band's cursor for an xdg resize-edge bitfield.
@@ -3677,6 +3695,10 @@ fn cursor_names(cursor: Cursor) -> &'static [&'static CStr] {
         Cursor::ResizeUpDown => &[c"ns-resize", c"sb_v_double_arrow", c"size_ver", c"row-resize"],
         Cursor::ResizeNwSe => &[c"nwse-resize", c"size_fdiag", c"bd_double_arrow"],
         Cursor::ResizeNeSw => &[c"nesw-resize", c"size_bdiag", c"fd_double_arrow"],
+        Cursor::Grab => &[c"grab", c"openhand", c"hand1"],
+        Cursor::Grabbing => &[c"grabbing", c"closedhand", c"dnd-move", c"hand1"],
+        Cursor::Move => &[c"move", c"fleur", c"all-scroll", c"size_all"],
+        Cursor::Crosshair => &[c"crosshair", c"tcross", c"cross"],
     }
 }
 
@@ -5064,6 +5086,18 @@ fn drain_protocol_events() {
                     (BTN_MIDDLE, true) => {
                         dispatch_at(owner, AppEvent::MiddleMouseDown { x, y, modifiers })
                     }
+                    // the compositor keeps the pointer on the surface while
+                    // a button is held: the lift lands where the press did
+                    (BTN_RIGHT, false) => dispatch_at(owner, AppEvent::ButtonUp {
+                        x,
+                        y,
+                        button: bunny_ui::custom::PointerButton::Secondary,
+                    }),
+                    (BTN_MIDDLE, false) => dispatch_at(owner, AppEvent::ButtonUp {
+                        x,
+                        y,
+                        button: bunny_ui::custom::PointerButton::Middle,
+                    }),
                     _ => {}
                 }
             }
@@ -5124,7 +5158,7 @@ fn drain_protocol_events() {
                 }
             }
             Ev::PinchBegin => with_client(|client| client.pinch_last = 1.0),
-            Ev::PinchUpdate { scale } => {
+            Ev::PinchUpdate { scale, rotation } => {
                 let step = with_client(|client| {
                     let ratio = pinch_ratio(&mut client.pinch_last, scale);
                     let (x, y) = client.pointer_pos;
@@ -5134,6 +5168,10 @@ fn drain_protocol_events() {
                 let (ratio, x, y, owner) = step;
                 if ratio != 1.0 {
                     dispatch_at(owner, AppEvent::Magnify { x, y, scale: ratio });
+                }
+                // the protocol turns clockwise; the scene counts the other way
+                if rotation != 0.0 {
+                    dispatch_at(owner, AppEvent::Rotate { x, y, radians: -rotation.to_radians() });
                 }
             }
             Ev::PinchEnd => {}

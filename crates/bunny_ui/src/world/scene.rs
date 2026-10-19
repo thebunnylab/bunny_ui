@@ -211,6 +211,13 @@ impl<C: CameraSource> CustomElement for SceneElement<C> {
         self.orbit.is_some()
     }
 
+    /// The closed hand while a drag moves the camera; the platform's own
+    /// pointer otherwise.
+    fn cursor(&self, _at: Point, _visible: Rect) -> Option<crate::layout::Cursor> {
+        let dragging = self.orbit.as_ref().is_some_and(|(orbit, _)| orbit.is_dragging());
+        dragging.then_some(crate::layout::Cursor::Grabbing)
+    }
+
     fn event(&self, event: &ElementEvent, ctx: &EventCtx) -> Response {
         let size = ctx.size();
         if let ElementEvent::PointerMoved { at, pressed: false, .. } = event

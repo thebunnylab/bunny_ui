@@ -459,7 +459,9 @@ const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
 const WM_RBUTTONDOWN: u32 = 0x0204;
+const WM_RBUTTONUP: u32 = 0x0205;
 const WM_MBUTTONDOWN: u32 = 0x0207;
+const WM_MBUTTONUP: u32 = 0x0208;
 const WM_MOUSEWHEEL: u32 = 0x020A;
 const WM_MOUSEHWHEEL: u32 = 0x020E;
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -576,6 +578,7 @@ const IDC_SIZENWSE: usize = 32642;
 const IDC_SIZENESW: usize = 32643;
 const IDC_SIZEWE: usize = 32644;
 const IDC_SIZENS: usize = 32645;
+const IDC_SIZEALL: usize = 32646;
 
 pub(crate) fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
@@ -711,6 +714,9 @@ pub enum AppEvent {
     RightMouseDown { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     /// The middle button's press — the wheel pressed down.
     MiddleMouseDown { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
+    /// The right or the middle button lifted — the end of a drag a box
+    /// may hold with it.
+    ButtonUp { x: f64, y: f64, button: bunny_ui::custom::PointerButton },
     MouseUp { x: f64, y: f64 },
     MouseMoved { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     /// The pointer left the window — without this event the hover would
@@ -1884,6 +1890,15 @@ pub enum Cursor {
     ResizeUpLeftDownRight,
     /// A frame's top-right or bottom-left corner (↗↙).
     ResizeUpRightDownLeft,
+    /// What is under the pointer moves with a drag: Windows has no hand
+    /// for it, and draws the four arrows its own canvases pan with.
+    Grab,
+    /// It is moving now — the same arrows.
+    Grabbing,
+    /// The four arrows.
+    Move,
+    /// The cross, for an exact point.
+    Crosshair,
 }
 
 /// The system cursor each outfit loads.
@@ -1897,6 +1912,8 @@ const fn cursor_id(cursor: Cursor) -> usize {
         Cursor::ResizeUpDown => IDC_SIZENS,
         Cursor::ResizeUpLeftDownRight => IDC_SIZENWSE,
         Cursor::ResizeUpRightDownLeft => IDC_SIZENESW,
+        Cursor::Grab | Cursor::Grabbing | Cursor::Move => IDC_SIZEALL,
+        Cursor::Crosshair => IDC_CROSS,
     }
 }
 
@@ -2683,14 +2700,35 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             // the same reclaim as the left press — a context ask is
             // still the scene's click
             reclaim_keyboard();
+            // the grab: a box holding the press keeps hearing the drag
+            // past the window's edge
+            unsafe {
+                SetCapture(hwnd);
+            }
             let (x, y) = layout_point(hwnd, lparam);
             dispatch_at(hwnd, AppEvent::RightMouseDown { x, y, modifiers: held_modifiers_now() });
             0
         }
         WM_MBUTTONDOWN => {
             reclaim_keyboard();
+            unsafe {
+                SetCapture(hwnd);
+            }
             let (x, y) = layout_point(hwnd, lparam);
             dispatch_at(hwnd, AppEvent::MiddleMouseDown { x, y, modifiers: held_modifiers_now() });
+            0
+        }
+        WM_RBUTTONUP | WM_MBUTTONUP => {
+            unsafe {
+                ReleaseCapture();
+            }
+            let (x, y) = layout_point(hwnd, lparam);
+            let button = if msg == WM_RBUTTONUP {
+                bunny_ui::custom::PointerButton::Secondary
+            } else {
+                bunny_ui::custom::PointerButton::Middle
+            };
+            dispatch_at(hwnd, AppEvent::ButtonUp { x, y, button });
             0
         }
         // a modifier going down or coming up: the state is read AFTER the
@@ -4601,6 +4639,7 @@ mod tests {
         assert_eq!(cursor_id(Cursor::Arrow), 32512, "IDC_ARROW");
         assert_eq!(cursor_id(Cursor::ResizeUpLeftDownRight), 32642, "IDC_SIZENWSE");
         assert_eq!(cursor_id(Cursor::ResizeUpRightDownLeft), 32643, "IDC_SIZENESW");
+        assert_eq!(cursor_id(Cursor::Move), 32646, "IDC_SIZEALL");
         // and the system has every one of them
         for cursor in [
             Cursor::Arrow,
@@ -4611,6 +4650,10 @@ mod tests {
             Cursor::ResizeUpDown,
             Cursor::ResizeUpLeftDownRight,
             Cursor::ResizeUpRightDownLeft,
+            Cursor::Grab,
+            Cursor::Grabbing,
+            Cursor::Move,
+            Cursor::Crosshair,
         ] {
             let handle = unsafe { LoadCursorW(0, cursor_id(cursor) as *const u16) };
             assert_ne!(handle, 0, "{cursor:?} loads nothing");
