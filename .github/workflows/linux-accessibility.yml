@@ -5,6 +5,7 @@ on:
     paths:
       - 'crates/bunny_ui/**'
       - 'crates/bunny_ui_linux/**'
+      - 'crates/bunny_ui_vulkan/**'
       - 'scripts/check-linux-accessibility.sh'
       - 'scripts/record-native-text-environment.py'
       - '.github/workflows/linux-accessibility.yml'
@@ -32,7 +33,8 @@ jobs:
           sudo apt-get install -y libxcb1-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-shm0-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libdbus-1-dev libsecret-1-dev \
             libfontconfig-dev libfreetype-dev libharfbuzz-dev libfribidi-dev fonts-dejavu fonts-liberation fonts-noto-color-emoji b3sum \
-            wayland-protocols weston xvfb dbus-x11 at-spi2-core python3-gi gir1.2-atspi-2.0
+            wayland-protocols weston xvfb dbus-x11 at-spi2-core python3-gi gir1.2-atspi-2.0 \
+            libegl1 libegl-mesa0 libgl1-mesa-dri libvulkan1 mesa-vulkan-drivers
       - name: Pinned compiler
         run: |
           rustup toolchain install 1.98.1 --profile minimal --component clippy
@@ -56,6 +58,18 @@ jobs:
         run: |
           dbus-run-session -- cargo test -p bunny-ui-linux --locked --all-targets
           BUNNY_PARANOID=all dbus-run-session -- cargo test -p bunny-ui-linux --locked --all-targets
+      - name: GL world pass, normal and paranoid
+        run: |
+          # the offscreen context is surfaceless: llvmpipe answers on a
+          # runner with no GPU, and the test names the renderer it got
+          cargo test -p bunny-ui-linux --locked --lib --features 3d world_tests -- --nocapture
+          BUNNY_PARANOID=all cargo test -p bunny-ui-linux --locked --lib --features 3d world_tests
+      - name: Vulkan world pass, normal and paranoid
+        run: |
+          # lavapipe answers on a runner with no GPU; the tests name the
+          # device they got
+          cargo test -p bunny-ui-vulkan --locked --lib --features 3d world -- --nocapture
+          BUNNY_PARANOID=all cargo test -p bunny-ui-vulkan --locked --lib --features 3d world
       - name: Core and facade on Linux
         run: |
           cargo test -p bunny-ui-core --locked --all-targets

@@ -46,6 +46,29 @@ use bunny_ui::gpu::walk::{
     RoundClip, RunAtlas, RunKind, SpriteInstance, GLASS_MAX_LEVEL, ATLAS_KEEP_WALKS,
 };
 
+#[cfg(feature = "3d")]
+mod world;
+
+/// Without the `3d` feature this tier draws no world: the walk shows the
+/// oracle's picture through the live road, and nothing here is asked.
+#[cfg(not(feature = "3d"))]
+mod world {
+    use super::{DescriptorSet, Pipeline, VkStack};
+
+    pub(super) struct VkWorld;
+
+    impl VkWorld {
+        pub(super) fn new() -> VkWorld {
+            VkWorld
+        }
+        pub(super) fn sweep(&mut self, _: &VkStack) {}
+        pub(super) fn release(&mut self, _: &VkStack) {}
+        pub(super) fn composites(&self, _: &[u64]) -> (Pipeline, Vec<DescriptorSet>) {
+            (0, Vec::new())
+        }
+    }
+}
+
 // MARK: - The committed shaders (SPIR-V beside their GLSL truth)
 
 const RECT_VERT_SPV: &[u8] = include_bytes!("shaders/rect.vert.spv");
@@ -209,6 +232,12 @@ const PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT: u32 = 0x400;
 
 const ACCESS_TRANSFER_WRITE: u32 = 0x1000;
 const ACCESS_SHADER_READ: u32 = 0x20;
+const ACCESS_COLOR_ATTACHMENT_READ: u32 = 0x80;
+const ACCESS_COLOR_ATTACHMENT_WRITE: u32 = 0x100;
+const ACCESS_TRANSFER_READ: u32 = 0x800;
+const SUBPASS_EXTERNAL: u32 = u32::MAX;
+/// A pool whose sets are given back one by one, with their pictures.
+const DESCRIPTOR_POOL_FREE_SETS: u32 = 0x1;
 
 const SHADER_STAGE_VERTEX: u32 = 0x1;
 const SHADER_STAGE_FRAGMENT: u32 = 0x10;
@@ -223,7 +252,8 @@ const VERTEX_INPUT_RATE_INSTANCE: u32 = 1;
 const PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: u32 = 3;
 const POLYGON_MODE_FILL: u32 = 0;
 const CULL_MODE_NONE: u32 = 0;
-const FRONT_FACE_CCW: u32 = 1;
+/// `VK_FRONT_FACE_COUNTER_CLOCKWISE` — 0 (1 is CLOCKWISE).
+const FRONT_FACE_COUNTER_CLOCKWISE: u32 = 0;
 const SAMPLE_COUNT_1: u32 = 1;
 const DYNAMIC_STATE_VIEWPORT: u32 = 0;
 const DYNAMIC_STATE_SCISSOR: u32 = 1;
@@ -881,6 +911,54 @@ struct Viewport {
     max_depth: f32,
 }
 
+/// `VkSubpassDependency`: how a pass orders against what comes before
+/// and after it.
+#[repr(C)]
+struct SubpassDependency {
+    src_subpass: u32,
+    dst_subpass: u32,
+    src_stage: u32,
+    dst_stage: u32,
+    src_access: u32,
+    dst_access: u32,
+    flags: u32,
+}
+
+/// `VkFormatProperties`.
+#[repr(C)]
+#[cfg_attr(not(feature = "3d"), allow(dead_code))]
+struct FormatProperties {
+    linear_tiling: u32,
+    optimal_tiling: u32,
+    buffer: u32,
+}
+
+/// What every 2D pass orders itself by: after the copies, the samples
+/// and the drawing that came before it (the acquire's wait included),
+/// and before the samples and the copies that read what it drew.
+fn pass_dependencies() -> [SubpassDependency; 2] {
+    [
+        SubpassDependency {
+            src_subpass: SUBPASS_EXTERNAL,
+            dst_subpass: 0,
+            src_stage: PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT | PIPELINE_STAGE_FRAGMENT_SHADER | PIPELINE_STAGE_TRANSFER,
+            dst_stage: PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT | PIPELINE_STAGE_FRAGMENT_SHADER,
+            src_access: ACCESS_COLOR_ATTACHMENT_WRITE | ACCESS_TRANSFER_WRITE,
+            dst_access: ACCESS_COLOR_ATTACHMENT_READ | ACCESS_COLOR_ATTACHMENT_WRITE | ACCESS_SHADER_READ,
+            flags: 0,
+        },
+        SubpassDependency {
+            src_subpass: 0,
+            dst_subpass: SUBPASS_EXTERNAL,
+            src_stage: PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT,
+            dst_stage: PIPELINE_STAGE_FRAGMENT_SHADER | PIPELINE_STAGE_TRANSFER | PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT,
+            src_access: ACCESS_COLOR_ATTACHMENT_WRITE,
+            dst_access: ACCESS_SHADER_READ | ACCESS_TRANSFER_READ | ACCESS_COLOR_ATTACHMENT_READ | ACCESS_COLOR_ATTACHMENT_WRITE,
+            flags: 0,
+        },
+    ]
+}
+
 #[repr(C)]
 struct Rect2D {
     offset: [i32; 2],
@@ -1181,6 +1259,21 @@ struct VkFns {
     cmd_set_viewport: unsafe extern "C" fn(CommandBuffer, u32, u32, *const Viewport),
     cmd_set_scissor: unsafe extern "C" fn(CommandBuffer, u32, u32, *const Rect2D),
     cmd_draw: unsafe extern "C" fn(CommandBuffer, u32, u32, u32, u32),
+    free_descriptor_sets:
+        unsafe extern "C" fn(Device, DescriptorPool, u32, *const DescriptorSet) -> VkResult,
+    // what the world pass adds (feature `3d`)
+    #[cfg_attr(not(feature = "3d"), allow(dead_code))]
+    free_command_buffers: unsafe extern "C" fn(Device, CommandPool, u32, *const CommandBuffer),
+    #[cfg_attr(not(feature = "3d"), allow(dead_code))]
+    reset_descriptor_pool: unsafe extern "C" fn(Device, DescriptorPool, u32) -> VkResult,
+    #[cfg_attr(not(feature = "3d"), allow(dead_code))]
+    queue_wait_idle: unsafe extern "C" fn(Queue) -> VkResult,
+    #[cfg_attr(not(feature = "3d"), allow(dead_code))]
+    get_format_properties: unsafe extern "C" fn(PhysicalDevice, u32, *mut FormatProperties),
+    #[cfg_attr(not(feature = "3d"), allow(dead_code))]
+    cmd_bind_index_buffer: unsafe extern "C" fn(CommandBuffer, BufferHandle, u64, u32),
+    #[cfg_attr(not(feature = "3d"), allow(dead_code))]
+    cmd_draw_indexed: unsafe extern "C" fn(CommandBuffer, u32, u32, u32, i32, u32),
 }
 
 fn resolve_fns(gipa: GipaFn, instance: Instance) -> Option<VkFns> {
@@ -1257,6 +1350,13 @@ fn resolve_fns(gipa: GipaFn, instance: Instance) -> Option<VkFns> {
         cmd_set_viewport: vk!(c"vkCmdSetViewport"),
         cmd_set_scissor: vk!(c"vkCmdSetScissor"),
         cmd_draw: vk!(c"vkCmdDraw"),
+        free_descriptor_sets: vk!(c"vkFreeDescriptorSets"),
+        free_command_buffers: vk!(c"vkFreeCommandBuffers"),
+        reset_descriptor_pool: vk!(c"vkResetDescriptorPool"),
+        queue_wait_idle: vk!(c"vkQueueWaitIdle"),
+        get_format_properties: vk!(c"vkGetPhysicalDeviceFormatProperties"),
+        cmd_bind_index_buffer: vk!(c"vkCmdBindIndexBuffer"),
+        cmd_draw_indexed: vk!(c"vkCmdDrawIndexed"),
     })
 }
 
@@ -1656,15 +1756,18 @@ impl VkStack {
                 std::ptr::null(),
                 &mut set_layout,
             );
+            // a set lives as long as its picture and is given back with it:
+            // a pool that only ever handed sets out ran dry after its 64th
+            // picture, however few were alive
             let pool_size = DescriptorPoolSize {
                 descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                count: 64,
+                count: 1024,
             };
             let pool_info = DescriptorPoolCreateInfo {
                 s_type: ST_DESCRIPTOR_POOL_CREATE,
                 p_next: std::ptr::null(),
-                flags: 0,
-                max_sets: 64,
+                flags: DESCRIPTOR_POOL_FREE_SETS,
+                max_sets: 1024,
                 pool_size_count: 1,
                 pool_sizes: &pool_size,
             };
@@ -1728,6 +1831,10 @@ impl VkStack {
                 preserve_count: 0,
                 preserves: std::ptr::null(),
             };
+            // every pass orders itself against its neighbours: with none,
+            // the target's first write could run before the acquire's wait
+            // and a copy out could read before the last draw landed
+            let dependencies = pass_dependencies();
             let pass_info = RenderPassCreateInfo {
                 s_type: ST_RENDER_PASS_CREATE,
                 p_next: std::ptr::null(),
@@ -1736,8 +1843,8 @@ impl VkStack {
                 attachments: &attachment,
                 subpass_count: 1,
                 subpasses: &subpass,
-                dependency_count: 0,
-                dependencies: std::ptr::null(),
+                dependency_count: dependencies.len() as u32,
+                dependencies: dependencies.as_ptr().cast(),
             };
             let mut render_pass: RenderPass = 0;
             (fns.create_render_pass)(device, &pass_info, std::ptr::null(), &mut render_pass);
@@ -1972,7 +2079,7 @@ impl VkStack {
             discard: 0,
             polygon_mode: POLYGON_MODE_FILL,
             cull_mode: CULL_MODE_NONE,
-            front_face: FRONT_FACE_CCW,
+            front_face: FRONT_FACE_COUNTER_CLOCKWISE,
             depth_bias: 0,
             bias_constant: 0.0,
             bias_clamp: 0.0,
@@ -2358,18 +2465,37 @@ impl VkStack {
     }
 }
 
+impl VkStack {
+    /// Gives one of the 2D pool's sets back, with the picture it read.
+    fn free_set(&self, set: DescriptorSet) {
+        if set != 0 {
+            unsafe { (self.fns.free_descriptor_sets)(self.device, self.descriptor_pool, 1, &set) };
+        }
+    }
+}
+
 impl Drop for VkStack {
     fn drop(&mut self) {
         // the callers drained the queue before letting go; objects the
         // frames minted (images, buffers) died with their owners
         unsafe {
             (self.fns.device_wait_idle)(self.device);
-            (self.fns.destroy_pipeline)(self.device, self.rect_pipeline, std::ptr::null());
-            (self.fns.destroy_pipeline)(self.device, self.sprite_pipeline, std::ptr::null());
-            (self.fns.destroy_pipeline)(self.device, self.live_pipeline, std::ptr::null());
-            (self.fns.destroy_pipeline)(self.device, self.mask_pipeline, std::ptr::null());
+            for pipeline in [
+                self.rect_pipeline,
+                self.sprite_pipeline,
+                self.live_pipeline,
+                self.mask_pipeline,
+                self.glass_pipeline,
+                self.blur_pipeline,
+                self.blit_pipeline,
+            ] {
+                (self.fns.destroy_pipeline)(self.device, pipeline, std::ptr::null());
+            }
             (self.fns.destroy_command_pool)(self.device, self.command_pool, std::ptr::null());
-            (self.fns.destroy_render_pass)(self.device, self.render_pass, std::ptr::null());
+            for pass in [self.render_pass, self.scene_first_pass, self.scene_pass, self.pyramid_pass] {
+                (self.fns.destroy_render_pass)(self.device, pass, std::ptr::null());
+            }
+            (self.fns.destroy_sampler)(self.device, self.linear_sampler, std::ptr::null());
             (self.fns.destroy_pipeline_layout)(
                 self.device,
                 self.pipeline_layout,
@@ -2632,6 +2758,9 @@ impl VkStack {
     }
 
     fn release_glass(&self, glass: &VkGlass) {
+        for set in [glass.scene_set, glass.ping.set, glass.pong.set] {
+            self.free_set(set);
+        }
         unsafe {
             (self.fns.destroy_framebuffer)(self.device, glass.scene_framebuffer, std::ptr::null());
             (self.fns.destroy_image_view)(self.device, glass.scene_view, std::ptr::null());
@@ -2757,6 +2886,9 @@ impl VkGround {
 struct VkGroundView<'a> {
     stack: &'a VkStack,
     ground: &'a mut VkGround,
+    /// The world pass, opened the first time a box paints a world.
+    #[cfg(feature = "3d")]
+    world: world::VkWorldDoor<'a>,
 }
 
 impl AtlasGround for VkGroundView<'_> {
@@ -2787,6 +2919,7 @@ impl AtlasGround for VkGroundView<'_> {
     fn drop_shared(&mut self) {
         if let Some(id) = self.ground.shared.take() {
             if let Some(texture) = self.ground.textures.remove(&id) {
+                self.stack.free_set(texture.set);
                 unsafe {
                     (self.stack.fns.destroy_image_view)(
                         self.stack.device,
@@ -2826,6 +2959,7 @@ impl AtlasGround for VkGroundView<'_> {
 
     fn drop_dedicated(&mut self, id: u64) {
         if let Some(texture) = self.ground.textures.remove(&id) {
+            self.stack.free_set(texture.set);
             unsafe {
                 (self.stack.fns.destroy_image_view)(
                     self.stack.device,
@@ -2860,6 +2994,11 @@ impl AtlasGround for VkGroundView<'_> {
 
     fn drop_live(&mut self, id: u64) {
         self.drop_dedicated(id);
+    }
+
+    #[cfg(feature = "3d")]
+    fn world(&mut self) -> Option<&mut dyn bunny_ui::gpu::world::WorldGround> {
+        self.world.open()
     }
 }
 
@@ -3050,6 +3189,7 @@ fn drain_all(stack: &VkStack, slots: &mut [VkSlot; 3]) {
 /// The runs of one pass, in paint order — the pipeline swaps only where
 /// rects and text alternate. Glass never reaches here: a pane reads the
 /// scene, so it takes a pass of its own.
+#[allow(clippy::too_many_arguments)]
 fn draw_runs(
     stack: &VkStack,
     ground: &mut VkGround,
@@ -3058,6 +3198,7 @@ fn draw_runs(
     batches: &FrameBatches,
     runs: &[DrawRun],
     push: &mut Push,
+    worlds: &(Pipeline, Vec<DescriptorSet>),
 ) {
     let fns = &stack.fns;
     unsafe {
@@ -3079,10 +3220,12 @@ fn draw_runs(
         let mut bound: Option<RunKind> = None;
         let mut bound_round = u32::MAX;
         let mut bound_set: DescriptorSet = 0;
+        // a world's target, by the index its run carries
+        let world_set = |index: u16| worlds.1.get(index as usize).copied().unwrap_or(0);
         for run in runs {
-            // this tier has no world pass yet: its ground opens no world
-            // door, and the walk shows the oracle's picture
-            if let RunKind::World(_) = run.kind {
+            if let RunKind::World(index) = run.kind
+                && (worlds.0 == 0 || world_set(index) == 0)
+            {
                 continue;
             }
             if bound_round != run.round {
@@ -3102,19 +3245,21 @@ fn draw_runs(
                 let pipeline = match run.kind {
                     RunKind::Rects => stack.rect_pipeline,
                     RunKind::Live(_) => stack.live_pipeline,
+                    // the sprite's road, through the composite's fragment
+                    RunKind::World(_) => worlds.0,
                     _ => stack.sprite_pipeline,
                 };
                 (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             }
             match run.kind {
                 // a pane reads the scene: it takes a pass of its own
-                RunKind::Glass | RunKind::World(_) => continue,
+                RunKind::Glass => continue,
                 RunKind::Rects => {
                     let offset =
                         run.base as u64 * std::mem::size_of::<RectInstance>() as u64;
                     (fns.cmd_bind_vertex_buffers)(command, 0, 1, &slot.rects, &offset);
                 }
-                RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) => {
+                RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) | RunKind::World(_) => {
                     let offset =
                         run.base as u64 * std::mem::size_of::<SpriteInstance>() as u64;
                     (fns.cmd_bind_vertex_buffers)(command, 0, 1, &slot.sprites, &offset);
@@ -3125,6 +3270,7 @@ fn draw_runs(
                             .and_then(|id| ground.textures.get(id))
                             .map(|texture| texture.set)
                             .unwrap_or(shared_set),
+                        RunKind::World(index) => world_set(index),
                         _ => shared_set,
                     };
                     if set != bound_set && set != 0 {
@@ -3151,6 +3297,10 @@ fn draw_runs(
 /// Records the whole frame into the slot's command buffer: upload
 /// barriers and copies first, then the render pass with the runs in
 /// paint order, then the optional corner mask.
+///
+/// The worlds that moved draw first, each in a pass of its own, and the
+/// 2D pass composites them; the answer is whether any did, for the walk
+/// to hold them as drawn.
 #[allow(clippy::too_many_arguments)]
 fn record_frame(
     stack: &VkStack,
@@ -3162,9 +3312,13 @@ fn record_frame(
     batches: &FrameBatches,
     corner_mask: Option<f64>,
     glass: Option<&VkGlass>,
-) {
+    world: &mut world::VkWorld,
+    slot_index: usize,
+) -> bool {
     let fns = &stack.fns;
     let command = slot.command;
+    #[cfg(not(feature = "3d"))]
+    let _ = slot_index;
     unsafe {
         (fns.reset_command_buffer)(command, 0);
         let begin = CommandBufferBeginInfo {
@@ -3264,6 +3418,14 @@ fn record_frame(
             texture.initialized = true;
         }
 
+        // the worlds that moved, each into its own target, before the 2D
+        // pass samples them
+        #[cfg(feature = "3d")]
+        let drew = world.encode(stack, command, slot_index, &batches.worlds);
+        #[cfg(not(feature = "3d"))]
+        let drew = false;
+        let worlds = world.composites(&batches.world_targets);
+
         // the pass: clear to canvas, the runs in paint order
         let clear = [
             canvas.r as f32 / 255.0,
@@ -3328,7 +3490,7 @@ fn record_frame(
         push_all(command, &push);
 
         match glass {
-            None => draw_runs(stack, ground, slot, command, batches, &batches.runs, &mut push),
+            None => draw_runs(stack, ground, slot, command, batches, &batches.runs, &mut push, &worlds),
             Some(targets) => {
                 let runs = &batches.runs;
                 let mut index = 0;
@@ -3346,6 +3508,7 @@ fn record_frame(
                             batches,
                             &runs[start..index],
                             &mut push,
+                            &worlds,
                         );
                     }
                     if index < runs.len() {
@@ -3398,6 +3561,7 @@ fn record_frame(
             (fns.cmd_draw)(command, 3, 1, 0, 0);
             (fns.cmd_end_render_pass)(command);
         }
+        drew
     }
 }
 
@@ -3812,6 +3976,9 @@ pub struct VkPresenter {
     /// that carries glass and remade whenever the swapchain resizes. A
     /// window that never shows glass never allocates them.
     glass: Option<VkGlass>,
+    /// The world pass: its pipelines are made the first time a box
+    /// paints a world.
+    world: world::VkWorld,
 }
 
 impl VkPresenter {
@@ -3907,12 +4074,18 @@ impl VkPresenter {
         let index = self.cursor;
         self.cursor = (self.cursor + 1) % self.slots.len();
         wait_slot(&self.stack, &mut self.slots[index]);
+        self.world.sweep(&self.stack);
         // walk with retries; staging overflow grows the arena, atlas
         // overflow runs the copying collector
         for attempt in 0..4 {
             self.ground
                 .bind_staging(self.slots[index].staging_map, self.slots[index].staging_capacity);
-            let mut view = VkGroundView { stack: &self.stack, ground: &mut self.ground };
+            let mut view = VkGroundView {
+                stack: &self.stack,
+                ground: &mut self.ground,
+                #[cfg(feature = "3d")]
+                world: world::VkWorldDoor { stack: &self.stack, world: &mut self.world },
+            };
             let walked = build_frame(
                 &mut view,
                 display,
@@ -3933,7 +4106,12 @@ impl VkPresenter {
                 if !self.slots[index].grow_staging(&self.stack, needed) {
                     return Presented::DeviceLost;
                 }
-                let mut view = VkGroundView { stack: &self.stack, ground: &mut self.ground };
+                let mut view = VkGroundView {
+                stack: &self.stack,
+                ground: &mut self.ground,
+                #[cfg(feature = "3d")]
+                world: world::VkWorldDoor { stack: &self.stack, world: &mut self.world },
+            };
                 self.atlas.reset(&mut view, false);
                 continue;
             }
@@ -3950,8 +4128,12 @@ impl VkPresenter {
                         continue;
                     }
                     drain_all(&self.stack, &mut self.slots);
-                    let mut view =
-                        VkGroundView { stack: &self.stack, ground: &mut self.ground };
+                    let mut view = VkGroundView {
+                stack: &self.stack,
+                ground: &mut self.ground,
+                #[cfg(feature = "3d")]
+                world: world::VkWorldDoor { stack: &self.stack, world: &mut self.world },
+            };
                     self.atlas.reset(&mut view, true);
                 }
             }
@@ -3989,7 +4171,7 @@ impl VkPresenter {
         let corner_mask = self.scene.then_some(8.0 * scale as f64);
         self.ensure_glass();
         let swapchain = self.swapchain.as_ref().expect("the image was acquired from a swapchain");
-        record_frame(
+        let drew = record_frame(
             &self.stack,
             &mut self.ground,
             &self.slots[index],
@@ -3999,7 +4181,15 @@ impl VkPresenter {
             &self.batches,
             corner_mask,
             self.glass.as_ref().filter(|_| !self.batches.glass.is_empty()),
+            &mut self.world,
+            index,
         );
+        #[cfg(feature = "3d")]
+        if drew {
+            self.atlas.worlds.drawn();
+        }
+        #[cfg(not(feature = "3d"))]
+        let _ = drew;
         unsafe {
             (self.stack.fns.end_command_buffer)(self.slots[index].command);
             let wait_stage = PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT;
@@ -4241,6 +4431,7 @@ impl VkPresenter {
             batches: FrameBatches::default(),
             retained: None,
             glass: None,
+            world: world::VkWorld::new(),
         })
     }
 
@@ -4321,9 +4512,11 @@ impl VkPresenter {
 
 impl Drop for VkPresenter {
     fn drop(&mut self) {
-        // the swapchain, then the surface, then the stack lets the
-        // device and the instance go; slots and ground images die with
-        // the device
+        // the world's objects first, on an idle device; then the
+        // swapchain, then the surface, then the stack lets the device and
+        // the instance go; slots and ground images die with the device
+        unsafe { (self.stack.fns.device_wait_idle)(self.stack.device) };
+        self.world.release(&self.stack);
         self.detach_surface();
     }
 }
@@ -4351,6 +4544,7 @@ pub struct OffscreenVk {
     /// The scene image and the blur pyramid, made on the first frame
     /// that carries glass.
     glass: Option<VkGlass>,
+    world: world::VkWorld,
 }
 
 impl OffscreenVk {
@@ -4466,6 +4660,7 @@ impl OffscreenVk {
             ground: VkGround::new(),
             batches: FrameBatches::default(),
             glass: None,
+            world: world::VkWorld::new(),
         })
     }
 
@@ -4481,10 +4676,16 @@ impl OffscreenVk {
         let index = self.cursor;
         self.cursor = (self.cursor + 1) % self.slots.len();
         wait_slot(&self.stack, &mut self.slots[index]);
+        self.world.sweep(&self.stack);
         for attempt in 0..4 {
             self.ground
                 .bind_staging(self.slots[index].staging_map, self.slots[index].staging_capacity);
-            let mut view = VkGroundView { stack: &self.stack, ground: &mut self.ground };
+            let mut view = VkGroundView {
+                stack: &self.stack,
+                ground: &mut self.ground,
+                #[cfg(feature = "3d")]
+                world: world::VkWorldDoor { stack: &self.stack, world: &mut self.world },
+            };
             let walked = build_frame(
                 &mut view,
                 display,
@@ -4503,7 +4704,12 @@ impl OffscreenVk {
                 if !self.slots[index].grow_staging(&self.stack, needed) {
                     return;
                 }
-                let mut view = VkGroundView { stack: &self.stack, ground: &mut self.ground };
+                let mut view = VkGroundView {
+                stack: &self.stack,
+                ground: &mut self.ground,
+                #[cfg(feature = "3d")]
+                world: world::VkWorldDoor { stack: &self.stack, world: &mut self.world },
+            };
                 self.atlas.reset(&mut view, false);
                 continue;
             }
@@ -4520,8 +4726,12 @@ impl OffscreenVk {
                         continue;
                     }
                     drain_all(&self.stack, &mut self.slots);
-                    let mut view =
-                        VkGroundView { stack: &self.stack, ground: &mut self.ground };
+                    let mut view = VkGroundView {
+                stack: &self.stack,
+                ground: &mut self.ground,
+                #[cfg(feature = "3d")]
+                world: world::VkWorldDoor { stack: &self.stack, world: &mut self.world },
+            };
                     self.atlas.reset(&mut view, true);
                 }
             }
@@ -4532,7 +4742,7 @@ impl OffscreenVk {
         if !self.batches.glass.is_empty() && self.glass.is_none() {
             self.glass = self.stack.glass_targets((self.width as u32, self.height as u32));
         }
-        record_frame(
+        let drew = record_frame(
             &self.stack,
             &mut self.ground,
             &self.slots[index],
@@ -4542,7 +4752,15 @@ impl OffscreenVk {
             &self.batches,
             None,
             self.glass.as_ref().filter(|_| !self.batches.glass.is_empty()),
+            &mut self.world,
+            index,
         );
+        #[cfg(feature = "3d")]
+        if drew {
+            self.atlas.worlds.drawn();
+        }
+        #[cfg(not(feature = "3d"))]
+        let _ = drew;
         // the readback tail rides the same command buffer: the pass
         // ended in TRANSFER_SRC (the offscreen final layout) — copy
         // into the host buffer before the fence signals
@@ -4625,6 +4843,30 @@ impl OffscreenVk {
         self.atlas.footprint()
     }
 
+    /// One world frame drawn by the world pass alone and read back:
+    /// premultiplied, sRGB-encoded RGBA8, the top row first — what the
+    /// CPU's `soft::draw` gives for the same frame. `None` when the world
+    /// pass cannot stand on this device.
+    #[cfg(feature = "3d")]
+    pub fn world_rgba(&mut self, frame: &std::rc::Rc<bunny_ui::world::WorldFrame>) -> Option<Vec<u8>> {
+        self.world_rgba_with(frame, &bunny_ui::image_engine::RawImages::default())
+    }
+
+    /// [`OffscreenVk::world_rgba`] with textures, decoded by `images`.
+    #[cfg(feature = "3d")]
+    pub fn world_rgba_with(&mut self, frame: &std::rc::Rc<bunny_ui::world::WorldFrame>, images: &dyn ImageEngine) -> Option<Vec<u8>> {
+        // the first slot's command buffer, on a drained device
+        drain_all(&self.stack, &mut self.slots);
+        let (command, fence) = (self.slots[0].command, self.slots[0].fence);
+        self.world.draw_single(&self.stack, command, fence, frame, images)
+    }
+
+    /// How many worlds the last frame drew: a held picture draws none.
+    #[cfg(feature = "3d")]
+    pub fn world_jobs(&self) -> usize {
+        self.batches.worlds.len()
+    }
+
     /// The rendered bytes, R,G,B,A per pixel — rows already top-first
     /// (this tier's NDC points down, the raster's own direction).
     pub fn read_rgba(&self) -> Vec<u8> {
@@ -4640,6 +4882,7 @@ impl OffscreenVk {
 impl Drop for OffscreenVk {
     fn drop(&mut self) {
         drain_all(&self.stack, &mut self.slots);
+        self.world.release(&self.stack);
         unsafe {
             (self.stack.fns.destroy_framebuffer)(
                 self.stack.device,
@@ -5265,6 +5508,14 @@ mod tests {
             "full.vert",
             "blur.frag",
             "blit.frag",
+            "world_mesh.vert",
+            "world_mesh.frag",
+            "world_stepped.frag",
+            "world_line.vert",
+            "world_line.frag",
+            "world_backdrop.vert",
+            "world_backdrop.frag",
+            "world_composite.frag",
         ] {
             let out = std::env::temp_dir().join(format!("bunny-drift-{stage}.spv"));
             let status = std::process::Command::new("glslangValidator")

@@ -1340,6 +1340,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     Some(bunny_ui::layout::Cursor::ResizeUpRightDownLeft) => {
                         ffi::Cursor::ResizeNeSw
                     }
+                    Some(bunny_ui::layout::Cursor::Grab) => ffi::Cursor::Grab,
+                    Some(bunny_ui::layout::Cursor::Grabbing) => ffi::Cursor::Grabbing,
+                    Some(bunny_ui::layout::Cursor::Move) => ffi::Cursor::Move,
+                    Some(bunny_ui::layout::Cursor::Crosshair) => ffi::Cursor::Crosshair,
                     None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
                     None => ffi::Cursor::Arrow,
                 },
@@ -1716,6 +1720,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     blit(runtime, root, ORIGIN_KEY);
                 }
             }
+            AppEvent::ButtonUp { x, y, button } => {
+                // the end of a drag a box held with that button (a page
+                // had its press and its lift together)
+                if runtime.button_released(x, y, button) {
+                    blit(runtime, root, ORIGIN_KEY);
+                }
+            }
             AppEvent::MouseDown { x, y, clicks, modifiers } => {
                 let at = window.raw_window();
                 if let Some(path) = runtime.host_at(x, y) {
@@ -1778,6 +1789,11 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
             AppEvent::Magnify { x, y, scale } => {
                 if runtime.magnify(x, y, scale) {
+                    soon(runtime, root, ORIGIN_WHEEL);
+                }
+            }
+            AppEvent::Rotate { x, y, radians } => {
+                if runtime.rotate(x, y, radians) {
                     soon(runtime, root, ORIGIN_WHEEL);
                 }
             }

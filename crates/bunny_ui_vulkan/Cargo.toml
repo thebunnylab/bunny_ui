@@ -6,5 +6,9 @@ description = "bunny-ui Vulkan tier — the swapchain presenter and the offscree
 license-file.workspace = true
 repository.workspace = true
 
+[features]
+# Worlds in three dimensions, drawn by the Vulkan world pass.
+3d = ["bunny-ui/3d"]
+
 [dependencies]
 bunny-ui = { workspace = true, features = ["canvas", "gpu"] }

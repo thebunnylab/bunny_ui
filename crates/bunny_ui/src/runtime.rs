@@ -1273,6 +1273,15 @@ impl Runtime {
             let at = Self::local(&placement, x, y);
             let event = crate::custom::ElementEvent::ButtonDown { at, button, modifiers };
             if self.deliver(&placement, event).handled {
+                // the box that took the press holds the pointer until the
+                // button lifts: a middle drag turns a world wherever the
+                // hand runs. A press that opened a menu leaves the hand to
+                // the menu, which a held drag picks a row in
+                let mut interaction = self.interaction.borrow_mut();
+                if interaction.menu.is_none() {
+                    interaction.button_grab = Some((placement.path.clone(), button));
+                    interaction.pointer = Some(Point { x, y });
+                }
                 return true;
             }
         }
@@ -1280,6 +1289,22 @@ impl Runtime {
             crate::custom::PointerButton::Secondary => self.context_menu_at(x, y) || was_open || cleared,
             crate::custom::PointerButton::Middle => was_open || cleared,
         }
+    }
+
+    /// A button past the primary one lifted. The box that took its press
+    /// hears [`crate::custom::ElementEvent::ButtonUp`] wherever the hand
+    /// is, and lets the pointer go; `true` = it took the lift.
+    pub fn button_released(&self, x: Px, y: Px, button: crate::custom::PointerButton) -> bool {
+        self.enter_scene();
+        let held = self.interaction.borrow().button_grab.clone();
+        let Some((path, holding)) = held else { return false };
+        if holding != button {
+            return false;
+        }
+        self.interaction.borrow_mut().button_grab = None;
+        let Some(placement) = self.custom_at(&path) else { return false };
+        let at = Self::local(&placement, x, y);
+        self.deliver(&placement, crate::custom::ElementEvent::ButtonUp { at, button }).handled
     }
 
     /// The `.context_menu(…)` region under a secondary press: its handler
@@ -2062,6 +2087,20 @@ impl Runtime {
     }
 
     fn pointer_moved_road(&self, x: Px, y: Px, modifiers: crate::action::Modifiers) -> bool {
+        // a box holding the press of a button past the primary one hears
+        // the move as that button's
+        let held = self.interaction.borrow().button_grab.clone();
+        if let Some((path, button)) = held {
+            self.interaction.borrow_mut().pointer = Some(Point { x, y });
+            if let Some(placement) = self.custom_at(&path) {
+                let at = Self::local(&placement, x, y);
+                let event = crate::custom::ElementEvent::ButtonMoved { at, button, modifiers };
+                return self.deliver(&placement, event).handled;
+            }
+            // the box left the scene mid-drag: the gesture ends with it
+            self.interaction.borrow_mut().button_grab = None;
+            return false;
+        }
         // a live divider drag owns the pointer: the move becomes a lane
         // extent, the retained writer reaches the binding, and the app's
         // state change re-lays the frame — hover stays untouched
@@ -3145,6 +3184,8 @@ impl Runtime {
                 }
                 Gesture::Cancel => repaint |= self.pointer_cancelled(),
                 Gesture::Magnify { at, scale } => repaint |= self.magnify(at.x, at.y, scale),
+                Gesture::Pan { at, dx, dy } => repaint |= self.two_finger_pan(at.x, at.y, dx, dy),
+                Gesture::Rotate { at, radians } => repaint |= self.rotate(at.x, at.y, radians),
             }
         }
         (repaint, input)
@@ -3194,7 +3235,16 @@ impl Runtime {
                 self.deliver(&placement, crate::custom::ElementEvent::PointerUp { at });
             }
         }
-        changed || dragged || grabbed.is_some()
+        // a button past the primary one, held by a box: the lift it will
+        // never see comes now
+        let held = self.interaction.borrow_mut().button_grab.take();
+        if let Some((path, button)) = &held
+            && let Some(placement) = self.custom_at(path)
+        {
+            let at = Self::local(&placement, at.x, at.y);
+            self.deliver(&placement, crate::custom::ElementEvent::ButtonUp { at, button: *button });
+        }
+        changed || dragged || grabbed.is_some() || held.is_some()
     }
 
     /// Two fingers — or a trackpad — changed their distance over the
@@ -3209,6 +3259,34 @@ impl Runtime {
         };
         let at = Self::local(&placement, x, y);
         self.deliver(&placement, crate::custom::ElementEvent::Magnify { at, scale }).handled
+    }
+
+    /// Two fingers on a touch screen moved together over the scene: the
+    /// app's box under the point between them hears
+    /// [`crate::custom::ElementEvent::Pan`]. Nothing else moves; `true` =
+    /// the box took it.
+    pub fn two_finger_pan(&self, x: Px, y: Px, dx: Px, dy: Px) -> bool {
+        self.enter_scene();
+        let over = self.hover_target(x, y).and_then(|path| self.custom_at(&path));
+        let Some(placement) = over else {
+            return false;
+        };
+        let at = Self::local(&placement, x, y);
+        self.deliver(&placement, crate::custom::ElementEvent::Pan { at, dx, dy }).handled
+    }
+
+    /// Two fingers — or a trackpad — turned over the scene: the app's
+    /// box under the point hears [`crate::custom::ElementEvent::Rotate`]
+    /// with the radians of this step, counter-clockwise positive. Nothing
+    /// else turns; `true` = the box took it.
+    pub fn rotate(&self, x: Px, y: Px, radians: f64) -> bool {
+        self.enter_scene();
+        let over = self.hover_target(x, y).and_then(|path| self.custom_at(&path));
+        let Some(placement) = over else {
+            return false;
+        };
+        let at = Self::local(&placement, x, y);
+        self.deliver(&placement, crate::custom::ElementEvent::Rotate { at, radians }).handled
     }
 
     /// The scroll regions under a point with travel, per axis —

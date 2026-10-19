@@ -966,7 +966,7 @@ pub(crate) struct XClient {
     xkb_base_event: u8,
     /// The core cursor font and one lazily-made cursor per style.
     cursor_font: u32,
-    cursors: [u32; 8],
+    cursors: [u32; 12],
     cursor_current: Option<Cursor>,
     /// Client-side double click — X sends plain buttons, the shell
     /// counts (the same 400 ms / 4 px window every platform keeps).
@@ -1169,7 +1169,7 @@ pub(crate) fn connect() {
             keyboard,
             xkb_base_event,
             cursor_font: 0,
-            cursors: [0; 8],
+            cursors: [0; 12],
             cursor_current: None,
             clicks: ClickClock::default(),
             source: None,
@@ -1551,6 +1551,10 @@ fn glyph_of(cursor: Cursor) -> u16 {
         Cursor::ResizeUpDown => 116,    // sb_v_double_arrow
         Cursor::ResizeNwSe => 134,      // top_left_corner
         Cursor::ResizeNeSw => 136,      // top_right_corner
+        // the core font draws no closed hand: both hands are hand1
+        Cursor::Grab | Cursor::Grabbing => 58, // hand1
+        Cursor::Move => 52,             // fleur
+        Cursor::Crosshair => 130,       // tcross
     }
 }
 
@@ -1564,6 +1568,10 @@ fn cursor_slot(cursor: Cursor) -> usize {
         Cursor::ResizeNeSw => 5,
         Cursor::Text => 6,
         Cursor::Cell => 7,
+        Cursor::Grab => 8,
+        Cursor::Grabbing => 9,
+        Cursor::Move => 10,
+        Cursor::Crosshair => 11,
     }
 }
 
@@ -3343,6 +3351,18 @@ fn interpret(event: *mut GenericEvent) -> Step {
                     y,
                     modifiers: held_modifiers(state),
                 }),
+                // the server grabs the pointer while a button is held: the
+                // lift comes to the window the press did
+                (XCB_BUTTON_RELEASE, 2) => Step::Deliver(owner, AppEvent::ButtonUp {
+                    x,
+                    y,
+                    button: bunny_ui::custom::PointerButton::Middle,
+                }),
+                (XCB_BUTTON_RELEASE, 3) => Step::Deliver(owner, AppEvent::ButtonUp {
+                    x,
+                    y,
+                    button: bunny_ui::custom::PointerButton::Secondary,
+                }),
                 // the wheel speaks buttons: one press per detent, the
                 // ×16 line doctrine, up positive toward the engine — and
                 // a detent is a step of no gesture
@@ -3821,8 +3841,9 @@ mod tests {
 
     #[test]
     fn every_cursor_style_wears_a_core_glyph() {
-        // sources are even (mask = glyph+1 pairs with it), all eight
-        // styles resolve, and no two share a face
+        // sources are even (mask = glyph+1 pairs with it), every style
+        // resolves into a slot of its own, and no two share a face — but
+        // the two hands, which the core font cannot tell apart
         let all = [
             Cursor::Arrow,
             Cursor::Text,
@@ -3832,15 +3853,20 @@ mod tests {
             Cursor::ResizeUpDown,
             Cursor::ResizeNwSe,
             Cursor::ResizeNeSw,
+            Cursor::Grab,
+            Cursor::Grabbing,
+            Cursor::Move,
+            Cursor::Crosshair,
         ];
         let mut seen = std::collections::HashSet::new();
+        let mut slots = std::collections::HashSet::new();
         for cursor in all {
             let glyph = glyph_of(cursor);
             assert_eq!(glyph % 2, 0, "cursor-font sources sit on even codes");
-            assert!(seen.insert(glyph), "two styles share glyph {glyph}");
-            assert!(cursor_slot(cursor) < 8);
+            assert!(seen.insert(glyph) || cursor == Cursor::Grabbing, "two styles share glyph {glyph}");
+            assert!(slots.insert(cursor_slot(cursor)) && cursor_slot(cursor) < 12);
         }
-        assert_eq!(seen.len(), 8);
+        assert_eq!(seen.len(), 11);
     }
 
     #[test]

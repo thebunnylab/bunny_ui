@@ -2,12 +2,13 @@
 
 *Status: the core is complete behind the `3d` feature — the retained
 world, cameras, the orbit, picking, the frame, the software rasterizer
-and the view — and the `gltf` feature reads assets. Metal draws worlds
-itself on the Mac and the phone, and WebGL2 in a browser. Every other
-tier shows a world too: the CPU rasterizer draws it, and the picture
-rides the live road the feeds use, until the tier's own pass comes —
-D3D11, GL and Vulkan. `cargo test -p bunny-ui-core --features gltf`
-proves the core on any machine.*
+and the view — and the `gltf` feature reads assets. Every tier draws
+worlds itself: Metal on the Mac and the phone, WebGL2 in a browser,
+D3D11 on Windows, Vulkan on Linux and Android, and GL 3.3 on a Linux
+box with no Vulkan. A tier that cannot make what a picture needs shows
+the picture the CPU draws, through the live road the feeds use.
+`cargo test -p bunny-ui-core --features gltf` proves the core on any
+machine.*
 
 An app turns worlds on in its manifest:
 
@@ -132,10 +133,20 @@ another camera along a path that curves around the target.
 
 `Orbit` reads the box's events and moves a `State<Camera>`. A drag
 turns the view around the surface the press landed on, and that point
-stays under the pointer; shift pans; the wheel and a pinch zoom toward
-the pointer. The pitch and the distance stay inside `OrbitLimits`. A
+stays under the pointer — with the primary button, or with the middle
+one, as drawing programs turn; shift pans; the wheel and a pinch zoom
+toward the pointer. On a touch screen two fingers pan the point between
+them and turn the view as they twist, and a trackpad's twist turns it
+too. The pitch and the distance stay inside `OrbitLimits`. A primary
 press that never travels comes back IGNORED on its release: that is a
-tap, and the caller answers it.
+tap, and the caller answers it. While a drag moves the camera, the
+pointer is the closed hand (`Cursor::Grabbing`).
+
+A box that answers the press of a button past the primary one holds the
+pointer until that button lifts: it hears `ElementEvent::ButtonMoved`
+wherever the hand runs, then `ElementEvent::ButtonUp`. Two fingers on a
+touch screen arrive as `ElementEvent::Pan` and `ElementEvent::Rotate`,
+beside the pinch's `Magnify`.
 
 ## Picking
 
@@ -166,7 +177,9 @@ pin every offset.
 | CPU oracle | draws every world; byte-stable on every machine |
 | Metal (Mac, phone) | draws worlds itself: one pass per world, four samples resolved in tile memory, held to the oracle by parity tests |
 | WebGL2 (browser) | draws worlds itself through the GL family's pass (`gpu::gl_world`): four samples resolved by a blit; `bunny_gpu_world_parity(n)` holds it to the oracle in a page |
-| D3D11, GL, Vulkan | show the oracle's picture through the live road; their own passes come next (GL 3.3 shares the WebGL2 pass) |
+| D3D11 (Windows) | draws worlds itself: the vertex shader reads the meshes from structured buffers, four samples resolved by `ResolveSubresource`; the parity tests run on WARP |
+| Vulkan (Linux, Android) | draws worlds itself from the GL family's shaders, turned to SPIR-V by a generator that a test holds to their text: four samples resolved in the render pass; the parity tests run on lavapipe |
+| GL 3.3 (Linux) | draws worlds itself through the GL family's pass, as WebGL2 does — the road of a box with no Vulkan; the parity tests run on llvmpipe |
 
 A tier that draws worlds keeps a target per box and hands the 2D pass
 the target like a feed. A world whose picture did not move is not

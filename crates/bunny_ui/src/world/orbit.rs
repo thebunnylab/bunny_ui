@@ -2,12 +2,15 @@
 //!
 //! [`Orbit`] reads the events of a box and moves a `State<Camera>`:
 //!
-//! - a drag turns the view around the point the press landed on;
+//! - a drag turns the view around the point the press landed on — with
+//!   the primary button, or the middle one, as drawing programs turn;
 //! - a drag with shift pans: that point follows the hand;
 //! - the wheel and a pinch zoom toward the point under the pointer, so
 //!   what the pointer is on stays under the pointer;
-//! - a press that never travels is a TAP: its release comes back
-//!   ignored, and the caller answers it.
+//! - two fingers on a touch screen pan together and turn the view as
+//!   they twist;
+//! - a primary press that never travels is a TAP: its release comes
+//!   back ignored, and the caller answers it.
 //!
 //! The turn keeps the world's up: the horizon stays level, and the pitch
 //! stops short of straight up and straight down.
@@ -110,8 +113,24 @@ impl Orbit {
     }
 
     pub(crate) fn handle(&self, event: &ElementEvent, size: Size, camera: State<Camera>, world: World) -> Response {
+        use crate::custom::PointerButton;
         let now = motor::task::now();
-        match *event {
+        // the middle button's drag is the primary's: it turns, and pans
+        // with shift — and it never taps
+        let event = match *event {
+            ElementEvent::ButtonDown { at, button: PointerButton::Middle, modifiers } => {
+                ElementEvent::PointerDown { at, clicks: 1, modifiers }
+            }
+            ElementEvent::ButtonMoved { at, button: PointerButton::Middle, modifiers } => {
+                ElementEvent::PointerMoved { at, pressed: true, modifiers }
+            }
+            ElementEvent::ButtonUp { at, button: PointerButton::Middle } => {
+                self.handle(&ElementEvent::PointerUp { at }, size, camera, world);
+                return Response::handled();
+            }
+            ref other => other.clone(),
+        };
+        match event {
             ElementEvent::PointerDown { at, modifiers, .. } => {
                 let current = camera.with(|camera| camera.at(now));
                 let mode = if modifiers.shift { Mode::Pan } else { Mode::Turn };
@@ -161,6 +180,24 @@ impl Orbit {
                 }
                 let current = camera.with(|camera| camera.at(now));
                 camera.set_if_changed(zoom(current, at, 1.0 / scale, size, world, &self.limits));
+                Response::handled()
+            }
+            ElementEvent::Pan { at, dx, dy } => {
+                // the point between the fingers follows them
+                let current = camera.with(|camera| camera.at(now));
+                let pivot = pivot_at(&current, at, size, world);
+                camera.set_if_changed(pan(current, pivot, dx, dy, size, &self.limits));
+                Response::handled()
+            }
+            ElementEvent::Rotate { at, radians } => {
+                // what lies under the fingers turns with them, around the
+                // point between them
+                if !radians.is_finite() {
+                    return Response::handled();
+                }
+                let current = camera.with(|camera| camera.at(now));
+                let pivot = pivot_at(&current, at, size, world);
+                camera.set_if_changed(turn(current, pivot, -radians, 0.0, &self.limits));
                 Response::handled()
             }
             _ => Response::ignored(),
@@ -374,5 +411,59 @@ mod tests {
             assert!(close(seen, Point { x: 380.0, y: 300.0 }), "{seen:?}");
             orbit.handle(&up(380.0, 300.0), size(), camera, world);
         }
+    }
+
+    #[test]
+    fn the_middle_button_turns_and_pans_like_the_primary_and_never_taps() {
+        use crate::custom::PointerButton::Middle;
+        let world = World::new();
+        let start = Camera::orbiting(vec3(1.0, 0.0, 2.0), 20.0, 30.0, 12.0);
+        let at = Point { x: 520.0, y: 210.0 };
+        for modifiers in [Modifiers::NONE, Modifiers::SHIFT] {
+            let (primary, middle) = (State::new(start), State::new(start));
+            let (by_primary, by_middle) = (Orbit::new(), Orbit::new());
+            by_primary.handle(&ElementEvent::PointerDown { at, clicks: 1, modifiers }, size(), primary, world);
+            by_middle.handle(&ElementEvent::ButtonDown { at, button: Middle, modifiers }, size(), middle, world);
+            for (x, y) in [(560.0, 230.0), (640.0, 180.0)] {
+                let to = Point { x, y };
+                by_primary.handle(&ElementEvent::PointerMoved { at: to, pressed: true, modifiers }, size(), primary, world);
+                by_middle.handle(&ElementEvent::ButtonMoved { at: to, button: Middle, modifiers }, size(), middle, world);
+            }
+            assert_eq!(primary.with(|c| *c), middle.with(|c| *c), "the same hand, the same camera");
+            assert!(by_middle.is_dragging());
+            let lift = ElementEvent::ButtonUp { at: Point { x: 640.0, y: 180.0 }, button: Middle };
+            assert!(by_middle.handle(&lift, size(), middle, world).handled);
+            assert!(!by_middle.is_dragging());
+        }
+        // a middle press that never travels is no tap
+        let (camera, orbit) = (State::new(start), Orbit::new());
+        orbit.handle(&ElementEvent::ButtonDown { at, button: Middle, modifiers: Modifiers::NONE }, size(), camera, world);
+        assert!(orbit.handle(&ElementEvent::ButtonUp { at, button: Middle }, size(), camera, world).handled);
+        assert_eq!(camera.with(|c| *c), start);
+    }
+
+    #[test]
+    fn two_fingers_pan_the_point_between_them_and_turn_around_it() {
+        let world = World::new();
+        let orbit = Orbit::new();
+        let start = Camera::orbiting(Vec3::ZERO, 45.0, 30.0, 10.0);
+        let camera = State::new(start);
+        let at = Point { x: 300.0, y: 260.0 };
+        let pivot = pivot_at(&start, at, size(), world);
+        orbit.handle(&ElementEvent::Pan { at: Point { x: 380.0, y: 300.0 }, dx: 80.0, dy: 40.0 }, size(), camera, world);
+        let seen = camera.with(|c| c.project(pivot, size())).expect("in front");
+        assert!(close(seen, Point { x: 380.0, y: 300.0 }), "the point slid with the fingers: {seen:?}");
+        // a counter-clockwise twist turns what is under the fingers the
+        // same way — seen from above, the eye goes clockwise around it
+        let before = camera.with(|c| *c);
+        let middle = Point { x: 400.0, y: 300.0 };
+        let centre = pivot_at(&before, middle, size(), world);
+        orbit.handle(&ElementEvent::Rotate { at: middle, radians: 0.3 }, size(), camera, world);
+        let after = camera.with(|c| *c);
+        let (yaw_before, _, _) = spherical(before.eye - centre).unwrap();
+        let (yaw_after, _, _) = spherical(after.eye - centre).unwrap();
+        assert!(((yaw_after - yaw_before) + 0.3).abs() < 1e-9, "{yaw_before} → {yaw_after}");
+        let seen = after.project(centre, size()).expect("in front");
+        assert!(close(seen, middle), "the point between the fingers stays put: {seen:?}");
     }
 }

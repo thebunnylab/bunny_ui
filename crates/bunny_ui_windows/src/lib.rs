@@ -1654,6 +1654,12 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     blit(runtime, root);
                 }
             }
+            AppEvent::ButtonUp { x, y, button } => {
+                // the end of a drag a box held with that button
+                if runtime.button_released(x, y, button) {
+                    blit(runtime, root);
+                }
+            }
             AppEvent::MouseDown { x, y, clicks, modifiers } => {
                 if runtime.pointer_clicked(x, y, clicks, modifiers) {
                     blit(runtime, root);
@@ -1847,6 +1853,10 @@ fn desired_cursor(
         (None, Some(Asked::Pointing)) => ffi::Cursor::Pointing,
         (None, Some(Asked::Cell)) => ffi::Cursor::Cell,
         (None, Some(Asked::Arrow)) => ffi::Cursor::Arrow,
+        (None, Some(Asked::Grab)) => ffi::Cursor::Grab,
+        (None, Some(Asked::Grabbing)) => ffi::Cursor::Grabbing,
+        (None, Some(Asked::Move)) => ffi::Cursor::Move,
+        (None, Some(Asked::Crosshair)) => ffi::Cursor::Crosshair,
         (None, None) if hovered => ffi::Cursor::Pointing,
         (None, None) => ffi::Cursor::Arrow,
     }

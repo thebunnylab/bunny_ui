@@ -902,12 +902,21 @@ pub enum ElementEvent {
     /// never looks at this arm hears none of them — a secondary press it
     /// ignores goes on to the `.context_menu` around it, as it always did.
     ///
-    /// Only the press: there is no release and no drag, and the press
-    /// does not move the keyboard. That is what the two gestures need. A
-    /// terminal opens its copy menu at the point without disturbing the
-    /// selection the menu acts on ([`EventCtx::open_menu`]); an editor
-    /// pastes the primary selection where the middle button landed.
+    /// The press does not move the keyboard. A terminal opens its copy
+    /// menu at the point without disturbing the selection the menu acts
+    /// on ([`EventCtx::open_menu`]); an editor pastes the primary
+    /// selection where the middle button landed. A box that answers the
+    /// press handled holds the pointer until that button lifts: it hears
+    /// every move as [`ElementEvent::ButtonMoved`], wherever the hand
+    /// runs, and the lift as [`ElementEvent::ButtonUp`] — the middle
+    /// button's drag that turns a world. A press that opened a menu
+    /// leaves the hand to the menu.
     ButtonDown { at: Point, button: PointerButton, modifiers: crate::action::Modifiers },
+    /// The pointer moved while a button past the primary one is held,
+    /// for the box that took its press.
+    ButtonMoved { at: Point, button: PointerButton, modifiers: crate::action::Modifiers },
+    /// That button lifted (or the press was taken back): the drag ends.
+    ButtonUp { at: Point, button: PointerButton },
     /// The wheel turned over the box. Ignore it and the scroll region
     /// around the box takes the turn instead.
     ///
@@ -967,6 +976,16 @@ pub enum ElementEvent {
     /// as far apart — at the point between them, in LOCAL coordinates.
     /// A map zooms around `at`; ignore it and nothing else zooms.
     Magnify { at: Point, scale: f64 },
+    /// Two fingers on a touch screen moved together: the point between
+    /// them travelled `(dx, dy)` in this step, and `at` is where it is
+    /// now. A map slides with them; ignore it and nothing else moves. (A
+    /// trackpad's two fingers scroll, as [`ElementEvent::Wheel`].)
+    Pan { at: Point, dx: Px, dy: Px },
+    /// Two fingers turned around the point between them: `radians` of
+    /// this step, counter-clockwise on the screen positive — the sense a
+    /// trackpad reports. A map turns with them; ignore it and nothing
+    /// else turns.
+    Rotate { at: Point, radians: f64 },
 }
 
 /// What the platform's input system reads from a focused box.
