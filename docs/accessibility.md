@@ -76,7 +76,12 @@ window's focused-element query resolves the focused proxy across its own scene,
 so a non-key popover can report its active choice through the parent that keeps
 keyboard focus. Other windows retain independent focus. A hosted native editor
 keeps its own focus when no Bunny overlay owns it. Inspecting only the parent's
-children still omits overlay choices; clients must include child surfaces.
+children still omits overlay choices; clients must include child surfaces. This
+also applies to sheets: while a sheet is open, the covered main surface can
+correctly expose no controls while the child panel exposes the active modal.
+An empty main-window snapshot alone does not demonstrate missing accessibility.
+Inspect the native child panel and its real actions before changing projection
+or exposing the covered background.
 
 The adapter keeps each native object while its `NodeId` remains exposed, converts
 layout bounds to screen coordinates, reports keyboard focus and forwards supported
@@ -100,7 +105,9 @@ main-thread AppKit probe against real windows and selectors. It checks live edit
 identity, screen bounds, modals, password redaction, retired objects and
 main-thread exit with an accessible window still open. Popover checks cover
 native button roles, labels, actions, focus through the parent, hit testing,
-repeated opening, retired choices and independent-window focus. This
+repeated opening, retired choices and independent-window focus. A routed-sheet
+case covers erased keyed screens, a binding derived from an optional destination,
+real Close/Edit actions, parent-reported focus and blocked background controls. This
 in-process probe does not require permission to control other applications. It
 is distinct from an external AX client dump or a human VoiceOver workflow.
 `scripts/check-macos-accessibility.swift <accessibility_native-executable>` runs
