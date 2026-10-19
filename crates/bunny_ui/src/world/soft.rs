@@ -600,9 +600,9 @@ fn floor_light(u: &FrameUniforms, map: &Texture, position: V3) -> [f32; 4] {
     map.sample(s.clamp(half_s, 1.0 - half_s), t.clamp(half_t, 1.0 - half_t), 0.0)
 }
 
-/// A surface's continuous codes through the frame's grade: the table's
-/// eight points around them, blended along red, then green, then blue —
-/// the shaders' order.
+/// A surface's continuous codes through the frame's grade: the four
+/// points of the table that the walk from the cube's low corner to its
+/// high one crosses, blended along that walk — the shaders' order.
 fn graded(frame: &WorldFrame, code: [f32; 3]) -> [f32; 3] {
     let start = frame.uniforms.tone[3];
     if start < 0.5 {
