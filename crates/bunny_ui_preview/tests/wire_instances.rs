@@ -160,3 +160,45 @@ fn malformed_instance_ids_are_refused_without_changing_old_message_kinds() {
     reader.feed(&malformed);
     assert!(reader.pull().is_err());
 }
+
+#[test]
+fn clipboard_text_roundtrips_without_changing_ordinary_key_or_text_messages() {
+    let paste = wire::ClipboardPaste {
+        key: "v".into(),
+        modifiers: 2,
+        text: "café 🐇\r\nΩ\n".into(),
+    };
+    let legacy = Message::ToHost(ToHost::Paste {
+        id: "scene".into(),
+        paste: paste.clone(),
+    });
+    assert_eq!(wire::encode(&legacy)[4], 86);
+    round_trip(legacy);
+    round_trip(Message::ToHost(ToHost::Instance {
+        instance: id(),
+        variant: 1,
+        command: C::Paste(paste),
+    }));
+    assert_eq!(
+        wire::encode(&Message::ToHost(ToHost::Key {
+            id: "scene".into(),
+            key: "v".into(),
+            modifiers: 2,
+        }))[4],
+        69
+    );
+    assert_eq!(
+        wire::encode(&Message::ToHost(ToHost::Text {
+            id: "scene".into(),
+            text: "literal".into(),
+        }))[4],
+        70
+    );
+    for modifiers in [2, 8, 10] {
+        assert!(wire::ClipboardPaste::is_shortcut("v", modifiers));
+        assert!(wire::ClipboardPaste::is_shortcut("V", modifiers));
+    }
+    for (key, modifiers) in [("v", 0), ("v", 3), ("v", 6), ("c", 2), ("v", 258)] {
+        assert!(!wire::ClipboardPaste::is_shortcut(key, modifiers));
+    }
+}

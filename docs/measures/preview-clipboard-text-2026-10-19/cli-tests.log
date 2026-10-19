@@ -1,0 +1,198 @@
+   Compiling bunny-ui-preview v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui_preview)
+   Compiling bunny-cli v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.58s
+     Running unittests src/lib.rs (target/debug/deps/bunny_cli-b7d2283b8e7acfe8)
+
+running 120 tests
+test build::macos::tests::a_key_goes_in_before_the_plist_closes ... ok
+test build::linux::tests::the_icon_goes_where_its_size_belongs ... ok
+test build::linux::tests::the_desktop_entry_names_the_window ... ok
+test build::macos::tests::the_developer_ids_are_read_off_the_keychain ... ok
+test build::tests::sizes_read_as_people_read_them ... ok
+test args::tests::bunched_flags_and_a_trailing_value ... ok
+test build::linux::tests::the_libraries_become_each_distributions_packages ... ok
+test args::tests::the_last_value_wins_and_all_are_kept ... ok
+test build::tests::a_logged_argument_reads_back_as_the_shell_would ... ok
+test args::tests::the_help_aligns_and_hides ... ok
+test build::android::tests::a_properties_file_reads_the_java_way ... ok
+test args::tests::the_rest_goes_to_the_app_untouched ... ok
+test args::tests::every_spelling_of_a_value_reads_the_same ... ok
+test args::tests::distance_counts_edits ... ok
+test build::android::tests::the_abis_are_named_or_all ... ok
+test args::tests::a_missing_value_and_a_value_on_a_flag_are_refused ... ok
+test args::tests::a_typo_names_what_it_meant ... ok
+test build::web::tests::the_hashed_files_are_kept_and_the_page_is_not ... ok
+test build::web::tests::a_file_is_named_after_its_content ... ok
+test cargo::tests::the_build_runs_from_the_manifests_directory ... ok
+test commands::doctor::tests::a_section_is_as_bad_as_its_worst_check ... ok
+test commands::doctor::tests::the_json_is_valid_and_complete ... ok
+test build::android::tests::the_key_file_is_found_from_the_android_folder ... ok
+test devices::tests::a_query_finds_one_device ... ok
+test devices::tests::adb_lists_serials_states_and_models ... ok
+test devices::tests::phones_from_devicectl_without_the_simulators ... ok
+test devices::tests::simulators_from_simctl ... ok
+test devices::tests::two_ready_devices_of_a_platform_must_be_named ... ok
+test formats::elf::tests::a_library_is_its_distributions_package ... ok
+test formats::elf::tests::the_needed_libraries_are_read ... ok
+test formats::pe::tests::the_subsystem_and_the_dlls_are_read ... ok
+test formats::inflate::tests::zlibs_dynamic_and_stored_streams_inflate ... ok
+test formats::png::tests::adler_is_the_one_zlib_checks ... ok
+test formats::deflate::tests::the_empty_stream_is_the_standard_one ... ok
+test formats::res::tests::a_version_becomes_four_numbers ... ok
+test formats::inflate::tests::the_lanes_own_stream_inflates ... ok
+test formats::png::tests::a_picture_is_a_png_with_its_chunks_and_checksums ... ok
+test formats::tar::tests::a_long_path_moves_its_folders_to_the_prefix ... ok
+test formats::sha::tests::the_standard_vectors ... ok
+test formats::res::tests::the_resources_are_a_res_file ... ok
+test formats::zip::tests::the_checksum_is_zips ... ok
+test formats::png::tests::a_picture_reads_back_and_filters_are_undone ... ok
+test hot::classify::tests::a_trait_declaration_without_a_body_is_kept ... ok
+test hot::classify::tests::the_tokens_skip_comments_and_keep_literals_whole ... ok
+test hot::tests::a_file_that_comes_or_goes_reaches_the_types ... ok
+test formats::zip::tests::an_archive_lists_its_files_where_unzip_looks ... ok
+test hot::tests::a_save_outside_the_library_restarts_the_app ... ok
+test hot::tests::the_answers_of_the_app_are_read ... ok
+test formats::res::tests::the_version_tree_nests_by_length ... ok
+test hot::classify::tests::a_body_that_declares_an_item_keeps_its_tokens ... ok
+test ids::tests::crate_names_follow_cargo_and_rust ... ok
+test ids::tests::each_platform_spells_the_id_its_way ... ok
+test ids::tests::ids_have_two_parts_of_letters ... ok
+test ids::tests::the_name_people_read ... ok
+test json::tests::escapes_and_surrogates ... ok
+test json::tests::broken_documents_are_refused ... ok
+test json::tests::the_shapes_tools_answer_in ... ok
+test json::tests::numbers_keep_their_text ... ok
+test hot::classify::tests::an_edit_inside_a_body_keeps_the_types ... ok
+test platform::android::tests::a_threadtime_line_reads ... ok
+test platform::android::tests::properties_are_escaped_the_java_way ... ok
+test hot::classify::tests::an_edit_outside_the_bodies_reaches_the_types ... ok
+test json::tests::writing_round_trips ... ok
+test platform::ios::tests::the_floor_is_ios_17 ... ok
+test platform::ios::tests::the_apps_switches_cross_into_the_simulator ... ok
+test platform::tests::a_plist_string_is_read_by_its_key ... ok
+test platform::web::tests::a_page_without_the_app_element_is_refused ... ok
+test platform::web::tests::the_abi_numbers_are_read_off_the_sources ... ok
+test platform::web::tests::the_page_boots_the_wasm_with_its_glue ... ok
+test preview::build_tests::diagnostic_free_failure_keeps_its_message_and_hint_and_ends_building ... ok
+test preview::build_tests::diagnostic_free_failure_without_hint_still_ends_building ... ok
+test preview::build_tests::failed_reload_preserves_every_compiler_diagnostic ... ok
+test preview::incoming_tests::read_failure_still_wakes_the_owner ... ok
+test preview::incoming_tests::reader_enqueues_before_waking_and_notifies_closure ... ok
+test preview::incoming_tests::registration_covers_preexisting_messages_and_replacement_can_reenter ... ok
+test process::tests::which_finds_a_shell ... ok
+test project::tests::a_plain_package_gets_defaults ... ok
+test project::tests::the_app_reads_from_its_package ... ok
+test template::tests::an_unfilled_placeholder_names_its_line ... ok
+test template::tests::placeholders_fill_and_the_rest_passes_through ... ok
+test template::tests::the_escape_follows_the_file_name ... ok
+test template::tests::values_are_escaped_for_their_file ... ok
+test templates::tests::a_changed_template_has_a_new_revision ... ok
+test templates::tests::a_stamp_reads_back ... ok
+test templates::tests::line_endings_do_not_change_the_hash ... ok
+test formats::deflate::tests::gzip_reads_it ... ok
+test templates::tests::outputs_drop_the_disguises ... ok
+test preview::incoming_tests::socket_data_and_disconnect_wake_without_owner_polling ... ok
+test toolchains::android::tests::avd_names_without_the_log_lines ... ok
+test toolchains::android::tests::java_reports_its_home_and_version ... ok
+test templates::tests::the_stamp_lists_every_file ... ok
+test templates::tests::every_template_on_disk_is_registered ... ok
+test toolchains::android::tests::nothing_found_is_none ... ok
+test toolchains::android_packages::tests::adoptium_names_the_archive_and_its_checksum ... ok
+test toolchains::android_packages::tests::the_cli_is_named_for_this_host ... ok
+test toolchains::android_packages::tests::the_newest_stable_ndk_by_number ... ok
+test toolchains::android_packages::tests::the_listed_packages_by_their_paths ... ok
+test toolchains::apple::tests::only_available_ios_runtimes_count ... ok
+test toolchains::linux::tests::the_family_comes_from_id_and_id_like ... ok
+test toolchains::linux::tests::the_install_line_lists_each_package_once ... ok
+test toolchains::rust::tests::the_verbose_version_reads ... ok
+test process::tests::a_missing_program_is_an_error_not_a_hang ... ok
+test wasm::tests::a_file_that_is_not_wasm_is_refused ... ok
+test wasm::tests::the_export_names_read ... ok
+test commands::upgrade::tests::an_edit_to_a_file_the_template_kept_is_left_alone ... ok
+test formats::deflate::tests::what_is_compressed_inflates_back ... ok
+test serve::tests::files_go_out_with_their_type_and_nothing_else_does ... ok
+test toolchains::rust::tests::a_target_is_its_library_folder ... ok
+test commands::upgrade::tests::without_a_stamp_every_difference_is_the_persons ... ok
+test formats::tar::tests::tar_reads_it ... ok
+test commands::upgrade::tests::an_untouched_file_is_updated_and_an_edited_one_stays ... ok
+test formats::zip::tests::unzip_reads_it ... ok
+test toolchains::android::tests::the_environment_wins_over_the_sdk ... ok
+test toolchains::android::tests::the_sdk_and_the_newest_ndk_are_found ... ok
+test formats::sha::tests::a_million_as_in_odd_pieces ... ok
+test hot::watch::tests::a_save_a_new_file_and_a_removal_are_changes ... ok
+test hot::watch::tests::a_sibling_package_is_watched_beside_the_app ... ok
+test serve::tests::a_waiting_page_hears_the_next_build ... ok
+test process::tests::output_is_captured_and_a_hang_is_cut ... ok
+test process::tests::a_daemon_on_the_pipes_does_not_hold_the_answer ... ok
+
+test result: ok. 120 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.04s
+
+     Running unittests src/main.rs (target/debug/deps/bunny-8d2ce4d7c47b8f39)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/build.rs (target/debug/deps/build-fcd3108e20fd159b)
+
+running 1 test
+test a_new_project_builds_its_packages ... ignored, builds the framework for release; run with --ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/build_sources.rs (target/debug/deps/build_sources-88a88f2b3d6d4729)
+
+running 4 tests
+test stable_sources_include_executable_and_nested_component_text ... ok
+test missing_roots_and_unreadable_source_are_errors_not_empty_receipts ... ok
+test reload_proof_rejects_inputs_that_only_a_restart_can_load ... ok
+test changed_sources_additions_removals_and_build_controls_refuse_provenance ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/cli.rs (target/debug/deps/cli-d888f67eb1ca1aaf)
+
+running 7 tests
+test new_writes_a_project_for_every_platform ... ok
+test names_with_quotes_stay_valid_toml ... ok
+test the_version_and_the_help ... ok
+test new_in_an_app_adds_only_what_is_missing ... ok
+test a_mistake_is_exit_two_with_the_way_out ... ok
+test run_outside_an_app_points_the_way ... ok
+test doctor_and_devices_answer_in_json ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+
+     Running tests/hot_reload.rs (target/debug/deps/hot_reload-1128d35cc6fa8905)
+
+running 1 test
+test two_generations_load_into_the_running_app ... ignored, builds the framework as a shared library; run with --ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/new_project.rs (target/debug/deps/new_project-875cc53a6859e4b6)
+
+running 1 test
+test a_new_project_builds_everywhere ... ignored, builds the framework for every installed target; run with --ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/preview_host.rs (target/debug/deps/preview_host-273e06e0edcf4718)
+
+running 1 test
+test the_preview_road_frames_clicks_and_survives_a_swap ... ignored, builds the framework as a shared library; run with --ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/preview_state_shape.rs (target/debug/deps/preview_state_shape-eeb61e86b9adb6b7)
+
+running 1 test
+test adding_a_same_type_field_restarts_without_reassigning_live_state ... ignored, builds and reloads a real Bunny preview host
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests bunny_cli
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

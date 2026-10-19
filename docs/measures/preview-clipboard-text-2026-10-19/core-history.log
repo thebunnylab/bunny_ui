@@ -1,0 +1,26 @@
+   Compiling bunny-ui-core v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-live-clipboard/bunny_ui/crates/bunny_ui)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.82s
+     Running tests/field_history.rs (target/debug/deps/field_history-72f7d162eafb2ad8)
+
+running 19 tests
+test external_value_changes_invalidate_local_history_before_another_render ... ok
+test pasting_one_letter_splits_the_typing_group ... ok
+test replacement_restores_the_selected_unicode_text_and_new_edit_discards_redo ... ok
+test one_composition_is_one_undo_and_cannot_be_undone_while_marked ... ok
+test an_empty_composition_notification_does_not_discard_redo ... ok
+test secret_field_history_never_exports_text_to_the_clipboard ... ok
+test cut_and_grapheme_deletion_restore_exact_bytes_and_selection ... ok
+test a_different_binding_with_equal_text_does_not_inherit_old_edits ... ok
+test composition_cancellation_preserves_the_previous_redo ... ok
+test focus_and_navigation_split_typing_without_losing_each_fields_history ... ok
+test a_custom_editing_strategy_keeps_its_own_undo ... ok
+test separate_workspace_scenes_have_separate_field_history ... ok
+test supplied_paste_text_is_one_history_step_between_typing_and_other_pastes ... ok
+test typing_undo_redo_stays_in_the_field_across_renders ... ok
+test a_named_move_retains_history_but_unmount_discards_it ... ok
+test unchanged_first_preedit_keeps_the_original_selection_for_undo ... ok
+test an_alert_does_not_undo_the_field_behind_it ... ok
+test history_retention_is_bounded_and_an_oversized_edit_does_not_leave_partial_undo ... ok
+test a_composition_evicted_by_the_budget_never_restores_a_partial_preedit ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s

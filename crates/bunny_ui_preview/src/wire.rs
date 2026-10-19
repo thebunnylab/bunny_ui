@@ -85,10 +85,14 @@ pub mod kind {
     pub const SELECT_EXECUTIONS: u8 = 83;
     pub const OBSERVE_VIEWS: u8 = 84;
     pub const OBSERVE_STATE: u8 = 85;
+    /// Explicit text paste, negotiated independently of ordinary keys/text.
+    pub const PASTE: u8 = 86;
 }
 
 /// Features a host explicitly offers in `Hello.caps`.
 pub mod caps {
+    /// Whole clipboard-text commits after custom shortcut handling.
+    pub const CLIPBOARD_TEXT: u32 = 256;
     /// Selected read-only state observations through messages 16 and 85.
     pub const STATE_OBSERVATIONS: u32 = 128;
     /// Opt-in mounted-view snapshots accompanying exact frame publications.
@@ -680,7 +684,17 @@ pub enum ToHost {
     Magnify { id: String, x: f64, y: f64, scale: f64 },
     Key { id: String, key: String, modifiers: u32 },
     Text { id: String, text: String },
-    Override { id: String, site: SiteKey, op: OverrideOp, patch: Patch },
+    /// Explicit paste after negotiating `caps::CLIPBOARD_TEXT`.
+    Paste {
+        id: String,
+        paste: ClipboardPaste,
+    },
+    Override {
+        id: String,
+        site: SiteKey,
+        op: OverrideOp,
+        patch: Patch,
+    },
     /// Send only after the host announces `caps::PLACE`.
     Place { id: String, site: SiteKey, op: OverrideOp, patch: PlacePatch },
     ClearOverrides { id: String },
@@ -688,6 +702,35 @@ pub enum ToHost {
     Forget { keys: Vec<u64> },
     Ping { nonce: u64 },
     Bye,
+}
+
+/// Text captured for one explicit paste gesture; never an OS clipboard handle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardPaste {
+    /// Original shortcut key, retained for application handler precedence.
+    pub key: String,
+    /// Original shortcut modifiers using the wire's key bits.
+    pub modifiers: u32,
+    /// Whole committed UTF-8 text, including its line endings.
+    pub text: String,
+}
+impl ClipboardPaste {
+    /// Whether the key/modifier pair is the ordinary text paste shortcut.
+    pub fn is_shortcut(key: &str, modifiers: u32) -> bool {
+        matches!(key, "v" | "V") && matches!(modifiers, 2 | 8 | 10)
+    }
+    fn put(&self, out: &mut Vec<u8>) {
+        out.string(&self.key);
+        out.u32(self.modifiers);
+        out.string(&self.text);
+    }
+    fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
+        Ok(Self {
+            key: c.string()?,
+            modifiers: c.u32()?,
+            text: c.string()?,
+        })
+    }
 }
 
 /// A message in either direction.
@@ -816,7 +859,7 @@ pub fn decode(kind: u8, payload: &[u8]) -> Result<Received, Malformed> {
     let mut cursor = Cursor { bytes: payload, at: 0, kind };
     let message = match kind {
         kind::HELLO..=kind::STATE_OBSERVATION => Message::ToIde(ToIde::get(&mut cursor)?),
-        kind::SELECT..=kind::OBSERVE_STATE => Message::ToHost(ToHost::get(&mut cursor)?),
+        kind::SELECT..=kind::PASTE => Message::ToHost(ToHost::get(&mut cursor)?),
         _ => return Ok(Received::Unknown { kind, len: payload.len() as u32 }),
     };
     if cursor.at != payload.len() {
@@ -2012,6 +2055,11 @@ impl ToHost {
                 out.u32(*modifiers);
                 kind::KEY
             }
+            ToHost::Paste { id, paste } => {
+                out.string(id);
+                paste.put(out);
+                kind::PASTE
+            }
             ToHost::Text { id, text } => {
                 out.string(id);
                 out.string(text);
@@ -2068,16 +2116,67 @@ impl ToHost {
                 command: InstanceCommand::get(c)?,
             },
             kind::SELECT => ToHost::Select(c.list(Selection::get)?),
-            kind::RETRAIT => ToHost::Retrait { id: c.string()?, traits: Traits::get(c)? },
-            kind::RESIZE => ToHost::Resize { id: c.string()?, size: Size::get(c)? },
-            kind::POINTER => ToHost::Pointer { id: c.string()?, kind: PointerKind::get(c)?, x: c.f64()?, y: c.f64()?, modifiers: c.u32()? },
-            kind::WHEEL => ToHost::Wheel { id: c.string()?, x: c.f64()?, y: c.f64()?, dx: c.f64()?, dy: c.f64()? },
-            kind::TOUCH => ToHost::Touch { id: c.string()?, phase: TouchPhase::get(c)?, touch: c.u64()?, x: c.f64()?, y: c.f64()?, taps: c.u8()? },
-            kind::MAGNIFY => ToHost::Magnify { id: c.string()?, x: c.f64()?, y: c.f64()?, scale: c.f64()? },
-            kind::KEY => ToHost::Key { id: c.string()?, key: c.string()?, modifiers: c.u32()? },
-            kind::TEXT => ToHost::Text { id: c.string()?, text: c.string()? },
-            kind::OVERRIDE => ToHost::Override { id: c.string()?, site: SiteKey::get(c)?, op: OverrideOp::get(c)?, patch: Patch::get(c)? },
-            kind::PLACE => ToHost::Place { id: c.string()?, site: SiteKey::get(c)?, op: OverrideOp::get(c)?, patch: PlacePatch::get(c)? },
+            kind::RETRAIT => ToHost::Retrait {
+                id: c.string()?,
+                traits: Traits::get(c)?,
+            },
+            kind::RESIZE => ToHost::Resize {
+                id: c.string()?,
+                size: Size::get(c)?,
+            },
+            kind::POINTER => ToHost::Pointer {
+                id: c.string()?,
+                kind: PointerKind::get(c)?,
+                x: c.f64()?,
+                y: c.f64()?,
+                modifiers: c.u32()?,
+            },
+            kind::WHEEL => ToHost::Wheel {
+                id: c.string()?,
+                x: c.f64()?,
+                y: c.f64()?,
+                dx: c.f64()?,
+                dy: c.f64()?,
+            },
+            kind::TOUCH => ToHost::Touch {
+                id: c.string()?,
+                phase: TouchPhase::get(c)?,
+                touch: c.u64()?,
+                x: c.f64()?,
+                y: c.f64()?,
+                taps: c.u8()?,
+            },
+            kind::MAGNIFY => ToHost::Magnify {
+                id: c.string()?,
+                x: c.f64()?,
+                y: c.f64()?,
+                scale: c.f64()?,
+            },
+            kind::KEY => ToHost::Key {
+                id: c.string()?,
+                key: c.string()?,
+                modifiers: c.u32()?,
+            },
+            kind::TEXT => ToHost::Text {
+                id: c.string()?,
+                text: c.string()?,
+            },
+            kind::PASTE => ToHost::Paste {
+                id: c.string()?,
+                paste: ClipboardPaste::get(c)?,
+            },
+            kind::OVERRIDE => ToHost::Override {
+                id: c.string()?,
+                site: SiteKey::get(c)?,
+                op: OverrideOp::get(c)?,
+                patch: Patch::get(c)?,
+            },
+            kind::PLACE => ToHost::Place {
+                id: c.string()?,
+                site: SiteKey::get(c)?,
+                op: OverrideOp::get(c)?,
+                patch: PlacePatch::get(c)?,
+            },
             kind::CLEAR_OVERRIDES => ToHost::ClearOverrides { id: c.string()? },
             kind::REQUEST_SNAPSHOT => ToHost::RequestSnapshot { id: c.string()? },
             kind::FORGET => ToHost::Forget { keys: c.list(|c| c.u64())? },
