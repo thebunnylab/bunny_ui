@@ -3,8 +3,10 @@
 //! printed as an ascii portrait (each character ≈ one 2×2 px block).
 //!
 //! ```sh
-//! cargo run -p bunny-ui --example counter_headless
+//! cargo run -p bunny-ui-core --example counter_headless
 //! ```
+
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
 
 use bunny_ui::layout::Size;
 use bunny_ui::prelude::*;
@@ -16,7 +18,7 @@ struct Counter {
 }
 
 impl Component for Counter {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         vstack!(
             text!("count: {}", self.count),
             spacer(),

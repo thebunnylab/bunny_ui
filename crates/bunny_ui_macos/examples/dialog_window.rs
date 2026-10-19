@@ -38,7 +38,7 @@ struct Page {
 }
 
 impl Component for Page {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let open = self.open;
         let theme = self.theme;
         let reached = self.reached;

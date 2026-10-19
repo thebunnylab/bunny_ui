@@ -3,6 +3,8 @@
 
 #![cfg(feature = "3d")]
 
+use bunny_ui_core as bunny_ui;
+
 use bunny_ui::custom::{CustomElement, ElementEvent, EventCtx, PaintCtx, Painter, Response, custom};
 use bunny_ui::layout::{Color, Rect, Size};
 use bunny_ui::prelude::*;
@@ -34,7 +36,7 @@ fn viewer() -> Viewer {
 }
 
 impl Component for Viewer {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         scene_view(self.world, self.camera)
             .orbit()
             .on_tap(move |hit| self.picked.set(hit.map(|hit| hit.entity)))
@@ -117,7 +119,7 @@ struct Page {
 }
 
 impl Component for Page {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         custom(self.editor)
     }
 }

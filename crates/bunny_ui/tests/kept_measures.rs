@@ -4,6 +4,8 @@
 //! dirty binding's key used to be taken and dropped on every pixel-path
 //! frame, and the kept measure above it answered with the old size until
 //! some body happened to run.
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use bunny_ui::layout::{Proposal, Size};
 use bunny_ui::prelude::*;
 use bunny_ui::runtime::Runtime;
@@ -16,7 +18,7 @@ struct Row {
 }
 
 impl Component for Row {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         // the word is handed to the text, never read here: a write moves
         // the text through its binding and runs no body
         let word = self.word;

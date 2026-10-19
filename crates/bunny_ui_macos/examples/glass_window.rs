@@ -40,7 +40,7 @@ struct App {
 }
 
 impl Component for App {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         vstack((self.sampler(), self.lens())).spacing(0.0)
     }
 }

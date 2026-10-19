@@ -1,0 +1,32 @@
+[package]
+name = "@BUNNY_CRATE_NAME@"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bunny-ui = { @BUNNY_UI_KEY@ = "@BUNNY_UI_VALUE@" }
+
+# What `bunny` builds the app as on every platform: the name people
+# read, and the reverse-DNS id each platform files the app under (the
+# iOS bundle id, the Android application id, the Linux app id). The
+# version above is the one people see; `build` counts every upload.
+[package.metadata.bunny]
+name = "@BUNNY_APP_NAME@"
+id = "@BUNNY_APP_ID@"
+build = 1
+
+# The framework runs optimized even in a debug build — its raster and
+# text paths are the app's frame rate — while the app's own code keeps
+# the fast compile and the debugger.
+[profile.dev.package."*"]
+opt-level = 2
+
+# The web's shipping profile: small over fast, at the download border.
+[profile.web]
+inherits = "release"
+opt-level = "z"
+codegen-units = 1
+lto = true
+strip = true
+panic = "abort"

@@ -16,14 +16,16 @@ use motor::identity::scoped_effect_slot;
 use motor::runtime::Site;
 use motor::state::{Context, EffectFn};
 
+type TaskRegistration = (Weak<RefCell<Option<TaskSlot>>>, String);
+
 thread_local! {
     static EFFECTS: RefCell<Option<Rc<[EffectFn]>>> = const { RefCell::new(None) };
     /// Every `.task` slot ever opened on this thread, weakly, WITH the
     /// identity scope it was opened under: the identity owns the cell,
     /// this list only watches it — and the scope is what tells one
     /// scene's tasks from another's when the sweep comes round.
-    static TASK_CELLS: RefCell<Vec<(Weak<RefCell<Option<TaskSlot>>>, String)>> =
-        RefCell::new(Vec::new());
+    static TASK_CELLS: RefCell<Vec<TaskRegistration>> =
+        const { RefCell::new(Vec::new()) };
     /// The pass counter the sweep compares against.
     static GENERATION: Cell<u64> = const { Cell::new(1) };
     /// Did THIS pass assemble its queue? A pass with no root declares
@@ -107,14 +109,15 @@ where
 /// dropping the handle cancels the task, so no sweep of our own exists.
 ///
 /// With an `id`, an id that moved cancels what runs and starts fresh
-/// (SwiftUI's `.task(id:)`). The factory is `Fn` because of that
-/// restart: what the future needs to own, it creates inside itself.
-pub fn task_effect<F, Fut>(site: Site, id: Option<String>, start: F) -> EffectFn
+/// (SwiftUI's `.task(id:)`). The repeatable async factory may lend its
+/// captures to a future. Each running task owns a shared factory handle
+/// so rebuilding the view cannot drop captures still borrowed across await.
+pub fn task_effect<F>(site: Site, id: Option<String>, start: F) -> EffectFn
 where
-    F: Fn() -> Fut + 'static,
-    Fut: std::future::Future<Output = ()> + 'static,
+    F: AsyncFn() + 'static,
 {
     let cell = scoped_effect_slot::<TaskSlot>(site);
+    let start = Rc::new(start);
     // the scope is read HERE, during the pass, because that is the only
     // moment the identity cursor exists — the sweep runs long after
     watch_task(&cell, motor::identity::cursor_scope().unwrap_or_default());
@@ -132,7 +135,11 @@ where
             }
             return false;
         }
-        let started = (id.clone(), motor::task::spawn(start()), generation);
+        let start = Rc::clone(&start);
+        // The executor owns this outer future. Its shared factory remains
+        // alive until the borrowed inner future completes or is cancelled.
+        let handle = motor::task::spawn(async move { start().await });
+        let started = (id.clone(), handle, generation);
         // out of the cell before it drops: cancelling runs the future's
         // own Drop, which must not find this slot borrowed
         let previous = cell.borrow_mut().replace(started);

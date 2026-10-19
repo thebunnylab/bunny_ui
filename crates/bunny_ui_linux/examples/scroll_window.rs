@@ -77,7 +77,7 @@ struct Driven {
 }
 
 impl Component for Driven {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let script = self.script;
         let mode = self.scene.mode;
         self.scene.task(move || async move {

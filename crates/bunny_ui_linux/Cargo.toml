@@ -1,7 +1,10 @@
 [package]
 name = "bunny-ui-linux"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
+description = "bunny-ui Linux shell — a Wayland window and its input, presented by the shared Vulkan tier or the CPU floor, with hand-written FFI and not a single dependency"
+license-file.workspace = true
+repository.workspace = true
 # every example is declared below with a platform-suffixed artifact
 # name; discovery would re-add the bare names and bring the collision
 # back
@@ -14,6 +17,10 @@ bunny-ui-vulkan.workspace = true
 [dev-dependencies]
 countries-core.workspace = true
 countries-pure.workspace = true
+
+[[test]]
+name = "accessibility_native"
+harness = false
 
 # the example FILES are deliberate twins of the other shells', but the
 # artifact names carry the platform: three crates emitting the same
@@ -82,3 +89,7 @@ path = "examples/table_window.rs"
 [[example]]
 name = "compose_window_linux"
 path = "examples/compose_window.rs"
+
+[[test]]
+name = "window_lifecycle"
+harness = false

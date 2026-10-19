@@ -2,6 +2,8 @@
 //! with it, and both lanes keep their place in the tree — the lane that
 //! stays is the same lane before, during and after, and the one that
 //! returns comes back to its own path.
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use bunny_ui::layout::{Proposal, Size};
 use bunny_ui::prelude::*;
 use bunny_ui::runtime::Runtime;
@@ -24,7 +26,7 @@ struct Room {
 }
 
 impl Component for Room {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let open = self.dock_open.get();
         hsplit(self.seam.binding(), lane_a(), lane_b()).min_sizes(100.0, 100.0).hide_trailing(!open)
     }

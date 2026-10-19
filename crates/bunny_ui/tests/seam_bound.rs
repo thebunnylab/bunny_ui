@@ -3,6 +3,8 @@
 //! each write re-ran that body — the whole window's, for a dock — and
 //! every body under it before a frame could lay out. Read by the layout,
 //! a write is a frame and nothing else.
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use bunny_ui::action::Modifiers;
 use bunny_ui::layout::{Proposal, Size};
 use bunny_ui::prelude::*;
@@ -16,7 +18,7 @@ struct Room {
 }
 
 impl Component for Room {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         hsplit(self.seam.binding(), text!("a").on_click(|| {}).id("a"), text!("b").on_click(|| {}).id("b"))
             .min_sizes(50.0, 50.0)
     }

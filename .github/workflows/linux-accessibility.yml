@@ -1,0 +1,73 @@
+name: Linux accessibility
+
+on:
+  pull_request:
+    paths:
+      - 'crates/bunny_ui/**'
+      - 'crates/bunny_ui_linux/**'
+      - 'scripts/check-linux-accessibility.sh'
+      - '.github/workflows/linux-accessibility.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-accessibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: System libraries and native clients
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb1-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-shm0-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libdbus-1-dev libsecret-1-dev \
+            libfontconfig-dev libfreetype-dev libharfbuzz-dev fonts-dejavu fonts-noto-color-emoji \
+            wayland-protocols weston xvfb dbus-x11 at-spi2-core python3-gi gir1.2-atspi-2.0
+      - name: Pinned compiler
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component clippy
+          rustup override set 1.98.1
+          rustc --version --verbose
+      - name: Native AT-SPI, X11 and Wayland, normal and paranoid
+        run: bash scripts/check-linux-accessibility.sh
+      - name: Linux shell, normal and paranoid
+        run: |
+          dbus-run-session -- cargo test -p bunny-ui-linux --locked --all-targets
+          BUNNY_PARANOID=all dbus-run-session -- cargo test -p bunny-ui-linux --locked --all-targets
+      - name: Core and facade on Linux
+        run: |
+          cargo test -p bunny-ui-core --locked --all-targets
+          BUNNY_PARANOID=all cargo test -p bunny-ui-core --locked --all-targets
+          cargo test -p bunny-ui-core --locked --all-targets --all-features
+          BUNNY_PARANOID=all cargo test -p bunny-ui-core --locked --all-targets --all-features
+          cargo test -p bunny-ui --locked --all-targets
+          cargo test -p bunny-ui --locked --doc
+          cargo check -p bunny-ui --locked --all-targets --no-default-features
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha || '4eb9dc9e64cb6994989e9975640a76d81772965d' }}
+          path: .ci-base
+          persist-credentials: false
+      - name: Strict lint diagnostic comparison
+        run: |
+          rustup override set 1.98.1 --path .ci-base
+          python3 scripts/check-clippy-regressions.py --baseline .ci-base --output lint-evidence \
+            --package bunny-ui-core --package bunny-ui-linux
+      - name: Preserve strict lint results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: strict-lint-linux
+          path: |
+            lint-evidence/*.jsonl
+            lint-evidence/comparison.json
+          if-no-files-found: warn

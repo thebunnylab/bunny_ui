@@ -20,6 +20,8 @@
 //! E <ms> dur=<ms>
 //! X <ms> what=<name>
 //! F <ms> settle=<ms> layout=<ms> pass=<ms> asm=<ms> measure=<ms> place=<ms> hover=<ms> passes=<n> layouts=<n> asm#=<n> hover#=<n> paints=<n> cmds=<n> mk=<n> mm=<n>
+//! V <ms> mount=<process-local number> stage=<load-request|load-return|commit|finish|post>
+//! U <ms> mount=<process-local number> attached=<0|1> width=<points> height=<points>
 //! W <ms> ran=<0|1> need=<0|1> why=<reasons>
 //! A <ms> asks=<n> also=<origins>
 //! I <ms> kind=<key|wheel|press|release|move|magnify>
@@ -28,6 +30,11 @@
 //! L <ms> blits=<n>   (live layers repainted alone: an overlay, a loop)
 //! Q <ms> box=<x0>,<y0>,<x1>,<y1>[ moved] | hide   (a change presented through the patch layer, or the patch stepping aside)
 //! ```
+//!
+//! `V` records only document lifecycle milestones and an opaque process-local
+//! mount number. It never records document data, URLs, paths or posted payloads.
+//! `U` records native attachment and tenant dimensions immediately before a
+//! document submission. These records do not establish presented pixels.
 //!
 //! `R` is a window callback (which notification asked, and at what
 //! size). `P` opens a present; `H` (host pass), `O` (overlay panels),

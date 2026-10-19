@@ -298,7 +298,7 @@ impl NodeList {
 
 /// The conformance every `struct X: View` writes by hand.
 ///
-/// (`var body: some View` → `fn body(self, ctx: &Context) -> impl View` —
+/// (`var body: some View` → `fn body(self) -> impl View` —
 /// return-position `impl Trait` in trait, stable since Rust 1.75. The
 /// concrete type of the whole tree is known at compile time.)
 ///
@@ -308,7 +308,7 @@ impl NodeList {
 /// `&self` form demanded. Views are cheap values (`State` is Copy); the
 /// runtime clones before calling.
 pub trait Component: Clone + 'static {
-    fn body(self, ctx: &Context) -> impl View;
+    fn body(self) -> impl View;
 
     /// The framework's own keyed list stands behind a boundary whose
     /// rows are kept by key when it re-runs. Only that list says so.
@@ -339,8 +339,10 @@ pub trait Component: Clone + 'static {
 /// renders. Written at the call site instead, the same copy would
 /// reserve its slot in the caller's frame for the whole subtree.
 #[inline(never)]
-fn run_body<'a, T: Component>(view: &T, ctx: &'a Context) -> impl View + use<'a, T> {
-    view.clone().body(ctx)
+fn run_body<T: Component>(view: &T, ctx: &Context) -> impl View {
+    motor::state::with_environment(ctx, || {
+        crate::diagnostics::body(std::any::type_name::<T>(), || view.clone().body())
+    })
 }
 
 /// Files the finished body under its identity, and puts the reference
@@ -528,32 +530,74 @@ impl<C: View> View for Vec<C> {
     }
 }
 
+/// The zero-child tuple is a fragment, just like every non-empty tuple.
+/// Blank stack macros retain their container without inventing a child node.
+impl View for () {
+    type Arity = Many;
+
+    fn render_into(&self, _ctx: &Context, _out: &mut NodeList) {}
+}
+
+/// A tuple chunk's children, with an index shared across generated chunks.
+/// This is public only because exported stack macros instantiate it downstream.
+#[doc(hidden)]
+pub trait TupleChildren: Clone + 'static {
+    fn render_children(&self, ctx: &Context, out: &mut NodeList, position: &mut usize);
+}
+
+/// Two compile-time child chunks, flattened without an extra layout or identity node.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct JoinedChildren<A, B>(A, B);
+
+impl<A, B> JoinedChildren<A, B> {
+    pub const fn new(first: A, rest: B) -> Self {
+        Self(first, rest)
+    }
+}
+
+impl<A: TupleChildren, B: TupleChildren> TupleChildren for JoinedChildren<A, B> {
+    fn render_children(&self, ctx: &Context, out: &mut NodeList, position: &mut usize) {
+        self.0.render_children(ctx, out, position);
+        self.1.render_children(ctx, out, position);
+    }
+}
+
+impl<A: TupleChildren, B: TupleChildren> View for JoinedChildren<A, B> {
+    type Arity = Many;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        self.render_children(ctx, out, &mut 0);
+    }
+}
+
 /// SwiftUI's `TupleView` — the implicit container of a multi-statement
 /// `@ViewBuilder` block, flattened into the parent's children.
 macro_rules! tuple_view {
     ($($name:ident),+) => {
         #[allow(non_snake_case)]
-        impl<$($name: View),+> View for ($($name,)+) {
-            type Arity = Many;
-
-            fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        impl<$($name: View),+> TupleChildren for ($($name,)+) {
+            fn render_children(&self, ctx: &Context, out: &mut NodeList, position: &mut usize) {
                 let ($(ref $name,)+) = *self;
-                // The tuple position is structural identity: two siblings of
-                // the same type do not get confused, and an empty `Option` does
-                // not shift the indices (the structure is static, not the emitted nodes).
-                let mut position = 0usize;
-                // one node a child, as a rule: room for the arity, made
-                // when the first one arrives
+                // The index belongs to the flat child list, even across macro
+                // chunks. An empty Option still owns its structural slot.
                 const ARITY: usize = [$(stringify!($name)),+].len();
                 out.expect_layout(ARITY);
                 $(
                     {
-                        let _frame = motor::identity::enter(position_segment(position));
+                        let _frame = motor::identity::enter(position_segment(*position));
                         $name.render_into(ctx, out);
-                        position += 1;
+                        *position += 1;
                     }
                 )+
-                let _ = position;
+            }
+        }
+
+        impl<$($name: View),+> View for ($($name,)+) {
+            type Arity = Many;
+
+            fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+                self.render_children(ctx, out, &mut 0);
             }
         }
     };
@@ -668,7 +712,7 @@ mod tests {
     }
 
     impl<const N: usize> Component for Level<N> {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             mark();
             let deeper =
                 (self.left > 0).then(|| Level { payload: self.payload, left: self.left - 1 });

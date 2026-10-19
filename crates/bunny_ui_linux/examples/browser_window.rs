@@ -152,7 +152,7 @@ struct Browser {
 }
 
 impl Component for Browser {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let (page, shown) = (self.page, self.shown);
         let (address, posted, title) = (self.address, self.posted, self.title);
         let handle = self.handle.clone();

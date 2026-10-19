@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- The app's iOS bundle. This file is yours to edit; `bunny` fills
+         every @BUNNY_…@ marker from Cargo.toml on each build (the name,
+         the id, the version) and leaves the rest as you wrote it. -->
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>@BUNNY_APP_NAME@</string>
+    <!-- The executable keeps cargo's own name: the linker's ad-hoc
+         signature is named after it. -->
+    <key>CFBundleExecutable</key>
+    <string>@BUNNY_EXECUTABLE@</string>
+    <key>CFBundleIdentifier</key>
+    <string>@BUNNY_BUNDLE_ID@</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>@BUNNY_APP_NAME@</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@BUNNY_VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@BUNNY_BUILD@</string>
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>@BUNNY_SDK_PLATFORM@</string>
+    </array>
+    <key>DTPlatformName</key>
+    <string>@BUNNY_SDK_NAME@</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <!-- `bunny` builds for this iOS and no older one (17.0 is the
+         framework's floor). -->
+    <key>MinimumOSVersion</key>
+    <string>17.0</string>
+    <!-- The scene life cycle: the shell builds its window when a scene
+         connects, and an app built with the iOS 27 SDK that declares no
+         manifest is trapped by UIKit before its launch returns. The
+         delegate class is named by the shell itself, not here; one scene,
+         because the screen is the window. Keep this entry. -->
+    <key>UIApplicationSceneManifest</key>
+    <dict>
+        <key>UIApplicationSupportsMultipleScenes</key>
+        <false/>
+    </dict>
+    <key>UIDeviceFamily</key>
+    <array>
+        <integer>1</integer>
+        <integer>2</integer>
+    </array>
+    <key>UIRequiredDeviceCapabilities</key>
+    <array>
+        <string>arm64</string>
+        <string>metal</string>
+    </array>
+    <!-- Without a launch screen the system letterboxes the app at a
+         legacy size, and the scale contract breaks silently. Keep it. -->
+    <key>UILaunchScreen</key>
+    <dict/>
+    <key>UIRequiresFullScreen</key>
+    <true/>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+</dict>
+</plist>

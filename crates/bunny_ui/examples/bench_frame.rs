@@ -1,7 +1,7 @@
 //! The frame ruler: a dashboard-shaped scene, one WHOLE frame per sample.
 //!
 //! ```sh
-//! cargo run --release -p bunny-ui --example bench_frame
+//! cargo run --release -p bunny-ui-core --example bench_frame
 //! ```
 //!
 //! `bench_pipeline` times `layout` on a small finder. This harness times
@@ -17,6 +17,8 @@
 //! table from [`bunny_ui::stats`] in a separate pass, so the timers never
 //! pay into the wall numbers. Text metrics come from the `PixelFont`:
 //! the allocation counts are the same on every machine.
+
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
 
 use bunny_ui::action::Modifiers;
 use bunny_ui::prelude::*;
@@ -46,7 +48,11 @@ const OVER_ROWS: (f64, f64) = (100.0, 300.0);
 /// content really travels under a pointer at rest and never sits on a
 /// clamp for long.
 fn travel(turn: usize) -> f64 {
-    if (turn / 30) % 2 == 0 { -8.0 } else { 8.0 }
+    if (turn / 30).is_multiple_of(2) {
+        -8.0
+    } else {
+        8.0
+    }
 }
 
 struct Bench {
@@ -74,7 +80,12 @@ impl Bench {
     }
 }
 
-fn scenarios(tag: &str, scene: bool, legend_rows: usize, full: bool) -> (Vec<harness::Report>, Vec<harness::StageRow>) {
+fn scenarios(
+    tag: &str,
+    scene: bool,
+    legend_rows: usize,
+    full: bool,
+) -> (Vec<harness::Report>, Vec<harness::StageRow>) {
     let runtime = || if scene { Runtime::scene("w0") } else { Runtime::new() };
     let mut reports = Vec::new();
     let mut rows = Vec::new();
@@ -171,7 +182,7 @@ fn scenarios(tag: &str, scene: bool, legend_rows: usize, full: bool) -> (Vec<har
         let bench = Bench::new(runtime(), legend_rows);
         let mut ticks = 0usize;
         let mut step = || {
-            if ticks % 24 == 0 {
+            if ticks.is_multiple_of(24) {
                 bench.root.pulse.set(ticks / 24 + 1);
                 bench.frame();
             }

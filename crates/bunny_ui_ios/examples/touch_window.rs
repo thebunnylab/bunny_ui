@@ -88,7 +88,7 @@ struct Playground {
 }
 
 impl Component for Playground {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let count = self.count;
         let opened = self.opened;
         let rows = (1..=200).collect::<Vec<usize>>();

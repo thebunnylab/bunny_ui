@@ -34,7 +34,7 @@ struct Counter {
 }
 
 impl Component for Counter {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         vstack!(
             text!("Count: {}", self.count).font(Font::Title),
             text!("Ticks: {}", self.ticks),

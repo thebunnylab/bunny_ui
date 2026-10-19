@@ -15,6 +15,8 @@
 //! at what the path costs today: going under it is progress, going over
 //! it is the regression these tests are for.
 
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -84,7 +86,7 @@ where
     B: Fn(Item) -> V + Copy + 'static,
     V: View,
 {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         (self.body)(self.item)
     }
 }
@@ -101,7 +103,7 @@ where
     B: Fn(Item) -> V + Copy + 'static,
     V: View,
 {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let body = self.body;
         for_each(self.items, |item| item.id.to_string(), move |item| Row { item: *item, body })
     }

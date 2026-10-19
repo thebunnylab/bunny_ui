@@ -331,9 +331,13 @@ fn refused(what: &str, hr: Hresult) -> String {
     format!("{what} (0x{:08X})", hr as u32)
 }
 
-/// This process's AppUserModelID — its executable's name, under the
+/// This process's AppUserModelID — the id the app gave
+/// (`bunny_ui::app!` gives it), or its executable's name under the
 /// house's own prefix.
 fn app_user_model_id() -> String {
+    if let Some(id) = bunny_ui::app::identity().and_then(|identity| identity.id) {
+        return id.to_string();
+    }
     let stem = std::env::current_exe()
         .ok()
         .and_then(|path| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))

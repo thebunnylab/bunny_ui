@@ -36,6 +36,9 @@ use std::sync::Arc;
 use crate::image_engine::{ImageEngine, ImageSource, RawImages, intrinsic_of};
 use crate::text_engine::{FontPatch, FontSpec, MeasureCache, PixelFont, TextEngine};
 
+mod grid;
+pub use grid::{CellArea, grid_cells};
+
 /// Logical pixels. Snapping to device pixels is the real backend's
 /// decision, at a single point of the pipeline — never spread around.
 pub type Px = f64;
@@ -480,6 +483,17 @@ pub enum Side {
     Trailing,
 }
 
+/// How an anchored popover participates in native keyboard navigation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PopoverFocus {
+    /// Controls form a scope, borrowing focus until the popover closes.
+    #[default]
+    Scope,
+    /// Keep the current owner and include choices in the existing Tab order.
+    /// Useful for completion lists whose editor must keep receiving text.
+    Preserve,
+}
+
 /// One of the window's own buttons, marked on a scene-drawn control
 /// so the platform treats it as the real thing (snap layouts hover
 /// the maximize button; the system closes on close). Shells without
@@ -668,6 +682,8 @@ pub struct LayoutEnv<'a> {
     /// PAINT and nothing else, because a modality decides chrome and
     /// never geometry.
     pub touch: bool,
+    /// Collect native accessibility semantics during this placement.
+    pub accessibility: bool,
 }
 
 impl LayoutEnv<'_> {
@@ -839,8 +855,26 @@ pub enum LayoutNode {
     /// `path`, which is the only thing the runtime needs to hand the
     /// size over.
     Measured { path: String, child: Box<LayoutNode> },
+    /// Semantic information with no effect on geometry or paint.
+    Accessible { semantics: crate::accessibility::Semantics, child: Box<LayoutNode> },
+    /// Where the child was written (`crate::provenance`): transparent to
+    /// measure and place, it records a [`crate::provenance::SitePlacement`]
+    /// with the frame it was placed at. Only made while a runtime records
+    /// sites — a pass nobody watches never holds one.
+    Sited {
+        site: crate::provenance::Site,
+        mounted: Option<crate::provenance::MountedId>,
+        reading: Option<crate::provenance::ReadBinding>,
+        kind: crate::provenance::NodeKind,
+        modifier: Option<&'static str>,
+        child: Box<LayoutNode>,
+    },
     /// Fills whatever the proposal gives (Rectangle).
     Fill,
+    /// A rectangle filled with the inherited shape ink.
+    Rectangle,
+    /// A filled ellipse inscribed in the proposed rectangle.
+    Ellipse,
     /// `hints` are what an `.element(…)` over the stack says
     /// ([`ElementHints`]), and `action` the one an `.on_click(…)` over
     /// it arms — the stack is the target an [`LayoutNode::Interactive`]
@@ -865,6 +899,14 @@ pub enum LayoutNode {
     /// offered that width, so a long label wraps inside it instead of
     /// overflowing.
     Flow { spacing: Px, line_spacing: Px, align: CrossAlign, children: Vec<LayoutNode> },
+    /// Equal-width tracks with sparse placement and per-child spans.
+    Grid {
+        columns: usize,
+        spacing: Px,
+        row_spacing: Px,
+        align: CrossAlign,
+        children: Vec<LayoutNode>,
+    },
     /// Overlay: all children in the same frame (ZStack, sheet on top).
     /// `align` is the HORIZONTAL edge each child sits on; the vertical
     /// one stays centered, exactly what SwiftUI's `.leading` means.
@@ -902,7 +944,18 @@ pub enum LayoutNode {
         layer: Box<LayoutNode>,
         child: Box<LayoutNode>,
     },
-    Padding { edges: Edges, child: Box<LayoutNode> },
+    /// A child parameter read by its enclosing stack, transparent elsewhere.
+    Placed { at: Point, child: Box<LayoutNode> },
+    /// Track occupancy read by the enclosing grid, transparent elsewhere.
+    Spanned {
+        columns: usize,
+        rows: usize,
+        child: Box<LayoutNode>,
+    },
+    Padding {
+        edges: Edges,
+        child: Box<LayoutNode>,
+    },
     /// `.frame(width:height:)` — `Some` axes override proposal and answer.
     ///
     /// `align` places the child INSIDE that answer on the horizontal axis:
@@ -1155,6 +1208,7 @@ pub enum LayoutNode {
         /// The popover's identity (dismiss registrations key on it).
         path: String,
         side: Side,
+        focus: PopoverFocus,
         overlay: Rc<LayoutNode>,
         child: Box<LayoutNode>,
     },
@@ -1269,6 +1323,8 @@ pub enum LayoutNode {
 /// Public in name only, like the slot beside it.
 #[derive(Clone, Debug, Default)]
 pub struct ElementHints {
+    /// Native semantics are independent of DOM hints and their folding rules.
+    pub(crate) semantics: Option<Rc<crate::accessibility::Semantics>>,
     pub(crate) tag: Option<Rc<str>>,
     pub(crate) class: Option<Rc<str>>,
     /// The id and the href, the rare words: one shared record, so
@@ -1276,7 +1332,25 @@ pub struct ElementHints {
     pub(crate) address: Option<Rc<Address>>,
 }
 
+/// State shared by built-in activation controls, keyboard navigation and AT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ControlState {
+    pub enabled: bool,
+    pub checked: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FocusStop {
+    pub path: Rc<str>,
+    pub frame: Rect,
+    pub region: Option<usize>,
+    pub control: Option<ControlState>,
+}
+
 impl ElementHints {
+    pub(crate) fn control(&self) -> Option<ControlState> {
+        self.address.as_ref().and_then(|address| address.control)
+    }
     pub(crate) fn is_empty(&self) -> bool {
         self.tag.is_none() && self.class.is_none() && self.address.is_none()
     }
@@ -1287,6 +1361,7 @@ impl ElementHints {
 /// it behind one shared word ([`Address::over`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Address {
+    pub(crate) control: Option<ControlState>,
     pub dom_id: Option<Rc<str>>,
     pub href: Option<Rc<str>>,
 }
@@ -1326,7 +1401,7 @@ impl Address {
     }
 
     /// One shared copy of an address.
-    fn shared(address: Address) -> Rc<Address> {
+    pub(crate) fn shared(address: Self) -> Rc<Self> {
         ADDRESSES.with(|addresses| {
             let mut addresses = addresses.borrow_mut();
             if let Some(shared) = addresses.get(&address) {
@@ -1342,6 +1417,13 @@ impl Address {
 }
 
 impl LayoutNode {
+    pub(crate) fn without_semantics(&self) -> &Self {
+        match self {
+            Self::Accessible { child, .. } => child.without_semantics(),
+            node => node,
+        }
+    }
+
     /// The hints a stack, a text or a style carries itself — `None` for
     /// any other node. A reference to a retained boundary keeps its own,
     /// read where the reference is.
@@ -1441,6 +1523,12 @@ pub enum Fit {
     /// the place draws the lines that were measured and never breaks
     /// them again against a frame of another width.
     Lines(Vec<usize>, Vec<(Size, Fit)>),
+    /// Cell allocation, resolved row heights and measured children.
+    Grid {
+        areas: Vec<CellArea>,
+        rows: Vec<Px>,
+        cells: Vec<(Size, Fit)>,
+    },
     /// The real content size (it can exceed the frame — that is what scrolls).
     ScrollContent(Size, Box<Fit>),
     /// A retained boundary's KEPT fit: measured on an earlier frame for
@@ -1469,6 +1557,18 @@ impl Fit {
         match (self.unshared(), other.unshared()) {
             (Fit::Leaf, Fit::Leaf) => true,
             (Fit::Children(a), Fit::Children(b)) => pairs(a, b),
+            (
+                Fit::Grid {
+                    areas: aa,
+                    rows: ra,
+                    cells: ca,
+                },
+                Fit::Grid {
+                    areas: ab,
+                    rows: rb,
+                    cells: cb,
+                },
+            ) => aa == ab && ra == rb && pairs(ca, cb),
             (Fit::Lines(la, a), Fit::Lines(lb, b)) => la == lb && pairs(a, b),
             (
                 Fit::Virtual { row_extent: ra, children: ca, offsets: oa },
@@ -2264,6 +2364,12 @@ pub struct VisualProps {
     /// (the LAW: hover swaps paint, never content).
     pub opacity_hovered: Option<f64>,
     pub opacity_pressed: Option<f64>,
+    /// `.hidden()` — the box keeps its place and shows no pixel: no
+    /// command of its subtree reaches the list, not even for a reader
+    /// that keeps the unseen (hidden is by design, not by the glass),
+    /// and no hit inside it exists. Paint only, like the rest: the box
+    /// measures and lays out exactly as it would.
+    pub hidden: bool,
     /// `.group_hovered()` — this box's hover and pressed paint follows
     /// the nearest `.hover_group()` above it, not the interactive
     /// target it belongs to.
@@ -2310,6 +2416,7 @@ impl VisualProps {
             opacity: self.opacity.or(outer.opacity),
             opacity_hovered: self.opacity_hovered.or(outer.opacity_hovered),
             opacity_pressed: self.opacity_pressed.or(outer.opacity_pressed),
+            hidden: self.hidden || outer.hidden,
             from_group: self.from_group || outer.from_group,
         }
     }
@@ -2582,6 +2689,11 @@ impl LayoutNode {
     /// paint. The retained boundaries met on the way are collected — their
     /// own trees are asked through their slots, each time.
     fn collect_quiet(&self, held: &mut Vec<Rc<crate::reconciler::Slot>>) -> bool {
+        // Keyboard navigation must retain controls beyond the visible band.
+        // Their draw commands can be culled, but their placement cannot.
+        if self.carried_hints().and_then(ElementHints::control).is_some_and(|state| state.enabled) {
+            return false;
+        }
         match self {
             LayoutNode::Text { .. }
             | LayoutNode::Spacer
@@ -2589,9 +2701,12 @@ impl LayoutNode {
             | LayoutNode::Image { .. }
             | LayoutNode::Icon { .. }
             | LayoutNode::Fill
+            | LayoutNode::Ellipse
+            | LayoutNode::Rectangle
             | LayoutNode::BoundaryHint { .. } => true,
             LayoutNode::Stack { children, .. }
             | LayoutNode::Flow { children, .. }
+            | LayoutNode::Grid { children, .. }
             | LayoutNode::Boundary { children, .. } => {
                 children.iter().all(|child| child.collect_quiet(held))
             }
@@ -2602,7 +2717,11 @@ impl LayoutNode {
             LayoutNode::Overlay { layer, child, .. } => {
                 layer.collect_quiet(held) && child.collect_quiet(held)
             }
-            LayoutNode::Padding { child, .. }
+            LayoutNode::Spanned { child, .. }
+            | LayoutNode::Placed { child, .. }
+            | LayoutNode::Accessible { child, .. }
+            | LayoutNode::Sited { child, .. }
+            | LayoutNode::Padding { child, .. }
             | LayoutNode::Frame { child, .. }
             | LayoutNode::MaxFrame { child, .. }
             | LayoutNode::FlexFrame { child, .. }
@@ -3044,7 +3163,7 @@ impl DisplayList {
                     DrawCommand::Image { rect: shift_rect(rect), source }
                 }
                 DrawCommand::PushClip { rect, corner_radius } => {
-                    DrawCommand::PushClip { rect: shift_rect(rect), corner_radius: corner_radius }
+                    DrawCommand::PushClip { rect: shift_rect(rect), corner_radius }
                 }
                 DrawCommand::PopClip => DrawCommand::PopClip,
             })
@@ -3190,6 +3309,7 @@ pub struct ModalFloor {
 /// "innermost" and "on top".
 #[derive(Clone, Debug)]
 pub struct ScrollRegion {
+    pub(crate) parent: Option<usize>,
     pub path: String,
     pub frame: Rect,
     pub content: Size,
@@ -3428,7 +3548,10 @@ impl std::fmt::Debug for DragBuilder {
 
 /// The closure a drop lands in — same story.
 #[derive(Clone)]
-pub struct DropAction(pub std::rc::Rc<dyn Fn(&dyn std::any::Any, DropPoint)>);
+pub struct DropAction(pub std::rc::Rc<DropHandler>);
+
+/// A typed-value drop handler after erasure at the layout boundary.
+pub type DropHandler = dyn Fn(&dyn std::any::Any, DropPoint);
 
 impl std::fmt::Debug for DropAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3559,6 +3682,7 @@ pub struct MenuOpen {
 #[derive(Debug)]
 struct QueuedOverlay {
     path: String,
+    focus: PopoverFocus,
     /// Where it hangs from — PHYSICAL, decided where the anchor was
     /// placed (a leading popover of a right-to-left island hangs at its
     /// right). `None` is a SHEET: it hangs from nothing and centres in
@@ -3611,6 +3735,8 @@ pub struct FieldPlacement {
     /// padding. The runtime keeps the caret inside THIS; the padding
     /// itself stays layout's business.
     pub run: Rect,
+    /// Left edge of the first displayed line and top of its line box.
+    /// Later visual lines resolve alignment from their own widths.
     pub text_origin: Point,
     pub font: FontSpec,
     /// When the field asks for the keyboard by itself.
@@ -3623,12 +3749,14 @@ pub struct FieldPlacement {
     /// fits is anchored ([`field_run_x`]). A line's OWN direction is its
     /// first letter's, decided by whoever reads it.
     pub direction: LayoutDirection,
+    /// Alignment within the padded run; absent means direction-relative leading.
+    pub text_align: Option<motor::views::TextAlignment>,
 }
 
 /// Where a field's run of `text_width` starts inside `run` — the frame
 /// minus the field's padding — scrolled by `offset_x`. A line that fits
-/// is anchored at the SCENE's leading edge, the right one when the
-/// scene reads right to left; a line that overflows scrolls by its OWN
+/// follows the requested alignment relative to the SCENE's direction;
+/// absent alignment means leading. A line that overflows scrolls by its OWN
 /// reading direction, so offset zero always shows the text's start and
 /// the caret's reveal counts in logical units either way. The answer is
 /// the run's LEFT edge, which is what a `TextLine` and every reader of
@@ -3638,11 +3766,21 @@ pub(crate) fn field_run_x(
     run: Rect,
     offset_x: Px,
     text_width: Px,
+    alignment: Option<motor::views::TextAlignment>,
     anchor_rtl: bool,
     line_rtl: bool,
 ) -> Px {
     if text_width <= run.size.width {
-        if anchor_rtl { run.origin.x + run.size.width - text_width } else { run.origin.x }
+        use motor::views::TextAlignment;
+        let room = run.size.width - text_width;
+        let shift = match (alignment, anchor_rtl) {
+            (None | Some(TextAlignment::Leading), false)
+            | (Some(TextAlignment::Trailing), true) => 0.0,
+            (Some(TextAlignment::Center), _) => room / 2.0,
+            (None | Some(TextAlignment::Leading), true)
+            | (Some(TextAlignment::Trailing), false) => room,
+        };
+        run.origin.x + shift
     } else if line_rtl {
         run.origin.x + run.size.width - text_width + offset_x
     } else {
@@ -3802,15 +3940,24 @@ pub const SPLIT_GRIP: Px = 6.0;
 
 #[derive(Default, Debug)]
 pub struct Placement {
+    /// The sited nodes placed so far (`crate::provenance`), in placement
+    /// order; empty unless the pass recorded sites.
+    pub(crate) sites: Vec<crate::provenance::SitePlacement>,
+    /// The enclosing sited nodes, by index into `sites`.
+    site_stack: Vec<u32>,
+    /// The enclosing component boundaries, by path — what a site names.
+    boundary_stack: Vec<Rc<str>>,
+    pub(crate) focus_order: Vec<FocusStop>,
+    pub(crate) focus_floor: usize,
+    pub(crate) focus_scope: Option<Rc<str>>,
+    accessibility_viewport: Option<Rect>,
+    accessibility_surface: Option<Rc<str>>,
+    pub(crate) accessibility: Vec<crate::accessibility::Placed>,
     pub frames: Frames,
     pub display: DisplayList,
     /// A Dom frame with no live island skips the display list — the
     /// clip stack still runs, only the command collection sleeps.
     skip_display: bool,
-    /// A canvas island placed this pass. When collection was OFF, the
-    /// runtime re-runs the pass collected — an island's birth costs
-    /// one extra walk; a steady frame costs none.
-    saw_island: bool,
     /// The window and its safe area, when the pass has insets at all —
     /// `None` on every desktop, so the zero-inset walk is today's walk
     /// byte for byte. [`LayoutNode::IgnoresSafeArea`] reads it.
@@ -3915,6 +4062,22 @@ pub struct Placement {
 }
 
 impl Placement {
+    fn can_reveal_focus(&self, frame: Rect) -> bool {
+        !frame.is_empty() && (!self.region_stack.is_empty() || self.accessible_bounds(frame).is_some())
+    }
+
+    fn accessible_bounds(&self, frame: Rect) -> Option<Rect> {
+        let frame = match self.accessibility_viewport {
+            Some(viewport) => frame.intersection(viewport)?,
+            None => frame,
+        };
+        match self.clip.last() {
+            Some(clip) => frame.intersection(*clip),
+            None => Some(frame),
+        }
+    }
+
+
     /// A placement seeded with an inherited ink — an island placed
     /// LOCALLY still paints with the foreground its subtree sits in.
     pub(crate) fn with_ink(ink: Color) -> Placement {
@@ -3927,6 +4090,7 @@ impl Placement {
     pub(crate) fn with_capture(size: Size, ink: Color) -> Placement {
         Placement {
             foreground: vec![ink],
+            accessibility_viewport: Some(Rect { origin: Point::default(), size }),
             dom: Some(crate::dom::DomCapture::new(size)),
             keep_unseen: true,
             ..Placement::default()
@@ -4047,6 +4211,20 @@ impl Placement {
         }
     }
 
+    /// Opens a box that shows no pixel — `.hidden()`. Muted like a box
+    /// under an empty clip, and under one, so no hit inside it exists;
+    /// but muted for EVERY reader, the one that keeps the unseen
+    /// included: a hidden box is hidden by design, not by the glass.
+    fn push_hidden(&mut self, at: Point) {
+        self.muted += 1;
+        self.push_clip(Rect { origin: at, size: Size::default() }, Corners::default());
+    }
+
+    fn pop_hidden(&mut self) {
+        self.pop_clip();
+        self.muted = self.muted.saturating_sub(1);
+    }
+
     fn current_clip(&self) -> Option<Rect> {
         self.clip.last().copied()
     }
@@ -4094,7 +4272,7 @@ impl Rect {
         let y0 = self.origin.y.max(other.origin.y);
         let x1 = (self.origin.x + self.size.width).min(other.origin.x + other.size.width);
         let y1 = (self.origin.y + self.size.height).min(other.origin.y + other.size.height);
-        (x1 > x0 && y1 > y0).then(|| Rect {
+        (x1 > x0 && y1 > y0).then_some(Rect {
             origin: Point { x: x0, y: y0 },
             size: Size { width: x1 - x0, height: y1 - y0 },
         })
@@ -4186,6 +4364,13 @@ pub struct Thumb {
 /// the draw list and the interaction targets.
 #[derive(Debug)]
 pub struct LayoutResult {
+    /// Every sited node the pass placed (`crate::provenance`), with its
+    /// frame; empty unless the runtime recorded sites.
+    pub sites: Vec<crate::provenance::SitePlacement>,
+    pub(crate) focus_order: Vec<FocusStop>,
+    pub(crate) focus_floor: usize,
+    pub(crate) focus_scope: Option<Rc<str>>,
+    pub(crate) accessibility: Vec<crate::accessibility::Placed>,
     pub size: Size,
     pub frames: Frames,
     pub display: DisplayList,
@@ -4201,9 +4386,6 @@ pub struct LayoutResult {
     /// Virtual windows that failed to cover the visible band this
     /// frame — the runtime re-materializes them in a follow-up pass.
     pub misses: Vec<String>,
-    /// A canvas island placed while display collection was off — the
-    /// runtime re-runs the pass collected.
-    pub(crate) saw_island: bool,
     /// The hits whose hover changes the picture (indices into `hits`),
     /// and the groups whose hover does. A frame re-reads the pointer
     /// after its layout; it lays out again only when the target the
@@ -4289,6 +4471,7 @@ pub(crate) fn layout_in(
             dialog_frames: None,
             scale: 1.0,
             touch: false,
+            accessibility: false,
         },
     )
 }
@@ -4385,6 +4568,7 @@ pub(crate) fn layout_placing(
         Rect { origin: Point { x: insets.leading, y: insets.top }, size: insets.inset(window).size };
     let mut out = Placement {
         keep_unseen,
+        accessibility_viewport: Some(window),
         thumb_layers: !keep_unseen && thumb_layers(),
         ..Placement::default()
     };
@@ -4398,6 +4582,7 @@ pub(crate) fn layout_placing(
         // full list's pure filter, and return the caller's original choice.
         let mut other = Placement {
             keep_unseen: !keep_unseen,
+            accessibility_viewport: Some(window),
             thumb_layers: keep_unseen && thumb_layers(),
             safe: out.safe,
             ..Placement::default()
@@ -4408,44 +4593,14 @@ pub(crate) fn layout_placing(
         place_overlays(container, &env, &mut other);
         crate::stats::restore(counted);
         let (full, cut) = if keep_unseen { (&out, &other) } else { (&other, &out) };
-        let seen = full.display.seen_only();
-        assert!(
-            seen.as_slice() == cut.display.as_slice(),
-            "paranoid(seen): the placement's cut and the filter of the full list differ — {} commands against {} (the full list holds {})",
-            cut.display.len(),
-            seen.len(),
-            full.display.len(),
-        );
-        // a quiet child left unplaced records its own boundaries and not the
-        // ones nested in it: the cut's frames are the full placement's, in
-        // order, with some left out — never one moved, never one invented
-        let mut all = full.frames.entries.iter();
-        let frames_agree = cut.frames.entries.iter().all(|kept| all.any(|entry| entry == kept));
-        // …and a hover group off the glass is not asked whether it paints a
-        // hover nobody can give it
-        let groups_agree = cut.sensitive_groups.iter().all(|group| full.sensitive_groups.contains(group));
-        assert!(
-            full.hits == cut.hits
-                && frames_agree
-                && groups_agree
-                && full.scrolls.len() == cut.scrolls.len()
-                && full.fields.len() == cut.fields.len()
-                && full.customs.len() == cut.customs.len()
-                && full.hosts.len() == cut.hosts.len()
-                && full.tooltips.len() == cut.tooltips.len()
-                && full.menus.len() == cut.menus.len()
-                && full.drag_sources.len() == cut.drag_sources.len()
-                && full.drops.len() == cut.drops.len()
-                && full.overlays.len() == cut.overlays.len()
-                && full.misses == cut.misses
-                && full.drag_regions == cut.drag_regions
-                && full.hover_sensitive == cut.hover_sensitive,
-            "paranoid(seen): the cut moved something other than the draw list",
-        );
+        assert_seen_placement(full, cut);
     }
     let thumbs = lift_thumbs(&mut out, &env);
     LayoutResult {
         size,
+        accessibility: out.accessibility,
+        sites: out.sites,
+        focus_order: out.focus_order, focus_floor: out.focus_floor, focus_scope: out.focus_scope,
         frames: out.frames,
         display: out.display,
         hits: out.hits,
@@ -4455,7 +4610,6 @@ pub(crate) fn layout_placing(
         customs: out.customs,
         hosts: out.hosts,
         misses: out.misses,
-        saw_island: out.saw_island,
         hover_sensitive: out.hover_sensitive,
         sensitive_groups: out.sensitive_groups,
         overlays: out.overlays,
@@ -4468,6 +4622,47 @@ pub(crate) fn layout_placing(
         drops: out.drops,
         thumbs,
     }
+}
+
+// A paint cut must preserve input ownership and placement geometry.
+fn assert_seen_placement(full: &Placement, cut: &Placement) {
+    let seen = full.display.seen_only();
+    assert!(
+        seen.as_slice() == cut.display.as_slice(),
+        "paranoid(seen): the placement's cut and the filter of the full list differ — {} commands against {} (the full list holds {})",
+        cut.display.len(),
+        seen.len(),
+        full.display.len(),
+    );
+    // a quiet child left unplaced records its own boundaries and not the
+    // ones nested in it: the cut's frames are the full placement's, in
+    // order, with some left out — never one moved, never one invented
+    let mut all = full.frames.entries.iter();
+    let frames_agree = cut.frames.entries.iter().all(|kept| all.any(|entry| entry == kept));
+    // …and a hover group off the glass is not asked whether it paints a
+    // hover nobody can give it
+    let groups_agree = cut.sensitive_groups.iter().all(|group| full.sensitive_groups.contains(group));
+    assert!(
+        full.hits == cut.hits
+            && frames_agree
+            && groups_agree
+            && full.scrolls.len() == cut.scrolls.len()
+            && full.fields.len() == cut.fields.len()
+            && full.focus_order == cut.focus_order
+            && full.focus_floor == cut.focus_floor
+            && full.focus_scope == cut.focus_scope
+            && full.customs.len() == cut.customs.len()
+            && full.hosts.len() == cut.hosts.len()
+            && full.tooltips.len() == cut.tooltips.len()
+            && full.menus.len() == cut.menus.len()
+            && full.drag_sources.len() == cut.drag_sources.len()
+            && full.drops.len() == cut.drops.len()
+            && full.overlays.len() == cut.overlays.len()
+            && full.misses == cut.misses
+            && full.drag_regions == cut.drag_regions
+            && full.hover_sensitive == cut.hover_sensitive,
+        "paranoid(seen): the cut moved something other than the draw list",
+    );
 }
 
 /// The thumbs a layer of their own shows exactly as the scene would, taken
@@ -4782,6 +4977,7 @@ pub fn layout_dom(
 ) -> (LayoutResult, crate::dom::DomNode) {
     let (size, fit) = root.measure(proposal, &env);
     let mut out = Placement {
+        accessibility_viewport: Some(window_bounds(proposal, size)),
         dom: Some(crate::dom::DomCapture::new(size)),
         skip_display: !collect_display,
         keep_unseen: true,
@@ -4796,6 +4992,9 @@ pub fn layout_dom(
     (
         LayoutResult {
             size,
+            accessibility: out.accessibility,
+            sites: out.sites,
+        focus_order: out.focus_order, focus_floor: out.focus_floor, focus_scope: out.focus_scope,
             frames: out.frames,
             display: out.display,
             hits: out.hits,
@@ -4805,8 +5004,7 @@ pub fn layout_dom(
             customs: out.customs,
             hosts: out.hosts,
             misses: out.misses,
-            saw_island: out.saw_island,
-            hover_sensitive: out.hover_sensitive,
+                hover_sensitive: out.hover_sensitive,
             sensitive_groups: out.sensitive_groups,
             overlays: out.overlays,
             modal_floor: out.modal_floor,
@@ -5309,7 +5507,22 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
             },
         };
         let start = out.display.len();
+        let (floor, scope) = (out.focus_floor, out.focus_scope.take());
+        out.focus_floor = out.focus_order.len();
+        out.focus_scope = Some(Rc::from(queued.path.as_str()));
+        let accessibility_surface = out.accessibility_surface.replace(Rc::from(queued.path.as_str()));
+        let accessibility_viewport = out.accessibility_viewport.replace(frame);
         queued.node.place(frame, &fit, env, out);
+        out.accessibility_viewport = accessibility_viewport;
+        out.accessibility_surface = accessibility_surface;
+        // a popover that placed no control is a picture beside the
+        // keyboard's owner — a completion list, a preview card — not a
+        // dialog: it opens no scope, the keyboard stays where it was and
+        // the walk never enters it
+        if queued.focus == PopoverFocus::Preserve || out.focus_order.len() == out.focus_floor {
+            out.focus_floor = floor;
+            out.focus_scope = scope;
+        }
         let end = out.display.len();
         out.overlays.push(OverlayPlacement {
             path: queued.path,
@@ -5456,15 +5669,23 @@ impl LayoutNode {
             // holds it, never across it — so a bar of them never makes its
             // row take the leftover HEIGHT. With no stack in reach (a
             // spacer measured on its own) it keeps the old bi-axial answer.
-            LayoutNode::Spacer => enclosing_main.map_or(true, |main| axis == main),
+            LayoutNode::Spacer => enclosing_main.is_none_or(|main| axis == main),
             // a fill FILLS the offer on both axes — legitimately bi-axial
-            LayoutNode::Fill => true,
+            LayoutNode::Fill | LayoutNode::Rectangle | LayoutNode::Ellipse => true,
             // a split FILLS the offer on both axes — its whole job is
             // dividing the room it was given
             LayoutNode::Split { .. } => true,
-            LayoutNode::Scroll { axes, .. } => match axis {
-                Axis::Vertical => axes.vertical(),
-                Axis::Horizontal => axes.horizontal(),
+            // A scrolling axis takes the offered viewport. Across it, the
+            // child still decides: a horizontal region containing a table's
+            // vertical list needs height, while a single text line does not.
+            // Dropping that appetite makes a stack measure the entire list
+            // unbounded and turns every row into a visible row.
+            LayoutNode::Scroll { axes, child, .. } => {
+                let travels = match axis {
+                    Axis::Vertical => axes.vertical(),
+                    Axis::Horizontal => axes.horizontal(),
+                };
+                travels || child.is_flexible(axis, enclosing_main)
             },
             // Flexible so the waterfall OFFERS it the room; it answers with
             // less when its child needs less, and the surplus goes back.
@@ -5527,12 +5748,16 @@ impl LayoutNode {
             // nesting it must not freeze it at its natural extent). It
             // also RENAMES the main axis: its children answer against its
             // own axis, not the grandparent's.
-            LayoutNode::Stack { children, axis: main, .. } => {
-                children.iter().any(|child| child.is_flexible(axis, Some(*main)))
-            }
+            LayoutNode::Stack {
+                children,
+                axis: main,
+                ..
+            } => children
+                .iter()
+                .any(|child| child.placed_at().is_none() && child.is_flexible(axis, Some(*main))),
             // a flow takes the width it is offered — that is where it
             // wraps — and answers its height with its lines
-            LayoutNode::Flow { .. } => axis == Axis::Horizontal,
+            LayoutNode::Flow { .. } | LayoutNode::Grid { .. } => axis == Axis::Horizontal,
             // a layer pile has no main axis of its own — the question
             // passes through it unchanged
             LayoutNode::Layered { children, .. } => {
@@ -5541,7 +5766,11 @@ impl LayoutNode {
             LayoutNode::Boundary { children, .. } => Self::boundary_is_flexible(children, axis, enclosing_main),
             // a probe is not a box: it answers for its child in every
             // direction, or measuring a view would change it
-            LayoutNode::Measured { child, .. } => child.is_flexible(axis, enclosing_main),
+            LayoutNode::Spanned { child, .. }
+            | LayoutNode::Placed { child, .. }
+            | LayoutNode::Accessible { child, .. }
+            | LayoutNode::Sited { child, .. }
+            | LayoutNode::Measured { child, .. } => child.is_flexible(axis, enclosing_main),
             // the app answers for its own box, per axis (the default is
             // yes on both, the same answer a Rectangle gives)
             LayoutNode::Custom { element, .. } => element.element().flexible(axis),
@@ -5554,6 +5783,65 @@ impl LayoutNode {
                 layout.map(|node| node.is_flexible(axis, enclosing_main)).unwrap_or(false)
             }),
             _ => false,
+        }
+    }
+
+    /// This stack child's physical position, looking through its outer wrappers.
+    /// The first (outermost) position wins. Retained components read the same tree.
+    pub fn placed_at(&self) -> Option<Point> {
+        match self {
+            Self::Placed { at, .. } => Some(*at),
+            Self::BoundaryRef { slot, .. } => {
+                slot.with_layout(|node| node.and_then(Self::placed_at))
+            }
+            _ => self.only_child().and_then(Self::placed_at),
+        }
+    }
+
+    /// The outermost grid span through wrappers, or one cell by default.
+    pub fn span_of(&self) -> (usize, usize) {
+        match self {
+            Self::Spanned { columns, rows, .. } => (*columns, *rows),
+            Self::BoundaryRef { slot, .. } => {
+                slot.with_layout(|node| node.map(Self::span_of).unwrap_or((1, 1)))
+            }
+            _ => self.only_child().map(Self::span_of).unwrap_or((1, 1)),
+        }
+    }
+
+    fn only_child(&self) -> Option<&Self> {
+        match self {
+            Self::Measured { child, .. }
+            | Self::Accessible { child, .. }
+            | Self::Sited { child, .. }
+            | Self::Overlay { child, .. }
+            | Self::Padding { child, .. }
+            | Self::Frame { child, .. }
+            | Self::MaxFrame { child, .. }
+            | Self::FlexFrame { child, .. }
+            | Self::Scroll { child, .. }
+            | Self::Hug { child, .. }
+            | Self::Styled { child, .. }
+            | Self::Animated { child, .. }
+            | Self::Interactive { child, .. }
+            | Self::HoverGroup { child, .. }
+            | Self::Island { child, .. }
+            | Self::Live { child, .. }
+            | Self::Sheet { child, .. }
+            | Self::Anchored { child, .. }
+            | Self::DragRegion { child, .. }
+            | Self::IgnoresSafeArea { child, .. }
+            | Self::ControlRegion { child, .. }
+            | Self::Tooltip { child, .. }
+            | Self::ContextSource { child, .. }
+            | Self::DragSource { child, .. }
+            | Self::DropTarget { child, .. }
+            | Self::ExactLayout { child, .. }
+            | Self::Hinted { child, .. }
+            | Self::Placed { child, .. }
+            | Self::Spanned { child, .. } => Some(child),
+            Self::Boundary { children, .. } if children.len() == 1 => children.first(),
+            _ => None,
         }
     }
 
@@ -5608,16 +5896,24 @@ impl LayoutNode {
             LayoutNode::Split { children, .. } => {
                 children.first().and_then(|child| child.first_baseline(env))
             }
-            LayoutNode::Padding { edges, child } => {
-                child.first_baseline(env).map(|baseline| baseline + edges.top)
-            }
-            LayoutNode::Stack { children, .. } | LayoutNode::Flow { children, .. } => {
+            LayoutNode::Padding { edges, child } => child
+                .first_baseline(env)
+                .map(|baseline| baseline + edges.top),
+            LayoutNode::Stack { children, .. } => children
+                .iter()
+                .find(|child| child.placed_at().is_none())
+                .and_then(|child| child.first_baseline(env)),
+            LayoutNode::Flow { children, .. } | LayoutNode::Grid { children, .. } => {
                 children.first().and_then(|child| child.first_baseline(env))
             }
             LayoutNode::Boundary { children, .. } => {
                 children.first().and_then(|child| child.first_baseline(env))
             }
-            LayoutNode::Measured { child, .. } => child.first_baseline(env),
+            LayoutNode::Spanned { child, .. }
+            | LayoutNode::Placed { child, .. }
+            | LayoutNode::Accessible { child, .. }
+            | LayoutNode::Sited { child, .. }
+            | LayoutNode::Measured { child, .. } => child.first_baseline(env),
             LayoutNode::BoundaryRef { slot, .. } => {
                 slot.with_layout(|layout| layout.and_then(|node| node.first_baseline(env)))
             }
@@ -5669,7 +5965,7 @@ impl LayoutNode {
                 (size, Fit::Leaf)
             }
 
-            LayoutNode::Spacer | LayoutNode::Fill => {
+            LayoutNode::Spacer | LayoutNode::Fill | LayoutNode::Rectangle | LayoutNode::Ellipse => {
                 let size = Size {
                     width: proposal.width.unwrap_or(0.0),
                     height: proposal.height.unwrap_or(0.0),
@@ -5751,7 +6047,7 @@ impl LayoutNode {
                     // the print-parity stub keeps the old rigid box
                     None => Size { width: 40.0, height: 40.0 },
                     Some(source) => {
-                        let intrinsic = intrinsic_of(&*env.images, source);
+                        let intrinsic = intrinsic_of(env.images, source);
                         // a size that is not known yet arrives later, with
                         // no state write to announce it
                         if intrinsic.is_none() {
@@ -5829,12 +6125,29 @@ impl LayoutNode {
                 measure_stack(*axis, *spacing, children, proposal, env)
             }
 
+            LayoutNode::Grid { columns, spacing, row_spacing, align, children } => {
+                grid::Tracks {
+                    columns: (*columns).max(1),
+                    gap: *spacing,
+                    row_gap: *row_spacing,
+                    align: *align,
+                }.measure(children, proposal, env)
+            }
             LayoutNode::Flow { spacing, line_spacing, children, .. } => {
                 measure_flow(*spacing, *line_spacing, children, proposal, env)
             }
 
-            LayoutNode::VirtualStack { row_extent, count, children, heights, measured: cache } => {
-                let child_proposal = Proposal { width: proposal.width, height: None };
+            LayoutNode::VirtualStack {
+                row_extent,
+                count,
+                children,
+                heights,
+                measured: cache,
+            } => {
+                let child_proposal = Proposal {
+                    width: proposal.width,
+                    height: None,
+                };
                 let measured: Vec<(usize, Size, Fit)> = children
                     .iter()
                     .map(|(index, child)| {
@@ -5953,33 +6266,46 @@ impl LayoutNode {
             }
 
             LayoutNode::Layered { children, .. } => {
-                let mut measured: Vec<(Size, Fit)> =
-                    children.iter().map(|child| child.measure(proposal, env)).collect();
-                let mut size = measured.iter().fold(Size::default(), |acc, (size, _)| Size {
-                    width: acc.width.max(size.width),
-                    height: acc.height.max(size.height),
-                });
+                let mut measured: Vec<(Size, Fit)> = children
+                    .iter()
+                    .map(|child| child.measure(position_proposal(proposal, child.placed_at()), env))
+                    .collect();
+                let mut size = children.iter().zip(&measured).fold(
+                    Size::default(),
+                    |acc, (child, (size, _))| {
+                        let at = child.placed_at().unwrap_or(Point::ZERO);
+                        Size {
+                            width: acc.width.max(at.x + size.width),
+                            height: acc.height.max(at.y + size.height),
+                        }
+                    },
+                );
                 // The stack's last pass, on both axes at once: a layer too
                 // big to shrink decides the box, and a layer that CAN take
                 // that box was measured against a smaller one. Centring it
                 // there would walk a full-bleed wash off the corner it was
                 // painted for. Asked again, once.
                 for (index, child) in children.iter().enumerate() {
+                    let at = child.placed_at().unwrap_or(Point::ZERO);
+                    let room = Size {
+                        width: (size.width - at.x).max(0.0),
+                        height: (size.height - at.y).max(0.0),
+                    };
                     let (answered, _) = &measured[index];
-                    let wider = size.width - answered.width > SETTLED
+                    let wider = room.width - answered.width > SETTLED
                         && child.is_flexible(Axis::Horizontal, None);
-                    let taller = size.height - answered.height > SETTLED
+                    let taller = room.height - answered.height > SETTLED
                         && child.is_flexible(Axis::Vertical, None);
                     if !wider && !taller {
                         continue;
                     }
                     let asked = Proposal {
-                        width: Some(if wider { size.width } else { answered.width }),
-                        height: Some(if taller { size.height } else { answered.height }),
+                        width: Some(if wider { room.width } else { answered.width }),
+                        height: Some(if taller { room.height } else { answered.height }),
                     };
                     measured[index] = child.measure(asked, env);
-                    size.width = size.width.max(measured[index].0.width);
-                    size.height = size.height.max(measured[index].0.height);
+                    size.width = size.width.max(at.x + measured[index].0.width);
+                    size.height = size.height.max(at.y + measured[index].0.height);
                 }
                 (size, Fit::Children(measured))
             }
@@ -6163,8 +6489,10 @@ impl LayoutNode {
                     flips: props.flips.unwrap_or(env.flips),
                     ..*env
                 };
-                let (size, fit) = child.measure(proposal, &env);
-                (size, Fit::Wrapped(size, Box::new(fit)))
+                // Styling changes the inherited environment, not the child's
+                // geometry. Keep its fit directly instead of boxing a duplicate
+                // handoff at every style layer and retained measurement.
+                child.measure(proposal, &env)
             }
 
             // the animation scope never touches geometry — by type
@@ -6185,6 +6513,11 @@ impl LayoutNode {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
+
+            LayoutNode::Spanned { child, .. }
+            | LayoutNode::Placed { child, .. }
+            | LayoutNode::Accessible { child, .. }
+            | LayoutNode::Sited { child, .. } => child.measure(proposal, env),
 
             LayoutNode::Measured { child, .. } => {
                 let (size, fit) = child.measure(proposal, env);
@@ -6222,19 +6555,73 @@ impl LayoutNode {
     }
 
     pub(crate) fn place(&self, frame: Rect, fit: &Fit, env: &LayoutEnv<'_>, out: &mut Placement) {
+        let semantic_start = out.accessibility.len();
+        let control = self.carried_hints().and_then(ElementHints::control);
+        let target = self.carried_action();
+        if let (Some(state), Some(path)) = (control, target)
+            && state.enabled && out.can_reveal_focus(frame)
+        {
+            out.focus_order.push(FocusStop {
+                path: Rc::clone(path), frame,
+                region: out.scrolls.iter().rposition(|region| Some(&region.path) == out.region_stack.last()),
+                control: Some(state),
+            });
+        }
         // a stack, a text or a style that carries its action is the
         // target an `Interactive` around it was, at its own frame
-        match self.carried_action() {
+        match target.filter(|_| control.is_none_or(|state| state.enabled)) {
             Some(path) => {
                 place_target(path, frame, env, out, |out| self.place_node(frame, fit, env, out));
             }
             None => self.place_node(frame, fit, env, out),
+        }
+        if let (Some(state), Some(path)) = (control, target)
+            && state.enabled && env.stamp.focus == Some(path.as_ref())
+        {
+            out.draw(DrawCommand::StrokeRect {
+                rect: frame, color: crate::theme::current().focus, width: 2.0,
+                corner_radius: Corners::all(6.0),
+            });
+        }
+        if env.accessibility && let Some(semantics) = self.carried_hints().and_then(|hints| hints.semantics.as_ref()) {
+            let bounds = out.accessible_bounds(frame);
+            semantics.collect(semantic_start, bounds, &out.accessibility_surface, &mut out.accessibility);
         }
     }
 
     /// The node itself, its own action aside.
     fn place_node(&self, frame: Rect, fit: &Fit, env: &LayoutEnv<'_>, out: &mut Placement) {
         match (self, fit.unshared()) {
+            (LayoutNode::Placed { child, .. }, _) | (LayoutNode::Spanned { child, .. }, _) => {
+                child.place(frame, fit, env, out)
+            }
+            (LayoutNode::Accessible { semantics, child }, _) => {
+                let start = out.accessibility.len();
+                child.place(frame, fit, env, out);
+                if env.accessibility {
+                    let bounds = out.accessible_bounds(frame);
+                    semantics.collect(start, bounds, &out.accessibility_surface, &mut out.accessibility);
+                }
+            }
+            // the record is the whole job: the child is placed at exactly
+            // the frame this node was given, under this site as its parent
+            (LayoutNode::Sited { site, mounted, reading, kind, modifier, child }, _) => {
+                let index = u32::try_from(out.sites.len()).unwrap_or(u32::MAX);
+                out.sites.push(crate::provenance::SitePlacement {
+                    index,
+                    parent: out.site_stack.last().copied(),
+                    site: *site,
+                    mounted: *mounted,
+                    reading: reading.clone(),
+                    kind: *kind,
+                    modifier: *modifier,
+                    frame,
+                    path: out.boundary_stack.last().cloned(),
+                });
+                out.site_stack.push(index);
+                child.place(frame, fit, env, out);
+                out.site_stack.pop();
+            }
             // visual leaves: the draw list is born here
             (LayoutNode::Text { content, highlights, truncation, .. }, Fit::Leaf) => {
                 let content = content.get();
@@ -6272,17 +6659,38 @@ impl LayoutNode {
                 );
             }
 
-            (LayoutNode::Fill, Fit::Leaf) => {
+            (LayoutNode::Fill | LayoutNode::Rectangle, Fit::Leaf) => {
+                let color = if matches!(self, LayoutNode::Rectangle) {
+                    out.foreground.last().copied().unwrap_or(Color::FILL)
+                } else {
+                    Color::FILL
+                };
                 if let Some(dom) = out.dom.as_mut() {
                     dom.open(crate::dom::DomKind::Box, frame, frame.origin);
-                    dom.set_background(Color::FILL);
+                    dom.set_background(color);
                     dom.close();
                 }
                 out.draw(DrawCommand::FillRect {
                     rect: frame,
-                    color: Color::FILL,
+                    color,
                     corner_radius: Corners::ZERO,
                 });
+            }
+
+            (LayoutNode::Ellipse, Fit::Leaf) => {
+                let color = out.foreground.last().copied().unwrap_or(Color::FILL);
+                if let Some(source) = crate::shapes::ellipse_source(frame.size, color) {
+                    if let Some(dom) = out.dom.as_mut() {
+                        dom.leaf(
+                            crate::dom::DomKind::Image(crate::dom::DomImage {
+                                key: source.key(),
+                                cover: false,
+                            }),
+                            frame,
+                        );
+                    }
+                    out.draw(DrawCommand::Image { rect: frame, source });
+                }
             }
 
             (
@@ -6298,6 +6706,19 @@ impl LayoutNode {
                 },
                 Fit::Leaf,
             ) => {
+                if env.accessibility {
+                    let bounds = out.accessible_bounds(frame);
+                    if let Some(bounds) = bounds.filter(|bounds| !bounds.is_empty()) {
+                        out.accessibility.push(crate::accessibility::Placed {
+                            enabled: true, checked: None,
+                            path: Rc::from(path.as_str()),
+                            role: if *secret { crate::accessibility::Role::PasswordField } else { crate::accessibility::Role::TextField },
+                            label: Arc::clone(placeholder),
+                            value: (!*secret).then(|| Arc::clone(content)),
+                            bounds: Some(bounds), surface: out.accessibility_surface.clone(), multiline: *multiline,
+                        });
+                    }
+                }
                 let multiline = *multiline;
                 let secret = *secret;
                 // Everything below draws and measures the string the
@@ -6459,11 +6880,13 @@ impl LayoutNode {
                 let anchor_rtl = env.rtl();
                 let line_geometry = |start: usize, end: usize| -> (Px, Px, bool) {
                     let line_rtl = crate::text_input::reads_right_to_left(&sample[start..end]);
-                    if !anchor_rtl && !line_rtl {
+                    if !anchor_rtl && !line_rtl
+                        && matches!(env.text_align, None | Some(motor::views::TextAlignment::Leading))
+                    {
                         return (text_origin.x, 0.0, false);
                     }
                     let line_w = width_of(start, end);
-                    (field_run_x(run, offset.x, line_w, anchor_rtl, line_rtl), line_w, line_rtl)
+                    (field_run_x(run, offset.x, line_w, env.text_align, anchor_rtl, line_rtl), line_w, line_rtl)
                 };
                 let color = if content.is_empty() {
                     theme.placeholder
@@ -6578,7 +7001,13 @@ impl LayoutNode {
                     // the boundary the caret stands at — and a caret that
                     // covers the NEXT character covers it on the side the
                     // line continues to, the left on a right-to-left line
-                    let (line_x, line_w, line_rtl) = line_geometry(start, end);
+                    // An empty editor's insertion point aligns an empty run,
+                    // independently of the placeholder's visible width.
+                    let (line_x, line_w, line_rtl) = if content.is_empty() {
+                        (field_run_x(run, 0.0, 0.0, env.text_align, anchor_rtl, false), 0.0, false)
+                    } else {
+                        line_geometry(start, end)
+                    };
                     let boundary =
                         field_glyph_x(line_x, line_w, line_rtl, width_of(start, caret.max(start)));
                     let origin = Point {
@@ -6627,14 +7056,25 @@ impl LayoutNode {
                     path: path.clone(),
                     frame,
                     run,
-                    text_origin,
+                    text_origin: Point {
+                        x: line_geometry(lines[0].0, lines[0].1).0,
+                        y: text_origin.y,
+                    },
                     font: env.font,
                     line_height: line_h,
                     multiline,
                     auto_focus: *auto_focus,
                     secret,
                     direction: env.direction,
+                    text_align: env.text_align,
                 });
+                if out.can_reveal_focus(frame) {
+                    out.focus_order.push(FocusStop {
+                        path: Rc::from(path.as_str()), frame,
+                        region: out.scrolls.iter().rposition(|region| Some(&region.path) == out.region_stack.last()),
+                        control: None,
+                    });
+                }
             }
 
             (LayoutNode::Leaf { .. }, Fit::Leaf) => {
@@ -6652,6 +7092,15 @@ impl LayoutNode {
             }
 
             (LayoutNode::Custom { path, element }, Fit::Leaf) => {
+                let focusable = !path.is_empty() && out.can_reveal_focus(frame)
+                    && element.element().accepts_keys() && !element.element().leaves_keyboard();
+                if focusable {
+                    out.focus_order.push(FocusStop {
+                        path: Rc::from(path.as_str()), frame,
+                        region: out.scrolls.iter().rposition(|region| Some(&region.path) == out.region_stack.last()),
+                        control: None,
+                    });
+                }
                 // what the clip lets through, in the box's own
                 // coordinates — the paint and the events read the SAME
                 // window, and a box inside a scroll learns its viewport
@@ -6695,8 +7144,10 @@ impl LayoutNode {
                     let visible = out.current_clip().map_or(Some(frame), |clip| {
                         frame.intersection(clip)
                     });
-                    visible.map(|visible| {
+                    if let Some(visible) = visible {
                         out.hits.push((path.to_string(), visible));
+                    }
+                    if visible.is_some() || focusable {
                         out.customs.push(CustomPlacement {
                             path: path.clone(),
                             frame,
@@ -6710,14 +7161,13 @@ impl LayoutNode {
                             slice: (0, 0),
                             direction: env.direction,
                         });
-                        out.customs.len() - 1
-                    })
+                        Some(out.customs.len() - 1)
+                    } else { None }
                 };
                 // what the app paints is PIXELS: on the element lowering
                 // the box becomes a canvas island, and the island slices
                 // exactly the commands between here and the close
                 let start = out.display.len();
-                out.saw_island = true;
                 if let Some(dom) = out.dom.as_mut() {
                     // the island covers what is VISIBLE, never the whole
                     // box: a box that declared four thousand points of
@@ -6981,6 +7431,9 @@ impl LayoutNode {
                 // the line the modal draws: everything recorded from
                 // here on is ABOVE it, and the walk back stops at the
                 // mark instead of reaching under it
+                out.accessibility.clear();
+                out.focus_floor = out.focus_order.len();
+                out.focus_scope = Some(Rc::from(path.as_str()));
                 out.modal_floor = Some(ModalFloor {
                     hits: out.hits.len(),
                     scrolls: out.scrolls.len(),
@@ -6993,6 +7446,7 @@ impl LayoutNode {
                 // and out of the scene, on the popover's own road
                 out.overlay_queue.push(QueuedOverlay {
                     path: path.clone(),
+                    focus: PopoverFocus::Scope,
                     side: None,
                     surface: surface.clone(),
                     node: Rc::clone(content),
@@ -7002,7 +7456,7 @@ impl LayoutNode {
                 });
             }
 
-            (LayoutNode::Anchored { path, side, overlay, child }, Fit::Wrapped(_, fit)) => {
+            (LayoutNode::Anchored { path, side, focus, overlay, child }, Fit::Wrapped(_, fit)) => {
                 child.place(frame, fit, env, out);
                 // the REAL anchor: un-shift the in-flight animation
                 // (the popover never chases a sliding row — the same
@@ -7020,6 +7474,7 @@ impl LayoutNode {
                     .is_none_or(|clip| anchor.intersection(clip).is_some());
                 out.overlay_queue.push(QueuedOverlay {
                     path: path.clone(),
+                    focus: *focus,
                     side: Some(side.physical(env.rtl())),
                     surface: OverlaySurface::Layer,
                     node: Rc::clone(overlay),
@@ -7219,7 +7674,7 @@ impl LayoutNode {
                     if cover {
                         // Fill spills over the frame on one axis — the
                         // clip is built in, never a separate modifier
-                        if let Some(rect) = cover_rect(frame, intrinsic_of(&*env.images, source)) {
+                        if let Some(rect) = cover_rect(frame, intrinsic_of(env.images, source)) {
                             out.push_clip(frame, 0.0);
                             out.draw(DrawCommand::Image {
                                 rect,
@@ -7283,6 +7738,24 @@ impl LayoutNode {
                 }
             }
 
+            (
+                LayoutNode::Grid {
+                    columns,
+                    spacing,
+                    row_spacing,
+                    align,
+                    children,
+                },
+                fit @ Fit::Grid { .. },
+            ) => {
+                grid::Tracks {
+                    columns: (*columns).max(1),
+                    gap: *spacing,
+                    row_gap: *row_spacing,
+                    align: *align,
+                }
+                .place(children, frame, fit, env, out);
+            }
             (LayoutNode::Stack { axis, spacing, align, children, .. }, Fit::Children(fits)) => {
                 place_stack(*axis, *spacing, *align, children, frame, fits, env, out);
             }
@@ -7430,6 +7903,9 @@ impl LayoutNode {
                     // recorded from now on is ABOVE, and the walk back
                     // stops at this mark instead of reaching under it
                     if *modal && index > 0 {
+                        out.accessibility.clear();
+                        out.focus_floor = out.focus_order.len();
+                        out.focus_scope = Some(Rc::from("#modal-layer"));
                         out.modal_floor = Some(ModalFloor {
                             hits: out.hits.len(),
                             scrolls: out.scrolls.len(),
@@ -7442,12 +7918,26 @@ impl LayoutNode {
                     }
                     // the alignment edge is horizontal — a 2pt accent bar
                     // hugs the leading side and still centers vertically
-                    let origin = Point {
-                        x: align_x(frame, size.width, *align, env.rtl()),
-                        y: frame.origin.y
-                            + align_offset(frame.size.height, size.height, CrossAlign::Center),
-                    };
-                    child.place(Rect { origin, size: *size }, fit, env, out);
+                    let origin = child.placed_at().map_or_else(
+                        || Point {
+                            x: align_x(frame, size.width, *align, env.rtl()),
+                            y: frame.origin.y
+                                + align_offset(frame.size.height, size.height, CrossAlign::Center),
+                        },
+                        |at| Point {
+                            x: frame.origin.x + at.x,
+                            y: frame.origin.y + at.y,
+                        },
+                    );
+                    child.place(
+                        Rect {
+                            origin,
+                            size: *size,
+                        },
+                        fit,
+                        env,
+                        out,
+                    );
                 }
             }
 
@@ -7525,6 +8015,7 @@ impl LayoutNode {
                     _ => (None, None),
                 };
                 if let Some(path) = path {
+                    let parent = out.scrolls.iter().rposition(|region| Some(&region.path) == out.region_stack.last());
                     out.region_stack.push(path.clone());
                     // BEFORE the child, which puts the regions in the
                     // paint order every other list here already keeps:
@@ -7532,6 +8023,7 @@ impl LayoutNode {
                     // over the one it covers, so walking back finds the
                     // innermost region of the topmost layer in one pass
                     out.scrolls.push(ScrollRegion {
+                        parent,
                         path: path.clone(),
                         frame,
                         content: *content,
@@ -7608,7 +8100,7 @@ impl LayoutNode {
                 out.pop_clip();
             }
 
-            (LayoutNode::Styled { props, child, .. }, Fit::Wrapped(_, fit)) => {
+            (LayoutNode::Styled { props, child, .. }, fit) => {
                 // the nearest styled EATS the color scope: its colors
                 // move, deeper styled nodes paint plain (no shared-key
                 // thrash between siblings of one scope)
@@ -7622,6 +8114,20 @@ impl LayoutNode {
                     anim: env.anim.map(|scope| AnimScope { colors: false, ..scope }),
                     ..*env
                 };
+                // `.hidden()`: the box keeps its place and shows no pixel.
+                // Under the pixel pipelines it places muted — its sites,
+                // sensors and tails still happen, into a list nobody
+                // reads. An element capture makes nothing of it: the
+                // browser shows nothing of a box that is not there, and
+                // the frames around it keep its place
+                if props.hidden {
+                    if out.dom.is_none() {
+                        out.push_hidden(frame.origin);
+                        child.place(frame, fit, &env, out);
+                        out.pop_hidden();
+                    }
+                    return;
+                }
                 // the animator paints the value in flight, never the
                 // target — it seeds, retargets and snaps behind this
                 let animated = |slot, color| match (colors, env.animator) {
@@ -7827,8 +8333,7 @@ impl LayoutNode {
                 // between open and close). Pixel targets place through:
                 // everything is the pixel pipeline there already.
                 if out.dom.is_some() {
-                    out.saw_island = true;
-                    let start = out.display.len();
+                        let start = out.display.len();
                     if let Some(dom) = out.dom.as_mut() {
                         dom.open_canvas(frame, start);
                     }
@@ -7950,7 +8455,15 @@ impl LayoutNode {
                 // exactly the frame this node was given
                 out.frames.record_named(path, frame);
                 if let Some((_, fit)) = fits.first() {
+                    // the sites placed under this boundary name it as their path
+                    let recording = crate::provenance::recording();
+                    if recording {
+                        out.boundary_stack.push(Rc::from(path.as_str()));
+                    }
                     child.place(frame, fit, env, out);
+                    if recording {
+                        out.boundary_stack.pop();
+                    }
                 }
             }
 
@@ -7992,6 +8505,11 @@ impl LayoutNode {
                     }
                     None => env,
                 };
+                // the sites placed under this boundary name it as their path
+                let recording = crate::provenance::recording();
+                if recording {
+                    out.boundary_stack.push(Rc::clone(path));
+                }
                 if children.len() == 1 {
                     children[0].place(frame, &fits[0].1, env, out);
                 } else {
@@ -8006,6 +8524,9 @@ impl LayoutNode {
                         out,
                     );
                 }
+                if recording {
+                    out.boundary_stack.pop();
+                }
                 if let Some(dom) = out.dom.as_mut() {
                     dom.close();
                 }
@@ -8014,12 +8535,20 @@ impl LayoutNode {
             // skipped boundary: places the RETAINED tree in its place
             // (measure's pair — both phases resolve the SAME retention,
             // the Fit mirrors by construction)
-            (LayoutNode::BoundaryRef { slot, .. }, fit) => {
+            (LayoutNode::BoundaryRef { path, slot, .. }, fit) => {
+                // a retained boundary names the sites under it too
+                let recording = crate::provenance::recording();
+                if recording {
+                    out.boundary_stack.push(Rc::clone(path));
+                }
                 slot.with_layout(|layout| {
                     if let Some(node) = layout {
                         node.place(frame, fit, env, out);
                     }
                 });
+                if recording {
+                    out.boundary_stack.pop();
+                }
             }
 
             (_, Fit::Leaf) => {}
@@ -8190,6 +8719,16 @@ fn measure_split(
 /// child back to be measured a second time.
 const SETTLED: Px = 0.5;
 
+fn position_proposal(proposal: Proposal, at: Option<Point>) -> Proposal {
+    match at {
+        Some(at) => Proposal {
+            width: proposal.width.map(|width| (width - at.x).max(0.0)),
+            height: proposal.height.map(|height| (height - at.y).max(0.0)),
+        },
+        None => proposal,
+    }
+}
+
 /// The stack algorithm: measures everyone ONCE with no restriction on the
 /// main axis (naturals + who is flexible), splits the leftover among the
 /// flexibles and re-measures only those. Shrinking never happens behind
@@ -8237,14 +8776,28 @@ fn measure_stack(
     // phase 1: naturals (unrestricted proposal on the main axis)
     let mut measured: Vec<(Size, Fit)> = children
         .iter()
-        .map(|child| child.measure(cross_proposal(None), env))
+        .map(|child| {
+            child.measure(
+                if child.placed_at().is_some() {
+                    position_proposal(proposal, child.placed_at())
+                } else {
+                    cross_proposal(None)
+                },
+                env,
+            )
+        })
         .collect();
 
-    let spacing_total = spacing * children.len().saturating_sub(1) as Px;
+    let spacing_total = spacing
+        * children
+            .iter()
+            .filter(|child| child.placed_at().is_none())
+            .count()
+            .saturating_sub(1) as Px;
     let flexible: Vec<usize> = children
         .iter()
         .enumerate()
-        .filter(|(_, child)| child.is_flexible(axis, Some(axis)))
+        .filter(|(_, child)| child.placed_at().is_none() && child.is_flexible(axis, Some(axis)))
         .map(|(index, _)| index)
         .collect();
 
@@ -8257,7 +8810,9 @@ fn measure_stack(
         let rigid: Px = measured
             .iter()
             .enumerate()
-            .filter(|(index, _)| !flexible.contains(index))
+            .filter(|(index, _)| {
+                children[*index].placed_at().is_none() && !flexible.contains(index)
+            })
             .map(|(_, (size, _))| main(size))
             .sum();
         let mut budget = (total - rigid - spacing_total).max(0.0);
@@ -8384,10 +8939,13 @@ fn measure_stack(
     };
     let mut cross_max: Px = measured
         .iter()
-        .map(|(size, _)| cross(size))
+        .zip(children)
+        .filter(|(_, child)| child.placed_at().is_none())
+        .map(|((size, _), _)| cross(size))
         .fold(0.0, Px::max);
     for (index, child) in children.iter().enumerate() {
-        if cross(&measured[index].0) >= cross_max - SETTLED
+        if child.placed_at().is_some()
+            || cross(&measured[index].0) >= cross_max - SETTLED
             || !child.is_flexible(cross_axis, Some(axis))
         {
             continue;
@@ -8404,7 +8962,13 @@ fn measure_stack(
         cross_max = cross_max.max(cross(&measured[index].0));
     }
 
-    let main_sum: Px = measured.iter().map(|(size, _)| main(size)).sum::<Px>() + spacing_total;
+    let main_sum: Px = measured
+        .iter()
+        .zip(children)
+        .filter(|(_, child)| child.placed_at().is_none())
+        .map(|((size, _), _)| main(size))
+        .sum::<Px>()
+        + spacing_total;
 
     let size = match axis {
         Axis::Vertical => Size { width: cross_max, height: main_sum },
@@ -9040,7 +9604,11 @@ fn place_stack(
                 .iter()
                 .zip(fits)
                 .map(|(child, (size, _))| {
-                    child.first_baseline(env).unwrap_or(size.height)
+                    if child.placed_at().is_some() {
+                        0.0
+                    } else {
+                        child.first_baseline(env).unwrap_or(size.height)
+                    }
                 })
                 .collect()
         });
@@ -9048,6 +9616,9 @@ fn place_stack(
         .as_ref()
         .map(|baselines| baselines.iter().fold(0.0_f64, |acc, b| acc.max(*b)));
     for (index, (child, (size, fit))) in children.iter().zip(fits).enumerate() {
+        if child.placed_at().is_some() {
+            continue;
+        }
         let cross_offset = |extent: Px, len: Px| match align {
             CrossAlign::Baseline => match (&baselines, shared) {
                 (Some(baselines), Some(shared)) => shared - baselines[index],
@@ -9091,6 +9662,22 @@ fn place_stack(
             Axis::Horizontal => size.width,
         } + spacing;
         if rtl { cursor -= step } else { cursor += step }
+    }
+    for (child, (size, fit)) in children.iter().zip(fits) {
+        if let Some(at) = child.placed_at() {
+            child.place(
+                Rect {
+                    origin: Point {
+                        x: frame.origin.x + at.x,
+                        y: frame.origin.y + at.y,
+                    },
+                    size: *size,
+                },
+                fit,
+                env,
+                out,
+            );
+        }
     }
 }
 
@@ -10655,6 +11242,10 @@ mod tests {
 
     /// Measures a node with the tests' default environment (PixelFont).
     fn measure_with_defaults(node: &LayoutNode, proposal: Proposal) -> Size {
+        measure_fit_with_defaults(node, proposal).0
+    }
+
+    fn measure_fit_with_defaults(node: &LayoutNode, proposal: Proposal) -> (Size, Fit) {
         let engine = PixelFont;
         let images = RawImages::default();
         let cache = MeasureCache::default();
@@ -10679,8 +11270,9 @@ mod tests {
             dialog_frames: None,
             scale: 1.0,
             touch: false,
+            accessibility: false,
         };
-        node.measure(proposal, &env).0
+        node.measure(proposal, &env)
     }
 
     /// Full layout with a pointer stamped into the env — how tests drive
@@ -10716,6 +11308,7 @@ mod tests {
                 dialog_frames: None,
                 scale: 1.0,
                 touch: false,
+            accessibility: false,
             },
         )
     }
@@ -10776,6 +11369,7 @@ mod tests {
             dialog_frames: None,
             scale: 1.0,
             touch: false,
+            accessibility: false,
         };
         let region = |width: Px| LayoutNode::Scroll {
             commanded: None,
@@ -11110,6 +11704,7 @@ mod tests {
             dialog_frames: None,
             scale: 1.0,
             touch: false,
+            accessibility: false,
         };
         let region = || LayoutNode::Scroll {
             commanded: None,
@@ -11185,6 +11780,7 @@ mod tests {
             dialog_frames: None,
             scale: 1.0,
             touch: false,
+            accessibility: false,
         };
 
         let root = LayoutNode::Scroll {
@@ -11315,6 +11911,25 @@ mod tests {
             DrawCommand::StrokeRect { color, width, .. }
                 if *color == Color::hex(0x445566) && *width == 2.0
         ));
+    }
+
+    #[test]
+    fn nested_styles_do_not_duplicate_the_child_measure_tree() {
+        let proposal = Proposal::exact(Size { width: 320.0, height: 240.0 });
+        for child in [text(8), stack(Axis::Vertical, CrossAlign::Start, vec![text(3), text(7)])] {
+            let (size, fit) = measure_fit_with_defaults(&child, proposal);
+            let original = layout(&child, proposal);
+            let mut wrapped = child;
+            for _ in 0..16 {
+                wrapped = styled(VisualProps::default(), wrapped);
+                let (styled_size, styled_fit) = measure_fit_with_defaults(&wrapped, proposal);
+                assert_eq!(styled_size, size);
+                assert!(styled_fit.same_as(&fit),
+                    "transparent styles must reuse the child's fit, not allocate another boxed tree");
+                assert_eq!(layout(&wrapped, proposal).display.as_slice(), original.display.as_slice(),
+                    "removing measure wrappers cannot change placement or pixels");
+            }
+        }
     }
 
     #[test]

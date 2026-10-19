@@ -100,6 +100,38 @@ impl Notification {
     }
 }
 
+/// Who the app is to the platform: the name a person reads and the
+/// reverse-DNS id the desktop files it under — a Wayland `app_id`, a
+/// Windows taskbar group, the `.desktop` file that matches it. A
+/// bundled platform (macOS, iOS, Android) reads both from its bundle;
+/// a bare binary has only what the app says here. `bunny_ui::app!`
+/// says it before the window opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Identity {
+    /// What a person reads: the window's title unless the app gives
+    /// another, the sender of its notifications.
+    pub name: &'static str,
+    /// The reverse-DNS id (`com.example.notes`), when the app has one.
+    pub id: Option<&'static str>,
+    /// The app's own version (`1.4.0`).
+    pub version: &'static str,
+}
+
+static IDENTITY: OnceLock<Identity> = OnceLock::new();
+
+/// Says who the app is — once. The first call wins and answers `true`;
+/// a later one (an Android activity created again in the same process)
+/// changes nothing and answers `false`.
+pub fn set_identity(identity: Identity) -> bool {
+    IDENTITY.set(identity).is_ok()
+}
+
+/// Who the app said it is, or `None` when it never said — a shell then
+/// names it after its executable, as it always did.
+pub fn identity() -> Option<Identity> {
+    IDENTITY.get().copied()
+}
+
 /// The senders the app handed over — every event goes to each of
 /// them, from whichever thread the platform speaks on.
 static SUBSCRIBERS: Mutex<Vec<Sender<AppEvent>>> = Mutex::new(Vec::new());
@@ -348,6 +380,16 @@ mod tests {
         });
         assert_eq!(notify(&letter), Ok(()));
         assert_eq!(notify(&Notification::new("x", "", "")), Err(String::from("no title")));
+    }
+
+    /// The app says who it is once; a second word is refused, not
+    /// mixed in — the shells read one identity for the whole process.
+    #[test]
+    fn the_first_identity_holds() {
+        let notes = Identity { name: "Notes", id: Some("com.example.notes"), version: "1.4.0" };
+        assert!(set_identity(notes));
+        assert!(!set_identity(Identity { name: "Other", id: None, version: "0.0.1" }));
+        assert_eq!(identity(), Some(notes));
     }
 
     /// The first caller holds the name; a later launch's arguments

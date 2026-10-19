@@ -28,6 +28,13 @@
 //! have been views loses the browser's text selection, its accessibility
 //! and its zero-patch hover.
 
+/// A context menu anchored at its logical position.
+type ContextMenu = (Point, Rc<[crate::views::MenuItem]>);
+#[cfg(test)]
+type PaintObservation = Rc<std::cell::Cell<Option<(Rect, FontSpec, Color)>>>;
+#[cfg(test)]
+type KeyObservation = Rc<std::cell::RefCell<Vec<(crate::action::Key, Option<char>)>>>;
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -522,6 +529,48 @@ impl<'a> Painter<'a> {
         self.fill_rounded(rect, color, 0.0);
     }
 
+    /// Paints a whole display list here, every command shifted to this
+    /// painter's origin — what a tool that shows frames another process
+    /// rendered calls, with the list it decoded off the wire.
+    pub fn draw_list(&mut self, display: &DisplayList) {
+        for command in display.iter() {
+            let shifted = match command.clone() {
+                DrawCommand::FillRect { rect, color, corner_radius } => {
+                    DrawCommand::FillRect { rect: self.shift(rect), color, corner_radius }
+                }
+                DrawCommand::Gradient { rect, paint, corner_radius } => DrawCommand::Gradient {
+                    rect: self.shift(rect),
+                    paint: match paint {
+                        crate::layout::GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
+                            crate::layout::GradientPaint::Radial { center: self.at(center), start, end, aspect, inner, outer }
+                        }
+                        crate::layout::GradientPaint::Linear { start, end, from, to } => {
+                            crate::layout::GradientPaint::Linear { start: self.at(start), end: self.at(end), from, to }
+                        }
+                    },
+                    corner_radius,
+                },
+                DrawCommand::Backdrop { rect, mut glass, corner_radius } => {
+                    glass.spot_center = self.at(glass.spot_center);
+                    DrawCommand::Backdrop { rect: self.shift(rect), glass, corner_radius }
+                }
+                DrawCommand::Shadow { rect, radius, color, corner_radius } => {
+                    DrawCommand::Shadow { rect: self.shift(rect), radius, color, corner_radius }
+                }
+                DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
+                    DrawCommand::StrokeRect { rect: self.shift(rect), color, width, corner_radius }
+                }
+                DrawCommand::TextLine { origin, content, range, color, font } => {
+                    DrawCommand::TextLine { origin: self.at(origin), content, range, color, font }
+                }
+                DrawCommand::Image { rect, source } => DrawCommand::Image { rect: self.shift(rect), source },
+                DrawCommand::PushClip { rect, corner_radius } => DrawCommand::PushClip { rect: self.shift(rect), corner_radius },
+                DrawCommand::PopClip => DrawCommand::PopClip,
+            };
+            self.display.push(shifted);
+        }
+    }
+
     /// A rectangle with rounded corners (anti-aliased, like every
     /// background in the framework).
     ///
@@ -539,6 +588,16 @@ impl<'a> Painter<'a> {
             color,
             corner_radius: corner_radius.into(),
         });
+    }
+
+    /// A filled ellipse inscribed in `rect`, using the shared vector pipeline.
+    pub fn fill_ellipse(&mut self, rect: Rect, color: Color) {
+        if let Some(source) = crate::shapes::ellipse_source(rect.size, color) {
+            self.display.push(DrawCommand::Image {
+                rect: self.shift(rect),
+                source,
+            });
+        }
     }
 
     /// A border painted INWARD from the edge.
@@ -843,10 +902,13 @@ pub enum ElementEvent {
         modifiers: crate::action::Modifiers,
         phase: WheelPhase,
     },
-    /// The pointer left the box (or the window).
+    /// The pointer left the box: for another target, for bare glass, or
+    /// out of the window. A box that keeps a hover of its own ends it here.
     PointerExited,
     /// A keystroke, while the box has focus — arrows, Enter, Tab and
-    /// the shortcuts, exactly as the keymap spells them. What the box
+    /// the shortcuts, exactly as the keymap spells them. Escape also reaches
+    /// a box that currently captures the pointer, before the focused box;
+    /// handling it ends that capture without a release action. What the box
     /// ignores goes on to the app's key bindings.
     ///
     /// The stroke carries BOTH questions: `pattern` names the key, and
@@ -972,7 +1034,7 @@ pub struct EventCtx<'a> {
     /// AFTER the box has answered — nothing of the scene is borrowed
     /// while the app is talking, which is the rule every door into a
     /// box already lives by.
-    pub(crate) menu: &'a RefCell<Option<(Point, Rc<[crate::views::MenuItem]>)>>,
+    pub(crate) menu: &'a RefCell<Option<ContextMenu>>,
     /// Which way the scene around the box reads — the same answer its
     /// paint was given ([`PaintCtx::direction`]), so a box that put a
     /// gutter on the leading edge hit-tests it on the same side.
@@ -1160,7 +1222,6 @@ mod tests {
     use crate::state_ext::StateExt;
     use crate::view::{Component, Either};
     use motor::state::State;
-    use motor::state::Context as ViewContext;
 
     /// A surface that fills itself and remembers what it was told.
     struct Bar {
@@ -1169,7 +1230,7 @@ mod tests {
     }
 
     impl Bar {
-        fn new(color: Color) -> (Bar, Rc<Cell<Option<(Rect, FontSpec, Color)>>>) {
+        fn new(color: Color) -> (Bar, PaintObservation) {
             let seen = Rc::new(Cell::new(None));
             (Bar { color, seen: Rc::clone(&seen) }, seen)
         }
@@ -1324,7 +1385,7 @@ mod tests {
             color: Color,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 custom(Bar { color: Color::FILL, seen: self.seen })
                     .foreground_color(self.color)
@@ -1346,7 +1407,7 @@ mod tests {
         #[derive(Clone)]
         struct Screen;
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 canvas(|ctx, painter| painter.fill(ctx.bounds(), Color::FILL))
             }
         }
@@ -1365,7 +1426,7 @@ mod tests {
         #[derive(Clone)]
         struct Screen;
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 canvas(|ctx, painter| painter.fill(ctx.bounds(), Color::hex(0x3B82F6)))
                     .frame(40.0, 20.0)
@@ -1387,7 +1448,7 @@ mod tests {
         let islands = runtime.dom_islands(1);
         assert_eq!(islands.len(), 1);
         assert!(
-            islands[0].rgba.chunks_exact(4).any(|pixel| pixel[3] > 0),
+            islands[0].rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 0),
             "the island carries the app's ink"
         );
         // a second frame with nothing changed asks for no pixels
@@ -1428,7 +1489,7 @@ mod tests {
             log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 custom(Recorder::new(&self.log))
                     .frame(80.0, 40.0)
@@ -1470,7 +1531,7 @@ mod tests {
             fired: Rc<Cell<bool>>,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 let fired = Rc::clone(&self.fired);
                 crate::zstack!(
                     crate::views::button(crate::views::text("under"), move || fired.set(true)),
@@ -1495,7 +1556,7 @@ mod tests {
             takes_wheel: Rc<Cell<bool>>,
         }
         impl Component for Scrolled {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 let (log, takes_wheel) = (self.log, self.takes_wheel);
                 crate::views::list(
@@ -1539,7 +1600,7 @@ mod tests {
             log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
         }
         impl Component for Page {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 let log = self.log;
                 crate::views::scroll(crate::vstack!(
@@ -1581,7 +1642,7 @@ mod tests {
             log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 custom(Recorder::new(&self.log))
             }
         }
@@ -1600,6 +1661,51 @@ mod tests {
         );
         runtime.pointer_exited();
         assert_eq!(log.borrow().last(), Some(&ElementEvent::PointerExited));
+    }
+
+    /// A box hears the pointer leave for ANOTHER view, not only for the
+    /// window's edge: a hover it keeps for itself would otherwise stay lit
+    /// after the hand moved on to a neighbour. Once per departure, and the
+    /// way back in is an ordinary move.
+    #[test]
+    fn a_move_onto_a_neighbour_tells_the_box_the_pointer_left() {
+        #[derive(Clone)]
+        struct Screen {
+            log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
+        }
+        impl Component for Screen {
+            fn body(self) -> impl View {
+                use crate::ext::ViewExt;
+                crate::hstack!(
+                    custom(Recorder::new(&self.log)).frame(40.0, 40.0),
+                    crate::views::text("next").frame(40.0, 40.0).on_click(|| {}),
+                    crate::views::spacer().frame(40.0, 40.0),
+                )
+                .spacing(0.0)
+            }
+        }
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let runtime = Runtime::new();
+        let view = Screen { log: Rc::clone(&log) };
+        runtime.layout(&view, Proposal { width: Some(120.0), height: Some(40.0) });
+        let exits = || {
+            log.borrow().iter().filter(|event| **event == ElementEvent::PointerExited).count()
+        };
+        runtime.pointer_moved(12.0, 8.0, false);
+        assert!(matches!(log.borrow().last(), Some(ElementEvent::PointerMoved { .. })));
+        // onto the neighbour target
+        runtime.pointer_moved(52.0, 8.0, false);
+        assert_eq!(log.borrow().last(), Some(&ElementEvent::PointerExited));
+        assert_eq!(exits(), 1);
+        // moving about on the neighbour tells the box nothing more
+        runtime.pointer_moved(60.0, 20.0, false);
+        assert_eq!(exits(), 1, "once per departure");
+        // back in, and out again onto bare glass
+        runtime.pointer_moved(12.0, 8.0, false);
+        assert!(matches!(log.borrow().last(), Some(ElementEvent::PointerMoved { .. })));
+        runtime.pointer_moved(100.0, 8.0, false);
+        assert_eq!(log.borrow().last(), Some(&ElementEvent::PointerExited));
+        assert_eq!(exits(), 2);
     }
 
     /// PAIN-88: a painted scene has no views inside it, and the choice
@@ -1648,7 +1754,7 @@ mod tests {
         }
 
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 // inset, so the box's own point is NOT the scene's
                 use crate::ext::ViewExt as _;
                 custom(Canvas { minted: Rc::clone(&self.minted) }).padding_length(20.0)
@@ -1741,7 +1847,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Screen;
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 custom(Sheet)
             }
         }
@@ -1802,7 +1908,7 @@ mod tests {
             reach: bool,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 // the grip over the middle of the cells: (94, 44) to (106, 56)
                 crate::zstack!(custom(Cells), custom(Grip { reach: self.reach }).frame(12.0, 12.0))
@@ -1859,7 +1965,7 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Screen;
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 use crate::views::{button, text};
                 let button = |label: &'static str| button(text(label), || {});
@@ -1949,7 +2055,7 @@ mod tests {
             editor: MiniEditor,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 // the editor on 0..40, the chrome on 40..46, a plain box on 46..52
                 crate::vstack!(
@@ -1992,7 +2098,7 @@ mod tests {
             log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 custom(Recorder::new(&self.log))
             }
         }
@@ -2045,7 +2151,7 @@ mod tests {
     /// walks the ordinary road — and it writes down what each one typed.
     #[derive(Clone, Default)]
     struct Commander {
-        seen: Rc<std::cell::RefCell<Vec<(crate::action::Key, Option<char>)>>>,
+        seen: KeyObservation,
         pressed: Rc<std::cell::RefCell<Vec<crate::action::Modifiers>>>,
     }
 
@@ -2081,7 +2187,7 @@ mod tests {
     }
 
     impl Component for Commanding {
-        fn body(self, _ctx: &ViewContext) -> impl View {
+        fn body(self) -> impl View {
             use crate::ext::ViewExt;
             custom(self.box_).frame(200.0, 40.0)
         }
@@ -2253,7 +2359,7 @@ mod tests {
     }
 
     impl Component for Editing {
-        fn body(self, _ctx: &ViewContext) -> impl View {
+        fn body(self) -> impl View {
             use crate::ext::ViewExt;
             crate::vstack!(
                 crate::views::text("above"),
@@ -2287,7 +2393,7 @@ mod tests {
         // the strokes come through the gate's door
         assert!(
             runtime
-                .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Backspace))
+                .key_stroke(crate::action::KeyPattern::key(crate::action::Key::Backspace))
                 .handled
         );
         assert_eq!(&*editor.text.borrow(), "let ");
@@ -2305,7 +2411,10 @@ mod tests {
         const NEXT: crate::action::ActionId = crate::action::ActionId("test.next");
         let pattern = crate::action::KeyPattern::key(crate::action::Key::Down);
         runtime.bind(pattern, NEXT);
-        assert!(!runtime.key_stroke(&pattern).handled, "the editor ignores Down");
+        assert!(
+            !runtime.key_stroke(pattern).handled,
+            "the editor ignores Down"
+        );
         assert_eq!(runtime.match_key(&pattern), Some(NEXT), "so the keymap answers");
     }
 
@@ -2388,7 +2497,7 @@ mod tests {
             editor: MiniEditor,
         }
         impl Component for Beating {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 crate::vstack!(
                     crate::views::text("above"),
@@ -2421,7 +2530,7 @@ mod tests {
             log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 custom(Recorder::new(&self.log))
             }
         }
@@ -2434,7 +2543,7 @@ mod tests {
         assert_eq!(runtime.focused(), None);
         assert!(
             !runtime
-                .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Enter))
+                .key_stroke(crate::action::KeyPattern::key(crate::action::Key::Enter))
                 .handled,
             "no focus, no keys"
         );
@@ -2463,7 +2572,7 @@ mod tests {
             gone: State<bool>,
         }
         impl Component for Screen {
-            fn body(self, _ctx: &ViewContext) -> impl View {
+            fn body(self) -> impl View {
                 use crate::ext::ViewExt;
                 if self.gone.get() {
                     Either::Second(crate::views::text("the box left"))

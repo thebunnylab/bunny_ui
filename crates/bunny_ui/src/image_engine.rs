@@ -714,7 +714,7 @@ fn fade_raster(
     }
     let source = raster_source(engine, inner, width, height)?;
     let mut rgba = source.rgba.clone();
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel[3] = ((pixel[3] as u32 * alpha as u32 + 127) / 255) as u8;
     }
     let faded = Rc::new(ImageRaster { width: source.width, height: source.height, rgba });
@@ -1102,7 +1102,7 @@ impl RawImages {
         let mut rgba = vec![0u8; width * height * 4];
         for y in 0..height {
             for x in 0..width {
-                let color = if (x / cell + y / cell) % 2 == 0 { light } else { dark };
+                let color = if (x / cell + y / cell).is_multiple_of(2) { light } else { dark };
                 let to = (y * width + x) * 4;
                 rgba[to..to + 4].copy_from_slice(&color);
             }
@@ -1287,7 +1287,13 @@ mod tests {
         let faded = raster_source(&engine, &half, 24, 24).expect("so does the veil over it");
         assert_eq!(full.width, faded.width);
         let alphas = |raster: &ImageRaster| -> Vec<u8> {
-            raster.rgba.chunks_exact(4).map(|pixel| pixel[3]).collect()
+            raster
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|pixel| pixel[3])
+                .collect()
         };
         let (before, after) = (alphas(&full), alphas(&faded));
         assert!(before.iter().any(|alpha| *alpha > 200), "the mark is there to fade");

@@ -111,7 +111,7 @@ struct Composer {
 }
 
 impl Component for Composer {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let (scheme, body, pasted, read) = (self.scheme, self.body, self.pasted, self.read);
         let (fetched, commits) = (self.fetched, self.commits);
         let (port, hits, handle) = (self.port, self.hits, self.handle);

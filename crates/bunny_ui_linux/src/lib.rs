@@ -219,9 +219,8 @@ impl WindowSpec {
     }
 }
 
-/// A window's handle in an [`App`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub struct WindowId(usize);
+use bunny_ui::window::Lifecycle;
+pub use bunny_ui::window::{CloseAction, WindowError, WindowId, WindowVisibility};
 
 /// Whether this shell opens more than one window at a time — it does:
 /// one poll loop, a `wl_surface` (or an xcb window) each, a presenter
@@ -253,6 +252,7 @@ pub struct App {
 /// gate, the crown's gates. The app installs ONE of each with the
 /// door and routes by the window the event arrived at.
 struct Slot {
+    lifecycle: Rc<Lifecycle>,
     window: usize,
     handle: ffi::WindowHandle,
     /// The window's own scene — what a locale the app pins reaches.
@@ -261,6 +261,7 @@ struct Slot {
     key_gate: RefCell<Box<dyn FnMut(&ffi::KeyStroke) -> bool>>,
     drag_gate: Box<dyn Fn(f64, f64) -> bool>,
     control_gate: Box<dyn Fn(f64, f64) -> Option<ffi::ControlHit>>,
+    _accessibility_refresh: Rc<dyn Fn()>,
 }
 
 struct AppInner {
@@ -280,6 +281,20 @@ impl AppInner {
         if self.routed.replace(true) {
             return;
         }
+        let closing = App {
+            inner: Rc::clone(self),
+        };
+        ffi::set_close_gate(Rc::new(move |window| {
+            let id = closing
+                .inner
+                .live()
+                .iter()
+                .find(|slot| slot.window == window)
+                .map(|slot| slot.lifecycle.id());
+            id.is_some_and(|id| {
+                closing.close_decision(id) == Ok(CloseAction::Close) && closing.slot(id).is_some()
+            })
+        }));
         let app = Rc::clone(self);
         ffi::set_handler(Box::new(move |event| {
             let source = ffi::event_source();
@@ -370,18 +385,136 @@ impl App {
         self.inner.route();
         (slot.handler.borrow_mut())(AppEvent::Redraw);
         ffi::show_window(slot.handle);
-        WindowId(slot.window)
+        slot.lifecycle.id()
     }
 
     /// Closes the window. The last one out quits the app.
     pub fn close(&self, id: WindowId) {
-        ffi::close_top_level(id.0);
-        self.inner.buried(id.0);
+        if let Some(slot) = self.slot(id) {
+            ffi::close_top_level(slot.window);
+            self.inner
+                .slots
+                .borrow_mut()
+                .retain(|live| live.lifecycle.id() != id);
+        }
     }
 
     /// The windows the app has open, oldest first.
     pub fn windows(&self) -> Vec<WindowId> {
-        self.inner.slots.borrow().iter().map(|slot| WindowId(slot.window)).collect()
+        self.inner
+            .slots
+            .borrow()
+            .iter()
+            .map(|slot| slot.lifecycle.id())
+            .collect()
+    }
+
+    fn slot(&self, id: WindowId) -> Option<Rc<Slot>> {
+        self.inner
+            .slots
+            .borrow()
+            .iter()
+            .find(|slot| slot.lifecycle.id() == id)
+            .cloned()
+    }
+
+    /// Hides a live window without destroying its scene. Repeating it is harmless.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn hide(&self, id: WindowId) -> Result<(), WindowError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        let previous = slot.lifecycle.set_hidden(true);
+        let result = ffi::set_window_visibility(slot.window, WindowVisibility::Hidden);
+        if result.is_err() {
+            slot.lifecycle.set_hidden(previous);
+        }
+        result
+    }
+
+    /// Shows a retained window and requests activation, subject to OS policy.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn show(&self, id: WindowId) -> Result<(), WindowError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        ffi::set_window_visibility(slot.window, WindowVisibility::Shown)?;
+        slot.lifecycle.set_hidden(false);
+        slot.runtime.request_frame();
+        ffi::wake_from_any_thread();
+        Ok(())
+    }
+
+    /// Reports native visibility; this does not mean unobscured or focused.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn visibility(&self, id: WindowId) -> Result<WindowVisibility, WindowError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        ffi::window_visibility(slot.window)
+    }
+
+    /// Replaces a window's user-close policy. Explicit [`App::close`] bypasses it.
+    /// Return Cancel while an asynchronous save decision is pending. A callback
+    /// may replace/remove itself or close/open windows; recursive requests for
+    /// the same window fail with [`WindowError::CloseInProgress`].
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn on_close_requested(
+        &self,
+        id: WindowId,
+        handler: impl FnMut(WindowId) -> CloseAction + 'static,
+    ) -> Result<(), WindowError> {
+        self.slot(id)
+            .ok_or(WindowError::StaleWindow)?
+            .lifecycle
+            .on_close(handler);
+        Ok(())
+    }
+
+    /// Restores default Close handling for subsequent user-close requests.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn clear_close_handler(&self, id: WindowId) -> Result<(), WindowError> {
+        self.slot(id)
+            .ok_or(WindowError::StaleWindow)?
+            .lifecycle
+            .clear();
+        Ok(())
+    }
+
+    fn close_decision(&self, id: WindowId) -> Result<CloseAction, WindowError> {
+        let action = self
+            .slot(id)
+            .ok_or(WindowError::StaleWindow)?
+            .lifecycle
+            .decide()?;
+        if action == CloseAction::Hide && self.slot(id).is_some() {
+            self.hide(id)?;
+        }
+        Ok(action)
+    }
+
+    /// Requests closure through the same policy as the native close button.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    /// Same-window callback recursion returns [`WindowError::CloseInProgress`].
+    pub fn request_close(&self, id: WindowId) -> Result<CloseAction, WindowError> {
+        let action = self.close_decision(id)?;
+        if action == CloseAction::Close {
+            self.close(id);
+        }
+        Ok(action)
+    }
+
+    /// Explicitly tears down every window, bypassing user-close policies.
+    pub fn quit(&self) {
+        for id in self.windows() {
+            self.close(id);
+        }
     }
 
     /// Pins the language every window reads — over the environment's,
@@ -476,7 +609,7 @@ struct WindowRoot<V: View> {
 }
 
 impl<V: View> bunny_ui::view::Component for WindowRoot<V> {
-    fn body(self, _ctx: &bunny_ui::prelude::Context) -> impl View {
+    fn body(self) -> impl View {
         self.root
     }
 }
@@ -566,6 +699,7 @@ struct DialogWindow {
 /// as long as it does — the frame path, the pools, the gates and the
 /// event handler — into a slot the app routes to.
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
+    let lifecycle = Rc::new(Lifecycle::default());
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
     runtime.drop_unseen();
@@ -581,6 +715,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             min: spec.min.map(|min| (min.width, min.height)),
         },
     );
+    let accessibility = ffi::accessibility::Accessibility::new(Rc::clone(&runtime), window.raw_window());
     // the bar: the compositor's where it offers one, the house's own
     // where it does not — decided BEFORE the GPU installs, because the
     // crown's corners want an alpha ground
@@ -642,10 +777,16 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // present takes a READY display list to the window — the tick path
     // reuses it without paying settle or effects
     let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList)> = Rc::new({
+        let lifecycle = Rc::clone(&lifecycle);
         let surface = Rc::clone(&surface);
         let panels = Rc::clone(&panels);
         let dialogs = Rc::clone(&dialogs);
+        let accessibility = Rc::clone(&accessibility);
+        let title = spec.title.to_string();
         move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| {
+            if lifecycle.is_hidden() {
+                return;
+            }
             (|| {
             let (width, height) = window.content_size();
             let scale = window.scale();
@@ -878,6 +1019,32 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 }
             }
             })();
+            // Decorator after every pixel path, including GPU early returns.
+            // Register every surface even before semantic capture is requested.
+            let (width, height) = window.content_size();
+            let mut semantic_surfaces = vec![ffi::accessibility::Surface {
+                key: None, handle: window,
+                origin: bunny_ui::layout::Point { x: 0.0, y: 0.0 },
+                size: Size { width, height }, title: title.clone(),
+            }];
+            for overlay in runtime.overlays() {
+                let dialog = dialogs.borrow().get(&overlay.path).copied();
+                let panel = panels.borrow().get(&overlay.path).copied();
+                let (handle, origin, size) = if let Some(dialog) = dialog {
+                    (dialog.handle, dialog.origin, overlay.frame.size)
+                } else if let Some(panel) = panel {
+                    const BLEED: f64 = 32.0;
+                    (panel, bunny_ui::layout::Point { x: overlay.frame.origin.x - BLEED, y: overlay.frame.origin.y - BLEED },
+                        Size { width: overlay.frame.size.width + 2.0 * BLEED, height: overlay.frame.size.height + 2.0 * BLEED })
+                } else { continue };
+                let title = match &overlay.surface {
+                    bunny_ui::layout::OverlaySurface::Window(spec) => spec.title.to_string(),
+                    bunny_ui::layout::OverlaySurface::Alert(spec) => spec.title.to_string(),
+                    bunny_ui::layout::OverlaySurface::Layer => String::new(),
+                };
+                semantic_surfaces.push(ffi::accessibility::Surface { key: Some(overlay.path), handle, origin, size, title });
+            }
+            accessibility.publish(semantic_surfaces);
             // the page's next frame comes after this one went up: the
             // engine is paced by the shell's own present
             webview::frame_presented(window.raw_window());
@@ -887,10 +1054,16 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // no news draws nothing — the same shape the mac shell keeps
     let pacer = Rc::new(FramePacer::new());
     let blit = {
+        let lifecycle = Rc::clone(&lifecycle);
         let present = Rc::clone(&present);
         let pacer = Rc::clone(&pacer);
         let dialogs = Rc::clone(&dialogs);
         move |runtime: &Runtime, root: &_, via: u8| {
+            // Hidden windows retain tasks/state, but must not re-show child surfaces.
+            if lifecycle.is_hidden() {
+                return;
+            }
+
             let _ = via;
             let (width, height) = window.content_size();
             // a box that draws parts which TOUCH puts the shared edge
@@ -1026,6 +1199,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // frame that presented nothing still tells the driver what it
     // wants, which is what starts the beat after a cold wait.
     let unpaced = std::env::var("BUNNY_PACING").is_ok_and(|value| value == "off");
+    let accessibility_refresh: Rc<dyn Fn()> = Rc::new({
+        let runtime = Rc::clone(&runtime);
+        let root = Rc::clone(&root);
+        let blit = blit.clone();
+        move || blit(&runtime, &*root, ORIGIN_REDRAW)
+    });
+    accessibility.set_refresh(&accessibility_refresh);
     let soon = {
         let blit = blit.clone();
         let pacer = Rc::clone(&pacer);
@@ -1201,6 +1381,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let handler_pacer = Rc::clone(&pacer);
     let handler_dialogs = Rc::clone(&dialogs);
     let held = Cell::new(Modifiers::NONE);
+    let handler_lifecycle = Rc::clone(&lifecycle);
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
@@ -1263,7 +1444,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // the user switched away: popovers close like the
                 // platform's own, and a page lets the keyboard go
                 webview::unfocus();
-                if runtime.dismiss_all_overlays() {
+                if !handler_lifecycle.is_hidden() && runtime.dismiss_all_overlays() {
                     blit(runtime, root, ORIGIN_KEY);
                 }
             }
@@ -1497,6 +1678,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // this slot's own handler, then shown — on wayland the first
     // presenting commit IS the reveal, so the window never flashes
     Rc::new(Slot {
+        lifecycle,
         window: window.raw_window(),
         handle: window,
         runtime,
@@ -1504,6 +1686,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         key_gate: RefCell::new(key_gate),
         drag_gate,
         control_gate,
+        _accessibility_refresh: accessibility_refresh,
     })
 }
 

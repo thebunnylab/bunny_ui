@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# For an app, `bunny run -d ios` does this (crates/bunny_cli); this lane builds the framework's own examples.
 # An example of the iOS shell on the iOS Simulator: build it for
 # aarch64-apple-ios-sim, assemble the unsigned .app (the simulator
 # installs those), install and launch. No Xcode project — a real device

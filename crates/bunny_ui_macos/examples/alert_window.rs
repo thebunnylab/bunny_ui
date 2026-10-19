@@ -35,7 +35,7 @@ struct Page {
 }
 
 impl Component for Page {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let (asking, long, reached, answered) = (self.asking, self.long, self.reached, self.answered);
         vstack!(
             text("The page behind the alert").font(Font::Title),

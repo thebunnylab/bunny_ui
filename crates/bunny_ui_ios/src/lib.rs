@@ -494,13 +494,12 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                         host.visible.size.width,
                         host.visible.size.height,
                     ),
-                    || webview::create(&host.path, &host.spec),
+                    |place| webview::create_placed(&host.path, &host.spec, place),
                     |child, _stamp| webview::update(&host.path, child, &host.spec),
                 );
             }
             let alive: Vec<String> = hosts.iter().map(|host| host.path.clone()).collect();
             ffi::host_sweep(&alive);
-            webview::sweep(&alive);
             // the sandwich: what painted ABOVE a host leaves the
             // drawable's present and composites on a segment surface
             // over the island (the desktops' law, without the drag they
@@ -774,6 +773,9 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
             use webview::WebviewEvent;
             let woke = match event {
                 WebviewEvent::Navigated { path, url } => runtime.webview_navigated(&path, &url),
+                // the finish is the Mac desk's beat (`bunny_ui_macos::pictures`):
+                // the app hears the commit, and the page's own events after it
+                WebviewEvent::Loaded { .. } => false,
                 WebviewEvent::Linked { path, url } => runtime.webview_linked(&path, &url),
                 WebviewEvent::Changed { path, html } => runtime.webview_changed(&path, &html),
                 WebviewEvent::Pasted { path, html, text } => {

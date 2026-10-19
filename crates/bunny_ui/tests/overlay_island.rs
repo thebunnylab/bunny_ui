@@ -3,6 +3,8 @@
 //! out of the scene, and repainted alone when a write reaches only what
 //! it read. Where no layer can, the box paints it inline as it always did.
 
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use bunny_ui::custom::{CustomElement, PaintCtx, Painter, custom};
 use bunny_ui::layout::{Color, DrawCommand, Point, Proposal, Rect, Size};
 use bunny_ui::prelude::*;

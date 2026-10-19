@@ -8,9 +8,15 @@ use crate::hash::FxHashMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
+/// Read-only, bounded observations of actual state storage.
+pub mod observation;
+
 /// A side effect collected while rendering (drained by `Runtime::pump`).
 /// Returns whether it observed a state change (i.e. a re-render is due).
 pub type EffectFn = Rc<dyn Fn(&Context) -> bool>;
+
+/// Application query lookup by declared model name.
+pub type QuerySource = Rc<dyn Fn(&'static str) -> Option<Rc<dyn Any>>>;
 
 /// `\.locale` — the languages the reader asked for, best first, as one
 /// normalized BCP-47 list: `"pt-BR,en-US,en"`.
@@ -471,7 +477,7 @@ pub struct EnvironmentValues {
     /// `\.injected` — `Rc<DIContainer>` in the app.
     pub injected: Option<Rc<dyn Any>>,
     /// `\.modelContext` stand-in: resolves `Query<T>` sources by type name.
-    pub querySource: Option<Rc<dyn Fn(&'static str) -> Option<Rc<dyn Any>>>>,
+    pub querySource: Option<QuerySource>,
 }
 
 /// Render-time context: environment values + collected effects.
@@ -491,6 +497,41 @@ impl Context {
     pub fn environment<T: FromEnvironment>(&self) -> T {
         T::from_environment(&self.values)
     }
+}
+
+thread_local! {
+    static BODY_ENVIRONMENT: RefCell<Option<Rc<EnvironmentValues>>> = const { RefCell::new(None) };
+}
+
+/// Reads the environment of the component whose body is running.
+///
+/// Call this in a component body or a helper called by that body. Capture
+/// the returned value when an event or asynchronous task needs it later.
+///
+/// # Panics
+/// Panics outside a component body; no implicit default environment exists.
+pub fn environment<T: FromEnvironment>() -> T {
+    let values = BODY_ENVIRONMENT.with(|current| current.borrow().clone())
+        .expect("environment() must be called inside a component body; capture the value for callbacks");
+    T::from_environment(&values)
+}
+
+/// Runs a component body in its inherited environment and restores the
+/// enclosing scope, including when the body unwinds.
+#[doc(hidden)]
+pub fn with_environment<R>(ctx: &Context, body: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Rc<EnvironmentValues>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BODY_ENVIRONMENT.with(|current| {
+                current.replace(self.0.take());
+            });
+        }
+    }
+    let _restore = Restore(
+        BODY_ENVIRONMENT.with(|current| current.replace(Some(Rc::clone(&ctx.values)))),
+    );
+    body()
 }
 
 /// `@Environment(\.key) var x: T` — resolvable from `EnvironmentValues`.
@@ -610,6 +651,9 @@ struct TypedSlot<T> {
     /// identity it names the value's content — a reader that kept what it
     /// saw at a count knows nothing changed while the count stands.
     writes: u64,
+    /// None after retirement; a reused arena slot gets a fresh dependency.
+    dep: Option<u64>,
+    constructor: &'static std::panic::Location<'static>,
 }
 
 struct TypedArena<T> {
@@ -622,14 +666,16 @@ impl<T> TypedArena<T> {
         TypedArena { slots: Vec::new(), free: Vec::new() }
     }
 
-    fn alloc(&mut self, value: T) -> (usize, u32) {
+    fn alloc(&mut self, value: T, dep: u64, constructor: &'static std::panic::Location<'static>) -> (usize, u32) {
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index];
             slot.value = Some(value);
             slot.writes += 1;
+            slot.dep = Some(dep);
+            slot.constructor = constructor;
             (index, slot.generation)
         } else {
-            self.slots.push(TypedSlot { generation: 0, value: Some(value), writes: 0 });
+            self.slots.push(TypedSlot { generation: 0, value: Some(value), writes: 0, dep: Some(dep), constructor });
             (self.slots.len() - 1, 0)
         }
     }
@@ -640,6 +686,7 @@ impl<T> TypedArena<T> {
         if let Some(slot) = self.slots.get_mut(index) {
             slot.generation += 1;
             slot.value = None;
+            slot.dep = None;
             self.free.push(index);
         }
     }
@@ -651,17 +698,48 @@ thread_local! {
     /// Every read and write of a state looks its arena up here, so the
     /// key is hashed the cheap way: a `TypeId` is the compiler's, never an
     /// outside caller's.
-    static ARENAS: RefCell<FxHashMap<TypeId, Rc<dyn Any>>> = RefCell::new(FxHashMap::default());
+    static ARENAS: RefCell<FxHashMap<TypeId, Arena>> = RefCell::new(FxHashMap::default());
     /// How the sweep frees without knowing `T`: one function pointer per
     /// type, registered when the arena is born.
     static FREERS: RefCell<FxHashMap<TypeId, fn(usize)>> = RefCell::new(FxHashMap::default());
     static NEXT_DEP: Cell<u64> = const { Cell::new(0) };
 }
 
+/// One type's arena, and — in a debug build — the shape of the type that
+/// made it.
+struct Arena {
+    cell: Rc<dyn Any>,
+    observe: observation::Reader,
+    #[cfg(debug_assertions)]
+    shape: Shape,
+}
+
+/// What a value of the arena's type occupies. A hot reload loads new
+/// code next to the old: a type it edited keeps its `TypeId` when the
+/// build kept its salt, and a value of the old shape read as the new
+/// one is memory read wrong. `bunny run` changes the salt when an edit
+/// reaches a type, so the new type gets an arena of its own; this check
+/// is the guard behind that rule — a size or an alignment that moved
+/// stops the app with a message, not with corrupt memory. It cannot see
+/// a change behind a pointer (`Vec<T>` keeps its size whatever `T` is).
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Shape {
+    size: usize,
+    align: usize,
+    name: &'static str,
+}
+
+#[cfg(debug_assertions)]
+impl Shape {
+    fn of<T>() -> Shape {
+        Shape { size: std::mem::size_of::<T>(), align: std::mem::align_of::<T>(), name: std::any::type_name::<T>() }
+    }
+}
+
 fn with_arena<T: 'static, R>(f: impl FnOnce(&mut TypedArena<T>) -> R) -> R {
     let cell = arena_cell::<T>();
-    let result = f(&mut cell.borrow_mut());
-    result
+    f(&mut cell.borrow_mut())
 }
 
 /// The arena of `T`, borrowed to READ: several reads of one type may
@@ -669,26 +747,42 @@ fn with_arena<T: 'static, R>(f: impl FnOnce(&mut TypedArena<T>) -> R) -> R {
 /// one fails loudly, the rule `update` already keeps.
 fn with_arena_ref<T: 'static, R>(f: impl FnOnce(&TypedArena<T>) -> R) -> R {
     let cell = arena_cell::<T>();
-    let result = f(&cell.borrow());
-    result
+    f(&cell.borrow())
 }
 
 /// The arena of `T`, made on first use.
 fn arena_cell<T: 'static>() -> Rc<RefCell<TypedArena<T>>> {
     ARENAS.with(|arenas| {
         let mut arenas = arenas.borrow_mut();
-        arenas
-            .entry(TypeId::of::<T>())
-            .or_insert_with(|| {
-                FREERS.with(|freers| {
-                    freers.borrow_mut().insert(TypeId::of::<T>(), free_typed::<T>)
-                });
-                Rc::new(RefCell::new(TypedArena::<T>::new())) as Rc<dyn Any>
-            })
+        let arena = arenas.entry(TypeId::of::<T>()).or_insert_with(|| {
+            FREERS.with(|freers| freers.borrow_mut().insert(TypeId::of::<T>(), free_typed::<T>));
+            Arena {
+                cell: Rc::new(RefCell::new(TypedArena::<T>::new())) as Rc<dyn Any>,
+                observe: observation::read_arena::<T>,
+                #[cfg(debug_assertions)]
+                shape: Shape::of::<T>(),
+            }
+        });
+        #[cfg(debug_assertions)]
+        check_shape(arena.shape, Shape::of::<T>());
+        arena
+            .cell
             .clone()
             .downcast::<RefCell<TypedArena<T>>>()
             .expect("an arena registered by TypeId is always its own type")
     })
+}
+
+#[cfg(debug_assertions)]
+fn check_shape(made: Shape, now: Shape) {
+    if made.size != now.size || made.align != now.align {
+        panic!(
+            "`{}` changed its shape while the app ran ({} bytes aligned to {} became {} bytes aligned \
+             to {}): the state the old code made cannot be read by the new code. Restart the app \
+             (R in `bunny run`)",
+            now.name, made.size, made.align, now.size, now.align,
+        );
+    }
 }
 
 fn free_typed<T: 'static>(index: usize) {
@@ -715,7 +809,9 @@ impl<T> Clone for State<T> {
 impl<T> Copy for State<T> {}
 
 impl<T: Clone + 'static> State<T> {
+    #[track_caller]
     pub fn new(value: T) -> Self {
+        let constructor = std::panic::Location::caller();
         match crate::identity::claim_anchor(TypeId::of::<T>()) {
             crate::identity::Claim::Existing { index, generation, dep } => {
                 // identity already mounted: revive the slot, discard the initial
@@ -727,7 +823,7 @@ impl<T: Clone + 'static> State<T> {
                     next.set(dep + 1);
                     dep
                 });
-                let (index, generation) = with_arena::<T, _>(|arena| arena.alloc(value));
+                let (index, generation) = with_arena::<T, _>(|arena| arena.alloc(value, dep, constructor));
                 crate::identity::fulfill_anchor(token, index, generation, dep);
                 State { index, generation, dep, _marker: PhantomData }
             }
@@ -1089,6 +1185,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn body_environment_restores_nested_scopes_even_after_unwind() {
+        let outer = Context {
+            values: Rc::new(EnvironmentValues {
+                locale: Locale::new("pt-BR"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let inner = Context {
+            values: Rc::new(EnvironmentValues {
+                locale: Locale::new("ja"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        with_environment(&outer, || {
+            assert_eq!(environment::<Locale>().identifier(), "pt-BR");
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_environment(&inner, || {
+                    assert_eq!(environment::<Locale>().identifier(), "ja");
+                    panic!("a component failed");
+                });
+            }));
+            assert!(panic.is_err());
+            assert_eq!(environment::<Locale>().identifier(), "pt-BR");
+        });
+        assert!(std::panic::catch_unwind(environment::<Locale>).is_err());
+    }
+
+    #[test]
     fn a_state_binding_lends_its_value_and_a_made_one_reads_it() {
         use std::cell::Cell;
         thread_local! { static CLONES: Cell<usize> = const { Cell::new(0) }; }
@@ -1167,8 +1293,9 @@ mod tests {
 
     #[test]
     fn state_clones_share_storage() {
+        fn clone_handle<T: Clone>(value: &T) -> T { value.clone() }
         let a = State::new(1);
-        let b = a.clone();
+        let b = clone_handle(&a);
         b.set(2);
         assert_eq!(a.wrappedValue(), 2);
     }
@@ -1189,8 +1316,10 @@ mod tests {
     /// them once, leaving every other holder with the values it had.
     #[test]
     fn a_context_copy_shares_its_values_until_one_is_written() {
-        let mut ctx = Context::default();
-        ctx.values = Rc::new(EnvironmentValues { locale: Locale::new("pt-BR"), ..EnvironmentValues::default() });
+        let mut ctx = Context {
+            values: Rc::new(EnvironmentValues { locale: Locale::new("pt-BR"), ..EnvironmentValues::default() }),
+            ..Context::default()
+        };
         let kept = ctx.clone();
         assert!(Rc::ptr_eq(&kept.values, &ctx.values), "a copy shares the values");
         Rc::make_mut(&mut ctx.values).locale = Locale::new("en");
@@ -1334,5 +1463,19 @@ mod tests {
         let values = EnvironmentValues::default();
         assert_eq!(values.layoutDirection, LayoutDirection::LeftToRight);
         assert_eq!(Context::default().environment::<LayoutDirection>(), LayoutDirection::LeftToRight);
+    }
+
+    /// A type that kept its `TypeId` across a hot reload but not its
+    /// size stops the app with the type's name; the same shape passes.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_type_that_changed_shape_stops_the_app() {
+        check_shape(Shape::of::<(u8, u16)>(), Shape::of::<(u8, u16)>());
+        let made = Shape::of::<u8>();
+        let now = Shape { name: "app::Todo", ..Shape::of::<String>() };
+        let stopped = std::panic::catch_unwind(|| check_shape(made, now)).expect_err("a moved size must stop");
+        let message = stopped.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(message.contains("`app::Todo` changed its shape"), "{message}");
+        assert!(message.contains("Restart the app"), "{message}");
     }
 }

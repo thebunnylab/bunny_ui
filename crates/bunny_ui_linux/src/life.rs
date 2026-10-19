@@ -209,8 +209,28 @@ fn notify(notification: &Notification) -> Result<(), String> {
         .map_err(|_| String::from("the notification thread is gone"))
 }
 
-/// This process's name for the desktop — its executable's.
+/// The desktop's handle for this app: the id the app gave
+/// (`bunny_ui::app!` gives it), the name its `.desktop` file carries,
+/// so the dock groups the window under the right icon — or the house
+/// default for an app that never said.
+pub(crate) fn app_id() -> CString {
+    let id = bunny_ui::app::identity().and_then(|identity| identity.id).unwrap_or("bunny_ui");
+    CString::new(id).unwrap_or_default()
+}
+
+/// The same handle as X11 spells it: `WM_CLASS` is the instance and the
+/// class, each NUL-ended, and both are the id.
+pub(crate) fn wm_class() -> Vec<u8> {
+    let id = app_id();
+    [id.as_bytes_with_nul(), id.as_bytes_with_nul()].concat()
+}
+
+/// This process's name for the desktop — the one the app gave, or its
+/// executable's.
 fn app_name() -> CString {
+    if let Some(identity) = bunny_ui::app::identity() {
+        return CString::new(identity.name).unwrap_or_default();
+    }
     let stem = std::env::current_exe()
         .ok()
         .and_then(|path| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))

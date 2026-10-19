@@ -290,8 +290,8 @@ struct Landing {
 }
 
 impl Component for Landing {
-    fn body(self, ctx: &Context) -> impl View {
-        let shape = Shape::of(ctx.environment::<Viewport>().width.max(320.0));
+    fn body(self) -> impl View {
+        let shape = Shape::of(environment::<Viewport>().width.max(320.0));
         scroll(
             vstack!(
                 hero(shape, self.texture.clone()),
@@ -937,7 +937,7 @@ fn rules(shape: Shape) -> impl View<Arity = Single> {
 }
 
 const DEMOS: [(&str, &str); 6] = [
-    ("cargo run -p bunny-ui --example counter_headless", "Prints a small interface to the terminal."),
+    ("cargo run -p bunny-ui-core --example counter_headless", "Prints a small interface to the terminal."),
     ("cargo run -p bunny-ui-macos --example counter_window", "Opens a native macOS window."),
     (
         "cargo run -p bunny-ui-macos --example git_window",

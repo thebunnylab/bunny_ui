@@ -4,6 +4,8 @@
 //! one surface and then another used to have the second one's settle
 //! skipped (its tasks never ran) and its layout answered with the first
 //! surface's frame.
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use bunny_ui::layout::{Proposal, Size};
 use bunny_ui::prelude::*;
 use bunny_ui::runtime::Runtime;
@@ -14,7 +16,7 @@ const SIZE: Size = Size { width: 300.0, height: 100.0 };
 struct First;
 
 impl Component for First {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         text!("first").on_click(|| {}).id("first-root")
     }
 }
@@ -25,7 +27,7 @@ struct Second {
 }
 
 impl Component for Second {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let landed = self.landed;
         text!("second").on_click(|| {}).id("second-root").task(move || async move { landed.set(true) })
     }

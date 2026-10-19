@@ -1,0 +1,39 @@
+   Compiling bunny-ui-preview v0.3.0 (https://github.com/thebunnylab/bunny_ui.git?rev=8412616d51c8deaf1dcb441b20b08390c24b7d93#8412616d)
+   Compiling design-model v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-layers-edits/trinity/domains/code/design-model)
+   Compiling preview-session v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-layers-edits/trinity/domains/code/preview-session)
+   Compiling bunny-cli v0.3.0 (https://github.com/thebunnylab/bunny_ui.git?rev=8412616d51c8deaf1dcb441b20b08390c24b7d93#8412616d)
+   Compiling preview-host-bunny v0.3.0 (/Volumes/Storage/Codex/worktrees/studio-layers-edits/trinity/domains/code/preview-host-bunny)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.35s
+     Running tests/host_roundtrip.rs (target/studio-execution/debug/deps/host_roundtrip-51756ec07252c210)
+
+running 1 test
+
+running 1 test
+@@trinity-host first frame in 11210.6 ms
+
+thread 'the_host_builds_frames_and_leaves_no_process_behind' (33764962) panicked at domains/code/preview-host-bunny/tests/support/source_history.rs:44:10:
+a failed reload must forward the compiler's original diagnostic
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test the_host_builds_frames_and_leaves_no_process_behind ... FAILED
+
+failures:
+
+failures:
+    the_host_builds_frames_and_leaves_no_process_behind
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.42s
+
+
+thread 'the_host_builds_frames_and_leaves_no_process_behind' (33764960) panicked at domains/code/preview-host-bunny/tests/host_roundtrip.rs:81:9:
+isolated host process failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test the_host_builds_frames_and_leaves_no_process_behind ... FAILED
+
+failures:
+
+failures:
+    the_host_builds_frames_and_leaves_no_process_behind
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.42s
+
+error: test failed, to rerun pass `-p preview-host-bunny --test host_roundtrip`

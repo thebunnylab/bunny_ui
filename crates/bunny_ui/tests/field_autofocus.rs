@@ -1,4 +1,6 @@
 //! Auto-focus must show the insertion point before the first edit.
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use bunny_ui::layout::Size;
 use bunny_ui::prelude::*;
 use bunny_ui::text_input::EditCommand;

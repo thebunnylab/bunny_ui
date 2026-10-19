@@ -46,7 +46,7 @@ struct Life {
 }
 
 impl Component for Life {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let (log, answer) = (self.log, self.answer);
         let notify = text("notify")
             .padding_length(12.0)

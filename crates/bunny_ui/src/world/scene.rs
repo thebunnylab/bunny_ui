@@ -138,7 +138,7 @@ impl<C: CameraSource> SceneView<C> {
 }
 
 impl<C: CameraSource> Component for SceneView<C> {
-    fn body(self, _ctx: &motor::state::Context) -> impl View {
+    fn body(self) -> impl View {
         let element: CustomView = custom(SceneElement {
             world: self.world,
             camera: self.camera,
@@ -268,7 +268,7 @@ mod tests {
     }
 
     impl Component for Viewer {
-        fn body(self, _ctx: &motor::state::Context) -> impl View {
+        fn body(self) -> impl View {
             BODIES.with(|bodies| bodies.set(bodies.get() + 1));
             scene_view(self.world, self.camera)
                 .orbit()

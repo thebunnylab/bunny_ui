@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- The app's macOS bundle. `bunny run` wraps the binary in it so
+         what needs a bundle works (notifications, the app's own name in
+         the menu bar); `bunny` fills every @BUNNY_…@ marker from
+         Cargo.toml and leaves the rest as you wrote it. -->
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>@BUNNY_APP_NAME@</string>
+    <key>CFBundleExecutable</key>
+    <string>@BUNNY_EXECUTABLE@</string>
+    <key>CFBundleIdentifier</key>
+    <string>@BUNNY_BUNDLE_ID@</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>@BUNNY_APP_NAME@</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@BUNNY_VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@BUNNY_BUILD@</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+</dict>
+</plist>

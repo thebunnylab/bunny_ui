@@ -14,6 +14,9 @@
 //! time (the cursor is gone by place time). An entry the place stopped
 //! touching belongs to an unmounted node and dies on the next tick.
 
+/// Animated origins keyed by their retained view path.
+type AnimatedOrigins = Vec<(Rc<str>, (f64, f64))>;
+
 use std::rc::Rc;
 
 use crate::layout::Color;
@@ -492,7 +495,7 @@ impl Animator {
     /// Advances every live track by `dt` seconds. Returns what moved
     /// plus the scroll offsets to write back — a settled flight
     /// delivers its final (snapped) value once and leaves.
-    pub(crate) fn tick(&mut self, dt: f64) -> (Ticked, Vec<(Rc<str>, (f64, f64))>) {
+    pub(crate) fn tick(&mut self, dt: f64) -> (Ticked, AnimatedOrigins) {
         let places = self.places;
         let mut moved = Ticked::default();
         self.entries.retain(|_, entry| {

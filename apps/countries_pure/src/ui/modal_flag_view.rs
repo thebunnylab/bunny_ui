@@ -32,7 +32,7 @@ impl Component for ModalFlagView {
     /// (zero-or-one arity) would decorate the nothing when `None` — the
     /// arity in the type forbids that, so the title and the toolbar follow
     /// the content that exists.
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let flag_item = self.country.flag.clone().map(|url| {
             self.clone()
                 .flag_view(url)

@@ -58,14 +58,14 @@ impl CountryDetails {
 }
 
 impl Component for CountryDetails {
-    fn body(self, ctx: &Context) -> impl View {
-        let injected = ctx.environment::<DIContainer>();
-        let locale = ctx.environment::<Locale>();
+    fn body(self) -> impl View {
+        let injected = environment::<DIContainer>();
+        let locale = environment::<Locale>();
         // State is Copy: it leaves the struct before `self` moves into the content
         let routing_state = self.routing_state;
         let title = self.country.name_locale(locale);
 
-        self.content(ctx)
+        self.content()
             .nav_bar_title(title)
             .on_receive(Self::routing_update(&injected), move |routing| {
                 routing_state.set(Routing {
@@ -78,17 +78,17 @@ impl Component for CountryDetails {
 // MARK: - Content
 
 impl CountryDetails {
-    fn content(self, ctx: &Context) -> impl UnaryView {
+    fn content(self) -> impl UnaryView {
         match self.details.get() {
-            Loadable::NotRequested => OneOf4::A(self.default_view(ctx)),
+            Loadable::NotRequested => OneOf4::A(self.default_view()),
             Loadable::IsLoading(..) => OneOf4::B(self.loading_view()),
-            Loadable::Loaded(details) => OneOf4::C(self.loaded_view(ctx, details)),
-            Loadable::Failed(error) => OneOf4::D(self.failed_view(ctx, error)),
+            Loadable::Loaded(details) => OneOf4::C(self.loaded_view(details)),
+            Loadable::Failed(error) => OneOf4::D(self.failed_view(error)),
         }
     }
 
-    fn default_view(self, ctx: &Context) -> impl UnaryView {
-        let injected = ctx.environment::<DIContainer>();
+    fn default_view(self) -> impl UnaryView {
+        let injected = environment::<DIContainer>();
         text("").on_appear(move || self.load_country_details(&injected, false))
     }
 
@@ -101,16 +101,16 @@ impl CountryDetails {
         ))
     }
 
-    fn failed_view(self, ctx: &Context, error: LoadError) -> impl UnaryView {
-        let injected = ctx.environment::<DIContainer>();
+    fn failed_view(self, error: LoadError) -> impl UnaryView {
+        let injected = environment::<DIContainer>();
         ErrorView::new(
             error,
             Rc::new(move || self.load_country_details(&injected, true)),
         )
     }
 
-    fn loaded_view(self, ctx: &Context, country_details: DBModel::CountryDetails) -> impl UnaryView {
-        let injected = ctx.environment::<DIContainer>();
+    fn loaded_view(self, country_details: DBModel::CountryDetails) -> impl UnaryView {
+        let injected = environment::<DIContainer>();
 
         let currencies = (!country_details.currencies.is_empty())
             .then(|| Self::currencies_section_view(country_details.currencies.clone()));
@@ -118,7 +118,7 @@ impl CountryDetails {
             .neighbors
             .clone()
             .filter(|neighbors| !neighbors.is_empty())
-            .map(|neighbors| self.clone().neighbors_section_view(ctx, neighbors));
+            .map(|neighbors| self.clone().neighbors_section_view(neighbors));
         // the view carries DATA (Clone, not Copy): each sub-view takes its
         // own copy — explicit, and cheap at the size this has
         let sheet_view = self.clone();
@@ -127,7 +127,7 @@ impl CountryDetails {
             self.country
                 .flag
                 .clone()
-                .map(|url| self.clone().flag_view(ctx, url)),
+                .map(|url| self.clone().flag_view(url)),
             self.clone().basic_info_section_view(country_details.clone()),
             currencies,
             neighbors,
@@ -146,8 +146,8 @@ impl CountryDetails {
 impl CountryDetails {
     /// `flagView(url:)` — the headless runtime's `onTapGesture` fires at
     /// render (there is no finger), so the sheet opens just like the demo.
-    fn flag_view(self, ctx: &Context, url: URL) -> impl UnaryView {
-        let injected = ctx.environment::<DIContainer>();
+    fn flag_view(self, url: URL) -> impl UnaryView {
+        let injected = environment::<DIContainer>();
         hstack((
             spacer(),
             ImageView::new(url)
@@ -187,8 +187,8 @@ impl CountryDetails {
     }
 
     /// `neighborsSectionView(neighbors:)`
-    fn neighbors_section_view(self, ctx: &Context, neighbors: Vec<DBModel::Country>) -> impl UnaryView {
-        let locale = ctx.environment::<Locale>();
+    fn neighbors_section_view(self, neighbors: Vec<DBModel::Country>) -> impl UnaryView {
+        let locale = environment::<Locale>();
         section(
             text("Neighboring countries"),
             (for_each(

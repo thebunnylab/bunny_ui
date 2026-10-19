@@ -3,6 +3,8 @@
 
 #![cfg(feature = "3d")]
 
+use bunny_ui_core as bunny_ui;
+
 use std::cell::Cell;
 
 use bunny_ui::custom::canvas;
@@ -26,7 +28,7 @@ struct Viewer {
 }
 
 impl Component for Viewer {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         BODIES.with(|bodies| bodies.set(bodies.get() + 1));
         canvas(move |ctx, painter| {
             painter.world(ctx.bounds(), self.world, self.camera);

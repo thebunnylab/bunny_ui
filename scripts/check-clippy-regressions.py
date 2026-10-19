@@ -2,6 +2,11 @@
 
 Existing failures remain failures in the logs and summary. This differential
 gate does not turn either strict invocation into a passing lint gate.
+
+A package is judged by the diagnostics in its own files. What a dependency
+emits while it compiles under this package's feature set — a workspace crate
+built without its default features, say — belongs to that dependency's own
+invocation, where its baseline is.
 """
 import argparse
 import json
@@ -9,7 +14,7 @@ from pathlib import Path
 import subprocess
 
 
-def diagnostic_keys(log, source):
+def diagnostic_keys(log, source, directory):
     diagnostics = set()
     for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
@@ -37,12 +42,24 @@ def diagnostic_keys(log, source):
                     # Macro definitions may anchor in the compiler's own
                     # library. Both invocations use that same toolchain.
                     pass
+            if not filename.is_absolute() and not filename.as_posix().startswith(directory + "/"):
+                # another workspace crate's file, compiled on this package's way
+                continue
             file = source / filename
             contents = file.read_text(encoding="utf-8").splitlines() if file.is_file() else []
             diagnostic.update(file=filename.as_posix(),
                               source=contents[span["line_start"] - 1].strip() if contents else "")
         diagnostics.add(json.dumps(diagnostic, sort_keys=True))
     return diagnostics
+
+
+def package_names(source):
+    """Each workspace package's name, by its directory under the root."""
+    metadata = json.loads(subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1"],
+                                         cwd=source, check=True, capture_output=True, text=True).stdout)
+    root = Path(metadata["workspace_root"])
+    return {Path(package["manifest_path"]).parent.relative_to(root).as_posix(): package["name"]
+            for package in metadata["packages"]}
 
 
 def main():
@@ -56,6 +73,11 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     record = {"packages": arguments.package, "strict_runs": {}}
     keys = {}
+    # A package is the same package on both revisions by its directory, not
+    # its name: a rename (bunny-ui → bunny-ui-core) must still compare the
+    # same code. One the baseline lacks has nothing to compare against.
+    directories = {name: directory for directory, name in package_names(arguments.candidate.resolve()).items()}
+    baseline_names = package_names(arguments.baseline.resolve())
     for name, source in (("baseline", arguments.baseline), ("candidate", arguments.candidate)):
         source = source.resolve()
         record["strict_runs"][name] = {}
@@ -63,16 +85,20 @@ def main():
         # A failing core invocation can stop Cargo before it reaches a native
         # dependent. Each touched package must therefore run independently.
         for package in arguments.package:
+            invoked = package if name == "candidate" else baseline_names.get(directories[package])
+            if invoked is None:
+                record["strict_runs"][name][package] = {"exit_code": None, "diagnostics": []}
+                continue
             # Retain independently compilable targets after one fails. Without
             # this, a library error can cancel its test target and make inherited
             # test-only warnings appear new on whichever revision ran farther.
             command = ["cargo", "clippy", "--locked", "--all-targets", "--all-features", "--keep-going",
                        "--no-deps", "--message-format=json", "--target-dir", str(output / (name + "-target")),
-                       "-p", package, "--", "-D", "warnings"]
+                       "-p", invoked, "--", "-D", "warnings"]
             log = output / (name + "-" + package + ".jsonl")
             with log.open("w", encoding="utf-8") as stream:
                 result = subprocess.run(command, cwd=source, stdout=stream, stderr=subprocess.STDOUT)
-            package_keys = diagnostic_keys(log, source)
+            package_keys = diagnostic_keys(log, source, directories[package])
             record["strict_runs"][name][package] = {
                 "exit_code": result.returncode,
                 "diagnostics": [json.loads(key) for key in sorted(package_keys)],

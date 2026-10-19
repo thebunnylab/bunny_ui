@@ -1,0 +1,14 @@
+{
+  "baseline-clippy.log": "e9b71b922feef56eb021b0a6f45460c4394c6b89a8f87409846277849a1e81fe",
+  "binary.json": "42d07e79920abf18588ad8e0ba066682cea0ff7eb1c1c15d2ee28fcb000d84fd",
+  "candidate-clippy.log": "f9735fa2426d4c5050d035a49b6be8cb64cbf9cdb33697540cb1e28c46ef3c1c",
+  "check_format.py": "13fccf2ff95f3c94b09cc79ee202ec14dcf53a06356738ce98843e03fb6f95de",
+  "clippy-comparison.json": "1a43250270990405c9c7b5dbb6a9de0f552339ccf0556980030f53c7d2c8a8d7",
+  "fail-first.log": "3e1f2b44b5a5a8a87d425efcfc71e3e3cb1fa62ad6fa69e83aa0adbd086e083a",
+  "format.json": "de47b55c2ed3c57cb81743043eba8ad397d27c107c5796cd5ec2411a57f57522",
+  "gates.json": "0639a6742965791b0d2d0575229108c0d3dc64f16b07e15166c8e29f00e554b2",
+  "native-final.log": "b1e2540870d84d5f7a39c7c0b9e06c9fb738f6258e40d4d2bfeec0f24259b34c",
+  "tests-macos.log": "70a680ff869bae7a8619da45c7e7ffdc2a1d92384bd06e1b1425490910f40d47",
+  "tests-trace.log": "266ced4fbbf6017445164c2230956321b4c6b095ad1d1074c2951ba6c05a932a",
+  "whitespace.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

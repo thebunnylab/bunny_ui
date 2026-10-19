@@ -7,8 +7,8 @@
 //! path, and panics when the two answers differ.
 //!
 //! ```sh
-//! BUNNY_PARANOID=all cargo test -p bunny-ui
-//! BUNNY_PARANOID=assemble,settle cargo test -p bunny-ui
+//! BUNNY_PARANOID=all cargo test -p bunny-ui-core
+//! BUNNY_PARANOID=assemble,settle cargo test -p bunny-ui-core
 //! ```
 //!
 //! Off, the cost is one branch for each shortcut taken. It is a test

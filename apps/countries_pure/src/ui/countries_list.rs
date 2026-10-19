@@ -67,13 +67,13 @@ impl Default for CountriesList {
 }
 
 impl Component for CountriesList {
-    fn body(self, ctx: &Context) -> impl View {
-        let injected = ctx.environment::<DIContainer>();
+    fn body(self) -> impl View {
+        let injected = environment::<DIContainer>();
 
         navigation_stack(
             self.navigation_path.binding(),
             (self
-                .content(ctx)
+                .content()
                 .query(
                     self.search_text.get(),
                     self.countries.binding(),
@@ -98,18 +98,18 @@ impl Component for CountriesList {
 
 impl CountriesList {
     /// `@ViewBuilder private var content`
-    fn content(self, ctx: &Context) -> impl UnaryView {
+    fn content(self) -> impl UnaryView {
         match self.countries_state.get() {
-            Loadable::NotRequested => OneOf4::A(self.default_view(ctx)),
+            Loadable::NotRequested => OneOf4::A(self.default_view()),
             Loadable::IsLoading(..) => OneOf4::B(Self::loading_view()),
-            Loadable::Loaded(()) => OneOf4::C(self.loaded_view(ctx)),
-            Loadable::Failed(error) => OneOf4::D(self.failed_view(ctx, error)),
+            Loadable::Loaded(()) => OneOf4::C(self.loaded_view()),
+            Loadable::Failed(error) => OneOf4::D(self.failed_view(error)),
         }
     }
 
     /// `defaultView()`
-    fn default_view(self, ctx: &Context) -> impl UnaryView {
-        let injected = ctx.environment::<DIContainer>();
+    fn default_view(self) -> impl UnaryView {
+        let injected = environment::<DIContainer>();
         text("").on_appear(move || {
             if !self.countries.get().is_empty() {
                 self.countries_state.set(Loadable::Loaded(()));
@@ -124,8 +124,8 @@ impl CountriesList {
     }
 
     /// `failedView(_:)`
-    fn failed_view(self, ctx: &Context, error: LoadError) -> impl UnaryView {
-        let injected = ctx.environment::<DIContainer>();
+    fn failed_view(self, error: LoadError) -> impl UnaryView {
+        let injected = environment::<DIContainer>();
         ErrorView::new(
             error,
             Rc::new(move || self.load_countries_list(&injected, true)),
@@ -139,8 +139,8 @@ impl CountriesList {
     /// `loadedView()` — the `@ViewBuilder` with `if` + `List` becomes a tuple
     /// with an `Option` (the codegen's `if let`) and the explicit `TupleView`
     /// that prints its own node.
-    fn loaded_view(self, ctx: &Context) -> impl UnaryView {
-        let injected = ctx.environment::<DIContainer>();
+    fn loaded_view(self) -> impl UnaryView {
+        let injected = environment::<DIContainer>();
 
         let no_matches = (self.countries.get().is_empty() && !self.search_text.get().is_empty())
             .then(|| text("No matches found").font(Font::Footnote));
@@ -158,7 +158,7 @@ impl CountriesList {
             .navigation_destination()
             .searchable(self.search_text.binding())
             .refreshable(move || self.load_countries_list(&refresh_injected, true))
-            .toolbar(toolbar_item(self.permissions_button(ctx)))
+            .toolbar(toolbar_item(self.permissions_button()))
             .on_change(
                 move || self.routing_state.get().country_code.clone(),
                 true,
@@ -189,8 +189,8 @@ impl CountriesList {
     }
 
     /// `permissionsButton` — `@ViewBuilder if canRequestPushPermission { … }`
-    fn permissions_button(self, ctx: &Context) -> Option<impl UnaryView> {
-        let injected = ctx.environment::<DIContainer>();
+    fn permissions_button(self) -> Option<impl UnaryView> {
+        let injected = environment::<DIContainer>();
         self.can_request_push_permission.get().then(|| {
             button(text("Allow Push"), move || {
                 self.request_push_permission(&injected)

@@ -21,7 +21,7 @@ struct Sheet {
 }
 
 impl Component for Sheet {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let picked = self.picked;
         vstack!(
             text("ten thousand rows, a screenful materialized").bold(),

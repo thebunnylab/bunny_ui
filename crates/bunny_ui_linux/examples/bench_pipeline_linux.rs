@@ -96,7 +96,7 @@ struct Finder {
 }
 
 impl Component for Finder {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let query = self.query.get();
         let items: Vec<(usize, Arc<str>, Arc<str>)> = self
             .files
@@ -170,7 +170,7 @@ struct AnimatedFinder {
 }
 
 impl Component for AnimatedFinder {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let query = self.query.get();
         let items: Vec<(usize, Arc<str>, Arc<str>)> = self
             .files
@@ -243,7 +243,7 @@ struct VirtualFinder {
 }
 
 impl Component for VirtualFinder {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let files = Rc::clone(&self.files);
         let visible = self.visible.get();
         let count = visible.len();

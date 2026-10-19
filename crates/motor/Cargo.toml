@@ -1,7 +1,9 @@
 [package]
-name = "motor"
-version = "0.1.0"
+name = "bunny-ui-motor"
+version.workspace = true
 edition.workspace = true
-description = "Fake port of SwiftUI/Combine for the CountriesSwiftUI Rust port — syntax only, no real UI"
+description = "The state, identity and environment engine behind bunny-ui"
+license-file.workspace = true
+repository.workspace = true
 
 [dependencies]

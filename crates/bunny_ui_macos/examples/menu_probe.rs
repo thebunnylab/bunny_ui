@@ -461,7 +461,7 @@ mod probe {
     }
 
     impl Component for Page {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             vstack!(
                 text("The menu bar's ruler").font(Font::Title),
                 text_field("the field the edits reach", self.note.binding()).auto_focus(),

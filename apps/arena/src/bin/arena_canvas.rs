@@ -10,14 +10,36 @@ struct Dial {
     probe: Option<std::rc::Rc<PaintProbe>>,
 }
 
+/// What the dial painted. The diagnostic prints its first seconds; on
+/// Windows the last paint also answers every observation boundary, so the
+/// producer can check that the loop actually moved on its trajectory.
 struct PaintProbe {
     started: std::time::Instant,
     frames: std::cell::Cell<u64>,
     slot: std::cell::Cell<u128>,
+    last: std::cell::Cell<Option<Paint>>,
+    diagnostic: bool,
+}
+
+/// One painted frame of the dial.
+#[derive(Clone, Copy)]
+struct Paint {
+    frame: u64,
+    phase: f64,
+    drawing: Rect,
+    marker: Rect,
+}
+
+impl Paint {
+    fn value(self) -> serde_json::Value {
+        let rect = |r: Rect| [r.origin.x, r.origin.y, r.size.width, r.size.height];
+        serde_json::json!({"frame": self.frame, "phase": self.phase,
+            "drawing_rect": rect(self.drawing), "marker": rect(self.marker)})
+    }
 }
 
 impl Component for Dial {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let probe = self.probe.clone();
         vstack!(
             hstack!(
@@ -40,27 +62,30 @@ impl Component for Dial {
                     y: centre.y + radius * angle.sin(),
                 };
                 let marker = Rect {
-                        origin: Point {
-                            x: hand.x - 6.0,
-                            y: hand.y - 6.0,
-                        },
-                        size: Size {
-                            width: 12.0,
-                            height: 12.0,
-                        },
-                    };
+                    origin: Point {
+                        x: hand.x - 6.0,
+                        y: hand.y - 6.0,
+                    },
+                    size: Size {
+                        width: 12.0,
+                        height: 12.0,
+                    },
+                };
                 painter.fill(marker, Color::hex(0xE69933));
                 if let Some(probe) = &probe {
                     let frame = probe.frames.get() + 1;
                     probe.frames.set(frame);
+                    let paint = Paint {
+                        frame,
+                        phase,
+                        drawing: ctx.frame,
+                        marker,
+                    };
+                    probe.last.set(Some(paint));
                     let slot = probe.started.elapsed().as_millis() / 500;
-                    if slot <= 3 && (frame == 1 || slot > probe.slot.get()) {
+                    if probe.diagnostic && slot <= 3 && (frame == 1 || slot > probe.slot.get()) {
                         probe.slot.set(slot);
-                        let rect = ctx.frame;
-                        let state = serde_json::json!({"frame": frame, "phase": phase,
-                            "drawing_rect": [rect.origin.x, rect.origin.y, rect.size.width, rect.size.height],
-                            "marker": [marker.origin.x, marker.origin.y, marker.size.width, marker.size.height]});
-                        println!("CANVAS_FRAME {} {state}", arena::unix_ms());
+                        println!("CANVAS_FRAME {} {}", arena::unix_ms(), paint.value());
                     }
                 }
             })
@@ -78,19 +103,33 @@ impl Component for Dial {
 
 fn main() {
     let args = Args::parse();
-    let probe = std::env::var_os("ARENA_SCENE_DIAGNOSTIC").map(|_| {
+    let diagnostic = std::env::var_os("ARENA_SCENE_DIAGNOSTIC").is_some();
+    // Windows answers its producer's boundaries with the last paint, so the
+    // probe is part of every Windows run; macOS keeps it diagnostic-only.
+    let probe = (diagnostic || cfg!(target_os = "windows")).then(|| {
         std::rc::Rc::new(PaintProbe {
             started: std::time::Instant::now(),
             frames: Default::default(),
             slot: Default::default(),
+            last: Default::default(),
+            diagnostic,
         })
     });
+    let witness = probe.clone();
     arena::scene::run(
         "arena — canvas",
         "canvas",
         Dial { probe },
         args,
         |_| {},
-        || serde_json::json!({}),
+        move || {
+            witness.as_ref().map_or_else(
+                || serde_json::json!({}),
+                |probe| {
+                    serde_json::json!({"frames": probe.frames.get(),
+                        "last_paint": probe.last.get().map(Paint::value)})
+                },
+            )
+        },
     );
 }

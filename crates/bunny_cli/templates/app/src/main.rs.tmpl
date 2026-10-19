@@ -1,0 +1,7 @@
+// A release build on Windows opens without a console window; a debug
+// build keeps one, for the app's logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+fn main() {
+    @BUNNY_CRATE_NAME@::run()
+}

@@ -1,4 +1,6 @@
 //! Active field input holds the caret; a quiet beat starts idle blinking.
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
+
 use bunny_ui::layout::{DrawCommand, Proposal, Size};
 use bunny_ui::prelude::*;
 use bunny_ui::text_input::EditCommand;

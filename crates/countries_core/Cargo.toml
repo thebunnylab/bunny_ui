@@ -2,6 +2,7 @@
 name = "countries-core"
 version = "0.1.0"
 edition.workspace = true
+publish = false
 description = "Manual Rust port of the non-UI layers of CountriesSwiftUI (Core, DI, Interactors, Repositories, Utilities)"
 
 [dependencies]

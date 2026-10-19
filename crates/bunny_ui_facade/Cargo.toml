@@ -1,0 +1,99 @@
+[package]
+name = "bunny-ui"
+version.workspace = true
+edition.workspace = true
+description = "Declarative UI in Rust with fine-grained reactivity, inspired by SwiftUI — one crate, with the native shell of the target it compiles for"
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["ui", "gui", "declarative", "reactive", "swiftui"]
+categories = ["gui"]
+
+[features]
+default = ["shell", "canvas"]
+# The shell of the target: macOS, iOS, Windows, Linux, Android or the
+# web, behind `run_window` and `platform`. Off for a crate that only
+# builds views — a component library, a theme — and leaves the window
+# to the application.
+shell = [
+    "dep:bunny-ui-macos",
+    "dep:bunny-ui-ios",
+    "dep:bunny-ui-windows",
+    "dep:bunny-ui-linux",
+    "dep:bunny-ui-android",
+    "dep:bunny-ui-web",
+]
+# The core's own features, passed through (see bunny-ui-core).
+canvas = ["bunny-ui-core/canvas"]
+svg = ["bunny-ui-core/svg"]
+gpu = ["bunny-ui-core/gpu"]
+codec = ["bunny-ui-core/codec"]
+# Hot reload, for `bunny run`: the framework comes in as one shared
+# library the app links, and `app!` writes the entry that each new build
+# of the app's code is loaded by. `bunny run` turns it on for a debug run
+# of an app on the desktop, the iOS Simulator or Android; no other build
+# needs it, and the web has no use for it.
+hot = ["shell", "dep:bunny-ui-dylib", "dep:bunny-ui-hot"]
+# Preview entries: each `#[preview]` function exports a symbol that
+# answers its view and traits, for the preview host Studio and `bunny
+# preview` run. `bunny preview` turns it on with `hot`; a plain build
+# keeps the functions and exports nothing.
+preview = ["dep:bunny-ui-hot", "dep:bunny-ui-preview", "bunny-ui-preview/host"]
+
+[dependencies]
+bunny-ui-core.workspace = true
+# The `#[preview]` attribute itself: always there, so a marked function
+# compiles in every build; what it exports follows the feature above.
+bunny-ui-preview-macros.workspace = true
+
+# The target picks the shell; the application never names one.
+[target.'cfg(target_os = "macos")'.dependencies]
+bunny-ui-macos = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+bunny-ui-ios = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+bunny-ui-windows = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bunny-ui-linux = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+bunny-ui-android = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bunny-ui-web = { workspace = true, optional = true }
+
+# Hot reload loads new code wherever a native debug build runs.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bunny-ui-dylib = { workspace = true, optional = true }
+bunny-ui-hot = { workspace = true, optional = true }
+bunny-ui-preview = { workspace = true, optional = true }
+
+[[example]]
+name = "counter"
+required-features = ["shell"]
+
+[[example]]
+name = "preview"
+required-features = ["shell", "preview"]
+
+[[test]]
+name = "app_macro"
+required-features = ["shell"]
+
+[[test]]
+name = "preview_macro"
+required-features = ["preview"]
+
+# One page per platform, each with the shell that target compiles.
+[package.metadata.docs.rs]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-ios",
+    "aarch64-linux-android",
+    "wasm32-unknown-unknown",
+]

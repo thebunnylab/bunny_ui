@@ -30,6 +30,59 @@
 
 use motor::hash::FxHashMap as HashMap;
 
+/// Nonmodal transient subtrees remember their invoker independently of which
+/// child holds the keyboard. Unlike a modal scope, they never trap navigation.
+#[derive(Default)]
+pub(crate) struct Returns {
+    lenders: HashMap<String, Option<String>>,
+}
+
+impl Returns {
+    /// Reconcile mounted boundaries before dead inputs release their focus.
+    /// Only a closing boundary that still owns the keyboard returns it.
+    pub(crate) fn sync(
+        &mut self,
+        mounted: &[String],
+        held: Option<&str>,
+        lives: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let closing_lender = |held: &str| {
+            self.lenders
+                .iter()
+                .filter(|(scope, _)| !mounted.contains(scope) && covers(scope, held))
+                .max_by_key(|(scope, _)| scope.len())
+                .and_then(|(_, lender)| lender.as_deref())
+        };
+        let mut candidate = held.and_then(closing_lender);
+        let mut restore = None;
+        // Nested boundaries can close together. Walk through their dead
+        // lenders, bounded even if an invalid focus cycle was recorded.
+        for _ in 0..self.lenders.len() {
+            let Some(path) = candidate else { break };
+            if lives(path) {
+                restore = Some(path.to_owned());
+                break;
+            }
+            candidate = closing_lender(path);
+        }
+        self.lenders.retain(|scope, _| mounted.contains(scope));
+        let owner = restore.as_deref().or(held);
+        for scope in mounted {
+            self.lenders.entry(scope.clone()).or_insert_with(|| {
+                owner
+                    .filter(|owner| !covers(scope, owner))
+                    .map(str::to_owned)
+            });
+        }
+        restore
+    }
+}
+
+fn covers(scope: &str, path: &str) -> bool {
+    path.strip_prefix(scope)
+        .is_some_and(|tail| tail.is_empty() || tail.starts_with('/'))
+}
+
 /// Who lent the keyboard to whom — borrower path → lender path.
 #[derive(Default)]
 pub(crate) struct Loans {
@@ -92,7 +145,7 @@ impl Loans {
 
 #[cfg(test)]
 mod tests {
-    use super::Loans;
+    use super::{Loans, Returns};
 
     fn alive<'a>(paths: &'a [&'a str]) -> impl Fn(&str) -> bool + 'a {
         move |path| paths.contains(&path)
@@ -138,5 +191,40 @@ mod tests {
         assert_eq!(book.heir("split/query", alive(&["editor"])), Some("editor"));
         assert_eq!(book.heir("inner", alive(&["split/query"])), Some("split/query"));
         assert_eq!(book.heir("query", alive(&["editor"])), None, "the old house owes nothing");
+    }
+
+    #[test]
+    fn nested_return_boundaries_can_close_together_or_independently() {
+        for together in [true, false] {
+            let mut returns = Returns::default();
+            let outer = "form".to_string();
+            let inner = "form/inner".to_string();
+            returns.sync(std::slice::from_ref(&outer), Some("open"), alive(&["open"]));
+            returns.sync(
+                &[outer.clone(), inner],
+                Some("form/field"),
+                alive(&["open", "form/field"]),
+            );
+            let mounted = if together { vec![] } else { vec![outer] };
+            let live = if together {
+                vec!["open"]
+            } else {
+                vec!["open", "form/field"]
+            };
+            assert_eq!(
+                returns.sync(&mounted, Some("form/inner/apply"), alive(&live)),
+                Some(if together { "open" } else { "form/field" }.to_string()),
+            );
+        }
+    }
+
+    #[test]
+    fn return_boundaries_do_not_treat_sibling_prefixes_as_descendants() {
+        let mut returns = Returns::default();
+        returns.sync(&["form".to_string()], Some("open"), alive(&["open"]));
+        assert_eq!(
+            returns.sync(&[], Some("forms/field"), alive(&["open", "forms/field"])),
+            None
+        );
     }
 }

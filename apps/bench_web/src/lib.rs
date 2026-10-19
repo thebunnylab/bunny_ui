@@ -39,7 +39,7 @@ struct Row {
 }
 
 impl Component for Row {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let on = self.on.get();
         let toggle = self.on;
         hstack!(
@@ -76,7 +76,7 @@ pub struct Bench {
 }
 
 impl Component for Bench {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let count = if self.filtered.get() { FILTERED } else { ROWS };
         let toggles = self.toggles.clone();
         let items: Vec<usize> = (0..count).collect();
@@ -189,7 +189,7 @@ pub mod keyed {
     }
 
     impl Component for KeyedRow {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let seed = self.seed;
             let id = seed.id;
             let rows = self.rows;
@@ -310,7 +310,7 @@ pub mod keyed {
 
     #[cfg(feature = "gpu")]
     impl Component for PixelRow {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             let seed = self.seed;
             let id = seed.id;
             let rows = self.rows;
@@ -367,7 +367,7 @@ pub mod keyed {
 
     #[cfg(feature = "gpu")]
     impl Component for PixelApp {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             vstack!(self.0.clone().controls(), self.0.pixel_table())
                 .alignment(HorizontalAlignment::Leading)
                 .frame(900.0, 800.0)
@@ -394,7 +394,7 @@ pub mod keyed {
     const PAGE_SIZE: f64 = 14.0;
 
     impl Component for App {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             vstack!(self.clone().controls(), self.table())
                 .alignment(HorizontalAlignment::Leading)
                 .frame(900.0, 800.0)
@@ -407,7 +407,7 @@ pub mod keyed {
 
     #[cfg(feature = "gpu")]
     impl Component for HybridApp {
-        fn body(self, _ctx: &Context) -> impl View {
+        fn body(self) -> impl View {
             vstack!(
                 self.0.clone().controls(),
                 // the island: the table's rows are pixels the engine

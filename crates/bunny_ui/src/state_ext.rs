@@ -4,6 +4,7 @@ use motor::state::{Binding, State};
 
 /// `State<T>::get()` — the `wrappedValue` of `@State`.
 pub trait StateExt<T: Clone + 'static> {
+    #[track_caller]
     fn get(&self) -> T;
 
     /// `state.add(1)` — the `+=` that works inside `Fn` closures: the
@@ -16,7 +17,9 @@ pub trait StateExt<T: Clone + 'static> {
 }
 
 impl<T: Clone + 'static> StateExt<T> for State<T> {
+    #[track_caller]
     fn get(&self) -> T {
+        crate::diagnostics::read();
         self.wrappedValue()
     }
 
@@ -30,11 +33,14 @@ impl<T: Clone + 'static> StateExt<T> for State<T> {
 
 /// `Binding<T>::get()` — the `wrappedValue` of `@Binding`/`$x`.
 pub trait BindingExt<T: Clone + 'static> {
+    #[track_caller]
     fn get(&self) -> T;
 }
 
 impl<T: Clone + 'static> BindingExt<T> for Binding<T> {
+    #[track_caller]
     fn get(&self) -> T {
+        crate::diagnostics::read();
         self.wrappedValue()
     }
 }

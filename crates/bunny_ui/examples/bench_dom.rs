@@ -1,7 +1,7 @@
 //! The Dom-mode ruler: a 200-row stateful table, headless.
 //!
 //! ```sh
-//! cargo run --release -p bunny-ui --example bench_dom
+//! cargo run --release -p bunny-ui-core --example bench_dom
 //! ```
 //!
 //! The element lowering pays a different bill than the pixel path:
@@ -16,6 +16,8 @@
 //! machine). The wall-time samples run with no stats clock installed;
 //! the stage table is a separate pass with the clock on, so the
 //! certified numbers never include the timers' own cost.
+
+extern crate bunny_ui_core as bunny_ui; // the core, by the name an application uses
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::rc::Rc;
@@ -82,7 +84,7 @@ struct Row {
 }
 
 impl Component for Row {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let on = self.on.get();
         let toggle = self.on;
         hstack!(
@@ -119,7 +121,7 @@ struct Table {
 }
 
 impl Component for Table {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let count = if self.filtered.get() { FILTERED } else { ROWS };
         let toggles = self.toggles.clone();
         let items: Vec<usize> = (0..count).collect();

@@ -1,0 +1,14 @@
+[package]
+name = "bunny-ui-hot"
+version.workspace = true
+edition.workspace = true
+description = "Hot reload for bunny-ui — the part inside the app: it loads each new build `bunny run` makes and swaps the views to it, the state kept"
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["bunny-ui", "hot-reload", "gui"]
+categories = ["gui", "development-tools"]
+
+[dependencies]
+bunny-ui.workspace = true
+motor.workspace = true

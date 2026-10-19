@@ -83,6 +83,24 @@ Registering the url scheme is the platform's own configuration (the
 bundle's `Info.plist`, the registry, a `.desktop` file), and stays
 the app's to write.
 
+On macOS, an associated HTTP(S) link arrives through
+`application:continueUserActivity:restorationHandler:` with
+`NSUserActivityTypeBrowsingWeb`. The shell forwards its `webpageURL` as one
+`Reopened` argument, preserving the URL fragment. Subscribe before creating the
+native app so a cold launch is heard too. Other activity types and missing URLs
+are not handled. The shell creates no restorable responder and does not retain
+the optional restoration block.
+
+The application still validates its own trusted origin and parameters, and owns
+its signed associated-domain entitlement and website association file. Receiving
+an event grants no access and must not implicitly accept an invitation. Sensitive
+links must stay out of logs and disk-backed instance spools: a bundled macOS app
+receives this event directly in memory. The delegate regression uses real
+Foundation activity/URL objects and the registered Objective-C method; it does
+not prove a deployed website association or system launch of a signed bundle.
+See Apple's [universal-link integration](https://developer.apple.com/documentation/xcode/supporting-universal-links-in-your-app)
+and [AppKit delegate contract](https://developer.apple.com/documentation/appkit/nsapplicationdelegate/application(_:continue:restorationhandler:)).
+
 ## More than one window
 
 A mail client detaches its composer; a workbench opens a second
@@ -139,6 +157,53 @@ iOS `run` hands the process
 to UIKit, which never returns, and on Android it hands the window to
 the activity, which was running already, and returns.
 
+## Retained visibility and close requests
+
+The desktop shells expose `App::hide`, `show` and `visibility` for a live
+`WindowId`. Hiding preserves the runtime, editor draft and logical focus;
+background tasks still wake through the app's existing channel. Native
+presentation, including child dialogs and popups, stays suspended until show.
+An ID denotes one lifetime, not a reusable native address: a stale or foreign
+ID returns `WindowError::StaleWindow`. Explicit `close` on such an ID is a no-op.
+
+```rust
+use bunny_ui::window::{CloseAction, WindowVisibility};
+
+// The app retains this window and its editor when its close button is used.
+app.on_close_requested(main, |_| CloseAction::Hide)?;
+match app.visibility(main)? {
+    WindowVisibility::Shown => app.hide(main)?,
+    WindowVisibility::Hidden => app.show(main)?,
+}
+// Quit and explicit close bypass the user-close policy.
+app.quit();
+```
+
+`CloseAction::Close` is the default. `Cancel` keeps the window open while, for
+example, a save prompt is answered; the application later calls `close` after
+Save/Discard, or leaves it open after Cancel. `request_close` runs the same
+policy as the native close button. A policy can replace or remove itself,
+open another window, or explicitly close its own window. Recursive requests
+for the same window return `WindowError::CloseInProgress`; native recursion
+cancels. `clear_close_handler` restores default handling. Closing the last
+window retains the shell's usual exit behavior; hiding the last does not exit.
+
+`Shown` means submitted to the window system. It does not promise unobscured
+pixels, focus, successful foreground activation or human interaction. Wayland
+show starts a fresh configure/ack/map cycle; buffers cannot attach while
+hidden or before that configure. The shell restores title, app ID and size
+constraints and rebuilds retained child surfaces after unmapping. On macOS,
+Windows and X11 the native window remains allocated while ordered out/hidden
+or unmapped. Mobile shells do not expose this desktop lifecycle contract.
+
+The native `window_lifecycle` test uses subprocesses to witness policy,
+retained drafts, stale IDs, callback reentrancy, all-hidden worker wake and
+final exit. AppKit `performClose` and Win32 `WM_CLOSE` exercise native request
+routing. The Linux probe uses a real compositor/server for mapping and the
+public close request for policy; it does not prove a compositor-generated
+close action. These checks do not replace physical input, tray/global-hotkey
+interaction or human assistive-technology testing.
+
 ## What each platform answers
 
 | | macOS | Windows | Linux | iOS | Android |
@@ -147,7 +212,7 @@ the activity, which was running already, and returns.
 | notification | UserNotifications, a category per button set | a WinRT toast under the process's AppUserModelID | `org.freedesktop.Notifications` `Notify` | UserNotifications, the same module as the Mac's; the system asks once | `NotificationManager` over JNI, one channel, a button per action; the person asked once at the first post |
 | activation | the center's delegate, while running or launched by the click | the toast's `Activated` event, while running | `ActionInvoked` on the session bus | the center's delegate, while running or launched by the tap | the activity RE-CREATED with the tap's intent, read at create — while running or as the launch |
 | second launch | the spool; a BUNDLED app reopens through the delegate instead | the spool | the spool | the system's own: one process by construction | the system's own: one activity by construction |
-| a url handed over | `application:openURLs:` → `Reopened` | an argument → the spool | an argument → the spool | the scene's `scene:openURLContexts:`, or the launch's `URLContexts` → `Reopened` | not yet — a `NativeActivity` hears no new intent |
+| a url handed over | `application:openURLs:` or a web browsing activity → `Reopened` | an argument → the spool | an argument → the spool | the scene's `scene:openURLContexts:`, or the launch's `URLContexts` → `Reopened` | not yet — a `NativeActivity` hears no new intent |
 | languages | `NSLocale.preferredLanguages`, and `NSCurrentLocaleDidChangeNotification` while running | `GetUserPreferredUILanguages`, read again on `WM_SETTINGCHANGE` | `LANGUAGE`, else `LC_ALL`, `LC_MESSAGES`, `LANG` — once; the environment does not move | `NSLocale.preferredLanguages`; a change relaunches the app | the configuration's `LocaleList`, read again on every configuration change |
 
 Five honest edges. macOS shows notifications for a BUNDLE, never a
@@ -169,3 +234,20 @@ that id gives it the app's name and icon, and a click on a toast of an
 app that already EXITED needs a COM server the registry knows — both
 the app's own setup. Linux announces sleep only where logind runs,
 which is where a laptop runs.
+
+## Native window presentation regression
+
+On macOS, each top-level window and pooled dialog has its own presenter,
+addressed by its content view. Opening a second window cannot replace the
+first window's layer; closing one releases only its presenter. Resize
+transactions and drawable back-pressure follow that same view.
+
+Run `python3 crates/bunny_ui_macos/tests/window_presenters.py --output /tmp/window-pixels`
+on a macOS desktop with window-capture access. The probe uses the public `App`
+API, changes independent scenes, closes/reopens secondary windows, then closes
+the original window and updates its survivor. It checks the actual captured
+window colors and last-window exit. It sends no keyboard or mouse input. A
+capture denial fails qualification; the script does not turn it into a skip.
+`BUNNY_PRESENT=cpu` exercises the explicit CPU fallback with the same probe.
+The output directory must be fresh, so a stage acknowledgement cannot come
+from an earlier run.

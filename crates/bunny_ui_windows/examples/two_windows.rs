@@ -36,7 +36,7 @@ struct Pane {
 }
 
 impl Component for Pane {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         let count = self.count;
         let another = std::rc::Rc::clone(&self.another);
         vstack!(

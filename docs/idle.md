@@ -15,6 +15,25 @@ purge. Replacing a frame, resizing and dropping the presenter release the
 resource appropriate to its current state. The existing presentation-complete
 check and first-frame grace interval are preserved.
 
+## Shared task deadlines
+
+Native scenes that call `Runtime::drive_tasks_by_wall` share one monotonic
+anchor with the thread-local task executor. Registering a second scene joins
+that anchor; each elapsed interval is counted once even when every window
+observes it. Equal or backwards observations cannot move the anchor backwards.
+A newly created sleeper synchronizes first, so synchronous window work before
+`task::sleep` cannot consume part of its requested delay. Each runtime retains
+a driver; dropping the last releases automatic wall synchronization. Headless
+manual ticks and per-scene animation/touch steps retain their existing contract.
+
+The macOS shell uses this wall-driver path. Other shells' frame-driven task
+clocks are unchanged by this repair and need separate native qualification.
+Run the injected-clock regressions with `cargo test -p bunny-ui-core --lib
+runtime::clock_tests`. The native `shared_task_clock` example requests 600 ms
+with one, two, three, then two windows, prints unrounded elapsed observations
+and rejects a deadline more than 20 ms early. It is a correctness probe, not an
+idle CPU or comparative performance measurement.
+
 ## Evidence and scope
 
 On the tested macOS 27 system, the retained drawable kept the system's
@@ -40,6 +59,7 @@ competitive rankings from this lifetime repair.
 ```sh
 cargo test -p bunny-ui-apple --lib a_landed_frame_keeps_pixels_without_retaining_its_drawable
 cargo test -p bunny-ui-macos --lib an_empty_task_queue_never_arms_an_unused_alarm
+cargo run --release -p bunny-ui-macos --example shared_task_clock
 cargo run --release -p bunny-ui-macos --example two_windows -- --drive
 cargo run --release -p bunny-ui-macos --example counter_window
 ```

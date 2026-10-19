@@ -360,7 +360,7 @@ impl App {
 }
 
 impl Component for App {
-    fn body(self, _ctx: &Context) -> impl View {
+    fn body(self) -> impl View {
         // the picker: the first cell rounds its LEFT, the last its
         // RIGHT, and the one between them rounds nothing
         let picker = hstack!(

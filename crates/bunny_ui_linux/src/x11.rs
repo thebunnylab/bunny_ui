@@ -1815,7 +1815,7 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, options: crate
                 title.len() as u32,
                 title.as_ptr().cast(),
             );
-            let class = b"bunny_ui\0bunny_ui\0";
+            let class = crate::life::wm_class();
             xcb_change_property(
                 client.connection,
                 PROP_MODE_REPLACE,
@@ -1868,6 +1868,7 @@ pub(crate) fn show_window(window: u32) {
 /// backing and the window itself go, in that order. The last window
 /// out ends the road.
 pub(crate) fn close_top_level(window: u32) {
+    crate::ffi::accessibility::retire_window(window as usize);
     crate::webview::teardown(window as usize);
     crate::vk::teardown(window as usize);
     crate::gl::teardown(window as usize);
@@ -1911,8 +1912,10 @@ pub(crate) fn settle_closes() {
     loop {
         let next = with_x(|client| client.close_requested.pop());
         let Some(window) = next else { break };
-        crate::ffi::dispatch_at(window as usize, AppEvent::WindowClosed);
-        close_top_level(window);
+        if crate::ffi::allow_close(window as usize) {
+            crate::ffi::dispatch_at(window as usize, AppEvent::WindowClosed);
+            close_top_level(window);
+        }
     }
 }
 
@@ -2277,7 +2280,7 @@ pub(crate) fn create_dialog(
             set(client.atoms.wm_protocols, ATOM_ATOM, 32, 1, (&raw const client.atoms.wm_delete_window).cast());
             set(client.atoms.net_wm_name, client.atoms.utf8_string, 8, title.len() as u32, title.as_ptr().cast());
             set(ATOM_WM_NAME, ATOM_STRING, 8, title.len() as u32, title.as_ptr().cast());
-            let class = b"bunny_ui\0bunny_ui\0";
+            let class = crate::life::wm_class();
             set(ATOM_WM_CLASS, ATOM_STRING, 8, class.len() as u32, class.as_ptr().cast());
             // the place and the size are the program's own; the floor
             // is the spec's
@@ -2384,6 +2387,7 @@ pub(crate) fn panel_present(
     with_x(|client| {
         let connection = client.connection;
         let owner = client.panels.get(index).and_then(|p| p.as_ref()).map(|p| p.owner);
+        if owner.and_then(|owner| window_ref(client, owner)).is_none_or(|win| !win.mapped) { return; }
         let scale = owner.and_then(|o| window_ref(client, o)).map(|w| w.scale).unwrap_or(1);
         // a popup born inside a dialog is measured from the DIALOG's
         // root origin — the WM placed the dialog, not the scene: the
@@ -2628,6 +2632,17 @@ pub(crate) fn window_origin_logical(window: u32) -> (f64, f64) {
         let scale = window_ref(client, window).map(|w| w.scale).unwrap_or(1) as f64;
         let origin = window_root_origin(client, window);
         (origin.0 as f64 / scale, origin.1 as f64 / scale)
+    })
+}
+
+/// Actual server origin for a main window or one of its native panels.
+pub(crate) fn accessibility_origin(window: u32, panel: Option<usize>) -> Option<(i32, i32)> {
+    with_x(|client| {
+        let window = match panel {
+            Some(index) => client.panels.get(index)?.as_ref()?.window,
+            None => window_ref(client, window)?.id,
+        };
+        Some(root_origin_of(client, window))
     })
 }
 
@@ -3574,6 +3589,7 @@ pub(crate) fn run() {
             PollFd { fd, events: POLLIN, revents: 0 },
             PollFd { fd: wake_fd, events: POLLIN, revents: 0 },
         ];
+        crate::ffi::accessibility::prepare(&mut fds);
         // the engine's own descriptors ride this poll (see the wayland
         // door)
         let timeout = match crate::webview::pump_prepare(&mut fds) {
@@ -3614,6 +3630,7 @@ pub(crate) fn run() {
         crate::webview::deliver_pending();
         // a window a verb or the manager asked to close, now
         settle_closes();
+        crate::ffi::accessibility::pump();
     }
     teardown();
 }
@@ -3670,6 +3687,67 @@ fn teardown() {
 }
 
 // MARK: - Tests
+
+/// Reads whether this retained X11 window was mapped.
+pub fn window_visibility(
+    window: u32,
+) -> Result<bunny_ui::window::WindowVisibility, bunny_ui::window::WindowError> {
+    use bunny_ui::window::{WindowError, WindowVisibility};
+    with_x(|client| {
+        window_ref(client, window)
+            .map(|win| {
+                if win.mapped {
+                    WindowVisibility::Shown
+                } else {
+                    WindowVisibility::Hidden
+                }
+            })
+            .ok_or(WindowError::StaleWindow)
+    })
+}
+
+/// Maps or unmaps one retained window and its native children.
+pub fn set_window_visibility(
+    window: u32,
+    visibility: bunny_ui::window::WindowVisibility,
+) -> Result<(), bunny_ui::window::WindowError> {
+    use bunny_ui::window::{WindowError, WindowVisibility};
+    with_x(|client| {
+        let connection = client.connection;
+        let win = window_at(client, window).ok_or(WindowError::StaleWindow)?;
+        let shown = visibility == WindowVisibility::Shown;
+        if win.mapped != shown {
+            unsafe {
+                if shown {
+                    xcb_map_window(connection, window);
+                } else {
+                    xcb_unmap_window(connection, window);
+                }
+                xcb_flush(connection);
+            }
+            win.mapped = shown;
+        }
+        if !shown {
+            for panel in client
+                .panels
+                .iter_mut()
+                .flatten()
+                .filter(|panel| panel.owner == window)
+            {
+                if panel.mapped {
+                    unsafe {
+                        xcb_unmap_window(connection, panel.window);
+                    }
+                    panel.mapped = false;
+                }
+            }
+            unsafe {
+                xcb_flush(connection);
+            }
+        }
+        Ok(())
+    })
+}
 
 #[cfg(test)]
 mod tests {
