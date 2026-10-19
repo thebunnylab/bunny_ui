@@ -331,7 +331,9 @@ impl Light {
         }
     }
 
-    /// Light from the sky and the ground.
+    /// Light from the sky and the ground. A world without one gets a
+    /// soft studio sky, so a side no sun reaches is never black; a world
+    /// that wants a black sky says so with this.
     pub fn sky(sky: Color, ground: Color) -> Light {
         Light::Sky { sky, ground, intensity: 1.0 }
     }

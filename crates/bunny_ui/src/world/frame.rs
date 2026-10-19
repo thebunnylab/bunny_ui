@@ -249,8 +249,9 @@ fn material_data(material: &Material) -> MaterialData {
     }
 }
 
-/// The studio light a world without lights gets: a soft sky, and a key
-/// light from the upper left of the view.
+/// The studio light: a soft sky every world gets until it holds a sky of
+/// its own, and a key light from the upper left of the view for a world
+/// with no light at all.
 const STUDIO_SUN: [f32; 3] = [0.62, 0.595, 0.558];
 const STUDIO_SKY: [f32; 3] = [0.414, 0.442, 0.488];
 const STUDIO_GROUND: [f32; 3] = [0.360, 0.340, 0.313];
@@ -587,6 +588,7 @@ fn uniforms(eye: &Eye<'_>, style: &WorldStyle, size: (u32, u32), px_per_point: f
     out.tone = [style.exposure, 0.8, 1.0, 0.0];
 
     let mut has_light = false;
+    let mut has_sky = false;
     let mut points = 0usize;
     for (light, eye_from_model) in lights {
         has_light = true;
@@ -600,6 +602,7 @@ fn uniforms(eye: &Eye<'_>, style: &WorldStyle, size: (u32, u32), px_per_point: f
                 out.sun_color = scaled(sun.color, sun.intensity);
             }
             Light::Sky { sky, ground, intensity } => {
+                has_sky = true;
                 out.sky_color = scaled(*sky, *intensity);
                 out.ground_color = scaled(*ground, *intensity);
             }
@@ -615,12 +618,16 @@ fn uniforms(eye: &Eye<'_>, style: &WorldStyle, size: (u32, u32), px_per_point: f
         }
     }
     out.counts = [points as f32, 0.0, 0.0, 0.0];
+    // a side the sun misses is never black: the studio sky fills it until
+    // the world brings a sky of its own (a black sky is a choice)
+    if !has_sky {
+        out.sky_color = [STUDIO_SKY[0], STUDIO_SKY[1], STUDIO_SKY[2], 0.0];
+        out.ground_color = [STUDIO_GROUND[0], STUDIO_GROUND[1], STUDIO_GROUND[2], 0.0];
+    }
     if !has_light {
         let toward = vec3(STUDIO_TOWARD_SUN[0], STUDIO_TOWARD_SUN[1], STUDIO_TOWARD_SUN[2]).normalized();
         out.sun_direction = [toward.x as f32, toward.y as f32, toward.z as f32, 1.0];
         out.sun_color = [STUDIO_SUN[0], STUDIO_SUN[1], STUDIO_SUN[2], 0.0];
-        out.sky_color = [STUDIO_SKY[0], STUDIO_SKY[1], STUDIO_SKY[2], 0.0];
-        out.ground_color = [STUDIO_GROUND[0], STUDIO_GROUND[1], STUDIO_GROUND[2], 0.0];
     }
     out
 }
@@ -756,10 +763,28 @@ mod tests {
         let frame = build(&world, &Camera::orbiting(Vec3::ZERO, 0.0, 20.0, 6.0));
         assert_eq!(frame.uniforms.sun_direction[3], 1.0);
         assert!(frame.uniforms.sky_color[0] > 0.0);
-        world.add_light(Light::sun().toward(vec3(0.0, -1.0, 0.0)));
+        // a sun of its own replaces the key light, and the studio sky
+        // stays to fill the side the sun misses
+        world.add_light(Light::sun().toward(vec3(0.0, -1.0, 0.0)).color(Color::rgb(255, 0, 0)));
         let frame = build(&world, &Camera::orbiting(Vec3::ZERO, 0.0, 0.0, 6.0));
-        assert_eq!(frame.uniforms.sky_color, [0.0; 4], "a world with lights keeps exactly its lights");
+        assert_eq!(frame.uniforms.sun_color[1], 0.0, "the world's own sun");
+        assert!(frame.uniforms.sky_color[0] > 0.0, "the studio sky fills the shade");
         let up = frame.uniforms.sun_direction;
         assert!((up[1] - 1.0).abs() < 1e-6, "toward the sun is up, in the eye of a level camera: {up:?}");
+        // a sky of its own replaces the studio's, even a black one
+        world.add_light(Light::sky(Color::rgb(0, 0, 0), Color::rgb(0, 0, 0)));
+        let frame = build(&world, &Camera::orbiting(Vec3::ZERO, 0.0, 0.0, 6.0));
+        assert_eq!(frame.uniforms.sky_color, [0.0; 4]);
+        assert_eq!(frame.uniforms.ground_color, [0.0; 4]);
+    }
+
+    #[test]
+    fn a_night_of_lamps_gets_no_studio_sun() {
+        let world = World::new();
+        world.add(Mesh::cuboid(1.0, 1.0, 1.0), gray());
+        world.add_light(Light::point(Color::rgb(255, 200, 150)));
+        let frame = build(&world, &Camera::orbiting(Vec3::ZERO, 0.0, 20.0, 6.0));
+        assert_eq!(frame.uniforms.sun_direction[3], 0.0);
+        assert_eq!(frame.uniforms.counts[0], 1.0);
     }
 }
