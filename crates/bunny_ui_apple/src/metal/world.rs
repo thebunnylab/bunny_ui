@@ -84,6 +84,7 @@ const GPU_FAMILY_APPLE1: u64 = 1001;
 const DRAW_MASK: u32 = 1;
 const DRAW_TEXTURED: u32 = 2;
 const DRAW_REPLACE: u32 = 4;
+const DRAW_COVERAGE: u32 = 8;
 
 // MARK: - The shaders
 
@@ -167,6 +168,7 @@ struct WorldDraw {
 constant uint DRAW_MASK = 1;
 constant uint DRAW_TEXTURED = 2;
 constant uint DRAW_REPLACE = 4;
+constant uint DRAW_COVERAGE = 8;
 constant uint MATERIAL_UNLIT = 1;
 constant uint MATERIAL_MASK = 4;
 constant float LINE_PULL = 2.0e-3;
@@ -449,8 +451,14 @@ static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* 
     float3 tint = float3(SRGB_DECODE[instance.tint.r], SRGB_DECODE[instance.tint.g], SRGB_DECODE[instance.tint.b]) * in.part_tint;
     float3 base = surface.rgb * tint * color.rgb;
     float alpha = surface.a * (float(instance.tint.a) / 255.0) * color.a;
+    // with four samples a cut-out's edge becomes coverage: the cut
+    // sharpened to a pixel's width, the samples it covers kept
+    float alpha_width = (draw.flags & DRAW_COVERAGE) != 0 ? fwidth(alpha) : 0.0;
+    float coverage = -1.0;
     if ((draw.flags & DRAW_MASK) != 0 || (flags & MATERIAL_MASK) != 0) {
-        if (alpha < material.params.z) {
+        if ((draw.flags & DRAW_COVERAGE) != 0) {
+            coverage = saturate((alpha - material.params.z) / max(alpha_width, 1e-4) + 0.5);
+        } else if (alpha < material.params.z) {
             discard_fragment();
         }
         alpha = 1.0;
@@ -479,7 +487,7 @@ static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* 
     }
     float3 code = float3(encode_code(linear.r), encode_code(linear.g), encode_code(linear.b));
     float3 codes = clamp(floor(code * alpha + 0.5 + dither), 0.0, 255.0);
-    return float4(codes, floor(alpha * 255.0 + 0.5)) / 255.0;
+    return float4(codes / 255.0, coverage >= 0.0 ? coverage : floor(alpha * 255.0 + 0.5) / 255.0);
 }
 
 fragment float4 world_fragment(WorldVary in [[stage_in]],
@@ -767,8 +775,9 @@ struct BackdropBlock {
 /// How a pipeline meets the target.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Pipe {
-    /// A surface; `true` when it steps back under the frame's edges.
-    Mesh(Blend, bool),
+    /// A surface; whether it steps back under the frame's edges, and
+    /// whether its alpha is its coverage (a cut-out at four samples).
+    Mesh(Blend, bool, bool),
     Lines,
     Backdrop,
 }
@@ -959,7 +968,9 @@ impl MetalWorld {
                             .and_then(|index| job.textures.get(index as usize).copied().flatten())
                             .and_then(|id| self.textures.get(&id).copied());
                         let bias = if blend == Blend::Replace { job.frame.face_bias } else { 0.0 };
-                        let pipeline = unsafe { stack.pipeline(self.device, Pipe::Mesh(blend, bias > 0.0), samples) };
+                        // with four samples a cut-out's edge becomes coverage
+                        let coverage = mask && samples > 1;
+                        let pipeline = unsafe { stack.pipeline(self.device, Pipe::Mesh(blend, bias > 0.0, coverage), samples) };
                         if pipeline.is_null() {
                             continue;
                         }
@@ -972,6 +983,9 @@ impl MetalWorld {
                         }
                         if blend == Blend::Replace {
                             flags |= DRAW_REPLACE;
+                        }
+                        if coverage {
+                            flags |= DRAW_COVERAGE;
                         }
                         draws.push(PreparedDraw::Mesh {
                             pipeline,
@@ -1183,17 +1197,17 @@ impl WorldStack {
             return pipeline;
         }
         let (vertex, fragment) = match pipe {
-            Pipe::Mesh(_, false) => ("world_vertex", "world_fragment"),
-            Pipe::Mesh(_, true) => ("world_vertex", "world_fragment_stepped"),
+            Pipe::Mesh(_, false, _) => ("world_vertex", "world_fragment"),
+            Pipe::Mesh(_, true, _) => ("world_vertex", "world_fragment_stepped"),
             Pipe::Lines => ("line_vertex", "line_fragment"),
             Pipe::Backdrop => ("backdrop_vertex", "backdrop_fragment"),
         };
-        let blend = match pipe {
-            Pipe::Mesh(blend, _) => blend,
-            Pipe::Lines => Blend::Alpha,
-            Pipe::Backdrop => Blend::Replace,
+        let (blend, coverage) = match pipe {
+            Pipe::Mesh(blend, _, coverage) => (blend, coverage),
+            Pipe::Lines => (Blend::Alpha, false),
+            Pipe::Backdrop => (Blend::Replace, false),
         };
-        let pipeline = unsafe { world_pipeline(device, self.library, vertex, fragment, blend, samples) };
+        let pipeline = unsafe { world_pipeline(device, self.library, vertex, fragment, blend, coverage, samples) };
         let pipeline = pipeline.unwrap_or_else(|reason| {
             eprintln!("bunny_ui metal: {reason}");
             null_mut()
@@ -1224,7 +1238,7 @@ impl Drop for WorldStack {
 /// A pipeline of the world pass: RGBA8 colour and 32-bit depth at
 /// `samples`, blended the way the CPU blends that kind of draw. Colour
 /// is premultiplied throughout.
-unsafe fn world_pipeline(device: Id, library: Id, vertex: &str, fragment: &str, blend: Blend, samples: u8) -> Result<Id, String> {
+unsafe fn world_pipeline(device: Id, library: Id, vertex: &str, fragment: &str, blend: Blend, coverage: bool, samples: u8) -> Result<Id, String> {
     unsafe {
         let vertex_fn = msg_id_arg(library, sel("newFunctionWithName:"), ns_string(vertex));
         let fragment_fn = msg_id_arg(library, sel("newFunctionWithName:"), ns_string(fragment));
@@ -1236,6 +1250,7 @@ unsafe fn world_pipeline(device: Id, library: Id, vertex: &str, fragment: &str, 
         msg_void_id(descriptor, sel("setFragmentFunction:"), fragment_fn);
         msg_void_u64(descriptor, sel("setDepthAttachmentPixelFormat:"), PIXEL_FORMAT_DEPTH32_FLOAT);
         msg_void_u64(descriptor, sel("setRasterSampleCount:"), samples as u64);
+        msg_void_bool(descriptor, sel("setAlphaToCoverageEnabled:"), coverage as i8);
         let attachment = msg_id_u64(msg_id(descriptor, sel("colorAttachments")), sel("objectAtIndexedSubscript:"), 0);
         msg_void_u64(attachment, sel("setPixelFormat:"), PIXEL_FORMAT_RGBA8);
         // over: rgb = s + d·(1−sa), a = sa + da·(1−sa); add: rgb = s + d,

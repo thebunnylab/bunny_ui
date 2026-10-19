@@ -214,6 +214,7 @@ const FRAMES_IN_FLIGHT: u64 = 3;
 const DRAW_MASK: u32 = 1;
 const DRAW_TEXTURED: u32 = 2;
 const DRAW_REPLACE: u32 = 4;
+const DRAW_COVERAGE: u32 = 8;
 
 #[repr(C)]
 struct StencilOpState([u32; 7]);
@@ -262,8 +263,9 @@ const _: () = assert!(DRAW_PUSH == 96);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Pipe {
     /// A surface: how it blends, whether it steps back under the edges,
-    /// whether it culls its back, whether its instances mirror it.
-    Mesh { blend: Blend, stepped: bool, cull_back: bool, mirrored: bool },
+    /// whether it culls its back, whether its instances mirror it, and
+    /// whether its alpha is its coverage (a cut-out at four samples).
+    Mesh { blend: Blend, stepped: bool, cull_back: bool, mirrored: bool, coverage: bool },
     /// Lines, by depth mode: tested, hidden only, always.
     Lines(u8),
     Backdrop,
@@ -1275,7 +1277,7 @@ impl WorldStack {
             sample_shading: 0,
             min_sample_shading: 0.0,
             sample_mask: std::ptr::null(),
-            alpha_to_coverage: 0,
+            alpha_to_coverage: matches!(pipe, Pipe::Mesh { coverage: true, .. }) as u32,
             alpha_to_one: 0,
         };
         // opaque surfaces write the depth; see-through ones and lines
@@ -1580,7 +1582,9 @@ impl WorldStack {
                             .and_then(|id| surfaces.get(&id));
                         let replace = blend == Blend::Replace;
                         let bias = if replace { frame.face_bias } else { 0.0 };
-                        let pipeline = self.pipeline(stack, Pipe::Mesh { blend, stepped: bias > 0.0, cull_back, mirrored }, samples);
+                        // with four samples a cut-out's edge becomes coverage
+                        let coverage = mask && samples > 1;
+                        let pipeline = self.pipeline(stack, Pipe::Mesh { blend, stepped: bias > 0.0, cull_back, mirrored, coverage }, samples);
                         if pipeline == 0 {
                             continue;
                         }
@@ -1593,6 +1597,9 @@ impl WorldStack {
                         }
                         if replace {
                             flags |= DRAW_REPLACE;
+                        }
+                        if coverage {
+                            flags |= DRAW_COVERAGE;
                         }
                         (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, pipeline);
                         let picture = surface.map_or(self.blank.set, |surface| surface.set);

@@ -268,7 +268,10 @@ nothing at all.
 | `Quality::High` | 4 | 4 million | 2048² | 9 |
 
 A box inside the budget is drawn at its own size. A larger box is drawn
-smaller, and the compositor stretches it to the box.
+smaller, and the compositor stretches it to the box. At four samples a
+cut-out surface (`Material::mask`) turns its edge into coverage — the
+cut sharpened to a pixel's width — so leaves and grilles keep a smooth
+edge; at one sample it cuts as the CPU does.
 
 ## The oracle
 
@@ -322,6 +325,6 @@ BUNNY_PARANOID=all cargo test -p bunny-ui-core --all-features
 cargo test -p bunny-ui-apple --features 3d
 cargo run -p bunny-ui-macos --features 3d --example world_window
 # in a page built with the web shell's `3d` feature, from the console:
-#   for (let n = 0; n < 14; n++) __bunny.bunny_gpu_world_parity(n)
+#   for (let n = 0; n < 15; n++) __bunny.bunny_gpu_world_parity(n)
 BUNNY_WORLD_GLB=chair.glb BUNNY_WORLD_DUMP=/tmp cargo test -p bunny-ui-core --features gltf --lib a_glb_from_the_environment -- --ignored
 ```

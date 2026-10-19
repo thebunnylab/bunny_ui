@@ -41,6 +41,7 @@ uniform vec4 u_draw;
 const uint DRAW_MASK = 1u;
 const uint DRAW_TEXTURED = 2u;
 const uint DRAW_REPLACE = 4u;
+const uint DRAW_COVERAGE = 8u;
 const uint MATERIAL_UNLIT = 1u;
 const uint MATERIAL_MASK = 4u;
 const float LINE_PULL = 2.0e-3;
@@ -369,8 +370,14 @@ vec4 shade() {
     vec4 surface = (front || !two_sided) ? base_row : vec4(back_row.xyz, base_row.w);
     vec3 base = surface.rgb * v_tint.rgb * color.rgb;
     float alpha = surface.a * v_tint.a * color.a;
+    // with four samples a cut-out's edge becomes coverage: the cut
+    // sharpened to a pixel's width, the samples it covers kept
+    float alpha_width = (draw & DRAW_COVERAGE) != 0u ? fwidth(alpha) : 0.0;
+    float coverage = -1.0;
     if ((draw & DRAW_MASK) != 0u || (flags & MATERIAL_MASK) != 0u) {
-        if (alpha < params_row.z) {
+        if ((draw & DRAW_COVERAGE) != 0u) {
+            coverage = clamp((alpha - params_row.z) / max(alpha_width, 1e-4) + 0.5, 0.0, 1.0);
+        } else if (alpha < params_row.z) {
             discard;
         }
         alpha = 1.0;
@@ -396,7 +403,7 @@ vec4 shade() {
     }
     vec3 code = vec3(encode_code(linear.r), encode_code(linear.g), encode_code(linear.b));
     vec3 codes = clamp(floor(code * alpha + 0.5 + dither), 0.0, 255.0);
-    return vec4(codes, floor(alpha * 255.0 + 0.5)) / 255.0;
+    return vec4(codes / 255.0, coverage >= 0.0 ? coverage : floor(alpha * 255.0 + 0.5) / 255.0);
 }
 "#;
 

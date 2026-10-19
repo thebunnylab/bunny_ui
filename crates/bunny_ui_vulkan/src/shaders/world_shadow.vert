@@ -37,6 +37,7 @@ layout(push_constant) uniform Draw {
 const uint DRAW_MASK = 1u;
 const uint DRAW_TEXTURED = 2u;
 const uint DRAW_REPLACE = 4u;
+const uint DRAW_COVERAGE = 8u;
 const uint MATERIAL_UNLIT = 1u;
 const uint MATERIAL_MASK = 4u;
 const float LINE_PULL = 2.0e-3;

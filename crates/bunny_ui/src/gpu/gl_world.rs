@@ -80,6 +80,7 @@ pub mod gl {
     pub const DEPTH_TEST: u32 = 0x0B71;
     pub const BLEND: u32 = 0x0BE2;
     pub const CULL_FACE: u32 = 0x0B44;
+    pub const SAMPLE_ALPHA_TO_COVERAGE: u32 = 0x809E;
     pub const BACK: u32 = 0x0405;
     pub const CW: u32 = 0x0900;
     pub const CCW: u32 = 0x0901;
@@ -452,6 +453,7 @@ impl<G: GlFamily> GlWorld<G> {
         gl.disable(gl::DEPTH_TEST);
         gl.depth_mask(true);
         gl.disable(gl::CULL_FACE);
+        gl.disable(gl::SAMPLE_ALPHA_TO_COVERAGE);
         gl.front_face(gl::CCW);
         gl.enable(gl::BLEND);
         let [a, b, c, d] = self.blend_2d;
@@ -577,6 +579,11 @@ impl<G: GlFamily> GlWorld<G> {
                     if mask {
                         flags |= 1;
                     }
+                    // with four samples a cut-out's edge becomes coverage
+                    let coverage = mask && target.multisample != 0;
+                    if coverage {
+                        flags |= 8;
+                    }
                     if surface.is_some() {
                         flags |= 2;
                     }
@@ -587,6 +594,11 @@ impl<G: GlFamily> GlWorld<G> {
                     gl.use_program(program.handle);
                     gl.uniform4fv(program.draw, &[[flags as f32, near, far, bias]]);
                     set_blend(gl, blend);
+                    if coverage {
+                        gl.enable(gl::SAMPLE_ALPHA_TO_COVERAGE);
+                    } else {
+                        gl.disable(gl::SAMPLE_ALPHA_TO_COVERAGE);
+                    }
                     gl.depth_func(gl::LESS);
                     gl.depth_mask(replace);
                     if cull_back {

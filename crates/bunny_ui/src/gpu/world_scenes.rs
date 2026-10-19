@@ -18,7 +18,7 @@ use crate::world::mesh::{Mesh, MeshData};
 use crate::world::store::World;
 
 /// How many worlds the catalog holds.
-pub const COUNT: u32 = 14;
+pub const COUNT: u32 = 15;
 
 /// What a tier's picture may differ from the CPU's by: the share of
 /// pixels whose worst channel is more than three codes apart, and more
@@ -202,6 +202,26 @@ pub fn world_scene(index: u32) -> WorldScene {
             tolerance: PENUMBRA,
             pictures: Vec::new(),
         },
+        14 => {
+            // the cut-out floor at four samples: its edges become coverage,
+            // which the CPU's one sample cannot show
+            let world = World::new();
+            let floor = Mesh::new(MeshData {
+                positions: vec![[-4.0, 0.0, 4.0], [4.0, 0.0, 4.0], [4.0, 0.0, -40.0], [-4.0, 0.0, -40.0]],
+                normals: vec![[0.0, 1.0, 0.0]; 4],
+                uvs: vec![[0.0, 0.0], [4.0, 0.0], [4.0, 22.0], [0.0, 22.0]],
+                indices: vec![0, 1, 2, 0, 2, 3],
+                ..MeshData::default()
+            });
+            let picture = checker(8, 64);
+            world.add(floor, Material::color(Color::WHITE).texture(picture.clone()).mask(0.5));
+            WorldScene {
+                frame: frame(&world, &Camera::looking_at(vec3(0.0, 1.2, 5.0), vec3(0.0, 0.0, -6.0)), Quality::Medium, (160, 120)),
+                name: "a cut-out at four samples",
+                tolerance: Tolerance { beyond_three: 0.25, beyond_sixteen: 0.08 },
+                pictures: vec![picture],
+            }
+        }
         13 => {
             // a sky over a ground, the horizon across the middle: the
             // backdrop follows the view's tilt, not the picture's rows

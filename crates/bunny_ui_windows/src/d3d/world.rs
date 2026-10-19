@@ -85,6 +85,7 @@ const COMPILE_IEEE_STRICTNESS: u32 = 1 << 13;
 const DRAW_MASK: u32 = 1;
 const DRAW_TEXTURED: u32 = 2;
 const DRAW_REPLACE: u32 = 4;
+const DRAW_COVERAGE: u32 = 8;
 
 // MARK: - The shaders
 
@@ -199,6 +200,7 @@ SamplerComparisonState shadow_sampler : register(s2);
 static const uint DRAW_MASK = 1;
 static const uint DRAW_TEXTURED = 2;
 static const uint DRAW_REPLACE = 4;
+static const uint DRAW_COVERAGE = 8;
 static const uint MATERIAL_UNLIT = 1;
 static const uint MATERIAL_MASK = 4;
 static const float LINE_PULL = 2.0e-3;
@@ -488,8 +490,14 @@ float4 world_shade(WorldVary v, bool front) {
     float3 tinted = float3(SRGB_DECODE[tint & 0xFFu], SRGB_DECODE[(tint >> 8) & 0xFFu], SRGB_DECODE[(tint >> 16) & 0xFFu]) * v.part_tint;
     float3 base = surface.rgb * tinted * color.rgb;
     float alpha = surface.a * ((float)(tint >> 24) / 255.0) * color.a;
+    // with four samples a cut-out's edge becomes coverage: the cut
+    // sharpened to a pixel's width, the samples it covers kept
+    float alpha_width = (draw.flags & DRAW_COVERAGE) != 0u ? fwidth(alpha) : 0.0;
+    float coverage = -1.0;
     if ((draw.flags & DRAW_MASK) != 0u || (flags & MATERIAL_MASK) != 0u) {
-        if (alpha < material.params.z) {
+        if ((draw.flags & DRAW_COVERAGE) != 0u) {
+            coverage = saturate((alpha - material.params.z) / max(alpha_width, 1e-4) + 0.5);
+        } else if (alpha < material.params.z) {
             discard;
         }
         alpha = 1.0;
@@ -518,7 +526,7 @@ float4 world_shade(WorldVary v, bool front) {
     }
     float3 code = float3(encode_code(shaded.r), encode_code(shaded.g), encode_code(shaded.b));
     float3 codes = clamp(floor(code * alpha + 0.5 + dither), 0.0, 255.0);
-    return float4(codes, floor(alpha * 255.0 + 0.5)) / 255.0;
+    return float4(codes / 255.0, coverage >= 0.0 ? coverage : floor(alpha * 255.0 + 0.5) / 255.0);
 }
 
 float4 world_fragment(WorldVary v, bool front : SV_IsFrontFace) : SV_Target {
@@ -798,6 +806,8 @@ struct WorldStack {
     /// Over and add; a replacing draw binds no blend at all.
     over: Com<BlendState>,
     add: Com<BlendState>,
+    /// A cut-out at four samples: no blend, its alpha its coverage.
+    coverage: Com<BlendState>,
     sampler: Com<SamplerState>,
     /// The shadow map's sampler: four texels compared and filtered.
     compare: Com<SamplerState>,
@@ -1102,6 +1112,11 @@ impl D3dWorld {
                         if replace {
                             flags |= DRAW_REPLACE;
                         }
+                        // with four samples a cut-out's edge becomes coverage
+                        let coverage = mask && target.color.is_some();
+                        if coverage {
+                            flags |= DRAW_COVERAGE;
+                        }
                         let block = DrawBlock { first_instance: draw.first_instance, flags, near, far, bias: [bias, 0.0, 0.0, 0.0], ..DrawBlock::default() };
                         write_constants(context, stack.draw.as_ptr(), bytes_of(&block));
                         (vtbl.vs_set_shader)(context, stack.mesh_vs.as_ptr(), null(), 0);
@@ -1112,6 +1127,7 @@ impl D3dWorld {
                         // the instances mirror the mesh: its front turns the other way
                         (vtbl.rs_set_state)(context, stack.rasterizers[cull_back as usize * 2 + mirrored as usize].as_ptr());
                         let blend_state = match blend {
+                            Blend::Replace if coverage => stack.coverage.as_ptr(),
                             Blend::Replace => null_mut(),
                             Blend::Alpha => stack.over.as_ptr(),
                             Blend::Add => stack.add.as_ptr(),
@@ -1399,6 +1415,24 @@ impl WorldStack {
             };
             let over = blend_state(BLEND_ONE, BLEND_INV_SRC_ALPHA, BLEND_ONE, BLEND_INV_SRC_ALPHA)?;
             let add = blend_state(BLEND_ONE, BLEND_ONE, BLEND_INV_DEST_ALPHA, BLEND_ONE)?;
+            let coverage = {
+                let target = RenderTargetBlendDesc {
+                    blend_enable: 0,
+                    src_blend: BLEND_ONE,
+                    dest_blend: BLEND_ONE,
+                    blend_op: BLEND_OP_ADD,
+                    src_blend_alpha: BLEND_ONE,
+                    dest_blend_alpha: BLEND_ONE,
+                    blend_op_alpha: BLEND_OP_ADD,
+                    write_mask: 0x0F,
+                };
+                let desc = BlendDesc { alpha_to_coverage: 1, independent_blend: 0, render_target: [target; 8] };
+                let mut state: *mut BlendState = null_mut();
+                if !com_ok(((*(*device).vtbl).create_blend_state)(device, &desc, &mut state)) {
+                    return Err("the coverage blend state refused".to_string());
+                }
+                Com::from_raw(state).ok_or("null coverage blend state")?
+            };
 
             let sampler_desc = SamplerDesc {
                 filter: FILTER_MIN_MAG_MIP_LINEAR,
@@ -1492,6 +1526,7 @@ impl WorldStack {
                 rasterizers,
                 over,
                 add,
+                coverage,
                 sampler,
                 compare,
                 always,
