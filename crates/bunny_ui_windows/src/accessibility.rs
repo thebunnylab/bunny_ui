@@ -4,7 +4,7 @@
 mod abi;
 use super::{Guid, Hresult, Hwnd, UnknownVtbl, WindowHandle};
 use abi::*;
-use bunny_ui::accessibility::{Action, NodeId, Role};
+use bunny_ui::accessibility::{Action, NodeId, RangeValue, Role};
 use bunny_ui::{layout::Rect, runtime::Runtime};
 use std::{
     cell::RefCell,
@@ -33,6 +33,7 @@ struct Node {
     multiline: bool,
     enabled: bool,
     checked: Option<bool>,
+    range: Option<RangeValue>,
 }
 #[derive(Clone, Default)]
 struct Snapshot {
@@ -155,6 +156,7 @@ impl Accessibility {
                         multiline: node.multiline,
                         enabled: node.enabled,
                         checked: node.checked,
+                        range: node.range,
                     })
                     .collect(),
                 origin: super::scene_origin(surface.window),
@@ -398,6 +400,34 @@ impl Surface {
                         Ok(Variant::boolean(node.enabled)),
                     );
                 }
+                if let (Some(old_range), Some(new_range)) = (old.range, node.range) {
+                    for property in [
+                        RANGE_VALUE,
+                        RANGE_MINIMUM,
+                        RANGE_MAXIMUM,
+                        RANGE_SMALL_CHANGE,
+                        RANGE_LARGE_CHANGE,
+                    ] {
+                        let old_value = range_property(old_range, property);
+                        let new_value = range_property(new_range, property);
+                        if old_value != new_value {
+                            notify_property(
+                                &provider,
+                                property,
+                                old_value.map(Variant::real),
+                                new_value.map(Variant::real),
+                            );
+                        }
+                    }
+                    if old.enabled != node.enabled {
+                        notify_property(
+                            &provider,
+                            RANGE_READ_ONLY,
+                            Ok(Variant::boolean(!old.enabled)),
+                            Ok(Variant::boolean(!node.enabled)),
+                        );
+                    }
+                }
                 if old.checked != node.checked {
                     notify_property(
                         &provider,
@@ -497,6 +527,7 @@ struct Provider {
     invoke: Port<InvokeVtbl>,
     value: Port<ValueVtbl>,
     toggle: Port<ToggleVtbl>,
+    range: Port<RangeVtbl>,
     refs: AtomicU32,
     surface: Weak<Surface>,
     key: Key,
@@ -535,6 +566,10 @@ impl Owned {
                 table: &TOGGLE_VTABLE,
                 owner: ptr::null_mut(),
             },
+            range: Port {
+                table: &RANGE_VTABLE,
+                owner: ptr::null_mut(),
+            },
             refs: AtomicU32::new(1),
             surface: Arc::downgrade(surface),
             key,
@@ -547,6 +582,7 @@ impl Owned {
         value.invoke.owner = owner;
         value.value.owner = owner;
         value.toggle.owner = owner;
+        value.range.owner = owner;
         Self(Box::into_raw(value))
     }
     fn simple(&self) -> Object {
@@ -598,6 +634,8 @@ unsafe extern "system" fn query(this: Object, iid: *const Guid, out: *mut Object
         ptr::from_ref(&value.invoke).cast_mut().cast()
     } else if iid == TOGGLE && value.role == Some(Role::Checkbox) {
         ptr::from_ref(&value.toggle).cast_mut().cast()
+    } else if iid == RANGE && value.role == Some(Role::Slider) {
+        ptr::from_ref(&value.range).cast_mut().cast()
     } else if iid == VALUE && matches!(value.role, Some(Role::TextField | Role::PasswordField)) {
         ptr::from_ref(&value.value).cast_mut().cast()
     } else {
@@ -663,6 +701,7 @@ unsafe extern "system" fn pattern(this: Object, pattern: i32, out: *mut Object) 
         let value = unsafe { provider(this) };
         let (_, _, node) = state(value)?;
         let iid = match pattern {
+            RANGE_PATTERN if value.role == Some(Role::Slider) => &RANGE,
             INVOKE_PATTERN if value.role == Some(Role::Button) => &INVOKE,
             TOGGLE_PATTERN if value.role == Some(Role::Checkbox) => &TOGGLE,
             VALUE_PATTERN
@@ -702,6 +741,7 @@ unsafe extern "system" fn property(this: Object, property: i32, out: *mut Varian
                         Role::Text => 50020,
                         Role::Button => 50000,
                         Role::Checkbox => 50002,
+                        Role::Slider => 50015,
                         Role::TextField | Role::PasswordField => 50004,
                     })),
                     AUTOMATION_ID => Variant::string(&format!("bunny:{}", node.id.get())),
@@ -711,6 +751,15 @@ unsafe extern "system" fn property(this: Object, property: i32, out: *mut Varian
                     FOCUSABLE => Ok(Variant::boolean(node.enabled && node.role != Role::Text)),
                     TOGGLE_STATE if node.role == Role::Checkbox => {
                         Ok(Variant::integer(i32::from(node.checked.unwrap_or(false))))
+                    }
+                    RANGE_READ_ONLY if node.role == Role::Slider => {
+                        Ok(Variant::boolean(!node.enabled))
+                    }
+                    RANGE_VALUE | RANGE_MINIMUM | RANGE_MAXIMUM | RANGE_LARGE_CHANGE
+                    | RANGE_SMALL_CHANGE
+                        if node.role == Role::Slider =>
+                    {
+                        range_property(node.range.ok_or(UNSUPPORTED)?, property).map(Variant::real)
                     }
                     PASSWORD => Ok(Variant::boolean(node.role == Role::PasswordField)),
                     VALUE_VALUE if node.role == Role::PasswordField => Err(DENIED),
@@ -832,10 +881,21 @@ fn enqueue(value: &Provider, action: Action) -> Hresult {
         ) | (
             Some(Role::TextField | Role::PasswordField),
             Action::Focus | Action::SetText(_)
+        ) | (
+            Some(Role::Slider),
+            Action::Focus | Action::Increment | Action::Decrement | Action::SetValue(_)
         ) | (None, Action::Focus)
     );
     if !supported {
         return UNSUPPORTED;
+    }
+    if let Action::SetValue(number) = action
+        && !node
+            .as_ref()
+            .and_then(|node| node.range)
+            .is_some_and(|range| range.contains(number))
+    {
+        return INVALID;
     }
     let Ok(mut requests) = surface.queue.requests.lock() else {
         return FAILED;
@@ -947,6 +1007,49 @@ unsafe extern "system" fn read_only(this: Object, out: *mut i32) -> Hresult {
         Ok(0)
     })
 }
+fn range_property(range: RangeValue, property: i32) -> Result<f64, Hresult> {
+    match property {
+        RANGE_VALUE => Ok(range.value()),
+        RANGE_MINIMUM => Ok(range.minimum()),
+        RANGE_MAXIMUM => Ok(range.maximum()),
+        RANGE_SMALL_CHANGE => Ok(range.small_change()),
+        RANGE_LARGE_CHANGE => Ok(range.large_change()),
+        _ => Err(UNSUPPORTED),
+    }
+}
+fn range_output(this: Object, out: *mut f64, property: i32) -> Hresult {
+    output(out, 0.0, || {
+        let (_, _, node) = state(unsafe { provider(this) })?;
+        range_property(
+            node.and_then(|node| node.range).ok_or(UNSUPPORTED)?,
+            property,
+        )
+    })
+}
+unsafe extern "system" fn set_range(this: Object, value: f64) -> Hresult {
+    enqueue(unsafe { provider(this) }, Action::SetValue(value))
+}
+unsafe extern "system" fn get_range(this: Object, out: *mut f64) -> Hresult {
+    range_output(this, out, RANGE_VALUE)
+}
+unsafe extern "system" fn range_minimum(this: Object, out: *mut f64) -> Hresult {
+    range_output(this, out, RANGE_MINIMUM)
+}
+unsafe extern "system" fn range_maximum(this: Object, out: *mut f64) -> Hresult {
+    range_output(this, out, RANGE_MAXIMUM)
+}
+unsafe extern "system" fn range_small(this: Object, out: *mut f64) -> Hresult {
+    range_output(this, out, RANGE_SMALL_CHANGE)
+}
+unsafe extern "system" fn range_large(this: Object, out: *mut f64) -> Hresult {
+    range_output(this, out, RANGE_LARGE_CHANGE)
+}
+unsafe extern "system" fn range_read_only(this: Object, out: *mut i32) -> Hresult {
+    output(out, 1, || {
+        let (_, _, node) = state(unsafe { provider(this) })?;
+        Ok(i32::from(!node.ok_or(UNSUPPORTED)?.enabled))
+    })
+}
 const fn unknown() -> UnknownVtbl {
     UnknownVtbl {
         query_interface: query,
@@ -991,6 +1094,17 @@ static VALUE_VTABLE: ValueVtbl = ValueVtbl {
     read_only,
 };
 
+static RANGE_VTABLE: RangeVtbl = RangeVtbl {
+    unknown: unknown(),
+    set: set_range,
+    get: get_range,
+    read_only: range_read_only,
+    maximum: range_maximum,
+    minimum: range_minimum,
+    large_change: range_large,
+    small_change: range_small,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1028,6 +1142,7 @@ mod tests {
                 multiline: node.multiline,
                 enabled: node.enabled,
                 checked: node.checked,
+                range: node.range,
             })
             .collect();
         let surface = Arc::new(Surface {

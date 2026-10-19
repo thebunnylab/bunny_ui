@@ -10,6 +10,7 @@ use bunny_ui::action::Modifiers;
 use bunny_ui::host::{MouseButton, WebviewInput};
 pub use bunny_ui_apple::webview::*;
 
+use crate::objc_bool::ObjcBool;
 use crate::ffi::{CGPoint, CGRect, Id, NS_NOT_FOUND, NSRange, Sel, class, sel};
 
 // The wheel is the one event AppKit has no constructor for: a scroll
@@ -45,14 +46,15 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_i64(obj: Id, sel: Sel) -> i64;
     #[link_name = "objc_msgSend"]
-    fn msg_bool_sel(obj: Id, sel: Sel, a: Sel) -> i8;
+    fn msg_bool_sel(obj: Id, sel: Sel, a: Sel) -> ObjcBool;
     #[link_name = "objc_msgSend"]
-    fn msg_bool(obj: Id, sel: Sel) -> i8;
+    fn msg_bool(obj: Id, sel: Sel) -> ObjcBool;
     #[link_name = "objc_msgSend"]
     fn msg_id_u64(obj: Id, sel: Sel, a: u64) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_f64(obj: Id, sel: Sel) -> f64;
-    #[link_name = "objc_msgSend"]
+    #[cfg_attr(target_arch = "aarch64", link_name = "objc_msgSend")]
+    #[cfg_attr(target_arch = "x86_64", link_name = "objc_msgSend_stret")]
     fn msg_rect(obj: Id, sel: Sel) -> CGRect;
     #[link_name = "objc_msgSend"]
     fn msg_point_point_id(obj: Id, sel: Sel, point: CGPoint, view: Id) -> CGPoint;
@@ -89,7 +91,7 @@ unsafe extern "C" {
         context: Id,
         characters: Id,
         bare: Id,
-        repeat: i8,
+        repeat: ObjcBool,
         code: u16,
     ) -> Id;
 
@@ -195,7 +197,7 @@ const fn press_kinds(button: MouseButton) -> (u64, u64) {
 unsafe fn window_point(view: Id, x: f64, y: f64) -> CGPoint {
     unsafe {
         let bounds = msg_rect(view, sel("bounds"));
-        let local = if msg_bool(view, sel("isFlipped")) != 0 {
+        let local = if msg_bool(view, sel("isFlipped")).get() {
             CGPoint { x: bounds.origin.x + x, y: bounds.origin.y + y }
         } else {
             CGPoint { x: bounds.origin.x + x, y: bounds.origin.y + bounds.size.height - y }
@@ -284,7 +286,7 @@ unsafe fn move_door(view: Id) -> Id {
             if owner.is_null() || std::ptr::eq(owner, view) {
                 continue;
             }
-            if msg_bool_sel(owner, sel("respondsToSelector:"), sel("mouseMoved:")) != 0 {
+            if msg_bool_sel(owner, sel("respondsToSelector:"), sel("mouseMoved:")).get() {
                 return owner;
             }
         }
@@ -375,7 +377,7 @@ unsafe fn main_screen_height() -> Option<f64> {
 unsafe fn send_text(view: Id, window: Id, text: &str) {
     unsafe {
         let door = sel("insertText:replacementRange:");
-        if msg_bool_sel(view, sel("respondsToSelector:"), door) != 0 {
+        if msg_bool_sel(view, sel("respondsToSelector:"), door).get() {
             msg_void_id_range(view, door, ns(text), NSRange { location: NS_NOT_FOUND, length: 0 });
             return;
         }
@@ -435,7 +437,7 @@ unsafe fn stroke(view: Id, window: Id, code: u16, characters: &str) {
                 null_mut(),
                 text,
                 text,
-                0,
+                ObjcBool::NO,
                 code,
             );
             if !event.is_null() {

@@ -93,3 +93,19 @@ path = "examples/compose_window.rs"
 [[test]]
 name = "window_lifecycle"
 harness = false
+
+[[test]]
+name = "window_relationships"
+harness = false
+
+[[test]]
+name = "window_geometry"
+harness = false
+
+[[test]]
+name = "dialog_geometry"
+harness = false
+
+[[test]]
+name = "system_appearance"
+harness = false

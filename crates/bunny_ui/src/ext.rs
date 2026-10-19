@@ -1434,7 +1434,14 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         spec: crate::layout::AlertSpec,
         content: impl Fn(&Context) -> Erased + 'static,
     ) -> Modified<Self> {
-        Modified::new(self, Modifier::Alert { is_presented, spec, content: Rc::new(content), })
+        Modified::new(
+            self,
+            Modifier::Alert {
+                is_presented,
+                spec: Box::new(spec),
+                content: Rc::new(content),
+            },
+        )
     }
 
     /// Marks THIS view as a window-drag handle: on a chrome-less

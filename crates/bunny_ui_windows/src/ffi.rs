@@ -18,6 +18,21 @@ use std::sync::{Condvar, Mutex, OnceLock};
 mod accessibility;
 pub(crate) use accessibility::{Accessibility, Request as AccessibilityRequest};
 
+#[path = "confirmation.rs"]
+mod confirmation;
+#[path = "window_ops.rs"]
+mod window_ops;
+pub use confirmation::{
+    available as confirmation_available, defer as defer_confirmations, queue as queue_confirmation,
+};
+pub use window_ops::{focus_window, set_window_parent};
+#[path = "geometry_ops.rs"]
+mod geometry_ops;
+pub use geometry_ops::{
+    forget_geometry, queue_dialog_geometry, register_geometry, restore_window_placement,
+    window_geometry,
+};
+
 // MARK: - Win32 ABI surface (the platform headers, transcribed)
 
 pub type Hwnd = isize;
@@ -683,6 +698,10 @@ pub(crate) fn com_init() {
 /// beats to each of them.
 #[derive(Clone)]
 pub enum AppEvent {
+    /// Captured native geometry addressed to its non-recycled scene lifetime.
+    GeometryChanged(bunny_ui::window::GeometryObservation),
+    /// Captured dialog geometry, bound to its current presentation.
+    DialogGeometryChanged(bunny_ui::window::DialogGeometryObservation),
     /// First UIA query enables semantic collection.
     AccessibilityEnable,
     /// A validated COM request returns to the scene thread.
@@ -1541,9 +1560,14 @@ fn unregister_top_level(hwnd: Hwnd) -> usize {
             }
         }
     }
-    if driver().hwnd.load(Ordering::Acquire) == hwnd {
-        // the slow beat is the driver's too: its posts follow the heir
-        driver().hwnd.store(heir, Ordering::Release);
+    let clock = driver();
+    // Posting and handing off the window share the beat lock. Neither kind
+    // of tick queued to a dying window can acknowledge its in-flight latch.
+    let _beat = clock.beat.lock().expect("driver lock");
+    if clock.hwnd.load(Ordering::Acquire) == hwnd {
+        clock.hwnd.store(heir, Ordering::Release);
+        clock.in_flight.store(false, Ordering::Release);
+        clock.slow_in_flight.store(false, Ordering::Release);
     }
     TOP_LEVEL.with(|windows| windows.borrow().len())
 }
@@ -1648,6 +1672,8 @@ pub fn dispatch(event: AppEvent) {
             handler(event);
         }
     });
+    geometry_ops::drain();
+    confirmation::drain();
 }
 
 // MARK: - DPI metrics (one funnel)
@@ -1981,14 +2007,14 @@ fn drive(shared: &'static Driver) {
                 if unsafe { DwmFlush() } < 0 {
                     std::thread::sleep(std::time::Duration::from_millis(16));
                 }
-                post_beat(shared, WM_APP_FRAME, &shared.in_flight);
+                post_beat(shared, beat, WM_APP_FRAME, &shared.in_flight);
             }
             Beat::Slow(step) => {
                 let now = performance_counter();
                 let (next, due) = slow.next(step, now, ticks_per_second());
                 if wait_until(timer, shared.changed, due, now) {
                     slow = next;
-                    post_beat(shared, WM_APP_SLOW, &shared.slow_in_flight);
+                    post_beat(shared, beat, WM_APP_SLOW, &shared.slow_in_flight);
                 }
             }
         }
@@ -1997,12 +2023,17 @@ fn drive(shared: &'static Driver) {
 
 /// Posts one beat to the driver's window unless the previous one of its
 /// kind is still in the queue.
-fn post_beat(shared: &Driver, message: u32, in_flight: &AtomicBool) {
+fn post_beat(shared: &Driver, expected: Beat, message: u32, in_flight: &AtomicBool) {
+    let beat = shared.beat.lock().expect("driver lock");
+    if *beat != expected || *beat == Beat::Parked {
+        return;
+    }
     let hwnd = shared.hwnd.load(Ordering::Acquire);
-    if hwnd != 0 && !in_flight.swap(true, Ordering::AcqRel) {
-        unsafe {
-            PostMessageW(hwnd, message, 0, 0);
-        }
+    if hwnd != 0
+        && !in_flight.swap(true, Ordering::AcqRel)
+        && unsafe { PostMessageW(hwnd, message, 0, 0) } == 0
+    {
+        in_flight.store(false, Ordering::Release);
     }
 }
 
@@ -2329,6 +2360,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             // it, and a dispatch would re-enter the handler running it.
             if is_dialog(hwnd) {
                 refresh_metrics(hwnd);
+                geometry_ops::notify_dialog(hwnd);
                 ask_represent(owner_of(hwnd));
                 return 0;
             }
@@ -2336,6 +2368,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 return 0;
             }
             refresh_metrics(hwnd);
+            geometry_ops::notify(hwnd);
             // the platform's word on the window itself, BEFORE the frame
             // that shows it: a scene-drawn caption swaps the square for
             // the restore glyph in the same composition as the new size
@@ -2347,7 +2380,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_DPICHANGED => {
-            if !is_top_level(hwnd) {
+            if !is_top_level(hwnd) && !is_dialog(hwnd) {
                 // layered panels are raw screen pixels — the owner's
                 // funnel rescales them on its next present
                 return 0;
@@ -2370,7 +2403,12 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 }
             }
             refresh_metrics(hwnd);
-            dispatch_at(hwnd, AppEvent::Redraw);
+            geometry_ops::notify(hwnd);
+            if is_dialog(hwnd) {
+                ask_represent(owner_of(hwnd));
+            } else {
+                dispatch_at(hwnd, AppEvent::Redraw);
+            }
             0
         }
         WM_PAINT => {
@@ -2598,6 +2636,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_MOVE => {
+            geometry_ops::notify(hwnd);
             if is_top_level(hwnd) {
                 // the engine repositions its own popups — a select
                 // dropdown, autofill — after the parent's move lands
@@ -2851,6 +2890,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
         }
         WM_APP_WAKE => {
             dispatch(AppEvent::Wake);
+            geometry_ops::drain_dialogs();
             0
         }
         WM_APP_REPRESENT => {
@@ -2964,6 +3004,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_DESTROY => {
+            geometry_ops::forget_dialog(hwnd);
             accessibility::destroy(hwnd);
             BACKING.with(|stores| {
                 if let Some(mut backing) = stores.borrow_mut().remove(&hwnd) {
@@ -3280,6 +3321,15 @@ pub struct WindowHandle {
 }
 
 impl WindowHandle {
+    /// Binds a native dialog to its runtime-owned presentation lease.
+    pub fn bind_dialog_geometry(
+        &self,
+        parent: Self,
+        session: Option<std::rc::Rc<bunny_ui::window::DialogGeometrySession>>,
+    ) {
+        geometry_ops::bind_dialog(self.hwnd, parent.hwnd, session);
+    }
+
     /// The window as an address — what an event's source is compared
     /// against, and the app's own handle for it.
     pub fn raw_window(&self) -> usize {
@@ -4426,6 +4476,39 @@ mod tests {
         // monitor: the caret is 30 × 50 points into the DIALOG
         let dialog = scene_rect_to_client(caret, 1.5, (100.0, 40.0));
         assert_eq!((dialog.left, dialog.top, dialog.right, dialog.bottom), (45, 75, 48, 102));
+    }
+
+    #[test]
+    fn a_failed_or_obsolete_beat_does_not_latch_the_driver() {
+        for (expected, message) in [
+            (Beat::Composition, WM_APP_FRAME),
+            (Beat::Slow(0.25), WM_APP_SLOW),
+        ] {
+            let shared = Driver {
+                beat: Mutex::new(expected),
+                resume: Condvar::new(),
+                changed: 0,
+                hwnd: AtomicIsize::new(isize::MAX),
+                in_flight: AtomicBool::new(false),
+                slow_in_flight: AtomicBool::new(false),
+            };
+            let latch = if message == WM_APP_FRAME {
+                &shared.in_flight
+            } else {
+                &shared.slow_in_flight
+            };
+            post_beat(&shared, expected, message, latch);
+            assert!(
+                !latch.load(Ordering::Acquire),
+                "an invalid HWND cannot acknowledge a failed post"
+            );
+            *shared.beat.lock().unwrap() = Beat::Parked;
+            post_beat(&shared, expected, message, latch);
+            assert!(
+                !latch.load(Ordering::Acquire),
+                "a retired pace must not post"
+            );
+        }
     }
 
     #[test]

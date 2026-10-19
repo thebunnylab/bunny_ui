@@ -138,6 +138,27 @@ pub trait CustomElement: 'static {
         Response::ignored()
     }
 
+    /// Optional bounded-range semantics, read only when native accessibility is
+    /// enabled. The retained placement supplies identity, clipping and label.
+    /// A range that declines keyboard focus is exposed as disabled.
+    fn accessibility_range(&self) -> Option<crate::accessibility::RangeValue> {
+        None
+    }
+
+    /// Applies a supported numeric action to the same binding used by input.
+    /// The runtime checks exposure and enabled state before calling this hook;
+    /// the element must still validate the requested value against its domain.
+    ///
+    /// # Errors
+    /// Returns unsupported by default, or a validation error from the control.
+    fn accessibility_action(
+        &self,
+        action: &crate::accessibility::Action,
+    ) -> Result<(), crate::accessibility::ActionError> {
+        let _ = action;
+        Err(crate::accessibility::ActionError::Unsupported)
+    }
+
     /// What the pointer should look like at `at`, in LOCAL coordinates.
     ///
     /// `None` — the default — leaves the shell's own rule standing: the hand

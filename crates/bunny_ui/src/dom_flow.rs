@@ -61,6 +61,7 @@ pub(crate) struct FlowEnv<'a> {
 /// What the walk hands back beside the scene.
 pub(crate) struct FlowOutput {
     pub scene: DomNode,
+    pub dialogs: Vec<(String, crate::window::DialogGeometry)>,
     /// The islands' draw commands — every island's range indexes here,
     /// already in island-local coordinates (each subtree placed at its
     /// own origin).
@@ -122,10 +123,22 @@ pub(crate) struct GroupRecord {
     pub own_stretch: bool,
     /// The class its body declared for it (`boundary_class`).
     pub own_class: Option<std::rc::Rc<str>>,
-    /// The binding that class reads through, when it reads for itself.
-    pub class_binding: Option<std::rc::Rc<crate::bind::Bound<String>>>,
+    /// Rare retained subscriptions/controllers stay off the per-row record.
+    attachments: Option<std::rc::Rc<GroupAttachments>>,
     /// Drop targets inside the group: a reuse must still count them.
     pub drops: usize,
+}
+
+#[derive(Debug)]
+struct GroupAttachments {
+    class_binding: Option<std::rc::Rc<crate::bind::Bound<String>>>,
+    dialogs: Vec<(String, crate::window::DialogGeometry)>,
+}
+
+impl GroupRecord {
+    pub(crate) fn class_binding(&self) -> Option<&std::rc::Rc<crate::bind::Bound<String>>> {
+        self.attachments.as_ref()?.class_binding.as_ref()
+    }
 }
 
 /// Lowers the semantic tree to a flow scene. The root is the mount
@@ -149,6 +162,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         unbounded: false,
         drops_seen: 0,
         overlays: Vec::new(),
+        dialogs: Vec::new(),
         display: crate::layout::DisplayList::default(),
         fields: Vec::new(),
         slot: (None, None),
@@ -198,6 +212,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         rule: 0,
     };
     FlowOutput {
+        dialogs: walk.dialogs,
         scene,
         display: walk.display,
         fields: walk.fields,
@@ -294,6 +309,7 @@ struct Walk<'a> {
     /// `FlowEnv::drop_rings`.
     drops_seen: usize,
     overlays: Vec<DomNode>,
+    dialogs: Vec<(String, crate::window::DialogGeometry)>,
     display: crate::layout::DisplayList,
     fields: Vec<(String, crate::layout::AutoFocus)>,
     /// A class the current boundary's body declared for its OWN
@@ -411,7 +427,10 @@ fn promise(path: &std::rc::Rc<str>, record: &GroupRecord) -> DomNode {
         layout: Some(DomLayout { stretch: record.own_stretch, ..DomLayout::default() }),
         hints: DomHints { class: record.own_class.clone(), ..DomHints::default() },
         children: Vec::new(),
-        binding: record.class_binding.clone().map(crate::dom::NodeBinding::Class),
+        binding: record
+            .class_binding()
+            .cloned()
+            .map(crate::dom::NodeBinding::Class),
         face: None,
         id: 0,
         rule: 0,
@@ -718,7 +737,17 @@ impl Walk<'_> {
             // In flow mode there is no native child view to cross and
             // no second surface to present on: the sheet is a layer over
             // the page, which is what it looks like anyway.
-            LayoutNode::Sheet { content, child, .. } => {
+            LayoutNode::Sheet {
+                path,
+                surface,
+                content,
+                child,
+            } => {
+                if let crate::layout::OverlaySurface::Window(spec) = surface
+                    && let Some(controller) = &spec.geometry
+                {
+                    self.dialogs.push((path.clone(), controller.clone()));
+                }
                 let container = placed(out, node(DomKind::Layers));
                 container.layout.as_mut().expect("flow node").align =
                     Some(align_code(crate::layout::CrossAlign::Center));
@@ -1539,6 +1568,9 @@ impl Walk<'_> {
             return None;
         }
         self.drops_seen += record.drops;
+        if let Some(attachments) = &record.attachments {
+            self.dialogs.extend_from_slice(&attachments.dialogs);
+        }
         out.push(promise(path, record));
         Some(record.fill)
     }
@@ -1557,6 +1589,7 @@ impl Walk<'_> {
         );
         let outer_pending = self.pending_boundary_class.take();
         let drops_before = self.drops_seen;
+        let dialogs_before = self.dialogs.len();
         // what ran under this boundary is what ran under its parent and
         // under its own path: when nothing did, no boundary below it is
         // touched, and none of them asks
@@ -1600,7 +1633,13 @@ impl Walk<'_> {
                 fill: LayoutNode::boundary_is_flexible(children, Axis::Vertical, None),
                 own_stretch,
                 own_class: group.hints.class.clone(),
-                class_binding,
+                attachments: (class_binding.is_some() || self.dialogs.len() != dialogs_before)
+                    .then(|| {
+                        std::rc::Rc::new(GroupAttachments {
+                            class_binding,
+                            dialogs: self.dialogs[dialogs_before..].to_vec(),
+                        })
+                    }),
                 drops: self.drops_seen - drops_before,
             },
         ));
@@ -1780,6 +1819,11 @@ impl Walk<'_> {
             &env,
             &mut placement,
         );
+        self.dialogs.extend(
+            placement
+                .dialog_geometry()
+                .map(|(path, controller)| (path.to_owned(), controller.clone())),
+        );
         // the interior arrives ABSOLUTE (geometry on every node); the
         // wrapper is a Content box — position:relative by creation —
         // sized by our answer, carried by the flow like any other box
@@ -1861,6 +1905,11 @@ impl Walk<'_> {
             &fit,
             &env,
             &mut placement,
+        );
+        self.dialogs.extend(
+            placement
+                .dialog_geometry()
+                .map(|(path, controller)| (path.to_owned(), controller.clone())),
         );
         self.display.extend(placement.display);
         // the boxes inside this island keep their LOCAL frames — the
@@ -2174,6 +2223,7 @@ mod tests {
             unbounded: false,
             drops_seen: 0,
             overlays: Vec::new(),
+            dialogs: Vec::new(),
             display: crate::layout::DisplayList::default(),
             fields: Vec::new(),
             slot: (None, None),

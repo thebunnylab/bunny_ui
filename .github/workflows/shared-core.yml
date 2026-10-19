@@ -145,6 +145,9 @@ jobs:
         run: |
           cargo test -p bunny-ui-macos --locked --all-targets
           BUNNY_PARANOID=all cargo test -p bunny-ui-macos --locked --all-targets
+          # Compile the alternate ABI here; the Intel job executes it natively.
+          rustup target add x86_64-apple-darwin
+          cargo check -p bunny-ui-macos --locked --all-targets --target x86_64-apple-darwin
           rustup target add aarch64-apple-ios
           cargo check -p bunny-ui-ios --locked --target aarch64-apple-ios
       - name: Strict lint diagnostic comparison
@@ -182,3 +185,25 @@ jobs:
           name: native-text-${{ matrix.runner }}
           path: native-text-environment.json
           if-no-files-found: error
+
+  intel-macos:
+    name: Native Intel macOS shell
+    runs-on: macos-26-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Pinned compiler and host
+        run: |
+          test "$(uname -m)" = x86_64
+          sw_vers
+          sysctl machdep.cpu.brand_string
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
+          rustc --version --verbose
+      - name: Native shell, normal and paranoid
+        run: |
+          cargo test -p bunny-ui-macos --locked --all-targets
+          BUNNY_PARANOID=all cargo test -p bunny-ui-macos --locked --all-targets
