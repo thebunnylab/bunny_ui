@@ -135,7 +135,10 @@ perspective lens shows far things small; a parallel lens keeps their
 size, for a plan or an isometric view. `project` takes a world point to
 the box; `ray` takes a point of the box back into the world; the two
 agree. `framing` fits a box of the world into view. `fly_to` reaches
-another camera along a path that curves around the target.
+another camera along a path that curves around the target; a flight
+from one kind of lens to the other is a dolly zoom — the angle closes
+as the eye backs away, the target's plane keeps its framing, and the
+parallel lens takes over at the end with no jump.
 
 `Orbit` reads the box's events and moves a `State<Camera>`. A drag
 turns the view around the surface the press landed on, and that point
