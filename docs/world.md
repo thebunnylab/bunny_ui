@@ -151,12 +151,21 @@ of the target keeps its picture. A frame that changes nothing seen
 draws nothing. A frame with a bloom, a new eye, or a change past half
 of the target is drawn whole.
 
+A parallel eye at `Quality::Low` stands on the target's grid of
+pixels: the world's origin falls on a pixel's corner (the eye moves by
+less than a pixel for it), and the dither's pattern runs with the
+world. A pan then moves the whole picture by whole pixels, and the box
+keeps a second target: the tier slides the picture from one into the
+other and draws only the strips the slide uncovers, with what changed.
+A frame of a pan costs its strips, not the whole picture. A turn, a
+zoom, a gradient backdrop or a new range of depths draws whole.
+
 The CPU proves the rule (`world::damage`): the next frame drawn over
-the last in its rects gives the same bytes as the next frame drawn
-whole, and each tier proves the same against its own whole picture.
-Metal draws rects at one sample: four memoryless samples resolve into
-the whole target. The GL family, D3D11 and Vulkan draw them at four
-samples too.
+the last — slid, then drawn in its rects — gives the same bytes as the
+next frame drawn whole, and each tier proves the same against its own
+whole picture. Metal draws rects at one sample: four memoryless
+samples resolve into the whole target. The GL family, D3D11 and Vulkan
+draw them at four samples too.
 
 ## Cameras and the hand
 
@@ -457,6 +466,6 @@ cargo test -p bunny-ui-apple --features 3d
 cargo run -p bunny-ui-macos --features 3d --example world_window
 # in a page built with the web shell's `3d` feature, from the console:
 #   for (let n = 0; n < 21; n++) __bunny.bunny_gpu_world_parity(n)
-#   for (let n = 0; n < 4; n++) __bunny.bunny_gpu_world_redraw(n)
+#   for (let n = 0; n < 6; n++) __bunny.bunny_gpu_world_redraw(n)
 BUNNY_WORLD_GLB=chair.glb BUNNY_WORLD_DUMP=/tmp cargo test -p bunny-ui-core --features gltf --lib a_glb_from_the_environment -- --ignored
 ```

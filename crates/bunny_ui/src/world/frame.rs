@@ -326,6 +326,24 @@ pub struct Cover {
     pub rect: [f32; 4],
 }
 
+/// Where a parallel eye at Low stands, so a target that holds a picture of
+/// the world can slide it when the eye moves across the view
+/// ([`super::damage`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pan {
+    /// A hash of all the frame's instances share but where the eye
+    /// stands: its turn and its lens, the size, the style, the lights in
+    /// the world, the still map, the floor map.
+    pub key: u64,
+    /// The pixel corner the world's origin falls on. The eye stands on
+    /// the target's grid of pixels, so a pan moves the picture by whole
+    /// pixels.
+    pub origin: [i64; 2],
+    /// The near and far planes, measured from the world's origin along
+    /// the view: a pan that keeps them keeps every depth.
+    pub depth: [f64; 2],
+}
+
 /// One picture of a world, decided: everything a tier needs to draw it.
 #[derive(Clone, Debug)]
 pub struct WorldFrame {
@@ -384,6 +402,9 @@ pub struct WorldFrame {
     /// the lights, the still map, the floor map — so two frames with the
     /// same one differ only where their covers do.
     pub scene: u64,
+    /// Where a parallel eye at Low stands; `None` for any other eye, and
+    /// for a backdrop that does not slide with the world (a gradient).
+    pub pan: Option<Pan>,
 }
 
 impl WorldFrame {
@@ -575,8 +596,26 @@ pub(crate) fn build_frame(
     time: f64,
 ) -> WorldFrame {
     let aspect = if size.1 > 0 { size.0.max(1) as f64 / size.1 as f64 } else { 1.0 };
-    let view = camera.view();
+    let mut view = camera.view();
     let parallel = matches!(camera.lens, Lens::Parallel { .. });
+    // at Low a parallel eye stands on the target's grid of pixels: the
+    // world's origin falls on a pixel's corner, so a pan moves the
+    // picture by whole pixels, and a target can slide the picture it
+    // holds. The step is under a pixel
+    let snapped = parallel && style.quality == Quality::Low && size.0 > 0 && size.1 > 0;
+    let mut origin = [0i64; 2];
+    if snapped {
+        let lens = camera.projection(aspect, -1.0, 1.0);
+        let (half_width, half_height) = (size.0 as f64 * 0.5, size.1 as f64 * 0.5);
+        let clip = lens.transform(vec4(view.m[12], view.m[13], view.m[14], 1.0));
+        let (x, y) = ((clip.x / clip.w + 1.0) * half_width, (1.0 - clip.y / clip.w) * half_height);
+        let (across, down) = (lens.m[0] * half_width, lens.m[5] * half_height);
+        if x.is_finite() && y.is_finite() && across.abs() > 1e-300 && down.abs() > 1e-300 {
+            view.m[12] += (x.round() - x) / across;
+            view.m[13] -= (y.round() - y) / down;
+            origin = [x.round() as i64, y.round() as i64];
+        }
+    }
     // the sides of the view, without a near or far yet
     let open = if parallel { camera.projection(aspect, -1.0e12, 1.0e12) } else { camera.projection(aspect, 1.0e-9, 1.0e12) };
     let sides = Frustum::from_matrix(&open);
@@ -592,6 +631,7 @@ pub(crate) fn build_frame(
     let mut joints: Vec<Row> = Vec::new();
     // the world's box around what is in view: no shadow falls past it
     let mut receivers = Aabb::EMPTY;
+    let mut light_key = motor::hash::FxHasher::default();
     let mut levels = world.levels.borrow_mut();
     for (id, data) in world.iter() {
         if !world.shown(id) {
@@ -677,7 +717,14 @@ pub(crate) fn build_frame(
                     line_sets.push((seen(bounds), lines.clone(), *line_style));
                 }
             }
-            Shape::Light(light) => lights.push((*light, eye_from_model)),
+            Shape::Light(light) => {
+                lights.push((*light, eye_from_model));
+                // where it stands in the world, for the pan's key
+                light_key.write(format!("{light:?}").as_bytes());
+                for value in matrix.m {
+                    light_key.write_u64(value.to_bits());
+                }
+            }
             Shape::Empty => {}
         }
     }
@@ -742,6 +789,7 @@ pub(crate) fn build_frame(
         covers: Vec::new(),
         moving_covers: Vec::new(),
         scene: 0,
+        pan: None,
     };
     // the pixels an eye-space box may reach on the target
     let reach = |bounds: &Aabb, margin: f64| reach_of(bounds, &projection, size, margin);
@@ -981,7 +1029,7 @@ pub(crate) fn build_frame(
         frame.uniforms.tone[3] = frame.parts.len() as f32 + 1.0;
         frame.parts.extend(grade.points.iter().map(|&[r, g, b]| [r, g, b, 255]));
     }
-    if let Some(map) = floor_map.filter(|map| map.size.x > 0.0 && map.size.y > 0.0) {
+    if let Some(map) = floor_map.as_ref().filter(|map| map.size.x > 0.0 && map.size.y > 0.0) {
         // u runs with the world's x from the map's corner, v with its z;
         // the eye's own place is taken out in f64
         let along = |row: usize, origin: f64, span: f64| {
@@ -1003,8 +1051,58 @@ pub(crate) fn build_frame(
     if let (Some(fit), Some(size)) = (moving_fit, style.quality.moving_shadow_size()) {
         (frame.uniforms.moving_from_eye, frame.uniforms.moving) = lookup(&fit, size, style.quality.moving_shadow_taps());
     }
+    // the dither's pattern runs with the world's origin: a slid picture
+    // keeps the pattern a whole one draws
+    if snapped && frame.uniforms.tone[2] > 0.5 {
+        let phase = (-origin[0]).rem_euclid(4) + 4 * (-origin[1]).rem_euclid(4);
+        frame.uniforms.tone[2] = 1.0 + phase as f32;
+    }
     frame.scene = scene_of(&frame, &view, &projection, style, px_per_point);
+    if snapped && !matches!(style.background, Background::Gradient { .. }) {
+        let key = pan_key(&frame, &view, &projection, style, px_per_point, light_key.finish(), floor_map.as_deref());
+        // the world's origin lies `-view.m[14]` along the view
+        frame.pan = Some(Pan { key, origin, depth: [near + view.m[14], far + view.m[14]] });
+    }
     frame
+}
+
+/// The hash of all a frame's instances share but where the eye stands:
+/// its turn and its lens, the size, the style, the lights in the world,
+/// the still map, the floor map, the edges' step back.
+fn pan_key(
+    frame: &WorldFrame,
+    view: &Mat4,
+    projection: &Mat4,
+    style: &WorldStyle,
+    px_per_point: f32,
+    lights: u64,
+    floor: Option<&super::material::FloorMap>,
+) -> u64 {
+    let mut hasher = motor::hash::FxHasher::default();
+    hasher.write_u32(frame.size.0);
+    hasher.write_u32(frame.size.1);
+    hasher.write_u8(frame.samples);
+    hasher.write_u32(px_per_point.to_bits());
+    // the eye's turn and the lens across the view, to a nanometer a
+    // meter: an eye and a target moved by one step turn by a last bit
+    let fine = |value: f64| (value * 1e9).round() as i64;
+    for k in [0, 1, 2, 4, 5, 6, 8, 9, 10] {
+        hasher.write_i64(fine(view.m[k]));
+    }
+    for k in [0, 5, 12, 13] {
+        hasher.write_i64(fine(projection.m[k]));
+    }
+    hasher.write_u64(super::view::style_hash(style));
+    hasher.write_u64(lights);
+    hasher.write_u32(frame.face_bias.to_bits());
+    hasher.write_u64(frame.shadow.as_ref().map_or(0, |shadow| shadow.generation));
+    if let Some(map) = floor {
+        hasher.write_u64(map.picture.key());
+        for value in [map.origin.x, map.origin.y, map.size.x, map.size.y] {
+            hasher.write_u64(value.to_bits());
+        }
+    }
+    hasher.finish()
 }
 
 /// The pixels an eye-space box may reach on a target of `size` through

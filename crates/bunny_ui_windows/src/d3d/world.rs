@@ -40,7 +40,7 @@ use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::rc::Rc;
 
-use bunny_ui::gpu::world::{Redraw, WorldCaps, WorldGround, WorldJob};
+use bunny_ui::gpu::world::{Redraw, WorldCaps, WorldGround, WorldJob, slide_copy};
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::world::bloom::LEVELS;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, WorldFrame};
@@ -51,7 +51,7 @@ use bunny_ui::world::wire::{
 
 use super::{
     ADDRESS_CLAMP, BIND_RENDER_TARGET, BIND_SHADER_RESOURCE, BLEND_INV_SRC_ALPHA, BLEND_ONE, BLEND_OP_ADD, BlendDesc, BlendState, Blob,
-    Buffer, BufferDesc, COMPARISON_NEVER, CPU_ACCESS_READ, CULL_NONE, Context, D3dRect, DepthStencilDesc,
+    Buffer, BufferDesc, COMPARISON_NEVER, CPU_ACCESS_READ, CULL_NONE, Context, D3dBox, D3dRect, DepthStencilDesc,
     DepthStencilOpDesc, DepthStencilState, Device, Dsv, FILL_SOLID, FILTER_MIN_MAG_MIP_LINEAR, FORMAT_RGBA8,
     FORMAT_RGBA8_SRGB, FORMAT_UNKNOWN, MAP_READ, MAP_WRITE_DISCARD, MISC_BUFFER_STRUCTURED, MappedSubresource,
     PixelShader, RasterizerDesc, RasterizerState, RenderTargetBlendDesc, Rtv, SHADER_SOURCE, SRV_DIMENSION_BUFFER,
@@ -642,8 +642,10 @@ float4 world_shade(WorldVary v, bool front, out float glow) {
                            floor_light(instance.flags, v.eye),
                            float3(SRGB_DECODE[instance.ambient & 0xFFu], SRGB_DECODE[(instance.ambient >> 8) & 0xFFu],
                                   SRGB_DECODE[(instance.ambient >> 16) & 0xFFu]));
+        // the pattern's phase runs it with the world's origin
         if (u.tone.z > 0.5) {
-            dither = bayer((uint)v.position.x, (uint)v.position.y);
+            uint phase = (uint)u.tone.z - 1u;
+            dither = bayer((uint)v.position.x + (phase & 3u), (uint)v.position.y + (phase >> 2u));
         }
         shaded = tone_curve(light, u.tone.x, u.tone.y);
     }
@@ -1335,6 +1337,16 @@ impl D3dWorld {
                 }
             }
 
+            // a slide first: the picture the box showed, moved by the
+            // pan's step, which the rects then draw over
+            if let Redraw::Slide { from, shift, .. } = &job.redraw
+                && let Some(from) = targets.get(from)
+                && let Some((source, to)) = slide_copy(*shift, target.size)
+            {
+                let region = D3dBox { left: source[0], top: source[1], front: 0, right: source[0] + source[2], bottom: source[1] + source[3], back: 1 };
+                (vtbl.copy_subresource_region)(context, target.resolve.as_ptr().cast(), 0, to[0], to[1], 0, from.resolve.as_ptr().cast(), 0, &region);
+            }
+
             let instance_view = instances.srv_ptr();
             let material_view = materials.srv_ptr();
             (vtbl.vs_set_shader_resources)(context, 1, 1, &instance_view);
@@ -1386,9 +1398,9 @@ impl D3dWorld {
             // scissor holds the backdrop — which fills a rect a clear
             // cannot — and the draws inside it, and the rest keeps what the
             // target holds
-            let (rects, scissored) = match &job.redraw {
-                Redraw::Whole => (vec![[0, 0, width, height]], 0),
-                Redraw::Rects(rects) => (rects.clone(), 4),
+            let (rects, scissored) = match job.redraw.rects() {
+                None => (vec![[0, 0, width, height]], 0),
+                Some(rects) => (rects.to_vec(), 4),
             };
             if scissored == 0 {
                 (vtbl.clear_render_target_view)(context, rtv, clear.as_ptr());
@@ -1541,15 +1553,23 @@ impl D3dWorld {
     }
 
     /// `before` drawn whole into a target of its own, then `after` over it
-    /// in `rects` alone ([`Redraw::Rects`]), read back as
-    /// [`D3dWorld::draw_single`] reads: what `after` drawn whole gives,
-    /// when the redraw is right. For the parity harness.
-    pub(super) fn draw_over(&mut self, before: &Rc<WorldFrame>, after: &Rc<WorldFrame>, rects: &[[u32; 4]], images: &dyn ImageEngine) -> Option<Vec<u8>> {
+    /// as a box draws its next frame — slid by `shift`, then `rects` drawn
+    /// again ([`WorldJob::over`]) — read back as [`D3dWorld::draw_single`]
+    /// reads: what `after` drawn whole gives, when the redraw is right.
+    /// For the parity harness.
+    pub(super) fn draw_over(
+        &mut self,
+        before: &Rc<WorldFrame>,
+        after: &Rc<WorldFrame>,
+        shift: [i32; 2],
+        rects: &[[u32; 4]],
+        images: &dyn ImageEngine,
+    ) -> Option<Vec<u8>> {
         let under = WorldJob::single(self.door()?, before, images)?;
         self.encode(std::slice::from_ref(&under));
-        let over = WorldJob::over(self.door()?, &under, after, images, rects.to_vec())?;
+        let over = WorldJob::over(self.door()?, &under, after, images, shift, rects.to_vec())?;
         self.encode(std::slice::from_ref(&over));
-        let out = self.read_target(under.target);
+        let out = self.read_target(over.target);
         over.give_back_over(self);
         under.give_back(self);
         out
@@ -1997,8 +2017,9 @@ impl WorldGround for D3dWorld {
     fn world_caps(&self) -> WorldCaps {
         // the adapter's name is not read here: the ask stands
         // the samples stay in their texture between frames: a part
-        // redraws over them, and the resolve gives back the rest unchanged
-        WorldCaps { samples: 4, start: bunny_ui::world::Quality::High, redraw_samples: 4 }
+        // redraws over them, and the resolve gives back the rest unchanged;
+        // a copy slides a picture
+        WorldCaps { samples: 4, start: bunny_ui::world::Quality::High, redraw_samples: 4, slides: true }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {
@@ -2240,7 +2261,7 @@ mod tests {
         let Some(mut gpu) = harness() else { return };
         for index in 0..REDRAWS {
             let redraw = world_redraw(index);
-            let over = gpu.world_over_rgba(&redraw.before, &redraw.after, &redraw.rects).expect("the world pass");
+            let over = gpu.world_over_rgba(&redraw.before, &redraw.after, redraw.shift, &redraw.rects).expect("the world pass");
             let whole = gpu.world_rgba(&redraw.after).expect("the world pass");
             let s = Spread::of(&over, &whole);
             eprintln!("{} in {:?}: worst {} · >1 {} of {}", redraw.name, redraw.rects, s.worst, s.beyond[0], s.pixels);

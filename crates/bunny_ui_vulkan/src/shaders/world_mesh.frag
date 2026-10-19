@@ -366,8 +366,10 @@ vec4 shade() {
         }
         vec3 light = lit(v_eye, normal, base, params_row.x, params_row.y, emissive_row.xyz, v_occlusion,
                          1u << ((v_flags >> 8) & 31u), sun_visibility(v_eye, normal), floor_light(v_eye), v_ambient);
+        // the pattern's phase runs it with the world's origin
         if (tone.z > 0.5) {
-            dither = bayer(uint(gl_FragCoord.x), uint(gl_FragCoord.y));
+            uint phase = uint(tone.z) - 1u;
+            dither = bayer(uint(gl_FragCoord.x) + (phase & 3u), uint(gl_FragCoord.y) + (phase >> 2u));
         }
         linear = tone_curve(light, tone.x, tone.y);
     }

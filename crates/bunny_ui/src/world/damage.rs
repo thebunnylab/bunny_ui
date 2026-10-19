@@ -8,6 +8,11 @@
 //! not the other, and, when the map of what moves changed, where the
 //! shadows of what moves fall in each. A frame with a bloom, or a change
 //! past half of the target, is drawn whole.
+//!
+//! A parallel eye at Low that only moved across the view
+//! ([`super::frame::Pan`]) moves the whole picture by whole pixels: the
+//! held picture slides by the same step, and the strips the slide
+//! uncovers are drawn with what changed.
 
 use std::collections::HashMap;
 
@@ -16,14 +21,65 @@ use super::frame::WorldFrame;
 /// The most rects a redraw takes; more merge into fewer.
 pub const MAX_RECTS: usize = 4;
 
+/// How to draw a frame over the picture of the one before it in the same
+/// target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reuse {
+    /// How far the held picture slides, in pixels: x right, y down.
+    pub shift: [i32; 2],
+    /// What to draw again, in pixels `[x, y, width, height]` from the top
+    /// left: what the slide uncovers and what changed. Empty when nothing
+    /// did.
+    pub rects: Vec<[u32; 4]>,
+}
+
 /// The rects of `next` to draw again over a target that holds `held`, in
 /// pixels `[x, y, width, height]` from the top left: empty when nothing it
-/// shows changed. `None` when it must be drawn whole.
+/// shows changed. `None` when it must be drawn whole — or slid
+/// ([`reuse`]).
 pub fn redraw_rects(held: &WorldFrame, next: &WorldFrame) -> Option<Vec<[u32; 4]>> {
-    if held.size != next.size || held.samples != next.samples || held.scene != next.scene || held.bloom > 0 || next.bloom > 0 {
+    reuse(held, next).filter(|reuse| reuse.shift == [0, 0]).map(|reuse| reuse.rects)
+}
+
+/// How to draw `next` over a target that holds `held`: slid by a step,
+/// then some rects drawn again. `None` when it must be drawn whole.
+pub fn reuse(held: &WorldFrame, next: &WorldFrame) -> Option<Reuse> {
+    if held.size != next.size || held.samples != next.samples || held.bloom > 0 || next.bloom > 0 {
         return None;
     }
+    let (width, height) = (next.size.0 as i64, next.size.1 as i64);
+    let shift = if held.scene == next.scene {
+        [0, 0]
+    } else {
+        // the eye moved across the view, and nothing else of the scene
+        let (Some(was), Some(is)) = (held.pan, next.pan) else { return None };
+        let reach = (was.depth[1] - was.depth[0]).abs().max(1e-9);
+        let same_depth = (0..2).all(|k| (was.depth[k] - is.depth[k]).abs() <= reach * 1e-9);
+        if was.key != is.key || !same_depth {
+            return None;
+        }
+        let step = [is.origin[0] - was.origin[0], is.origin[1] - was.origin[1]];
+        if step[0].abs() >= width || step[1].abs() >= height {
+            return None;
+        }
+        [step[0] as i32, step[1] as i32]
+    };
+    let (dx, dy) = (shift[0] as f32, shift[1] as f32);
     let mut changed: Vec<[f32; 4]> = Vec::new();
+    // what the slide uncovers
+    let (w, h) = (width as f32, height as f32);
+    if dx > 0.0 {
+        changed.push([0.0, 0.0, dx, h]);
+    } else if dx < 0.0 {
+        changed.push([w + dx, 0.0, w, h]);
+    }
+    if dy > 0.0 {
+        changed.push([0.0, 0.0, w, dy]);
+    } else if dy < 0.0 {
+        changed.push([0.0, h + dy, w, h]);
+    }
+    // a held rect, where the slide leaves it
+    let slid = |rect: [f32; 4]| [rect[0] + dx, rect[1] + dy, rect[2] + dx, rect[3] + dy];
     // each key as many times as it shows: the covers one frame has more
     // of than the other changed
     let mut counts = HashMap::<u64, i64>::new();
@@ -39,7 +95,7 @@ pub fn redraw_rects(held: &WorldFrame, next: &WorldFrame) -> Option<Vec<[u32; 4]
                 && *count * sign > 0
             {
                 *count -= sign;
-                changed.push(cover.rect);
+                changed.push(if sign > 0 { slid(cover.rect) } else { cover.rect });
             }
         }
     };
@@ -48,7 +104,7 @@ pub fn redraw_rects(held: &WorldFrame, next: &WorldFrame) -> Option<Vec<[u32; 4]
     // the map of what moves changed: where its shadows fell, and fall
     let moving = |frame: &WorldFrame| frame.moving_shadow.as_ref().map(|shadow| shadow.generation);
     if moving(held) != moving(next) {
-        changed.extend(&held.moving_covers);
+        changed.extend(held.moving_covers.iter().map(|rect| slid(*rect)));
         changed.extend(&next.moving_covers);
     }
     let rects = merged(&changed, next.size);
@@ -56,13 +112,15 @@ pub fn redraw_rects(held: &WorldFrame, next: &WorldFrame) -> Option<Vec<[u32; 4]
     if area * 2 > next.size.0 as u64 * next.size.1 as u64 {
         return None;
     }
-    Some(rects)
+    Some(Reuse { shift, rects })
 }
 
 /// Whole pixels around `rects` (`[left, top, right, bottom]`), inside a
-/// target of `size`, as at most [`MAX_RECTS`] rects that never overlap:
-/// rects that meet become their hull, and while too many are left, the
-/// two whose hull adds the least.
+/// target of `size`, as at most [`MAX_RECTS`] rects: two that meet become
+/// their hull when it costs no more than both (an L of two strips stays
+/// two), and while too many are left, the two whose hull adds the least.
+/// Rects may overlap: a pixel drawn again in a second rect is drawn the
+/// same.
 fn merged(rects: &[[f32; 4]], size: (u32, u32)) -> Vec<[u32; 4]> {
     let mut boxes: Vec<[u32; 4]> = rects
         .iter()
@@ -79,9 +137,10 @@ fn merged(rects: &[[f32; 4]], size: (u32, u32)) -> Vec<[u32; 4]> {
     }
     let area = |b: [u32; 4]| (b[2] - b[0]) as u64 * (b[3] - b[1]) as u64;
     loop {
-        let meeting = (0..boxes.len())
-            .flat_map(|i| (i + 1..boxes.len()).map(move |j| (i, j)))
-            .find(|&(i, j)| boxes[i][0] < boxes[j][2] && boxes[j][0] < boxes[i][2] && boxes[i][1] < boxes[j][3] && boxes[j][1] < boxes[i][3]);
+        let meeting = (0..boxes.len()).flat_map(|i| (i + 1..boxes.len()).map(move |j| (i, j))).find(|&(i, j)| {
+            let (a, b) = (boxes[i], boxes[j]);
+            a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3] && area(hull(a, b)) <= area(a) + area(b)
+        });
         let pair = meeting.or_else(|| {
             (boxes.len() > MAX_RECTS)
                 .then(|| {
@@ -262,6 +321,112 @@ mod tests {
         assert_eq!(redraw_rects(&before, &frame(&world, Quality::Medium, 0.0)), None, "the still shadow moved");
     }
 
+    /// The room through a parallel eye at Low over `target`, the eye
+    /// `height` meters across the view.
+    fn iso(world: &World, target: Vec3, time: f64) -> WorldFrame {
+        let mut camera = Camera::orbiting(target, 45.0, 35.0, 20.0);
+        camera.lens = crate::world::camera::Lens::Parallel { height: 9.0 };
+        world.with(|data| build_frame(data, &camera, &style(Quality::Low), SIZE, 1.0, time))
+    }
+
+    #[test]
+    fn a_parallel_eye_at_low_stands_on_the_pixel_grid() {
+        let (world, _) = room();
+        let still = iso(&world, Vec3::ZERO, 0.0);
+        let pan = still.pan.expect("a parallel eye at Low");
+        // the origin of the world sits mid-target, on a pixel's corner
+        assert!((pan.origin[0] - SIZE.0 as i64 / 2).abs() <= 1 && (pan.origin[1] - SIZE.1 as i64 / 2).abs() <= 1, "{pan:?}");
+        // a pan by a fraction of a pixel stands on the grid too: the
+        // origin moves by whole pixels, and the dither with it
+        let moved = iso(&world, vec3(0.013, 0.0, -0.021), 0.0);
+        let phase = |frame: &WorldFrame| frame.uniforms.tone[2] as i64 - 1;
+        let expect = |origin: [i64; 2]| (-origin[0]).rem_euclid(4) + 4 * (-origin[1]).rem_euclid(4);
+        assert_eq!(phase(&still), expect(pan.origin));
+        assert_eq!(phase(&moved), expect(moved.pan.expect("a pan").origin));
+        // not at Medium, nor through a perspective eye
+        assert!(frame_at_medium(&world).pan.is_none());
+        assert!(frame(&world, Quality::Low, 0.0).pan.is_none());
+    }
+
+    fn frame_at_medium(world: &World) -> WorldFrame {
+        let mut camera = Camera::orbiting(Vec3::ZERO, 45.0, 35.0, 20.0);
+        camera.lens = crate::world::camera::Lens::Parallel { height: 9.0 };
+        world.with(|data| build_frame(data, &camera, &style(Quality::Medium), SIZE, 1.0, 0.0))
+    }
+
+    /// `next` drawn over `held` slid and redrawn in its rects is `next`
+    /// drawn whole, byte for byte: the eye stands on the pixel grid and the
+    /// dither runs with the world. The slide, which must be one.
+    fn slid_exactly(held: &WorldFrame, next: &WorldFrame) -> Reuse {
+        let reuse = reuse(held, next).expect("a slide");
+        assert_ne!(reuse.shift, [0, 0], "the eye moved");
+        let over = soft::draw_over_with(&soft::slid(&soft::draw(held), reuse.shift), next, &reuse.rects, &|_| None);
+        let whole = soft::draw(next);
+        let wrong = over.rgba.chunks(4).zip(whole.rgba.chunks(4)).filter(|(a, b)| a != b).count();
+        assert_eq!(wrong, 0, "the slide by {:?} in {:?} misses {wrong} pixels", reuse.shift, reuse.rects);
+        reuse
+    }
+
+    #[test]
+    fn a_pan_at_low_slides_the_picture_and_draws_what_it_uncovers() {
+        let (world, _) = room();
+        let before = iso(&world, Vec3::ZERO, 0.0);
+        let after = iso(&world, vec3(0.4, 0.0, -0.25), 0.0);
+        let reuse = slid_exactly(&before, &after);
+        // the two strips the slide uncovers, and nothing else
+        assert_eq!(reuse.rects.len(), 2, "{reuse:?}");
+        let area: u32 = reuse.rects.iter().map(|r| r[2] * r[3]).sum();
+        let uncovered = reuse.shift[0].unsigned_abs() * SIZE.1 + reuse.shift[1].unsigned_abs() * SIZE.0;
+        assert_eq!(area, uncovered, "{reuse:?}");
+    }
+
+    #[test]
+    fn a_pan_while_a_figure_walks_slides_and_redraws_the_walk() {
+        let (world, figure) = room();
+        figure.move_to(vec3(-0.5, 0.1, 2.0), 1.0);
+        let before = iso(&world, Vec3::ZERO, 0.2);
+        let after = iso(&world, vec3(-0.3, 0.0, 0.2), 0.4);
+        slid_exactly(&before, &after);
+    }
+
+    #[test]
+    fn a_pan_by_an_awkward_step_still_slides() {
+        // an eye and a target moved by one step, as a hand's pan moves
+        // them: the turn between them may change in its last bit
+        let (world, _) = room();
+        let looking = |shift: Vec3| {
+            let start = Camera::orbiting(vec3(0.1, 0.0, 0.7), 45.0, 35.0, 20.0);
+            let mut camera = Camera::looking_at(start.eye + shift, start.target + shift);
+            camera.lens = crate::world::camera::Lens::Parallel { height: 9.0 };
+            world.with(|data| build_frame(data, &camera, &style(Quality::Low), SIZE, 1.0, 0.0))
+        };
+        let before = looking(Vec3::ZERO);
+        // steps whose turn differs from the first in its last bit
+        let turn = |shift: Vec3| {
+            let start = Camera::orbiting(vec3(0.1, 0.0, 0.7), 45.0, 35.0, 20.0);
+            let view = Camera::looking_at(start.eye + shift, start.target + shift).view();
+            [0, 1, 2, 4, 5, 6, 8, 9, 10].map(|k| view.m[k].to_bits())
+        };
+        for step in [vec3(2.116_573_886_622_883, 0.0, 0.775_746_603_011_303_3), vec3(2.575_375_156_993_571_2, 0.0, -2.105_203_682_180_405_4)] {
+            assert_ne!(turn(step), turn(Vec3::ZERO), "the turn moved by a last bit");
+            slid_exactly(&before, &looking(step));
+        }
+    }
+
+    #[test]
+    fn a_turn_or_a_zoom_does_not_slide() {
+        let (world, _) = room();
+        let before = iso(&world, Vec3::ZERO, 0.0);
+        let mut turned = Camera::orbiting(Vec3::ZERO, 46.0, 35.0, 20.0);
+        turned.lens = crate::world::camera::Lens::Parallel { height: 9.0 };
+        let turned = world.with(|data| build_frame(data, &turned, &style(Quality::Low), SIZE, 1.0, 0.0));
+        assert_eq!(reuse(&before, &turned), None);
+        let mut zoomed = Camera::orbiting(Vec3::ZERO, 45.0, 35.0, 20.0);
+        zoomed.lens = crate::world::camera::Lens::Parallel { height: 8.0 };
+        let zoomed = world.with(|data| build_frame(data, &zoomed, &style(Quality::Low), SIZE, 1.0, 0.0));
+        assert_eq!(reuse(&before, &zoomed), None);
+    }
+
     #[test]
     fn many_far_apart_changes_merge_into_few_rects() {
         let rects: Vec<[f32; 4]> = (0..9).map(|k| [k as f32 * 15.0, 5.0, k as f32 * 15.0 + 4.0, 9.0]).collect();
@@ -271,8 +436,9 @@ mod tests {
             let inside = merged.iter().any(|m| rect[0] >= m[0] as f32 && rect[2] <= (m[0] + m[2]) as f32 && rect[1] >= m[1] as f32 && rect[3] <= (m[1] + m[3]) as f32);
             assert!(inside, "{rect:?} is redrawn");
         }
-        // two that overlap are one
-        assert_eq!(merged_of(&[[0.0, 0.0, 10.0, 10.0], [5.5, 5.0, 20.0, 12.0]]), vec![[0, 0, 20, 12]]);
+        // two that mostly overlap are one; an L of two strips stays two
+        assert_eq!(merged_of(&[[0.0, 0.0, 10.0, 10.0], [2.0, 1.0, 11.0, 10.0]]), vec![[0, 0, 11, 10]]);
+        assert_eq!(merged_of(&[[96.0, 0.0, 100.0, 100.0], [0.0, 98.0, 100.0, 100.0]]).len(), 2);
     }
 
     fn merged_of(rects: &[[f32; 4]]) -> Vec<[u32; 4]> {

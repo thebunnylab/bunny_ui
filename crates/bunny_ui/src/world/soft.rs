@@ -91,6 +91,28 @@ pub fn draw_over_with(held: &Picture, frame: &WorldFrame, rects: &[[u32; 4]], te
     draw_into(&mut target, frame, textures)
 }
 
+/// `held` slid by `shift` pixels (x right, y down), as a target slides the
+/// picture it holds when a parallel eye pans at Low: what the slide
+/// uncovers is left clear, for the rects drawn over it.
+pub fn slid(held: &Picture, shift: [i32; 2]) -> Picture {
+    let (width, height) = (held.width as i64, held.height as i64);
+    let mut rgba = vec![0u8; held.rgba.len()];
+    for y in 0..height {
+        let from_y = y - shift[1] as i64;
+        if !(0..height).contains(&from_y) {
+            continue;
+        }
+        for x in 0..width {
+            let from_x = x - shift[0] as i64;
+            if (0..width).contains(&from_x) {
+                let (to, from) = (((y * width + x) * 4) as usize, ((from_y * width + from_x) * 4) as usize);
+                rgba[to..to + 4].copy_from_slice(&held.rgba[from..from + 4]);
+            }
+        }
+    }
+    Picture { width: held.width, height: held.height, rgba }
+}
+
 /// Runs the frame's draws into a cleared target.
 fn draw_into(target: &mut Target, frame: &WorldFrame, textures: &dyn Fn(usize) -> Option<Rc<Texture>>) -> Picture {
     let (width, height) = (target.width, target.height);
@@ -647,7 +669,12 @@ impl Job<'_> {
                     ambient: [decode(self.instance.ambient[0]), decode(self.instance.ambient[1]), decode(self.instance.ambient[2])],
                 },
             );
-            let dither = if u.tone[2] > 0.5 { shade::bayer(x, y) } else { 0.0 };
+            let dither = if u.tone[2] > 0.5 {
+                let phase = u.tone[2] as u32 - 1;
+                shade::bayer(x + (phase & 3), y + (phase >> 2))
+            } else {
+                0.0
+            };
             (shade::tone(lit, u.tone[0], u.tone[1]), dither)
         };
         let codes = graded(self.frame, linear.map(encode_code)).map(|code| quantize(code * alpha, dither) as f32);

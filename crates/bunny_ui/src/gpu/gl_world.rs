@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::world::{Redraw, WorldCaps, WorldGround, WorldJob};
+use super::world::{Redraw, WorldCaps, WorldGround, WorldJob, slide_copy};
 use super::world_shaders as source;
 use crate::image_engine::ImageEngine;
 use crate::world::frame::{Background, Blend, DrawKind, ShadowFrame, WorldFrame};
@@ -166,7 +166,7 @@ pub trait GlFamily {
     fn renderbuffer_storage(&mut self, renderbuffer: u32, samples: i32, internal: u32, width: i32, height: i32);
     /// The colour of the read framebuffer onto the draw framebuffer, the
     /// same rectangle on both: how multisamples resolve.
-    fn blit_color(&mut self, rect: [i32; 4]);
+    fn blit_color(&mut self, from: [i32; 4], to: [i32; 2]);
     /// The box the scissor test keeps, `[x, y, width, height]` in the
     /// framebuffer's pixels.
     fn scissor(&mut self, rect: [i32; 4]);
@@ -683,9 +683,22 @@ impl<G: GlFamily> GlWorld<G> {
             }
             Background::Transparent | Background::Gradient { .. } | Background::Sky { .. } => [0.0; 4],
         };
-        let (rects, partial) = match &job.redraw {
-            Redraw::Whole => (vec![[0, 0, width as u32, height as u32]], false),
-            Redraw::Rects(rects) => (rects.clone(), true),
+        // a slide first: the picture the box showed, moved into this
+        // target by the pan's step, which the rects then draw over
+        if let Redraw::Slide { from, shift, .. } = &job.redraw
+            && let Some(from) = self.targets.get(from).copied()
+            && let Some((source, to)) = slide_copy(*shift, target.size)
+        {
+            let gl = &mut self.gl;
+            gl.bind_framebuffer(gl::READ_FRAMEBUFFER, from.resolve);
+            gl.bind_framebuffer(gl::DRAW_FRAMEBUFFER, target.resolve);
+            gl.blit_color(source.map(|value| value as i32), to.map(|value| value as i32));
+            gl.bind_framebuffer(gl::FRAMEBUFFER, if target.multisample != 0 { target.multisample } else { target.resolve });
+        }
+        let gl = &mut self.gl;
+        let (rects, partial) = match job.redraw.rects() {
+            None => (vec![[0, 0, width as u32, height as u32]], false),
+            Some(rects) => (rects.to_vec(), true),
         };
         if partial {
             gl.enable(gl::SCISSOR_TEST);
@@ -808,12 +821,12 @@ impl<G: GlFamily> GlWorld<G> {
             gl.bind_framebuffer(gl::READ_FRAMEBUFFER, target.multisample);
             gl.bind_framebuffer(gl::DRAW_FRAMEBUFFER, target.resolve);
             for &rect in &rects {
-                gl.blit_color(rect.map(|value| value as i32));
+                gl.blit_color(rect.map(|value| value as i32), [rect[0] as i32, rect[1] as i32]);
             }
             if let Some(bloom) = bloom {
                 gl.read_buffer(gl::COLOR_ATTACHMENT1);
                 gl.bind_framebuffer(gl::DRAW_FRAMEBUFFER, bloom.glow_framebuffer);
-                gl.blit_color([0, 0, width, height]);
+                gl.blit_color([0, 0, width, height], [0, 0]);
                 gl.read_buffer(gl::COLOR_ATTACHMENT0);
                 gl.invalidate_framebuffer(gl::READ_FRAMEBUFFER, gl::COLOR_ATTACHMENT1, 0);
             }
@@ -956,15 +969,23 @@ impl<G: GlFamily> GlWorld<G> {
     }
 
     /// `before` drawn whole into a target of its own, then `after` over it
-    /// in `rects` alone ([`super::world::Redraw::Rects`]), read back as
-    /// [`GlWorld::draw_single`] reads: what `after` drawn whole gives,
-    /// when the redraw is right. For the parity harness.
-    pub fn draw_over(&mut self, before: &Rc<WorldFrame>, after: &Rc<WorldFrame>, rects: &[[u32; 4]], images: &dyn ImageEngine) -> Option<Vec<u8>> {
+    /// as a box draws its next frame — slid by `shift`, then `rects` drawn
+    /// again ([`WorldJob::over`]) — read back as [`GlWorld::draw_single`]
+    /// reads: what `after` drawn whole gives, when the redraw is right. For
+    /// the parity harness.
+    pub fn draw_over(
+        &mut self,
+        before: &Rc<WorldFrame>,
+        after: &Rc<WorldFrame>,
+        shift: [i32; 2],
+        rects: &[[u32; 4]],
+        images: &dyn ImageEngine,
+    ) -> Option<Vec<u8>> {
         let under = WorldJob::single(self.door()?, before, images)?;
         self.encode(std::slice::from_ref(&under));
-        let over = WorldJob::over(self.door()?, &under, after, images, rects.to_vec())?;
+        let over = WorldJob::over(self.door()?, &under, after, images, shift, rects.to_vec())?;
         self.encode(std::slice::from_ref(&over));
-        let resolve = self.targets.get(&under.target)?.resolve;
+        let resolve = self.targets.get(&over.target)?.resolve;
         let mut out = vec![0u8; after.size.0 as usize * after.size.1 as usize * 4];
         self.gl.bind_framebuffer(gl::FRAMEBUFFER, resolve);
         self.gl.read_pixels(after.size.0 as i32, after.size.1 as i32, &mut out);
@@ -1034,8 +1055,9 @@ fn point_instances<G: GlFamily>(gl: &mut G, base: usize) {
 impl<G: GlFamily> WorldGround for GlWorld<G> {
     fn world_caps(&self) -> WorldCaps {
         let start = self.gl.renderer().map_or(crate::world::frame::Quality::High, |name| crate::world::governor::device_quality(&name));
-        // a rect alone resolves by a blit of that rect
-        WorldCaps { samples: self.samples, start, redraw_samples: 4 }
+        // a rect alone resolves by a blit of that rect, and a picture
+        // slides by a blit from one target into another
+        WorldCaps { samples: self.samples, start, redraw_samples: 4, slides: true }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {
@@ -1385,8 +1407,8 @@ mod tests {
         fn renderbuffer_storage(&mut self, _: u32, samples: i32, internal: u32, _: i32, _: i32) {
             self.note(format!("storage {samples} {internal:#x}"));
         }
-        fn blit_color(&mut self, rect: [i32; 4]) {
-            self.note(format!("blit {}x{}", rect[2], rect[3]));
+        fn blit_color(&mut self, from: [i32; 4], _: [i32; 2]) {
+            self.note(format!("blit {}x{}", from[2], from[3]));
         }
         fn scissor(&mut self, rect: [i32; 4]) {
             self.note(format!("scissor {rect:?}"));

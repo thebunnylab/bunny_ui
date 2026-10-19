@@ -513,7 +513,8 @@ struct ContextVtbl {
     rs_set_viewports: unsafe extern "system" fn(*mut Context, u32, *const Viewport),
     // 45 RSSetScissorRects
     rs_set_scissor_rects: unsafe extern "system" fn(*mut Context, u32, *const D3dRect),
-    _pad_46: [usize; 1], // 46 CopySubresourceRegion
+    // 46 CopySubresourceRegion
+    copy_subresource_region: unsafe extern "system" fn(*mut Context, *mut c_void, u32, u32, u32, u32, *mut c_void, u32, *const D3dBox),
     // 47 CopyResource
     copy_resource: unsafe extern "system" fn(*mut Context, *mut c_void, *mut c_void),
     // 48 UpdateSubresource
@@ -604,6 +605,8 @@ const _: () =
     assert!(std::mem::offset_of!(AdapterDesc1, flags) == 280 + 3 * std::mem::size_of::<usize>());
 const _: () =
     assert!(std::mem::offset_of!(ContextVtbl, rs_set_scissor_rects) == 45 * std::mem::size_of::<usize>());
+const _: () =
+    assert!(std::mem::offset_of!(ContextVtbl, copy_subresource_region) == 46 * std::mem::size_of::<usize>());
 
 /// `D3D11_RECT`: a scissor's box, its right and bottom past its last
 /// pixel.
@@ -3247,16 +3250,18 @@ impl OffscreenD3d {
         self.ground.world.draw_single(frame, images)
     }
 
-    /// `before` drawn whole, then `after` over it in `rects` alone, read
-    /// back: what `after` drawn whole gives, when the redraw is right.
+    /// `before` drawn whole, then `after` over it — slid by `shift`, then
+    /// `rects` drawn again — read back: what `after` drawn whole gives,
+    /// when the redraw is right.
     #[cfg(feature = "3d")]
     pub fn world_over_rgba(
         &mut self,
         before: &std::rc::Rc<bunny_ui::world::WorldFrame>,
         after: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+        shift: [i32; 2],
         rects: &[[u32; 4]],
     ) -> Option<Vec<u8>> {
-        self.ground.world.draw_over(before, after, rects, &bunny_ui::image_engine::RawImages::default())
+        self.ground.world.draw_over(before, after, shift, rects, &bunny_ui::image_engine::RawImages::default())
     }
 
     /// How many worlds the last frame drew: a held picture draws none.

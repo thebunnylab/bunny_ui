@@ -1707,9 +1707,10 @@ impl GlFamily for Gl33 {
         }
     }
 
-    fn blit_color(&mut self, rect: [i32; 4]) {
-        let [x0, y0, x1, y1] = [rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]];
-        unsafe { (self.world.blit_framebuffer)(x0, y0, x1, y1, x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST as GlEnum) }
+    fn blit_color(&mut self, from: [i32; 4], to: [i32; 2]) {
+        let [x0, y0, x1, y1] = [from[0], from[1], from[0] + from[2], from[1] + from[3]];
+        let [u0, v0, u1, v1] = [to[0], to[1], to[0] + from[2], to[1] + from[3]];
+        unsafe { (self.world.blit_framebuffer)(x0, y0, x1, y1, u0, v0, u1, v1, GL_COLOR_BUFFER_BIT, GL_NEAREST as GlEnum) }
     }
 
     fn scissor(&mut self, rect: [i32; 4]) {
@@ -2759,16 +2760,18 @@ impl OffscreenGl {
         self.world.as_mut()?.draw_single(frame, images)
     }
 
-    /// `before` drawn whole, then `after` over it in `rects` alone, read
-    /// back: what `after` drawn whole gives, when the redraw is right.
+    /// `before` drawn whole, then `after` over it — slid by `shift`, then
+    /// `rects` drawn again — read back: what `after` drawn whole gives,
+    /// when the redraw is right.
     #[cfg(feature = "3d")]
     pub fn world_over_rgba(
         &mut self,
         before: &std::rc::Rc<bunny_ui::world::WorldFrame>,
         after: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+        shift: [i32; 2],
         rects: &[[u32; 4]],
     ) -> Option<Vec<u8>> {
-        self.world.as_mut()?.draw_over(before, after, rects, &bunny_ui::image_engine::RawImages::default())
+        self.world.as_mut()?.draw_over(before, after, shift, rects, &bunny_ui::image_engine::RawImages::default())
     }
 
     /// How many worlds the last frame drew: a held picture draws none.
@@ -3652,7 +3655,7 @@ mod world_tests {
         let Some(mut gpu) = harness() else { return };
         for index in 0..REDRAWS {
             let redraw = world_redraw(index);
-            let over = gpu.world_over_rgba(&redraw.before, &redraw.after, &redraw.rects).expect("the world pass");
+            let over = gpu.world_over_rgba(&redraw.before, &redraw.after, redraw.shift, &redraw.rects).expect("the world pass");
             let whole = gpu.world_rgba(&redraw.after).expect("the world pass");
             let s = Spread::of(&over, &whole);
             eprintln!("{} in {:?}: worst {} · >1 {} of {}", redraw.name, redraw.rects, s.worst, s.beyond[0], s.pixels);

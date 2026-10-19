@@ -876,6 +876,22 @@ struct ImageMemoryBarrier {
     layer_count: u32,
 }
 
+/// `VkImageCopy`: a region of one image's colour onto another's.
+#[repr(C)]
+struct ImageCopy {
+    src_aspect: u32,
+    src_mip: u32,
+    src_base_layer: u32,
+    src_layer_count: u32,
+    src_offset: [i32; 3],
+    dst_aspect: u32,
+    dst_mip: u32,
+    dst_base_layer: u32,
+    dst_layer_count: u32,
+    dst_offset: [i32; 3],
+    extent: [u32; 3],
+}
+
 #[repr(C)]
 struct BufferImageCopy {
     buffer_offset: u64,
@@ -1238,6 +1254,7 @@ struct VkFns {
         unsafe extern "C" fn(CommandBuffer, BufferHandle, ImageHandle, u32, u32, *const BufferImageCopy),
     cmd_copy_image_to_buffer:
         unsafe extern "C" fn(CommandBuffer, ImageHandle, u32, BufferHandle, u32, *const BufferImageCopy),
+    cmd_copy_image: unsafe extern "C" fn(CommandBuffer, ImageHandle, u32, ImageHandle, u32, u32, *const ImageCopy),
     cmd_begin_render_pass:
         unsafe extern "C" fn(CommandBuffer, *const RenderPassBeginInfo, u32),
     cmd_end_render_pass: unsafe extern "C" fn(CommandBuffer),
@@ -1341,6 +1358,7 @@ fn resolve_fns(gipa: GipaFn, instance: Instance) -> Option<VkFns> {
         cmd_pipeline_barrier: vk!(c"vkCmdPipelineBarrier"),
         cmd_copy_buffer_to_image: vk!(c"vkCmdCopyBufferToImage"),
         cmd_copy_image_to_buffer: vk!(c"vkCmdCopyImageToBuffer"),
+        cmd_copy_image: vk!(c"vkCmdCopyImage"),
         cmd_begin_render_pass: vk!(c"vkCmdBeginRenderPass"),
         cmd_end_render_pass: vk!(c"vkCmdEndRenderPass"),
         cmd_bind_pipeline: vk!(c"vkCmdBindPipeline"),
@@ -4861,18 +4879,20 @@ impl OffscreenVk {
         self.world.draw_single(&self.stack, command, fence, frame, images)
     }
 
-    /// `before` drawn whole, then `after` over it in `rects` alone, read
-    /// back: what `after` drawn whole gives, when the redraw is right.
+    /// `before` drawn whole, then `after` over it — slid by `shift`, then
+    /// `rects` drawn again — read back: what `after` drawn whole gives,
+    /// when the redraw is right.
     #[cfg(feature = "3d")]
     pub fn world_over_rgba(
         &mut self,
         before: &std::rc::Rc<bunny_ui::world::WorldFrame>,
         after: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+        shift: [i32; 2],
         rects: &[[u32; 4]],
     ) -> Option<Vec<u8>> {
         drain_all(&self.stack, &mut self.slots);
         let (command, fence) = (self.slots[0].command, self.slots[0].fence);
-        self.world.draw_over(&self.stack, command, fence, before, after, rects, &bunny_ui::image_engine::RawImages::default())
+        self.world.draw_over(&self.stack, command, fence, before, after, shift, rects, &bunny_ui::image_engine::RawImages::default())
     }
 
     /// How many worlds the last frame drew: a held picture draws none.

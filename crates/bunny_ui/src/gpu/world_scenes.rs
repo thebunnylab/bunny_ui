@@ -434,15 +434,17 @@ pub fn world_scene(index: u32) -> WorldScene {
 }
 
 /// How many redraws the catalog holds.
-pub const REDRAWS: u32 = 4;
+pub const REDRAWS: u32 = 6;
 
 /// One redraw of the catalog: a frame, the next frame of the same
-/// target, and the rects the second asks for over the first. A tier draws
-/// the first whole and the second in the rects alone, and must give what
-/// it gives for the second drawn whole.
+/// target, and how the second reuses the first — slid by `shift`, then
+/// `rects` drawn again. A tier draws the first whole and the second over
+/// it, and must give what it gives for the second drawn whole.
 pub struct WorldRedraw {
     pub before: Rc<WorldFrame>,
     pub after: Rc<WorldFrame>,
+    /// `[0, 0]` for a redraw in place.
+    pub shift: [i32; 2],
     pub rects: Vec<[u32; 4]>,
     pub name: &'static str,
 }
@@ -474,6 +476,23 @@ pub fn world_redraw(index: u32) -> WorldRedraw {
             block.set_tint(Color::rgb(60, 160, 220));
             ("a block turns blue under a sky", before, at(&style, 0.0))
         }
+        // a parallel eye pans at Low: the picture slides by whole pixels
+        // and the strips it uncovers are drawn, a figure's walk with them
+        4 | 5 => {
+            if index == 5 {
+                world.add(Mesh::cuboid(0.3, 0.9, 0.3), Material::color(Color::rgb(70, 110, 200))).set_position(vec3(-1.0, -0.05, 1.5)).move_to(vec3(2.0, -0.05, 1.5), 1.0);
+            }
+            let eye = |at: Vec3| {
+                let mut camera = Camera::orbiting(at, 45.0, 35.0, 20.0);
+                camera.lens = crate::world::camera::Lens::Parallel { height: 7.0 };
+                camera
+            };
+            let style = style(Quality::Low);
+            let before = Rc::new(world.with(|data| build_frame(data, &eye(Vec3::ZERO), &style, (200, 150), 1.0, 0.3)));
+            let after = Rc::new(world.with(|data| build_frame(data, &eye(vec3(0.35, 0.0, -0.2)), &style, (200, 150), 1.0, 0.6)));
+            let name = if index == 4 { "a parallel eye pans" } else { "a parallel eye pans while a figure walks" };
+            (name, before, after)
+        }
         // edges move across the floor at one sample
         _ => {
             let square = [vec3(0.0, 0.0, 0.0), vec3(1.0, 0.0, 0.0), vec3(1.0, 0.0, 1.0), vec3(0.0, 0.0, 1.0)];
@@ -485,8 +504,8 @@ pub fn world_redraw(index: u32) -> WorldRedraw {
             ("a square of edges moves", before, at(&style, 0.0))
         }
     };
-    let rects = crate::world::damage::redraw_rects(&before, &after).expect("a part of the picture");
-    WorldRedraw { before, after, rects, name }
+    let reuse = crate::world::damage::reuse(&before, &after).expect("a part of the picture");
+    WorldRedraw { before, after, shift: reuse.shift, rects: reuse.rects, name }
 }
 
 /// How two pictures differ: the worst channel, and how many pixels sit
@@ -526,14 +545,17 @@ mod tests {
 
     #[test]
     fn every_redraw_of_the_catalog_is_a_part_and_exact_on_the_oracle() {
+        use crate::world::soft::{draw, draw_over_with, slid};
         for index in 0..REDRAWS {
             let redraw = world_redraw(index);
             let area: u32 = redraw.rects.iter().map(|r| r[2] * r[3]).sum();
             assert!(area > 0 && area * 2 < 200 * 150, "{}: {:?}", redraw.name, redraw.rects);
-            let over = crate::world::soft::draw_over_with(&crate::world::soft::draw(&redraw.before), &redraw.after, &redraw.rects, &|_| None);
-            assert!(over.rgba == crate::world::soft::draw(&redraw.after).rgba, "{} is not the whole", redraw.name);
+            let held = slid(&draw(&redraw.before), redraw.shift);
+            let over = draw_over_with(&held, &redraw.after, &redraw.rects, &|_| None);
+            assert!(over.rgba == draw(&redraw.after).rgba, "{} is not the whole", redraw.name);
         }
         assert!(world_redraw(0).after.samples == 4 && world_redraw(1).after.samples == 1);
+        assert!(world_redraw(4).shift != [0, 0] && world_redraw(5).shift != [0, 0], "the pans slide");
     }
 
     #[test]

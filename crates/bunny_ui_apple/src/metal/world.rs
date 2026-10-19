@@ -32,7 +32,7 @@ use std::ptr::null_mut;
 use std::rc::Rc;
 
 use bunny_ui::gpu::walk::FrameBatches;
-use bunny_ui::gpu::world::{Redraw, WorldCaps, WorldGround, WorldJob};
+use bunny_ui::gpu::world::{Redraw, WorldCaps, WorldGround, WorldJob, slide_copy};
 use bunny_ui::world::bloom::LEVELS;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, WorldFrame};
 use bunny_ui::world::shade::SRGB_DECODE;
@@ -61,6 +61,23 @@ unsafe extern "C" {
     // the struct travels by reference, as the C ABI says
     #[link_name = "objc_msgSend"]
     fn msg_void_scissor(obj: Id, sel: Sel, rect: MTLScissorRect);
+    // `copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:
+    // toTexture:destinationSlice:destinationLevel:destinationOrigin:` — the
+    // origins and the size travel by reference, as the C ABI says
+    #[link_name = "objc_msgSend"]
+    fn msg_void_copy_texture(
+        obj: Id,
+        sel: Sel,
+        source: Id,
+        source_slice: u64,
+        source_level: u64,
+        source_origin: MTLOrigin,
+        source_size: MTLSize,
+        destination: Id,
+        destination_slice: u64,
+        destination_level: u64,
+        destination_origin: MTLOrigin,
+    );
 }
 
 #[repr(C)]
@@ -613,8 +630,10 @@ static float4 world_shade(WorldVary in, bool front, device const WorldMaterial* 
                            sun_visibility(u, shadow_map, compare, moving_map, moving_compare, in.eye, normal),
                            floor_light(u, instance.flags, floor_map, wrap, in.eye),
                            float3(SRGB_DECODE[instance.ambient.r], SRGB_DECODE[instance.ambient.g], SRGB_DECODE[instance.ambient.b]));
+        // the pattern's phase runs it with the world's origin
         if (u.tone.z > 0.5) {
-            dither = bayer(uint(in.position.x), uint(in.position.y));
+            uint phase = uint(u.tone.z) - 1;
+            dither = bayer(uint(in.position.x) + (phase & 3), uint(in.position.y) + (phase >> 2));
         }
         linear = tone(light, u.tone.x, u.tone.y);
     }
@@ -1113,6 +1132,7 @@ struct Selectors {
     set_fragment_sampler: Sel,
     draw_indexed: Sel,
     set_scissor: Sel,
+    copy_texture: Sel,
 }
 
 struct WorldStack {
@@ -1339,7 +1359,16 @@ impl MetalWorld {
             // a part of the target, at one sample: four memoryless samples
             // would resolve the rest away
             let rects = match &job.redraw {
-                Redraw::Rects(rects) if samples == 1 => Some(rects.clone()),
+                Redraw::Rects(rects) | Redraw::Slide { rects, .. } if samples == 1 => Some(rects.clone()),
+                _ => None,
+            };
+            // the picture the box showed, moved by the pan's step
+            let slide = match &job.redraw {
+                Redraw::Slide { from, shift, .. } if samples == 1 => self
+                    .targets
+                    .get(from)
+                    .zip(slide_copy(*shift, target.size))
+                    .map(|(from, (source, to))| (from.resolve, source, to)),
                 _ => None,
             };
             let mut draws = Vec::with_capacity(job.frame.draws.len());
@@ -1473,6 +1502,7 @@ impl MetalWorld {
                 joints,
                 draws,
                 rects,
+                slide,
                 reaches,
                 sampler: stack.sampler,
                 shadow,
@@ -1604,6 +1634,7 @@ impl WorldStack {
                     set_depth_state: sel("setDepthStencilState:"),
                     set_cull_mode: sel("setCullMode:"),
                     set_scissor: sel("setScissorRect:"),
+                    copy_texture: sel("copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:"),
                     set_winding: sel("setFrontFacingWinding:"),
                     set_fragment_sampler: sel("setFragmentSamplerState:atIndex:"),
                     draw_indexed: sel("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:"),
@@ -1838,8 +1869,8 @@ unsafe fn attachment(device: Id, format: u64, size: (u32, u32), samples: u8, sto
 impl WorldGround for MetalWorld {
     fn world_caps(&self) -> WorldCaps {
         // four memoryless samples resolve into the whole target: a part
-        // is redrawn at one sample alone
-        WorldCaps { samples: 4, start: self.start, redraw_samples: 1 }
+        // is redrawn at one sample alone; a blit slides a picture
+        WorldCaps { samples: 4, start: self.start, redraw_samples: 1, slides: true }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {
@@ -2089,6 +2120,9 @@ struct PreparedJob {
     /// The rects to draw, the rest of the target kept: `None` draws all
     /// of it.
     rects: Option<Vec<[u32; 4]>>,
+    /// A slide before them: the picture to copy from, the rect of it that
+    /// stays in view, and the pixel it lands on.
+    slide: Option<(Id, [u32; 4], [u32; 2])>,
     /// For each draw, the rects it reaches, a bit each.
     reaches: Vec<u8>,
     sampler: Id,
@@ -2186,6 +2220,26 @@ impl FramePass {
             unsafe {
                 for shadow in [&job.shadow, &job.moving_shadow].into_iter().flatten() {
                     encode_casters(command, sels, &world, pass_class, staging, job, shadow);
+                }
+                // a slide lands before the rects are drawn over it
+                if let Some((from, source, to)) = job.slide {
+                    let blit = msg_id(command, sels.blit_encoder);
+                    if !blit.is_null() {
+                        msg_void_copy_texture(
+                            blit,
+                            world.copy_texture,
+                            from,
+                            0,
+                            0,
+                            MTLOrigin { x: source[0] as u64, y: source[1] as u64, z: 0 },
+                            MTLSize { width: source[2] as u64, height: source[3] as u64, depth: 1 },
+                            job.resolve,
+                            0,
+                            0,
+                            MTLOrigin { x: to[0] as u64, y: to[1] as u64, z: 0 },
+                        );
+                        msg_void(blit, sels.end_encoding);
+                    }
                 }
                 let pass = msg_id(pass_class, sels.render_pass_descriptor);
                 let attachment = msg_id_u64(msg_id(pass, sels.color_attachments), sels.object_at, 0);
@@ -2439,15 +2493,17 @@ pub(super) fn single_job(world: &mut MetalWorld, frame: &Rc<WorldFrame>, images:
     WorldJob::single(world.door()?, frame, images)
 }
 
-/// `frame` over what `under` drew, in `rects` alone, for the harness.
+/// `frame` over what `under` drew — slid by `shift`, then `rects` drawn
+/// again — for the harness.
 pub(super) fn over_job(
     world: &mut MetalWorld,
     under: &WorldJob,
     frame: &Rc<WorldFrame>,
     images: &dyn bunny_ui::image_engine::ImageEngine,
+    shift: [i32; 2],
     rects: Vec<[u32; 4]>,
 ) -> Option<WorldJob> {
-    WorldJob::over(world.door()?, under, frame, images, rects)
+    WorldJob::over(world.door()?, under, frame, images, shift, rects)
 }
 
 /// The resolved picture of a harness target, row by row.
@@ -2565,10 +2621,10 @@ mod tests {
         let Some(mut gpu) = harness() else { return };
         for index in 0..REDRAWS {
             let redraw = world_redraw(index);
-            let over = gpu.world_over_rgba(&redraw.before, &redraw.after, &redraw.rects).expect("the world pass");
+            let over = gpu.world_over_rgba(&redraw.before, &redraw.after, redraw.shift, &redraw.rects).expect("the world pass");
             let whole = gpu.world_rgba(&redraw.after).expect("the world pass");
             let s = Spread::of(&over, &whole);
-            eprintln!("{} in {:?}: worst {} · >1 {} of {}", redraw.name, redraw.rects, s.worst, s.beyond[0], s.pixels);
+            eprintln!("{} slid {:?} in {:?}: worst {} · >1 {} of {}", redraw.name, redraw.shift, redraw.rects, s.worst, s.beyond[0], s.pixels);
             assert_eq!(s.worst, 0, "{}: the redraw is not the whole picture", redraw.name);
         }
     }

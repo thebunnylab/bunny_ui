@@ -399,12 +399,13 @@ export function gl_renderbuffer_storage_multisample(renderbuffer, samples, inter
     gl.renderbufferStorage(gl.RENDERBUFFER, internal >>> 0, width | 0, height | 0);
   }
 }
-// the samples resolve: a rect of the read framebuffer's colour onto the
-// same rect of the draw one
-export function gl_blit_framebuffer(x, y, width, height) {
+// a rect of the read framebuffer's colour onto the draw one, its corner at
+// (toX, toY): the samples' resolve, and a picture's slide
+export function gl_blit_framebuffer(x, y, width, height, toX, toY) {
   if (!gl) return;
   const [x0, y0, x1, y1] = [x | 0, y | 0, (x + width) | 0, (y + height) | 0];
-  gl.blitFramebuffer(x0, y0, x1, y1, x0, y0, x1, y1, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+  const [u0, v0] = [toX | 0, toY | 0];
+  gl.blitFramebuffer(x0, y0, x1, y1, u0, v0, u0 + (width | 0), v0 + (height | 0), gl.COLOR_BUFFER_BIT, gl.NEAREST);
 }
 // a tiled GPU need not write back what nobody reads
 export function gl_invalidate_framebuffer(target, first, second) {

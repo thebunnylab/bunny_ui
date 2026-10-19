@@ -3686,20 +3686,22 @@ impl OffscreenGpu {
         }
     }
 
-    /// `before` drawn whole, then `after` over it in `rects` alone
-    /// ([`bunny_ui::gpu::world::Redraw::Rects`]), read back: what `after`
+    /// `before` drawn whole, then `after` over it as a box draws its next
+    /// frame — slid by `shift`, then `rects` drawn again
+    /// ([`bunny_ui::gpu::world::WorldJob::over`]) — read back: what `after`
     /// drawn whole gives, when the redraw is right.
     pub fn world_over_rgba(
         &mut self,
         before: &Rc<bunny_ui::world::WorldFrame>,
         after: &Rc<bunny_ui::world::WorldFrame>,
+        shift: [i32; 2],
         rects: &[[u32; 4]],
     ) -> Option<Vec<u8>> {
         let images = bunny_ui::image_engine::RawImages::default();
         unsafe {
             let pool = objc_autoreleasePoolPush();
             let under = self.run_world_job(|world| world::single_job(world, before, &images));
-            let over = under.as_ref().and_then(|under| self.run_world_job(|world| world::over_job(world, under, after, &images, rects.to_vec())));
+            let over = under.as_ref().and_then(|under| self.run_world_job(|world| world::over_job(world, under, after, &images, shift, rects.to_vec())));
             let bytes = over.as_ref().and_then(|over| world::read_target(&self.ground.world, over.target, &self.stack.sels));
             if let Some(over) = over {
                 over.give_back_over(&mut self.ground.world);

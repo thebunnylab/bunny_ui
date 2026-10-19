@@ -45,7 +45,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::rc::Rc;
 
-use bunny_ui::gpu::world::{Redraw, WorldCaps, WorldGround, WorldJob};
+use bunny_ui::gpu::world::{Redraw, WorldCaps, WorldGround, WorldJob, slide_copy};
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::world::bloom::LEVELS;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, ShadowFrame, WorldFrame};
@@ -761,7 +761,11 @@ impl VkWorld {
                     continue;
                 };
                 let bloom = if frame.bloom > 0 { blooms.get(&job.target) } else { None };
-                world.record(stack, command, job, target, bloom, set, slot.buffer, instances as u64, &shadows, meshes, surfaces, segments);
+                let slid_from = match &job.redraw {
+                    Redraw::Slide { from, .. } => targets.get(from).map(|from| from.picture.image),
+                    _ => None,
+                };
+                world.record(stack, command, job, target, bloom, set, slot.buffer, instances as u64, &shadows, slid_from, meshes, surfaces, segments);
             }
         }
         true
@@ -792,9 +796,10 @@ impl VkWorld {
     }
 
     /// `before` drawn whole into a target of its own, then `after` over it
-    /// in `rects` alone ([`Redraw::Rects`]), read back as
-    /// [`VkWorld::draw_single`] reads: what `after` drawn whole gives, when
-    /// the redraw is right. For the parity harness.
+    /// as a box draws its next frame — slid by `shift`, then `rects` drawn
+    /// again ([`WorldJob::over`]) — read back as [`VkWorld::draw_single`]
+    /// reads: what `after` drawn whole gives, when the redraw is right.
+    /// For the parity harness.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw_over(
         &mut self,
@@ -803,12 +808,13 @@ impl VkWorld {
         fence: Fence,
         before: &Rc<WorldFrame>,
         after: &Rc<WorldFrame>,
+        shift: [i32; 2],
         rects: &[[u32; 4]],
         images: &dyn ImageEngine,
     ) -> Option<Vec<u8>> {
         let mut door = VkWorldDoor { stack, world: self };
         let under = WorldJob::single(door.open()?, before, images)?;
-        let over = WorldJob::over(door.open()?, &under, after, images, rects.to_vec());
+        let over = WorldJob::over(door.open()?, &under, after, images, shift, rects.to_vec());
         let out = over.as_ref().and_then(|over| self.draw_and_read(stack, command, fence, &[under.clone(), over.clone()]));
         let mut door = VkWorldDoor { stack, world: self };
         if let Some(ground) = door.open() {
@@ -1798,6 +1804,7 @@ impl WorldStack {
         blocks: BufferHandle,
         instances: u64,
         shadows: &[JobShadow<'_>; 2],
+        slid_from: Option<ImageHandle>,
         meshes: &HashMap<u64, MeshBuffers>,
         surfaces: &HashMap<u64, Surface>,
         segments: &HashMap<u64, Segments>,
@@ -1827,10 +1834,18 @@ impl WorldStack {
             // all of the target, or a pass a rect the job asks for: the
             // render area holds its clears and its resolve, the scissor its
             // draws, and the rest of the picture stays
-            let (rects, partial) = match &job.redraw {
-                Redraw::Whole => (vec![[0, 0, width, height]], false),
-                Redraw::Rects(rects) => (rects.clone(), true),
+            let (rects, partial) = match job.redraw.rects() {
+                None => (vec![[0, 0, width, height]], false),
+                Some(rects) => (rects.to_vec(), true),
             };
+            // a slide first: the picture the box showed, moved by the pan's
+            // step, which the rects then draw over
+            if let Redraw::Slide { shift, .. } = &job.redraw
+                && let Some(from) = slid_from
+                && let Some((source, to)) = slide_copy(*shift, target.size)
+            {
+                self.record_slide(stack, command, from, target.picture.image, source, to);
+            }
             for &rect in &rects {
                 let begin = RenderPassBeginInfo {
                     s_type: ST_RENDER_PASS_BEGIN,
@@ -1948,6 +1963,80 @@ impl WorldStack {
             if let Some(bloom) = bloom {
                 self.record_bloom(stack, command, target, bloom, frame.bloom);
             }
+        }
+    }
+
+    /// The picture `from` holds, its rect `source` copied onto `into` with
+    /// its corner at `to`: the slide of a pan, before the passes that draw
+    /// over it. `into`'s picture is replaced where the copy lands and
+    /// drawn where it does not, so what it held is let go; both pictures
+    /// end ready to be read, as the passes that keep them expect.
+    unsafe fn record_slide(&self, stack: &VkStack, command: CommandBuffer, from: ImageHandle, into: ImageHandle, source: [u32; 4], to: [u32; 2]) {
+        let fns = &stack.fns;
+        let barrier = |image: ImageHandle, old_layout: u32, new_layout: u32, src_access: u32, dst_access: u32| ImageMemoryBarrier {
+            s_type: ST_IMAGE_MEMORY_BARRIER,
+            p_next: std::ptr::null(),
+            src_access,
+            dst_access,
+            old_layout,
+            new_layout,
+            src_family: u32::MAX,
+            dst_family: u32::MAX,
+            image,
+            aspect: IMAGE_ASPECT_COLOR,
+            base_mip: 0,
+            mip_count: 1,
+            base_layer: 0,
+            layer_count: 1,
+        };
+        let attachment = ACCESS_COLOR_ATTACHMENT_READ | ACCESS_COLOR_ATTACHMENT_WRITE;
+        unsafe {
+            let before = [
+                barrier(from, IMAGE_LAYOUT_SHADER_READ_ONLY, IMAGE_LAYOUT_TRANSFER_SRC, ACCESS_COLOR_ATTACHMENT_WRITE, ACCESS_TRANSFER_READ),
+                barrier(into, IMAGE_LAYOUT_UNDEFINED, IMAGE_LAYOUT_TRANSFER_DST, ACCESS_SHADER_READ, ACCESS_TRANSFER_WRITE),
+            ];
+            (fns.cmd_pipeline_barrier)(
+                command,
+                PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT | PIPELINE_STAGE_FRAGMENT_SHADER,
+                PIPELINE_STAGE_TRANSFER,
+                0,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                2,
+                before.as_ptr(),
+            );
+            let region = ImageCopy {
+                src_aspect: IMAGE_ASPECT_COLOR,
+                src_mip: 0,
+                src_base_layer: 0,
+                src_layer_count: 1,
+                src_offset: [source[0] as i32, source[1] as i32, 0],
+                dst_aspect: IMAGE_ASPECT_COLOR,
+                dst_mip: 0,
+                dst_base_layer: 0,
+                dst_layer_count: 1,
+                dst_offset: [to[0] as i32, to[1] as i32, 0],
+                extent: [source[2], source[3], 1],
+            };
+            (fns.cmd_copy_image)(command, from, IMAGE_LAYOUT_TRANSFER_SRC, into, IMAGE_LAYOUT_TRANSFER_DST, 1, &region);
+            let after = [
+                barrier(from, IMAGE_LAYOUT_TRANSFER_SRC, IMAGE_LAYOUT_SHADER_READ_ONLY, ACCESS_TRANSFER_READ, ACCESS_SHADER_READ),
+                barrier(into, IMAGE_LAYOUT_TRANSFER_DST, IMAGE_LAYOUT_SHADER_READ_ONLY, ACCESS_TRANSFER_WRITE, attachment | ACCESS_SHADER_READ),
+            ];
+            (fns.cmd_pipeline_barrier)(
+                command,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT | PIPELINE_STAGE_FRAGMENT_SHADER,
+                0,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                2,
+                after.as_ptr(),
+            );
         }
     }
 
@@ -3065,8 +3154,9 @@ impl WorldGround for VkWorldDoor<'_> {
         unsafe { (self.stack.fns.get_physical_device_properties)(self.stack.physical, &mut properties) };
         let end = properties.device_name.iter().position(|&byte| byte == 0).unwrap_or(properties.device_name.len());
         let name = String::from_utf8_lossy(&properties.device_name[..end]);
-        // a pass a rect, whose render area holds its clears and resolve
-        WorldCaps { samples: 4, start: bunny_ui::world::governor::device_quality(&name), redraw_samples: 4 }
+        // a pass a rect, whose render area holds its clears and resolve;
+        // an image copy slides a picture
+        WorldCaps { samples: 4, start: bunny_ui::world::governor::device_quality(&name), redraw_samples: 4, slides: true }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {
@@ -3321,7 +3411,7 @@ mod tests {
         let Some(mut gpu) = harness() else { return };
         for index in 0..REDRAWS {
             let redraw = world_redraw(index);
-            let over = gpu.world_over_rgba(&redraw.before, &redraw.after, &redraw.rects).expect("the world pass");
+            let over = gpu.world_over_rgba(&redraw.before, &redraw.after, redraw.shift, &redraw.rects).expect("the world pass");
             let whole = gpu.world_rgba(&redraw.after).expect("the world pass");
             let s = Spread::of(&over, &whole);
             eprintln!("{} in {:?}: worst {} · >1 {} of {}", redraw.name, redraw.rects, s.worst, s.beyond[0], s.pixels);

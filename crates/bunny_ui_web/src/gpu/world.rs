@@ -147,8 +147,8 @@ impl GlFamily for WebGl {
     fn renderbuffer_storage(&mut self, renderbuffer: u32, samples: i32, internal: u32, width: i32, height: i32) {
         unsafe { gl_renderbuffer_storage_multisample(renderbuffer, samples, internal, width, height) }
     }
-    fn blit_color(&mut self, rect: [i32; 4]) {
-        unsafe { gl_blit_framebuffer(rect[0], rect[1], rect[2], rect[3]) }
+    fn blit_color(&mut self, from: [i32; 4], to: [i32; 2]) {
+        unsafe { gl_blit_framebuffer(from[0], from[1], from[2], from[3], to[0], to[1]) }
     }
     fn scissor(&mut self, rect: [i32; 4]) {
         unsafe { gl_scissor(rect[0], rect[1], rect[2], rect[3]) }
