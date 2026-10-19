@@ -26,6 +26,9 @@
 //! The patch stream has a fixed little-endian encoding ([`encode`]) —
 //! one `DataView` walk on the other side of the border, no JSON.
 
+/// Shared text highlight byte ranges and their paint color.
+pub type TextHighlights = (Rc<Vec<(usize, usize)>>, Color);
+
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -48,6 +51,10 @@ pub enum DomKind {
     Group { path: std::rc::Rc<str> },
     /// A styled box (background, border, radius, shadow, interaction).
     Box,
+    /// A filled rectangle inheriting CSS currentColor.
+    Rectangle,
+    /// A filled ellipse inheriting CSS currentColor.
+    Ellipse,
     /// One run of text — the browser renders and selects it natively.
     Text(DomText),
     /// A native `<input>` — the browser owns the editing. Boxed: the
@@ -101,7 +108,12 @@ pub enum DomKind {
     /// crosses the border in either direction. The element is wired to
     /// its stream once — a changed handle rewires it, a changed flag
     /// alone never restarts the playback (`docs/video.md`).
-    Video { stream: u32, mirrored: bool, cover: bool, radius: f32 },
+    Video {
+        stream: u32,
+        mirrored: bool,
+        cover: bool,
+        radius: f32,
+    },
     /// A flow container: `display:flex; flex-direction:column`. Two
     /// variants instead of a payload so the keyed match's discriminant
     /// tells the axes apart — an axis change recreates the element.
@@ -110,6 +122,8 @@ pub enum DomKind {
     FlexRow,
     /// Layered children: `display:grid`, everyone in the same cell.
     Layers,
+    /// Equal-width column tracks with sparse cell placement.
+    Grid,
     /// A CLEAN boundary, by promise: no body under this path ran this
     /// frame, so the retained subtree still holds — the diff keeps it
     /// wholesale and never descends. Internal to the walk and the
@@ -328,6 +342,13 @@ pub struct DomLook {
     /// the radius already on the box: the browser cuts the subtree to
     /// the curve as a LAYER, its own native rounded clip.
     pub clip: bool,
+    /// `.hidden()` — the glue's `visibility:hidden`: the box keeps its
+    /// place in the flow, paints nothing and takes no pointer, as the
+    /// pixel pipelines keep the place and skip the subtree. Flow is a
+    /// CSS layout, so a box left out would not keep its place — the
+    /// sibling would move up — which is why the capture's answer
+    /// cannot be the flow's.
+    pub hidden: bool,
     /// `.opacity(…)` and its two states. In THIS mode the fade is a
     /// real LAYER — the browser composites the subtree once — which is
     /// strictly better than the per-command multiply the pixel
@@ -385,6 +406,7 @@ impl DomLook {
         focus_border: None,
         placeholder_color: None,
         clip: false,
+        hidden: false,
         opacity: None,
         hover_opacity: None,
         pressed_opacity: None,
@@ -409,6 +431,7 @@ impl DomLook {
             focus_border: None,
             placeholder_color: None,
             clip: props.clip,
+            hidden: props.hidden,
             opacity: props.opacity,
             hover_opacity: props.opacity_hovered,
             pressed_opacity: props.opacity_pressed,
@@ -433,6 +456,7 @@ impl DomLook {
             || props.corner_radius.is_some()
             || props.shadow.is_some()
             || props.clip
+            || props.hidden
             || props.opacity.is_some()
             || props.opacity_hovered.is_some()
             || props.opacity_pressed.is_some()
@@ -534,7 +558,7 @@ pub struct DomText {
     /// browser's own default for our writing direction.
     pub text_align: Option<motor::views::TextAlignment>,
     /// Match highlight spans (byte ranges) + their color.
-    pub highlights: Option<(Rc<Vec<(usize, usize)>>, Color)>,
+    pub highlights: Option<TextHighlights>,
     pub truncation: Option<Truncation>,
     /// The face is the one declared above: the text names no font of
     /// its own, and the look it wears carries none.
@@ -805,7 +829,7 @@ impl DomCapture {
             // the rebuild must not drop what the layer scope decided
             pass_through: self.overlay_depth > 0 && interactive.is_none(),
             transition,
-            group: props.from_group.then(|| group).flatten(),
+            group: props.from_group.then_some(group).flatten(),
             ..DomLook::from_props(props)
         };
         // the tint has no layer of its own in a browser: it folds into
@@ -1022,6 +1046,12 @@ impl DomCapture {
 pub struct DomLayout {
     /// Gap between a flex container's children, px.
     pub gap: Option<f32>,
+    /// Equal-width grid track count; absent on other containers.
+    pub columns: Option<u16>,
+    /// The containing block for children taken out of flow.
+    pub relative: bool,
+    /// Rare child placement parameters, shared when a scene is retained.
+    pub placement: Option<Rc<DomPlacement>>,
     /// Cross-axis alignment: 0 start, 1 center, 2 end, 3 baseline.
     pub align: Option<u8>,
     /// Padding `(top, trailing, bottom, leading)`, px — logical sides, so
@@ -1058,6 +1088,60 @@ pub struct DomLayout {
     pub direction: Option<motor::state::LayoutDirection>,
 }
 
+/// A positioned child's physical coordinates and its stack's sizing rule.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DomPosition {
+    /// Physical left offset, in points, independent of reading direction.
+    pub x: f32,
+    /// Top offset, in points.
+    pub y: f32,
+    /// Layers include the offset in their natural extent; flow stacks do not.
+    pub layered: bool,
+    /// Take the remaining horizontal room when the child is flexible.
+    pub fill_x: bool,
+    /// Take the remaining vertical room when the child is flexible.
+    pub fill_y: bool,
+}
+
+/// Grid occupancy and the child's horizontal appetite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DomSpan {
+    /// Column tracks, clamped to the grid width.
+    pub columns: u16,
+    /// Row tracks.
+    pub rows: u16,
+    /// Fill the allocated width rather than align at natural width.
+    pub fill_x: bool,
+}
+
+/// Rare stack-child geometry. Ordinary flow nodes pay only one pointer.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DomPlacement {
+    /// The stack's physical point and sizing rule.
+    pub at: Option<DomPosition>,
+    /// Column and row spans, reserved for grid lowering in the same ABI.
+    pub span: Option<DomSpan>,
+}
+
+/// Per-element geometry, kept outside shared appearance rules.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DomBox {
+    /// Pinned width in points.
+    pub width: Option<f32>,
+    /// Pinned height in points.
+    pub height: Option<f32>,
+    /// Maximum width in points.
+    pub max_width: Option<f32>,
+    /// Maximum height in points.
+    pub max_height: Option<f32>,
+    /// Virtual row offset in points.
+    pub slot_y: Option<f32>,
+    /// Physical position within the enclosing stack.
+    pub at: Option<DomPosition>,
+    /// Column and row spans. Reserved for grid lowering in the same ABI.
+    pub span: Option<DomSpan>,
+}
+
 /// Element hints only the Dom consumes — a real tag, a class, an id.
 /// Every other lowering ignores them, like `.rendering(Gpu)` on a
 /// pixel target. Empty on everything the engine makes by itself.
@@ -1091,6 +1175,10 @@ impl DomHints {
 pub enum CreateKind {
     Group,
     Box,
+    /// A filled rectangle.
+    Rectangle,
+    /// An ellipse inscribed in its box.
+    Ellipse,
     Text,
     Field,
     Scroll,
@@ -1101,6 +1189,8 @@ pub enum CreateKind {
     FlexColumn,
     FlexRow,
     Layers,
+    /// Equal-width column tracks with sparse cell placement.
+    Grid,
     Popover,
     /// A `<textarea>`: the field of many lines. A separate kind because
     /// the ELEMENT differs — a field that changes shape is recreated,
@@ -1205,6 +1295,8 @@ pub enum DomPatch {
         max_width: Option<f32>,
         max_height: Option<f32>,
         slot_y: Option<f32>,
+        at: Option<DomPosition>,
+        span: Option<DomSpan>,
     },
     /// The element's own marks: its tooltip and the hover group it owns.
     SetMarks { id: u32, tooltip: Option<Arc<str>>, group_owner: Option<u64> },
@@ -1339,7 +1431,7 @@ const PATCHES_PER_FRESH_GROUP: usize = 8;
 /// in, so a list that clears moves no row and frees no vector inside
 /// the frame.
 enum Buried {
-    One(DomNode),
+    One(Box<DomNode>),
     Many(Vec<DomNode>),
 }
 
@@ -1347,7 +1439,7 @@ impl Buried {
     /// The subtrees, root by root.
     fn roots(&self) -> &[DomNode] {
         match self {
-            Buried::One(root) => std::slice::from_ref(root),
+            Buried::One(root) => std::slice::from_ref(root.as_ref()),
             Buried::Many(roots) => roots,
         }
     }
@@ -1829,12 +1921,6 @@ impl DomLowering {
         patches
     }
 
-    /// Does the retained scene hold any canvas island? The runtime
-    /// skips display-list collection when none is alive.
-    pub(crate) fn has_islands(&self) -> bool {
-        !self.islands.is_empty()
-    }
-
     /// The islands whose pixels no longer match, cleared of their flag.
     /// Each returns `(id, logical width, logical height, commands)` —
     /// the caller rasterizes and blits.
@@ -1960,6 +2046,7 @@ fn look_layout(layout: &DomLayout) -> DomLayout {
         max_width: None,
         max_height: None,
         slot_y: None,
+        placement: None,
         ..layout.clone()
     }
 }
@@ -2012,6 +2099,8 @@ fn look_hash(node: &DomNode) -> u64 {
         DomKind::Root => 0,
         DomKind::Group { .. } => 1,
         DomKind::Box => 2,
+        DomKind::Rectangle => 18,
+        DomKind::Ellipse => 19,
         DomKind::Text(_) => 3,
         DomKind::Field(_) => 4,
         DomKind::Scroll { .. } => 5,
@@ -2023,6 +2112,7 @@ fn look_hash(node: &DomNode) -> u64 {
         DomKind::FlexColumn => 11,
         DomKind::FlexRow => 12,
         DomKind::Layers => 13,
+        DomKind::Grid => 17,
         DomKind::Reuse { .. } => 14,
         DomKind::Popover { .. } => 15,
         DomKind::Video { .. } => 16,
@@ -2032,6 +2122,9 @@ fn look_hash(node: &DomNode) -> u64 {
         Some(layout) => {
             1u8.hash(&mut hasher);
             hash_f32(layout.gap, &mut hasher);
+            if let Some(columns) = layout.columns {
+                columns.hash(&mut hasher);
+            }
             layout.align.hash(&mut hasher);
             layout
                 .padding
@@ -2044,6 +2137,9 @@ fn look_hash(node: &DomNode) -> u64 {
             layout.fill.hash(&mut hasher);
             hash_f32(layout.wrap, &mut hasher);
             layout.plain.hash(&mut hasher);
+            if layout.relative {
+                0x706f736974696f6eu64.hash(&mut hasher);
+            }
             // only an island adds to the hash: every look without a direction
             // of its own hashes as it always did
             if let Some(direction) = layout.direction {
@@ -2069,6 +2165,7 @@ fn look_hash(node: &DomNode) -> u64 {
     style.shadow.map(|(radius, color)| (radius.to_bits(), u32::from_be_bytes([color.r, color.g, color.b, color.a]))).hash(&mut hasher);
     style.transition.map(|(response, damping)| (response.to_bits(), damping.to_bits())).hash(&mut hasher);
     style.clip.hash(&mut hasher);
+    style.hidden.hash(&mut hasher);
     hash_f64(style.opacity, &mut hasher);
     hash_f64(style.hover_opacity, &mut hasher);
     hash_f64(style.pressed_opacity, &mut hasher);
@@ -2165,13 +2262,38 @@ fn face_only(face: FontSpec) -> DomText {
 }
 
 /// The element's own geometry, as the box patch carries it.
-fn geometry_of(layout: &DomLayout) -> [Option<f32>; 5] {
-    [layout.width, layout.height, layout.max_width, layout.max_height, layout.slot_y]
+fn geometry_of(layout: &DomLayout) -> DomBox {
+    DomBox {
+        width: layout.width,
+        height: layout.height,
+        max_width: layout.max_width,
+        max_height: layout.max_height,
+        slot_y: layout.slot_y,
+        at: layout.placement.as_ref().and_then(|p| p.at),
+        span: layout.placement.as_ref().and_then(|p| p.span),
+    }
 }
 
-fn box_patch(id: u32, geometry: [Option<f32>; 5]) -> DomPatch {
-    let [width, height, max_width, max_height, slot_y] = geometry;
-    DomPatch::SetBox { id, width, height, max_width, max_height, slot_y }
+fn box_patch(id: u32, geometry: DomBox) -> DomPatch {
+    let DomBox {
+        width,
+        height,
+        max_width,
+        max_height,
+        slot_y,
+        at,
+        span,
+    } = geometry;
+    DomPatch::SetBox {
+        id,
+        width,
+        height,
+        max_width,
+        max_height,
+        slot_y,
+        at,
+        span,
+    }
 }
 
 /// The element's own marks.
@@ -2194,6 +2316,8 @@ fn create_kind(kind: &DomKind) -> CreateKind {
         DomKind::Root => unreachable!("the root is never created"),
         DomKind::Group { .. } => CreateKind::Group,
         DomKind::Box => CreateKind::Box,
+        DomKind::Rectangle => CreateKind::Rectangle,
+        DomKind::Ellipse => CreateKind::Ellipse,
         DomKind::Text(_) => CreateKind::Text,
         DomKind::Field(field) => {
             if field.multiline {
@@ -2212,6 +2336,7 @@ fn create_kind(kind: &DomKind) -> CreateKind {
         DomKind::FlexColumn => CreateKind::FlexColumn,
         DomKind::FlexRow => CreateKind::FlexRow,
         DomKind::Layers => CreateKind::Layers,
+        DomKind::Grid => CreateKind::Grid,
         DomKind::Popover { .. } => CreateKind::Popover,
         // a reuse only exists where a retained group matched; reaching
         // creation means the promise broke — mount an empty anchor and
@@ -2271,7 +2396,7 @@ fn island_commands(node: &DomNode, ctx: &LowerCtx) -> Vec<DrawCommand> {
                 DrawCommand::Image { rect: shift(rect), source }
             }
             DrawCommand::PushClip { rect, corner_radius } => {
-                DrawCommand::PushClip { rect: shift(rect), corner_radius: corner_radius }
+                DrawCommand::PushClip { rect: shift(rect), corner_radius }
             }
             DrawCommand::PopClip => DrawCommand::PopClip,
         })
@@ -2528,9 +2653,12 @@ fn same_shape(node: &DomNode, old: &DomNode) -> bool {
     match &node.kind {
         DomKind::Group { .. }
         | DomKind::Box
+        | DomKind::Rectangle
+        | DomKind::Ellipse
         | DomKind::FlexColumn
         | DomKind::FlexRow
-        | DomKind::Layers => {}
+        | DomKind::Layers
+        | DomKind::Grid => {}
         DomKind::Text(text) => {
             if text.highlights.is_some() {
                 return false;
@@ -2574,6 +2702,7 @@ fn same_shape(node: &DomNode, old: &DomNode) -> bool {
 /// reads of a layout.)
 fn same_look_layout(a: &DomLayout, b: &DomLayout) -> bool {
     a.gap == b.gap
+        && a.columns == b.columns
         && a.align == b.align
         && a.padding == b.padding
         && a.grow == b.grow
@@ -2581,6 +2710,7 @@ fn same_look_layout(a: &DomLayout, b: &DomLayout) -> bool {
         && a.fill == b.fill
         && a.wrap == b.wrap
         && a.plain == b.plain
+        && a.relative == b.relative
 }
 
 /// The shared part of two styles, equal? (What [`look_hash`] reads of
@@ -2597,10 +2727,13 @@ fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
     match &node.kind {
         DomKind::Group { .. }
         | DomKind::Box
+        | DomKind::Rectangle
+        | DomKind::Ellipse
         | DomKind::Text(_)
         | DomKind::FlexColumn
         | DomKind::FlexRow
-        | DomKind::Layers => {}
+        | DomKind::Layers
+        | DomKind::Grid => {}
         _ => return false,
     }
     if let DomKind::Text(text) = &node.kind
@@ -2618,7 +2751,29 @@ fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
     // the look says everything a rule shares; the box and the hints
     // say the rest the clone must carry byte for byte
     look_hash(node).hash(hasher);
-    geometry_of(layout).map(|value| value.map(f32::to_bits)).hash(hasher);
+    let geometry = geometry_of(layout);
+    [
+        geometry.width,
+        geometry.height,
+        geometry.max_width,
+        geometry.max_height,
+        geometry.slot_y,
+    ]
+    .map(|value| value.map(f32::to_bits))
+    .hash(hasher);
+    geometry
+        .at
+        .map(|at| {
+            (
+                at.x.to_bits(),
+                at.y.to_bits(),
+                at.layered,
+                at.fill_x,
+                at.fill_y,
+            )
+        })
+        .hash(hasher);
+    geometry.span.hash(hasher);
     node.hints.tag.as_deref().hash(hasher);
     node.hints.class.as_deref().hash(hasher);
     // the action path is the row's own; that there IS one is the shape
@@ -2697,7 +2852,7 @@ fn create_subtree(
         // a flow node speaks semantics; its geometry fields are silent
         Some(layout) => {
             let geometry = geometry_of(layout);
-            if geometry.iter().any(Option::is_some) {
+            if geometry != DomBox::default() {
                 patches.push(box_patch(id, geometry));
             }
         }
@@ -2855,7 +3010,7 @@ fn remove_subtree(retained: DomNode, ctx: &mut LowerCtx, patches: &mut Vec<DomPa
     if !ctx.templates.members.is_empty() || !ctx.islands.is_empty() {
         forget_now(&retained, ctx);
     }
-    ctx.graveyard.push(Buried::One(retained));
+    ctx.graveyard.push(Buried::One(Box::new(retained)));
 }
 
 /// Every old child leaves and nothing stays: the parent is emptied in
@@ -3117,7 +3272,7 @@ fn diff_node(
         None => {
             // an absolute node that WAS flow clears its box first
             if old.layout.is_some() {
-                patches.push(box_patch(id, [None; 5]));
+                patches.push(box_patch(id, DomBox::default()));
             }
             if (old.x, old.y) != (new.x, new.y) {
                 patches.push(DomPatch::SetTransform { id, x: new.x, y: new.y });
@@ -3800,7 +3955,7 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 ///
 /// Bump this constant when ANY of these change:
 /// - the op codes or their payloads (the table on [`encode`])
-/// - the create kinds (0 group .. 15 video)
+/// - the create kinds (0 group .. 16 grid)
 /// - the style mask bits or their field order
 /// - the weight or truncation codes
 /// - the key table or the modifier bits (the shell's `named_key`)
@@ -3886,7 +4041,11 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 /// offset is logical on both sides of the wire — the glue negates
 /// `scrollLeft` under a right-to-left mount, which reports it at or
 /// below zero.
-pub const ABI_VERSION: u32 = 20;
+///
+/// 21 (0.3.0): stack placement and grid. SetBox bits 5/6 carry a position
+/// (u8 flags: layered/fill-x/fill-y, f32 x/y) and spans (u16 columns/rows, u8 fill-x); flow bit 14 carries the u16 grid column count and bit 15 marks
+/// the containing block of out-of-flow children. Grid shares this revision.
+pub const ABI_VERSION: u32 = 21;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -3953,6 +4112,10 @@ pub const ABI_VERSION: u32 = 20;
 ///                      capture time, because an element has one
 ///                      background colour and the tint sits under
 ///                      whatever the box paints itself
+///                   24 hidden (no payload — the bit IS the value):
+///                      visibility:hidden, the box keeps its place in
+///                      the flow and paints nothing, as `.hidden()`
+///                      does in the pixel pipelines
 ///   6 set text      u32 rgba, u8 inherits ink (1 = no color of its
 ///                   own — the box above owns both states),
 ///                   f32 size, u8 weight, u8 mono, u8 italic,
@@ -3998,7 +4161,9 @@ pub const ABI_VERSION: u32 = 20;
 ///                   12 plain (flag, no payload),
 ///                   13 direction u8 (0 ltr, 1 rtl) — an island that
 ///                   reads the other way: `direction` and an isolated
-///                   `unicode-bidi` on its box
+///                   `unicode-bidi` on its box;
+///                   14 columns u16 (grid track count);
+///                   15 relative containing block (flag, no payload)
 ///  12 move          u32 parent, u32 before (0 = to the end)
 ///  13 reveal        u32 target — the container scrolls it into view
 ///  14 set anchor    u32 anchor element, u8 side (0 top, 1 bottom,
@@ -4226,7 +4391,16 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_u32(&mut out, (*rule >> 32) as u32);
                 push_u32(&mut out, *rule as u32);
             }
-            DomPatch::SetBox { id, width, height, max_width, max_height, slot_y } => {
+            DomPatch::SetBox {
+                id,
+                width,
+                height,
+                max_width,
+                max_height,
+                slot_y,
+                at,
+                span,
+            } => {
                 out.push(23);
                 push_u32(&mut out, *id);
                 let fields = [width, height, max_width, max_height, slot_y];
@@ -4236,9 +4410,29 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                         mask |= 1 << bit;
                     }
                 }
+                if at.is_some() {
+                    mask |= 1 << 5;
+                }
+                if span.is_some() {
+                    mask |= 1 << 6;
+                }
                 out.push(mask);
                 for field in fields.into_iter().flatten() {
                     push_f32(&mut out, *field as f64);
+                }
+                if let Some(at) = at {
+                    out.push(
+                        u8::from(at.layered)
+                            | (u8::from(at.fill_x) << 1)
+                            | (u8::from(at.fill_y) << 2),
+                    );
+                    push_f32(&mut out, at.x);
+                    push_f32(&mut out, at.y);
+                }
+                if let Some(span) = span {
+                    push_u16(&mut out, span.columns);
+                    push_u16(&mut out, span.rows);
+                    out.push(u8::from(span.fill_x));
                 }
             }
             DomPatch::SetMarks { id, tooltip, group_owner } => {
@@ -4369,6 +4563,10 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
         // payload-free, like the clip bit: the bit IS the value
         mask |= 1 << 21;
     }
+    if style.hidden {
+        // payload-free, like the clip bit: the bit IS the value
+        mask |= 1 << 24;
+    }
     if style.glass.is_some() {
         mask |= 1 << 23;
     }
@@ -4466,83 +4664,92 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
 }
 
 fn encode_layout(out: &mut Vec<u8>, layout: &DomLayout) {
-                let mut mask = 0u16;
-                if layout.gap.is_some() {
-                    mask |= 1;
-                }
-                if layout.align.is_some() {
-                    mask |= 1 << 1;
-                }
-                if layout.padding.is_some() {
-                    mask |= 1 << 2;
-                }
-                if layout.width.is_some() {
-                    mask |= 1 << 3;
-                }
-                if layout.height.is_some() {
-                    mask |= 1 << 4;
-                }
-                if layout.max_width.is_some() {
-                    mask |= 1 << 5;
-                }
-                if layout.max_height.is_some() {
-                    mask |= 1 << 6;
-                }
-                if layout.grow {
-                    mask |= 1 << 7;
-                }
-                if layout.slot_y.is_some() {
-                    mask |= 1 << 8;
-                }
-                if layout.stretch {
-                    mask |= 1 << 9;
-                }
-                if layout.fill {
-                    mask |= 1 << 10;
-                }
-                if layout.wrap.is_some() {
-                    mask |= 1 << 11;
-                }
-                if layout.plain {
-                    mask |= 1 << 12;
-                }
-                if layout.direction.is_some() {
-                    mask |= 1 << 13;
-                }
-                push_u16(out, mask);
-                if let Some(gap) = layout.gap {
-                    push_f32(out, gap);
-                }
-                if let Some(align) = layout.align {
-                    out.push(align);
-                }
-                if let Some((top, trailing, bottom, leading)) = layout.padding {
-                    push_f32(out, top);
-                    push_f32(out, trailing);
-                    push_f32(out, bottom);
-                    push_f32(out, leading);
-                }
-                if let Some(width) = layout.width {
-                    push_f32(out, width);
-                }
-                if let Some(height) = layout.height {
-                    push_f32(out, height);
-                }
-                if let Some(max_width) = layout.max_width {
-                    push_f32(out, max_width);
-                }
-                if let Some(max_height) = layout.max_height {
-                    push_f32(out, max_height);
-                }
-                if let Some(slot_y) = layout.slot_y {
-                    push_f32(out, slot_y);
-                }
-                if let Some(wrap) = layout.wrap {
-                    push_f32(out, wrap);
-                }
-                if let Some(direction) = layout.direction {
-                    out.push(direction.is_rtl() as u8);
-                }
+    let mut mask = 0u16;
+    if layout.gap.is_some() {
+        mask |= 1;
+    }
+    if layout.align.is_some() {
+        mask |= 1 << 1;
+    }
+    if layout.padding.is_some() {
+        mask |= 1 << 2;
+    }
+    if layout.width.is_some() {
+        mask |= 1 << 3;
+    }
+    if layout.height.is_some() {
+        mask |= 1 << 4;
+    }
+    if layout.max_width.is_some() {
+        mask |= 1 << 5;
+    }
+    if layout.max_height.is_some() {
+        mask |= 1 << 6;
+    }
+    if layout.grow {
+        mask |= 1 << 7;
+    }
+    if layout.slot_y.is_some() {
+        mask |= 1 << 8;
+    }
+    if layout.stretch {
+        mask |= 1 << 9;
+    }
+    if layout.fill {
+        mask |= 1 << 10;
+    }
+    if layout.wrap.is_some() {
+        mask |= 1 << 11;
+    }
+    if layout.plain {
+        mask |= 1 << 12;
+    }
+    if layout.direction.is_some() {
+        mask |= 1 << 13;
+    }
+    if layout.columns.is_some() {
+        mask |= 1 << 14;
+    }
+    if layout.relative {
+        mask |= 1 << 15;
+    }
+    push_u16(out, mask);
+    if let Some(gap) = layout.gap {
+        push_f32(out, gap);
+    }
+    if let Some(align) = layout.align {
+        out.push(align);
+    }
+    if let Some((top, trailing, bottom, leading)) = layout.padding {
+        push_f32(out, top);
+        push_f32(out, trailing);
+        push_f32(out, bottom);
+        push_f32(out, leading);
+    }
+    if let Some(width) = layout.width {
+        push_f32(out, width);
+    }
+    if let Some(height) = layout.height {
+        push_f32(out, height);
+    }
+    if let Some(max_width) = layout.max_width {
+        push_f32(out, max_width);
+    }
+    if let Some(max_height) = layout.max_height {
+        push_f32(out, max_height);
+    }
+    if let Some(slot_y) = layout.slot_y {
+        push_f32(out, slot_y);
+    }
+    if let Some(wrap) = layout.wrap {
+        push_f32(out, wrap);
+    }
+    if let Some(direction) = layout.direction {
+        out.push(direction.is_rtl() as u8);
+    }
+    if let Some(columns) = layout.columns {
+        push_u16(out, columns);
+    }
 }
 
 /// A text's face and ink, as a look carries them.
@@ -4581,6 +4788,8 @@ fn kind_code(kind: CreateKind) -> u8 {
     match kind {
         CreateKind::Group => 0,
         CreateKind::Box => 1,
+        CreateKind::Rectangle => 17,
+        CreateKind::Ellipse => 18,
         CreateKind::Text => 2,
         CreateKind::Field => 3,
         CreateKind::Scroll => 4,
@@ -4595,6 +4804,7 @@ fn kind_code(kind: CreateKind) -> u8 {
         CreateKind::Editor => 13,
         CreateKind::Iframe => 14,
         CreateKind::Video => 15,
+        CreateKind::Grid => 16,
     }
 }
 
@@ -4957,7 +5167,7 @@ mod tests {
                 DomPatch::Create { id, kind: CreateKind::Group, .. } => Some(*id),
                 _ => None,
             })
-            .last()
+            .next_back()
             .expect("Inner mounted as a group");
 
         view.gap.set(12.0);
@@ -5355,7 +5565,7 @@ mod tests {
             "the pixels match the island's box"
         );
         assert!(
-            islands[0].rgba.chunks_exact(4).any(|pixel| pixel[3] > 0),
+            islands[0].rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 0),
             "the island has ink"
         );
 
@@ -6605,6 +6815,7 @@ mod tests {
             focus_border: Some(Color::hex(0x8899AA)),
             placeholder_color: Some(Color::hex(0x99AABB)),
             clip: true,
+            hidden: false,
             opacity: Some(0.5),
             hover_opacity: Some(0.75),
             pressed_opacity: Some(0.25),
@@ -6632,15 +6843,15 @@ mod tests {
             inherits_face: false,
         });
         let plain = flow_row("c");
-        assert_eq!(look_hash(&boxed), 0x14d3_3cb5_f0e2_1ffa);
-        assert_eq!(look_hash(&words), 0xaeb5_8869_66cf_63d7);
-        assert_eq!(look_hash(&plain), 0x5727_5724_1e9c_57df);
+        assert_eq!(look_hash(&boxed), 0xc6a2_35e5_858f_ec6f);
+        assert_eq!(look_hash(&words), 0x80c1_7ab4_826a_edc3);
+        assert_eq!(look_hash(&plain), 0xe7fd_ea19_a8cf_c332);
         // the element's own parts wear the same rule
         boxed.style.interactive = Some(Rc::from("a/b"));
         boxed.style.set_tooltip(Some(Arc::from("tip")));
         boxed.style.set_group_owner(Some(9));
         boxed.layout.as_mut().expect("flow").slot_y = Some(40.0);
-        assert_eq!(look_hash(&boxed), 0x14d3_3cb5_f0e2_1ffa);
+        assert_eq!(look_hash(&boxed), 0xc6a2_35e5_858f_ec6f);
     }
 
     #[test]
@@ -6661,6 +6872,28 @@ mod tests {
         let mut expected = without.clone();
         expected[MASK_AT + 1] |= 0x40;
         assert_eq!(with, expected);
+    }
+
+    /// `.hidden()` on the web: a payload-free bit of its own, past the
+    /// glass's, and a look that is nothing but hidden is still a look —
+    /// so a hidden text keeps its box in the flow rather than lowering
+    /// as inline ink.
+    #[test]
+    fn a_hidden_box_sets_the_visibility_bit_and_nothing_else() {
+        let bare = DomLook { background: Some(Color::hex(0x123456)), ..DomLook::default() };
+        let unseen = DomLook { hidden: true, ..bare.clone() };
+        assert_ne!(DomLook { hidden: true, ..DomLook::NONE }, DomLook::NONE, "a hidden-only look is a look");
+        let without = encode(&[define(bare)]);
+        let with = encode(&[define(unseen)]);
+        assert_eq!(with.len(), without.len(), "the bit carries no payload");
+        let mask = u32::from_le_bytes([with[MASK_AT], with[MASK_AT + 1], with[MASK_AT + 2], with[MASK_AT + 3]]);
+        assert_eq!(mask & (1 << 24), 1 << 24, "bit 24 says the box is unseen");
+        let mut expected = without.clone();
+        expected[MASK_AT + 3] |= 0x01;
+        assert_eq!(with, expected);
+        let props = VisualProps { hidden: true, ..VisualProps::default() };
+        assert!(DomLook::paints(&props), "a hidden text keeps its box in the flow, never inline ink");
+        assert_eq!(DomLook::from_props(&props), DomLook { hidden: true, ..DomLook::NONE });
     }
 
     #[test]
@@ -6691,7 +6924,7 @@ mod tests {
         let mask = u32::from_le_bytes(bytes[MASK_AT..MASK_AT + 4].try_into().unwrap());
         assert_eq!(mask, 1 << 22, "four radii take bit 22, and bit 4 stays clear");
         let radii: Vec<f32> = bytes[MASK_AT + 4..MASK_AT + 4 + 16]
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
             .collect();
         assert_eq!(radii, vec![1.0, 2.0, 3.0, 4.0]);
@@ -6983,6 +7216,7 @@ mod tests {
                 tag: Some(tag.into()),
                 class: Some(class.into()),
                 address: Some(Rc::new(crate::layout::Address {
+                    control: None,
                     dom_id: Some(id.into()),
                     href: None,
                 })),
@@ -7053,7 +7287,7 @@ mod tests {
             for at in (1..length).rev() {
                 seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
                 scramble.swap(at, (seed >> 33) as usize % (at + 1));
-                if seed % 11 == 0 {
+                if seed.is_multiple_of(11) {
                     scramble[at] = FRESH;
                 }
             }
@@ -7687,6 +7921,108 @@ mod tests {
         assert!(matches!(&regapped[1], DomPatch::UseRule { id: 0, .. }), "{regapped:#?}");
     }
 
+    #[test]
+    fn grid_tracks_and_spans_are_byte_stable() {
+        let mut bytes = Vec::new();
+        encode_layout(
+            &mut bytes,
+            &DomLayout {
+                columns: Some(3),
+                gap: Some(4.0),
+                wrap: Some(8.0),
+                align: Some(1),
+                ..DomLayout::default()
+            },
+        );
+        let expected = [
+            &(1u16 | 2 | (1 << 11) | (1 << 14)).to_le_bytes()[..],
+            &4f32.to_le_bytes()[..],
+            &[1],
+            &8f32.to_le_bytes()[..],
+            &3u16.to_le_bytes()[..],
+        ]
+        .concat();
+        assert_eq!(bytes, expected);
+        let patch = DomPatch::SetBox {
+            id: 7,
+            width: None,
+            height: None,
+            max_width: None,
+            max_height: None,
+            slot_y: None,
+            at: None,
+            span: Some(DomSpan {
+                columns: 2,
+                rows: 3,
+                fill_x: true,
+            }),
+        };
+        let expected = [
+            &1u32.to_le_bytes()[..],
+            &[23],
+            &7u32.to_le_bytes()[..],
+            &[64],
+            &2u16.to_le_bytes()[..],
+            &3u16.to_le_bytes()[..],
+            &[1],
+        ]
+        .concat();
+        assert_eq!(encode(&[patch]), expected);
+        assert_eq!(kind_code(CreateKind::Grid), 16);
+    }
+
+    #[test]
+    fn position_geometry_is_byte_stable_and_clears_without_changing_the_look() {
+        let patch = DomPatch::SetBox {
+            id: 7,
+            width: None,
+            height: None,
+            max_width: None,
+            max_height: None,
+            slot_y: None,
+            at: Some(DomPosition {
+                x: 10.0,
+                y: 20.0,
+                layered: true,
+                fill_x: false,
+                fill_y: false,
+            }),
+            span: None,
+        };
+        let expected: Vec<u8> = [
+            &1u32.to_le_bytes()[..],
+            &[23],
+            &7u32.to_le_bytes()[..],
+            &[32, 1],
+            &10f32.to_le_bytes()[..],
+            &20f32.to_le_bytes()[..],
+        ]
+        .concat();
+        assert_eq!(encode(&[patch]), expected);
+        let mut layout = DomLayout::default();
+        let before = look_layout(&layout);
+        layout.placement = Some(Rc::new(DomPlacement {
+            at: Some(DomPosition {
+                x: 10.0,
+                y: 20.0,
+                layered: false,
+                fill_x: false,
+                fill_y: false,
+            }),
+            span: None,
+        }));
+        assert_eq!(look_layout(&layout), before);
+        assert_ne!(geometry_of(&layout), DomBox::default());
+        assert!(matches!(
+            box_patch(7, DomBox::default()),
+            DomPatch::SetBox {
+                at: None,
+                span: None,
+                ..
+            }
+        ));
+    }
+
     /// The box an element owns, a move and a reveal, pinned byte for
     /// byte: the box is a mask of five and the floats it names, in order.
     #[test]
@@ -7699,6 +8035,8 @@ mod tests {
                 max_width: None,
                 max_height: None,
                 slot_y: Some(120.0),
+                at: None,
+                span: None,
             },
             DomPatch::Move { id: 5, parent: 1, before: 9 },
             DomPatch::Reveal { id: 3, target: 44 },
@@ -8687,16 +9025,23 @@ mod size_tests {
         // (wasm: DomNode 248, DomStyle 16, DomKind 56, Modifier 56); a
         // placed element's box stays f64, the served page prints it. The
         // node is the retention too: its element id and its rule are the
-        // eight bytes over 320, where a wrapper around every kept node
+        // eight bytes over 320, plus the aligned pointer to rare child placement,
+        // where a wrapper around every kept node
         // was forty and a second vector per parent
-        assert!(size_of::<super::DomNode>() <= 328, "DomNode grew: box the rare record, not the node");
+        assert!(
+            size_of::<super::DomNode>() <= 336,
+            "DomNode grew: box the rare record, not the node"
+        );
         // the action path inline, the look and the marks boxed
         assert!(size_of::<super::DomStyle>() <= 32, "DomStyle grew: a look's field belongs in DomLook");
         // no kind wider than a text, the commonest: a wider one is boxed
         assert!(size_of::<super::DomKind>() <= 72, "DomKind grew: box the new payload");
         assert!(size_of::<super::DomText>() <= 72, "DomText grew");
-        // the flow record holds the wire's f32s
-        assert!(size_of::<Option<super::DomLayout>>() <= 84, "DomLayout grew: a length is an f32");
+        // The flow record holds f32s and one pointer for rare placement parameters.
+        assert!(
+            size_of::<Option<super::DomLayout>>() <= 96,
+            "DomLayout grew: a length is an f32"
+        );
         // a stack, a text and a style carry their hints and their action,
         // the text the widest: a wrapper for each was a box per row
         assert!(size_of::<crate::layout::LayoutNode>() <= 120, "LayoutNode grew: box the rare payload");

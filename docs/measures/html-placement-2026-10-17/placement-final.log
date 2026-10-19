@@ -1,0 +1,29 @@
+{
+  "loads": [
+    {
+      "mount": "1",
+      "when": 36.3,
+      "width": 330.0,
+      "height": 190.0
+    },
+    {
+      "mount": "2",
+      "when": 78.5,
+      "width": 320.0,
+      "height": 180.0
+    },
+    {
+      "mount": "3",
+      "when": 216.1,
+      "width": 320.0,
+      "height": 180.0
+    },
+    {
+      "mount": "4",
+      "when": 290.6,
+      "width": 320.0,
+      "height": 180.0
+    }
+  ],
+  "count": 4
+}

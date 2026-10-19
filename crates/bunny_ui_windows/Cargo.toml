@@ -26,3 +26,7 @@ targets = ["x86_64-pc-windows-msvc"]
 [[test]]
 name = "accessibility_native"
 harness = false
+
+[[test]]
+name = "window_lifecycle"
+harness = false

@@ -8,7 +8,13 @@ description = "The arena's own apps: the scenes every framework is measured on, 
 [dependencies]
 serde_json.workspace = true
 bunny-ui = { package = "bunny-ui-core", path = "../../crates/bunny_ui", features = ["gpu"] }
+
+# Each scene opens through its platform's production shell (`platform`).
+[target.'cfg(target_os = "macos")'.dependencies]
 bunny-ui-macos = { path = "../../crates/bunny_ui_macos" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+bunny-ui-windows = { path = "../../crates/bunny_ui_windows" }
 
 [[bin]]
 name = "arena_table"

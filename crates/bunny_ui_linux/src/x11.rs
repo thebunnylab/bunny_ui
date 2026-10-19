@@ -1912,8 +1912,10 @@ pub(crate) fn settle_closes() {
     loop {
         let next = with_x(|client| client.close_requested.pop());
         let Some(window) = next else { break };
-        crate::ffi::dispatch_at(window as usize, AppEvent::WindowClosed);
-        close_top_level(window);
+        if crate::ffi::allow_close(window as usize) {
+            crate::ffi::dispatch_at(window as usize, AppEvent::WindowClosed);
+            close_top_level(window);
+        }
     }
 }
 
@@ -2385,6 +2387,7 @@ pub(crate) fn panel_present(
     with_x(|client| {
         let connection = client.connection;
         let owner = client.panels.get(index).and_then(|p| p.as_ref()).map(|p| p.owner);
+        if owner.and_then(|owner| window_ref(client, owner)).is_none_or(|win| !win.mapped) { return; }
         let scale = owner.and_then(|o| window_ref(client, o)).map(|w| w.scale).unwrap_or(1);
         // a popup born inside a dialog is measured from the DIALOG's
         // root origin — the WM placed the dialog, not the scene: the
@@ -3684,6 +3687,67 @@ fn teardown() {
 }
 
 // MARK: - Tests
+
+/// Reads whether this retained X11 window was mapped.
+pub fn window_visibility(
+    window: u32,
+) -> Result<bunny_ui::window::WindowVisibility, bunny_ui::window::WindowError> {
+    use bunny_ui::window::{WindowError, WindowVisibility};
+    with_x(|client| {
+        window_ref(client, window)
+            .map(|win| {
+                if win.mapped {
+                    WindowVisibility::Shown
+                } else {
+                    WindowVisibility::Hidden
+                }
+            })
+            .ok_or(WindowError::StaleWindow)
+    })
+}
+
+/// Maps or unmaps one retained window and its native children.
+pub fn set_window_visibility(
+    window: u32,
+    visibility: bunny_ui::window::WindowVisibility,
+) -> Result<(), bunny_ui::window::WindowError> {
+    use bunny_ui::window::{WindowError, WindowVisibility};
+    with_x(|client| {
+        let connection = client.connection;
+        let win = window_at(client, window).ok_or(WindowError::StaleWindow)?;
+        let shown = visibility == WindowVisibility::Shown;
+        if win.mapped != shown {
+            unsafe {
+                if shown {
+                    xcb_map_window(connection, window);
+                } else {
+                    xcb_unmap_window(connection, window);
+                }
+                xcb_flush(connection);
+            }
+            win.mapped = shown;
+        }
+        if !shown {
+            for panel in client
+                .panels
+                .iter_mut()
+                .flatten()
+                .filter(|panel| panel.owner == window)
+            {
+                if panel.mapped {
+                    unsafe {
+                        xcb_unmap_window(connection, panel.window);
+                    }
+                    panel.mapped = false;
+                }
+            }
+            unsafe {
+                xcb_flush(connection);
+            }
+        }
+        Ok(())
+    })
+}
 
 #[cfg(test)]
 mod tests {

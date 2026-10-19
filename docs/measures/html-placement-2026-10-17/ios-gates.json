@@ -1,0 +1,52 @@
+[
+  {
+    "label": "baseline",
+    "revision": "b7ca9592d384754526013c2ce45d67b716f8c60b",
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "bunny-ui-ios",
+      "--target",
+      "aarch64-apple-ios-sim",
+      "--all-targets",
+      "--locked",
+      "--no-deps",
+      "--keep-going",
+      "--jobs",
+      "1",
+      "--message-format=json",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "started": "2026-10-17T21:19:07.045345+00:00",
+    "ended": "2026-10-17T21:19:14.823087+00:00",
+    "exit_code": 101
+  },
+  {
+    "label": "candidate",
+    "revision": "a47c97181b6afdfb11c8fe36d3893117592446dd",
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "bunny-ui-ios",
+      "--target",
+      "aarch64-apple-ios-sim",
+      "--all-targets",
+      "--locked",
+      "--no-deps",
+      "--keep-going",
+      "--jobs",
+      "1",
+      "--message-format=json",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "started": "2026-10-17T21:19:14.823412+00:00",
+    "ended": "2026-10-17T21:19:25.452755+00:00",
+    "exit_code": 101
+  }
+]

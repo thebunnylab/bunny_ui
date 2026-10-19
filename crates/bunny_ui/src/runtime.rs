@@ -11,6 +11,9 @@
 //! the fine invalidation joins the stability condition and is visible in
 //! [`Runtime::take_dirty`] and [`Runtime::body_runs`].
 
+type IslandHits = HashMap<Rc<str>, Vec<(String, Rect)>>;
+type ChordObserver = Rc<dyn Fn(&[KeyPattern])>;
+
 use std::cell::{Cell, RefCell};
 use motor::hash::FxHashMap as HashMap;
 use std::rc::Rc;
@@ -178,6 +181,11 @@ pub struct Runtime {
     /// in paint order — the hit-test
     /// map for pointer events.
     last_hits: RefCell<Vec<(String, Rect)>>,
+    /// The sited nodes of the last layout (`crate::provenance`) — empty
+    /// unless [`Runtime::record_sites`] turned recording on.
+    last_sites: RefCell<Vec<crate::provenance::SitePlacement>>,
+    /// Exported read observations cannot outlive this runtime or recording session.
+    observation_lifetime: RefCell<Rc<()>>,
     /// Which of those hits paint a pointer state (indices into
     /// `last_hits`), and which hover groups do — the last layout's
     /// answer to "would a hover HERE change the picture?".
@@ -230,7 +238,7 @@ pub struct Runtime {
     /// identity — target path and frame in the island's own
     /// coordinates, from the last walk that lowered the island. A
     /// canvas click is routed by them.
-    island_hits: RefCell<HashMap<Rc<str>, Vec<(String, Rect)>>>,
+    island_hits: RefCell<IslandHits>,
     /// Dom mode: one retained paint target per island, by element id —
     /// a frame repaints what changed inside the island and ships that
     /// rect, where it once rasterized the whole box into a fresh bitmap.
@@ -271,6 +279,9 @@ pub struct Runtime {
     /// The fields of the last layout (geometry + effective font) —
     /// click-to-position and IME sync measure through here.
     last_fields: RefCell<Vec<FieldPlacement>>,
+    last_focus_order: RefCell<Vec<crate::layout::FocusStop>>,
+    last_focus_floor: Cell<usize>,
+    navigation_scopes: RefCell<Vec<(Rc<str>, Option<String>)>>,
     /// The splits of the last layout — a divider drag maps the pointer
     /// back to a lane extent through this geometry.
     last_splits: RefCell<Vec<crate::layout::SplitPlacement>>,
@@ -305,9 +316,22 @@ pub struct Runtime {
     /// the retention ONCE (tokens read in a body are baked into the
     /// scene).
     theme_version: Cell<u64>,
+    /// The theme THIS runtime renders under when it has one of its own
+    /// ([`Runtime::theme`]) — a preview scene beside its light twin.
+    /// `None` renders under the installed theme, like every app.
+    theme: RefCell<Option<crate::theme::Theme>>,
+    /// [`Runtime::set_theme`] moved the runtime's own theme: the next
+    /// pass rebuilds the retention once, the way an installed theme does
+    /// for every runtime.
+    theme_moved: Cell<bool>,
     /// The code version the last pass saw ([`code_changed`]): new code
     /// rebuilds the retention once, the way a new theme does.
     code_version: Cell<u64>,
+    /// The overrides version the last pass saw
+    /// ([`crate::provenance::set_overrides`]): a moved table rebuilds the
+    /// retention once, the way a new theme does — the nodes baked the
+    /// modifiers they were built with.
+    overrides_version: Cell<u64>,
     /// The app keymap: key pattern → action. Runtime config (like the
     /// text engine), not retention — bind is a declaration of intent.
     keymap: RefCell<HashMap<KeyPattern, ActionId>>,
@@ -336,7 +360,7 @@ pub struct Runtime {
     /// with the strokes in the air after every change: a stroke that
     /// opened or lengthened a sequence, and the end of one, however it
     /// ended (an action, a dead end, Escape, the slow tick).
-    chord_sink: RefCell<Option<Rc<dyn Fn(&[KeyPattern])>>>,
+    chord_sink: RefCell<Option<ChordObserver>>,
     /// Whether the sink has heard the sequence now in the air — so its
     /// end is announced exactly when its start was, and a plain stroke
     /// (pushed and resolved in one breath) says nothing at all.
@@ -385,6 +409,7 @@ pub struct Runtime {
     /// Who lent the keyboard to a field's beat — the road home when the
     /// field leaves still holding it (`crate::loans`).
     loans: RefCell<crate::loans::Loans>,
+    focus_returns: RefCell<crate::loans::Returns>,
     /// The retained animations — springs keyed by identity, resolved
     /// at place through the env, advanced by the shell's tick.
     animator: RefCell<crate::anim::Animator>,
@@ -420,6 +445,7 @@ pub struct Runtime {
     /// time, so the number needs no key: it belongs to whatever
     /// `interaction.pressed` names, and the release takes it.
     pressed_clicks: Cell<u8>,
+    pressed_modifiers: Cell<crate::action::Modifiers>,
     /// Original word/line selected by a field press. Held motion extends
     /// from this entire unit, never from a partially swept caret.
     field_unit_anchor: Cell<Option<(usize, usize)>>,
@@ -530,6 +556,14 @@ pub struct Runtime {
     pump_fresh: Cell<bool>,
 }
 
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if let Some(scene) = self.scene.as_deref() {
+            reconciler::forget_root_inputs(scene);
+        }
+    }
+}
+
 impl Default for Runtime {
     fn default() -> Self {
         Self::new()
@@ -603,45 +637,121 @@ impl Runtime {
     /// wrapper down to it — so an app that wants to put the caret somewhere
     /// (a form's Tab walk, a screen that opens with one box already live)
     /// would have to spell a path it does not own. It owns the NAME, and this
-    /// resolves it against the last layout's fields and custom controls.
+    /// resolves it against the last layout's eligible controls.
     /// An exact field name wins. Otherwise, the name must contain exactly one
-    /// visible custom control that accepts keys and does not leave them behind.
+    /// eligible control. Native scroll regions reveal an offscreen target.
     ///
-    /// `false` when no eligible control, or several custom controls, match the
+    /// `false` when no eligible control, or several controls, match the
     /// name. Before the first frame there are no controls to reach.
     pub fn focus_named(&self, id: &str) -> bool {
+        self.enter_scene();
         let tail = format!("[{id}]");
-        let path = self
-            .last_fields
-            .borrow()
-            .iter()
-            .find(|field| field.path.ends_with(&tail))
-            .map(|field| field.path.clone());
-        let path = path.or_else(|| {
-            let customs = self.last_customs.borrow();
-            let dom_customs = self.dom_customs.borrow();
-            let mut matches = customs
-                .iter()
-                .chain(dom_customs.iter().map(|(_, placement)| placement))
-                .filter(|placement| {
-                    let element = placement.element.element();
-                    placement.path.split('/').any(|segment| segment == tail)
-                        && placement.visible.size.width > 0.0
-                        && placement.visible.size.height > 0.0
-                        && element.accepts_keys()
-                        && !element.leaves_keyboard()
-                });
-            let first = matches.next()?;
-            // A name around several custom controls is not a focus target.
-            matches.next().is_none().then(|| first.path.clone())
-        });
-        match path {
-            Some(path) => {
-                self.focus(&path);
-                true
+        let stop = {
+            let order = self.last_focus_order.borrow();
+            let available = &order[self.last_focus_floor.get()..];
+            let exact = available.iter().find(|stop| {
+                stop.path.ends_with(&tail) && reconciler::has_editor(&stop.path)
+            });
+            if let Some(stop) = exact {
+                Some(stop.clone())
+            } else {
+                let mut matches = available.iter().filter(|stop| stop.path.split('/').any(|segment| segment == tail));
+                let first = matches.next();
+                if matches.next().is_some() { return false; }
+                first.cloned()
             }
-            None => false,
+        };
+        if let Some(stop) = stop {
+            self.focus_stop(&stop);
+            return true;
         }
+        // Flow-DOM custom islands are placed by the browser, outside the
+        // native layout walk. Preserve their named-focus door.
+        let path = {
+            let customs = self.dom_customs.borrow();
+            let mut matches = customs.iter().map(|(_, placement)| placement).filter(|placement| {
+                placement.path.split('/').any(|segment| segment == tail)
+                    && !placement.visible.is_empty()
+                    && placement.element.element().accepts_keys()
+                    && !placement.element.element().leaves_keyboard()
+            });
+            let first = matches.next();
+            if matches.next().is_some() { return false; }
+            first.map(|placement| placement.path.clone())
+        };
+        path.is_some_and(|path| { self.focus(&path); true })
+    }
+
+    fn focus_stop(&self, stop: &crate::layout::FocusStop) {
+        self.focus(&stop.path);
+        let mut region = stop.region;
+        let mut wanted = stop.frame;
+        while let Some(placed) = region.and_then(|index| self.last_scrolls.borrow().get(index).cloned()) {
+            let before = self.scroll_offset(&placed.path);
+            self.reveal_in(&placed, wanted);
+            let after = self.scroll_offset(&placed.path);
+            if placed.direction.is_rtl() { wanted.origin.x += after.x - before.x; }
+            else { wanted.origin.x -= after.x - before.x; }
+            wanted.origin.y -= after.y - before.y;
+            region = placed.parent;
+        }
+    }
+
+    fn traverse_focus(&self, backwards: bool) -> bool {
+        let stop = {
+            let order = self.last_focus_order.borrow();
+            let order = &order[self.last_focus_floor.get()..];
+            if order.is_empty() { return false; }
+            let held = self.focus.borrow();
+            let current = order.iter().position(|stop| Some(stop.path.as_ref()) == held.as_deref());
+            let next = match (current, backwards) {
+                (Some(0) | None, true) => order.len() - 1,
+                (Some(index), true) => index - 1,
+                (Some(index), false) => (index + 1) % order.len(),
+                (None, false) => 0,
+            };
+            order[next].clone()
+        };
+        self.focus_stop(&stop);
+        true
+    }
+
+    /// A popup or modal layer owns its controls until it closes. Remember the
+    /// previous owner independently of individual popup controls, so Tab can
+    /// move inside the popup without losing the return address.
+    fn sync_navigation_scope(&self, result: &crate::layout::LayoutResult) -> bool {
+        let held = self.focused();
+        let (changed, restore) = {
+            let mut scopes = self.navigation_scopes.borrow_mut();
+            if scopes.last().map(|(scope, _)| scope) == result.focus_scope.as_ref() {
+                (false, None)
+            } else {
+                let mut restore = None;
+                let returning = result.focus_scope.is_none()
+                    || scopes.iter().any(|(scope, _)| Some(scope) == result.focus_scope.as_ref());
+                if returning {
+                    while scopes.last().map(|(scope, _)| scope) != result.focus_scope.as_ref() {
+                        if let Some((_, lender)) = scopes.pop() { restore = lender; } else { break; }
+                    }
+                } else if let Some(scope) = &result.focus_scope {
+                    scopes.push((Rc::clone(scope), held.clone()));
+                }
+                (true, restore)
+            }
+        };
+        let available = &result.focus_order[result.focus_floor..];
+        if let Some(stop) = restore.and_then(|path| available.iter().find(|stop| stop.path.as_ref() == path)) {
+            self.focus_stop(stop);
+            return true;
+        }
+        if result.focus_scope.is_some()
+            && !available.iter().any(|stop| Some(stop.path.as_ref()) == held.as_deref())
+            && !held.as_deref().is_some_and(|path| reconciler::declares(path, ALERT_CONTEXT))
+        {
+            if let Some(stop) = available.first() { self.focus_stop(stop); }
+            else if held.is_some() { self.blur(); }
+        }
+        changed || self.focused() != held
     }
 
     /// The identity path `rel` has inside this scene — what an app hands
@@ -684,7 +794,8 @@ impl Runtime {
                 }
             };
             effects::set_queue(queue);
-            if !reconciler::assembly_is_current(root) {
+            let replaced_root = reconciler::refresh_root_region(root);
+            if had_root_region || replaced_root || !reconciler::assembly_is_current(root) {
                 crate::stats::note_assembly();
                 self.assemble_input(root, had_root_region);
             } else if crate::paranoid::on(crate::paranoid::ASSEMBLE) {
@@ -693,13 +804,10 @@ impl Runtime {
         });
     }
 
-    /// Brings the tables the input doors read up to date. The path-keyed
-    /// ones follow the retention at every entry and need nothing here
-    /// but the root region's one-pass registrations; the two DERIVED
-    /// ones (handlers, key contexts) rebuild from the entries that carry
-    /// them.
+    /// Rebuilds this scene's derived input tables from retained entries and
+    /// its last rendered root region. Switching scenes never replaces root
+    /// registrations or refills the effect queue.
     fn assemble_input(&self, root: &str, had_root_region: bool) {
-        reconciler::refresh_root_region();
         reconciler::assemble_handlers(root);
         reconciler::assemble_contexts(root);
         reconciler::set_assembled_root(root, had_root_region);
@@ -734,6 +842,7 @@ impl Runtime {
     /// view of it; a single-window app never pays, because the marker
     /// already names its root.
     fn enter_scene(&self) {
+        self.enter_theme();
         let Some(root) = self.last_root.borrow().clone() else {
             return;
         };
@@ -838,6 +947,47 @@ impl Runtime {
     /// The window's horizontal size class, as the shell reads it from
     /// the platform's traits. Compared first: a rotation that keeps the
     /// class rebuilds nothing. The answer says whether it moved.
+    /// Renders this runtime under `theme` instead of the installed one
+    /// (builder): the preview road, where a dark scene stands beside a
+    /// light one on the same thread. The theme is entered before every
+    /// pass and every layout, quietly — the installed theme's version does
+    /// not move, so neither scene rebuilds the other.
+    pub fn theme(self, theme: crate::theme::Theme) -> Self {
+        self.theme.replace(Some(theme));
+        self
+    }
+
+    /// Moves the runtime's own theme between frames (`None` goes back to
+    /// the installed one). Answers whether it moved; when it did, the
+    /// next pass rebuilds the retention once, as an installed theme would.
+    pub fn set_theme(&self, theme: Option<crate::theme::Theme>) -> bool {
+        if *self.theme.borrow() == theme {
+            return false;
+        }
+        self.theme.replace(theme);
+        self.theme_moved.set(true);
+        self.frame_asked.set(true);
+        true
+    }
+
+    /// The theme this runtime renders under when it has one of its own.
+    pub fn scene_theme(&self) -> Option<crate::theme::Theme> {
+        *self.theme.borrow()
+    }
+
+    /// Makes this runtime's theme the thread's: its own, or the installed
+    /// one when it has none. Every pass, layout and input door enters it.
+    fn enter_theme(&self) {
+        match *self.theme.borrow() {
+            Some(theme) => crate::theme::set_quiet(theme),
+            None => crate::theme::restore_installed(),
+        }
+    }
+
+    pub fn size_class(&self) -> SizeClass {
+        self.ctx.borrow().values.horizontalSizeClass
+    }
+
     pub fn set_size_class(&self, class: SizeClass) -> bool {
         if self.ctx.borrow().values.horizontalSizeClass == class {
             return false;
@@ -1514,6 +1664,8 @@ impl Runtime {
             last_root: RefCell::new(None),
             last_root_type: Cell::new(None),
             last_hits: RefCell::new(Vec::new()),
+            last_sites: RefCell::new(Vec::new()),
+            observation_lifetime: RefCell::new(Rc::new(())),
             last_hover_sensitive: RefCell::new(Vec::new()),
             last_sensitive_groups: RefCell::new(Vec::new()),
             hover_move_had_more: Cell::new(false),
@@ -1543,6 +1695,9 @@ impl Runtime {
             goal_column: Cell::new(None),
             accessibility: RefCell::new(crate::accessibility::State::default()),
             last_fields: RefCell::new(Vec::new()),
+            last_focus_order: RefCell::new(Vec::new()),
+            last_focus_floor: Cell::new(0),
+            navigation_scopes: RefCell::new(Vec::new()),
             last_splits: RefCell::new(Vec::new()),
             last_customs: RefCell::new(Vec::new()),
             last_hosts: RefCell::new(Vec::new()),
@@ -1551,7 +1706,10 @@ impl Runtime {
             webview_eval_next: Cell::new(0),
             live_ledger: RefCell::new(motor::hash::FxHashMap::default()),
             theme_version: Cell::new(crate::theme::version()),
+            theme: RefCell::new(None),
+            theme_moved: Cell::new(false),
             code_version: Cell::new(code_version()),
+            overrides_version: Cell::new(crate::provenance::overrides_version()),
             keymap: RefCell::new(HashMap::default()),
             scoped_keymap: RefCell::new(HashMap::default()),
             chords: RefCell::new(Vec::new()),
@@ -1573,6 +1731,7 @@ impl Runtime {
             element_reveals: RefCell::new(HashMap::default()),
             auto_focused: RefCell::new(std::collections::HashSet::default()),
             loans: RefCell::new(crate::loans::Loans::default()),
+            focus_returns: RefCell::new(crate::loans::Returns::default()),
             animator: RefCell::new(crate::anim::Animator::default()),
             last_proposal: Cell::new(None),
             last_overlays: RefCell::new(Vec::new()),
@@ -1584,6 +1743,7 @@ impl Runtime {
             last_drop_rings: RefCell::new(Vec::new()),
             drag_armed: RefCell::new(None),
             pressed_clicks: Cell::new(1),
+            pressed_modifiers: Cell::new(crate::action::Modifiers::NONE),
             field_unit_anchor: Cell::new(None),
             touch: RefCell::new(crate::touch::Recognizer::new()),
             touch_modality: Cell::new(false),
@@ -1651,6 +1811,8 @@ impl Runtime {
     /// views the walk missed, effect-queue reassembly, and the sweep.
     /// Returns both outputs (print and layout) still holding references.
     fn render_pass<R: View>(&self, root: &R) -> NodeList {
+        // the tokens the bodies read are this runtime's, not the last scene's
+        self.enter_theme();
         let _accessibility = crate::accessibility::CaptureScope::enter(self.accessibility.borrow().enabled);
         // virtualized bodies read LAST frame's region geometry (offset
         // taken NOW — a wheel that just moved it must reach the window
@@ -1714,9 +1876,21 @@ impl Runtime {
             self.code_version.set(code_version);
             self.invalidate_scene();
         }
+        // the same for a moved override table: the retained nodes carry
+        // the modifiers of the last table
+        let overrides_version = crate::provenance::overrides_version();
+        if self.overrides_version.get() != overrides_version {
+            self.overrides_version.set(overrides_version);
+            self.invalidate_scene();
+        }
         // the same for a moved environment: a body that read the size
         // class baked its answer into the scene it retained
         if self.env_moved.replace(false) {
+            self.invalidate_scene();
+        }
+        // …and a theme of the runtime's own that moved: the bodies baked
+        // the old tokens, as they do for an installed theme
+        if self.theme_moved.replace(false) {
             self.invalidate_scene();
         }
         effects::reset();
@@ -1939,8 +2113,15 @@ impl Runtime {
         };
         let changed = interaction.hovered != hovered;
         interaction.pointer = Some(Point { x, y });
-        interaction.hovered = hovered.clone();
+        let left = std::mem::replace(&mut interaction.hovered, hovered.clone());
         drop(interaction);
+        // the box the pointer just left hears it go, whatever it went to —
+        // another target, bare glass — exactly as it does when the pointer
+        // leaves the window: a hover a box keeps for itself (a lifted row, a
+        // column of chevrons) otherwise outlives the hand that made it
+        if changed && let Some(placement) = left.as_deref().and_then(|path| self.custom_at(path)) {
+            self.deliver(&placement, crate::custom::ElementEvent::PointerExited);
+        }
         // a free move over a box still reaches it: a cursor over code
         // wants the column under it
         let over = hovered.as_deref().and_then(|path| self.custom_at(path));
@@ -2325,15 +2506,63 @@ impl Runtime {
                 }
             }
         }
-        let Some(placement) = self.focused_custom() else {
-            return crate::custom::Response::ignored();
-        };
-        let response = self.deliver(&placement, crate::custom::ElementEvent::Key(stroke));
-        if response.handled {
-            self.caret_phase.set(CaretPhase::Visible);
-            self.dirty_island_of(&placement.path);
+        if let Some(edit) = [Edit::Undo, Edit::Redo].into_iter().find(|edit| edit.stroke() == *pattern)
+            && let Some(path) = self.focused()
+            && self.field_at(&path).is_some()
+            && let Some(history) = reconciler::editor_history(&path)
+        {
+            let mut caret = self.carets.borrow().get(&path).copied().unwrap_or_default();
+            if history.restore(edit, &mut caret) {
+                self.carets.borrow_mut().insert(path.clone(), caret);
+                self.caret_phase.set(CaretPhase::Held);
+                self.frame_asked.set(true);
+                self.goal_column.set(None);
+                self.reveal_caret(&path);
+                return crate::custom::Response::handled();
+            }
         }
-        response
+        if let Some(placement) = self.focused_custom() {
+            let response = self.deliver(&placement, crate::custom::ElementEvent::Key(stroke));
+            if response.handled {
+                self.caret_phase.set(CaretPhase::Visible);
+                self.dirty_island_of(&placement.path);
+                return response;
+            }
+        }
+        if let Some(edit) = Edit::ALL.into_iter().find(|edit| edit.stroke() == *pattern)
+            && let Some(path) = self.edit_responder_focus(edit)
+            && reconciler::run_edit_handler(&path, edit)
+        {
+            self.frame_asked.set(true);
+            return crate::custom::Response::handled();
+        }
+        self.control_key(pattern)
+    }
+
+    fn control_key(&self, pattern: &KeyPattern) -> crate::custom::Response {
+        if pattern.is_plain() && pattern.key == crate::action::Key::Tab
+            && self.traverse_focus(pattern.shift)
+        {
+            return crate::custom::Response::handled();
+        }
+        if pattern.is_plain() && !pattern.shift {
+            let control = {
+                let order = self.last_focus_order.borrow();
+                let held = self.focus.borrow();
+                order[self.last_focus_floor.get()..].iter()
+                    .find(|stop| Some(stop.path.as_ref()) == held.as_deref())
+                    .and_then(|stop| stop.control.map(|state| (Rc::clone(&stop.path), state)))
+            };
+            if let Some((path, state)) = control
+                && (pattern.key == crate::action::Key::Char(' ')
+                    || (pattern.key == crate::action::Key::Enter && state.checked.is_none()))
+                && reconciler::run_action(&path, 1)
+            {
+                self.frame_asked.set(true);
+                return crate::custom::Response::handled();
+            }
+        }
+        crate::custom::Response::ignored()
     }
 
     /// Button down: ARMS pressed on the target under the point — no
@@ -2449,6 +2678,7 @@ impl Runtime {
         // risen press of a box, the thumb, the seam and the ordinary
         // tail all take their count from here, and the release takes it
         self.pressed_clicks.set(clicks);
+        self.pressed_modifiers.set(modifiers);
         self.field_unit_anchor.set(None);
         let target = self.hover_target(x, y);
         // a press inside the app's box hands it the pointer: nothing
@@ -2534,6 +2764,9 @@ impl Runtime {
         // including the ones that end a drag, a grab, a seam or a thumb
         // and fire no action at all, so the next gesture starts at one
         let clicks = self.pressed_clicks.replace(1);
+        let modifiers = self
+            .pressed_modifiers
+            .replace(crate::action::Modifiers::NONE);
         self.field_unit_anchor.set(None);
         // a live drag ends here: over a compatible target the value
         // lands (the drag clears FIRST — the action writes state into
@@ -2586,7 +2819,7 @@ impl Runtime {
                     .borrow()
                     .iter()
                     .any(|(path, rect)| *path == above && rect.contains(x, y));
-                if inside && self.activate_clicks(&above, clicks) {
+                if inside && reconciler::run_action_with_modifiers(&above, clicks, modifiers) {
                     return Some(above);
                 }
             }
@@ -2629,21 +2862,34 @@ impl Runtime {
             }
         };
         // outside the borrow: the action can write state and re-enter here
-        let activated = fired.as_deref().is_some_and(|path| self.activate_clicks(path, clicks));
+        let activated = fired
+            .as_deref()
+            .is_some_and(|path| reconciler::run_action_with_modifiers(path, clicks, modifiers));
+        self.focus_after_activation(fired.as_deref());
+        fired.filter(|_| activated)
+    }
+
+    /// Pointer and accessibility invocation leave the same keyboard owner.
+    fn focus_after_activation(&self, fired: Option<&str>) {
         // the keyboard follows the click: to the view that answers a copy
         // for what was clicked (the row's table), and away from every
         // field otherwise — first responder follows the click. Chrome is
         // the exception (`.leaves_keyboard()`): a menu's row, a toolbar
         // button, and the keyboard stays where it was
-        if !fired.as_deref().is_some_and(reconciler::leaves_keyboard) {
-            match fired.as_deref().and_then(reconciler::copy_owner) {
+        if !fired.is_some_and(reconciler::leaves_keyboard) {
+            let control = fired.and_then(|path| {
+                self.last_focus_order.borrow().iter().find(|stop| stop.path.as_ref() == path && stop.control.is_some()).cloned()
+            });
+            match control {
+                Some(stop) => self.focus_stop(&stop),
+                None => match fired.and_then(reconciler::copy_owner) {
                 Some(owner) => self.focus_element(&owner),
                 None => {
                     self.blur();
                 }
+                },
             }
         }
-        fired.filter(|_| activated)
     }
 
     /// What the pointer should look like where it is — the box under it
@@ -2913,6 +3159,7 @@ impl Runtime {
 
     fn pointer_cancelled_road(&self) -> bool {
         self.pressed_clicks.set(1);
+        self.pressed_modifiers.set(crate::action::Modifiers::NONE);
         self.field_unit_anchor.set(None);
         self.drag_armed.borrow_mut().take();
         let dragged = self.drag_value.borrow_mut().take().is_some();
@@ -3609,8 +3856,9 @@ impl Runtime {
     /// An edit answers while the keyboard is held by someone who can take
     /// it. A copy needs anyone who can hand text back: a field that is not
     /// secret, a box, or a read-only view with `.on_copy`. A cut, a paste
-    /// and a select-all need a field or a box. An undo and a redo need a
-    /// box, because a field keeps no history.
+    /// and a select-all need a field or a box. Undo and Redo use a box's
+    /// own commands or the focused field's available history. A non-text control
+    /// can instead use its nearest ancestor's `.on_edit` responder.
     pub fn menu_answers(&self, pick: Pick) -> bool {
         self.enter_scene();
         match pick {
@@ -3626,12 +3874,17 @@ impl Runtime {
                 let boxed = self.custom_at(&path).is_some();
                 let field = self.field_at(&path);
                 let open_field = field.as_ref().is_some_and(|field| !field.secret);
-                match edit {
+                let local = match edit {
                     Edit::Copy => boxed || open_field || reconciler::answers_copy(&path),
                     Edit::Cut => boxed || open_field,
                     Edit::Paste | Edit::SelectAll => boxed || field.is_some(),
-                    Edit::Undo | Edit::Redo => boxed,
-                }
+                    Edit::Undo | Edit::Redo => boxed || reconciler::editor_history(&path).is_some_and(|history| {
+                        let caret = self.carets.borrow().get(&path).copied().unwrap_or_default();
+                        history.available(edit, caret)
+                    }),
+                };
+                local || self.edit_responder_focus(edit)
+                    .is_some_and(|focus| reconciler::has_edit_handler(&focus, edit))
             }
         }
     }
@@ -3657,6 +3910,22 @@ impl Runtime {
             Pick::Command(action) => self.dispatch_action(action),
             Pick::Edit(edit) => self.menu_edit(edit),
         }
+    }
+
+    /// Ordinary controls may ask their containing editor. Fields and custom
+    /// editors own their command even when they cannot currently answer it.
+    fn edit_responder_focus(&self, edit: Edit) -> Option<String> {
+        if self.alert_asks() {
+            return None;
+        }
+        let path = self.focused()?;
+        if self.field_at(&path).is_some()
+            || self.custom_at(&path).is_some()
+            || (edit == Edit::Copy && reconciler::answers_copy(&path))
+        {
+            return None;
+        }
+        Some(path)
     }
 
     /// [`Runtime::menu_pick`] for an edit the window answers.
@@ -3826,6 +4095,7 @@ impl Runtime {
         self.frame_asked.set(true);
         let moved = self.focus.borrow().as_deref() != Some(path);
         if moved {
+            if let Some(history) = reconciler::editor_history(path) { history.separate(); }
             self.blur();
         }
         self.caret_phase.set(if placement.is_some() || self.custom_at(path).is_some() {
@@ -3835,10 +4105,10 @@ impl Runtime {
         });
         *self.focus.borrow_mut() = Some(path.to_string());
         self.sync_field_focus();
-        self.carets
-            .borrow_mut()
-            .entry(path.to_string())
-            .or_insert(CaretState { caret: usize::MAX, anchor: None, marked: None });
+        if reconciler::has_editor(path) {
+            self.carets.borrow_mut().entry(path.to_string())
+                .or_insert(CaretState { caret: usize::MAX, anchor: None, marked: None });
+        }
         if !moved {
             return;
         }
@@ -3858,6 +4128,7 @@ impl Runtime {
     /// `shift` keeps the anchor where it already was, which is the
     /// keyboard's own extend done with the mouse.
     fn select_at(&self, path: &str, x: Px, y: Px, clicks: u8, shift: bool) {
+        if let Some(history) = reconciler::editor_history(path) { history.separate(); }
         self.caret_phase.set(CaretPhase::Held);
         self.goal_column.set(None);
         let held = self.focus.borrow().as_deref() == Some(path);
@@ -4192,6 +4463,7 @@ impl Runtime {
     /// does everywhere. A one-line field declines, so a list under a
     /// search box still navigates with the arrows.
     fn walk_line(&self, path: &str, down: bool, select: bool) -> Edited {
+        if let Some(history) = reconciler::editor_history(path) { history.separate(); }
         let declined = Edited { applied: false, output: None };
         let Some(field) = self.field_at(path).filter(|field| field.multiline) else {
             return declined;
@@ -4301,6 +4573,7 @@ impl Runtime {
 
     pub fn blur(&self) -> bool {
         let dropped = self.focus.borrow_mut().take();
+        if let Some(history) = dropped.as_deref().and_then(reconciler::editor_history) { history.separate(); }
         self.sync_field_focus();
         // the box hears the keyboard leave — a selection that only
         // means something while focused goes quiet
@@ -4328,7 +4601,8 @@ impl Runtime {
 
     fn caret_blinks(&self) -> bool {
         self.focus.borrow().as_deref().is_some_and(|path| {
-            !reconciler::answers_copy(path) || self.custom_at(path).is_some()
+            !self.last_focus_order.borrow().iter().any(|stop| stop.path.as_ref() == path && stop.control.is_some())
+                && (!reconciler::answers_copy(path) || self.custom_at(path).is_some())
         })
     }
 
@@ -4624,6 +4898,7 @@ impl Runtime {
         let Some(path) = self.focus.borrow().clone() else {
             return false;
         };
+        if let Some(history) = reconciler::editor_history(&path) { history.separate(); }
         if let Some(placement) = self.custom_at(&path) {
             if let Some(image) = crate::clipboard::read_image() {
                 let response = self.deliver(&placement, crate::custom::ElementEvent::PasteImage(image));
@@ -4640,10 +4915,12 @@ impl Runtime {
             self.frame_asked.set(true);
             return true;
         }
-        match crate::clipboard::read() {
+        let applied = match crate::clipboard::read() {
             Some(text) => self.key(EditCommand::Insert(text)).applied,
             None => false,
-        }
+        };
+        if let Some(history) = reconciler::editor_history(&path) { history.separate(); }
+        applied
     }
 
     /// A full frame for the shell: settle, layout at the viewport,
@@ -4868,6 +5145,7 @@ impl Runtime {
             paints: motor::identity::has_dirty_paints(),
             theme: crate::theme::version() != self.theme_version.get(),
             code: code_version() != self.code_version.get(),
+            overrides: crate::provenance::overrides_version() != self.overrides_version.get(),
             environment: self.env_moved.get(),
             insets: self.last_insets.get() != self.frame_insets(),
             webview: reconciler::has_webview_commands(),
@@ -5155,13 +5433,13 @@ impl Runtime {
         let no_promises = motor::hash::FxHashMap::default();
         let boxes = self.island_boxes.borrow();
         let flow = crate::dom_flow::FlowEnv {
-            scroll_offsets: &*offsets,
+            scroll_offsets: &offsets,
             direction: self.layout_direction(),
             size: (size.width, size.height),
             layout: Some(env),
             changed: &changed,
             retained_groups: match rings_held {
-                true => &retained_groups,
+                true => retained_groups,
                 // the ring moved: no boundary may promise this frame,
                 // or the walk never reaches the target that wears it
                 false => &no_promises,
@@ -5286,13 +5564,13 @@ impl Runtime {
         let no_promises = motor::hash::FxHashMap::default();
         let boxes = self.island_boxes.borrow();
         let flow = crate::dom_flow::FlowEnv {
-            scroll_offsets: &*offsets,
+            scroll_offsets: &offsets,
             direction: self.layout_direction(),
             size: (size.width, size.height),
             layout: Some(env),
             changed: &changed,
             retained_groups: match rings_held {
-                true => &retained_groups,
+                true => retained_groups,
                 // the ring moved: no boundary may promise this frame,
                 // or the walk never reaches the target that wears it
                 false => &no_promises,
@@ -5324,6 +5602,12 @@ impl Runtime {
         reconciler::run_action(path, clicks)
     }
 
+    /// Browser-resolved click with the initiating event's modifier keys.
+    /// The existing `dom_action` remains the modifier-free compatibility door.
+    pub fn dom_action_with_modifiers(&self, path: &str, clicks: u8, modifiers: crate::action::Modifiers) -> bool {
+        reconciler::run_action_with_modifiers(path, clicks, modifiers)
+    }
+
     /// The canvas islands whose CONTENT changed since the last call —
     /// each one's display list and its physical size, with no pixels.
     /// A tier that paints its own islands takes this road;
@@ -5337,6 +5621,32 @@ impl Runtime {
     /// page that has no elements to query.
     pub fn hits_snapshot(&self) -> Vec<(String, Rect)> {
         self.last_hits.borrow().clone()
+    }
+
+    /// Record where every node was written (`crate::provenance`): from the
+    /// next pass on, each builder and modifier wraps its node in its site
+    /// and the layout keeps a placement per site. Turn it on BEFORE the
+    /// first pass — a boundary the reconciler already retained keeps the
+    /// nodes it built until its body runs again. Off, a pass is the pass
+    /// it always was.
+    pub fn record_sites(&self, on: bool) {
+        crate::provenance::set_recording(on);
+        if !on {
+            self.last_sites.borrow_mut().clear();
+            *self.observation_lifetime.borrow_mut() = Rc::new(());
+        }
+    }
+
+    /// Every sited node the last layout placed, with its frame in the
+    /// scene's coordinates — the table a tool maps a click or a caret
+    /// through. Empty unless [`Runtime::record_sites`] is on.
+    pub fn sites(&self) -> Vec<crate::provenance::SitePlacement> {
+        let mut sites = self.last_sites.borrow().clone();
+        let owner = self.observation_lifetime.borrow();
+        for site in &mut sites {
+            if let Some(reading) = &mut site.reading { reading.attach(&owner); }
+        }
+        sites
     }
 
     /// Dom mode: every island's element id, origin and size in the
@@ -6112,10 +6422,11 @@ impl Runtime {
         let Some(path) = self.dom.borrow().island_path(id) else {
             return false;
         };
-        if let Some((w, h)) = self.island_boxes.borrow().get(path.as_ref()) {
-            if (w - width).abs() < 0.5 && (h - height).abs() < 0.5 {
-                return false;
-            }
+        if let Some((w, h)) = self.island_boxes.borrow().get(path.as_ref())
+            && (w - width).abs() < 0.5
+            && (h - height).abs() < 0.5
+        {
+            return false;
         }
         self.island_boxes.borrow_mut().insert(Rc::clone(&path), (width, height));
         // the island lives under a body — the fresh box re-runs it
@@ -6292,14 +6603,15 @@ impl Runtime {
             if own as f32 == pin { own } else { pin.into() }
         }
         fn walk(node: &crate::dom::DomNode, boxes: &mut HashMap<Rc<str>, (f64, f64)>) {
-            if let crate::dom::DomKind::Canvas { path: Some(path), .. } = &node.kind {
-                if let Some(layout) = &node.layout {
-                    if let (Some(w), Some(h)) = (layout.width, layout.height) {
+            if let crate::dom::DomKind::Canvas {
+                path: Some(path), ..
+            } = &node.kind
+                && let Some(layout) = &node.layout
+                && let (Some(w), Some(h)) = (layout.width, layout.height)
+            {
                         boxes
                             .entry(Rc::clone(path))
                             .or_insert((seed(w, node.width), seed(h, node.height)));
-                    }
-                }
             }
             for child in &node.children {
                 walk(child, boxes);
@@ -6713,7 +7025,7 @@ impl Runtime {
                 | self.apply_measures(&result)
                 | self.apply_row_anchors()
                 | self.apply_tail_follow(&result);
-            let focused = self.apply_auto_focus(&result);
+            let focused = self.sync_navigation_scope(&result) | self.apply_auto_focus(&result);
             // a miss measured on the round a target just moved is
             // spurious — it audited the PRE-jump offset; the relayout
             // below re-audits against the real one
@@ -6781,6 +7093,14 @@ impl Runtime {
         // take its caret and its once-per-identity memory with it, and
         // the retains below would have thrown both away
         self.follow_named_inputs();
+        let restore = self.focus_returns.borrow_mut().sync(
+            &reconciler::focus_returns(),
+            self.focus.borrow().as_deref(),
+            input_lives,
+        );
+        if let Some(path) = restore {
+            self.hand_keyboard(&path, None);
+        }
         self.carets.borrow_mut().retain(|path, _| reconciler::has_editor(path));
         self.auto_focused.borrow_mut().retain(|key| {
             // a once-per-beat memory is keyed `path#beat`, a box's or a
@@ -6988,6 +7308,9 @@ impl Runtime {
             return true;
         }
         for field in &result.fields {
+            if result.focus_scope.is_some() && !result.focus_order[result.focus_floor..]
+                .iter().any(|stop| stop.path.as_ref() == field.path)
+            { continue; }
             if self.claim_auto_focus(&field.path, field.auto_focus) {
                 // This layout has retained the field's geometry. Reveal the
                 // focused caret now, before the first frame or keystroke.
@@ -7002,6 +7325,9 @@ impl Runtime {
         // Each (box, beat) fires once, so the user can focus away and stay
         // away until the app beats again.
         for placement in &result.customs {
+            if result.focus_scope.is_some() && !result.focus_order[result.focus_floor..]
+                .iter().any(|stop| stop.path.as_ref() == placement.path)
+            { continue; }
             // an overlay island shares its box's element: the keyboard goes
             // to the box, never to the island
             if placement.overlay {
@@ -7048,6 +7374,9 @@ impl Runtime {
         dom: bool,
         collect_display: bool,
     ) -> (crate::layout::LayoutResult, Option<crate::dom::DomNode>) {
+        // the chrome reads its tokens at placement: this runtime's theme
+        // must be the thread's before the walk
+        self.enter_theme();
         // every call walks measure+place (the stable-root shortcut
         // skips BODIES, not geometry) — so every call counts
         crate::stats::note_layout_pass();
@@ -7176,11 +7505,19 @@ impl Runtime {
         // `clone_from`, not a fresh clone: the tables keep their capacity
         // from frame to frame, and the paths inside keep their buffers
         self.last_hits.borrow_mut().clone_from(&result.hits);
+        self.last_sites.borrow_mut().clone_from(&result.sites);
         self.last_hover_sensitive.borrow_mut().clone_from(&result.hover_sensitive);
         self.last_sensitive_groups.borrow_mut().clone_from(&result.sensitive_groups);
         self.last_scrolls.borrow_mut().clone_from(&result.scrolls);
         self.last_modal_floor.set(result.modal_floor);
+        let lost_control = self.focused().is_some_and(|path| {
+            self.last_focus_order.borrow().iter().any(|stop| stop.path.as_ref() == path)
+                && !result.focus_order.iter().any(|stop| stop.path.as_ref() == path)
+        });
+        if lost_control { self.blur(); }
         self.last_fields.borrow_mut().clone_from(&result.fields);
+        self.last_focus_order.borrow_mut().clone_from(&result.focus_order);
+        self.last_focus_floor.set(result.focus_floor);
         self.accessibility.borrow_mut().update(&result.accessibility);
         self.last_splits.borrow_mut().clone_from(&result.splits);
         self.last_customs.borrow_mut().clone_from(&result.customs);
@@ -7250,7 +7587,12 @@ impl Runtime {
         // to it is a reason to ask them again, and a write to anything
         // else is not
         motor::identity::begin_effects(self.pump_fresh.replace(false));
-        let changed = effects::take().iter().any(|effect| effect(&ctx));
+        // Every mounted effect must observe this pass. Short-circuiting after
+        // the first change can starve later mounts/tasks once the tree is quiet.
+        let mut changed = false;
+        for effect in &*effects::take() {
+            changed |= effect(&ctx);
+        }
         motor::identity::end_effects();
         changed
     }
@@ -7415,6 +7757,7 @@ impl Runtime {
             && !motor::task::has_ready()
             && crate::theme::version() == self.theme_version.get()
             && code_version() == self.code_version.get()
+            && crate::provenance::overrides_version() == self.overrides_version.get()
             && !self.env_moved.get()
             && self.last_insets.get() == self.frame_insets()
             && !self.has_pending_dirty()
@@ -7453,6 +7796,7 @@ impl Runtime {
         (self.last_root_type.get() == Some(root)
             && crate::theme::version() == self.theme_version.get()
             && code_version() == self.code_version.get()
+            && crate::provenance::overrides_version() == self.overrides_version.get()
             && !self.env_moved.get()
             && !self.has_pending_dirty())
         .then(|| self.root_boundary.borrow().clone())
@@ -7662,6 +8006,8 @@ pub struct FrameNeed {
     pub theme: bool,
     /// The code of the views changed ([`code_changed`]).
     pub code: bool,
+    /// The override table moved ([`crate::provenance::set_overrides`]).
+    pub overrides: bool,
     /// The environment moved.
     pub environment: bool,
     /// The safe area or the keyboard inset moved.
@@ -7686,6 +8032,7 @@ impl FrameNeed {
             || self.paints
             || self.theme
             || self.code
+            || self.overrides
             || self.environment
             || self.insets
             || self.webview
@@ -7700,6 +8047,7 @@ impl FrameNeed {
 /// view that answers a copy holds it by its `.on_copy`.
 fn input_lives(path: &str) -> bool {
     reconciler::has_editor(path)
+        || reconciler::has_action(path)
         || reconciler::has_custom(path)
         || reconciler::declares(path, ALERT_CONTEXT)
         || reconciler::answers_copy(path)
@@ -7813,10 +8161,15 @@ impl Runtime {
         if !node.supports(&action) { return Err(ActionError::Unsupported); }
         self.enter_scene();
         let applied = match action {
-            Action::Activate => reconciler::run_action(&node.path, 1),
+            Action::Activate => {
+                let applied = reconciler::run_action(&node.path, 1);
+                if applied { self.focus_after_activation(Some(&node.path)); }
+                applied
+            }
             Action::Focus => {
-                if self.field_at(&node.path).is_none() { return Err(ActionError::Unavailable); }
-                self.focus(&node.path);
+                let stop = self.last_focus_order.borrow().iter().skip(self.last_focus_floor.get())
+                    .find(|stop| stop.path == node.path).cloned().ok_or(ActionError::Unavailable)?;
+                self.focus_stop(&stop);
                 true
             }
             Action::SetText(text) => {

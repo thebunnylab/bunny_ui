@@ -77,7 +77,7 @@ pub fn family_name(bytes: &[u8]) -> Option<String> {
             // Windows, Unicode BMP: UTF-16BE — the one every face carries
             (3, 1) | (0, _) => {
                 let units: Vec<u16> =
-                    raw.chunks_exact(2).map(|pair| u16::from_be_bytes([pair[0], pair[1]])).collect();
+                    raw.as_chunks::<2>().0.iter().map(|pair| u16::from_be_bytes([pair[0], pair[1]])).collect();
                 return Some(String::from_utf16_lossy(&units));
             }
             // Macintosh Roman: close enough to ASCII for a family name

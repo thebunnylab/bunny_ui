@@ -53,7 +53,7 @@ macro_rules! template {
 /// The project itself: rendered with the app's names at `new`.
 pub const APP: Set = Set {
     name: "app",
-    revision: 1,
+    revision: 2,
     files: &[
         template!("app/Cargo.toml.tmpl"),
         template!("app/README.md.tmpl"),

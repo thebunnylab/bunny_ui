@@ -46,6 +46,10 @@ pub enum Modifier {
     FrameMax(f64, f64, Alignment),
     FrameFlex(f64, f64, Alignment),
     HugHeight,
+    /// The outer box sits at this point in its enclosing stack.
+    Position(crate::layout::Point),
+    /// Number of grid columns and rows occupied by the outer box.
+    Span(usize, usize),
     NavigationTitle(String),
     NavigationBarTitle(String),
     ListStyle(ListStyle),
@@ -54,6 +58,7 @@ pub enum Modifier {
     MultilineTextAlignment(TextAlignment),
     Blur(f64),
     IgnoresSafeArea,
+    /// `.hidden()` — laid out as it would be, painted and hit as nothing.
     Hidden,
     /// A reactive accessible name for one semantic element.
     AccessibilityLabel(crate::bind::TextSource),
@@ -115,6 +120,8 @@ pub enum Modifier {
     OnMeasure(Rc<dyn Fn(crate::layout::Size)>),
     /// The field asks for focus on its first appearance.
     AutoFocus,
+    /// Return focus to the invoker when this transient subtree closes.
+    RestoreFocusOnClose,
     /// The field takes the keyboard on each new beat, from whoever holds it.
     AutoFocusBeat(u64),
     /// As [`Modifier::AutoFocusBeat`], selecting the field's whole text on
@@ -170,6 +177,7 @@ pub enum Modifier {
     /// click (no caret) and answers ⌘C with what it has selected.
     OnCopy(crate::reconciler::CopyFn),
     OnAction(crate::action::ActionId, Rc<dyn Fn()>),
+    OnEdit(crate::menu::Edit, Rc<dyn Fn()>),
 
     // MARK: - Interaction (the action fires at render, as in the headless engine)
     OnAppear(Rc<dyn Fn()>),
@@ -216,6 +224,7 @@ pub enum Modifier {
     Popover {
         is_presented: Binding<bool>,
         side: crate::layout::Side,
+        focus: crate::layout::PopoverFocus,
         on_dismiss: Option<Rc<dyn Fn()>>,
         content: Rc<dyn Fn(&Context) -> crate::erased::Erased>,
     },
@@ -241,6 +250,111 @@ pub enum Modifier {
 }
 
 impl Modifier {
+    /// The method that made this modifier, as the app wrote it — the word
+    /// a site carries (`crate::provenance`). A tuple variant's arguments
+    /// are not the name; `FrameWH` is `.frame(…)` and `PaddingLength` is
+    /// `.padding(…)` to the reader.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Modifier::Font { .. } => "font",
+            Modifier::Bold => "bold",
+            Modifier::Italic => "italic",
+            Modifier::Padding => "padding",
+            Modifier::PaddingLength { .. } => "padding",
+            Modifier::PaddingEdge { .. } => "padding_edge",
+            Modifier::FrameWH { .. } => "frame",
+            Modifier::FrameWidth { .. } => "frame_width",
+            Modifier::FrameHeight { .. } => "frame_height",
+            Modifier::Tracking { .. } => "tracking",
+            Modifier::FrameMax { .. } => "frame_max",
+            Modifier::FrameFlex { .. } => "frame_flex",
+            Modifier::HugHeight => "hug_height",
+            Modifier::Position(_) => "position",
+            Modifier::Span(_, _) => "span",
+            Modifier::NavigationTitle { .. } => "navigation_title",
+            Modifier::NavigationBarTitle { .. } => "navigation_bar_title",
+            Modifier::ListStyle { .. } => "list_style",
+            Modifier::ProgressViewStyle { .. } => "progress_view_style",
+            Modifier::NavigationViewStyle => "navigation_view_style",
+            Modifier::MultilineTextAlignment { .. } => "multiline_text_alignment",
+            Modifier::Blur { .. } => "blur",
+            Modifier::IgnoresSafeArea => "ignores_safe_area",
+            Modifier::Hidden => "hidden",
+            Modifier::AccessibilityLabel { .. } => "accessibility_label",
+            Modifier::AccessibilityHidden => "accessibility_hidden",
+            Modifier::Equatable => "equatable",
+            Modifier::BackgroundColor { .. } => "background_color",
+            Modifier::BackgroundGradient { .. } => "background_gradient",
+            Modifier::ForegroundColor { .. } => "foreground_color",
+            Modifier::Border { .. } => "border",
+            Modifier::CornerRadius { .. } => "corner_radius",
+            Modifier::Clipped => "clipped",
+            Modifier::Tooltip { .. } => "tooltip",
+            Modifier::ContextMenu { .. } => "context_menu",
+            Modifier::OnContextClick { .. } => "on_context_click",
+            Modifier::OnDrag { .. } => "on_drag",
+            Modifier::OnDrop { .. } => "on_drop",
+            Modifier::Monospaced => "monospaced",
+            Modifier::FontFamily { .. } => "font_family",
+            Modifier::FontSize { .. } => "font_size",
+            Modifier::LineHeight { .. } => "line_height",
+            Modifier::FontWeight { .. } => "font_weight",
+            Modifier::BackgroundHovered { .. } => "background_hovered",
+            Modifier::Opacity { .. } => "opacity",
+            Modifier::OpacityHovered { .. } => "opacity_hovered",
+            Modifier::OpacityPressed { .. } => "opacity_pressed",
+            Modifier::HoverGroup => "hover_group",
+            Modifier::GroupHovered => "group_hovered",
+            Modifier::BackgroundPressed { .. } => "background_pressed",
+            Modifier::ForegroundHovered { .. } => "foreground_hovered",
+            Modifier::ForegroundPressed { .. } => "foreground_pressed",
+            Modifier::Highlight { .. } => "highlight",
+            Modifier::TruncationMode { .. } => "truncation_mode",
+            Modifier::ScrollTarget { .. } => "scroll_target",
+            Modifier::OnMeasure { .. } => "on_measure",
+            Modifier::AutoFocus => "auto_focus",
+            Modifier::RestoreFocusOnClose => "restore_focus_on_close",
+            Modifier::AutoFocusBeat { .. } => "auto_focus_beat",
+            Modifier::SelectOnBeat { .. } => "select_on_beat",
+            Modifier::Shadow { .. } => "shadow",
+            Modifier::Glass { .. } => "glass",
+            Modifier::Resizable => "resizable",
+            Modifier::AspectRatio { .. } => "aspect_ratio",
+            Modifier::Animated { .. } => "animated",
+            Modifier::Looping { .. } => "looping",
+            Modifier::Rendering { .. } => "rendering",
+            Modifier::KeyContext { .. } => "key_context",
+            Modifier::LeavesKeyboard => "leaves_keyboard",
+            Modifier::KeyContextFocused { .. } => "key_context_focused",
+            Modifier::WindowDragRegion => "window_drag_region",
+            Modifier::WindowControl { .. } => "window_control",
+            Modifier::ElementHint { .. } => "element",
+            Modifier::LayoutMode { .. } => "layout_mode",
+            Modifier::OnClick { .. } => "on_click",
+            Modifier::OnHover { .. } => "on_hover",
+            Modifier::OnCopy { .. } => "on_copy",
+            Modifier::OnAction { .. } => "on_action",
+            Modifier::OnEdit { .. } => "on_edit",
+            Modifier::OnAppear { .. } => "on_appear",
+            Modifier::OnTapGesture { .. } => "on_tap_gesture",
+            Modifier::Id { .. } => "id",
+            Modifier::Effect { .. } => "effect",
+            Modifier::Sheet { .. } => "sheet",
+            Modifier::Dialog { .. } => "dialog",
+            Modifier::Alert { .. } => "alert",
+            Modifier::Popover { .. } => "popover",
+            Modifier::EnvSet { .. } => "inject",
+            Modifier::Custom { .. } => "modifier",
+            Modifier::Searchable => "searchable",
+            Modifier::Refreshable => "refreshable",
+            Modifier::Toolbar => "toolbar",
+            Modifier::AttachEnvironmentOverrides => "attach_environment_overrides",
+            Modifier::AttachEnvironmentOverridesOnChange => "attach_environment_overrides_on_change",
+            Modifier::NavigationDestination => "navigation_destination",
+            Modifier::FlipsForRightToLeftLayoutDirection { .. } => "flips_for_right_to_left_layout_direction",
+        }
+    }
+
     /// The `[.name(detail)]` appended to the rendered node's line.
     fn suffix(&self) -> String {
         match self {
@@ -272,6 +386,8 @@ impl Modifier {
                 " [.frame(flex, minWidth: {min_width}, minHeight: {min_height}, alignment: {alignment})]"
             ),
             Modifier::HugHeight => " [.hugHeight]".into(),
+            Modifier::Span(columns, rows) => format!(" [.span({columns}, {rows})]"),
+            Modifier::Position(at) => format!(" [.position({}, {})]", at.x, at.y),
             Modifier::NavigationTitle(title) => format!(" [.navigationTitle({title:?})]"),
             Modifier::NavigationBarTitle(title) => format!(" [.navigationBarTitle({title:?})]"),
             Modifier::ListStyle(style) => format!(" [.listStyle({style})]"),
@@ -340,6 +456,7 @@ impl Modifier {
             Modifier::ScrollTarget(id) => format!(" [.scrollTarget({id:?})]"),
             Modifier::OnMeasure(_) => " [.onMeasure]".into(),
             Modifier::AutoFocus => " [.autoFocus()]".into(),
+            Modifier::RestoreFocusOnClose => " [.restoreFocusOnClose()]".into(),
             Modifier::AutoFocusBeat(beat) => format!(" [.autoFocusBeat({beat})]"),
             Modifier::SelectOnBeat(beat) => format!(" [.selectOnBeat({beat})]"),
             Modifier::Shadow(radius, color) => format!(" [.shadow(radius: {radius}, {color})]"),
@@ -366,8 +483,7 @@ impl Modifier {
                     crate::layout::WindowControl::Minimize => "minimize",
                     crate::layout::WindowControl::Maximize => "maximize",
                 }
-            )
-            .into(),
+            ),
             Modifier::ElementHint(tag, class, dom_id, href) => {
                 format!(" [.element({tag:?}, {class:?}, {dom_id:?}, {href:?})]")
             }
@@ -376,6 +492,7 @@ impl Modifier {
             Modifier::OnHover(_) => " [.onHover()]".into(),
             Modifier::OnCopy(_) => " [.onCopy()]".into(),
             Modifier::OnAction(id, _) => format!(" [.onAction({id})]"),
+            Modifier::OnEdit(edit, _) => format!(" [.onEdit({edit:?})]"),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
             Modifier::OnTapGesture(_) => " [.onTapGesture()]".into(),
             Modifier::Effect { name, detail, .. } => format!(" [.{name}{detail}]"),
@@ -429,6 +546,19 @@ fn rewrite_scroll_node(
     ) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        LayoutNode::Spanned {
+            columns,
+            rows,
+            child,
+        } => LayoutNode::Spanned {
+            columns,
+            rows,
+            child: Box::new(rewrite_scroll_node(*child, rewrite)),
+        },
+        LayoutNode::Placed { at, child } => LayoutNode::Placed {
+            at,
+            child: Box::new(rewrite_scroll_node(*child, rewrite)),
+        },
         LayoutNode::Accessible { semantics, child } => LayoutNode::Accessible {
             semantics, child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
@@ -527,6 +657,19 @@ fn rewrite_field_node(
     rewrite: &impl Fn(FieldParts) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        LayoutNode::Spanned {
+            columns,
+            rows,
+            child,
+        } => LayoutNode::Spanned {
+            columns,
+            rows,
+            child: Box::new(rewrite_field_node(*child, rewrite)),
+        },
+        LayoutNode::Placed { at, child } => LayoutNode::Placed {
+            at,
+            child: Box::new(rewrite_field_node(*child, rewrite)),
+        },
         LayoutNode::Accessible { semantics, child } => LayoutNode::Accessible {
             semantics, child: Box::new(rewrite_field_node(*child, rewrite)),
         },
@@ -620,6 +763,19 @@ fn rewrite_pixel_node(
     icon: &impl Fn(crate::icon::Symbol, bool, bool) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        LayoutNode::Spanned {
+            columns,
+            rows,
+            child,
+        } => LayoutNode::Spanned {
+            columns,
+            rows,
+            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
+        },
+        LayoutNode::Placed { at, child } => LayoutNode::Placed {
+            at,
+            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
+        },
         LayoutNode::Accessible { semantics, child } => LayoutNode::Accessible {
             semantics, child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
@@ -690,6 +846,19 @@ fn rewrite_text_node(
     ) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        LayoutNode::Spanned {
+            columns,
+            rows,
+            child,
+        } => LayoutNode::Spanned {
+            columns,
+            rows,
+            child: Box::new(rewrite_text_node(*child, rewrite)),
+        },
+        LayoutNode::Placed { at, child } => LayoutNode::Placed {
+            at,
+            child: Box::new(rewrite_text_node(*child, rewrite)),
+        },
         LayoutNode::Accessible { semantics, child } => LayoutNode::Accessible {
             semantics, child: Box::new(rewrite_text_node(*child, rewrite)),
         },
@@ -811,6 +980,31 @@ fn hints_over(hints: &mut crate::layout::ElementHints, outer: [&Option<Rc<str>>;
 pub struct Modified<C> {
     pub(crate) base: C,
     pub(crate) modifier: Modifier,
+    /// Where the modifier was called (`crate::provenance`).
+    pub(crate) site: crate::provenance::Site,
+}
+
+impl<C> Modified<C> {
+    /// A modifier over its base, sited at the caller — every `ViewExt`
+    /// method is `#[track_caller]`, so the site is the app's own line.
+    #[track_caller]
+    pub(crate) fn new(base: C, modifier: Modifier) -> Self {
+        Self { base, modifier, site: crate::provenance::here() }
+    }
+}
+
+/// A retained standard-edit responder around a single view. The boundary
+/// preserves its handler when the scene is revisited after another window;
+/// the contained modifier keeps the original caller's source site.
+#[derive(Clone)]
+pub struct EditResponder<C> {
+    pub(crate) content: Modified<C>,
+}
+
+impl<C: View<Arity = Single>> crate::view::Component for EditResponder<C> {
+    fn body(self) -> impl View {
+        self.content
+    }
 }
 
 /// What `.on_drop(…)` answers: the view, taking a typed drag — and one
@@ -931,12 +1125,12 @@ where
             layer: Box::new(layer),
             child: Box::new(node),
         });
-        if let Some(node) = out.last_mut() {
-            if crate::view::print_enabled() {
+        if let Some(node) = out.last_mut()
+            && crate::view::print_enabled()
+        {
                 node.line
                     .push_str(if behind { " [.background()]" } else { " [.overlay()]" });
-                node.children.extend(layer_prints);
-            }
+            node.children.extend(layer_prints);
         }
     }
 }
@@ -948,10 +1142,12 @@ impl<C: View<Arity = Single>> View for Modified<C> {
         // `.modifier(…)` re-renders through the custom modifier's own
         // body(content:), and marks the node — the recomputable blur path.
         if let Modifier::Custom(custom) = &self.modifier {
+            let mark = out.layout_mark();
             let applied = custom.apply(ctx, crate::erased::erased(self.base.clone()));
             let mut nodes = NodeList::new();
             applied.render_into(ctx, &mut nodes);
             seal_custom(&**custom, nodes, out);
+            crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Modifier, Some(self.modifier.name()));
             return;
         }
 
@@ -959,12 +1155,14 @@ impl<C: View<Arity = Single>> View for Modified<C> {
         // must carry the name while the subtree declares its state,
         // its animations and its hit paths.
         if let Modifier::Id(name) = &self.modifier {
+            let mark = out.layout_mark();
             let mut nodes = NodeList::new();
             {
                 let _frame = motor::identity::enter(named_segment(name));
                 self.base.render_into(ctx, &mut nodes);
             }
             seal_id(name, nodes, out);
+            crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Modifier, Some("id"));
             return;
         }
 
@@ -990,8 +1188,13 @@ impl<C: View<Arity = Single>> View for Modified<C> {
 
         // …and everything the modifier does AFTER the base is
         // generic-free, so it lives in ONE function instead of
-        // one copy per chain in the program
-        apply(&self.modifier, ctx, base_ctx, out, mark);
+        // one copy per chain in the program — unless a tool put a
+        // replacement on this site, which then stands in for it
+        match crate::provenance::replacement_at(self.site) {
+            Some(replacement) => apply(&replacement, ctx, base_ctx, out, mark),
+            None => apply(&self.modifier, ctx, base_ctx, out, mark),
+        }
+        crate::provenance::seal(ctx, out, mark, self.site, crate::provenance::NodeKind::Modifier, Some(self.modifier.name()));
     }
 }
 
@@ -1006,20 +1209,25 @@ fn named_segment(name: &std::rc::Rc<str>) -> String {
 
 #[inline(never)]
 fn seal_id(name: &std::rc::Rc<str>, mut nodes: NodeList, out: &mut NodeList) {
-    if crate::view::print_enabled() {
-        if let Some(node) = nodes.last_mut() {
-            node.line.push_str(&format!(" [.id({name:?})]"));
-        }
+    if crate::view::print_enabled()
+        && let Some(node) = nodes.last_mut()
+    {
+        node.line.push_str(&format!(" [.id({name:?})]"));
     }
     out.extend(nodes);
 }
 
 #[inline(never)]
-fn seal_custom(custom: &dyn crate::erased::CustomModifier, mut nodes: NodeList, out: &mut NodeList) {
-    if crate::view::print_enabled() {
-        if let Some(node) = nodes.last_mut() {
-            node.line.push_str(&format!(" [.modifier({})]", custom.name()));
-        }
+fn seal_custom(
+    custom: &dyn crate::erased::CustomModifier,
+    mut nodes: NodeList,
+    out: &mut NodeList,
+) {
+    if crate::view::print_enabled()
+        && let Some(node) = nodes.last_mut()
+    {
+        node.line
+            .push_str(&format!(" [.modifier({})]", custom.name()));
     }
     out.extend(nodes);
 }
@@ -1035,7 +1243,7 @@ fn seal_custom(custom: &dyn crate::erased::CustomModifier, mut nodes: NodeList, 
 /// modifiers an app writes. It was thirty-six copies and a third of
 /// all the code in the web build.
 #[inline(never)]
-fn apply(
+pub(crate) fn apply(
     modifier: &Modifier,
     ctx: &Context,
     base_ctx: &Context,
@@ -1138,7 +1346,7 @@ fn apply(
                 let is_presented = is_presented.clone();
                 crate::reconciler::attribute_action(
                     Rc::from(format!("{path}/#dismiss")),
-                    Rc::new(move |_| is_presented.set(false)),
+                    Rc::new(move |_, _| is_presented.set(false)),
                 );
             }
             // the sheet's own lowering — same centring, same capture —
@@ -1190,7 +1398,7 @@ fn apply(
                 };
                 crate::reconciler::attribute_action(Rc::from(format!("{path}/#dismiss")), {
                     let cancel = cancel.clone();
-                    Rc::new(move |_| cancel())
+                    Rc::new(move |_, _| cancel())
                 });
                 crate::reconciler::attribute_handler(
                     path.clone(),
@@ -1229,6 +1437,7 @@ fn apply(
         Modifier::Popover {
             is_presented,
             side,
+            focus,
             on_dismiss,
             content,
         } if is_presented.get() => {
@@ -1266,7 +1475,7 @@ fn apply(
                     // a dismiss has no count to hear: the same
                     // closure the keyboard's Escape handler holds
                     let close = close.clone();
-                    Rc::new(move |_| close())
+                    Rc::new(move |_, _| close())
                 });
                 crate::reconciler::attribute_handler(
                     path.clone(),
@@ -1283,6 +1492,7 @@ fn apply(
             out.wrap_layout_from(mark, |base| LayoutNode::Anchored {
                 path: path.unwrap_or_default(),
                 side,
+                focus: *focus,
                 overlay: Rc::new(wrap_layout(popover_layouts)),
                 child: Box::new(base),
             });
@@ -1353,6 +1563,19 @@ fn apply(
                 min_width,
                 min_height,
                 align,
+                child: Box::new(node),
+            });
+        }
+        Modifier::Span(columns, rows) => {
+            out.wrap_layout_from(mark, |node| LayoutNode::Spanned {
+                columns: *columns,
+                rows: *rows,
+                child: Box::new(node),
+            });
+        }
+        Modifier::Position(at) => {
+            out.wrap_layout_from(mark, |node| LayoutNode::Placed {
+                at: *at,
                 child: Box::new(node),
             });
         }
@@ -1570,6 +1793,7 @@ fn apply(
             mark,
             VisualProps { opacity_pressed: Some(*value), ..VisualProps::default() },
         ),
+        Modifier::Hidden => wrap_styled(out, mark, VisualProps { hidden: true, ..VisualProps::default() }),
         Modifier::GroupHovered => wrap_styled(
             out,
             mark,
@@ -1718,6 +1942,10 @@ fn apply(
             let path = motor::identity::cursor_scope().unwrap_or_default();
             crate::reconciler::attribute_context(path, name, false);
         }
+        Modifier::RestoreFocusOnClose => {
+            let path = motor::identity::cursor_scope().unwrap_or_default();
+            crate::reconciler::attribute_context(path, crate::reconciler::FOCUS_RETURN, false);
+        }
         Modifier::KeyContextFocused(name) => {
             // the same declaration, with the view it hangs on: it counts
             // while the focused field or box is somewhere below it
@@ -1819,6 +2047,11 @@ fn apply(
             // — the action arrives by dispatch (keyboard), not hit-test
             if let Some(path) = motor::identity::cursor_scope() {
                 crate::reconciler::attribute_handler(path, *id, handler.clone());
+            }
+        }
+        Modifier::OnEdit(edit, handler) => {
+            if let Some(path) = motor::identity::cursor_scope() {
+                crate::reconciler::attribute_edit_handler(path, *edit, handler.clone());
             }
         }
         _ => {}

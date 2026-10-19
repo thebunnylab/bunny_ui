@@ -190,11 +190,11 @@ fn prune_empty(out: &mut Flattened, drawn: bool) {
     if drawn {
         return;
     }
-    if let Some(&(first, _)) = out.contours.last() {
-        if out.points.len() - first < 2 {
-            out.points.truncate(first);
-            out.contours.pop();
-        }
+    if let Some(&(first, _)) = out.contours.last()
+        && out.points.len() - first < 2
+    {
+        out.points.truncate(first);
+        out.contours.pop();
     }
 }
 
@@ -386,9 +386,9 @@ pub(crate) fn fill_into(mask: &mut Mask, flat: &Flattened, rule: Rule) {
             }
         }
         if touched {
-            for x in 0..mask.width {
-                if row[x] > 0.0 {
-                    mask.max_at(x, y, row[x].min(1.0));
+            for (x, coverage) in row.iter().copied().enumerate().take(mask.width) {
+                if coverage > 0.0 {
+                    mask.max_at(x, y, coverage.min(1.0));
                 }
             }
         }
@@ -407,9 +407,9 @@ fn add_run(row: &mut [f32], from: f64, to: f64) -> bool {
     let share = 1.0 / ROWS as f64;
     let first = from.floor() as usize;
     let last = (to.ceil() as usize).min(row.len());
-    for x in first..last {
+    for (x, coverage) in row.iter_mut().enumerate().take(last).skip(first) {
         let cover = (to.min(x as f64 + 1.0) - from.max(x as f64)).max(0.0);
-        row[x] += (cover * share) as f32;
+        *coverage += (cover * share) as f32;
     }
     true
 }
@@ -583,7 +583,7 @@ mod tests {
     /// of the polyline.
     #[test]
     fn a_cubic_stays_within_the_bound() {
-        const KAPPA: f32 = 0.552_284_75;
+        const KAPPA: f32 = 0.552_284_8;
         let radius = 12.0_f32;
         let path = [
             Verb::Move(radius, 0.0),
@@ -800,7 +800,7 @@ mod tests {
     /// sign, an order or a parity gone wrong.
     #[test]
     fn the_coverage_matches_a_brute_force_count() {
-        const KAPPA: f32 = 0.552_284_75;
+        const KAPPA: f32 = 0.552_284_8;
         let diamond = vec![
             Verb::Move(8.0, 0.5),
             Verb::Line(15.5, 8.0),

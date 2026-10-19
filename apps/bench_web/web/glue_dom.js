@@ -47,7 +47,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 20;
+const EXPECTED_ABI = 21;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads (`bunny run` and `bunny build` write it);
@@ -444,6 +444,11 @@ const KIND_BASE = [
   "border:0;box-sizing:border-box;min-width:0;min-height:0",
   // 15 video: the video host's stream, the box underneath owns the clicks
   "display:block;pointer-events:none;box-sizing:border-box;min-width:0;min-height:0",
+  // 16 grid: sparse cells in equal-width tracks
+  "display:grid;box-sizing:border-box;min-width:0;min-height:0",
+  // 17 rectangle, 18 ellipse: independent axes, inherited hover/press ink
+  "box-sizing:border-box;min-width:0;min-height:0;background:currentColor",
+  "box-sizing:border-box;min-width:0;min-height:0;background:currentColor;border-radius:50%",
 ];
 
 // The rules of one look: the base, then one per state. The twin of the
@@ -469,9 +474,15 @@ function lookRules(selector, kind, flags, style, layout, face) {
     delete decl.display;
     delete decl["flex-direction"];
   }
-  if (layout.gap !== null) decl.gap = `${layout.gap}px`;
+  if (layout.relative) { decl.position = "relative"; decl.isolation = "isolate"; }
+  if (layout.gap !== null) decl[kind === 16 ? "column-gap" : "gap"] = `${layout.gap}px`;
+  if (layout.columns !== null) {
+    decl["grid-template-columns"] = `repeat(${layout.columns},minmax(0,1fr))`;
+    decl["align-items"] = "center";
+    decl["align-content"] = "start";
+  }
   if (layout.align !== null) {
-    decl["align-items"] =
+    decl[kind === 16 ? "justify-items" : "align-items"] =
       layout.align === 1 ? "center" : layout.align === 2 ? "flex-end" : layout.align === 3 ? "baseline" : "flex-start";
   }
   // layers: the same alignment across the cell, so a centred stack
@@ -511,7 +522,7 @@ function lookRules(selector, kind, flags, style, layout, face) {
   }
   if (layout.wrap !== null) {
     // a row that wraps: its lines break where its items' widths say
-    decl["flex-wrap"] = "wrap";
+    if (kind !== 16) decl["flex-wrap"] = "wrap";
     decl["row-gap"] = `${layout.wrap}px`;
   }
   if (style.background) decl["background-color"] = style.background;
@@ -534,6 +545,9 @@ function lookRules(selector, kind, flags, style, layout, face) {
   if (style.fade !== null) decl.opacity = `${style.fade}`;
   // a layer that asks for nothing: the click belongs to whatever it covers
   if (style.passThrough) decl["pointer-events"] = "none";
+  // `.hidden()`: the box keeps its place in the flow and shows nothing —
+  // visibility, never display, or the sibling would move up
+  if (style.hidden) decl.visibility = "hidden";
   if (style.filter) {
     decl["backdrop-filter"] = style.filter;
     decl["-webkit-backdrop-filter"] = style.filter;
@@ -731,7 +745,7 @@ function createElementOf(kind, tag) {
   // 7 image, 8 icon, 9 flex column, 10 flex row, 11 layers, 12 popover,
   // 13 editor — the field of MANY lines, a `<textarea>` —
   // 14 iframe — the native host's page, 15 video — the video host's
-  // stream. The element is born BARE:
+  // stream; 16 grid — a sparse equal-track container. The element is born BARE:
   // every declaration its kind brings along is the look's (op 21),
   // worn by class — a thousand rows that look alike share one rule
   if (kind === 6) return document.createElement("canvas");
@@ -827,7 +841,7 @@ function applyPatches(view, length) {
   // the three records a look is made of, decoded with no element in
   // hand: a look is defined once (op 21), then worn by class (op 22)
   const readStyle = () => {
-    // the mask carries twenty-four bits, so it crosses as a u32
+    // the mask carries twenty-five bits, so it crosses as a u32
     const mask = u32();
     const style = {
       background: null,
@@ -849,6 +863,7 @@ function applyPatches(view, length) {
       pressedFade: null,
       group: null,
       passThrough: false,
+      hidden: false,
       filter: null,
     };
     if (mask & 1) style.background = rgba(u32());
@@ -924,6 +939,8 @@ function applyPatches(view, length) {
       u32();
     }
     if (mask & 2097152) style.passThrough = true;
+    // bit 24: hidden — the box keeps its place, paints nothing
+    if (mask & 16777216) style.hidden = true;
     if (mask & 4194304) {
       // four corners, clockwise from the top left — the CSS order
       const tl = f32();
@@ -960,6 +977,7 @@ function applyPatches(view, length) {
   const readLayout = () => {
     const mask = u16();
     const layout = {
+      relative: (mask & 32768) !== 0,
       gap: null,
       align: null,
       padding: null,
@@ -969,6 +987,7 @@ function applyPatches(view, length) {
       wrap: null,
       plain: (mask & 4096) !== 0,
       direction: null,
+      columns: null,
     };
     if (mask & 1) layout.gap = f32();
     if (mask & 2) layout.align = u8();
@@ -986,6 +1005,7 @@ function applyPatches(view, length) {
       layout.direction = u8();
       dirRules = true;
     }
+    if (mask & 16384) layout.columns = u16();
     return layout;
   };
   const readFace = () => {
@@ -1395,6 +1415,8 @@ function applyPatches(view, length) {
       const maxWidth = mask & 4 ? f32() : null;
       const maxHeight = mask & 8 ? f32() : null;
       const slotY = mask & 16 ? f32() : null;
+      const at = mask & 32 ? { flags: u8(), x: f32(), y: f32() } : null;
+      const span = mask & 64 ? { columns: u16(), rows: u16(), fillX: u8() !== 0 } : null;
       if (el) {
         const style = el.style;
         const dressed = style.length !== 0;
@@ -1418,6 +1440,28 @@ function applyPatches(view, length) {
           style.left = "";
           style.right = "";
         }
+        for (const key of ["marginLeft", "marginTop", "alignSelf", "justifySelf", "zIndex", "gridColumn", "gridRow", "bottom"]) style[key] = "";
+        if (at) {
+          if (at.flags & 1) {
+            style.marginLeft = `${at.x}px`;
+            style.marginTop = `${at.y}px`;
+            style.alignSelf = at.flags & 4 ? "stretch" : "start";
+            style.justifySelf = at.flags & 2 ? "stretch" : "left";
+          } else {
+            style.position = "absolute";
+            style.left = `${at.x}px`;
+            style.top = `${at.y}px`;
+            style.zIndex = "1";
+            if (at.flags & 2) style.right = "0";
+            if (at.flags & 4) style.bottom = "0";
+          }
+        }
+        if (span) {
+          style.gridColumn = `span ${span.columns}`;
+          style.gridRow = `span ${span.rows}`;
+          if (span.fillX) style.justifySelf = "stretch";
+        }
+
       }
     } else if (op === 24) {
       // the element's marks: the tooltip it shows, the group it owns

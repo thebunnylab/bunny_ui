@@ -1,11 +1,17 @@
 //! A text editor over 400 or 30 000 lines, the keyboard in it: typing, or
 //! the wheel over the text.
 use std::cell::Cell;
-use std::rc::Rc;
 
-use arena::{Args, FONT_FAMILY, Step, WINDOW, lines, scripted, unix_ms};
+use arena::{Args, FONT_FAMILY, Step, WINDOW, lines, platform, scripted, unix_ms};
 use bunny_ui::prelude::*;
-use bunny_ui_macos::{App, CoreGraphicsImageEngine, CoreTextEngine, WindowSpec};
+
+/// The editor's face size. On Windows the shared contract makes every glyph
+/// eight units wide: the installed face's advance is 1126 units of a
+/// 2048-unit em, so `8 × 2048 / 1126` is the size that lands on it.
+#[cfg(target_os = "windows")]
+const EDITOR_FONT_SIZE: f64 = 8.0 * 2048.0 / 1126.0;
+#[cfg(not(target_os = "windows"))]
+const EDITOR_FONT_SIZE: f64 = 13.0;
 
 const OVER: (f64, f64) = (WINDOW.0 * 0.5, WINDOW.1 * 0.5);
 
@@ -16,23 +22,34 @@ struct Editor {
 
 impl Component for Editor {
     fn body(self) -> impl View {
-        text_editor("", self.text.binding())
-            .font_family(FONT_FAMILY)
-            .font_size(13.0)
-            .auto_focus()
+        line_box(
+            text_editor("", self.text.binding())
+                .font_family(FONT_FAMILY)
+                .font_size(EDITOR_FONT_SIZE)
+                .auto_focus(),
+        )
     }
+}
+
+/// The Windows contract's line box: sixteen units, the rhythm every
+/// framework measured beside it is given.
+#[cfg(target_os = "windows")]
+fn line_box(editor: impl View<Arity = Single>) -> impl View {
+    editor.line_height(16.0)
+}
+
+/// macOS keeps the face's own line box.
+#[cfg(not(target_os = "windows"))]
+fn line_box(editor: impl View<Arity = Single>) -> impl View {
+    editor
 }
 
 fn main() {
     let args = Args::parse();
     let text = State::new(lines(args.lines));
-    // Keep the same assembly as run_window, retaining the runtime only to
-    // observe the actual selection at the two ends of the script.
-    let runtime = Rc::new(
-        Runtime::new()
-            .text_engine(Rc::new(CoreTextEngine::new()))
-            .image_engine(Rc::new(CoreGraphicsImageEngine::new())),
-    );
+    // The window's own runtime, retained only to observe the actual
+    // selection at the two ends of the script.
+    let runtime = platform::runtime();
     let observer = runtime.clone();
     let ready = Cell::new(false);
     let script = args.clone();
@@ -73,14 +90,31 @@ fn main() {
             snapshot.selected.0,
             snapshot.selected.1,
         );
+        #[cfg(target_os = "windows")]
+        caret_witness(&snapshot, observer.last_viewport());
     });
-    let app = App::new();
-    app.open(
-        WindowSpec::titled("arena — editor").size(WINDOW.0, WINDOW.1),
-        runtime,
-        root,
-    );
-    app.run();
+    platform::open("arena — editor", runtime, root);
+}
+
+/// Where the caret actually is. The Windows producer types through the
+/// system's queue, so the app reports what landed: a script that typed out
+/// of view, or into a viewport that never followed the caret, did different
+/// work than the one it claims.
+#[cfg(target_os = "windows")]
+fn caret_witness(
+    snapshot: &bunny_ui::runtime::ImeSnapshot,
+    viewport: Option<bunny_ui::layout::Size>,
+) {
+    let caret = snapshot.caret_rect;
+    let state = serde_json::json!({
+        "caret_rect": [caret.origin.x, caret.origin.y, caret.size.width, caret.size.height],
+        "viewport": viewport.map(|size| [size.width, size.height]),
+        "caret_visible": viewport.is_some_and(|size| caret.origin.x >= 0.0
+            && caret.origin.y >= 0.0
+            && caret.origin.x + caret.size.width <= size.width
+            && caret.origin.y + caret.size.height <= size.height),
+    });
+    println!("EDITOR_CARET {} {state}", unix_ms());
 }
 
 fn matches_text(actual: &str, original: &str, added: usize) -> bool {

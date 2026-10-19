@@ -38,6 +38,10 @@
 #![forbid(unsafe_code)]
 
 pub mod accessibility;
+/// Where a node was written — the sites a tool maps frames to (Studio).
+pub mod provenance;
+/// The preview vocabulary — a view with the traits it is shown under (Studio).
+pub mod preview;
 pub mod action;
 pub mod anim;
 pub mod bind;
@@ -53,10 +57,13 @@ pub mod ext;
 pub mod font_file;
 pub mod glass;
 pub mod app;
+pub mod window;
 pub mod host;
 pub mod icon;
 pub mod image_engine;
 pub mod layout;
+#[cfg(feature = "canvas")]
+pub mod line_chart;
 pub mod menu;
 mod loans;
 pub mod modifier;
@@ -71,6 +78,7 @@ pub mod raster;
 pub mod pacing;
 mod paranoid;
 mod reconciler;
+mod shapes;
 pub mod runtime;
 #[cfg(feature = "canvas")]
 pub mod slider;
@@ -80,6 +88,7 @@ pub mod stats;
 pub mod text_engine;
 pub mod text_value;
 pub mod text_input;
+mod field_history;
 mod grapheme;
 pub mod theme;
 pub mod touch;
@@ -112,27 +121,65 @@ macro_rules! text {
     };
 }
 
+/// Packs a macro's children in typed chunks while retaining a flat identity index.
+/// Ordinary short stacks keep their existing tuple type; longer lists add no View nodes.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bunny_children {
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr,
+     $g:expr, $h:expr, $i:expr, $j:expr, $k:expr, $l:expr, $($rest:expr),+ $(,)?) => {
+        $crate::view::JoinedChildren::new(
+            ($a, $b, $c, $d, $e, $f, $g, $h, $i, $j, $k, $l),
+            $crate::__bunny_children!($($rest),+),
+        )
+    };
+    ($($child:expr),* $(,)?) => { ($($child,)*) };
+}
+
 /// `vstack!(a, b, c)` — the children without the tuple's doubled parentheses.
 #[macro_export]
 macro_rules! vstack {
-    ($($child:expr),+ $(,)?) => {
-        $crate::views::vstack(($($child,)+))
+    ($($child:expr),* $(,)?) => {
+        $crate::views::vstack($crate::__bunny_children!($($child),*))
     };
 }
 
 /// `hstack!(a, b, c)` — see [`vstack!`].
 #[macro_export]
 macro_rules! hstack {
-    ($($child:expr),+ $(,)?) => {
-        $crate::views::hstack(($($child,)+))
+    ($($child:expr),* $(,)?) => {
+        $crate::views::hstack($crate::__bunny_children!($($child),*))
     };
 }
 
 /// `zstack!(a, b, c)` — see [`vstack!`].
 #[macro_export]
 macro_rules! zstack {
-    ($($child:expr),+ $(,)?) => {
-        $crate::views::zstack(($($child,)+))
+    ($($child:expr),* $(,)?) => {
+        $crate::views::zstack($crate::__bunny_children!($($child),*))
+    };
+}
+
+/// `grid!(a, b, c)` — equal columns, optional per-child spans.
+#[macro_export]
+macro_rules! grid {
+    ($($child:expr),* $(,)?) => { $crate::views::grid($crate::__bunny_children!($($child),*)) };
+}
+
+/// What `#[preview]` expands to where the core stands alone — a crate
+/// that consumes `bunny-ui-core` under the `bunny_ui` name, with no
+/// facade to mint a symbol: the entry is nothing, and the function is
+/// kept from reading as dead code, since the attribute still marks it
+/// for the scan (`bunny preview --list`, an IDE's gallery). The facade's
+/// own arm, under its `preview` feature, exports the symbol a host
+/// loads; its definition shadows this one for every app.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bunny_preview_entry {
+    ($ident:ident, $symbol:ident, $name:expr, $scope:expr, $example:expr $(,)?) => {
+        const _: () = {
+            let _ = $ident;
+        };
     };
 }
 
@@ -140,11 +187,13 @@ macro_rules! zstack {
 /// worker thread (or a browser callback) hands its results over.
 pub mod task {
     pub use motor::task::{
-        Receiver, Recv, SendError, Sender, Sleep, Spawned, channel, sleep, spawn,
+        Receiver, Recv, SendError, Sender, Sleep, Spawned, advance, channel, poll_ready, set_wake_hook, sleep, spawn,
     };
 }
 
 pub mod prelude {
+    pub use crate::{grid, hstack, text, vstack, zstack};
+    pub use crate::ext::ViewExt;
     pub use crate::action::{ActionId, Key, KeyPattern};
     pub use crate::anim::{FramePace, Loop, Spring, Ticked};
     // the app's strings: `catalog::Table` and `catalog::Key` stay
@@ -162,8 +211,6 @@ pub mod prelude {
         ColorScheme, EditorCommand, HostSpec, MediaHandle, NetworkPolicy, VideoView, WebviewHandle,
         video, webview, webview_html,
     };
-    pub use crate::{hstack, text, vstack, zstack};
-    pub use crate::ext::ViewExt;
     pub use crate::icon::house as symbol;
     pub use crate::icon::{ICON_GRID, Ink, Paint, Rule, Symbol, Verb};
     pub use crate::image_engine::{
@@ -177,6 +224,8 @@ pub mod prelude {
         VisualProps,
     };
     pub use crate::theme::{self, Theme};
+    // `Device` stays qualified (`preview::Device`): a shell's own `Device` meets the prelude in its tests
+    pub use crate::preview::{Preview, Scheme, Sizing, Traits};
     pub use crate::words::{self, Word, Words};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Tracking, Weight};
     pub use crate::text_input::{CaretState, EditCommand, KeyboardType};
@@ -5143,10 +5192,10 @@ mod tests {
         let pattern = KeyPattern::key(Key::Char('d'));
         assert!(pattern.is_text_input(), "`d` is a bare character");
         assert!(
-            !runtime.key_stroke(&pattern).handled,
+            !runtime.key_stroke(pattern).handled,
             "the box ignores it, so the keymap gets its turn",
         );
-        let action = match runtime.chord(&pattern) {
+        let action = match runtime.chord(pattern) {
             crate::action::KeyMatch::Action(action) => action,
             other => panic!("the map answers the bare key, got {other:?}"),
         };
@@ -6778,7 +6827,7 @@ mod tests {
 
             assert!(runtime.focus_named("composer"));
             assert!(runtime.paste(), "the picture landed");
-            assert_eq!(panel.attached.borrow().as_slice(), [png.clone()]);
+            assert_eq!(panel.attached.borrow().as_slice(), std::slice::from_ref(&png));
             assert_eq!(panel.prompt.get(), "", "and no text followed it");
 
             assert!(runtime.focus_named("note"));
@@ -8204,7 +8253,7 @@ mod tests {
 
         // and the chord stays the app's there: one door per field
         assert!(
-            !runtime.key_stroke(&KeyPattern::command(Key::Enter)).handled,
+            !runtime.key_stroke(KeyPattern::command(Key::Enter)).handled,
             "the chord over a one-line field belongs to the app"
         );
         assert_eq!(panel.sent.get(), 1);
@@ -8221,7 +8270,7 @@ mod tests {
         assert_eq!(panel.committed.get(), 0, "and a break is not a submit");
 
         // ...and puts its own key on the chord, before the keymap
-        assert!(runtime.key_stroke(&KeyPattern::command(Key::Enter)).handled);
+        assert!(runtime.key_stroke(KeyPattern::command(Key::Enter)).handled);
         assert_eq!(panel.committed.get(), 1);
         assert_eq!(panel.note.get(), "ab\n", "the chord left the note alone");
     }
@@ -8560,7 +8609,7 @@ mod tests {
 
     /// The Edit menu acts on the field that holds the keyboard, and the
     /// clipboard is the runtime's business: a copy writes it, a paste reads
-    /// it. A field keeps no history, so its Undo is dark.
+    /// it. Undo restores the field's last local edit and its selection.
     #[test]
     fn an_edit_item_reaches_the_field_that_holds_the_keyboard() {
         use crate::layout::{Proposal, Size};
@@ -8592,7 +8641,7 @@ mod tests {
         for edit in [Edit::Cut, Edit::Copy, Edit::Paste, Edit::SelectAll] {
             assert!(answers(edit), "{edit:?} answers in a field");
         }
-        assert!(!answers(Edit::Undo) && !answers(Edit::Redo), "a field keeps no history");
+        assert!(!answers(Edit::Undo) && !answers(Edit::Redo), "the field has not been edited yet");
 
         assert!(runtime.menu_pick(Pick::Edit(Edit::SelectAll)));
         assert!(runtime.menu_pick(Pick::Edit(Edit::Copy)));
@@ -8603,7 +8652,10 @@ mod tests {
         assert!(runtime.menu_pick(Pick::Edit(Edit::Paste)));
         runtime.render_stable(&form);
         assert_eq!(form.name.get(), "Deco", "the paste read it back");
-        assert!(!runtime.menu_pick(Pick::Edit(Edit::Undo)), "dark, so it runs nothing");
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Undo)));
+        assert_eq!(form.name.get(), "", "Undo reversed this field's paste");
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Redo)));
+        assert_eq!(form.name.get(), "Deco");
     }
 
     /// A read-only view that copies answers Copy from the menu, and nothing
@@ -10820,7 +10872,7 @@ mod tests {
         runtime.bind(KeyPattern::key(Key::Char('w')), NEXT_WORD);
 
         let stroke = KeyPattern::key(Key::Char('w'));
-        let action = match runtime.chord(&stroke) {
+        let action = match runtime.chord(stroke) {
             crate::action::KeyMatch::Action(action) => action,
             other => panic!("the map answers the bare key, got {other:?}"),
         };
@@ -10830,7 +10882,7 @@ mod tests {
         // an action the host never took leaves the stroke alone, so a
         // field downstream still types it
         runtime.bind(KeyPattern::key(Key::Char('q')), ActionId("test.vim.unmounted"));
-        let orphan = match runtime.chord(&KeyPattern::key(Key::Char('q'))) {
+        let orphan = match runtime.chord(KeyPattern::key(Key::Char('q'))) {
             crate::action::KeyMatch::Action(action) => action,
             other => panic!("bound, got {other:?}"),
         };
@@ -12338,13 +12390,15 @@ mod tests {
             runtime.render_stable(&page);
             runtime.layout(&page, Proposal::exact(WINDOW))
         };
-        let press = |pattern: KeyPattern| match runtime.chord(&pattern) {
-            KeyMatch::Action(action) => {
-                runtime.dispatch_action(action);
-                runtime.render_stable(&page);
-                Some(action)
+        let press = |pattern: KeyPattern| {
+            match runtime.chord(pattern) {
+                KeyMatch::Action(action) => {
+                    runtime.dispatch_action(action);
+                    runtime.render_stable(&page);
+                    Some(action)
+                }
+                KeyMatch::Pending | KeyMatch::None => None,
             }
-            KeyMatch::Pending | KeyMatch::None => None,
         };
         let ask = |answer: &'static str| {
             page.open.set(true);
@@ -13166,10 +13220,10 @@ mod tests {
             runtime.observe_keys(move |report| heard.borrow_mut().push(report.clone()));
         }
 
-        let _ = runtime.chord(&escape);
-        let _ = runtime.chord(&k);
-        let _ = runtime.chord(&s_key);
-        let _ = runtime.chord(&KeyPattern::key(Key::F(12)));
+        let _ = runtime.chord(escape);
+        let _ = runtime.chord(k);
+        let _ = runtime.chord(s_key);
+        let _ = runtime.chord(KeyPattern::key(Key::F(12)));
 
         let heard = heard.borrow();
         let answers: Vec<KeyMatch> = heard.iter().map(|report| report.matched).collect();
@@ -13225,39 +13279,39 @@ mod tests {
 
         // the first stroke fires nothing and is spent — the keyboard is
         // held, and a which-key panel can read what is on offer
-        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        assert_eq!(runtime.chord(k), KeyMatch::Pending);
         assert_eq!(runtime.pending_chord(), vec![k]);
         // the second completes it
-        assert_eq!(runtime.chord(&s_key), KeyMatch::Action(KEYMAP));
+        assert_eq!(runtime.chord(s_key), KeyMatch::Action(KEYMAP));
         assert!(runtime.pending_chord().is_empty(), "and the sequence is over");
 
         // that same second stroke on its OWN is the single binding
-        assert_eq!(runtime.chord(&s_key), KeyMatch::Action(SAVE));
+        assert_eq!(runtime.chord(s_key), KeyMatch::Action(SAVE));
 
         // a sequence that leads nowhere ends, and SPENDS its last
         // stroke: re-reading it fresh is how an editor fires something
         // nobody asked for
-        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
-        assert_eq!(runtime.chord(&x), KeyMatch::None);
+        assert_eq!(runtime.chord(k), KeyMatch::Pending);
+        assert_eq!(runtime.chord(x), KeyMatch::None);
         assert!(runtime.pending_chord().is_empty());
 
         // Escape is the way out, and it CONSUMES — a chord abandoned
         // must not also close the palette standing behind it
-        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
-        assert_eq!(runtime.chord(&escape), KeyMatch::Pending);
+        assert_eq!(runtime.chord(k), KeyMatch::Pending);
+        assert_eq!(runtime.chord(escape), KeyMatch::Pending);
         assert!(runtime.pending_chord().is_empty());
         // with nothing in the air, Escape is the app's again
         runtime.bind(escape, ZEN);
-        assert_eq!(runtime.chord(&escape), KeyMatch::Action(ZEN));
+        assert_eq!(runtime.chord(escape), KeyMatch::Action(ZEN));
 
         // the hand leaving for the pointer drops it too
-        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        assert_eq!(runtime.chord(k), KeyMatch::Pending);
         runtime.pointer_pressed(10.0, 10.0);
         assert!(runtime.pending_chord().is_empty(), "a press ends the chord");
 
         // and the slow clock ages it out: the SECOND tick drops it, the
         // tooltip's own idiom
-        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        assert_eq!(runtime.chord(k), KeyMatch::Pending);
         assert!(!runtime.chord_tick(), "one tick only ages it");
         assert!(runtime.slow_tick_needed(), "a pending chord needs its second tick");
         assert_eq!(runtime.pending_chord(), vec![k]);
@@ -13268,17 +13322,17 @@ mod tests {
         assert!(!runtime.slow_tick_needed(), "an expired chord has no clock work");
 
         // a scoped sequence answers only while its context is mounted
-        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
-        assert_eq!(runtime.chord(&i), KeyMatch::None, "the editor is not up");
+        assert_eq!(runtime.chord(k), KeyMatch::Pending);
+        assert_eq!(runtime.chord(i), KeyMatch::None, "the editor is not up");
         app.editing.set(true);
         runtime.settle(&app);
         runtime.layout(&app, viewport);
-        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
-        assert_eq!(runtime.chord(&i), KeyMatch::Action(QUICK_DOC));
+        assert_eq!(runtime.chord(k), KeyMatch::Pending);
+        assert_eq!(runtime.chord(i), KeyMatch::Action(QUICK_DOC));
 
         // and emptying the table takes the sequences with it
         runtime.clear_bindings();
-        assert_eq!(runtime.chord(&k), KeyMatch::None, "no prefix left to hold");
+        assert_eq!(runtime.chord(k), KeyMatch::None, "no prefix left to hold");
         assert!(runtime.pending_chord().is_empty());
     }
 
@@ -13304,19 +13358,19 @@ mod tests {
         let sink = Rc::clone(&heard);
         runtime.observe_chord(move |pending| sink.borrow_mut().push(pending.to_vec()));
 
-        assert_eq!(runtime.chord(&s_key), KeyMatch::Action(SAVE));
+        assert_eq!(runtime.chord(s_key), KeyMatch::Action(SAVE));
         assert!(heard.borrow().is_empty(), "a plain stroke opens nothing, and says nothing");
 
-        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        assert_eq!(runtime.chord(k), KeyMatch::Pending);
         assert_eq!(heard.borrow().as_slice(), [vec![k]], "the opener is heard");
-        assert_eq!(runtime.chord(&s_key), KeyMatch::Action(KEYMAP));
+        assert_eq!(runtime.chord(s_key), KeyMatch::Action(KEYMAP));
         assert_eq!(heard.borrow().last().map(Vec::len), Some(0), "the end is heard as empty");
 
-        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
-        assert_eq!(runtime.chord(&x), KeyMatch::None);
+        assert_eq!(runtime.chord(k), KeyMatch::Pending);
+        assert_eq!(runtime.chord(x), KeyMatch::None);
         assert_eq!(heard.borrow().last().map(Vec::len), Some(0), "a dead end too");
 
-        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        assert_eq!(runtime.chord(k), KeyMatch::Pending);
         let _ = runtime.chord_tick();
         assert_eq!(heard.borrow().last(), Some(&vec![k]), "one tick keeps it");
         assert!(runtime.chord_tick());
@@ -13360,7 +13414,7 @@ mod tests {
         assert!(!runtime.modifiers_changed(command), "the same state twice is no change");
         assert_eq!(runtime.held_modifiers(), command);
         for _ in 0..3 {
-            let crate::action::KeyMatch::Action(id) = runtime.chord(&KeyPattern::command(Key::Char('p')))
+            let crate::action::KeyMatch::Action(id) = runtime.chord(KeyPattern::command(Key::Char('p')))
             else {
                 panic!("⌘P is bound");
             };
@@ -14618,7 +14672,7 @@ mod tests {
         // reopen, Escape closes through the stroke gate
         runtime.context_click(30.0, 8.0);
         let handled = runtime
-            .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape));
+            .key_stroke(crate::action::KeyPattern::key(crate::action::Key::Escape));
         assert!(handled.handled, "Escape closed the menu");
         assert!(runtime.interaction().menu.is_none());
 
@@ -15206,7 +15260,7 @@ mod tests {
         runtime.pointer_moved(60.0, 40.0, false);
         assert!(runtime.interaction().drag.is_some());
         let handled = runtime
-            .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape));
+            .key_stroke(crate::action::KeyPattern::key(crate::action::Key::Escape));
         assert!(handled.handled);
         assert!(runtime.interaction().drag.is_none());
         runtime.pointer_released(60.0, 40.0);
@@ -15316,13 +15370,12 @@ mod tests {
 
         // the wheel travels BOTH ways and clamps per axis
         assert!(runtime.wheel(60.0, 30.0, -4.0, -6.0));
-        let offsets = runtime
+        runtime
             .layout(&Sheet, crate::layout::Proposal::exact(size))
             .scrolls
             .first()
             .map(|_| ())
             .expect("still there");
-        let _ = offsets;
         // a huge wheel pins to the far corner instead of flying off
         runtime.wheel(60.0, 30.0, -100_000.0, -100_000.0);
         let pinned = runtime.layout(&Sheet, crate::layout::Proposal::exact(size));
@@ -15596,7 +15649,6 @@ mod tests {
                 vstack!(
                     text("tab").on_drag(|| drag(Tab { index: 1 }, "tab")),
                     empty().frame(80.0, 40.0).on_drop_at(|_: &Tab, _| {}).preview({
-                        let seen = seen;
                         move |at| {
                             let mut log = seen.get();
                             log.push(match at {
@@ -15651,7 +15703,7 @@ mod tests {
         runtime.pointer_moved(inside.0, inside.1, false);
         assert_eq!(view.seen.get().last().map(String::as_str), Some("over"));
         let handled =
-            runtime.key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape));
+            runtime.key_stroke(crate::action::KeyPattern::key(crate::action::Key::Escape));
         assert!(handled.handled, "escape cancelled the drag");
         assert_eq!(view.seen.get().last().map(String::as_str), Some("left"),
             "a cancelled drag closes the preview");
@@ -15722,7 +15774,7 @@ mod tests {
         let (local_y, height) = view.at.get().expect("it landed");
         assert_eq!(height, 100, "the box it reports against is the WHOLE one");
         assert!(
-            local_y >= 20 && local_y <= 22,
+            (20..=22).contains(&local_y),
             "the place is measured down the target's own box, not the slice: {local_y}"
         );
     }
@@ -17265,8 +17317,10 @@ mod tests {
     /// seed did not name is the seed's own.
     #[test]
     fn a_headless_seed_is_the_locale_until_a_shell_speaks() {
-        let mut values = EnvironmentValues::default();
-        values.locale = Locale::new("he");
+        let values = EnvironmentValues {
+            locale: Locale::new("he"),
+            ..EnvironmentValues::default()
+        };
         let runtime = Runtime::with_environment(values);
         assert_eq!(runtime.locale().identifier(), "he");
         assert_eq!(runtime.layout_direction(), LayoutDirection::RightToLeft, "derived from the seed");
@@ -17276,8 +17330,10 @@ mod tests {
         assert_eq!(runtime.layout_direction(), LayoutDirection::LeftToRight);
 
         // a seed that names a direction keeps it
-        let mut values = EnvironmentValues::default();
-        values.layoutDirection = LayoutDirection::RightToLeft;
+        let values = EnvironmentValues {
+            layoutDirection: LayoutDirection::RightToLeft,
+            ..EnvironmentValues::default()
+        };
         let runtime = Runtime::with_environment(values);
         assert_eq!(runtime.layout_direction(), LayoutDirection::RightToLeft);
         assert_eq!(runtime.locale().identifier(), "en");
@@ -18116,3 +18172,6 @@ mod input_focus_policy_tests {
         assert!(runtime.focused().is_none());
     }
 }
+
+#[cfg(test)]
+mod mount_tests;

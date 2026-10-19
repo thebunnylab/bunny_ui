@@ -48,13 +48,12 @@ impl Hasher for FxHasher {
         // load. A slice of "up to eight" is a copy of unknown length, and
         // the compiler calls `memmove` for it — once for each word of every
         // path this hasher is given, which is the hottest loop it has.
-        let mut words = bytes.chunks_exact(8);
-        for chunk in &mut words {
-            let word = u64::from_le_bytes(chunk.try_into().expect("a chunk of eight"));
+        let (words, tail) = bytes.as_chunks::<8>();
+        for chunk in words {
+            let word = u64::from_le_bytes(*chunk);
             self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(SEED);
         }
         // the tail, zero-filled: the same word the loop above would make
-        let tail = words.remainder();
         if !tail.is_empty() {
             self.0 = (self.0.rotate_left(5) ^ tail_word(tail)).wrapping_mul(SEED);
         }

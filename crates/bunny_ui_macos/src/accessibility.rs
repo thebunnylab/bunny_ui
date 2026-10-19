@@ -41,6 +41,8 @@ unsafe extern "C" {
     fn predicate(object: Id, selector: Sel, value: Id) -> i8;
     #[link_name = "objc_msgSend"]
     fn boolean(object: Id, selector: Sel) -> i8;
+    #[link_name = "objc_msgSend"]
+    fn number_bool(object: Id, selector: Sel, value: i8) -> Id;
     #[link_name = "objc_msgSendSuper"]
     fn super_object(object: *const Super, selector: Sel) -> Id;
     #[link_name = "objc_msgSend"]
@@ -396,8 +398,11 @@ fn changes(previous: Option<&Node>, current: &Node) -> impl Iterator<Item = Noti
             .is_some_and(|old| old.label != current.label)
             .then_some(Notification::Title),
         previous
-            .is_some_and(|old| value_of(old) != value_of(current))
+            .is_some_and(|old| value_of(old) != value_of(current) || old.checked != current.checked)
             .then_some(Notification::Value),
+        previous
+            .is_some_and(|old| old.enabled != current.enabled)
+            .then_some(Notification::Layout),
         (current.focused && previous.is_none_or(|old| !old.focused)).then_some(Notification::Focus),
     ]
     .into_iter()
@@ -470,8 +475,26 @@ extern "C" fn view_focused(this: Id, _: Sel) -> Id {
         return this;
     };
     surface.activate();
-    // A hosted native editor owns its first responder and its own AX focus.
-    // Retained Bunny fields use this view as first responder instead.
+    // A non-key child panel keeps keyboard focus in its parent window. Resolve
+    // the scene's focused proxy across surfaces so that querying that parent
+    // still reaches the active popup choice. Other windows own separate scenes.
+    let focused = surface.scene.upgrade().and_then(|scene| {
+        scene.surfaces.borrow().values().find_map(|surface| {
+            surface
+                .elements
+                .borrow()
+                .iter()
+                .find(|element| element.node.borrow().focused)
+                .map(Rc::clone)
+        })
+    });
+    if let Some(element) = &focused
+        && element.node.borrow().surface.is_some()
+    {
+        return element.object;
+    }
+    // A hosted native editor owns its first responder and its own AX focus
+    // when no Bunny overlay owns focus. Retained fields use this view instead.
     unsafe {
         let mut responder = msg_id(msg_id(this, sel("window")), sel("firstResponder"));
         // AppKit's shared field editor speaks for its owning text control.
@@ -496,12 +519,7 @@ extern "C" fn view_focused(this: Id, _: Sel) -> Id {
         }
     }
 
-    surface
-        .elements
-        .borrow()
-        .iter()
-        .find(|element| element.node.borrow().focused)
-        .map_or(this, |element| element.object)
+    focused.map_or(this, |element| element.object)
 }
 fn contains(frame: CGRect, point: CGPoint) -> bool {
     point.x >= frame.origin.x
@@ -542,6 +560,9 @@ extern "C" fn view_hit(this: Id, _: Sel, point: CGPoint) -> Id {
 extern "C" fn element_alive(this: Id, _: Sel) -> i8 {
     i8::from(element(this).is_some())
 }
+extern "C" fn element_enabled(this: Id, _: Sel) -> i8 {
+    i8::from(element(this).is_some_and(|element| element.node.borrow().enabled))
+}
 extern "C" fn element_role(this: Id, _: Sel) -> Id {
     let Some(element) = element(this) else {
         return empty();
@@ -550,6 +571,7 @@ extern "C" fn element_role(this: Id, _: Sel) -> Id {
         ns_string(match element.node.borrow().role {
             Role::Text => "AXStaticText",
             Role::Button => "AXButton",
+            Role::Checkbox => "AXCheckBox",
             Role::TextField | Role::PasswordField => "AXTextField",
         })
     }
@@ -580,6 +602,11 @@ extern "C" fn element_value(this: Id, _: Sel) -> Id {
         return empty();
     };
     let node = element.node.borrow();
+    if let Some(checked) = node.checked {
+        return unsafe {
+            number_bool(class("NSNumber"), sel("numberWithBool:"), i8::from(checked))
+        };
+    }
     value_of(&node).map_or(empty(), |value| unsafe { ns_string(value) })
 }
 extern "C" fn element_identifier(this: Id, _: Sel) -> Id {
@@ -626,12 +653,15 @@ extern "C" fn element_allowed(this: Id, _: Sel, selector: Sel) -> i8 {
     };
     let node = element.node.borrow();
     if selector == unsafe { sel("accessibilityPerformPress") } {
-        return i8::from(node.role == Role::Button);
+        return i8::from(node.supports(&Action::Activate));
     }
-    if selector == unsafe { sel("setAccessibilityValue:") }
-        || selector == unsafe { sel("setAccessibilityFocused:") }
-    {
-        return i8::from(matches!(node.role, Role::TextField | Role::PasswordField));
+    if selector == unsafe { sel("setAccessibilityValue:") } {
+        return i8::from(
+            node.enabled && matches!(node.role, Role::TextField | Role::PasswordField),
+        );
+    }
+    if selector == unsafe { sel("setAccessibilityFocused:") } {
+        return i8::from(node.supports(&Action::Focus));
     }
     let name = unsafe { CStr::from_ptr(sel_getName(selector)) }.to_bytes();
     i8::from(!name.starts_with(b"setAccessibility") && !name.starts_with(b"accessibilityPerform"))
@@ -687,7 +717,7 @@ pub(super) unsafe fn register_view(view: Id) {
             ),
             (
                 "isAccessibilityEnabled",
-                element_alive as *const c_void,
+                element_enabled as *const c_void,
                 c"c@:",
             ),
             ("accessibilityRole", element_role as *const c_void, c"@@:"),

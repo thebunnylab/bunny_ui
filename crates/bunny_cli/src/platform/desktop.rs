@@ -24,6 +24,17 @@ pub fn build(project: &Project, options: &Options) -> Result<PathBuf> {
 /// the executable to start, and the one cargo made — inside a bundle,
 /// they are two files.
 pub fn build_with(project: &Project, options: &Options, target: Option<&str>, more_features: &[String]) -> Result<(PathBuf, PathBuf)> {
+    build_with_diagnostics(project, options, target, more_features, cargo::Diagnostics::Render)
+}
+
+/// [`build_with`], the compiler's diagnostics going where `diagnostics` says.
+pub fn build_with_diagnostics(
+    project: &Project,
+    options: &Options,
+    target: Option<&str>,
+    more_features: &[String],
+    diagnostics: cargo::Diagnostics,
+) -> Result<(PathBuf, PathBuf)> {
     let bin = project.require_bin()?;
     let mut features = options.features.clone();
     features.extend(more_features.iter().cloned());
@@ -38,6 +49,7 @@ pub fn build_with(project: &Project, options: &Options, target: Option<&str>, mo
         env: project.build_env(),
         rustc_args: Vec::new(),
         quiet: false,
+        diagnostics,
     })?;
     if cfg!(target_os = "macos") && project.dir.join("macos").is_dir() {
         return Ok((bundle(project, &built.artifact, options.release)?, built.artifact));

@@ -262,6 +262,17 @@ fn leading_doctype_end(html: &str) -> usize {
     }
 }
 
+/// Who owns a local document's vertical wheel gestures.
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
+pub enum DocumentScroll {
+    /// The embedded engine owns scrolling, as in a browser or editor.
+    #[default]
+    Document,
+    /// Vertical gestures reach the enclosing scene; horizontal gestures remain
+    /// in the document. The macOS native host serves this policy.
+    ParentVertical,
+}
+
 /// A page shown from MEMORY — what [`webview_html`] puts in the spec.
 /// The letter as the app gave it, with what the app asked of it; the
 /// shells load [`Document::sealed`], and stamp by [`Document::digest`].
@@ -285,6 +296,8 @@ pub struct Document {
     pub paste: bool,
     /// The editor takes the keyboard as soon as it appears.
     pub focus: bool,
+    /// The scroll owner requested by a read-only embedded document.
+    pub scroll: DocumentScroll,
     /// A fingerprint of the letter and everything asked of it — what a
     /// shell's stamp compares, so a body that runs again with the same
     /// letter never reloads it, and a changed one always does.
@@ -306,6 +319,7 @@ impl Document {
             editable: false,
             paste: false,
             focus: false,
+            scroll: DocumentScroll::Document,
             digest: 0,
         };
         document.restamp();
@@ -329,6 +343,7 @@ impl Document {
     /// Edited in place — see [`WebviewView::editable`].
     pub fn editable(mut self) -> Document {
         self.editable = true;
+        self.scroll = DocumentScroll::Document;
         self.restamp();
         self
     }
@@ -348,12 +363,24 @@ impl Document {
         self
     }
 
+    /// Let an enclosing reader own vertical wheel gestures. The engine still
+    /// owns horizontal motion, links and text selection. Editors retain their
+    /// own scrolling regardless of modifier order. Served on native macOS.
+    pub fn scroll_with_parent(mut self) -> Document {
+        if !self.editable {
+            self.scroll = DocumentScroll::ParentVertical;
+            self.restamp();
+        }
+        self
+    }
+
     fn restamp(&mut self) {
         let mut hasher = DefaultHasher::new();
         self.html.hash(&mut hasher);
         self.base.hash(&mut hasher);
         self.policy.hash(&mut hasher);
         self.scheme.hash(&mut hasher);
+        self.scroll.hash(&mut hasher);
         (self.editable, self.paste, self.focus).hash(&mut hasher);
         self.digest = hasher.finish();
     }
@@ -1044,6 +1071,14 @@ impl WebviewView {
         self
     }
 
+    /// Give a read-only local document's vertical wheel gestures to its parent
+    /// reader while preserving its other input. Served on native macOS; URL
+    /// pages and editors retain the engine's ordinary scrolling.
+    pub fn scroll_with_parent(mut self) -> WebviewView {
+        self.document = self.document.map(Document::scroll_with_parent);
+        self
+    }
+
     /// The DOCUMENT is edited in place — the composer of a mail client.
     /// The engine's own editing works the body (the caret, the
     /// selection, typing, undo), the commands come from the allowlist
@@ -1389,6 +1424,19 @@ pub fn video(stream: MediaHandle) -> VideoView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parent_wheel_policy_is_explicit_and_cannot_take_over_an_editor() {
+        use super::{Document, DocumentScroll, NetworkPolicy};
+        let doc = Document::new("<p>A letter</p>", "", NetworkPolicy::Deny);
+        assert_eq!(doc.scroll, DocumentScroll::Document);
+        let embedded = doc.clone().scroll_with_parent();
+        assert_eq!(embedded.scroll, DocumentScroll::ParentVertical);
+        assert_ne!(embedded.digest, doc.digest);
+        assert_eq!(embedded.sealed(), doc.sealed(), "input routing cannot alter sealed content");
+        assert_eq!(embedded.editable().scroll, DocumentScroll::Document);
+        assert_eq!(doc.editable().scroll_with_parent().scroll, DocumentScroll::Document);
+    }
+
     use super::*;
 
     /// The seal stands AHEAD of the document: nothing the document

@@ -7,13 +7,15 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+type Watcher<T> = Rc<dyn Fn(&T)>;
+
 struct StoreInner<T> {
     /// Dependency identity: a view that read `value()` during its body
     /// depends on the WHOLE store (object granularity, like an
     /// ObservableObject) — `send`/`update` dirty whoever read.
     dep_id: u64,
     value: RefCell<T>,
-    watchers: RefCell<Vec<Rc<dyn Fn(&T)>>>,
+    watchers: RefCell<Vec<Watcher<T>>>,
 }
 
 /// `typealias Store<State> = CurrentValueSubject<State, Never>`
@@ -119,7 +121,7 @@ impl<V: Clone + PartialEq + 'static> AnyPublisher<V> {
     /// (the `onReceive` delivery). `pub` so the typed `bunny_ui` layer can
     /// build its own onReceive effects.
     pub fn poll(&self) -> Option<V> {
-        let Some(value) = (self.source)() else { return None };
+        let value = (self.source)()?;
         let mut last = self.last.borrow_mut();
         if last.as_ref() == Some(&value) {
             None
@@ -141,7 +143,7 @@ impl<V: Clone + 'static> Clone for AnyPublisher<V> {
 #[derive(Clone)]
 pub struct PassthroughSubject<V> {
     last: Rc<RefCell<Option<V>>>,
-    watchers: Rc<RefCell<Vec<Rc<dyn Fn(&V)>>>>,
+    watchers: Rc<RefCell<Vec<Watcher<V>>>>,
 }
 
 impl<V: Clone + PartialEq + 'static> PassthroughSubject<V> {

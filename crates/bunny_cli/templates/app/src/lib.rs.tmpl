@@ -33,4 +33,11 @@ fn home() -> impl View {
     Counter { count: State::new(0) }
 }
 
+/// What Studio and `bunny preview` show while you work: the first view,
+/// as a preview. Mark any function that builds a view the same way.
+#[bunny_ui::preview]
+fn home_preview() -> impl View {
+    home()
+}
+
 bunny_ui::app!(home, bunny_ui::AppConfig::new().size(420.0, 640.0));

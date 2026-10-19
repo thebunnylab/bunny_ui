@@ -1,0 +1,31 @@
+   Compiling bunny-ui-apple v0.3.0 (/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement/crates/bunny_ui_apple)
+   Compiling bunny-ui-macos v0.3.0 (/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement/crates/bunny_ui_macos)
+warning[E0133]: call to unsafe function `bunny_ui_apple::ffi::class` is unsafe and requires unsafe block
+    --> crates/bunny_ui_macos/src/ffi.rs:1184:50
+     |
+1184 |     let sup = ObjcSuper { receiver: this, class: class("NSView") };
+     |                                                  ^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+    --> crates/bunny_ui_macos/src/ffi.rs:1183:1
+     |
+1183 | unsafe fn key_equivalent_super(this: Id, event: Id) -> i8 {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+     = note: `#[warn(unsafe_op_in_unsafe_fn)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+warning: unnecessary `unsafe` block
+    --> crates/bunny_ui_macos/src/ffi.rs:2491:21
+     |
+2477 |         unsafe {
+     |         ------ because it's nested under this `unsafe` block
+...
+2491 |                     unsafe { kill_layer_actions(layer) };
+     |                     ^^^^^^ unnecessary `unsafe` block
+     |
+     = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+For more information about this error, try `rustc --explain E0133`.
+warning: `bunny-ui-macos` (lib) generated 2 warnings (run `cargo fix --lib -p bunny-ui-macos` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.85s

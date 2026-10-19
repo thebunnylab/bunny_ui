@@ -110,9 +110,7 @@ fn a_compact_live_surface_moves_with_layout_without_repainting() {
         height: 200.0,
     };
     let offset = State::new(7.0);
-    let view = Shift {
-        offset: offset.clone(),
-    };
+    let view = Shift { offset };
     let _ = runtime.display_frame(&view, size);
     let first = runtime.live_islands_all(1).remove(0);
     assert_eq!(first.width, 12);
@@ -134,9 +132,7 @@ fn fractional_placement_restores_the_full_texture_without_stale_cropping() {
         height: 200.0,
     };
     let offset = State::new(7.0);
-    let view = Shift {
-        offset: offset.clone(),
-    };
+    let view = Shift { offset };
     let _ = runtime.display_frame(&view, size);
     assert_eq!(runtime.live_islands_all(1).remove(0).width, 12);
     offset.set(7.5);

@@ -1,6 +1,6 @@
 # Accessibility semantics and native bridges
 
-The core can project text, buttons and editable fields from the retained scene
+The core can project text, buttons, checkboxes and editable fields from the retained scene
 into `bunny_ui::accessibility::Tree`. This is the data boundary for native
 adapters. It does not by itself expose an application to VoiceOver, UIA or AT-SPI.
 
@@ -44,9 +44,19 @@ different runtime cannot address the same control.
 
 `accessibility_action(id, action)` validates the handle and supported action,
 then uses the real control's callback or editing path. Buttons support
-`Activate`; editable fields support `Focus` and `SetText`. Unsupported and
+`Activate` and `Focus`; checkboxes support `Activate` (toggle) and `Focus`;
+editable fields support `Focus` and `SetText`. Disabled controls retain their
+semantic nodes with `enabled = false` and reject actions. Checkboxes expose
+`checked: Some(bool)` separately from text values. Unsupported and
 unavailable requests return distinct errors. Successful actions request a
 frame. Snapshots report current keyboard focus without requesting a frame.
+
+Successful `Activate` follows the pointer's keyboard-ownership rule after the
+callback: a focusable control receives focus, including its containing editor's
+standard edit commands. Explicit `.leaves_keyboard()` chrome preserves the
+current owner. This also gives forms an invoking control to restore when they
+close; it does not install a global edit-command fallback or change a focused
+text field's own history. Rejected actions leave focus unchanged.
 
 ## macOS adapter
 
@@ -55,11 +65,20 @@ owned by each native view. Its first accessibility query enables semantic captur
 applications do not need to opt in manually. Overlay panels have their own roots,
 including when the first query targets an already-open modal.
 
+Popup choices remain children of their native overlay surface. The parent
+window's focused-element query resolves the focused proxy across its own scene,
+so a non-key popover can report its active choice through the parent that keeps
+keyboard focus. Other windows retain independent focus. A hosted native editor
+keeps its own focus when no Bunny overlay owns it. Inspecting only the parent's
+children still omits overlay choices; clients must include child surfaces.
+
 The adapter keeps each native object while its `NodeId` remains exposed, converts
 layout bounds to screen coordinates, reports keyboard focus and forwards supported
 press, focus and value edits through the shell's existing event queue. Secure
 fields expose `AXSecureTextField` with no value. Removed controls and closed windows
 reject actions even if a client still retains their former native objects.
+Checkboxes expose `AXCheckBox` and an `NSNumber` value, with value-change
+notifications. Both buttons and checkboxes expose focus and enabled state.
 
 After installing the new snapshot, the adapter sends AppKit notifications for
 changed names, values, focus, membership and geometry. An unchanged scene sends no
@@ -71,7 +90,9 @@ dependency and stays inside the existing macOS FFI boundary.
 `cargo test -p bunny-ui-macos --test accessibility_native --locked` runs a
 main-thread AppKit probe against real windows and selectors. It checks live edits,
 identity, screen bounds, modals, password redaction, retired objects and
-main-thread exit with an accessible window still open. This
+main-thread exit with an accessible window still open. Popover checks cover
+native button roles, labels, actions, focus through the parent, hit testing,
+repeated opening, retired choices and independent-window focus. This
 in-process probe does not require permission to control other applications. It
 is distinct from an external AX client dump or a human VoiceOver workflow.
 
@@ -81,7 +102,9 @@ The Win32 shell answers `WM_GETOBJECT` with a UI Automation fragment root for
 each scene and overlay window. The first UIA request enables semantic collection,
 including a request directed at an already-open modal. Text, buttons and fields
 expose their native control types, names, physical screen bounds and stable
-runtime IDs. Buttons expose Invoke; single-line fields expose Value and keyboard focus.
+runtime IDs. Buttons expose Invoke; checkboxes expose Toggle and ToggleState;
+single-line fields expose Value. All three control types expose keyboard focus
+and enabled state. Toggle and enabled changes emit property notifications.
 Multiline editors expose focus but require the still-unimplemented Text pattern
 for text access; they do not claim Value pattern support.
 Password fields set IsPassword and refuse value reads.
@@ -121,7 +144,9 @@ timer, Rust dependency or separate form model is introduced.
 The first client query enables retained capture. Main windows and overlay surfaces
 have distinct roots; leaves retain their object paths while their `NodeId` is
 exposed. Accessible and Application properties describe the current objects.
-Component exposes bounds, hit testing and field focus; Action invokes buttons;
+Component exposes bounds, hit testing and control focus; Action invokes buttons
+and toggles checkboxes. Checkboxes expose CHECKABLE/CHECKED states and changes;
+disabled controls omit ENABLED/SENSITIVE and reject actions.
 Text reads Unicode scalar ranges; EditableText replaces a field's whole contents.
 Unsupported operations return a D-Bus error. Text selection, caret offsets,
 character geometry and partial edits are not implemented yet.

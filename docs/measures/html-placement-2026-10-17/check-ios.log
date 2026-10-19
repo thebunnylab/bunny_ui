@@ -1,0 +1,5 @@
+    Checking bunny-ui-motor v0.3.0 (/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement/crates/motor)
+    Checking bunny-ui-core v0.3.0 (/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement/crates/bunny_ui)
+    Checking bunny-ui-apple v0.3.0 (/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement/crates/bunny_ui_apple)
+    Checking bunny-ui-ios v0.3.0 (/Volumes/Storage/Code/bunnylab/bunny_ui/.worktrees/mail-placement/crates/bunny_ui_ios)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.89s

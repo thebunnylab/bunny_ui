@@ -32,6 +32,10 @@ pub trait Session {
     fn wait(&mut self, timeout: Duration) -> Option<Option<i32>>;
     /// Ends the app.
     fn stop(&mut self);
+    /// The generation confirmed by the hot runtime, when the session has one.
+    fn generation(&self) -> Option<u32> {
+        None
+    }
     /// Loads a new build of the app's code into the running app — a hot
     /// reload — and answers how long the app took to swap to it. `None`:
     /// this app cannot take new code while it runs.

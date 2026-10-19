@@ -195,13 +195,13 @@ impl WindowSpec {
     }
 }
 
-/// A window's handle in an [`App`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub struct WindowId(usize);
+use bunny_ui::window::Lifecycle;
+pub use bunny_ui::window::{CloseAction, WindowError, WindowId, WindowVisibility};
 
 /// Everything one window owns for as long as it is open. The app holds
 /// these and routes every event to the one it belongs to.
 struct Slot {
+    lifecycle: Rc<Lifecycle>,
     /// The `HWND` as an address — what an event's source is compared
     /// against.
     window: usize,
@@ -209,6 +209,7 @@ struct Slot {
     /// The window's own scene — what a locale the app pins reaches.
     runtime: Rc<Runtime>,
     handler: RefCell<Box<dyn FnMut(AppEvent)>>,
+    pending: RefCell<std::collections::VecDeque<AppEvent>>,
     key_gate: RefCell<Box<dyn FnMut(&ffi::KeyStroke) -> bool>>,
     /// The bar's answer to a menu key — Alt alone, F10, an Alt chord.
     menu_gate: RefCell<Box<dyn FnMut(bunny_ui::menu::MenuKey) -> bool>>,
@@ -218,6 +219,23 @@ struct Slot {
     on_web: Box<dyn Fn(webview::WebviewEvent)>,
     /// Files dragged in from the system: previewed, dropped, or gone.
     file_drag: Box<dyn Fn(f64, f64, Vec<std::path::PathBuf>, filedrop::FileDrag) -> bool>,
+}
+
+impl Slot {
+    /// The first frame runs directly, outside the global dispatcher. Native
+    /// child creation can synchronously report activation during that frame;
+    /// replay those events after its scene borrow ends instead of reentering it.
+    fn dispatch(&self, event: AppEvent) {
+        self.pending.borrow_mut().push_back(event);
+        let Ok(mut handler) = self.handler.try_borrow_mut() else {
+            return;
+        };
+        loop {
+            let event = self.pending.borrow_mut().pop_front();
+            let Some(event) = event else { break };
+            handler(event);
+        }
+    }
 }
 
 /// This shell holds MORE THAN ONE window — the detachable composer,
@@ -305,13 +323,13 @@ impl App {
     /// Raises a window on `runtime`, showing `root`.
     pub fn open(&self, spec: WindowSpec, runtime: Rc<Runtime>, root: impl View) -> WindowId {
         let slot = mount(&spec, runtime, root);
-        let id = WindowId(slot.window);
+        let id = slot.lifecycle.id();
         self.inner.slots.borrow_mut().push(Rc::clone(&slot));
         Rc::clone(&self.inner).route();
         // its own first frame, through its OWN handler and not the
         // global road: a window is very often opened from inside an
         // event, and the road is busy carrying that event
-        (slot.handler.borrow_mut())(AppEvent::Redraw);
+        slot.dispatch(AppEvent::Redraw);
         // painted, then shown — a window never flashes unpainted
         ffi::show_window(slot.handle);
         id
@@ -319,12 +337,131 @@ impl App {
 
     /// Closes a window. The app stays up unless it was the last.
     pub fn close(&self, id: WindowId) {
-        ffi::close_top_level(id.0);
+        if let Some(slot) = self.slot(id) {
+            ffi::close_top_level(slot.window);
+            self.inner
+                .slots
+                .borrow_mut()
+                .retain(|live| live.lifecycle.id() != id);
+        }
     }
 
     /// The windows the app has open, oldest first.
     pub fn windows(&self) -> Vec<WindowId> {
-        self.inner.slots.borrow().iter().map(|slot| WindowId(slot.window)).collect()
+        self.inner
+            .slots
+            .borrow()
+            .iter()
+            .map(|slot| slot.lifecycle.id())
+            .collect()
+    }
+
+    fn slot(&self, id: WindowId) -> Option<Rc<Slot>> {
+        self.inner
+            .slots
+            .borrow()
+            .iter()
+            .find(|slot| slot.lifecycle.id() == id)
+            .cloned()
+    }
+
+    /// Hides a live window without destroying its scene. Repeating it is harmless.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn hide(&self, id: WindowId) -> Result<(), WindowError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        let previous = slot.lifecycle.set_hidden(true);
+        let result = ffi::set_window_visibility(slot.window, WindowVisibility::Hidden);
+        if result.is_err() {
+            slot.lifecycle.set_hidden(previous);
+        }
+        result
+    }
+
+    /// Shows a retained window and requests activation, subject to OS policy.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn show(&self, id: WindowId) -> Result<(), WindowError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        ffi::set_window_visibility(slot.window, WindowVisibility::Shown)?;
+        slot.lifecycle.set_hidden(false);
+        slot.runtime.request_frame();
+        ffi::wake_from_any_thread();
+        Ok(())
+    }
+
+    /// Reports native visibility; this does not mean unobscured or focused.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn visibility(&self, id: WindowId) -> Result<WindowVisibility, WindowError> {
+        let slot = self.slot(id).ok_or(WindowError::StaleWindow)?;
+        ffi::window_visibility(slot.window)
+    }
+
+    /// Replaces a window's user-close policy. Explicit [`App::close`] bypasses it.
+    /// Return Cancel while an asynchronous save decision is pending. A callback
+    /// may replace/remove itself or close/open windows; recursive requests for
+    /// the same window fail with [`WindowError::CloseInProgress`].
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn on_close_requested(
+        &self,
+        id: WindowId,
+        handler: impl FnMut(WindowId) -> CloseAction + 'static,
+    ) -> Result<(), WindowError> {
+        self.slot(id)
+            .ok_or(WindowError::StaleWindow)?
+            .lifecycle
+            .on_close(handler);
+        Ok(())
+    }
+
+    /// Restores default Close handling for subsequent user-close requests.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    pub fn clear_close_handler(&self, id: WindowId) -> Result<(), WindowError> {
+        self.slot(id)
+            .ok_or(WindowError::StaleWindow)?
+            .lifecycle
+            .clear();
+        Ok(())
+    }
+
+    fn close_decision(&self, id: WindowId) -> Result<CloseAction, WindowError> {
+        let action = self
+            .slot(id)
+            .ok_or(WindowError::StaleWindow)?
+            .lifecycle
+            .decide()?;
+        if action == CloseAction::Hide && self.slot(id).is_some() {
+            self.hide(id)?;
+        }
+        Ok(action)
+    }
+
+    /// Requests closure through the same policy as the native close button.
+    ///
+    /// # Errors
+    /// Returns [`WindowError::StaleWindow`] for a closed or foreign ID.
+    /// Same-window callback recursion returns [`WindowError::CloseInProgress`].
+    pub fn request_close(&self, id: WindowId) -> Result<CloseAction, WindowError> {
+        let action = self.close_decision(id)?;
+        if action == CloseAction::Close {
+            self.close(id);
+        }
+        Ok(action)
+    }
+
+    /// Explicitly tears down every window, bypassing user-close policies.
+    pub fn quit(&self) {
+        for id in self.windows() {
+            self.close(id);
+        }
     }
 
     /// Pins the language every window reads — over the system's display
@@ -368,6 +505,20 @@ impl AppInner {
         if self.routed.replace(true) {
             return;
         }
+        let closing = App {
+            inner: Rc::clone(&self),
+        };
+        ffi::set_close_gate(Rc::new(move |window| {
+            let id = closing
+                .inner
+                .live()
+                .iter()
+                .find(|slot| slot.window == window)
+                .map(|slot| slot.lifecycle.id());
+            id.is_some_and(|id| {
+                closing.close_decision(id) == Ok(CloseAction::Close) && closing.slot(id).is_some()
+            })
+        }));
         let app = Rc::clone(&self);
         ffi::set_handler(Box::new(move |event| {
             let source = ffi::event_source();
@@ -375,8 +526,7 @@ impl AppInner {
             for slot in app.live() {
                 // source 0 is a beat every window shares
                 if source == 0 || slot.window == source {
-                    let mut handler = slot.handler.borrow_mut();
-                    handler(event.clone());
+                    slot.dispatch(event.clone());
                 }
             }
             if gone {
@@ -462,6 +612,7 @@ pub fn run_window_chrome(
 /// long as it does — the frame path, the pools, the gates and the event
 /// handler — into a slot the [`App`] holds and routes to.
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
+    let lifecycle = Rc::new(Lifecycle::default());
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
     runtime.drop_unseen();
@@ -1013,11 +1164,15 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     });
     // Semantics follow every pixel path, including retained GPU early returns.
     let present = Rc::new({
+        let lifecycle = Rc::clone(&lifecycle);
         let paint = present;
         let accessibility = Rc::clone(&accessibility);
         let panels = Rc::clone(&panels);
         let dialogs = Rc::clone(&dialogs);
         move |runtime: &Runtime, display| {
+            if lifecycle.is_hidden() {
+                return;
+            }
             paint(runtime, display);
             let surfaces: Vec<_> = {
                 let panels = panels.borrow();
@@ -1031,9 +1186,15 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         }
     });
     let blit = {
+        let lifecycle = Rc::clone(&lifecycle);
         let accessibility = Rc::clone(&accessibility);
         let present = Rc::clone(&present);
         move |runtime: &Runtime, root: &_| {
+            // Hidden windows retain tasks/state, but must not re-show child surfaces.
+            if lifecycle.is_hidden() {
+                return;
+            }
+
             // A dialog's close button is the reader asking the SCENE to close,
             // not the window to die: spend those asks before the frame lays
             // out, so this pass renders without the dialog.
@@ -1316,6 +1477,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         }
     });
 
+    let handler_lifecycle = Rc::clone(&lifecycle);
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
@@ -1379,7 +1541,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // platform's own — and the decorations freeze: they
                 // animate for eyes that are on them (the mac's rule)
                 runtime.set_loops_paused(true);
-                if runtime.dismiss_all_overlays() {
+                if !handler_lifecycle.is_hidden() && runtime.dismiss_all_overlays() {
                     blit(runtime, root);
                 }
                 // a frozen loop asks for no frames: the beat parks
@@ -1541,13 +1703,18 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // has nothing left to draw
             AppEvent::WindowClosed => {}
         }
+        // A hidden scene can dirty state and then await another timer. Keep the
+        // task clock armed even when that turn deliberately skips presentation.
+        ffi::want_pace(window.raw_window(), pace_of(runtime));
     });
 
     Rc::new(Slot {
+        lifecycle,
         window: window.raw_window(),
         handle: window,
         runtime,
         handler: RefCell::new(handler),
+        pending: RefCell::default(),
         key_gate: RefCell::new(key_gate),
         menu_gate: RefCell::new(menu_gate),
         drag_gate,

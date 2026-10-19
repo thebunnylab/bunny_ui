@@ -156,6 +156,9 @@ impl<'a> Runner<'a> {
         let began = Instant::now();
         if let Some(hot) = self.hot.as_mut() {
             let session = hot.start()?;
+            for note in hot.take_notes() {
+                println!("{}", term::warn(&note));
+            }
             announce(began, self.device);
             return Ok(Some(session));
         }
@@ -342,7 +345,12 @@ fn reload(runner: &mut Runner, app: &mut dyn Session, keys: &mut Option<Keys>) -
             let note = if done.new_types { " · a type changed: the state of the app's own types starts over" } else { "" };
             println!("{}{}", term::ok(&format!("Reloaded in {}", seconds(done.took))), term::dim(note));
         }
-        Err(Missed::Build) => println!("{}", term::dim("the app keeps the code it had: fix it and save")),
+        Err(Missed::Build(error)) => {
+            // Cargo already rendered compiler diagnostics in this lane.
+            // Report the summary (or an I/O error), without replaying them.
+            term::print_error(&error.message, error.hint.as_deref());
+            println!("{}", term::dim("the app keeps the code it had: fix it and save"));
+        }
         Err(Missed::Restart(why)) => restart = Some(why),
         Err(Missed::Load(why)) => {
             term::print_error(&format!("the app did not take the new code: {why}"), Some("press R to restart it"));
@@ -406,7 +414,7 @@ fn finish(code: Option<i32>) -> Result<()> {
             println!("{}", term::dim("the app exited"));
             Ok(())
         }
-        Some(code) => Err(Error { message: format!("the app exited with code {code}"), hint: None, code: code.clamp(1, 255) as u8 }),
+        Some(code) => Err(Error { diagnostics: Vec::new(), message: format!("the app exited with code {code}"), hint: None, code: code.clamp(1, 255) as u8 }),
         None => Err(Error::new("the app was ended by a signal")),
     }
 }

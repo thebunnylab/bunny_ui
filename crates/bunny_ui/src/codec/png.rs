@@ -53,12 +53,12 @@ impl Format {
     }
 
     fn stride(&self, width: usize) -> usize {
-        (width * self.bits_per_pixel() + 7) / 8
+        (width * self.bits_per_pixel()).div_ceil(8)
     }
 
     /// The filter's "byte to the left" distance.
     fn bpp(&self) -> usize {
-        ((self.bits_per_pixel() + 7) / 8).max(1)
+        self.bits_per_pixel().div_ceil(8).max(1)
     }
 }
 
@@ -81,7 +81,7 @@ pub fn decode(bytes: &[u8]) -> Option<Image> {
         let kind = &bytes[at + 4..at + 8];
         let payload = bytes.get(at + 8..at + 8 + len)?;
         match kind {
-            b"PLTE" => palette = payload.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect(),
+            b"PLTE" => palette = payload.as_chunks::<3>().0.iter().map(|c| [c[0], c[1], c[2]]).collect(),
             b"tRNS" => trans = payload.to_vec(),
             b"IDAT" => compressed.extend_from_slice(payload),
             b"IEND" => break,
@@ -99,8 +99,8 @@ pub fn decode(bytes: &[u8]) -> Option<Image> {
         if x0 >= width || y0 >= height {
             continue;
         }
-        let pass_w = (width - x0 + dx - 1) / dx;
-        let pass_h = (height - y0 + dy - 1) / dy;
+        let pass_w = (width - x0).div_ceil(dx);
+        let pass_h = (height - y0).div_ceil(dy);
         let rows = defilter(&raw, &mut cursor, pass_w, pass_h, &format)?;
         let stride = format.stride(pass_w);
         for j in 0..pass_h {
@@ -248,13 +248,11 @@ pub(crate) mod tests {
 
     /// A one-color RGBA8 PNG of `w × h`, filter 0 on every row.
     pub(crate) fn png_rgba(w: u32, h: u32, pixel: [u8; 4]) -> Vec<u8> {
-        let mut raw = Vec::new();
-        for _ in 0..h {
-            raw.push(0);
-            for _ in 0..w {
-                raw.extend_from_slice(&pixel);
-            }
+        let mut row = vec![0];
+        for _ in 0..w {
+            row.extend_from_slice(&pixel);
         }
+        let raw = row.repeat(h as usize);
         let mut ihdr = Vec::new();
         ihdr.extend_from_slice(&w.to_be_bytes());
         ihdr.extend_from_slice(&h.to_be_bytes());
@@ -272,7 +270,14 @@ pub(crate) mod tests {
         assert_eq!(header(&png), Some((4, 3)));
         let image = decode(&png).expect("decodes");
         assert_eq!((image.width, image.height), (4, 3));
-        assert!(image.rgba.chunks_exact(4).all(|px| px == [10, 20, 30, 200]));
+        assert!(
+            image
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|px| *px == [10, 20, 30, 200])
+        );
     }
 
     #[test]
