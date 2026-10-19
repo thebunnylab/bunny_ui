@@ -39,7 +39,7 @@ use super::{
     msg_void_clear_color, msg_void_f64, msg_void_id, msg_void_id_u64, msg_void_id_u64_u64, msg_void_ptr_u64_u64,
     msg_void_region_u64_ptr_u64, msg_void_u64, msg_void_u64x3, msg_void_u64x5,
 };
-use crate::ffi::{Id, Sel, class, error_message, ns_string, sel};
+use crate::ffi::{Id, Sel, class, error_message, ns_string, sel, text_of};
 
 #[allow(clashing_extern_declarations)]
 #[link(name = "objc", kind = "dylib")]
@@ -857,6 +857,8 @@ pub(super) struct MetalWorld {
     device: Id,
     /// The 2D target's pixel format, for the composite pipeline.
     format: u64,
+    /// The quality the device's name starts its worlds at.
+    start: bunny_ui::world::Quality,
     built: Built,
     targets: HashMap<u64, Target>,
     meshes: HashMap<u64, MeshBuffers>,
@@ -872,9 +874,11 @@ pub(super) struct MetalWorld {
 
 impl MetalWorld {
     pub(super) fn new(device: Id, format: u64) -> MetalWorld {
+        let name = unsafe { text_of(msg_id(device, sel("name"))) };
         MetalWorld {
             device,
             format,
+            start: name.map_or(bunny_ui::world::Quality::High, |name| bunny_ui::world::governor::device_quality(&name)),
             built: Built::Not,
             targets: HashMap::new(),
             meshes: HashMap::new(),
@@ -1323,7 +1327,7 @@ unsafe fn attachment(device: Id, format: u64, size: (u32, u32), samples: u8, sto
 
 impl WorldGround for MetalWorld {
     fn world_caps(&self) -> WorldCaps {
-        WorldCaps { samples: 4 }
+        WorldCaps { samples: 4, start: self.start }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {

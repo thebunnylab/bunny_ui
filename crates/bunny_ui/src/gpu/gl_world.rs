@@ -157,6 +157,11 @@ pub trait GlFamily {
     /// counts a framebuffer of depth alone complete only once it is said;
     /// ES and WebGL2 need nothing.
     fn draw_no_color(&mut self) {}
+    /// The name the device's graphics answer to, when the tier can read
+    /// it: the governor's start.
+    fn renderer(&self) -> Option<String> {
+        None
+    }
 
     fn viewport(&mut self, width: i32, height: i32);
     fn enable(&mut self, capability: u32);
@@ -732,7 +737,8 @@ fn point_instances<G: GlFamily>(gl: &mut G, base: usize) {
 
 impl<G: GlFamily> WorldGround for GlWorld<G> {
     fn world_caps(&self) -> WorldCaps {
-        WorldCaps { samples: self.samples }
+        let start = self.gl.renderer().map_or(crate::world::frame::Quality::High, |name| crate::world::governor::device_quality(&name));
+        WorldCaps { samples: self.samples, start }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {

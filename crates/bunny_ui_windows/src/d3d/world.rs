@@ -1543,7 +1543,8 @@ impl WorldStack {
 
 impl WorldGround for D3dWorld {
     fn world_caps(&self) -> WorldCaps {
-        WorldCaps { samples: 4 }
+        // the adapter's name is not read here: the ask stands
+        WorldCaps { samples: 4, start: bunny_ui::world::Quality::High }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {

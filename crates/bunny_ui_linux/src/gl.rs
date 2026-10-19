@@ -1718,6 +1718,11 @@ impl GlFamily for Gl33 {
         }
     }
 
+    fn renderer(&self) -> Option<String> {
+        let name = unsafe { (self.gl.get_string)(GL_RENDERER) };
+        (!name.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned())
+    }
+
     fn viewport(&mut self, width: i32, height: i32) {
         unsafe { (self.gl.viewport)(0, 0, width, height) }
     }

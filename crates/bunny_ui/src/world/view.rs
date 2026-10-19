@@ -14,7 +14,7 @@ use std::rc::Rc;
 use motor::state::State;
 
 use super::camera::Camera;
-use super::frame::{Background, WorldFrame, WorldStyle};
+use super::frame::{Background, Quality, WorldFrame, WorldStyle};
 use super::store::{World, WorldData};
 use crate::custom::Painter;
 use crate::image_engine::{ImageRaster, ImageSource};
@@ -49,8 +49,8 @@ pub struct Shot {
     frame: RefCell<Option<Decided>>,
 }
 
-/// A frame decided for a target size.
-type Decided = ((u32, u32), Rc<WorldFrame>);
+/// A frame decided for a target size and a quality.
+type Decided = (((u32, u32), Quality), Rc<WorldFrame>);
 
 impl Shot {
     /// A picture of `world` through `camera` (sampled at `time`), for a
@@ -69,16 +69,28 @@ impl Shot {
         &self.style
     }
 
+    /// The engine clock's time the shot was taken at.
+    pub fn time(&self) -> f64 {
+        self.time
+    }
+
     /// The frame for a target of `size` pixels, decided once per size.
     pub fn frame(&self, size: (u32, u32)) -> Rc<WorldFrame> {
+        self.frame_at(size, self.style.quality)
+    }
+
+    /// The frame for a target of `size` pixels at `quality` — the one a
+    /// governor allows, at most the style's — decided once per both.
+    pub fn frame_at(&self, size: (u32, u32), quality: Quality) -> Rc<WorldFrame> {
         if let Some((held, frame)) = self.frame.borrow().as_ref()
-            && *held == size
+            && *held == (size, quality)
         {
             return Rc::clone(frame);
         }
         let px_per_point = if self.points.0 > 0.0 { (size.0 as f64 / self.points.0) as f32 } else { 1.0 };
-        let frame = Rc::new(super::frame::build_frame(&self.world, &self.camera, &self.style, size, px_per_point, self.time));
-        *self.frame.borrow_mut() = Some((size, Rc::clone(&frame)));
+        let style = WorldStyle { quality: quality.min(self.style.quality), ..self.style.clone() };
+        let frame = Rc::new(super::frame::build_frame(&self.world, &self.camera, &style, size, px_per_point, self.time));
+        *self.frame.borrow_mut() = Some(((size, quality), Rc::clone(&frame)));
         frame
     }
 }

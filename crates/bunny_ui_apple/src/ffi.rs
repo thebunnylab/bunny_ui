@@ -267,6 +267,17 @@ pub unsafe fn ns_string(text: &str) -> Id {
 }
 
 /// An `NSError`'s own words, or a placeholder when it has none.
+/// The text of an `NSString`, or `None` for a null one.
+pub unsafe fn text_of(string: Id) -> Option<String> {
+    unsafe {
+        if string.is_null() {
+            return None;
+        }
+        let chars = msg_cstr(string, sel("UTF8String"));
+        (!chars.is_null()).then(|| std::ffi::CStr::from_ptr(chars).to_string_lossy().into_owned())
+    }
+}
+
 pub unsafe fn error_message(error: Id) -> String {
     unsafe {
         if error.is_null() {

@@ -16,6 +16,7 @@
 
 pub mod camera;
 pub mod frame;
+pub mod governor;
 #[cfg(feature = "gltf")]
 pub mod gltf;
 #[cfg(feature = "gltf")]

@@ -267,6 +267,16 @@ nothing at all.
 | `Quality::Medium` (default) | 4 | 2.2 million | 2048² | 4 |
 | `Quality::High` | 4 | 4 million | 2048² | 9 |
 
+The style's quality is an ask, and a governor answers it for each box,
+never above it. It starts from the name the device's graphics answer to
+— a software rasterizer or an older integrated part low, a part of the
+middle at the middle, a discrete or newer part high — and it weighs the
+beat of the frames while the world moves: a beat that keeps missing the
+display's steps (nine frames in ten over one and a half steps) or a run
+of long frames steps a quality down; a long stretch with room to spare
+steps up, once a session and one step past the start at most. A world
+at rest is not weighed: it costs nothing.
+
 A box inside the budget is drawn at its own size. A larger box is drawn
 smaller, and the compositor stretches it to the box. At four samples a
 cut-out surface (`Material::mask`) turns its edge into coverage — the

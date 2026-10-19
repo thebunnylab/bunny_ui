@@ -41,8 +41,8 @@ pub enum Background {
     Sky { zenith: Color, horizon: Color, ground: Color },
 }
 
-/// What a picture of the world may cost.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// What a picture of the world may cost, from the least to the most.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum Quality {
     /// One sample a pixel and a small pixel budget: a weak GPU, a phone,
     /// a busy page.

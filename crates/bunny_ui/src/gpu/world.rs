@@ -24,7 +24,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::image_engine::{ImageEngine, ImageSource};
-use crate::world::frame::WorldFrame;
+use crate::world::frame::{Quality, WorldFrame};
+use crate::world::governor::Governor;
 use crate::world::mesh::{Lines, Mesh};
 use crate::world::view::Shot;
 use crate::world::wire::segment_bytes;
@@ -34,6 +35,10 @@ use crate::world::wire::segment_bytes;
 pub struct WorldCaps {
     /// The most samples a pixel a target may take: 1 or 4.
     pub samples: u8,
+    /// The quality the device starts its worlds at
+    /// ([`crate::world::governor::device_quality`] of its name); `High`
+    /// when the tier cannot name it, which leaves the ask alone.
+    pub start: Quality,
 }
 
 /// The door a tier opens for worlds. Each call moves bytes or mints a
@@ -198,6 +203,8 @@ pub struct WorldResidency {
     segments: HashMap<u64, Asset>,
     /// Each box's shadow map, by slot.
     shadow_maps: HashMap<u64, HeldMap>,
+    /// Each box's governor, by slot: the quality it draws at.
+    governors: HashMap<u64, Governor>,
     /// The walk in progress.
     walk: u64,
     /// What this walk's jobs leave in their targets — kept apart until
@@ -240,6 +247,7 @@ impl WorldResidency {
         self.textures.clear();
         self.segments.clear();
         self.shadow_maps.clear();
+        self.governors.clear();
         self.pending.clear();
         self.pending_shadows.clear();
     }
@@ -267,9 +275,11 @@ impl WorldResidency {
         generation: u64,
         box_px: (u32, u32),
     ) -> Option<ResolvedWorld> {
-        let quality = shot.style().quality;
+        let caps = ground.world_caps();
+        let governor = self.governors.entry(slot).or_insert_with(|| Governor::new(caps.start));
+        let quality = governor.quality(shot.style().quality);
         let size = quality.target_size(box_px);
-        let samples = quality.samples().min(ground.world_caps().samples).max(1);
+        let samples = quality.samples().min(caps.samples).max(1);
         let walk = self.walk;
         let target = match self.targets.get_mut(&slot) {
             Some(target) if target.size == size && target.samples == samples => {
@@ -289,7 +299,11 @@ impl WorldResidency {
         if target.holds == Some(generation) {
             return Some(ResolvedWorld { target: id, size, job: None });
         }
-        let frame = shot.frame(size);
+        let frame = shot.frame_at(size, quality);
+        // the world draws: its beat is the governor's measure
+        if let Some(governor) = self.governors.get_mut(&slot) {
+            governor.drew(shot.time());
+        }
         let mut meshes = Vec::with_capacity(frame.meshes.len());
         for mesh in &frame.meshes {
             meshes.push(self.mesh(ground, mesh)?);
@@ -391,6 +405,8 @@ impl WorldResidency {
             }
             keep
         });
+        let targets = &self.targets;
+        self.governors.retain(|slot, _| targets.contains_key(slot));
         self.shadow_maps.retain(|_, map| {
             let keep = !idle(map.walk, TARGET_IDLE_WALKS);
             if !keep {
@@ -438,11 +454,12 @@ mod tests {
         dropped: Vec<&'static str>,
         refuse: bool,
         samples: u8,
+        start: Quality,
     }
 
     impl Ledger {
         fn new() -> Ledger {
-            Ledger { samples: 4, ..Ledger::default() }
+            Ledger { samples: 4, start: Quality::High, ..Ledger::default() }
         }
 
         fn mint(&mut self, what: &'static str) -> Option<u64> {
@@ -467,7 +484,7 @@ mod tests {
 
     impl WorldGround for Ledger {
         fn world_caps(&self) -> WorldCaps {
-            WorldCaps { samples: self.samples }
+            WorldCaps { samples: self.samples, start: self.start }
         }
         fn make_target(&mut self, _: u32, _: u32, _: u8) -> Option<u64> {
             self.mint("target")
@@ -702,6 +719,35 @@ mod tests {
         let job = residency.resolve(&mut ground, &RawImages::default(), &shot(&world, Quality::Low), 7, 1, (64, 64)).unwrap().job.unwrap();
         assert!(job.frame.shadow.is_some(), "the frame asks for a shadow");
         assert!(job.shadow.is_none(), "the tier has no map: the picture still draws");
+    }
+
+    #[test]
+    fn the_device_starts_the_quality_and_slow_frames_step_it_down() {
+        let (world, cube) = cube_world();
+        let shot_at = |time: f64, yaw: f64| {
+            let style = WorldStyle { quality: Quality::High, ..WorldStyle::default() };
+            Shot::new(world.with(WorldData::clone), Camera::orbiting(Vec3::ZERO, yaw, 25.0, 5.0), style, time, (100.0, 80.0))
+        };
+        let images = RawImages::default();
+        // a device whose name starts it at the middle draws four samples
+        // and the middle's shadows, though the box asks for the most
+        let (mut ground, mut residency) = (Ledger { start: Quality::Medium, ..Ledger::new() }, WorldResidency::default());
+        residency.begin_walk(1);
+        let job = residency.resolve(&mut ground, &images, &shot_at(0.0, 30.0), 7, 1, (200, 160)).unwrap().job.unwrap();
+        assert_eq!(job.frame.samples, 4);
+        assert_eq!(job.frame.uniforms.shadow, [0.0; 4], "no sun with shadows here");
+        // a run of long frames while the camera turns steps it down
+        let mut time = 0.0;
+        for walk in 2..9u64 {
+            time += 0.08;
+            residency.begin_walk(walk);
+            residency.drawn();
+            let job = residency.resolve(&mut ground, &images, &shot_at(time, 30.0 + walk as f64), 7, walk, (200, 160)).unwrap().job.unwrap();
+            if walk == 8 {
+                assert_eq!(job.frame.samples, 1, "down to one sample");
+            }
+        }
+        let _ = cube;
     }
 
     #[test]

@@ -2247,7 +2247,11 @@ unsafe fn one_time(stack: &VkStack, work: impl FnOnce(CommandBuffer)) -> bool {
 
 impl WorldGround for VkWorldDoor<'_> {
     fn world_caps(&self) -> WorldCaps {
-        WorldCaps { samples: 4 }
+        let mut properties = unsafe { std::mem::zeroed::<PhysicalDeviceProperties>() };
+        unsafe { (self.stack.fns.get_physical_device_properties)(self.stack.physical, &mut properties) };
+        let end = properties.device_name.iter().position(|&byte| byte == 0).unwrap_or(properties.device_name.len());
+        let name = String::from_utf8_lossy(&properties.device_name[..end]);
+        WorldCaps { samples: 4, start: bunny_ui::world::governor::device_quality(&name) }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {
