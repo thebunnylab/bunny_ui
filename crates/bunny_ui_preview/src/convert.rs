@@ -325,7 +325,8 @@ pub fn image_key(source: &ImageSource) -> u64 {
         | ImageSource::Native { key, .. }
         | ImageSource::Feed { key, .. }
         | ImageSource::Faded { key, .. }
-        | ImageSource::Mirrored { key, .. } => *key,
+        | ImageSource::Mirrored { key, .. }
+        | ImageSource::World { key, .. } => *key,
     }
 }
 
@@ -357,7 +358,11 @@ pub fn resource(source: &ImageSource) -> Option<Resource> {
         ImageSource::Feed { generation, size, bytes, .. } => {
             ResourceKind::Feed { generation: *generation, size: *size, rgba: bytes.to_vec() }
         }
-        ImageSource::Native { .. } | ImageSource::Faded { .. } | ImageSource::Mirrored { .. } => return None,
+        // a world is drawn where it shows, like a platform surface: the
+        // wire carries no picture of it
+        ImageSource::Native { .. } | ImageSource::Faded { .. } | ImageSource::Mirrored { .. } | ImageSource::World { .. } => {
+            return None;
+        }
     };
     Some(Resource { key: image_key(inner), kind })
 }

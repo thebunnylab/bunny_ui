@@ -91,7 +91,28 @@ pub enum ImageSource {
     /// veil does, so a mirrored image is simply another image to every
     /// pipeline; the raster is the inner's with each row read backwards.
     Mirrored { key: u64, inner: Rc<ImageSource> },
+    /// A picture of a world in three dimensions, drawn by the tier — or
+    /// by the CPU where no tier draws worlds. `key` is the SLOT, the
+    /// target a tier keeps for the box that paints it; `generation` moves
+    /// with every change the picture shows, and rides the equality, so a
+    /// new picture is damage and an unchanged one is skipped. `veil` is
+    /// the box's opacity: a fade keeps a world a world, so it is never
+    /// drawn again on the CPU to be faded. Built by
+    /// `Painter::world` (feature `3d`); without the feature nothing makes
+    /// one.
+    World { key: u64, generation: u64, veil: u8, shot: WorldShot },
 }
+
+/// What a world picture carries to the pipelines: the frozen world, the
+/// camera and the style it is seen with.
+#[cfg(feature = "3d")]
+pub type WorldShot = Rc<crate::world::view::Shot>;
+
+/// Without the `3d` feature a world picture carries nothing, and nothing
+/// can make one.
+#[cfg(not(feature = "3d"))]
+#[derive(Clone)]
+pub struct WorldShot(());
 
 /// Domain tags folded into the key so the two variants never share an
 /// identity by accident.
@@ -102,6 +123,7 @@ const FADE_TAG: u64 = 0x62_6e_79_5f_66_61_64_65; // "bny_fade"
 const MIRROR_TAG: u64 = 0x62_6e_79_5f_6d_69_72_72; // "bny_mirr"
 const RGBA_TAG: u64 = 0x62_6e_79_5f_72_67_62_61; // "bny_rgba"
 const FEED_TAG: u64 = 0x626e_795f_6665_6564; // "bny_feed"
+const WORLD_TAG: u64 = 0x626e_795f_776f_726c; // "bny_worl"
 
 fn fx_hash(tag: u64, bytes: &[u8]) -> u64 {
     let mut hasher = motor::hash::FxHasher::default();
@@ -327,6 +349,12 @@ impl ImageSource {
         if alpha == 255 {
             return self.clone();
         }
+        // a world fades on the tier, in the copy that composites it: the
+        // veil rides the identity and the picture is not drawn again
+        if let ImageSource::World { key, generation, veil, shot } = self {
+            let veil = ((*veil as u32 * alpha as u32 + 127) / 255) as u8;
+            return ImageSource::World { key: *key, generation: *generation, veil, shot: shot.clone() };
+        }
         // a veil over a veil multiplies, and only the OUTER one stays:
         // the identity of a stack of fades is one number
         let (inner, alpha) = match self {
@@ -357,7 +385,9 @@ impl ImageSource {
     pub fn mirrored(&self) -> ImageSource {
         let inner = match self {
             ImageSource::Mirrored { inner, .. } => return (**inner).clone(),
-            ImageSource::Native { .. } => return self.clone(),
+            // a world has no reading direction: a right-to-left scene
+            // shows the same room
+            ImageSource::Native { .. } | ImageSource::World { .. } => return self.clone(),
             other => Rc::new(other.clone()),
         };
         let mut hasher = motor::hash::FxHasher::default();
@@ -382,8 +412,20 @@ impl ImageSource {
             | ImageSource::Rgba { key, .. }
             | ImageSource::Feed { key, .. }
             | ImageSource::Faded { key, .. }
-            | ImageSource::Mirrored { key, .. } => *key,
+            | ImageSource::Mirrored { key, .. }
+            | ImageSource::World { key, .. } => *key,
         }
+    }
+
+    /// The identity a world picture rides the live-texture road with: the
+    /// slot, and a frame number that moves with the generation and the
+    /// veil. `None` for any other picture.
+    pub fn world_feed(&self) -> Option<(u64, u64)> {
+        let ImageSource::World { key, generation, veil, .. } = self else { return None };
+        let mut hasher = motor::hash::FxHasher::default();
+        hasher.write_u64(*generation);
+        hasher.write_u8(*veil);
+        Some((key ^ WORLD_TAG, hasher.finish()))
     }
 }
 
@@ -444,6 +486,11 @@ impl PartialEq for ImageSource {
                 ImageSource::Mirrored { key, .. },
                 ImageSource::Mirrored { key: other_key, .. },
             ) => key == other_key,
+            // the slot, the picture and the veil: one target, many frames
+            (
+                ImageSource::World { key, generation, veil, .. },
+                ImageSource::World { key: other_key, generation: other_generation, veil: other_veil, .. },
+            ) => key == other_key && generation == other_generation && veil == other_veil,
             _ => false,
         }
     }
@@ -484,6 +531,9 @@ impl fmt::Debug for ImageSource {
                 write!(f, "faded({inner:?}, {alpha})")
             }
             ImageSource::Mirrored { inner, .. } => write!(f, "mirrored({inner:?})"),
+            ImageSource::World { key, generation, veil, .. } => {
+                write!(f, "world(0x{key:016x} #{generation}, veil {veil})")
+            }
         }
     }
 }
@@ -595,6 +645,13 @@ pub fn raster_source(
             fade_raster(*key, engine, inner, *alpha, width, height)
         }
         ImageSource::Mirrored { key, inner } => mirror_raster(*key, engine, inner, width, height),
+        // the oracle draws the world where no tier does
+        #[cfg(feature = "3d")]
+        ImageSource::World { key, generation, veil, shot } => {
+            crate::world::view::world_raster(engine, *key, *generation, *veil, shot, width, height)
+        }
+        #[cfg(not(feature = "3d"))]
+        ImageSource::World { .. } => None,
         _ => engine.raster(source, width, height),
     }
 }
@@ -622,6 +679,11 @@ pub fn intrinsic_of(engine: &dyn ImageEngine, source: &ImageSource) -> Option<(u
         ImageSource::Faded { inner, .. } | ImageSource::Mirrored { inner, .. } => {
             intrinsic_of(engine, inner)
         }
+        // a world has the size of the box that painted it
+        #[cfg(feature = "3d")]
+        ImageSource::World { shot, .. } => Some(shot.points()),
+        #[cfg(not(feature = "3d"))]
+        ImageSource::World { .. } => None,
         _ => engine.intrinsic(source),
     }
 }
@@ -1065,7 +1127,8 @@ impl ImageEngine for RawImages {
             | ImageSource::Rgba { .. }
             | ImageSource::Feed { .. }
             | ImageSource::Faded { .. }
-            | ImageSource::Mirrored { .. } => {
+            | ImageSource::Mirrored { .. }
+            | ImageSource::World { .. } => {
                 // the door intercepts what the house draws before any
                 // engine — a regression at a call site should be LOUD
                 debug_assert!(false, "a house drawing never reaches an engine");
@@ -1099,7 +1162,8 @@ impl ImageEngine for RawImages {
             | ImageSource::Rgba { .. }
             | ImageSource::Feed { .. }
             | ImageSource::Faded { .. }
-            | ImageSource::Mirrored { .. } => {
+            | ImageSource::Mirrored { .. }
+            | ImageSource::World { .. } => {
                 debug_assert!(false, "a house drawing never reaches an engine");
                 return None;
             }

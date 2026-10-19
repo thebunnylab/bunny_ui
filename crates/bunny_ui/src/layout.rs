@@ -4245,6 +4245,15 @@ impl Placement {
 }
 
 impl Rect {
+    /// A box of `width × height` centred on `center` — the box around a
+    /// point a mark or a label stands on.
+    pub fn around(center: Point, width: Px, height: Px) -> Rect {
+        Rect {
+            origin: Point { x: center.x - width * 0.5, y: center.y - height * 0.5 },
+            size: Size { width, height },
+        }
+    }
+
     /// No area: nothing drawn under this clip reaches a pixel.
     pub fn is_empty(&self) -> bool {
         self.size.width <= 0.0 || self.size.height <= 0.0

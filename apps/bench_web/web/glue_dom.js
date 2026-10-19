@@ -1671,6 +1671,11 @@ const GPU_VERBS = [
   "gl_create_framebuffer", "gl_bind_framebuffer", "gl_framebuffer_texture_2d",
   "gl_check_framebuffer_status", "gl_delete_framebuffer",
   "gl_draw_arrays", "gl_draw_arrays_instanced", "gl_read_pixels",
+  "gl_uniform4fv", "gl_buffer_data", "gl_delete_vertex_array", "gl_vertex_attrib_i_pointer",
+  "gl_framebuffer_renderbuffer", "gl_create_renderbuffer", "gl_delete_renderbuffer",
+  "gl_renderbuffer_storage_multisample", "gl_blit_framebuffer", "gl_invalidate_framebuffer",
+  "gl_depth_func", "gl_depth_mask", "gl_cull_face", "gl_front_face", "gl_clear_depth",
+  "gl_draw_elements_instanced",
 ];
 
 // Keyed by the modules' RELATIVE names — see glue.js on why.

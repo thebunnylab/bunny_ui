@@ -73,7 +73,6 @@ jobs:
           # Retain the actual adapter witness on successful parity tests too.
           cargo test -p "$PLATFORM" --locked --all-targets -- --nocapture
           BUNNY_PARANOID=all cargo test -p "$PLATFORM" --locked --all-targets -- --nocapture
-
       - name: Core default, normal and paranoid
         run: |
           cargo test -p bunny-ui-core --locked --all-targets
@@ -131,6 +130,11 @@ jobs:
             aarch64-linux-android wasm32-unknown-unknown; do
             cargo check -p bunny-ui --locked --all-targets --features hot --target "$target"
           done
+      - name: Metal world pass, normal and paranoid
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p bunny-ui-apple --locked --all-targets --features 3d -- --nocapture
+          BUNNY_PARANOID=all cargo test -p bunny-ui-apple --locked --all-targets --features 3d
       - name: macOS shell, normal and paranoid; iOS build
         if: runner.os == 'macOS'
         run: |

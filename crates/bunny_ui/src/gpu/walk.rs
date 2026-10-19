@@ -242,6 +242,13 @@ pub trait AtlasGround {
     /// A whole texture of its own for an image too big to shelf.
     fn make_dedicated(&mut self, w: u32, h: u32, bytes: &[u8], pitch_px: u32) -> Option<u64>;
     fn drop_dedicated(&mut self, id: u64);
+
+    /// The tier's door for worlds. `None` = this tier draws no world
+    /// itself, and the oracle's picture rides the live road.
+    #[cfg(feature = "3d")]
+    fn world(&mut self) -> Option<&mut dyn super::world::WorldGround> {
+        None
+    }
 }
 
 // MARK: - The run atlas (text tiles, append-only shelves)
@@ -455,6 +462,11 @@ pub struct RunAtlas {
     pub walk: u64,
     /// The walk the last reset closed — `fresh` reads the pair.
     pub reset_walk: u64,
+    /// What the ground holds for worlds: targets by slot, meshes,
+    /// textures and segments by identity. Outside the collector's reach,
+    /// like the feeds, and retired on idleness.
+    #[cfg(feature = "3d")]
+    pub worlds: super::world::WorldResidency,
 }
 
 /// One dedicated texture — the ground's handle, its size — and the
@@ -500,6 +512,8 @@ impl RunAtlas {
             live: HashMap::new(),
             walk: 0,
             reset_walk: 0,
+            #[cfg(feature = "3d")]
+            worlds: super::world::WorldResidency::default(),
         }
     }
 
@@ -507,6 +521,8 @@ impl RunAtlas {
     /// takes. `build_frame` calls it first, on every attempt.
     pub fn begin_walk(&mut self) {
         self.walk = self.walk.wrapping_add(1);
+        #[cfg(feature = "3d")]
+        self.worlds.begin_walk(self.walk);
     }
 
     /// True while a reset would give nothing back: the first walk after
@@ -781,6 +797,15 @@ impl RunAtlas {
         if let ImageSource::Feed { key, generation, size, format, bytes } = source {
             return Ok(self.resolve_live(ground, *key, *generation, *size, *format, bytes));
         }
+        // a world's key is its SLOT: the shelf and the dedicated caches
+        // would show an old picture. Where no tier draws worlds, the
+        // oracle's picture rides the live road, once per generation.
+        if let Some((slot, frame)) = source.world_feed() {
+            let Some(raster) = raster_source(engine, source, width as usize, height as usize) else {
+                return Ok(None);
+            };
+            return Ok(self.resolve_live(ground, slot, frame, (width, height), PixelFormat::Rgba8, &raster.rgba));
+        }
         let cache_key = (source.key(), width, height);
         let walk = self.walk;
         if let Some(entry) = self.dedicated.get_mut(&cache_key) {
@@ -943,6 +968,11 @@ pub enum RunKind {
     /// scaled to the destination by the tier's linear sampler. The index
     /// points into the same texture list.
     Live(u16),
+    /// Sprites read from a world's TARGET, which the tier drew this frame
+    /// or holds from an earlier one: premultiplied, scaled to the box by
+    /// the linear sampler, the box's veil in `tex.x` and the target's size
+    /// in `tex.zw`. The index points into the frame's world targets.
+    World(u16),
 }
 
 #[derive(Clone, Copy)]
@@ -969,7 +999,7 @@ pub struct DrawRun {
 fn list_of(kind: RunKind) -> u8 {
     match kind {
         RunKind::Rects => 0,
-        RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) => 1,
+        RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) | RunKind::World(_) => 1,
         RunKind::Glass => 2,
     }
 }
@@ -1080,6 +1110,12 @@ pub struct FrameBatches {
     /// Dedicated texture handles this frame reads (borrowed from the
     /// atlas's cache — the ground owns and releases them).
     pub textures: Vec<u64>,
+    /// The world targets this frame composites, by the ground's world
+    /// handle — what a [`RunKind::World`] index points into.
+    pub world_targets: Vec<u64>,
+    /// The world pictures to draw before the 2D pass, in paint order.
+    #[cfg(feature = "3d")]
+    pub worlds: Vec<super::world::WorldJob>,
 }
 
 /// Walks the display list in paint order and fills the frame batches.
@@ -1104,6 +1140,9 @@ pub fn build_frame(
     batches.glass.clear();
     batches.runs.clear();
     batches.textures.clear();
+    batches.world_targets.clear();
+    #[cfg(feature = "3d")]
+    batches.worlds.clear();
     batches.rounds.clear();
     batches.rounds.push(NO_ROUND);
     let out = &mut batches.rects;
@@ -1358,6 +1397,37 @@ pub fn build_frame(
                 if box_intersect(dest, clip).is_none() {
                     continue;
                 }
+                // a tier that draws worlds draws this one into a target of
+                // its own; one that could not shows the oracle's picture
+                #[cfg(feature = "3d")]
+                if let ImageSource::World { key, generation, veil, shot } = source
+                    && let Some(world) = ground.world()
+                    && let Some(picture) = atlas.worlds.resolve(world, images, shot, *key, *generation, (width, height))
+                {
+                    if let Some(job) = picture.job {
+                        batches.worlds.push(job);
+                    }
+                    let index = match batches.world_targets.iter().position(|t| *t == picture.target) {
+                        Some(index) => index,
+                        None => {
+                            batches.world_targets.push(picture.target);
+                            batches.world_targets.len() - 1
+                        }
+                    };
+                    batches.sprites.push(SpriteInstance {
+                        dest: [dest.0 as f32, dest.1 as f32, dest.2 as f32, dest.3 as f32],
+                        tex: [*veil as f32 / 255.0, 0.0, picture.size.0 as f32, picture.size.1 as f32],
+                        clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
+                    });
+                    note_run(
+                        &mut batches.runs,
+                        RunKind::World(index as u16),
+                        round_of(&clips),
+                        batches.sprites.len() - 1,
+                        sprite_box(&batches.sprites[batches.sprites.len() - 1]),
+                    );
+                    continue;
+                }
                 match atlas.resolve_image(ground, source, width, height, images)? {
                     None => {}
                     Some(ResolvedImage::Tiles(entry)) => {
@@ -1486,6 +1556,10 @@ pub fn build_frame(
         }
     }
     atlas.retire_live(ground);
+    #[cfg(feature = "3d")]
+    if let Some(world) = ground.world() {
+        atlas.worlds.retire(world);
+    }
     Ok(())
 }
 
@@ -1618,6 +1692,11 @@ impl FrameBatches {
             feed(&mut hash, &run.base.to_le_bytes());
             feed(&mut hash, &run.count.to_le_bytes());
             feed(&mut hash, &run.round.to_le_bytes());
+        }
+        #[cfg(feature = "3d")]
+        for job in &self.worlds {
+            feed(&mut hash, &job.frame.checksum().to_le_bytes());
+            feed(&mut hash, &[job.samples]);
         }
         hash
     }
