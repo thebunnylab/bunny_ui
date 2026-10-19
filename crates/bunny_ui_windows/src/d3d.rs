@@ -57,6 +57,9 @@ use bunny_ui::text_engine::TextEngine;
 
 use crate::ffi::{Com, Guid, Hresult, Hwnd, UnknownVtbl, com_ok};
 
+#[cfg(feature = "3d")]
+mod world;
+
 // MARK: - FFI border
 
 #[link(name = "d3d11", kind = "raw-dylib")]
@@ -302,6 +305,31 @@ struct QueryDesc {
     misc_flags: u32,
 }
 
+/// `D3D11_DEPTH_STENCILOP_DESC`: what the stencil does on each outcome.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "3d"), allow(dead_code))]
+struct DepthStencilOpDesc {
+    stencil_fail_op: u32,
+    stencil_depth_fail_op: u32,
+    stencil_pass_op: u32,
+    stencil_func: u32,
+}
+
+/// `D3D11_DEPTH_STENCIL_DESC` — the two masks are the narrow fields.
+#[repr(C)]
+#[cfg_attr(not(feature = "3d"), allow(dead_code))]
+struct DepthStencilDesc {
+    depth_enable: i32,
+    depth_write_mask: u32,
+    depth_func: u32,
+    stencil_enable: i32,
+    stencil_read_mask: u8,
+    stencil_write_mask: u8,
+    front_face: DepthStencilOpDesc,
+    back_face: DepthStencilOpDesc,
+}
+
 /// `D3D11_SHADER_RESOURCE_VIEW_DESC` with the union flattened — the
 /// buffer variant uses the first two words, the rest stay zero.
 #[repr(C)]
@@ -355,7 +383,15 @@ struct DeviceVtbl {
         *const c_void,
         *mut *mut Rtv,
     ) -> Hresult,
-    _pad_10_11: [usize; 2], // 10 CreateDepthStencilView, 11 CreateInputLayout
+    // 10 CreateDepthStencilView (null desc inherits the texture format)
+    #[cfg_attr(not(feature = "3d"), allow(dead_code))]
+    create_depth_stencil_view: unsafe extern "system" fn(
+        *mut Device,
+        *mut c_void,
+        *const c_void,
+        *mut *mut Dsv,
+    ) -> Hresult,
+    _pad_11: [usize; 1], // 11 CreateInputLayout
     // 12 CreateVertexShader
     create_vertex_shader: unsafe extern "system" fn(
         *mut Device,
@@ -377,7 +413,13 @@ struct DeviceVtbl {
     // 20 CreateBlendState
     create_blend_state:
         unsafe extern "system" fn(*mut Device, *const BlendDesc, *mut *mut BlendState) -> Hresult,
-    _pad_21: [usize; 1], // 21 CreateDepthStencilState
+    // 21 CreateDepthStencilState
+    #[cfg_attr(not(feature = "3d"), allow(dead_code))]
+    create_depth_stencil_state: unsafe extern "system" fn(
+        *mut Device,
+        *const DepthStencilDesc,
+        *mut *mut DepthStencilState,
+    ) -> Hresult,
     // 22 CreateRasterizerState
     create_rasterizer_state: unsafe extern "system" fn(
         *mut Device,
@@ -433,7 +475,13 @@ struct ContextVtbl {
     // 16 PSSetConstantBuffers
     ps_set_constant_buffers:
         unsafe extern "system" fn(*mut Context, u32, u32, *const *mut Buffer),
-    _pad_17_20: [usize; 4], // 17..=19 input assembler, 20 DrawIndexedInstanced
+    _pad_17_18: [usize; 2], // 17..=18 input layout, vertex buffers
+    // 19 IASetIndexBuffer
+    #[cfg_attr(not(feature = "3d"), allow(dead_code))]
+    ia_set_index_buffer: unsafe extern "system" fn(*mut Context, *mut Buffer, u32, u32),
+    // 20 DrawIndexedInstanced
+    #[cfg_attr(not(feature = "3d"), allow(dead_code))]
+    draw_indexed_instanced: unsafe extern "system" fn(*mut Context, u32, u32, u32, i32, u32),
     // 21 DrawInstanced
     draw_instanced: unsafe extern "system" fn(*mut Context, u32, u32, u32, u32),
     _pad_22_23: [usize; 2], // 22..=23 geometry stage
@@ -455,7 +503,10 @@ struct ContextVtbl {
     // 35 OMSetBlendState
     om_set_blend_state:
         unsafe extern "system" fn(*mut Context, *mut BlendState, *const f32, u32),
-    _pad_36_42: [usize; 7], // 36..=42 depth, stream-out, indirect draws, dispatch
+    // 36 OMSetDepthStencilState
+    #[cfg_attr(not(feature = "3d"), allow(dead_code))]
+    om_set_depth_stencil_state: unsafe extern "system" fn(*mut Context, *mut DepthStencilState, u32),
+    _pad_37_42: [usize; 6], // 37..=42 stream-out, indirect draws, dispatch
     // 43 RSSetState
     rs_set_state: unsafe extern "system" fn(*mut Context, *mut RasterizerState),
     // 44 RSSetViewports
@@ -476,7 +527,15 @@ struct ContextVtbl {
     _pad_49: [usize; 1], // 49 CopyStructureCount
     // 50 ClearRenderTargetView
     clear_render_target_view: unsafe extern "system" fn(*mut Context, *mut Rtv, *const f32),
-    _pad_51_110: [usize; 60], // 51..=110 the stages this shell never touches
+    _pad_51_52: [usize; 2], // 51..=52 unordered-access clears
+    // 53 ClearDepthStencilView
+    #[cfg_attr(not(feature = "3d"), allow(dead_code))]
+    clear_depth_stencil_view: unsafe extern "system" fn(*mut Context, *mut Dsv, u32, f32, u8),
+    _pad_54_56: [usize; 3], // 54 GenerateMips, 55..=56 resource LOD
+    // 57 ResolveSubresource (both resources are any ID3D11Resource)
+    #[cfg_attr(not(feature = "3d"), allow(dead_code))]
+    resolve_subresource: unsafe extern "system" fn(*mut Context, *mut c_void, u32, *mut c_void, u32, u32),
+    _pad_58_110: [usize; 53], // 58..=110 the stages this shell never touches
     // 111 Flush
     flush: unsafe extern "system" fn(*mut Context),
 }
@@ -691,6 +750,14 @@ struct SamplerState {
 }
 #[repr(C)]
 struct Query {
+    _opaque: [u8; 0],
+}
+#[repr(C)]
+pub(crate) struct Dsv {
+    _opaque: [u8; 0],
+}
+#[repr(C)]
+pub(crate) struct DepthStencilState {
     _opaque: [u8; 0],
 }
 
@@ -1240,10 +1307,6 @@ unsafe fn compile_shader(
     target: &str,
     driver: Driver,
 ) -> Option<Com<Blob>> {
-    let entry = CString::new(entry).expect("entry without NUL");
-    let target = CString::new(target).expect("target without NUL");
-    let mut code: *mut Blob = null_mut();
-    let mut errors: *mut Blob = null_mut();
     let defines = [
         ShaderDefine { name: c"BUNNY_GLASS_BYTE_PRECISION".as_ptr(), definition: c"1".as_ptr() },
         ShaderDefine { name: null(), definition: null() },
@@ -1252,16 +1315,33 @@ unsafe fn compile_shader(
         Driver::Hardware => null(),
         Driver::Warp => defines.as_ptr().cast(),
     };
+    unsafe { compile_source(compile, SHADER_SOURCE, entry, target, defines, 0) }
+}
+
+/// One entry of `source`, with `defines` (a null-ended list, or null)
+/// and the compiler's `flags`.
+unsafe fn compile_source(
+    compile: D3dCompileFn,
+    source: &str,
+    entry: &str,
+    target: &str,
+    defines: *const c_void,
+    flags: u32,
+) -> Option<Com<Blob>> {
+    let entry = CString::new(entry).expect("entry without NUL");
+    let target = CString::new(target).expect("target without NUL");
+    let mut code: *mut Blob = null_mut();
+    let mut errors: *mut Blob = null_mut();
     let hr = unsafe {
         compile(
-            SHADER_SOURCE.as_ptr() as *const c_void,
-            SHADER_SOURCE.len(),
+            source.as_ptr() as *const c_void,
+            source.len(),
             null(),
             defines,
             null(),
             entry.as_ptr(),
             target.as_ptr(),
-            0,
+            flags,
             0,
             &mut code,
             &mut errors,
@@ -1521,7 +1601,6 @@ impl D3dStack {
     /// One pass over `target`: clear to `canvas`, then the runs in paint
     /// order — the pipeline swaps only where rects and text alternate.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     unsafe fn encode_frame(
         &self,
         target: *mut Rtv,
@@ -1535,6 +1614,7 @@ impl D3dStack {
         atlas_srv: *mut Srv,
         textures: &[*mut Srv],
         glass: Option<&GlassTargets>,
+        worlds: &WorldRuns,
     ) {
         let context = self.context.as_ptr();
         unsafe {
@@ -1638,10 +1718,21 @@ impl D3dStack {
                         }
                         // answered above, in passes of its own
                         RunKind::Glass => continue,
-                        // no world pass on this tier yet: its ground opens
-                        // no world door, and the walk shows the oracle's
-                        // picture through the live road
-                        RunKind::World(_) => continue,
+                        // a world's target, composited with the box's veil
+                        // and its clip — the sprite's road, another shader
+                        RunKind::World(index) => {
+                            let picture = worlds.targets.get(index as usize).copied().unwrap_or(null_mut());
+                            if worlds.composite.is_null() || picture.is_null() {
+                                continue;
+                            }
+                            (vtbl.vs_set_shader)(context, self.sprite_vs.as_ptr(), null(), 0);
+                            (vtbl.ps_set_shader)(context, worlds.composite, null(), 0);
+                            (vtbl.vs_set_shader_resources)(context, 0, 1, &sprite_srv);
+                            (vtbl.ps_set_shader_resources)(context, 0, 1, &sprite_srv);
+                            (vtbl.ps_set_shader_resources)(context, 1, 1, &picture);
+                            let sampler = self.sampler.as_ptr();
+                            (vtbl.ps_set_samplers)(context, 0, 1, &sampler);
+                        }
                     }
                     bound = Some(run.kind);
                 }
@@ -1890,12 +1981,48 @@ struct D3dGround {
     /// The dedicated and live textures, by the handle the walk was given.
     textures: HashMap<u64, (Com<Texture2d>, Com<Srv>)>,
     next: u64,
+    /// The world pass: its shaders compile the first time a box paints
+    /// a world.
+    #[cfg(feature = "3d")]
+    world: world::D3dWorld,
 }
 
 impl D3dGround {
     fn new(device: *mut Device, context: *mut Context) -> D3dGround {
-        D3dGround { device, context, shared: None, textures: HashMap::new(), next: 1 }
+        D3dGround {
+            device,
+            context,
+            shared: None,
+            textures: HashMap::new(),
+            next: 1,
+            #[cfg(feature = "3d")]
+            world: world::D3dWorld::new(device, context),
+        }
     }
+
+    /// What the 2D pass composites the frame's world runs with.
+    #[cfg(feature = "3d")]
+    fn world_runs(&self, handles: &[u64]) -> WorldRuns {
+        self.world.runs(handles)
+    }
+
+    #[cfg(not(feature = "3d"))]
+    fn world_runs(&self, _: &[u64]) -> WorldRuns {
+        WorldRuns::none()
+    }
+
+    /// Draws the worlds that moved, each into its own target, before the
+    /// 2D pass samples them; the walk then holds them as drawn.
+    #[cfg(feature = "3d")]
+    fn encode_worlds(&mut self, atlas: &mut RunAtlas, batches: &FrameBatches) {
+        if !batches.worlds.is_empty() {
+            self.world.encode(&batches.worlds);
+            atlas.worlds.drawn();
+        }
+    }
+
+    #[cfg(not(feature = "3d"))]
+    fn encode_worlds(&mut self, _: &mut RunAtlas, _: &FrameBatches) {}
 
     fn shared_srv(&self) -> *mut Srv {
         self.shared.as_ref().map_or(null_mut(), |(_, srv)| srv.as_ptr())
@@ -1978,6 +2105,25 @@ impl AtlasGround for D3dGround {
 
     fn drop_live(&mut self, id: u64) {
         self.textures.remove(&id);
+    }
+
+    #[cfg(feature = "3d")]
+    fn world(&mut self) -> Option<&mut dyn bunny_ui::gpu::world::WorldGround> {
+        self.world.door()
+    }
+}
+
+/// What the 2D pass composites a world's target with: the pixel shader,
+/// and each world run's target view by the index the run carries. Null
+/// and empty on a stack that draws no world.
+struct WorldRuns {
+    composite: *mut PixelShader,
+    targets: Vec<*mut Srv>,
+}
+
+impl WorldRuns {
+    fn none() -> WorldRuns {
+        WorldRuns { composite: null_mut(), targets: Vec::new() }
     }
 }
 
@@ -2604,6 +2750,7 @@ impl D3dPresenter {
         if !upload_frame(&mut self.slots[index], device, context, &self.batches) {
             return Presented::DeviceLost;
         }
+        self.ground.encode_worlds(&mut self.atlas, &self.batches);
         let backbuffer = self.rtv.as_ref().expect("the view was just made").as_ptr();
         let target = self
             .intermediate
@@ -2622,6 +2769,7 @@ impl D3dPresenter {
                 self.ground.shared_srv(),
                 &self.ground.bound(&self.batches.textures),
                 self.glass.as_ref().filter(|_| !self.batches.glass.is_empty()),
+                &self.ground.world_runs(&self.batches.world_targets),
             );
             if let Some((_, _, srv, _)) = &self.intermediate {
                 // the StretchBlt of the GPU road: one bilinear triangle
@@ -3015,6 +3163,7 @@ impl OffscreenD3d {
         if !upload_frame(&mut self.slots[index], device, context, &self.batches) {
             return;
         }
+        self.ground.encode_worlds(&mut self.atlas, &self.batches);
         unsafe {
             self.stack.encode_frame(
                 self.target_rtv.as_ptr(),
@@ -3028,6 +3177,7 @@ impl OffscreenD3d {
                 self.ground.shared_srv(),
                 &self.ground.bound(&self.batches.textures),
                 self.glass.as_ref().filter(|_| !self.batches.glass.is_empty()),
+                &self.ground.world_runs(&self.batches.world_targets),
             );
         }
         mark_in_flight(&mut self.slots[index], device, context);
@@ -3066,6 +3216,27 @@ impl OffscreenD3d {
         images: &dyn ImageEngine,
     ) {
         self.present_inner(display, scale, canvas, text, images, false);
+    }
+
+    /// One world frame drawn by the world pass alone and read back:
+    /// premultiplied, sRGB-encoded RGBA8, the top row first — what the
+    /// CPU's `soft::draw` gives for the same frame. `None` when the world
+    /// pass cannot stand on this device.
+    #[cfg(feature = "3d")]
+    pub fn world_rgba(&mut self, frame: &std::rc::Rc<bunny_ui::world::WorldFrame>) -> Option<Vec<u8>> {
+        self.world_rgba_with(frame, &bunny_ui::image_engine::RawImages::default())
+    }
+
+    /// [`OffscreenD3d::world_rgba`] with textures, decoded by `images`.
+    #[cfg(feature = "3d")]
+    pub fn world_rgba_with(&mut self, frame: &std::rc::Rc<bunny_ui::world::WorldFrame>, images: &dyn ImageEngine) -> Option<Vec<u8>> {
+        self.ground.world.draw_single(frame, images)
+    }
+
+    /// How many worlds the last frame drew: a held picture draws none.
+    #[cfg(feature = "3d")]
+    pub fn world_jobs(&self) -> usize {
+        self.batches.worlds.len()
     }
 
     /// The atlas footprint — how many cached runs, images and dedicated
