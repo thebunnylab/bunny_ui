@@ -370,6 +370,14 @@ once — and the middle of the three times starts every box that has not
 stepped yet: under 1.5 ms High, under 4 ms Medium, slower Low, whatever
 the device's name said.
 
+While the camera moves — it flies, or it changed in the last quarter
+second (`world::view::SETTLE`) — a miss takes pixels before it takes
+quality: each side of the target goes to 80 %, 64 %, then half, and the
+compositor stretches it to the box; only past half does the quality step
+down, and room to spare gives the pixels back first. A beat after the
+camera rests draws the world at its whole size. A world drawn on the CPU
+does not change size.
+
 A box inside the budget is drawn at its own size. A larger box is drawn
 smaller, and the compositor stretches it to the box. At four samples a
 cut-out surface (`Material::mask`) turns its edge into coverage — the

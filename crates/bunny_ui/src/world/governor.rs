@@ -18,6 +18,12 @@
 //! stretch at a third of that steps up. A world that does not move is
 //! drawn once and governs nothing.
 //!
+//! While a box's camera moves, a world that misses its budget first draws
+//! at fewer pixels — each side down a step at a time, to half — and the
+//! compositor stretches it to the box; only past half does the quality
+//! step down. The frame after the camera settles draws it whole
+//! ([`Governor::scale`]).
+//!
 //! Before any box is weighed, a tier that keeps timers draws a fixed
 //! world off screen a few times ([`probed_quality`]): its time on the GPU
 //! starts every box at the quality the device can carry, whatever its
@@ -52,6 +58,9 @@ const PAUSE: f64 = 0.25;
 const FASTEST_BEAT: f64 = 1.0 / 240.0;
 /// The GPU times the governor weighs, of each kind of frame.
 const TIMED_WINDOW: usize = 30;
+/// The shares of each side a world draws at while its camera moves, a
+/// step down each time it misses its budget.
+const SCALES: [f64; 4] = [1.0, 0.8, 0.64, 0.5];
 /// What nine frames in ten may cost the GPU, in seconds: a frame drawn
 /// whole, and a frame that redraws a part.
 const WHOLE_BUDGET: f64 = 0.010;
@@ -85,6 +94,10 @@ pub(crate) struct Governor {
     part_times: VecDeque<f64>,
     /// Whole frames in a row whose GPU time had room to spare.
     timed_room: u32,
+    /// Into [`SCALES`]: the share of each side drawn while the camera moves.
+    scale: usize,
+    /// Whether the box's camera moves now.
+    camera_moving: bool,
 }
 
 impl Governor {
@@ -102,7 +115,21 @@ impl Governor {
             whole_times: VecDeque::with_capacity(TIMED_WINDOW),
             part_times: VecDeque::with_capacity(TIMED_WINDOW),
             timed_room: 0,
+            scale: 0,
+            camera_moving: false,
         }
+    }
+
+    /// The share of each side the world draws at while its camera moves;
+    /// a camera at rest draws it whole.
+    pub(crate) fn scale(&self) -> f64 {
+        SCALES[self.scale]
+    }
+
+    /// Whether the box's camera moves now: a miss then takes pixels before
+    /// it takes quality.
+    pub(crate) fn camera_moves(&mut self, moving: bool) {
+        self.camera_moving = moving;
     }
 
     /// The quality to draw at when the world asks for `asked`.
@@ -146,7 +173,7 @@ impl Governor {
             self.long.pop_front();
         }
         if self.long.len() >= LONG_FRAMES {
-            self.step_down();
+            self.over_budget();
             return;
         }
         if self.beats.len() < WINDOW {
@@ -154,11 +181,11 @@ impl Governor {
         }
         let slow = self.slow_end();
         if slow > self.shortest * OVER_BEAT {
-            self.step_down();
+            self.over_budget();
         } else if slow <= self.shortest * ROOM_BEAT {
             self.room += 1;
             if self.room >= ROOM_FRAMES {
-                self.step_up();
+                self.under_budget();
             }
         } else {
             self.room = 0;
@@ -182,15 +209,48 @@ impl Governor {
         let slow = percentile(window);
         let budget = if whole { WHOLE_BUDGET } else { PART_BUDGET };
         if slow > budget {
-            self.step_down();
+            self.over_budget();
         } else if whole && slow < budget * TIMED_ROOM {
             self.timed_room += 1;
-            if self.timed_room >= TIMED_ROOM_FRAMES {
-                self.step_up();
+            // pixels come back sooner than a quality does
+            let wait = if self.scale > 0 { TIMED_WINDOW as u32 } else { TIMED_ROOM_FRAMES };
+            if self.timed_room >= wait {
+                self.under_budget();
             }
         } else if whole {
             self.timed_room = 0;
         }
+    }
+
+    /// A miss: while the camera moves, a step of pixels first; then a step
+    /// of quality.
+    fn over_budget(&mut self) {
+        if self.camera_moving && self.scale + 1 < SCALES.len() {
+            self.scale += 1;
+            self.forget();
+        } else {
+            self.step_down();
+        }
+    }
+
+    /// Room to spare: the pixels back first, then a step of quality.
+    fn under_budget(&mut self) {
+        if self.scale > 0 {
+            self.scale -= 1;
+            self.forget();
+        } else {
+            self.step_up();
+        }
+    }
+
+    /// The next window weighs what changed alone.
+    fn forget(&mut self) {
+        self.beats.clear();
+        self.long.clear();
+        self.room = 0;
+        self.whole_times.clear();
+        self.part_times.clear();
+        self.timed_room = 0;
     }
 
     /// The beat nine frames in ten keep under.
@@ -383,6 +443,36 @@ mod tests {
         governor.timed(f64::NAN, true);
         governor.timed(-1.0, true);
         assert_eq!(governor.whole_times.len(), held);
+    }
+
+    #[test]
+    fn a_moving_camera_gives_pixels_before_quality_and_takes_them_back_first() {
+        let mut governor = Governor::new(Quality::High);
+        governor.camera_moves(true);
+        let window = |governor: &mut Governor, seconds: f64| {
+            for _ in 0..TIMED_WINDOW {
+                governor.timed(seconds, true);
+            }
+        };
+        for (step, scale) in [0.8, 0.64, 0.5].into_iter().enumerate() {
+            window(&mut governor, 0.014);
+            assert_eq!((governor.scale(), governor.quality(Quality::High)), (scale, Quality::High), "step {step}");
+        }
+        // past half a side, the quality gives way
+        window(&mut governor, 0.014);
+        assert_eq!((governor.scale(), governor.quality(Quality::High)), (0.5, Quality::Medium));
+        // room to spare gives the pixels back before a quality, a step a
+        // window and a half
+        window(&mut governor, 0.001);
+        window(&mut governor, 0.001);
+        assert_eq!((governor.scale(), governor.quality(Quality::High)), (0.64, Quality::Medium));
+        window(&mut governor, 0.001);
+        window(&mut governor, 0.001);
+        assert_eq!((governor.scale(), governor.quality(Quality::High)), (0.8, Quality::Medium));
+        // a camera at rest misses in quality alone
+        let mut still = Governor::new(Quality::High);
+        window(&mut still, 0.014);
+        assert_eq!((still.scale(), still.quality(Quality::High)), (1.0, Quality::Medium));
     }
 
     #[test]

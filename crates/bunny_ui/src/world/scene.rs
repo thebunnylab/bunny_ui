@@ -337,6 +337,34 @@ mod tests {
     }
 
     #[test]
+    fn a_camera_that_moved_draws_whole_once_it_rests() {
+        let (runtime, viewer, _) = mount();
+        let shot = |list: &crate::layout::DisplayList| {
+            list.iter()
+                .find_map(|command| match command {
+                    DrawCommand::Image { source: crate::image_engine::ImageSource::World { generation, shot, .. }, .. } => {
+                        Some((*generation, shot.is_camera_moving()))
+                    }
+                    _ => None,
+                })
+                .expect("a world")
+        };
+        let (_, moving) = shot(&runtime.display_frame(&viewer, SIZE));
+        assert!(!moving, "a camera that never changed rests");
+        viewer.camera.set(Camera::looking_at(vec3(2.0, 1.0, 6.0), Vec3::ZERO));
+        let (turned, moving) = shot(&runtime.display_frame(&viewer, SIZE));
+        assert!(moving && runtime.wants_frame(), "it moves, and a beat comes to see it rest");
+        runtime.tick(super::super::view::SETTLE / 2.0);
+        assert_eq!(shot(&runtime.display_frame(&viewer, SIZE)), (turned, true), "the same picture while it may still move");
+        runtime.tick(super::super::view::SETTLE);
+        let (rested, moving) = shot(&runtime.display_frame(&viewer, SIZE));
+        assert!(!moving && rested != turned, "at rest, a picture of its own");
+        runtime.tick(0.01);
+        assert!(!runtime.wants_frame(), "and then no beat at all");
+        assert_eq!(BODIES.with(Cell::get), 0, "no body ran");
+    }
+
+    #[test]
     fn a_label_follows_the_camera_without_a_body() {
         let (runtime, viewer, cube) = mount();
         viewer.picked.set(Some(cube));

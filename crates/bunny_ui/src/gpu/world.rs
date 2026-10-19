@@ -326,6 +326,14 @@ pub(crate) struct ResolvedWorld {
     pub job: Option<WorldJob>,
 }
 
+/// `size` with each side at `share` of itself, at least a pixel.
+fn scaled(size: (u32, u32), share: f64) -> (u32, u32) {
+    if share >= 1.0 {
+        return size;
+    }
+    (((size.0 as f64 * share).floor() as u32).max(1), ((size.1 as f64 * share).floor() as u32).max(1))
+}
+
 /// Walks a target may sit unread before it is given back.
 pub const TARGET_IDLE_WALKS: u64 = 120;
 /// The probe's picture, and how many times it is drawn.
@@ -492,8 +500,12 @@ impl WorldResidency {
             _ => caps.start,
         };
         let governor = self.governors.entry(slot).or_insert_with(|| Governor::new(start));
+        governor.camera_moves(shot.is_camera_moving());
         let quality = governor.quality(shot.style().quality);
         let size = quality.target_size(box_px);
+        // a moving camera draws at the governor's share of each side, and
+        // the box stretches it; at rest, whole
+        let size = if shot.is_camera_moving() { scaled(size, governor.scale()) } else { size };
         let samples = quality.samples().min(caps.samples).max(1);
         let walk = self.walk;
         let target = match self.targets.get_mut(&slot) {
@@ -1129,6 +1141,35 @@ mod tests {
         }
         let quality = residency.governors.get(&7).expect("the box's governor").quality(Quality::High);
         assert_eq!(quality, Quality::Medium, "a window of whole frames over 10 ms steps down once");
+    }
+
+    #[test]
+    fn a_moving_camera_draws_fewer_pixels_while_it_misses_and_whole_at_rest() {
+        let (world, _) = cube_world();
+        let (mut ground, mut residency) = (Ledger::new(), WorldResidency::default());
+        let images = RawImages::default();
+        let style = WorldStyle { quality: Quality::High, ..WorldStyle::default() };
+        let shot = |yaw: f64, moving: bool| {
+            Shot::new(world.with(WorldData::clone), Camera::orbiting(Vec3::ZERO, yaw, 25.0, 5.0), style.clone(), 0.0, (100.0, 80.0)).camera_moving(moving)
+        };
+        let mut sizes = Vec::new();
+        for walk in 1..=31u64 {
+            residency.begin_walk(walk);
+            let resolved = residency.resolve(&mut ground, &images, &shot(walk as f64, true), 7, walk, (200, 160)).expect("a target");
+            sizes.push(resolved.size);
+            let job = resolved.job.expect("a job");
+            residency.drawn();
+            ground.timings.push(WorldTiming { target: job.target, seconds: 0.014 });
+            residency.retire(&mut ground);
+        }
+        // a window over budget takes a step of pixels, not of quality
+        assert_eq!((sizes[0], sizes[30]), ((200, 160), (160, 128)));
+        assert_eq!(residency.governors[&7].quality(Quality::High), Quality::High);
+        // the camera rests: the same picture, drawn whole
+        residency.begin_walk(32);
+        let resolved = residency.resolve(&mut ground, &images, &shot(31.0, false), 7, 32, (200, 160)).expect("a target");
+        assert_eq!(resolved.size, (200, 160));
+        assert_eq!(resolved.job.expect("a job").redraw, Redraw::Whole);
     }
 
     #[test]
