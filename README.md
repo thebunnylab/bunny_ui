@@ -30,7 +30,7 @@ nothing to pick by hand. A crate that only builds views, such as a component
 library or a theme, leaves the shell to the application:
 
 ```toml
-bunny-ui = { version = "0.2", default-features = false }
+bunny-ui = { version = "0.3", default-features = false }
 ```
 
 To start an app with every platform's files already in place, the `bunny`
