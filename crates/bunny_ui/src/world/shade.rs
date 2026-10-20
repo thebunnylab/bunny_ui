@@ -168,8 +168,7 @@ pub fn tone(color: V3, exposure: f32, knee: f32) -> V3 {
 
 /// The 4×4 ordered dither at a pixel, in `(−½, ½)`.
 pub fn bayer(x: u32, y: u32) -> f32 {
-    const B: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
-    (B[(y & 3) as usize][(x & 3) as usize] as f32 + 0.5) / 16.0 - 0.5
+    (super::bloom::bayer_index(x, y) as f32 + 0.5) / 16.0 - 0.5
 }
 
 /// A surface point as a shader sees it.
@@ -188,7 +187,19 @@ pub struct Surface {
     pub occlusion: f32,
     /// The light groups the surface belongs to.
     pub groups: u32,
+    /// How much of the sun reaches the point: 1 in full light, 0 in the
+    /// sun's shadow.
+    pub shadow: f32,
+    /// What the floor map gives the point: linear light added, and in
+    /// `[3]` the share of the sky's light that reaches it. `[0, 0, 0, 1]`
+    /// for a surface that reads none.
+    pub floor: [f32; 4],
+    /// Multiplies the light from the sky and the ground (linear).
+    pub ambient: V3,
 }
+
+/// What a surface that reads no floor map reads.
+pub const NO_FLOOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
 /// The light a surface sends toward the eye, before the tone curve.
 pub fn lit(u: &super::wire::FrameUniforms, surface: &Surface) -> V3 {
@@ -202,8 +213,9 @@ pub fn lit(u: &super::wire::FrameUniforms, surface: &Surface) -> V3 {
     let r = surface.roughness.clamp(0.045, 1.0);
     let (a, a2) = (r * r, r * r * r * r);
     let up = [u.sky_up[0], u.sky_up[1], u.sky_up[2]];
-    let (sky, ground) = ([u.sky_color[0], u.sky_color[1], u.sky_color[2]], [u.ground_color[0], u.ground_color[1], u.ground_color[2]]);
-    let ao = 1.0 + (surface.occlusion - 1.0) * 0.8;
+    let sky = mul([u.sky_color[0], u.sky_color[1], u.sky_color[2]], surface.ambient);
+    let ground = mul([u.ground_color[0], u.ground_color[1], u.ground_color[2]], surface.ambient);
+    let ao = (1.0 + (surface.occlusion - 1.0) * 0.8) * surface.floor[3];
 
     let mut light = scale(mul(diffuse, hemisphere(n, up, sky, ground)), ao);
     let reflected = add(scale(n, 2.0 * dot(n, v)), scale(v, -1.0));
@@ -224,7 +236,7 @@ pub fn lit(u: &super::wire::FrameUniforms, surface: &Surface) -> V3 {
             let fresnel = add(f0, scale(add([1.0, 1.0, 1.0], scale(f0, -1.0)), x5));
             let specular = scale(fresnel, pi_d * visibility);
             let sun = [u.sun_color[0], u.sun_color[1], u.sun_color[2]];
-            light = add(light, scale(mul(add(diffuse, specular), sun), n_dot_l));
+            light = add(light, scale(mul(add(diffuse, specular), sun), n_dot_l * surface.shadow));
         }
     }
 
@@ -248,6 +260,7 @@ pub fn lit(u: &super::wire::FrameUniforms, surface: &Surface) -> V3 {
         light = add(light, scale(mul(diffuse, color), attenuation * saturate(dot(n, l))));
     }
 
+    light = add(light, mul(diffuse, [surface.floor[0], surface.floor[1], surface.floor[2]]));
     add(light, surface.emissive)
 }
 

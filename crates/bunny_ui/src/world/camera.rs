@@ -153,6 +153,7 @@ impl Camera {
         }
         let s = t * t * (3.0 - 2.0 * t);
         let target = flight.from_target.lerp(self.target, s);
+        let blend = |a: f64, b: f64| (a.ln() + (b.ln() - a.ln()) * s).exp();
         let eye = match (spherical(flight.from_eye - flight.from_target), spherical(self.eye - self.target)) {
             (Some(a), Some(b)) if self.up == Vec3::Y => {
                 // around the target, the short way: a turn stays a turn
@@ -162,8 +163,18 @@ impl Camera {
                 } else if yaw < -std::f64::consts::PI {
                     yaw += std::f64::consts::TAU;
                 }
-                let distance = (a.2.ln() + (b.2.ln() - a.2.ln()) * s).exp();
-                target + direction_of(a.0 + yaw * s, a.1 + (b.1 - a.1) * s) * distance
+                let direction = direction_of(a.0 + yaw * s, a.1 + (b.1 - a.1) * s);
+                // a lens of another kind: a dolly zoom — the angle closes
+                // (or opens) as the eye backs away (or comes in), and the
+                // target's plane keeps its framing all the way
+                if let Some((from_k, to_k)) = dolly(flight.from_lens, self.lens) {
+                    let from_height = Camera { eye: flight.from_eye, target: flight.from_target, lens: flight.from_lens, flight: None, ..*self }.view_height();
+                    let height = blend(from_height, self.view_height());
+                    let k = blend(from_k, to_k);
+                    let lens = Lens::Perspective { fov_y_degrees: (2.0 * k.atan()).to_degrees() };
+                    return Camera { eye: target + direction * (height / (2.0 * k)), target, lens, ..*self };
+                }
+                target + direction * blend(a.2, b.2)
             }
             _ => flight.from_eye.lerp(self.eye, s),
         };
@@ -174,7 +185,8 @@ impl Camera {
             (Lens::Parallel { height: a }, Lens::Parallel { height: b }) => {
                 Lens::Parallel { height: (a.ln() + (b.ln() - a.ln()) * s).exp() }
             }
-            // a lens of another kind changes at the end
+            // a lens of another kind, off the turning path, changes at
+            // the end
             (from, _) => from,
         };
         Camera { eye, target, lens, ..*self }
@@ -297,6 +309,23 @@ pub(crate) fn direction_of(yaw: f64, pitch: f64) -> Vec3 {
     vec3(pitch.cos() * yaw.sin(), pitch.sin(), pitch.cos() * yaw.cos())
 }
 
+/// How narrow a dolly zoom's angle gets before the parallel lens takes
+/// over: a fiftieth of the perspective's, where the two pictures differ
+/// by less than a pixel at the target's plane.
+const DOLLY_FLOOR: f64 = 0.02;
+
+/// The half-angle tangents a flight between a perspective and a parallel
+/// lens runs between, the parallel end at the floor; `None` for a flight
+/// that keeps its lens's kind.
+fn dolly(from: Lens, to: Lens) -> Option<(f64, f64)> {
+    let tangent = |degrees: f64| (degrees.to_radians() * 0.5).tan();
+    match (from, to) {
+        (Lens::Perspective { fov_y_degrees }, Lens::Parallel { .. }) => Some((tangent(fov_y_degrees), tangent(fov_y_degrees) * DOLLY_FLOOR)),
+        (Lens::Parallel { .. }, Lens::Perspective { fov_y_degrees }) => Some((tangent(fov_y_degrees) * DOLLY_FLOOR, tangent(fov_y_degrees))),
+        _ => None,
+    }
+}
+
 /// `(yaw, pitch, distance)` of an offset from a target; `None` for no
 /// offset at all.
 pub(crate) fn spherical(offset: Vec3) -> Option<(f64, f64, f64)> {
@@ -370,6 +399,28 @@ mod tests {
         let back = Camera::orbiting(Vec3::ZERO, 170.0, 30.0, 10.0).fly_to(Camera::orbiting(Vec3::ZERO, -170.0, 30.0, 10.0), 1.0);
         let (yaw, _, _) = spherical(back.at(start + 0.5).eye).unwrap();
         assert!(close(yaw.abs().to_degrees(), 180.0, 1e-9), "{}", yaw.to_degrees());
+    }
+
+    #[test]
+    fn a_flight_to_another_lens_keeps_the_target_framed() {
+        motor::task::advance(0.0);
+        let start = motor::task::now();
+        let free = Camera::orbiting(Vec3::ZERO, 20.0, 30.0, 10.0);
+        let plan = Camera::orbiting(Vec3::ZERO, 45.0, 35.264, 12.0).parallel_height(6.0);
+        for (from, to) in [(free, plan), (plan, free)] {
+            let flying = from.fly_to(to, 1.0);
+            let mut last = from.view_height();
+            for step in 1..100 {
+                let now = flying.at(start + step as f64 / 100.0);
+                assert!(matches!(now.lens, Lens::Perspective { .. }), "a perspective all the way");
+                let height = now.view_height();
+                // the framed height glides from one end to the other
+                assert!((height / last - 1.0).abs() < 0.03, "a jump at {step}: {last} to {height}");
+                last = height;
+            }
+            assert!((last / to.view_height() - 1.0).abs() < 0.03, "the last step meets the landing: {last}");
+            assert_eq!(flying.at(start + 1.0), to, "and the landing is the destination, exactly");
+        }
     }
 
     #[test]

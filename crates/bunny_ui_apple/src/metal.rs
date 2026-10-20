@@ -80,7 +80,7 @@ mod world {
             None
         }
 
-        pub(super) unsafe fn encode(&self, _command: Id, _sels: &super::Sels, _pass_class: Id, _staging: Id) {}
+        pub(super) unsafe fn encode(&self, _command: Id, _queue: Id, _sels: &super::Sels, _pass_class: Id, _staging: Id) {}
     }
 }
 
@@ -1078,7 +1078,7 @@ impl MetalStack {
             }
             // the worlds next, each into its own target: the 2D pass
             // below samples them
-            frame.worlds.encode(command, &self.sels, self.pass_class, frame.staging);
+            frame.worlds.encode(command, self.queue, &self.sels, self.pass_class, frame.staging);
             let mut cleared = false;
             let mut index = 0;
             while index < frame.runs.len() {
@@ -1800,9 +1800,16 @@ impl MetalGround {
     unsafe fn prepare_worlds(&mut self, batches: &FrameBatches) -> world::FramePass {
         let mut staged = Vec::with_capacity(batches.worlds.len());
         for job in &batches.worlds {
-            let (instances, materials) = world::staged_bytes(job);
+            let bytes = world::staged_bytes(job);
             let mut place = |bytes: &[u8]| if bytes.is_empty() { 0 } else { unsafe { self.stage(bytes) } };
-            staged.push((place(&instances), place(&materials)));
+            staged.push(world::StagedAt {
+                instances: place(&bytes.instances),
+                materials: place(&bytes.materials),
+                casters: place(&bytes.casters),
+                moving_casters: place(&bytes.moving_casters),
+                parts: place(&bytes.parts),
+                joints: place(&bytes.joints),
+            });
         }
         self.world.prepare(batches, &staged)
     }
@@ -3725,9 +3732,50 @@ impl OffscreenGpu {
 
     /// [`OffscreenGpu::world_rgba`] with textures, decoded by `images`.
     pub fn world_rgba_with(&mut self, frame: &Rc<bunny_ui::world::WorldFrame>, images: &dyn ImageEngine) -> Option<Vec<u8>> {
-        use bunny_ui::gpu::world::WorldGround;
         unsafe {
             let pool = objc_autoreleasePoolPush();
+            let job = self.run_world_job(|world| world::single_job(world, frame, images));
+            let bytes = job.as_ref().and_then(|job| world::read_target(&self.ground.world, job.target, &self.stack.sels));
+            if let Some(job) = job {
+                job.give_back(&mut self.ground.world);
+            }
+            objc_autoreleasePoolPop(pool);
+            bytes
+        }
+    }
+
+    /// `before` drawn whole, then `after` over it as a box draws its next
+    /// frame — slid by `shift`, then `rects` drawn again
+    /// ([`bunny_ui::gpu::world::WorldJob::over`]) — read back: what `after`
+    /// drawn whole gives, when the redraw is right.
+    pub fn world_over_rgba(
+        &mut self,
+        before: &Rc<bunny_ui::world::WorldFrame>,
+        after: &Rc<bunny_ui::world::WorldFrame>,
+        shift: [i32; 2],
+        rects: &[[u32; 4]],
+    ) -> Option<Vec<u8>> {
+        let images = bunny_ui::image_engine::RawImages::default();
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let under = self.run_world_job(|world| world::single_job(world, before, &images));
+            let over = under.as_ref().and_then(|under| self.run_world_job(|world| world::over_job(world, under, after, &images, shift, rects.to_vec())));
+            let bytes = over.as_ref().and_then(|over| world::read_target(&self.ground.world, over.target, &self.stack.sels));
+            if let Some(over) = over {
+                over.give_back_over(&mut self.ground.world);
+            }
+            if let Some(under) = under {
+                under.give_back(&mut self.ground.world);
+            }
+            objc_autoreleasePoolPop(pool);
+            bytes
+        }
+    }
+
+    /// One world job, made by `make` in a slot of its own, drawn and waited
+    /// for.
+    unsafe fn run_world_job(&mut self, make: impl FnOnce(&mut world::MetalWorld) -> Option<bunny_ui::gpu::world::WorldJob>) -> Option<bunny_ui::gpu::world::WorldJob> {
+        unsafe {
             poll_uploads(&mut self.slots, &mut self.atlas, &self.stack.sels);
             let index = acquire_slot(
                 &mut self.slots,
@@ -3737,38 +3785,22 @@ impl OffscreenGpu {
             )
             .index;
             self.ground.begin_slot(index, &mut self.atlas);
-            let Some(job) = world::single_job(&mut self.ground.world, frame, images) else {
-                objc_autoreleasePoolPop(pool);
-                return None;
-            };
+            let job = make(&mut self.ground.world)?;
             let mut batches = FrameBatches::default();
             batches.worlds.push(job.clone());
             let pass = self.ground.prepare_worlds(&batches);
             let command = msg_id(self.stack.queue, self.stack.sels.command_buffer);
-            pass.encode(command, &self.stack.sels, self.stack.pass_class, self.ground.staging_buffer());
+            pass.encode(command, self.stack.queue, &self.stack.sels, self.stack.pass_class, self.ground.staging_buffer());
             msg_void(command, self.stack.sels.commit);
             msg_void(command, self.stack.sels.wait_completed);
-            let bytes = world::read_target(&self.ground.world, job.target, &self.stack.sels);
-            let door = &mut self.ground.world;
-            door.drop_target(job.target);
-            for id in job.meshes {
-                door.drop_mesh(id);
-            }
-            for id in job.segments {
-                door.drop_segments(id);
-            }
-            for id in job.textures.into_iter().flatten() {
-                door.drop_texture(id);
-            }
-            objc_autoreleasePoolPop(pool);
-            bytes
+            Some(job)
         }
     }
 
     /// The world jobs the last walk made: none when every world on screen
     /// held its picture.
     pub fn world_jobs(&self) -> usize {
-        self.batches.worlds.len()
+        self.batches.box_worlds()
     }
 }
 

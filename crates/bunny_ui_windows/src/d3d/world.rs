@@ -15,8 +15,21 @@
 //! the shaders read by index — the same road the 2D pass takes, with no
 //! input layout.
 //!
+//! A frame whose sun casts draws its casters first, when the box's map
+//! does not hold them yet: a pass of depth alone, no pixel stage, into a
+//! 16-bit map the surfaces read through a comparing sampler (`t5`, `s2`).
+//! What moves casts into a second map of its own the same way (`t13`,
+//! `s3`), so a walk never draws the still casters again. A frame without
+//! a map binds a texel and a sampler whose comparison always passes.
+//!
 //! The world shaders are compiled the first time a box paints a world:
 //! an app that shows none never pays for them.
+//!
+//! A frame with a bloom draws each pixel's glow beside its colour, into a
+//! second view of one byte (`SV_Target1`), and after the resolve runs the
+//! chain of `bunny_ui::world::bloom`: draws into small textures of the
+//! target's own (`t9`, `t10`, `b3`), and the spill blended over the
+//! target as a screen.
 //!
 //! The pass leaves the 2D pass's ground as it found it: the 2D pass
 //! binds its own targets, shaders, buffers and states, and its sampler
@@ -27,18 +40,21 @@ use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::rc::Rc;
 
-use bunny_ui::gpu::world::{WorldCaps, WorldGround, WorldJob};
+use bunny_ui::gpu::world::{Redraw, WorldCaps, WorldGround, WorldJob, WorldTiming, slide_copy};
 use bunny_ui::image_engine::ImageEngine;
+use bunny_ui::world::bloom::LEVELS;
 use bunny_ui::world::frame::{Background, Blend, DrawKind, WorldFrame};
 use bunny_ui::world::shade::SRGB_DECODE;
-use bunny_ui::world::wire::{SEGMENT_STRIDE, instance_bytes, instance_offset, material_bytes, segment_bytes};
+use bunny_ui::world::wire::{
+    SEGMENT_STRIDE, SHADOW_INSTANCE_STRIDE, instance_bytes, instance_offset, material_bytes, part_bytes, shadow_instance_bytes,
+};
 
 use super::{
-    BIND_RENDER_TARGET, BIND_SHADER_RESOURCE, BLEND_INV_SRC_ALPHA, BLEND_ONE, BLEND_OP_ADD, BlendDesc, BlendState, Blob,
-    Buffer, BufferDesc, COMPARISON_NEVER, CPU_ACCESS_READ, CULL_NONE, Context, DepthStencilDesc,
+    ADDRESS_CLAMP, BIND_RENDER_TARGET, BIND_SHADER_RESOURCE, BLEND_INV_SRC_ALPHA, BLEND_ONE, BLEND_OP_ADD, BlendDesc, BlendState, Blob,
+    Buffer, BufferDesc, COMPARISON_NEVER, CPU_ACCESS_READ, CULL_NONE, Context, D3dBox, D3dRect, DepthStencilDesc,
     DepthStencilOpDesc, DepthStencilState, Device, Dsv, FILL_SOLID, FILTER_MIN_MAG_MIP_LINEAR, FORMAT_RGBA8,
     FORMAT_RGBA8_SRGB, FORMAT_UNKNOWN, MAP_READ, MAP_WRITE_DISCARD, MISC_BUFFER_STRUCTURED, MappedSubresource,
-    PixelShader, RasterizerDesc, RasterizerState, RenderTargetBlendDesc, Rtv, SHADER_SOURCE, SRV_DIMENSION_BUFFER,
+    PixelShader, Query, QueryDesc, RasterizerDesc, RasterizerState, RenderTargetBlendDesc, Rtv, S_OK, SHADER_SOURCE, SRV_DIMENSION_BUFFER,
     SamplerDesc, SamplerState, SlotBuffer, Srv, SrvDesc, SubresourceData, TOPOLOGY_TRIANGLELIST, Texture2d,
     Texture2dDesc, USAGE_DEFAULT, USAGE_STAGING, VertexShader, Viewport, WorldRuns, blob_bytes, compile_source,
     compiler, make_constant_buffer, make_rtv, make_srv,
@@ -48,7 +64,20 @@ use crate::ffi::{Com, com_ok};
 // MARK: - D3D vocabulary of the world pass (values from the SDK headers)
 
 const FORMAT_D32_FLOAT: u32 = 40;
+const QUERY_TIMESTAMP: u32 = 2;
+const QUERY_TIMESTAMP_DISJOINT: u32 = 3;
+const ASYNC_GETDATA_DONOTFLUSH: u32 = 1;
+/// Jobs the pass keeps waiting to be timed before it lets the oldest go.
+const TIMERS_HELD: usize = 32;
+const FORMAT_R8_UNORM: u32 = 61;
+const BLEND_INV_DEST_COLOR: u32 = 10;
 const FORMAT_R32_UINT: u32 = 42;
+const FORMAT_R16_TYPELESS: u32 = 53;
+const FORMAT_D16_UNORM: u32 = 55;
+const FORMAT_R16_UNORM: u32 = 56;
+const SRV_DIMENSION_TEXTURE2D: u32 = 4;
+const DSV_DIMENSION_TEXTURE2D: u32 = 3;
+const FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT: u32 = 0x94;
 const USAGE_IMMUTABLE: u32 = 1;
 const BIND_INDEX_BUFFER: u32 = 0x2;
 const BIND_DEPTH_STENCIL: u32 = 0x40;
@@ -71,6 +100,7 @@ const COMPILE_IEEE_STRICTNESS: u32 = 1 << 13;
 const DRAW_MASK: u32 = 1;
 const DRAW_TEXTURED: u32 = 2;
 const DRAW_REPLACE: u32 = 4;
+const DRAW_COVERAGE: u32 = 8;
 
 // MARK: - The shaders
 
@@ -97,6 +127,10 @@ struct WorldUniforms {
     float4 point_position[8];
     float4 point_color[8];
     uint4 point_groups[2];
+    float4 floor_u;
+    float4 floor_v;
+    column_major float4x4 moving_from_eye;
+    float4 moving;
 };
 
 struct WorldInstance {
@@ -106,6 +140,10 @@ struct WorldInstance {
     uint material_base;
     uint entity;
     uint flags;
+    uint ambient;
+    uint part_base;
+    uint joint_base;
+    uint morph;
 };
 
 struct WorldMaterial {
@@ -144,10 +182,11 @@ struct WorldDraw {
     float4 line_shape;
 };
 
+// the ramp's ends in codes, the target's size and the backdrop's kind;
+// for a sky, the ground's codes, the world's up and the lens
+// (`WorldFrame::backdrop`)
 struct Backdrop {
-    float4 top;
-    float4 bottom;
-    float4 size;
+    float4 rows[6];
 };
 
 // every cbuffer owns its register: a stricter compiler refuses two on one
@@ -168,11 +207,27 @@ StructuredBuffer<WorldInstance> instances : register(t1);
 StructuredBuffer<WorldMaterial> materials : register(t2);
 Texture2D<float4> picture : register(t3);
 StructuredBuffer<WorldSegment> segments : register(t4);
+Texture2D<float> shadow_map : register(t5);
+// the map of what moves, read the same way
+Texture2D<float> moving_map : register(t13);
+Texture2D<float4> floor_picture : register(t7);
+// the frame's part table: a part's tint and, in the top byte, 0 when it hides
+StructuredBuffer<uint> parts : register(t8);
+// a skinned mesh's deform stream (two words a vertex: its joints, then
+// its weights) and the frame's palettes (three rows a joint)
+StructuredBuffer<uint> deform : register(t11);
+StructuredBuffer<float4> joints : register(t12);
 SamplerState surface_sampler : register(s1);
+SamplerComparisonState shadow_sampler : register(s2);
+SamplerComparisonState moving_sampler : register(s3);
 
 static const uint DRAW_MASK = 1;
 static const uint DRAW_TEXTURED = 2;
 static const uint DRAW_REPLACE = 4;
+static const uint DRAW_COVERAGE = 8;
+// the mesh's deform stream opens each vertex's words with its skin; its
+// morph targets' count lies from bit 5
+static const uint DEFORM_SKIN = 16;
 static const uint MATERIAL_UNLIT = 1;
 static const uint MATERIAL_MASK = 4;
 static const float LINE_PULL = 2.0e-3;
@@ -244,8 +299,77 @@ float encode_code(float shade) {
     return s * 255.0;
 }
 
+// how much of the sun a map lets reach a point: its depth from the sun
+// against the map's, each lookup four texels compared and filtered by the
+// sampler; `params` is (1/size, normal offset, depth bias, taps)
+float map_visibility(Texture2D<float> map, SamplerComparisonState compare, float4x4 from_eye, float4 params,
+                     float3 position, float3 n) {
+    float taps = params.w;
+    if (taps < 0.5 || u.sun_direction.w <= 0.5) {
+        return 1.0;
+    }
+    float n_dot_l = saturate(dot(n, u.sun_direction.xyz));
+    if (!(n_dot_l > 0.0)) {
+        return 1.0;
+    }
+    float sine = sqrt(max(1.0 - n_dot_l * n_dot_l, 0.0));
+    float3 p = position + n * (params.y * sine);
+    float4 s = mul(from_eye, float4(p, 1.0));
+    if (!(s.x > 0.0 && s.x < 1.0 && s.y > 0.0 && s.y < 1.0)) {
+        return 1.0;
+    }
+    float reference = clamp(s.z - params.z, 0.0, 1.0);
+    float texel = params.x;
+    if (taps < 1.5) {
+        return map.SampleCmpLevelZero(compare, s.xy, reference);
+    }
+    if (taps < 4.5) {
+        float four = 0.0;
+        four += map.SampleCmpLevelZero(compare, float2(s.x - 0.5 * texel, s.y - 0.5 * texel), reference);
+        four += map.SampleCmpLevelZero(compare, float2(s.x + 0.5 * texel, s.y - 0.5 * texel), reference);
+        four += map.SampleCmpLevelZero(compare, float2(s.x - 0.5 * texel, s.y + 0.5 * texel), reference);
+        four += map.SampleCmpLevelZero(compare, float2(s.x + 0.5 * texel, s.y + 0.5 * texel), reference);
+        return four * 0.25;
+    }
+    float sum = 0.0;
+    [unroll]
+    for (int j = -1; j <= 1; j++) {
+        [unroll]
+        for (int i = -1; i <= 1; i++) {
+            sum += map.SampleCmpLevelZero(compare, float2(s.x + (float)i * texel, s.y + (float)j * texel), reference);
+        }
+    }
+    return sum / 9.0;
+}
+
+// how much of the sun reaches a point: the still map's word times the
+// word of the map of what moves
+float sun_visibility(float3 position, float3 n) {
+    return map_visibility(shadow_map, shadow_sampler, u.shadow_from_eye, u.shadow, position, n)
+         * map_visibility(moving_map, moving_sampler, u.moving_from_eye, u.moving, position, n);
+}
+
+// what the floor map gives a point: its texel from the base level, never
+// past the picture's edge; nothing off the map or for a surface that
+// reads none
+float4 floor_light(uint flags, float3 position) {
+    if (u.counts.y < 0.5 || (flags & 2u) == 0u) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    float s = u.floor_u.x * position.x + u.floor_u.y * position.y + u.floor_u.z * position.z + u.floor_u.w;
+    float t = u.floor_v.x * position.x + u.floor_v.y * position.y + u.floor_v.z * position.z + u.floor_v.w;
+    if (!(s >= 0.0 && s <= 1.0 && t >= 0.0 && t <= 1.0)) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    uint width;
+    uint height;
+    floor_picture.GetDimensions(width, height);
+    float2 half_texel = 0.5 / float2((float)width, (float)height);
+    return floor_picture.SampleLevel(surface_sampler, clamp(float2(s, t), half_texel, float2(1.0, 1.0) - half_texel), 0.0);
+}
+
 float3 lit(float3 position, float3 n, float3 base, float roughness, float metallic, float3 emissive,
-           float occlusion, uint groups) {
+           float occlusion, uint groups, float shadow, float4 floor_texel, float3 ambient) {
     bool parallel = u.params.w > 0.5;
     float3 v = parallel ? float3(0.0, 0.0, 1.0) : safe_normalize(-position);
     float n_dot_v = clamp(dot(n, v), 1e-4, 1.0);
@@ -256,9 +380,9 @@ float3 lit(float3 position, float3 n, float3 base, float roughness, float metall
     float a = r * r;
     float a2 = r * r * r * r;
     float3 up = u.sky_up.xyz;
-    float3 sky = u.sky_color.xyz;
-    float3 ground = u.ground_color.xyz;
-    float ao = 1.0 + (occlusion - 1.0) * 0.8;
+    float3 sky = u.sky_color.xyz * ambient;
+    float3 ground = u.ground_color.xyz * ambient;
+    float ao = (1.0 + (occlusion - 1.0) * 0.8) * floor_texel.a;
 
     float3 light = diffuse * hemisphere(n, up, sky, ground) * ao;
     float3 reflected = n * (2.0 * dot(n, v)) - v;
@@ -278,7 +402,7 @@ float3 lit(float3 position, float3 n, float3 base, float roughness, float metall
             float x5 = x * x * x * x * x;
             float3 fresnel = f0 + (float3(1.0, 1.0, 1.0) - f0) * x5;
             float3 specular = fresnel * (pi_d * visibility);
-            light = light + (diffuse + specular) * u.sun_color.xyz * n_dot_l;
+            light = light + (diffuse + specular) * u.sun_color.xyz * (n_dot_l * shadow);
         }
     }
 
@@ -302,6 +426,7 @@ float3 lit(float3 position, float3 n, float3 base, float roughness, float metall
         light = light + diffuse * u.point_color[i].xyz * (attenuation * saturate(dot(n, l)));
     }
 
+    light = light + diffuse * floor_texel.rgb;
     return light + emissive;
 }
 
@@ -342,16 +467,76 @@ struct WorldVary {
     noperspective float depth : W_DEPTH;
     nointerpolation uint material : W_MATERIAL;
     nointerpolation uint instance : W_INSTANCE;
+    // the tint of the vertex's part over the instance's (linear)
+    nointerpolation float3 part_tint : W_PART;
 };
+
+// a vertex's morphs, weighed by the instance's two 16-bit shares, then
+// its pose: each of its four joints applied to the point, and without
+// the move to the normal, weighed by its share — the CPU's order. The
+// deform stream holds each vertex's skin (two words) then each morph
+// target's change (six); the draw's flags say which
+void deform_vertex(uint flags, uint joint_base, uint shares, uint corner, inout float3 p, inout float3 n) {
+    uint morphs = (flags >> 5) & 3u;
+    bool skinned = (flags & DEFORM_SKIN) != 0u;
+    uint first = corner * ((skinned ? 2u : 0u) + 6u * morphs);
+    uint at = first + (skinned ? 2u : 0u);
+    for (uint m = 0u; m < morphs; m++) {
+        float w = (float)((shares >> (16u * m)) & 65535u) / 65535.0;
+        float3 moved = float3(asfloat(deform[at]), asfloat(deform[at + 1u]), asfloat(deform[at + 2u]));
+        float3 turned = float3(asfloat(deform[at + 3u]), asfloat(deform[at + 4u]), asfloat(deform[at + 5u]));
+        p = p + w * moved;
+        n = n + w * turned;
+        at += 6u;
+    }
+    if (!skinned || joint_base == 0xFFFFFFFFu) {
+        return;
+    }
+    uint which = deform[first];
+    uint weights = deform[first + 1u];
+    float3 moved = float3(0.0, 0.0, 0.0);
+    float3 turned = float3(0.0, 0.0, 0.0);
+    for (uint k = 0u; k < 4u; k++) {
+        float w = (float)((weights >> (8u * k)) & 255u) / 255.0;
+        uint row = joint_base + 3u * ((which >> (8u * k)) & 255u);
+        float4 r0 = joints[row];
+        float4 r1 = joints[row + 1u];
+        float4 r2 = joints[row + 2u];
+        moved = moved + w * float3(r0.x * p.x + r0.y * p.y + r0.z * p.z + r0.w,
+                                   r1.x * p.x + r1.y * p.y + r1.z * p.z + r1.w,
+                                   r2.x * p.x + r2.y * p.y + r2.z * p.z + r2.w);
+        turned = turned + w * float3(r0.x * n.x + r0.y * n.y + r0.z * n.z,
+                                     r1.x * n.x + r1.y * n.y + r1.z * n.z,
+                                     r2.x * n.x + r2.y * n.y + r2.z * n.z);
+    }
+    p = moved;
+    n = turned;
+}
 
 WorldVary world_vertex(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     WorldVertex vx = vertices[vid];
     uint index = draw.first_instance + iid;
     WorldInstance instance = instances[index];
-    float3 eye = to_eye(instance, vx.position);
+    WorldVary o;
+    o.part_tint = float3(1.0, 1.0, 1.0);
+    // a part that hides leaves the clip volume with every corner
+    if (instance.part_base != 0xFFFFFFFFu) {
+        uint part = parts[instance.part_base + (vx.ids >> 16)];
+        if ((part >> 24) == 0u) {
+            o = (WorldVary)0;
+            o.position = float4(0.0, 0.0, 2.0, 1.0);
+            return o;
+        }
+        o.part_tint = float3(SRGB_DECODE[part & 0xFFu], SRGB_DECODE[(part >> 8) & 0xFFu], SRGB_DECODE[(part >> 16) & 0xFFu]);
+    }
+    float3 p = vx.position;
     int2 folded = int2(asint(vx.folded << 16) >> 16, asint(vx.folded) >> 16);
     float3 n = unfold_normal(folded);
-    WorldVary o;
+    // a vertex takes its morphs, then its pose, before it is placed
+    if ((draw.flags & (DEFORM_SKIN | (3u << 5))) != 0u) {
+        deform_vertex(draw.flags, instance.joint_base, instance.morph, vid, p, n);
+    }
+    float3 eye = to_eye(instance, p);
     o.position = mul(u.clip_from_eye, float4(eye, 1.0));
     o.depth = o.position.z / o.position.w;
     o.eye = eye;
@@ -365,9 +550,54 @@ WorldVary world_vertex(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     return o;
 }
 
+// the grade: 16 × 16 × 16 points of codes in the part table, from
+// tone.w less one. A surface's codes fall in a cube of eight points;
+// the walk from its low corner to its high one, the largest share
+// first, crosses four of them, and the codes blend along that walk —
+// the CPU's order
+float3 grade_point(uint index) {
+    uint packed = parts[index];
+    return float3((float)(packed & 0xFFu), (float)((packed >> 8) & 0xFFu), (float)((packed >> 16) & 0xFFu));
+}
+
+float3 graded(float3 code) {
+    if (u.tone.w < 0.5) {
+        return code;
+    }
+    float3 g = clamp(code / 255.0 * 15.0, 0.0, 15.0);
+    float3 i = min(floor(g), float3(14.0, 14.0, 14.0));
+    float3 w = g - i;
+    uint3 s = uint3(1u, 16u, 256u);
+    if (w.x < w.y) {
+        w.xy = w.yx;
+        s.xy = s.yx;
+    }
+    if (w.y < w.z) {
+        w.yz = w.zy;
+        s.yz = s.zy;
+    }
+    if (w.x < w.y) {
+        w.xy = w.yx;
+        s.xy = s.yx;
+    }
+    uint low = (uint)u.tone.w - 1u + (uint)i.x + 16u * (uint)i.y + 256u * (uint)i.z;
+    float3 p0 = grade_point(low);
+    float3 p1 = grade_point(low + s.x);
+    float3 p2 = grade_point(low + s.x + s.y);
+    float3 p3 = grade_point(low + s.x + s.y + s.z);
+    return p0 + (p1 - p0) * w.x + (p2 - p1) * w.y + (p3 - p2) * w.z;
+}
+
 // premultiplied codes over 255: the target's unorm write rounds them to
 // the byte the CPU computes
-float4 world_shade(WorldVary v, bool front) {
+// how much a surface glows, from the light it gives off: its brightest
+// channel, a quarter a unit (bunny_ui::world::bloom::glow)
+float glow_of(float3 emissive) {
+    return saturate(max(emissive.r, max(emissive.g, emissive.b)) * 0.25);
+}
+
+// `glow` takes the surface's glow, a code premultiplied by its alpha
+float4 world_shade(WorldVary v, bool front, out float glow) {
     float4 cut = u.section;
     if (any(cut != 0.0) && cut.x * v.eye.x + cut.y * v.eye.y + cut.z * v.eye.z + cut.w < 0.0) {
         discard;
@@ -385,11 +615,17 @@ float4 world_shade(WorldVary v, bool front) {
     bool two_sided = material.back.w > 0.5;
     float4 surface = (front || !two_sided) ? material.base : float4(material.back.xyz, material.base.w);
     uint tint = instance.tint;
-    float3 tinted = float3(SRGB_DECODE[tint & 0xFFu], SRGB_DECODE[(tint >> 8) & 0xFFu], SRGB_DECODE[(tint >> 16) & 0xFFu]);
+    float3 tinted = float3(SRGB_DECODE[tint & 0xFFu], SRGB_DECODE[(tint >> 8) & 0xFFu], SRGB_DECODE[(tint >> 16) & 0xFFu]) * v.part_tint;
     float3 base = surface.rgb * tinted * color.rgb;
     float alpha = surface.a * ((float)(tint >> 24) / 255.0) * color.a;
+    // with four samples a cut-out's edge becomes coverage: the cut
+    // sharpened to a pixel's width, the samples it covers kept
+    float alpha_width = (draw.flags & DRAW_COVERAGE) != 0u ? fwidth(alpha) : 0.0;
+    float coverage = -1.0;
     if ((draw.flags & DRAW_MASK) != 0u || (flags & MATERIAL_MASK) != 0u) {
-        if (alpha < material.params.z) {
+        if ((draw.flags & DRAW_COVERAGE) != 0u) {
+            coverage = saturate((alpha - material.params.z) / max(alpha_width, 1e-4) + 0.5);
+        } else if (alpha < material.params.z) {
             discard;
         }
         alpha = 1.0;
@@ -407,26 +643,44 @@ float4 world_shade(WorldVary v, bool front) {
             normal = -normal;
         }
         float3 light = lit(v.eye, normal, base, material.params.x, material.params.y,
-                           material.emissive.xyz, v.occlusion, 0xFFFFFFFFu);
+                           material.emissive.xyz, v.occlusion, 1u << ((instance.flags >> 8) & 31u), sun_visibility(v.eye, normal),
+                           floor_light(instance.flags, v.eye),
+                           float3(SRGB_DECODE[instance.ambient & 0xFFu], SRGB_DECODE[(instance.ambient >> 8) & 0xFFu],
+                                  SRGB_DECODE[(instance.ambient >> 16) & 0xFFu]));
+        // the pattern's phase runs it with the world's origin
         if (u.tone.z > 0.5) {
-            dither = bayer((uint)v.position.x, (uint)v.position.y);
+            uint phase = (uint)u.tone.z - 1u;
+            dither = bayer((uint)v.position.x + (phase & 3u), (uint)v.position.y + (phase >> 2u));
         }
         shaded = tone_curve(light, u.tone.x, u.tone.y);
     }
-    float3 code = float3(encode_code(shaded.r), encode_code(shaded.g), encode_code(shaded.b));
+    float3 code = graded(float3(encode_code(shaded.r), encode_code(shaded.g), encode_code(shaded.b)));
     float3 codes = clamp(floor(code * alpha + 0.5 + dither), 0.0, 255.0);
-    return float4(codes, floor(alpha * 255.0 + 0.5)) / 255.0;
+    glow = floor(glow_of(material.emissive.xyz) * alpha * 255.0 + 0.5);
+    return float4(codes / 255.0, coverage >= 0.0 ? coverage : floor(alpha * 255.0 + 0.5) / 255.0);
 }
 
-float4 world_fragment(WorldVary v, bool front : SV_IsFrontFace) : SV_Target {
-    return world_shade(v, front);
+// the glow rides SV_Target1: a frame with a bloom binds a view there, and
+// any other frame drops it
+struct WorldBack {
+    float4 color : SV_Target0;
+    float4 glow : SV_Target1;
+};
+
+WorldBack world_fragment(WorldVary v, bool front : SV_IsFrontFace) {
+    WorldBack o;
+    float glow;
+    o.color = world_shade(v, front, glow);
+    o.glow = float4(glow / 255.0, 0.0, 0.0, o.color.a);
+    return o;
 }
 
 // a plain depth, as the GL family writes it: D3D takes a conservative
 // one (SV_DepthGreaterEqual) only from a pixel whose position is
 // interpolated at its centroid, and the step is measured at the centre
 struct SteppedBack {
-    float4 color : SV_Target;
+    float4 color : SV_Target0;
+    float4 glow : SV_Target1;
     float depth : SV_Depth;
 };
 
@@ -435,9 +689,45 @@ struct SteppedBack {
 SteppedBack world_fragment_stepped(WorldVary v, bool front : SV_IsFrontFace) {
     float slope = max(abs(ddx(v.depth)), abs(ddy(v.depth)));
     SteppedBack o;
-    o.color = world_shade(v, front);
+    float glow;
+    o.color = world_shade(v, front, glow);
+    o.glow = float4(glow / 255.0, 0.0, 0.0, o.color.a);
     o.depth = min(v.position.z + draw.bias.x * slope + DEPTH_TIE, DEPTH_CEILING);
     return o;
+}
+
+// MARK: - The sun's shadow map (bunny_ui::world::shadow)
+
+struct ShadowCaster {
+    float4 rows[3];
+    uint part_base;
+    uint joint_base;
+    uint morph;
+    uint pad;
+};
+
+StructuredBuffer<ShadowCaster> casters : register(t6);
+
+// a caster into the map, placed by its rows: D3D's clip space already
+// puts the map's top at its first row, and its depth in [0, 1]
+float4 shadow_vertex(uint vid : SV_VertexID, uint iid : SV_InstanceID) : SV_Position {
+    float3 p = vertices[vid].position;
+    ShadowCaster caster = casters[draw.first_instance + iid];
+    // a part that hides casts nothing
+    if (caster.part_base != 0xFFFFFFFFu && (parts[caster.part_base + (vertices[vid].ids >> 16)] >> 24) == 0u) {
+        return float4(0.0, 0.0, 2.0, 1.0);
+    }
+    // a caster casts its morphs and its pose
+    if ((draw.flags & (DEFORM_SKIN | (3u << 5))) != 0u) {
+        float3 unused = float3(0.0, 0.0, 0.0);
+        deform_vertex(draw.flags, caster.joint_base, caster.morph, vid, p, unused);
+    }
+    float4 r0 = caster.rows[0];
+    float4 r1 = caster.rows[1];
+    float4 r2 = caster.rows[2];
+    return float4(r0.x * p.x + r0.y * p.y + r0.z * p.z + r0.w,
+                  r1.x * p.x + r1.y * p.y + r1.z * p.z + r1.w,
+                  r2.x * p.x + r2.y * p.y + r2.z * p.z + r2.w, 1.0);
 }
 
 // MARK: - Lines (bunny_ui::world::soft::line)
@@ -505,7 +795,8 @@ LineVary line_vertex(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
 }
 
 struct LineOut {
-    float4 color : SV_Target;
+    float4 color : SV_Target0;
+    float4 glow : SV_Target1;
     float depth : SV_Depth;
 };
 
@@ -545,6 +836,8 @@ LineOut line_fragment(LineVary v) {
     float alpha = coverage * draw.line_color.a;
     LineOut o;
     o.color = float4(codes * alpha, alpha * 255.0) / 255.0;
+    // an edge glows not, and covers the glow behind it as its colour does
+    o.glow = float4(0.0, 0.0, 0.0, o.color.a);
     o.depth = z;
     return o;
 }
@@ -556,11 +849,104 @@ float4 backdrop_vertex(uint vid : SV_VertexID) : SV_Position {
     return float4(corner * 2.0 - 1.0, 0.5, 1.0);
 }
 
-float4 backdrop_fragment(float4 position : SV_Position) : SV_Target {
-    float t = position.y / ramp.size.y;
-    float4 c = clamp(floor(ramp.top + (ramp.bottom - ramp.top) * t + 0.5), 0.0, 255.0);
+WorldBack backdrop_fragment(float4 position : SV_Position) {
+    float4 c;
+    if (ramp.rows[2].z > 0.5) {
+        // the view's ray through the pixel, against the world's up
+        float x = position.x / ramp.rows[2].x * 2.0 - 1.0;
+        float y = 1.0 - position.y / ramp.rows[2].y * 2.0;
+        float3 ray = ramp.rows[5].z > 0.5 ? float3(0.0, 0.0, -1.0) : normalize(float3(x * ramp.rows[5].x, y * ramp.rows[5].y, -1.0));
+        float e = dot(ray, ramp.rows[4].xyz);
+        float4 to = e >= 0.0 ? ramp.rows[0] : ramp.rows[3];
+        float t = e >= 0.0 ? e * (2.0 - e) : min(-e * 8.0, 1.0);
+        c = clamp(floor(ramp.rows[1] + (to - ramp.rows[1]) * t + 0.5), 0.0, 255.0);
+    } else {
+        float t = position.y / ramp.rows[2].y;
+        c = clamp(floor(ramp.rows[0] + (ramp.rows[1] - ramp.rows[0]) * t + 0.5), 0.0, 255.0);
+    }
     float3 rgb = floor((c.rgb * c.a + 127.0) / 255.0);
-    return float4(rgb, c.a) / 255.0;
+    WorldBack o;
+    o.color = float4(rgb, c.a) / 255.0;
+    o.glow = float4(0.0, 0.0, 0.0, 0.0);
+    return o;
+}
+
+// MARK: - The bloom (bunny_ui::world::bloom)
+
+// every step reads whole texels, the edge repeated past it, and sums
+// whole codes: the CPU's chain, to the code
+Texture2D<float4> bloom_above : register(t9);
+Texture2D<float4> bloom_second : register(t10);
+
+// (1 when the step down reads the glow, the strength in 256ths, the steps
+// the step below carries, 0)
+cbuffer BloomBlock : register(b3) {
+    float4 bloom;
+};
+
+uint3 codes_at(Texture2D<float4> image, int2 at) {
+    uint width, height;
+    image.GetDimensions(width, height);
+    int2 last = int2(width, height) - int2(1, 1);
+    return (uint3)(image.Load(int3(clamp(at, int2(0, 0), last), 0)).rgb * 255.0 + 0.5);
+}
+
+// the step below read at a texel of the step above: the four nearest,
+// weighted 9, 3, 3 and 1
+uint3 up16(Texture2D<float4> below, int2 at) {
+    int2 m = at / 2;
+    int2 o = int2((at.x & 1) == 0 ? -1 : 1, (at.y & 1) == 0 ? -1 : 1);
+    return 9u * codes_at(below, m) + 3u * codes_at(below, m + int2(o.x, 0)) + 3u * codes_at(below, m + int2(0, o.y)) +
+           codes_at(below, m + o);
+}
+
+// a step down: the 4 × 4 block around the texel's own 2 × 2 above, five
+// for the middle four and one for the ring; the first step reads the
+// colours times their glow
+float4 bloom_down_fragment(float4 position : SV_Position) : SV_Target {
+    int2 at = int2(position.xy);
+    bool glowing = bloom.x > 0.5;
+    uint width, height;
+    bloom_second.GetDimensions(width, height);
+    int2 last = int2(width, height) - int2(1, 1);
+    uint3 sum = uint3(0, 0, 0);
+    for (int dy = -1; dy <= 2; dy++) {
+        for (int dx = -1; dx <= 2; dx++) {
+            int2 p = 2 * at + int2(dx, dy);
+            uint3 texel = codes_at(bloom_above, p);
+            if (glowing) {
+                texel *= (uint)(bloom_second.Load(int3(clamp(p, int2(0, 0), last), 0)).r * 255.0 + 0.5);
+            }
+            uint weight = (dx == 0 || dx == 1) && (dy == 0 || dy == 1) ? 5u : 1u;
+            sum += weight * texel;
+        }
+    }
+    uint whole = glowing ? 8160u : 32u;
+    return float4((float3)((sum + whole / 2u) / whole) / 255.0, 1.0);
+}
+
+// a step up: its own step down and the step below read up, each of the
+// steps below weighing as much as its own
+float4 bloom_up_fragment(float4 position : SV_Position) : SV_Target {
+    int2 at = int2(position.xy);
+    uint below = (uint)bloom.z;
+    uint whole = 16u * (below + 1u);
+    uint3 sum = 16u * codes_at(bloom_above, at) + below * up16(bloom_second, at) + whole / 2u;
+    return float4((float3)(sum / whole) / 255.0, 1.0);
+}
+
+// the spill: the chain's top read up, times the strength and a gain of
+// four, as far as the pixel does not glow itself, dithered to whole
+// codes; the target blends it as a screen
+float4 bloom_spill_fragment(float4 position : SV_Position) : SV_Target {
+    int2 at = int2(position.xy);
+    uint width, height;
+    bloom_above.GetDimensions(width, height);
+    int2 last = int2(width, height) - int2(1, 1);
+    uint glow = (uint)(bloom_above.Load(int3(clamp(at, int2(0, 0), last), 0)).r * 255.0 + 0.5);
+    uint dither = 65280u * BAYER[(at.y & 3) * 4 + (at.x & 3)] + 32640u;
+    uint3 s = min(((uint)bloom.y * 4u * up16(bloom_second, at) * (255u - glow) + dither) / 1044480u, uint3(255u, 255u, 255u));
+    return float4((float3)s / 255.0, (float)max(s.r, max(s.g, s.b)) / 255.0);
 }
 "#;
 
@@ -604,13 +990,21 @@ struct DrawBlock {
 
 const _: () = assert!(std::mem::size_of::<DrawBlock>() == 64);
 
-/// The twin of `Backdrop` in the shaders: codes, then the target's size.
+/// The twin of `Backdrop` in the shaders: `WorldFrame::backdrop`'s rows.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct BackdropBlock {
-    top: [f32; 4],
-    bottom: [f32; 4],
-    size: [f32; 4],
+    rows: [[f32; 4]; 6],
+}
+
+/// `D3D11_DEPTH_STENCIL_VIEW_DESC` of one level of a 2D texture.
+#[repr(C)]
+struct DsvDesc {
+    format: u32,
+    view_dimension: u32,
+    flags: u32,
+    mip_slice: u32,
+    _union_pad: [u32; 2],
 }
 
 /// The bytes of a plain block.
@@ -628,28 +1022,50 @@ const DEPTH_ALWAYS: usize = 4;
 
 struct WorldStack {
     mesh_vs: Com<VertexShader>,
+    /// The casters into a shadow map; they draw with no pixel stage.
+    shadow_vs: Com<VertexShader>,
     line_vs: Com<VertexShader>,
     backdrop_vs: Com<VertexShader>,
     mesh_ps: Com<PixelShader>,
     stepped_ps: Com<PixelShader>,
     line_ps: Com<PixelShader>,
     backdrop_ps: Com<PixelShader>,
+    /// The bloom's steps: down, back up, the spill.
+    bloom_ps: [Com<PixelShader>; 3],
+    /// The spill's blend: a screen, `c + s·(1 − c)`.
+    screen: Com<BlendState>,
     /// The 2D pass's pixel shader for a world's target.
     composite_ps: Com<PixelShader>,
     /// Opaque, see-through, lines tested, lines hidden, always.
     depth_states: [Com<DepthStencilState>; 5],
     /// By culling (none, back), then by the front's winding
-    /// (counter-clockwise, clockwise).
-    rasterizers: [Com<RasterizerState>; 4],
+    /// (counter-clockwise, clockwise); then the four again with the
+    /// scissor on, for a frame drawn in rects.
+    rasterizers: [Com<RasterizerState>; 8],
     /// Over and add; a replacing draw binds no blend at all.
     over: Com<BlendState>,
     add: Com<BlendState>,
+    /// A cut-out at four samples: no blend, its alpha its coverage.
+    coverage: Com<BlendState>,
     sampler: Com<SamplerState>,
+    /// The shadow map's sampler: four texels compared and filtered.
+    compare: Com<SamplerState>,
+    /// A texel and a sampler that always answer "lit": what a frame
+    /// without a map binds.
+    always: Com<SamplerState>,
+    lit: (Com<Texture2d>, Com<Srv>),
     /// One white texel: what a draw with no texture binds.
     blank: (Com<Texture2d>, Com<Srv>),
+    /// One black, opaque texel: a floor map that adds and takes nothing,
+    /// bound while a frame's floor map is not decoded.
+    dark: (Com<Texture2d>, Com<Srv>),
+    /// One word: the deform stream a mesh without a skin binds.
+    no_deform: (Com<Buffer>, Com<Srv>),
     uniforms: Com<Buffer>,
     draw: Com<Buffer>,
     backdrop: Com<Buffer>,
+    /// A bloom step's four values.
+    bloom: Com<Buffer>,
 }
 
 enum Built {
@@ -671,18 +1087,50 @@ struct Target {
     _depth: Com<Texture2d>,
     dsv: Com<Dsv>,
     size: (u32, u32),
+    samples: u8,
+}
+
+/// A texture the chain draws into and reads from.
+struct Step {
+    texture: Com<Texture2d>,
+    rtv: Com<Rtv>,
+    srv: Com<Srv>,
+    size: (u32, u32),
+}
+
+/// A target's bloom: its glow and the chain's steps, made on its first
+/// frame with a bloom.
+struct BloomTargets {
+    /// The glow at one sample: where its samples resolve, and what the
+    /// chain reads.
+    glow: Step,
+    /// The glow's samples, or none at one sample.
+    glow_samples: Option<(Com<Texture2d>, Com<Rtv>)>,
+    down: Vec<Step>,
+    up: Vec<Step>,
 }
 
 struct MeshBuffers {
     _vertices: Com<Buffer>,
     vertex_srv: Com<Srv>,
     indices: Com<Buffer>,
+    /// The deform stream, one word an element, for a skinned mesh.
+    deform: Option<(Com<Buffer>, Com<Srv>)>,
 }
 
 struct Segments {
     /// The buffer and its view, or none for an empty set.
     view: Option<(Com<Buffer>, Com<Srv>)>,
     count: u32,
+}
+
+/// A box's shadow map: one 16-bit texture, a depth view to draw the
+/// casters through and a view the surfaces read.
+struct ShadowMap {
+    _texture: Com<Texture2d>,
+    dsv: Com<Dsv>,
+    srv: Com<Srv>,
+    size: u32,
 }
 
 /// The D3D11 side of the world seam: it mints targets, buffers and
@@ -695,11 +1143,32 @@ pub(super) struct D3dWorld {
     meshes: HashMap<u64, MeshBuffers>,
     textures: HashMap<u64, (Com<Texture2d>, Com<Srv>)>,
     segments: HashMap<u64, Segments>,
+    shadow_maps: HashMap<u64, ShadowMap>,
+    /// By target.
+    blooms: HashMap<u64, BloomTargets>,
     next: u64,
     /// The frame's instances and materials, written again for each job:
     /// a discard map gives every job a buffer of its own.
     instances: SlotBuffer,
     materials: SlotBuffer,
+    /// The rows of a shadow's casters, the same way.
+    casters: SlotBuffer,
+    /// The frame's part table, the same way.
+    parts: SlotBuffer,
+    /// The frame's palettes, the same way.
+    joints: SlotBuffer,
+    /// Each job's queries — the clock's span, its first and its last tick —
+    /// by target, until the GPU has run it.
+    timers: Vec<(u64, [Com<Query>; 3])>,
+}
+
+/// `D3D11_QUERY_DATA_TIMESTAMP_DISJOINT`: the ticks a second, and whether
+/// the clock jumped while the queries ran.
+#[repr(C)]
+#[derive(Default)]
+struct TimestampDisjoint {
+    frequency: u64,
+    disjoint: i32,
 }
 
 impl D3dWorld {
@@ -712,9 +1181,15 @@ impl D3dWorld {
             meshes: HashMap::new(),
             textures: HashMap::new(),
             segments: HashMap::new(),
+            shadow_maps: HashMap::new(),
+            blooms: HashMap::new(),
             next: 1,
             instances: SlotBuffer::empty(),
             materials: SlotBuffer::empty(),
+            casters: SlotBuffer::empty(),
+            parts: SlotBuffer::empty(),
+            joints: SlotBuffer::empty(),
+            timers: Vec::new(),
         }
     }
 
@@ -754,6 +1229,21 @@ impl D3dWorld {
 
     /// Draws every job into its target. Call it after the walk and before
     /// the 2D pass.
+    /// Three new queries for one job's time: the clock's span, its first
+    /// tick and its last; `None` when the device refuses one.
+    unsafe fn timer_queries(&self) -> Option<[Com<Query>; 3]> {
+        let device = self.device;
+        let make = |query: u32| -> Option<Com<Query>> {
+            let desc = QueryDesc { query, misc_flags: 0 };
+            let mut out: *mut Query = null_mut();
+            if !com_ok(unsafe { ((*(*device).vtbl).create_query)(device, &desc, &mut out) }) {
+                return None;
+            }
+            Com::from_raw(out)
+        };
+        Some([make(QUERY_TIMESTAMP_DISJOINT)?, make(QUERY_TIMESTAMP)?, make(QUERY_TIMESTAMP)?])
+    }
+
     pub(super) fn encode(&mut self, jobs: &[WorldJob]) {
         let Built::Ready(stack) = &self.built else { return };
         if jobs.is_empty() {
@@ -774,7 +1264,27 @@ impl D3dWorld {
             (vtbl.ps_set_samplers)(context, 1, 1, &sampler);
         }
         for job in jobs {
+            // the GPU's clock over the job: its shadows, its pass, its bloom
+            let queries = unsafe { self.timer_queries() };
+            if let Some([span, first, _]) = &queries {
+                unsafe {
+                    let vtbl = &*(*context).vtbl;
+                    (vtbl.begin)(context, span.as_ptr().cast());
+                    (vtbl.end)(context, first.as_ptr().cast());
+                }
+            }
             self.encode_job(job);
+            if let Some(queries) = queries {
+                unsafe {
+                    let vtbl = &*(*context).vtbl;
+                    (vtbl.end)(context, queries[2].as_ptr().cast());
+                    (vtbl.end)(context, queries[0].as_ptr().cast());
+                }
+                self.timers.push((job.target, queries));
+                if self.timers.len() > TIMERS_HELD {
+                    self.timers.remove(0);
+                }
+            }
         }
         unsafe {
             let vtbl = &*(*context).vtbl;
@@ -786,20 +1296,45 @@ impl D3dWorld {
     }
 
     fn encode_job(&mut self, job: &WorldJob) {
-        let D3dWorld { device, context, built, targets, meshes, textures, segments, instances, materials, .. } = self;
+        let D3dWorld { device, context, built, targets, meshes, textures, segments, shadow_maps, blooms, instances, materials, casters, parts, joints, .. } =
+            self;
         let (device, context) = (*device, *context);
         let Built::Ready(stack) = built else { return };
         let Some(target) = targets.get(&job.target) else { return };
         let frame = &job.frame;
+        // a frame with a bloom draws its glow beside its colour
+        if frame.bloom > 0
+            && !blooms.contains_key(&job.target)
+            && let Some(made) = unsafe { bloom_targets(device, target.size, target.samples) }
+        {
+            blooms.insert(job.target, made);
+        }
+        let bloom = if frame.bloom > 0 { blooms.get(&job.target) } else { None };
+        let map = job.shadow.and_then(|shadow| shadow_maps.get(&shadow.map).map(|map| (shadow, map)));
+        let moving_map = job.moving_shadow.and_then(|shadow| shadow_maps.get(&shadow.map).map(|map| (shadow, map)));
         // what every draw of the frame reads: the instances and the
         // material table, a discard map each, so a job never waits on the
         // one before it
         let instance_data = instance_bytes(&frame.instances);
         let material_data = material_bytes(&frame.materials);
+        // one part at least: the stage's view is never left empty
+        let mut part_data = part_bytes(&frame.parts);
+        if part_data.is_empty() {
+            part_data = vec![255; 4];
+        }
+        // one row at least: the palette's view is never left empty
+        let mut joint_data: Vec<u8> = frame.joints.iter().flatten().flat_map(|value| value.to_le_bytes()).collect();
+        if joint_data.is_empty() {
+            joint_data = vec![0; 16];
+        }
         let staged = instances.ensure(device, frame.instances.len(), instance_offset::SIZE)
             && materials.ensure(device, frame.materials.len(), 64)
+            && parts.ensure(device, part_data.len() / 4, 4)
+            && joints.ensure(device, joint_data.len() / 16, 16)
             && instances.upload(context, &instance_data)
-            && materials.upload(context, &material_data);
+            && materials.upload(context, &material_data)
+            && parts.upload(context, &part_data)
+            && joints.upload(context, &joint_data);
         if !staged {
             return;
         }
@@ -807,15 +1342,95 @@ impl D3dWorld {
         unsafe {
             let vtbl = &*(*context).vtbl;
             write_constants(context, stack.uniforms.as_ptr(), &frame.uniforms.to_bytes());
+            let part_view = parts.srv_ptr();
+            (vtbl.vs_set_shader_resources)(context, 8, 1, &part_view);
+            (vtbl.ps_set_shader_resources)(context, 8, 1, &part_view);
+            let joint_view = joints.srv_ptr();
+            (vtbl.vs_set_shader_resources)(context, 12, 1, &joint_view);
+
+            // the sun's maps first, each when it does not hold this frame's
+            // casters; the second upload of the casters' rows discards the
+            // first, which the draws before it keep
+            for (held, frame_shadow) in [(map, frame.shadow.as_ref()), (moving_map, frame.moving_shadow.as_ref())] {
+                let (Some((shadow, map)), Some(frame_shadow)) = (held, frame_shadow) else { continue };
+                if !shadow.draw {
+                    continue;
+                }
+                let rows = shadow_instance_bytes(&frame_shadow.instances);
+                if casters.ensure(device, frame_shadow.instances.len(), SHADOW_INSTANCE_STRIDE) && casters.upload(context, &rows) {
+                    // nothing reads a map while one is drawn
+                    let none: *mut Srv = null_mut();
+                    (vtbl.ps_set_shader_resources)(context, 5, 1, &none);
+                    (vtbl.ps_set_shader_resources)(context, 13, 1, &none);
+                    let no_color: *mut Rtv = null_mut();
+                    (vtbl.om_set_render_targets)(context, 1, &no_color, map.dsv.as_ptr().cast());
+                    let side = map.size as f32;
+                    let port = Viewport { top_left_x: 0.0, top_left_y: 0.0, width: side, height: side, min_depth: 0.0, max_depth: 1.0 };
+                    (vtbl.rs_set_viewports)(context, 1, &port);
+                    (vtbl.clear_depth_stencil_view)(context, map.dsv.as_ptr(), CLEAR_DEPTH, 1.0, 0);
+                    (vtbl.vs_set_shader)(context, stack.shadow_vs.as_ptr(), null(), 0);
+                    (vtbl.ps_set_shader)(context, null_mut(), null(), 0);
+                    (vtbl.om_set_depth_stencil_state)(context, stack.depth_states[DEPTH_OPAQUE].as_ptr(), 0);
+                    (vtbl.rs_set_state)(context, stack.rasterizers[0].as_ptr());
+                    (vtbl.om_set_blend_state)(context, null_mut(), null(), 0xFFFF_FFFF);
+                    let caster_view = casters.srv_ptr();
+                    (vtbl.vs_set_shader_resources)(context, 6, 1, &caster_view);
+                    for draw in &frame_shadow.draws {
+                        let Some(buffers) = job.meshes.get(draw.mesh as usize).and_then(|id| meshes.get(id)) else { continue };
+                        let deform = frame.meshes.get(draw.mesh as usize).map_or(0, |mesh| mesh.deform_flags());
+                        let block = DrawBlock { first_instance: draw.first_instance, flags: deform, ..DrawBlock::default() };
+                        write_constants(context, stack.draw.as_ptr(), bytes_of(&block));
+                        let vertex_view = buffers.vertex_srv.as_ptr();
+                        (vtbl.vs_set_shader_resources)(context, 0, 1, &vertex_view);
+                        let deform_view = buffers.deform.as_ref().map_or(stack.no_deform.1.as_ptr(), |(_, view)| view.as_ptr());
+                        (vtbl.vs_set_shader_resources)(context, 11, 1, &deform_view);
+                        (vtbl.ia_set_index_buffer)(context, buffers.indices.as_ptr(), FORMAT_R32_UINT, 0);
+                        (vtbl.draw_indexed_instanced)(context, draw.index_count, draw.instance_count, draw.first_index, 0, 0);
+                    }
+                }
+            }
+
+            // a slide first: the picture the box showed, moved by the
+            // pan's step, which the rects then draw over
+            if let Redraw::Slide { from, shift, .. } = &job.redraw
+                && let Some(from) = targets.get(from)
+                && let Some((source, to)) = slide_copy(*shift, target.size)
+            {
+                let region = D3dBox { left: source[0], top: source[1], front: 0, right: source[0] + source[2], bottom: source[1] + source[3], back: 1 };
+                (vtbl.copy_subresource_region)(context, target.resolve.as_ptr().cast(), 0, to[0], to[1], 0, from.resolve.as_ptr().cast(), 0, &region);
+            }
+
             let instance_view = instances.srv_ptr();
             let material_view = materials.srv_ptr();
             (vtbl.vs_set_shader_resources)(context, 1, 1, &instance_view);
             (vtbl.ps_set_shader_resources)(context, 1, 1, &instance_view);
             (vtbl.ps_set_shader_resources)(context, 2, 1, &material_view);
 
-            // the target, cleared to the backdrop
+            // the target, cleared to the backdrop, and its glow to none
             let rtv = target.color.as_ref().map_or(target.resolve_rtv.as_ptr(), |(_, rtv)| rtv.as_ptr());
-            (vtbl.om_set_render_targets)(context, 1, &rtv, target.dsv.as_ptr().cast());
+            let glow_rtv = bloom.map(|bloom| bloom.glow_samples.as_ref().map_or(bloom.glow.rtv.as_ptr(), |(_, rtv)| rtv.as_ptr()));
+            match glow_rtv {
+                Some(glow_rtv) => {
+                    let views = [rtv, glow_rtv];
+                    (vtbl.om_set_render_targets)(context, 2, views.as_ptr(), target.dsv.as_ptr().cast());
+                    (vtbl.clear_render_target_view)(context, glow_rtv, [0.0f32; 4].as_ptr());
+                }
+                None => (vtbl.om_set_render_targets)(context, 1, &rtv, target.dsv.as_ptr().cast()),
+            }
+            // the maps are read once they are no longer drawn into
+            let [(shadow_view, shadow_sampler), (moving_view, moving_sampler)] = [map, moving_map].map(|held| {
+                held.map_or((stack.lit.1.as_ptr(), stack.always.as_ptr()), |(_, map)| (map.srv.as_ptr(), stack.compare.as_ptr()))
+            });
+            (vtbl.ps_set_shader_resources)(context, 5, 1, &shadow_view);
+            (vtbl.ps_set_samplers)(context, 2, 1, &shadow_sampler);
+            (vtbl.ps_set_shader_resources)(context, 13, 1, &moving_view);
+            (vtbl.ps_set_samplers)(context, 3, 1, &moving_sampler);
+            let floor_view = frame
+                .floor
+                .and_then(|index| job.textures.get(index as usize).copied().flatten())
+                .and_then(|id| textures.get(&id))
+                .map_or(stack.dark.1.as_ptr(), |(_, srv)| srv.as_ptr());
+            (vtbl.ps_set_shader_resources)(context, 7, 1, &floor_view);
             let port = Viewport {
                 top_left_x: 0.0,
                 top_left_y: 0.0,
@@ -830,94 +1445,124 @@ impl D3dWorld {
                     let premultiply = |channel: u8| ((channel as u32 * c.a as u32 + 127) / 255) as f32 / 255.0;
                     [premultiply(c.r), premultiply(c.g), premultiply(c.b), c.a as f32 / 255.0]
                 }
-                Background::Transparent | Background::Gradient { .. } => [0.0; 4],
+                Background::Transparent | Background::Gradient { .. } | Background::Sky { .. } => [0.0; 4],
             };
-            (vtbl.clear_render_target_view)(context, rtv, clear.as_ptr());
-            (vtbl.clear_depth_stencil_view)(context, target.dsv.as_ptr(), CLEAR_DEPTH, 1.0, 0);
-            if let Background::Gradient { top, bottom } = frame.background {
-                let codes = |c: bunny_ui::layout::Color| [c.r as f32, c.g as f32, c.b as f32, c.a as f32];
-                let ramp = BackdropBlock { top: codes(top), bottom: codes(bottom), size: [width as f32, height as f32, 0.0, 0.0] };
-                write_constants(context, stack.backdrop.as_ptr(), bytes_of(&ramp));
-                (vtbl.vs_set_shader)(context, stack.backdrop_vs.as_ptr(), null(), 0);
-                (vtbl.ps_set_shader)(context, stack.backdrop_ps.as_ptr(), null(), 0);
-                (vtbl.om_set_depth_stencil_state)(context, stack.depth_states[DEPTH_ALWAYS].as_ptr(), 0);
-                (vtbl.rs_set_state)(context, stack.rasterizers[0].as_ptr());
-                (vtbl.om_set_blend_state)(context, null_mut(), null(), 0xFFFF_FFFF);
-                (vtbl.draw_instanced)(context, 3, 1, 0, 0);
+            // all of the target, or each rect the job asks for: the
+            // scissor holds the backdrop — which fills a rect a clear
+            // cannot — and the draws inside it, and the rest keeps what the
+            // target holds
+            let (rects, scissored) = match job.redraw.rects() {
+                None => (vec![[0, 0, width, height]], 0),
+                Some(rects) => (rects.to_vec(), 4),
+            };
+            if scissored == 0 {
+                (vtbl.clear_render_target_view)(context, rtv, clear.as_ptr());
             }
-
+            (vtbl.clear_depth_stencil_view)(context, target.dsv.as_ptr(), CLEAR_DEPTH, 1.0, 0);
             let (near, far) = (frame.near as f32, frame.far as f32);
-            for draw in &frame.draws {
-                match draw.kind {
-                    DrawKind::Mesh { mesh, first_index, index_count, texture, cull_back, mirrored, blend, mask } => {
-                        let Some(buffers) = job.meshes.get(mesh as usize).and_then(|id| meshes.get(id)) else { continue };
-                        let surface = texture
-                            .and_then(|index| job.textures.get(index as usize).copied().flatten())
-                            .and_then(|id| textures.get(&id))
-                            .map(|(_, srv)| srv.as_ptr());
-                        let replace = blend == Blend::Replace;
-                        let bias = if replace { frame.face_bias } else { 0.0 };
-                        let mut flags = 0;
-                        if mask {
-                            flags |= DRAW_MASK;
-                        }
-                        if surface.is_some() {
-                            flags |= DRAW_TEXTURED;
-                        }
-                        if replace {
-                            flags |= DRAW_REPLACE;
-                        }
-                        let block = DrawBlock { first_instance: draw.first_instance, flags, near, far, bias: [bias, 0.0, 0.0, 0.0], ..DrawBlock::default() };
-                        write_constants(context, stack.draw.as_ptr(), bytes_of(&block));
-                        (vtbl.vs_set_shader)(context, stack.mesh_vs.as_ptr(), null(), 0);
-                        let pixel = if bias > 0.0 { &stack.stepped_ps } else { &stack.mesh_ps };
-                        (vtbl.ps_set_shader)(context, pixel.as_ptr(), null(), 0);
-                        let depth = if replace { DEPTH_OPAQUE } else { DEPTH_SEE_THROUGH };
-                        (vtbl.om_set_depth_stencil_state)(context, stack.depth_states[depth].as_ptr(), 0);
-                        // the instances mirror the mesh: its front turns the other way
-                        (vtbl.rs_set_state)(context, stack.rasterizers[cull_back as usize * 2 + mirrored as usize].as_ptr());
-                        let blend_state = match blend {
-                            Blend::Replace => null_mut(),
-                            Blend::Alpha => stack.over.as_ptr(),
-                            Blend::Add => stack.add.as_ptr(),
-                        };
-                        (vtbl.om_set_blend_state)(context, blend_state, null(), 0xFFFF_FFFF);
-                        let vertex_view = buffers.vertex_srv.as_ptr();
-                        (vtbl.vs_set_shader_resources)(context, 0, 1, &vertex_view);
-                        let picture = surface.unwrap_or(stack.blank.1.as_ptr());
-                        (vtbl.ps_set_shader_resources)(context, 3, 1, &picture);
-                        (vtbl.ia_set_index_buffer)(context, buffers.indices.as_ptr(), FORMAT_R32_UINT, 0);
-                        (vtbl.draw_indexed_instanced)(context, index_count, draw.instance_count, first_index, 0, 0);
+            for &rect in &rects {
+                let partial = scissored != 0;
+                if partial {
+                    let scissor = D3dRect { left: rect[0] as i32, top: rect[1] as i32, right: (rect[0] + rect[2]) as i32, bottom: (rect[1] + rect[3]) as i32 };
+                    (vtbl.rs_set_scissor_rects)(context, 1, &scissor);
+                }
+                let backdrop = if partial { Some(frame.fill()) } else { frame.backdrop() };
+                if let Some(rows) = backdrop {
+                    let ramp = BackdropBlock { rows };
+                    write_constants(context, stack.backdrop.as_ptr(), bytes_of(&ramp));
+                    (vtbl.vs_set_shader)(context, stack.backdrop_vs.as_ptr(), null(), 0);
+                    (vtbl.ps_set_shader)(context, stack.backdrop_ps.as_ptr(), null(), 0);
+                    (vtbl.om_set_depth_stencil_state)(context, stack.depth_states[DEPTH_ALWAYS].as_ptr(), 0);
+                    (vtbl.rs_set_state)(context, stack.rasterizers[scissored].as_ptr());
+                    (vtbl.om_set_blend_state)(context, null_mut(), null(), 0xFFFF_FFFF);
+                    (vtbl.draw_instanced)(context, 3, 1, 0, 0);
+                }
+
+                for draw in &frame.draws {
+                    if partial && !frame.draw_reaches(draw, rect) {
+                        continue;
                     }
-                    DrawKind::Lines { lines, style } => {
-                        let Some(set) = job.segments.get(lines as usize).and_then(|id| segments.get(id)) else { continue };
-                        let (Some(style), Some((_, view))) = (frame.line_styles.get(style as usize), set.view.as_ref()) else { continue };
-                        if set.count == 0 {
-                            continue;
+                    match draw.kind {
+                        DrawKind::Mesh { mesh, first_index, index_count, texture, cull_back, mirrored, blend, mask } => {
+                            let Some(buffers) = job.meshes.get(mesh as usize).and_then(|id| meshes.get(id)) else { continue };
+                            let surface = texture
+                                .and_then(|index| job.textures.get(index as usize).copied().flatten())
+                                .and_then(|id| textures.get(&id))
+                                .map(|(_, srv)| srv.as_ptr());
+                            let replace = blend == Blend::Replace;
+                            let bias = if replace { frame.face_bias } else { 0.0 };
+                            let mut flags = 0;
+                            if mask {
+                                flags |= DRAW_MASK;
+                            }
+                            if surface.is_some() {
+                                flags |= DRAW_TEXTURED;
+                            }
+                            if replace {
+                                flags |= DRAW_REPLACE;
+                            }
+                            // with four samples a cut-out's edge becomes coverage
+                            let coverage = mask && target.color.is_some();
+                            if coverage {
+                                flags |= DRAW_COVERAGE;
+                            }
+                            // how the mesh lays out its morphs and its skin
+                            flags |= frame.meshes.get(mesh as usize).map_or(0, |mesh| mesh.deform_flags());
+                            let block = DrawBlock { first_instance: draw.first_instance, flags, near, far, bias: [bias, 0.0, 0.0, 0.0], ..DrawBlock::default() };
+                            write_constants(context, stack.draw.as_ptr(), bytes_of(&block));
+                            (vtbl.vs_set_shader)(context, stack.mesh_vs.as_ptr(), null(), 0);
+                            let pixel = if bias > 0.0 { &stack.stepped_ps } else { &stack.mesh_ps };
+                            (vtbl.ps_set_shader)(context, pixel.as_ptr(), null(), 0);
+                            let depth = if replace { DEPTH_OPAQUE } else { DEPTH_SEE_THROUGH };
+                            (vtbl.om_set_depth_stencil_state)(context, stack.depth_states[depth].as_ptr(), 0);
+                            // the instances mirror the mesh: its front turns the other way
+                            (vtbl.rs_set_state)(context, stack.rasterizers[scissored + cull_back as usize * 2 + mirrored as usize].as_ptr());
+                            let blend_state = match blend {
+                                Blend::Replace if coverage => stack.coverage.as_ptr(),
+                                Blend::Replace => null_mut(),
+                                Blend::Alpha => stack.over.as_ptr(),
+                                Blend::Add => stack.add.as_ptr(),
+                            };
+                            (vtbl.om_set_blend_state)(context, blend_state, null(), 0xFFFF_FFFF);
+                            let vertex_view = buffers.vertex_srv.as_ptr();
+                            (vtbl.vs_set_shader_resources)(context, 0, 1, &vertex_view);
+                            let deform_view = buffers.deform.as_ref().map_or(stack.no_deform.1.as_ptr(), |(_, view)| view.as_ptr());
+                            (vtbl.vs_set_shader_resources)(context, 11, 1, &deform_view);
+                            let picture = surface.unwrap_or(stack.blank.1.as_ptr());
+                            (vtbl.ps_set_shader_resources)(context, 3, 1, &picture);
+                            (vtbl.ia_set_index_buffer)(context, buffers.indices.as_ptr(), FORMAT_R32_UINT, 0);
+                            (vtbl.draw_indexed_instanced)(context, index_count, draw.instance_count, first_index, 0, 0);
                         }
-                        let depth = match style.shape[3] as u32 {
-                            0 => DEPTH_LINES_TESTED,
-                            1 => DEPTH_LINES_HIDDEN,
-                            _ => DEPTH_ALWAYS,
-                        };
-                        let block = DrawBlock {
-                            first_instance: draw.first_instance,
-                            flags: 0,
-                            near,
-                            far,
-                            bias: [0.0; 4],
-                            line_color: style.color,
-                            line_shape: style.shape,
-                        };
-                        write_constants(context, stack.draw.as_ptr(), bytes_of(&block));
-                        (vtbl.vs_set_shader)(context, stack.line_vs.as_ptr(), null(), 0);
-                        (vtbl.ps_set_shader)(context, stack.line_ps.as_ptr(), null(), 0);
-                        (vtbl.om_set_depth_stencil_state)(context, stack.depth_states[depth].as_ptr(), 0);
-                        (vtbl.rs_set_state)(context, stack.rasterizers[0].as_ptr());
-                        (vtbl.om_set_blend_state)(context, stack.over.as_ptr(), null(), 0xFFFF_FFFF);
-                        let segment_view = view.as_ptr();
-                        (vtbl.vs_set_shader_resources)(context, 4, 1, &segment_view);
-                        (vtbl.draw_instanced)(context, 6, set.count, 0, 0);
+                        DrawKind::Lines { lines, style } => {
+                            let Some(set) = job.segments.get(lines as usize).and_then(|id| segments.get(id)) else { continue };
+                            let (Some(style), Some((_, view))) = (frame.line_styles.get(style as usize), set.view.as_ref()) else { continue };
+                            if set.count == 0 {
+                                continue;
+                            }
+                            let depth = match style.shape[3] as u32 {
+                                0 => DEPTH_LINES_TESTED,
+                                1 => DEPTH_LINES_HIDDEN,
+                                _ => DEPTH_ALWAYS,
+                            };
+                            let block = DrawBlock {
+                                first_instance: draw.first_instance,
+                                flags: 0,
+                                near,
+                                far,
+                                bias: [0.0; 4],
+                                line_color: style.color,
+                                line_shape: style.shape,
+                            };
+                            write_constants(context, stack.draw.as_ptr(), bytes_of(&block));
+                            (vtbl.vs_set_shader)(context, stack.line_vs.as_ptr(), null(), 0);
+                            (vtbl.ps_set_shader)(context, stack.line_ps.as_ptr(), null(), 0);
+                            (vtbl.om_set_depth_stencil_state)(context, stack.depth_states[depth].as_ptr(), 0);
+                            (vtbl.rs_set_state)(context, stack.rasterizers[scissored].as_ptr());
+                            (vtbl.om_set_blend_state)(context, stack.over.as_ptr(), null(), 0xFFFF_FFFF);
+                            let segment_view = view.as_ptr();
+                            (vtbl.vs_set_shader_resources)(context, 4, 1, &segment_view);
+                            (vtbl.draw_instanced)(context, 6, set.count, 0, 0);
+                        }
                     }
                 }
             }
@@ -933,6 +1578,18 @@ impl D3dWorld {
                     FORMAT_RGBA8,
                 );
             }
+            if let Some((glow_samples, _)) = bloom.and_then(|bloom| bloom.glow_samples.as_ref()) {
+                let glow = &bloom.expect("a bloom").glow;
+                (vtbl.resolve_subresource)(context, glow.texture.as_ptr().cast(), 0, glow_samples.as_ptr().cast(), 0, FORMAT_R8_UNORM);
+            }
+            // the maps leave the slots they were read from: the next shadow
+            // pass draws into them
+            let none: *mut Srv = null_mut();
+            (vtbl.ps_set_shader_resources)(context, 5, 1, &none);
+            (vtbl.ps_set_shader_resources)(context, 13, 1, &none);
+            if let Some(bloom) = bloom {
+                encode_bloom(context, stack, target, bloom, frame.bloom);
+            }
         }
     }
 
@@ -941,37 +1598,33 @@ impl D3dWorld {
     /// the CPU's `soft::draw` gives for the same frame. For the parity
     /// harness; `None` when the pass cannot stand.
     pub(super) fn draw_single(&mut self, frame: &Rc<WorldFrame>, images: &dyn ImageEngine) -> Option<Vec<u8>> {
-        let samples = frame.samples.clamp(1, 4);
-        let door = self.door()?;
-        let target = door.make_target(frame.size.0, frame.size.1, samples)?;
-        let mut meshes = Vec::new();
-        for mesh in &frame.meshes {
-            meshes.push(door.make_mesh(&mesh.vertex_bytes(), &mesh.index_bytes())?);
-        }
-        let mut segments = Vec::new();
-        for lines in &frame.lines {
-            segments.push(door.make_segments(&segment_bytes(lines.segments()))?);
-        }
-        let mut textures = Vec::new();
-        for picture in &frame.textures {
-            textures.push(bunny_ui::world::texture::texture_of(images, picture).and_then(|texture| {
-                let levels: Vec<&[u8]> = texture.levels.iter().map(|level| level.rgba.as_slice()).collect();
-                door.make_texture(texture.levels[0].width, texture.levels[0].height, &levels)
-            }));
-        }
-        let job = WorldJob { target, size: frame.size, samples, frame: Rc::clone(frame), meshes, textures, segments };
+        let job = WorldJob::single(self.door()?, frame, images)?;
         self.encode(std::slice::from_ref(&job));
-        let out = self.read_target(target);
-        self.drop_target(job.target);
-        for id in job.meshes {
-            self.drop_mesh(id);
-        }
-        for id in job.segments {
-            self.drop_segments(id);
-        }
-        for id in job.textures.into_iter().flatten() {
-            self.drop_texture(id);
-        }
+        let out = self.read_target(job.target);
+        job.give_back(self);
+        out
+    }
+
+    /// `before` drawn whole into a target of its own, then `after` over it
+    /// as a box draws its next frame — slid by `shift`, then `rects` drawn
+    /// again ([`WorldJob::over`]) — read back as [`D3dWorld::draw_single`]
+    /// reads: what `after` drawn whole gives, when the redraw is right.
+    /// For the parity harness.
+    pub(super) fn draw_over(
+        &mut self,
+        before: &Rc<WorldFrame>,
+        after: &Rc<WorldFrame>,
+        shift: [i32; 2],
+        rects: &[[u32; 4]],
+        images: &dyn ImageEngine,
+    ) -> Option<Vec<u8>> {
+        let under = WorldJob::single(self.door()?, before, images)?;
+        self.encode(std::slice::from_ref(&under));
+        let over = WorldJob::over(self.door()?, &under, after, images, shift, rects.to_vec())?;
+        self.encode(std::slice::from_ref(&over));
+        let out = self.read_target(over.target);
+        over.give_back_over(self);
+        under.give_back(self);
         out
     }
 
@@ -1010,6 +1663,90 @@ impl D3dWorld {
             (vtbl.unmap)(context, staging.as_ptr().cast(), 0);
         }
         Some(bytes)
+    }
+}
+
+/// The chain over a resolved target: four steps down from its colours and
+/// glow, three back up, and the spill blended over the target. A texture
+/// becomes a view to draw into before the step after reads it.
+unsafe fn encode_bloom(context: *mut Context, stack: &WorldStack, target: &Target, bloom: &BloomTargets, strength: u16) {
+    unsafe {
+        let vtbl = &*(*context).vtbl;
+        (vtbl.vs_set_shader)(context, stack.backdrop_vs.as_ptr(), null(), 0);
+        (vtbl.om_set_depth_stencil_state)(context, null_mut(), 0);
+        (vtbl.rs_set_state)(context, stack.rasterizers[0].as_ptr());
+        let block = stack.bloom.as_ptr();
+        (vtbl.ps_set_constant_buffers)(context, 3, 1, &block);
+        let step = |rtv: *mut Rtv, size: (u32, u32), shader: &Com<PixelShader>, above: *mut Srv, second: *mut Srv, values: [f32; 4]| {
+            let none: [*mut Srv; 2] = [null_mut(); 2];
+            (vtbl.ps_set_shader_resources)(context, 9, 2, none.as_ptr());
+            (vtbl.om_set_render_targets)(context, 1, &rtv, null_mut());
+            let port = Viewport { top_left_x: 0.0, top_left_y: 0.0, width: size.0 as f32, height: size.1 as f32, min_depth: 0.0, max_depth: 1.0 };
+            (vtbl.rs_set_viewports)(context, 1, &port);
+            write_constants(context, block, bytes_of(&values));
+            (vtbl.ps_set_shader)(context, shader.as_ptr(), null(), 0);
+            let views = [above, second];
+            (vtbl.ps_set_shader_resources)(context, 9, 2, views.as_ptr());
+            (vtbl.draw_instanced)(context, 3, 1, 0, 0);
+        };
+        let [down, up, spill] = &stack.bloom_ps;
+        (vtbl.om_set_blend_state)(context, null_mut(), null(), 0xFFFF_FFFF);
+        step(bloom.down[0].rtv.as_ptr(), bloom.down[0].size, down, target.resolve_srv.as_ptr(), bloom.glow.srv.as_ptr(), [1.0, 0.0, 0.0, 0.0]);
+        for level in 1..LEVELS {
+            let above = bloom.down[level - 1].srv.as_ptr();
+            step(bloom.down[level].rtv.as_ptr(), bloom.down[level].size, down, above, above, [0.0; 4]);
+        }
+        let mut lower = bloom.down[LEVELS - 1].srv.as_ptr();
+        for (below, level) in (0..LEVELS - 1).rev().enumerate() {
+            let values = [0.0, 0.0, (below + 1) as f32, 0.0];
+            step(bloom.up[level].rtv.as_ptr(), bloom.up[level].size, up, bloom.down[level].srv.as_ptr(), lower, values);
+            lower = bloom.up[level].srv.as_ptr();
+        }
+        (vtbl.om_set_blend_state)(context, stack.screen.as_ptr(), null(), 0xFFFF_FFFF);
+        step(target.resolve_rtv.as_ptr(), target.size, spill, bloom.glow.srv.as_ptr(), lower, [0.0, strength as f32, 0.0, 0.0]);
+        // nothing of the chain stays bound: the next frame draws into it
+        let none: [*mut Srv; 2] = [null_mut(); 2];
+        (vtbl.ps_set_shader_resources)(context, 9, 2, none.as_ptr());
+        (vtbl.om_set_blend_state)(context, null_mut(), null(), 0xFFFF_FFFF);
+    }
+}
+
+/// A target's bloom: the glow (with samples of its own when the target
+/// takes more than one) and the chain's steps. `None` when one is
+/// refused.
+unsafe fn bloom_targets(device: *mut Device, size: (u32, u32), samples: u8) -> Option<BloomTargets> {
+    unsafe {
+        let step = |format: u32, size: (u32, u32)| -> Option<Step> {
+            let texture = super::make_target_texture(device, size.0, size.1, format, 1)?;
+            let rtv = make_rtv(device, &texture, None)?;
+            let srv = make_srv(device, &texture)?;
+            Some(Step { texture, rtv, srv, size })
+        };
+        let glow = step(FORMAT_R8_UNORM, size)?;
+        let glow_samples = if samples > 1 {
+            let desc = Texture2dDesc {
+                width: size.0,
+                height: size.1,
+                mip_levels: 1,
+                array_size: 1,
+                format: FORMAT_R8_UNORM,
+                sample_count: samples as u32,
+                sample_quality: 0,
+                usage: USAGE_DEFAULT,
+                bind_flags: BIND_RENDER_TARGET,
+                cpu_access_flags: 0,
+                misc_flags: 0,
+            };
+            let texture = texture_2d(device, &desc, None)?;
+            let rtv = make_rtv(device, &texture, None)?;
+            Some((texture, rtv))
+        } else {
+            None
+        };
+        let sizes = bunny_ui::world::bloom::sizes(size);
+        let down = sizes.iter().map(|&size| step(FORMAT_RGBA8, size)).collect::<Option<Vec<Step>>>()?;
+        let up = sizes[..LEVELS - 1].iter().map(|&size| step(FORMAT_RGBA8, size)).collect::<Option<Vec<Step>>>()?;
+        Some(BloomTargets { glow, glow_samples, down, up })
     }
 }
 
@@ -1097,12 +1834,18 @@ impl WorldStack {
                 Com::from_raw(out).ok_or_else(|| format!("null world pixel shader {entry}"))
             };
             let mesh_vs = vertex("world_vertex")?;
+            let shadow_vs = vertex("shadow_vertex")?;
             let line_vs = vertex("line_vertex")?;
             let backdrop_vs = vertex("backdrop_vertex")?;
             let mesh_ps = pixel(&source, "world_fragment", COMPILE_IEEE_STRICTNESS)?;
             let stepped_ps = pixel(&source, "world_fragment_stepped", COMPILE_IEEE_STRICTNESS)?;
             let line_ps = pixel(&source, "line_fragment", COMPILE_IEEE_STRICTNESS)?;
             let backdrop_ps = pixel(&source, "backdrop_fragment", COMPILE_IEEE_STRICTNESS)?;
+            let bloom_ps = [
+                pixel(&source, "bloom_down_fragment", COMPILE_IEEE_STRICTNESS)?,
+                pixel(&source, "bloom_up_fragment", COMPILE_IEEE_STRICTNESS)?,
+                pixel(&source, "bloom_spill_fragment", COMPILE_IEEE_STRICTNESS)?,
+            ];
             let composite_ps = pixel(&composite_source, "world_composite_fragment", 0)?;
 
             let depth_state = |compare: u32, write: bool| -> Result<Com<DepthStencilState>, String> {
@@ -1136,7 +1879,7 @@ impl WorldStack {
                 depth_state(COMPARISON_ALWAYS, false)?,
             ];
 
-            let rasterizer = |cull: u32, counter_clockwise: bool| -> Result<Com<RasterizerState>, String> {
+            let rasterizer = |cull: u32, counter_clockwise: bool, scissor: bool| -> Result<Com<RasterizerState>, String> {
                 let desc = RasterizerDesc {
                     fill_mode: FILL_SOLID,
                     cull_mode: cull,
@@ -1145,7 +1888,7 @@ impl WorldStack {
                     depth_bias_clamp: 0.0,
                     slope_scaled_depth_bias: 0.0,
                     depth_clip_enable: 1,
-                    scissor_enable: 0,
+                    scissor_enable: scissor as i32,
                     multisample_enable: 1,
                     antialiased_line_enable: 0,
                 };
@@ -1158,10 +1901,14 @@ impl WorldStack {
             // the clip space is the frame's, upside up: a front that turns
             // counter-clockwise there is a front here
             let rasterizers = [
-                rasterizer(CULL_NONE, true)?,
-                rasterizer(CULL_NONE, false)?,
-                rasterizer(CULL_BACK, true)?,
-                rasterizer(CULL_BACK, false)?,
+                rasterizer(CULL_NONE, true, false)?,
+                rasterizer(CULL_NONE, false, false)?,
+                rasterizer(CULL_BACK, true, false)?,
+                rasterizer(CULL_BACK, false, false)?,
+                rasterizer(CULL_NONE, true, true)?,
+                rasterizer(CULL_NONE, false, true)?,
+                rasterizer(CULL_BACK, true, true)?,
+                rasterizer(CULL_BACK, false, true)?,
             ];
 
             // over: rgb = s + d·(1−sa), a = sa + da·(1−sa); add: rgb = s + d,
@@ -1186,6 +1933,25 @@ impl WorldStack {
             };
             let over = blend_state(BLEND_ONE, BLEND_INV_SRC_ALPHA, BLEND_ONE, BLEND_INV_SRC_ALPHA)?;
             let add = blend_state(BLEND_ONE, BLEND_ONE, BLEND_INV_DEST_ALPHA, BLEND_ONE)?;
+            let screen = blend_state(BLEND_INV_DEST_COLOR, BLEND_ONE, BLEND_INV_DEST_ALPHA, BLEND_ONE)?;
+            let coverage = {
+                let target = RenderTargetBlendDesc {
+                    blend_enable: 0,
+                    src_blend: BLEND_ONE,
+                    dest_blend: BLEND_ONE,
+                    blend_op: BLEND_OP_ADD,
+                    src_blend_alpha: BLEND_ONE,
+                    dest_blend_alpha: BLEND_ONE,
+                    blend_op_alpha: BLEND_OP_ADD,
+                    write_mask: 0x0F,
+                };
+                let desc = BlendDesc { alpha_to_coverage: 1, independent_blend: 0, render_target: [target; 8] };
+                let mut state: *mut BlendState = null_mut();
+                if !com_ok(((*(*device).vtbl).create_blend_state)(device, &desc, &mut state)) {
+                    return Err("the coverage blend state refused".to_string());
+                }
+                Com::from_raw(state).ok_or("null coverage blend state")?
+            };
 
             let sampler_desc = SamplerDesc {
                 filter: FILTER_MIN_MAG_MIP_LINEAR,
@@ -1204,6 +1970,44 @@ impl WorldStack {
                 return Err("world sampler refused".to_string());
             }
             let sampler = Com::from_raw(sampler).ok_or("null world sampler")?;
+            let comparing = |function: u32| -> Result<Com<SamplerState>, String> {
+                let desc = SamplerDesc {
+                    filter: FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT,
+                    address_u: ADDRESS_CLAMP,
+                    address_v: ADDRESS_CLAMP,
+                    address_w: ADDRESS_CLAMP,
+                    mip_lod_bias: 0.0,
+                    max_anisotropy: 1,
+                    comparison_func: function,
+                    border_color: [0.0; 4],
+                    min_lod: 0.0,
+                    max_lod: 0.0,
+                };
+                let mut state: *mut SamplerState = null_mut();
+                if !com_ok(((*(*device).vtbl).create_sampler_state)(device, &desc, &mut state)) {
+                    return Err("the shadow sampler refused".to_string());
+                }
+                Com::from_raw(state).ok_or_else(|| "null shadow sampler".to_string())
+            };
+            let compare = comparing(COMPARISON_LESS_EQUAL)?;
+            let always = comparing(COMPARISON_ALWAYS)?;
+            let lit_desc = Texture2dDesc {
+                width: 1,
+                height: 1,
+                mip_levels: 1,
+                array_size: 1,
+                format: FORMAT_R16_UNORM,
+                sample_count: 1,
+                sample_quality: 0,
+                usage: USAGE_IMMUTABLE,
+                bind_flags: BIND_SHADER_RESOURCE,
+                cpu_access_flags: 0,
+                misc_flags: 0,
+            };
+            let far = [0xFFu8; 2];
+            let level = [SubresourceData { memory: far.as_ptr().cast(), pitch: 2, slice_pitch: 0 }];
+            let lit = texture_2d(device, &lit_desc, Some(&level)).ok_or("no lit texel")?;
+            let lit_srv = make_srv(device, &lit).ok_or("no lit texel view")?;
 
             let blank_desc = Texture2dDesc {
                 width: 1,
@@ -1222,25 +2026,41 @@ impl WorldStack {
             let level = [SubresourceData { memory: white.as_ptr().cast(), pitch: 4, slice_pitch: 0 }];
             let blank = texture_2d(device, &blank_desc, Some(&level)).ok_or("no blank texture")?;
             let blank_srv = make_srv(device, &blank).ok_or("no blank texture view")?;
+            let black = [0u8, 0, 0, 255];
+            let level = [SubresourceData { memory: black.as_ptr().cast(), pitch: 4, slice_pitch: 0 }];
+            let dark = texture_2d(device, &blank_desc, Some(&level)).ok_or("no dark texel")?;
+            let dark_srv = make_srv(device, &dark).ok_or("no dark texel view")?;
+            let no_deform = filled_buffer(device, &[0; 4], BIND_SHADER_RESOURCE, 4).ok_or("no empty deform stream")?;
+            let no_deform_view = buffer_view(device, &no_deform, 1).ok_or("no empty deform view")?;
 
             Ok(WorldStack {
                 mesh_vs,
+                shadow_vs,
                 line_vs,
                 backdrop_vs,
                 mesh_ps,
                 stepped_ps,
                 line_ps,
                 backdrop_ps,
+                bloom_ps,
+                screen,
                 composite_ps,
                 depth_states,
                 rasterizers,
                 over,
                 add,
+                coverage,
                 sampler,
+                compare,
+                always,
+                lit: (lit, lit_srv),
                 blank: (blank, blank_srv),
+                dark: (dark, dark_srv),
+                no_deform: (no_deform, no_deform_view),
                 uniforms: make_constant_buffer(device, bunny_ui::world::wire::frame_offset::SIZE as u32).ok_or("world constants refused")?,
                 draw: make_constant_buffer(device, std::mem::size_of::<DrawBlock>() as u32).ok_or("draw constants refused")?,
                 backdrop: make_constant_buffer(device, std::mem::size_of::<BackdropBlock>() as u32).ok_or("backdrop constants refused")?,
+                bloom: make_constant_buffer(device, 16).ok_or("bloom constants refused")?,
             })
         }
     }
@@ -1248,7 +2068,11 @@ impl WorldStack {
 
 impl WorldGround for D3dWorld {
     fn world_caps(&self) -> WorldCaps {
-        WorldCaps { samples: 4 }
+        // the adapter's name is not read here: the ask stands
+        // the samples stay in their texture between frames: a part
+        // redraws over them, and the resolve gives back the rest unchanged;
+        // a copy slides a picture; timestamp queries time each job
+        WorldCaps { samples: 4, start: bunny_ui::world::Quality::High, redraw_samples: 4, slides: true, timers: true }
     }
 
     fn make_target(&mut self, width: u32, height: u32, samples: u8) -> Option<u64> {
@@ -1286,7 +2110,7 @@ impl WorldGround for D3dWorld {
                 return None;
             }
             let dsv = Com::from_raw(dsv)?;
-            Target { resolve, resolve_srv, resolve_rtv, color, _depth: depth, dsv, size: (width, height) }
+            Target { resolve, resolve_srv, resolve_rtv, color, _depth: depth, dsv, size: (width, height), samples: samples.max(1) }
         };
         let id = self.mint();
         self.targets.insert(id, target);
@@ -1296,10 +2120,11 @@ impl WorldGround for D3dWorld {
     fn drop_target(&mut self, id: u64) {
         // a frame in flight keeps what it reads: the context holds its
         // own references to what is bound
+        self.blooms.remove(&id);
         self.targets.remove(&id);
     }
 
-    fn make_mesh(&mut self, vertices: &[u8], indices: &[u8]) -> Option<u64> {
+    fn make_mesh(&mut self, vertices: &[u8], indices: &[u8], deform: &[u8]) -> Option<u64> {
         use bunny_ui::world::mesh::VERTEX_STRIDE;
         if vertices.len() < VERTEX_STRIDE || indices.len() < 4 {
             return None;
@@ -1309,7 +2134,14 @@ impl WorldGround for D3dWorld {
             let vertex_buffer = filled_buffer(device, vertices, BIND_SHADER_RESOURCE, VERTEX_STRIDE as u32)?;
             let vertex_srv = buffer_view(device, &vertex_buffer, (vertices.len() / VERTEX_STRIDE) as u32)?;
             let indices = filled_buffer(device, indices, BIND_INDEX_BUFFER, 0)?;
-            MeshBuffers { _vertices: vertex_buffer, vertex_srv, indices }
+            let deform = if deform.len() >= 4 {
+                let buffer = filled_buffer(device, deform, BIND_SHADER_RESOURCE, 4)?;
+                let view = buffer_view(device, &buffer, (deform.len() / 4) as u32)?;
+                Some((buffer, view))
+            } else {
+                None
+            };
+            MeshBuffers { _vertices: vertex_buffer, vertex_srv, indices, deform }
         };
         let id = self.mint();
         self.meshes.insert(id, buffers);
@@ -1380,6 +2212,78 @@ impl WorldGround for D3dWorld {
     fn drop_segments(&mut self, id: u64) {
         self.segments.remove(&id);
     }
+
+    fn make_shadow_map(&mut self, size: u32) -> Option<u64> {
+        let device = self.device;
+        let map = unsafe {
+            // one texture behind two views: a 16-bit depth to draw into,
+            // the same bits as a value to compare against
+            let desc = Texture2dDesc {
+                width: size,
+                height: size,
+                mip_levels: 1,
+                array_size: 1,
+                format: FORMAT_R16_TYPELESS,
+                sample_count: 1,
+                sample_quality: 0,
+                usage: USAGE_DEFAULT,
+                bind_flags: BIND_DEPTH_STENCIL | BIND_SHADER_RESOURCE,
+                cpu_access_flags: 0,
+                misc_flags: 0,
+            };
+            let texture = texture_2d(device, &desc, None)?;
+            let dsv_desc = DsvDesc { format: FORMAT_D16_UNORM, view_dimension: DSV_DIMENSION_TEXTURE2D, flags: 0, mip_slice: 0, _union_pad: [0; 2] };
+            let mut dsv: *mut Dsv = null_mut();
+            if !com_ok(((*(*device).vtbl).create_depth_stencil_view)(device, texture.as_ptr().cast(), (&dsv_desc as *const DsvDesc).cast(), &mut dsv)) {
+                return None;
+            }
+            let dsv = Com::from_raw(dsv)?;
+            // the view of a 2D texture: its first level, one level
+            let srv_desc = SrvDesc { format: FORMAT_R16_UNORM, view_dimension: SRV_DIMENSION_TEXTURE2D, first_element: 0, num_elements: 1, _union_pad: [0; 2] };
+            let mut srv: *mut Srv = null_mut();
+            if !com_ok(((*(*device).vtbl).create_shader_resource_view)(device, texture.as_ptr().cast(), &srv_desc, &mut srv)) {
+                return None;
+            }
+            let srv = Com::from_raw(srv)?;
+            ShadowMap { _texture: texture, dsv, srv, size }
+        };
+        let id = self.mint();
+        self.shadow_maps.insert(id, map);
+        Some(id)
+    }
+
+    fn drop_shadow_map(&mut self, id: u64) {
+        self.shadow_maps.remove(&id);
+    }
+
+    fn take_timings(&mut self) -> Vec<WorldTiming> {
+        let context = self.context;
+        let mut timings = Vec::new();
+        self.timers.retain(|(target, [span, first, last])| unsafe {
+            let vtbl = &*(*context).vtbl;
+            let mut clock = TimestampDisjoint::default();
+            let size = std::mem::size_of::<TimestampDisjoint>() as u32;
+            if (vtbl.get_data)(context, span.as_ptr().cast(), (&mut clock as *mut TimestampDisjoint).cast(), size, ASYNC_GETDATA_DONOTFLUSH) != S_OK {
+                return true;
+            }
+            let read = |query: &Com<Query>, out: &mut u64| {
+                (vtbl.get_data)(context, query.as_ptr().cast(), (out as *mut u64).cast(), 8, ASYNC_GETDATA_DONOTFLUSH) == S_OK
+            };
+            let (mut from, mut to) = (0u64, 0u64);
+            if !(read(first, &mut from) && read(last, &mut to)) {
+                return true;
+            }
+            // a clock that jumped while they ran gives no measure
+            if clock.disjoint == 0 && clock.frequency > 0 && to >= from {
+                let seconds = (to - from) as f64 / clock.frequency as f64;
+                if WorldTiming::plausible(seconds) {
+                    timings.push(WorldTiming { target: *target, seconds });
+                }
+            }
+            false
+        });
+        timings
+    }
 }
 
 // MARK: - Tests
@@ -1430,6 +2334,40 @@ mod tests {
             let s = Spread::of(&ours, &oracle);
             eprintln!("{}: worst {} · >1 {} · >3 {} · >16 {} of {}", scene.name, s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
             assert!(s.within(scene.tolerance), "{} is beyond its tolerance", scene.name);
+        }
+    }
+
+    #[test]
+    fn each_world_job_is_timed_on_the_gpu() {
+        use bunny_ui::gpu::world::{WorldGround, WorldTiming};
+        use bunny_ui::gpu::world_scenes::world_scene;
+        let Some(mut gpu) = harness() else { return };
+        let frame = world_scene(6).frame;
+        // three times: the first draw may also build the shaders
+        let mut timings = Vec::new();
+        for _ in 0..3 {
+            gpu.world_rgba(&frame).expect("the world pass");
+            timings.extend(gpu.ground.world.take_timings());
+        }
+        eprintln!("{}: {timings:?}", world_scene(6).name);
+        assert!(timings.len() <= 3 && timings.iter().all(|t| WorldTiming::plausible(t.seconds)), "{timings:?}");
+        // a software rasterizer's clock may give no time it can vouch for
+        let adapter = super::super::adapter_description(&gpu.stack.device).expect("the adapter");
+        let warp = super::super::Driver::Hardware.precision(adapter.vendor, adapter.device) == super::super::Driver::Warp;
+        assert!(!timings.is_empty() || warp, "no job was timed");
+    }
+
+    #[test]
+    fn every_redraw_of_the_catalog_matches_its_whole_picture() {
+        use bunny_ui::gpu::world_scenes::{REDRAWS, world_redraw};
+        let Some(mut gpu) = harness() else { return };
+        for index in 0..REDRAWS {
+            let redraw = world_redraw(index);
+            let over = gpu.world_over_rgba(&redraw.before, &redraw.after, redraw.shift, &redraw.rects).expect("the world pass");
+            let whole = gpu.world_rgba(&redraw.after).expect("the world pass");
+            let s = Spread::of(&over, &whole);
+            eprintln!("{} in {:?}: worst {} · >1 {} of {}", redraw.name, redraw.rects, s.worst, s.beyond[0], s.pixels);
+            assert!(s.worst <= redraw.worst, "{}: the redraw is not the whole picture", redraw.name);
         }
     }
 
@@ -1547,9 +2485,9 @@ mod tests {
     #[test]
     fn the_wire_blocks_hold_their_layout() {
         assert_eq!(std::mem::size_of::<super::DrawBlock>(), 64);
-        assert_eq!(std::mem::size_of::<super::BackdropBlock>(), 48);
+        assert_eq!(std::mem::size_of::<super::BackdropBlock>(), 96);
         assert_eq!(bunny_ui::world::mesh::VERTEX_STRIDE, 32, "WorldVertex reads 32 bytes");
-        assert_eq!(bunny_ui::world::wire::instance_offset::SIZE, 112, "WorldInstance reads 112 bytes");
+        assert_eq!(bunny_ui::world::wire::instance_offset::SIZE, 128, "WorldInstance reads 128 bytes");
         assert_eq!(bunny_ui::world::wire::SEGMENT_STRIDE, 24, "WorldSegment reads 24 bytes");
     }
 }

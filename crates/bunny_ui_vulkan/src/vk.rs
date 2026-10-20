@@ -137,6 +137,7 @@ type Framebuffer = u64;
 type BufferHandle = u64;
 type DeviceMemory = u64;
 type Fence = u64;
+type QueryPool = u64;
 type Semaphore = u64;
 type CommandPool = u64;
 type Sampler = u64;
@@ -157,6 +158,7 @@ const ST_INSTANCE_CREATE: u32 = 1;
 const ST_DEVICE_QUEUE_CREATE: u32 = 2;
 const ST_DEVICE_CREATE: u32 = 3;
 const ST_SUBMIT_INFO: u32 = 4;
+const ST_QUERY_POOL_CREATE: u32 = 11;
 const ST_MEMORY_ALLOCATE: u32 = 5;
 const ST_FENCE_CREATE: u32 = 8;
 const ST_SEMAPHORE_CREATE: u32 = 9;
@@ -876,6 +878,33 @@ struct ImageMemoryBarrier {
     layer_count: u32,
 }
 
+/// `VkQueryPoolCreateInfo`.
+#[repr(C)]
+struct QueryPoolCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    query_type: u32,
+    query_count: u32,
+    pipeline_statistics: u32,
+}
+
+/// `VkImageCopy`: a region of one image's colour onto another's.
+#[repr(C)]
+struct ImageCopy {
+    src_aspect: u32,
+    src_mip: u32,
+    src_base_layer: u32,
+    src_layer_count: u32,
+    src_offset: [i32; 3],
+    dst_aspect: u32,
+    dst_mip: u32,
+    dst_base_layer: u32,
+    dst_layer_count: u32,
+    dst_offset: [i32; 3],
+    extent: [u32; 3],
+}
+
 #[repr(C)]
 struct BufferImageCopy {
     buffer_offset: u64,
@@ -1238,6 +1267,12 @@ struct VkFns {
         unsafe extern "C" fn(CommandBuffer, BufferHandle, ImageHandle, u32, u32, *const BufferImageCopy),
     cmd_copy_image_to_buffer:
         unsafe extern "C" fn(CommandBuffer, ImageHandle, u32, BufferHandle, u32, *const BufferImageCopy),
+    cmd_copy_image: unsafe extern "C" fn(CommandBuffer, ImageHandle, u32, ImageHandle, u32, u32, *const ImageCopy),
+    create_query_pool: unsafe extern "C" fn(Device, *const QueryPoolCreateInfo, *const c_void, *mut QueryPool) -> i32,
+    destroy_query_pool: unsafe extern "C" fn(Device, QueryPool, *const c_void),
+    cmd_reset_query_pool: unsafe extern "C" fn(CommandBuffer, QueryPool, u32, u32),
+    cmd_write_timestamp: unsafe extern "C" fn(CommandBuffer, u32, QueryPool, u32),
+    get_query_pool_results: unsafe extern "C" fn(Device, QueryPool, u32, u32, usize, *mut c_void, u64, u32) -> i32,
     cmd_begin_render_pass:
         unsafe extern "C" fn(CommandBuffer, *const RenderPassBeginInfo, u32),
     cmd_end_render_pass: unsafe extern "C" fn(CommandBuffer),
@@ -1341,6 +1376,12 @@ fn resolve_fns(gipa: GipaFn, instance: Instance) -> Option<VkFns> {
         cmd_pipeline_barrier: vk!(c"vkCmdPipelineBarrier"),
         cmd_copy_buffer_to_image: vk!(c"vkCmdCopyBufferToImage"),
         cmd_copy_image_to_buffer: vk!(c"vkCmdCopyImageToBuffer"),
+        cmd_copy_image: vk!(c"vkCmdCopyImage"),
+        create_query_pool: vk!(c"vkCreateQueryPool"),
+        destroy_query_pool: vk!(c"vkDestroyQueryPool"),
+        cmd_reset_query_pool: vk!(c"vkCmdResetQueryPool"),
+        cmd_write_timestamp: vk!(c"vkCmdWriteTimestamp"),
+        get_query_pool_results: vk!(c"vkGetQueryPoolResults"),
         cmd_begin_render_pass: vk!(c"vkCmdBeginRenderPass"),
         cmd_end_render_pass: vk!(c"vkCmdEndRenderPass"),
         cmd_bind_pipeline: vk!(c"vkCmdBindPipeline"),
@@ -4861,10 +4902,26 @@ impl OffscreenVk {
         self.world.draw_single(&self.stack, command, fence, frame, images)
     }
 
+    /// `before` drawn whole, then `after` over it — slid by `shift`, then
+    /// `rects` drawn again — read back: what `after` drawn whole gives,
+    /// when the redraw is right.
+    #[cfg(feature = "3d")]
+    pub fn world_over_rgba(
+        &mut self,
+        before: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+        after: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+        shift: [i32; 2],
+        rects: &[[u32; 4]],
+    ) -> Option<Vec<u8>> {
+        drain_all(&self.stack, &mut self.slots);
+        let (command, fence) = (self.slots[0].command, self.slots[0].fence);
+        self.world.draw_over(&self.stack, command, fence, before, after, shift, rects, &bunny_ui::image_engine::RawImages::default())
+    }
+
     /// How many worlds the last frame drew: a held picture draws none.
     #[cfg(feature = "3d")]
     pub fn world_jobs(&self) -> usize {
-        self.batches.worlds.len()
+        self.batches.box_worlds()
     }
 
     /// The rendered bytes, R,G,B,A per pixel — rows already top-first
@@ -5515,7 +5572,11 @@ mod tests {
             "world_line.frag",
             "world_backdrop.vert",
             "world_backdrop.frag",
+            "world_shadow.vert",
             "world_composite.frag",
+            "world_bloom_down.frag",
+            "world_bloom_up.frag",
+            "world_bloom_spill.frag",
         ] {
             let out = std::env::temp_dir().join(format!("bunny-drift-{stage}.spv"));
             let status = std::process::Command::new("glslangValidator")

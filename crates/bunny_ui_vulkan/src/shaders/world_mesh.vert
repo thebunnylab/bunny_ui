@@ -20,6 +20,10 @@ layout(std140, set = 0, binding = 0) uniform World {
     vec4 point_position[8];
     vec4 point_color[8];
     uvec4 point_groups[2];
+    vec4 floor_u;
+    vec4 floor_v;
+    mat4 moving_from_eye;
+    vec4 moving;
 };
 
 // (flags, near, far, step back): what one draw adds to the frame
@@ -35,6 +39,7 @@ layout(push_constant) uniform Draw {
 const uint DRAW_MASK = 1u;
 const uint DRAW_TEXTURED = 2u;
 const uint DRAW_REPLACE = 4u;
+const uint DRAW_COVERAGE = 8u;
 const uint MATERIAL_UNLIT = 1u;
 const uint MATERIAL_MASK = 4u;
 const float LINE_PULL = 2.0e-3;
@@ -61,11 +66,77 @@ float encode_code(float linear) {
 }
 const float SRGB_DECODE[256] = float[256](0.0, 0.000303527, 0.000607054, 0.000910581, 0.001214108, 0.001517635, 0.001821162, 0.0021246888, 0.002428216, 0.0027317428, 0.00303527, 0.0033465358, 0.0036765074, 0.004024717, 0.004391442, 0.0047769533, 0.0051815165, 0.0056053917, 0.006048833, 0.0065120906, 0.00699541, 0.007499032, 0.008023193, 0.008568126, 0.009134059, 0.009721218, 0.010329823, 0.010960094, 0.011612245, 0.012286488, 0.0129830325, 0.013702083, 0.014443844, 0.015208514, 0.015996294, 0.016807375, 0.017641954, 0.01850022, 0.019382361, 0.020288562, 0.02121901, 0.022173885, 0.023153367, 0.024157632, 0.02518686, 0.026241222, 0.027320892, 0.02842604, 0.029556835, 0.030713445, 0.031896032, 0.033104766, 0.034339808, 0.035601314, 0.03688945, 0.038204372, 0.039546236, 0.0409152, 0.04231141, 0.04373503, 0.045186203, 0.046665087, 0.048171826, 0.049706567, 0.051269457, 0.052860647, 0.054480277, 0.05612849, 0.05780543, 0.059511237, 0.061246052, 0.063010015, 0.064803265, 0.06662594, 0.06847817, 0.070360094, 0.07227185, 0.07421357, 0.07618538, 0.07818742, 0.08021982, 0.08228271, 0.08437621, 0.08650046, 0.08865558, 0.09084171, 0.093058966, 0.09530747, 0.09758735, 0.099898726, 0.10224173, 0.104616486, 0.107023105, 0.10946171, 0.11193243, 0.114435375, 0.116970666, 0.11953843, 0.122138776, 0.12477182, 0.12743768, 0.13013647, 0.13286832, 0.13563333, 0.13843161, 0.14126329, 0.14412847, 0.14702727, 0.14995979, 0.15292615, 0.15592647, 0.15896083, 0.16202937, 0.1651322, 0.1682694, 0.17144111, 0.1746474, 0.17788842, 0.18116425, 0.18447499, 0.18782078, 0.19120169, 0.19461784, 0.19806932, 0.20155625, 0.20507874, 0.20863687, 0.21223076, 0.2158605, 0.2195262, 0.22322796, 0.22696587, 0.23074006, 0.23455058, 0.23839757, 0.24228112, 0.24620132, 0.25015828, 0.2541521, 0.25818285, 0.26225066, 0.2663556, 0.2704978, 0.2746773, 0.27889428, 0.28314874, 0.28744084, 0.29177064, 0.29613826, 0.30054379, 0.3049873, 0.30946892, 0.31398872, 0.31854677, 0.3231432, 0.3277781, 0.33245152, 0.33716363, 0.34191442, 0.34670407, 0.3515326, 0.35640013, 0.3613068, 0.3662526, 0.3712377, 0.37626213, 0.38132602, 0.38642943, 0.39157248, 0.39675522, 0.40197778, 0.4072402, 0.4125426, 0.41788507, 0.42326766, 0.4286905, 0.43415365, 0.43965718, 0.4452012, 0.4507858, 0.45641103, 0.462077, 0.4677838, 0.47353148, 0.47932017, 0.48514995, 0.49102086, 0.49693298, 0.5028865, 0.50888133, 0.5149177, 0.52099556, 0.5271151, 0.5332764, 0.5394795, 0.54572445, 0.55201143, 0.5583404, 0.5647115, 0.57112485, 0.57758045, 0.58407843, 0.59061885, 0.59720176, 0.60382736, 0.61049557, 0.6172066, 0.6239604, 0.63075715, 0.63759685, 0.6444797, 0.65140563, 0.65837485, 0.6653873, 0.67244315, 0.6795425, 0.6866853, 0.69387174, 0.7011019, 0.70837575, 0.7156935, 0.7230551, 0.73046076, 0.7379104, 0.7454042, 0.7529422, 0.7605245, 0.76815116, 0.7758222, 0.7835378, 0.7912979, 0.7991027, 0.80695224, 0.8148466, 0.82278574, 0.8307699, 0.838799, 0.8468732, 0.8549926, 0.8631572, 0.8713671, 0.8796224, 0.8879231, 0.8962694, 0.9046612, 0.91309863, 0.92158186, 0.9301109, 0.9386857, 0.9473065, 0.9559733, 0.9646863, 0.9734453, 0.9822506, 0.9911021, 1.0);
 
+layout(std430, set = 0, binding = 2) readonly buffer Parts {
+    uint rows[];
+} parts;
+
+uvec4 part_row(uint index) {
+    uint packed = parts.rows[index];
+    return uvec4(packed & 255u, (packed >> 8) & 255u, (packed >> 16) & 255u, packed >> 24);
+}
+
+layout(std430, set = 0, binding = 3) readonly buffer Joints {
+    vec4 rows[];
+} palette;
+layout(std430, set = 2, binding = 0) readonly buffer Deform {
+    uint words[];
+} deform;
+
+const uint DEFORM_SKIN = 16u;
+
+vec4 joint_row(uint index) {
+    return palette.rows[index];
+}
+
+uint deform_word(uint index) {
+    return deform.words[index];
+}
+
+// the vertex's morphs, weighed by the instance's two 16-bit shares, then
+// its pose: each of its four joints applied to the point, and without
+// the move to the normal, weighed by its share — the CPU's order
+void deform_vertex(uint flags, uint joint_base, uint shares, inout vec3 p, inout vec3 n) {
+    uint morphs = (flags >> 5u) & 3u;
+    bool skinned = (flags & DEFORM_SKIN) != 0u;
+    uint first = uint(gl_VertexIndex) * ((skinned ? 2u : 0u) + 6u * morphs);
+    uint at = first + (skinned ? 2u : 0u);
+    for (uint k = 0u; k < morphs; k++) {
+        float w = float((shares >> (16u * k)) & 65535u) / 65535.0;
+        vec3 moved = vec3(uintBitsToFloat(deform_word(at)), uintBitsToFloat(deform_word(at + 1u)), uintBitsToFloat(deform_word(at + 2u)));
+        vec3 turned = vec3(uintBitsToFloat(deform_word(at + 3u)), uintBitsToFloat(deform_word(at + 4u)), uintBitsToFloat(deform_word(at + 5u)));
+        p = p + w * moved;
+        n = n + w * turned;
+        at += 6u;
+    }
+    if (!skinned || joint_base == 0xFFFFFFFFu) {
+        return;
+    }
+    uint joints = deform_word(first);
+    uint weights = deform_word(first + 1u);
+    vec3 point = vec3(0.0);
+    vec3 normal = vec3(0.0);
+    for (uint k = 0u; k < 4u; k++) {
+        float w = float((weights >> (8u * k)) & 255u) / 255.0;
+        uint row = joint_base + 3u * ((joints >> (8u * k)) & 255u);
+        vec4 r0 = joint_row(row);
+        vec4 r1 = joint_row(row + 1u);
+        vec4 r2 = joint_row(row + 2u);
+        point = point + w * vec3(r0.x * p.x + r0.y * p.y + r0.z * p.z + r0.w,
+                                 r1.x * p.x + r1.y * p.y + r1.z * p.z + r1.w,
+                                 r2.x * p.x + r2.y * p.y + r2.z * p.z + r2.w);
+        normal = normal + w * vec3(r0.x * n.x + r0.y * n.y + r0.z * n.z,
+                                   r1.x * n.x + r1.y * n.y + r1.z * n.z,
+                                   r2.x * n.x + r2.y * n.y + r2.z * n.z);
+    }
+    p = point;
+    n = normal;
+}
+
 layout(location = 0) in vec3 a_position;
 layout(location = 1) in ivec2 a_normal;
 layout(location = 2) in vec2 a_uv;
 layout(location = 3) in uvec4 a_color;
-layout(location = 4) in uvec2 a_ids;
+layout(location = 4) in uvec4 a_ids;
 layout(location = 5) in vec4 i_row0;
 layout(location = 6) in vec4 i_row1;
 layout(location = 7) in vec4 i_row2;
@@ -74,6 +145,7 @@ layout(location = 9) in vec4 i_normal1;
 layout(location = 10) in vec4 i_normal2;
 layout(location = 11) in uvec4 i_tint;
 layout(location = 12) in uvec3 i_ids;
+layout(location = 13) in uvec4 i_more;
 
 layout(location = 0) out vec3 v_eye;
 layout(location = 1) out vec3 v_normal;
@@ -83,6 +155,8 @@ layout(location = 4) out float v_occlusion;
 layout(location = 5) out vec2 v_zw;
 layout(location = 6) flat out uint v_material;
 layout(location = 7) flat out vec4 v_tint;
+layout(location = 8) flat out uint v_flags;
+layout(location = 9) flat out vec3 v_ambient;
 
 vec3 unfold_normal(ivec2 folded) {
     float u = max(float(folded.x) / 32767.0, -1.0);
@@ -100,10 +174,15 @@ vec3 unfold_normal(ivec2 folded) {
 
 void main() {
     vec3 p = a_position;
+    vec3 n = unfold_normal(a_normal);
+    // a vertex takes its morphs, then its pose, before it is placed
+    uint layout_flags = uint(u_draw.x);
+    if ((layout_flags & (DEFORM_SKIN | (3u << 5u))) != 0u) {
+        deform_vertex(layout_flags, i_more.z, i_more.w, p, n);
+    }
     vec3 eye = vec3(i_row0.x * p.x + i_row0.y * p.y + i_row0.z * p.z + i_row0.w,
                     i_row1.x * p.x + i_row1.y * p.y + i_row1.z * p.z + i_row1.w,
                     i_row2.x * p.x + i_row2.y * p.y + i_row2.z * p.z + i_row2.w);
-    vec3 n = unfold_normal(a_normal);
     vec4 clip = clip_from_eye * vec4(eye, 1.0);
     gl_Position = to_gl(clip);
     v_zw = vec2(clip.z, clip.w);
@@ -113,5 +192,18 @@ void main() {
     v_color = vec4(SRGB_DECODE[a_color.r], SRGB_DECODE[a_color.g], SRGB_DECODE[a_color.b], float(a_color.a) / 255.0);
     v_occlusion = float(a_ids.y) / 255.0;
     v_material = i_ids.x + a_ids.x;
-    v_tint = vec4(SRGB_DECODE[i_tint.r], SRGB_DECODE[i_tint.g], SRGB_DECODE[i_tint.b], float(i_tint.a) / 255.0);
+    vec4 tint = vec4(SRGB_DECODE[i_tint.r], SRGB_DECODE[i_tint.g], SRGB_DECODE[i_tint.b], float(i_tint.a) / 255.0);
+    // the instance's part states: a part that hides leaves the clip
+    // volume with every corner, a part's tint goes over the instance's
+    if (i_more.y != 0xFFFFFFFFu) {
+        uvec4 part = part_row(i_more.y + (a_ids.z | (a_ids.w << 8)));
+        if (part.w == 0u) {
+            gl_Position = to_gl(vec4(0.0, 0.0, 2.0, 1.0));
+            return;
+        }
+        tint = vec4(tint.r * SRGB_DECODE[part.r], tint.g * SRGB_DECODE[part.g], tint.b * SRGB_DECODE[part.b], tint.a);
+    }
+    v_tint = tint;
+    v_flags = i_ids.z;
+    v_ambient = vec3(SRGB_DECODE[i_more.x & 255u], SRGB_DECODE[(i_more.x >> 8) & 255u], SRGB_DECODE[(i_more.x >> 16) & 255u]);
 }

@@ -39,6 +39,18 @@ function glObj(handle) {
   return glObjects[handle >>> 0] ?? null;
 }
 
+// the GPU's timers, where the browser keeps them: asked once a context
+let glTimer = null;
+let glTimerFor = null;
+
+function glTimerExt() {
+  if (glTimerFor !== gl) {
+    glTimerFor = gl;
+    glTimer = gl ? gl.getExtension("EXT_disjoint_timer_query_webgl2") : null;
+  }
+  return glTimer;
+}
+
 function glRelease(handle) {
   const slot = handle >>> 0;
   if (slot === 0 || slot >= glObjects.length) return null;
@@ -66,6 +78,15 @@ function glFloats(pointer, length) {
   length >>>= 0;
   if (pointer % 4 === 0) return new Float32Array(glWasm.memory.buffer, pointer, length >>> 2);
   return new Float32Array(glBytes(pointer, length).slice().buffer);
+}
+
+// Words for an UNSIGNED_INT texture, the same way: WebGL takes no bytes
+// for words
+function glWords(pointer, length) {
+  pointer >>>= 0;
+  length >>>= 0;
+  if (pointer % 4 === 0) return new Uint32Array(glWasm.memory.buffer, pointer, length >>> 2);
+  return new Uint32Array(glBytes(pointer, length).slice().buffer);
 }
 
 const glDecoder = new TextDecoder();
@@ -198,6 +219,7 @@ const bunnyGlImports = {
   // MARK: - Fixed state
 
   gl_viewport(x, y, width, height) { gl.viewport(x | 0, y | 0, width | 0, height | 0); },
+  gl_scissor(x, y, width, height) { gl.scissor(x | 0, y | 0, width | 0, height | 0); },
   gl_clear_color(r, g, b, a) { gl.clearColor(r, g, b, a); },
   gl_clear(mask) { gl.clear(mask >>> 0); },
   gl_enable(cap) { gl.enable(cap >>> 0); },
@@ -304,9 +326,11 @@ const bunnyGlImports = {
   gl_tex_image_2d(target, level, internal, width, height, format, kind, pointer, length) {
     // a null pointer allocates without filling — the atlas and the
     // pyramid both open their storage that way. FLOAT data wants a view
-    // of floats; every other kind takes the bytes
+    // of floats, UNSIGNED_INT one of words; every other kind takes the
+    // bytes
+    const words = (kind >>> 0) === 0x1405;
     const source = pointer
-      ? (kind >>> 0) === 0x1406 ? glFloats(pointer, length) : glBytes(pointer, length)
+      ? (kind >>> 0) === 0x1406 ? glFloats(pointer, length) : words ? glWords(pointer, length) : glBytes(pointer, length)
       : null;
     gl.texImage2D(
       target >>> 0, level | 0, internal | 0, width | 0, height | 0, 0,
@@ -369,11 +393,12 @@ const bunnyGlImports = {
       gl.renderbufferStorage(gl.RENDERBUFFER, internal >>> 0, width | 0, height | 0);
     }
   },
-  // the samples resolve: the read framebuffer's colour onto the draw one
-  gl_blit_framebuffer(width, height) {
-    gl.blitFramebuffer(
-      0, 0, width | 0, height | 0, 0, 0, width | 0, height | 0, gl.COLOR_BUFFER_BIT, gl.NEAREST,
-    );
+  // a rect of the read framebuffer's colour onto the draw one, its corner
+  // at (toX, toY): the samples' resolve, and a picture's slide
+  gl_blit_framebuffer(x, y, width, height, toX, toY) {
+    const [x0, y0, x1, y1] = [x | 0, y | 0, (x + width) | 0, (y + height) | 0];
+    const [u0, v0] = [toX | 0, toY | 0];
+    gl.blitFramebuffer(x0, y0, x1, y1, u0, v0, u0 + (width | 0), v0 + (height | 0), gl.COLOR_BUFFER_BIT, gl.NEAREST);
   },
   // a tiled GPU need not write back what nobody reads
   gl_invalidate_framebuffer(target, first, second) {
@@ -382,6 +407,38 @@ const bunnyGlImports = {
     if (second >>> 0) attachments.push(second >>> 0);
     if (attachments.length) gl.invalidateFramebuffer(target >>> 0, attachments);
   },
+  // the GPU's time over a run of commands, where the browser keeps it
+  gl_has_timers() {
+    return glTimerExt() ? 1 : 0;
+  },
+  gl_timer_begin() {
+    const ext = glTimerExt();
+    if (!ext) return 0;
+    const query = gl.createQuery();
+    gl.beginQuery(ext.TIME_ELAPSED_EXT, query);
+    return glPut(query);
+  },
+  gl_timer_end() {
+    const ext = glTimerExt();
+    if (ext) gl.endQuery(ext.TIME_ELAPSED_EXT);
+  },
+  // nanoseconds; -1 while the GPU runs it, -2 when the measure was lost
+  gl_timer_read(handle) {
+    const query = glObj(handle);
+    const ext = glTimerExt();
+    if (!query || !ext) return -2;
+    if (!gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE)) return -1;
+    const lost = gl.getParameter(ext.GPU_DISJOINT_EXT);
+    const nanos = gl.getQueryParameter(query, gl.QUERY_RESULT);
+    gl.deleteQuery(glRelease(handle));
+    return lost ? -2 : nanos;
+  },
+  // a frame that draws its glow draws into two attachments
+  gl_draw_buffers(count) {
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1].slice(0, Math.min(count >>> 0, 2)));
+  },
+  gl_read_buffer(attachment) { gl.readBuffer(attachment >>> 0); },
+  gl_clear_bufferfv(index, r, g, b, a) { gl.clearBufferfv(gl.COLOR, index | 0, [r, g, b, a]); },
   gl_depth_func(func) { gl.depthFunc(func >>> 0); },
   gl_depth_mask(write) { gl.depthMask(write !== 0); },
   gl_cull_face(face) { gl.cullFace(face >>> 0); },

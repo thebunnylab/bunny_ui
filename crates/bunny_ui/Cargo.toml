@@ -49,3 +49,7 @@ required-features = ["canvas"]
 [[example]]
 name = "counter_headless"
 required-features = ["canvas"]
+
+[[example]]
+name = "bench_world"
+required-features = ["3d"]

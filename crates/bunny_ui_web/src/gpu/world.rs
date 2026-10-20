@@ -147,11 +147,40 @@ impl GlFamily for WebGl {
     fn renderbuffer_storage(&mut self, renderbuffer: u32, samples: i32, internal: u32, width: i32, height: i32) {
         unsafe { gl_renderbuffer_storage_multisample(renderbuffer, samples, internal, width, height) }
     }
-    fn blit_color(&mut self, width: i32, height: i32) {
-        unsafe { gl_blit_framebuffer(width, height) }
+    fn blit_color(&mut self, from: [i32; 4], to: [i32; 2]) {
+        unsafe { gl_blit_framebuffer(from[0], from[1], from[2], from[3], to[0], to[1]) }
+    }
+    fn scissor(&mut self, rect: [i32; 4]) {
+        unsafe { gl_scissor(rect[0], rect[1], rect[2], rect[3]) }
+    }
+    fn has_timers(&self) -> bool {
+        unsafe { gl_has_timers() != 0 }
+    }
+    fn begin_timer(&mut self) -> u32 {
+        unsafe { gl_timer_begin() }
+    }
+    fn end_timer(&mut self) {
+        unsafe { gl_timer_end() }
+    }
+    fn read_timer(&mut self, timer: u32) -> bunny_ui::gpu::gl_world::TimerRead {
+        use bunny_ui::gpu::gl_world::TimerRead;
+        match unsafe { gl_timer_read(timer) } {
+            nanos if nanos >= 0.0 => TimerRead::Nanos(nanos as u64),
+            -1.0 => TimerRead::Pending,
+            _ => TimerRead::Lost,
+        }
     }
     fn invalidate_framebuffer(&mut self, target: u32, first: u32, second: u32) {
         unsafe { gl_invalidate_framebuffer(target, first, second) }
+    }
+    fn draw_buffers(&mut self, count: u32) {
+        unsafe { gl_draw_buffers(count) }
+    }
+    fn read_buffer(&mut self, attachment: u32) {
+        unsafe { gl_read_buffer(attachment) }
+    }
+    fn clear_color_buffer(&mut self, index: i32, color: [f32; 4]) {
+        unsafe { gl_clear_bufferfv(index, color[0], color[1], color[2], color[3]) }
     }
 
     fn viewport(&mut self, width: i32, height: i32) {

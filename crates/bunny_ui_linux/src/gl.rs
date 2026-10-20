@@ -200,6 +200,12 @@ const GL_RENDERER: GlEnum = 0x1F01;
 const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
 const GL_BLEND: GlEnum = 0x0BE2;
 const GL_SCISSOR_TEST: GlEnum = 0x0C11;
+#[cfg(feature = "3d")]
+const GL_TIME_ELAPSED: GlEnum = 0x88BF;
+#[cfg(feature = "3d")]
+const GL_QUERY_RESULT: GlEnum = 0x8866;
+#[cfg(feature = "3d")]
+const GL_QUERY_RESULT_AVAILABLE: GlEnum = 0x8867;
 const GL_DEPTH_TEST: GlEnum = 0x0B71;
 const GL_CULL_FACE: GlEnum = 0x0B44;
 const GL_SRC_ALPHA: GlEnum = 0x0302;
@@ -425,12 +431,23 @@ struct GlWorldFns {
     renderbuffer_storage_multisample: unsafe extern "C" fn(GlEnum, i32, GlEnum, i32, i32),
     framebuffer_renderbuffer: unsafe extern "C" fn(GlEnum, GlEnum, GlEnum, u32),
     blit_framebuffer: unsafe extern "C" fn(i32, i32, i32, i32, i32, i32, i32, i32, u32, GlEnum),
+    scissor: unsafe extern "C" fn(i32, i32, i32, i32),
+    gen_queries: unsafe extern "C" fn(i32, *mut u32),
+    delete_queries: unsafe extern "C" fn(i32, *const u32),
+    begin_query: unsafe extern "C" fn(GlEnum, u32),
+    end_query: unsafe extern "C" fn(GlEnum),
+    get_query_objectiv: unsafe extern "C" fn(u32, GlEnum, *mut i32),
+    get_query_objectui64v: unsafe extern "C" fn(u32, GlEnum, *mut u64),
     depth_func: unsafe extern "C" fn(GlEnum),
     depth_mask: unsafe extern "C" fn(u8),
     cull_face: unsafe extern "C" fn(GlEnum),
     front_face: unsafe extern "C" fn(GlEnum),
     clear_depth: unsafe extern "C" fn(f64),
     draw_elements_instanced: unsafe extern "C" fn(GlEnum, i32, GlEnum, *const c_void, i32),
+    draw_buffer: unsafe extern "C" fn(GlEnum),
+    draw_buffers: unsafe extern "C" fn(i32, *const GlEnum),
+    read_buffer: unsafe extern "C" fn(GlEnum),
+    clear_bufferfv: unsafe extern "C" fn(GlEnum, i32, *const f32),
     /// GL 4.3, or `ARB_invalidate_subdata`: a hint the pass can lose.
     invalidate_framebuffer: Option<unsafe extern "C" fn(GlEnum, i32, *const GlEnum)>,
 }
@@ -466,12 +483,23 @@ fn resolve_world(egl: &EglFns) -> Option<GlWorldFns> {
         renderbuffer_storage_multisample: gl!("glRenderbufferStorageMultisample"),
         framebuffer_renderbuffer: gl!("glFramebufferRenderbuffer"),
         blit_framebuffer: gl!("glBlitFramebuffer"),
+        scissor: gl!("glScissor"),
+        gen_queries: gl!("glGenQueries"),
+        delete_queries: gl!("glDeleteQueries"),
+        begin_query: gl!("glBeginQuery"),
+        end_query: gl!("glEndQuery"),
+        get_query_objectiv: gl!("glGetQueryObjectiv"),
+        get_query_objectui64v: gl!("glGetQueryObjectui64v"),
         depth_func: gl!("glDepthFunc"),
         depth_mask: gl!("glDepthMask"),
         cull_face: gl!("glCullFace"),
         front_face: gl!("glFrontFace"),
         clear_depth: gl!("glClearDepth"),
         draw_elements_instanced: gl!("glDrawElementsInstanced"),
+        draw_buffer: gl!("glDrawBuffer"),
+        draw_buffers: gl!("glDrawBuffers"),
+        read_buffer: gl!("glReadBuffer"),
+        clear_bufferfv: gl!("glClearBufferfv"),
         invalidate_framebuffer: sym("glInvalidateFramebuffer").map(|address| unsafe { entry(address) }),
     })
 }
@@ -1697,14 +1725,79 @@ impl GlFamily for Gl33 {
         }
     }
 
-    fn blit_color(&mut self, width: i32, height: i32) {
-        unsafe { (self.world.blit_framebuffer)(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST as GlEnum) }
+    fn blit_color(&mut self, from: [i32; 4], to: [i32; 2]) {
+        let [x0, y0, x1, y1] = [from[0], from[1], from[0] + from[2], from[1] + from[3]];
+        let [u0, v0, u1, v1] = [to[0], to[1], to[0] + from[2], to[1] + from[3]];
+        unsafe { (self.world.blit_framebuffer)(x0, y0, x1, y1, u0, v0, u1, v1, GL_COLOR_BUFFER_BIT, GL_NEAREST as GlEnum) }
+    }
+
+    fn scissor(&mut self, rect: [i32; 4]) {
+        unsafe { (self.world.scissor)(rect[0], rect[1], rect[2], rect[3]) }
+    }
+
+    // GL 3.3 keeps timers in its core (`GL_TIME_ELAPSED`)
+    fn has_timers(&self) -> bool {
+        true
+    }
+
+    fn begin_timer(&mut self) -> u32 {
+        let mut query = 0;
+        unsafe {
+            (self.world.gen_queries)(1, &mut query);
+            (self.world.begin_query)(GL_TIME_ELAPSED, query);
+        }
+        query
+    }
+
+    fn end_timer(&mut self) {
+        unsafe { (self.world.end_query)(GL_TIME_ELAPSED) }
+    }
+
+    fn read_timer(&mut self, timer: u32) -> bunny_ui::gpu::gl_world::TimerRead {
+        use bunny_ui::gpu::gl_world::TimerRead;
+        let mut ready = 0;
+        unsafe { (self.world.get_query_objectiv)(timer, GL_QUERY_RESULT_AVAILABLE, &mut ready) };
+        if ready == 0 {
+            return TimerRead::Pending;
+        }
+        let mut nanos = 0u64;
+        unsafe {
+            (self.world.get_query_objectui64v)(timer, GL_QUERY_RESULT, &mut nanos);
+            (self.world.delete_queries)(1, &timer);
+        }
+        TimerRead::Nanos(nanos)
     }
 
     fn invalidate_framebuffer(&mut self, target: u32, first: u32, second: u32) {
         let Some(invalidate) = self.world.invalidate_framebuffer else { return };
         let attachments: Vec<GlEnum> = [first, second].into_iter().filter(|attachment| *attachment != 0).collect();
         unsafe { invalidate(target, attachments.len() as i32, attachments.as_ptr()) }
+    }
+
+    fn draw_no_color(&mut self) {
+        unsafe {
+            (self.world.draw_buffer)(0);
+            (self.world.read_buffer)(0);
+        }
+    }
+
+    fn draw_buffers(&mut self, count: u32) {
+        const ATTACHMENTS: [GlEnum; 2] = [0x8CE0, 0x8CE1];
+        unsafe { (self.world.draw_buffers)(count.min(2) as i32, ATTACHMENTS.as_ptr()) }
+    }
+
+    fn read_buffer(&mut self, attachment: u32) {
+        unsafe { (self.world.read_buffer)(attachment) }
+    }
+
+    fn clear_color_buffer(&mut self, index: i32, color: [f32; 4]) {
+        const GL_COLOR: GlEnum = 0x1800;
+        unsafe { (self.world.clear_bufferfv)(GL_COLOR, index, color.as_ptr()) }
+    }
+
+    fn renderer(&self) -> Option<String> {
+        let name = unsafe { (self.gl.get_string)(GL_RENDERER) };
+        (!name.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned())
     }
 
     fn viewport(&mut self, width: i32, height: i32) {
@@ -2718,10 +2811,24 @@ impl OffscreenGl {
         self.world.as_mut()?.draw_single(frame, images)
     }
 
+    /// `before` drawn whole, then `after` over it — slid by `shift`, then
+    /// `rects` drawn again — read back: what `after` drawn whole gives,
+    /// when the redraw is right.
+    #[cfg(feature = "3d")]
+    pub fn world_over_rgba(
+        &mut self,
+        before: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+        after: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+        shift: [i32; 2],
+        rects: &[[u32; 4]],
+    ) -> Option<Vec<u8>> {
+        self.world.as_mut()?.draw_over(before, after, shift, rects, &bunny_ui::image_engine::RawImages::default())
+    }
+
     /// How many worlds the last frame drew: a held picture draws none.
     #[cfg(feature = "3d")]
     pub fn world_jobs(&self) -> usize {
-        self.batches.worlds.len()
+        self.batches.box_worlds()
     }
 
     /// The rendered bytes, R,G,B,A per pixel — the same order as the
@@ -3590,6 +3697,39 @@ mod world_tests {
             let s = Spread::of(&ours, &oracle);
             eprintln!("{}: worst {} · >1 {} · >3 {} · >16 {} of {}", scene.name, s.worst, s.beyond[0], s.beyond[1], s.beyond[2], s.pixels);
             assert!(s.within(scene.tolerance), "{} is beyond its tolerance", scene.name);
+        }
+    }
+
+    #[test]
+    fn each_world_job_is_timed_on_the_gpu() {
+        use bunny_ui::gpu::world::{WorldGround, WorldTiming};
+        use bunny_ui::gpu::world_scenes::world_scene;
+        let Some(mut gpu) = harness() else { return };
+        let frame = world_scene(6).frame;
+        gpu.world_rgba(&frame).expect("the world pass");
+        let timings = gpu.world.as_mut().expect("the world pass").take_timings();
+        if gpu.renderer().contains("llvmpipe") {
+            // its elapsed time can lose the query's start and read the
+            // time since boot: the family keeps only a time it can trust
+            assert!(timings.len() <= 1 && timings.iter().all(|t| WorldTiming::plausible(t.seconds)), "{timings:?}");
+            return;
+        }
+        assert_eq!(timings.len(), 1, "one job, one time: {timings:?}");
+        assert!(timings[0].seconds > 0.0 && timings[0].seconds < 1.0, "{timings:?}");
+        eprintln!("{} took {:.3} ms on the GPU", world_scene(6).name, timings[0].seconds * 1000.0);
+    }
+
+    #[test]
+    fn every_redraw_of_the_catalog_matches_its_whole_picture() {
+        use bunny_ui::gpu::world_scenes::{REDRAWS, world_redraw};
+        let Some(mut gpu) = harness() else { return };
+        for index in 0..REDRAWS {
+            let redraw = world_redraw(index);
+            let over = gpu.world_over_rgba(&redraw.before, &redraw.after, redraw.shift, &redraw.rects).expect("the world pass");
+            let whole = gpu.world_rgba(&redraw.after).expect("the world pass");
+            let s = Spread::of(&over, &whole);
+            eprintln!("{} in {:?}: worst {} · >1 {} of {}", redraw.name, redraw.rects, s.worst, s.beyond[0], s.pixels);
+            assert!(s.worst <= redraw.worst, "{}: the redraw is not the whole picture", redraw.name);
         }
     }
 

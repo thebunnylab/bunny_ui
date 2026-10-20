@@ -3,8 +3,9 @@
 
 use std::rc::Rc;
 
-use super::math::{Mat4, Vec3};
+use super::math::{Mat4, Vec2, Vec3};
 use super::mesh::{Mesh, MeshData};
+use super::skin::Skin;
 use crate::image_engine::ImageSource;
 use crate::layout::Color;
 
@@ -122,16 +123,76 @@ impl Material {
 pub struct Model {
     pub mesh: Mesh,
     pub materials: Rc<[Material]>,
+    /// How the mesh hangs from a skeleton, for a mesh whose vertices name
+    /// joints: the entity, or one above it, plays the clip that moves it.
+    pub skin: Option<Skin>,
+    /// Coarser meshes for when the model stands small on the target, each
+    /// taking over below its height in pixels, the coarsest last
+    /// ([`Model::with_lods`]).
+    pub lods: Rc<[(Mesh, f32)]>,
 }
 
 impl Model {
     pub fn new(mesh: Mesh, materials: impl Into<Rc<[Material]>>) -> Model {
-        Model { mesh, materials: materials.into() }
+        Model { mesh, materials: materials.into(), skin: None, lods: Rc::from([]) }
     }
 
     /// One material for every vertex.
     pub fn single(mesh: Mesh, material: Material) -> Model {
-        Model { mesh, materials: Rc::from(vec![material]) }
+        Model { mesh, materials: Rc::from(vec![material]), skin: None, lods: Rc::from([]) }
+    }
+
+    /// The same model, hanging from `skin`.
+    pub fn skinned(self, skin: Skin) -> Model {
+        Model { skin: Some(skin), ..self }
+    }
+
+    /// The same model with coarser meshes: each `(mesh, pixels)` takes
+    /// over below `pixels` of the model's height on the target, the
+    /// coarsest last. A level holds until the height leaves it by a tenth,
+    /// so a figure that bobs across a step does not flicker. The meshes
+    /// share the model's materials (and skin).
+    pub fn with_lods(self, lods: impl IntoIterator<Item = (Mesh, f32)>) -> Model {
+        let mut lods: Vec<(Mesh, f32)> = lods.into_iter().filter(|(_, pixels)| pixels.is_finite() && *pixels > 0.0).collect();
+        lods.sort_by(|a, b| b.1.total_cmp(&a.1));
+        Model { lods: lods.into(), ..self }
+    }
+
+    /// The level to draw at `pixels` of height on the target: 0 for the
+    /// model's own mesh, `k` for the `k`th of its lods. `held` is the
+    /// level the frame before drew: it stands while the height stays
+    /// within a tenth of the step that would change it.
+    pub fn level(&self, pixels: f64, held: Option<u8>) -> u8 {
+        let level_at = |height: f64| self.lods.iter().filter(|(_, below)| height < *below as f64).count() as u8;
+        let wanted = level_at(pixels);
+        match held {
+            Some(held) if (level_at(pixels * 1.1)..=level_at(pixels / 1.1)).contains(&held) => held,
+            _ => wanted,
+        }
+    }
+
+    /// The mesh of `level`.
+    pub fn mesh_at(&self, level: u8) -> &Mesh {
+        match level.checked_sub(1) {
+            Some(index) => self.lods.get(index as usize).map_or(&self.mesh, |(mesh, _)| mesh),
+            None => &self.mesh,
+        }
+    }
+
+    /// A soft dark disc `radius` meters across its half, for under
+    /// something that moves — a person, a cart — where a shadow map would
+    /// be drawn again every frame: one see-through quad a hair above its
+    /// origin, `darkness` (0 to 1) at its heart and nothing at its rim. It
+    /// casts nothing. Parent it to what it follows, at the floor's height.
+    pub fn blob_shadow(radius: f64, darkness: f32) -> Model {
+        // a hair above the floor it lies on, so the two never fight
+        const LIFT: f64 = 0.005;
+        let mut data = Mesh::plane(radius * 2.0, radius * 2.0).data().clone();
+        for position in &mut data.positions {
+            position[1] += LIFT as f32;
+        }
+        let ink = Color::rgba(0, 0, 0, (darkness.clamp(0.0, 1.0) * 255.0).round() as u8);
+        Model::single(Mesh::new(data), Material::unlit(ink).texture(blob_falloff()).blend())
     }
 
     /// Many pieces as ONE model: one mesh, so one draw for all of them,
@@ -306,6 +367,67 @@ impl PointLight {
     pub fn groups(self, groups: u32) -> PointLight {
         PointLight { groups, ..self }
     }
+}
+
+/// How one part of a mesh looks ([`super::mesh::MeshData::parts`]): a
+/// tint over its own colours, or not shown at all. A merged mesh keeps
+/// one upload and one draw while its pieces change.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PartState {
+    pub tint: Color,
+    pub shown: bool,
+}
+
+impl Default for PartState {
+    fn default() -> PartState {
+        PartState { tint: Color::WHITE, shown: true }
+    }
+}
+
+impl PartState {
+    /// The part, tinted.
+    pub fn tinted(tint: Color) -> PartState {
+        PartState { tint, shown: true }
+    }
+
+    /// The part, not shown.
+    pub fn hidden() -> PartState {
+        PartState { tint: Color::WHITE, shown: false }
+    }
+}
+
+/// The falloff of a blob shadow: white, its alpha `(1 − r²)²` from the
+/// centre to the rim. One picture for every blob, so they share a
+/// texture and a draw.
+fn blob_falloff() -> ImageSource {
+    const SIDE: u32 = 64;
+    let mut rgba = Vec::with_capacity((SIDE * SIDE * 4) as usize);
+    for row in 0..SIDE {
+        for column in 0..SIDE {
+            let at = |index: u32| (index as f64 + 0.5) / SIDE as f64 * 2.0 - 1.0;
+            let r2 = (at(column) * at(column) + at(row) * at(row)).min(1.0);
+            let alpha = (1.0 - r2) * (1.0 - r2);
+            rgba.extend_from_slice(&[255, 255, 255, (alpha * 255.0).round() as u8]);
+        }
+    }
+    ImageSource::rgba(0xB10B_0000_0000_0001, (SIDE, SIDE), rgba)
+}
+
+/// Light and shade baked flat onto the ground: a picture laid on the
+/// world's x–z plane and read by the surfaces that ask for it
+/// ([`super::store::EntitySpec::reads_floor_map`]). Its colour is light
+/// added to theirs — a room's lamps, baked once — and its alpha the share
+/// of the sky's light that reaches them: the shade a chair leaves under
+/// itself. A surface reads it for the price of one texel a pixel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FloorMap {
+    /// sRGB colour, straight alpha; an alpha of 255 is nothing in the way.
+    pub picture: ImageSource,
+    /// The world `(x, z)` of the picture's first texel corner: its first
+    /// row lies along `z = origin.y`, its first column along `x = origin.x`.
+    pub origin: Vec2,
+    /// The meters the picture spans: along x, then along z.
+    pub size: Vec2,
 }
 
 /// The light a world holds. A light is an entity: a point light stands

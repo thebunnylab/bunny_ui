@@ -1558,6 +1558,10 @@ pub fn build_frame(
     atlas.retire_live(ground);
     #[cfg(feature = "3d")]
     if let Some(world) = ground.world() {
+        // the device's probe draws beside the boxes, composited by none
+        if let Some(job) = atlas.worlds.probe(world, images) {
+            batches.worlds.push(job);
+        }
         atlas.worlds.retire(world);
     }
     Ok(())
@@ -1659,6 +1663,13 @@ impl AtlasGround for RecordingGround {
 }
 
 impl FrameBatches {
+    /// How many of the frame's world jobs draw a box's picture: all but
+    /// the device's probe, which no box composites.
+    #[cfg(feature = "3d")]
+    pub fn box_worlds(&self) -> usize {
+        self.worlds.iter().filter(|job| self.world_targets.contains(&job.target)).count()
+    }
+
     /// One number over the instance bytes, for a tier to compare against
     /// another machine's. Same walk, same number — so a scene that
     /// disagrees on pixels but agrees here has a bug BELOW the walk, and

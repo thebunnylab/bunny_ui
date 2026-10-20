@@ -20,6 +20,10 @@ layout(std140, set = 0, binding = 0) uniform World {
     vec4 point_position[8];
     vec4 point_color[8];
     uvec4 point_groups[2];
+    vec4 floor_u;
+    vec4 floor_v;
+    mat4 moving_from_eye;
+    vec4 moving;
 };
 
 // (flags, near, far, step back): what one draw adds to the frame
@@ -35,6 +39,7 @@ layout(push_constant) uniform Draw {
 const uint DRAW_MASK = 1u;
 const uint DRAW_TEXTURED = 2u;
 const uint DRAW_REPLACE = 4u;
+const uint DRAW_COVERAGE = 8u;
 const uint MATERIAL_UNLIT = 1u;
 const uint MATERIAL_MASK = 4u;
 const float LINE_PULL = 2.0e-3;

@@ -1975,6 +1975,48 @@ pub extern "C" fn bunny_gpu_world_parity(index: u32) -> u32 {
     u32::from(!pass)
 }
 
+/// How many world jobs the GPU's timers measured since the last ask; each
+/// one goes to the console. A browser without
+/// `EXT_disjoint_timer_query_webgl2` measures none.
+#[cfg(all(feature = "gpu", feature = "3d"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_gpu_world_timings() -> u32 {
+    let timings = gpu::world_timings();
+    for timing in &timings {
+        gpu::say(&format!("world timing: {:.3} ms on the GPU", timing.seconds * 1000.0));
+    }
+    timings.len() as u32
+}
+
+/// One redraw from the catalog: the first frame drawn whole and the next
+/// over it — slid, then drawn in its rects — against the next drawn whole,
+/// both by this tier's world pass. Returns 0 when the two agree within the
+/// redraw's worst, 1 when they do not, 2 when the world pass cannot stand.
+#[cfg(all(feature = "gpu", feature = "3d"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_gpu_world_redraw(index: u32) -> u32 {
+    use bunny_ui::gpu::world_scenes::{Spread, world_redraw};
+    let redraw = world_redraw(index);
+    let images = bunny_ui::image_engine::RawImages::default();
+    let over = gpu::world_over_rgba(&redraw.before, &redraw.after, redraw.shift, &redraw.rects, &images);
+    let (Some(over), Some(whole)) = (over, gpu::world_rgba(&redraw.after, &images)) else {
+        gpu::say(&format!("world redraw {}: the world pass did not stand", redraw.name));
+        return 2;
+    };
+    let spread = Spread::of(&over, &whole);
+    gpu::say(&format!(
+        "world redraw {} slid {:?} in {:?}: {} · worst {} · >1 {} of {}",
+        redraw.name,
+        redraw.shift,
+        redraw.rects,
+        if spread.worst <= redraw.worst { "pass" } else { "FAIL" },
+        spread.worst,
+        spread.beyond[0],
+        spread.pixels,
+    ));
+    u32::from(spread.worst > redraw.worst)
+}
+
 /// One timed present of a full-window scene, in milliseconds.
 ///
 /// `road` 0 is this tier, 1 is a FRESH `Surface` each sample (the shape

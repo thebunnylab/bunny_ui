@@ -10,14 +10,15 @@ use std::rc::Rc;
 use crate::image_engine::ImageSource;
 use crate::layout::Color;
 use crate::world::camera::Camera;
-use crate::world::frame::{Background, Quality, WorldFrame, WorldStyle};
-use crate::world::material::{Light, LineDepth, LineStyle, Material};
+use crate::world::frame::{Background, Grade, Quality, WorldFrame, WorldStyle};
+use crate::world::material::{FloorMap, Light, LineDepth, LineStyle, Material, Model, PartState};
+use crate::world::math::Mat4;
 use crate::world::math::{Vec3, vec2, vec3};
 use crate::world::mesh::{Mesh, MeshData};
 use crate::world::store::World;
 
 /// How many worlds the catalog holds.
-pub const COUNT: u32 = 6;
+pub const COUNT: u32 = 21;
 
 /// What a tier's picture may differ from the CPU's by: the share of
 /// pixels whose worst channel is more than three codes apart, and more
@@ -31,6 +32,11 @@ pub struct Tolerance {
 /// Interiors agree to the dither's step; the pixels a triangle's edge
 /// crosses may fall to either side.
 const EXACT: Tolerance = Tolerance { beyond_three: 0.02, beyond_sixteen: 0.01 };
+
+/// A shadow's edge is a filtered blend of comparisons, and a texture
+/// unit keeps fewer bits of the blend than the CPU: the penumbra may sit
+/// a few codes apart.
+const PENUMBRA: Tolerance = Tolerance { beyond_three: 0.03, beyond_sixteen: 0.01 };
 
 /// One world of the catalog: the frame, its name, its tolerance.
 pub struct WorldScene {
@@ -55,6 +61,40 @@ fn still_life() -> World {
     world
 }
 
+/// The still life under a sun that casts: the box's shadow falls on the
+/// floor and on the ball.
+fn shadowed_still_life() -> World {
+    let world = World::new();
+    world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(222, 120, 60)));
+    world.add(Mesh::plane(6.0, 6.0), Material::color(Color::rgb(200, 196, 188))).set_position(vec3(0.0, -0.5, 0.0));
+    world.add(Mesh::sphere(0.45), Material::color(Color::rgb(70, 110, 200)).roughness(0.3).metallic(0.2)).set_position(vec3(1.25, -0.05, 0.5));
+    world.add_light(Light::sun().toward(vec3(0.6, -1.0, 0.45)).with_shadows());
+    world
+}
+
+/// A floor map of `side` texels over a `span`-meter square centred on the
+/// origin: the shade a box at the origin leaves under itself, and a warm
+/// pool of baked lamp light off to one side.
+pub fn floor_map(side: u32, span: f64) -> FloorMap {
+    let mut rgba = Vec::with_capacity((side * side * 4) as usize);
+    for row in 0..side {
+        for column in 0..side {
+            let at = |index: u32| -span * 0.5 + (index as f64 + 0.5) / side as f64 * span;
+            let (x, z) = (at(column), at(row));
+            let near = (x * x + z * z).sqrt();
+            let shade = (0.2 + 0.8 * (near - 0.5) / 0.8).clamp(0.2, 1.0);
+            let (dx, dz) = (x - 1.4, z + 0.9);
+            let pool = (1.0 - (dx * dx + dz * dz).sqrt() / 1.4).clamp(0.0, 1.0);
+            rgba.extend_from_slice(&[(150.0 * pool) as u8, (96.0 * pool) as u8, (40.0 * pool) as u8, (255.0 * shade) as u8]);
+        }
+    }
+    FloorMap {
+        picture: ImageSource::rgba(0xF100_0000_0000_0001, (side, side), rgba),
+        origin: vec2(-span * 0.5, -span * 0.5),
+        size: vec2(span, span),
+    }
+}
+
 /// A checker of `cells` squares a side over a clear band.
 pub fn checker(cells: u32, side: u32) -> ImageSource {
     let mut rgba = Vec::with_capacity((side * side * 4) as usize);
@@ -72,9 +112,92 @@ pub fn checker(cells: u32, side: u32) -> ImageSource {
     ImageSource::rgba(0xC4EC_0000_0000_0001, (side, side), rgba)
 }
 
+/// Lamps at night, at High with a bloom: what glows spills its light
+/// around itself.
+fn night_lamps() -> WorldFrame {
+    let world = World::new();
+    world.add(Mesh::plane(6.0, 6.0), Material::color(Color::rgb(70, 74, 86))).set_position(vec3(0.0, -0.5, 0.0));
+    world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(222, 120, 60)));
+    world
+        .add(Mesh::sphere(0.25), Material::unlit(Color::rgb(255, 214, 160)).emissive(Color::rgb(255, 214, 160), 3.0))
+        .set_position(vec3(-1.1, 0.4, 0.6));
+    world
+        .add(Mesh::cuboid(0.9, 0.08, 0.08), Material::unlit(Color::rgb(90, 200, 255)).emissive(Color::rgb(90, 200, 255), 4.0))
+        .set_position(vec3(1.0, 0.7, -0.2));
+    world.add_light(Light::sun().toward(vec3(-1.0, -2.0, -1.5)).intensity(0.25));
+    let night = WorldStyle { background: Background::Color(Color::rgb(14, 16, 24)), bloom: 0.7, ..style(Quality::High) };
+    world.frame(&Camera::orbiting(Vec3::ZERO, 25.0, 20.0, 5.0), &night, (200, 150), 1.0)
+}
+
+/// A post on a floor whose top half hangs from a joint that a clip
+/// turns and carries, held at its end; the sun casts its pose. With
+/// `morphs`, it also swells and stretches by two morph targets.
+fn swaying_post(morphs: bool) -> WorldFrame {
+    use crate::world::math::{Quat, Transform};
+    use crate::world::skin::{Channel, Clip, Path, Play, Skeleton, SkeletonNode, Skin};
+    let skeleton = Skeleton::new(vec![
+        SkeletonNode { name: None, parent: None, rest: Transform::IDENTITY },
+        SkeletonNode { name: None, parent: Some(0), rest: Transform::IDENTITY },
+    ]);
+    let skin = Skin::new(skeleton, vec![0, 1], Vec::new()).expect("two joints");
+    let mut data = Mesh::cuboid(0.5, 2.0, 0.5).data().clone();
+    data.joints = vec![[0, 1, 0, 0]; data.positions.len()];
+    data.weights = data.positions.iter().map(|p| if p[1] > 0.0 { [0, 255, 0, 0] } else { [255, 0, 0, 0] }).collect();
+    if morphs {
+        use crate::world::mesh::Morph;
+        // the top swells across, the whole post stretches up
+        let swell = data.positions.iter().map(|p| if p[1] > 0.0 { [p[0] * 0.8, 0.0, p[2] * 0.8] } else { [0.0; 3] }).collect();
+        let stretch = data.positions.iter().map(|p| [0.0, (p[1] + 1.0) * 0.25, 0.0]).collect();
+        data.morphs = vec![Morph { positions: swell, normals: Vec::new() }, Morph { positions: stretch, normals: Vec::new() }];
+    }
+    let world = World::new();
+    world.add(Mesh::plane(6.0, 6.0), Material::color(Color::rgb(200, 196, 188))).set_position(vec3(0.0, -1.0, 0.0));
+    let post = world.add_model(Model::single(Mesh::new(data), Material::color(Color::rgb(222, 120, 60))).skinned(skin));
+    if morphs {
+        post.set_morph([0.6, 0.3]);
+    }
+    let lean = Quat::from_axis_angle(Vec3::Z, 0.5);
+    let channels = vec![
+        Channel { node: 1, path: Path::Translation, step: false, times: Rc::from([0.0, 1.0]), values: Rc::from([0.0, 0.0, 0.0, 0.4, 0.0, 0.0]) },
+        Channel {
+            node: 1,
+            path: Path::Rotation,
+            step: false,
+            times: Rc::from([0.0, 1.0]),
+            values: Rc::from([0.0, 0.0, 0.0, 1.0, lean.x as f32, lean.y as f32, lean.z as f32, lean.w as f32]),
+        },
+    ];
+    post.set_play(Some(Play { clip: Clip::new(None, channels), start: motor::task::now() - 10.0, speed: 1.0, looped: false, from: None }));
+    // a low sun: the pose casts a long shadow
+    world.add_light(Light::sun().toward(vec3(1.0, -0.8, 0.6)).with_shadows());
+    let mut frame = world.frame(&Camera::orbiting(Vec3::ZERO, 30.0, 22.0, 6.0), &style(Quality::Low), (200, 150), 1.0);
+    frame.samples = 1;
+    frame
+}
+
+/// A box that walks past a still one at Medium: the still one casts into
+/// the cached map, the walker into the second map, drawn at one sample.
+fn walker() -> WorldFrame {
+    let world = World::new();
+    world.add(Mesh::plane(8.0, 8.0), Material::color(Color::rgb(200, 196, 188))).set_position(vec3(0.0, -0.5, 0.0));
+    world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(222, 120, 60))).set_position(vec3(-1.2, 0.0, -0.6));
+    // setting out: it stands where it starts, facing its way
+    world.add(Mesh::cuboid(0.6, 1.6, 0.6), Material::color(Color::rgb(70, 110, 200))).set_position(vec3(-1.0, 0.3, 1.5)).move_to(vec3(2.0, 0.3, 1.5), 1.0);
+    world.add_light(Light::sun().toward(vec3(1.0, -0.9, 0.6)).with_shadows());
+    let mut frame = world.frame(&Camera::orbiting(Vec3::ZERO, 20.0, 30.0, 8.0), &style(Quality::Medium), (200, 150), 1.0);
+    frame.samples = 1;
+    frame
+}
+
 /// World `index` of the catalog.
 pub fn world_scene(index: u32) -> WorldScene {
     let frame = |world: &World, camera: &Camera, quality: Quality, size: (u32, u32)| Rc::new(world.frame(camera, &style(quality), size, 1.0));
+    // a quality's shadow, drawn at one sample like the CPU's picture
+    let one_sample = |world: &World, camera: &Camera, quality: Quality, size: (u32, u32)| {
+        let mut frame = world.frame(camera, &style(quality), size, 1.0);
+        frame.samples = 1;
+        Rc::new(frame)
+    };
     match index % COUNT {
         0 => WorldScene {
             frame: frame(&still_life(), &Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0), Quality::Low, (160, 120)),
@@ -144,6 +267,162 @@ pub fn world_scene(index: u32) -> WorldScene {
                 pictures: vec![picture],
             }
         }
+        6 => WorldScene {
+            frame: frame(&shadowed_still_life(), &Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0), Quality::Low, (160, 120)),
+            name: "a cast shadow",
+            tolerance: PENUMBRA,
+            pictures: Vec::new(),
+        },
+        7 => WorldScene {
+            frame: one_sample(&shadowed_still_life(), &Camera::orbiting(Vec3::ZERO, 20.0, 35.0, 4.0), Quality::Medium, (200, 150)),
+            name: "a shadow of four lookups",
+            tolerance: PENUMBRA,
+            pictures: Vec::new(),
+        },
+        18 => WorldScene { frame: Rc::new(swaying_post(false)), name: "a post on its joints", tolerance: PENUMBRA, pictures: Vec::new() },
+        19 => WorldScene { frame: Rc::new(swaying_post(true)), name: "a post that swells", tolerance: PENUMBRA, pictures: Vec::new() },
+        20 => WorldScene { frame: Rc::new(walker()), name: "a walker's shadow of its own", tolerance: PENUMBRA, pictures: Vec::new() },
+        16 => {
+            // drawn at one sample, so the glow's edge is the CPU's
+            let mut frame = night_lamps();
+            frame.samples = 1;
+            WorldScene { frame: Rc::new(frame), name: "lamps that bloom", tolerance: EXACT, pictures: Vec::new() }
+        }
+        17 => WorldScene {
+            frame: Rc::new(night_lamps()),
+            name: "lamps that bloom, four samples",
+            // the CPU takes one sample: the edges, and the glow they spill
+            tolerance: Tolerance { beyond_three: 0.08, beyond_sixteen: 0.06 },
+            pictures: Vec::new(),
+        },
+        15 => {
+            // the still life through a grade of the night: the warm
+            // channels pressed toward the blue, the darks lifted
+            let night = Grade::from_fn(|[r, g, b]| {
+                let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                [0.05 + 0.75 * (0.6 * r + 0.4 * luma), 0.06 + 0.82 * (0.8 * g + 0.2 * luma), 0.11 + 0.89 * b]
+            });
+            let graded = WorldStyle { grade: Some(night), ..style(Quality::Medium) };
+            let mut frame = still_life().frame(&Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0), &graded, (160, 120), 1.0);
+            frame.samples = 1;
+            WorldScene { frame: Rc::new(frame), name: "a graded picture", tolerance: EXACT, pictures: Vec::new() }
+        }
+        14 => {
+            // the cut-out floor at four samples: its edges become coverage,
+            // which the CPU's one sample cannot show
+            let world = World::new();
+            let floor = Mesh::new(MeshData {
+                positions: vec![[-4.0, 0.0, 4.0], [4.0, 0.0, 4.0], [4.0, 0.0, -40.0], [-4.0, 0.0, -40.0]],
+                normals: vec![[0.0, 1.0, 0.0]; 4],
+                uvs: vec![[0.0, 0.0], [4.0, 0.0], [4.0, 22.0], [0.0, 22.0]],
+                indices: vec![0, 1, 2, 0, 2, 3],
+                ..MeshData::default()
+            });
+            let picture = checker(8, 64);
+            world.add(floor, Material::color(Color::WHITE).texture(picture.clone()).mask(0.5));
+            WorldScene {
+                frame: frame(&world, &Camera::looking_at(vec3(0.0, 1.2, 5.0), vec3(0.0, 0.0, -6.0)), Quality::Medium, (160, 120)),
+                name: "a cut-out at four samples",
+                tolerance: Tolerance { beyond_three: 0.25, beyond_sixteen: 0.08 },
+                pictures: vec![picture],
+            }
+        }
+        13 => {
+            // a sky over a ground, the horizon across the middle: the
+            // backdrop follows the view's tilt, not the picture's rows
+            let world = World::new();
+            world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(222, 120, 60))).set_position(vec3(0.0, 0.0, -2.0));
+            let sky = WorldStyle {
+                background: Background::Sky { zenith: Color::rgb(92, 140, 210), horizon: Color::rgb(222, 230, 238), ground: Color::rgb(150, 144, 132) },
+                ..style(Quality::Low)
+            };
+            WorldScene {
+                frame: Rc::new(world.frame(&Camera::looking_at(vec3(0.0, 1.0, 4.0), vec3(0.0, 1.6, -4.0)), &sky, (200, 140), 1.0)),
+                name: "a sky over a ground",
+                tolerance: EXACT,
+                pictures: Vec::new(),
+            }
+        }
+        12 => {
+            // three boxes merged into one mesh: the middle one hides (and
+            // casts nothing), the last takes a tint; a ball beside them
+            // stands in a blue room's ambient
+            let world = World::new();
+            world.add(Mesh::plane(6.0, 6.0), Material::color(Color::rgb(214, 210, 202))).set_position(vec3(0.0, -0.5, 0.0));
+            let piece = Model::single(Mesh::cuboid(0.7, 1.0, 0.7), Material::color(Color::rgb(222, 120, 60)));
+            let merged = Model::merge((0..3u16).map(|part| (piece.clone(), Mat4::translation(vec3(part as f64 * 1.0 - 1.0, 0.0, 0.0)), part)));
+            let row = world.add_model(merged);
+            row.set_parts(Some(std::rc::Rc::from(vec![PartState::default(), PartState::hidden(), PartState::tinted(Color::rgb(120, 200, 255))])));
+            world
+                .add(Mesh::sphere(0.4), Material::color(Color::rgb(236, 232, 224)))
+                .set_position(vec3(0.0, -0.1, 1.1))
+                .set_ambient(Color::rgb(90, 140, 255));
+            world.add_light(Light::sun().toward(vec3(0.6, -1.0, -0.5)).with_shadows());
+            WorldScene {
+                frame: frame(&world, &Camera::orbiting(Vec3::ZERO, 15.0, 30.0, 5.0), Quality::Low, (200, 140)),
+                name: "parts that hide and tint",
+                tolerance: PENUMBRA,
+                pictures: Vec::new(),
+            }
+        }
+        11 => {
+            let world = World::new();
+            let map = floor_map(32, 6.0);
+            let picture = map.picture.clone();
+            world.set_floor_map(Some(map));
+            world.add(Mesh::plane(6.0, 6.0), Material::color(Color::rgb(214, 210, 202))).set_position(vec3(0.0, -0.5, 0.0)).set_reads_floor_map(true);
+            world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(90, 140, 210)));
+            world.add_light(Light::sun().toward(vec3(-1.0, -2.0, -1.5)));
+            WorldScene {
+                frame: frame(&world, &Camera::orbiting(Vec3::ZERO, 25.0, 40.0, 6.0), Quality::Low, (200, 140)),
+                name: "a floor map",
+                tolerance: EXACT,
+                pictures: vec![picture],
+            }
+        }
+        10 => {
+            // two rooms at night, a lamp in each: each lamp reaches its own
+            // room's group alone, though the light would reach both
+            let world = World::new();
+            world.add_light(Light::sky(Color::rgb(30, 34, 46), Color::rgb(20, 18, 16)));
+            let floor = Mesh::plane(3.0, 3.0);
+            let block = Mesh::cuboid(0.8, 0.8, 0.8);
+            for (room, x) in [(1u8, -1.6), (2u8, 1.6)] {
+                world.add(floor.clone(), Material::color(Color::rgb(210, 204, 196))).set_position(vec3(x, 0.0, 0.0)).set_light_group(room);
+                world.add(block.clone(), Material::color(Color::rgb(222, 120, 60))).set_position(vec3(x, 0.4, -0.4)).set_light_group(room);
+                let lamp = if room == 1 { Color::rgb(255, 196, 140) } else { Color::rgb(150, 190, 255) };
+                world.add_light(Light::point(lamp).intensity(2.5).range(4.5).radius(0.4).groups(1 << room)).set_position(vec3(x * 0.4, 1.2, 0.6));
+            }
+            WorldScene {
+                frame: frame(&world, &Camera::orbiting(vec3(0.0, 0.3, 0.0), 0.0, 38.0, 6.0), Quality::Low, (200, 120)),
+                name: "lamps by group",
+                tolerance: EXACT,
+                pictures: Vec::new(),
+            }
+        }
+        9 => {
+            let world = World::new();
+            world.add(Mesh::plane(8.0, 8.0), Material::color(Color::rgb(228, 224, 216)));
+            let outline = [vec2(0.0, 0.0), vec2(2.4, 0.0), vec2(2.4, 2.4), vec2(0.0, 2.4)];
+            let hole = [vec2(0.6, 0.6), vec2(1.8, 0.6), vec2(1.8, 1.8), vec2(0.6, 1.8)];
+            let ring = Mesh::extrude(&outline, &[&hole], 0.4);
+            let at = vec3(-1.2, 0.0, 1.2);
+            world.add(ring.clone(), Material::color(Color::rgb(226, 114, 60))).set_position(at);
+            world.add_lines(ring.edges(30.0), LineStyle::solid(Color::rgb(30, 32, 40), 1.2)).set_position(at);
+            let xray = WorldStyle { xray: true, ..style(Quality::Low) };
+            WorldScene {
+                frame: Rc::new(world.frame(&Camera::orbiting(vec3(0.0, 0.2, 0.0), 28.0, 32.0, 5.5), &xray, (200, 140), 1.0)),
+                name: "an X-ray",
+                tolerance: Tolerance { beyond_three: 0.03, beyond_sixteen: 0.015 },
+                pictures: Vec::new(),
+            }
+        }
+        8 => WorldScene {
+            frame: one_sample(&shadowed_still_life(), &Camera::orbiting(vec3(0.5, 0.0, 0.3), 50.0, 30.0, 3.5).parallel(), Quality::High, (200, 150)),
+            name: "a shadow of nine lookups",
+            tolerance: PENUMBRA,
+            pictures: Vec::new(),
+        },
         _ => WorldScene {
             frame: frame(&still_life(), &Camera::orbiting(Vec3::ZERO, 35.0, 28.0, 5.0), Quality::Medium, (160, 120)),
             name: "four samples",
@@ -152,6 +431,86 @@ pub fn world_scene(index: u32) -> WorldScene {
             pictures: Vec::new(),
         },
     }
+}
+
+/// How many redraws the catalog holds.
+pub const REDRAWS: u32 = 6;
+
+/// One redraw of the catalog: a frame, the next frame of the same
+/// target, and how the second reuses the first — slid by `shift`, then
+/// `rects` drawn again. A tier draws the first whole and the second over
+/// it, and must give what it gives for the second drawn whole.
+pub struct WorldRedraw {
+    pub before: Rc<WorldFrame>,
+    pub after: Rc<WorldFrame>,
+    /// `[0, 0]` for a redraw in place.
+    pub shift: [i32; 2],
+    pub rects: Vec<[u32; 4]>,
+    pub name: &'static str,
+    /// The most a tier's channel may differ from its own whole picture:
+    /// none in place; one code for a slide, whose eye moved — the same
+    /// point shades from numbers of the eye's space a last bit apart.
+    pub worst: u8,
+}
+
+/// Redraw `index` of the catalog.
+pub fn world_redraw(index: u32) -> WorldRedraw {
+    use crate::world::frame::build_frame;
+    let world = World::new();
+    world.add(Mesh::plane(8.0, 8.0), Material::color(Color::rgb(200, 196, 188))).set_position(vec3(0.0, -0.5, 0.0));
+    let block = world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(Color::rgb(222, 120, 60))).set_position(vec3(-1.2, 0.0, -0.6));
+    world.add_light(Light::sun().toward(vec3(1.0, -0.9, 0.6)).with_shadows());
+    let camera = Camera::orbiting(Vec3::ZERO, 20.0, 30.0, 8.0);
+    let at = |style: &WorldStyle, time: f64| Rc::new(world.with(|data| build_frame(data, &camera, style, (200, 150), 1.0, time)));
+    let (name, before, after) = match index {
+        // a figure walks: where it was, where it is, and its shadow in the
+        // map of what moves, at four samples and at one
+        0 | 1 => {
+            world.add(Mesh::cuboid(0.3, 0.9, 0.3), Material::color(Color::rgb(70, 110, 200))).set_position(vec3(-1.0, -0.05, 1.5)).move_to(vec3(2.0, -0.05, 1.5), 1.0);
+            let style = style(if index == 0 { Quality::Medium } else { Quality::Low });
+            let name = if index == 0 { "a figure walks, at four samples" } else { "a figure walks, at one sample" };
+            (name, at(&style, 0.3), at(&style, 0.6))
+        }
+        // a part turns another colour over a sky: the backdrop fills the
+        // rect the clear cannot
+        2 => {
+            let sky = Background::Sky { zenith: Color::rgb(90, 140, 220), horizon: Color::rgb(220, 228, 240), ground: Color::rgb(120, 110, 96) };
+            let style = WorldStyle { background: sky, ..style(Quality::Medium) };
+            let before = at(&style, 0.0);
+            block.set_tint(Color::rgb(60, 160, 220));
+            ("a block turns blue under a sky", before, at(&style, 0.0))
+        }
+        // a parallel eye pans at Low: the picture slides by whole pixels
+        // and the strips it uncovers are drawn, a figure's walk with them
+        4 | 5 => {
+            if index == 5 {
+                world.add(Mesh::cuboid(0.3, 0.9, 0.3), Material::color(Color::rgb(70, 110, 200))).set_position(vec3(-1.0, -0.05, 1.5)).move_to(vec3(2.0, -0.05, 1.5), 1.0);
+            }
+            let eye = |at: Vec3| {
+                let mut camera = Camera::orbiting(at, 45.0, 35.0, 20.0);
+                camera.lens = crate::world::camera::Lens::Parallel { height: 7.0 };
+                camera
+            };
+            let style = style(Quality::Low);
+            let before = Rc::new(world.with(|data| build_frame(data, &eye(Vec3::ZERO), &style, (200, 150), 1.0, 0.3)));
+            let after = Rc::new(world.with(|data| build_frame(data, &eye(vec3(0.35, 0.0, -0.2)), &style, (200, 150), 1.0, 0.6)));
+            let name = if index == 4 { "a parallel eye pans" } else { "a parallel eye pans while a figure walks" };
+            (name, before, after)
+        }
+        // edges move across the floor at one sample
+        _ => {
+            let square = [vec3(0.0, 0.0, 0.0), vec3(1.0, 0.0, 0.0), vec3(1.0, 0.0, 1.0), vec3(0.0, 0.0, 1.0)];
+            let edges = world.add_lines(crate::world::mesh::Lines::path(&square, true), LineStyle::solid(Color::rgb(30, 30, 30), 2.0));
+            edges.set_position(vec3(0.6, -0.45, 0.4));
+            let style = style(Quality::Low);
+            let before = at(&style, 0.0);
+            edges.set_position(vec3(0.9, -0.45, 0.6));
+            ("a square of edges moves", before, at(&style, 0.0))
+        }
+    };
+    let reuse = crate::world::damage::reuse(&before, &after).expect("a part of the picture");
+    let worst = u8::from(reuse.shift != [0, 0]);
+    WorldRedraw { before, after, shift: reuse.shift, rects: reuse.rects, name, worst }
 }
 
 /// How two pictures differ: the worst channel, and how many pixels sit
@@ -190,6 +549,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_redraw_of_the_catalog_is_a_part_and_exact_on_the_oracle() {
+        use crate::world::soft::{draw, draw_over_with, slid};
+        for index in 0..REDRAWS {
+            let redraw = world_redraw(index);
+            let area: u32 = redraw.rects.iter().map(|r| r[2] * r[3]).sum();
+            assert!(area > 0 && area * 2 < 200 * 150, "{}: {:?}", redraw.name, redraw.rects);
+            let held = slid(&draw(&redraw.before), redraw.shift);
+            let over = draw_over_with(&held, &redraw.after, &redraw.rects, &|_| None);
+            assert!(over.rgba == draw(&redraw.after).rgba, "{} is not the whole", redraw.name);
+        }
+        assert!(world_redraw(0).after.samples == 4 && world_redraw(1).after.samples == 1);
+        assert!(world_redraw(4).shift != [0, 0] && world_redraw(5).shift != [0, 0], "the pans slide");
+    }
+
+    #[test]
     fn every_world_of_the_catalog_draws_on_the_cpu() {
         for index in 0..COUNT {
             let scene = world_scene(index);
@@ -199,6 +573,30 @@ mod tests {
             assert!(painted > 0, "{} painted nothing", scene.name);
             // the CPU against itself is the zero of the scale
             assert!(Spread::of(&picture.rgba, &picture.rgba).within(scene.tolerance));
+            if let Some(dump) = std::env::var_os("BUNNY_WORLD_DUMP") {
+                let (w, h) = scene.frame.size;
+                let _ = std::fs::write(std::path::Path::new(&dump).join(format!("catalog-{index}-{w}x{h}.rgba")), &picture.rgba);
+            }
+        }
+    }
+
+    #[test]
+    fn every_shadow_of_the_catalog_shows() {
+        for index in 0..COUNT {
+            let scene = world_scene(index);
+            if scene.frame.shadow.is_none() {
+                continue;
+            }
+            let shaded = crate::world::soft::draw(&scene.frame);
+            let mut sunlit = (*scene.frame).clone();
+            sunlit.shadow = None;
+            sunlit.uniforms.shadow = [0.0; 4];
+            sunlit.moving_shadow = None;
+            sunlit.uniforms.moving = [0.0; 4];
+            let plain = crate::world::soft::draw(&sunlit);
+            let darker = shaded.rgba.as_chunks::<4>().0.iter().zip(plain.rgba.as_chunks::<4>().0).filter(|(a, b)| a[0] as i32 + 20 < b[0] as i32).count();
+            let share = darker as f64 / scene.frame.size.0 as f64 / scene.frame.size.1 as f64;
+            assert!(share > 0.02, "{}: {share} of the picture in clear shadow", scene.name);
         }
     }
 }

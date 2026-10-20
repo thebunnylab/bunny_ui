@@ -243,7 +243,7 @@ a box shows it through a camera.
 ```rust
 let world = World::new();
 world.add(Mesh::cuboid(1.0, 1.0, 1.0), Material::color(orange));
-world.add_light(Light::sun().toward(vec3(-1.0, -2.0, -1.5)));
+world.add_light(Light::sun().toward(vec3(-1.0, -2.0, -1.5)).with_shadows());
 
 scene_view(self.world, self.camera)
     .orbit()                                   // the hand turns the camera

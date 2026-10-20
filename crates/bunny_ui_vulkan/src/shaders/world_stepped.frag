@@ -20,6 +20,10 @@ layout(std140, set = 0, binding = 0) uniform World {
     vec4 point_position[8];
     vec4 point_color[8];
     uvec4 point_groups[2];
+    vec4 floor_u;
+    vec4 floor_v;
+    mat4 moving_from_eye;
+    vec4 moving;
 };
 
 // (flags, near, far, step back): what one draw adds to the frame
@@ -35,6 +39,7 @@ layout(push_constant) uniform Draw {
 const uint DRAW_MASK = 1u;
 const uint DRAW_TEXTURED = 2u;
 const uint DRAW_REPLACE = 4u;
+const uint DRAW_COVERAGE = 8u;
 const uint MATERIAL_UNLIT = 1u;
 const uint MATERIAL_MASK = 4u;
 const float LINE_PULL = 2.0e-3;
@@ -60,6 +65,15 @@ float encode_code(float linear) {
     return s * 255.0;
 }
 
+layout(std430, set = 0, binding = 2) readonly buffer Parts {
+    uint rows[];
+} parts;
+
+uvec4 part_row(uint index) {
+    uint packed = parts.rows[index];
+    return uvec4(packed & 255u, (packed >> 8) & 255u, (packed >> 16) & 255u, packed >> 24);
+}
+
 layout(location = 0) in vec3 v_eye;
 layout(location = 1) in vec3 v_normal;
 layout(location = 2) in vec2 v_uv;
@@ -68,12 +82,21 @@ layout(location = 4) in float v_occlusion;
 layout(location = 5) in vec2 v_zw;
 layout(location = 6) flat in uint v_material;
 layout(location = 7) flat in vec4 v_tint;
+layout(location = 8) flat in uint v_flags;
+layout(location = 9) flat in vec3 v_ambient;
 
 layout(std430, set = 0, binding = 1) readonly buffer Materials {
     vec4 rows[];
 } materials;
 layout(set = 1, binding = 0) uniform sampler2D u_surface;
+layout(set = 0, binding = 5) uniform sampler2DShadow u_shadow;
+// the map of what moves
+layout(set = 0, binding = 6) uniform sampler2DShadow u_moving;
+layout(set = 0, binding = 4) uniform sampler2D u_floor;
 layout(location = 0) out vec4 out_color;
+// how much the pixel glows, premultiplied as its colour: a frame with a
+// bloom draws it beside the colour, and any other frame drops it
+layout(location = 1) out vec4 out_glow;
 
 const int BAYER[16] = int[16](0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5);
 
@@ -120,7 +143,69 @@ float bayer(uint x, uint y) {
     return (float(BAYER[int((y & 3u) * 4u + (x & 3u))]) + 0.5) / 16.0 - 0.5;
 }
 
-vec3 lit(vec3 position, vec3 n, vec3 base, float roughness, float metallic, vec3 emissive, float occlusion, uint groups) {
+// how much of the sun a map lets reach a point: its depth from the sun
+// against the map's, each lookup four texels compared and filtered by the
+// sampler; `params` is (1/size, normal offset, depth bias, taps)
+float map_visibility(highp sampler2DShadow map, mat4 from_eye, vec4 params, vec3 position, vec3 n) {
+    float taps = params.w;
+    if (taps < 0.5 || sun_direction.w <= 0.5) {
+        return 1.0;
+    }
+    float n_dot_l = clamp(dot(n, sun_direction.xyz), 0.0, 1.0);
+    if (!(n_dot_l > 0.0)) {
+        return 1.0;
+    }
+    float sine = sqrt(max(1.0 - n_dot_l * n_dot_l, 0.0));
+    vec3 p = position + n * (params.y * sine);
+    vec4 s = from_eye * vec4(p, 1.0);
+    if (!(s.x > 0.0 && s.x < 1.0 && s.y > 0.0 && s.y < 1.0)) {
+        return 1.0;
+    }
+    float reference = clamp(s.z - params.z, 0.0, 1.0);
+    float texel = params.x;
+    if (taps < 1.5) {
+        return textureLod(map, vec3(s.x, s.y, reference), 0.0);
+    }
+    if (taps < 4.5) {
+        float sum = 0.0;
+        sum += textureLod(map, vec3(s.x - 0.5 * texel, s.y - 0.5 * texel, reference), 0.0);
+        sum += textureLod(map, vec3(s.x + 0.5 * texel, s.y - 0.5 * texel, reference), 0.0);
+        sum += textureLod(map, vec3(s.x - 0.5 * texel, s.y + 0.5 * texel, reference), 0.0);
+        sum += textureLod(map, vec3(s.x + 0.5 * texel, s.y + 0.5 * texel, reference), 0.0);
+        return sum * 0.25;
+    }
+    float sum = 0.0;
+    for (int j = -1; j <= 1; j++) {
+        for (int i = -1; i <= 1; i++) {
+            sum += textureLod(map, vec3(s.x + float(i) * texel, s.y + float(j) * texel, reference), 0.0);
+        }
+    }
+    return sum / 9.0;
+}
+
+// how much of the sun reaches a point: the still map's word times the
+// word of the map of what moves
+float sun_visibility(vec3 position, vec3 n) {
+    return map_visibility(u_shadow, shadow_from_eye, shadow, position, n) * map_visibility(u_moving, moving_from_eye, moving, position, n);
+}
+
+// what the floor map gives a point: its texel from the base level, never
+// past the picture's edge; nothing off the map or for a surface that
+// reads none
+vec4 floor_light(vec3 position) {
+    if (counts.y < 0.5 || (v_flags & 2u) == 0u) {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
+    float s = floor_u.x * position.x + floor_u.y * position.y + floor_u.z * position.z + floor_u.w;
+    float t = floor_v.x * position.x + floor_v.y * position.y + floor_v.z * position.z + floor_v.w;
+    if (!(s >= 0.0 && s <= 1.0 && t >= 0.0 && t <= 1.0)) {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
+    vec2 half_texel = 0.5 / vec2(textureSize(u_floor, 0));
+    return textureLod(u_floor, clamp(vec2(s, t), half_texel, vec2(1.0) - half_texel), 0.0);
+}
+
+vec3 lit(vec3 position, vec3 n, vec3 base, float roughness, float metallic, vec3 emissive, float occlusion, uint groups, float shadow, vec4 floor_map, vec3 ambient) {
     bool parallel = params.w > 0.5;
     vec3 v = parallel ? vec3(0.0, 0.0, 1.0) : safe_normalize(-position);
     float n_dot_v = clamp(dot(n, v), 1e-4, 1.0);
@@ -131,9 +216,9 @@ vec3 lit(vec3 position, vec3 n, vec3 base, float roughness, float metallic, vec3
     float a = r * r;
     float a2 = r * r * r * r;
     vec3 up = sky_up.xyz;
-    vec3 sky = sky_color.xyz;
-    vec3 ground = ground_color.xyz;
-    float ao = 1.0 + (occlusion - 1.0) * 0.8;
+    vec3 sky = sky_color.xyz * ambient;
+    vec3 ground = ground_color.xyz * ambient;
+    float ao = (1.0 + (occlusion - 1.0) * 0.8) * floor_map.a;
 
     vec3 light = diffuse * hemisphere(n, up, sky, ground) * ao;
     vec3 reflected = n * (2.0 * dot(n, v)) - v;
@@ -153,7 +238,7 @@ vec3 lit(vec3 position, vec3 n, vec3 base, float roughness, float metallic, vec3
             float x5 = x * x * x * x * x;
             vec3 fresnel = f0 + (vec3(1.0) - f0) * x5;
             vec3 specular = fresnel * (pi_d * visibility);
-            light = light + (diffuse + specular) * sun_color.xyz * n_dot_l;
+            light = light + (diffuse + specular) * sun_color.xyz * (n_dot_l * shadow);
         }
     }
 
@@ -179,12 +264,59 @@ vec3 lit(vec3 position, vec3 n, vec3 base, float roughness, float metallic, vec3
         light = light + diffuse * point_color[i].xyz * (attenuation * clamp(dot(n, l), 0.0, 1.0));
     }
 
+    light = light + diffuse * floor_map.rgb;
     return light + emissive;
+}
+
+// the grade: 16 × 16 × 16 points of codes in the part table, from
+// tone.w less one. A surface's codes fall in a cube of eight points;
+// the walk from its low corner to its high one, the largest share
+// first, crosses four of them, and the codes blend along that walk —
+// the CPU's order
+vec3 grade_point(uint index) {
+    return vec3(part_row(index).rgb);
+}
+
+vec3 graded(vec3 code) {
+    if (tone.w < 0.5) {
+        return code;
+    }
+    vec3 g = clamp(code / 255.0 * 15.0, 0.0, 15.0);
+    vec3 i = min(floor(g), vec3(14.0));
+    vec3 w = g - i;
+    uvec3 s = uvec3(1u, 16u, 256u);
+    if (w.x < w.y) {
+        w.xy = w.yx;
+        s.xy = s.yx;
+    }
+    if (w.y < w.z) {
+        w.yz = w.zy;
+        s.yz = s.zy;
+    }
+    if (w.x < w.y) {
+        w.xy = w.yx;
+        s.xy = s.yx;
+    }
+    uint low = uint(tone.w) - 1u + uint(i.x) + 16u * uint(i.y) + 256u * uint(i.z);
+    vec3 p0 = grade_point(low);
+    vec3 p1 = grade_point(low + s.x);
+    vec3 p2 = grade_point(low + s.x + s.y);
+    vec3 p3 = grade_point(low + s.x + s.y + s.z);
+    return p0 + (p1 - p0) * w.x + (p2 - p1) * w.y + (p3 - p2) * w.z;
 }
 
 vec4 material_row(int row) {
     int index = int(v_material);
     return materials.rows[index * 4 + row];
+}
+
+// the glow `shade` leaves, in a code premultiplied by its alpha
+float shade_glow = 0.0;
+
+// how much a surface glows, from the light it gives off: its brightest
+// channel, a quarter a unit
+float glow_of(vec3 emissive) {
+    return clamp(max(emissive.r, max(emissive.g, emissive.b)) * 0.25, 0.0, 1.0);
 }
 
 // premultiplied codes over 255: the target's unorm write rounds them to
@@ -208,8 +340,14 @@ vec4 shade() {
     vec4 surface = (front || !two_sided) ? base_row : vec4(back_row.xyz, base_row.w);
     vec3 base = surface.rgb * v_tint.rgb * color.rgb;
     float alpha = surface.a * v_tint.a * color.a;
+    // with four samples a cut-out's edge becomes coverage: the cut
+    // sharpened to a pixel's width, the samples it covers kept
+    float alpha_width = (draw & DRAW_COVERAGE) != 0u ? fwidth(alpha) : 0.0;
+    float coverage = -1.0;
     if ((draw & DRAW_MASK) != 0u || (flags & MATERIAL_MASK) != 0u) {
-        if (alpha < params_row.z) {
+        if ((draw & DRAW_COVERAGE) != 0u) {
+            coverage = clamp((alpha - params_row.z) / max(alpha_width, 1e-4) + 0.5, 0.0, 1.0);
+        } else if (alpha < params_row.z) {
             discard;
         }
         alpha = 1.0;
@@ -226,19 +364,24 @@ vec4 shade() {
         if (!front) {
             normal = -normal;
         }
-        vec3 light = lit(v_eye, normal, base, params_row.x, params_row.y, emissive_row.xyz, v_occlusion, 0xFFFFFFFFu);
+        vec3 light = lit(v_eye, normal, base, params_row.x, params_row.y, emissive_row.xyz, v_occlusion,
+                         1u << ((v_flags >> 8) & 31u), sun_visibility(v_eye, normal), floor_light(v_eye), v_ambient);
+        // the pattern's phase runs it with the world's origin
         if (tone.z > 0.5) {
-            dither = bayer(uint(gl_FragCoord.x), uint(gl_FragCoord.y));
+            uint phase = uint(tone.z) - 1u;
+            dither = bayer(uint(gl_FragCoord.x) + (phase & 3u), uint(gl_FragCoord.y) + (phase >> 2u));
         }
         linear = tone_curve(light, tone.x, tone.y);
     }
-    vec3 code = vec3(encode_code(linear.r), encode_code(linear.g), encode_code(linear.b));
+    vec3 code = graded(vec3(encode_code(linear.r), encode_code(linear.g), encode_code(linear.b)));
     vec3 codes = clamp(floor(code * alpha + 0.5 + dither), 0.0, 255.0);
-    return vec4(codes, floor(alpha * 255.0 + 0.5)) / 255.0;
+    shade_glow = floor(glow_of(emissive_row.xyz) * alpha * 255.0 + 0.5);
+    return vec4(codes / 255.0, coverage >= 0.0 ? coverage : floor(alpha * 255.0 + 0.5) / 255.0);
 }
 
 void main() {
     out_color = shade();
+    out_glow = vec4(shade_glow / 255.0, 0.0, 0.0, out_color.a);
     float depth = v_zw.x / v_zw.y;
     float slope = max(abs(dFdx(depth)), abs(dFdy(depth)));
     gl_FragDepth = min(gl_FragCoord.z + u_draw.w * slope + DEPTH_TIE, DEPTH_CEILING);

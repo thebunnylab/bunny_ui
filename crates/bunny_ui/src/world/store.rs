@@ -16,9 +16,11 @@ use std::rc::Rc;
 use motor::hash::FxHashMap as HashMap;
 use motor::state::State;
 
-use super::material::{Light, LineStyle, Material, Model};
+use super::material::{FloorMap, Light, LineStyle, Material, Model, PartState};
 use super::math::{Aabb, Mat4, Quat, Transform, Vec3};
 use super::mesh::{Lines, Mesh};
+use super::motion::Motion;
+use super::skin::{Clip, Play};
 use crate::layout::Color;
 
 /// Slots per chunk: the unit an edit copies when a snapshot shares it.
@@ -46,8 +48,31 @@ pub struct EntitySpec {
     pub visible: bool,
     pub pickable: bool,
     pub casts_shadow: bool,
+    /// The entity's surfaces read the world's floor map
+    /// ([`World::set_floor_map`]): a floor, a rug, a terrace.
+    pub reads_floor_map: bool,
+    /// The group of lights the entity's surfaces answer to, 0 to 31: a
+    /// point light reaches the groups its mask names
+    /// ([`super::material::PointLight::groups`]). A lamp in one room
+    /// does not light the next.
+    pub light_group: u8,
     /// Multiplies the colour of every material of the entity.
     pub tint: Color,
+    /// Multiplies the light the entity takes from the sky and the ground:
+    /// the ambient of the room it stands in. White by default.
+    pub ambient: Color,
+    /// The state of each part of the entity's mesh, by part number: a
+    /// part takes a tint of its own, or hides, with no new mesh. A part
+    /// past the end keeps its own look.
+    pub parts: Option<Rc<[PartState]>>,
+    /// The clip the entity plays: its own skinned mesh, and every skinned
+    /// entity below it that plays none of its own, take the pose.
+    pub play: Option<Play>,
+    /// A walk the entity is on: while it lasts, it places the entity (and
+    /// may turn it), whatever the transform says.
+    pub motion: Option<Motion>,
+    /// The weights of its mesh's morph targets, each in `[0, 1]`.
+    pub morph: [f32; 2],
     /// A number the app chooses, given back with a pick.
     pub tag: u64,
     /// Raw JSON an asset brought with it, untouched.
@@ -68,7 +93,14 @@ impl EntitySpec {
             visible: true,
             pickable: true,
             casts_shadow: true,
+            reads_floor_map: false,
+            light_group: 0,
             tint: Color::WHITE,
+            ambient: Color::WHITE,
+            parts: None,
+            play: None,
+            motion: None,
+            morph: [0.0; 2],
             tag: 0,
             extras: None,
         }
@@ -119,8 +151,26 @@ impl EntitySpec {
         EntitySpec { casts_shadow: false, ..self }
     }
 
+    /// The entity's surfaces read the world's floor map.
+    pub fn reading_floor_map(self) -> EntitySpec {
+        EntitySpec { reads_floor_map: true, ..self }
+    }
+
+    /// The entity's surfaces answer to the lights of `group` (0 to 31).
+    pub fn in_light_group(self, group: u8) -> EntitySpec {
+        EntitySpec { light_group: group.min(31), ..self }
+    }
+
     /// The box around what the entity shows, in its own space. Empty for
     /// a group and a light.
+    /// The entity's own transform at `time`, moved by the walk it is on.
+    pub fn transform_at(&self, time: f64) -> Transform {
+        match &self.motion {
+            Some(motion) => motion.applied(self.transform, time),
+            None => self.transform,
+        }
+    }
+
     pub fn local_bounds(&self) -> Aabb {
         match &self.shape {
             Shape::Model(model) => model.mesh.bounds(),
@@ -167,11 +217,17 @@ pub(crate) struct WorldData {
     free: Rc<Vec<u32>>,
     keyed: Rc<HashMap<u64, EntityId>>,
     live: u32,
+    /// The light and shade baked on the ground.
+    pub(crate) floor_map: Option<Rc<FloorMap>>,
+    /// The level each model was last drawn at: a level holds while the
+    /// model's height stays near it. Shared by every snapshot; frames
+    /// write it, and no write of it repaints anything.
+    pub(crate) levels: Rc<std::cell::RefCell<HashMap<EntityId, u8>>>,
 }
 
 impl WorldData {
     fn new() -> WorldData {
-        WorldData { chunks: Vec::new(), free: Rc::default(), keyed: Rc::default(), live: 0 }
+        WorldData { chunks: Vec::new(), free: Rc::default(), keyed: Rc::default(), live: 0, floor_map: None, levels: Rc::default() }
     }
 
     fn slot(&self, id: EntityId) -> Option<&Slot> {
@@ -250,16 +306,22 @@ impl WorldData {
         })
     }
 
-    /// The entity's place in the world: its own transform after each of
-    /// its parents'. A parent chain longer than the world is a cycle and
-    /// stops there.
+    /// The entity's place in the world now (the engine clock's time): see
+    /// [`WorldData::world_matrix_at`].
     pub(crate) fn world_matrix(&self, id: EntityId) -> Option<Mat4> {
+        self.world_matrix_at(id, motor::task::now())
+    }
+
+    /// The entity's place in the world at `time`: its own transform after
+    /// each of its parents', each moved by the walk it is on. A parent
+    /// chain longer than the world is a cycle and stops there.
+    pub(crate) fn world_matrix_at(&self, id: EntityId, time: f64) -> Option<Mat4> {
         let mut data = self.get(id)?;
-        let mut matrix = data.spec.transform.matrix();
+        let mut matrix = data.spec.transform_at(time).matrix();
         let mut steps = 0u32;
         while let Some(parent) = data.parent {
             let Some(parent_data) = self.get(parent) else { break };
-            matrix = parent_data.spec.transform.matrix() * matrix;
+            matrix = parent_data.spec.transform_at(time).matrix() * matrix;
             data = parent_data;
             steps += 1;
             if steps > self.live {
@@ -267,6 +329,53 @@ impl WorldData {
             }
         }
         Some(matrix)
+    }
+
+    /// The clip the entity's pose comes from: its own, or that of the
+    /// nearest entity above it that plays one, and which entity that is.
+    pub(crate) fn play_of(&self, id: EntityId) -> Option<(EntityId, &Play)> {
+        let mut current = Some(id);
+        let mut steps = 0u32;
+        while let Some(at) = current {
+            let data = self.get(at)?;
+            if let Some(play) = &data.spec.play {
+                return Some((at, play));
+            }
+            current = data.parent;
+            steps += 1;
+            if steps > self.live + 1 {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Whether the entity moves by itself at `time`: it walks, or rides on
+    /// one that walks, or its skinned mesh plays a clip that moves.
+    pub(crate) fn moves(&self, id: EntityId, time: f64) -> bool {
+        let mut current = Some(id);
+        let mut steps = 0u32;
+        while let Some(at) = current {
+            let Some(data) = self.get(at) else { return false };
+            if data.spec.motion.as_ref().is_some_and(|motion| motion.moving(time)) {
+                return true;
+            }
+            current = data.parent;
+            steps += 1;
+            if steps > self.live + 1 {
+                break;
+            }
+        }
+        let skinned = self.get(id).is_some_and(|data| matches!(&data.spec.shape, Shape::Model(model) if model.skin.is_some()));
+        skinned && self.play_of(id).is_some_and(|(_, play)| play.moving(time))
+    }
+
+    /// Whether a clip of the world still plays, or an entity still walks,
+    /// at `time`.
+    pub(crate) fn moving(&self, time: f64) -> bool {
+        self.iter().any(|(_, data)| {
+            data.spec.play.as_ref().is_some_and(|play| play.moving(time)) || data.spec.motion.as_ref().is_some_and(|motion| motion.moving(time))
+        })
     }
 
     /// Is the entity shown — itself and every parent above it?
@@ -365,9 +474,45 @@ impl World {
         self.add_spec(EntitySpec::new(Shape::Empty))
     }
 
+    /// The world's three axes from the origin, `length` meters each way —
+    /// x red, y green, z blue, solid where they run positive and dashed
+    /// where they run negative: the guide of a modelling tool. ONE group,
+    /// in one write: move it, hide it or remove it whole.
+    pub fn add_axes(&self, length: f64) -> Entity {
+        let reach = length.max(0.0) as f32;
+        let axes = [(0usize, Color::rgb(204, 52, 52)), (1, Color::rgb(46, 150, 64)), (2, Color::rgb(52, 92, 210))];
+        self.edit(|edit| {
+            let group = edit.add(EntitySpec::new(Shape::Empty));
+            for (axis, color) in axes {
+                for sign in [1.0f32, -1.0] {
+                    let mut end = [0.0f32; 3];
+                    end[axis] = reach * sign;
+                    let style = LineStyle::solid(color, 1.0);
+                    let style = if sign < 0.0 { style.dashed(6.0, 4.0) } else { style };
+                    let line = edit.add(EntitySpec { pickable: false, ..EntitySpec::lines(Lines::new(vec![[[0.0; 3], end]]), style) });
+                    edit.set_parent(line, Some(group));
+                }
+            }
+            group
+        })
+    }
+
     pub fn add_spec(&self, spec: EntitySpec) -> Entity {
         let id = self.data.update(|data| data.insert(EntityData { spec, parent: None, key: None }));
         Entity { world: *self, id }
+    }
+
+    /// Lays a picture of baked light and shade on the ground, read by the
+    /// entities that ask for it; `None` takes it away. One write, and
+    /// none when the map is the one already laid.
+    pub fn set_floor_map(&self, map: Option<FloorMap>) {
+        self.data.update_if(|data| {
+            let same = data.floor_map.as_deref() == map.as_ref();
+            if !same {
+                data.floor_map = map.map(Rc::new);
+            }
+            (!same, ())
+        });
     }
 
     /// Many changes as ONE write: the box that shows the world repaints
@@ -492,12 +637,20 @@ impl WorldEdit<'_> {
         }
     }
 
+    /// Places the entity; a walk it was on stops.
     pub fn set_position(&mut self, entity: Entity, position: Vec3) {
-        self.update(entity, |spec| spec.transform.translation = position);
+        self.update(entity, |spec| {
+            spec.transform.translation = position;
+            spec.motion = None;
+        });
     }
 
+    /// Places and turns the entity; a walk it was on stops.
     pub fn set_transform(&mut self, entity: Entity, transform: Transform) {
-        self.update(entity, |spec| spec.transform = transform);
+        self.update(entity, |spec| {
+            spec.transform = transform;
+            spec.motion = None;
+        });
     }
 
     pub fn show(&mut self, entity: Entity, shown: bool) {
@@ -603,8 +756,12 @@ impl Entity {
             .map(|id| Entity { world: self.world, id })
     }
 
+    /// Places the entity; a walk it was on stops.
     pub fn set_position(self, position: Vec3) -> Entity {
-        self.change(|spec| spec.transform.translation = position)
+        self.change(|spec| {
+            spec.transform.translation = position;
+            spec.motion = None;
+        })
     }
 
     pub fn set_rotation(self, rotation: Quat) -> Entity {
@@ -615,8 +772,12 @@ impl Entity {
         self.change(|spec| spec.transform.scale = scale)
     }
 
+    /// Places, turns and scales the entity; a walk it was on stops.
     pub fn set_transform(self, transform: Transform) -> Entity {
-        self.change(|spec| spec.transform = transform)
+        self.change(|spec| {
+            spec.transform = transform;
+            spec.motion = None;
+        })
     }
 
     pub fn set_shape(self, shape: Shape) -> Entity {
@@ -635,12 +796,85 @@ impl Entity {
         self.change(|spec| spec.casts_shadow = casts)
     }
 
+    /// Whether the entity's surfaces read the world's floor map.
+    pub fn set_reads_floor_map(self, reads: bool) -> Entity {
+        self.change(|spec| spec.reads_floor_map = reads)
+    }
+
+    /// The entity's surfaces answer to the lights of `group` (0 to 31).
+    pub fn set_light_group(self, group: u8) -> Entity {
+        self.change(|spec| spec.light_group = group.min(31))
+    }
+
     pub fn set_tint(self, tint: Color) -> Entity {
         self.change(|spec| spec.tint = tint)
     }
 
+    /// Multiplies the light the entity takes from the sky and the ground.
+    pub fn set_ambient(self, ambient: Color) -> Entity {
+        self.change(|spec| spec.ambient = ambient)
+    }
+
+    /// The state of each part of the entity's mesh, by part number;
+    /// `None` gives every part its own look back.
+    pub fn set_parts(self, parts: Option<Rc<[PartState]>>) -> Entity {
+        self.change(|spec| spec.parts = parts)
+    }
+
     pub fn set_tag(self, tag: u64) -> Entity {
         self.change(|spec| spec.tag = tag)
+    }
+
+    /// Plays `clip` from now, over and over: the entity's skinned mesh,
+    /// and every skinned entity below it, move with it — a figure and
+    /// what it wears. A box that shows the world asks for frames while it
+    /// moves.
+    pub fn play(self, clip: &Clip) -> Entity {
+        let start = motor::task::now();
+        self.change(|spec| spec.play = Some(Play { clip: clip.clone(), start, speed: 1.0, looped: true, from: None }))
+    }
+
+    /// Plays `clip` from now, once, and holds its last pose.
+    pub fn play_once(self, clip: &Clip) -> Entity {
+        let start = motor::task::now();
+        self.change(|spec| spec.play = Some(Play { clip: clip.clone(), start, speed: 1.0, looped: false, from: None }))
+    }
+
+    /// Plays `clip` from now, over and over, taking over from the clip it
+    /// played across `seconds`: the old pose blends into the new one, a
+    /// walk easing into a stand.
+    pub fn cross_fade(self, clip: &Clip, seconds: f64) -> Entity {
+        let start = motor::task::now();
+        self.change(|spec| {
+            let next = Play { clip: clip.clone(), start, speed: 1.0, looped: true, from: None };
+            spec.play = Some(match &spec.play {
+                Some(playing) => playing.handed_to(next, start, seconds),
+                None => next,
+            });
+        })
+    }
+
+    /// The weights of the entity's mesh's morph targets, each in `[0, 1]`:
+    /// a cheek that puffs, a coat that settles on a seat.
+    pub fn set_morph(self, weights: [f32; 2]) -> Entity {
+        self.change(|spec| spec.morph = weights)
+    }
+
+    /// Walks the entity from where it stands now to `to`, `speed` meters a
+    /// second, facing its way. A box that shows the world asks for frames
+    /// until it arrives; placing the entity stops the walk.
+    pub fn move_to(self, to: Vec3, speed: f64) -> Entity {
+        let start = motor::task::now();
+        self.change(|spec| {
+            let from = spec.transform_at(start).translation;
+            spec.motion = Some(Motion { from, to, start, speed, face: true });
+        })
+    }
+
+    /// The clip and its timing, whole; `None` puts the skinned meshes
+    /// below back in their rest pose.
+    pub fn set_play(self, play: Option<Play>) -> Entity {
+        self.change(|spec| spec.play = play)
     }
 
     /// Hangs the entity under `parent`: it moves, turns and hides with
@@ -692,6 +926,26 @@ mod tests {
         assert!(Rc::ptr_eq(&before.chunks[0], &after.chunks[0]), "an untouched chunk is shared");
         assert!(!Rc::ptr_eq(&before.chunks[1], &after.chunks[1]), "the touched chunk was copied");
         assert!(Rc::ptr_eq(&before.chunks[2], &after.chunks[2]));
+    }
+
+    #[test]
+    fn a_walk_moves_the_entity_and_asks_for_frames_until_it_arrives() {
+        let world = World::new();
+        let walker = world.add(cube(), red());
+        walker.move_to(vec3(4.0, 0.0, 0.0), 2.0);
+        let start = motor::task::now();
+        let at = |time: f64| world.with(|data| data.world_matrix_at(walker.id(), time)).expect("alive").translation_part();
+        assert_eq!(at(start + 1.0), vec3(2.0, 0.0, 0.0), "halfway after a second");
+        assert_eq!(at(start + 5.0), vec3(4.0, 0.0, 0.0), "held where it arrived");
+        assert!(world.with(|data| data.moving(start + 1.0)));
+        assert!(!world.with(|data| data.moving(start + 5.0)), "an arrival asks for no frame");
+        // a child walks with its parent
+        let rider = world.add(cube(), red()).set_parent(Some(walker));
+        assert_eq!(world.with(|data| data.world_matrix_at(rider.id(), start + 1.0)).expect("alive").translation_part(), vec3(2.0, 0.0, 0.0));
+        // placing the entity stops the walk
+        walker.set_position(vec3(-1.0, 0.0, 0.0));
+        assert_eq!(at(start + 1.0), vec3(-1.0, 0.0, 0.0));
+        assert!(!world.with(|data| data.moving(start + 1.0)));
     }
 
     #[test]

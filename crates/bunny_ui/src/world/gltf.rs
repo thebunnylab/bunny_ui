@@ -7,19 +7,26 @@
 //! materials with a base colour texture, emissive light
 //! (`KHR_materials_emissive_strength`), alpha modes, two sides and
 //! unlit surfaces (`KHR_materials_unlit`); nodes with a matrix or a
-//! translation, rotation and scale; and the `extras` of nodes and
+//! translation, rotation and scale; a region a vertex (`_REGION`, its
+//! part: a sleeve, the skin under a coat) for a part to hide or take a
+//! tint of its own; skins (`JOINTS_0`, `WEIGHTS_0`, the
+//! inverse binds) and the animations that move their nodes, keys held
+//! (`STEP`) or blended (`LINEAR`); up to two morph targets a mesh (their
+//! places and normals, weighed by the app); and the `extras` of nodes and
 //! meshes, handed on as raw JSON.
 //!
 //! What it refuses, by name: buffers in files outside the asset, sparse
-//! accessors, and any input that is not what it claims — always an
-//! error, never a panic.
+//! accessors, cubic spline keys (sample them at a steady rate), a skin
+//! of more than 256 joints, and any input that is not what it claims —
+//! always an error, never a panic.
 
 use std::rc::Rc;
 
 use super::json::{Json, JsonError};
 use super::material::{AlphaMode, Material, Model};
 use super::math::{Mat4, Quat, Transform, Vec3, vec3};
-use super::mesh::{Mesh, MeshData};
+use super::mesh::{MAX_MORPHS, Mesh, MeshData, Morph};
+use super::skin::{Channel, Clip, Path, Skeleton, SkeletonNode, Skin};
 use super::shade::encode;
 use super::store::{Entity, EntitySpec, Shape, World};
 use crate::image_engine::ImageSource;
@@ -69,17 +76,29 @@ pub struct AssetNode {
 }
 
 /// What a glTF asset holds: a model per mesh, the tree of nodes that
-/// places them, and the nodes at the top of the scene.
+/// places them, and the nodes at the top of the scene; for a figure, its
+/// skeleton, its skins and its clips.
 #[derive(Clone, Debug)]
 pub struct Asset {
+    /// A model per mesh, then one per node that hangs a mesh from a skin.
     pub models: Vec<Model>,
-    /// The `extras` of each mesh, beside its model.
+    /// The `extras` of each model's mesh, beside it.
     pub model_extras: Vec<Option<Rc<str>>>,
     pub nodes: Vec<AssetNode>,
     pub roots: Vec<usize>,
+    /// The asset's nodes as a skeleton, when a skin names them.
+    pub skeleton: Option<Skeleton>,
+    pub skins: Vec<Skin>,
+    /// The animations, each a clip of the skeleton's nodes.
+    pub clips: Vec<Clip>,
 }
 
 impl Asset {
+    /// The clip named `name`.
+    pub fn clip(&self, name: &str) -> Option<&Clip> {
+        self.clips.iter().find(|clip| clip.name() == Some(name))
+    }
+
     /// Reads a GLB file, or a glTF text whose buffers and images are
     /// `data:` URIs.
     pub fn from_bytes(bytes: &[u8]) -> Result<Asset, GltfError> {
@@ -396,6 +415,7 @@ fn read(json: &Json, bin: Option<&[u8]>) -> Result<Asset, GltfError> {
         let mut data = MeshData::default();
         let mut slots: Vec<Option<usize>> = Vec::new();
         let mut materials: Vec<Material> = Vec::new();
+        let mut morphs: Vec<Morph> = Vec::new();
         for primitive in mesh.get("primitives").map_or(&[][..], Json::as_array) {
             if primitive.get("mode").and_then(Json::as_index).unwrap_or(4) != 4 {
                 continue; // lines and points have no surface to draw
@@ -445,6 +465,41 @@ fn read(json: &Json, bin: Option<&[u8]>) -> Result<Asset, GltfError> {
                 Some(index) => document.floats(index)?.0.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect::<Vec<_>>(),
                 None => Vec::new(),
             };
+            // the region of each vertex: its part, to hide or tint
+            let regions = match attribute("_REGION") {
+                Some(index) => {
+                    let (values, components) = document.floats(index)?;
+                    if components != 1 || values.iter().any(|&region| !(0.0..65536.0).contains(&region)) {
+                        return Err(GltfError::Unsupported("a _REGION that is not one 16-bit number a vertex"));
+                    }
+                    values.iter().map(|&region| region as u16).collect::<Vec<_>>()
+                }
+                None => Vec::new(),
+            };
+            // the joints a vertex hangs from, a byte each, and their shares
+            let joints = match attribute("JOINTS_0") {
+                Some(index) => {
+                    let (values, components) = document.floats(index)?;
+                    if components != 4 {
+                        return Err(GltfError::Unsupported("JOINTS_0 that is not VEC4"));
+                    }
+                    if values.iter().any(|&joint| !(0.0..256.0).contains(&joint)) {
+                        return Err(GltfError::Unsupported("a skin of more than 256 joints"));
+                    }
+                    values.as_chunks::<4>().0.iter().map(|j| j.map(|joint| joint as u8)).collect::<Vec<_>>()
+                }
+                None => Vec::new(),
+            };
+            let weights = match attribute("WEIGHTS_0") {
+                Some(index) => {
+                    let (values, components) = document.floats(index)?;
+                    if components != 4 {
+                        return Err(GltfError::Unsupported("WEIGHTS_0 that is not VEC4"));
+                    }
+                    values.as_chunks::<4>().0.iter().map(|w| w.map(|share| (share.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)).collect::<Vec<_>>()
+                }
+                None => Vec::new(),
+            };
             // an attribute of the wrong length is no attribute
             let fill = |list: Vec<[f32; 3]>| if list.len() == count { list } else { Vec::new() };
             let normals = fill(normals);
@@ -452,7 +507,42 @@ fn read(json: &Json, bin: Option<&[u8]>) -> Result<Asset, GltfError> {
             data.uvs.extend(if uvs.len() == count { uvs } else { vec![[0.0, 0.0]; count] });
             data.colors.extend(if colors.len() == count { colors } else { vec![[255; 4]; count] });
             data.occlusion.extend(if occlusion.len() == count { occlusion } else { vec![255; count] });
+            data.parts.extend(if regions.len() == count { regions } else { vec![0; count] });
+            // a skin's lists stay whole across the primitives, or go
+            if joints.len() == count && weights.len() == count && data.joints.len() == base as usize {
+                data.joints.extend(joints);
+                data.weights.extend(weights);
+            } else {
+                data.joints.clear();
+                data.weights.clear();
+            }
             data.materials.extend(std::iter::repeat_n(slot.min(255) as u8, count));
+            // morph targets: each primitive's vertices in each target, a
+            // primitive without one adding no change
+            let targets = primitive.get("targets").map_or(&[][..], Json::as_array);
+            if targets.len() > MAX_MORPHS {
+                return Err(GltfError::Unsupported("more than two morph targets"));
+            }
+            while morphs.len() < targets.len() {
+                morphs.push(Morph { positions: vec![[0.0; 3]; base as usize], normals: vec![[0.0; 3]; base as usize] });
+            }
+            for (k, morph) in morphs.iter_mut().enumerate() {
+                let target = targets.get(k);
+                let read = |name: &str| -> Result<Vec<[f32; 3]>, GltfError> {
+                    match target.and_then(|t| t.get(name)).and_then(Json::as_index) {
+                        Some(index) => {
+                            let (values, components) = document.floats(index)?;
+                            if components != 3 || values.len() != count * 3 {
+                                return Err(GltfError::Unsupported("a morph target that does not match its primitive"));
+                            }
+                            Ok(values.as_chunks::<3>().0.to_vec())
+                        }
+                        None => Ok(vec![[0.0; 3]; count]),
+                    }
+                };
+                morph.positions.extend(read("POSITION")?);
+                morph.normals.extend(read("NORMAL")?);
+            }
             match primitive.get("indices").and_then(Json::as_index) {
                 Some(index) => {
                     for i in document.indices(index)? {
@@ -472,6 +562,7 @@ fn read(json: &Json, bin: Option<&[u8]>) -> Result<Asset, GltfError> {
         if materials.is_empty() {
             materials.push(default_material());
         }
+        data.morphs = morphs;
         models.push(Model::new(Mesh::new(data), materials));
         model_extras.push(mesh.get("extras").map(|e| Rc::from(e.to_text())));
     }
@@ -523,7 +614,97 @@ fn read(json: &Json, bin: Option<&[u8]>) -> Result<Asset, GltfError> {
             (0..nodes.len()).filter(|&n| !child[n]).collect()
         }
     };
-    Ok(Asset { models, model_extras, nodes, roots })
+    // the skins: the asset's nodes as one skeleton, each skin naming its
+    // joints among them; a node that hangs a mesh from a skin takes a
+    // model of its own, placed where the node stands in the skeleton
+    let skin_list = document.list("skins");
+    let (skeleton, skins) = if skin_list.is_empty() {
+        (None, Vec::new())
+    } else {
+        let mut parent = vec![None; nodes.len()];
+        for (index, node) in nodes.iter().enumerate() {
+            for &child in &node.children {
+                if let Some(slot) = parent.get_mut(child) {
+                    *slot = Some(index as u32);
+                }
+            }
+        }
+        let skeleton = Skeleton::new(
+            nodes.iter().zip(&parent).map(|(node, &parent)| SkeletonNode { name: node.name.clone(), parent, rest: node.transform }).collect(),
+        );
+        let mut skins = Vec::new();
+        for skin in skin_list {
+            let joints: Vec<u32> = skin.get("joints").map_or(&[][..], Json::as_array).iter().filter_map(Json::as_index).map(|j| j as u32).collect();
+            if joints.iter().any(|&joint| joint as usize >= nodes.len()) {
+                return Err(GltfError::Missing("a skin's joint node"));
+            }
+            let inverse_bind = match skin.get("inverseBindMatrices").and_then(Json::as_index) {
+                Some(index) => {
+                    let (values, components) = document.floats(index)?;
+                    if components != 16 {
+                        return Err(GltfError::Unsupported("inverse binds that are not MAT4"));
+                    }
+                    values
+                        .as_chunks::<16>()
+                        .0
+                        .iter()
+                        .map(|m| {
+                            let mut matrix = Mat4::IDENTITY;
+                            for (at, value) in m.iter().enumerate() {
+                                matrix.m[at] = *value as f64;
+                            }
+                            matrix
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+            skins.push(Skin::new(skeleton.clone(), joints, inverse_bind).ok_or(GltfError::Unsupported("a skin of more than 256 joints"))?);
+        }
+        (Some(skeleton), skins)
+    };
+    if let Some(skeleton) = &skeleton {
+        let pose = skeleton.pose(None, 0.0);
+        for (index, node) in document.list("nodes").iter().enumerate() {
+            let Some(skin) = node.get("skin").and_then(Json::as_index) else { continue };
+            let skin = skins.get(skin).ok_or(GltfError::Missing("skins"))?;
+            let Some(model) = nodes[index].model else { continue };
+            let skinned = models[model].clone().skinned(skin.placed(&pose[index]));
+            models.push(skinned);
+            model_extras.push(model_extras[model].clone());
+            nodes[index].model = Some(models.len() - 1);
+        }
+    }
+
+    // the animations: each a clip of the skeleton's nodes
+    let mut clips = Vec::new();
+    for animation in document.list("animations") {
+        let samplers = animation.get("samplers").map_or(&[][..], Json::as_array);
+        let mut channels = Vec::new();
+        for channel in animation.get("channels").map_or(&[][..], Json::as_array) {
+            let target = channel.get("target").ok_or(GltfError::Missing("channel.target"))?;
+            let Some(node) = target.get("node").and_then(Json::as_index).filter(|&node| node < nodes.len()) else { continue };
+            let path = match target.get("path").and_then(Json::as_str) {
+                Some("translation") => Path::Translation,
+                Some("rotation") => Path::Rotation,
+                Some("scale") => Path::Scale,
+                _ => continue, // morph weights move no node
+            };
+            let sampler = channel.get("sampler").and_then(Json::as_index).and_then(|at| samplers.get(at)).ok_or(GltfError::Missing("animation.sampler"))?;
+            let step = match sampler.get("interpolation").and_then(Json::as_str).unwrap_or("LINEAR") {
+                "LINEAR" => false,
+                "STEP" => true,
+                _ => return Err(GltfError::Unsupported("a cubic spline animation")),
+            };
+            let input = sampler.get("input").and_then(Json::as_index).ok_or(GltfError::Missing("sampler.input"))?;
+            let output = sampler.get("output").and_then(Json::as_index).ok_or(GltfError::Missing("sampler.output"))?;
+            let (times, _) = document.floats(input)?;
+            let (values, _) = document.floats(output)?;
+            channels.push(Channel { node: node as u32, path, step, times: Rc::from(times), values: Rc::from(values) });
+        }
+        clips.push(Clip::new(animation.get("name").and_then(Json::as_str).map(Rc::from), channels));
+    }
+    Ok(Asset { models, model_extras, nodes, roots, skeleton, skins, clips })
 }
 
 #[cfg(test)]
@@ -615,6 +796,105 @@ mod tests {
         assert_eq!(frame.meshes.len(), 1, "one mesh");
         assert_eq!(frame.draws.len(), 1, "one instanced draw");
         assert_eq!(frame.draws[0].instance_count, 2);
+    }
+
+    #[test]
+    fn a_skinned_glb_imports_its_skin_and_clip() {
+        let mut bin = Vec::new();
+        let floats = |bin: &mut Vec<u8>, values: &[f32]| values.iter().for_each(|v| bin.extend_from_slice(&v.to_le_bytes()));
+        floats(&mut bin, &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]); // 0: positions
+        for index in [0u16, 1, 2, 0] {
+            bin.extend_from_slice(&index.to_le_bytes()); // 36: indices, padded
+        }
+        for _ in 0..3 {
+            bin.extend_from_slice(&[1, 0, 0, 0]); // 44: every vertex on the skin's second joint
+        }
+        for _ in 0..3 {
+            floats(&mut bin, &[1.0, 0.0, 0.0, 0.0]); // 56: weights
+        }
+        let identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        floats(&mut bin, &identity); // 104: the hips' inverse bind
+        floats(&mut bin, &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 1.0]); // the arm's
+        floats(&mut bin, &[0.0, 1.0]); // 232: key times
+        floats(&mut bin, &[0.0, 1.0, 0.0, 1.0, 1.0, 0.0]); // 240: the arm's place at each
+        let json = r#"{"asset":{"version":"2.0"},"buffers":[{"byteLength":264}],
+            "bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36},{"buffer":0,"byteOffset":36,"byteLength":6},
+              {"buffer":0,"byteOffset":44,"byteLength":12},{"buffer":0,"byteOffset":56,"byteLength":48},
+              {"buffer":0,"byteOffset":104,"byteLength":128},{"buffer":0,"byteOffset":232,"byteLength":8},
+              {"buffer":0,"byteOffset":240,"byteLength":24}],
+            "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"},
+              {"bufferView":2,"componentType":5121,"count":3,"type":"VEC4"},{"bufferView":3,"componentType":5126,"count":3,"type":"VEC4"},
+              {"bufferView":4,"componentType":5126,"count":2,"type":"MAT4"},{"bufferView":5,"componentType":5126,"count":2,"type":"SCALAR"},
+              {"bufferView":6,"componentType":5126,"count":2,"type":"VEC3"}],
+            "meshes":[{"primitives":[{"attributes":{"POSITION":0,"JOINTS_0":2,"WEIGHTS_0":3},"indices":1}]}],
+            "skins":[{"joints":[1,2],"inverseBindMatrices":4}],
+            "animations":[{"name":"wave","channels":[{"sampler":0,"target":{"node":2,"path":"translation"}}],
+              "samplers":[{"input":5,"output":6,"interpolation":"LINEAR"}]}],
+            "nodes":[{"mesh":0,"skin":0},{"name":"hips","children":[2]},{"name":"arm","translation":[0,1,0]}],
+            "scenes":[{"nodes":[0,1]}],"scene":0}"#;
+        let asset = Asset::from_bytes(&glb(json, &bin)).expect("a valid skinned asset");
+        assert_eq!(asset.skins.len(), 1);
+        assert_eq!(asset.skins[0].joints(), &[1, 2]);
+        let clip = asset.clip("wave").expect("the clip by name").clone();
+        assert_eq!(clip.duration(), 1.0);
+        let model = &asset.models[asset.nodes[0].model.expect("the mesh node's model")];
+        assert!(model.skin.is_some() && model.mesh.is_skinned(), "the node hangs its mesh from the skin");
+        // played to its end and held: the arm one meter along x from its bind
+        let world = World::new();
+        let figure = world.spawn(&asset);
+        figure.set_play(Some(super::super::skin::Play { clip, start: motor::task::now() - 2.0, speed: 1.0, looped: false, from: None }));
+        let camera = super::super::camera::Camera::looking_at(vec3(0.5, 0.5, 6.0), vec3(0.5, 0.5, 0.0));
+        let frame = world.frame(&camera, &super::super::frame::WorldStyle::default(), (64, 64), 1.0);
+        assert_eq!(frame.joints.len(), 6, "two joints, three rows each");
+        assert_eq!(&frame.joints[3..6], &[[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]);
+        assert_eq!(frame.instances[0].joint_base, 0);
+        // cubic spline keys are refused by name
+        let cubic = json.replace(r#""interpolation":"LINEAR""#, r#""interpolation":"CUBICSPLINE""#);
+        assert_eq!(Asset::from_bytes(&glb(&cubic, &bin)).err(), Some(GltfError::Unsupported("a cubic spline animation")));
+    }
+
+    #[test]
+    fn regions_arrive_as_parts() {
+        let mut bin = triangle_bin();
+        bin.extend_from_slice(&[0, 0]); // the indices padded to four bytes
+        for region in [0u16, 3, 3] {
+            bin.extend_from_slice(&region.to_le_bytes()); // 44: a region a vertex
+        }
+        let json = r#"{"asset":{"version":"2.0"},"buffers":[{"byteLength":50}],
+            "bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36},{"buffer":0,"byteOffset":36,"byteLength":6},{"buffer":0,"byteOffset":44,"byteLength":6}],
+            "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"},
+              {"bufferView":2,"componentType":5123,"count":3,"type":"SCALAR"}],
+            "meshes":[{"primitives":[{"attributes":{"POSITION":0,"_REGION":2},"indices":1}]}],
+            "nodes":[{"mesh":0}]}"#;
+        let asset = Asset::from_bytes(&glb(json, &bin)).expect("a valid asset");
+        let mesh = &asset.models[0].mesh;
+        assert_eq!(mesh.part_count(), 4, "regions 0 to 3");
+        let parts: Vec<u16> = mesh.data().parts.clone();
+        assert_eq!(parts.iter().filter(|&&part| part == 3).count(), 2, "two corners in region 3");
+    }
+
+    #[test]
+    fn a_mesh_with_targets_imports_its_morphs() {
+        let mut bin = triangle_bin();
+        bin.extend_from_slice(&[0, 0]); // the indices padded to four bytes
+        for value in [0.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0] {
+            bin.extend_from_slice(&value.to_le_bytes()); // 44: the second corner moves toward +z
+        }
+        let json = r#"{"asset":{"version":"2.0"},"buffers":[{"byteLength":80}],
+            "bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36},{"buffer":0,"byteOffset":36,"byteLength":6},{"buffer":0,"byteOffset":44,"byteLength":36}],
+            "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"},
+              {"bufferView":2,"componentType":5126,"count":3,"type":"VEC3"}],
+            "meshes":[{"primitives":[{"attributes":{"POSITION":0},"indices":1,"targets":[{"POSITION":2}]}]}],
+            "nodes":[{"mesh":0}]}"#;
+        let asset = Asset::from_bytes(&glb(json, &bin)).expect("a valid asset");
+        let mesh = &asset.models[0].mesh;
+        assert_eq!(mesh.morph_count(), 1);
+        // the flat faces split the corners; the morph travels with them
+        let data = mesh.data();
+        let moved = data.positions.iter().zip(&data.morphs[0].positions).find(|(p, _)| **p == [1.0, 0.0, 0.0]).map(|(_, m)| *m);
+        assert_eq!(moved, Some([0.0, 0.0, 1.0]));
+        let three = json.replace(r#""targets":[{"POSITION":2}]"#, r#""targets":[{"POSITION":2},{"POSITION":2},{"POSITION":2}]"#);
+        assert_eq!(Asset::from_bytes(&glb(&three, &bin)).err(), Some(GltfError::Unsupported("more than two morph targets")));
     }
 
     #[test]

@@ -154,13 +154,36 @@ unsafe extern "C" {
     /// Binds the renderbuffer and gives it storage; 0 samples is one.
     #[cfg(feature = "3d")]
     fn gl_renderbuffer_storage_multisample(renderbuffer: u32, samples: i32, internal: u32, width: i32, height: i32);
-    /// The read framebuffer's colour onto the draw framebuffer, the same
-    /// rectangle on both, nearest.
+    /// A rectangle of the read framebuffer's colour onto the draw
+    /// framebuffer, its corner at `(to_x, to_y)`, nearest.
     #[cfg(feature = "3d")]
-    fn gl_blit_framebuffer(width: i32, height: i32);
+    fn gl_blit_framebuffer(x: i32, y: i32, width: i32, height: i32, to_x: i32, to_y: i32);
+    /// The box the scissor test keeps, in the framebuffer's pixels.
+    #[cfg(feature = "3d")]
+    fn gl_scissor(x: i32, y: i32, width: i32, height: i32);
+    /// 1 when the browser keeps GPU timers (`EXT_disjoint_timer_query_webgl2`).
+    #[cfg(feature = "3d")]
+    fn gl_has_timers() -> u32;
+    /// A timer over the commands that follow; 0 without timers.
+    #[cfg(feature = "3d")]
+    fn gl_timer_begin() -> u32;
+    #[cfg(feature = "3d")]
+    fn gl_timer_end();
+    /// Nanoseconds; −1 while the GPU runs the timer, −2 when its measure
+    /// was lost.
+    #[cfg(feature = "3d")]
+    fn gl_timer_read(timer: u32) -> f64;
     /// Up to two attachments; 0 is none.
     #[cfg(feature = "3d")]
     fn gl_invalidate_framebuffer(target: u32, first: u32, second: u32);
+    /// The bound draw framebuffer's first `count` colour attachments.
+    #[cfg(feature = "3d")]
+    fn gl_draw_buffers(count: u32);
+    #[cfg(feature = "3d")]
+    fn gl_read_buffer(attachment: u32);
+    /// One colour attachment of the bound draw framebuffer, cleared.
+    #[cfg(feature = "3d")]
+    fn gl_clear_bufferfv(index: i32, r: f32, g: f32, b: f32, a: f32);
     #[cfg(feature = "3d")]
     fn gl_depth_func(function: u32);
     #[cfg(feature = "3d")]
@@ -1309,6 +1332,35 @@ pub(crate) fn world_rgba(frame: &std::rc::Rc<bunny_ui::world::WorldFrame>, image
         let mut slot = slot.borrow_mut();
         let tier = slot.as_mut()?;
         let rgba = tier.ground.world.draw_single(frame, images);
+        unsafe { gl_finish() };
+        rgba
+    })
+}
+
+/// What the GPU took over the world jobs whose timers came back since the
+/// last ask — for the parity harness. A browser hands a timer's measure
+/// over a task or more after the frame that set it.
+#[cfg(feature = "3d")]
+pub(crate) fn world_timings() -> Vec<bunny_ui::gpu::world::WorldTiming> {
+    use bunny_ui::gpu::world::WorldGround;
+    TIER.with(|slot| slot.borrow_mut().as_mut().map(|tier| tier.ground.world.take_timings()).unwrap_or_default())
+}
+
+/// `before` drawn whole by the world pass alone, then `after` over it —
+/// slid by `shift`, then `rects` drawn again — read back top row first,
+/// for the parity harness.
+#[cfg(feature = "3d")]
+pub(crate) fn world_over_rgba(
+    before: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+    after: &std::rc::Rc<bunny_ui::world::WorldFrame>,
+    shift: [i32; 2],
+    rects: &[[u32; 4]],
+    images: &dyn ImageEngine,
+) -> Option<Vec<u8>> {
+    TIER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let tier = slot.as_mut()?;
+        let rgba = tier.ground.world.draw_over(before, after, shift, rects, images);
         unsafe { gl_finish() };
         rgba
     })
