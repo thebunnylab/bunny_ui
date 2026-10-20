@@ -362,9 +362,12 @@ pub enum ResourceKind {
     Rgba { size: (u32, u32), rgba: Vec<u8> },
     /// An encoded image (PNG, JPEG) the tool decodes.
     Encoded { bytes: Vec<u8> },
-    /// A vector path.
+    /// A vector path — a traced one, or an app's own symbol that one
+    /// path draws.
     Vector { verbs: Vec<Verb>, paint: Paint, ink: Ink, box_size: (f32, f32) },
-    /// A house symbol by name, tinted.
+    /// A symbol by name, tinted. A tool draws the framework's own from
+    /// the name; an app's own comes by name only when no single path
+    /// draws it, and a tool cannot draw it then.
     Symbol { name: String, color: Color, forced: bool },
     /// A file's icon, by path — the tool resolves it on its side.
     FileIcon { path: String },
