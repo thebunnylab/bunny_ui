@@ -205,6 +205,41 @@ pub fn grid_entry() -> &'static PreviewEntry {
     &GRID
 }
 
+/// An app's own mark that no single path draws: a pen and a filled dot in
+/// one ink, which the house piles in by MAX.
+const DOT_LINE: Symbol = Symbol::new(
+    "app.dot-line",
+    &bunny_ui::icon::Glyph {
+        draws: &[
+            bunny_ui::icon::Draw { paint: Paint::Stroke { width: 2.0 }, path: &[Verb::Move(5.5, 18.5), Verb::Line(18.5, 5.5)], tint: None },
+            bunny_ui::icon::Draw {
+                paint: Paint::Fill(Rule::NonZero),
+                path: &[Verb::Move(21.0, 5.0), Verb::Cubic(21.0, 7.8, 17.0, 7.8, 17.0, 5.0), Verb::Cubic(17.0, 2.2, 21.0, 2.2, 21.0, 5.0), Verb::Close],
+                tint: None,
+            },
+        ],
+    },
+);
+
+#[derive(Clone)]
+struct Glyphs;
+impl Component for Glyphs {
+    fn body(self) -> impl View {
+        icon(DOT_LINE)
+    }
+}
+
+fn make_glyphs() -> Output {
+    Output::of(Glyphs)
+}
+static GLYPHS: PreviewEntry = PreviewEntry::new(
+    Meta { ident: "glyphs", name: "Glyphs", scope: "Images", example: "glyphs", module: "host", file: "src/lib.rs", line: 26 }, make_glyphs,
+);
+#[unsafe(export_name = "bunny_preview__glyphs")]
+pub fn glyphs_entry() -> &'static PreviewEntry {
+    &GLYPHS
+}
+
 /// A manifest directory whose `src/lib.rs` the scan reads: the previews
 /// above, and one the binary does not export. Written ONCE per process:
 /// every test in this binary reads it, and the tests run in parallel, so a
@@ -217,7 +252,7 @@ fn manifest_dir() -> PathBuf {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
         dir.join("src/lib.rs"),
-        "use bunny_ui::prelude::*;\n\n#[preview(name = \"Card\", scope = \"Cards\")]\nfn card() -> impl View { text(\"\") }\n\n#[preview(name = \"Boom\", scope = \"Cards\")]\nfn boom() -> impl View { text(\"\") }\n\n#[preview]\nfn ghost() -> impl View { text(\"\") }\n\n#[preview(name = \"Zoomer\", scope = \"Gestures\")]\nfn zoomer() -> impl View { text(\"\") }\n\n#[preview(name = \"Tapper\", scope = \"Gestures\")]\nfn tapper() -> impl View { text(\"\") }\n\n#[preview(name = \"Page\", scope = \"Hosts\")]\nfn page() -> impl View { text(\"\") }\n\n#[preview]\nfn placed() -> impl View { text(\"\") }\n\n#[preview]\nfn grid_card() -> impl View { text(\"\") }\n\nbunny_ui::app!(root);\n",
+        "use bunny_ui::prelude::*;\n\n#[preview(name = \"Card\", scope = \"Cards\")]\nfn card() -> impl View { text(\"\") }\n\n#[preview(name = \"Boom\", scope = \"Cards\")]\nfn boom() -> impl View { text(\"\") }\n\n#[preview]\nfn ghost() -> impl View { text(\"\") }\n\n#[preview(name = \"Zoomer\", scope = \"Gestures\")]\nfn zoomer() -> impl View { text(\"\") }\n\n#[preview(name = \"Tapper\", scope = \"Gestures\")]\nfn tapper() -> impl View { text(\"\") }\n\n#[preview(name = \"Page\", scope = \"Hosts\")]\nfn page() -> impl View { text(\"\") }\n\n#[preview]\nfn placed() -> impl View { text(\"\") }\n\n#[preview]\nfn grid_card() -> impl View { text(\"\") }\n\n#[preview]\nfn glyphs() -> impl View { text(\"\") }\n\nbunny_ui::app!(root);\n",
     )
     .unwrap();
     dir
@@ -280,7 +315,8 @@ fn hello_lists_what_the_binary_exports_and_names_what_it_does_not() {
                     "tapper",
                     "page",
                     "placed",
-                    "grid_card"
+                    "grid_card",
+                    "glyphs"
                 ]
             );
             assert_eq!(previews[1].id, "src/lib.rs#card");
@@ -552,6 +588,36 @@ fn a_host_box_rides_the_frame_and_a_door_fills_it() {
         frame.commands
     );
     assert_eq!(frame.hosts.len(), 1, "the box still rides the frame");
+}
+
+#[test]
+fn a_glyph_no_single_path_draws_goes_by_name_then_whole_before_its_frame() {
+    let (mut host, seen) = host();
+    host.handle(select("glyphs", fixed(40.0, 40.0)));
+    assert!(host.tick(), "nothing sent: {:?} poisoned: {:?}", seen.borrow(), host.poisoned());
+    let messages = seen.borrow_mut().drain(..).collect::<Vec<_>>();
+    let resources: Vec<&wire::Resource> = messages
+        .iter()
+        .filter_map(|message| match message {
+            ToIde::Resource(resource) => Some(resource),
+            _ => None,
+        })
+        .collect();
+    // a tool that predates the glyph kind skips it and keeps the name; a
+    // newer one keeps what came last under the key, the drawing
+    let [named, whole] = resources.as_slice() else {
+        panic!("the name, then the glyph: {resources:?}");
+    };
+    assert_eq!(named.key, whole.key);
+    assert!(matches!(&named.kind, wire::ResourceKind::Symbol { name, .. } if name == "app.dot-line"), "{named:?}");
+    assert!(matches!(&whole.kind, wire::ResourceKind::Glyph { name, draws, .. } if name == "app.dot-line" && draws.len() == 2), "{whole:?}");
+    let frame_at = messages.iter().position(|message| matches!(message, ToIde::Frame(_))).expect("a frame");
+    assert!(
+        messages[..frame_at].iter().filter(|message| matches!(message, ToIde::Resource(_))).count() == 2,
+        "both travel before the frame that draws them: {messages:?}"
+    );
+    let ToIde::Frame(frame) = &messages[frame_at] else { unreachable!() };
+    assert!(frame.commands.iter().any(|command| matches!(command, wire::Draw::Image { image, .. } if image.key == named.key)));
 }
 
 /// Boxes by scene and path, as the host names them to a door.

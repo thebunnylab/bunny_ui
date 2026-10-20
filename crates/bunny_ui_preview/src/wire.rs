@@ -19,7 +19,8 @@
 //! [`WIRE_VERSION`] is 1. It is frozen: a change to an existing message
 //! is a new kind, never a new meaning for an old one. The kinds that
 //! joined after it froze — `Touch`, `Magnify` and `Place`, tool → host — are
-//! skipped by a host that predates them, by their length.
+//! skipped by a host that predates them, by their length; and `Glyph`, host
+//! → tool, by a tool that predates it.
 
 use std::fmt;
 
@@ -61,6 +62,10 @@ pub mod kind {
     pub const EXECUTIONS_SELECTED: u8 = 14;
     pub const VIEW_SNAPSHOT: u8 = 15;
     pub const STATE_OBSERVATION: u8 = 16;
+    /// An app's own glyph that no single path draws, whole — a resource
+    /// on a kind of its own, joined after v1 froze: a tool that predates
+    /// it skips it by its length.
+    pub const GLYPH: u8 = 17;
 
     pub const SELECT: u8 = 64;
     pub const RETRAIT: u8 = 65;
@@ -366,13 +371,30 @@ pub enum ResourceKind {
     /// path draws.
     Vector { verbs: Vec<Verb>, paint: Paint, ink: Ink, box_size: (f32, f32) },
     /// A symbol by name, tinted. A tool draws the framework's own from
-    /// the name; an app's own comes by name only when no single path
-    /// draws it, and a tool cannot draw it then.
+    /// the name; an app's own comes by name just before it comes whole
+    /// ([`ResourceKind::Glyph`]), for a tool that predates the glyph.
     Symbol { name: String, color: Color, forced: bool },
     /// A file's icon, by path — the tool resolves it on its side.
     FileIcon { path: String },
     /// One generation of a live feed.
     Feed { generation: u64, size: (u32, u32), rgba: Vec<u8> },
+    /// An app's own symbol whole, tinted: its draws in order, which a tool
+    /// paints as the framework paints a glyph — one ink's draws piled in
+    /// by MAX and blended once, an ink of their own painted over them.
+    /// `forced` spends the draws' own tints. It rides its own message kind,
+    /// [`kind::GLYPH`], never `RESOURCE`: a tool that predates it skips it,
+    /// and reads the symbol's name sent just before ([`Resource::by_name`]).
+    Glyph { name: String, color: Color, forced: bool, draws: Vec<GlyphDraw> },
+}
+
+/// One draw of a glyph: a path on the 24-unit icon grid, how it is
+/// painted, and its own colour when it keeps one — `None` takes the
+/// glyph's ink.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlyphDraw {
+    pub paint: Paint,
+    pub verbs: Vec<Verb>,
+    pub tint: Option<Color>,
 }
 
 /// A resource, by key.
@@ -380,6 +402,26 @@ pub enum ResourceKind {
 pub struct Resource {
     pub key: u64,
     pub kind: ResourceKind,
+}
+
+impl Resource {
+    /// What a tool that predates a kind reads in its place, under the same
+    /// key: a glyph's symbol by name, which such a tool can at least name.
+    /// `None` for every kind v1 reads.
+    pub fn by_name(&self) -> Option<Resource> {
+        match &self.kind {
+            ResourceKind::Glyph { name, color, forced, .. } => Some(Resource {
+                key: self.key,
+                kind: ResourceKind::Symbol { name: name.clone(), color: *color, forced: *forced },
+            }),
+            ResourceKind::Rgba { .. }
+            | ResourceKind::Encoded { .. }
+            | ResourceKind::Vector { .. }
+            | ResourceKind::Symbol { .. }
+            | ResourceKind::FileIcon { .. }
+            | ResourceKind::Feed { .. } => None,
+        }
+    }
 }
 
 // =============================================================================
@@ -522,6 +564,8 @@ pub enum ToIde {
         variant: Option<u32>,
         message: String,
     },
+    /// The bytes behind an image key, before the first frame that draws it
+    /// — on `RESOURCE`, or on `GLYPH` for a glyph, just after its name.
     Resource(Resource),
     Status { text: String },
     /// One preview's pass panicked; the host is alive.
@@ -861,7 +905,7 @@ impl Reader {
 pub fn decode(kind: u8, payload: &[u8]) -> Result<Received, Malformed> {
     let mut cursor = Cursor { bytes: payload, at: 0, kind };
     let message = match kind {
-        kind::HELLO..=kind::STATE_OBSERVATION => Message::ToIde(ToIde::get(&mut cursor)?),
+        kind::HELLO..=kind::GLYPH => Message::ToIde(ToIde::get(&mut cursor)?),
         kind::SELECT..=kind::PASTE => Message::ToHost(ToHost::get(&mut cursor)?),
         _ => return Ok(Received::Unknown { kind, len: payload.len() as u32 }),
     };
@@ -1550,8 +1594,17 @@ impl Wire for Resource {
                 out.u32(size.1);
                 out.bytes(rgba);
             }
+            // its own kind says what it is: no tag, and never under RESOURCE
+            ResourceKind::Glyph { name, color, forced, draws } => {
+                out.string(name);
+                color.put(out);
+                out.bool(*forced);
+                out.list(draws, |out, draw| draw.put(out));
+            }
         }
     }
+    /// The `RESOURCE` kind: v1's kinds, by tag. A glyph comes under its
+    /// own kind ([`Resource::get_glyph`]).
     fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
         let key = c.u64()?;
         let kind = match c.u8()? {
@@ -1564,6 +1617,27 @@ impl Wire for Resource {
             tag => return Err(Malformed::BadTag { what: "ResourceKind", tag }),
         };
         Ok(Resource { key, kind })
+    }
+}
+
+impl Resource {
+    /// The `GLYPH` kind: a key and a glyph, untagged.
+    fn get_glyph(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
+        Ok(Resource {
+            key: c.u64()?,
+            kind: ResourceKind::Glyph { name: c.string()?, color: Color::get(c)?, forced: c.bool()?, draws: c.list(GlyphDraw::get)? },
+        })
+    }
+}
+
+impl Wire for GlyphDraw {
+    fn put(&self, out: &mut Vec<u8>) {
+        self.paint.put(out);
+        out.list(&self.verbs, |out, verb| verb.put(out));
+        out.option(self.tint.as_ref(), |out, tint| tint.put(out));
+    }
+    fn get(c: &mut Cursor<'_>) -> Result<Self, Malformed> {
+        Ok(GlyphDraw { paint: Paint::get(c)?, verbs: c.list(Verb::get)?, tint: c.option(Color::get)? })
     }
 }
 
@@ -1885,7 +1959,18 @@ impl ToIde {
             }
             ToIde::Resource(resource) => {
                 resource.put(out);
-                kind::RESOURCE
+                match resource.kind {
+                    // v1's kinds, which every tool reads
+                    ResourceKind::Rgba { .. }
+                    | ResourceKind::Encoded { .. }
+                    | ResourceKind::Vector { .. }
+                    | ResourceKind::Symbol { .. }
+                    | ResourceKind::FileIcon { .. }
+                    | ResourceKind::Feed { .. } => kind::RESOURCE,
+                    // its own kind, which a tool that predates it skips: a
+                    // new tag under RESOURCE would end that tool's connection
+                    ResourceKind::Glyph { .. } => kind::GLYPH,
+                }
             }
             ToIde::Status { text } => {
                 out.string(text);
@@ -1960,6 +2045,7 @@ impl ToIde {
                 message: c.string()?,
             },
             kind::RESOURCE => ToIde::Resource(Resource::get(c)?),
+            kind::GLYPH => ToIde::Resource(Resource::get_glyph(c)?),
             kind::STATUS => ToIde::Status { text: c.string()? },
             kind::PANICKED => ToIde::Panicked { preview: c.string()?, message: c.string()? },
             kind::PANIC => ToIde::Panic { message: c.string()? },
