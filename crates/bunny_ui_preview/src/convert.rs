@@ -6,9 +6,11 @@
 //! the frame's string table, a font's family as its name. An image is
 //! named by the key of its innermost source, with the fades and flips
 //! the app wrapped it in folded into an [`ImageRef`]; the bytes behind a
-//! key are a [`Resource`] the host sends once. A site's `Location`
-//! becomes a file, a line and a column; a site the framework named
-//! itself keeps its name. A theme travels as its tokens by name.
+//! key are a [`Resource`] the host sends once. A symbol of the
+//! framework's own travels by name, which the tool knows; an app's own
+//! travels as the traced path it draws, under that path's key. A site's
+//! `Location` becomes a file, a line and a column; a site the framework
+//! named itself keeps its name. A theme travels as its tokens by name.
 //!
 //! ## Production gotchas
 //!
@@ -19,7 +21,23 @@
 //! - A wrapped image raised from the wire carries keys derived from the
 //!   inner one, not the app's original wrapper keys; what paints is the
 //!   same, what caches is keyed afresh.
+//! - One traced path draws an app's symbol only when every draw takes
+//!   the same ink and the draws are one, or pens of one width. A glyph
+//!   that sets a fill beside other draws, or draws in several inks,
+//!   still travels by name, and a tool that knows only the framework's
+//!   symbols cannot draw it. Splitting it into several paths would not
+//!   draw it either: the house piles one ink's draws in by MAX, while
+//!   pictures composited over each other darken where they overlap.
+//! - The traced path scales to its box's width from the top-left corner;
+//!   the house centres a glyph on the largest square of its box. The two
+//!   agree on a square, the box `icon(…)` and `Painter::icon` always
+//!   give a symbol; a symbol stretched into another shape (a resizable
+//!   `image(…)`, a hand-placed `Painter::image`) differs.
+//! - An app symbol's key on the wire is its drawing's, not its name's:
+//!   the host sends a key once per connection, so a drawing edited under
+//!   hot reload has to be a new key to reach the tool at all.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -293,8 +311,10 @@ pub fn font_spec(font: &wire::Font, strings: &[String]) -> Result<FontSpec, Miss
 // =============================================================================
 
 /// The wire's name for an image: its innermost source's key with the
-/// fades and flips folded in — and that innermost source.
-pub fn image_ref(source: &ImageSource) -> (ImageRef, &ImageSource) {
+/// fades and flips folded in — and that innermost source as the wire
+/// carries it: a symbol of the app's own as the traced path it draws,
+/// when one path draws it.
+pub fn image_ref(source: &ImageSource) -> (ImageRef, Cow<'_, ImageSource>) {
     let mut alpha: u32 = 255;
     let mut mirrored = false;
     let mut at = source;
@@ -311,10 +331,81 @@ pub fn image_ref(source: &ImageSource) -> (ImageRef, &ImageSource) {
             _ => break,
         }
     }
-    (ImageRef { key: image_key(at), alpha: alpha as u8, mirrored }, at)
+    let inner = carried(at);
+    (ImageRef { key: image_key(&inner), alpha: alpha as u8, mirrored }, inner)
 }
 
-/// The key of a source.
+/// What the wire carries for an innermost source: the source itself, or
+/// — for a symbol of the app's own, which no tool knows by name — the
+/// one traced path it draws, when one path draws it.
+fn carried(source: &ImageSource) -> Cow<'_, ImageSource> {
+    match source {
+        ImageSource::Symbol { symbol, color, forced, .. } if !is_house(symbol) => {
+            traced(symbol.glyph, *color, *forced).map_or(Cow::Borrowed(source), Cow::Owned)
+        }
+        _ => Cow::Borrowed(source),
+    }
+}
+
+/// Whether a symbol is the framework's own of its name — the one a tool
+/// draws from the name alone. A symbol the app names like a house one
+/// and draws otherwise is the app's.
+fn is_house(symbol: &icon::Symbol) -> bool {
+    icon::house::named(symbol.name).is_some_and(|house| {
+        house == *symbol
+            && house.glyph.draws.len() == symbol.glyph.draws.len()
+            && house
+                .glyph
+                .draws
+                .iter()
+                .zip(symbol.glyph.draws)
+                .all(|(ours, theirs)| ours.paint == theirs.paint && ours.path == theirs.path && ours.tint == theirs.tint)
+    })
+}
+
+/// The one traced path that draws `glyph` in `color` byte for byte on
+/// the square an icon is given — `None` when it takes more than one.
+///
+/// The house lays a glyph on the [`icon::ICON_GRID`] square: the draws
+/// of one ink pile their coverage in by MAX and that run blends once; a
+/// draw of another ink paints over it. A traced path is one paint and
+/// one ink on the same square, so it is the glyph when every draw takes
+/// one ink — its own tint, or `color` (every draw's, when `forced`) —
+/// and the draws are one, or pens of one width: a pen's coverage is its
+/// distance to the nearest segment, piled in by MAX, so one pen over
+/// all their contours is their union. Two fills do not merge (one's
+/// winding would cut or fill the other), nor do a fill and a pen.
+///
+/// The pens' verbs join from each draw's first `Move`: a verb before it
+/// draws nothing on its own, but after another draw it would carry on
+/// that draw's contour.
+fn traced(glyph: &icon::Glyph, color: layout::Color, forced: bool) -> Option<ImageSource> {
+    let ink_of = |draw: &icon::Draw| if forced { color } else { draw.tint.unwrap_or(color) };
+    let (paint, ink, verbs) = match glyph.draws {
+        // a glyph with nothing in it draws nothing, not a stand-in
+        [] => (icon::Paint::Fill(icon::Rule::NonZero), color, Vec::new()),
+        [draw] => (draw.paint, ink_of(draw), draw.path.to_vec()),
+        [first, rest @ ..] => {
+            let one_pen = matches!(first.paint, icon::Paint::Stroke { .. })
+                && rest.iter().all(|draw| draw.paint == first.paint && ink_of(draw) == ink_of(first));
+            if !one_pen {
+                return None;
+            }
+            let verbs = glyph
+                .draws
+                .iter()
+                .flat_map(|draw| draw.path.iter().skip_while(|verb| !matches!(verb, icon::Verb::Move(..))))
+                .copied()
+                .collect();
+            (first.paint, ink_of(first), verbs)
+        }
+    };
+    let grid = icon::ICON_GRID as f32;
+    Some(ImageSource::path(verbs, paint, icon::Ink::Solid(ink), (grid, grid)))
+}
+
+/// The key of a source — its own. The key the wire names an image by is
+/// [`image_ref`]'s, which is the traced path's for an app's own symbol.
 pub fn image_key(source: &ImageSource) -> u64 {
     match source {
         ImageSource::Bytes { key, .. }
@@ -332,10 +423,11 @@ pub fn image_key(source: &ImageSource) -> u64 {
 
 /// The resource behind a source, for the wire — `None` for a platform
 /// surface, which has no bytes to send. A wrapped source answers its
-/// innermost one's.
+/// innermost one's, as the wire carries it: an app's own symbol sends
+/// the path it draws when one path draws it, and its name otherwise.
 pub fn resource(source: &ImageSource) -> Option<Resource> {
     let (_, inner) = image_ref(source);
-    let kind = match inner {
+    let kind = match &*inner {
         ImageSource::Bytes { bytes, .. } => ResourceKind::Encoded { bytes: bytes.to_vec() },
         ImageSource::FileIcon { path, .. } => ResourceKind::FileIcon { path: path.to_string() },
         ImageSource::Symbol { symbol, color, forced, .. } => {
@@ -364,7 +456,7 @@ pub fn resource(source: &ImageSource) -> Option<Resource> {
             return None;
         }
     };
-    Some(Resource { key: image_key(inner), kind })
+    Some(Resource { key: image_key(&inner), kind })
 }
 
 fn verb_to_wire(verb: icon::Verb) -> wire::Verb {
@@ -387,8 +479,9 @@ fn verb_from_wire(verb: wire::Verb) -> icon::Verb {
     }
 }
 
-/// The source a resource describes — `None` for a house symbol this
-/// build does not know by name.
+/// The source a resource describes — `None` for a symbol this build does
+/// not know by name: an app's own, which a host sends by name when one
+/// path cannot draw it (and a host from before it sent paths, always).
 pub fn image_source(resource: &Resource) -> Option<ImageSource> {
     let key = resource.key;
     Some(match &resource.kind {
@@ -510,7 +603,7 @@ pub fn lower(display: &DisplayList, strings: &mut Strings) -> (Vec<Draw>, Vec<Im
             DrawCommand::Image { rect, source } => {
                 let (image, inner) = image_ref(source);
                 if seen.insert(image.key, ()).is_none() {
-                    images.push(inner.clone());
+                    images.push(inner.into_owned());
                 }
                 Draw::Image { rect: (*rect).into(), image }
             }
