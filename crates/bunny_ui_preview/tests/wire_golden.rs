@@ -213,8 +213,29 @@ fn stream() -> (Vec<Message>, Vec<u8>) {
             messages.push(Message::ToHost(ToHost::Place { id: String::from("p"), site: SiteKey { file: String::from("f"), line: 1, column: 1 }, op, patch }));
         }
     }
+    messages.push(glyph());
     let bytes = messages.iter().flat_map(encode).collect();
     (messages, bytes)
+}
+
+/// An app's glyph whole: a pen, then a fill with a palette of its own.
+fn glyph() -> Message {
+    Message::ToIde(ToIde::Resource(Resource {
+        key: 7,
+        kind: ResourceKind::Glyph {
+            name: String::from("app.dotted"),
+            color: color(29, 29, 31, 255),
+            forced: false,
+            draws: vec![
+                GlyphDraw { paint: Paint::Stroke { width: 2.0 }, verbs: vec![Verb::Move(5.5, 18.5), Verb::Line(18.5, 5.5)], tint: None },
+                GlyphDraw {
+                    paint: Paint::Fill { even_odd: false },
+                    verbs: vec![Verb::Move(21.0, 5.0), Verb::Cubic(21.0, 6.1, 20.1, 7.0, 19.0, 7.0), Verb::Quad(17.0, 7.0, 17.0, 5.0), Verb::Close],
+                    tint: Some(color(247, 140, 60, 255)),
+                },
+            ],
+        },
+    }))
 }
 
 #[test]
@@ -255,6 +276,20 @@ fn a_truncated_frame_is_malformed_and_a_stranger_kind_is_skipped() {
     reader.feed(&encode(&Message::ToHost(ToHost::Bye)));
     assert_eq!(reader.pull().unwrap(), Some(Received::Unknown { kind: 250, len: 1 }));
     assert_eq!(reader.pull().unwrap(), Some(Received::Message(Message::ToHost(ToHost::Bye))));
+}
+
+#[test]
+fn a_glyph_rides_a_kind_of_its_own_after_the_preexisting_stream() {
+    let (_, bytes) = stream();
+    let before = include_bytes!("fixtures/wire_v1_before_glyph.bin");
+    assert!(bytes.starts_with(before), "no byte the glyph kind found moved");
+    let glyph = encode(&glyph());
+    assert_eq!(&bytes[before.len()..], glyph.as_slice());
+    // kind 17: past every host-to-tool kind a reader knew before it (the
+    // last was 16), below the tool-to-host ones — so that reader answers
+    // `Unknown` and skips it by its length, as it skips any stranger
+    assert_eq!(glyph[4], kind::GLYPH);
+    const { assert!(kind::GLYPH == kind::STATE_OBSERVATION + 1 && kind::GLYPH < kind::SELECT) };
 }
 
 #[test]

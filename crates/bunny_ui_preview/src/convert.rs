@@ -8,7 +8,8 @@
 //! the app wrapped it in folded into an [`ImageRef`]; the bytes behind a
 //! key are a [`Resource`] the host sends once. A symbol of the
 //! framework's own travels by name, which the tool knows; an app's own
-//! travels as the traced path it draws, under that path's key. A site's
+//! travels as what it draws — the one traced path, when one path draws
+//! it, and the whole glyph otherwise — under its drawing's key. A site's
 //! `Location` becomes a file, a line and a column; a site the framework
 //! named itself keeps its name. A theme travels as its tokens by name.
 //!
@@ -22,12 +23,20 @@
 //!   inner one, not the app's original wrapper keys; what paints is the
 //!   same, what caches is keyed afresh.
 //! - One traced path draws an app's symbol only when every draw takes
-//!   the same ink and the draws are one, or pens of one width. A glyph
-//!   that sets a fill beside other draws, or draws in several inks,
-//!   still travels by name, and a tool that knows only the framework's
-//!   symbols cannot draw it. Splitting it into several paths would not
-//!   draw it either: the house piles one ink's draws in by MAX, while
-//!   pictures composited over each other darken where they overlap.
+//!   the same ink and the draws are one, or pens of one width; it then
+//!   rides `RESOURCE`, which every tool reads. A glyph that sets a fill
+//!   beside other draws, or draws in several inks, travels whole on the
+//!   `GLYPH` kind, and the tool paints it with the framework's own glyph
+//!   rasterizer. Splitting it into paths would not draw it: the house
+//!   piles one ink's draws in by MAX, while pictures composited over each
+//!   other darken where they overlap. A tool that predates `GLYPH` skips
+//!   it, so the host sends the symbol by name first — the most such a
+//!   tool can show is a stand-in it names.
+//! - A tool keeps every glyph it is sent, once per key, for as long as it
+//!   runs: the house rasterizes a glyph from `&'static` tables, so a
+//!   received drawing is leaked into them, as `Symbol::from_svg` leaks a
+//!   drawing it reads. An icon set is small; an edit under hot reload adds
+//!   one drawing more.
 //! - The traced path scales to its box's width from the top-left corner;
 //!   the house centres a glyph on the largest square of its box. The two
 //!   agree on a square, the box `icon(…)` and `Painter::icon` always
@@ -38,7 +47,9 @@
 //!   hot reload has to be a new key to reach the tool at all.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::Hasher;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -312,8 +323,8 @@ pub fn font_spec(font: &wire::Font, strings: &[String]) -> Result<FontSpec, Miss
 
 /// The wire's name for an image: its innermost source's key with the
 /// fades and flips folded in — and that innermost source as the wire
-/// carries it: a symbol of the app's own as the traced path it draws,
-/// when one path draws it.
+/// carries it: a symbol of the app's own as the traced path it draws when
+/// one path draws it, and under its drawing's key when it travels whole.
 pub fn image_ref(source: &ImageSource) -> (ImageRef, Cow<'_, ImageSource>) {
     let mut alpha: u32 = 255;
     let mut mirrored = false;
@@ -336,15 +347,87 @@ pub fn image_ref(source: &ImageSource) -> (ImageRef, Cow<'_, ImageSource>) {
 }
 
 /// What the wire carries for an innermost source: the source itself, or
-/// — for a symbol of the app's own, which no tool knows by name — the
-/// one traced path it draws, when one path draws it.
+/// — for a symbol of the app's own, which no tool knows by name — the one
+/// traced path it draws when one path draws it, and the symbol itself,
+/// under its drawing's key, when it travels whole.
 fn carried(source: &ImageSource) -> Cow<'_, ImageSource> {
     match source {
         ImageSource::Symbol { symbol, color, forced, .. } if !is_house(symbol) => {
-            traced(symbol.glyph, *color, *forced).map_or(Cow::Borrowed(source), Cow::Owned)
+            Cow::Owned(traced(symbol.glyph, *color, *forced).unwrap_or_else(|| ImageSource::Symbol {
+                key: drawing_key(symbol, *color, *forced),
+                symbol: *symbol,
+                color: *color,
+                forced: *forced,
+            }))
         }
         _ => Cow::Borrowed(source),
     }
+}
+
+/// The domain tag folded into a whole glyph's key: "bny_glyp".
+const GLYPH_TAG: u64 = 0x626e_795f_676c_7970;
+
+/// FNV-1a, the hash a symbol's name is folded with — small, and the same
+/// on every build.
+struct Fnv(u64);
+
+impl Hasher for Fnv {
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// The key an app's glyph travels whole under: its name, its draws, its
+/// ink and its reading, folded together — the drawing's identity, so an
+/// edit under hot reload is a new key. The house's own key folds only the
+/// name, and a tool keeps a glyph per key.
+fn drawing_key(symbol: &icon::Symbol, color: layout::Color, forced: bool) -> u64 {
+    let mut fold = Fnv(0xcbf2_9ce4_8422_2325);
+    let colour = |fold: &mut Fnv, color: layout::Color| fold.write(&[color.r, color.g, color.b, color.a]);
+    fold.write_u64(GLYPH_TAG);
+    fold.write_usize(symbol.name.len());
+    fold.write(symbol.name.as_bytes());
+    colour(&mut fold, color);
+    fold.write_u8(u8::from(forced));
+    fold.write_usize(symbol.glyph.draws.len());
+    for draw in symbol.glyph.draws {
+        match draw.paint {
+            icon::Paint::Fill(icon::Rule::NonZero) => fold.write_u8(0),
+            icon::Paint::Fill(icon::Rule::EvenOdd) => fold.write_u8(1),
+            icon::Paint::Stroke { width } => {
+                fold.write_u8(2);
+                fold.write_u32(width.to_bits());
+            }
+        }
+        match draw.tint {
+            None => fold.write_u8(0),
+            Some(tint) => {
+                fold.write_u8(1);
+                colour(&mut fold, tint);
+            }
+        }
+        fold.write_usize(draw.path.len());
+        for verb in draw.path {
+            let (tag, numbers): (u8, &[f32]) = match verb {
+                icon::Verb::Move(x, y) => (0, &[*x, *y]),
+                icon::Verb::Line(x, y) => (1, &[*x, *y]),
+                icon::Verb::Quad(a, b, x, y) => (2, &[*a, *b, *x, *y]),
+                icon::Verb::Cubic(a, b, c, d, x, y) => (3, &[*a, *b, *c, *d, *x, *y]),
+                icon::Verb::Close => (4, &[]),
+            };
+            fold.write_u8(tag);
+            for number in numbers {
+                fold.write_u32(number.to_bits());
+            }
+        }
+    }
+    fold.finish()
 }
 
 /// Whether a symbol is the framework's own of its name — the one a tool
@@ -405,7 +488,7 @@ fn traced(glyph: &icon::Glyph, color: layout::Color, forced: bool) -> Option<Ima
 }
 
 /// The key of a source — its own. The key the wire names an image by is
-/// [`image_ref`]'s, which is the traced path's for an app's own symbol.
+/// [`image_ref`]'s, which is the drawing's for an app's own symbol.
 pub fn image_key(source: &ImageSource) -> u64 {
     match source {
         ImageSource::Bytes { key, .. }
@@ -424,22 +507,35 @@ pub fn image_key(source: &ImageSource) -> u64 {
 /// The resource behind a source, for the wire — `None` for a platform
 /// surface, which has no bytes to send. A wrapped source answers its
 /// innermost one's, as the wire carries it: an app's own symbol sends
-/// the path it draws when one path draws it, and its name otherwise.
+/// the path it draws when one path draws it, and the whole glyph
+/// otherwise ([`Resource::by_name`] is what goes just before that).
 pub fn resource(source: &ImageSource) -> Option<Resource> {
     let (_, inner) = image_ref(source);
     let kind = match &*inner {
         ImageSource::Bytes { bytes, .. } => ResourceKind::Encoded { bytes: bytes.to_vec() },
         ImageSource::FileIcon { path, .. } => ResourceKind::FileIcon { path: path.to_string() },
-        ImageSource::Symbol { symbol, color, forced, .. } => {
+        ImageSource::Symbol { symbol, color, forced, .. } if is_house(symbol) => {
             ResourceKind::Symbol { name: symbol.name.to_string(), color: (*color).into(), forced: *forced }
         }
+        // an app's own that no single path draws: the glyph, whole
+        ImageSource::Symbol { symbol, color, forced, .. } => ResourceKind::Glyph {
+            name: symbol.name.to_string(),
+            color: (*color).into(),
+            forced: *forced,
+            draws: symbol
+                .glyph
+                .draws
+                .iter()
+                .map(|draw| wire::GlyphDraw {
+                    paint: paint_to_wire(draw.paint),
+                    verbs: draw.path.iter().map(|verb| verb_to_wire(*verb)).collect(),
+                    tint: draw.tint.map(Into::into),
+                })
+                .collect(),
+        },
         ImageSource::Path { verbs, paint, ink, box_size, .. } => ResourceKind::Vector {
             verbs: verbs.iter().map(|verb| verb_to_wire(*verb)).collect(),
-            paint: match *paint {
-                icon::Paint::Fill(icon::Rule::NonZero) => wire::Paint::Fill { even_odd: false },
-                icon::Paint::Fill(icon::Rule::EvenOdd) => wire::Paint::Fill { even_odd: true },
-                icon::Paint::Stroke { width } => wire::Paint::Stroke { width },
-            },
+            paint: paint_to_wire(*paint),
             ink: match *ink {
                 icon::Ink::Solid(color) => wire::Ink::Solid(color.into()),
                 icon::Ink::Ramp(gradient) => wire::Ink::Ramp(gradient.into()),
@@ -457,6 +553,22 @@ pub fn resource(source: &ImageSource) -> Option<Resource> {
         }
     };
     Some(Resource { key: image_key(&inner), kind })
+}
+
+fn paint_to_wire(paint: icon::Paint) -> wire::Paint {
+    match paint {
+        icon::Paint::Fill(icon::Rule::NonZero) => wire::Paint::Fill { even_odd: false },
+        icon::Paint::Fill(icon::Rule::EvenOdd) => wire::Paint::Fill { even_odd: true },
+        icon::Paint::Stroke { width } => wire::Paint::Stroke { width },
+    }
+}
+
+fn paint_from_wire(paint: wire::Paint) -> icon::Paint {
+    match paint {
+        wire::Paint::Fill { even_odd: false } => icon::Paint::Fill(icon::Rule::NonZero),
+        wire::Paint::Fill { even_odd: true } => icon::Paint::Fill(icon::Rule::EvenOdd),
+        wire::Paint::Stroke { width } => icon::Paint::Stroke { width },
+    }
 }
 
 fn verb_to_wire(verb: icon::Verb) -> wire::Verb {
@@ -480,8 +592,8 @@ fn verb_from_wire(verb: wire::Verb) -> icon::Verb {
 }
 
 /// The source a resource describes — `None` for a symbol this build does
-/// not know by name: an app's own, which a host sends by name when one
-/// path cannot draw it (and a host from before it sent paths, always).
+/// not know by name: an app's own, which a host sends by name just before
+/// sending it whole (and a host from before it sent drawings, always).
 pub fn image_source(resource: &Resource) -> Option<ImageSource> {
     let key = resource.key;
     Some(match &resource.kind {
@@ -490,11 +602,7 @@ pub fn image_source(resource: &Resource) -> Option<ImageSource> {
         ResourceKind::Vector { verbs, paint, ink, box_size } => ImageSource::Path {
             key,
             verbs: verbs.iter().map(|verb| verb_from_wire(*verb)).collect(),
-            paint: match *paint {
-                wire::Paint::Fill { even_odd: false } => icon::Paint::Fill(icon::Rule::NonZero),
-                wire::Paint::Fill { even_odd: true } => icon::Paint::Fill(icon::Rule::EvenOdd),
-                wire::Paint::Stroke { width } => icon::Paint::Stroke { width },
-            },
+            paint: paint_from_wire(*paint),
             ink: match *ink {
                 wire::Ink::Solid(color) => icon::Ink::Solid(color.into()),
                 wire::Ink::Ramp(gradient) => icon::Ink::Ramp(gradient.into()),
@@ -507,6 +615,12 @@ pub fn image_source(resource: &Resource) -> Option<ImageSource> {
             color: (*color).into(),
             forced: *forced,
         },
+        ResourceKind::Glyph { name, color, forced, draws } => ImageSource::Symbol {
+            key,
+            symbol: kept(key, name, draws),
+            color: (*color).into(),
+            forced: *forced,
+        },
         ResourceKind::FileIcon { path } => ImageSource::FileIcon { key, path: Rc::from(path.as_str()) },
         ResourceKind::Feed { generation, size, rgba } => ImageSource::Feed {
             key,
@@ -516,6 +630,34 @@ pub fn image_source(resource: &Resource) -> Option<ImageSource> {
             bytes: Rc::from(rgba.as_slice()),
         },
     })
+}
+
+thread_local! {
+    /// The glyphs this tool was sent, by key, as the house holds them.
+    static KEPT: RefCell<HashMap<u64, icon::Symbol>> = RefCell::new(HashMap::new());
+}
+
+/// The symbol a glyph sent under `key` draws as: the one kept the first
+/// time the key was raised — a tool raises its resources for every
+/// picture it paints, and must not leak a drawing per frame. The key is
+/// the drawing's identity on the wire, so it never stands for another.
+fn kept(key: u64, name: &str, draws: &[wire::GlyphDraw]) -> icon::Symbol {
+    KEPT.with(|kept| *kept.borrow_mut().entry(key).or_insert_with(|| leaked(name, draws)))
+}
+
+/// A glyph in the `&'static` tables the house rasterizes, leaked — the
+/// way `Symbol::from_svg` holds a drawing it reads at runtime.
+fn leaked(name: &str, draws: &[wire::GlyphDraw]) -> icon::Symbol {
+    let draws: Vec<icon::Draw> = draws
+        .iter()
+        .map(|draw| icon::Draw {
+            paint: paint_from_wire(draw.paint),
+            path: Vec::leak(draw.verbs.iter().map(|verb| verb_from_wire(*verb)).collect()),
+            tint: draw.tint.map(Into::into),
+        })
+        .collect();
+    let glyph: &'static icon::Glyph = Box::leak(Box::new(icon::Glyph { draws: Vec::leak(draws) }));
+    icon::Symbol::new(String::leak(name.to_owned()), glyph)
 }
 
 /// `inner` wrapped the way `image` says: mirrored, then faded, with

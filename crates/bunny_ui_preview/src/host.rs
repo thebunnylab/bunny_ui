@@ -968,6 +968,12 @@ impl Host {
             }
             if let Some(resource) = convert::resource(&image) {
                 self.sent_resources.insert(key);
+                // a tool that predates a kind skips it: what it reads in its
+                // place goes first, under the same key, and a newer tool
+                // keeps what came last
+                if let Some(named) = resource.by_name() {
+                    (self.sink)(ToIde::Resource(named));
+                }
                 (self.sink)(ToIde::Resource(resource));
             }
         }

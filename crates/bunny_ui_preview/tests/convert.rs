@@ -181,7 +181,8 @@ fn ellipse_geometry_and_ink_round_trip_through_existing_vector_resources() {
 }
 
 // An app's own symbols: the tool knows only the house's by name, so the
-// host sends the path an app symbol draws whenever one path draws it.
+// host sends what an app symbol draws — the one path, when one path draws
+// it, and the whole glyph when it takes more.
 
 const PEN: Paint = Paint::Stroke { width: 2.0 };
 const INK: Color = Color { r: 0x1d, g: 0x1d, b: 0x1f, a: 255 };
@@ -306,6 +307,77 @@ const DOTTED: Symbol = Symbol::new(
     },
 );
 
+/// The same line with its dot moved — an edit under hot reload.
+const DOTTED_EDITED: Symbol = Symbol::new(
+    "app.dotted",
+    &Glyph {
+        draws: &[
+            Draw { paint: PEN, path: &[Move(5.5, 18.5), Line(18.5, 5.5)], tint: None },
+            Draw {
+                paint: Paint::Fill(Rule::NonZero),
+                path: &[
+                    Move(20.0, 6.0),
+                    Cubic(20.0, 7.1, 19.1, 8.0, 18.0, 8.0),
+                    Cubic(16.9, 8.0, 16.0, 7.1, 16.0, 6.0),
+                    Cubic(16.0, 4.9, 16.9, 4.0, 18.0, 4.0),
+                    Cubic(19.1, 4.0, 20.0, 4.9, 20.0, 6.0),
+                    Close,
+                ],
+                tint: None,
+            },
+        ],
+    },
+);
+
+/// Two discs that overlap, two fills in one ink: the house takes their
+/// MAX, one path would wind them into one shape.
+const TWO_FILLS: Symbol = Symbol::new(
+    "app.two-fills",
+    &Glyph {
+        draws: &[
+            Draw {
+                paint: Paint::Fill(Rule::NonZero),
+                path: &[
+                    Move(15.0, 12.0),
+                    Cubic(15.0, 15.9, 11.9, 19.0, 8.0, 19.0),
+                    Cubic(4.1, 19.0, 1.0, 15.9, 1.0, 12.0),
+                    Cubic(1.0, 8.1, 4.1, 5.0, 8.0, 5.0),
+                    Cubic(11.9, 5.0, 15.0, 8.1, 15.0, 12.0),
+                    Close,
+                ],
+                tint: None,
+            },
+            Draw {
+                paint: Paint::Fill(Rule::NonZero),
+                path: &[
+                    Move(23.0, 12.0),
+                    Cubic(23.0, 15.9, 19.9, 19.0, 16.0, 19.0),
+                    Cubic(12.1, 19.0, 9.0, 15.9, 9.0, 12.0),
+                    Cubic(9.0, 8.1, 12.1, 5.0, 16.0, 5.0),
+                    Cubic(19.9, 5.0, 23.0, 8.1, 23.0, 12.0),
+                    Close,
+                ],
+                tint: None,
+            },
+        ],
+    },
+);
+
+/// A tag in its own colour with an outline in the ink — a file-type mark.
+const TAGGED: Symbol = Symbol::new(
+    "app.tagged",
+    &Glyph {
+        draws: &[
+            Draw {
+                paint: Paint::Fill(Rule::NonZero),
+                path: &[Move(4.0, 4.0), Line(14.0, 4.0), Line(20.0, 12.0), Line(14.0, 20.0), Line(4.0, 20.0), Close],
+                tint: Some(ORANGE),
+            },
+            Draw { paint: PEN, path: &[Move(4.0, 4.0), Line(14.0, 4.0), Line(20.0, 12.0), Line(14.0, 20.0), Line(4.0, 20.0), Close], tint: None },
+        ],
+    },
+);
+
 /// An app's own `check`, drawn otherwise than the house's.
 const OWN_CHECK: Symbol = Symbol::new(
     "check",
@@ -412,16 +484,99 @@ fn a_house_symbol_still_travels_by_name() {
 }
 
 #[test]
-fn a_glyph_one_path_cannot_draw_still_travels_by_name() {
-    // a pen and a fill in one ink overlap by MAX in the house; two
-    // pictures composited over each other would darken the joint
-    let sent = resource(&ImageSource::symbol(DOTTED, INK)).unwrap();
-    assert_eq!(sent.kind, wire::ResourceKind::Symbol { name: String::from("app.dotted"), color: INK.into(), forced: false });
-    // which no tool knows by name: it draws a stand-in there, and names it
-    assert!(image_source(&sent).is_none());
-    // and a drawing in two inks paints one over the other
-    let sent = resource(&ImageSource::symbol(TWO_TONE, INK)).unwrap();
-    assert!(matches!(sent.kind, wire::ResourceKind::Symbol { ref name, .. } if name == "app.two-tone"), "{:?}", sent.kind);
+fn a_glyph_one_path_cannot_draw_travels_whole_and_paints_as_the_app_does() {
+    // a pen and a fill in one ink pile in by MAX in the house, and so do
+    // two fills; a drawing in two inks paints one run over the other — no
+    // single path draws these, so the glyph travels as it is
+    let readings = [
+        (DOTTED, INK, false),
+        (DOTTED, ACCENT, true),
+        (DOTTED, Color { a: 153, ..INK }, false),
+        (TWO_TONE, INK, false),
+        (TWO_FILLS, INK, false),
+        (TAGGED, INK, false),
+    ];
+    for (symbol, color, forced) in readings {
+        let source = if forced { ImageSource::symbol_forced(symbol, color) } else { ImageSource::symbol(symbol, color) };
+        let (sent, back) = received(&source);
+        assert!(matches!(&sent.kind, wire::ResourceKind::Glyph { name, .. } if name == symbol.name), "{source:?} went as {:?}", sent.kind);
+        assert!(matches!(back, ImageSource::Symbol { .. }), "{back:?}");
+        for side in [12, 16, 20, 24, 32, 48, 64] {
+            assert!(pixels(&back, side) == pixels(&source, side), "{source:?} differs at {side}");
+        }
+        // on a message kind of its own, which a tool that predates it skips
+        let bytes = wire::encode(&wire::Message::ToIde(wire::ToIde::Resource(sent.clone())));
+        assert_eq!(bytes[4], wire::kind::GLYPH);
+        let mut reader = wire::Reader::new();
+        reader.feed(&bytes);
+        assert!(matches!(
+            reader.pull().unwrap(),
+            Some(wire::Received::Message(wire::Message::ToIde(wire::ToIde::Resource(decoded)))) if decoded == sent
+        ));
+        // and the name such a tool reads in its place, under the same key
+        let named = wire::ResourceKind::Symbol { name: symbol.name.to_string(), color: color.into(), forced };
+        assert_eq!(sent.by_name(), Some(wire::Resource { key: sent.key, kind: named }));
+    }
+}
+
+#[test]
+fn a_frame_of_whole_glyphs_paints_as_the_app_paints_it() {
+    let square = |x: f64, side: f64| Rect { origin: Point { x, y: 4.0 }, size: Size { width: side, height: side } };
+    let display = DisplayList::from(vec![
+        DrawCommand::Image { rect: square(4.0, 24.0), source: ImageSource::symbol(DOTTED, INK) },
+        DrawCommand::Image { rect: square(32.0, 16.0), source: ImageSource::symbol(DOTTED, INK).faded(0.4) },
+        DrawCommand::Image { rect: square(52.0, 32.0), source: ImageSource::symbol(TWO_TONE, INK).mirrored() },
+        DrawCommand::Image {
+            rect: square(88.0, 20.0),
+            source: ImageSource::symbol_forced(TWO_FILLS, ACCENT).mirrored().faded(0.6),
+        },
+        DrawCommand::Image { rect: square(112.0, 24.0), source: ImageSource::symbol(TAGGED, INK) },
+    ]);
+    let mut strings = Strings::new();
+    let (commands, sources) = lower(&display, &mut strings);
+    let images: HashMap<u64, ImageSource> = sources
+        .iter()
+        .map(|source| {
+            let (sent, back) = received(source);
+            (sent.key, back)
+        })
+        .collect();
+    assert!(images.values().all(|source| matches!(source, ImageSource::Symbol { .. })), "{images:?}");
+    let raised = raise(&commands, &strings.into_table(), &images).unwrap();
+    for scale in [1, 2] {
+        let paint = |list: &DisplayList| rasterize_scaled(list, 140 * scale, 40 * scale, scale, Color::WHITE).to_rgba_bytes();
+        let app = paint(&display);
+        assert!(app.chunks(4).any(|pixel| pixel != [255, 255, 255, 255]), "the app's frame has ink at {scale}x");
+        assert!(paint(&raised) == app, "the frame differs at {scale}x");
+    }
+}
+
+#[test]
+fn a_glyph_raised_again_is_the_drawing_already_kept() {
+    // a tool raises its resources for every picture it paints: the
+    // drawing behind one key is kept once, never once per frame
+    let (sent, first) = received(&ImageSource::symbol(DOTTED, INK));
+    let again = image_source(&sent).unwrap();
+    let (ImageSource::Symbol { symbol: first, .. }, ImageSource::Symbol { symbol: again, .. }) = (first, again) else {
+        panic!("a glyph raises to a symbol");
+    };
+    assert!(std::ptr::eq(first.glyph, again.glyph));
+    assert_eq!(first.name, "app.dotted");
+}
+
+#[test]
+fn a_whole_glyph_travels_under_its_drawings_identity() {
+    let key = |source: &ImageSource| image_ref(source).0.key;
+    let dotted = ImageSource::symbol(DOTTED, INK);
+    assert_eq!(key(&dotted), key(&ImageSource::symbol(DOTTED, INK)), "one drawing in one ink, one key");
+    assert_eq!(key(&dotted), resource(&dotted).unwrap().key, "the frame names what the resource carries");
+    assert_ne!(key(&dotted), dotted.key(), "the drawing's identity, not the name's");
+    // the host sends a key once and the tool keeps a drawing per key: an
+    // edit under the same name has to be a new one
+    let edited = ImageSource::symbol(DOTTED_EDITED, INK);
+    assert_ne!(key(&dotted), key(&edited), "an edited drawing under the same name");
+    assert_ne!(key(&dotted), key(&ImageSource::symbol(DOTTED, ACCENT)), "a re-tint");
+    assert!(pixels(&received(&edited).1, 24) == pixels(&edited, 24), "the edit is what the tool draws");
 }
 
 #[test]
