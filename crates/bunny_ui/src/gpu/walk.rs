@@ -16,7 +16,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::image_engine::{ImageEngine, ImageRaster, ImageSource, PixelFormat, raster_source};
 use crate::layout::{Color, Corners, DisplayList, DrawCommand, Rect};
-use crate::raster::physical_extent;
+use crate::raster::{baseline_row, physical_extent};
 use crate::text_engine::{FontKey, FontSpec, TextEngine};
 
 /// The run atlas: text tiles append into one shared texture. Runs wider
@@ -377,6 +377,10 @@ pub struct RunEntry {
     pub tiles: Vec<Tile>,
     pub width: u32,
     pub height: u32,
+    /// The row its glyphs stand on, and the ascent the layout measured —
+    /// what places it ([`crate::text_engine::TextRaster`]).
+    pub baseline: u32,
+    pub ascent: f64,
     /// The last walk that read it — what the collector asks before it
     /// gives a shelf back.
     pub walk: u64,
@@ -697,6 +701,8 @@ impl RunAtlas {
                 tiles,
                 width,
                 height,
+                baseline: raster.baseline as u32,
+                ascent: raster.ascent,
                 walk: self.walk,
             });
         }
@@ -1324,28 +1330,34 @@ pub fn build_frame(
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
                 let slice = &content[range.0..range.1];
                 // the composite_text mirror: one snap of the logical
-                // origin, texels copied 1:1 from there
+                // origin across, one of the baseline down, texels copied 1:1
+                // from there
                 let base_x = (origin.x * factor).round() as i64;
-                let base_y = (origin.y * factor).round() as i64;
+                let corner_y = (origin.y * factor).round() as i64;
                 // A line that cannot meet the clip is dropped BEFORE it is
                 // resolved: resolving shapes it, rasters it and packs it
                 // into the atlas, and a scroll region holds far more lines
-                // outside its clip than inside. The raster grows right and
-                // down from the origin, so the far sides are exact. The
-                // near sides need the raster's size, which only resolving
-                // knows — so they use a bound no real line reaches, and a
-                // line inside the bound is resolved and tested as before.
-                if base_x >= clip.2 || base_y >= clip.3 {
+                // outside its clip than inside. The raster grows right from
+                // the origin, so that far side is exact. Down, it snaps by
+                // its baseline, which can stand its first row one above the
+                // snapped corner but never more — so the bottom keeps that
+                // row of margin. The near sides need the raster's size,
+                // which only resolving knows — so they use a bound no real
+                // line reaches, and a line inside the bound is resolved and
+                // tested as before.
+                if base_x >= clip.2 || corner_y > clip.3 {
                     continue;
                 }
                 let (reach_x, reach_y) = line_reach(slice, font, factor);
-                if base_x + reach_x <= clip.0 || base_y + reach_y <= clip.1 {
+                if base_x + reach_x <= clip.0 || corner_y + reach_y <= clip.1 {
                     continue;
                 }
                 let Some(entry) = atlas.resolve(ground, slice, font, *color, scale, engine)?
                 else {
                     continue;
                 };
+                let base_y =
+                    baseline_row(origin.y, entry.ascent, scale) - i64::from(entry.baseline);
                 let dest =
                     (base_x, base_y, base_x + entry.width as i64, base_y + entry.height as i64);
                 if box_intersect(dest, clip).is_none() {
@@ -1975,14 +1987,16 @@ mod tests {
         };
 
         // 200 rows at 20 pt; the clip (y 1100..1160) shows rows 55, 56, 57.
-        // The far side is exact: no row from 58 on is resolved. The near
+        // The far side is exact to the row a baseline snap can lift a
+        // raster by: row 58, whose corner meets the clip's bottom edge, is
+        // resolved and then tested exactly; no row from 59 on is. The near
         // side is a bound of 208 pt at this size: rows 45..55 are resolved
         // and then tested exactly, rows 0..45 are never resolved.
         let (uploads, picture) = walk(&column(0..200));
-        let (near_uploads, near_picture) = walk(&column(45..58));
+        let (near_uploads, near_picture) = walk(&column(45..59));
         assert_eq!(picture, near_picture, "what is drawn is the same bytes");
         assert_eq!(uploads, near_uploads, "and nothing farther reached the atlas");
-        assert!(uploads <= 13, "{uploads} uploads: only the rows near the clip were resolved");
+        assert!(uploads <= 14, "{uploads} uploads: only the rows near the clip were resolved");
     }
 
     #[test]

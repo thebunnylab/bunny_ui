@@ -4,7 +4,7 @@
 
 use super::*;
 use bunny_ui::layout::{DrawCommand, Point, Rect};
-use bunny_ui::raster::{Bitmap, carve_covering, rasterize_with};
+use bunny_ui::raster::{Bitmap, baseline_row, carve_covering, rasterize_with};
 
 const MAX_PIXELS: usize = 128 * 1024;
 const MAX_COMMANDS: usize = 64;
@@ -189,7 +189,7 @@ impl Scene {
                 | DrawCommand::Image { .. } => return None,
             }
         }
-        let display = patch_coordinates(&lifted, rect, factor)?;
+        let display = patch_coordinates(&lifted, rect, scale, text, cache)?;
         Some(Self {
             display,
             size: (width, height),
@@ -324,7 +324,7 @@ impl Scene {
             };
             let lifted = carve_covering(&candidates, (0, candidates.len()), logical)
                 .map_or_else(DisplayList::default, |(_, display)| display);
-            let Some(display) = patch_coordinates(&lifted, rect, factor) else {
+            let Some(display) = patch_coordinates(&lifted, rect, self.scale, text, cache) else {
                 return false;
             };
             let bitmap = rasterize_with(
@@ -437,12 +437,18 @@ fn measured_candidates(
 
 // The whole raster snaps in window coordinates. Rounding a translated
 // half-pixel instead can cross zero and move the result one pixel: round
-// ties away from zero do not commute with an integer translation.
+// ties away from zero do not commute with an integer translation. A line of
+// text snaps by its baseline, not its corner (`baseline_row`), so its row is
+// found here, in window coordinates, and the local origin stands its ascent
+// above that row: the patch's own snap of the baseline lands on it exactly.
 pub(super) fn patch_coordinates(
     display: &DisplayList,
     patch: DamageRect,
-    factor: f64,
+    scale: usize,
+    text: &dyn TextEngine,
+    cache: &MeasureCache,
 ) -> Option<DisplayList> {
+    let factor = scale as f64;
     let point = |origin: Point| Point {
         x: ((origin.x * factor).round() - patch.0 as f64) / factor,
         y: ((origin.y * factor).round() - patch.1 as f64) / factor,
@@ -469,9 +475,20 @@ pub(super) fn patch_coordinates(
                 | DrawCommand::StrokeRect { rect: bounds, .. }
                 | DrawCommand::PushClip { rect: bounds, .. } => *bounds = rect(*bounds),
                 DrawCommand::TextLine {
-                    origin, content, range, ..
+                    origin,
+                    content,
+                    range,
+                    font,
+                    ..
                 } => {
-                    *origin = point(*origin);
+                    let ascent = cache
+                        .get_or_measure(content.get(range.0..range.1)?, font, text)
+                        .ascent;
+                    let row = baseline_row(origin.y, ascent, scale) - patch.1;
+                    *origin = Point {
+                        x: point(*origin).x,
+                        y: row as f64 / factor - ascent,
+                    };
                     // Native scenes can outlive their source frame, including
                     // hidden patches. Retain only the visible text of a large
                     // document, before any scene or raster witness owns it.

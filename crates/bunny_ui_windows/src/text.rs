@@ -1117,7 +1117,11 @@ impl TextEngine for DirectWriteEngine {
         };
         let metrics = self.measure_line(text, font);
         let width = (metrics.width * scale as f64).ceil() as usize;
-        let height = (metrics.height() * scale as f64).ceil() as usize;
+        // the glyphs stand on a WHOLE row, so Direct2D's own vertical snap
+        // has no fraction to move; the compositor snaps the line's
+        // baseline instead, once, where it knows the origin
+        let baseline = (metrics.ascent * scale as f64).ceil() as usize;
+        let height = baseline + (metrics.descent * scale as f64).ceil() as usize;
         if width == 0 || height == 0 {
             return None;
         }
@@ -1188,12 +1192,12 @@ impl TextEngine for DirectWriteEngine {
                     return None;
                 }
                 let brush = Com::from_raw(brush)?;
-                // the ceil slack stays on TOP: the line box sits against
-                // the bitmap's bottom, baseline `descent` above it
-                let slack = height as f32 / scale as f32 - (slot.ascent + slot.descent) as f32;
+                // the layout's baseline sits `ascent` below where it is
+                // drawn: drawn that much above row `baseline`, it stands on it
+                let top = baseline as f32 / scale as f32 - slot.ascent as f32;
                 ((*(*target_ptr).vtbl).draw_text_layout)(
                     target_ptr,
-                    D2dPoint { x: 0.0, y: slack.max(0.0) },
+                    D2dPoint { x: 0.0, y: top },
                     layout.as_ptr(),
                     brush.as_ptr(),
                     D2D1_DRAW_TEXT_COLOR_FONT,
@@ -1235,7 +1239,8 @@ impl TextEngine for DirectWriteEngine {
         Some(TextRaster {
             width,
             height,
-            baseline: (metrics.ascent * scale as f64).round() as usize,
+            baseline,
+            ascent: metrics.ascent,
             rgba,
         })
     }

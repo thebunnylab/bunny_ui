@@ -669,6 +669,12 @@ impl TextEngine for FreeTypeEngine {
         if width == 0 || height == 0 {
             return None;
         }
+        // the compositor places the line by the LAYOUT's ascent, which is
+        // measured on the face at scale 1: FreeType rounds a sized face's
+        // metrics to whole pixels, so this face's ascent over `scale` is
+        // not that number
+        let layout_ascent =
+            self.face(&Self::key(font, 1)).map_or(0.0, |face| self.line_box(face).0);
         let mut rgba = vec![0u8; width * height * 4];
         for entry in &shaped {
             unsafe {
@@ -743,7 +749,7 @@ impl TextEngine for FreeTypeEngine {
                 }
             }
         }
-        Some(TextRaster { width, height, baseline, rgba })
+        Some(TextRaster { width, height, baseline, ascent: layout_ascent, rgba })
     }
 }
 

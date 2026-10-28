@@ -789,15 +789,18 @@ impl Bitmap {
         }
     }
 
-    /// Composites a line rasterized by the engine at the logical origin,
-    /// snapped ONCE (the raster already comes in physical pixels).
+    /// Composites a line rasterized by the engine: across, by the logical
+    /// origin snapped ONCE; down, by its baseline snapped once
+    /// ([`baseline_row`]) — the raster already comes in physical pixels.
     fn composite_text(&mut self, origin_x: f64, origin_y: f64, scale: usize, raster: &TextRaster) {
-        self.composite_rgba(origin_x, origin_y, scale, raster.width, raster.height, &raster.rgba);
+        let base_x = (origin_x * scale as f64).round() as i64;
+        let base_y = baseline_row(origin_y, raster.ascent, scale) - raster.baseline as i64;
+        self.blit_rgba(base_x, base_y, raster.width, raster.height, &raster.rgba);
     }
 
-    /// Source-over blit of ANY straight-alpha RGBA rectangle (text
-    /// rasters, images) at the logical origin, snapped ONCE — the
-    /// pixels already come in physical size.
+    /// Source-over blit of ANY straight-alpha RGBA rectangle (images, and
+    /// text through [`Self::composite_text`]) at the logical origin,
+    /// snapped ONCE — the pixels already come in physical size.
     fn composite_rgba(
         &mut self,
         origin_x: f64,
@@ -809,6 +812,11 @@ impl Bitmap {
     ) {
         let base_x = (origin_x * scale as f64).round() as i64;
         let base_y = (origin_y * scale as f64).round() as i64;
+        self.blit_rgba(base_x, base_y, width, height, rgba);
+    }
+
+    /// The source-over blit itself, at a PHYSICAL top-left already snapped.
+    fn blit_rgba(&mut self, base_x: i64, base_y: i64, width: usize, height: usize, rgba: &[u8]) {
         // clamp the loop to the clip: a long line under a small damage
         // rect must cost the visible slice, not the line
         let (cx0, cy0, cx1, cy1) = self.clip_box();
@@ -838,6 +846,16 @@ impl Bitmap {
 /// the engine rasters once and the bytes agree everywhere.
 pub fn physical_extent(length: f64, scale: usize) -> usize {
     (length * scale as f64).round().max(0.0) as usize
+}
+
+/// The physical row a line of text stands on: the baseline the layout
+/// meant — the line box's top plus the engine's unrounded ascent — rounded
+/// ONCE, to the nearest row, the way a browser snaps a horizontal line's
+/// baseline. The SAME rounding on every pipeline (CPU compositor, GPU atlas,
+/// a patch rebased into its own coordinates), so a line lands on one row
+/// whoever paints it; row [`TextRaster::baseline`] goes there.
+pub fn baseline_row(origin_y: f64, ascent: f64, scale: usize) -> i64 {
+    ((origin_y + ascent) * scale as f64).round() as i64
 }
 
 fn scale_rect(rect: Rect, scale: f64) -> Rect {

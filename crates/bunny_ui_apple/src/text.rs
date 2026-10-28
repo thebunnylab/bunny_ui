@@ -173,6 +173,7 @@ unsafe extern "C" {
     ) -> CGContextRef;
     fn CGContextRelease(context: CGContextRef);
     fn CGContextScaleCTM(context: CGContextRef, sx: f64, sy: f64);
+    fn CGContextTranslateCTM(context: CGContextRef, tx: f64, ty: f64);
     fn CGContextSetTextPosition(context: CGContextRef, x: f64, y: f64);
     fn CGContextSetRGBFillColor(context: CGContextRef, r: f64, g: f64, b: f64, a: f64);
 }
@@ -553,7 +554,12 @@ impl TextEngine for CoreTextEngine {
             )
         };
         let width = (metrics.width * scale as f64).ceil() as usize;
-        let height = (metrics.height() * scale as f64).ceil() as usize;
+        // the glyphs stand on a WHOLE row: CoreGraphics floors a fractional
+        // baseline to the pixel below (up to a whole pixel low), so the
+        // fraction is never handed to it — the compositor snaps the line's
+        // baseline instead, once, where it knows the origin
+        let baseline = (metrics.ascent * scale as f64).ceil() as usize;
+        let height = baseline + (metrics.descent * scale as f64).ceil() as usize;
         if width == 0 || height == 0 {
             unsafe { CFRelease(line) };
             return None;
@@ -576,11 +582,13 @@ impl TextEngine for CoreTextEngine {
                 CFRelease(line);
                 return None;
             }
+            // CG counts y upward: the baseline row sits `height - baseline`
+            // whole pixels above the bottom, moved there BEFORE the scale so
+            // no division by it can leave a fraction to floor
+            CGContextTranslateCTM(context, 0.0, (height - baseline) as f64);
             // drawing in logical points, context in physical px (retina)
             CGContextScaleCTM(context, scale as f64, scale as f64);
-            // CG counts y upward: the baseline sits `descent` from the
-            // bottom of the line box (the ceil slack stays on top, sub-pixel)
-            CGContextSetTextPosition(context, 0.0, metrics.descent);
+            CGContextSetTextPosition(context, 0.0, 0.0);
             CGContextSetRGBFillColor(
                 context,
                 color.r as f64 / 255.0,
@@ -607,7 +615,8 @@ impl TextEngine for CoreTextEngine {
         Some(TextRaster {
             width,
             height,
-            baseline: (metrics.ascent * scale as f64).round() as usize,
+            baseline,
+            ascent: metrics.ascent,
             rgba,
         })
     }
@@ -635,6 +644,46 @@ mod tests {
             .expect("has ink");
         assert!(raster.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
         assert!(raster.baseline > 0 && raster.baseline <= raster.height);
+    }
+
+    #[test]
+    fn a_raster_stands_on_its_baseline_row_with_the_measured_ascent() {
+        let engine = CoreTextEngine::new();
+        // flat-footed stems: their last ink IS the baseline
+        let stems = "IIII";
+        for face in [FontSpec::DEFAULT, FontSpec::DEFAULT.family("Helvetica Neue")] {
+            for size in [12.0, 14.0, 26.0] {
+                let font = FontSpec { size, ..face };
+                let measured = engine.measure_line(stems, &font);
+                for scale in [1, 2, 3] {
+                    let case = format!("{font:?} at scale {scale}");
+                    let raster =
+                        engine.raster_line(stems, &font, Color::BLACK, scale).expect("has ink");
+                    assert_eq!(raster.ascent, measured.ascent, "{case}");
+                    let ink = |row: usize| {
+                        raster.rgba[row * raster.width * 4..(row + 1) * raster.width * 4]
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|pixel| pixel[3])
+                            .max()
+                            .unwrap_or(0)
+                    };
+                    // a foot on a whole row: its last row as inked as the
+                    // stem above it, the baseline row bare
+                    assert!(ink(raster.baseline - 2) > 0, "{case}: the stems reach the baseline");
+                    assert_eq!(ink(raster.baseline - 1), ink(raster.baseline - 2), "{case}");
+                    assert_eq!(ink(raster.baseline), 0, "{case}: nothing stands below them");
+                    // the whole line box fits, and no more than a row of
+                    // slack on either side of it
+                    let row = 1.0 / scale as f64;
+                    let above = raster.baseline as f64 * row - measured.ascent;
+                    let below = (raster.height - raster.baseline) as f64 * row - measured.descent;
+                    assert!((0.0..row).contains(&above), "{case}: {above} of slack above");
+                    assert!((0.0..row).contains(&below), "{case}: {below} of slack below");
+                }
+            }
+        }
     }
 
     #[test]
