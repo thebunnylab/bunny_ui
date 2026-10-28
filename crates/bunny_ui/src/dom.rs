@@ -936,8 +936,9 @@ impl DomCapture {
         // tooltip armed by the wrapper lands on THIS box
         let tooltip = node.style.take_tooltip();
         let mut look = DomLook {
-            // the rebuild must not drop what the layer scope decided
-            pass_through: self.overlay_depth > 0 && interactive.is_none(),
+            // the rebuild must not drop what the layer scope decided,
+            // nor a hit the view itself declined
+            pass_through: props.passive || (self.overlay_depth > 0 && interactive.is_none()),
             transition,
             group: props.from_group.then_some(group).flatten(),
             ..DomLook::from_props(props)
