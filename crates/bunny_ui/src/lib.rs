@@ -43,6 +43,7 @@ pub mod provenance;
 /// The preview vocabulary — a view with the traits it is shown under (Studio).
 pub mod preview;
 pub mod action;
+pub mod angle;
 pub mod anim;
 pub mod bind;
 mod blur;
@@ -81,6 +82,7 @@ pub mod pacing;
 mod paranoid;
 mod reconciler;
 mod shapes;
+pub use shapes::{BorderStyle, Stripes};
 pub mod runtime;
 #[cfg(feature = "canvas")]
 pub mod slider;
@@ -218,7 +220,9 @@ pub mod prelude {
         video, webview, webview_html,
     };
     pub use crate::icon::house as symbol;
-    pub use crate::icon::{ICON_GRID, Ink, Paint, Rule, Symbol, Verb};
+    pub use crate::angle::{Angle, QuarterTurn};
+    pub use crate::shapes::{BorderStyle, Stripes};
+    pub use crate::icon::{Cap, Dash, ICON_GRID, Ink, Paint, Rule, Symbol, Verb};
     pub use crate::image_engine::{
         FeedKey, ImageEngine, ImageFeed, ImageRaster, ImageSource, PixelFormat, RawImages, file_icon,
     };

@@ -857,7 +857,9 @@ pub enum LayoutNode {
     /// A house glyph. `forced` spends the drawing's own palette, so
     /// the inherited ink covers every stroke — see
     /// [`crate::views::Icon::monochrome`].
-    Icon { symbol: crate::icon::Symbol, resizable: bool, forced: bool },
+    /// `turn` is radians clockwise about the glyph's centre — zero for
+    /// the upright glyph, which paints the bytes it always did.
+    Icon { symbol: crate::icon::Symbol, resizable: bool, forced: bool, turn: f32 },
     /// A view whose resolved size goes back to the app (`.on_measure`).
     ///
     /// Transparent to the layout in both directions: it measures as its
@@ -1290,6 +1292,12 @@ pub enum LayoutNode {
     /// absolute machinery, pixel-partner to the canvas. Transparent on
     /// every pixel target (they are exact already, by construction).
     ExactLayout { child: Box<LayoutNode> },
+    /// `.quarter_turn(…)`: the child lays out UPRIGHT in a box whose
+    /// axes the turn swaps, and what it paints turns with the box — its
+    /// lines become [`DrawCommand::TurnedText`], its fills and edges turn
+    /// their rects. The box is the turned one: a label turned a quarter
+    /// is as wide as it was tall, so the row beside it makes room.
+    Turned { turn: crate::angle::QuarterTurn, child: Box<LayoutNode> },
     /// A class for the ENCLOSING boundary's element, declared from
     /// inside its body — the door a row uses to flip its own `<tr>`
     /// class without its parent hearing. Invisible everywhere: zero
@@ -2316,6 +2324,10 @@ pub struct VisualProps {
     /// Inherited downward: the text below paints with the current foreground.
     pub foreground: Option<Color>,
     pub border: Option<(Color, Px)>,
+    /// How the border's line is drawn — `None` is the solid ring.
+    pub border_style: Option<crate::shapes::BorderStyle>,
+    /// Bands painted over the background and the ramp, under the child.
+    pub stripes: Option<crate::shapes::Stripes>,
     pub corner_radius: Option<Corners>,
     /// Alternate background under hover/pressed of the ancestor
     /// `Interactive` — in Dom, `:hover`/`:active`. (Generalizing the
@@ -2415,6 +2427,8 @@ impl VisualProps {
             clip: self.clip || outer.clip,
             foreground: self.foreground.or(outer.foreground),
             border: self.border.or(outer.border),
+            border_style: self.border_style.or(outer.border_style),
+            stripes: self.stripes.or(outer.stripes),
             corner_radius: self.corner_radius.or(outer.corner_radius),
             background_hovered: self.background_hovered.or(outer.background_hovered),
             background_pressed: self.background_pressed.or(outer.background_pressed),
@@ -2603,6 +2617,25 @@ pub enum DrawCommand {
         color: Color,
         font: FontSpec,
     },
+    /// One line of text TURNED a quarter, a half or three quarters —
+    /// the label on a chart's vertical axis. The engine shapes and
+    /// rasterizes it upright, through the caches every line shares, and
+    /// the raster turns afterwards: a quarter turn moves each pixel to
+    /// another pixel, so nothing is resampled.
+    ///
+    /// `pivot` is where the line STARTS ON ITS BASELINE — the one point
+    /// an upright line and its turned twin share. The baseline snaps to
+    /// a whole pixel there, once, the way an upright line's does, and
+    /// the line reads away from it in the turn's direction: down for a
+    /// quarter, left for a half, up for three quarters.
+    TurnedText {
+        pivot: Point,
+        content: Arc<str>,
+        range: (usize, usize),
+        color: Color,
+        font: FontSpec,
+        turn: crate::angle::QuarterTurn,
+    },
     /// One image. `rect` is the destination in logical px — the backend
     /// asks the frame's [`ImageEngine`] for pixels at the rect's
     /// PHYSICAL size, so every pipeline composites the same bytes. The
@@ -2648,6 +2681,11 @@ impl PartialEq for DrawCommand {
             TextLine { origin, content, range, color, font } => matches!(other,
                 TextLine { origin: o, content: t, range: g, color: c, font: f }
                     if origin == o && color == c && font == f
+                        && ((Arc::ptr_eq(content, t) && range == g)
+                            || content[range.0..range.1] == t[g.0..g.1])),
+            TurnedText { pivot, content, range, color, font, turn } => matches!(other,
+                TurnedText { pivot: o, content: t, range: g, color: c, font: f, turn: q }
+                    if pivot == o && color == c && font == f && turn == q
                         && ((Arc::ptr_eq(content, t) && range == g)
                             || content[range.0..range.1] == t[g.0..g.1])),
             Image { rect, source } => matches!(other,
@@ -2841,6 +2879,22 @@ impl DrawCommand {
             DrawCommand::TextLine { origin, font, .. } => {
                 hits(origin.x - 1.0, origin.y - 1.0, Px::INFINITY, origin.y + font.size * 3.0)
             }
+            // the same reach, turned: without end the way the line reads,
+            // three sizes either side of its baseline
+            DrawCommand::TurnedText { pivot, font, turn, .. } => {
+                let across = font.size * 3.0;
+                match turn {
+                    crate::angle::QuarterTurn::Clockwise => {
+                        hits(pivot.x - across, pivot.y - 1.0, pivot.x + across, Px::INFINITY)
+                    }
+                    crate::angle::QuarterTurn::Half => {
+                        hits(Px::NEG_INFINITY, pivot.y - across, pivot.x + 1.0, pivot.y + across)
+                    }
+                    crate::angle::QuarterTurn::Counterclockwise => {
+                        hits(pivot.x - across, Px::NEG_INFINITY, pivot.x + across, pivot.y + 1.0)
+                    }
+                }
+            }
             DrawCommand::PushClip { .. } | DrawCommand::PopClip => true,
         }
     }
@@ -2881,6 +2935,16 @@ impl DrawCommand {
                     range: *range,
                     color: *color,
                     font: *font,
+                }
+            }
+            DrawCommand::TurnedText { pivot, content, range, color, font, turn } => {
+                DrawCommand::TurnedText {
+                    pivot: Point { x: pivot.x + by.x, y: pivot.y + by.y },
+                    content: Arc::clone(content),
+                    range: *range,
+                    color: *color,
+                    font: *font,
+                    turn: *turn,
                 }
             }
             DrawCommand::Image { rect, source } => {
@@ -3108,7 +3172,8 @@ impl DisplayList {
                 DrawCommand::FillRect { color, .. }
                 | DrawCommand::StrokeRect { color, .. }
                 | DrawCommand::Shadow { color, .. }
-                | DrawCommand::TextLine { color, .. } => fade(color),
+                | DrawCommand::TextLine { color, .. }
+                | DrawCommand::TurnedText { color, .. } => fade(color),
                 // the pane fades by its TINT and its lights: what it
                 // samples is the scene, and the scene is already there
                 DrawCommand::Backdrop { glass, .. } => {
@@ -3130,6 +3195,146 @@ impl DisplayList {
                 DrawCommand::Image { source, .. } => *source = source.faded(opacity),
                 DrawCommand::PushClip { .. } | DrawCommand::PopClip => {}
             }
+        }
+    }
+
+    /// Turns everything painted since `from` with its box: `upright` is
+    /// the box the commands were placed in, and they land in the box the
+    /// turn makes of it, at the same top-left corner. A line becomes a
+    /// [`DrawCommand::TurnedText`] standing on its own baseline (`ascent`
+    /// answers where that is), a turned line turns again, a glyph turns
+    /// its drawing; fills, edges, halos, clips and ramps turn their
+    /// geometry. Any other picture keeps its pixels upright in its turned
+    /// box — a photograph is not a mark.
+    pub(crate) fn turn_from(
+        &mut self,
+        from: usize,
+        upright: Rect,
+        turn: crate::angle::QuarterTurn,
+        ascent: impl Fn(&str, &FontSpec) -> Px,
+    ) {
+        use crate::angle::QuarterTurn;
+        let (w, h) = (upright.size.width, upright.size.height);
+        let o = upright.origin;
+        let point = |p: Point| {
+            let (x, y) = (p.x - o.x, p.y - o.y);
+            let (x, y) = match turn {
+                QuarterTurn::Clockwise => (h - y, x),
+                QuarterTurn::Half => (w - x, h - y),
+                QuarterTurn::Counterclockwise => (y, w - x),
+            };
+            Point { x: x + o.x, y: y + o.y }
+        };
+        let rect = |r: Rect| {
+            let a = point(r.origin);
+            let b = point(Point { x: r.origin.x + r.size.width, y: r.origin.y + r.size.height });
+            Rect {
+                origin: Point { x: a.x.min(b.x), y: a.y.min(b.y) },
+                size: Size { width: (a.x - b.x).abs(), height: (a.y - b.y).abs() },
+            }
+        };
+        // a corner goes where the turn takes it
+        let corners = |c: Corners| match turn {
+            QuarterTurn::Clockwise => Corners {
+                top_left: c.bottom_left,
+                top_right: c.top_left,
+                bottom_right: c.top_right,
+                bottom_left: c.bottom_right,
+            },
+            QuarterTurn::Half => Corners {
+                top_left: c.bottom_right,
+                top_right: c.bottom_left,
+                bottom_right: c.top_left,
+                bottom_left: c.top_right,
+            },
+            QuarterTurn::Counterclockwise => Corners {
+                top_left: c.top_right,
+                top_right: c.bottom_right,
+                bottom_right: c.bottom_left,
+                bottom_left: c.top_left,
+            },
+        };
+        for command in &mut self.commands[from..] {
+            *command = match std::mem::replace(command, DrawCommand::PopClip) {
+                DrawCommand::FillRect { rect: r, color, corner_radius } => {
+                    DrawCommand::FillRect { rect: rect(r), color, corner_radius: corners(corner_radius) }
+                }
+                DrawCommand::StrokeRect { rect: r, color, width, corner_radius } => DrawCommand::StrokeRect {
+                    rect: rect(r),
+                    color,
+                    width,
+                    corner_radius: corners(corner_radius),
+                },
+                DrawCommand::Shadow { rect: r, radius, color, corner_radius } => DrawCommand::Shadow {
+                    rect: rect(r),
+                    radius,
+                    color,
+                    corner_radius: corners(corner_radius),
+                },
+                DrawCommand::Backdrop { rect: r, glass, corner_radius } => DrawCommand::Backdrop {
+                    rect: rect(r),
+                    glass,
+                    corner_radius: corners(corner_radius),
+                },
+                DrawCommand::Gradient { rect: r, paint, corner_radius } => DrawCommand::Gradient {
+                    rect: rect(r),
+                    paint: match paint {
+                        GradientPaint::Linear { start, end, from, to } => {
+                            GradientPaint::Linear { start: point(start), end: point(end), from, to }
+                        }
+                        GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
+                            GradientPaint::Radial { center: point(center), start, end, aspect, inner, outer }
+                        }
+                    },
+                    corner_radius: corners(corner_radius),
+                },
+                DrawCommand::TextLine { origin, content, range, color, font } => {
+                    let rise = ascent(&content[range.0..range.1], &font);
+                    DrawCommand::TurnedText {
+                        pivot: point(Point { x: origin.x, y: origin.y + rise }),
+                        content,
+                        range,
+                        color,
+                        font,
+                        turn,
+                    }
+                }
+                DrawCommand::TurnedText { pivot, content, range, color, font, turn: inner } => {
+                    let pivot = point(pivot);
+                    match inner.then(turn) {
+                        Some(turn) => DrawCommand::TurnedText { pivot, content, range, color, font, turn },
+                        // two turns that make a whole stand the line up again
+                        None => {
+                            let rise = ascent(&content[range.0..range.1], &font);
+                            DrawCommand::TextLine {
+                                origin: Point { x: pivot.x, y: pivot.y - rise },
+                                content,
+                                range,
+                                color,
+                                font,
+                            }
+                        }
+                    }
+                }
+                DrawCommand::Image { rect: r, source } => DrawCommand::Image {
+                    rect: rect(r),
+                    source: match source {
+                        crate::image_engine::ImageSource::Symbol { symbol, color, forced, turn: spun, .. } => {
+                            crate::image_engine::ImageSource::symbol_turned(
+                                symbol,
+                                color,
+                                forced,
+                                crate::angle::Angle::radians(f64::from(spun) + turn.angle().as_radians()),
+                            )
+                        }
+                        other => other,
+                    },
+                },
+                DrawCommand::PushClip { rect: r, corner_radius } => {
+                    DrawCommand::PushClip { rect: rect(r), corner_radius: corners(corner_radius) }
+                }
+                DrawCommand::PopClip => DrawCommand::PopClip,
+            };
         }
     }
 
@@ -3175,6 +3380,16 @@ impl DisplayList {
                         range,
                         color,
                         font,
+                    }
+                }
+                DrawCommand::TurnedText { pivot, content, range, color, font, turn } => {
+                    DrawCommand::TurnedText {
+                        pivot: Point { x: pivot.x + dx, y: pivot.y + dy },
+                        content,
+                        range,
+                        color,
+                        font,
+                        turn,
                     }
                 }
                 DrawCommand::Image { rect, source } => {
@@ -5961,6 +6176,7 @@ impl LayoutNode {
             | Self::DragSource { child, .. }
             | Self::DropTarget { child, .. }
             | Self::ExactLayout { child, .. }
+            | Self::Turned { child, .. }
             | Self::Hinted { child, .. }
             | Self::Placed { child, .. }
             | Self::Spanned { child, .. } => Some(child),
@@ -6243,6 +6459,23 @@ impl LayoutNode {
             LayoutNode::ExactLayout { child } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
+            // the child answers upright; the box is that answer, turned
+            LayoutNode::Turned { turn, child } => {
+                let swaps = turn.swaps_axes();
+                let inner = if swaps {
+                    Proposal { width: proposal.height, height: proposal.width }
+                } else {
+                    proposal
+                };
+                let (upright, fit) = child.measure(inner, env);
+                let size = if swaps {
+                    Size { width: upright.height, height: upright.width }
+                } else {
+                    upright
+                };
+                (size, Fit::Wrapped(upright, Box::new(fit)))
             }
 
             LayoutNode::Stack { axis, spacing, children, .. } => {
@@ -7721,6 +7954,29 @@ impl LayoutNode {
                 child.place(frame, fit, env, out);
             }
 
+            (LayoutNode::Turned { turn, child }, Fit::Wrapped(_, fit)) => {
+                // the child places upright in the box with its axes
+                // swapped back, at the same corner; what it painted then
+                // turns into the frame it was given
+                let size = if turn.swaps_axes() {
+                    Size { width: frame.size.height, height: frame.size.width }
+                } else {
+                    frame.size
+                };
+                let upright = Rect { origin: frame.origin, size };
+                if let Some(dom) = out.dom.as_mut() {
+                    dom.open_turned(frame, size, *turn);
+                }
+                let from = out.display.len();
+                child.place(upright, fit, env, out);
+                out.display.turn_from(from, upright, *turn, |slice, font| {
+                    env.cache.get_or_measure(slice, font, env.text).ascent
+                });
+                if let Some(dom) = out.dom.as_mut() {
+                    dom.close_turned();
+                }
+            }
+
             (LayoutNode::IgnoresSafeArea { child }, Fit::Wrapped(_, fit)) => {
                 let Some(safe) = out.safe else {
                     // no inset anywhere: the node is glass
@@ -7920,7 +8176,7 @@ impl LayoutNode {
                 }
             },
 
-            (LayoutNode::Icon { symbol, forced, .. }, Fit::Leaf) => {
+            (LayoutNode::Icon { symbol, forced, turn, .. }, Fit::Leaf) => {
                 // the ink is the INHERITED one, the same line Text
                 // reads — .foreground_color and the hover/press inks
                 // reach a glyph with zero new API
@@ -7938,6 +8194,7 @@ impl LayoutNode {
                             color,
                             inherits_ink: false,
                             forced: *forced,
+                            turn: *turn,
                         }),
                         frame,
                     );
@@ -7951,10 +8208,15 @@ impl LayoutNode {
                         },
                         size: Size { width: side, height: side },
                     };
-                    let glyph = if *forced {
-                        ImageSource::symbol_forced(*symbol, color)
-                    } else {
-                        ImageSource::symbol(*symbol, color)
+                    let glyph = match (*forced, *turn) {
+                        (true, 0.0) => ImageSource::symbol_forced(*symbol, color),
+                        (false, 0.0) => ImageSource::symbol(*symbol, color),
+                        (forced, turn) => ImageSource::symbol_turned(
+                            *symbol,
+                            color,
+                            forced,
+                            crate::angle::Angle::radians(f64::from(turn)),
+                        ),
                     };
                     // a glyph that points the way flips with the scene
                     // when its view said so; its identity carries the flip
@@ -8457,6 +8719,21 @@ impl LayoutNode {
                         corner_radius: props.corner_radius.unwrap_or_default(),
                     });
                 }
+                // the bands paint over both grounds, cut to the corner
+                // the background takes
+                if let Some(stripes) = props.stripes
+                    && let Some(source) = crate::shapes::stripes_source(frame.size, &stripes)
+                {
+                    let corners = props.corner_radius.unwrap_or_default();
+                    let rounded = corners.uniform() != Some(0.0);
+                    if rounded {
+                        out.push_clip(frame, corners);
+                    }
+                    out.draw(DrawCommand::Image { rect: frame, source });
+                    if rounded {
+                        out.pop_clip();
+                    }
+                }
                 // the ink walks the same ladder as the background: a
                 // state with no ink of its own falls back to the base
                 let ink = if pressed {
@@ -8484,12 +8761,16 @@ impl LayoutNode {
                     out.foreground.pop();
                 }
                 if let Some((color, width)) = props.border {
-                    out.draw(DrawCommand::StrokeRect {
-                        rect: frame,
-                        color: animated(crate::anim::Channel::Border, color),
-                        width,
-                        corner_radius: props.corner_radius.unwrap_or_default(),
-                    });
+                    let color = animated(crate::anim::Channel::Border, color);
+                    let corner_radius = props.corner_radius.unwrap_or_default();
+                    // a broken line is a traced path; the solid one keeps
+                    // the exact ring every pipeline draws
+                    match props.border_style.and_then(|style| {
+                        crate::shapes::border_source(frame.size, color, width, style, corner_radius)
+                    }) {
+                        Some(source) => out.draw(DrawCommand::Image { rect: frame, source }),
+                        None => out.draw(DrawCommand::StrokeRect { rect: frame, color, width, corner_radius }),
+                    }
                 }
                 // the veil closes the box. In ELEMENT mode the browser
                 // owns it (a real layer, on the element itself), so the
@@ -12450,7 +12731,7 @@ mod tests {
     const CHECK: crate::icon::Symbol = crate::icon::Symbol::new("test.check", &CHECK_GLYPH);
 
     fn icon_node(resizable: bool) -> LayoutNode {
-        LayoutNode::Icon { symbol: CHECK, resizable, forced: false }
+        LayoutNode::Icon { symbol: CHECK, resizable, forced: false, turn: 0.0 }
     }
 
     #[test]
@@ -12526,7 +12807,7 @@ mod tests {
         let ink = Color::hex(0x8957E5);
         let root = styled(
             VisualProps { foreground: Some(ink), ..VisualProps::default() },
-            LayoutNode::Icon { symbol: CHECK, resizable: false, forced: true },
+            LayoutNode::Icon { symbol: CHECK, resizable: false, forced: true, turn: 0.0 },
         );
         let result = layout(&root, Proposal::unspecified());
         let source = result

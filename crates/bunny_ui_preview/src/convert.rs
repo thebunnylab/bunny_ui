@@ -60,7 +60,7 @@ use bunny_ui_core::modifier::Modifier;
 use bunny_ui_core::prelude::{Alignment, Edge, LayoutDirection, Locale, Site, SizeClass};
 use bunny_ui_core::preview as core_preview;
 use bunny_ui_core::provenance::SitePlacement;
-use bunny_ui_core::text_engine::{Family, FontDesign, FontSpec, Slant, Weight};
+use bunny_ui_core::text_engine::{Family, FontDesign, FontSpec, Slant, TextEngine, Weight};
 use bunny_ui_core::theme::Theme;
 
 use crate::wire::{self, Draw, ImageRef, Resource, ResourceKind, Strings};
@@ -350,18 +350,93 @@ pub fn image_ref(source: &ImageSource) -> (ImageRef, Cow<'_, ImageSource>) {
 /// — for a symbol of the app's own, which no tool knows by name — the one
 /// traced path it draws when one path draws it, and the symbol itself,
 /// under its drawing's key, when it travels whole.
+///
+/// A TURNED glyph travels as the drawing it is: the host turns its verbs,
+/// and the tool draws them upright. One pen and one ink is one traced
+/// path, as ever; anything else travels whole, kept under the key that
+/// folds the turn. The wire is frozen, and it never hears of a turn.
 fn carried(source: &ImageSource) -> Cow<'_, ImageSource> {
     match source {
+        ImageSource::Symbol { symbol, color, forced, turn, .. } if *turn != 0.0 => {
+            let draws: Vec<wire::GlyphDraw> = symbol
+                .glyph
+                .draws
+                .iter()
+                .map(|draw| wire_draw(draw.paint, draw.path, draw.tint, *turn))
+                .collect();
+            if let Some(path) = traced_draws(&draws, *color, *forced) {
+                return Cow::Owned(path);
+            }
+            let key = drawing_key(symbol, *color, *forced, *turn);
+            Cow::Owned(ImageSource::Symbol {
+                key,
+                symbol: kept(key, symbol.name, &draws),
+                color: *color,
+                forced: *forced,
+                turn: 0.0,
+            })
+        }
         ImageSource::Symbol { symbol, color, forced, .. } if !is_house(symbol) => {
             Cow::Owned(traced(symbol.glyph, *color, *forced).unwrap_or_else(|| ImageSource::Symbol {
-                key: drawing_key(symbol, *color, *forced),
+                key: drawing_key(symbol, *color, *forced, 0.0),
                 symbol: *symbol,
                 color: *color,
                 forced: *forced,
+                turn: 0.0,
             }))
         }
         _ => Cow::Borrowed(source),
     }
+}
+
+/// One draw as the frozen wire carries it: turned `turn` radians about
+/// the grid's centre, and a dashed pen lowered to the plain geometry it
+/// draws ([`icon::undashed`]) — the wire knows a fill and a round pen.
+fn wire_draw(paint: icon::Paint, path: &[icon::Verb], tint: Option<layout::Color>, turn: f32) -> wire::GlyphDraw {
+    let centre = icon::ICON_GRID / 2.0;
+    let turned: Cow<'_, [icon::Verb]> = if turn == 0.0 {
+        Cow::Borrowed(path)
+    } else {
+        Cow::Owned(icon::turned(path, f64::from(turn), (centre, centre)))
+    };
+    let (verbs, paint) = plain(&turned, paint);
+    wire::GlyphDraw {
+        paint: paint_to_wire(paint),
+        verbs: verbs.iter().map(|verb| verb_to_wire(*verb)).collect(),
+        tint: tint.map(Into::into),
+    }
+}
+
+/// A path and its paint as the wire can say them: a dash lowered to its
+/// geometry, every other paint as it is.
+fn plain(path: &[icon::Verb], paint: icon::Paint) -> (Cow<'_, [icon::Verb]>, icon::Paint) {
+    match paint {
+        icon::Paint::Dashed { width, dash } => {
+            let (verbs, paint) = icon::undashed(path, width, dash);
+            (Cow::Owned(verbs), paint)
+        }
+        other => (Cow::Borrowed(path), other),
+    }
+}
+
+/// [`traced`]'s rule over draws already on the wire's terms: one draw,
+/// or round pens of one width in one ink, is one traced path.
+fn traced_draws(draws: &[wire::GlyphDraw], color: layout::Color, forced: bool) -> Option<ImageSource> {
+    let ink_of = |draw: &wire::GlyphDraw| if forced { color } else { draw.tint.map_or(color, Into::into) };
+    let (first, rest) = draws.split_first()?;
+    let one_pen = rest.is_empty()
+        || (matches!(first.paint, wire::Paint::Stroke { .. })
+            && rest.iter().all(|draw| draw.paint == first.paint && ink_of(draw) == ink_of(first)));
+    if !one_pen {
+        return None;
+    }
+    let verbs: Vec<icon::Verb> = draws
+        .iter()
+        .flat_map(|draw| draw.verbs.iter().map(|verb| verb_from_wire(*verb)))
+        .skip_while(|verb| !matches!(verb, icon::Verb::Move(..)))
+        .collect();
+    let grid = icon::ICON_GRID as f32;
+    Some(ImageSource::path(verbs, paint_from_wire(first.paint), icon::Ink::Solid(ink_of(first)), (grid, grid)))
 }
 
 /// The domain tag folded into a whole glyph's key: "bny_glyp".
@@ -387,7 +462,7 @@ impl Hasher for Fnv {
 /// ink and its reading, folded together — the drawing's identity, so an
 /// edit under hot reload is a new key. The house's own key folds only the
 /// name, and a tool keeps a glyph per key.
-fn drawing_key(symbol: &icon::Symbol, color: layout::Color, forced: bool) -> u64 {
+fn drawing_key(symbol: &icon::Symbol, color: layout::Color, forced: bool, turn: f32) -> u64 {
     let mut fold = Fnv(0xcbf2_9ce4_8422_2325);
     let colour = |fold: &mut Fnv, color: layout::Color| fold.write(&[color.r, color.g, color.b, color.a]);
     fold.write_u64(GLYPH_TAG);
@@ -395,6 +470,10 @@ fn drawing_key(symbol: &icon::Symbol, color: layout::Color, forced: bool) -> u64
     fold.write(symbol.name.as_bytes());
     colour(&mut fold, color);
     fold.write_u8(u8::from(forced));
+    // only a turned drawing folds its turn: an upright one keeps its key
+    if turn != 0.0 {
+        fold.write_u32(turn.to_bits());
+    }
     fold.write_usize(symbol.glyph.draws.len());
     for draw in symbol.glyph.draws {
         match draw.paint {
@@ -403,6 +482,13 @@ fn drawing_key(symbol: &icon::Symbol, color: layout::Color, forced: bool) -> u64
             icon::Paint::Stroke { width } => {
                 fold.write_u8(2);
                 fold.write_u32(width.to_bits());
+            }
+            icon::Paint::Dashed { width, dash } => {
+                fold.write_u8(3);
+                for value in [width, dash.on, dash.off, dash.phase] {
+                    fold.write_u32(value.to_bits());
+                }
+                fold.write_u8(dash.cap as u8);
             }
         }
         match draw.tint {
@@ -526,21 +612,20 @@ pub fn resource(source: &ImageSource) -> Option<Resource> {
                 .glyph
                 .draws
                 .iter()
-                .map(|draw| wire::GlyphDraw {
-                    paint: paint_to_wire(draw.paint),
-                    verbs: draw.path.iter().map(|verb| verb_to_wire(*verb)).collect(),
-                    tint: draw.tint.map(Into::into),
-                })
+                .map(|draw| wire_draw(draw.paint, draw.path, draw.tint, 0.0))
                 .collect(),
         },
-        ImageSource::Path { verbs, paint, ink, box_size, .. } => ResourceKind::Vector {
+        ImageSource::Path { verbs, paint, ink, box_size, .. } => {
+            let (verbs, paint) = plain(verbs, *paint);
+            ResourceKind::Vector {
             verbs: verbs.iter().map(|verb| verb_to_wire(*verb)).collect(),
-            paint: paint_to_wire(*paint),
+            paint: paint_to_wire(paint),
             ink: match *ink {
                 icon::Ink::Solid(color) => wire::Ink::Solid(color.into()),
                 icon::Ink::Ramp(gradient) => wire::Ink::Ramp(gradient.into()),
             },
             box_size: *box_size,
+        }
         },
         ImageSource::Rgba { size, rgba, .. } => ResourceKind::Rgba { size: *size, rgba: rgba.to_vec() },
         ImageSource::Feed { generation, size, bytes, .. } => {
@@ -560,6 +645,9 @@ fn paint_to_wire(paint: icon::Paint) -> wire::Paint {
         icon::Paint::Fill(icon::Rule::NonZero) => wire::Paint::Fill { even_odd: false },
         icon::Paint::Fill(icon::Rule::EvenOdd) => wire::Paint::Fill { even_odd: true },
         icon::Paint::Stroke { width } => wire::Paint::Stroke { width },
+        // every caller lowers a dash first ([`plain`]); one that did not
+        // would still draw its line, solid, rather than nothing
+        icon::Paint::Dashed { width, .. } => wire::Paint::Stroke { width },
     }
 }
 
@@ -614,12 +702,14 @@ pub fn image_source(resource: &Resource) -> Option<ImageSource> {
             symbol: icon::house::named(name)?,
             color: (*color).into(),
             forced: *forced,
+            turn: 0.0,
         },
         ResourceKind::Glyph { name, color, forced, draws } => ImageSource::Symbol {
             key,
             symbol: kept(key, name, draws),
             color: (*color).into(),
             forced: *forced,
+            turn: 0.0,
         },
         ResourceKind::FileIcon { path } => ImageSource::FileIcon { key, path: Rc::from(path.as_str()) },
         ResourceKind::Feed { generation, size, rgba } => ImageSource::Feed {
@@ -706,6 +796,49 @@ fn string(strings: &[String], index: u32) -> Result<&str, Missing> {
     strings.get(index as usize).map(String::as_str).ok_or(Missing::String { index })
 }
 
+/// The turned lines of a list as the pictures they paint, for the wire,
+/// which is frozen and has no turned line of its own.
+///
+/// The host's engine shapes each line, the core turns its raster the way
+/// every pipeline does ([`bunny_ui_core::raster::turn_raster`]) and
+/// places it at the pixel the pipelines put it on, `scale` pixels to the
+/// point. A tool that draws the frame at that scale paints the host's
+/// bytes; at another it resamples a picture, as it does any image. A list
+/// with no turned line comes back as it went in.
+pub fn turned_as_pictures(display: DisplayList, text: &dyn TextEngine, scale: usize) -> DisplayList {
+    if !display.iter().any(|command| matches!(command, DrawCommand::TurnedText { .. })) {
+        return display;
+    }
+    let commands = display
+        .iter()
+        .filter_map(|command| {
+            let DrawCommand::TurnedText { pivot, content, range, color, font, turn } = command else {
+                return Some(command.clone());
+            };
+            let slice = content.get(range.0..range.1)?;
+            let upright = text.raster_line(slice, font, *color, scale)?;
+            let turned = bunny_ui_core::raster::turn_raster(&upright, *turn);
+            let (x, y) = bunny_ui_core::raster::turned_corner(
+                *pivot,
+                (upright.width, upright.height, upright.baseline),
+                *turn,
+                scale,
+            );
+            let mut fold = Fnv(0xcbf2_9ce4_8422_2325);
+            fold.write(slice.as_bytes());
+            fold.write(format!("{font:?}{color:?}{turn:?}{scale}").as_bytes());
+            let factor = scale as f64;
+            let rect = layout::Rect {
+                origin: layout::Point { x: x as f64 / factor, y: y as f64 / factor },
+                size: layout::Size { width: turned.width as f64 / factor, height: turned.height as f64 / factor },
+            };
+            let size = (turned.width as u32, turned.height as u32);
+            Some(DrawCommand::Image { rect, source: ImageSource::rgba(fold.finish(), size, turned.rgba) })
+        })
+        .collect::<Vec<_>>();
+    DisplayList::from(commands)
+}
+
 /// A display list as draws, its strings interned, and the distinct
 /// innermost images it needs, in first-use order.
 pub fn lower(display: &DisplayList, strings: &mut Strings) -> (Vec<Draw>, Vec<ImageSource>) {
@@ -737,6 +870,17 @@ pub fn lower(display: &DisplayList, strings: &mut Strings) -> (Vec<Draw>, Vec<Im
             },
             DrawCommand::TextLine { origin, content, range, color, font: spec } => Draw::TextLine {
                 origin: (*origin).into(),
+                text: strings.intern(content),
+                range: (range.0 as u32, range.1 as u32),
+                color: (*color).into(),
+                font: font(spec, strings),
+            },
+            // the frozen wire has no turned line: [`turned_as_pictures`]
+            // makes each one the picture it paints before the list comes
+            // here, and a list that skipped it shows the line upright,
+            // starting where it would have started
+            DrawCommand::TurnedText { pivot, content, range, color, font: spec, .. } => Draw::TextLine {
+                origin: (*pivot).into(),
                 text: strings.intern(content),
                 range: (range.0 as u32, range.1 as u32),
                 color: (*color).into(),

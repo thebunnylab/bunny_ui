@@ -26,19 +26,55 @@ const ROWS: usize = 16;
 /// curve at icon sizes ever meets it (the clamp would BREAK the bound).
 const MAX_SEGMENTS: usize = 128;
 
-/// The grid→device placing: a uniform scale and a shift. Icons never
-/// rotate, so the whole transform is three numbers — and the flattening
-/// error scales with the SAME factor, which keeps the bound honest.
+/// The grid→device placing: a turn about a pivot, a uniform scale and
+/// a shift. A turn and a uniform scale keep every length's ratio, so
+/// the flattening error scales with the SAME factor the drawing does,
+/// which keeps the bound honest.
 #[derive(Clone, Copy)]
 pub(crate) struct Placing {
     pub scale: f64,
     pub dx: f64,
     pub dy: f64,
+    /// Applied FIRST, in the table's own units: a glyph turns about the
+    /// centre of its grid, whatever size it lands at.
+    pub spin: Spin,
 }
 
 impl Placing {
     fn apply(&self, x: f32, y: f32) -> (f64, f64) {
-        (x as f64 * self.scale + self.dx, y as f64 * self.scale + self.dy)
+        let (x, y) = self.spin.apply(x as f64, y as f64);
+        (x * self.scale + self.dx, y * self.scale + self.dy)
+    }
+}
+
+/// A turn about one point, clockwise on the y-down screen — the way
+/// CSS's `rotate()` and SwiftUI's `rotationEffect` read an angle.
+#[derive(Clone, Copy)]
+pub(crate) struct Spin {
+    cos: f64,
+    sin: f64,
+    cx: f64,
+    cy: f64,
+}
+
+impl Spin {
+    /// No turn at all. It is exact, not merely close: `x·1 − y·0` is
+    /// `x` to the last bit, so an upright glyph keeps the bytes it
+    /// always had.
+    pub const NONE: Spin = Spin { cos: 1.0, sin: 0.0, cx: 0.0, cy: 0.0 };
+
+    /// `radians` clockwise about `(cx, cy)`.
+    pub fn about(radians: f64, cx: f64, cy: f64) -> Spin {
+        if radians == 0.0 {
+            return Spin::NONE;
+        }
+        let (sin, cos) = radians.sin_cos();
+        Spin { cos, sin, cx, cy }
+    }
+
+    pub fn apply(&self, x: f64, y: f64) -> (f64, f64) {
+        let (dx, dy) = (x - self.cx, y - self.cy);
+        (dx * self.cos - dy * self.sin + self.cx, dx * self.sin + dy * self.cos + self.cy)
     }
 }
 
@@ -455,6 +491,184 @@ pub(crate) fn stroke_into(mask: &mut Mask, flat: &Flattened, width: f64) {
     }
 }
 
+// MARK: - Dashes
+
+/// One run of ink a dash pattern leaves on a contour: the points it
+/// rides, in device space, and the direction it set off in — a dot
+/// (`on` of zero) has a single point and still needs a heading for a
+/// square cap.
+pub(crate) struct Run {
+    points: Vec<(f64, f64)>,
+    heading: (f64, f64),
+}
+
+/// Walks every contour of `flat` with a dash pattern, in device px:
+/// `on` of ink, `off` of air, the walk starting `phase` into the
+/// pattern (SVG's `stroke-dashoffset`). The pattern restarts on every
+/// contour, as SVG says it does, and runs ON across the joints of one —
+/// a dash that meets a corner bends around it instead of stopping
+/// there, so the rhythm a reader sees is the length along the line.
+pub(crate) fn dash_runs(flat: &Flattened, on: f64, off: f64, phase: f64) -> Vec<Run> {
+    let (on, off) = (on.max(0.0), off.max(0.0));
+    let period = on + off;
+    let mut runs = Vec::new();
+    // a NaN period answers no to both: no pattern, no runs
+    if period <= 0.0 || !period.is_finite() {
+        return runs;
+    }
+    for (points, sealed) in flat.contours() {
+        let count = points.len();
+        let segments = match (sealed, count) {
+            (_, 0 | 1) => 0,
+            (true, _) => count,
+            (false, _) => count - 1,
+        };
+        let at = phase.rem_euclid(period);
+        // the start of a period is ink, even when the ink has no length:
+        // that is where a dot lands
+        let (mut inked, mut left) =
+            if at < on || at == 0.0 { (true, on - at) } else { (false, period - at) };
+        let mut open: Option<Run> = None;
+        let mut heading = (1.0, 0.0);
+        let mut last = points[0];
+        for i in 0..segments {
+            let a = points[i];
+            let b = points[(i + 1) % count];
+            let length = (b.0 - a.0).hypot(b.1 - a.1);
+            if length <= 0.0 {
+                continue;
+            }
+            heading = ((b.0 - a.0) / length, (b.1 - a.1) / length);
+            let point = |t: f64| (a.0 + heading.0 * t, a.1 + heading.1 * t);
+            let mut travelled = 0.0;
+            while travelled < length {
+                if inked && open.is_none() {
+                    open = Some(Run { points: vec![point(travelled)], heading });
+                }
+                if inked && left <= 0.0 {
+                    // a dot lands where it falls and the air resumes
+                    runs.extend(open.take());
+                    inked = false;
+                    left = off;
+                    continue;
+                }
+                let step = (length - travelled).min(left);
+                travelled += step;
+                left -= step;
+                if inked && let Some(run) = &mut open {
+                    run.points.push(point(travelled));
+                }
+                if left <= 1e-9 {
+                    if inked {
+                        runs.extend(open.take());
+                        (inked, left) = (false, off);
+                    } else {
+                        (inked, left) = (true, on);
+                    }
+                }
+            }
+            last = b;
+        }
+        // a dot the pattern puts on the contour's very end
+        if inked && on <= 0.0 && open.is_none() && segments > 0 {
+            open = Some(Run { points: vec![last], heading });
+        }
+        runs.extend(open.take());
+    }
+    runs
+}
+
+/// The runs as open contours — what the round pen of [`stroke_into`]
+/// rides: each run wears round caps and a dot becomes a disc.
+pub(crate) fn runs_as_contours(runs: &[Run]) -> Flattened {
+    let mut out = Flattened { points: Vec::new(), contours: Vec::new() };
+    for run in runs {
+        out.contours.push((out.points.len(), false));
+        out.points.extend_from_slice(&run.points);
+    }
+    out
+}
+
+/// The OUTLINE of every run under a flat pen `width` wide — the closed
+/// polygons a fill rule turns into ink. A butt end stops square at the
+/// run's own end; a square end goes on half a pen further, which is
+/// SVG's `square` cap and the corner of a dotted CSS border. Joints
+/// inside a run meet at their mitre, cut to a bevel past SVG's default
+/// limit of four.
+///
+/// The fill is exact along x and sub-sampled along y, the same kernel
+/// every filled glyph rides, so a dash's flat end lands on its true
+/// fraction of a pixel — the round pen could only ever end in a disc.
+pub(crate) fn runs_outline(runs: &[Run], width: f64, extend: bool) -> Flattened {
+    const MITER_LIMIT: f64 = 4.0;
+    let half = width / 2.0;
+    let mut out = Flattened { points: Vec::new(), contours: Vec::new() };
+    for run in runs {
+        let mut points = run.points.clone();
+        if points.len() == 1 {
+            // a dot: nothing under a butt end, a square under a square one
+            if !extend {
+                continue;
+            }
+            let (x, y) = points[0];
+            let (hx, hy) = run.heading;
+            points = vec![(x - hx * half, y - hy * half), (x + hx * half, y + hy * half)];
+        } else if extend {
+            let first = heading_of(points[0], points[1]);
+            let last = heading_of(points[points.len() - 2], points[points.len() - 1]);
+            points[0] = (points[0].0 - first.0 * half, points[0].1 - first.1 * half);
+            let end = points.len() - 1;
+            points[end] = (points[end].0 + last.0 * half, points[end].1 + last.1 * half);
+        }
+        let count = points.len();
+        // the left side forward, then the right side back
+        let mut left = Vec::with_capacity(count + 2);
+        let mut right = Vec::with_capacity(count + 2);
+        for i in 0..count {
+            let normal_of = |a: (f64, f64), b: (f64, f64)| {
+                let (hx, hy) = heading_of(a, b);
+                (-hy, hx)
+            };
+            let before = (i > 0).then(|| normal_of(points[i - 1], points[i]));
+            let after = (i + 1 < count).then(|| normal_of(points[i], points[i + 1]));
+            let (x, y) = points[i];
+            match (before, after) {
+                (Some(n), None) | (None, Some(n)) => {
+                    left.push((x + n.0 * half, y + n.1 * half));
+                    right.push((x - n.0 * half, y - n.1 * half));
+                }
+                (Some(n0), Some(n1)) => {
+                    let (mx, my) = (n0.0 + n1.0, n0.1 + n1.1);
+                    let length = mx.hypot(my);
+                    let cos = if length > 1e-12 { (mx * n0.0 + my * n0.1) / length } else { 0.0 };
+                    if cos * MITER_LIMIT < 1.0 {
+                        // too sharp for a mitre: the bevel's two corners
+                        for n in [n0, n1] {
+                            left.push((x + n.0 * half, y + n.1 * half));
+                            right.push((x - n.0 * half, y - n.1 * half));
+                        }
+                    } else {
+                        let reach = half / cos;
+                        let (ux, uy) = (mx / length, my / length);
+                        left.push((x + ux * reach, y + uy * reach));
+                        right.push((x - ux * reach, y - uy * reach));
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+        out.contours.push((out.points.len(), true));
+        out.points.extend(left);
+        out.points.extend(right.into_iter().rev());
+    }
+    out
+}
+
+fn heading_of(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    let length = (b.0 - a.0).hypot(b.1 - a.1);
+    if length <= 0.0 { (1.0, 0.0) } else { ((b.0 - a.0) / length, (b.1 - a.1) / length) }
+}
+
 /// Distance from a point to one segment — the stroke's whole geometry,
 /// and the test bench's ruler.
 pub(crate) fn segment_distance(
@@ -475,13 +689,135 @@ pub(crate) fn segment_distance(
 mod tests {
     use super::*;
 
-    const ONE: Placing = Placing { scale: 1.0, dx: 0.0, dy: 0.0 };
+    const ONE: Placing = Placing { scale: 1.0, dx: 0.0, dy: 0.0, spin: Spin::NONE };
 
     fn polyline_distance(point: (f64, f64), points: &[(f64, f64)]) -> f64 {
         points
             .windows(2)
             .map(|pair| segment_distance(point, pair[0], pair[1]))
             .fold(f64::INFINITY, f64::min)
+    }
+
+    fn run_lengths(runs: &[Run]) -> Vec<f64> {
+        runs.iter()
+            .map(|run| {
+                run.points.windows(2).map(|pair| (pair[1].0 - pair[0].0).hypot(pair[1].1 - pair[0].1)).sum()
+            })
+            .collect()
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
+    #[test]
+    fn a_dash_walks_its_rhythm_along_the_line() {
+        let flat = flatten(&[Verb::Move(0.0, 0.0), Verb::Line(20.0, 0.0)], ONE);
+        let runs = dash_runs(&flat, 4.0, 2.0, 0.0);
+        let starts: Vec<f64> = runs.iter().map(|run| run.points[0].0).collect();
+        assert_eq!(starts, vec![0.0, 6.0, 12.0, 18.0], "a dash every six, from the start");
+        let lengths = run_lengths(&runs);
+        assert!(close(lengths[0], 4.0) && close(lengths[2], 4.0));
+        assert!(close(lengths[3], 2.0), "the line ends inside the last dash: {lengths:?}");
+    }
+
+    #[test]
+    fn the_phase_starts_the_walk_inside_the_pattern() {
+        let flat = flatten(&[Verb::Move(0.0, 0.0), Verb::Line(20.0, 0.0)], ONE);
+        // five into a pattern of six: one point of air, then a dash
+        let runs = dash_runs(&flat, 4.0, 2.0, 5.0);
+        assert!(close(runs[0].points[0].0, 1.0), "{:?}", runs[0].points);
+        // a negative phase walks back into the pattern, as SVG says
+        let back = dash_runs(&flat, 4.0, 2.0, -1.0);
+        assert!(close(back[0].points[0].0, 1.0), "{:?}", back[0].points);
+    }
+
+    #[test]
+    fn a_dash_bends_around_a_corner_instead_of_stopping() {
+        let flat = flatten(
+            &[Verb::Move(0.0, 0.0), Verb::Line(10.0, 0.0), Verb::Line(10.0, 10.0)],
+            ONE,
+        );
+        let runs = dash_runs(&flat, 15.0, 5.0, 0.0);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].points, vec![(0.0, 0.0), (10.0, 0.0), (10.0, 5.0)]);
+        assert!(close(run_lengths(&runs)[0], 15.0));
+    }
+
+    #[test]
+    fn a_dash_measures_a_curve_by_its_length() {
+        // a quarter of a circle of radius ten: 5π long
+        let k = 10.0 * 0.552_284_8;
+        let flat = flatten(&[Verb::Move(10.0, 0.0), Verb::Cubic(10.0, k, k, 10.0, 0.0, 10.0)], ONE);
+        let runs = dash_runs(&flat, 3.0, 1.0, 0.0);
+        let inked: f64 = run_lengths(&runs).iter().sum();
+        let whole = 5.0 * std::f64::consts::PI;
+        // whole dashes of three every four, and a share of the last
+        let expected = (whole / 4.0).floor() * 3.0 + (whole % 4.0).min(3.0);
+        assert!((inked - expected).abs() < 0.05, "{inked} against {expected}");
+    }
+
+    #[test]
+    fn a_dash_of_no_length_is_a_dot_on_every_beat() {
+        let flat = flatten(&[Verb::Move(0.0, 0.0), Verb::Line(20.0, 0.0)], ONE);
+        let runs = dash_runs(&flat, 0.0, 5.0, 0.0);
+        let dots: Vec<(f64, f64)> = runs.iter().map(|run| run.points[0]).collect();
+        assert!(runs.iter().all(|run| run.points.len() == 1), "every run is one point");
+        assert_eq!(dots, vec![(0.0, 0.0), (5.0, 0.0), (10.0, 0.0), (15.0, 0.0), (20.0, 0.0)]);
+    }
+
+    #[test]
+    fn the_pattern_restarts_on_every_contour() {
+        let flat = flatten(
+            &[
+                Verb::Move(0.0, 0.0),
+                Verb::Line(5.0, 0.0),
+                Verb::Move(0.0, 4.0),
+                Verb::Line(5.0, 4.0),
+            ],
+            ONE,
+        );
+        let runs = dash_runs(&flat, 3.0, 3.0, 0.0);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[1].points[0], (0.0, 4.0), "the second contour starts on ink");
+    }
+
+    #[test]
+    fn a_butt_end_stops_square_and_a_square_end_goes_half_a_pen_on() {
+        let flat = flatten(&[Verb::Move(2.0, 5.0), Verb::Line(6.0, 5.0)], ONE);
+        let runs = dash_runs(&flat, 10.0, 0.0, 0.0);
+        let butt = runs_outline(&runs, 2.0, false);
+        let (points, sealed) = butt.contours().next().expect("one outline");
+        assert!(sealed);
+        let xs = points.iter().map(|p| p.0);
+        let ys = points.iter().map(|p| p.1);
+        assert_eq!((xs.clone().fold(f64::MAX, f64::min), xs.fold(f64::MIN, f64::max)), (2.0, 6.0));
+        assert_eq!((ys.clone().fold(f64::MAX, f64::min), ys.fold(f64::MIN, f64::max)), (4.0, 6.0));
+        let square = runs_outline(&runs, 2.0, true);
+        let (points, _) = square.contours().next().expect("one outline");
+        let xs = points.iter().map(|p| p.0);
+        assert_eq!((xs.clone().fold(f64::MAX, f64::min), xs.fold(f64::MIN, f64::max)), (1.0, 7.0));
+        // a dot has no length: nothing under a butt end, a square under a square one
+        let dot = dash_runs(&flat, 0.0, 10.0, 0.0);
+        assert_eq!(runs_outline(&dot, 2.0, false).contours().count(), 0);
+        assert_eq!(runs_outline(&dot, 2.0, true).contours().count(), 1);
+    }
+
+    #[test]
+    fn a_turn_moves_every_point_about_its_pivot() {
+        let quarter = Placing {
+            scale: 1.0,
+            dx: 0.0,
+            dy: 0.0,
+            spin: Spin::about(std::f64::consts::FRAC_PI_2, 12.0, 12.0),
+        };
+        let flat = flatten(&[Verb::Move(12.0, 4.0), Verb::Line(20.0, 4.0)], quarter);
+        let (points, _) = flat.contours().next().expect("one contour");
+        // clockwise on the y-down screen: right of the pivot goes below it
+        assert!((points[0].0 - 20.0).abs() < 1e-9 && (points[0].1 - 12.0).abs() < 1e-9, "{points:?}");
+        assert!((points[1].0 - 20.0).abs() < 1e-9 && (points[1].1 - 20.0).abs() < 1e-9, "{points:?}");
+        // no turn is exact, not merely close
+        assert_eq!(Spin::NONE.apply(3.25, -7.5), (3.25, -7.5));
     }
 
     #[test]
@@ -589,7 +925,7 @@ mod tests {
             Verb::Move(radius, 0.0),
             Verb::Cubic(radius, radius * KAPPA, radius * KAPPA, radius, 0.0, radius),
         ];
-        let placing = Placing { scale: 20.0, dx: 0.0, dy: 0.0 };
+        let placing = Placing { scale: 20.0, dx: 0.0, dy: 0.0, spin: Spin::NONE };
         let flat = flatten(&path, placing);
         let all: Vec<_> = flat.contours().collect();
         let points = all[0].0;
@@ -608,7 +944,7 @@ mod tests {
     #[test]
     fn a_quad_stays_within_the_bound() {
         let path = [Verb::Move(0.0, 20.0), Verb::Quad(12.0, -20.0, 24.0, 20.0)];
-        let placing = Placing { scale: 8.0, dx: 3.0, dy: 5.0 };
+        let placing = Placing { scale: 8.0, dx: 3.0, dy: 5.0, spin: Spin::NONE };
         let flat = flatten(&path, placing);
         let all: Vec<_> = flat.contours().collect();
         let points = all[0].0;
@@ -653,7 +989,7 @@ mod tests {
 
     #[test]
     fn the_placing_lands_where_it_says() {
-        let placing = Placing { scale: 2.0, dx: 10.0, dy: 20.0 };
+        let placing = Placing { scale: 2.0, dx: 10.0, dy: 20.0, spin: Spin::NONE };
         let flat = flatten(&[Verb::Move(0.0, 0.0), Verb::Line(24.0, 24.0)], placing);
         let all: Vec<_> = flat.contours().collect();
         assert_eq!(all[0].0, &[(10.0, 20.0), (58.0, 68.0)]);

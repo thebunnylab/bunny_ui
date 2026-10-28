@@ -549,6 +549,25 @@ function lookRules(selector, kind, flags, style, layout, face) {
   // visibility, never display, or the sibling would move up
   if (style.hidden) decl.visibility = "hidden";
   if (style.blur !== null) decl.filter = `blur(${style.blur}px)`;
+  // the turn rides `rotate` and `translate`, which compose with the
+  // `transform` that positions the element instead of replacing it
+  if (style.turn !== null) {
+    const turn = [
+      ["0 100%", "90deg", "0 -100%", null],
+      ["50% 50%", "180deg", null, null],
+      ["100% 0", "270deg", "-100% 0", null],
+      [null, null, null, "vertical-rl"],
+      ["50% 50%", "180deg", null, null],
+      ["50% 50%", "180deg", null, "vertical-rl"],
+    ][style.turn];
+    if (turn) {
+      const [origin, rotate, translate, writing] = turn;
+      if (origin) decl["transform-origin"] = origin;
+      if (rotate) decl.rotate = rotate;
+      if (translate) decl.translate = translate;
+      if (writing) decl["writing-mode"] = writing;
+    }
+  }
   if (style.filter) {
     decl["backdrop-filter"] = style.filter;
     decl["-webkit-backdrop-filter"] = style.filter;
@@ -867,6 +886,7 @@ function applyPatches(view, length) {
       hidden: false,
       filter: null,
       blur: null,
+      turn: null,
     };
     if (mask & 1) style.background = rgba(u32());
     if (mask & 2) style.hover = rgba(u32());
@@ -975,6 +995,26 @@ function applyPatches(view, length) {
       }
     }
     if (mask & 33554432) style.blur = f32();
+    // bit 28: the border's line — the browser fits its own dashes
+    if (mask & 268435456) {
+      const keyword = ["solid", "dashed", "dotted"][u8()] || "solid";
+      if (style.border) style.border = style.border.replace(" solid ", ` ${keyword} `);
+    }
+    // bit 29: bands over the background, CSS's own hard-stop repeat
+    if (mask & 536870912) {
+      const angle = f32();
+      const width = f32();
+      const period = f32();
+      const ink = rgba(u32());
+      const bands =
+        `repeating-linear-gradient(${angle}deg, ${ink} 0 ${width}px, ` +
+        `transparent ${width}px ${period}px)`;
+      style.image = style.image ? `${bands}, ${style.image}` : bands;
+    }
+    // bit 30: a quarter turn — about the box's own corner where the
+    // engine placed the children (0–2), the flow's writing-mode where
+    // the browser lays them out (3–5)
+    if (mask & 1073741824) style.turn = u8();
     return style;
   };
   const readLayout = () => {
@@ -1378,6 +1418,8 @@ function applyPatches(view, length) {
       for (let d = 0; d < count; d++) {
         const paint = u8();
         const width = f32();
+        // a dashed pen carries its rhythm: on, off, phase and the cap
+        const dash = paint === 3 ? [f32(), f32(), f32(), u8()] : null;
         // a draw wears its OWN colour when it declared one; otherwise
         // it takes the ink the element inherits
         const ink = u8() === 1 ? rgba(u32()) : "currentColor";
@@ -1385,12 +1427,16 @@ function applyPatches(view, length) {
         if (!el) continue;
         const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
         path.setAttribute("d", data);
-        if (paint === 2) {
+        if (paint === 2 || paint === 3) {
           path.setAttribute("fill", "none");
           path.setAttribute("stroke", ink);
           path.setAttribute("stroke-width", width);
-          path.setAttribute("stroke-linecap", "round");
-          path.setAttribute("stroke-linejoin", "round");
+          path.setAttribute("stroke-linecap", dash ? ["butt", "round", "square"][dash[3]] : "round");
+          path.setAttribute("stroke-linejoin", dash && dash[3] !== 1 ? "miter" : "round");
+          if (dash) {
+            path.setAttribute("stroke-dasharray", dash[0] + " " + dash[1]);
+            path.setAttribute("stroke-dashoffset", dash[2]);
+          }
         } else {
           path.setAttribute("fill", ink);
           if (paint === 1) path.setAttribute("fill-rule", "evenodd");

@@ -39,11 +39,16 @@ pub enum ImageSource {
     /// `forced` spends the drawing's own palette: every draw takes
     /// `color`, whatever tint it declares. It rides the key like the
     /// ink does, so the two readings of one glyph are two identities.
+    ///
+    /// `turn` is radians clockwise about the grid's centre — zero for
+    /// every glyph that stands upright, which keeps the identity it
+    /// always had; a turned one is its own.
     Symbol {
         key: u64,
         symbol: crate::icon::Symbol,
         color: crate::layout::Color,
         forced: bool,
+        turn: f32,
     },
     /// A path the app TRACED while the frame ran — the runtime twin of
     /// the glyph: the verbs come from data (a squiggle under a word, a
@@ -195,7 +200,22 @@ impl ImageSource {
     /// orange under any ink, which is what a file-type set is for.
     /// [`ImageSource::symbol_forced`] is the other reading.
     pub fn symbol(symbol: crate::icon::Symbol, color: crate::layout::Color) -> ImageSource {
-        ImageSource::inked(symbol, color, false)
+        ImageSource::inked(symbol, color, false, 0.0)
+    }
+
+    /// A tinted glyph TURNED about its centre — the chevron of a row
+    /// that opened, a loader through its cycle. The house turns the
+    /// drawing before it rasterizes it, so the edges stay as sharp as
+    /// an upright glyph's; the turn rides the key, so each angle is
+    /// its own tile and an upright glyph keeps the identity it had.
+    pub fn symbol_turned(
+        symbol: crate::icon::Symbol,
+        color: crate::layout::Color,
+        forced: bool,
+        turn: crate::angle::Angle,
+    ) -> ImageSource {
+        let turn = if turn.is_zero() { 0.0 } else { turn.as_radians() as f32 };
+        ImageSource::inked(symbol, color, forced, turn)
     }
 
     /// The same glyph read as a MASK: this ink, and nothing else. Every
@@ -213,7 +233,7 @@ impl ImageSource {
         symbol: crate::icon::Symbol,
         color: crate::layout::Color,
     ) -> ImageSource {
-        ImageSource::inked(symbol, color, true)
+        ImageSource::inked(symbol, color, true, 0.0)
     }
 
     /// The one mix both readings go through. `forced` sits above the
@@ -223,6 +243,7 @@ impl ImageSource {
         symbol: crate::icon::Symbol,
         color: crate::layout::Color,
         forced: bool,
+        turn: f32,
     ) -> ImageSource {
         let packed = ((forced as u64) << 32)
             | ((color.r as u64) << 24)
@@ -230,9 +251,14 @@ impl ImageSource {
             | ((color.b as u64) << 8)
             | color.a as u64;
         let mut key = symbol.key ^ packed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        // a turn moves the key only when there is one: every upright
+        // glyph keeps the identity the caches and the wire know
+        if turn != 0.0 {
+            key ^= (u64::from(turn.to_bits()) | 1 << 40).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+        }
         key = key.wrapping_mul(0xff51_afd7_ed55_8ccd);
         key ^= key >> 33;
-        ImageSource::Symbol { key, symbol, color, forced }
+        ImageSource::Symbol { key, symbol, color, forced, turn }
     }
 
     /// A traced path — built at PAINT, where the geometry is known.
@@ -288,6 +314,13 @@ impl ImageSource {
             Paint::Stroke { width } => {
                 hasher.write_u8(6);
                 number(&mut hasher, width);
+            }
+            Paint::Dashed { width, dash } => {
+                hasher.write_u8(9);
+                for value in [width, dash.on, dash.off, dash.phase] {
+                    number(&mut hasher, value);
+                }
+                hasher.write_u8(dash.cap as u8);
             }
         }
         // the ink is part of the identity, exactly like a symbol's
@@ -505,9 +538,9 @@ impl fmt::Debug for ImageSource {
                 write!(f, "bytes(0x{key:016x}, {}b)", bytes.len())
             }
             ImageSource::FileIcon { path, .. } => write!(f, "file-icon({path})"),
-            ImageSource::Symbol { symbol, color, forced, .. } => write!(
+            ImageSource::Symbol { symbol, color, forced, turn, .. } => write!(
                 f,
-                "symbol({}, #{:02x}{:02x}{:02x}{:02x}{})",
+                "symbol({}, #{:02x}{:02x}{:02x}{:02x}{}{})",
                 symbol.name,
                 color.r,
                 color.g,
@@ -515,7 +548,13 @@ impl fmt::Debug for ImageSource {
                 color.a,
                 // only the forced reading says so: every print that
                 // came before this door keeps the words it had
-                if *forced { ", forced" } else { "" }
+                if *forced { ", forced" } else { "" },
+                // and only a turned glyph says how far
+                if *turn == 0.0 {
+                    String::new()
+                } else {
+                    format!(", turned {}°", (f64::from(*turn).to_degrees() * 100.0).round() / 100.0)
+                }
             ),
             ImageSource::Path { key, verbs, .. } => {
                 write!(f, "path(0x{key:016x}, {} verbs)", verbs.len())
@@ -614,8 +653,8 @@ pub fn raster_source(
 ) -> Option<Rc<ImageRaster>> {
     match source {
         ImageSource::Native { .. } => None,
-        ImageSource::Symbol { key, symbol, color, forced } => {
-            crate::icon::raster(*key, symbol, *color, *forced, width, height)
+        ImageSource::Symbol { key, symbol, color, forced, turn } => {
+            crate::icon::raster(*key, symbol, *color, *forced, *turn, width, height)
         }
         ImageSource::Path { key, verbs, paint, ink, box_size } => {
             crate::icon::raster_trace(*key, verbs, *paint, *ink, *box_size, width, height)

@@ -71,6 +71,12 @@ pub enum Modifier {
     BackgroundGradient(crate::layout::Gradient),
     ForegroundColor(Color),
     Border(Color, f64),
+    /// `.border_style(…)` — how the border's line is drawn.
+    BorderStyle(crate::shapes::BorderStyle),
+    /// `.background_stripes(…)` — bands over the background.
+    BackgroundStripes(crate::shapes::Stripes),
+    /// `.quarter_turn(…)` — the subtree laid out upright and turned.
+    QuarterTurn(crate::angle::QuarterTurn),
     CornerRadius(crate::layout::Corners),
     /// `.clipped()` — the subtree is cut to the box (and its corner).
     Clipped,
@@ -288,6 +294,9 @@ impl Modifier {
             Modifier::BackgroundGradient { .. } => "background_gradient",
             Modifier::ForegroundColor { .. } => "foreground_color",
             Modifier::Border { .. } => "border",
+            Modifier::BorderStyle { .. } => "border_style",
+            Modifier::BackgroundStripes { .. } => "background_stripes",
+            Modifier::QuarterTurn { .. } => "quarter_turn",
             Modifier::CornerRadius { .. } => "corner_radius",
             Modifier::Clipped => "clipped",
             Modifier::Tooltip { .. } => "tooltip",
@@ -418,6 +427,15 @@ impl Modifier {
             },
             Modifier::ForegroundColor(color) => format!(" [.foregroundColor({color})]"),
             Modifier::Border(color, width) => format!(" [.border({color}, width: {width})]"),
+            Modifier::BorderStyle(style) => format!(" [.borderStyle(.{})]", style.css()),
+            Modifier::QuarterTurn(turn) => format!(" [.quarterTurn({}°)]", turn.degrees()),
+            Modifier::BackgroundStripes(stripes) => format!(
+                " [.background(Stripes({}°, {} every {}, {}))]",
+                stripes.angle.as_degrees(),
+                stripes.width,
+                stripes.period,
+                stripes.ink
+            ),
             // one radius prints as one number — the print of a box
             // that rounds all four never changed
             Modifier::CornerRadius(radii) => match radii.uniform() {
@@ -801,7 +819,13 @@ fn rewrite_pixel_node(
         // wrapper, which no rewrite crosses: it is left as it was left
         marked if !marked.is_bare() => marked,
         LayoutNode::Image { source, resizable, fit } => rewrite(source, resizable, fit),
-        LayoutNode::Icon { symbol, resizable, forced } => icon(symbol, resizable, forced),
+        // the closure rebuilds the glyph; its turn rides through untouched
+        LayoutNode::Icon { symbol, resizable, forced, turn } => match icon(symbol, resizable, forced) {
+            LayoutNode::Icon { symbol, resizable, forced, .. } => {
+                LayoutNode::Icon { symbol, resizable, forced, turn }
+            }
+            other => other,
+        },
         LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
@@ -1644,6 +1668,20 @@ pub(crate) fn apply(
             mark,
             VisualProps { border: Some((*color, *width)), ..VisualProps::default() },
         ),
+        Modifier::BorderStyle(style) => wrap_styled(
+            out,
+            mark,
+            VisualProps { border_style: Some(*style), ..VisualProps::default() },
+        ),
+        Modifier::BackgroundStripes(stripes) => wrap_styled(
+            out,
+            mark,
+            VisualProps { stripes: Some(*stripes), ..VisualProps::default() },
+        ),
+        Modifier::QuarterTurn(turn) => out.wrap_layout_from(mark, |node| LayoutNode::Turned {
+            turn: *turn,
+            child: Box::new(node),
+        }),
         Modifier::CornerRadius(radii) => wrap_styled(
             out,
             mark,
@@ -1889,7 +1927,7 @@ pub(crate) fn apply(
             rewrite_pixel_node(
                 node,
                 &|source, _, fit| LayoutNode::Image { source, resizable: true, fit },
-                &|symbol, _, forced| LayoutNode::Icon { symbol, resizable: true, forced },
+                &|symbol, _, forced| LayoutNode::Icon { symbol, resizable: true, forced, turn: 0.0 },
             )
         }),
         Modifier::AspectRatio(mode) => out.wrap_layout_from(mark, |node| {
@@ -1901,7 +1939,7 @@ pub(crate) fn apply(
                     fit: Some(*mode),
                 },
                 // a glyph is a square — it has its one ratio already
-                &|symbol, resizable, forced| LayoutNode::Icon { symbol, resizable, forced },
+                &|symbol, resizable, forced| LayoutNode::Icon { symbol, resizable, forced, turn: 0.0 },
             )
         }),
         Modifier::Animated(spec) => {

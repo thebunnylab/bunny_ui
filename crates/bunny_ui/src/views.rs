@@ -1262,6 +1262,7 @@ pub fn image(source: impl Into<crate::image_engine::ImageSource>) -> Image {
 pub struct Icon {
     symbol: crate::icon::Symbol,
     forced: bool,
+    turn: crate::angle::Angle,
     site: crate::provenance::Site,
 }
 
@@ -1283,6 +1284,24 @@ impl Icon {
         self.forced = true;
         self
     }
+
+    /// The glyph turned about its centre — CSS's `rotate()`, clockwise.
+    ///
+    /// ```ignore
+    /// // the disclosure of a row: right while closed, down while open
+    /// icon(symbol::CHEVRON_RIGHT).rotation(Angle::degrees(if open { 90.0 } else { 0.0 }))
+    /// ```
+    ///
+    /// The house turns the DRAWING before it rasterizes it, so a turned
+    /// glyph is as sharp as an upright one, at any angle. The box does
+    /// not turn: a glyph's square is the same square at every angle, so
+    /// a chevron that opens moves nothing around it. For a loader, read
+    /// the phase of a `.looping(…)` box and paint through
+    /// [`Painter::icon_turned`](crate::custom::Painter::icon_turned).
+    pub fn rotation(mut self, angle: crate::angle::Angle) -> Self {
+        self.turn = angle;
+        self
+    }
 }
 
 impl View for Icon {
@@ -1298,11 +1317,18 @@ impl View for Icon {
 impl Icon {
     /// The node itself, before its site is sealed over it.
     fn render_unsited(&self, _ctx: &Context, out: &mut NodeList) {
-        out.push(RenderNode::leaf(crate::view::print_line(|| format!("Icon ({})", self.symbol.name))));
+        out.push(RenderNode::leaf(crate::view::print_line(|| {
+            if self.turn.is_zero() {
+                format!("Icon ({})", self.symbol.name)
+            } else {
+                format!("Icon ({}, rotation: {}°)", self.symbol.name, self.turn.as_degrees())
+            }
+        })));
         out.push_layout(LayoutNode::Icon {
             symbol: self.symbol,
             resizable: false,
             forced: self.forced,
+            turn: if self.turn.is_zero() { 0.0 } else { self.turn.as_radians() as f32 },
         });
     }
 }
@@ -1850,7 +1876,7 @@ pub fn menu_divider() -> MenuItem {
 
 #[track_caller]
 pub fn icon(symbol: crate::icon::Symbol) -> Icon {
-    Icon { symbol, forced: false, site: crate::provenance::here() }
+    Icon { symbol, forced: false, turn: crate::angle::Angle::ZERO, site: crate::provenance::here() }
 }
 
 // MARK: - Containers
