@@ -972,7 +972,7 @@ impl Walk<'_> {
                 let mut look = DomLook {
                     // a layer that asks for nothing lets the click
                     // reach whatever it covers
-                    pass_through: self.overlay_depth > 0 && interactive.is_none(),
+                    pass_through: props.passive || (self.overlay_depth > 0 && interactive.is_none()),
                     group: self.groups.last().copied(),
                     transition: self.pending_transition.take(),
                     ..DomLook::from_props(props)
@@ -1165,7 +1165,7 @@ impl Walk<'_> {
                 let scroll = placed(out, node(DomKind::Scroll {
                     path: path.clone(),
                     offset: (offset.x, offset.y),
-                    target: target.clone(),
+                    target: target.as_ref().map(|target| target.id.clone()),
                 }));
                 {
                     let layout = scroll.layout.as_mut().expect("flow node");

@@ -3077,7 +3077,7 @@ where
             prints,
         ));
         out.push_layout(LayoutNode::Scroll {
-            target: reveal_id,
+            target: reveal_id.map(|id| crate::layout::ScrollTarget { id, anchor: None }),
             commanded: None,
             axes: crate::layout::ScrollAxes::Vertical,
             fill: false,

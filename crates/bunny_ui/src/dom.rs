@@ -464,7 +464,7 @@ impl DomLook {
             pressed_opacity: props.opacity_pressed,
             group: None,
             glass: props.glass.map(GlassFilter::of),
-            pass_through: false,
+            pass_through: props.passive,
             scrollbar: None,
         }
     }
@@ -486,6 +486,7 @@ impl DomLook {
             || props.shadow.is_some()
             || props.clip
             || props.hidden
+            || props.passive
             || props.opacity.is_some()
             || props.blur.is_some()
             || props.opacity_hovered.is_some()

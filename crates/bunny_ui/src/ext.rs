@@ -410,6 +410,20 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::Hidden)
     }
 
+    /// `.allowsHitTesting(false)` — the view takes no pointer: a press, a
+    /// hover or a drop reaches what is painted beneath it, the CSS
+    /// `pointer-events: none`. Everything it draws still shows, and it
+    /// keeps its place. For a decoration drawn over controls: a canvas
+    /// of plants over the rooms of a floor plan, a glow over a chart.
+    ///
+    /// ```ignore
+    /// zstack!(rooms(), canvas(plants).allows_hit_testing(false))
+    /// ```
+    #[track_caller]
+    fn allows_hit_testing(self, enabled: bool) -> Modified<Self> {
+        Modified::new(self, Modifier::AllowsHitTesting(enabled))
+    }
+
     // MARK: - Visuals (semantic node properties — `Styled` in the scene)
 
     /// `.background(Color.red)` — a solid color as a node property (the
@@ -1074,7 +1088,17 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// stays visible); the wheel stays sovereign in between.
     #[track_caller]
     fn scroll_target(self, id: impl Into<String>) -> Modified<Self> {
-        Modified::new(self, Modifier::ScrollTarget(id.into()))
+        Modified::new(self, Modifier::ScrollTarget(id.into(), None))
+    }
+
+    /// `.scroll_target(id)` held at an anchor when the id changes —
+    /// SwiftUI's `scrollTo(id, anchor:)`. The row's `anchor.y` meets the
+    /// window's: `UnitPoint::CENTER` centres it, the browser's
+    /// `scrollIntoView({block: 'center'})`, as a document outline does when
+    /// it brings a clause to the reader.
+    #[track_caller]
+    fn scroll_target_anchored(self, id: impl Into<String>, anchor: crate::layout::UnitPoint) -> Modified<Self> {
+        Modified::new(self, Modifier::ScrollTarget(id.into(), Some(anchor.y)))
     }
 
     /// The field receives focus on its FIRST appearance — and never
