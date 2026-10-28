@@ -282,6 +282,7 @@ fn clearing_dom_placement_removes_its_inline_geometry() {
         slot_y: None,
         at: None,
         span: None,
+        sticky: None,
     }]);
     let html = page.html();
     assert!(

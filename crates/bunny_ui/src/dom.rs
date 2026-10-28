@@ -859,8 +859,56 @@ impl DomCapture {
         self.close();
     }
 
-    /// A pixel island owns effects that the DOM cannot apply inside its canvas.
-    #[cfg(feature = "canvas")]
+    /// Opens a styled box the BROWSER sticks, standing in its containing
+    /// block: a wrapper that takes no pointer at `block` — from the box's
+    /// slot down to the bottom edge of the block that lays the box out —
+    /// and inside it the box itself, at the top and in the flow, where
+    /// `position: sticky` works.
+    ///
+    /// Everything else here is positioned by its frame, and the browser
+    /// scrolls an exact interior without asking for a layout: a stick
+    /// the engine computed would trail the scroll by a frame and leave
+    /// its slot behind on every momentum fling. The wrapper's bottom is
+    /// where CSS releases the box, which is the engine's own bound, and
+    /// the box takes the pointer back ([`DomSticky::takes_pointer`]) so
+    /// the wrapper's glass below it stays the siblings'.
+    /// [`DomCapture::close_sticky`] closes both.
+    pub(crate) fn open_sticky(&mut self, props: &VisualProps, frame: Rect, block: Rect, sticky: DomSticky) {
+        // what the scope armed is the BOX's — the wrapper only holds it
+        let armed = (self.pending_interactive.take(), self.pending_transition.take(), self.armed_tooltip.take());
+        self.open(DomKind::Box, block, block.origin);
+        (self.pending_interactive, self.pending_transition, self.armed_tooltip) = armed;
+        if self.island == 0
+            && let Some((_, wrapper)) = self.stack.last_mut()
+        {
+            wrapper.style.look_mut().pass_through = true;
+        }
+        self.open_styled(props, frame);
+        if self.island > 0 {
+            return;
+        }
+        if let Some((_, node)) = self.stack.last_mut() {
+            // a flow node: the browser places it, the geometry fields
+            // stay silent and the box patch pins its size
+            node.x = 0.0;
+            node.y = 0.0;
+            node.layout = Some(DomLayout {
+                width: Some(frame.size.width as f32),
+                height: Some(frame.size.height as f32),
+                placement: Some(Rc::new(DomPlacement { sticky: Some(sticky), ..DomPlacement::default() })),
+                ..DomLayout::default()
+            });
+        }
+    }
+
+    /// Closes what [`DomCapture::open_sticky`] opened.
+    pub(crate) fn close_sticky(&mut self) {
+        self.close();
+        self.close();
+    }
+
+    /// A pixel island owns effects that the DOM cannot apply inside its
+    /// canvas — a blur, a stick. Never, on a build without islands.
     pub(crate) fn in_canvas(&self) -> bool {
         self.island > 0
     }
@@ -1158,6 +1206,21 @@ pub struct DomLayout {
     pub direction: Option<motor::state::LayoutDirection>,
 }
 
+/// A box the browser sticks: `position: sticky; top` — the browser holds
+/// it at the line while its scrollport travels, at its own scrolling
+/// speed, where a new layout per scrolled pixel would trail a frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DomSticky {
+    /// The line below the scrollport's top edge, in points.
+    pub top: f32,
+    /// The box takes the pointer back: `pointer-events: auto`. An exact
+    /// interior stands a sticky box in a wrapper as tall as the rest of
+    /// its containing block that takes none, so the box, and only the
+    /// box, answers again — unless a subtree around it declined the
+    /// pointer.
+    pub takes_pointer: bool,
+}
+
 /// A positioned child's physical coordinates and its stack's sizing rule.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DomPosition {
@@ -1191,6 +1254,9 @@ pub struct DomPlacement {
     pub at: Option<DomPosition>,
     /// Column and row spans, reserved for grid lowering in the same ABI.
     pub span: Option<DomSpan>,
+    /// The browser sticks the box (`.sticky(top)`). The element's own,
+    /// like its pinned size: it travels in the box patch, never in a look.
+    pub sticky: Option<DomSticky>,
 }
 
 /// Per-element geometry, kept outside shared appearance rules.
@@ -1210,6 +1276,8 @@ pub struct DomBox {
     pub at: Option<DomPosition>,
     /// Column and row spans. Reserved for grid lowering in the same ABI.
     pub span: Option<DomSpan>,
+    /// The browser sticks the box.
+    pub sticky: Option<DomSticky>,
 }
 
 /// Element hints only the Dom consumes — a real tag, a class, an id.
@@ -1367,6 +1435,8 @@ pub enum DomPatch {
         slot_y: Option<f32>,
         at: Option<DomPosition>,
         span: Option<DomSpan>,
+        /// `position: sticky; top` — the browser holds the box.
+        sticky: Option<DomSticky>,
     },
     /// The element's own marks: its tooltip and the hover group it owns.
     SetMarks { id: u32, tooltip: Option<Arc<str>>, group_owner: Option<u64> },
@@ -2351,6 +2421,7 @@ fn geometry_of(layout: &DomLayout) -> DomBox {
         slot_y: layout.slot_y,
         at: layout.placement.as_ref().and_then(|p| p.at),
         span: layout.placement.as_ref().and_then(|p| p.span),
+        sticky: layout.placement.as_ref().and_then(|p| p.sticky),
     }
 }
 
@@ -2363,6 +2434,7 @@ fn box_patch(id: u32, geometry: DomBox) -> DomPatch {
         slot_y,
         at,
         span,
+        sticky,
     } = geometry;
     DomPatch::SetBox {
         id,
@@ -2373,6 +2445,7 @@ fn box_patch(id: u32, geometry: DomBox) -> DomPatch {
         slot_y,
         at,
         span,
+        sticky,
     }
 }
 
@@ -4143,7 +4216,13 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 ///
 /// 22 (2026-10-19): foreground blur in style bit 25, followed by one f32
 /// logical radius. Every browser decoder must consume the field together.
-pub const ABI_VERSION: u32 = 22;
+///
+/// 23 (2026-10-28): sticky boxes. SetBox (op 23) bit 7 carries an f32 top
+/// and a u8 flag after the spans: the glue writes `position:sticky;top`
+/// after every other position the box names, and the flag (1) adds
+/// `pointer-events:auto` — a box an exact interior stood in a wrapper
+/// that takes no pointer.
+pub const ABI_VERSION: u32 = 23;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -4503,6 +4582,7 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 slot_y,
                 at,
                 span,
+                sticky,
             } => {
                 out.push(23);
                 push_u32(&mut out, *id);
@@ -4518,6 +4598,9 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 }
                 if span.is_some() {
                     mask |= 1 << 6;
+                }
+                if sticky.is_some() {
+                    mask |= 1 << 7;
                 }
                 out.push(mask);
                 for field in fields.into_iter().flatten() {
@@ -4536,6 +4619,10 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                     push_u16(&mut out, span.columns);
                     push_u16(&mut out, span.rows);
                     out.push(u8::from(span.fill_x));
+                }
+                if let Some(sticky) = sticky {
+                    push_f32(&mut out, f64::from(sticky.top));
+                    out.push(u8::from(sticky.takes_pointer));
                 }
             }
             DomPatch::SetMarks { id, tooltip, group_owner } => {
@@ -8318,6 +8405,7 @@ mod tests {
                 rows: 3,
                 fill_x: true,
             }),
+            sticky: None,
         };
         let expected = [
             &1u32.to_le_bytes()[..],
@@ -8350,6 +8438,7 @@ mod tests {
                 fill_y: false,
             }),
             span: None,
+            sticky: None,
         };
         let expected: Vec<u8> = [
             &1u32.to_le_bytes()[..],
@@ -8372,6 +8461,7 @@ mod tests {
                 fill_y: false,
             }),
             span: None,
+            sticky: None,
         }));
         assert_eq!(look_layout(&layout), before);
         assert_ne!(geometry_of(&layout), DomBox::default());
@@ -8383,6 +8473,43 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A sticky box crosses in its box patch, bit 7 after the spans: the
+    /// line as an f32 and the pointer flag. It is the element's own, so
+    /// two boxes that stick at different lines still wear one look.
+    #[test]
+    fn sticky_geometry_is_byte_stable_and_stays_out_of_the_look() {
+        let patch = DomPatch::SetBox {
+            id: 7,
+            width: Some(100.0),
+            height: None,
+            max_width: None,
+            max_height: None,
+            slot_y: None,
+            at: None,
+            span: None,
+            sticky: Some(DomSticky { top: 12.0, takes_pointer: true }),
+        };
+        let expected: Vec<u8> = [
+            &1u32.to_le_bytes()[..],
+            &[23],
+            &7u32.to_le_bytes()[..],
+            &[1 | 1 << 7],
+            &100f32.to_le_bytes()[..],
+            &12f32.to_le_bytes()[..],
+            &[1],
+        ]
+        .concat();
+        assert_eq!(encode(&[patch]), expected);
+        let plain = DomLayout::default();
+        let stick = DomSticky { top: 0.0, takes_pointer: false };
+        let stuck = DomLayout {
+            placement: Some(Rc::new(DomPlacement { sticky: Some(stick), ..DomPlacement::default() })),
+            ..DomLayout::default()
+        };
+        assert_eq!(look_layout(&stuck), look_layout(&plain), "the look never hears of the stick");
+        assert_eq!(geometry_of(&stuck).sticky, Some(stick), "the box patch carries it");
     }
 
     /// The box an element owns, a move and a reveal, pinned byte for
@@ -8399,6 +8526,7 @@ mod tests {
                 slot_y: Some(120.0),
                 at: None,
                 span: None,
+                sticky: None,
             },
             DomPatch::Move { id: 5, parent: 1, before: 9 },
             DomPatch::Reveal { id: 3, target: 44 },

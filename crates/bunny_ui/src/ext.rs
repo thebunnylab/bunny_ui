@@ -213,6 +213,43 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::Position(crate::layout::Point { x, y }))
     }
 
+    /// CSS `position: sticky; top: <top>` — the view keeps its slot until
+    /// its nearest vertical scroll region carries it above the line `top`
+    /// points below the region's top edge, and from there it holds that
+    /// line. Its containing block carries it away again: the box of the
+    /// stack, grid, flow or pile that lays it out among its siblings (the
+    /// region's content when it sits in the region directly), whose
+    /// bottom edge the view never crosses. A detail panel beside a long
+    /// catalogue stays in view this way, and leaves with its row.
+    ///
+    /// Layout is untouched — the slot is measured and kept as it was —
+    /// and everything the view is moves with it: paint, presses, focus,
+    /// the accessible frame. Put it OUTERMOST among the view's modifiers,
+    /// so its containing block is the container itself; a frame, padding
+    /// or overlay between them is the same box as the view, never its
+    /// block.
+    ///
+    /// - **Paint order stays the tree's.** A sibling drawn after the view
+    ///   paints, and takes presses, over it where they overlap. A browser
+    ///   lifts a positioned box over its in-flow siblings; a pinned header
+    ///   over rows here goes after them in a pile —
+    ///   `zstack!(rows, header.sticky(0.0))` with the rows padded down.
+    /// - **Only the top edge sticks**, and only a vertical region holds
+    ///   it: a sideways strip between the view and that region is passed
+    ///   through, where a browser would take the strip as the scrollport.
+    /// - **In a browser the browser sticks it**, at its own scrolling
+    ///   speed, and bounds it by the element's DOM parent. A view a row
+    ///   or a column places with `.position(x, y)` is out of the flow
+    ///   there, where CSS has no stick. A non-finite `top` never sticks.
+    ///
+    /// ```ignore
+    /// hstack!(cards, detail.sticky(0.0)).alignment(VerticalAlignment::Top)
+    /// ```
+    #[track_caller]
+    fn sticky(self, top: f64) -> Modified<Self> {
+        Modified::new(self, Modifier::Sticky(top))
+    }
+
     /// `.frame(width: 120, height: 80)` — the box is exact and the
     /// content CENTRES in it, as SwiftUI's does.
     #[track_caller]
