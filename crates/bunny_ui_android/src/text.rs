@@ -160,13 +160,16 @@ impl AndroidTextEngine {
     /// refused (the caller keeps whatever it had).
     fn typeface(&self, env: Env, spec: &FontSpec) -> Option<JObject> {
         let typeface_class = env.class(c"android/graphics/Typeface")?;
-        let bold = !matches!(spec.weight, Weight::Regular | Weight::Medium);
+        let bold = spec.weight.number() >= 600;
         let italic = spec.slant == Slant::Italic;
         // Typeface.NORMAL 0, BOLD 1, ITALIC 2, BOLD_ITALIC 3
         let style = (bold as i32) | ((italic as i32) << 1);
         // the weight the spec asks for, in the platform's own scale
         let weight = match spec.weight {
-            Weight::Regular => 400u16,
+            Weight::Thin => 100u16,
+            Weight::ExtraLight => 200,
+            Weight::Light => 300,
+            Weight::Regular => 400,
             Weight::Medium => 500,
             Weight::Semibold => 600,
             Weight::Bold => 700,

@@ -230,8 +230,8 @@ pub mod prelude {
     // its own (`custom(…)` / `canvas(…)`)
     pub use crate::layout::{
         AlertSpec, Color, CrossAlign, DialogChrome, DialogSpec, Edges, Fraction, Glass, Gradient,
-        OverlaySurface, Point, Proposal, Px, Rect, Rendering, Side, Size, Truncation, UnitPoint,
-        VisualProps,
+        OverlaySurface, Point, Proposal, Px, Rect, Rendering, ScrollIndicators, Side, Size,
+        Truncation, UnitPoint, VisualProps,
     };
     pub use crate::theme::{self, Theme};
     // `Device` stays qualified (`preview::Device`): a shell's own `Device` meets the prelude in its tests
@@ -2308,9 +2308,13 @@ mod tests {
     #[test]
     fn the_weight_scale_travels_as_a_number() {
         use crate::text_engine::Weight;
-        // the six the vocabulary can now spell, and the code each one
-        // travels as — the glue's table is indexed by exactly this
+        // the nine the vocabulary can now spell, and the code each one
+        // travels as — the glue's table is indexed by exactly this. The
+        // light end joined after the first six, so it follows them
         let scale = [
+            Weight::Thin,
+            Weight::ExtraLight,
+            Weight::Light,
             Weight::Regular,
             Weight::Medium,
             Weight::Semibold,
@@ -2337,11 +2341,11 @@ mod tests {
             bytes[4 + 1 + 8 + 1 + 1 + 4 + 2 + 1 + 4 + 1 + 4]
         };
         let codes: Vec<u8> = scale.iter().map(|weight| code_of(*weight)).collect();
-        assert_eq!(codes, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(codes, vec![6, 7, 8, 0, 1, 2, 3, 4, 5]);
         // the glue mirrors them by hand: one CSS number per code
         let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
         assert!(
-            glue.contains("const CSS_WEIGHTS = [400, 500, 600, 700, 800, 900];"),
+            glue.contains("const CSS_WEIGHTS = [400, 500, 600, 700, 800, 900, 100, 200, 300];"),
             "the glue's weight table drifted from the engine's scale"
         );
         // and the modifier carries the name through to the printed tree
@@ -14206,6 +14210,7 @@ mod tests {
             width: Some(20.0),
             height: Some(40.0),
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             child: Box::new(LayoutNode::Image {
                 source: Some(source),
                 resizable: true,

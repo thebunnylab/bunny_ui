@@ -21,7 +21,7 @@ use motor::state::{Binding, Context, EffectFn, EnvironmentValues};
 use motor::view::RenderNode;
 
 use crate::erased::CustomModifier;
-use crate::layout::{Color, CrossAlign, Edges, LayoutNode, TextHighlight, Truncation, VisualProps};
+use crate::layout::{Color, CrossAlign, Edges, LayoutNode, TextMarks, Truncation, VisualProps};
 use crate::text_engine::{FontDesign, FontPatch, FontSpec, Tracking, Weight};
 use crate::state_ext::BindingExt;
 use crate::view::{NodeList, Single, View, wrap_in_place};
@@ -117,7 +117,10 @@ pub enum Modifier {
     BackgroundPressed(Color),
     ForegroundHovered(Color),
     ForegroundPressed(Color),
-    Highlight(Rc<Vec<(usize, usize)>>, Color),
+    /// Inks over stretches of the text, each its own colour.
+    Highlight(Rc<Vec<crate::layout::InkSpan>>),
+    /// The rules a text draws under or through its words.
+    TextDecoration(crate::layout::Decoration),
     TruncationMode(Truncation),
     /// The scroll region follows this item id when it changes.
     ScrollTarget(String),
@@ -319,6 +322,7 @@ impl Modifier {
             Modifier::ForegroundHovered { .. } => "foreground_hovered",
             Modifier::ForegroundPressed { .. } => "foreground_pressed",
             Modifier::Highlight { .. } => "highlight",
+            Modifier::TextDecoration { .. } => "text_decoration",
             Modifier::TruncationMode { .. } => "truncation_mode",
             Modifier::ScrollTarget { .. } => "scroll_target",
             Modifier::OnMeasure { .. } => "on_measure",
@@ -468,8 +472,23 @@ impl Modifier {
             Modifier::ForegroundHovered(color) => format!(" [.foregroundHovered({color})]"),
             Modifier::ForegroundPressed(color) => format!(" [.foregroundPressed({color})]"),
             Modifier::BackgroundPressed(color) => format!(" [.backgroundPressed({color})]"),
-            Modifier::Highlight(ranges, color) => {
-                format!(" [.highlight({} ranges, {color})]", ranges.len())
+            Modifier::Highlight(spans) => match spans.first() {
+                Some(first) if spans.iter().all(|span| span.color == first.color) => {
+                    format!(" [.highlight({} ranges, {})]", spans.len(), first.color)
+                }
+                _ => format!(" [.highlight({} ranges)]", spans.len()),
+            },
+            Modifier::TextDecoration(decoration) => {
+                let rule = |name: &str, ink: Option<crate::layout::RuleInk>| match ink {
+                    None => String::new(),
+                    Some(crate::layout::RuleInk::Text) => format!(" [.{name}()]"),
+                    Some(crate::layout::RuleInk::Color(color)) => format!(" [.{name}({color})]"),
+                };
+                format!(
+                    "{}{}",
+                    rule("underline", decoration.underline),
+                    rule("strikethrough", decoration.strikethrough)
+                )
             }
             Modifier::TruncationMode(mode) => format!(" [.truncationMode(.{mode:?})]"),
             Modifier::ScrollTarget(id) => format!(" [.scrollTarget({id:?})]"),
@@ -560,6 +579,7 @@ fn rewrite_scroll_node(
         Option<String>,
         crate::layout::ScrollAxes,
         bool,
+        crate::layout::ScrollIndicators,
         Option<crate::layout::Point>,
         Box<LayoutNode>,
     ) -> LayoutNode,
@@ -584,8 +604,8 @@ fn rewrite_scroll_node(
         // a node that wears hints or an action stood behind their
         // wrapper, which no rewrite crosses: it is left as it was left
         marked if !marked.is_bare() => marked,
-        LayoutNode::Scroll { path, axes, fill, commanded, child, .. } => {
-            rewrite(path, axes, fill, commanded, child)
+        LayoutNode::Scroll { path, axes, fill, indicators, commanded, child, .. } => {
+            rewrite(path, axes, fill, indicators, commanded, child)
         }
         LayoutNode::Styled { props, child, hints, action } => LayoutNode::Styled {
             props,
@@ -618,22 +638,25 @@ fn rewrite_scroll_node(
             edges,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
-        LayoutNode::Frame { width, height, align, child } => LayoutNode::Frame {
+        LayoutNode::Frame { width, height, align, vertical, child } => LayoutNode::Frame {
             width,
             height,
             align,
+            vertical,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
-        LayoutNode::MaxFrame { max_width, max_height, align, child } => LayoutNode::MaxFrame {
+        LayoutNode::MaxFrame { max_width, max_height, align, vertical, child } => LayoutNode::MaxFrame {
             max_width,
             max_height,
             align,
+            vertical,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
-        LayoutNode::FlexFrame { min_width, min_height, align, child } => LayoutNode::FlexFrame {
+        LayoutNode::FlexFrame { min_width, min_height, align, vertical, child } => LayoutNode::FlexFrame {
             min_width,
             min_height,
             align,
+            vertical,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
         other => other,
@@ -652,7 +675,8 @@ struct FieldParts {
     multiline: bool,
     auto_focus: crate::layout::AutoFocus,
     bare: bool,
-    highlights: Option<TextHighlight>,
+    inset: Option<Rc<crate::layout::Edges>>,
+    highlights: Option<Rc<TextMarks>>,
     secret: bool,
 }
 
@@ -665,6 +689,7 @@ impl FieldParts {
             multiline: self.multiline,
             auto_focus: self.auto_focus,
             bare: self.bare,
+            inset: self.inset,
             highlights: self.highlights,
             secret: self.secret,
         }
@@ -702,6 +727,7 @@ fn rewrite_field_node(
             multiline,
             auto_focus,
             bare,
+            inset,
             highlights,
             secret,
         } => rewrite(FieldParts {
@@ -711,6 +737,7 @@ fn rewrite_field_node(
             multiline,
             auto_focus,
             bare,
+            inset,
             highlights,
             secret,
         }),
@@ -745,22 +772,25 @@ fn rewrite_field_node(
             edges,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
-        LayoutNode::Frame { width, height, align, child } => LayoutNode::Frame {
+        LayoutNode::Frame { width, height, align, vertical, child } => LayoutNode::Frame {
             width,
             height,
             align,
+            vertical,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
-        LayoutNode::MaxFrame { max_width, max_height, align, child } => LayoutNode::MaxFrame {
+        LayoutNode::MaxFrame { max_width, max_height, align, vertical, child } => LayoutNode::MaxFrame {
             max_width,
             max_height,
             align,
+            vertical,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
-        LayoutNode::FlexFrame { min_width, min_height, align, child } => LayoutNode::FlexFrame {
+        LayoutNode::FlexFrame { min_width, min_height, align, vertical, child } => LayoutNode::FlexFrame {
             min_width,
             min_height,
             align,
+            vertical,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
         other => other,
@@ -857,22 +887,25 @@ fn rewrite_pixel_node(
             edges,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
-        LayoutNode::Frame { width, height, align, child } => LayoutNode::Frame {
+        LayoutNode::Frame { width, height, align, vertical, child } => LayoutNode::Frame {
             width,
             height,
             align,
+            vertical,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
-        LayoutNode::MaxFrame { max_width, max_height, align, child } => LayoutNode::MaxFrame {
+        LayoutNode::MaxFrame { max_width, max_height, align, vertical, child } => LayoutNode::MaxFrame {
             max_width,
             max_height,
             align,
+            vertical,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
-        LayoutNode::FlexFrame { min_width, min_height, align, child } => LayoutNode::FlexFrame {
+        LayoutNode::FlexFrame { min_width, min_height, align, vertical, child } => LayoutNode::FlexFrame {
             min_width,
             min_height,
             align,
+            vertical,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
         other => other,
@@ -883,7 +916,7 @@ fn rewrite_text_node(
     node: LayoutNode,
     rewrite: &impl Fn(
         crate::bind::TextSource,
-        Option<TextHighlight>,
+        Option<Rc<TextMarks>>,
         Option<Truncation>,
     ) -> LayoutNode,
 ) -> LayoutNode {
@@ -1355,6 +1388,7 @@ pub(crate) fn apply(
                 }),
                 None => out.wrap_layout_from(mark, |base| LayoutNode::Layered {
                     align: CrossAlign::Center,
+                    vertical: CrossAlign::Center,
                     modal: true,
                     children: vec![base, wrap_layout(sheet_layouts.clone())],
                 }),
@@ -1405,6 +1439,7 @@ pub(crate) fn apply(
                 }),
                 None => out.wrap_layout_from(mark, |base| LayoutNode::Layered {
                     align: CrossAlign::Center,
+                    vertical: CrossAlign::Center,
                     modal: true,
                     children: vec![base, wrap_layout(dialog_layouts.clone())],
                 }),
@@ -1472,6 +1507,7 @@ pub(crate) fn apply(
                 }),
                 None => out.wrap_layout_from(mark, |base| LayoutNode::Layered {
                     align: CrossAlign::Center,
+                    vertical: CrossAlign::Center,
                     modal: true,
                     children: vec![base, wrap_layout(alert_layouts.clone())],
                 }),
@@ -1561,20 +1597,24 @@ pub(crate) fn apply(
         Modifier::FrameWH(width, height, alignment) => {
             let (width, height) = (Some(*width), Some(*height));
             let align = crate::views::cross_align(*alignment);
+            let vertical = crate::views::vertical_align(*alignment);
             out.wrap_layout_from(mark, |node| LayoutNode::Frame {
                 width,
                 height,
                 align,
+                vertical,
                 child: Box::new(node),
             });
         }
         Modifier::FrameWidth(width, alignment) => {
             let width = Some(*width);
             let align = crate::views::cross_align(*alignment);
+            let vertical = crate::views::vertical_align(*alignment);
             out.wrap_layout_from(mark, |node| LayoutNode::Frame {
                 width,
                 height: None,
                 align,
+                vertical,
                 child: Box::new(node),
             });
         }
@@ -1586,26 +1626,31 @@ pub(crate) fn apply(
                 // the width is the child's own answer, so there is no room
                 // to place it in: the horizontal edge has nothing to say
                 align: crate::layout::CrossAlign::Center,
+                vertical: crate::layout::CrossAlign::Center,
                 child: Box::new(node),
             });
         }
         Modifier::FrameMax(max_width, max_height, alignment) => {
             let (max_width, max_height) = (*max_width, *max_height);
             let align = crate::views::cross_align(*alignment);
+            let vertical = crate::views::vertical_align(*alignment);
             out.wrap_layout_from(mark, |node| LayoutNode::MaxFrame {
                 max_width,
                 max_height,
                 align,
+                vertical,
                 child: Box::new(node),
             });
         }
         Modifier::FrameFlex(min_width, min_height, alignment) => {
             let (min_width, min_height) = (*min_width, *min_height);
             let align = crate::views::cross_align(*alignment);
+            let vertical = crate::views::vertical_align(*alignment);
             out.wrap_layout_from(mark, |node| LayoutNode::FlexFrame {
                 min_width,
                 min_height,
                 align,
+                vertical,
                 child: Box::new(node),
             });
         }
@@ -1875,17 +1920,39 @@ pub(crate) fn apply(
         // (SwiftUI parity: truncationMode outside text does nothing)
         // both leaves that draw text answer to it: the record is the
         // same, and so is the splitter that reads it
-        Modifier::Highlight(ranges, color) => out.wrap_layout_from(mark, |node| {
-            let highlight = TextHighlight { ranges: ranges.clone(), color: *color };
-            let node = rewrite_text_node(node, &|content, _, truncation| LayoutNode::Text {
+        // a highlight replaces the INKS and keeps the rest: a rich
+        // paragraph keeps its runs under a finder's match
+        Modifier::Highlight(spans) => out.wrap_layout_from(mark, |node| {
+            let inked = |marks: Option<Rc<TextMarks>>| {
+                let inks = TextMarks::of_inks(spans.iter().copied()).inks;
+                Some(Rc::new(TextMarks { inks, ..marks.as_deref().cloned().unwrap_or_default() }))
+            };
+            let node = rewrite_text_node(node, &|content, highlights, truncation| LayoutNode::Text {
                 content,
-                highlights: Some(highlight.clone()),
+                highlights: inked(highlights),
                 truncation,
                 hints: Default::default(),
                 action: None,
             });
             rewrite_field_node(node, &|parts| {
-                FieldParts { highlights: Some(highlight.clone()), ..parts }.into_node()
+                let highlights = inked(parts.highlights.clone());
+                FieldParts { highlights, ..parts }.into_node()
+            })
+        }),
+        // the rule the closest modifier names wins, rule by rule: a
+        // `.underline()` written on the text stands over one written
+        // around it
+        Modifier::TextDecoration(decoration) => out.wrap_layout_from(mark, |node| {
+            rewrite_text_node(node, &|content, highlights, truncation| {
+                let marks = highlights.as_deref().cloned().unwrap_or_default();
+                let decoration = marks.decoration.or(*decoration);
+                LayoutNode::Text {
+                    content,
+                    highlights: Some(Rc::new(TextMarks { decoration, ..marks })),
+                    truncation,
+                    hints: Default::default(),
+                    action: None,
+                }
             })
         }),
         Modifier::TruncationMode(mode) => out.wrap_layout_from(mark, |node| {
@@ -1912,13 +1979,14 @@ pub(crate) fn apply(
             });
         }
         Modifier::ScrollTarget(id) => out.wrap_layout_from(mark, |node| {
-            rewrite_scroll_node(node, &|path, axes, fill, commanded, child| {
+            rewrite_scroll_node(node, &|path, axes, fill, indicators, commanded, child| {
                 LayoutNode::Scroll {
                     path,
                     target: Some(id.clone()),
                     axes,
                     commanded,
                     fill,
+                    indicators,
                     child,
                 }
             })

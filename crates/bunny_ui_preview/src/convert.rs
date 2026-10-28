@@ -254,6 +254,9 @@ impl From<wire::Glass> for layout::GlassPaint {
 impl From<Weight> for wire::Weight {
     fn from(w: Weight) -> Self {
         match w {
+            Weight::Thin => wire::Weight::Thin,
+            Weight::ExtraLight => wire::Weight::ExtraLight,
+            Weight::Light => wire::Weight::Light,
             Weight::Regular => wire::Weight::Regular,
             Weight::Medium => wire::Weight::Medium,
             Weight::Semibold => wire::Weight::Semibold,
@@ -267,6 +270,9 @@ impl From<Weight> for wire::Weight {
 impl From<wire::Weight> for Weight {
     fn from(w: wire::Weight) -> Self {
         match w {
+            wire::Weight::Thin => Weight::Thin,
+            wire::Weight::ExtraLight => Weight::ExtraLight,
+            wire::Weight::Light => Weight::Light,
             wire::Weight::Regular => Weight::Regular,
             wire::Weight::Medium => Weight::Medium,
             wire::Weight::Semibold => Weight::Semibold,
@@ -1120,5 +1126,11 @@ fn alignment_from_wire(alignment: wire::Alignment) -> Alignment {
         wire::Alignment::Leading => Alignment::Leading,
         wire::Alignment::Center => Alignment::Center,
         wire::Alignment::Trailing => Alignment::Trailing,
+        wire::Alignment::TopLeading => Alignment::TopLeading,
+        wire::Alignment::Top => Alignment::Top,
+        wire::Alignment::TopTrailing => Alignment::TopTrailing,
+        wire::Alignment::BottomLeading => Alignment::BottomLeading,
+        wire::Alignment::Bottom => Alignment::Bottom,
+        wire::Alignment::BottomTrailing => Alignment::BottomTrailing,
     }
 }

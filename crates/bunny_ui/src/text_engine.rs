@@ -22,6 +22,13 @@ use motor::hash::FxHashMap as HashMap;
 
 use crate::layout::{Color, Px};
 
+/// A weight by name, on the scale CSS numbers 100 to 900
+/// ([`Weight::number`]).
+///
+/// The light end was named after the rest, and is declared after it on
+/// purpose: a weight hashes by its place in this list, and the rules a
+/// served page names, the caches and the goldens all hash a face. Read
+/// the scale by [`Weight::number`], never by the order here.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Weight {
     Regular,
@@ -33,6 +40,34 @@ pub enum Weight {
     ExtraBold,
     /// 900 — the heaviest a face usually offers.
     Black,
+    /// 100 — the hairline of a display face.
+    Thin,
+    /// 200.
+    ExtraLight,
+    /// 300 — the light figure a design sets large: a step number, a
+    /// hero's lead. Below Regular the scale had no word, and a face
+    /// asked for `font-weight: 300` came out at 400.
+    Light,
+}
+
+impl Weight {
+    /// The weight on the 100–900 scale CSS, DirectWrite, Android and
+    /// fontconfig's tables are written in — what makes "is this bold?"
+    /// a comparison instead of a list of names that the next weight
+    /// forgets to join.
+    pub const fn number(self) -> u16 {
+        match self {
+            Weight::Thin => 100,
+            Weight::ExtraLight => 200,
+            Weight::Light => 300,
+            Weight::Regular => 400,
+            Weight::Medium => 500,
+            Weight::Semibold => 600,
+            Weight::Bold => 700,
+            Weight::ExtraBold => 800,
+            Weight::Black => 900,
+        }
+    }
 }
 
 /// Upright, or leaning. The preview tab of an editor writes its label
@@ -328,6 +363,15 @@ pub trait TextEngine {
         Vec::new()
     }
 
+    /// How thick the face draws its rules — the underline and the
+    /// strikethrough — in logical points, from the face's own tables.
+    /// `None` lets the layout take a tenth of the size (at least a
+    /// point), which is what a browser does for a face that says
+    /// nothing.
+    fn decoration_thickness(&self, _font: &FontSpec) -> Option<Px> {
+        None
+    }
+
     /// `None` = nothing to paint (empty string, zero width). `scale` is
     /// the retina factor — the raster comes out in physical pixels.
     fn raster_line(
@@ -588,6 +632,46 @@ pub fn break_lines(
     engine: &dyn TextEngine,
     cache: &MeasureCache,
 ) -> Vec<(usize, usize)> {
+    break_lines_by(text, max_width, &OneFace { text, font, engine, cache })
+}
+
+/// What the breaker asks of a paragraph: how wide a stretch of it is.
+///
+/// One face answers by measuring the slice ([`OneFace`]); a paragraph
+/// of styled runs answers by adding up its runs, each in its own face —
+/// and both are broken by the SAME greedy walk, so a rich paragraph
+/// wraps where a plain one with the same widths would.
+pub trait LineMeasure {
+    /// The width of `text[start..end]`, as it would be drawn on a line.
+    fn width(&self, start: usize, end: usize) -> Px;
+
+    /// Is `text[start..end]` one line at `max_width`? A measure may
+    /// answer from a cheaper bound than [`LineMeasure::width`].
+    fn fits(&self, start: usize, end: usize, max_width: Px) -> bool {
+        self.width(start, end) <= max_width
+    }
+}
+
+/// One face over the whole text — the breaker's ordinary case.
+pub struct OneFace<'a> {
+    pub text: &'a str,
+    pub font: &'a FontSpec,
+    pub engine: &'a dyn TextEngine,
+    pub cache: &'a MeasureCache,
+}
+
+impl LineMeasure for OneFace<'_> {
+    fn width(&self, start: usize, end: usize) -> Px {
+        self.cache.get_or_measure(&self.text[start..end], self.font, self.engine).width
+    }
+
+    fn fits(&self, start: usize, end: usize, max_width: Px) -> bool {
+        paragraph_fits(&self.text[start..end], self.font, max_width, self.engine, self.cache)
+    }
+}
+
+/// [`break_lines`] with the widths a [`LineMeasure`] answers.
+pub fn break_lines_by(text: &str, max_width: Px, measure: &impl LineMeasure) -> Vec<(usize, usize)> {
     let mut lines = Vec::new();
     let mut paragraph = 0usize;
     loop {
@@ -598,7 +682,7 @@ pub fn break_lines(
             .find('\n')
             .map(|offset| paragraph + offset)
             .unwrap_or(text.len());
-        wrap_paragraph(text, paragraph, stop, font, max_width, engine, cache, &mut lines);
+        wrap_paragraph(text, paragraph, stop, max_width, measure, &mut lines);
         if stop == text.len() {
             return lines;
         }
@@ -609,22 +693,19 @@ pub fn break_lines(
 /// One paragraph's soft breaks, pushed in order. Always pushes at
 /// least one line — an empty paragraph is an empty visual line, which
 /// is where a caret goes after a lone break.
-#[allow(clippy::too_many_arguments)]
 fn wrap_paragraph(
     text: &str,
     start: usize,
     stop: usize,
-    font: &FontSpec,
     max_width: Px,
-    engine: &dyn TextEngine,
-    cache: &MeasureCache,
+    measure: &impl LineMeasure,
     lines: &mut Vec<(usize, usize)>,
 ) {
     // a paragraph that fits is one line, whatever its words: a short
     // printable-ASCII one is decided by a bound (no shaping at all), any
     // other by ONE measure of the whole — the word walk below measures a
     // growing prefix per word, which a page of short lines never needs
-    if paragraph_fits(&text[start..stop], font, max_width, engine, cache) {
+    if measure.fits(start, stop, max_width) {
         lines.push((start, stop));
         return;
     }
@@ -645,9 +726,7 @@ fn wrap_paragraph(
         }
 
         if !is_space {
-            let width = cache
-                .get_or_measure(&text[line_start..byte(token_end)], font, engine)
-                .width;
+            let width = measure.width(line_start, byte(token_end));
             if width > max_width && byte(cursor) > line_start {
                 // The spaces already walked hang at the previous line's end.
                 lines.push((line_start, byte(cursor)));
@@ -659,11 +738,7 @@ fn wrap_paragraph(
                 // narrower scalar prefix would corrupt the visible character.
                 let mut end = cursor + 1;
                 for candidate in cursor + 2..=token_end {
-                    if cache
-                        .get_or_measure(&text[line_start..byte(candidate)], font, engine)
-                        .width
-                        > max_width
-                    {
+                    if measure.width(line_start, byte(candidate)) > max_width {
                         break;
                     }
                     end = candidate;
@@ -772,7 +847,8 @@ fn rewrap(
     let mut paragraph = start;
     loop {
         let stop = new[paragraph..end_new].find('\n').map_or(end_new, |at| paragraph + at);
-        wrap_paragraph(new, paragraph, stop, font, max_width, engine, cache, &mut lines);
+        let measure = OneFace { text: new, font, engine, cache };
+        wrap_paragraph(new, paragraph, stop, max_width, &measure, &mut lines);
         if stop == end_new {
             break;
         }

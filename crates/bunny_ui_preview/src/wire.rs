@@ -20,7 +20,12 @@
 //! is a new kind, never a new meaning for an old one. The kinds that
 //! joined after it froze — `Touch`, `Magnify` and `Place`, tool → host — are
 //! skipped by a host that predates them, by their length; and `Glyph`, host
-//! → tool, by a tool that predates it.
+//! → tool, by a tool that predates it. The light weights (`Thin`,
+//! `ExtraLight`, `Light`, tags 6–8) are the one value set that grew: no
+//! old tag changed meaning and every stream without them is the bytes it
+//! was, but a tool that predates them reads a frame that draws one as
+//! malformed, naming the tag ([`Malformed::BadTag`]) — a host should not
+//! send a light face to a tool older than the weights.
 
 use std::fmt;
 
@@ -211,6 +216,9 @@ pub enum Weight {
     Bold,
     ExtraBold,
     Black,
+    Thin,
+    ExtraLight,
+    Light,
 }
 
 /// A font design.
@@ -633,6 +641,12 @@ pub enum Alignment {
     Leading,
     Center,
     Trailing,
+    TopLeading,
+    Top,
+    TopTrailing,
+    BottomLeading,
+    Bottom,
+    BottomTrailing,
 }
 
 /// A data-only modifier — what an override may put on a node.
@@ -1083,7 +1097,19 @@ macro_rules! tagged_enum {
     };
 }
 
-tagged_enum!(Weight { Regular = 0, Medium = 1, Semibold = 2, Bold = 3, ExtraBold = 4, Black = 5 });
+// the light end joined after the freeze: tags 6–8 follow the six the
+// wire was born with, and no tag moved
+tagged_enum!(Weight {
+    Regular = 0,
+    Medium = 1,
+    Semibold = 2,
+    Bold = 3,
+    ExtraBold = 4,
+    Black = 5,
+    Thin = 6,
+    ExtraLight = 7,
+    Light = 8,
+});
 tagged_enum!(Design { Default = 0, Mono = 1 });
 tagged_enum!(Slant { Upright = 0, Italic = 1 });
 tagged_enum!(Scheme { Light = 0, Dark = 1, Both = 2 });
@@ -1094,7 +1120,17 @@ tagged_enum!(PointerKind { Move = 0, Down = 1, Up = 2, Leave = 3 });
 tagged_enum!(TouchPhase { Began = 0, Moved = 1, Ended = 2, Cancelled = 3 });
 tagged_enum!(OverrideOp { Replace = 0, Append = 1, Hide = 2 });
 tagged_enum!(Edge { Top = 0, Bottom = 1, Leading = 2, Trailing = 3 });
-tagged_enum!(Alignment { Leading = 0, Center = 1, Trailing = 2 });
+tagged_enum!(Alignment {
+    Leading = 0,
+    Center = 1,
+    Trailing = 2,
+    TopLeading = 3,
+    Top = 4,
+    TopTrailing = 5,
+    BottomLeading = 6,
+    Bottom = 7,
+    BottomTrailing = 8,
+});
 
 impl Wire for Point {
     fn put(&self, out: &mut Vec<u8>) {
@@ -2338,6 +2374,36 @@ mod tests {
         let mut big = Reader::new();
         big.feed(&[0xff, 0xff, 0xff, 0xff, 1]);
         assert!(matches!(big.pull(), Err(Malformed::Oversized { .. })));
+    }
+
+    #[test]
+    fn the_light_weights_follow_the_six_the_wire_was_born_with() {
+        let tag = |weight: Weight| {
+            let mut out = Vec::new();
+            weight.put(&mut out);
+            out
+        };
+        // the six keep their bytes; the light end takes the next three
+        let scale = [
+            (Weight::Regular, 0),
+            (Weight::Medium, 1),
+            (Weight::Semibold, 2),
+            (Weight::Bold, 3),
+            (Weight::ExtraBold, 4),
+            (Weight::Black, 5),
+            (Weight::Thin, 6),
+            (Weight::ExtraLight, 7),
+            (Weight::Light, 8),
+        ];
+        for (weight, byte) in scale {
+            assert_eq!(tag(weight), [byte], "{weight:?}");
+            let bytes = [byte];
+            let mut cursor = Cursor { bytes: &bytes, at: 0, kind: kind::FRAME };
+            assert_eq!(Weight::get(&mut cursor), Ok(weight));
+        }
+        let unknown = [9];
+        let mut cursor = Cursor { bytes: &unknown, at: 0, kind: kind::FRAME };
+        assert_eq!(Weight::get(&mut cursor), Err(Malformed::BadTag { what: "Weight", tag: 9 }));
     }
 
     #[test]

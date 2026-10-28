@@ -1484,6 +1484,7 @@ mod tests {
                     width: None,
                     height: Some(30.0),
                     align: CrossAlign::Center,
+                    vertical: CrossAlign::Center,
                     child: Box::new(LayoutNode::Spacer),
                 },
                 node(bar),
@@ -1538,12 +1539,14 @@ mod tests {
             commanded: None,
             axes: crate::layout::ScrollAxes::Vertical,
             fill: false,
+            indicators: crate::layout::ScrollIndicators::Visible,
             path: None,
             target: None,
             child: Box::new(LayoutNode::Frame {
                 width: None,
                 height: Some(400.0),
                 align: CrossAlign::Center,
+                vertical: CrossAlign::Center,
                 child: Box::new(node(bar)),
             }),
         };
