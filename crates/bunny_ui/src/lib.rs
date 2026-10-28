@@ -226,8 +226,8 @@ pub mod prelude {
     // its own (`custom(…)` / `canvas(…)`)
     pub use crate::layout::{
         AlertSpec, Color, CrossAlign, DialogChrome, DialogSpec, Edges, Fraction, Glass, Gradient,
-        OverlaySurface, Point, Proposal, Px, Rect, Rendering, Side, Size, Truncation, UnitPoint,
-        VisualProps,
+        OverlaySurface, Point, Proposal, Px, Rect, Rendering, ScrollIndicators, Side, Size,
+        Truncation, UnitPoint, VisualProps,
     };
     pub use crate::theme::{self, Theme};
     // `Device` stays qualified (`preview::Device`): a shell's own `Device` meets the prelude in its tests
@@ -14206,6 +14206,7 @@ mod tests {
             width: Some(20.0),
             height: Some(40.0),
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             child: Box::new(LayoutNode::Image {
                 source: Some(source),
                 resizable: true,

@@ -3425,6 +3425,19 @@ impl Runtime {
         };
         let (held_x, held_y) = (keep(held_x, region_x), keep(held_y, region_y));
         if held_x.is_some() || held_y.is_some() {
+            // the regions the gesture moves are frame state: an overlay
+            // thumb shows while its region is named here. Written only
+            // when the set changes, so a gesture in flight allocates
+            // nothing past its first step
+            let moving = [held_x.as_deref(), held_y.as_deref()];
+            let mut interaction = self.interaction.borrow_mut();
+            let same = interaction.scrolling.len() == moving.iter().flatten().count()
+                && moving.iter().flatten().all(|path| interaction.scrolling.iter().any(|held| held == path));
+            if !same {
+                interaction.scrolling = moving.iter().flatten().map(|path| (*path).to_owned()).collect();
+                interaction.scrolling.dedup();
+            }
+            drop(interaction);
             *self.wheel_latch.borrow_mut() =
                 Some(WheelLatch { anchor, x: held_x, y: held_y, offered, aged: false });
         }
@@ -3467,13 +3480,30 @@ impl Runtime {
 
     /// The slow clock, aging the wheel's latch: the SECOND tick with no
     /// wheel between releases it, and the next wheel asks again what is
-    /// under the pointer. The tooltip's own idiom. Nothing on screen
-    /// changes, so there is no answer.
-    pub fn wheel_tick(&self) {
+    /// under the pointer. The tooltip's own idiom.
+    ///
+    /// The release ends the gesture, and an overlay thumb
+    /// ([`crate::layout::ScrollIndicators::Hidden`]) that showed for it
+    /// goes with it: `true` = a region the gesture moved shows its thumb
+    /// only mid-gesture, and the shell owes the scene a frame. Every
+    /// other release changes nothing on screen.
+    pub fn wheel_tick(&self) -> bool {
         let mut latch = self.wheel_latch.borrow_mut();
         match latch.as_mut() {
-            Some(held) if !held.aged => held.aged = true,
-            _ => *latch = None,
+            Some(held) if !held.aged => {
+                held.aged = true;
+                false
+            }
+            _ => {
+                *latch = None;
+                drop(latch);
+                let moving = std::mem::take(&mut self.interaction.borrow_mut().scrolling);
+                !moving.is_empty()
+                    && self.last_scrolls.borrow().iter().any(|region| {
+                        region.indicators == crate::layout::ScrollIndicators::Hidden
+                            && moving.contains(&region.path)
+                    })
+            }
         }
     }
 

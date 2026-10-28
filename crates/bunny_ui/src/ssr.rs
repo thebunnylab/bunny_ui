@@ -929,7 +929,7 @@ fn rule_text(
         base.insert("align-items", "center".into());
         base.insert("align-content", "start".into());
     }
-    if let Some(align) = layout.align {
+    if let Some(align) = layout.align.map(|align| align & 15) {
         base.insert(
             if matches!(kind, CreateKind::Grid) {
                 "justify-items"
@@ -951,6 +951,20 @@ fn rule_text(
         && let Some(align) = base.get("align-items").cloned()
     {
         base.insert("justify-items", align);
+    }
+    // a named vertical edge: a frame's column places its child along its
+    // main axis, a layer pile and a grid hold every cell's child on the
+    // block axis
+    if let Some(edge) = layout.align.map(|align| align >> 4).filter(|edge| *edge > 0) {
+        let edge = match edge {
+            2 => "center",
+            3 => "flex-end",
+            _ => "flex-start",
+        };
+        match kind {
+            CreateKind::Layers | CreateKind::Grid => base.insert("align-items", edge.into()),
+            _ => base.insert("justify-content", edge.into()),
+        };
     }
     // the record's sides are logical, and so are the properties: a
     // right-to-left mount puts the leading inset on the right by itself
@@ -1065,6 +1079,16 @@ fn rule_text(
     }
     if style.clip {
         base.insert("overflow", "hidden".into());
+    }
+    if let Some(indicators) = style.scrollbar {
+        base.insert(
+            "scrollbar-width",
+            match indicators {
+                crate::layout::ScrollIndicators::Never => "none",
+                crate::layout::ScrollIndicators::Hidden | crate::layout::ScrollIndicators::Visible => "thin",
+            }
+            .into(),
+        );
     }
     if style.hidden {
         // the box keeps its place in the flow and shows nothing

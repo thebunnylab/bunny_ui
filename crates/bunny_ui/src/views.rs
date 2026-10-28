@@ -488,6 +488,10 @@ pub struct TextField {
     submit_on_enter: bool,
     yields_on_submit: bool,
     bare: bool,
+    /// Between the edge and the text: the house's
+    /// ([`crate::layout::FIELD_INSET`]) unless
+    /// [`TextField::content_inset`] names another.
+    inset: Option<Rc<crate::layout::Edges>>,
     secret: bool,
     editing: Option<Rc<dyn crate::text_input::EditingStrategy>>,
     nav_intercept: Option<Binding<bool>>,
@@ -615,6 +619,23 @@ impl TextField {
     /// gate.
     pub fn bare(mut self) -> Self {
         self.bare = true;
+        self
+    }
+
+    /// The room between the field's edge and its text, edge by edge —
+    /// [`FIELD_INSET`] (8 × 5 points) unless named here.
+    ///
+    /// A field set into a design's own padding — a search box whose
+    /// chrome is a row, a composer whose card is the padding, a cell —
+    /// counts that padding once: `.bare().content_inset(Edges::ZERO)`
+    /// puts the text exactly where the design does, instead of 8 points
+    /// further in. Measure, the text, the caret, the selection and the
+    /// run's scroll all count from this inset, and so does the browser's
+    /// `<input>`.
+    ///
+    /// [`FIELD_INSET`]: crate::layout::FIELD_INSET
+    pub fn content_inset(mut self, inset: crate::layout::Edges) -> Self {
+        self.inset = (inset != crate::layout::FIELD_INSET).then(|| Rc::new(inset));
         self
     }
 
@@ -827,6 +848,7 @@ impl TextField {
                 );
                 out.push_layout(LayoutNode::Field {
                     bare: self.bare,
+                    inset: self.inset.clone(),
                     // a chain writes this, never the constructor
                     highlights: None,
                     path,
@@ -1120,6 +1142,7 @@ pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> Text
         submit_on_enter: false,
         yields_on_submit: false,
         bare: false,
+        inset: None,
         secret: false,
         editing: None,
         nav_intercept: None,
@@ -1150,6 +1173,7 @@ pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> Tex
         submit_on_enter: false,
         yields_on_submit: false,
         bare: false,
+        inset: None,
         secret: false,
         editing: None,
         nav_intercept: None,
@@ -1770,6 +1794,7 @@ pub struct ScrollView<C> {
     axes: crate::layout::ScrollAxes,
     hug: bool,
     fill: bool,
+    indicators: crate::layout::ScrollIndicators,
     offset: Option<Binding<crate::layout::Point>>,
     site: crate::provenance::Site,
 }
@@ -1801,8 +1826,31 @@ impl<C> ScrollView<C> {
     /// The content still SCROLLS on what it actually holds — this grows the
     /// lane it is placed in, not what it answered, exactly as a split's lane
     /// is not its child's answer.
+    ///
+    /// The content is PLACED in that lane, so a frame around it holds
+    /// its child by its own alignment — `.leading` centres a short page
+    /// vertically, as SwiftUI's `.frame(minHeight:)` does. A page that
+    /// reads from the top says so: `.frame_max(∞, ∞, Alignment::TopLeading)`.
     pub fn fill_viewport(mut self) -> Self {
         self.fill = true;
+        self
+    }
+
+    /// When the region shows its thumb ([`ScrollIndicators`]).
+    ///
+    /// `Visible` is every region's default. `Hidden` is the overlay
+    /// scrollbar — a thumb that appears while the wheel or a finger moves
+    /// the region, or while it is held, and is gone at rest. `Never`
+    /// takes it away, for a strip that scrolls only when the window is too
+    /// narrow for it. Travel is the same in all three.
+    ///
+    /// ```ignore
+    /// scroll(product_rail()).horizontal().scroll_indicators(ScrollIndicators::Never)
+    /// ```
+    ///
+    /// [`ScrollIndicators`]: crate::layout::ScrollIndicators
+    pub fn scroll_indicators(mut self, indicators: crate::layout::ScrollIndicators) -> Self {
+        self.indicators = indicators;
         self
     }
 
@@ -1899,6 +1947,7 @@ impl<C: View> ScrollView<C> {
             axes: self.axes,
             commanded,
             fill: self.fill,
+            indicators: self.indicators,
             child: Box::new(wrap_layout(layouts)),
         };
         out.push_layout(if self.hug {
@@ -1920,6 +1969,7 @@ pub fn scroll<C: View>(content: C) -> ScrollView<C> {
         axes: crate::layout::ScrollAxes::Vertical,
         hug: false,
         fill: false,
+        indicators: crate::layout::ScrollIndicators::Visible,
         offset: None,
         site: crate::provenance::here(),
     }
@@ -2047,14 +2097,24 @@ fn stack_line(kind: &str, alignment: &str, spacing: Option<f64>) -> String {
     }
 }
 
-/// The full `Alignment` in layout terms. A ZStack aligns on both axes;
-/// what the enum names is the HORIZONTAL edge (`.leading` is leading
-/// and centered, as in SwiftUI).
+/// The HORIZONTAL edge of an `Alignment`, in layout terms: `.leading`,
+/// `.topLeading` and `.bottomLeading` all hug the leading side.
 pub(crate) fn cross_align(alignment: Alignment) -> CrossAlign {
     match alignment {
-        Alignment::Leading => CrossAlign::Start,
-        Alignment::Center => CrossAlign::Center,
-        Alignment::Trailing => CrossAlign::End,
+        Alignment::Leading | Alignment::TopLeading | Alignment::BottomLeading => CrossAlign::Start,
+        Alignment::Center | Alignment::Top | Alignment::Bottom => CrossAlign::Center,
+        Alignment::Trailing | Alignment::TopTrailing | Alignment::BottomTrailing => CrossAlign::End,
+    }
+}
+
+/// The VERTICAL edge of an `Alignment`, in layout terms. The middle row
+/// (`.leading`, `.center`, `.trailing`) centres, as in SwiftUI — which
+/// is what every alignment meant before it had a vertical edge to name.
+pub(crate) fn vertical_align(alignment: Alignment) -> CrossAlign {
+    match alignment {
+        Alignment::TopLeading | Alignment::Top | Alignment::TopTrailing => CrossAlign::Start,
+        Alignment::Leading | Alignment::Center | Alignment::Trailing => CrossAlign::Center,
+        Alignment::BottomLeading | Alignment::Bottom | Alignment::BottomTrailing => CrossAlign::End,
     }
 }
 
@@ -2064,6 +2124,8 @@ struct StackPresentation<'a> {
     spacing: Option<f64>,
     axis: Option<Axis>,
     align: CrossAlign,
+    /// The vertical edge of a ZStack; a row or column has none to name.
+    vertical: CrossAlign,
 }
 
 fn render_stack<C: View>(
@@ -2078,6 +2140,7 @@ fn render_stack<C: View>(
         spacing,
         axis,
         align,
+        vertical,
     } = presentation;
     let mut nodes = NodeList::new();
     children.render_into(ctx, &mut nodes);
@@ -2100,7 +2163,7 @@ fn render_stack<C: View>(
             action: None,
         },
         // ZStack: all children in the same frame
-        None => LayoutNode::Layered { align, modal: false, children: layouts },
+        None => LayoutNode::Layered { align, vertical, modal: false, children: layouts },
     });
 }
 
@@ -2137,6 +2200,7 @@ impl<C: View> VStack<C> {
                 spacing: self.spacing,
                 axis: Some(Axis::Vertical),
                 align: self.alignment.cross(),
+                vertical: CrossAlign::Center,
             },
         );
     }
@@ -2203,6 +2267,7 @@ impl<C: View> HStack<C> {
                     spacing: self.spacing,
                     axis: Some(Axis::Horizontal),
                     align: self.alignment.cross(),
+                    vertical: CrossAlign::Center,
                 },
             );
         };
@@ -2309,6 +2374,7 @@ impl<C: View> ZStack<C> {
                 spacing: None,
                 axis: None,
                 align: cross_align(self.alignment),
+                vertical: vertical_align(self.alignment),
             },
         );
     }
@@ -2317,7 +2383,8 @@ impl<C: View> ZStack<C> {
 
 impl<C> ZStack<C> {
     /// `ZStack(alignment: .leading)` — the children hug that horizontal
-    /// edge and stay centered vertically.
+    /// edge and stay centered vertically; `.topLeading` holds them in the
+    /// corner, the way a page's content reads from its top.
     pub fn alignment(mut self, alignment: Alignment) -> Self {
         self.alignment = alignment;
         self
@@ -2361,7 +2428,9 @@ impl<C> Grid<C> {
         self.row_spacing = Some(spacing);
         self
     }
-    /// Horizontal alignment within each cell. Vertically cells are centered.
+    /// Alignment within each cell. The middle row (`.leading`, `.center`,
+    /// `.trailing`) centres a short child in a tall row; `.topLeading`
+    /// and its siblings hold it against the row's top or bottom.
     pub fn alignment(mut self, alignment: Alignment) -> Self {
         self.alignment = alignment;
         self
@@ -2394,6 +2463,7 @@ impl<C: View> View for Grid<C> {
             spacing: self.spacing,
             row_spacing: self.row_spacing.unwrap_or(self.spacing),
             align: cross_align(self.alignment),
+            vertical: vertical_align(self.alignment),
             children,
         });
         crate::provenance::seal(
@@ -2585,6 +2655,7 @@ where
             commanded: None,
             axes: crate::layout::ScrollAxes::Vertical,
             fill: false,
+            indicators: crate::layout::ScrollIndicators::Visible,
             path: motor::identity::cursor_scope(),
             child: Box::new(LayoutNode::Stack {
                 axis: Axis::Vertical,
@@ -2984,6 +3055,7 @@ where
             commanded: None,
             axes: crate::layout::ScrollAxes::Vertical,
             fill: false,
+            indicators: crate::layout::ScrollIndicators::Visible,
             path: motor::identity::cursor_scope(),
             child: Box::new(LayoutNode::VirtualStack {
                 row_extent: self
@@ -3575,6 +3647,7 @@ impl<H: View, C: View> Section<H, C> {
                 commanded: None,
                 axes: crate::layout::ScrollAxes::Vertical,
                 fill: false,
+                indicators: crate::layout::ScrollIndicators::Visible,
                 path: motor::identity::cursor_scope(),
                 child: Box::new(stacked),
             }

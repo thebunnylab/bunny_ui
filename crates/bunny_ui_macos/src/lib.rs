@@ -2596,8 +2596,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // and `cmd-k` lets the keyboard go
             let chorded = runtime.chord_tick();
             // and the wheel's latch: two ticks with no wheel end
-            // the scroll gesture
-            runtime.wheel_tick();
+            // the scroll gesture, and an overlay thumb goes with it
+            let unlatched = runtime.wheel_tick();
             // …but never mid-drag: the resize steps are the only presenter
             // there. A caret blinking in a focused URL bar presented whole
             // frames between two steps and the two geometries composited
@@ -2614,13 +2614,14 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             let layered = blinked
                 && !explained
                 && !chorded
+                && !unlatched
                 && metal::active(window.view())
                 && !window.in_live_resize()
                 && !dialog_resizing();
             let overlay = if layered { runtime.blink_overlay(window.scale()) } else { None };
             match overlay {
                 Some(blits) => present_live_blits(&window, runtime, blits),
-                None if blinked || explained || chorded => {
+                None if blinked || explained || chorded || unlatched => {
                     soon(runtime, root, trace::Origin::Blink);
                 }
                 None => {}

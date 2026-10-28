@@ -982,5 +982,11 @@ fn alignment_from_wire(alignment: wire::Alignment) -> Alignment {
         wire::Alignment::Leading => Alignment::Leading,
         wire::Alignment::Center => Alignment::Center,
         wire::Alignment::Trailing => Alignment::Trailing,
+        wire::Alignment::TopLeading => Alignment::TopLeading,
+        wire::Alignment::Top => Alignment::Top,
+        wire::Alignment::TopTrailing => Alignment::TopTrailing,
+        wire::Alignment::BottomLeading => Alignment::BottomLeading,
+        wire::Alignment::Bottom => Alignment::Bottom,
+        wire::Alignment::BottomTrailing => Alignment::BottomTrailing,
     }
 }

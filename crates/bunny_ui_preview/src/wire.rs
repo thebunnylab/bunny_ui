@@ -641,6 +641,12 @@ pub enum Alignment {
     Leading,
     Center,
     Trailing,
+    TopLeading,
+    Top,
+    TopTrailing,
+    BottomLeading,
+    Bottom,
+    BottomTrailing,
 }
 
 /// A data-only modifier — what an override may put on a node.
@@ -1114,7 +1120,17 @@ tagged_enum!(PointerKind { Move = 0, Down = 1, Up = 2, Leave = 3 });
 tagged_enum!(TouchPhase { Began = 0, Moved = 1, Ended = 2, Cancelled = 3 });
 tagged_enum!(OverrideOp { Replace = 0, Append = 1, Hide = 2 });
 tagged_enum!(Edge { Top = 0, Bottom = 1, Leading = 2, Trailing = 3 });
-tagged_enum!(Alignment { Leading = 0, Center = 1, Trailing = 2 });
+tagged_enum!(Alignment {
+    Leading = 0,
+    Center = 1,
+    Trailing = 2,
+    TopLeading = 3,
+    Top = 4,
+    TopTrailing = 5,
+    BottomLeading = 6,
+    Bottom = 7,
+    BottomTrailing = 8,
+});
 
 impl Wire for Point {
     fn put(&self, out: &mut Vec<u8>) {

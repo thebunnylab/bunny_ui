@@ -39,11 +39,23 @@ impl Display for Font {
     }
 }
 
+/// Where a child sits in a box bigger than itself, on both axes —
+/// SwiftUI's `Alignment`. The first three are the MIDDLE row: they name
+/// the horizontal edge and centre vertically, which is what `.leading`
+/// means in SwiftUI and what every alignment here meant before the top
+/// and bottom rows existed. The other six hold the child against the
+/// top or bottom edge as well, the way a page reads from its corner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Alignment {
     Leading,
     Center,
     Trailing,
+    TopLeading,
+    Top,
+    TopTrailing,
+    BottomLeading,
+    Bottom,
+    BottomTrailing,
 }
 
 impl Display for Alignment {
@@ -52,6 +64,12 @@ impl Display for Alignment {
             Alignment::Leading => "leading",
             Alignment::Center => "center",
             Alignment::Trailing => "trailing",
+            Alignment::TopLeading => "topLeading",
+            Alignment::Top => "top",
+            Alignment::TopTrailing => "topTrailing",
+            Alignment::BottomLeading => "bottomLeading",
+            Alignment::Bottom => "bottom",
+            Alignment::BottomTrailing => "bottomTrailing",
         };
         write!(f, ".{name}")
     }

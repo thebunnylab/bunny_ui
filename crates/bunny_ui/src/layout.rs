@@ -907,16 +907,19 @@ pub enum LayoutNode {
     /// overflowing.
     Flow { spacing: Px, line_spacing: Px, align: CrossAlign, children: Vec<LayoutNode> },
     /// Equal-width tracks with sparse placement and per-child spans.
+    /// `align` and `vertical` place each child inside its cell.
     Grid {
         columns: usize,
         spacing: Px,
         row_spacing: Px,
         align: CrossAlign,
+        vertical: CrossAlign,
         children: Vec<LayoutNode>,
     },
     /// Overlay: all children in the same frame (ZStack, sheet on top).
-    /// `align` is the HORIZONTAL edge each child sits on; the vertical
-    /// one stays centered, exactly what SwiftUI's `.leading` means.
+    /// `align` is the HORIZONTAL edge each child sits on and `vertical`
+    /// the vertical one: SwiftUI's `.leading` is `Start` over `Center`,
+    /// its `.topLeading` is `Start` over `Start`.
     ///
     /// `modal` says the topmost child CAPTURES what it COVERS: the
     /// pointer and the wheel do not reach anything the scene painted
@@ -929,7 +932,7 @@ pub enum LayoutNode {
     /// captures its own subtree and what came before, and nothing
     /// else — which is why a sheet belongs where a sheet belongs, over
     /// the scene it is modal to. A plain pile captures nothing.
-    Layered { align: CrossAlign, modal: bool, children: Vec<LayoutNode> },
+    Layered { align: CrossAlign, vertical: CrossAlign, modal: bool, children: Vec<LayoutNode> },
     /// `.overlay(at, view)` — a layer painted OVER the box (or UNDER
     /// it, with `behind`), taking the box's size and giving it NOTHING
     /// back.
@@ -965,26 +968,40 @@ pub enum LayoutNode {
     },
     /// `.frame(width:height:)` — `Some` axes override proposal and answer.
     ///
-    /// `align` places the child INSIDE that answer on the horizontal axis:
-    /// an exact box centres by default, as SwiftUI does, and a column of a
-    /// grid says `Start` so every cell has the same reading edge. The
-    /// vertical axis centres always — the port's `Alignment` names the
-    /// horizontal edge and nothing else.
+    /// `align` places the child INSIDE that answer on the horizontal axis
+    /// and `vertical` on the vertical one: an exact box centres by
+    /// default, as SwiftUI does, and a column of a grid says `Start` so
+    /// every cell has the same reading edge. `Alignment`'s middle row
+    /// (`.leading`, `.center`, `.trailing`) centres vertically; its top
+    /// and bottom rows hold the child against that edge.
     Frame {
         width: Option<Px>,
         height: Option<Px>,
         align: CrossAlign,
+        vertical: CrossAlign,
         child: Box<LayoutNode>,
     },
     /// `.frame(maxWidth:maxHeight:)` — `∞` = "fill what was proposed".
-    MaxFrame { max_width: Px, max_height: Px, align: CrossAlign, child: Box<LayoutNode> },
+    MaxFrame {
+        max_width: Px,
+        max_height: Px,
+        align: CrossAlign,
+        vertical: CrossAlign,
+        child: Box<LayoutNode>,
+    },
     /// A flexible box with a floor: it fills what it is proposed, never
     /// less than the floor — and unproposed on an axis it IS the floor,
     /// not its content, which is what lets a table's lane stay one width
     /// on every row under a sideways scroll (proposed nothing) and still
     /// share a pane that is wider. A floor of zero hugs the content on
     /// that axis.
-    FlexFrame { min_width: Px, min_height: Px, align: CrossAlign, child: Box<LayoutNode> },
+    FlexFrame {
+        min_width: Px,
+        min_height: Px,
+        align: CrossAlign,
+        vertical: CrossAlign,
+        child: Box<LayoutNode>,
+    },
     /// Vertical scroll region: answers what it was offered, measures the
     /// content without restriction and keeps the excess to itself (the
     /// shrink contract). `path` is the region's structural identity — the
@@ -1019,6 +1036,8 @@ pub enum LayoutNode {
         /// of the file for that press, and the same is true sideways of the
         /// widest line.
         fill: bool,
+        /// When the thumb shows ([`ScrollIndicators`]).
+        indicators: ScrollIndicators,
         child: Box<LayoutNode>,
     },
     /// Takes AT MOST what its child needs on one axis.
@@ -1122,6 +1141,13 @@ pub enum LayoutNode {
         /// never had. Padding, caret, selection and the key gate are
         /// untouched — this is paint, and only paint.
         bare: bool,
+        /// Between the field's edge and its text: [`FIELD_INSET`] when
+        /// `None`, the caller's own otherwise — boxed, because almost
+        /// every field keeps the house inset and the node is the size of
+        /// its widest kind. Measure, the text's origin, the caret, the
+        /// selection and the run's scroll all count from it, so a field
+        /// set into a design's own padding can take none.
+        inset: Option<Rc<Edges>>,
         /// Stretches of the CONTENT in another ink — the same record a
         /// `text(…)` carries, read by the same run splitter. It is what
         /// tints a `{{variable}}` inside an editable line.
@@ -2546,6 +2572,10 @@ pub struct Interaction {
     pub menu: Option<MenuOpen>,
     /// The live drag — the runtime's, resolved before layout.
     pub drag: Option<DragLive>,
+    /// The regions a scroll gesture is moving — the wheel's latch, one
+    /// per axis at most. A region whose thumb only shows mid-gesture
+    /// ([`ScrollIndicators::Hidden`]) shows it while it is named here.
+    pub scrolling: Vec<String>,
 }
 
 /// A scrollbar thumb under the pointer, mid-drag.
@@ -3291,6 +3321,32 @@ impl ScrollAxes {
     }
 }
 
+/// When a region shows its thumb — SwiftUI's `ScrollIndicatorVisibility`,
+/// and the CSS `scrollbar-width` a design system writes.
+///
+/// The thumb is chrome, not content: a strip of icons that scrolls when
+/// the window is narrow (a product rail, a row of mode links) says
+/// nothing with a bar under it, and a transcript or a navigation list
+/// reads cleaner when its bar only appears while the hand moves it,
+/// the way an overlay scrollbar does on a Mac.
+///
+/// Every value scrolls the same: the wheel, the keyboard, a reveal and
+/// a finger travel as they always did. Only the thumb and its grab band
+/// come and go — a thumb that is not shown cannot be grabbed.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum ScrollIndicators {
+    /// Painted whenever the content overflows — every region's default.
+    #[default]
+    Visible,
+    /// Painted only while the region is in a scroll gesture (a wheel
+    /// turn or a finger's pan, until the slow clock ages the gesture
+    /// out) or its thumb is held: an overlay scrollbar.
+    /// `scrollbar-width: thin` on the web, where the platform decides.
+    Hidden,
+    /// Never painted, never grabbed — `scrollbar-width: none`.
+    Never,
+}
+
 /// Where a modal layer drew its line: how long every list the pointer
 /// consults was when the layer went up. Everything recorded from those
 /// marks on is ABOVE the modal and still answers; what came before is
@@ -3348,6 +3404,9 @@ pub struct ScrollRegion {
     /// is the right one, so the wheel's and the thumb's physical moves
     /// change the offset the other way round.
     pub direction: LayoutDirection,
+    /// When its thumb shows: the slow clock that ends a gesture asks for
+    /// a frame only when a thumb that only shows mid-gesture must go.
+    pub indicators: ScrollIndicators,
 }
 
 /// What SURFACE a modal layer asks the shell for.
@@ -5361,6 +5420,7 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
                         width: None,
                         height: Some(MENU_ROW_H),
                         align: CrossAlign::Center,
+                        vertical: CrossAlign::Center,
                         child: Box::new(LayoutNode::Stack {
                             axis: Axis::Horizontal,
                             spacing: 0.0,
@@ -5397,6 +5457,7 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
                     width: None,
                     height: Some(MENU_DIVIDER_H),
                     align: CrossAlign::Center,
+                    vertical: CrossAlign::Center,
                     child: Box::new(LayoutNode::Padding {
                         edges: Edges {
                             top: 4.0,
@@ -5910,13 +5971,50 @@ impl LayoutNode {
 
     /// This stack child's physical position, looking through its outer wrappers.
     /// The first (outermost) position wins. Retained components read the same tree.
+    ///
+    /// A stack whose every child is placed is itself placed at the
+    /// origin ([`LayoutNode::pins_rows`]): its boxes count from the box
+    /// it is written in, which is where SwiftUI's `ForEach` puts its
+    /// rows — `for_each` builds a column of its own, and the marks of a
+    /// chart would otherwise count from that column, centred wherever
+    /// the layers above put it.
     pub fn placed_at(&self) -> Option<Point> {
         match self {
             Self::Placed { at, .. } => Some(*at),
             Self::BoundaryRef { slot, .. } => {
                 slot.with_layout(|node| node.and_then(Self::placed_at))
             }
+            Self::Stack { children, .. } if Self::pins_rows(children) => Some(Point::ZERO),
+            // a component's tuple of placed views is the same pile
+            Self::Boundary { children, .. } if children.len() > 1 && Self::pins_rows(children) => {
+                Some(Point::ZERO)
+            }
             _ => self.only_child().and_then(Self::placed_at),
+        }
+    }
+
+    /// Is every one of these stack children placed — a stack with no
+    /// flow left, only boxes at points? It then measures as the extent of
+    /// what it places and stands at its parent's origin, so the points
+    /// mean the same in the stack as in the box around it.
+    ///
+    /// A child counts when a `.position()` is on it, through its wrappers
+    /// — never because it is a pile itself. The question is asked of a
+    /// stack's every child on every pass, and this keeps its answer as
+    /// cheap as a wrapper chain instead of a walk down nested stacks.
+    pub(crate) fn pins_rows(children: &[LayoutNode]) -> bool {
+        !children.is_empty() && children.iter().all(|child| child.placed_directly().is_some())
+    }
+
+    /// [`LayoutNode::placed_at`] without the pile rule: the position on
+    /// this node or on a wrapper around it.
+    fn placed_directly(&self) -> Option<Point> {
+        match self {
+            Self::Placed { at, .. } => Some(*at),
+            Self::BoundaryRef { slot, .. } => {
+                slot.with_layout(|node| node.and_then(Self::placed_directly))
+            }
+            _ => self.only_child().and_then(Self::placed_directly),
         }
     }
 
@@ -5980,9 +6078,9 @@ impl LayoutNode {
                 let content = content.get();
                 Some(paragraph::first_baseline(&content, highlights.as_deref(), env))
             }
-            LayoutNode::Field { .. } => {
+            LayoutNode::Field { inset, .. } => {
                 let metrics = env.cache.get_or_measure("0", &env.font, env.text);
-                Some(FIELD_PAD_V + metrics.ascent)
+                Some(field_inset(inset.as_deref()).top + metrics.ascent)
             }
             LayoutNode::Styled { props, child, .. } => {
                 let env = LayoutEnv {
@@ -6064,7 +6162,9 @@ impl LayoutNode {
                 (size, Fit::Leaf)
             }
 
-            LayoutNode::Field { path, content: held, placeholder, multiline, secret, .. } => {
+            LayoutNode::Field { path, content: held, placeholder, multiline, secret, inset, .. } => {
+                let inset = field_inset(inset.as_deref());
+                let (across, down) = (inset.leading + inset.trailing, inset.top + inset.bottom);
                 let shown;
                 let content: &str = if *secret {
                     shown = crate::text_input::masked(held);
@@ -6091,19 +6191,19 @@ impl LayoutNode {
                     });
                     let width = proposal
                         .width
-                        .unwrap_or_else(|| note_natural_width(sample, env) + 2.0 * FIELD_PAD_H);
+                        .unwrap_or_else(|| note_natural_width(sample, env) + across);
                     let height = proposal.height.unwrap_or_else(|| {
-                        let inner = (width - 2.0 * FIELD_PAD_H).max(1.0);
+                        let inner = (width - across).max(1.0);
                         let lines =
                             env.cache.field_lines(path, sample, shared, &env.font, inner, env.text);
-                        lines.len() as Px * line_h + 2.0 * FIELD_PAD_V
+                        lines.len() as Px * line_h + down
                     });
                     (Size { width, height }, Fit::Leaf)
                 } else {
                     let metrics = env.cache.get_or_measure(sample, &env.font, env.text);
-                    let width = proposal.width.unwrap_or(metrics.width + 2.0 * FIELD_PAD_H);
+                    let width = proposal.width.unwrap_or(metrics.width + across);
                     let line_h = env.line_height.unwrap_or(metrics.height());
-                    (Size { width, height: line_h + 2.0 * FIELD_PAD_V }, Fit::Leaf)
+                    (Size { width, height: line_h + down }, Fit::Leaf)
                 }
             }
 
@@ -6216,12 +6316,13 @@ impl LayoutNode {
                 measure_stack(*axis, *spacing, children, proposal, env)
             }
 
-            LayoutNode::Grid { columns, spacing, row_spacing, align, children } => {
+            LayoutNode::Grid { columns, spacing, row_spacing, align, vertical, children } => {
                 grid::Tracks {
                     columns: (*columns).max(1),
                     gap: *spacing,
                     row_gap: *row_spacing,
                     align: *align,
+                    vertical: *vertical,
                 }.measure(children, proposal, env)
             }
             LayoutNode::Flow { spacing, line_spacing, children, .. } => {
@@ -6790,6 +6891,7 @@ impl LayoutNode {
                     multiline,
                     auto_focus,
                     bare,
+                    inset,
                     highlights,
                     secret,
                 },
@@ -6922,8 +7024,11 @@ impl LayoutNode {
                 // the font keeps its own raster, centred by half-leading.
                 let line_h = env.line_height.unwrap_or(metrics.height());
                 let leading = (line_h - metrics.height()) / 2.0;
-                let inner = (frame.size.width - 2.0 * FIELD_PAD_H).max(0.0);
-                let inner_h = (frame.size.height - 2.0 * FIELD_PAD_V).max(0.0);
+                let inset = field_inset(inset.as_deref());
+                let inner = (frame.size.width - inset.leading - inset.trailing).max(0.0);
+                let inner_h = (frame.size.height - inset.top - inset.bottom).max(0.0);
+                // the leading inset is on the side the scene reads from
+                let inset_left = if env.rtl() { inset.trailing } else { inset.leading };
                 // one shape, one loop: the one-line field is the field
                 // whose list of lines has one entry
                 let single = [(0usize, sample.len())];
@@ -6950,11 +7055,11 @@ impl LayoutNode {
                     y: scroll.y.clamp(0.0, overflow_y),
                 };
                 let text_origin = Point {
-                    x: frame.origin.x + FIELD_PAD_H - offset.x,
-                    y: frame.origin.y + FIELD_PAD_V - offset.y,
+                    x: frame.origin.x + inset_left - offset.x,
+                    y: frame.origin.y + inset.top - offset.y,
                 };
                 let run = Rect {
-                    origin: Point { x: frame.origin.x + FIELD_PAD_H, y: frame.origin.y + FIELD_PAD_V },
+                    origin: Point { x: frame.origin.x + inset_left, y: frame.origin.y + inset.top },
                     size: Size { width: inner, height: inner_h },
                 };
                 // everything the field writes is cut by its own box:
@@ -7936,6 +8041,7 @@ impl LayoutNode {
                     spacing,
                     row_spacing,
                     align,
+                    vertical,
                     children,
                 },
                 fit @ Fit::Grid { .. },
@@ -7945,6 +8051,7 @@ impl LayoutNode {
                     gap: *spacing,
                     row_gap: *row_spacing,
                     align: *align,
+                    vertical: *vertical,
                 }
                 .place(children, frame, fit, env, out);
             }
@@ -8089,7 +8196,7 @@ impl LayoutNode {
                 }
             }
 
-            (LayoutNode::Layered { align, modal, children }, Fit::Children(fits)) => {
+            (LayoutNode::Layered { align, vertical, modal, children }, Fit::Children(fits)) => {
                 for (index, (child, (size, fit))) in children.iter().zip(fits).enumerate() {
                     // a modal pile draws its line here: everything
                     // recorded from now on is ABOVE, and the walk back
@@ -8108,13 +8215,14 @@ impl LayoutNode {
                             hosts: out.hosts.len(),
                         });
                     }
-                    // the alignment edge is horizontal — a 2pt accent bar
-                    // hugs the leading side and still centers vertically
+                    // two edges: a 2pt accent bar at `.leading` hugs the
+                    // leading side and still centers vertically, and a
+                    // badge at `.topTrailing` takes the corner
                     let origin = child.placed_at().map_or_else(
                         || Point {
                             x: align_x(frame, size.width, *align, env.rtl()),
                             y: frame.origin.y
-                                + align_offset(frame.size.height, size.height, CrossAlign::Center),
+                                + align_offset(frame.size.height, size.height, *vertical),
                         },
                         |at| Point {
                             x: frame.origin.x + at.x,
@@ -8142,11 +8250,10 @@ impl LayoutNode {
                 child.place(Rect { origin, size: *child_size }, fit, env, out);
             }
 
-            (LayoutNode::Frame { align, child, .. }, Fit::Wrapped(child_size, fit)) => {
+            (LayoutNode::Frame { align, vertical, child, .. }, Fit::Wrapped(child_size, fit)) => {
                 let origin = Point {
                     x: align_x(frame, child_size.width, *align, env.rtl()),
-                    y: frame.origin.y
-                        + align_offset(frame.size.height, child_size.height, CrossAlign::Center),
+                    y: frame.origin.y + align_offset(frame.size.height, child_size.height, *vertical),
                 };
                 child.place(Rect { origin, size: *child_size }, fit, env, out);
             }
@@ -8157,16 +8264,15 @@ impl LayoutNode {
                 child.place(frame, fit, env, out);
             }
 
-            (LayoutNode::MaxFrame { align, child, .. }, Fit::Wrapped(child_size, fit))
-            | (LayoutNode::FlexFrame { align, child, .. }, Fit::Wrapped(child_size, fit)) => {
+            (LayoutNode::MaxFrame { align, vertical, child, .. }, Fit::Wrapped(child_size, fit))
+            | (LayoutNode::FlexFrame { align, vertical, child, .. }, Fit::Wrapped(child_size, fit)) => {
                 let x = align_x(frame, child_size.width, *align, env.rtl());
-                let y = frame.origin.y
-                    + align_offset(frame.size.height, child_size.height, CrossAlign::Center);
+                let y = frame.origin.y + align_offset(frame.size.height, child_size.height, *vertical);
                 child.place(Rect { origin: Point { x, y }, size: *child_size }, fit, env, out);
             }
 
             (
-                LayoutNode::Scroll { path, target, axes, commanded, child, .. },
+                LayoutNode::Scroll { path, target, axes, commanded, indicators, child, .. },
                 Fit::ScrollContent(content, fit),
             ) => {
                 // per-axis travel over SNAPPED values: "scrollable by
@@ -8227,6 +8333,7 @@ impl LayoutNode {
                         row_extent,
                         row_offsets,
                         direction: env.direction,
+                        indicators: *indicators,
                     });
                 }
                 if let Some(dom) = out.dom.as_mut() {
@@ -8267,7 +8374,19 @@ impl LayoutNode {
                     out.region_stack.pop();
                 }
                 out.anchors.pop();
-                if max_y > 0.0 && axes.vertical() {
+                // the thumb is chrome the region may keep to itself: a
+                // gesture names the region it moves, a grab the one it
+                // holds, and an overlay thumb shows for either
+                let shows = match indicators {
+                    ScrollIndicators::Visible => true,
+                    ScrollIndicators::Never => false,
+                    ScrollIndicators::Hidden => path.as_deref().is_some_and(|path| {
+                        let interaction = env.stamp.interaction;
+                        interaction.scrolling.iter().any(|moving| moving == path)
+                            || interaction.thumb_drag.as_ref().is_some_and(|drag| drag.path == path)
+                    }),
+                };
+                if shows && max_y > 0.0 && axes.vertical() {
                     draw_scrollbar(
                         path.as_deref(),
                         frame,
@@ -8278,7 +8397,7 @@ impl LayoutNode {
                         out,
                     );
                 }
-                if max_x > 0.0 && axes.horizontal() {
+                if shows && max_x > 0.0 && axes.horizontal() {
                     draw_scrollbar_h(
                         path.as_deref(),
                         frame,
@@ -9187,9 +9306,19 @@ fn measure_stack(
         .sum::<Px>()
         + spacing_total;
 
-    let size = match axis {
-        Axis::Vertical => Size { width: cross_max, height: main_sum },
-        Axis::Horizontal => Size { width: main_sum, height: cross_max },
+    // a stack with NO child in its flow is a pile of placed boxes — the
+    // list a chart's marks come from. It is as big as what it places,
+    // the way the layers it hands them to are ([`LayoutNode::pins_rows`])
+    let size = if LayoutNode::pins_rows(children) {
+        children.iter().zip(&measured).fold(Size::default(), |acc, (child, (size, _))| {
+            let at = child.placed_at().unwrap_or(Point::ZERO);
+            Size { width: acc.width.max(at.x + size.width), height: acc.height.max(at.y + size.height) }
+        })
+    } else {
+        match axis {
+            Axis::Vertical => Size { width: cross_max, height: main_sum },
+            Axis::Horizontal => Size { width: main_sum, height: cross_max },
+        }
     };
     (size, Fit::Children(measured))
 }
@@ -9505,6 +9634,16 @@ pub const SCROLLBAR_GRAB: Px = 12.0;
 
 const FIELD_PAD_H: Px = 8.0;
 const FIELD_PAD_V: Px = 5.0;
+/// The inset every field keeps between its edge and its text unless the
+/// caller names another ([`crate::views::TextField::content_inset`]) —
+/// the padding the browser's glue mirrors for its own `<input>`.
+pub const FIELD_INSET: Edges =
+    Edges { top: FIELD_PAD_V, trailing: FIELD_PAD_H, bottom: FIELD_PAD_V, leading: FIELD_PAD_H };
+
+/// A field node's inset: its own, or the house's.
+fn field_inset(inset: Option<&Edges>) -> Edges {
+    inset.copied().unwrap_or(FIELD_INSET)
+}
 pub(crate) const FIELD_RADIUS: Px = 5.0;
 const FIELD_CARET_W: Px = 1.5;
 
@@ -9811,6 +9950,7 @@ mod tests {
                 width: Some(width),
                 height: Some(height),
                 align: CrossAlign::Center,
+                vertical: CrossAlign::Center,
                 child: Box::new(LayoutNode::Spacer),
             },
         )
@@ -9888,6 +10028,7 @@ mod tests {
             width: Some(132.0),
             height: Some(30.0),
             align,
+            vertical: CrossAlign::Center,
             child: Box::new(boundary("n", text(4))),
         };
         let read = |align: CrossAlign, direction: LayoutDirection| {
@@ -9908,6 +10049,7 @@ mod tests {
     fn a_layered_stack_hugs_the_right_for_leading_in_rtl() {
         let pile = LayoutNode::Layered {
             align: CrossAlign::Start,
+            vertical: CrossAlign::Center,
             modal: false,
             children: vec![fixed("wide", 118.0, 10.0), fixed("bar", 2.0, 10.0)],
         };
@@ -9969,6 +10111,7 @@ mod tests {
                 width: None,
                 height: Some(40.0),
                 align: CrossAlign::Center,
+                vertical: CrossAlign::Center,
                 child: Box::new(LayoutNode::Fill),
             },
         );
@@ -10007,6 +10150,7 @@ mod tests {
                     width: Some(200.0),
                     height: Some(30.0),
                     align: CrossAlign::End,
+                    vertical: CrossAlign::Center,
                     child: Box::new(fixed("framed", 60.0, 10.0)),
                 },
                 LayoutNode::Flow {
@@ -10022,6 +10166,7 @@ mod tests {
                 },
                 LayoutNode::Layered {
                     align: CrossAlign::Start,
+                    vertical: CrossAlign::Center,
                     modal: false,
                     children: vec![fixed("under", 120.0, 20.0), fixed("over", 15.0, 20.0)],
                 },
@@ -10035,10 +10180,12 @@ mod tests {
                     width: Some(240.0),
                     height: Some(30.0),
                     align: CrossAlign::Center,
+                    vertical: CrossAlign::Center,
                     child: Box::new(LayoutNode::Scroll {
                         commanded: None,
                         axes: ScrollAxes::Horizontal,
                         fill: false,
+                        indicators: crate::layout::ScrollIndicators::Visible,
                         path: Some("strip".into()),
                         target: None,
                         child: Box::new(boundary("strip_content", text(60))),
@@ -10048,6 +10195,7 @@ mod tests {
                     width: Some(260.0),
                     height: Some(40.0),
                     align: CrossAlign::Center,
+                    vertical: CrossAlign::Center,
                     child: Box::new(LayoutNode::Split {
                         path: "seam".into(),
                         axis: Axis::Horizontal,
@@ -10062,6 +10210,7 @@ mod tests {
                                 width: Some(1.0),
                                 height: None,
                                 align: CrossAlign::Center,
+                                vertical: CrossAlign::Center,
                                 child: Box::new(LayoutNode::Spacer),
                             },
                             boundary("lane_b", LayoutNode::Spacer),
@@ -10115,6 +10264,7 @@ mod tests {
                     width: Some(1.0),
                     height: None,
                     align: CrossAlign::Center,
+                    vertical: CrossAlign::Center,
                     child: Box::new(LayoutNode::Spacer),
                 },
                 boundary("b", LayoutNode::Spacer),
@@ -10141,10 +10291,12 @@ mod tests {
             width: Some(100.0),
             height: Some(50.0),
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             child: Box::new(LayoutNode::Scroll {
                 commanded: None,
                 axes: ScrollAxes::Horizontal,
                 fill: false,
+                indicators: crate::layout::ScrollIndicators::Visible,
                 path: Some("strip".into()),
                 target: None,
                 child: Box::new(boundary("content", text(40))),
@@ -10176,10 +10328,12 @@ mod tests {
             width: Some(100.0),
             height: Some(100.0),
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             child: Box::new(LayoutNode::Scroll {
                 commanded: None,
                 axes: ScrollAxes::Vertical,
                 fill: false,
+                indicators: crate::layout::ScrollIndicators::Visible,
                 path: Some("list".into()),
                 target: None,
                 child: Box::new(stack(Axis::Vertical, CrossAlign::Start, rows)),
@@ -10214,6 +10368,7 @@ mod tests {
             width: Some(40.0),
             height: None,
             align: CrossAlign::Start,
+            vertical: CrossAlign::Center,
             child: Box::new(LayoutNode::Styled {
                 props: VisualProps { text_align: align, ..VisualProps::default() }.shared(),
                 child: Box::new(LayoutNode::Text {
@@ -10259,6 +10414,7 @@ mod tests {
             width: Some(100.0),
             height: None,
             align: CrossAlign::Start,
+            vertical: CrossAlign::Center,
             child: Box::new(LayoutNode::Text {
                 content: crate::bind::TextSource::from("x".repeat(20)),
                 highlights: None,
@@ -10471,6 +10627,7 @@ mod tests {
                 width: Some(48.0),
                 height: Some(280.0),
                 align: CrossAlign::Center,
+                vertical: CrossAlign::Center,
                 child: Box::new(LayoutNode::Spacer),
             },
         );
@@ -10510,6 +10667,7 @@ mod tests {
                 width: None,
                 height: Some(40.0),
                 align: CrossAlign::Center,
+                vertical: CrossAlign::Center,
                 child: Box::new(LayoutNode::Fill),
             },
         );
@@ -10519,6 +10677,7 @@ mod tests {
                 width: Some(948.0),
                 height: None,
                 align: CrossAlign::Center,
+                vertical: CrossAlign::Center,
                 child: Box::new(LayoutNode::Spacer),
             },
         );
@@ -10548,6 +10707,7 @@ mod tests {
         let pile = LayoutNode::Layered {
             modal: false,
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             children: vec![
                 boundary("wash", LayoutNode::Spacer),
                 boundary(
@@ -10556,6 +10716,7 @@ mod tests {
                         width: None,
                         height: Some(372.0),
                         align: CrossAlign::Center,
+                        vertical: CrossAlign::Center,
                         child: Box::new(LayoutNode::Spacer),
                     },
                 ),
@@ -10582,6 +10743,7 @@ mod tests {
                     max_width: f64::INFINITY,
                     max_height: cap,
                     align: CrossAlign::Start,
+                    vertical: CrossAlign::Center,
                     child: Box::new(LayoutNode::Spacer),
                 },
             )
@@ -10623,6 +10785,7 @@ mod tests {
                         max_width: 260.0,
                         max_height: f64::INFINITY,
                         align: CrossAlign::Start,
+                        vertical: CrossAlign::Center,
                         child: Box::new(LayoutNode::Spacer),
                     },
                 ),
@@ -10632,6 +10795,7 @@ mod tests {
                         width: Some(1.0),
                         height: None,
                         align: CrossAlign::Center,
+                        vertical: CrossAlign::Center,
                         child: Box::new(LayoutNode::Spacer),
                     },
                 ),
@@ -10715,6 +10879,7 @@ mod tests {
                         min_width: 300.0,
                         min_height: 0.0,
                         align: CrossAlign::Start,
+                        vertical: CrossAlign::Center,
                         child: Box::new(LayoutNode::Spacer),
                     },
                 ),
@@ -10782,6 +10947,7 @@ mod tests {
             width: Some(272.0),
             height: None,
             align: CrossAlign::Start,
+            vertical: CrossAlign::Center,
             child: Box::new(LayoutNode::Stack {
                 axis: Axis::Vertical,
                 spacing: 8.0,
@@ -10819,6 +10985,7 @@ mod tests {
                         min_width: 320.0,
                         min_height: 0.0,
                         align: CrossAlign::Start,
+                        vertical: CrossAlign::Center,
                         child: Box::new(LayoutNode::Spacer),
                     },
                 ),
@@ -10829,6 +10996,7 @@ mod tests {
                         max_width: 100.0,
                         max_height: f64::INFINITY,
                         align: CrossAlign::Start,
+                        vertical: CrossAlign::Center,
                         child: Box::new(LayoutNode::Spacer),
                     },
                 ),
@@ -10862,6 +11030,7 @@ mod tests {
         let layered = LayoutNode::Layered {
             modal: false,
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             children: vec![chip.clone(), rule.clone()],
         };
         assert!(
@@ -10907,6 +11076,7 @@ mod tests {
             width: None,
             height: Some(0.0),
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             child: Box::new(LayoutNode::Spacer),
         });
         assert!(!framed.is_flexible(Axis::Vertical, None));
@@ -10944,6 +11114,7 @@ mod tests {
                     width: Some(1.0),
                     height: None,
                     align: CrossAlign::Center,
+                    vertical: CrossAlign::Center,
                     child: Box::new(LayoutNode::Spacer),
                 },
                 boundary("b", LayoutNode::Spacer),
@@ -10997,6 +11168,7 @@ mod tests {
                             width: Some(1.0),
                             height: None,
                             align: CrossAlign::Center,
+                            vertical: CrossAlign::Center,
                             child: Box::new(LayoutNode::Spacer),
                         },
                         boundary("b", LayoutNode::Spacer),
@@ -11055,6 +11227,7 @@ mod tests {
                             width: Some(1.0),
                             height: None,
                             align: CrossAlign::Center,
+                            vertical: CrossAlign::Center,
                             child: Box::new(LayoutNode::Spacer),
                         },
                         boundary("b", LayoutNode::Spacer),
@@ -11105,6 +11278,7 @@ mod tests {
                     width: None,
                     height: Some(1.0),
                     align: CrossAlign::Center,
+                    vertical: CrossAlign::Center,
                     child: Box::new(LayoutNode::Spacer),
                 },
                 boundary("bottom", LayoutNode::Spacer),
@@ -11132,6 +11306,7 @@ mod tests {
             width: None,
             height: Some(22.0),
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             child: Box::new(boundary("row", LayoutNode::Spacer)),
         };
         let result = layout(&root, Proposal { width: Some(300.0), height: Some(600.0) });
@@ -11151,6 +11326,7 @@ mod tests {
             width: Some(132.0),
             height: Some(30.0),
             align,
+            vertical: CrossAlign::Center,
             child: Box::new(boundary(path, text(chars))),
         };
         let read = |node: LayoutNode, path: &str| {
@@ -11180,6 +11356,7 @@ mod tests {
             width: Some(100.0),
             height: Some(40.0),
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             child: Box::new(boundary("inner", text(5))),
         };
         let result = layout(&root, Proposal::unspecified());
@@ -11199,12 +11376,14 @@ mod tests {
             width: Some(132.0),
             height: Some(30.0),
             align: CrossAlign::Start,
+            vertical: CrossAlign::Center,
             child: Box::new(text(4)),
         };
         let ceiling = LayoutNode::MaxFrame {
             max_width: 132.0,
             max_height: 30.0,
             align: CrossAlign::Start,
+            vertical: CrossAlign::Center,
             child: Box::new(text(4)),
         };
 
@@ -11230,6 +11409,7 @@ mod tests {
                         commanded: None,
                         axes: crate::layout::ScrollAxes::Vertical,
                         fill: false,
+                        indicators: crate::layout::ScrollIndicators::Visible,
                         path: None,
                         target: None,
                         child: Box::new(boundary("content", text(1000))),
@@ -11274,6 +11454,7 @@ mod tests {
             width: Some(100.0),
             height: None,
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             child: Box::new(text(5)),
         };
         let result = layout(&root, Proposal::unspecified());
@@ -11396,6 +11577,7 @@ mod tests {
             max_width: f64::INFINITY,
             max_height: 60.0,
             align: CrossAlign::Start,
+            vertical: CrossAlign::Center,
             child: Box::new(text(5)),
         };
         let size =
@@ -11409,6 +11591,7 @@ mod tests {
             min_width: 150.0,
             min_height: 0.0,
             align: CrossAlign::Start,
+            vertical: CrossAlign::Center,
             child: Box::new(text(5)),
         };
         let wide = measure_with_defaults(&lane, Proposal { width: Some(300.0), height: Some(50.0) });
@@ -11452,12 +11635,14 @@ mod tests {
             commanded: None,
             axes: crate::layout::ScrollAxes::Horizontal,
             fill: true,
+            indicators: crate::layout::ScrollIndicators::Visible,
             path: Some("table".to_string()),
             target: None,
             child: Box::new(LayoutNode::FlexFrame {
                 min_width: 100.0,
                 min_height: 0.0,
                 align: CrossAlign::Start,
+                vertical: CrossAlign::Center,
                 child: Box::new(text(5)),
             }),
         }
@@ -11683,6 +11868,7 @@ mod tests {
         let pile = LayoutNode::Layered {
             modal: true,
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             children: vec![
                 host("page"),
                 LayoutNode::Leaf { size: Size { width: 50.0, height: 50.0 } },
@@ -11787,6 +11973,7 @@ mod tests {
             commanded: None,
             axes: crate::layout::ScrollAxes::Vertical,
             fill: false,
+            indicators: crate::layout::ScrollIndicators::Visible,
             path: Some("doc".to_string()),
             target: None,
             // 3 rows of 16 = 48, well under the 200 on offer.
@@ -11808,6 +11995,7 @@ mod tests {
                 commanded: None,
                 axes: crate::layout::ScrollAxes::Vertical,
                 fill: false,
+                indicators: crate::layout::ScrollIndicators::Visible,
                 path: Some("doc".to_string()),
                 target: None,
                 child: Box::new(rows(40)),
@@ -11864,6 +12052,7 @@ mod tests {
             commanded: None,
             axes: crate::layout::ScrollAxes::Vertical,
             fill: false,
+            indicators: crate::layout::ScrollIndicators::Visible,
             path: Some("list".to_string()),
             target: None,
             child: Box::new(rows(10)),
@@ -11900,6 +12089,7 @@ mod tests {
             commanded: None,
             axes: crate::layout::ScrollAxes::Vertical,
             fill: false,
+            indicators: crate::layout::ScrollIndicators::Visible,
             path: Some("list".to_string()),
             target: None,
             child: Box::new(LayoutNode::Stack {
@@ -11937,6 +12127,7 @@ mod tests {
             commanded: None,
             axes: crate::layout::ScrollAxes::Vertical,
             fill: false,
+            indicators: crate::layout::ScrollIndicators::Visible,
             path: Some("list".to_string()),
             target: None,
             child: Box::new(rows(count)),
@@ -12252,6 +12443,7 @@ mod tests {
             width: Some(24.0),
             height: Some(24.0),
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             child: Box::new(icon_node(true)),
         };
         assert_eq!(
@@ -12311,6 +12503,7 @@ mod tests {
             width: Some(40.0),
             height: Some(20.0),
             align: CrossAlign::Center,
+            vertical: CrossAlign::Center,
             child: Box::new(icon_node(true)),
         };
         let result = layout(&node, Proposal::unspecified());

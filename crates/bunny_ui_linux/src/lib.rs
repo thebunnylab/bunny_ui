@@ -1818,9 +1818,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // ticks and `cmd-k` lets the keyboard go
                 let chorded = runtime.chord_tick();
                 // and the wheel's latch: two ticks with no wheel end
-                // the scroll gesture
-                runtime.wheel_tick();
-                if blinked || explained || chorded {
+                // the scroll gesture, and an overlay thumb goes with it
+                let unlatched = runtime.wheel_tick();
+                if blinked || explained || chorded || unlatched {
                     soon(runtime, root, ORIGIN_BLINK);
                 }
                 // the net under the beat: an ask that waited for a beat
