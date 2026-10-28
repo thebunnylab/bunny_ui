@@ -908,6 +908,9 @@ impl Host {
         }
         let Some(Pass { size, display, hosts, .. }) = self.pass(index) else { return };
         let display = self.pictured(index, &hosts, display);
+        // the wire has no turned line: each travels as the picture it is,
+        // at the two pixels a point a tool's canvas draws by default
+        let display = convert::turned_as_pictures(display, &*self.engines.text, 2);
         let scene = &self.scenes[index];
         let scale = scene.traits.resolved_scale().round().max(1.0) as usize;
         let width = (size.width * scale as f64).round().max(1.0) as usize;

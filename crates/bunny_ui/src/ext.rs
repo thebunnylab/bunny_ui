@@ -437,6 +437,41 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified::new(self, Modifier::BackgroundGradient(gradient))
     }
 
+    /// `repeating-linear-gradient(…)` with hard stops — bands of one ink
+    /// over the background and the ramp, under the content, cut to the
+    /// corner radius.
+    ///
+    /// ```ignore
+    /// // the share of a plan nobody has measured yet
+    /// bar.background_color(GROUND)
+    ///     .background_stripes(Stripes::new(Angle::degrees(135.0), 4.0, 8.0, HATCH))
+    /// ```
+    #[track_caller]
+    fn background_stripes(self, stripes: crate::shapes::Stripes) -> Modified<Self> {
+        Modified::new(self, Modifier::BackgroundStripes(stripes))
+    }
+
+    /// Turns the view a quarter, a half or three quarters — the label on
+    /// a chart's vertical axis, the spine of a side tab.
+    ///
+    /// ```ignore
+    /// text("Maturity (%)").quarter_turn(QuarterTurn::Counterclockwise)
+    /// ```
+    ///
+    /// Unlike SwiftUI's `rotationEffect`, the turn is LAYOUT, the way
+    /// CSS's `writing-mode` is: the view lays out upright in the box with
+    /// its axes swapped, and the box it answers is the turned one — the
+    /// row beside a vertical label makes room for it. Its lines are
+    /// shaped upright by the engine and their rasters turned, never
+    /// resampled ([`QuarterTurn`](crate::angle::QuarterTurn)). A glyph
+    /// inside turns its drawing; a photograph keeps its pixels upright.
+    /// Paint only turns: the hit regions inside stay where the upright
+    /// layout put them, so turn what a reader reads, not a control.
+    #[track_caller]
+    fn quarter_turn(self, turn: crate::angle::QuarterTurn) -> Modified<Self> {
+        Modified::new(self, Modifier::QuarterTurn(turn))
+    }
+
     /// `.rendering(Rendering::Gpu)` — on the web's element lowering
     /// this subtree insists on the pixel pipeline: a canvas island our
     /// layout positions, filled with the subtree's own draw commands.
@@ -528,6 +563,22 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     #[track_caller]
     fn border(self, color: Color, width: f64) -> Modified<Self> {
         Modified::new(self, Modifier::Border(color, width))
+    }
+
+    /// `border-style: dashed` — how the border's line is drawn, beside
+    /// the `.border(…)` that gives it an ink and a width.
+    ///
+    /// ```ignore
+    /// // a node still waiting for review
+    /// card.border(PENDING, 1.0).border_style(BorderStyle::Dashed)
+    /// ```
+    ///
+    /// The dashes follow the corner radius and keep the browser's
+    /// rhythm ([`BorderStyle`](crate::shapes::BorderStyle)); the element
+    /// lowering hands the browser the keyword itself.
+    #[track_caller]
+    fn border_style(self, style: crate::shapes::BorderStyle) -> Modified<Self> {
+        Modified::new(self, Modifier::BorderStyle(style))
     }
 
     /// `.cornerRadius(8)` — rounds THIS node's background.

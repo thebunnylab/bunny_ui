@@ -167,6 +167,10 @@ pub struct DomIcon {
     /// The drawing reads as a MASK: no draw carries its own colour to
     /// the browser, so every path takes the element's ink.
     pub forced: bool,
+    /// Radians clockwise about the grid's centre. The paths travel
+    /// already turned, so the browser draws the turn the house does
+    /// and the glue never hears about it.
+    pub turn: f32,
 }
 
 /// The visual record of a node — everything CSS will say about it, in
@@ -326,6 +330,15 @@ pub struct DomLook {
     pub hover_color: Option<Color>,
     pub pressed_color: Option<Color>,
     pub border: Option<(Color, Px)>,
+    /// `border-style` — the browser fits its own dashes, the same
+    /// rhythm the house traces.
+    pub border_style: Option<crate::shapes::BorderStyle>,
+    /// A `repeating-linear-gradient` over the background.
+    pub stripes: Option<crate::shapes::Stripes>,
+    /// A quarter turn of the box's content: `true` when the browser lays
+    /// it out (the flow lowering's `writing-mode`), `false` when the
+    /// engine placed it (a turn about the box's own corner).
+    pub turn: Option<(crate::angle::QuarterTurn, bool)>,
     pub corner_radius: Option<Corners>,
     pub shadow: Option<(Px, Color)>,
     /// `(response, damping)` of the enclosing animation scope — the
@@ -405,6 +418,9 @@ impl DomLook {
         hover_color: None,
         pressed_color: None,
         border: None,
+        border_style: None,
+        stripes: None,
+        turn: None,
         corner_radius: None,
         shadow: None,
         transition: None,
@@ -432,6 +448,9 @@ impl DomLook {
             hover_color: props.foreground_hovered,
             pressed_color: props.foreground_pressed,
             border: props.border,
+            border_style: props.border_style.filter(|_| props.border.is_some()),
+            stripes: props.stripes,
+            turn: None,
             corner_radius: props.corner_radius,
             shadow: props.shadow,
             transition: None,
@@ -462,6 +481,7 @@ impl DomLook {
             || props.foreground_hovered.is_some()
             || props.foreground_pressed.is_some()
             || props.border.is_some()
+            || props.stripes.is_some()
             || props.corner_radius.is_some()
             || props.shadow.is_some()
             || props.clip
@@ -813,6 +833,29 @@ impl DomCapture {
         // the node inherits the ink until a `Styled` says otherwise
         self.ink.push(self.current_ink());
         self.stack.push((child_origin, node));
+    }
+
+    /// Opens a turned box: the element at the turned `frame`, and inside
+    /// it, at the same corner, the UPRIGHT box (`upright`) the children
+    /// are placed in, turned about its own corner by the browser. The
+    /// turn rides CSS's `rotate` and `translate`, which compose with the
+    /// `transform` that positions every element instead of replacing it.
+    /// [`DomCapture::close_turned`] closes both.
+    pub(crate) fn open_turned(&mut self, frame: Rect, upright: Size, turn: crate::angle::QuarterTurn) {
+        self.open(DomKind::Box, frame, frame.origin);
+        self.open(DomKind::Box, Rect { origin: frame.origin, size: upright }, frame.origin);
+        if self.island > 0 {
+            return;
+        }
+        if let Some((_, node)) = self.stack.last_mut() {
+            node.style.look_mut().turn = Some((turn, false));
+        }
+    }
+
+    /// Closes what [`DomCapture::open_turned`] opened.
+    pub(crate) fn close_turned(&mut self) {
+        self.close();
+        self.close();
     }
 
     /// A pixel island owns effects that the DOM cannot apply inside its canvas.
@@ -2421,6 +2464,16 @@ fn island_commands(node: &DomNode, ctx: &LowerCtx) -> Vec<DrawCommand> {
                     range,
                     color,
                     font,
+                }
+            }
+            DrawCommand::TurnedText { pivot, content, range, color, font, turn } => {
+                DrawCommand::TurnedText {
+                    pivot: Point { x: pivot.x + dx, y: pivot.y + dy },
+                    content,
+                    range,
+                    color,
+                    font,
+                    turn,
                 }
             }
             DrawCommand::Gradient { rect, paint, corner_radius } => DrawCommand::Gradient {
@@ -4371,9 +4424,18 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                         crate::icon::Paint::Fill(crate::icon::Rule::NonZero) => (0u8, 0.0f32),
                         crate::icon::Paint::Fill(crate::icon::Rule::EvenOdd) => (1, 0.0),
                         crate::icon::Paint::Stroke { width } => (2, width),
+                        crate::icon::Paint::Dashed { width, .. } => (3, width),
                     };
                     out.push(paint);
                     push_f32(&mut out, width as f64);
+                    // a dashed pen hands the browser its own rhythm:
+                    // `stroke-dasharray`, `stroke-dashoffset` and the cap
+                    if let crate::icon::Paint::Dashed { dash, .. } = draw.paint {
+                        push_f32(&mut out, dash.on as f64);
+                        push_f32(&mut out, dash.off as f64);
+                        push_f32(&mut out, dash.phase as f64);
+                        out.push(dash.cap as u8);
+                    }
                     // a forced drawing hands over NO colour of its
                     // own, which is what makes every path inherit the
                     // element's ink — the browser already had the rule
@@ -4384,7 +4446,15 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                         }
                         None => out.push(0),
                     }
-                    push_bytes_u32(&mut out, crate::icon::to_svg_path(draw.path).as_bytes());
+                    let data = if icon.turn == 0.0 {
+                        crate::icon::to_svg_path(draw.path)
+                    } else {
+                        let centre = crate::icon::ICON_GRID / 2.0;
+                        let turned =
+                            crate::icon::turned(draw.path, f64::from(icon.turn), (centre, centre));
+                        crate::icon::to_svg_path(&turned)
+                    };
+                    push_bytes_u32(&mut out, data.as_bytes());
                 }
             }
             DomPatch::SetIframe { id, src, sealed } => {
@@ -4605,6 +4675,15 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
     if style.blur.is_some() {
         mask |= 1 << 25;
     }
+    if style.border_style.is_some() {
+        mask |= 1 << 28;
+    }
+    if style.stripes.is_some() {
+        mask |= 1 << 29;
+    }
+    if style.turn.is_some() {
+        mask |= 1 << 30;
+    }
     // a viewport's thumb: bit 31 and one byte at the record's end
     if style.scrollbar.is_some() {
         mask |= 1 << 31;
@@ -4702,6 +4781,23 @@ fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
     }
     if let Some(blur) = style.blur {
         push_f32(out, blur);
+    }
+    if let Some(border_style) = style.border_style {
+        out.push(border_style as u8);
+    }
+    if let Some(stripes) = style.stripes {
+        push_f32(out, stripes.angle.as_degrees());
+        push_f32(out, stripes.width);
+        push_f32(out, stripes.period);
+        push_u32(out, pack_color(stripes.ink));
+    }
+    if let Some((turn, flows)) = style.turn {
+        let quarter = match turn {
+            crate::angle::QuarterTurn::Clockwise => 0u8,
+            crate::angle::QuarterTurn::Half => 1,
+            crate::angle::QuarterTurn::Counterclockwise => 2,
+        };
+        out.push(quarter + if flows { 3 } else { 0 });
     }
     if let Some(indicators) = style.scrollbar {
         // 0 the overlay thumb (`thin`), 1 none (`none`); a visible bar
@@ -6993,6 +7089,9 @@ mod tests {
             hover_color: Some(Color::hex(0x556677)),
             pressed_color: Some(Color::hex(0x667788)),
             border: Some((Color::hex(0x778899), 1.5)),
+            border_style: None,
+            stripes: None,
+            turn: None,
             corner_radius: Some(Corners::all(6.0)),
             shadow: Some((4.0, Color::hex_a(0x0000_0040))),
             transition: Some((0.4, 0.8)),
@@ -7145,6 +7244,7 @@ mod tests {
             color: Color::hex(0x8A94A6),
             inherits_ink: false,
             forced: false,
+            turn: 0.0,
         };
         let bytes = encode(&[DomPatch::SetIcon { id: 7, icon }]);
         let expected: Vec<u8> = [
@@ -7170,6 +7270,72 @@ mod tests {
     /// every path inherits the element's ink — the rule the glue
     /// already had, reached by saying nothing instead of saying more.
     #[test]
+    fn a_look_says_its_border_style_its_bands_and_its_turn_after_the_rest() {
+        let ink = Color::hex(0x112233);
+        let look = DomLook {
+            border: Some((Color::BLACK, 1.0)),
+            border_style: Some(crate::shapes::BorderStyle::Dashed),
+            stripes: Some(crate::shapes::Stripes::new(crate::angle::Angle::degrees(135.0), 4.0, 8.0, ink)),
+            turn: Some((crate::angle::QuarterTurn::Counterclockwise, true)),
+            ..DomLook::NONE
+        };
+        let mut out = Vec::new();
+        encode_style(&mut out, &look);
+        let mask = u32::from_le_bytes(out[0..4].try_into().unwrap());
+        assert_eq!(mask, 1 << 3 | 1 << 28 | 1 << 29 | 1 << 30, "the border, its style, the bands, the turn");
+        let mut tail = vec![1u8];
+        for value in [135.0f32, 4.0, 8.0] {
+            tail.extend_from_slice(&value.to_le_bytes());
+        }
+        tail.extend_from_slice(&pack_color(ink).to_le_bytes());
+        // three quarters, laid out by the browser: the flow's code
+        tail.push(2 + 3);
+        assert!(out.ends_with(&tail), "{out:?}");
+        // the glue reads all three
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        for bit in ["mask & 268435456", "mask & 536870912", "mask & 1073741824"] {
+            assert!(glue.contains(bit), "glue_dom.js reads {bit}");
+        }
+        assert!(glue.contains("stroke-dasharray"), "glue_dom.js hands a dashed pen its rhythm");
+    }
+
+    #[test]
+    fn a_turned_icon_sends_its_paths_turned_and_a_dashed_draw_its_rhythm() {
+        const DASHED: crate::icon::Glyph = crate::icon::Glyph {
+            draws: &[crate::icon::Draw {
+                paint: crate::icon::Paint::Dashed {
+                    width: 2.0,
+                    dash: crate::icon::Dash::new(3.0, 1.0).cap(crate::icon::Cap::Round),
+                },
+                path: MARK_PATH,
+                tint: None,
+            }],
+        };
+        const DASHED_MARK: crate::icon::Symbol = crate::icon::Symbol::new("test.dashed", &DASHED);
+        let record = |symbol, turn| DomIcon {
+            key: 1,
+            symbol,
+            color: Color::BLACK,
+            inherits_ink: false,
+            forced: false,
+            turn,
+        };
+        let upright = encode(&[DomPatch::SetIcon { id: 7, icon: record(MARK, 0.0) }]);
+        let turned = encode(&[DomPatch::SetIcon { id: 7, icon: record(MARK, std::f32::consts::FRAC_PI_2) }]);
+        assert_ne!(upright, turned, "the path travels turned");
+        let centre = crate::icon::ICON_GRID / 2.0;
+        let path = crate::icon::to_svg_path(&crate::icon::turned(MARK_PATH, std::f64::consts::FRAC_PI_2, (centre, centre)));
+        assert!(turned.windows(path.len()).any(|window| window == path.as_bytes()));
+        let dashed = encode(&[DomPatch::SetIcon { id: 7, icon: record(DASHED_MARK, 0.0) }]);
+        let mut rhythm = vec![3u8];
+        for value in [2.0f32, 3.0, 1.0, 0.0] {
+            rhythm.extend_from_slice(&value.to_le_bytes());
+        }
+        rhythm.push(1);
+        assert!(dashed.windows(rhythm.len()).any(|window| window == rhythm), "paint 3, the pen, its rhythm and its cap");
+    }
+
+    #[test]
     fn a_forced_icon_hands_over_no_palette() {
         const ORANGE: Color = Color::hex(0xF78C3C);
         const TWO_TONE: crate::icon::Glyph = crate::icon::Glyph {
@@ -7186,6 +7352,7 @@ mod tests {
             color: Color::hex(0x8957E5),
             inherits_ink: false,
             forced,
+            turn: 0.0,
         };
         let plain = encode(&[DomPatch::SetIcon { id: 7, icon: record(false) }]);
         let forced = encode(&[DomPatch::SetIcon { id: 7, icon: record(true) }]);

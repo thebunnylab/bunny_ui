@@ -76,6 +76,191 @@ pub enum Paint {
     /// joins are ROUND — the one shape the house kernel draws exactly,
     /// and the only one the icon world uses.
     Stroke { width: f32 },
+    /// Ride the contour with a pen that lifts on a [`Dash`] rhythm —
+    /// the dashed edge of a proposed link, the dotted one of an
+    /// inferred one. A dash bends around the contour's corners; its
+    /// ENDS are the dash's [`Cap`].
+    Dashed { width: f32, dash: Dash },
+}
+
+/// How a pen ends — SVG's `stroke-linecap`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Cap {
+    /// Square, exactly at the end of the dash: what SVG and every CSS
+    /// `dashed` border draw unless told otherwise.
+    Butt,
+    /// Half a disc past the end. A dash of length zero is a round dot.
+    Round,
+    /// Half a pen past the end, square. A dash of length zero is a
+    /// square dot — the thin dotted border of a browser.
+    Square,
+}
+
+/// A pen that lifts on a rhythm: `on` of ink, `off` of air, starting
+/// `phase` into the pattern — SVG's two-value `stroke-dasharray` and its
+/// `stroke-dashoffset`, in the path's OWN units (grid units in a glyph,
+/// points in a painted path), so the rhythm survives every size the
+/// mark is drawn at.
+///
+/// ```ignore
+/// // `stroke-dasharray: 4 3` — a proposed edge
+/// Paint::Dashed { width: 1.5, dash: Dash::new(4.0, 3.0) }
+/// // round dots 4 apart — an inferred one
+/// Paint::Dashed { width: 2.0, dash: Dash::new(0.0, 4.0).cap(Cap::Round) }
+/// ```
+///
+/// The pattern restarts on every contour, which is what SVG does, and
+/// runs on across the corners of one. The house rasterizes it, so the
+/// CPU compositor, the GPU atlas and the browser canvas paint the same
+/// pixels, and the element lowering hands the browser the same numbers.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Dash {
+    pub on: f32,
+    pub off: f32,
+    pub phase: f32,
+    pub cap: Cap,
+}
+
+impl Dash {
+    /// `on` of ink then `off` of air, from the start, with butt ends.
+    pub const fn new(on: f32, off: f32) -> Dash {
+        Dash { on, off, phase: 0.0, cap: Cap::Butt }
+    }
+
+    /// Starts the walk this far into the pattern — the knob that makes
+    /// a dashed line crawl.
+    pub const fn phase(mut self, phase: f32) -> Dash {
+        self.phase = phase;
+        self
+    }
+
+    /// How every dash ends.
+    pub const fn cap(mut self, cap: Cap) -> Dash {
+        self.cap = cap;
+        self
+    }
+}
+
+/// A turned copy of a verb table: `radians` clockwise about `about`,
+/// in the table's own units. Lengths and pens are unchanged, so a
+/// turned path strokes exactly as wide as the upright one.
+///
+/// The painter turns a path about its own centre with
+/// [`Painter::path_turned`](crate::custom::Painter::path_turned); this is
+/// the same turn for a table the app keeps.
+pub fn turned(path: &[Verb], radians: f64, about: (f64, f64)) -> Vec<Verb> {
+    let spin = vector::Spin::about(radians, about.0, about.1);
+    let at = |x: f32, y: f32| {
+        let (x, y) = spin.apply(x as f64, y as f64);
+        (x as f32, y as f32)
+    };
+    path.iter()
+        .map(|verb| match *verb {
+            Verb::Move(x, y) => {
+                let (x, y) = at(x, y);
+                Verb::Move(x, y)
+            }
+            Verb::Line(x, y) => {
+                let (x, y) = at(x, y);
+                Verb::Line(x, y)
+            }
+            Verb::Quad(cx, cy, x, y) => {
+                let (cx, cy) = at(cx, cy);
+                let (x, y) = at(x, y);
+                Verb::Quad(cx, cy, x, y)
+            }
+            Verb::Cubic(ax, ay, bx, by, x, y) => {
+                let (ax, ay) = at(ax, ay);
+                let (bx, by) = at(bx, by);
+                let (x, y) = at(x, y);
+                Verb::Cubic(ax, ay, bx, by, x, y)
+            }
+            Verb::Close => Verb::Close,
+        })
+        .collect()
+}
+
+/// A dashed pen as plain geometry: the outlines of its dashes under a
+/// fill, or — under a round cap — the runs of ink under the round pen
+/// the house always had. In the table's own units.
+///
+/// Every reader that predates [`Paint::Dashed`] already draws what this
+/// answers, which is how a dashed mark crosses a boundary that cannot
+/// learn a new paint (the preview wire is frozen), and how a box's
+/// border, whose sides each fit their own rhythm, becomes ONE path.
+pub fn undashed(path: &[Verb], width: f32, dash: Dash) -> (Vec<Verb>, Paint) {
+    let one = vector::Placing { scale: 1.0, dx: 0.0, dy: 0.0, spin: vector::Spin::NONE };
+    let flat = vector::flatten(path, one);
+    let runs = vector::dash_runs(&flat, dash.on as f64, dash.off as f64, dash.phase as f64);
+    let (contours, paint) = match dash.cap {
+        Cap::Round => (vector::runs_as_contours(&runs), Paint::Stroke { width }),
+        Cap::Butt | Cap::Square => (
+            vector::runs_outline(&runs, width as f64, dash.cap == Cap::Square),
+            Paint::Fill(Rule::NonZero),
+        ),
+    };
+    let mut verbs = Vec::new();
+    for (points, sealed) in contours.contours() {
+        let Some(&(x, y)) = points.first() else { continue };
+        verbs.push(Verb::Move(x as f32, y as f32));
+        // a dot is a pen put down and lifted on one point — SVG strokes
+        // it, and so does the house
+        if points.len() == 1 {
+            verbs.push(Verb::Line(x as f32, y as f32));
+        }
+        verbs.extend(points[1..].iter().map(|&(x, y)| Verb::Line(x as f32, y as f32)));
+        if sealed {
+            verbs.push(Verb::Close);
+        }
+    }
+    (verbs, paint)
+}
+
+/// How long a verb table is, walked the way the house flattens it — the
+/// length a dash pattern is fitted to.
+pub(crate) fn length(path: &[Verb]) -> f64 {
+    let one = vector::Placing { scale: 1.0, dx: 0.0, dy: 0.0, spin: vector::Spin::NONE };
+    vector::flatten(path, one)
+        .contours()
+        .map(|(points, sealed)| {
+            let open: f64 = points.windows(2).map(|pair| {
+                (pair[1].0 - pair[0].0).hypot(pair[1].1 - pair[0].1)
+            }).sum();
+            match (sealed, points.first(), points.last()) {
+                (true, Some(first), Some(last)) => open + (first.0 - last.0).hypot(first.1 - last.1),
+                _ => open,
+            }
+        })
+        .sum()
+}
+
+/// One paint into a coverage mask, at `scale` device pixels per unit
+/// of the table. The one door every raster below goes through, so a
+/// glyph and a traced path dash alike.
+fn paint_into(mask: &mut vector::Mask, flat: &vector::Flattened, paint: Paint, scale: f64) {
+    match paint {
+        Paint::Fill(rule) => vector::fill_into(mask, flat, rule),
+        Paint::Stroke { width: pen } => vector::stroke_into(mask, flat, pen as f64 * scale),
+        Paint::Dashed { width: pen, dash } => {
+            let runs = vector::dash_runs(
+                flat,
+                dash.on as f64 * scale,
+                dash.off as f64 * scale,
+                dash.phase as f64 * scale,
+            );
+            let pen = pen as f64 * scale;
+            match dash.cap {
+                // the round pen IS the round cap, and its joints
+                Cap::Round => vector::stroke_into(mask, &vector::runs_as_contours(&runs), pen),
+                // a flat end is an outline the exact fill covers
+                Cap::Butt | Cap::Square => vector::fill_into(
+                    mask,
+                    &vector::runs_outline(&runs, pen, dash.cap == Cap::Square),
+                    Rule::NonZero,
+                ),
+            }
+        }
+    }
 }
 
 /// What the ink of a traced path IS: one colour, or a ramp. The ramp is
@@ -258,6 +443,7 @@ pub(crate) fn raster(
     symbol: &Symbol,
     color: Color,
     forced: bool,
+    turn: f32,
     width: usize,
     height: usize,
 ) -> Option<Rc<ImageRaster>> {
@@ -272,7 +458,7 @@ pub(crate) fn raster(
         if cache.len() >= ICON_KEEP {
             cache.clear();
         }
-        let raster = Rc::new(rasterize(symbol.glyph, color, forced, width, height));
+        let raster = Rc::new(rasterize(symbol.glyph, color, forced, turn, width, height));
         cache.insert((key, width, height), Rc::clone(&raster));
         Some(raster)
     })
@@ -422,15 +608,10 @@ fn rasterize_trace(
     } else {
         height as f64 / box_size.1 as f64
     };
-    let placing = vector::Placing { scale, dx: 0.0, dy: 0.0 };
+    let placing = vector::Placing { scale, dx: 0.0, dy: 0.0, spin: vector::Spin::NONE };
     let mut mask = vector::Mask::new(width, height);
     let flat = vector::flatten(path, placing);
-    match paint {
-        Paint::Fill(rule) => vector::fill_into(&mut mask, &flat, rule),
-        Paint::Stroke { width: pen } => {
-            vector::stroke_into(&mut mask, &flat, pen as f64 * scale)
-        }
-    }
+    paint_into(&mut mask, &flat, paint, scale);
     let mut rgba = vec![0u8; width * height * 4];
     match ink {
         Ink::Solid(color) => paint_mask(&mask, color, &mut rgba, width, height),
@@ -465,15 +646,18 @@ fn rasterize(
     glyph: &Glyph,
     color: Color,
     forced: bool,
+    turn: f32,
     width: usize,
     height: usize,
 ) -> ImageRaster {
     let side = width.min(height) as f64;
     let scale = side / ICON_GRID;
+    let centre = ICON_GRID / 2.0;
     let placing = vector::Placing {
         scale,
         dx: (width as f64 - side) / 2.0,
         dy: (height as f64 - side) / 2.0,
+        spin: vector::Spin::about(turn as f64, centre, centre),
     };
     // consecutive draws of ONE color pile into a union mask and blend
     // ONCE — a monochrome glyph stays byte for byte what it always
@@ -496,12 +680,7 @@ fn rasterize(
         run_color = Some(ink);
         scratch.clear();
         let flat = vector::flatten(draw.path, placing);
-        match draw.paint {
-            Paint::Fill(rule) => vector::fill_into(&mut scratch, &flat, rule),
-            Paint::Stroke { width: pen } => {
-                vector::stroke_into(&mut scratch, &flat, pen as f64 * scale)
-            }
-        }
+        paint_into(&mut scratch, &flat, draw.paint, scale);
         union.merge_max(&scratch);
     }
     flush(&mut union, &mut run_color, &mut rgba);
@@ -631,17 +810,80 @@ mod tests {
         assert_ne!(black.key(), SQUARE.key, "the tinted key leaves the bare one");
     }
 
+    const LINE: &[Verb] = &[Verb::Move(0.0, 5.0), Verb::Line(20.0, 5.0)];
+
+    fn trace_alpha(paint: Paint, x: usize, y: usize) -> u8 {
+        let raster = rasterize_trace(LINE, paint, Ink::Solid(INK), (20.0, 10.0), 20, 10);
+        raster.rgba[(y * 20 + x) * 4 + 3]
+    }
+
+    #[test]
+    fn a_dashed_pen_inks_its_dashes_and_lifts_between() {
+        let dashed = Paint::Dashed { width: 2.0, dash: Dash::new(4.0, 4.0) };
+        assert_eq!(trace_alpha(dashed, 1, 4), 255, "inside the first dash");
+        assert_eq!(trace_alpha(dashed, 5, 4), 0, "the air after it");
+        assert_eq!(trace_alpha(dashed, 9, 4), 255, "the second dash");
+        // the solid pen inks the air the dash leaves
+        assert_eq!(trace_alpha(Paint::Stroke { width: 2.0 }, 5, 4), 255);
+    }
+
+    #[test]
+    fn a_butt_end_stops_where_a_round_one_reaches_past() {
+        let butt = Paint::Dashed { width: 2.0, dash: Dash::new(4.0, 4.0) };
+        let round = Paint::Dashed { width: 2.0, dash: Dash::new(4.0, 4.0).cap(Cap::Round) };
+        let square = Paint::Dashed { width: 2.0, dash: Dash::new(4.0, 4.0).cap(Cap::Square) };
+        // the pixel just past the first dash's end
+        assert_eq!(trace_alpha(butt, 4, 4), 0, "a butt end stops at four");
+        assert!(trace_alpha(round, 4, 4) > 100, "a round end reaches half a pen past");
+        assert_eq!(trace_alpha(square, 4, 4), 255, "a square end covers the next pen's half");
+    }
+
+    #[test]
+    fn a_turned_glyph_is_the_drawing_turned_not_the_pixels() {
+        const BAR: &[Verb] = &[
+            Verb::Move(4.0, 10.0),
+            Verb::Line(20.0, 10.0),
+            Verb::Line(20.0, 14.0),
+            Verb::Line(4.0, 14.0),
+            Verb::Close,
+        ];
+        const BAR_GLYPH: Glyph = Glyph { draws: &[Draw { paint: Paint::Fill(Rule::NonZero), path: BAR, tint: None }] };
+        let at = |raster: &ImageRaster, x: usize, y: usize| raster.rgba[(y * 24 + x) * 4 + 3];
+        let upright = rasterize(&BAR_GLYPH, INK, false, 0.0, 24, 24);
+        assert_eq!(at(&upright, 6, 12), 255);
+        assert_eq!(at(&upright, 12, 6), 0);
+        let quarter = rasterize(&BAR_GLYPH, INK, false, std::f32::consts::FRAC_PI_2, 24, 24);
+        assert_eq!(at(&quarter, 6, 12), 0, "the bar left the row");
+        assert_eq!(at(&quarter, 12, 6), 255, "and stands in the column");
+        // a turn of zero is the bytes it always was
+        assert_eq!(upright.rgba, rasterize(&BAR_GLYPH, INK, false, 0.0, 24, 24).rgba);
+    }
+
+    #[test]
+    fn a_dash_lowers_to_the_geometry_every_reader_knows() {
+        let (verbs, paint) = undashed(LINE, 2.0, Dash::new(3.0, 2.0));
+        assert_eq!(paint, Paint::Fill(Rule::NonZero), "flat ends are outlines under a fill");
+        let closes = verbs.iter().filter(|verb| matches!(verb, Verb::Close)).count();
+        assert_eq!(closes, 4, "dashes at 0, 5, 10 and 15 on a line of twenty");
+        let (verbs, paint) = undashed(LINE, 2.0, Dash::new(0.0, 5.0).cap(Cap::Round));
+        assert_eq!(paint, Paint::Stroke { width: 2.0 }, "round dots ride the round pen");
+        let moves = verbs.iter().filter(|verb| matches!(verb, Verb::Move(..))).count();
+        assert_eq!(moves, 5, "a dot every five, both ends included");
+        // the length a rhythm is fitted to
+        assert!((length(LINE) - 20.0).abs() < 1e-9);
+    }
+
     #[test]
     fn the_glyph_cache_returns_the_same_allocation() {
-        let first = raster(1234, &SQUARE, INK, false, 24, 24).unwrap();
-        let second = raster(1234, &SQUARE, INK, false, 24, 24).unwrap();
+        let first = raster(1234, &SQUARE, INK, false, 0.0, 24, 24).unwrap();
+        let second = raster(1234, &SQUARE, INK, false, 0.0, 24, 24).unwrap();
         assert!(Rc::ptr_eq(&first, &second));
     }
 
     #[test]
     fn a_zero_side_paints_nothing() {
-        assert!(raster(9, &SQUARE, INK, false, 0, 24).is_none());
-        assert!(raster(9, &SQUARE, INK, false, 24, 0).is_none());
+        assert!(raster(9, &SQUARE, INK, false, 0.0, 0, 24).is_none());
+        assert!(raster(9, &SQUARE, INK, false, 0.0, 24, 0).is_none());
     }
 
     /// The oldest pin in the book: a glyph that IS a rectangle must
@@ -649,7 +891,7 @@ mod tests {
     /// untouched zeros outside, nothing in between.
     #[test]
     fn a_rectangle_glyph_matches_the_house_fill() {
-        let raster = rasterize(&SQUARE_GLYPH, INK, false, 24, 24);
+        let raster = rasterize(&SQUARE_GLYPH, INK, false, 0.0, 24, 24);
         for y in 0..24 {
             for x in 0..24 {
                 let want: [u8; 4] = if (4..20).contains(&x) && (4..20).contains(&y) {
@@ -689,7 +931,7 @@ mod tests {
             ],
         };
         let ink = Color { r: 20, g: 40, b: 60, a: 255 };
-        let raster = rasterize(&TWO_TONE, ink, false, 24, 24);
+        let raster = rasterize(&TWO_TONE, ink, false, 0.0, 24, 24);
         let pixel = |x: usize, y: usize| {
             let at = (y * 24 + x) * 4;
             [raster.rgba[at], raster.rgba[at + 1], raster.rgba[at + 2], raster.rgba[at + 3]]
@@ -725,7 +967,7 @@ mod tests {
             ],
         };
         let accent = Color { r: 137, g: 87, b: 229, a: 255 };
-        let raster = rasterize(&TWO_TONE, accent, true, 24, 24);
+        let raster = rasterize(&TWO_TONE, accent, true, 0.0, 24, 24);
         let pixel = |x: usize, y: usize| {
             let at = (y * 24 + x) * 4;
             [raster.rgba[at], raster.rgba[at + 1], raster.rgba[at + 2], raster.rgba[at + 3]]
@@ -742,8 +984,8 @@ mod tests {
     #[test]
     fn forcing_a_plain_glyph_changes_no_byte() {
         let ink = Color { r: 20, g: 40, b: 60, a: 255 };
-        let plain = rasterize(&SQUARE_GLYPH, ink, false, 24, 24);
-        let forced = rasterize(&SQUARE_GLYPH, ink, true, 24, 24);
+        let plain = rasterize(&SQUARE_GLYPH, ink, false, 0.0, 24, 24);
+        let forced = rasterize(&SQUARE_GLYPH, ink, true, 0.0, 24, 24);
         assert_eq!(plain.rgba, forced.rgba);
     }
 
@@ -785,7 +1027,7 @@ mod tests {
         const CIRCLE: Glyph =
             Glyph { draws: &[Draw { paint: Paint::Fill(Rule::NonZero), path: CIRCLE_PATH, tint: None }] };
         let side = 48;
-        let raster = rasterize(&CIRCLE, INK, false, side, side);
+        let raster = rasterize(&CIRCLE, INK, false, 0.0, side, side);
         let radius = side as f64 / 2.0;
         let mut beyond_two = 0usize;
         for y in 0..side {
@@ -814,7 +1056,7 @@ mod tests {
         // the glyph door and the runtime door share the same stone: a
         // 24 unit square drawn as a const glyph and the SAME verbs
         // traced into a 24 point box must land byte for byte
-        let glyph = rasterize(&SQUARE_GLYPH, INK, false, 24, 24);
+        let glyph = rasterize(&SQUARE_GLYPH, INK, false, 0.0, 24, 24);
         let trace = rasterize_trace(
             SQUARE_PATH,
             Paint::Fill(Rule::NonZero),

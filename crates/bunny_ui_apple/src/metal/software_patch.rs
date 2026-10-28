@@ -183,6 +183,24 @@ impl Scene {
                         return None;
                     }
                 }
+                // a turned line costs the raster its upright twin does,
+                // and the turn on top
+                DrawCommand::TurnedText { range, content, font, .. } => {
+                    bytes = bytes.checked_add(range.1.checked_sub(range.0)?)?;
+                    if bytes > MAX_TEXT_BYTES {
+                        return None;
+                    }
+                    let metrics = cache.get_or_measure(&content[range.0..range.1], font, text);
+                    if !metrics.width.is_finite() || !metrics.height().is_finite() {
+                        return None;
+                    }
+                    let width = (metrics.width * factor).ceil().max(0.0) as usize;
+                    let height = (metrics.height() * factor).ceil().max(0.0) as usize;
+                    text_pixels = text_pixels.checked_add(width.checked_mul(height)?.checked_mul(2)?)?;
+                    if text_pixels > budget.text {
+                        return None;
+                    }
+                }
                 DrawCommand::Gradient { .. }
                 | DrawCommand::Backdrop { .. }
                 | DrawCommand::Shadow { .. }
@@ -492,6 +510,16 @@ pub(super) fn patch_coordinates(
                     // Native scenes can outlive their source frame, including
                     // hidden patches. Retain only the visible text of a large
                     // document, before any scene or raster witness owns it.
+                    if content.len() > 4096 && range.1 - range.0 < content.len() / 4 {
+                        *content = std::sync::Arc::from(&content[range.0..range.1]);
+                        *range = (0, content.len());
+                    }
+                }
+                // a turned line snaps by its pivot alone, so the pivot
+                // snaps here, in window coordinates, and the patch's own
+                // snap of it lands on the same pixel
+                DrawCommand::TurnedText { pivot, content, range, .. } => {
+                    *pivot = point(*pivot);
                     if content.len() > 4096 && range.1 - range.0 < content.len() / 4 {
                         *content = std::sync::Arc::from(&content[range.0..range.1]);
                         *range = (0, content.len());

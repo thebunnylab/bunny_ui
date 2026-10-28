@@ -16,7 +16,8 @@ use std::hash::{Hash, Hasher};
 
 use crate::image_engine::{ImageEngine, ImageRaster, ImageSource, PixelFormat, raster_source};
 use crate::layout::{Color, Corners, DisplayList, DrawCommand, Rect};
-use crate::raster::{baseline_row, physical_extent};
+use crate::angle::QuarterTurn;
+use crate::raster::{baseline_row, physical_extent, turn_raster, turned_corner};
 use crate::text_engine::{FontKey, FontSpec, TextEngine};
 
 /// The run atlas: text tiles append into one shared texture. Runs wider
@@ -374,6 +375,10 @@ pub struct RunEntry {
     color: u32,
     scale: u32,
     content: String,
+    /// The turn its tiles were cut from — `None` for an upright line.
+    /// A turned entry holds the raster ALREADY turned, so it draws as
+    /// the upright sprites every entry draws as.
+    turn: Option<QuarterTurn>,
     pub tiles: Vec<Tile>,
     pub width: u32,
     pub height: u32,
@@ -381,6 +386,8 @@ pub struct RunEntry {
     /// what places it ([`crate::text_engine::TextRaster`]).
     pub baseline: u32,
     pub ascent: f64,
+    /// The UPRIGHT raster's size — what a turned entry is placed by.
+    pub upright: (u32, u32),
     /// The last walk that read it — what the collector asks before it
     /// gives a shelf back.
     pub walk: u64,
@@ -392,7 +399,7 @@ fn packed_color(color: Color) -> u32 {
 
 /// The lookup hash — computed WITHOUT allocating (typing must never pay
 /// a String per warm frame); collisions resolve by comparing the entry.
-fn run_hash(font: FontKey, color: u32, scale: u32, content: &str) -> u64 {
+fn run_hash(font: FontKey, color: u32, scale: u32, content: &str, turn: Option<QuarterTurn>) -> u64 {
     // every text line of every presented frame passes here: the house
     // hash, not SipHash
     let mut hasher = motor::hash::FxHasher::default();
@@ -400,6 +407,10 @@ fn run_hash(font: FontKey, color: u32, scale: u32, content: &str) -> u64 {
     color.hash(&mut hasher);
     scale.hash(&mut hasher);
     content.hash(&mut hasher);
+    // only a turned line folds its turn: an upright one hashes as it did
+    if let Some(turn) = turn {
+        turn.hash(&mut hasher);
+    }
     hasher.finish()
 }
 
@@ -655,26 +666,51 @@ impl RunAtlas {
         scale: usize,
         engine: &dyn TextEngine,
     ) -> Result<Option<&RunEntry>, AtlasFull> {
+        self.resolve_turned(ground, slice, font, color, scale, None, engine)
+    }
+
+    /// [`Atlas::resolve`] for a line that may be TURNED: the engine's
+    /// upright raster goes through [`turn_raster`], the one turn the CPU
+    /// compositor takes too, before it is cut into tiles — so a turned
+    /// line's sprites carry the compositor's bytes. Its `width` and
+    /// `height` are the turned raster's; `baseline` stays the upright
+    /// row, which [`turned_corner`] places by.
+    #[allow(clippy::too_many_arguments, reason = "resolve's own six, plus the turn it threads through")]
+    pub fn resolve_turned(
+        &mut self,
+        ground: &mut dyn AtlasGround,
+        slice: &str,
+        font: &FontSpec,
+        color: Color,
+        scale: usize,
+        turn: Option<QuarterTurn>,
+        engine: &dyn TextEngine,
+    ) -> Result<Option<&RunEntry>, AtlasFull> {
         let key = font.key();
         let packed = packed_color(color);
-        let hash = run_hash(key, packed, scale as u32, slice);
-        let warm = self.entries.get(&hash).is_some_and(|bucket| {
-            bucket.iter().any(|entry| {
-                entry.font == key
-                    && entry.color == packed
-                    && entry.scale == scale as u32
-                    && entry.content == slice
-            })
-        });
+        let hash = run_hash(key, packed, scale as u32, slice, turn);
+        let same = |entry: &RunEntry| {
+            entry.font == key
+                && entry.color == packed
+                && entry.scale == scale as u32
+                && entry.turn == turn
+                && entry.content == slice
+        };
+        let warm = self.entries.get(&hash).is_some_and(|bucket| bucket.iter().any(same));
         if !warm {
-            let Some(raster) = engine.raster_line(slice, font, color, scale) else {
+            let Some(upright) = engine.raster_line(slice, font, color, scale) else {
                 return Ok(None);
             };
             if !ground.ensure_shared(self.size) {
                 return Err(AtlasFull);
             }
-            let width = raster.width as u32;
-            let height = raster.height as u32;
+            let (width, height, rgba) = match turn {
+                None => (upright.width as u32, upright.height as u32, std::borrow::Cow::Borrowed(&upright.rgba[..])),
+                Some(turn) => {
+                    let turned = turn_raster(&upright, turn);
+                    (turned.width as u32, turned.height as u32, std::borrow::Cow::Owned(turned.rgba))
+                }
+            };
             let mut tiles = Vec::new();
             let mut chunk_x: u32 = 0;
             while chunk_x < width {
@@ -682,14 +718,7 @@ impl RunAtlas {
                 let Some((x, y)) = self.packer.place(chunk_width, height) else {
                     return Err(AtlasFull);
                 };
-                ground.upload_shared(
-                    x,
-                    y,
-                    chunk_width,
-                    height,
-                    &raster.rgba[chunk_x as usize * 4..],
-                    raster.width as u32,
-                );
+                ground.upload_shared(x, y, chunk_width, height, &rgba[chunk_x as usize * 4..], width);
                 tiles.push(Tile { x, y, width: chunk_width, height });
                 chunk_x += chunk_width;
             }
@@ -698,11 +727,13 @@ impl RunAtlas {
                 color: packed,
                 scale: scale as u32,
                 content: slice.to_string(),
+                turn,
                 tiles,
                 width,
                 height,
-                baseline: raster.baseline as u32,
-                ascent: raster.ascent,
+                baseline: upright.baseline as u32,
+                ascent: upright.ascent,
+                upright: (upright.width as u32, upright.height as u32),
                 walk: self.walk,
             });
         }
@@ -710,14 +741,7 @@ impl RunAtlas {
         let entry = self
             .entries
             .get_mut(&hash)
-            .and_then(|bucket| {
-                bucket.iter_mut().find(|entry| {
-                    entry.font == key
-                        && entry.color == packed
-                        && entry.scale == scale as u32
-                        && entry.content == slice
-                })
-            })
+            .and_then(|bucket| bucket.iter_mut().find(|entry| same(entry)))
             .expect("a run just resolved lives in the atlas");
         // read this walk: the collector keeps what a recent walk read
         entry.walk = walk;
@@ -1394,6 +1418,55 @@ pub fn build_frame(
                     );
                 }
             }
+            DrawCommand::TurnedText { pivot, content, range, color, font, turn } => {
+                let Some(clip) = effective_clip(&clips, whole) else { continue };
+                let slice = &content[range.0..range.1];
+                let Some(entry) =
+                    atlas.resolve_turned(ground, slice, font, *color, scale, Some(*turn), engine)?
+                else {
+                    continue;
+                };
+                // the composite_turned mirror: the pivot snapped once, the
+                // turned raster's texels pasted 1:1 from the corner it
+                // names
+                let upright = (entry.upright.0 as usize, entry.upright.1 as usize, entry.baseline as usize);
+                let (base_x, base_y) = turned_corner(*pivot, upright, *turn, scale);
+                let dest =
+                    (base_x, base_y, base_x + entry.width as i64, base_y + entry.height as i64);
+                if box_intersect(dest, clip).is_none() {
+                    continue;
+                }
+                let mut chunk_x: i64 = 0;
+                for tile in &entry.tiles {
+                    let chunk = (
+                        base_x + chunk_x,
+                        base_y,
+                        base_x + chunk_x + tile.width as i64,
+                        base_y + tile.height as i64,
+                    );
+                    chunk_x += tile.width as i64;
+                    if box_intersect(chunk, clip).is_none() {
+                        continue;
+                    }
+                    batches.sprites.push(SpriteInstance {
+                        dest: [chunk.0 as f32, chunk.1 as f32, chunk.2 as f32, chunk.3 as f32],
+                        tex: [
+                            tile.x as f32,
+                            tile.y as f32,
+                            (tile.x + tile.width) as f32,
+                            (tile.y + tile.height) as f32,
+                        ],
+                        clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
+                    });
+                    note_run(
+                        &mut batches.runs,
+                        RunKind::Sprites,
+                        round_of(&clips),
+                        batches.sprites.len() - 1,
+                        sprite_box(&batches.sprites[batches.sprites.len() - 1]),
+                    );
+                }
+            }
             DrawCommand::Image { rect, source } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
                 let width = physical_extent(rect.size.width, scale) as u32;
@@ -1809,6 +1882,55 @@ mod tests {
             color: Color::rgba(240, 240, 240, 255),
             font: FontSpec::DEFAULT,
         });
+    }
+
+    #[test]
+    fn a_turned_line_rides_the_atlas_where_the_compositor_blits_it() {
+        let font = FontSpec::DEFAULT;
+        let pivot = crate::layout::Point { x: 30.25, y: 90.5 };
+        let turn = crate::angle::QuarterTurn::Counterclockwise;
+        let display = DisplayList::from(vec![DrawCommand::TurnedText {
+            pivot,
+            content: std::sync::Arc::from("Axis"),
+            range: (0, 4),
+            color: Color::rgba(20, 30, 40, 255),
+            font,
+            turn,
+        }]);
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let mut batches = FrameBatches::default();
+        build_frame(
+            &mut ground,
+            &display,
+            2,
+            (200, 240),
+            &crate::text_engine::PixelFont,
+            &crate::image_engine::RawImages::default(),
+            &mut atlas,
+            &mut batches,
+        )
+        .expect("the line fits the atlas");
+        // the bytes and the corner the CPU compositor uses
+        let upright = crate::text_engine::PixelFont
+            .raster_line("Axis", &font, Color::rgba(20, 30, 40, 255), 2)
+            .expect("the house font paints");
+        let turned = turn_raster(&upright, turn);
+        let (x, y) = turned_corner(pivot, (upright.width, upright.height, upright.baseline), turn, 2);
+        assert_eq!(batches.sprites.len(), 1, "one tile: the turned line is narrow");
+        assert_eq!(
+            batches.sprites[0].dest,
+            [x as f32, y as f32, (x + turned.width as i64) as f32, (y + turned.height as i64) as f32],
+            "the sprite stands where the compositor blits",
+        );
+        let (_, _, w, h, _) = ground.uploads[0];
+        assert_eq!((w as usize, h as usize), (turned.width, turned.height), "the atlas holds the turned raster");
+        // an upright line of the same words is another entry, untouched
+        let upright_entry = atlas
+            .resolve(&mut ground, "Axis", &font, Color::rgba(20, 30, 40, 255), 2, &crate::text_engine::PixelFont)
+            .expect("fits")
+            .expect("paints");
+        assert_eq!((upright_entry.width as usize, upright_entry.height as usize), (upright.width, upright.height));
     }
 
     #[test]

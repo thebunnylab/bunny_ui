@@ -1138,13 +1138,14 @@ impl Walk<'_> {
                     None => out.push(node(DomKind::Box)),
                 }
             }
-            LayoutNode::Icon { symbol, forced, .. } => {
+            LayoutNode::Icon { symbol, forced, turn, .. } => {
                 out.push(node(DomKind::Icon(crate::dom::DomIcon {
                     key: symbol.key,
                     symbol: *symbol,
                     color: self.current_ink(),
                     inherits_ink: !self.ink_scopes.is_empty(),
                     forced: *forced,
+                    turn: *turn,
                 })));
             }
             LayoutNode::Scroll { path, target, commanded, child, axes, fill, indicators, .. } => {
@@ -1447,6 +1448,17 @@ impl Walk<'_> {
             #[cfg(not(feature = "canvas"))]
             LayoutNode::ExactLayout { .. } => {
                 out.push(node(DomKind::Box));
+            }
+            // the browser lays the flow out, so the turn is its own
+            // `writing-mode`: the box swaps its axes natively and the
+            // row beside it makes room, as the engine's layout does
+            LayoutNode::Turned { turn, child } => {
+                let mut turned = node(DomKind::Box);
+                turned.style.look_mut().turn = Some((*turn, true));
+                let mut children = Vec::new();
+                self.lower_into(child, &mut children);
+                turned.children = children;
+                out.push(turned);
             }
             #[cfg(feature = "canvas")]
             LayoutNode::Island { path, child } => {

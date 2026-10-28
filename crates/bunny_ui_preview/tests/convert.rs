@@ -82,7 +82,7 @@ fn images_travel_by_key_with_their_wraps_folded_in() {
     assert_eq!(sent.key, 7);
     let received = image_source(&sent).expect("rgba comes back");
     assert!(matches!(received, ImageSource::Rgba { key: 7, size: (1, 1), .. }));
-    let symbol = resource(&ImageSource::Symbol { key: 11, symbol: bunny_ui::icon::house::CHECK, color: Color::BLACK, forced: false }).unwrap();
+    let symbol = resource(&ImageSource::Symbol { key: 11, symbol: bunny_ui::icon::house::CHECK, color: Color::BLACK, forced: false, turn: 0.0 }).unwrap();
     assert!(matches!(image_source(&symbol), Some(ImageSource::Symbol { key: 11, .. })));
     let raised = raise(
         &[wire::Draw::Image { rect: wire::Rect::default(), image }],
@@ -594,4 +594,52 @@ fn an_app_symbol_travels_under_its_drawings_identity() {
     let display = DisplayList::from(vec![DrawCommand::Image { rect: Rect::default(), source: arch.clone() }]);
     let (commands, _) = lower(&display, &mut strings);
     assert!(matches!(commands.as_slice(), [wire::Draw::Image { image, .. }] if image.key == key(&arch)));
+}
+
+#[test]
+fn the_frozen_wire_carries_a_dash_a_turn_and_a_turned_line_as_what_they_draw() {
+    // a dashed path travels as the plain geometry it draws
+    let dashed = ImageSource::path(
+        vec![Move(0.0, 5.0), Line(20.0, 5.0)],
+        Paint::Dashed { width: 2.0, dash: Dash::new(3.0, 2.0) },
+        Ink::Solid(Color::BLACK),
+        (20.0, 10.0),
+    );
+    let sent = resource(&dashed).expect("a path has bytes");
+    let wire::ResourceKind::Vector { paint, verbs, .. } = &sent.kind else { panic!("{:?}", sent.kind) };
+    assert_eq!(*paint, wire::Paint::Fill { even_odd: false }, "flat ends are outlines under a fill");
+    assert!(verbs.iter().filter(|verb| matches!(verb, wire::Verb::Close)).count() >= 4, "one outline a dash");
+    // the tool draws what the host drew
+    let raised = image_source(&sent).expect("the vector comes back");
+    let engine = bunny_ui::image_engine::RawImages::default();
+    let host = raster_source(&engine, &dashed, 20, 10).expect("the host paints");
+    let tool = raster_source(&engine, &raised, 20, 10).expect("the tool paints");
+    let ink = |raster: &bunny_ui::image_engine::ImageRaster| raster.rgba.chunks(4).filter(|pixel| pixel[3] > 128).count();
+    assert_eq!(ink(&host), ink(&tool), "the same dashes on both sides");
+
+    // a turned glyph travels with its verbs turned, under its own key
+    let upright = ImageSource::symbol(symbol::CHEVRON_RIGHT, Color::BLACK);
+    let turned = ImageSource::symbol_turned(symbol::CHEVRON_RIGHT, Color::BLACK, false, Angle::degrees(90.0));
+    let (upright_ref, _) = image_ref(&upright);
+    let (turned_ref, inner) = image_ref(&turned);
+    assert_ne!(upright_ref.key, turned_ref.key);
+    assert!(
+        !matches!(&*inner, ImageSource::Symbol { turn, .. } if *turn != 0.0),
+        "the wire never hears of a turn: {inner:?}"
+    );
+
+    // a turned line becomes the picture it paints
+    let display = DisplayList::from(vec![DrawCommand::TurnedText {
+        pivot: Point { x: 10.0, y: 60.0 },
+        content: "Axis".into(),
+        range: (0, 4),
+        color: Color::BLACK,
+        font: FontSpec::DEFAULT,
+        turn: QuarterTurn::Counterclockwise,
+    }]);
+    let pictured = bunny_ui_preview::convert::turned_as_pictures(display, &PixelFont, 2);
+    assert!(matches!(
+        pictured.iter().next(),
+        Some(DrawCommand::Image { source: ImageSource::Rgba { .. }, .. })
+    ));
 }

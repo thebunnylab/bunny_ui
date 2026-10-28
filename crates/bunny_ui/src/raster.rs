@@ -22,6 +22,7 @@ use crate::glass::{Lens, Pyramid};
 use crate::layout::{
     Color, Corners, DisplayList, DrawCommand, GlassPaint, GradientPaint, Point, Rect,
 };
+use crate::angle::QuarterTurn;
 use crate::text_engine::{PixelFont, TextEngine, TextRaster};
 
 /// An RGBA buffer (one `0xRRGGBBAA` `u32` per pixel, rows top to
@@ -798,6 +799,20 @@ impl Bitmap {
         self.blit_rgba(base_x, base_y, raster.width, raster.height, &raster.rgba);
     }
 
+    /// A turned line at its pivot — [`turn_raster`] then the same blit
+    /// every raster takes, at [`turned_corner`].
+    fn composite_turned(
+        &mut self,
+        pivot: crate::layout::Point,
+        turn: QuarterTurn,
+        scale: usize,
+        raster: &TextRaster,
+    ) {
+        let turned = turn_raster(raster, turn);
+        let (x, y) = turned_corner(pivot, (raster.width, raster.height, raster.baseline), turn, scale);
+        self.blit_rgba(x, y, turned.width, turned.height, &turned.rgba);
+    }
+
     /// Source-over blit of ANY straight-alpha RGBA rectangle (images, and
     /// text through [`Self::composite_text`]) at the logical origin,
     /// snapped ONCE — the pixels already come in physical size.
@@ -856,6 +871,49 @@ pub fn physical_extent(length: f64, scale: usize) -> usize {
 /// whoever paints it; row [`TextRaster::baseline`] goes there.
 pub fn baseline_row(origin_y: f64, ascent: f64, scale: usize) -> i64 {
     ((origin_y + ascent) * scale as f64).round() as i64
+}
+
+/// An upright line's raster, TURNED: each pixel moves to another pixel
+/// and none is resampled, so the glyphs stay exactly as the engine drew
+/// them. Every pipeline turns through this one function, which is what
+/// keeps them byte for byte alike.
+pub fn turn_raster(raster: &TextRaster, turn: QuarterTurn) -> crate::image_engine::ImageRaster {
+    let (w, h) = (raster.width, raster.height);
+    let (out_w, out_h) = if turn.swaps_axes() { (h, w) } else { (w, h) };
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let (tx, ty) = match turn {
+                QuarterTurn::Clockwise => (h - 1 - y, x),
+                QuarterTurn::Half => (w - 1 - x, h - 1 - y),
+                QuarterTurn::Counterclockwise => (y, w - 1 - x),
+            };
+            let from = (y * w + x) * 4;
+            let to = (ty * out_w + tx) * 4;
+            rgba[to..to + 4].copy_from_slice(&raster.rgba[from..from + 4]);
+        }
+    }
+    crate::image_engine::ImageRaster { width: out_w, height: out_h, rgba }
+}
+
+/// Where a turned raster's top-left lands, in physical pixels: the
+/// pivot — the start of the line on its baseline — snapped ONCE, and
+/// the upright raster's baseline row standing on it, turned. The
+/// upright twin is [`baseline_row`]; both round the same point.
+pub fn turned_corner(
+    pivot: crate::layout::Point,
+    upright: (usize, usize, usize),
+    turn: QuarterTurn,
+    scale: usize,
+) -> (i64, i64) {
+    let (width, height, baseline) = (upright.0 as i64, upright.1 as i64, upright.2 as i64);
+    let x = (pivot.x * scale as f64).round() as i64;
+    let y = (pivot.y * scale as f64).round() as i64;
+    match turn {
+        QuarterTurn::Clockwise => (x - (height - baseline), y),
+        QuarterTurn::Half => (x - width, y - (height - baseline)),
+        QuarterTurn::Counterclockwise => (x - baseline, y - width),
+    }
 }
 
 fn scale_rect(rect: Rect, scale: f64) -> Rect {
@@ -995,6 +1053,16 @@ pub fn list_bounds(
                     origin.y + metrics.height() + 1.0,
                 );
             }
+            DrawCommand::TurnedText { pivot, content, range, font, turn, .. } => {
+                let metrics = cache.get_or_measure(&content[range.0..range.1], font, text);
+                let Rect { origin, size } = turn.line_box(*pivot, &metrics);
+                fold(
+                    origin.x - 1.0,
+                    origin.y - 1.0,
+                    origin.x + size.width + 1.0,
+                    origin.y + size.height + 1.0,
+                );
+            }
             DrawCommand::PushClip { .. } | DrawCommand::PopClip => {}
         }
     }
@@ -1062,6 +1130,8 @@ pub fn range_covers(
                 f64::INFINITY,
                 origin.y + font.size * 3.0,
             ),
+            // the command's own superset reach, which needs no engine
+            turned @ DrawCommand::TurnedText { .. } => turned.may_reach(rect),
             DrawCommand::PushClip { .. } | DrawCommand::PopClip => false,
         })
 }
@@ -1120,6 +1190,7 @@ pub fn carve_covering(
         DrawCommand::TextLine { origin, font, .. } => {
             hits(origin.x - 1.0, origin.y - 1.0, f64::INFINITY, origin.y + font.size * 3.0)
         }
+        turned @ DrawCommand::TurnedText { .. } => turned.may_reach(rect),
         DrawCommand::PushClip { .. } | DrawCommand::PopClip => false,
     };
     let mut carves: Vec<(usize, usize)> = Vec::new();
@@ -1233,6 +1304,12 @@ pub fn rasterize_over(
                     bitmap.composite_text(origin.x, origin.y, scale, &raster);
                 }
             }
+            DrawCommand::TurnedText { pivot, content, range, color, font, turn } => {
+                let slice = &content[range.0..range.1];
+                if let Some(raster) = text.raster_line(slice, font, *color, scale) {
+                    bitmap.composite_turned(*pivot, *turn, scale, &raster);
+                }
+            }
             DrawCommand::Image { rect, source } => {
                 let width = physical_extent(rect.size.width, scale);
                 let height = physical_extent(rect.size.height, scale);
@@ -1334,6 +1411,12 @@ fn command_box(
                 x + (metrics.width * factor).ceil() as i64 + 2,
                 y + (metrics.height() * factor).ceil() as i64 + 2,
             )
+        }
+        DrawCommand::TurnedText { pivot, content, range, font, turn, .. } => {
+            let metrics = cache.get_or_measure(&content[range.0..range.1], font, text);
+            let (x0, y0, x1, y1) = Bitmap::snap(scale_rect(turn.line_box(*pivot, &metrics), factor));
+            // the same slack, on every side the snap could move
+            (x0 - 2, y0 - 2, x1 + 2, y1 + 2)
         }
         // the destination rect is the whole truth — no slack needed
         DrawCommand::Image { rect, .. } => Bitmap::snap(scale_rect(*rect, factor)),
@@ -1711,6 +1794,12 @@ impl Surface {
                             self.bitmap.composite_text(origin.x, origin.y, self.scale, &raster);
                         }
                     }
+                    DrawCommand::TurnedText { pivot, content, range, color, font, turn } => {
+                        let slice = &content[range.0..range.1];
+                        if let Some(raster) = text.raster_line(slice, font, *color, self.scale) {
+                            self.bitmap.composite_turned(*pivot, *turn, self.scale, &raster);
+                        }
+                    }
                     DrawCommand::Image { rect: image_rect, source } => {
                         let width = physical_extent(image_rect.size.width, self.scale);
                         let height = physical_extent(image_rect.size.height, self.scale);
@@ -1983,6 +2072,40 @@ mod tests {
     }
     use super::*;
     use crate::layout::{DrawCommand, Glass, Point};
+
+    /// A raster whose every pixel says where it came from.
+    fn numbered(width: usize, height: usize, baseline: usize) -> TextRaster {
+        let rgba = (0..width * height).flat_map(|i| [i as u8, 0, 0, 255]).collect();
+        TextRaster { width, height, baseline, ascent: baseline as f64, rgba }
+    }
+
+    #[test]
+    fn a_quarter_turn_moves_every_pixel_to_its_place() {
+        // 3 wide, 2 tall: rows [0 1 2] [3 4 5]
+        let raster = numbered(3, 2, 1);
+        let red = |turned: &crate::image_engine::ImageRaster| -> Vec<u8> {
+            turned.rgba.chunks(4).map(|pixel| pixel[0]).collect()
+        };
+        let clockwise = turn_raster(&raster, QuarterTurn::Clockwise);
+        assert_eq!((clockwise.width, clockwise.height), (2, 3));
+        assert_eq!(red(&clockwise), vec![3, 0, 4, 1, 5, 2], "the left column comes from the bottom row");
+        let counter = turn_raster(&raster, QuarterTurn::Counterclockwise);
+        assert_eq!(red(&counter), vec![2, 5, 1, 4, 0, 3], "the start of the line sinks to the bottom");
+        let half = turn_raster(&raster, QuarterTurn::Half);
+        assert_eq!((half.width, half.height), (3, 2));
+        assert_eq!(red(&half), vec![5, 4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn a_turned_raster_stands_its_baseline_on_the_snapped_pivot() {
+        let pivot = Point { x: 10.4, y: 20.6 };
+        // thirty wide, twelve tall, standing on row nine
+        let upright = (30, 12, 9);
+        // the pivot snaps once, at two pixels a point: (21, 41)
+        assert_eq!(turned_corner(pivot, upright, QuarterTurn::Counterclockwise, 2), (21 - 9, 41 - 30));
+        assert_eq!(turned_corner(pivot, upright, QuarterTurn::Clockwise, 2), (21 - 3, 41));
+        assert_eq!(turned_corner(pivot, upright, QuarterTurn::Half, 2), (21 - 30, 41 - 3));
+    }
 
     /// Draws the ascii portrait of a bitmap patch — a readable golden.
     fn portrait(bitmap: &Bitmap, x: usize, y: usize, w: usize, h: usize, ink: u32) -> String {

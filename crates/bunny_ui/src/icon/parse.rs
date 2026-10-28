@@ -78,6 +78,10 @@ pub fn to_rust_const(const_name: &str, name: &str, parsed: &ParsedGlyph) -> Stri
             Paint::Fill(Rule::NonZero) => "Paint::Fill(Rule::NonZero)".to_string(),
             Paint::Fill(Rule::EvenOdd) => "Paint::Fill(Rule::EvenOdd)".to_string(),
             Paint::Stroke { width } => format!("Paint::Stroke {{ width: {width:?} }}"),
+            Paint::Dashed { width, dash } => format!(
+                "Paint::Dashed {{ width: {width:?}, dash: Dash::new({:?}, {:?}).phase({:?}).cap(Cap::{:?}) }}",
+                dash.on, dash.off, dash.phase, dash.cap
+            ),
         };
         let tint_source = match tint {
             Some(color) => format!(
@@ -393,8 +397,15 @@ pub fn parse(svg: &str) -> Result<ParsedGlyph, SvgError> {
     let dy = (super::ICON_GRID as f32 - height * scale) / 2.0 - min_y * scale;
     let place = |x: f32, y: f32| (x * scale + dx, y * scale + dy);
     for (paint, path, _) in &mut out.draws {
-        if let Paint::Stroke { width } = paint {
-            *width *= scale;
+        match paint {
+            Paint::Stroke { width } => *width *= scale,
+            Paint::Dashed { width, dash } => {
+                *width *= scale;
+                dash.on *= scale;
+                dash.off *= scale;
+                dash.phase *= scale;
+            }
+            Paint::Fill(_) => {}
         }
         for verb in path {
             *verb = match *verb {
@@ -653,7 +664,12 @@ fn push_draws(out: &mut ParsedGlyph, state: &Inherited, verbs: Vec<Verb>) {
 fn dash_verbs(verbs: &[Verb], pattern: &[f32]) -> Vec<Verb> {
     let flat = crate::icon::vector::flatten(
         verbs,
-        crate::icon::vector::Placing { scale: 1.0, dx: 0.0, dy: 0.0 },
+        crate::icon::vector::Placing {
+            scale: 1.0,
+            dx: 0.0,
+            dy: 0.0,
+            spin: crate::icon::vector::Spin::NONE,
+        },
     );
     let cycle: f32 = pattern.iter().sum();
     if cycle <= 0.0 {

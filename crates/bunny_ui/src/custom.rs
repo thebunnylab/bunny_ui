@@ -584,6 +584,9 @@ impl<'a> Painter<'a> {
                 DrawCommand::TextLine { origin, content, range, color, font } => {
                     DrawCommand::TextLine { origin: self.at(origin), content, range, color, font }
                 }
+                DrawCommand::TurnedText { pivot, content, range, color, font, turn } => {
+                    DrawCommand::TurnedText { pivot: self.at(pivot), content, range, color, font, turn }
+                }
                 DrawCommand::Image { rect, source } => DrawCommand::Image { rect: self.shift(rect), source },
                 DrawCommand::PushClip { rect, corner_radius } => DrawCommand::PushClip { rect: self.shift(rect), corner_radius },
                 DrawCommand::PopClip => DrawCommand::PopClip,
@@ -698,6 +701,42 @@ impl<'a> Painter<'a> {
         });
     }
 
+    /// One line of text TURNED — the label on a chart's vertical axis.
+    /// The engine shapes and rasterizes it upright, through the caches
+    /// every line shares, and the raster turns without resampling.
+    ///
+    /// `pivot` is where the line STARTS ON ITS BASELINE: the point an
+    /// upright line and its turned twin share, and the one the baseline
+    /// snaps at. From the turned box's top-left corner, ask the turn:
+    ///
+    /// ```ignore
+    /// let line = ctx.line("Maturity (%)");
+    /// let turn = QuarterTurn::Counterclockwise;
+    /// // centred down the left edge of the plot
+    /// let origin = Point { x: 4.0, y: (plot.height - line.width) / 2.0 };
+    /// p.text_turned(turn.pivot_in(origin, &line), "Maturity (%)", p.ink(), turn);
+    /// ```
+    pub fn text_turned(
+        &mut self,
+        pivot: Point,
+        content: impl Into<Arc<str>>,
+        color: Color,
+        turn: crate::angle::QuarterTurn,
+    ) {
+        let content = content.into();
+        if content.is_empty() {
+            return;
+        }
+        self.display.push(DrawCommand::TurnedText {
+            pivot: self.at(pivot),
+            range: (0, content.len()),
+            content,
+            color,
+            font: self.font,
+            turn,
+        });
+    }
+
     /// One image, at the platform's own decode of the destination size.
     /// A feed (`&ImageFeed`) goes through the same door: the GPU scales
     /// its newest frame into `rect`.
@@ -737,6 +776,100 @@ impl<'a> Painter<'a> {
             rect: self.shift(square),
             source: ImageSource::symbol(symbol, color),
         });
+    }
+
+    /// [`Painter::icon`] turned about the square's centre — clockwise,
+    /// at any angle. Inside a `.looping(…)` box the phase is the loader:
+    ///
+    /// ```ignore
+    /// p.icon_turned(rect, symbol::LOADER, p.ink(), Angle::radians(ctx.phase * TAU))
+    /// ```
+    ///
+    /// Each angle is its own tile, and the traced cache keeps a cycle's
+    /// worth of them warm without crowding out the still icons.
+    pub fn icon_turned(
+        &mut self,
+        rect: Rect,
+        symbol: crate::icon::Symbol,
+        color: Color,
+        angle: crate::angle::Angle,
+    ) {
+        let side = rect.size.width.min(rect.size.height);
+        if side <= 0.0 {
+            return;
+        }
+        let square = Rect {
+            origin: Point {
+                x: rect.origin.x + (rect.size.width - side) / 2.0,
+                y: rect.origin.y + (rect.size.height - side) / 2.0,
+            },
+            size: Size { width: side, height: side },
+        };
+        self.display.push(DrawCommand::Image {
+            rect: self.shift(square),
+            source: ImageSource::symbol_turned(symbol, color, false, angle),
+        });
+    }
+
+    /// [`Painter::path`] turned about the centre of the path's own box —
+    /// a mark drawn upright in the table, shown at an angle. The pen
+    /// keeps its width and a dash its rhythm.
+    pub fn path_turned(
+        &mut self,
+        verbs: &[crate::icon::Verb],
+        paint: crate::icon::Paint,
+        ink: impl Into<crate::icon::Ink>,
+        angle: crate::angle::Angle,
+    ) {
+        if angle.is_zero() {
+            self.path(verbs, paint, ink);
+            return;
+        }
+        let Some((min_x, min_y, max_x, max_y)) = crate::icon::bounds(verbs) else {
+            return;
+        };
+        let centre = ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0);
+        let turned = crate::icon::turned(verbs, angle.as_radians(), centre);
+        self.path(&turned, paint, ink);
+    }
+
+    /// A border in a [`BorderStyle`](crate::shapes::BorderStyle) — the
+    /// same line `.border(…).border_style(…)` draws, for a box the app
+    /// paints itself. A solid one is [`Painter::stroke`].
+    pub fn border(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        width: Px,
+        style: crate::shapes::BorderStyle,
+        corner_radius: impl Into<Corners>,
+    ) {
+        let corner_radius = corner_radius.into();
+        match crate::shapes::border_source(rect.size, color, width, style, corner_radius) {
+            Some(source) => self.display.push(DrawCommand::Image { rect: self.shift(rect), source }),
+            None => self.stroke(rect, color, width, corner_radius),
+        }
+    }
+
+    /// Bands of one ink over `rect`, cut to its corners — the same
+    /// [`Stripes`](crate::shapes::Stripes) `.background_stripes(…)` lays
+    /// behind a box, resolved against THIS rect.
+    pub fn stripes(
+        &mut self,
+        rect: Rect,
+        stripes: crate::shapes::Stripes,
+        corner_radius: impl Into<Corners>,
+    ) {
+        let Some(source) = crate::shapes::stripes_source(rect.size, &stripes) else {
+            return;
+        };
+        let corner_radius = corner_radius.into();
+        let image = DrawCommand::Image { rect: self.shift(rect), source };
+        if corner_radius.uniform() == Some(0.0) {
+            self.display.push(image);
+        } else {
+            self.clipped_rounded(rect, corner_radius, |painter| painter.display.push(image));
+        }
     }
 
     /// A path the app builds THIS frame, in LOCAL points — the door
@@ -789,6 +922,11 @@ impl<'a> Painter<'a> {
         // contour) plus one point for the anti-aliased edge
         let pad = match paint {
             crate::icon::Paint::Stroke { width } => width as f64 / 2.0 + 1.0,
+            // a square end reaches half a pen past the line, both ways
+            crate::icon::Paint::Dashed { width, dash } => match dash.cap {
+                crate::icon::Cap::Square => width as f64 * std::f64::consts::FRAC_1_SQRT_2 + 1.0,
+                _ => width as f64 / 2.0 + 1.0,
+            },
             crate::icon::Paint::Fill(_) => 1.0,
         };
         let origin = Point { x: min_x - pad, y: min_y - pad };
