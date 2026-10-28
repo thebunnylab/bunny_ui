@@ -78,6 +78,9 @@ pub(crate) fn wrap_layout(children: Vec<LayoutNode>) -> LayoutNode {
 pub struct Text {
     /// What the text reads.
     pub source: crate::bind::TextSource,
+    /// The runs of a [`rich_text`] paragraph — `None` for a text in one
+    /// face, which is every `text(…)`.
+    pub marks: Option<Rc<crate::layout::TextMarks>>,
     /// Where `text(…)` was called; an `IntoText` names itself until then.
     pub(crate) site: crate::provenance::Site,
 }
@@ -114,12 +117,134 @@ impl Text {
         ));
         out.push_layout(LayoutNode::Text {
             content,
-            highlights: None,
+            highlights: self.marks.clone(),
             truncation: None,
             hints: crate::layout::ElementHints { semantics, ..Default::default() },
             action: None,
         });
     }
+}
+
+/// One run of a [`rich_text`] paragraph: its words, and how they differ
+/// from the paragraph around them. A slot it does not name is the
+/// paragraph's — `run("bold").bold()` keeps the paragraph's size, family
+/// and ink.
+#[derive(Clone, Debug)]
+pub struct Run {
+    words: Arc<str>,
+    style: crate::layout::RunStyle,
+}
+
+/// A run of words for [`rich_text`].
+pub fn run(words: impl Into<Arc<str>>) -> Run {
+    Run { words: words.into(), style: crate::layout::RunStyle::default() }
+}
+
+impl Run {
+    /// `<strong>` — the run in the bold weight.
+    pub fn bold(self) -> Self {
+        self.weight(crate::text_engine::Weight::Bold)
+    }
+
+    /// The run at a weight by name.
+    pub fn weight(mut self, weight: crate::text_engine::Weight) -> Self {
+        self.style.font.weight = Some(weight);
+        self
+    }
+
+    /// `<em>` — the run leaning.
+    pub fn italic(mut self) -> Self {
+        self.style.font.slant = Some(crate::text_engine::Slant::Italic);
+        self
+    }
+
+    /// `<code>` — the run in the monospaced face.
+    pub fn monospaced(mut self) -> Self {
+        self.style.font.design = Some(crate::text_engine::FontDesign::Mono);
+        self
+    }
+
+    /// The run at another size, in points.
+    pub fn font_size(mut self, size: f64) -> Self {
+        self.style.font.size = Some(size);
+        self
+    }
+
+    /// The run in a named family.
+    pub fn family(mut self, name: &str) -> Self {
+        self.style.font.family = Some(crate::text_engine::Family::named(name));
+        self
+    }
+
+    /// The run's ink.
+    pub fn foreground_color(mut self, color: Color) -> Self {
+        self.style.color = Some(color);
+        self
+    }
+
+    /// A ground behind the run's line box — `<mark>`, an inserted clause.
+    pub fn background_color(mut self, color: Color) -> Self {
+        self.style.background = Some(color);
+        self
+    }
+
+    /// A rule under the run, in its ink (`None`) or a colour of its own.
+    pub fn underline(mut self, color: Option<Color>) -> Self {
+        self.style.decoration.underline = Some(color.into());
+        self
+    }
+
+    /// `<del>` — a rule through the run, in its ink (`None`) or a colour
+    /// of its own (`text-decoration-color`).
+    pub fn strikethrough(mut self, color: Option<Color>) -> Self {
+        self.style.decoration.strikethrough = Some(color.into());
+        self
+    }
+}
+
+impl<S: Into<Arc<str>>> From<S> for Run {
+    fn from(words: S) -> Run {
+        run(words)
+    }
+}
+
+/// A paragraph of styled runs — `Text("a") + Text("b").bold()` in
+/// SwiftUI, `<p>a <strong>b</strong></p>` in a page.
+///
+/// The runs are ONE text: one string, measured and broken as one
+/// paragraph — a bold word wraps with its sentence, a `\n` inside a run
+/// breaks the line — and read, selected and spoken as one. Every modifier
+/// a text takes applies to the whole: `.font_size(…)` sets the size the
+/// runs patch over, `.foreground_color(…)` the ink the runs that name
+/// none wear, `.highlight(…)` lays its inks over the runs.
+///
+/// ```ignore
+/// rich_text([
+///     run("Fees are payable within "),
+///     run("thirty (30)").strikethrough(Some(clay)),
+///     run(" "),
+///     run("forty-five (45)").background_color(sage),
+///     run(" days."),
+/// ])
+/// .font_size(15.0)
+/// ```
+#[track_caller]
+pub fn rich_text(runs: impl IntoIterator<Item = impl Into<Run>>) -> Text {
+    let mut words = String::new();
+    let mut spans = Vec::new();
+    for run in runs {
+        let run: Run = run.into();
+        let start = words.len();
+        words.push_str(&run.words);
+        if run.style != crate::layout::RunStyle::default() && start < words.len() {
+            spans.push(crate::layout::TextRun { start, end: words.len(), style: run.style });
+        }
+    }
+    let source = crate::bind::TextSource::Fixed(Arc::from(words));
+    crate::diagnostics::text(&source);
+    let marks = (!spans.is_empty())
+        .then(|| Rc::new(crate::layout::TextMarks { runs: spans, ..Default::default() }));
+    Text { source, marks, site: crate::provenance::here() }
 }
 
 
@@ -144,7 +269,7 @@ pub fn text(value: impl crate::text_value::IntoText) -> Text {
 /// [`text`].
 #[track_caller]
 pub fn text_with<S: Into<Arc<str>>>(read: impl Fn() -> S + 'static) -> Text {
-    Text { source: crate::bind::TextSource::Lazy(Rc::new(move || read().into())), site: crate::provenance::here() }
+    Text { source: crate::bind::TextSource::Lazy(Rc::new(move || read().into())), marks: None, site: crate::provenance::here() }
 }
 
 // The button chrome geometry (Role/Size come later; the future

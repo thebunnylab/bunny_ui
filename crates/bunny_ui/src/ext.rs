@@ -944,10 +944,65 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     }
 
     /// Paints stretches of the TEXT in another color (byte ranges into
-    /// the content) — a finder's match highlight. Only affects `text(…)`.
+    /// the content) — a finder's match highlight. Only affects `text(…)`
+    /// and fields; the measure stays intact.
     #[track_caller]
     fn highlight(self, ranges: Vec<(usize, usize)>, color: Color) -> Modified<Self> {
-        Modified::new(self, Modifier::Highlight(Rc::new(ranges), color))
+        let spans = ranges
+            .into_iter()
+            .map(|(start, end)| crate::layout::InkSpan { start, end, color })
+            .collect();
+        Modified::new(self, Modifier::Highlight(Rc::new(spans)))
+    }
+
+    /// [`ViewExt::highlight`] with an ink per stretch: `(start, end,
+    /// color)` byte ranges — a syntax colouring is ONE of these, keywords,
+    /// strings and comments each in their own colour. Stretches may come
+    /// in any order; where two overlap, the one that starts first wins
+    /// until it ends.
+    ///
+    /// ```ignore
+    /// text(source).monospaced().highlight_colored(vec![
+    ///     (0, 2, keyword),   // "fn"
+    ///     (12, 19, string),  // "\"hello\""
+    /// ])
+    /// ```
+    #[track_caller]
+    fn highlight_colored(self, spans: Vec<(usize, usize, Color)>) -> Modified<Self> {
+        let spans = spans
+            .into_iter()
+            .map(|(start, end, color)| crate::layout::InkSpan { start, end, color })
+            .collect();
+        Modified::new(self, Modifier::Highlight(Rc::new(spans)))
+    }
+
+    /// `.underline(color:)` — a rule under the text's words, in their own
+    /// ink (`None`) or in a colour of its own. A link that underlines on
+    /// hover writes it on the hovered branch. Only affects `text(…)`.
+    #[track_caller]
+    fn underline(self, color: Option<Color>) -> Modified<Self> {
+        Modified::new(
+            self,
+            Modifier::TextDecoration(crate::layout::Decoration {
+                underline: Some(color.into()),
+                ..crate::layout::Decoration::NONE
+            }),
+        )
+    }
+
+    /// `.strikethrough(color:)` — a rule through the text's words, in
+    /// their own ink (`None`) or in a colour of its own, the way a diff
+    /// strikes what it removed (`text-decoration-color`). Only affects
+    /// `text(…)`.
+    #[track_caller]
+    fn strikethrough(self, color: Option<Color>) -> Modified<Self> {
+        Modified::new(
+            self,
+            Modifier::TextDecoration(crate::layout::Decoration {
+                strikethrough: Some(color.into()),
+                ..crate::layout::Decoration::NONE
+            }),
+        )
     }
 
     /// `.truncationMode(.middle)` — turns wrapping off: the text becomes

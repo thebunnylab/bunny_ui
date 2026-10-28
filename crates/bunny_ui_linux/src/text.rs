@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uint, c_void};
 
 use bunny_ui::layout::Color;
-use bunny_ui::text_engine::{FontDesign, FontSpec, LineMetrics, Slant, TextEngine, TextRaster, Weight};
+use bunny_ui::text_engine::{FontDesign, FontSpec, LineMetrics, Slant, TextEngine, TextRaster};
 
 // MARK: - fontconfig ABI (API-only; patterns are opaque)
 
@@ -281,7 +281,7 @@ impl FreeTypeEngine {
         let name = key.family.name()?;
         let registered = self.registered.borrow();
         let faces = registered.get(&name.to_lowercase())?;
-        let want = [400i32, 500, 600, 700, 800, 900][key.weight as usize];
+        let want = (i32::from(key.weight) + 1) * 100;
         faces
             .iter()
             .min_by_key(|face| (face.italic != key.italic, (face.weight as i32 - want).abs()))
@@ -300,14 +300,8 @@ impl FreeTypeEngine {
     fn key(font: &FontSpec, scale: usize) -> FaceKey {
         FaceKey {
             mono: font.design == FontDesign::Mono,
-            weight: match font.weight {
-                Weight::Regular => 0,
-                Weight::Medium => 1,
-                Weight::Semibold => 2,
-                Weight::Bold => 3,
-                Weight::ExtraBold => 4,
-                Weight::Black => 5,
-            },
+            // the step on the 100–900 scale, from 0 for Thin
+            weight: (font.weight.number() / 100 - 1) as u8,
             italic: font.slant == Slant::Italic,
             family: font.family,
             size_bits: font.size.to_bits(),
@@ -350,8 +344,9 @@ impl FreeTypeEngine {
                 None => c"sans-serif",
             };
             FcPatternAddString(pattern, c"family".as_ptr(), family.as_ptr().cast());
-            // the fc scale: regular 80, medium 100, demibold 180, bold
-            // 200, extrabold 205, black 210 — one entry per `Weight`
+            // the fc scale: thin 0, extralight 40, light 50, regular
+            // 80, medium 100, demibold 180, bold 200, extrabold 205,
+            // black 210 — one entry per `Weight`
             let weight = FC_WEIGHTS[key.weight as usize];
             FcPatternAddInteger(pattern, c"weight".as_ptr(), weight);
             FcPatternAddInteger(pattern, c"slant".as_ptr(), if key.italic { 100 } else { 0 });
@@ -586,8 +581,9 @@ struct Shaped {
     y: i64,
 }
 
-/// fontconfig's weight for each `Weight`, in the key's order.
-const FC_WEIGHTS: [c_int; 6] = [80, 100, 180, 200, 205, 210];
+/// fontconfig's weight for each `Weight`, in the key's order: Thin (0)
+/// through Black (210), with Regular at 80.
+const FC_WEIGHTS: [c_int; 9] = [0, 40, 50, 80, 100, 180, 200, 205, 210];
 
 #[path = "text_geometry.rs"]
 mod geometry;
@@ -758,6 +754,7 @@ impl TextEngine for FreeTypeEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bunny_ui::text_engine::Weight;
 
     fn engine() -> FreeTypeEngine {
         FreeTypeEngine::new()
@@ -811,6 +808,9 @@ mod tests {
     fn every_weight_finds_the_fontconfig_scale() {
         let engine = engine();
         for weight in [
+            Weight::Thin,
+            Weight::ExtraLight,
+            Weight::Light,
             Weight::Regular,
             Weight::Medium,
             Weight::Semibold,
@@ -821,7 +821,7 @@ mod tests {
             let font = FontSpec { weight, ..FontSpec::DEFAULT };
             let _ = engine.raster_line("w", &font, black(), 1);
         }
-        assert_eq!(FC_WEIGHTS.len(), 6);
+        assert_eq!(FC_WEIGHTS.len(), 9);
     }
 
     #[test]

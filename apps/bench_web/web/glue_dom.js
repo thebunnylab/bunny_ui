@@ -699,7 +699,7 @@ function cssFont(size, weight, mono, italic, named) {
   return `${italic ? "italic " : ""}${weight} ${size}px ${family}`;
 }
 
-const CSS_WEIGHTS = [400, 500, 600, 700, 800, 900];
+const CSS_WEIGHTS = [400, 500, 600, 700, 800, 900, 100, 200, 300];
 
 function rgba(packed) {
   const r = (packed >>> 24) & 0xff;
@@ -1036,6 +1036,23 @@ function applyPatches(view, length) {
     };
   };
 
+  // a text's rules: the lines (1 under, 4 through) and the colour one
+  // of them names (2 and 8) — 0 is the words' own ink
+  const readRules = () => {
+    const flags = u8();
+    const under = u32();
+    const through = u32();
+    const lines = [];
+    if (flags & 1) lines.push("underline");
+    if (flags & 4) lines.push("line-through");
+    const color = flags & 2 ? rgba(under) : flags & 8 ? rgba(through) : "";
+    return { line: lines.join(" "), color };
+  };
+  const applyRules = (style, rules) => {
+    style.textDecorationLine = rules.line;
+    style.textDecorationColor = rules.color;
+  };
+
   // the words of an element: into the one text node it already holds
   // when it holds exactly that — a clone's cell, an updated label —
   // else by replacing the children
@@ -1283,14 +1300,30 @@ function applyPatches(view, length) {
         }
       }
     } else if (op === 6) {
-      // the words and their spans: the face is the look's
+      // the words and their styled stretches: the face is the look's,
+      // a stretch says only what it changes (its mask)
       const el = lookup(id);
       const raw = bytes(u32());
       const spanCount = u16();
       const spans = [];
-      for (let s = 0; s < spanCount; s++) spans.push([u32(), u32()]);
-      const spanColor = rgba(u32());
+      for (let s = 0; s < spanCount; s++) {
+        const from = u32();
+        const to = u32();
+        const mask = u8();
+        const look = {};
+        if (mask & 1) look.color = rgba(u32());
+        if (mask & 2) look.background = rgba(u32());
+        if (mask & 4) look.weight = CSS_WEIGHTS[u8()];
+        if (mask & 8) look.italic = u8();
+        if (mask & 16) look.mono = u8();
+        if (mask & 32) look.size = f32();
+        if (mask & 64) look.rules = readRules();
+        if (mask & 128) look.family = text(u16());
+        spans.push([from, to, look]);
+      }
+      const rules = readRules();
       if (el) {
+        applyRules(el.style, rules);
         if (spanCount === 0) {
           // one write, into the text node that stands when one does
           setWords(el, decoder.decode(raw));
@@ -1299,24 +1332,38 @@ function applyPatches(view, length) {
         el.textContent = "";
         // spans are BYTE ranges into the UTF-8 — slice before decoding
         let cursor = 0;
-        const emit = (from, to, highlighted) => {
+        const emit = (from, to, look) => {
           if (to <= from) return;
           const piece = decoder.decode(raw.subarray(from, to));
-          if (highlighted) {
+          if (look) {
             const mark = document.createElement("span");
-            mark.style.color = spanColor;
+            const style = mark.style;
+            if (look.color) style.color = look.color;
+            if (look.background) style.backgroundColor = look.background;
+            if (look.weight) style.fontWeight = String(look.weight);
+            if (look.italic !== undefined) style.fontStyle = look.italic ? "italic" : "normal";
+            if (look.family || look.mono !== undefined) {
+              const house = look.mono
+                ? "ui-monospace, Menlo, Consolas, monospace"
+                : 'system-ui, -apple-system, "Segoe UI", sans-serif';
+              style.fontFamily = look.family
+                ? `"${look.family.replace(/"/g, "")}", ${house}`
+                : house;
+            }
+            if (look.size) style.fontSize = `${look.size}px`;
+            if (look.rules) applyRules(style, look.rules);
             mark.textContent = piece;
             el.appendChild(mark);
           } else {
             el.appendChild(document.createTextNode(piece));
           }
         };
-        for (const [from, to] of spans) {
-          emit(cursor, from, false);
-          emit(from, to, true);
+        for (const [from, to, look] of spans) {
+          emit(cursor, from, null);
+          emit(from, to, look);
           cursor = to;
         }
-        emit(cursor, raw.length, false);
+        emit(cursor, raw.length, null);
       }
     } else if (op === 7) {
       const el = lookup(id);

@@ -167,7 +167,9 @@ struct Element {
     attrs: BTreeMap<&'static str, String>,
     /// The element's own inline declarations: its box, its geometry.
     style: BTreeMap<&'static str, String>,
-    text: Vec<(String, Option<Color>)>,
+    /// The words, each stretch with the declarations of its `<span>` —
+    /// `None` for plain words between them.
+    text: Vec<(String, Option<String>)>,
     children: Vec<u32>,
     /// The look it wears — a class on the page's sheet.
     rule: Option<u64>,
@@ -572,30 +574,33 @@ impl Tree {
                     return;
                 };
                 element.text.clear();
-                match &text.highlights {
-                    Some((ranges, highlight)) => {
-                        let raw = text.content.as_bytes();
-                        let mut cursor = 0usize;
-                        for (start, end) in ranges.iter() {
-                            if *start > cursor {
-                                element.text.push((
-                                    String::from_utf8_lossy(&raw[cursor..*start]).into_owned(),
-                                    None,
-                                ));
-                            }
-                            element.text.push((
-                                String::from_utf8_lossy(&raw[*start..*end]).into_owned(),
-                                Some(*highlight),
-                            ));
-                            cursor = *end;
-                        }
-                        if cursor < raw.len() {
-                            element
-                                .text
-                                .push((String::from_utf8_lossy(&raw[cursor..]).into_owned(), None));
-                        }
+                let raw = text.content.as_bytes();
+                let words = |from: usize, to: usize| String::from_utf8_lossy(&raw[from..to]).into_owned();
+                let marks = text.highlights.as_deref();
+                let mut cursor = 0usize;
+                for stretch in marks.map(|marks| crate::dom::text_stretches(&text.content, marks)).unwrap_or_default() {
+                    if stretch.start > cursor {
+                        element.text.push((words(cursor, stretch.start), None));
                     }
-                    None => element.text.push((text.content.to_string(), None)),
+                    element.text.push((words(stretch.start, stretch.end), Some(stretch_css(&stretch))));
+                    cursor = stretch.end;
+                }
+                if cursor < raw.len() || element.text.is_empty() {
+                    element.text.push((words(cursor, raw.len()), None));
+                }
+                let rules = marks.map_or(crate::layout::Decoration::NONE, |marks| marks.decoration);
+                match rules_css(rules) {
+                    Some((line, rule_color)) => {
+                        element.style.insert("text-decoration-line", line);
+                        match rule_color {
+                            Some(rule_color) => element.style.insert("text-decoration-color", rule_color),
+                            None => element.style.remove("text-decoration-color"),
+                        };
+                    }
+                    None => {
+                        element.style.remove("text-decoration-line");
+                        element.style.remove("text-decoration-color");
+                    }
                 }
             }
             DomPatch::SetField { id, field } => {
@@ -718,11 +723,11 @@ impl Tree {
             return;
         }
         out.push('>');
-        for (run, highlight) in &element.text {
-            match highlight {
-                Some(mark) => out.push_str(&format!(
-                    "<span style=\"color:{}\">{}</span>",
-                    color(*mark),
+        for (run, look) in &element.text {
+            match look {
+                Some(look) => out.push_str(&format!(
+                    "<span style=\"{}\">{}</span>",
+                    escape_attr(look),
                     escape_text(run)
                 )),
                 None => out.push_str(&escape_text(run)),
@@ -1152,8 +1157,74 @@ fn rule_text(
     out
 }
 
+/// A stretch's `<span>` declarations: what it changes over the text.
+fn stretch_css(stretch: &crate::dom::Stretch) -> String {
+    let mut declarations = Vec::new();
+    if let Some(ink) = stretch.color {
+        declarations.push(format!("color:{}", color(ink)));
+    }
+    if let Some(ground) = stretch.background {
+        declarations.push(format!("background-color:{}", color(ground)));
+    }
+    if let Some(weight) = stretch.weight {
+        declarations.push(format!("font-weight:{}", weight.number()));
+    }
+    if let Some(italic) = stretch.italic {
+        declarations.push(format!("font-style:{}", if italic { "italic" } else { "normal" }));
+    }
+    match (&stretch.family, stretch.mono) {
+        (Some(family), mono) => declarations.push(format!(
+            "font-family:\"{}\", {}",
+            family.replace('"', ""),
+            house_family(mono == Some(true))
+        )),
+        (None, Some(mono)) => declarations.push(format!("font-family:{}", house_family(mono))),
+        (None, None) => {}
+    }
+    if let Some(size) = stretch.size {
+        declarations.push(format!("font-size:{size}px"));
+    }
+    if let Some((line, rule_color)) = rules_css(stretch.decoration) {
+        declarations.push(format!("text-decoration-line:{line}"));
+        if let Some(rule_color) = rule_color {
+            declarations.push(format!("text-decoration-color:{rule_color}"));
+        }
+    }
+    declarations.join(";")
+}
+
+/// The `text-decoration-line` of a set of rules, and its colour when one
+/// rule names its own — CSS has one decoration colour per element, so a
+/// pair of rules in two colours wears the underline's.
+fn rules_css(decoration: crate::layout::Decoration) -> Option<(String, Option<String>)> {
+    use crate::layout::RuleInk;
+    let line = match (decoration.underline, decoration.strikethrough) {
+        (None, None) => return None,
+        (Some(_), None) => "underline",
+        (None, Some(_)) => "line-through",
+        (Some(_), Some(_)) => "underline line-through",
+    };
+    let own = [decoration.underline, decoration.strikethrough].into_iter().flatten().find_map(|rule| match rule {
+        RuleInk::Color(rule_color) => Some(color(rule_color)),
+        RuleInk::Text => None,
+    });
+    Some((line.to_string(), own))
+}
+
+/// The house stacks a face falls back to.
+fn house_family(mono: bool) -> &'static str {
+    if mono {
+        "ui-monospace, Menlo, Consolas, monospace"
+    } else {
+        "system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    }
+}
+
 fn css_font(font: &crate::text_engine::FontSpec) -> String {
     let weight = match font.weight {
+        crate::text_engine::Weight::Thin => 100,
+        crate::text_engine::Weight::ExtraLight => 200,
+        crate::text_engine::Weight::Light => 300,
         crate::text_engine::Weight::Regular => 400,
         crate::text_engine::Weight::Medium => 500,
         crate::text_engine::Weight::Semibold => 600,
@@ -1306,6 +1377,29 @@ mod tests {
         assert!(!trailing.contains("right"), "{trailing}");
         assert!(!rule(None).contains("text-align"), "leading is the browser's own start");
         assert!(rule(Some(TextAlignment::Center)).contains("text-align:center"));
+    }
+
+    /// A rich paragraph is served as styled spans: a run says what it
+    /// changes, and the rule a text wears is the element's own.
+    #[test]
+    fn a_rich_paragraph_is_served_as_styled_spans() {
+        let clay = Color::hex(0xcaa396);
+        let paragraph = rich_text([
+            run("payable within "),
+            run("thirty").strikethrough(Some(clay)),
+            run(" "),
+            run("forty-five").weight(crate::text_engine::Weight::Light).monospaced(),
+        ]);
+        let page = render(&paragraph, Size { width: 400.0, height: 100.0 });
+        assert!(page.html.contains("payable within <span"), "{}", page.html);
+        assert!(
+            page.html.contains(&format!("text-decoration-line:line-through;text-decoration-color:{}", color(clay))),
+            "{}",
+            page.html
+        );
+        assert!(page.html.contains("font-weight:300;font-family:ui-monospace"), "{}", page.html);
+        let underlined = render(&text("link").underline(None), Size { width: 100.0, height: 40.0 });
+        assert!(underlined.html.contains("text-decoration-line:underline"), "{}", underlined.html);
     }
 
     /// A served page's mount wears its language and the way it reads:
