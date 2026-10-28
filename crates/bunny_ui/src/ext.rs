@@ -1085,7 +1085,10 @@ pub trait ViewExt: View<Arity = Single> + Sized {
 
     /// The scroll region follows this item id: when the id CHANGES, the
     /// region scrolls just enough to reveal the row (keyboard selection
-    /// stays visible); the wheel stays sovereign in between.
+    /// stays visible); the wheel stays sovereign in between. The id names
+    /// a list's keyed row, or a component given `.id(id)` anywhere in the
+    /// region's content (the outermost one, unless a scroll region nearer
+    /// to it holds it).
     #[track_caller]
     fn scroll_target(self, id: impl Into<String>) -> Modified<Self> {
         Modified::new(self, Modifier::ScrollTarget(id.into(), None))
