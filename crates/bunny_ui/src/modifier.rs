@@ -21,7 +21,7 @@ use motor::state::{Binding, Context, EffectFn, EnvironmentValues};
 use motor::view::RenderNode;
 
 use crate::erased::CustomModifier;
-use crate::layout::{Color, CrossAlign, Edges, LayoutNode, TextHighlight, Truncation, VisualProps};
+use crate::layout::{Color, CrossAlign, Edges, LayoutNode, TextMarks, Truncation, VisualProps};
 use crate::text_engine::{FontDesign, FontPatch, FontSpec, Tracking, Weight};
 use crate::state_ext::BindingExt;
 use crate::view::{NodeList, Single, View, wrap_in_place};
@@ -111,7 +111,10 @@ pub enum Modifier {
     BackgroundPressed(Color),
     ForegroundHovered(Color),
     ForegroundPressed(Color),
-    Highlight(Rc<Vec<(usize, usize)>>, Color),
+    /// Inks over stretches of the text, each its own colour.
+    Highlight(Rc<Vec<crate::layout::InkSpan>>),
+    /// The rules a text draws under or through its words.
+    TextDecoration(crate::layout::Decoration),
     TruncationMode(Truncation),
     /// The scroll region follows this item id when it changes.
     ScrollTarget(String),
@@ -310,6 +313,7 @@ impl Modifier {
             Modifier::ForegroundHovered { .. } => "foreground_hovered",
             Modifier::ForegroundPressed { .. } => "foreground_pressed",
             Modifier::Highlight { .. } => "highlight",
+            Modifier::TextDecoration { .. } => "text_decoration",
             Modifier::TruncationMode { .. } => "truncation_mode",
             Modifier::ScrollTarget { .. } => "scroll_target",
             Modifier::OnMeasure { .. } => "on_measure",
@@ -450,8 +454,23 @@ impl Modifier {
             Modifier::ForegroundHovered(color) => format!(" [.foregroundHovered({color})]"),
             Modifier::ForegroundPressed(color) => format!(" [.foregroundPressed({color})]"),
             Modifier::BackgroundPressed(color) => format!(" [.backgroundPressed({color})]"),
-            Modifier::Highlight(ranges, color) => {
-                format!(" [.highlight({} ranges, {color})]", ranges.len())
+            Modifier::Highlight(spans) => match spans.first() {
+                Some(first) if spans.iter().all(|span| span.color == first.color) => {
+                    format!(" [.highlight({} ranges, {})]", spans.len(), first.color)
+                }
+                _ => format!(" [.highlight({} ranges)]", spans.len()),
+            },
+            Modifier::TextDecoration(decoration) => {
+                let rule = |name: &str, ink: Option<crate::layout::RuleInk>| match ink {
+                    None => String::new(),
+                    Some(crate::layout::RuleInk::Text) => format!(" [.{name}()]"),
+                    Some(crate::layout::RuleInk::Color(color)) => format!(" [.{name}({color})]"),
+                };
+                format!(
+                    "{}{}",
+                    rule("underline", decoration.underline),
+                    rule("strikethrough", decoration.strikethrough)
+                )
             }
             Modifier::TruncationMode(mode) => format!(" [.truncationMode(.{mode:?})]"),
             Modifier::ScrollTarget(id) => format!(" [.scrollTarget({id:?})]"),
@@ -634,7 +653,7 @@ struct FieldParts {
     multiline: bool,
     auto_focus: crate::layout::AutoFocus,
     bare: bool,
-    highlights: Option<TextHighlight>,
+    highlights: Option<Rc<TextMarks>>,
     secret: bool,
 }
 
@@ -859,7 +878,7 @@ fn rewrite_text_node(
     node: LayoutNode,
     rewrite: &impl Fn(
         crate::bind::TextSource,
-        Option<TextHighlight>,
+        Option<Rc<TextMarks>>,
         Option<Truncation>,
     ) -> LayoutNode,
 ) -> LayoutNode {
@@ -1837,17 +1856,39 @@ pub(crate) fn apply(
         // (SwiftUI parity: truncationMode outside text does nothing)
         // both leaves that draw text answer to it: the record is the
         // same, and so is the splitter that reads it
-        Modifier::Highlight(ranges, color) => out.wrap_layout_from(mark, |node| {
-            let highlight = TextHighlight { ranges: ranges.clone(), color: *color };
-            let node = rewrite_text_node(node, &|content, _, truncation| LayoutNode::Text {
+        // a highlight replaces the INKS and keeps the rest: a rich
+        // paragraph keeps its runs under a finder's match
+        Modifier::Highlight(spans) => out.wrap_layout_from(mark, |node| {
+            let inked = |marks: Option<Rc<TextMarks>>| {
+                let inks = TextMarks::of_inks(spans.iter().copied()).inks;
+                Some(Rc::new(TextMarks { inks, ..marks.as_deref().cloned().unwrap_or_default() }))
+            };
+            let node = rewrite_text_node(node, &|content, highlights, truncation| LayoutNode::Text {
                 content,
-                highlights: Some(highlight.clone()),
+                highlights: inked(highlights),
                 truncation,
                 hints: Default::default(),
                 action: None,
             });
             rewrite_field_node(node, &|parts| {
-                FieldParts { highlights: Some(highlight.clone()), ..parts }.into_node()
+                let highlights = inked(parts.highlights.clone());
+                FieldParts { highlights, ..parts }.into_node()
+            })
+        }),
+        // the rule the closest modifier names wins, rule by rule: a
+        // `.underline()` written on the text stands over one written
+        // around it
+        Modifier::TextDecoration(decoration) => out.wrap_layout_from(mark, |node| {
+            rewrite_text_node(node, &|content, highlights, truncation| {
+                let marks = highlights.as_deref().cloned().unwrap_or_default();
+                let decoration = marks.decoration.or(*decoration);
+                LayoutNode::Text {
+                    content,
+                    highlights: Some(Rc::new(TextMarks { decoration, ..marks })),
+                    truncation,
+                    hints: Default::default(),
+                    action: None,
+                }
             })
         }),
         Modifier::TruncationMode(mode) => out.wrap_layout_from(mark, |node| {
