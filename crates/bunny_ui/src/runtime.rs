@@ -257,6 +257,9 @@ pub struct Runtime {
     last_modal_floor: std::cell::Cell<Option<crate::layout::ModalFloor>>,
     /// The focused field (identity path) — owner of the keyboard.
     focus: RefCell<Option<String>>,
+    /// Did focus last move by the keyboard? Pointer input lowers it, a
+    /// key raises it; a control's ring follows (`:focus-visible`).
+    focus_visible: Cell<bool>,
     /// Retain the old policy so an unmounted field can still hear blur.
     focused_policy: RefCell<Option<Rc<dyn crate::text_input::EditingStrategy>>>,
     /// The field that last heard it holds the keyboard, and the word it
@@ -1717,6 +1720,7 @@ impl Runtime {
             last_scrolls: RefCell::new(Vec::new()),
             last_modal_floor: std::cell::Cell::new(None),
             focus: RefCell::new(None),
+            focus_visible: Cell::new(true),
             focused_policy: RefCell::new(None),
             focus_heard: RefCell::new((None, None)),
             carets: RefCell::new(HashMap::default()),
@@ -2454,6 +2458,8 @@ impl Runtime {
     /// stroke on to the app's bindings.
     pub fn key_stroke(&self, stroke: impl Into<crate::action::Stroke>) -> crate::custom::Response {
         self.enter_scene();
+        // the hand is on the keys: the focus it moves wears its ring
+        self.focus_visible.set(true);
         let stroke = stroke.into();
         let pattern = &stroke.pattern;
         // an open menu takes Escape before anyone — its owner is the
@@ -3065,6 +3071,8 @@ impl Runtime {
     /// A pointer door was entered from OUTSIDE a touch spend, so the
     /// hand on the machine is a mouse.
     fn note_pointer_source(&self) {
+        // the hand is on the pointer: focus it moves shows no ring
+        self.focus_visible.set(false);
         if !self.in_touch.get() {
             self.touch_modality.set(false);
             self.press_held.set(0.0);
@@ -5651,6 +5659,7 @@ impl Runtime {
             focus: focus.as_deref(),
             carets: &carets,
             caret_visible: self.caret_phase.get().visible(),
+            focus_visible: self.focus_visible.get(),
         };
         self.cache.begin_frame();
         self.last_proposal.set(Some(crate::layout::Proposal::exact(size)));
@@ -5787,6 +5796,7 @@ impl Runtime {
             focus: focus.as_deref(),
             carets: &carets,
             caret_visible: self.caret_phase.get().visible(),
+            focus_visible: self.focus_visible.get(),
         };
         self.cache.begin_frame();
         self.last_proposal.set(Some(crate::layout::Proposal::exact(size)));
@@ -7024,29 +7034,34 @@ impl Runtime {
     /// Applies `.scroll_target(id)` requests: for each region whose
     /// declared target CHANGED since the last application, scrolls just
     /// enough to reveal the row (top-aligns when above, bottom-aligns
-    /// when below). Returns whether any offset moved. A target whose row
+    /// when below), or brings the row's anchor to the window's when the
+    /// target names one (`.scroll_target_anchored`). Returns whether any offset moved. A target whose row
     /// is not mounted this frame (filtered out) stays pending — it
     /// applies when the row appears.
     fn apply_scroll_targets(&self, result: &crate::layout::LayoutResult) -> bool {
         let mut moved = false;
         for region in &result.scrolls {
             let Some(target) = &region.target else { continue };
-            if self.scroll_targets.borrow().get(&region.path) == Some(target) {
+            if self.scroll_targets.borrow().get(&region.path) == Some(&target.id) {
                 continue;
             }
-            let key = format!("{}/[{}]", region.path, target);
+            let key = format!("{}/[{}]", region.path, target.id);
             let Some(row) = result.frames.get(&key) else { continue };
-            self.scroll_targets.borrow_mut().insert(region.path.clone(), target.clone());
+            self.scroll_targets.borrow_mut().insert(region.path.clone(), target.id.clone());
             let region_top = region.frame.origin.y;
             let region_bottom = region_top + region.frame.size.height;
             let row_top = row.origin.y;
             let row_bottom = row_top + row.size.height;
-            let delta = if row_top < region_top {
-                row_top - region_top
-            } else if row_bottom > region_bottom {
-                row_bottom - region_bottom
-            } else {
-                0.0
+            let delta = match target.anchor {
+                // a named point of the row meets the same point of the
+                // window, wherever the row stood
+                Some(anchor) => {
+                    (row_top + anchor * row.size.height)
+                        - (region_top + anchor * region.frame.size.height)
+                }
+                None if row_top < region_top => row_top - region_top,
+                None if row_bottom > region_bottom => row_bottom - region_bottom,
+                None => 0.0,
             };
             if delta != 0.0 {
                 let current = self.scroll_offset(&region.path);
@@ -7691,6 +7706,7 @@ impl Runtime {
             focus: focus.as_deref(),
             carets: &carets,
             caret_visible: self.caret_phase.get().visible(),
+            focus_visible: self.focus_visible.get(),
         };
         self.cache.begin_frame();
         crate::layout::set_overlay_layers(self.overlay_layers.get());

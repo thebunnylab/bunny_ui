@@ -743,6 +743,11 @@ pub struct FrameStamp<'a> {
     pub carets: &'a HashMap<String, crate::text_input::CaretState>,
     /// Blink phase — the caret only paints when visible.
     pub caret_visible: bool,
+    /// Did focus last move by the KEYBOARD? A control's focus ring is
+    /// for the reader who travels by keys — `:focus-visible` in a
+    /// browser, and what a Mac does, where a pressed button shows no
+    /// ring. A field keeps its focus border either way.
+    pub focus_visible: bool,
 }
 
 impl<'a> FrameStamp<'a> {
@@ -752,7 +757,7 @@ impl<'a> FrameStamp<'a> {
         interaction: &'a Interaction,
         carets: &'a HashMap<String, crate::text_input::CaretState>,
     ) -> Self {
-        FrameStamp { interaction, focus: None, carets, caret_visible: true }
+        FrameStamp { interaction, focus: None, carets, caret_visible: true, focus_visible: true }
     }
 }
 
@@ -1011,10 +1016,10 @@ pub enum LayoutNode {
     /// remounts).
     Scroll {
         path: Option<String>,
-        /// The item id the region follows: when it CHANGES, the runtime
-        /// scrolls just enough to reveal the row — the wheel stays
-        /// sovereign in between (`.scroll_target(id)`).
-        target: Option<String>,
+        /// The item the region follows: when its id CHANGES, the runtime
+        /// reveals the row — just enough, or at the anchor it names — and
+        /// the wheel stays sovereign in between (`.scroll_target(id)`).
+        target: Option<ScrollTarget>,
         /// Which way the region travels. A list is vertical; an editor
         /// without wrap, a terminal and a spreadsheet go sideways too.
         axes: ScrollAxes,
@@ -2423,6 +2428,12 @@ pub struct VisualProps {
     /// the nearest `.hover_group()` above it, not the interactive
     /// target it belongs to.
     pub from_group: bool,
+    /// `.allows_hit_testing(false)` — the subtree takes no pointer: no
+    /// hit, tooltip, menu, drag or drop region inside it exists, so a
+    /// press or a hover reaches what is painted beneath. Paint, focus and
+    /// layout are untouched — a decoration drawn over a control (plants
+    /// over a room, a glow over a chart) stops being a wall.
+    pub passive: bool,
 }
 
 impl VisualProps {
@@ -2470,6 +2481,7 @@ impl VisualProps {
             opacity_pressed: self.opacity_pressed.or(outer.opacity_pressed),
             hidden: self.hidden || outer.hidden,
             from_group: self.from_group || outer.from_group,
+            passive: self.passive || outer.passive,
         }
     }
 
@@ -3562,6 +3574,22 @@ pub enum ScrollIndicators {
     Never,
 }
 
+/// The row a region follows (`.scroll_target`), and where in the window it
+/// is held when it changes.
+///
+/// No anchor reveals it by the shortest distance: nothing moves when the
+/// row already shows, and a row above or below lands on the near edge —
+/// keyboard selection, which must never jump. An anchor names a POINT,
+/// SwiftUI's `scrollTo(id, anchor:)`: that height of the row meets the
+/// same height of the window, so 0.5 centres it (the browser's
+/// `scrollIntoView({block: 'center'})`), 0 sets it at the top and 1 at
+/// the bottom — clamped to the travel the region has.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScrollTarget {
+    pub id: String,
+    pub anchor: Option<Px>,
+}
+
 /// Where a modal layer drew its line: how long every list the pointer
 /// consults was when the layer went up. Everything recorded from those
 /// marks on is ABOVE the modal and still answers; what came before is
@@ -3601,7 +3629,7 @@ pub struct ScrollRegion {
     pub frame: Rect,
     pub content: Size,
     /// The declared scroll target (`.scroll_target(id)`), if any.
-    pub target: Option<String>,
+    pub target: Option<ScrollTarget>,
     /// The offset the app is holding, when the region was given a
     /// binding to hold it in (`.offset(binding)`).
     pub commanded: Option<Point>,
@@ -4357,6 +4385,9 @@ pub struct Placement {
     /// reaches a pixel, so nothing under one joins the list — not even the
     /// clip's own two commands, which keeps the list balanced.
     muted: u32,
+    /// How many subtrees that decline hit testing are open
+    /// ([`VisualProps::passive`]): while any is, no pointer region joins.
+    passive: u32,
     /// Keep every command, seen or not: the control of the cut below
     /// ([`Placement::draw`]). The Dom lowering places with it, because a
     /// browser scrolls what was lowered without asking for a new layout.
@@ -6980,6 +7011,10 @@ impl LayoutNode {
     }
 
     pub(crate) fn place(&self, frame: Rect, fit: &Fit, env: &LayoutEnv<'_>, out: &mut Placement) {
+        // a subtree that declines hit testing opens its depth here, so the
+        // style's own target declines too
+        let passive = matches!(self, LayoutNode::Styled { props, .. } if props.passive);
+        out.passive += u32::from(passive);
         let semantic_start = out.accessibility.len();
         let control = self.carried_hints().and_then(ElementHints::control);
         let target = self.carried_action();
@@ -7000,8 +7035,10 @@ impl LayoutNode {
             }
             None => self.place_node(frame, fit, env, out),
         }
+        // the ring is for the reader who travels by keys: a control the
+        // mouse pressed holds focus and shows none, as in a browser
         if let (Some(state), Some(path)) = (control, target)
-            && state.enabled && env.stamp.focus == Some(path.as_ref())
+            && state.enabled && env.stamp.focus == Some(path.as_ref()) && env.stamp.focus_visible
         {
             out.draw(DrawCommand::StrokeRect {
                 rect: frame, color: crate::theme::current().focus, width: 2.0,
@@ -7012,6 +7049,7 @@ impl LayoutNode {
             let bounds = out.accessible_bounds(frame);
             semantics.collect(semantic_start, bounds, &out.accessibility_surface, &mut out.accessibility);
         }
+        out.passive -= u32::from(passive);
     }
 
     /// The node itself, its own action aside.
@@ -7553,11 +7591,7 @@ impl LayoutNode {
                 }
                 // the field is a pointer target (clicking focuses) —
                 // clipped like any hit
-                let visible = match out.current_clip() {
-                    Some(clip) => frame.intersection(clip),
-                    None => Some(frame),
-                };
-                if let Some(visible) = visible {
+                if let Some(visible) = clip_of(out, frame) {
                     out.hits.push((path.to_string(), visible));
                 }
                 out.fields.push(FieldPlacement {
@@ -7671,7 +7705,7 @@ impl LayoutNode {
                     let visible = out.current_clip().map_or(Some(frame), |clip| {
                         frame.intersection(clip)
                     });
-                    if let Some(visible) = visible {
+                    if let Some(visible) = visible.filter(|_| out.passive == 0) {
                         out.hits.push((path.to_string(), visible));
                     }
                     if visible.is_some() || focusable {
@@ -8392,11 +8426,7 @@ impl LayoutNode {
                         },
                     }
                 };
-                let visible = match out.current_clip() {
-                    Some(clip) => seam.intersection(clip),
-                    None => Some(seam),
-                };
-                if let Some(visible) = visible {
+                if let Some(visible) = clip_of(out, seam) {
                     out.hits.push((format!("{path}/#split"), visible));
                 }
                 out.splits.push(SplitPlacement {
@@ -9979,6 +10009,9 @@ fn draw_scrollbar(
 /// geometry-routed region goes through. What is not visible cannot be
 /// grabbed, explained, dropped on or dragged from.
 fn clip_of(out: &Placement, rect: Rect) -> Option<Rect> {
+    if out.passive > 0 {
+        return None;
+    }
     match out.current_clip() {
         Some(clip) => rect.intersection(clip),
         None => Some(rect),
@@ -10043,10 +10076,7 @@ fn place_target(
     // outside the viewport the hit does NOT exist; a
     // half-visible row clicks only on its visible part (the
     // recorded rect is the intersection with the current clip)
-    let visible = match out.current_clip() {
-        Some(clip) => frame.intersection(clip),
-        None => Some(frame),
-    };
+    let visible = clip_of(out, frame);
     let hit_index = visible.map(|visible| {
         out.hits.push((path.to_string(), visible));
         out.hits.len() - 1

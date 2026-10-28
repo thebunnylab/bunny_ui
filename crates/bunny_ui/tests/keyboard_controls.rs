@@ -380,7 +380,7 @@ fn a_field_strategy_keeps_its_tab_until_it_declines() {
 }
 
 #[test]
-fn focus_ring_is_retained_without_a_caret_timer_and_pointer_focus_matches_keyboard_focus() {
+fn focus_ring_is_retained_without_a_caret_timer_and_belongs_to_keyboard_focus() {
     use bunny_ui::layout::DrawCommand;
     let runtime = Runtime::new();
     let form = Form::new();
@@ -395,10 +395,17 @@ fn focus_ring_is_retained_without_a_caret_timer_and_pointer_focus_matches_keyboa
     runtime.pointer_released(bounds.origin.x + 2.0, bounds.origin.y + 2.0);
     focused(&runtime, "save");
     assert_eq!(form.presses.get(), 1);
+    let ring = |frame: &bunny_ui::layout::LayoutResult| frame.display.iter().any(|command| matches!(command,
+        DrawCommand::StrokeRect { color, width: 2.0, .. } if *color == bunny_ui::theme::current().focus));
+    // a pressed button holds focus and shows no ring, as in a browser
+    // (`:focus-visible`) and on a Mac
+    assert!(!ring(&runtime.layout(&form, Proposal::exact(SIZE))), "a press leaves no ring");
+    // the keyboard's focus wears it
+    tab(&runtime, false);
+    assert!(runtime.focus_named("save"));
     let focused_frame = runtime.layout(&form, Proposal::exact(SIZE));
     assert!(!runtime.blink(), "a button never starts caret polling");
-    assert!(focused_frame.display.iter().any(|command| matches!(command,
-        DrawCommand::StrokeRect { color, width: 2.0, .. } if *color == bunny_ui::theme::current().focus)));
+    assert!(ring(&focused_frame), "after a key, focus shows its ring");
     let retained = runtime.layout(&form, Proposal::exact(SIZE));
     assert_eq!(
         focused_frame.display.as_slice(),

@@ -5842,7 +5842,7 @@ mod tests {
         );
         let region = result.scrolls.first().expect("the region survived the layer");
         assert_eq!(
-            region.target.as_deref(),
+            region.target.as_ref().map(|target| target.id.as_str()),
             Some("row20"),
             "the rewrite reached the Scroll through the overlay"
         );

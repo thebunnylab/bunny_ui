@@ -60,6 +60,8 @@ pub enum Modifier {
     IgnoresSafeArea,
     /// `.hidden()` — laid out as it would be, painted and hit as nothing.
     Hidden,
+    /// `.allows_hit_testing(false)`: the subtree takes no pointer.
+    AllowsHitTesting(bool),
     /// A reactive accessible name for one semantic element.
     AccessibilityLabel(crate::bind::TextSource),
     /// Decorative content excluded from the accessibility tree.
@@ -123,7 +125,7 @@ pub enum Modifier {
     TextDecoration(crate::layout::Decoration),
     TruncationMode(Truncation),
     /// The scroll region follows this item id when it changes.
-    ScrollTarget(String),
+    ScrollTarget(String, Option<f64>),
     /// `.on_measure(|size| …)` — the size the view resolved to, handed
     /// back to the app.
     OnMeasure(Rc<dyn Fn(crate::layout::Size)>),
@@ -290,6 +292,7 @@ impl Modifier {
             Modifier::Blur { .. } => "blur",
             Modifier::IgnoresSafeArea => "ignores_safe_area",
             Modifier::Hidden => "hidden",
+            Modifier::AllowsHitTesting(_) => "allows_hit_testing",
             Modifier::AccessibilityLabel { .. } => "accessibility_label",
             Modifier::AccessibilityHidden => "accessibility_hidden",
             Modifier::Equatable => "equatable",
@@ -419,6 +422,7 @@ impl Modifier {
             Modifier::AccessibilityLabel(_) => " [.accessibility_label()]".into(),
             Modifier::AccessibilityHidden => " [.accessibility_hidden()]".into(),
             Modifier::Hidden => " [.hidden()]".into(),
+            Modifier::AllowsHitTesting(on) => format!(" [.allowsHitTesting({on})]"),
             Modifier::Equatable => " [.equatable()]".into(),
             Modifier::BackgroundColor(color) => format!(" [.background({color})]"),
             Modifier::BackgroundGradient(gradient) => match gradient {
@@ -491,7 +495,8 @@ impl Modifier {
                 )
             }
             Modifier::TruncationMode(mode) => format!(" [.truncationMode(.{mode:?})]"),
-            Modifier::ScrollTarget(id) => format!(" [.scrollTarget({id:?})]"),
+            Modifier::ScrollTarget(id, None) => format!(" [.scrollTarget({id:?})]"),
+            Modifier::ScrollTarget(id, Some(anchor)) => format!(" [.scrollTarget({id:?}, anchor: {anchor})]"),
             Modifier::OnMeasure(_) => " [.onMeasure]".into(),
             Modifier::AutoFocus => " [.autoFocus()]".into(),
             Modifier::RestoreFocusOnClose => " [.restoreFocusOnClose()]".into(),
@@ -1901,6 +1906,9 @@ pub(crate) fn apply(
             VisualProps { opacity_pressed: Some(*value), ..VisualProps::default() },
         ),
         Modifier::Hidden => wrap_styled(out, mark, VisualProps { hidden: true, ..VisualProps::default() }),
+        Modifier::AllowsHitTesting(on) => {
+            wrap_styled(out, mark, VisualProps { passive: !on, ..VisualProps::default() });
+        }
         Modifier::GroupHovered => wrap_styled(
             out,
             mark,
@@ -1978,11 +1986,11 @@ pub(crate) fn apply(
                 child: Box::new(node),
             });
         }
-        Modifier::ScrollTarget(id) => out.wrap_layout_from(mark, |node| {
+        Modifier::ScrollTarget(id, anchor) => out.wrap_layout_from(mark, |node| {
             rewrite_scroll_node(node, &|path, axes, fill, indicators, commanded, child| {
                 LayoutNode::Scroll {
                     path,
-                    target: Some(id.clone()),
+                    target: Some(crate::layout::ScrollTarget { id: id.clone(), anchor: *anchor }),
                     axes,
                     commanded,
                     fill,
