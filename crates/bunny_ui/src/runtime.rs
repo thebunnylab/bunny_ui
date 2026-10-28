@@ -7037,7 +7037,9 @@ impl Runtime {
     /// when below), or brings the row's anchor to the window's when the
     /// target names one (`.scroll_target_anchored`). Returns whether any offset moved. A target whose row
     /// is not mounted this frame (filtered out) stays pending — it
-    /// applies when the row appears.
+    /// applies when the row appears. The row is found by
+    /// [`scroll_target_frame`]: a list's keyed row, or a keyed component
+    /// anywhere in the region's content.
     fn apply_scroll_targets(&self, result: &crate::layout::LayoutResult) -> bool {
         let mut moved = false;
         for region in &result.scrolls {
@@ -7045,8 +7047,7 @@ impl Runtime {
             if self.scroll_targets.borrow().get(&region.path) == Some(&target.id) {
                 continue;
             }
-            let key = format!("{}/[{}]", region.path, target.id);
-            let Some(row) = result.frames.get(&key) else { continue };
+            let Some(row) = scroll_target_frame(result, region, &target.id) else { continue };
             self.scroll_targets.borrow_mut().insert(region.path.clone(), target.id.clone());
             let region_top = region.frame.origin.y;
             let region_bottom = region_top + region.frame.size.height;
@@ -8464,6 +8465,46 @@ impl Runtime {
         };
         if applied { self.frame_asked.set(true); Ok(()) } else { Err(ActionError::Unavailable) }
     }
+}
+
+/// Where a region's scroll target stands. A list's keyed row is recorded
+/// right under the region (`region/[id]`) and wins. Otherwise the target
+/// is the outermost boundary — a component — whose path carries the
+/// `[id]` segment somewhere in the region's content, as SwiftUI's
+/// `scrollTo(id)` finds any view with that id inside the scroll view, and
+/// the browser's `scrollIntoView` any element. A boundary a nearer region
+/// inside holds belongs to that region: the outer one does not move for
+/// it. Only boundaries record frames, so a plain view keyed `.id(id)`
+/// is not found — key the component that draws it.
+fn scroll_target_frame(
+    result: &crate::layout::LayoutResult,
+    region: &crate::layout::ScrollRegion,
+    id: &str,
+) -> Option<Rect> {
+    let segment = format!("/[{id}]");
+    if let Some(row) = result.frames.get(&format!("{}{segment}", region.path)) {
+        return Some(row);
+    }
+    let inside = |outer: &str, path: &str| {
+        path.len() > outer.len() && path.starts_with(outer) && path.as_bytes()[outer.len()] == b'/'
+    };
+    let nearer = |keyed: &str| {
+        result.scrolls.iter().any(|inner| inside(&region.path, &inner.path) && inside(&inner.path, keyed))
+    };
+    result
+        .frames
+        .iter()
+        .filter(|(path, _)| inside(&region.path, path))
+        .filter_map(|(path, frame)| {
+            // the keyed segment, whole: `[id]` ends the path or a segment
+            let at = path.match_indices(segment.as_str()).map(|(at, _)| at + segment.len()).find(|&end| {
+                path[end..].is_empty() || path[end..].starts_with('/')
+            })?;
+            Some((&path[..at], frame))
+        })
+        .filter(|(keyed, _)| !nearer(keyed))
+        .min_by_key(|(keyed, _)| keyed.len())
+        .map(|(_, frame)| frame)
 }
 
 #[cfg(test)]
